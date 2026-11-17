@@ -16,6 +16,9 @@
 //! `ftol_rel`, applied to the *accepted* step and, before taking one, to the decrease the
 //! quadratic model predicts for it.
 
+use crate::estimation::saem::fold_nll_grad;
+use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+
 /// One fused evaluation: objective value, packed gradient and row-major `n × n` information.
 pub(crate) struct ValueGradInfo {
     pub val: f64,
@@ -23,29 +26,57 @@ pub(crate) struct ValueGradInfo {
     pub info: Vec<f64>,
 }
 
-/// Fold per-subject `(value, gradient, information)` triples in subject order. `None` when any
-/// subject has no information (outside the closed form's scope): the caller then keeps the
-/// derivative-free solve rather than stepping on a partial curvature.
+/// Fold per-subject `(value, gradient, information)` triples in subject order, with the
+/// information when `want_info`. `None` when `want_info` and any subject has none (outside
+/// the closed form's scope): the caller then keeps the derivative-free solve rather than
+/// stepping on a partial curvature. Without `want_info` the information is ignored and the
+/// result's is empty. The value and gradient fold is SAEM's [`fold_nll_grad`], the one
+/// subject-ordered reduction of the numerical M-steps (#703).
 pub(crate) fn fold_value_grad_info(
     per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)>,
     n: usize,
+    want_info: bool,
 ) -> Option<ValueGradInfo> {
-    let mut out = ValueGradInfo {
-        val: 0.0,
-        grad: vec![0.0; n],
-        info: vec![0.0; n * n],
-    };
+    let mut info = vec![0.0; if want_info { n * n } else { 0 }];
+    let mut pairs = Vec::with_capacity(per_subj.len());
     for (v, g, i) in per_subj {
-        let i = i?;
-        out.val += v;
-        for (a, b) in out.grad.iter_mut().zip(&g) {
-            *a += b;
+        if want_info {
+            for (a, b) in info.iter_mut().zip(&i?) {
+                *a += b;
+            }
         }
-        for (a, b) in out.info.iter_mut().zip(&i) {
-            *a += b;
-        }
+        pairs.push((v, g));
     }
-    Some(out)
+    let (val, grad) = fold_nll_grad(pairs, n);
+    Some(ValueGradInfo { val, grad, info })
+}
+
+/// What an optimizer is handed for a value that is not finite: the crate's sentinel, a flat,
+/// maximally bad point ([`SUBJECT_SENTINEL_NLL`]).
+pub(crate) fn finite_value(val: f64) -> f64 {
+    if val.is_finite() {
+        val
+    } else {
+        SUBJECT_SENTINEL_NLL
+    }
+}
+
+/// A non-finite gradient entry is zeroed, as the value's sentinel is flat.
+pub(crate) fn finite_grad(grad: &mut [f64]) {
+    for g in grad.iter_mut().filter(|g| !g.is_finite()) {
+        *g = 0.0;
+    }
+}
+
+/// What NLopt receives from a numerical M-step objective that was asked for its gradient: the
+/// gradient written to `out` with [`finite_grad`] applied, and the value through
+/// [`finite_value`]. The one cleanup SAEM's and IMP/IMPMAP's solves share.
+pub(crate) fn nlopt_value_and_grad((val, grad): (f64, Vec<f64>), out: &mut [f64]) -> f64 {
+    for (o, g) in out.iter_mut().zip(grad) {
+        *o = g;
+    }
+    finite_grad(out);
+    finite_value(val)
 }
 
 /// Armijo sufficient-decrease constant of the backtracking line search (the textbook `1e-4`).
@@ -92,15 +123,60 @@ fn cholesky_solve(a: &[f64], m: usize, ridge: f64, rhs: &[f64]) -> Option<Vec<f6
     Some(y)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Fused passes [`fisher_scoring`] still gets on this thread (`None`: no limit): past them
+    /// the information is out of scope, so a driver test can make a solve decline at its start
+    /// (`0`) or lose its information after one accepted step (`1`) — a stall no model reaches
+    /// on demand.
+    pub(crate) static FUSED_PASSES_ALLOWED: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// One fused evaluation, or its absence where [`FUSED_PASSES_ALLOWED`] is spent (test builds).
+fn run_fused<F>(fused: &mut F, x: &[f64]) -> Option<ValueGradInfo>
+where
+    F: FnMut(&[f64]) -> Option<ValueGradInfo>,
+{
+    #[cfg(test)]
+    if let Some(left) = FUSED_PASSES_ALLOWED.get() {
+        if left == 0 {
+            return None;
+        }
+        FUSED_PASSES_ALLOWED.set(Some(left - 1));
+    }
+    fused(x)
+}
+
+/// How [`fisher_scoring`] ended.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NewtonOutcome {
+    /// The information was out of scope at the start point: `x` is untouched and nothing was
+    /// solved.
+    Declined,
+    /// The iteration reached one of its own stopping rules — the tolerance (the step it would
+    /// take is not worth a pass, or the one it took changed the objective by less than
+    /// `ftol_rel`), every coordinate held at a bound, or the evaluation budget. `x` is the
+    /// answer.
+    Converged,
+    /// No admissible step was left although the tolerance was not met — the information
+    /// would not factor at any ridge (non-finite entries), no damped step decreased the
+    /// objective, or a later point lost its information. `x` is the last accepted point
+    /// (the start when none was); the caller continues from it with another solver.
+    Stalled,
+}
+
 /// Minimise an objective over the box `[lower, upper]` from `x` (updated in place) by Fisher
 /// scoring.
 ///
 /// `fused(x)` returns the value, gradient and information in one pass, or `None` where the
 /// information is out of scope; `value(x)` is the same objective's value alone (a trial point
 /// is judged on it, and only an accepted point that the iteration continues from pays for the
-/// derivatives). Returns `false` — `x` untouched — when the information is out of scope at the
-/// start point, so the caller can keep the derivative-free solve. `maxeval` bounds the
-/// evaluations of either kind (the budget BOBYQA gets in value evaluations).
+/// derivatives). Returns [`NewtonOutcome::Declined`] — `x` untouched — when the information is
+/// out of scope at the start point, and [`NewtonOutcome::Stalled`] when the iteration cannot
+/// take a step it has not converged for; in both the caller keeps the derivative-free solve
+/// (from `x`). `maxeval` bounds the evaluations of either kind (the budget BOBYQA gets in
+/// value evaluations).
 ///
 /// A coordinate with `lower == upper`, or at a bound with the gradient pushing outward, is held
 /// for that step; the step solves the remaining block of `I` (Levenberg-damped as far as needed
@@ -113,19 +189,20 @@ pub(crate) fn fisher_scoring<V, F>(
     ftol_rel: f64,
     mut value: V,
     mut fused: F,
-) -> bool
+) -> NewtonOutcome
 where
     V: FnMut(&[f64]) -> f64,
     F: FnMut(&[f64]) -> Option<ValueGradInfo>,
 {
     let n = x.len();
-    let Some(mut cur) = fused(x) else {
-        return false;
+    let Some(mut cur) = run_fused(&mut fused, x) else {
+        return NewtonOutcome::Declined;
     };
     let mut evals = 1u32;
     // Persists across iterations (Levenberg-Marquardt): a rejected step raises it, an accepted
     // one lowers it, and below the floor it is exactly zero — the plain Fisher step.
     let mut ridge = 0.0f64;
+    let mut stalled = false;
     while evals < maxeval {
         let free: Vec<usize> = (0..n)
             .filter(|&i| {
@@ -156,6 +233,8 @@ where
         // gradient-like step, so the sequence ends in a decrease.
         let mut accepted = None;
         let mut first = true;
+        // The first factored step is not worth a pass: converged, not stalled.
+        let mut not_worth_a_pass = false;
         for _ in 0..MAX_DAMPINGS {
             if evals >= maxeval {
                 break;
@@ -170,6 +249,7 @@ where
                 // the tolerance: below it the step is not worth a pass.
                 let predicted = -0.5 * g.iter().zip(&s).map(|(a, b)| a * b).sum::<f64>();
                 if !(predicted > ftol_rel * cur.val.abs()) {
+                    not_worth_a_pass = true;
                     break;
                 }
             }
@@ -187,8 +267,17 @@ where
             ridge = (ridge * 10.0).max(RIDGE_FLOOR);
         }
         let Some((trial, v)) = accepted else {
+            // Out of budget or a step not worth a pass is an ending; every damping tried
+            // with the budget left is a stall.
+            stalled = !not_worth_a_pass && evals < maxeval;
             break;
         };
+        // A damping so heavy that the step vanishes in rounding is "accepted" at the same
+        // point: no progress, which is a stall.
+        if trial == x {
+            stalled = true;
+            break;
+        }
         ridge = if ridge * 0.1 < RIDGE_FLOOR {
             0.0
         } else {
@@ -202,16 +291,24 @@ where
         }
         // Another step from here needs the derivatives at the accepted point.
         evals += 1;
-        match fused(x) {
+        match run_fused(&mut fused, x) {
             Some(nx) => cur = nx,
-            None => break,
+            None => {
+                stalled = true;
+                break;
+            }
         }
     }
-    true
+    if stalled {
+        NewtonOutcome::Stalled
+    } else {
+        NewtonOutcome::Converged
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::NewtonOutcome::{Converged, Declined, Stalled};
     use super::*;
 
     /// Gaussian regression `y_j = a·exp(b·t_j)`, additive σ fixed at 1: value, exact score and
@@ -242,7 +339,14 @@ mod tests {
     }
 
     /// Run the solver, counting evaluations of either kind.
-    fn solve<F>(x: &mut [f64], lo: &[f64], hi: &[f64], maxeval: u32, ftol: f64, f: F) -> (bool, u32)
+    fn solve<F>(
+        x: &mut [f64],
+        lo: &[f64],
+        hi: &[f64],
+        maxeval: u32,
+        ftol: f64,
+        f: F,
+    ) -> (NewtonOutcome, u32)
     where
         F: Fn(&[f64]) -> Option<ValueGradInfo>,
     {
@@ -269,7 +373,7 @@ mod tests {
     fn fisher_scoring_finds_the_zero_residual_optimum_in_a_few_passes() {
         let mut x = [1.5, -0.4];
         let (solved, calls) = solve(&mut x, &[-9.0; 2], &[9.0; 2], 100, 1e-12, exp_fit);
-        assert!(solved);
+        assert_eq!(solved, Converged);
         assert!(
             (x[0] - 2.0).abs() < 1e-5 && (x[1] + 0.7).abs() < 1e-5,
             "{x:?}"
@@ -281,11 +385,17 @@ mod tests {
     fn fisher_scoring_respects_bounds_and_pinned_coordinates() {
         // Optimum a = 2 lies above the bound 1.8: the solve stops on the bound, b free.
         let mut x = [1.5, -0.4];
-        assert!(solve(&mut x, &[-9.0, -9.0], &[1.8, 9.0], 100, 1e-12, exp_fit).0);
+        assert_eq!(
+            solve(&mut x, &[-9.0, -9.0], &[1.8, 9.0], 100, 1e-12, exp_fit).0,
+            Converged
+        );
         assert_eq!(x[0], 1.8);
         // A pinned coordinate never moves.
         let mut y = [1.5, -0.4];
-        assert!(solve(&mut y, &[1.5, -9.0], &[1.5, 9.0], 100, 1e-12, exp_fit).0);
+        assert_eq!(
+            solve(&mut y, &[1.5, -9.0], &[1.5, 9.0], 100, 1e-12, exp_fit).0,
+            Converged
+        );
         assert_eq!(y[0], 1.5);
         assert!(y[1] != -0.4);
     }
@@ -293,15 +403,10 @@ mod tests {
     #[test]
     fn fisher_scoring_declines_without_information_and_honours_the_budget() {
         let mut x = [1.5, -0.4];
-        assert!(!fisher_scoring(
-            &mut x,
-            &[-9.0; 2],
-            &[9.0; 2],
-            10,
-            1e-9,
-            |_| 0.0,
-            |_| None
-        ));
+        assert_eq!(
+            fisher_scoring(&mut x, &[-9.0; 2], &[9.0; 2], 10, 1e-9, |_| 0.0, |_| None),
+            Declined
+        );
         assert_eq!(x, [1.5, -0.4]);
         let mut z = [1.5, -0.4];
         let (_, calls) = solve(&mut z, &[-9.0; 2], &[9.0; 2], 3, 1e-15, exp_fit);
@@ -350,7 +455,7 @@ mod tests {
                 info: vec![0.01],
             })
         });
-        assert!(solved && x[0].abs() < 1e-3, "{x:?}");
+        assert!(solved == Converged && x[0].abs() < 1e-3, "{x:?}");
     }
 
     #[test]
@@ -364,7 +469,95 @@ mod tests {
                 info: vec![1.0, 0.0, 0.0, 0.0],
             })
         });
-        assert!(solved && x[0].abs() < 1e-6 && x[1].abs() < 1.0, "{x:?}");
+        assert!(
+            solved == Converged && x[0].abs() < 1e-6 && x[1].abs() < 1.0,
+            "{x:?}"
+        );
+    }
+
+    /// A solve that cannot take a step it has not converged for is `Stalled`, never `Converged`,
+    /// and says where it stopped: information that does not factor at any ridge (non-finite
+    /// entries) at the start, every damped step uphill, and a later point that lost its
+    /// information. Each branch's own assertion carries the discriminator the others lack:
+    /// `x` untouched for the first two, `x` at the accepted point for the third.
+    #[test]
+    fn a_solve_with_no_admissible_step_is_stalled_not_converged() {
+        // ½(x-3)² with an information that is NaN: no ridge makes it factor.
+        let nan_info = |v: &[f64]| {
+            Some(ValueGradInfo {
+                val: 0.5 * (v[0] - 3.0).powi(2),
+                grad: vec![v[0] - 3.0],
+                info: vec![f64::NAN],
+            })
+        };
+        let mut x = [2.9];
+        let (out, calls) = solve(&mut x, &[-9.0], &[9.0], 100, 1e-12, nan_info);
+        assert_eq!((out, x), (Stalled, [2.9]));
+        assert_eq!(calls, 1, "no value pass: nothing factored");
+        // Factors, but the objective's value is uphill at every trial: all dampings rejected.
+        let uphill = |v: &[f64]| {
+            Some(ValueGradInfo {
+                val: 1.0 + 0.5 * (v[0] - 3.0).powi(2) + (v[0] - 2.9).abs() * 10.0,
+                grad: vec![v[0] - 3.0],
+                info: vec![1.0],
+            })
+        };
+        let mut y = [2.9];
+        let (out, calls) = solve(&mut y, &[-9.0], &[9.0], 1000, 1e-12, uphill);
+        assert_eq!((out, y), (Stalled, [2.9]));
+        assert!(calls > 2, "the dampings were tried: {calls}");
+        // A later point without information: the accepted point is kept, and it is a stall.
+        let lost = |v: &[f64]| {
+            (v[0] == 2.9).then(|| ValueGradInfo {
+                val: 1.0 + 0.5 * (v[0] - 3.0).powi(2),
+                grad: vec![v[0] - 3.0],
+                info: vec![1.0],
+            })
+        };
+        let mut z = [2.9];
+        let out = fisher_scoring(
+            &mut z,
+            &[-9.0],
+            &[9.0],
+            100,
+            1e-12,
+            |v| 1.0 + 0.5 * (v[0] - 3.0).powi(2),
+            lost,
+        );
+        assert!(
+            out == Stalled && (z[0] - 3.0).abs() < 1e-12,
+            "{out:?} {z:?}"
+        );
+    }
+
+    /// The endings that are not stalls: a first step not worth a pass, every coordinate held at
+    /// a bound, and an exhausted budget are all `Converged`.
+    #[test]
+    fn a_solve_that_reached_a_stopping_rule_is_converged() {
+        let mut at_opt = [2.0, -0.7];
+        assert_eq!(
+            solve(&mut at_opt, &[-9.0; 2], &[9.0; 2], 100, 1e-7, exp_fit).0,
+            Converged
+        );
+        // Held at the lower bound with the gradient pushing outward: no free coordinate.
+        let mut held = [1.0];
+        let up = |v: &[f64]| {
+            Some(ValueGradInfo {
+                val: v[0],
+                grad: vec![1.0],
+                info: vec![1.0],
+            })
+        };
+        assert_eq!(
+            solve(&mut held, &[1.0], &[9.0], 100, 1e-12, up).0,
+            Converged
+        );
+        assert_eq!(held, [1.0]);
+        let mut budget = [1.5, -0.4];
+        assert_eq!(
+            solve(&mut budget, &[-9.0; 2], &[9.0; 2], 3, 1e-15, exp_fit).0,
+            Converged
+        );
     }
 
     #[test]
@@ -373,12 +566,34 @@ mod tests {
             (1.0, vec![1.0, 2.0], Some(vec![1.0, 0.0, 0.0, 1.0])),
             (2.0, vec![3.0, 4.0], Some(vec![2.0, 0.0, 0.0, 2.0])),
         ];
-        let f = fold_value_grad_info(ok, 2).unwrap();
+        let f = fold_value_grad_info(ok.clone(), 2, true).unwrap();
         assert_eq!(
             (f.val, f.grad, f.info),
             (3.0, vec![4.0, 6.0], vec![3.0, 0.0, 0.0, 3.0])
         );
+        // Without `want_info` the information is neither required nor summed.
+        let v = fold_value_grad_info(ok, 2, false).unwrap();
+        assert_eq!((v.val, v.grad, v.info), (3.0, vec![4.0, 6.0], vec![]));
         let bad = vec![(1.0, vec![0.0, 0.0], None)];
-        assert!(fold_value_grad_info(bad, 2).is_none());
+        assert!(fold_value_grad_info(bad.clone(), 2, true).is_none());
+        assert!(fold_value_grad_info(bad, 2, false).is_some());
+    }
+
+    /// The shared cleanup: a non-finite value becomes the crate's sentinel and a non-finite
+    /// gradient entry a zero; finite ones are untouched.
+    #[test]
+    fn non_finite_values_and_gradients_are_cleaned_to_the_sentinel_and_zero() {
+        assert_eq!(finite_value(f64::NAN), SUBJECT_SENTINEL_NLL);
+        assert_eq!(finite_value(f64::INFINITY), SUBJECT_SENTINEL_NLL);
+        assert_eq!(finite_value(-2.5), -2.5);
+        let mut g = [1.0, f64::NAN, f64::NEG_INFINITY, -0.5];
+        finite_grad(&mut g);
+        assert_eq!(g, [1.0, 0.0, 0.0, -0.5]);
+        let mut out = [9.0; 2];
+        assert_eq!(
+            nlopt_value_and_grad((f64::NAN, vec![f64::NAN, 3.0]), &mut out),
+            SUBJECT_SENTINEL_NLL
+        );
+        assert_eq!(out, [0.0, 3.0]);
     }
 }

@@ -610,9 +610,8 @@ fn numerical_mstep_scope_gap_refuses_iov_and_mixtures() {
     assert!(numerical_mstep_scope_gap(&model, 0, true).is_some());
 }
 
-#[test]
-fn numerical_mstep_scope_gap_refuses_a_correlated_residual() {
-    let model = parse_model_string(
+fn correlated_residual_model() -> CompiledModel {
+    parse_model_string(
         r"
 [parameters]
   theta TVCL(1.0, 0.1, 10.0)
@@ -637,13 +636,16 @@ fn numerical_mstep_scope_gap_refuses_a_correlated_residual() {
   CMT=2: DV ~ proportional(PROP2)
 ",
     )
-    .expect("block_sigma fixture parses");
-    assert!(numerical_mstep_scope_gap(&model, 0, false).is_some());
+    .expect("block_sigma fixture parses")
 }
 
 #[test]
-fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
-    let model = parse_model_string(
+fn numerical_mstep_scope_gap_refuses_a_correlated_residual() {
+    assert!(numerical_mstep_scope_gap(&correlated_residual_model(), 0, false).is_some());
+}
+
+fn magnitude_model() -> CompiledModel {
+    parse_model_string(
         r"
 [parameters]
   theta TVCL(1.0, 0.1, 10.0)
@@ -662,17 +664,20 @@ fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
   WPSE continuous
 ",
     )
-    .expect("magnitude fixture parses");
-    assert!(numerical_mstep_scope_gap(&model, 0, false).is_some());
+    .expect("magnitude fixture parses")
+}
+
+#[test]
+fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
+    assert!(numerical_mstep_scope_gap(&magnitude_model(), 0, false).is_some());
 }
 
 /// #1421: a FREM model is in scope — its covariate rows' score and information
 /// are exact since `obs_dvar_dlogsigma` (see the FD-parity tests in
 /// `fixed_eta_gradient_tests.rs`), so `score_sa` and `mstep_draws` need not
 /// refuse it any more.
-#[test]
-fn numerical_mstep_scope_gap_admits_a_frem_model() {
-    let model = parse_model_string(
+fn frem_model() -> CompiledModel {
+    parse_model_string(
         r"
 [parameters]
   theta TVCL(1.0, 0.1, 10.0)
@@ -694,9 +699,36 @@ fn numerical_mstep_scope_gap_admits_a_frem_model() {
   frem_sigma = EPSCOV
 ",
     )
-    .expect("FREM fixture parses");
+    .expect("FREM fixture parses")
+}
+
+#[test]
+fn numerical_mstep_scope_gap_admits_a_frem_model() {
+    let model = frem_model();
     assert!(model.frem_config.is_some(), "the fixture must be FREM");
     assert_eq!(numerical_mstep_scope_gap(&model, 0, false), None);
+}
+
+/// One-compartment IV with IOV on clearance (κ live on a later dose).
+fn iov_model() -> CompiledModel {
+    parse_model_string(
+        r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  kappa KAPPA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("IOV fixture parses")
 }
 
 // ── stored-draw re-centring ────────────────────────────────────────────────
@@ -1486,15 +1518,16 @@ fn lbfgs_mstep_at_the_production_budget_captures_the_converged_gain() {
 #[test]
 fn the_lbfgs_advisory_names_its_cause() {
     use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
-    assert!(mstep_optimizer_advisory_for(Bobyqa, false, false, "SAEM").is_none());
-    assert!(mstep_optimizer_advisory_for(Bobyqa, true, false, "SAEM").is_none());
-    assert!(mstep_optimizer_advisory_for(Lbfgs, false, true, "SAEM").is_none());
-    let sa = mstep_optimizer_advisory_for(Lbfgs, true, true, "SAEM").expect("score_sa");
+    let advisory = |o, sa, exact, label| resolve_mstep_optimizer_for(o, sa, exact, None, label).1;
+    assert!(advisory(Bobyqa, false, false, "SAEM").is_none());
+    assert!(advisory(Bobyqa, true, false, "SAEM").is_none());
+    assert!(advisory(Lbfgs, false, true, "SAEM").is_none());
+    let sa = advisory(Lbfgs, true, true, "SAEM").expect("score_sa");
     assert!(
         sa.contains("mstep_solver = score_sa") && !sa.contains("forward difference"),
         "{sa}"
     );
-    let fd = mstep_optimizer_advisory_for(Lbfgs, false, false, "IMPMAP").expect("out of scope");
+    let fd = advisory(Lbfgs, false, false, "IMPMAP").expect("out of scope");
     assert!(fd.starts_with("IMPMAP:"), "{fd}");
     assert!(
         fd.contains("forward difference") && !fd.contains("score_sa"),
@@ -1502,8 +1535,9 @@ fn the_lbfgs_advisory_names_its_cause() {
     );
     // The production wrapper reads the adjoint's scope: an analytic two-compartment model is in it.
     let model = no_eta_theta_model();
-    assert!(mstep_optimizer_advisory(&model, Lbfgs, false, "SAEM").is_none());
-    assert!(mstep_optimizer_advisory(&model, Lbfgs, true, "SAEM").is_some());
+    let prod = |sa| resolve_mstep_optimizer(&model, Lbfgs, sa, false, "SAEM");
+    assert_eq!(prod(false), (Lbfgs, None));
+    assert!(prod(true).1.is_some());
 }
 
 /// Converged Fisher scoring = converged BOBYQA, single draw: same objective, same optimum
@@ -1632,29 +1666,157 @@ fn newton_mstep_at_the_production_budget_captures_the_converged_gain() {
     }
 }
 
-/// The advisory for `newton`: silent where the information exists, one cause-named message
-/// otherwise (the scope message must not name `score_sa`, the `score_sa` one not the scope).
-#[test]
-fn the_newton_advisory_names_its_cause() {
-    use crate::types::MstepOptimizer::Newton;
-    assert!(mstep_optimizer_advisory_for(Newton, false, true, "SAEM").is_none());
-    let sa = mstep_optimizer_advisory_for(Newton, true, true, "SAEM").expect("score_sa");
+/// A model the adjoint's recorders decline (a Form C readout without its compiled program),
+/// otherwise a plain Gaussian one-compartment ODE.
+fn out_of_adjoint_model() -> CompiledModel {
+    let mut m = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+    )
+    .expect("ODE fixture parses");
     assert!(
-        sa.contains("mstep_solver = score_sa") && !sa.contains("adjoint"),
-        "{sa}"
+        crate::sens::ode_provider::adjoint::recorder_in_scope(&m),
+        "premise: the adjoint serves it with its program"
     );
-    let scope = mstep_optimizer_advisory_for(Newton, false, false, "IMP").expect("scope");
-    assert!(scope.starts_with("IMP:"), "{scope}");
+    m.ode_spec.as_mut().unwrap().readout_program = None;
+    m
+}
+
+/// The `newton` scope is ONE decision, [`newton_scope_gap`], read by the advisory and the
+/// solve alike: `newton` runs on a model with the closed-form information and runs `bobyqa`
+/// — named, with the property that put it there — on every one without. Each reason's
+/// assertion carries its own discriminator and the others' negatives, so a message that names
+/// two cannot pass; the effective optimizer is `bobyqa` in each, never silently `newton`.
+#[test]
+fn the_newton_scope_is_one_decision_with_a_named_reason() {
+    use crate::types::BloqMethod;
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let reasons = [
+        "mixture",
+        "M3 censoring",
+        "block_sigma",
+        "magnitude term",
+        "outside the adjoint's scope",
+    ];
+    let plain = no_eta_theta_model();
+    assert_eq!(newton_scope_gap(&plain, false), None);
+    let mut m3 = no_eta_theta_model();
+    m3.bloq_method = BloqMethod::M3;
+    let ode_out = out_of_adjoint_model();
+    for (label, model, mixture, want) in [
+        ("mixture", &plain, true, 0usize),
+        ("M3", &m3, false, 1),
+        ("out of the adjoint", &ode_out, false, 4),
+    ] {
+        let gap = newton_scope_gap(model, mixture).unwrap_or_else(|| panic!("{label}: no gap"));
+        assert!(gap.contains(reasons[want]), "{label}: {gap}");
+        let (opt, warning) = resolve_mstep_optimizer(model, Newton, false, mixture, "IMP");
+        let w = warning.unwrap_or_else(|| panic!("{label}: silent"));
+        assert_eq!(opt, Bobyqa, "{label}");
+        assert!(
+            w.starts_with("IMP:") && w.contains("runs `bobyqa`"),
+            "{label}: {w}"
+        );
+        for (k, other) in reasons.iter().enumerate() {
+            assert_eq!(w.contains(other), k == want, "{label}: {other} in {w}");
+        }
+        assert!(!w.contains("score_sa"), "{label}: {w}");
+    }
+    // The model-property reasons of the Gaussian-scope list are the same list `score_sa` reads.
+    for (model, k) in [(correlated_residual_model(), 2), (magnitude_model(), 3)] {
+        let gap = newton_scope_gap(&model, false).expect("a gap");
+        assert!(gap.contains(reasons[k]), "{gap}");
+        assert_eq!(Some(gap), numerical_mstep_scope_gap(&model, 0, false));
+    }
+    // Inside it — a closed form, IOV (the adjoint records the stacked `[η | κ]`), FREM — newton
+    // is the optimizer, with no warning.
+    assert_eq!(
+        resolve_mstep_optimizer(&plain, Newton, false, false, "SAEM"),
+        (Newton, None)
+    );
+    assert_eq!(newton_scope_gap(&iov_model(), false), None);
+    assert_eq!(newton_scope_gap(&frem_model(), false), None);
+    // `score_sa` replaces the numerical solve: the option has nothing to act on, and says that
+    // (not a scope reason).
+    let (opt, w) = resolve_mstep_optimizer(&plain, Newton, true, false, "SAEM");
+    let w = w.expect("score_sa");
     assert!(
-        scope.contains("adjoint")
-            && scope.contains("keeps `bobyqa`")
-            && !scope.contains("score_sa"),
-        "{scope}"
+        opt == Bobyqa
+            && w.contains("mstep_solver = score_sa")
+            && !w.contains("adjoint")
+            && !w.contains("runs `bobyqa`"),
+        "{w}"
+    );
+    // Bobyqa and lbfgs are not Newton's to change.
+    assert_eq!(
+        resolve_mstep_optimizer(&m3, Bobyqa, false, true, "SAEM"),
+        (Bobyqa, None)
+    );
+    assert_eq!(
+        resolve_mstep_optimizer(
+            &plain,
+            crate::types::MstepOptimizer::Lbfgs,
+            false,
+            true,
+            "SAEM"
+        )
+        .0,
+        crate::types::MstepOptimizer::Lbfgs
     );
 }
 
+/// A Newton solve whose fused pass loses its information after one accepted step (a stall) is
+/// not a solved one: the route is `bobyqa`, and the solve reaches BOBYQA's maximiser — the
+/// start-point stall (`0` passes: declined at the start) takes the same route, so the two
+/// differ only by where BOBYQA starts.
+#[test]
+fn a_stalled_newton_mstep_continues_with_bobyqa() {
+    use crate::estimation::mstep_newton::FUSED_PASSES_ALLOWED;
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let route = |passes: Option<u32>| {
+        MSTEP_ROUTE.with(|c| c.set([0; 3]));
+        FUSED_PASSES_ALLOWED.set(passes);
+        let got = maximiser_with(&model, &population, &p, &draws[0], &[], Newton, 400, false);
+        FUSED_PASSES_ALLOWED.set(None);
+        (MSTEP_ROUTE.with(|c| c.get()), got)
+    };
+    // Unlimited: Newton solved it.
+    assert_eq!(route(None).0, [0, 0, 1]);
+    for passes in [0u32, 1] {
+        let (used, got) = route(Some(passes));
+        assert_eq!(used, [1, 0, 0], "{passes} fused pass(es): BOBYQA ran");
+        let gap = worst_gap(&got, &reference);
+        assert!(
+            gap < 5e-3,
+            "{passes} pass(es): {gap:.3e} from the maximiser"
+        );
+    }
+}
+
 /// The value path with a prediction memo is the memo-free `obs_nll_sum` bit for bit, serves an
-/// unchanged θ from the slot (a stale draw proves it), and gives each draw its own slots.
+/// unchanged θ from the memo (a stale draw proves it), gives each draw its own sample, and a
+/// tracking memo replaces the predictions when θ moves while a pinned-θ one declines the move.
 #[test]
 fn the_memoised_value_path_is_obs_nll_sum_bit_for_bit() {
     use crate::estimation::pred_memo::PredMemo;
@@ -1662,48 +1824,28 @@ fn the_memoised_value_path_is_obs_nll_sum_bit_for_bit() {
     let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
     let draws = eta_draws();
     let n = population.subjects.len();
-    let memo = PredMemo::new(2 * n);
     let th: Vec<f64> = packed_start().log_theta.iter().map(|x| x.exp()).collect();
     let th2: Vec<f64> = th.iter().map(|x| x * 1.01).collect();
+    // Two samples (draws) per subject; θ free under Newton, so the memo follows θ.
+    let memo = PredMemo::for_solve(vec![2usize; n], true, true).unwrap();
+    let ev = memo.begin(&th).unwrap();
     for sg in [[0.1f64], [0.2], [0.35]] {
         let plain = obs_nll_sum(&model, &population, &th, &sg, &draws[0], &[]);
-        let with = obs_nll_sum_memo(
-            &model,
-            &population,
-            &th,
-            &sg,
-            &draws[0],
-            &[],
-            Some((&memo, 0)),
-        );
+        let with = obs_nll_sum_memo(&model, &population, &th, &sg, &draws[0], &[], Some((ev, 0)));
         assert_eq!(plain, with, "σ = {sg:?}");
     }
-    // Stale: slots 0..n hold draw 0's predictions for `th`; draw 1 through them scores draw 0.
+    // Stale: sample 0 holds draw 0's predictions for `th`; draw 1 through it scores draw 0.
     let sg = [0.2f64];
     let d0 = obs_nll_sum(&model, &population, &th, &sg, &draws[0], &[]);
     let d1 = obs_nll_sum(&model, &population, &th, &sg, &draws[1], &[]);
     assert!(d0 != d1, "fixture: the draws must differ");
-    let stale = obs_nll_sum_memo(
-        &model,
-        &population,
-        &th,
-        &sg,
-        &draws[1],
-        &[],
-        Some((&memo, 0)),
-    );
-    assert_eq!(stale, d0, "served from the slot");
-    // Its own slots (base n) compute draw 1 itself; a changed θ recomputes through slot 0.
-    let own = obs_nll_sum_memo(
-        &model,
-        &population,
-        &th,
-        &sg,
-        &draws[1],
-        &[],
-        Some((&memo, n)),
-    );
+    let stale = obs_nll_sum_memo(&model, &population, &th, &sg, &draws[1], &[], Some((ev, 0)));
+    assert_eq!(stale, d0, "served from the memo");
+    // Its own sample (1) computes draw 1 itself.
+    let own = obs_nll_sum_memo(&model, &population, &th, &sg, &draws[1], &[], Some((ev, 1)));
     assert_eq!(own, d1);
+    // A moved θ opens a new evaluation of a tracking memo: recomputed through sample 0.
+    let ev2 = memo.begin(&th2).unwrap();
     let moved = obs_nll_sum_memo(
         &model,
         &population,
@@ -1711,10 +1853,13 @@ fn the_memoised_value_path_is_obs_nll_sum_bit_for_bit() {
         &sg,
         &draws[1],
         &[],
-        Some((&memo, 0)),
+        Some((ev2, 0)),
     );
     assert_eq!(
         moved,
         obs_nll_sum(&model, &population, &th2, &sg, &draws[1], &[])
     );
+    // A pinned-θ memo holds the first θ: a different one is declined, not served from.
+    let fixed = PredMemo::for_solve(vec![2usize; n], false, false).unwrap();
+    assert!(fixed.begin(&th).is_some() && fixed.begin(&th2).is_none());
 }

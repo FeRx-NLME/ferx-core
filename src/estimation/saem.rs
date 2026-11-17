@@ -11,14 +11,16 @@ use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_into_iov, obs_nll_subject_into_iov_memo, obs_nll_subject_score,
     obs_nll_subject_score_iov,
 };
+use crate::estimation::mstep_newton::{
+    finite_grad, finite_value, nlopt_value_and_grad, NewtonOutcome,
+};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
-use crate::estimation::pred_memo::{MemoSlot, PredMemo};
+use crate::estimation::pred_memo::{memoized, EvalMemo, PredMemo};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
     individual_nll_prepared, is_usable_subject_nll, IndividualNllPrep, IndividualNllScratch,
-    SUBJECT_SENTINEL_NLL,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1039,8 +1041,18 @@ fn numerical_mstep_scope_gap(
         return Some("the model has IOV");
     }
     if is_mixture {
-        return Some("the model is a mixture");
+        return Some(MIXTURE_GAP);
     }
+    information_scope_gap(model)
+}
+
+/// The mixture entry of [`numerical_mstep_scope_gap`] and [`newton_scope_gap`].
+const MIXTURE_GAP: &str = "the model is a mixture";
+
+/// The model properties, beyond IOV and mixtures, that put a frozen-η M-step objective outside
+/// the plain Gaussian scope the expected information is derived for (see
+/// [`numerical_mstep_scope_gap`] for why each one does). `None` is inside it.
+fn information_scope_gap(model: &CompiledModel) -> Option<&'static str> {
     if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Some("the model uses M3 censoring");
     }
@@ -2394,7 +2406,7 @@ pub(crate) fn mh_kappa_steps(
 /// rayon worker count that produced `per_subj` (#703): a parallel `reduce`
 /// would combine partials along thread-count-dependent boundaries, and f64
 /// addition is non-associative.
-fn fold_nll_grad(per_subj: Vec<(f64, Vec<f64>)>, n: usize) -> (f64, Vec<f64>) {
+pub(crate) fn fold_nll_grad(per_subj: Vec<(f64, Vec<f64>)>, n: usize) -> (f64, Vec<f64>) {
     per_subj
         .into_iter()
         .fold((0.0, vec![0.0f64; n]), |(nll_a, mut ga), (nll_b, gb)| {
@@ -2447,72 +2459,107 @@ fn class_sigma_subst(sigma_values: &[f64], over: &[(usize, f64)]) -> Option<Vec<
     Some(v)
 }
 
-/// Advisory for `mstep_optimizer = lbfgs` (SAEM, IMP and IMPMAP): what the user asked for and
-/// what the fit will do about it. `None` under the default `bobyqa`, and under a model the
-/// adjoint's recorders serve (the θ score is then exact, which is the point of the option).
+/// Why `mstep_optimizer = newton` cannot serve this fit, or `None` where it can. This is the
+/// one scope decision, taken once per fit: the advisory ([`resolve_mstep_optimizer`]) and the
+/// solve both read its result, so what the warning says is what runs.
 ///
-/// L-BFGS reads the fixed-η score of [`obs_nll_subject_grad`]. Outside the recorders' scope
-/// that score's θ part is a forward difference (relative step `1e-5`), so the solve
-/// still runs — to the accuracy of its gradient, which a `1e-7` relative tolerance can
-/// exceed — rather than being refused; the message says so instead of leaving it silent.
-/// `score_sa_active` is SAEM's `mstep_solver = score_sa`, which replaces the numerical
-/// solve altogether, so the option has nothing to act on.
-pub(crate) fn mstep_optimizer_advisory(
+/// Newton is an exact-curvature method: it serves exactly the models whose expected
+/// information has a closed form from the adjoint's per-observation sensitivities — the adjoint
+/// in scope, a plain Gaussian likelihood ([`information_scope_gap`]: no M3 censoring, TTE
+/// endpoint, correlated residual, `[covariate_nn]` θ or residual magnitude) and not a mixture
+/// (the information is not class-resolved). IOV is inside it: the adjoint records the stacked
+/// `[η | κ]`. Outside it Fisher scoring on forward-difference rows is not offered.
+pub(crate) fn newton_scope_gap(model: &CompiledModel, is_mixture: bool) -> Option<&'static str> {
+    if is_mixture {
+        return Some(MIXTURE_GAP);
+    }
+    if let Some(gap) = information_scope_gap(model) {
+        return Some(gap);
+    }
+    (!crate::sens::ode_provider::adjoint::recorder_in_scope(model))
+        .then_some("the model is outside the adjoint's scope")
+}
+
+/// The `mstep_optimizer` a fit runs (SAEM, IMP and IMPMAP), decided once, with the warning for
+/// where it differs from the request or does not do what it says. `bobyqa` (the default) is
+/// silent. `newton` outside [`newton_scope_gap`] runs `bobyqa`, and says which property of
+/// the model put it there; under `mstep_solver = score_sa`, which replaces the numerical solve
+/// altogether, the option has nothing to act on. `lbfgs` runs as asked, silently where the
+/// recorders serve the model (its θ score is exact, which is the point of the option) and with
+/// a warning otherwise — the θ score is then a forward difference (relative step `1e-5`), so
+/// the solve runs to the accuracy of its gradient, which a `1e-7` relative tolerance can exceed.
+pub(crate) fn resolve_mstep_optimizer(
     model: &CompiledModel,
-    optimizer: MstepOptimizer,
+    requested: MstepOptimizer,
     score_sa_active: bool,
+    is_mixture: bool,
     label: &str,
-) -> Option<String> {
-    mstep_optimizer_advisory_for(
-        optimizer,
+) -> (MstepOptimizer, Option<String>) {
+    resolve_mstep_optimizer_for(
+        requested,
         score_sa_active,
         crate::sens::ode_provider::adjoint::recorder_in_scope(model),
+        newton_scope_gap(model, is_mixture),
         label,
     )
 }
 
-/// [`mstep_optimizer_advisory`] with the model's scope decided by the caller.
-fn mstep_optimizer_advisory_for(
+/// [`resolve_mstep_optimizer`] with the model's scope decided by the caller: whether the
+/// adjoint serves it (`exact_theta_score`, what `lbfgs` reads) and [`newton_scope_gap`].
+fn resolve_mstep_optimizer_for(
     optimizer: MstepOptimizer,
     score_sa_active: bool,
     exact_theta_score: bool,
+    newton_gap: Option<&str>,
     label: &str,
-) -> Option<String> {
+) -> (MstepOptimizer, Option<String>) {
     if optimizer == MstepOptimizer::Bobyqa {
-        return None;
+        return (optimizer, None);
     }
     if optimizer == MstepOptimizer::Newton {
         return if score_sa_active {
-            Some(format!(
-                "{label}: `mstep_optimizer = newton` has no effect under `mstep_solver = \
-                 score_sa`, which takes one Newton step on the averaged score instead of a \
-                 numerical solve."
-            ))
-        } else if exact_theta_score {
-            None
+            (
+                MstepOptimizer::Bobyqa,
+                Some(format!(
+                    "{label}: `mstep_optimizer = newton` has no effect under `mstep_solver = \
+                     score_sa`, which takes one Newton step on the averaged score instead of a \
+                     numerical solve."
+                )),
+            )
+        } else if let Some(gap) = newton_gap {
+            (
+                MstepOptimizer::Bobyqa,
+                Some(format!(
+                    "{label}: `mstep_optimizer = newton` needs the exact closed-form \
+                     information of the adjoint's per-observation sensitivities, and {gap}, so \
+                     the M-step runs `bobyqa`."
+                )),
+            )
         } else {
-            Some(format!(
-                "{label}: `mstep_optimizer = newton` needs the adjoint's per-observation \
-                 sensitivities for its curvature; this model is outside the adjoint's scope, so \
-                 the M-step keeps `bobyqa`."
-            ))
+            (optimizer, None)
         };
     }
     if score_sa_active {
-        return Some(format!(
-            "{label}: `mstep_optimizer = lbfgs` has no effect under `mstep_solver = score_sa`, \
-             which takes one Newton step on the averaged score instead of a numerical solve."
-        ));
+        return (
+            optimizer,
+            Some(format!(
+                "{label}: `mstep_optimizer = lbfgs` has no effect under `mstep_solver = score_sa`, \
+                 which takes one Newton step on the averaged score instead of a numerical solve."
+            )),
+        );
     }
     if exact_theta_score {
-        return None;
+        return (optimizer, None);
     }
-    Some(format!(
-        "{label}: `mstep_optimizer = lbfgs` is running without an exact θ gradient — this model \
-         is outside the adjoint's scope, so the M-step's θ score is a forward difference \
-         (relative step 1e-5) and L-BFGS converges only to that accuracy. `mstep_optimizer = \
-         bobyqa` (the default) does not read a gradient."
-    ))
+    (
+        optimizer,
+        Some(format!(
+            "{label}: `mstep_optimizer = lbfgs` is running without an exact θ gradient — this \
+             model is outside the adjoint's scope, so the M-step's θ score is a forward \
+             difference (relative step 1e-5) and L-BFGS converges only to that accuracy. \
+             `mstep_optimizer = bobyqa` (the default) does not read a gradient."
+        )),
+    )
 }
 
 #[cfg(test)]
@@ -2604,18 +2651,22 @@ fn theta_sigma_mstep_light(
     };
 
     // Predictions never depend on σ and every η/κ of this solve is fixed, so evaluations at one
-    // θ (a σ-only solve: all of them) share one prediction pass per `(draw, subject)`
-    // (`PredMemo`). A mixture scores under a per-class guard and keeps its own path.
-    let n_subj_memo = population.subjects.len();
-    let pred_memo = mix_mstep
-        .is_none()
-        .then(|| PredMemo::new((1 + extra_eta_draws.len()) * n_subj_memo));
-    let memo_slot = |draw: usize, i: usize| {
-        pred_memo.as_ref().map(|m| MemoSlot {
-            memo: m,
-            idx: draw * n_subj_memo + i,
-        })
+    // θ share one prediction pass per `(subject, draw)` (`PredMemo`): every evaluation of a
+    // σ-only solve, and a Newton solve's value pass and the fused pass at the same point. A
+    // solve that never sees a θ twice keeps no predictions, and a mixture, which scores under a
+    // per-class guard, keeps its own path.
+    let theta_free = (0..n_theta).any(|i| lower[i] < upper[i]);
+    let pred_memo = if mix_mstep.is_none() {
+        PredMemo::for_solve(
+            std::iter::repeat_n(1 + extra_eta_draws.len(), population.subjects.len()),
+            theta_free,
+            mstep_optimizer == MstepOptimizer::Newton,
+        )
+    } else {
+        None
     };
+    // One θ comparison per evaluation, then every `(subject, draw)` slot hangs off it.
+    let begin = |th: &[f64]| pred_memo.as_ref().and_then(|m| m.begin(th));
 
     // Objective operating on the unscaled packed parameters.
     //
@@ -2634,60 +2685,19 @@ fn theta_sigma_mstep_light(
     // and folded serially (#703). Factored out of `obj` so the K-draw objective
     // (#1458) can call it once per stored draw; at `mstep_draws = 1` there is
     // exactly one call and the arithmetic is unchanged.
-    let one_draw_grad =
-        |th: &[f64], sg: &[f64], etas: &[Vec<f64>], draw: usize| -> (f64, Vec<f64>) {
-            if let Some(kappas) = kappas_opt {
-                let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
-                    population.subjects.len().min(etas.len()).min(kappas.len()),
-                    EventPkParams::default,
-                    |scratch, i| {
-                        let ((subject, eta), kaps) =
-                            ((&population.subjects[i], &etas[i]), &kappas[i]);
-                        {
-                            let cls = mix_mstep.map(|m| m.classes[i]);
-                            let _g = cls.map(|c| {
-                                crate::parser::model_parser::MixtureClassGuard::enter(c + 1)
-                            });
-                            let over: &[(usize, f64)] = match (mix_mstep, cls) {
-                                (Some(m), Some(c)) => &m.class_sigma_over[c],
-                                _ => &[],
-                            };
-                            let sub_sg = class_sigma_subst(sg, over);
-                            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
-                            let (nll, mut grad, _) = obs_nll_subject_score_iov(
-                                model,
-                                subject,
-                                th,
-                                sg_i,
-                                eta,
-                                kaps,
-                                &theta_packs_log_mask,
-                                &lower,
-                                &upper,
-                                n_theta,
-                                n_sigma,
-                                scratch,
-                                false,
-                                memo_slot(draw, i),
-                            );
-                            // A held σ override carries no information about the
-                            // free base σ — zero that subject's contribution.
-                            for &(sidx, _) in over {
-                                if n_theta + sidx < grad.len() {
-                                    grad[n_theta + sidx] = 0.0;
-                                }
-                            }
-                            (nll, grad)
-                        }
-                    },
-                );
-                fold_nll_grad(per_subj, n)
-            } else {
-                let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
-                    population.subjects.len().min(etas.len()),
-                    EventPkParams::default,
-                    |scratch, i| {
-                        let (subject, eta) = (&population.subjects[i], &etas[i]);
+    let one_draw_grad = |th: &[f64],
+                         sg: &[f64],
+                         etas: &[Vec<f64>],
+                         draw: usize,
+                         ev: Option<EvalMemo<'_>>|
+     -> (f64, Vec<f64>) {
+        if let Some(kappas) = kappas_opt {
+            let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
+                population.subjects.len().min(etas.len()).min(kappas.len()),
+                EventPkParams::default,
+                |scratch, i| {
+                    let ((subject, eta), kaps) = ((&population.subjects[i], &etas[i]), &kappas[i]);
+                    {
                         let cls = mix_mstep.map(|m| m.classes[i]);
                         let _g = cls
                             .map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
@@ -2697,12 +2707,13 @@ fn theta_sigma_mstep_light(
                         };
                         let sub_sg = class_sigma_subst(sg, over);
                         let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
-                        let (nll, mut grad, _) = obs_nll_subject_score(
+                        let (nll, mut grad, _) = obs_nll_subject_score_iov(
                             model,
                             subject,
                             th,
                             sg_i,
                             eta,
+                            kaps,
                             &theta_packs_log_mask,
                             &lower,
                             &upper,
@@ -2710,32 +2721,75 @@ fn theta_sigma_mstep_light(
                             n_sigma,
                             scratch,
                             false,
-                            memo_slot(draw, i),
+                            ev.map(|e| e.slot(i, draw)),
                         );
+                        // A held σ override carries no information about the
+                        // free base σ — zero that subject's contribution.
                         for &(sidx, _) in over {
                             if n_theta + sidx < grad.len() {
                                 grad[n_theta + sidx] = 0.0;
                             }
                         }
                         (nll, grad)
-                    },
-                );
-                fold_nll_grad(per_subj, n)
-            }
-        };
-    let one_draw_value = |th: &[f64], sg: &[f64], etas: &[Vec<f64>], draw: usize| -> f64 {
-        let memo = pred_memo.as_ref().map(|m| (m, draw * n_subj_memo));
-        match (mix_mstep, kappas_opt) {
-            (Some(mx), Some(kappas)) => {
-                obs_nll_sum_iov_mix(model, population, th, sg, etas, kappas, mx)
-            }
-            (Some(mx), None) => obs_nll_sum_mix(model, population, th, sg, etas, mx, schedules),
-            (None, Some(kappas)) => {
-                obs_nll_sum_iov_memo(model, population, th, sg, etas, kappas, schedules, memo)
-            }
-            (None, None) => obs_nll_sum_memo(model, population, th, sg, etas, schedules, memo),
+                    }
+                },
+            );
+            fold_nll_grad(per_subj, n)
+        } else {
+            let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
+                population.subjects.len().min(etas.len()),
+                EventPkParams::default,
+                |scratch, i| {
+                    let (subject, eta) = (&population.subjects[i], &etas[i]);
+                    let cls = mix_mstep.map(|m| m.classes[i]);
+                    let _g =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let over: &[(usize, f64)] = match (mix_mstep, cls) {
+                        (Some(m), Some(c)) => &m.class_sigma_over[c],
+                        _ => &[],
+                    };
+                    let sub_sg = class_sigma_subst(sg, over);
+                    let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
+                    let (nll, mut grad, _) = obs_nll_subject_score(
+                        model,
+                        subject,
+                        th,
+                        sg_i,
+                        eta,
+                        &theta_packs_log_mask,
+                        &lower,
+                        &upper,
+                        n_theta,
+                        n_sigma,
+                        scratch,
+                        false,
+                        ev.map(|e| e.slot(i, draw)),
+                    );
+                    for &(sidx, _) in over {
+                        if n_theta + sidx < grad.len() {
+                            grad[n_theta + sidx] = 0.0;
+                        }
+                    }
+                    (nll, grad)
+                },
+            );
+            fold_nll_grad(per_subj, n)
         }
     };
+    let one_draw_value =
+        |th: &[f64], sg: &[f64], etas: &[Vec<f64>], draw: usize, ev: Option<EvalMemo<'_>>| -> f64 {
+            let memo = ev.map(|e| (e, draw));
+            match (mix_mstep, kappas_opt) {
+                (Some(mx), Some(kappas)) => {
+                    obs_nll_sum_iov_mix(model, population, th, sg, etas, kappas, mx)
+                }
+                (Some(mx), None) => obs_nll_sum_mix(model, population, th, sg, etas, mx, schedules),
+                (None, Some(kappas)) => {
+                    obs_nll_sum_iov_memo(model, population, th, sg, etas, kappas, schedules, memo)
+                }
+                (None, None) => obs_nll_sum_memo(model, population, th, sg, etas, schedules, memo),
+            }
+        };
 
     let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
@@ -2744,11 +2798,12 @@ fn theta_sigma_mstep_light(
         // maximiser of an average, rather than the average of maximisers the
         // caller's Robbins-Monro blend would form (#1458).
         let k_draws = 1 + extra_eta_draws.len();
+        let ev = begin(&th);
         if let Some(g) = grad {
-            let (mut val, mut grad_vec) = one_draw_grad(&th, &sg, etas, 0);
+            let (mut val, mut grad_vec) = one_draw_grad(&th, &sg, etas, 0, ev);
             if k_draws > 1 {
                 for (k, d) in extra_eta_draws.iter().enumerate() {
-                    let (v2, g2) = one_draw_grad(&th, &sg, d, k + 1);
+                    let (v2, g2) = one_draw_grad(&th, &sg, d, k + 1, ev);
                     val += v2;
                     for (a, b) in grad_vec.iter_mut().zip(g2.iter()) {
                         *a += b;
@@ -2760,27 +2815,16 @@ fn theta_sigma_mstep_light(
                     *a /= kf;
                 }
             }
-            for (gi, &gv) in g.iter_mut().zip(grad_vec.iter()) {
-                *gi = if gv.is_finite() { gv } else { 0.0 };
-            }
-            if val.is_finite() {
-                val
-            } else {
-                SUBJECT_SENTINEL_NLL
-            }
+            nlopt_value_and_grad((val, grad_vec), g)
         } else {
-            let mut val = one_draw_value(&th, &sg, etas, 0);
+            let mut val = one_draw_value(&th, &sg, etas, 0, ev);
             if k_draws > 1 {
                 for (k, d) in extra_eta_draws.iter().enumerate() {
-                    val += one_draw_value(&th, &sg, d, k + 1);
+                    val += one_draw_value(&th, &sg, d, k + 1, ev);
                 }
                 val /= k_draws as f64;
             }
-            if val.is_finite() {
-                val
-            } else {
-                SUBJECT_SENTINEL_NLL
-            }
+            finite_value(val)
         }
     };
 
@@ -2789,7 +2833,8 @@ fn theta_sigma_mstep_light(
     let one_draw_fused = |th: &[f64],
                           sg: &[f64],
                           etas: &[Vec<f64>],
-                          draw: usize|
+                          draw: usize,
+                          ev: Option<EvalMemo<'_>>|
      -> Option<crate::estimation::mstep_newton::ValueGradInfo> {
         let m = population.subjects.len().min(etas.len());
         let m = kappas_opt.map_or(m, |k| m.min(k.len()));
@@ -2810,7 +2855,7 @@ fn theta_sigma_mstep_light(
                     n_sigma,
                     scratch,
                     true,
-                    memo_slot(draw, i),
+                    ev.map(|e| e.slot(i, draw)),
                 ),
                 None => obs_nll_subject_score(
                     model,
@@ -2825,22 +2870,25 @@ fn theta_sigma_mstep_light(
                     n_sigma,
                     scratch,
                     true,
-                    memo_slot(draw, i),
+                    ev.map(|e| e.slot(i, draw)),
                 ),
             }
         });
-        crate::estimation::mstep_newton::fold_value_grad_info(per_subj, n)
+        crate::estimation::mstep_newton::fold_value_grad_info(per_subj, n, true)
     };
     // `mstep_optimizer = newton`: Fisher scoring on that fused pass, averaged over the same
-    // K draws as the BOBYQA objective. Declined (mixture; a subject outside the information's
-    // closed form) it falls through to the derivative-free solve below.
+    // K draws as the BOBYQA objective. The fit's scope decision (`newton_scope_gap`) has
+    // already kept it off every model without the closed-form information; a subject that
+    // still declines at run time, or a solve that stalls, falls through to the derivative-free
+    // solve below, from the point it reached.
     let fused_mean = |xv: &[f64]| -> Option<crate::estimation::mstep_newton::ValueGradInfo> {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        let mut acc = one_draw_fused(&th, &sg, etas, 0)?;
+        let ev = begin(&th);
+        let mut acc = one_draw_fused(&th, &sg, etas, 0, ev)?;
         let k_draws = 1 + extra_eta_draws.len();
         for (k, d) in extra_eta_draws.iter().enumerate() {
-            let o = one_draw_fused(&th, &sg, d, k + 1)?;
+            let o = one_draw_fused(&th, &sg, d, k + 1, ev)?;
             acc.val += o.val;
             for (a, b) in acc.grad.iter_mut().zip(&o.grad) {
                 *a += b;
@@ -2855,19 +2903,17 @@ fn theta_sigma_mstep_light(
             acc.grad.iter_mut().for_each(|a| *a /= kf);
             acc.info.iter_mut().for_each(|a| *a /= kf);
         }
-        for g in acc.grad.iter_mut() {
-            if !g.is_finite() {
-                *g = 0.0;
-            }
-        }
-        if !acc.val.is_finite() {
-            acc.val = SUBJECT_SENTINEL_NLL;
-        }
+        finite_grad(&mut acc.grad);
+        acc.val = finite_value(acc.val);
         Some(acc)
     };
-    if mstep_optimizer == MstepOptimizer::Newton && mix_mstep.is_none() {
+    if mstep_optimizer == MstepOptimizer::Newton {
+        debug_assert!(
+            mix_mstep.is_none(),
+            "a mixture is outside `newton_scope_gap`: the fit resolves it to bobyqa"
+        );
         let mut xn = x.clone();
-        let solved = crate::estimation::mstep_newton::fisher_scoring(
+        let outcome = crate::estimation::mstep_newton::fisher_scoring(
             &mut xn,
             &lower,
             &upper,
@@ -2876,10 +2922,15 @@ fn theta_sigma_mstep_light(
             |xv| obj(xv, None, &mut ()),
             fused_mean,
         );
-        if solved {
-            #[cfg(test)]
-            note_mstep_route(2);
-            return (xn[..n_theta].to_vec(), xn[n_theta..].to_vec());
+        match outcome {
+            NewtonOutcome::Converged => {
+                #[cfg(test)]
+                note_mstep_route(2);
+                return (xn[..n_theta].to_vec(), xn[n_theta..].to_vec());
+            }
+            // BOBYQA continues from where Newton stopped (its start when it took no step).
+            NewtonOutcome::Stalled => x.copy_from_slice(&xn),
+            NewtonOutcome::Declined => {}
         }
     }
     // Compute per-element scale factors from the initial point.
@@ -2912,28 +2963,27 @@ fn theta_sigma_mstep_light(
 
     // See `MSTEP_NLOPT_ALGORITHM` for rationale (BOBYQA vs SLSQP).
     let algorithm = match mstep_optimizer {
-        MstepOptimizer::Bobyqa => MSTEP_NLOPT_ALGORITHM,
         MstepOptimizer::Lbfgs => nlopt::Algorithm::Lbfgs,
-        // Newton keeps BOBYQA for what it declines (a mixture, a subject with no information).
-        MstepOptimizer::Newton => MSTEP_NLOPT_ALGORITHM,
+        // Newton keeps BOBYQA for what it declines or stalls on.
+        _ => MSTEP_NLOPT_ALGORITHM,
     };
     let mut opt = nlopt::Nlopt::new(algorithm, n, obj_s, nlopt::Target::Minimize, ());
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
     opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
-    if mix_mstep.is_some() {
-        // The mixture arm keeps the pre-#1415 configuration — NLopt's default
-        // first design and the 1e-4 tolerance. On the NONMEM anchor it no
-        // longer matters (the switched θ are closed-form since #2458); it is
-        // kept for the mixtures without an orbit move, where no configuration
-        // is anchored. See `MSTEP_MIXTURE_FTOL_REL`.
-        opt.set_ftol_rel(MSTEP_MIXTURE_FTOL_REL).unwrap();
-    } else if mstep_optimizer == MstepOptimizer::Lbfgs {
-        // A gradient method has no first design to localise: it starts from the
-        // current point along the steepest-descent direction.
-        opt.set_ftol_rel(MSTEP_FTOL_REL).unwrap();
+    // The mixture arm keeps the pre-#1415 configuration — NLopt's default first design and the
+    // 1e-4 tolerance. On the NONMEM anchor it no longer matters (the switched θ are
+    // closed-form since #2458); it is kept for the mixtures without an orbit move, where no
+    // configuration is anchored. See `MSTEP_MIXTURE_FTOL_REL`.
+    opt.set_ftol_rel(if mix_mstep.is_some() {
+        MSTEP_MIXTURE_FTOL_REL
     } else {
-        opt.set_ftol_rel(MSTEP_FTOL_REL).unwrap();
+        MSTEP_FTOL_REL
+    })
+    .unwrap();
+    // A gradient method has no first design to localise: it starts from the current point
+    // along the steepest-descent direction.
+    if mix_mstep.is_none() && mstep_optimizer != MstepOptimizer::Lbfgs {
         // A warm-started local solve needs a *local* first design (#1415).
         // Every coordinate gets the same trust radius in packed units, undone
         // through the optional magnitude scaling so the radius is the same
@@ -3010,9 +3060,9 @@ pub(crate) fn obs_nll_sum(
     )
 }
 
-/// [`obs_nll_sum`] with the predictions served from the memo's slots `base + i` where they are
-/// held for this `θ` (the M-step solve's evaluations at one θ). The per-subject scoring is the
-/// same `obs_nll_subject_from_preds` call on the same predictions either way.
+/// [`obs_nll_sum`] with the predictions served from the evaluation's memo, subject `i`'s sample
+/// `draw` (the M-step solve's evaluations at one θ). The per-subject scoring is the same
+/// `obs_nll_subject_from_preds` call on the same predictions either way.
 pub(crate) fn obs_nll_sum_memo(
     model: &CompiledModel,
     population: &Population,
@@ -3020,7 +3070,7 @@ pub(crate) fn obs_nll_sum_memo(
     sigma_values: &[f64],
     etas: &[Vec<f64>],
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
-    memo: Option<(&PredMemo, usize)>,
+    memo: Option<(EvalMemo<'_>, usize)>,
 ) -> f64 {
     // Collect in subject order and sum serially so the objective does not
     // depend on the rayon worker count (f64 addition is non-associative and a
@@ -3042,19 +3092,12 @@ pub(crate) fn obs_nll_sum_memo(
                     scratch,
                     schedule,
                 ),
-                Some((m, base)) => {
-                    let preds = crate::estimation::pred_memo::memoized(
-                        Some(MemoSlot {
-                            memo: m,
-                            idx: base + i,
-                        }),
-                        theta,
-                        || {
-                            crate::pk::compute_predictions_with_tv_into_with_schedule(
-                                model, subject, theta, &etas[i], scratch, schedule,
-                            )
-                        },
-                    );
+                Some((ev, draw)) => {
+                    let preds = memoized(Some(ev.slot(i, draw)), || {
+                        crate::pk::compute_predictions_with_tv_into_with_schedule(
+                            model, subject, theta, &etas[i], scratch, schedule,
+                        )
+                    });
                     crate::stats::likelihood::obs_nll_subject_from_preds(
                         model,
                         subject,
@@ -3095,7 +3138,7 @@ fn obs_nll_sum_iov(
     )
 }
 
-/// [`obs_nll_sum_iov`] with the memo's slots `base + i`, as [`obs_nll_sum_memo`].
+/// [`obs_nll_sum_iov`] with the evaluation's memo, as [`obs_nll_sum_memo`].
 #[allow(clippy::too_many_arguments)]
 fn obs_nll_sum_iov_memo(
     model: &CompiledModel,
@@ -3105,7 +3148,7 @@ fn obs_nll_sum_iov_memo(
     etas: &[Vec<f64>],
     kappas: &[Vec<Vec<f64>>],
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
-    memo: Option<(&PredMemo, usize)>,
+    memo: Option<(EvalMemo<'_>, usize)>,
 ) -> f64 {
     // Deterministic reduction (collect in subject order, fold serially): a
     // parallel `.sum()` would make the objective depend on the rayon worker
@@ -3124,10 +3167,7 @@ fn obs_nll_sum_iov_memo(
                 &kappas[i],
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
-                memo.map(|(m, base)| MemoSlot {
-                    memo: m,
-                    idx: base + i,
-                }),
+                memo.map(|(ev, draw)| ev.slot(i, draw)),
             )
         },
     );
@@ -5528,12 +5568,16 @@ pub fn run_saem(
         numerical_mstep_scope_gap,
     );
     warnings.extend(mstep_option_warnings);
-    warnings.extend(mstep_optimizer_advisory(
+    // The optimizer the numerical M-steps run, decided once (`newton_scope_gap`): what the
+    // warning says is what every solve below is handed.
+    let (mstep_optimizer, mstep_optimizer_warning) = resolve_mstep_optimizer(
         model,
         options.mstep_optimizer,
         use_score_sa,
+        saem_mix.is_some(),
         "SAEM",
-    ));
+    );
+    warnings.extend(mstep_optimizer_warning);
     if let Some(w) = imh_noeta_theta_warning(imh_mode, numerically_estimated_theta, use_score_sa) {
         warnings.push(w);
     }
@@ -6737,7 +6781,7 @@ pub fn run_saem(
                             None,
                             &schedules,
                             &extra_eta_draws,
-                            options.mstep_optimizer,
+                            mstep_optimizer,
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                         damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
@@ -6840,7 +6884,7 @@ pub fn run_saem(
                     // A mixture is outside the K-draw scope gate, so this is
                     // always the historical single-draw objective.
                     &[],
-                    options.mstep_optimizer,
+                    mstep_optimizer,
                 );
                 damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                 damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
@@ -6894,7 +6938,7 @@ pub fn run_saem(
                             }),
                             &schedules,
                             &extra_eta_draws,
-                            options.mstep_optimizer,
+                            mstep_optimizer,
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                         damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);

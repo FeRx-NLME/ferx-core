@@ -3405,42 +3405,35 @@ fn memoised_predictions_change_no_score_and_are_served_for_an_unchanged_theta() 
                 )
             }
         };
-        let memo = PredMemo::new(1);
-        let slot = || {
-            Some(MemoSlot {
-                memo: &memo,
-                idx: 0,
-            })
-        };
+        // θ free under Newton: the memo follows θ, one evaluation per distinct θ.
+        let memo = PredMemo::for_solve([1usize], true, true).unwrap();
+        let slot = |theta: &[f64]| memo.begin(theta).map(|ev| ev.slot(0, 0));
         let th = [5.0f64, 50.0];
         // σ-only sequence: the first call fills the slot, the rest are served from it.
         for sigma in [0.1, 0.17, 0.3] {
             let plain = score(&th, sigma, 0.1, None);
-            let with = score(&th, sigma, 0.1, slot());
+            let with = score(&th, sigma, 0.1, slot(&th));
             assert_eq!(plain, with, "iov={iov} σ={sigma}");
             assert!(plain.2.is_some(), "iov={iov}: information in scope");
         }
         // Stale on purpose: the slot holds η = 0.1's predictions for this θ, so η = -0.3 through
         // it scores η = 0.1's predictions — and the memo-free η = -0.3 is a different number.
         let first = score(&th, 0.1, 0.1, None);
-        let stale = score(&th, 0.1, -0.3, slot());
+        let stale = score(&th, 0.1, -0.3, slot(&th));
         let fresh = score(&th, 0.1, -0.3, None);
         assert_eq!(stale.0, first.0, "iov={iov}: served from the slot");
         assert!(fresh.0 != first.0, "iov={iov}: the two η must differ");
         // A different θ recomputes (and now the slot holds that one).
         let th2 = [5.5f64, 48.0];
         assert_eq!(
-            score(&th2, 0.1, -0.3, slot()),
+            score(&th2, 0.1, -0.3, slot(&th2)),
             score(&th2, 0.1, -0.3, None),
             "iov={iov}"
         );
         // One slot shared by the value path and the score path.
         if iov {
-            let memo2 = PredMemo::new(1);
-            let s2 = Some(MemoSlot {
-                memo: &memo2,
-                idx: 0,
-            });
+            let memo2 = PredMemo::for_solve([1usize], true, true).unwrap();
+            let s2 = memo2.begin(&th).map(|ev| ev.slot(0, 0));
             let mut scratch2 = EventPkParams::default();
             let plain_v = obs_nll_subject_into_iov(
                 &model,
@@ -3467,4 +3460,102 @@ fn memoised_predictions_change_no_score_and_are_served_for_an_unchanged_theta() 
             assert_eq!(via, score(&th, 0.2, 0.1, None));
         }
     }
+}
+
+/// The Newton M-step's information is the adjoint's or none: `obs_nll_subject_score` (the
+/// M-step solves' entry) withholds it from a subject the adjoint declined — whose per-θ rows
+/// would be forward differences, a curvature the exact-curvature solve must not step on —
+/// while `obs_nll_subject_grad_fisher` (`score_sa`'s) still takes the differenced rows; the
+/// gradient is the same either way. Both sides on one declined subject, and the in-scope
+/// control, where the two entries agree to the bit.
+#[test]
+fn the_solve_entry_withholds_a_differenced_information_where_score_sa_takes_it() {
+    use crate::types::DoseEvent;
+    let src = |ode: bool| {
+        let structural = if ode {
+            "ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V"
+        } else {
+            "pk one_cpt_iv(cl=CL, v=V)"
+        };
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+             [structural_model]\n  {structural}\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        )
+    };
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        dose_occasions: vec![1],
+        occasions: vec![1; 3],
+        obs_cmts: vec![1; 3],
+        cens: vec![0; 3],
+        obs_times: vec![1.0, 3.0, 6.0],
+        observations: vec![1.7, 1.2, 0.8],
+        ..Default::default()
+    };
+    let (n_theta, n_sigma) = (2usize, 1usize);
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let both = |model: &CompiledModel| {
+        let th = [5.0f64, 50.0];
+        let mut scratch = EventPkParams::default();
+        let solve = obs_nll_subject_score(
+            model,
+            &subject,
+            &th,
+            &[0.1],
+            &[0.1],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+            true,
+            None,
+        );
+        let score_sa = obs_nll_subject_grad_fisher(
+            model,
+            &subject,
+            &th,
+            &[0.1],
+            &[0.1],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        (solve, score_sa)
+    };
+    // In scope: the exact rows serve both entries, bit for bit.
+    let model = crate::parser::model_parser::parse_model_string(&src(false)).unwrap();
+    assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(
+        &model
+    ));
+    let (solve, score_sa) = both(&model);
+    assert!(solve.2.is_some());
+    assert_eq!(solve, score_sa);
+    // Declined (an ODE readout without its compiled program): the gradient is the same
+    // forward difference in both; only `score_sa` has an information, and the solve has none.
+    let mut model = crate::parser::model_parser::parse_model_string(&src(true)).unwrap();
+    assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(
+        &model
+    ));
+    model.ode_spec.as_mut().unwrap().readout_program = None;
+    assert!(!crate::sens::ode_provider::adjoint::recorder_in_scope(
+        &model
+    ));
+    let (solve, score_sa) = both(&model);
+    assert!(
+        solve.2.is_none(),
+        "the solve entry must not carry a differenced information"
+    );
+    assert!(score_sa.2.is_some(), "score_sa takes the differenced rows");
+    assert_eq!((solve.0, &solve.1), (score_sa.0, &score_sa.1));
 }

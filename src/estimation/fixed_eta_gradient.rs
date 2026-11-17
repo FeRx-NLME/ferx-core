@@ -163,7 +163,7 @@ pub(crate) fn obs_nll_subject_into_iov_memo(
     // Continuous per-occasion-aware prediction (issue #104) — same model the
     // E-step (`individual_nll_iov`) and FOCEI use, so E and M steps stay
     // consistent.
-    let preds = memoized(memo, theta, || {
+    let preds = memoized(memo, || {
         crate::pk::predict_iov_with_scratch_and_schedule(
             model, subject, theta, eta, kappas, pk_scratch, schedule,
         )
@@ -604,7 +604,7 @@ fn obs_nll_subject_grad_iov_impl(
 
     // Non-M3 path: continuous per-occasion-aware base predictions (issue #104).
     let n_obs = subject.observations.len();
-    let preds = memoized(memo, theta, || {
+    let preds = memoized(memo, || {
         crate::pk::predict_iov(model, subject, theta, eta, kappas)
     });
     // FREM covariate rows use EPSCOV, not the PK residual error (see
@@ -869,6 +869,7 @@ pub(crate) fn obs_nll_subject_grad(
         n_sigma,
         pk_scratch,
         false,
+        false,
         None,
     );
     (nll, grad)
@@ -906,6 +907,7 @@ pub(crate) fn obs_nll_subject_score(
         n_sigma,
         pk_scratch,
         want_fisher,
+        true,
         memo,
     )
 }
@@ -970,6 +972,7 @@ pub(crate) fn obs_nll_subject_grad_fisher(
         n_sigma,
         pk_scratch,
         true,
+        false,
         None,
     )
 }
@@ -1072,7 +1075,10 @@ fn assemble_fisher(
 /// The one body behind [`obs_nll_subject_grad`] and
 /// [`obs_nll_subject_grad_fisher`]. `want_fisher` only *adds* the information
 /// block; with it `false` the returned `(nll, grad)` is bit-identical to what
-/// this function has always returned.
+/// this function has always returned. `exact_info_only` withholds the information (the
+/// gradient is unchanged) from a subject the adjoint declined, whose per-observation
+/// `∂f/∂θ` rows would be forward differences: the M-step Newton solve is an exact-curvature
+/// method and takes none, while `score_sa`'s averaged information accepts them.
 #[allow(clippy::too_many_arguments)]
 fn obs_nll_subject_grad_impl(
     model: &CompiledModel,
@@ -1087,6 +1093,7 @@ fn obs_nll_subject_grad_impl(
     n_sigma: usize,
     pk_scratch: &mut EventPkParams,
     want_fisher: bool,
+    exact_info_only: bool,
     memo: Option<MemoSlot<'_>>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
@@ -1102,7 +1109,7 @@ fn obs_nll_subject_grad_impl(
         // obs_nll_subject_into for all parameters. Predictions are σ-independent,
         // so solve the model once and reuse the base predictions across every σ
         // perturbation — only θ perturbations need a fresh solve (#557).
-        let preds_base = memoized(memo, theta, || {
+        let preds_base = memoized(memo, || {
             crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch)
         });
         let nll_base = obs_nll_subject_from_preds(
@@ -1205,7 +1212,7 @@ fn obs_nll_subject_grad_impl(
     }
 
     // Non-M3 path.
-    let preds_base = memoized(memo, theta, || {
+    let preds_base = memoized(memo, || {
         crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch)
     });
 
@@ -1366,6 +1373,9 @@ fn obs_nll_subject_grad_impl(
             &mut grad[..n_theta],
             fisher_ok.then(|| &mut df_packed[..n_theta]),
         );
+    // A declined subject's rows would be differences: no information for an exact-only caller
+    // (the per-θ loop below then takes the plain gradient path, as without `want_fisher`).
+    let fisher_ok = fisher_ok && (exact || !exact_info_only);
 
     for i in 0..n_theta {
         if exact || lower[i] == upper[i] || nn_plan.as_ref().is_some_and(|p| p.covers(i)) {

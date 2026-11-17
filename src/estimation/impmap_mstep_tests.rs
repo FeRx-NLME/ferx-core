@@ -776,7 +776,7 @@ fn shifted_start(model: &CompiledModel) -> (Vec<f64>, Vec<bool>, Vec<f64>, Vec<f
     (x, mask, lower, upper, p.theta.len(), p.sigma.values.len())
 }
 
-/// Worst `|g - fd| / max(1, |g|)` of [`weighted_mstep_value_grad`] against central differences
+/// Worst `|g - fd| / max(1, |g|)` of [`weighted_mstep_score`] against central differences
 /// of [`weighted_mstep_objective`] over the packed vector, with the value checked on the way.
 fn weighted_gradient_gap(model: &CompiledModel, pop: &Population, scale: f64, h: f64) -> f64 {
     let draws = sampled_draws(model, pop, scale);
@@ -793,9 +793,11 @@ fn weighted_gradient_gap(model: &CompiledModel, pop: &Population, scale: f64, h:
         weighted_mstep_objective(model, pop, &draws, &schedules, &th, &sg)
     };
     let (th, sg) = natural(&x);
-    let (v, g) = weighted_mstep_value_grad(
-        model, pop, &draws, &th, &sg, &mask, &lower, &upper, n_theta, n_sigma, None,
-    );
+    let score = weighted_mstep_score(
+        model, pop, &draws, &th, &sg, &mask, &lower, &upper, n_theta, n_sigma, false, None,
+    )
+    .expect("a score without the information always exists");
+    let (v, g) = (score.val, score.grad);
     let v0 = value(&x);
     assert!(v0.is_finite() && v0 < 1e19, "objective {v0}");
     assert!(
@@ -974,40 +976,277 @@ fn newton_reaches_the_bobyqa_optimum_of_the_weighted_objective() {
     assert_eq!(w.moved(&got), 14);
 }
 
-/// The weighted objective with the solve's prediction memo is the memo-free objective bit for
-/// bit across a σ-only sequence and a θ move (the memo is replaced, not served stale).
+/// The weighted objective and score with the solve's prediction memo are the memo-free ones bit
+/// for bit across a σ-only sequence and a θ move, in both modes: a tracking memo (θ free,
+/// Newton) replaces its predictions when θ moves and serves the same θ again,
+/// and a pinned-θ memo declines a θ it does not hold.
 #[test]
 fn the_memoised_weighted_objective_is_the_plain_one_bit_for_bit() {
     let w = WideSolve::new();
-    let memo = SolveMemo::new(&w.draws);
-    let eval = |theta: &[f64], log_sigma: &[f64], memoised: bool| {
-        let sg: Vec<f64> = log_sigma.iter().map(|s| s.exp()).collect();
+    let sizes = || w.draws.iter().map(|d| d.etas.len());
+    let tracking = PredMemo::for_solve(sizes(), true, true).unwrap();
+    let eval = |memo: &PredMemo, draws: &[SubjectDraws], theta: &[f64], ls: &[f64], on: bool| {
+        let sg: Vec<f64> = ls.iter().map(|s| s.exp()).collect();
         weighted_mstep_objective_memo(
             &w.model,
             &w.pop,
-            &w.draws,
+            draws,
             &w.schedules,
             theta,
             &sg,
-            memoised.then_some(&memo),
+            on.then(|| memo.begin(theta)).flatten(),
         )
     };
     for bump in [0.0, 0.2, -0.3] {
         let ls: Vec<f64> = w.log_sigma.iter().map(|s| s + bump).collect();
         assert_eq!(
-            eval(&w.theta, &ls, false),
-            eval(&w.theta, &ls, true),
+            eval(&tracking, &w.draws, &w.theta, &ls, false),
+            eval(&tracking, &w.draws, &w.theta, &ls, true),
             "σ bump {bump}"
         );
     }
     let moved: Vec<f64> = w.theta.iter().map(|t| t + 0.05).collect();
     assert_eq!(
-        eval(&moved, &w.log_sigma, false),
-        eval(&moved, &w.log_sigma, true)
+        eval(&tracking, &w.draws, &moved, &w.log_sigma, false),
+        eval(&tracking, &w.draws, &moved, &w.log_sigma, true)
     );
-    // Back at the first θ: the slot was replaced by the moved one, so this recomputes.
+    // Back at the first θ: the memo was replaced by the moved one, so this recomputes.
     assert_eq!(
-        eval(&w.theta, &w.log_sigma, false),
-        eval(&w.theta, &w.log_sigma, true)
+        eval(&tracking, &w.draws, &w.theta, &w.log_sigma, false),
+        eval(&tracking, &w.draws, &w.theta, &w.log_sigma, true)
     );
+    // The score and its information through a memo are the memo-free ones, at one θ twice
+    // (the value pass, then the fused pass at the accepted point).
+    let (x, mask, lower, upper, n_theta, n_sigma) = shifted_start(&w.model);
+    let th: Vec<f64> = (0..n_theta)
+        .map(|i| if mask[i] { x[i].exp() } else { x[i] })
+        .collect();
+    let sg: Vec<f64> = x[n_theta..].iter().map(|v| v.exp()).collect();
+    let score = |want_fisher: bool, memo: Option<EvalMemo<'_>>| {
+        weighted_mstep_score(
+            &w.model,
+            &w.pop,
+            &w.draws,
+            &th,
+            &sg,
+            &mask,
+            &lower,
+            &upper,
+            n_theta,
+            n_sigma,
+            want_fisher,
+            memo,
+        )
+        .expect("in scope")
+    };
+    let fresh = PredMemo::for_solve(sizes(), true, true).unwrap();
+    let value_pass = weighted_mstep_objective_memo(
+        &w.model,
+        &w.pop,
+        &w.draws,
+        &w.schedules,
+        &th,
+        &sg,
+        fresh.begin(&th),
+    );
+    let (plain, memoised) = (score(true, None), score(true, fresh.begin(&th)));
+    assert_eq!(
+        value_pass, plain.val,
+        "the value pass is the fused pass's value"
+    );
+    assert_eq!(
+        (plain.val, &plain.grad, &plain.info),
+        (memoised.val, &memoised.grad, &memoised.info)
+    );
+    assert_eq!(plain.info.len(), (n_theta + n_sigma).pow(2));
+    // A pinned-θ memo holds the first θ and declines another.
+    let fixed = PredMemo::for_solve(sizes(), false, false).unwrap();
+    assert!(fixed.begin(&th).is_some() && fixed.begin(&moved).is_none());
+}
+
+/// `fisher_scoring` is handed the solve's own state and reports one of three outcomes, and the
+/// weighted solve acts on each: `Converged` is the answer (route `newton`); a start without
+/// information (`Declined`) and a solve that loses it after one accepted step (`Stalled`) both
+/// continue with BOBYQA — from the start, and from the point Newton reached — and the
+/// continuation is exactly BOBYQA's solve from there, not the start-point `x` Newton left.
+#[test]
+fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_stopped() {
+    use crate::estimation::mstep_newton::FUSED_PASSES_ALLOWED;
+    use crate::estimation::saem::MSTEP_ROUTE;
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let w = WideSolve::new();
+    let n_sigma = w.log_sigma.len();
+    let n_theta = w.theta.len();
+    let n = n_theta + n_sigma;
+    let x0: Vec<f64> = w.theta.iter().chain(&w.log_sigma).copied().collect();
+    let lower: Vec<f64> = w
+        .theta_lower
+        .iter()
+        .copied()
+        .chain(vec![-8.0; n_sigma])
+        .collect();
+    let upper: Vec<f64> = w
+        .theta_upper
+        .iter()
+        .copied()
+        .chain(vec![5.0; n_sigma])
+        .collect();
+    let obj = |xv: &[f64], _g: Option<&mut [f64]>, _: &mut ()| {
+        w.objective(&xv[..n_theta], &xv[n_theta..])
+    };
+    let mask = vec![false; n_theta];
+    let fused = |xv: &[f64]| {
+        let sg: Vec<f64> = xv[n_theta..].iter().map(|v| v.exp()).collect();
+        weighted_mstep_score(
+            &w.model,
+            &w.pop,
+            &w.draws,
+            &xv[..n_theta],
+            &sg,
+            &mask,
+            &lower,
+            &upper,
+            n_theta,
+            n_sigma,
+            true,
+            None,
+        )
+    };
+    let solve = |from: &[f64], optimizer, passes: Option<u32>| {
+        MSTEP_ROUTE.with(|c| c.set([0; 3]));
+        FUSED_PASSES_ALLOWED.set(passes);
+        let f: &dyn Fn(&[f64]) -> Option<ValueGradInfo> = &fused;
+        let step = solve_weighted_mstep(
+            obj,
+            from.to_vec(),
+            &lower,
+            &upper,
+            n_theta,
+            4,
+            optimizer,
+            (optimizer == Newton).then_some(f),
+        );
+        FUSED_PASSES_ALLOWED.set(None);
+        (MSTEP_ROUTE.with(|c| c.get()), step)
+    };
+    let packed = |s: &WeightedMstep| -> Vec<f64> {
+        s.log_theta.iter().chain(&s.log_sigma).copied().collect()
+    };
+    // Converged: Newton's own answer, and not BOBYQA's.
+    let (route, newton) = solve(&x0, Newton, None);
+    assert_eq!(route, [0, 0, 1]);
+    // Declined at the start (no fused pass): BOBYQA from `x0`, exactly.
+    let (route, declined) = solve(&x0, Newton, Some(0));
+    let (_, bobyqa0) = solve(&x0, Bobyqa, None);
+    assert_eq!(route, [1, 0, 0]);
+    assert_eq!(packed(&declined), packed(&bobyqa0));
+    assert!(
+        packed(&declined) != packed(&newton),
+        "fixture: the routes must differ"
+    );
+    // Stalled after one accepted step: BOBYQA from the point Newton reached.
+    let mut x1 = x0.clone();
+    FUSED_PASSES_ALLOWED.set(Some(1));
+    let outcome = crate::estimation::mstep_newton::fisher_scoring(
+        &mut x1,
+        &lower,
+        &upper,
+        4 * (n as u32 + 1),
+        MSTEP_FTOL_REL,
+        |xv| obj(xv, None, &mut ()),
+        &fused,
+    );
+    FUSED_PASSES_ALLOWED.set(None);
+    assert_eq!(outcome, NewtonOutcome::Stalled);
+    assert!(x1 != x0, "Newton took a step before it stalled");
+    let (route, stalled) = solve(&x0, Newton, Some(1));
+    let (_, bobyqa1) = solve(&x1, Bobyqa, None);
+    assert_eq!(route, [1, 0, 0]);
+    assert_eq!(
+        packed(&stalled),
+        packed(&bobyqa1),
+        "BOBYQA continued from Newton's point"
+    );
+    assert!(
+        packed(&stalled) != packed(&bobyqa0),
+        "and not from the start"
+    );
+}
+
+/// The test hook counts a weighted M-step once, however many branches of the solve read it:
+/// `FAIL_MSTEP_SOLVES_AFTER = 1` lets the first solve work and fails the second, on `bobyqa`
+/// and on a `newton` request alike (which a failed solve must not run).
+#[test]
+fn a_solve_consumes_one_forced_failure_count() {
+    use crate::estimation::saem::MSTEP_ROUTE;
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let w = WideSolve::new();
+    for optimizer in [Bobyqa, Newton] {
+        MSTEP_ROUTE.with(|c| c.set([0; 3]));
+        FAIL_MSTEP_SOLVES_AFTER.set(Some(1));
+        let first = w.solve_with(4, optimizer);
+        let second = w.solve_with(4, optimizer);
+        FAIL_MSTEP_SOLVES_AFTER.set(None);
+        assert!(
+            first.failure.is_none(),
+            "{optimizer:?}: the first solve works"
+        );
+        assert!(
+            matches!(second.failure, Some(nlopt::FailState::Failure)),
+            "{optimizer:?}: the second fails"
+        );
+        let used = MSTEP_ROUTE.with(|c| c.get());
+        assert_eq!(
+            used[2],
+            u32::from(optimizer == Newton),
+            "{optimizer:?}: a forced failure runs no Newton"
+        );
+    }
+}
+
+/// End to end, the `newton` request is one decision per fit: where the closed-form information
+/// exists it runs Newton, silently; on a mixture it runs `bobyqa` and the fit says why — for
+/// IMP and IMPMAP alike.
+#[test]
+fn newton_runs_where_its_scope_holds_and_says_so_where_it_does_not() {
+    use crate::estimation::saem::MSTEP_ROUTE;
+    let pop = one_cpt_pop();
+    let mut opts = FitOptions::default();
+    opts.impmap_iterations = 3;
+    opts.impmap_samples = 100;
+    opts.impmap_seed = Some(11);
+    opts.imp_iterations = 3;
+    opts.imp_samples = 100;
+    opts.imp_seed = Some(11);
+    opts.run_covariance_step = false;
+    opts.mstep_optimizer = crate::types::MstepOptimizer::Newton;
+    for (source, in_scope) in [(ONE_CPT, true), (MIX_ONE_CPT, false)] {
+        let model = parse_model_string(source).unwrap();
+        let p = &model.default_params;
+        for imp in [false, true] {
+            MSTEP_ROUTE.with(|c| c.set([0; 3]));
+            let res = if imp {
+                run_imp(&model, &pop, p, None, &opts).expect("imp")
+            } else {
+                run_impmap(&model, &pop, p, None, &opts).expect("impmap")
+            };
+            let route = MSTEP_ROUTE.with(|c| c.get());
+            let warning = res
+                .warnings
+                .iter()
+                .find(|w| w.contains("`mstep_optimizer = newton`"));
+            let what = format!("in_scope = {in_scope}, imp = {imp}, route {route:?}");
+            if in_scope {
+                assert_eq!(warning, None, "{what}");
+                assert!(route[2] > 0 && route[0] == 0, "{what}");
+            } else {
+                let w = warning.unwrap_or_else(|| panic!("{what}: {:?}", res.warnings));
+                assert!(
+                    w.contains("the model is a mixture") && w.contains("runs `bobyqa`"),
+                    "{what}: {w}"
+                );
+                assert!(route[2] == 0 && route[0] > 0, "{what}");
+            }
+        }
+    }
 }

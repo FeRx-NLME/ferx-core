@@ -51,12 +51,15 @@ use crate::estimation::inner_optimizer::{
     build_schedule_cache, cacheable_schedule, cacheable_schedule_iov, find_ebe, EbeResult,
     InnerLoopStats,
 };
-use crate::estimation::mstep_newton::{fisher_scoring, fold_value_grad_info, ValueGradInfo};
+use crate::estimation::mstep_newton::{
+    finite_value, fisher_scoring, fold_value_grad_info, nlopt_value_and_grad, NewtonOutcome,
+    ValueGradInfo,
+};
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
-use crate::estimation::pred_memo::{memoized, MemoSlot, PredMemo};
+use crate::estimation::pred_memo::{memoized, EvalMemo, MemoSlot, PredMemo};
 use crate::estimation::saem::{
-    classify_mixture_mu_ref_pairs, classify_mu_ref_pairs, floor_omega_diagonal,
+    classify_mixture_mu_ref_pairs, classify_mu_ref_pairs, floor_omega_diagonal, fold_nll_grad,
     get_mixture_mu_ref_pairs, mixture_mu_ref_means, mstep_initial_step,
     mu_ref_pairs_for_cov_groups, MixtureMuRefPairs, MuRefPairs, MSTEP_FTOL_REL,
 };
@@ -1808,12 +1811,17 @@ fn run_mcem(
     for n in &cov_mu_notes {
         warnings.push(format!("{label}: {n}"));
     }
-    warnings.extend(crate::estimation::saem::mstep_optimizer_advisory(
-        model,
-        options.mstep_optimizer,
-        false,
-        label,
-    ));
+    // The optimizer the weighted M-steps run, decided once (`newton_scope_gap`): what the
+    // warning says is what every solve below is handed.
+    let (mstep_optimizer, mstep_optimizer_warning) =
+        crate::estimation::saem::resolve_mstep_optimizer(
+            model,
+            options.mstep_optimizer,
+            false,
+            false,
+            label,
+        );
+    warnings.extend(mstep_optimizer_warning);
     // Every member's eta (#1620): see the SAEM twin in `run_saem`.
     let cov_group_etas: Vec<usize> =
         crate::estimation::covariate_mu_ref::group_etas(&cov_mu_groups);
@@ -2556,7 +2564,7 @@ fn run_mcem(
             n_sigma,
             mstep_maxiter,
             &theta_packs_log_mask,
-            options.mstep_optimizer,
+            mstep_optimizer,
         );
         mstep_motion.record(
             &mstep_before,
@@ -3355,12 +3363,17 @@ fn run_mcem_mixture(
     }
 
     let mut warnings: Vec<String> = Vec::new();
-    warnings.extend(crate::estimation::saem::mstep_optimizer_advisory(
-        model,
-        options.mstep_optimizer,
-        false,
-        label,
-    ));
+    // The mixture M-step is outside Newton's scope (`newton_scope_gap`): `newton` runs
+    // `bobyqa` here, and the warning says so.
+    let (mstep_optimizer, mstep_optimizer_warning) =
+        crate::estimation::saem::resolve_mstep_optimizer(
+            model,
+            options.mstep_optimizer,
+            false,
+            true,
+            label,
+        );
+    warnings.extend(mstep_optimizer_warning);
 
     // The mixture MCEM never uses the closed-form log-mu-ref θ shift (a
     // class-switched typical value cannot be paired to a single η), so *every* θ
@@ -3854,7 +3867,7 @@ fn run_mcem_mixture(
             n_sigma,
             mstep_maxiter,
             &theta_packs_log_mask,
-            options.mstep_optimizer,
+            mstep_optimizer,
         );
         mstep_motion.record(
             &mstep_before,
@@ -4351,35 +4364,6 @@ pub(crate) fn draw_obs_nll(
     }
 }
 
-/// The per-solve prediction memo of a weighted M-step: one [`PredMemo`] slot per
-/// `(subject, sample)`, addressed through the subjects' running sample offsets.
-struct SolveMemo {
-    memo: PredMemo,
-    offsets: Vec<usize>,
-}
-
-impl SolveMemo {
-    fn new(draws: &[SubjectDraws]) -> Self {
-        let mut offsets = Vec::with_capacity(draws.len());
-        let mut total = 0usize;
-        for d in draws {
-            offsets.push(total);
-            total += d.etas.len();
-        }
-        Self {
-            memo: PredMemo::new(total),
-            offsets,
-        }
-    }
-
-    fn slot(&self, subject: usize, sample: usize) -> MemoSlot<'_> {
-        MemoSlot {
-            memo: &self.memo,
-            idx: self.offsets[subject] + sample,
-        }
-    }
-}
-
 /// [`draw_obs_nll`] with the predictions served from a [`MemoSlot`] where it holds them for
 /// this `θ`; the scoring is the same code on the same values either way.
 #[allow(clippy::too_many_arguments)]
@@ -4411,7 +4395,7 @@ fn draw_obs_nll_memo(
             )
         })
     } else {
-        let preds = memoized(Some(memo), theta, || {
+        let preds = memoized(Some(memo), || {
             crate::pk::compute_predictions_with_tv_into_with_schedule(
                 model, subject, theta, b, scratch, schedule,
             )
@@ -4426,43 +4410,6 @@ fn draw_obs_nll_memo(
             b,
         )
     }
-}
-
-/// [`draw_obs_nll`] and its exact gradient in the packed `[log θ | log σ]` space, from the
-/// fixed-η score SAEM's M-step uses ([`obs_nll_subject_grad`] / [`obs_nll_subject_grad_iov`]):
-/// the adjoint θ score and the analytic σ score. `lower[i] == upper[i]` marks a pinned
-/// coordinate, which contributes zero.
-#[allow(clippy::too_many_arguments)]
-fn draw_obs_nll_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    b: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    scratch: &mut EventPkParams,
-    memo: Option<MemoSlot<'_>>,
-) -> (f64, Vec<f64>) {
-    let (v, g, _) = draw_obs_score(
-        model,
-        subject,
-        theta,
-        sigma,
-        b,
-        theta_packs_log_mask,
-        lower,
-        upper,
-        n_theta,
-        n_sigma,
-        scratch,
-        false,
-        memo,
-    );
-    (v, g)
 }
 
 /// The per-draw score, with the information when `want_fisher`: IOV subjects' stacked samples
@@ -4524,44 +4471,15 @@ fn draw_obs_score(
     }
 }
 
-/// [`draw_obs_nll_grad`] with the expected information (`None` outside its closed form).
+/// The importance-weighted M-step's value and exact score in the packed `[log θ | log σ]`
+/// space, `Σᵢ Σₖ w̃ᵢₖ · (obs_nll, ∇ obs_nll)(yᵢ | bᵢₖ, θ, σ)`, from the fixed-η score SAEM's
+/// M-step uses ([`draw_obs_score`]): the adjoint θ score and the analytic σ score
+/// (`lower[i] == upper[i]` marks a pinned coordinate, which contributes zero). With
+/// `want_fisher` the expected information of the same objective comes with it, from the same
+/// recording; `None` then when any subject's is out of scope. Without it the result is the
+/// gradient solve's (`lbfgs`), its information empty and never `None`.
 #[allow(clippy::too_many_arguments)]
-fn draw_obs_nll_grad_fisher(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    b: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    scratch: &mut EventPkParams,
-    memo: Option<MemoSlot<'_>>,
-) -> (f64, Vec<f64>, Option<Vec<f64>>) {
-    draw_obs_score(
-        model,
-        subject,
-        theta,
-        sigma,
-        b,
-        theta_packs_log_mask,
-        lower,
-        upper,
-        n_theta,
-        n_sigma,
-        scratch,
-        true,
-        memo,
-    )
-}
-
-/// [`weighted_mstep_value_grad`] with the information, for `mstep_optimizer = newton`:
-/// `Σᵢ Σₖ w̃ᵢₖ · (value, score, information)` of the per-draw objective. `None` when any
-/// subject's information is out of scope.
-#[allow(clippy::too_many_arguments)]
-fn weighted_mstep_value_grad_info(
+fn weighted_mstep_score(
     model: &CompiledModel,
     population: &Population,
     draws: &[SubjectDraws],
@@ -4572,7 +4490,8 @@ fn weighted_mstep_value_grad_info(
     upper: &[f64],
     n_theta: usize,
     n_sigma: usize,
-    memo: Option<&SolveMemo>,
+    want_fisher: bool,
+    memo: Option<EvalMemo<'_>>,
 ) -> Option<ValueGradInfo> {
     let n = n_theta + n_sigma;
     let per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)> = crate::par::map_init(
@@ -4582,12 +4501,12 @@ fn weighted_mstep_value_grad_info(
             let (subject, d) = (&population.subjects[idx], &draws[idx]);
             let mut val = 0.0f64;
             let mut grad = vec![0.0f64; n];
-            let mut info = Some(vec![0.0f64; n * n]);
+            let mut info = want_fisher.then(|| vec![0.0f64; n * n]);
             for (k, (w, b)) in d.weights.iter().zip(d.etas.iter()).enumerate() {
                 if *w == 0.0 {
                     continue;
                 }
-                let (v, g, i) = draw_obs_nll_grad_fisher(
+                let (v, g, i) = draw_obs_score(
                     model,
                     subject,
                     theta,
@@ -4599,114 +4518,28 @@ fn weighted_mstep_value_grad_info(
                     n_theta,
                     n_sigma,
                     scratch,
-                    memo.map(|m| m.slot(idx, k)),
+                    want_fisher,
+                    memo.map(|ev| ev.slot(idx, k)),
                 );
                 val += w * v;
                 for (a, gi) in grad.iter_mut().zip(g) {
                     *a += w * gi;
                 }
-                match (info.as_mut(), i) {
-                    (Some(acc), Some(i)) => {
-                        for (a, ii) in acc.iter_mut().zip(i) {
-                            *a += w * ii;
+                if let Some(acc) = info.as_mut() {
+                    match i {
+                        Some(i) => {
+                            for (a, ii) in acc.iter_mut().zip(i) {
+                                *a += w * ii;
+                            }
                         }
+                        None => info = None,
                     }
-                    _ => info = None,
                 }
             }
             (val, grad, info)
         },
     );
-    let mut out = fold_value_grad_info(per_subj, n)?;
-    for g in out.grad.iter_mut() {
-        if !g.is_finite() {
-            *g = 0.0;
-        }
-    }
-    if !out.val.is_finite() {
-        out.val = 1e20;
-    }
-    Some(out)
-}
-
-/// Fold per-subject `(value, gradient)` pairs in subject order into the population's.
-fn fold_value_grad(per_subj: Vec<(f64, Vec<f64>)>, n: usize) -> (f64, Vec<f64>) {
-    let mut val = 0.0f64;
-    let mut grad = vec![0.0f64; n];
-    for (v, g) in per_subj {
-        val += v;
-        for (a, b) in grad.iter_mut().zip(g) {
-            *a += b;
-        }
-    }
-    (val, grad)
-}
-
-/// What NLopt receives from a weighted M-step objective: the value as
-/// [`weighted_mstep_objective`] returns it (`1e20` when not finite) and, when the solver asks,
-/// the gradient with a non-finite entry zeroed (a flat, maximally bad point, as SAEM's M-step).
-fn mstep_value_and_grad((val, grad): (f64, Vec<f64>), out: &mut [f64]) -> f64 {
-    for (o, g) in out.iter_mut().zip(grad) {
-        *o = if g.is_finite() { g } else { 0.0 };
-    }
-    if val.is_finite() {
-        val
-    } else {
-        1e20
-    }
-}
-
-/// [`weighted_mstep_objective`] with its exact gradient in the packed `[log θ | log σ]` space
-/// (`Σᵢ Σₖ w̃ᵢₖ · ∇ obs_nll(yᵢ | bᵢₖ, θ, σ)`), for `mstep_optimizer = lbfgs`.
-#[allow(clippy::too_many_arguments)]
-fn weighted_mstep_value_grad(
-    model: &CompiledModel,
-    population: &Population,
-    draws: &[SubjectDraws],
-    theta: &[f64],
-    sigma: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    memo: Option<&SolveMemo>,
-) -> (f64, Vec<f64>) {
-    let n = n_theta + n_sigma;
-    let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
-        population.subjects.len().min(draws.len()),
-        EventPkParams::default,
-        |scratch, idx| {
-            let (subject, d) = (&population.subjects[idx], &draws[idx]);
-            let mut val = 0.0f64;
-            let mut grad = vec![0.0f64; n];
-            for (k, (w, b)) in d.weights.iter().zip(d.etas.iter()).enumerate() {
-                if *w == 0.0 {
-                    continue;
-                }
-                let (v, g) = draw_obs_nll_grad(
-                    model,
-                    subject,
-                    theta,
-                    sigma,
-                    b,
-                    theta_packs_log_mask,
-                    lower,
-                    upper,
-                    n_theta,
-                    n_sigma,
-                    scratch,
-                    memo.map(|m| m.slot(idx, k)),
-                );
-                val += w * v;
-                for (a, gi) in grad.iter_mut().zip(g) {
-                    *a += w * gi;
-                }
-            }
-            (val, grad)
-        },
-    );
-    fold_value_grad(per_subj, n)
+    fold_value_grad_info(per_subj, n, want_fisher)
 }
 
 /// Each subject's cached event schedule for the MCEM scoring loops, `None` where
@@ -4807,8 +4640,8 @@ fn weighted_mstep_objective(
     weighted_mstep_objective_memo(model, population, draws, schedules, theta, sigma, None)
 }
 
-/// [`weighted_mstep_objective`] with the predictions served from the solve's [`SolveMemo`]
-/// where it holds them for this `θ`.
+/// [`weighted_mstep_objective`] with the predictions served from the evaluation's memo (the
+/// solve's evaluations at one `θ`).
 fn weighted_mstep_objective_memo(
     model: &CompiledModel,
     population: &Population,
@@ -4816,7 +4649,7 @@ fn weighted_mstep_objective_memo(
     schedules: &[Option<EventSchedule>],
     theta: &[f64],
     sigma: &[f64],
-    memo: Option<&SolveMemo>,
+    memo: Option<EvalMemo<'_>>,
 ) -> f64 {
     // Reduce in subject order (collect then serial sum) so the objective is
     // reproducible regardless of rayon worker count — a parallel `.sum()`
@@ -4839,7 +4672,7 @@ fn weighted_mstep_objective_memo(
                         continue;
                     }
                     s += w * match memo {
-                        Some(m) => draw_obs_nll_memo(
+                        Some(ev) => draw_obs_nll_memo(
                             model,
                             subject,
                             theta,
@@ -4847,7 +4680,7 @@ fn weighted_mstep_objective_memo(
                             b,
                             schedule.as_ref(),
                             scratch,
-                            m.slot(idx, k),
+                            ev.slot(idx, k),
                         ),
                         None => draw_obs_nll(
                             model,
@@ -4864,12 +4697,7 @@ fn weighted_mstep_objective_memo(
             }
         },
     );
-    let val: f64 = per_subj.iter().sum();
-    if val.is_finite() {
-        val
-    } else {
-        1e20
-    }
+    finite_value(per_subj.iter().sum())
 }
 
 /// Stable token of [`gate_converged_on_mstep_motion`].
@@ -5121,7 +4949,7 @@ fn solve_weighted_mstep<F>(
     maxiter: u32,
     mstep_optimizer: MstepOptimizer,
     // The fused value/score/information of the same objective, for `newton`; `None` where the
-    // caller has none (a mixture), which keeps BOBYQA.
+    // caller has none (a mixture, which the fit's scope decision keeps off `newton`).
     fused: Option<&dyn Fn(&[f64]) -> Option<ValueGradInfo>>,
 ) -> WeightedMstep
 where
@@ -5130,10 +4958,9 @@ where
     let n = x.len();
     let start = x.clone();
     let algorithm = match mstep_optimizer {
-        MstepOptimizer::Bobyqa => nlopt::Algorithm::Bobyqa,
         MstepOptimizer::Lbfgs => nlopt::Algorithm::Lbfgs,
-        // Newton keeps BOBYQA for what it declines.
-        MstepOptimizer::Newton => nlopt::Algorithm::Bobyqa,
+        // Newton keeps BOBYQA for what it declines or stalls on.
+        _ => nlopt::Algorithm::Bobyqa,
     };
     let mut opt = nlopt::Nlopt::new(algorithm, n, &obj, nlopt::Target::Minimize, ());
     opt.set_lower_bounds(lower).unwrap();
@@ -5149,7 +4976,11 @@ where
         opt.set_initial_step(&initial_step).unwrap();
     }
 
-    let newton_solved = !mstep_solve_forced_to_fail()
+    // The test hook counts a solve once, however many branches read it.
+    let forced_failure = mstep_solve_forced_to_fail();
+    // A stalled Newton leaves `x` at its last accepted point and BOBYQA continues from it, so
+    // the failure and frozen-coordinate accounting below sees what the continuation did.
+    let newton_solved = !forced_failure
         && mstep_optimizer == MstepOptimizer::Newton
         && fused.is_some_and(|f| {
             fisher_scoring(
@@ -5160,7 +4991,7 @@ where
                 MSTEP_FTOL_REL,
                 |xv| obj(xv, None, &mut ()),
                 f,
-            )
+            ) == NewtonOutcome::Converged
         });
     #[cfg(test)]
     crate::estimation::saem::note_mstep_route(if newton_solved {
@@ -5170,7 +5001,7 @@ where
     });
     let failure = if newton_solved {
         None
-    } else if mstep_solve_forced_to_fail() {
+    } else if forced_failure {
         Some(nlopt::FailState::Failure)
     } else {
         mstep_failure(&opt.optimize(&mut x))
@@ -5244,18 +5075,27 @@ fn theta_sigma_weighted_mstep(
             .collect()
     };
 
-    // The solve's samples are fixed, so evaluations at one θ (a σ-only solve: all of them)
-    // share one prediction pass per sample (`PredMemo`).
-    let memo = SolveMemo::new(draws);
+    // The solve's samples are fixed, so evaluations at one θ share one prediction pass per
+    // sample (`PredMemo`): every evaluation of a σ-only solve, and a Newton solve's value pass
+    // and fused pass at the same point. A solve that never sees a θ twice keeps no predictions.
+    let theta_free = (0..n_theta).any(|i| lower[i] < upper[i]);
+    let pred_memo = PredMemo::for_solve(
+        draws.iter().map(|d| d.etas.len()),
+        theta_free,
+        mstep_optimizer == MstepOptimizer::Newton,
+    );
+    // One θ comparison per evaluation, then every `(subject, sample)` slot hangs off it.
+    let begin = |th: &[f64]| pred_memo.as_ref().and_then(|m| m.begin(th));
 
     // Weighted observation NLL, parallel over subjects. Each subject contributes
     // Σₖ w̃ₖ · obs_nll(yᵢ | ηᵢₖ, θ, σ).
     let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
+        let ev = begin(&th);
         match grad {
-            Some(g) => mstep_value_and_grad(
-                weighted_mstep_value_grad(
+            Some(g) => {
+                let score = weighted_mstep_score(
                     model,
                     population,
                     draws,
@@ -5266,26 +5106,22 @@ fn theta_sigma_weighted_mstep(
                     &upper,
                     n_theta,
                     n_sigma,
-                    Some(&memo),
-                ),
-                g,
-            ),
-            None => weighted_mstep_objective_memo(
-                model,
-                population,
-                draws,
-                schedules,
-                &th,
-                &sg,
-                Some(&memo),
-            ),
+                    false,
+                    ev,
+                )
+                .expect("a score without the information always exists");
+                nlopt_value_and_grad((score.val, score.grad), g)
+            }
+            None => {
+                weighted_mstep_objective_memo(model, population, draws, schedules, &th, &sg, ev)
+            }
         }
     };
 
     let fused = |xv: &[f64]| -> Option<ValueGradInfo> {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        weighted_mstep_value_grad_info(
+        let mut out = weighted_mstep_score(
             model,
             population,
             draws,
@@ -5296,8 +5132,12 @@ fn theta_sigma_weighted_mstep(
             &upper,
             n_theta,
             n_sigma,
-            Some(&memo),
-        )
+            true,
+            begin(&th),
+        )?;
+        crate::estimation::mstep_newton::finite_grad(&mut out.grad);
+        out.val = finite_value(out.val);
+        Some(out)
     };
     solve_weighted_mstep(
         obj,
@@ -5389,7 +5229,7 @@ fn theta_sigma_weighted_mstep_mixture(
                             if *w == 0.0 {
                                 continue;
                             }
-                            let (v, gr) = draw_obs_nll_grad(
+                            let (v, gr, _) = draw_obs_score(
                                 model,
                                 subject,
                                 &th,
@@ -5401,6 +5241,7 @@ fn theta_sigma_weighted_mstep_mixture(
                                 n_theta,
                                 n_sigma,
                                 scratch,
+                                false,
                                 None,
                             );
                             val += p * w * v;
@@ -5412,7 +5253,7 @@ fn theta_sigma_weighted_mstep_mixture(
                     (val, grad)
                 },
             );
-            return mstep_value_and_grad(fold_value_grad(per_subj, n), g);
+            return nlopt_value_and_grad(fold_nll_grad(per_subj, n), g);
         }
         let per_subj: Vec<f64> = crate::par::map_init(
             population.subjects.len(),

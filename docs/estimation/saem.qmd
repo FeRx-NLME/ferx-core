@@ -511,10 +511,19 @@ adjoint produces from one recording of the predictions:
 
 Both solve the same problem as BOBYQA — same objective, packed space, bounds, budget and
 tolerance — so they move to the same optimum; they are not a different estimator. The
-option is opt-in and `bobyqa` is the default. Under `newton`, a subject whose
-information has no closed form (an M3, TTE or dense-residual-covariance model, a residual
-magnitude, a `[covariate_nn]` θ) and a SAEM mixture keep the BOBYQA solve; a model outside
-the adjoint's scope says so in the fit's warnings.
+option is opt-in and `bobyqa` is the default.
+
+`newton` serves exactly the models whose expected information has a closed form from the
+adjoint: the adjoint in scope, a plain Gaussian likelihood (no M3 censoring, TTE endpoint,
+`block_sigma` residual correlation, `[covariate_nn]` θ or residual magnitude), and not a
+mixture (SAEM, IMP and IMPMAP alike). IOV is inside it. This is decided once per fit; on any
+other model the M-step runs `bobyqa`, and a warning in the fit's `warnings` names the
+property that put the model out of scope. Fisher scoring is never run on finite-difference
+curvature. A Newton solve that cannot take a step it has not converged for (information
+that does not factor at any damping, or no damped step that decreases the objective)
+continues with BOBYQA from the point it reached, and the weighted M-step's failure and
+frozen-coordinate gates (`W_MCEM_MSTEP_FAILED`, `W_MCEM_MSTEP_FROZEN`) see that
+continuation.
 
 ##### Measured {#saem-mstep-optimizer-measured}
 
@@ -535,9 +544,12 @@ Without the memo (the first measurement of this option) Newton was 1.13 to 1.54 
 cheaper than BOBYQA, because BOBYQA's 8 to 15 value evaluations each predicted again and
 Newton needs 3 to 4 passes. Predictions never depend on σ and a solve holds every η, κ and
 importance sample fixed, so every evaluation at an unchanged θ shares one prediction pass
-per subject (per sample): in a σ-only M-step that is every evaluation. The memo is keyed on
-the θ it was computed at (a free θ that moves recomputes) and applies to all three
-optimizers; it returns the predictions the solve's own predictor returned the first time,
+per subject (per sample): in a σ-only M-step that is every evaluation. The memo is kept only
+where an evaluation can repeat a θ — a solve whose θ are all pinned (every evaluation) and
+a Newton solve (the value pass at a trial point, then the fused pass at the accepted one);
+a free-θ solve under BOBYQA or L-BFGS visits no θ twice and stores nothing. The θ is
+compared once per evaluation and a subject's samples share one buffer that a hit borrows.
+It returns the predictions the solve's own predictor returned the first time,
 so the fit file and the sdtab of all 90 fits (6 sets, 3 optimizers, 5 seeds) are
 byte-identical to the memo-free run, and BOBYQA alone takes 1.3 to 2.0 times fewer
 instructions. What is left of the M-step is one prediction pass plus residual arithmetic,
