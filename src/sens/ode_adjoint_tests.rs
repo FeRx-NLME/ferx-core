@@ -5404,16 +5404,21 @@ pub(super) fn hessian_gaps_for(
     // production runs the nested-dual passes; a test thread's default 2 MB is too small.
     // `(reverse per direction, every plan along the directions, no mu fold)`; returns the
     // Hessian and how many plans the pass assembled from a basis.
-    let hessian_in = |per_direction: bool, plan_dirs: bool, fold_off: bool| {
+    // `(…, every pass through the recorded likelihood kernel)`; also how many passes took the
+    // structured kernel.
+    let hessian_in4 = |per_direction: bool, plan_dirs: bool, fold_off: bool, struct_off: bool| {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(crate::FIT_RAYON_STACK_SIZE)
                 .spawn_scoped(scope, || {
                     use super::hessian::basis::{BASIS_PLANS, MU_FOLD_OFF, PLAN_PER_DIRECTION};
+                    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
                     super::hessian::REVERSE_PER_DIRECTION.with(|c| c.set(per_direction));
                     PLAN_PER_DIRECTION.with(|c| c.set(plan_dirs));
                     MU_FOLD_OFF.with(|c| c.set(fold_off));
+                    STRUCT_OFF.with(|c| c.set(struct_off));
                     BASIS_PLANS.with(|c| c.set(0));
+                    STRUCT_PASSES.with(|c| c.set(0));
                     let h = subject_adjoint_cov_hessian(
                         model,
                         s,
@@ -5422,12 +5427,18 @@ pub(super) fn hessian_gaps_for(
                         eta.as_slice(),
                         objective,
                     );
-                    (h, BASIS_PLANS.with(std::cell::Cell::get))
+                    (
+                        (h, BASIS_PLANS.with(std::cell::Cell::get)),
+                        STRUCT_PASSES.with(std::cell::Cell::get),
+                    )
                 })
                 .expect("spawn")
                 .join()
                 .expect("join")
         })
+    };
+    let hessian_in = |per_direction: bool, plan_dirs: bool, fold_off: bool| {
+        hessian_in4(per_direction, plan_dirs, fold_off, false).0
     };
     let hessian = |per_direction: bool| {
         hessian_in(per_direction, false, false)
@@ -5455,6 +5466,20 @@ pub(super) fn hessian_gaps_for(
         );
         assert!(g_dirs < 1e-12, "basis vs directions: {g_dirs:.2e}");
         assert!(g_fold < 1e-12, "fold vs none: {g_fold:.2e}");
+        // The structured FOCEI kernel (#2980) against the recorded kernel's sweep.
+        let ((h_st, _), n_st) = hessian_in4(false, false, false, false);
+        let ((h_rec, _), n_rec) = hessian_in4(false, false, false, true);
+        let (h_st, h_rec) = (
+            h_st.expect("structured: in scope"),
+            h_rec.expect("recorded: in scope"),
+        );
+        let g_st = rel_gap(h_st.as_slice(), h_rec.as_slice());
+        eprintln!("hessian: {n_st} structured passes ({n_rec} with it off); structured vs recorded {g_st:.2e}");
+        assert_eq!(
+            n_rec, 0,
+            "the switch must take every pass through the recorded kernel"
+        );
+        assert!(g_st < 1e-12, "structured vs recorded kernel: {g_st:.2e}");
     }
     // Forward over reverse (production) against reverse over forward, one reverse per
     // direction (#2980): the same second derivatives of the same programs, so they differ by

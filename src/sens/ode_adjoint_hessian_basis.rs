@@ -147,11 +147,16 @@ impl MuFold {
         // Per line: `∂μ/∂θ_i` and `∂²μ/∂θ_i∂θ_j` (`j·n_th + i`) for the folded `i`.
         let mut grad = vec![vec![0.0; n_th]; n_lines];
         let mut hess = vec![vec![0.0; n_th * n_th]; n_lines];
+        // `∂²μ/∂θ_i∂θ_j` is symmetric: a pair of folded θ takes one run, filling both entries.
+        let folded = |m: usize| spec.thetas.contains(&m);
         for &i in spec.thetas.iter().filter(|&&i| i < n_th) {
-            for j in 0..n_th {
+            for j in (0..n_th).filter(|&j| !(folded(j) && j < i)) {
                 for (k, d) in seeded(i, j).iter().enumerate() {
                     grad[k][i] = d.grad[0];
                     hess[k][j * n_th + i] = d.hess[0][1];
+                    if folded(j) {
+                        hess[k][i * n_th + j] = d.hess[0][1];
+                    }
                 }
             }
         }
@@ -201,7 +206,7 @@ impl MuFold {
     }
 
     /// θ `i`'s lines, if the fold carries it.
-    fn of(&self, i: usize) -> Option<&[(usize, f64)]> {
+    pub(super) fn of(&self, i: usize) -> Option<&[(usize, f64)]> {
         self.d1.get(i).map(Vec::as_slice).filter(|d| !d.is_empty())
     }
 }
@@ -232,6 +237,11 @@ struct BasisAdj {
 }
 
 impl Basis {
+    /// `(axes, base lanes per output, values, Jacobian)` of the prediction basis.
+    pub(super) fn parts(&self) -> (&[Input], usize, &[f64], &[f64]) {
+        (&self.axes, self.lb, &self.vals, &self.jac)
+    }
+
     fn idx(&self, inp: Input) -> usize {
         match inp {
             Input::Eta(k) => k,
@@ -327,8 +337,15 @@ impl CovPlan<'_> {
                 m.z[z] = true;
             }
         }
-        *self.moved.borrow_mut() = Some(m);
-        self.bases.borrow_mut().clear();
+        let same = self
+            .moved
+            .borrow()
+            .as_ref()
+            .is_some_and(|o| o.x == m.x && o.z == m.z && o.n_dirs == m.n_dirs);
+        if !same {
+            *self.moved.borrow_mut() = Some(m);
+            self.bases.borrow_mut().clear();
+        }
     }
 
     /// Parameter slot `i`'s tangent on lane `a` (θ, then network outputs, then σ).

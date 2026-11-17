@@ -43,6 +43,8 @@ use crate::sens::num::{log_sum_exp, PkNum};
 #[path = "ode_adjoint_hessian_basis.rs"]
 pub(super) mod basis;
 use basis::{Basis, Lanes, Moved, MuFold, PlanKey, PlanRun};
+#[path = "ode_adjoint_hessian_struct.rs"]
+pub(super) mod st;
 
 /// The most directions one pass carries as the plans' tangent lanes.
 ///
@@ -302,13 +304,23 @@ fn x_dirs(n: usize) -> Vec<Dir> {
 /// (`F`, `g_k`).
 fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix<f64>)> {
     let n = plan.pn();
-    let run = plan.run(&[], 0)?;
-    let unit = |o: usize| -> Vec<f64> { (0..=n).map(|c| if c == o { 1.0 } else { 0.0 }).collect() };
-    let rows = plan.reverse(&run, &(0..=n).map(unit).collect::<Vec<_>>())?;
-    // ∇_η F, H = ∂g/∂η and ∂g along `along`, from the inputs' adjoints.
-    let grad_f = DVector::from_fn(n, |k, _| rows[0][plan.eta_slot(k)]);
-    let h = DMatrix::from_fn(n, n, |o, k| rows[1 + o][plan.eta_slot(k)]);
-    let gx = DMatrix::from_fn(n, along.len(), |o, j| plan.along(&rows[1 + o], &along[j]));
+    // ∇_η F, H = ∂g/∂η and ∂g along `along`: from the structured kernel where it serves, else
+    // from the recorded composition's inputs' adjoints.
+    let (grad_f, h, gx) = match plan.struct_mode(along) {
+        Some((g, h, gx)) => (DVector::from_vec(g), h, gx),
+        None => {
+            let run = plan.run(&[], 0)?;
+            let unit = |o: usize| -> Vec<f64> {
+                (0..=n).map(|c| if c == o { 1.0 } else { 0.0 }).collect()
+            };
+            let rows = plan.reverse(&run, &(0..=n).map(unit).collect::<Vec<_>>())?;
+            (
+                DVector::from_fn(n, |k, _| rows[0][plan.eta_slot(k)]),
+                DMatrix::from_fn(n, n, |o, k| rows[1 + o][plan.eta_slot(k)]),
+                DMatrix::from_fn(n, along.len(), |o, j| plan.along(&rows[1 + o], &along[j])),
+            )
+        }
+    };
     // Nonsingular, not necessarily definite: see `mode_solve`.
     let hs = h.symmetric_part();
     let solve: Box<dyn Fn(&DMatrix<f64>) -> Option<DMatrix<f64>>> = match hs.clone().cholesky() {
@@ -465,7 +477,10 @@ fn psi_lanes(
             plan.reverse_tangent(&run, &s)?
         };
         for a in 0..chunk.len() {
-            let psi_a = out[1 + a] - (0..n).map(|k| w[k] * out[(1 + k) * l + 1 + a]).sum::<f64>();
+            let psi_a = match run.psi.borrow().as_ref() {
+                Some(p) => p[a],
+                None => out[1 + a] - (0..n).map(|k| w[k] * out[(1 + k) * l + 1 + a]).sum::<f64>(),
+            };
             lane(c * width + a, psi_a, &|d: &Dir| plan.along(&rows[a], d));
         }
     }
@@ -814,6 +829,8 @@ pub(super) struct CovPlan<'a> {
     moved: std::cell::RefCell<Option<Moved>>,
     /// Each plan's run along its input axes, kept for every pass ([`basis`]).
     bases: std::cell::RefCell<std::collections::HashMap<PlanKey, Basis>>,
+    /// The structured kernel's rows at this point ([`st`]), formed on the first pass.
+    st_rows: std::cell::RefCell<Option<st::Rows>>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -919,14 +936,20 @@ pub(super) struct CovRun {
     /// Per node: its predictions', its term's and its variance rows' plans.
     nodes: Vec<(Option<PlanRun>, Option<PlanRun>, Option<PlanRun>)>,
     k1: Option<super::kernel::KernelRun>,
-    k2: super::kernel::KernelRun,
+    /// The recorded likelihood kernel; `None` where the pass takes the structured kernel.
+    k2: Option<super::kernel::KernelRun>,
+    /// The structured kernel's inputs (every kernel input's value, then its tangents): the
+    /// pass's [`st`] form instead of `k2`.
+    st_inputs: Option<Vec<f64>>,
+    /// The structured pass's `ψ_a`, set by its sweep.
+    psi: std::cell::RefCell<Option<Vec<f64>>>,
 }
 
 impl CovRun {
     /// The kernel's outputs: per output (`F`, then each `g_k`), its value and `kt` tangents
     /// (the value alone at the value layout).
     pub(super) fn out(&self) -> &[f64] {
-        &self.k2.out
+        self.k2.as_ref().map_or(&[][..], |k| &k.out[..])
     }
 }
 
@@ -990,6 +1013,7 @@ impl<'a> CovPlan<'a> {
             fold,
             moved: std::cell::RefCell::new(None),
             bases: std::cell::RefCell::new(std::collections::HashMap::new()),
+            st_rows: std::cell::RefCell::new(None),
         }
     }
 
@@ -1495,15 +1519,23 @@ impl<'a> CovPlan<'a> {
         } else {
             None
         };
-        let k2 = super::kernel::kernel_run(
-            model,
-            subject,
-            super::kernel::variant_of(&(self.variant.bytes(), 2u8, slots.end)),
-            layout_k,
-            &inputs,
-            1 + pn,
-            &record_k2,
-        )?;
+        // A tangent pass of a structured subject keeps the kernel's inputs for [`st`] instead of
+        // running the recorded kernel.
+        let structured = kt > 0 && slots.n_nodes == 0 && self.structured();
+        let k2 = if structured {
+            None
+        } else {
+            Some(super::kernel::kernel_run(
+                model,
+                subject,
+                super::kernel::variant_of(&(self.variant.bytes(), 2u8, slots.end)),
+                layout_k,
+                &inputs,
+                1 + pn,
+                &record_k2,
+            )?)
+        };
+        let st_inputs = structured.then(|| inputs.clone());
         Some(CovRun {
             slots,
             kt,
@@ -1515,6 +1547,8 @@ impl<'a> CovPlan<'a> {
             nodes,
             k1,
             k2,
+            st_inputs,
+            psi: std::cell::RefCell::new(None),
         })
     }
 
@@ -1695,9 +1729,16 @@ impl<'a> CovPlan<'a> {
         let mut rows = vec![vec![0.0; width]; ns];
         // Stage 2, then the nodes back to their locations, then stage 1.
         let mut adj = if tangent {
-            vec![r.k2.reverse_tangent(&seeds[0])?.to_vec()]
+            match r.st_inputs.as_ref() {
+                Some(_) => {
+                    let (adj, psi) = self.struct_adjoint(r, &seeds[0])?;
+                    *r.psi.borrow_mut() = Some(psi);
+                    vec![adj]
+                }
+                None => vec![r.k2.as_ref()?.reverse_tangent(&seeds[0])?.to_vec()],
+            }
         } else {
-            r.k2.reverse(seeds)?
+            r.k2.as_ref()?.reverse(seeds)?
         };
         if let Some(k1) = r.k1.as_ref() {
             let mut b_seeds = vec![vec![0.0; sl.n_nodes * pn * lk]; adj.len()];

@@ -628,6 +628,71 @@ fn focei_parts<T: PkNum>(
     focei_rows_k(ctx, f, g, eta, p, None, true)
 }
 
+/// An uncensored Gaussian row's `ℓ = r²/V + log V` at prediction `fd` with variance `vd`
+/// (`r = y − f`), over any dual the caller carries: [`focei_rows`]' and the covariance
+/// Hessian's structured rows' one formula (#2980).
+#[inline]
+fn gauss_l<D: PkNum>(y: f64, fd: D, vd: D) -> D {
+    let r = D::from_f64(y) - fd;
+    r * r / vd + vd.ln()
+}
+
+/// A FOCEI row's `H̃` weight `1/V + ½·(∂V/∂f / V)²` (`c̃ = (∂V/∂f / V)·g`, no RUV IIV).
+#[inline]
+fn focei_alpha<T: PkNum>(v: T, vf: T) -> T {
+    let cs = vf / v;
+    T::from_f64(1.0) / v + T::from_f64(0.5) * cs * cs
+}
+
+/// Row `j` of the FOCEI diagonal path as the structured covariance Hessian reads it (#2980):
+/// `(ℓ, ∂ℓ/∂f, α)` at prediction `f` — an uncensored Gaussian row, no RUV IIV, no SDE, no
+/// FREM ([`structured_rows_supported`]). `T` carries the derivatives the caller needs (a dual
+/// over the row's local inputs); the arithmetic is [`focei_rows`]'.
+pub(crate) fn focei_gauss_row<T: PkNum>(
+    ctx: &LikCtx,
+    j: usize,
+    f: T,
+    p: &ParT<T>,
+) -> Option<(T, T, T)> {
+    let pk = p.wrap_rows::<1>();
+    let fd = DualT::<1, T> {
+        v: f,
+        g: [T::from_f64(1.0)],
+    };
+    let ruv = DualT::<1, T> {
+        v: T::from_f64(1.0),
+        g: [T::from_f64(0.0)],
+    };
+    let vd = ctx.variance_v(j, fd, ruv, &pk);
+    if !positive_finite(vd.v) {
+        return None;
+    }
+    let lj = gauss_l(ctx.subject.observations[j], fd, vd);
+    Some((lj.v, lj.g[0], focei_alpha(vd.v, vd.g[0])))
+}
+
+/// Whether a subject's FOCEI objective is the row-and-reduce form [`focei_gauss_row`] and the
+/// reduce `½·[ηᵀΩ⁻¹η + log|Ω| + log|Ω⁻¹ + Σ αGGᵀ|]` describe exactly: the diagonal path with
+/// every row an uncensored Gaussian one, no RUV IIV, no SDE, no FREM rows, no non-Gaussian
+/// records, no custom residual magnitude and no residual correlations.
+pub(crate) fn structured_rows_supported(ctx: &LikCtx) -> bool {
+    let m = ctx.model;
+    !ctx.dense()
+        && m.residual_error_eta.is_none()
+        && !ctx.sde
+        && m.frem_config.is_none()
+        && !ctx.subject.fremtype.iter().any(|&ft| ft > 0)
+        && ctx.subject.obs_records.is_empty()
+        && !(0..ctx.n()).any(|j| ctx.censored(j).is_some())
+        && !m.ruv_magnitude.as_ref().is_some_and(|rm| rm.is_active())
+        && ctx.params.residual_correlations.is_empty()
+}
+
+/// `ηᵀΩ⁻¹η + log|Ω|` (the prior the objective reads), for the structured reduce.
+pub(crate) fn prior_of<T: PkNum>(ctx: &LikCtx, eta: &[T], p: &ParT<T>) -> T {
+    ctx.prior(eta, p)
+}
+
 /// [`focei_rows`] at the dual width the subject needs: direction 0 is the prediction, then
 /// `η_r` under RUV IIV, then the row's `p_obs` under an SDE.
 fn focei_rows_k<T: PkNum>(
@@ -736,8 +801,7 @@ fn focei_rows<T: PkNum, const K: usize>(
                 if !positive_finite(vd.v) {
                     return None;
                 }
-                let r = lift(c(y)) - fd;
-                let lj = r * r / vd + vd.ln();
+                let lj = gauss_l(y, fd, vd);
                 data = data + lj.v;
                 dl[j] = lj.g[0];
                 if let Some(r) = rr {
@@ -753,9 +817,11 @@ fn focei_rows<T: PkNum, const K: usize>(
                 // g·gᵀ/V + ½·c̃c̃ᵀ with c̃ = (∂V/∂f / V)·g, whose η_r entry is 2 under RUV IIV.
                 match (rr, interaction) {
                     (_, false) => terms.push((iv, Cow::Borrowed(gj), Cow::Borrowed(gj))),
-                    (None, true) => {
-                        terms.push((iv + c(0.5) * cs * cs, Cow::Borrowed(gj), Cow::Borrowed(gj)))
-                    }
+                    (None, true) => terms.push((
+                        focei_alpha(vd.v, vd.g[0]),
+                        Cow::Borrowed(gj),
+                        Cow::Borrowed(gj),
+                    )),
                     (Some(r), true) => {
                         let ck: Vec<T> = (0..nn)
                             .map(|k| if k == r { c(2.0) } else { cs * gj[k] })
