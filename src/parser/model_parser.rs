@@ -2027,6 +2027,160 @@ fn thetas_read_outside_the_group(
         .collect()
 }
 
+/// The mu-referenced lines the covariance Hessian folds into η-space (#2982), and the θ
+/// read only through them.
+///
+/// A line `P = g⁻¹(A(θ, covariates) + η)` whose η no other statement or block reads makes
+/// `P` a function of `φ = A + η` alone, so a θ that reaches the likelihood only through
+/// such lines moves every prediction exactly as the η-direction `∂A/∂θ` does
+/// (`sens::ode_adjoint_hessian`). Everything here is conservative: no fold where a
+/// statement is conditional or a θ is gathered by a computed index, a line must read
+/// exactly one η and assign its name once, and no other η may reach it through a local.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct MuFoldSpec {
+    /// Per line: its BSV η, the variable slot it assigns (its `indiv_var_names` index), and
+    /// its link `g`.
+    pub(crate) lines: Vec<(usize, usize, MuTransform)>,
+    /// The θ read by no statement or block but those lines.
+    pub(crate) thetas: Vec<usize>,
+}
+
+/// [`MuFoldSpec`] of `[individual_parameters]` `stmts`: the exclusive mu lines among the
+/// detected BSV mu-references (`mu_refs`, and the covariate groups `cov_refs`), and the θ
+/// that reach one of them and whose every route to the likelihood ends at one
+/// ([`thetas_read_outside_the_group`] with those lines as the owners, the dose attributes the
+/// engine reads by name counted as outside reads).
+#[allow(clippy::too_many_arguments)]
+fn mu_fold_spec(
+    stmts: &[Statement],
+    theta_names: &[String],
+    eta_names: &[String],
+    n_bsv: usize,
+    outside_idents: &HashSet<String>,
+    mu_refs: &HashMap<String, MuRef>,
+    cov_refs: &[CovariateMuRef],
+    indiv_var_names: &[String],
+) -> MuFoldSpec {
+    let mut gathered = false;
+    visit_stmt_nodes(stmts, &mut |e| {
+        gathered |= matches!(e, Expression::ThetaGather { .. })
+    });
+    if gathered || stmts.iter().any(|s| !matches!(s, Statement::Assign(..))) {
+        return MuFoldSpec::default();
+    }
+    let etas_of = |expr: &Expression| {
+        let mut set = std::collections::BTreeSet::new();
+        visit_expr_nodes(expr, &mut |n| {
+            if let Expression::Eta(i) = n {
+                set.insert(*i);
+            }
+        });
+        set
+    };
+    // Names whose value depends on some η (through any chain of locals).
+    let mut eta_tainted: HashSet<String> = HashSet::new();
+    for s in stmts {
+        if let Statement::Assign(name, expr) = s {
+            let mut reads = !etas_of(expr).is_empty();
+            visit_expr_nodes(expr, &mut |n| {
+                if let Expression::Variable(v) = n {
+                    reads |= eta_tainted.contains(&v.to_ascii_uppercase());
+                }
+            });
+            if reads {
+                eta_tainted.insert(name.to_ascii_uppercase());
+            }
+        }
+    }
+    let mut lines = Vec::new();
+    let mut owners: Vec<&Statement> = Vec::new();
+    for (e, name) in eta_names.iter().enumerate().take(n_bsv) {
+        let transform = match mu_refs.get(name) {
+            Some(m) if theta_names.contains(&m.theta_name) => Some(m.transform),
+            _ => cov_refs
+                .iter()
+                .find(|c| &c.eta_name == name)
+                .map(|c| c.transform),
+        };
+        let Some(transform) = transform.filter(|t| {
+            matches!(
+                t,
+                MuTransform::Log | MuTransform::Logit | MuTransform::Identity
+            )
+        }) else {
+            continue;
+        };
+        if outside_idents.contains(&name.to_ascii_uppercase()) {
+            continue;
+        }
+        let readers: Vec<&Statement> = stmts
+            .iter()
+            .filter(|s| matches!(s, Statement::Assign(_, x) if etas_of(x).contains(&e)))
+            .collect();
+        let [owner @ Statement::Assign(var, expr)] = readers[..] else {
+            continue;
+        };
+        let mut local_eta = false;
+        visit_expr_nodes(expr, &mut |n| {
+            if let Expression::Variable(v) = n {
+                local_eta |= eta_tainted.contains(&v.to_ascii_uppercase());
+            }
+        });
+        let assigned = stmts
+            .iter()
+            .filter(|s| matches!(s, Statement::Assign(n, _) if n.eq_ignore_ascii_case(var)))
+            .count();
+        let Some(slot) = indiv_var_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(var))
+        else {
+            continue;
+        };
+        if etas_of(expr).len() != 1 || local_eta || assigned != 1 {
+            continue;
+        }
+        lines.push((e, slot, transform));
+        owners.push(owner);
+    }
+    if lines.is_empty() {
+        return MuFoldSpec::default();
+    }
+    // The names the likelihood reads: every other block's, and the dose attributes (`F1`,
+    // `ALAG2`, `D1`, …), which the engine applies by name with no textual reader (#993).
+    let mut outside = outside_idents.clone();
+    outside.extend(stmts.iter().filter_map(|s| match s {
+        Statement::Assign(n, _) if engine_dose_attr(n, false).is_some() => {
+            Some(n.to_ascii_uppercase())
+        }
+        _ => None,
+    }));
+    let thetas = theta_names
+        .iter()
+        .enumerate()
+        .filter(|&(i, t)| {
+            // It reaches some line (else there is nothing to fold) …
+            let mut reach = HashSet::new();
+            spread_theta_taint(stmts, i, &[], &mut reach);
+            let reaches = owners.iter().any(|o| match o {
+                Statement::Assign(n, _) => reach.contains(&n.to_ascii_uppercase()),
+                _ => false,
+            });
+            // … and nothing else.
+            reaches
+                && thetas_read_outside_the_group(
+                    stmts,
+                    theta_names,
+                    &outside,
+                    &owners,
+                    std::slice::from_ref(t),
+                )
+                .is_empty()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    MuFoldSpec { lines, thetas }
+}
+
 /// Whether an assignment **other than** the group's own typical value reads the
 /// group's eta — the eta-side twin of [`thetas_read_outside_the_group`], and
 /// the second precondition the exact M-step engine needs.
@@ -5940,6 +6094,16 @@ pub fn parse_full_model_with(
         eta_names_bsv.len(),
         &outside_idents,
     );
+    let mu_fold = mu_fold_spec(
+        &indiv_stmts,
+        &theta_names,
+        &all_eta_names,
+        eta_names_bsv.len(),
+        &outside_idents,
+        &mu_refs,
+        &covariate_mu_refs,
+        &indiv_var_names,
+    );
 
     // Build pk_indices: maps each individual parameter (by declaration order)
     // to its PK parameter index. Needed for AD to place values in correct slots.
@@ -6031,6 +6195,7 @@ pub fn parse_full_model_with(
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
+    indiv_param_partials.mu_fold = mu_fold;
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
         &indiv_var_names,
@@ -33951,6 +34116,18 @@ impl IndivParamProgram {
         })
     }
 
+    /// Variable `var_slot` (a top-level `[individual_parameters]` name's slot) at `(θ, η)` on
+    /// any number type: a folded mu line's typical value (#2982).
+    pub(crate) fn eval_var_g<T: crate::sens::num::vm::VmNum>(
+        &self,
+        theta: &[T],
+        eta: &[T],
+        covariates: &HashMap<String, f64>,
+        var_slot: usize,
+    ) -> T {
+        self.eval_vars_g(theta, eta, covariates, &[], |v| v[var_slot])
+    }
+
     /// The shared body of [`Self::eval_params_g`] and [`Self::eval_var_slots_g`]: run the
     /// program and hand `read` every variable.
     fn eval_vars_g<T: crate::sens::num::vm::VmNum, R>(
@@ -35094,6 +35271,9 @@ pub struct IndivParamPartials {
     /// mu-reference *belongs to* rather than a guess from the η's name (#1930).
     /// Empty for hand-built fixtures.
     pub(crate) mu_ref_owners: std::collections::BTreeMap<String, String>,
+    /// The mu lines and θ the covariance Hessian folds into η-space ([`MuFoldSpec`], #2982).
+    /// Empty for hand-built fixtures, which then take no fold.
+    pub(crate) mu_fold: MuFoldSpec,
     /// The names a `[derived]` expression looks up at evaluation time (#2599),
     /// read through [`crate::CompiledModel::derived_reads`]. Parser bookkeeping
     /// kept here rather than on the public `DerivedExprSpec`, whose fields are
@@ -35129,6 +35309,7 @@ impl IndivParamPartials {
             lognormal_eta_chain: None,
             nested_levels: None,
             mu_ref_owners: std::collections::BTreeMap::new(),
+            mu_fold: MuFoldSpec::default(),
             derived_reads: Vec::new(),
             random_indiv_params: None,
         }
@@ -35203,6 +35384,7 @@ fn build_indiv_param_partials(
         lognormal_eta_chain: None,
         nested_levels: None,
         mu_ref_owners: std::collections::BTreeMap::new(),
+        mu_fold: MuFoldSpec::default(),
         derived_reads: Vec::new(),
         random_indiv_params: None,
     }

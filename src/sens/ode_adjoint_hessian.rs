@@ -40,6 +40,10 @@ use crate::sens::focei_kernel::{chol_logdet, focei_htilde, OmegaT};
 use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, PkNum};
 
+#[path = "ode_adjoint_hessian_basis.rs"]
+pub(super) mod basis;
+use basis::{Basis, Lanes, Moved, MuFold, PlanKey, PlanRun};
+
 /// The most directions one pass carries as the plans' tangent lanes.
 ///
 /// A pass is one forward along its directions and one forward-over-reverse sweep over
@@ -433,6 +437,7 @@ fn psi_lanes(
     let n = plan.pn();
     let width = pass_width();
     let l = 1 + width;
+    plan.prepare(dirs);
     for (c, chunk) in dirs.chunks(width).enumerate() {
         let run = plan.run(chunk, width)?;
         let out = run.out();
@@ -802,6 +807,13 @@ pub(super) struct CovPlan<'a> {
     d2: Vec<f64>,
     second: bool,
     variant: kj::Desc,
+    /// The θ the prediction plans carry on their η axes ([`MuFold`], #2982).
+    fold: Option<MuFold>,
+    /// The axes the Hessian's directions move ([`Self::prepare`]); `None`: every plan along
+    /// the passes' directions.
+    moved: std::cell::RefCell<Option<Moved>>,
+    /// Each plan's run along its input axes, kept for every pass ([`basis`]).
+    bases: std::cell::RefCell<std::collections::HashMap<PlanKey, Basis>>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -899,13 +911,13 @@ pub(super) struct CovRun {
     kt: usize,
     /// The packed axis each tangent moves.
     dir_x: Vec<Option<usize>>,
-    pred: Option<Kept>,
+    pred: Option<PlanRun>,
     /// An SDE subject's EKF variance rows, a plan over θ then σ.
-    var: Option<Kept>,
-    pop: Option<Kept>,
-    ng: Option<Kept>,
+    var: Option<PlanRun>,
+    pop: Option<PlanRun>,
+    ng: Option<PlanRun>,
     /// Per node: its predictions', its term's and its variance rows' plans.
-    nodes: Vec<(Option<Kept>, Option<Kept>, Option<Kept>)>,
+    nodes: Vec<(Option<PlanRun>, Option<PlanRun>, Option<PlanRun>)>,
     k1: Option<super::kernel::KernelRun>,
     k2: super::kernel::KernelRun,
 }
@@ -954,6 +966,11 @@ impl<'a> CovPlan<'a> {
             sc.width,
             &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
         ));
+        let fold = if basis::mu_fold_off() {
+            None
+        } else {
+            MuFold::at(sc.model, subject, &th, &sc.eta)
+        };
         CovPlan {
             ctx,
             sc,
@@ -970,6 +987,9 @@ impl<'a> CovPlan<'a> {
             d2,
             second,
             variant,
+            fold,
+            moved: std::cell::RefCell::new(None),
+            bases: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1043,26 +1063,13 @@ impl<'a> CovPlan<'a> {
     }
 
     /// The parameter slots of a prediction plan: θ, and under the reduced basis the network
-    /// outputs after it; tangent `a` along `dirs[a]`.
-    fn pred_params(&self, dirs: &[Dir]) -> (Vec<f64>, Box<dyn Fn(usize, usize) -> f64 + '_>) {
-        let n_th = self.th.len();
+    /// outputs after it (their tangents: [`Self::param_t`]).
+    fn pred_values(&self) -> Vec<f64> {
         let mut p = self.th.clone();
         if let Some(z) = self.nn_z {
             p.extend(z.iter().flatten());
         }
-        let dirs = dirs.to_vec();
-        (
-            p,
-            Box::new(move |i, a| {
-                if i < n_th {
-                    self.theta_t(&dirs, i, a)
-                } else if dirs.get(a).and_then(|d| d.z) == Some(i - n_th) {
-                    1.0
-                } else {
-                    0.0
-                }
-            }),
-        )
+        p
     }
 
     /// Run a subject's prediction plan at `(θ, eta)` along `eta_t` (base layout `base`).
@@ -1072,7 +1079,7 @@ impl<'a> CovPlan<'a> {
         model: &CompiledModel,
         eta: &[f64],
         eta_t: &dyn Fn(usize, usize) -> f64,
-        dirs: &[Dir],
+        lanes: Lanes<'_>,
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
@@ -1080,10 +1087,11 @@ impl<'a> CovPlan<'a> {
             tan: kt as u8,
             ..base
         };
-        let (params, p_t) = self.pred_params(dirs);
+        let params = self.pred_values();
+        let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let n_obs = self.subject.observations.len();
         let mut serve = |pl: &PlanArc| -> Option<Kept> {
-            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &*p_t, kt);
+            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
             (du[n_obs * layout.lanes()] == 1.0).then(|| Kept {
@@ -1113,7 +1121,7 @@ impl<'a> CovPlan<'a> {
         &self,
         eta: &[f64],
         eta_t: &dyn Fn(usize, usize) -> f64,
-        dirs: &[Dir],
+        lanes: Lanes<'_>,
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
@@ -1122,19 +1130,9 @@ impl<'a> CovPlan<'a> {
             ..base
         };
         let sigma = self.sc.params.sigma.values.as_slice();
-        let s0 = packed_segments(self.template).sigma_start();
-        let (mut params, pred_t) = self.pred_params(dirs);
-        let n_p = params.len();
+        let mut params = self.pred_values();
         params.extend_from_slice(sigma);
-        let p_t = |i: usize, a: usize| -> f64 {
-            if i < n_p {
-                pred_t(i, a)
-            } else if dirs.get(a).and_then(|d| d.x) == Some(s0 + i - n_p) {
-                sigma[i - n_p]
-            } else {
-                0.0
-            }
-        };
+        let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let n_obs = self.subject.observations.len();
         let mut serve = |pl: &PlanArc| -> Option<Kept> {
             let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
@@ -1174,7 +1172,7 @@ impl<'a> CovPlan<'a> {
         &self,
         eta: &[f64],
         eta_t: &dyn Fn(usize, usize) -> f64,
-        dirs: &[Dir],
+        lanes: Lanes<'_>,
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
@@ -1183,7 +1181,7 @@ impl<'a> CovPlan<'a> {
             ..base
         };
         let plans = super::terms::non_gaussian_plans(self.sc.model, self.subject, &self.th, eta)?;
-        let p_t = |i: usize, a: usize| self.theta_t(dirs, i, a);
+        let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let (u, p) = Self::plan_inputs(layout, eta, eta_t, &self.th, &p_t, kt);
         plans.iter().find_map(|pl| {
             let mut du = vec![0.0; 2 * layout.lanes()];
@@ -1225,13 +1223,33 @@ impl<'a> CovPlan<'a> {
             wide: false,
             tan: 0,
         };
+        let n_par = self.th.len() + self.nz;
+        let n_sig = self.sc.params.sigma.values.len();
         let pred = if n_obs > 0 {
-            Some(self.run_pred(model, eta, &eta_t, dirs, base, kt)?)
+            Some(self.plan_run(
+                PlanKey::Pred,
+                dirs,
+                pn,
+                n_par,
+                true,
+                &eta_t,
+                kt,
+                &|lanes, et| self.run_pred(model, eta, et, lanes, base, kt),
+            )?)
         } else {
             None
         };
         let var = if n_obs > 0 && model.is_sde() {
-            Some(self.run_var(eta, &eta_t, dirs, base, kt)?)
+            Some(self.plan_run(
+                PlanKey::Var,
+                dirs,
+                pn,
+                n_par + n_sig,
+                true,
+                &eta_t,
+                kt,
+                &|lanes, et| self.run_var(eta, et, lanes, base, kt),
+            )?)
         } else {
             None
         };
@@ -1253,7 +1271,16 @@ impl<'a> CovPlan<'a> {
         {
             let zero_t = |_: usize, _: usize| 0.0;
             let zeros = vec![0.0; pn];
-            Some(self.run_pred(sc.pop_model, &zeros, &zero_t, dirs, Layout::F64, kt)?)
+            Some(self.plan_run(
+                PlanKey::Pop,
+                dirs,
+                pn,
+                n_par,
+                false,
+                &zero_t,
+                kt,
+                &|lanes, et| self.run_pred(sc.pop_model, &zeros, et, lanes, Layout::F64, kt),
+            )?)
         } else {
             None
         };
@@ -1261,7 +1288,16 @@ impl<'a> CovPlan<'a> {
         let nb = model.n_eta;
         let ng = if has_ng {
             let base = super::terms::layout2(nb);
-            Some(self.run_term(&sc.eta[..nb], &eta_t, dirs, base, kt)?)
+            Some(self.plan_run(
+                PlanKey::Term,
+                dirs,
+                nb,
+                self.th.len(),
+                true,
+                &eta_t,
+                kt,
+                &|lanes, et| self.run_term(&sc.eta[..nb], et, lanes, base, kt),
+            )?)
         } else {
             None
         };
@@ -1294,10 +1330,12 @@ impl<'a> CovPlan<'a> {
                 put_in(&mut inputs, lk, $slot, $v, $t)
             };
         }
+        let po = |pr: &PlanRun, j: usize, x: usize, a: Option<usize>| self.plan_out(pr, j, x, a);
         if let Some(pk) = pred.as_ref() {
             for j in 0..n_obs {
                 for x in 0..lb {
-                    put!(slots.f(j, x), pk.out(j, x, None), &|a| pk.out(
+                    put!(slots.f(j, x), po(pk, j, x, None), &|a| po(
+                        pk,
                         j,
                         x,
                         Some(a)
@@ -1308,7 +1346,8 @@ impl<'a> CovPlan<'a> {
         if let Some(vk) = var.as_ref() {
             for j in 0..n_obs {
                 for x in 0..lb {
-                    put!(slots.f(n_obs + j, x), vk.out(j, x, None), &|a| vk.out(
+                    put!(slots.f(n_obs + j, x), po(vk, j, x, None), &|a| po(
+                        vk,
                         j,
                         x,
                         Some(a)
@@ -1318,7 +1357,8 @@ impl<'a> CovPlan<'a> {
         }
         if let Some(pp) = pop.as_ref() {
             for j in 0..n_obs {
-                put!(slots.pop + j, pp.out(j, 0, None), &|a| pp.out(
+                put!(slots.pop + j, po(pp, j, 0, None), &|a| po(
+                    pp,
                     j,
                     0,
                     Some(a)
@@ -1326,16 +1366,18 @@ impl<'a> CovPlan<'a> {
             }
         }
         if let Some(t) = ng.as_ref() {
-            put!(slots.ng, t.out(0, 0, None), &|a| t.out(0, 0, Some(a)));
+            put!(slots.ng, po(t, 0, 0, None), &|a| po(t, 0, 0, Some(a)));
             for k in 0..nb {
-                put!(slots.ng_g(k), t.out(0, 1 + k, None), &|a| t.out(
+                put!(slots.ng_g(k), po(t, 0, 1 + k, None), &|a| po(
+                    t,
                     0,
                     1 + k,
                     Some(a)
                 ));
                 for l in 0..=k {
                     let h = super::terms::h_lane(nb, k, l);
-                    put!(slots.ng_h(k, l), t.out(0, h, None), &|a| t.out(
+                    put!(slots.ng_h(k, l), po(t, 0, h, None), &|a| po(
+                        t,
                         0,
                         h,
                         Some(a)
@@ -1381,9 +1423,19 @@ impl<'a> CovPlan<'a> {
                 let bv: Vec<f64> = (0..pn).map(|k| k1.out[(nd * pn + k) * lk]).collect();
                 let bt = |k: usize, a: usize| k1.out[(nd * pn + k) * lk + 1 + a];
                 let fb = if n_obs > 0 {
-                    let fb = self.run_pred(model, &bv, &bt, dirs, Layout::F64, kt)?;
+                    let fb = self.plan_run(
+                        PlanKey::Node(nd),
+                        dirs,
+                        pn,
+                        n_par,
+                        true,
+                        &bt,
+                        kt,
+                        &|lanes, et| self.run_pred(model, &bv, et, lanes, Layout::F64, kt),
+                    )?;
                     for j in 0..n_obs {
-                        put!(slots.nf + nd * n_rows + j, fb.out(j, 0, None), &|a| fb.out(
+                        put!(slots.nf + nd * n_rows + j, po(&fb, j, 0, None), &|a| po(
+                            &fb,
                             j,
                             0,
                             Some(a)
@@ -1394,12 +1446,21 @@ impl<'a> CovPlan<'a> {
                     None
                 };
                 let fv = if n_obs > 0 && model.is_sde() {
-                    let fv = self.run_var(&bv, &bt, dirs, Layout::F64, kt)?;
+                    let fv = self.plan_run(
+                        PlanKey::NodeVar(nd),
+                        dirs,
+                        pn,
+                        n_par + n_sig,
+                        true,
+                        &bt,
+                        kt,
+                        &|lanes, et| self.run_var(&bv, et, lanes, Layout::F64, kt),
+                    )?;
                     for j in 0..n_obs {
                         put!(
                             slots.nf + nd * n_rows + n_obs + j,
-                            fv.out(j, 0, None),
-                            &|a| fv.out(j, 0, Some(a))
+                            po(&fv, j, 0, None),
+                            &|a| po(&fv, j, 0, Some(a))
                         );
                     }
                     Some(fv)
@@ -1408,8 +1469,18 @@ impl<'a> CovPlan<'a> {
                 };
                 let qb = if ng.is_some() {
                     let bb: Vec<f64> = bv[..nb].to_vec();
-                    let t = self.run_term(&bb, &bt, dirs, Layout::F64, kt)?;
-                    put!(slots.nq_node + nd, t.out(0, 0, None), &|a| t.out(
+                    let t = self.plan_run(
+                        PlanKey::NodeTerm(nd),
+                        dirs,
+                        nb,
+                        self.th.len(),
+                        true,
+                        &bt,
+                        kt,
+                        &|lanes, et| self.run_term(&bb, et, lanes, Layout::F64, kt),
+                    )?;
+                    put!(slots.nq_node + nd, po(&t, 0, 0, None), &|a| po(
+                        &t,
                         0,
                         0,
                         Some(a)
@@ -1632,7 +1703,7 @@ impl<'a> CovPlan<'a> {
             let mut b_seeds = vec![vec![0.0; sl.n_nodes * pn * lk]; adj.len()];
             for (nd, (fb, qb, fv)) in r.nodes.iter().enumerate() {
                 let mut node =
-                    |kept: &Kept, slot: &dyn Fn(usize) -> usize, n_out: usize| -> Option<()> {
+                    |kept: &PlanRun, slot: &dyn Fn(usize) -> usize, n_out: usize| -> Option<()> {
                         let back =
                             self.plan_reverse(kept, r, &adj, slot, n_out, tangent, &mut rows)?;
                         for (sd, ub) in back.iter().enumerate() {
@@ -1692,7 +1763,8 @@ impl<'a> CovPlan<'a> {
         }
         if let Some(t) = r.ng.as_ref() {
             let nb = sl.nb;
-            let lb = t.layout.base_lanes();
+            // The term plan's base layout (`run`): value, gradient and Hessian over the BSV block.
+            let lb = super::terms::layout2(nb).base_lanes();
             let slot = |_: usize, x: usize| -> usize {
                 if x == 0 {
                     sl.ng
@@ -1734,7 +1806,7 @@ impl<'a> CovPlan<'a> {
     /// `rows`. Returns the η-input adjoints per seed (all lanes), for a node's location.
     fn plan_reverse(
         &self,
-        kept: &Kept,
+        kept: &PlanRun,
         r: &CovRun,
         adj: &[Vec<f64>],
         slot: &dyn Fn(usize) -> usize,
@@ -1753,7 +1825,7 @@ impl<'a> CovPlan<'a> {
     #[allow(clippy::too_many_arguments)]
     fn plan_reverse_lanes(
         &self,
-        kept: &Kept,
+        pr: &PlanRun,
         r: &CovRun,
         adj: &[Vec<f64>],
         slot: &dyn Fn(usize, usize) -> usize,
@@ -1762,6 +1834,14 @@ impl<'a> CovPlan<'a> {
         tangent: bool,
         rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
+        let kept = match pr {
+            PlanRun::Direct(k) => k,
+            // A basis is only built for forward-over-reverse passes ([`CovPlan::plan_run`]).
+            PlanRun::Basis(u) if tangent => {
+                return self.basis_reverse(u, r, adj, slot, n_out, nl, rows);
+            }
+            PlanRun::Basis(_) => return None,
+        };
         let (kt, lk) = (r.kt, 1 + r.kt);
         let (l, lb) = (kept.layout.lanes(), kept.layout.base_lanes());
         let ns = adj.len();

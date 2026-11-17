@@ -5402,20 +5402,60 @@ pub(super) fn hessian_gaps_for(
     let eta = ebe(&params);
     // On a thread with the fit pool's worker stack (`FIT_RAYON_STACK_SIZE`), where
     // production runs the nested-dual passes; a test thread's default 2 MB is too small.
-    let hessian = |per_direction: bool| {
+    // `(reverse per direction, every plan along the directions, no mu fold)`; returns the
+    // Hessian and how many plans the pass assembled from a basis.
+    let hessian_in = |per_direction: bool, plan_dirs: bool, fold_off: bool| {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(crate::FIT_RAYON_STACK_SIZE)
                 .spawn_scoped(scope, || {
+                    use super::hessian::basis::{BASIS_PLANS, MU_FOLD_OFF, PLAN_PER_DIRECTION};
                     super::hessian::REVERSE_PER_DIRECTION.with(|c| c.set(per_direction));
-                    subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), objective)
+                    PLAN_PER_DIRECTION.with(|c| c.set(plan_dirs));
+                    MU_FOLD_OFF.with(|c| c.set(fold_off));
+                    BASIS_PLANS.with(|c| c.set(0));
+                    let h = subject_adjoint_cov_hessian(
+                        model,
+                        s,
+                        &params,
+                        &x,
+                        eta.as_slice(),
+                        objective,
+                    );
+                    (h, BASIS_PLANS.with(std::cell::Cell::get))
                 })
                 .expect("spawn")
                 .join()
                 .expect("join")
         })
-        .expect("subject must be in adjoint scope")
     };
+    let hessian = |per_direction: bool| {
+        hessian_in(per_direction, false, false)
+            .0
+            .expect("subject must be in adjoint scope")
+    };
+    // The plans along a basis of their inputs (#2980) against every plan along the directions,
+    // and the mu fold against none: the same derivatives assembled by linearity (and, folded,
+    // through `∂μ/∂θ`), so they differ by rounding only.
+    {
+        let (h_basis, n_basis) = hessian_in(false, false, false);
+        let (h_dirs, _) = hessian_in(false, true, false);
+        let (h_nofold, _) = hessian_in(false, false, true);
+        let (h_basis, h_dirs, h_nofold) = (
+            h_basis.expect("basis: in scope"),
+            h_dirs.expect("directions: in scope"),
+            h_nofold.expect("no fold: in scope"),
+        );
+        let (g_dirs, g_fold) = (
+            rel_gap(h_basis.as_slice(), h_dirs.as_slice()),
+            rel_gap(h_basis.as_slice(), h_nofold.as_slice()),
+        );
+        eprintln!(
+            "hessian: {n_basis} basis plans; basis vs directions {g_dirs:.2e}, fold vs none {g_fold:.2e}"
+        );
+        assert!(g_dirs < 1e-12, "basis vs directions: {g_dirs:.2e}");
+        assert!(g_fold < 1e-12, "fold vs none: {g_fold:.2e}");
+    }
     // Forward over reverse (production) against reverse over forward, one reverse per
     // direction (#2980): the same second derivatives of the same programs, so they differ by
     // the accumulation order only. Every fixture of this oracle is also that parity check.
