@@ -80,6 +80,24 @@ pub(crate) const GN_DEGENERATE_COLLAPSE_WARNING: &str =
 pub(crate) const GN_BUDGET_WARNING: &str =
     "Gauss-Newton: max iterations reached without convergence";
 
+/// The warning `method = gn` carries when the population has fewer subjects than free
+/// parameters (#2438): the BHHH information `Σᵢ gᵢgᵢᵀ` is one rank-one term per subject, so
+/// it is singular by construction, and the trust-region steps it models can stall along the
+/// directions it does not see (`pktte_joint`: 6 subjects, 7 free parameters, every step
+/// after iteration 5 rejected). `gn_hybrid` finishes with an L-BFGS polish that needs no BHHH.
+pub(crate) fn gn_rank_deficient_warning(n_subjects: usize, n_free: usize) -> String {
+    let subjects = if n_subjects == 1 {
+        "subject"
+    } else {
+        "subjects"
+    };
+    format!(
+        "Gauss-Newton (BHHH): {n_subjects} {subjects} for {n_free} free parameters, so the \
+         BHHH information has rank at most {n_subjects} and is singular; its steps can stall \
+         short of the optimum. Use method = gn_hybrid, or a different optimizer."
+    )
+}
+
 /// Whether an accepted step ends the GN loop as converged on the small-change rule:
 /// the OFV moved by less than `1e-6` relative, from iteration 4 on, **and** the radius the
 /// step was solved under had not collapsed (`radius ≥ GN_COLLAPSED_RADIUS`, #2738). Below
@@ -207,6 +225,11 @@ pub fn run_foce_gn(
              consider method=foce_i for heavy censoring fractions (>20%)."
                 .to_string(),
         );
+    }
+
+    let n_free = fixed_mask.iter().filter(|&&f| !f).count();
+    if n_subj < n_free && !matches!(options.method, EstimationMethod::FoceGnHybrid) {
+        warnings.push(gn_rank_deficient_warning(n_subj, n_free));
     }
 
     if verbose {
@@ -2892,6 +2915,51 @@ mod tests {
     /// #816 follow-up regression: GN and its FOCEI hybrid both optimize in packed
     /// Cholesky space, so their covariance step uses the optimizer's exact factor
     /// `L`. Both return sites must carry `packed_estimate` so a standalone
+    /// #2438: plain `gn` warns, once, when the population has fewer subjects than free
+    /// parameters, since its BHHH is then singular by construction. One more subject, or
+    /// `gn_hybrid`, does not warn. `make_model` has 4 free parameters, `make_population` 3.
+    #[test]
+    fn gn_warns_when_its_bhhh_is_rank_deficient_by_construction() {
+        let model = make_model();
+        let pop = make_population();
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::FoceGn,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let rank = |p: &Population, o: &FitOptions| -> Vec<String> {
+            run_foce_gn(&model, p, &model.default_params, o)
+                .warnings
+                .into_iter()
+                .filter(|w| w.starts_with("Gauss-Newton (BHHH): "))
+                .collect()
+        };
+        assert_eq!(
+            rank(&pop, &opts),
+            [
+                "Gauss-Newton (BHHH): 3 subjects for 4 free parameters, so the BHHH information \
+              has rank at most 3 and is singular; its steps can stall short of the optimum. Use \
+              method = gn_hybrid, or a different optimizer."
+            ]
+        );
+        let mut four = pop.clone();
+        four.subjects.push(Subject {
+            id: "4".into(),
+            ..pop.subjects[0].clone()
+        });
+        assert!(
+            rank(&four, &opts).is_empty(),
+            "as many subjects as parameters"
+        );
+        let hybrid = FitOptions {
+            method: crate::types::EstimationMethod::FoceGnHybrid,
+            ..opts.clone()
+        };
+        assert!(rank(&pop, &hybrid).is_empty(), "gn_hybrid");
+        assert!(gn_rank_deficient_warning(1, 2).starts_with("Gauss-Newton (BHHH): 1 subject for"));
+    }
+
     /// `run_covariance` reproduces the inline covariance bit-for-bit (without it the
     /// standalone step re-decomposes `chol(L·Lᵀ) ≠ L` and diverges on an
     /// ill-conditioned ω). Fails if either return regresses to `None`.
@@ -6418,8 +6486,10 @@ mod tests {
             "the accepted polish's warning must reach the fit, got {:?}",
             hybrid.warnings
         );
-        // The GN phase's own record of how the polish's start was reached stays.
-        for w in &pure.warnings {
+        // The GN phase's own record of how the polish's start was reached stays. `pure` runs
+        // that phase as plain `gn`, whose rank warning (#2438) the hybrid does not raise.
+        let gn_only = |w: &&String| !w.starts_with("Gauss-Newton (BHHH): ");
+        for w in pure.warnings.iter().filter(gn_only) {
             assert!(
                 hybrid.warnings.contains(w),
                 "GN-phase warning {w:?} dropped: {:?}",
