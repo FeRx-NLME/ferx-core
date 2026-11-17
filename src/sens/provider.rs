@@ -89,10 +89,24 @@ fn prog_covers_required_pk_slots(
 /// by wrapping the negative elapsed time up into `[0, II)`. Returns `None` when
 /// the dose does not contribute at `t_obs`. `lag_d` is the seeded lagtime dual;
 /// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
+///
+/// Known divergence, confined to `ALAG > II`: this *wraps* the pre-arrival phase where
+/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
+/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and always takes the collapsed
+/// `C_ss(t − t_eff)` where production splits into tail + arrival once
+/// `!crate::dosing::ss_arrival_is_trough`; predictions measured up to ~19 % from production's
+/// there. It needs its own fix and its own anchor.
 #[inline]
 fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
+    use crate::sens::num::BranchCmp as B;
     let t_eff = dose.time + lag_val;
-    if t_eff <= t_obs {
+    // A recording decides on its own lag, through the branch API (#2786): the same sum.
+    let arrived = if T::RECORDS_BRANCHES {
+        lag_d.br_shift_cmp(dose.time, B::Le, t_obs)
+    } else {
+        t_eff <= t_obs
+    };
+    if arrived {
         // `elapsed = (t_obs − dose.time) − lagtime`.
         Some(T::from_f64(t_obs - dose.time) - lag_d)
     } else if dose.ss && dose.ii > 0.0 && t_obs >= dose.time {
@@ -101,8 +115,16 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
         // locally constant, so `∂elapsed/∂lagtime = −1` still holds.
         let raw = t_obs - t_eff;
         let n = (-raw / dose.ii).ceil();
+        if T::RECORDS_BRANCHES {
+            // `n` is a step function of the lag: keep it, `n − 1 < (t_eff − t_obs)/II ≤ n`,
+            // on the recorded quotient (the same operations: `−(a − b) = b − a` exactly).
+            let q = (T::from_f64(dose.time) + lag_d - T::from_f64(t_obs)) / T::from_f64(dose.ii);
+            if !(q.br_cmp_c(B::Gt, n - 1.0) && q.br_cmp_c(B::Le, n)) {
+                return None;
+            }
+        }
         let wrapped = T::from_f64(t_obs - dose.time + n * dose.ii) - lag_d;
-        if wrapped.val() < 0.0 {
+        if wrapped.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
             None
         } else {
             Some(wrapped)
@@ -130,7 +152,7 @@ struct PkClassFlags {
 /// The 14 PK-parameter duals a dose superposition reads, seeded once from `seed_dim`
 /// (which slot maps to which compact dual axis; `None` = constant). Generic over the
 /// seeded number type so the outer walker instantiates it at `Dual2<N>` (full `(θ,η)`
-/// jet + Hessian) and the inner at `Dual1<N>` (η-gradient only) from identical code.
+/// jet + Hessian) and the inner at `Dual2<N>` (η-gradient only) from identical code.
 /// `lag_val` is kept alongside `lag_d` so the lagged-arrival reset test can branch on the
 /// plain value without a borrow.
 struct SeededPkDuals<T: PkNum> {
@@ -202,7 +224,7 @@ impl<T: PkNum> SeededPkDuals<T> {
     /// ([`crate::sens::propagate::cl_or_v_degenerate`], #2104), on the seeded values.
     #[inline]
     fn cl_or_v_degenerate(&self) -> bool {
-        crate::sens::propagate::cl_or_v_degenerate(self.cl_d.val(), self.v1_d.val())
+        crate::sens::propagate::cl_or_v_degenerate_g(self.cl_d, self.v1_d)
     }
 
     /// `crate::sens::propagate::dose_override_g` on the seeded values, for the
@@ -319,7 +341,6 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         && model.n_kappa == 0
         && scaling_supported(model)
         && init_supported(model)
-        && analytic_readout_dual_supported(model)
         // Every individual-parameter slot must be one we differentiate; a slot outside
         // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) routes to FD.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
@@ -354,7 +375,7 @@ thread_local! {
 /// (before #2093) the then-predicate `analytical_supported` returned `true`, `build_info::gradient_method{,_inner}` persisted
 /// "analytic", and then *every* subject fell through `const_dispatch!`'s `_ => None` to
 /// finite differences at ~10× the cost — precisely the "claim analytic then FD every
-/// subject" drift that `analytic_readout_dual_supported` exists to prevent (#637). Declining
+/// subject" drift the route predicates exist to prevent (#637). Declining
 /// here changes no numbers (those subjects already ran on FD); it makes the reported method
 /// match the route (PR #950 review #2).
 ///
@@ -371,135 +392,139 @@ fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
         .is_none_or(|prog| prog.pk_slots_ref().len() <= MAX_CLOSED_FORM_SLOTS)
 }
 
-/// Whether an analytic Form C readout (`[scaling] y = <expr>`, #650), if present,
-/// is one the closed-form engines evaluate on a dual (`eval_readout_jet`). `true` when there is no
-/// readout (the built-in concentration output), or when the readout is:
-/// - a **uniform** `Single` readout (per-CMT `y[CMT=N]` routes to FD for now),
-/// - carrying a **dual-evaluable** program (no bare θ/η / NN output — those are
-///   left un-desugared on the analytic path, so they fall back to FD), and
-/// - not referencing the oral **depot** amount (the static superposition jet
-///   reconstructs the central amount as `conc × V` but not the depot amount),
-///   and the model has no `[initial_conditions]` baseline (the init impulse is
-///   layered onto the concentration, not the post-readout output).
-///
-/// When `false`, the model's Form C readout routes to the finite-difference
-/// gradient — which differentiates the readout-aware f64 predictor, so it is
-/// correct, just slower (a documented fallback, not silent: the parser attaches
-/// a warning). Keeping the check here means the scope predicates
-/// (`closed_form_model_scope`, and through it the adjoint's `model_in_scope`) report FD
-/// honestly rather than claiming analytic and then FD-ing every subject (#637).
-pub(crate) fn analytic_readout_dual_supported(model: &CompiledModel) -> bool {
-    let Some(ar) = &model.analytic_readout else {
-        return true;
-    };
-    if !model.analytical_init.is_empty() {
-        return false;
-    }
-    match (&ar.readout, &ar.program) {
-        (crate::ode::OdeReadout::Single(_), Some(prog)) => {
-            // Depot is state slot 0 only in the first-order-oral
-            // `["depot", "central"]` layout. IV models (and the transit model,
-            // whose analytic layout is central-only) have no depot slot, so their
-            // slot 0 is `central` — guard the depot check on the layout, not on
-            // `is_oral()` (which also matches transit).
-            let has_depot_slot = matches!(
-                model.pk_model,
-                PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-            );
-            prog.is_dual_evaluable() && !(has_depot_slot && prog.references_state(0))
-        }
-        _ => false,
-    }
-}
-
-/// Whether an analytic Form C readout can be served analytically on the
-/// **tv-covariate / oral-infusion / TIME** event-walk path (#650).
-///
-/// The walk's `PkDual` carries only the eight structural slots (`CL..V3`), so a readout
-/// referencing a 9th+ individual parameter (reachable once several non-structural readout
-/// params are allocated — a 3-cpt-oral sigmoid-Emax `y = <expr>` exhausts the low slots
-/// immediately) used to fall back to FD here. Since #486 the walk materializes those higher
-/// slots per observation (now the full PK-slot vector `closed_form_event_predictions` reads
-/// through `obs_params(j)`) — value from `pk_param_fn`, jet from the same program
-/// derivatives — so the slot ceiling is gone and this now reduces to the static-path scope.
-pub(crate) fn readout_tvcov_supported(model: &CompiledModel) -> bool {
-    let Some(ar) = &model.analytic_readout else {
-        return true;
-    };
-    match &ar.program {
-        Some(_) => analytic_readout_dual_supported(model),
-        None => false,
-    }
-}
-
-/// Evaluate an analytic Form C readout jet at one observation (#650), generic over
-/// the `PkNum` dual type.
-///
-/// Reconstructs the compartment-amount state the readout expects — the central
-/// amount is `conc × V` (`params[PK_IDX_V]`), any depot slot is left at zero
-/// (depot-referencing readouts route to FD, so the walks never reach here with
-/// one) — then runs the readout program. Shared by the static
-/// (`analytic_static_predictions`, via `apply_readout_jet`) and event-walk
-/// (`closed_form_event_predictions`) recordings so the two cannot drift. `params` is the flat
-/// PK-slot dual vector; `ro_state` / `ro_vars` / `ro_stack` are caller-owned
-/// scratch, cleared here.
-#[inline]
-fn eval_readout_jet<T: crate::sens::num::vm::VmNum>(
-    prog: &crate::parser::model_parser::OdeOutputProgram,
-    conc: T,
-    params: &[T],
-    cov: &std::collections::HashMap<String, f64>,
-    ro_state: &mut Vec<T>,
-    ro_vars: &mut Vec<T>,
-    ro_stack: &mut Vec<T>,
-) -> T {
-    let n_states = prog.n_states();
-    let central_slot = n_states.saturating_sub(1);
-    ro_state.clear();
-    ro_state.resize(n_states, T::from_f64(0.0));
-    ro_state[central_slot] = conc * params[PK_IDX_V];
-    prog.eval_output_g::<T>(ro_state, params, cov, ro_vars, ro_stack)
-}
-
-/// Apply the analytic Form-C readout (#650) to one observation's (already clamped)
-/// concentration jet: replace `conc` with `y = <expr>` over the seeded dual (central
-/// amount = conc × V), under this observation's `ModelTimeGuard` so a `TIME`-referencing
-/// readout resolves `Op::PushTime` to `t_obs` (matching production's
-/// `apply_analytic_readout` guard; a no-op for a `TIME`-free readout). Returns `conc`
-/// unchanged with no readout, touching the covariate/time snapshots only on the readout
-/// path. Generic over the number type, so every recording through
-/// `analytic_static_predictions` shares the guard/eval wiring (#637).
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn apply_readout_jet<T: crate::sens::num::vm::VmNum>(
-    conc: T,
-    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
-    ro_pk_duals: Option<&[T; N_PK]>,
+/// The readout program observation `j` evaluates. The outer `Option` is the model's: `None`
+/// where the readout has no compiled program (a hand-built model; the parser always compiles
+/// one), which declines the subject. The inner one is the observation's: under a per-CMT
+/// readout an observation whose CMT has no entry is a `NaN` prediction, as
+/// `OdeReadout::eval` serves it.
+pub(crate) fn readout_program_at<'a>(
+    ar: &'a crate::types::AnalyticReadout,
     subject: &Subject,
-    obs_i: usize,
-    ro_state: &mut Vec<T>,
-    ro_vars: &mut Vec<T>,
-    ro_stack: &mut Vec<T>,
-) -> T {
-    if let (Some(prog), Some(pkd)) = (readout, ro_pk_duals) {
-        // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
-        // thread-local; enter this observation's time to match production's
-        // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
-        // `readout_time`, like production — the raw data-file clock.
-        let _time_guard =
-            crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(obs_i));
-        eval_readout_jet::<T>(
-            prog,
-            conc,
-            pkd,
-            subject.obs_cov(obs_i),
-            ro_state,
-            ro_vars,
-            ro_stack,
-        )
-    } else {
-        conc
+    j: usize,
+) -> Option<Option<&'a crate::parser::model_parser::OdeOutputProgram>> {
+    match &ar.readout {
+        crate::ode::OdeReadout::Single(_) => ar.program.as_ref().map(Some),
+        crate::ode::OdeReadout::PerCmt(map) => {
+            match map.get(&subject.obs_cmts.get(j).copied().unwrap_or(0)) {
+                Some(r) => r.program.as_ref().map(Some),
+                None => Some(None),
+            }
+        }
+        crate::ode::OdeReadout::ObsCmt(_) => None,
     }
+}
+
+/// The analytic Form C readout (`[scaling] y = <expr>`, #650) at every observation, over the
+/// recording's number type: each observation's concentration `conc[j]` (clamped at zero and
+/// carrying any `init(...)` impulse, as production applies the readout last of the three)
+/// becomes the central **amount** `conc × V` the readout reads (`V` from that observation's
+/// parameters), beside the oral depot amount `depot[j]` where the readout reads it, the
+/// individual parameters, covariates and `leaves`; the program is the model's uniform one or
+/// the observation's CMT's. Each evaluation runs under its own `ModelTimeGuard` so a `TIME`
+/// readout resolves to `t_obs`, as `pk::apply_analytic_readout`'s does.
+///
+/// One evaluator for the static superposition and both event walks, so the three cannot drift.
+/// `obs_params(j)` is the flat PK-slot vector at observation `j`. `None` for a readout with no
+/// compiled program (see [`readout_program_at`]).
+pub(crate) fn apply_closed_form_readout_g<'p, T: crate::sens::num::vm::VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    conc: Vec<T>,
+    depot: Option<&[T]>,
+    obs_params: &dyn Fn(usize) -> std::borrow::Cow<'p, [T; N_PK]>,
+    leaves: crate::sens::ode_provider::ReadoutLeaves<'_, T>,
+) -> Option<Vec<T>> {
+    let Some(ar) = model.analytic_readout.as_ref() else {
+        return Some(conc);
+    };
+    let mut ro_state: Vec<T> = crate::scratch::take_for(0);
+    let mut ro_vars: Vec<T> = crate::scratch::take_for(0);
+    let mut ro_stack: Vec<T> = crate::scratch::take_for(0);
+    let mut out = crate::scratch::take_for(conc.len());
+    for (j, &c) in conc.iter().enumerate() {
+        let Some(prog) = readout_program_at(ar, subject, j)? else {
+            out.push(T::from_f64(f64::NAN));
+            continue;
+        };
+        let _time_guard =
+            crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
+        let params = obs_params(j);
+        let n_states = prog.n_states();
+        ro_state.clear();
+        ro_state.resize(n_states, T::from_f64(0.0));
+        ro_state[n_states.saturating_sub(1)] = c * params[PK_IDX_V];
+        if let (Some(d), true) = (depot, n_states > 1) {
+            ro_state[0] = d[j];
+        }
+        out.push(prog.eval_output_g::<T>(
+            &ro_state,
+            &params[..],
+            leaves.theta,
+            leaves.eta,
+            subject.obs_cov(j),
+            &mut ro_vars,
+            &mut ro_stack,
+        ));
+    }
+    crate::scratch::give_for(conc);
+    crate::scratch::give_for(ro_state);
+    crate::scratch::give_for(ro_vars);
+    crate::scratch::give_for(ro_stack);
+    Some(out)
+}
+
+/// The oral depot amount at every observation (`pk::analytical_state_at_times`, slot 0) over
+/// the recording's number type: the superposed `F·amt·e^{−ka·τ}` of every bolus into the
+/// depot (an infusion bypasses it), `τ` the lagged elapsed time of [`lagged_elapsed`], an SS
+/// bolus scaled by the steady-state factor, floored at zero — all at the **one** snapshot
+/// `pk` production reads it from (the subject-static `t = 0` parameters of the occasion), so
+/// on a time-varying-covariate subject it is not the per-observation snapshot the readout's own
+/// parameters read. Production refuses the subjects this superposition cannot serve (EVID 3/4
+/// resets, a dose off the default compartment), so none reaches here.
+/// `dual_of(slot, value)` seeds each PK slot.
+pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
+    subject: &Subject,
+    pk: &crate::types::PkParams,
+    dual_of: &dyn Fn(usize, f64) -> T,
+) -> Vec<T> {
+    let d = SeededPkDuals::<T>::seed_with(pk, dual_of);
+    subject
+        .obs_times
+        .iter()
+        .map(|&t_obs| {
+            if crate::pk::superposition_arrival_non_finite(&subject.doses, d.lag_val) {
+                return T::from_f64(f64::NAN);
+            }
+            let ss_cutoff = crate::dosing::ss_reset_cutoff(&subject.doses, t_obs);
+            let mut acc = T::from_f64(0.0);
+            for (k, dose) in subject.doses.iter().enumerate() {
+                if dose.is_infusion() || !crate::dosing::ss_reset_live(&subject.doses, ss_cutoff, k)
+                {
+                    continue;
+                }
+                let Some(tau) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
+                    continue;
+                };
+                if d.ka_d.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+                    || tau.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+                {
+                    continue;
+                }
+                let a = d.f_d * T::from_f64(dose.amt) * (-(d.ka_d * tau)).exp();
+                acc = acc
+                    + if dose.ss && dose.ii > 0.0 {
+                        a * crate::sens::num::ss_factor(d.ka_d, dose.ii)
+                    } else {
+                        a
+                    };
+            }
+            if acc.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
+                T::from_f64(0.0)
+            } else {
+                acc
+            }
+        })
+        .collect()
 }
 
 /// Whether the model's `[initial_conditions]` baseline (#521) is one the closed-form
@@ -568,27 +593,6 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
     crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
 }
 
-/// `analytic_outer_gradient_available`, kept as the shared entry point that
-/// `crate::types::Optimizer::resolve_auto` and `build_info::gradient_method_outer`
-/// consult so `auto`'s pick and the reported gradient method can never disagree
-/// with the outer loop's actual dispatch.
-///
-/// As of the FOCE σ-magnitude work (#486), a custom / time-varying residual-error
-/// magnitude (`σ = expr(TIME, cov, θ)`) is analytic on **both** loops — the
-/// Sheiner–Beal FOCE (non-interaction) assembly (`subject_packed_gradient_foce` /
-/// `subject_packed_gradient_foce_iov`) now threads `mult(θ)` through its marginal
-/// `R⁰` (value + direct-θ derivative), matching the FOCEI direct-θ channel. So the
-/// predicate no longer narrows by `interaction`: every exclusion in
-/// `analytic_outer_gradient_available` is interaction-independent (a magnitude
-/// combined with an M3-censored row is a *per-subject* FD fallback, as under
-/// FOCEI, not a model-level decline). The `interaction` parameter is retained for
-/// call-site stability and in case a future interaction-only channel must
-/// re-narrow here.
-pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interaction: bool) -> bool {
-    let _ = interaction;
-    analytic_outer_gradient_available(model)
-}
-
 // ─── IOV (inter-occasion variability) analytic sensitivities ──────────
 //
 // IOV makes the PK parameters switch mid-decay at occasion boundaries (NONMEM
@@ -603,10 +607,10 @@ pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interactio
 // The inner/outer "η" for an IOV subject is the **stacked** random-effects vector
 //   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
 // with `K = iov_occasion_groups(subject).len()`. The adjoint differentiates over that
-// stacked vector (`subject_width`, capped at `MAX_WIDTH` in `ode_adjoint.rs`), so the
-// caller's block-Ω (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the
-// clause-by-clause history below describes the pre-#2093 forward provider; the
-// predicate now only gates the absorption-walk routing, `absorption_walk_sens_in_scope`.)
+// stacked vector (the subject's own `[η, κ]` width, uncapped), so the caller's block-Ω
+// (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the clause-by-clause history
+// below describes the pre-#2093 forward provider; the predicate now only gates the
+// absorption-walk routing, `absorption_walk_sens_in_scope`.)
 
 /// Dual width of one IOV program evaluation on the outer builder: the declared θ, the
 /// combined `[η_bsv, κ]`, and — for a `[covariate_nn]` model — one axis per network
@@ -711,9 +715,8 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     }
     // Lagtime is now carried on the IOV walk (#486): the dose arrival `t + ALAG` is threaded
     // as a moving dual boundary, exactly like a modeled infusion end, so the saltation falls
-    // out of the closed-form flow. A subject that *also* carries an SS dose still declines
-    // (per-subject, `ss_lagtime_walk_unsupported`) — production's pre-arrival SS overlay has
-    // no dual twin yet.
+    // out of the closed-form flow — an SS dose's seed at its record and an SS infusion's
+    // previous-cycle residual window included (#2786).
     // Initial-compartment amounts (#521) are now differentiable on the IOV event-driven walk
     // too (#486): the adjoint's `record_analytic_events` layers the `A₀·kernel(t, pk)` impulse
     // per occasion — the amount `A₀` from the BSV-only snapshot (`bsv_amount`, κ = 0) and the decay
@@ -730,21 +733,6 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     {
         return false;
     }
-    // Analytic Form C readout (`[scaling] y = <expr>`, #655): served on the IOV
-    // event-driven walk when it fits the eight structural `PkDual` slots — the same
-    // walk-capable scope the TV-cov path uses (`readout_tvcov_supported`: a uniform
-    // dual-evaluable `Single` readout, no depot reference, no `[initial_conditions]`,
-    // no slot past `PK_IDX_V3`). The adjoint's `record_analytic_events` seeds the readout PK
-    // params from the observation's own occasion source, so they carry κ just as the
-    // walk's concentration does — matching production's per-occasion
-    // `apply_analytic_readout(..., [η_bsv, κ_g], ...)` (#1079). A
-    // readout outside that scope (per-CMT, depot, direct θ/η, slot overflow) declines to
-    // FD here so the reported method stays honest — the closed-form IOV twin of
-    // `analytical_supported_core`'s `analytic_readout_dual_supported` clause.
-    // `readout_tvcov_supported` is `true` for a plain (no-readout) model.
-    if !readout_tvcov_supported(model) {
-        return false;
-    }
     let n_eff = model.n_eta + model.n_kappa;
     // The outer θ-axis clause is on the *declared* θ (`n_program_theta`), not `model.n_theta`: a
     // `[covariate_nn]` model's generated weights are not referenceable from the program and reach
@@ -755,8 +743,8 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     // output-channel factorization the chain relies on (a direct read of a generated weight θ
     // breaks it — same predicate `tvcov_analytical_supported` / `nn_theta_gradient` use), and the
     // builder's own dual width (declared θ + `[η, κ]` + outputs) fitting its `1..=24` dispatch. The
-    // adjoint has no θ-count limit (its width is the per-subject random-effect width,
-    // `subject_width`), so `model.n_theta` itself is unbounded here.
+    // adjoint has no θ-count limit (its width is the per-subject random-effect width),
+    // so `model.n_theta` itself is unbounded here.
     if require_theta_axis && nn_weight_theta_count(model) > 0 {
         if !nn_output_chain_supported(model) || iov_program_axes(model) > ABSORPTION_WALK_AXES {
             return false;
@@ -793,7 +781,7 @@ const ABSORPTION_WALK_AXES: usize = 24;
 ///
 /// * IOV: the closed-form IOV scope, and a stacked width `n_eta + K·n_kappa` below the dual
 ///   walk's cap (`ABSORPTION_WALK_AXES = 24`; the outer seeds at least one θ column beside
-///   it). The twin's ODE IOV gradient (the adjoint) reaches `MAX_WIDTH` in `ode_adjoint.rs`,
+///   it). The twin's ODE IOV gradient (the adjoint) is uncapped in `ode_adjoint.rs`,
 ///   so a many-occasion subject past 24 stays there;
 /// * time-varying covariates: the closed-form TV-walk scope (`tvcov_analytical_supported`).
 pub(crate) fn absorption_walk_sens_in_scope(model: &CompiledModel, subject: &Subject) -> bool {
@@ -830,8 +818,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // back here for the `uses_time_builtin` case) so a `TIME` model did not recurse
     // (#637 review #1).
     // Lagtime is carried on the TV-cov / `TIME` event walk since #486 (moving dual arrival
-    // boundary); an SS dose alongside it still declines per-subject via
-    // `ss_lagtime_walk_unsupported`.
+    // boundary), an SS dose alongside it since #2786.
     if !analytical_supported_core(model) {
         return false;
     }
@@ -884,14 +871,6 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // #486 LTBS × IOV is served on the inner as well (`record_analytic_events`), so no LTBS
     // combination routes the inner to FD any more.
     if !scaling_supported(model) {
-        return false;
-    }
-    // An analytic Form C readout must also fit the event-walk's structural
-    // `PkDual` slots here (#650). Without this, a readout whose params spill past
-    // `PK_IDX_V3` made the pre-#2093 `analytical_supported` (via the `uses_time` clause)
-    // report "analytic" while every event-walk subject silently falls back to FD —
-    // exactly the route/report drift #637 guards against.
-    if !readout_tvcov_supported(model) {
         return false;
     }
     match model.indiv_param_partials.indiv_param_program.as_ref() {
@@ -973,7 +952,7 @@ pub(crate) fn nn_output_chain_supported(model: &CompiledModel) -> bool {
 /// transient `D ≤ 0` / `R ≤ 0` from turning `amt/D` into a non-finite rate (#486).
 #[inline]
 fn clamp_dual_floor<T: crate::sens::num::PkNum>(x: T, floor: f64) -> T {
-    if x.val() > floor {
+    if x.br_cmp_c(crate::sens::num::BranchCmp::Gt, floor) {
         x
     } else {
         T::from_f64(floor)
@@ -1049,29 +1028,6 @@ pub(crate) fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subjec
     modeled_doses_resolvable(model, subject)
 }
 
-/// True when this subject combines a **steady-state infusion with a lagtime** on the event walk.
-///
-/// Production loads a lagged SS dose's periodic state at the dose **record** and lets the walk
-/// carry it to the lagged arrival (#1121, `EventKind::DoseRecord` in
-/// `pk::event_driven`). The dual walk now mirrors that seed for boluses. An infusion also has
-/// a previous-cycle residual rate window after the record; until that forcing is dualized, it
-/// remains a hard decline to FD rather than an approximation.
-///
-/// This gate is consulted from the four **walk** entry points only, so widening it leaves the
-/// CF *static* superposition path alone — that path reaches SS × lagtime without passing here.
-/// Do not read that as the static path being correct. `lagged_elapsed` still implements the
-/// pre-#1121 semantics on both sides of the arrival: it *wraps* the pre-arrival phase where
-/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
-/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and it always takes the collapsed
-/// `C_ss(t − t_eff)` where production splits into tail + arrival once
-/// `!crate::dosing::ss_arrival_is_trough`. Both divergences are confined to `ALAG > II`, where
-/// the static path (`analytic_static_predictions`) returns `Some` on predictions measured up to ~19 % from
-/// production's. Pre-existing, and untouched by #1311, which changes the walk alone; it needs
-/// its own fix and its own anchor.
-pub(crate) fn ss_lagtime_walk_unsupported(model: &CompiledModel, subject: &Subject) -> bool {
-    model.has_lagtime() && subject.doses.iter().any(|d| d.ss && d.is_infusion())
-}
-
 /// Per-dose lagtime **values** for the event schedule (`τ_k = t_k + ALAG`), read from each
 /// dose's own PK snapshot so a TV-covariate or `TIME`-dependent lag is honoured per dose —
 /// production parity (`pk::compute_predictions_event_driven` builds `dose_lagtimes` the same
@@ -1104,90 +1060,6 @@ fn dose_lag_duals<T: crate::sens::num::PkNum>(
         .collect()
 }
 
-/// True when the walk's **moving** breaks are separable, i.e. representable by the single-`dt`
-/// dual walk. A break moves when the model has an estimated lagtime (every dose arrival, and
-/// every infusion end riding it) or when a dose is a modeled `RATE=-1/-2` infusion (its end).
-///
-/// The walk resolves a break time to **one** dual position (`dual_pos`, first match within 1e-9).
-/// So the subject declines to FD when either
-///
-/// 1. **two distinct moving breaks coincide.** They generally carry *different* jets, and the walk
-///    would silently hand the first one's jet to both.
-///
-///    This is deliberately conservative — it declines even breaks that happen to share a `D`/`R`
-///    slot. It has to be: since #486 each dose's lagtime and window are seeded from **that dose's
-///    own snapshot** (its occasion under IOV, its covariates under TV-cov, its event time under
-///    `TIME`), so two breaks backed by the same PK slot no longer imply the same dual. Keying the
-///    check on the slot — as it used to — would admit, say, a κ-on-`ALAG` subject whose occasion-2
-///    arrival lands on occasion-1's infusion end, and differentiate one with respect to the other's
-///    jet. The duals themselves are not comparable here (this runs on `f64` times, before any is
-///    built), so coincidence alone is the decline.
-///
-/// 2. a moving break coincides with a **fixed** break — a reset, a covariate-change (`PkOnly`), or,
-///    when the model has no lagtime, a **dose event time** (with a lagtime every arrival is itself a
-///    moving break, so those are covered by (1) instead). Those times do not move with `(θ, η)`, but
-///    the walk resolves one dual position per break, so it would drag the fixed event along with the
-///    moving one.
-///
-///    **Observations are exempt**: the walk *corrects* them instead of declining, stepping the
-///    read-out state back across the sliver between the sample and the boundary
-///    (`crate::sens::propagate::event_driven_sens_with_doses_g`). An observation landing on *two*
-///    moving breaks is still declined — by (1), since those two breaks coincide with each other.
-///
-/// Both are degenerate, measure-zero coincidences. `eff` are the resolved doses the walk sees.
-fn moving_bounds_separable(
-    model: &CompiledModel,
-    subject: &Subject,
-    eff: &[crate::types::DoseEvent],
-    dose_lagtimes: &[f64],
-) -> bool {
-    let attr_map = model.active_dose_attr_map();
-    let has_lag = model.has_lagtime();
-    let mut moving: Vec<f64> = Vec::new();
-    for (k, d) in subject.doses.iter().enumerate() {
-        // The walk's break times are the *lagged* arrivals, so compare on those.
-        let t_start = eff[k].time + dose_lagtimes.get(k).copied().unwrap_or(0.0);
-        // Dose arrival: moves only under a lagtime.
-        if has_lag {
-            moving.push(t_start);
-        }
-        // Infusion end: moves under a lagtime (riding the arrival) and/or when modeled.
-        if eff[k].rate > 0.0 && eff[k].duration > 0.0 {
-            let modeled = crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some();
-            if modeled || has_lag {
-                moving.push(t_start + eff[k].duration);
-            }
-        }
-    }
-    if moving.is_empty() {
-        return true;
-    }
-    // (1) Two distinct moving breaks may not coincide.
-    for (i, &t) in moving.iter().enumerate() {
-        if moving[..i].iter().any(|&u| (u - t).abs() < 1e-9) {
-            return false;
-        }
-    }
-    // (2) A moving break may not land on a fixed one. Observations are corrected, not declined.
-    let mut fixed: Vec<f64> = subject
-        .pk_only_times
-        .iter()
-        .chain(subject.reset_times.iter())
-        .copied()
-        .collect();
-    if !has_lag {
-        // Without a lagtime a dose lands at its record time, which is a fixed break the walk must
-        // not drag along with someone else's moving infusion end.
-        fixed.extend(eff.iter().map(|d| d.time));
-    }
-    for f in fixed {
-        if moving.iter().any(|&t| (t - f).abs() < 1e-9) {
-            return false;
-        }
-    }
-    true
-}
-
 /// Per-dose infusion duals `(rate, window)` for the event walk
 /// (`crate::sens::propagate::event_driven_sens_with_doses_g`, #486): `Some` for a
 /// modeled `RATE=-1/-2` dose, and under bioavailability for every infusion; `None`
@@ -1196,7 +1068,7 @@ fn moving_bounds_separable(
 /// bioavailability the dose-time `F` is applied exactly as `resolve_eff_doses` applies
 /// it to the f64 window (#419): a rate-defined window stretches to `F·dur`, a
 /// duration-defined rate scales by `F`; the walk injects the rate as-is. `slot_dual(dose_k, pk_slot)` supplies the seeded dual of the `D`/`R` PK
-/// slot at dose `k`'s snapshot (`Dual2<M>` outer, `Dual1<N>` inner). A transient
+/// slot at dose `k`'s snapshot (`Dual2<M>` outer, `Dual2<N>` inner). A transient
 /// non-positive `D`/`R` is clamped to its floor, mirroring the f64
 /// `DoseEvent::resolve_rate`.
 fn modeled_dose_inf_duals<T: crate::sens::num::PkNum>(
@@ -1279,7 +1151,7 @@ fn cached_event_schedule(
         scratch.push(doses.len() as u64);
         for d in doses {
             // Exactly the dose fields the schedule reads (its event times, and the
-            // infusion rates of `active_rates_at` / `ss_residual_infusion_end`); the
+            // infusion rates of `active_rates_at` / `ss_residual_infusion_ends`); the
             // amount is not one of them — the walk reads it from `doses` directly. `rate`
             // is kept although no edit isolates it: a real rate change moves `duration`
             // too, and the walk revalidates the cached rates itself (`rates_valid_for`).
@@ -1317,17 +1189,15 @@ fn cached_event_schedule(
     })
 }
 
-/// The closed-form event walk with its output readout, over any number type: modeled
+/// The closed-form event walk's concentrations, over any number type: modeled
 /// doses resolved to their windows, lag-shifted arrivals as moving boundaries, the walk
-/// itself (`closed_form_sens_walk_g`), the production clamp of the concentration at zero,
-/// then the analytic Form C readout (#650) at each observation. Shared by the forward
-/// TV-cov provider (`Dual2`) and the adjoint gradient (`DualV`), so neither carries its
-/// own copy of the event semantics.
+/// itself (`closed_form_sens_walk_g`) and the production clamp of the concentration at zero.
+/// The `init(...)` impulses and the analytic Form C readout (#650) follow
+/// ([`apply_closed_form_readout_g`]), as in production.
 ///
 /// `dose_pk` are the per-dose f64 PK params (window resolution and lag values),
-/// `pk_at_*` the per-event params as `T`, `slot_dual(k, slot)` dose `k`'s PK slot as `T`
-/// (modeled `D`/`R`, `ALAG`), and `obs_params(j)` the flat PK-slot vector the readout
-/// reads at observation `j`. `None` where the walk cannot serve the subject (coincident
+/// `pk_at_*` the per-event params as `T`, and `slot_dual(k, slot)` dose `k`'s PK slot as `T`
+/// (modeled `D`/`R`, `ALAG`). `None` where the walk cannot serve the subject (coincident
 /// moving breaks, or an absorption walk the closed form declines).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
@@ -1338,8 +1208,6 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
     pk_at_obs: &[crate::sens::propagate::PkDual<T>],
     pk_at_pk_only: &[crate::sens::propagate::PkDual<T>],
     slot_dual: &dyn Fn(usize, usize) -> T,
-    obs_params: &dyn Fn(usize) -> [T; N_PK],
-    readout: Option<&crate::parser::model_parser::OdeOutputProgram>,
 ) -> Option<Vec<T>> {
     // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
     // schedule's break times, and build the per-dose duals so the injected rate and
@@ -1352,12 +1220,8 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
     // (production parity) and the walk threads `∂ALAG` through the dual sub-interval
     // lengths, so the arrival is a moving boundary like a modeled infusion end.
     let dose_lagtimes = dose_lagtime_values(model, dose_pk);
-    // Coincident moving breaks carrying different jets — and, under a lagtime, a moving
-    // break landing on a fixed obs/reset/cov-change time — aren't representable by the
-    // single-`dt` walk; decline to FD (#486 review #2).
-    if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
-        return None;
-    }
+    // Breaks that land on one instant — with one another, or on a record — are crossed by the
+    // walk itself (`propagate_bounds_g`), each at its own jet: no coincidence declines a point.
     let schedule = cached_event_schedule(subject, model.pk_model, &eff_doses, &dose_lagtimes);
     let dose_inf_dual = modeled_dose_inf_duals::<T>(model, subject, slot_dual);
     let dose_lag_dual = dose_lag_duals::<T>(model, subject, slot_dual);
@@ -1374,41 +1238,23 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
         slot_dual,
     )?;
 
-    // Analytic Form C readout (#650): scratch for the per-observation dual eval.
-    let mut ro_state: Vec<T> = Vec::new();
-    let mut ro_vars: Vec<T> = Vec::new();
-    let mut ro_stack: Vec<T> = Vec::new();
+    // Clamp the concentration jet to ≥ 0 BEFORE any `init(...)` impulse or readout — production
+    // clamps `conc.max(0.0)` and only then layers them on (the readout returned unclamped).
     Some(
-        conc.iter()
-            .enumerate()
-            .map(|(j, c)| {
-                // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
-                // `conc.max(0.0)` and only then applies the readout (returned unclamped).
-                let c = if c.val() < 0.0 { T::from_f64(0.0) } else { *c };
-                let Some(ro) = readout else {
-                    return c;
-                };
-                // A `TIME`-referencing readout resolves `Op::PushTime` from the model-time
-                // thread-local; enter this observation's time to match production's
-                // `apply_analytic_readout` guard (no-op for a `TIME`-free readout).
-                let _time_guard =
-                    crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
-                eval_readout_jet::<T>(
-                    ro,
-                    c,
-                    &obs_params(j),
-                    subject.obs_cov(j),
-                    &mut ro_state,
-                    &mut ro_vars,
-                    &mut ro_stack,
-                )
+        conc.into_iter()
+            .map(|c| {
+                if c.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
+                    T::from_f64(0.0)
+                } else {
+                    c
+                }
             })
             .collect(),
     )
 }
 
 /// Per observation the prediction and its exact `∂f/∂η` at `(θ, η)` (the stacked `[η, κ]`
-/// under IOV), from one tape-free recording of the unified recorder
+/// under IOV), from one recording of the unified recorder
 /// (`sens::ode_provider::adjoint`) — closed form, event walks, user ODEs, compartment-free
 /// models alike — or `None` for a subject no recorder serves. FREM pseudo-observation rows
 /// carry their exact `θ_i + η_e`.
@@ -1475,7 +1321,7 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
         let a0 = prog.eval_scale_g(theta, eta, &subject.covariates, &vars);
         // Only a non-finite amount is skipped. A zero one still carries `∂A₀/∂(θ, η)`, which
         // reaches `∂C` as `kernel · ∂A₀` (#527): skipping it zeroes that gradient.
-        if !a0.val().is_finite() {
+        if !a0.br_abs_lt(f64::INFINITY) {
             continue;
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
@@ -1505,8 +1351,8 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
 }
 
 /// The closed-form engines' model-level scope, as the adjoint gradient's recorders see
-/// it: a closed form the superposition and event walk implement, no ODE, and a Form C
-/// readout the shared `eval_readout_jet` can evaluate.
+/// it: a closed form the superposition and event walk implement, and no ODE; every Form C
+/// readout is evaluated ([`apply_closed_form_readout_g`]).
 /// Unlike the retired (pre-#2093) `analytical_supported` it carries none of the forward
 /// provider's dispatch-width or slot limits.
 pub(crate) fn closed_form_model_scope(model: &CompiledModel) -> bool {
@@ -1525,14 +1371,13 @@ pub(crate) fn closed_form_model_scope(model: &CompiledModel) -> bool {
                 | PkModel::ThreeCptIv
                 | PkModel::ThreeCptOral
         )
-        && analytic_readout_dual_supported(model)
 }
 
 /// The closed-form static-superposition predictions at every observation over a
 /// caller-seeded numeric type: `slot_dual(slot)` gives each PK slot's dual (or `None` for
 /// a constant). The same kernels, clamp and readout as the f64 predictor, with no
 /// `dp_deta` chain (scaling and LTBS follow in the adjoint's `closed_form_finish`). The adjoint
-/// gradient (`sens::ode_provider::adjoint`) seeds the slots with `DualV` η-tangents.
+/// gradient (`sens::ode_provider::adjoint`) seeds the slots with η-tangents.
 ///
 /// `None` outside that path's scope (event-driven walk, algebraic or ODE models,
 /// resets with SS, unresolved modeled doses, rate-defined infusions under F, analytic
@@ -1577,19 +1422,11 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
     };
     let dual_of = |slot: usize, value: f64| slot_dual(slot).unwrap_or_else(|| T::from_f64(value));
     let seeded = SeededPkDuals::<T>::seed_with(pk, &dual_of).with_disposition(flags);
-    let readout = model
-        .analytic_readout
-        .as_ref()
-        .and_then(|ar| ar.program.as_ref());
-    let ro_pk: Option<[T; N_PK]> = readout
-        .map(|_| std::array::from_fn(|s| dual_of(s, pk.values.get(s).copied().unwrap_or(0.0))));
-    let mut ro_state: Vec<T> = crate::scratch::take_for(0);
-    let mut ro_vars: Vec<T> = crate::scratch::take_for(0);
-    let mut ro_stack: Vec<T> = crate::scratch::take_for(0);
-    // The clamped concentrations, then the analytic `init(...)` impulses on top (production
-    // adds them before the readout and scaling; the two never coexist on the closed form).
+    // The clamped concentrations, then the analytic `init(...)` impulses on top, then the readout
+    // (production's order).
     let mut conc: Vec<T> = crate::scratch::take_for(subject.obs_times.len());
     conc.extend(subject.obs_times.iter().map(|&t_obs| {
+        T::chunk_mark();
         let fd = superpose_doses(
             &seeded,
             flags,
@@ -1598,7 +1435,7 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
             reset_floor_at(subject, t_obs),
         );
         // Mirror production's `conc.max(0.0)`.
-        if fd.val() < 0.0 {
+        if fd.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
             T::from_f64(0.0)
         } else {
             fd
@@ -1611,25 +1448,22 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
         crate::scratch::give_for(amount);
         added?;
     }
-    let mut out = crate::scratch::take_for(subject.obs_times.len());
-    for (obs_i, &conc) in conc.iter().enumerate() {
-        let y = apply_readout_jet(
-            conc,
-            readout,
-            ro_pk.as_ref(),
-            subject,
-            obs_i,
-            &mut ro_state,
-            &mut ro_vars,
-            &mut ro_stack,
-        );
-        out.push(y);
-    }
-    crate::scratch::give_for(conc);
-    crate::scratch::give_for(ro_state);
-    crate::scratch::give_for(ro_vars);
-    crate::scratch::give_for(ro_stack);
-    Some(out)
+    let Some(ar) = model.analytic_readout.as_ref() else {
+        return Some(conc);
+    };
+    let depot = ar
+        .references_depot()
+        .then(|| closed_form_depot_amounts_g(subject, pk, &dual_of));
+    let ro_pk: [T; N_PK] =
+        std::array::from_fn(|s| dual_of(s, pk.values.get(s).copied().unwrap_or(0.0)));
+    apply_closed_form_readout_g(
+        model,
+        subject,
+        conc,
+        depot.as_deref(),
+        &|_| std::borrow::Cow::Borrowed(&ro_pk),
+        crate::sens::ode_provider::ReadoutLeaves { theta, eta },
+    )
 }
 
 /// The analytic individual-parameter program, when it covers every slot the closed form

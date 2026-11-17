@@ -34,7 +34,8 @@ OPTIONS:
     -h, --help           Show this help.
 
 RULES:
-    nan-fold   a max/min fold in test code, which discards NaN
+    nan-fold              a max/min fold in test code, which discards NaN
+    recorded-value-read   a `.plain()` value read outside a `!T::RECORDS_BRANCHES` arm (src/)
 
 Scope: tests/**, crates/*/tests/**, src/**/*_tests.rs, src/**/tests/**, files
 reached through a #[cfg(test)] `mod`, and #[cfg(test)] / #[test] items anywhere.
@@ -42,6 +43,7 @@ Rule files and the ratchet baseline live in tools/lint-rules/.
 ";
 
 const NAN_FOLD_DOC: &str = include_str!("../../../tools/lint-rules/nan-fold.md");
+const RECORDED_DOC: &str = include_str!("../../../tools/lint-rules/recorded-value-read.md");
 
 fn main() -> ExitCode {
     let mut root = repo_root();
@@ -68,7 +70,13 @@ fn main() -> ExitCode {
                         print!("{NAN_FOLD_DOC}");
                         ExitCode::SUCCESS
                     }
-                    other => usage_error(&format!("unknown rule {other:?} (known: nan-fold)")),
+                    Some("recorded-value-read") => {
+                        print!("{RECORDED_DOC}");
+                        ExitCode::SUCCESS
+                    }
+                    other => usage_error(&format!(
+                        "unknown rule {other:?} (known: nan-fold, recorded-value-read)"
+                    )),
                 }
             }
             other => return usage_error(&format!("unknown argument `{other}`")),

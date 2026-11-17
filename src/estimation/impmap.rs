@@ -36,6 +36,7 @@
 //! SDE / `[diffusion]` models are refused for the same reason `IMP` refuses
 //! them. Use FOCE / FOCEI for those.
 
+use crate::cold_sort::ColdSort;
 use crate::estimation::covariate_mu_ref::{resolve_covariate_mu_groups, GroupStepInput};
 use crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov_with_schedule;
 use crate::estimation::importance_sampling::{
@@ -63,7 +64,6 @@ use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
-use rayon::prelude::*;
 
 /// Positive-definite floor for free Ω diagonals (matches the SAEM constant).
 const OMEGA_DIAG_FLOOR: f64 = 1e-6;
@@ -337,7 +337,7 @@ fn ramp_se_per_subject(ess_fracs: &[f64], k: usize, stuck: &[bool]) -> (f64, usi
 /// it shows which subjects drive a ramp (#2690).
 fn lowest_ess_summary(ids: &[&str], ess_fracs: &[f64], k: usize, n: usize) -> String {
     let mut order: Vec<usize> = (0..ess_fracs.len()).collect();
-    order.sort_by(|&a, &b| ess_fracs[a].total_cmp(&ess_fracs[b]));
+    order.cold_sort_by(&|&a, &b| ess_fracs[a].total_cmp(&ess_fracs[b]));
     order
         .iter()
         .take(n)
@@ -1266,32 +1266,28 @@ fn run_map_multistart(
         None
     };
 
-    let results: Vec<EbeResult> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            let warm = prev_etas.map(|pe| pe[i].as_slice());
-            // Deterministic per-subject, per-iteration seed, separated from IS draws.
-            let subj_seed = seed
-                .wrapping_add(i as u64)
-                .wrapping_add((iteration as u64) << 32)
-                .wrapping_add(0x4D43_4554_4100u64);
-            find_ebe_multistart(
-                model,
-                subject,
-                params,
-                inner_maxiter,
-                inner_tol,
-                warm,
-                Some(mu_k),
-                0,
-                mceta,
-                omega_chol.as_ref(),
-                subj_seed,
-            )
-        })
-        .collect();
+    let results: Vec<EbeResult> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let warm = prev_etas.map(|pe| pe[i].as_slice());
+        // Deterministic per-subject, per-iteration seed, separated from IS draws.
+        let subj_seed = seed
+            .wrapping_add(i as u64)
+            .wrapping_add((iteration as u64) << 32)
+            .wrapping_add(0x4D43_4554_4100u64);
+        find_ebe_multistart(
+            model,
+            subject,
+            params,
+            inner_maxiter,
+            inner_tol,
+            warm,
+            Some(mu_k),
+            0,
+            mceta,
+            omega_chol.as_ref(),
+            subj_seed,
+        )
+    });
 
     let stats = InnerLoopStats {
         n_unconverged: results.iter().filter(|r| !r.converged).count(),
@@ -1454,6 +1450,8 @@ pub fn run_imp(
     warm_etas: Option<&[DVector<f64>]>,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    let _prints =
+        crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
     let result = run_imp_stage(model, population, init_params, warm_etas, options)?;
     Ok(apply_settling_verdict(
         result,
@@ -2122,11 +2120,11 @@ fn run_mcem(
             .omega_iov
             .as_ref()
             .map(|iov| JointPriors::build(&params_k.omega, iov, &n_occ_of, defensive_alpha));
-        let mut draws: Vec<_> = population
-            .subjects
-            .par_iter()
-            .enumerate()
-            .map_init(EventPkParams::default, |scratch, (i, subject)| {
+        let mut draws: Vec<_> = crate::par::map_init(
+            population.subjects.len(),
+            EventPkParams::default,
+            |scratch, i| {
+                let subject = &population.subjects[i];
                 // Poll per subject: the inner-loop MAP + IS draws below are the
                 // dominant per-iteration cost, so without this a cancel set
                 // mid-iteration is not seen until the next iteration's top-of-loop
@@ -2344,8 +2342,8 @@ fn run_mcem(
                     defensive_mixture.as_ref(),
                     schedules[i].as_ref(),
                 )
-            })
-            .collect();
+            },
+        );
 
         // If a cancel was observed inside the E-step, the `draws` are placeholders;
         // break before the M-steps consume them. The post-loop check returns Err.
@@ -2440,7 +2438,7 @@ fn run_mcem(
             .filter(|(_, &s)| s)
             .map(|(&id, _)| id)
             .collect();
-        ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        ess_fracs.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         final_ess_median = ess_fracs.get(ess_fracs.len() / 2).copied().unwrap_or(1.0);
 
         // Record this iteration's parameters for the trace (opt-in).
@@ -2649,12 +2647,11 @@ fn run_mcem(
                 };
                 let solved = if group.needs_data_term {
                     let data = |th: &[f64], shifts: &[Vec<f64>]| -> f64 {
-                        let per_subj: Vec<f64> = population
-                            .subjects
-                            .par_iter()
-                            .zip(draws.par_iter())
-                            .enumerate()
-                            .map_init(EventPkParams::default, |scratch, (i, (subject, d))| {
+                        let per_subj: Vec<f64> = crate::par::map_init(
+                            population.subjects.len().min(draws.len()),
+                            EventPkParams::default,
+                            |scratch, i| {
+                                let (subject, d) = (&population.subjects[i], &draws[i]);
                                 let mut s = 0.0f64;
                                 for (w, eta) in d.weights.iter().zip(d.etas.iter()) {
                                     if *w == 0.0 {
@@ -2673,8 +2670,8 @@ fn run_mcem(
                                     );
                                 }
                                 s
-                            })
-                            .collect();
+                            },
+                        );
                         per_subj.iter().sum()
                     };
                     group.solve_numerical(population, &input, mstep_maxiter, &data)
@@ -3612,11 +3609,11 @@ fn run_mcem_mixture(
         // Parallel over subjects; the class loop runs inside each worker so the
         // `MIXNUM` guard is entered on the same thread as the solve/draws.
         #[allow(clippy::type_complexity)]
-        let per_subject: Vec<(Vec<SubjectDraws>, Vec<f64>, f64)> = population
-            .subjects
-            .par_iter()
-            .enumerate()
-            .map_init(EventPkParams::default, |scratch, (i, subject)| {
+        let per_subject: Vec<(Vec<SubjectDraws>, Vec<f64>, f64)> = crate::par::map_init(
+            population.subjects.len(),
+            EventPkParams::default,
+            |scratch, i| {
+                let subject = &population.subjects[i];
                 // Poll per subject: one subject's E-step is `n_classes` inner
                 // solves plus `n_classes · K` importance draws — the dominant
                 // per-iteration cost — so without this a cancel set mid-sweep is
@@ -3729,8 +3726,8 @@ fn run_mcem_mixture(
                 }
                 let (contribution, pmix_i, _mixest) = combine_subject(&logp, &nll);
                 (class_draws, pmix_i, contribution)
-            })
-            .collect();
+            },
+        );
 
         if crate::cancel::is_cancelled(cancel) {
             break;
@@ -4063,6 +4060,7 @@ fn run_mcem_mixture(
         pmix: meval.pmix,
         mixest: meval.mixest,
         n_fd_h_redone: meval.n_fd_h_redone,
+        class_nll: meval.class_nll,
     });
 
     // ---- Covariance step (mixture-aware) ----
@@ -4435,14 +4433,17 @@ fn weighted_mstep_objective(
     // reproducible regardless of rayon worker count — a parallel `.sum()`
     // folds along thread-count-dependent split points and f64 addition is
     // non-associative (#703).
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .zip(draws.par_iter())
-        .zip(schedules.par_iter())
-        .map_init(
-            EventPkParams::default,
-            |scratch, ((subject, d), schedule)| {
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population
+            .subjects
+            .len()
+            .min(draws.len())
+            .min(schedules.len()),
+        EventPkParams::default,
+        |scratch, idx| {
+            let ((subject, d), schedule) =
+                ((&population.subjects[idx], &draws[idx]), &schedules[idx]);
+            {
                 let mut s = 0.0f64;
                 for (w, b) in d.weights.iter().zip(d.etas.iter()) {
                     if *w == 0.0 {
@@ -4459,9 +4460,9 @@ fn weighted_mstep_objective(
                     );
                 }
                 s
-            },
-        )
-        .collect();
+            }
+        },
+    );
     let val: f64 = per_subj.iter().sum();
     if val.is_finite() {
         val
@@ -4883,11 +4884,11 @@ fn theta_sigma_weighted_mstep_mixture(
     let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        let per_subj: Vec<f64> = population
-            .subjects
-            .par_iter()
-            .enumerate()
-            .map_init(EventPkParams::default, |scratch, (i, subject)| {
+        let per_subj: Vec<f64> = crate::par::map_init(
+            population.subjects.len(),
+            EventPkParams::default,
+            |scratch, i| {
+                let subject = &population.subjects[i];
                 let mut s = 0.0f64;
                 for c in 0..n_classes {
                     let p = pmix[i][c];
@@ -4915,8 +4916,8 @@ fn theta_sigma_weighted_mstep_mixture(
                     s += p * sc;
                 }
                 s
-            })
-            .collect();
+            },
+        );
         let val: f64 = per_subj.iter().sum();
         if val.is_finite() {
             val
@@ -8825,6 +8826,9 @@ mod tests {
                 .build()
                 .unwrap();
             pool.install(|| {
+                // Each count from an empty plan cache: the second run would otherwise reuse
+                // the first's recordings (the same model and subjects) and build fewer.
+                crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
                 reset_schedule_build_count();
                 let opts = tv_imp_options(iterations);
                 run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");

@@ -334,3 +334,28 @@ fn a_by_column_alone_is_not_an_undeclared_expression_covariate() {
     let w = undeclared(&also_read).expect("an expression read is reported");
     assert!(w.contains(": ARM."), "{w}");
 }
+
+/// #2912: the `abpm_keizer` block verbatim — an `if (DVID == 1) … else …` with an additive
+/// sigma per branch, two *independent* sigmas (no `block_sigma`), and `iiv_on_ruv` on the
+/// line after the closing brace. #2656's test above pairs the form with a `block_sigma`;
+/// this is the plain two-readout case, and a `[data]` block ahead of `[parameters]` as the
+/// shipped file has. Reported as a regression from a ferx-r build that predates #2656.
+#[test]
+fn iiv_on_ruv_after_an_if_else_with_independent_sigmas_parses() {
+    let block = "  if (DVID == 1) {\n    DV ~ additive(PROP_ERR)\n  } else {\n    \
+                 DV ~ additive(ADD_ERR)\n  }\n  iiv_on_ruv = ETA_RUV";
+    let body = text("  omega ETA_RUV ~ 0.1\n", "", block);
+    for src in [body.clone(), format!("[data]\n  path = data.csv\n\n{body}")] {
+        let m = parse_model_string(&src).unwrap_or_else(|e| panic!("{e}\n{src}"));
+        assert_eq!(
+            m.residual_error_eta,
+            Some(0),
+            "ETA_RUV is declared ahead of ETA_CL"
+        );
+        let crate::types::ErrorSpec::Selected { .. } = m.error_spec else {
+            panic!("expected a selected error model, got {:?}", m.error_spec);
+        };
+        assert!(m.residual_correlations.is_empty());
+        assert!(m.referenced_covariates.contains(&"DVID".to_string()));
+    }
+}

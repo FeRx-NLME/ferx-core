@@ -186,7 +186,7 @@ fn a_logit_linked_block_takes_the_exact_newton_matrix_and_differences_on_a_decli
 fn off_the_adjoint_route_a_linked_block_takes_the_differenced_matrix() {
     let p = b2(None, gradient_fd);
     let o = options(&p);
-    assert!(!profile_gradient_is_analytic(&p.parsed.model, &o));
+    assert!(!profile_gradient_is_analytic(&p.parsed.model));
     let (fd, c) = solve_b2(&p, &o);
     assert!(c.exact_matrices == 0 && c.fd_matrices > 0, "{c:?}");
     assert!(c.adjoint_gradients == 0 && c.fd_gradients > 0, "{c:?}");

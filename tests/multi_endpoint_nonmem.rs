@@ -64,7 +64,7 @@
 //! N*log(2π) constant, matching ferx's convention) = -60.0971.
 
 use ferx_core::parser::model_parser::{parse_model_file, parse_model_string};
-use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, GradientMethod};
+use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 use std::path::Path;
 
 // ── NONMEM 7.5.1 FOCEI reference (MINIMIZATION SUCCESSFUL) ──
@@ -130,7 +130,6 @@ fn objective_matches_nonmem_at_reference_params() {
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
-    opts.gradient_method = GradientMethod::Fd;
     opts.run_covariance_step = false;
     opts.verbose = false;
 
@@ -162,7 +161,6 @@ fn fit_recovers_theta_and_per_cmt_sigma() {
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
-    opts.gradient_method = GradientMethod::Fd;
     opts.run_covariance_step = false;
     opts.verbose = false;
 

@@ -6,6 +6,7 @@ patterns` and the `Patterns lint` CI job.
 | Rule | What it catches | Rule file |
 |---|---|---|
 | `nan-fold` | a `max`/`min` fold in test code, which discards `NaN` | [`nan-fold.md`](nan-fold.md) |
+| `recorded-value-read` | a `.plain()` value read on a generic number outside a `!T::RECORDS_BRANCHES` arm, in `src/` production code (#2786) | [`recorded-value-read.md`](recorded-value-read.md) |
 
 [`baseline.txt`](baseline.txt) is the shrink-only ratchet of findings that
 predate a rule. A new finding fails, a function whose count grows fails, and a
@@ -17,6 +18,7 @@ tools/preflight.sh patterns                       # the gate CI runs
 cargo run -p patterns-lint                        # same report from the CLI
 cargo run -p patterns-lint -- --no-baseline       # every finding, baselined or not
 cargo run -p patterns-lint -- --explain nan-fold  # print a rule file
+cargo run -p patterns-lint -- --explain recorded-value-read
 ```
 
 The rules work on the `syn` AST, not on lines. A regex cannot see a fold that

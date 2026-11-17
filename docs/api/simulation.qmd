@@ -284,6 +284,7 @@ pub struct SimulateUncertaintyOptions {
     pub n_sim_per_draw: usize,           // eta/eps replicates per draw
     pub method: UncertaintyMethod,       // Asymptotic | Sir
     pub seed: Option<u64>,
+    pub horizon: Option<f64>,            // TTE administrative horizon, every draw
 }
 
 pub enum UncertaintyMethod {
@@ -298,9 +299,23 @@ pub enum UncertaintyMethod {
 - `opts.n_uncertainty_draws`: number of parameter sets drawn.
 - `opts.n_sim_per_draw`: number of subject-level replicates per draw.
 - `opts.method`: how to draw the parameter sets.
+- `opts.horizon`: administrative censoring horizon for TTE endpoints, the same
+  one for every draw. It is the `SimulateOptions::horizon` of
+  `simulate_with_options()`, checked by the same code: finite, `> 0`, and not
+  below any subject's entry time (`E_SIMULATE_HORIZON` otherwise). `None` keeps
+  each record's own window. No effect on continuous endpoints.
 
-**Returns:** `Vec<SimulationResult>` of length `n_uncertainty_draws *
-n_sim_per_draw * n_subjects * n_obs`. Each row carries a `draw` index
+A repeated-event (`type = rtte`) or drug-driven (joint PK-TTE) hazard has no
+implicit window, so it requires `opts.horizon`; without one the call is refused
+with `E_SIMULATE_HORIZON`. Each draw is simulated the way
+`simulate_with_options()` simulates that draw's parameters under the same
+horizon. The two calls do not return the same rows from the same seed: drawing
+the parameter sets advances the random stream first.
+
+**Returns:** `Vec<SimulationResult>`. For continuous endpoints its length is
+`n_uncertainty_draws * n_sim_per_draw * n_subjects * n_obs`; a TTE endpoint
+returns its event and censoring rows instead, and a repeated-event stream has a
+variable number per subject. Each row carries a `draw` index
 (1..=n_uncertainty_draws) and a `sim` index (1..=n_sim_per_draw).
 
 **Prerequisites:**
@@ -327,6 +342,7 @@ let sims = simulate_with_uncertainty(
         n_sim_per_draw: 10,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(42),
+        horizon: None,                   // Some(h) for a TTE endpoint
     },
 )?;
 ```

@@ -25,40 +25,32 @@
 //! | `mixture_iv_cov_rsr` | default (`R⁻¹SR⁻¹`) | `rsr`                    |
 //! | `mixture_iv_cov_r0`  | `MATRIX=R`          | `r` (control)            |
 //!
-//! ## ferx's `S` is not NONMEM's `S` — on any model, not only a mixture
+//! ## ferx's `S` is NONMEM's `S` (#2974)
 //!
-//! The two engines differentiate different per-subject objectives. NONMEM's score is
-//! the **total** derivative of `−2LLᵢ(x)`, the EBE η̂ᵢ(x) re-estimated and the FOCEI
-//! `log|H̃|` recomputed at every perturbed `x`. ferx's (`subject_nll_pop_grad`, shared
-//! by the single-population path this fix reuses per class) holds the mode and its
-//! prediction Jacobian at `x̂`: the EBE-response term is the documented zero of
-//! `subject_eta_response_correction` (#338 Part A, the ω/σ blocks deferred to #1817).
-//! The held score is biased, so the gap is a convention difference that more subjects
-//! do not remove: at this point the re-estimated `Σᵢ gᵢ` on TVCL2 is 3e-4 and the held
-//! one 16.2, a mean per-subject shift of 0.539 against a mean `|gᵢ|` of 0.466 (the
-//! oracle below prints both). Replicating the subjects scales `Σᵢ gᵢ`, `S` and `R`
-//! alike, so the SE ratios stay put. The gap on `SE(TVCL2)` is 14 %.
+//! The two engines differentiate the same per-subject objective: the **total** derivative
+//! of `−2LLᵢ(x)`, the EBE η̂ᵢ(x) re-estimated and the FOCEI `log|H̃|` recomputed at every
+//! `x`. ferx takes it exactly, as the subject's term of the adjoint outer gradient
+//! (`covariance::subject_total_score`), per class for a mixture. Before #2974 ferx held the
+//! mode and its prediction Jacobian at `x̂` (the fixed-mode score), which is biased at the
+//! MLE: at this point the re-estimated `Σᵢ gᵢ` on TVCL2 is 3e-4 and the held one 16.2, and
+//! the gap on `SE(TVCL2)` was 14 %. More subjects do not close that gap, since replicating
+//! them scales `Σᵢ gᵢ`, `S` and `R` alike.
 //!
 //! `tests/nonmem/mixture_iv_cov_score_oracle.py` computes the per-subject mixture
 //! `−2LLᵢ` in closed form, outside both engines, and forms `S = Σ gᵢgᵢᵀ` from central
-//! differences under each convention. It reproduces NONMEM's OBJ to 4e-8, and its two
-//! conventions land one on each engine (macOS arm64):
+//! differences under each convention. It reproduces NONMEM's OBJ to 4e-8 (macOS arm64):
 //!
-//! | `S` SE    | NONMEM `MATRIX=S` | oracle, η̂ re-estimated | oracle, mode held | ferx `s`  |
-//! |-----------|-------------------|-------------------------|-------------------|-----------|
-//! | TVCL1     | 0.132375          | 0.132374                | 0.134032          | 0.134032  |
-//! | TVCL2     | 0.293660          | 0.293660                | 0.252108          | 0.252108  |
-//! | V         | 0.213639          | 0.213639                | 0.211925          | 0.211925  |
-//! | P1        | 0.108812          | 0.108812                | 0.122599          | 0.122599  |
+//! | `S` SE    | NONMEM `MATRIX=S` | oracle, η̂ re-estimated | oracle, mode held (ferx before #2974) |
+//! |-----------|-------------------|-------------------------|---------------------------------------|
+//! | TVCL1     | 0.132375          | 0.132374                | 0.134032                              |
+//! | TVCL2     | 0.293660          | 0.293660                | 0.252108                              |
+//! | V         | 0.213639          | 0.213639                | 0.211925                              |
+//! | P1        | 0.108812          | 0.108812                | 0.122599                              |
 //!
-//! The same oracle's `--single` run shows the gap on the one-population twin of this
-//! model (`CL = TVCL·exp(η)`, same data): η̂ re-estimated `SE(TVCL) = 0.053787`, mode
-//! held `0.062615`, ferx `0.062615`, and NONMEM's own `MATRIX=S` on that twin
-//! (`single_iv_cov_s`) `0.0537872` — a pre-existing single-population convention, not
-//! a mixture defect. So `s`/`rsr` are anchored here on the oracle's mode-held column,
-//! and the oracle's re-estimated column is checked against NONMEM, which pins *which*
-//! convention each engine implements. When ferx's score gains the EBE response, the
-//! straddle assertion below reddens and the anchor moves to NONMEM's `.ext` directly.
+//! The same oracle's `--single` run covers the one-population twin of this model
+//! (`CL = TVCL·exp(η)`, same data; NONMEM `single_iv_cov_{s,rsr,r0}`). `s`/`rsr` are anchored
+//! on the oracle's re-estimated column and on NONMEM's `.ext` directly; the held column stays
+//! as the straddle that shows the bound discriminates between the conventions.
 
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::{fit, read_nonmem_csv, CovarianceMethod, FitOptions, FitResult};
@@ -72,8 +64,8 @@ const NM_P1: f64 = 0.471970;
 
 /// `mixture_iv_cov_score_oracle.py` at the point above (TVCL1, TVCL2, V, P1), numpy
 /// on macOS arm64. `R` is the central-difference Hessian of the total objective;
-/// `TOTAL` re-estimates η̂ at every stencil point (NONMEM's convention), `HELD` holds
-/// the mode and its prediction Jacobian at `x̂` (ferx's).
+/// `TOTAL` re-estimates η̂ at every stencil point (NONMEM's convention, and ferx's since
+/// #2974), `HELD` holds the mode and its prediction Jacobian at `x̂` (ferx's before).
 const ORACLE_R: [f64; 4] = [0.10580139, 0.25430878, 0.18610565, 0.10257858];
 const ORACLE_S_TOTAL: [f64; 4] = [0.13237448, 0.29366024, 0.2136393, 0.1088116];
 const ORACLE_RSR_TOTAL: [f64; 4] = [0.08546294, 0.22427684, 0.16875011, 0.10125359];
@@ -95,7 +87,6 @@ const SG_ORACLE_R: [f64; 2] = [0.10060276, 0.18149165];
 const SG_ORACLE_S_TOTAL: [f64; 2] = [0.05378717, 0.2077644];
 const SG_ORACLE_RSR_TOTAL: [f64; 2] = [0.18865498, 0.16248856];
 const SG_ORACLE_S_HELD: [f64; 2] = [0.06261534, 0.20833995];
-const SG_ORACLE_RSR_HELD: [f64; 2] = [0.16537104, 0.1668051];
 
 const SG_NAMES: [&str; 2] = ["TVCL", "V"];
 
@@ -299,33 +290,50 @@ fn mixture_r_se_matches_nonmem_r() {
     );
 }
 
-/// ferx's `s` / `rsr` against the third-way oracle's mode-held convention, and the
-/// oracle's re-estimated convention against NONMEM's `MATRIX=S` / `R⁻¹SR⁻¹` — see the
-/// module doc for why the anchor is split this way.
+/// ferx's `s` / `rsr` against the third-way oracle's re-estimated (total-derivative)
+/// convention and against NONMEM's `MATRIX=S` / `R⁻¹SR⁻¹` directly (#2974), with the
+/// oracle's mode-held column as the straddle.
 ///
-/// Measured worst relative gaps, macOS arm64, and the bound each gets:
+/// Measured worst relative gaps (Linux x86_64, the reference platform, #2974; an earlier
+/// Windows run agreed on every row but `r` vs oracle, 2.1e-4 there), and the bound each gets:
 ///
 /// | comparison                        | worst            | bound | why that bound                       |
 /// |-----------------------------------|------------------|-------|--------------------------------------|
-/// | ferx `s` vs oracle held           | 2.7e-7 (TVCL1)   | 1e-5  | 37×; no `R` in `S⁻¹`                 |
-/// | ferx `r` vs oracle                | 2.1e-4 (V)       | 1e-3  | 4.7×; the two FD `R` stencils        |
-/// | ferx `rsr` vs oracle held         | 4.0e-4 (V)       | 1e-3  | 2.5×; inherits the `R` row above     |
+/// | ferx `s` vs oracle total          | 1.3e-8 (TVCL1)   | 1e-6  | 75×; no `R` in `S⁻¹`                 |
+/// | ferx `s` vs NONMEM `MATRIX=S`     | 3.9e-6 (TVCL1)   | 2e-5  | 5×; NONMEM prints 6 figures (≤ 4e-6) |
+/// | ferx `r` vs oracle                | 2.1e-5 (V)       | 1e-3  | 47× (4.7× on Windows); two FD stencils |
+/// | ferx `rsr` vs oracle total        | 4.2e-5 (V)       | 3e-4  | 7×; inherits the `R` row above       |
 /// | NONMEM `S` vs oracle total        | 3.9e-6 (TVCL1)   | 2e-5  | 5×; NONMEM prints 6 figures (≤ 4e-6) |
 /// | NONMEM `R⁻¹SR⁻¹` vs oracle total  | 8.9e-3 (TVCL1)   | 2e-2  | 2.2×; NONMEM's FD `R` (see `r` test) |
+/// | ferx `s` vs oracle held           | 1.6e-1 (TVCL2)   | > 0.1 | the straddle, 1e5× the `s` bound     |
 /// | oracle held vs total, `S`         | 1.4e-1 (TVCL2)   | > 0.1 | the straddle, ≥ 5000× the `s` bound  |
 /// | oracle held vs total, `R⁻¹SR⁻¹`   | 3.6e-1 (TVCL2)   | > 0.1 | the straddle, ≥ 5× the NONMEM bound  |
 #[test]
 fn mixture_s_rsr_ses_match_score_oracle_and_nonmem() {
-    // ferx implements the mode-held convention, to the oracle's FD accuracy.
+    // ferx implements the re-estimated (total-derivative) convention (#2974).
     let s = theta_ses(&eval_only_fit(CovarianceMethod::CrossProduct), "s");
     let rsr = theta_ses(&eval_only_fit(CovarianceMethod::Sandwich), "rsr");
     let r = theta_ses(&eval_only_fit(CovarianceMethod::Hessian), "r");
-    let w_s = worst_rel("ferx s vs oracle held", &s, &ORACLE_S_HELD);
+    let w_s = worst_rel("ferx s vs oracle total", &s, &ORACLE_S_TOTAL);
+    let w_s_nm = worst_rel(
+        "ferx s vs NONMEM MATRIX=S",
+        &s,
+        &nonmem_theta_ses("mixture_iv_cov_s"),
+    );
     let w_r = worst_rel("ferx r vs oracle", &r, &ORACLE_R);
-    let w_rsr = worst_rel("ferx rsr vs oracle held", &rsr, &ORACLE_RSR_HELD);
-    assert!(w_s < 1e-5, "ferx s vs oracle (mode held): {w_s:.3e}");
+    let w_rsr = worst_rel("ferx rsr vs oracle total", &rsr, &ORACLE_RSR_TOTAL);
+    let w_held = worst_rel("ferx s vs oracle held", &s, &ORACLE_S_HELD);
+    assert!(w_s < 1e-6, "ferx s vs oracle (η̂ re-estimated): {w_s:.3e}");
+    assert!(w_s_nm < 2e-5, "ferx s vs NONMEM MATRIX=S: {w_s_nm:.3e}");
     assert!(w_r < 1e-3, "ferx r vs oracle: {w_r:.3e}");
-    assert!(w_rsr < 1e-3, "ferx rsr vs oracle (mode held): {w_rsr:.3e}");
+    assert!(
+        w_rsr < 3e-4,
+        "ferx rsr vs oracle (η̂ re-estimated): {w_rsr:.3e}"
+    );
+    assert!(
+        w_held > 0.1,
+        "straddle: ferx s must be distinguishable from the mode-held convention: {w_held:.3e}"
+    );
 
     // NONMEM implements the re-estimated (total-derivative) convention.
     let w_nm_s = worst_rel(
@@ -348,8 +356,7 @@ fn mixture_s_rsr_ses_match_score_oracle_and_nonmem() {
     );
 
     // The straddle: the two conventions differ by far more than any agreement above,
-    // so passing on one column says nothing about the other. If ferx's score gains
-    // the EBE response, `w_s` fails first — move the s/rsr anchor to NONMEM's `.ext`.
+    // so passing on one column says nothing about the other.
     let w_conv_s = worst_rel("oracle S held vs total", &ORACLE_S_HELD, &ORACLE_S_TOTAL);
     let w_conv_rsr = worst_rel(
         "oracle RSR held vs total",
@@ -364,8 +371,8 @@ fn mixture_s_rsr_ses_match_score_oracle_and_nonmem() {
 
 /// The one-population twin (`single_iv_cov_{s,rsr,r0}`, NONMEM 7.5.1, OBJ
 /// 350.26613177): the same split as the mixture test above, on a model with no
-/// `[mixture]` at all — so the `S` gap is ferx's single-population score convention,
-/// which the mixture path inherits per class, not anything #1956 introduced.
+/// `[mixture]` at all: the single-population score whose convention the mixture path
+/// takes per class. Since #2974 ferx's `s`/`rsr` take the re-estimated column here too.
 ///
 /// Measured worst relative gaps (NONMEM side Linux, everything else macOS arm64), and
 /// the bound each gets:
@@ -378,14 +385,15 @@ fn mixture_s_rsr_ses_match_score_oracle_and_nonmem() {
 /// | NONMEM `R⁻¹SR⁻¹` vs oracle total  | 1.4e-3 (TVCL)   | 5e-3   | 3.5×; inherits NONMEM's `R` row         |
 /// | ferx `r` vs oracle `R`            | 7.9e-7 (TVCL)   | 1e-5   | 13×; analytic `R` vs the oracle's FD    |
 /// | ferx `r` vs NONMEM `MATRIX=R`     | 7.2e-4 (TVCL)   | 2e-3   | 2.8×; the NONMEM `R` row, again         |
-/// | ferx `s` vs oracle held           | 3.3e-8 (TVCL)   | 1e-6   | 30×; the oracle prints 8 figures        |
-/// | ferx `rsr` vs oracle held         | 1.6e-6 (TVCL)   | 1e-5   | 6×; the `r`-vs-oracle row above         |
-/// | ferx `s` vs NONMEM `S` (straddle) | 1.6e-1 (TVCL)   | > 0.1  | the straddle, 1.6e5× the `s` bound      |
+/// | ferx `s` vs oracle total          | 2.4e-8 (TVCL)   | 1e-6   | 41×; the oracle prints 8 figures        |
+/// | ferx `rsr` vs oracle total        | 1.6e-6 (TVCL)   | 1e-5   | 6×; the `r`-vs-oracle row above         |
+/// | ferx `s` vs NONMEM `S`            | 1.9e-6 (V)      | 1e-5   | 5×; NONMEM prints 6 figures (≤ 2.4e-6)  |
+/// | ferx `s` vs oracle held (straddle)| 1.4e-1 (TVCL)   | > 0.1  | the straddle, 1.4e5× the `s` bound      |
 ///
 /// The `R` gap is NONMEM's: ferx and the oracle agree to 7.9e-7, NONMEM is 7.2e-4
 /// off both — the same six-figure-point FD noise the mixture's `r` test measures.
 #[test]
-fn single_population_twin_shows_the_same_s_convention_gap() {
+fn single_population_twin_s_matches_nonmem_matrix_s() {
     let nm_s = nonmem_theta_ses_n("single_iv_cov_s", 2);
     let nm_rsr = nonmem_theta_ses_n("single_iv_cov_rsr", 2);
     let nm_r = nonmem_theta_ses_n("single_iv_cov_r0", 2);
@@ -425,7 +433,7 @@ fn single_population_twin_shows_the_same_s_convention_gap() {
         "twin NONMEM R⁻¹SR⁻¹ vs oracle (η̂ re-estimated): {w_nm_rsr:.3e}"
     );
 
-    // ferx implements the mode-held convention; its `R` is the oracle's.
+    // ferx implements the re-estimated convention (#2974); its `R` is the oracle's.
     let src = single_model_src();
     let s = theta_ses_n(
         &eval_only_fit_of(&src, CovarianceMethod::CrossProduct),
@@ -445,30 +453,39 @@ fn single_population_twin_shows_the_same_s_convention_gap() {
     let w_r_oracle = worst_rel_named("twin ferx r vs oracle", &SG_NAMES, &r, &SG_ORACLE_R);
     let w_r = worst_rel_named("twin ferx r vs NONMEM MATRIX=R", &SG_NAMES, &r, &nm_r);
     let w_s = worst_rel_named(
+        "twin ferx s vs oracle total",
+        &SG_NAMES,
+        &s,
+        &SG_ORACLE_S_TOTAL,
+    );
+    let w_rsr = worst_rel_named(
+        "twin ferx rsr vs oracle total",
+        &SG_NAMES,
+        &rsr,
+        &SG_ORACLE_RSR_TOTAL,
+    );
+    assert!(w_r_oracle < 1e-5, "twin ferx r vs oracle: {w_r_oracle:.3e}");
+    assert!(w_r < 2e-3, "twin ferx r vs NONMEM MATRIX=R: {w_r:.3e}");
+    assert!(
+        w_s < 1e-6,
+        "twin ferx s vs oracle (η̂ re-estimated): {w_s:.3e}"
+    );
+    assert!(
+        w_rsr < 1e-5,
+        "twin ferx rsr vs oracle (η̂ re-estimated): {w_rsr:.3e}"
+    );
+
+    // Against NONMEM's own `.ext`, and the straddle against the mode-held column.
+    let w_nm = worst_rel_named("twin ferx s vs NONMEM S", &SG_NAMES, &s, &nm_s);
+    assert!(w_nm < 1e-5, "twin ferx s vs NONMEM MATRIX=S: {w_nm:.3e}");
+    let w_straddle = worst_rel_named(
         "twin ferx s vs oracle held",
         &SG_NAMES,
         &s,
         &SG_ORACLE_S_HELD,
     );
-    let w_rsr = worst_rel_named(
-        "twin ferx rsr vs oracle held",
-        &SG_NAMES,
-        &rsr,
-        &SG_ORACLE_RSR_HELD,
-    );
-    assert!(w_r_oracle < 1e-5, "twin ferx r vs oracle: {w_r_oracle:.3e}");
-    assert!(w_r < 2e-3, "twin ferx r vs NONMEM MATRIX=R: {w_r:.3e}");
-    assert!(w_s < 1e-6, "twin ferx s vs oracle (mode held): {w_s:.3e}");
-    assert!(
-        w_rsr < 1e-5,
-        "twin ferx rsr vs oracle (mode held): {w_rsr:.3e}"
-    );
-
-    // The straddle, against NONMEM's own `.ext` rather than the oracle: with no
-    // mixture, ferx's `s` is still more than 10 % off NONMEM's `MATRIX=S`.
-    let w_straddle = worst_rel_named("twin ferx s vs NONMEM S", &SG_NAMES, &s, &nm_s);
     assert!(
         w_straddle > 0.1,
-        "twin: ferx s must stay distinguishable from NONMEM S: {w_straddle:.3e}"
+        "twin: ferx s must stay distinguishable from the mode-held convention: {w_straddle:.3e}"
     );
 }

@@ -215,8 +215,8 @@ fn assert_tail_is_free(model: &str, tail_wt: f64, options: &FitOptions, rounding
 
     let new = fitted(&full, options);
     let old = fitted_on_every_record(&full, options);
-    assert_eq!(new.gradient_method_inner, "analytic (Dual2)");
-    assert_eq!(new.gradient_method_outer, "analytic (Dual2)");
+    assert_eq!(new.gradient_method_inner, "analytic");
+    assert_eq!(new.gradient_method_outer, "analytic");
     let start = FitOptions {
         outer_maxiter: 0,
         ..options.clone()
@@ -1106,8 +1106,8 @@ mod non_gaussian {
         assert_eq!(full.population.subjects[0].doses.len(), 3);
 
         let new = fitted(&full, &options);
-        assert_eq!(new.gradient_method_inner, "analytic (Dual2)");
-        assert_eq!(new.gradient_method_outer, "analytic (Dual2)");
+        assert_eq!(new.gradient_method_inner, "analytic");
+        assert_eq!(new.gradient_method_outer, "analytic");
         assert_eq!(
             numbers(&new),
             numbers(&fitted_on_every_record(&full, &options))

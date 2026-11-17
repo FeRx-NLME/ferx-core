@@ -113,11 +113,17 @@ serde = { version = "1", features = ["derive"] }
 # reads back — can return an estimate one bit from the one that was written.
 # Every consumer here is numeric output that is meant to reload as itself.
 serde_json = { version = "1", features = ["float_roundtrip"] }
-zip = { version = "9", default-features = false, features = ["deflate"] }
+# `deflate-flate2-zlib-rs`, not `deflate`: the latter also links the zopfli encoder,
+# which zip uses only for a compression level above 9 — never requested here, so
+# bundles are byte-identical without it.
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 rayon = "1.10"
 rand = "0.10"
 rand_distr = "0.6"
-regex = "1.11"
+# Trimmed feature set: the model-text patterns need Unicode `\w`/`\s`/`\b` and `(?i)` case
+# folding (the keyword gate in the parser is pinned to agree with them on NBSP, `K`
+# (Kelvin), `İ`, ...), but never `\p{..}` classes, scripts or the perf-only engines.
+regex = { version = "1.11", default-features = false, features = ["std", "unicode-perl", "unicode-case"] }
 thiserror = "2"
 nlopt = "0.8"
 argmin = { version = "0.11", features = ["serde1"] }
@@ -129,7 +135,9 @@ sobol = "1.0"
 # consumer (`ferx-cli`, `ferx-tools`, ferx-r) depends on `ferx-core` with
 # `default-features = false`, so a default feature would be off exactly where it matters.
 # A host Cranelift cannot target falls back to the register code at runtime.
-cranelift-codegen = "0.137"
+# No default features: `timing` (pass timers nothing reads) is the one default we can
+# drop — `std`/`unwind` are required by cranelift-jit anyway, `host-arch` is the ISA.
+cranelift-codegen = { version = "0.137", default-features = false, features = ["std", "host-arch"] }
 cranelift-frontend = "0.137"
 cranelift-jit = "0.137"
 cranelift-module = "0.137"

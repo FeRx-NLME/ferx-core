@@ -7,7 +7,7 @@
 //! axis past it, an ODE IOV fit ran its EBE search on finite differences (28–38k FD calls
 //! in two outer iterations on `warfarin_iov`) and `optimizer = auto` resolved to BOBYQA with
 //! `gradient_method_outer` reading `N/A`; a compartment-free IOV fit ran both loops on
-//! finite differences under `analytic (Dual2)` labels. A FIX θ did not help: `n_theta`
+//! finite differences under `analytic` labels. A FIX θ did not help: `n_theta`
 //! counts it. #2093 retired that provider, and the adjoint recorders that replaced it
 //! seed θ on a reverse tape and only `[η, κ]` forward, so no θ-dependent width remains.
 //! These tests pin that the axis count no longer matters on either engine.
@@ -206,11 +206,11 @@ fn assert_straddle(engine: &str, model: fn(usize, bool) -> String, n_at_cap: usi
             r.warnings
         );
         assert_eq!(
-            r.gradient_method_inner, "analytic (Dual2)",
+            r.gradient_method_inner, "analytic",
             "{engine}, {label}: inner route"
         );
         assert_eq!(
-            r.gradient_method_outer, "analytic (Dual2)",
+            r.gradient_method_outer, "analytic",
             "{engine}, {label}: outer route"
         );
         assert_eq!(

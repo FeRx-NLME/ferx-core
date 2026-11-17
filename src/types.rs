@@ -358,7 +358,7 @@ impl DoseEvent {
     /// A `NaN` `time` instead lands where every engine already looks. It is the
     /// same shape a `NaN` `ALAG` produces (`dose.time + lag`), so the #1189
     /// machinery absorbs it unchanged: each walk pushes `d.time` onto its
-    /// timeline, [`crate::ode::predictions::timeline_has_non_finite`] /
+    /// timeline, [`crate::ode::predictions::times_have_non_finite`] /
     /// `EventSchedule::non_finite_event_time` sees it, and the subject comes
     /// back `NaN` — which the estimation guards already read as a diverged solve
     /// and the optimizer as a wall. One repulsion channel for every non-finite
@@ -483,6 +483,13 @@ impl DoseEvent {
         self.cmt.max(1)
     }
 
+    /// Write `CMT=0` as the compartment 1 it means. For a dose rewritten into an infusion
+    /// ([`crate::dosing::lower_zero_order_ss`]): a `CMT=0` infusion has no rate channel, so the
+    /// lowered dose names its compartment.
+    pub(crate) fn resolve_default_cmt(&mut self) {
+        self.cmt = self.cmt.max(1);
+    }
+
     /// The literal authored `CMT`, `0` included — the escape hatch for the few
     /// sites that need the raw value rather than a resolved index: detecting a
     /// `CMT=0` dose (`d.cmt_raw() == 0`), echoing it in a diagnostic, or passing
@@ -552,21 +559,29 @@ impl DoseEvent {
         }
     }
 
-    /// A clone of this dose repositioned to the origin of a single steady-state
-    /// cycle: `time = 0`, with `ss`/`ii` cleared so the event-driven equilibration
-    /// walk replays it as an ordinary within-cycle dose. Preserves the
-    /// bioavailability-reshaped `(rate, duration)` this dose already carries —
-    /// unlike [`Self::new`], which would recompute `duration = amt/rate` and drop
-    /// `F` (#419). Lives here because it constructs a `DoseEvent` by functional
-    /// update, which the now-private `cmt` field forbids outside this
-    /// module (#912).
-    pub(crate) fn synthetic_cycle_dose(&self) -> DoseEvent {
-        DoseEvent {
+    /// The infusions one steady-state cycle of this dose replays, at the cycle origin with
+    /// `ss`/`ii` cleared: the newest pulse over `[0, r)` and, when the pulses overlap
+    /// (`T_inf > II`), the `m` earlier ones that run through the whole cycle as one window of
+    /// rate `m·rate` (`crate::dosing::ss_overlap_split_g`). Preserves the
+    /// bioavailability-reshaped `(rate, duration)` this dose already carries — unlike
+    /// [`Self::new`], which would recompute `duration = amt/rate` and drop `F` (#419). Lives
+    /// here because it constructs a `DoseEvent` by functional update, which the private `cmt`
+    /// field forbids outside this module (#912).
+    pub(crate) fn ss_cycle_doses(&self) -> Vec<DoseEvent> {
+        let (m, r) = crate::dosing::ss_overlap_split_g(self.duration, self.ii);
+        let at = |rate: f64, duration: f64| DoseEvent {
             time: 0.0,
             ss: false,
             ii: 0.0,
+            rate,
+            duration,
             ..self.clone()
+        };
+        let mut out = vec![at(self.rate, r)];
+        if m > 0 {
+            out.push(at(m as f64 * self.rate, self.ii));
         }
+        out
     }
 }
 
@@ -756,6 +771,13 @@ pub struct DoseAttrMap {
     /// makes the collision data-dependent, so it is judged in
     /// `api::validation::check_modeled_dose_rates` rather than by the parser (#993).
     prediction_path_reads: HashMap<(DoseAttr, usize), String>,
+    /// `1-based compartment -> PkParams slot` of the `dur` of the **sole** `zero_order()`
+    /// forcing feeding it (#2786): a compartment fed by nothing but one zero-order window. An
+    /// `SS=1` dose into such a compartment is lowered to a duration-modeled infusion that reads
+    /// its window from this slot ([`crate::dosing::lower_zero_order_ss`]), so the steady-state
+    /// seed, the residual windows and the exact derivatives are the infusion's own. Kept apart
+    /// from `indexed` so a model's `D{n}` bookkeeping (and [`Self::is_empty`]) is unchanged.
+    zero_order: HashMap<usize, (usize, Option<usize>)>,
 }
 
 impl DoseAttr {
@@ -916,7 +938,79 @@ impl DoseAttrMap {
     /// a `CMT=0` modeled-`RATE` dose is an infusion by `DoseEvent::is_infusion`,
     /// which `check_dose_compartments` rejects on both engines.
     pub fn indexed_slot(&self, attr: DoseAttr, cmt: usize) -> Option<usize> {
-        self.indexed.get(&(attr, cmt.max(1))).copied()
+        self.indexed.get(&(attr, cmt.max(1))).copied().or_else(|| {
+            // A dose lowered from a pure zero-order compartment reads its duration from the
+            // forcing's `dur` slot (#2786).
+            if attr == DoseAttr::Duration {
+                self.zero_order.get(&cmt.max(1)).map(|z| z.0)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Record that 1-based compartment `cmt` is fed by one `zero_order()` forcing and nothing
+    /// else, its `dur` read from PkParams `slot` (#2786). `route_lag_slot` is the forcing's own
+    /// `lag=` slot when it is the **only** lag the compartment's doses carry (no `ALAG{c}`, no
+    /// bare `lagtime`): a dose lowered to an infusion reads it as the dose's lag
+    /// ([`Self::lagtime_for_dose`]); the forcing keeps it for every other dose.
+    pub(crate) fn set_zero_order(
+        &mut self,
+        cmt: usize,
+        slot: usize,
+        route_lag_slot: Option<usize>,
+    ) {
+        self.zero_order.insert(cmt, (slot, route_lag_slot));
+    }
+
+    /// The `dur` slot of the sole zero-order forcing feeding 1-based `cmt`, if it has exactly
+    /// that ([`Self::set_zero_order`]).
+    pub(crate) fn zero_order_slot(&self, cmt: usize) -> Option<usize> {
+        self.zero_order.get(&cmt.max(1)).map(|z| z.0)
+    }
+
+    /// The per-route lag slot a dose lowered from 1-based pure zero-order `cmt` carries as its
+    /// own lag ([`Self::set_zero_order`]), if there is one.
+    pub(crate) fn lowered_route_lag_slot(&self, cmt: usize) -> Option<usize> {
+        self.zero_order.get(&cmt.max(1)).and_then(|z| z.1)
+    }
+
+    /// Whether some pure zero-order compartment hands its route lag to its lowered doses.
+    pub(crate) fn has_lowered_route_lag(&self) -> bool {
+        self.zero_order.values().any(|z| z.1.is_some())
+    }
+
+    /// The route-lag slot of `d` when `d` is an `SS=1` dose into a pure zero-order compartment
+    /// whose lag lives on the route: the dose the engines walk lowered to an infusion
+    /// ([`crate::dosing::lower_zero_order_ss`]), read here lowered or not (a user-coded SS
+    /// infusion into such a compartment is refused by validation, so the two are one set).
+    fn lowered_dose_lag_slot(&self, d: &DoseEvent) -> Option<usize> {
+        if d.ss && d.ii > 0.0 {
+            self.lowered_route_lag_slot(d.cmt_1based())
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::lag_slot`] for the dose `d`: a dose lowered from a route-lagged zero-order
+    /// compartment lags by the route's `lag=` slot (its lag now lives on the dose); every other
+    /// dose by its compartment's lag. The one reader every dose-lag consumer goes through.
+    pub(crate) fn lag_slot_for_dose(&self, d: &DoseEvent) -> usize {
+        self.lowered_dose_lag_slot(d)
+            .unwrap_or_else(|| self.lag_slot(d.cmt_raw()))
+    }
+
+    /// [`Self::lagtime`] for the dose `d` ([`Self::lag_slot_for_dose`]).
+    pub(crate) fn lagtime_for_dose(&self, d: &DoseEvent, params: &[f64]) -> f64 {
+        match self.lowered_dose_lag_slot(d) {
+            Some(slot) => params.get(slot).copied().unwrap_or(0.0),
+            None => self.lagtime(d.cmt_raw(), params),
+        }
+    }
+
+    /// Whether any compartment is a pure zero-order one.
+    pub(crate) fn has_zero_order(&self) -> bool {
+        !self.zero_order.is_empty()
     }
 
     /// Whether any compartment-indexed entry for `attr` is declared (e.g. `F1`/`F2`
@@ -3631,7 +3725,7 @@ pub struct RuvMagnitude {
     /// this flag and route those subjects to their magnitude-aware
     /// finite-difference fallback instead.
     pub theta_dependent: bool,
-    /// Parallel to `per_sigma`: the compiled `Dual1` θ-derivative program for the
+    /// Parallel to `per_sigma`: the compiled `Dual2` θ-derivative program for the
     /// same non-bare slot (#576/#486), or `None` for a bare slot. Lets the
     /// analytic outer θ/σ gradient differentiate the magnitude directly — a new
     /// direct-θ term in `∂R/∂θ` — instead of falling back to FD. The runtime
@@ -3656,7 +3750,7 @@ pub struct RuvMagnitude {
     /// exponent reach every estimator through the plumbing the magnitude
     /// already has (see `residual_error::slot_exponent`).
     pub per_sigma_exponent: Vec<Option<RuvMagFn>>,
-    /// Parallel to `per_sigma_exponent`: the `Dual1` θ-derivative program of each
+    /// Parallel to `per_sigma_exponent`: the `Dual2` θ-derivative program of each
     /// exponent, so the analytic outer θ gradient carries `∂R/∂p · ∂p/∂θ`.
     pub per_sigma_exponent_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
     /// Whether any multiplier or exponent expression reads the `TAD` built-in
@@ -4014,7 +4108,7 @@ pub struct AnalyticalInit {
 /// order and feeds it, plus individual params / covariates, to the shared
 /// `PkNum`-generic evaluator `crate::parser::model_parser::OdeOutputProgram::eval_output_g`
 /// — the same one the ODE provider uses — so FOCE/FOCEI sensitivities stay
-/// analytic over `Dual2`/`Dual1` (no finite-difference fallback on the
+/// analytic over `Dual2`/`Dual2` (no finite-difference fallback on the
 /// supported paths).
 ///
 /// `#[non_exhaustive]`: constructed only inside the crate (the parser).
@@ -4924,8 +5018,45 @@ pub(crate) struct NestedLevels {
     pub(crate) readers: Vec<Vec<String>>,
 }
 
+/// The identity of a constructed model, keying its compiled plans (#2786). Minted from a global
+/// counter, never reused, so a model built at a dropped one's address cannot be served its
+/// plans; a clone is a new model and mints its own. Dropping it purges the model's plans.
+#[derive(Debug)]
+pub struct PlanId(u64);
+
+impl PlanId {
+    /// A fresh identity.
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        PlanId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+    pub(crate) fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for PlanId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for PlanId {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PlanId {
+    fn drop(&mut self) {
+        crate::parser::model_parser::rhs_regcode::kernel_jit::drop_model(self.0);
+    }
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
+    /// The model's identity: keys its compiled plans.
+    pub plan_id: PlanId,
     pub name: String,
     pub pk_model: PkModel,
     pub error_model: ErrorModel,
@@ -5549,8 +5680,7 @@ impl GradientMethod {
     /// **The one predicate** every consumer of the flag reads — the outer gradient and the
     /// `auto` optimizer pick, the inner η-gradient route, the covariance R-matrix scope and
     /// the IOV FD reason. A union, like [`GradientMethod::effective`]: `Fd` from either side
-    /// wins and `Auto` is neutral. SDE is not folded in here — each reader already declines
-    /// an SDE model on its own scope.
+    /// wins and `Auto` is neutral.
     pub(crate) fn forced_fd(model: &CompiledModel) -> bool {
         model.gradient_method == GradientMethod::Fd || LOCAL_FORCED_FD.get().unwrap_or(false)
     }
@@ -5561,8 +5691,7 @@ impl GradientMethod {
     ///
     /// `fit()`, `run_covariance` and `run_sir` resolve this per call (#1613): each arms
     /// its own `options.gradient_method` for the duration of the run, and every reader
-    /// asks [`GradientMethod::forced_fd`], which also reads the model's flag; an SDE model
-    /// is declined by each reader's own scope. This function is the same rule for a
+    /// asks [`GradientMethod::forced_fd`], which also reads the model's flag. This function is the same rule for a
     /// caller that holds the pair but runs nothing — `check` mirrors it — and
     /// `run_model_with_data` still stamps it onto the model it hands back, which outlives
     /// the fit.
@@ -5577,12 +5706,11 @@ impl GradientMethod {
     ///   `model.gradient_method` by hand and never touched `options` — reading the
     ///   options alone would miss it, and the loop honours the model.
     ///
-    /// Taking either source's `Fd`, plus `is_sde`, is right in all three cases and
-    /// idempotent on an already-stamped model.
+    /// Taking either source's `Fd` is right in all three cases and idempotent on an
+    /// already-stamped model.
     pub(crate) fn effective(model: &CompiledModel, options: &FitOptions) -> GradientMethod {
         if model.gradient_method == GradientMethod::Fd
             || options.gradient_method == GradientMethod::Fd
-            || model.is_sde()
         {
             GradientMethod::Fd
         } else {
@@ -6289,6 +6417,18 @@ impl CompiledModel {
         self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, None)
     }
 
+    /// [`Self::has_lagtime`], or a per-route `lag=` that `SS=1` doses into a pure zero-order
+    /// compartment carry as their own lag once lowered to infusions (#2786). Only the sites
+    /// that read a *lowered* dose's lag ask this; everywhere else a route lag stays on the
+    /// route and the model stays on the lag-free paths.
+    pub(crate) fn has_dose_lag(&self) -> bool {
+        self.has_lagtime()
+            || self
+                .ode_spec
+                .as_ref()
+                .is_some_and(|o| o.dose_attr_map.has_lowered_route_lag())
+    }
+
     /// Routes 1 and 3 of [`Self::has_lagtime`]: the bare lag slot is written,
     /// by a declared parameter (`pk_indices`) or by a literal on the `pk(...)`
     /// line (`const_pk_slots`).
@@ -6307,12 +6447,17 @@ impl CompiledModel {
     /// the entry indexed for 1-based `c` counts ([`Self::has_lagtime_on_cmt`]).
     fn has_indexed_dose_attr(&self, attr: DoseAttr, cmt: Option<usize>) -> bool {
         self.ode_spec.is_some()
-            && self.indiv_param_names.iter().any(|n| {
+            && (self.indiv_param_names.iter().any(|n| {
                 matches!(
                     DoseAttr::from_indexed_name(n),
                     Some((a, indexed_cmt)) if a == attr && cmt.is_none_or(|c| c == indexed_cmt)
                 )
-            })
+            }) || self.ode_spec.as_ref().is_some_and(|o| match cmt {
+                // An entry the parser registered without the name (a per-route `lag=` on a
+                // lone zero-order compartment is its `ALAG{c}`, #2786).
+                None => o.dose_attr_map.has_indexed_attr(attr),
+                Some(c) => o.dose_attr_map.indexed_slot(attr, c).is_some(),
+            }))
     }
 
     /// True when any built-in absorption input-rate forcing carries a per-route
@@ -6337,47 +6482,6 @@ impl CompiledModel {
     /// rejection (#719 gap 1) to the actual SS-dosed compartment.
     pub fn has_lagtime_on_cmt(&self, cmt: usize) -> bool {
         self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, Some(cmt))
-    }
-
-    /// True when `subject` has a steady-state dose into a built-in absorption
-    /// input-rate compartment that the analytic dual SS fixed point does **not**
-    /// serve: SS into a `zero_order` spanning window (the pointwise `R_in` fixed
-    /// point doesn't build it), or SS combined with an absorption lag on the dosed
-    /// compartment — either a compartment `lagtime`/`ALAG` ([`Self::has_lagtime_on_cmt`])
-    /// or a per-route `lag=` on the forcing ([`crate::pk::absorption::InputRateForcing`]'s
-    /// `lag_slot`, #859). All are hard-rejected upstream (`E_ABSORPTION_SS_ZERO_ORDER`
-    /// / `E_ABSORPTION_SS_LAG`, `api::check_absorption_dosing` — whose `has_ss_lag`
-    /// covers a per-route lag via `route_lag_cmts`); the ODE walk gates
-    /// (`event_walk_scope` behind `event_walk_subject_supported`, and `ode_iov_walk_scope`)
-    /// re-check it as belt-and-suspenders so the
-    /// analytic-vs-FD routing stays self-consistent if either upstream check is
-    /// relaxed. This must therefore mirror the upstream predicate exactly — the
-    /// per-route `lag_slot` clause was added with #859 (which made a `first_order`
-    /// route lag analytic, so without it a relaxed upstream reject would route an
-    /// SS + route-lag model onto the analytic SS seed, which does not carry the
-    /// per-route onset). Single source of truth for those three sites (#835 review)
-    /// — keeping the scope in one place so it cannot drift between them (cf. the
-    /// #814 attribution-drift class of bug). Scoped to the SS-dosed compartment:
-    /// an SS dose into a plain compartment on a model that separately declares
-    /// absorption for a different route is unaffected (its `R_in` is inert for
-    /// that dose).
-    pub(crate) fn ss_absorption_out_of_scope(&self, subject: &Subject) -> bool {
-        let Some(ode) = self.ode_spec.as_ref() else {
-            return false;
-        };
-        subject.doses.iter().any(|d| {
-            // Match the forcing 0-based and probe the lagtime 1-based so a `CMT=0` dose (the
-            // default dose compartment == compartment 1) is scoped like `CMT=1` (#899, #913 review)
-            // — otherwise a `CMT=0` SS dose into a zero-order / lagged absorption compartment
-            // slips this out-of-scope guard and is silently mis-served.
-            d.ss && d.ii > 0.0
-                && ode.input_rate.iter().any(|f| {
-                    f.cmt == d.cmt_idx()
-                        && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
-                            || f.lag_slot.is_some()
-                            || self.has_lagtime_on_cmt(d.cmt_1based()))
-                })
-        })
     }
 
     /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
@@ -6551,7 +6655,7 @@ impl CompiledModel {
     /// loops are analytic on FOCE and FOCEI (#644/#659) — including combined with `iiv_on_ruv` on
     /// the closed-form (#673/#677) and ODE (#486) paths, since the outer assembly is
     /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude combined with an
-    /// M3-censored row or more θ than the magnitude program's `Dual1`
+    /// M3-censored row or more θ than the magnitude program's `Dual2`
     /// dispatch serves (see #486's remaining-FD register). The FD forward NLL is itself
     /// magnitude-aware, so those fallbacks stay exact.
     #[inline]
@@ -6870,6 +6974,33 @@ pub struct TteObsDiagnostic {
     /// leans high. Under censoring, check `coxsnell` against Exp(1) with a censored
     /// estimate instead.
     pub pit: f64,
+    /// Simulation-based npde of a single-event record (#1889), from
+    /// [`crate::stats::npde::compute_tte_npde`]: `Φ⁻¹` of the fraction of population
+    /// replicates with an earlier event, imputed above that fraction for a
+    /// right-censored time. NaN unless the fit ran with `[fit_options] npde_nsim > 0`
+    /// and the record could be scored. NPDE and NPD are the same number for a single
+    /// event, so the sdtab writes this field to both columns. Absent from a value
+    /// serialised before #1889, which reads back as NaN.
+    #[serde(default = "nan_f64")]
+    pub npde: f64,
+}
+
+/// Serde default of an optional score: NaN, "not computed". The derive default of an
+/// `f64` is `0.0`, a valid-looking score.
+#[cfg(feature = "survival")]
+fn nan_f64() -> f64 {
+    f64::NAN
+}
+
+/// Whether any time-to-event row of `subjects` carries a finite npde (#1889). The one
+/// answer both the sdtab (whether `NPDE` / `NPD` columns exist for a fit whose only
+/// scores are on TTE rows) and the `.fitrx` writer (whether `predictions_tte.csv` gets
+/// its `NPDE` column) read.
+#[cfg(feature = "survival")]
+pub(crate) fn any_tte_npde(subjects: &[SubjectResult]) -> bool {
+    subjects
+        .iter()
+        .any(|s| s.tte_rows.iter().any(|r| r.npde.is_finite()))
 }
 
 /// Per-subject estimation results
@@ -7757,7 +7888,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     #[allow(clippy::if_same_then_else)]
     let (severity, category) = if lower.starts_with("multi-start:") {
         // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
-        // failed: <errors>" and "best result from start k/n". A prefix-token arm ahead of
+        // failed: <errors>" and the #2867 summary of the starts. A prefix-token arm ahead of
         // *every* other arm, because the failure note interpolates the sibling starts' own
         // error text: a "did not converge" or covariance-failure phrase in it would land on a
         // Critical arm and mark a healthy returned fit as failing. The note is about runs that
@@ -7798,6 +7929,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // "non-finite", "stability-limited", "singular Jacobian", …), which prose arms below
         // would claim as an estimation or solver-health problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.starts_with("w_plan_fd_fallback") {
+        // #2786: a compiled plan failed and its subjects took finite differences. Token arm
+        // ahead of the prose ones: the message quotes the plan layer's own failure reason.
+        (WarningSeverity::Warning, WarningCode::GradientFallback)
     } else if lower.starts_with("w_ode_rhs_") {
         // #2681: which engine runs the `[odes]` RHS. Informational, and a token arm ahead of
         // the prose ones: the message names the construct, and "interpreter" or a function
@@ -7851,6 +7986,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // estimate whose category drives `skip_estimate_near_boundary` and
         // `reject_on_boundary`. A near-miss phrasing there would silently drop
         // bootstrap replicates.
+        (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
+    } else if lower.contains("w_theta_init_outside_bounds") {
+        // #2865: the evaluation-only half of `E_THETA_INIT_OUTSIDE_BOUNDS` — a
+        // `theta` start outside its own declared range at `maxiter = 0`, clamped
+        // and scored at the bound. The same category as the arm above (a start
+        // the box moved), through its own arm because neither token contains the
+        // other. A token arm for the same reason too: the message quotes a
+        // "bound", and the "optimizer bound" prose arm is `BoundaryEstimate`,
+        // which would drop bootstrap replicates.
         (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
     } else if lower.contains("w_stalled_at_init") {
         // #997 §2: the fit never left its initial estimates. Matched on its `W_`
@@ -8706,14 +8850,22 @@ pub struct FitResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_csv: Option<String>,
     /// Number of outer iterations in which at least one subject had an
-    /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling).
+    /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling). An evaluation whose
+    /// inner pass stopped once the EBE guard's rejection was certain (#2709) always counts
+    /// here. The full pass would instead have counted as a non-finite objective if its OFV
+    /// was non-finite and only the unconverged fraction tripped the guard. The evaluation is
+    /// rejected with the same penalty either way.
     pub ebe_convergence_warnings: u32,
-    /// Worst-case number of unconverged subjects in a single outer iteration.
+    /// Worst-case number of unconverged subjects in a single outer iteration. An evaluation
+    /// whose inner pass stopped once the EBE guard's rejection was certain (#2709) counts the
+    /// subjects it solved, so its count is a lower bound; a run with no feasible evaluation
+    /// never stops one.
     pub max_unconverged_subjects: u32,
     /// How many times, summed over every inner loop (not a count of distinct subjects), an
     /// inner solve returned a fallback's point (`EbeResult::used_fallback`): the recovery
     /// after the primary search failed its certificate, or the runaway-EBE guard's. A solve
-    /// whose fallback point a multi-start candidate then replaced is not counted (#2589).
+    /// whose fallback point a multi-start candidate then replaced is not counted (#2589), nor
+    /// a subject an inner pass left unsolved once the EBE guard's rejection was certain (#2709).
     /// Counted only by the outer loop under an NLopt optimizer (`auto`, `bobyqa`, `slsqp`,
     /// `mma`, and `nlopt_lbfgs` with its model-file aliases `lbfgs` / `bfgs`), for FOCE,
     /// FOCEI, Laplace and AGQ alike; by a fit with a `profile`d level block; and by Bayes'
@@ -8727,7 +8879,8 @@ pub struct FitResult {
     /// stop was not a mode and the stationarity certificate moved it there with the gradient.
     /// The primary search's moved point is not a fallback. Always `0` under every other
     /// `inner_optimizer`, and counted only on the paths that count `total_ebe_fallbacks`
-    /// (#2571).
+    /// (#2571). A subject an inner pass left unsolved once the EBE guard's rejection was
+    /// certain (#2709) is not counted.
     pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,
@@ -8762,7 +8915,8 @@ pub struct FitResult {
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
     /// `NaN` when no series has ≥ 2 valid IWRES values (a series is a subject's
-    /// rows, split at its `correlation … by` blocks and its parallel occasions).
+    /// rows, split at its `correlation … by` blocks and its occasions where these
+    /// are parallel; blocks and occasions that run in time stay one series).
     pub iwres_lag1_r: f64,
     /// Pooled Durbin-Watson statistic for IWRES within subjects.
     /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
@@ -9006,6 +9160,11 @@ pub struct FitResult {
     /// `n_starts == 1` (no perturbation applied) or when no seed was set and
     /// the run used a random seed derived from the system clock.
     pub multi_start_seed: Option<u64>,
+    /// What each start of a multi-start fit did (#2867): one [`StartRecord`] per start, in
+    /// start order, exactly one of them `selected`. Empty when `n_starts == 1`. The other
+    /// starts' full results are not kept; these rows are what remains of them.
+    #[serde(default)]
+    pub starts: Vec<StartRecord>,
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
     /// when no explicit seed was set in `[fit_options]`.
     pub saem_seed: Option<u64>,
@@ -9320,6 +9479,14 @@ impl FitResult {
                 "status".to_string(),
                 serde_json::to_value(self.status()).expect("FitStatus is serializable"),
             );
+            // #2911: the parameter estimates keyed by name, in the fit YAML's own layout —
+            // `estimates.theta.CL.estimate` is the YAML's `theta.CL.estimate` — so a reader
+            // of final estimates does not branch on which file it was handed. Derived, like
+            // `status`: `from_json_str` ignores it and reads the vectors above.
+            map.insert(
+                "estimates".to_string(),
+                crate::io::output::estimates_json(self),
+            );
         }
         v
     }
@@ -9491,7 +9658,7 @@ pub struct FitOptions {
     /// loop's warm start then carries the chosen basin forward, so the scan runs
     /// only on cold solves: the pre-flight, the first evaluation of each optimizer
     /// leg (including a #1565 basin restart) and the final re-solve (an all-zero
-    /// start counts as cold, #2014). The `global_search` pre-search's probes run
+    /// start counts as cold unless an earlier pass returned it as the mode, #2014, #2688). The `global_search` pre-search's probes run
     /// without it. Subjects on the event-driven path
     /// (system resets / time-varying covariates) re-seed every random effect;
     /// every other subject is probed per coordinate for a weakly-identified
@@ -11102,17 +11269,10 @@ impl Optimizer {
     /// reliable. (A residual `correlation` line with kappa, which #2122 sent to L-BFGS
     /// on its finite-difference gradient, is analytic since #2093 and takes the
     /// general rule.)
-    ///
-    /// `interaction` is `options.interaction` (`true` for `method = focei`,
-    /// `false` for plain `method = foce`) — a custom residual-magnitude model's
-    /// direct-θ channel is FOCEI-only (#486 review), so a magnitude-active model
-    /// under plain FOCE must still resolve to `Bobyqa` even though
-    /// `analytic_outer_gradient_available` (interaction-agnostic) says the model
-    /// is in scope.
-    pub fn resolve_auto(self, model: &CompiledModel, interaction: bool) -> Optimizer {
+    pub fn resolve_auto(self, model: &CompiledModel) -> Optimizer {
         self.resolve_auto_given_analytic(
             model,
-            crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction),
+            crate::sens::provider::analytic_outer_gradient_available(model),
         )
     }
 
@@ -11282,6 +11442,29 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
+    /// Whether this estimator reads `outer_maxiter = 0` as NONMEM `MAXEVAL=0`: one
+    /// objective evaluation at the initial estimates and no search.
+    ///
+    /// Those are the stages `fit()` routes through `optimize_population` (FOCE, FOCEI,
+    /// Laplace, which short-circuits to `evaluate_at_initial_params`) and pure
+    /// Gauss–Newton, whose loop runs `1..=maxiter`. Not SAEM, IMP, IMPMAP, Bayes or VI,
+    /// which carry their own iteration counts, nor the Gauss–Newton hybrid, whose FOCEI
+    /// polish runs a fixed budget whatever `maxiter` says.
+    ///
+    /// The one membership list behind [`FitOptions::evaluation_only_run`] and the
+    /// start-side checks' "does a search run" gate (`api::validation::outer_search_runs`).
+    /// They were two lists, and the second one missed VI and the hybrid (#2865 review).
+    /// An allow-list, so a new estimator counts as searching until it is added here.
+    pub(crate) fn evaluates_at_maxiter_zero(self) -> bool {
+        matches!(
+            self,
+            EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::Laplace
+        )
+    }
+
     /// Whether this method's objective is an integral over the random effects, so
     /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
     /// rule for the "requires at least one random effect" family:
@@ -11594,15 +11777,7 @@ impl FitOptions {
     pub(crate) fn evaluation_only_run(&self) -> bool {
         let eval_only = self.eval_only_methods();
         self.method_chain().iter().all(|m| {
-            eval_only.contains(m)
-                || (self.outer_maxiter == 0
-                    && matches!(
-                        m,
-                        EstimationMethod::Foce
-                            | EstimationMethod::FoceI
-                            | EstimationMethod::FoceGn
-                            | EstimationMethod::Laplace
-                    ))
+            eval_only.contains(m) || (self.outer_maxiter == 0 && m.evaluates_at_maxiter_zero())
         })
     }
 
@@ -12365,6 +12540,12 @@ pub struct ParsedModel {
 #[path = "types_fit_status.rs"]
 mod fit_status;
 pub use fit_status::{FitStatus, StatusReason};
+
+// #2867: what each start of a multi-start fit did, and the summary of their spread.
+#[path = "types_multi_start.rs"]
+mod multi_start;
+pub use multi_start::StartRecord;
+pub(crate) use multi_start::{StartSpread, START_AGREE_OFV};
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests

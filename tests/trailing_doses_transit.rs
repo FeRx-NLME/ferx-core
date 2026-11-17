@@ -94,8 +94,8 @@ fn bits(r: &FitResult) -> Vec<u64> {
 fn trailing_doses_do_not_change_a_transit_fit() {
     let with_tail = fitted(&dataset(29));
     let without = fitted(&dataset(2));
-    assert_eq!(with_tail.gradient_method_inner, "analytic (Dual2)");
-    assert_eq!(with_tail.gradient_method_outer, "analytic (Dual2)");
+    assert_eq!(with_tail.gradient_method_inner, "analytic");
+    assert_eq!(with_tail.gradient_method_outer, "analytic");
     assert!(with_tail.ofv.is_finite());
     assert_eq!(bits(&with_tail), bits(&without));
 }

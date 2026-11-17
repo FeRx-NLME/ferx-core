@@ -139,9 +139,10 @@ threads_per_fit = total_threads / replicates      (at least 1, floored)
 
 So `from_budget(8, 200)` is `8 x 1`, `from_budget(8, 2)` is `2 x 4`, and
 `from_budget(8, 3)` is `3 x 2` — the division floors rather than
-oversubscribing. `total_threads = 0` means the engine default (available cores
-minus one, capped at 8); both levels are always at least 1, so a plan never
-silently means "let Rayon decide".
+oversubscribing. `total_threads = 0` means the engine default (a positive
+`RAYON_NUM_THREADS` if set, else available cores minus one, at least two where
+two cores exist, capped at 8); both levels are always at least 1, so a plan
+never silently means "let Rayon decide".
 
 `PoolPlan::install()` is the part you should not hand-roll. ferx builds its own
 pools with a 32 MiB worker stack (`FIT_RAYON_STACK_SIZE`) because wide ODE+IOV
@@ -370,8 +371,7 @@ The other two steps are what the file entry points do besides binding: the
 `[data_selection]` filter and the IOV column go to the reader. Leave either out
 and the fit runs without that setting, and nothing warns you. `gradient` needs
 no step: `fit` reads it from the options it is given, so a file's
-`gradient = fd` takes effect here as it does from the file entry points, and an
-SDE model runs on finite differences whatever it says
+`gradient = fd` takes effect here as it does from the file entry points
 ([#1613](https://github.com/FeRx-NLME/ferx-core/issues/1613)). With both steps,
 the example gives the same parameter vector and the same objective as
 `run_model_with_data`, equal to the bit. The test suite pins that on a

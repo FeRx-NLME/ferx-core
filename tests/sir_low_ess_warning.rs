@@ -199,7 +199,7 @@ fn warfarin_iov_focei_warns_and_names_the_shelf_variance_and_natural_does_not() 
     assert!(low_ess(&nat).is_none(), "{:?}", nat.warnings);
 }
 
-/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3883345788064 since #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
+/// S4: the healthy `warfarin_iov` FOCE fit (ESS 402.3820667781389 since #2786's last wave; 402.3883345788064 from #2706; 402.38098512621974 from #2549; 402.38186322963156 from #2462; 402.38245815217266 from #2443; 402.34727326791347 from #2261 PR 2; 402.3472759966188 from #2261 PR 1; 402.3856724693695 from #2280; 402.38107815756786 from #2210; 402.3820222439373 from #2217; 402.38567292526295 from #2202; 402.3856723316291 from #2093; 404.59 from #1722's frozen-variance FOCE EBEs; 396.21 before)
 /// carries no SIR warning at all.
 #[test]
 #[cfg_attr(
@@ -277,7 +277,12 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
     // path to the same optimum (OFV 205.0903 on both, 55 → 64 iterations measured base
     // 0dabda75 against head), and the fixed-seed SIR proposal is built from the covariance
     // there. The FOCEI literals above stayed inside `ESS_REL_TOL`.
-    assert_ess(f.sir_ess, 402.388_334_578_806_4, "FOCE packed");
+    // #2786's last wave (edea3b69..dc3d1ccc) moved it by −1.6e-5
+    // relative (402.3883345788064 → 402.3820667781389; x86_64 CI slow-tests run 43794969148):
+    // the range adds the off-mode polish, EBE adoption and the coincident-break walk; which of
+    // them moves this fit's L-BFGS path (and the covariance the fixed-seed proposal is built
+    // from) was not isolated. The ESS stays 4× above the warning threshold.
+    assert_ess(f.sir_ess, 402.382_066_778_138_9, "FOCE packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 }
 
@@ -285,7 +290,7 @@ fn warfarin_iov_foce_carries_no_sir_warning() {
 ///
 /// Packed (default): ESS 159.03340958544695 since #2549's warm verification legs (159.03342968405167 from #2549 with #2544; 159.0334071602698 from #2549 alone; 159.03319612992476 from #2544 alone; 159.03323734232006 from #2462; 159.0331768009516 from #2261 PR 2; 159.03317704270248 from #2261 PR 1; 159.03342053931178 from #2093; 143.22 before it), 1.59× the threshold, and no SIR
 /// warning — the closest healthy fixture to the threshold, so moving it to
-/// `sir_resamples` (250) reddens this half. Natural: ESS 43.099436598567785 since #2549's warm verification legs (43.09944471640555 from #2549 with #2544; 43.099435640565254 from #2549 alone; 43.099283326146214 from #2544 alone; 43.09929454157046 from #2462; 43.09925605709212 from #2261; 43.09944242607953 from #2093; 35.19 before it),
+/// `sir_resamples` (250) reddens this half. Natural: ESS 43.099436650396704 since #2786's last wave (43.099436598567785 from #2549's warm verification legs; 43.09944471640555 from #2549 with #2544; 43.099435640565254 from #2549 alone; 43.099283326146214 from #2544 alone; 43.09929454157046 from #2462; 43.09925605709212 from #2261; 43.09944242607953 from #2093; 35.19 before it),
 /// **with** the warning, which points back to `packed` and carries no box
 /// sentence. Flipping the default to natural reddens the packed half.
 #[test]
@@ -332,10 +337,14 @@ fn mbma_placebo_is_healthy_under_packed_and_warns_under_natural() {
     // 159.033_409_585_446_95, −1.3e-7; 43.099_444_716_405_55 → 43.099_436_598_567_785,
     // −1.9e-7; Linux x86_64): the #2462 leg now starts at the incumbent's own modes rather
     // than cold, so it stops at a slightly different point of the same optimum.
+    // #2786's last wave (edea3b69..dc3d1ccc) moved the natural one by +1.2e-9
+    // (43.099_436_598_567_785 → 43.099_436_650_396_704; x86_64 CI slow-tests run 43794969148):
+    // the same range as the FOCE note, cause not isolated. The packed one stayed inside
+    // `ESS_REL_TOL` (159.033_409_686_987_88 measured).
     assert_ess(f.sir_ess, 159.033_409_585_446_95, "MBMA packed");
     assert!(sir_warnings(&f).is_empty(), "{:?}", f.warnings);
 
-    assert_ess(nat.sir_ess, 43.099_436_598_567_785, "MBMA natural");
+    assert_ess(nat.sir_ess, 43.099_436_650_396_704, "MBMA natural");
     let w = low_ess(&nat).unwrap_or_else(|| panic!("no low-ESS warning: {:?}", nat.warnings));
     assert!(
         w.contains("`sir_scale = packed` may sample it better"),

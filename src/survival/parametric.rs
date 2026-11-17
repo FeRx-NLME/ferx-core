@@ -18,6 +18,7 @@
 //
 // All functions guard against t ≤ 0 to avoid log/pow domain errors.
 
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 use crate::types::HazardFamily;
 
@@ -102,13 +103,18 @@ pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
             let gt = gamma * k(t);
             let exp_gt = gt.exp();
             let h_val = alpha * exp_gt * exp_loghr;
-            if gt.val().abs() < GOMPERTZ_SERIES_BELOW {
+            if gt.br_abs_lt(GOMPERTZ_SERIES_BELOW) {
+                // A recording type (#2786) records `exprel` as one primitive: the series'
+                // values would be literals of the point it saw.
+                if T::RECORDS_BRANCHES {
+                    return (h_val, alpha * exp_loghr * (k(t) * gt.exprel(4)));
+                }
                 // Near γt = 0 the quotient cancels (0/0 at γ = 0): H = α·e^loghr·t·exprel(γt)
                 // with exprel(x) = (eˣ − 1)/x from its series, entered with its first two
                 // derivatives. The limit written as its value (`γ = 0 ⇒ H = α·t`) would
                 // drop every γ-derivative a dual carries — the FOCEI η-Hessian of a γ(η)
                 // at γ̂ = 0 lost its `α·t³/3` curvature that way (#2437).
-                let [v, d1, d2, d3, d4] = exprel_series(gt.val());
+                let [v, d1, d2, d3, d4] = exprel_series(gt.plain());
                 return (
                     h_val,
                     alpha * exp_loghr * (k(t) * gt.lift4(v, d1, d2, d3, d4)),

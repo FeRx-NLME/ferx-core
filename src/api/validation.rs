@@ -7,6 +7,7 @@
 //! `pub` / `pub(crate)` re-exports in the parent module.
 use super::*;
 use crate::api::levels::{level_index_finding, LevelIndexFinding};
+use crate::cold_sort::ColdSort;
 
 /// Does this identifier read as a random-effect name (`ETA_CL`, `eta_v`,
 /// `KAPPA_CL`)?
@@ -2817,12 +2818,19 @@ pub(crate) fn check_absorption_dosing(
     // equilibrated *through* the absorption kernel (a pulse-train trough) and its infinite
     // periodic pulse train is superposed as `R_in` on the forward walk, so predictions match
     // an explicit run-in exactly (`ode::predictions::equilibrate_ss_state` +
-    // `add_prepared_input_rate_forcing`). Two combinations stay out of scope and are rejected
-    // here rather than silently mis-served:
-    //   * zero_order() absorption — its input is a spanning window, not a pointwise density,
-    //     so SS needs a periodic-window equilibration (separate follow-up under #719).
-    //   * a lagtime on the SS-dosed compartment — the SS+lagtime pre-arrival seed
-    //     (`ss_state_at_phase`) is still bolus-only for input-rate compartments.
+    // `add_prepared_input_rate_forcing`), with or without a lag (compartment `lagtime`/`ALAG`
+    // or a per-route `lag=`, #2786): the periodic forcing is anchored on the record and the
+    // record's state is the fixed point of the cycle the dose's own pulse arrives `lag` into.
+    //
+    // An SS dose into a compartment fed by a single `zero_order()` window is supported too
+    // (#2786): the dose is lowered to a duration-modeled SS infusion (`dosing::lower_zero_order_ss`)
+    // and rides the steady-state infusion machinery, lag included. What stays out of scope is a
+    // zero-order window the lowering cannot represent, rejected here rather than mis-served:
+    //   * `zero_order()` mixed with another absorption function on the same compartment —
+    //     the window and the density share one dose, so the periodic window train and the
+    //     periodic density sum would both have to be seeded.
+    //   * `zero_order()` with a per-route `lag=` on a compartment that also declares its own
+    //     `ALAG{c}`/`lagtime` — the two lags add, and the infusion carries one.
     use std::collections::BTreeSet;
     let cmts: BTreeSet<usize> = ode.input_rate.iter().map(|f| f.cmt + 1).collect();
     let zero_order_cmts: BTreeSet<usize> = ode
@@ -2832,62 +2840,54 @@ pub(crate) fn check_absorption_dosing(
         .map(|f| f.cmt + 1)
         .collect();
     // `cmt_1based()` throughout so a `CMT=0` dose (the default dose compartment == compartment 1)
-    // is scoped like `CMT=1` against these 1-based `f.cmt + 1` sets (#899, #913 review). The raw
-    // `d.cmt` this replaced left `CMT=0` bypassing the SS-unsupported gates, so an SS `CMT=0` dose
-    // into a zero-order / lagged absorption compartment skipped its clean rejection and fell
-    // through to the silent zero-order drop the same review fixed in `zero_order_dur_and_frac`.
-    let has_ss_zero_order = population.subjects.iter().any(|s| {
-        s.doses
-            .iter()
-            .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt_1based()))
-    });
-    // A per-route lag (`fn(..., lag=L)`, #856) lives on the forcing's `lag_slot`, NOT the
-    // compartment-lag machinery, so `has_lagtime_on_cmt` does not see it — but the SS
-    // equilibration seed is just as unable to route the dose through a per-route-lagged
-    // onset over the previous interval as through a compartment `lagtime`/`ALAG`. Reject
-    // the combination the same way, compartment-scoped so a per-route lag on a *different*
-    // pathway does not block an SS dose into an un-lagged compartment.
-    let route_lag_cmts: BTreeSet<usize> = ode
-        .input_rate
-        .iter()
-        .filter(|f| f.lag_slot.is_some())
-        .map(|f| f.cmt + 1)
-        .collect();
-    // Compartment-scoped, not model-wide (`model.has_lagtime()`): a lag declared on a
-    // *different* absorption pathway (e.g. `ALAG2`) must not block an SS dose into an
-    // un-lagged compartment (e.g. `CMT=1`). Covers both a compartment `lagtime`/`ALAG`
-    // and a per-route `lag=` on a forcing feeding the SS-dosed compartment.
-    let has_ss_lag = population.subjects.iter().any(|s| {
+    // is scoped like `CMT=1` against these 1-based `f.cmt + 1` sets (#899, #913 review).
+    let lowerable = |c: usize| ode.dose_attr_map.zero_order_slot(c).is_some();
+    let route_lagged_zero_order = |c: usize| {
+        ode.input_rate.iter().any(|f| {
+            f.cmt + 1 == c
+                && f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
+                && f.lag_slot.is_some()
+        })
+    };
+    let ss_zero_order_mixed = population.subjects.iter().any(|s| {
         s.doses.iter().any(|d| {
             d.ss && d.ii > 0.0
-                && cmts.contains(&d.cmt_1based())
-                && (model.has_lagtime_on_cmt(d.cmt_1based())
-                    || route_lag_cmts.contains(&d.cmt_1based()))
+                && zero_order_cmts.contains(&d.cmt_1based())
+                && !lowerable(d.cmt_1based())
         })
     });
-    if has_ss_zero_order {
+    let ss_zero_order_two_lags = population.subjects.iter().any(|s| {
+        s.doses.iter().any(|d| {
+            d.ss && d.ii > 0.0
+                && lowerable(d.cmt_1based())
+                && route_lagged_zero_order(d.cmt_1based())
+                && ode
+                    .dose_attr_map
+                    .lowered_route_lag_slot(d.cmt_1based())
+                    .is_none()
+        })
+    });
+    if ss_zero_order_mixed {
         diags.push(
             Diagnostic::error(
-                "E_ABSORPTION_SS_ZERO_ORDER",
-                "Steady-state dosing (SS=1) into a zero_order() absorption compartment is not \
-                 yet supported: unlike the pointwise density kernels (transit/igd/weibull/\
-                 first_order), the zero-order input is a spanning window and its periodic \
-                 steady state needs a window-based equilibration (a follow-up under #719). \
-                 Expand the run-in with explicit dosing records, or use a density absorption \
-                 kernel.",
+                "E_ABSORPTION_SS_ZERO_ORDER_MIXED",
+                "Steady-state dosing (SS=1) into a compartment fed by a zero_order() window \
+                 together with another absorption function (a `mixed` model) is not supported: \
+                 the zero-order window train and the density's periodic tail would both have to \
+                 be seeded from one dose. A compartment fed by zero_order() alone is supported, \
+                 with or without a lag. Use a single absorption function on that compartment, \
+                 or expand the run-in with explicit dosing records.",
             )
             .with_block("odes"),
         );
-    } else if has_ss_lag {
+    } else if ss_zero_order_two_lags {
         diags.push(
             Diagnostic::error(
-                "E_ABSORPTION_SS_LAG",
-                "Steady-state dosing (SS=1) into a built-in absorption compartment combined \
-                 with an absorption lagtime (a compartment `lagtime`/`ALAG` or a per-route \
-                 `lag=`) is not yet supported: the SS+lagtime pre-arrival seed does not yet \
-                 route the dose through the absorption kernel over the previous interval. \
-                 Remove the lagtime, expand the run-in with explicit dosing records, or dose \
-                 without SS.",
+                "E_ABSORPTION_SS_ZERO_ORDER_LAG",
+                "Steady-state dosing (SS=1) into a zero_order() compartment that carries both a \
+                 per-route `lag=` and a compartment `lagtime`/`ALAG` is not supported: the two \
+                 lags add and the steady-state infusion it is served as carries one. Declare the \
+                 delay once, either as `zero_order(dur=..., lag=...)` or as `ALAG{c}`.",
             )
             .with_block("odes"),
         );
@@ -2905,7 +2905,7 @@ pub(crate) fn check_absorption_dosing(
     //     equilibration (bolus-record only) nor the infusion convolution handles the periodic
     //     zero-order-into-kernel steady state yet.
     //
-    // Unlike the SS-*bolus* gates above (`has_ss` / `has_ss_zero_order`), this reject is
+    // Unlike the SS-*bolus* gates above (the steady-state bolus gates above), this reject is
     // **`II`-independent** — it fires on `d.ss && d.is_infusion()` with no `d.ii > 0.0` condition.
     // An SS bolus with `II ≤ 0` legitimately degrades to a single non-SS bolus (a valid prediction,
     // flagged by the `W_STEADY_STATE_II` warning), so those gates let it through. But an SS infusion
@@ -3844,7 +3844,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
 /// *panicked* the objective path and both dense builders
 /// (`called Option::unwrap() on a None value`, from a `partial_cmp(..).unwrap()` sort);
 /// it now yields a typed non-finite subject
-/// ([`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite)),
+/// ([`times_have_non_finite`](crate::ode::predictions::times_have_non_finite)),
 /// which the estimation guards absorb as a diverged solve. That is the right behaviour
 /// for a *mid-fit* θ/η excursion, but a wasteful and opaque one when the model is
 /// already broken at its starting point — a covariate relationship that divides by a
@@ -5781,7 +5781,7 @@ fn absorption_flip_flop_wording(model: &CompiledModel) -> (&'static str, &'stati
     }
 }
 
-/// The clause naming the 2-cpt confluent-eigenvalue edge (`|α − β| < 1e-12`), empty for a
+/// The clause naming the 2-cpt confluent-eigenvalue edge (`α = β`), empty for a
 /// 1-cpt model, which has a single disposition exponential and so no such edge.
 fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
     if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
@@ -5794,7 +5794,7 @@ fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
 /// fall **outside the closed form's convergence domain** — the flip-flop regime
 /// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
-/// (`|α − β| < 1e-12`) — where it returns an identically-zero profile that silently
+/// (`α = β`) — where it returns an identically-zero profile that silently
 /// degenerates the objective (a proportional error model collapses `(σ·pred)²` to 0).
 /// Unlike a twin-carrying model — which [`crate::pk::effective_model_for_eval`]
 /// auto-reroutes to its exact ODE `transit()` twin — a twin-less form (one carrying a
@@ -6928,18 +6928,16 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
-    // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
-    // than silently running a different method. `auto` (analytic where in scope,
-    // else FD) and `fd` are unaffected.
+    // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired; the exact
+    // derivatives are the default. Reject it rather than silently running a different
+    // method. `auto` and `fd` are unaffected.
     if options.gradient_method == crate::types::GradientMethod::Ad {
         diags.push(
             Diagnostic::error(
                 "E_AD_RETIRED",
                 "gradient_method = ad is no longer supported: the Enzyme automatic-differentiation \
-                 path was retired in favour of the analytic `Dual2` sensitivities. Set \
-                 gradient_method = auto (uses the exact analytic gradient where it is in scope and \
-                 falls back to finite differences otherwise) or fd.",
+                 path was retired, and exact derivatives are the default. Set \
+                 gradient_method = auto (exact derivatives) or fd (finite differences).",
             )
             .with_block("fit_options"),
         );
@@ -8090,19 +8088,26 @@ fn residual_correlation_inert(model: &CompiledModel, population: &Population) ->
     )]
 }
 
+/// Whether any stage of the run searches, so a start clamped into its box is **held**
+/// there rather than scored once.
+///
+/// `maxiter > 0` always searches. At `maxiter = 0` a stage searches unless its estimator
+/// reads that as `MAXEVAL=0` (`EstimationMethod::evaluates_at_maxiter_zero`, the engine's
+/// own list). The list used to be spelled here, as saem / imp / impmap / bayes, and so
+/// missed `vi` and `gn_hybrid`: both search at `maxiter = 0`, and both were treated as
+/// evaluation-only by every start-side check (#2865 review).
+///
+/// Not `!FitOptions::evaluation_only_run()`: that also counts a standalone
+/// `imp_eval_only` / `agq_eval_only` run as evaluation-only at any `maxiter`, and the
+/// start-side checks have never exempted those.
 fn outer_search_runs(options: &FitOptions) -> bool {
     if options.outer_maxiter > 0 {
         return true;
     }
-    options.method_chain().iter().any(|m| {
-        matches!(
-            m,
-            EstimationMethod::Saem
-                | EstimationMethod::Imp
-                | EstimationMethod::Impmap
-                | EstimationMethod::Bayes
-        )
-    })
+    options
+        .method_chain()
+        .iter()
+        .any(|m| !m.evaluates_at_maxiter_zero())
 }
 
 /// Which declaration a flagged variance coordinate came from — the keyword the
@@ -8739,6 +8744,17 @@ const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
 /// message below names the other one when it explains that silence.
 const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
 
+/// The `W_` token of the evaluation-only half of `E_THETA_INIT_OUTSIDE_BOUNDS`
+/// (#2865): a `theta` start outside its own declared range on a run that does
+/// not search (`maxiter = 0`), which is clamped and scored at the bound.
+///
+/// Its own token, not [`START_OUT_OF_BOX_TOKEN`]: that one names an internal
+/// rail the user never wrote, this one a bound they declared, and the remedies
+/// differ. Both classify as `WarningCode::InitOutsideBounds` — a start the box
+/// moved — through separate arms of [`crate::types::classify_warning`], because
+/// neither token is a substring of the other.
+const THETA_START_EVAL_ONLY_TOKEN: &str = "W_THETA_INIT_OUTSIDE_BOUNDS";
+
 /// Report an initial estimate that packs **strictly outside** its own box, and
 /// is therefore silently moved by `clamp_to_bounds` before the first objective
 /// evaluation (#1251).
@@ -8753,7 +8769,7 @@ const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
 /// |---|---|---|
 /// | any coordinate whose box is **empty** (`lower > upper`) | either | **error**, and not exempt at `maxiter = 0` |
 /// | any coordinate the **packer itself** altered (#1307) | ferx's | warning, and not exempt at `maxiter = 0` |
-/// | θ strictly outside its **declared** lower / upper | the user's | **error** |
+/// | θ strictly outside its **declared** lower / upper | the user's | **error** when a search runs; warning `W_THETA_INIT_OUTSIDE_BOUNDS` on an evaluation-only run (#2865) |
 /// | θ above the hidden `1e9` cap | ferx's | warning |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, below `−6` | ferx's | *not reported here* — [`check_variance_init_rails`] owns it, as an error (#1229) |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, above `+6` | ferx's | warning |
@@ -8940,10 +8956,14 @@ pub(crate) fn check_packed_start_in_box(
     // floors the value and the bound identically; and a free ρ, which lands
     // exactly *on* its rail rather than outside it. Those three are the #1309
     // doc's own list of what the box predicate is structurally blind to.
+    //
+    // The declared-range walk is claimed on **every** run since #2865: it emits
+    // at `maxiter = 0` too, as `W_THETA_INIT_OUTSIDE_BOUNDS`, and that message
+    // names the value the run scores. Only the rail walk is still silent there.
     let mut claimed: std::collections::BTreeSet<usize> = inverted.iter().copied().collect();
+    claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
     if outer_search_runs(options) {
         claimed.extend(coordinates_outside_bounds(&start, &kinds).map(|h| h.index));
-        claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
     }
 
     // What the fit will **actually** use, which is not `mv.represented` whenever
@@ -9094,16 +9114,20 @@ pub(crate) fn check_packed_start_in_box(
         );
     }
 
-    // Same exemption as the rail check: an eval-only run clamps too, it just
-    // does not hold. `tests/check_command.rs` pins that `fit()` succeeds at
-    // `outer_maxiter = 0` on a start that would otherwise be refused. The
-    // empty-box errors already collected are **not** exempt and ride out with
-    // it — an eval-only run clamps into the empty box too, and aborts.
-    if !outer_search_runs(options) {
-        return diags;
-    }
+    // An eval-only run clamps too, it just does not hold the clamped value
+    // through a search. So it is never *refused* for a start outside its box
+    // (`tests/check_command.rs` pins that `fit()` succeeds at
+    // `outer_maxiter = 0`), and `--dofv`, `ferx gam --no-fit` and the bootstrap
+    // Δofv sweep can hand in machine-produced parameters. What it does get is
+    // the declared-range finding below as a **warning** (#2865): the one OFV it
+    // reports is the OFV of the bound, not of the declared start.
+    let eval_only = !outer_search_runs(options);
 
     // ── θ against its own DECLARED range ────────────────────────────────────
+    //
+    // An error when a search runs, `W_THETA_INIT_OUTSIDE_BOUNDS` when none does.
+    // One walk and one predicate for both, so the two verdicts cannot disagree
+    // about which θ is outside its range.
     //
     // Judged on the natural scale, not the packed one, and that is the whole
     // reason this is a separate walk: `pack_params` floors the value at
@@ -9148,6 +9172,77 @@ pub(crate) fn check_packed_start_in_box(
         // this same interval, so there is nothing to drift from (#1309 review).
         let (lo_advice, hi_advice) = theta_representable_range(init_params, hit.index);
         let effective = init_params.theta[hit.index].clamp(lo_advice, hi_advice);
+        let suggestion = format!(
+            "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
+             the declared range"
+        );
+        if eval_only {
+            // The value scored is not always the declared bound: a declared
+            // lower at or below `LOG_PACK_FLOOR`, or a declared upper above
+            // `THETA_PACK_CEIL`, is replaced by that cap in the box. Say so, or
+            // the message quotes a bound and a scored value that do not match
+            // with no reason given.
+            let stand_in = if effective != hit.bound {
+                format!(
+                    " {effective:e} is the nearest value to that bound that ferx can represent."
+                )
+            } else {
+                String::new()
+            };
+            // "Widen the range" only scores the declared start if ferx can hold
+            // that number once the range admits it. A negative start can always be
+            // held: admitting it makes the lower bound negative, which selects
+            // identity packing. A start of 0, or one outside
+            // `[LOG_PACK_FLOOR, THETA_PACK_CEIL]`, cannot be held under log packing:
+            // `theta TVCL(1e13, 0.001, 1e14)` is in range, unreported at
+            // `maxiter = 0`, and scored at `1e9` (#2865 review). So the advice is
+            // gated, and the other branch says why there is nothing to widen to.
+            let lower = init_params.theta_lower[hit.index];
+            let widening_scores_it = !crate::estimation::parameterization::theta_packs_log(lower)
+                || hit.value < 0.0
+                || (LOG_PACK_FLOOR..=THETA_PACK_CEIL).contains(&hit.value);
+            let score_declared = if widening_scores_it {
+                format!(
+                    "To score {:e}, widen the declared range to include it;",
+                    hit.value
+                )
+            } else {
+                format!(
+                    "{:e} cannot be scored while the lower bound is 0 or more: such a theta is \
+                     held on the log scale, between {LOG_PACK_FLOOR:e} and {THETA_PACK_CEIL:e};",
+                    hit.value
+                )
+            };
+            // The help line follows the same gate: it must not offer the widening
+            // the message has just ruled out.
+            let suggestion = if widening_scores_it {
+                suggestion
+            } else {
+                format!("move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e})")
+            };
+            diags.push(
+                Diagnostic::warning(
+                    THETA_START_EVAL_ONLY_TOKEN,
+                    format!(
+                        "{THETA_START_EVAL_ONLY_TOKEN}: `theta {name}` starts at {value:e}, \
+                         {side} its own declared {bound_word} bound of {bound:e}. This run \
+                         evaluates the objective once and does not search (`maxiter = 0`), and \
+                         the start is clamped into its box first, so the OFV and every \
+                         prediction and estimate reported are those of {name} = {effective:e}, \
+                         not of the declared {value:e}.{stand_in} {score_declared} to score \
+                         {effective:e}, declare that as the start. A run that searches refuses \
+                         this declaration with E_THETA_INIT_OUTSIDE_BOUNDS.",
+                        value = hit.value,
+                        bound = hit.bound,
+                        side = hit.side.direction(),
+                        bound_word = hit.side.bound_name(),
+                    ),
+                )
+                .with_block("parameters")
+                .with_suggestion(suggestion),
+            );
+            continue;
+        }
         diags.push(
             Diagnostic::error(
                 "E_THETA_INIT_OUTSIDE_BOUNDS",
@@ -9166,11 +9261,15 @@ pub(crate) fn check_packed_start_in_box(
                 ),
             )
             .with_block("parameters")
-            .with_suggestion(format!(
-                "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
-                 the declared range"
-            )),
+            .with_suggestion(suggestion),
         );
+    }
+
+    // The rail walk below keeps the eval-only exemption whole: an internal-rail
+    // start is not reported at `maxiter = 0`. The empty-box errors and the
+    // declared-range warnings already collected ride out with it.
+    if eval_only {
+        return diags;
     }
 
     // No `inverted` consult here: `coordinates_outside_bounds` already declines
@@ -9371,6 +9470,7 @@ pub(crate) fn check_model_data_warnings_rule(
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
+    diags.extend(output_mixnum_is_class(model, population));
     diags.extend(residual_correlation_inert(model, population));
     diags.extend(residual_correlation_partly_confounded(
         model, population, iov_rule,
@@ -9434,107 +9534,6 @@ pub(crate) fn check_model_data_warnings_rule(
         ));
     }
 
-    // SS=1 infusion with T_inf > II (overlapping pulses). The analytical 1-/2-/3-
-    // cpt closed forms now superpose the overlapping past pulse train (#379), so
-    // these are handled exactly. Only ODE models — and subjects that route to the
-    // event-driven walker (EVID 3/4 resets) — still skip SS pre-equilibration.
-    let analytic_handles_overlap = model.ode_spec.is_none();
-    // For a modeled dose (RATE=-2 → `D{cmt}` duration, or RATE=-1 → `R{cmt}` rate;
-    // #324) the `(rate, duration)` pair is unresolved here — both are 0 until
-    // `resolve_rate` — so resolve it at the typical-value point through the
-    // engine-correct `active_dose_attr_map()`.
-    //
-    // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
-    // (the same rule + floor clamps the integrator applies at runtime), not a
-    // hand-rolled slot read, so the warning's notion of "duration" can't drift
-    // from the integrator's. It is a *typical-value* heuristic: it uses init
-    // theta, eta = 0, and this subject's covariates, whereas runtime uses
-    // per-occasion eta/IOV — a modeled SS infusion whose duration crosses `II`
-    // only on some occasions may not be flagged here (and conversely a typical
-    // overlap may not occur on every occasion). The runtime SS-skip is the
-    // backstop; this catches the common typical-value / covariate-driven overlap.
-    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-    // This dose as the integrator will construct it, plus the `F` that reshapes it: the
-    // resolved `(rate, duration)` pair and `f_bio` for its compartment, both at the
-    // typical-value point. `None` when a modeled dose has no matching parameter — an
-    // upstream *error* (`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`), but this
-    // warnings pass must stay panic-free if run on such a model rather than hit
-    // `resolve_rate`'s slot `.expect`.
-    //
-    // One resolution, two consumers: this warning and the `W_STEADY_STATE_ABSOLUTE_TIME` gate
-    // further down read the *same* resolved dose through the *same* predicate, so the two
-    // cannot drift about which doses the run-in actually serves.
-    let resolved_dose = |s: &Subject, d: &DoseEvent| -> Option<(DoseEvent, f64)> {
-        use crate::types::{DoseAttr, RateMode};
-        let attr_map = model.active_dose_attr_map();
-        // The dose attribute whose slot holds this modeled dose's value, if any.
-        let attr = match d.rate_mode {
-            RateMode::Fixed => None,
-            RateMode::ModeledDuration => Some(DoseAttr::Duration),
-            RateMode::ModeledRate => Some(DoseAttr::Rate),
-        };
-        if attr.is_some_and(|a| attr_map.indexed_slot(a, d.cmt_raw()).is_none()) {
-            return None;
-        }
-        // Initial-estimate warning pass: typical values at t=0.
-        let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0);
-        Some((
-            d.resolve_rate(attr_map, &pk.values),
-            attr_map.f_bio(d.cmt_raw(), &pk.values),
-        ))
-    };
-    // Whether the steady-state run-in **skips** this dose because its infusion outlasts its own
-    // interval. This is the integrator's own test rather than a paraphrase of it:
-    // `equilibrate_ss_pk_state` (`ode/predictions.rs`) compares
-    // `dose.bioavailable_infusion(f_bio).1` against `dose.ii`, and the event-driven
-    // equilibration reshapes its synthetic cycle dose the same way
-    // (`with_bioavailable_infusion`, #419). So `F` is part of the comparison on both engines —
-    // on a rate-defined infusion it scales the *length* (the data fixes the rate), on a
-    // duration-defined one (`RATE=-2`) it scales the rate and the length is untouched.
-    //
-    // Comparing the unscaled duration instead made both warnings below say things that were
-    // not true, in opposite directions (#1281). Measured on a 1-cpt `[odes]` model with
-    // `AMT = 100, RATE = 5, II = 12` (duration 20) and observations at 482 / 485: at
-    // `F1 = 1.0` the predictions are `9.514379031181768` / `22.093161802029634` — finite,
-    // the run-in skipped, and "applied as a single (non-SS) infusion" is true of it. At
-    // `F1 = 0.5` (`T_inf = 10 ≤ II`) the same record on a `TAFD`-reading RHS returns
-    // `NaN` / `NaN`, which nothing but the run-in can produce — so that sentence was false
-    // there, while `W_STEADY_STATE_ABSOLUTE_TIME` was suppressed on the one row that needed
-    // it. `tests/modeled_duration.rs` holds the arm that must not move: `RATE=-2` answers the
-    // same before and after, which a hand-written `F * duration` would break.
-    let run_in_skips_overlapping_infusion = |s: &Subject, d: &DoseEvent| -> bool {
-        resolved_dose(s, d).is_some_and(|(resolved, f_bio)| {
-            crate::dosing::is_real_infusion(&resolved)
-                && resolved.bioavailable_infusion(f_bio).1 > d.ii
-        })
-    };
-    let n_ss_overlapping_inf = population
-        .subjects
-        .iter()
-        .filter(|s| {
-            let overlapping = s
-                .doses
-                .iter()
-                .any(|d| d.ss && d.ii > 0.0 && run_in_skips_overlapping_infusion(s, d));
-            overlapping && (!analytic_handles_overlap || s.has_resets())
-        })
-        .count();
-    if n_ss_overlapping_inf > 0 {
-        diags.push(Diagnostic::warning(
-            "W_STEADY_STATE_INFUSION",
-            format!(
-                "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
-                 pulses) on a model path that does not pre-equilibrate steady \
-                 state (ODE model, or EVID=3/4 resets routing to the event-driven \
-                 walker) — the dose is applied as a single (non-SS) infusion, so \
-                 the system is not at steady state at the dose time. The analytical \
-                 1-/2-/3-cpt closed forms do handle this case; use a shorter \
-                 infusion (T_inf ≤ II) or remove the SS flag otherwise.",
-                n_ss_overlapping_inf
-            ),
-        ));
-    }
-
     // SS=1 dose on an `[odes]` right-hand side that reads an **absolute** clock (#1139).
     //
     // The run-in that stands in for the infinite past does not integrate on the subject's
@@ -9552,20 +9551,9 @@ pub(crate) fn check_model_data_warnings_rule(
     // `check_model_data_rule`, and serve the same numbers unwarned.
     //
     // **Counted per dose that actually reaches the run-in**, because the consequence sentences
-    // below name what the run-in does and are false wherever it is skipped.
-    // `equilibrate_ss_pk_state` bails before integrating anything for an overlapping SS
-    // infusion (`is_inf && t_inf > dose.ii`) and for a dose whose compartment is outside the
-    // state vector (`cmt_idx >= n_states`), leaving the ordinary finite TAFD anchor in place.
-    // Measured on `0.003*TAFD` with `AMT=100, RATE=5, II=12, SS=1` (T_inf = 20 > II): the fit
-    // returns **OFV 367.2851**, finite — so an unfiltered count would have printed "it reads
-    // NaN and the objective is non-finite" next to a `W_STEADY_STATE_INFUSION` correctly
-    // saying the record was served as a single non-SS infusion. Filtering on the *same*
-    // predicate that warning uses makes the two partition rather than contradict.
-    //
-    // Deliberately *not* suppressed when a neighbouring steady-state warning fires on a dose
-    // this one still counts: `W_STEADY_STATE_INFUSION` is a typical-value heuristic by its
-    // own comment above (a modeled SS infusion may overlap on some occasions only), so
-    // blanket suppression would drop a true finding.
+    // below name what the run-in does and are false wherever it is skipped:
+    // `equilibrate_ss_pk_state` bails for a dose whose compartment is outside the state vector
+    // (`cmt_idx >= n_states`), leaving the ordinary finite TAFD anchor in place.
     //
     // `[diffusion]` is **not** excluded, twice over. Since #1260 `solve_ekf` runs its own
     // run-in (`ode::ekf::equilibrate_ss_ekf`) on the same cycle-local clock with the same
@@ -9590,34 +9578,18 @@ pub(crate) fn check_model_data_warnings_rule(
         // through `Subject::has_periodic_ss_dose` because the two further conjuncts below are
         // per dose too: a subject may carry one equilibrating SS dose and one that bails.
         let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
-        let equilibrates = |s: &Subject, d: &DoseEvent| -> bool {
+        let equilibrates = |d: &DoseEvent| -> bool {
             if !(d.ss && d.ii > 0.0) {
                 return false;
             }
             // The out-of-range compartment bail-out (#899): `CMT` beyond the state vector
             // returns the unequilibrated zero state without touching the RHS.
-            if d.cmt_idx() >= n_states {
-                return false;
-            }
-            // The overlapping-infusion bail-out — the same predicate
-            // `W_STEADY_STATE_INFUSION` reports on, so the two findings partition the
-            // population rather than contradicting each other about which doses the run-in
-            // serves. `F` is why that had to be one function and not two spellings (#1281):
-            // it enters through `bioavailable_infusion`, and a paraphrase that compared the
-            // unscaled duration suppressed this warning on exactly the `F < 1` row whose
-            // predictions are `NaN`.
-            //
-            // Typical-value like the resolution it sits on: `F` may itself carry an η, so a
-            // dose that crosses `II` on some subjects only is judged on the typical one. The
-            // runtime bail-out is the backstop. An unresolvable modeled dose (no slot — an
-            // upstream error) counts as reaching the run-in, since the integrator will not
-            // treat it as a real infusion either.
-            !run_in_skips_overlapping_infusion(s, d)
+            d.cmt_idx() < n_states
         };
         let n_ss = population
             .subjects
             .iter()
-            .filter(|s| s.doses.iter().any(|d| equilibrates(s, d)))
+            .filter(|s| s.doses.iter().any(equilibrates))
             .count();
         if n_ss > 0 {
             let (reads_tafd, reads_solver_time) =
@@ -9858,6 +9830,7 @@ pub(crate) fn check_model_data_warnings_rule(
     // flip-flop model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
     // error instead (`check_absorption_flip_flop_no_twin`), rejected at
     // fit / predict / simulate / `ferx check`.
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     if matches!(
         model.pk_model,
         PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
@@ -10133,7 +10106,7 @@ fn additive_init_scale_check(
     if mags.is_empty() {
         return None;
     }
-    mags.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    mags.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = mags.len() / 2;
     let data_scale = if mags.len() % 2 == 1 {
         mags[mid]
@@ -10474,6 +10447,20 @@ pub(crate) fn check_nn_input_scale(
 /// carries verbatim (the `W_…` token, or a pinned phrase), so a reworded warning
 /// falls through to the generic `W_PARSE` rather than silently mislabelling —
 /// which is why the codes are asserted at both ends.
+/// One parse warning as a check-report [`Diagnostic`]. A deprecated block
+/// (#2913) carries its block and line, read back out of the message the way
+/// [`parse_error_to_diagnostic`] reads the block-header errors; every other
+/// warning keeps its full text under the code [`parse_warning_to_code`] picks.
+fn parse_warning_to_diagnostic(w: &str) -> Diagnostic {
+    let code = parse_warning_to_code(w);
+    match w.strip_prefix(crate::parser::model_parser::DEPRECATED_BLOCK_PREFIX) {
+        Some(rest) if code == crate::parser::model_parser::DEPRECATED_BLOCK_CODE => {
+            locate(Diagnostic::warning(code, String::new()), w, rest)
+        }
+        _ => Diagnostic::warning(code, w.to_string()),
+    }
+}
+
 fn parse_warning_to_code(w: &str) -> &'static str {
     if w.contains("declared in [parameters] but not referenced") {
         "W_UNUSED_PARAM"
@@ -10483,6 +10470,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
         "W_DERIVED_STEP_IGNORED"
     } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
         "W_ABSORPTION_TWIN_DECLINED"
+    } else if w.contains(crate::parser::model_parser::DEPRECATED_BLOCK_CODE) {
+        crate::parser::model_parser::DEPRECATED_BLOCK_CODE
     } else {
         "W_PARSE"
     }
@@ -10494,7 +10483,7 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), the
 /// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), the
 /// scale tag on a `block_*` declaration (→ `E_BLOCK_VARIANCE_ONLY`, #1377), and
-/// the block-header shapes (→ `E_UNKNOWN_BLOCK` / `E_DEPRECATED_BLOCK` /
+/// the block-header shapes (→ `E_UNKNOWN_BLOCK` /
 /// `E_BLOCK_INSTANCE_NAME` / `E_BLOCK_FEATURE_DISABLED`, #1040); everything else is
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
 /// pinned to by a test, so a reworded message cannot silently fall through to the
@@ -10628,13 +10617,6 @@ pub(crate) fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
             d = d.with_suggestion(format!("did you mean `[{near}]`?"));
         }
         return locate(d, err, rest);
-    }
-    if let Some(rest) = err.strip_prefix("Deprecated block `[") {
-        return locate(
-            Diagnostic::error("E_DEPRECATED_BLOCK", String::new()),
-            err,
-            rest,
-        );
     }
     if let Some(rest) = err.strip_prefix("Block `[") {
         // Match each shape on its own sentinel rather than letting one be the
@@ -10828,7 +10810,7 @@ pub fn validate_model_file_with(
     //     context in the message text; we use W_PARSE as the generic code here
     //     rather than a narrower code that would mislabel unrelated warnings.
     for w in &parsed.model.parse_warnings {
-        diags.push(Diagnostic::warning(parse_warning_to_code(w), w.clone()));
+        diags.push(parse_warning_to_diagnostic(w));
     }
 
     // 2b. Model / estimation-option compatibility (data-independent): catches
@@ -11157,6 +11139,34 @@ pub(crate) fn bind_for_check(
     crate::api::covariate_stats::bind_covariate_stats_diag(parsed, model_text, population)
 }
 
+/// `W_OUTPUT_MIXNUM_IS_CLASS` (#2784): `[output] MIXNUM` on a `[mixture]` model whose
+/// data also carry a `MIXNUM` column. The sdtab column is the class, so a user who listed
+/// it expecting their covariate is told. A data column of that name is unreachable from
+/// the model already (an expression reads the built-in). In the warning bundle
+/// ([`check_model_data_warnings`]) so `fit()` reports it as `ferx check` does.
+pub(crate) fn output_mixnum_is_class(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<Diagnostic> {
+    let col = model
+        .output_columns
+        .iter()
+        .find(|c| super::output_columns::is_mixture_class_column(model, c))?;
+    let data_col = population
+        .covariate_names
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case(col))?;
+    Some(Diagnostic::warning(
+        "W_OUTPUT_MIXNUM_IS_CLASS",
+        format!(
+            "W_OUTPUT_MIXNUM_IS_CLASS: [output] column `{col}` on a [mixture] model is the \
+             mixture class (the simulated class where the data were drawn under one, else \
+             the fitted MIXEST), as NONMEM's `$TABLE MIXNUM` is; it is not the data column \
+             `{data_col}`. Rename that column to write it to sdtab"
+        ),
+    ))
+}
+
 /// Validate `model.output_columns` against known quantities, emitting
 /// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
 pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
@@ -11188,6 +11198,12 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
+        // `MIXNUM` on a `[mixture]` model is the class (#2784), whatever the data carry;
+        // a data column of that name is reported by `output_mixnum_is_class`, from the
+        // warning bundle `fit()` reports, not from this list `fit()` reads error-first.
+        if super::output_columns::is_mixture_class_column(model, col) {
+            continue;
+        }
         // Valid if it's a covariate, indiv param, or derived name. Synthetic
         // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
@@ -11207,6 +11223,9 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
+            if model.mixture.is_some() {
+                candidates.push(super::output_columns::MIXNUM_COLUMN);
+            }
             diags.push(Diagnostic::error(
                 "E_OUTPUT_UNKNOWN_COLUMN",
                 format!(

@@ -19,14 +19,30 @@ fit against, so `ferx model.ferx` (no `--data`) and `ferx check model.ferx`
   <new-name> = <actual-header>   # optional column renames
 ```
 
-`path` is the only required key. A relative path is resolved **relative to the
-model file's own directory** — not the current working directory of the process
-running `ferx` — so a model and its dataset can be moved together as a pair.
+A relative path is resolved **relative to the model file's own directory** —
+not the current working directory of the process running `ferx` — so a model and
+its dataset can be moved together as a pair.
 
 ```
 [data]
   path = warfarin.csv
 ```
+
+`path` is optional. A model whose dataset is always supplied by the caller —
+`ferx model.ferx --data x.csv`, `ferx_fit(model, data = ...)`,
+`ferx_simulate(model, data = ...)` — can keep a `[data]` block for its
+[column maps](#column-mapping) alone:
+
+```
+[data]
+  TIME = TAFD
+  DV   = CONC
+```
+
+Without a `path` nothing is resolved against the model's directory, so such a
+model can be copied anywhere. When a `path` *is* written and the caller also
+passes data, the path is never opened either — the caller's dataset wins (see
+[Precedence](#precedence-cli-r-overrides-the-model-file)).
 
 ---
 
@@ -114,12 +130,13 @@ warning.
 
 ## When neither is given
 
-If a model has no `[data]` block and no dataset path is supplied externally,
+If a model has no `[data] path` (no `[data]` block, or one that only maps
+columns) and no dataset path is supplied externally,
 `ferx model.ferx` (without `--simulate`) and `fit_from_files`/`run_model_with_data*`
 without a path both fail with a clear error rather than a generic file-not-found:
 
 ```
-Error: no dataset specified — pass a data path, or add a `[data]` block (`path = ...`) to the model file
+Error: no dataset specified — pass a data path, or set `path = ...` in the model file's `[data]` block
 ```
 
 `ferx check model.ferx` treats the absence of any dataset as "skip

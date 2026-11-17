@@ -173,12 +173,7 @@ pub(crate) fn one_cpt_oral_depot(dose: &DoseEvent, tau: f64, ka: f64, f_bio: f64
     }
     let a = f_bio * dose.amt * (-ka * tau).exp();
     if dose.ss && dose.ii > 0.0 {
-        let denom = 1.0 - (-ka * dose.ii).exp();
-        if denom > 0.0 {
-            a / denom
-        } else {
-            0.0
-        }
+        a * crate::sens::num::ss_factor(ka, dose.ii)
     } else {
         a
     }

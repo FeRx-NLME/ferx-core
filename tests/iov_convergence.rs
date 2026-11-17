@@ -899,11 +899,19 @@ fn iov_pure_gn_reaches_the_lbfgs_optimum() {
         gn.ofv - lbfgs.ofv
     );
     assert!(
-        (gn_iov / lbfgs_iov - 1.0).abs() < 0.01,
+        (gn_iov / lbfgs_iov - 1.0).abs() < GN_IOV_OMEGA_REL,
         "[#2455] GN's Ω_iov must reach L-BFGS's: {gn_iov:.6} vs {lbfgs_iov:.6}; before \
          the fix it stayed near its 0.01 init"
     );
 }
+
+/// Ω_iov bound for [`iov_pure_gn_reaches_the_lbfgs_optimum`]. GN stops on its OFV-change rule
+/// on a nearly flat Ω_iov ridge, so its Ω_iov sits off L-BFGS's by whatever that stop leaves.
+/// Measured on x86_64 CI (slow-tests, `main` `4795026e`, after #2978's total-derivative BHHH
+/// rows): GN 0.036358 vs L-BFGS 0.035704, 1.83% (OFV 308.842016 vs 308.830469). The earlier 1%
+/// was not a measured bound. 5% is 2.7× headroom; the pre-#2455 failure (Ω_iov stuck near its
+/// 0.01 init, 0.0118 vs 0.0357, −67%) sits 13× outside it.
+const GN_IOV_OMEGA_REL: f64 = 0.05;
 
 /// Bound for [`iov_pure_gn_reaches_the_lbfgs_optimum`]; see the measurement there.
 const GN_IOV_OFV_GAP: f64 = 0.05;

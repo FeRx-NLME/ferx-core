@@ -10,7 +10,7 @@
 //!
 //! `maxiter = 0`: one evaluation, no convergence loop (Tier 2). There is no
 //! tolerance to measure: the assertion is bit-equality. Realised, both arms on
-//! `gradient: analytic (Dual2)`: OFV 312.860485 on Linux aarch64
+//! `gradient: analytic`: OFV 312.860485 on Linux aarch64
 //! (`tools/linux-test.sh`) and on macOS arm64 — the issue's 312.8605 for the
 //! declared run on Linux x86_64.
 
