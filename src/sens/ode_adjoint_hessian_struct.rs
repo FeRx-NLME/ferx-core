@@ -150,7 +150,8 @@ fn dotv(a: &[f64], b: &[f64]) -> f64 {
 enum Prep {
     One(f64),
     G(Vec<f64>),
-    Gg(Vec<Vec<f64>>),
+    /// Row-major `m × m`.
+    Gg(Vec<f64>),
 }
 
 impl Prep {
@@ -159,15 +160,22 @@ impl Prep {
             Mono::One => Prep::One(a[0]),
             Mono::G => Prep::G(a[..m].to_vec()),
             Mono::Q => Prep::G(a[..m * (m + 1) / 2].to_vec()),
-            Mono::Gg => Prep::Gg(sym(a, m)),
+            Mono::Gg => Prep::Gg(sym(a, m).concat()),
         }
     }
 }
 
-/// `y = Q·v` into a reused buffer.
-fn mv_into(q: &[Vec<f64>], v: &[f64], y: &mut [f64]) {
-    for (yk, r) in y.iter_mut().zip(q) {
-        *yk = r.iter().zip(v).map(|(a, b)| a * b).sum();
+/// `y = Q·v` into a reused buffer (`Q` row-major, `y.len()` square).
+#[inline]
+fn mv_into(q: &[f64], v: &[f64], y: &mut [f64]) {
+    let m = y.len();
+    for (k, yk) in y.iter_mut().enumerate() {
+        let r = &q[k * m..(k + 1) * m];
+        let mut acc = 0.0;
+        for l in 0..m {
+            acc += r[l] * v[l];
+        }
+        *yk = acc;
     }
 }
 
@@ -183,7 +191,7 @@ fn back(a: &Prep, g: &[f64], r: f64, dg: &mut [f64], qg: &mut [f64]) -> f64 {
             dotv(av, g)
         }
         Prep::Gg(q) => {
-            mv_into(q, g, qg);
+            mv_into(q, g, &mut qg[..g.len()]);
             for (d, x) in dg.iter_mut().zip(qg.iter()) {
                 *d += 2.0 * r * x;
             }
