@@ -385,6 +385,32 @@ impl CovPlan<'_> {
         std::cell::Ref::filter_map(rows, Option::as_ref).ok()
     }
 
+    /// The reduce's forward over reverse seeded on its output, along `kt` tangents (`rin`: each
+    /// input's value, then its tangents), in the same layout: per input its value adjoint, then
+    /// its adjoint's tangent along each. One tangent per run, for the reason the bases take one
+    /// axis per run: the kernel's code grows with its width, its calls with their count.
+    fn reduce_for(&self, family: Family, rin: &[f64], kt: usize) -> Option<Vec<f64>> {
+        let lk = 1 + kt;
+        let n_in = rin.len() / lk;
+        let mut out = vec![0.0; n_in * lk];
+        let mut one = vec![0.0; n_in * 2];
+        for a in 0..kt {
+            for i in 0..n_in {
+                one[2 * i] = rin[i * lk];
+                one[2 * i + 1] = rin[i * lk + 1 + a];
+            }
+            let kr = self.reduce_run(family, &one, 1)?;
+            let radj = kr.reverse_tangent(&[1.0, 0.0])?;
+            for i in 0..n_in {
+                if a == 0 {
+                    out[i * lk] = radj[2 * i];
+                }
+                out[i * lk + 1 + a] = radj[2 * i + 1];
+            }
+        }
+        Some(out)
+    }
+
     /// The reduce `R(η, x, A, w)` along `kt` tangents (`rin`: each input's value, then its
     /// tangents): a small recorded program, no rows.
     fn reduce_run(
@@ -660,10 +686,7 @@ impl CovPlan<'_> {
         for k in 0..pn {
             rin[(pn + nx + na + k) * lk] = w[k];
         }
-        let kr = self.reduce_run(family, &rin, kt)?;
-        let mut rs = vec![0.0; lk];
-        rs[0] = 1.0;
-        let radj = kr.reverse_tangent(&rs)?;
+        let radj = self.reduce_for(family, &rin, kt)?;
         let a_val: Vec<f64> = (0..na).map(|t| radj[(pn + nx + t) * lk]).collect();
         let a_tan: Vec<Vec<f64>> = (0..kt)
             .map(|a| (0..na).map(|t| radj[(pn + nx + t) * lk + 1 + a]).collect())
@@ -874,10 +897,7 @@ impl CovPlan<'_> {
         for o in 0..pn {
             rin[(pn + nx + na + o) * lk + 1 + o] = 1.0;
         }
-        let kr = self.reduce_run(family, &rin, pn)?;
-        let mut rs = vec![0.0; lk];
-        rs[0] = 1.0;
-        let radj = kr.reverse_tangent(&rs)?;
+        let radj = self.reduce_for(family, &rin, pn)?;
         // Per output `y` (`F`, then each `g_o`): the aggregate adjoint, then back to the rows.
         let ny = 1 + pn;
         let sign = |y: usize| if y == 0 { 1.0 } else { -1.0 };
