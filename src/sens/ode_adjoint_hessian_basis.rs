@@ -398,9 +398,9 @@ impl CovPlan<'_> {
         eta_up: bool,
         eta_t: &dyn Fn(usize, usize) -> f64,
         width: usize,
-        run: &dyn Fn(Lanes<'_>, &dyn Fn(usize, usize) -> f64) -> Option<Kept>,
+        run: &dyn Fn(Lanes<'_>, &dyn Fn(usize, usize) -> f64, usize) -> Option<Kept>,
     ) -> Option<PlanRun> {
-        let direct = || run(Lanes::Dirs(dirs), eta_t).map(PlanRun::Direct);
+        let direct = || run(Lanes::Dirs(dirs), eta_t, width).map(PlanRun::Direct);
         let moved = self.moved.borrow();
         let Some(m) = moved.as_ref().filter(|_| {
             !dirs.is_empty() && !plan_per_direction() && !super::reverse_per_direction()
@@ -471,16 +471,18 @@ impl CovPlan<'_> {
         }
         drop(moved);
         if !self.bases.borrow().contains_key(&key) {
-            // Chunk `c` carries axes `c·width ..`, each lane the unit tangent of its input.
+            // One run carries every axis: the plan's code is fetched once per subject, not once
+            // per axis (its lanes are the work, the same however they are split).
+            let bw = axes.len();
             let runs = axes
-                .chunks(width)
+                .chunks(bw)
                 .map(|ch| {
                     let t =
                         |k: usize, b: usize| f64::from(u8::from(ch.get(b) == Some(&Input::Eta(k))));
-                    run(Lanes::Axes(ch), &t)
+                    run(Lanes::Axes(ch), &t, bw)
                 })
                 .collect::<Option<Vec<Kept>>>()?;
-            let (lb, vals, jac) = Basis::dense(&runs, width, axes.len());
+            let (lb, vals, jac) = Basis::dense(&runs, bw, axes.len());
             self.bases.borrow_mut().insert(
                 key,
                 Basis {
@@ -488,7 +490,7 @@ impl CovPlan<'_> {
                     n_eta,
                     n_par,
                     runs,
-                    w: width,
+                    w: bw,
                     lb,
                     vals,
                     jac,

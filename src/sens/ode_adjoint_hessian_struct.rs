@@ -123,12 +123,6 @@ fn sym(p: &[f64], m: usize) -> Vec<Vec<f64>> {
     q
 }
 
-fn mv(q: &[Vec<f64>], v: &[f64]) -> Vec<f64> {
-    q.iter()
-        .map(|r| r.iter().zip(v).map(|(a, b)| a * b).sum())
-        .collect()
-}
-
 fn dotv(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
@@ -364,6 +358,15 @@ impl CovPlan<'_> {
         rin: &[f64],
         kt: usize,
     ) -> Option<super::kernel::KernelRun> {
+        let layout = Layout {
+            tan: kt as u8,
+            ..Layout::F64
+        };
+        // The subject's reduce plan, looked up once (its key hashes the subject and the
+        // parameters); every later run goes straight to it.
+        if let Some(p) = self.st_reduce.borrow().as_ref() {
+            return super::kernel::KernelRun::of_plan(p, layout, rin, 1);
+        }
         let pn = self.pn();
         let nx = self.nx;
         let (at, na) = offsets(family.monos(), pn);
@@ -456,10 +459,6 @@ impl CovPlan<'_> {
                 }
             }
         };
-        let layout = Layout {
-            tan: kt as u8,
-            ..Layout::F64
-        };
         let tag = match family {
             Family::Focei => 7u8,
             Family::Foce => 8u8,
@@ -474,7 +473,7 @@ impl CovPlan<'_> {
             .chain(&sc.params.sigma.values)
             .map(|v| v.to_bits())
             .collect();
-        super::kernel::kernel_run_shared(
+        let kr = super::kernel::kernel_run_shared(
             model,
             subject,
             super::kernel::variant_of(&(self.variant.bytes(), tag, pn, nx, lits)),
@@ -482,7 +481,9 @@ impl CovPlan<'_> {
             rin,
             1,
             &record,
-        )
+        )?;
+        *self.st_reduce.borrow_mut() = Some(kr.plan().clone());
+        Some(kr)
     }
 
     /// Per row, its local inputs' tangents along direction `a` (`tan(slot, a)`): the
@@ -709,7 +710,7 @@ impl CovPlan<'_> {
             true,
             &zero,
             kt,
-            &|lanes, et| self.run_pred(model, eta, et, lanes, base, kt),
+            &|lanes, et, k| self.run_pred(model, eta, et, lanes, base, k),
         )?;
         if !matches!(pr, PlanRun::Basis(_)) {
             return None;

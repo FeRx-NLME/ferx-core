@@ -447,7 +447,14 @@ fn psi_lanes(
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let n = plan.pn();
-    let width = pass_width();
+    // A structured subject runs no large kernel per pass (its plans come from their bases, its
+    // likelihood kernel is the rows and the reduce): one pass carries every direction, so the
+    // passes' fixed work is paid once.
+    let width = if plan.structured() && !dirs.is_empty() {
+        dirs.len()
+    } else {
+        pass_width()
+    };
     let l = 1 + width;
     plan.prepare(dirs);
     for (c, chunk) in dirs.chunks(width).enumerate() {
@@ -831,6 +838,8 @@ pub(super) struct CovPlan<'a> {
     bases: std::cell::RefCell<std::collections::HashMap<PlanKey, Basis>>,
     /// The structured kernel's rows at this point ([`st`]), formed on the first pass.
     st_rows: std::cell::RefCell<Option<st::Rows>>,
+    /// The structured kernel's reduce plan, once looked up.
+    st_reduce: std::cell::RefCell<Option<std::sync::Arc<kj::Plan>>>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -1014,6 +1023,7 @@ impl<'a> CovPlan<'a> {
             moved: std::cell::RefCell::new(None),
             bases: std::cell::RefCell::new(std::collections::HashMap::new()),
             st_rows: std::cell::RefCell::new(None),
+            st_reduce: std::cell::RefCell::new(None),
         }
     }
 
@@ -1258,7 +1268,7 @@ impl<'a> CovPlan<'a> {
                 true,
                 &eta_t,
                 kt,
-                &|lanes, et| self.run_pred(model, eta, et, lanes, base, kt),
+                &|lanes, et, k| self.run_pred(model, eta, et, lanes, base, k),
             )?)
         } else {
             None
@@ -1272,7 +1282,7 @@ impl<'a> CovPlan<'a> {
                 true,
                 &eta_t,
                 kt,
-                &|lanes, et| self.run_var(eta, et, lanes, base, kt),
+                &|lanes, et, k| self.run_var(eta, et, lanes, base, k),
             )?)
         } else {
             None
@@ -1303,7 +1313,7 @@ impl<'a> CovPlan<'a> {
                 false,
                 &zero_t,
                 kt,
-                &|lanes, et| self.run_pred(sc.pop_model, &zeros, et, lanes, Layout::F64, kt),
+                &|lanes, et, k| self.run_pred(sc.pop_model, &zeros, et, lanes, Layout::F64, k),
             )?)
         } else {
             None
@@ -1320,7 +1330,7 @@ impl<'a> CovPlan<'a> {
                 true,
                 &eta_t,
                 kt,
-                &|lanes, et| self.run_term(&sc.eta[..nb], et, lanes, base, kt),
+                &|lanes, et, k| self.run_term(&sc.eta[..nb], et, lanes, base, k),
             )?)
         } else {
             None
@@ -1455,7 +1465,7 @@ impl<'a> CovPlan<'a> {
                         true,
                         &bt,
                         kt,
-                        &|lanes, et| self.run_pred(model, &bv, et, lanes, Layout::F64, kt),
+                        &|lanes, et, k| self.run_pred(model, &bv, et, lanes, Layout::F64, k),
                     )?;
                     for j in 0..n_obs {
                         put!(slots.nf + nd * n_rows + j, po(&fb, j, 0, None), &|a| po(
@@ -1478,7 +1488,7 @@ impl<'a> CovPlan<'a> {
                         true,
                         &bt,
                         kt,
-                        &|lanes, et| self.run_var(&bv, et, lanes, Layout::F64, kt),
+                        &|lanes, et, k| self.run_var(&bv, et, lanes, Layout::F64, k),
                     )?;
                     for j in 0..n_obs {
                         put!(
@@ -1501,7 +1511,7 @@ impl<'a> CovPlan<'a> {
                         true,
                         &bt,
                         kt,
-                        &|lanes, et| self.run_term(&bb, et, lanes, Layout::F64, kt),
+                        &|lanes, et, k| self.run_term(&bb, et, lanes, Layout::F64, k),
                     )?;
                     put!(slots.nq_node + nd, po(&t, 0, 0, None), &|a| po(
                         &t,

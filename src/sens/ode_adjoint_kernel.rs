@@ -28,6 +28,34 @@ pub(super) struct KernelRun {
 }
 
 impl KernelRun {
+    /// The plan this run ran: a caller that runs it again skips the lookup.
+    pub(super) fn plan(&self) -> &Arc<kj::Plan> {
+        &self.plan
+    }
+
+    /// `plan` run forward at `layout` on `inputs` (as [`kernel_run`]'s run).
+    pub(super) fn of_plan(
+        plan: &Arc<kj::Plan>,
+        layout: Layout,
+        inputs: &[f64],
+        n_out: usize,
+    ) -> Option<Self> {
+        let l = layout.lanes();
+        let mut out = kj::Buf::new((n_out + 1) * l);
+        let fwd = plan.forward_layout(layout, &[], inputs, &mut out)?;
+        if out[n_out * l] != 1.0 {
+            return None;
+        }
+        Some(KernelRun {
+            plan: plan.clone(),
+            fwd,
+            layout,
+            n_in: inputs.len() / l,
+            n_out,
+            out,
+        })
+    }
+
     /// Output `o`'s value.
     pub(super) fn value(&self, o: usize) -> f64 {
         self.out[o * self.layout.lanes()]
