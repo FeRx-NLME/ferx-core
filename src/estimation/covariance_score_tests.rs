@@ -404,7 +404,8 @@ fn a_zero_score_names_its_parameters() {
         "{two}"
     );
     for m in [&all, &one, &two] {
-        assert!(!m.contains("rank at most") && !m.contains("rsr"), "{m}");
+        let other = ["rank at most", "rsr", "collinear"];
+        assert!(!other.iter().any(|o| m.contains(o)), "{m}");
     }
 }
 
@@ -429,15 +430,20 @@ fn fewer_subjects_than_parameters_states_the_rank_only_below_the_count() {
         "{at_count}"
     );
     assert!(at_count.contains("are collinear"), "{at_count}");
-    // A zero score and the design are separate causes, and both are named.
+    // A zero score and the design are separate causes, and both are named; `r`/`rsr` is not
+    // advised, since `R` is singular along the zero score too.
     let both = singular_msg(&cross(&[[1.0, 0.0, 2.0], [3.0, 0.0, -1.0]]), 2);
     assert!(
         both.contains(
-            "in every subject, so the data do not inform it; fix or remove it. With 2 subjects"
+            "fix or remove it. With 2 subjects and 3 free parameters S has rank at most 2, so it \
+             is singular on this design at any estimate. SE"
         ),
         "{both}"
     );
-    assert!(!both.contains("collinear"), "{both}");
+    assert!(
+        !both.contains("collinear") && !both.contains("rsr"),
+        "{both}"
+    );
 }
 
 /// Two parameters whose scores cancel in every subject (the likelihood reads only their ratio)
@@ -459,6 +465,15 @@ fn collinear_scores_name_the_parameters_they_cancel_in() {
     let units = [super::CoordUnits::Dimensionless; 3];
     assert!(super::invert_cross_product(&bad, &units).is_none());
     assert!(super::invert_cross_product(&ok, &units).is_some());
+    // A zero score does not hide a collinear pair among the others.
+    let with_zero = singular_msg(
+        &cross(&[[1.0, -1.0, 0.0], [2.0, -2.0, 0.0], [-0.5, 0.5, 0.0]]),
+        3,
+    );
+    assert!(
+        with_zero.contains("fix or remove it. The per-subject scores of TVKON, TVVB are collinear"),
+        "{with_zero}"
+    );
     let m = singular_msg(&bad, 4);
     assert!(
         m.contains(
