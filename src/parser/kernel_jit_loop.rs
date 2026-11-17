@@ -2063,9 +2063,9 @@ fn rows_body_call(
     tbl: &mut Vec<u32>,
 ) {
     let n_slots = b.n_vars + b.caps.len() + b.n_out + b.guarded as usize;
-    tbl.clear();
-    tbl.extend(0..n_slots as u32);
-    let t2 = k.doubled(tbl, n_slots as u32);
+    let iota: Vec<u32> = (0..n_slots as u32).collect();
+    k.doubled(&iota, n_slots as u32, tbl);
+    let t2 = &tbl[..];
     // SAFETY: `t2` names slots below `2·n_slots`, whose `l` lanes `sh` and each seed's block of
     // `ts` hold.
     unsafe {

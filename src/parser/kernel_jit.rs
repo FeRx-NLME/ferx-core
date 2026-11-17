@@ -3742,12 +3742,11 @@ impl Tiered {
 
     /// The doubled slot table a rows reverse call passes: `idx`'s first [`Self::entries`]
     /// entries, then each `off` on.
-    pub(crate) fn doubled(&self, idx: &[u32], off: u32) -> Vec<u32> {
+    pub(crate) fn doubled(&self, idx: &[u32], off: u32, out: &mut Vec<u32>) {
         let e = &idx[..self.entries.min(idx.len())];
-        e.iter()
-            .copied()
-            .chain(e.iter().map(|&x| x + off))
-            .collect()
+        out.clear();
+        out.extend_from_slice(e);
+        out.extend(e.iter().map(|&x| x + off));
     }
 
     /// Run the kernel: `adj` is the adjoint buffer of a reverse kernel (null otherwise).
@@ -6016,6 +6015,8 @@ impl Plan {
         let lt = Layout { tan: 1, ..layout };
         let w = lt.lanes();
         let mut li = r.logs.first().map_or(0, Vec::len);
+        // The doubled slot tables, built into one buffer call after call.
+        let mut idx2: Vec<u32> = Vec::new();
         for (c, k) in self.calls.iter().zip(fns.iter()).rev() {
             match (c, k) {
                 (
@@ -6039,7 +6040,7 @@ impl Plan {
                         let _ = prog;
                         continue;
                     }
-                    let idx2 = k.doubled(idx, self.n_slots as u32);
+                    k.doubled(idx, self.n_slots as u32, &mut idx2);
                     // Test builds check every rows-reverse chunk against its per-direction kernel.
                     #[cfg(test)]
                     let before = Some((sh.clone(), ts.clone()));
