@@ -103,27 +103,67 @@ impl MuFold {
             MuTransform::Logit => 1.0 / (1.0 + (-u).exp()),
             _ => u,
         };
-        let zeros = vec![0.0; eta.len()];
-        let f = |th: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
-            let z: Vec<kj::Tr> = zeros
+        // `μ_k(θ) = g_k(P_k(θ, η = 0))` and its derivatives by a forward second-order dual, one
+        // evaluation per pair `(θ_i, θ_j)` with `θ_i` folded: lane 0 along `θ_i`, lane 1 along
+        // `θ_j` (the same θ for `i = j`), so `hess[0][1]` is `∂²μ/∂θ_i∂θ_j`. A mu line is a few
+        // operations, so this is cheaper than recording one.
+        use crate::sens::dual2::Dual2;
+        let mu_of = |th: &[Dual2<2>]| -> Vec<Dual2<2>> {
+            let z = vec![Dual2::<2>::constant(0.0); eta.len()];
+            spec.lines
                 .iter()
-                .map(|&v| <kj::Tr as PkNum>::from_f64(v))
-                .collect();
-            Some(
-                spec.lines
-                    .iter()
-                    .map(|&(_, slot, t)| {
-                        let v = prog.eval_var_g(th, &z, cov, slot);
-                        match t {
-                            MuTransform::Log => v.ln(),
-                            MuTransform::Logit => (v / (<kj::Tr as PkNum>::from_f64(1.0) - v)).ln(),
-                            _ => v,
-                        }
-                    })
-                    .collect(),
-            )
+                .map(|&(_, slot, t)| {
+                    let v = prog.eval_var_g(th, &z, cov, slot);
+                    match t {
+                        MuTransform::Log => v.ln(),
+                        MuTransform::Logit => (v / (Dual2::<2>::constant(1.0) - v)).ln(),
+                        _ => v,
+                    }
+                })
+                .collect()
         };
-        let (mu, grad, hess) = kj::derivs_of(theta, spec.lines.len(), true, &f).ok()?;
+        let seeded = |i: usize, j: usize| -> Vec<Dual2<2>> {
+            let th: Vec<Dual2<2>> = theta
+                .iter()
+                .enumerate()
+                .map(|(m, &v)| {
+                    let mut d = Dual2::<2>::constant(v);
+                    if m == i {
+                        d.grad[0] = 1.0;
+                    }
+                    if m == j {
+                        d.grad[1] = 1.0;
+                    }
+                    d
+                })
+                .collect();
+            mu_of(&th)
+        };
+        let n_lines = spec.lines.len();
+        let mu: Vec<f64> = seeded(usize::MAX, usize::MAX)
+            .iter()
+            .map(|d| d.value)
+            .collect();
+        // Per line: `∂μ/∂θ_i` and `∂²μ/∂θ_i∂θ_j` (`j·n_th + i`) for the folded `i`.
+        let mut grad = vec![vec![0.0; n_th]; n_lines];
+        let mut hess = vec![vec![0.0; n_th * n_th]; n_lines];
+        for &i in spec.thetas.iter().filter(|&&i| i < n_th) {
+            for j in 0..n_th {
+                for (k, d) in seeded(i, j).iter().enumerate() {
+                    grad[k][i] = d.grad[0];
+                    hess[k][j * n_th + i] = d.hess[0][1];
+                }
+            }
+        }
+        if !(mu.iter().all(|v| v.is_finite())
+            && grad
+                .iter()
+                .flatten()
+                .chain(hess.iter().flatten())
+                .all(|v| v.is_finite()))
+        {
+            return None;
+        }
         // The structure: each line's value is `g⁻¹(μ + η)` at the current η and at η moved by a
         // half on every effect — one point alone says nothing where η̂ is (near) zero, and AGQ's
         // plans run at nodes away from it. The two sides are one identity evaluated two ways
