@@ -4334,8 +4334,8 @@ impl ProfileCtx<'_> {
     /// review row 3). A `|θ₀|`-floored coordinate passes the #2406 gate, its twin the subject
     /// re-solved at τ/100 (#2678). About `2·nf²` re-solves of one subject, where the
     /// population stencil it replaces re-profiles every subject at each of its points. A
-    /// non-finite entry makes the whole block non-finite; a cancelled step gives zeros, which
-    /// the caller's cancel check discards.
+    /// non-finite entry, or a cancel, makes the whole block non-finite, so the step fails
+    /// rather than sum a partial `Aᵢ`.
     fn subject_structural_fd(
         &self,
         i: usize,
@@ -4356,7 +4356,12 @@ impl ProfileCtx<'_> {
             let s = tight_ctx.resolve(i, &unpack_params(x, hold), warm);
             (!s.unconverged && !s.fallback && !s.nm_polished).then_some(2.0 * s.nll)
         };
-        let Some(st) = fd_ofv_hessian_gated(
+        // One subject's stencil inside the population's step: no progress lines of its own.
+        let quiet = FitOptions {
+            verbose: false,
+            ..self.options.clone()
+        };
+        match fd_ofv_hessian_gated(
             x_hat.len(),
             x_hat,
             free,
@@ -4365,14 +4370,13 @@ impl ProfileCtx<'_> {
             at(x_hat),
             &at,
             Some(&tight),
-            self.options,
-        ) else {
-            return DMatrix::zeros(nf, nf);
-        };
-        if !st.diag_nan.is_empty() || !st.offdiag_nan.is_empty() {
-            return DMatrix::from_element(nf, nf, f64::NAN);
+            &quiet,
+        ) {
+            Some(st) if st.diag_nan.is_empty() && st.offdiag_nan.is_empty() => {
+                DMatrix::from_fn(nf, nf, |a, b| st.hess[(free[a], free[b])])
+            }
+            _ => DMatrix::from_element(nf, nf, f64::NAN),
         }
-        DMatrix::from_fn(nf, nf, |a, b| st.hess[(free[a], free[b])])
     }
 
     /// Subject `i`'s exact `(Aᵢ, Bᵢ, Dᵢ)` (OFV scale; `nf × nf`, `nf × k`, `k × k`) at its

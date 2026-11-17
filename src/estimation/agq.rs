@@ -1362,16 +1362,17 @@ impl<'a> SubjectScoreContext<'a> {
             .map(|g| (g, ScoreRoute::Reconverged))
     }
 
-    /// Subject `subject`'s AGQ objective at `xv` with its mode re-solved at `tol`; `tight` also
-    /// rejects a solve that fell to Nelder–Mead (the #2406 twin's resolve test).
+    /// Subject `subject`'s AGQ objective at `xv` with its mode re-solved at the score's inner
+    /// tolerance or, `tight`, at its #2406 twin's τ/100, which also rejects a solve that fell to
+    /// Nelder–Mead.
     fn reconverged_nll(
         &self,
         subject: &Subject,
         xv: &[f64],
         joint_warm: &[f64],
-        tol: f64,
         tight: bool,
     ) -> Option<f64> {
+        use crate::estimation::fd_resolution::{ebe_resolved, tight_tol};
         use crate::estimation::parameterization::{compute_mu_k, unpack_params};
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
@@ -1383,14 +1384,18 @@ impl<'a> SubjectScoreContext<'a> {
             subject,
             &p,
             self.options.inner_maxiter,
-            tol,
+            if tight {
+                tight_tol(self.fd_inner_tol)
+            } else {
+                self.fd_inner_tol
+            },
             Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,
         );
         if ebe.hard_reject
             || !ebe.converged
-            || (tight && !crate::estimation::fd_resolution::ebe_resolved(&ebe))
+            || (tight && !ebe_resolved(&ebe))
             || !ebe.nll.is_finite()
             || ebe.nll >= SUBJECT_SENTINEL_NLL
         {
@@ -1415,25 +1420,25 @@ impl<'a> SubjectScoreContext<'a> {
     /// The reconverged central difference of the subject's AGQ objective, through the outer
     /// gradient's [`central_diff_packed_gated`](crate::estimation::outer_optimizer::central_diff_packed_gated),
     /// so a `|θ₀|`-floored step passes the #2406 resolution gate (#2678). `None` when the
-    /// objective at `x` itself is not usable.
+    /// objective at `x` or at any probe the stencil scores is not usable, as before #2678: the
+    /// subject's score is then declined, not differenced around the missing point.
     fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
-        let tol = self.fd_inner_tol;
-        let nll = |xv: &[f64], tol: f64, tight: bool| {
-            self.reconverged_nll(subject, xv, joint_warm, tol, tight)
-        };
-        nll(self.x, tol, false)?;
-        let floor = crate::estimation::parameterization::fd_step_floors(self.template, self.model);
-        let tight = |xv: &[f64]| nll(xv, crate::estimation::fd_resolution::tight_tol(tol), true);
-        Some(
-            crate::estimation::outer_optimizer::central_diff_packed_gated(
-                self.x,
-                &self.fixed,
-                &floor,
-                self.bounds,
-                |xv| nll(xv, tol, false).unwrap_or(f64::NAN),
-                Some(&tight),
-            ),
-        )
+        self.reconverged_nll(subject, self.x, joint_warm, false)?;
+        let missing = std::cell::Cell::new(false);
+        let tight = |xv: &[f64]| self.reconverged_nll(subject, xv, joint_warm, true);
+        let g = crate::estimation::outer_optimizer::central_diff_packed_gated(
+            self.x,
+            &self.fixed,
+            &crate::estimation::parameterization::fd_step_floors(self.template, self.model),
+            self.bounds,
+            |xv| {
+                let v = self.reconverged_nll(subject, xv, joint_warm, false);
+                missing.set(missing.get() || v.is_none());
+                v.unwrap_or(f64::NAN)
+            },
+            Some(&tight),
+        );
+        (!missing.get()).then_some(g)
     }
 }
 
