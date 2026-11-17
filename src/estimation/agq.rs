@@ -1362,7 +1362,16 @@ impl<'a> SubjectScoreContext<'a> {
             .map(|g| (g, ScoreRoute::Reconverged))
     }
 
-    fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
+    /// Subject `subject`'s AGQ objective at `xv` with its mode re-solved at `tol`; `tight` also
+    /// rejects a solve that fell to Nelder–Mead (the #2406 twin's resolve test).
+    fn reconverged_nll(
+        &self,
+        subject: &Subject,
+        xv: &[f64],
+        joint_warm: &[f64],
+        tol: f64,
+        tight: bool,
+    ) -> Option<f64> {
         use crate::estimation::parameterization::{compute_mu_k, unpack_params};
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
@@ -1374,13 +1383,14 @@ impl<'a> SubjectScoreContext<'a> {
             subject,
             &p,
             self.options.inner_maxiter,
-            self.fd_inner_tol,
+            tol,
             Some(joint_warm),
             Some(&mu),
             self.options.inner_restarts,
         );
         if ebe.hard_reject
             || !ebe.converged
+            || (tight && !crate::estimation::fd_resolution::ebe_resolved(&ebe))
             || !ebe.nll.is_finite()
             || ebe.nll >= SUBJECT_SENTINEL_NLL
         {
@@ -1402,32 +1412,28 @@ impl<'a> SubjectScoreContext<'a> {
         is_usable_subject_nll(nll).then_some(nll)
     }
 
+    /// The reconverged central difference of the subject's AGQ objective, through the outer
+    /// gradient's [`central_diff_packed_gated`](crate::estimation::outer_optimizer::central_diff_packed_gated),
+    /// so a `|θ₀|`-floored step passes the #2406 resolution gate (#2678). `None` when the
+    /// objective at `x` itself is not usable.
     fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
-        self.reconverged_nll(subject, self.x, joint_warm)?;
-        let mut g = vec![0.0; self.x.len()];
-        for k in 0..self.x.len() {
-            if self.fixed[k] {
-                continue;
-            }
-            let floor =
-                crate::estimation::parameterization::fd_step_floor(self.template, self.model, k);
-            let h = crate::estimation::parameterization::fd_step(1e-4, self.x[k], floor);
-            let mut xp = self.x.to_vec();
-            let mut xm = self.x.to_vec();
-            xp[k] = (self.x[k] + h).min(self.bounds.upper[k]);
-            xm[k] = (self.x[k] - h).max(self.bounds.lower[k]);
-            let width = xp[k] - xm[k];
-            if width.abs() < 1e-16 {
-                continue;
-            }
-            let fp = self.reconverged_nll(subject, &xp, joint_warm)?;
-            let fm = self.reconverged_nll(subject, &xm, joint_warm)?;
-            g[k] = (fp - fm) / width;
-            if !g[k].is_finite() {
-                return None;
-            }
-        }
-        Some(g)
+        let tol = self.fd_inner_tol;
+        let nll = |xv: &[f64], tol: f64, tight: bool| {
+            self.reconverged_nll(subject, xv, joint_warm, tol, tight)
+        };
+        nll(self.x, tol, false)?;
+        let floor = crate::estimation::parameterization::fd_step_floors(self.template, self.model);
+        let tight = |xv: &[f64]| nll(xv, crate::estimation::fd_resolution::tight_tol(tol), true);
+        Some(
+            crate::estimation::outer_optimizer::central_diff_packed_gated(
+                self.x,
+                &self.fixed,
+                &floor,
+                self.bounds,
+                |xv| nll(xv, tol, false).unwrap_or(f64::NAN),
+                Some(&tight),
+            ),
+        )
     }
 }
 

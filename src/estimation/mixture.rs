@@ -1186,6 +1186,11 @@ impl MixtureScoreContext {
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
+///
+/// It takes no #2406 resolution gate: its probes re-solve every class's EBEs cold, not warm
+/// from the mode, so they do not stop inside τ of the centre's. Measured on
+/// `MIX_PARITY_MODEL` with an O(1) exponent on CL declared at `1e-4` and `1e-6` (#2678):
+/// 1.4e-7 and 2.8e-5 from the exact gradient, against 4.6e-7 declared at 1.
 pub fn mixture_gradient_fd(
     model: &CompiledModel,
     population: &Population,

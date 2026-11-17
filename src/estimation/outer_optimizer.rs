@@ -10608,7 +10608,7 @@ fn reporting_fd_gradient(
 /// at its own floor, with its one-sided fallback — the covariance gate's fallback too. Floor 1
 /// was the worst step there: on a `V = TVV/k` volume it is the step through `V ≤ 0` that made
 /// the probe go missing (#2406 review r1).
-fn central_diff_packed_gated(
+pub(crate) fn central_diff_packed_gated(
     x: &[f64],
     fixed: &[bool],
     floor: &[f64],

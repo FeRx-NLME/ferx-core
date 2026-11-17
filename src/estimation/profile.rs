@@ -50,7 +50,9 @@ use std::time::Instant;
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::estimation::covariance::{fd_ofv_hessian, CovStepOutcome};
+#[cfg(test)]
+use crate::estimation::covariance::fd_ofv_hessian;
+use crate::estimation::covariance::{fd_ofv_hessian_gated, CovStepOutcome};
 use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_map, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
 };
@@ -3711,6 +3713,16 @@ impl ProfileCtx<'_> {
             }
             Err(_) => f64::NAN,
         };
+        // The stencil's #2406 tight twin: the same solve at τ/100, kept only when every inner
+        // solve in it converged without Nelder–Mead.
+        let tight_ctx = ProfileCtx {
+            inner_tol: crate::estimation::fd_resolution::tight_tol(cov_ctx.inner_tol),
+            ..cov_ctx
+        };
+        let tight = |xv: &[f64]| {
+            let s = tight_ctx.solve(&unpack_params(xv, hold), &warm).ok()?;
+            crate::estimation::fd_resolution::inner_resolved(&s.ebe).then_some(s.ofv)
+        };
         let mut out = if cov_ctx.cov_is_analytic() {
             // No stencil runs, so the estimate's own solve is the one whose fallbacks the
             // step reports.
@@ -3720,7 +3732,7 @@ impl ProfileCtx<'_> {
                 .extend(solve.fd_gradient_subjects.iter().copied());
             cov_ctx.exact_covariance(hold, x_hat, free, solve, start)
         } else {
-            self.covariance_stencil(hold, x_hat, free, solve, start, &cov_ctx, &f, None)
+            self.covariance_stencil(hold, x_hat, free, solve, start, &cov_ctx, &f, &tight, None)
         };
         if let Some(w) = profile_fd_gradient_warning(
             self.population,
@@ -3838,6 +3850,7 @@ impl ProfileCtx<'_> {
         start: Instant,
         cov_ctx: &ProfileCtx<'_>,
         f: &F,
+        tight: crate::estimation::covariance::TightOfv<'_>,
         blocks: Option<LevelBlocks>,
     ) -> CovStepOutcome {
         let fail = |reason: String| CovStepOutcome {
@@ -3856,7 +3869,7 @@ impl ProfileCtx<'_> {
             return fail(PROFILE_NOT_FINITE_AT_ESTIMATE.to_string());
         }
         let floor = fd_step_floors(hold, self.model);
-        let Some(stencil) = fd_ofv_hessian(
+        let Some(stencil) = fd_ofv_hessian_gated(
             n,
             x_hat,
             free,
@@ -3864,6 +3877,7 @@ impl ProfileCtx<'_> {
             profile_fd_hessian_step(options),
             f0,
             f,
+            Some(tight),
             options,
         ) else {
             return fail(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
@@ -4112,19 +4126,13 @@ impl ProfileCtx<'_> {
         let l = layout.coords.len();
         let (theta_steps, level_steps) = self.block_steps(hold, x_hat, free, solve)?;
         let adjoint = self.cov_is_analytic();
-        // A declined subject's `Aᵢ` steps as the profile stencil does (#2414); its `Bᵢ` keeps
-        // `B`'s global step on either route (`COV_STEP_SE`). With both at one step, the mixed
-        // step's worst correlation-scale gap to the all-exact one on F2 is 1.3e-2 / 1.3e-3 /
-        // 1.9e-3 / 3.5e-3 / 1.2e-2 at 1e-2 / 3e-3 / 1e-3 / 3e-4 / 1e-4 (macOS arm64):
-        // truncation above `3e-3`, the re-solved differences' noise below. `Bᵢ` at the
-        // global `1e-2` instead moves it to 1.6e-3, inside the same band.
-        let a_steps: Vec<f64> = free
-            .iter()
-            .map(|&i| {
-                let floor = fd_step_floor(hold, self.model, i);
-                fd_step(profile_fd_hessian_step(self.options), x_hat[i], floor)
-            })
-            .collect();
+        // A declined subject's `Aᵢ` steps as the profile stencil does (#2414,
+        // [`Self::subject_structural_fd`]); its `Bᵢ` keeps `B`'s global step on either route
+        // (`COV_STEP_SE`). With both at one step, the mixed step's worst correlation-scale gap
+        // to the all-exact one on F2 is 1.3e-2 / 1.3e-3 / 1.9e-3 / 3.5e-3 / 1.2e-2 at 1e-2 /
+        // 3e-3 / 1e-3 / 3e-4 / 1e-4 (macOS arm64): truncation above `3e-3`, the re-solved
+        // differences' noise below. `Bᵢ` at the global `1e-2` instead moves it to 1.6e-3,
+        // inside the same band.
         let pt = adjoint
             .then(|| crate::sens::ode_provider::adjoint::PackedPoint::new(hold, x_hat))
             .flatten();
@@ -4153,9 +4161,8 @@ impl ProfileCtx<'_> {
                             &theta_steps,
                             &level_steps,
                         );
-                        let a = adjoint.then(|| {
-                            self.subject_structural_fd(i, hold, x_hat, free, solve, &a_steps)
-                        });
+                        let a = adjoint
+                            .then(|| self.subject_structural_fd(i, hold, x_hat, free, solve));
                         (d, b, a, false)
                     }
                 }
@@ -4321,10 +4328,14 @@ impl ProfileCtx<'_> {
 
     /// Subject `i`'s `Aᵢ` (OFV scale, `nf × nf`) by central differences of its term over the
     /// structural free coordinates, its levels held at `β̂` and its EBE re-solved at every
-    /// point, at `steps`: the exact route's `Aᵢ` for a subject the adjoint declines, so
-    /// `A_p` stays a Schur complement with that one term on finite differences (#2417
-    /// review row 3). `2·nf²` re-solves of one subject, where the population stencil it
-    /// replaces re-profiles every subject at each of its points.
+    /// point, on the profile stencil ([`fd_ofv_hessian_gated`] at
+    /// [`profile_fd_hessian_step`]): the exact route's `Aᵢ` for a subject the adjoint declines,
+    /// so `A_p` stays a Schur complement with that one term on finite differences (#2417
+    /// review row 3). A `|θ₀|`-floored coordinate passes the #2406 gate, its twin the subject
+    /// re-solved at τ/100 (#2678). About `2·nf²` re-solves of one subject, where the
+    /// population stencil it replaces re-profiles every subject at each of its points. A
+    /// non-finite entry makes the whole block non-finite; a cancelled step gives zeros, which
+    /// the caller's cancel check discards.
     fn subject_structural_fd(
         &self,
         i: usize,
@@ -4332,33 +4343,36 @@ impl ProfileCtx<'_> {
         x_hat: &[f64],
         free: &[usize],
         solve: &ProfileSolve,
-        steps: &[f64],
     ) -> DMatrix<f64> {
         let nf = free.len();
         let warm = &joint_warm_start(&solve.etas[i], &solve.kappas[i]);
-        // `x_hat` carries `β̂` in the level coordinates, which `hold` keeps fixed.
-        let at = |ds: &[(usize, f64)]| -> f64 {
-            let mut x = x_hat.to_vec();
-            for &(a, d) in ds {
-                x[free[a]] += d;
-            }
-            2.0 * self.resolve(i, &unpack_params(&x, hold), warm).nll
+        let tight_ctx = ProfileCtx {
+            inner_tol: crate::estimation::fd_resolution::tight_tol(self.inner_tol),
+            ..*self
         };
-        let f0 = at(&[]);
-        let mut a = DMatrix::zeros(nf, nf);
-        for s in 0..nf {
-            let h = steps[s];
-            a[(s, s)] = (at(&[(s, h)]) - 2.0 * f0 + at(&[(s, -h)])) / (h * h);
-            for t in 0..s {
-                let g = steps[t];
-                let v = (at(&[(s, h), (t, g)]) - at(&[(s, h), (t, -g)]) - at(&[(s, -h), (t, g)])
-                    + at(&[(s, -h), (t, -g)]))
-                    / (4.0 * h * g);
-                a[(s, t)] = v;
-                a[(t, s)] = v;
-            }
+        // `x_hat` carries `β̂` in the level coordinates, which `hold` keeps fixed.
+        let at = |x: &[f64]| 2.0 * self.resolve(i, &unpack_params(x, hold), warm).nll;
+        let tight = |x: &[f64]| {
+            let s = tight_ctx.resolve(i, &unpack_params(x, hold), warm);
+            (!s.unconverged && !s.fallback && !s.nm_polished).then_some(2.0 * s.nll)
+        };
+        let Some(st) = fd_ofv_hessian_gated(
+            x_hat.len(),
+            x_hat,
+            free,
+            &fd_step_floors(hold, self.model),
+            profile_fd_hessian_step(self.options),
+            at(x_hat),
+            &at,
+            Some(&tight),
+            self.options,
+        ) else {
+            return DMatrix::zeros(nf, nf);
+        };
+        if !st.diag_nan.is_empty() || !st.offdiag_nan.is_empty() {
+            return DMatrix::from_element(nf, nf, f64::NAN);
         }
-        a
+        DMatrix::from_fn(nf, nf, |a, b| st.hess[(free[a], free[b])])
     }
 
     /// Subject `i`'s exact `(Aᵢ, Bᵢ, Dᵢ)` (OFV scale; `nf × nf`, `nf × k`, `k × k`) at its

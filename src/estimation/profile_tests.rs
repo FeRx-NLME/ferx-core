@@ -4958,16 +4958,6 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
             fd_step(LEVEL_BLOCKS_ORACLE_STEP, cp.x_hat[i], floor)
         })
         .collect();
-    // `Aᵢ`'s FD at the step production gives a declined subject (`level_blocks`).
-    let a_step = profile_fd_hessian_step(&o);
-    let a_steps: Vec<f64> = cp
-        .free
-        .iter()
-        .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model, i);
-            fd_step(a_step, cp.x_hat[i], floor)
-        })
-        .collect();
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&cp.hold, &cp.x_hat).unwrap();
     let per: Vec<(f64, f64, f64, f64)> = (0..p.population.subjects.len())
         .into_par_iter()
@@ -4975,8 +4965,8 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
             assert!(!cp.solve.off_mode[i], "subject {i} is off its mode");
             let (fd_d, fd_b) =
                 c.subject_blocks_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve, &ts, &ls);
-            let fd_a =
-                c.subject_structural_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve, &a_steps);
+            // `Aᵢ`'s FD at the step production gives a declined subject (`level_blocks`).
+            let fd_a = c.subject_structural_fd(i, &cp.hold, &cp.x_hat, &cp.free, &cp.solve);
             let (ad_a, ad_b, ad_d) = c
                 .subject_blocks_adjoint(i, &pt, &cp.free, &cp.solve)
                 .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
@@ -7479,4 +7469,96 @@ fn a_profiled_budget_is_spent_only_before_or_during_a_leg() {
             .is_some_and(|w| w.contains("spent its evaluation budget"));
         assert_eq!(advises, want, "{name}: warning");
     }
+}
+
+/// #2678: the profile's two finite-difference Hessians, the `A_p` stencil (off the exact route)
+/// and a declined subject's `Aᵢ`, step a small identity-packed θ by its `|θ₀|` floor. F2 with a
+/// Hill exponent `HH = 1 + G + c`, `G` declared at `1e-4` and shifted to F2's optimum
+/// `Ĝ = 1.1064`, so it is the objective with `G` on a floored step. Ungated, both steps
+/// failed as not positive definite (eigenvalues to −4.8e4 and −967); with `G` declared at 1
+/// both succeed. Gated, the #2406 twin re-solves the profile (the subject) at τ/100. Measured
+/// (macOS arm64): the stencil's var(G) 1.3e-4 from the exact route's, and the mixed step
+/// 6.7e-4 from the exact one on the correlation scale; with `G` declared at 1, 3.8e-4 and
+/// 6.6e-4. Needs F2's twelve studies: on fewer, κ collapses and neither route is positive
+/// definite.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn the_profile_stencils_resolve_a_small_exponents_step() {
+    let (t0, g_hat) = (1e-4, 1.1063515493553668);
+    let edit = move |t: String| {
+        let t = t
+            .replace(
+                "  theta ET50(2.0, 0.01, 100.0)\n",
+                &format!("  theta ET50(2.0, 0.01, 100.0)\n  theta G({t0:e}, -5.0, 5.0)\n"),
+            )
+            .replace(
+                "  EMAXI = EMAX * exp(ETA_EM)\n",
+                &format!(
+                    "  EMAXI = EMAX * exp(ETA_EM)\n  HH = 1 + G + {:e}\n",
+                    g_hat - t0
+                ),
+            )
+            .replace(
+                "DRUG = TRT * EMAXI * TIME / (TIME + ET50)",
+                "DRUG = TRT * EMAXI * TIME^HH / (TIME^HH + ET50^HH)",
+            );
+        assert!(
+            t.contains("theta G(") && t.contains("TIME^HH"),
+            "fixture moved"
+        );
+        t
+    };
+    let mut p = prep(F2, F2_DATA, None, edit);
+    p.init_params.theta[..4].copy_from_slice(&[
+        45.31187415643503,
+        4.944069717405715,
+        1.1824211136844773,
+        t0,
+    ]);
+    p.init_params.omega =
+        crate::types::OmegaMatrix::from_diagonal(&[0.07576247061936897], vec!["ETA_EM".into()]);
+    p.init_params.omega_iov = Some(crate::types::OmegaMatrix::from_diagonal(
+        &[1.0371184297143634],
+        vec!["KAPPA_ARM".into()],
+    ));
+    let gk = p
+        .parsed
+        .model
+        .theta_names
+        .iter()
+        .position(|n| n == "G")
+        .unwrap();
+    let o = options(&p);
+    let exact = cov_step(&p, &o).0.matrix.expect("the exact route's matrix");
+    let off = FitOptions {
+        analytic_cov_hessian: false,
+        ..o.clone()
+    };
+    let stencil = cov_step(&p, &off).0;
+    let stencil = stencil
+        .matrix
+        .unwrap_or_else(|| panic!("{:?}", stencil.warnings));
+    let rel = (stencil[(gk, gk)] - exact[(gk, gk)]).abs() / exact[(gk, gk)];
+    FORCE_PROFILE_COV_DECLINE.with(|c| c.set(Some(1)));
+    let declined = cov_step(&p, &o).0;
+    FORCE_PROFILE_COV_DECLINE.with(|c| c.set(None));
+    let mixed = declined
+        .matrix
+        .unwrap_or_else(|| panic!("{:?}", declined.warnings));
+    let gap = (0..exact.nrows())
+        .flat_map(|i| (0..exact.ncols()).map(move |j| (i, j)))
+        .filter(|&(i, j)| exact[(i, i)] > 0.0 && exact[(j, j)] > 0.0)
+        .map(|(i, j)| {
+            (mixed[(i, j)] - exact[(i, j)]).abs() / (exact[(i, i)] * exact[(j, j)]).sqrt()
+        })
+        .fold(0.0_f64, |a, g| {
+            assert!(g.is_finite());
+            a.max(g)
+        });
+    eprintln!("MEASURE #2678 profile: stencil var(G) rel {rel:e}, mixed gap {gap:e}");
+    assert!(rel < 2e-3, "stencil var(G): rel {rel:e}");
+    assert!(gap < R2_MIXED_GAP, "mixed gap {gap:e}");
 }
