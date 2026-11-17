@@ -1167,6 +1167,47 @@ fn the_native_tangent_jacobian_matches_the_jet_fallback() {
     assert!(worst < 1e-12, "{worst:e}");
 }
 
+/// A `NativeJacobian` reuses its lane buffers across calls (only the values are rewritten; the
+/// one-hot tangent lanes are laid out once): a second evaluation at other `(u, params, t)`
+/// equals, bit for bit, a first evaluation on a fresh one — with and without the clock
+/// direction. The fixture makes the reuse observable: a stale value lane, or a tangent lane
+/// that was disturbed, changes the second Jacobian.
+#[test]
+fn a_reused_native_jacobian_equals_a_fresh_one_bit_for_bit() {
+    let mut rng = Rng(0x51D0_77A3_19E4_C2B6);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let mut compared = 0;
+    for case in 0..60 {
+        let odes = random_odes(&mut rng);
+        let prog = program(&odes);
+        let (u1, u2) = (seed_values(&mut rng, 3), seed_values(&mut rng, 3));
+        let (p1, p2) = (
+            seed_values(&mut rng, n_params),
+            seed_values(&mut rng, n_params),
+        );
+        let (t1, t2) = (rng.unit() * 5.0, rng.unit() * 5.0 + 5.0);
+        for clock in [false, true] {
+            let (Some(reused), Some(fresh)) =
+                (prog.program_jacobian(clock), prog.program_jacobian(clock))
+            else {
+                continue;
+            };
+            let (mut j, mut jt) = (vec![0.0; 9], vec![0.0; 3]);
+            assert!(reused.eval(&u1, &p1, t1, &mut j, &mut jt), "case {case}");
+            let (mut a, mut at) = (vec![0.0; 9], vec![0.0; 3]);
+            let (mut b, mut bt) = (vec![0.0; 9], vec![0.0; 3]);
+            assert!(reused.eval(&u2, &p2, t2, &mut a, &mut at), "case {case}");
+            assert!(fresh.eval(&u2, &p2, t2, &mut b, &mut bt), "case {case}");
+            assert!(
+                bits_eq(&a, &b) && bits_eq(&at, &bt),
+                "case {case} clock={clock}:\n{odes}\nreused {a:?} {at:?}\nfresh  {b:?} {bt:?}"
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 50, "only {compared} native cases");
+}
+
 /// The QSS-TMDD shape that motivated compiling `sqrt` (#2844), plus a bare `sqrt` of a state
 /// so the guard's inputs reach it directly.
 const SQRT_ODES: &str = "  d/dt(x1) = sqrt(x1)

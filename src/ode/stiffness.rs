@@ -177,8 +177,9 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
 
 /// One-sided finite-difference Jacobian at `(t, u)`, column-major (`jac[i + j * n]` is
 /// `∂f_i/∂u_j`, the layout `DMatrix` expects). `None` on an empty system or a non-finite
-/// entry — a caller that cannot form the Jacobian must not guess.
-/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+/// entry — a caller that cannot form the Jacobian must not guess. Test-only convenience over
+/// `fd_jacobian_into`.
+#[cfg(test)]
 fn fd_jacobian<T: PkNum>(
     rhs: &crate::ode::solver::RhsG<'_, T>,
     u: &[T],
@@ -186,33 +187,91 @@ fn fd_jacobian<T: PkNum>(
     t: f64,
 ) -> Option<Vec<f64>> {
     let n = u.len();
-    if n == 0 {
-        return None;
-    }
-
-    let mut f0 = vec![T::from_f64(0.0); n];
-    rhs(u, params, T::from_f64(t), &mut f0);
-    if f0.iter().any(|v| !v.plain().is_finite()) {
-        return None;
-    }
-
-    let mut u_pert = u.to_vec();
-    let mut f1 = vec![T::from_f64(0.0); n];
     let mut jac = vec![0.0; n * n];
+    fd_jacobian_into(rhs, u, params, t, &mut jac).then_some(jac)
+}
+
+/// The largest state count whose probe scratch lives on the stack.
+const PROBE_STACK_N: usize = 8;
+
+/// The one-sided finite-difference Jacobian (see the test-only `fd_jacobian`) into `jac`
+/// (`n * n` long); `false` where that returns `None`. The probe runs once per segment, so its
+/// three state-sized work vectors sit on the stack up to [`PROBE_STACK_N`] states.
+///
+/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches
+/// it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time)
+/// and returns before this code, except after the recording has already failed.
+fn fd_jacobian_into<T: PkNum>(
+    rhs: &crate::ode::solver::RhsG<'_, T>,
+    u: &[T],
+    params: &[T],
+    t: f64,
+    jac: &mut [f64],
+) -> bool {
+    let n = u.len();
+    if n == 0 {
+        return false;
+    }
+    let z = T::from_f64(0.0);
+    if n <= PROBE_STACK_N {
+        let (mut f0, mut u_pert, mut f1) =
+            ([z; PROBE_STACK_N], [z; PROBE_STACK_N], [z; PROBE_STACK_N]);
+        fd_jacobian_core(
+            rhs,
+            u,
+            params,
+            t,
+            jac,
+            &mut f0[..n],
+            &mut u_pert[..n],
+            &mut f1[..n],
+        )
+    } else {
+        let (mut f0, mut u_pert, mut f1) = (vec![z; n], vec![z; n], vec![z; n]);
+        fd_jacobian_core(rhs, u, params, t, jac, &mut f0, &mut u_pert, &mut f1)
+    }
+}
+
+/// [`fd_jacobian_into`]'s arithmetic over the caller's `f0`, `u_pert` and `f1` (`n` long, any
+/// contents).
+///
+/// Non-recording: reached only through [`fd_jacobian_into`], which the adaptive driver calls on
+/// the value lane (see there).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn fd_jacobian_core<T: PkNum>(
+    rhs: &crate::ode::solver::RhsG<'_, T>,
+    u: &[T],
+    params: &[T],
+    t: f64,
+    jac: &mut [f64],
+    f0: &mut [T],
+    u_pert: &mut [T],
+    f1: &mut [T],
+) -> bool {
+    let n = u.len();
+    f0.fill(T::from_f64(0.0));
+    rhs(u, params, T::from_f64(t), f0);
+    if f0.iter().any(|v| !v.plain().is_finite()) {
+        return false;
+    }
+
+    u_pert.copy_from_slice(u);
+    f1.fill(T::from_f64(0.0));
     for j in 0..n {
         let h = JAC_FD_REL_STEP * u[j].plain().abs().max(1.0);
         u_pert[j] = u[j] + T::from_f64(h);
-        rhs(&u_pert, params, T::from_f64(t), &mut f1);
+        rhs(u_pert, params, T::from_f64(t), f1);
         u_pert[j] = u[j];
         for (i, f1i) in f1.iter().enumerate() {
             let d = (f1i.plain() - f0[i].plain()) / h;
             if !d.is_finite() {
-                return None;
+                return false;
             }
             jac[i + j * n] = d;
         }
     }
-    Some(jac)
+    true
 }
 
 /// `max_i |Re λ_i|` of a column-major `n × n` matrix, via a **bounded** Schur decomposition.
@@ -271,9 +330,18 @@ pub(crate) fn resolve_method<T: PkNum>(
     if opts.method != OdeMethod::Auto {
         return opts.method;
     }
-    let Some(jac) = fd_jacobian(rhs, u, params, t) else {
-        return OdeMethod::EXPLICIT_FALLBACK;
+    let n = u.len();
+    let mut stack_jac = [0.0; PROBE_STACK_N * PROBE_STACK_N];
+    let mut heap_jac = Vec::new();
+    let jac: &mut [f64] = if n <= PROBE_STACK_N {
+        &mut stack_jac[..n * n]
+    } else {
+        heap_jac.resize(n * n, 0.0);
+        &mut heap_jac
     };
+    if !fd_jacobian_into(rhs, u, params, t, jac) {
+        return OdeMethod::EXPLICIT_FALLBACK;
+    }
     // Cheap sufficient test first: if Gershgorin's bound on `|λ|max` is already below the
     // threshold, no eigenvalue can reach it and the eigensolve would only confirm the verdict
     // this line already gives. Ordinary absorption/elimination segments — the overwhelming
@@ -287,10 +355,10 @@ pub(crate) fn resolve_method<T: PkNum>(
     // and one whose verdict genuinely varies within a subject (a fast mode carried by
     // `KON · central` is identically zero before the first dose) — for a saving a sound bound
     // gets without giving up anything.
-    if gershgorin_abs_bound(&jac, u.len()) < STIFF_RE_LAMBDA_THRESHOLD {
+    if gershgorin_abs_bound(jac, n) < STIFF_RE_LAMBDA_THRESHOLD {
         return OdeMethod::EXPLICIT_FALLBACK;
     }
-    match schur_max_abs_re(jac, u.len()) {
+    match schur_max_abs_re(jac.to_vec(), n) {
         Some(lambda) if lambda >= STIFF_RE_LAMBDA_THRESHOLD => stiff_method_for(opts),
         _ => OdeMethod::EXPLICIT_FALLBACK,
     }

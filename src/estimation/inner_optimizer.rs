@@ -7023,6 +7023,90 @@ impl BfgsUpdateBuffers {
         }
     }
 }
+/// Widest square product `nalgebra`'s `gemm` still does with its own column-by-column loop:
+/// above it (all four dimensions over 5) the product goes to `matrixmultiply`, whose blocked
+/// order the update below does not reproduce.
+const BFGS_SMALL_DIM: usize = 5;
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: every width updates through the operand matrices (the form
+    /// [`bfgs_update_small`] replaced), so a test can run one solve down both paths.
+    static FORCE_BFGS_BUFFERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a solve of `n` random effects updates through the operand matrices (`true`) or in
+/// place ([`bfgs_update_small`]).
+fn bfgs_uses_buffers(n: usize) -> bool {
+    #[cfg(test)]
+    if FORCE_BFGS_BUFFERS.with(|f| f.get()) {
+        return true;
+    }
+    n > BFGS_SMALL_DIM
+}
+
+/// `d = −H·g` as `d_vec.gemv(-1.0, &h, &g_vec, 0.0)` computes it (`axcpy`: the first column
+/// `(α·h[i,0])·g₀`, each later one `(α·h[i,j])·gⱼ + dᵢ`), without the vector copies.
+fn neg_gemv(h: &DMatrix<f64>, g: &[f64], d: &mut [f64]) {
+    let n = g.len();
+    let hs = h.as_slice();
+    for i in 0..n {
+        d[i] = (-1.0 * hs[i]) * g[0];
+    }
+    for j in 1..n {
+        for i in 0..n {
+            d[i] = ((-1.0 * hs[j * n + i]) * g[j]) + d[i];
+        }
+    }
+}
+
+/// The dense BFGS update `H ← (I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` for a solve of at most
+/// [`BFGS_SMALL_DIM`] random effects, in place: each element is the very sequence of
+/// operations `nalgebra`'s small-matrix `mul_to` / `-=` / `+=` run on the dense operands
+/// (a product element is `((a₀·b₀) + a₁·b₁) + …`, in column order), so the result is bit for
+/// bit the same, with no operand matrices and no calls.
+fn bfgs_update_small(h: &mut DMatrix<f64>, s: &[f64], y: &[f64], rho: f64) {
+    let n = s.len();
+    debug_assert!(n <= BFGS_SMALL_DIM && h.nrows() == n && h.ncols() == n);
+    let (mut rs, mut ry) = ([0.0_f64; BFGS_SMALL_DIM], [0.0_f64; BFGS_SMALL_DIM]);
+    for i in 0..n {
+        rs[i] = s[i] * rho;
+        ry[i] = y[i] * rho;
+    }
+    // Column-major `n×n` operands: `left = I − ρs·yᵀ`, `right = I − ρy·sᵀ`.
+    let mut left = [[0.0_f64; BFGS_SMALL_DIM]; BFGS_SMALL_DIM];
+    let mut right = [[0.0_f64; BFGS_SMALL_DIM]; BFGS_SMALL_DIM];
+    for j in 0..n {
+        for i in 0..n {
+            let eye = if i == j { 1.0 } else { 0.0 };
+            left[j][i] = eye - rs[i] * y[j];
+            right[j][i] = eye - ry[i] * s[j];
+        }
+    }
+    let hs = h.as_mut_slice();
+    // `t = left·H`.
+    let mut t = [[0.0_f64; BFGS_SMALL_DIM]; BFGS_SMALL_DIM];
+    for j in 0..n {
+        for i in 0..n {
+            let mut acc = left[0][i] * hs[j * n];
+            for k in 1..n {
+                acc = left[k][i] * hs[j * n + k] + acc;
+            }
+            t[j][i] = acc;
+        }
+    }
+    // `H = t·right + ρs·sᵀ`.
+    for j in 0..n {
+        for i in 0..n {
+            let mut acc = t[0][i] * right[j][0];
+            for k in 1..n {
+                acc = t[k][i] * right[j][k] + acc;
+            }
+            hs[j * n + i] = acc + rs[i] * s[j];
+        }
+    }
+}
+
 /// Dense (`n×n` inverse-Hessian) BFGS driver, retained for low-dimensional inner
 /// problems where it beats L-BFGS (no two-loop bookkeeping) and for the
 /// solver-scaling benchmark. `grad` supplies the gradient (FD or analytic).
@@ -7076,15 +7160,15 @@ fn dense_bfgs_run(
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
     let mut g = grad(x);
-    let mut g_vec = DVector::zeros(n);
-    let mut d_vec = DVector::zeros(n);
     let mut d = vec![0.0; n];
     let mut s = vec![0.0; n];
     let mut y = vec![0.0; n];
     let mut s_vec = DVector::zeros(n);
     let mut y_vec = DVector::zeros(n);
-    let eye = DMatrix::identity(n, n);
-    let mut upd = BfgsUpdateBuffers::new(n);
+    // The update's operand matrices, for the widths whose products `nalgebra` hands to
+    // `matrixmultiply` (see [`bfgs_update_small`]); a narrower solve updates in place.
+    let mut upd =
+        bfgs_uses_buffers(n).then(|| (DMatrix::identity(n, n), BfgsUpdateBuffers::new(n)));
     let mut line_search_point = vec![0.0; n];
     // Track the objective at the current iterate so the line search never has to
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).
@@ -7159,9 +7243,7 @@ fn dense_bfgs_run(
             return InnerExit::Converged;
         }
 
-        g_vec.as_mut_slice().copy_from_slice(&g);
-        d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
-        d.copy_from_slice(d_vec.as_slice());
+        neg_gemv(&h_inv, &g, &mut d);
         if seed_inv.is_none() && h_unshaped {
             cap_curvature_free_step(&mut d, precond);
         }
@@ -7185,8 +7267,7 @@ fn dense_bfgs_run(
                 h_inv *= h0_step_scale(gnorm);
             }
             h_unshaped = true;
-            d_vec.gemv(-1.0, &h_inv, &g_vec, 0.0);
-            d.copy_from_slice(d_vec.as_slice());
+            neg_gemv(&h_inv, &g, &mut d);
             if seed_inv.is_none() {
                 cap_curvature_free_step(&mut d, precond);
             }
@@ -7251,25 +7332,31 @@ fn dense_bfgs_run(
             let sy = s_vec.dot(&y_vec);
             if curvature_pair_accepted(sy, s_vec.norm(), y_vec.norm(), enable_stall) {
                 let rho = 1.0 / sy;
-                // `(I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` with the operands' own kernels (`mul_to`
-                // is what `*` calls), into buffers held for the solve rather than a fresh
-                // matrix per product (#1564): the same arithmetic, bit for bit.
-                upd.rs.copy_from(&s_vec);
-                upd.rs *= rho;
-                upd.ry.copy_from(&y_vec);
-                upd.ry *= rho;
-                upd.yt.tr_copy_from(&y_vec);
-                upd.st.tr_copy_from(&s_vec);
-                upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
-                upd.ry.mul_to(&upd.st, &mut upd.outer_b);
-                upd.left.copy_from(&eye);
-                upd.left -= &upd.outer_a;
-                upd.right.copy_from(&eye);
-                upd.right -= &upd.outer_b;
-                upd.left.mul_to(&h_inv, &mut upd.t);
-                upd.t.mul_to(&upd.right, &mut h_inv);
-                upd.rs.mul_to(&upd.st, &mut upd.outer_a);
-                h_inv += &upd.outer_a;
+                match upd.as_mut() {
+                    None => bfgs_update_small(&mut h_inv, &s, &y, rho),
+                    Some((eye, upd)) => {
+                        // `(I − ρsyᵀ)·H·(I − ρysᵀ) + ρssᵀ` with the operands' own kernels
+                        // (`mul_to` is what `*` calls), into buffers held for the solve rather
+                        // than a fresh matrix per product (#1564): the same arithmetic, bit
+                        // for bit.
+                        upd.rs.copy_from(&s_vec);
+                        upd.rs *= rho;
+                        upd.ry.copy_from(&y_vec);
+                        upd.ry *= rho;
+                        upd.yt.tr_copy_from(&y_vec);
+                        upd.st.tr_copy_from(&s_vec);
+                        upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
+                        upd.ry.mul_to(&upd.st, &mut upd.outer_b);
+                        upd.left.copy_from(eye);
+                        upd.left -= &upd.outer_a;
+                        upd.right.copy_from(eye);
+                        upd.right -= &upd.outer_b;
+                        upd.left.mul_to(&h_inv, &mut upd.t);
+                        upd.t.mul_to(&upd.right, &mut h_inv);
+                        upd.rs.mul_to(&upd.st, &mut upd.outer_a);
+                        h_inv += &upd.outer_a;
+                    }
+                }
                 h_unshaped = false;
             }
         }

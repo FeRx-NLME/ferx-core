@@ -5897,15 +5897,38 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
-/// `psi_along` spends its directions over passes of `MAX_PASS` (2), or narrower under
-/// `PASS_WIDTH_CAP`. Each column must still land on its own direction: width 2 over 7 packed
-/// axes leaves a ragged last pass, so an offset taken from the pass's own width rather than the
-/// planned one misplaces columns; width 1 has none, and is the reference. Measured:
-/// bit-identical (a column's arithmetic does not see the other tangents); a misplaced column
-/// moves the matrix by O(1) of its largest entry.
-#[test]
-fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
+/// The covariance Hessian's production passes (`MAX_PASS` = 2 directions each, forward over
+/// reverse) equal one direction per pass (`PASS_WIDTH_CAP` = 1), on a plain subject, an AGQ one
+/// (`n_agq = 3`, non-exact anchor), an IOV one (stacked η/κ widths, per-occasion tangents) and,
+/// with `nn`, a reduced-basis `[covariate_nn]` one. Width 2 over 7 packed axes leaves a ragged
+/// last pass, so an offset taken from the pass's own width rather than the planned one
+/// misplaces columns; width 1 has none, and is the reference. Measured: bit-identical (a
+/// column's arithmetic does not see the other tangent); a misplaced column moves the matrix by
+/// O(1) of its largest entry.
+fn narrow_equals_production(label: &str, model: &CompiledModel, s: &Subject, o: Objective) {
     use super::hessian::PASS_WIDTH_CAP;
+    let params = moved_params(model);
+    let x = pack_params(&params);
+    let eta = ebe_for(model, s, &params, 1e-12, o != Objective::Foce);
+    let run = |cap: Option<usize>| {
+        with_fit_stack(|| {
+            PASS_WIDTH_CAP.with(|c| c.set(cap));
+            let h = subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), o);
+            PASS_WIDTH_CAP.with(|c| c.set(None));
+            h
+        })
+        .unwrap_or_else(|| panic!("{label}: in scope"))
+    };
+    let production = run(None);
+    let narrow = run(Some(1));
+    assert_eq!(narrow.shape(), production.shape(), "{label}: shape");
+    let worst = rel_gap(narrow.as_slice(), production.as_slice());
+    eprintln!("{label}: width 1 vs 2: {worst:.2e}");
+    assert!(worst < 1e-12, "{label}: width 1 vs 2: {worst:.2e}");
+}
+
+#[test]
+fn cov_hessian_narrow_passes_equal_the_production_ones() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
     let s = subject(
         &one,
@@ -5916,39 +5939,29 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
         &TIMES,
         &[0.1, -0.05, 0.2],
     );
-    let params = moved_params(&one);
-    let x = pack_params(&params);
     assert_eq!(
-        x.len(),
+        pack_params(&moved_params(&one)).len(),
         7,
         "the fixture must leave a ragged last pass at width 2"
     );
-    let eta = ebe_for(&one, &s, &params, 1e-12, true);
-    let run = |cap: Option<usize>| {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(crate::FIT_RAYON_STACK_SIZE)
-                .spawn_scoped(scope, || {
-                    PASS_WIDTH_CAP.with(|c| c.set(cap));
-                    subject_adjoint_cov_hessian(
-                        &one,
-                        &s,
-                        &params,
-                        &x,
-                        eta.as_slice(),
-                        Objective::Focei,
-                    )
-                })
-                .expect("spawn")
-                .join()
-                .expect("join")
-        })
-        .expect("in scope")
-    };
-    let full = run(None);
-    let worst = rel_gap(run(Some(1)).as_slice(), full.as_slice());
-    eprintln!("cov Hessian at width 1 vs 2: {worst:.2e}");
-    assert!(worst < 1e-12, "width 1 vs 2: {worst:.2e}");
+    narrow_equals_production("FOCEI", &one, &s, Objective::Focei);
+    narrow_equals_production(
+        "AGQ-3",
+        &one,
+        &s,
+        Objective::Agq {
+            n_agq: 3,
+            exact: false,
+        },
+    );
+    let iov = parse_model_string(ODE_IOV).unwrap();
+    let s_iov = iov_subject(&iov);
+    narrow_equals_production("IOV", &iov, &s_iov, Objective::Focei);
+    #[cfg(feature = "nn")]
+    {
+        let (m, s) = covariate_nn_fixture();
+        narrow_equals_production("covariate NN", &m, &s, Objective::Focei);
+    }
 }
 
 #[test]
@@ -7749,6 +7762,33 @@ fn closed_vs_generic(
         }
     }
     worst
+}
+
+/// The closed form declines, in every build, when its row sensitivities are not as wide as
+/// Ω⁻¹ (a `ParT` from `map_rows` carries no Ω, so its width would be 0 and the Hessian
+/// silently empty); a `ParT` with Ω answers. Mutation: drop the width check in
+/// `inner_hessian_through_predictions` → the no-Ω call returns `Some` of an empty matrix.
+#[test]
+fn the_inner_hessian_through_predictions_declines_a_width_it_cannot_assemble() {
+    use crate::sens::focei_kernel::{inner_hessian_through_predictions, LikCtx, ParT};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &model.default_params;
+    let ctx = LikCtx::new(&model, &s, params);
+    let (f, g, q) = live_jets(TIMES.len(), 3);
+    let full = ParT::of(&model, &s, params);
+    let h = inner_hessian_through_predictions(&ctx, &f, &g, &q, &full).expect("with Ω");
+    assert_eq!((h.len(), h[0].len()), (3, 3));
+    let rows = full.map_rows(|x| x);
+    assert!(
+        inner_hessian_through_predictions(&ctx, &f, &g, &q, &rows).is_none(),
+        "a ParT without Ω declines"
+    );
 }
 
 /// The closed form is the generic exact inner Hessian, on arbitrary jets — the identity is

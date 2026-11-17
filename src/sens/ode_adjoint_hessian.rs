@@ -1530,7 +1530,8 @@ impl<'a> CovPlan<'a> {
                         }
                     }
                 }
-                let lh = factor_anchor(&mut h_a, &p.omega.inv)?;
+                let nh = h_a.len();
+                let lh = factor_anchor(&mut h_a, p.omega_inv(nh))?;
                 let grid = agq_grid(n_agq, sc.width);
                 if nodes {
                     // b = η + √2·L⁻ᵀz per node.

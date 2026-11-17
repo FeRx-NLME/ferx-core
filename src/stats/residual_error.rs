@@ -136,12 +136,14 @@ impl<T: Copy> IntoIterator for Loads<T> {
 ///
 /// A variance that cannot be scored (`NaN`, `≤ 0`, subnormal) is replaced by
 /// `MIN_VARIANCE`; every positive normal variance is returned as it is (#2441).
+#[inline]
 pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64 {
     guard_variance(residual_variance_raw(error_model, f_pred, sigma_values))
 }
 
 /// [`residual_variance`] before the invalid-variance guard: the variance the
 /// #958 derivative gates test with [`variance_is_guarded`].
+#[inline]
 pub(crate) fn residual_variance_raw(
     error_model: ErrorModel,
     f_pred: f64,
@@ -549,7 +551,28 @@ impl ErrorSpec {
     /// `2·f·σ_prop²` (σ_prop is the endpoint's proportional sigma, which is the
     /// first sigma for both `Proportional` and `Combined`). `Single` ignores
     /// `cmt`; `PerCmt` dispatches on the endpoint registered for `cmt`.
+    #[inline]
     pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
+        // `Single` without the `exp(−f)` slot, the common spec: the gate below on the raw
+        // variance, then the closed slope — the very expressions of the general path
+        // ([`Self::dvar_df_raw`] reads `σ₀` as `sigma.first()`), without building the
+        // loading shape to learn there is no such slot. `LogCombined` takes the general one.
+        if let ErrorSpec::Single(em) = self {
+            if !matches!(em, ErrorModel::LogCombined) {
+                if variance_is_guarded(residual_variance_raw(*em, f, sigma)) {
+                    return 0.0;
+                }
+                let prop_sigma = sigma.first().copied().unwrap_or(0.0);
+                return match em {
+                    ErrorModel::Additive => 0.0,
+                    _ => 2.0 * f * prop_sigma * prop_sigma,
+                };
+            }
+        }
+        self.dvar_df_general(cmt, f, sigma)
+    }
+
+    fn dvar_df_general(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         // Guard-aware derivative: where `variance_at` replaces the raw variance by
         // the constant `MIN_VARIANCE` (`variance_is_guarded`: NaN, ≤ 0 or
         // subnormal — e.g. `f = 0` under proportional error) the variance is
@@ -919,14 +942,25 @@ impl ErrorSpec {
         }
     }
 
+    // `Single` (one error model for every endpoint, the common spec) is read inline, so the
+    // per-row dispatch the inner loop runs a million times a fit is a compare and the
+    // variance expression; the per-endpoint spec stays out of line in `variance_at_by`.
+    #[inline]
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
-        self.variance_at_by(cmt, f_pred, sigma, residual_variance)
+        match self {
+            ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
+            _ => self.variance_at_by(cmt, f_pred, sigma, residual_variance),
+        }
     }
 
     /// [`variance_at`](Self::variance_at) before the invalid-variance guard
     /// ([`variance_is_guarded`]). `NaN` for an unregistered `PerCmt` cmt, as there.
+    #[inline]
     pub(crate) fn variance_at_raw(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
-        self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw)
+        match self {
+            ErrorSpec::Single(em) => residual_variance_raw(*em, f_pred, sigma),
+            _ => self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw),
+        }
     }
 
     fn variance_at_by(
@@ -3459,6 +3493,74 @@ mod tests {
         // A row of the wrong length carries no exponent half.
         assert_eq!(slot_exponent(&[1.0, 1.0, 1.3], 2, 0), None);
         assert_eq!(slot_exponent(&[1.3], 0, 0), None);
+    }
+
+    /// The `Single` fast paths of `variance_at`, `variance_at_raw` and `dvar_df` are the
+    /// per-endpoint general path bit for bit: every error model, over predictions that
+    /// reach every arm (zero and subnormal and `NaN`, which the variance guard replaces and
+    /// the slope gate zeroes; negative; large). A `PerCmt` spec with the same model at the
+    /// one endpoint is the independent reference for the value and the slope, so a fast arm
+    /// that drifts from the general one reddens here.
+    ///
+    /// Mutations: drop the `variance_is_guarded` return in the `dvar_df` fast arm → the
+    /// `f = -0.0` row (measured: `Proportional slope at f = -0: -0 vs 0`, the live slope
+    /// `2·f·σ²` keeps the zero's sign where the gated one is `+0.0`) and the rows whose raw
+    /// variance underflows or is `NaN` (`1e-200`, `5e-324`, `NaN`: a live slope against `0.0`)
+    /// fail; the `f = 0.0` row does not, since `2·0·σ² = 0.0` is the gated value too. Use
+    /// `sigma[1]` for `prop_sigma` → the combined row differs.
+    #[test]
+    fn single_spec_fast_paths_match_the_per_endpoint_general_path() {
+        for (em, sigma, idx) in [
+            (ErrorModel::Additive, vec![0.3], vec![0usize]),
+            (ErrorModel::Proportional, vec![0.2], vec![0]),
+            (ErrorModel::Combined, vec![0.2, 0.7], vec![0, 1]),
+            (ErrorModel::LogCombined, vec![0.2, 0.7], vec![0, 1]),
+        ] {
+            let single = ErrorSpec::Single(em);
+            let mut map = HashMap::new();
+            map.insert(
+                1usize,
+                EndpointError {
+                    error_model: em,
+                    sigma_idx: idx,
+                },
+            );
+            let per = ErrorSpec::PerCmt(map);
+            for f in [
+                0.0,
+                -0.0,
+                1e-200,
+                5e-324,
+                f64::NAN,
+                -2.5,
+                0.7,
+                13.0,
+                1e150,
+                f64::INFINITY,
+            ] {
+                let same = |a: f64, b: f64, what: &str| {
+                    assert!(
+                        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                        "{em:?} {what} at f = {f}: {a} vs {b}"
+                    );
+                };
+                same(
+                    single.variance_at(1, f, &sigma),
+                    per.variance_at(1, f, &sigma),
+                    "value",
+                );
+                same(
+                    single.variance_at_raw(1, f, &sigma),
+                    per.variance_at_raw(1, f, &sigma),
+                    "raw value",
+                );
+                same(
+                    single.dvar_df(1, f, &sigma),
+                    per.dvar_df(1, f, &sigma),
+                    "slope",
+                );
+            }
+        }
     }
 
     /// `variance_at_scaled` under an exponent is `m²σ²|f|^{2p}` (+ `σ_add²`
