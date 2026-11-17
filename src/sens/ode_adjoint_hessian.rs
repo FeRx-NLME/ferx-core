@@ -1228,14 +1228,17 @@ impl<'a> CovPlan<'a> {
         base: Layout,
         kt: usize,
     ) -> Option<Vec<Kept>> {
+        // Several axes: one run each (a single axis is the one-tangent run below).
         if let Lanes::Axes(ax) = lanes {
-            return (0..ax.len())
-                .map(|a| {
-                    let et1 = |k: usize, _: usize| eta_t(k, a);
-                    self.run_var(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
-                        .and_then(|mut v| v.pop())
-                })
-                .collect();
+            if ax.len() > 1 {
+                return (0..ax.len())
+                    .map(|a| {
+                        let et1 = |k: usize, _: usize| eta_t(k, a);
+                        self.run_var(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
+                            .and_then(|mut v| v.pop())
+                    })
+                    .collect();
+            }
         }
         let layout = Layout {
             tan: kt as u8,
@@ -1290,14 +1293,17 @@ impl<'a> CovPlan<'a> {
         base: Layout,
         kt: usize,
     ) -> Option<Vec<Kept>> {
+        // Several axes: one run each (a single axis is the one-tangent run below).
         if let Lanes::Axes(ax) = lanes {
-            return (0..ax.len())
-                .map(|a| {
-                    let et1 = |k: usize, _: usize| eta_t(k, a);
-                    self.run_term(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
-                        .and_then(|mut v| v.pop())
-                })
-                .collect();
+            if ax.len() > 1 {
+                return (0..ax.len())
+                    .map(|a| {
+                        let et1 = |k: usize, _: usize| eta_t(k, a);
+                        self.run_term(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
+                            .and_then(|mut v| v.pop())
+                    })
+                    .collect();
+            }
         }
         let layout = Layout {
             tan: kt as u8,

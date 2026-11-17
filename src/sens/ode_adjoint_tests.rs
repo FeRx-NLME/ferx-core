@@ -5727,7 +5727,10 @@ fn cov_diag_on_axes_is_the_full_hessians_diagonal() {
         }
     }
     eprintln!("axes diagonal vs full Hessian: worst rel {worst:.2e}");
-    assert!(worst == 0.0, "{worst:.2e}");
+    // Equal to rounding, not bit for bit: the plans' bases are built along the axes the
+    // request's directions move (#2980), so a block's columns combine a different basis than
+    // the full Hessian's. Measured 6.3e-16 here; a wrong column is O(1).
+    assert!(worst < 1e-13, "{worst:.2e}");
     let eta = ebe_for(&five, &s, &params, 1e-10, true);
     let past = [x.len()];
     assert!(
@@ -5789,7 +5792,10 @@ fn cov_block_on_axes_is_the_full_hessians_block() {
         }
     }
     eprintln!("axes block vs full Hessian: worst rel {worst:.2e}");
-    assert!(worst == 0.0, "{worst:.2e}");
+    // Equal to rounding, not bit for bit: the plans' bases are built along the axes the
+    // request's directions move (#2980), so a block's columns combine a different basis than
+    // the full Hessian's. Measured 1.8e-15 here; a wrong column is O(1).
+    assert!(worst < 1e-13, "{worst:.2e}");
     let eta = ebe_for(&five, &s, &params, 1e-10, true);
     assert!(
         subject_adjoint_cov_block_at(
@@ -5846,7 +5852,10 @@ fn cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block() {
         }
     }
     eprintln!("covariate NN: block vs full Hessian {worst:.2e}");
-    assert!(worst == 0.0, "{worst:.2e}");
+    // Equal to rounding, not bit for bit: the plans' bases are built along the axes the
+    // request's directions move (#2980), so a block's columns combine a different basis than
+    // the full Hessian's. Measured 4.2e-15 here; a wrong column is O(1).
+    assert!(worst < 1e-13, "{worst:.2e}");
 }
 
 /// The diagonal on a `[covariate_nn]` subject goes through the networks' reduced basis
@@ -7987,11 +7996,28 @@ fn production_sites_take_the_closed_form_inner_hessian() {
         r.0 >= 2 && r.1 == 0,
         "Laplace gradient (untaped + taped anchor): {r:?}"
     );
-    let r = hessian_route(&s, &|| {
-        subject_adjoint_cov_hessian(&one, &s, &params, &x, eta.as_slice(), laplace)
-            .expect("served");
-    });
-    assert!(r.0 >= 1 && r.1 == 0, "Laplace covariance step: {r:?}");
+    // The covariance step's structured kernel forms the exact anchor from its row aggregates
+    // (#2980) and calls neither routine; with it off, the recorded kernel takes the closed form.
+    // Never the generic route: the straddle shows the count is the route's, not a constant.
+    let cov_route = |off: bool| {
+        super::hessian::st::STRUCT_OFF.with(|c| c.set(off));
+        let r = hessian_route(&s, &|| {
+            subject_adjoint_cov_hessian(&one, &s, &params, &x, eta.as_slice(), laplace)
+                .expect("served");
+        });
+        super::hessian::st::STRUCT_OFF.with(|c| c.set(false));
+        r
+    };
+    assert_eq!(
+        cov_route(false),
+        (0, 0),
+        "Laplace covariance step, structured"
+    );
+    let r = cov_route(true);
+    assert!(
+        r.0 >= 1 && r.1 == 0,
+        "Laplace covariance step, recorded: {r:?}"
+    );
     // A FREM row reads η directly: the generic path, and only it.
     let frem = parse_model_string(FREM_MODEL).unwrap();
     let mut fs = subject_shell(
