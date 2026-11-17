@@ -2043,6 +2043,9 @@ pub(crate) struct MuFoldSpec {
     pub(crate) lines: Vec<(usize, usize, MuTransform)>,
     /// The θ read by no statement or block but those lines.
     pub(crate) thetas: Vec<usize>,
+    /// Per line, every θ that reaches it (folded or not): the only pairs whose cross
+    /// derivative of that line's `μ` can be nonzero.
+    pub(crate) reach: Vec<Vec<usize>>,
 }
 
 /// [`MuFoldSpec`] of `[individual_parameters]` `stmts`: the exclusive mu lines among the
@@ -2154,17 +2157,35 @@ fn mu_fold_spec(
         }
         _ => None,
     }));
+    // Per θ, the lines it reaches.
+    let lines_of: Vec<Vec<usize>> = (0..theta_names.len())
+        .map(|i| {
+            let mut reach = HashSet::new();
+            spread_theta_taint(stmts, i, &[], &mut reach);
+            owners
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| match o {
+                    Statement::Assign(n, _) => reach.contains(&n.to_ascii_uppercase()),
+                    _ => false,
+                })
+                .map(|(k, _)| k)
+                .collect()
+        })
+        .collect();
+    let reach: Vec<Vec<usize>> = (0..lines.len())
+        .map(|k| {
+            (0..theta_names.len())
+                .filter(|&i| lines_of[i].contains(&k))
+                .collect()
+        })
+        .collect();
     let thetas = theta_names
         .iter()
         .enumerate()
         .filter(|&(i, t)| {
             // It reaches some line (else there is nothing to fold) …
-            let mut reach = HashSet::new();
-            spread_theta_taint(stmts, i, &[], &mut reach);
-            let reaches = owners.iter().any(|o| match o {
-                Statement::Assign(n, _) => reach.contains(&n.to_ascii_uppercase()),
-                _ => false,
-            });
+            let reaches = !lines_of[i].is_empty();
             // … and nothing else.
             reaches
                 && thetas_read_outside_the_group(
@@ -2178,7 +2199,11 @@ fn mu_fold_spec(
         })
         .map(|(i, _)| i)
         .collect();
-    MuFoldSpec { lines, thetas }
+    MuFoldSpec {
+        lines,
+        thetas,
+        reach,
+    }
 }
 
 /// Whether an assignment **other than** the group's own typical value reads the

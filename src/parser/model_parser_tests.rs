@@ -39979,6 +39979,16 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
         ["TVCL", "TVV", "TH_WT"],
         "a shared covariate exponent"
     );
+    // Per line, the θ that reach it: the pairs whose cross derivative the Hessian forms. TH_WT
+    // reaches both lines, each typical value only its own — a pair left out here would drop a
+    // nonzero `∂²μ/∂θ_i∂θ_j`, one put in costs a program run.
+    let f = &m.indiv_param_partials.mu_fold;
+    let reach: Vec<Vec<&str>> = f
+        .reach
+        .iter()
+        .map(|r| r.iter().map(|&i| m.theta_names[i].as_str()).collect())
+        .collect();
+    assert_eq!(reach, [vec!["TVCL", "TH_WT"], vec!["TVV", "TH_WT"]]);
 
     // A dose attribute the engine reads by name (#993), with no reader in any other block: a
     // mu-referenced lag folds its θ; the same θ also read by `F1` does not (code review r2).

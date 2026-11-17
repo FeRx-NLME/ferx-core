@@ -217,9 +217,13 @@ impl MuFold {
                 let spec = &model.indiv_param_partials.mu_fold;
                 let n_th = theta.len();
                 let folded = |m: usize| self.of(m).is_some();
+                // Only θ that reach a common line can have a nonzero cross derivative there.
+                let share = |i: usize, j: usize| {
+                    spec.reach.iter().any(|r| r.contains(&i) && r.contains(&j))
+                };
                 let mut d2 = vec![vec![Vec::new(); n_th]; n_th];
                 for i in (0..n_th).filter(|&i| folded(i)) {
-                    for j in (0..n_th).filter(|&j| !(folded(j) && j < i)) {
+                    for j in (0..n_th).filter(|&j| !(folded(j) && j < i) && share(i, j)) {
                         let d = mu_dual(model, subject, theta, n_eta, i, j)?;
                         for (k, x) in d.iter().enumerate() {
                             let h = x.hess[0][1];
