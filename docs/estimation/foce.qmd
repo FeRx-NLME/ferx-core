@@ -337,13 +337,13 @@ Measured on the full-TMDD model of [#2845](https://github.com/FeRx-NLME/ferx-cor
 
 | `ode_method`, `ode_reltol` / `ode_abstol` | step `1e-7` (before) | integrating step (now) |
 |---|---|---|
-| `rodas4`, `1e-4` / `1e-6` (default) | 75.9 | 0.012 |
-| `rodas4`, `1e-5` / `1e-8` | 22.9 | 0.0011 |
-| `rodas4`, `1e-6` / `1e-9` | 0.015 | 0.0007 |
+| `rodas4`, `1e-4` / `1e-6` (default) | 2.0 | 0.0059 |
+| `rodas4`, `1e-5` / `1e-8` | 0.57 | 0.0011 |
+| `rodas4`, `1e-6` / `1e-9` | 0.0007 | 0.0007 |
 | `rk45`, `1e-4` / `1e-6` | 109.3 | 0.125 |
-| `auto`, `1e-4` / `1e-6` | 173.1 | 0.115 |
+| `auto`, `1e-4` / `1e-6` | 19.9 | 0.0093 |
 
-Each point is also cheaper: a search that stalls keeps iterating on noise. On Linux x86_64 every row falls by a similar factor: under `rodas4` at the default, 37.9 before and 0.0093 now. A whole fit can take longer, because it no longer stops early. On `examples/warfarin_sde` (macOS arm64, every θ scaled by 0.90 to 1.10):
+Where the search stalls it also costs more, because it keeps iterating on noise: under `rk45` the 25 points took 54 s against 68 s, and the other rows took the same wall. A whole fit can take longer, because it no longer stops early. On `examples/warfarin_sde` (macOS arm64, every θ scaled by 0.90 to 1.10):
 
 - **Default tolerance, seven starts:** every fit ended lower, by a median 0.049 OFV. It reached the old final OFV a median 4% sooner, and its total wall was a median 11% longer.
 - **`1e-6` / `1e-8`, six starts:** the gain is smaller, because the roundoff step stalls less there. The median final OFV was 0.001 lower and the median wall 6% longer.

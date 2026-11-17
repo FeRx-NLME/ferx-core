@@ -8324,10 +8324,11 @@ const FD_GRADIENT_STEP: f64 = 1e-7;
 /// the search stops on it at an EBE that is not the mode. On the full-TMDD fixture of #2845
 /// (30 subjects, `rodas4`, `gradient = fd`, default tolerances, 25 `TVKON` points from 1.300
 /// to 1.348, OFV against the analytic inner gradient at the same tolerance), the worst point
-/// was 75.9 OFV off at `1e-7`, 0.135 at `1e-5`, 0.009 at `1e-4`, 0.012 at `1e-3` and 0.205 at
-/// `1e-2`. Under `rk45`, whose step sequence changes more often, `1e-4` still left 0.506 and
-/// `1e-3` 0.125. At `1e-5` / `1e-8` the roundoff step still left 22.9 and the step
-/// [`integrating_fd_step`] gives 0.0011; at `1e-6` / `1e-9`, 0.015 and 0.0007. Taking the
+/// was 2.0 OFV off at `1e-7` and 0.0059 at `1e-3` (75.9 and 0.012 before #2939, which also
+/// measured 0.135 at `1e-5`, 0.009 at `1e-4` and 0.205 at `1e-2`). Under `rk45`, whose step
+/// sequence changes more often, `1e-7` leaves 109.3, `1e-4` left 0.506 and `1e-3` 0.125. At
+/// `1e-5` / `1e-8` the roundoff step leaves 0.57 and the step
+/// [`integrating_fd_step`] gives 0.0011; at `1e-6` / `1e-9`, 0.0007 and 0.0007. Taking the
 /// difference at the tightened [`ODE_FD_JACOBIAN_RELTOL`] did no better at `1e-3` and cost
 /// 6× the wall. Same value as [`ODE_FD_JACOBIAN_STEP`], for the same reason. This is the step
 /// at [`ODE_FD_GRADIENT_STEP_RELTOL`]; [`integrating_fd_step`] scales it to the fit's.
