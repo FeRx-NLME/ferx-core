@@ -4846,4 +4846,19 @@ fn a_reset_is_effective_only_after_a_record() {
             (false, false)
         ]
     );
+    // A subject with endpoint records counts any reset as effective, the conservative side.
+    let inert = Subject {
+        reset_times: vec![0.0],
+        ..Subject::default()
+    };
+    let endpoint = Subject {
+        obs_records: vec![crate::types::ObsRecord::Count {
+            time: 5.0,
+            raw_time: 5.0,
+            count: 1,
+            cmt: 1,
+        }],
+        ..inert.clone()
+    };
+    assert!(!inert.has_effective_resets() && endpoint.has_effective_resets());
 }
