@@ -7438,6 +7438,9 @@ pub fn parse_full_model_with(
     {
         #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
         let mut level_capable_cmts = model.binary_cmts();
+        // Count records define a level like binary ones (#2877).
+        level_capable_cmts.extend(model.count_cmts());
+        level_capable_cmts.sort_unstable();
         #[cfg(feature = "markov")]
         {
             level_capable_cmts.extend(model.dtmm_cmts());
@@ -20591,6 +20594,9 @@ pub(crate) fn level_record_cmts(
         use crate::types::EndpointLikelihood as E;
         let reads = match ep {
             E::Binary { lp_covariates, .. } => lp_covariates.iter().any(|c| c == index),
+            E::Count {
+                count_covariates, ..
+            } => count_covariates.iter().any(|c| c == index),
             #[cfg(feature = "markov")]
             E::Dtmm {
                 prob_covariates, ..

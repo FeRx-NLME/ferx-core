@@ -137,7 +137,8 @@ fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
 
 Levels are discovered from **Gaussian observation records**, and from the records of
-a `[binary_model]` predictor or a DTMM `[markov_model]` that reads the block (#2562).
+a `[binary_model]` predictor, a [`[count_model]`](count.qmd) mean (#2877) or a DTMM
+`[markov_model]` that reads the block (#2562).
 Those endpoints evaluate each record on its own, so each record is a level of the block
 and carries its own index, keyed on its `TIME` as written. A subject with neither — only
 time-to-event or CTMM records, or records of an endpoint that does not read the block —

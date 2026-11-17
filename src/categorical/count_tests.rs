@@ -670,3 +670,43 @@ fn zero_mean_limit_is_consistent_across_likelihood_pmf_and_sampler() {
         .iter()
         .all(|r| matches!(r.outcome, SimOutcome::Count { count: 0 })));
 }
+
+/// A data-driven θ level block read bare by a count mean, on count-only data (review r3):
+/// the count records define the levels (TRT is 0 then 1 within every subject, so both
+/// levels come from the records alone, no Gaussian row exists), each record carries its own
+/// index, and the data term scores each record at its own level. Before the count records
+/// were level rows this model was refused as having no levels.
+#[test]
+fn count_records_define_and_carry_theta_levels() {
+    let prep = load(
+        "[parameters]\n  theta BASE(4.0, 0.01, 100.0)\n  theta EFF[TRT](0.0, -5.0, 5.0)\n\
+         [covariates]\n  TRT categorical\n[count_model]\n  cmt = 1\n  \
+         log_lambda = log(BASE) + EFF\n",
+        "nonmem_anchor/count_pois.csv",
+    );
+    let model = &prep.parsed.model;
+    // Two levels under the default sum-to-zero contrast: one free θ, the TRT = 1 level its
+    // negative. Without the count records as level rows only TRT = 0 (the baseline) is a
+    // level, and every record is scored at it.
+    let blocks = &model.indiv_param_partials.theta_blocks.level_blocks;
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].record_cmts,
+        vec![1],
+        "the count endpoint reads the block"
+    );
+    assert_eq!(model.theta_names, vec!["BASE", "EFF[TRT=0]"]);
+    let theta = [4.0, 0.35];
+    let s = &prep.population.subjects[0];
+    let mut want = 0.0;
+    for (k, r) in s.obs_records.iter().enumerate() {
+        let ObsRecord::Count { count, .. } = r else {
+            unreachable!()
+        };
+        // Records 0..3 are TRT = 0, records 3..6 TRT = 1.
+        let eff = if k < 3 { theta[1] } else { -theta[1] };
+        want -= count_log_pmf(4.0 * eff.exp(), None, f64::from(*count));
+    }
+    let got = super::super::discrete_subject_nll(model, s, &theta, &[]);
+    assert!((got - want).abs() < 1e-10, "{got} vs {want}");
+}
