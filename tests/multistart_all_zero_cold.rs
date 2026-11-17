@@ -10,9 +10,11 @@
 //! The fixture is three subjects of a one-compartment oral model. Subject 1 is flip-flop
 //! (ka = 0.02 < k = CL/V = 0.1), so swapping ka and k (V' = V·k/ka) reproduces its curve
 //! exactly and its individual objective has two modes that differ only in the Ω penalty.
-//! Subjects 2 and 3 are ordinary controls. Each subject has an inert `EVID=3` reset before
-//! its dose, which puts it on the multi-start's scan-every-coordinate arm: without it the
-//! well-curved twin is never seeded at all (#2013, a separate defect). Only `TVCL` is
+//! Subjects 2 and 3 are ordinary controls. Each subject has an `EVID=3` reset after its last
+//! observation, which changes no prediction but puts it on the multi-start's
+//! scan-every-coordinate arm: without it the well-curved twin is never seeded at all (#2013, a
+//! separate defect). A reset on the first record no longer does that, being a no-op (#2081),
+//! so the reset follows the data instead of preceding the dose. Only `TVCL` is
 //! estimated. NONMEM 7.5.1 at the same estimates, `MAXEVAL=0`, gives −219.629822 from
 //! η = 0 (`MCETA=0`) and −235.253006 with `MCETA=1000`; ferx matches both to 6 decimals at
 //! `maxiter = 0` (#2013's comparison).
@@ -45,10 +47,11 @@ fn run(inner_restarts: usize) -> FitResult {
         .enumerate()
     {
         let id = id + 1;
-        csv.push_str(&format!("{id},0,.,3,.,1,1\n{id},0,.,1,100,1,1\n"));
+        csv.push_str(&format!("{id},0,.,1,100,1,1\n"));
         for t in TIMES {
             csv.push_str(&format!("{id},{t},{:.10e},0,.,1,0\n", conc(cl, v, ka, t)));
         }
+        csv.push_str(&format!("{id},100,.,3,.,1,1\n"));
     }
     let path = std::env::temp_dir().join(format!(
         "ferx_2014_multistart_{}_{inner_restarts}.csv",
@@ -58,7 +61,9 @@ fn run(inner_restarts: usize) -> FitResult {
     let pop = read_nonmem_csv(&path, None, None).expect("the fixture data loads");
     let _ = std::fs::remove_file(&path);
     assert!(
-        pop.subjects.iter().all(|s| s.has_resets()),
+        pop.subjects
+            .iter()
+            .all(|s| s.reset_times.iter().any(|&t| t > s.doses[0].time)),
         "premise: every subject takes the scan-every-coordinate arm"
     );
 

@@ -4813,3 +4813,37 @@ fn evaluation_only_run_reads_each_estimators_own_meaning_of_maxiter_zero() {
         assert_eq!(o.evaluation_only_run(), want, "{name}");
     }
 }
+
+/// #2081: a reset is effective when a record precedes it. Read through the reader, which
+/// shifts a reset that is not the first record past every record before it, so a dose at
+/// the reset's own time that comes first in the file still makes it effective.
+#[test]
+fn a_reset_is_effective_only_after_a_record() {
+    let csv = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
+               1,0,.,4,100,1,1\n1,1,5,0,.,1,0\n\
+               2,0,.,3,.,1,1\n2,2,.,1,100,1,1\n2,3,5,0,.,1,0\n\
+               3,0,.,1,100,1,1\n3,0,.,4,100,1,1\n3,1,5,0,.,1,0\n\
+               4,0,.,1,100,1,1\n4,1,5,0,.,1,0\n4,5,.,3,.,1,1\n4,6,5,0,.,1,0\n\
+               5,0,.,1,100,1,1\n5,1,5,0,.,1,0\n";
+    let path = std::env::temp_dir().join(format!("ferx_2081_{}.csv", std::process::id()));
+    std::fs::write(&path, csv).unwrap();
+    let pop = crate::read_nonmem_csv(&path, None, None).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let got: Vec<(bool, bool)> = pop
+        .subjects
+        .iter()
+        .map(|s| (s.has_resets(), s.has_effective_resets()))
+        .collect();
+    // The first-record EVID=4, an EVID=3 ahead of the first dose, a dose then EVID=4 at the
+    // same time, a reset after a dose, no reset.
+    assert_eq!(
+        got,
+        [
+            (true, false),
+            (true, false),
+            (true, true),
+            (true, true),
+            (false, false)
+        ]
+    );
+}
