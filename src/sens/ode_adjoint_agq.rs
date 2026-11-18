@@ -254,8 +254,7 @@ fn agq_planned_over(
         exact,
         grid.len(),
         n_nodes_b,
-        ng.map(|n| (n.jets.g.len(), keep.len())),
-        &keep,
+        ng.map(|n| n.jets.g.len()),
         &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
     ));
     type T = kj_tr::Tr;

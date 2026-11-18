@@ -6822,13 +6822,12 @@ pub(crate) mod outer_fd_fallback {
         );
     }
 
-    /// A declined subject's gradient is one of five kinds, worst case over the fit: reconverged
+    /// A declined subject's gradient is one of four kinds, worst case over the fit: reconverged
     /// finite differences because no recorder serves it (structural), reconverged because the
-    /// exact route failed, the quadrature's held-EBE score (the only producer of that kind),
-    /// zero (repelled, or dropped by the #1520 guard), or exact at its re-solved EBE. The
+    /// exact route failed, zero (repelled, or dropped by the #1520 guard), or exact at its
+    /// re-solved EBE. The
     /// warning names each non-empty group with its count and the sentence true of it — never
-    /// another's: the held-EBE remedy for a subject that was repelled, served exactly or
-    /// reconverged, nor "exact" for one that was not. Each cell asserts the sentence that
+    /// another's: "exact" for a subject that was not. Each cell asserts the sentence that
     /// must appear and the others that must not, so forcing any group reddens it; a subject
     /// flagged in two groups counts in the worse one. A population served exactly throughout
     /// has no fallback to report, so no warning at all.
@@ -6845,10 +6844,6 @@ pub(crate) mod outer_fd_fallback {
              results are correct but slower.";
         const EXACT: &str = "were re-solved to their EBEs at the trial point and given the \
              exact analytic gradient there.";
-        const HELD: &str = "used fixed-EBE outer gradients (the quadrature's held-EBE route), \
-             which omit the EBE-response term the analytic gradient carries. If the fit stalls, \
-             `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
-             evaluation.";
         const ZERO: &str = "contributed no gradient at the trial points where they declined: \
              their objective there was non-finite or at the failed-subject sentinel (or the \
              incumbent guard dropped them), so the optimizer rejects those points.";
@@ -6871,7 +6866,6 @@ pub(crate) mod outer_fd_fallback {
                 ("STRUCT", STRUCT),
                 ("RECON", RECON),
                 ("EXACT", EXACT),
-                ("HELD", HELD),
                 ("ZERO", ZERO),
             ] {
                 assert_eq!(
@@ -6893,16 +6887,6 @@ pub(crate) mod outer_fd_fallback {
                 false,
             ),
             ZERO,
-        );
-        only(
-            &warn(
-                &|l| {
-                    l.record_held(0);
-                    l.record_held(1);
-                },
-                false,
-            ),
-            HELD,
         );
         // Zero on one evaluation, exact on another is a zero-contributing subject.
         only(
@@ -6973,7 +6957,7 @@ pub(crate) mod outer_fd_fallback {
             split.contains(&format!("of these, 1 {STRUCT} Another 1 {EXACT}")),
             "a split population names both groups with their counts; got: {split}"
         );
-        assert!(!split.contains(HELD) && !split.contains(SKIPPED), "{split}");
+        assert!(!split.contains(SKIPPED), "{split}");
         let skipped = warn(
             &|l| {
                 l.record_structural(0);
