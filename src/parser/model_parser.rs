@@ -30988,24 +30988,7 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
-        // A positive argument is the type's own `sqrt`. Anything else is a constant, so the
-        // derivative there is zero (`PkNum::sqrt`'s convention, #2892): `inf · 0` would otherwise put
-        // a `NaN` in the jets, whose bits optimised code does not reproduce from one route to
-        // the next (#2844). The value is the `f64` lane VM's (`eval_bytecode`): `±0` passes
-        // through as `sqrt(±0) = ±0`, and a negative or `NaN` argument floors to `+0`. The
-        // `v >= 0` test, not `f64::max`, whose signed-zero result is not specified.
-        // The tests are recordable branches (`val` would fail a recording, #2786); the
-        // `±0` case is the value as a constant, so a zero keeps its sign.
-        Op::Sqrt => {
-            use crate::sens::num::BranchCmp::{Ge, Gt};
-            if v.br_cmp_c(Gt, 0.0) {
-                v.sqrt()
-            } else if v.br_cmp_c(Ge, 0.0) {
-                v.value_only()
-            } else {
-                T::from_f64(0.0)
-            }
-        }
+        Op::Sqrt => v.sqrt_vm(),
         Op::Abs => v.abs(),
         // Constants of the value (no derivative), recorded as primitives by a recording type.
         Op::Floor => v.floor_c(),

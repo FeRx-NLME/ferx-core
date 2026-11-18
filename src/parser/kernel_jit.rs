@@ -549,6 +549,7 @@ const T_JET: u8 = 30;
 const T_FLOOR: u8 = 31;
 const T_CEIL: u8 = 33;
 const T_ROUND: u8 = 34;
+const T_SQRT_VM: u8 = 35;
 const T_GATE: u8 = 32;
 /// A comparison: this plus its `ir::Cc`.
 const T_CMP: u8 = 40;
@@ -982,6 +983,10 @@ impl PkNum for Tr {
     }
     fn sqrt(self) -> Self {
         self.unary(T_SQRT, Unary::Sqrt, self.v.sqrt())
+    }
+    fn sqrt_vm(self) -> Self {
+        let v = if self.v >= 0.0 { self.v } else { 0.0 };
+        self.unary(T_SQRT_VM, Unary::SqrtRhs, v.sqrt())
     }
     /// One primitive, not the iteration: its count of steps depends on the values.
     fn gamma_pq(self, x: Self, upper: bool) -> Self {
