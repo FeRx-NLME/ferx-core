@@ -225,6 +225,47 @@ pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
     }
 }
 
+/// [`normal_cdf_g`] for a recording type (#2786) that reads it **inside an ODE step**, where `z`
+/// moves with the stage time: the same value, with every branch of [`erf_g`] and [`erfc_g`] a
+/// selection. Those branches are guards of a recorded body, which fail at any other stage of the
+/// segment than the one recorded (#3004: an infusion into an `igd()` kernel evaluates `Φ` at the
+/// stage time). Each arm is read at a safe argument where it is not taken, the incomplete gamma
+/// off its `x ≤ 0` clamp. Both arms are evaluated, so a caller whose `z` is fixed per recording
+/// keeps the branching form.
+pub(crate) fn normal_cdf_stage<T: PkNum>(z: T) -> T {
+    use crate::sens::num::BranchCmp::{Gt, Lt};
+    let (zero, one, half) = (T::from_f64(0.0), T::from_f64(1.0), T::from_f64(0.5));
+    // Φ(z) = ½·erfc(x), x = −z/√2; erfc = 1 − erf, or Q(½, x²) above x = 1 (`erfc_g`).
+    let x = -z * T::from_f64(INV_SQRT_2);
+    let germ_sq = T::from_f64(ERF_GERM_HALF_WIDTH * ERF_GERM_HALF_WIDTH);
+    let near = x * x;
+    let germ = T::from_f64(TWO_OVER_SQRT_PI) * (x - x * x * x / T::from_f64(3.0));
+    let away = T::select_if(Lt, near, germ_sq, one, x);
+    let sign = T::select_if(Lt, x, zero, T::from_f64(-1.0), one);
+    let erf = T::select_if(
+        Gt,
+        near,
+        germ_sq,
+        sign * regularized_gamma_p(half, away * away),
+        germ,
+    );
+    let upper_x = T::select_if(Gt, x, one, x, T::from_f64(2.0));
+    let upper = regularized_gamma_q(half, upper_x * upper_x);
+    half * T::select_if(Gt, x, one, upper, one - erf)
+}
+
+/// [`log_normal_cdf_g`] for a recording type inside an ODE step: [`normal_cdf_stage`]'s
+/// selections, and the Mills switch one too, each arm read at a safe `z` where it is not taken
+/// (the Mills fraction needs `t ≥ 2`, `ln Φ` a `z` above its underflow).
+pub(crate) fn log_normal_cdf_stage<T: PkNum>(z: T) -> T {
+    use crate::sens::num::BranchCmp::Lt;
+    let switch = T::from_f64(LOG_NORMAL_CDF_MILLS_SWITCH);
+    let t = T::select_if(Lt, z, switch, -z, -switch);
+    let mills = T::from_f64(-0.5) * t * t - T::from_f64(HALF_LN_2PI) - (t + mills_excess(t)).ln();
+    let direct = normal_cdf_stage(T::select_if(Lt, z, switch, switch, z)).ln();
+    T::select_if(Lt, z, switch, mills, direct)
+}
+
 /// Below this `z`, [`log_normal_cdf_g`] takes the Mills form instead of `ln Φ(z)` (#2769).
 /// Measured against a 60-digit `mpmath` `ln Φ` and its derivatives on `z ∈ [−42, −2]`
 /// in steps of ½: the Mills form is exact to the last bit in value, gradient and Hessian
