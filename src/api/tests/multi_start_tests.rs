@@ -112,30 +112,69 @@ fn test_per_start_saem_seed_derivation() {
     }
 }
 
-/// Every seeded sampler gets its own per-start stream (#3021), including the IS
-/// samplers, and start `k` never shares a seed with start 0's defaults.
+/// Starts k > 0 get their own SAEM and Bayes streams when the chain runs that sampler
+/// (#3021), keep the user's seed otherwise (so a result never reports a seed nothing
+/// used), and always keep the IS seeds, so every start's IS-evaluated OFV is scored on
+/// common draws.
 #[test]
-fn per_start_options_reseed_every_sampler() {
+fn per_start_options_reseed_the_samplers_the_chain_runs_and_share_the_is_seeds() {
     use super::{per_start_options, per_start_seed};
-    let base = FitOptions {
+    use crate::estimation::bayes::BAYES_DEFAULT_SEED;
+    use crate::estimation::saem::SAEM_DEFAULT_SEED;
+    use crate::types::EstimationMethod;
+    let sampled = FitOptions {
+        methods: vec![EstimationMethod::Saem, EstimationMethod::Bayes],
         saem_seed: Some(7),
-        imp_seed: None,
-        impmap_seed: Some(99),
+        bayes_seed: None,
+        imp_seed: Some(5),
+        impmap_seed: None,
         global_search: true,
         ..FitOptions::default()
     };
-    let o = per_start_options(&base, 3);
-    assert_eq!(o.saem_seed, Some(per_start_seed(7, 3)));
+    for k in 1..6 {
+        let o = per_start_options(&sampled, k);
+        // Set seed: hashed from it. Unset: hashed from the sampler's own default.
+        assert_eq!(o.saem_seed, Some(per_start_seed(7, k)));
+        assert_eq!(o.bayes_seed, Some(per_start_seed(BAYES_DEFAULT_SEED, k)));
+        // Start k never replays start 0's stream.
+        assert_ne!(o.saem_seed, Some(7));
+        assert_ne!(o.bayes_seed, Some(BAYES_DEFAULT_SEED));
+        // The IS seeds are the user's, unchanged.
+        assert_eq!(o.imp_seed, Some(5));
+        assert_eq!(o.impmap_seed, None);
+        assert!(!o.global_search);
+    }
+    let seeds: std::collections::HashSet<_> = (1..6)
+        .map(|k| per_start_options(&sampled, k).saem_seed)
+        .collect();
+    assert_eq!(seeds.len(), 5, "every start gets its own SAEM seed");
+
+    // `methods` empty: `method` is the chain. SAEM alone re-seeds SAEM from its default.
+    let saem_only = FitOptions {
+        method: EstimationMethod::Saem,
+        methods: Vec::new(),
+        saem_seed: None,
+        bayes_seed: Some(3),
+        ..FitOptions::default()
+    };
+    let o = per_start_options(&saem_only, 2);
+    assert_eq!(o.saem_seed, Some(per_start_seed(SAEM_DEFAULT_SEED, 2)));
     assert_eq!(
         o.bayes_seed,
-        Some(per_start_seed(base.bayes_seed.unwrap_or(12345), 3))
+        Some(3),
+        "no Bayes stage: the user's seed is kept"
     );
-    assert_eq!(o.imp_seed, Some(per_start_seed(12345, 3)));
-    assert_eq!(o.impmap_seed, Some(per_start_seed(99, 3)));
-    assert!(!o.global_search);
-    let o4 = per_start_options(&base, 4);
-    assert_ne!(o.imp_seed, o4.imp_seed);
-    assert_ne!(o.impmap_seed, o4.impmap_seed);
+
+    // A FOCEI chain runs neither sampler, so nothing is derived.
+    let focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        methods: Vec::new(),
+        saem_seed: None,
+        bayes_seed: None,
+        ..FitOptions::default()
+    };
+    let o = per_start_options(&focei, 3);
+    assert_eq!((o.saem_seed, o.bayes_seed), (None, None));
 }
 
 // ── #2867: the per-start records ───────────────────────────────────────────────────────

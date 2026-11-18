@@ -795,6 +795,10 @@ fn impose_omega_structure(
     }
 }
 
+/// `bayes_seed` when unset ("bayesnam"). Also the base multi-start derives later starts'
+/// Bayes seeds from (`api::fit::per_start_options`).
+pub(crate) const BAYES_DEFAULT_SEED: u64 = 0x6E_61_6D_63_62_61_79_65;
+
 /// Full MCMC Bayesian estimation entry point (Path A: Gibbs-within-HMC).
 ///
 /// Per sweep, per chain:
@@ -890,7 +894,7 @@ pub fn run_bayes(
     // for the tight ones cannot. Zero for a single η, where it would repeat the
     // block move.
     let n_cw_sweeps = crate::estimation::saem::componentwise_sweeps(n_eta_mh, n_eta);
-    let master_seed = options.bayes_seed.unwrap_or(0x6E_61_6D_63_62_61_79_65); // "bayesnam"
+    let master_seed = options.bayes_seed.unwrap_or(BAYES_DEFAULT_SEED);
     let verbose = options.verbose;
 
     // Mu-referenced (log) θ↔η map: mu_pairs[eta_idx] = Some(theta_idx) when that

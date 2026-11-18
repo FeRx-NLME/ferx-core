@@ -50,11 +50,16 @@ mod tests {
         }
     }
 
-    /// Every site derives its stream seed through [`stream_seed`]: no non-test source line
-    /// seeds from `seed ± coordinate` arithmetic (the #3021 shape — `seed.wrapping_add(i as
-    /// u64)`, `seed + i`), which no unit test of one estimator would catch for the others.
+    /// Every site derives its stream seed through [`stream_seed`]: no source line under
+    /// `src/` or `crates/` (test code included) seeds from `seed ± coordinate` or
+    /// `seed ^ coordinate` arithmetic (the #3021 shape: `seed.wrapping_add(i as u64)`,
+    /// `seed + i`), which no unit test of one estimator would catch for the others. A
+    /// second, name-independent check flags any `seed_from_u64(…)` argument that mixes by
+    /// `+`, `-`, `^` or `wrapping_add/sub` without a hash. The exemptions are listed with
+    /// their reason, and each must still match, so a stale one fails too.
     #[test]
     fn no_site_derives_a_stream_seed_by_addition() {
+        use regex::Regex;
         fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             for e in std::fs::read_dir(dir).unwrap() {
                 let p = e.unwrap().path();
@@ -65,21 +70,66 @@ mod tests {
                 }
             }
         }
+        /// `(path suffix, text on the logical line, why it is not the #3021 defect)`.
+        const EXEMPT: &[(&str, &str, &str)] = &[
+            (
+                "estimation/importance_sampling.rs",
+                "splitmix64(seed ^ IS_ADAPT_SEED_TAG ^ pass as u64)",
+                "pilot_seed: `seed` is already a stream_seed hash, and the result is finalised",
+            ),
+            (
+                "estimation/importance_sampling.rs",
+                "seed.wrapping_add(0x534F_424F_4C00_0000u64)",
+                "test oracle: a copy of the pre-#1965 shift code, one stream, no coordinate",
+            ),
+            (
+                "estimation/vi/elbo.rs",
+                "let mut z = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)",
+                "crn_eps: odd-multiplier mix, collides only at a 64-bit-sized coordinate gap",
+            ),
+            (
+                "api/vpc_tte.rs",
+                "let mut z = seed ^ (sim as u64).wrapping_mul(",
+                "censoring_uniform: XOR of odd-multiplied coordinates, then a finaliser",
+            ),
+            (
+                "stats/npde_tte.rs",
+                "combine_seed(seed ^ IMPUTE_SALT, index as u64)",
+                "constant salt; the coordinate goes through combine_seed, a hash",
+            ),
+            (
+                "stats/npde_tte.rs",
+                "combine_seed(seed ^ BATCH_SALT, batch as u64)",
+                "constant salt; the coordinate goes through combine_seed, a hash",
+            ),
+            (
+                "bootstrap/resample.rs",
+                "seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)",
+                "replicate_seed: collides only for seeds differing by a multiple of the constant",
+            ),
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
-        walk(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
-            &mut files,
-        );
+        walk(&root.join("src"), &mut files);
+        walk(&root.join("crates"), &mut files);
         assert!(files.len() > 100, "scan found only {} files", files.len());
+        let coord = Regex::new(r"\bas u64\b|u64::from\(").unwrap();
+        let add_sub = Regex::new(r"\.wrapping_(add|sub)\(").unwrap();
+        let op_seed = Regex::new(r"seed\w*\s*[-+^]\s|[-+^]\s*\w*seed\b").unwrap();
+        let sfu = Regex::new(r"seed_from_u64\((.*)\)").unwrap();
+        let hashed = Regex::new(r"stream_seed|splitmix|combine_seed|hash").unwrap();
+        let mixed = Regex::new(r"wrapping_(add|sub)\(|\s[-+^]\s").unwrap();
         let mut bad = Vec::new();
+        let mut used = vec![0usize; EXEMPT.len()];
         for f in files {
-            let name = f.file_name().unwrap().to_string_lossy().to_string();
-            if name == "rng.rs" {
+            if f.file_name().is_some_and(|n| n == "rng.rs") {
                 continue;
             }
-            // Join method-chain continuations (`seed\n    .wrapping_add(i as u64)`) and
-            // arguments rustfmt puts on their own lines (`.wrapping_add(\n    i as u64,\n)`)
-            // into one logical line, so a derivation split over several lines is scanned whole.
+            let path = f.to_string_lossy().replace('\\', "/");
+            // One logical line per statement: join method-chain and operator
+            // continuations (`seed\n    .wrapping_add(i as u64)`, `master_seed\n    + i as
+            // u64`) and arguments rustfmt puts on their own lines, so a derivation split
+            // over several lines is scanned whole.
             let mut logical: Vec<(usize, String)> = Vec::new();
             for (n, line) in std::fs::read_to_string(&f).unwrap().lines().enumerate() {
                 let t = line.trim();
@@ -87,38 +137,50 @@ mod tests {
                     continue;
                 }
                 match logical.last_mut() {
+                    Some((_, prev)) if t.starts_with(['.', ')']) => prev.push_str(t),
                     Some((_, prev))
-                        if t.starts_with('.') || t.starts_with(')') || prev.ends_with('(') =>
+                        if t.starts_with(['+', '-', '^', '*'])
+                            || prev.ends_with(['(', '+', '-', '^', '*', '=']) =>
                     {
+                        prev.push(' ');
                         prev.push_str(t)
                     }
                     _ => logical.push((n + 1, t.to_string())),
                 }
             }
             for (n, line) in logical {
-                // A seed multiplied by an odd constant before the coordinates are added
-                // (VI's `crn_eps`) is a multiplicative mix, not `seed + i`: `(s, i)` and
-                // `(s + 1, i')` meet only at a 64-bit-sized `i' - i`.
-                if !line.contains("seed") || line.contains("seed.wrapping_mul(") {
+                let named = line.contains("seed")
+                    && coord.is_match(&line)
+                    && (add_sub.is_match(&line) || op_seed.is_match(&line));
+                let unhashed = sfu
+                    .captures(&line)
+                    .is_some_and(|c| !hashed.is_match(&c[1]) && mixed.is_match(&c[1]));
+                if !(named || unhashed) {
                     continue;
                 }
-                // ` as u64` with no closing paren also catches a scaled coordinate
-                // (`seed.wrapping_add(chain as u64 * K)`, Bayes' pre-#3021 shape).
-                let additive = line.contains(".wrapping_add(") && line.contains(" as u64");
-                let plus = line.contains("seed + ") && line.contains(" as u64");
-                if additive || plus {
-                    bad.push(format!("{}:{}: {}", f.display(), n, line));
+                match EXEMPT
+                    .iter()
+                    .position(|(p, text, _)| path.ends_with(p) && line.contains(text))
+                {
+                    Some(k) => used[k] += 1,
+                    None => bad.push(format!("{path}:{n}: {line}")),
                 }
             }
         }
         assert!(
             bad.is_empty(),
-            "additive stream-seed derivation:\n{}",
+            "additive / XOR stream-seed derivation (use rng::stream_seed):\n{}",
             bad.join("\n")
         );
+        for ((p, text, why), n) in EXEMPT.iter().zip(&used) {
+            assert_eq!(
+                *n, 1,
+                "exemption `{p}` / `{text}` ({why}) matched {n} lines"
+            );
+        }
         // Every file that seeds per-subject / per-chain / per-start streams must also name
         // the helper.
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let src = root.join("src");
         for f in [
             "estimation/importance_sampling.rs",
             "estimation/impmap.rs",

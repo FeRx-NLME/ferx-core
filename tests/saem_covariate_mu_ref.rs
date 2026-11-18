@@ -992,15 +992,23 @@ fn fit_shared(edit: impl FnOnce(&mut FitOptions)) -> FitResult {
 /// (#3021) moved seed 1 onto another path of the same noisy distribution: over 15 seeds
 /// `THETA_WT` has sd 0.058 (150/250), 0.051 (300/700) and 0.153 (`score_sa`, one seed at
 /// 1.20) — the pre-#3021 streams measured sd 0.074 / 0.070 / 0.048 on the same seeds, so the
-/// noise is the fixture's, not the change's — and B's `THETA_WT_V1` is bimodal (0.21–0.33
-/// on 5 of 15 seeds, 0.47–0.71 on the rest, sd 0.17), so no single seed can honour the
-/// 0.04 / 0.05 bounds. The median of 9 seeds can: its
-/// worst realised error over the 7 windows of consecutive seeds 1..15 is `THETA_WT` 0.016 /
-/// 0.020 / 0.028, `THETA_CRCL` ≤ 0.0042, `TVCL` ≤ 0.0050 (shared arms), A: `THETA_CRCL`
-/// 0.0002, `TVCL` 0.0014, typical V1 0.12, B: `THETA_WT_V1` 0.0226, typical V1 0.57
+/// noise is the fixture's, not the change's — so no single seed can honour the 0.04
+/// bound. The median of 9 seeds can: its worst realised error over the 7 windows of
+/// consecutive seeds 1..15 is `THETA_WT` 0.016 / 0.020 / 0.028, `THETA_CRCL` ≤ 0.0042,
+/// `TVCL` ≤ 0.0050 (shared arms), A: `THETA_CRCL` 0.0002, `TVCL` 0.0014, typical V1 0.12
 /// (Linux x86_64, `ci-fast`) — each inside the bound with 1.4× or more headroom, and the
-/// pre-fix values stay far outside (below).
+/// pre-fix values stay far outside (below). Case B needs more seeds: [`ANCHOR_B_SEEDS`].
 const SAEM_SEEDS: std::ops::RangeInclusive<u64> = 1..=9;
+
+/// Case B's seeds: 25, not [`SAEM_SEEDS`]' 9. `THETA_WT_V1` is trimodal on this fixture
+/// (#3021 review; seeds 1..=40, macOS arm64 `ci-test`, the profile the slow-tests job
+/// runs): 20 of 40 seeds land within 0.05 of NONMEM's 0.591, 9 in a low mode 0.21–0.54
+/// around the pre-#1630 value, 11 high at 0.64–1.43. A 9-seed median failed the 0.05
+/// bound on 5 of the 32 windows of consecutive seeds (worst error 0.215), so seeds 1..=9
+/// passed by luck of the draw. Over every 25-seed window of 1..=40 the median's worst error
+/// is `THETA_WT_V1` 0.0226 (bound 0.05) and typical V1 0.529 (bound 1.2), and it stays at
+/// least 0.167 / 1.93 clear of the pre-#1630 values (margins 0.15 / 1.5). 0.55 s a fit.
+const ANCHOR_B_SEEDS: std::ops::RangeInclusive<u64> = 1..=25;
 
 fn median(mut v: Vec<f64>) -> f64 {
     assert!(
@@ -1263,7 +1271,7 @@ fn saem_merges_a_group_reading_a_superseded_anchor() {
     ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
 )]
 fn saem_takes_a_colliding_plain_anchor_into_the_group() {
-    let fits: Vec<(FitResult, Vec<String>)> = SAEM_SEEDS
+    let fits: Vec<(FitResult, Vec<String>)> = ANCHOR_B_SEEDS
         .map(|seed| {
             fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
                 o.saem_seed = Some(seed);
@@ -1292,8 +1300,8 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
         ANCHOR_B_TH_WT_V1_TOL,
     );
     assert!(
-        // 0.15, above the 0.139 the ±ANCHOR_B_TH_WT_V1_TOL band implies: the 9-seed median
-        // sat ≤ 0.0226 off NONMEM, i.e. ≥ 0.167 clear of the pre-#1630 value.
+        // 0.15, above the 0.139 the ±ANCHOR_B_TH_WT_V1_TOL band implies: every measured
+        // 25-seed median sat ≥ 0.167 clear of the pre-#1630 value (see ANCHOR_B_SEEDS).
         (th_wt_v1 - BEFORE_ANCHOR_B_TH_WT_V1).abs() > 0.15,
         "B: THETA_WT_V1 = {th_wt_v1:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TH_WT_V1}"
     );
@@ -1305,8 +1313,8 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
     );
     assert_finite_close("B: TVV2·TH_R", tvv1, NM_ANCHOR_B_TVV1, ANCHOR_B_TVV1_TOL);
     assert!(
-        // 1.5, above the 1.26 the ±ANCHOR_B_TVV1_TOL band implies: the 9-seed median sat
-        // ≤ 0.57 off NONMEM, i.e. ≥ 1.89 clear of the pre-#1630 value.
+        // 1.5, above the 1.26 the ±ANCHOR_B_TVV1_TOL band implies: every measured 25-seed
+        // median sat ≥ 1.93 clear of the pre-#1630 value (see ANCHOR_B_SEEDS).
         (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 1.5,
         "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
     );

@@ -769,23 +769,45 @@ pub(crate) fn per_start_seed(base: u64, k: usize) -> u64 {
 }
 
 /// The options multi-start start `k > 0` runs with:
-/// - `saem_seed` / `bayes_seed` / `imp_seed` / `impmap_seed`: derived from the user's
-///   seed (or its default) by [`per_start_seed`], so each start gets a different MH/MCMC
-///   trajectory or set of IS draws. The Bayes sampler keys off `bayes_seed`, so without
-///   it every start runs an identical RNG trajectory (differing only by the perturbed
-///   init): wasted compute and false multi-start robustness. The IS seeds used to be
-///   shared, so every IMP/IMPMAP start reused one draw set (#3021). Start 0 keeps the
-///   user's seeds for reproducibility.
+/// - `saem_seed` / `bayes_seed`: when the method chain runs that sampler, derived by
+///   [`per_start_seed`] from the user's seed, or from the sampler's own default when it
+///   is unset, so each start gets a different MH/MCMC trajectory. A chain without the
+///   sampler keeps the user's value, so the result does not report a seed nothing used.
+///   The Bayes sampler keys off `bayes_seed`, so without it every start runs an
+///   identical RNG trajectory (differing only by the perturbed init): wasted compute and
+///   false multi-start robustness. Start 0 keeps the user's seeds for reproducibility.
+/// - `imp_seed` / `impmap_seed` stay shared on purpose: they also seed the IS evaluation
+///   that every start's ranked OFV comes from, and common draws are what make two starts
+///   on the same optimum score the same. Per-start IS draws would make `select_start`
+///   pick the luckiest Monte Carlo noise and break `StartSpread`'s 1.0 OFV agreement.
 /// - `global_search`: CRS2-LM ignores the starting point and samples freely in
 ///   `[lower, upper]`, so running it on starts 1..n overrides the perturbation and makes
 ///   multi-start a no-op for those starts. It runs on start 0 only.
 pub(crate) fn per_start_options(options: &FitOptions, k: usize) -> FitOptions {
-    let seed = |s: Option<u64>| Some(per_start_seed(s.unwrap_or(12345), k));
+    let chain = if options.methods.is_empty() {
+        std::slice::from_ref(&options.method)
+    } else {
+        options.methods.as_slice()
+    };
+    let derive = |runs: bool, s: Option<u64>, default: u64| {
+        if runs {
+            Some(per_start_seed(s.unwrap_or(default), k))
+        } else {
+            s
+        }
+    };
+    let runs = |m: EstimationMethod| chain.contains(&m);
     FitOptions {
-        saem_seed: seed(options.saem_seed),
-        bayes_seed: seed(options.bayes_seed),
-        imp_seed: seed(options.imp_seed),
-        impmap_seed: seed(options.impmap_seed),
+        saem_seed: derive(
+            runs(EstimationMethod::Saem),
+            options.saem_seed,
+            crate::estimation::saem::SAEM_DEFAULT_SEED,
+        ),
+        bayes_seed: derive(
+            runs(EstimationMethod::Bayes),
+            options.bayes_seed,
+            crate::estimation::bayes::BAYES_DEFAULT_SEED,
+        ),
         global_search: false,
         ..options.clone()
     }

@@ -119,6 +119,10 @@ const MSTEP_MIXTURE_FTOL_REL: f64 = 1e-4;
 /// being far below any plausible estimated variance.
 pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
+/// `saem_seed` when unset. Also the base multi-start derives later starts' SAEM seeds
+/// from (`api::fit::per_start_options`).
+pub(crate) const SAEM_DEFAULT_SEED: u64 = 12345;
+
 /// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
 /// scaling result for single-coordinate random-walk Metropolis is ≈0.44
 /// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
@@ -4335,7 +4339,7 @@ pub fn run_saem(
     let n_sigma = init_params.sigma.values.len();
 
     // Master RNG
-    let master_seed = options.saem_seed.unwrap_or(12345);
+    let master_seed = options.saem_seed.unwrap_or(SAEM_DEFAULT_SEED);
 
     if verbose {
         eprintln!(
@@ -12776,11 +12780,21 @@ DV ~ additive(EPS)
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_scale_adaptation: ScaleAdaptation::Interval,
-            saem_seed: Some(1444),
+            saem_seed: Some(SCALE1444_SEED),
             run_covariance_step: false,
             ..FitOptions::default()
         };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        // The silence below must come from the "controller has run" gate, not from a
+        // rate that happens to sit inside the band on this seed (#3021 review).
+        let tail = res
+            .saem_mh_accept_tail
+            .expect("the window reached its floor");
+        assert!(
+            tail < MH_RATE_LOW,
+            "the silent arm's tail rate {tail:.4} must be below MH_RATE_LOW = {MH_RATE_LOW}, \
+             or its silence proves nothing"
+        );
         assert!(
             !res.warnings
                 .iter()

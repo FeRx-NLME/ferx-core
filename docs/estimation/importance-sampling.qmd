@@ -441,9 +441,10 @@ $$
 - **Reproducibility.** When `imp_seed` is unset, the evaluation (an
   `imp_eval_only` stage, or the marginal reported after a stage) uses `42` and the
   `imp` estimator's MCEM iterations use `12345`, so two fits with the same
-  `imp_samples` and `imp_proposal_df` produce identical `−2 log L`. Set it explicitly to vary the RNG stream. Each subject's stream is a
-  hash of `(imp_seed, subject index)`, so runs under different seeds share no subject
-  stream (before #3021, seed `s` subject `i` and seed `s+1` subject `i-1` were the
+  `imp_samples` and `imp_proposal_df` produce identical `−2 log L`. Set it explicitly
+  to vary the RNG stream. Each subject's stream is a hash of `imp_seed` and its
+  coordinates (the subject index, plus the MCEM iteration for the estimator), so runs
+  under different seeds share no subject stream (before #3021, seed `s` subject `i` and seed `s+1` subject `i-1` were the
   same stream, so consecutive seeds were nearly the same run). The full set of
   `imp_*` defaults is listed in the
   [`[fit_options]` reference](../model-file/fit-options.qmd#importance-sampling-imp).

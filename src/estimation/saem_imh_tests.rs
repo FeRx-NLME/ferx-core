@@ -1852,8 +1852,9 @@ const FROZEN_MAIN: [f64; FROZEN_LEN] = [
     f64::from_bits(0xc049913536369f76),
 ];
 
-/// The default path frozen against `main` (f8955c24): a seeded random-walk fit's
-/// estimates and objective, captured there with this exact fixture. Any change
+/// The default path, frozen: a seeded random-walk fit's estimates and objective with
+/// this exact fixture (captured on `main` f8955c24, re-captured under #3021 when the
+/// per-subject E-step streams were re-keyed; see `FROZEN_MAIN`). Any change
 /// to the default E-step — an extra RNG draw, a reordered proposal, a scale
 /// controller fed differently — moves these far past the tolerance (one extra
 /// draw moves θ in the third figure), while the tolerance absorbs a last-bit
