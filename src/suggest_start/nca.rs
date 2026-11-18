@@ -664,44 +664,22 @@ mod tests {
     #[test]
     fn test_auc_multidose_uses_first_interval() {
         use crate::types::{DoseEvent, Subject};
-        use std::collections::HashMap;
 
         let dose_amt = 100.0;
         let times_all = vec![0.5, 1.0, 2.0, 4.0, 24.5, 25.0, 26.0];
         let concs_all = vec![8.0, 7.0, 5.5, 3.5, 7.8, 6.8, 5.2]; // second dose starts at 24
 
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0),
                 DoseEvent::new(24.0, dose_amt, 1, 0.0, false, 0.0),
             ],
             obs_times: times_all.clone(),
-            obs_raw_times: Vec::new(),
             observations: concs_all.clone(),
             cens: vec![0; 7],
             obs_cmts: vec![1; 7],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
 
         let (t, c) = first_dose_obs(&subject);

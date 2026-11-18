@@ -11113,38 +11113,16 @@ DV ~ additive(EPS)
         use crate::types::{DoseEvent, SigmaVector};
         use rand::rngs::StdRng;
         use rand::SeedableRng;
-        use std::collections::HashMap;
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0],
             obs_cmts: vec![1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let omega = OmegaMatrix::from_diagonal(&[1.0], vec!["ETA_CL".into()]);
         let sigma = SigmaVector {
@@ -11274,38 +11252,16 @@ DV ~ additive(EPS)
     fn cancelled_run_returns_err_and_skips_final_ebe() {
         use crate::cancel::CancelFlag;
         use crate::types::{DoseEvent, FitOptions, Population};
-        use std::collections::HashMap;
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0, 0.5],
             obs_cmts: vec![1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let population = Population {
             subjects: vec![subj],
@@ -11383,40 +11339,20 @@ DV ~ additive(EPS)
     #[test]
     fn mh_kappa_zero_step_always_accepts_and_preserves_kappa() {
         use crate::types::test_helpers::analytical_model;
-        use std::collections::HashMap;
 
         let model = analytical_model(GradientMethod::Auto);
 
         // One subject with 2 occasions (occasions = [1,1,2,2]).
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "S1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0],
-            obs_raw_times: Vec::new(),
             observations: vec![50.0, 40.0, 35.0, 28.0],
             obs_cmts: vec![1; 4],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1u32, 1, 2, 2],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
 
         let omega_bsv = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
@@ -11511,7 +11447,6 @@ DV ~ additive(EPS)
     /// occasion boundary — one `kappas[i]` entry per occasion, and a class per
     /// subject, exactly what the κ phase's per-`i` guard branches on.
     fn mix_iov_pop() -> Population {
-        use std::collections::HashMap;
         let subjects = (0..4)
             .map(|i| {
                 let cl: f64 = if i < 2 { 1.0 } else { 3.0 };
@@ -11524,37 +11459,18 @@ DV ~ additive(EPS)
                     })
                     .collect();
                 Subject {
-                    obs_rgroup: Vec::new(),
                     id: (i + 1).to_string(),
                     doses: vec![
                         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
                         DoseEvent::new(2.0, 100.0, 1, 0.0, false, 0.0),
                     ],
                     obs_times,
-                    obs_raw_times: Vec::new(),
                     observations,
                     obs_cmts: vec![1, 1, 1, 1],
-                    covariates: HashMap::new(),
-                    dose_covariates: Vec::new(),
-                    obs_covariates: Vec::new(),
-                    pk_only_times: Vec::new(),
-                    pk_only_raw_times: Vec::new(),
-                    reset_period_times: Vec::new(),
-                    pk_only_covariates: Vec::new(),
-                    reset_times: Vec::new(),
-                    reset_covariates: Vec::new(),
-                    cmt_toggles: Vec::new(),
                     cens: vec![0, 0, 0, 0],
                     occasions: vec![1, 1, 2, 2],
-                    obs_l2: Vec::new(),
                     dose_occasions: vec![1, 2],
-                    reset_occasions: Vec::new(),
-                    pk_only_occasions: Vec::new(),
-                    fremtype: Vec::new(),
-                    obs_records: vec![],
-                    endpoint_covariates: Vec::new(),
-                    filled_cells: Vec::new(),
-                    simulated_mixnum: None,
+                    ..Default::default()
                 }
             })
             .collect();
@@ -11702,38 +11618,16 @@ DV ~ additive(EPS)
     #[test]
     fn saem_trace_emits_value_columns_with_na_grads() {
         use crate::types::{DoseEvent, FitOptions, Population};
-        use std::collections::HashMap;
 
         let model = analytical_model(GradientMethod::Auto);
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0, 0.5],
             obs_cmts: vec![1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let population = Population {
             subjects: vec![subj],
@@ -13267,36 +13161,15 @@ DV ~ additive(EPS)
 
     fn one_obs_subject() -> Subject {
         use crate::types::DoseEvent;
-        use std::collections::HashMap;
+
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0],
             obs_cmts: vec![1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 

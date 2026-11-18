@@ -4685,28 +4685,22 @@ mod tests {
         let k = 1e3_f64;
         let omega = DMatrix::from_row_slice(2, 2, &[0.09, 0.3 * k, 0.3 * k, 25.0 * k * k]);
         let t = crate::types::ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, 2.0],
             theta_names: vec!["SLOPE".into(), "TVCL".into()],
             // Identity-packed (negative lower bound), then log-packed (a lower bound of 0).
             theta_lower: vec![-100.0, 0.0],
             theta_upper: vec![100.0, 50.0],
-            theta_fixed: vec![false; 2],
-            omega: crate::types::OmegaMatrix::from_matrix(
-                omega,
-                vec!["E1".into(), "E2".into()],
-                false,
-            ),
             omega_fixed: vec![false; 3],
             sigma: crate::types::SigmaVector {
                 values: vec![0.05],
                 names: vec!["PROP_ERR".into()],
             },
-            sigma_fixed: vec![false],
-            omega_iov: None,
             kappa_fixed: vec![],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(crate::types::OmegaMatrix::from_matrix(
+                omega,
+                vec!["E1".into(), "E2".into()],
+                false,
+            ))
         };
         let x = crate::estimation::parameterization::pack_params(&t);
         // Packed: θ₀, θ₁, L₁₁, L₂₁, L₂₂, σ.
@@ -4746,27 +4740,21 @@ mod tests {
         let mut theta_lower = vec![0.001];
         theta_lower.extend(std::iter::repeat_n(f64::NEG_INFINITY, n_weights));
         crate::types::ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: (0..n).map(|i| 0.3 + i as f64).collect(),
             theta_names,
             theta_lower,
             theta_upper: vec![f64::INFINITY; n],
             theta_fixed: vec![false; n],
-            omega: crate::types::OmegaMatrix::from_matrix(
-                DMatrix::from_element(1, 1, 0.09),
-                vec!["ETA_CL".into()],
-                true,
-            ),
-            omega_fixed: vec![false],
             sigma: crate::types::SigmaVector {
                 values: vec![0.05],
                 names: vec!["PROP_ERR".into()],
             },
-            sigma_fixed: vec![false],
-            omega_iov: None,
             kappa_fixed: vec![],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(crate::types::OmegaMatrix::from_matrix(
+                DMatrix::from_element(1, 1, 0.09),
+                vec!["ETA_CL".into()],
+                true,
+            ))
         }
     }
 
@@ -5233,23 +5221,18 @@ mod tests {
             false,
         );
         let template = crate::types::ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.1],
             theta_upper: vec![50.0],
             theta_fixed: vec![false],
-            omega,
             omega_fixed: vec![false; 2],
             sigma: crate::types::SigmaVector {
                 values: vec![0.05],
                 names: vec!["PROP_ERR".into()],
             },
-            sigma_fixed: vec![false],
-            omega_iov: None,
             kappa_fixed: vec![],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         };
         // Packed layout: theta(1) | omega lower triangle L₁₁, L₂₁, L₂₂ (3) | sigma(1).
         let n = 5;
@@ -5307,22 +5290,16 @@ mod tests {
             names: vec!["EPS".into()],
         };
         let template = crate::types::ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.1],
             theta_upper: vec![50.0],
             theta_fixed: vec![false],
-            omega: omega.clone(),
-            omega_fixed: vec![false],
             sigma: sigma.clone(),
-            sigma_fixed: vec![false],
-            omega_iov: None,
             kappa_fixed: vec![],
             mixture: Some(crate::types::MixtureParams {
                 omega: vec![
-                    omega,
+                    omega.clone(),
                     crate::types::OmegaMatrix::from_diagonal(&[0.25], vec!["ETA_CL".into()]),
                 ],
                 sigma: vec![sigma.clone(), sigma],
@@ -5331,6 +5308,7 @@ mod tests {
                 sigma_override_addr: vec![],
                 sigma_override_fixed: vec![],
             }),
+            ..crate::types::test_helpers::bare_params(omega)
         };
         // Packed layout: TVCL | ETA_CL | EPS | ETA_CL_MIX2.
         let n = 4;

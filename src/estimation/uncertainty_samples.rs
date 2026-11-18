@@ -953,23 +953,16 @@ mod tests {
         let omega_matrix = DMatrix::from_diagonal(&DVector::from_vec(vec![0.04]));
         let omega = OmegaMatrix::from_matrix(omega_matrix, vec!["eta_CL".to_string()], true);
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 5.0],
             theta_names: vec!["CL".to_string(), "V".to_string()],
             theta_lower: vec![1e-3, 1e-3],
             theta_upper: vec![1e6, 1e6],
             theta_fixed: vec![false, false],
-            omega,
-            omega_fixed: vec![false],
             sigma: SigmaVector {
                 values: vec![0.1],
                 names: vec!["prop_err".to_string()],
             },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 

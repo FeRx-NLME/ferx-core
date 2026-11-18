@@ -42,7 +42,6 @@ use super::*;
 use crate::estimation::parameterization::pack_params;
 use crate::estimation::vi::family::FullRank;
 use crate::types::{DoseEvent, Population, Subject};
-use std::collections::HashMap;
 
 /// Dose and (constant) volume baked into the fixture below.
 const DOSE: f64 = 100.0;
@@ -98,34 +97,13 @@ fn linear_gaussian_model() -> CompiledModel {
 /// sets `dv_pre_logged`, so `fit()` must not transform them again.
 fn oracle_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: TIMES.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: obs.to_vec(),
         obs_cmts: vec![1; TIMES.len()],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; TIMES.len()],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -554,7 +532,6 @@ fn linear_gaussian_iov_model() -> CompiledModel {
 /// per occasion.
 fn iov_subject(id: &str, obs: &[f64]) -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         // A **single** bolus, deliberately. A second dose would make the concentration a
         // sum of two exponentials, and `log(Σ exp)` is not affine in `z` — the affineness
@@ -563,30 +540,12 @@ fn iov_subject(id: &str, obs: &[f64]) -> Subject {
         // log-prediction stays affine even though clearance switches partway through.
         doses: vec![DoseEvent::new(0.0, DOSE, 1, 0.0, false, 0.0)],
         obs_times: IOV_TIMES.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: obs.to_vec(),
         obs_cmts: vec![1; IOV_TIMES.len()],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; IOV_TIMES.len()],
         occasions: IOV_OCCASIONS.to_vec(),
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

@@ -1264,7 +1264,6 @@ mod tests {
     fn make_test_population() -> Population {
         let subjects = vec![
             Subject {
-                obs_rgroup: Vec::new(),
                 id: "1".to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0, 4.0],
@@ -1277,29 +1276,10 @@ mod tests {
                     m.insert("AGE".to_string(), 30.0);
                     m
                 },
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0, 0, 0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             },
             Subject {
-                obs_rgroup: Vec::new(),
                 id: "2".to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0],
@@ -1312,26 +1292,8 @@ mod tests {
                     m.insert("AGE".to_string(), 40.0);
                     m
                 },
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0, 0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             },
         ];
         Population {
@@ -1346,89 +1308,38 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
-            plan_id: Default::default(),
-            residual_serial: None,
-            priors: Vec::new(),
-            prior_from_fit: None,
-            covariate_model: None,
-            has_conditional_eta_params: false,
-            name: "test".into(),
             pk_model: PkModel::OneCptOral,
-            error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
-            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
             n_theta: 3,
             n_eta: 3,
-            n_epsilon: 1,
-            n_kappa: 0,
             theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
             eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
-            kappa_names: Vec::new(),
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
             indiv_param_partials: IndivParamPartials::empty(),
-            default_params: ModelParameters {
-                residual_correlations: Vec::new(),
-                residual_correlation_fixed: Vec::new(),
-                theta: vec![0.2, 10.0, 1.5],
-                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
-                theta_lower: vec![0.001, 0.1, 0.01],
-                theta_upper: vec![10.0, 500.0, 50.0],
-                theta_fixed: vec![false, false, false],
-                omega: OmegaMatrix::from_diagonal(
-                    &[0.09, 0.04, 0.30],
-                    vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
-                ),
-                omega_fixed: vec![false, false, false],
-                sigma: SigmaVector {
-                    values: vec![0.02],
-                    names: vec!["PROP_ERR".into()],
-                },
-                sigma_fixed: vec![false],
-                omega_iov: None,
-                kappa_fixed: Vec::new(),
-                mixture: None,
-            },
             omega_init_as_sd: vec![false, false, false],
-            sigma_init_as_sd: vec![false],
-            kappa_init_as_sd: Vec::new(),
-            kappa_weights: Vec::new(),
-            mu_refs: HashMap::new(),
-            covariate_mu_refs: Vec::new(),
-            kappa_mu_refs: HashMap::new(),
             tv_fn: Some(Box::new(|_t, _c| vec![0.2, 10.0, 1.5])),
             pk_indices: vec![0, 1, 4],
             eta_map: vec![0, 1, 2],
             pk_idx_f64: vec![0.0, 1.0, 4.0],
             sel_flat: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            dose_attr_map: Default::default(),
-            ode_spec: None,
-            diffusion_theta_start: None,
-            diffusion_state_indices: Vec::new(),
-            bloq_method: BloqMethod::Drop,
             referenced_covariates: vec![],
-            gradient_method: GradientMethod::Fd,
-            parse_warnings: Vec::new(),
-            eta_param_info: Vec::new(),
-            kappa_param_types: Vec::new(),
-            theta_transform: Vec::new(),
-            theta_eta_linked: Vec::new(),
-            #[cfg(feature = "nn")]
-            covariate_nns: Vec::new(),
-            scaling: ScalingSpec::None,
-            log_transform: false,
-            dv_pre_logged: false,
-            derived_exprs: vec![],
-            output_columns: vec![],
-            #[cfg(feature = "survival")]
-            endpoints: std::collections::BTreeMap::new(),
-            frem_config: None,
-            residual_error_eta: None,
-            analytical_init: Vec::new(),
-            analytic_readout: None,
-            ruv_magnitude: None,
-            absorption_ode_equivalent: None,
-            mixture: None,
+            ..crate::types::test_helpers::bare_model(ModelParameters {
+                theta: vec![0.2, 10.0, 1.5],
+                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+                theta_lower: vec![0.001, 0.1, 0.01],
+                theta_upper: vec![10.0, 500.0, 50.0],
+                theta_fixed: vec![false, false, false],
+                omega_fixed: vec![false, false, false],
+                sigma: SigmaVector {
+                    values: vec![0.02],
+                    names: vec!["PROP_ERR".into()],
+                },
+                ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                    &[0.09, 0.04, 0.30],
+                    vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+                ))
+            })
         }
     }
 
@@ -2351,7 +2262,6 @@ mod tests {
         // 3 subjects with RACE: 1 (most common), 2, 3
         for (id, race) in &[("1", 1.0), ("2", 1.0), ("3", 2.0), ("4", 3.0)] {
             subjects.push(Subject {
-                obs_rgroup: Vec::new(),
                 id: id.to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0],
@@ -2364,26 +2274,8 @@ mod tests {
                     m.insert("RACE".to_string(), *race);
                     m
                 },
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             });
         }
         Population {
@@ -2523,7 +2415,6 @@ mod tests {
         let mut pop = make_test_population();
         // Add a third subject.
         pop.subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: "3".to_string(),
             observations: vec![3.0],
             obs_times: vec![1.0],
@@ -2537,26 +2428,8 @@ mod tests {
                 m.insert("RACE".to_string(), 2.0);
                 m
             },
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: Vec::new(),
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
         // Subject 1: RACE=1, Subject 2: RACE=-99
         pop.subjects[0].covariates.insert("RACE".to_string(), 1.0);

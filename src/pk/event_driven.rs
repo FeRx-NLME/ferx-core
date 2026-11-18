@@ -1529,7 +1529,6 @@ mod tests {
     use super::*;
     use crate::types::DoseEvent;
     use approx::assert_relative_eq;
-    use std::collections::HashMap;
 
     fn pk_one(cl: f64, v: f64) -> PkParams {
         let mut p = PkParams::default();
@@ -1550,34 +1549,13 @@ mod tests {
     fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         let n_obs = obs_times.len();
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times,
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; n_obs],
             obs_cmts: vec![1; n_obs],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 

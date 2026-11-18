@@ -1199,7 +1199,6 @@ mod tests {
     fn ekf_zero_diffusion_matches_ode_predictions() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         let doses = vec![bolus_dose(100.0)];
         let obs_times = vec![1.0, 4.0, 8.0, 12.0];
@@ -1222,49 +1221,17 @@ mod tests {
         );
 
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ode_spec = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(one_cpt_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
-            init_fn: None,
-            solver_opts: OdeSolverOptions::default(),
-            input_rate: Vec::new(),
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
-            dose_attr_map: Default::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(one_cpt_rhs))
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -1414,7 +1381,6 @@ mod tests {
     fn ekf_matches_the_ode_twin_and_a_closed_form_on_a_model_time_rhs() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         let (cl, v) = (1.0f64, 20.0f64);
         let ke = cl / v;
@@ -1472,49 +1438,18 @@ mod tests {
             );
 
             let subj = Subject {
-                obs_rgroup: Vec::new(),
                 id: "1".into(),
                 doses: doses.clone(),
                 obs_times: obs_times.clone(),
-                obs_raw_times: Vec::new(),
                 observations: vec![0.0; obs_times.len()],
                 obs_cmts: vec![1; obs_times.len()],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0; obs_times.len()],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             };
             let ode_spec = OdeSpec {
-                chz_state_slots: Vec::new(),
-                rhs: Box::new(time_reading_rhs(slot, c)),
-                n_states: 1,
-                state_names: vec!["central".into()],
                 readout: crate::ode::OdeReadout::ObsCmt(0),
-                diffusion_var: Vec::new(),
-                init_fn: None,
                 solver_opts: opts,
-                input_rate: Vec::new(),
-                rhs_program: None,
-                readout_program: None,
-                indiv_param_program: None,
-                dose_attr_map: Default::default(),
+                ..crate::types::test_helpers::bare_ode(Box::new(time_reading_rhs(slot, c)))
             };
             let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -1568,7 +1503,6 @@ mod tests {
     fn ekf_reads_an_obs_one_ulp_after_a_dose_post_dose() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         // Two doses so the second lands with the compartment non-empty: the pre/post-dose
         // pair is 45.38 vs 145.38 rather than 0 vs 100.
@@ -1625,49 +1559,18 @@ mod tests {
         );
 
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ode_spec = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(one_cpt_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
-            init_fn: None,
             solver_opts: opts,
-            input_rate: Vec::new(),
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
-            dose_attr_map: Default::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(one_cpt_rhs))
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
         for (i, (ekf, &ode)) in ekf_pts.iter().zip(ode_preds.iter()).enumerate() {
@@ -1955,7 +1858,7 @@ mod tests {
     /// since only one of the two engines is mutated).
     #[test]
     fn ekf_infusion_end_collision_applies_the_bolus_once() {
-        use crate::ode::predictions::{ode_predictions, OdeReadout, OdeSpec};
+        use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
         use std::collections::HashMap;
 
@@ -2020,19 +1923,9 @@ mod tests {
 
         // And against the objective engine at zero diffusion, so the two cannot drift.
         let ode = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(one_cpt_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
-            readout: OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
             solver_opts: opts,
-            input_rate: Vec::new(),
-            init_fn: None,
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
             dose_attr_map: crate::types::DoseAttrMap::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(one_cpt_rhs))
         };
         let subject = Subject {
             id: "1".into(),
@@ -2593,7 +2486,6 @@ mod tests {
     fn ekf_ss_run_in_shares_the_ode_run_in_clock_on_a_time_reading_rhs() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         let (cl, v, c, ii, amt) = (1.0f64, 20.0f64, 0.05f64, 12.0f64, 100.0f64);
         let ke = cl / v;
@@ -2626,49 +2518,18 @@ mod tests {
         let (got, was) = (run(&ss), run(&single));
 
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: ss.clone(),
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ode_spec = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(t_reading_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
-            init_fn: None,
             solver_opts: opts,
-            input_rate: Vec::new(),
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
-            dose_attr_map: Default::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(t_reading_rhs))
         };
         let ode = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 

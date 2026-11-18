@@ -266,39 +266,18 @@ mod tests {
     const EXPR_SCALE_MODEL: &str = "[parameters]\n  theta TVCL(5.0,0.5,50.0)\n  theta TVV(50.0,5.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  sigma PROP_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
 
     fn iv_subject() -> crate::types::Subject {
-        use std::collections::HashMap;
         let times = [0.5, 1.0, 2.0, 4.0, 8.0];
         crate::types::Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![crate::types::DoseEvent::new(
                 0.0, 1000.0, 1, 0.0, false, 0.0,
             )],
             obs_times: times.to_vec(),
-            obs_raw_times: Vec::new(),
             observations: vec![5.0; times.len()],
             obs_cmts: vec![1; times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; times.len()],
             occasions: vec![1; times.len()],
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 

@@ -4176,34 +4176,14 @@ mod tests {
         let eta = vec![0.1_f64; model.n_eta + model.n_kappa];
 
         let base = |doses: Vec<DoseEvent>| Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times: vec![1.0, 4.0, 26.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0; 3],
             obs_cmts: vec![1; 3],
             covariates: HashMap::from([("WT".to_string(), 70.0)]),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: Vec::new(),
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
 
         let static_subject = base(vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)]);
@@ -4500,40 +4480,21 @@ mod tests {
         .expect("fixture parses");
 
         let mut subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
-            doses: Vec::new(),
             obs_times: vec![1.0, 9.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; 2],
             obs_cmts: vec![1; 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
             reset_times: vec![8.0],
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             // The reset row itself is occasion 2 — the occasion it STARTS. The record
             // before it is occasion 1, which is what every neighbour-inferring rule
             // resolves to, and what ferx used before this was measured.
             reset_occasions: vec![2],
-            pk_only_occasions: Vec::new(),
             cens: vec![0; 2],
             // t=1 is occasion 1, t=9 (after the reset) is occasion 2, so both are kappa
             // groups through an observation. (An occasion named only on a reset row is a
             // group too since #1153 — the end of this test.)
             occasions: vec![1, 2],
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
 
         let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
@@ -4780,36 +4741,18 @@ mod tests {
 
         let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
-            doses: Vec::new(),
             obs_times: vec![1.0, 40.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; 2],
             obs_cmts: vec![1; 2],
             covariates: wt(100.0),
-            dose_covariates: Vec::new(),
             obs_covariates: vec![wt(100.0), wt(10.0)],
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
             reset_times: vec![5.0, 30.0],
             // Each reset row carries a `WT` shared with no neighbouring record, so reading
             // one row early or late shows up in the assertions below.
             reset_covariates: vec![wt(50.0), wt(80.0)],
-            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
 
         let theta = model.default_params.theta.clone();
@@ -4833,34 +4776,14 @@ mod tests {
         // `compute_predictions` should zero the state at the reset. Dose at
         // t=0, reset at t=5, obs at t=1 (positive) and t=6 (zero).
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 1000.0)],
             obs_times: vec![1.0, 6.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; 2],
             obs_cmts: vec![1; 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
             reset_times: vec![5.0],
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let pk = make_pk_params(10.0, 100.0);
         let preds = compute_predictions(PkModel::OneCptIv, &subj, &pk);
@@ -4898,34 +4821,16 @@ mod tests {
         n_obs: usize,
     ) -> Subject {
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: (0..n_doses).map(|i| bolus_dose(i as f64, 100.0)).collect(),
             obs_times: (0..n_obs).map(|i| 1.0 + i as f64).collect(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; n_obs],
             obs_cmts: vec![1; n_obs],
             covariates: cov_const,
             dose_covariates: dose_cov,
             obs_covariates: obs_cov,
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 
@@ -4933,21 +4838,11 @@ mod tests {
     /// theta[0] (so we can prove pk_param_fn was called with the right
     /// covariate snapshot per event).
     fn cl_from_cr_model() -> crate::types::CompiledModel {
-        use crate::types::{
-            BloqMethod, CompiledModel, ErrorModel, GradientMethod, ModelParameters, OmegaMatrix,
-            PkModel, ScalingSpec, SigmaVector,
-        };
+        use crate::types::{CompiledModel, ErrorModel, ModelParameters, OmegaMatrix, SigmaVector};
         CompiledModel {
-            plan_id: Default::default(),
-            residual_serial: None,
-            priors: Vec::new(),
-            prior_from_fit: None,
-            covariate_model: None,
             name: "cl_from_cr".into(),
-            pk_model: PkModel::OneCptIv,
             error_model: ErrorModel::Additive,
             error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
-            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|theta, _eta, cov, _t: f64| {
                 let mut p = PkParams::default();
                 let cr = cov.get("CR").copied().unwrap_or(1.0);
@@ -4957,73 +4852,31 @@ mod tests {
             }),
             n_theta: 1,
             n_eta: 0,
-            n_epsilon: 1,
-            n_kappa: 0,
             theta_names: vec!["TVCL".into()],
             eta_names: Vec::new(),
-            kappa_names: Vec::new(),
-            default_params: ModelParameters {
-                residual_correlations: Vec::new(),
-                residual_correlation_fixed: Vec::new(),
+            omega_init_as_sd: Vec::new(),
+            pk_indices: vec![],
+            eta_map: vec![],
+            pk_idx_f64: vec![],
+            sel_flat: vec![],
+            referenced_covariates: vec!["CR".into()],
+            indiv_param_names: Vec::new(),
+            ..crate::types::test_helpers::bare_model(ModelParameters {
                 theta: vec![1.0],
                 theta_names: vec!["TVCL".into()],
                 theta_lower: vec![0.0],
                 theta_upper: vec![f64::INFINITY],
                 theta_fixed: vec![false],
-                omega: OmegaMatrix::from_diagonal(&[], Vec::new()),
                 omega_fixed: Vec::new(),
                 sigma: SigmaVector {
                     values: vec![0.1],
                     names: vec!["EPS".into()],
                 },
-                sigma_fixed: vec![false],
-                omega_iov: None,
-                kappa_fixed: Vec::new(),
-                mixture: None,
-            },
-            omega_init_as_sd: Vec::new(),
-            sigma_init_as_sd: vec![false],
-            kappa_init_as_sd: Vec::new(),
-            kappa_weights: Vec::new(),
-            mu_refs: HashMap::new(),
-            covariate_mu_refs: Vec::new(),
-            kappa_mu_refs: HashMap::new(),
-            tv_fn: None,
-            pk_indices: vec![],
-            eta_map: vec![],
-            pk_idx_f64: vec![],
-            sel_flat: vec![],
-            ode_spec: None,
-            dose_attr_map: Default::default(),
-            diffusion_theta_start: None,
-            diffusion_state_indices: Vec::new(),
-            bloq_method: BloqMethod::Drop,
-            referenced_covariates: vec!["CR".into()],
-            gradient_method: GradientMethod::Fd,
-            parse_warnings: Vec::new(),
-            has_conditional_eta_params: false,
-            eta_param_info: Vec::new(),
-            kappa_param_types: Vec::new(),
-            indiv_param_names: Vec::new(),
-            indiv_param_partials: crate::types::IndivParamPartials::empty(),
-            theta_transform: Vec::new(),
-            theta_eta_linked: Vec::new(),
-            #[cfg(feature = "nn")]
-            covariate_nns: Vec::new(),
-            scaling: ScalingSpec::None,
-            log_transform: false,
-            dv_pre_logged: false,
-            derived_exprs: vec![],
-            output_columns: vec![],
-            #[cfg(feature = "survival")]
-            endpoints: std::collections::BTreeMap::new(),
-            frem_config: None,
-            residual_error_eta: None,
-            analytical_init: Vec::new(),
-            analytic_readout: None,
-            ruv_magnitude: None,
-            absorption_ode_equivalent: None,
-            mixture: None,
+                ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                    &[],
+                    Vec::new(),
+                ))
+            })
         }
     }
 
@@ -5159,34 +5012,13 @@ mod tests {
     #[test]
     fn test_compute_predictions_length() {
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 1000.0)],
             obs_times: vec![1.0, 2.0, 4.0, 8.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; 4],
             obs_cmts: vec![1; 4],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let pk = make_pk_params(10.0, 100.0);
         let preds = compute_predictions(PkModel::OneCptIv, &subject, &pk);
@@ -5931,34 +5763,15 @@ mod tests {
         let obs_times = vec![1.0, 3.0, 25.0, 27.0];
         let n = obs_times.len();
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![bolus_dose(0.0, 100.0), bolus_dose(24.0, 100.0)],
             obs_times,
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; n],
             obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1, 1, 2, 2],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 
@@ -6600,34 +6413,13 @@ mod tests {
 
         let n_obs = obs_times.len();
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "mixed".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; n_obs],
             obs_cmts: vec![1; n_obs],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n_obs],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let pk_dose: Vec<PkParams> = vec![pk.clone(); doses.len()];
         let pk_obs: Vec<PkParams> = vec![pk.clone(); obs_times.len()];

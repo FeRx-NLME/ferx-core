@@ -4189,34 +4189,12 @@ mod tests {
         let mut subjects = Vec::new();
         for id in ids {
             subjects.push(Subject {
-                obs_rgroup: Vec::new(),
                 id: (*id).to_string(),
-                doses: vec![],
                 obs_times: (0..n_obs_each).map(|j| j as f64).collect(),
-                obs_raw_times: Vec::new(),
                 observations: (0..n_obs_each).map(|j| 5.0 + j as f64).collect(),
                 obs_cmts: vec![1; n_obs_each],
-                covariates: HashMap::new(),
-                dose_covariates: vec![],
-                obs_covariates: vec![],
-                pk_only_times: vec![],
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: vec![],
-                reset_times: vec![],
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0; n_obs_each],
-                occasions: vec![],
-                obs_l2: Vec::new(),
-                dose_occasions: vec![],
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             });
         }
         Population {

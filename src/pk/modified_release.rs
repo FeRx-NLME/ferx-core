@@ -1896,34 +1896,15 @@ mod tests {
         let n = obs_times.len();
         let nd = doses.len();
         crate::types::Subject {
-            obs_rgroup: Vec::new(),
             id: "R".into(),
             doses,
             obs_times,
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; n],
             obs_cmts: vec![1; n],
-            covariates: std::collections::HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1; nd],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 

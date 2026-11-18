@@ -1580,15 +1580,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
             InnerSolvePolicy {
                 seed,
                 ebe_variance: EbeVariance::Conditional,
-                capture_terminal_hessian: false,
-                accelerate_exact_outer: false,
-                screen: 0,
-                twin_seed: false,
-                init_is_mode: false,
-                init_is_warm: false,
-                keep_certified_start: false,
-                unseeded_iov_warm: false,
-                skip_refused: false,
+                ..Default::default()
             },
             h.map(|h| PredictedFrom {
                 mode: &warm,
@@ -1664,15 +1656,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
             InnerSolvePolicy {
                 seed,
                 ebe_variance: EbeVariance::Conditional,
-                capture_terminal_hessian: false,
-                accelerate_exact_outer: false,
-                screen: 0,
-                twin_seed: false,
-                init_is_mode: false,
-                init_is_warm: false,
-                keep_certified_start: false,
-                unseeded_iov_warm: false,
-                skip_refused: false,
+                ..Default::default()
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1695,15 +1679,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
             InnerSolvePolicy {
                 seed: kind,
                 ebe_variance: EbeVariance::Conditional,
-                capture_terminal_hessian: false,
-                accelerate_exact_outer: false,
-                screen: 0,
-                twin_seed: false,
-                init_is_mode: false,
-                init_is_warm: false,
-                keep_certified_start: false,
-                unseeded_iov_warm: false,
-                skip_refused: false,
+                ..Default::default()
             },
             true,
             None,
@@ -1775,15 +1751,8 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
     let policy = |seed| InnerSolvePolicy {
         seed,
         ebe_variance: EbeVariance::Conditional,
-        capture_terminal_hessian: false,
         accelerate_exact_outer: true,
-        screen: 0,
-        twin_seed: false,
-        init_is_mode: false,
-        init_is_warm: false,
-        keep_certified_start: false,
-        unseeded_iov_warm: false,
-        skip_refused: false,
+        ..Default::default()
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)

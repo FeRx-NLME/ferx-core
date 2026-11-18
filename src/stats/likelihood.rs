@@ -5102,42 +5102,22 @@ mod tests {
         assert!(worst < 1e-6, "{worst:.2e}");
     }
     use crate::types::{
-        BloqMethod, DoseEvent, EndpointError, ErrorModel, ErrorSpec, GradientMethod, PkModel,
-        PkParams, ResidualCorrelation,
+        BloqMethod, DoseEvent, EndpointError, ErrorModel, ErrorSpec, GradientMethod, PkParams,
+        ResidualCorrelation,
     };
     use approx::assert_relative_eq;
     use std::collections::HashMap;
 
     fn make_simple_subject() -> Subject {
         Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            obs_raw_times: Vec::new(),
             observations: vec![50.0, 40.0, 30.0, 45.0, 35.0, 25.0],
             obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }
     }
 
@@ -5147,16 +5127,6 @@ mod tests {
 
     fn make_model() -> CompiledModel {
         CompiledModel {
-            plan_id: Default::default(),
-            residual_serial: None,
-            priors: Vec::new(),
-            prior_from_fit: None,
-            covariate_model: None,
-            name: "test".into(),
-            pk_model: PkModel::OneCptIv,
-            error_model: ErrorModel::Proportional,
-            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
-            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(
                 |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
                     let mut p = PkParams::default();
@@ -5165,75 +5135,16 @@ mod tests {
                     p
                 },
             ),
-            n_theta: 2,
-            n_eta: 1,
-            n_epsilon: 1,
-            theta_names: vec!["TVCL".into(), "TVV".into()],
-            eta_names: vec!["ETA_CL".into()],
-            default_params: crate::types::ModelParameters {
-                residual_correlations: Vec::new(),
-                residual_correlation_fixed: Vec::new(),
-                theta: vec![5.0, 50.0],
-                theta_names: vec!["TVCL".into(), "TVV".into()],
+            gradient_method: GradientMethod::default(),
+            ..crate::types::test_helpers::bare_model(crate::types::ModelParameters {
                 theta_lower: vec![0.01, 1.0],
                 theta_upper: vec![100.0, 500.0],
-                theta_fixed: vec![false; 2],
-                omega: make_omega(0.09),
-                omega_fixed: vec![false],
                 sigma: crate::types::SigmaVector {
                     values: vec![0.05],
                     names: vec!["PROP_ERR".into()],
                 },
-                sigma_fixed: vec![false],
-                omega_iov: None,
-                kappa_fixed: Vec::new(),
-                mixture: None,
-            },
-            omega_init_as_sd: vec![false],
-            sigma_init_as_sd: vec![false],
-            kappa_init_as_sd: Vec::new(),
-            kappa_weights: Vec::new(),
-            mu_refs: HashMap::new(),
-            covariate_mu_refs: Vec::new(),
-            tv_fn: None,
-            pk_indices: vec![0, 1],
-            eta_map: vec![0],
-            pk_idx_f64: vec![0.0, 1.0],
-            sel_flat: vec![1.0, 0.0],
-            ode_spec: None,
-            dose_attr_map: Default::default(),
-            diffusion_theta_start: None,
-            diffusion_state_indices: Vec::new(),
-            bloq_method: BloqMethod::Drop,
-            referenced_covariates: Vec::new(),
-            gradient_method: GradientMethod::default(),
-            parse_warnings: Vec::new(),
-            has_conditional_eta_params: false,
-            eta_param_info: Vec::new(),
-            kappa_param_types: Vec::new(),
-            theta_transform: Vec::new(),
-            theta_eta_linked: Vec::new(),
-            n_kappa: 0,
-            kappa_names: Vec::new(),
-            kappa_mu_refs: HashMap::new(),
-            indiv_param_names: vec!["CL".into(), "V".into()],
-            indiv_param_partials: crate::types::IndivParamPartials::empty(),
-            #[cfg(feature = "nn")]
-            covariate_nns: Vec::new(),
-            scaling: ScalingSpec::None,
-            log_transform: false,
-            dv_pre_logged: false,
-            derived_exprs: vec![],
-            output_columns: vec![],
-            #[cfg(feature = "survival")]
-            endpoints: std::collections::BTreeMap::new(),
-            frem_config: None,
-            residual_error_eta: None,
-            analytical_init: Vec::new(),
-            analytic_readout: None,
-            ruv_magnitude: None,
-            absorption_ode_equivalent: None,
-            mixture: None,
+                ..crate::types::test_helpers::bare_params(make_omega(0.09))
+            })
         }
     }
 
@@ -6701,34 +6612,13 @@ mod tests {
     #[test]
     fn compute_cwres_does_not_scale_frem_rows_by_iiv_on_ruv() {
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
-            doses: Vec::new(),
             obs_times: vec![1.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: vec![11.0, 21.0],
             obs_cmts: vec![1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 100],
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.5]);
@@ -6898,34 +6788,13 @@ mod tests {
         // With H = 0 the SB prediction f0 = ipred and R_tilde = R (diagonal), so
         // for additive error CWRES_j = (y_j − f_j) / (m_j·σ).
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
-            doses: Vec::new(),
             obs_times: vec![1.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: vec![12.0, 22.0],
             obs_cmts: vec![1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
             fremtype: vec![0, 0],
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ipreds = vec![10.0, 20.0];
         let eta_hat = DVector::from_vec(vec![0.0]);
@@ -9368,7 +9237,6 @@ pub(crate) fn conditional_obs_nll_from_preds(
 #[cfg(test)]
 mod conditional_obs_terms_tests {
     use super::*;
-    use std::collections::HashMap;
 
     /// #2266: the per-record terms `W_NONFINITE_OBJECTIVE` names a record by sum to
     /// the FOCEI scorer's data term. At η̂ = 0 with `H = 0` the scorer
@@ -9401,34 +9269,13 @@ mod conditional_obs_terms_tests {
         .expect("parse");
         assert!(model.is_sde(), "premise: an SDE model");
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0, 8.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.6, 1.5, 1.2, 0.9],
             obs_cmts: vec![1; 4],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let p = &model.default_params;
         let eta = DVector::zeros(model.n_eta);

@@ -2467,20 +2467,14 @@ mod tests {
             names: vec!["sigma_prop".into()],
         };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![10.0, 100.0],
             theta_names: vec!["cl".into(), "v".into()],
             theta_lower: vec![0.01, 0.01],
             theta_upper: vec![1000.0, 10000.0],
-            theta_fixed: vec![false; 2],
-            omega,
             omega_fixed: vec![false; 2],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
@@ -3496,20 +3490,15 @@ mod tests {
             names: vec!["sigma_prop".into()],
         };
         let template = ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, -0.8, -0.01],
             theta_names: vec!["tvcl".into(), "gamma".into(), "age_eff".into()],
             theta_lower: vec![0.1, -3.0, -1.0],
             theta_upper: vec![100.0, 3.0, 1.0],
             theta_fixed: vec![false; 3],
-            omega,
             omega_fixed: vec![false; 1],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         };
         let packed = pack_params(&template);
         // theta[0] is sign-constrained (lower=0.1) → log-packed.
@@ -3662,20 +3651,14 @@ mod tests {
             names: vec!["sigma_prop".into()],
         };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![10.0, 100.0],
             theta_names: vec!["cl".into(), "v".into()],
             theta_lower: vec![0.01, 0.01],
             theta_upper: vec![1000.0, 10000.0],
-            theta_fixed: vec![false; 2],
-            omega,
             omega_fixed: vec![false; 2],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
@@ -3717,23 +3700,17 @@ mod tests {
     /// (2,2)=7, σ=8.
     fn block_plus_diag_template() -> ModelParameters {
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 2.0],
             theta_names: vec!["a".into(), "b".into()],
             theta_lower: vec![0.0, 0.0],
             theta_upper: vec![10.0, 10.0],
             theta_fixed: vec![false, false],
-            omega: make_block_plus_diag_omega(),
             omega_fixed: vec![false, false, false],
             sigma: SigmaVector {
                 values: vec![0.3],
                 names: vec!["s".into()],
             },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(make_block_plus_diag_omega())
         }
     }
 
@@ -3780,23 +3757,21 @@ mod tests {
     ///   iov packed offset 3: (0,0)=3 (1,0)=4 (2,0)=5 (1,1)=6 (2,1)=7 (2,2)=8
     fn block_plus_diag_iov_template() -> ModelParameters {
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
             theta_names: vec!["a".into()],
             theta_lower: vec![0.0],
             theta_upper: vec![10.0],
             theta_fixed: vec![false],
-            omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
-            omega_fixed: vec![false],
             sigma: SigmaVector {
                 values: vec![0.3],
                 names: vec!["s".into()],
             },
-            sigma_fixed: vec![false],
             omega_iov: Some(make_block_plus_diag_omega()),
             kappa_fixed: vec![false, false, false],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                &[0.09],
+                vec!["ETA_CL".into()],
+            ))
         }
     }
 
@@ -4124,23 +4099,17 @@ mod tests {
         m[(1, 0)] = 0.02;
         let omega = OmegaMatrix::from_matrix(m, vec![String::new(), String::new()], false);
         let t = ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
             theta_names: vec![String::new()],
             theta_lower: vec![0.0],
             theta_upper: vec![10.0],
             theta_fixed: vec![false],
-            omega,
             omega_fixed: vec![false, false],
             sigma: SigmaVector {
                 values: vec![0.3],
                 names: vec![String::new()],
             },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         };
         let names = coordinate_names(&t);
         assert_eq!(
@@ -4182,10 +4151,7 @@ mod tests {
 
     // ── mu-referencing helpers ──────────────────────────────────────────
 
-    use crate::types::{
-        BloqMethod, CompiledModel, ErrorModel, GradientMethod, MuRef, PkModel, PkParams,
-        ScalingSpec,
-    };
+    use crate::types::{CompiledModel, GradientMethod, MuRef, PkParams};
     use std::collections::HashMap;
 
     /// Build a minimal CompiledModel with the given mu-refs. Only fields
@@ -4214,55 +4180,28 @@ mod tests {
             names: vec!["PROP_ERR".into()],
         };
         let default_params = ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![0.2, 10.0, 1.5],
             theta_names: theta_names.clone(),
             theta_lower: vec![0.001, 0.1, 0.01],
             theta_upper: vec![10.0, 500.0, 50.0],
             theta_fixed: vec![false; 3],
-            omega,
             omega_fixed: vec![false; 3],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         };
         CompiledModel {
-            plan_id: Default::default(),
-            residual_serial: None,
-            priors: Vec::new(),
-            prior_from_fit: None,
-            covariate_model: None,
-            name: "test".into(),
-            pk_model: PkModel::OneCptIv,
-            error_model: ErrorModel::Proportional,
-            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
-            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
             n_theta: 3,
             n_eta: 3,
-            n_epsilon: 1,
             theta_names,
             eta_names,
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
-            indiv_param_partials: crate::types::IndivParamPartials::empty(),
-            default_params,
             omega_init_as_sd: vec![false; 3],
-            sigma_init_as_sd: vec![false],
-            kappa_init_as_sd: Vec::new(),
-            kappa_weights: Vec::new(),
             mu_refs: refs,
-            covariate_mu_refs: Vec::new(),
-            kappa_mu_refs: HashMap::new(),
-            tv_fn: None,
             pk_indices: vec![0, 1, 4],
-
             eta_map: (0..3).map(|i| i as i32).collect(),
-
             pk_idx_f64: vec![0.0, 1.0, 4.0],
-
             sel_flat: {
                 let mut v = vec![0.0f64; 3 * 3];
                 for i in 0..3 {
@@ -4270,37 +4209,8 @@ mod tests {
                 }
                 v
             },
-            ode_spec: None,
-            dose_attr_map: Default::default(),
-            diffusion_theta_start: None,
-            diffusion_state_indices: Vec::new(),
-            bloq_method: BloqMethod::Drop,
-            referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
-            parse_warnings: Vec::new(),
-            has_conditional_eta_params: false,
-            eta_param_info: Vec::new(),
-            kappa_param_types: Vec::new(),
-            theta_transform: Vec::new(),
-            theta_eta_linked: Vec::new(),
-            n_kappa: 0,
-            kappa_names: Vec::new(),
-            #[cfg(feature = "nn")]
-            covariate_nns: Vec::new(),
-            scaling: ScalingSpec::None,
-            log_transform: false,
-            dv_pre_logged: false,
-            derived_exprs: vec![],
-            output_columns: vec![],
-            #[cfg(feature = "survival")]
-            endpoints: std::collections::BTreeMap::new(),
-            frem_config: None,
-            residual_error_eta: None,
-            analytical_init: Vec::new(),
-            analytic_readout: None,
-            ruv_magnitude: None,
-            absorption_ode_equivalent: None,
-            mixture: None,
+            ..crate::types::test_helpers::bare_model(default_params)
         }
     }
 
@@ -4561,20 +4471,15 @@ mod tests {
             names: vec!["PROP_ERR".into()],
         };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.01],
             theta_upper: vec![100.0],
             theta_fixed: vec![false],
-            omega,
-            omega_fixed: vec![false],
             sigma,
-            sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
@@ -4717,20 +4622,15 @@ mod tests {
             names: vec!["PROP_ERR".into()],
         };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![0.2],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.01],
             theta_upper: vec![100.0],
             theta_fixed: vec![false],
-            omega,
-            omega_fixed: vec![false],
             sigma,
-            sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false, false],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
