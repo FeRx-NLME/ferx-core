@@ -246,34 +246,23 @@ impl MlpMapper {
         self.jacobian_impl(x, weights, false)
     }
 
-    /// Jacobian of the output layer's **pre-activations** `z_L` vs the flat
-    /// weight vector, shape `(n_outputs × n_weights)`. Identical to
-    /// [`jacobian`](Self::jacobian) except the backward sweep is seeded at
-    /// `z_L` rather than at `a_L = f(z_L)`, so the output activation's
-    /// derivative is not applied. When `output_activation` is
-    /// [`Activation::Identity`] the two agree exactly.
+    /// Jacobian of the output layer's **pre-activations** `z_L` vs the flat weight vector, shape
+    /// `(n_outputs × n_weights)`. Identical to [`jacobian`](Self::jacobian) except the backward sweep is
+    /// seeded at `z_L` rather than at `a_L = f(z_L)`, so the output activation's derivative is not
+    /// applied; for [`Activation::Identity`] the two agree exactly.
     ///
-    /// # Why this variant exists
-    ///
-    /// It is the exact chain-rule bridge used by
-    /// `crate::estimation::fixed_eta_gradient` to get `∂NLL/∂w` for every NN
-    /// weight from just `n_outputs` finite-difference evaluations. Because
-    /// `z_k = (W_L a_{L-1} + b_L)_k` depends on the output-layer bias `b_k`
-    /// with `∂z_k/∂b_k = 1` exactly (and `∂z_j/∂b_k = 0` for `j ≠ k`), a
-    /// finite difference of the objective in `b_k` *is* `∂NLL/∂z_k`. Then
+    /// It is the exact chain-rule bridge `crate::estimation::fixed_eta_gradient` uses to get `∂NLL/∂w`
+    /// for every NN weight from just `n_outputs` finite-difference evaluations: since
+    /// `z_k = (W_L a_{L-1} + b_L)_k` has `∂z_k/∂b_k = 1` exactly (and `∂z_j/∂b_k = 0` for `j ≠ k`), a
+    /// finite difference of the objective in `b_k` *is* `∂NLL/∂z_k`, and
     ///
     /// ```text
     /// ∂NLL/∂w_j = Σ_k (∂NLL/∂z_k) · (∂z_k/∂w_j)
     /// ```
     ///
-    /// with the second factor read straight off this matrix.
-    ///
-    /// Seeding at `z_L` instead of `a_L` is what keeps that identity
-    /// unconditional. The post-activation form would need a division by
-    /// `f'(z_k)`, which is unusable exactly where it matters — a saturated
-    /// `Softplus`/`Sigmoid` head drives `f'(z_k) → 0`, and the recovered
-    /// derivative would be `0/0` in floating point. Here the factor never
-    /// appears: it cancels analytically between the seed and the chain.
+    /// with the second factor read off this matrix. Seeding at `z_L` keeps that unconditional; the
+    /// post-activation form would divide by `f'(z_k)`, which is `0/0` where it matters (a saturated
+    /// `Softplus`/`Sigmoid` head drives `f'(z_k) → 0`). Here the factor cancels analytically.
     pub fn jacobian_preactivation(
         &self,
         x: &[f64],
@@ -515,22 +504,17 @@ impl MlpMapper {
 
     /// One-pass curvature kernel: value, plus whatever `sink` asks for.
     ///
-    /// Each grid axis is a uniform sweep of nodes `x_0 … x_{n−1}` in the
-    /// network's own input space (see [`CurvatureGrid`]), and every interior
-    /// node `k` contributes `C_k = f(x_{k+1}) − 2·f(x_k) + f(x_{k−1})` per
-    /// output. The network is evaluated **once per node** — adjacent stencils
-    /// share nodes, so this is `n` evaluations per axis rather than `3(n−2)` —
-    /// and when a derivative is wanted the output is read off the same backward
-    /// sweep that produces the Jacobian ([`jacobian_with_output`](Self::jacobian_with_output)),
-    /// so no separate forward pass runs.
+    /// Each grid axis is a uniform sweep of nodes `x_0 … x_{n−1}` in the network's own input space (see
+    /// [`CurvatureGrid`]), and every interior node `k` contributes `C_k = f(x_{k+1}) − 2·f(x_k) +
+    /// f(x_{k−1})` per output. The network is evaluated **once per node** (adjacent stencils share
+    /// nodes: `n` evaluations per axis rather than `3(n−2)`), and a derivative is read off the same
+    /// backward sweep that produces the Jacobian ([`jacobian_with_output`](Self::jacobian_with_output)).
     ///
-    /// Gradient: `∂C/∂w = J(x_{k+1}) − 2·J(x_k) + J(x_{k−1})`, so
-    /// `∂pen/∂w = Σ 2·lambda·C·∂C/∂w`. Touches bias entries too (biases shift
-    /// the curve), unlike the L2 term. Hessian: the Gauss–Newton form
-    /// `2·lambda·Σ (∂C/∂w)(∂C/∂w)ᵀ`, which drops the `C·∂²C/∂w²` term — positive
-    /// semi-definite by construction and exact at `C = 0`, i.e. at the flat map
-    /// the penalty pulls toward, which is the regime a trust-region / BHHH
-    /// consumer needs it in. `lambda == 0.0` or an empty grid touches nothing.
+    /// Gradient: `∂C/∂w = J(x_{k+1}) − 2·J(x_k) + J(x_{k−1})`, so `∂pen/∂w = Σ 2·lambda·C·∂C/∂w`;
+    /// biases are touched too (they shift the curve), unlike the L2 term. Hessian: the Gauss–Newton form
+    /// `2·lambda·Σ (∂C/∂w)(∂C/∂w)ᵀ`, dropping `C·∂²C/∂w²`: positive semi-definite by construction and
+    /// exact at `C = 0`, the flat map the penalty pulls toward (the regime a trust-region / BHHH consumer
+    /// needs). `lambda == 0.0` or an empty grid touches nothing.
     pub(crate) fn curvature_penalty_accum(
         &self,
         weights: &[f64],
@@ -854,25 +838,19 @@ pub struct NamedMlpMapper {
     /// Per-input location subtracted before the forward pass (`center` in the
     /// `[covariate_nn]` block). All zeros unless the model declares otherwise.
     input_center: Vec<f64>,
-    /// Per-input scale divided out after centering (`scale` in the block). All ones
-    /// unless the model declares otherwise; entries are validated non-zero and finite at
-    /// parse time.
+    /// Per-input scale divided out after centering (`scale` in the block). All ones unless declared;
+    /// entries are validated non-zero and finite at parse time.
     ///
-    /// # Why this is declared rather than estimated from the data
+    /// Declared rather than estimated from the data: a network fed raw covariates is badly conditioned
+    /// (`WT ≈ 70` and `CRCL ≈ 86` saturate a `tanh` layer at Glorot initialisation, and the optimizer
+    /// escapes only by driving first-layer weights tiny while later layers grow). Measured on a
+    /// two-covariate DCM, unnormalised inputs pushed weights to ~1e11 and the residual error to 15× its
+    /// true value; standardised inputs stayed inside `[-1.3, 1.6]`.
     ///
-    /// A network fed raw covariates is badly conditioned: `WT ≈ 70` and `CRCL ≈ 86`
-    /// saturate a `tanh` layer at Glorot initialisation, and the optimizer's only escape
-    /// is to drive the first-layer weights to tiny values while later layers grow to
-    /// compensate. Measured on a two-covariate DCM, unnormalised inputs pushed weights to
-    /// ~1e11 and the residual error to 15× its true value; the same model with
-    /// standardised inputs stayed inside `[-1.3, 1.6]`.
-    ///
-    /// The constants live in the model file, not in fitted state, for two reasons.
-    /// `fit()` takes `&CompiledModel`, so statistics derived from the estimation data
-    /// could not be written back for `predict()` to reuse — and recomputing them on new
-    /// data would silently change the model between fitting and prediction, the classic
-    /// train/serve skew. Declaring them also matches how population PK already writes
-    /// normalisation down (`(WT/70)^0.75` names its reference weight), and keeps the
+    /// The constants live in the model file, not in fitted state: `fit()` takes `&CompiledModel`, so
+    /// statistics derived from the estimation data could not be written back for `predict()`, and
+    /// recomputing them on new data would change the model between fitting and prediction (train/serve
+    /// skew). It also matches how population PK writes normalisation down (`(WT/70)^0.75`) and keeps the
     /// model file a complete description of the transform.
     input_scale: Vec<f64>,
 }
@@ -998,36 +976,26 @@ impl NamedMlpMapper {
         &self.input_names
     }
 
-    /// Forward pass returning the raw output vector in *declaration order*
-    /// (the order of `output_names`), without routing through `PkParams`.
-    ///
-    /// `forward` writes results into PK slots via `name_to_index`, which is
-    /// what the fit / predict / simulate paths ultimately want. The parser,
-    /// however, needs to look up outputs by their position in the
-    /// `[covariate_nn]` block's `outputs` list (so the AST can carry a tiny
-    /// `output_idx` rather than a string slot name). This method is the
+    /// Forward pass returning the raw output vector in *declaration order* (the order of
+    /// `output_names`), without routing through `PkParams`. `forward` writes into PK slots via
+    /// `name_to_index` (what fit / predict / simulate want); the parser needs outputs by position in the
+    /// `[covariate_nn]` `outputs` list (so the AST carries a tiny `output_idx`), hence this
     /// parser-facing variant.
     ///
-    /// Missing covariates are substituted with `0.0` to match the rest of the
-    /// parser's expression evaluator (which uses `unwrap_or(0.0)` for missing
-    /// covariate lookups). The remaining error variants — `WeightCountMismatch`
-    /// / `InputCountMismatch` — only fire on genuine wiring bugs, so callers
-    /// can typically `.expect(...)` the result.
+    /// Missing covariates are substituted with `0.0`, matching the parser's expression evaluator
+    /// (`unwrap_or(0.0)`). The remaining error variants (`WeightCountMismatch` / `InputCountMismatch`)
+    /// only fire on wiring bugs, so callers can typically `.expect(...)`.
     ///
-    /// **The zero-fill is not the guard against a bad input name.** Silently
-    /// substituting `0.0` degenerates the network to a constant — a typo'd input would
-    /// otherwise produce a plausible-looking fit that learned nothing. What prevents
-    /// that is `api::check_covariates` at fit time, which sees `[covariate_nn]` inputs
-    /// only because the parser registers them in `referenced_covariates` — that
-    /// registration exists for this reason as much as for time-varying covariates.
-    /// Keep the two together: dropping the registration re-opens that failure silently.
+    /// **The zero-fill is not the guard against a bad input name** (a typo'd input would degenerate the
+    /// network to a constant and give a plausible-looking fit that learned nothing). That is
+    /// `api::check_covariates` at fit time, which sees `[covariate_nn]` inputs only because the parser
+    /// registers them in `referenced_covariates`; keep the two together, or the failure reopens silently.
     ///
-    /// `inputs = [TIME]` is **not** refused by that check on a model-aware file read:
-    /// every column the model references is read, with or without `[covariates]`
-    /// (#1936), so a `TIME` header arrives as a per-record covariate and the network
-    /// sees it. Only an in-memory population lacking `TIME`, or a model-free
-    /// `read_nonmem_csv*` one, is refused. Whether NN `TIME` should be refused on
-    /// every path is open (#1942).
+    /// `inputs = [TIME]` is **not** refused by that check on a model-aware file read: every column the
+    /// model references is read, with or without `[covariates]` (#1936), so a `TIME` header arrives as a
+    /// per-record covariate. Only an in-memory population lacking `TIME`, or a model-free
+    /// `read_nonmem_csv*` one, is refused. Whether NN `TIME` should be refused on every path is open
+    /// (#1942).
     pub fn forward_raw(
         &self,
         weights: &[f64],
@@ -1181,19 +1149,12 @@ impl CovariateMapper for NamedMlpMapper {
 
 /// One instance of a `[covariate_nn NAME]` block, stored on `CompiledModel`.
 ///
-/// The parser builds this and:
-///
-/// 1. registers the mapper's `n_weights()` weights as plain thetas in the
-///    optimizer parameter vector, with names of the form
-///    `W_<NAME>_<l>_<i>_<j>` / `B_<NAME>_<l>_<i>` (uppercased), starting
-///    at index [`weights_offset`](Self::weights_offset);
-/// 2. stores the resulting handle here so the fit / predict / simulate
-///    paths can slice out the relevant weights at runtime via
-///    `&theta[weights_offset..weights_offset + n_weights]`.
-///
-/// Multiple `[covariate_nn]` blocks per model are syntactically allowed by
-/// the parser (the `named` block map keys them by `NAME`), though Phase A M1
-/// only exercises the single-block case end-to-end.
+/// The parser builds this and (1) registers the mapper's `n_weights()` weights as plain thetas in
+/// the optimizer parameter vector, named `W_<NAME>_<l>_<i>_<j>` / `B_<NAME>_<l>_<i>` (uppercased),
+/// starting at [`weights_offset`](Self::weights_offset); (2) stores the handle here so fit / predict /
+/// simulate can slice `&theta[weights_offset..weights_offset + n_weights]` at runtime. Multiple
+/// `[covariate_nn]` blocks per model are syntactically allowed (the `named` block map keys them by
+/// `NAME`), though Phase A M1 only exercises the single-block case end-to-end.
 #[derive(Debug, Clone)]
 pub struct CovariateNn {
     /// User-visible identifier from the block header (e.g. `TYPICAL_PK`).
@@ -1242,30 +1203,23 @@ impl<'a> PenaltySink<'a> {
 
 /// A marginal partial-dependence grid for the smoothness/curvature penalty.
 ///
-/// For each NN input in turn, the input is swept across its observed range in
-/// **z-scored** space (uniform step `NN_SMOOTH_GRID_STEP_Z`, in units of that
-/// input's observed sd) while every other input is held at its median. Every
-/// interior node `k` of a sweep contributes one stencil
-/// `C = f(x_{k+1}) − 2·f(x_k) + f(x_{k−1})`. The grid mirrors the
-/// partial-dependence curves used in downstream diagnostics, so the penalty
-/// smooths exactly what those plots show.
+/// For each NN input in turn, the input is swept across its observed range in **z-scored** space
+/// (uniform step `NN_SMOOTH_GRID_STEP_Z`, in units of that input's observed sd) while every other
+/// input is held at its median. Every interior node `k` of a sweep contributes one stencil
+/// `C = f(x_{k+1}) − 2·f(x_k) + f(x_{k−1})`. The grid mirrors the partial-dependence curves used in
+/// downstream diagnostics, so the penalty smooths exactly what those plots show.
 ///
-/// **The grid lives in the network's input space, not in raw covariate
-/// space.** [`NamedMlpMapper`] feeds its MLP `(x − center) / scale` on every
-/// prediction (`build_input_vec_zero_fill`), so the values handed to
-/// [`build`](Self::build) are already normalised the same way
-/// ([`collect_input_values`]), and the node vectors go straight into
-/// [`MlpMapper::forward`] / [`MlpMapper::jacobian`] — the same function the fit
-/// evaluates, at the same inputs. A grid built on raw covariates would probe the
-/// network where the fit never runs it: with `center = [70, 86]`, `scale = [12,
-/// 23]` the fit sees `z ∈ ≈[−2, 2]` while raw `WT ∈ [45, 90]` saturates every
-/// `tanh` unit, so `C ≈ 0` and the penalty is a silent no-op on exactly the
-/// normalised models it targets.
+/// **The grid lives in the network's input space, not in raw covariate space.** [`NamedMlpMapper`]
+/// feeds its MLP `(x − center) / scale` on every prediction (`build_input_vec_zero_fill`), so the
+/// values handed to [`build`](Self::build) are normalised the same way ([`collect_input_values`]) and
+/// the node vectors go straight into [`MlpMapper::forward`] / [`MlpMapper::jacobian`]. A grid on raw
+/// covariates would probe the network where the fit never runs it: with `center = [70, 86]`,
+/// `scale = [12, 23]` the fit sees `z ∈ ≈[−2, 2]` while raw `WT ∈ [45, 90]` saturates every `tanh`
+/// unit, so `C ≈ 0` and the penalty is a silent no-op on exactly the normalised models it targets.
 ///
-/// Node count per axis is capped at `NN_SMOOTH_GRID_MAX_NODES`; an axis whose
-/// observed z-span would need more nodes at the default step gets a **coarser
-/// step** over the full span rather than a truncated sweep, so the upper tail of
-/// a wide-range covariate is never silently left unpenalised.
+/// Node count per axis is capped at `NN_SMOOTH_GRID_MAX_NODES`; an axis whose z-span would need more
+/// nodes at the default step gets a **coarser step** over the full span rather than a truncated
+/// sweep, so the upper tail of a wide-range covariate is never left unpenalised.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CurvatureGrid {
     /// One sweep per usable input axis: the node input vectors (length
@@ -1384,26 +1338,21 @@ fn median_of_sorted(sorted: &[f64]) -> f64 {
     }
 }
 
-/// Collect the observed values of each of a mapper's named inputs across the
-/// population, in the mapper's input order and **normalised the way the mapper
-/// feeds them to its MLP** (`(x − center) / scale`, [`NamedMlpMapper::normalize`])
-/// — so the grid built from them lives in the space the fit actually evaluates
-/// the network in. Missing covariates are skipped (they never contribute a
-/// value); a subject's `NaN` placeholder for a column it has no finite value in
-/// passes through and is dropped by [`CurvatureGrid::build`].
+/// Collect the observed values of each of a mapper's named inputs across the population, in the
+/// mapper's input order and **normalised the way the mapper feeds them to its MLP**
+/// (`(x − center) / scale`, [`NamedMlpMapper::normalize`]), so the grid lives in the space the fit
+/// evaluates the network in. Missing covariates are skipped; a subject's `NaN` placeholder for a
+/// column it has no finite value in passes through and is dropped by [`CurvatureGrid::build`].
 ///
-/// **Every covariate snapshot the model reads is a source**, not just the
-/// subject-static baseline. A time-varying NN input reaches the network through
-/// the per-event LOCF maps (`obs_covariates`, `dose_covariates`,
-/// `pk_only_covariates`, and the EVID=3/4 `reset_covariates` — the same four
-/// [`crate::types::Subject::time_varying_covariate_names`] scans), so those are what the sweep
-/// has to span: a population whose every subject *starts* at the same value but
-/// moves later has zero baseline spread, and a baseline-only grid would drop the
-/// axis and leave the whole traversed range unpenalised. The snapshots are
-/// deduplicated **per subject** (LOCF copies are bit-identical, so exact
-/// equality is the right test), so a subject contributes one entry per distinct
-/// value it actually visits rather than one per record — a densely-sampled
-/// subject does not out-vote the others in the axis' mean / sd / median.
+/// **Every covariate snapshot the model reads is a source**, not just the subject-static baseline.
+/// A time-varying NN input reaches the network through the per-event LOCF maps (`obs_covariates`,
+/// `dose_covariates`, `pk_only_covariates`, and the EVID=3/4 `reset_covariates`, the same four
+/// [`crate::types::Subject::time_varying_covariate_names`] scans), so those are what the sweep must
+/// span: a population whose every subject *starts* at the same value but moves later has zero
+/// baseline spread, and a baseline-only grid would drop the axis and leave the traversed range
+/// unpenalised. Snapshots are deduplicated **per subject** (LOCF copies are bit-identical, so exact
+/// equality is right), so a densely-sampled subject does not out-vote the others in the axis' mean /
+/// sd / median.
 fn collect_input_values(mapper: &NamedMlpMapper, population: &Population) -> Vec<Vec<f64>> {
     let names = mapper.input_names();
     let mut values: Vec<Vec<f64>> = vec![Vec::new(); names.len()];
@@ -1432,22 +1381,18 @@ fn collect_input_values(mapper: &NamedMlpMapper, population: &Population) -> Vec
     values
 }
 
-/// Per-network regularization state, built once before the optimize loop and
-/// shared (by reference) across every objective/gradient evaluation.
-///
-/// Holds a cheap clone of each NN's inner [`MlpMapper`], the theta offset of
-/// its weight block, and (when smoothness is on) its prebuilt
-/// [`CurvatureGrid`]. Built with no specs — so every method is a no-op that
-/// touches nothing — unless at least one λ is positive, and each kernel is
+/// Per-network regularization state, built once before the optimize loop and shared (by reference)
+/// across every objective/gradient evaluation. Holds a cheap clone of each NN's inner [`MlpMapper`],
+/// the theta offset of its weight block, and (when smoothness is on) its prebuilt [`CurvatureGrid`].
+/// Built with no specs (every method a no-op) unless at least one λ is positive, and each kernel is
 /// itself a no-op at `λ == 0.0`, so an unregularized fit adds nothing.
 ///
-/// The penalty is applied to the **optimizer's** objective only. `theta` is the
-/// full natural-space theta vector; NN weights are identity-packed (the parser
-/// gives them `theta_lower = −∞`), so a natural-space weight coordinate *is* a
-/// packed coordinate and the raw-weight gradient / Hessian map one-to-one onto
-/// packed indices. The outer optimizers' per-coordinate `scale[k]` is applied
-/// by the caller on the assembled packed gradient, exactly as it is to the
-/// likelihood part — the penalty needs no separate Jacobian-of-scaling factor.
+/// The penalty is applied to the **optimizer's** objective only. `theta` is the full natural-space
+/// vector; NN weights are identity-packed (the parser gives them `theta_lower = −∞`), so a
+/// natural-space weight coordinate *is* a packed coordinate and the raw-weight gradient / Hessian map
+/// one-to-one onto packed indices. The outer optimizers' per-coordinate `scale[k]` is applied by the
+/// caller on the assembled packed gradient, as for the likelihood part, so the penalty needs no
+/// separate Jacobian-of-scaling factor.
 #[derive(Debug, Clone)]
 pub(crate) struct NnRegularizer {
     l2_lambda: f64,
@@ -3257,16 +3202,14 @@ mod regularizer_fit_tests {
         );
     }
 
-    /// Growing the L2 strength shrinks the NN weights, flattening the learned
-    /// covariate→modulator curve.
+    /// Growing the L2 strength shrinks the NN weights, flattening the learned covariate→modulator curve.
     ///
-    /// **The start is part of the fixture (#1561).** Without its `init` line the
-    /// fixture starts every output at `softplus(0) = 0.693` (true CL 5, V1 50, Q 10,
-    /// V2 100, KA 1.2). From there the λ = 0 fit reported `converged = true` at data
-    /// OFV −234.14, and the λ = 1000 fit stopped at a covariate-free point of
-    /// −1173.56. Both were poor optima, and the cross-optimality check below failed
-    /// on the λ = 0 fit. With `init` declared, as the `[covariate_nn]` docs say to do
-    /// on every DCM, the same three fits measure (macOS/arm64, `ci-test`, one thread):
+    /// **The start is part of the fixture (#1561).** Without its `init` line every output starts at
+    /// `softplus(0) = 0.693` (true CL 5, V1 50, Q 10, V2 100, KA 1.2): the λ = 0 fit reported
+    /// `converged = true` at data OFV −234.14 and the λ = 1000 fit stopped at a covariate-free −1173.56,
+    /// both poor optima (the cross-optimality check below failed on the λ = 0 fit). With `init` declared,
+    /// as the `[covariate_nn]` docs say to do on every DCM, the same fits measure (macOS/arm64,
+    /// `ci-test`, one thread):
     ///
     /// | λ | data OFV | ‖W‖² |
     /// |---|---|---|
@@ -3274,52 +3217,37 @@ mod regularizer_fit_tests {
     /// | 5 | −1196.52 | 1.373 |
     /// | 1000 | −1185.46 | 7.4e-12 |
     ///
-    /// The λ = 5 point is the same −1196.517 from three different declared starts
-    /// (this one, the simulation's true values, and a start at 40% of them). The
-    /// bare start is also warned about at fit time now (`W_NN_BARE_OUTPUT_START`).
+    /// The λ = 5 point is the same −1196.517 from three declared starts (this one, the simulation's true
+    /// values, and 40% of them). The bare start is also warned about at fit time (`W_NN_BARE_OUTPUT_START`).
     ///
-    /// `two_cpt_oral_cov` is **not** a null-covariate dataset: it was simulated
-    /// with `(WT/70)^θ` on CL and V1 and `(CRCL/100)^θ` on CL
-    /// (`src/bin/generate_data.rs`), and this NN maps (WT, CRCL) → the typical PK
-    /// parameters. With every weight at zero each hidden unit is constant and the
-    /// network collapses to a covariate-free typical value. That is also a stationary
-    /// point of the data objective, because constant hidden units zero the weight
-    /// gradient, so a fit can stop there.
+    /// `two_cpt_oral_cov` is **not** a null-covariate dataset: it was simulated with `(WT/70)^θ` on CL and
+    /// V1 and `(CRCL/100)^θ` on CL (`src/bin/generate_data.rs`), and this NN maps (WT, CRCL) → the typical
+    /// PK parameters. With every weight at zero each hidden unit is constant and the network collapses to a
+    /// covariate-free typical value, also a stationary point of the data objective (constant hidden units
+    /// zero the weight gradient), so a fit can stop there.
     ///
-    /// The test used to assert that λ = 5 *and* λ = 100 both reach a ~1e-4 norm
-    /// floor. That tested which basin each fit stopped in, not what L2 does, and it
-    /// flipped with unrelated changes to the inner solve (#1389, #1474) and with the
-    /// toolchain.
-    ///
-    /// What is asserted is what a correct optimizer must produce:
+    /// The test once asserted that λ = 5 *and* λ = 100 both reach a ~1e-4 norm floor, which tested which
+    /// basin each fit stopped in, not what L2 does, and flipped with unrelated changes (#1389, #1474) and
+    /// the toolchain. What is asserted is what a correct optimizer must produce:
     ///
     /// 1. every fit converges;
     /// 2. the λ = 0 fit has weights and CL-modulator spread for L2 to remove;
-    /// 3. **cross-optimality**: under its own λ, each fit's penalized objective is no
-    ///    worse than any other fitted point's. This is a necessary condition of a
-    ///    minimum. It is computed from the three fits alone, because the reported
-    ///    `ofv` excludes the penalty and so does not depend on λ (verified by
-    ///    re-scoring one θ at λ = 0, 5 and 100);
-    /// 4. the mid λ shrinks the weights by orders of magnitude and reduces the
-    ///    modulator spread, while the heavy λ flattens both to the floor.
-    ///    `LAMBDA_BIG = 1000` is far above the λ ≈ 8 at which the zero-weight point
-    ///    first beats the λ = 5 point ((−1185.46 + 1196.52) / 1.373).
+    /// 3. **cross-optimality**: under its own λ, each fit's penalized objective is no worse than any other
+    ///    fitted point's (a necessary condition of a minimum). Computed from the three fits alone, because
+    ///    the reported `ofv` excludes the penalty and so does not depend on λ (verified by re-scoring one
+    ///    θ at λ = 0, 5 and 100);
+    /// 4. the mid λ shrinks the weights by orders of magnitude and reduces the modulator spread, while the
+    ///    heavy λ flattens both to the floor. `LAMBDA_BIG = 1000` is far above the λ ≈ 8 at which the
+    ///    zero-weight point first beats the λ = 5 point ((−1185.46 + 1196.52) / 1.373).
     ///
-    /// Gated with `#[cfg]` rather than the usual Tier-3
-    /// `#[cfg_attr(not(feature = "slow-tests"), ignore = "…")]`, because this
-    /// test lives in `src/` — which codecov measures — instead of `tests/`,
-    /// which `codecov.yml` ignores wholesale. An `#[ignore]`d body is compiled
-    /// but never run, so on a PR (where slow-tests never run) its ~50 lines
-    /// would read as uncovered and drag the patch gate under its 90% floor.
-    /// Compiling it out instead makes it a measurement gap rather than a miss,
-    /// the same way the rest of the feature-gated surface behaves (#293).
-    ///
-    /// Bit-rot is caught on every PR by `cargo check --tests --no-default-features
-    /// --features ci,nn,slow-tests` (preflight check matrix and the CI `Check`
-    /// job), and the body actually *runs* nightly: `slow-tests.yml` passes
-    /// `ferx-core/nn` alongside `ferx-core/slow-tests` for exactly this
-    /// `nn` + `slow-tests` family (it once passed no `nn`, which left every DCM
-    /// Tier-3 fit — this one included — running in no CI job at all).
+    /// Gated with `#[cfg]` rather than the usual Tier-3 `#[cfg_attr(not(feature = "slow-tests"), ignore =
+    /// "…")]`: the test lives in `src/` (measured by codecov) rather than `tests/` (ignored wholesale), and
+    /// an `#[ignore]`d body is compiled but never run, so on a PR its ~50 lines would read as uncovered
+    /// and drag the patch gate under its 90% floor. Compiling it out makes it a measurement gap, as for
+    /// the rest of the feature-gated surface (#293). Bit-rot is caught on every PR by
+    /// `cargo check --tests --no-default-features --features ci,nn,slow-tests`, and the body *runs*
+    /// nightly: `slow-tests.yml` passes `ferx-core/nn` alongside `ferx-core/slow-tests` (once it passed no
+    /// `nn`, leaving every DCM Tier-3 fit running in no CI job).
     #[test]
     #[cfg(feature = "slow-tests")]
     fn l2_shrinks_weights_and_modulator_variation() {
@@ -3495,31 +3423,24 @@ mod regularizer_fit_tests {
         }
     }
 
-    /// The abort behind #1277's reopen, caught on a 44-eval budget at PR time
-    /// (#1428; the test is #1411's, ported onto the #1414 restart).
+    /// The abort behind #1277's reopen, caught on a 44-eval budget at PR time (#1428; the test is #1411's,
+    /// ported onto the #1414 restart).
     ///
-    /// Run on the fixture **without** its `init` line ([`load_bare`]), which is the
-    /// start this was measured from. That bare start's λ = 0 fit begins with a
-    /// scaled gradient of norm 1.7e5, so the identity-Hessian cap shrinks
-    /// L-BFGS's opening step by that factor and its first line search extrapolates — eleven improving evaluations,
-    /// 18759 → 7975 — until Luksan's ten-extrapolation cap returns `Failure` on
-    /// eval 12 with no further evaluation. Before the restart in
-    /// `outer_optimizer::resolve_mid_descent_restart`, that was the whole fit:
-    /// reported at OFV 7902 on Linux (3209.81 on macOS — the abort lands at a
-    /// different point there; `0` is below both), `converged = false`, with
-    /// `l2_shrinks_weights_and_modulator_variation` failing on the ‖W‖² it
-    /// produced. The restarted run, on the 32 evals the abort left of the
-    /// budget, reaches well below zero: measured **−229.56 at eval 44**, exactly
-    /// the budget, with both the restart notice and the "increase maxiter"
-    /// warning on the result (−540.59 with #1411's in-launch resume on the same
-    /// remaining budget; −271.34 in 56 evals with #1414's fresh-budget restart).
+    /// Run on the fixture **without** its `init` line ([`load_bare`]), the start this was measured from.
+    /// That start's λ = 0 fit begins with a scaled gradient of norm 1.7e5, so the identity-Hessian cap
+    /// shrinks L-BFGS's opening step by that factor and its first line search extrapolates (eleven
+    /// improving evaluations, 18759 → 7975) until Luksan's ten-extrapolation cap returns `Failure` on
+    /// eval 12. Before the restart in `outer_optimizer::resolve_mid_descent_restart` that was the whole
+    /// fit: OFV 7902 on Linux (3209.81 on macOS), `converged = false`, with
+    /// `l2_shrinks_weights_and_modulator_variation` failing on the ‖W‖² it produced. The restarted run, on
+    /// the 32 evals left, reaches **−229.56 at eval 44**, exactly the budget, with the restart notice and
+    /// the "increase maxiter" warning on the result (−540.59 with #1411's in-launch resume; −271.34 in 56
+    /// evals with #1414's fresh-budget restart).
     ///
-    /// `maxiter = 1` is a 44-eval budget (`outer_maxiter × (n + 1)`, n = 43):
-    /// enough to recover and descend well past the old abort point. The Hessian-seeded
-    /// inner solve may now avoid that exact outer line-search abort altogether, so the
-    /// invariant is the outcome rather than the historical warning: the fit gets below
-    /// zero and stays within the requested budget. Dedicated
-    /// `resolve_mid_descent_restart` unit tests pin the restart dispatch itself.
+    /// `maxiter = 1` is a 44-eval budget (`outer_maxiter × (n + 1)`, n = 43), enough to recover and descend
+    /// past the old abort point. The Hessian-seeded inner solve may now avoid that exact line-search abort,
+    /// so the invariant is the outcome rather than the historical warning: the fit gets below zero and
+    /// stays within the requested budget. `resolve_mid_descent_restart` unit tests pin the restart dispatch.
     #[test]
     fn first_line_search_abort_is_avoided_or_resumed_not_reported() {
         let (model, options, population) = load_bare();
