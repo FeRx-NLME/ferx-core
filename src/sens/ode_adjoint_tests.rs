@@ -4236,6 +4236,12 @@ fn laplace_kernel(
 /// `mode_solve_declines_an_indefinite_hessian_off_the_mode`).
 #[test]
 fn laplace_serves_the_prior_precision_anchor_fallback() {
+    for n_agq in [1usize, 3] {
+        runtime_declined_subject_is_served_exactly(n_agq);
+    }
+}
+
+fn runtime_declined_subject_is_served_exactly(n_agq: usize) {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
     let s = subject(
         &one,
@@ -4274,21 +4280,18 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         .into_iter()
         .find(|e| indefinite(e))
         .expect("a point where the exact anchor is indefinite");
-    let prod = laplace_prod(&one, &s, params, &eta);
+    let prod = agq_prod(&one, &s, params, &eta, n_agq, true);
     assert!(
         prod.is_finite() && prod < 1e19,
         "production falls back: {prod}"
     );
-    let laplace = Objective::Agq {
-        n_agq: 1,
-        exact: true,
-    };
+    let laplace = Objective::Agq { n_agq, exact: true };
     assert!(
         subject_adjoint_gradient(&one, &s, params, &x, &eta, laplace).is_none(),
         "off the mode, an indefinite H must decline rather than drop wᵀ∇_η l"
     );
-    // The optimizer's salvage for that subject: the held-EBE score, `∂A/∂x` at this fixed
-    // `η` — FD of production's objective with `η` held, not reconverged.
+    // The old salvage for that subject, the held-EBE score `∂A/∂x` at this fixed `η` (FD of
+    // production's objective with `η` held, not reconverged): the straddle's far side.
     let held = subject_adjoint_held_ebe_score(&one, &s, params, &x, &eta, laplace)
         .expect("the held-EBE score serves the declined subject");
     let mut worst = 0.0f64;
@@ -4298,7 +4301,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
             let mut xv = x.clone();
             xv[k] += d;
             let p = crate::estimation::parameterization::unpack_params(&xv, params);
-            laplace_prod(&one, &s, &p, &eta)
+            agq_prod(&one, &s, &p, &eta, n_agq, true)
         };
         let fd = (at(h) - at(-h)) / (2.0 * h);
         assert!(
@@ -4309,16 +4312,17 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         worst = worst.max((held[k] - fd).abs() / (1.0 + fd.abs()));
     }
     eprintln!("held-EBE score vs fixed-η FD: worst rel {worst:.3e}");
-    // Measured 4.794e-10 (central FD, h = 1e-5); ~10× headroom.
+    // Measured 4.794e-10 (n_agq = 1), 7.780e-9 (n_agq = 3) (central FD, h = 1e-5); ~10× headroom.
     assert!(
-        worst < 5e-9,
+        worst < 1e-7,
         "held-EBE score off the fixed-η FD by {worst:.3e}"
     );
     // FOCE/FOCEI have their own salvage in the outer optimizer: no held route here.
     assert!(subject_adjoint_held_ebe_score(&one, &s, params, &x, &eta, Objective::Focei).is_none());
 
-    // The population gradient takes that route for the optimizer — the held score, not
-    // `2·n_x` reconverged ones — and says so in the outer FD-fallback warning.
+    // The population gradient (the optimizer's) re-solves the subject's EBE at the trial point
+    // and takes the exact score there: it matches the reconverged-FD oracle, which the held
+    // score above does not (the straddle), and the warning says so.
     use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
     use crate::types::{EstimationMethod, FitOptions, Population};
     let population = Population {
@@ -4331,6 +4335,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
     };
     let options = FitOptions {
         method: EstimationMethod::Laplace,
+        n_agq,
         ..FitOptions::default()
     };
     let log = OuterFdDeclineLog::new(1);
@@ -4349,16 +4354,82 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         None,
     )
     .expect("population gradient");
-    for (k, (&gk, &hk)) in g.iter().zip(&held).enumerate() {
+    let f_at = |xv: &[f64]| {
+        let p = crate::estimation::parameterization::unpack_params(xv, params);
+        let e = ebe_for(&one, &s, &p, 1e-12, true);
+        agq_prod(&one, &s, &p, e.as_slice(), n_agq, true)
+    };
+    let (mut served, mut old) = (0.0f64, 0.0f64);
+    for k in 0..x.len() {
+        let fd = |h: f64| {
+            let (mut xp, mut xm) = (x.clone(), x.clone());
+            xp[k] += h;
+            xm[k] -= h;
+            (f_at(&xp) - f_at(&xm)) / (2.0 * h)
+        };
+        let rich = (4.0 * fd(1e-3) - fd(2e-3)) / 3.0;
+        assert!(
+            rich.is_finite() && g[k].is_finite(),
+            "x[{k}]: {} {rich}",
+            g[k]
+        );
+        // g is the OFV gradient, 2·F.
+        let e_served = (g[k] - 2.0 * rich).abs() / (1.0 + (2.0 * rich).abs());
+        let e_old = (2.0 * held[k] - 2.0 * rich).abs() / (1.0 + (2.0 * rich).abs());
+        assert!(e_served.is_finite() && e_old.is_finite(), "x[{k}]");
+        served = served.max(e_served);
+        old = old.max(e_old);
+    }
+    eprintln!("n_agq = {n_agq}: served vs reconverged FD {served:.3e}, held vs FD {old:.3e}");
+    assert!(
+        served < SERVED_TOL,
+        "n_agq = {n_agq}: served score off the oracle by {served:.3e}"
+    );
+    assert!(
+        old > 100.0 * served && old > 1e-2,
+        "n_agq = {n_agq}: the held score must be far off the oracle ({old:.3e} vs {served:.3e})"
+    );
+    assert!(
+        log.all_declines_exact() && outer_fd_fallback_warning(&population, &log).is_none(),
+        "the decline was served exactly at the re-solved EBE: no fallback to warn about"
+    );
+    assert!(g.iter().any(|v| *v != 0.0));
+    // The route and the mode: the served subject reports `ResolvedExact` and hands the
+    // re-solved EBE back as polished, so the objective is evaluated where the gradient was
+    // taken; without the optimizer's salvage the same decline is a runtime one (a recorder
+    // serves the subject), reconverged and not structural.
+    {
+        use crate::estimation::agq::{ScoreRoute, SubjectScoreContext};
+        let bounds = crate::estimation::parameterization::compute_bounds(params);
+        let ctx = SubjectScoreContext::new(&one, params, &x, &options, &bounds, false);
+        let mut mode = ModeOut::default();
+        let (_, route) = ctx
+            .score_routed_with_mode(&s, &eta, &[], true, &mut mode)
+            .expect("score");
+        assert_eq!(route, ScoreRoute::ResolvedExact, "n_agq = {n_agq}");
+        let ebe = ebe_for(&one, &s, params, 1e-12, true);
+        let polished = mode
+            .eta_polished
+            .expect("the re-solved mode is handed back");
+        let gap = polished
+            .iter()
+            .zip(ebe.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, |m, d| {
+                assert!(d.is_finite());
+                m.max(d)
+            });
+        assert!(gap < 1e-6, "polished mode off the EBE by {gap:.2e}");
+        let (_, route) = ctx.score_routed(&s, &eta, &[], false).expect("score");
         assert_eq!(
-            gk.to_bits(),
-            (2.0 * hk).to_bits(),
-            "x[{k}]: OFV = 2·F of the held score"
+            route,
+            ScoreRoute::Reconverged { structural: false },
+            "n_agq = {n_agq}"
         );
     }
-    let w = outer_fd_fallback_warning(&population, &log).expect("the salvage is reported");
-    assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
 }
+
+const SERVED_TOL: f64 = 1e-2;
 
 /// #2713: a FOCEI gradient declined at its mode system says so. Off the mode, on a grid
 /// point where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s

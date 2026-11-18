@@ -11529,9 +11529,6 @@ pub(crate) struct OuterFdDeclineLog {
     /// The declined subjects that contributed **zero** at some trial point: repelled there
     /// (non-finite or sentinel objective) or dropped by the #1520 guard.
     zeroed: Vec<std::sync::atomic::AtomicBool>,
-    /// The declined subjects the quadrature scored with its held-EBE route
-    /// (`agq::ScoreRoute::HeldEbe`), the one route that omits the EBE response.
-    held: Vec<std::sync::atomic::AtomicBool>,
     /// How many `(subject, evaluation)` salvages [`skip_fd_salvage`] dropped (#1520). A
     /// count, not a per-subject flag: the same subject declining at two blown-up trials is
     /// two skipped salvages.
@@ -11568,9 +11565,6 @@ enum SalvageKind {
     Reconverged,
     /// The adjoint at its re-solved EBE: exact.
     Exact,
-    /// The quadrature's held-EBE score (`agq::ScoreRoute::HeldEbe`), which omits the EBE
-    /// response. No other route produces it.
-    Held,
     /// Nothing but zero: the subject was repelled at the trial points where it declined (or
     /// the #1520 guard dropped it), so it contributed no gradient there.
     Zero,
@@ -11602,9 +11596,6 @@ impl OuterFdDeclineLog {
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
             zeroed: (0..n_subjects)
-                .map(|_| std::sync::atomic::AtomicBool::new(false))
-                .collect(),
-            held: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
             skipped_salvages: AtomicUsize::new(0),
@@ -11689,13 +11680,6 @@ impl OuterFdDeclineLog {
         }
     }
 
-    /// Mark declined subject `i` as scored by the quadrature's held-EBE route.
-    pub(crate) fn record_held(&self, i: usize) {
-        if let Some(flag) = self.held.get(i) {
-            flag.store(true, Ordering::Relaxed);
-        }
-    }
-
     /// The worst salvage subject `i` took over the fit.
     fn salvage_kind(&self, i: usize) -> SalvageKind {
         let on = |v: &[std::sync::atomic::AtomicBool]| {
@@ -11705,8 +11689,6 @@ impl OuterFdDeclineLog {
             SalvageKind::Structural
         } else if on(&self.reconverged) {
             SalvageKind::Reconverged
-        } else if on(&self.held) {
-            SalvageKind::Held
         } else if on(&self.zeroed) {
             SalvageKind::Zero
         } else if on(&self.exact) {
@@ -11726,8 +11708,8 @@ impl OuterFdDeclineLog {
             .count()
     }
 
-    /// Whether every declined subject was served exactly: no finite-difference or held-EBE
-    /// salvage ran, so a gradient assembled over them is the exact one.
+    /// Whether every declined subject was served exactly: no finite-difference salvage or
+    /// zero fill ran, so a gradient assembled over them is the exact one.
     pub(crate) fn all_declines_exact(&self) -> bool {
         self.declined_indices()
             .into_iter()
@@ -11772,9 +11754,7 @@ impl OuterFdDeclineLog {
 /// finite differences for a subject no recorder serves ([`is_structural_decline`]) or whose
 /// exact route failed too (correct, slower); the exact gradient at the re-solved EBE
 /// (reported, but not a fallback, so alone it raises no warning); zero where the subject was
-/// repelled or the #1520 guard dropped it; and the quadrature's held-EBE score, the only
-/// route that omits the EBE response and the only one `reconverge_gradient_interval`
-/// remedies. The route is not passed in, so no caller can pair a log with the wrong sentence.
+/// repelled or the #1520 guard dropped it. The route is not passed in, so no caller can pair a log with the wrong sentence.
 ///
 /// "Could not be given" rather than "fell outside the provider's scope": the log records
 /// every failure of `subject_analytic_outer_gradient`, which includes a
@@ -11795,10 +11775,6 @@ pub(crate) fn outer_fd_fallback_warning(
         .and_then(|&i| population.subjects.get(i))
         .map(|s| format!(" (e.g. subject {})", s.id))
         .unwrap_or_default();
-    const HELD_EBE: &str = "used fixed-EBE outer gradients (the quadrature's held-EBE route), \
-         which omit the EBE-response term the analytic gradient carries. If the fit stalls, \
-         `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
-         evaluation.";
     const ZERO: &str = "contributed no gradient at the trial points where they declined: \
          their objective there was non-finite or at the failed-subject sentinel (or the \
          incumbent guard dropped them), so the optimizer rejects those points.";
@@ -11822,7 +11798,6 @@ pub(crate) fn outer_fd_fallback_warning(
         (count(SalvageKind::Structural), STRUCTURAL),
         (count(SalvageKind::Reconverged), RECONVERGED),
         (count(SalvageKind::Exact), EXACT),
-        (count(SalvageKind::Held), HELD_EBE),
         (count(SalvageKind::Zero), ZERO),
     ]
     .into_iter()

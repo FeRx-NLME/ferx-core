@@ -410,16 +410,11 @@ pub(crate) fn subject_adjoint_gradient_and_mode_at(
     g
 }
 
-/// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
-/// identity [`subject_adjoint_gradient_at`] declines — an indefinite exact `H` at an `η̂` the
-/// inner search's fallback left short of stationary ([`mode_solve`]). Without the identity
-/// the EBE response is not available exactly, and the alternative is the reconverged
-/// finite-difference score, `2·n_x` EBE re-solves per subject: on a 147-weight covariate
-/// network under Laplace that turned a 7.5 s fit into a 90 s one. This is the AGQ twin of
-/// FOCE/FOCEI's held-EBE salvage, omits the same EBE-response term, and is reported by the
-/// same outer FD-fallback warning. `None` wherever [`subject_adjoint_gradient_at`] declines for
-/// any other reason (scope, a non-finite recording) and for the FOCE/FOCEI objectives,
-/// whose salvage lives in the outer optimizer.
+/// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, without the EBE-response term.
+/// No production route takes it (a runtime-declined subject is re-solved to its EBE and scored
+/// exactly, `agq::ScoreRoute::ResolvedExact`); it is the biased score the tests hold that route
+/// against. `None` for the FOCE/FOCEI objectives and wherever
+/// [`subject_adjoint_gradient_at`] declines for a reason other than the mode identity.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_held_ebe_score(
     model: &CompiledModel,
@@ -430,19 +425,8 @@ pub(crate) fn subject_adjoint_held_ebe_score(
     objective: Objective,
 ) -> Option<Vec<f64>> {
     let pt = PackedPoint::new(template, x)?;
-    subject_adjoint_held_ebe_score_at(model, subject, &pt, eta_hat, objective)
-}
-
-/// `subject_adjoint_held_ebe_score` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
-pub(crate) fn subject_adjoint_held_ebe_score_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-) -> Option<Vec<f64>> {
     matches!(objective, Objective::Agq { .. })
-        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true, None))?
+        .then(|| adjoint_gradient(model, subject, &pt, eta_hat, objective, true, None))?
 }
 
 /// The fixed-EBE objective and its exact packed gradient at `η̂` with the linearisation
