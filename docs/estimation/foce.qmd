@@ -141,7 +141,7 @@ gradients include the EBE-response term but are slower. The reported outer gradi
 method is the model-level route, not the per-subject one.
 ```
 
-A fit in which every declined subject was served exactly at its re-solved EBE (below) has no fallback to report and emits no warning. The consequence sentence is chosen per subject from what actually ran: reconverged finite differences (structural, or the exact route failed too), the exact gradient at the re-solved EBE (named only beside another group), zero (the subject was repelled, or the blown-up-trial guard dropped it), or, on the quadrature route only, the held-EBE score.
+A fit in which every declined subject was served exactly at its re-solved EBE (below) has no fallback to report and emits no warning. The consequence sentence is chosen per subject from what actually ran: reconverged finite differences (structural, or the exact route failed too), the exact gradient at the re-solved EBE (named only beside another group), or zero (the subject was repelled, or the blown-up-trial guard dropped it).
 
 The parenthesis counts the declined subjects by cause (#2713), one clause per cause:
 

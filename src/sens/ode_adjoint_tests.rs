@@ -4422,7 +4422,7 @@ fn runtime_declined_subject_is_served_exactly(n_agq: usize) {
         let ctx = SubjectScoreContext::new(&one, params, &x, &options, &bounds, false);
         let mut mode = ModeOut::default();
         let (_, route) = ctx
-            .score_routed_with_mode(&s, &eta, &[], true, &mut mode)
+            .score_routed_with_mode(None, &s, &eta, &[], true, &mut mode)
             .expect("score");
         assert_eq!(route, ScoreRoute::ResolvedExact, "n_agq = {n_agq}");
         let ebe = ebe_for(&one, &s, params, 1e-12, true);
@@ -4443,6 +4443,38 @@ fn runtime_declined_subject_is_served_exactly(n_agq: usize) {
             route,
             ScoreRoute::Reconverged { structural: false },
             "n_agq = {n_agq}"
+        );
+        // The structural probe (an adjoint recording) is asked only where its answer is used,
+        // and once per fit: the covariance step's form (`resolve_ok = false`) never asks, the
+        // optimizer's asks once for a subject whose decline the log has seen answered "no", and a
+        // context without the log asks at every call. Mutations: probe unconditionally (the first
+        // count), drop the log's kept answer (the second), or the log (the third).
+        use std::sync::atomic::Ordering::Relaxed;
+        let fit_log = OuterFdDeclineLog::new(1);
+        let logged = SubjectScoreContext::new(&one, params, &x, &options, &bounds, false)
+            .with_declines(Some(&fit_log));
+        logged.score_routed(&s, &eta, &[], false).expect("score");
+        logged.score(&s, &eta, &[]).expect("score");
+        assert_eq!(logged.probes.load(Relaxed), 0, "n_agq = {n_agq}: no probe");
+        for _ in 0..3 {
+            let (_, route) = logged
+                .score_routed_with_mode(Some(0), &s, &eta, &[], true, &mut ModeOut::default())
+                .expect("score");
+            assert_eq!(route, ScoreRoute::ResolvedExact, "n_agq = {n_agq}");
+        }
+        assert_eq!(
+            logged.probes.load(Relaxed),
+            1,
+            "n_agq = {n_agq}: probed once"
+        );
+        for _ in 0..2 {
+            ctx.score_routed_with_mode(Some(0), &s, &eta, &[], true, &mut ModeOut::default())
+                .expect("score");
+        }
+        assert_eq!(
+            ctx.probes.load(Relaxed),
+            3,
+            "n_agq = {n_agq}: without the log every call probes"
         );
     }
 }
@@ -8754,6 +8786,92 @@ fn the_agq_gradient_is_exact_with_a_non_gaussian_term() {
     }
     eprintln!("non-Gaussian AGQ gradient: worst {worst:.2e}");
     assert!(worst < 5e-7, "worst relative difference {worst:.2e}");
+}
+
+/// A quadrature node whose non-Gaussian endpoint term is not usable (`NaN`, or beyond the
+/// sentinel) while its Gaussian term `l` is finite is left out of the sum by the objective
+/// (`agq::agq_terms` scores `l + q`), and the adjoint serves the subject over the same nodes:
+/// mixed with PK rows and with the endpoint alone, against the reconverged-FD oracle. Two
+/// predictors on `ETA_CL`: `exp(200*ETA_CL)` is `~1e30` at the upper nodes (finite, over
+/// `1e20`, small below), and `16*(0.008 - ETA_CL^3)^0.5` is `NaN` there (the parser's `^` does
+/// not clamp). Measured: the subject is served *without* the live-node filter reaching these
+/// nodes (the first kernel run forms, since `q` enters the reverse as numbers and `0 * NaN` never
+/// arises through it), and swapping the filter's `l + q` for `l` alone leaves this test green, so
+/// it pins the parity of the served gradient, not the filter's `q` term (the review's reading of
+/// that term as a defect has no observable effect; see the filter's comment).
+#[cfg(all(feature = "survival", feature = "markov"))]
+#[test]
+fn an_agq_node_with_an_unusable_endpoint_term_is_served_exactly() {
+    use crate::types::ObsRecord;
+    let mut worst = 0.0f64;
+    for (case, logit, nan) in [
+        ("sentinel", "exp(200.0 * ETA_CL)", false),
+        ("nan", "16.0 * (0.008 - ETA_CL ^ 3) ^ 0.5", true),
+    ] {
+        let model = parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+             theta TVKA(1.2, 0.05, 20.0)\n  theta TH0(-0.3, -10.0, 10.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             KA = TVKA\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n\
+             [binary_model]\n  cmt   = 3\n  logit = TH0 + 2.0 * ETA_CL + {logit}\n"
+        ))
+        .unwrap();
+        let records: Vec<ObsRecord> = [(0.0, 0), (1.0, 0), (2.0, 1), (4.0, 0)]
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt: 3,
+            })
+            .collect();
+        let mut only = subject(
+            &model,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[],
+            &[0.0, 0.0],
+        );
+        only.obs_records = records.clone();
+        assert!(only.observations.is_empty());
+        let mut mixed = subject(
+            &model,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 12.0],
+            &[0.1, -0.05],
+        );
+        mixed.obs_records = records;
+        assert!(crate::pk::subject_feeds_analytical_pk(&model, &mixed));
+        for (tag, s) in [("endpoint only", &only), ("mixed", &mixed)] {
+            // The premise: the term is usable at the mode and below, and not at the upper node
+            // (the nodes sit at the mode, ±~0.5 in `ETA_CL`).
+            let params = moved_params(&model);
+            let eta = ebe_for(&model, s, &params, 1e-12, true);
+            let q: Vec<f64> = [-0.5, 0.0, 0.5]
+                .iter()
+                .map(|d| {
+                    let e = [eta[0] + d, eta[1]];
+                    super::ng_value_grad(&model, s, &params.theta, &e).map_or(f64::NAN, |r| r.0)
+                })
+                .collect();
+            let unusable = |v: f64| !crate::stats::likelihood::is_usable_subject_nll(v);
+            assert!(
+                !unusable(q[0]) && !unusable(q[1]) && unusable(q[2]) && q[2].is_nan() == nan,
+                "{case}/{tag}: the premise, a usable term below and an unusable one at the upper \
+                 node: {q:?}"
+            );
+            for (n_agq, exact) in [(3, true), (3, false)] {
+                let w = fd_oracle_agq(&model, s, n_agq, exact);
+                eprintln!("{case}/{tag} n_agq={n_agq} exact={exact}: worst {w:.2e}");
+                assert!(w.is_finite());
+                worst = worst.max(w);
+            }
+        }
+    }
+    // Measured on Linux: 2.5e-6 on the `sentinel` mixed subject (the `exp(200*ETA_CL)` slope
+    // makes the Richardson oracle's own error that large on the small TVCL component).
+    assert!(worst < 1e-5, "{worst:.2e}");
 }
 
 /// The covariance step's exact Hessian on subjects carrying non-Gaussian records — a

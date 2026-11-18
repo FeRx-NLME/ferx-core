@@ -2731,9 +2731,8 @@ fn the_hot_table_compares_the_layout_structure() {
 /// squaring of a Padé approximant overflow and the subject reported `W_PLAN_FD_FALLBACK` for a
 /// point nothing needed a derivative at (#3004). The controls on the other side of each gate
 /// stay the point's: a count out of range (the repeat) and a finite product that is simply
-/// recorded. Mutations: drop `note_nonfinite` from `record_mat` -> the product row reads
-/// `Point`; drop it from `record_repeat` (or make `run_why` return `Err(false)` for a body
-/// that declines) -> the repeat row reads `Point`.
+/// recorded. Mutation: stop `MatSpec::run` noting a non-finite result to an open recording
+/// -> the product row and the repeat row both read `Point`.
 #[test]
 fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_scope() {
     use crate::sens::num::RecHooks;
@@ -2772,4 +2771,22 @@ fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_
         FailScope::Repelled
     );
     assert_eq!(repeat(2.0, 100.0).err().expect("fails").1, FailScope::Point);
+    // A body whose inner solve is singular at a later iterate (`x -> (x-1)²/(x-1)`, singular at
+    // `x = 1`): a real failure of the point, not an overflow, so it stays the point's. Mutation:
+    // note a non-finite result unconditionally in `RepeatSpec::run` (the old reading of every
+    // body `None`) -> this row reads `Repelled`.
+    let solve_body = |v: &[Tr]| {
+        let q = v[0] - Tr::k(1.0);
+        <Tr as RecHooks>::mat_solve(&[q], &[q * q], 1)
+            .flatten()
+            .expect("records")
+    };
+    begin();
+    let out = <Tr as RecHooks>::repeat(&[Tr::eta(0, 3.0)], Tr::eta(1, 3.0), &solve_body);
+    assert!(matches!(out, Some(None)), "the third iterate is singular");
+    assert_eq!(end(Some(vec![])).err().expect("fails").1, FailScope::Point);
+    begin();
+    let out = <Tr as RecHooks>::repeat(&[Tr::eta(0, 3.0)], Tr::eta(1, 2.0), &solve_body);
+    assert!(matches!(out, Some(Some(_))), "two iterates are regular");
+    assert!(end(Some(vec![])).is_ok());
 }

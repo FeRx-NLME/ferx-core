@@ -1196,8 +1196,8 @@ fn finish(
 /// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
 /// from a certified or iteration-limited inner search, which need not be stationary in
 /// `‖g‖∞` (see [`MODE_STATIONARY_TOL`]), and the gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
-/// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
-/// score ([`subject_adjoint_held_ebe_score_at`]), not the reconverged one.
+/// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review), and the caller re-solves its EBE
+/// and scores it there (`agq::ScoreRoute::ResolvedExact`) rather than take a held-EBE score.
 ///
 /// The SPD branch takes no such gate, deliberately. Near a strict mode `η̂ = η* + ε` and
 /// `∂Ψ/∂x` misses the converged objective's total derivative by `O(|∇_η l|)` only, while

@@ -1083,6 +1083,7 @@ fn agq_population_evaluate_impl(
                 ..ModeOut::default()
             };
             let score = context.score_routed_with_mode(
+                Some(i),
                 subject,
                 eta_hats[i].as_slice(),
                 subj_kappas,
@@ -1252,6 +1253,13 @@ pub(crate) struct SubjectScoreContext<'a> {
     /// `x` unpacked once for every subject this context scores (`None` when `x` is not
     /// `template`'s packed length, which the adjoint declines).
     point: Option<crate::sens::ode_provider::adjoint::PackedPoint<'a>>,
+    /// The fit's decline log, which remembers a subject whose structural probe answered "no"
+    /// ([`crate::estimation::outer_optimizer::OuterFdDeclineLog::is_structural`]) so a declined
+    /// subject pays the recording once per fit, not once per evaluation.
+    declines: Option<&'a crate::estimation::outer_optimizer::OuterFdDeclineLog>,
+    /// Test hook: how many structural probes (recordings) this context ran.
+    #[cfg(test)]
+    pub(crate) probes: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> SubjectScoreContext<'a> {
@@ -1277,6 +1285,20 @@ impl<'a> SubjectScoreContext<'a> {
             force_fd: force_fd || !analytic_gradient_available(model),
             fd_inner_tol: crate::estimation::inner_optimizer::stencil_inner_tol(options.inner_tol),
             point: crate::sens::ode_provider::adjoint::PackedPoint::new(template, x),
+            declines: None,
+            #[cfg(test)]
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// This context asking `log` before it probes whether a decline is structural.
+    pub(crate) fn with_declines(
+        self,
+        log: Option<&'a crate::estimation::outer_optimizer::OuterFdDeclineLog>,
+    ) -> Self {
+        Self {
+            declines: log,
+            ..self
         }
     }
 
@@ -1312,14 +1334,28 @@ impl<'a> SubjectScoreContext<'a> {
         kappas: &[nalgebra::DVector<f64>],
         resolve_ok: bool,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
-        self.score_routed_with_mode(subject, eta, kappas, resolve_ok, &mut ModeOut::default())
+        self.score_routed_with_mode(
+            None,
+            subject,
+            eta,
+            kappas,
+            resolve_ok,
+            &mut ModeOut::default(),
+        )
     }
 
     /// [`Self::score_routed`], with what `mode` asks for about the subject's mode
     /// ([`ModeOut`]: its response, its exact inner Hessian) formed by the same adjoint pass.
-    /// Exact route only; on any other `mode` comes back empty (#2549).
+    /// Exact route only; on any other `mode` comes back empty (#2549). `index` is the subject's
+    /// place in the fit, which keys the decline log's kept answer.
+    ///
+    /// Whether a decline is structural is asked (a recording) only where the answer is used: the
+    /// optimizer's salvage (`resolve_ok`) routes on it, and the label it puts on a reconverged
+    /// score is what the fit's warning reports. Without `resolve_ok` (the covariance step, the
+    /// predicted-gain scores) the label is discarded and reads `structural: false`.
     pub(crate) fn score_routed_with_mode(
         &self,
+        index: Option<usize>,
         subject: &Subject,
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
@@ -1366,12 +1402,23 @@ impl<'a> SubjectScoreContext<'a> {
                     return Some((g, ScoreRoute::Exact));
                 }
                 mode.clear();
-                structural = crate::estimation::outer_optimizer::is_structural_decline(
-                    self.model,
-                    subject,
-                    self.template,
-                    &joint_warm,
-                );
+                structural = resolve_ok && {
+                    let probe = || {
+                        #[cfg(test)]
+                        self.probes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::estimation::outer_optimizer::is_structural_decline(
+                            self.model,
+                            subject,
+                            self.template,
+                            &joint_warm,
+                        )
+                    };
+                    match (self.declines, index) {
+                        (Some(log), Some(i)) => log.is_structural(i, probe),
+                        _ => probe(),
+                    }
+                };
                 if resolve_ok && !structural {
                     // The EBE re-solved at the trial point is stationary, so the mode
                     // identity the held `η̂` lacked holds there: the exact score, with the
@@ -1535,7 +1582,8 @@ pub(crate) fn population_gradient_mixed(
     }
     let want_eta_dx = eta_dx.as_ref().is_some_and(|s| s.want_dx);
     let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd)
+        .with_declines(declines);
     let scores: Vec<_> = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
         let mut mode = ModeOut {
@@ -1544,6 +1592,7 @@ pub(crate) fn population_gradient_mixed(
             ..ModeOut::default()
         };
         let score = context.score_routed_with_mode(
+            Some(i),
             subject,
             eta_hats[i].as_slice(),
             kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),

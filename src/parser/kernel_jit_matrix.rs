@@ -186,7 +186,16 @@ impl MatSpec {
                 }
             }
         }
-        out[..nn * l].iter().all(|v| v.is_finite())
+        if out[..nn * l].iter().all(|v| v.is_finite()) {
+            return true;
+        }
+        // An overflowed result is a point the value path cannot score either; a recording this
+        // call runs inside (a repeat body's record-time run) is told, so a failure it causes is
+        // repelled, while a singular solve (above) stays the point's.
+        if super::recording_open() {
+            super::note_nonfinite();
+        }
+        false
     }
 
     /// The reverse: `out_adj` the result's adjoints per seed, into `in_adj` per seed the two
@@ -535,10 +544,6 @@ pub(crate) fn record_mat(op: MatOp, a: &[Tr], b: &[Tr], n: usize) -> Option<Vec<
     // guard, so the plan would replay it where the factorization is regular. Failing the
     // recording costs this subject the FD fallback at a singular point, never a wrong answer.
     if !spec.run(Layout::F64, &inputs, &mut out) {
-        // A non-finite result (an overflowed product) is a point the value path cannot score.
-        if out.iter().any(|v| !v.is_finite()) {
-            note_nonfinite();
-        }
         fail_here("a matrix call's record-time run failed");
         return None;
     }
