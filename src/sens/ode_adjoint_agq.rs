@@ -21,6 +21,10 @@ use crate::sens::num::{log_sum_exp, wsum3};
 
 /// The quadrature (AGQ, Laplace) gradient of a subject through its plans; `None` where a
 /// plan cannot be recorded.
+///
+/// Every node first. Only when that gradient does not form (a diverged node: see
+/// [`agq_planned_over`]'s `drop_dropped`) is it re-run without the nodes the objective itself
+/// drops, so a subject with no diverged node pays nothing for the check.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn agq_planned(
     model: &CompiledModel,
@@ -42,6 +46,59 @@ pub(super) fn agq_planned(
     mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
     var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
     p1: &PredLanes<&[f64]>,
+) -> Option<Vec<f64>> {
+    let mut run = |drop_dropped: bool| {
+        agq_planned_over(
+            model,
+            subject,
+            lay,
+            template,
+            params,
+            x,
+            eta,
+            ctx,
+            so,
+            pv,
+            grid,
+            h_exact,
+            exact,
+            held,
+            ng,
+            eta_dx.as_deref_mut(),
+            mode_fwd,
+            var_fwd,
+            p1,
+            drop_dropped,
+        )
+        .filter(|g| g.iter().all(|v| v.is_finite()))
+    };
+    run(false).or_else(|| run(true))
+}
+
+/// [`agq_planned`] over the nodes it keeps: every node, or with `drop_dropped` only those whose
+/// term the objective keeps.
+#[allow(clippy::too_many_arguments)]
+fn agq_planned_over(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    template: &ModelParameters,
+    params: &ModelParameters,
+    x: &[f64],
+    eta: &[f64],
+    ctx: &LikCtx,
+    so: &StackedOmega,
+    pv: &ParT<f64>,
+    grid: &[(Vec<f64>, f64, Vec<f64>)],
+    h_exact: Option<&DMatrix<f64>>,
+    exact: bool,
+    held: bool,
+    ng: Option<&AgqNg>,
+    mut eta_dx: Option<&mut ModeOut>,
+    mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
+    var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
+    p1: &PredLanes<&[f64]>,
+    drop_dropped: bool,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
@@ -90,7 +147,7 @@ pub(super) fn agq_planned(
     // AGQ, #3004). So a node whose term is non-finite or the sentinel is left out of the
     // kernel, as it is out of the sum: the value and every gradient component are unchanged by
     // it. A finite node whose weight merely underflows stays: its derivative is `0 · finite`.
-    let keep: Vec<usize> = if !grid.is_empty() && nodes.len() == grid.len() {
+    let keep: Vec<usize> = if drop_dropped && !grid.is_empty() && nodes.len() == grid.len() {
         grid.iter()
             .zip(&nodes)
             .enumerate()

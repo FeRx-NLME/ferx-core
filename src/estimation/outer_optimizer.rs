@@ -10707,8 +10707,8 @@ fn central_diff_packed(
 ///
 /// Returns `(nllᵢ, d(nllᵢ)/dx)`, the gradient of length `x.len()`; the caller scales by
 /// 2 and zeroes fixed coordinates, matching the analytic per-subject convention. `nllᵢ`
-/// is the held-EBE objective at `x`, which [`held_ebe_salvage`] reads to tell a
-/// repelled subject from a real one.
+/// is the held-EBE objective at `x`, which tells a repelled subject from a real one
+/// ([`structural_fill`]).
 #[allow(clippy::too_many_arguments)]
 fn subject_fixed_ebe_gradient(
     x: &[f64],
@@ -10922,8 +10922,8 @@ fn structural_fill(nll: f64) -> DeclinedFill {
 /// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges that
 /// subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
 /// included. Since #1529 it serves two callers here: a structural decline
-/// ([`non_iov_declined_salvage`], #1536), and the last resort of [`held_ebe_salvage`] for
-/// a subject whose held-EBE gradient came back non-finite at a usable objective. GN,
+/// ([`non_iov_declined_salvage`], #1536), and the last resort of [`declined_salvage`] for
+/// a subject the exact route cannot serve at its re-solved EBE (#3004). GN,
 /// trust-region and the covariance step's `S` read it for a subject the adjoint declines
 /// (`covariance::subject_total_score`, #2974).
 #[allow(clippy::too_many_arguments)]
@@ -11433,8 +11433,8 @@ pub(crate) fn skip_fd_salvage(
 /// The per-subject gradient a declined subject gets (#1520): **zero** when
 /// [`skip_fd_salvage`] fires for it — the subject's contribution to the population
 /// gradient is dropped at that point — and otherwise the salvage `salvage` computes:
-/// the held-EBE [`held_ebe_salvage`] for non-IOV (#1529), the reconverged-FD
-/// [`subject_reconverged_fd_gradient_iov`] under IOV. Shared by the non-IOV and IOV mixed
+/// the exact gradient at the re-solved EBE ([`declined_salvage`], #3004), else the
+/// reconverged-FD gradient. Shared by the non-IOV and IOV mixed
 /// assemblies so the guard has one implementation; the assemblies differ only in which
 /// salvage they pass. Records the skip on `declines`.
 ///
@@ -11466,7 +11466,7 @@ fn declined_subject_gradient(
 }
 
 /// Which subjects actually took a per-subject salvage outer gradient during this fit —
-/// held-EBE for non-IOV ([`held_ebe_salvage`], #1529), reconverged FD under IOV —
+/// exact at the re-solved EBE ([`declined_salvage`], #3004), else reconverged FD —
 /// because `subject_analytic_outer_gradient` (or its IOV twin) declined them (#1154).
 ///
 /// One `AtomicBool` per subject, set on the fallback arm of the mixed assemblies. Recorded

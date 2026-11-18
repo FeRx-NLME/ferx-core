@@ -205,3 +205,44 @@ fn focei_makes_substantial_progress_on_nn_model() {
         n_total,
     );
 }
+
+/// `examples/warfarin_dcm.ferx` under three-node AGQ on its own dataset: every subject's
+/// outer gradient is the exact one (#3004). At the first trial points two subjects (e.g.
+/// subject 23) have quadrature nodes whose network-driven variance is not positive, which the
+/// objective scores as the sentinel and gives exactly zero weight. The AGQ kernel used to take
+/// the NaN derivative of those nodes and decline the whole subject to reconverged finite
+/// differences ("2 of 30 subjects could not be given the exact analytic outer gradient"); it
+/// now drops the nodes the objective drops. No toy model reproduces a diverged node at a
+/// reachable grid point, so the fixture is the example itself, at `maxiter = 2` (7 s in a
+/// `ci-fast` build). Mutation: without the retry over the kept nodes it fails.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_dcm_under_three_node_agq_keeps_every_outer_gradient_exact() {
+    let src = std::fs::read_to_string("examples/warfarin_dcm.ferx").expect("example reads");
+    let parsed = parse_full_model(&src).expect("model parses with --features nn");
+    let model = parsed.model;
+    let mut options = parsed.fit_options;
+    options.n_agq = 3;
+    options.outer_maxiter = 2;
+    options.run_covariance_step = false;
+    assert_eq!(options.agq_nodes(), Some(3), "the fit runs three-node AGQ");
+    let population = read_nonmem_csv(
+        std::path::Path::new("data/warfarin_dcm.csv"),
+        Some(&["WT", "CRCL"]),
+        None,
+    )
+    .expect("dataset loads");
+    let result = fit(&model, &population, &model.default_params, &options).expect("fit runs");
+    let fd: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("could not be given the exact analytic outer gradient"))
+        .collect();
+    assert!(
+        fd.is_empty(),
+        "no subject may fall back to FD outer gradients: {fd:?}"
+    );
+}
