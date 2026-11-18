@@ -1065,7 +1065,7 @@ pub fn run_bayes(
     };
 
     let chain_outputs: Vec<Option<ChainOutput>> = crate::par::map(n_chains, |chain| {
-        let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
+        let mut rng = StdRng::seed_from_u64(crate::rng::stream_seed(master_seed, &[chain as u64]));
         let mut scratch = EventPkParams::default();
         // The block MH kernel owns its own buffers (`MhScratch`), which
         // carry the η-independent NLL inputs alongside the `EventPkParams`.

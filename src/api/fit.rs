@@ -736,7 +736,10 @@ pub(crate) fn perturb_init(
     if start_idx == 0 {
         return params.clone();
     }
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(base_seed.wrapping_add(start_idx as u64));
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(crate::rng::stream_seed(
+        base_seed,
+        &[start_idx as u64],
+    ));
     let normal = Normal::new(0.0_f64, 1.0_f64).expect("normal dist");
     let mut p = params.clone();
     for (i, t) in p.theta.iter_mut().enumerate() {
@@ -1314,8 +1317,8 @@ fn fit_unstamped(
                 options
             } else {
                 opts_k_storage = FitOptions {
-                    saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
-                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
+                    saem_seed: Some(crate::rng::stream_seed(base_saem_seed, &[k as u64])),
+                    bayes_seed: Some(crate::rng::stream_seed(base_bayes_seed, &[k as u64])),
                     global_search: false,
                     ..options.clone()
                 };

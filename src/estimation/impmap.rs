@@ -2134,7 +2134,7 @@ fn run_mcem(
                 if crate::cancel::is_cancelled(cancel) {
                     return SubjectDraws::cancelled(n_eta);
                 }
-                let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
+                let subj_seed = crate::rng::stream_seed(seed, &[i as u64, k as u64]);
 
                 // IOV subject (#2301): sample the stacked `b = [η, κ₁..κ_K]` from one
                 // joint proposal against the block-diagonal prior `Ω ⊕ I_K ⊗ Ω_iov`,
@@ -3646,10 +3646,10 @@ fn run_mcem_mixture(
                             options.inner_restarts,
                             mceta,
                             omega_chol.as_ref(),
-                            seed.wrapping_add(i as u64)
-                                .wrapping_add((k as u64) << 32)
-                                .wrapping_add((c as u64) << 48)
-                                .wrapping_add(0x4D43_4554_4100u64),
+                            crate::rng::stream_seed(
+                                seed,
+                                &[i as u64, k as u64, c as u64, 0x4D43_4554_4100u64],
+                            ),
                         );
                         let h_post = compute_posterior_hessian(
                             model,

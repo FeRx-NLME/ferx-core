@@ -196,8 +196,8 @@ fn npde_decorrelates_a_paired_block_sigma_at_the_fitted_correlation() {
 /// the declared ρ (or none, falling back to it), on rows that are never paired.
 /// Its `R` is diagonal, so the shared correlated draw takes its per-row fast
 /// path, which consumes the RNG stream in the same order as the old scalar loop.
-/// The scores are the ones `d43afca9` produced before the draw moved, pinned to
-/// the bit. A draw that perturbed the stream (an extra normal, or rows drawn in
+/// The scores are pinned to the bit: first captured from `d43afca9` (before the draw
+/// moved), re-captured under #3010, which re-keyed the per-subject streams. A draw that perturbed the stream (an extra normal, or rows drawn in
 /// another order) would move them. Turning the fast path off does not: the
 /// eigen square root of a diagonal `R` was measured to give the same bits, so
 /// the fast path is a cost saving, not a numerical one.
@@ -217,10 +217,10 @@ fn a_fixed_block_sigma_scores_exactly_as_before_the_shared_draw() {
     let mut params = model.default_params.clone();
     assert_eq!(model.residual_correlations.len(), 1);
     let pinned: [f64; 4] = [
-        0.15096921547331393,
         0.12566134687610309,
-        -0.2793190341322942,
-        0.2793190341322942,
+        0.10043372055919272,
+        -0.2275449764238035,
+        0.17637416469849554,
     ];
     for corr in [model.residual_correlations.clone(), vec![]] {
         params.residual_correlations = corr;

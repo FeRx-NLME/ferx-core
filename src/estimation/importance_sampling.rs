@@ -12,8 +12,8 @@
 //! (sparse-data PK, strong nonlinearity).
 //!
 //! The kernel is rayon-parallel over subjects; per-subject RNGs are seeded
-//! from `options.imp_seed.wrapping_add(i as u64)` so the result is
-//! deterministic for a given seed.
+//! from `stream_seed(options.imp_seed, &[i])` (#3010: a hash, so runs under consecutive
+//! seeds share no subject stream) so the result is deterministic for a given seed.
 //!
 //! ## Adaptive evaluation (#2653)
 //!
@@ -70,13 +70,7 @@ pub(crate) fn inv_normal_cdf(u: f64) -> f64 {
     crate::stats::special::normal_inv_cdf(u.clamp(1e-15, 1.0 - 1e-15))
 }
 
-/// SplitMix64 finaliser: decorrelates the per-coordinate scramble seeds.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
+use crate::rng::{splitmix64, stream_seed};
 
 /// Hash-based nested uniform (Owen) scramble of a 32-bit Sobol coordinate
 /// (Burley 2020, "Practical Hash-based Owen Scrambling", after Laine & Karras
@@ -720,7 +714,7 @@ pub fn run_importance_sampling(
             }
             let eta_hat = &eta_hats[i];
             let kap = kappas.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            let subj_seed = seed.wrapping_add(i as u64);
+            let subj_seed = stream_seed(seed, &[i as u64]);
 
             if model.n_kappa > 0 && !kap.is_empty() {
                 // Joint (eta, kappa) sampling for IOV models. Ω_iov is guaranteed

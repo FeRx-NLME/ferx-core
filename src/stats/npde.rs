@@ -118,7 +118,7 @@ pub struct SubjectNpde {
 /// (`K`); `seed` makes the draw reproducible.
 ///
 /// Subjects are simulated in parallel, each with its own RNG seeded from
-/// `seed + subject_index`, so the result is independent of the rayon schedule
+/// `stream_seed(seed, &[subject_index])` (a hash: consecutive seeds share no stream, #3010), so the result is independent of the rayon schedule
 /// and reproducible for a fixed `seed`.
 ///
 /// For an IOV model the reference distribution draws one independent occasion
@@ -272,7 +272,8 @@ pub fn compute_npde_npd_diag(
     let scores = crate::api::install_on_engine_pool(|| {
         crate::par::map(population.subjects.len(), |i| {
             let subject = &population.subjects[i];
-            let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
+            let mut rng =
+                rand::rngs::StdRng::seed_from_u64(crate::rng::stream_seed(base_seed, &[i as u64]));
             let n_obs = subject.observations.len();
 
             // sims[(j, k)] — observation j, replicate k. Column-per-replicate

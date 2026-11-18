@@ -440,7 +440,10 @@ $$
   marginal is reported. See [Adaptive evaluation](#adaptive-evaluation).
 - **Reproducibility.** `imp_seed` defaults to `42` when unset (so two
   fits with the same `imp_samples` and `imp_proposal_df` produce identical
-  `−2 log L`). Set it explicitly to vary the RNG stream. The full set of
+  `−2 log L`). Set it explicitly to vary the RNG stream. Each subject's stream is a
+  hash of `(imp_seed, subject index)`, so runs under different seeds share no subject
+  stream (before #3010, seed `s` subject `i` and seed `s+1` subject `i-1` were the
+  same stream, so consecutive seeds were nearly the same run). The full set of
   `imp_*` defaults is listed in the
   [`[fit_options]` reference](../model-file/fit-options.qmd#importance-sampling-imp).
 
