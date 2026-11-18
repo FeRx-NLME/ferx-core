@@ -274,24 +274,27 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                         ),
                         // The production dispatch: reconverged for a structural decline
                         // (#1536), exact at the re-solved EBE otherwise.
-                        _ => non_iov_declined_salvage(
-                            is_structural_decline(
-                                &model,
-                                &pop.subjects[i],
+                        _ => {
+                            non_iov_declined_salvage(
+                                is_structural_decline(
+                                    &model,
+                                    &pop.subjects[i],
+                                    params,
+                                    etas[i].as_slice(),
+                                ),
+                                &x,
                                 params,
-                                etas[i].as_slice(),
-                            ),
-                            &x,
-                            params,
-                            &model,
-                            &pop,
-                            i,
-                            &etas[i],
-                            &hms[i],
-                            &bounds,
-                            &opts,
-                            &OuterFdDeclineLog::new(pop.subjects.len()),
-                        ),
+                                &model,
+                                &pop,
+                                i,
+                                &etas[i],
+                                &hms[i],
+                                &bounds,
+                                &opts,
+                                &OuterFdDeclineLog::new(pop.subjects.len()),
+                            )
+                            .0
+                        }
                     };
                     for (acc, value) in expected.iter_mut().zip(g) {
                         *acc += 2.0 * value;

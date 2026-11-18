@@ -132,13 +132,16 @@ The `gradient:` banner and the `gradient_method_inner` field describe the **inne
 The two can disagree. A subject no recorder serves — an out-of-scope ODE dose event, or any subject whose inner Hessian is not positive-definite at the trial point — is salvaged individually, while the model as a whole stays in scope and keeps reporting `analytic`. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
 
 ```
-1 of 32 subjects could not be given the exact analytic outer gradient during this fit
-(e.g. subject 7) (1 with an inner Hessian at the EBE that was singular, or indefinite
-at an EBE that was not stationary (an EBE off a strict mode), at some trial point) and
-were re-solved to their EBEs at the trial point and given the exact analytic gradient
-there. The reported outer gradient method is the model-level route, not the per-subject
-one.
+1 of 32 subjects could not be given the exact analytic outer gradient at the EBE the
+optimizer held during this fit (e.g. subject 7) (1 with a shape no analytic recorder
+serves, or a recording that failed or came back non-finite at some trial point) and used
+reconverged finite-difference outer gradients because no analytic recorder serves them:
+recording their exact derivatives failed, as it will at every parameter point. Those
+gradients include the EBE-response term but are slower. The reported outer gradient
+method is the model-level route, not the per-subject one.
 ```
+
+A fit in which every declined subject was served exactly at its re-solved EBE (below) has no fallback to report and emits no warning. The consequence sentence is chosen per subject from what actually ran: reconverged finite differences (structural, or the exact route failed too), the exact gradient at the re-solved EBE (named only beside another group), zero (the subject was repelled, or the blown-up-trial guard dropped it), or, on the quadrature route only, the held-EBE score.
 
 The parenthesis counts the declined subjects by cause (#2713), one clause per cause:
 
@@ -151,10 +154,10 @@ The counts cover every trial point of the fit, including rejected ones. A subjec
 
 A subject the analytic gradient declines at a trial point is never given a held-EBE gradient, which omits the EBE-response term $\tfrac12\,\partial_\eta\log|\tilde H|\cdot\mathrm d\hat\eta/\mathrm dx$ and so biases every step it enters (#1529, #3004). It takes one of two gradients, both of which carry that term:
 
-- **Exact, at a re-solved EBE.** The subject's EBE is re-solved at the trial point (warm from the held one, at the finite-difference stencil's tight tolerance) and the adjoint is run there: one inner solve and one adjoint pass. This serves a decline that is a property of the point, such as an inner Hessian that is not positive definite at an EBE off its mode. Under IOV the re-solve is the joint $(\hat\eta, \hat\kappa)$ mode. The warning says so: `were re-solved to their EBEs at the trial point and given the exact analytic gradient there`.
+- **Exact, at a re-solved EBE.** The subject's EBE is re-solved at the trial point (warm from the held one, at the finite-difference stencil's tight tolerance) and the adjoint is run there: one inner solve and one adjoint pass. This serves a decline that is a property of the point, such as an inner Hessian that is not positive definite at an EBE off its mode. Under IOV the re-solve is the joint $(\hat\eta, \hat\kappa)$ mode. Beside subjects that did fall back, the warning says so: `were re-solved to their EBEs at the trial point and given the exact analytic gradient there`. The re-solved mode is handed back to the EBE store as a polished mode is, so the next evaluation starts there and the subject does not decline again from the same off-mode $\hat\eta$.
 - **Reconverged finite differences.** Where the adjoint declines the subject at the re-solved EBE too, and for a **structural** decline (one the subject takes at every parameter point because its exact recording fails, #1536), the gradient is the central difference of the subject's objective with its EBE re-solved at every probe (`2·n_free` warm solves). A structural subject skips the exact attempt, since it would fail again. On a 31-subject fluconazole model with paired total/unbound rows, L-BFGS stalled at OFV 807.9 on the held-EBE gradient against 738.0 with the reconverged one (NONMEM: 734.6). The warning names the two cases separately.
 
-A declined subject that is **repelled** at the trial point (its objective is the `1e20` sentinel) contributes a zero gradient: the population objective there carries the sentinel, so no line search accepts the point and its gradient is never used to take a step. The blown-up-trial guard (#1520) applies before either gradient, [below](#blown-up-trial-salvage).
+A declined subject that is **repelled** at the trial point (its objective is the `1e20` sentinel) contributes a zero gradient: the population objective there carries the sentinel, so no line search accepts the point and its gradient is never used to take a step. The warning names it as `contributed no gradient at the trial points where they declined`. The blown-up-trial guard (#1520) applies before either gradient, [below](#blown-up-trial-salvage).
 
 Because the gradient at the reported estimates is then exact for every subject served at a re-solved EBE, `final_gradient_source` reads `analytic` there; it reads `finite_difference` only when a subject took the finite-difference route.
 

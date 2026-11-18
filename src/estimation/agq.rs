@@ -262,7 +262,10 @@ impl ScoreRoute {
     fn record(self, log: &crate::estimation::outer_optimizer::OuterFdDeclineLog, i: usize) {
         match self {
             ScoreRoute::Exact => {}
-            ScoreRoute::HeldEbe => log.record(i),
+            ScoreRoute::HeldEbe => {
+                log.record(i);
+                log.record_held(i);
+            }
             ScoreRoute::Reconverged => {
                 log.record(i);
                 log.record_structural(i);
@@ -1578,6 +1581,42 @@ pub fn agq_population_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3009 review 2: the quadrature's held-EBE route is the one producer of the held-EBE
+    /// sentence, and its reconverged route the structural one; an exact route records nothing.
+    /// Discriminator and negatives in one test, so forcing either route onto the other's
+    /// record reddens it.
+    #[test]
+    fn score_routes_are_recorded_as_their_own_kind() {
+        use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
+        let mut pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin.csv"),
+            None,
+            None,
+        )
+        .expect("data");
+        pop.subjects.truncate(1);
+        let warn = |route: ScoreRoute| {
+            let log = OuterFdDeclineLog::new(1);
+            route.record(&log, 0);
+            outer_fd_fallback_warning(&pop, &log)
+        };
+        assert!(
+            warn(ScoreRoute::Exact).is_none(),
+            "an exact route is no decline"
+        );
+        let held = warn(ScoreRoute::HeldEbe).expect("held warns");
+        assert!(
+            held.contains("held-EBE route") && held.contains("reconverge_gradient_interval"),
+            "{held}"
+        );
+        assert!(!held.contains("no analytic recorder serves them"), "{held}");
+        let fd = warn(ScoreRoute::Reconverged).expect("reconverged warns");
+        assert!(
+            fd.contains("no analytic recorder serves them") && !fd.contains("held-EBE"),
+            "{fd}"
+        );
+    }
 
     #[test]
     fn inline_iov_slice_table_is_bitwise_identical_to_legacy_allocation() {

@@ -6822,14 +6822,16 @@ pub(crate) mod outer_fd_fallback {
         );
     }
 
-    /// A declined subject's gradient is one of four kinds, worst case over the fit: reconverged
+    /// A declined subject's gradient is one of five kinds, worst case over the fit: reconverged
     /// finite differences because no recorder serves it (structural), reconverged because the
-    /// exact route failed, exact at its re-solved EBE, or a route that records only the decline
-    /// (the quadrature's held-EBE score). The warning names each non-empty group with its count
-    /// and the sentence true of it — never another's: the held-EBE remedy for a subject that
-    /// was served exactly or reconverged, nor "exact" for one that was not. Each cell asserts
-    /// the sentence that must appear and the others that must not, so forcing any group
-    /// reddens it; a subject flagged in two groups counts in the worse one.
+    /// exact route failed, the quadrature's held-EBE score (the only producer of that kind),
+    /// zero (repelled, or dropped by the #1520 guard), or exact at its re-solved EBE. The
+    /// warning names each non-empty group with its count and the sentence true of it — never
+    /// another's: the held-EBE remedy for a subject that was repelled, served exactly or
+    /// reconverged, nor "exact" for one that was not. Each cell asserts the sentence that
+    /// must appear and the others that must not, so forcing any group reddens it; a subject
+    /// flagged in two groups counts in the worse one. A population served exactly throughout
+    /// has no fallback to report, so no warning at all.
     #[test]
     fn consequence_sentence_names_each_salvage_group() {
         let (model, analytic, declining) = analytic_and_declining();
@@ -6843,12 +6845,15 @@ pub(crate) mod outer_fd_fallback {
              results are correct but slower.";
         const EXACT: &str = "were re-solved to their EBEs at the trial point and given the \
              exact analytic gradient there.";
-        const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
-             term the analytic gradient carries. If the fit stalls, \
+        const HELD: &str = "used fixed-EBE outer gradients (the quadrature's held-EBE route), \
+             which omit the EBE-response term the analytic gradient carries. If the fit stalls, \
              `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
              evaluation.";
+        const ZERO: &str = "contributed no gradient at the trial points where they declined: \
+             their objective there was non-finite or at the failed-subject sentinel (or the \
+             incumbent guard dropped them), so the optimizer rejects those points.";
         const SKIPPED: &str = "1 of their salvage gradients were skipped";
-        let warn = |flags: &dyn Fn(&OuterFdDeclineLog), skipped: bool| {
+        let warn_opt = |flags: &dyn Fn(&OuterFdDeclineLog), skipped: bool| {
             let log = OuterFdDeclineLog::new(2);
             log.record(0);
             log.record(1);
@@ -6856,7 +6861,10 @@ pub(crate) mod outer_fd_fallback {
             if skipped {
                 log.record_skipped_salvage();
             }
-            outer_fd_fallback_warning(&pop, &log).expect("declines warn")
+            outer_fd_fallback_warning(&pop, &log)
+        };
+        let warn = |flags: &dyn Fn(&OuterFdDeclineLog), skipped: bool| {
+            warn_opt(flags, skipped).expect("declines warn")
         };
         let only = |w: &str, present: &str| {
             for (name, sentence) in [
@@ -6864,6 +6872,7 @@ pub(crate) mod outer_fd_fallback {
                 ("RECON", RECON),
                 ("EXACT", EXACT),
                 ("HELD", HELD),
+                ("ZERO", ZERO),
             ] {
                 assert_eq!(
                     w.contains(sentence),
@@ -6872,16 +6881,53 @@ pub(crate) mod outer_fd_fallback {
                 );
             }
         };
-        only(&warn(&|_| {}, false), HELD);
+        // A decline nothing recorded a route for took no gradient: zero, never the held-EBE
+        // sentence (#3009 review: the old fall-through said "held" for a zero-filled subject).
+        only(&warn(&|_| {}, false), ZERO);
+        only(
+            &warn(
+                &|l| {
+                    l.record_zeroed(0);
+                    l.record_zeroed(1);
+                },
+                false,
+            ),
+            ZERO,
+        );
+        only(
+            &warn(
+                &|l| {
+                    l.record_held(0);
+                    l.record_held(1);
+                },
+                false,
+            ),
+            HELD,
+        );
+        // Zero on one evaluation, exact on another is a zero-contributing subject.
         only(
             &warn(
                 &|l| {
                     l.record_exact(0);
                     l.record_exact(1);
+                    l.record_zeroed(0);
+                    l.record_zeroed(1);
                 },
                 false,
             ),
-            EXACT,
+            ZERO,
+        );
+        // Every decline served exactly: no fallback ran, so nothing to warn about.
+        assert!(
+            warn_opt(
+                &|l| {
+                    l.record_exact(0);
+                    l.record_exact(1);
+                },
+                false
+            )
+            .is_none(),
+            "an all-exact population has no fallback to report"
         );
         only(
             &warn(
@@ -7089,6 +7135,251 @@ pub(crate) mod outer_fd_fallback {
         );
     }
 
+    /// #3009 review 1: a served decline hands its re-solved mode back as a polished one, so
+    /// the EBE store adopts it. The subject's held `η̂` is moved off the mode; the exact route
+    /// re-solves and differentiates at the mode, and without the hand-back the store would keep
+    /// the off-mode `η̂` (the subject then declines and pays the re-solve at every evaluation,
+    /// scored at the held `η̂` while its gradient is the mode's).
+    ///
+    /// Asserted: the polished mode is the tight EBE and not the held one (a straddle: the two
+    /// are 0.2 apart in every η); after [`adopt_polished_modes`] the store holds it and the
+    /// objective scored there equals the objective at the EBE and not the held `η̂`'s; and the
+    /// served gradient is the central difference of that re-solved objective (the oracle the
+    /// optimizer's objective is, `subject_reconverged_fd_gradient`). Mutation: returning
+    /// `None` for the mode in [`declined_salvage`] reddens the `expect`.
+    #[test]
+    fn a_served_decline_hands_its_resolved_mode_to_the_store() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let prep = crate::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare");
+        let model = &prep.parsed.model;
+        let pop = mk_pop(vec![prep.population.subjects[0].clone()]);
+        let params = &prep.init_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let at = unpack_params(&x, params);
+        let ebe = find_ebe_for_stage(
+            model,
+            &pop.subjects[0],
+            &at,
+            500,
+            1e-12,
+            None,
+            None,
+            0,
+            &opts,
+        );
+        let held = &ebe.eta + DVector::from_element(model.n_eta, 0.2);
+        let mut ehs = vec![held.clone()];
+        let mut hms = vec![ebe.h_matrix.clone()];
+        let log = OuterFdDeclineLog::new(1);
+        log.force_decline(0);
+        let (g, _, polished) = population_gradient_sens_mixed_dx(
+            &x,
+            params,
+            model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+            false,
+        );
+        assert!(log.all_declines_exact(), "served exactly, not by FD");
+        let mode = polished[0]
+            .clone()
+            .expect("a served decline hands its mode back");
+        assert!(mode.iter().all(|v| v.is_finite()));
+        let mut to_ebe = 0.0f64;
+        let mut to_held = 0.0f64;
+        for ((m, e), h) in mode.iter().zip(ebe.eta.iter()).zip(held.iter()) {
+            to_ebe = to_ebe.max((m - e).abs()); // nan-ok: every operand asserted finite above
+            to_held = to_held.max((m - h).abs()); // nan-ok: every operand asserted finite above
+        }
+        eprintln!(
+            "MEASURE polished mode: {to_ebe:.3e} from the EBE, {to_held:.3e} from the held eta"
+        );
+        assert!(to_ebe < 1e-5, "the mode is the re-solved EBE: {to_ebe:e}");
+        assert!(
+            to_held > 0.1,
+            "straddle: the held eta is off the mode: {to_held:e}"
+        );
+
+        let mut kappas = vec![Vec::new()];
+        adopt_polished_modes(
+            model,
+            &pop,
+            params,
+            &x,
+            &polished,
+            &mut ehs,
+            &mut hms,
+            &mut kappas,
+        );
+        let nll_at = |eta: &DVector<f64>, h: &DMatrix<f64>| {
+            crate::stats::likelihood::foce_subject_nll(
+                model,
+                &pop.subjects[0],
+                &at.theta,
+                eta,
+                h,
+                &at.omega,
+                &at.sigma.values,
+                &at.residual_correlations,
+                true,
+            )
+        };
+        let adopted = nll_at(&ehs[0], &hms[0]);
+        let at_ebe = nll_at(&ebe.eta, &ebe.h_matrix);
+        let stale = nll_at(&held, &ebe.h_matrix);
+        eprintln!(
+            "MEASURE nll adopted {adopted:.9}, at the EBE {at_ebe:.9}, at the held eta {stale:.9}"
+        );
+        assert!(
+            (adopted - at_ebe).abs() < 1e-6 * (1.0 + at_ebe.abs()),
+            "{adopted} vs {at_ebe}"
+        );
+        assert!(
+            (stale - at_ebe).abs() > 1e-3,
+            "straddle: the held eta scores differently, {stale} vs {at_ebe}"
+        );
+
+        let oracle: Vec<f64> = subject_reconverged_fd_gradient(
+            &x,
+            params,
+            model,
+            &pop.subjects[0],
+            &held,
+            &bounds,
+            &opts,
+        )
+        .iter()
+        .map(|g| 2.0 * g)
+        .collect();
+        let gap = worst_rel_gap(&g, &oracle);
+        eprintln!("MEASURE served vs central difference of the re-solved objective {gap:.3e}");
+        assert!(gap < 3e-6, "{gap:e}");
+    }
+
+    /// #3009 review 1, IOV: the joint `[η̂, κ̂]` mode comes back at the full stacked width,
+    /// from an off-mode joint start, and is the re-solved one.
+    #[test]
+    fn an_iov_served_decline_hands_back_the_joint_mode() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let stage = FitOptions {
+            method: EstimationMethod::Foce,
+            interaction: false,
+            ..FitOptions::default()
+        };
+        let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+            .expect("prepare");
+        let (model, s) = (&prep.parsed.model, &prep.population.subjects[0]);
+        let p = &prep.init_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(p);
+        let at = unpack_params(&x, p);
+        let ebe = find_ebe_for_stage(model, s, &at, 500, 1e-12, None, None, 0, &stage);
+        let mode_true = joint_warm_start(&ebe.eta, &ebe.kappas);
+        let held = &mode_true + DVector::from_element(mode_true.len(), 0.2);
+        let log = OuterFdDeclineLog::new(1);
+        log.record(0);
+        let (_, mode) = declined_salvage(false, 0, &x, p, model, s, &held, &bounds, &stage, &log);
+        let mode = mode.expect("an exact salvage hands its mode back");
+        assert_eq!(
+            mode.len(),
+            mode_true.len(),
+            "eta and every occasion's kappa"
+        );
+        let (mut to_true, mut to_held) = (0.0f64, 0.0f64);
+        for ((m, t), h) in mode.iter().zip(mode_true.iter()).zip(held.iter()) {
+            assert!(m.is_finite());
+            to_true = to_true.max((m - t).abs()); // nan-ok: m asserted finite in this loop
+            to_held = to_held.max((m - h).abs()); // nan-ok: m asserted finite in this loop
+        }
+        eprintln!(
+            "MEASURE IOV joint mode: {to_true:.3e} from the mode, {to_held:.3e} from the held start"
+        );
+        assert!(to_true < 1e-4, "re-solved: {to_true:e}");
+        assert!(
+            to_held > 0.1,
+            "straddle: the held start is off the mode: {to_held:e}"
+        );
+    }
+
+    /// #3009 review 2: a repelled declined subject (objective at the sentinel at the held
+    /// `η̂`) contributes zero and is recorded as such. The warning then says that, with the
+    /// discriminator (the zero sentence) and its negatives (not the held-EBE remedy, not
+    /// a reconverged difference). Without the flag the same log reads as exact and is silent
+    /// (second half), so dropping `record_zeroed` in [`non_iov_declined_salvage`] reddens it.
+    #[test]
+    fn a_repelled_declined_subject_is_recorded_and_worded_as_zero() {
+        let (model, _analytic, declining) = analytic_and_declining();
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let pop = mk_pop(vec![declining.clone(), declining.clone()]);
+        let n_obs = declining.observations.len();
+        let eta = DVector::from_element(model.n_eta, 0.1);
+        let h_repelled = DMatrix::from_element(n_obs, model.n_eta, f64::NAN);
+        let log = OuterFdDeclineLog::new(2);
+        log.record(0);
+        log.record(1);
+        // Both were served exactly at an earlier evaluation (recorded as the salvage does);
+        // subject 0 is then repelled, which must outrank that.
+        log.record_exact(0);
+        log.record_exact(1);
+        let (g, mode) = non_iov_declined_salvage(
+            false,
+            &x,
+            params,
+            &model,
+            &pop,
+            0,
+            &eta,
+            &h_repelled,
+            &bounds,
+            &opts,
+            &log,
+        );
+        assert_eq!((g, mode), (vec![0.0; x.len()], None));
+        let w = outer_fd_fallback_warning(&pop, &log).expect("a zeroed decline warns");
+        assert!(
+            w.contains(
+                "of these, 1 were re-solved to their EBEs at the trial point and given the exact analytic gradient there. Another 1 contributed no gradient at the trial points where they declined"
+            ) && w.contains("Another 1 contributed"),
+            "{w}"
+        );
+        assert!(
+            !w.contains("held-EBE")
+                && !w.contains("reconverge_gradient_interval")
+                && !w.contains("finite-difference"),
+            "a zero-filled subject is not a held-EBE or reconverged one: {w}"
+        );
+        // The flag is what makes it zero: the exact-only log is silent, and gains the
+        // warning exactly when the subject is also recorded as zeroed.
+        let log2 = OuterFdDeclineLog::new(2);
+        log2.record(0);
+        log2.record_exact(0);
+        assert!(outer_fd_fallback_warning(&pop, &log2).is_none());
+        log2.record_zeroed(0);
+        assert!(outer_fd_fallback_warning(&pop, &log2).is_some());
+    }
+
     /// #3004 (B2.7) under IOV, through [`declined_salvage`] directly (the IOV assembly does not
     /// read the forced flags): the salvage at the re-solved joint mode equals the analytic IOV
     /// gradient and the reconverged oracle, and is recorded exact.
@@ -7116,8 +7407,15 @@ pub(crate) mod outer_fd_fallback {
         );
         let log = OuterFdDeclineLog::new(1);
         log.record(0);
-        let served = declined_salvage(false, 0, &x, p, model, s, &stacked, &bounds, &stage, &log);
+        let (served, mode) =
+            declined_salvage(false, 0, &x, p, model, s, &stacked, &bounds, &stage, &log);
         assert!(log.all_declines_exact(), "served exactly");
+        // The joint mode the gradient was taken at flows back like a polished one: the full
+        // stacked [η̂, κ̂] width, so `adopt_polished_modes` takes the κ̂ cells too.
+        assert_eq!(
+            mode.expect("an exact salvage hands its mode back").len(),
+            stacked.len()
+        );
         let analytic = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
             model,
             s,
@@ -7156,7 +7454,7 @@ pub(crate) mod outer_fd_fallback {
         let eta = DVector::from_element(model.n_eta, 0.1);
         let log = OuterFdDeclineLog::new(1);
         log.record(0);
-        let got = declined_salvage(
+        let (got, mode) = declined_salvage(
             false,
             0,
             &x,
@@ -7168,6 +7466,7 @@ pub(crate) mod outer_fd_fallback {
             &opts,
             &log,
         );
+        assert!(mode.is_none(), "a reconverged salvage has no single mode");
         let oracle =
             subject_reconverged_fd_gradient(&x, params, &model, &declining, &eta, &bounds, &opts);
         assert_eq!(got, oracle);
@@ -7312,8 +7611,8 @@ pub(crate) mod outer_fd_fallback {
                 &OuterFdDeclineLog::new(1),
             )
         };
-        assert_eq!(salvage(&h_repelled), vec![0.0; x.len()]);
-        assert_eq!(salvage(&h_usable), unguarded);
+        assert_eq!(salvage(&h_repelled).0, vec![0.0; x.len()]);
+        assert_eq!(salvage(&h_usable).0, unguarded);
     }
 
     /// #1722 review finding 1: the per-subject FD salvage re-solves the subject's EBE under
@@ -8795,6 +9094,16 @@ pub(crate) mod outer_fd_fallback {
             log_guarded.skipped_salvages(),
             1,
             "exactly one salvage skipped"
+        );
+        // The dropped subject is recorded as a zero contribution (its worst kind is still
+        // structural, the worse of the two, so the sentence is the structural one).
+        assert!(
+            log_guarded.zeroed[1].load(Ordering::Relaxed),
+            "the guard's drop is recorded as zero"
+        );
+        assert!(
+            !log_plain.zeroed[1].load(Ordering::Relaxed),
+            "and only the guard's"
         );
         let g0 = subject_analytic_outer_gradient(
             &model,

@@ -2222,13 +2222,11 @@ fn a_subject_that_declines_at_runtime_gets_the_exact_envelope_gradient() {
     assert!(exact < G1_HANDED_BOUND, "{exact}");
 }
 
-/// A profiled fit reports the subjects that declined the analytic outer gradient at
-/// runtime, as an unprofiled fit does (#1154): before, `optimize_profiled` built its own
-/// decline log and never read it, so the fallback was silent. Non-IOV F2 (analytic at
-/// model level), every subject forced to decline: the warning counts them and names the
-/// **exact** salvage they get (#3004), not a held-EBE one. The same fit without the switch
-/// is the straddle — no warning. Dies when the warning is not emitted, or names another
-/// salvage.
+/// A profiled fit reads the decline log it builds, as an unprofiled fit does (#1154): non-IOV
+/// F2 (analytic at model level), every subject forced to decline. Each decline is served
+/// exactly at its re-solved EBE (#3004), so no fallback ran and no warning is emitted
+/// (#3009 review 3); the same fit without the switch likewise. The warning's text for
+/// declines that are not served exactly is pinned in `outer_optimizer_tests`.
 #[test]
 fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
     let p = prep(F2, F2_DATA, Some(2), |t| {
@@ -2260,19 +2258,10 @@ fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
     FORCE_PROFILED_DECLINES.with(|c| c.set(false));
     let forced = forced.unwrap_or_else(|e| std::panic::resume_unwind(e));
     let w = fallback(&forced);
-    assert_eq!(w.len(), 1, "{:?}", forced.warnings);
-    assert!(
-        w[0].starts_with(&format!("{n} of {n} subjects")),
-        "{}",
-        w[0]
-    );
-    assert!(
-        w[0].contains("were re-solved to their EBEs at the trial point and given the exact")
-            && !w[0].contains("fixed-EBE")
-            && !w[0].contains("finite-difference"),
-        "every decline is served exactly: {}",
-        w[0]
-    );
+    // Every decline is served exactly at its re-solved EBE (#3004), so no fallback ran and
+    // there is nothing to warn about (#3009 review 3): the old sentence claimed both.
+    assert!(w.is_empty(), "{:?}", forced.warnings);
+    let _ = n;
 
     let plain = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     assert!(fallback(&plain).is_empty(), "{:?}", plain.warnings);

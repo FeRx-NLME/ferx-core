@@ -642,7 +642,7 @@ pub(crate) fn mixture_gradient_salvaged(
         Some(&salvage),
         |f| f(),
     )
-    .expect("an IOV mixture gradient needs every class's κ̂ (`modes`), one per occasion");
+    .expect("an IOV mixture gradient needs the class modes (`modes`)");
     let mut grad = vec![0.0f64; packed_segments(params).total()];
     for row in &rows {
         for (g, v) in grad.iter_mut().zip(row) {
@@ -721,18 +721,42 @@ pub(crate) fn mixture_subject_gradients(
                 }
                 // `MIXNUM` resolves to the class on this (worker) thread.
                 let _class = MixtureClassGuard::enter(cls + 1);
+                let mut misshaped = false;
                 let eta = match modes.filter(|_| iov) {
-                    Some(m) => {
-                        DVector::from_column_slice(&crate::estimation::covariance::stacked_mode(
-                            model,
-                            subject,
-                            &eval.etas_by_class[cls][i],
-                            m.kappas[cls].get(i),
-                        )?)
-                    }
+                    Some(m) => match crate::estimation::covariance::stacked_mode(
+                        model,
+                        subject,
+                        &eval.etas_by_class[cls][i],
+                        m.kappas[cls].get(i),
+                    ) {
+                        Some(mode) => DVector::from_column_slice(&mode),
+                        // A κ̂ count or width that does not match the occasions (a class
+                        // solve that failed or was hard-rejected): the value scores this
+                        // term at `class_nll`, the sentinel for such a mode. A repelled
+                        // term contributes zero, as a non-mixture subject does; one with a
+                        // real objective takes the reconverged difference from κ̂ = 0, which
+                        // re-solves its own mode (the exact route would differentiate at the
+                        // κ̂ = 0 start, not at a mode). Only with a salvage: without one the
+                        // decline is `None` for the whole.
+                        None if salvage.is_none() => return None,
+                        None if !crate::stats::likelihood::is_usable_subject_nll(
+                            eval.class_nll[i][cls],
+                        ) =>
+                        {
+                            continue
+                        }
+                        None => {
+                            misshaped = true;
+                            let cells =
+                                crate::stats::stacked_layout::group_count(subject) * model.n_kappa;
+                            let mut stacked = eval.etas_by_class[cls][i].as_slice().to_vec();
+                            stacked.resize(stacked.len() + cells, 0.0);
+                            DVector::from_vec(stacked)
+                        }
+                    },
                     None => eval.etas_by_class[cls][i].clone(),
                 };
-                let exact = points[cls].as_ref().and_then(|pt| {
+                let exact = points[cls].as_ref().filter(|_| !misshaped).and_then(|pt| {
                     crate::estimation::sens_outer_gradient::subject_gradient_at(
                         model,
                         subject,
@@ -1989,6 +2013,116 @@ mod tests {
         }
         eprintln!("IOV mixture_gradient vs reconverged FD: worst {worst:.2e}");
         assert!(worst < 1e-7, "{worst:.2e}");
+    }
+
+    /// #3009 review 4: a class mode whose κ̂ count does not match the subject's occasions (a
+    /// failed or hard-rejected class solve) used to panic [`super::mixture_gradient_salvaged`]
+    /// (`.expect` on the whole row). The value path scores that term at `class_nll`:
+    ///
+    /// - with a real objective, the term takes the reconverged difference from a κ̂ = 0 start,
+    ///   which re-solves its own mode and is recorded on the log — the same gradient as the
+    ///   clean modes' (measured below; differentiating at the κ̂ = 0 start itself is off by
+    ///   2.6e-2);
+    /// - at the sentinel (repelled), it contributes zero — bit for bit the gradient with that
+    ///   term's weight zeroed — and nothing is recorded.
+    ///
+    /// The second half is a straddle on the first: zeroing a term whose value is real moves the
+    /// gradient (asserted), so a zero fill that ignored `class_nll` would redden the first half.
+    #[test]
+    fn iov_mixture_gradient_survives_a_misshaped_class_mode() {
+        use crate::estimation::outer_optimizer::OuterFdDeclineLog;
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            inner_tol: 1e-10,
+            ..crate::types::FitOptions::default()
+        };
+        let params = &model.default_params;
+        let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        let n = pop.subjects.len();
+        let clean_log = OuterFdDeclineLog::new(n);
+        let clean = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            &clean_log,
+        );
+        assert!(
+            clean_log.declined_indices().is_empty(),
+            "control: nothing declines"
+        );
+
+        // The class with the larger weight for subject 0: its term is live.
+        let cls = if eval.pmix[0][0] >= eval.pmix[0][1] {
+            0
+        } else {
+            1
+        };
+        assert!(eval.pmix[0][cls] > 0.1, "fixture: a live term");
+        let mut bad = super::MixtureClassModes {
+            kappas: modes.kappas.clone(),
+        };
+        assert!(bad.kappas[cls][0].len() >= 2, "fixture: several occasions");
+        bad.kappas[cls][0].pop();
+
+        // Real objective: differenced at the re-solved mode.
+        let log = OuterFdDeclineLog::new(n);
+        let g =
+            super::mixture_gradient_salvaged(&model, &pop, params, &opts, &eval, Some(&bad), &log);
+        assert_eq!(
+            log.declined_indices(),
+            vec![0],
+            "the mis-shaped term is salvaged"
+        );
+        let mut worst = 0.0f64;
+        for (a, b) in g.iter().zip(&clean) {
+            assert!(a.is_finite() && b.is_finite());
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        eprintln!("MEASURE mis-shaped class mode, salvaged vs clean: worst rel {worst:.3e}");
+        assert!(worst < 1e-4, "{worst:e}");
+
+        // Repelled: the term is zero, exactly as if its weight were.
+        let (mut repelled, _) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        repelled.class_nll[0][cls] = crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+        let log = OuterFdDeclineLog::new(n);
+        let g0 = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &repelled,
+            Some(&bad),
+            &log,
+        );
+        assert!(
+            log.declined_indices().is_empty(),
+            "a repelled term takes no salvage"
+        );
+        let (mut unweighted, _) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        unweighted.pmix[0][cls] = 0.0;
+        let want = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &unweighted,
+            Some(&modes),
+            &OuterFdDeclineLog::new(n),
+        );
+        assert_eq!(g0, want, "a repelled term contributes exactly zero");
+        let live = g0
+            .iter()
+            .zip(&clean)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max); // nan-ok: every operand asserted finite above
+        assert!(
+            live > 1e3 * worst,
+            "straddle: the zeroed term is live, {live:e} vs {worst:e}"
+        );
     }
 
     #[test]
