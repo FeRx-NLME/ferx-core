@@ -106,10 +106,11 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
 }
 
 /// An `SS=1` dose whose lag is past `II`, as `crate::pk::predict_concentration` and
-/// `crate::pk::analytical_state_at_times` read it (#1121, #3028): the train from its pulse on the record (`crate::dosing::ss_seed_phase` is `0`),
-/// plus the one real dose arriving at `t_eff` once it has — `(ss_elapsed, arrival_elapsed)`.
-/// `None` for every other dose, which [`lagged_elapsed`] serves (#1353: its wrap and collapsed
-/// arrival put the jets ~19 % from these predictions, the outer gradient 100 % off).
+/// `crate::pk::analytical_state_at_times` read it (#1121, #3028): the train from its pulse on
+/// the record (`crate::dosing::ss_seed_phase` is `0`), plus the one real dose arriving at
+/// `t_eff` once it has — `(ss_elapsed, arrival_elapsed)`. `None` for every other dose, which
+/// [`lagged_elapsed`] serves (#1353: its wrap and collapsed arrival put the jets ~19 % from
+/// these predictions, the outer gradient 100 % off).
 #[inline]
 fn ss_lag_past_ii<T: PkNum>(
     dose: &DoseEvent,
@@ -126,6 +127,19 @@ fn ss_lag_past_ii<T: PkNum>(
         since,
         arrived(dose, t_obs, lag_val, lag_d).then(|| since - lag_d),
     ))
+}
+
+/// The elapsed times `dose` is superposed at by `t_obs`: [`ss_lag_past_ii`]'s pair past
+/// `lag = II`, else [`lagged_elapsed`]'s one term (the only route to it). `None`: no term.
+#[inline]
+fn lagged_terms<T: PkNum>(
+    dose: &DoseEvent,
+    t_obs: f64,
+    lag_val: f64,
+    lag_d: T,
+) -> Option<(T, Option<T>)> {
+    ss_lag_past_ii(dose, t_obs, lag_val, lag_d)
+        .or_else(|| lagged_elapsed(dose, t_obs, lag_val, lag_d).map(|e| (e, None)))
 }
 
 /// Whether `dose` has arrived by `t_obs` (`dose.time + lag ≤ t_obs`); a recording decides on its
@@ -284,17 +298,13 @@ fn superpose_doses<T: PkNum>(
         {
             continue;
         }
-        let (elapsed, arrival) = match ss_lag_past_ii(dose, t_obs, d.lag_val, d.lag_d) {
-            Some(terms) => terms,
-            None => match lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) {
-                Some(e) => (e, None),
-                None => continue,
-            },
+        let Some((elapsed, arrival)) = lagged_terms(dose, t_obs, d.lag_val, d.lag_d) else {
+            continue;
         };
-        // Each dose's term its own chunk (an arrival past `lag = II` one more): its code depends on
-        // the dose's kind and the model, not
-        // on how many doses came before, so subjects with different designs share it (their
-        // times and amounts are the chunk's literals) and it is compiled once per model (#2980).
+        // Each dose's term its own chunk (an arrival past `lag = II` one more): its code depends
+        // on the dose's kind and the model, not on how many doses came before, so subjects with
+        // different designs share it (their times and amounts are the chunk's literals) and it is
+        // compiled once per model (#2980).
         T::chunk_mark();
         // A degenerate `CL` or `V` drops the dose and a `NaN` one makes it `NaN`: the value
         // path's own override in `pk::single_dose_concentration`, from the same helper, so
@@ -498,7 +508,7 @@ pub(crate) fn apply_closed_form_readout_g<'p, T: crate::sens::num::vm::VmNum>(
 
 /// The oral depot amount at every observation (`pk::analytical_state_at_times`, slot 0) over
 /// the recording's number type: the superposed `F·amt·e^{−ka·τ}` of every bolus into the
-/// depot (an infusion bypasses it), `τ` the lagged elapsed time of [`lagged_elapsed`], an SS
+/// depot (an infusion bypasses it), `τ` the lagged elapsed times of [`lagged_terms`], an SS
 /// bolus scaled by the steady-state factor, floored at zero — all at the **one** snapshot
 /// `pk` production reads it from (the subject-static `t = 0` parameters of the occasion), so
 /// on a time-varying-covariate subject it is not the per-observation snapshot the readout's own
@@ -525,12 +535,8 @@ pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
                 {
                     continue;
                 }
-                let (tau, arrival) = match ss_lag_past_ii(dose, t_obs, d.lag_val, d.lag_d) {
-                    Some(terms) => terms,
-                    None => match lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) {
-                        Some(e) => (e, None),
-                        None => continue,
-                    },
+                let Some((tau, arrival)) = lagged_terms(dose, t_obs, d.lag_val, d.lag_d) else {
+                    continue;
                 };
                 if d.ka_d.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
                     || tau.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)

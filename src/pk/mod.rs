@@ -3168,44 +3168,32 @@ pub fn analytical_state_at_times(
                 if !crate::dosing::ss_reset_live(&subject.doses, cutoff, k) {
                     continue;
                 }
+                // `predict_concentration`'s two cases, term for term (#1121, #3028).
                 let t_eff = dose.time + lagtime;
-                // Past `lag = II`, `predict_concentration`'s clamp and split (#1121, #3028): the
-                // train from its pulse on the record, plus the one real arrival on its own.
-                if dose.ss
-                    && dose.ii > 0.0
-                    && t >= dose.time
-                    && !crate::dosing::ss_arrival_is_trough(dose, lagtime)
-                {
-                    let mut add = |dose: &DoseEvent, tau: f64| {
-                        for (s, v) in state
-                            .iter_mut()
-                            .zip(single_dose_states(pk_model, dose, tau, pk_params))
-                        {
-                            *s += v;
-                        }
-                    };
-                    add(
-                        dose,
-                        t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime),
-                    );
-                    if t_eff <= t {
+                let tau = if t_eff <= t {
+                    if dose.ss
+                        && dose.ii > 0.0
+                        && !crate::dosing::ss_arrival_is_trough(dose, lagtime)
+                    {
+                        // Past `lag = II`: the train from its pulse on the record, plus the one
+                        // real arrival on its own.
                         let mut arrival = dose.clone();
                         arrival.ss = false;
-                        add(&arrival, t - t_eff);
-                    }
-                    continue;
-                }
-                let tau = if t_eff <= t {
-                    t - t_eff
-                } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
-                    let raw = t - t_eff;
-                    let n = (-raw / dose.ii).ceil();
-                    let wrapped = raw + n * dose.ii;
-                    if wrapped >= 0.0 {
-                        wrapped
-                    } else {
+                        let tail = t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime);
+                        for (s, (a, b)) in state.iter_mut().zip(
+                            single_dose_states(pk_model, dose, tail, pk_params)
+                                .into_iter()
+                                .zip(single_dose_states(pk_model, &arrival, t - t_eff, pk_params)),
+                        ) {
+                            *s += a;
+                            *s += b;
+                        }
                         continue;
                     }
+                    t - t_eff
+                } else if dose.ss && dose.ii > 0.0 && t >= dose.time {
+                    // The pre-arrival tail: the pulse before the record, `ss_seed_phase` old.
+                    t - dose.time + crate::dosing::ss_seed_phase(dose, lagtime)
                 } else {
                     continue;
                 };

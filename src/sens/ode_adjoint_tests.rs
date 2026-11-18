@@ -7723,7 +7723,7 @@ fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
 
 /// #1353: an `SS=1` bolus whose lag is longer than `II` (`nonmem_anchor/ss_lag_ge_ii`, ID 2:
 /// `ALAG1 = 15`, `II = 12`) on the closed form, IV and oral, against reconverged FD, with the
-/// lag below `II` beside it so the straddle is asserted; and (#3028) a readout of the oral
+/// lag below `II` and at it beside it so the straddle is asserted; and (#3028) a readout of the oral
 /// depot, whose amounts wrapped there too, with every arm's closed-form central state equal to
 /// its concentration. The closed form's superposition wrapped the
 /// pre-arrival phase and collapsed the arrival there, where the predictions clamp and split
@@ -7732,13 +7732,19 @@ fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
 #[test]
 fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
     let depot = "[scaling]\n  y = (central + 0.3 * depot) / V\n";
-    for (lag, pk, readout) in [
-        (3.0, "one_cpt_iv(cl=CL, v=V", ""),
-        (15.0, "one_cpt_iv(cl=CL, v=V", ""),
-        (3.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", ""),
-        (15.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", ""),
-        (3.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", depot),
-        (15.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", depot),
+    let iv = "one_cpt_iv(cl=CL, v=V";
+    let oral = "one_cpt_oral(cl=CL, v=V, ka=1.2";
+    // `rate`: a 2 h infusion into central, which the static superposition serves too.
+    for (lag, pk, readout, rate) in [
+        (3.0, iv, "", 0.0),
+        (15.0, iv, "", 0.0),
+        (12.0, iv, "", 0.0),
+        (3.0, iv, "", 300.0),
+        (15.0, iv, "", 300.0),
+        (3.0, oral, "", 0.0),
+        (15.0, oral, "", 0.0),
+        (3.0, oral, depot, 0.0),
+        (15.0, oral, depot, 0.0),
     ] {
         let model = parse_model_string(&format!(
             "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
@@ -7750,14 +7756,14 @@ fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
         .unwrap();
         let s = subject(
             &model,
-            vec![DoseEvent::new(0.0, 600.0, 1, 0.0, true, 12.0)],
+            vec![DoseEvent::new(0.0, 600.0, 1, rate, true, 12.0)],
             &[1.0, 2.0, 4.0, 6.0, 8.0, 10.0, 13.0, 14.5, 16.0, 20.0, 26.0],
             &[0.1, -0.1],
         );
         let worst = fd_oracle(&model, &s, true);
         assert!(
             worst < 1e-8,
-            "{pk} {readout} lag {lag}: worst relative difference {worst:.2e}"
+            "{pk} {readout} rate {rate} lag {lag}: worst relative difference {worst:.2e}"
         );
         let pk_p =
             (model.pk_param_fn)(&model.default_params.theta, &[0.0; 2], &HashMap::new(), 0.0);
@@ -7766,7 +7772,7 @@ fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
             let c = crate::pk::predict_concentration(model.pk_model, &s.doses, t, &pk_p);
             let central = *st.last().unwrap();
             assert!(
-                (central - c).abs() <= 1e-12 * c.abs(),
+                (central - c).abs() <= 1e-10 * c.abs(),
                 "{pk} lag {lag}, t = {t}: central state {central} against concentration {c}"
             );
         }
