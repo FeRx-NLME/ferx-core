@@ -190,6 +190,10 @@ impl<const N: usize, B: PkNum> crate::sens::num::RecHooks for DualT<N, B> {
     // be the recorder's to record, not a dual's to carry): nothing integrates one, and the
     // driver's entry points assert it.
     const ODE_DRIVER_OK: bool = !B::RECORDS_BRANCHES;
+    #[cfg(feature = "markov")]
+    fn note_declined() {
+        B::note_declined();
+    }
     fn floor_c(self) -> Self {
         DualT {
             v: self.v.floor_c(),
