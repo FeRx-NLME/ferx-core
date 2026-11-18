@@ -4677,6 +4677,38 @@ pub enum LinkFn {
 pub type LinearPredictorFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
+#[cfg(feature = "survival")]
+/// Distribution family of a `[count_model]` endpoint (#2877).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountFamily {
+    /// Poisson: `P(Y = k) = λᵏ e^{−λ} / k!`, variance `λ`.
+    Poisson,
+    /// Negative binomial in the mean / size parameterisation (`type = negbin`): mean `λ`,
+    /// size `r > 0`, variance `λ + λ²/r`. The Poisson is the `r → ∞` limit.
+    NegBin,
+}
+
+#[cfg(feature = "survival")]
+/// Which scale a `[count_model]` mean expression is written on (#2877): `lambda = …` gives
+/// the mean itself (it must evaluate to a finite positive number), `log_lambda = …` gives
+/// `log λ` (any finite number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountMeanScale {
+    /// `lambda = …`: the expression is the mean count `λ`.
+    Linear,
+    /// `log_lambda = …`: the expression is `log λ`.
+    Log,
+}
+
+#[cfg(feature = "survival")]
+/// Closure evaluating a `[count_model]` endpoint's parameters at one record from
+/// `(theta, eta, covariates)`: `[mean, size]`, the mean on the endpoint's
+/// [`CountMeanScale`] and the negative-binomial size `r` (`NaN` for a Poisson endpoint,
+/// which has none). Called under the record's model-time scope, as
+/// [`LinearPredictorFn`] is.
+pub type CountParamFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> [f64; 2] + Send + Sync>;
+
 #[cfg(feature = "markov")]
 /// Closure building a CTMM generator matrix `Q(θ, η, covariates, state)` — the
 /// S×S transition-intensity (generator) matrix for a continuous-time Markov
@@ -4849,7 +4881,28 @@ pub enum EndpointLikelihood {
         /// refused at fit setup by `crate::api::check_survival_tv_covariates` (#741).
         prob_covariates: Vec<String>,
     },
-    // Ordinal, Poisson, NegBin deferred to Phase 4
+    /// Count endpoint (#2877): a non-negative integer DV observed via
+    /// [`ObsRecord::Count`], scored per record against a Poisson or negative-binomial law
+    /// with mean `λ(θ, η, covariates, TIME)` — the `[count_model]` block. The data term is
+    /// `−Σ log P(Y = k_r)`, constant `ln Γ(k + 1)` included (NONMEM's `F_FLAG = 1`
+    /// `−2·log PMF` convention).
+    Count {
+        family: CountFamily,
+        /// Scale the mean expression is written on (`lambda` / `log_lambda`).
+        scale: CountMeanScale,
+        /// `[mean, size]` at one record — see [`CountParamFn`].
+        param_fn: CountParamFn,
+        /// Resolved, dual-evaluable form of the same expressions (the mean, then `r` for a
+        /// negative binomial), for the exact inner / outer derivatives through the
+        /// discrete term's plan. `None` — the endpoint keeps its FD gradient — when an
+        /// expression cannot be represented exactly.
+        param_program: Option<crate::parser::model_parser::EndpointExprProgram>,
+        /// Covariate names the mean and size read (including through
+        /// `[individual_parameters]`). Read at each record's own covariate snapshot, as
+        /// [`Self::Binary`]'s `lp_covariates` are.
+        count_covariates: Vec<String>,
+    },
+    // Ordinal deferred to Phase 4
 }
 
 #[cfg(feature = "survival")]
@@ -4863,6 +4916,9 @@ impl std::fmt::Debug for EndpointLikelihood {
                 write!(f, "Tte({hazard:?}, {recurrence:?})")
             }
             EndpointLikelihood::Binary { link, .. } => write!(f, "Binary({link:?})"),
+            EndpointLikelihood::Count { family, scale, .. } => {
+                write!(f, "Count({family:?}, {scale:?})")
+            }
             #[cfg(feature = "markov")]
             EndpointLikelihood::Ctmm {
                 n_states,
@@ -4941,8 +4997,8 @@ impl SimOutcome {
 /// Only variants with a **live producer** are declared. The plan also sketches
 /// `Survival` and `Rate` arms; TTE prediction already ships as the richer
 /// [`crate::api::SurvivalPredictionResult`] (S/H/h + CIF + median/mean, more than a
-/// three-field variant would hold), and `Rate` waits on the Poisson/count slice —
-/// adding either before it can be produced would be an untestable dead arm.
+/// three-field variant would hold), so adding it would be an untestable dead arm. `Rate`
+/// is the count endpoint's (#2877).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Prediction {
     /// Gaussian continuous prediction (the existing scalar path).
@@ -4952,15 +5008,28 @@ pub enum Prediction {
     /// CTMM occupancy `π(t)` reuses this variant (#820), indexed by generator
     /// state; callers map back to DV codes through the endpoint's `state_codes`.
     CatProbs { probs: Vec<f64> },
+    /// Count-endpoint prediction (#2877): the mean count `lambda` of the record and, for a
+    /// negative-binomial endpoint, its size `r` (`None` for a Poisson endpoint).
+    /// [`Prediction::prob`] turns it into `P(Y = k)`.
+    Rate { lambda: f64, size: Option<f64> },
 }
 
 impl Prediction {
-    /// `P(Y = k)` for state index `k`, or `None` when this is not a categorical
-    /// prediction or `k` is out of range. Keeps callers from indexing `probs`
+    /// `P(Y = k)` for state index `k` (or count `k`), or `None` when this is not a
+    /// categorical or count prediction or `k` is out of range — for a count, above
+    /// `u32::MAX`, the largest count a record carries. Keeps callers from indexing `probs`
     /// directly and panicking on a shape they did not check.
     pub fn prob(&self, k: usize) -> Option<f64> {
         match self {
             Prediction::CatProbs { probs } => probs.get(k).copied(),
+            Prediction::Rate { lambda, size } => {
+                let k = u32::try_from(k).ok()?;
+                Some(crate::stats::special::count_pmf(
+                    *lambda,
+                    *size,
+                    f64::from(k),
+                ))
+            }
             Prediction::Continuous { .. } => None,
         }
     }
@@ -6038,6 +6107,25 @@ impl CompiledModel {
         c
     }
 
+    /// True if any endpoint is a [`Count`](EndpointLikelihood::Count) (Poisson /
+    /// negative-binomial) endpoint (#2877).
+    #[cfg(feature = "survival")]
+    pub fn has_count(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Count { .. }))
+    }
+
+    /// CMTs routed to a `Count` endpoint, ascending (`endpoints` is a `BTreeMap`). The
+    /// datareader routes these rows to [`ObsRecord::Count`] via `ObsRouting.count`.
+    #[cfg(feature = "survival")]
+    pub fn count_cmts(&self) -> Vec<usize> {
+        self.endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Count { .. }).then_some(*cmt))
+            .collect()
+    }
+
     /// True if any endpoint is a [`Ctmm`](EndpointLikelihood::Ctmm)
     /// (continuous-time Markov) endpoint — Phase 5, Track D (#759).
     #[cfg(feature = "markov")]
@@ -6084,16 +6172,16 @@ impl CompiledModel {
     }
 
     /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint scored
-    /// by `discrete_subject_nll` — the binary / Bernoulli family and the discrete-time
-    /// Markov (DTMM, #2473) endpoint; ordinal / Poisson / negative-binomial extend this
-    /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
+    /// by `discrete_subject_nll` — the binary / Bernoulli family, the Poisson /
+    /// negative-binomial count family (#2877) and the discrete-time Markov (DTMM, #2473)
+    /// endpoint; ordinal extends this match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
     /// without editing a likelihood dispatch site. (The CTMM is not in it: it has its own
     /// `ctmm_subject_nll` dispatch.)
     #[cfg(feature = "survival")]
     pub fn has_discrete(&self) -> bool {
         self.endpoints.values().any(|e| match e {
-            EndpointLikelihood::Binary { .. } => true,
+            EndpointLikelihood::Binary { .. } | EndpointLikelihood::Count { .. } => true,
             #[cfg(feature = "markov")]
             EndpointLikelihood::Dtmm { .. } => true,
             _ => false,
@@ -6128,6 +6216,12 @@ impl CompiledModel {
     /// (TTE or categorical) can be parsed.
     #[cfg(not(feature = "survival"))]
     pub fn has_non_gaussian(&self) -> bool {
+        false
+    }
+
+    /// Always false without the `survival` feature - `[count_model]` can't be parsed.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_count(&self) -> bool {
         false
     }
 
@@ -8247,6 +8341,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // #2832's adopted rail completion; its not-converged twin says "not reported as
         // converged" and is filed by the convergence arm above first.
         || lower.contains("resumed from just above the guard")
+        // #3005's adopted collapse completion, the same shape.
+        || lower.contains("re-inflated to the initial value")
     {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {

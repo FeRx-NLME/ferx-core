@@ -32,6 +32,7 @@ Fitting a model-based meta-analysis of arm-level summary data? Start at [Model-b
 | `[scaling]` | No | Compartment scaling / observation readouts |
 | `[simulation]` | No | Define a simulation trial design |
 | `[binary_model]` | No | Binary / logistic endpoint (needs `--features survival`) |
+| `[count_model]` | No | Poisson / negative-binomial count endpoint (needs `--features survival`) |
 | `[event_model]` | No | Time-to-event endpoint (needs `--features survival`) |
 | `[markov_model]` | No | Continuous-time Markov endpoint (needs `--features markov`) |
 

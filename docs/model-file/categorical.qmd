@@ -7,8 +7,9 @@ observation — a category index rather than a continuous concentration. The fir
 member of the family is the **binary / Bernoulli** endpoint: mixed-effects
 **logistic regression**, declared with a `[binary_model]` block.
 
-> Ordinal (proportional-odds), Poisson, and negative-binomial endpoints are planned
-> follow-ups in the same family. This page documents the binary endpoint only.
+> Poisson and negative-binomial counts have their own block, documented in
+> [Count endpoints](count.qmd). An ordinal (proportional-odds) endpoint is a planned
+> follow-up. This page documents the binary endpoint only.
 
 ## The `[binary_model]` block
 

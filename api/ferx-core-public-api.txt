@@ -338,8 +338,12 @@ pub fn ferx_core::cancel::is_cancelled(flag: &core::option::Option<ferx_core::ca
 pub mod ferx_core::categorical
 pub fn ferx_core::categorical::binary_diagnostics(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
 pub fn ferx_core::categorical::binary_pearson_residual(y: f64, p: f64, q: f64) -> f64
+pub fn ferx_core::categorical::count_diagnostics(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
+pub fn ferx_core::categorical::count_pearson_residual(k: f64, lambda: f64, size: core::option::Option<f64>) -> f64
 pub fn ferx_core::categorical::predict_binary(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], results: &mut alloc::vec::Vec<ferx_core::EndpointPredictionResult>)
+pub fn ferx_core::categorical::predict_count(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], results: &mut alloc::vec::Vec<ferx_core::EndpointPredictionResult>)
 pub fn ferx_core::categorical::simulate_binary<R: rand_core::Rng>(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize, rng: &mut R, results: &mut alloc::vec::Vec<ferx_core::SimulationResult>, warnings: &mut alloc::vec::Vec<alloc::string::String>)
+pub fn ferx_core::categorical::simulate_count<R: rand_core::Rng>(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize, rng: &mut R, results: &mut alloc::vec::Vec<ferx_core::SimulationResult>, warnings: &mut alloc::vec::Vec<alloc::string::String>)
 pub mod ferx_core::diagnostics
 pub enum ferx_core::diagnostics::Severity
 pub ferx_core::diagnostics::Severity::Error
@@ -2508,6 +2512,8 @@ pub fn ferx_core::stats::residual_error::iwres(obs: f64, ipred: f64, error_model
 pub fn ferx_core::stats::residual_error::iwres_autocorrelation(subjects: &[ferx_core::SubjectResult]) -> (f64, f64)
 pub fn ferx_core::stats::residual_error::residual_variance(error_model: ferx_core::ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64
 pub mod ferx_core::stats::special
+pub fn ferx_core::stats::special::count_log_pmf(lambda: f64, size: core::option::Option<f64>, k: f64) -> f64
+pub fn ferx_core::stats::special::count_pmf(lambda: f64, size: core::option::Option<f64>, k: f64) -> f64
 pub fn ferx_core::stats::special::digamma(x: f64) -> f64
 pub fn ferx_core::stats::special::erf(x: f64) -> f64
 pub fn ferx_core::stats::special::erf_g<T: ferx_core::sens::num::PkNum>(x: T) -> T
@@ -2573,6 +2579,12 @@ impl ferx_core::BloqMethod
 pub fn ferx_core::BloqMethod::has_censored_row(self, cens: &[i8]) -> bool
 pub fn ferx_core::BloqMethod::is_censored_row(self, cens: i8) -> bool
 pub fn ferx_core::BloqMethod::label(self) -> &'static str
+pub enum ferx_core::types::CountFamily
+pub ferx_core::types::CountFamily::NegBin
+pub ferx_core::types::CountFamily::Poisson
+pub enum ferx_core::types::CountMeanScale
+pub ferx_core::types::CountMeanScale::Linear
+pub ferx_core::types::CountMeanScale::Log
 pub enum ferx_core::types::CovarianceFallback
 pub ferx_core::types::CovarianceFallback::None
 pub ferx_core::types::CovarianceFallback::Sir
@@ -2662,6 +2674,12 @@ pub ferx_core::types::EndpointLikelihood::Binary::link: ferx_core::LinkFn
 pub ferx_core::types::EndpointLikelihood::Binary::lp_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::EndpointLikelihood::Binary::lp_fn: ferx_core::LinearPredictorFn
 pub ferx_core::types::EndpointLikelihood::Binary::lp_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::types::EndpointLikelihood::Count
+pub ferx_core::types::EndpointLikelihood::Count::count_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Count::family: ferx_core::CountFamily
+pub ferx_core::types::EndpointLikelihood::Count::param_fn: ferx_core::CountParamFn
+pub ferx_core::types::EndpointLikelihood::Count::param_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::types::EndpointLikelihood::Count::scale: ferx_core::CountMeanScale
 pub ferx_core::types::EndpointLikelihood::Ctmm
 pub ferx_core::types::EndpointLikelihood::Ctmm::generator_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::EndpointLikelihood::Ctmm::generator_fn: ferx_core::GeneratorFn
@@ -2872,6 +2890,9 @@ pub ferx_core::types::Prediction::CatProbs
 pub ferx_core::types::Prediction::CatProbs::probs: alloc::vec::Vec<f64>
 pub ferx_core::types::Prediction::Continuous
 pub ferx_core::types::Prediction::Continuous::pred: f64
+pub ferx_core::types::Prediction::Rate
+pub ferx_core::types::Prediction::Rate::lambda: f64
+pub ferx_core::types::Prediction::Rate::size: core::option::Option<f64>
 impl ferx_core::Prediction
 pub fn ferx_core::Prediction::prob(&self, k: usize) -> core::option::Option<f64>
 pub enum ferx_core::types::PriorSpread
@@ -3116,6 +3137,7 @@ pub ferx_core::types::CompiledModel::tv_fn: core::option::Option<ferx_core::TvFn
 impl ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static [alloc::string::String]
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
+pub fn ferx_core::CompiledModel::count_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
@@ -3123,6 +3145,7 @@ pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
+pub fn ferx_core::CompiledModel::has_count(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
@@ -4006,6 +4029,7 @@ pub fn ferx_core::types::classify_warning(raw: &str) -> ferx_core::WarningEntry
 pub fn ferx_core::types::framework_keys() -> &'static [&'static str]
 pub fn ferx_core::types::method_specific_keys(m: ferx_core::EstimationMethod) -> &'static [&'static str]
 pub fn ferx_core::types::omega_se_at(se_omega: &core::option::Option<alloc::vec::Vec<f64>>, n_eta: usize, i: usize, j: usize) -> core::option::Option<f64>
+pub type ferx_core::types::CountParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> [f64; 2] + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::DerivedFilterFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> bool + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::ErrorSelectFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&std::collections::hash::map::HashMap<alloc::string::String, f64>) -> usize + core::marker::Send + core::marker::Sync)>
@@ -4052,6 +4076,12 @@ pub ferx_core::Comparison::Ge
 pub ferx_core::Comparison::Gt
 pub ferx_core::Comparison::Le
 pub ferx_core::Comparison::Lt
+pub enum ferx_core::CountFamily
+pub ferx_core::CountFamily::NegBin
+pub ferx_core::CountFamily::Poisson
+pub enum ferx_core::CountMeanScale
+pub ferx_core::CountMeanScale::Linear
+pub ferx_core::CountMeanScale::Log
 pub enum ferx_core::CovarianceFallback
 pub ferx_core::CovarianceFallback::None
 pub ferx_core::CovarianceFallback::Sir
@@ -4170,6 +4200,12 @@ pub ferx_core::EndpointLikelihood::Binary::link: ferx_core::LinkFn
 pub ferx_core::EndpointLikelihood::Binary::lp_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::EndpointLikelihood::Binary::lp_fn: ferx_core::LinearPredictorFn
 pub ferx_core::EndpointLikelihood::Binary::lp_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::EndpointLikelihood::Count
+pub ferx_core::EndpointLikelihood::Count::count_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Count::family: ferx_core::CountFamily
+pub ferx_core::EndpointLikelihood::Count::param_fn: ferx_core::CountParamFn
+pub ferx_core::EndpointLikelihood::Count::param_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::EndpointLikelihood::Count::scale: ferx_core::CountMeanScale
 pub ferx_core::EndpointLikelihood::Ctmm
 pub ferx_core::EndpointLikelihood::Ctmm::generator_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::EndpointLikelihood::Ctmm::generator_fn: ferx_core::GeneratorFn
@@ -4394,6 +4430,9 @@ pub ferx_core::Prediction::CatProbs
 pub ferx_core::Prediction::CatProbs::probs: alloc::vec::Vec<f64>
 pub ferx_core::Prediction::Continuous
 pub ferx_core::Prediction::Continuous::pred: f64
+pub ferx_core::Prediction::Rate
+pub ferx_core::Prediction::Rate::lambda: f64
+pub ferx_core::Prediction::Rate::size: core::option::Option<f64>
 impl ferx_core::Prediction
 pub fn ferx_core::Prediction::prob(&self, k: usize) -> core::option::Option<f64>
 pub enum ferx_core::PriorSpread
@@ -4746,6 +4785,7 @@ pub ferx_core::CompiledModel::tv_fn: core::option::Option<ferx_core::TvFn>
 impl ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static [alloc::string::String]
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
+pub fn ferx_core::CompiledModel::count_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
@@ -4753,6 +4793,7 @@ pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
+pub fn ferx_core::CompiledModel::has_count(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
@@ -6066,6 +6107,7 @@ pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::op
 pub fn ferx_core::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
+pub type ferx_core::CountParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> [f64; 2] + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::DerivedFilterFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> bool + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ErrorSelectFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&std::collections::hash::map::HashMap<alloc::string::String, f64>) -> usize + core::marker::Send + core::marker::Sync)>

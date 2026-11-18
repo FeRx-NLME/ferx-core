@@ -227,9 +227,16 @@ impl FixedSpec {
     /// The reverse over `layout` from the forward's `log`, for `seeds` blocks: `out_adj` the
     /// state's adjoints (`seeds × n × lanes`), adding the captures' into `in_adj`
     /// (`seeds × n_caps × lanes`). The state the search started from takes none.
+    ///
+    /// The walk is the same for every `sweep`: `M` is a constant of the recorded steps (their
+    /// count already covers the derivative order of a reverse), and `w = Mᵀū` is applied lane
+    /// by lane, so under forward over reverse the adjoints' tangent lanes go through it as
+    /// their values do — the tangent of the same step program the reverse over forward
+    /// differentiates (#2980).
     pub(super) fn run_rev(
         &self,
         layout: Layout,
+        sweep: Sweep,
         log: &FixedLog,
         seeds: usize,
         out_adj: &[f64],
@@ -247,7 +254,7 @@ impl FixedSpec {
                 let mut ub: Vec<f64> = out_adj[sd * n * l..(sd + 1) * n * l].to_vec();
                 for f in log.steps.iter().rev() {
                     let mut pb = vec![0.0; (n + nc) * l];
-                    if !plan.reverse_from(f, layout, 1, &mut [], &mut pb, &ub) {
+                    if !plan.sweep_back(f, layout, sweep, 1, &mut [], &mut pb, &ub) {
                         return false;
                     }
                     ub.copy_from_slice(&pb[..n * l]);
@@ -274,7 +281,7 @@ impl FixedSpec {
                     }
                 }
                 let mut pb = vec![0.0; (n + nc) * l];
-                if !plan.reverse_from(f, layout, 1, &mut [], &mut pb, &w) {
+                if !plan.sweep_back(f, layout, sweep, 1, &mut [], &mut pb, &w) {
                     return false;
                 }
                 for i in 0..n * l {
@@ -533,6 +540,7 @@ impl RepeatSpec {
     pub(super) fn run_rev(
         &self,
         layout: Layout,
+        sweep: Sweep,
         log: &FixedLog,
         seeds: usize,
         out_adj: &[f64],
@@ -545,7 +553,10 @@ impl RepeatSpec {
             let ia = &mut in_adj[sd * w..(sd + 1) * w];
             for f in log.steps.iter().rev() {
                 let mut pb = vec![0.0; (n + nc) * l];
-                if !self.body.reverse_from(f, layout, 1, &mut [], &mut pb, &ub) {
+                if !self
+                    .body
+                    .sweep_back(f, layout, sweep, 1, &mut [], &mut pb, &ub)
+                {
                     return false;
                 }
                 ub.copy_from_slice(&pb[..n * l]);

@@ -5319,6 +5319,27 @@ fn closed_form_per_compartment_scale_matches_reconverged_fd() {
 
 // ---- covariance Hessian (`hessian::subject_adjoint_cov_hessian`) -------------------------
 
+/// The worst `|got − want|` relative to `want`'s largest entry. Every entry (and the scale it
+/// divides by) is asserted finite first: a `max` fold drops a `NaN`, so a diverged entry would
+/// otherwise pass green.
+pub(super) fn rel_gap(got: &[f64], want: &[f64]) -> f64 {
+    assert_eq!(got.len(), want.len());
+    let mut scale = 0.0f64;
+    for &v in want {
+        assert!(v.is_finite(), "non-finite reference entry {v}");
+        scale = scale.max(v.abs());
+    }
+    let mut worst = 0.0f64;
+    for (&a, &b) in got.iter().zip(want) {
+        assert!(
+            a.is_finite() && b.is_finite() && scale.is_finite(),
+            "non-finite entry {a} vs {b}"
+        );
+        worst = worst.max((a - b).abs() / scale.max(1e-300));
+    }
+    worst
+}
+
 /// The adjoint profile Hessian against Richardson differences of the exact gradient with
 /// the EBE re-solved at every point — the profile objective's own definition of `d²F̂/dx²`,
 /// independent of `Uᵀ∇²ΨU`. Returns the worst relative gap `|H − ref| / (1 + |ref|)` (and
@@ -5381,17 +5402,100 @@ pub(super) fn hessian_gaps_for(
     let eta = ebe(&params);
     // On a thread with the fit pool's worker stack (`FIT_RAYON_STACK_SIZE`), where
     // production runs the nested-dual passes; a test thread's default 2 MB is too small.
-    let h = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(crate::FIT_RAYON_STACK_SIZE)
-            .spawn_scoped(scope, || {
-                subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), objective)
-            })
-            .expect("spawn")
-            .join()
-            .expect("join")
-    })
-    .expect("subject must be in adjoint scope");
+    // `(reverse per direction, every plan along the directions, no mu fold)`; returns the
+    // Hessian and how many plans the pass assembled from a basis.
+    // `(…, every pass through the recorded likelihood kernel)`; also how many passes took the
+    // structured kernel.
+    let hessian_in4 = |per_direction: bool, plan_dirs: bool, fold_off: bool, struct_off: bool| {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    use super::hessian::basis::{BASIS_PLANS, MU_FOLD_OFF, PLAN_PER_DIRECTION};
+                    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
+                    super::hessian::REVERSE_PER_DIRECTION.with(|c| c.set(per_direction));
+                    PLAN_PER_DIRECTION.with(|c| c.set(plan_dirs));
+                    MU_FOLD_OFF.with(|c| c.set(fold_off));
+                    STRUCT_OFF.with(|c| c.set(struct_off));
+                    BASIS_PLANS.with(|c| c.set(0));
+                    STRUCT_PASSES.with(|c| c.set(0));
+                    let h = subject_adjoint_cov_hessian(
+                        model,
+                        s,
+                        &params,
+                        &x,
+                        eta.as_slice(),
+                        objective,
+                    );
+                    (
+                        (h, BASIS_PLANS.with(std::cell::Cell::get)),
+                        STRUCT_PASSES.with(std::cell::Cell::get),
+                    )
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        })
+    };
+    let hessian_in = |per_direction: bool, plan_dirs: bool, fold_off: bool| {
+        hessian_in4(per_direction, plan_dirs, fold_off, false).0
+    };
+    let hessian = |per_direction: bool| {
+        hessian_in(per_direction, false, false)
+            .0
+            .expect("subject must be in adjoint scope")
+    };
+    // The plans along a basis of their inputs (#2980) against every plan along the directions,
+    // and the mu fold against none: the same derivatives assembled by linearity (and, folded,
+    // through `∂μ/∂θ`), so they differ by rounding only.
+    {
+        let (h_basis, n_basis) = hessian_in(false, false, false);
+        let (h_dirs, _) = hessian_in(false, true, false);
+        let (h_nofold, _) = hessian_in(false, false, true);
+        let (h_basis, h_dirs, h_nofold) = (
+            h_basis.expect("basis: in scope"),
+            h_dirs.expect("directions: in scope"),
+            h_nofold.expect("no fold: in scope"),
+        );
+        let (g_dirs, g_fold) = (
+            rel_gap(h_basis.as_slice(), h_dirs.as_slice()),
+            rel_gap(h_basis.as_slice(), h_nofold.as_slice()),
+        );
+        eprintln!(
+            "hessian: {n_basis} basis plans; basis vs directions {g_dirs:.2e}, fold vs none {g_fold:.2e}"
+        );
+        assert!(g_dirs < 1e-12, "basis vs directions: {g_dirs:.2e}");
+        assert!(g_fold < 1e-12, "fold vs none: {g_fold:.2e}");
+        // The structured FOCEI kernel (#2980) against the recorded kernel's sweep.
+        let ((h_st, _), n_st) = hessian_in4(false, false, false, false);
+        let ((h_rec, _), n_rec) = hessian_in4(false, false, false, true);
+        let (h_st, h_rec) = (
+            h_st.expect("structured: in scope"),
+            h_rec.expect("recorded: in scope"),
+        );
+        let g_st = rel_gap(h_st.as_slice(), h_rec.as_slice());
+        eprintln!("hessian: {n_st} structured passes ({n_rec} with it off); structured vs recorded {g_st:.2e}");
+        assert_eq!(
+            n_rec, 0,
+            "the switch must take every pass through the recorded kernel"
+        );
+        assert!(g_st < 1e-12, "structured vs recorded kernel: {g_st:.2e}");
+    }
+    // Forward over reverse (production) against reverse over forward, one reverse per
+    // direction (#2980): the same second derivatives of the same programs, so they differ by
+    // the accumulation order only. Every fixture of this oracle is also that parity check.
+    // Measured over its 63 fixture runs (closed form, ODE, SDE, IOV, NN, steady state,
+    // non-Gaussian terms; FOCE, FOCEI, Laplace, AGQ): worst 2.1e-14 relative to the largest
+    // entry, so `1e-12` leaves ~50x headroom. A dropped lane-glue term (θ's `d²θ/dx²`, a value
+    // lane read for a tangent) moves an entry by O(1) of the matrix.
+    let h = hessian(false);
+    let h_rof = hessian(true);
+    let worst_for = rel_gap(h.as_slice(), h_rof.as_slice());
+    eprintln!("hessian: forward over reverse vs a reverse per direction {worst_for:.2e}");
+    assert!(
+        worst_for < 1e-12,
+        "forward over reverse vs a reverse per direction: {worst_for:.2e}"
+    );
     let n = x.len();
     assert_eq!((h.nrows(), h.ncols()), (n, n));
     let mut fd = DMatrix::<f64>::zeros(n, n);
@@ -5435,10 +5539,9 @@ pub(super) fn hessian_gaps_for(
         "asymmetric: {:.2e}",
         gap(&h, &h.transpose())
     );
-    assert!(
-        h.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-1,
-        "a vanishing Hessian tests nothing"
-    );
+    let peak = h.iter().map(|v| v.abs()).fold(0.0, f64::max); // nan-ok: the fold is asserted finite on the next line
+    assert!(peak.is_finite(), "a non-finite Hessian entry");
+    assert!(peak > 1e-1, "a vanishing Hessian tests nothing");
     let vs_fd = gap(&h, &fd);
     eprintln!("hessian: vs reconverged FD of the gradient {vs_fd:.2e}");
     (vs_fd, f64::NAN)
@@ -5623,7 +5726,10 @@ fn cov_diag_on_axes_is_the_full_hessians_diagonal() {
         }
     }
     eprintln!("axes diagonal vs full Hessian: worst rel {worst:.2e}");
-    assert!(worst == 0.0, "{worst:.2e}");
+    // Equal to rounding, not bit for bit: the plans' bases are built along the axes the
+    // request's directions move (#2980), so a block's columns combine a different basis than
+    // the full Hessian's. Measured 6.3e-16 here; a wrong column is O(1).
+    assert!(worst < 1e-13, "{worst:.2e}");
     let eta = ebe_for(&five, &s, &params, 1e-10, true);
     let past = [x.len()];
     assert!(
@@ -5685,7 +5791,10 @@ fn cov_block_on_axes_is_the_full_hessians_block() {
         }
     }
     eprintln!("axes block vs full Hessian: worst rel {worst:.2e}");
-    assert!(worst == 0.0, "{worst:.2e}");
+    // Equal to rounding, not bit for bit: the plans' bases are built along the axes the
+    // request's directions move (#2980), so a block's columns combine a different basis than
+    // the full Hessian's. Measured 1.8e-15 here; a wrong column is O(1).
+    assert!(worst < 1e-13, "{worst:.2e}");
     let eta = ebe_for(&five, &s, &params, 1e-10, true);
     assert!(
         subject_adjoint_cov_block_at(
@@ -5742,7 +5851,10 @@ fn cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block() {
         }
     }
     eprintln!("covariate NN: block vs full Hessian {worst:.2e}");
-    assert!(worst == 0.0, "{worst:.2e}");
+    // Equal to rounding, not bit for bit: the plans' bases are built along the axes the
+    // request's directions move (#2980), so a block's columns combine a different basis than
+    // the full Hessian's. Measured 4.2e-15 here; a wrong column is O(1).
+    assert!(worst < 1e-13, "{worst:.2e}");
 }
 
 /// The diagonal on a `[covariate_nn]` subject goes through the networks' reduced basis
@@ -5858,50 +5970,39 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
-/// The covariance Hessian's production passes (one direction each, the single-tangent layout:
-/// `psi_lanes` / `psi_diag`) equal the `K`-tangent layout that `PASS_WIDTH_CAP` runs in tests,
-/// where the directions are spent over wider passes. Each column must still land on its own
-/// direction: width 3 over 7 packed axes leaves a ragged last pass, so an offset taken from
-/// the pass's own width rather than the planned one misplaces columns. On a plain subject, an
-/// AGQ one (`n_agq = 3`, non-exact anchor), an IOV one (stacked η/κ widths, per-occasion
-/// tangents) and, with `nn`, a reduced-basis `[covariate_nn]` one. A column's arithmetic does
-/// not see the other tangents, so equality is bit-for-bit where measured (printed with
-/// `--nocapture`); a misplaced column moves the matrix by O(1) of its largest entry.
-/// Mutation: offset `psi_lanes`'s `lane(c * width + a, ..)` by the last pass's width → the ragged
-/// width-3 rows differ.
-fn single_tangent_equals_k_wide(label: &str, model: &CompiledModel, s: &Subject, o: Objective) {
-    use super::hessian::PASS_WIDTH_CAP;
+/// The covariance Hessian's production passes (structured: one pass of every direction;
+/// recorded: one per direction) equal passes of exactly one and of two directions
+/// (`PASS_WIDTH`), on a plain subject, an AGQ one (`n_agq = 3`, non-exact anchor), an IOV one
+/// (stacked η/κ widths, per-occasion tangents) and, with `nn`, a reduced-basis `[covariate_nn]`
+/// one. Width 2 over 7 packed axes leaves a ragged last pass, so an offset taken from the pass's
+/// own width rather than the planned one misplaces columns; width 1 has none, and is the
+/// reference. Measured: equal to rounding (a column's arithmetic does not see the other
+/// tangent); a misplaced column moves the matrix by O(1) of its largest entry.
+fn narrow_equals_production(label: &str, model: &CompiledModel, s: &Subject, o: Objective) {
+    use super::hessian::PASS_WIDTH;
     let params = moved_params(model);
     let x = pack_params(&params);
     let eta = ebe_for(model, s, &params, 1e-12, o != Objective::Foce);
-    let run = |cap: Option<usize>| {
+    let run = |w: Option<usize>| {
         with_fit_stack(|| {
-            PASS_WIDTH_CAP.with(|c| c.set(cap));
+            PASS_WIDTH.with(|c| c.set(w));
             let h = subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), o);
-            PASS_WIDTH_CAP.with(|c| c.set(None));
+            PASS_WIDTH.with(|c| c.set(None));
             h
         })
         .unwrap_or_else(|| panic!("{label}: in scope"))
     };
-    let single = run(None);
-    for cap in [3, 4] {
-        let wide = run(Some(cap));
-        assert_eq!(wide.shape(), single.shape(), "{label} width {cap}: shape");
-        let mut worst = 0.0f64;
-        for (i, (a, b)) in wide.iter().zip(single.iter()).enumerate() {
-            assert!(
-                a.is_finite() && b.is_finite(),
-                "{label} width {cap}: non-finite entry {i}"
-            );
-            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
-        }
-        eprintln!("{label}: single-tangent vs width {cap}: {worst:.2e}");
-        assert!(worst == 0.0, "{label} width {cap}: {worst:.2e}");
+    let narrow = run(Some(1));
+    for (name, h) in [("width 2", run(Some(2))), ("production", run(None))] {
+        assert_eq!(narrow.shape(), h.shape(), "{label}: shape");
+        let worst = rel_gap(narrow.as_slice(), h.as_slice());
+        eprintln!("{label}: width 1 vs {name}: {worst:.2e}");
+        assert!(worst < 1e-12, "{label}: width 1 vs {name}: {worst:.2e}");
     }
 }
 
 #[test]
-fn cov_hessian_single_tangent_passes_equal_the_k_wide_ones() {
+fn cov_hessian_narrow_passes_equal_the_production_ones() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
     let s = subject(
         &one,
@@ -5915,10 +6016,10 @@ fn cov_hessian_single_tangent_passes_equal_the_k_wide_ones() {
     assert_eq!(
         pack_params(&moved_params(&one)).len(),
         7,
-        "the fixture must leave a ragged last pass at width 3"
+        "the fixture must leave a ragged last pass at width 2"
     );
-    single_tangent_equals_k_wide("FOCEI", &one, &s, Objective::Focei);
-    single_tangent_equals_k_wide(
+    narrow_equals_production("FOCEI", &one, &s, Objective::Focei);
+    narrow_equals_production(
         "AGQ-3",
         &one,
         &s,
@@ -5929,11 +6030,11 @@ fn cov_hessian_single_tangent_passes_equal_the_k_wide_ones() {
     );
     let iov = parse_model_string(ODE_IOV).unwrap();
     let s_iov = iov_subject(&iov);
-    single_tangent_equals_k_wide("IOV", &iov, &s_iov, Objective::Focei);
+    narrow_equals_production("IOV", &iov, &s_iov, Objective::Focei);
     #[cfg(feature = "nn")]
     {
         let (m, s) = covariate_nn_fixture();
-        single_tangent_equals_k_wide("covariate NN", &m, &s, Objective::Focei);
+        narrow_equals_production("covariate NN", &m, &s, Objective::Focei);
     }
 }
 
@@ -6035,6 +6136,13 @@ fn cov_hessian_matches_profile_fd_laplace_and_agq() {
                 exact: true,
             },
             "Laplace",
+        ),
+        (
+            Objective::Agq {
+                n_agq: 1,
+                exact: false,
+            },
+            "Laplace H̃",
         ),
         (
             Objective::Agq {
@@ -7887,11 +7995,28 @@ fn production_sites_take_the_closed_form_inner_hessian() {
         r.0 >= 2 && r.1 == 0,
         "Laplace gradient (untaped + taped anchor): {r:?}"
     );
-    let r = hessian_route(&s, &|| {
-        subject_adjoint_cov_hessian(&one, &s, &params, &x, eta.as_slice(), laplace)
-            .expect("served");
-    });
-    assert!(r.0 >= 1 && r.1 == 0, "Laplace covariance step: {r:?}");
+    // The covariance step's structured kernel forms the exact anchor from its row aggregates
+    // (#2980) and calls neither routine; with it off, the recorded kernel takes the closed form.
+    // Never the generic route: the straddle shows the count is the route's, not a constant.
+    let cov_route = |off: bool| {
+        super::hessian::st::STRUCT_OFF.with(|c| c.set(off));
+        let r = hessian_route(&s, &|| {
+            subject_adjoint_cov_hessian(&one, &s, &params, &x, eta.as_slice(), laplace)
+                .expect("served");
+        });
+        super::hessian::st::STRUCT_OFF.with(|c| c.set(false));
+        r
+    };
+    assert_eq!(
+        cov_route(false),
+        (0, 0),
+        "Laplace covariance step, structured"
+    );
+    let r = cov_route(true);
+    assert!(
+        r.0 >= 1 && r.1 == 0,
+        "Laplace covariance step, recorded: {r:?}"
+    );
     // A FREM row reads η directly: the generic path, and only it.
     let frem = parse_model_string(FREM_MODEL).unwrap();
     let mut fs = subject_shell(
@@ -11783,4 +11908,211 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     );
     assert!(ran >= 60, "only {ran} subjects ran");
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
+}
+
+/// The structured kernel's reduce is one plan shared by every subject (`kernel_run_shared`,
+/// #2980). Two subjects with different doses and data on one thread — the second runs the
+/// first's cached plan — each against the recorded kernel, so a reduce keyed too loosely (one
+/// subject's recording served where it does not hold) or baking a subject's data shows.
+/// Mutation: key the shared plan without the parameter literals (or reuse one plan for every
+/// variant) → the second subject's Hessian moves.
+#[test]
+fn structured_reduce_is_shared_across_subjects_exactly() {
+    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s1 = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let s2 = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[-0.2, 0.15, 0.05],
+    );
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    with_fit_stack(|| {
+        let h = |s: &Subject, off: bool| {
+            STRUCT_OFF.with(|c| c.set(off));
+            let eta = ebe_for(&model, s, &params, 1e-12, true);
+            let h = subject_adjoint_cov_hessian(
+                &model,
+                s,
+                &params,
+                &x,
+                eta.as_slice(),
+                Objective::Focei,
+            )
+            .expect("in scope");
+            STRUCT_OFF.with(|c| c.set(false));
+            h
+        };
+        STRUCT_PASSES.with(|c| c.set(0));
+        let (a1, a2) = (h(&s1, false), h(&s2, false));
+        assert!(
+            STRUCT_PASSES.with(std::cell::Cell::get) > 0,
+            "the fixture must take the structured kernel"
+        );
+        let (b1, b2) = (h(&s1, true), h(&s2, true));
+        let (g1, g2) = (
+            rel_gap(a1.as_slice(), b1.as_slice()),
+            rel_gap(a2.as_slice(), b2.as_slice()),
+        );
+        eprintln!("structured vs recorded across subjects: {g1:.2e}, {g2:.2e}");
+        assert!(g1 < 1e-12 && g2 < 1e-12, "{g1:.2e} {g2:.2e}");
+    });
+}
+
+/// A FOCE subject past the Woodbury gate (`1 + tr(LᵀSL) > 1e6`, where production factors `R̃`
+/// itself) is outside the structured kernel's form, so its passes take the recorded kernel
+/// rather than declining the subject (#2980 review). The pair straddles the gate: at the
+/// fixture's σ the subject takes the structured kernel, at a σ shrunk `1e-5`× (the trace far
+/// past `1e6`) none of its passes does — both asserted — and each Hessian matches the recorded
+/// kernel's (measured: 3.4e-15 structured, exactly 0 on the recorded route; bound as
+/// `structured_reduce_is_shared_across_subjects_exactly`'s).
+/// Mutation: drop `struct_rows_hold` from `CovPlan::run`'s gate → the shrunk-σ subject's
+/// Hessian is `None` (its structured sweep cannot form the rows).
+#[test]
+fn foce_past_the_woodbury_gate_takes_the_recorded_kernel() {
+    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let base = moved_params(&model);
+    let mut tight = base.clone();
+    for v in tight.sigma.values.iter_mut() {
+        *v *= 1e-5;
+    }
+    with_fit_stack(|| {
+        for (params, want_structured) in [(&base, true), (&tight, false)] {
+            let x = pack_params(params);
+            let eta = ebe_for(&model, &s, params, 1e-12, false);
+            let h = |off: bool| {
+                STRUCT_OFF.with(|c| c.set(off));
+                let h = subject_adjoint_cov_hessian(
+                    &model,
+                    &s,
+                    params,
+                    &x,
+                    eta.as_slice(),
+                    Objective::Foce,
+                );
+                STRUCT_OFF.with(|c| c.set(false));
+                h
+            };
+            STRUCT_PASSES.with(|c| c.set(0));
+            let got = h(false).expect("the exact Hessian, structured or recorded");
+            let structured = STRUCT_PASSES.with(std::cell::Cell::get) > 0;
+            assert_eq!(
+                structured, want_structured,
+                "structured passes: {structured}, want {want_structured}"
+            );
+            let want = h(true).expect("the recorded kernel's Hessian");
+            let gap = rel_gap(got.as_slice(), want.as_slice());
+            eprintln!("Woodbury straddle, structured {structured}: gap {gap:.2e}");
+            assert!(gap < 1e-12, "{gap:.2e}");
+        }
+    });
+}
+
+/// A shared kernel (`kernel_run_shared`) serves a point on the other side of a branch its
+/// first recording took: the recording carries that branch as a guard, so the second point
+/// fails it and is served by a plan recorded there — the Laplace reduce factors `H` or
+/// jitters it per subject (`factor_anchor`), on one shared key. The straddle is asserted:
+/// both points must take the same key and opposite branches, and each value is the branch's
+/// own closed form. Mutation: serve only the first plan under a key → the second point
+/// declines (`None`); serve it without its guard → the second point gets `x²` (= 9, not 6).
+#[test]
+fn shared_kernel_serves_both_sides_of_a_recorded_branch() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::sens::num::vm::Layout;
+    use crate::sens::num::{BranchCmp, PkNum};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let taken = std::cell::RefCell::new(Vec::new());
+    let f = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
+        let x = lv[0];
+        let pos = x.br_cmp_c(BranchCmp::Gt, 0.0);
+        taken.borrow_mut().push(pos);
+        Some(vec![if pos {
+            x * x
+        } else {
+            x * <kj::Tr as PkNum>::from_f64(-3.0)
+        }])
+    };
+    let variant = super::kernel::variant_of(&("branch test", 1u8));
+    let run = |v: f64| {
+        super::kernel::kernel_run_shared(&model, &s, variant.clone(), Layout::F64, &[v], 1, &f)
+            .map(|k| k.value(0))
+    };
+    let a = run(2.0).expect("first point records");
+    let b = run(-2.0).expect("the other branch is served by its own recording");
+    let c = run(3.0).expect("the first branch is served again");
+    // A family-template replay may run the recorder once more on the new branch before it
+    // records afresh; what matters is that both branches were recorded and nothing after.
+    let t = taken.borrow();
+    assert!(
+        t[0] && t[1..].iter().all(|p| !p) && t.len() >= 2,
+        "the straddle: the first point positive, the second recorded on the other branch: {t:?}"
+    );
+    assert_eq!((a, b, c), (4.0, 6.0, 9.0));
+}
+
+/// The covariance Hessian's bases take the shared-primal kernels (#2980): on closed-form and
+/// linear-ODE subjects the rows forward and the rows forward-over-reverse run, and on a
+/// nonlinear-ODE subject the ODE step loop runs as rows too — each counted where it completes, so a silent fallback to the
+/// per-axis runs (correct, and invisible to every oracle) fails here. The Hessians themselves
+/// are pinned by the oracles (`hessian_gaps_for`); this pins which engine produced them.
+#[test]
+fn the_covariance_bases_take_the_shared_primal_kernels() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::ROWS_RUNS;
+    // Closed form; a linear ODE (its matrix exponential, no step loop); a nonlinear one (the
+    // step loop).
+    for (src, ode) in [
+        (ONE_CPT_ORAL, false),
+        (ONE_CPT_ORAL_ODE, false),
+        (MM_ODE, true),
+    ] {
+        let model = parse_model_string(src).unwrap();
+        let s = subject(
+            &model,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &TIMES,
+            &[0.1, -0.05, 0.2],
+        );
+        let params = moved_params(&model);
+        let x = pack_params(&params);
+        let eta = ebe_for(&model, &s, &params, 1e-12, true);
+        // Counted on the thread that runs the step (`with_fit_stack` runs it on its own).
+        let [fwd, rev, loops] = with_fit_stack(|| {
+            ROWS_RUNS.with(|c| c.set([0; 3]));
+            subject_adjoint_cov_hessian(&model, &s, &params, &x, eta.as_slice(), Objective::Focei)
+                .expect("in scope");
+            ROWS_RUNS.with(std::cell::Cell::get)
+        });
+        eprintln!("ode {ode}: rows forwards {fwd}, reverses {rev}, loop runs {loops}");
+        assert!(
+            fwd > 0 && rev > 0,
+            "ode {ode}: rows forward {fwd}, reverse {rev}"
+        );
+        assert_eq!(loops > 0, ode, "ode {ode}: rows loop runs {loops}");
+    }
 }
