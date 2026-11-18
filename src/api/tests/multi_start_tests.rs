@@ -96,17 +96,46 @@ fn test_n_starts_and_seed_via_parser() {
 
 #[test]
 fn test_per_start_saem_seed_derivation() {
+    use super::per_start_seed;
     let base: u64 = 12345;
-    // Each start k > 0 gets base + k; start 0 keeps the base unchanged.
-    assert_eq!(base.wrapping_add(0), 12345);
-    assert_eq!(base.wrapping_add(1), 12346);
-    assert_eq!(base.wrapping_add(7), 12352);
-    // All derived seeds are distinct.
-    let seeds: Vec<u64> = (0..8).map(|k| base.wrapping_add(k)).collect();
-    let unique: std::collections::HashSet<u64> = seeds.iter().copied().collect();
-    assert_eq!(unique.len(), 8);
-    // wrapping_add is defined at u64::MAX.
-    assert_eq!(u64::MAX.wrapping_add(1), 0);
+    // Start 0 keeps the user's seed; later starts hash (base, k).
+    assert_eq!(per_start_seed(base, 0), base);
+    assert_eq!(per_start_seed(base, 3), crate::rng::stream_seed(base, &[3]));
+    // All starts under one base get distinct seeds, including at u64::MAX.
+    for b in [base, u64::MAX] {
+        let seeds: std::collections::HashSet<u64> = (0..8).map(|k| per_start_seed(b, k)).collect();
+        assert_eq!(seeds.len(), 8);
+    }
+    // #3021: start k under seed s must not replay start k - 1 under seed s + 1.
+    for k in 2..8 {
+        assert_ne!(per_start_seed(base, k), per_start_seed(base + 1, k - 1));
+    }
+}
+
+/// Every seeded sampler gets its own per-start stream (#3021), including the IS
+/// samplers, and start `k` never shares a seed with start 0's defaults.
+#[test]
+fn per_start_options_reseed_every_sampler() {
+    use super::{per_start_options, per_start_seed};
+    let base = FitOptions {
+        saem_seed: Some(7),
+        imp_seed: None,
+        impmap_seed: Some(99),
+        global_search: true,
+        ..FitOptions::default()
+    };
+    let o = per_start_options(&base, 3);
+    assert_eq!(o.saem_seed, Some(per_start_seed(7, 3)));
+    assert_eq!(
+        o.bayes_seed,
+        Some(per_start_seed(base.bayes_seed.unwrap_or(12345), 3))
+    );
+    assert_eq!(o.imp_seed, Some(per_start_seed(12345, 3)));
+    assert_eq!(o.impmap_seed, Some(per_start_seed(99, 3)));
+    assert!(!o.global_search);
+    let o4 = per_start_options(&base, 4);
+    assert_ne!(o.imp_seed, o4.imp_seed);
+    assert_ne!(o.impmap_seed, o4.impmap_seed);
 }
 
 // ── #2867: the per-start records ───────────────────────────────────────────────────────

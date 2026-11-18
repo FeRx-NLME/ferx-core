@@ -29,22 +29,25 @@
 //!
 //! # Measured
 //!
-//! Linux x86_64 (`slow-tests.yml` run 37947001684, `nocapture`, at `42ec2252`) and
-//! macOS arm64 (debug) agree with each other on every printed digit below.
+//! At the default `SEED`, on the hashed per-subject streams (#3021; macOS arm64, and the
+//! fitted-ρ rows match the Linux x86_64 40-seed run below). In brackets, the values on
+//! the pre-#3021 `seed + i` streams (Linux x86_64 `slow-tests.yml` run 37947001684 at
+//! `42ec2252`, and macOS arm64, equal on every printed digit).
 //!
 //! | arm | ρ ferx draws at | worst \|ΔNPD\| | worst \|ΔNPDE\| |
 //! |---|---|---|---|
-//! | A | fitted −0.9 | **0.43894** | **0.28557** |
-//! | A | declared 0.5 (pre-#1733) | 1.69407 | 1.75498 |
-//! | A | 0 | 1.43112 | 1.63312 |
-//! | B | fitted −0.8 | **0.11838** (`FREE = 0` rows) | **0.28835** |
-//! | B | declared 0.5 (pre-#1733) | — | 2.55441 |
-//! | B | 0 (independent rows, pre-#1733) | — | 1.73352 |
+//! | A | fitted −0.9 | **0.3494** (0.43894) | **0.6737** (0.28557) |
+//! | A | declared 0.5 (pre-#1733) | 1.6364 (1.69407) | 1.8331 (1.75498) |
+//! | A | 0 | 1.4114 (1.43112) | 1.7196 (1.63312) |
+//! | B | fitted −0.8 | **0.1197** (0.11838) (`FREE = 0` rows) | **0.2155** (0.28835) |
+//! | B | declared 0.5 (pre-#1733) | — | 2.4213 (2.55441) |
+//! | B | 0 (independent rows, pre-#1733) | — | 1.7438 (1.73352) |
 //!
 //! The fitted-ρ numbers are the Monte-Carlo disagreement of two independent
 //! 2000-draw empirical CDFs, largest in the tails: arm A's worst NPD is one record
-//! at `pd ≈ 0.998`. The bounds are set from the 40-seed distribution (see the constants). Both pre-#1733 configurations are
-//! controls that must fail the bounds, so the anchor can fail.
+//! at `pd ≈ 0.998`. The bounds are set from the 40-seed distribution (see the
+//! constants). Both pre-#1733 configurations are controls that must fail the bounds, so
+//! the anchor can fail.
 //!
 //! **NPD on the second row of an `L2` record is a NONMEM convention, not a ferx
 //! defect.** On `FREE = 1` rows NONMEM's NPD tracks the *partner* row's score
@@ -82,6 +85,16 @@ const SEED: u64 = 1733;
 /// Each bound sits ≥ 1.3× above the largest fitted-ρ value seen and below the
 /// smallest value the wrong-ρ draws (the pre-#1733 behaviour and ρ = 0) produced on
 /// any seed, so the straddle tests hold for every seed measured, not only the default.
+/// Re-measured on macOS arm64 over the same 40 seeds plus 1733 (hashed streams): the
+/// fitted-ρ maxima reproduce the "new" column exactly, and the new-stream control
+/// minima are A 1.554 / 1.308 (|ΔNPD|), 1.698 / 1.554 (|ΔNPDE|), B 2.328 / 1.562.
+///
+/// Why the maxima repeat to three digits across the two stream families: ferx's score
+/// is `Φ⁻¹` of a count out of 2000, so in the tails it takes few values, and the worst
+/// row is where a tail count is reached. A |ΔNPDE| 0.674 is NONMEM's 2.8070 against
+/// ferx's clamp `Φ⁻¹(1 − 1/4000)` = 3.4808, A |ΔNPD| 0.762 is 2.5288 against
+/// `Φ⁻¹(1999/2000)` = 3.2905, and B |ΔNPD| 0.264 is −2.1930 against `Φ⁻¹(14/2000)` =
+/// −2.4573. Any stream set that reaches those counts gives the same maximum.
 const A_NPD_TOL: f64 = 1.0;
 const A_NPDE_TOL: f64 = 1.0;
 const B_NPDE_TOL: f64 = 0.58;
@@ -225,13 +238,13 @@ fn npde_at_the_fitted_within_observation_rho_matches_nonmem() {
     let w = run("a", -0.9, 210);
     assert!(
         w.npd_free0 < A_NPD_TOL,
-        "worst |dNPD| = {:.5} exceeds {A_NPD_TOL} (default seed on the old streams 0.43894; max over 40 seeds 0.762): the residual \
-         draw is not at the fitted block_sigma rho",
+        "worst |dNPD| = {:.5} exceeds {A_NPD_TOL} (realised 0.3494; max over 40 seeds \
+         0.762): the residual draw is not at the fitted block_sigma rho",
         w.npd_free0
     );
     assert!(
         w.npde < A_NPDE_TOL,
-        "worst |dNPDE| = {:.5} exceeds {A_NPDE_TOL} (default seed on the old streams 0.28557; max over 40 seeds 0.674)",
+        "worst |dNPDE| = {:.5} exceeds {A_NPDE_TOL} (realised 0.6737; max over 40 seeds 0.674)",
         w.npde
     );
 }
@@ -246,7 +259,7 @@ fn npde_at_the_declared_rho_diverges_from_nonmem_arm_a() {
             w.npd_free0 > A_NPD_TOL && w.npde > A_NPDE_TOL,
             "the {label}-rho control agrees with NONMEM to |dNPD| {:.5} / |dNPDE| {:.5}, \
              inside the anchor's own bounds ({A_NPD_TOL} / {A_NPDE_TOL}): the anchor no \
-             longer straddles #1733 (realised 1.69 / 1.75 declared, 1.43 / 1.63 zero)",
+             longer straddles #1733 (realised 1.64 / 1.83 declared, 1.41 / 1.72 zero)",
             w.npd_free0,
             w.npde
         );
@@ -270,11 +283,11 @@ fn npde_of_an_l2_pair_at_the_fitted_rho_matches_nonmem() {
         w.npd_free0
     );
     // NONMEM's NPD on the second row of an L2 record tracks the partner row; ferx's
-    // is the row's own marginal. Realised 2.13499. See the module docs.
+    // is the row's own marginal. Realised 2.1179 (2.13499 before #3021). See the module docs.
     assert!(
         w.npd_free1 > 1.0,
         "ferx NPD on FREE = 1 rows agrees with NONMEM's to {:.5}: expected the \
-         second-row-of-L2 convention gap (realised 2.13)",
+         second-row-of-L2 convention gap (realised 2.12)",
         w.npd_free1
     );
 }
@@ -288,8 +301,8 @@ fn npde_of_an_l2_pair_drawn_independently_diverges_from_nonmem() {
         assert!(
             w.npde > B_NPDE_TOL,
             "the {label} control agrees with NONMEM to |dNPDE| {:.5}, inside \
-             {B_NPDE_TOL}: the anchor no longer straddles #1733 (realised 2.55 \
-             declared, 1.73 independent)",
+             {B_NPDE_TOL}: the anchor no longer straddles #1733 (realised 2.42 \
+             declared, 1.74 independent)",
             w.npde
         );
     }

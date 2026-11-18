@@ -1234,7 +1234,9 @@ fn saem_merges_a_group_reading_a_superseded_anchor() {
         ANCHOR_TH_CRCL_TOL,
     );
     assert!(
-        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.3,
+        // 0.335, not the 0.328 the ±ANCHOR_TH_CRCL_TOL band already implies, so this
+        // check can fail on its own: the 9-seed median sat 0.0002 off NONMEM (0.3425 clear).
+        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.335,
         "A: THETA_CRCL = {th_crcl:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_A_TH_CRCL}"
     );
     let tvcl = median_theta(&results, "TVCL");
@@ -1290,7 +1292,9 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
         ANCHOR_B_TH_WT_V1_TOL,
     );
     assert!(
-        (th_wt_v1 - BEFORE_ANCHOR_B_TH_WT_V1).abs() > 0.1,
+        // 0.15, above the 0.139 the ±ANCHOR_B_TH_WT_V1_TOL band implies: the 9-seed median
+        // sat ≤ 0.0226 off NONMEM, i.e. ≥ 0.167 clear of the pre-#1630 value.
+        (th_wt_v1 - BEFORE_ANCHOR_B_TH_WT_V1).abs() > 0.15,
         "B: THETA_WT_V1 = {th_wt_v1:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TH_WT_V1}"
     );
     let tvv1 = median(
@@ -1301,7 +1305,9 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
     );
     assert_finite_close("B: TVV2·TH_R", tvv1, NM_ANCHOR_B_TVV1, ANCHOR_B_TVV1_TOL);
     assert!(
-        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 1.0,
+        // 1.5, above the 1.26 the ±ANCHOR_B_TVV1_TOL band implies: the 9-seed median sat
+        // ≤ 0.57 off NONMEM, i.e. ≥ 1.89 clear of the pre-#1630 value.
+        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 1.5,
         "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
     );
 }

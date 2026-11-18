@@ -12568,16 +12568,17 @@ DV ~ additive(EPS)
         // "half of it ran": deleting the per-η componentwise update alone leaves
         // the block update to carry the combined rate, and it gets only part of
         // the way. Both bounds are measured, not picked (#1451 review) — the
-        // realised |rate − target| is:
+        // realised |rate − target| at `SCALE1444_SEED` (hashed streams, #3021; the
+        // mutant is `if n_cw_sweeps > 0` → `if false` in the Robbins-Monro block):
         //
         //             both halves   componentwise half deleted   bound
-        //   below       0.0729              0.1624               0.12
-        //   (the mutation columns were measured before #3021 re-seeded the streams;
-        //   the passing case is now 0.0691 below and 0.0316 above, same bounds)
-        //   above       0.0324              0.0807               0.06
+        //   below       0.0691              0.1646               0.12
+        //   above       0.0316              0.0913               0.06
         //
-        // i.e. each bound sits between the two, with 1.6x / 1.9x headroom over
-        // the passing case, so it is exactly this mutation that both die for.
+        // i.e. each bound sits between the two, with 1.7x / 1.9x headroom over
+        // the passing case and 1.4x / 1.5x below the mutant, so it is exactly this
+        // mutation that both die for. (Before #3021, at seed 1444: 0.0729 / 0.1624
+        // below, 0.0324 / 0.0807 above.)
         // The block half alone is caught by the `closer than its twin` pair
         // above.
         assert!(

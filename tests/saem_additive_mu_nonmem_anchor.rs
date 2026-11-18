@@ -186,10 +186,15 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     );
 
     // The control: TVE0 also read in [structural_model], so it is not mu-referenced and
-    // stays on the ridge (measured 172.663 at the default seed, 168.54–172.76 over five,
-    // what the inline spelling gave before #2544).
+    // stays off the MLE. Before #3021 it measured 172.663 at the default seed and
+    // 168.54–172.76 over five (what the inline spelling gave before #2544). On the hashed
+    // streams (#3021) its distance above the MLE scatters widely: 0.845 at the default
+    // seed and 0.233–13.65 over seeds 1..=20, while the split mu-reference sits at most
+    // 0.00034 above (macOS aarch64; the default seed matches Linux x86_64 CI to the
+    // printed digit). 0.05 is 4.7x below the lowest control and ~150x above the highest
+    // mu-referenced fit, so it still separates the shapes on every seed measured.
     assert!(
-        shared.ofv > mle + 1.0,
+        shared.ofv > mle + 0.05,
         "shared BASE = TVE0 + PLAFIX + ETA_E0 with TVE0 read elsewhere must stay off the \
          MLE: {}",
         shared.ofv

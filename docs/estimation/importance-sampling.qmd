@@ -438,9 +438,10 @@ $$
   `FitResult.subjects[i]` diagnostics.
 - **`imp_adapt_passes`** sets how many pilot passes adapt the proposal before a
   marginal is reported. See [Adaptive evaluation](#adaptive-evaluation).
-- **Reproducibility.** `imp_seed` defaults to `42` when unset (so two
-  fits with the same `imp_samples` and `imp_proposal_df` produce identical
-  `−2 log L`). Set it explicitly to vary the RNG stream. Each subject's stream is a
+- **Reproducibility.** When `imp_seed` is unset, the evaluation (an
+  `imp_eval_only` stage, or the marginal reported after a stage) uses `42` and the
+  `imp` estimator's MCEM iterations use `12345`, so two fits with the same
+  `imp_samples` and `imp_proposal_df` produce identical `−2 log L`. Set it explicitly to vary the RNG stream. Each subject's stream is a
   hash of `(imp_seed, subject index)`, so runs under different seeds share no subject
   stream (before #3021, seed `s` subject `i` and seed `s+1` subject `i-1` were the
   same stream, so consecutive seeds were nearly the same run). The full set of

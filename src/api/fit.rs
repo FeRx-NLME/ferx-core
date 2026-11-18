@@ -757,6 +757,40 @@ pub(crate) fn perturb_init(
     p
 }
 
+/// The seed of one sampler (SAEM, Bayes, IMP, IMPMAP) on multi-start start `k`: start 0
+/// keeps the user's seed, every later start hashes `(base, k)` (#3021: `base + k` made
+/// start `k` under seed `s` replay start `k - 1` under seed `s + 1`).
+pub(crate) fn per_start_seed(base: u64, k: usize) -> u64 {
+    if k == 0 {
+        base
+    } else {
+        crate::rng::stream_seed(base, &[k as u64])
+    }
+}
+
+/// The options multi-start start `k > 0` runs with:
+/// - `saem_seed` / `bayes_seed` / `imp_seed` / `impmap_seed`: derived from the user's
+///   seed (or its default) by [`per_start_seed`], so each start gets a different MH/MCMC
+///   trajectory or set of IS draws. The Bayes sampler keys off `bayes_seed`, so without
+///   it every start runs an identical RNG trajectory (differing only by the perturbed
+///   init): wasted compute and false multi-start robustness. The IS seeds used to be
+///   shared, so every IMP/IMPMAP start reused one draw set (#3021). Start 0 keeps the
+///   user's seeds for reproducibility.
+/// - `global_search`: CRS2-LM ignores the starting point and samples freely in
+///   `[lower, upper]`, so running it on starts 1..n overrides the perturbation and makes
+///   multi-start a no-op for those starts. It runs on start 0 only.
+pub(crate) fn per_start_options(options: &FitOptions, k: usize) -> FitOptions {
+    let seed = |s: Option<u64>| Some(per_start_seed(s.unwrap_or(12345), k));
+    FitOptions {
+        saem_seed: seed(options.saem_seed),
+        bayes_seed: seed(options.bayes_seed),
+        imp_seed: seed(options.imp_seed),
+        impmap_seed: seed(options.impmap_seed),
+        global_search: false,
+        ..options.clone()
+    }
+}
+
 /// Multi-start ranking: should the candidate `(c_ofv, c_conv)` replace the
 /// current best `(b_ofv, b_conv)`?
 ///
@@ -1282,8 +1316,6 @@ fn fit_unstamped(
     // replicate-level pool *and* the full-width shared pool underneath every replicate
     // (#1115). Unpinned, the shared big-stack pool handles both levels as before.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
-    let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
-    let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
@@ -1303,25 +1335,11 @@ fn fit_unstamped(
     let par_starts = || -> Vec<(usize, Result<FitResult, EngineError>)> {
         crate::par::map(n, |k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
-            // Per-start option overrides for k > 0:
-            // - saem_seed / bayes_seed: derive from base so each start gets a different
-            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
-            //   perturbing it every start runs an identical RNG trajectory (differing
-            //   only by the perturbed init) — wasted compute and false multi-start
-            //   robustness. Start 0 keeps the user's seeds for reproducibility.
-            // - global_search: CRS2-LM ignores the starting point and samples freely in
-            //   [lower, upper], so running it on starts 1..n overrides the perturbation
-            //   and makes multi-start a no-op for those starts. Only run it on start 0.
             let opts_k_storage;
             let opts_ref: &FitOptions = if k == 0 {
                 options
             } else {
-                opts_k_storage = FitOptions {
-                    saem_seed: Some(crate::rng::stream_seed(base_saem_seed, &[k as u64])),
-                    bayes_seed: Some(crate::rng::stream_seed(base_bayes_seed, &[k as u64])),
-                    global_search: false,
-                    ..options.clone()
-                };
+                opts_k_storage = per_start_options(options, k);
                 &opts_k_storage
             };
             (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))

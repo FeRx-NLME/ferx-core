@@ -1270,10 +1270,8 @@ fn run_map_multistart(
         let subject = &population.subjects[i];
         let warm = prev_etas.map(|pe| pe[i].as_slice());
         // Deterministic per-subject, per-iteration seed, separated from IS draws.
-        let subj_seed = seed
-            .wrapping_add(i as u64)
-            .wrapping_add((iteration as u64) << 32)
-            .wrapping_add(0x4D43_4554_4100u64);
+        let subj_seed =
+            crate::rng::stream_seed(seed, &[i as u64, iteration as u64, 0x4D43_4554_4100u64]);
         find_ebe_multistart(
             model,
             subject,
@@ -3674,10 +3672,7 @@ fn run_mcem_mixture(
                         );
                         (center, h_post)
                     };
-                    let subj_seed = seed
-                        .wrapping_add(i as u64)
-                        .wrapping_add((k as u64) << 32)
-                        .wrapping_add((c as u64) << 48);
+                    let subj_seed = crate::rng::stream_seed(seed, &[i as u64, k as u64, c as u64]);
                     // Per-subject, per-class ISCALE pilot search — the same guard
                     // the single-population E-step runs (#528/#961): it rescues
                     // subjects whose posterior Hessian is a poor curvature

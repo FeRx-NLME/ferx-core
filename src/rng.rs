@@ -77,15 +77,37 @@ mod tests {
             if name == "rng.rs" {
                 continue;
             }
+            // Join method-chain continuations (`seed\n    .wrapping_add(i as u64)`) and
+            // arguments rustfmt puts on their own lines (`.wrapping_add(\n    i as u64,\n)`)
+            // into one logical line, so a derivation split over several lines is scanned whole.
+            let mut logical: Vec<(usize, String)> = Vec::new();
             for (n, line) in std::fs::read_to_string(&f).unwrap().lines().enumerate() {
-                let t = line.trim_start();
-                if t.starts_with("//") || !line.contains("seed") {
+                let t = line.trim();
+                if t.starts_with("//") {
                     continue;
                 }
-                let additive = line.contains(".wrapping_add(") && line.contains(" as u64)");
+                match logical.last_mut() {
+                    Some((_, prev))
+                        if t.starts_with('.') || t.starts_with(')') || prev.ends_with('(') =>
+                    {
+                        prev.push_str(t)
+                    }
+                    _ => logical.push((n + 1, t.to_string())),
+                }
+            }
+            for (n, line) in logical {
+                // A seed multiplied by an odd constant before the coordinates are added
+                // (VI's `crn_eps`) is a multiplicative mix, not `seed + i`: `(s, i)` and
+                // `(s + 1, i')` meet only at a 64-bit-sized `i' - i`.
+                if !line.contains("seed") || line.contains("seed.wrapping_mul(") {
+                    continue;
+                }
+                // ` as u64` with no closing paren also catches a scaled coordinate
+                // (`seed.wrapping_add(chain as u64 * K)`, Bayes' pre-#3021 shape).
+                let additive = line.contains(".wrapping_add(") && line.contains(" as u64");
                 let plus = line.contains("seed + ") && line.contains(" as u64");
                 if additive || plus {
-                    bad.push(format!("{}:{}: {}", f.display(), n + 1, t));
+                    bad.push(format!("{}:{}: {}", f.display(), n, line));
                 }
             }
         }
@@ -94,8 +116,7 @@ mod tests {
             "additive stream-seed derivation:\n{}",
             bad.join("\n")
         );
-        // The line scan cannot see a derivation split over several lines (SAEM's was), so
-        // every file that seeds per-subject / per-chain / per-start streams must also name
+        // Every file that seeds per-subject / per-chain / per-start streams must also name
         // the helper.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         for f in [

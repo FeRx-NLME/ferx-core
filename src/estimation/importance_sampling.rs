@@ -1107,9 +1107,7 @@ pub fn run_importance_sampling_mixture(
                     scratch,
                 );
                 let defensive = DefensiveMixture::new(&omega_inv, n_eta, defensive_alpha);
-                let subj_seed = seed
-                    .wrapping_add(i as u64)
-                    .wrapping_add((c as u64).wrapping_shl(40));
+                let subj_seed = stream_seed(seed, &[i as u64, c as u64]);
                 let (center, h_final) = adapted_eta_proposal(
                     model,
                     subject,
@@ -2080,9 +2078,7 @@ fn iscale_pilot_grid_search(
         let frac = g as f64 / (N_GRID - 1) as f64;
         let scale = (log_min + frac * (log_max - log_min)).exp();
         // Use a different seed per scale to avoid correlations
-        let pilot_seed = seed
-            .wrapping_add(0x4953_4341_4C45_0000u64)
-            .wrapping_add(g as u64);
+        let pilot_seed = stream_seed(seed, &[0x4953_4341_4C45_0000u64, g as u64]);
         if let Some(ess) = pilot_ess(scale, pilot_seed) {
             if ess > best_ess {
                 best_ess = ess;
