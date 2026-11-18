@@ -7722,25 +7722,30 @@ fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
 }
 
 /// #1353: an `SS=1` bolus whose lag is longer than `II` (`nonmem_anchor/ss_lag_ge_ii`, ID 2:
-/// `ALAG1 = 15`, `II = 12`) on the closed form, IV and oral, against reconverged FD, with the lag below `II`
-/// beside it so the straddle is asserted. The closed form's superposition wrapped the
+/// `ALAG1 = 15`, `II = 12`) on the closed form, IV and oral, against reconverged FD, with the
+/// lag below `II` beside it so the straddle is asserted; and (#3028) a readout of the oral
+/// depot, whose amounts wrapped there too, with every arm's closed-form central state equal to
+/// its concentration. The closed form's superposition wrapped the
 /// pre-arrival phase and collapsed the arrival there, where the predictions clamp and split
 /// (#1121): 1.0 relative off at lag 15, 8.0e-10 at lag 3. Measured now (macOS arm64): 2.5e-10
 /// and 8.0e-10.
 #[test]
 fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
-    for (lag, pk) in [
-        (3.0, "one_cpt_iv(cl=CL, v=V"),
-        (15.0, "one_cpt_iv(cl=CL, v=V"),
-        (3.0, "one_cpt_oral(cl=CL, v=V, ka=1.2"),
-        (15.0, "one_cpt_oral(cl=CL, v=V, ka=1.2"),
+    let depot = "[scaling]\n  y = (central + 0.3 * depot) / V\n";
+    for (lag, pk, readout) in [
+        (3.0, "one_cpt_iv(cl=CL, v=V", ""),
+        (15.0, "one_cpt_iv(cl=CL, v=V", ""),
+        (3.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", ""),
+        (15.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", ""),
+        (3.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", depot),
+        (15.0, "one_cpt_oral(cl=CL, v=V, ka=1.2", depot),
     ] {
         let model = parse_model_string(&format!(
             "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
              theta TVLAG({lag}, 0.1, 40.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  \
              sigma PROP_ERR ~ 0.05 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
              V = TVV * exp(ETA_V)\n  LAG = TVLAG\n[structural_model]\n  \
-             pk {pk}, lagtime=LAG)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n"
+             pk {pk}, lagtime=LAG)\n{readout}[error_model]\n  DV ~ proportional(PROP_ERR)\n"
         ))
         .unwrap();
         let s = subject(
@@ -7752,8 +7757,19 @@ fn ss_bolus_with_a_lag_past_ii_matches_reconverged_fd() {
         let worst = fd_oracle(&model, &s, true);
         assert!(
             worst < 1e-8,
-            "{pk} lag {lag}: worst relative difference {worst:.2e}"
+            "{pk} {readout} lag {lag}: worst relative difference {worst:.2e}"
         );
+        let pk_p =
+            (model.pk_param_fn)(&model.default_params.theta, &[0.0; 2], &HashMap::new(), 0.0);
+        let states = crate::pk::predict_all_states(model.pk_model, &s, &pk_p);
+        for (&t, st) in s.obs_times.iter().zip(&states) {
+            let c = crate::pk::predict_concentration(model.pk_model, &s.doses, t, &pk_p);
+            let central = *st.last().unwrap();
+            assert!(
+                (central - c).abs() <= 1e-12 * c.abs(),
+                "{pk} lag {lag}, t = {t}: central state {central} against concentration {c}"
+            );
+        }
     }
 }
 

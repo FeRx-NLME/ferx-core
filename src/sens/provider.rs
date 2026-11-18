@@ -85,47 +85,28 @@ fn prog_covers_required_pk_slots(
 /// Elapsed time since a dose's *lagged* arrival, as a dual carrying the lagtime
 /// sensitivity (`∂elapsed/∂lagtime = −1`). Mirrors `crate::pk::predict_concentration`:
 /// the dose contributes from `dose.time + lagtime` onward, and a steady-state
-/// dose additionally shows its pre-arrival tail (the previous interval's pulse)
-/// by wrapping the negative elapsed time up into `[0, II)`. Returns `None` when
-/// the dose does not contribute at `t_obs`. `lag_d` is the seeded lagtime dual;
-/// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
+/// dose additionally shows its pre-arrival tail, the previous interval's pulse at
+/// `t_eff − II`. Returns `None` when the dose does not contribute at `t_obs`. `lag_d` is the
+/// seeded lagtime dual; `lag_val` its value (kept separate to branch on `.val()` without a
+/// borrow).
 ///
-/// Past `ALAG > II` this *wraps* the pre-arrival phase, as the depot amounts' production twin
-/// (`pk::analytical_state_at_times`) does; the concentrations take [`ss_lag_past_ii`] there.
+/// An `SS=1` dose whose lag is past `II` is not served here: its callers take
+/// [`ss_lag_past_ii`] there, so a pre-arrival tail is at most one interval old and its
+/// elapsed time `t_obs − dose.time + II − lag` is in `[0, II)`.
 #[inline]
 fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
-    use crate::sens::num::BranchCmp as B;
-    let t_eff = dose.time + lag_val;
     if arrived(dose, t_obs, lag_val, lag_d) {
         // `elapsed = (t_obs − dose.time) − lagtime`.
         Some(T::from_f64(t_obs - dose.time) - lag_d)
     } else if dose.ss && dose.ii > 0.0 && t_obs >= dose.time {
-        // Pre-arrival steady-state tail: the most recent pulse landed at
-        // `t_eff − n·II`; wrap the negative elapsed up into `[0, II)`. `n` is
-        // locally constant, so `∂elapsed/∂lagtime = −1` still holds.
-        let raw = t_obs - t_eff;
-        let n = (-raw / dose.ii).ceil();
-        if T::RECORDS_BRANCHES {
-            // `n` is a step function of the lag: keep it, `n − 1 < (t_eff − t_obs)/II ≤ n`,
-            // on the recorded quotient (the same operations: `−(a − b) = b − a` exactly).
-            let q = (T::from_f64(dose.time) + lag_d - T::from_f64(t_obs)) / T::from_f64(dose.ii);
-            if !(q.br_cmp_c(B::Gt, n - 1.0) && q.br_cmp_c(B::Le, n)) {
-                return None;
-            }
-        }
-        let wrapped = T::from_f64(t_obs - dose.time + n * dose.ii) - lag_d;
-        if wrapped.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
-            None
-        } else {
-            Some(wrapped)
-        }
+        Some(T::from_f64(t_obs - dose.time + dose.ii) - lag_d)
     } else {
         None
     }
 }
 
-/// An `SS=1` dose whose lag is past `II`, as `crate::pk::predict_concentration` reads it
-/// (#1121): the train from its pulse on the record (`crate::dosing::ss_seed_phase` is `0`),
+/// An `SS=1` dose whose lag is past `II`, as `crate::pk::predict_concentration` and
+/// `crate::pk::analytical_state_at_times` read it (#1121, #3028): the train from its pulse on the record (`crate::dosing::ss_seed_phase` is `0`),
 /// plus the one real dose arriving at `t_eff` once it has — `(ss_elapsed, arrival_elapsed)`.
 /// `None` for every other dose, which [`lagged_elapsed`] serves (#1353: its wrap and collapsed
 /// arrival put the jets ~19 % from these predictions, the outer gradient 100 % off).
@@ -544,21 +525,29 @@ pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
                 {
                     continue;
                 }
-                let Some(tau) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
-                    continue;
+                let (tau, arrival) = match ss_lag_past_ii(dose, t_obs, d.lag_val, d.lag_d) {
+                    Some(terms) => terms,
+                    None => match lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) {
+                        Some(e) => (e, None),
+                        None => continue,
+                    },
                 };
                 if d.ka_d.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
                     || tau.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
                 {
                     continue;
                 }
-                let a = d.f_d * T::from_f64(dose.amt) * (-(d.ka_d * tau)).exp();
+                let depot = |tau: T| d.f_d * T::from_f64(dose.amt) * (-(d.ka_d * tau)).exp();
+                let a = depot(tau);
                 acc = acc
                     + if dose.ss && dose.ii > 0.0 {
                         a * crate::sens::num::ss_factor(d.ka_d, dose.ii)
                     } else {
                         a
                     };
+                if let Some(t) = arrival {
+                    acc = acc + depot(t);
+                }
             }
             if acc.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
                 T::from_f64(0.0)
