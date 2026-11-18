@@ -149,6 +149,48 @@ fn the_block_is_the_classical_model_it_desugars_to() {
     assert_eq!(hand_fit.theta, block_fit.theta);
 }
 
+/// SAEM reads the covariate groups' outside reads to choose its M-step (#619, #1620): the block
+/// must route there exactly as the relation written by hand, so a short seeded run of each is
+/// bit-identical (#3014). Before the fix the block's own text made its relation θ look read
+/// outside the groups, sending the block form down the other M-step.
+#[test]
+fn saem_takes_the_same_route_for_both_forms() {
+    let hand = parse_full_model(&classical()).expect("classical model must parse");
+    let block = parse_full_model(&declarative()).expect("block-declared model must parse");
+    // Non-degeneracy: the hand form must actually reach the joint M-step, or both arms taking
+    // the data-term route would agree just as well. Both relation lines are covariate groups
+    // and no group θ is read outside its own line.
+    let groups = &hand.model.covariate_mu_refs;
+    let mut etas: Vec<&str> = groups.iter().map(|g| g.eta_name.as_str()).collect();
+    etas.sort_unstable();
+    assert_eq!(etas, ["ETA_CL", "ETA_V1"], "both relations are groups");
+    assert!(
+        groups.iter().all(|g| g.shared_thetas.is_empty()),
+        "the hand form's relation θ are exclusive to their groups: {groups:?}"
+    );
+    let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("covariate dataset must load");
+    // Tier-2: a few SAEM iterations, never a convergence loop.
+    let opts = FitOptions {
+        method: ferx_core::types::EstimationMethod::Saem,
+        saem_n_exploration: 3,
+        saem_n_convergence: 3,
+        // The route under test is the M-step; nothing below reads the covariance step.
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let hand_fit = fit(&hand.model, &pop, &hand.model.default_params, &opts)
+        .expect("short classical SAEM fit must not error");
+    let block_fit = fit(&block.model, &pop, &block.model.default_params, &opts)
+        .expect("short block-declared SAEM fit must not error");
+    assert!(
+        hand_fit.ofv.is_finite(),
+        "the classical arm must produce an objective"
+    );
+    assert_eq!(hand_fit.ofv, block_fit.ofv);
+    assert_eq!(hand_fit.theta, block_fit.theta);
+    assert_eq!(hand_fit.omega, block_fit.omega);
+}
+
 #[test]
 fn the_relation_table_is_echoed_on_the_fit_result() {
     // The point of the block: a search reads the covariate model back off the

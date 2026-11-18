@@ -41,10 +41,11 @@ use std::path::{Path, PathBuf};
 const ALLOWED: &[(&str, usize, &str)] = &[
     (
         "src/api/fit.rs",
-        8,
+        9,
         "the stage loop resolves `stage_opts.interaction` through `interaction_for`; the \
          `post_opts` shadow resolves it for the post-fit block, so every later \
-         `options.interaction` there is the resolved flag",
+         `options.interaction` there is the resolved flag; the `saem_ofv = agq` readout \
+         passes its flag to `interaction_for(Laplace, ..)` (#2973)",
     ),
     (
         "src/api/postfit.rs",

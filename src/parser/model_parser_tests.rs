@@ -31114,7 +31114,7 @@ fn the_param_consumer_stop_set() {
 /// #1662: a named `[event_model NAME]` reads parameters too, and its lines are
 /// in `extracted.named`, not the unnamed map. (No kappa here: an event
 /// predictor may not read an IOV-dependent parameter.)
-/// Dies under: the named-block loop of `param_consumer_identifiers` deleted.
+/// Dies under: the named half of `every_block_body` deleted.
 #[cfg(feature = "survival")]
 #[test]
 fn a_named_event_model_consumes_a_parameter() {
@@ -40095,35 +40095,279 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
     assert_eq!(names(&m), ["TVCL", "TVV"], "an additive line");
 }
 
-/// A `[covariate_model]` relation folds exactly as the expression it desugars to (#2980): the
-/// block's text declares its θ, it does not read them, so a block-declared covariate θ must not
-/// count as an outside read. Each form against the other, and the hand form against its own
-/// expectation, so a fold lost on both sides cannot pass as agreement.
+/// A `[covariate_model]` relation is read by every exclusivity check exactly as the expression it
+/// desugars to (#2980, #3014): the block's text declares its θ, it does not read them. The mu
+/// fold, the plain and covariate mu-refs and the covariate groups' outside reads (SAEM's joint
+/// M-step) must agree between the two spellings, and the hand form must actually be exclusive,
+/// so a check lost on both sides cannot pass as agreement. The straddle: an
+/// `[initial_conditions]` amount computed from a relation θ is a real outside read, and both
+/// spellings must still see it.
 #[test]
-fn a_block_declared_covariate_theta_folds_as_its_hand_written_relation() {
+fn a_covariate_model_block_is_read_through_its_statements_by_every_exclusivity_check() {
     let head = "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV1(50.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V1 ~ 0.1\n  sigma PROP ~ 0.1\n";
     let tail = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V1)\n[error_model]\n  DV ~ proportional(PROP)\n";
-    let hand = format!("{head}  theta THETA_CL_WT(0.6, 0.01, 5.0)\n  theta THETA_CL_CRCL(0.3, 0.01, 5.0)\n  theta THETA_V1_WT(0.9, 0.01, 5.0)\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_CL_WT * (CRCL / 100)^THETA_CL_CRCL * exp(ETA_CL)\n  V1 = TVV1 * (WT / 70)^THETA_V1_WT * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n{tail}");
-    let block = format!("{head}[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n[covariate_model]\n  CL ~ WT   power(center = 70)  => THETA_CL_WT(0.6, 0.01, 5.0)\n  CL ~ CRCL power(center = 100) => THETA_CL_CRCL(0.3, 0.01, 5.0)\n  V1 ~ WT   power(center = 70)  => THETA_V1_WT(0.9, 0.01, 5.0)\n{tail}");
-    let fold = |t: &str| {
+    let hand = |extra: &str| {
+        format!("{head}  theta THETA_CL_WT(0.6, 0.01, 5.0)\n  theta THETA_CL_CRCL(0.3, 0.01, 5.0)\n  theta THETA_V1_WT(0.9, 0.01, 5.0)\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_CL_WT * (CRCL / 100)^THETA_CL_CRCL * exp(ETA_CL)\n  V1 = TVV1 * (WT / 70)^THETA_V1_WT * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n{tail}{extra}")
+    };
+    let block = |extra: &str| {
+        format!("{head}[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n[covariate_model]\n  CL ~ WT   power(center = 70)  => THETA_CL_WT(0.6, 0.01, 5.0)\n  CL ~ CRCL power(center = 100) => THETA_CL_CRCL(0.3, 0.01, 5.0)\n  V1 ~ WT   power(center = 70)  => THETA_V1_WT(0.9, 0.01, 5.0)\n{tail}{extra}")
+    };
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        thetas: Vec<String>,
+        mu_refs: Vec<(String, String)>,
+        groups: Vec<(String, Vec<String>, Vec<String>, Vec<String>)>,
+        fold: (
+            Vec<(usize, usize, crate::types::MuTransform)>,
+            Vec<usize>,
+            Vec<Vec<usize>>,
+        ),
+    }
+    let seen = |t: &str| {
         let m = parse_full_model(t).expect("model must parse").model;
+        let mut mu_refs: Vec<(String, String)> = m
+            .mu_refs
+            .iter()
+            .map(|(e, r)| (e.clone(), r.theta_name.clone()))
+            .collect();
+        mu_refs.sort();
+        let groups = m
+            .covariate_mu_refs
+            .iter()
+            .map(|g| {
+                (
+                    g.eta_name.clone(),
+                    g.theta_names.clone(),
+                    g.shared_thetas.clone(),
+                    g.read_outside_groups.clone(),
+                )
+            })
+            .collect();
         let f = &m.indiv_param_partials.mu_fold;
-        (
-            m.theta_names.clone(),
-            f.lines.clone(),
-            f.thetas.clone(),
-            f.reach.clone(),
+        Seen {
+            thetas: m.theta_names.clone(),
+            mu_refs,
+            groups,
+            fold: (f.lines.clone(), f.thetas.clone(), f.reach.clone()),
+        }
+    };
+
+    let (h, b) = (seen(&hand("")), seen(&block("")));
+    assert_eq!(
+        h.groups.len(),
+        2,
+        "both lines are covariate mu-ref groups: {h:?}"
+    );
+    assert!(
+        h.groups.iter().all(|g| g.3.is_empty()),
+        "the hand form's relation θ are read by nothing outside the groups: {h:?}"
+    );
+    assert_eq!(h.fold.1, vec![0, 1, 2, 3, 4], "the hand form folds every θ");
+    assert_eq!(h, b, "the block form must be read exactly as the hand form");
+
+    // The straddle: a real outside reader of THETA_CL_WT.
+    let reader = "[initial_conditions]\n  init(central) = THETA_CL_WT * 0.001\n";
+    let (h, b) = (seen(&hand(reader)), seen(&block(reader)));
+    let cl = b
+        .groups
+        .iter()
+        .find(|g| g.0 == "ETA_CL")
+        .expect("the CL group is recorded");
+    assert_eq!(
+        cl.3,
+        vec!["THETA_CL_WT"],
+        "an [initial_conditions] read is outside every group"
+    );
+    assert!(
+        !b.fold.1.contains(&2),
+        "a θ read outside is not folded: {b:?}"
+    );
+    assert_eq!(h, b, "both spellings see the outside read alike");
+}
+
+/// A named endpoint block reads θ as its unnamed spelling does (#3014 review): a hazard reading
+/// the CL group's covariate θ makes that θ an outside read of the group, and keeps it out of the
+/// covariance fold, whether the block is `[event_model]` or `[event_model death]`. The unnamed
+/// arm is the control the named one must match; before the fix only the unnamed half of the
+/// blocks was scanned, so the named arm called `THETA_WT` exclusive and SAEM's joint M-step
+/// would have dropped the hazard's dependence on it.
+#[cfg(feature = "survival")]
+#[test]
+fn a_named_endpoint_block_is_an_outside_reader_like_its_unnamed_spelling() {
+    let model = |header: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 1.0, 500.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVLAMBDA(0.05, 0.001, 10.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{header}\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA * (WT / 70)^THETA_WT\n"
         )
     };
-    let (h, b) = (fold(&hand), fold(&block));
+    for header in ["[event_model]", "[event_model death]"] {
+        let m = parse_full_model(&model(header))
+            .unwrap_or_else(|e| panic!("{header}: model must parse: {e}"))
+            .model;
+        let cl = m
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .unwrap_or_else(|| panic!("{header}: the CL group is recorded"));
+        assert_eq!(
+            cl.read_outside_groups,
+            vec!["THETA_WT"],
+            "{header}: the hazard reads THETA_WT outside the CL group"
+        );
+        let wt = m.theta_names.iter().position(|n| n == "THETA_WT").unwrap();
+        assert!(
+            !m.indiv_param_partials.mu_fold.thetas.contains(&wt),
+            "{header}: a θ the hazard reads is not folded: {:?}",
+            m.indiv_param_partials.mu_fold
+        );
+    }
+}
+
+/// Every registered block is decided as an outside reader or not (#3014 review): the
+/// exclusivity checks' scan is an allow-list, so a new block that reads θ or η and is left
+/// off it would make a shared group look exclusive. Mirrors
+/// `every_block_is_sorted_into_param_consumer_or_not`.
+#[test]
+fn every_block_is_sorted_into_outside_reader_or_not() {
+    use std::collections::BTreeSet;
+    let registry: BTreeSet<&str> = BLOCK_REGISTRY.iter().map(|(name, _, _)| *name).collect();
+    let yes: BTreeSet<&str> = OUTSIDE_READER_BLOCKS.iter().copied().collect();
+    let no: BTreeSet<&str> = NON_OUTSIDE_READER_BLOCKS.iter().copied().collect();
+    assert_eq!(yes.len(), OUTSIDE_READER_BLOCKS.len(), "duplicate reader");
     assert_eq!(
-        h.0, b.0,
-        "the two forms must name the same θ in the same order"
+        no.len(),
+        NON_OUTSIDE_READER_BLOCKS.len(),
+        "duplicate non-reader"
     );
-    assert_eq!(h.2, vec![0, 1, 2, 3, 4], "the hand form folds every θ");
+    assert!(
+        yes.is_disjoint(&no),
+        "{:?}",
+        yes.intersection(&no).collect::<Vec<_>>()
+    );
+    let sorted: BTreeSet<&str> = yes.union(&no).copied().collect();
+    assert_eq!(sorted, registry);
+    // Every parameter consumer turns a parameter into a prediction, so it reads too.
+    for b in PARAM_CONSUMER_BLOCKS {
+        assert!(
+            yes.contains(b),
+            "[{b}] consumes a parameter but is no reader"
+        );
+    }
+}
+
+/// The outside scan reads a reader block whether it is unnamed or named, and skips a block
+/// that only declares or reports a name, named or not (#3014 review). In `[mixture]` it reads
+/// the mixing probability and skips a per-class `omega(k)`/`sigma(k)` declaration. The blocks are built
+/// directly rather than parsed, so the test needs no feature: every named reader block
+/// (`[event_model NAME]`, `[markov_model NAME]`, …) is behind `survival` or `markov`, and
+/// `extract_blocks` refuses one without its feature.
+#[test]
+fn the_outside_scan_reads_reader_blocks_of_either_spelling_and_nothing_else() {
+    let lines = |s: &[&str]| s.iter().map(|l| l.to_string()).collect::<Vec<String>>();
+    let mut extracted = ExtractedBlocks::default();
+    for (ty, body) in [
+        ("odes", lines(&["d/dt(central) = -IN_ODES * central"])),
+        ("event_model", lines(&["scale = IN_UNNAMED"])),
+        (
+            "covariate_model",
+            lines(&["CL ~ WT power(center = 70) => COV_THETA(0.6)"]),
+        ),
+        ("output", lines(&["REPORTED"])),
+        ("derived", lines(&["COLUMN = DERIVED_IN * 2"])),
+        (
+            "mixture",
+            lines(&[
+                "nsub = 2",
+                "logit(1) = MIX_THETA",
+                "omega(2) MIX_ETA ~ 0.15",
+                "sigma(2) MIX_EPS ~ 0.02",
+            ]),
+        ),
+        ("simulation", lines(&["covariate SIM_COV = 70"])),
+    ] {
+        extracted.unnamed.insert(ty.to_string(), body);
+    }
+    for (ty, inst, body) in [
+        (
+            "event_model",
+            "death",
+            lines(&["scale = IN_NAMED * exp(ETA_HAZ)"]),
+        ),
+        ("markov_model", "sleep", lines(&["rate = IN_MARKOV"])),
+        (
+            "covariate_nn",
+            "TYPICAL_PK",
+            lines(&["inputs = [NN_IN]", "outputs = [NN_OUT]"]),
+        ),
+    ] {
+        extracted
+            .named
+            .entry(ty.to_string())
+            .or_default()
+            .insert(inst.to_string(), body);
+    }
+    let seen = identifiers_of_blocks(&extracted, OUTSIDE_READER_BLOCKS);
+    for read in [
+        "IN_ODES",
+        "IN_UNNAMED",
+        "IN_NAMED",
+        "ETA_HAZ",
+        "IN_MARKOV",
+        "MIX_THETA",
+    ] {
+        assert!(seen.contains(read), "{read} is read: {seen:?}");
+    }
+    for declared in [
+        "NN_IN",
+        "NN_OUT",
+        "COV_THETA",
+        "REPORTED",
+        "DERIVED_IN",
+        "SIM_COV",
+        "MIX_ETA",
+        "MIX_EPS",
+    ] {
+        assert!(
+            !seen.contains(declared),
+            "{declared} is only declared or reported: {seen:?}"
+        );
+    }
+}
+
+/// Tabling a group's typical value is no read of its θ (#3014 review): `[output]` and
+/// `[derived]` report a column after the fit and feed no prediction, so `TVCL` listed there
+/// leaves the CL group exclusive, as the same model without the listing is. The straddle: the
+/// same name in `[initial_conditions]`, which sets a predicted amount, is a read.
+#[test]
+fn a_reported_typical_value_is_no_outside_read() {
+    let model = |extra: &str| {
+        format!(
+            "[parameters]\n  theta THETA_CL(5.0, 0.1, 100.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVV(50.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  TVCL = THETA_CL * (WT / 70)^THETA_WT\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{extra}"
+        )
+    };
+    let shared = |extra: &str| {
+        parse_full_model(&model(extra))
+            .unwrap_or_else(|e| panic!("model must parse ({extra}): {e}"))
+            .model
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .expect("the CL group is recorded")
+            .shared_thetas
+            .clone()
+    };
+    assert!(shared("").is_empty(), "control: the group is exclusive");
+    assert!(
+        shared("[output]\n  TVCL CL\n").is_empty(),
+        "a reported typical value is no read"
+    );
+    assert!(
+        shared("[derived]\n  TV_REPORT = TVCL * 1\n").is_empty(),
+        "a [derived] column of it is no read either"
+    );
     assert_eq!(
-        h, b,
-        "the block form must fold exactly what the hand form folds"
+        shared("[initial_conditions]\n  init(central) = TVCL * 0.001\n"),
+        ["THETA_CL", "THETA_WT"],
+        "an initial amount computed from it is"
     );
 }
 
@@ -40174,4 +40418,94 @@ fn endpoint_program_reads_a_covariate_missing_from_its_list_by_name() {
     let p = leaf_program(Expression::Covariate("X".into()), &[]);
     assert_eq!(leaf_value(&p, &[("X", 5.0)]), 5.0);
     assert_eq!(leaf_value(&p, &[]), 0.0);
+}
+
+/// The η side of the exclusivity check reads the other blocks too (#3014 review): an
+/// `[initial_conditions]` amount computed from a group's η, or from an additive mu-ref's η, is
+/// a second use of that η, so SAEM's joint M-step (which re-centres it by Δ_i) must not take
+/// the group, and the additive anchor is dropped. The control without it keeps both, and so
+/// does a `[derived]` column of the η, which is computed after the fit.
+#[test]
+fn an_eta_read_by_another_block_is_a_second_use() {
+    let model = |extra: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVV(50.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)\n  V = TVV + ETA_V\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{extra}"
+        )
+    };
+    let seen = |extra: &str| {
+        let m = parse_full_model(&model(extra))
+            .unwrap_or_else(|e| panic!("model must parse ({extra}): {e}"))
+            .model;
+        let cl = m
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .expect("the CL group is recorded")
+            .eta_shared;
+        (cl, m.mu_refs.contains_key("ETA_V"))
+    };
+    assert_eq!(
+        seen(""),
+        (false, true),
+        "control: both η are exclusive to their line"
+    );
+    assert_eq!(
+        seen("[derived]\n  SHRINK_CL = ETA_CL * 2\n  SHRINK_V = ETA_V * 2\n"),
+        (false, true),
+        "a [derived] column of each η is no second use"
+    );
+    assert_eq!(
+        seen("[initial_conditions]\n  init(central) = 0.001 * (1 + ETA_CL + ETA_V)\n"),
+        (true, false),
+        "an initial amount read from each η is a second use"
+    );
+}
+
+/// A `[mixture]` per-class variance override names an η without reading it (#3014 review):
+/// `omega(2) ETA_V ~ 0.2` declares class 2's variance, so the additive mu-ref on `ETA_V` stays,
+/// as it does without the override. Before the outside scan skipped those lines, the η side
+/// counted the declaration as a second use and dropped the anchor.
+#[test]
+fn a_mixture_class_variance_override_is_no_second_use() {
+    let model = |overrides: &str| {
+        format!(
+            "[parameters]\n  theta TVCL1(1.0, 0.001, 100.0)\n  theta TVCL2(3.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  theta MIXL(0.0, -10.0, 10.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma EPS ~ 0.01\n[mixture]\n  nsub = 2\n  logit(1) = MIXL\n{overrides}[individual_parameters]\n  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)\n  V = TVV + ETA_V\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n"
+        )
+    };
+    for overrides in ["", "  omega(2) ETA_V ~ 0.2\n  sigma(2) EPS ~ 0.02\n"] {
+        let m = parse_model_string(&model(overrides))
+            .unwrap_or_else(|e| panic!("model must parse ({overrides:?}): {e}"));
+        assert!(
+            m.mu_refs.contains_key("ETA_V"),
+            "{overrides:?}: the additive anchor on ETA_V stays: {:?}",
+            m.mu_refs.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+/// The same η read through a hazard, unnamed and named: the named spelling is the one the
+/// unnamed-only scan missed (#3014 review).
+#[cfg(feature = "survival")]
+#[test]
+fn an_eta_read_by_a_named_hazard_is_a_second_use_like_its_unnamed_spelling() {
+    let model = |header: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 1.0, 500.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVLAMBDA(0.05, 0.001, 10.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{header}\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA * exp(0.5 * ETA_CL)\n"
+        )
+    };
+    for header in ["[event_model]", "[event_model death]"] {
+        let m = parse_full_model(&model(header))
+            .unwrap_or_else(|e| panic!("{header}: model must parse: {e}"))
+            .model;
+        let cl = m
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .unwrap_or_else(|| panic!("{header}: the CL group is recorded"));
+        assert!(cl.eta_shared, "{header}: the hazard reads ETA_CL: {cl:?}");
+        assert!(
+            cl.read_outside_groups.is_empty(),
+            "{header}: no θ of the group is read outside it: {cl:?}"
+        );
+    }
 }

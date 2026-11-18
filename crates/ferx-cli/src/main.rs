@@ -464,6 +464,18 @@ fn main() {
 
             println!("\nFit completed!");
             println!("OFV: {:.4}", fit_result.ofv);
+            // A SAEM fit's OFV is the SAEM objective or the IS / quadrature -2 log L (#2973);
+            // say which, and give the FOCE/Laplace value the old number was.
+            if let Some(o) = &fit_result.saem_objective {
+                let kind = match o.kind {
+                    ferx_core::types::SaemOfv::Saem => {
+                        "SAEM objective (NONMEM SAEMOBJ convention; not a likelihood)"
+                    }
+                    ferx_core::types::SaemOfv::Agq => "adaptive Gauss-Hermite -2LL",
+                    _ => "importance-sampled -2LL (NONMEM IMP EONLY=1)",
+                };
+                println!("  {kind}; FOCE/Laplace OFV (diagnostic): {:.4}", o.foce_ofv);
+            }
             println!("Elapsed: {:.3}s", elapsed_secs);
             for (name, val) in fit_result.theta_names.iter().zip(fit_result.theta.iter()) {
                 println!("  {} = {:.6}", name, val);

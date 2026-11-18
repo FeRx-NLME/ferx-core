@@ -526,7 +526,7 @@ fn vi_fit_round_trips_through_a_fitrx_bundle() {
     .unwrap();
     let l = load_fit(&path).expect("a VI bundle must load").fit;
 
-    assert!(l.ofv.is_nan() && l.aic.is_nan() && l.bic.is_nan());
+    assert!(l.ofv.is_nan() && l.aic.is_none() && l.bic.is_none());
     let lv =
         l.vi.as_ref()
             .expect("the VI result must survive the round trip");
