@@ -418,13 +418,9 @@ pub trait PkNum:
     fn sin(self) -> Self;
     /// `acos` (3-cpt trigonometric cubic root solve).
     fn acos(self) -> Self;
-    /// The bytecode VM's `Op::Sqrt`: the type's `sqrt` of a positive argument, else a constant
-    /// (zero derivative, #2892; an `inf · 0` would put a `NaN` in the jets, #2844). The value is
-    /// the `f64` lane VM's: `±0` passes through as `sqrt(±0) = ±0`, and a negative or `NaN`
-    /// argument floors to `+0` (`v >= 0`, not `f64::max`, whose signed-zero result is not
-    /// specified). A recording type records one total node instead (#3002): its branches would
-    /// be guards, and a loop body recorded at a positive argument would decline the segment
-    /// once the argument reaches zero.
+    /// The bytecode VM's `Op::Sqrt`: the type's `sqrt` of a positive argument, else the constant
+    /// `±0` (a zero keeps its sign) or `+0` (negative, `NaN`), with zero jets (#2892, #2844). A
+    /// recording type records one total node instead: its branches would be guards (#3002).
     fn sqrt_vm(self) -> Self {
         use BranchCmp::{Ge, Gt};
         if self.br_cmp_c(Gt, 0.0) {
