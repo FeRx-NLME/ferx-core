@@ -166,6 +166,75 @@ fn generate_warfarin() {
     write_nonmem_csv("data/warfarin.csv", &subjects, &[], 1);
 }
 
+/// The parts every model built here shares — proportional error, analytic, no covariates,
+/// IOV, priors or optional blocks — at `default_params`. Each builder names the rest.
+fn bare_model(default_params: ModelParameters) -> CompiledModel {
+    CompiledModel {
+        plan_id: Default::default(),
+        residual_serial: None,
+        priors: Vec::new(),
+        prior_from_fit: None,
+        covariate_model: None,
+        name: String::new(),
+        pk_model: PkModel::OneCptOral,
+        error_model: ErrorModel::Proportional,
+        error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
+        residual_correlations: Vec::new(),
+        pk_param_fn: Box::new(|_, _, _, _| PkParams::default()),
+        n_theta: 0,
+        n_eta: 0,
+        n_epsilon: 1,
+        theta_names: Vec::new(),
+        eta_names: Vec::new(),
+        default_params,
+        omega_init_as_sd: Vec::new(),
+        sigma_init_as_sd: vec![false; 1],
+        kappa_init_as_sd: Vec::new(),
+        kappa_weights: Vec::new(),
+        tv_fn: None,
+        pk_indices: Vec::new(),
+        eta_map: Vec::new(),
+        pk_idx_f64: Vec::new(),
+        sel_flat: Vec::new(),
+        ode_spec: None,
+        dose_attr_map: Default::default(),
+        diffusion_theta_start: None,
+        diffusion_state_indices: Vec::new(),
+        bloq_method: BloqMethod::Drop,
+        mu_refs: HashMap::new(),
+        covariate_mu_refs: Vec::new(),
+        kappa_mu_refs: HashMap::new(),
+        referenced_covariates: Vec::new(),
+        gradient_method: GradientMethod::default(),
+        parse_warnings: Vec::new(),
+        has_conditional_eta_params: false,
+        eta_param_info: Vec::new(),
+        kappa_param_types: Vec::new(),
+        theta_transform: Vec::new(),
+        theta_eta_linked: Vec::new(),
+        n_kappa: 0,
+        kappa_names: Vec::new(),
+        indiv_param_names: Vec::new(),
+        indiv_param_partials: crate::types::IndivParamPartials::empty(),
+        #[cfg(feature = "nn")]
+        covariate_nns: Vec::new(),
+        scaling: ScalingSpec::None,
+        log_transform: false,
+        dv_pre_logged: false,
+        derived_exprs: vec![],
+        output_columns: vec![],
+        #[cfg(feature = "survival")]
+        endpoints: std::collections::BTreeMap::new(),
+        frem_config: None,
+        residual_error_eta: None,
+        analytical_init: Vec::new(),
+        analytic_readout: None,
+        ruv_magnitude: None,
+        absorption_ode_equivalent: None,
+        mixture: None,
+    }
+}
+
 fn build_warfarin_model() -> CompiledModel {
     let theta_names = vec!["TVCL".into(), "TVV".into(), "TVKA".into()];
     let eta_names = vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()];
@@ -200,37 +269,20 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "warfarin".into(),
-        pk_model: PkModel::OneCptOral,
-        error_model: ErrorModel::Proportional,
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         pk_param_fn,
         n_theta: 3,
         n_eta: 3,
-        n_epsilon: 1,
         theta_names,
         eta_names,
-        default_params,
         omega_init_as_sd: vec![false; 3],
-        sigma_init_as_sd: vec![false; 1],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA],
-
         eta_map: (0..3).map(|i| i as i32).collect(),
-
         pk_idx_f64: [PK_IDX_CL, PK_IDX_V, PK_IDX_KA]
             .iter()
             .map(|&i| i as f64)
             .collect(),
-
         sel_flat: {
             // n_tv = 3, n_eta = 3, each tv uses its positional eta.
             let mut v = vec![0.0f64; 3 * 3];
@@ -239,42 +291,8 @@ fn build_warfarin_model() -> CompiledModel {
             }
             v
         },
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::default(),
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        n_kappa: 0,
-        kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..bare_model(default_params)
     }
 }
 
@@ -346,37 +364,21 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
-        error_model: ErrorModel::Proportional,
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         pk_param_fn,
         n_theta: 4,
         n_eta: 4,
-        n_epsilon: 1,
         theta_names,
         eta_names,
-        default_params: params.clone(),
         omega_init_as_sd: vec![false; 4],
-        sigma_init_as_sd: vec![false; 1],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
-
         eta_map: (0..4).map(|i| i as i32).collect(),
-
         pk_idx_f64: [PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2]
             .iter()
             .map(|&i| i as f64)
             .collect(),
-
         sel_flat: {
             let mut v = vec![0.0f64; 4 * 4];
             for i in 0..4 {
@@ -384,42 +386,8 @@ fn generate_two_cpt_iv() {
             }
             v
         },
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::default(),
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        n_kappa: 0,
-        kappa_names: Vec::new(),
         indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..bare_model(params.clone())
     };
     let obs_times = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0, 48.0, 72.0];
     let subjects = simulate_subjects(&model, &params, 15, 100.0, 1, &obs_times, 123, None);
@@ -487,37 +455,21 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
-        error_model: ErrorModel::Proportional,
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         pk_param_fn,
         n_theta: 7,
         n_eta: 5,
-        n_epsilon: 1,
         theta_names,
         eta_names,
-        default_params: params.clone(),
         omega_init_as_sd: vec![false; 5],
-        sigma_init_as_sd: vec![false; 1],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        tv_fn: None,
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_KA],
-
         eta_map: (0..5).map(|i| i as i32).collect(),
-
         pk_idx_f64: [PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2, PK_IDX_KA]
             .iter()
             .map(|&i| i as f64)
             .collect(),
-
         sel_flat: {
             let mut v = vec![0.0f64; 5 * 5];
             for i in 0..5 {
@@ -525,24 +477,6 @@ fn generate_two_cpt_oral_cov() {
             }
             v
         },
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::default(),
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        n_kappa: 0,
-        kappa_names: Vec::new(),
         indiv_param_names: vec![
             "CL".into(),
             "V".into(),
@@ -550,23 +484,7 @@ fn generate_two_cpt_oral_cov() {
             "V2".into(),
             "KA".into(),
         ],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..bare_model(params.clone())
     };
 
     // Generate random covariates (matching Julia seed 456)
@@ -712,34 +630,17 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "mm_oral".into(),
-        pk_model: PkModel::OneCptOral,
-        error_model: ErrorModel::Proportional,
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         pk_param_fn,
         n_theta: 4,
         n_eta: 2,
-        n_epsilon: 1,
         theta_names,
         eta_names,
-        default_params: params.clone(),
         omega_init_as_sd: vec![false; 2],
-        sigma_init_as_sd: vec![false; 1],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        tv_fn: None,
         pk_indices: vec![0, 2],
-
         eta_map: (0..2).map(|i| i as i32).collect(),
-
         pk_idx_f64: vec![0.0, 2.0],
-
         sel_flat: {
             let mut v = vec![0.0f64; 2 * 2];
             for i in 0..2 {
@@ -748,41 +649,8 @@ fn generate_mm_oral() {
             v
         },
         ode_spec: Some(ode_spec),
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::default(),
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        n_kappa: 0,
-        kappa_names: Vec::new(),
         indiv_param_names: vec!["VMAX".into(), "KM".into(), "V".into(), "KA".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..bare_model(params.clone())
     };
     let obs_times = vec![
         0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,
