@@ -9769,7 +9769,8 @@ pub struct FitOptions {
     /// [`inner_restarts`](Self::inner_restarts) gates, before its per-coordinate scan, so it
     /// runs only on the same cold solves and `inner_restarts = 0` disables it too. Each
     /// subject scores `inner_screen` Sobol points drawn from `N(0, 4Ω)` on its individual
-    /// objective, descends from the 3 lowest that lie more than 0.5 apart in the Ω⁻¹ metric (#2863), and keeps a result only when it is lower
+    /// objective, descends from up to 3 of its 32 lowest, lowest first, each more than 0.5 from
+    /// those before it in the Ω⁻¹ metric (#2863), and keeps a result only when it is lower
     /// than the mode it already has and more than 0.5 from it in the Ω⁻¹ metric. A per-
     /// coordinate scan cannot reach a mode that is off every axis — the flip-flop twin of
     /// a one-compartment oral subject, where `CL`, `V` and `KA` move together — and this

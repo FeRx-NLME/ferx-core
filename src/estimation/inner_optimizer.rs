@@ -3648,7 +3648,7 @@ fn find_ebe_solve(
         // subject sits where `η_ka` and `η_V` move together (`ka ↔ CL/V`), and a cold
         // BFGS from η = 0 and every axis seed descend into the same shallower basin.
         // The screen scores `policy.screen` quasi-random points from `N(0, 4Ω)`, keyed
-        // by the subject's ID, and descends from the `SCREEN_TOP_K` lowest. A descent
+        // by the subject's ID, and descends from spread-out starts among the lowest. A descent
         // replaces the incumbent only when it is lower by more than the same `1e-9` the
         // axis scan uses AND lies more than `SCREEN_MIN_OMEGA_DIST` from it in the Ω⁻¹
         // metric: a descent that reconverges to the incumbent's basin, whatever its
@@ -7616,10 +7616,10 @@ fn screen_descents(
         .collect()
 }
 
-/// Starts the #2013 screen keeps: up to [`SCREEN_TOP_K`] of the [`SCREEN_POOL`] lowest of `n`
-/// Sobol points from `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first, each more than
-/// [`SCREEN_MIN_OMEGA_DIST`] from those before it in the Ω⁻¹ metric. A point whose objective is not
-/// finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
+/// Starts the #2013 screen keeps: up to [`SCREEN_TOP_K`] of the [`SCREEN_POOL`] lowest of
+/// `n` Sobol points from `N(0, (SCREEN_SD_MULT)²·Ω)`, by `obj`, lowest first, each more than
+/// [`SCREEN_MIN_OMEGA_DIST`] from those before it in the Ω⁻¹ metric. A point whose
+/// objective is not finite is dropped. The stream is keyed by [`screen_seed`] of the subject's ID, so it
 /// depends neither on the worker thread nor on the subject's position in the data. Empty
 /// when there is nothing to draw, or more random effects than the Sobol table carries.
 fn screen_starts(
@@ -7635,11 +7635,10 @@ fn screen_starts(
     if n == 0 || n_eta == 0 || n_eta > SOBOL_MAX_DIMS || omega.chol.nrows() != n_eta {
         return Vec::new();
     }
-    // The lowest `SCREEN_POOL` so far, lowest first, with their `z` (the Ω⁻¹ metric is
-    // Euclidean in `z`). A point goes in after every kept point it ties (`total_cmp` is a
-    // total order), which is the order a stable sort of all `n` scored points gives, so
-    // only the kept points are ever copied out of the reused buffers.
-    let mut best: Vec<(f64, Vec<f64>, Vec<f64>)> = Vec::with_capacity(SCREEN_POOL + 1);
+    // The lowest `SCREEN_POOL` so far, lowest first. A point goes in after every kept point
+    // it ties (`total_cmp` is a total order), which is the order a stable sort of all `n`
+    // scored points gives, so only the kept points are ever copied out of the reused buffers.
+    let mut best: Vec<(f64, Vec<f64>)> = Vec::with_capacity(SCREEN_POOL + 1);
     let mut z = DVector::<f64>::zeros(n_eta);
     let mut e = DVector::<f64>::zeros(n_eta);
     for_each_sobol_uniform(n_eta, n, screen_seed(subject_id), |u| {
@@ -7651,29 +7650,23 @@ fn screen_starts(
         if !v.is_finite() {
             return;
         }
-        let at = best.partition_point(|(b, ..)| b.total_cmp(&v).is_le());
+        let at = best.partition_point(|(b, _)| b.total_cmp(&v).is_le());
         if at < SCREEN_POOL {
-            best.insert(at, (v, e.as_slice().to_vec(), z.as_slice().to_vec()));
+            best.insert(at, (v, e.as_slice().to_vec()));
             best.truncate(SCREEN_POOL);
         }
     });
     // The starts, lowest first, each farther than `SCREEN_MIN_OMEGA_DIST` from those kept
     // before it: a larger screen holds more points near one mode, and the plain lowest
     // `SCREEN_TOP_K` would all descend into it (#2863).
-    let mut starts: Vec<(Vec<f64>, Vec<f64>)> = Vec::with_capacity(SCREEN_TOP_K);
-    for (_, e, z) in best {
-        let far = |s: &(Vec<f64>, Vec<f64>)| {
-            s.1.iter()
-                .zip(&z)
-                .map(|(a, b)| (a - b).powi(2))
-                .sum::<f64>()
-                > SCREEN_MIN_OMEGA_DIST.powi(2)
-        };
+    let mut starts: Vec<Vec<f64>> = Vec::with_capacity(SCREEN_TOP_K);
+    for (_, e) in best {
+        let far = |s: &Vec<f64>| omega_distance(s, &e, omega) > SCREEN_MIN_OMEGA_DIST;
         if starts.len() < SCREEN_TOP_K && starts.iter().all(far) {
-            starts.push((e, z));
+            starts.push(e);
         }
     }
-    starts.into_iter().map(|(e, _)| e).collect()
+    starts
 }
 
 /// 64-bit FNV-1a of a subject ID: the #2013 screen's Sobol scramble seed. A fixed

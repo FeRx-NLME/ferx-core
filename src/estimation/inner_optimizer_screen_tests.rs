@@ -206,21 +206,21 @@ fn screen_starts_are_the_lowest_spread_draws_of_the_scaled_prior() {
         })
         .collect();
 
-    // A flat objective ties every draw, so the stable sort keeps the first three in Sobol
-    // order: this pins the stream, its seed, the 2·chol(Ω) scale and the top-K count.
+    // A flat objective ties every draw, so the stable sort keeps Sobol order: this pins the
+    // stream, its seed, the 2·chol(Ω) scale and the top-K count.
     let flat = screen_starts(&|_| 0.0, &omega, 3, 100, "S1");
     assert_eq!(flat, spread(&draws, &omega));
     assert_eq!(flat.len(), SCREEN_TOP_K);
 
-    // A real objective takes the three lowest, lowest first.
+    // A real objective takes the lowest that lie apart, lowest first.
     let sq = |e: &[f64]| e.iter().map(|x| x * x).sum::<f64>();
     let got = screen_starts(&sq, &omega, 3, 100, "S1");
     let mut want = draws.clone();
     want.sort_by(|a, b| sq(a).total_cmp(&sq(b)));
     assert_eq!(got, spread(&want, &omega));
 
-    // Ties among non-minimal values: the kept starts are a stable sort's first three,
-    // so a later draw never displaces an earlier one it ties. Coarse buckets of `sq`
+    // Ties among non-minimal values: the pool is a stable sort's prefix, so a later draw
+    // never displaces an earlier one it ties. Coarse buckets of `sq`
     // put many draws on each level.
     let coarse = |e: &[f64]| (sq(e) * 4.0).floor();
     let got = screen_starts(&coarse, &omega, 3, 100, "S1");
