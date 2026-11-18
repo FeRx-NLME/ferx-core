@@ -65,6 +65,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use ferx_core::cancel::is_cancelled;
@@ -378,12 +379,17 @@ impl Runner {
         // not mix engines.
         let groups = cost_groups(candidates, &todo);
         let n_fitted = AtomicUsize::new(0);
+        // The first fit whose objective is not a likelihood (a SAEM fit under the default
+        // `saem_ofv = saem`, #2973) ends the run: nothing it would be ranked on means
+        // anything. Never ranked, never scored as 0/inf. A fit with no information criterion
+        // for another reason (a non-finite objective) is judged as before.
+        let no_ic: Mutex<Option<String>> = Mutex::new(None);
 
         let fit_one = |(i, threads_per_fit): (usize, usize)| -> Option<(usize, CandidateResult)> {
             // Between candidates, not inside one: this is the granularity the
             // cancellation contract promises, and it is why a cancelled run can
             // still return everything that finished.
-            if is_cancelled(&self.cancel) {
+            if is_cancelled(&self.cancel) || no_ic.lock().is_ok_and(|g| g.is_some()) {
                 return None;
             }
             let candidate = &candidates[i];
@@ -391,6 +397,12 @@ impl Runner {
             let outcome = fitter(candidate, threads_per_fit);
             let seconds = started.elapsed().as_secs_f64();
             let result = match outcome {
+                Ok(fitted) if ranks_on_no_likelihood(&fitted) => {
+                    if let Ok(mut g) = no_ic.lock() {
+                        g.get_or_insert_with(|| no_information_criterion_message(&candidate.id));
+                    }
+                    return None;
+                }
                 Ok(fitted) => {
                     let verdict = check_strictness(&fitted, &options.strictness);
                     let criterion = options.criterion.of(&fitted);
@@ -459,6 +471,9 @@ impl Runner {
                 })?;
             fitted.extend(done);
         }
+        if let Some(msg) = no_ic.into_inner().ok().flatten() {
+            return Err(msg);
+        }
 
         // ── assembly of the foreign fits, re-scored under this run ──────────
         // Journalled as this run's own rows — fit file included — so the
@@ -469,6 +484,12 @@ impl Runner {
             let Some(f) = foreign.remove(hashes[i].as_str()) else {
                 continue;
             };
+            // A reused fit is ranked like a fresh one, so it meets the same rule (#2973).
+            if let Foreign::Fit { fit, .. } = &f {
+                if ranks_on_no_likelihood(fit) {
+                    return Err(no_information_criterion_message(&candidates[i].id));
+                }
+            }
             let result = foreign_result(&candidates[i], &hashes[i], f, options);
             if let Some(j) = &journal {
                 j.append(&record_of(&result), result.fit.as_ref());
@@ -505,6 +526,10 @@ impl Runner {
                 n_reused += 1;
                 let result =
                     reused_result(&candidates[i], record, self.cache_dir.as_deref(), options);
+                // A resumed fit is re-scored from its cached file: same rule as a fresh one.
+                if result.fit.as_ref().is_some_and(ranks_on_no_likelihood) {
+                    return Err(no_information_criterion_message(&candidates[i].id));
+                }
                 on_finished(&result);
                 outcomes.insert(i, result);
             }
@@ -822,6 +847,24 @@ fn collect_search_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     for child in children {
         collect_search_dirs(&child, depth + 1, out);
     }
+}
+
+/// Whether `fit` reports an objective that is not a likelihood — a SAEM fit under the default
+/// `saem_ofv = saem` (#2973) — so no candidate can be ranked on it, under any criterion.
+fn ranks_on_no_likelihood(fit: &ferx_core::types::FitResult) -> bool {
+    fit.saem_objective
+        .as_ref()
+        .is_some_and(|o| o.kind == ferx_core::types::SaemOfv::Saem)
+}
+
+/// The run-stopping error for a candidate whose fit has no AIC/BIC (#2973).
+fn no_information_criterion_message(id: &str) -> String {
+    format!(
+        "candidate `{id}` has no information criterion: its fit reports an objective that is \
+         not a likelihood (a SAEM fit under the default `saem_ofv = saem`), so candidates \
+         cannot be ranked on it. Set `saem_ofv = imp` (or `agq` / `focei`) in the \
+         [fit_options] to rank on a likelihood."
+    )
 }
 
 /// A foreign fit as this run's result: scored under *this* run's criterion

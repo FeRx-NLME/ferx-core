@@ -8714,8 +8714,14 @@ pub struct FitResult {
     /// the **penalized** objective — MAP / penalized-ML SEs, not posterior SDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prior_summary: Vec<PriorSummary>,
-    pub aic: f64,
-    pub bic: f64,
+    /// `ofv_data + 2k`, or `None` when the reported objective is not a likelihood: a SAEM
+    /// fit under `saem_ofv = saem` (NONMEM's SAEMOBJ, #2973). Set `saem_ofv = imp`
+    /// (or `agq` / `focei`) for a value. Also `None` when the value is not finite (an
+    /// estimator with no objective, such as a VI fit under `vi_final_ofv = none`).
+    pub aic: Option<f64>,
+    /// `ofv_data + k·ln(n)`; `None` whenever [`Self::aic`] is, and also for a fit with no
+    /// records to count (`n = 0`).
+    pub bic: Option<f64>,
     pub theta: Vec<f64>,
     pub theta_names: Vec<String>,
     /// Names of the random effects (etas), parallel to the omega diagonal.
@@ -8815,6 +8821,12 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
+    /// `Some` when `ofv` of a SAEM fit is NONMEM's SAEM objective or the importance-sampled /
+    /// quadrature `−2 log L` (`saem_ofv`, default `saem`, #2973) rather than the FOCE/Laplace objective, which it
+    /// then carries as [`SaemObjective::foce_ofv`]. `None` for every other fit and for
+    /// `saem_ofv = focei`.
+    #[serde(default)]
+    pub saem_objective: Option<SaemObjective>,
     /// Per-iteration IMPMAP parameter trace, analogous to NONMEM `.ext` file
     /// output. `Some` when the final estimating stage was IMPMAP.
     pub impmap_trace: Option<ImpmapTrace>,
@@ -10389,6 +10401,13 @@ pub struct FitOptions {
     /// draws per subject. `0` keeps the single Laplace proposal, which reads high
     /// on sparse subjects (#2653).
     pub imp_adapt_passes: usize,
+    /// Draws per pilot pass of the evaluation's proposal adaptation (`imp_adapt_passes`).
+    /// `0` (default) runs every pilot at the full `imp_samples`, as NONMEM's `EONLY=1`
+    /// iterations do; a smaller value (clamped to `2..=imp_samples`) fits the proposal's
+    /// centre and scale from fewer draws and keeps the final readout at `imp_samples`, so the
+    /// estimate stays unbiased while the evaluation costs `(passes·pilot + K)/((passes + 1)·K)`
+    /// of the full one. Read by the evaluation only, not by the estimating `imp` iterations.
+    pub imp_adapt_samples: usize,
     /// Number of MCEM iterations for the estimating `imp` path (ignored when
     /// `imp_eval_only`). Default 200.
     pub imp_iterations: usize,
@@ -10414,6 +10433,22 @@ pub struct FitOptions {
     /// The EBEs are reconverged at the incoming parameters before the grid is laid, because
     /// adaptive quadrature centres itself on the conditional mode.
     pub agq_eval_only: bool,
+    /// Which objective a SAEM fit reports as its OFV (AIC/BIC exist only for a likelihood readout): see
+    /// [`SaemOfv`]. Default [`SaemOfv::Saem`], NONMEM's `SAEMOBJ`; `imp` is its `IMP EONLY=1` follow-up.
+    /// Read only when SAEM is the last estimating stage and the chain has no explicit
+    /// evaluator stage of its own.
+    pub saem_ofv: SaemOfv,
+    /// Importance samples per subject for the `saem_ofv = imp` readout. Default 3000, the
+    /// `NITER=5 ISAMPLE=3000` setting `docs/estimation/importance-sampling.qmd` matches
+    /// NONMEM's `EONLY=1` at. Independent of `imp_samples`, which the estimating `imp`
+    /// stage and an explicit `imp_eval_only` stage use.
+    pub saem_ofv_samples: usize,
+    /// Quadrature nodes per random effect for the `saem_ofv = agq` readout. Default 11: on a 500-subject, 3-eta fit 5, 7, 11 and 15 nodes gave 5224.76, 5221.22, 5220.31 and 5220.21, so 11 is within 0.1 of the converged value where 7 is 1.0 high.
+    pub saem_ofv_nodes: usize,
+    /// Draws per pilot pass of the `saem_ofv = imp` readout's proposal adaptation (see
+    /// [`Self::imp_adapt_samples`]); the final readout always draws `saem_ofv_samples`. `0`
+    /// runs the pilots at the full count.
+    pub saem_ofv_pilot_samples: usize,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -10884,10 +10919,15 @@ impl Default for FitOptions {
             imp_seed: None,
             imp_low_ess_threshold: 0.1,
             imp_adapt_passes: 5,
+            imp_adapt_samples: 0,
             imp_iterations: 200,
             imp_averaging: 50,
             imp_eval_only: false,
             agq_eval_only: false,
+            saem_ofv: SaemOfv::default(),
+            saem_ofv_samples: 3000,
+            saem_ofv_nodes: 11,
+            saem_ofv_pilot_samples: 300,
             impmap_iterations: 200,
             impmap_samples: 300,
             impmap_proposal_df: 4.0,
@@ -11666,6 +11706,56 @@ pub enum ViSigmaUpdate {
     /// Step `σ` with Adam alongside `θ`. The pre-fix behaviour, kept as an escape
     /// hatch and for reproducing earlier fits; expect the bias described above.
     Adam,
+}
+
+/// Which objective a SAEM fit reports as its OFV (`saem_ofv`, #2973).
+///
+/// SAEM maximises the exact marginal likelihood but produces no usable value of it. NONMEM
+/// reports its **`SAEMOBJ`** for the SAEM step — the stochastic-approximation readout of the
+/// complete-data objective, not a likelihood — and follows it with `METHOD=IMP EONLY=1` for the
+/// marginal `−2 log L` when one is wanted. That is the default here, and the importance-sampled
+/// value is the explicit follow-up (`saem_ofv = imp`, or `method = [saem, imp]` with
+/// `imp_eval_only`). The FOCE/Laplace value stays available on [`SaemObjective::foce_ofv`] either
+/// way; under the default AIC/BIC are `None` (no likelihood is reported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SaemOfv {
+    /// NONMEM's `SAEMOBJ`: `−2 Σ_i log( mean p(y_i, η_i) )`, the log of the mean joint density of
+    /// the data and the random effects over the convergence phase's draws and iterations (no
+    /// `2π` constants; `estimation/saem_objective.rs`). **Not a likelihood**: it is not comparable
+    /// across models or with a FOCE/FOCEI/IMP objective, and AIC/BIC are not built from it.
+    /// A mixture, whose convention no NONMEM run anchors, reports `imp` with a warning.
+    #[default]
+    Saem,
+    /// Importance-sampled `−2 log L` at the final estimates (NONMEM `IMP EONLY=1`), with
+    /// its Monte-Carlo standard error: `saem_ofv_samples` draws per subject, seeded by
+    /// `imp_seed`, so two runs agree.
+    Imp,
+    /// Adaptive Gauss–Hermite quadrature at the final estimates, `saem_ofv_nodes` nodes per
+    /// random effect. Deterministic; practical for up to three random effects, beyond which
+    /// (and for mixtures) the fit falls back to `imp` with a warning.
+    Agq,
+    /// The FOCE/Laplace objective at the SAEM estimates: the pre-#2973 behaviour, and the
+    /// value that is directly comparable with a FOCE/FOCEI fit of the same data.
+    Focei,
+}
+
+/// What the OFV of a SAEM fit is, when it is not the FOCE/Laplace value (#2973). Surfaced on
+/// [`FitResult::saem_objective`]; `None` there means `ofv` is the FOCE/Laplace objective.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SaemObjective {
+    /// Which evaluator produced `FitResult::ofv` (never [`SaemOfv::Focei`]).
+    pub kind: SaemOfv,
+    /// Monte-Carlo standard error of `ofv` under [`SaemOfv::Imp`]; `None` under `saem` and `agq`.
+    pub mc_standard_error: Option<f64>,
+    /// Importance samples per subject under `imp`; `None` under `saem` and `agq`.
+    pub n_samples: Option<usize>,
+    /// Quadrature nodes per random effect under `agq`; `None` under `saem` and `imp`.
+    pub n_nodes: Option<usize>,
+    /// The FOCE/Laplace objective at the same estimates, `2·pop_nll` after the EBE
+    /// refinement: the value SAEM fits reported before #2973, kept as a diagnostic and for
+    /// comparison with a FOCE fit. AIC/BIC are `None` under [`SaemOfv::Saem`] (the SAEM
+    /// objective is not a likelihood) and built from `ofv` under `imp` and `agq`.
+    pub foce_ofv: f64,
 }
 
 /// Which marginal likelihood, if any, to evaluate at the converged VI estimate.
@@ -12490,6 +12580,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "conddist_keep_samples",
             "seed",
             "saem_seed",
+            "saem_ofv",
+            "saem_ofv_samples",
+            "saem_ofv_nodes",
+            "saem_ofv_pilot_samples",
         ],
         EstimationMethod::Imp => &[
             "imp_samples",
@@ -12497,6 +12591,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_seed",
             "imp_low_ess_threshold",
             "imp_adapt_passes",
+            "imp_adapt_samples",
             "imp_iterations",
             "imp_averaging",
             "imp_eval_only",

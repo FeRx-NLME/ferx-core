@@ -670,6 +670,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::params: ferx_core::Mode
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_n_subjects_hmc: core::option::Option<usize>
+pub ferx_core::estimation::outer_optimizer::OuterResult::saem_objective_value: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::sir_fallback_proposal: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::stationary_start: bool
 pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_fallbacks: u32
@@ -2917,6 +2918,11 @@ pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
 pub ferx_core::types::SaemMstepSolver::ScoreSa
+pub enum ferx_core::types::SaemOfv
+pub ferx_core::types::SaemOfv::Agq
+pub ferx_core::types::SaemOfv::Focei
+pub ferx_core::types::SaemOfv::Imp
+pub ferx_core::types::SaemOfv::Saem
 pub enum ferx_core::types::ScaleAdaptation
 pub ferx_core::types::ScaleAdaptation::Interval
 pub ferx_core::types::ScaleAdaptation::RobbinsMonro
@@ -3368,6 +3374,7 @@ pub ferx_core::types::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::types::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::imp_adapt_passes: usize
+pub ferx_core::types::FitOptions::imp_adapt_samples: usize
 pub ferx_core::types::FitOptions::imp_auto: bool
 pub ferx_core::types::FitOptions::imp_averaging: usize
 pub ferx_core::types::FitOptions::imp_defensive_alpha: f64
@@ -3448,6 +3455,10 @@ pub ferx_core::types::FitOptions::saem_n_convergence: usize
 pub ferx_core::types::FitOptions::saem_n_exploration: usize
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::types::FitOptions::saem_n_mh_steps: usize
+pub ferx_core::types::FitOptions::saem_ofv: ferx_core::SaemOfv
+pub ferx_core::types::FitOptions::saem_ofv_nodes: usize
+pub ferx_core::types::FitOptions::saem_ofv_pilot_samples: usize
+pub ferx_core::types::FitOptions::saem_ofv_samples: usize
 pub ferx_core::types::FitOptions::saem_omega_burnin: usize
 pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::types::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
@@ -3493,9 +3504,9 @@ pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Ve
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
 pub struct ferx_core::types::FitResult
-pub ferx_core::types::FitResult::aic: f64
+pub ferx_core::types::FitResult::aic: core::option::Option<f64>
 pub ferx_core::types::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
-pub ferx_core::types::FitResult::bic: f64
+pub ferx_core::types::FitResult::bic: core::option::Option<f64>
 pub ferx_core::types::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::types::FitResult::bloq_method: alloc::string::String
 pub ferx_core::types::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
@@ -3600,6 +3611,7 @@ pub ferx_core::types::FitResult::restored_from_checkpoint: bool
 pub ferx_core::types::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::types::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::types::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
+pub ferx_core::types::FitResult::saem_objective: core::option::Option<ferx_core::SaemObjective>
 pub ferx_core::types::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::types::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
@@ -3875,6 +3887,12 @@ pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::types::SaemObjective
+pub ferx_core::types::SaemObjective::foce_ofv: f64
+pub ferx_core::types::SaemObjective::kind: ferx_core::SaemOfv
+pub ferx_core::types::SaemObjective::mc_standard_error: core::option::Option<f64>
+pub ferx_core::types::SaemObjective::n_nodes: core::option::Option<usize>
+pub ferx_core::types::SaemObjective::n_samples: core::option::Option<usize>
 pub struct ferx_core::types::SigmaVector
 pub ferx_core::types::SigmaVector::names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::SigmaVector::values: alloc::vec::Vec<f64>
@@ -4457,6 +4475,11 @@ pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa
 pub ferx_core::SaemMstepSolver::ScoreSa
+pub enum ferx_core::SaemOfv
+pub ferx_core::SaemOfv::Agq
+pub ferx_core::SaemOfv::Focei
+pub ferx_core::SaemOfv::Imp
+pub ferx_core::SaemOfv::Saem
 pub enum ferx_core::ScaleAdaptation
 pub ferx_core::ScaleAdaptation::Interval
 pub ferx_core::ScaleAdaptation::RobbinsMonro
@@ -5094,6 +5117,7 @@ pub ferx_core::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::imp_adapt_passes: usize
+pub ferx_core::FitOptions::imp_adapt_samples: usize
 pub ferx_core::FitOptions::imp_auto: bool
 pub ferx_core::FitOptions::imp_averaging: usize
 pub ferx_core::FitOptions::imp_defensive_alpha: f64
@@ -5174,6 +5198,10 @@ pub ferx_core::FitOptions::saem_n_convergence: usize
 pub ferx_core::FitOptions::saem_n_exploration: usize
 pub ferx_core::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::FitOptions::saem_n_mh_steps: usize
+pub ferx_core::FitOptions::saem_ofv: ferx_core::SaemOfv
+pub ferx_core::FitOptions::saem_ofv_nodes: usize
+pub ferx_core::FitOptions::saem_ofv_pilot_samples: usize
+pub ferx_core::FitOptions::saem_ofv_samples: usize
 pub ferx_core::FitOptions::saem_omega_burnin: usize
 pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
@@ -5219,9 +5247,9 @@ pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Ve
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
 pub struct ferx_core::FitResult
-pub ferx_core::FitResult::aic: f64
+pub ferx_core::FitResult::aic: core::option::Option<f64>
 pub ferx_core::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
-pub ferx_core::FitResult::bic: f64
+pub ferx_core::FitResult::bic: core::option::Option<f64>
 pub ferx_core::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::FitResult::bloq_method: alloc::string::String
 pub ferx_core::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
@@ -5326,6 +5354,7 @@ pub ferx_core::FitResult::restored_from_checkpoint: bool
 pub ferx_core::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
+pub ferx_core::FitResult::saem_objective: core::option::Option<ferx_core::SaemObjective>
 pub ferx_core::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
@@ -5734,6 +5763,12 @@ pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::SaemObjective
+pub ferx_core::SaemObjective::foce_ofv: f64
+pub ferx_core::SaemObjective::kind: ferx_core::SaemOfv
+pub ferx_core::SaemObjective::mc_standard_error: core::option::Option<f64>
+pub ferx_core::SaemObjective::n_nodes: core::option::Option<usize>
+pub ferx_core::SaemObjective::n_samples: core::option::Option<usize>
 pub struct ferx_core::ScoringSettings
 pub ferx_core::ScoringSettings::ebe_warm_start: bool
 pub ferx_core::ScoringSettings::gradient_method: ferx_core::GradientMethod

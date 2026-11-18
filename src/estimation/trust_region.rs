@@ -1031,6 +1031,7 @@ pub(crate) fn optimize_trust_region_seeded(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,

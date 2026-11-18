@@ -130,6 +130,9 @@ fn saem_on_the_one_line_spelling_lands_with_the_split_one() {
                 let f = fit(&model, &data, |o| {
                     o.method = ferx_core::types::EstimationMethod::Saem;
                     o.saem_seed = Some(s);
+                    // The bounds below are on the FOCE objective at SAEM's estimates (the
+                    // pre-#2973 SAEM `ofv`); the default readout is now NONMEM's SAEMOBJ.
+                    o.saem_ofv = ferx_core::types::SaemOfv::Focei;
                 });
                 assert!(f.ofv.is_finite(), "{indiv} seed {s}: {}", f.ofv);
                 f.ofv

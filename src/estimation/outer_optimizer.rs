@@ -68,6 +68,10 @@ pub struct OuterResult {
     /// Estimated OFV evaluations saved by the SAEM mu-ref gradient step M-step.
     /// Non-None only when method=saem and mu_referencing=true.
     pub saem_mu_ref_m_step_evals_saved: Option<u64>,
+    /// NONMEM's `SAEMOBJ` of a SAEM run (`estimation::saem_objective`), accumulated over the
+    /// convergence phase's draws. `None` for every other method, for a mixture or IOV model,
+    /// and for a SAEM run with no convergence iteration.
+    pub saem_objective_value: Option<f64>,
     /// Number of subjects that used HMC at least once during the SAEM E-step.
     /// `None` when `n_leapfrog = 0` (MH-only run) or for non-SAEM methods.
     pub saem_n_subjects_hmc: Option<usize>,
@@ -1281,6 +1285,7 @@ fn evaluate_at_initial_params(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,
@@ -9438,6 +9443,7 @@ fn optimize_nlopt_attempt_probed(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
@@ -10168,6 +10174,7 @@ fn optimize_bfgs(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,
