@@ -146,8 +146,8 @@ fn check(
     );
     for (rho0, r) in fits {
         assert_eq!(
-            r.optimizer, "auto (nlopt_lbfgs)",
-            "{label}: start {rho0}: auto must take L-BFGS on the kappa + correlation route"
+            r.optimizer, "auto (trust_region)",
+            "{label}: start {rho0}: auto must take the trust region on the kappa + correlation route"
         );
     }
 }

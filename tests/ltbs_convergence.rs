@@ -108,12 +108,12 @@ fn ltbs_warfarin_fit_converges_and_recovers_pk() {
     // TVKA is the weakest-determined θ here (≈18% RSE, ETA_KA CV ≈ 58%), sitting
     // on a flat OFV ridge. It had a 5% band while the default outer was
     // derivative-free BOBYQA, which false-converged ~0.2 SE from NONMEM (≈0.79 vs
-    // 0.811). Since #490 the default `auto` resolves to `nlopt_lbfgs` on this
-    // in-scope model (asserted below) and lands TVKA at a relative error of
-    // 1.6e-5 (measured on #1540, release, macOS), so it now shares the 2% band of
-    // the other θ — over 1000× headroom on the measured error.
+    // 0.811). On this in-scope model the default `auto` resolved to `nlopt_lbfgs`
+    // from #490 and to `trust_region` since #2975 (asserted below); L-BFGS landed
+    // TVKA at a relative error of 1.6e-5 (measured on #1540, release, macOS), so it
+    // shares the 2% band of the other θ — over 1000× headroom on the measured error.
     assert_eq!(
-        result.optimizer, "auto (nlopt_lbfgs)",
+        result.optimizer, "auto (trust_region)",
         "the default arm this band was measured on"
     );
     assert!(

@@ -185,8 +185,8 @@ fn compartment_free_route_ignores_the_old_axis_cap_and_fix_theta() {
         assert_eq!(r.gradient_method_inner, "analytic", "{label}: inner");
         assert_eq!(r.gradient_method_outer, "analytic", "{label}: outer");
         assert_eq!(
-            r.optimizer, "auto (nlopt_lbfgs)",
-            "{label}: `auto` takes L-BFGS on an analytic outer gradient, not BOBYQA"
+            r.optimizer, "auto (trust_region)",
+            "{label}: `auto` takes the trust region on an analytic outer gradient, not BOBYQA"
         );
 
         // No warning — at parse time or from the fit — names a cap, a finite-difference

@@ -11094,17 +11094,18 @@ impl CompiledModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Optimizer {
     /// Pick the outer optimizer automatically from the model (the default).
-    /// Resolves to [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI
+    /// Resolves to [`Optimizer::TrustRegion`] when the exact analytic FOCE/FOCEI
     /// gradient is available (the model is in the analytic (adjoint) gradient's scope
     /// and the user did not force `gradient_method = fd`), and to
     /// [`Optimizer::Bobyqa`] otherwise (a model outside the analytic scope, or
     /// `gradient_method = fd`, where the outer loop must fall back to finite
     /// differences). Above [`BOBYQA_MAX_DIM`] free packed parameters it takes
     /// `NloptLbfgs` even on an FD gradient, and mixture models always take
-    /// `Bobyqa` (that override lives in the outer optimizer's dispatch, not here). Benchmarking across ~10 real FOCEI datasets (#490) found
-    /// NLopt L-BFGS fastest-to-optimum on every analytic-gradient problem, while
-    /// BOBYQA was both fastest and most reliable when only finite differences
-    /// are available. See [`Optimizer::resolve_auto`].
+    /// `Bobyqa` (that override lives in the outer optimizer's dispatch, not here).
+    /// On an exact gradient the trust region reached the best OFV from every start of a
+    /// 61-model benchmark in fewer iterations and cycles than L-BFGS (#2975); BOBYQA was
+    /// both fastest and most reliable when only finite differences are available (#490).
+    /// See [`Optimizer::resolve_auto`].
     Auto,
     Bfgs,
     Lbfgs,
@@ -11131,7 +11132,11 @@ pub enum Optimizer {
     /// `docs/estimation/optimizers.qmd` for the cefepime and Emax PKPD
     /// validations behind that choice.
     Bobyqa,
-    /// Newton trust-region with Steihaug CG subproblem (via argmin)
+    /// PORT-style model/trust-region method on exact second-order information (#2975):
+    /// a saddle-free exact Hessian seeds a damped BFGS model, refreshed exactly on a
+    /// poor step or a change of the active bound set, with an exact eigen-subproblem
+    /// and a stop certified on the exact Newton decrement. What [`Optimizer::Auto`]
+    /// resolves to on an exact gradient.
     TrustRegion,
 }
 
@@ -11351,7 +11356,7 @@ impl Optimizer {
 
     /// Resolve [`Optimizer::Auto`] to a concrete optimizer for `model`; every
     /// other variant is returned unchanged (idempotent). `auto` picks
-    /// [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI gradient is
+    /// [`Optimizer::TrustRegion`] when the exact analytic FOCE/FOCEI gradient is
     /// available — the model is in the analytic (adjoint) gradient's scope and the user
     /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
     /// otherwise, with one exception that takes L-BFGS on a finite-difference
@@ -11405,8 +11410,11 @@ impl Optimizer {
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
         // gradient.
+        // With an exact gradient, `auto` takes the trust region (#2975): measured on 61
+        // models from 9 starts it reached the best OFV on every start where L-BFGS missed
+        // three times silently, in 0.41× L-BFGS's iterations and the fewest cycles.
         if analytic_outer_gradient {
-            Optimizer::NloptLbfgs
+            Optimizer::TrustRegion
         } else {
             Optimizer::Bobyqa
         }

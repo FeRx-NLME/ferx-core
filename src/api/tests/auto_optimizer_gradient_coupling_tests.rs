@@ -286,7 +286,7 @@ fn resolve_auto_is_unchanged_by_the_split() {
     for (model, expected) in [
         (
             analytical_model(GradientMethod::Auto),
-            Optimizer::NloptLbfgs,
+            Optimizer::TrustRegion,
         ),
         (analytical_model(GradientMethod::Fd), Optimizer::Bobyqa),
         (ode_model(GradientMethod::Auto), Optimizer::Bobyqa),

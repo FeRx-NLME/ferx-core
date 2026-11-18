@@ -37,7 +37,7 @@ The default `optimizer = auto` picks the algorithm per model (see [`auto`](#the-
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or the model is a mixture. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
+| `auto` | Per-model selection | **Default.** Resolves to `trust_region` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or the model is a mixture. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
 
 ### NLopt algorithms
 
@@ -125,7 +125,7 @@ gradient norm.
 
 ## When to use which
 
-**`auto` (default)** — leave this in place for most fits. It inspects the model and picks `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available and `bobyqa` when only finite differences are — the two choices that came out fastest-and-most-reliable in the #490 benchmarking (see [The `auto` default](#the-auto-default)). Override it only when you have a model-specific reason to pin a particular optimizer.
+**`auto` (default)** — leave this in place for most fits. It inspects the model and picks `trust_region` when the exact analytic FOCE/FOCEI gradient is available and `bobyqa` when only finite differences are — the choices that came out most reliable and fastest in the #2975 and #490 benchmarking (see [The `auto` default](#the-auto-default)). Override it only when you have a model-specific reason to pin a particular optimizer.
 
 **`bobyqa`** — what `auto` selects on FD-only problems, and a fine explicit choice there. Derivative-free quadratic trust-region; re-evaluates EBEs at every trial point so it avoids the fixed-EBE gradient bias that stalls gradient-based optimizers on ill-conditioned fits. On the cefepime 2-cpt benchmark below it reaches a lower OFV than `slsqp` (even reconverged at full cost) in less wall time. Works equally well on smooth analytical PK models — converges more slowly than gradient methods per iteration but each iteration is cheap (no FD gradient sweep).
 
@@ -137,7 +137,7 @@ gradient norm.
 
 **`lbfgs` / `nlopt_lbfgs`** — strong choices wherever the exact analytic gradient applies: FOCE, FOCEI, Laplace and AGQ on closed-form, compartment-free and user-`[odes]` models, with or without IOV (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)). The gradient is exact and bias-free, so they reach the true optimum. Models outside that scope (the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) fall back to the finite-difference gradient and its fixed-EBE bias; prefer `bobyqa` for those. TTE, binary and CTMM endpoints are inside it: their outer gradient is the exact marginal one, EBE response included ([TTE: the outer gradient](tte.qmd#outer-gradient-reconverged)). **`mma`** is rarely needed.
 
-> **Why these two?** `bobyqa` doesn't use the gradient, so it never sees the fixed-EBE FD gradient bias that drives gradient-based optimizers to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data (the Emax PKPD benchmark in [`saem.md`](saem.qmd) and the cefepime validation below). On analytical PK models the gradient is exact and bias-free, and `nlopt_lbfgs` exploits it to reach the optimum faster than the derivative-free search. `auto` (default since #490) routes each model to the right one of the two automatically; before `auto` the standalone default was `bobyqa`, and before that `slsqp`.
+> **Why these two?** `bobyqa` doesn't use the gradient, so it never sees the fixed-EBE FD gradient bias that drives gradient-based optimizers to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data (the Emax PKPD benchmark in [`saem.md`](saem.qmd) and the cefepime validation below). On analytical PK models the gradient is exact and bias-free, and `nlopt_lbfgs` exploits it to reach the optimum faster than the derivative-free search. `auto` (default since #490) routes each model to the right one of the two automatically; its exact-gradient pick was `nlopt_lbfgs` until #2975 made it `trust_region`. Before `auto` the standalone default was `bobyqa`, and before that `slsqp`.
 
 ---
 
@@ -153,9 +153,9 @@ Two cases override that rule:
 - **More than 64 free packed parameters** (`BOBYQA_MAX_DIM`) → `nlopt_lbfgs` even on a finite-difference gradient. BOBYQA's interpolation set grows quadratically with the parameter count, so above that size O(n) FD passes are cheaper (#1064).
 - **Mixture models** (`[mixture]`) → `bobyqa` regardless of gradient availability, as the robust choice against label-switching multimodality (#977).
 
-Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
+Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. On an exact gradient, `trust_region` reached the best OFV from every one of 9 starts on a 26-model benchmark (234 fits), where `nlopt_lbfgs` stopped above it three times while reporting convergence, and it took 0.41× L-BFGS's iterations and the fewest CPU cycles (#2975; see [How `trust_region` works](#trust-region-method)). Earlier, limited benchmarking across ~10 real FOCEI datasets (#490) had found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
 
-For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a mixture model — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit `bobyqa` or NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured, with no warning. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (trust_region)`, or `auto (bobyqa)` for a mixture model — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit `bobyqa` or NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured, with no warning. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
 ### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
 
@@ -430,7 +430,7 @@ a clean stationary point. If the OFV matters, compare against a second optimizer
 
 ### An L-BFGS / SLSQP stop is verified at a tight inner tolerance {#gradient-stop-verification}
 
-A FOCE / FOCEI fit with `nlopt_lbfgs` or `slsqp` (including `optimizer = auto` when it picks L-BFGS)
+A FOCE / FOCEI fit with `nlopt_lbfgs` or `slsqp` 
 has stopping rules it cannot reach. It stops when its line search can no longer find a lower
 objective, and the plateau check then decides whether that stop is converged. At the default
 `inner_tol = 1e-5`, though, the EBE re-solve noise can hide the remaining descent on an
