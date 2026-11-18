@@ -1087,11 +1087,6 @@ thread_local! {
         const { std::cell::Cell::new(POLISH_STEPS) };
 }
 
-#[cfg(test)]
-/// Test hook: the ids of the subjects whose polish is off, on every thread (a population pass
-/// runs its subjects on the pool, where [`POLISH_BUDGET`] is not set).
-static POLISH_OFF_FOR: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
 /// Test guard: the polish off for its lifetime, to read the decline and its salvage.
 #[cfg(test)]
 pub(crate) struct PolishOff(usize);
@@ -1110,41 +1105,12 @@ impl Drop for PolishOff {
     }
 }
 
-/// Test guard: the polish off, on every thread, for the subject with this id only (keep the
-/// ids unique to the test).
-#[cfg(test)]
-pub(crate) struct PolishOffFor(String);
-
-#[cfg(test)]
-impl PolishOffFor {
-    pub(crate) fn new(id: &str) -> Self {
-        POLISH_OFF_FOR.lock().unwrap().push(id.to_string());
-        PolishOffFor(id.to_string())
-    }
-}
-
-#[cfg(test)]
-impl Drop for PolishOffFor {
-    fn drop(&mut self) {
-        let mut v = POLISH_OFF_FOR.lock().unwrap();
-        if let Some(i) = v.iter().position(|x| *x == self.0) {
-            v.remove(i);
-        }
-    }
-}
-
 fn polish_steps(subject: &Subject) -> usize {
+    let _ = subject;
     #[cfg(test)]
-    return if POLISH_OFF_FOR.lock().unwrap().contains(&subject.id) {
-        0
-    } else {
-        POLISH_BUDGET.with(|c| c.get())
-    };
+    return POLISH_BUDGET.with(|c| c.get());
     #[cfg(not(test))]
-    {
-        let _ = subject;
-        POLISH_STEPS
-    }
+    POLISH_STEPS
 }
 
 /// A pass that declined at its mode system (an `η̂` the inner search left off the mode, on
@@ -3449,7 +3415,7 @@ fn fixed_eta_theta_sweeps(
     // An SDE subject's score has variance rows beside the predictions: the callers that hand σ
     // ([`fixed_eta_theta_sigma_contractions`]) weight them; the rest contract the predictions
     // alone (FOCE's population prediction at η = 0, whose variance rows are not in the score).
-    if !recorder_in_scope(model) || (model.is_sde() && want_jac && sigma.is_none()) {
+    if !recorder_in_scope(model) {
         return None;
     }
     let sigma = sigma.filter(|_| model.is_sde());

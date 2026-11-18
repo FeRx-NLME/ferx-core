@@ -135,10 +135,9 @@ The two can disagree. A subject no recorder serves — an out-of-scope ODE dose 
 1 of 32 subjects could not be given the exact analytic outer gradient during this fit
 (e.g. subject 7) (1 with an inner Hessian at the EBE that was singular, or indefinite
 at an EBE that was not stationary (an EBE off a strict mode), at some trial point) and
-used fixed-EBE outer gradients, which omit the EBE-response term the analytic gradient
-carries. If the fit stalls, `reconverge_gradient_interval = N` restores the reconverged
-gradient every N-th evaluation. The reported outer gradient method is the model-level
-route, not the per-subject one.
+were re-solved to their EBEs at the trial point and given the exact analytic gradient
+there. The reported outer gradient method is the model-level route, not the per-subject
+one.
 ```
 
 The parenthesis counts the declined subjects by cause (#2713), one clause per cause:
@@ -148,34 +147,16 @@ The parenthesis counts the declined subjects by cause (#2713), one clause per ca
 
 The counts cover every trial point of the fit, including rejected ones. A subject that declined for both causes is counted under each, so the counts can add up to more than the declined total.
 
-#### When the optimizer stops short {#outer-stop-report}
-
-When a gradient-driven outer optimizer (L-BFGS, SLSQP, MMA, BFGS) stops without converging, the fit adds a warning about the gradient at the reported estimates (#2713). It counts the subjects whose outer gradient there is the fixed-EBE fallback and says how far the gradient the fit used is from the exact one, in which those subjects are reconverged:
-
-```
-The outer optimizer stopped without converging (#2713). At the reported estimates 3 of
-40 subjects carry fixed-EBE outer gradients, and the gradient the fit used there is
-12.346% off the exact one. Unless the stop was the evaluation budget, test whether that
-caused it by rerunning with `reconverge_gradient_interval = 1`: if the stop goes away,
-the fallback was the cause; if it stays, look at the objective: EBEs that change mode
-between nearby estimates, or a kink in the model such as `if`, `abs` or `max`.
-```
-
-When no subject carries the fallback there, the warning says the final gradient is exact and points at the objective instead. The fallback can still have biased the gradient at a line-search trial point, so this rules it out only at the reported estimates. A fit that ran out of its evaluation budget gets the report too, beside its own budget warning; there the budget is the cause, and the report only says whether the final gradient was exact.
-
-The check costs one population outer gradient plus, for each subject on the fallback, one held-EBE and one reconverged finite-difference gradient. It is skipped for IOV models and under `reconverge_gradient_interval = 1`, where every declined subject is already reconverged; under AGQ/Laplace and for mixture models, which assemble their gradient elsewhere; and for a model off the analytic outer gradient (`gradient = fd`, or out of its scope), whose gradient is finite differences throughout. Under `reconverge_gradient_interval` above 1 the report measures the held-EBE gradient, the one the fit used on the evaluations the schedule does not reconverge; the last evaluation may have been one it does.
-
 #### What a declined subject is charged {#declined-subject-salvage}
 
-The salvage follows the [`reconverge_gradient_interval`](#gradient-accuracy-vs-cost-reconverged-ebes) schedule like every other fixed-EBE gradient (#1529): a declined subject gets the gradient at its **held** EBE — `2·n_free` evaluations of that one subject, no inner re-solve — and an evaluation the schedule reconverges re-solves every subject's EBE anyway. Before #1529 a declined subject was always charged a reconverged finite-difference gradient (`2·n_free` full EBE solves) whatever the setting. Because declines depend on the trial point, a blown-up line-search trial could send most of the population down that path at once: on a 55-subject parent–metabolite ODE model, 46 subjects declined at one such trial, about 1,200 EBE solves for a single gradient and 82% of the fit's wall time.
+A subject the analytic gradient declines at a trial point is never given a held-EBE gradient, which omits the EBE-response term $\tfrac12\,\partial_\eta\log|\tilde H|\cdot\mathrm d\hat\eta/\mathrm dx$ and so biases every step it enters (#1529, #3004). It takes one of two gradients, both of which carry that term:
 
-The held-EBE gradient differentiates the same per-subject objective the fit reports. Where a closed form would miss a term of it — a θ-dependent residual magnitude, `block_sigma` correlations, M3, IIV on residual error — it is a central difference of that objective instead. A declined subject that is **repelled** at the trial point (its objective is the `1e20` sentinel) contributes a zero gradient: the population objective there carries the sentinel, so no line search accepts the point and its gradient is never used to take a step. If the held-EBE gradient comes back non-finite at a usable objective, that subject alone falls back to the reconverged gradient.
+- **Exact, at a re-solved EBE.** The subject's EBE is re-solved at the trial point (warm from the held one, at the finite-difference stencil's tight tolerance) and the adjoint is run there: one inner solve and one adjoint pass. This serves a decline that is a property of the point, such as an inner Hessian that is not positive definite at an EBE off its mode. Under IOV the re-solve is the joint $(\hat\eta, \hat\kappa)$ mode. The warning says so: `were re-solved to their EBEs at the trial point and given the exact analytic gradient there`.
+- **Reconverged finite differences.** Where the adjoint declines the subject at the re-solved EBE too, and for a **structural** decline (one the subject takes at every parameter point because its exact recording fails, #1536), the gradient is the central difference of the subject's objective with its EBE re-solved at every probe (`2·n_free` warm solves). A structural subject skips the exact attempt, since it would fail again. On a 31-subject fluconazole model with paired total/unbound rows, L-BFGS stalled at OFV 807.9 on the held-EBE gradient against 738.0 with the reconverged one (NONMEM: 734.6). The warning names the two cases separately.
 
-One kind of decline is exempt from the schedule: a **structural** one, which the subject takes at every parameter point rather than at an occasional trial (#1536). Since #2786 no supported data shape is outside the recorders' scope, so that means a subject whose exact recording fails: the failure depends on the model and the data alone, so it recurs at every parameter point and such a subject is never analytic. The held-EBE gradient would then be the only gradient it ever contributes, and its missing EBE-response term biases every step rather than a few. On a 31-subject fluconazole model with paired total/unbound rows, L-BFGS stalled at OFV 807.9 on the held-EBE gradient against 738.0 with the reconverged one (NONMEM: 734.6). Structural declines therefore take the reconverged gradient whatever `reconverge_gradient_interval` says. The one exception is the blown-up-trial guard (#1520): under SLSQP or MMA, a trial that guard skips gets a zero contribution from a structural decline too, at a point the optimizer rejects anyway. The warning names structural declines separately: `used reconverged finite-difference outer gradients because no analytic recorder serves them`. (Before #2093 the structural cause was a cross-row residual covariance combined with a feature the dense assembly did not cover; the adjoint's kernel scores every such combination itself.)
+A declined subject that is **repelled** at the trial point (its objective is the `1e20` sentinel) contributes a zero gradient: the population objective there carries the sentinel, so no line search accepts the point and its gradient is never used to take a step. The blown-up-trial guard (#1520) applies before either gradient, [below](#blown-up-trial-salvage).
 
-A subject with a cross-row residual covariance takes the **exact analytic gradient of the dense-`R` objective** (#1960; since #2093 from the adjoint's likelihood kernel), under both FOCEI and FOCE. For FOCEI that is the same Laplace marginal, with `H̃ = JᵀR⁻¹J + ½B + Ω⁻¹` and `B_kl = tr(R⁻¹M_kR⁻¹M_l)`; for FOCE the Sheiner–Beal marginal with `R̃ = JΩJᵀ + R⁰`. Either is differentiated along every θ, Ω, σ and ρ coordinate together with its EBE response in one reverse sweep, so no EBE is re-solved and no difference is taken. The kernel scores a paired `block_sigma` and `correlation cs|ar1|car1` blocks on closed-form and ODE models, with IOV κ (#2101) and `iiv_on_ruv`; a subject with censored (M3) or FREM rows is scored row by row with the live correlated variance, as production scores it. On the 31-subject fluconazole model above, where every subject is paired, the reconverged gradient was about 81% of the fit's time. With the dense assembly the FOCEI fit takes 1.9 s instead of 23.9 s, and FOCE 4.5 s instead of 36.2 s, at the same OFV (Linux arm64, one thread).
-
-IOV models (`kappa`/`block_kappa`) always reconverge and ignore `reconverge_gradient_interval`, so a declined IOV subject still takes the reconverged gradient, and the warning says so: `used reconverged finite-difference outer gradients; their results are correct but slower`. A fit with a `profile`d θ level block does the same for every decline, IOV or not, because its optimizer stops short on a gradient without the EBE-response term (#2136). It reports its declines with the same warning and that sentence, or the structural one when every decline is structural. Before, a profiled fit never reported them.
+Because the gradient at the reported estimates is then exact for every subject served at a re-solved EBE, `final_gradient_source` reads `analytic` there; it reads `finite_difference` only when a subject took the finite-difference route.
 
 #### How declines are counted {#how-declines-are-counted}
 
@@ -191,7 +172,7 @@ That gate looks one degree too strict, because $-H^{-1}M$ needs $H$ only **nonsi
 
 This was measured rather than assumed ([#1513](https://github.com/FeRx-NLME/ferx-core/issues/1513)). Substituting a full-pivot LU makes a 100-subject transit-absorption fit 12% faster and eliminates all 16 of its declines, but over those 16 events the resulting gradient disagrees with the reconverged finite-difference one by a median relative $0.378$ — against a $1.4 \times 10^{-3}$ noise floor measured on the *same fit's* positive-definite subjects — and points in a near-orthogonal direction (cosine $0.032$) at the worst of them. The $H$ matrices are well conditioned throughout, so that is the broken precondition, not a numerical artifact. The fit still lands at the same optimum, which is exactly why an OFV comparison cannot settle a question like this one.
 
-The practical reading for a user: a `gradient:` banner of `analytic` together with a per-subject fallback warning means some subjects' inner loops are finishing away from their optimum, not that ferx is being needlessly cautious. Those subjects get the held-EBE gradient (the reconverged one under IOV) at those points.
+The practical reading for a user: a `gradient:` banner of `analytic` together with a per-subject fallback warning means some subjects' inner loops are finishing away from their optimum, not that ferx is being needlessly cautious. Those subjects get the exact gradient at a re-solved EBE (reconverged finite differences if that fails too) at those points.
 
 #### Why an inner loop finishes away from its optimum {#inner-loop-noise-floor}
 
@@ -212,7 +193,7 @@ What this does **not** do is make the declines go away: 16 decline events before
 
 #### The salvage is not bought at a blown-up trial point {#blown-up-trial-salvage}
 
-A reconverged salvage — every declined subject before #1529, and still every declined IOV subject — costs `2·n_free` warm EBE re-solves for one subject, and much of that spend used to land on trial points the optimizer was about to reject anyway — line-search steps whose objective sits thousands to $10^{15}$ units above the incumbent ([#1520](https://github.com/FeRx-NLME/ferx-core/issues/1520)). Since #1520 a declined subject at such a point contributes nothing to the outer gradient there instead of buying the salvage, and the warning above says how many salvages were skipped.
+A reconverged salvage — every declined subject before #1529 — costs `2·n_free` warm EBE re-solves for one subject, and much of that spend used to land on trial points the optimizer was about to reject anyway — line-search steps whose objective sits thousands to $10^{15}$ units above the incumbent ([#1520](https://github.com/FeRx-NLME/ferx-core/issues/1520)). Since #1520 a declined subject at such a point contributes nothing to the outer gradient there instead of buying the salvage, and the warning above says how many salvages were skipped.
 
 Two gates, both required, both in the same units — excess of a `−2LL` over its value at the reference point, per observation:
 

@@ -4321,7 +4321,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
             "x[{k}]: OFV = 2·F of the held score"
         );
     }
-    let w = outer_fd_fallback_warning(&one, &population, &log).expect("the salvage is reported");
+    let w = outer_fd_fallback_warning(&population, &log).expect("the salvage is reported");
     assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
 }
 
@@ -8165,8 +8165,23 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         (
             "ode_iov",
             parse_model_string(ODE_IOV).unwrap(),
-            bolus,
+            bolus.clone(),
             vec![0.1, -0.05, 0.08, -0.03],
+        ),
+        // An SDE model (#3004): `want_jac` without σ is the predictions' own `∂f_j/∂θ`, served
+        // rather than declined to a forward difference per θ.
+        (
+            "warfarin_sde",
+            parse_model_string(
+                &std::fs::read_to_string(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/examples/warfarin_sde.ferx"
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+            bolus,
+            vec![0.1, -0.05, 0.08],
         ),
     ];
     let mut worst_all = 0.0f64;
@@ -8213,9 +8228,12 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
             1e-9
         } else if name == "additive_four_eta" {
             1e-13
+        } else if name == "warfarin_sde" {
+            1e-12
         } else {
             1e-14
         };
+        eprintln!("MEASURE {name}: {worst:e}");
         assert!(worst < bound, "{name}: worst relative difference {worst:e}");
         worst_all = worst_all.max(worst);
     }

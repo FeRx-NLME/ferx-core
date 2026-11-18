@@ -614,6 +614,7 @@ pub(crate) fn mixture_gradient_salvaged(
     let salvage = |d: DeclinedTerm<'_>| {
         let subject = &population.subjects[d.subject];
         declines.record(d.subject);
+        declines.record_reconverged(d.subject);
         if d.cp.omega_iov.is_none() {
             let _guard = MixtureClassGuard::enter(d.cls + 1);
             if crate::estimation::outer_optimizer::is_structural_decline(
@@ -3450,7 +3451,7 @@ mod tests {
                 .is_none(),
             "fixture: the strict assembly must decline subject 0"
         );
-        let log = OuterFdDeclineLog::reconverging(pop.subjects.len());
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
         let salvaged = super::mixture_gradient_salvaged(
             &model,
             &pop,
@@ -3508,7 +3509,7 @@ mod tests {
             "fixture: subject 0's salvaged terms must be live ({live:e} vs {worst:e})"
         );
 
-        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the decline warns");
+        let w = outer_fd_fallback_warning(&pop, &log).expect("the decline warns");
         assert!(
             w.contains("1 of 4") && w.contains(&format!("subject {}", pop.subjects[0].id)),
             "{w}"

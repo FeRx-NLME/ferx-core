@@ -6640,8 +6640,7 @@ pub(crate) mod outer_fd_fallback {
         let (model, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w =
-            outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
+        let w = outer_fd_fallback_warning(&pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
         assert!(
             w.contains("could not be given the exact analytic outer gradient"),
@@ -6673,7 +6672,7 @@ pub(crate) mod outer_fd_fallback {
     /// stamped a cause on (the quadrature's) keeps the generic sentence.
     #[test]
     fn warning_names_each_decline_cause() {
-        let (model, analytic, declining) = analytic_and_declining();
+        let (_, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         const MODE: &str = "with an inner Hessian at the EBE that was singular, or indefinite \
              at an EBE that was not stationary (an EBE off a strict mode), at some trial point";
@@ -6686,7 +6685,7 @@ pub(crate) mod outer_fd_fallback {
                 log.record(i);
                 log.record_cause(i, c);
             }
-            outer_fd_fallback_warning(&model, &pop, &log).expect("must warn")
+            outer_fd_fallback_warning(&pop, &log).expect("must warn")
         };
         let only = |w: &str, present: &[&str]| {
             for clause in [MODE, RECORDING, GENERIC] {
@@ -6720,7 +6719,7 @@ pub(crate) mod outer_fd_fallback {
 
         let log = OuterFdDeclineLog::new(2);
         log.record(1);
-        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
+        let w = outer_fd_fallback_warning(&pop, &log).expect("must warn");
         only(&w, &[GENERIC]);
     }
 
@@ -6823,198 +6822,357 @@ pub(crate) mod outer_fd_fallback {
         );
     }
 
-    /// #1529: the consequence sentence depends on which salvage the route takes, so both
-    /// sides of the `iov` gate are asserted in one test — a gate stuck on either branch
-    /// reddens it. Non-IOV declines take the held-EBE gradient, whose remedy is
-    /// `reconverge_gradient_interval`; IOV declines are still reconverged (the IOV route
-    /// ignores that knob), so pointing an IOV user at it would be false advice.
+    /// A declined subject's gradient is one of four kinds, worst case over the fit: reconverged
+    /// finite differences because no recorder serves it (structural), reconverged because the
+    /// exact route failed, exact at its re-solved EBE, or a route that records only the decline
+    /// (the quadrature's held-EBE score). The warning names each non-empty group with its count
+    /// and the sentence true of it — never another's: the held-EBE remedy for a subject that
+    /// was served exactly or reconverged, nor "exact" for one that was not. Each cell asserts
+    /// the sentence that must appear and the others that must not, so forcing any group
+    /// reddens it; a subject flagged in two groups counts in the worse one.
     #[test]
-    fn consequence_sentence_follows_the_salvage_route() {
-        let (model, analytic, declining) = analytic_and_declining();
-        let pop = mk_pop(vec![analytic, declining]);
-        // A numerical (held-EBE) decline of subject 1, built directly: the fixture's real
-        // decline is structural (never servable), which takes the reconverged salvage on
-        // both sides of the gate and so cannot straddle the remedy sentence. The real
-        // evaluation is `warns_with_count_and_example_subject`'s.
-        let log = OuterFdDeclineLog::new(2);
-        log.record(1);
-        // The IOV twin of the fixture model: same subjects, one `kappa` on CL. The route is
-        // read from the model inside the warning, so pairing the same log with each model
-        // is what exercises it — an `iov` hard-coded at the call site would redden one leg.
-        let iov_model = crate::parser::model_parser::parse_model_string(
-            &WARFARIN_F
-                .replace(
-                    "omega ETA_KA ~ 0.30",
-                    "omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02",
-                )
-                .replace("TVCL * exp(ETA_CL)", "TVCL * exp(ETA_CL + KAPPA_CL)"),
-        )
-        .expect("IOV twin parses");
-        assert!(
-            iov_model.n_kappa > 0 && model.n_kappa == 0,
-            "fixture precondition: the two models must straddle the IOV gate"
-        );
-
-        let non_iov = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
-        assert!(
-            non_iov.contains("used fixed-EBE outer gradients")
-                && non_iov.contains("omit the EBE-response term"),
-            "non-IOV must name the held-EBE salvage; got: {non_iov}"
-        );
-        assert!(
-            non_iov.contains("`reconverge_gradient_interval = N`"),
-            "non-IOV must name the remedy; got: {non_iov}"
-        );
-        assert!(!non_iov.contains("correct but slower"), "got: {non_iov}");
-
-        let iov = outer_fd_fallback_warning(&iov_model, &pop, &log).expect("must warn");
-        assert!(
-            iov.contains("reconverged finite-difference outer gradients")
-                && iov.contains("correct but slower"),
-            "IOV must name the reconverged salvage; got: {iov}"
-        );
-        assert!(
-            !iov.contains("reconverge_gradient_interval") && !iov.contains("fixed-EBE"),
-            "IOV ignores the interval knob; got: {iov}"
-        );
-    }
-
-    /// A reconverging log (a profiled fit's, #2136) salvages a numerical non-IOV decline
-    /// reconverged, so the sentence names that salvage, never the held-EBE one or its
-    /// `reconverge_gradient_interval` remedy. The same decline on a plain log is the
-    /// straddle: held-EBE, with the remedy. An all-structural reconverging log keeps the
-    /// structural sentence, which is true on both logs; a mixed one (numerical and
-    /// structural) takes the reconverged sentence. Dies when the reconverging branch is
-    /// dropped, when it swallows the structural case, or when it skips the mixed one.
-    #[test]
-    fn a_reconverging_log_names_the_reconverged_salvage() {
+    fn consequence_sentence_names_each_salvage_group() {
         let (model, analytic, declining) = analytic_and_declining();
         assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
         let pop = mk_pop(vec![analytic, declining]);
-
-        let reconverging = OuterFdDeclineLog::reconverging(2);
-        reconverging.record(1);
-        let w = outer_fd_fallback_warning(&model, &pop, &reconverging).expect("must warn");
-        assert!(
-            w.contains("used reconverged finite-difference outer gradients")
-                && w.contains("correct but slower"),
-            "reconverging: the reconverged salvage; got: {w}"
-        );
-        assert!(
-            !w.contains("fixed-EBE") && !w.contains("reconverge_gradient_interval"),
-            "reconverging: no held-EBE sentence or remedy; got: {w}"
-        );
-
-        let plain = OuterFdDeclineLog::new(2);
-        plain.record(1);
-        let held = outer_fd_fallback_warning(&model, &pop, &plain).expect("must warn");
-        assert!(
-            held.contains("used fixed-EBE outer gradients")
-                && held.contains("`reconverge_gradient_interval = N`"),
-            "the straddle: a plain log names the held-EBE salvage; got: {held}"
-        );
-
-        let structural = OuterFdDeclineLog::reconverging(2);
-        structural.record(1);
-        structural.record_structural(1);
-        let st = outer_fd_fallback_warning(&model, &pop, &structural).expect("must warn");
-        assert!(
-            st.contains("no analytic recorder serves them"),
-            "an all-structural reconverging log keeps the structural sentence; got: {st}"
-        );
-
-        // Mixed: one numerical and one structural decline. A reconverging log salvaged
-        // both reconverged, so no "The other N used fixed-EBE …" half (#2394 review 1).
-        let mixed = OuterFdDeclineLog::reconverging(2);
-        mixed.record(0);
-        mixed.record(1);
-        mixed.record_structural(1);
-        let mx = outer_fd_fallback_warning(&model, &pop, &mixed).expect("must warn");
-        assert!(
-            mx.contains("used reconverged finite-difference outer gradients")
-                && mx.contains("correct but slower"),
-            "a mixed reconverging log: the reconverged salvage; got: {mx}"
-        );
-        assert!(
-            !mx.contains("fixed-EBE") && !mx.contains("reconverge_gradient_interval"),
-            "a mixed reconverging log: no held-EBE half or remedy; got: {mx}"
-        );
-    }
-
-    /// #1536: a non-IOV decline takes one of two salvages — reconverged for a structural
-    /// decline, held-EBE otherwise — and the warning must describe each subject by the one
-    /// it got. The input space is the (structural, held-EBE) split of the declined set,
-    /// three non-empty cells; all three are asserted here, each on the sentence that must
-    /// appear *and* the one that must not, so forcing any branch reddens the test.
-    #[test]
-    fn consequence_sentence_names_each_non_iov_salvage_group() {
-        let (model, analytic, declining) = analytic_and_declining();
-        assert_eq!(model.n_kappa, 0, "fixture precondition: non-IOV");
-        let pop = mk_pop(vec![analytic, declining]);
-        // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
              no analytic recorder serves them: recording their exact derivatives failed, as it \
              will at every parameter point. Those gradients include the EBE-response term but \
              are slower.";
-        const CORRECT: &str = "include the EBE-response term but are slower";
+        const RECON: &str = "used reconverged finite-difference outer gradients; their \
+             results are correct but slower.";
+        const EXACT: &str = "were re-solved to their EBEs at the trial point and given the \
+             exact analytic gradient there.";
         const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
              term the analytic gradient carries. If the fit stalls, \
              `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
              evaluation.";
-        const REMEDY: &str = "`reconverge_gradient_interval = N`";
         const SKIPPED: &str = "1 of their salvage gradients were skipped";
-        let warn_with = |structural: &[usize], skipped: bool| {
+        let warn = |flags: &dyn Fn(&OuterFdDeclineLog), skipped: bool| {
             let log = OuterFdDeclineLog::new(2);
             log.record(0);
             log.record(1);
-            for &i in structural {
-                log.record_structural(i);
-            }
+            flags(&log);
             if skipped {
                 log.record_skipped_salvage();
             }
-            outer_fd_fallback_warning(&model, &pop, &log).expect("declines warn")
+            outer_fd_fallback_warning(&pop, &log).expect("declines warn")
         };
-        let warn = |structural: &[usize]| warn_with(structural, false);
+        let only = |w: &str, present: &str| {
+            for (name, sentence) in [
+                ("STRUCT", STRUCT),
+                ("RECON", RECON),
+                ("EXACT", EXACT),
+                ("HELD", HELD),
+            ] {
+                assert_eq!(
+                    w.contains(sentence),
+                    sentence == present,
+                    "group {name}; got: {w}"
+                );
+            }
+        };
+        only(&warn(&|_| {}, false), HELD);
+        only(
+            &warn(
+                &|l| {
+                    l.record_exact(0);
+                    l.record_exact(1);
+                },
+                false,
+            ),
+            EXACT,
+        );
+        only(
+            &warn(
+                &|l| {
+                    l.record_reconverged(0);
+                    l.record_reconverged(1);
+                },
+                false,
+            ),
+            RECON,
+        );
+        only(
+            &warn(
+                &|l| {
+                    l.record_structural(0);
+                    l.record_structural(1);
+                },
+                false,
+            ),
+            STRUCT,
+        );
+        // Worst wins: exact on one evaluation, reconverged on another is a reconverged subject.
+        only(
+            &warn(
+                &|l| {
+                    l.record_exact(0);
+                    l.record_exact(1);
+                    l.record_reconverged(0);
+                    l.record_reconverged(1);
+                },
+                false,
+            ),
+            RECON,
+        );
+        let split = warn(
+            &|l| {
+                l.record_structural(1);
+                l.record_exact(0);
+            },
+            false,
+        );
+        assert!(
+            split.contains(&format!("of these, 1 {STRUCT} Another 1 {EXACT}")),
+            "a split population names both groups with their counts; got: {split}"
+        );
+        assert!(!split.contains(HELD) && !split.contains(SKIPPED), "{split}");
+        let skipped = warn(
+            &|l| {
+                l.record_structural(0);
+                l.record_structural(1);
+            },
+            true,
+        );
+        assert!(
+            skipped.contains(STRUCT) && skipped.contains(SKIPPED),
+            "{skipped}"
+        );
+    }
 
-        let held_only = warn(&[]);
-        assert!(
-            held_only.contains(HELD) && held_only.contains(REMEDY),
-            "got: {held_only}"
-        );
-        assert!(
-            !held_only.contains(STRUCT) && !held_only.contains(CORRECT),
-            "got: {held_only}"
-        );
+    /// Which declined subjects a gradient assembled over them is exact for: every one served at
+    /// its re-solved EBE (or none declined), not one that took a finite-difference or held
+    /// salvage. [`exact_reporting_gradient`] reads it to decide the label. Mutations that
+    /// redden it: reading `declined_indices` alone (every decline reads as inexact), or
+    /// ignoring the structural / reconverged flags.
+    #[test]
+    fn a_gradient_is_exact_when_every_decline_was_served_exactly() {
+        let log = OuterFdDeclineLog::new(3);
+        assert!(log.all_declines_exact(), "no decline");
+        log.record(0);
+        assert!(!log.all_declines_exact(), "declined, no salvage recorded");
+        log.record_exact(0);
+        assert!(log.all_declines_exact(), "served exactly");
+        log.record(1);
+        log.record_exact(1);
+        log.record_reconverged(1);
+        assert!(!log.all_declines_exact(), "one reconverged");
+        let log = OuterFdDeclineLog::new(2);
+        log.record(0);
+        log.record_exact(0);
+        log.record_structural(0);
+        assert!(!log.all_declines_exact(), "one structural");
+    }
 
-        let structural_only = warn(&[0, 1]);
-        assert!(
-            structural_only.contains(STRUCT) && structural_only.contains(CORRECT),
-            "got: {structural_only}"
-        );
-        assert!(
-            !structural_only.contains(HELD) && !structural_only.contains(REMEDY),
-            "a reconverged subject must not be pointed at the interval knob; got: \
-             {structural_only}"
-        );
+    /// Worst `|a − b| / (1 + |b|)` over the coordinates, every operand asserted finite first
+    /// (a `NaN` would otherwise be folded away).
+    fn worst_rel_gap(a: &[f64], b: &[f64]) -> f64 {
+        assert_eq!(a.len(), b.len());
+        let mut worst = 0.0_f64;
+        for (x, y) in a.iter().zip(b) {
+            assert!(x.is_finite() && y.is_finite(), "{x} / {y}");
+            worst = worst.max((x - y).abs() / (1.0 + y.abs()));
+        }
+        worst
+    }
 
-        let split = warn(&[1]);
-        assert!(
-            split.contains(&format!("of these, 1 {STRUCT}"))
-                && split.contains(CORRECT)
-                && split.contains(&format!("The other 1 {HELD}"))
-                && split.contains(REMEDY),
-            "a split population must name both groups with their counts; got: {split}"
+    /// #3004 (B2.7): a subject the analytic outer gradient declines at runtime — here forced,
+    /// the numerical decline of a mode system that would not solve — is served by the adjoint at
+    /// its EBE re-solved at the trial point, so its gradient carries the EBE response. The
+    /// held-EBE gradient it replaced omits `½·∂log|H̃|/∂η · dη̂/dx` and is biased by an `O(1)`
+    /// amount on the Ω/σ coordinates, where this one agrees with the reconverged
+    /// finite-difference oracle. The held gradient is computed here beside it, so the test fails
+    /// on a salvage that returns it (measured, Linux x86_64: served 1.1e-7 from the oracle, held 0.50; bounds 3e-6 and 1000x).
+    ///
+    /// Engine: the forced decline replaces only the assembly's own call; the salvage's call is
+    /// the real adjoint, so the exact leg runs on the recorder plans, not on FD. Non-degenerate:
+    /// the EBE is a mode away from η = 0 (asserted), where the response term is non-zero.
+    #[test]
+    fn a_runtime_decline_is_served_at_the_resolved_ebe_not_the_held_one() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let prep = crate::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare");
+        let model = &prep.parsed.model;
+        let pop = mk_pop(vec![prep.population.subjects[0].clone()]);
+        let params = &prep.init_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let at = unpack_params(&x, params);
+        let ebe = find_ebe_for_stage(
+            &model,
+            &pop.subjects[0],
+            &at,
+            500,
+            1e-12,
+            None,
+            None,
+            0,
+            &opts,
         );
-        assert!(!split.contains(SKIPPED), "no skip recorded; got: {split}");
+        assert!(
+            ebe.eta.iter().any(|e| e.abs() > 1e-2),
+            "fixture: the EBE is off zero, {:?}",
+            ebe.eta
+        );
+        let (ehs, hms) = (vec![ebe.eta.clone()], vec![ebe.h_matrix.clone()]);
+        let run = |force: bool| {
+            let log = OuterFdDeclineLog::new(1);
+            if force {
+                log.force_decline(0);
+            }
+            let g = population_gradient_sens_mixed(
+                &x,
+                params,
+                &model,
+                &pop,
+                &ehs,
+                &hms,
+                &bounds,
+                &opts,
+                OuterTrial::unknown(),
+                &log,
+            );
+            (g, log)
+        };
+        let (analytic_g, quiet) = run(false);
+        assert!(quiet.declined_indices().is_empty(), "control: no decline");
+        let (served, log) = run(true);
+        assert_eq!(log.declined_indices(), vec![0]);
+        assert!(log.all_declines_exact(), "served exactly, not by FD");
+        let oracle: Vec<f64> = subject_reconverged_fd_gradient(
+            &x,
+            params,
+            &model,
+            &pop.subjects[0],
+            &ebe.eta,
+            &bounds,
+            &opts,
+        )
+        .iter()
+        .map(|g| 2.0 * g)
+        .collect();
+        let held: Vec<f64> = subject_fixed_ebe_gradient(
+            &x,
+            params,
+            &model,
+            &pop,
+            0,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &[],
+            &bounds,
+            &opts,
+        )
+        .1
+        .iter()
+        .map(|g| 2.0 * g)
+        .collect();
+        let to_analytic = worst_rel_gap(&served, &analytic_g);
+        let to_oracle = worst_rel_gap(&served, &oracle);
+        let held_to_oracle = worst_rel_gap(&held, &oracle);
+        eprintln!(
+            "MEASURE served vs analytic {to_analytic:.3e}, served vs reconverged FD \
+             {to_oracle:.3e}, held-EBE vs reconverged FD {held_to_oracle:.3e}"
+        );
+        assert!(to_analytic < 1e-6, "served vs analytic: {to_analytic:e}");
+        assert!(to_oracle < 3e-6, "served vs reconverged FD: {to_oracle:e}");
+        assert!(
+            held_to_oracle > 1e3 * to_oracle,
+            "straddle: the held-EBE gradient must be visibly biased, {held_to_oracle:e}"
+        );
+    }
 
-        // A #1520 skip on a structural fit appends its own sentence without disturbing
-        // the structural one.
-        let skipped = warn_with(&[0, 1], true);
+    /// #3004 (B2.7) under IOV, through [`declined_salvage`] directly (the IOV assembly does not
+    /// read the forced flags): the salvage at the re-solved joint mode equals the analytic IOV
+    /// gradient and the reconverged oracle, and is recorded exact.
+    #[test]
+    fn an_iov_decline_is_served_at_the_resolved_joint_mode() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let stage = FitOptions {
+            method: EstimationMethod::Foce,
+            interaction: false,
+            ..FitOptions::default()
+        };
+        let prep = crate::prepare_run("examples/warfarin_iov.ferx", Some("data/warfarin_iov.csv"))
+            .expect("prepare");
+        let (model, s) = (&prep.parsed.model, &prep.population.subjects[0]);
+        let p = &prep.init_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(p);
+        let at = unpack_params(&x, p);
+        let ebe = find_ebe_for_stage(model, s, &at, 500, 1e-12, None, None, 0, &stage);
+        let stacked = joint_warm_start(&ebe.eta, &ebe.kappas);
         assert!(
-            skipped.contains(STRUCT) && skipped.contains(SKIPPED) && !skipped.contains(HELD),
-            "got: {skipped}"
+            stacked.iter().any(|e| e.abs() > 1e-2),
+            "fixture: off zero, {stacked:?}"
         );
+        let log = OuterFdDeclineLog::new(1);
+        log.record(0);
+        let served = declined_salvage(false, 0, &x, p, model, s, &stacked, &bounds, &stage, &log);
+        assert!(log.all_declines_exact(), "served exactly");
+        let analytic = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
+            model,
+            s,
+            p,
+            &x,
+            stacked.as_slice(),
+        )
+        .expect("in scope");
+        let oracle = subject_reconverged_fd_gradient(&x, p, model, s, &stacked, &bounds, &stage);
+        let (to_analytic, to_oracle) = (
+            worst_rel_gap(&served, &analytic),
+            worst_rel_gap(&served, &oracle),
+        );
+        eprintln!("MEASURE IOV served vs analytic {to_analytic:.3e}, vs oracle {to_oracle:.3e}");
+        assert!(to_analytic < 1e-6, "{to_analytic:e}");
+        assert!(to_oracle < 3e-6, "{to_oracle:e}");
+    }
+
+    /// #3004: where the exact route fails too (every plan of this subject fails), a
+    /// non-structural decline takes the reconverged difference — bit for bit the oracle — and
+    /// is recorded as such, so the warning and the reporting gradient do not call it exact.
+    /// The structural flag is *not* set (it is the caller's claim about the subject).
+    #[test]
+    fn a_decline_the_exact_route_cannot_serve_is_reconverged_and_recorded() {
+        let (model, _, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![declining.clone()]);
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let eta = DVector::from_element(model.n_eta, 0.1);
+        let log = OuterFdDeclineLog::new(1);
+        log.record(0);
+        let got = declined_salvage(
+            false,
+            0,
+            &x,
+            params,
+            &model,
+            &pop.subjects[0],
+            &eta,
+            &bounds,
+            &opts,
+            &log,
+        );
+        let oracle =
+            subject_reconverged_fd_gradient(&x, params, &model, &declining, &eta, &bounds, &opts);
+        assert_eq!(got, oracle);
+        assert!(!log.all_declines_exact(), "reconverged FD is not exact");
+        assert_eq!(log.n_structural_for_test(), 0);
     }
 
     /// An all-analytic population is silent.
@@ -7023,7 +7181,7 @@ pub(crate) mod outer_fd_fallback {
         let (model, analytic, _) = analytic_and_declining();
         let pop = mk_pop(vec![analytic]);
         let log = record_one_gradient_eval(&model, &pop);
-        assert!(outer_fd_fallback_warning(&model, &pop, &log).is_none());
+        assert!(outer_fd_fallback_warning(&pop, &log).is_none());
     }
 
     /// The case the *inner* warning deliberately suppresses and this one must not: a
@@ -7046,8 +7204,8 @@ pub(crate) mod outer_fd_fallback {
         );
         let pop = mk_pop(vec![declining.clone(), declining]);
         let log = record_one_gradient_eval(&model, &pop);
-        let w = outer_fd_fallback_warning(&model, &pop, &log)
-            .expect("an all-FD in-scope population must warn");
+        let w =
+            outer_fd_fallback_warning(&pop, &log).expect("an all-FD in-scope population must warn");
         assert!(w.contains("2 of 2"), "got: {w}");
     }
 
@@ -7057,43 +7215,14 @@ pub(crate) mod outer_fd_fallback {
     /// without touching the analytic branch, so there is nothing to report.
     #[test]
     fn an_untouched_log_says_nothing() {
-        let (model, analytic, declining) = analytic_and_declining();
+        let (_, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         assert!(
-            outer_fd_fallback_warning(&model, &pop, &log).is_none(),
+            outer_fd_fallback_warning(&pop, &log).is_none(),
             "a fit that never evaluated an analytic outer gradient must not warn — even \
              with a subject the provider would decline"
         );
-    }
-
-    /// #1529 review: the three fills of `declined_subject_gradient`, keyed on the held-EBE
-    /// objective and gradient. A repelled subject (the `1e20` sentinel, or NaN/∞) must
-    /// contribute zero rather than a sentinel-driven FD number *or* a reconverge — the
-    /// latter is the #1529 cost at blown-up trials; a usable objective with a non-finite
-    /// gradient must go to the reconverged fallback rather than leak `NaN` into the sum.
-    /// Each arm is pinned both ways so collapsing any two reddens it.
-    #[test]
-    fn declined_fill_keys_on_the_held_ebe_objective_and_gradient() {
-        let finite = [0.5, -1.0];
-        let nan = [0.5, f64::NAN];
-        assert_eq!(declined_fill(12.3, &finite), DeclinedFill::HeldEbe);
-        assert_eq!(declined_fill(12.3, &nan), DeclinedFill::Reconverge);
-        assert_eq!(
-            declined_fill(12.3, &[f64::INFINITY, 0.0]),
-            DeclinedFill::Reconverge
-        );
-        // Sentinel and non-finite objectives are repelled whatever the gradient says.
-        for nll in [1e20, 2e20, f64::INFINITY, f64::NAN] {
-            assert_eq!(
-                declined_fill(nll, &finite),
-                DeclinedFill::Zero,
-                "nll = {nll}"
-            );
-            assert_eq!(declined_fill(nll, &nan), DeclinedFill::Zero, "nll = {nll}");
-        }
-        // Just under the sentinel is a real objective.
-        assert_eq!(declined_fill(9.99e19, &finite), DeclinedFill::HeldEbe);
     }
 
     /// #1537 review: a structural decline keys on the held-EBE objective exactly as the
@@ -7169,7 +7298,19 @@ pub(crate) mod outer_fd_fallback {
         );
 
         let salvage = |h: &DMatrix<f64>| {
-            non_iov_declined_salvage(true, &x, params, &model, &pop, 0, &eta, h, &bounds, &opts)
+            non_iov_declined_salvage(
+                true,
+                &x,
+                params,
+                &model,
+                &pop,
+                0,
+                &eta,
+                h,
+                &bounds,
+                &opts,
+                &OuterFdDeclineLog::new(1),
+            )
         };
         assert_eq!(salvage(&h_repelled), vec![0.0; x.len()]);
         assert_eq!(salvage(&h_usable), unguarded);
@@ -8351,11 +8492,11 @@ pub(crate) mod outer_fd_fallback {
     /// (or a sentence that is always emitted) reddens it.
     #[test]
     fn warning_names_skipped_salvages_only_when_there_were_any() {
-        let (model, analytic, declining) = analytic_and_declining();
+        let (_, analytic, declining) = analytic_and_declining();
         let pop = mk_pop(vec![analytic, declining]);
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         log.record(1);
-        let before = outer_fd_fallback_warning(&model, &pop, &log).expect("a decline warns");
+        let before = outer_fd_fallback_warning(&pop, &log).expect("a decline warns");
         assert!(
             !before.contains("skipped"),
             "no skipped salvage, no sentence about one; got: {before}"
@@ -8363,7 +8504,7 @@ pub(crate) mod outer_fd_fallback {
         log.record_skipped_salvage();
         log.record_skipped_salvage();
         assert_eq!(log.skipped_salvages(), 2);
-        let after = outer_fd_fallback_warning(&model, &pop, &log).expect("a decline warns");
+        let after = outer_fd_fallback_warning(&pop, &log).expect("a decline warns");
         assert!(
             after.contains("2 of their salvage gradients were skipped"),
             "the sentence must carry the count; got: {after}"
