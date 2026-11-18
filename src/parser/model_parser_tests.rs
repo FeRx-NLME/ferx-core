@@ -40183,3 +40183,40 @@ fn a_covariate_model_block_is_read_through_its_statements_by_every_exclusivity_c
     );
     assert_eq!(h, b, "both spellings see the outside read alike");
 }
+
+/// A named endpoint block reads θ as its unnamed spelling does (#3014 review): a hazard reading
+/// the CL group's covariate θ makes that θ an outside read of the group, and keeps it out of the
+/// covariance fold, whether the block is `[event_model]` or `[event_model death]`. The unnamed
+/// arm is the control the named one must match; before the fix only the unnamed half of the
+/// blocks was scanned, so the named arm called `THETA_WT` exclusive and SAEM's joint M-step
+/// would have dropped the hazard's dependence on it.
+#[cfg(feature = "survival")]
+#[test]
+fn a_named_endpoint_block_is_an_outside_reader_like_its_unnamed_spelling() {
+    let model = |header: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 1.0, 500.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVLAMBDA(0.05, 0.001, 10.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{header}\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA * (WT / 70)^THETA_WT\n"
+        )
+    };
+    for header in ["[event_model]", "[event_model death]"] {
+        let m = parse_full_model(&model(header))
+            .unwrap_or_else(|e| panic!("{header}: model must parse: {e}"))
+            .model;
+        let cl = m
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .unwrap_or_else(|| panic!("{header}: the CL group is recorded"));
+        assert_eq!(
+            cl.read_outside_groups,
+            vec!["THETA_WT"],
+            "{header}: the hazard reads THETA_WT outside the CL group"
+        );
+        let wt = m.theta_names.iter().position(|n| n == "THETA_WT").unwrap();
+        assert!(
+            !m.indiv_param_partials.mu_fold.thetas.contains(&wt),
+            "{header}: a θ the hazard reads is not folded: {:?}",
+            m.indiv_param_partials.mu_fold
+        );
+    }
+}

@@ -6100,10 +6100,11 @@ pub fn parse_full_model_with(
             eta_names_bsv.len(),
         ))
     });
-    // Every identifier any *other* block spells, so a theta that reaches the
-    // likelihood outside `[individual_parameters]` (an `[odes]` right-hand side,
-    // a `[derived]` readout) is visible to the exclusivity checks: the additive
-    // mu-refs' (#2544) and the covariate groups' (#619). `[parameters]` is
+    // Every identifier any *other* block spells, unnamed or named, so a theta that reaches
+    // the likelihood outside `[individual_parameters]` (an `[odes]` right-hand
+    // side, a `[derived]` readout) is visible to the exclusivity checks: the
+    // additive mu-refs' (#2544, plain and mixture-class), the covariate groups'
+    // (#619) and the covariance mu fold's (#2980). `[parameters]` is
     // excluded because it is where the thetas are declared; the only theta a
     // model may name there is a FIXed one in a kappa weight, which no M-step
     // moves. `[covariate_model]` is excluded for the same reason (#3014): its
@@ -6120,6 +6121,13 @@ pub fn parse_full_model_with(
         ) {
             continue;
         }
+        collect_referenced_identifiers(lines, &mut outside_idents);
+    }
+    // Named blocks (`[event_model death]`, `[binary_model …]`, …) read θ exactly as their
+    // unnamed spelling does, and none of them declares one: every instance counts (#3014
+    // review). Before, only the unnamed half was scanned, so a θ a named hazard read looked
+    // exclusive to its group, and the joint M-step dropped a data term that depends on it.
+    for lines in extracted.named.values().flat_map(|m| m.values()) {
         collect_referenced_identifiers(lines, &mut outside_idents);
     }
     let mu_ref_scan = MuRefScan {

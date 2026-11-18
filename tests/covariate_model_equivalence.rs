@@ -163,6 +163,8 @@ fn saem_takes_the_same_route_for_both_forms() {
         method: ferx_core::types::EstimationMethod::Saem,
         saem_n_exploration: 3,
         saem_n_convergence: 3,
+        // The route under test is the M-step; nothing below reads the covariance step.
+        run_covariance_step: false,
         ..FitOptions::default()
     };
     let hand_fit = fit(&hand.model, &pop, &hand.model.default_params, &opts)
