@@ -96,8 +96,10 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/outer_optimizer.rs",
-        14,
+        15,
         "the outer optimizer and objective, run on a stage's options; \
+         #3004's `exact_at_resolved_ebe` (the adjoint at a declined subject's re-solved EBE) \
+         reads the same stage options as the salvage around it; \
          `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options \
          (#2549: the built-in BFGS loop's two standalone `population_eta_dx` reads went \
          with its separate mode-response pass); the #2093 basin probe's switched-subject \
