@@ -508,6 +508,113 @@ fn the_reverse_pass_is_the_forward_tangents_transposed_on_random_programs() {
     eprintln!("reverse pass vs forward tangents: worst relative difference {worst:e}");
 }
 
+/// `ir::tangent_rows` (#2980) on random programs: its tangent-free instructions form a prefix —
+/// none reads a tangent argument or a later value, so a multi-seed call may run them once —
+/// and, run whole per seed, it gives each seed's output tangents as the independent forward
+/// oracle (`ir::interpret_tangent`) does. A wrong partition (a tangent instruction left in the
+/// prefix, a host call split) fails the first check; a wrong tangent rule or a misplaced
+/// tangent argument the second.
+#[test]
+fn tangent_rows_split_the_primal_from_each_seeds_tangent_on_random_programs() {
+    use super::ir::{self, Inst, Layout};
+    let mut rng = Rng(0xA076_1D64_78BD_642F);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let layouts = [
+        Layout::F64,
+        Layout {
+            n: 2,
+            m: 0,
+            th: false,
+            wide: false,
+            tan: 0,
+        },
+    ];
+    let (mut worst, mut checked) = (0.0f64, 0usize);
+    for case in 0..60 {
+        let odes = random_odes(&mut rng);
+        let prog = program(&odes);
+        let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog))
+            .unwrap_or_else(|e| panic!("case {case} did not compile ({e:?}):\n{odes}"));
+        for &l in &layouts {
+            let w = l.lanes();
+            let fwd = ir::forward(&reg.code, reg.n_regs, l);
+            let Some((rows, prefix)) = ir::tangent_rows(&fwd) else {
+                continue;
+            };
+            let n = fwd.n_args;
+            for (i, inst) in rows.insts[..prefix].iter().enumerate() {
+                if let Inst::Load { arg, .. } | Inst::Store { arg, .. } = *inst {
+                    assert!(
+                        arg < n || arg == n + 2,
+                        "case {case}: prefix instruction {i} reads tangent argument {arg}"
+                    );
+                }
+                for x in ir::value_operands(inst) {
+                    assert!(
+                        (x as usize) < prefix,
+                        "case {case}: prefix instruction {i} reads value {x} past the prefix"
+                    );
+                }
+            }
+            let lanes = |rng: &mut Rng, k: usize| -> Vec<f64> {
+                (0..k * w).map(|_| rng.unit() * 2.0 + 0.1).collect()
+            };
+            let u = lanes(&mut rng, 3);
+            let pv = lanes(&mut rng, n_params);
+            let sd = vec![1.75, rng.unit() * 5.0, rng.unit() * 2.0, f64::EPSILON]
+                .into_iter()
+                .flat_map(|v| std::iter::once(v).chain(std::iter::repeat_n(0.0, w - 1)))
+                .collect::<Vec<f64>>();
+            for _seed in 0..3 {
+                let tu: Vec<f64> = (0..u.len()).map(|_| rng.unit() * 2.0 - 1.0).collect();
+                let tp: Vec<f64> = (0..pv.len()).map(|_| rng.unit() * 2.0 - 1.0).collect();
+                let mut want = vec![
+                    tu.clone(),
+                    tp.clone(),
+                    vec![0.0; sd.len()],
+                    vec![0.0; 3 * w],
+                ];
+                ir::interpret_tangent(&fwd, &[&u, &pv, &sd, &vec![0.0; 3 * w]], &mut want);
+                let (mut u_, mut p_, mut s_, mut du) =
+                    (u.clone(), pv.clone(), sd.clone(), vec![0.0; 3 * w]);
+                let (mut tu_, mut tp_, mut ts, mut tdu) = (
+                    tu.clone(),
+                    tp.clone(),
+                    vec![0.0; sd.len()],
+                    vec![0.0; 3 * w],
+                );
+                ir::interpret(
+                    &rows,
+                    &mut [
+                        &mut u_, &mut p_, &mut s_, &mut du, &mut tu_, &mut tp_, &mut ts, &mut tdu,
+                    ],
+                );
+                for (j, (&got, &exp)) in tdu.iter().zip(&want[3]).enumerate() {
+                    if exp.is_nan() {
+                        continue;
+                    }
+                    assert!(
+                        got.is_finite() == exp.is_finite(),
+                        "case {case} {l:?}: output tangent {j}: {got} vs {exp}"
+                    );
+                    if exp.is_finite() {
+                        assert!(got.is_finite() && exp.is_finite());
+                        worst = worst.max((got - exp).abs() / (1.0 + exp.abs()));
+                    }
+                }
+                checked += 1;
+            }
+        }
+    }
+    // Every draw splits, dead-arm masks included (a forward needs none).
+    assert!(
+        checked == 360,
+        "the fixture must exercise the split: {checked} seeds"
+    );
+    eprintln!("tangent rows vs forward oracle: worst {worst:e} over {checked} seeds");
+    assert!(worst < 1e-12, "worst relative difference {worst:e}");
+}
+
 /// Forward-over-reverse (`ir::tangent` of `ir::reverse`) is the Hessian of `ū·f` applied
 /// to a direction. The oracle derives the same entries a second way, forward-over-forward
 /// (`ir::tangent` twice, which never runs the reverse pass): `∂²(ū·f)/∂uᵢ∂u_j` from a pair
@@ -534,7 +641,7 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
         let du_bar: Vec<f64> = (0..3).map(|_| rng.unit() * 2.0 - 1.0).collect();
         let zeros = |n: usize| vec![0.0; n];
         // `ir::tangent` against the tangent interpreter, two directions at once.
-        let t2 = ir::tangent(&fwd, 2);
+        let t2 = ir::tangent(&fwd, 2, 0).0;
         let mut dirs: Vec<Vec<f64>> = [3, n_params, 4, 3].iter().map(|&n| zeros(2 * n)).collect();
         for (a, d) in dirs.iter_mut().enumerate().take(3) {
             for (i, x) in d.iter_mut().enumerate() {
@@ -572,8 +679,8 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
         }
         // Forward-over-reverse: row `i` of `H = ∂²(ū·f)/∂u²`, the tangent of `ū` along `eᵢ`.
         let rev = ir::reverse(&fwd);
-        let fr = ir::tangent(&rev, 1);
-        let ff = ir::tangent(&ir::tangent(&fwd, 1), 1);
+        let fr = ir::tangent(&rev, 1, 0).0;
+        let ff = ir::tangent(&ir::tangent(&fwd, 1, 0).0, 1, 0).0;
         for i in 0..3 {
             let mut bufs: Vec<Vec<f64>> = vec![
                 u.clone(),

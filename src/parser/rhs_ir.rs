@@ -1562,7 +1562,12 @@ pub(super) fn reverse(fwd: &Func) -> Func {
 /// Tangents are kept sparse: a value no input reaches has none, and emits nothing. A dead
 /// arm needs no mask here — its value is only read through the [`Inst::Select`] that chose
 /// it, and the select picks the taken arm's tangent.
-pub(super) fn tangent(f: &Func, k: usize) -> Func {
+///
+/// Also returns how many of its instructions come from `f`'s first `prefix`: the tangent of a
+/// prefix that reads none of `f`'s later arguments reads none of their tangents either, so a
+/// reverse's forward recomputation stays a prefix of its forward over reverse (#2980) — run
+/// once and shared by every seed (`prefix` 0: none).
+pub(super) fn tangent(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
     type Tan = Option<Vec<V>>;
     // `Σ ± scale·tangent`, sparse: `None` when every term is.
     fn lin(b: &mut Func, k: usize, terms: &[(&Tan, Option<V>, bool)]) -> Tan {
@@ -1595,6 +1600,7 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
     let mut b = Func::new(2 * n);
     let mut map = vec![V::MAX; f.insts.len()];
     let mut tan: Vec<Tan> = vec![None; f.insts.len()];
+    let mut emitted = 0;
     for (i, inst) in f.insts.iter().enumerate() {
         b.cur = f.live[i].map(|c| map[c as usize]);
         let fw = |x: V| map[x as usize];
@@ -1777,9 +1783,230 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
             Inst::Select(..) => None,
         };
         tan[i] = new;
+        if i + 1 == prefix {
+            emitted = b.insts.len();
+        }
     }
     b.cur = None;
-    b
+    (b, emitted)
+}
+
+/// An instruction's value operands, as a list (tests).
+#[cfg(test)]
+pub(super) fn value_operands(inst: &Inst) -> Vec<V> {
+    let (o, k) = operands(inst);
+    o[..k].to_vec()
+}
+
+/// An instruction's value operands.
+fn operands(inst: &Inst) -> ([V; 3], usize) {
+    match *inst {
+        Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => ([0; 3], 0),
+        Inst::Neg(x)
+        | Inst::Abs(x)
+        | Inst::Floor(x)
+        | Inst::Ceil(x)
+        | Inst::Call1(_, x)
+        | Inst::StopGrad(x)
+        | Inst::HostArg(x) => ([x, 0, 0], 1),
+        Inst::Store { v, .. } => ([v, 0, 0], 1),
+        Inst::Add(x, y)
+        | Inst::Sub(x, y)
+        | Inst::Mul(x, y)
+        | Inst::Div(x, y)
+        | Inst::Powf(x, y)
+        | Inst::Cmp(_, x, y)
+        | Inst::And(x, y)
+        | Inst::Or(x, y) => ([x, y, 0], 2),
+        Inst::Gamma { a, x, .. } => ([a, x, 0], 2),
+        Inst::Select(c, x, y) => ([c, x, y], 3),
+    }
+}
+
+/// `inst` with each value operand mapped by `m`.
+fn remap(inst: Inst, m: impl Fn(V) -> V) -> Inst {
+    match inst {
+        Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => inst,
+        Inst::Add(x, y) => Inst::Add(m(x), m(y)),
+        Inst::Sub(x, y) => Inst::Sub(m(x), m(y)),
+        Inst::Mul(x, y) => Inst::Mul(m(x), m(y)),
+        Inst::Div(x, y) => Inst::Div(m(x), m(y)),
+        Inst::Neg(x) => Inst::Neg(m(x)),
+        Inst::Abs(x) => Inst::Abs(m(x)),
+        Inst::Floor(x) => Inst::Floor(m(x)),
+        Inst::Ceil(x) => Inst::Ceil(m(x)),
+        Inst::Call1(s, x) => Inst::Call1(s, m(x)),
+        Inst::Powf(x, y) => Inst::Powf(m(x), m(y)),
+        Inst::Gamma { upper, i, j, a, x } => Inst::Gamma {
+            upper,
+            i,
+            j,
+            a: m(a),
+            x: m(x),
+        },
+        Inst::Cmp(c, x, y) => Inst::Cmp(c, m(x), m(y)),
+        Inst::And(x, y) => Inst::And(m(x), m(y)),
+        Inst::Or(x, y) => Inst::Or(m(x), m(y)),
+        Inst::Select(c, x, y) => Inst::Select(m(c), m(x), m(y)),
+        Inst::StopGrad(x) => Inst::StopGrad(m(x)),
+        Inst::HostArg(x) => Inst::HostArg(m(x)),
+        Inst::Store { arg, off, v } => Inst::Store { arg, off, v: m(v) },
+    }
+}
+
+/// `g` with every instruction that reads no per-seed argument (`per_seed(arg)`) first, in
+/// order, then the rest: the prefix a multi-seed call runs once, and the suffix it runs per
+/// seed. Exact: a shared instruction never reads a per-seed one, so every value keeps its
+/// operands before it; a host call's arguments, call and outputs are tied by order rather than
+/// by operand, so a call any of whose arguments is per seed moves whole. The result carries no
+/// dead-arm conditions: they mask a reverse transform's derivatives, and these functions are
+/// only run, never transformed again.
+fn split_per_seed(g: &Func, per_seed: impl Fn(u8) -> bool) -> (Func, usize) {
+    let mut dep = vec![false; g.insts.len()];
+    let mut call_dep = false;
+    let mut after_host = false;
+    for (i, inst) in g.insts.iter().enumerate() {
+        let (ops, k) = operands(inst);
+        let reads = ops[..k].iter().any(|&x| dep[x as usize]);
+        dep[i] = match *inst {
+            Inst::Load { arg, .. } => per_seed(arg),
+            Inst::Store { arg, .. } => reads || per_seed(arg),
+            Inst::HostArg(_) => {
+                if after_host {
+                    call_dep = false;
+                    after_host = false;
+                }
+                call_dep |= reads;
+                reads
+            }
+            Inst::Host(_) => {
+                after_host = true;
+                call_dep
+            }
+            Inst::HostOut(_) => call_dep,
+            _ => reads,
+        };
+    }
+    // A host call's arguments follow its dependence too: a call that moves takes them along.
+    let mut group = false;
+    for i in (0..g.insts.len()).rev() {
+        match g.insts[i] {
+            Inst::Host(_) => group = dep[i],
+            Inst::HostArg(_) if group => dep[i] = true,
+            _ => {}
+        }
+    }
+    let mut out = Func::new(g.n_args);
+    let mut map = vec![V::MAX; g.insts.len()];
+    for pass in [false, true] {
+        for (i, &inst) in g.insts.iter().enumerate() {
+            if dep[i] == pass {
+                map[i] = out.push(remap(inst, |x| map[x as usize]));
+            }
+        }
+    }
+    out.live = vec![None; out.insts.len()];
+    let prefix = dep.iter().filter(|d| !**d).count();
+    (out, prefix)
+}
+
+/// The forward `f` differentiated along one direction, laid out for a multi-seed call
+/// (#2980): the tangent of argument `a` is argument `n + a` at the same offsets ([`tangent`]
+/// at `k = 1`), which the reverse kernels' calling convention binds to a per-seed buffer; and
+/// every instruction that reads no tangent comes first ([`split_per_seed`]). Those — the
+/// primal, its stores included — run once per call; the rest once per seed, each seed's
+/// tangents in its own buffer.
+pub(super) fn tangent_rows(f: &Func) -> Option<(Func, usize)> {
+    let (g, _) = tangent(f, 1, 0);
+    let n = f.n_args;
+    // The literals' tangents (argument `n + 2`) are zeros, so reading them reads no tangent.
+    Some(split_per_seed(&g, |a| a >= n && a != n + 2))
+}
+
+/// The reverse of the forward `f` differentiated along one direction, for a multi-seed call
+/// whose adjoint seed every seed shares (#2980): `tangent(reverse(f), 1)`, its arguments
+/// placed on a doubled slot table — the call's entries, then the same entries a plan's slot
+/// count on — so the shared buffer is `[values | adjoints]` and each seed's
+/// `[values' tangents | adjoints' tangents]`, through the arguments a kernel already binds
+/// (inputs `0`, outputs `3`, a seed's inputs `4` and outputs `7`). `n_in` is the chunk's input
+/// entries, `l` the lanes. The values and adjoints (the forward recomputation and the reverse
+/// seeded with the shared `ū`) run once per call; every tangent once per seed. Returns the
+/// function, its prefix, and the entry count `k` the table's second half starts at: a caller
+/// builds the doubled table from the first `k` entries ([`super::kernel_jit`]).
+pub(super) fn tangent_reverse_rows(
+    f: &Func,
+    n_in: usize,
+    l: usize,
+) -> Option<(Func, usize, usize)> {
+    let n = f.n_args;
+    if n != 4 {
+        return None;
+    }
+    let n_out = f
+        .insts
+        .iter()
+        .filter_map(|i| match *i {
+            Inst::Store { arg: 3, off, .. } => Some(off as usize / l + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let (g, _) = tangent(&reverse(f), 1, 0);
+    // Entry `e`'s copy in the table's second half.
+    let k = (n_in + n_out) as u32;
+    let up = |off: u32| off + k * l as u32;
+    let mut h = Func::new(n);
+    for &inst in &g.insts {
+        let inst = match inst {
+            // Values: the primal (inputs 0, outputs 3, literals 2) unchanged.
+            Inst::Load { arg: 0 | 2, .. } => inst,
+            // Adjoints: the shared buffer's second half.
+            Inst::Load { arg: 4, off } => Inst::Load {
+                arg: 0,
+                off: up(off),
+            },
+            Inst::Load { arg: 7, off } => Inst::Load {
+                arg: 0,
+                off: up(off) + (n_in * l) as u32,
+            },
+            Inst::Store { arg: 4, off, v } => Inst::Store {
+                arg: 3,
+                off: off + (n_out * l) as u32,
+                v,
+            },
+            // The values' tangents: each seed's first half.
+            Inst::Load { arg: 8, off } => Inst::Load { arg: 4, off },
+            Inst::Store { arg: 11, off, v } => Inst::Store { arg: 7, off, v },
+            // The adjoints' tangents: each seed's second half.
+            Inst::Load { arg: 12, off } => Inst::Load {
+                arg: 4,
+                off: up(off),
+            },
+            Inst::Load { arg: 15, off } => Inst::Load {
+                arg: 4,
+                off: up(off) + (n_in * l) as u32,
+            },
+            Inst::Store { arg: 12, off, v } => Inst::Store {
+                arg: 7,
+                off: off + (n_out * l) as u32,
+                v,
+            },
+            // Literals' adjoints and every literal tangent: zeros, never stored (a dropped store
+            // keeps its index, as a constant: nothing reads a store's).
+            Inst::Load {
+                arg: 6 | 10 | 14, ..
+            }
+            | Inst::Store {
+                arg: 6 | 10 | 14, ..
+            } => Inst::Const(0f64.to_bits()),
+            Inst::Load { .. } | Inst::Store { .. } => return None,
+            i => i,
+        };
+        h.insts.push(inst);
+        h.live.push(None);
+    }
+    let (g, prefix) = split_per_seed(&h, |a| a == 4 || a == 7);
+    Some((g, prefix, n_in + n_out))
 }
 
 /// [`tangent`] in `k` directions with the tangents packed into the value arguments: a
@@ -1788,7 +2015,19 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
 /// `i·l(1+k) + l + lane·k + j` (`Layout::tan`). Argument 2 (the literals, indexed by slot
 /// alone) has no tangents: their loads are zeros.
 pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) -> Func {
-    let t = tangent(f, k);
+    tangent_packed_prefix(f, k, l, seed_tangents, 0).0
+}
+
+/// [`tangent_packed`] with [`tangent`]'s count of the instructions `f`'s first `prefix` became
+/// (packing moves locations, never instructions).
+pub(super) fn tangent_packed_prefix(
+    f: &Func,
+    k: usize,
+    l: usize,
+    seed_tangents: bool,
+    prefix: usize,
+) -> (Func, usize) {
+    let (t, emitted) = tangent(f, k, prefix);
     let n = f.n_args;
     let wl = (l * (1 + k)) as u32;
     let (l32, k32) = (l as u32, k as u32);
@@ -1823,7 +2062,7 @@ pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) 
         })
         .collect();
     out.live = t.live.clone();
-    out
+    (out, emitted)
 }
 
 /// Run a [`Func`] in Rust: the reference semantics the native lowering must reproduce, and

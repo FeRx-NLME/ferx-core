@@ -39954,3 +39954,165 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
         );
     }
 }
+
+/// The covariance Hessian's mu fold (#2982) carries a θ on the η lanes only when every route it
+/// takes to the likelihood ends at an exclusive mu line `P = g⁻¹(A(θ) + η)`. One case per rule,
+/// each against the plain model it varies, so a rule dropped from `mu_fold_spec` reddens its own
+/// line: θ read by the right-hand side; an η shared with another line; an η scaled by a θ; a
+/// conditional statement; a covariate θ shared by two lines (still foldable: both are exclusive);
+/// an additive and a covariate-power line.
+#[test]
+fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line() {
+    fn model(params: &str, indiv: &str, rhs: &str) -> CompiledModel {
+        let src = format!(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(40.0, 1.0, 500.0)\n{params}\
+             \n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+             [individual_parameters]\n{indiv}\n[structural_model]\n  ode(states=[central])\n\
+             [odes]\n  d/dt(central) = {rhs}\n[scaling]\n  y = central / V\n\
+             [covariates]\n  WT continuous\n[error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        );
+        parse_model_string(&src).unwrap_or_else(|e| panic!("{e}\n{src}"))
+    }
+    let names = |m: &CompiledModel| -> Vec<String> {
+        let f = &m.indiv_param_partials.mu_fold;
+        f.thetas.iter().map(|&i| m.theta_names[i].clone()).collect()
+    };
+    let plain = "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)";
+    let rhs = "-(CL/V) * central";
+    let m = model("", plain, rhs);
+    assert_eq!(names(&m), ["TVCL", "TVV"], "the plain log-normal model");
+    assert_eq!(m.indiv_param_partials.mu_fold.lines.len(), 2);
+
+    // TVCL also read by the right-hand side (through K2, which the ODE reads): it reaches the
+    // data around CL.
+    let m = model(
+        "",
+        &format!("{plain}\n  K2 = 0.001 * TVCL"),
+        "-(CL/V) * central - K2 * central",
+    );
+    assert_eq!(names(&m), ["TVV"], "θ read by the right-hand side");
+
+    // ETA_CL also on V: neither line is exclusive, so neither θ folds.
+    let m = model(
+        "",
+        "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V + 0.5 * ETA_CL)",
+        rhs,
+    );
+    assert!(
+        !names(&m).contains(&"TVCL".to_string()),
+        "an η read by two lines: {:?}",
+        names(&m)
+    );
+
+    // V's line reads a second η no other line reads: each η has one reader, so only the
+    // one-η rule keeps V's line (and TVV) out.
+    let m = model(
+        "  omega ETA_X ~ 0.01",
+        "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V + ETA_X)",
+        rhs,
+    );
+    assert_eq!(names(&m), ["TVCL"], "a line reading two η");
+
+    // An η scaled by a θ: `exp(TH_S·η)` is not `g⁻¹(A + η)`.
+    let m = model(
+        "  theta TH_S(1.0, 0.1, 10.0)",
+        "  CL = TVCL * exp(TH_S * ETA_CL)\n  V  = TVV  * exp(ETA_V)",
+        rhs,
+    );
+    let n = names(&m);
+    assert!(
+        !n.contains(&"TVCL".to_string()) && !n.contains(&"TH_S".to_string()),
+        "a scaled η: {n:?}"
+    );
+
+    // A conditional statement anywhere: no fold at all.
+    let m = model(
+        "",
+        "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)\n  if (TVV > 1) {\n    Q = 1\n  } else {\n    Q = 2\n  }",
+        rhs,
+    );
+    assert!(
+        names(&m).is_empty(),
+        "a conditional statement: {:?}",
+        names(&m)
+    );
+
+    // A covariate exponent shared by both lines folds: both lines are exclusive, so every
+    // route TH_WT takes ends at one of them.
+    let m = model(
+        "  theta TH_WT(0.75, -3.0, 3.0)",
+        "  CL = TVCL * (WT / 70)^TH_WT * exp(ETA_CL)\n  V  = TVV * (WT / 70)^TH_WT * exp(ETA_V)",
+        rhs,
+    );
+    assert_eq!(
+        names(&m),
+        ["TVCL", "TVV", "TH_WT"],
+        "a shared covariate exponent"
+    );
+    // Per line, the θ that reach it: the pairs whose cross derivative the Hessian forms. TH_WT
+    // reaches both lines, each typical value only its own — a pair left out here would drop a
+    // nonzero `∂²μ/∂θ_i∂θ_j`, one put in costs a program run.
+    let f = &m.indiv_param_partials.mu_fold;
+    let reach: Vec<Vec<&str>> = f
+        .reach
+        .iter()
+        .map(|r| r.iter().map(|&i| m.theta_names[i].as_str()).collect())
+        .collect();
+    assert_eq!(reach, [vec!["TVCL", "TH_WT"], vec!["TVV", "TH_WT"]]);
+
+    // A dose attribute the engine reads by name (#993), with no reader in any other block: a
+    // mu-referenced lag folds its θ; the same θ also read by `F1` does not (code review r2).
+    let lag = "  theta TVLAG(0.5, 0.01, 5.0)\n  omega ETA_LAG ~ 0.1";
+    let m = model(
+        lag,
+        &format!("{plain}\n  ALAG1 = TVLAG * exp(ETA_LAG)"),
+        rhs,
+    );
+    assert_eq!(names(&m), ["TVCL", "TVV", "TVLAG"], "a mu-referenced lag");
+    let m = model(
+        lag,
+        &format!("{plain}\n  ALAG1 = TVLAG * exp(ETA_LAG)\n  F1 = 1 - 0.01 * TVLAG"),
+        rhs,
+    );
+    assert_eq!(
+        names(&m),
+        ["TVCL", "TVV"],
+        "θ also read by a dose attribute"
+    );
+
+    // An additive line (identity link).
+    let m = model("", "  CL = TVCL * exp(ETA_CL)\n  V  = TVV + ETA_V", rhs);
+    assert_eq!(names(&m), ["TVCL", "TVV"], "an additive line");
+}
+
+/// A `[covariate_model]` relation folds exactly as the expression it desugars to (#2980): the
+/// block's text declares its θ, it does not read them, so a block-declared covariate θ must not
+/// count as an outside read. Each form against the other, and the hand form against its own
+/// expectation, so a fold lost on both sides cannot pass as agreement.
+#[test]
+fn a_block_declared_covariate_theta_folds_as_its_hand_written_relation() {
+    let head = "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV1(50.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V1 ~ 0.1\n  sigma PROP ~ 0.1\n";
+    let tail = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V1)\n[error_model]\n  DV ~ proportional(PROP)\n";
+    let hand = format!("{head}  theta THETA_CL_WT(0.6, 0.01, 5.0)\n  theta THETA_CL_CRCL(0.3, 0.01, 5.0)\n  theta THETA_V1_WT(0.9, 0.01, 5.0)\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_CL_WT * (CRCL / 100)^THETA_CL_CRCL * exp(ETA_CL)\n  V1 = TVV1 * (WT / 70)^THETA_V1_WT * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n{tail}");
+    let block = format!("{head}[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n[covariate_model]\n  CL ~ WT   power(center = 70)  => THETA_CL_WT(0.6, 0.01, 5.0)\n  CL ~ CRCL power(center = 100) => THETA_CL_CRCL(0.3, 0.01, 5.0)\n  V1 ~ WT   power(center = 70)  => THETA_V1_WT(0.9, 0.01, 5.0)\n{tail}");
+    let fold = |t: &str| {
+        let m = parse_full_model(t).expect("model must parse").model;
+        let f = &m.indiv_param_partials.mu_fold;
+        (
+            m.theta_names.clone(),
+            f.lines.clone(),
+            f.thetas.clone(),
+            f.reach.clone(),
+        )
+    };
+    let (h, b) = (fold(&hand), fold(&block));
+    assert_eq!(
+        h.0, b.0,
+        "the two forms must name the same θ in the same order"
+    );
+    assert_eq!(h.2, vec![0, 1, 2, 3, 4], "the hand form folds every θ");
+    assert_eq!(
+        h, b,
+        "the block form must fold exactly what the hand form folds"
+    );
+}

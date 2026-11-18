@@ -71,6 +71,17 @@ const MAX_SQUARINGS: u32 = 64;
 /// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
 fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: &mut [bool]) {
     use crate::sens::linsolve::all_finite;
+    // A recording takes the product as one call (#2980): compact code at run time, not the
+    // product written out lane by lane in the plan's kernel. (A failed call fails the recording.)
+    if let Some(c) = T::mat_mul(&x[..n * n], &y[..n * n], n) {
+        match c {
+            Some(c) => out[..n * n].copy_from_slice(&c),
+            // The recorder failed the recording; nothing reads this product, but leave no stale
+            // one behind.
+            None => out[..n * n].fill(T::from_f64(f64::NAN)),
+        }
+        return;
+    }
     // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
     // products to be exactly `±0` (`all_finite`).
     for (k, f) in row_finite.iter_mut().enumerate().take(n) {
@@ -406,6 +417,10 @@ impl<T: PkNum> Expm<T> {
             let (vi, ui) = (self.v[i], self.u[i]);
             q[i] = vi - ui;
             p[i] = vi + ui;
+        }
+        // A recording takes the solve as one call (#2980), as it does the products.
+        if let Some(r) = T::mat_solve(&q[..n * n], &p[..n * n], n) {
+            return r;
         }
         if !lu_factor_in_place_g(q, &mut self.piv, n) {
             return None;
