@@ -218,6 +218,8 @@ struct Rec {
     replay: Option<Arc<Template>>,
     at: usize,
     alts: Arc<Vec<Arc<Template>>>,
+    /// Plan it without keeping a template ([`recorded`]: its family's structure keeps changing).
+    transient: bool,
 }
 
 /// A recording's extent at one point ([`Rec::snapshot`]).
@@ -276,10 +278,8 @@ impl Rec {
                         .find(|o| meets(o) && o.trace.get(..at) == t.trace.get(..at))
                         .cloned();
                     if next.is_none() {
-                        self.failed.get_or_insert((
-                            "another structure than its template".into(),
-                            FailScope::Subject,
-                        ));
+                        self.failed
+                            .get_or_insert((TEMPLATE_MISMATCH.into(), FailScope::Subject));
                     }
                     self.replay = next;
                 }
@@ -1436,6 +1436,8 @@ pub(crate) struct Tie {
     raw_marks: Vec<usize>,
     trace: Vec<Step>,
     replayed: Option<Arc<Template>>,
+    /// Keep no template of it ([`Rec::transient`]).
+    transient: bool,
 }
 
 /// Close the recording with `outs` as the outputs, or the reason it cannot be compiled.
@@ -1485,10 +1487,7 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
             && r.code.len() == t.raw.len()
             && r.code.iter().zip(&t.raw).all(|(a, b)| a.same(b));
         if !same {
-            return Err((
-                "another structure than its template".into(),
-                FailScope::Subject,
-            ));
+            return Err((TEMPLATE_MISMATCH.into(), FailScope::Subject));
         }
         return Ok(Recording {
             code: Vec::new(),
@@ -1521,8 +1520,12 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
             raw_marks: r.marks,
             trace: r.trace,
             replayed: None,
+            transient: false,
         },
-        None => Tie::default(),
+        None => Tie {
+            transient: r.transient,
+            ..Tie::default()
+        },
     };
     Ok(Recording {
         code,
@@ -1557,21 +1560,40 @@ pub(crate) fn recorded(
     let off = TEMPLATE_PROBE.with(|p| p.get().0);
     #[cfg(not(test))]
     let off = false;
-    let alts = (!off)
+    let known = (!off)
         .then(|| lock_families().get(family).cloned())
         .flatten();
-    if let Some(alts) = alts.filter(|a| !a.is_empty()) {
+    // A family whose structure keeps changing (an event time that moves with η: a modeled
+    // infusion duration crossing its observations) would keep a template per structure it
+    // meets, and replay against each of them first: recorded afresh, it keeps none.
+    let transient = || {
+        begin();
+        rec(|r| r.transient = true);
+        end(f())
+    };
+    if known.as_ref().is_some_and(|k| k.misses >= UNSTABLE_AFTER) {
+        return transient();
+    }
+    if let Some(alts) = known.map(|k| k.alts).filter(|a| !a.is_empty()) {
         begin();
         rec(|r| {
             r.family = Some(family.clone());
             r.replay = Some(alts[0].clone());
             r.alts = alts;
         });
-        if let Ok(r) = end(f()) {
-            STATS.replayed.fetch_add(1, Relaxed);
-            #[cfg(test)]
-            REPLAYS.with(|c| c.set(c.get() + 1));
-            return Ok(r);
+        match end(f()) {
+            Ok(r) => {
+                STATS.replayed.fetch_add(1, Relaxed);
+                #[cfg(test)]
+                REPLAYS.with(|c| c.set(c.get() + 1));
+                return Ok(r);
+            }
+            Err((why, _)) if why == TEMPLATE_MISMATCH => {
+                if missed(family) {
+                    return transient();
+                }
+            }
+            Err(_) => {}
         }
     }
     begin();
@@ -1579,9 +1601,52 @@ pub(crate) fn recorded(
     end(f())
 }
 
+/// Count a replay of `family` that met another structure; at the [`UNSTABLE_AFTER`]th, release
+/// the templates it kept — from its replay list and from the template map, where nothing but
+/// another family's list holds them now — and answer `true`: from here it keeps none. A
+/// template is a cache, so dropping it costs a later recording a plan, never a value.
+fn missed(family: &SubjectKey) -> bool {
+    let alts = {
+        let mut m = lock_families();
+        let Some(k) = m.get_mut(family) else {
+            return false;
+        };
+        k.misses += 1;
+        if k.misses < UNSTABLE_AFTER {
+            return false;
+        }
+        std::mem::take(&mut k.alts)
+    };
+    if !alts.is_empty() {
+        let mut t = templates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.retain(|_, v| {
+            v.retain(|o| !alts.iter().any(|a| Arc::ptr_eq(a, o)));
+            !v.is_empty()
+        });
+    }
+    true
+}
+
 /// Per family of plans ([`SubjectKey::family`]), the templates its recordings were planned
-/// from, the latest first: what [`recorded`] replays.
-type Families = HashMap<SubjectKey, Arc<Vec<Arc<Template>>>, FxBuild>;
+/// from, the latest first and at most [`MAX_VARIANTS`] of them: what [`recorded`] replays.
+type Families = HashMap<SubjectKey, Family, FxBuild>;
+
+/// A family's templates ([`Families`]), and how many of its replays met another structure.
+#[derive(Clone, Default)]
+struct Family {
+    alts: Arc<Vec<Arc<Template>>>,
+    misses: u32,
+}
+
+/// Why a replay ended: the recording took a decision its templates did not ([`recorded`]
+/// counts these per family).
+const TEMPLATE_MISMATCH: &str = "another structure than its template";
+
+/// A family's mismatched replays past which [`recorded`] records it afresh and keeps no
+/// template: every structure it met would otherwise stay kept, a few MB each, for the fit.
+pub(crate) const UNSTABLE_AFTER: u32 = 2;
 fn lock_families() -> std::sync::MutexGuard<'static, Families> {
     static F: OnceLock<Mutex<Families>> = OnceLock::new();
     F.get_or_init(Default::default)
@@ -4981,6 +5046,7 @@ impl Recording {
             return Some(self.serve(&t.plan, &t.src));
         }
         let family = self.tie.family.take();
+        let transient = self.tie.transient;
         let owner = family.as_ref().map(|f| (f.scope, f.model));
         let key = self.shape(layout, n_eta, n_theta);
         let lock = || {
@@ -5008,10 +5074,11 @@ impl Recording {
             if let Some(f) = family.as_ref().filter(|_| !t.raw.is_empty()) {
                 let mut m = lock_families();
                 let e = m.entry(f.clone()).or_default();
-                if !e.first().is_some_and(|o| Arc::ptr_eq(o, t)) {
+                if !e.alts.first().is_some_and(|o| Arc::ptr_eq(o, t)) {
                     let mut v: Vec<Arc<Template>> = vec![t.clone()];
-                    v.extend(e.iter().filter(|o| !Arc::ptr_eq(o, t)).cloned());
-                    *e = Arc::new(v);
+                    v.extend(e.alts.iter().filter(|o| !Arc::ptr_eq(o, t)).cloned());
+                    v.truncate(MAX_VARIANTS);
+                    e.alts = Arc::new(v);
                 }
             }
         };
@@ -5022,7 +5089,7 @@ impl Recording {
         }
         let (tplan, src) = self.plan_fresh(layout, n_eta, n_theta)?;
         let plan = self.serve(&tplan, &src);
-        if off {
+        if off || transient {
             return Some(plan);
         }
         // The template keeps the structure, not the values.
@@ -5046,6 +5113,10 @@ impl Recording {
         let t = match v.iter().find(|o| t.rec.fits(o, layout, n_eta, n_theta)) {
             Some(o) => o.clone(),
             None => {
+                // The oldest leaves first: a structure met once and never again goes.
+                if v.len() >= MAX_VARIANTS {
+                    v.remove(0);
+                }
                 let t = Arc::new(t);
                 v.push(t.clone());
                 t
