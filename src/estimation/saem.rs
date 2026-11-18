@@ -139,6 +139,17 @@ pub(crate) fn mstep_budget(
 /// the work.
 pub(crate) const MSTEP_FTOL_REL: f64 = 1e-7;
 
+/// Absolute objective tolerance of the numerical θ/σ M-step: the same number as
+/// [`MSTEP_FTOL_REL`], so the stopping rule is NLopt's `|Δf| < ftol_abs ∨ |Δf| < ftol_rel ·
+/// mean(|f|, |f'|)` — relative to the objective's size, with a floor where the objective is
+/// near zero or crosses it (a Gaussian NLL with a small σ can), where a purely relative
+/// tolerance collapses to nothing and the solve never stops on it. BOBYQA reads it from NLopt
+/// (`set_ftol_abs`) and Newton applies the same rule ([`ftol_threshold`]), so both
+/// optimizers of one M-step stop on one criterion.
+///
+/// [`ftol_threshold`]: crate::estimation::mstep_newton::ftol_threshold
+pub(crate) const MSTEP_FTOL_ABS: f64 = MSTEP_FTOL_REL;
+
 /// Relative objective tolerance of the numerical θ/σ M-step **under a mixture
 /// model** — the pre-#1415 value, kept deliberately, together with NLopt's
 /// default first design (no `set_initial_step`).
@@ -2539,12 +2550,21 @@ pub(crate) fn newton_scope_gap(model: &CompiledModel, is_mixture: bool) -> Optio
 /// That warning is for a solve with a θ to score: `theta_free` is whether the numerical
 /// M-steps have any θ the closed-form steps do not own (a σ-only solve's score is the exact σ
 /// score whatever the adjoint's scope).
+///
+/// `sigma_only_bobyqa` is where `auto` keeps `bobyqa` for a solve with no free θ: SAEM's, whose
+/// σ-only BOBYQA evaluations are *all* served by the prediction memo (one prediction pass per
+/// M-step, then residual arithmetic), so Newton's fused pass — a recording and its sweep — is
+/// extra work for no fewer evaluations (0–5% more instructions measured on the σ-only SAEM
+/// set). IMP/IMPMAP pass `false`: there BOBYQA keeps no memo (it is `subjects × K × n_obs`
+/// numbers at `imp_samples` per subject) and recomputes every σ-only evaluation, so Newton's
+/// memo is the gain (σ-only Newton is 0.39–0.54× BOBYQA's instructions).
 pub(crate) fn resolve_mstep_optimizer(
     model: &CompiledModel,
     requested: MstepOptimizer,
     score_sa_active: bool,
     is_mixture: bool,
     theta_free: bool,
+    sigma_only_bobyqa: bool,
     label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     resolve_mstep_optimizer_for(
@@ -2553,6 +2573,7 @@ pub(crate) fn resolve_mstep_optimizer(
         crate::sens::ode_provider::adjoint::recorder_in_scope(model),
         newton_scope_gap(model, is_mixture),
         theta_free,
+        sigma_only_bobyqa,
         label,
     )
 }
@@ -2572,6 +2593,7 @@ fn resolve_mstep_optimizer_for(
     exact_theta_score: bool,
     newton_gap: Option<&str>,
     theta_free: bool,
+    sigma_only_bobyqa: bool,
     label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     if optimizer == MstepOptimizer::Bobyqa {
@@ -2579,9 +2601,10 @@ fn resolve_mstep_optimizer_for(
     }
     if optimizer == MstepOptimizer::Auto {
         // The documented rule, applied silently: Newton wherever its scope holds. Under
-        // `score_sa` there is no numerical solve to choose for.
+        // `score_sa` there is no numerical solve to choose for, and where BOBYQA's σ-only
+        // evaluations are memo-served (`sigma_only_bobyqa`) a solve with no θ has none to gain.
         return (
-            if score_sa_active || newton_gap.is_some() {
+            if score_sa_active || newton_gap.is_some() || (sigma_only_bobyqa && !theta_free) {
                 MstepOptimizer::Bobyqa
             } else {
                 MstepOptimizer::Newton
@@ -3020,7 +3043,12 @@ fn theta_sigma_mstep_light(
             return (xn[..n_theta].to_vec(), xn[n_theta..].to_vec());
         }
         // BOBYQA continues from where Newton stopped (its start when it took no step), with
-        // what is left of the M-step's budget.
+        // what is left of the M-step's budget. It evaluates every point once, so a memo
+        // that follows θ is retired, and one that holds a pinned θ is re-keyed on the
+        // continuation's own packing of it (`PredMemo::continue_with_bobyqa`).
+        if let Some(m) = pred_memo.as_ref() {
+            m.continue_with_bobyqa();
+        }
         x.copy_from_slice(&xn);
         remaining = budget.saturating_sub(solve.evals);
         if remaining == 0 {
@@ -3077,6 +3105,9 @@ fn theta_sigma_mstep_light(
         MSTEP_FTOL_REL
     })
     .unwrap();
+    if mix_mstep.is_none() {
+        opt.set_ftol_abs(MSTEP_FTOL_ABS).unwrap();
+    }
     // A gradient method has no first design to localise: it starts from the current point
     // along the steepest-descent direction.
     if mix_mstep.is_none() && mstep_optimizer != MstepOptimizer::Lbfgs {
@@ -5672,6 +5703,7 @@ pub fn run_saem(
         use_score_sa,
         saem_mix.is_some(),
         mstep_has_free_theta(n_theta, &init_params.theta_fixed, &closed_form_owned),
+        true,
         "SAEM",
     );
     warnings.extend(mstep_optimizer_warning);

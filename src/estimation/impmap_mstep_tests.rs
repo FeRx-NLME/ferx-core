@@ -1118,8 +1118,10 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
             None,
         )
     };
+    let handovers = std::cell::Cell::new(0u32);
     let solve = |from: &[f64], optimizer, passes: Option<u32>, maxeval: u32| {
         MSTEP_ROUTE.with(|c| c.set([0; 3]));
+        handovers.set(0);
         FUSED_PASSES_ALLOWED.set(passes);
         let f: &dyn Fn(&[f64]) -> Option<ValueGradInfo> = &fused;
         let step = solve_weighted_mstep(
@@ -1131,6 +1133,7 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
             maxeval,
             optimizer,
             (optimizer == Newton).then_some(f),
+            &|| handovers.set(handovers.get() + 1),
             None,
         );
         FUSED_PASSES_ALLOWED.set(None);
@@ -1142,10 +1145,21 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
     // Converged: Newton's own answer, and not BOBYQA's.
     let (route, newton) = solve(&x0, Newton, None, budget);
     assert_eq!(route, [0, 0, 1]);
+    assert_eq!(handovers.get(), 0, "no continuation, no hand-over");
     // Declined at the start (no fused pass): BOBYQA from `x0`, exactly, with the whole budget
     // (a declined pass spent none).
     let (route, declined) = solve(&x0, Newton, Some(0), budget);
+    assert_eq!(
+        handovers.get(),
+        1,
+        "the memo is told BOBYQA takes over, once"
+    );
     let (_, bobyqa0) = solve(&x0, Bobyqa, None, budget);
+    assert_eq!(
+        handovers.get(),
+        0,
+        "an explicit bobyqa solve is not a hand-over"
+    );
     assert_eq!(route, [1, 0, 0]);
     assert_eq!(packed(&declined), packed(&bobyqa0));
     assert!(
@@ -1173,6 +1187,7 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
         "fixture: Newton spent {spent} of {budget}"
     );
     let (route, stalled) = solve(&x0, Newton, Some(1), budget);
+    assert_eq!(handovers.get(), 1, "a stall after one step hands over too");
     let (_, bobyqa1) = solve(&x1, Bobyqa, None, budget - spent);
     assert_eq!(route, [1, 0, 0]);
     assert_eq!(

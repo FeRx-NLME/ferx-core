@@ -397,7 +397,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
     n_sigma: usize,
     pk_scratch: &mut crate::pk::EventPkParams,
 ) -> (f64, Vec<f64>) {
-    let (nll, grad, _) = obs_nll_subject_grad_iov_impl(
+    let (nll, grad, _) = obs_nll_subject_score_iov(
         model,
         subject,
         theta,
@@ -417,90 +417,18 @@ pub(crate) fn obs_nll_subject_grad_iov(
     (nll, grad)
 }
 
-/// The IOV score for the M-step solves: [`obs_nll_subject_grad_iov`] /
-/// [`obs_nll_subject_grad_iov_fisher`] by `want_fisher`, with the predictions served from a
-/// [`MemoSlot`] where it holds them for this `θ`, and computed with the subject's cached
-/// [`EventSchedule`](crate::pk::event_driven::EventSchedule) — the predictor the value objective
-/// ([`obs_nll_subject_into_iov_memo`]) uses, so one memo slot holds the same numbers whichever
-/// of the two filled it.
+/// The IOV score for the M-step solves, and the one body behind [`obs_nll_subject_grad_iov`]:
+/// `(nll, grad, info)` of the observation NLL over `[log θ | log σ]` at fixed `η` and `κ`.
+/// With `want_fisher` the expected information of the same objective comes with it, as
+/// [`obs_nll_subject_grad_fisher`] has it for the non-IOV score: `None` for the information (the
+/// gradient still exact) outside the Gaussian scope its closed form needs, or when the adjoint
+/// declined and the θ score is a forward difference with no per-observation rows. The
+/// predictions are served from a [`MemoSlot`] where it holds them for this `θ`, and computed
+/// with the subject's cached [`EventSchedule`](crate::pk::event_driven::EventSchedule) — the
+/// predictor the value objective ([`obs_nll_subject_into_iov_memo`]) uses, so one memo slot
+/// holds the same numbers whichever of the two filled it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_score_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut crate::pk::EventPkParams,
-    want_fisher: bool,
-    memo: Option<MemoSlot<'_>>,
-    schedule: Option<&crate::pk::event_driven::EventSchedule>,
-) -> (f64, Vec<f64>, Option<Vec<f64>>) {
-    obs_nll_subject_grad_iov_impl(
-        model,
-        subject,
-        theta,
-        sigma_values,
-        eta,
-        kappas,
-        theta_packs_log_mask,
-        lower,
-        upper,
-        n_theta,
-        n_sigma,
-        pk_scratch,
-        want_fisher,
-        memo,
-        schedule,
-    )
-}
-
-/// [`obs_nll_subject_grad_iov`] plus the expected information of the same objective, as
-/// [`obs_nll_subject_grad_fisher`] has it for the non-IOV score: `None` for the information
-/// (the gradient still exact) outside the Gaussian scope its closed form needs, or when the
-/// adjoint declined and the θ score is a forward difference with no per-observation rows.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn obs_nll_subject_grad_iov_fisher(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    pk_scratch: &mut crate::pk::EventPkParams,
-) -> (f64, Vec<f64>, Option<Vec<f64>>) {
-    obs_nll_subject_grad_iov_impl(
-        model,
-        subject,
-        theta,
-        sigma_values,
-        eta,
-        kappas,
-        theta_packs_log_mask,
-        lower,
-        upper,
-        n_theta,
-        n_sigma,
-        pk_scratch,
-        true,
-        None,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn obs_nll_subject_grad_iov_impl(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],

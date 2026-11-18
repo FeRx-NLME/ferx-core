@@ -1546,7 +1546,7 @@ fn lbfgs_mstep_at_the_production_budget_captures_the_converged_gain() {
 fn the_lbfgs_advisory_names_its_cause() {
     use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
     let advisory =
-        |o, sa, exact, label| resolve_mstep_optimizer_for(o, sa, exact, None, true, label).1;
+        |o, sa, exact, label| resolve_mstep_optimizer_for(o, sa, exact, None, true, false, label).1;
     assert!(advisory(Bobyqa, false, false, "SAEM").is_none());
     assert!(advisory(Bobyqa, true, false, "SAEM").is_none());
     assert!(advisory(Lbfgs, false, true, "SAEM").is_none());
@@ -1563,7 +1563,7 @@ fn the_lbfgs_advisory_names_its_cause() {
     );
     // The production wrapper reads the adjoint's scope: an analytic two-compartment model is in it.
     let model = no_eta_theta_model();
-    let prod = |sa| resolve_mstep_optimizer(&model, Lbfgs, sa, false, true, "SAEM");
+    let prod = |sa| resolve_mstep_optimizer(&model, Lbfgs, sa, false, true, false, "SAEM");
     assert_eq!(prod(false), (Lbfgs, None));
     assert!(prod(true).1.is_some());
 }
@@ -1754,7 +1754,8 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     ] {
         let gap = newton_scope_gap(model, mixture).unwrap_or_else(|| panic!("{label}: no gap"));
         assert!(gap.contains(reasons[want]), "{label}: {gap}");
-        let (opt, warning) = resolve_mstep_optimizer(model, Newton, false, mixture, true, "IMP");
+        let (opt, warning) =
+            resolve_mstep_optimizer(model, Newton, false, mixture, true, false, "IMP");
         let w = warning.unwrap_or_else(|| panic!("{label}: silent"));
         assert_eq!(opt, Bobyqa, "{label}");
         assert!(
@@ -1775,14 +1776,14 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     // Inside it — a closed form, IOV (the adjoint records the stacked `[η | κ]`), FREM — newton
     // is the optimizer, with no warning.
     assert_eq!(
-        resolve_mstep_optimizer(&plain, Newton, false, false, true, "SAEM"),
+        resolve_mstep_optimizer(&plain, Newton, false, false, true, false, "SAEM"),
         (Newton, None)
     );
     assert_eq!(newton_scope_gap(&iov_model(), false), None);
     assert_eq!(newton_scope_gap(&frem_model(), false), None);
     // `score_sa` replaces the numerical solve: the option has nothing to act on, and says that
     // (not a scope reason).
-    let (opt, w) = resolve_mstep_optimizer(&plain, Newton, true, false, true, "SAEM");
+    let (opt, w) = resolve_mstep_optimizer(&plain, Newton, true, false, true, false, "SAEM");
     let w = w.expect("score_sa");
     assert!(
         opt == Bobyqa
@@ -1793,7 +1794,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     );
     // Bobyqa and lbfgs are not Newton's to change.
     assert_eq!(
-        resolve_mstep_optimizer(&m3, Bobyqa, false, true, true, "SAEM"),
+        resolve_mstep_optimizer(&m3, Bobyqa, false, true, true, false, "SAEM"),
         (Bobyqa, None)
     );
     assert_eq!(
@@ -1803,6 +1804,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
             false,
             true,
             true,
+            false,
             "SAEM"
         )
         .0,
@@ -1841,7 +1843,7 @@ fn auto_is_newton_inside_the_scope_and_silent_bobyqa_outside() {
         ("score_sa", &plain, true, false, Bobyqa),
     ] {
         assert_eq!(
-            resolve_mstep_optimizer(model, Auto, sa, mixture, true, "SAEM"),
+            resolve_mstep_optimizer(model, Auto, sa, mixture, true, false, "SAEM"),
             (want, None),
             "{label}"
         );
@@ -1853,7 +1855,7 @@ fn auto_is_newton_inside_the_scope_and_silent_bobyqa_outside() {
     }
     // The explicit request out of scope still says why.
     assert!(
-        resolve_mstep_optimizer(&m3, Newton, false, false, true, "SAEM")
+        resolve_mstep_optimizer(&m3, Newton, false, false, true, false, "SAEM")
             .1
             .is_some()
     );
@@ -2212,7 +2214,7 @@ fn the_lbfgs_advisory_needs_a_theta_for_the_solve_to_differentiate() {
 fn the_lbfgs_advisory_gate_and_the_free_theta_predicate() {
     use crate::types::MstepOptimizer::Lbfgs;
     let advisory =
-        |exact, free| resolve_mstep_optimizer_for(Lbfgs, false, exact, None, free, "IMP").1;
+        |exact, free| resolve_mstep_optimizer_for(Lbfgs, false, exact, None, free, false, "IMP").1;
     assert!(advisory(false, true).is_some());
     assert!(
         advisory(false, false).is_none(),
@@ -2276,4 +2278,247 @@ fn the_memoised_value_path_is_obs_nll_sum_bit_for_bit() {
     // A pinned-θ memo holds the first θ: a different one is declined, not served from.
     let fixed = PredMemo::for_solve(vec![2usize; n], false, false).unwrap();
     assert!(fixed.begin(&th).is_some() && fixed.begin(&th2).is_none());
+}
+
+/// The optimizer's `scale_params` packing returns a pinned coordinate bit for bit: the scale
+/// is taken from the coordinate itself (`|v|`, or 1 below 0.1), so `(v / scale) · scale` is `v`
+/// exactly — `±1 · |v|`, or `v / 1 · 1`. That is what lets a σ-only (pinned-θ) memo, whose θ key
+/// is compared bit for bit, keep serving a BOBYQA continuation that evaluates at the scaled
+/// packing's `xs · scale` after a Newton solve evaluated at `x`. If the scale rule changes to
+/// anything that is not the coordinate's own magnitude this fails, and the memo needs a re-key
+/// at the hand-over.
+#[test]
+fn the_scaled_packing_returns_a_pinned_coordinate_bit_for_bit() {
+    let mut st = 0x1_0001_u64;
+    let mut values: Vec<f64> = vec![
+        0.0,
+        0.1,
+        -0.1,
+        0.1 + 1e-17,
+        1.0,
+        -1.0,
+        2.0f64.ln(),
+        400.0f64.ln(),
+    ];
+    values.extend((0..2000).map(|_| 12.0 * lcg(&mut st)));
+    values.extend((0..2000).map(|_| 0.2 * lcg(&mut st)));
+    for v in values {
+        let scale = crate::estimation::parameterization::compute_scale(&[v])[0];
+        assert_eq!(((v / scale) * scale).to_bits(), v.to_bits(), "v = {v:e}");
+    }
+}
+
+/// What the prediction memo does after a Newton solve stalls and BOBYQA takes over. A solve
+/// with every θ pinned (σ-only) keeps serving — under `scale_params`, whose packing is
+/// bit-exact for a pinned coordinate (above) — and declines none of the continuation's
+/// evaluations; a solve with free θ has retired its tracking memo (BOBYQA evaluates each point
+/// once, so every evaluation would only copy predictions in): the memo took part in Newton's
+/// evaluations and in none of the continuation's.
+#[test]
+fn a_stalled_newton_mstep_keeps_a_pinned_theta_memo_and_retires_a_tracking_one() {
+    use crate::estimation::mstep_newton::FUSED_PASSES_ALLOWED;
+    use crate::estimation::pred_memo::LAST_SOLVE;
+    use crate::estimation::saem::MSTEP_EVALS;
+    use crate::types::MstepOptimizer::Newton;
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let draws = eta_draws();
+    let run = |pinned: bool, scale_params: bool| {
+        let mut p = packed_start();
+        if pinned {
+            p.theta_lower = p.log_theta.clone();
+            p.theta_upper = p.log_theta.clone();
+        }
+        MSTEP_ROUTE.with(|c| c.set([0; 3]));
+        MSTEP_EVALS.with(|c| c.set(0));
+        FUSED_PASSES_ALLOWED.set(Some(1));
+        let _ = maximiser_with(
+            &model,
+            &population,
+            &p,
+            &draws[0],
+            &[],
+            Newton,
+            1,
+            scale_params,
+        );
+        FUSED_PASSES_ALLOWED.set(None);
+        assert_eq!(
+            MSTEP_ROUTE.with(|c| c.get()),
+            [1, 0, 0],
+            "premise: Newton stalled"
+        );
+        (MSTEP_EVALS.with(|c| c.get()), LAST_SOLVE.with(|c| c.get()))
+    };
+    for scale_params in [false, true] {
+        let (evals, (opened, declined)) = run(true, scale_params);
+        assert!(
+            evals > 8,
+            "premise: BOBYQA ran after Newton ({evals} evaluations)"
+        );
+        assert_eq!(
+            (opened, declined),
+            (evals, 0),
+            "σ-only, scale_params = {scale_params}: every evaluation of the continuation is served"
+        );
+    }
+    for scale_params in [false, true] {
+        let (evals, (opened, declined)) = run(false, scale_params);
+        assert!(
+            evals > 8,
+            "premise: BOBYQA ran after Newton ({evals} evaluations)"
+        );
+        assert!(
+            opened <= 3 && declined == evals - opened,
+            "free θ, scale_params = {scale_params}: the memo took part in {opened} of {evals} \
+             evaluations (Newton's: a fused pass, a trial's value) and the continuation's \
+             {declined} found it retired"
+        );
+    }
+}
+
+/// `auto` keeps BOBYQA for a SAEM solve with no free θ and Newton for one with — where Newton
+/// is in scope at all — and keeps Newton for IMP/IMPMAP either way (`sigma_only_bobyqa`): the
+/// rule is structural (free θ × who owns the memo), never a size. An explicit `newton` is the
+/// user's, σ-only included, in both. And the fits report it: a SAEM fit with every θ
+/// mu-referenced runs `bobyqa`, an IMP fit of the same model `newton`.
+#[test]
+fn auto_is_bobyqa_for_a_sigma_only_saem_solve_and_newton_for_imp() {
+    use crate::types::MstepOptimizer::{Auto, Bobyqa, Newton};
+    let plain = no_eta_theta_model();
+    for (theta_free, sigma_only_bobyqa, want) in [
+        (true, true, Newton),
+        (true, false, Newton),
+        (false, true, Bobyqa),
+        (false, false, Newton),
+    ] {
+        assert_eq!(
+            resolve_mstep_optimizer(
+                &plain,
+                Auto,
+                false,
+                false,
+                theta_free,
+                sigma_only_bobyqa,
+                "X"
+            ),
+            (want, None),
+            "θ free {theta_free}, σ-only bobyqa {sigma_only_bobyqa}"
+        );
+        assert_eq!(
+            resolve_mstep_optimizer(
+                &plain,
+                Newton,
+                false,
+                false,
+                theta_free,
+                sigma_only_bobyqa,
+                "X"
+            ),
+            (Newton, None),
+            "an explicit newton is the request"
+        );
+    }
+    let pop = declined_ode_population(8);
+    let src = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+               omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma EPS ~ 0.04\n\
+               [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+               [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+               [error_model]\n  DV ~ proportional(EPS)\n";
+    let model = parse_model_string(src).expect("parses");
+    let used = |method| {
+        let mut opts = crate::types::FitOptions::default();
+        opts.method = method;
+        opts.saem_n_exploration = 2;
+        opts.saem_n_convergence = 1;
+        opts.saem_seed = Some(3);
+        opts.imp_iterations = 2;
+        opts.imp_samples = 20;
+        opts.imp_auto = false;
+        opts.imp_seed = Some(3);
+        opts.run_covariance_step = false;
+        crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("fits")
+            .mstep_optimizer_used
+    };
+    assert_eq!(
+        used(crate::types::EstimationMethod::Saem).as_deref(),
+        Some("bobyqa")
+    );
+    assert_eq!(
+        used(crate::types::EstimationMethod::Imp).as_deref(),
+        Some("newton")
+    );
+}
+
+/// The BOBYQA solve stops on NLopt's absolute floor too ([`MSTEP_FTOL_ABS`], the same number as
+/// the relative tolerance): at a zero-residual optimum with a pinned unit σ the objective is
+/// `Σ r²/2 → 0`, and a purely relative tolerance (`1e-7 · mean|f|`) shrinks with it, so the
+/// solve would run on until its trust radius collapses. With the floor it ends at the first
+/// iteration that gains less than `1e-7`: measured 28 evaluations (f = 2e-14) against 194
+/// without it (budget 500); the bound of 60 sits between, 2× over the floored count.
+#[test]
+fn a_bobyqa_mstep_with_a_zero_residual_optimum_stops_on_the_absolute_floor() {
+    use crate::estimation::saem::{mstep_budget, MSTEP_EVALS};
+    use crate::types::MstepOptimizer::Bobyqa;
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.05, 20.0)
+  theta TVV(10.0, 1.0, 200.0)
+  omega ETA_CL ~ 0.09
+  sigma ADD_ERR ~ 1.0 (sd) FIX
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ additive(ADD_ERR)
+",
+    )
+    .expect("fixture parses");
+    let population = no_eta_population(&model, &[1.3, 12.0]);
+    let etas: Vec<Vec<f64>> = etas_true().iter().map(|&e| vec![e]).collect();
+    let p = Packed {
+        log_theta: vec![1.0f64.ln(), 10.0f64.ln()],
+        log_sigma: vec![0.0],
+        theta_lower: vec![0.05f64.ln(), 1.0f64.ln()],
+        theta_upper: vec![20.0f64.ln(), 200.0f64.ln()],
+        sigma_lower: vec![0.0],
+        sigma_upper: vec![0.0],
+        mask: vec![true; 2],
+    };
+    MSTEP_EVALS.with(|c| c.set(0));
+    let got = theta_sigma_mstep_light(
+        &model,
+        &population,
+        &etas,
+        None,
+        &p.log_theta,
+        &p.log_sigma,
+        &p.theta_lower,
+        &p.theta_upper,
+        &p.sigma_lower,
+        &p.sigma_upper,
+        2,
+        1,
+        1,
+        false,
+        &p.mask,
+        None,
+        &[],
+        &[],
+        Bobyqa,
+        None,
+    );
+    let evals = MSTEP_EVALS.with(|c| c.get());
+    let budget = mstep_budget(1, 3, 2, Bobyqa, false);
+    let f = conditional_objective(&model, &population, &etas, &[], &got);
+    eprintln!("zero-residual BOBYQA: {evals} evaluations of {budget}, f = {f:.3e}");
+    assert!(f < 1e-3, "converged to the zero-residual optimum: {f}");
+    assert!(
+        evals < 60,
+        "{evals} evaluations: the absolute floor ends the solve, not the budget {budget}"
+    );
 }

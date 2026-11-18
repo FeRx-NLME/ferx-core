@@ -3146,7 +3146,7 @@ fn a_fully_pinned_theta_block_skips_the_adjoint_and_keeps_the_sigma_score() {
     assert!(g_free[0].abs() > 1e-6 && g_one[1] == g_free[1]);
 }
 
-/// The IOV score's expected information (`obs_nll_subject_grad_iov_fisher`) against the closed
+/// The IOV score's expected information (`obs_nll_subject_score_iov`) against the closed
 /// form of a proportional-error model assembled independently from central differences of
 /// `predict_iov` (`V = σ²f²`, so `dV/df = 2σ²f`, `∂V/∂log σ = 2V`):
 /// the sum of `f_a f_b / V + ½ V_a V_b / V²` over observations, written out below term by
@@ -3200,7 +3200,7 @@ fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
         n_sigma,
         &mut scratch,
     );
-    let (v1, g1, info) = obs_nll_subject_grad_iov_fisher(
+    let (v1, g1, info) = obs_nll_subject_score_iov(
         &model,
         &subject,
         &theta,
@@ -3213,6 +3213,9 @@ fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
         n_theta,
         n_sigma,
         &mut scratch,
+        true,
+        None,
+        None,
     );
     // The objective is the same call; the gradient is the same derivative taken two ways —
     // one reverse sweep seeded with the weights, or (with the information, whose rows it
@@ -3280,7 +3283,7 @@ fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
     }
     // κ must be live: the occasion-2 rows differ from a κ = 0 evaluation, or the stacked
     // adjoint input could be ignored without this test seeing it.
-    let (_, _, flat) = obs_nll_subject_grad_iov_fisher(
+    let (_, _, flat) = obs_nll_subject_score_iov(
         &model,
         &subject,
         &theta,
@@ -3293,6 +3296,9 @@ fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
         n_theta,
         n_sigma,
         &mut scratch,
+        true,
+        None,
+        None,
     );
     let flat = flat.expect("in scope");
     assert!(
@@ -3304,7 +3310,7 @@ fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
     let mut lo_pin = lo.clone();
     lo_pin[1] = 0.0;
     hi_pin[1] = 0.0;
-    let (_, _, pinned) = obs_nll_subject_grad_iov_fisher(
+    let (_, _, pinned) = obs_nll_subject_score_iov(
         &model,
         &subject,
         &theta,
@@ -3317,6 +3323,9 @@ fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
         n_theta,
         n_sigma,
         &mut scratch,
+        true,
+        None,
+        None,
     );
     let pinned = pinned.expect("in scope");
     for b in 0..n {

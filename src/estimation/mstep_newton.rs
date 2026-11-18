@@ -12,9 +12,9 @@
 //! model and more to move it, this takes a handful of fused passes.
 //!
 //! Same problem as the derivative-free solve: same packed space, same bounds, same
-//! evaluation budget, and the same stopping rule — `|Δf| < ftol_rel · |f|`, NLopt's
-//! `ftol_rel`, applied to the *accepted* step and, before taking one, to the decrease the
-//! quadratic model predicts for it.
+//! evaluation budget, and the same stopping rule — NLopt's, `|Δf| < ftol_abs ∨ |Δf| < ftol_rel ·
+//! mean(|f|, |f'|)` ([`ftol_threshold`]), applied to the *accepted* step and, before taking one,
+//! to the decrease the quadratic model predicts for it.
 
 use crate::estimation::saem::fold_nll_grad;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
@@ -78,6 +78,16 @@ pub(crate) fn nlopt_value_and_grad((val, grad): (f64, Vec<f64>), out: &mut [f64]
     }
     finite_grad(out);
     finite_value(val)
+}
+
+/// The decrease below which a step from objective `f_old` to `f_new` is not worth taking, for
+/// the relative tolerance `ftol_rel` (also the absolute one): NLopt's `relstop` with
+/// `ftol_abs = ftol_rel`, `ftol_rel · max(mean(|f_old|, |f_new|), 1)`. The `max` is the absolute
+/// tolerance's floor — where the objective is near zero or passes through it, a purely
+/// relative threshold collapses to nothing and the solve spends its budget on steps that
+/// change nothing it can resolve. BOBYQA gets the same rule from NLopt (`set_ftol_abs`).
+pub(crate) fn ftol_threshold(ftol_rel: f64, f_old: f64, f_new: f64) -> f64 {
+    ftol_rel * (0.5 * (f_old.abs() + f_new.abs())).max(1.0)
 }
 
 /// Armijo sufficient-decrease constant of the backtracking line search (the textbook `1e-4`).
@@ -204,7 +214,18 @@ where
     let mut ridge = 0.0f64;
     let mut stalled = false;
     let mut lost = false;
+    // Whether the objective has confirmed a step of this solve. Until it has, the quadratic
+    // model's prediction alone does not end the solve (see `confirm` below).
+    let mut stepped = false;
     while evals < maxeval {
+        // The model predicts no worthwhile decrease at a start the objective has not yet
+        // vouched for: the solve takes the one undamped Fisher step and lets the objective
+        // decide, as BOBYQA's first design always evaluates. Where the objective is dominated
+        // by a constant the model cannot see — a start at which a subject is scored by the
+        // invalid-variance guard, 1.2e13 of it — the relative tolerance is the constant's, and
+        // the prediction (0.08 there) is far inside it while the objective still has a smooth
+        // part to give. A start that really is converged pays one value pass for it.
+        let mut confirm = false;
         let free: Vec<usize> = (0..n)
             .filter(|&i| {
                 lower[i] < upper[i]
@@ -235,8 +256,11 @@ where
         for _ in 0..MAX_DAMPINGS {
             if let Some(s) = cholesky_solve(&a, m, probe * max_diag, &neg_g) {
                 let predicted = -0.5 * g.iter().zip(&s).map(|(a, b)| a * b).sum::<f64>();
-                if !(predicted > ftol_rel * cur.val.abs()) {
-                    return (NewtonOutcome::Converged, evals);
+                if !(predicted > ftol_threshold(ftol_rel, cur.val, cur.val - predicted)) {
+                    if stepped {
+                        return (NewtonOutcome::Converged, evals);
+                    }
+                    confirm = true;
                 }
                 break;
             }
@@ -260,6 +284,10 @@ where
             for (p, &i) in free.iter().enumerate() {
                 trial[i] = (x[i] + s[p]).clamp(lower[i], upper[i]);
             }
+            if confirm && trial == x {
+                // Stationary to the bit: nothing to confirm.
+                return (NewtonOutcome::Converged, evals);
+            }
             let slope: f64 = (0..n).map(|i| cur.grad[i] * (trial[i] - x[i])).sum();
             let v = value(&trial);
             evals += 1;
@@ -267,6 +295,11 @@ where
                 accepted = Some((trial, v));
                 damped = ridge > 0.0;
                 break;
+            }
+            if confirm {
+                // The model predicted no gain and the objective agrees (the step is no
+                // decrease): converged where it started.
+                return (NewtonOutcome::Converged, evals);
             }
             ridge = (ridge * 10.0).max(RIDGE_FLOOR);
         }
@@ -288,11 +321,12 @@ where
             ridge * 0.1
         };
         let decrease = cur.val - v;
+        stepped = true;
         x.copy_from_slice(&trial);
         // Inside the tolerance on a plain Fisher step: this is the answer, and its
         // derivatives are not needed. A damped step's small decrease says how short the step
         // was, not how little is left; the undamped test at the next point decides.
-        if !damped && decrease < ftol_rel * v.abs() {
+        if !damped && decrease < ftol_threshold(ftol_rel, cur.val, v) {
             break;
         }
         // Another step from here needs the derivatives at the accepted point — and the budget
@@ -548,6 +582,87 @@ mod tests {
             solve(&mut y, &[-9.0; 2], &[9.0; 2], 100, 1e-9, flat).0,
             Converged
         );
+    }
+
+    /// The tolerance has an absolute floor: where the objective is near zero a purely relative
+    /// threshold (`ftol_rel · |f|`) collapses with it and the solve takes steps it cannot
+    /// resolve until the budget ends. `f = x⁴` (minimum 0) under an information of 10 moves by
+    /// damped steepest descent, a predicted decrease of `0.8x⁶` per step against `f = x⁴`: the
+    /// relative rule is not met before `x ≈ 3.5e-4` (about 1e7 steps), the floored rule at
+    /// `x ≈ 0.07` (about 250). The solve stops on the floor inside a budget the relative rule
+    /// would spend whole.
+    #[test]
+    fn an_objective_near_zero_stops_on_the_absolute_floor() {
+        let quartic = |v: &[f64]| {
+            Some(ValueGradInfo {
+                val: v[0].powi(4),
+                grad: vec![4.0 * v[0].powi(3)],
+                info: vec![10.0],
+            })
+        };
+        let mut x = [1.0];
+        let (out, calls) = solve(&mut x, &[-9.0], &[9.0], 5000, 1e-7, quartic);
+        assert_eq!(out, Converged);
+        assert!(
+            calls < 1500 && x[0].abs() < 0.2,
+            "{calls} passes, x = {x:?}: the floor ends the solve, not the budget"
+        );
+        // The threshold itself: NLopt's `relstop` with `ftol_abs = ftol_rel`.
+        assert_eq!(ftol_threshold(1e-7, 0.0, 0.0), 1e-7);
+        assert_eq!(ftol_threshold(1e-7, 4e3, 2e3), 1e-7 * 3e3);
+        assert_eq!(
+            ftol_threshold(1e-7, -4e3, 2e3),
+            1e-7 * 3e3,
+            "across zero: sizes, not signs"
+        );
+    }
+
+    /// A start the objective has not vouched for is not converged on the model's word alone.
+    /// The objective is `1e13 + ½(x − 3)²`: the constant is all the relative tolerance sees
+    /// (`1e-7 · 1e13 = 1e6` against a predicted decrease of 0.005), the way a start scored by
+    /// the invalid-variance guard is dominated by its 1e13 while the smooth part is small. The
+    /// solve takes its one Fisher step and the objective confirms it (the answer is `x = 3`,
+    /// two passes); a start that already is the optimum is stationary to the bit and costs one;
+    /// and where the objective refuses the step the solve is converged where it started.
+    #[test]
+    fn a_start_the_objective_has_not_vouched_for_takes_one_step() {
+        let plateau = |v: &[f64]| {
+            Some(ValueGradInfo {
+                val: 1e13 + 0.5 * (v[0] - 3.0).powi(2),
+                grad: vec![v[0] - 3.0],
+                info: vec![1.0],
+            })
+        };
+        let mut x = [2.9];
+        let (out, calls) = solve(&mut x, &[-9.0], &[9.0], 100, 1e-7, plateau);
+        assert_eq!(out, Converged);
+        assert_eq!(calls, 2, "fused at the start, one value at the step");
+        assert!((x[0] - 3.0).abs() < 1e-12, "the step was taken: {x:?}");
+        let mut at = [3.0];
+        let (out, calls) = solve(&mut at, &[-9.0], &[9.0], 100, 1e-7, plateau);
+        assert_eq!(
+            (out, calls, at),
+            (Converged, 1, [3.0]),
+            "stationary: nothing to confirm"
+        );
+        // The objective disagrees with the model: the step is uphill, the solve stays put.
+        let mut y = [2.9];
+        let (out, calls) = fisher_scoring(
+            &mut y,
+            &[-9.0],
+            &[9.0],
+            100,
+            1e-7,
+            |v| 1e13 + 1.0 + (v[0] - 2.9).abs(),
+            |_| {
+                Some(ValueGradInfo {
+                    val: 1e13,
+                    grad: vec![1e-3],
+                    info: vec![1.0],
+                })
+            },
+        );
+        assert_eq!((out, calls, y), (Converged, 2, [2.9]));
     }
 
     #[test]

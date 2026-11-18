@@ -33,6 +33,7 @@
 //! holds) only, never under BOBYQA.
 
 use std::ops::{Deref, Range};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// Which evaluations of a solve share predictions (see the module docs).
@@ -42,6 +43,13 @@ pub(crate) enum MemoMode {
     Fixed,
     /// θ is free: the memo follows the latest evaluation's θ.
     Track,
+}
+
+/// Whether two θ are the same *numbers*, bit for bit. `==` would call `-0.0` and `0.0` the same,
+/// and a model that reads the sign of a zero (`1/θ`, `atan2`, `copysign`) predicts differently at
+/// each: the memo must hand back exactly what the predictor returns at *this* θ.
+fn same_bits(a: &[f64], b: &[f64]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// The solve's θ key and its generation (bumped when the key moves).
@@ -55,6 +63,14 @@ thread_local! {
     /// Memos opened on this thread (test builds): what a test reads to see whether a solve
     /// kept predictions at all.
     pub(crate) static OPENED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `(evaluations opened, evaluations declined)` of the memo most recently dropped on this
+    /// thread (test builds): what a solve-level test reads to see how many of a solve's
+    /// evaluations the memo took part in.
+    pub(crate) static LAST_SOLVE: std::cell::Cell<(u32, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// Marks a sample whose predictions are not stored for the current generation.
@@ -78,6 +94,12 @@ pub(crate) struct SubjectPreds {
 /// The predictions of one solve: one buffer per subject, and the solve's θ key.
 pub(crate) struct PredMemo {
     mode: MemoMode,
+    /// Set by [`PredMemo::continue_with_bobyqa`] on a [`MemoMode::Track`] memo: nothing is
+    /// stored from then on.
+    retired: AtomicBool,
+    /// Evaluations opened and declined (test builds), reported on drop to [`LAST_SOLVE`].
+    #[cfg(test)]
+    seen: [std::sync::atomic::AtomicU32; 2],
     key: Mutex<ThetaKey>,
     subjects: Vec<Mutex<SubjectPreds>>,
 }
@@ -101,6 +123,9 @@ impl PredMemo {
         OPENED.with(|c| c.set(c.get() + 1));
         Some(Self {
             mode,
+            retired: AtomicBool::new(false),
+            #[cfg(test)]
+            seen: Default::default(),
             key: Mutex::new(ThetaKey {
                 theta: None,
                 generation: 0,
@@ -129,11 +154,44 @@ impl PredMemo {
         g.start.iter().filter(|&&s| s != NOT_STORED).count()
     }
 
+    /// The solve hands over to a derivative-free optimizer (a Newton solve that stalled).
+    ///
+    /// * [`MemoMode::Track`]: that optimizer evaluates every point once, so the memo can never
+    ///   hit; each evaluation would only pay a copy of every prediction and the clearing of
+    ///   every subject's sample table. The memo is retired — its buffers freed, nothing
+    ///   stored again.
+    /// * [`MemoMode::Fixed`]: kept. The continuation sees the same pinned θ, bit for bit — the
+    ///   optimizer's `scale_params` packing divides a pinned coordinate by a scale taken from
+    ///   that very coordinate (`|x|`, or 1), so `(x / scale) · scale` returns `x` exactly
+    ///   (pinned by `the_scaled_packing_returns_a_pinned_coordinate_bit_for_bit`) — and the
+    ///   memo's remaining evaluations are served as before.
+    pub(crate) fn continue_with_bobyqa(&self) {
+        if self.mode == MemoMode::Track {
+            self.retired.store(true, Ordering::Relaxed);
+            for s in &self.subjects {
+                let mut g = s.lock().unwrap_or_else(|e| e.into_inner());
+                g.start = Vec::new();
+                g.data = Vec::new();
+            }
+        }
+    }
+
     /// Open one evaluation at `theta`: the one place the θ key is read. `None` — evaluate
-    /// without the memo — when this θ is not the one a [`MemoMode::Fixed`] solve holds.
+    /// without the memo — when this θ is not the one a [`MemoMode::Fixed`] solve holds, or
+    /// when the memo is retired ([`PredMemo::continue_with_bobyqa`]).
     pub(crate) fn begin(&self, theta: &[f64]) -> Option<EvalMemo<'_>> {
+        let opened = self.begin_inner(theta);
+        #[cfg(test)]
+        self.seen[usize::from(opened.is_none())].fetch_add(1, Ordering::Relaxed);
+        opened
+    }
+
+    fn begin_inner(&self, theta: &[f64]) -> Option<EvalMemo<'_>> {
+        if self.retired.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut key = self.key.lock().unwrap_or_else(|e| e.into_inner());
-        let same = key.theta.as_deref() == Some(theta);
+        let same = key.theta.as_deref().is_some_and(|k| same_bits(k, theta));
         match (self.mode, same) {
             (_, true) => {}
             (MemoMode::Fixed, false) if key.theta.is_some() => return None,
@@ -146,6 +204,19 @@ impl PredMemo {
             memo: self,
             generation: key.generation,
         })
+    }
+}
+
+#[cfg(test)]
+impl Drop for PredMemo {
+    fn drop(&mut self) {
+        let [opened, declined] = &self.seen;
+        LAST_SOLVE.with(|c| {
+            c.set((
+                opened.load(Ordering::Relaxed),
+                declined.load(Ordering::Relaxed),
+            ))
+        });
     }
 }
 
@@ -223,13 +294,10 @@ pub(crate) fn memoized<'a>(
             // a start can address: not storable.
             return Preds::Owned(preds);
         }
-        if g.data.capacity() == 0 {
-            // Exactly what scoring every sample would take, reserved (not touched) at once:
-            // the buffer then never doubles, so its footprint is the scored samples' and
-            // not up to twice that with a copy of it during each growth.
-            let all = g.start.len() * n_obs;
-            g.data.reserve_exact(all);
-        }
+        // Grown by what is scored, amortised (`Vec`'s doubling): nothing is reserved for the
+        // samples nothing asks for, so a subject whose samples mostly carry a zero importance
+        // weight holds the scored samples' predictions (at most twice that while it grows) and
+        // not `K · n_obs` numbers each.
         g.data.extend_from_slice(&preds);
         g.start[s.sample] = at as u32;
     }
@@ -352,8 +420,8 @@ mod tests {
         assert_eq!(held(), 2 * 3);
         let capacity = memo.subjects[0].lock().unwrap().data.capacity();
         assert!(
-            (1000 * 3..1000 * 3 + 3).contains(&capacity),
-            "reserved once for the sample count, not grown by doubling: {capacity}"
+            capacity < 1000 * 3 / 10,
+            "no room is reserved for the 998 samples nobody scored: {capacity}"
         );
         assert_eq!(
             memoized(Some(ev.slot(0, 700)), || unreachable!()).to_vec(),
@@ -368,5 +436,107 @@ mod tests {
         let moved = memo.begin(&[2.0]).unwrap();
         memoized(Some(moved.slot(0, 5)), || vec![5.0, 5.5, 6.0]);
         assert_eq!(held(), 3);
+    }
+
+    /// The buffer follows the scored samples as they arrive — amortised growth, the footprint
+    /// within twice what is held — and never the sample count: 100 of 10 000 samples scored in
+    /// one subject, with a reallocation count logarithmic in what is held. A reserve of
+    /// `K · n_obs` at the first store (10 000 · 20 numbers per subject) fails the bound at once.
+    #[test]
+    fn the_buffer_grows_with_the_scored_samples_not_the_sample_count() {
+        let (k, n_obs, scored) = (10_000usize, 20usize, 100usize);
+        let memo = PredMemo::for_solve([k], true, true).unwrap();
+        let ev = memo.begin(&[1.0]).unwrap();
+        let (mut reallocations, mut last) = (0u32, 0usize);
+        for (i, sample) in (0..scored).map(|i| i * 97 % k).enumerate() {
+            memoized(Some(ev.slot(0, sample)), || vec![i as f64; n_obs]);
+            let g = memo.subjects[0].lock().unwrap();
+            assert!(
+                g.data.capacity() <= 2 * g.data.len().max(n_obs),
+                "capacity {} holds {} numbers",
+                g.data.capacity(),
+                g.data.len()
+            );
+            if g.data.capacity() != last {
+                last = g.data.capacity();
+                reallocations += 1;
+            }
+        }
+        assert_eq!(memo.scored(0), scored);
+        assert!(
+            reallocations <= 2 * (usize::BITS - (scored * n_obs).leading_zeros()),
+            "{reallocations} reallocations for {} numbers",
+            scored * n_obs
+        );
+    }
+
+    /// The θ key is the numbers' bits: `-0.0` is not `0.0` (a model reading the sign of a zero
+    /// predicts differently at each), in both modes, and an identical θ still hits. `NaN`
+    /// compares equal to itself bit for bit — it is the same key, not a never-hit one.
+    #[test]
+    fn a_negative_zero_is_not_the_theta_a_positive_zero_stored() {
+        for (free, newton) in [(false, false), (true, true)] {
+            let memo = PredMemo::for_solve([1usize], free, newton).unwrap();
+            let calls = std::cell::Cell::new(0u32);
+            let get = |theta: &[f64]| {
+                let ev = memo.begin(theta)?;
+                Some(memoized(Some(ev.slot(0, 0)), || count(&calls, vec![1.0 / theta[0]])).to_vec())
+            };
+            assert_eq!(get(&[0.0]).unwrap(), [f64::INFINITY]);
+            assert_eq!(get(&[0.0]).unwrap(), [f64::INFINITY]);
+            assert_eq!(calls.get(), 1, "the same bits are served");
+            if free {
+                assert_eq!(
+                    get(&[-0.0]).unwrap(),
+                    [f64::NEG_INFINITY],
+                    "Track recomputes"
+                );
+                assert_eq!(calls.get(), 2);
+            } else {
+                assert!(
+                    get(&[-0.0]).is_none(),
+                    "Fixed declines another θ, -0.0 included"
+                );
+                assert_eq!(calls.get(), 1);
+            }
+            let nan = f64::NAN;
+            let before = calls.get();
+            let _ = get(&[nan]);
+            let n_first = calls.get();
+            let _ = get(&[nan]);
+            assert_eq!(calls.get(), n_first, "a NaN θ is its own key");
+            assert!(n_first <= before + 1);
+        }
+    }
+
+    /// The hand-over to a derivative-free continuation. `Track`: retired — nothing served,
+    /// nothing stored, the buffers freed (a continuation never revisits a θ, so a memo left on
+    /// would copy every prediction into it for no hit). `Fixed`: untouched, still serving its
+    /// θ.
+    #[test]
+    fn a_continuation_retires_a_tracking_memo_and_leaves_a_fixed_one() {
+        let track = PredMemo::for_solve([3usize], true, true).unwrap();
+        let ev = track.begin(&[1.0]).unwrap();
+        memoized(Some(ev.slot(0, 1)), || vec![1.0, 2.0]);
+        assert_eq!(track.scored(0), 1);
+        track.continue_with_bobyqa();
+        assert!(track.begin(&[1.0]).is_none(), "retired: never serves");
+        assert!(track.begin(&[2.0]).is_none());
+        {
+            let g = track.subjects[0].lock().unwrap();
+            assert_eq!((g.data.capacity(), g.start.capacity()), (0, 0), "freed");
+        }
+
+        let fixed = PredMemo::for_solve([1usize], false, true).unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let get = |theta: f64| {
+            let ev = fixed.begin(&[theta])?;
+            Some(memoized(Some(ev.slot(0, 0)), || count(&calls, vec![theta])).to_vec())
+        };
+        assert_eq!(get(1.5).unwrap(), [1.5]);
+        fixed.continue_with_bobyqa();
+        assert_eq!(get(1.5).unwrap(), [1.5]);
+        assert_eq!(calls.get(), 1, "still served after the hand-over");
+        assert!(get(2.5).is_none(), "and still pinned to its θ");
     }
 }
