@@ -18146,11 +18146,13 @@ mod guard_stop {
 /// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch on the last
 /// permitted evaluation has been attributed to the guard. On `one_cpt_iv` / SLSQP with the
 /// #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification a spent
-/// budget is final and never reset), a 106-evaluation budget ends inside the latch: NLopt
+/// budget is final and never reset), a budget that ends inside the latch makes NLopt
 /// returns `MaxEvalReached`, the plateau check takes the stop, and the fit is converged with
 /// `eval_budget_spent == false`. The guard-off twin at the same budget runs out on its own
-/// descent: `MaxEvalReached` and `true`. Measured window (macOS arm64): budgets 105–107 all
-/// straddle; 106 sits in its middle. Mutation: fill `eval_budget_spent` from
+/// descent: `MaxEvalReached` and `true`. The budget is found, not fixed (#2901): the window
+/// moves with the build (macOS arm64 105–107, Linux x86_64 107–108), and its top is the
+/// evaluation count of the guarded run left to stop by itself, which latches and then stops
+/// on its tolerance. Mutation: fill `eval_budget_spent` from
 /// `max_eval_reached` as it stood *before* the latch reset → the latched run reads `true`.
 #[test]
 fn eval_budget_spent_is_read_after_the_latch_reset() {
@@ -18161,11 +18163,10 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
     use crate::read_nonmem_csv;
     use std::path::Path;
 
-    const BUDGET: u32 = 106;
     let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
     let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
     let _off = WarmPredictorOff::new();
-    let run = |guard: bool| {
+    let run = |guard: bool, budget: Option<u32>| {
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
             interaction: true,
@@ -18177,7 +18178,7 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
             ..FitOptions::default()
         };
         UNPROFILED_VERIFY_OFF.with(|o| o.set(true));
-        EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(BUDGET)));
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(budget));
         let out = optimize_nlopt_once(
             &model,
             &pop,
@@ -18193,8 +18194,20 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
         UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
         out
     };
-    let (on, on_outcome) = run(true);
-    let (off, off_outcome) = run(false);
+    // Both runs left to stop by themselves, then one evaluation fewer than either took: the
+    // unguarded run is still descending there and the guarded one has latched (asserted
+    // below). On macOS arm64 at 4af057421 both take 123 evaluations, and 119–122 straddle.
+    let (free, free_outcome) = run(true, None);
+    let (free_off, _) = run(false, None);
+    assert!(
+        free_outcome.stagnation_latched,
+        "premise: the guarded run latches, got {:?}",
+        free.optimizer_stop
+    );
+    let evals = free.n_iterations.min(free_off.n_iterations);
+    let budget = Some(u32::try_from(evals - 1).expect("an evaluation count"));
+    let (on, on_outcome) = run(true, budget);
+    let (off, off_outcome) = run(false, budget);
     // The straddle: both runs end on the budget, one inside the latch and one outside it.
     assert!(on_outcome.stagnation_latched, "the guarded run must latch");
     assert!(!off_outcome.stagnation_latched, "guard off never latches");
