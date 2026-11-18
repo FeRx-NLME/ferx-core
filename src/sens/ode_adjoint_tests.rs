@@ -4476,6 +4476,33 @@ fn runtime_declined_subject_is_served_exactly(n_agq: usize) {
             3,
             "n_agq = {n_agq}: without the log every call probes"
         );
+        // The fused outer-loop evaluation (`agq_population_evaluate`, what the NLopt objective
+        // runs) takes the same log: three evaluations of the declined subject ask the probe once.
+        // Mutation: pass `None` for the log there -> the log is never asked, 0 probes.
+        let loop_log = OuterFdDeclineLog::new(1);
+        let anchor = options.hessian_anchor();
+        for _ in 0..3 {
+            crate::estimation::agq::agq_population_evaluate(
+                &one,
+                &population,
+                params,
+                params,
+                &x,
+                &[DVector::from_column_slice(&eta)],
+                &[Vec::new()],
+                &bounds,
+                &options,
+                n_agq,
+                anchor,
+                false,
+                Some(&loop_log),
+            );
+        }
+        assert_eq!(
+            loop_log.structural_probes.load(Relaxed),
+            1,
+            "n_agq = {n_agq}: the fused loop probes once per fit"
+        );
     }
 }
 

@@ -1708,7 +1708,13 @@ fn run_inner_loop_and_nll_prepared(
     predicted_from: Option<crate::estimation::inner_optimizer::PredictedFromAll<'_>>,
     mu_k: Option<&[f64]>,
     // The fused AGQ gradient's inputs, and whether it forms the mode response (#2549).
-    agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds, bool)>,
+    agq_gradient_inputs: Option<(
+        &ModelParameters,
+        &[f64],
+        &PackedBounds,
+        bool,
+        Option<&OuterFdDeclineLog>,
+    )>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
     // What `prev_etas` are ([`PrevEtas`]): converged modes at `params` only on the first
     // evaluation seeded from the flat-theta pre-flight (#2076), an earlier pass's modes on
@@ -1816,38 +1822,42 @@ fn run_inner_loop_and_nll_prepared(
         }
         let n_nodes = options.agq_nodes().expect("AGQ branch");
         let evaluation =
-            agq_gradient_inputs.map(|(template, x, bounds, want_eta_dx)| match schedules {
-                Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
-                    model,
-                    population,
-                    params,
-                    template,
-                    x,
-                    &etas,
-                    &kappas,
-                    bounds,
-                    options,
-                    n_nodes,
-                    options.hessian_anchor(),
-                    cache,
-                    &terminal_work,
-                    want_eta_dx,
-                ),
-                None => crate::estimation::agq::agq_population_evaluate(
-                    model,
-                    population,
-                    params,
-                    template,
-                    x,
-                    &etas,
-                    &kappas,
-                    bounds,
-                    options,
-                    n_nodes,
-                    options.hessian_anchor(),
-                    want_eta_dx,
-                ),
-            });
+            agq_gradient_inputs.map(
+                |(template, x, bounds, want_eta_dx, declines)| match schedules {
+                    Some(cache) => crate::estimation::agq::agq_population_evaluate_with_schedules(
+                        model,
+                        population,
+                        params,
+                        template,
+                        x,
+                        &etas,
+                        &kappas,
+                        bounds,
+                        options,
+                        n_nodes,
+                        options.hessian_anchor(),
+                        cache,
+                        &terminal_work,
+                        want_eta_dx,
+                        declines,
+                    ),
+                    None => crate::estimation::agq::agq_population_evaluate(
+                        model,
+                        population,
+                        params,
+                        template,
+                        x,
+                        &etas,
+                        &kappas,
+                        bounds,
+                        options,
+                        n_nodes,
+                        options.hessian_anchor(),
+                        want_eta_dx,
+                        declines,
+                    ),
+                },
+            );
         let nll = evaluation.as_ref().map_or_else(
             || {
                 crate::estimation::agq::agq_population_nll_prepared(
@@ -7436,6 +7446,7 @@ fn optimize_nlopt_attempt_probed(
                             x.as_slice(),
                             &bounds,
                             warm_predictor,
+                            Some(declines),
                         )),
                         Some(&schedule_cache),
                         prev,
@@ -10726,10 +10737,9 @@ fn subject_fixed_ebe_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> (f64, Vec<f64>) {
-    // The held-EBE score as is: the `log|H̃|` EBE-response term the FOCEI score drops was
-    // once added back here from a closed form (#274/#289), which was identically zero since
-    // #338 Part A and has been removed. A subject whose response matters is reconverged
-    // instead (`declined_salvage_reconverges`).
+    // The held-EBE score as is: it omits the `log|H̃|` EBE-response term. A subject whose
+    // response matters never takes this gradient: a declined subject is served at its
+    // re-solved EBE or reconverged ([`declined_salvage`]).
     crate::estimation::gauss_newton::subject_nll_pop_grad(
         x,
         init_params,
@@ -10748,10 +10758,10 @@ fn subject_fixed_ebe_gradient(
 /// at every parameter point of the fit, rather than the parameter-dependent decline
 /// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
 ///
-/// For such a subject a fixed-EBE gradient would not be an occasional stand-in but the
-/// **only** gradient it ever contributes, and its missing EBE-response term would then bias
-/// every step (on `fluconazole_radboudumc`, before the dense assembly served its paired
-/// rows, L-BFGS stalled at `‖g‖ ≈ 655`, OFV 807.88–810.28 against 738.05; NONMEM 734.64).
+/// For such a subject the exact route can never serve it, so it takes the reconverged
+/// gradient at every evaluation (a fixed-EBE gradient's missing EBE-response term, once the
+/// stand-in, stalled L-BFGS on `fluconazole_radboudumc` at `‖g‖ ≈ 655`, OFV 807.88–810.28
+/// against 738.05; NONMEM 734.64, #1536).
 /// The adjoint's kernel scores dense residual covariances itself, so the one structural
 /// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
@@ -11558,7 +11568,7 @@ pub(crate) struct OuterFdDeclineLog {
     forced: Vec<std::sync::atomic::AtomicBool>,
     /// Test hook: how many times [`Self::is_structural`] ran its probe (a recording).
     #[cfg(test)]
-    structural_probes: AtomicUsize,
+    pub(crate) structural_probes: AtomicUsize,
 }
 
 /// Why the analytic outer gradient declined a subject (#2713). A large fallback share has
@@ -12276,9 +12286,8 @@ fn ad_population_gradient(
     debug_assert_eq!(hms.len(), n_subj);
     debug_assert_eq!(kappas.len(), n_subj);
     let np = x.len();
-    // IOV routes through the reconverged-FD gradient, not here, so the `log|H̃|`
-    // EBE-response term `subject_fixed_ebe_gradient` adds only affects non-IOV
-    // FOCEI gradient steps.
+    // The fixed-EBE score, which omits the `log|H̃|` EBE-response term; IOV routes through the
+    // reconverged-FD gradient, not here.
     let per_subj: Vec<Vec<f64>> = crate::par::map(n_subj, |i| {
         subject_fixed_ebe_gradient(
             x,

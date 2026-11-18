@@ -981,6 +981,7 @@ pub(crate) fn agq_population_evaluate(
     n_nodes: usize,
     anchor: HessianAnchor,
     want_eta_dx: bool,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -997,6 +998,7 @@ pub(crate) fn agq_population_evaluate(
         None,
         None,
         want_eta_dx,
+        declines,
     )
 }
 
@@ -1019,6 +1021,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
     schedules: &[Option<pk::event_driven::EventSchedule>],
     terminal_work: &[TerminalLaplaceWork],
     want_eta_dx: bool,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -1035,6 +1038,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
         Some(schedules),
         Some(terminal_work),
         want_eta_dx,
+        declines,
     )
 }
 
@@ -1055,10 +1059,13 @@ fn agq_population_evaluate_impl(
     terminal_work: Option<&[TerminalLaplaceWork]>,
     // Whether each subject's mode response `dη̂ᵢ/dx` is formed with its score (#2549).
     want_eta_dx: bool,
+    // The fit's decline log: a declined subject's structural probe is asked once per fit.
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, false)
+        .with_declines(declines);
 
     let exact_anchor = matches!(anchor, HessianAnchor::Exact);
     let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> =
@@ -1943,6 +1950,7 @@ mod tests {
                 3,
                 anchor,
                 false,
+                None,
             );
             let terms_only =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
@@ -2547,6 +2555,7 @@ mod tests {
                 3,
                 anchor,
                 false,
+                None,
             );
             let cached_eval = agq_population_evaluate_with_schedules(
                 &model,
@@ -2563,6 +2572,7 @@ mod tests {
                 &schedules,
                 &terminal_work,
                 false,
+                None,
             );
             assert_eq!(uncached_eval.nll.to_bits(), cached_eval.nll.to_bits());
             let (uncached_grad, cached_grad) = (
@@ -2594,6 +2604,7 @@ mod tests {
                     Some(&schedules),
                     None,
                     false,
+                    None,
                 );
                 let reused_one = agq_population_evaluate_impl(
                     &model,
@@ -2610,6 +2621,7 @@ mod tests {
                     Some(&schedules),
                     Some(&terminal_work),
                     false,
+                    None,
                 );
                 assert_eq!(fresh_one.nll.to_bits(), reused_one.nll.to_bits());
                 for (fresh, reused) in fresh_one
