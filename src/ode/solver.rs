@@ -75,41 +75,33 @@ const E7: f64 = -1.0 / 40.0;
 /// before (#603 review #4).
 pub(crate) const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
 
-/// Accepted steps between mid-segment stiffness re-probes under [`OdeMethod::Auto`] (#1080
-/// Part C).
+/// Accepted steps between mid-segment stiffness re-probes under [`OdeMethod::Auto`] (#1080 Part C).
 ///
-/// The a-priori probe reads the Jacobian at a segment's *entry* state, which is the one state
-/// a binding model looks least stiff at: both factors of a `KON · C · R` term can be zero at
-/// dose time and large an hour later. Re-probing along the way is what lets the driver notice,
-/// and the interval is the whole cost/latency trade:
+/// The a-priori probe reads the Jacobian at a segment's *entry* state, the one state a binding
+/// model looks least stiff at (both factors of a `KON · C · R` term can be zero at dose time and
+/// large an hour later). Re-probing along the way lets the driver notice; the interval is the
+/// cost/latency trade:
 ///
-/// * **Cost.** A probe is `n + 1` right-hand-side evaluations plus an `O(n²)` Gershgorin bound
-///   (the eigensolve only runs when that bound cannot rule stiffness out — #1080 Part B), so
-///   it is a fraction of a step. Amortized over 25 accepted steps it is ~1% of the segment,
-///   which is what a long benign segment pays: it is re-probed, the verdict never changes, and
-///   its trajectory is bit-identical to the pinned one. A segment shorter than 25 accepted
-///   steps — a dosing interval with a handful of saves, the overwhelming majority — is never
-///   re-probed at all and pays nothing.
-/// * **Latency.** A segment that has turned stiff takes hundreds to thousands of steps before
-///   it exhausts `max_steps`, so 25 steps of delay is noise against the detection it buys.
+/// * **Cost.** A probe is `n + 1` RHS evaluations plus an `O(n²)` Gershgorin bound (the eigensolve
+///   only runs when that bound cannot rule stiffness out, #1080 Part B): ~1% of the segment
+///   amortized over 25 accepted steps. A long benign segment is re-probed, the verdict never
+///   changes, and its trajectory is bit-identical to the pinned one; a segment shorter than 25
+///   accepted steps (the overwhelming majority) is never re-probed and pays nothing.
+/// * **Latency.** A segment that has turned stiff takes hundreds to thousands of steps before it
+///   exhausts `max_steps`, so 25 steps of delay is noise.
 ///
-/// **The switch is one-way** (#2845): a segment may escalate from the explicit
-/// stepper to a stiff one part-way through, but is never demoted back. Once a segment is on a
-/// stiff stepper it stops being re-probed, so it changes stepper at most once.
-///
-/// Demotion on a single probe reading was what made `auto` carry `rk45`'s error and jitter on
-/// a TMDD model where the stiff steppers are right: the probe read the relaxing tail as
-/// non-stiff, swapped to `rk45`, and integrated the rest of the segment at explicit accuracy —
-/// at a step chosen by a probe counter that runs across segments, so *where* it landed moved
-/// with θ and the objective jittered by a third to a half of the outer optimizer's plateau
-/// window. On that fixture (`ode_reltol = 1e-6`, macOS arm64, as reported on #2845) blocking
-/// only the demotion took the OFV error against a `vern7` reference from -4.7e-3 to -1e-4, the
-/// same as a pinned `rodas4`.
-/// A stiff stepper integrates a non-stiff tail correctly, only at a higher per-step cost, and
-/// the *next* segment is probed afresh at its entry state, so the cost is bounded by one
-/// segment. The one-way rule also replaces the per-segment switch cap #1080 Part C carried
-/// against a trajectory hovering at the threshold: with no way down there is nothing to
-/// oscillate between.
+/// **The switch is one-way** (#2845): a segment may escalate from the explicit stepper to a stiff
+/// one part-way through but is never demoted back, so it changes stepper at most once. Demotion on a
+/// single probe reading made `auto` carry `rk45`'s error and jitter on a TMDD model where the stiff
+/// steppers are right: the probe read the relaxing tail as non-stiff, swapped to `rk45`, and
+/// integrated the rest of the segment at explicit accuracy, at a step chosen by a probe counter that
+/// runs across segments, so *where* it landed moved with θ and the objective jittered by a third to
+/// a half of the outer optimizer's plateau window. On that fixture (`ode_reltol = 1e-6`, macOS
+/// arm64, #2845) blocking only the demotion took the OFV error against a `vern7` reference from
+/// -4.7e-3 to -1e-4, the same as a pinned `rodas4`. A stiff stepper integrates a non-stiff tail
+/// correctly at a higher per-step cost, and the *next* segment is probed afresh, so the cost is
+/// bounded by one segment. The one-way rule also replaces the per-segment switch cap #1080 Part C
+/// carried against a trajectory hovering at the threshold (nothing to oscillate between).
 pub(crate) const AUTO_SWITCH_PROBE_INTERVAL: usize = 25;
 
 /// Dormand-Prince 5(4)'s real-axis stability boundary, used by Hairer's free
@@ -171,41 +163,33 @@ pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 /// Which stepper integrates the `[odes]` block (`[fit_options] ode_method`).
 ///
 /// The default is the explicit [`Rk45`](OdeMethod::Rk45); the three Rosenbrock entries are
-/// **linearly implicit** and exist for stiff systems — fast binding / TMDD-style
-/// quasi-equilibrium, Michaelis-Menten with `Km ≪ C`, long transit chains, QSP cascades —
-/// where an explicit method is stability-limited and grinds down to `min_dt` (visible as
+/// **linearly implicit** and exist for stiff systems (fast binding / TMDD-style quasi-equilibrium,
+/// Michaelis-Menten with `Km ≪ C`, long transit chains, QSP cascades) where an explicit method is
+/// stability-limited and grinds down to `min_dt` (visible as
 /// [`OdeSolverStats::min_step_clamped_steps`]) instead of being accuracy-limited.
 ///
-/// Cost per step differs sharply, so this is not a free upgrade: RK45 takes 6 `f` evaluations
-/// (FSAL), while a Rosenbrock step adds the exact `n × n` Jacobian and `∂f/∂t` (differenced,
-/// `n + 1` extra evaluations, only for a caller's own closure through [`solve_ode`]) plus an
-/// `O(n³)` factorization. On a non-stiff 1–3 compartment model
-/// RK45 stays the faster choice; the Rosenbrock methods win only where stiffness, not
-/// accuracy, is what caps the step.
+/// Cost per step differs sharply: RK45 takes 6 `f` evaluations (FSAL); a Rosenbrock step adds the
+/// exact `n × n` Jacobian and `∂f/∂t` (differenced, `n + 1` extra evaluations, only for a caller's
+/// own closure through [`solve_ode`]) plus an `O(n³)` factorization. On a non-stiff 1-3 compartment
+/// model RK45 stays faster; the Rosenbrock methods win only where stiffness, not accuracy, caps the
+/// step.
 ///
-/// `n` there is the size of the system being integrated, which is **not** always the `[odes]`
-/// state count. A CTMM endpoint integrates the occupancy system `dP/dt = P·Q(t)`
+/// `n` is the size of the system being integrated, **not** always the `[odes]` state count. A CTMM
+/// endpoint integrates the occupancy system `dP/dt = P·Q(t)`
 /// ([`crate::markov::ctmm_inhomogeneous_transition_with_opts`]), whose state is the flattened
-/// `s × s` transition matrix — so an `s`-state chain makes this an `s²`-state integration, and
-/// a Rosenbrock method there builds an `s² × s²` Jacobian per step attempt. That is the right
-/// behaviour for a chain whose transition rates are widely separated (the occupancy solve is
-/// then genuinely stiff, which is why the intensity guard above it already talks about one),
-/// but it is pure overhead for the usual well-scaled chain — so choose `ode_method` on a CTMM
-/// model with the `s²` cost in mind, not the `[odes]` one.
+/// `s × s` transition matrix: an `s`-state chain is an `s²`-state integration and a Rosenbrock method
+/// builds an `s² × s²` Jacobian per step attempt. Right for a chain with widely separated rates (a
+/// genuinely stiff occupancy solve), pure overhead for the usual well-scaled chain, so choose
+/// `ode_method` on a CTMM model with the `s²` cost in mind.
 ///
-/// Honoured by every `saveat` integration — predictions, the FOCE/FOCEI objective,
-/// steady-state equilibration and the analytic-sensitivity walk — dispatched centrally in
-/// `solve_ode_dense` (the sole owner of the f64 stepping loop) and [`solve_ode_g`].
-///
-/// Every method is a full peer: each implements `Stepper` — including its own continuous
-/// extension — and every consumer is written once against that trait. Dense `saveat` saves,
-/// in-step soft sampling (joint PK-TTE cumulative hazard, CTMM occupancy, adaptive-dosing
-/// monitors), event-time root-finding and the analytic-sensitivity path therefore work for
-/// all methods, with no per-method or per-feature wiring, and a method added later inherits
-/// the whole set.
-///
-/// Serialised as its canonical [`as_str`](OdeMethod::as_str) token, the spelling a
-/// `.fitrx` bundle records it under (#1758).
+/// Honoured by every `saveat` integration (predictions, the FOCE/FOCEI objective, steady-state
+/// equilibration, the analytic-sensitivity walk), dispatched centrally in `solve_ode_dense` (the
+/// sole owner of the f64 stepping loop) and [`solve_ode_g`]. Every method is a full peer: each
+/// implements `Stepper`, including its own continuous extension, and every consumer is written once
+/// against that trait, so dense saves, in-step soft sampling (joint PK-TTE cumulative hazard, CTMM
+/// occupancy, adaptive-dosing monitors), event-time root-finding and the analytic-sensitivity path
+/// work for all methods with no per-method wiring. Serialised as its canonical
+/// [`as_str`](OdeMethod::as_str) token, the spelling a `.fitrx` bundle records (#1758).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OdeMethod {
@@ -230,44 +214,39 @@ pub enum OdeMethod {
     /// (`ode_reltol ≤ 1e-8`); at loose ones RK45's cheaper steps win. See
     /// `crate::ode::explicit_rk`.
     Vern7,
-    /// Pick the stepper from the system itself: an a-priori Jacobian eigenvalue probe reads
-    /// `|Re λ|max` at each integration's own initial state and starts a stiff method only
-    /// where the system is genuinely stability-limited, keeping the explicit default
-    /// everywhere else. See [`crate::ode::stiffness`] for what is measured, where, and why an
-    /// unclassifiable system stays explicit.
+    /// Pick the stepper from the system itself: an a-priori Jacobian eigenvalue probe reads `|Re λ|max`
+    /// at each integration's own initial state and starts a stiff method only where the system is
+    /// stability-limited, keeping the explicit default elsewhere. See [`crate::ode::stiffness`] for what
+    /// is measured, where, and why an unclassifiable system stays explicit.
     ///
-    /// This is the *starting* decision for each integrated segment. By default,
-    /// [`OdeSolverOptions::auto_switch`] re-probes periodically and may replace the active
-    /// stepper between accepted steps while retaining the state integrated so far. Disable
-    /// that option to keep the starting method fixed for the duration of the segment. Both
-    /// modes preserve the guarantees the other variants carry (dense output, event
-    /// root-finding, `Dual2` sensitivities).
+    /// This is the *starting* decision for each integrated segment. By default
+    /// [`OdeSolverOptions::auto_switch`] re-probes periodically and may replace the active stepper
+    /// between accepted steps while retaining the state integrated so far; disabling it keeps the
+    /// starting method fixed for the segment. Both modes preserve dense output, event root-finding and
+    /// `Dual2` sensitivities.
     ///
-    /// **The default.** A model that names no `ode_method` is probed, which is the right
-    /// behaviour for the same reason the feature exists: whether a system is stiff is a
-    /// property of the equations, and a user who has to know the answer in advance to get a
-    /// tractable fit is being asked the wrong question. Every model that is *not* stiff keeps
-    /// [`Rk45`](OdeMethod::Rk45) and pays one Jacobian per segment for the privilege; every
-    /// model that is stiff stops being stability-limited without anyone having to notice.
+    /// **The default.** Whether a system is stiff is a property of the equations, and a user who must
+    /// know the answer in advance to get a tractable fit is being asked the wrong question. Every
+    /// non-stiff model keeps [`Rk45`](OdeMethod::Rk45) and pays one Jacobian per segment; every stiff
+    /// one stops being stability-limited without anyone noticing.
     #[default]
     Auto,
-    /// Exact propagation of a **linear time-invariant** right-hand side by the matrix
-    /// exponential — no stepping, no tolerance, no stability limit (#852; NONMEM's ADVAN5).
-    /// The propagator lives in `crate::ode::linear`.
+    /// Exact propagation of a **linear time-invariant** right-hand side by the matrix exponential: no
+    /// stepping, no tolerance, no stability limit (#852; NONMEM's ADVAN5). The propagator lives in
+    /// `crate::ode::linear`.
     ///
     /// Not a stepper: each segment's `du/dt = A·u + b` is read off the RHS and advanced as
-    /// `exp([[A, b], [0, 0]]·h)`, exact to roundoff. A model gets it in one of two ways — the
-    /// parser selects it for [`Auto`](OdeMethod::Auto) when its `[odes]` block is
-    /// *structurally* affine in the states, reads no model time and carries no absorption
-    /// forcing; or the user names `ode_method = linear`, which asserts that and is refused on
-    /// a model that is not (a parse error from the model file, `E_ODE_METHOD_LINEAR` from a
-    /// caller's `FitOptions`). Any named integrator opts a linear model out.
+    /// `exp([[A, b], [0, 0]]·h)`, exact to roundoff. A model gets it in one of two ways: the parser
+    /// selects it for [`Auto`](OdeMethod::Auto) when its `[odes]` block is *structurally* affine in the
+    /// states, reads no model time and carries no absorption forcing; or the user names
+    /// `ode_method = linear`, which asserts that and is refused on a model that is not (a parse error
+    /// from the model file, `E_ODE_METHOD_LINEAR` from a caller's `FitOptions`). Any named integrator
+    /// opts a linear model out.
     ///
-    /// Only a parser-certified spec takes the exact path. The public `solve_ode*` functions
-    /// take an arbitrary closure and integrate `Linear` as `Auto`: the propagator's runtime
-    /// self-check samples finitely many points, so it cannot certify a closure. A certified
-    /// segment it still declines (an overflowing exponential, say) is integrated as `Auto`
-    /// would integrate it and counted in
+    /// Only a parser-certified spec takes the exact path. The public `solve_ode*` functions take an
+    /// arbitrary closure and integrate `Linear` as `Auto` (the self-check samples finitely many points,
+    /// so it cannot certify a closure). A certified segment it still declines (an overflowing
+    /// exponential) is integrated as `Auto` would and counted in
     /// [`OdeSolverStats::linear_declined_segments`].
     Linear,
 }
@@ -323,31 +302,26 @@ pub struct OdeSolverOptions {
     /// Stepper to use. Default [`OdeMethod::Rk45`]; see [`OdeMethod`] for when a stiff
     /// method pays and which paths honour it.
     pub method: OdeMethod,
-    /// Give up on a segment once this many of its steps have clamped at `min_dt`, instead of
-    /// grinding on to [`max_steps`](Self::max_steps) (#708, #1080 Part B).
+    /// Give up on a segment once this many of its steps have clamped at `min_dt`, instead of grinding on
+    /// to [`max_steps`](Self::max_steps) (#708, #1080 Part B).
     ///
-    /// A clamp is the solver saying "I cannot meet tolerance here and am advancing anyway";
-    /// once a segment has produced a handful of them it is stability-limited, and the
-    /// remaining thousands of steps buy nothing but wall time. Aborting freeze-pads the
-    /// segment's tail exactly as the existing unrecoverable-clamp break does — the result is
-    /// no more wrong than the ground-out one, it just costs less — and bumps
-    /// [`OdeSolverStats::stiff_aborted_segments`] so the fit's solver-diagnostics warning can
-    /// say so.
+    /// A clamp is the solver saying "I cannot meet tolerance here and am advancing anyway"; a segment
+    /// with a handful of them is stability-limited and the remaining thousands of steps buy only wall
+    /// time. Aborting freeze-pads the segment's tail as the existing unrecoverable-clamp break does (no
+    /// more wrong than the ground-out one, only cheaper) and bumps
+    /// [`OdeSolverStats::stiff_aborted_segments`] so the fit's solver-diagnostics warning can say so.
     ///
-    /// `None` (the default) grinds to `max_steps`, i.e. the pre-#1080 behaviour, bit for bit.
-    /// This is deliberately **not** on by default: an early abort trades a slow-but-eventually-
-    /// integrated segment for a freeze-padded one, which is a change to the objective, not
-    /// only to its cost.
+    /// `None` (the default) grinds to `max_steps`, the pre-#1080 behaviour bit for bit. Deliberately
+    /// **not** on by default: an early abort trades a slow-but-eventually-integrated segment for a
+    /// freeze-padded one, a change to the objective, not only its cost.
     ///
-    /// Independent of [`OdeMethod::Auto`]. Under `auto` an escalation that trips the budget is
-    /// discarded by the guard exactly as any other stalled escalation would be (the trigger is
-    /// [`OdeSolverStats::stiff_min_step_clamped_steps`]` > 0`, which an abort on a stiff
-    /// stepper has by construction) and the segment is re-solved explicitly.
-    ///
-    /// The budget is per *method*, not per segment: when [`auto_switch`](Self::auto_switch)
-    /// swaps the stepper part-way, the count starts again, because what it bounds is how long
-    /// one method may grind on a segment it cannot step, and the clamps behind the switch
-    /// measured the method that was replaced.
+    /// Independent of [`OdeMethod::Auto`]: under `auto` an escalation that trips the budget is discarded
+    /// by the guard like any other stalled escalation (the trigger is
+    /// [`OdeSolverStats::stiff_min_step_clamped_steps`]` > 0`, which an abort on a stiff stepper has by
+    /// construction) and the segment is re-solved explicitly. The budget is per *method*, not per
+    /// segment: when [`auto_switch`](Self::auto_switch) swaps the stepper part-way the count restarts,
+    /// since it bounds how long one method may grind on a segment it cannot step, and the clamps behind
+    /// the switch measured the replaced method.
     pub stiff_abort_after: Option<u32>,
     /// Let [`OdeMethod::Auto`] change stepper **inside** a segment, not only at its start
     /// (#1080 Part C). Default `true`; ignored under every named method, which is pinned.
@@ -495,32 +469,27 @@ impl OdeSolverOverride {
     }
 }
 
-// ── Where the armed override lives: one thread-local, and a pool that carries it ────────
+// ── Where the armed override lives: one thread-local, and a pool that carries it ──
 //
-// The override is *per fit*, and a fit is not one thread: the inner loop fans out over
-// subjects with rayon, so the workers doing the integrating have to see it too. Two shapes
-// were tried and both are wrong, which is why this one looks the way it does.
+// The override is *per fit*, and a fit is not one thread: the inner loop fans out over subjects
+// with rayon, so the workers doing the integrating must see it too. Two other shapes are wrong.
 //
-// A single process-global slot — the shape the inner-loop settings had until #426 —
-// cannot express "this fit's options" at all. `ferx-tools` runs `fit()` from a
-// `par_iter` over replicates and `api::pool` explicitly supports concurrent callers, so with
-// one slot a second fit's arming overwrites the first's, and a fit that expressed *no*
-// opinion (the default `FitOptions`, i.e. almost every fit in the process) pushes the slot
-// back to "nothing armed" while another fit is still running. Both directions silently return
-// a number computed at an accuracy nobody asked for, which is #1212 itself.
+// A single process-global slot (the inner-loop settings' shape until #426) cannot express "this
+// fit's options": `ferx-tools` runs `fit()` from a `par_iter` over replicates and `api::pool`
+// supports concurrent callers, so a second fit's arming overwrites the first's, and a fit that
+// expressed *no* opinion (almost every fit) pushes the slot back to "nothing armed" while another
+// fit still runs. Both directions silently return a number at an accuracy nobody asked for (#1212).
 //
-// A thread-local alone fixes the arming thread and leaves every worker reading whatever some
-// other fit published — the same defect, one thread over, and *not* bounded in the safe
-// direction: `ode_reltol` takes any positive value, a method-only override replaces no
-// tolerance at all, and `ode_max_steps` / `ode_stiff_abort_after` have no tighter/coarser
-// ordering to fall back on.
+// A thread-local alone fixes the arming thread and leaves every worker reading whatever some other
+// fit published: the same defect one thread over, and *not* bounded in the safe direction
+// (`ode_reltol` takes any positive value, a method-only override replaces no tolerance, and
+// `ode_max_steps` / `ode_stiff_abort_after` have no tighter/coarser ordering to fall back on).
 //
-// So the override is a thread-local, and a fit that has one **runs on a pool whose workers
-// were started with that same value already installed** (`api::pool::fit_scope_pool`, keyed by `api::pool::FitScope`).
-// A worker in that pool serves only fits carrying that override — the pool is keyed by it —
-// so "which fit am I serving?" has one answer per thread and no cross-fit read exists to be
-// wrong. A fit with no override keeps using the shared pool, whose workers never install one
-// and therefore integrate at the spec's baked options, whatever any other fit is doing.
+// So the override is a thread-local, and a fit that has one **runs on a pool whose workers were
+// started with that same value already installed** (`api::pool::fit_scope_pool`, keyed by
+// `api::pool::FitScope`). Such a worker serves only fits carrying that override, so "which fit am
+// I serving?" has one answer per thread. A fit with no override uses the shared pool, whose
+// workers never install one and integrate at the spec's baked options.
 
 thread_local! {
     /// The override in force on this thread: `None` outside a fit (and on every worker of the
@@ -708,25 +677,21 @@ pub struct OdeSolverStats {
     /// takes no stats, so a failure on the event-time path (TTE / adaptive dosing) is not
     /// counted here and a zero is not by itself proof that every solve in the fit was clean.
     pub auto_fallback_failed: usize,
-    /// Integration attempts that stopped before reaching the end of their segment and
-    /// freeze-padded the remaining output times with the last state — or, when the stop was on
-    /// a state that had gone non-finite, padded them with `NaN`; those are also counted in
-    /// [`diverged_segments`](Self::diverged_segments) (#1539).
+    /// Integration attempts that stopped before reaching the end of their segment and freeze-padded the
+    /// remaining output times with the last state (or with `NaN` when the stop was on a state that had
+    /// gone non-finite; those are also in [`diverged_segments`](Self::diverged_segments), #1539).
     ///
-    /// This counts attempts, including stiff attempts the `auto` guard later discarded.
-    /// Subtract [`discarded_unfinished_segments`](Self::discarded_unfinished_segments) to
-    /// obtain the number of unfinished trajectories the caller actually received.
+    /// This counts attempts, including stiff attempts the `auto` guard later discarded; subtract
+    /// [`discarded_unfinished_segments`](Self::discarded_unfinished_segments) for the unfinished
+    /// trajectories the caller received.
     ///
-    /// A roll-up, not a disjoint category. Every segment counted by
-    /// [`stiff_aborted_segments`](Self::stiff_aborted_segments) is by construction also counted
-    /// here (the budgeted abort only fires while `t < tf`), as is every segment that stopped
-    /// because its stepper could not form a step at `min_dt`. Do not add this to those
-    /// counters; the fit's `ode_solver` warning subtracts the abandoned ones before reporting
-    /// the rest, so its clauses stay disjoint. What is left over after that subtraction is
-    /// dominated by segments that exhausted [`OdeSolverOptions::max_steps`].
-    ///
-    /// It is a floor, not a total: `solve_ode_until_threshold` takes no stats, so segments
-    /// integrated on the event-time path (TTE / adaptive dosing) are not counted here.
+    /// A roll-up, not a disjoint category: every segment in
+    /// [`stiff_aborted_segments`](Self::stiff_aborted_segments) is also counted here (the budgeted abort
+    /// only fires while `t < tf`), as is every segment that stopped because its stepper could not form
+    /// a step at `min_dt`. Do not add this to those counters; the fit's `ode_solver` warning subtracts
+    /// the abandoned ones first so its clauses stay disjoint. What is left is dominated by segments
+    /// that exhausted [`OdeSolverOptions::max_steps`]. A floor, not a total: `solve_ode_until_threshold`
+    /// takes no stats, so event-time segments (TTE / adaptive dosing) are not counted.
     pub unfinished_segments: usize,
     /// Integrations abandoned early because their min-`dt` clamps crossed
     /// [`OdeSolverOptions::stiff_abort_after`] (#708, #1080 Part B).
@@ -760,63 +725,42 @@ pub struct OdeSolverStats {
     /// Of [`unfinished_segments`](Self::unfinished_segments), the attempts discarded by the
     /// `auto` escalation guard before it re-solved the segment explicitly.
     pub discarded_unfinished_segments: usize,
-    /// Engine walks abandoned **before integrating** because their timeline could not be
-    /// ordered — a `NaN`/`inf` dose time, lagtime, route lag or infusion duration
+    /// Engine walks abandoned **before integrating** because their timeline could not be ordered: a
+    /// `NaN`/`inf` dose time, lagtime, route lag or infusion duration
     /// (`ode::predictions::times_have_non_finite`, #1189).
     ///
-    /// The odd one out, and deliberately: every other counter here reports work that *happened*,
-    /// so an abandoned walk leaves all of them at zero. That reading is not distinguishable from
-    /// a subject there was nothing to integrate for — measured on one model in a
-    /// `SolverStatsScope`, a normal subject read `attempted/accepted/rejected = 7/7/0` while a
-    /// non-finite timeline, a subject with no records, and a subject with a single observation at
-    /// `t = 0` all read `0/0/0`, returning `[NaN, NaN, NaN, NaN]`, `[]` and `[0.0]` respectively
-    /// (#1234). This counter is what separates the first of those three from the other two.
+    /// The odd one out, deliberately: every other counter reports work that *happened*, so an abandoned
+    /// walk leaves all at zero, which is indistinguishable from a subject with nothing to integrate.
+    /// Measured on one model in a `SolverStatsScope`, a normal subject read `attempted/accepted/rejected
+    /// = 7/7/0` while a non-finite timeline, a subject with no records, and a subject with a single
+    /// observation at `t = 0` all read `0/0/0`, returning `[NaN, NaN, NaN, NaN]`, `[]` and `[0.0]`
+    /// (#1234). This counter separates the first from the other two.
     ///
-    /// Counted **once per abandoned walk**, not per subject and not per segment — the honest
-    /// count of trajectories that were never integrated. A post-fit sweep drives more than one
-    /// engine over the same subject, so one bad subject contributes more than one: measured at
-    /// **3** on a plain two-subject FOCEI fit (`ode_predictions` twice,
-    /// `ode_predictions_with_states` once). Zero on every well-formed fit, so any non-zero value
-    /// means some subject's predictions are `NaN` by construction.
+    /// Counted **once per abandoned walk**, not per subject or segment. A post-fit sweep drives more than
+    /// one engine over the same subject, so one bad subject contributes more than one (measured **3** on
+    /// a plain two-subject FOCEI fit: `ode_predictions` twice, `ode_predictions_with_states` once). Zero
+    /// on every well-formed fit, so any non-zero value means some subject's predictions are `NaN` by
+    /// construction.
     ///
-    /// Recorded on all eight `f64` engine sites, through
-    /// `ode::predictions::abandon_non_finite_timeline` — the predicate and this counter are one
-    /// call, so a ninth guard cannot be written that detects an unorderable timeline without
-    /// reporting it (pinned by
-    /// `the_bare_timeline_predicates_are_not_called_outside_this_guard`). The eight are the four
-    /// dense / event-driven prediction walks, the adaptive driver and its frozen replay, the EKF
+    /// Recorded on all eight `f64` engine sites through `ode::predictions::abandon_non_finite_timeline`
+    /// (predicate and counter are one call, so a ninth guard cannot detect an unorderable timeline
+    /// without reporting it; pinned by `the_bare_timeline_predicates_are_not_called_outside_this_guard`):
+    /// the four dense / event-driven prediction walks, the adaptive driver and its frozen replay, the EKF
     /// walk, and `ode_solve_until_chz_threshold`'s event-time solve.
     ///
-    /// **All eight fire in production as of #1304.** They did not before it: outside tests,
-    /// `SolverStatsScope::enter` appeared in exactly two places, both reached only from
-    /// `fit()`'s post-fit pass, so the adaptive driver, its frozen replay and the CHZ
-    /// event-time solve — reached only under `simulate()` / `simulate_adaptive()` — recorded
-    /// into an inactive sink and contributed nothing to any warning. They carried the recorder
-    /// so that wiring a scope onto those paths would be a small change rather than a re-audit,
-    /// which is what it turned out to be. `api::predict_diag`, `api::simulate_with_options_diag`
-    /// and `api::simulate_adaptive` now open one (through `api::postfit::solver_stats_scope`,
-    /// the single gate), so this counter reaches a user on every entry point that has a
-    /// warnings channel to carry it.
-    ///
-    /// The CHZ site was never "the one silent hole" it was described as before that correction:
-    /// its sole production caller (`survival::draw_ode_tte_latent`) turns `SolveFailed` into a
-    /// per-subject `W_TTE_SOLVE_FAILED` warning naming the cause (#2087), on a channel of its
-    /// own.
-    ///
-    /// What is still true of that site is narrower and lives in the *step* counters, not this
-    /// one: `ode_solve_until_chz_threshold` runs on `solve_ode_until_threshold`, its own driver,
-    /// which never tees into `STATS_SINK`. So with a scope open its `attempted_steps` read `0`
-    /// on a solve that crossed the threshold normally (measured, #1304 item 3), and on that
-    /// engine the step counters cannot serve as the "did anything integrate" discriminator they
-    /// are elsewhere. This counter is recorded directly by the guard, not through the driver,
-    /// so it is unaffected. Teeing that driver is #1304's remaining item.
-    ///
-    /// The two analytic-sensitivity walks (`sens::ode_provider`) carry the same predicate and
-    /// deliberately do **not** bump this: their sweep is collected in its own scope from which
-    /// `fit_inner` copies exactly one field
-    /// ([`auto_stiff_rejected_jets`](Self::auto_stiff_rejected_jets)), so a gradient-solve event
-    /// deposited here would either be discarded or — if that copy were widened — fire a warning
-    /// clause about predictions.
+    /// **All eight fire in production as of #1304.** Before it `SolverStatsScope::enter` appeared outside
+    /// tests only in `fit()`'s post-fit pass, so the adaptive driver, its replay and the CHZ solve
+    /// (reached only under `simulate()` / `simulate_adaptive()`) recorded into an inactive sink.
+    /// `api::predict_diag`, `api::simulate_with_options_diag` and `api::simulate_adaptive` now open a scope
+    /// (through `api::postfit::solver_stats_scope`, the single gate), so this counter reaches a user on
+    /// every entry point with a warnings channel. The CHZ site was never "the one silent hole": its sole
+    /// production caller (`survival::draw_ode_tte_latent`) turns `SolveFailed` into a per-subject
+    /// `W_TTE_SOLVE_FAILED` warning (#2087). What is still true is narrower and lives in the *step*
+    /// counters: `ode_solve_until_chz_threshold` runs on `solve_ode_until_threshold`, which never tees
+    /// into `STATS_SINK`, so with a scope open its `attempted_steps` read `0` on a solve that crossed the
+    /// threshold normally (#1304 item 3, whose teeing is the remaining item), and the step counters cannot
+    /// serve as the "did anything integrate" discriminator there. This counter is recorded by the guard
+    /// directly and is unaffected.
     pub abandoned_non_finite_timeline: usize,
     /// Segments whose integration stopped short **because a state went non-finite** — the
     /// right-hand side diverged — so the output times it did not reach were padded with `NaN`
@@ -3038,8 +2982,7 @@ pub enum ThresholdCrossing {
 /// The crossing is localized *inside* the step that brackets it, by bisecting the stepper's own
 /// continuous extension — so this works for every [`OdeMethod`], and a method added later needs
 /// no changes here.
-#[cfg(test)]
-pub(crate) fn solve_ode_until_threshold(
+pub fn solve_ode_until_threshold(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u: &mut [f64],
     t_span: (f64, f64),

@@ -388,28 +388,25 @@ fn point_time<T: VmNum>(t: f64, end: T) -> T {
     }
 }
 
-/// Periodic steady state of the EKF's `(mean, covariance)` pair for an `SS=1` record
-/// (#1260): the state the filter would hold at the record had the dose been given every
-/// `II` since forever, with no observation in between.
+/// Periodic steady state of the EKF's `(mean, covariance)` pair for an `SS=1` record (#1260): the
+/// state the filter would hold at the record had the dose been given every `II` since forever, with
+/// no observation in between.
 ///
-/// The pulse train is expanded the way the ODE path's nonlinear fallback does it
-/// (`equilibrate_ss_pk_state`): from `u = 0, P = 0`, cycles of *(apply dose; integrate
-/// `II`)* on that fallback's cycle-local clock — bolus, or an `F`-reshaped active window
-/// followed by a quiet one — until the concatenated `(u, P)` stops moving by [`SsStopTracker`]'s
-/// criterion (read on the values, as the dual walks do) or [`SS_EQUILIBRATION_CYCLES`] is
-/// spent, with the #867 non-convergence warning on a spent cap. No exact linear fixed point
-/// here: a bolus leaves `P` untouched, so `P`'s cycle map is the continuous Riccati flow
-/// over `II`, and the same quadrature the walk uses is what makes an explicit train and
-/// this run-in agree to the stop tolerance. `P` is carried alongside `u` rather than seeded
-/// after it because on a nonlinear right-hand side the Jacobian along the cycle depends on
-/// the mean's own phase. A recording type records the cycle map once and the train as a
-/// run-time search on the values ([`ss_train`]), differentiating the converged pair implicitly.
+/// The pulse train is expanded as the ODE path's nonlinear fallback does it
+/// (`equilibrate_ss_pk_state`): from `u = 0, P = 0`, cycles of *(apply dose; integrate `II`)* on that
+/// fallback's cycle-local clock (bolus, or an `F`-reshaped active window then a quiet one) until the
+/// concatenated `(u, P)` stops moving by [`SsStopTracker`]'s criterion (read on the values, as the
+/// dual walks do) or [`SS_EQUILIBRATION_CYCLES`] is spent, with the #867 non-convergence warning on
+/// a spent cap. No exact linear fixed point: a bolus leaves `P` untouched, so `P`'s cycle map is the
+/// continuous Riccati flow over `II`, and the same quadrature the walk uses makes an explicit train
+/// and this run-in agree to the stop tolerance. `P` is carried alongside `u` because on a nonlinear
+/// RHS the Jacobian along the cycle depends on the mean's own phase. A recording type records the
+/// cycle map once and the train as a run-time search on the values ([`ss_train`]), differentiating
+/// the converged pair implicitly.
 ///
-/// Cost, measured on the #1260 fixture (one objective evaluation, debug build): the run-in
-/// early-stops after 16–21 cycles; 569 ms with the `SS=1` record against 996 ms with the 41
-/// explicit records it stands for.
-///
-/// Returns the zero pair for the shapes the ODE run-in also declines: `II ≤ 0` or a compartment
+/// Cost on the #1260 fixture (one objective evaluation, debug build): the run-in early-stops after
+/// 16-21 cycles; 569 ms with the `SS=1` record against 996 ms with the 41 explicit records it stands
+/// for. Returns the zero pair for the shapes the ODE run-in also declines: `II ≤ 0` or a compartment
 /// outside the state vector.
 #[allow(clippy::too_many_arguments)]
 fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
@@ -613,26 +610,23 @@ fn ekf_ipred<T: VmNum>(v: T) -> T {
 
 /// Propagate mean and covariance through a subject's dose+obs timeline.
 ///
-/// `rhs`, `n_states`, `obs_cmt_idx` mirror `OdeSpec`. `diffusion_var` is the
-/// diagonal of Q (length == n_states). `r_of(j, ipred)` is observation `j`'s
-/// measurement variance R given the filter's own prediction there, so the Kalman
-/// update is correct for proportional and combined error models, where R depends on the
-/// predicted value. The returned `p_obs` values are the pre-update EKF covariance
-/// components and are not inflated by R. `dose_f_bio` is each dose's bioavailability
-/// (`Fn`, #369) and `params` the PK parameters (both numbers of the filter's type, so their
-/// derivatives flow through the mean and the covariance); the EKF path applies no lagtime.
-/// `doses` are resolved (`resolve_subject_doses`); `modeled[k]`, when given, is dose `k`'s
-/// modeled `D`/`R` as such a number ([`infusion_of`]), and empty for a caller on `f64`.
+/// `rhs`, `n_states`, `obs_cmt_idx` mirror `OdeSpec`. `diffusion_var` is the diagonal of Q (length
+/// == n_states). `r_of(j, ipred)` is observation `j`'s measurement variance R given the filter's own
+/// prediction there, so the Kalman update is correct for proportional and combined error models. The
+/// returned `p_obs` values are the pre-update EKF covariance components, not inflated by R.
+/// `dose_f_bio` is each dose's bioavailability (`Fn`, #369) and `params` the PK parameters (both of
+/// the filter's number type, so derivatives flow through the mean and covariance); the EKF path
+/// applies no lagtime. `doses` are resolved (`resolve_subject_doses`); `modeled[k]`, when given, is
+/// dose `k`'s modeled `D`/`R` as such a number ([`infusion_of`]), empty for a caller on `f64`.
 ///
-/// An infusion's window end moves with `F` (rate-defined) or its modeled `D`/`R`: it is a
-/// break time of the filter's type, so the mean solve's span, the covariance quadrature's
-/// sub-steps and their midpoints all carry its derivatives — the discrete filter is
-/// differentiated as it is computed, with the timeline's order guarded.
+/// An infusion's window end moves with `F` (rate-defined) or its modeled `D`/`R`: it is a break time
+/// of the filter's type, so the mean solve's span, the covariance quadrature's sub-steps and their
+/// midpoints all carry its derivatives (the discrete filter is differentiated as computed, with the
+/// timeline's order guarded).
 ///
-/// Dose events are handled identically to `ode_predictions`: boluses add to
-/// state; infusions inject a rate term into the wrapped RHS. Covariance is
-/// reset to zero at initial time and propagated forward from there; an `SS=1`
-/// record replaces both mean and covariance with their periodic steady state
+/// Dose events are handled as in `ode_predictions`: boluses add to state; infusions inject a rate
+/// term into the wrapped RHS. Covariance is reset to zero at the initial time and propagated forward;
+/// an `SS=1` record replaces mean and covariance with their periodic steady state
 /// ([`equilibrate_ss_ekf`], #1260).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
@@ -1012,24 +1006,18 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
                 n,
             );
 
-            // Same assimilate-once mask as the boundary read: an observation sitting
-            // exactly on this segment's `t_end` is read here *and* at the next break as
-            // its `t_start`, and `kalman_update` is not idempotent.
+            // Same assimilate-once mask as the boundary read: an observation exactly on this segment's `t_end`
+            // is read here *and* at the next break as its `t_start`, and `kalman_update` is not idempotent.
             //
-            // Records sharing this exact time are **one** measurement instant and share
-            // a single update, exactly as the boundary path above does — `solve_ekf`
-            // has one `obs_cmt_idx`, so N records here are N reads of the same
-            // compartment at the same time, and updating N times would shrink `p_mat`
-            // as though N independent measurements had arrived. Before #1263 only the
-            // last index of a shared time was in the map at all, so the others kept
-            // their `{ ipred: 0.0, p_obs: 0.0 }` prefill.
-            //
-            // So are the records one ULP above it: the reader moves the first of two
-            // co-timed records one ULP below their tie (#614, #1810), and the pair is still
-            // one instant (`crate::types::same_instant`). Both times are in `saveat`, so the
-            // earlier point takes the pair's single update and the later finds every index
-            // already assimilated. No break sits between the two times, so the solver saves
-            // both off one step and they share a state as well.
+            // Records sharing this exact time are **one** measurement instant and share a single update
+            // (`solve_ekf` has one `obs_cmt_idx`, so N records are N reads of the same compartment at the same
+            // time; N updates would shrink `p_mat` as if N independent measurements arrived). Before #1263 only
+            // the last index of a shared time was in the map, so the others kept their
+            // `{ ipred: 0.0, p_obs: 0.0 }` prefill. So are the records one ULP above it: the reader moves the
+            // first of two co-timed records one ULP below their tie (#614, #1810) and the pair is still one
+            // instant (`crate::types::same_instant`). Both times are in `saveat`, so the earlier point takes
+            // the pair's single update and the later finds every index already assimilated (no break sits
+            // between them, so they also share a state).
             let here = obs_map
                 .get(&pt.t.to_bits())
                 .into_iter()
@@ -1360,23 +1348,20 @@ mod tests {
         }
     }
 
-    /// The **value** oracle for #1131, and the strongest one available: with the diffusion
-    /// variance at zero the EKF's mean walk reduces to the ordinary ODE integration, so
-    /// `solve_ekf`'s `ipred` must equal `ode_predictions`' — on a TAD- and a TAFD-reading
-    /// RHS, the exact models the bare-slice defect destroyed.
+    /// The **value** oracle for #1131: with the diffusion variance at zero the EKF's mean walk reduces
+    /// to the ordinary ODE integration, so `solve_ekf`'s `ipred` must equal `ode_predictions`' on a TAD-
+    /// and a TAFD-reading RHS, the exact models the bare-slice defect destroyed.
     ///
-    /// Both engines call `predictions::tad_anchor_for` after this fix, so this test cannot
-    /// observe a wrong *anchor rule* shared by both — that is what the NONMEM anchors in
-    /// `nonmem_anchor/` are for. What it does observe is the defect that was actually there:
-    /// the EKF passing a slice too short for the RHS to read the slot at all. Deleting
-    /// either the `seed_ext_params` call or the per-segment anchor write in `solve_ekf`
-    /// turns the EKF column into the `0.0` clamp while the ODE column stays correct.
+    /// Both engines call `predictions::tad_anchor_for`, so this cannot observe a wrong *anchor rule*
+    /// shared by both (that is what `nonmem_anchor/` is for). It observes the defect that was there: the
+    /// EKF passing a slice too short for the RHS to read the slot at all. Deleting either the
+    /// `seed_ext_params` call or the per-segment anchor write in `solve_ekf` turns the EKF column into the
+    /// `0.0` clamp while the ODE column stays correct.
     ///
-    /// A third reference, independent of both engines, keeps them from agreeing on a wrong
-    /// answer. For `dA/dt = -ke·A·(1 + c·u)` the exponent integrates in closed form:
-    /// with `u = TAD` the clock restarts at each arrival, with `u = TAFD` it does not, so
-    /// the two slots have *different* closed forms after the second dose — a fixture that
-    /// plumbed one slot into both would fail here.
+    /// A third reference independent of both engines keeps them from agreeing on a wrong answer: for
+    /// `dA/dt = -ke·A·(1 + c·u)` the exponent integrates in closed form; with `u = TAD` the clock
+    /// restarts at each arrival, with `u = TAFD` it does not, so the two slots have *different* closed
+    /// forms after the second dose (a fixture plumbing one slot into both would fail).
     #[test]
     fn ekf_matches_the_ode_twin_and_a_closed_form_on_a_model_time_rhs() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
@@ -1483,22 +1468,14 @@ mod tests {
         );
     }
 
-    /// #1226 on the EKF walk: an observation **one ULP after** a dose record is read
-    /// post-dose, matching `ode_predictions`.
-    ///
-    /// This loop rescans every dose at every break exactly as the ODE prediction engines
-    /// do, and it carried the same `t > t_start + 1e-12 && t <= t_end + 1e-12` segment
-    /// filter plus an exact-bit `obs_map` boundary lookup — so the sample was claimed by
-    /// the *pre*-dose segment and the post-dose read missed it. The EKF path applies no
-    /// lagtime, so a data time one ULP after a dose record is the reachable geometry here
-    /// rather than a lagged arrival.
-    ///
-    /// Oracle: `ode_predictions` on the identical fixture, which is itself anchored on
-    /// NONMEM in `ode/predictions_tests.rs::lag_arrival_read_1226` — plus the closed form
-    /// below, so the two engines cannot agree on a wrong answer.
-    ///
-    /// Mutation: revert either the boundary band read or the segment filter in `solve_ekf`
-    /// and `ipred` at the ULP sample drops by a whole 100 mg dose.
+    /// #1226 on the EKF walk: an observation **one ULP after** a dose record is read post-dose, matching
+    /// `ode_predictions`. This loop rescans every dose at every break as the ODE engines do and carried
+    /// the same `t > t_start + 1e-12 && t <= t_end + 1e-12` segment filter plus an exact-bit `obs_map`
+    /// boundary lookup, so the sample was claimed by the *pre*-dose segment. The EKF applies no lagtime,
+    /// so one ULP after a dose record is the reachable geometry. Oracle: `ode_predictions` on the same
+    /// fixture (anchored on NONMEM in `ode/predictions_tests.rs::lag_arrival_read_1226`) plus the closed
+    /// form below. Mutation: reverting either the boundary band read or the segment filter drops `ipred`
+    /// at the ULP sample by a whole 100 mg dose.
     #[test]
     fn ekf_reads_an_obs_one_ulp_after_a_dose_post_dose() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
@@ -1747,32 +1724,25 @@ mod tests {
         }
     }
 
-    /// A measurement landing exactly on a dose break must be assimilated **once**, while its
-    /// `ipred` is still the post-dose one.
+    /// A measurement landing exactly on a dose break must be assimilated **once**, while its `ipred` is
+    /// still the post-dose one.
     ///
-    /// Unlike the ODE engines, where a band write is an idempotent index assignment, the EKF
-    /// runs a `kalman_update` that mutates `p_mat`. An observation on an interior break is
-    /// saved by the segment ending there *and* read at that break as the next `t_start`, so
-    /// it was assimilated twice — the covariance shrank twice, giving an over-confident
-    /// `p_obs` at that record and a distorted covariance for the rest of the subject.
+    /// Unlike the ODE engines (an idempotent index assignment), the EKF runs a `kalman_update` that
+    /// mutates `p_mat`. An observation on an interior break is saved by the segment ending there *and*
+    /// read at that break as the next `t_start`, so it was assimilated twice: an over-confident `p_obs`
+    /// and a distorted covariance for the rest of the subject. Measured here: `p_obs` at `t = 6` was
+    /// **0.0437** against the correct **0.3460** (8×), and at `t = 12` 0.4420 against 0.4514. The defect
+    /// **predates #1226** (the old exact-bit lookup matched an observation at `t_start` as the band does),
+    /// but the band widens which records can reach it.
     ///
-    /// Measured on this fixture: `p_obs` at `t = 6` was **0.0437** against the correct
-    /// **0.3460** (a factor of 8), and the knock-on at `t = 12` was 0.4420 against 0.4514.
-    /// The defect **predates #1226** — the old exact-bit boundary lookup matched an
-    /// observation exactly at `t_start` just as the band does — but the band widens which
-    /// records can reach it, so the mask is part of this change.
+    /// **Oracle: a bolus does not touch `p_mat`.** Nudging the dose 1e-6 h earlier (far outside the match
+    /// band, negligible propagation) must leave every `p_obs` unchanged; a double assimilation violates
+    /// that by 8× and no reference implementation is needed. The split is asserted both ways: gating the
+    /// *whole* boundary read on the mask (not only the `kalman_update`) makes `ipred` read pre-dose
+    /// (68.73 instead of 168.73), reintroducing #1226.
     ///
-    /// **Oracle: a bolus does not touch `p_mat`.** So nudging the dose 1e-6 h earlier —
-    /// far outside the match band, but a negligible amount of propagation — must leave every
-    /// `p_obs` unchanged. That differential is what a double assimilation violates by a
-    /// factor of 8, and it needs no reference implementation.
-    ///
-    /// The split matters and is asserted both ways: gating the *whole* boundary read on the
-    /// mask (rather than only the `kalman_update`) makes `ipred` read pre-dose — measured
-    /// 68.73 instead of 168.73, i.e. it reintroduces the #1226 defect on the EKF.
-    ///
-    /// Mutations: drop the `assimilated` guard → `p_obs` at `t = 6` collapses to 0.0437;
-    /// make the guard `continue` before writing `ipred` → `ipred` at `t = 6` reads 68.73.
+    /// Mutations: drop the `assimilated` guard → `p_obs` at `t = 6` collapses to 0.0437; make the guard
+    /// `continue` before writing `ipred` → `ipred` at `t = 6` reads 68.73.
     #[test]
     fn ekf_assimilates_a_measurement_on_a_dose_break_exactly_once() {
         let obs_times = vec![2.0, 6.0, 12.0];
@@ -1945,22 +1915,19 @@ mod tests {
         }
     }
 
-    /// A non-finite time on this walk's timeline used to panic its
-    /// `partial_cmp(..).unwrap()` sort. It must now return non-finite `ipred`s — not a
-    /// finite filter pass computed on a timeline that could not be ordered, which is
-    /// what `total_cmp` alone would give.
+    /// A non-finite time on this walk's timeline used to panic its `partial_cmp(..).unwrap()` sort; it
+    /// must now return non-finite `ipred`s, not a finite filter pass on a timeline that could not be
+    /// ordered (what `total_cmp` alone would give).
     ///
-    /// **Defence in depth, and the fixture says why.** The route that reaches the other
-    /// engines — a non-finite *lag* — cannot reach this one: the EKF path applies no
-    /// lagtime, and its only derived break is the infusion end, which
-    /// [`is_real_infusion`] already refuses to emit when `duration = amt/rate` is
-    /// non-finite (that dose falls back to the bolus branch, deliberately, and the
-    /// timeline stays orderable — measured). So the trigger here is a non-finite *record*
-    /// time, reachable through the hand-built entry `solve_ekf` exposes. The guard exists
-    /// because this walk's sort is the same one, not because a fitted dataset gets here.
+    /// **Defence in depth.** The route reaching the other engines (a non-finite *lag*) cannot reach this
+    /// one: the EKF applies no lagtime and its only derived break is the infusion end, which
+    /// [`is_real_infusion`] refuses to emit when `duration = amt/rate` is non-finite (that dose falls
+    /// back to the bolus branch and the timeline stays orderable, measured). So the trigger is a
+    /// non-finite *record* time via the hand-built `solve_ekf` entry; the guard exists because this
+    /// walk's sort is the same one, not because a fitted dataset gets here.
     ///
-    /// Mutation: restore `partial_cmp(..).unwrap()` → panic; delete the
-    /// `times_have_non_finite` guard → finite `ipred`s and the assert below fires.
+    /// Mutation: restore `partial_cmp(..).unwrap()` → panic; delete the `times_have_non_finite` guard →
+    /// finite `ipred`s and the assert below fires.
     #[test]
     fn ekf_non_finite_break_is_non_finite_not_a_panic() {
         let doses = vec![
@@ -2012,28 +1979,23 @@ mod tests {
         );
     }
 
-    /// **NONMEM anchor — a RATE-defined infusion under `F ≠ 1` on the EKF walk.**
+    /// **NONMEM anchor: a RATE-defined infusion under `F ≠ 1` on the EKF walk.**
     ///
-    /// `F` reshapes an infusion's **duration**, not its rate (#419): NONMEM holds the data
-    /// `RATE` and delivers `F·AMT` over `F·AMT/RATE`. `ekf.rs` pushed an unscaled
-    /// `dose.time + dose.duration` as the window's break, so `active_infusions`'
-    /// membership test (`predictions.rs:1520-1531`, `end >= t_end - EPS`) rejected the
-    /// window in **every** segment and the infusion delivered zero mass — measured
-    /// `ipred = 0.0` at every observation for `F = 0.5`, against `27.86 / 42.08 / 31.18`
-    /// from `ode_predictions` (#1263 review).
+    /// `F` reshapes an infusion's **duration**, not its rate (#419): NONMEM holds the data `RATE` and
+    /// delivers `F·AMT` over `F·AMT/RATE`. `ekf.rs` pushed an unscaled `dose.time + dose.duration` as the
+    /// window's break, so `active_infusions`' membership test (`predictions.rs:1520-1531`,
+    /// `end >= t_end - EPS`) rejected the window in **every** segment and the infusion delivered zero
+    /// mass (`ipred = 0.0` at every observation for `F = 0.5`, against `27.86 / 42.08 / 31.18` from
+    /// `ode_predictions`, #1263).
     ///
-    /// The reference is **NONMEM 7.6.0 PRED**, not ferx: `nonmem_anchor/oral_central_inf_advan2_f06.ctl`
-    /// (ADVAN2 TRANS2, `CL=5, V=50, KA=1, F2=0.6, S2=V`, 100 mg at `RATE=25` into `CMT=2`,
-    /// obs at `t = 1, 3, 6, 10, 16`), whose digits are also pinned in
-    /// `tests/oral_central_infusion_nonmem_anchor.rs` for the analytical paths. The system
-    /// is written here as the explicit two-state ODE twin so it reaches `solve_ekf`, which
-    /// the analytical anchor cannot.
-    ///
-    /// Non-degenerate on both sides of the quantity under test: `t = 1` is **inside** the
-    /// window (where `F` has not yet moved the answer — it is the same value as the `F = 1`
-    /// run) and `t = 3, 6, 10, 16` are all **past** the `F`-shortened end at `2.4 h`, where
-    /// an unscaled duration and a scaled one disagree. An implementation that ignored `F`
-    /// on the window would match the first point and miss the other four.
+    /// The reference is **NONMEM 7.6.0 PRED**: `nonmem_anchor/oral_central_inf_advan2_f06.ctl` (ADVAN2
+    /// TRANS2, `CL=5, V=50, KA=1, F2=0.6, S2=V`, 100 mg at `RATE=25` into `CMT=2`, obs at
+    /// `t = 1, 3, 6, 10, 16`), whose values are also pinned in
+    /// `tests/oral_central_infusion_nonmem_anchor.rs` for the analytical paths; written here as the
+    /// explicit two-state ODE twin so it reaches `solve_ekf`. Non-degenerate on both sides: `t = 1` is
+    /// **inside** the window (same as the `F = 1` run) and `t = 3, 6, 10, 16` are **past** the
+    /// `F`-shortened end at `2.4 h`, so an implementation ignoring `F` on the window would match the
+    /// first point and miss the other four.
     #[test]
     fn ekf_infusion_under_f_matches_nonmem() {
         // `oral_central_inf_advan2_f06.tab`, NONMEM 7.6.0 PRED at FORMAT=,1PE17.10.
@@ -2731,24 +2693,19 @@ mod tests {
 
     /// **A co-timed pair the reader split one ULP apart is filled, from one update.**
     ///
-    /// Two observations at `TIME 4` with an EVID=2 row after the first reach the engine as
-    /// `[4⁻, 4]`: the reader moves the first one ULP below the tie (#1810). The segment
-    /// `saveat` deduped at `1e-15`, which merged the pair, so the record at `4` was never
-    /// saved and kept its `{ ipred: 0.0, p_obs: 0.0 }` prefill, a finite zero in the
-    /// likelihood. With both times saved, the in-segment read must still treat the pair as the
-    /// one instant it was written as (`crate::types::same_instant`): one update, as for the
-    /// unsplit `[4, 4]`, not two.
+    /// Two observations at `TIME 4` with an EVID=2 row after the first reach the engine as `[4⁻, 4]`
+    /// (#1810). The segment `saveat` deduped at `1e-15`, merging the pair, so the record at `4` was never
+    /// saved and kept its `{ ipred: 0.0, p_obs: 0.0 }` prefill (a finite zero in the likelihood). With
+    /// both times saved, the in-segment read must treat the pair as the one instant it was written as
+    /// (`crate::types::same_instant`): one update, as for the unsplit `[4, 4]`.
     ///
-    /// Measured on macOS arm64: worst relative difference from the unsplit run 2.1e-16, over
-    /// `ipred` and `p_obs` of all three records. Bound `1e-12`.
-    ///
-    /// Mutation: drop the one-ULP-up lookup and the pair assimilates twice — `p_obs` of the
-    /// record at `4` measured 0.0097 against the unsplit 0.337. Restoring the `1e-15` dedup
-    /// alone leaves this test green, since the lookup fills the record at `4` from the `4⁻`
-    /// point either way. That dedup is pinned on the other engines, by
-    /// `a_reader_split_tie_is_read_on_every_ode_engine` in `predictions_tests.rs`. With both
-    /// reverted, the code before the fix, the record at `4` keeps its `0.0` prefill and the
-    /// first assertion below fails.
+    /// Measured on macOS arm64: worst relative difference from the unsplit run 2.1e-16 over `ipred` and
+    /// `p_obs` of all three records. Bound `1e-12`. Mutation: dropping the one-ULP-up lookup assimilates
+    /// the pair twice (`p_obs` of the record at `4`: 0.0097 against the unsplit 0.337). Restoring the
+    /// `1e-15` dedup alone leaves this test green (the lookup fills the record from the `4⁻` point either
+    /// way); that dedup is pinned on the other engines by `a_reader_split_tie_is_read_on_every_ode_engine`
+    /// in `predictions_tests.rs`. With both reverted, the record at `4` keeps its `0.0` prefill and the
+    /// first assertion fails.
     #[test]
     fn ekf_reader_split_tie_is_one_instant() {
         let pk = make_pk(1.0, 20.0);
@@ -2797,20 +2754,16 @@ mod tests {
 
     /// **An obs / dose / obs tie the reader split takes one update too.**
     ///
-    /// Obs, bolus, obs at `TIME 4` reach the engine as `[4⁻, 4]` (#614), with a break at `4`
-    /// between the pair. The `4⁻` record reads the state before the dose and the `4` record
-    /// the state after it, but the pair is still one instant, so it takes one update, as the
-    /// unsplit `[4, 4]` does. This tie was already filled before #2010's fix, since a break
-    /// sits at `4`, but from two updates: the `4⁻` point took an in-segment update and the
-    /// boundary read at `4` a second one. The one-ULP-up lookup makes it one, so an EKF fit
-    /// with such a tie moves its objective.
+    /// Obs, bolus, obs at `TIME 4` reach the engine as `[4⁻, 4]` (#614), with a break at `4` between the
+    /// pair. The `4⁻` record reads the state before the dose and the `4` record the state after, but the
+    /// pair is one instant, so it takes one update, as the unsplit `[4, 4]` does. The tie was already
+    /// filled before #2010's fix (a break sits at `4`) but from two updates: an in-segment update at `4⁻`
+    /// and a second from the boundary read at `4`. The one-ULP-up lookup makes it one, so an EKF fit with
+    /// such a tie moves its objective.
     ///
     /// Measured on macOS arm64: `p_obs` 0.33658 / 0.0097115 / 0.33985 before the fix and
-    /// 0.33658 / 0.33658 / 0.34302 after, the unsplit run's to 1.7e-16 relative. `ipred`
-    /// is 81.87 / 181.87 / 148.91 either way. Bound `1e-12`.
-    ///
-    /// Mutation: drop the one-ULP-up lookup and the pair assimilates twice — `p_obs` of the
-    /// record at `4` falls back to 0.0097 and the bit-equality below fails.
+    /// 0.33658 / 0.33658 / 0.34302 after, the unsplit run's to 1.7e-16 relative. `ipred` is
+    /// 81.87 / 181.87 / 148.91 either way. Bound `1e-12`.
     #[test]
     fn ekf_reader_split_tie_across_a_dose_is_one_update() {
         let pk = make_pk(1.0, 20.0);
