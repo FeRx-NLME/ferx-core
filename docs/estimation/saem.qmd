@@ -1142,9 +1142,9 @@ is biased where SAEM is usually chosen).
 
 | `saem_ofv` | `ofv` | AIC, BIC | Notes |
 |---|---|---|---|
-| `saem` (default) | NONMEM's `SAEMOBJ` | none (`None`) | Free (accumulated from the E-step's draws). IOV models average the joint density of data, η and κ draws; a model with no random effects reports the data `−2 log L`. A mixture has no NONMEM-anchored convention, so it reports the `imp` value **with a warning** naming the fallback. |
+| `saem` (default) | NONMEM's `SAEMOBJ` | none (`None`) | Free (accumulated from the E-step's draws). IOV models (an IOV-only model included) average the joint density of data, η and κ draws; a model with no random effects at all reports the data `−2 log L`. A mixture has no NONMEM-anchored convention, so it reports the `imp` value **with a warning** naming the fallback. |
 | `imp` | importance-sampled `−2 log L`, NONMEM `IMP EONLY=1` | from `ofv` | `saem_ofv_samples` draws per subject (3000, the `ISAMPLE=3000` setting the [NONMEM comparison](importance-sampling.qmd#nonmem-comparison) uses), seeded by `imp_seed` so two runs agree to the bit. Carries a Monte-Carlo standard error. |
-| `agq` | adaptive Gauss–Hermite quadrature at the final estimates | from `ofv` | Deterministic and exact up to the node count; `saem_ofv_nodes ^ n_eta` evaluations per subject, so up to three random effects. A mixture or a model with more random effects falls back to `imp` with a warning. A natural cross-check of the IS value. |
+| `agq` | adaptive Gauss–Hermite quadrature at the final estimates | from `ofv` | Deterministic and exact up to the node count; `saem_ofv_nodes ^ n_eta` evaluations per subject, so up to three random effects. A mixture, a model with more random effects, or an IOV model whose stacked grid (`n_eta + n_occ·n_kappa` dimensions) exceeds the quadrature grid limit falls back to `imp` with a warning. A natural cross-check of the IS value. |
 | `focei` | the FOCE/Laplace objective | from `ofv` | The behaviour before #2973, and the value that is directly comparable with a FOCE/FOCEI fit. |
 
 #### What the SAEM objective is {#saem-objective-definition}

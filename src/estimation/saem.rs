@@ -5302,7 +5302,9 @@ pub fn run_saem(
     let mut saemobj = crate::estimation::saem_objective::SaemObjAccumulator::new(
         n_subjects,
         crate::estimation::saem_objective::unsupported(model).is_none(),
-        model.n_eta == 0,
+        // No random effect at all (neither η nor κ): nothing is sampled, so the value is the
+        // data −2 log L at the last parameters. An IOV-only model samples κ and averages.
+        model.n_eta == 0 && model.n_kappa == 0,
     );
 
     // Main loop

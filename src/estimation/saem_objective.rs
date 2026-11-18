@@ -39,9 +39,10 @@ use crate::types::CompiledModel;
 /// the mixing probability) or be the class-marginal `p(y, η)`, NONMEM's `$MIX` SAEMOBJ
 /// convention is not anchored by any committed run, and picking one unverified would be a
 /// guess. IOV models are covered: the cache holds `−log p(y, η, κ)` (the occasion effects'
-/// prior included), averaged inside the log like any other draw (not anchored either). With
-/// no random effects (`n_η = 0`) SAEMOBJ is the data `−2 log L` at the final estimates, so the
-/// last draw's value is reported, not an average over iterations at moving parameters.
+/// prior included), averaged inside the log like any other draw (not anchored either), an
+/// IOV-only model (`n_η = 0`, `n_κ > 0`) included. With no random effects at all (no η and no
+/// κ) SAEMOBJ is the data `−2 log L` at the final estimates, so the last draw's value is
+/// reported, not an average over iterations at moving parameters.
 pub(crate) fn unsupported(model: &CompiledModel) -> Option<&'static str> {
     if model.mixture.is_some() {
         Some(
@@ -57,7 +58,7 @@ pub(crate) fn unsupported(model: &CompiledModel) -> Option<&'static str> {
 /// maximum; a raw exponential is never formed).
 pub(crate) struct SaemObjAccumulator {
     enabled: bool,
-    /// `n_η = 0`: the value is the last draw's (the data −2 log L), not a mean.
+    /// No η and no κ: the value is the last draw's (the data −2 log L), not a mean.
     last_only: bool,
     max: Vec<f64>,
     /// `Σ_t exp(−nll_t − max)`.

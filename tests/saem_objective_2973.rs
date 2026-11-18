@@ -711,3 +711,87 @@ fn a_run_without_a_convergence_phase_has_no_saem_objective_and_says_so() {
         r.warnings
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review fixes
+// ---------------------------------------------------------------------------
+
+/// An `imp_eval_only` flag left in the options of a chain with no `imp` stage is inert, so the
+/// chain has no evaluator stage of its own and the default readout still runs (it used to be
+/// skipped silently, publishing the FOCE/Laplace value with AIC/BIC built from it).
+/// Mutation: gate the readout on `eval_only_methods.is_empty()` again.
+#[test]
+fn an_inert_eval_only_flag_does_not_disable_the_readout() {
+    let mut o = short_saem(SaemOfv::Saem);
+    o.imp_eval_only = true;
+    let r = warfarin_fit(&o);
+    let obj = r.saem_objective.as_ref().expect("the readout ran");
+    assert_eq!(obj.kind, SaemOfv::Saem);
+    assert!(r.aic.is_none() && r.bic.is_none());
+}
+
+/// `saem_ofv = agq` on an IOV model counts the stacked κ in the grid (d = n_η + n_occ·n_κ):
+/// `warfarin_iov_saem` has 3 η and one κ over two occasions, so d = 5 and 11⁵ nodes is over the
+/// grid limit. The readout falls back to `imp` and says why instead of laying the grid.
+/// Mutation: drop the IOV grid check (the fit reports `agq`, slowly).
+#[test]
+fn agq_readout_counts_iov_occasions_in_the_grid_and_falls_back() {
+    let prep = prepare_run(
+        "examples/warfarin_iov_saem.ferx",
+        Some("data/warfarin_iov_saem.csv"),
+    )
+    .expect("prepare");
+    let mut o = FitOptions {
+        saem_ofv: SaemOfv::Agq,
+        ..prep.parsed.fit_options.clone()
+    };
+    o.saem_n_exploration = 10;
+    o.saem_n_convergence = 10;
+    o.saem_ofv_samples = 200;
+    o.run_covariance_step = false;
+    o.verbose = false;
+    o.threads = Some(1);
+    let r = fit(&prep.parsed.model, &prep.population, &prep.init_params, &o).expect("fit");
+    let obj = r.saem_objective.as_ref().expect("a reported objective");
+    assert_eq!(obj.kind, SaemOfv::Imp);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("saem_ofv = agq unavailable") && w.contains("IOV")),
+        "{:?}",
+        r.warnings
+    );
+}
+
+/// A `FitOptions` built in code skips the model-file parser's range checks: an out-of-range
+/// `saem_ofv_nodes` falls back to `imp` with a warning, and `saem_ofv_samples = 1` (below the
+/// default 300 pilot draws) reports the FOCE/Laplace value with a warning. Neither panics.
+/// Mutations: drop the node-range check (`gauss_hermite` asserts); clamp the pilot size before
+/// the `imp_samples >= 2` check (`clamp` panics).
+#[test]
+fn out_of_range_readout_options_from_the_api_warn_instead_of_panicking() {
+    let mut o = short_saem(SaemOfv::Agq);
+    o.saem_ofv_nodes = 0;
+    let r = warfarin_fit(&o);
+    assert_eq!(
+        r.saem_objective.as_ref().map(|s| s.kind),
+        Some(SaemOfv::Imp)
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("saem_ofv_nodes")),
+        "{:?}",
+        r.warnings
+    );
+
+    let mut o = short_saem(SaemOfv::Imp);
+    o.saem_ofv_samples = 1;
+    let r = warfarin_fit(&o);
+    assert!(r.saem_objective.is_none());
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("importance-sampled −2 log L skipped")),
+        "{:?}",
+        r.warnings
+    );
+}

@@ -128,6 +128,20 @@ fn yaml_proposal_df(nu: f64) -> String {
     }
 }
 
+/// A float as a YAML scalar at `{:.6}`, or YAML's own `.nan` / `.inf` / `-.inf` when it is not
+/// finite: Rust's `NaN` / `inf` would be read back as strings (#2973, the class of #3006).
+fn yaml_f64_6(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:.6}")
+    } else if v.is_nan() {
+        ".nan".to_string()
+    } else if v > 0.0 {
+        ".inf".to_string()
+    } else {
+        "-.inf".to_string()
+    }
+}
+
 /// Largest absolute component of [`FitResult::final_gradient`], or `None` when
 /// the fit reported no gradient (#1934). A non-finite component makes the whole
 /// norm `NaN` rather than being dropped — `f64::max` discards `NaN`, so a plain
@@ -3426,7 +3440,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         };
         writeln!(f, "  ofv_type: {ty}").map_err(|e| e.to_string())?;
         if let Some(se) = o.mc_standard_error {
-            writeln!(f, "  ofv_mc_standard_error: {se:.6}").map_err(|e| e.to_string())?;
+            writeln!(f, "  ofv_mc_standard_error: {}", yaml_f64_6(se))
+                .map_err(|e| e.to_string())?;
         }
         if let Some(k) = o.n_samples {
             writeln!(f, "  ofv_n_samples: {k}").map_err(|e| e.to_string())?;
@@ -3434,7 +3449,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         if let Some(n) = o.n_nodes {
             writeln!(f, "  ofv_n_nodes: {n}").map_err(|e| e.to_string())?;
         }
-        writeln!(f, "  ofv_foce_laplace: {:.6}", o.foce_ofv).map_err(|e| e.to_string())?;
+        writeln!(f, "  ofv_foce_laplace: {}", yaml_f64_6(o.foce_ofv)).map_err(|e| e.to_string())?;
     }
     if let Some(ref is) = result.importance_sampling {
         writeln!(
@@ -8294,6 +8309,29 @@ mod tests {
         assert!(!summary.contains("marginal"), "{summary}");
         let yaml = objective_yaml(&r);
         assert!(yaml.contains("  ofv: 4326.600000\n  aic:"), "{yaml}");
+    }
+
+    /// #2973 review: the readout's YAML floats spell a non-finite value as YAML does (`.nan`,
+    /// `.inf`, `-.inf`), never Rust's `NaN` / `inf`, which a YAML reader loads as a string.
+    /// Mutation: write `ofv_foce_laplace` with `{:.6}` again.
+    #[test]
+    fn saem_objective_yaml_floats_are_yaml_scalars_when_not_finite() {
+        assert_eq!(yaml_f64_6(1.5), "1.500000");
+        assert_eq!(yaml_f64_6(f64::NAN), ".nan");
+        assert_eq!(yaml_f64_6(f64::INFINITY), ".inf");
+        assert_eq!(yaml_f64_6(f64::NEG_INFINITY), "-.inf");
+        use EstimationMethod::Saem;
+        let mut r = imp_objective_result(Saem, &[Saem], Some(KappaTreatment::NotApplicable));
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Imp,
+            mc_standard_error: Some(f64::NAN),
+            n_samples: Some(10),
+            n_nodes: None,
+            foce_ofv: f64::NAN,
+        });
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  ofv_mc_standard_error: .nan\n"), "{yaml}");
+        assert!(yaml.contains("  ofv_foce_laplace: .nan\n"), "{yaml}");
     }
 
     /// #2973: a SAEM fit under the default `saem_ofv = saem` has no information criterion.

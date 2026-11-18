@@ -8620,9 +8620,11 @@ pub struct FitResult {
     pub prior_summary: Vec<PriorSummary>,
     /// `ofv_data + 2k`, or `None` when the reported objective is not a likelihood: a SAEM
     /// fit under `saem_ofv = saem` (NONMEM's SAEMOBJ, #2973). Set `saem_ofv = imp`
-    /// (or `agq` / `focei`) for a value. `Some(NaN)` marks an estimator with no objective.
+    /// (or `agq` / `focei`) for a value. Also `None` when the value is not finite (an
+    /// estimator with no objective, such as a VI fit under `vi_final_ofv = none`).
     pub aic: Option<f64>,
-    /// `ofv_data + k·ln(n)`; `None` exactly when [`Self::aic`] is.
+    /// `ofv_data + k·ln(n)`; `None` whenever [`Self::aic`] is, and also for a fit with no
+    /// records to count (`n = 0`).
     pub bic: Option<f64>,
     pub theta: Vec<f64>,
     pub theta_names: Vec<String>,

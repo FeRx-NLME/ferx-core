@@ -464,8 +464,8 @@ fn main() {
 
             println!("\nFit completed!");
             println!("OFV: {:.4}", fit_result.ofv);
-            // A SAEM fit's OFV is the IS / quadrature -2 log L (#2973); say so, and give the
-            // FOCE/Laplace value the old number was.
+            // A SAEM fit's OFV is the SAEM objective or the IS / quadrature -2 log L (#2973);
+            // say which, and give the FOCE/Laplace value the old number was.
             if let Some(o) = &fit_result.saem_objective {
                 let kind = match o.kind {
                     ferx_core::types::SaemOfv::Saem => {

@@ -1520,10 +1520,68 @@ fn floor_escaped(
     })
 }
 
-/// The `−2 log L` a SAEM fit reports at its final estimates (#2973), by `saem_ofv`:
-/// the importance-sampled value (NONMEM `IMP EONLY=1`) or the adaptive-quadrature one.
-/// `prev` is the SAEM stage's result, whose EBEs and Hessians seed the evaluator and whose
-/// `ofv` (the FOCE/Laplace objective) is kept as `SaemObjective::foce_ofv`.
+/// The adaptive-Gauss–Hermite `−2 log L` at `params`, with the EBEs reconverged there: the
+/// grid is centred on the conditional mode and scaled by its Hessian, so a mode carried over
+/// from another method would misplace it. `opts` is a quadrature stage's options
+/// (`agq_nodes()` is `Some`); its inner tolerance, Hessian seed and anchor are used as given.
+/// Shared by the `agq_eval_only` stage and the `saem_ofv = agq` readout (#2973), so the two
+/// agree at the same parameters.
+#[allow(clippy::type_complexity)]
+fn agq_marginal_at(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    warm: Option<&[DVector<f64>]>,
+    opts: &FitOptions,
+) -> (
+    f64,
+    Vec<DVector<f64>>,
+    Vec<DMatrix<f64>>,
+    Vec<Vec<DVector<f64>>>,
+) {
+    let n_nodes = opts.agq_nodes().unwrap_or(1);
+    let mu_k = crate::estimation::parameterization::compute_mu_k(
+        model,
+        &params.theta,
+        opts.mu_referencing,
+    );
+    // Seeded like the estimator stages and `run_covariance` (#1389): at a loose
+    // `inner_tol` the seeded and unseeded solves stop at η̂ that differ at the
+    // ~1e-11 level, and this OFV should agree with the one a preceding
+    // Laplace/AGQ stage reported at the same parameters.
+    let (eta_hats, h_matrices, _stats, kappas) =
+        crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+            model,
+            population,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            warm,
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            crate::estimation::inner_optimizer::InnerHessianSeed::for_options(opts),
+            opts,
+            crate::estimation::inner_optimizer::PrevEtas::Solved,
+        );
+    let nll = crate::estimation::agq::agq_population_nll(
+        model,
+        population,
+        params,
+        &eta_hats,
+        &kappas,
+        n_nodes,
+        opts.hessian_anchor(),
+    );
+    (2.0 * nll, eta_hats, h_matrices, kappas)
+}
+
+/// The objective a SAEM fit reports at its final estimates (#2973), by `saem_ofv`: NONMEM's
+/// SAEM objective (accumulated during the run), the importance-sampled `−2 log L` (NONMEM
+/// `IMP EONLY=1`) or the adaptive-quadrature one. `prev` is the SAEM stage's result, whose
+/// EBEs and Hessians seed the evaluator and whose `ofv` (the FOCE/Laplace objective) is kept
+/// as `SaemObjective::foce_ofv`. An `Err` (or a non-finite value) is the caller's cue to fall
+/// back, with a warning.
 fn saem_reported_objective(
     model: &CompiledModel,
     population: &Population,
@@ -1539,7 +1597,10 @@ fn saem_reported_objective(
                 .filter(|v| v.is_finite())
                 .ok_or_else(|| {
                     crate::estimation::saem_objective::unsupported(model)
-                        .unwrap_or("the run had no convergence-phase draw")
+                        .unwrap_or(
+                            "the run had no convergence-phase draw, or a subject's joint \
+                             density was not finite",
+                        )
                         .to_string()
                 })?;
             let obj = SaemObjective {
@@ -1597,41 +1658,51 @@ fn saem_reported_objective(
                     model.n_eta
                 ));
             }
-            // Reconverged exactly like the `agq_eval_only` stage: the grid is centred on the
-            // conditional mode and scaled by its Hessian, at the tolerance quadrature needs.
+            // The model-file parser checks this range; a `FitOptions` built in code does not
+            // pass through it, and `gauss_hermite` asserts it.
+            if !(2..=crate::estimation::agq::MAX_AGQ_NODES).contains(&n_nodes) {
+                return Err(format!(
+                    "saem_ofv_nodes must be in 2..={}, got {n_nodes}",
+                    crate::estimation::agq::MAX_AGQ_NODES
+                ));
+            }
+            // IOV stacks every occasion's κ into the grid (d = n_η + n_occ·n_κ), which the
+            // n_η bound above does not see: cap the grid itself, as `check_agq_grid_iov` does
+            // for an AGQ stage.
+            if model.n_kappa > 0 {
+                let max_occ = population
+                    .subjects
+                    .iter()
+                    .map(crate::stats::stacked_layout::group_count)
+                    .max()
+                    .unwrap_or(0);
+                let d = crate::stats::stacked_layout::stacked_width(
+                    model.n_eta,
+                    model.n_kappa,
+                    max_occ,
+                );
+                let grid = crate::estimation::agq::grid_size(n_nodes, d);
+                if grid > crate::estimation::agq::MAX_AGQ_GRID {
+                    return Err(format!(
+                        "with IOV the quadrature grid stacks {d} random effects \
+                         ({n_nodes}^{d} nodes per subject, above the {} limit)",
+                        crate::estimation::agq::MAX_AGQ_GRID
+                    ));
+                }
+            }
+            // Evaluated exactly as an `agq_eval_only` stage would be at these estimates: a
+            // `laplace` stage with `n_agq = saem_ofv_nodes`, at the tolerance quadrature
+            // needs (`fit_inner` tightens a quadrature stage's `inner_tol` the same way).
             let mut o = opts.clone();
+            o.method = EstimationMethod::Laplace;
+            o.methods = Vec::new();
+            o.interaction =
+                crate::types::interaction_for(EstimationMethod::Laplace, opts.interaction);
+            o.n_agq = n_nodes;
             o.inner_tol = o.inner_tol.min(1e-8);
-            let mu_k = crate::estimation::parameterization::compute_mu_k(
-                model,
-                &prev.params.theta,
-                o.mu_referencing,
-            );
             let warm =
                 crate::estimation::outer_optimizer::joint_warm_starts(&prev.eta_hats, &prev.kappas);
-            let (eta_hats, _h, _stats, kappas) =
-                crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
-                    model,
-                    population,
-                    &prev.params,
-                    o.inner_maxiter,
-                    o.inner_tol,
-                    Some(warm.as_slice()),
-                    Some(&mu_k),
-                    o.min_obs_for_convergence_check as usize,
-                    o.inner_restarts,
-                    crate::estimation::inner_optimizer::InnerHessianSeed::None,
-                    &o,
-                    crate::estimation::inner_optimizer::PrevEtas::Solved,
-                );
-            let nll = crate::estimation::agq::agq_population_nll(
-                model,
-                population,
-                &prev.params,
-                &eta_hats,
-                &kappas,
-                n_nodes,
-                crate::types::HessianAnchor::Exact,
-            );
+            let (ofv, ..) = agq_marginal_at(model, population, &prev.params, Some(&warm), &o);
             let obj = SaemObjective {
                 kind,
                 mc_standard_error: None,
@@ -1639,7 +1710,7 @@ fn saem_reported_objective(
                 n_nodes: Some(n_nodes),
                 foce_ofv: prev.ofv,
             };
-            Ok((2.0 * nll, obj, None))
+            Ok((ofv, obj, None))
         }
     }
 }
@@ -2442,46 +2513,18 @@ fn fit_inner(
         // modes) would put the grid in the wrong place. Deterministic throughout, which is
         // the whole point relative to `method = [..., imp]` with `imp_eval_only`.
         if method == EstimationMethod::Laplace && stage_opts.agq_eval_only {
-            let n_nodes = stage_opts.agq_nodes().unwrap_or(1);
-            let mu_k = crate::estimation::parameterization::compute_mu_k(
-                model,
-                &stage_params.theta,
-                stage_opts.mu_referencing,
-            );
-            // Seeded like the estimator stages and `run_covariance` (#1389): at a loose
-            // `inner_tol` the seeded and unseeded solves stop at η̂ that differ at the
-            // ~1e-11 level, and this stage's OFV should agree with the one a preceding
-            // Laplace/AGQ stage reported at the same parameters. Warm from the preceding
-            // stage's joint mode, κ̂ included, so an IOV subject does not restart κ at 0
-            // (#2261).
+            // Warm from the preceding stage's joint mode, κ̂ included, so an IOV subject does
+            // not restart κ at 0 (#2261).
             let warm = result.as_ref().map(|r| {
                 crate::estimation::outer_optimizer::joint_warm_starts(&r.eta_hats, &r.kappas)
             });
-            let (eta_hats, h_matrices, _stats, kappas) =
-                crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
-                    model,
-                    population,
-                    &stage_params,
-                    stage_opts.inner_maxiter,
-                    stage_opts.inner_tol,
-                    warm.as_deref(),
-                    Some(&mu_k),
-                    stage_opts.min_obs_for_convergence_check as usize,
-                    stage_opts.inner_restarts,
-                    crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
-                    &stage_opts,
-                    crate::estimation::inner_optimizer::PrevEtas::Solved,
-                );
-            let nll = crate::estimation::agq::agq_population_nll(
+            let (ofv, eta_hats, h_matrices, kappas) = agq_marginal_at(
                 model,
                 population,
                 &stage_params,
-                &eta_hats,
-                &kappas,
-                n_nodes,
-                stage_opts.hessian_anchor(),
+                warm.as_deref(),
+                &stage_opts,
             );
-            let ofv = 2.0 * nll;
             // This stage writes `result.ofv` on both branches, so it owns the
             // published objective even though it estimates nothing (#1303).
             objective_stage = Some(method);
@@ -2718,9 +2761,10 @@ fn fit_inner(
                         });
                     }
                     // `[saem, imp]` + `imp_eval_only` is NONMEM's `SAEM` → `IMP EONLY=1`
-                    // workflow spelled out: under the default `saem_ofv = imp` its IS value
-                    // is the reported objective, as the implicit readout would have been
-                    // (#2973). A later `agq_eval_only` stage still replaces it.
+                    // workflow spelled out: as NONMEM's final `$EST` step's value does, its IS
+                    // value becomes the reported objective under `saem_ofv = saem` (the
+                    // default) or `imp` (#2973). This is the terminal stage (validation), so
+                    // nothing later overwrites it.
                     let after_saem = chain[..stage_idx]
                         .iter()
                         .rev()
@@ -2860,21 +2904,30 @@ fn fit_inner(
         objective_stage = Some(method);
         result = Some(stage_result);
 
-        // SAEM's reported objective (#2973): NONMEM follows `METHOD=SAEM` with
-        // `METHOD=IMP EONLY=1` and reports that importance-sampled −2 log L, so that is the
-        // default `ofv`; the FOCE/Laplace value moves to `SaemObjective::foce_ofv`. A chain
-        // that carries its own evaluator stage (`imp_eval_only` / `agq_eval_only`) is
-        // explicit and handled by that stage. Best-effort like the IMP marginal below: a
-        // model the evaluator cannot score keeps the FOCE/Laplace `ofv`, with a warning.
+        // SAEM's reported objective (#2973): by default NONMEM's SAEM objective (SAEMOBJ),
+        // or by `saem_ofv` the importance-sampled / quadrature −2 log L; the FOCE/Laplace
+        // value moves to `SaemObjective::foce_ofv`. A chain that carries its own evaluator
+        // stage after SAEM (`imp_eval_only` / `agq_eval_only`) is explicit and handled by
+        // that stage; an eval-only flag naming a method the chain does not run is inert and
+        // does not count. Best-effort like the IMP marginal below: a model the evaluator
+        // cannot score keeps the FOCE/Laplace `ofv`, with a warning.
         if method == EstimationMethod::Saem
             && is_last_estimating
-            && eval_only_methods.is_empty()
+            && stage_idx + 1 == chain.len()
             && stage_opts.saem_ofv != SaemOfv::Focei
         {
             let prev = result.as_mut().expect("stage result was just set");
             let mut tried = stage_opts.saem_ofv;
             let outcome = loop {
-                match saem_reported_objective(model, population, prev, &stage_opts, tried) {
+                let attempt = saem_reported_objective(model, population, prev, &stage_opts, tried)
+                    .and_then(|x| {
+                        if x.0.is_finite() {
+                            Ok(x)
+                        } else {
+                            Err(format!("the value is not finite ({})", x.0))
+                        }
+                    });
+                match attempt {
                     Ok(x) => break Some(x),
                     Err(e) if tried == SaemOfv::Saem => {
                         accumulated_warnings.push(format!(
@@ -2899,7 +2952,7 @@ fn fit_inner(
                     }
                 }
             };
-            if let Some((ofv, obj, is)) = outcome.filter(|(ofv, ..)| ofv.is_finite()) {
+            if let Some((ofv, obj, is)) = outcome {
                 if let Some(msg) = is
                     .as_ref()
                     .and_then(crate::estimation::importance_sampling::marginal_reliability_warning)

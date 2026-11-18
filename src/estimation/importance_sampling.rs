@@ -647,16 +647,17 @@ pub fn run_importance_sampling(
     let defensive_alpha = eval_defensive_alpha(options);
     let adapt_passes = options.imp_adapt_passes;
     let cancel = &options.cancel;
+
+    if k_samples < 2 {
+        return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
+    }
     // Draws per pilot pass: `imp_adapt_samples`, or the full `imp_samples` when unset (0).
+    // After the `k_samples >= 2` check: `clamp` panics when its bounds cross.
     let pilot_k = if options.imp_adapt_samples == 0 {
         k_samples
     } else {
         options.imp_adapt_samples.clamp(2, k_samples)
     };
-
-    if k_samples < 2 {
-        return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
-    }
     if nu.is_nan() || nu < 1.0 {
         return Err(format!(
             "IS: imp_proposal_df must be >= 1.0 or `normal`, got {}",

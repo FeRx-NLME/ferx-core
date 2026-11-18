@@ -107,11 +107,28 @@ fn two_candidates_with_the_same_canonical_text_are_fitted_once() {
     assert_eq!(report.results[1].parent.as_deref(), Some("first"));
 }
 
-/// #2973: a candidate whose fit has no information criterion (a SAEM fit under the default
-/// `saem_ofv = saem`) stops the run with an error that names the fix, under every criterion;
-/// it is never ranked on its non-likelihood objective, and later candidates are not fitted.
-/// Mutations: drop the `aic/bic is_none` arm (the run returns Ok and ranks it); drop the
-/// `no_ic` check at the top of `fit_one` (the later candidates are fitted); drop the fix
+/// A fit whose objective is NONMEM's SAEM objective (`saem_ofv = saem`, #2973): not a
+/// likelihood, so no AIC/BIC.
+fn saem_objective_fit(ofv: f64) -> ferx_core::types::FitResult {
+    let mut fit = converged_fit(ofv);
+    fit.aic = None;
+    fit.bic = None;
+    fit.saem_objective = Some(ferx_core::types::SaemObjective {
+        kind: ferx_core::types::SaemOfv::Saem,
+        mc_standard_error: None,
+        n_samples: None,
+        n_nodes: None,
+        foce_ofv: ofv + 1000.0,
+    });
+    fit
+}
+
+/// #2973: a candidate whose fit reports the SAEM objective (not a likelihood, so no
+/// information criterion) stops the run with an error that names the fix, under every
+/// criterion; it is never ranked on its non-likelihood objective, and later candidates are
+/// not fitted.
+/// Mutations: drop the `ranks_on_no_likelihood` arm (the run returns Ok and ranks it); drop
+/// the `no_ic` check at the top of `fit_one` (the later candidates are fitted); drop the fix
 /// from the message.
 #[test]
 fn a_fit_without_an_information_criterion_stops_the_run_naming_the_fix() {
@@ -131,10 +148,7 @@ fn a_fit_without_an_information_criterion_stops_the_run_naming_the_fix() {
             .threads(1)
             .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
                 recorder.record(&c.id);
-                let mut fit = converged_fit(100.0);
-                fit.aic = None;
-                fit.bic = None;
-                Ok(fit)
+                Ok(saem_objective_fit(100.0))
             })
             .map(|_| ())
             .unwrap_err();
@@ -153,6 +167,98 @@ fn a_fit_without_an_information_criterion_stops_the_run_naming_the_fix() {
         })
         .expect("a fit with criteria is ranked");
     assert_eq!(report.results.len(), 1);
+}
+
+/// #2973 review: a fit with no information criterion for another reason (a non-SAEM fit whose
+/// objective came back non-finite) is judged as before — it fails the gate or ranks last —
+/// and does not abort the whole search with advice about `saem_ofv`.
+/// Mutation: key the stop on `aic.is_none()` instead of the SAEM objective (the run errs).
+#[test]
+fn a_non_saem_fit_without_an_information_criterion_does_not_stop_the_run() {
+    let candidates = vec![
+        candidate("first", "[parameters]\ntheta CL = 1\n"),
+        candidate("second", "[parameters]\ntheta CL = 2\n"),
+    ];
+    let options = RunOptions {
+        criterion: Criterion::Aic,
+        ..lenient()
+    };
+    let report = Runner::new()
+        .threads(1)
+        .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+            let mut fit = converged_fit(100.0);
+            if c.id == "first" {
+                fit.ofv = f64::NAN;
+                fit.converged = false;
+                fit.aic = None;
+                fit.bic = None;
+            }
+            Ok(fit)
+        })
+        .expect("a divergent candidate does not abort the search");
+    assert_eq!(report.results.len(), 2);
+    assert!(report.results[0].criterion.is_nan());
+    assert_eq!(report.results[1].criterion, 102.0);
+}
+
+/// #2973 review: a SAEM-objective fit reused from another search directory, or read back on
+/// a resume, meets the same rule as a fresh one: the run stops rather than ranking it.
+/// Mutations: drop the guard on the foreign loop (the reuse run returns Ok); drop the guard
+/// on the resumed rows (the resume run returns Ok).
+#[test]
+fn a_reused_or_resumed_saem_objective_fit_stops_the_run() {
+    // Seed a directory with ordinary fits, then rewrite their cached files as SAEM-objective
+    // fits: what a cache written before this rule (or by another tool) can hold.
+    let seed = |dir: &std::path::Path| -> Vec<Candidate> {
+        let seeded = seed_dir(dir, &["a"], Criterion::Ofv);
+        let fits = crate::search::journal::fits_dir(dir);
+        for entry in std::fs::read_dir(&fits).expect("fits dir") {
+            let path = entry.expect("entry").path();
+            let text = std::fs::read_to_string(&path).expect("read fit");
+            let mut fit = ferx_core::types::FitResult::from_json_str(&text).expect("parse fit");
+            fit.aic = None;
+            fit.bic = None;
+            fit.saem_objective = saem_objective_fit(fit.ofv).saem_objective;
+            std::fs::write(&path, serde_json::to_string(&fit).expect("ser")).expect("write");
+        }
+        seeded
+    };
+
+    // Reused from another directory.
+    let other = tempfile::tempdir().expect("tempdir");
+    let seeded = seed(other.path());
+    let err = Runner::new()
+        .threads(1)
+        .reuse_from(other.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &lenient(), |_, _| {
+            Ok(converged_fit(100.0))
+        })
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.contains("`a`") && err.contains("saem_ofv = imp"),
+        "{err}"
+    );
+
+    // Resumed from this run's own directory.
+    let own = tempfile::tempdir().expect("tempdir");
+    let seeded = seed(own.path());
+    let options = RunOptions {
+        resume: true,
+        ..lenient()
+    };
+    let err = Runner::new()
+        .threads(1)
+        .cache_dir(own.path())
+        .run_with_fitter(&seeded, &population(&["1"]), &options, |_, _| {
+            Ok(converged_fit(100.0))
+        })
+        .map(|_| ())
+        .unwrap_err();
+    assert!(
+        err.contains("`a`") && err.contains("saem_ofv = imp"),
+        "{err}"
+    );
 }
 
 // A fit with no criterion scores NaN under `Criterion::Aic` and every BIC type, never 0.
