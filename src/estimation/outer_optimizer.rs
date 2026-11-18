@@ -4951,7 +4951,7 @@ fn per_subject_outer_gradients_checked(
             checked,
         );
     }
-    let objective = crate::estimation::covariance::cov_objective(options);
+    let objective = crate::estimation::covariance::cov_objective(model, options);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
     crate::par::map(population.subjects.len(), |i| {

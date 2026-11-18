@@ -929,9 +929,18 @@ pub(super) mod forced_cov_decline {
 
 /// The objective the analytic R-matrix differentiates: the one the fit minimised (see
 /// `analytic_cov_hessian`), and whose per-subject gradients the BHHH decrement reads.
-pub(crate) fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
+///
+/// A mixture model's objective is FOCE/FOCEI whatever `n_agq` says: `mixture_ofv` scores every
+/// class with the FOCE/FOCEI subject objective and never evaluates a quadrature grid (fitting a
+/// mixture under Laplace/AGQ is #3025). So a caller that hands `run_covariance` a quadrature
+/// `n_agq` for a mixture fit still gets the R-matrix of the objective that fit minimised.
+pub(crate) fn cov_objective(
+    model: &CompiledModel,
+    options: &FitOptions,
+) -> crate::sens::ode_provider::adjoint::Objective {
     use crate::sens::ode_provider::adjoint::Objective;
-    match options.agq_nodes() {
+    let quadrature = options.agq_nodes().filter(|_| model.mixture.is_none());
+    match quadrature {
         Some(n_agq) => Objective::Agq {
             n_agq,
             exact: options.hessian_anchor() != HessianAnchor::GaussNewton,
@@ -1099,21 +1108,11 @@ fn analytic_cov_model_declines(
     if !options.analytic_cov_hessian {
         out.push(CovScopeDecline::Disabled);
     }
-    // A mixture has its own exact assembly (`mixture::mixture_cov_hessian`), for the
-    // FOCE/FOCEI class objectives `mixture_ofv` scores. A caller-supplied `n_agq` (through
-    // `run_covariance`) makes `cov_objective` Laplace/AGQ, which that assembly declines.
-    if model.mixture.is_some()
-        && !matches!(
-            cov_objective(options),
-            crate::sens::ode_provider::adjoint::Objective::Foce
-                | crate::sens::ode_provider::adjoint::Objective::Focei
-        )
-    {
-        out.push(CovScopeDecline::Mixture);
-    }
-    // The adjoint's profile Hessian serves every estimator and anchor; what it declines is
-    // the model (a shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's
-    // exact term) or the user's `gradient = fd` opt-out from analytic derivatives.
+    // The adjoint's profile Hessian serves every estimator and anchor, and a mixture through
+    // its own exact assembly (`mixture::mixture_cov_hessian`, over the FOCE/FOCEI objective
+    // `cov_objective` gives a mixture); what it declines is the model (a shape no recorder
+    // serves, a non-Gaussian endpoint outside FOCE/FOCEI's exact term) or the user's
+    // `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
     }
@@ -1123,7 +1122,7 @@ fn analytic_cov_model_declines(
     if model.has_non_gaussian()
         && !crate::sens::ode_provider::adjoint::cov_non_gaussian_served(
             model,
-            cov_objective(options),
+            cov_objective(model, options),
         )
     {
         out.push(CovScopeDecline::NonGaussianEndpoint);
@@ -1296,7 +1295,7 @@ fn per_subject_adjoint<R: Send>(
     // differentiates every one of these objectives — FOCE (its frozen-variance mode
     // included), FOCEI, and the quadrature marginal under either anchor, Laplace's exact `H`
     // carried by an inner η-dual — so there is no anchor or estimator to decline here.
-    let objective = cov_objective(options);
+    let objective = cov_objective(model, options);
     // One unpack for the population: every subject is at `x`.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
     Some(crate::par::map(
@@ -2652,7 +2651,7 @@ fn covariance_step(
                 template,
                 x_hat,
                 options,
-                cov_objective(options),
+                cov_objective(model, options),
             ) {
                 Some(h) => AnalyticCovAssembly::Full(h),
                 None => AnalyticCovAssembly::Unavailable,

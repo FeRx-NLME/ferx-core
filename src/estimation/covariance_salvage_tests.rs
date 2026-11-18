@@ -2281,16 +2281,16 @@ fn the_analytic_r_matrix_skips_held_axes_and_keeps_the_free_block_bit_identical(
     }
 }
 
-/// A mixture fit whose covariance step is asked for under Laplace/AGQ (`run_covariance` with a
-/// caller-supplied `n_agq`) reaches `mixture_cov_hessian`, which serves the FOCE/FOCEI class
-/// objectives only and returns `None` for the rest. The walk therefore has to name it
-/// beforehand (`CovScopeDecline::Mixture`), or the route is predicted Analytic and the
-/// stencil's drift is reported as a per-subject bail. Both sides of the gate in one test: FOCE,
-/// FOCEI and a non-mixture model under the same quadrature must not carry the clause.
+/// A mixture's objective is FOCE/FOCEI whatever `n_agq` says (`mixture_ofv` never evaluates a
+/// quadrature grid; Laplace/AGQ mixtures are #3025), so a caller-supplied quadrature `n_agq`
+/// through `run_covariance` must not move the R-matrix onto an objective the fit never
+/// minimised: `cov_objective` gives the mixture FOCEI and the exact mixture assembly serves it
+/// (#3004 review r2). The same options on a non-mixture model keep the quadrature objective, so
+/// the rule is the mixture's, not the options'.
 #[test]
-fn a_mixture_under_quadrature_is_declined_by_name_and_predicts_the_stencil() {
-    use crate::estimation::cov_diagnostics::CovScopeDecline;
+fn a_mixture_differentiates_the_objective_its_fit_scored_whatever_n_agq_says() {
     use crate::estimation::covariance::PredictedRRoute;
+    use crate::sens::ode_provider::adjoint::Objective;
     use crate::types::{EstimationMethod, FitOptions};
     let mixture = parse_model_string(
         "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
@@ -2307,59 +2307,30 @@ fn a_mixture_under_quadrature_is_declined_by_name_and_predicts_the_stencil() {
          [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
     )
     .unwrap();
-    let opts = |method, n_agq| FitOptions {
-        method,
-        n_agq,
+    let focei_agq = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 3,
         ..FitOptions::default()
     };
-    for (label, o) in [
-        ("laplace", opts(EstimationMethod::Laplace, 1)),
-        ("agq", opts(EstimationMethod::Laplace, 3)),
-        ("focei+agq", opts(EstimationMethod::FoceI, 3)),
-    ] {
-        assert!(
-            o.agq_nodes().is_some(),
-            "{label}: premise, a quadrature objective"
-        );
-        assert_eq!(
-            super::analytic_cov_model_declines(&mixture, &o),
-            vec![CovScopeDecline::Mixture],
-            "{label}"
-        );
-        assert_eq!(
-            super::predicted_r_route(&mixture, &o),
-            PredictedRRoute::Stencil,
-            "{label}"
-        );
-        assert_eq!(
-            super::analytic_cov_declines(&mixture, &o),
-            vec![CovScopeDecline::Mixture],
-            "{label}: named, not the per-subject-bail fallback"
-        );
-        assert_eq!(
-            super::analytic_cov_model_declines(&plain, &o),
-            Vec::new(),
-            "{label}: the clause is the mixture's, not the quadrature's"
-        );
-    }
-    for (label, o) in [
-        ("foce", opts(EstimationMethod::Foce, 1)),
-        ("focei", opts(EstimationMethod::FoceI, 1)),
-    ] {
-        assert!(o.agq_nodes().is_none(), "{label}");
-        assert_eq!(
-            super::analytic_cov_model_declines(&mixture, &o),
-            Vec::new(),
-            "{label}"
-        );
-        assert_eq!(
-            super::predicted_r_route(&mixture, &o),
-            PredictedRRoute::Analytic,
-            "{label}"
-        );
-    }
     assert!(
-        CovScopeDecline::Mixture.clause().contains("mixture"),
-        "the message names the mixture"
+        focei_agq.agq_nodes().is_some(),
+        "premise: a quadrature objective"
+    );
+    assert_eq!(
+        super::cov_objective(&mixture, &focei_agq),
+        Objective::Focei,
+        "the mixture keeps the objective its fit scored"
+    );
+    assert!(
+        matches!(
+            super::cov_objective(&plain, &focei_agq),
+            Objective::Agq { n_agq: 3, .. }
+        ),
+        "a single population keeps the quadrature objective"
+    );
+    assert!(super::analytic_cov_model_declines(&mixture, &focei_agq).is_empty());
+    assert_eq!(
+        super::predicted_r_route(&mixture, &focei_agq),
+        PredictedRRoute::Analytic
     );
 }
