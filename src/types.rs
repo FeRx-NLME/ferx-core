@@ -9274,7 +9274,9 @@ pub struct FitResult {
     #[serde(default)]
     pub starts: Vec<StartRecord>,
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
-    /// when no explicit seed was set in `[fit_options]`.
+    /// when no explicit seed was set in `[fit_options]`. When start `k > 0` of a
+    /// multi-start SAEM fit wins, this is that start's derived seed
+    /// (`per_start_seed`, #3021), the one that reproduces it.
     pub saem_seed: Option<u64>,
     /// The seed the SIR draws actually used: `sir_seed` when it was set, the
     /// built-in default otherwise, so the run is reproducible from this field

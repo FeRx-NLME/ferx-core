@@ -1837,22 +1837,24 @@ fn the_mixing_tally_leaves_the_imh_move_out() {
     assert_eq!(prop, cw_prop, "IMH proposals reached the mixing tally");
 }
 
-/// Captured on `main` f8955c24 (macOS arm64) by running this test's body there:
-/// θ (2), Ω (2×2, column-major), σ (1), the SAEM objective.
+/// θ (2), Ω (2×2, column-major), σ (1), the SAEM objective. Originally captured on `main`
+/// f8955c24 (macOS arm64); re-captured on Linux x86_64 under #3021, which re-keyed the
+/// per-subject E-step streams (`stream_seed`), so every draw moved (θ₁ 2.7158 → 2.6976).
 const FROZEN_LEN: usize = 8;
 const FROZEN_MAIN: [f64; FROZEN_LEN] = [
-    f64::from_bits(0x4005b9e068362eda),
-    f64::from_bits(0x403308f6f0f08f9c),
-    f64::from_bits(0x3fba2eb62a8bc775),
+    f64::from_bits(0x4005949fc23c16ad),
+    f64::from_bits(0x4032e90e1d76cd3d),
+    f64::from_bits(0x3fb9d33220d5b90d),
     0.0,
     0.0,
-    f64::from_bits(0x3f6e0970b0407fdd),
-    f64::from_bits(0x3fa543cf2f825db8),
-    f64::from_bits(0xc049b5cf65530c04),
+    f64::from_bits(0x3f7223960bfe95f2),
+    f64::from_bits(0x3fa742ba0442093a),
+    f64::from_bits(0xc049913536369f76),
 ];
 
-/// The default path frozen against `main` (f8955c24): a seeded random-walk fit's
-/// estimates and objective, captured there with this exact fixture. Any change
+/// The default path, frozen: a seeded random-walk fit's estimates and objective with
+/// this exact fixture (captured on `main` f8955c24, re-captured under #3021 when the
+/// per-subject E-step streams were re-keyed; see `FROZEN_MAIN`). Any change
 /// to the default E-step — an extra RNG draw, a reordered proposal, a scale
 /// controller fed differently — moves these far past the tolerance (one extra
 /// draw moves θ in the third figure), while the tolerance absorbs a last-bit

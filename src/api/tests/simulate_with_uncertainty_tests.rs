@@ -3758,7 +3758,7 @@ fn every_public_options_struct_implements_default() {
 
 /// The crossers an NPDE reference run at `seed` draws on [`tiny_population`] under
 /// [`INDOMAIN_TWINLESS_TRANSIT_SRC`] at ω²(ETA_CL) = `var`, counted **outside** the engine:
-/// the subject-`i` stream is `StdRng::seed_from_u64(seed + i)`, each replicate draws one η
+/// the subject-`i` stream is `StdRng::seed_from_u64(stream_seed(seed, &[i]))`, each replicate draws one η
 /// normal then one ε normal per observation (a single σ, no `block_sigma`, so the per-row
 /// draw), and the domain test is the closed form — `CL/V = 0.5·e^η/4 ≥ KTR = (3+1)/20`
 /// ⇔ `η ≥ ln 1.6`. Coupled to the draw order on purpose: an exact count is what lets the
@@ -3771,7 +3771,7 @@ fn npde_reference_crossers(var: f64, nsim: usize, seed: u64) -> usize {
     let threshold = 1.6_f64.ln();
     let mut crossed = 0;
     for (i, s) in pop.subjects.iter().enumerate() {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(i as u64));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(crate::rng::stream_seed(seed, &[i as u64]));
         for _ in 0..nsim {
             let eta = var.sqrt() * normal.sample(&mut rng);
             for _ in &s.observations {
