@@ -7705,7 +7705,8 @@ fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
         "near-singular row: gated F gap {:.3e}, ungated {:.3e}",
         gated.0, ungated.0
     );
-    // Measured on macOS arm64 (#2441, t = 20 h): ungated 7.4e-2 relative, gated 7.7e-12. The
+    // Measured on macOS arm64 (#2441, t = 20 h): ungated 7.4e-2 relative, gated 7.7e-12 (3.2e-11
+    // since #2988 rotates the rows into `I + S` rather than factoring the dense `R̃`). The
     // ungated bound sits 10× inside its side; the gated one (kept from the Linux-measured
     // t = 23 h fixture, 2.3e-11) has ~30× headroom here. Either reddens if the gate stops
     // separating them.
