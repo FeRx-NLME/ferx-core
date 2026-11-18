@@ -376,6 +376,25 @@ Two conventions matter when reproducing this:
   a factor of two — that is the convention difference, not a discrepancy. See
   [`covariance_method`](model-file/fit-options.qmd).
 
+## How do I fit count data (Poisson / negative binomial), like NONMEM's `-2LL` count models or nlmixr2's `dpois`?
+
+Declare a [`[count_model]`](model-file/count.qmd) block: `type = poisson` or
+`type = negbin`, the mean as `lambda = …` or `log_lambda = …`, and for the negative
+binomial the size `r = …` (variance `λ + λ²/r`). There is no `$PRED` log-likelihood to
+write by hand.
+
+| | NONMEM | nlmixr2 | ferx |
+|--|--------|---------|------|
+| Poisson | `Y = -2*(DV*LOG(LAM) - LAM - GAMLN(DV+1))`, `$EST ... -2LL` | `DV ~ dpois(lambda)` | `type = poisson`, `lambda = …` |
+| Negative binomial | a `GAMLN`-based log-PMF in `$PRED` | `DV ~ dnbinomMu(size, mu)` | `type = negbin`, `lambda = …`, `r = size` |
+| Objective | `−2 log L`, `ln Γ(k+1)` included | `−2 log L` | `−2 log L`, `ln Γ(k+1)` included |
+
+The ferx objective equals NONMEM's `METHOD=COND LAPLACE -2LL` objective at the same
+estimates (within 2.1e-8 on the committed anchors), and on fixed effects it equals R's
+`glm(family = poisson)` / `MASS::glm.nb` deviance-scale `−2 log L`. A dispersion
+parameterisation `var = μ + αμ²` is `r = 1 / ALPHA`; see [Negative-binomial
+parameterisation](model-file/count.qmd#negative-binomial-parameterisation).
+
 ## How do I validate a model file without running a full fit?
 
 Use `ferx check`:

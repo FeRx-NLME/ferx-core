@@ -622,6 +622,16 @@ pub(crate) trait RecHooks: Sized {
     ) -> Option<Option<Vec<Self>>> {
         None
     }
+    /// `x·y` of `n×n` row-major matrices as one call of a recording (#2980,
+    /// `kernel_jit::record_mat`): `None` for every type that is not a recording type (the caller
+    /// multiplies), `Some(None)` when the recording cannot take the call.
+    fn mat_mul(_x: &[Self], _y: &[Self], _n: usize) -> Option<Option<Vec<Self>>> {
+        None
+    }
+    /// `q⁻¹·p` of `n×n` row-major matrices as one call of a recording (as [`Self::mat_mul`]).
+    fn mat_solve(_q: &[Self], _p: &[Self], _n: usize) -> Option<Option<Vec<Self>>> {
+        None
+    }
     /// A steady state recorded as one fixed-point call (#2786, `kernel_jit::record_fixed`):
     /// `maps` the cycle maps the search runs (each recorded once, from `u0`), `solve` the
     /// search itself on the values, `held` the coordinates every map leaves where they are

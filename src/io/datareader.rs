@@ -596,14 +596,21 @@ impl CovariateReads {
 impl ObsRouting {
     /// Routing for a model with TTE and/or binary/categorical endpoints: `tte` →
     /// `ObsRecord::Event`, `discrete` → `ObsRecord::DiscreteState` (binary/categorical,
-    /// #760). Count endpoints are not produced yet, so that set stays empty. Pass an
-    /// empty `discrete` set for the pre-Phase-4.0 TTE-only behaviour.
+    /// #760). Count CMTs are added with [`Self::with_count`]. Pass an empty `discrete` set
+    /// for the pre-Phase-4.0 TTE-only behaviour.
     pub(crate) fn tte_and_discrete(tte: &HashSet<usize>, discrete: &HashSet<usize>) -> Self {
         Self {
             tte: tte.clone(),
             discrete: discrete.clone(),
             ..Default::default()
         }
+    }
+
+    /// Route `count` CMTs' rows to `ObsRecord::Count` (builder form) — the `[count_model]`
+    /// endpoints (#2877).
+    pub(crate) fn with_count(mut self, count: HashSet<usize>) -> Self {
+        self.count = count;
+        self
     }
 
     /// Register the per-CMT placeholder DV code used for integer-coded design

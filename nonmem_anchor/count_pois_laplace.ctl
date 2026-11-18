@@ -1,0 +1,14 @@
+$PROBLEM ferx #2877 count endpoint (pois, laplace): -2 log PMF with ln Gamma(k+1) kept, LAPLACE
+$INPUT ID TIME DV CMT EVID MDV WT TRT
+$DATA count_pois.csv IGNORE=@
+$PRED
+ LAM = EXP(LOG(THETA(1)) + THETA(2)*(WT/70 - 1) + THETA(3)*TRT + ETA(1))
+
+ Y = -2*(DV*LOG(LAM) - LAM - GAMLN(DV+1))
+$THETA
+ (0.01, 4, 100)   ; BASE
+ (-10, 0.5, 10)   ; BETA
+ (-10, -0.4, 10)  ; GAM
+
+$OMEGA 0.25  ; ETA_C
+$ESTIMATION METHOD=COND LAPLACE -2LL MAXEVAL=9999 NSIG=4 SIGL=12 PRINT=10 NOABORT FORMAT=s1PE23.16

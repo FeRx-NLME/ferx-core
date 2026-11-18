@@ -1524,3 +1524,28 @@ fn a_from_fit_reparse_refusal_on_a_stats_only_model_is_the_stats_code() {
         assert!(e.to_string().contains("nothing to estimate"), "{what}: {e}");
     }
 }
+
+#[cfg(feature = "survival")]
+/// A covariate that changes only across count records (TRT is 0 on each subject's first
+/// three rows and 1 after, and the count rows are not Gaussian observations) is seen by the
+/// covariate-statistics walk at every value the count mean is evaluated at, so `levels =
+/// auto` / `[covariate_model]` statistics cannot drop the later level (review r2 #1).
+#[test]
+fn covariate_values_include_count_record_snapshots() {
+    let prep = crate::categorical::exact_eta_hessian_tests::load(
+        "[parameters]\n  theta BASE(4.0, 0.01, 100.0)\n  theta GAM(-0.5, -10.0, 10.0)\n\
+         [covariates]\n  TRT continuous\n[count_model]\n  cmt = 1\n  \
+         log_lambda = log(BASE) + GAM * TRT\n",
+        "nonmem_anchor/count_nb.csv",
+    );
+    let s = &prep.population.subjects[0];
+    assert_eq!(
+        s.covariates.get("TRT"),
+        Some(&0.0),
+        "baseline is the first row's"
+    );
+    assert!(s.obs_covariates.is_empty(), "no Gaussian rows carry TRT");
+    let mut vals = super::subject_covariate_values(s, "TRT");
+    vals.sort_by(f64::total_cmp);
+    assert_eq!(vals, vec![0.0, 1.0]);
+}

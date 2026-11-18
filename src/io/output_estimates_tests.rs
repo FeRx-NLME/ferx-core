@@ -402,3 +402,32 @@ fn yaml_name_quotes_exactly_the_implicit_scalars_unless_asked() {
         assert_eq!(yaml_name(plain, true), yaml_quote(plain), "{plain}");
     }
 }
+
+/// #3006: a level name is a plain scalar in block context, but in a flow sequence its
+/// `[`/`]` are structural, so it must be quoted there — and only there.
+#[test]
+fn yaml_flow_name_quotes_flow_indicators_that_block_context_allows() {
+    for level in ["TEFF[TIME=0.5]", "P[STUDY=1,TIME=2]", "A{B}", "x:y"] {
+        assert_eq!(yaml_flow_name(level), yaml_quote(level), "{level}");
+    }
+    // The block-context form of the same names stays bare (the #2911 contract)…
+    assert_eq!(yaml_name("TEFF[TIME=0.5]", false), "TEFF[TIME=0.5]");
+    assert_eq!(yaml_name("P[STUDY=1,TIME=2]", false), "P[STUDY=1,TIME=2]");
+    // …and a plain identifier stays bare in both.
+    for plain in ["CL", "log_chol_ETA_CL", "ETA_V__ETA_CL", "EPS_1"] {
+        assert_eq!(yaml_flow_name(plain), plain, "{plain}");
+        assert_eq!(yaml_name(plain, false), plain, "{plain}");
+    }
+    // Every reason block context quotes for carries over to flow context.
+    for misread in [
+        "YES", "null", "", "[A]", "-x", "#c", "a: b", "a #b", "t:", " lead",
+    ] {
+        assert_eq!(yaml_name(misread, false), yaml_quote(misread), "{misread}");
+        assert_eq!(yaml_flow_name(misread), yaml_quote(misread), "{misread}");
+    }
+    assert_eq!(
+        yaml_flow_names(&["INT", "TEFF[TIME=0.5]"]),
+        "[INT, \"TEFF[TIME=0.5]\"]"
+    );
+    assert_eq!(yaml_flow_names::<&str>(&[]), "[]");
+}
