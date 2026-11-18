@@ -2661,7 +2661,10 @@ fn central_raw(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams, infu
         PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
             if ss =>
         {
-            unreachable!("{pk_model:?} SS doses reroute to the ODE twin (effective_for)")
+            unreachable!(
+                "{} SS doses reroute to the ODE twin (effective_for)",
+                pk_model.canonical_name()
+            )
         }
         // Transit / IG reject infusions at parse, so only the absorbed bolus exists.
         PkModel::OneCptTransit => {
