@@ -32,10 +32,9 @@ use nalgebra::DVector;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-/// Seed offset for the conditional-distribution pass so its RNG stream is
-/// reproducible and independent of the SAEM E-step stream (which keys on
-/// `master_seed + k * 100_000 + i`, plus `999_999` for the kappa kernel).
-const CONDDIST_SEED_OFFSET: u64 = 777_000_000;
+/// Purpose tag of the conditional-distribution pass so its RNG streams are reproducible
+/// and independent of the SAEM E-step streams (keyed `(k, i)` and `(k, i, 999_999)`).
+const CONDDIST_STREAM_TAG: u64 = 777_000_000;
 
 /// Nudge an MH step scale toward `target` acceptance, matching the main SAEM
 /// loop's multiplicative adaptation (×1.1 / ×0.9, clamped to [0.01, 5.0]).
@@ -80,10 +79,7 @@ pub fn run_conditional_distribution(
     // With the default burnin=20 this gives interval=2; with burnin=500 → 50
     // (matching saem_adapt_interval's default, preserving validated behaviour).
     let adapt_interval = (burnin / 10).max(1);
-    let master_seed = options
-        .saem_seed
-        .unwrap_or(12345)
-        .wrapping_add(CONDDIST_SEED_OFFSET);
+    let master_seed = options.saem_seed.unwrap_or(12345);
 
     // Componentwise sweep count is the main loop's, by construction — the same
     // helper, not a copy of its arithmetic.
@@ -112,7 +108,10 @@ pub fn run_conditional_distribution(
         MhScratch::default,
         |mh_scratch, i| {
             let subject = &population.subjects[i];
-            let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(i as u64));
+            let mut rng = StdRng::seed_from_u64(crate::rng::stream_seed(
+                master_seed,
+                &[CONDDIST_STREAM_TAG, i as u64],
+            ));
             // Same per-subject hoist as the SAEM E-step: the η-independent NLL
             // inputs and the proposal buffers are rebuilt here, not per proposal.
             mh_scratch.begin_subject(model, subject, theta, n_eta);

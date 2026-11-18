@@ -119,6 +119,10 @@ const MSTEP_MIXTURE_FTOL_REL: f64 = 1e-4;
 /// being far below any plausible estimated variance.
 pub(crate) const SAEM_OMEGA_DIAG_FLOOR: f64 = 1e-6;
 
+/// `saem_seed` when unset. Also the base multi-start derives later starts' SAEM seeds
+/// from (`api::fit::per_start_options`).
+pub(crate) const SAEM_DEFAULT_SEED: u64 = 12345;
+
 /// Target acceptance rate for the componentwise (1-D) eta kernel. The optimal
 /// scaling result for single-coordinate random-walk Metropolis is ≈0.44
 /// (Roberts & Rosenthal 2001), higher than the block kernel's 0.40 target.
@@ -4267,7 +4271,7 @@ pub(crate) fn componentwise_sweeps(n_mh_steps: usize, n_eta: usize) -> usize {
 /// bad OFV before paying for the covariance matrix. Kept as a pure function so
 /// the message is unit-testable.
 fn saem_final_ofv_report(ofv: f64) -> String {
-    format!("SAEM completed. Final OFV = {:.4}", ofv)
+    format!("SAEM completed. FOCE/Laplace OFV = {:.4}", ofv)
 }
 
 pub fn run_saem(
@@ -4335,7 +4339,7 @@ pub fn run_saem(
     let n_sigma = init_params.sigma.values.len();
 
     // Master RNG
-    let master_seed = options.saem_seed.unwrap_or(12345);
+    let master_seed = options.saem_seed.unwrap_or(SAEM_DEFAULT_SEED);
 
     if verbose {
         eprintln!(
@@ -5297,6 +5301,16 @@ pub fn run_saem(
     // established rebuild-per-call behaviour.
     let schedules = saem_schedule_cache(model, population);
 
+    // NONMEM's SAEMOBJ: per subject the log of the mean joint density over the convergence
+    // phase's draws (`saem_objective`). Free: it reads the NLL cache the iteration refreshes.
+    let mut saemobj = crate::estimation::saem_objective::SaemObjAccumulator::new(
+        n_subjects,
+        crate::estimation::saem_objective::unsupported(model).is_none(),
+        // No random effect at all (neither η nor κ): nothing is sampled, so the value is the
+        // data −2 log L at the last parameters. An IOV-only model samples κ and averages.
+        model.n_eta == 0 && model.n_kappa == 0,
+    );
+
     // Main loop
     for k in 1..=n_iter {
         // Per-iteration combined (block + componentwise) accept / proposal
@@ -5508,11 +5522,10 @@ pub fn run_saem(
                             e_step_fit,
                         );
                         let subject = &population.subjects[i];
-                        let mut rng = StdRng::seed_from_u64(
-                            master_seed
-                                .wrapping_add(k as u64 * 100_000)
-                                .wrapping_add(i as u64),
-                        );
+                        let mut rng = StdRng::seed_from_u64(crate::rng::stream_seed(
+                            master_seed,
+                            &[k as u64, i as u64],
+                        ));
                         let kappas_mh_opt =
                             omega_iov_for_eta_mh.map(|iov| (kappas_i.as_slice(), iov));
 
@@ -5931,12 +5944,10 @@ pub fn run_saem(
                             Some(c) => (&class_omegas[c], class_sigmas[c].as_slice()),
                             None => (&omega_k, st.sigma_vals.as_slice()),
                         };
-                        let mut rng = StdRng::seed_from_u64(
-                            master_seed
-                                .wrapping_add(k as u64 * 100_000)
-                                .wrapping_add(i as u64)
-                                .wrapping_add(999_999),
-                        );
+                        let mut rng = StdRng::seed_from_u64(crate::rng::stream_seed(
+                            master_seed,
+                            &[k as u64, i as u64, 999_999],
+                        ));
                         // Recompute NLL under the IOV-consistent function before
                         // proposing kappa.  After the eta MH block, nll_cache[i]
                         // may have been set by mh_steps via individual_nll_iov
@@ -6762,6 +6773,9 @@ pub fn run_saem(
                 });
             state.nll_cache = new_nlls;
         }
+        if k > k1 {
+            saemobj.update(&state.nll_cache);
+        }
 
         // #903 review: re-anchor the iiv_on_ruv growth caps to the data-informed
         // σ/ω_RUV reached by the end of the exploration phase, taking the *looser*
@@ -7278,6 +7292,7 @@ pub fn run_saem(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved,
+        saem_objective_value: saemobj.value(),
         saem_n_subjects_hmc,
         saem_mh_accept_tail,
         ebe_convergence_warnings: 0,
@@ -8177,6 +8192,22 @@ mod tests {
             opts.iov_column = Some("OCC".to_string());
         }
         crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok")
+    }
+
+    /// The SAEM objective of a mixture is not anchored by NONMEM, so the default readout says so
+    /// and reports the importance-sampled value instead of falling back silently (#2973).
+    #[test]
+    fn mixture_saem_objective_falls_back_to_imp_with_a_named_warning() {
+        let r = mix996_fit("TVV * exp(ETA_V)", false, true);
+        let obj = r.saem_objective.as_ref().expect("a reported objective");
+        assert_eq!(obj.kind, crate::types::SaemOfv::Imp);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("saem_ofv = saem unavailable") && w.contains("mixture")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// #2548 item 1: an additive mu-referenced typical value under a `[mixture]` is named
@@ -9182,11 +9213,11 @@ mod tests {
         // CLI user can judge the fit before the covariance step runs.
         assert_eq!(
             saem_final_ofv_report(1234.56789),
-            "SAEM completed. Final OFV = 1234.5679"
+            "SAEM completed. FOCE/Laplace OFV = 1234.5679"
         );
         assert_eq!(
             saem_final_ofv_report(-42.0),
-            "SAEM completed. Final OFV = -42.0000"
+            "SAEM completed. FOCE/Laplace OFV = -42.0000"
         );
     }
 
@@ -12392,6 +12423,14 @@ DV ~ additive(EPS)
     /// diagnostic's window, and hence from the tail rate it reports.
     const SCALE1444_BURNIN: usize = 30;
 
+    /// Seed of the #1444 fixtures below. The realised interval-rule tail rate on the
+    /// over-dispersed fixture scatters across seeds (60 seeds measured under #3021: 0.064 to
+    /// 0.115, median 0.087, 14 of 60 at or above the 0.10 band edge), so the fixture needs a
+    /// seed whose arms sit clear of the gates; 1444 landed at 0.1031 once the per-subject
+    /// streams were hashed (#3021). At this seed: interval 0.0833, RM 0.3309 (over-dispersed
+    /// Omega); interval 0.6240, RM 0.4316 (sensible Omega).
+    const SCALE1444_SEED: u64 = 22;
+
     /// 60 SAEM iterations — 30 post-burn-in, past `MH_RATE_MIN_WINDOW` — with
     /// two firings of the interval rule before the window opens, so both arms
     /// are exercised and the tail tier's "the controller has run" gate is met.
@@ -12436,7 +12475,7 @@ DV ~ additive(EPS)
             saem_omega_burnin: SCALE1444_BURNIN,
             saem_scale_adaptation: rule,
             saem_scale_deadband: band,
-            saem_seed: Some(1444),
+            saem_seed: Some(SCALE1444_SEED),
             run_covariance_step: false,
             ..FitOptions::default()
         };
@@ -12530,12 +12569,12 @@ DV ~ additive(EPS)
 
         // (a) Starting far BELOW target: a grossly over-dispersed Ω (SD 10 on a
         //     log-scale η) makes the block proposal ≈ 3 log-units, so nearly
-        //     everything is rejected. Realised: interval 0.0844, RM 0.3271.
+        //     everything is rejected. Realised: interval 0.0833, RM 0.3309.
         let (_, lo_int) = scale1444_fit(100.0, 100.0, ScaleAdaptation::Interval);
         let (_, lo_rm) = scale1444_fit(100.0, 100.0, ScaleAdaptation::RobbinsMonro);
         // (b) Starting ABOVE target, so the rule is shown to be a controller
-        //     and not a ratchet on a real chain too. Realised: interval 0.6114,
-        //     RM 0.4324.
+        //     and not a ratchet on a real chain too. Realised: interval 0.6240,
+        //     RM 0.4316.
         let (_, hi_int) = scale1444_fit(0.09, 0.04, ScaleAdaptation::Interval);
         let (_, hi_rm) = scale1444_fit(0.09, 0.04, ScaleAdaptation::RobbinsMonro);
         for (name, r) in [
@@ -12563,14 +12602,17 @@ DV ~ additive(EPS)
         // "half of it ran": deleting the per-η componentwise update alone leaves
         // the block update to carry the combined rate, and it gets only part of
         // the way. Both bounds are measured, not picked (#1451 review) — the
-        // realised |rate − target| is:
+        // realised |rate − target| at `SCALE1444_SEED` (hashed streams, #3021; the
+        // mutant is `if n_cw_sweeps > 0` → `if false` in the Robbins-Monro block):
         //
         //             both halves   componentwise half deleted   bound
-        //   below       0.0729              0.1624               0.12
-        //   above       0.0324              0.0807               0.06
+        //   below       0.0691              0.1646               0.12
+        //   above       0.0316              0.0913               0.06
         //
-        // i.e. each bound sits between the two, with 1.6x / 1.9x headroom over
-        // the passing case, so it is exactly this mutation that both die for.
+        // i.e. each bound sits between the two, with 1.7x / 1.9x headroom over
+        // the passing case and 1.4x / 1.5x below the mutant, so it is exactly this
+        // mutation that both die for. (Before #3021, at seed 1444: 0.0729 / 0.1624
+        // below, 0.0324 / 0.0807 above.)
         // The block half alone is caught by the `closer than its twin` pair
         // above.
         assert!(
@@ -12723,8 +12765,8 @@ DV ~ additive(EPS)
         // sweeps, so `(0.0, 0.5)` contains every attainable rate the chain
         // actually produces down here (the sixths 0 … 1/2 and the thirds 0,
         // 1/3) and essentially every step is skipped. Realised tail
-        // acceptance: plain RM **0.3240**, banded **0.0788**, against the
-        // interval rule's 0.0844 on the same fixture — i.e. the banded arm
+        // acceptance: plain RM **0.3309**, banded **0.0611**, against the
+        // interval rule's 0.0833 on the same fixture — i.e. the banded arm
         // stays where a chain whose scale is left alone stays.
         let (_, rm) = scale1444_fit(100.0, 100.0, ScaleAdaptation::RobbinsMonro);
         let (_, banded) = scale1444_fit_band(
@@ -12768,11 +12810,21 @@ DV ~ additive(EPS)
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,
             saem_scale_adaptation: ScaleAdaptation::Interval,
-            saem_seed: Some(1444),
+            saem_seed: Some(SCALE1444_SEED),
             run_covariance_step: false,
             ..FitOptions::default()
         };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
+        // The silence below must come from the "controller has run" gate, not from a
+        // rate that happens to sit inside the band on this seed (#3021 review).
+        let tail = res
+            .saem_mh_accept_tail
+            .expect("the window reached its floor");
+        assert!(
+            tail < MH_RATE_LOW,
+            "the silent arm's tail rate {tail:.4} must be below MH_RATE_LOW = {MH_RATE_LOW}, \
+             or its silence proves nothing"
+        );
         assert!(
             !res.warnings
                 .iter()
@@ -12800,7 +12852,7 @@ DV ~ additive(EPS)
         use crate::types::ScaleAdaptation;
         // A grossly over-dispersed Ω (SD 10 on a log-scale η): the block
         // proposals are `δ·chol(Ω)·z` ≈ 3 log-units, so almost everything is
-        // rejected. Realised tail rate on this fixture: 8.4% — below the 10%
+        // rejected. Realised tail rate on this fixture: 8.3% — below the 10%
         // band and *above* the 1% "not mixing" tier, i.e. exactly the regime
         // the pre-#1444 diagnostic could not see, reached by a real fit rather
         // than by calling the predicate directly.
@@ -12849,13 +12901,13 @@ DV ~ additive(EPS)
         );
 
         // The negative control, same code path and iteration counts: a
-        // sensibly-scaled Ω (realised tail 61.14%) must not trip it. Without
+        // sensibly-scaled Ω (realised tail 62.40%) must not trip it. Without
         // this the assertion above is satisfied by a diagnostic that fires on
         // everything.
         let (ok, ok_tail) = scale1444_fit(0.09, 0.04, ScaleAdaptation::Interval);
         // Pin that the control is silent *because* its rate is inside the band,
         // not because the fixture happens to miss the tier for some other
-        // reason. Realised: 0.6114.
+        // reason. Realised: 0.6240.
         assert!(
             ok_tail.is_finite() && (MH_RATE_LOW..=MH_RATE_HIGH).contains(&ok_tail),
             "the control's realised tail {ok_tail:.4} must be inside the band, \

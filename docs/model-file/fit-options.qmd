@@ -861,6 +861,15 @@ Suits deep compartment models (`[covariate_nn]`), models where the FOCE inner lo
 | `omega_burnin` | `20` | Initial exploration iterations during which Ω (and Ω<sub>IOV</sub>) are held at their starting values while the MH chain warms up. Clamped to `n_exploration`; set `0` to disable. Prevents the Ω collapse described in the SAEM page. |
 | `seed` | `12345` | RNG seed for reproducibility |
 
+### Reported objective
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `saem_ofv` | `saem` | Which objective a SAEM fit reports as `ofv`. `saem`: NONMEM's `SAEMOBJ`, the objective it prints for the SAEM step (`−2 Σ log` of the mean joint density of data and random effects over the convergence draws, no 2π constants); **not a likelihood**, not comparable across models, and there is no AIC/BIC under it (`null`; a model search stops with an error naming `saem_ofv = imp`); a mixture reports the `imp` value with a warning; IOV models average the joint density of the data, η and κ draws (not NONMEM-anchored); with no random effects it is the data `−2 log L`. `imp`: the importance-sampled `−2 log L` at the final estimates, NONMEM `IMP EONLY=1`, with its Monte-Carlo SE (AIC/BIC built from it, as from `agq` and `focei`). `agq`: adaptive Gauss–Hermite quadrature at the final estimates (deterministic; up to three random effects and a grid within the quadrature limit with IOV's stacked κ, else falls back to `imp` with a warning). `focei`: the FOCE/Laplace objective, the behaviour before #2973. The FOCE/Laplace value is kept as `saem_objective.foce_ofv` under `saem`, `imp` and `agq`. Not read when the chain has its own evaluator stage after SAEM (an `imp_eval_only` / `agq_eval_only` flag naming a method the chain does not run does not count). See [The reported OFV](../estimation/saem.qmd#saem-reported-ofv). |
+| `saem_ofv_samples` | `3000` | Importance samples per subject for `saem_ofv = imp` (NONMEM `ISAMPLE=3000`). Seeded by `imp_seed`. Must be ≥ 2. |
+| `saem_ofv_nodes` | `11` | Gauss–Hermite nodes per random effect for `saem_ofv = agq`, `2`–`21`. Chosen by measured convergence (see [The reported OFV](../estimation/saem.qmd#saem-reported-ofv)). |
+| `saem_ofv_pilot_samples` | `300` | Draws per pilot pass of the `saem_ofv = imp` readout's proposal adaptation (`imp_adapt_passes` passes, default 5); the final readout always draws `saem_ofv_samples`. 300 cuts the readout to under half the cost of full-size pilots for a 4% larger Monte-Carlo SE (see [The reported OFV](../estimation/saem.qmd#saem-ofv-cost)); `0` runs the pilots at the full `saem_ofv_samples`. |
+
 ### f-SAEM E-step kernel
 
 | Key | Default | Description |
@@ -987,13 +996,14 @@ sparsely-sampled PK).
 | Key | Default | Description |
 |-----|---------|-------------|
 | `imp_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
+| `imp_adapt_samples` | `0` | Draws per pilot pass of an evaluation's proposal adaptation (`imp_adapt_passes`). `0` runs every pilot at `imp_samples`, as NONMEM's `EONLY=1` iterations do; a smaller value (at least 2) fits the proposal from fewer draws and keeps the final readout at `imp_samples`. Not read by the estimating `imp` iterations. |
 | `imp_iterations` | `200` | MCEM iterations (estimator only). |
 | `imp_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
 | `imp_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
 | `imp_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
 | `imp_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `imp_samples` is the *starting* count and the floor, and K follows a **per-subject** objective MC SE target of 0.05, up to 10000. Recommended for high-dimensional / FREM models. Set `false` to pin K. Estimating path only: an `imp_eval_only` evaluation draws a fixed `imp_samples` and warns if this option is set. See [Adaptive sample count](../estimation/importance-sampling.qmd#adaptive-sample-count). |
 | `imp_max_time` | none | Wall-clock limit on the IMP iterations, in seconds. The fit stops with its current estimate and `converged: false`. See [Wall-clock limit](../estimation/importance-sampling.qmd#wall-clock-limit). |
-| `imp_seed` | `12345` | RNG seed. Same seed → identical result. |
+| `imp_seed` | `12345` (estimator); `42` (evaluation) | RNG seed. Unset, the `imp` MCEM iterations use `12345` and an `imp_eval_only` evaluation or a reported marginal uses `42`. Same seed → identical result; per-subject streams are hashed from the seed and the stream's coordinates (subject, and the MCEM iteration for the estimator), so different seeds share no stream (#3021). |
 | `imp_sobol` | `false` | Estimator only: Sobol quasi-random IS draws for the MCEM E-step, the `imp` counterpart of `impmap_sobol` (#1965). `imp_eval_only` stays pseudo-random. The same limits apply as for `impmap_sobol`, checked when the fit starts: a Student-t proposal (`imp_proposal_df`) of at most 1000 degrees of freedom (use `normal` beyond that), and at most 1000 quasi-random coordinates per draw (the ETAs, plus one each for a t proposal and the defensive mixture). |
 | `imp_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
 | `imp_adapt_passes` | `5` | Pilot passes that adapt each subject's proposal before a marginal `−2 log L` is reported, under `imp_eval_only` and after an estimating `imp` or `impmap` stage (NONMEM `EONLY=1 NITER=5`). The MCEM iterations are not affected. Each pass costs one more `imp_samples` draws per subject. `0` keeps the single Laplace proposal, which reads high on sparse subjects. While above `0`, a marginal's proposal keeps at least `0.1` of the prior. See [Adaptive evaluation](../estimation/importance-sampling.qmd#adaptive-evaluation). |

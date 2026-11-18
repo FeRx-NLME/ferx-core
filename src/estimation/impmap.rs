@@ -1270,10 +1270,8 @@ fn run_map_multistart(
         let subject = &population.subjects[i];
         let warm = prev_etas.map(|pe| pe[i].as_slice());
         // Deterministic per-subject, per-iteration seed, separated from IS draws.
-        let subj_seed = seed
-            .wrapping_add(i as u64)
-            .wrapping_add((iteration as u64) << 32)
-            .wrapping_add(0x4D43_4554_4100u64);
+        let subj_seed =
+            crate::rng::stream_seed(seed, &[i as u64, iteration as u64, 0x4D43_4554_4100u64]);
         find_ebe_multistart(
             model,
             subject,
@@ -2134,7 +2132,7 @@ fn run_mcem(
                 if crate::cancel::is_cancelled(cancel) {
                     return SubjectDraws::cancelled(n_eta);
                 }
-                let subj_seed = seed.wrapping_add(i as u64).wrapping_add((k as u64) << 32);
+                let subj_seed = crate::rng::stream_seed(seed, &[i as u64, k as u64]);
 
                 // IOV subject (#2301): sample the stacked `b = [η, κ₁..κ_K]` from one
                 // joint proposal against the block-diagonal prior `Ω ⊕ I_K ⊗ Ω_iov`,
@@ -3108,6 +3106,7 @@ fn run_mcem(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,
@@ -3646,10 +3645,10 @@ fn run_mcem_mixture(
                             options.inner_restarts,
                             mceta,
                             omega_chol.as_ref(),
-                            seed.wrapping_add(i as u64)
-                                .wrapping_add((k as u64) << 32)
-                                .wrapping_add((c as u64) << 48)
-                                .wrapping_add(0x4D43_4554_4100u64),
+                            crate::rng::stream_seed(
+                                seed,
+                                &[i as u64, k as u64, c as u64, 0x4D43_4554_4100u64],
+                            ),
                         );
                         let h_post = compute_posterior_hessian(
                             model,
@@ -3674,10 +3673,7 @@ fn run_mcem_mixture(
                         );
                         (center, h_post)
                     };
-                    let subj_seed = seed
-                        .wrapping_add(i as u64)
-                        .wrapping_add((k as u64) << 32)
-                        .wrapping_add((c as u64) << 48);
+                    let subj_seed = crate::rng::stream_seed(seed, &[i as u64, k as u64, c as u64]);
                     // Per-subject, per-class ISCALE pilot search — the same guard
                     // the single-population E-step runs (#528/#961): it rescues
                     // subjects whose posterior Hessian is a poor curvature
@@ -4117,6 +4113,7 @@ fn run_mcem_mixture(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,

@@ -195,7 +195,11 @@ fn assert_reaches_foce(method: EstimationMethod, tol: f64, tweak: impl FnOnce(&m
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn saem_reaches_the_foce_objective_on_negative_predictions() {
-    assert_reaches_foce(EstimationMethod::Saem, TOL_SAEM, |o| o.saem_seed = Some(7));
+    assert_reaches_foce(EstimationMethod::Saem, TOL_SAEM, |o| {
+        o.saem_seed = Some(7);
+        // The oracle is the FOCE objective, so SAEM reports its FOCE/Laplace value.
+        o.saem_ofv = ferx_core::types::SaemOfv::Focei;
+    });
 }
 
 #[test]
