@@ -6625,7 +6625,7 @@ fn forced_fd_agq(t: String) -> String {
 /// G3-A. A subject whose adjoint level gradient is declined under quadrature takes the
 /// **reconverged** differences, and the solve lands where the all-adjoint one does, at
 /// both anchors. Dies when a declined subject's gradient is taken with its EBE held (the
-/// quadrature's held-EBE salvage, `subject_adjoint_held_ebe_score`).
+/// held-EBE salvage `subject_adjoint_held_ebe_score` computes, a test oracle now).
 #[test]
 fn a_declined_subject_takes_the_reconverged_gradient_under_quadrature() {
     for (name, edit, anchor) in AGQ3 {

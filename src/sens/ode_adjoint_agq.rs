@@ -116,21 +116,21 @@ pub(super) fn agq_planned(
     // sentinel (`agq::agq_terms`), a log-term of ~-1e20 that `logsumexp` takes to exactly
     // zero weight; its derivative is then `0 * d(huge or non-finite)`, which the reverse
     // turns into a NaN and declines the whole subject (a `[covariate_nn]` DCM under 3-node
-    // AGQ, #3004). So a node whose term is non-finite or the sentinel is left out of the
+    // AGQ, #3004). So a node whose total term (the Gaussian `l` plus the non-Gaussian endpoint
+    // term `q`, the sum the value path scores) is non-finite or the sentinel is left out of the
     // kernel, as it is out of the sum: the value and every gradient component are unchanged by
-    // it. A finite node whose weight merely underflows stays: its derivative is `0 * finite`.
+    // it. A subject with no prediction rows has `l` from the prior alone, so its nodes are
+    // filtered the same way. A finite node whose weight merely underflows stays: its derivative
+    // is `0 * finite`.
     let live: Vec<usize> = kept
         .iter()
         .copied()
         .filter(|&j| {
             let (_, cw, b) = &grid[j];
-            let Some((du, _, _)) = nodes.get(j) else {
-                return true;
-            };
+            let du: &[f64] = nodes.get(j).map_or(&[], |n| &n.0);
             inner_l(ctx, du, b, pv, None).is_some_and(|l| {
-                l.is_finite()
-                    && l < crate::stats::likelihood::SUBJECT_SENTINEL_NLL
-                    && (*cw - (l + ng.map_or(0.0, |ng| ng.nodes[j].0))).is_finite()
+                let total = l + ng.map_or(0.0, |ng| ng.nodes[j].0);
+                crate::stats::likelihood::is_usable_subject_nll(total) && (*cw - total).is_finite()
             })
         })
         .collect();
