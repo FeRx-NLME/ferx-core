@@ -3041,29 +3041,7 @@ mod tests {
 
     // ── Mixture (#985) ──
 
-    const MIX_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_MODEL: &str = crate::test_models::ONE_CPT_IV_5;
 
     fn mix_pop() -> crate::types::Population {
         use std::io::Write;
@@ -3152,30 +3130,7 @@ mod tests {
 
     /// Same two-class model as `MIX_MODEL` plus a per-occasion κ on CL, so the
     /// Bayes κ block runs under a mixture.
-    const MIX_IOV_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta P1(0.5, 0.001, 0.999)
-  omega ETA_CL ~ 0.05
-  kappa KAPPA_CL ~ 0.02
-  sigma EPS ~ 0.04
-
-[mixture]
-  nsub = 2
-  p(1) = P1
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_IOV_MODEL: &str = crate::test_models::ONE_CPT_IV_11;
 
     /// Two subjects × two dosing occasions (`OCC`), bimodal CL.
     fn mix_iov_pop() -> crate::types::Population {
@@ -3359,30 +3314,7 @@ mod tests {
     /// class-shared under the conjugate Ω block) with a clear error (#985).
     #[test]
     fn bayes_rejects_per_class_overrides() {
-        const OV: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.04
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-  omega(2) ETA_CL ~ 0.15
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        const OV: &str = crate::test_models::ONE_CPT_IV_6;
         let model = crate::parser::model_parser::parse_model_string(OV).unwrap();
         let pop = mix_pop();
         let mut opts = FitOptions::default();

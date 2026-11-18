@@ -348,30 +348,7 @@ fn non_gaussian_curvature_falls_back_to_fd() {
     }
 }
 
-const MIXTURE: &str = r"
-[parameters]
-  theta TVCL1(1.2, 0.01, 100.0)
-  theta TVCL2(2.5, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  theta BWT(0.0, -5.0, 5.0)
-  omega ETA_CL ~ 0.05
-  sigma EPS ~ 0.01
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL + BWT*(WT - 75)
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+const MIXTURE: &str = crate::test_models::ONE_CPT_IV_18;
 
 #[test]
 fn mixture_falls_back_to_fd() {

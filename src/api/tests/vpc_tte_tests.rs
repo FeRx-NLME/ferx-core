@@ -16,40 +16,11 @@ const EXP_TTE: &str = r"
   scale  = TVLAMBDA * exp(ETA_LAMBDA)
 ";
 
-const COMPETING: &str = r"
-[parameters]
-  theta TVLAMBDA_A(0.05, 0.001, 10.0)
-  theta TVLAMBDA_B(0.03, 0.001, 10.0)
-
-[event_model cause_a]
-  cmt    = 2
-  family = exponential
-  scale  = TVLAMBDA_A
-
-[event_model cause_b]
-  cmt    = 3
-  family = exponential
-  scale  = TVLAMBDA_B
-";
+const COMPETING: &str = crate::test_models::MODEL_2;
 
 const RTTE: &str = "\n[parameters]\n  theta TVLAMBDA(0.15, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  type   = rtte\n  family = exponential\n  scale  = TVLAMBDA\n";
 
-const PK_ONLY: &str = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  sigma PROP_ERR ~ 0.05 (sd)
-
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+const PK_ONLY: &str = crate::test_models::ONE_CPT_IV_22;
 
 fn model(src: &str) -> CompiledModel {
     parse_model_string(src).expect("model parses")

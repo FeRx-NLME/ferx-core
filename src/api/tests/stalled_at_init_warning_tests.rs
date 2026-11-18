@@ -216,23 +216,7 @@ fn only_a_chain_with_no_estimating_stage_is_exempt() {
 #[test]
 fn standalone_evaluators_report_no_stall_through_fit() {
     use crate::api::nonfinite_objective_tests::subject_with_dose_time;
-    let model = crate::parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse");
+    let model = crate::parse_model_string(crate::test_models::ONE_CPT_IV_3).expect("parse");
     let pop = Population {
         subjects: vec![
             subject_with_dose_time("1", 0.0, 1.0),

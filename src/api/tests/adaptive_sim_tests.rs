@@ -11,44 +11,10 @@ use std::collections::HashMap;
 // but **not referenced** by CL, so predictions are η-invariant and the whole
 // simulation is effectively deterministic — the bit-exact oracle below relies
 // on this (a drawn-but-unused η leaves the trajectory at the η=0 value).
-const ODE_NO_IIV: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+const ODE_NO_IIV: &str = crate::test_models::ODE_1;
 
 // Same structural model, with between-subject variability on CL.
-const ODE_IIV: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+const ODE_IIV: &str = crate::test_models::ODE_5;
 
 // IOV ODE model (#701): a per-occasion κ on CL over a near-degenerate BSV η
 // (the parser requires an omega). A seeded run's η and per-occasion κ are both
@@ -4832,27 +4798,7 @@ fn from_spec_runs_the_shipped_tdm_example() {
 
 /// `[fit_options] ode_max_steps` starved to a handful of steps, so the driver's segments give
 /// up and freeze-pad their tails. Same structural model as `ODE_NO_IIV`.
-const ODE_STARVED_BUDGET: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-[fit_options]
-  ode_method = rk45
-  ode_max_steps = 2
-"#;
+const ODE_STARVED_BUDGET: &str = crate::test_models::ODE_4;
 
 /// `simulate_adaptive` opens a `SolverStatsScope`, so its runs carry the ODE-solver
 /// diagnostics (#1304 item 2) and the model/data bundle (#1280).

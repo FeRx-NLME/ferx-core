@@ -1360,37 +1360,8 @@ fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
 fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
     use crate::parser::model_parser::parse_model_string;
 
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
-    0.04,
-    0.01, 0.09
-  ]
-
-[individual_parameters]
-  CL  = TVCL * exp(ETA_CL)
-  V   = TVV
-
-[structural_model]
-  ode(states=[central])
-
-[odes]
-  d/dt(central) = -CL/V * central
-
-[scaling]
-  y[CMT=1] = 2.0 * central / V
-  y[CMT=2] = central / V
-
-[error_model]
-  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
-  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
-",
-    )
-    .expect("cross-endpoint block_sigma ODE model parses");
+    let model = parse_model_string(crate::test_models::ODE_3)
+        .expect("cross-endpoint block_sigma ODE model parses");
 
     let mut subjects = Vec::new();
     for (id, dose_amt, obs) in [
@@ -1550,37 +1521,8 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
 fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
     use crate::parser::model_parser::parse_model_string;
 
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
-    0.04,
-    0.01, 0.09
-  ]
-
-[individual_parameters]
-  CL  = TVCL * exp(ETA_CL)
-  V   = TVV
-
-[structural_model]
-  ode(states=[central])
-
-[odes]
-  d/dt(central) = -CL/V * central
-
-[scaling]
-  y[CMT=1] = 2.0 * central / V
-  y[CMT=2] = central / V
-
-[error_model]
-  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
-  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
-",
-    )
-    .expect("cross-endpoint block_sigma ODE model parses");
+    let model = parse_model_string(crate::test_models::ODE_3)
+        .expect("cross-endpoint block_sigma ODE model parses");
 
     // Check time first: this is the guard the docs contradicted.
     let check_opts = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
@@ -1730,26 +1672,8 @@ fn test_saem_block_sigma_ofv_matches_foce() {
 
     // Single-endpoint combined error with a fixed correlated $SIGMA block —
     // the docs validation model (NONMEM FOCE OFV 18.7158, ferx FOCE 18.7274).
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.01, 10.0) FIX
-  theta TVV(10.0, 0.1, 100.0) FIX
-  omega ETA_CL ~ 0.04 FIX
-  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ combined(PROP_ERR, ADD_ERR)
-",
-    )
-    .expect("fixed-param block_sigma combined model parses");
+    let model = parse_model_string(crate::test_models::ONE_CPT_IV_1)
+        .expect("fixed-param block_sigma combined model parses");
 
     let mut subjects = Vec::new();
     for (id, obs) in [
@@ -1815,26 +1739,8 @@ fn test_saem_block_sigma_ofv_matches_foce() {
 fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
     use crate::parser::model_parser::parse_model_string;
 
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.01, 10.0) FIX
-  theta TVV(10.0, 0.1, 100.0) FIX
-  omega ETA_CL ~ 0.04 FIX
-  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ combined(PROP_ERR, ADD_ERR)
-",
-    )
-    .expect("fixed-param block_sigma combined model parses");
+    let model = parse_model_string(crate::test_models::ONE_CPT_IV_1)
+        .expect("fixed-param block_sigma combined model parses");
 
     let mut subjects = Vec::new();
     for (id, obs) in [

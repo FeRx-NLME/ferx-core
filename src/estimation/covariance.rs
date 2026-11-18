@@ -5689,31 +5689,7 @@ mod tests {
     /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries
     /// the override tail. Packed order: [TVCL, TVV, MIXL, BWT | ω(ETA_CL) |
     /// σ(EPS) | ω_MIX2 | σ_MIX2].
-    const MIX_OVERRIDE_MODEL: &str = r"
-[parameters]
-  theta TVCL(1.5, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.2, -10.0, 10.0)
-  theta BWT(0.05, -5.0, 5.0)
-  omega ETA_CL ~ 0.06
-  sigma EPS ~ 0.02
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL + BWT*(WT - 75)
-  omega(2) ETA_CL ~ 0.15
-  sigma(2) EPS ~ 0.03
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_OVERRIDE_MODEL: &str = crate::test_models::ONE_CPT_IV_13;
 
     #[test]
     fn packed_param_label_names_mixture_overrides() {

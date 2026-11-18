@@ -715,26 +715,8 @@ fn check_saem_mstep_score(
 /// rule stays exact once V / ∂V∂f / ∂V∂logσ take their `_scaled` forms.
 #[test]
 fn obs_nll_subject_grad_weighted_error_matches_fd() {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP_ERR ~ 0.10 (sd)
-  sigma ADD_ERR  ~ 0.50 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ combined(PROP_ERR * (1.0 + 0.5 * WPSE), ADD_ERR) weight = WPSE
-[covariates]
-  WPSE continuous
-",
-    )
-    .expect("weighted model parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_14)
+        .expect("weighted model parses");
     assert!(model.has_custom_ruv_magnitude());
     assert!(
         !model.has_theta_dependent_ruv_magnitude(),
@@ -1198,26 +1180,8 @@ fn fisher_information_zeroes_a_pinned_coordinate() {
 #[test]
 fn fisher_information_is_withheld_outside_the_gaussian_scope() {
     use crate::types::DoseEvent;
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP_ERR ~ 0.10 (sd)
-  sigma ADD_ERR  ~ 0.50 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ combined(PROP_ERR * (1.0 + 0.5 * WPSE), ADD_ERR) weight = WPSE
-[covariates]
-  WPSE continuous
-",
-    )
-    .expect("magnitude fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_14)
+        .expect("magnitude fixture parses");
     assert!(model.has_custom_ruv_magnitude());
     let theta = vec![1.0f64, 10.0];
     let sigma_values = vec![0.10f64, 0.50];

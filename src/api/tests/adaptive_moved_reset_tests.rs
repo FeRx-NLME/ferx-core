@@ -12,24 +12,7 @@ use crate::sim::adaptive::{ControllerCtx, DoseAction};
 
 const CODE: &str = "W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET";
 
-const MODEL: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+const MODEL: &str = crate::test_models::ODE_5;
 
 const HEADER: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV,RATE,II,ADDL\n";
 

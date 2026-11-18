@@ -5649,31 +5649,7 @@ mod tests {
     /// and this warning fired (#918).
     #[test]
     fn impmap_mixture_takes_a_class_shared_logit_anchor() {
-        let src = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta LOGIT_F(-0.405465, -10.0, 10.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_F ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 else TVCL2
-  V  = TVV
-  F  = inv_logit(LOGIT_F + ETA_F)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V, f=F)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_7;
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
@@ -5798,26 +5774,7 @@ mod tests {
     /// it, while the ordinary log-packed lognormal `TVCL` stays unlisted.
     #[test]
     fn imp_log_packed_logit_mu_ref_routes_to_weighted_mstep() {
-        let src = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta LOGIT_F(0.5, 0.0, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_F ~ 0.04
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  F  = inv_logit(LOGIT_F + ETA_F)
-  CL = TVCL * exp(ETA_CL) * F
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_8;
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         assert_eq!(
             model.mu_refs.get("ETA_F").map(|m| m.transform),
@@ -5895,24 +5852,7 @@ mod tests {
     /// The #619 additive form with the covariate group as the **only**
     /// eta-bearing parameter (`V` carries no eta), so a closed-form channel
     /// exists if and only if the group is active.
-    const COVMUREF_ONLY_MODEL: &str = r"
-[parameters]
-  theta TVCL(4.0, 0.0, 100.0)
-  theta TH_CRCL(0.02, 0.0, 5.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.01 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const COVMUREF_ONLY_MODEL: &str = crate::test_models::ONE_CPT_IV_9;
 
     /// #619 under IMP: the group's thetas are pinned out of the weighted M-step
     /// and moved by the group step; the "no closed-form mu-referenced
@@ -5957,24 +5897,7 @@ mod tests {
     /// negative for the lowest-CRCL subject: `TVCL + (40 − 90)·TH_CRCL =
     /// 4 − 50·0.2 = −6`, so the lognormal `mu` is `NaN` for that subject and
     /// both group engines decline.
-    const COVMUREF_INADMISSIBLE_START: &str = r"
-[parameters]
-  theta TVCL(4.0, 0.0, 100.0)
-  theta TH_CRCL(0.2, 0.0, 5.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.01 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const COVMUREF_INADMISSIBLE_START: &str = crate::test_models::ONE_CPT_IV_10;
 
     /// A group that cannot step must not have its thetas pinned out of the
     /// weighted M-step (#918 review).
@@ -7051,25 +6974,7 @@ mod tests {
     /// argument and nothing else.
     #[test]
     fn mu_ref_anchor_mask_reads_the_resolved_groups_not_the_parsed_ones() {
-        let src = r"
-[parameters]
-  theta TVCL(150.0, 0.0, 1000.0)
-  theta TH_CRCL(2.0, 0.0, 50.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  omega ETA_CL ~ 0.2
-  omega ETA_V ~ 0.1
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_19;
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         assert_eq!(
             model.covariate_mu_refs.len(),
@@ -7300,29 +7205,7 @@ mod tests {
 
     // ── Estimating IMP/IMPMAP under a mixture (#985) ──
 
-    const MIX_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_MODEL: &str = crate::test_models::ONE_CPT_IV_5;
 
     fn mix_pop() -> Population {
         use std::io::Write;
@@ -7380,30 +7263,7 @@ mod tests {
     /// Estimating IMP/IMPMAP rejects a mixture with per-class Ω/Σ overrides.
     #[test]
     fn estimating_imp_rejects_per_class_overrides() {
-        const OV: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.04
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-  omega(2) ETA_CL ~ 0.15
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        const OV: &str = crate::test_models::ONE_CPT_IV_6;
         let model = crate::parser::model_parser::parse_model_string(OV).unwrap();
         let pop = mix_pop();
         let opts = FitOptions::default();

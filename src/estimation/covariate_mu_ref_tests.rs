@@ -3,25 +3,7 @@ use crate::types::{MuTransform, Population};
 use nalgebra::DMatrix;
 use std::io::Write;
 
-const ADDITIVE_MODEL: &str = r"
-[parameters]
-  theta TVCL(150.0, 0.0, 1000.0)
-  theta TH_CRCL(2.0, 0.0, 50.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  omega ETA_CL ~ 0.2
-  omega ETA_V ~ 0.1
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+const ADDITIVE_MODEL: &str = crate::test_models::ONE_CPT_IV_19;
 
 fn model(src: &str) -> CompiledModel {
     crate::parser::model_parser::parse_model_string(src).expect("model parses")

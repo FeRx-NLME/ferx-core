@@ -875,19 +875,7 @@ mod tests {
 
     /// The mixed-effects CTMM of `tests/markov_smoke.rs`: a per-subject random effect on
     /// the awake→asleep intensity, no `[structural_model]` (an endpoint-only fit).
-    const MIXED_CTMM: &str = r"
-[parameters]
-  theta LQ01(-0.7, -6.0, 3.0)
-  theta LQ10(-1.2, -6.0, 3.0)
-  omega ETA_Q ~ 0.1
-
-[markov_model]
-  type   = ctmm
-  cmt    = 5
-  states = [awake=0, asleep=1]
-  transition awake  -> asleep = exp(LQ01 + ETA_Q)
-  transition asleep -> awake  = exp(LQ10)
-";
+    const MIXED_CTMM: &str = crate::test_models::MODEL_1;
 
     fn ctmm_subject(states: &[(f64, usize)]) -> Subject {
         Subject {

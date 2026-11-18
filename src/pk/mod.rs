@@ -3658,23 +3658,9 @@ mod tests {
     /// `NaN` by value, only loses sharing, and the rows for those pin that too.
     #[test]
     fn records_share_an_evaluation_only_when_every_pk_input_matches_bitwise() {
-        let model = crate::parser::model_parser::parse_model_string(
-            r#"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.1
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL) * (WT/70)
-  V  = TVV * (AGE/40)
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ additive(EPS)
-"#,
-        )
-        .expect("parses");
+        let model =
+            crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_21)
+                .expect("parses");
         assert_eq!(model.referenced_covariates, ["AGE", "WT"]);
         let base = covs(&[("WT", 70.0), ("AGE", 40.0)]);
         let maps = [
@@ -3766,23 +3752,9 @@ mod tests {
     /// observation's), and non-adjacently, and asserts that it does.
     #[test]
     fn shared_per_event_snapshots_are_each_records_own_evaluation_bitwise() {
-        let model = crate::parser::model_parser::parse_model_string(
-            r#"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.1
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL) * (WT/70)
-  V  = TVV * (AGE/40)
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ additive(EPS)
-"#,
-        )
-        .expect("parses");
+        let model =
+            crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_21)
+                .expect("parses");
         let w = |wt: f64| covs(&[("WT", wt), ("AGE", 40.0)]);
         let mut s = make_subject_with_tv(w(70.0), vec![w(70.0), w(95.0)], Vec::new(), 2, 5);
         s.obs_covariates = vec![w(70.0), w(95.0), w(95.0), w(80.0), w(70.0)];

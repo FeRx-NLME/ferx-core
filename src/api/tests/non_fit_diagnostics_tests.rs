@@ -501,30 +501,7 @@ fn simulate_adaptive_reports_both_halves_of_the_bundle() {
 
     // Same starved-budget ODE the adaptive suite uses, plus an `SS=1, II=0` base dose so the
     // model/data half is live alongside the solver half.
-    let m = parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-[fit_options]
-  ode_method = rk45
-  ode_max_steps = 2
-"#,
-    )
-    .expect("parse");
+    let m = parse_model_string(crate::test_models::ODE_4).expect("parse");
 
     let obs_times = vec![6.0, 30.0, 54.0];
     let subject = Subject {
@@ -582,27 +559,7 @@ fn simulate_adaptive_reports_both_halves_of_the_bundle() {
 fn simulate_adaptive_withholds_no_doses_and_only_there() {
     use crate::sim::adaptive::{ControllerCtx, DoseAction};
 
-    let m = parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse");
+    let m = parse_model_string(crate::test_models::ODE_5).expect("parse");
     assert!(
         !m.is_algebraic(),
         "the filter's own predicate must not be what hides it"

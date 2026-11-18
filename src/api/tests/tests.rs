@@ -634,25 +634,7 @@ fn saem_non_mu_referenced_warning_is_none_when_all_eta_params_are_muref() {
 /// case it exists for (#621).
 #[test]
 fn saem_non_mu_referenced_warning_returns_when_the_run_builds_no_covariate_group() {
-    let src = r"
-[parameters]
-  theta TVCL(150.0, 0.0, 1000.0)
-  theta TH_CRCL(2.0, 0.0, 50.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  omega ETA_CL ~ 0.2
-  omega ETA_V ~ 0.1
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    let src = crate::test_models::ONE_CPT_IV_19;
     let model = crate::parser::model_parser::parse_model_string(src).expect("model parses");
     assert_eq!(model.covariate_mu_refs.len(), 1, "CL carries a group");
     assert!(

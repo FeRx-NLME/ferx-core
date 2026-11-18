@@ -4745,29 +4745,7 @@ mod tests {
 
     // ── Mixture class-marginal IS objective (#985) ──
 
-    const MIX_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_MODEL: &str = crate::test_models::ONE_CPT_IV_5;
 
     fn mix_pop() -> crate::types::Population {
         use std::io::Write;

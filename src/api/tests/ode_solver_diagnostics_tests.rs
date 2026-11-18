@@ -737,23 +737,7 @@ fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
 /// A one-compartment closed-form twin of [`two_state_model`]: no `[odes]`, so
 /// the sweep's `model.ode_spec.is_none()` guard fires and it has nothing to do.
 fn closed_form_model() -> CompiledModel {
-    parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse")
+    parse_model_string(crate::test_models::ONE_CPT_IV_3).expect("parse")
 }
 
 /// An **FD fit** must sweep nothing (#1207 review). `adjoint::recorder_in_scope` describes

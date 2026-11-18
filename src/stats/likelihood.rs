@@ -7138,34 +7138,7 @@ mod tests {
         use crate::parser::model_parser::parse_model_string;
         use crate::types::{EventType, ObsRecord};
 
-        let src = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-  theta TVH0(0.01, 1e-5, 10.0)
-  theta TVBETA(0.5, -10.0, 10.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.02 (sd)
-[individual_parameters]
-  CL   = TVCL * exp(ETA_CL)
-  V    = TVV
-  KA   = TVKA
-  H0   = TVH0
-  BETA = TVBETA
-[structural_model]
-  ode(obs_cmt=central, states=[depot, central])
-[odes]
-  d/dt(depot)   = -KA * depot
-  d/dt(central) =  KA * depot - (CL/V) * central
-[event_model]
-  cmt    = 2
-  hazard = H0 * exp(BETA * (central / V))
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  method = focei
-";
+        let src = crate::test_models::ODE_9;
         let model = parse_model_string(src).expect("joint PK-TTE model must parse");
         let mut subject = make_simple_subject();
         // make_simple_subject doses CMT 1 (depot) with 6 PK obs; add a TTE event on CMT 2.
@@ -7291,37 +7264,8 @@ mod tests {
     /// model without editing that test's fixture.
     #[cfg(feature = "survival")]
     fn joint_pktte_ode_model() -> CompiledModel {
-        crate::parser::model_parser::parse_model_string(
-            r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.0, 0.01, 50.0)
-  theta TVH0(0.01, 1e-5, 10.0)
-  theta TVBETA(0.5, -10.0, 10.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.02 (sd)
-[individual_parameters]
-  CL   = TVCL * exp(ETA_CL)
-  V    = TVV
-  KA   = TVKA
-  H0   = TVH0
-  BETA = TVBETA
-[structural_model]
-  ode(obs_cmt=central, states=[depot, central])
-[odes]
-  d/dt(depot)   = -KA * depot
-  d/dt(central) =  KA * depot - (CL/V) * central
-[event_model]
-  cmt    = 2
-  hazard = H0 * exp(BETA * (central / V))
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  method = focei
-",
-        )
-        .expect("joint PK-TTE model must parse")
+        crate::parser::model_parser::parse_model_string(crate::test_models::ODE_9)
+            .expect("joint PK-TTE model must parse")
     }
 
     /// [`joint_pktte_ode_model`] without its compiled `[odes]` program: a spec the walks

@@ -7170,25 +7170,7 @@ fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
 
 #[test]
 fn covariate_mu_ref_reaches_the_compiled_model() {
-    let src = r"
-[parameters]
-  theta TVCL(150.0, 0.0, 1000.0)
-  theta TH_CRCL(2.0, 0.0, 50.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  omega ETA_CL ~ 0.2
-  omega ETA_V ~ 0.1
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    let src = crate::test_models::ONE_CPT_IV_19;
     let m = parse_model_string(src).expect("parses");
     assert_eq!(m.covariate_mu_refs.len(), 1);
     assert_eq!(m.covariate_mu_refs[0].eta_name, "ETA_CL");
@@ -12873,21 +12855,7 @@ fn test_classify_logit_scale() {
 fn test_classify_logit_probability_scale() {
     // inv_logit(logit(THETA_F) + ETA_F) — THETA_F on probability scale (0,1)
     use crate::types::{EtaParamType, ThetaTransform};
-    let model_str = r"
-[parameters]
-  theta THETA_F(0.70, 0.001, 0.999)
-  sigma EPS ~ 0.01
-  omega ETA_F  ~ 0.1
-
-[individual_parameters]
-  F = inv_logit(logit(THETA_F) + ETA_F)
-
-[structural_model]
-  pk one_cpt_iv(cl=1, v=1)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    let model_str = crate::test_models::ONE_CPT_IV_20;
     let model = super::parse_full_model(model_str).unwrap().model;
     let f_info = model
         .eta_param_info
@@ -12902,21 +12870,7 @@ fn test_classify_logit_probability_scale() {
 #[test]
 fn test_inv_logit_logit_theta_evaluates() {
     // inv_logit(logit(0.70) + 0) should equal 0.70
-    let model_str = r"
-[parameters]
-  theta THETA_F(0.70, 0.001, 0.999)
-  sigma EPS ~ 0.01
-  omega ETA_F  ~ 0.1
-
-[individual_parameters]
-  F = inv_logit(logit(THETA_F) + ETA_F)
-
-[structural_model]
-  pk one_cpt_iv(cl=1, v=1)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    let model_str = crate::test_models::ONE_CPT_IV_20;
     let model = super::parse_full_model(model_str).unwrap().model;
     let tv = model.tv_fn.as_ref().unwrap()(&[0.70], &Default::default());
     assert!(

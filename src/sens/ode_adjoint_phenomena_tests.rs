@@ -999,28 +999,7 @@ fn time_in_individual_parameters_matches_reconverged_fd() {
 
 // ---- CMT=0 doses ---------------------------------------------------------------------
 
-const ONE_CPT_ORAL_ODE: &str = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta TVKA(1.2, 0.05, 20.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V ~ 0.06
-  sigma PROP_ERR ~ 0.1 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V = TVV * exp(ETA_V)
-  KA = TVKA
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL/V) * central
-[scaling]
-  y = central / V
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const ONE_CPT_ORAL_ODE: &str = crate::test_models::ODE_6;
 
 /// #899: `CMT=0` is the default dose compartment (compartment 1) on every walk; the
 /// adjoint gradient of a `CMT=0` subject must be **bit-identical** to its `CMT=1` twin and
@@ -1622,49 +1601,9 @@ fn per_route_lag_matches_reconverged_fd() {
 
 // ---- the covariance R-matrix: lag, M3, IOV × Laplace ---------------------------------
 
-const ODE_LAG: &str = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta TVKA(1.2, 0.05, 20.0)
-  theta TVLAG(0.4, 0.01, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_LAG ~ 0.1
-  sigma PROP_ERR ~ 0.1 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V = TVV
-  KA = TVKA
-  LAGTIME = TVLAG * exp(ETA_LAG)
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL/V) * central
-[scaling]
-  y = central / V
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const ODE_LAG: &str = crate::test_models::ODE_7;
 
-const ONE_CPT_ORAL: &str = r#"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const ONE_CPT_ORAL: &str = crate::test_models::ONE_CPT_ORAL_4;
 
 const CF_LAG: &str = r#"
 [parameters]
@@ -2654,25 +2593,7 @@ fn ode_iiv_on_ruv_with_m3_and_closed_form_ss_with_lag_are_analytic() {
     // Measured 6.2e-7 on Linux; ~10× headroom.
     assert!(g < 6e-6, "{g:.2e}");
     // (2) closed-form SS bolus + estimated lag.
-    let cf = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta TVKA(1.2, 0.05, 20.0)
-  theta TVLAG(0.5, 0.01, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_LAG ~ 0.1
-  sigma PROP_ERR ~ 0.1 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V = TVV
-  KA = TVKA
-  ALAG = TVLAG * exp(ETA_LAG)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+    let cf = crate::test_models::ONE_CPT_ORAL_3;
     let m = parse_model_string(cf).unwrap();
     // The SS dose as a bolus into the depot, and (#2786) as an infusion into the central
     // compartment, whose seed at the record carries the previous cycle's window: one that
@@ -3774,25 +3695,7 @@ fn churn_points() -> Vec<(f64, Vec<f64>)> {
         .collect()
 }
 
-const CF_SS_LAG: &str = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta TVKA(1.2, 0.05, 20.0)
-  theta TVLAG(0.5, 0.01, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_LAG ~ 0.1
-  sigma PROP_ERR ~ 0.1 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V = TVV
-  KA = TVKA
-  ALAG = TVLAG * exp(ETA_LAG)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const CF_SS_LAG: &str = crate::test_models::ONE_CPT_ORAL_3;
 
 /// A closed-form SS dose under an estimated lag, a later dose on residual drug: `cmt` 1 a bolus,
 /// 2 an infusion at `rate`. The variants a plan holds after `churn_points`.

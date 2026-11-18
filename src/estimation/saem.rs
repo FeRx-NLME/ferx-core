@@ -8860,26 +8860,7 @@ mod tests {
     /// the saved-eval count is non-zero here.
     #[test]
     fn saem_log_packed_logit_mu_ref_routes_to_numerical_mstep() {
-        let src = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta LOGIT_F(0.5, 0.0, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_F ~ 0.04
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  F  = inv_logit(LOGIT_F + ETA_F)
-  CL = TVCL * exp(ETA_CL) * F
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_8;
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
@@ -8924,26 +8905,7 @@ mod tests {
     /// packing advisory is noise and must stay silent (same gate as #996).
     #[test]
     fn saem_mu_referencing_off_suppresses_the_log_packed_logit_advisory() {
-        let src = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta LOGIT_F(0.5, 0.0, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_F ~ 0.04
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  F  = inv_logit(LOGIT_F + ETA_F)
-  CL = TVCL * exp(ETA_CL) * F
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_8;
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
@@ -9029,24 +8991,7 @@ mod tests {
     /// The #619 additive form with the covariate group as the **only**
     /// eta-bearing parameter (`V` carries no eta), so a closed-form channel
     /// exists if and only if the group is active.
-    const COVMUREF_ONLY_MODEL: &str = r"
-[parameters]
-  theta TVCL(4.0, 0.0, 100.0)
-  theta TH_CRCL(0.02, 0.0, 5.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.01 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const COVMUREF_ONLY_MODEL: &str = crate::test_models::ONE_CPT_IV_9;
 
     /// #619: with the covariate group active, SAEM has a closed-form channel
     /// (the saved-eval count is `Some(>0)`), the parameter is not reported as
@@ -9215,24 +9160,7 @@ mod tests {
     /// [`COVMUREF_ONLY_MODEL`] started where the additive typical value is
     /// negative for the lowest-CRCL subject (`4 − 50·0.2 = −6`), so both group
     /// engines return `None`.
-    const COVMUREF_INADMISSIBLE_START: &str = r"
-[parameters]
-  theta TVCL(4.0, 0.0, 100.0)
-  theta TH_CRCL(0.2, 0.0, 5.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.01 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const COVMUREF_INADMISSIBLE_START: &str = crate::test_models::ONE_CPT_IV_10;
 
     /// SAEM pins a group's thetas only *after* a successful solve, so an
     /// inadmissible start costs no freeze — but it silently reverts the group
@@ -9375,31 +9303,7 @@ mod tests {
         // pinned, so it is `Some(> 0)` only if LOGIT_F is in the pair set — the
         // control being `saem_mixture_without_shared_mu_ref_stays_on_numerical_mstep`
         // below, whose identical fixture has no shared anchor and reports `None`.
-        let src = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta LOGIT_F(-0.405465, -10.0, 10.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_F ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 else TVCL2
-  V  = TVV
-  F  = inv_logit(LOGIT_F + ETA_F)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V, f=F)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_7;
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();

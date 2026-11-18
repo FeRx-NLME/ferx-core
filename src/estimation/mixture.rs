@@ -1560,30 +1560,7 @@ mod tests {
         s
     }
 
-    const MIX_FIT_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.2, 0.01, 100.0)
-  theta TVCL2(2.5, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  theta BWT(0.0, -5.0, 5.0)
-  omega ETA_CL ~ 0.05
-  sigma EPS ~ 0.01
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL + BWT*(WT - 75)
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_FIT_MODEL: &str = crate::test_models::ONE_CPT_IV_18;
 
     fn read_pop(csv: &str) -> crate::types::Population {
         use std::io::Write;
@@ -1635,30 +1612,7 @@ mod tests {
     /// MIXNUM-branched CL with a per-occasion κ on CL (`+ KAPPA_CL`), constant
     /// `p(1)` mixing, diagonal IOV Ω. The IOV segment is packed between σ and the
     /// (here empty) per-class override tail, so this exercises the #985 coexistence.
-    const MIX_IOV_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta P1(0.5, 0.001, 0.999)
-  omega ETA_CL ~ 0.05
-  kappa KAPPA_CL ~ 0.02
-  sigma EPS ~ 0.04
-
-[mixture]
-  nsub = 2
-  p(1) = P1
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_IOV_MODEL: &str = crate::test_models::ONE_CPT_IV_11;
 
     #[test]
     fn iov_mixture_fit_runs_and_emits_posteriors() {
@@ -2347,29 +2301,7 @@ mod tests {
     /// (`tests/nonmem/mixture_iv.ctl`): TVCL1/TVCL2 branch, `p(1)` direct-form
     /// mixing, no per-class overrides. The four free thetas (TVCL1, TVCL2, TVV,
     /// P1) are the covariance step's targets.
-    const MIX_COV_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta P1(0.5, 0.001, 0.999)
-  omega ETA_CL ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  p(1) = P1
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_COV_MODEL: &str = crate::test_models::ONE_CPT_IV_12;
 
     #[test]
     fn mixture_covariance_step_runs_and_sizes() {
@@ -2580,31 +2512,7 @@ mod tests {
     // parity test then exercises the real analytic gradient (softmax mixing
     // slots, base + per-class-override Ω/σ slots). A `MIXNUM`-conditional model
     // is out of analytic scope and takes the FD route (see `mixture_gradient`).
-    const MIX_PARITY_MODEL: &str = r"
-[parameters]
-  theta TVCL(1.5, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.2, -10.0, 10.0)
-  theta BWT(0.05, -5.0, 5.0)
-  omega ETA_CL ~ 0.06
-  sigma EPS ~ 0.02
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL + BWT*(WT - 75)
-  omega(2) ETA_CL ~ 0.15
-  sigma(2) EPS ~ 0.03
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_PARITY_MODEL: &str = crate::test_models::ONE_CPT_IV_13;
 
     /// The exact gradient of `mixture_ofv` at tight inner tolerance, with every class's modes.
     fn exact_mixture_grad(

@@ -887,26 +887,7 @@ fn block_sigma_with_l2_is_not_flagged_unused() {
 /// (W_STEADY_STATE_INIT) rather than silently superpose the two (#521 review).
 #[test]
 fn ss_dose_with_analytical_init_warns() {
-    let src = r#"
-[parameters]
-  theta TVCL(3.0, 0.01, 100.0)
-  theta TVV(20.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.04 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[initial_conditions]
-  init(central) = 30 * V
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+    let src = crate::test_models::ONE_CPT_IV_4;
     let model = crate::parser::model_parser::parse_full_model(src)
         .expect("parse ok")
         .model;
@@ -943,26 +924,7 @@ fn ss_dose_with_analytical_init_warns() {
 /// No SS dose → no W_STEADY_STATE_INIT, even with an init baseline present.
 #[test]
 fn non_ss_dose_with_analytical_init_does_not_warn() {
-    let src = r#"
-[parameters]
-  theta TVCL(3.0, 0.01, 100.0)
-  theta TVV(20.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP_ERR ~ 0.04 (sd)
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[initial_conditions]
-  init(central) = 30 * V
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+    let src = crate::test_models::ONE_CPT_IV_4;
     let model = crate::parser::model_parser::parse_full_model(src)
         .expect("parse ok")
         .model;

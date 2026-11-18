@@ -23,27 +23,8 @@ use crate::estimation::parameterization::compute_bounds;
 /// the model's own initial estimates so the fit has a real optimum to move toward
 /// rather than an arbitrary one.
 fn fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_15)
+        .expect("fixture parses");
     let params = model.default_params.clone();
 
     let make = |id: &str, scale: f64| Subject {
@@ -71,29 +52,8 @@ fn fixture() -> (CompiledModel, Population, ModelParameters) {
 /// shape `examples/warfarin_block_omega.ferx` uses. The `ETA_KA` row is outside the
 /// `(ETA_CL, ETA_V)` block, so `Ω(2,0)` and `Ω(2,1)` are structural zeros.
 fn mixed_omega_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("mixed omega fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_ORAL_1)
+        .expect("mixed omega fixture parses");
     let params = model.default_params.clone();
     let (_, population, _) = fixture();
     (model, population, params)
@@ -968,31 +928,8 @@ fn settling_is_judged_against_noise_not_objective_magnitude() {
 /// quantity, so a fixture where every subject agreed would not exercise
 /// [`Families::PerSubject`] or catch an offset computed from the wrong subject's `K`.
 fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  kappa KAPPA_CL ~ 0.02
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL + KAPPA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-
-[fit_options]
-  iov_column = OCC
-",
-    )
-    .expect("IOV fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_16)
+        .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
         id: id.into(),
@@ -1214,27 +1151,9 @@ fn param_criterion_is_vacuous_when_every_population_parameter_is_fixed() {
         "a model with free θ/Ω/σ must keep the parameter-stability criterion"
     );
 
-    let all_fixed = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0) FIX
-  theta TVV(10.0, 1.0, 100.0) FIX
-  omega ETA_CL ~ 0.09 FIX
-  omega ETA_V  ~ 0.04 FIX
-  sigma PROP_ERR ~ 0.04 FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("all-FIXed fixture parses");
+    let all_fixed =
+        crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_17)
+            .expect("all-FIXed fixture parses");
     assert!(
         !super::param_criterion_applies(&all_fixed.default_params),
         "with every population coordinate FIXed the criterion is vacuous and must be disabled"
@@ -1271,27 +1190,9 @@ fn param_criterion_is_vacuous_when_every_population_parameter_is_fixed() {
 /// And the user is told, because it changes what `converged` is based on.
 #[test]
 fn all_fixed_population_says_convergence_rests_on_the_objective_alone() {
-    let all_fixed = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0) FIX
-  theta TVV(10.0, 1.0, 100.0) FIX
-  omega ETA_CL ~ 0.09 FIX
-  omega ETA_V  ~ 0.04 FIX
-  sigma PROP_ERR ~ 0.04 FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("all-FIXed fixture parses");
+    let all_fixed =
+        crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_17)
+            .expect("all-FIXed fixture parses");
     let (_m, population, _p) = fixture();
     let out = run_vi(
         &all_fixed,

@@ -21,24 +21,7 @@ use crate::types::{CompiledModel, DoseEvent, ModelParameters, Subject};
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 
-const WARFARIN: &str = r#"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const WARFARIN: &str = crate::test_models::ONE_CPT_ORAL_4;
 
 fn warfarin_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
     let n = times.len();

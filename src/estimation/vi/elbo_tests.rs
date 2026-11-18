@@ -22,27 +22,8 @@ use std::collections::HashMap;
 /// identically zero and the parity tests would pass vacuously. Two `η`s rather
 /// than one also means `FullRank` has a genuine off-diagonal to exercise.
 fn fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("closed-form 1-cpt IV fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_IV_15)
+        .expect("closed-form 1-cpt IV fixture parses");
     let params = model.default_params.clone();
     (model, two_subject_population(1.0), params)
 }
@@ -80,29 +61,8 @@ fn two_subject_population(scale: f64) -> Population {
 /// `(2,0)` and `(2,1)` — are **structural zeros**: they occupy packed coordinates
 /// but are not parameters. Nothing else in the VI test suite exercises them.
 fn mixed_omega_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  block_omega (ETA_CL, ETA_V) = [0.09, 0.02, 0.04]
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-",
-    )
-    .expect("mixed block + diagonal omega fixture parses");
+    let model = crate::parser::model_parser::parse_model_string(crate::test_models::ONE_CPT_ORAL_1)
+        .expect("mixed block + diagonal omega fixture parses");
     let params = model.default_params.clone();
     (model, two_subject_population(1.0), params)
 }

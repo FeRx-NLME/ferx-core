@@ -148,24 +148,7 @@ fn relerr(got: f64, want: f64) -> f64 {
 
 /// `ODE_NO_IIV` of `adaptive_sim_tests.rs`, verbatim: the fixture the bare bits were
 /// measured on.
-const ODE_NO_IIV: &str = r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+const ODE_NO_IIV: &str = crate::test_models::ODE_1;
 
 /// The `Dv` readings of a bare model, bit for bit as before the lift: `ODE_NO_IIV`,
 /// observations 2/6/10, decisions 0/4/8, the `dv_threshold` controller, seed 7. Measured

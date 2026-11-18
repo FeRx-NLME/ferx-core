@@ -382,28 +382,7 @@ fn adaptive_cmt_toggle_with_reset_and_base_regimen() {
 /// check (#2753). CL steps at the EVID=2 rows, which carry their own covariate row.
 #[test]
 fn adaptive_cmt_toggle_under_a_time_varying_covariate() {
-    let model = r#"
-[parameters]
-  theta TVKA(0.3, 0.01, 10.0)
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  KA = TVKA
-  CL = TVCL * CRCL / 100.0
-  V  = TVV
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL / V) * central / (1 + central / 200)
-[scaling]
-  y[CMT=1] = depot
-  y[CMT=2] = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+    let model = crate::test_models::ODE_2;
     let m = parse_model_string(model).expect("parse");
     let rows: [(f64, u8, i32, f64); 7] = [
         (1.0, 0, 2, 100.0),
@@ -685,28 +664,7 @@ fn adaptive_dead_lagged_dose_does_not_turn_its_compartment_on() {
 
 /// Oral 1-cpt `[odes]` model with CL on a time-varying `CRCL`, so a run takes the per-event
 /// path and its verifier is `adaptive_frozen_replay_tv`.
-const GUT_CRCL: &str = r#"
-[parameters]
-  theta TVKA(0.3, 0.01, 10.0)
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  KA = TVKA
-  CL = TVCL * CRCL / 100.0
-  V  = TVV
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL / V) * central / (1 + central / 200)
-[scaling]
-  y[CMT=1] = depot
-  y[CMT=2] = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+const GUT_CRCL: &str = crate::test_models::ODE_2;
 
 /// A held run on `pop` (one decision at 7, no dose), with the verifier on, and `predict()` on
 /// the same subject. The decision sits on an observation's time, so the driver breaks where

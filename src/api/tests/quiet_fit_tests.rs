@@ -23,23 +23,7 @@ const CHILD_ENV: &str = "FERX_QUIET_FIT_CHILD";
 const TEST_PATH: &str = "api::quiet_fit_tests::a_quiet_fit_writes_nothing_to_stdout_or_stderr";
 
 fn model() -> CompiledModel {
-    parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse")
+    parse_model_string(crate::test_models::ONE_CPT_IV_3).expect("parse")
 }
 
 fn subject(id: &str, scale: f64) -> Subject {

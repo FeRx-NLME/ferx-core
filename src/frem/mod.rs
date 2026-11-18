@@ -1641,27 +1641,7 @@ mod tests {
 
     #[test]
     fn test_generate_frem_model_omega_dimensions() {
-        let base_text = r"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.02
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+        let base_text = crate::test_models::ONE_CPT_ORAL_2;
 
         let pop = make_test_population();
         let model = make_test_model();
@@ -1688,27 +1668,7 @@ mod tests {
         // Issue #239: when a prior fit is supplied, its theta/omega estimates
         // seed the generated FREM model's PK init values instead of the base
         // model file's declared inits.
-        let base_text = r"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.02
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+        let base_text = crate::test_models::ONE_CPT_ORAL_2;
 
         let pop = make_test_population();
         let model = make_test_model();
@@ -1788,27 +1748,7 @@ mod tests {
         // declared omega) instead of panicking on an out-of-bounds index inside
         // `fit_omega_value`. The base model has 3 PK etas; here `omega` is only
         // 2x2, so the ETA_KA lookup (index 2) is out of range.
-        let base_text = r"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.02
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+        let base_text = crate::test_models::ONE_CPT_ORAL_2;
 
         let pop = make_test_population();
         let model = make_test_model();

@@ -5134,31 +5134,7 @@ fn a_nested_layout_off_the_warm_start_keeps_eta_hat_in_release() {
 /// #979: the two-endpoint total/unbound model with a `block_sigma` across its two
 /// per-CMT proportional sigmas and a κ on CL — the fluconazole shape that used to be
 /// refused with `E_BLOCK_SIGMA_IOV_UNSUPPORTED`.
-const BLOCK_SIGMA_IOV: &str = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta FU(0.3, 0.01, 1.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V ~ 0.06
-  kappa KAPPA_CL ~ 0.04
-  block_sigma (PROP_TOT, PROP_UNB) = [0.01, 0.006, 0.0225]
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL + KAPPA_CL)
-  V = TVV * exp(ETA_V)
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL/V) * central
-[scaling]
-  y[CMT=1] = central / V
-  y[CMT=2] = FU * central / V
-[error_model]
-  CMT=1: DV ~ proportional(PROP_TOT)
-  CMT=2: DV ~ proportional(PROP_UNB)
-[fit_options]
-  iov_column = OCC
-"#;
+const BLOCK_SIGMA_IOV: &str = crate::test_models::ODE_8;
 
 /// Three occasions with a dose at the start of each (later occasions carry the earlier
 /// ones' drug), and a total + unbound sample at each time. `paired = false` keeps only

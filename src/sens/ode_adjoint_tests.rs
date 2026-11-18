@@ -91,28 +91,7 @@ fn parity_for(model: &CompiledModel, s: &Subject, interaction: bool) -> f64 {
     fd_oracle(model, s, interaction)
 }
 
-const ONE_CPT_ORAL_ODE: &str = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta TVKA(1.2, 0.05, 20.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V ~ 0.06
-  sigma PROP_ERR ~ 0.1 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V = TVV * exp(ETA_V)
-  KA = TVKA
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL/V) * central
-[scaling]
-  y = central / V
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const ONE_CPT_ORAL_ODE: &str = crate::test_models::ODE_6;
 
 const TWO_CPT_INF_COMBINED_BLOCK: &str = r#"
 [parameters]
@@ -507,24 +486,7 @@ pub(super) fn fd_oracle(model: &CompiledModel, s: &Subject, interaction: bool) -
 
 // ---- closed-form (analytical) engine --------------------------------------------------
 
-const ONE_CPT_ORAL: &str = r#"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const ONE_CPT_ORAL: &str = crate::test_models::ONE_CPT_ORAL_4;
 
 const TWO_CPT_IV_COMBINED: &str = r#"
 [parameters]
@@ -987,30 +949,7 @@ const ODE_INIT: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-const ODE_LAG: &str = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta TVKA(1.2, 0.05, 20.0)
-  theta TVLAG(0.4, 0.01, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_LAG ~ 0.1
-  sigma PROP_ERR ~ 0.1 (sd)
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V = TVV
-  KA = TVKA
-  LAGTIME = TVLAG * exp(ETA_LAG)
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL/V) * central
-[scaling]
-  y = central / V
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+const ODE_LAG: &str = crate::test_models::ODE_7;
 
 const ODE_TVCOV: &str = r#"
 [parameters]
@@ -3556,31 +3495,7 @@ fn the_iov_outer_gradient_is_exact_with_a_non_gaussian_term() {
 /// #979: a two-endpoint model — total and unbound concentration, a per-CMT proportional
 /// error each — whose two sigmas form a `block_sigma`, with a κ on CL. The shape of the
 /// fluconazole total/unbound model that tripped `E_BLOCK_SIGMA_IOV_UNSUPPORTED`.
-pub(super) const ODE_IOV_BLOCK_SIGMA: &str = r#"
-[parameters]
-  theta TVCL(4.0, 0.1, 100.0)
-  theta TVV(30.0, 1.0, 500.0)
-  theta FU(0.3, 0.01, 1.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V ~ 0.06
-  kappa KAPPA_CL ~ 0.04
-  block_sigma (PROP_TOT, PROP_UNB) = [0.01, 0.006, 0.0225]
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL + KAPPA_CL)
-  V = TVV * exp(ETA_V)
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL/V) * central
-[scaling]
-  y[CMT=1] = central / V
-  y[CMT=2] = FU * central / V
-[error_model]
-  CMT=1: DV ~ proportional(PROP_TOT)
-  CMT=2: DV ~ proportional(PROP_UNB)
-[fit_options]
-  iov_column = OCC
-"#;
+pub(super) const ODE_IOV_BLOCK_SIGMA: &str = crate::test_models::ODE_8;
 
 /// Three occasions, a dose at the start of each so every later occasion starts with
 /// residual drug (κ_g reaches the following occasions), and a total and an unbound

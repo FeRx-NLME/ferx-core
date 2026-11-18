@@ -36,23 +36,7 @@ use crate::types::{BloqMethod, ViFinalOfv, WarningCode, WarningSeverity};
 /// A one-compartment closed form — no ODE solve, so a chain test that has to run
 /// two real estimators stays inside the Tier-1 time budget.
 fn one_cpt_model() -> CompiledModel {
-    parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse")
+    parse_model_string(crate::test_models::ONE_CPT_IV_3).expect("parse")
 }
 
 /// The #1296 model: a rapid-equilibrium two-state ODE, benign at `KFAST = 1`.
@@ -3970,23 +3954,7 @@ fn a_settled_run_and_a_non_mcem_fit_are_left_alone() {
 #[test]
 fn a_short_mcem_fit_is_told_its_verdict_was_not_tested() {
     use crate::api::postfit::MCEM_SETTLING_UNTESTED_TOKEN;
-    let model = parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma ADD ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ additive(ADD)
-"#,
-    )
-    .expect("parse");
+    let model = parse_model_string(crate::test_models::ONE_CPT_IV_2).expect("parse");
     let subject = |id: &str| {
         let mut s = subject_with_dose_time(id, 0.0, 1.0);
         s.observations = s
@@ -4197,25 +4165,7 @@ fn a_direct_estimator_call_gets_the_settling_verdict() {
 #[test]
 fn a_risen_marginal_reaches_the_published_verdict() {
     use crate::api::postfit::{MCEM_OBJECTIVE_ROSE_TOKEN, NONFINITE_MARGINAL_TOKEN};
-    let additive = || {
-        parse_model_string(
-            r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma ADD ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ additive(ADD)
-"#,
-        )
-        .expect("parse")
-    };
+    let additive = || parse_model_string(crate::test_models::ONE_CPT_IV_2).expect("parse");
     let worsening = poisoned(additive(), |theta, _, pk| {
         if (theta[0] - 1.0).abs() > 1e-6 {
             pk.values[1] = 1e6;
