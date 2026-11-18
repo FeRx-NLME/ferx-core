@@ -685,10 +685,12 @@ pub(crate) fn gauss_row_l<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -
 /// Whether a subject's FOCEI objective is the row-and-reduce form [`focei_gauss_row`] and the
 /// reduce `½·[ηᵀΩ⁻¹η + log|Ω| + log|Ω⁻¹ + Σ αGGᵀ|]` describe exactly: the diagonal path with
 /// every row an uncensored Gaussian one, no RUV IIV, no SDE, no FREM rows, no non-Gaussian
-/// records, no custom residual magnitude and no residual correlations.
+/// records, no custom residual magnitude and a diagonal residual covariance — asked of
+/// `ResidualCov::is_dense` (`stats::residual_error`), which sees every correlation source,
+/// not only `block_sigma` pairs (#1081).
 pub(crate) fn structured_rows_supported(ctx: &LikCtx) -> bool {
     let m = ctx.model;
-    !ctx.dense()
+    !ctx.cov.is_dense()
         && m.residual_error_eta.is_none()
         && !ctx.sde
         && m.frem_config.is_none()
@@ -696,7 +698,6 @@ pub(crate) fn structured_rows_supported(ctx: &LikCtx) -> bool {
         && ctx.subject.obs_records.is_empty()
         && !(0..ctx.n()).any(|j| ctx.censored(j).is_some())
         && !m.ruv_magnitude.as_ref().is_some_and(|rm| rm.is_active())
-        && ctx.params.residual_correlations.is_empty()
 }
 
 /// Row `j` of FOCE's Sheiner–Beal marginal as the structured covariance Hessian reads it

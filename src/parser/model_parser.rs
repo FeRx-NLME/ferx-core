@@ -6119,12 +6119,25 @@ pub fn parse_full_model_with(
         eta_names_bsv.len(),
         &outside_idents,
     );
+    // The fold reads `[covariate_model]` through the statements it desugars to (#619, already in
+    // `indiv_stmts`): its text declares the relation θ rather than reading them, so counting it
+    // as an outside read would leave a block-declared covariate θ unfolded where the same
+    // relation written by hand folds (#2980).
+    let mut fold_outside: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, lines) in blocks.iter() {
+        if !matches!(
+            key.as_str(),
+            "parameters" | "individual_parameters" | "covariate_model"
+        ) {
+            collect_referenced_identifiers(lines, &mut fold_outside);
+        }
+    }
     let mu_fold = mu_fold_spec(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         eta_names_bsv.len(),
-        &outside_idents,
+        &fold_outside,
         &mu_refs,
         &covariate_mu_refs,
         &indiv_var_names,
