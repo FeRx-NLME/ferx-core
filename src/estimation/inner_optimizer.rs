@@ -3445,76 +3445,10 @@ fn find_ebe_solve(
         && use_analytic
         && !enable_stall
         && model.frem_config.is_none();
-    // EXPERIMENT (#2975): `FERX_INNER_NEWTON=gn|exact` — a fresh metric at every accepted
-    // point (Gauss–Newton `H̃`, or the exact conditional Hessian) instead of BFGS updates. Only
-    // where the seed itself is in scope (the dense route, a seed formed).
-    let newton_mode = std::env::var("FERX_INNER_NEWTON").ok();
-    let metric_fn = |e: &[f64]| -> Option<DMatrix<f64>> {
-        let m = analytic_inner_seed_hessian(
-            model,
-            subject,
-            params,
-            e,
-            schedule,
-            mult.as_deref(),
-            err_keys.as_ref(),
-            &mut obs_grad_recycle.borrow_mut(),
-            newton_mode.as_deref() == Some("exact"),
-            frozen,
-        );
-        // The seed pass wrote its own rows into the buffer the terminal Jacobian reuses.
-        if let Some(k) = rows_at.borrow_mut().as_mut() {
-            k.clear();
-        }
-        m.map(|(h, _)| h)
-    };
-    let metric: Option<&MetricFn<'_>> =
-        (newton_mode.is_some() && dense_bfgs_route && initial_hessian.is_some())
-            .then_some(&metric_fn as &MetricFn<'_>);
-    // EXPERIMENT (#2975): `FERX_INNER_TR=bfgs|exact|gn` — the inner trust region.
-    let tr_mode = std::env::var("FERX_INNER_TR").ok();
-    let tr_metric_fn = |e: &[f64]| -> Option<DMatrix<f64>> {
-        let m = analytic_inner_seed_hessian(
-            model,
-            subject,
-            params,
-            e,
-            schedule,
-            mult.as_deref(),
-            err_keys.as_ref(),
-            &mut obs_grad_recycle.borrow_mut(),
-            tr_mode.as_deref() == Some("exact"),
-            frozen,
-        );
-        if let Some(k) = rows_at.borrow_mut().as_mut() {
-            k.clear();
-        }
-        m.map(|(h, _)| h)
-    };
-    let tr_result = (!start_certified && dense_bfgs_route && tr_mode.is_some())
-        .then(|| {
-            let metric =
-                (tr_mode.as_deref() != Some("bfgs")).then_some(&tr_metric_fn as &MetricFn<'_>);
-            inner_trust_region_run(
-                &obj,
-                prime,
-                &agrad,
-                &mut eta,
-                n_eta,
-                max_iter,
-                tol,
-                initial_hessian.as_ref(),
-                stop_precond,
-                metric,
-            )
-        })
-        .flatten();
     let result = if start_certified {
         InnerExit::Converged
-    } else if let Some(r) = tr_result {
-        r
     } else {
-        inner_minimize_with_metric(
+        inner_minimize_with_prime(
             &obj,
             prime,
             &agrad,
@@ -3527,7 +3461,6 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
-            metric,
         )
     };
 
@@ -6801,40 +6734,6 @@ fn inner_minimize_with_prime(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> InnerExit {
-    inner_minimize_with_metric(
-        obj,
-        prime,
-        grad,
-        x,
-        n,
-        max_iter,
-        tol,
-        precond,
-        hessian_seed,
-        stop_precond,
-        stall_at,
-        short_line_search,
-        None,
-    )
-}
-
-/// [`inner_minimize_with_prime`] with an optional per-iterate metric for the dense driver.
-#[allow(clippy::too_many_arguments)]
-fn inner_minimize_with_metric(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
-    metric: Option<&MetricFn<'_>>,
-) -> InnerExit {
     if matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
@@ -6877,7 +6776,7 @@ fn inner_minimize_with_metric(
             short_line_search,
         )
     } else {
-        dense_bfgs_run_with_metric(
+        dense_bfgs_run(
             obj,
             prime,
             grad,
@@ -6890,7 +6789,6 @@ fn inner_minimize_with_metric(
             stop_precond,
             stall_at,
             short_line_search,
-            metric,
         )
     };
     #[cfg(test)]
@@ -7246,16 +7144,6 @@ fn dense_bfgs_core(
     .converged()
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test counter: steps whose metric came from [`MetricFn`] rather than a BFGS update.
-    pub(crate) static METRIC_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// A curvature metric of the inner objective at a point (#2975 experiment): the Gauss–Newton
-/// `H̃` or the exact Hessian. `None` where it cannot be formed.
-pub(crate) type MetricFn<'a> = dyn Fn(&[f64]) -> Option<DMatrix<f64>> + 'a;
-
 /// [`dense_bfgs_core`], reporting how the search ended ([`InnerExit`]).
 #[allow(clippy::too_many_arguments)]
 fn dense_bfgs_run(
@@ -7271,42 +7159,6 @@ fn dense_bfgs_run(
     stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
-) -> InnerExit {
-    dense_bfgs_run_with_metric(
-        obj,
-        prime,
-        grad,
-        x,
-        n,
-        max_iter,
-        tol,
-        precond,
-        hessian_seed,
-        stop_precond,
-        stall_at,
-        short_line_search,
-        None,
-    )
-}
-
-/// [`dense_bfgs_run`] with an optional per-iterate metric: at every accepted point a metric
-/// that forms replaces the BFGS update (a Newton / Fisher-scoring step under the same line
-/// search, stall logic and certificate).
-#[allow(clippy::too_many_arguments)]
-fn dense_bfgs_run_with_metric(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    precond: Option<&[f64]>,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    stall_at: &dyn Fn(&[f64]) -> bool,
-    short_line_search: bool,
-    metric: Option<&MetricFn<'_>>,
 ) -> InnerExit {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
@@ -7473,16 +7325,7 @@ fn dense_bfgs_run_with_metric(
         ) {
             return InnerExit::Stuck;
         }
-        // The metric at the new point, made saddle-free and inverted, replaces the update.
-        let fresh = metric
-            .and_then(|m| m(x))
-            .and_then(|h| seed_h_inv(n, Some(&crate::estimation::trust_region::saddle_free(&h))));
-        if let Some(hi) = fresh {
-            h_inv = hi;
-            h_unshaped = false;
-            #[cfg(test)]
-            METRIC_STEPS.with(|c| c.set(c.get() + 1));
-        } else if !reset {
+        if !reset {
             for i in 0..n {
                 y[i] = g_new[i] - g[i];
             }
@@ -7525,85 +7368,6 @@ fn dense_bfgs_run_with_metric(
     }
 
     InnerExit::Failed
-}
-
-/// EXPERIMENT (#2975): the outer trust region's method on the inner η-problem. The model is
-/// `m(s) = f + gᵀs + ½ sᵀBs` with `B` the saddle-free seed updated by damped BFGS (`bfgs`), or a
-/// fresh metric at every accepted point (`exact` / `gn`, through `metric`); the subproblem is
-/// solved exactly on `B`'s eigenbasis in Moré's scaled norm; a step is accepted on the
-/// actual-to-predicted ratio. One fused value-and-gradient evaluation per accepted step, one value
-/// per rejected one, no line search. Stops on the same gradient certificate as the line-search
-/// driver. `None` when there is no seed to start the model from.
-#[allow(clippy::too_many_arguments)]
-fn inner_trust_region_run(
-    obj: &dyn Fn(&[f64]) -> f64,
-    prime: Option<&PrimeFn<'_>>,
-    grad: &dyn Fn(&[f64]) -> Vec<f64>,
-    x: &mut [f64],
-    n: usize,
-    max_iter: usize,
-    tol: f64,
-    hessian_seed: Option<&DMatrix<f64>>,
-    stop_precond: Option<&[f64]>,
-    metric: Option<&MetricFn<'_>>,
-) -> Option<InnerExit> {
-    use crate::estimation::trust_region::{
-        damped_bfgs_update, saddle_free, saddle_free_subproblem,
-    };
-    let seed = hessian_seed.filter(|h| h.nrows() == n && h.ncols() == n)?;
-    let mut b = saddle_free(seed);
-    let mut g = DVector::from_vec(grad(x));
-    let mut f = obj(x);
-    let mut radius = 1.0_f64;
-    let mut d_scale = vec![0.0_f64; n];
-    for _ in 0..max_iter {
-        if grad_norm_metric(g.as_slice(), stop_precond) < tol {
-            return Some(InnerExit::Converged);
-        }
-        for i in 0..n {
-            let v = b[(i, i)].abs().sqrt();
-            if v.is_finite() && v > d_scale[i] {
-                d_scale[i] = v;
-            }
-        }
-        let dmax = d_scale.iter().copied().fold(0.0_f64, f64::max);
-        if !(dmax > 0.0) {
-            return Some(InnerExit::Failed);
-        }
-        let d: Vec<f64> = d_scale.iter().map(|&v| v.max(1e-8 * dmax)).collect();
-        let gy = DVector::from_fn(n, |i, _| g[i] / d[i]);
-        let hy = DMatrix::from_fn(n, n, |i, j| b[(i, j)] / (d[i] * d[j]));
-        let Some(sub) = saddle_free_subproblem(&gy, hy, radius) else {
-            return Some(InnerExit::Failed);
-        };
-        let xn: Vec<f64> = (0..n).map(|i| x[i] + sub.step[i] / d[i]).collect();
-        let pred = -(gy.dot(&sub.step) + 0.5 * sub.step.dot(&(&sub.habs * &sub.step)));
-        let f_new = prime.and_then(|p| p(&xn)).unwrap_or_else(|| obj(&xn));
-        let rho = if pred > 0.0 { (f - f_new) / pred } else { -1.0 };
-        let snorm = sub.step.norm();
-        if f_new.is_finite() && f_new < f && rho > 1e-4 {
-            let g_new = DVector::from_vec(grad(&xn));
-            let s = DVector::from_fn(n, |i, _| xn[i] - x[i]);
-            match metric.and_then(|m| m(&xn)) {
-                Some(h) => b = saddle_free(&h),
-                None => damped_bfgs_update(&mut b, &s, &(&g_new - &g)),
-            }
-            x.copy_from_slice(&xn);
-            f = f_new;
-            g = g_new;
-            if rho > 0.75 && snorm >= 0.99 * radius {
-                radius = (2.0 * radius).min(1e3);
-            } else if rho < 0.25 {
-                radius = 0.25 * snorm.max(1e-12);
-            }
-        } else {
-            radius = 0.25 * snorm.max(1e-12);
-            if radius < 1e-12 {
-                return Some(InnerExit::Failed);
-            }
-        }
-    }
-    Some(InnerExit::Failed)
 }
 
 /// Nelder-Mead simplex minimization (fallback)
