@@ -77,22 +77,68 @@ impl Value {
 }
 
 /// A name the model file chose (a θ, η, σ or κ name, an `A__B` off-diagonal, a base
-/// name) as a YAML key or scalar: always quoted when `always` (under `estimates:`),
-/// otherwise only when YAML 1.1 — which R's `yaml` package implements — would read it
-/// bare as something other than that string. Every legal identifier is a plain scalar
-/// except the boolean and null spellings: `YES`, `no`, `On`, `OFF`, `y`, `N`, `TRUE`,
-/// `NULL`, … would come back as `TRUE` / `FALSE` / `NULL` and address a different key than
-/// the JSON's `"YES"` (#2911). The check is case-insensitive, so it also quotes a few
-/// mixed-case spellings YAML would read as strings; that costs only the quotes.
+/// name) as a YAML **block** key or scalar: always quoted when `always` (under
+/// `estimates:`), otherwise only when YAML 1.1 — which R's `yaml` package implements —
+/// would read it bare as something other than that string, or could not read it at all.
+///
+/// Every legal identifier is a plain scalar except the boolean and null spellings: `YES`,
+/// `no`, `On`, `OFF`, `y`, `N`, `TRUE`, `NULL`, … would come back as `TRUE` / `FALSE` /
+/// `NULL` and address a different key than the JSON's `"YES"` (#2911). The check is
+/// case-insensitive, so it also quotes a few mixed-case spellings YAML would read as
+/// strings; that costs only the quotes.
+///
+/// A level name (`TEFF[TIME=0.5]`) is not an identifier, but in block context a plain
+/// scalar may contain `[`, `]`, `=` and `,` as long as it does not *start* with an
+/// indicator, so it stays bare. What is quoted is anything that would change the
+/// document's shape: a leading indicator or space, `: ` or ` #` inside, a trailing `:`
+/// or space, or a control character ([`needs_quotes_in_block`]). In a flow sequence
+/// (`[a, b]`) more characters are structural — use [`yaml_flow_name`] there (#3006).
 pub(crate) fn yaml_name(name: &str, always: bool) -> String {
-    const IMPLICIT: &[&str] = &[
-        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", "",
-    ];
-    if always || IMPLICIT.contains(&name.to_ascii_lowercase().as_str()) {
+    if always || needs_quotes_in_block(name) {
         yaml_quote(name)
     } else {
         name.to_string()
     }
+}
+
+/// [`yaml_name`] for an element of a YAML **flow** sequence (`parameters: [A, B]`). Inside
+/// `[...]` the flow indicators `[`, `]`, `{`, `}` and `,` are structural even mid-scalar,
+/// so `[INT, TEFF[TIME=0.5]]` opens a nested sequence and the document fails to parse
+/// (#3006). Such a name — and one holding `:`, which YAML 1.1 parsers treat
+/// inconsistently inside flow context — is quoted; a plain identifier stays bare.
+pub(crate) fn yaml_flow_name(name: &str) -> String {
+    const FLOW: &[char] = &['[', ']', '{', '}', ',', ':'];
+    if needs_quotes_in_block(name) || name.contains(FLOW) {
+        yaml_quote(name)
+    } else {
+        name.to_string()
+    }
+}
+
+/// A comma-joined YAML flow sequence of names, each through [`yaml_flow_name`].
+pub(crate) fn yaml_flow_names<S: AsRef<str>>(names: &[S]) -> String {
+    let items: Vec<String> = names.iter().map(|n| yaml_flow_name(n.as_ref())).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Whether `name` must be quoted to round-trip as that string in YAML block context.
+fn needs_quotes_in_block(name: &str) -> bool {
+    const IMPLICIT: &[&str] = &[
+        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", "",
+    ];
+    // Characters that start a non-plain node, or are reserved, at the head of a scalar.
+    const INDICATORS: &[char] = &[
+        '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '\'', '"', '%', '@',
+        '`',
+    ];
+    IMPLICIT.contains(&name.to_ascii_lowercase().as_str())
+        || name.starts_with(INDICATORS)
+        || name.starts_with(char::is_whitespace)
+        || name.ends_with(char::is_whitespace)
+        || name.ends_with(':')
+        || name.contains(": ")
+        || name.contains(" #")
+        || name.contains(char::is_control)
 }
 
 /// One named entry of a section: a parameter (`CL`), or an off-diagonal (`A__B`).
