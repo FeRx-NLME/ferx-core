@@ -6208,3 +6208,53 @@ fn a_lagged_ss_absorption_kink_on_a_clock_reading_rhs_has_the_exact_inner_hessia
         "d2l/deta2 vs FD of the exact gradient: {bad:?}"
     );
 }
+
+/// #3004: `examples/per_route_lag_absorption.ferx` at its **start values** — the point the
+/// outer optimizer's pre-flights evaluate the exact gradient, `R` diagonal and Hessian at —
+/// with an observation exactly ON the delayed route's lagged arrival (`TVLAG2 = 3`, `t = 3`),
+/// one either side of it, and a second dose on residual drug. The arrival is a kink in the
+/// lag; the exact derivative follows the value path's convention, so the gradient, the full
+/// Hessian and the diagonal along every packed axis are finite under both objectives (the
+/// report of a non-finite start-value Hessian did not reproduce on the PR head), and the
+/// Hessian matches the reconverged FD oracle at a point off the kink (`hessian_gaps_for`,
+/// which moves the θ).
+#[test]
+fn per_route_lag_example_start_values_are_exact_and_finite() {
+    let src = std::fs::read_to_string("examples/per_route_lag_absorption.ferx").unwrap();
+    let m = parse_model_string(&src).unwrap();
+    assert!(m.has_route_absorption_lag());
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.25, 1.0, 2.9, 3.0, 3.1, 4.0, 8.0, 13.0, 15.1, 15.5, 24.0];
+    let s = subject(&m, doses.clone(), &times, &[0.1, -0.05]);
+    let params = m.default_params.clone();
+    let x = pack_params(&params);
+    assert_eq!(
+        params.theta[5], 3.0,
+        "the start value sits on the observation"
+    );
+    let pt = PackedPoint::new(&params, &x).unwrap();
+    let axes: Vec<usize> = (0..x.len()).collect();
+    for obj in [Objective::Focei, Objective::Foce] {
+        let eta = ebe_for(&m, &s, &params, 1e-10, obj != Objective::Foce);
+        let eta = eta.as_slice();
+        let g = subject_adjoint_gradient(&m, &s, &params, &x, eta, obj).expect("gradient served");
+        let h = subject_adjoint_cov_hessian(&m, &s, &params, &x, eta, obj).expect("H served");
+        let d = subject_adjoint_cov_diag_at(&m, &s, &pt, eta, obj, &axes).expect("diag served");
+        assert!(g.iter().all(|v| v.is_finite()), "{obj:?} gradient {g:?}");
+        assert!(h.iter().all(|v| v.is_finite()), "{obj:?} Hessian");
+        assert!(d.iter().all(|v| v.is_finite()), "{obj:?} diagonal {d:?}");
+        for (k, &a) in axes.iter().enumerate() {
+            let gap = (d[k] - h[(a, a)]).abs() / (1.0 + h[(a, a)].abs());
+            assert!(gap < 1e-9, "{obj:?} diag[{a}] {} vs H {}", d[k], h[(a, a)]);
+        }
+    }
+    let m = with_tol(m, 1e-12, 1e-14);
+    let off_kink = [0.25, 1.0, 2.5, 3.5, 4.0, 8.0, 13.0, 15.5, 24.0];
+    let s = subject(&m, doses, &off_kink, &[0.1, -0.05]);
+    let (gap, _) = hessian_gaps_for(&m, &s, Objective::Focei);
+    // Measured 1.6e-9 on Linux; ~10x headroom.
+    assert!(gap < 2e-8, "Hessian vs reconverged FD: {gap:.2e}");
+}
