@@ -1985,6 +1985,8 @@ fn test_saem_block_sigma_ofv_matches_foce() {
     // SAEM evaluation at the same fixed params.
     let mut saem_opts = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
     saem_opts.saem_n_exploration = 2;
+    // The regression is about the FOCE/Laplace readout (#2973 made IS the default).
+    saem_opts.saem_ofv = crate::types::SaemOfv::Focei;
     saem_opts.saem_n_convergence = 0;
     saem_opts.saem_n_mh_steps = 1;
     saem_opts.saem_adapt_interval = 10;

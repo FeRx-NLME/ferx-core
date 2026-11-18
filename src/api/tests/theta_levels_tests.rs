@@ -5090,7 +5090,7 @@ mod absorption {
         let site = |param: Option<&str>, via: Option<&str>| ScaleShare {
             param: param.map(str::to_string),
             eta_via: via.map(str::to_string),
-            binary: false,
+            endpoint: None,
         };
         let via = |v: &str| Some(EtaRoute::Via(v.to_string()));
         let cases: [(&str, Option<ScaleShare>, Option<EtaRoute>); 8] = [

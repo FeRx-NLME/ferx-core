@@ -58,8 +58,8 @@ pub(crate) fn converged_fit(ofv: f64) -> FitResult {
     let mut result = fixture_fit();
     result.converged = true;
     result.ofv = ofv;
-    result.aic = ofv + 2.0;
-    result.bic = ofv + 5.0;
+    result.aic = Some(ofv + 2.0);
+    result.bic = Some(ofv + 5.0);
     result
 }
 

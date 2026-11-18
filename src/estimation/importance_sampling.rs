@@ -338,10 +338,67 @@ fn eval_defensive_alpha(options: &FitOptions) -> f64 {
     }
 }
 
+/// What a pilot pass keeps of its draws: the ESS fraction and the weighted moments.
+struct PilotMoments {
+    ess_fraction: f64,
+    mean: Vec<f64>,
+    second_moment: DMatrix<f64>,
+}
+
+/// One pilot pass: [`subject_is_draws_with`] at unit scale, without the per-draw `Vec`s it
+/// retains for the M-step (the draws are stored flat), so the same draws and weights, and the
+/// same moments bit for bit. A pass with no usable proposal reports ESS 0.
+#[allow(clippy::too_many_arguments)]
+fn subject_pilot_moments(
+    obs_nll: &SampleObsNll<'_>,
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    mixture: Option<&DefensiveMixture>,
+) -> PilotMoments {
+    let mut flat: Vec<f64> = Vec::with_capacity(k_samples * d);
+    let Some(log_w) = is_log_weights(
+        obs_nll,
+        eta_hat,
+        h,
+        omega_inv,
+        log_det_omega,
+        d,
+        k_samples,
+        nu,
+        seed,
+        scratch,
+        1.0,
+        false,
+        mixture,
+        Some(&mut flat),
+    ) else {
+        return PilotMoments {
+            ess_fraction: 0.0,
+            mean: vec![0.0; d],
+            second_moment: DMatrix::zeros(d, d),
+        };
+    };
+    let (_, weights) = logsumexp_with_normalised(&log_w);
+    let ess_fraction = ess_from_weights(&weights) / (k_samples as f64);
+    let (mean, second_moment) = weighted_moments(&weights, &flat, d);
+    PilotMoments {
+        ess_fraction,
+        mean,
+        second_moment,
+    }
+}
+
 /// The proposal centre and precision a pilot's weighted moments give, or `None`
 /// when they cannot be used: too few effective draws, a non-finite moment, or a
 /// covariance that is not positive-definite.
-fn proposal_from_moments(draws: &SubjectDraws, k: usize) -> Option<(DVector<f64>, DMatrix<f64>)> {
+fn proposal_from_moments(draws: &PilotMoments, k: usize) -> Option<(DVector<f64>, DMatrix<f64>)> {
     let d = draws.mean.len();
     let min_ess = IS_ADAPT_MIN_ESS_PER_DIM * (d + 1) as f64;
     if !(draws.ess_fraction * k as f64 >= min_ess) {
@@ -387,7 +444,7 @@ fn adapt_proposal(
         if crate::cancel::is_cancelled(cancel) {
             break;
         }
-        let draws = subject_is_draws_with(
+        let draws = subject_pilot_moments(
             obs_nll,
             &center,
             &h,
@@ -398,8 +455,6 @@ fn adapt_proposal(
             nu,
             pilot_seed(seed, pass),
             scratch,
-            1.0,
-            false,
             mixture,
         );
         match proposal_from_moments(&draws, k_samples) {
@@ -616,6 +671,13 @@ pub fn run_importance_sampling(
     if k_samples < 2 {
         return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
     }
+    // Draws per pilot pass: `imp_adapt_samples`, or the full `imp_samples` when unset (0).
+    // After the `k_samples >= 2` check: `clamp` panics when its bounds cross.
+    let pilot_k = if options.imp_adapt_samples == 0 {
+        k_samples
+    } else {
+        options.imp_adapt_samples.clamp(2, k_samples)
+    };
     if nu.is_nan() || nu < 1.0 {
         return Err(format!(
             "IS: imp_proposal_df must be >= 1.0 or `normal`, got {}",
@@ -777,7 +839,7 @@ pub fn run_importance_sampling(
                         &prior.inv,
                         prior.log_det,
                         n_b,
-                        k_samples,
+                        pilot_k,
                         nu,
                         subj_seed,
                         scratch,
@@ -873,7 +935,7 @@ pub fn run_importance_sampling(
                     &omega_inv,
                     log_det_omega,
                     n_eta,
-                    k_samples,
+                    pilot_k,
                     nu,
                     subj_seed,
                     scratch,
@@ -1833,7 +1895,7 @@ fn is_log_weights(
     iscale: f64,
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
-    mut keep: Option<&mut Vec<Vec<f64>>>,
+    mut keep: Option<&mut Vec<f64>>,
 ) -> Option<Vec<f64>> {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -1932,7 +1994,7 @@ fn is_log_weights(
 
         log_w.push(log_p_y + log_p_eta - log_q);
         if let Some(etas) = keep.as_deref_mut() {
-            etas.push(eta_sample.clone());
+            etas.extend_from_slice(&eta_sample);
         }
     }
 
@@ -1960,7 +2022,7 @@ pub(crate) fn subject_is_draws_with(
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
-    let mut etas: Vec<Vec<f64>> = Vec::with_capacity(k_samples);
+    let mut flat: Vec<f64> = Vec::with_capacity(k_samples * d);
     let Some(log_w) = is_log_weights(
         obs_nll,
         eta_hat,
@@ -1975,7 +2037,7 @@ pub(crate) fn subject_is_draws_with(
         iscale,
         use_sobol,
         mixture,
-        Some(&mut etas),
+        Some(&mut flat),
     ) else {
         return SubjectDraws {
             log_marginal: 0.0,
@@ -1991,18 +2053,8 @@ pub(crate) fn subject_is_draws_with(
     let log_marginal = lse - (k_samples as f64).ln();
     let ess = ess_from_weights(&weights);
     let ess_fraction = ess / (k_samples as f64);
-
-    // Weighted first and second moments Σₖ w̃ₖ ηₖ and Σₖ w̃ₖ ηₖ ηₖᵀ.
-    let mut mean = vec![0.0_f64; d];
-    let mut second_moment = DMatrix::<f64>::zeros(d, d);
-    for (w, eta) in weights.iter().zip(etas.iter()) {
-        for i in 0..d {
-            mean[i] += w * eta[i];
-            for j in 0..d {
-                second_moment[(i, j)] += w * eta[i] * eta[j];
-            }
-        }
-    }
+    let (mean, second_moment) = weighted_moments(&weights, &flat, d);
+    let etas: Vec<Vec<f64>> = flat.chunks_exact(d).map(<[f64]>::to_vec).collect();
 
     SubjectDraws {
         log_marginal,
@@ -2012,6 +2064,22 @@ pub(crate) fn subject_is_draws_with(
         mean,
         second_moment,
     }
+}
+
+/// Weighted first and second moments `Σₖ w̃ₖ ηₖ` and `Σₖ w̃ₖ ηₖ ηₖᵀ` of draws stored flat,
+/// `d` per sample.
+fn weighted_moments(weights: &[f64], flat: &[f64], d: usize) -> (Vec<f64>, DMatrix<f64>) {
+    let mut mean = vec![0.0_f64; d];
+    let mut second_moment = DMatrix::<f64>::zeros(d, d);
+    for (w, eta) in weights.iter().zip(flat.chunks_exact(d)) {
+        for i in 0..d {
+            mean[i] += w * eta[i];
+            for j in 0..d {
+                second_moment[(i, j)] += w * eta[i] * eta[j];
+            }
+        }
+    }
+    (mean, second_moment)
 }
 
 /// The evaluation-only readout of [`subject_is_draws_with`]'s draws: the same
@@ -5142,12 +5210,9 @@ mod tests {
         assert_eq!(center[0], 0.26);
     }
 
-    fn pilot(ess_fraction: f64, mean: f64, second_moment: f64) -> SubjectDraws {
-        SubjectDraws {
-            log_marginal: 0.0,
+    fn pilot(ess_fraction: f64, mean: f64, second_moment: f64) -> PilotMoments {
+        PilotMoments {
             ess_fraction,
-            etas: Vec::new(),
-            weights: Vec::new(),
             mean: vec![mean],
             second_moment: scalar(second_moment),
         }

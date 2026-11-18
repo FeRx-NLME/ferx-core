@@ -1,0 +1,14 @@
+$PROBLEM ferx #2877 count endpoint (nb, fixed): -2 log PMF with ln Gamma(k+1) kept, LAPLACE
+$INPUT ID TIME DV CMT EVID MDV WT TRT
+$DATA count_nb.csv IGNORE=@
+$PRED
+ LAM = EXP(LOG(THETA(1)) + THETA(2)*(WT/70 - 1) + THETA(3)*TRT + ETA(1))
+ R = THETA(4)
+ Y = -2*(GAMLN(DV+R) - GAMLN(R) - GAMLN(DV+1) + R*LOG(R/(R+LAM)) + DV*LOG(LAM/(R+LAM)))
+$THETA
+ (0.01, 3, 100)   ; BASE
+ (-10, 0.1, 10)   ; BETA
+ (-10, -0.1, 10)  ; GAM
+ (0.01, 5, 1000)  ; R (size)
+$OMEGA 0 FIX  ; no random effect: fixed-effects-only case
+$ESTIMATION METHOD=COND LAPLACE -2LL MAXEVAL=9999 NSIG=4 SIGL=12 PRINT=10 NOABORT FORMAT=s1PE23.16

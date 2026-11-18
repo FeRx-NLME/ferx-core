@@ -128,6 +128,20 @@ fn yaml_proposal_df(nu: f64) -> String {
     }
 }
 
+/// A float as a YAML scalar at `{:.6}`, or YAML's own `.nan` / `.inf` / `-.inf` when it is not
+/// finite: Rust's `NaN` / `inf` would be read back as strings (#2973, the class of #3006).
+fn yaml_f64_6(v: f64) -> String {
+    if v.is_finite() {
+        format!("{v:.6}")
+    } else if v.is_nan() {
+        ".nan".to_string()
+    } else if v > 0.0 {
+        ".inf".to_string()
+    } else {
+        "-.inf".to_string()
+    }
+}
+
 /// Largest absolute component of [`FitResult::final_gradient`], or `None` when
 /// the fit reported no gradient (#1934). A non-finite component makes the whole
 /// norm `NaN` rather than being dropped — `f64::max` discards `NaN`, so a plain
@@ -1394,8 +1408,16 @@ fn ofv_is_imp_laplace(result: &FitResult) -> bool {
 }
 
 /// The importance-sampling marginal, printed next to `ofv` so the two cannot be
-/// mistaken for one another. `None` when the fit has no marginal.
+/// mistaken for one another. `None` when the fit has no marginal, or when the marginal
+/// *is* `ofv` (a SAEM fit under `saem_ofv = imp`, whose OFV row carries its SE).
 fn is_marginal_line(result: &FitResult) -> Option<String> {
+    if result
+        .saem_objective
+        .as_ref()
+        .is_some_and(|o| o.kind == SaemOfv::Imp)
+    {
+        return None;
+    }
     result.importance_sampling.as_ref().map(|is| {
         format!(
             "IS marginal -2LL:  {:.4}  (MC SE = {:.4}, K = {})",
@@ -1404,12 +1426,59 @@ fn is_marginal_line(result: &FitResult) -> Option<String> {
     })
 }
 
+/// How the OFV row of a SAEM fit names what it is (#2973), `None` when it is the
+/// FOCE/Laplace objective.
+fn saem_ofv_label(result: &FitResult) -> Option<String> {
+    let o = result.saem_objective.as_ref()?;
+    Some(match o.kind {
+        SaemOfv::Saem => {
+            "OFV (SAEM objective, NONMEM SAEMOBJ convention; not a likelihood)".to_string()
+        }
+        SaemOfv::Imp => format!(
+            "OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = {:.4}, K = {})",
+            o.mc_standard_error.unwrap_or(f64::NAN),
+            o.n_samples.unwrap_or(0)
+        ),
+        SaemOfv::Agq => format!("OFV (AGQ -2LL, {} nodes)", o.n_nodes.unwrap_or(0)),
+        SaemOfv::Focei => "OFV".to_string(),
+    })
+}
+
+/// The console line standing in for AIC/BIC when the fit has none (#2973).
+fn ic_unavailable_line(result: &FitResult) -> &'static str {
+    match &result.saem_objective {
+        Some(o) if o.kind == SaemOfv::Saem => {
+            "AIC/BIC: n/a \u{2014} the SAEM objective is not a likelihood; set saem_ofv = imp \
+             (or agq/focei) for information criteria"
+        }
+        _ => "AIC/BIC: n/a \u{2014} the fit reports no likelihood",
+    }
+}
+
 /// What a reader comparing this objective with a NONMEM `.lst` needs to be told
 /// (#2654). Empty for a fit with no importance-sampling stage, so its output is
 /// unchanged. Shared by the console, the summary file and the YAML comments.
 fn objective_notes(result: &FitResult) -> Vec<&'static str> {
     let laplace = ofv_is_imp_laplace(result);
     let mut notes = Vec::new();
+    if let Some(o) = &result.saem_objective {
+        notes.push(match o.kind {
+            SaemOfv::Saem => {
+                "OFV is NONMEM's SAEMOBJ convention (the SAEM objective, not a likelihood): do not \
+                 compare it across models. There is no AIC or BIC for it (they are null); \
+                 the FOCE/Laplace value is reported separately, and saem_ofv = imp gives the importance-sampled -2LL (NONMEM IMP EONLY=1)."
+            }
+            SaemOfv::Imp => {
+                "OFV, AIC and BIC come from the importance-sampled -2LL at the SAEM estimates \
+                 (NONMEM IMP EONLY=1); the FOCE/Laplace value is reported separately as a diagnostic."
+            }
+            _ => {
+                "OFV, AIC and BIC come from adaptive Gauss-Hermite quadrature at the SAEM \
+                 estimates; the FOCE/Laplace value is reported separately as a diagnostic."
+            }
+        });
+        return notes;
+    }
     if laplace {
         notes.push("OFV, AIC and BIC come from a final Laplace pass, not the IS marginal.");
     }
@@ -1429,11 +1498,13 @@ fn objective_notes(result: &FitResult) -> Vec<&'static str> {
 /// only in `indent`.
 fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
     use std::fmt::Write as _;
-    let ofv_label = if ofv_is_imp_laplace(result) {
-        "OFV (Laplace)"
-    } else {
-        "OFV"
-    };
+    let ofv_label = saem_ofv_label(result).unwrap_or_else(|| {
+        if ofv_is_imp_laplace(result) {
+            "OFV (Laplace)".to_string()
+        } else {
+            "OFV".to_string()
+        }
+    });
     let _ = writeln!(out, "{indent}{ofv_label}:  {:.4}", result.ofv);
     // Under parameter priors (#254) the OFV above is the penalized objective
     // that was minimised, so the split is printed right under it — and AIC/BIC
@@ -1443,11 +1514,25 @@ fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
         let _ = writeln!(out, "{indent}  data:  {:.4}", result.ofv_data);
         let _ = writeln!(out, "{indent}  prior: {:.4}", result.ofv_prior);
     }
+    if let Some(o) = &result.saem_objective {
+        let _ = writeln!(
+            out,
+            "{indent}FOCE/Laplace OFV (diagnostic):  {:.4}",
+            o.foce_ofv
+        );
+    }
     if let Some(line) = is_marginal_line(result) {
         let _ = writeln!(out, "{indent}{line}");
     }
-    let _ = writeln!(out, "{indent}AIC:  {:.4}", result.aic);
-    let _ = writeln!(out, "{indent}BIC:  {:.4}", result.bic);
+    match (result.aic, result.bic) {
+        (Some(aic), Some(bic)) => {
+            let _ = writeln!(out, "{indent}AIC:  {aic:.4}");
+            let _ = writeln!(out, "{indent}BIC:  {bic:.4}");
+        }
+        _ => {
+            let _ = writeln!(out, "{indent}{}", ic_unavailable_line(result));
+        }
+    }
     for note in objective_notes(result) {
         let _ = writeln!(out, "{indent}{note}");
     }
@@ -2127,7 +2212,7 @@ pub fn format_comparison(runs: &[(String, &FitResult)]) -> String {
         "AIC",
         &runs
             .iter()
-            .map(|(_, r)| format!("{:.4}", r.aic))
+            .map(|(_, r)| r.aic.map_or("n/a".to_string(), |v| format!("{v:.4}")))
             .collect::<Vec<_>>(),
     );
     row(
@@ -2135,7 +2220,7 @@ pub fn format_comparison(runs: &[(String, &FitResult)]) -> String {
         "BIC",
         &runs
             .iter()
-            .map(|(_, r)| format!("{:.4}", r.bic))
+            .map(|(_, r)| r.bic.map_or("n/a".to_string(), |v| format!("{v:.4}")))
             .collect::<Vec<_>>(),
     );
     row(
@@ -3344,6 +3429,28 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if ofv_is_imp_laplace(result) {
         writeln!(f, "  ofv_type: laplace").map_err(|e| e.to_string())?;
     }
+    // A SAEM fit's objective (#2973): what `ofv` is, its Monte-Carlo SE, and the
+    // FOCE/Laplace value it replaced. Absent under `saem_ofv = focei` and for every other
+    // method, so their YAML is unchanged.
+    if let Some(o) = &result.saem_objective {
+        let ty = match o.kind {
+            SaemOfv::Saem => "saem_objective",
+            SaemOfv::Imp => "importance_sampling",
+            _ => "agq",
+        };
+        writeln!(f, "  ofv_type: {ty}").map_err(|e| e.to_string())?;
+        if let Some(se) = o.mc_standard_error {
+            writeln!(f, "  ofv_mc_standard_error: {}", yaml_f64_6(se))
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(k) = o.n_samples {
+            writeln!(f, "  ofv_n_samples: {k}").map_err(|e| e.to_string())?;
+        }
+        if let Some(n) = o.n_nodes {
+            writeln!(f, "  ofv_n_nodes: {n}").map_err(|e| e.to_string())?;
+        }
+        writeln!(f, "  ofv_foce_laplace: {}", yaml_f64_6(o.foce_ofv)).map_err(|e| e.to_string())?;
+    }
     if let Some(ref is) = result.importance_sampling {
         writeln!(
             f,
@@ -3373,8 +3480,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         .map_err(|e| e.to_string())?;
         writeln!(f, "  # is not a log-likelihood.").map_err(|e| e.to_string())?;
     }
-    writeln!(f, "  aic: {:.6}", result.aic).map_err(|e| e.to_string())?;
-    writeln!(f, "  bic: {:.6}", result.bic).map_err(|e| e.to_string())?;
+    for (key, v) in [("aic", result.aic), ("bic", result.bic)] {
+        match v {
+            Some(v) => writeln!(f, "  {key}: {v:.6}"),
+            None => writeln!(f, "  {key}: null"),
+        }
+        .map_err(|e| e.to_string())?;
+    }
 
     if !result.prior_summary.is_empty() {
         writeln!(f, "\nparameter_priors:").map_err(|e| e.to_string())?;
@@ -3414,8 +3526,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if !result.profiled_blocks.is_empty() {
         writeln!(
             f,
-            "\nprofiled_blocks: [{}]",
-            result.profiled_blocks.join(", ")
+            "\nprofiled_blocks: {}",
+            estimates::yaml_flow_names(&result.profiled_blocks)
         )
         .map_err(|e| e.to_string())?;
     }
@@ -3423,7 +3535,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
         for (block, range) in &theta_blocks {
             let s = theta_block_summary(result, range.clone());
-            writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
+            writeln!(f, "  {}:", estimates::yaml_name(block, false)).map_err(|e| e.to_string())?;
             writeln!(f, "    n_free_coefficients: {}", s.n_free).map_err(|e| e.to_string())?;
             writeln!(f, "    n_fixed_coefficients: {}", s.n_fixed).map_err(|e| e.to_string())?;
             if result.profiled_blocks.contains(block) {
@@ -3438,6 +3550,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .strip_prefix(&format!("{block}["))
                     .and_then(|r| r.strip_suffix(']'))
                     .unwrap_or(&result.theta_names[i]);
+                // Quoted always, as before, but escaped: a label is data (#3006).
+                let label = yaml_quote(label);
                 // A FIX coefficient reads as a fixed scalar θ does above (#1891):
                 // flagged, with no SE — it was not estimated.
                 let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
@@ -3445,7 +3559,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 match se {
                     _ if is_fixed => writeln!(
                         f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        "      - {{ label: {}, estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
                         label, result.theta[i]
                     ),
                     // A profiled level held on its bound (#2112): estimated, but held by
@@ -3460,7 +3574,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                         };
                         writeln!(
                             f,
-                            "      - {{ label: \"{}\", estimate: {:.6}, {}se: ~, rse_pct: ~, held: {} }}",
+                            "      - {{ label: {}, estimate: {:.6}, {}se: ~, rse_pct: ~, held: {} }}",
                             label,
                             result.theta[i],
                             at_bound,
@@ -3469,7 +3583,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     }
                     Some(se) => writeln!(
                         f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
+                        "      - {{ label: {}, estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
                         label,
                         result.theta[i],
                         se,
@@ -3477,7 +3591,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     ),
                     None => writeln!(
                         f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, se: ~, rse_pct: ~ }}",
+                        "      - {{ label: {}, estimate: {:.6}, se: ~, rse_pct: ~ }}",
                         label, result.theta[i]
                     ),
                 }
@@ -3495,7 +3609,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if !result.neural_networks.is_empty() {
         writeln!(f, "\nneural_networks:").map_err(|e| e.to_string())?;
         for nn in &result.neural_networks {
-            writeln!(f, "  {}:", nn.name).map_err(|e| e.to_string())?;
+            let key = estimates::yaml_name(&nn.name, false);
+            writeln!(f, "  {key}:").map_err(|e| e.to_string())?;
             writeln!(
                 f,
                 "    shape: [{}]",
@@ -3510,10 +3625,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    output_activation: {}", nn.output_activation)
                 .map_err(|e| e.to_string())?;
-            writeln!(f, "    inputs: [{}]", nn.input_names.join(", "))
-                .map_err(|e| e.to_string())?;
-            writeln!(f, "    outputs: [{}]", nn.output_names.join(", "))
-                .map_err(|e| e.to_string())?;
+            let inputs = estimates::yaml_flow_names(&nn.input_names);
+            writeln!(f, "    inputs: {inputs}").map_err(|e| e.to_string())?;
+            let outputs = estimates::yaml_flow_names(&nn.output_names);
+            writeln!(f, "    outputs: {outputs}").map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
             // Emitted only when the model actually normalises, so a plain network's
             // block is byte-identical to before. The reported weights are meaningless
@@ -3727,8 +3842,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         // posterior variance (see docs/estimation/vi.qmd). It is for individual-level
         // reporting and shrinkage, not a route to population standard errors.
         if !v.eta_means.is_empty() {
-            writeln!(f, "  eta_names: [{}]", result.eta_names.join(", "))
-                .map_err(|e| e.to_string())?;
+            let eta_names = estimates::yaml_flow_names(&result.eta_names);
+            writeln!(f, "  eta_names: {eta_names}").map_err(|e| e.to_string())?;
             writeln!(f, "  eta_posterior:").map_err(|e| e.to_string())?;
             for (i, mean) in v.eta_means.iter().enumerate() {
                 let id = result
@@ -3789,7 +3904,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  ci_theta:").map_err(|e| e.to_string())?;
             for (i, name) in result.theta_names.iter().enumerate() {
                 if i < ci.len() {
-                    writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
+                    let key = estimates::yaml_name(name, false);
+                    writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                     writeln!(f, "      lower: {:.6}", ci[i].0).map_err(|e| e.to_string())?;
                     writeln!(f, "      upper: {:.6}", ci[i].1).map_err(|e| e.to_string())?;
                 }
@@ -3803,7 +3919,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("omega_{}_{}", i + 1, i + 1));
-                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                let key = estimates::yaml_name(&key, false);
+                writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3816,7 +3933,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("sigma_{}", i + 1));
-                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                let key = estimates::yaml_name(&key, false);
+                writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3829,7 +3947,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(k)
                     .cloned()
                     .unwrap_or_else(|| format!("kappa_{}", k + 1));
-                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                let key = estimates::yaml_name(&key, false);
+                writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3885,11 +4004,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  estimator: {} # {}", m.label(), m.formula())
                 .map_err(|e| e.to_string())?;
         }
-        writeln!(f, "  parameters: [{}]", names.join(", ")).map_err(|e| e.to_string())?;
+        let params = estimates::yaml_flow_names(&names);
+        writeln!(f, "  parameters: {params}").map_err(|e| e.to_string())?;
         writeln!(f, "  rows:").map_err(|e| e.to_string())?;
         for i in 0..n {
             let row: Vec<String> = (0..n).map(|j| fmt_cov_entry(cov[(i, j)])).collect();
-            writeln!(f, "    {}: [{}]", names[i], row.join(", ")).map_err(|e| e.to_string())?;
+            let key = estimates::yaml_name(&names[i], false);
+            writeln!(f, "    {key}: [{}]", row.join(", ")).map_err(|e| e.to_string())?;
         }
     }
 
@@ -4183,8 +4304,8 @@ mod tests {
             covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
-            aic: 0.0,
-            bic: 0.0,
+            aic: Some(0.0),
+            bic: Some(0.0),
             theta: Vec::new(),
             theta_names: Vec::new(),
             eta_names: Vec::new(),
@@ -4217,6 +4338,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            saem_objective: None,
             impmap_trace: None,
             bayes: None,
             vi: None,
@@ -4336,8 +4458,8 @@ mod tests {
         r.method_chain = vec![EstimationMethod::FoceI];
         r.converged = true;
         r.ofv = 123.45;
-        r.aic = 130.0;
-        r.bic = 140.0;
+        r.aic = Some(130.0);
+        r.bic = Some(140.0);
         r.n_subjects = 12;
         r.n_obs = 96;
         r.n_parameters = 4;
@@ -5710,8 +5832,8 @@ mod tests {
             covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
-            aic: 0.0,
-            bic: 0.0,
+            aic: Some(0.0),
+            bic: Some(0.0),
             theta: Vec::new(),
             theta_names: Vec::new(),
             eta_names: Vec::new(),
@@ -5744,6 +5866,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            saem_objective: None,
             impmap_trace: None,
             bayes: None,
             vi: None,
@@ -7581,6 +7704,51 @@ mod tests {
         r
     }
 
+    /// #3006: a fit with a θ level block and the covariance step on wrote
+    /// `parameters: [INT, TEFF[TIME=0.5], …]`, whose `[` opens a nested flow sequence,
+    /// so no YAML parser could read the file. Parse the whole document back and check
+    /// every place a level name lands — the flow lists and the block keys — reads as
+    /// the name itself.
+    #[test]
+    fn write_estimates_yaml_with_level_names_parses_back() {
+        let mut r = comprehensive_result();
+        let names = ["TEFF[TIME=0.5]", "TEFF[TIME=1]"];
+        r.theta_names = names.iter().map(|s| s.to_string()).collect();
+        r.theta_fixed = vec![false, false];
+        r.profiled_blocks = vec!["TEFF".into()];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        let parsed = serde_saphyr::from_str::<serde_json::Value>(&yaml);
+        assert!(parsed.is_ok(), "fit.yaml must parse: {parsed:?}\n{yaml}");
+        let doc = parsed.unwrap();
+
+        let params = doc["covariance_matrix"]["parameters"].as_array();
+        assert!(params.is_some(), "parameters is a sequence:\n{yaml}");
+        let params = params.unwrap();
+        assert_eq!(params.len(), 10, "{params:?}");
+        assert_eq!(params[0], names[0], "{params:?}");
+        assert_eq!(params[1], names[1], "{params:?}");
+        assert_eq!(params[2], "log_chol_ETA_CL", "{params:?}");
+        for name in names {
+            let row = &doc["covariance_matrix"]["rows"][name];
+            assert_eq!(row.as_array().map(Vec::len), Some(10), "rows.{name}: {row}");
+            assert!(doc["theta"][name].is_object(), "theta.{name}");
+            assert!(
+                doc["sir"]["ci_theta"][name].is_object(),
+                "sir.ci_theta.{name}"
+            );
+        }
+        assert_eq!(doc["profiled_blocks"], serde_json::json!(["TEFF"]));
+        // Only the flow list needed quotes: block keys keep their bare spelling.
+        assert!(yaml.contains("\n    TEFF[TIME=0.5]: ["), "{yaml}");
+        assert!(
+            yaml.contains("  parameters: [\"TEFF[TIME=0.5]\", \"TEFF[TIME=1]\", log_chol_ETA_CL,"),
+            "{yaml}"
+        );
+    }
+
     /// The `sir:` section of a fit YAML, through the line before the next
     /// top-level key.
     fn yaml_sir_section(r: &FitResult) -> String {
@@ -8195,6 +8363,182 @@ mod tests {
         assert!(!summary.contains("marginal"), "{summary}");
         let yaml = objective_yaml(&r);
         assert!(yaml.contains("  ofv: 4326.600000\n  aic:"), "{yaml}");
+    }
+
+    /// #2973 review: the readout's YAML floats spell a non-finite value as YAML does (`.nan`,
+    /// `.inf`, `-.inf`), never Rust's `NaN` / `inf`, which a YAML reader loads as a string.
+    /// Mutation: write `ofv_foce_laplace` with `{:.6}` again.
+    #[test]
+    fn saem_objective_yaml_floats_are_yaml_scalars_when_not_finite() {
+        assert_eq!(yaml_f64_6(1.5), "1.500000");
+        assert_eq!(yaml_f64_6(f64::NAN), ".nan");
+        assert_eq!(yaml_f64_6(f64::INFINITY), ".inf");
+        assert_eq!(yaml_f64_6(f64::NEG_INFINITY), "-.inf");
+        use EstimationMethod::Saem;
+        let mut r = imp_objective_result(Saem, &[Saem], Some(KappaTreatment::NotApplicable));
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Imp,
+            mc_standard_error: Some(f64::NAN),
+            n_samples: Some(10),
+            n_nodes: None,
+            foce_ofv: f64::NAN,
+        });
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  ofv_mc_standard_error: .nan\n"), "{yaml}");
+        assert!(yaml.contains("  ofv_foce_laplace: .nan\n"), "{yaml}");
+    }
+
+    /// #2973: a SAEM fit under the default `saem_ofv = saem` has no information criterion.
+    /// The YAML keeps the keys as `null`, the console says why and names the fix, and a
+    /// likelihood readout (`imp`) or a non-SAEM fit prints its numbers as before.
+    /// Mutations: print AIC/BIC from `ofv`; drop the fix from the n/a line; write `0` for the
+    /// key; swap the Saem/Imp arms of `ic_unavailable_line`.
+    #[test]
+    fn saem_default_prints_no_aic_bic_and_names_the_fix() {
+        use EstimationMethod::Saem;
+        let mut r = imp_objective_result(Saem, &[Saem], Some(KappaTreatment::NotApplicable));
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Saem,
+            mc_standard_error: None,
+            n_samples: None,
+            n_nodes: None,
+            foce_ofv: 4326.6,
+        });
+        r.aic = None;
+        r.bic = None;
+        let summary = format_summary(&r);
+        assert!(
+            summary.contains(
+                "AIC/BIC: n/a \u{2014} the SAEM objective is not a likelihood; set saem_ofv = imp \
+                 (or agq/focei) for information criteria"
+            ),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("AIC:  ") && !summary.contains("BIC:  "),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  aic: null\n  bic: null\n"), "{yaml}");
+
+        // A likelihood readout prints both numbers and no n/a line.
+        r.saem_objective.as_mut().unwrap().kind = SaemOfv::Imp;
+        r.aic = Some(4400.0);
+        r.bic = Some(4410.0);
+        let summary = format_summary(&r);
+        assert!(summary.contains("AIC:  4400.0000") && summary.contains("BIC:  4410.0000"));
+        assert!(!summary.contains("AIC/BIC: n/a"), "{summary}");
+        let yaml = objective_yaml(&r);
+        assert!(
+            yaml.contains("  aic: 4400.000000\n  bic: 4410.000000\n"),
+            "{yaml}"
+        );
+
+        // A non-SAEM fit with no criterion (no likelihood at all) says so without the SAEM advice.
+        r.saem_objective = None;
+        r.aic = None;
+        r.bic = None;
+        let summary = format_summary(&r);
+        assert!(summary.contains("AIC/BIC: n/a"), "{summary}");
+        assert!(
+            !summary.contains(
+                "saem_ofv = imp \
+             (or"
+            ),
+            "{summary}"
+        );
+    }
+
+    /// #2973: a SAEM fit whose OFV is the importance-sampled (or quadrature) −2 log L says so
+    /// in the report and the YAML, prints the FOCE/Laplace value as a separate diagnostic, and
+    /// does not repeat the IS marginal on a second row. Each sentence has its own assertion,
+    /// and the `saem_ofv = focei` fit (no `saem_objective`) carries none of it.
+    #[test]
+    fn saem_objective_is_labelled_with_the_foce_value_as_a_diagnostic() {
+        use EstimationMethod::Saem;
+        let mut r = imp_objective_result(Saem, &[Saem], Some(KappaTreatment::NotApplicable));
+        r.ofv = 4299.6;
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Imp,
+            mc_standard_error: Some(0.75),
+            n_samples: Some(1000),
+            n_nodes: None,
+            foce_ofv: 4326.6,
+        });
+        let summary = format_summary(&r);
+        assert!(
+            summary.contains(
+                "OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = 0.7500, K = 1000):  4299.6000"
+            ),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("FOCE/Laplace OFV (diagnostic):  4326.6000"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("importance-sampled -2LL at the SAEM estimates"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("IS marginal -2LL"),
+            "the marginal is the OFV row, not a second one: {summary}"
+        );
+        // Not the IMP-estimator wording: a SAEM fit is not an `ofv_is_imp_laplace` fit.
+        assert!(
+            !summary.contains(LAPLACE_NOTE) && !summary.contains(COMPARE_NOTE),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        for line in [
+            "  ofv: 4299.600000\n",
+            "  ofv_type: importance_sampling\n",
+            "  ofv_mc_standard_error: 0.750000\n",
+            "  ofv_n_samples: 1000\n",
+            "  ofv_foce_laplace: 4326.600000\n",
+        ] {
+            assert!(yaml.contains(line), "{line:?} missing from {yaml}");
+        }
+        assert!(!yaml.contains("ofv_n_nodes"), "{yaml}");
+
+        // The quadrature spelling: a node count, no Monte-Carlo SE.
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Agq,
+            mc_standard_error: None,
+            n_samples: None,
+            n_nodes: Some(11),
+            foce_ofv: 4326.6,
+        });
+        r.importance_sampling = None;
+        let summary = format_summary(&r);
+        assert!(
+            summary.contains("OFV (AGQ -2LL, 11 nodes):  4299.6000"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("adaptive Gauss-Hermite quadrature"),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  ofv_type: agq\n"), "{yaml}");
+        assert!(yaml.contains("  ofv_n_nodes: 11\n"), "{yaml}");
+        assert!(
+            !yaml.contains("ofv_mc_standard_error") && !yaml.contains("ofv_n_samples"),
+            "{yaml}"
+        );
+
+        // `saem_ofv = focei`: nothing of the above.
+        r.saem_objective = None;
+        let summary = format_summary(&r);
+        assert!(
+            !summary.contains("diagnostic") && !summary.contains("IS -2LL"),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        assert!(
+            !yaml.contains("ofv_type") && !yaml.contains("ofv_foce_laplace"),
+            "{yaml}"
+        );
     }
 
     #[test]

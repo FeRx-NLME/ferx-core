@@ -28,6 +28,34 @@ pub(super) struct KernelRun {
 }
 
 impl KernelRun {
+    /// The plan this run ran: a caller that runs it again skips the lookup.
+    pub(super) fn plan(&self) -> &Arc<kj::Plan> {
+        &self.plan
+    }
+
+    /// `plan` run forward at `layout` on `inputs` (as [`kernel_run`]'s run).
+    pub(super) fn of_plan(
+        plan: &Arc<kj::Plan>,
+        layout: Layout,
+        inputs: &[f64],
+        n_out: usize,
+    ) -> Option<Self> {
+        let l = layout.lanes();
+        let mut out = kj::Buf::new((n_out + 1) * l);
+        let fwd = plan.forward_layout(layout, &[], inputs, &mut out)?;
+        if out[n_out * l] != 1.0 {
+            return None;
+        }
+        Some(KernelRun {
+            plan: plan.clone(),
+            fwd,
+            layout,
+            n_in: inputs.len() / l,
+            n_out,
+            out,
+        })
+    }
+
     /// Output `o`'s value.
     pub(super) fn value(&self, o: usize) -> f64 {
         self.out[o * self.layout.lanes()]
@@ -43,6 +71,28 @@ impl KernelRun {
             || !self
                 .plan
                 .reverse_from(&self.fwd, self.layout, rows, &mut [], &mut p_bar, seeds)
+        {
+            return None;
+        }
+        p_bar.iter().all(|v| v.is_finite()).then_some(p_bar)
+    }
+
+    /// Forward over reverse (#2980) from a forward at a tangent layout: one sweep seeded with
+    /// `seed` (laid out like the outputs, value and tangent lanes), giving every leaf's lanes
+    /// laid out the same way — the value lanes' adjoints and their tangents along each
+    /// direction ([`kj::Plan::reverse_tangent_from`]).
+    pub(super) fn reverse_tangent(&self, seed: &[f64]) -> Option<kj::Buf> {
+        self.reverse_tangent_flat(seed, 1)
+    }
+
+    /// [`Self::reverse_tangent`] for `rows` seeds at once (laid out one after another), the
+    /// recomputed forward shared: per row, every leaf's lanes.
+    pub(super) fn reverse_tangent_flat(&self, seeds: &[f64], rows: usize) -> Option<kj::Buf> {
+        let mut p_bar = kj::Buf::new(rows * self.n_in * self.layout.lanes());
+        if seeds.len() != rows * self.n_out * self.layout.lanes()
+            || !self
+                .plan
+                .reverse_tangent_from(&self.fwd, rows, &mut [], &mut p_bar, seeds)
         {
             return None;
         }
@@ -172,6 +222,66 @@ pub(super) fn kernel_run(
         true,
         &mut |plan| run(plan),
     )
+}
+
+/// [`kernel_run`] for a kernel that reads no subject data — its leaves carry everything that
+/// differs between subjects, and `variant` everything its recording bakes in (layout, the
+/// parameter values it reads as literals): one plan per configuration serves every subject, so
+/// a subject neither records nor first-tier runs it (#2980: the structured covariance kernel's
+/// reduce). A thread's plans are kept in a small table, oldest dropped first.
+pub(super) fn kernel_run_shared(
+    model: &CompiledModel,
+    subject: &Subject,
+    variant: kj::Desc,
+    layout: Layout,
+    inputs: &[f64],
+    n_out: usize,
+    f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
+) -> Option<KernelRun> {
+    const KEEP: usize = 64;
+    thread_local! {
+        static SHARED: std::cell::RefCell<Vec<(kj::SubjectKey, Arc<kj::Plan>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let l = layout.lanes();
+    if inputs.len() % l != 0 {
+        return None;
+    }
+    let n_in = inputs.len() / l;
+    let key = kj::SubjectKey::new(model, subject, 0, n_in)
+        .with_kind(KERNEL_KIND)
+        .with_variant(variant)
+        .family();
+    // Every plan recorded under the key: a recorded program carries the branches its recording
+    // point took as guards, so a point on another branch is served by the plan recorded there.
+    let cached: Vec<Arc<kj::Plan>> = SHARED.with(|c| {
+        c.borrow()
+            .iter()
+            .filter(|(k, _)| *k == key)
+            .map(|(_, p)| p.clone())
+            .collect()
+    });
+    for plan in &cached {
+        if let Some(kr) = KernelRun::of_plan(plan, layout, inputs, n_out) {
+            return Some(kr);
+        }
+    }
+    let rec = kj::recorded(&key, || {
+        let leaves: Vec<kj::Tr> = (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
+        f(&leaves)
+            .filter(|y| y.len() == n_out)
+            .map(|y| y.iter().map(|x| x.reg()).collect())
+    })
+    .ok()?;
+    let p = Arc::new(rec.plan(Layout::F64, 0, n_in)?);
+    SHARED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= KEEP {
+            c.remove(0);
+        }
+        c.push((key, p.clone()));
+    });
+    KernelRun::of_plan(&p, layout, inputs, n_out)
 }
 
 /// A kernel configuration's [`kj::SubjectKey`] variant: everything that shapes the kernel's

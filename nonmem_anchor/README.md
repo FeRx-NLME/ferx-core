@@ -127,6 +127,7 @@ further down this file). Run outputs (`.lst`, `.ext`, `.tab`, …) are in `resul
 | **Profile likelihood through a logit link** | a bounded proportion whose unstructured placebo and study `ETA` sit inside `inv_logit`, under `METHOD=1 INTER` and `METHOD=1 LAPLACE INTER` — [#2111](https://github.com/FeRx-NLME/ferx-core/issues/2111); see the section below | `profile_logit_b2_focei.ctl`, `profile_logit_b2_laplace.ctl` (2) | `profile_logit_b2.ferx` *(in `tests/profiled_logit_levels.rs`)* |
 | **A level block in a binary predictor** | 2400 Bernoulli rows whose unstructured placebo and study `ETA` are read on the log-odds, each record at its own visit and arm, under `METHOD=COND LAPLACE LIKE`, unprofiled ([#2562](https://github.com/FeRx-NLME/ferx-core/issues/2562)) and profiled (the binary half of [#2111](https://github.com/FeRx-NLME/ferx-core/issues/2111)); see the section below | `profile_logit_b1_laplace.ctl` | `profile_logit_b1.ferx` *(in `tests/binary_logit_levels.rs`)* |
 | **A probit link for a binary predictor** | `[binary_model] probit =` (`P = PHI(LP)`) on B1-probit, 2400 Bernoulli rows with an unstructured placebo and a study `ETA` on the probit scale, under `METHOD=COND LAPLACE LIKE`, unprofiled and profiled, plus a `MAXEVAL=0` tail point and a tabulation of NONMEM's `PHI` itself — [#2603](https://github.com/FeRx-NLME/ferx-core/issues/2603); see the section below | `probit_b1_laplace.ctl`, `probit_b1_tail.ctl`, `probit_phi_probe.ctl` (3) | `probit_b1.ferx` *(in `tests/binary_probit_nonmem_anchor.rs`)* |
+| **Poisson / negative-binomial count endpoint** | `[count_model]` `type = poisson` / `negbin` on 60 subjects × 6 records (mean reads between-subject `WT` and within-subject `TRT`), `Y = −2·log PMF` with `GAMLN` under `METHOD=COND LAPLACE -2LL`: random intercept, fixed effects (`$OMEGA 0 FIX`, = R `glm` / `glm.nb`), and `MAXEVAL=0` at the `lme4::glmer` / `glmer.nb` optima — [#2877](https://github.com/FeRx-NLME/ferx-core/issues/2877) | `count_pois_laplace.ctl`, `count_nb_laplace.ctl`, `count_pois_fixed.ctl`, `count_nb_fixed.ctl`, `count_pois_glmer.ctl`, `count_nb_glmer.ctl` (6) | `count_pois.ferx`, `count_nb.ferx` *(in `tests/count_nonmem_anchor.rs`)* |
 | **Nested levels × residual correlation** | `exact3` with each arm's residuals correlated, `correlation ar1\|car1(RHO) by ARM` — [#1082](https://github.com/FeRx-NLME/ferx-core/issues/1082) PR5 (`MAXEVAL=0`, FOCEI; `gen_ctl.py` writes the streams) | `nested_levels_3_ar1/{ar1_r0,ar1_p05,ar1_m04,car1_p06}.ctl` | *(in `tests/nested_levels_correlation_nonmem_anchor.rs`)* |
 | **NPDE / NPD with a correlated residual** | a `block_sigma` correlation inside one combined error (A, ρ = −0.9) and across an `L2` total/unbound pair (B, ρ = −0.8) — [#1733](https://github.com/FeRx-NLME/ferx-core/issues/1733) | `npde_block_sigma_{a,b}.ctl` | `tests/fixtures/npde_block_sigma_{a,b}.ferx` *(in `tests/npde_block_sigma_nonmem_anchor.rs`)* |
 | **SAEM additive mu-reference** | SAEM on `E0 = MU_1 + ETA(1)` (additive mu-ref) against the same model without `MU_`, TVE0 and ω² free, every other θ `FIX` at `level_se_a`'s optimum; each estimate scored by `METHOD=1 MAXEVAL=0` — [#2540](https://github.com/FeRx-NLME/ferx-core/issues/2540); the one-line `BASE = MU_1 + PLA + ETA(1)` as a mu-reference — [#2544](https://github.com/FeRx-NLME/ferx-core/issues/2544); see the section below | `saem_additive_mu.ctl`, `saem_additive_mu_inline.ctl`, `saem_additive_mu_nomu.ctl` | `saem_additive_mu.ferx`, `saem_additive_mu_inline.ferx`, `saem_additive_mu_shared.ferx` *(in `tests/saem_additive_mu_nonmem_anchor.rs`)* |
@@ -227,6 +228,15 @@ respective model (see below).
 > equivalent −3698.448). The abort is not the fit failing: the two runs performed
 > while preparing this anchor (with and without `$COVARIANCE`) produced
 > bit-identical `.ext` trajectories. The table above is what `.ext` reports.
+
+> **SAEM reported objective (#2973).** The six SAEM anchors that end in `METHOD=IMP EONLY=1`
+> (`covmuref_{shared,additive,power}_saem`, `covmuref_anchor_{a,b}_saem`, `logit_fraction_saem`)
+> also anchor ferx's default reported OFV: `tests/saem_objective_2973.rs` evaluates ferx's
+> importance sampler (K = 3000) at NONMEM's SAEM estimates (the SAEM table of the `.ext`) and
+> compares it with the `EONLY` objective (the last row of the IMP table; the spread of its ten
+> iterations is NONMEM's Monte-Carlo SE). All six agree within 1.2 combined SEs, worst 0.26 OFV
+> units, while NONMEM's own SAEM-table objective (`SAEMOBJ`) sits 700–1000 units away. No new
+> control stream; the numbers are in `docs/estimation/saem.qmd#saem-ofv-nonmem`.
 
 ## The dataset
 
