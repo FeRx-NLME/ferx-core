@@ -2724,3 +2724,56 @@ fn the_hot_table_compares_the_layout_structure() {
     assert!(t.get(&key, stamp, None).is_some(), "none vs none");
     assert!(t.get(&key, stamp, Some(&l_a)).is_none(), "none vs layout");
 }
+
+/// A plan's kernels keep only what runs and lowers them (#3010): each compiled kernel's
+/// instructions at their length and no `live`, which only the transforms that built it read,
+/// and each chunk program's code at its length. A fit keeps thousands of kernels; on #3010's
+/// 156-subject model this was 1.7 GB of IR at the peak, 0.8 GB after.
+/// Mutation: drop `into_kernel` from `Tiered::new` (or the chunk code's `shrink_to_fit`) → the
+/// kernel (or program) named in the message keeps its slack.
+#[test]
+fn a_plans_kernels_keep_only_what_runs_them() {
+    begin();
+    let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
+    let y = (et[0] * et[1]).exp() + et[0] * et[0];
+    let rec = end(Some(vec![y.reg()])).expect("records");
+    let l1 = Layout {
+        n: 2,
+        m: 0,
+        th: false,
+        wide: false,
+        tan: 0,
+    };
+    let plan = rec.plan(l1, 2, 0).expect("plans");
+    let l = l1.lanes();
+    let u = [0.3, 1.0, 0.0, 0.3, 0.0, 1.0];
+    assert_eq!(u.len(), 2 * l);
+    let fwd = plan.forward_kept(l1, &u, &[]).expect("runs");
+    let mut du_bar = vec![0.0; l];
+    du_bar[0] = 1.0;
+    let mut ub = vec![0.0; 2 * l];
+    assert!(plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar));
+    // Kernels seen: [forward, reverse].
+    let mut seen = [0usize; 2];
+    for c in &plan.calls {
+        let Call::Chunk { prog, .. } = c else {
+            continue;
+        };
+        assert_eq!(
+            prog.code.capacity(),
+            prog.code.len(),
+            "a chunk program's code"
+        );
+        for t in prog.compiled.lock().unwrap().values().flatten() {
+            let what = if t.rev { "reverse" } else { "forward" };
+            assert!(t.f.live.is_empty(), "the {what} kernel keeps `live`");
+            assert_eq!(
+                t.f.insts.capacity(),
+                t.f.insts.len(),
+                "the {what} kernel's instructions"
+            );
+            seen[t.rev as usize] += 1;
+        }
+    }
+    assert!(seen[0] > 0 && seen[1] > 0, "kernels seen {seen:?}");
+}
