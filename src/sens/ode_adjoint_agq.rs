@@ -83,6 +83,57 @@ pub(super) fn agq_planned(
         nodes.push((du, (plan, std::sync::Arc::new(f)), var));
     }
 
+    // The nodes the objective itself drops. A diverged node scores `individual_nll`'s `1e20`
+    // sentinel (`agq::agq_terms`), a log-term of ~−1e20 that `logsumexp` takes to exactly
+    // zero weight; its derivative is then `0 · ∂(huge or non-finite)`, which the reverse
+    // turns into a NaN and declines the whole subject (a `[covariate_nn]` DCM under 3-node
+    // AGQ, #3004). So a node whose term is non-finite, sentinel, or more than 745 below the
+    // largest (its weight underflows to exactly zero) is left out of the kernel, as it is out
+    // of the sum: the value and every gradient component are unchanged by it.
+    let keep: Vec<usize> = if !grid.is_empty() && nodes.len() == grid.len() {
+        let terms: Vec<Option<f64>> = grid
+            .iter()
+            .zip(&nodes)
+            .enumerate()
+            .map(|(j, ((_, cw, b), (du, _, _)))| {
+                let l = inner_l(ctx, du, b, pv, None)?;
+                let t = *cw - (l + ng.map_or(0.0, |ng| ng.nodes[j].0));
+                (l.is_finite()
+                    && l < crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+                    && t.is_finite())
+                .then_some(t)
+            })
+            .collect();
+        let top = terms
+            .iter()
+            .flatten()
+            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        (0..grid.len())
+            .filter(|&j| terms[j].is_some_and(|t| t > top - 745.0))
+            .collect()
+    } else {
+        (0..grid.len()).collect()
+    };
+    if keep.is_empty() && !grid.is_empty() {
+        return None;
+    }
+    let kept_grid;
+    let grid: &[(Vec<f64>, f64, Vec<f64>)] = if keep.len() == grid.len() {
+        grid
+    } else {
+        let mut mask = vec![false; grid.len()];
+        for &j in &keep {
+            mask[j] = true;
+        }
+        let mut flags = mask.iter();
+        nodes.retain(|_| flags.next().copied().unwrap_or(false));
+        kept_grid = keep.iter().map(|&j| grid[j].clone()).collect::<Vec<_>>();
+        &kept_grid
+    };
+    let ng_nodes: Vec<&(f64, Vec<f64>)> = ng
+        .map(|ng| keep.iter().map(|&j| &ng.nodes[j]).collect())
+        .unwrap_or_default();
+
     // ---- the objective and ∇_η l from the kernel plan --------------------------------
     // Every input that moves between calls is a leaf: the predictions and their jets at η̂
     // (`Q` too, which only the exact anchor reads), η̂, the parameters, the non-Gaussian
@@ -111,11 +162,11 @@ pub(super) fn agq_planned(
     let (pr, om) = param_leaves(pv, so, &mut inp);
     let ng_r = ng.map(|ng| ng_leaves(n, &ng.jets, &mut inp));
     let node_qr: Vec<Leaf> = ng
-        .map(|ng| ng.nodes.iter().map(|(q, _)| inp.leaf(*q)).collect())
+        .map(|_| ng_nodes.iter().map(|(q, _)| inp.leaf(*q)).collect())
         .unwrap_or_default();
     let node_gq: Vec<Vec<Leaf>> = ng
-        .map(|ng| {
-            ng.nodes
+        .map(|_| {
+            ng_nodes
                 .iter()
                 .map(|(_, gq)| gq.iter().take(n_bsv).map(|&v| inp.leaf(v)).collect())
                 .collect()
@@ -143,7 +194,8 @@ pub(super) fn agq_planned(
         exact,
         grid.len(),
         n_nodes_b,
-        ng.map(|n| (n.jets.g.len(), n.nodes.len())),
+        ng.map(|n| (n.jets.g.len(), keep.len())),
+        &keep,
         &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
     ));
     type T = kj_tr::Tr;

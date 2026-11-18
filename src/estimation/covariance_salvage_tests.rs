@@ -1151,11 +1151,11 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
             );
         }
         assert_eq!(
-            super::analytic_cov_declines(&m, &options, false),
+            super::analytic_cov_declines(&m, &options),
             vec![CovScopeDecline::PerSubjectBail],
             "{axes} axes: no model-level clause may decline the analytic R-matrix"
         );
-        assert!(super::analytic_r_expected(&m, &options, false));
+        assert!(super::analytic_r_expected(&m, &options));
 
         let mut fd = model(n_fix);
         fd.gradient_method = GradientMethod::Fd;
@@ -1165,7 +1165,7 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
             Optimizer::Bobyqa,
             "{axes} axes, FD"
         );
-        assert!(!super::analytic_r_expected(&fd, &options, false));
+        assert!(!super::analytic_r_expected(&fd, &options));
     }
 }
 
@@ -1293,7 +1293,7 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
         ..FitOptions::default()
     };
     assert_eq!(
-        predicted_r_route(&model, &options, false),
+        predicted_r_route(&model, &options),
         PredictedRRoute::Analytic
     );
     let disabled = FitOptions {
@@ -1301,7 +1301,7 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
         ..options.clone()
     };
     assert_eq!(
-        predicted_r_route(&model, &disabled, false),
+        predicted_r_route(&model, &disabled),
         PredictedRRoute::Stencil
     );
     assert_eq!(
@@ -1415,14 +1415,11 @@ fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
 
     for (label, model) in &cases {
         assert_eq!(
-            super::analytic_cov_model_declines(model, &options, false),
+            super::analytic_cov_model_declines(model, &options),
             Vec::new(),
             "{label}"
         );
-        assert!(
-            super::analytic_r_expected(model, &options, false),
-            "{label}"
-        );
+        assert!(super::analytic_r_expected(model, &options), "{label}");
     }
 }
 
@@ -1459,7 +1456,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             other => unreachable!("{other:?} has a remedy but no fixture applying it"),
         }
         assert_eq!(
-            super::analytic_cov_model_declines(&model, &options, false),
+            super::analytic_cov_model_declines(&model, &options),
             vec![decline],
             "{decline:?}: the fixture hits only its own clause"
         );
@@ -1469,7 +1466,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             _ => unreachable!(),
         }
         assert_eq!(
-            super::analytic_cov_model_declines(&model, &options, false),
+            super::analytic_cov_model_declines(&model, &options),
             Vec::new(),
             "{decline:?}: {} must clear the walk",
             decline.remedy().unwrap()
@@ -1708,7 +1705,7 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
     assert!(options.analytic_cov_hessian);
     assert!(super::cov_ode_override(&default, &options).is_some());
     assert_eq!(
-        super::predicted_r_route(&default, &options, false),
+        super::predicted_r_route(&default, &options),
         super::PredictedRRoute::Analytic,
         "fixture: every subject is on the analytic R-matrix"
     );
@@ -1784,7 +1781,7 @@ fn the_hybrid_covariance_step_runs_whole_at_the_plateau_tolerance() {
     let tight = ode_model_at(Some((1e-9, 1e-11)));
     let options = FitOptions::default();
     assert_eq!(
-        super::predicted_r_route(&default, &options, false),
+        super::predicted_r_route(&default, &options),
         super::PredictedRRoute::Analytic,
         "fixture: the decline is invisible to the route walk"
     );
