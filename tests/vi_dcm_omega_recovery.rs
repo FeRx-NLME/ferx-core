@@ -294,34 +294,14 @@ fn design(cov: CovariateDesign) -> Population {
             covariates.insert("WT".to_string(), cov.weight_of(s));
             covariates.insert("CRCL".to_string(), cov.crcl_of(s));
             Subject {
-                obs_rgroup: Vec::new(),
                 id: format!("{}", s + 1),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times,
-                obs_raw_times: Vec::new(),
                 observations: vec![0.0; n_obs],
                 obs_cmts: vec![1; n_obs],
                 covariates,
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0; n_obs],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: vec![],
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             }
         })
         .collect();

@@ -91,7 +91,6 @@
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, GradientMethod, OmegaMatrix, Population, Subject};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions, MAX_PK_PARAMS};
-use std::collections::HashMap;
 
 const N_FILLER: usize = 15;
 /// Count of engine-reserved PK slots (`F`, `LAGTIME`). Mirrors
@@ -187,34 +186,13 @@ fn template_population(n: usize) -> Population {
     let obs_times = [1.0_f64, 4.0, 12.0];
     let subjects: Vec<Subject> = (1..=n)
         .map(|i| Subject {
-            obs_rgroup: Vec::new(),
             id: format!("{i}"),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.to_vec(),
-            obs_raw_times: vec![],
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![2; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: vec![],
-            obs_covariates: vec![],
-            pk_only_times: vec![],
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: vec![],
-            reset_times: vec![],
-            reset_covariates: vec![],
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: vec![],
-            obs_l2: Vec::new(),
-            dose_occasions: vec![],
-            reset_occasions: vec![],
-            pk_only_occasions: Vec::new(),
-            fremtype: vec![],
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
 

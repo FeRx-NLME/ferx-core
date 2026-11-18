@@ -13,7 +13,6 @@ use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
 use ferx_core::parser::model_parser::parse_model_string;
 use ferx_core::types::{DoseEvent, Population, Subject};
 use ferx_core::{fit, simulate_with_seed, EstimationMethod, FitOptions};
-use std::collections::HashMap;
 
 const MODEL: &str = r#"
 [parameters]
@@ -38,34 +37,13 @@ fn template_population(n: usize) -> Population {
     let times = [0.5_f64, 1.0, 2.0, 4.0, 8.0, 12.0];
     let subjects: Vec<Subject> = (1..=n)
         .map(|i| Subject {
-            obs_rgroup: Vec::new(),
             id: format!("{i}"),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; times.len()],
             obs_cmts: vec![1; times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: vec![],
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
 

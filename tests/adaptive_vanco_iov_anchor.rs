@@ -48,7 +48,6 @@ use ferx_core::parser::model_parser::parse_full_model_file;
 use ferx_core::{
     simulate_adaptive_from_spec, AdaptiveSimulateOptions, DoseEvent, Population, Subject,
 };
-use std::collections::HashMap;
 use std::path::Path;
 
 mod common;
@@ -103,34 +102,14 @@ const DOSE_TOL: f64 = 1e-3;
 fn anchor_subject(decision_times: &[f64]) -> Subject {
     let n = decision_times.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: Vec::<DoseEvent>::new(),
         obs_times: decision_times.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: vec![1; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: vec![],
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
