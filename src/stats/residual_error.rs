@@ -36,20 +36,17 @@ pub(crate) fn guard_variance(raw: f64) -> f64 {
     }
 }
 
-/// The `power(...)` exponent of sigma slot `slot` carried by a magnitude row
-/// (#1182), or `None` when the row carries none. An exponent of exactly `1`
-/// *is* returned: it is the proportional loading, and the value functions take
-/// the legacy arithmetic for it bit for bit (`scaled_loadings`), but the
-/// direct-θ derivative (taped by the adjoint through `RuvMagDerivProgram::eval_g` into
-/// `focei_kernel`'s loadings) still owes `∂R/∂p` there —
-/// a search starts every power candidate at `p = 1`, and a gradient that read
-/// `0` on the exponent axis at that point would never move it.
+/// The `power(...)` exponent of sigma slot `slot` carried by a magnitude row (#1182), or
+/// `None` when the row carries none. An exponent of exactly `1` *is* returned: it is the
+/// proportional loading and the value functions take the legacy arithmetic for it bit for
+/// bit (`scaled_loadings`), but the direct-θ derivative (taped by the adjoint through
+/// `RuvMagDerivProgram::eval_g` into `focei_kernel`'s loadings) still owes `∂R/∂p` there (a
+/// search starts every power candidate at `p = 1`; a zero gradient on the exponent axis
+/// there would never move it).
 ///
-/// The layout is [`crate::types::RuvMagnitude::eval_obs`]'s: a row of length
-/// `2·n_sigma` holds the multipliers in `[0, n_sigma)` and the exponents in
-/// `[n_sigma, 2·n_sigma)`; any shorter row is multipliers only. `n_sigma` is
-/// the flat global sigma count, which is what every caller passes as
-/// `sigma.len()`.
+/// Layout as [`crate::types::RuvMagnitude::eval_obs`]: a row of length `2·n_sigma` holds the
+/// multipliers in `[0, n_sigma)` and the exponents in `[n_sigma, 2·n_sigma)`; a shorter row is
+/// multipliers only. `n_sigma` is the flat global sigma count (`sigma.len()`).
 #[inline]
 pub(crate) fn slot_exponent(mult: &[f64], n_sigma: usize, slot: usize) -> Option<f64> {
     if n_sigma == 0 || mult.len() != 2 * n_sigma {
@@ -246,22 +243,19 @@ impl ErrorSpec {
         self.sigma_loadings_inline(cmt, f, n_sigma).to_vec()
     }
 
-    /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on,
-    /// parallel in shape to [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings).
+    /// `∂(sigma loading coefficient)/∂f` for each slot an observation loads on, parallel in shape
+    /// to [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings).
     ///
-    /// The proportional slot loads `f` (slope `1`) and the additive slot loads the
-    /// constant `1` (slope `0`), so for every error model but `LogCombined` the slopes
-    /// do not depend on `f`. `LogCombined`'s natural-unit additive slot loads `exp(−f)`,
-    /// whose slope does (#2729): it is reported as `NaN` here, so a caller that has not
-    /// passed the prediction cannot silently use a wrong value — use
-    /// [`Self::sigma_loading_slopes_at`], which is exact for every model.
+    /// The proportional slot loads `f` (slope `1`) and the additive slot the constant `1` (slope
+    /// `0`), so for every error model but `LogCombined` the slopes do not depend on `f`.
+    /// `LogCombined`'s natural-unit additive slot loads `exp(−f)`, whose slope does (#2729): it
+    /// is reported as `NaN` here so a caller that has not passed the prediction cannot silently
+    /// use a wrong value; use [`Self::sigma_loading_slopes_at`], exact for every model.
     ///
-    /// Returning the slopes with the *same slot presence* as
-    /// [`ErrorSpec::sigma_loadings`](crate::types::ErrorSpec::sigma_loadings) lets the dense-`R` derivative
-    /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the exact
-    /// bilinear cross-covariance assembly with the value loadings replaced by
-    /// these slopes — the off-diagonal `R` is linear in each observation's
-    /// loadings, so `∂R_jk/∂f_j = cross(slopes_j, values_k)`.
+    /// The same slot presence as `sigma_loadings` lets the dense-`R` derivative
+    /// ([`crate::stats::residual_error::compute_dr_df_matrices`]) reuse the bilinear
+    /// cross-covariance assembly with value loadings replaced by slopes: `∂R_jk/∂f_j =
+    /// cross(slopes_j, values_k)`.
     pub fn sigma_loading_slopes(&self, cmt: usize, n_sigma: usize) -> Vec<(usize, f64)> {
         self.loading_shape(cmt, n_sigma)
             .iter()
@@ -712,18 +706,14 @@ impl ErrorSpec {
 
     /// `d²(residual variance)/d(prediction f)²` for one observation at `cmt`.
     ///
-    /// Additive endpoints contribute 0 (variance is `σ_add²`, independent of f).
-    /// Proportional and combined endpoints contribute `2·σ_prop²` (variance has
-    /// a `f²·σ_prop²` term, so the second derivative w.r.t. f is constant).
-    /// `Single` ignores `cmt`; `PerCmt` dispatches on the endpoint registered
-    /// for `cmt`. Used by the Almquist Laplace FOCEI gradient's θ-axis β_j
-    /// chain — keeping the per-CMT routing here lets the same closed-form
-    /// gradient handle multi-endpoint models without changing the call site.
+    /// Additive endpoints contribute 0; proportional and combined endpoints `2·σ_prop²` (the
+    /// `f²·σ_prop²` term has a constant second derivative). `Single` ignores `cmt`; `PerCmt`
+    /// dispatches on the endpoint registered for `cmt` (used by the Almquist Laplace FOCEI
+    /// gradient's θ-axis β_j chain, so multi-endpoint models need no call-site change).
     ///
-    /// Guard-aware in `f` for the same reason as [`dvar_df`](Self::dvar_df):
-    /// where `variance_at` replaces an invalid raw variance by `MIN_VARIANCE`
-    /// (`variance_is_guarded`), the variance is locally constant in `f`, so
-    /// `∂²v/∂f² = 0` — not the raw `2·σ²` (#958).
+    /// Guard-aware in `f` like [`dvar_df`](Self::dvar_df): where `variance_at` replaces an
+    /// invalid raw variance by `MIN_VARIANCE` (`variance_is_guarded`), the variance is locally
+    /// constant in `f`, so `∂²v/∂f² = 0`, not the raw `2·σ²` (#958).
     pub fn d2var_df2(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         if variance_is_guarded(self.variance_at_raw(cmt, f, sigma)) {
             return 0.0;
@@ -765,17 +755,14 @@ impl ErrorSpec {
         }
     }
 
-    /// `d²(residual variance)/d(prediction f)²` with a per-observation custom
-    /// magnitude (#484/#576) — the second-derivative analogue of [`dvar_df_scaled`].
+    /// `d²(residual variance)/d(prediction f)²` with a per-observation custom magnitude
+    /// (#484/#576), the second-derivative analogue of [`dvar_df_scaled`].
     ///
-    /// The proportional loading carries the multiplier `m_prop`, so the variance's
-    /// `f²·(m_prop·σ_prop)²` term differentiates twice to `2·(m_prop·σ_prop)²`, i.e. [`d2var_df2`]
-    /// scaled by `m_prop²` — exactly the `m²` factor [`dvar_df_scaled`] applies to `dvar_df`.
-    /// Keeping the same scaling here lets the M3 censored curvature (which differentiates the same
-    /// `v(f)`) stay internally consistent under a custom RUV magnitude, and the Gauss-Newton
-    /// gradient (`gauss_newton.rs`) consume the same magnitude-scaled second derivative (as did,
-    /// before #2093, the retired `sens_outer_gradient::prepare_stacked`). A `mult` of all ones
-    /// reproduces [`d2var_df2`].
+    /// The proportional loading carries the multiplier `m_prop`, so `f²·(m_prop·σ_prop)²`
+    /// differentiates twice to `2·(m_prop·σ_prop)²`, i.e. [`d2var_df2`] scaled by `m_prop²`, the
+    /// same `m²` factor [`dvar_df_scaled`] applies to `dvar_df`. This keeps the M3 censored
+    /// curvature and the Gauss-Newton gradient (`gauss_newton.rs`) consistent under a custom RUV
+    /// magnitude. A `mult` of all ones reproduces [`d2var_df2`].
     ///
     /// [`dvar_df_scaled`]: ErrorSpec::dvar_df_scaled
     /// [`dvar_df`]: ErrorSpec::dvar_df
@@ -892,21 +879,16 @@ impl ErrorSpec {
 
     /// Residual variance for one observation, dispatching on its compartment.
     ///
-    /// For `Single` the `cmt` is ignored and the full `sigma` slice is used
-    /// (the back-compat path). For `PerCmt` the endpoint registered for `cmt`
-    /// selects the error model and slices `sigma` by its `sigma_idx`. Returns
-    /// `NaN` when `cmt` has no registered endpoint, or when an endpoint's
-    /// `sigma_idx` points outside `sigma` — defensive guards mirroring the
-    /// scaling path. Fit-time validation rejects an uncovered CMT up front,
-    /// and `build_error_spec` resolves indices against the real sigma vector,
-    /// so a `NaN` here is only reachable via a hand-constructed model.
-    /// Whether the residual variance depends on the prediction `f` for any
-    /// endpoint (proportional or combined). When `false` (purely additive),
-    /// the variance is constant in `f`, so FOCE's choice of evaluation point
-    /// (linearized `f0` vs population `f(η=0)`) is irrelevant and the cheap
-    /// path stays bit-identical. Used to gate the FOCE population-variance
-    /// (`f(η=0)`) treatment in the marginal, analytical gradient, and
-    /// covariance step.
+    /// For `Single` the `cmt` is ignored and the full `sigma` slice is used. For `PerCmt` the
+    /// endpoint registered for `cmt` selects the error model and slices `sigma` by its
+    /// `sigma_idx`. Returns `NaN` when `cmt` has no registered endpoint or an endpoint's
+    /// `sigma_idx` points outside `sigma` (defensive; fit-time validation and
+    /// `build_error_spec` rule it out, so only a hand-constructed model reaches it).
+    /// Whether the residual variance depends on the prediction `f` for any endpoint
+    /// (proportional or combined). When `false` (purely additive), FOCE's choice of evaluation
+    /// point (linearized `f0` vs population `f(η=0)`) is irrelevant and the cheap path stays
+    /// bit-identical. Gates the FOCE population-variance (`f(η=0)`) treatment in the marginal,
+    /// analytical gradient, and covariance step.
     pub fn has_f_dependent_variance(&self) -> bool {
         match self {
             ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
@@ -1035,23 +1017,20 @@ pub fn compute_r_diag_maybe_scaled(
         .collect()
 }
 
-/// Gaussian observation NLL `Σ_j ½(ln V_j + (y_j − f_j)²/V_j)` from a supplied
-/// prediction vector, with the per-observation custom magnitude (#484 / #1029)
-/// and the `iiv_on_ruv` variance scale folded in.
+/// Gaussian observation NLL `Σ_j ½(ln V_j + (y_j − f_j)²/V_j)` from a supplied prediction
+/// vector, with the per-observation custom magnitude (#484 / #1029) and the `iiv_on_ruv`
+/// variance scale folded in.
 ///
-/// Single owner of the "score these predictions against this magnitude" formula
-/// so a diagonal-`R` estimator can evaluate it at a *perturbed* parameter point
-/// without duplicating it. SAEM's M-step θ gradient uses exactly that: with a
-/// magnitude active it forward-differences this whole quantity — capturing both
-/// the prediction channel and the magnitude's own direct-θ channel — instead of
-/// chaining an analytic `∂nll/∂f` that would silently drop the second one.
+/// Single owner of the "score these predictions against this magnitude" formula so a
+/// diagonal-`R` estimator can evaluate it at a *perturbed* parameter point. SAEM's M-step θ
+/// gradient forward-differences this whole quantity when a magnitude is active, capturing the
+/// prediction channel and the magnitude's direct-θ channel (an analytic `∂nll/∂f` would drop
+/// the second).
 ///
-/// `frem_var[j] = Some(v)` overrides observation `j`'s variance outright (FREM
-/// covariate pseudo-observations use `EPSCOV²`, not the PK residual error, and
-/// carry neither the magnitude nor `ruv_scale`). Variances are guarded
-/// ([`guard_variance`]) exactly as the callers' inline loops do and predictions are
-/// not floored at all (#2440), so this is a drop-in for them. Censored (M3) rows are
-/// **not** handled — callers with `BloqMethod::M3`
+/// `frem_var[j] = Some(v)` overrides observation `j`'s variance outright (FREM covariate
+/// pseudo-observations use `EPSCOV²` and carry neither the magnitude nor `ruv_scale`).
+/// Variances are guarded ([`guard_variance`]) as in the callers' inline loops and predictions
+/// are not floored (#2440). Censored (M3) rows are **not** handled; `BloqMethod::M3` callers
 /// take their own path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gaussian_obs_nll_scaled(
@@ -1110,18 +1089,17 @@ pub(crate) fn gaussian_obs_nll_scaled(
 /// The structure a subject's residual covariance `R` is built from (#1081).
 ///
 /// Every consumer that asks "can `R` couple two observation rows?" asks
-/// [`is_dense`](Self::is_dense) on one of these — directly, or through
-/// `ModelParameters::residual_is_dense` / `CompiledModel::residual_is_dense` — and
-/// every dense-`R` builder takes one, so a second source of off-diagonal terms is
-/// one field here and one clause in `is_dense`, not ~45 call sites that each test
-/// `residual_correlations.is_empty()` and would each silently score a correlated
-/// model with independent residuals if missed. `tests/residual_is_dense_is_the_one_predicate.rs`
-/// keeps it that way.
+/// [`is_dense`](Self::is_dense) on one of these (directly, or through
+/// `ModelParameters::residual_is_dense` / `CompiledModel::residual_is_dense`), and every
+/// dense-`R` builder takes one, so a second source of off-diagonal terms is one field here
+/// and one clause in `is_dense`, not ~45 call sites that would each silently score a
+/// correlated model with independent residuals if missed.
+/// `tests/residual_is_dense_is_the_one_predicate.rs` keeps it that way.
 ///
 /// The per-observation *diagonal* helpers ([`ErrorSpec::variance_at_with_correlations`],
-/// [`compute_r_diag_with_correlations`], [`compute_iwres_with_correlations`]) keep
-/// taking the `block_sigma` pairs directly: those carry the within-observation
-/// `combined(...)` term, which is a property of the pairs, not of `R`'s shape.
+/// [`compute_r_diag_with_correlations`], [`compute_iwres_with_correlations`]) keep taking the
+/// `block_sigma` pairs directly: those carry the within-observation `combined(...)` term, a
+/// property of the pairs, not of `R`'s shape.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ResidualCov<'a> {
     /// The `block_sigma` off-diagonal correlations (#847) — the live ones from the
@@ -1458,29 +1436,22 @@ pub(crate) fn loadings_share_correlation(
 
 /// Match observations into cross-covariance pairs within each residual block.
 ///
-/// [`same_residual_block`] decides which rows may pair, and the grouping source
-/// sets the pairing rule:
+/// [`same_residual_block`] decides which rows may pair; the grouping source sets the rule:
 ///
-/// * **Explicit `L2` group** — the rows are one user-declared correlated unit,
-///   so **every** complementary pair in the group is correlated (all-to-all). A
-///   genuine 3+ endpoint block (e.g. parent + two metabolites, each pair
-///   correlated and jointly positive-definite) keeps its full cross-covariance
-///   structure. Over-grouping true replicates into one L2 unit would make that
-///   block indefinite and fail `R.cholesky()` loudly — which is the user telling
-///   the fit their grouping is wrong, not a silent drop.
-/// * **`(time, occasion)` fallback** — replicate assays cannot be told apart, so
-///   partners are matched **one-to-one, greedily in row order**: each unmatched
-///   row takes the first later unmatched row in its block with a nonzero cross
-///   covariance. This yields disjoint 2×2 pairs, so a co-temporal 4-row
-///   replicate block stays PD instead of collapsing to the invalid sentinel
-///   (issue #827).
+/// * **Explicit `L2` group**: the rows are one user-declared correlated unit, so **every**
+///   complementary pair is correlated (all-to-all), keeping a 3+ endpoint block's full
+///   cross-covariance structure. Over-grouping true replicates makes the block indefinite and
+///   fails `R.cholesky()` loudly (the user's grouping is wrong, not a silent drop).
+/// * **`(time, occasion)` fallback**: replicate assays cannot be told apart, so partners are
+///   matched **one-to-one, greedily in row order** (each unmatched row takes the first later
+///   unmatched row in its block with a nonzero cross covariance). This yields disjoint 2×2
+///   pairs, so a co-temporal 4-row replicate block stays PD instead of collapsing to the
+///   invalid sentinel (#827).
 ///
-/// Returns `(j, k, cov)` triples with `j < k`. `cov` is the value-loading cross
-/// covariance the two `R` builders reuse directly (avoiding a recompute); the
-/// derivative builders take only the `(j, k)` pairing and recompute with slope
-/// loadings. `loadings[j]` are observation `j`'s sigma value loadings (slot
-/// presence is identical for slope loadings, so the same pairing drives the
-/// derivative builders).
+/// Returns `(j, k, cov)` triples with `j < k`. `cov` is the value-loading cross covariance
+/// the two `R` builders reuse; the derivative builders take only the `(j, k)` pairing and
+/// recompute with slope loadings (`loadings[j]` are observation `j`'s sigma value loadings;
+/// slot presence is identical for slope loadings).
 fn match_partners(
     loadings: &[Vec<(usize, f64)>],
     obs_times: &[f64],
@@ -2118,27 +2089,21 @@ pub(crate) fn r_matrix_maybe_scaled(
 }
 
 /// `∂R/∂f_m` matrices of the dense residual covariance built by
-/// [`compute_r_matrix_with_correlations`] (or its `_scaled` variant) — one
-/// symmetric `n×n` matrix per observation `m`.
+/// [`compute_r_matrix_with_correlations`] (or its `_scaled` variant), one symmetric `n×n`
+/// matrix per observation `m`.
 ///
-/// `dr[m]` is nonzero only in row/column `m`, because every entry of `R`
-/// depends on the prediction vector only through the two observations it
-/// couples, and each sigma loading coefficient is affine in `f` (proportional
-/// slot loads `f`, additive slot a constant). So:
+/// `dr[m]` is nonzero only in row/column `m`: every entry of `R` depends on the predictions
+/// only through the two observations it couples, and each sigma loading is affine in `f`.
+///   * diagonal: `∂R_mm/∂f_m`, the `f`-derivative of `variance_at_scaled`, including any
+///     within-observation `block_sigma` cross term;
+///   * off-diagonal `(m,k)` in the same residual block: `∂R_mk/∂f_m`, which, as
+///     `cross_observation_covariance` is bilinear in the two observations' loadings, is that
+///     cross-covariance with observation `m`'s *slope* loadings
+///     ([`ErrorSpec::sigma_loading_slopes`]) in place of its value loadings.
 ///
-/// * diagonal: `∂R_mm/∂f_m` — the `f`-derivative of `variance_at_scaled`,
-///   including any within-observation `block_sigma` cross term;
-/// * off-diagonal `(m,k)` in the same residual block: `∂R_mk/∂f_m`, which —
-///   because `cross_observation_covariance` is bilinear in the two
-///   observations' loadings — is exactly that cross-covariance evaluated with
-///   observation `m`'s *slope* loadings ([`ErrorSpec::sigma_loading_slopes`])
-///   in place of its value loadings.
-///
-/// Feeds the FOCEI interaction Hessian term
-/// `B_kl = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l)` with `∂R/∂η_k = Σ_m H[m,k]·dr[m]`.
-/// `mult` is the #484 per-observation magnitude matrix (`None` ⇒ all ones),
-/// applied identically to the value and slope loadings so the derivative tracks
-/// the magnitude-scaled `R`.
+/// Feeds the FOCEI interaction Hessian term `B_kl = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l)` with
+/// `∂R/∂η_k = Σ_m H[m,k]·dr[m]`. `mult` is the #484 per-observation magnitude matrix (`None`
+/// ⇒ all ones), applied identically to value and slope loadings.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_dr_df_matrices(
     error_spec: &ErrorSpec,
@@ -2421,35 +2386,27 @@ fn diag_self_deriv(
     d
 }
 
-/// Second-order `∂²R/∂f_a∂f_b` tensor of the dense residual covariance — the
-/// curvature companion to [`compute_dr_df_matrices`], returned as `d2r[a][b]`,
-/// an `n×n` symmetric matrix per ordered prediction pair `(a, b)`
-/// (`d2r[a][b] == d2r[b][a]` by equality of mixed partials).
+/// Second-order `∂²R/∂f_a∂f_b` tensor of the dense residual covariance, the curvature
+/// companion to [`compute_dr_df_matrices`], returned as `d2r[a][b]`, an `n×n` symmetric
+/// matrix per ordered prediction pair (`d2r[a][b] == d2r[b][a]`).
 ///
-/// Every sigma loading coefficient is *affine* in `f` (proportional slot loads
-/// `f`, additive slot is constant), so the second `f`-derivative of any loading
-/// is zero. Combined with the fact that each `R` entry couples at most two
-/// observations, only two families of second derivatives survive:
+/// Every sigma loading is affine in `f`, so its second derivative is zero, and each `R` entry
+/// couples at most two observations; two families survive:
 ///
-/// * `d2r[m][m]` has a single nonzero entry at `(m, m)`:
-///   `∂²R_mm/∂f_m²` — the second `f`-derivative of `variance_at_scaled`. With
-///   `c_s` the value loading, `c_s' = slope_s`, `c_s'' = 0`, the within-obs
-///   `block_sigma` cross term `2 ρ σ_i σ_j c_i c_j` differentiates twice to
-///   `4 ρ σ_i σ_j c_i' c_j'` (see `diag_self_second_deriv`). The off-diagonal
-///   entries of `R` have `∂²R_mk/∂f_m² = cross(c_m'', c_k) = 0`, so they do not
-///   appear here.
-/// * `d2r[m][k]` for `m ≠ k` in the same residual block has nonzero entries at
-///   `(m, k)` and `(k, m)`: `∂²R_mk/∂f_m∂f_k`. Because
-///   `cross_observation_covariance` is bilinear in the two observations'
-///   loadings, this mixed partial is exactly that cross-covariance evaluated
-///   with *both* observations' slope loadings — `cross(slope_m, slope_k)`.
+/// * `d2r[m][m]` has a single nonzero entry at `(m, m)`, `∂²R_mm/∂f_m²`, the second
+///   `f`-derivative of `variance_at_scaled`. With `c_s' = slope_s`, `c_s'' = 0`, the
+///   within-obs `block_sigma` cross term `2 ρ σ_i σ_j c_i c_j` differentiates twice to
+///   `4 ρ σ_i σ_j c_i' c_j'` (see `diag_self_second_deriv`). Off-diagonal entries have
+///   `∂²R_mk/∂f_m² = cross(c_m'', c_k) = 0`.
+/// * `d2r[m][k]` for `m ≠ k` in the same residual block has nonzero entries at `(m, k)` and
+///   `(k, m)`: `∂²R_mk/∂f_m∂f_k`, the cross-covariance with *both* observations' slope
+///   loadings, `cross(slope_m, slope_k)` (bilinearity of `cross_observation_covariance`).
 ///
-/// Feeds the dense FOCEI outer-gradient curvature coefficients (the `β`/`α'`
-/// reservoir in `sens_outer_gradient`) and the inner Hessian response
-/// correction, via `∂²R/∂η_k∂η_l = Σ_{m,m'} H[m,k] H[m',l] · d2r[m][m']`
-/// (plus the `Σ_m (∂²f_m/∂η_k∂η_l) · ∂R/∂f_m` term carried by the first-order
-/// [`compute_dr_df_matrices`]). `mult` is the #484 per-observation magnitude
-/// matrix, applied to the slope loadings identically to the first-order path.
+/// Feeds the dense FOCEI outer-gradient curvature coefficients (the `β`/`α'` reservoir in
+/// `sens_outer_gradient`) and the inner Hessian response correction, via
+/// `∂²R/∂η_k∂η_l = Σ_{m,m'} H[m,k] H[m',l] · d2r[m][m']` (plus the
+/// `Σ_m (∂²f_m/∂η_k∂η_l) · ∂R/∂f_m` term carried by [`compute_dr_df_matrices`]). `mult` is the
+/// #484 magnitude matrix, applied to the slope loadings as in the first-order path.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_d2r_df2_matrices(
     error_spec: &ErrorSpec,
@@ -2753,22 +2710,20 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
     residual_autocorrelation(subjects.iter().map(|s| s.iwres.as_slice()))
 }
 
-/// Whether `subject`'s occasions **run in time** (#2829): each label is one
-/// contiguous run of observation rows, and every label change has a strictly later
-/// `obs_times` than the row before it. True for a subject with no occasions or one.
+/// Whether `subject`'s occasions **run in time** (#2829): each label is one contiguous run of
+/// observation rows, and every label change has a strictly later `obs_times` than the row
+/// before it. True for a subject with no occasions or one.
 ///
-/// This is what tells sequential occasions (the visits of one subject: dosing
-/// intervals, study periods) from parallel ones (the arms of one study, a nested
-/// model's level cells), which restart the clock. No source flag can: a single
-/// `level X by COL in ID` is written into `iov_column`, so arms and visits reach the
-/// fit the same way, and only the rows differ.
+/// This tells sequential occasions (the visits of one subject) from parallel ones (the arms of
+/// one study, a nested model's level cells), which restart the clock; no source flag can (a
+/// single `level X by COL in ID` is written into `iov_column`, so arms and visits reach the
+/// fit the same way).
 ///
-/// - **Strict** at the boundary: two arms that both start at `t = 0`, one of them a
-///   single baseline row, are parallel.
-/// - The **internal** clock, `obs_times`, not `obs_raw_times`: an `EVID = 4`
-///   crossover keeps running across the reset, so its periods are in time.
-/// - A derived `iov_occasion` rule always passes: its labels count the edges at or
-///   before each time.
+/// - **Strict** at the boundary: two arms that both start at `t = 0`, one of them a single
+///   baseline row, are parallel.
+/// - The **internal** clock, `obs_times`, not `obs_raw_times`: an `EVID = 4` crossover keeps
+///   running across the reset.
+/// - A derived `iov_occasion` rule always passes (its labels count the edges before each time).
 pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
     labels_run_in_time(&subject.occasions, &subject.obs_times)
 }
@@ -2809,31 +2764,27 @@ fn labels_run_in_time(labels: &[u32], obs_times: &[f64]) -> bool {
     true
 }
 
-/// The series the fit's Durbin–Watson statistic pairs within (#2798): `values`
-/// (one per observation row of `subject`) split into the rows sharing the key
-/// `(occasions[j], obs_rgroup[j])`. Each part is read only when it does **not** run
-/// in time: the occasions ([`occasions_run_in_time`], #2829) and the residual blocks
-/// ([`residual_blocks_run_in_time`], #2858) are tested apart, by the same rule. Rows
-/// are grouped **by key**, not by contiguous run, and kept in row order; the groups
-/// come out in order of first appearance.
+/// The series the fit's Durbin–Watson statistic pairs within (#2798): `values` (one per
+/// observation row of `subject`) split into the rows sharing the key
+/// `(occasions[j], obs_rgroup[j])`. Each part is read only when it does **not** run in time:
+/// the occasions ([`occasions_run_in_time`], #2829) and the residual blocks
+/// ([`residual_blocks_run_in_time`], #2858) are tested apart, by the same rule. Rows are
+/// grouped **by key**, not by contiguous run, in row order; groups come out in order of first
+/// appearance.
 ///
-/// The key is what the fit grouped the rows by: the occasions are the prepared
-/// population's (an `iov_column`, a derived `iov_occasion` rule, or a nested
-/// model's level cells, `assign_level_cells`), and the residual blocks a
-/// `correlation … by` line's (`assign_residual_groups`). Occasions in time are one
-/// residual series: a pair joining one visit's last row to the next visit's first is
-/// a real lag pair, and with one observation per occasion it is the only kind there
-/// is (split there, a sparse TDM fit had no pair at all and no statistic). Parallel
-/// occasions restart the clock, so the same pair would join one arm's last visit to
-/// another arm's first.
+/// The key is what the fit grouped by: the occasions are the prepared population's (an
+/// `iov_column`, a derived `iov_occasion` rule, or a nested model's level cells,
+/// `assign_level_cells`), the residual blocks a `correlation … by` line's
+/// (`assign_residual_groups`). Occasions in time are one residual series: a pair joining one
+/// visit's last row to the next visit's first is a real lag pair (with one observation per
+/// occasion the only kind; split there, a sparse TDM fit had no statistic). Parallel occasions
+/// restart the clock, so the same pair would join one arm's last visit to another arm's first.
 ///
-/// Whitened residuals split the same way: the Cholesky factor of a block-diagonal
-/// (up to permutation) `R` has no fill between blocks, so whitening never mixes two
-/// residual blocks. Under the model the whitened rows of two blocks are independent,
-/// so a pair across blocks in time asks the statistic's own question: is there
-/// dependence the line does not explain? Split there, a line `by` the visits hid the
-/// cross-visit pairs from the statistic, and with one row per block left it `NaN`
-/// (#2858).
+/// Whitened residuals split the same way: the Cholesky factor of a block-diagonal (up to
+/// permutation) `R` has no fill between blocks, and under the model the whitened rows of two
+/// blocks are independent, so a pair across blocks in time asks the statistic's own question
+/// (dependence the line does not explain). Split there, a line `by` the visits hid the
+/// cross-visit pairs and, with one row per block, gave `NaN` (#2858).
 pub(crate) fn split_by_residual_group(
     values: &[f64],
     subject: &crate::types::Subject,
@@ -2885,24 +2836,23 @@ pub(crate) fn grouped_iwres_autocorrelation(
     residual_autocorrelation(series.iter().map(Vec::as_slice))
 }
 
-/// [`iwres_autocorrelation`] under a `correlation … by COL` line (#1081): the same
-/// pooled statistics on each subject's IWRES **whitened by the residual covariance
-/// the model fitted**, `w = L⁻¹ D · iwres` with `R = L Lᵀ` the subject's `R` at the
-/// individual predictions and `D = diag(√R_jj)` (so `D · iwres = y − f`).
+/// [`iwres_autocorrelation`] under a `correlation … by COL` line (#1081): the same pooled
+/// statistics on each subject's IWRES **whitened by the residual covariance the model
+/// fitted**, `w = L⁻¹ D · iwres` with `R = L Lᵀ` the subject's `R` at the individual
+/// predictions and `D = diag(√R_jj)` (so `D · iwres = y − f`).
 ///
-/// With `iiv_on_ruv` this `R` is the η = 0 one and `D · iwres` is `(y − f)/s`, since
-/// IWRES already divides by the subject's `s = exp(η̂_ruv)`. That is the same `w`:
-/// the subject's `R` is `s²·R₀`, so its factor is `s·L₀` (#2656).
+/// With `iiv_on_ruv` this `R` is the η = 0 one and `D · iwres` is `(y − f)/s` (IWRES already
+/// divides by `s = exp(η̂_ruv)`); the same `w`, since the subject's `R` is `s²·R₀` (#2656).
 ///
-/// Under the model `w` is independent standard normal, so the statistic asks what
-/// it asks of an independent-residual model — is there dependence the model does
-/// *not* explain? On raw IWRES it would report the correlation the line was written
-/// to model (Durbin–Watson 0.99 on the naproxen `cs` fit). A subject whose `R` does
-/// not factor contributes nothing, as a subject with < 2 finite IWRES does.
+/// Under the model `w` is independent standard normal, so the statistic asks what it asks
+/// of an independent-residual model: is there dependence the model does *not* explain? On
+/// raw IWRES it would report the correlation the line models (Durbin–Watson 0.99 on the
+/// naproxen `cs` fit). A subject whose `R` does not factor contributes nothing, as one with
+/// < 2 finite IWRES does.
 ///
-/// The whitened series is split like the raw one ([`split_by_residual_group`],
-/// #2798): pairs stay within one residual block when the subject's blocks are
-/// parallel (#2858), and within one occasion when its occasions are (#2829).
+/// Split like the raw series ([`split_by_residual_group`], #2798): pairs stay within one
+/// residual block when the blocks are parallel (#2858), and within one occasion when the
+/// occasions are (#2829).
 pub(crate) fn whitened_residual_autocorrelation(
     model: &crate::types::CompiledModel,
     population: &crate::types::Population,
@@ -2953,20 +2903,17 @@ fn whitened_rows(
         .map(|w| w.as_slice().to_vec())
 }
 
-/// The Durbin–Watson statistic over the lag pairs that **join two residual blocks**
-/// (#2858), with their count: in every subject whose blocks run in time
-/// ([`residual_blocks_run_in_time`]), the consecutive rows `(j − 1, j)` of the
-/// decorrelated series whose blocks differ. `(0, NaN)` when there is none.
+/// The Durbin–Watson statistic over the lag pairs that **join two residual blocks** (#2858),
+/// with their count: in every subject whose blocks run in time
+/// ([`residual_blocks_run_in_time`]), the consecutive rows `(j − 1, j)` of the decorrelated
+/// series whose blocks differ. `(0, NaN)` when there is none.
 ///
-/// These are the pairs a `correlation … by` line over groups in time leaves
-/// independent. The pooled statistic averages them with the pairs inside a block,
-/// which the line models: with three rows per visit, two pairs in three are inside
-/// (measured on `tests/data/dw_sequential_algebraic/rich.csv` under `ar1(RHO) by
-/// OCC`: 1.36 across blocks, 2.11 inside, 1.94 pooled). Pair-normalised like the
-/// pooled one, so independent rows give 2.
-///
-/// A pair that also crosses a parallel occasion is left out, as the pooled
-/// statistic leaves it out.
+/// These are the pairs a `correlation … by` line over groups in time leaves independent. The
+/// pooled statistic averages them with the pairs inside a block, which the line models
+/// (measured on `tests/data/dw_sequential_algebraic/rich.csv` under `ar1(RHO) by OCC`: 1.36
+/// across blocks, 2.11 inside, 1.94 pooled with three rows per visit). Pair-normalised like
+/// the pooled one, so independent rows give 2. A pair that also crosses a parallel occasion is
+/// left out, as in the pooled statistic.
 pub(crate) fn whitened_cross_block_dw(
     model: &crate::types::CompiledModel,
     population: &crate::types::Population,

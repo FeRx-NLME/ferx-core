@@ -4,18 +4,11 @@ use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 
-/// Route predictions through analytical PK or ODE solver depending on model,
-/// honouring per-event PK parameters when the subject has time-varying
-/// covariates. The TV-aware dispatcher in `pk::compute_predictions_with_tv`
-/// handles the analytical / ODE / event-driven branching.
-///
-/// This is the canonical predictions entry point for FOCE/FOCEI inner-loop
-/// objectives. Callers must pass the same `(theta, eta)` they use elsewhere
-/// in the NLL — `pk_param_fn` is invoked internally once per event (TV path)
-/// or once per subject (no-TV path).
-///
-/// Allocates a fresh `EventPkParams` scratch on each call. Hot loops should
-/// use [`model_predictions_into`] with a reused scratch buffer instead.
+/// Predictions through analytical PK or the ODE solver, honouring per-event PK
+/// parameters under time-varying covariates (`pk::compute_predictions_with_tv`).
+/// Canonical predictions entry for FOCE/FOCEI inner-loop objectives; pass the same
+/// `(theta, eta)` used elsewhere in the NLL. Allocates a fresh `EventPkParams`; hot
+/// loops should use [`model_predictions_into`].
 #[inline]
 fn model_predictions(
     model: &CompiledModel,
@@ -66,11 +59,8 @@ pub fn individual_nll(
     )
 }
 
-/// Same as [`individual_nll`] but uses a caller-owned scratch buffer.
-/// The hot-path entry point for SAEM's MH proposals: a single buffer
-/// allocated outside the per-subject MH loop is reused across all
-/// proposed `eta`s, eliminating the per-call `Vec<PkParams>` churn
-/// that previously dominated SAEM allocator pressure on TV-cov data.
+/// [`individual_nll`] with a caller-owned scratch buffer (SAEM MH hot path: one
+/// buffer reused across all proposed `eta`s).
 pub fn individual_nll_into(
     model: &CompiledModel,
     subject: &Subject,
@@ -97,18 +87,12 @@ pub fn individual_nll_into(
     )
 }
 
-/// TTE negative log-likelihood for an ODE-accumulated hazard (joint PK-TTE, #564).
+/// TTE NLL for an ODE-accumulated hazard (joint PK-TTE, #564): solves the augmented
+/// ODE at `(theta, eta)`, reads `H(t) = u[chz_state]` (and `h = u̇[chz_state]` for exact
+/// events) and feeds `crate::survival::tte_nll_from_curves`. Re-solves every call.
 ///
-/// Solves the subject's augmented ODE at `(theta, eta)` and reads the cumulative
-/// hazard `H(t) = u[chz_state]` (and, for exact events, the instantaneous hazard
-/// `h(t) = u̇[chz_state]`) at the event / censor / entry / interval times, then feeds
-/// them to the shared [`crate::survival::tte_nll_from_curves`] per-record likelihood.
-/// Re-solves the ODE on every call, so the inner EBE search and the FOCEI FD-Hessian
-/// (which perturbs η) each get a consistent, freshly-integrated hazard.
-///
-/// **Test-only** since #901: production reaches this composition through the dedicated
-/// arm of [`tte_endpoint_nll_visit`]. The tests keep it as the reference that arm must
-/// equal bit for bit (`tte_record_terms_fold_to_the_dedicated_solve_nll`).
+/// **Test-only** since #901: the reference the dedicated arm of
+/// [`tte_endpoint_nll_visit`] must equal bit for bit.
 #[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll(
     model: &CompiledModel,
@@ -192,11 +176,9 @@ fn tte_ode_curves(
     }
 }
 
-/// Per-record TTE NLL from cumulative-hazard / hazard curves already sampled at
-/// `times` (sorted-unique). The lookup closures binary-search `times`, exact on the
-/// f64 values that populated it. Shared by [`tte_ode_nll`] (which solves the ODE to
-/// build `cum`/`haz`) and the #570 joint-PK-TTE inner-NLL share (which reads `H`/`h`
-/// off the Gaussian solve), so the per-record likelihood logic lives in one place.
+/// Per-record TTE NLL from `H`/`h` curves sampled at sorted-unique `times` (lookups
+/// binary-search exact f64 values). Shared by [`tte_ode_nll`] and the #570
+/// joint-PK-TTE share so the per-record likelihood lives in one place.
 #[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll_from_curves(
     records: &[ObsRecord],
@@ -246,15 +228,9 @@ pub(crate) struct JointPkTteSolve {
     chz_states: Vec<Vec<f64>>,
     /// PK-parameter snapshot used for the solve.
     ///
-    /// **Test-only.** The fit path evaluates `h = dCHZ/dt` through `rhs_params` below,
-    /// which since #1261 carries this same snapshot *extended* with the per-time dose
-    /// anchors the RHS reads — so nothing in production needs the bare vector, and
-    /// `cargo clippy -- -Dunused` says so. The #1223 parity test does need it: it asserts
-    /// the pre-start state is bit-identical to `ode.initial_state(..)`, which is a claim
-    /// about the SEEDING, so the seed has to be built from the snapshot this solve
-    /// actually used. Recomputing one in the test would fold in a second claim — that the
-    /// share derives the snapshot the test thinks it does — and a failure would no longer
-    /// say which of the two broke.
+    /// **Test-only.** The fit path uses `rhs_params` (this snapshot extended with dose
+    /// anchors, #1261). The #1223 parity test needs the exact snapshot this solve used to
+    /// assert the pre-start state equals `ode.initial_state(..)`.
     #[cfg(test)]
     pk_values: Vec<f64>,
     /// Extended parameter snapshots aligned to `times`, including the dose-time anchors
@@ -262,12 +238,10 @@ pub(crate) struct JointPkTteSolve {
     rhs_params: Vec<[f64; crate::types::MAX_PK_PARAMS + 2]>,
 }
 
-/// Build the shared joint PK-TTE solve, but only when it is provably equivalent to
-/// the separate Gaussian + `ode_cumhaz_hazard` solves: a plain ODE model with at
-/// least one OdeAccumulated hazard and none of the features that route the Gaussian
-/// path away from the no-TV `ode_predictions` (time-varying covariates, EVID-3/4
-/// resets, SDE diffusion, FREM pseudo-observations). Returns `None` otherwise, and the
-/// caller keeps the established two-solve path.
+/// Build the shared joint PK-TTE solve only when provably equivalent to the separate
+/// Gaussian + `ode_cumhaz_hazard` solves: a plain ODE model with an OdeAccumulated
+/// hazard and no TV covariates, EVID-3/4 resets, SDE diffusion or FREM. `None`
+/// otherwise (caller keeps the two-solve path).
 #[cfg(feature = "survival")]
 fn try_joint_pktte_shared_solve(
     model: &CompiledModel,
@@ -276,22 +250,12 @@ fn try_joint_pktte_shared_solve(
     eta: &[f64],
 ) -> Option<JointPkTteSolve> {
     let ode = model.ode_spec.as_ref()?;
-    // The share computes the Gaussian predictions via `ode_predictions_and_chz`, i.e.
-    // the plain no-TV `ode_predictions` with a single t=0 PK snapshot. It is only
-    // equivalent when the standalone prediction path (`compute_predictions_with_tv_*`)
-    // takes that same snapshot route. Reject every case it routes elsewhere: model time
-    // (`pk::model_uses_time_anywhere`) or time-varying covariates send it through the
-    // per-event `ode_predictions_event_driven` (pk/mod.rs); EVID-3/4 resets also need the
-    // event-driven walker; SDE adds EKF process noise; FREM rewrites the
-    // pseudo-observation predictions. Each keeps the established two-solve fallback.
-    //
-    // The model-time clause must be the **wide** predicate, matching the routing site
-    // this mirrors (`pk/mod.rs`). Asking the narrow `compiled_model_uses_time_builtin`
-    // inspects only the individual-parameter program, so an `[odes]` RHS reading
-    // `TAD`/`TAFD`/`T`/`TIME` stayed admitted here after #1124 rerouted the standalone
-    // path — leaving the objective's Gaussian term on the dense engine while the
-    // reported IPRED came from the event-driven one, which is exactly the split the
-    // stated contract above exists to prevent.
+    // Equivalent only when the standalone prediction path takes the same no-TV
+    // `ode_predictions` snapshot route. Model time or TV covariates route through
+    // `ode_predictions_event_driven`; EVID-3/4 need the event-driven walker; SDE adds EKF
+    // noise; FREM rewrites pseudo-obs predictions. The model-time clause must be the
+    // **wide** predicate matching `pk/mod.rs` routing: the narrow one missed `[odes]`
+    // reading TAD/TIME after #1124.
     if subject.obs_records.is_empty()
         || subject.has_tv_covariates()
         || subject.has_resets()
@@ -387,17 +351,12 @@ fn try_joint_pktte_shared_solve(
     })
 }
 
-/// TTE NLL for an OdeAccumulated endpoint, reading `H`/`h` from the shared joint solve
-/// instead of integrating again. `cum = CHZ` and `haz = dCHZ/dt` are read exactly as
-/// `ode_cumhaz_hazard` does (state slot `chz_state`; the bare RHS for the derivative);
-/// the only difference is that the state came from the Gaussian solve's Hermite
-/// read-back, equal to a dedicated clamped solve to solver tolerance. A time before the
-/// integration start carries the seeded initial state on both engines (#1223), so it
-/// scores `H = 0`; a NaN state means a diverged solve and stays NaN, which
-/// `tte_nll_from_curves` maps to the `1e20` sentinel — matching `ode_cumhaz_hazard`.
+/// TTE NLL for an OdeAccumulated endpoint reading `H`/`h` from the shared joint solve
+/// (state slot `chz_state`; bare RHS for the derivative), equal to a dedicated solve to
+/// solver tolerance. Pre-start times score `H = 0` (#1223); a NaN state maps to the
+/// `1e20` sentinel, matching `ode_cumhaz_hazard`.
 ///
-/// **Test-only** since #901: production reads the share through the shared arm of
-/// [`tte_endpoint_nll_visit`], which this composition must equal bit for bit.
+/// **Test-only** since #901: [`tte_endpoint_nll_visit`]'s shared arm must equal it.
 #[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll_from_shared(
     ode: &crate::ode::OdeSpec,
@@ -435,7 +394,7 @@ fn shared_tte_curves(
 }
 
 /// Dispatch a TTE endpoint's per-subject NLL on its hazard representation, re-solving any
-/// ODE: the closed form of [`crate::survival::tte_data_term`] for `Analytic`, a dedicated
+/// ODE: the closed form of `crate::survival::tte_data_term` for `Analytic`, a dedicated
 /// solve for an `OdeAccumulated` (joint PK-TTE) hazard. The
 /// no-share, no-visitor case of [`tte_endpoint_nll_visit`].
 #[cfg(feature = "survival")]
@@ -461,26 +420,18 @@ fn tte_endpoint_nll(
     )
 }
 
-/// **The** routing of a TTE endpoint's per-subject likelihood onto its curves — the one
-/// place the `(joint_share, hazard)` choice is made (#901 review). An `Analytic` hazard is
-/// the closed form. An `OdeAccumulated` hazard takes, in this order:
+/// **The** routing of a TTE endpoint's per-subject likelihood onto its curves (#901).
+/// `Analytic` is the closed form. `OdeAccumulated` takes, in order:
 ///
-/// 1. the dual walk evaluated at `f64` (`survival::ode_tte_nll_g`), wherever it serves
-///    the subject (`ode_hazard_walk_in_scope`) — the very function the exact derivatives
-///    differentiate, so the objective and its gradient are one function (#2482);
-/// 2. outside the walk's scope, the #570 shared solve when `joint_share` is `Some`;
-/// 3. otherwise — and also when an in-scope walk returns `None` — the dedicated solve
-///    ([`tte_ode_curves`]).
+/// 1. the dual walk at `f64` (`survival::ode_tte_nll_g`) where in scope
+///    (`ode_hazard_walk_in_scope`), so objective and gradient are one function (#2482);
+/// 2. otherwise the #570 shared solve when `joint_share` is `Some`;
+/// 3. otherwise (or when the walk returns `None`) the dedicated solve ([`tte_ode_curves`]).
 ///
-/// Each scored record's term goes to `visit`, and the returned NLL is their fold. A walk
-/// that returns `None` does so before scoring, so it never leaves stray terms behind.
-///
-/// Every caller goes through here: the objective ([`accumulate_non_gaussian_nll`] and
-/// `foce_subject_nll_cov`'s at-mode term, with a no-op visitor), the FD perturbations and
-/// [`non_gaussian_terms`] (through [`tte_endpoint_nll`], no share), and the residuals
-/// ([`tte_endpoint_record_terms`], with a collector). So a residual cannot be read off a
-/// different engine than the objective scored. Recurrence is orthogonal to the ODE path,
-/// which is Single-only (RTTE + drug-driven hazard is rejected at parse).
+/// Each scored record's term goes to `visit`; the return is their fold. Every caller
+/// (objective, FD perturbations, [`non_gaussian_terms`], residuals via
+/// [`tte_endpoint_record_terms`]) goes through here, so residuals and objective share
+/// one engine. The ODE path is Single-only (RTTE + drug hazard rejected at parse).
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn tte_endpoint_nll_visit(
@@ -525,12 +476,9 @@ fn tte_endpoint_nll_visit(
     }
 }
 
-/// The per-record terms one TTE endpoint's likelihood scores at `eta` (#901), or `None`
-/// when that likelihood is the `1e20` sentinel (no residual is defined on the rail).
-///
-/// [`tte_endpoint_nll_visit`] with a collecting visitor, so the terms come off the curves
-/// the reported objective scored — the same router, given the same `joint_share` — and
-/// fold to that NLL bit for bit.
+/// The per-record terms one TTE endpoint scores at `eta` (#901), or `None` on the
+/// `1e20` sentinel. [`tte_endpoint_nll_visit`] with a collector, so the terms fold to
+/// the reported NLL bit for bit.
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tte_endpoint_record_terms(
@@ -634,31 +582,18 @@ pub(crate) fn tte_endpoint_nll_for_tests(
     tte_endpoint_nll(model, subject, hazard, *recurrence, records, theta, eta)
 }
 
-/// Accumulate every non-Gaussian endpoint's data-term NLL into `acc`, applying `factor` to
-/// each contribution. This is the single seam the FOCEI, SAEM θ-M-step, and IOV likelihood
-/// paths share: TTE endpoints are scored by [`tte_endpoint_nll`] (an `OdeAccumulated`
-/// joint-PK-TTE hazard reads `H`/`h` off the #570 shared solve when `joint_share` is `Some`);
-/// the discrete families — binary today, ordinal / Poisson / negative-binomial later — by
-/// [`crate::categorical::discrete_subject_nll`]. A new endpoint family is enabled by one arm
-/// in those two callees, touching no dispatch site.
+/// Accumulate every non-Gaussian endpoint's data-term NLL into `acc`, times `factor`.
+/// The one seam FOCEI, SAEM θ-M-step and IOV share: TTE via [`tte_endpoint_nll`],
+/// discrete families via [`crate::categorical::discrete_subject_nll`].
 ///
-/// It accumulates **into `acc` per term** — one `factor * term` add per TTE endpoint (in
-/// ascending CMT order, the `BTreeMap` order of `model.endpoints`, so the sum is the same on
-/// every compile — #2531), then one for the discrete term — rather than returning
-/// a folded sum, so a running `data_ll` that already holds the Gaussian residual term stays
-/// **bit-identical** to the previously-inlined loop. Returning `-> f64` and adding
-/// `factor * sum` once would reassociate the floating-point adds and perturb the FOCEI hot
-/// path for multi-endpoint (competing-risks / TTE+binary) subjects.
+/// Adds **into `acc` per term** (TTE endpoints in ascending CMT order, #2531, then the
+/// discrete term) rather than returning a sum: a single `factor * sum` add would
+/// reassociate and break bit-identity of the FOCEI hot path.
 ///
-/// `factor` is the site's OFV-scale weight (`2·` on the halved FOCEI/IOV `data_ll`, `1·` on
-/// the raw SAEM / non-interaction NLL). `joint_share` is `None` on every path that does not
-/// build the shared solve, and passing it is faithful to what each inlined:
-/// - the two **IOV** sites (`individual_nll_iov`, `obs_nll_subject_into_iov`) inlined
-///   `tte_data_term`, which equals `tte_endpoint_nll` here because an IOV model's hazard is
-///   always `Analytic` — IOV + joint-PK-TTE is rejected at parse;
-/// - the **SAEM θ-M-step** (`obs_nll_subject_from_preds`) already inlined `tte_endpoint_nll`
-///   and *may* carry an `OdeAccumulated` endpoint (SAEM + joint-PK-TTE is not rejected); the
-///   `_` arm re-solves it via `tte_ode_nll`, exactly as that site did before the fold.
+/// `factor` is the OFV-scale weight (`2·` on halved FOCEI/IOV `data_ll`, `1·` on raw
+/// SAEM NLL). `joint_share` is `None` wherever the shared solve is not built; IOV
+/// hazards are always `Analytic` (IOV + joint-PK-TTE rejected at parse), SAEM may carry
+/// an `OdeAccumulated` endpoint, re-solved via `tte_ode_nll`.
 #[cfg(feature = "survival")]
 pub(crate) fn accumulate_non_gaussian_nll(
     model: &CompiledModel,
@@ -716,15 +651,11 @@ pub(crate) fn accumulate_non_gaussian_nll(
     }
 }
 
-/// Each non-Gaussian data term of one subject at `eta`, named, one per TTE endpoint
-/// (ascending CMT), then the categorical and the CTMM term when the model has one —
-/// the terms [`accumulate_non_gaussian_nll`] sums, kept apart so
-/// `W_NONFINITE_OBJECTIVE` can say which one failed (#2267). Raw NLLs, not the
-/// OFV-scale `2·` the contribution carries.
-///
-/// An `OdeAccumulated` hazard is re-solved here rather than read off the #570 shared
-/// solve, which agrees to solver tolerance; a diverged solve is `NaN` on both and maps
-/// to the same `1e20` sentinel. Empty for a subject with no non-Gaussian record.
+/// Each non-Gaussian data term of one subject at `eta`, named (TTE per endpoint in
+/// ascending CMT, then categorical and CTMM) — the terms
+/// [`accumulate_non_gaussian_nll`] sums, kept apart so `W_NONFINITE_OBJECTIVE` can
+/// name the failing one (#2267). Raw NLLs. `OdeAccumulated` hazards are re-solved
+/// (agree with the #570 share to solver tolerance). Empty with no non-Gaussian record.
 #[cfg(feature = "survival")]
 pub(crate) fn non_gaussian_terms(
     model: &CompiledModel,
@@ -768,26 +699,16 @@ pub(crate) fn non_gaussian_terms(
     terms
 }
 
-/// The finite value a per-subject objective is clamped to when it is numerically
-/// ill-defined — a non-finite NLL, a non-positive-definite `R`, a diverged solve, a
-/// survival / categorical / CTMM term that cannot be scored. Large and **finite** so
-/// the optimizer is repelled from the point rather than aborted by a `NaN`/`inf`.
-///
-/// The single home of the value (#2269): every guard in this module, in
-/// `crate::survival`, `crate::categorical` and `crate::markov` returns it, the
-/// estimators' "is this subject usable" tests (`gauss_newton`, `agq`) compare against
-/// it, and `W_NONFINITE_OBJECTIVE` reads it to label a population objective as sitting
-/// on the rail (`outer_optimizer::nonfinite_objective_reason`). Change it here and all
-/// of them move together. The IOV + FREM refusal deliberately returns a different
-/// value, [`IOV_FREM_REFUSAL_NLL`].
+/// The finite value a numerically ill-defined per-subject objective is clamped to
+/// (non-finite NLL, non-PD `R`, diverged solve, unscorable term): large and finite so
+/// the optimizer is repelled, not aborted. Single home of the value (#2269): guards
+/// here and in survival / categorical / markov return it, and `gauss_newton`, `agq` and
+/// `W_NONFINITE_OBJECTIVE` compare against it. The IOV + FREM refusal deliberately
+/// uses [`IOV_FREM_REFUSAL_NLL`].
 pub(crate) const SUBJECT_SENTINEL_NLL: f64 = 1e20;
 
-/// Whether an NLL is a real value rather than NaN/∞ or the
-/// [`SUBJECT_SENTINEL_NLL`] rail. `<` rather than `!=`, so a subject whose own
-/// objective reaches the rail also reads as unusable — and so does a sum over
-/// subjects holding one on it (`SUBJECT_SENTINEL_NLL` plus any ordinary objective
-/// rounds to at least itself). Every reader asking "did this evaluate?" of a
-/// per-subject score, or of a sum of them, goes through here (#2269).
+/// Whether an NLL is real rather than NaN/∞ or on the [`SUBJECT_SENTINEL_NLL`] rail.
+/// `<` rather than `!=` so a sum holding a sentinel also reads unusable (#2269).
 pub(crate) fn is_usable_subject_nll(nll: f64) -> bool {
     nll.is_finite() && nll < SUBJECT_SENTINEL_NLL
 }
@@ -803,16 +724,10 @@ pub(crate) fn iov_refuses_frem(model: &CompiledModel, subject: &Subject) -> bool
     model.frem_config.is_some() && subject.fremtype.iter().any(|&ft| ft > 0)
 }
 
-/// Hot-path variant that additionally threads through a pre-built
-/// [`pk::event_driven::EventSchedule`]. The FOCE inner-loop obj closure
-/// and Jacobian build the schedule once per `find_ebe` call and reuse
-/// it across all BFGS iterations.
-///
-/// `residual_correlations` carries the **live** `block_sigma` off-diagonals the
-/// way `sigma_values` carries the live σ (#847). FOCE/FOCEI estimate ρ, so their
-/// inner loop must pass the current optimizer value rather than the model's
-/// declaration; an estimator that holds ρ fixed passes
-/// `&model.residual_correlations`, which is then the same thing.
+/// Hot-path variant taking a pre-built [`pk::event_driven::EventSchedule`] (built once
+/// per `find_ebe` call). `residual_correlations` carries the **live** `block_sigma`
+/// off-diagonals as `sigma_values` carries live σ (#847): FOCE/FOCEI pass the current
+/// ρ; estimators holding ρ fixed pass `&model.residual_correlations`.
 pub fn individual_nll_into_with_schedule(
     model: &CompiledModel,
     subject: &Subject,
@@ -873,20 +788,11 @@ pub(crate) fn individual_nll_into_with_schedule_cov(
     )
 }
 
-/// Caller-owned buffers for repeated [`individual_nll`] evaluations of one
-/// subject — the SAEM MH loop's counterpart to [`pk::EventPkParams`].
-///
-/// What it hoists is what [`individual_nll_into_with_schedule`] allocates on
-/// **every** call: the prediction vector (that wrapper hands
-/// `compute_predictions_with_tv_recycle_with_schedule` a fresh `Vec::new()`, so
-/// on the SAEM path nothing was ever actually recycled), and the two
-/// `DVector`s of the η-prior quadratic form. Three heap allocations per MH
-/// proposal, ~39 proposals per subject per SAEM iteration.
-///
-/// Purely buffers: every field is fully overwritten before it is read, so a
-/// reused scratch scores bit-identically to a fresh one. `pk` is public because
-/// the callers that still need a bare [`pk::EventPkParams`] (the mixture class
-/// draw, the IOV NLL) borrow it directly rather than keeping a second buffer.
+/// Caller-owned buffers for repeated [`individual_nll`] evaluations of one subject
+/// (SAEM MH loop): the prediction vector and the two `DVector`s of the η-prior
+/// quadratic form, which [`individual_nll_into_with_schedule`] allocates every call.
+/// Every field is overwritten before read, so reuse is bit-identical. `pk` is public
+/// so callers needing a bare [`pk::EventPkParams`] borrow it.
 #[derive(Default)]
 pub(crate) struct IndividualNllScratch {
     pub pk: pk::EventPkParams,
@@ -906,38 +812,19 @@ impl IndividualNllScratch {
     }
 }
 
-/// The η-independent inputs of one subject's individual NLL: the per-observation
-/// residual dispatch keys and the `#484` residual-magnitude multipliers.
-///
-/// Neither depends on η — `obs_keys` reads the CMT column or a covariate
-/// selector, `ruv_obs_mult` reads (θ, covariates, TIME) — so an MH sweep, which
-/// holds θ and σ fixed and varies only η, can build them once per subject
-/// instead of once per proposal. For an `ErrorSpec::Single`/`PerCmt` model
-/// `obs_keys` borrows and `ruv_obs_mult` returns `None` immediately, so this
-/// costs one `Vec<usize>` copy per subject per iteration; for a `Selected`
-/// error model (a `[error_model]` with an `if`) it takes a per-observation
-/// closure evaluation off the proposal loop entirely.
+/// The η-independent inputs of one subject's individual NLL: per-observation residual
+/// dispatch keys and the `#484` residual-magnitude multipliers. Built once per subject
+/// per MH sweep (θ, σ fixed) instead of once per proposal.
 #[derive(Default)]
 pub(crate) struct IndividualNllPrep {
     err_keys: Vec<usize>,
     ruv_mult: Option<Vec<Vec<f64>>>,
     /// Test-only: the `MIXNUM` value in effect when [`Self::refresh`] ran.
     ///
-    /// Both halves of this prep can read the mixture class — `ruv_obs_mult`'s
-    /// per-sigma programs resolve `Expression::MixNum` through the
-    /// `MIXTURE_CLASS` thread-local, and `validate_ruv_expr` rejects η and NN
-    /// outputs but not the class index, so a `[mixture]` model may legally write
-    /// `DV ~ proportional(EPS * (1 + 0.5*(MIXNUM-1)))`. The wrapper this prep
-    /// replaced evaluated them inside the MH proposal loop and therefore inside
-    /// the drawn class's `MixtureClassGuard`; hoisting them out is only correct
-    /// if the caller refreshes **under the same guard**.
-    ///
-    /// That is an ordering contract between two call sites, invisible in the
-    /// types, and PR #1452 got it wrong on the first pass — `run_saem`'s E-step
-    /// refreshed one line above `MixtureClassGuard::enter`, serving class 1's
-    /// residual variance to every class-2 subject. So the contract is checked
-    /// where the prep is *consumed*, which makes every mixture test in the
-    /// suite a detector for it rather than only a dedicated one.
+    /// `ruv_obs_mult` can read the mixture class (`Expression::MixNum`), so the caller must
+    /// refresh **under the same `MixtureClassGuard`** as the proposals. PR #1452 broke that
+    /// ordering once; checking it where the prep is consumed makes every mixture test a
+    /// detector.
     #[cfg(test)]
     mix_class_at_refresh: usize,
 }
@@ -958,14 +845,8 @@ impl IndividualNllPrep {
     }
 }
 
-/// Scratch-reusing, bit-identical form of [`individual_nll_into`].
-///
-/// Same arithmetic in the same order — it differs from the wrapper only in
-/// where the buffers come from (`prep`/`scratch` rather than four fresh
-/// allocations) — so a fit that switches to it reproduces the previous trace
-/// exactly. `residual_correlations` is `model.residual_correlations` for the
-/// same reason [`individual_nll_into`] uses it: every caller of this form holds
-/// ρ at its declaration.
+/// Scratch-reusing, bit-identical form of [`individual_nll_into`]: same arithmetic in
+/// the same order, buffers from `prep`/`scratch`. Callers hold ρ at its declaration.
 pub(crate) fn individual_nll_prepared(
     model: &CompiledModel,
     subject: &Subject,
@@ -1055,15 +936,11 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
     )
 }
 
-/// The population predictions `f(η = 0)` at which a non-interaction FOCE subject's
-/// residual variance is held, or `None` when the error model's variance does not
-/// depend on the prediction (additive), where holding it changes nothing.
-///
-/// This is the **one** definition of `R⁰`'s evaluation point: the Sheiner–Beal
-/// marginal ([`foce_subject_nll`]) scores `R⁰` here, and the FOCE EBE search
-/// (`inner_optimizer`, `EbeVariance::Population`) holds its variance here, so the
-/// mode the inner loop finds is the mode of the objective the marginal linearises
-/// around — NONMEM `METHOD=1` without `INTER` (#319, #1722).
+/// Population predictions `f(η = 0)` at which a non-interaction FOCE subject's residual
+/// variance is held, or `None` for an additive (prediction-free) variance. The **one**
+/// definition of `R⁰`'s evaluation point, shared by [`foce_subject_nll`] and the FOCE
+/// EBE search, so both linearise around the same mode — NONMEM `METHOD=1` without
+/// `INTER` (#319, #1722).
 pub(crate) fn population_variance_preds(
     model: &CompiledModel,
     subject: &Subject,
@@ -1115,12 +992,10 @@ pub(crate) fn population_variance_preds_iov(
     ))
 }
 
-/// Whether the objective's value-only predictions may come from the subject's compiled plan
-/// ([`crate::sens::ode_provider::adjoint::plan_values`]) instead of the native predictor: a
-/// closed-form model (plain or IOV) or an `[odes]` model on the exact linear path, without a
-/// lagtime, where the plan's forward is bit-equal to the native walk and cheaper than it. Not a
-/// nonlinear `[odes]` model (its values come from a solver loop the plan does not serve), and not
-/// a lagged one (the recorded onset arithmetic measured up to 5 ulp off the native walk).
+/// Whether value-only predictions may come from the compiled plan
+/// ([`crate::sens::ode_provider::adjoint::plan_values`]): a closed-form model or an
+/// `[odes]` model on the exact linear path, without lagtime (onset arithmetic measured
+/// up to 5 ulp off the native walk), where the plan is bit-equal and cheaper.
 pub(crate) fn plan_value_route(model: &CompiledModel) -> bool {
     #[cfg(test)]
     if PLAN_VALUES_OFF.with(|c| c.get()) {
@@ -1129,11 +1004,9 @@ pub(crate) fn plan_value_route(model: &CompiledModel) -> bool {
     plan_value_bit_equal(model)
 }
 
-/// The one predicate for "the plan's value is bit-equal to the native objective" for `model`:
-/// not a lagged model (the recorded onset arithmetic measured up to 5 ulp off the native walk)
-/// and not a nonlinear / RK45 `[odes]` model. Every place that scores, memoises or compares a
-/// plan value next to native ones asks this — [`plan_value_route`] and the inner solve's fused
-/// value (`find_ebe_solve`'s memo and fused line-search trial) — so they cannot disagree.
+/// The one predicate for "the plan's value is bit-equal to the native objective": not
+/// lagged (5 ulp off, measured) and not a nonlinear / RK45 `[odes]` model. Shared by
+/// [`plan_value_route`] and `find_ebe_solve`'s memo and fused line search.
 pub(crate) fn plan_value_bit_equal(model: &CompiledModel) -> bool {
     !model.has_lagtime()
         && model
@@ -1164,17 +1037,10 @@ fn plan_value_preds(
 }
 
 /// [`individual_nll_into_prepared_with_schedule`] with an optional frozen residual
-/// variance (#1722).
-///
-/// `frozen_var_preds = Some(f₀)` scores every Gaussian row's residual variance at
-/// `f₀[j]` (from [`population_variance_preds`]) instead of at the row's own
-/// prediction — the non-interaction FOCE EBE objective, whose variance is a constant
-/// of the search. The residual itself, the prior and every non-Gaussian term keep
-/// the conditional `f(η)`. The `iiv_on_ruv` scale is not applied under a frozen
-/// variance: `R⁰` is the variance at *every* random effect zero, `η_ruv` included,
-/// exactly as the marginal builds it (and `fit` refuses `iiv_on_ruv` under a
-/// non-interaction stage anyway). `None` is the conditional objective, bit-identical
-/// to the function above.
+/// variance (#1722). `Some(f₀)` scores each Gaussian row's variance at `f₀[j]` (from
+/// [`population_variance_preds`]) — the non-interaction FOCE EBE objective; residual,
+/// prior and non-Gaussian terms keep `f(η)`, and the `iiv_on_ruv` scale is not applied
+/// (`R⁰` has every random effect zero). `None` is bit-identical to the function above.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     model: &CompiledModel,
@@ -1280,13 +1146,9 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
         }
     } else {
         for (j, (&y, &f_pred)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-            // #905: never score a non-Gaussian-endpoint observation as Gaussian. On
-            // the endpoint-routed load path (`read_population_for`) these rows live in
-            // `obs_records`, so this is a no-op; on a model-blind `read_nonmem_csv`
-            // load they sit in the Gaussian Vecs with a NaN `f_pred` (the analytical
-            // predictor declined them, #905) and must be skipped — a `y - NaN`
-            // residual would otherwise poison the whole subject's NLL. Guarded on the
-            // empty-endpoints common case so plain PK models pay nothing.
+            // #905: never score a non-Gaussian-endpoint row as Gaussian. A no-op on the
+            // endpoint-routed load; on a model-blind load these rows carry a NaN `f_pred` that
+            // would poison the NLL.
             #[cfg(feature = "survival")]
             if !model.endpoints.is_empty()
                 && subject
@@ -1359,11 +1221,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     }
 
     let nll = 0.5 * (eta_prior + log_det_omega + data_ll);
-    // Guard a non-finite prediction the same way we guard a non-finite Ω above:
-    // an ODE integration can blow up to NaN/inf when the EBE search pushes eta
-    // into an extreme region, which would otherwise poison the inner optimizer
-    // (e.g. the Nelder-Mead simplex sort). Return the large finite sentinel so
-    // the bad point sorts as worst and gets reflected away. See issue #97.
+    // A blown-up solve (NaN/inf) maps to the finite sentinel so it sorts as worst (#97).
     if nll.is_finite() {
         nll
     } else {
@@ -1371,21 +1229,12 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     }
 }
 
-/// Dense correlated-residual (block_sigma) Gaussian data term for one subject.
-///
-/// Builds the residual covariance `R` from
-/// [`compute_r_matrix_with_correlations`](crate::stats::residual_error::compute_r_matrix_with_correlations),
-/// scales it by `ruv_scale`, adds the per-observation EKF process-noise `p_obs`
-/// to the diagonal (`&[]` on the SAEM / non-SDE paths), then returns the
-/// un-halved quadratic form plus log-determinant `rᵀ R⁻¹ r + log|R|`. Returns
-/// `None` when `R` is not positive-definite so the caller can emit its `1e20`
-/// sentinel.
-///
-/// Shared by the FOCE/E-step ([`individual_nll_into_with_schedule`]) and the
-/// SAEM M-step ([`obs_nll_subject_into`]) so both evaluate an identical
-/// conditional likelihood — the two previously carried divergent copies, one of
-/// which floored predictions while the other did not, biasing SAEM σ/θ when a
-/// prediction reached ≤ 0 (#557).
+/// Dense correlated-residual (block_sigma) Gaussian data term for one subject:
+/// `rᵀ R⁻¹ r + log|R|` (un-halved) with `R` from
+/// [`compute_r_matrix_with_correlations`](crate::stats::residual_error::compute_r_matrix_with_correlations)
+/// scaled by `ruv_scale` plus EKF `p_obs` on the diagonal. `None` when `R` is not PD.
+/// Shared by FOCE ([`individual_nll_into_with_schedule`]) and the SAEM M-step
+/// ([`obs_nll_subject_into`]) so both score one likelihood (#557).
 fn dense_residual_data_term(
     model: &CompiledModel,
     subject: &Subject,
@@ -1431,19 +1280,10 @@ fn dense_residual_data_term(
     Some(residuals.dot(&solved) + chol_log_det(&chol.l()))
 }
 
-/// Observation-only NLL for a single subject with ETAs held fixed.
-///
-/// Returns the data term `−log p(y_i | η, θ, σ)` (no prior, no |Ω| term) — the
-/// piece that participates in the SAEM M-step gradient and the IS-LL numerator.
-///
-/// Under M3, censored rows contribute the matching normal-tail likelihood
-/// instead of the Gaussian residual term.
-/// `residual_correlations` carries the **live** `block_sigma` off-diagonals
-/// alongside the live `sigma_values` (#847). Reading them off `model` instead
-/// would be wrong for any estimator that inherits a fitted rho from an earlier
-/// chain stage — `method = [focei, imp]` hands IMP the FOCEI estimate, so a
-/// declaration-sourced R would score a different likelihood than the one just
-/// optimized.
+/// Observation-only NLL `−log p(y_i | η, θ, σ)` for one subject (no prior / |Ω|) — the
+/// SAEM M-step and IS-LL numerator term. M3-censored rows contribute normal tails.
+/// `residual_correlations` carries the **live** ρ (#847): a chain like
+/// `[focei, imp]` hands IMP the fitted ρ, which the declaration would not reflect.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into(
     model: &CompiledModel,
@@ -1466,16 +1306,9 @@ pub(crate) fn obs_nll_subject_into(
     )
 }
 
-/// [`obs_nll_subject_into`] with the subject's cached event-driven schedule.
-///
-/// Same relationship as [`individual_nll_into`] to
-/// [`individual_nll_into_with_schedule`], and for the same reason: on the
-/// event-driven path the uncached call rebuilds `EventSchedule::for_subject`
-/// — a merged event sort plus a per-interval bounds `Vec` — inside every
-/// evaluation, and the SAEM M-step evaluates this once per subject per NLopt
-/// step, tens of times per iteration. `None` is exactly the previous behaviour,
-/// and is what a subject whose schedule cannot be reused
-/// (`inner_optimizer::cacheable_schedule`) still gets.
+/// [`obs_nll_subject_into`] with the subject's cached event-driven schedule (avoids
+/// rebuilding `EventSchedule::for_subject` per SAEM M-step evaluation). `None` is the
+/// uncached behaviour (see `inner_optimizer::cacheable_schedule`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into_with_schedule(
     model: &CompiledModel,
@@ -1501,12 +1334,8 @@ pub(crate) fn obs_nll_subject_into_with_schedule(
     )
 }
 
-/// Observation-only NLL from *precomputed* predictions.
-///
-/// Identical to [`obs_nll_subject_into`] except the caller supplies `preds`
-/// (predictions are independent of `σ`), letting the SAEM M-step σ-gradient FD
-/// loop reuse one ODE solve across all σ perturbations instead of re-solving per
-/// element (#557). `theta` is only consumed by the TTE hazard term.
+/// [`obs_nll_subject_into`] from *precomputed* `preds` (σ-independent), so the SAEM
+/// σ-gradient FD loop reuses one solve (#557). `theta` feeds only the TTE hazard.
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_from_preds(
@@ -1585,11 +1414,8 @@ fn obs_nll_subject_from_preds_with_semantics(
         }
     } else {
         for (j, (&y, &f)) in subject.observations.iter().zip(preds.iter()).enumerate() {
-            // #905: a non-Gaussian-endpoint observation must never be scored as
-            // Gaussian — the SAEM M-step / IS twin of the skip in
-            // `individual_nll_into_with_schedule`. No-op on the endpoint-routed path
-            // (those rows live in `obs_records`); on a model-blind load it keeps a NaN
-            // `f` (the declined predictor) out of the sum. Guarded on empty-endpoints.
+            // #905: never score a non-Gaussian-endpoint row as Gaussian (twin of the skip in
+            // `individual_nll_into_with_schedule`).
             #[cfg(feature = "survival")]
             if !model.endpoints.is_empty()
                 && subject
@@ -1613,14 +1439,9 @@ fn obs_nll_subject_from_preds_with_semantics(
                     }
                 }
             }
-            // The prediction is scored as-is, never clamped to a positive floor: a
-            // negative prediction is legitimate for an additive model (baseline minus
-            // effect, change from baseline, a signed biomarker), for `log(c)` under LTBS,
-            // and for a FREM covariate pseudo-observation (#406). Clamping it fabricates
-            // a residual, so this objective then disagrees with `individual_nll_into`
-            // (FOCE/Laplace/AGQ), which never clamped (#2440). Positivity of a
-            // proportional/combined variance is the variance floor's job, below; a
-            // non-finite prediction maps to the 1e20 sentinel at the end.
+            // Never clamp the prediction: negative values are legitimate (additive models, LTBS,
+            // FREM, #406), and clamping disagreed with `individual_nll_into` (#2440). Variance
+            // positivity is the variance floor's job; non-finite maps to the sentinel below.
             let v = match frem_var {
                 Some(vv) if semantics == PredNllSemantics::Marginal => vv.max(1e-12),
                 Some(vv) => vv,
@@ -1662,11 +1483,8 @@ fn obs_nll_subject_from_preds_with_semantics(
         accumulate_non_gaussian_nll(model, subject, theta, eta, None, 1.0, &mut nll);
     }
 
-    // #2440: with no prediction floor, a NaN prediction yields a NaN NLL. Map it to
-    // the same 1e20 sentinel `individual_nll_into` uses, so a blown-up solve is scored
-    // as the worst point rather than poisoning the SAEM/IMP/IMPMAP/VI objective. (The
-    // floor used to hide this the other way: `f64::max` discards NaN, so a NaN
-    // prediction was silently scored as 1e-12.)
+    // #2440: a NaN prediction yields a NaN NLL; map it to the 1e20 sentinel like
+    // `individual_nll_into`.
     if nll.is_finite() {
         nll
     } else {
@@ -1674,12 +1492,8 @@ fn obs_nll_subject_from_preds_with_semantics(
     }
 }
 
-/// Compute per-observation EKF process-noise variance (p_obs) for an SDE model.
-///
-/// Returns an empty vec when `model.is_sde()` is false — callers should check
-/// `model.is_sde()` before calling this to avoid an unnecessary ODE pass.
-/// Also read by the level binder's rank check (#2421), as the channel an SDE
-/// likelihood adds to the deterministic predictions.
+/// Per-observation EKF process-noise variance (`p_obs`) for an SDE model; empty when
+/// `!model.is_sde()`. Also read by the level binder's rank check (#2421).
 pub(crate) fn ekf_p_obs(
     model: &CompiledModel,
     subject: &Subject,
@@ -1706,17 +1520,11 @@ pub(crate) fn ekf_p_obs(
         }
     }
 
-    // The EKF is a single-pass filter over the whole subject timeline with a
-    // constant PK-parameter vector (no per-event recompute), so the `TIME`
-    // built-in resolves at the integration start (t=0) — the same convention as
-    // the single-pass ODE prediction path. (Time-varying *ODE-RHS* `TIME` is
-    // still honoured: the integrator supplies its own clock.) #610.
+    // Single-pass EKF with a constant PK vector, so `TIME` resolves at t=0, as in the
+    // single-pass ODE prediction path (#610). ODE-RHS `TIME` still uses the solver clock.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
-    // EKF process-noise variance uses a single error model. This is sound: a
-    // per-CMT (multi-endpoint) error model needs a Form C `y[CMT=N]` readout to
-    // observe multiple compartments, and the parser rejects Form C on SDE
-    // models — so an SDE model is always `ErrorSpec::Single` and the
-    // representative `model.error_model` is exact here.
+    // An SDE model is always `ErrorSpec::Single` (Form C, needed for per-CMT errors, is
+    // rejected on SDE), so `model.error_model` is exact here.
     debug_assert!(
         matches!(model.error_spec, ErrorSpec::Single(_)),
         "EKF path reached with a non-Single error spec (per-CMT + SDE should be unreachable)"
@@ -1735,23 +1543,9 @@ pub(crate) fn ekf_p_obs(
     p_obs
 }
 
-/// FOCE per-subject negative log-likelihood.
-///
-/// Non-interaction (standard FOCE):
-///   NLL_i = 0.5 * [(y - f0)' * R_tilde_inv * (y - f0) + log|R_tilde|]
-///   where f0 = f(eta_hat) - H * eta_hat  (linearized population prediction)
-///         R_tilde = H * Omega * H' + R(f0)
-///
-/// When M3 censoring is active and the subject has any CENS!=0 row, we route through
-/// the interaction path: mixing a linearized Gaussian term with a non-linearized
-/// `log Φ(·)` censored term produces inconsistent OFVs near the LOQ boundary, so we
-/// promote the whole subject to FOCEI — which is what NONMEM LAPLACE+M3 does in
-/// practice.
-///
-/// Multiplicative factor on the residual variance from an IIV-on-RUV eta
-/// (`Y = IPRED + EPS·EXP(ETA)`): `exp(2·eta[k])` for `Some(k)` in range, else
-/// `1.0`. Mirrors [`CompiledModel::residual_var_scale`] for call sites that
-/// hold the eta slice and the index but not the `&CompiledModel`.
+/// Residual-variance factor from an IIV-on-RUV eta (`Y = IPRED + EPS·EXP(ETA)`):
+/// `exp(2·eta[k])` for `Some(k)` in range, else `1.0`. Mirrors
+/// [`CompiledModel::residual_var_scale`] for callers without the model.
 #[inline]
 pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> f64 {
     match residual_error_eta {
@@ -1760,14 +1554,13 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
     }
 }
 
-/// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
-/// parallel to `sigma_values` (#847): FOCE/FOCEI estimate ρ, so the marginal has
-/// to be scored at the optimizer's current value, not the model's declaration.
+/// FOCE per-subject negative log-likelihood. Non-interaction (standard FOCE):
+/// `NLL_i = 0.5 * [(y - f0)' R̃⁻¹ (y - f0) + log|R̃|]`, `f0 = f(η̂) - H η̂`,
+/// `R̃ = H Ω H' + R(f0)`.
 ///
-/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
-/// (#1081) is **not** applied here, so such a model is scored with independent
-/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
-/// carries it.
+/// `residual_correlations` carries the **live** `block_sigma` ρ (#847). A
+/// `correlation … by COL` line (#1081) is **not** applied here; `fit()` uses the
+/// in-crate form that carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_subject_nll(
     model: &CompiledModel,
@@ -1864,28 +1657,19 @@ fn note(parts: &mut PartSink<'_>, name: &str, nll: f64) {
     }
 }
 
-/// The parts of `subject`'s [`foce_subject_nll_cov`] contribution, recorded by the branch
-/// that computes it (#2267): the Sheiner–Beal marginal under FOCE, the row-wise or
-/// dense-`R` Almquist marginal under FOCEI, and the joint form with the time-to-event,
-/// categorical and CTMM terms and their curvature. When the marginal returns its
-/// sentinel, the part that made it is recorded as `NaN` under a name saying why, and the
-/// parts it never reached are absent. Healthy, `2·Σ nll` is the contribution, to
-/// rounding. The names:
+/// The parts of `subject`'s [`foce_subject_nll_cov`] contribution, recorded by the
+/// branch that computes it (#2267). Healthy, `2·Σ nll` is the contribution to
+/// rounding; when the marginal hits its sentinel, the failing part is recorded as
+/// `NaN` under a name saying why and unreached parts are absent. Names:
 ///
-/// * FOCE — `linearized residual term` (`½ rᵀR̃⁻¹r` over the quantified rows),
-///   `linearized covariance log-determinant` (`½ ln|R̃|`, `R̃ = HΩHᵀ + R`), or
-///   `linearized covariance R̃ (not positive definite)` in their place;
-/// * FOCEI — `Gaussian residual term` (`½(rᵀR⁻¹r + ln|R|)` at the predictions at
-///   `eta_hat`), or `Gaussian residual variance (non-finite or non-positive)` on the
-///   row-wise path and `Gaussian residual covariance R (not positive definite)` on the
-///   dense one in its place; `random-effect prior` (`½(η̂ᵀΩ⁻¹η̂ + ln|Ω|)`);
-///   `curvature log-determinant` (`½ ln|H̃|`), or `curvature (H̃ not positive definite)`;
-/// * both — `censored (M3) term`, when the fit censors one of the subject's rows;
-/// * a subject with time-to-event, categorical or CTMM records — every one of those data
-///   terms (as [`non_gaussian_terms`] names them), the Gaussian residual term, prior and
-///   curvature under FOCE as well, since that branch is the joint conditional form; and
-///   a failed curvature names the non-Gaussian η-Hessian when it is not finite, or says
-///   `once the non-Gaussian Hessian is added` when the Gaussian `H̃` alone factors.
+/// * FOCE — `linearized residual term`, `linearized covariance log-determinant`, or
+///   `linearized covariance R̃ (not positive definite)`;
+/// * FOCEI — `Gaussian residual term` (or its non-finite / non-PD variants),
+///   `random-effect prior`, `curvature log-determinant` or
+///   `curvature (H̃ not positive definite)`;
+/// * both — `censored (M3) term` when a row is censored;
+/// * with TTE/categorical/CTMM records — every [`non_gaussian_terms`] name plus the
+///   joint-form Gaussian, prior and curvature parts (also under FOCE).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_contribution_parts(
     model: &CompiledModel,
@@ -1915,11 +1699,9 @@ pub(crate) fn foce_subject_contribution_parts(
     parts
 }
 
-/// A subject's non-Gaussian data terms at the mode `eta_hat` (TTE endpoints, the discrete
-/// family, CTMM): their summed raw NLL and their summed η-Hessian, each part recorded in
-/// `parts`. What the FOCE/FOCEI marginal folds into its data term (`2·q`) and its curvature
-/// (`H̃ + ∇²q`); shared by the non-IOV marginal and the IOV one, which scores it over the
-/// BSV block (the terms read BSV η only).
+/// A subject's non-Gaussian data terms at `eta_hat` (TTE, discrete, CTMM): summed raw
+/// NLL and summed η-Hessian, each part recorded in `parts`. Folded into the FOCE/FOCEI
+/// data term (`2·q`) and curvature (`H̃ + ∇²q`) by the non-IOV and IOV marginals.
 #[cfg(feature = "survival")]
 fn non_gaussian_mode_terms(
     model: &CompiledModel,
@@ -1930,11 +1712,8 @@ fn non_gaussian_mode_terms(
     parts: &mut PartSink<'_>,
 ) -> (f64, DMatrix<f64>) {
     use crate::types::EndpointLikelihood;
-    // The TTE data NLL, summed over all TTE CMTs.
-    // Iterate model.endpoints (typically 1–3 entries) rather than scanning
-    // obs_records for unique CMTs — avoids the HashSet and one pass over records.
-    // It is a `BTreeMap`, so both sums below run in ascending CMT order and are
-    // bit-identical on every compile (#2531).
+    // TTE data NLL over `model.endpoints` (a `BTreeMap`: ascending CMT, bit-identical
+    // on every compile, #2531).
     let n_eta = eta_hat.len();
     let mut tte_nll_at_mode = 0.0_f64;
     let mut tte_h = DMatrix::<f64>::zeros(n_eta, n_eta);
@@ -2009,11 +1788,9 @@ fn non_gaussian_mode_terms(
         note(parts, "CTMM", mode);
         tte_nll_at_mode += mode;
     }
-    // The curvature, exact: the whole term's η-Hessian from its plan (#2786). A subject a
-    // part already repels by its value takes none. One whose term cannot be recorded (a plan
-    // defect: every decline of the exact Hessian at a point the value scores is one, see
-    // `adjoint::HessianDecline`) takes the central-difference Hessian of the same NLL — the safety net — and is
-    // repelled only when that is not finite either.
+    // Exact curvature from the plan (#2786). A decline (`adjoint::HessianDecline`, a plan
+    // defect) falls back to the central-difference Hessian; repelled only if that is
+    // not finite either.
     if n_eta > 0 && tte_nll_at_mode < crate::survival::REPEL_SENTINEL_FLOOR {
         match crate::survival::non_gaussian_eta_jets2(model, subject, theta, eta_hat.as_slice()) {
             Some((_, _, h)) => tte_h += h,
@@ -2102,12 +1879,9 @@ fn foce_subject_nll_cov_split(
     let frem_r_override =
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
 
-    // TTE Laplace correction: when the subject has TTE obs_records, we compute
-    // the η-Hessian of the TTE data term (exact where the endpoint has a dual program,
-    // else a finite difference — #2437) and add it to hrh inside
-    // the interaction path so log|H̃| includes both Gaussian and TTE curvature.
-    // For pure-TTE subjects (no Gaussian obs), the interaction path still runs
-    // but h_matrix is empty and hrh comes entirely from the TTE Hessian.
+    // TTE Laplace correction: add the TTE data term's η-Hessian (exact with a dual
+    // program, else FD, #2437) to hrh so log|H̃| holds both curvatures. Pure-TTE subjects
+    // get hrh entirely from it.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
         let (tte_nll_at_mode, tte_h) = non_gaussian_mode_terms(
@@ -2130,15 +1904,9 @@ fn foce_subject_nll_cov_split(
             &p_obs,
             tte_nll_at_mode,
             tte_h,
-            // FOCE/FOCEI is selected by the `interaction` flag alone — M3 no longer
-            // force-promotes to interaction (mirrors the non-TTE branch below and the
-            // IOV `foce_subject_nll_iov`, #367/#591), so FOCE-M3 keeps non-interaction
-            // (no CᵀC) semantics here too. NOTE: the censored data term on this TTE path
-            // still rides `gaussian_foce_accum` at the conditional (η̂) variance, not the
-            // population-variance Sheiner–Beal `foce_subject_nll_standard` the non-TTE
-            // FOCE-M3 path uses; reconciling that (a `*_standard_with_tte` censored term)
-            // is a follow-up — joint analytic-`family` TTE + M3 + FOCE is the only path
-            // affected.
+            // `interaction` alone selects FOCE/FOCEI; M3 no longer promotes (#367/#591). Known
+            // gap: this TTE path's censored term rides the conditional variance, not the
+            // Sheiner–Beal one the non-TTE FOCE-M3 path uses.
             interaction,
             model.residual_error_eta,
             ruv_mult.as_deref(),
@@ -2146,21 +1914,11 @@ fn foce_subject_nll_cov_split(
         );
     }
 
-    // M3 no longer force-promotes to interaction: plain FOCE keeps a consistent
-    // FOCE (Sheiner–Beal) objective for the whole subject, with the censored rows
-    // entering the standard path as `−logΦ` terms (excluded from R̃). FOCEI still
-    // takes the interaction path. This matches NONMEM `METHOD=1 LAPLACE` with vs
-    // without INTER (FOCE-M3 and FOCEI-M3 are genuinely different optima).
-    // Interaction (FOCEI, and SAEM's AIC/BIC-comparable OFV which evaluates this
-    // with `interaction = true`) routes by whether the residual covariance is
-    // diagonal. A correlated (`block_sigma`) model uses the dense-R interaction
-    // marginal [`foce_subject_nll_interaction_dense`] (#616); the diagonal
-    // accumulator [`foce_subject_nll_interaction`] would silently drop the
-    // off-diagonal covariance. The non-interaction (Sheiner–Beal) branch carries
-    // the dense R for both cases via `compute_r_matrix_with_correlations`.
-    // The dense-R form applies exactly when the inner objective uses it: a subject with
-    // censored or FREM rows is scored row-wise by both (with the live correlated
-    // variance), so `F − ½log|H̃|` stays the inner objective `l`.
+    // M3 no longer promotes to interaction: FOCE-M3 and FOCEI-M3 are different optima
+    // (NONMEM `METHOD=1 LAPLACE` with/without INTER). Interaction routes on whether R
+    // is diagonal: `block_sigma` uses `foce_subject_nll_interaction_dense` (#616);
+    // the diagonal accumulator would drop the off-diagonals. Censored or FREM rows are
+    // scored row-wise by both objectives, so `F − ½log|H̃|` stays the inner objective.
     let rowwise = model.bloq_in_force().has_censored_row(&subject.cens)
         || subject.fremtype.iter().any(|&ft| ft > 0);
     if interaction {
@@ -2198,14 +1956,9 @@ fn foce_subject_nll_cov_split(
             )
         }
     } else {
-        // FOCE (no interaction): evaluate the residual variance R at the
-        // population prediction f(η=0) — NONMEM's no-interaction semantics —
-        // not the SB-linearized f0. f0 = f(η̂) − H·η̂ can extrapolate to
-        // near-zero/negative concentrations on a nonlinear (e.g. oral) model,
-        // collapsing R(f0)=(f0·σ)² to the floor and making R̃ ill-conditioned;
-        // f(η=0) is the physically sensible typical-individual prediction
-        // (always ≥0). Skipped for additive error (variance is f-independent,
-        // so f0 and f(η=0) give the same R) to keep that path bit-identical.
+        // FOCE: R at the population prediction f(η=0) (NONMEM no-interaction), not the
+        // linearized f0, which can extrapolate to ≤ 0 and collapse R. Skipped for additive
+        // error, where both give the same R.
         let pop_preds = population_variance_preds(model, subject, theta, eta_hat.len());
         foce_subject_nll_standard_split(
             subject,
@@ -2226,14 +1979,9 @@ fn foce_subject_nll_cov_split(
     }
 }
 
-/// Standard FOCE (no interaction). When any CENS rows are present AND
-/// `bloq_method == M3`, the dispatcher has already routed to the interaction
-/// Build per-observation R-diagonal overrides for FREM covariate pseudo-observations.
-/// Returns `None` when FREM is inactive (no config or empty fremtype).
-/// Overwrite the residual-variance diagonal at FREM covariate pseudo-observation
-/// rows with the per-row overrides built by [`build_frem_r_override`]. `None`
-/// entries (ordinary PK observations) are left untouched. Indices past the end
-/// of `r_diag` are skipped defensively.
+/// Overwrite the residual-variance diagonal at FREM pseudo-observation rows with the
+/// overrides from [`build_frem_r_override`]; `None` entries and indices past the end
+/// are left untouched.
 pub fn apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[Option<f64>]) {
     for (j, ov) in overrides.iter().enumerate() {
         if let (Some(v), true) = (ov, j < r_diag.len()) {
@@ -2248,6 +1996,8 @@ pub fn apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[Option<f64>]) {
 /// (`fixed_eta_gradient::obs_dvar_dlogsigma`, #1421).
 pub(crate) const FREM_VARIANCE_FLOOR: f64 = 1e-12;
 
+/// Per-observation R-diagonal overrides for FREM covariate pseudo-observations;
+/// `None` when FREM is inactive (no config or empty fremtype).
 pub fn build_frem_r_override(
     frem_config: Option<&FremConfig>,
     fremtype: &[u16],
@@ -2424,18 +2174,10 @@ fn foce_subject_nll_standard_split(
     }
     let r_diag: Vec<f64> = (0..r_matrix.nrows()).map(|j| r_matrix[(j, j)]).collect();
 
-    // M3 BLOQ under FOCE: the censored rows leave the Sheiner–Beal marginal (R̃ and
-    // the quadratic form are built over the quantified rows only) and re-enter as
-    // the univariate marginal tail probability `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)`, using the
-    // SAME linearized-marginal moments the quantified rows use: the marginal mean
-    // `f0 = f(η̂) − Hη̂` and the marginal variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰ⱼ` (#646).
-    // This keeps FOCE a consistent Sheiner–Beal (linearized-marginal) objective —
-    // matching Monolix's linearization likelihood and first-order/Tobit theory —
-    // in contrast to FOCEI (`foce_subject_nll_interaction`), a *conditional* first-order
-    // method whose censored term stays at the conditional `f(η̂)`/`R⁰` and instead folds
-    // the censored curvature into `H̃` (see `cens_hess`, #486) — the same conditional
-    // treatment NONMEM's LAPLACE M3 uses, at FOCEI Gauss-Newton order (dropping the
-    // `∂²f/∂η²` term full Laplace keeps).
+    // M3 under FOCE: censored rows leave the Sheiner–Beal marginal and re-enter as
+    // `−logΦ((LLOQ − f0)/√R̃ⱼⱼ)` with the same linearized moments (`f0 = f(η̂) − Hη̂`,
+    // `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰ⱼ`, #646). FOCEI instead keeps the conditional `f(η̂)`/`R⁰` and
+    // folds censored curvature into `H̃` (`cens_hess`, #486), as NONMEM LAPLACE M3.
     let m3 = bloq_method.has_censored_row(&subject.cens);
     let quant: Vec<usize> = if m3 {
         (0..n_obs)
@@ -2523,52 +2265,24 @@ fn model_n_eta(h_matrix: &DMatrix<f64>) -> usize {
     h_matrix.ncols()
 }
 
-/// FOCEI INTER per-subject −2·log marginal — Almquist 2015 Laplace form.
-///
-/// Per-subject objective (without the `N·log(2π)` data-side constant that
-/// NONMEM and nlmixr2 also drop):
+/// FOCEI INTER per-subject −2·log marginal — Almquist 2015 Laplace form (without
+/// the `N·log(2π)` constant):
 ///
 /// ```text
 ///   data_ll(η̂) + η̂'·Ω⁻¹·η̂ + log|Ω| + log|H̃|
 /// ```
 ///
-/// where
-///   `data_ll(η̂) = Σⱼ [(yⱼ − fⱼ)² / Rⱼ + log Rⱼ]`     (R evaluated at η̂)
-///   `H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹`            (Almquist 2015 eq. 15)
-///   `a_{j,k} = ∂fⱼ/∂η_k`                              (rows of `h_matrix`)
-///   `c̃_{j,k} = (∂Rⱼ/∂η_k) / Rⱼ = (∂Rⱼ/∂fⱼ)·a_{j,k} / Rⱼ`
-///                                                     (chain rule;
-///                                                      `∂R/∂f` from
-///                                                      `ErrorSpec::dvar_df`)
+/// with `data_ll(η̂) = Σⱼ [(yⱼ − fⱼ)² / Rⱼ + log Rⱼ]` (R at η̂),
+/// `H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + Ω⁻¹` (eq. 15), `a = ∂f/∂η` (`h_matrix`) and
+/// `c̃_{j,k} = (∂Rⱼ/∂fⱼ)·a_{j,k} / Rⱼ`. The `½·c̃'·c̃` INTER correction vanishes for
+/// additive error.
 ///
-/// The `½·c̃'·c̃` piece is the **INTER correction**: it captures the
-/// η-dependence of the residual variance in the conditional Hessian. It
-/// vanishes for additive (η-independent R) error, in which case `H̃`
-/// reduces to the FOCE-non-interaction `a'·diag(1/R)·a + Ω⁻¹`.
+/// Matches NONMEM `METHOD=1 INTER` and nlmixr2 `focei`: reconstructing NONMEM's
+/// per-subject OBJ with this formula reproduced its OFV to 0.013 of 66 539 (jasmine
+/// peds vanco). The earlier Sheiner–Beal form diverged at large |η|.
 ///
-/// This matches NONMEM's `METHOD=1 INTER` and nlmixr2's `est="focei"` —
-/// independently verified on the jasmine peds vanco dataset: at NONMEM's
-/// converged params, NM reports OFV 66 539, nlmixr2 66 727, and ferx's
-/// Almquist Laplace agrees to within FD-vs-analytical-sensitivity noise.
-/// The Python reconstruction of NM's per-subject OBJ from its own (η̂, ETC,
-/// IPRED) using this exact formula reproduces NM's reported OFV to within
-/// 0.013 out of 66 539 — confirming Almquist 2015 first-order is what
-/// NONMEM computes.
-///
-/// The previous implementation used the Sheiner–Beal linearised marginal
-/// `(y − f₀)' R̃⁻¹ (y − f₀) + log|R̃|` with `R̃ = HΩH' + R(η̂)`. For
-/// nonlinear PK with INTER, that form diverges from the Laplace value at
-/// large |η|, and the outer optimiser can exploit the gap to drive `σ_add`
-/// small (the negative-EPS-shrinkage symptom on jasmine peds vanco). See
-/// `[[focei-laplace-not-sheiner-beal]]` memory.
-///
-/// With `bloq_method == M3`, censored observations leave the Gaussian residual
-/// sum and contribute the matching normal-tail likelihood `−logΦ` evaluated at η̂
-/// (the `bloq_term`). They also enter `H̃`/`log|H̃|` at FOCEI (Gauss–Newton) order —
-/// the structural `g2·a·aᵀ` plus, under `iiv_on_ruv`, the residual-eta `C·z`/`C·m`
-/// cross terms (`cens_hess`) — consistently with the quantified rows, matching
-/// NONMEM's LAPLACE M3 Hessian (only the `g1·d2f` piece FOCEI drops for every row
-/// is dropped here too).
+/// Under M3, censored rows contribute `−logΦ` at η̂ and enter `H̃` at Gauss–Newton
+/// order (`cens_hess`, including `iiv_on_ruv` cross terms), as NONMEM LAPLACE M3.
 pub fn foce_subject_nll_interaction(
     subject: &Subject,
     ipreds: &[f64],
@@ -2732,15 +2446,9 @@ fn note_gaussian_data(
 }
 
 /// FOCEI INTER per-subject −2·log marginal for a **correlated** (`block_sigma`)
-/// residual covariance — the dense-`R` generalisation of
-/// [`foce_subject_nll_interaction`].
-///
-/// The diagonal interaction path forms `R` one observation at a time and so
-/// silently drops the `block_sigma` off-diagonals. This path instead carries the
-/// full residual covariance `R` (from
-/// [`compute_r_matrix_with_correlations`](crate::stats::residual_error::compute_r_matrix_with_correlations),
-/// the same matrix the FOCE non-interaction and SAEM paths use), giving the
-/// Almquist 2015 first-order conditional Hessian
+/// residual covariance — the dense-`R` generalisation of `foce_subject_nll_interaction`,
+/// which forms `R` row by row and would drop the off-diagonals. With `R` from
+/// [`compute_r_matrix_with_correlations`](crate::stats::residual_error::compute_r_matrix_with_correlations):
 ///
 /// ```text
 ///   data_ll(η̂) = rᵀ R⁻¹ r + log|R|
@@ -2748,20 +2456,9 @@ fn note_gaussian_data(
 ///   B_{kl}      = tr(R⁻¹ ∂R/∂η_k R⁻¹ ∂R/∂η_l),  ∂R/∂η_k = Σ_m H[m,k]·∂R/∂f_m
 /// ```
 ///
-/// where `H = ∂f/∂η` (`h_matrix`) and the per-observation `∂R/∂f_m` come from
-/// [`crate::stats::residual_error::compute_dr_df_matrices`].
-///
-/// Reduces **exactly** to [`foce_subject_nll_interaction`] when `R` is diagonal
-/// (ρ = 0): `Hᵀ diag(1/V) H = Σ_m a_m a_mᵀ/V_m` (`hrh`) and, since each `∂R/∂f_m`
-/// is then the single diagonal entry `∂V_m/∂f_m`, `R⁻¹ ∂R/∂η_k` is diagonal with
-/// entries `c̃_{m,k} = (∂V_m/∂η_k)/V_m`, so `B = c̃ᵀc̃` (`ctc`). The dispatcher
-/// keeps ρ = 0 on the diagonal path, so that function stays the bit-for-bit
-/// reference and this one runs only when correlations are present.
-///
-/// `block_sigma` is rejected up front together with M3, FREM, IOV (κ), and
-/// `iiv_on_ruv`, so none of those appear here; `p_obs` (SDE EKF process noise)
-/// inflates the `R` diagonal as an η-independent term, matching the diagonal
-/// interaction path (and excluded from `∂R/∂η`).
+/// Reduces exactly to the diagonal form at ρ = 0 (`B = c̃ᵀc̃`); the dispatcher keeps
+/// ρ = 0 on the diagonal path. `block_sigma` is rejected with M3, FREM, IOV and
+/// `iiv_on_ruv`; `p_obs` inflates the `R` diagonal η-independently.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_subject_nll_interaction_dense(
     subject: &Subject,
@@ -2975,20 +2672,12 @@ fn foce_subject_nll_interaction_dense_split(
     0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde)
 }
 
-/// FOCEI NLL with both Gaussian interaction terms and a TTE Laplace correction.
+/// FOCEI NLL with the Gaussian interaction terms plus a TTE Laplace correction.
 ///
-/// Adds the TTE data-term at η̂ to `data_ll` and the η-Hessian of the TTE
-/// data term to `hrh` before computing log|H̃|.  The Gaussian path is unchanged.
-///
-/// `tte_data_nll`  — the pre-computed TTE NLL at η̂ (sum over all TTE endpoints).
-///   Scaled by 2 to match the convention that data_ll is halved at the end.
-/// `tte_hessian`  — η-Hessian of the *raw* non-Gaussian NLL (un-halved): exact where the
-///                  endpoint has a dual program, else a finite difference (#2437).
-///   Added to `hrh` before the `log|H̃|` computation.
-/// `interaction`  — when `false` (plain FOCE) the η-dependence of the residual
-///   variance is ignored: the `½·CᵀC` interaction term is dropped from `H̃`.
-///   For pure-TTE subjects CᵀC is all-zero, so this only matters for mixed
-///   PK+TTE models run under FOCE.
+/// `tte_data_nll` — TTE NLL at η̂ over all TTE endpoints (scaled by 2; `data_ll` is
+/// halved at the end). `tte_hessian` — η-Hessian of the raw non-Gaussian NLL (exact
+/// with a dual program, else FD, #2437), added to `hrh` before `log|H̃|`.
+/// `interaction = false` (FOCE) drops `½·CᵀC` from `H̃`; only matters for mixed PK+TTE.
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_interaction_with_tte(
@@ -3057,12 +2746,9 @@ fn foce_subject_nll_interaction_with_tte(
         "random-effect prior",
         0.5 * (eta_prior + omega.log_det),
     );
-    // FOCEI adds the ½·CᵀC interaction curvature; plain FOCE omits it. The censored
-    // `cens_hess` (structural `g2·a·aᵀ` + residual-eta `C·z`/`C·m`) is FOCEI-order
-    // curvature — its `g2` folds in `∂v/∂f`/`∂²v/∂f²`, and the `C·z`/`C·m` terms are
-    // pure `iiv_on_ruv` interaction — so it is gated to the interaction branch, exactly
-    // as `½·g.ctc` is. Plain FOCE (non-interaction) leaves censored rows out of `H̃`,
-    // matching `foce_subject_nll_standard`.
+    // FOCEI adds ½·CᵀC; FOCE omits it. `cens_hess` is FOCEI-order curvature (its `g2`
+    // folds in ∂v/∂f, and C·z/C·m are `iiv_on_ruv` interaction), so it is gated the
+    // same way; plain FOCE leaves censored rows out of `H̃`.
     let htilde = if interaction {
         hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv
     } else {
@@ -3104,29 +2790,18 @@ struct GaussianFoceTerms {
     ctc: DMatrix<f64>,
     /// Σⱼ censored normal-tail terms (M3 method).
     bloq_term: f64,
-    /// Σⱼ censored rows' contribution to `H̃` at FOCEI (Gauss-Newton) order:
-    /// the structural curvature `g2·aⱼ'aⱼ` (`g2 = ∂²(−logΦ)/∂f²`) plus, under
-    /// `iiv_on_ruv`, the residual-eta cross terms `C·z` (diagonal) and `C·m·a`
-    /// (η_ruv coupling). This is `precise_ebe`'s censored inner-Hessian block
-    /// **minus** the `g1·d2f` term FOCEI legitimately drops (that drop is the
-    /// FOCEI-vs-LAPLACE difference; excluding the *rows* was an inconsistency).
-    /// Added directly (unscaled) to `H̃`, so censored rows enter `log|H̃|`
-    /// consistently with quantified rows. Zero when no censored rows.
+    /// Σⱼ censored rows' contribution to `H̃` at FOCEI (Gauss-Newton) order: `g2·aⱼ'aⱼ`
+    /// (`g2 = ∂²(−logΦ)/∂f²`) plus, under `iiv_on_ruv`, the `C·z` / `C·m·a` cross terms —
+    /// `precise_ebe`'s censored block minus the `g1·d2f` term FOCEI drops. Added unscaled.
     cens_hess: DMatrix<f64>,
 }
 
 /// Each observation's own `−2 log L` term in the FOCEI conditional data term at
-/// `ipreds` and `eta_hat` (#2266): `r²/V + ln V` on a quantified row, `−2 log Φ` on
-/// a row censored for this fit, read off [`gaussian_foce_accum`]'s own sweep, so
-/// every input the scorer resolves is resolved the same way — raw `IPRED` (no
-/// positivity floor) and unclamped `V`, the live `block_sigma` correlations in
-/// `residual_cov`, the SDE process-noise variance, FREM overrides, the `iiv_on_ruv`
-/// scale and a custom residual magnitude. A row whose `V` the scorer rejects (not
-/// finite or not positive) is `NaN`, the row that sends the subject to the sentinel.
-/// The terms sum to the marginal's `data_ll + bloq_term` when every row is usable.
-///
-/// Under FOCE (no interaction) or a dense residual covariance the marginal does not
-/// split by record; this is still what each record contributes at η̂ on its own.
+/// `ipreds`/`eta_hat` (#2266): `r²/V + ln V` (quantified) or `−2 log Φ` (censored for
+/// this fit), read off [`gaussian_foce_accum`]'s sweep so every input resolves as the
+/// scorer resolves it. A row whose `V` is rejected is `NaN`. Terms sum to
+/// `data_ll + bloq_term` when all rows are usable; under FOCE or dense `R` they are
+/// still each record's own contribution at η̂.
 pub(crate) fn conditional_obs_neg2ll_terms(
     model: &CompiledModel,
     subject: &Subject,
@@ -3178,14 +2853,9 @@ pub(crate) fn conditional_obs_neg2ll_terms(
     terms
 }
 
-/// Shared Gaussian accumulation loop for the FOCE/FOCEI interaction path.
-///
-/// Computes the per-observation Hessian terms from the Gaussian residuals and
-/// their variance derivatives. Returns `None` if any observation variance is
-/// non-finite or non-positive (callers should return the 1e20 sentinel).
-///
-/// Both [`foce_subject_nll_interaction`] and the TTE variant call this helper
-/// to eliminate the identical inner loop that previously existed in both.
+/// Shared Gaussian accumulation loop for the FOCE/FOCEI interaction path: the
+/// per-observation Hessian terms from residuals and variance derivatives. `None` if any
+/// variance is non-finite or non-positive (caller returns the 1e20 sentinel).
 fn gaussian_foce_accum(
     subject: &Subject,
     ipreds: &[f64],
@@ -3238,11 +2908,8 @@ fn gaussian_foce_accum(
         // residual-eta c̃ column only on ordinary PK rows.
         let frem_ov = frem_r_override.and_then(|o| o.get(j)).and_then(|v| *v);
         let is_pk_row = frem_ov.is_none();
-        // `residual_rd` returns the bare `(R, ∂R/∂f)` pair and leaves `ruv_scale`
-        // to the caller, so both carry the factor: scaling `R` by `exp(2·η_ruv)`
-        // multiplies `∂R/∂f` by the same amount, and the two cancel in `c_scale`
-        // below. FREM covariate rows take their variance from the override and
-        // contribute `∂R/∂f = 0` (additive near-zero sigma).
+        // `residual_rd` leaves `ruv_scale` to the caller: scaling `R` scales `∂R/∂f` too and
+        // both cancel in `c_scale`. FREM rows take the override variance and `∂R/∂f = 0`.
         let (v_resid, dvar_df) = match frem_ov {
             Some(v) => (v, 0.0),
             None => {
@@ -3382,27 +3049,17 @@ fn gaussian_foce_accum(
 }
 
 /// Conditional η-precision at `eta_hat` — the FOCEI/Laplace approximation to
-/// `−∂² log p(η | y, θ) / ∂η²`, i.e. the Hessian of the halved objective
-/// [`individual_nll`] scores:
+/// `−∂² log p(η | y, θ) / ∂η²` (Hessian of the halved [`individual_nll`]):
 ///
 /// ```text
 ///   H̃ = Hᵀ R⁻¹ H + ½·C̃ᵀC̃ + Ω⁻¹       (interaction = true)
 ///   H̃ = Hᵀ R⁻¹ H + Ω⁻¹                (interaction = false)
 /// ```
 ///
-/// This is the matrix whose log-determinant the FOCEI objective
-/// (`foce_subject_nll_interaction`) takes, assembled from the *same*
-/// `gaussian_foce_accum` loop, so a proposal built on this curvature and the
-/// FOCEI objective cannot drift apart. Consumed by the SAEM f-SAEM kernel
-/// (`estimation::saem_imh`, #1449).
-///
-/// Scope: the Gaussian observation rows of a subject with a diagonal residual R; an
-/// SDE subject's EKF variances `p_obs` (empty otherwise) add to each row's `V`, held
-/// η-independent as FOCEI's `H̃` holds them. The FREM R-override, `block_sigma`
-/// correlations and IIV on the residual are deliberately **not** threaded
-/// through; the caller gates those model shapes out rather than score them with
-/// an approximation this function would silently supply. Returns `None` when
-/// any observation variance is non-finite or non-positive.
+/// Built from the same `gaussian_foce_accum` loop as the FOCEI objective, for the
+/// SAEM f-SAEM kernel (`estimation::saem_imh`, #1449). Scope: Gaussian rows with
+/// diagonal R (SDE `p_obs` added η-independently); FREM overrides, `block_sigma` and
+/// IIV-on-RUV are gated out by the caller. `None` on a non-finite/non-positive variance.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conditional_eta_precision(
     model: &CompiledModel,
@@ -3488,38 +3145,18 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
     2.0 * ld
 }
 
-/// IOV-aware FOCE per-subject NLL — a *proper* linearised marginal over the
-/// full random-effect vector `b = [η, κ₁, …, κ_K]`.
+/// IOV-aware FOCE per-subject NLL — a linearised marginal over the full random-effect
+/// vector `b = [η, κ₁, …, κ_K]`: with `H_full = [∂f/∂η │ ∂f/∂κ₁ │ …]` and
+/// `Σ_b = blkdiag(Ω_bsv, Ω_iov × K)`, evaluates `0.5·[(y−f₀)ᵀ R̃⁻¹ (y−f₀) + log|R̃|]`,
+/// `R̃ = H_full Σ_b H_fullᵀ + R`.
 ///
-/// The per-occasion κ draws are integrated out by the same Sheiner–Beal
-/// marginal that handles the BSV η: we assemble the augmented sensitivity
-/// matrix `H_full = [∂f/∂η │ ∂f/∂κ₁ │ … │ ∂f/∂κ_K]` and the block-diagonal
-/// prior covariance `Σ_b = blkdiag(Ω_bsv, Ω_iov, …, Ω_iov)` (K copies), then
-/// evaluate the ordinary FOCE/FOCEI form `0.5·[(y−f₀)ᵀ R̃⁻¹ (y−f₀) + log|R̃|]`
-/// with `R̃ = H_full Σ_b H_fullᵀ + R`.
+/// No separate κ prior: the earlier `MAP` penalty omitted the κ Laplace determinant,
+/// leaving `+0.5·K·log|Ω_iov|` → −∞ as Ω_iov → 0 (#101). K = 0 reduces exactly to
+/// [`foce_subject_nll`]. `kappas[k]` is occasion k's EBE (order of
+/// `iov_occasion_groups`); empty `kappas` takes the non-IOV path.
 ///
-/// Because `∂f/∂κ_k` is non-zero only on occasion-k's observation rows (κ_k
-/// enters only that occasion's predictions, under the cross-occasion
-/// dose-carryover convention of `individual_nll_iov`), the κ columns are
-/// block-structured and the κ blocks of `Σ_b` couple only same-occasion rows
-/// — independent occasions stay independent in `R̃`.
-///
-/// This replaces the earlier shortcut (BSV-only linearisation plus an explicit
-/// `0.5·Σ_k[κᵀΩ_iov⁻¹κ + log|Ω_iov|]` MAP penalty). That penalty omitted the
-/// κ-block Laplace determinant `log|H_κᵀR⁻¹H_κ + Ω_iov⁻¹|`; in a correct
-/// marginal `log|Ω| + log|J|` combine into the bounded `log|R̃/R|`, so dropping
-/// `log|J|` left a bare `+0.5·K·log|Ω_iov|` that → −∞ as Ω_iov → 0, leaving
-/// `omega_iov` unidentified and the FOCE OFV not comparable to NONMEM / SAEM.
-/// See issue #101. With the augmented form, no separate κ prior is added (it
-/// is already folded into `R̃`), and the K=0 case reduces exactly to
-/// [`foce_subject_nll`].
-///
-/// `kappas[k]` is the EBE kappa vector for occasion k (same order as
-/// `iov_occasion_groups`).  When `kappas` is empty, falls through to the
-/// non-IOV path (no overhead for non-IOV subjects or models).
-///
-/// A `block_sigma` model is scored at its **declared** off-diagonals; the fit, which
-/// estimates them, scores the live ones through `foce_subject_nll_iov_cov` (#979).
+/// Scores `block_sigma` at its **declared** ρ; the fit uses
+/// `foce_subject_nll_iov_cov` with the live one (#979).
 pub fn foce_subject_nll_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -3600,16 +3237,10 @@ pub(crate) fn foce_subject_nll_iov_cov(
     }
 }
 
-/// The linearization an IOV subject is scored and diagnosed on: the joint EBE
-/// `b̂ = [η̂, κ̂₁, …, κ̂_K]`, the stacked sensitivity `H_full = ∂f/∂b` at `b̂`, the
-/// block-diagonal prior `Σ_b = blkdiag(Ω, Ω_IOV × K)`, and `IPRED = f(b̂)`.
-///
-/// Built once by [`iov_linearization`] and consumed by both the IOV marginal
-/// ([`foce_subject_nll_iov`]) and the post-fit CWRES (#1948), so the residual NONMEM
-/// tables as `CWRES` linearizes over the same random effects the objective integrates
-/// — NONMEM treats an occasion κ as one more `ETA`. Before #1948 CWRES used η alone:
-/// the `H_κ·κ̂` part of `f0` stayed in the residual and `H_κ·Ω_IOV·H_κᵀ` was missing
-/// from `R̃`.
+/// The linearization an IOV subject is scored and diagnosed on: joint EBE
+/// `b̂ = [η̂, κ̂₁, …, κ̂_K]`, `H_full = ∂f/∂b` at `b̂`, `Σ_b = blkdiag(Ω, Ω_IOV × K)` and
+/// `IPRED = f(b̂)`. Built once by [`iov_linearization`] for both the IOV marginal and
+/// post-fit CWRES, so CWRES linearizes over κ as NONMEM does (#1948).
 pub(crate) struct IovLinearization {
     /// `f(η̂, κ̂)` through the continuous per-occasion prediction (`pk::predict_iov`).
     pub(crate) ipreds: Vec<f64>,
@@ -3645,13 +3276,9 @@ fn nested_kappa_fd_forced() -> bool {
     false
 }
 
-/// Build the subject's [`IovLinearization`], or `None` when `kappas` does not hold
-/// exactly one width-`n_iov` vector per occasion group.
-///
-/// That mismatch never comes out of the EBE pipeline. It would silently leave the
-/// unmatched occasions' ipreds (and H columns) at 0.0, so each caller maps `None` to
-/// its own refusal: the marginal to the large finite sentinel (mirroring the guards in
-/// `individual_nll_iov`), the CWRES pass to `NaN`.
+/// Build the subject's [`IovLinearization`], or `None` when `kappas` does not hold one
+/// width-`n_iov` vector per occasion group (never from the EBE pipeline; callers map
+/// it to the sentinel or to `NaN` CWRES).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn iov_linearization(
     model: &CompiledModel,
@@ -3679,14 +3306,10 @@ pub(crate) fn iov_linearization(
     let k_occ = layout.n_groups();
     let n_b = layout.n_stacked();
 
-    // ipreds at the joint EBE via the continuous, per-occasion-aware prediction
-    // (proper cross-occasion carryover; issue #104), plus the augmented
-    // H-matrix. BSV columns come from the passed-in H; the κ columns are the exact
-    // stacked recording's below (central differences only where it declines).
-    // Because κ_k changes occasion-k's clearance, it affects occasion-k's
-    // observations AND the carryover into later occasions — so a κ column is
-    // dense across rows, as the continuous prediction's derivative is
-    // (the old Option-A version wrote κ_k only on occasion-k's rows).
+    // ipreds at the joint EBE via the continuous per-occasion prediction (cross-occasion
+    // carryover, #104), plus the augmented H. BSV columns from the passed-in H; κ columns
+    // from the exact stacked recording (central differences where it declines). A κ
+    // column is dense across rows: κ_k also affects carryover into later occasions.
     let kappa_slices: Vec<Vec<f64>> = kappas.iter().map(|k| k.as_slice().to_vec()).collect();
     // One layout and one scratch for the 2·n_b + 1 predictions below (#2037): the layout
     // depends on the subject alone, and each prediction rewrites every scratch event.
@@ -3875,12 +3498,10 @@ pub(crate) fn foce_subject_nll_iov_linearized(
     )
 }
 
-/// The parts of an IOV subject's [`foce_subject_nll_iov_linearized`] contribution, recorded
-/// by the branch that computes it, as [`foce_subject_contribution_parts`] records them for
-/// a subject without κ (#2267 review r6). The marginal is over the stacked `[η, κ]`
-/// system, so `random-effect prior` is `½(b̂ᵀΣ_b⁻¹b̂ + ln|Σ_b|)` over both, and the
-/// curvature and FOCE's `R̃` carry the κ columns of `H`. A subject the marginal refuses
-/// for its FREM rows has the one part `IOV + FREM refusal`.
+/// The parts of an IOV subject's [`foce_subject_nll_iov_linearized`] contribution, as
+/// [`foce_subject_contribution_parts`] records them without κ (#2267). `random-effect
+/// prior` is over the stacked `[η, κ]`; curvature and `R̃` carry κ columns. A FREM
+/// refusal has the one part `IOV + FREM refusal`.
 pub(crate) fn foce_subject_iov_contribution_parts(
     model: &CompiledModel,
     subject: &Subject,
@@ -3929,22 +3550,11 @@ fn foce_subject_nll_iov_linearized_split(
     let (k_occ, n_eta, n_iov) = (*k_occ, *n_eta, *n_iov);
     let eta_hat = &b_hat.as_slice()[..n_eta];
 
-    // The augmented system is now an ordinary FOCE/FOCEI marginal: κ is
-    // integrated out through R̃ exactly like η, so no separate κ prior is
-    // added (doing so would double-count the random-effect penalty).
-    // M3 no longer force-promotes IOV-FOCE subjects to interaction (#591, mirroring the
-    // non-IOV `foce_subject_nll` change in #367/8abadbb7): plain FOCE keeps a consistent
-    // FOCE (Sheiner–Beal) objective for the whole subject — the censored rows leave the
-    // linearized augmented marginal and re-enter through `foce_subject_nll_standard` as the
-    // marginal tail `−logΦ((LLOQ−f0)/√R̃ⱼⱼ)`, R̃ⱼⱼ = Hⱼ Σ_b Hⱼᵀ + R⁰ⱼ over the stacked
-    // [η, κ] system (#646, the same linearized-marginal moments the quantified rows use).
-    // FOCEI still takes the interaction path. FOCE-IOV-M3 and FOCEI-IOV-M3 are genuinely different
-    // optima, matching NONMEM METHOD=1 LAPLACE with vs without INTER. (Previously a
-    // censored subject was silently evaluated with η-interaction even under FOCE, mixing a
-    // Sheiner–Beal marginal with a FOCEI censored term.) The censored rows are now routed
-    // by the `interaction` flag alone — `foce_subject_nll_standard` carries the M3 `−logΦ`
-    // term for the non-interaction path — so there is no `m3_active` gate here (the non-IOV
-    // `foce_subject_nll`, including its TTE branch, drops the promotion the same way).
+    // κ is integrated out through R̃ like η, so no separate κ prior (it would double
+    // count). M3 does not promote IOV-FOCE to interaction (#591, as #367 for non-IOV):
+    // censored rows re-enter via `foce_subject_nll_standard` as
+    // `−logΦ((LLOQ−f0)/√R̃ⱼⱼ)` over the stacked system (#646); FOCEI takes the interaction
+    // path. Routing is by `interaction` alone, so no `m3_active` gate here.
     let p_obs_iov = if model.is_sde() {
         ekf_p_obs(model, subject, theta, eta_hat, sigma_values)
     } else {
@@ -3959,11 +3569,9 @@ fn foce_subject_nll_iov_linearized_split(
     }
     // Per-observation custom residual magnitude (#484); η/κ-independent.
     let ruv_mult = model.ruv_obs_mult(subject, theta);
-    // A subject's non-Gaussian records (TTE, the discrete family): their data term and their
-    // curvature, which read BSV η only, enter the stacked marginal over the BSV block — the
-    // non-IOV marginal's `with_tte` form over `[η, κ]`. Before, the IOV marginal dropped
-    // them while its inner objective (`individual_nll_iov`) scored them, so the objective
-    // the outer loop minimised was not the one its EBE was the mode of.
+    // Non-Gaussian records (TTE, discrete) read BSV η only and enter the stacked marginal
+    // over the BSV block, so the outer objective matches the one `individual_nll_iov`'s
+    // EBE is the mode of.
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
         let eta_bsv = DVector::from_column_slice(eta_hat);
@@ -3992,12 +3600,9 @@ fn foce_subject_nll_iov_linearized_split(
     // A dense `R` here is a `correlation … by` line (#1082 PR5), whose ρ is a θ, or a
     // `block_sigma` off-diagonal (#979), whose live ρ the caller passes in `residual_cov`.
     if interaction {
-        // The non-IOV dispatcher's predicate (`foce_subject_nll_cov`): a dense `R` takes
-        // the dense-R interaction marginal, over the stacked `[η, κ…]` system, so
-        // `R̃ = H Σ_b Hᵀ + R` carries both every level's block and `R`'s off-diagonal —
-        // except a subject with censored rows, which that dispatcher and the IOV EBE search
-        // (`individual_nll_iov_frozen_in`) both score row-wise; the marginal must too, or
-        // the objective is not the one its EBE minimised.
+        // As `foce_subject_nll_cov`: dense `R` takes the dense interaction marginal over the
+        // stacked `[η, κ…]` system, except censored subjects, scored row-wise both here and
+        // in the IOV EBE search (`individual_nll_iov_frozen_in`).
         let rowwise = model.bloq_in_force().has_censored_row(&subject.cens);
         if !residual_cov.is_dense() || rowwise {
             foce_subject_nll_interaction_split(
@@ -4033,11 +3638,8 @@ fn foce_subject_nll_iov_linearized_split(
             )
         }
     } else {
-        // FOCE (no interaction): evaluate R at the population prediction with
-        // all random effects zero (η=0, κ=0), matching the non-IOV marginal so
-        // the zero-κ / Ω_iov→0 reduction collapses exactly to the BSV marginal.
-        // Additive error keeps f0 (bit-identical).
-        // `kappas` has one length-`n_iov` vector per occasion (checked above).
+        // FOCE: R at f(η=0, κ=0), matching the non-IOV marginal so Ω_iov→0 reduces exactly.
+        // Additive error keeps f0 (bit-identical). `kappas` has one vector per occasion.
         let pop_preds = population_variance_preds_iov(model, subject, theta, n_eta, n_iov, k_occ);
         foce_subject_nll_standard_split(
             subject,
@@ -4073,13 +3675,8 @@ pub fn foce_population_nll_iov(
     sigma_values: &[f64],
     interaction: bool,
 ) -> f64 {
-    // Compute each subject's NLL in parallel, then reduce in a fixed subject
-    // order. rayon's `ParallelIterator::sum` folds partial sums along split
-    // boundaries that depend on the worker-thread count, and f64 addition is
-    // not associative — so a bare `.sum()` yields a thread-count-dependent OFV
-    // (e.g. 4 vs 15 threads). Collecting into an ordered `Vec` and summing
-    // serially makes the objective bit-reproducible regardless of thread count
-    // while keeping the expensive per-subject work parallel (#703).
+    // Per-subject NLLs in parallel, summed serially in subject order: rayon's `sum`
+    // depends on thread count and f64 addition is not associative (#703).
     let per_subj: Vec<f64> = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
         let kappas = if i < kappas_per_subject.len() {
@@ -4103,12 +3700,9 @@ pub fn foce_population_nll_iov(
     per_subj.iter().sum()
 }
 
-/// Population FOCE objective: sum over all subjects
-///
-/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
-/// (#1081) is **not** applied here, so such a model is scored with independent
-/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
-/// carries it.
+/// Population FOCE objective: sum over all subjects. Takes `block_sigma` ρ only; a
+/// `correlation … by COL` line (#1081) is **not** applied (`fit()` uses the in-crate
+/// form that carries it).
 #[allow(clippy::too_many_arguments)]
 pub fn foce_population_nll(
     model: &CompiledModel,
@@ -4169,47 +3763,21 @@ pub(crate) fn foce_population_nll_cov(
     per_subj.iter().sum()
 }
 
-/// Compute CWRES (Conditional Weighted Residuals) for a subject — Hooker et
-/// al. (2007), NONMEM's `CWRES` table item.
+/// CWRES (Hooker et al. 2007, NONMEM's `CWRES`) for a subject: the **decorrelated**
+/// residual `R̃^{-1/2}(y − f0)` with `f0 = f(η̂) − H·η̂`, `R̃ = H·Ω·Hᵀ + R` and the
+/// *symmetric* inverse square root (eigendecomposition). `R` is at `r_preds` when given
+/// (`IPRED` under interaction, `f(η = 0)` under FOCE), else at `f0`.
 ///
-/// The residual is `y − f0` with `f0 = f(η̂) − H·η̂`, the FOCE-linearized
-/// population prediction, and its covariance is `R̃ = H·Ω·Hᵀ + R`. The
-/// returned vector is the **decorrelated** residual `R̃^{-1/2}(y − f0)`, with
-/// `R̃^{-1/2}` the *symmetric* inverse square root (eigendecomposition), not
-/// `(y − f0)ⱼ / √R̃ⱼⱼ` and not the Cholesky factor. `R` is evaluated at
-/// `r_preds` when given — `IPRED` under an interaction fit, the population
-/// prediction `f(η = 0)` under FOCE without interaction, the points the
-/// respective marginals use — and at `f0` otherwise.
+/// Pinned against NONMEM 7.5.1 (40-subject oral, #1182): reproduces its `CWRES` to RMS
+/// 1e-4 (table rounding), where marginal standardisation was off by 0.75 and Cholesky
+/// by 0.57.
 ///
-/// That recipe was pinned against NONMEM 7.5.1 on a 40-subject oral dataset
-/// with sizeable η (#1182): rebuilt from NONMEM's own tabled `G11..G31`,
-/// `ETA`, `IPRED` and `PRED`, the symmetric square root with `R` at `IPRED`
-/// reproduces its `CWRES` column to an RMS of 1e-4 (the table's rounding),
-/// where the marginal standardisation ferx used before was off by an RMS of
-/// 0.75 and a Cholesky decorrelation by 0.57 — differences large enough to
-/// change which residual-error form a CWRES-based screen (ruvsearch's) picks.
-/// A model with no η has `R̃` diagonal, so every recipe agrees there.
+/// Under IOV pass the stacked forms (`eta_hat = b̂`, `h_matrix = ∂f/∂b`,
+/// `omega = blkdiag(Ω, Ω_IOV × K)`), as the fit's sdtab does (#1948).
 ///
-/// Under inter-occasion variability the random effects are `b = [η, κ₁, …, κ_K]`,
-/// and the arguments are their stacked forms: `eta_hat = b̂`, `h_matrix = ∂f/∂b`
-/// and `omega = blkdiag(Ω, Ω_IOV × K)` — the system [`foce_subject_nll_iov`]
-/// integrates, which is what the fit's sdtab passes (#1948). NONMEM treats an
-/// occasion κ as one more `ETA`, so its `CWRES` linearizes over all of `b`;
-/// passing η alone leaves `H_κ·κ̂` in the residual and drops `H_κ·Ω_IOV·H_κᵀ`
-/// from `R̃`. Under FOCE without interaction `r_preds` is then `f(η = 0, κ = 0)`.
-///
-/// Rows censored **for this fit** — `CENS != 0` under `bloq_method = m3`, never
-/// under `drop`, see [`BloqMethod::is_censored_row`] — get `NaN`, since a
-/// weighted Gaussian residual is undefined when the observed value is censored,
-/// and are left out of the decorrelation. Under `drop` a `CENS != 0` row is an
-/// ordinary observation the likelihood scored at its `DV`, so it stays in the
-/// system: gating on the raw flag instead blanked it *and* shifted every other
-/// CWRES of that subject, because the decorrelation mixes rows (#1499).
-///
-/// Takes the `block_sigma` correlations only: a model's `correlation … by COL` line
-/// (#1081) is **not** applied here, so such a model is scored with independent
-/// residuals. `fit()` and the post-fit diagnostics use the in-crate form that
-/// carries it.
+/// Rows censored **for this fit** ([`BloqMethod::is_censored_row`]) get `NaN` and are
+/// left out of the decorrelation; under `drop` a `CENS != 0` row stays (#1499). Takes
+/// `block_sigma` ρ only; a `correlation … by COL` line (#1081) is **not** applied.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_cwres(
     subject: &Subject,
@@ -4329,15 +3897,9 @@ pub(crate) fn compute_cwres_cov(
     }
     let r_tilde = compute_r_tilde_with_r(h_matrix, &omega.matrix, &r_matrix);
 
-    // CWRES = R̃^{-1/2} (y − f0) over the uncensored rows, with the symmetric
-    // inverse square root: R̃ = V·Λ·Vᵀ, R̃^{-1/2} = V·Λ^{-1/2}·Vᵀ. This is the
-    // decorrelation NONMEM's `CWRES` applies (see the doc comment); a Cholesky
-    // factor decorrelates too but yields a different vector, and the marginal
-    // `(y − f0)ⱼ / √R̃ⱼⱼ` a third — the three agree only when `H·Ω·Hᵀ` has no
-    // off-diagonals, i.e. with no η. Rows censored for this fit are left out of
-    // the system and reported as NaN; a non-positive eigenvalue (a hand-built
-    // pathological input) falls back to the marginal standardisation rather than
-    // panicking.
+    // Symmetric inverse square root R̃ = V·Λ·Vᵀ, R̃^{-1/2} = V·Λ^{-1/2}·Vᵀ (NONMEM's
+    // decorrelation; see the doc comment) over uncensored rows. A non-positive eigenvalue
+    // falls back to marginal standardisation rather than panicking.
     let live: Vec<usize> = (0..n_obs)
         .filter(|&j| !bloq_method.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)))
         .collect();
@@ -4390,26 +3952,11 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
         .collect()
 }
 
-/// IOV kappa groups for a subject.
-///
-/// Observation occasions keep the historical [`split_obs_by_occasion`] order. Dose
-/// occasions that have no sampled observations are appended in first-dose order with an
-/// empty observation-index list. This preserves existing stacked-kappa ordering for the
-/// common case while assigning dose-only occasions their own axes, so dose carryover into
-/// later observations can be differentiated analytically.
-///
-/// Occasions carried only by pk-only rows (`EVID=2` / `EVID=0, MDV=1`,
-/// `Subject::pk_only_occasions`) come last, in file order, also with an empty list. Such a
-/// row runs `$PK` under its own occasion (#1876) and governs the interval ending at it, so
-/// its κ moves every later prediction; NONMEM gives that occasion an `ETA` like any other.
-/// Without a group here the row would fall back to κ = 0.
-///
-/// Occasions carried only by EVID=3/4 reset rows (`Subject::reset_occasions`) come after
-/// those, in file order, by the same rule (#1153). A reset row runs `$PK` under its own
-/// occasion (#1133) and re-seeds `init(...)` / `[initial_conditions]` from it, so its κ
-/// moves every prediction after the reset; NONMEM gives that occasion an `ETA` too
-/// (`nonmem_anchor/reset_init_snapshot_K*.ctl`). With this, every labelled record of
-/// every kind has a group, and κ = 0 is left only for a record with no label at all.
+/// IOV kappa groups for a subject: observation occasions in [`split_obs_by_occasion`]
+/// order, then dose-only occasions (first-dose order), then occasions carried only by
+/// pk-only rows (`EVID=2` / `MDV=1`, #1876), then only by EVID=3/4 reset rows (#1153),
+/// each with an empty observation list. Each of those rows runs `$PK` under its own
+/// occasion and NONMEM gives it an `ETA`, so κ = 0 is left only for unlabelled records.
 pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     let mut groups = split_obs_by_occasion(subject);
     let mut seen: std::collections::HashSet<u32> = groups.iter().map(|(occ, _)| *occ).collect();
@@ -4426,30 +3973,13 @@ pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
     groups
 }
 
-/// Whether any scored observation can read each [`iov_occasion_groups`] entry's κ,
-/// parallel to that list (#1911).
-///
-/// A group that owns an observation is informed. A group with none — a dose-only
-/// occasion, or one only pk-only or reset rows carry — can reach a prediction only through
-/// state carried forward in time, so:
-///
-/// - with `carries_state = false` (a compartment-free, `$PRED`-style model, whose every
-///   prediction reads its own record's parameters alone) it is never informed — the MBMA
-///   arm-visit reported only as an `MDV = 1` row;
-/// - otherwise it acts from its first record onward (a dose's carryover; the interval a
-///   pk-only row closes; the baseline a reset re-seeds), so it is informed exactly when
-///   some observation sits at or after that record's time.
-///
-/// A reset row counts as such a record only when `reset_reseeds`: its κ reaches a
-/// prediction through nothing but the `init(...)` it re-seeds (the segment ending at a
-/// reset is discarded), so on a closed-form model, whose resets read no parameters, and
-/// on an ODE model with no `init(...)`, whose resets zero the state, an occasion only a
-/// reset row carries is uninformed (#1153 review r1 #1). An `init(...)` that reads no
-/// κ-bearing parameter still counts — conservative, like the tie below.
-///
-/// An uninformed group's κ̂ is the prior mode 0 and it leaves the objective unchanged.
-/// The time rule is conservative at a tie (an observation at the record's own time
-/// counts), so it only ever drops groups the data cannot see.
+/// Whether any scored observation can read each [`iov_occasion_groups`] entry's κ
+/// (#1911). A group owning an observation is informed. Otherwise, with
+/// `carries_state = false` (`$PRED`-style) it never is; else it is informed when some
+/// observation sits at or after its first record (a tie counts — conservative). A
+/// reset row counts only when `reset_reseeds` (its κ reaches predictions only through
+/// `init(...)`, #1153). An uninformed κ̂ is the prior mode 0 and leaves the objective
+/// unchanged.
 pub(crate) fn iov_group_informed(
     subject: &Subject,
     carries_state: bool,
@@ -4521,11 +4051,9 @@ pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashM
         .collect()
 }
 
-/// The combined effect vector `[η_bsv, κ_g]` for occasion group `g`, sliced from a
-/// subject's stacked `[η_bsv, κ₁..κ_K]` vector. The κ-axis offset itself is owned by
-/// `stats::stacked_layout` (`kappa_offset`, #1082); this keeps its public signature and
-/// delegates there, so the closed-form and ODE IOV providers cannot seed κ onto different
-/// axes (#466 review round 2).
+/// `[η_bsv, κ_g]` for occasion group `g`, sliced from the stacked
+/// `[η_bsv, κ₁..κ_K]`. The offset is owned by `stats::stacked_layout` (`kappa_offset`,
+/// #1082) so closed-form and ODE IOV providers agree.
 pub fn iov_combined_effect(
     stacked_eta: &[f64],
     n_eta: usize,
@@ -4539,14 +4067,8 @@ pub fn iov_combined_effect(
     c
 }
 
-/// The combined effect vector `[η_bsv, 0…0]` — the κ=0 counterpart of
-/// [`iov_combined_effect`], for an event with no occasion group. A pk-only (EVID=2 or
-/// EVID=0/MDV=1) row runs under its own occasion's group since #1876; this is the vector
-/// for one with no resolvable occasion, an unlabelled in-memory row on a subject where no
-/// record carries a label (matching production `predict_iov`'s
-/// `combined_for(u32::MAX)` miss). Shares the stacked-η layout with [`iov_combined_effect`]
-/// so the closed-form and ODE IOV providers cannot seed the κ=0 block differently (#598
-/// review).
+/// `[η_bsv, 0…0]` — the κ=0 counterpart of [`iov_combined_effect`] for an event with
+/// no resolvable occasion (matching `predict_iov`'s `combined_for(u32::MAX)` miss).
 pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
@@ -4556,7 +4078,8 @@ pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -
 
 /// Build a block-diagonal omega from BSV omega and K copies of IOV omega.
 /// Used for the extended H-matrix in the FOCE outer loop with IOV.
-pub fn build_block_diag_omega(
+#[cfg(test)]
+pub(crate) fn build_block_diag_omega(
     omega_bsv: &DMatrix<f64>,
     omega_iov: &DMatrix<f64>,
     n_occasions: usize,
@@ -4564,23 +4087,12 @@ pub fn build_block_diag_omega(
     crate::stats::stacked_layout::block_diag_stack(omega_bsv, omega_iov, n_occasions)
 }
 
-/// IOV-aware individual NLL: uses per-occasion kappas.
+/// IOV-aware individual NLL with per-occasion kappas (`kappas[k]` in
+/// `iov_occasion_groups` order; empty falls back to [`individual_nll`]).
 ///
-/// `kappas[k]` is the kappa vector for the k-th unique occasion (in the order
-/// returned by `iov_occasion_groups`).  When `kappas` is empty, falls back
-/// to the standard (no-IOV) `individual_nll` path.
-///
-/// **Cross-occasion dose carryover (issue #104).** Predictions are computed by
-/// [`pk::predict_iov`], which builds per-event PK parameters carrying each
-/// event's occasion kappa and propagates the compartment amounts continuously
-/// across occasion boundaries (via the event-driven solver). A dose given in an
-/// earlier occasion therefore decays through a later occasion with the *later*
-/// occasion's clearance — matching NONMEM's integration model. This replaced
-/// the earlier "Option A" superposition, which scored each occasion against the
-/// whole dose history with a single clearance and biased the likelihood on
-/// no-washout designs. The FD Jacobian (`compute_jacobian_fd_iov`) and the
-/// augmented marginal (`foce_subject_nll_iov`) use the same prediction, so NLL
-/// and gradients stay consistent.
+/// Predictions come from [`pk::predict_iov`], which carries amounts continuously
+/// across occasions, so an earlier dose decays with the later occasion's clearance as
+/// in NONMEM (#104). The FD Jacobian and `foce_subject_nll_iov` use the same prediction.
 pub fn individual_nll_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -4633,13 +4145,8 @@ pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
 }
 
 /// [`individual_nll_iov_with_scratch`] with the subject's cached
-/// [`EventSchedule`](pk::event_driven::EventSchedule).
-///
-/// Without this the IOV arm of the SAEM E-step held a schedule cache it could
-/// not hand to anything: `predict_iov` took no schedule, so every MH proposal on
-/// an IOV model rebuilt the merged event sort it was built to avoid (#1452
-/// review). `None` reproduces the previous behaviour exactly, and is what a
-/// subject the shared `cacheable_schedule` gate declines still gets.
+/// [`EventSchedule`](pk::event_driven::EventSchedule) (#1452). `None` reproduces the
+/// uncached behaviour.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     model: &CompiledModel,
@@ -4669,9 +4176,7 @@ pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
 }
 
 /// [`individual_nll_iov_with_scratch_and_schedule`] with an optional frozen residual
-/// variance — the IOV twin of [`individual_nll_into_prepared_with_schedule_frozen`]
-/// (#1722). `frozen_var_preds = Some(f₀)` (from [`population_variance_preds_iov`])
-/// scores each non-FREM row's variance at `f₀[j]`, without the `iiv_on_ruv` scale;
+/// variance — IOV twin of [`individual_nll_into_prepared_with_schedule_frozen`] (#1722);
 /// `None` is bit-identical to the conditional objective.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
@@ -4731,10 +4236,8 @@ pub(crate) fn quad_form(m: &DMatrix<f64>, v: &[f64]) -> f64 {
 
 /// [`individual_nll_iov_frozen`] over a caller-built `layout`
 /// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)),
-/// so the EBE search builds the subject's layout once rather than once per objective
-/// evaluation (#2037). `residual_cov` is the residual structure the data term scores:
-/// the live `block_sigma` off-diagonals for the FOCE/FOCEI EBE search (#979), the
-/// declaration (`CompiledModel::residual_cov_theta`) for every other caller.
+/// built once per EBE search (#2037). `residual_cov`: live `block_sigma` ρ for the
+/// FOCE/FOCEI EBE search (#979), the declaration for every other caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     model: &CompiledModel,
@@ -4912,13 +4415,9 @@ mod endpoint_order_tests;
 mod tests {
     use super::*;
 
-    /// The IOV marginal scores a subject's non-Gaussian records. Pinned by an exact
-    /// reduction to the non-IOV marginal, whose TTE and binary terms are NONMEM-anchored: `κ`
-    /// only on a parameter no scored record reads, `κ̂ = 0`, so the stacked system's κ block
-    /// adds `½(ln|Ω_IOV| + ln|Ω_IOV⁻¹|) = 0` per group and the two marginals are one number —
-    /// for a TTE and a binary endpoint, under both interaction settings. Before the fix the
-    /// IOV marginal dropped the term (it reduced to the subject with its records deleted),
-    /// while its inner objective kept it.
+    /// The IOV marginal scores non-Gaussian records: with κ on a parameter no record reads
+    /// (κ̂ = 0) it equals the NONMEM-anchored non-IOV marginal, for TTE and binary, under
+    /// both interaction settings.
     #[cfg(feature = "survival")]
     #[test]
     fn the_iov_marginal_scores_the_non_gaussian_term() {
@@ -5237,12 +4736,8 @@ mod tests {
         assert!((ferx_ofv - nonmem_ofv).abs() < 1e-6);
     }
 
-    /// #1496, site `m3_logcdf` (`cens < 0`): a `CENS` flag outside -1/0/1 is scored
-    /// by its sign alone — `7` exactly as `1`, `-2` exactly as `-1` — which is what
-    /// `W_CENS_UNEXPECTED` tells the user. The test above uses only ±1, so it catches
-    /// a swapped tail but not a site that tests `cens == -1` instead of `cens < 0`;
-    /// this one does. The two tails differ at this point (z = ∓1), so neither
-    /// equality holds because the tails happen to agree.
+    /// #1496, `m3_logcdf` (`cens < 0`): an out-of-domain `CENS` scores by its sign (`7` as
+    /// `1`, `-2` as `-1`); the two tails differ here (z = ∓1).
     #[test]
     fn m3_logcdf_scores_an_out_of_domain_flag_by_its_sign() {
         let at = |cens: i8| m3_logcdf(10.0, 12.0, 2.0, cens);
@@ -5261,15 +4756,10 @@ mod tests {
         }
     }
 
-    /// #2762, the M3 callers of `log_normal_cdf`: a censored row whose limit lies so far on
-    /// the certain side that `z = (limit − f)/sd` passes `|z| ≈ 1.9e154` (where `normal_cdf`
-    /// squares it to `+∞`) scored a `NaN` term — measured end to end on
-    /// `examples/warfarin_bloq.ferx` at `3cd15863`: `LLOQ = 1e300` (CENS=1) or `ULOQ = −1e300`
-    /// (CENS=−1) on one row took the objective to the 2e20 divergence sentinel ("censored (M3)
-    /// term = NaN"). Its probability is 1, so the term is `0` — the same `0` a limit of `±1e6`
-    /// already scores, where `Φ` rounds to `1` without reaching the gate. Through the three
-    /// Gaussian objectives (conditional, FOCE and FOCEI marginals), the far limit must score
-    /// bit-for-bit as the near one.
+    /// #2762: an M3 limit so far on the certain side that `|z| ≈ 1.9e154` (`normal_cdf`
+    /// overflows) scored NaN (`warfarin_bloq.ferx`, `LLOQ = 1e300` → 2e20 sentinel). Its term
+    /// is `0`; through the conditional, FOCE and FOCEI objectives the far limit must score
+    /// bit-for-bit as a `±1e6` one.
     #[test]
     fn a_censored_limit_past_the_normal_cdf_overflow_scores_as_certain() {
         let theta = [5.0, 50.0];
@@ -5336,14 +4826,9 @@ mod tests {
         }
     }
 
-    /// #1496: the two claims `W_CENS_UNEXPECTED` makes about the objective, checked
-    /// against the objective rather than restated. Under `m3` an out-of-domain flag
-    /// scores as its sign's code (`7` as `1`, `-2` as `-1`); under `drop` any flag
-    /// scores as the quantified row it is at `0`. Through the three Gaussian
-    /// objectives the message speaks for: the conditional `individual_nll`, and the
-    /// FOCE and FOCEI marginals of `foce_subject_nll`. The straddle is asserted, so
-    /// no equality holds because two arms agree: under `m3`, `1`, `-1` and `0` score
-    /// three different ways on this subject.
+    /// #1496: `W_CENS_UNEXPECTED`'s two claims checked against the objective: under `m3` an
+    /// out-of-domain flag scores as its sign's code, under `drop` as a quantified row —
+    /// through `individual_nll` and the FOCE/FOCEI marginals; `1`, `-1`, `0` all differ.
     #[test]
     fn an_out_of_domain_cens_flag_scores_by_sign_under_m3_and_as_quantified_under_drop() {
         let theta = [5.0, 50.0];
@@ -5507,17 +4992,9 @@ mod tests {
         approx::assert_relative_eq!(got, expected, epsilon = 1e-9);
     }
 
-    /// #1029 degenerate oracle: `weight = W` reproduces the hand-built
-    /// study-as-subject construction — `DV/W` in the data, `PRED/W` in the
-    /// `[scaling]` block, `sigma FIX 1` in `[parameters]` — exactly.
-    ///
-    /// The two objectives differ only by the Jacobian of the `y ↦ y/W` change of
-    /// variable, `Σ_j ln W_j`. That is a data-only constant: identical for every
-    /// model fitted to the same rows with the same weight column, so it cancels
-    /// out of every ΔOFV, likelihood-ratio test, and AIC comparison. It appears
-    /// at all only because ferx scores on the *natural* scale, which is what
-    /// keeps DV / PRED / IPRED / CWRES and the VPC in reported units with no
-    /// back-transformation.
+    /// #1029 degenerate oracle: `weight = W` reproduces the hand-built study-as-subject
+    /// construction (`DV/W`, `PRED/W`, `sigma FIX 1`) up to the data-only Jacobian
+    /// `Σ_j ln W_j` of `y ↦ y/W`, which cancels from every ΔOFV.
     #[test]
     fn test_weighted_error_model_matches_the_hand_built_construction() {
         let src = |err: &str| {
@@ -5721,15 +5198,10 @@ mod tests {
         }
     }
 
-    /// #1911: a group without observations is informed iff an observation sits at or
-    /// after its first record. Observations run t = 1..6. Groups: OCC 1, 2 (own obs);
-    /// 3 dose-only at t = 2 (carryover reaches t = 3..6 → informed); 4 dose-only at
-    /// t = 10 (after every obs → not); 5 pk-only at t = 6 (tie with the last obs → kept,
-    /// the conservative side); 6 pk-only at t = 8 and 12 (first record after the obs →
-    /// not); 7 dose at t = 9 then pk-only at t = 1 (the EARLIEST record across both
-    /// kinds decides → informed). OCC 2 also gets a dose at t = 50, after its own
-    /// observations: a group that owns an observation is informed whatever its records'
-    /// times. Under `carries_state = false` only the two observation groups remain.
+    /// #1911: a group without observations is informed iff an observation sits at or after
+    /// its first record (obs t = 1..6): dose-only at 2 yes, at 10 no; pk-only at 6 (tie)
+    /// yes, at 8/12 no; dose 9 + pk-only 1 yes (earliest decides); an own-obs group is
+    /// always informed. Under `carries_state = false` only observation groups remain.
     #[test]
     fn test_iov_group_informed_by_first_record_time() {
         let mut subj = make_simple_subject();
@@ -5782,13 +5254,9 @@ mod tests {
         approx::assert_relative_eq!(base, iov, epsilon = 1e-10);
     }
 
-    /// The IOV individual NLL — SAEM's E-step evaluator, the Bayes MH target,
-    /// and the IOV importance-sampling weight — must apply the per-observation
-    /// residual magnitude (#484/#1029) exactly as the non-IOV path does. With no
-    /// kappas the two are the same likelihood, so any divergence is the
-    /// magnitude going missing on one side. A weight that *varies within the
-    /// subject* is what makes this bite: a frozen or dropped multiplier still
-    /// matches on the first row.
+    /// The IOV individual NLL (SAEM E-step, Bayes MH, IOV IS weight) applies the
+    /// per-observation residual magnitude (#484/#1029) as the non-IOV path does; a weight
+    /// varying within the subject makes it bite.
     #[test]
     fn test_individual_nll_iov_applies_the_residual_magnitude() {
         let model = crate::parser::model_parser::parse_model_string(
@@ -5831,16 +5299,8 @@ mod tests {
 
     #[test]
     fn test_individual_nll_finite_sentinel_on_nonfinite_eta() {
-        // Regression for issue #97: when the EBE search wanders into an extreme
-        // region (here a non-finite eta, standing in for an ODE blow-up), the
-        // NLL must return the large finite sentinel, never a non-finite value.
-        // A NaN/inf leaking out poisons the inner Nelder-Mead simplex sort and
-        // aborts the fit; this guard mirrors the existing non-finite Ω guard.
-        //
-        // Note the analytical PK path scrubs NaN via `.max()`/`.min()`
-        // (`NaN.max(1e-30) == 1e-30`), so the non-finiteness here enters through
-        // the eta-prior term `η'Ω⁻¹η`, which is exactly the quantity the inner
-        // optimizer drives.
+        // #97: a non-finite eta (standing in for an ODE blow-up) must give the finite
+        // sentinel. The analytical path scrubs NaN via `.max()`, so it enters through η'Ω⁻¹η.
         let model = make_model();
         let subj = make_simple_subject();
         let omega = make_omega(0.09);
@@ -5859,13 +5319,9 @@ mod tests {
         );
     }
 
-    /// #2269: the guards and every reader of the per-subject sentinel use one value.
-    /// Each guard below is driven to its sentinel and compared to
-    /// `SUBJECT_SENTINEL_NLL` with `==`, then the value is handed to the readers that
-    /// label it: Gauss–Newton's / AGQ's usability test must reject it, and
-    /// `W_NONFINITE_OBJECTIVE` must call a population holding one such subject "at the
-    /// divergence sentinel". A guard returning any other value (say a re-typed `1e21`)
-    /// fails the `==`; a reader comparing against its own copy fails the label.
+    /// #2269: each guard returns exactly `SUBJECT_SENTINEL_NLL`, and its readers
+    /// (Gauss–Newton / AGQ usability, `W_NONFINITE_OBJECTIVE` "divergence sentinel" label)
+    /// recognise it.
     #[test]
     fn subject_sentinel_guards_and_readers_agree() {
         let model = make_model();
@@ -5935,20 +5391,10 @@ mod tests {
         );
     }
 
-    /// #2269: no per-subject guard spells the sentinel as a bare literal again, so it
-    /// cannot drift from `SUBJECT_SENTINEL_NLL`. Scans the production code of every
-    /// file under `src/` — not comments, string literals, `*_tests.rs` siblings or
-    /// top-level `mod tests` blocks — so a new writer anywhere is caught, not only in
-    /// a list someone remembered to extend.
-    ///
-    /// `POPULATION_OBJECTIVE_FILES` are the exceptions, each for a stated reason: their
-    /// `1e20`s clamp a *population* objective handed to an outer or M-step optimizer
-    /// (the outer OFV, the profile / trust-region / mu-ref / SAEM-mixture / IMPMAP
-    /// M-step objectives, the presearch and cancel returns), a different quantity on a
-    /// different scale that happens to share the spelling; or, for `io/fitrx.rs`, a
-    /// formatting round-trip value. A per-subject writer added to one of them is not
-    /// caught here. `saem.rs` is not on the list: its Score-SA gate reads
-    /// `obs_nll_sum`, a sum of per-subject scores, so the whole file uses the constant.
+    /// #2269: no per-subject guard spells the sentinel as a bare literal. Scans production
+    /// code under `src/` (not comments, strings, `*_tests.rs` or `mod tests`).
+    /// `POPULATION_OBJECTIVE_FILES` are exceptions whose `1e20`s clamp a *population*
+    /// objective (or, in `io/fitrx.rs`, a formatting value). `saem.rs` uses the constant.
     #[test]
     fn no_bare_sentinel_literal_in_guard_files() {
         const POPULATION_OBJECTIVE_FILES: [&str; 7] = [
@@ -6280,13 +5726,8 @@ mod tests {
         approx::assert_relative_eq!(dense_mult, dense, max_relative = 1e-9);
     }
 
-    /// Regression for the FOCE+proportional fix: the residual variance must be
-    /// evaluated at a supplied population prediction `f(η=0)`, not the
-    /// SB-linearized `f0 = ipred − H·η̂`. When `f0` crosses zero (a nonlinear
-    /// model's linearization undershooting), `R(f0) = (f0·σ)²` collapses to the
-    /// floor and that observation's huge weight blows up the marginal — the
-    /// pathology that made FOCE+proportional multimodal with an indefinite
-    /// covariance. Passing `r_pred_override = Some(positive preds)` must avoid it.
+    /// FOCE+proportional: R is evaluated at a supplied `f(η=0)`, not the SB-linearized
+    /// `f0`, whose zero crossing collapses `R(f0)` to the floor.
     #[test]
     fn foce_standard_variance_uses_override_not_zero_crossing_f0() {
         let subject = make_simple_subject(); // 6 obs
@@ -6332,12 +5773,8 @@ mod tests {
         );
 
         assert!(nll_override.is_finite() && nll_f0.is_finite());
-        // The f0 path's near-floored first-observation variance inflates the
-        // marginal above the override path (which weights by the true ~positive
-        // prediction). The two differ by a clear, deterministic margin (~56 on
-        // this construction) — confirming R is evaluated at the override, not f0.
-        // (The HΩH' term in R̃ cushions the floored R(f0), so the gap is moderate
-        // rather than catastrophic, but it is well above FP noise.)
+        // The f0 path's floored variance inflates the marginal by a clear margin (~56 here);
+        // HΩH' cushions it, but it is far above FP noise.
         assert!(
             nll_f0 - nll_override > 20.0,
             "override must change the SB marginal (R evaluated at f(η=0), not f0): \
@@ -6345,12 +5782,8 @@ mod tests {
         );
     }
 
-    /// #646: FOCE (Sheiner–Beal) M3 censored rows must use the linearized-marginal
-    /// variance `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰`, not the conditional residual `R⁰`. With the
-    /// quantified rows' Jacobian zeroed, the quant SB marginal `R̃ = R` is
-    /// Ω-independent, so the objective can only depend on Ω through the censored
-    /// row's marginal variance. The old conditional censored term (√R⁰) would give
-    /// an identical NLL for any Ω; the marginal term must not.
+    /// #646: FOCE M3 censored rows use `R̃ⱼⱼ = Hⱼ Ω Hⱼᵀ + R⁰`, not `R⁰`. With quantified
+    /// rows' Jacobian zeroed, only the censored row can make the NLL depend on Ω.
     #[test]
     fn foce_m3_censored_uses_marginal_variance() {
         let mut subject = make_simple_subject();
@@ -6391,12 +5824,8 @@ mod tests {
         );
     }
 
-    /// Regression for the FREM r_diag merge collision: `frem_r_override` must
-    /// reach the residual-variance diagonal that feeds R̃, even though
-    /// `r_pred_override` re-evaluates R afterward. Before the fix the override
-    /// loop ran on a `r_diag` that was immediately shadowed and discarded, so
-    /// FREM covariate rows silently used the PK error variance and the marginal
-    /// was identical with or without the override.
+    /// FREM r_diag merge collision: `frem_r_override` must reach the diagonal feeding R̃
+    /// even though `r_pred_override` re-evaluates R afterward.
     #[test]
     fn foce_standard_applies_frem_r_override() {
         let subject = make_simple_subject(); // 6 obs
@@ -6453,18 +5882,10 @@ mod tests {
         assert_eq!(combined[(0, 2)], 0.0); // off-block must be zero
     }
 
-    /// Algebraic identity check: under additive (η-independent R) error, the
-    /// Almquist `½·c̃'·c̃` INTER correction is identically zero, so
-    /// `H̃ = a'·diag(1/R)·a + Ω⁻¹`. We hand-compute the closed-form Laplace
-    /// value from the same H, R, η̂ and assert bit-for-bit agreement with
-    /// `foce_subject_nll_interaction`.
-    ///
-    /// (Replaces the previous `test_focei_matches_foce_when_r_is_eta_independent`,
-    /// which asserted FOCEI INTER == FOCE non-INTER exactly under additive
-    /// error. That identity only holds for the Sheiner–Beal form; the
-    /// Almquist Laplace form NONMEM/nlmixr2 use does *not* satisfy it because
-    /// the two forms approximate the same true marginal differently for
-    /// nonlinear models. See `[[focei-laplace-not-sheiner-beal]]`.)
+    /// Under additive error the Almquist `½·c̃'·c̃` correction is zero, so
+    /// `foce_subject_nll_interaction` equals the hand-computed
+    /// `a'·diag(1/R)·a + Ω⁻¹` Laplace value bit for bit. (FOCEI ≠ FOCE here: that identity
+    /// holds only for the Sheiner–Beal form.)
     #[test]
     fn test_focei_laplace_additive_matches_handcomputed_hessian() {
         let subj = make_simple_subject();
@@ -6531,12 +5952,8 @@ mod tests {
         );
     }
 
-    /// IIV on residual error (#409): with a *dedicated* residual-error eta and
-    /// additive error, predictions do not depend on that eta (so its `H`/`a`
-    /// column is zero), but the FOCEI marginal must (a) scale R by exp(2·η̂_ruv)
-    /// in the data term and (b) add the constant `c̃_{j,ruv}=2` column to the
-    /// `½·c̃'·c̃` curvature, giving `H̃ = 0.5·(4·n_obs) + Ω⁻¹ = 2·n_obs + 1/ω`.
-    /// We hand-compute the whole marginal and assert bit-for-bit agreement.
+    /// IIV on RUV (#409): a dedicated residual eta with additive error scales R by
+    /// exp(2·η̂_ruv) and adds `c̃_{j,ruv}=2`, so `H̃ = 2·n_obs + 1/ω`; hand-computed, bit for bit.
     #[test]
     fn test_focei_iiv_on_ruv_matches_handcomputed() {
         let subj = make_simple_subject();
@@ -6649,12 +6066,8 @@ mod tests {
         assert_relative_eq!(cwres[1], frem_expected, epsilon = 1e-12);
     }
 
-    /// #1182: CWRES is the *decorrelated* conditional weighted residual —
-    /// `R̃^{-1/2}(y − f0)` with the symmetric inverse square root — not each
-    /// residual over its own marginal SD. With a nonzero `H` the two differ;
-    /// the oracle is the defining identity `R̃^{1/2}·z = y − f0` (checked with
-    /// the matrix square root built independently here), plus the invariant
-    /// `zᵀz = rᵀR̃⁻¹r`. The covariance is built from `r_preds` when given.
+    /// #1182: CWRES is `R̃^{-1/2}(y − f0)` with the symmetric square root, not the marginal
+    /// standardisation. Oracle: `R̃^{1/2}·z = y − f0` (independent sqrt) and `zᵀz = rᵀR̃⁻¹r`.
     #[test]
     fn compute_cwres_decorrelates_with_the_symmetric_inverse_square_root() {
         let subject = Subject {
@@ -6916,15 +6329,8 @@ mod tests {
         );
     }
 
-    /// Confirms the Almquist `½·c̃'·c̃` INTER correction is actually wired:
-    /// switching from additive (c̃ ≡ 0) to combined error (`dvar_df ≠ 0`,
-    /// hence c̃ ≠ 0) must change the Laplace H̃ and therefore the per-subject
-    /// OFV by a non-trivial amount, even when the proportional-component
-    /// magnitude is small enough that the *data* term barely shifts.
-    ///
-    /// Catches a regression where the c̃'c̃ accumulator is dropped or zeroed —
-    /// in that case the additive and combined Laplace values would coincide
-    /// up to the tiny `(prop·f)² → R` difference in the data quadratic.
+    /// The Almquist `½·c̃'·c̃` correction is wired: additive → combined error changes the
+    /// per-subject OFV non-trivially even when the data term barely shifts.
     #[test]
     fn test_focei_laplace_combined_uses_inter_correction() {
         let subj = make_simple_subject();
@@ -7204,18 +6610,10 @@ mod tests {
         }
     }
 
-    /// #1885 T2: for a joint PK-TTE subject the likelihood scores on the **dedicated**
-    /// solve (a reset declines the share), `predict_survival_at_etas_diag` on a grid of
-    /// exactly that subject's scored times reads `H` and `h` bit for bit as the scorer
-    /// did, and the scorer's exact-event term rebuilt from the predicted row is the one
-    /// `tte_endpoint_nll` returns, bit for bit.
-    ///
-    /// Two subjects with different η, supplied in the reverse of population order: the
-    /// zero η (a) and a zip slip that swaps them (b) fail both bit comparisons. Predict
-    /// integrating on another engine or grid (c) is caught by the second only — the
-    /// scorer's term rebuilt from the row against `tte_endpoint_nll`. The first compares
-    /// with `ode_cumhaz_hazard` at `[t]`, the call predict itself makes, so it holds by
-    /// construction under (c).
+    /// #1885 T2: for a joint PK-TTE subject scored on the **dedicated** solve,
+    /// `predict_survival_at_etas_diag` on its scored times reads `H`/`h` bit for bit, and
+    /// the exact-event term rebuilt from the row equals `tte_endpoint_nll`. Two subjects
+    /// in reverse order catch a zero η or a zip slip; the rebuilt term catches another engine.
     #[cfg(feature = "survival")]
     #[test]
     fn ebe_survival_reads_the_dedicated_ode_solve_bit_for_bit() {
@@ -7294,17 +6692,11 @@ mod tests {
         }
     }
 
-    /// #1885 T3: for a subject the likelihood scores on the #570 **share**, the individual
-    /// curve on a 0.5-step 0–48 grid (plus Tᵢ) agrees with the share's `H(Tᵢ)` to the ODE
-    /// tolerance, not bitwise: an adaptive solve's value at a time depends on the other
-    /// times it is asked for (plan M4).
+    /// #1885 T3: on the #570 **share**, the individual curve (0.5-step grid 0–48 plus Tᵢ)
+    /// agrees with the share's `H(Tᵢ)` to ODE tolerance, not bitwise.
     ///
-    /// Band, measured: worst realised relative gap over the four (T, η) cases below is
-    /// 1.300e-4 on Linux aarch64 (`tools/linux-test.sh`) and on macOS arm64, the same in
-    /// every printed digit; the bound sits ~2.3× above it. The second clause — η̂ moves
-    /// `H(Tᵢ)` by more than half — keeps the band from also admitting the η = 0 curve,
-    /// which is what mutation (a) would return. A `NaN` on either leg fails the
-    /// `is_finite` check before any comparison.
+    /// Band, measured: worst relative gap 1.300e-4 (Linux aarch64 and macOS arm64); the
+    /// bound is ~2.3× above it. η̂ moving `H(Tᵢ)` by more than half excludes the η = 0 curve.
     #[cfg(feature = "survival")]
     #[test]
     fn ebe_survival_agrees_with_the_share_to_solver_tolerance() {
@@ -7360,13 +6752,9 @@ mod tests {
         eprintln!("T3 worst share-vs-predict rel gap {worst:.3e}");
     }
 
-    /// Plain no-TV `[odes]` block (does not itself read `TAD`) plus an `OdeAccumulated`
-    /// hazard that does — the exact model shape `try_joint_pktte_shared_solve`'s
-    /// `model_uses_time_anywhere` guard admits to the #570 shared solve, since that
-    /// check is scoped to the PK program and does not inspect the injected
-    /// `d/dt(__chz_*)` hazard line. Shared by the two tests below: one exercising
-    /// `tte_endpoint_nll` / `ode_cumhaz_hazard` directly, the other the production
-    /// `individual_nll_into_with_schedule` entry point FOCE/FOCEI actually calls.
+    /// No-TV `[odes]` plus an `OdeAccumulated` hazard reading `TAD` — the shape
+    /// `try_joint_pktte_shared_solve` admits to the #570 share (its time guard does not
+    /// inspect the injected `d/dt(__chz_*)` line). Shared by the two tests below.
     #[cfg(feature = "survival")]
     fn tad_hazard_two_dose_model() -> CompiledModel {
         use crate::parser::model_parser::parse_model_string;
@@ -7397,18 +6785,11 @@ DV ~ proportional(PROP_ERR)
         .expect("TAD-reading ODE hazard must parse")
     }
 
-    /// A joint PK-TTE subject whose first record is a dose at **t = 10** — so the
-    /// integration starts at 10 and a TTE time below it is genuinely pre-start.
-    ///
-    /// `make_simple_subject` cannot host one: it doses at `t = 0`, and `entry_time` is
-    /// gated `> 0.0` ("no truncation"), so there is no positive time before its start.
-    /// PK observations sit at 12 / 16 / 24, all *after* the dose, which keeps
-    /// `t_last ≥ subject_integration_start` and so routes the pre-start read through the
-    /// engines' pre-first-break **fill** rather than through the `k = 0` boundary visit
-    /// that covers a degenerate every-time-before-the-dose timeline (#1218).
-    /// #1261: a TTE hazard readout must receive the dose-time anchors the ODE
-    /// integration used. A bare `PkParams::values` slice made TAD NaN, which the
-    /// scorer converted into its finite 1e20 rejection sentinel.
+    /// A joint PK-TTE subject whose first record is a dose at **t = 10**, so a TTE time
+    /// below it is pre-start; PK obs at 12/16/24 route the pre-start read through the
+    /// pre-first-break fill, not the `k = 0` boundary visit (#1218).
+    /// #1261: a TTE hazard readout must receive the dose-time anchors the ODE used (a bare
+    /// `PkParams::values` made TAD NaN → 1e20 sentinel).
     #[cfg(feature = "survival")]
     #[test]
     fn tte_hazard_readout_uses_the_current_tad_anchor() {
@@ -7474,22 +6855,11 @@ DV ~ proportional(PROP_ERR)
         assert_relative_eq!(haz[0], 0.118, epsilon = 2e-6);
     }
 
-    /// #1261 code-review follow-up: the sibling test above calls `tte_endpoint_nll` and
-    /// `ode_cumhaz_hazard` directly, never the dispatcher FOCE/FOCEI's inner loop
-    /// actually calls. `individual_nll_into_with_schedule` builds `joint_share` for this
-    /// exact model shape (plain no-TV `[odes]` + an `OdeAccumulated` hazard reading
-    /// `TAD`) and routes the TTE term through `tte_ode_nll_from_shared` /
-    /// `share.rhs_params[i]` instead — the #1261 fix's real call site
-    /// (`src/stats/likelihood.rs`, the `(ode.rhs)(st, &share.rhs_params[i], t, &mut du)`
-    /// line). A revert there would go uncaught by every other test in this file.
-    ///
-    /// Isolate the TTE contribution by subtracting a PK-only sibling model/subject that
-    /// drops `[event_model]` and the CMT-3 record entirely: both share the identical
-    /// `[odes]` block, doses, and PK observation, so the Gaussian data term is the same
-    /// between the two calls and cancels in the difference — the #570 shared solve's own
-    /// invariant is that its predictions are bit-identical to the standalone no-TV path
-    /// the PK-only sibling takes (`try_joint_pktte_shared_solve` returns `None` for it,
-    /// since it declares no TTE endpoint to share).
+    /// #1261 follow-up: through the production dispatcher
+    /// `individual_nll_into_with_schedule`, which routes the TTE term through
+    /// `tte_ode_nll_from_shared` / `share.rhs_params[i]`. The TTE contribution is isolated
+    /// by subtracting a PK-only sibling (same `[odes]`, doses, obs; no share), whose
+    /// Gaussian term is bit-identical.
     #[cfg(feature = "survival")]
     #[test]
     fn hot_path_individual_nll_reads_the_shared_solve_tad_anchor() {
@@ -7598,35 +6968,12 @@ DV ~ proportional(PROP_ERR)
         subject
     }
 
-    /// #1223: a TTE time **at or before the subject's first record** must be scored, not
-    /// repelled, and must be scored identically on all three production callers.
-    ///
-    /// The one-solve share (`ode_predictions_and_chz`, #570) NaN-filled a `chz_times`
-    /// entry before the integration start; `tte_ode_nll_from_shared` skips a non-finite
-    /// state, `tte_nll_from_curves` maps the resulting NaN `H` to its `1e20` sentinel, and
-    /// the subject is repelled. The dedicated engine (`ode_dense_solve_states`) has filled
-    /// the same node with the seeded state since the CTMM scorer needed it. Which engine a
-    /// subject reaches is decided by `try_joint_pktte_shared_solve`'s admission list — a
-    /// reset, a time-varying covariate, model time in the PK block — none of which has
-    /// anything to do with when its `TENTRY` falls.
-    ///
-    /// Three arms, one per shape that can put a time before the start: a left-truncation
-    /// `entry_time`, an interval-censored `left` (pushed unconditionally, with no `> 0`
-    /// gate), and a right-censoring time itself.
-    ///
-    /// **What is non-degenerate here.** The seeded state of this model is all zeros (no
-    /// `init(...)`), so "state == `initial_state`" is a zeros-against-zeros identity; the
-    /// value that actually discriminates is the hazard, `h = H0·exp(BETA·0/V) = H0 = 0.01`
-    /// exactly — non-zero, and wrong under any other state. The non-degenerate *state*
-    /// check lives in the driver twin
-    /// (`ode::predictions::tests::prestart_chz_time_reads_the_seeded_state_on_both_paths`),
-    /// which seeds a non-zero `init(central)`.
-    ///
-    /// **`predict_survival` is a third caller, not a third geometry**: it routes
-    /// `OdeAccumulated` straight to `crate::survival::ode_cumhaz_hazard`, the same dense
-    /// solve the two-solve arm uses. It is here because it is the public entry point users
-    /// read `H`/`h` from, not as independent evidence. The independent oracle is the
-    /// hand-computed `H = 0`, `h = H0`.
+    /// #1223: a TTE time **at or before the first record** is scored, not repelled, and
+    /// identically on all three production callers (the #570 share, the dedicated solve,
+    /// `predict_survival`). Arms: left-truncation `entry_time`, interval `left`, right
+    /// censoring time. The seeded state is all zeros, so the discriminating value is
+    /// `h = H0 = 0.01` (the hand-computed oracle with `H = 0`); the non-zero-state check
+    /// lives in `ode::predictions::tests::prestart_chz_time_reads_the_seeded_state_on_both_paths`.
     #[cfg(feature = "survival")]
     #[test]
     fn prestart_tte_time_is_scored_on_share_dedicated_and_predict_survival() {
@@ -7686,19 +7033,9 @@ DV ~ proportional(PROP_ERR)
                     cmt: 2,
                 }],
             ),
-            // `left = 0.0` specifically, because the two bounds are gated differently. The
-            // value also has to stay `0.0` for a second reason: it makes this arm's
-            // `predict_survival(&[0.0])` a zero-*maximum* grid, which is #1218's exact shape, so
-            // the arm doubles as free regression coverage for PR #1222's fix. Changing it to
-            // some other pre-start value (5.0 or 8.0, matching its siblings) would look like a
-            // tidy-up and would silently drop that.
-            //
-            // `try_joint_pktte_shared_solve` pushes `entry_time` only `if *entry_time > 0.0`
-            // ("no truncation"), but pushes `left`/`right` unconditionally. So on this subject
-            // a `left = 0` *is* a pre-start CHZ time that reaches the share while a
-            // `TENTRY = 0` never does — the asymmetry the docs sentence ("at or before") has to
-            // cover, and the one a later refactor could silently remove by adding a `> 0` gate
-            // to `left` for symmetry.
+            // `left = 0.0` deliberately: `entry_time` is pushed only if `> 0`, `left` always, so
+            // this reaches the share; and `predict_survival(&[0.0])` is #1218's zero-maximum grid
+            // (PR #1222 coverage). Do not "tidy" it to 5.0/8.0.
             (
                 "interval censoring with left = 0 (ungated bound)",
                 0.0_f64,
@@ -7830,15 +7167,9 @@ DV ~ proportional(PROP_ERR)
                 "{arm}: share {shared_tte} must match dedicated {dedicated_tte} to solver tol"
             );
 
-            // The FOCEI Laplace objective, which adds the ODE-TTE **FD-Hessian** term. Without
-            // this leg every assertion above is on the value path: before the fix the pre-start
-            // node returned the `1e20` sentinel, so a Hessian built by perturbing η around it was
-            // garbage rather than merely a wrong scalar — and a regression that reinstated the
-            // sentinel only inside the perturbation would pass all the value-path checks. The
-            // Tier-2 end-to-end test cannot cover this either: its model declares no omega, so no
-            // Hessian term is ever formed. A zero Gaussian sensitivity matrix is fine here — the
-            // prior plus the TTE Hessian keep H̃ positive-definite (same setup as
-            // `joint_pktte_ode_hazard_nll_paths_finite`, which does this for `entry_time = 0`).
+            // FOCEI Laplace leg: the ODE-TTE FD-Hessian perturbs η around the pre-start node, so
+            // a sentinel reinstated only inside the perturbation would pass the value checks.
+            // Zero Gaussian H is fine: prior + TTE Hessian keep H̃ PD.
             let n_obs = subject.observations.len();
             let foce = foce_subject_nll(
                 &model,
@@ -7864,15 +7195,9 @@ DV ~ proportional(PROP_ERR)
         }
     }
 
-    /// #1223 positive control: the *convention* the fix adopts, as a differential pair
-    /// that straddles the integration start.
-    ///
-    /// A pre-start `entry_time` must contribute **nothing** — `H(entry) = 0`, so the
-    /// left-truncated `H(T) − H(entry)` equals the untruncated `H(T)` — while a post-start
-    /// one must change the objective. Without the second leg the first is satisfied by any
-    /// implementation that ignores `entry_time` entirely; without the first, by the
-    /// alternative convention of starting the hazard clock at the earliest TTE time, which
-    /// would make `H(entry) > 0` and shift the NLL.
+    /// #1223 positive control straddling the integration start: a pre-start `entry_time`
+    /// contributes nothing (`H(entry) = 0`), a post-start one changes the objective. Rules
+    /// out both "ignore entry_time" and "start the clock at the earliest TTE time".
     #[cfg(feature = "survival")]
     #[test]
     fn prestart_entry_time_contributes_nothing_post_start_entry_does() {
@@ -7907,13 +7232,9 @@ DV ~ proportional(PROP_ERR)
             "the pair must straddle the integration start ({start})"
         );
 
-        // Pre-start entry contributes nothing, and does so **bit-exactly** — measured
-        // (`306.2186273580891` both ways, difference `0.0`), and bit-exact by construction
-        // rather than by luck: `entry_time = 5` adds a node to the shared solve's CHZ time
-        // vector, but that node is filled before the break walk and lies in no segment, and
-        // the horizon `t_last = max(obs 24, chz) = 24` is unchanged either way — so the
-        // break timeline, every segment and the Gaussian solve are identical. A tolerance
-        // here would be strictly weaker with nothing bought for it.
+        // Bit-exact by construction (measured `306.2186273580891` both ways): the pre-start
+        // node is filled before the break walk and `t_last` stays 24, so every segment is
+        // identical. A tolerance would be strictly weaker.
         assert_eq!(
             pre.to_bits(),
             none.to_bits(),
@@ -7929,20 +7250,10 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// #1187, at the objective: the joint PK-TTE hazard has **two** production routes and
-    /// they resolve infusions differently.
-    ///
-    /// Arm A is the #570 shared single solve (`ode_predictions_and_chz` →
-    /// `integrate_segment` → `active_infusions`). Arm B is the established two-solve
-    /// fallback (`tte_endpoint_nll` → `ode_cumhaz_hazard` → `ode_dense_solve_states` →
-    /// `gated_infusions`). Only arm B resolved through the unguarded helper, so for a PK
-    /// block with a **built-in absorption forcing fed by a `RATE>0` dose** the two arms
-    /// integrated different drug exposures and produced different cumulative hazards —
-    /// a wrong *objective*, not just a wrong diagnostic.
-    ///
-    /// The pairing matters beyond this bug: `model_uses_time_anywhere` (#1166) decides
-    /// which arm a time-dependent-hazard model takes, so a divergence here is reachable
-    /// by a routing change alone. Pinning A ≡ B is what makes that routing safe.
+    /// #1187: the joint PK-TTE hazard's two production routes — the #570 share
+    /// (`active_infusions`) and the two-solve fallback (`gated_infusions`) — must agree for a
+    /// `RATE>0` dose into a built-in absorption forcing; before the fix they integrated
+    /// different exposures. Routing (#1166) can move a model between arms, so A ≡ B matters.
     #[cfg(feature = "survival")]
     #[test]
     fn joint_pktte_hazard_arms_agree_for_infusion_into_absorption() {
@@ -8054,27 +7365,13 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// #1187 external anchor: the joint PK-TTE **cumulative hazard** under a `RATE>0` dose
-    /// into a built-in absorption compartment, against NONMEM 7.6.0.
+    /// #1187 external anchor: joint PK-TTE cumulative hazard `A(3)` under a `RATE>0` dose
+    /// into an absorption compartment vs NONMEM 7.6.0 (`nonmem_anchor/pktte_inf.{ctl,csv}`,
+    /// `ADVAN13 TOL=9`, all fixed, η = 0). CHZ rather than OFV, which carries tool-specific
+    /// constants.
     ///
-    /// [`joint_pktte_hazard_arms_agree_for_infusion_into_absorption`] pins the two ferx arms
-    /// to each other; two engines agreeing is not evidence that either is right, so this
-    /// pins them to a tool that has no such split — NONMEM integrates the augmented system
-    /// once. `A(3)` (the CHZ compartment) is compared rather than the OFV: a likelihood
-    /// model (`F_FLAG=1`) carries different additive constants in the two tools, while the
-    /// cumulative hazard is constant-free.
-    ///
-    /// Reference: `nonmem_anchor/pktte_inf.{ctl,csv}` — `ADVAN13 TOL=9`, explicit
-    /// `DEPOT/CENTRAL/CHZ` compartments, `MAXEVAL=0 POSTHOC`, every `THETA FIX` and
-    /// `$OMEGA 0 FIX` so both tools evaluate at `eta = 0`. NONMEM's zero-order fill of an
-    /// explicit depot followed by first-order `KA` is exactly what ferx's `first_order()`
-    /// kernel plus the `R_in_inf` convolution reproduces — the equivalence already anchored
-    /// by `tests/infusion_absorption_nonmem_anchor.rs`.
-    ///
-    /// Measured: before the fix the dedicated arm read `H(1.86) = 3.796844e0` against
-    /// NONMEM's `1.2217e-1` — **31×** — while the shared arm was already correct. The
-    /// hazard is exponential in concentration (`H0·exp(BETA·C)`), so the doubled input
-    /// rate compounds rather than scaling linearly.
+    /// Measured: before the fix the dedicated arm read `H(1.86) = 3.796844e0` vs NONMEM
+    /// `1.2217e-1` (31×); the shared arm was already correct.
     #[cfg(feature = "survival")]
     #[test]
     fn joint_pktte_cumulative_hazard_matches_nonmem_for_infusion_into_absorption() {
@@ -8146,14 +7443,9 @@ DV ~ proportional(PROP_ERR)
             _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
         };
 
-        // NONMEM 7.6.0, `nonmem_anchor/results/pktte_inf.tab`: CHZ at TIME = 1.86.
-        //
-        // Printed at 9 significant figures via `FORMAT=s1PE15.8` in the control stream —
-        // deliberately, and load-bearing. `$TABLE`'s default is 5 significant figures, which
-        // would bank this as `1.2217e-1` and carry ±5e-6 of its **own rounding**: 4.1e-5
-        // relative — a floor under any tolerance this anchor could assert, regardless of how
-        // close ferx actually is. At 9 figures the reference's own contribution drops to
-        // ~1e-9 and the bound below measures ferx instead of NONMEM's printf.
+        // NONMEM 7.6.0, `nonmem_anchor/results/pktte_inf.tab`: CHZ at TIME = 1.86, printed at
+        // 9 significant figures (`FORMAT=s1PE15.8`): the default 5 would add 4.1e-5 relative
+        // rounding of its own, a floor under any bound here.
         const NONMEM_CHZ_AT_EVENT: f64 = 1.22168018e-1;
 
         // Arm B — the two-solve fallback, i.e. the arm that carried the defect.
@@ -8165,14 +7457,8 @@ DV ~ proportional(PROP_ERR)
         assert_eq!(share.times, vec![1.86], "share must cover the event time");
         let cum_shared = share.chz_states[0][chz_state];
 
-        // Per-arm bounds, each measured rather than chosen, because the two arms are not
-        // equally accurate: the dedicated arm lands at **1.41e-9** and the shared arm at
-        // **3.26e-6** — a 2300x spread. Both are far inside the arms-agree tolerance and
-        // neither is a defect; they integrate different timelines (the share covers the
-        // union of TTE record times in one pass, the dedicated call solves to `[1.86]`
-        // alone), so their local error differs. A single loose bound covering both would
-        // let a real regression in the tight arm pass unnoticed, which is the whole reason
-        // they are separated here.
+        // Per-arm bounds, measured: dedicated 1.41e-9, shared 3.26e-6 (different timelines,
+        // different local error). One loose bound would hide a regression in the tight arm.
         for (arm, got, tol) in [
             ("dedicated (ode_cumhaz_hazard)", cum_dedicated[0], 1e-8),
             ("shared (#570)", cum_shared, 1e-5),
@@ -8186,13 +7472,8 @@ DV ~ proportional(PROP_ERR)
         }
     }
 
-    /// #570 guard regression (found by an independent review of #613): a joint PK-TTE
-    /// model whose `[individual_parameters]` references the `TIME` built-in must NOT
-    /// take the shared single-solve path. The standalone prediction path routes such a
-    /// model through the per-event, TIME-resolved `ode_predictions_event_driven`
-    /// (`pk/mod.rs`), so the share's single t=0 PK snapshot would be silently wrong
-    /// (~30–50% off on a time-switching parameter — no error, no NaN, just a wrong
-    /// OFV). The guard must return `None` so the established two-solve path runs.
+    /// #570 guard: a joint PK-TTE model whose `[individual_parameters]` reads `TIME` must
+    /// not take the share; its single t=0 snapshot would be ~30–50% off.
     #[cfg(feature = "survival")]
     #[test]
     fn joint_pktte_share_rejects_time_builtin_model() {
@@ -8273,36 +7554,19 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// The same rejection, for model time read in the **`[odes]` RHS** rather than
-    /// in `[individual_parameters]`.
-    ///
-    /// The sibling above cannot pin this: its fixture puts `TIME` in an individual
-    /// parameter, where the narrow `compiled_model_uses_time_builtin` and the wide
-    /// `pk::model_uses_time_anywhere` both return `true`, so it passes under either
-    /// and the choice of predicate is invisible to it. Here only the wide one fires,
-    /// which is the whole difference — and reverting the gate to the narrow
-    /// predicate left the entire suite green before this test existed.
-    ///
-    /// Why the rejection is required: the shared solve (#570) computes the Gaussian
-    /// predictions from the plain no-TV `ode_predictions` with a single `t=0` PK
-    /// snapshot, so it is only equivalent when the standalone prediction path takes
-    /// that same route. Since #1124 an `[odes]` RHS reading model time routes to the
-    /// event-driven walker instead, so admitting the share here would leave the
-    /// objective's Gaussian term on the dense engine while the reported IPRED came
-    /// from the event-driven one.
+    /// The same rejection for model time read in the **`[odes]` RHS**: only the wide
+    /// `pk::model_uses_time_anywhere` fires here (the sibling passes under the narrow
+    /// predicate too). Since #1124 such a model routes to the event-driven walker, so the
+    /// share would score a different Gaussian term than the reported IPRED.
     #[test]
     #[cfg(feature = "survival")]
     fn joint_pktte_share_rejects_model_time_in_the_odes_rhs() {
         use crate::parser::model_parser::parse_model_string;
         use crate::types::{EventType, ObsRecord};
 
-        // Same shape as the sibling, but the time dependence lives in the RHS and
-        // the individual parameters are entirely time-independent. The hazard is
-        // deliberately time-independent too, so the only thing this fixture can be
-        // rejected *for* is the PK RHS. Since #1166 a `TIME`-reading hazard no
-        // longer trips the predicate at all — the injected `d/dt(__chz_n)` line is
-        // excluded from it — which is what `joint_pktte_share_admits_a_time_
-        // dependent_hazard` below pins from the other side.
+        // Time dependence only in the PK RHS; the hazard is time-independent so the RHS is the
+        // only reason to reject. Since #1166 a `TIME`-reading hazard does not trip the
+        // predicate (pinned by `joint_pktte_share_admits_a_time_dependent_hazard`).
         let src = r"
 [parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -8419,13 +7683,8 @@ DV ~ proportional(PROP_ERR)
         )
     }
 
-    /// #1166, the admission side: a Gompertz-shaped hazard — a hazard that reads
-    /// `TIME` by definition — on an autonomous PK block **takes** #570's single
-    /// shared solve.
-    ///
-    /// The sibling above pins the opposite direction (a `TAD`-reading PK RHS is
-    /// still rejected), so between them the gate is pinned from both sides and
-    /// neither "always admit" nor "always decline" survives.
+    /// #1166: a Gompertz-shaped (`TIME`-reading) hazard on an autonomous PK block **takes**
+    /// the share; with the sibling, the gate is pinned from both sides.
     #[test]
     #[cfg(feature = "survival")]
     fn joint_pktte_share_admits_a_time_dependent_hazard() {
@@ -8469,26 +7728,9 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// An `EVID=3/4` reset **declines** the share — the routing that
-    /// `tests/pktte_prestart_entry.rs` is built on, and which nothing pinned until #1223.
-    ///
-    /// That file's whole structure is "A1 goes through the share, A4 (the same subject plus a
-    /// reset) goes through the dedicated engine, both must agree". Admit reset subjects to the
-    /// share and A4 silently becomes a second run of A1's engine: every assertion there still
-    /// passes, both pinned OFVs still match, and its own guard —
-    /// `(A4_OFV - A1_OFV).abs() > 1e-3` — does not notice, because it shows the two *subjects*
-    /// differ, not that they took different *engines*. The "both engines agree" claim would be
-    /// false while reading green.
-    ///
-    /// The share's own precondition is why the decline is required, not merely conventional:
-    /// it computes predictions via `ode_predictions_and_chz`, i.e. the no-TV `ode_predictions`
-    /// with a single `t = 0` PK snapshot, and a reset needs the event-driven walker.
-    ///
-    /// Measured, not argued: with `|| subject.has_resets()` disabled in the admission list, this
-    /// test is the **only** one that fails. The other three admission tests stay green (they
-    /// cover model time and a time-dependent hazard), and so do all three tests in
-    /// `tests/pktte_prestart_entry.rs` — A4 included, whose whole premise is that it runs the
-    /// dedicated engine.
+    /// An `EVID=3/4` reset **declines** the share (a reset needs the event-driven walker) —
+    /// the premise of `tests/pktte_prestart_entry.rs` (A1 via share, A4 via dedicated).
+    /// Measured: disabling `|| subject.has_resets()` fails only this test.
     #[cfg(feature = "survival")]
     #[test]
     fn joint_pktte_share_rejects_a_subject_with_resets() {
@@ -8530,34 +7772,18 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// #1166, the routing oracle: two models that compute the **same arithmetic**
-    /// must land on the same engine, and therefore agree bit-for-bit.
-    ///
-    /// `* (1.0 + 0.0*TIME)` is the exact identity in IEEE arithmetic — `0.0*t` is
-    /// `0.0` for finite `t`, `1.0 + 0.0` is `1.0`, and `h * 1.0` is `h` — and the
-    /// RHS is interpreted bytecode, so nothing folds it away. Any difference in
-    /// the result is therefore a difference of *engine*, not of arithmetic: before
-    /// #1166 the flagged twin declined the shared solve and assembled the Gaussian
-    /// half on the event-driven walk, which agreed with the dense driver only to
-    /// solver tolerance (measured: 0 of 40 subjects bit-identical on the anchored
-    /// fixture, worst per-subject 3.25e-4 at ferx's default tolerances).
-    ///
-    /// A value test could not see this — both arms are correct to tolerance — and
-    /// a routing assertion alone could not either, since it would pass for a
-    /// predicate that admitted the *wrong* pair too. Bit-identity is the assertion
-    /// that is exactly as strong as the claim.
+    /// #1166 routing oracle: two models computing the **same arithmetic**
+    /// (`* (1.0 + 0.0*TIME)` is an IEEE identity, not folded by the bytecode) must land on
+    /// the same engine and agree bit-for-bit. Before #1166 the flagged twin took the
+    /// event-driven walk (0 of 40 subjects bit-identical, worst 3.25e-4).
     #[test]
     #[cfg(feature = "survival")]
     fn identical_arithmetic_takes_the_identical_engine_bit_for_bit() {
         use crate::parser::model_parser::parse_model_string;
         use crate::types::{EventType, ObsRecord};
 
-        // The pair must **straddle** the predicate under the old behaviour, or the
-        // test is vacuous: with a time-reading base hazard both twins would have
-        // been flagged, both would have declined, and they would agree bit-for-bit
-        // whether the fix is present or not. (Found by mutating the fix away and
-        // watching this test survive.) So the base hazard is autonomous and only
-        // the twin's identity factor reads time.
+        // The pair must straddle the old predicate (found by mutation): the base hazard is
+        // autonomous, only the twin's identity factor reads time.
         let plain = parse_model_string(&joint_time_hazard_src("H0 * exp(BETA * (central / V))"))
             .expect("parse");
         let twin = parse_model_string(&joint_time_hazard_src(
@@ -8614,19 +7840,11 @@ DV ~ proportional(PROP_ERR)
         }
     }
 
-    /// #1218 on the fit path. `tte_ode_nll` is the two-solve arm `tte_endpoint_nll` takes when
-    /// `try_joint_pktte_shared_solve` declines — time-varying covariates, EVID-3/4 resets, a
-    /// model-time read, SDE, FREM. A subject whose only TTE record sits on its first dose
-    /// builds `times = [0.0]`, a one-break timeline in `ode_dense_solve_states`, and until
-    /// #1218 read `NaN` there, which `tte_nll_from_curves` maps to the `1e20` sentinel: the
-    /// subject was repelled, not scored. It now scores `H(0) − ln h(0)` with `h(0)` the
-    /// post-dose hazard — the number the multi-point grid already gave.
-    ///
-    /// An exact event rather than a censor, on purpose: a censor at `t = 0` scores
-    /// `H(0) = 0` under the fix *and* under the wrong fix (filling the row from the seeded
-    /// pre-dose state), while `−ln h(0)` sees the difference — `h(0) = H0·exp(BETA·C)` at the
-    /// SS trough + pulse against the drug-free `H0`. Measured: `1e20` before, and under the
-    /// seeded-state variant `−ln 0.02 = 3.91` where the post-dose row gives `−ln 25.6`.
+    /// #1218 on the fit path: a subject whose only TTE record sits on its first dose builds
+    /// `times = [0.0]` in `tte_ode_nll`'s dedicated solve and read `NaN` (→ `1e20`). It now
+    /// scores `H(0) − ln h(0)` with the post-dose hazard. An exact event, since a censor
+    /// scores `H(0) = 0` under the wrong (seeded-state) fix too. Measured: `1e20` before,
+    /// `−ln 0.02 = 3.91` under the seeded-state variant vs `−ln 25.6` post-dose.
     #[cfg(feature = "survival")]
     #[test]
     fn tte_ode_nll_scores_an_event_on_the_first_dose_instead_of_the_sentinel() {
@@ -8730,15 +7948,9 @@ DV ~ proportional(PROP_ERR)
             "tte_ode_nll = {nll} but H(0) - ln h(0) from the multi-point grid = {want}"
         );
     }
-    /// #2267 review r4: the joint (time-to-event, categorical, CTMM) marginal records the
-    /// curvature it actually factors, which carries the non-Gaussian η-Hessian, and says
-    /// when that Hessian is what broke it. Healthy, `2·(Σ parts + non-Gaussian data)`
-    /// is the contribution — under FOCEI and FOCE, whose `H̃` differ.
-    ///
-    /// Measured: the healthy gap is `0` under both flags, against a bound of `1e-12·nll`.
-    ///
-    /// Mutation (run): invert the Gaussian-`H̃` test → the `−1e6` case reads the plain
-    /// name; drop the finiteness arm → the `NaN` case reads another name.
+    /// #2267: the joint (TTE/categorical/CTMM) marginal records the curvature it factors
+    /// (with the non-Gaussian η-Hessian) and names it when that breaks. Healthy, the parts
+    /// sum to the contribution under FOCEI and FOCE (measured gap `0`, bound `1e-12·nll`).
     #[cfg(feature = "survival")]
     #[test]
     fn the_joint_marginal_names_a_curvature_the_non_gaussian_hessian_broke() {
@@ -8820,12 +8032,8 @@ DV ~ proportional(PROP_ERR)
 
     // ── #901: per-record TTE terms on each ODE arm of the router (T6 / T7) ──
 
-    /// The two-record joint PK-TTE subject of T6 / T7: an exact event after a late entry
-    /// and a censor, so `H(entry)`, `log h` and a second `ΔH` are all live. The dose is at
-    /// t = 10. `entry` before it (5) is a time the dual walk cannot serve, so an in-scope
-    /// subject falls back from the walk; after it (12) the walk serves. `ss` makes the dose
-    /// steady-state, which takes the subject out of the walk's scope; `reset` adds an EVID-3
-    /// reset, which declines the #570 share.
+    /// The two-record joint PK-TTE subject of T6 / T7 (dose at t = 10): `entry` 5 is outside
+    /// the dual walk's reach, 12 inside; `ss` leaves the walk's scope; `reset` declines the share.
     #[cfg(feature = "survival")]
     fn record_terms_subject(reset: bool, ss: bool, entry: f64) -> Subject {
         let mut subject = late_start_joint_subject(vec![
@@ -8920,19 +8128,10 @@ DV ~ proportional(PROP_ERR)
         terms
     }
 
-    /// T6a (#901), walk arm: a subject the dual walk serves (#2482) is scored off the walk
-    /// even when a #570 share exists, because the objective scores it there — the walk's
-    /// value is the one its exact derivatives differentiate. The terms fold
-    /// **bit-identically** to `survival::ode_tte_nll_g`, and not to the share's NLL.
-    ///
-    /// Bit-identity is the only test that sees an engine swap: the engines agree to solver
-    /// tolerance, below every NONMEM anchor's bound (#901 plan, M5). Dies on: the share read
-    /// for an in-scope subject, or the walk's terms not visited.
-    ///
-    /// Skipping the walk arm falls to the share, which this test's `assert_ne` tells apart
-    /// from the walk. (On its scope the walk at `f64` reproduces the dedicated solve bit for
-    /// bit — measured rel 0 at η ∈ {0.2, −0.4, 0, 0.7} on this fixture — so the share is the
-    /// only engine the walk's precedence is observable against.)
+    /// T6a (#901), walk arm: an in-scope subject is scored off the dual walk (#2482) even
+    /// when a #570 share exists; terms fold **bit-identically** to `survival::ode_tte_nll_g`
+    /// and differ from the share's NLL. (The walk reproduces the dedicated solve bit for bit
+    /// here — measured rel 0 at η ∈ {0.2, −0.4, 0, 0.7}.)
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_walk_nll() {
@@ -8971,12 +8170,9 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// T6b (#901), shared arm: a spec without a compiled `[odes]` program takes the subject
-    /// out of the walks' scope while the #570 share still admits it, and the terms fold bit-identically to
-    /// the NLL the objective scores off that share (`tte_ode_nll_from_shared`), not to the
-    /// dedicated solve's.
-    ///
-    /// Dies on: the share arm reading the dedicated solve.
+    /// T6b (#901), shared arm: without a compiled `[odes]` program the subject leaves the
+    /// walk's scope while the share admits it; terms fold bit-identically to
+    /// `tte_ode_nll_from_shared`.
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_shared_solve_nll() {
@@ -9008,14 +8204,9 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// #901, the `1e20` rail: when a subject's survival likelihood is the sentinel,
-    /// `tte_endpoint_record_terms` returns `None` — even though the loop already visited
-    /// the records it scored before the one that failed. A clock-forward stream with an
-    /// exact event followed by an interval-censored record (unsupported for RTTE, so the
-    /// sentinel) visits the event, then bails. The control without the interval record
-    /// returns its one term, so the `None` is about the rail and not the fixture.
-    ///
-    /// Dies on: returning the partial terms collected before the sentinel.
+    /// #901: on the `1e20` rail `tte_endpoint_record_terms` returns `None`, not the partial
+    /// terms visited before the failing record (an RTTE interval record); the control
+    /// without it returns its one term.
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_are_none_on_the_sentinel_rail() {
@@ -9063,13 +8254,8 @@ DV ~ proportional(PROP_ERR)
         assert!(terms(&[event, interval]).is_none());
     }
 
-    /// #901, competing risks: one row per cause's record, on that cause's `CMT`, in
-    /// ascending CMT, each from its **cause-specific** `H_k` — `λ_k·e^η·T` with distinct
-    /// `λ_A, λ_B` — and never the total hazard `(λ_A + λ_B)·e^η·T`. Records are given in
-    /// descending CMT so the ascending order is the function's, not the fixture's.
-    ///
-    /// Dies on: a cause's records scored under another cause's endpoint, the per-CMT
-    /// filter dropped (every record under each cause), CMTs walked in hash order.
+    /// #901, competing risks: one row per cause's record, in ascending CMT (records given
+    /// descending), each from its cause-specific `H_k`, never the total hazard.
     #[cfg(feature = "survival")]
     #[test]
     fn tte_diagnostics_give_one_cause_specific_row_per_cause_record() {
@@ -9119,13 +8305,8 @@ DV ~ proportional(PROP_ERR)
         }
     }
 
-    /// #901 review round 1, row 2: a TTE row's `TIME` is the time **as written**, through
-    /// `Subject::param_time_at`, when the record sits in a reset period that restarts
-    /// `TIME`. The reader shifts such a record onto the monotonic engine clock (here a
-    /// written 4 lands at engine 104, past a reset recorded at engine 100 / written 0);
-    /// the hazard is scored on the engine clock, the sdtab must join back to the data.
-    ///
-    /// Dies on: the call site passing the engine time through (`|t| t`), which writes 104.
+    /// #901: a TTE row's `TIME` is the time **as written** (`Subject::param_time_at`) in a
+    /// reset period: written 4 at engine 104 must report 4, not 104.
     #[cfg(feature = "survival")]
     #[test]
     fn tte_diagnostics_report_the_written_time_in_a_restarted_period() {
@@ -9166,12 +8347,8 @@ DV ~ proportional(PROP_ERR)
         assert!((rows[0].coxsnell - 0.10 * 104.0).abs() < 1e-12);
     }
 
-    /// T7 (#901), dedicated arm: a spec without a compiled `[odes]` program takes the subject
-    /// out of the walks' scope and an EVID-3 reset declines the share, and the terms fold bit-identically to the
-    /// dedicated `tte_ode_nll`. Both declines are asserted first, so the test is about the
-    /// dedicated arm and not about a scope that happened to be empty.
-    ///
-    /// Dies on: the dedicated arm reading anything else.
+    /// T7 (#901), dedicated arm: no `[odes]` program and an EVID-3 reset (both declines
+    /// asserted), terms fold bit-identically to `tte_ode_nll`.
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_dedicated_solve_nll() {
@@ -9195,15 +8372,10 @@ DV ~ proportional(PROP_ERR)
     }
 }
 
-/// Conditional observation NLL from precomputed predictions, using the exact
-/// raw-prediction semantics of the inner/IOV likelihoods.
-///
-/// Unlike [`obs_nll_subject_from_preds`] (the SAEM/IS observation objective), this
-/// does not floor ordinary predictions or clamp residual variances. AGQ integrates
-/// the conditional likelihood used by the inner problem, so its fused value/score
-/// path must preserve those semantics exactly. Kept as the tests' independent
-/// conditional objective (`nested_correlation_tests`) since the AGQ path it served moved to
-/// the adjoint (#486).
+/// Conditional observation NLL from precomputed predictions with the inner/IOV raw
+/// semantics (no prediction floor, no variance clamp), unlike
+/// [`obs_nll_subject_from_preds`]. Kept as an independent oracle for
+/// `nested_correlation_tests` since AGQ moved to the adjoint (#486).
 #[cfg(test)]
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
 #[allow(clippy::too_many_arguments)]
@@ -9238,12 +8410,8 @@ pub(crate) fn conditional_obs_nll_from_preds(
 mod conditional_obs_terms_tests {
     use super::*;
 
-    /// #2266: the per-record terms `W_NONFINITE_OBJECTIVE` names a record by sum to
-    /// the FOCEI scorer's data term. At η̂ = 0 with `H = 0` the scorer
-    /// (`foce_subject_nll_cov`, interaction) reduces to `½(data_ll + bloq_term)`:
-    /// `η̂ᵀΩ⁻¹η̂ = 0` and `H̃ = Ω⁻¹`, so `log|Ω|` and `log|H̃|` cancel. The model is an
-    /// SDE, so the EKF process-noise variance is in both; dropping it from either
-    /// side breaks the equality (it is ~`p_obs` against `σ² = 1` per record).
+    /// #2266: the per-record terms sum to the FOCEI scorer's data term. At η̂ = 0, `H = 0`
+    /// the scorer reduces to `½(data_ll + bloq_term)`; the SDE `p_obs` must be in both.
     #[test]
     fn conditional_terms_sum_to_the_focei_data_term_of_an_sde_model() {
         let model = crate::parser::model_parser::parse_model_string(
@@ -9366,16 +8534,11 @@ mod negative_prediction_tests {
         (subject, f)
     }
 
-    /// #2440: every spelling of the fixed-η Gaussian data term — the SAEM M-step /
-    /// IMP / IMPMAP / VI entry `obs_nll_subject_into`, its precomputed-prediction twin
-    /// `obs_nll_subject_from_preds`, and the `ruv_mult` FD helper
-    /// `gaussian_obs_nll_scaled` — scores a negative prediction as written, equal to the
-    /// hand sum and to the FOCE-family `individual_nll` (minus its `½ log|Ω|` at `η = 0`).
-    ///
-    /// Before the fix the first three floored `f` at `1e-12` and returned 80.683110594
-    /// against the hand value −3.388883083. Realised error on macOS arm64: 0 (bit-equal)
-    /// for the three fixed-η spellings against the hand sum, ≤ 1e-15 for
-    /// `individual_nll`; the 1e-12 bound is headroom for summation order.
+    /// #2440: every fixed-η Gaussian data term (`obs_nll_subject_into`,
+    /// `obs_nll_subject_from_preds`, `gaussian_obs_nll_scaled`) scores a negative prediction
+    /// as written, equal to the hand sum and to `individual_nll` minus `½ log|Ω|`. Before the
+    /// fix: 80.683110594 vs hand −3.388883083. Measured error 0 (≤ 1e-15 for
+    /// `individual_nll`); 1e-12 is headroom for summation order.
     #[test]
     fn fixed_eta_objective_scores_a_negative_prediction_as_written() {
         let model = negative_prediction_model();

@@ -315,7 +315,8 @@ pub(crate) fn three_cpt_oral_peripherals(
 }
 
 /// Predict concentration from a single dose at elapsed time t using 3-cmt model.
-pub fn three_cpt_predict(
+#[cfg(test)]
+pub(crate) fn three_cpt_predict(
     dose: &DoseEvent,
     t: f64,
     cl: f64,

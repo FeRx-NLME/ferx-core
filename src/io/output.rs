@@ -25,14 +25,10 @@ fn se_cell(se: Option<f64>) -> String {
     }
 }
 
-/// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
-/// missing or not finite (#2225).
-/// Why parameter `i` of family `kind` has no standard error (#2797), or `None` when it
-/// has one: it is in `FitResult::held_at_bound` — a profiled level on its declared bound
-/// (#2112) or a coordinate collapsed on the internal guard. Its SE is not available, as a
-/// FIX parameter's is not, but it was estimated. The one predicate every renderer reads,
-/// so the console, the YAML and the parameter table cannot disagree. A hand-built result
-/// that sets only the deprecated `profiled_levels_at_bound` is still honoured.
+/// Why parameter `i` of family `kind` has no standard error (#2797), or `None`: it is
+/// in `FitResult::held_at_bound` (a profiled level on its bound, #2112, or a coordinate
+/// collapsed on the internal guard). The one predicate every renderer reads. A
+/// hand-built result setting only the deprecated `profiled_levels_at_bound` is honoured.
 pub(crate) fn se_held(result: &FitResult, kind: ParameterKind, i: usize) -> Option<HeldReason> {
     result
         .held_at_bound
@@ -66,6 +62,8 @@ fn theta_row_cells(result: &FitResult, i: usize, name: &str) -> (String, String,
     (name.to_string(), se_str, rse_str)
 }
 
+/// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
+/// missing or not finite (#2225).
 fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
     match se.filter(|s| s.is_finite()) {
         Some(s) => (format!("{:.6}", s), format!("{:.1}", rse_pct(est, s))),
@@ -73,13 +71,10 @@ fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
     }
 }
 
-/// The CV of `P = TV · exp(η)`, `η ~ N(0, var)`, as a percent:
-/// `sqrt(exp(var) − 1) · 100`, exactly (#1858), or `0` for a non-positive
-/// variance. Not the first-order `sqrt(var) · 100`, which runs low and falls
-/// further behind as `var` grows (0.2: 44.7 against 47.1; 2.37: 154 against
-/// 311). The one place a log-normal OMEGA/KAPPA CV% is computed; `exp_m1`
-/// keeps a tiny variance's digits. Above `var ≈ 709.78` `exp_m1` overflows and
-/// this is `+∞`; the YAML writes that through [`yaml_cv_pct`].
+/// The CV% of `P = TV · exp(η)`, `η ~ N(0, var)`: `sqrt(exp(var) − 1) · 100` exactly
+/// (#1858), `0` for a non-positive variance. Not the first-order `sqrt(var) · 100`
+/// (0.2: 44.7 vs 47.1; 2.37: 154 vs 311). `exp_m1` keeps a tiny variance's digits;
+/// above `var ≈ 709.78` this is `+∞` (YAML: [`yaml_cv_pct`]).
 fn cv_pct(var: f64) -> f64 {
     if var > 0.0 {
         var.exp_m1().sqrt() * 100.0
@@ -88,16 +83,13 @@ fn cv_pct(var: f64) -> f64 {
     }
 }
 
-/// Above this a console CV% switches from `{:.1}` to scientific notation
-/// (#1883). `{:.1}` prints every integer digit of the double, so a variance
-/// near 156 printed a 36-digit CV% of which ~17 carry information; a CV% this
-/// large already says the log-normal reading does not fit the variance.
+/// Above this a console CV% switches from `{:.1}` to scientific notation (#1883):
+/// `{:.1}` printed a 36-digit CV% for a variance near 156.
 const CV_PCT_FIXED_MAX: f64 = 1e6;
 
-/// A CV% for a console row: `{:.1}` below [`CV_PCT_FIXED_MAX`], three
-/// significant figures in scientific notation (`7.64e35`) from it up, `inf`
-/// past `exp_m1`'s overflow. Rust's `e` spelling parses back as a number in R
-/// and Python, which ferx-r's tests rely on.
+/// A CV% for a console row: `{:.1}` below [`CV_PCT_FIXED_MAX`], three significant
+/// figures in scientific notation (`7.64e35`) above, `inf` past overflow. The `e`
+/// spelling parses back in R and Python (ferx-r's tests rely on it).
 fn console_cv_pct(cv: f64) -> String {
     if cv.is_finite() && cv >= CV_PCT_FIXED_MAX {
         format!("{:.2e}", cv)
@@ -142,11 +134,9 @@ fn yaml_f64_6(v: f64) -> String {
     }
 }
 
-/// Largest absolute component of [`FitResult::final_gradient`], or `None` when
-/// the fit reported no gradient (#1934). A non-finite component makes the whole
-/// norm `NaN` rather than being dropped — `f64::max` discards `NaN`, so a plain
-/// fold would report the finite components of a broken gradient as if they were
-/// all of it.
+/// Largest absolute component of [`FitResult::final_gradient`], or `None` without
+/// one (#1934). A non-finite component makes the result `NaN` (a plain
+/// `f64::max` fold would drop it).
 fn final_gradient_max_abs(result: &FitResult) -> Option<f64> {
     let g = result.final_gradient.as_ref()?;
     Some(g.iter().fold(0.0_f64, |m, x| {
@@ -158,12 +148,9 @@ fn final_gradient_max_abs(result: &FitResult) -> Option<f64> {
     }))
 }
 
-/// The `Final gradient:` line printed under `Converged:` (#1934), or `None` when
-/// the fit reported no gradient. It is |g|∞ in the packed optimizer coordinates
-/// (log-θ, Cholesky-Ω, log-σ), labelled with where the vector came from. A
-/// `converged` verdict next to a gradient far from zero is the signal #1934's
-/// false stop carried (|g|∞ 1.14 against ~1e-3 at the optimum) that no other
-/// line of the report showed.
+/// The `Final gradient:` line under `Converged:` (#1934), or `None`: |g|∞ in the
+/// packed optimizer coordinates, labelled with its source. Exposes a false stop
+/// (#1934: |g|∞ 1.14 against ~1e-3 at the optimum).
 fn final_gradient_line(result: &FitResult) -> Option<String> {
     let norm = final_gradient_max_abs(result)?;
     let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
@@ -194,31 +181,21 @@ fn sd_from_var(var: f64) -> f64 {
     }
 }
 
-/// The console parenthetical describing a random-effect variance on the scale
-/// the effect enters (#1643): CV% for log-normal, SD for additive and logit,
-/// nothing for a custom expression. `None` for the type means "unknown" (a
-/// `.fitrx` saved before #1643, an ETA with no `eta_param_info` entry) and keeps
-/// the log-normal CV% every row printed before.
-///
-/// `weighted` marks a sample-size-weighted kappa (#1031): its variance is the
-/// unweighted γ², so a CV% or SD of it is that of a weight-1 arm and is
-/// labelled so (#1666) — the line after the row gives the same figure at the
-/// typical weight (#1683), built by the same [`spread_note`].
+/// The console note for a random-effect variance on its scale (#1643): CV% for
+/// log-normal, SD for additive and logit, nothing for custom; `None` type
+/// (unknown, e.g. a pre-#1643 `.fitrx`) keeps the log-normal CV%. `weighted`
+/// marks a sample-size-weighted kappa (#1031), labelled as the weight-1 arm
+/// (#1666); see [`spread_note`].
 fn variance_note(t: Option<EtaParamType>, var: f64, weighted: bool) -> Option<String> {
     let at_weight = if weighted { " at weight 1" } else { "" };
     spread_note(t, var, at_weight)
 }
 
-/// The spread of a random effect whose variance **at the arm described** is
-/// `var`, on the scale of type `t`, qualified by `at`: `CV% = cv_pct(var){at}`
-/// for log-normal and unknown, `SD = √var{at}` for additive,
-/// `SD = √var{at}, logit scale` for logit, nothing for custom. The one
-/// formatter behind a kappa's row ([`variance_note`], the row's `var`, `at` =
-/// `" at weight 1"`) and its weight line (`var / n`, `at` =
-/// `" at NARM = 4.0000"`, #1697), so the two cannot word the same quantity
-/// differently. It takes the variance, not an SD: the exact log-normal CV is
-/// not linear in the SD, so the typical arm's CV% is `cv_pct(var / n)`, not
-/// `100 · √var / √n` (#1858).
+/// The spread of a random effect with variance `var` at the arm described, on the
+/// scale of type `t`, qualified by `at`: `CV% = cv_pct(var){at}` (log-normal /
+/// unknown), `SD = √var{at}` (additive, `, logit scale` for logit), nothing for
+/// custom. Shared by a kappa's row and its weight line (#1697). Takes the variance:
+/// the typical arm's CV% is `cv_pct(var / n)`, not `100 · √var / √n` (#1858).
 fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
     match t {
         None | Some(EtaParamType::LogNormal) => {
@@ -232,35 +209,26 @@ fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
     }
 }
 
-/// The YAML line describing a random-effect variance on its scale (#1643), rendered from
-/// [`estimates::spread_field`], the field the `omega:` / `omega_iov:` sections write:
-/// `cv_pct` for log-normal (and unknown, as before), `sd` for additive and
-/// logit, nothing for custom. Indented for an `omega`/`omega_iov` entry.
-///
-/// For a weighted kappa this is the weight-1 figure, like `variance` beside it
-/// (#1666); the entry's `weight` key marks that, and `sd_at_typical_weight`
-/// carries the typical arm — with, for log-normal and unknown, a
-/// `cv_pct_at_typical_weight` ([`typical_cv_yaml_line`]), since the exact CV%
-/// is not `100 · sd_at_typical_weight` (#1858).
+/// The YAML line for a random-effect variance on its scale (#1643), rendered from
+/// [`estimates::spread_field`]: `cv_pct` (log-normal / unknown), `sd` (additive,
+/// logit), nothing for custom. For a weighted kappa it is the weight-1 figure
+/// (#1666); see [`typical_cv_yaml_line`] for the typical arm (#1858).
 #[cfg(test)]
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
     estimates::spread_field(t, var).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
-/// A weighted kappa's `cv_pct_at_typical_weight` YAML line: `cv_pct` of the
-/// typical arm's variance `var_at` (`var / n`), the CV% the console's weight
-/// line prints, for log-normal and unknown types; `None` for the rest, whose
-/// `sd_at_typical_weight` already is the console's figure. Rendered from
-/// [`estimates::typical_cv_field`], the field the `omega_iov:` section writes.
+/// A weighted kappa's `cv_pct_at_typical_weight` YAML line (`cv_pct(var / n)`) for
+/// log-normal and unknown types, else `None`. Rendered from
+/// [`estimates::typical_cv_field`].
 #[cfg(test)]
 fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> {
     estimates::typical_cv_field(t, var_at).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
-/// The type of the ETA called `name`, looked up **by name** in
-/// `eta_param_info`: that list is in statement order, not `eta_names` order,
-/// and holds one entry per individual parameter the ETA appears in. All
-/// entries agree → that type; any disagreement → `Custom`; none → `None`.
+/// The type of the ETA called `name`, looked up **by name** in `eta_param_info`
+/// (statement order, one entry per use): all agree → that type; disagreement →
+/// `Custom`; none → `None`.
 fn eta_type(result: &FitResult, name: &str) -> Option<EtaParamType> {
     let mut types = result
         .eta_param_info
@@ -293,10 +261,8 @@ fn status_shows_cv(status: &CovarianceStatus) -> bool {
     )
 }
 
-/// The typical-value θ an ETA is linked to (`EtaParamInfo::linked_theta`): the
-/// θ the ETA is added to directly, as in `THETA + ETA` or
-/// `inv_logit(THETA + ETA)`. [`OmegaRowsOptions::typical_value_spread`] reads it
-/// to put an additive ETA's SD and a logit ETA's ±1 SD on the scale of that θ.
+/// The typical-value θ an ETA is added to directly (`THETA + ETA`,
+/// `inv_logit(THETA + ETA)`), read by [`OmegaRowsOptions::typical_value_spread`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EtaLinkedTheta {
     /// The θ's name, as printed in the `at NAME = …` clause.
@@ -304,22 +270,16 @@ pub struct EtaLinkedTheta {
     /// The θ's estimate as the fit reports it (`FitResult::theta`), untransformed.
     pub value: f64,
     /// The θ's transform (`FitResult::theta_transform`); `None` when unknown.
-    /// Decides whether a logit ETA's θ is already a probability
-    /// (`LogitProbability`) or on the logit scale; unknown falls back to the
-    /// ETA's own type.
+    /// Decides whether a logit ETA's θ is already a probability.
     pub transform: Option<ThetaTransform>,
 }
 
-/// The facts an `--- OMEGA Estimates ---` row reads, borrowed from wherever
-/// they live: a [`FitResult`] ([`OmegaRowsInput::from_result`]), or a wrapper's
-/// own copy of the fit at print time (ferx-r's `print.ferx_fit()`, #1859). Both
-/// then print through [`format_omega_rows_from`], so the rows cannot drift
-/// between the CLI, [`format_summary`] and a wrapper. The OMEGA twin of
-/// [`KappaRowsInput`].
+/// The facts an `--- OMEGA Estimates ---` row reads, borrowed from a [`FitResult`]
+/// ([`OmegaRowsInput::from_result`]) or a wrapper's copy (ferx-r, #1859); both print
+/// through [`format_omega_rows_from`]. The OMEGA twin of [`KappaRowsInput`].
 ///
-/// Every slice is indexed by ETA; a short or empty slice reads as the field's
-/// default for the missing ETAs (named `ETA`, not fixed, no SE, unknown type,
-/// not initialised as an SD, no linked θ).
+/// Slices are indexed by ETA; a short slice reads as the defaults (named `ETA`, not
+/// fixed, no SE, unknown type, no linked θ).
 #[derive(Debug, Clone)]
 pub struct OmegaRowsInput<'a> {
     /// The between-subject covariance matrix; one row per ETA, its diagonal
@@ -329,16 +289,11 @@ pub struct OmegaRowsInput<'a> {
     pub eta_names: &'a [String],
     /// Per-ETA FIX flag: a fixed ETA is labelled `[FIX]` with `SE = ---`.
     pub omega_fixed: &'a [bool],
-    /// The SEs as `run_covariance` writes `FitResult::se_omega`: one per ETA
-    /// (diagonal Ω) or the packed lower triangle (block Ω), read through
-    /// [`crate::types::omega_se_at`]. `None` (or a missing or non-finite entry) prints
-    /// `SE = N/A`.
+    /// The SEs as in `FitResult::se_omega` (per ETA, or packed lower triangle for a
+    /// block Ω), read through [`crate::types::omega_se_at`]; missing prints `N/A`.
     pub se_omega: Option<&'a [f64]>,
-    /// Per-ETA scale, already resolved **by name** from
-    /// `FitResult::eta_param_info` (whose order is statement order, not ETA
-    /// order): the one type every use of the ETA agrees on, `Custom` when they
-    /// disagree, `None` when it has none (a `.fitrx` saved before #1643, an ETA
-    /// no parameter classifies), which prints the log-normal CV%.
+    /// Per-ETA scale, resolved **by name** from `FitResult::eta_param_info`:
+    /// `Custom` on disagreement, `None` when unknown (prints the log-normal CV%).
     pub eta_param_types: Vec<Option<EtaParamType>>,
     /// Per-ETA SD-init flag (`FitResult::omega_init_as_sd`), for
     /// [`OmegaRowsOptions::init_as_sd`].
@@ -373,10 +328,8 @@ impl<'a> OmegaRowsInput<'a> {
     }
 }
 
-/// The θ the ETA called `name` is linked to, by the same by-name rule as
-/// [`eta_type`]: every `eta_param_info` entry for the ETA names the same θ →
-/// that θ, with its estimate and transform; disagreement, no link, or a name
-/// not in `theta_names` → `None`.
+/// The θ the ETA called `name` is linked to, by [`eta_type`]'s by-name rule;
+/// `None` on disagreement, no link, or a name not in `theta_names`.
 fn eta_linked_theta(result: &FitResult, name: &str) -> Option<EtaLinkedTheta> {
     let mut links = result
         .eta_param_info
@@ -395,22 +348,17 @@ fn eta_linked_theta(result: &FitResult, name: &str) -> Option<EtaLinkedTheta> {
     })
 }
 
-/// How [`format_omega_rows_from`] renders its rows. `Default` (everything off)
-/// is what the CLI and [`format_summary`] print. Each flag adds one thing a
-/// wrapper's print may want; build with `..Default::default()` so a flag added
-/// later does not break the caller. The rows carry no glyph above ASCII of
-/// their own either way (names are printed as given).
+/// How [`format_omega_rows_from`] renders its rows. `Default` is what the CLI and
+/// [`format_summary`] print; build with `..Default::default()`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OmegaRowsOptions {
     /// A scale tag after the label, in a 12-wide column: `[log-normal]`,
     /// `[additive]`, `[logit]` (both logit types) or `[custom]`; blank for an
     /// unknown type.
     pub type_tag: bool,
-    /// Extend the note with the ETA's spread at its linked θ: an additive ETA's
-    /// `CV% = SD/|θ|·100 at NAME = θ` (when `|θ| > 1e-12`), a logit ETA's
-    /// `+/-1 SD = [lo, hi]` on the probability scale. Part of the note, so
-    /// absent with it (custom ETA, failed or SIR-fallback covariance) and for
-    /// an ETA with no linked θ.
+    /// Extend the note with the ETA's spread at its linked θ: additive
+    /// `CV% = SD/|θ|·100 at NAME = θ` (when `|θ| > 1e-12`), logit `+/-1 SD = [lo, hi]`
+    /// on the probability scale. Absent whenever the note is.
     pub typical_value_spread: bool,
     /// `  [initial specified as SD]` after the SE of an ETA whose initial value
     /// was written `omega NAME ~ X (sd)`.
@@ -437,13 +385,10 @@ fn eta_type_tag(t: Option<EtaParamType>) -> &'static str {
     }
 }
 
-/// The clause [`OmegaRowsOptions::typical_value_spread`] appends to the note
-/// of an ETA of type `t` and variance `var` linked to `theta`, or `None` when
-/// there is nothing to add: additive `, CV% = … at NAME = …` (`|θ| ≤ 1e-12`
-/// adds nothing — a CV% about zero is meaningless), logit
-/// `, +/-1 SD = [lo, hi]` around the θ on the logit scale — `logit(θ)` when
-/// the θ is a probability (its transform, else the ETA's type, says
-/// `LogitProbability`), skipped when that is not finite (a θ outside (0, 1)).
+/// The clause [`OmegaRowsOptions::typical_value_spread`] appends, or `None`:
+/// additive `, CV% = … at NAME = …` (nothing for `|θ| ≤ 1e-12`), logit
+/// `, +/-1 SD = [lo, hi]` around `logit(θ)` when θ is a probability, skipped when
+/// not finite.
 fn typical_value_clause(
     t: Option<EtaParamType>,
     var: f64,
@@ -480,15 +425,11 @@ fn typical_value_clause(
     }
 }
 
-/// The OMEGA rows the CLI's `--- OMEGA Estimates ---` section and
-/// [`format_summary`] print, one `name = variance  (note)  SE = …` line per
-/// ETA. The note is the exact log-normal CV% (#1858) or the SD on the ETA's
-/// scale (#1643); it is absent for a custom ETA, and on every row when the
-/// covariance step failed or fell back to SIR. A fixed ETA reads
-/// `name [FIX] = …  SE = ---`. `opts` adds the extras a wrapper's print shows
-/// (see [`OmegaRowsOptions`]); with the default it prints exactly the CLI's
-/// rows. One line per `\n`; empty for a zero-row `omega`. Off-diagonal
-/// block-Ω correlations are not part of the rows.
+/// The OMEGA rows of the CLI and [`format_summary`]: one
+/// `name = variance  (note)  SE = …` line per ETA. The note is the exact CV%
+/// (#1858) or the SD on the ETA's scale (#1643); absent for custom ETAs and when
+/// covariance failed or fell back to SIR. Fixed: `name [FIX] = …  SE = ---`.
+/// Off-diagonal correlations are not included.
 pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) -> String {
     format_omega_rows_held(input, opts, &|_| false)
 }
@@ -561,11 +502,9 @@ fn format_omega_rows_held(
     out
 }
 
-/// The `--- SIGMA Estimates ---` rows of [`print_results`] and
-/// [`format_summary`]: `name = σ  (CV% = σ·100)  SE = …` for a proportional σ
-/// (stored on the SD scale, so its CV% is direct), `name = σ  SE = …` for an
-/// additive one (observation units, no CV%), `[FIX]` with `SE = ---` for a
-/// fixed one. `sigma_types` is parallel to `sigma`.
+/// The `--- SIGMA Estimates ---` rows: `name = σ  (CV% = σ·100)  SE = …` for a
+/// proportional σ (SD scale), `name = σ  SE = …` for additive, `[FIX]` with
+/// `SE = ---` when fixed.
 fn format_sigma_rows(result: &FitResult) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -607,10 +546,8 @@ fn format_sigma_rows(result: &FitResult) -> String {
     out
 }
 
-/// Why `[mixture]` override `o` has no standard error (#2833), or `None` when it has one:
-/// a [`FitResult::held_at_bound`] entry of **its** class, family and base index. Matching
-/// on `(kind, index)` alone would name the base parameter, which is [`se_held`]'s job;
-/// matching any `class.is_some()` would hold every override of the base when one is.
+/// Why `[mixture]` override `o` has no SE (#2833), or `None`: a
+/// [`FitResult::held_at_bound`] entry of **its** class, family and base index.
 pub(crate) fn override_held(result: &FitResult, o: &MixtureOverrideParam) -> Option<HeldReason> {
     result
         .held_at_bound
@@ -658,10 +595,8 @@ impl OverrideRow<'_> {
     }
 }
 
-/// The override rows of `result` (#2833), in `mixture_overrides` order. Empty with no
-/// override, and when the result records values without one descriptor each (a hand-built
-/// result, a bundle older than the descriptors): such a row cannot be named. The one
-/// source every renderer reads, so the console, the YAML and the table cannot disagree.
+/// The override rows of `result` (#2833), in `mixture_overrides` order; empty
+/// without one descriptor per value (such a row cannot be named).
 fn override_rows(result: &FitResult) -> Vec<OverrideRow<'_>> {
     let Some(values) = result.mixture_overrides.as_deref() else {
         return Vec::new();
@@ -694,10 +629,8 @@ fn override_rows(result: &FitResult) -> Vec<OverrideRow<'_>> {
         .collect()
 }
 
-/// The `--- Mixture per-class overrides ---` section of [`print_results`] and
-/// [`format_summary`] (#2833), header included, or `""` without an override. An Ω row
-/// reads like an OMEGA row (`name = variance  (CV% = …)  SE = …`), a σ row like a SIGMA
-/// row; `[FIX]` with `SE = ---` for a fixed override, `SE = N/A` for a held one.
+/// The `--- Mixture per-class overrides ---` section (#2833), or `""`. Rows read
+/// like OMEGA / SIGMA rows; `SE = ---` when fixed, `SE = N/A` when held.
 fn format_mixture_override_rows(result: &FitResult) -> String {
     use std::fmt::Write;
     let rows = override_rows(result);
@@ -740,13 +673,9 @@ fn format_mixture_override_rows(result: &FitResult) -> String {
     out
 }
 
-/// A weighted kappa's (#1031) weight source text and, when the dataset gave a
-/// typical weight `n > 0` and the variance is non-negative, `(n, var / n)` —
-/// the variance of a typical arm, from which the weight line's CV% or SD and
-/// the YAML's `sd_at_typical_weight` / `cv_pct_at_typical_weight` are all
-/// derived. `None` for an unweighted kappa. The console's weight line and the
-/// fit YAML's `weight*` keys (#1660) both read this, so the two cannot print
-/// different numbers.
+/// A weighted kappa's (#1031) weight source and, with a typical weight `n > 0` and
+/// non-negative variance, `(n, var / n)`. `None` when unweighted. Shared by the
+/// console weight line and the YAML `weight*` keys (#1660).
 fn kappa_weight_facts<'a>(
     weights: &'a [Option<String>],
     weight_typical: &[Option<f64>],
@@ -761,14 +690,10 @@ fn kappa_weight_facts<'a>(
     Some((w, typical))
 }
 
-/// The facts a `--- KAPPA (IOV) Estimates ---` row reads, borrowed from
-/// wherever they live: a [`FitResult`] ([`KappaRowsInput::from_result`]), or a
-/// wrapper's own copy of the fit at print time (ferx-r's `print.ferx_fit()`,
-/// #1825). Both then print through [`format_kappa_rows_from`], so the rows
-/// cannot drift between the CLI, [`format_summary`] and a wrapper.
-///
-/// Every slice is indexed by kappa; a short or empty slice reads as the field's
-/// default for the missing kappas (not fixed, no SE, unknown type, unweighted).
+/// The facts a `--- KAPPA (IOV) Estimates ---` row reads, from a [`FitResult`]
+/// ([`KappaRowsInput::from_result`]) or a wrapper's copy (ferx-r, #1825); both
+/// print through [`format_kappa_rows_from`]. Slices are indexed by kappa; a short
+/// slice reads as the defaults.
 #[derive(Debug, Clone)]
 pub struct KappaRowsInput<'a> {
     /// The IOV covariance matrix; one row per kappa, its diagonal printed.
@@ -818,10 +743,8 @@ impl<'a> KappaRowsInput<'a> {
 /// and [`format_summary`] print.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct KappaRowsOptions {
-    /// Spell the formatter's own two non-ASCII glyphs in ASCII: `→` as `->`
-    /// and `κ` as `kappa`. For a console that cannot print UTF-8 (R in a C
-    /// locale prints them as `<U+2192>` / `<U+03BA>`). Names and weight
-    /// columns are printed as given either way.
+    /// Spell `→` as `->` and `κ` as `kappa`, for consoles without UTF-8 (R in a C
+    /// locale).
     pub ascii: bool,
 }
 
@@ -835,11 +758,9 @@ fn format_kappa_rows(result: &FitResult) -> String {
     })
 }
 
-/// The KAPPA (IOV) rows the CLI's `--- KAPPA (IOV) Estimates ---` section and
-/// [`format_summary`] print, one `name = variance  (note)  SE = …` line per
-/// kappa, each weighted kappa (#1031) followed by its weight line. One line per
-/// `\n`; empty for a zero-row `omega_iov`. Off-diagonal `block_kappa`
-/// correlations are not part of the rows.
+/// The KAPPA (IOV) rows of the CLI and [`format_summary`]: one
+/// `name = variance  (note)  SE = …` line per kappa, each weighted kappa (#1031)
+/// followed by its weight line. Off-diagonal correlations are not included.
 pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) -> String {
     format_kappa_rows_held(input, opts, &|_| false)
 }
@@ -888,16 +809,9 @@ fn format_kappa_rows_held(
         let kappa_type = input.kappa_param_types.get(i).copied();
         let note = note_suffix(variance_note(kappa_type, var, weight.is_some()), show_cv);
         let _ = writeln!(out, "  {:<20} = {:.6}{}  SE = {}", label, var, note, se_str);
-        // Sample-size-weighted IOV (#1031): the estimate above is the
-        // *unweighted* γ² — the quantity a published MBMA reports — so
-        // print the effective SD at the median arm alongside it. A raw
-        // γ of 2.0 on a logit scale reads as alarming until it is divided.
-        // The spread is the row's note at the typical arm — the same
-        // `spread_note`, its `at` clause naming the arm (#1683, #1697) — so it
-        // goes wherever the note does (#1698): no spread when `show_cv` is
-        // false (covariance failed or fell back to SIR) or the type has no
-        // note (custom), the bare line as when no typical weight exists. The
-        // YAML's `sd_at_typical_weight` is written regardless, like `sd`.
+        // Weighted IOV (#1031): the estimate is the unweighted γ², so also print
+        // the spread at the typical arm via the same `spread_note` (#1683, #1697),
+        // wherever the note is shown (#1698). The YAML writes it regardless.
         if let Some((w, typical)) = weight {
             let spread = typical.filter(|_| show_cv).and_then(|(n, var_at)| {
                 spread_note(kappa_type, var_at, &format!(" at {} = {:.4}", w, n))
@@ -934,10 +848,8 @@ fn kappa_name_at_level(result: &FitResult, k: usize) -> String {
     }
 }
 
-/// The console's `--- Kappa Shrinkage (pooled) ---` block, one string per line
-/// (#2083), empty when the fit has no kappa shrinkage. The pooled lines name each κ's
-/// level under nested levels, as [`format_summary`] does, since the pool is that
-/// level's groups; the per-occasion lines keep the bare names, as there.
+/// The console's `--- Kappa Shrinkage (pooled) ---` lines (#2083), empty without
+/// kappa shrinkage. Pooled lines name each κ's level under nested levels.
 pub(crate) fn format_kappa_shrinkage_lines(result: &FitResult) -> Vec<String> {
     let mut lines = Vec::new();
     if result.shrinkage_kappa.is_empty() {
@@ -1019,19 +931,12 @@ pub struct OffDiagCorr<'a> {
     pub corr_source: OffDiagCorrSource,
 }
 
-/// The off-diagonal entries of the random-effect covariance matrix `m` (Ω, or
-/// Ω_IOV of a `block_kappa`) that the console's `--- Correlations ---` blocks
-/// and [`format_summary`] report, in row-major lower-triangle order: every
-/// `(i, j)`, `j < i`, with `|cov| > 1e-15`. Its correlation is the
-/// `param_corr` entry when the matrix is given (`FitResult::omega_param_corr`
-/// / `omega_iov_param_corr`), else `cov / (√var_i · √var_j)` (0 when either
-/// variance is not positive); [`OffDiagCorr::corr_source`] says which.
-///
-/// `names` is indexed like `m`; a missing name reads as `default_name` (the
-/// console uses `ETA` for Ω and `KAPPA` for Ω_IOV). The console and summary
-/// walks for Ω and Ω_IOV all read this, so they cannot disagree on which pairs
-/// are correlated (#1682); a wrapper (ferx-r's `print.ferx_fit()`, #2231)
-/// reads the same facts and formats each line itself.
+/// The off-diagonal entries of `m` (Ω, or Ω_IOV of a `block_kappa`) that the
+/// console and [`format_summary`] report: every `(i, j)`, `j < i`, with
+/// `|cov| > 1e-15`, in row-major lower-triangle order. The correlation is the
+/// given `param_corr` entry, else `cov / (√var_i · √var_j)` (0 for a non-positive
+/// variance); [`OffDiagCorr::corr_source`] says which. A missing name reads as
+/// `default_name`. One source for every writer and wrappers (#1682, #2231).
 pub fn offdiag_corrs<'a>(
     m: &nalgebra::DMatrix<f64>,
     param_corr: Option<&nalgebra::DMatrix<f64>>,
@@ -1183,30 +1088,15 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
 }
 
 /// Number of coefficients at or above which a θ vector or level block (#1064) is
-/// reported as its own compact section instead of one entry per θ in the θ table.
-///
-/// The count is of the block's entries in `theta_names` — its θ, `FIX` or not —
-/// not of its levels: a `sum_to_zero` block's dependent level has no θ, so a
-/// 21-level block (20 coefficients) is compacted and a 20-level one (19) is not.
-/// A `FIX` coefficient counts here, since it still takes a row, although the
-/// report lists it as `FIX` rather than free (#1891).
-/// [`compact_theta_blocks`] applies the rule; call it rather than comparing against
-/// this constant, so a caller cannot drift from the writers (#1623).
-///
-/// A four-level block reads better inline, exactly as it did before the
-/// feature existed; an unstructured placebo effect with 800 levels would bury
-/// the structural parameters it exists to protect.
+/// reported in its own compact section. Counts the block's θ in `theta_names`
+/// (`FIX` included, #1891), not its levels: a 21-level `sum_to_zero` block (20 θ)
+/// is compacted. Use [`compact_theta_blocks`] rather than this constant (#1623).
 pub const THETA_BLOCK_COMPACT_MIN: usize = 20;
 
-/// The θ index ranges of the vector / level blocks in `names` that carry
-/// [`THETA_BLOCK_COMPACT_MIN`] or more coefficients — the blocks that `print_results`,
-/// `format_summary` and the fit YAML report in their own compact section.
-///
-/// Blocks are recognised from the `NAME[level]` naming the parser assigns, which
-/// is unambiguous: a scalar θ name is `\w+`, so it can never contain a bracket, and
-/// neural-network weights are named without one. So any run of `NAME[…]` names is
-/// a block — a counted `theta NAME[N]` block as well as a level block. Levels of a
-/// block are contiguous by construction.
+/// The θ index ranges of the vector / level blocks in `names` with
+/// [`THETA_BLOCK_COMPACT_MIN`] or more coefficients. Blocks are runs of
+/// `NAME[…]` names (a scalar θ name never contains a bracket); levels are
+/// contiguous by construction.
 pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
     let block_of = |n: &String| -> Option<String> {
         n.strip_suffix(']')
@@ -1231,19 +1121,10 @@ pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<us
     out
 }
 
-/// `(min, median, max)` of a block's values — the statistic `print_results`,
-/// `format_summary` and the fit YAML print for each block [`compact_theta_blocks`]
-/// returns. The median is the **lower** of the two middle values on an even count
-/// — the levels are a nuisance block, not a quantity anyone interpolates.
-///
-/// Public so a binding that collapses the same blocks (ferx-r's `print.ferx_fit`)
-/// prints the same median as the engine instead of restating the rule (#1812):
-/// pass it `&theta[range]` for each range `compact_theta_blocks` returns.
-///
-/// Values are ordered by [`f64::total_cmp`], so a `NaN` sorts past `+inf` (or,
-/// sign bit set, below `-inf`) rather than being dropped. An empty slice has no
-/// summary and returns `(NaN, NaN, NaN)`; `compact_theta_blocks` never yields an
-/// empty block.
+/// `(min, median, max)` of a block's values, as every writer prints for a block
+/// from [`compact_theta_blocks`]. The median is the **lower** middle value on an
+/// even count. Public so bindings print the same median (#1812). Ordered by
+/// [`f64::total_cmp`] (`NaN` is not dropped); empty → `(NaN, NaN, NaN)`.
 pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
     if values.is_empty() {
         return (f64::NAN, f64::NAN, f64::NAN);
@@ -1264,10 +1145,8 @@ struct ThetaBlockSummary {
     /// single θs fixed through `theta_fixed` (an API caller, or the outer
     /// optimizer freezing a θ with no effect on the objective).
     n_fixed: usize,
-    /// `(min, median, max)` over **every** coefficient, FIX or not: a fixed level
-    /// is still the value the model predicts with, so leaving it out would
-    /// misdescribe what the block absorbs, and a fully `FIX` block would have
-    /// nothing to summarise.
+    /// `(min, median, max)` over **every** coefficient, FIX included: a fixed
+    /// level is still what the model predicts with.
     min: f64,
     median: f64,
     max: f64,
@@ -1285,10 +1164,8 @@ impl ThetaBlockSummary {
     }
 }
 
-/// The whole THETA BLOCKS section — header and one line per block — or `""` when
-/// no block is compact. `print_results` prints it to stderr verbatim and
-/// `format_summary` appends it with each block line indented by `indent`, so the
-/// console and the saved report are one writer and a test of either covers both.
+/// The THETA BLOCKS section, or `""` when no block is compact. One writer for
+/// `print_results` and `format_summary` (lines indented by `indent`).
 fn format_theta_blocks_section(
     result: &FitResult,
     theta_blocks: &[(String, std::ops::Range<usize>)],
@@ -1335,19 +1212,10 @@ fn theta_block_summary(result: &FitResult, range: std::ops::Range<usize>) -> The
     }
 }
 
-/// Render the per-parameter prior report (#254), or nothing when no prior is in
-/// force.
-///
-/// One writer for both the console (`print_results`) and the file summary, so
-/// the two cannot drift — the numbers a user quotes from a terminal and the ones
-/// in a saved report have to be the same numbers.
-///
-/// The column that earns its place is `shift`: `(x̂ − m)/s` in the space the
-/// prior lives in. A raw difference only says the estimate moved; the
-/// standardized one says whether the data and the prior actually disagree, which
-/// is the question a MAP fit is asked. `family` is printed because it is decided
-/// by the parameter's declared *bounds*, not by the prior declaration — see
-/// [`crate::estimation::priors`].
+/// Render the per-parameter prior report (#254), or nothing without priors. One
+/// writer for the console and the file summary. `shift` is `(x̂ − m)/s` in the
+/// prior's space (whether data and prior disagree); `family` is decided by the
+/// parameter's bounds — see [`crate::estimation::priors`].
 fn write_prior_summary(out: &mut impl std::fmt::Write, result: &FitResult) {
     if result.prior_summary.is_empty() {
         return;
@@ -1379,24 +1247,10 @@ fn write_prior_summary(out: &mut impl std::fmt::Write, result: &FitResult) {
     );
 }
 
-/// The covariance-step status with the estimator that produced it appended, e.g.
-/// `computed (R⁻¹SR⁻¹, covariance_method = rsr)` (#1382).
-///
-/// A condition number is not comparable across estimators — the same fit was
-/// measured at 1.42e8 under the sandwich and 3.68e5 under `s`, both correct —
-/// so the status line has to say which one it is before the figure below it can
-/// be compared to NONMEM (whose `$COVARIANCE` default is `RSR`, not `R`) or to
-/// another ferx run. Falls back to the bare status when there is no matrix and
-/// hence no estimator to name.
-/// Whether `ofv` on this result is the final Laplace pass of an IMP/IMPMAP fit
-/// (#2654), which NONMEM's `METHOD=IMP` objective is not.
-///
-/// `FitResult::method` is the last *estimating* stage, so it alone is not enough:
-/// `method = [imp, laplace]` + `agq_eval_only` still reports `IMP` while `ofv`
-/// holds the quadrature marginal the trailing stage wrote. A trailing
-/// `imp_eval_only` stage is the one evaluator that leaves `ofv` alone. A standalone
-/// `imp_eval_only` run scores `ofv` with the same Laplace objective at the initial
-/// parameters, so it counts too.
+/// Whether `ofv` is the final Laplace pass of an IMP/IMPMAP fit (#2654), which
+/// NONMEM's `METHOD=IMP` objective is not. `FitResult::method` alone is not enough:
+/// a trailing `agq_eval_only` overwrites `ofv`, while a trailing `imp_eval_only`
+/// leaves it; a standalone `imp_eval_only` run counts too.
 fn ofv_is_imp_laplace(result: &FitResult) -> bool {
     use crate::types::EstimationMethod::{Imp, Impmap};
     if !matches!(result.method, Imp | Impmap) {
@@ -1506,10 +1360,8 @@ fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
         }
     });
     let _ = writeln!(out, "{indent}{ofv_label}:  {:.4}", result.ofv);
-    // Under parameter priors (#254) the OFV above is the penalized objective
-    // that was minimised, so the split is printed right under it — and AIC/BIC
-    // are labelled with the half they are computed from, since an information
-    // criterion from a penalized objective would not be one.
+    // Under priors (#254) the OFV is penalized, so print the split and label AIC/BIC
+    // with the half they are computed from.
     if !result.prior_summary.is_empty() {
         let _ = writeln!(out, "{indent}  data:  {:.4}", result.ofv_data);
         let _ = writeln!(out, "{indent}  prior: {:.4}", result.ofv_prior);
@@ -1538,6 +1390,10 @@ fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
     }
 }
 
+/// The covariance-step status with its estimator appended, e.g.
+/// `computed (R⁻¹SR⁻¹, covariance_method = rsr)` (#1382): condition numbers are not
+/// comparable across estimators (one fit: 1.42e8 sandwich, 3.68e5 `s`). Bare status
+/// without a matrix.
 fn covariance_status_label(result: &FitResult) -> String {
     let status = match result.covariance_status {
         CovarianceStatus::Computed => "computed",
@@ -1632,10 +1488,7 @@ pub fn print_results(result: &FitResult) {
     #[cfg(not(feature = "nn"))]
     let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
-    // #1064: a θ level block with hundreds of levels is a nuisance
-    // block — the point is what it absorbs, not the individual values. Keep it
-    // out of the main table and summarise it below, so the structural
-    // parameters it exists to protect stay readable.
+    // #1064: summarise large θ level blocks below rather than in the main table.
     let theta_blocks = compact_theta_blocks(&result.theta_names);
     let blocked_theta_indices: std::collections::HashSet<usize> =
         theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
@@ -1694,11 +1547,8 @@ pub fn print_results(result: &FitResult) {
 
     // Omega estimates
     let n_eta = result.omega.nrows();
-    // A fixed-effects-only fit (`n_eta = 0`, #989) has no Omega to report. Printing
-    // the header above an empty body reads as an estimation that failed rather than
-    // one that was never asked for, so suppress the whole section; the loops below
-    // are already no-ops at 0. Mirrors the `if n_eta > 0` guard the YAML writer's
-    // `--- OMEGA ---` section already carries.
+    // A fixed-effects-only fit (`n_eta = 0`, #989) prints no OMEGA section (an empty
+    // header would read as a failure), as the YAML writer does.
     if n_eta > 0 {
         eprintln!("\n--- OMEGA Estimates ---");
     }
@@ -1887,14 +1737,10 @@ pub fn print_results(result: &FitResult) {
     eprintln!("{}\n", "=".repeat(60));
 }
 
-/// Render a concise, `psn::sumo`-style summary of a completed fit as a
-/// `String`: parameter estimates plus basic run information. Unlike
-/// [`print_results`] (which streams the full, kitchen-sink report to stderr),
-/// this *returns text* so it can be sent to stdout, redirected to a file, or
-/// asserted on in a test. It stays focused on the headline numbers a modeller
-/// scans first — convergence, objective function, the parameter table with
-/// %RSE, key diagnostics (condition number, shrinkage) and run metadata — and
-/// is what the `ferx summary <run.fitrx>` subcommand prints.
+/// Render a concise, `psn::sumo`-style summary of a completed fit as a `String`
+/// (unlike [`print_results`], which streams the full report to stderr):
+/// convergence, objective, the parameter table with %RSE, key diagnostics and run
+/// metadata. What `ferx summary <run.fitrx>` prints.
 pub fn format_summary(result: &FitResult) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -2055,10 +1901,8 @@ pub fn format_summary(result: &FitResult) -> String {
             let _ = writeln!(out, "  Eta shrinkage: {}", parts.join(", "));
         }
     }
-    // Kappa shrinkage (#1667): pooled, then one line per occasion slot. Unlike
-    // the console, which prints `K NaN` and nests the slots under the pooled
-    // block, non-finite entries are dropped as for the ETAs, and each slot line
-    // names itself so it reads without a pooled parent.
+    // Kappa shrinkage (#1667): pooled, then one self-naming line per occasion slot;
+    // non-finite entries are dropped as for the ETAs.
     let kappa_parts = |sh: &[f64]| -> Vec<String> {
         sh.iter()
             .enumerate()
@@ -2108,14 +1952,10 @@ pub fn format_summary(result: &FitResult) -> String {
     out
 }
 
-/// Render a Markdown table comparing several runs side by side.
-///
-/// Each element of `runs` is `(label, fit)`, where `label` names the run
-/// (typically the `.fitrx` file stem) and becomes a column header. Backs
-/// `ferx summary` when given two or more bundles: one run-info table (method,
-/// convergence, OFV/AIC/BIC, ΔOFV vs the first run, runtime, sizes) followed
-/// by THETA / OMEGA / SIGMA estimate tables whose rows are the union of
-/// parameter names across all runs (a `—` marks a parameter absent from a run).
+/// Render a Markdown table comparing several `(label, fit)` runs side by side
+/// (`ferx summary` with two or more bundles): run info (method, convergence,
+/// OFV/AIC/BIC, ΔOFV vs the first run, runtime, sizes), then THETA / OMEGA / SIGMA
+/// tables over the union of names (`—` marks an absent parameter).
 pub fn format_comparison(runs: &[(String, &FitResult)]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
@@ -2372,11 +2212,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .iter()
         .any(|s| s.cens.iter().any(|&c| c != 0));
     let any_occ = population.subjects.iter().any(|s| !s.occasions.is_empty());
-    // Discrete (binary) and time-to-event rows always carry their endpoint's CMT, and
-    // that CMT is the only thing distinguishing them from the Gaussian rows they are
-    // appended after — so their presence forces the column on. Without this a
-    // binary-only or TTE-only fit (no Gaussian rows at all, hence no `obs_cmts`) would
-    // emit an sdtab with the endpoint CMT silently dropped.
+    // Discrete and TTE rows always carry their endpoint CMT, the only thing telling
+    // them from Gaussian rows, so their presence forces the column on.
     #[cfg(feature = "survival")]
     let has_endpoint_rows =
         |s: &SubjectResult| !s.discrete_rows.is_empty() || !s.tte_rows.is_empty();
@@ -2425,10 +2262,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .unwrap_or(0);
     let any_mixture = n_mix_classes > 0;
     let mut mixest_col = Vec::with_capacity(n_total);
-    // The generating class of a `--simulate` population (#2372), next to the fitted one.
-    // An `[output] MIXNUM` on a `[mixture]` model (#2784) arrives as an extra column
-    // holding the class, simulated or fitted; it replaces this one rather than sitting
-    // beside it under the same name.
+    // The generating class of a `--simulate` population (#2372). An `[output] MIXNUM`
+    // on a `[mixture]` model (#2784) replaces this column rather than duplicating it.
     let any_mixnum = population
         .subjects
         .iter()
@@ -2441,10 +2276,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         let subj = &population.subjects[si];
         for j in 0..sr.ipred.len() {
             ids.push(sr.id.parse::<f64>().unwrap_or(si as f64 + 1.0));
-            // Report the raw data TIME (so sdtab joins back to the input CSV and
-            // to covtab, which is also raw); `obs_times` may be the internal
-            // shifted timeline for stacked reset occasions. Falls back to
-            // `obs_times` when no raw vector was recorded (in-memory subjects).
+            // Raw data TIME (joins back to the input CSV and covtab); falls back to
+            // `obs_times` for in-memory subjects.
             times.push(subj.readout_time(j));
             dvs.push(subj.observations[j]);
             cens_col.push(sr.cens.get(j).copied().unwrap_or(0) as f64);
@@ -2524,13 +2357,9 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
-    // Nested levels (#1082 PR4): one column per kappa, named after it, holding the κ̂ of
-    // the row's own group at the κ's level — the arm κ̂ of the row's arm, the study κ̂
-    // of its study. Unlike an η, a κ̂ varies between the rows of one subject, so it is
-    // per-row data. The group is found by the row's own labels in the level's columns
-    // (`LevelKappaEbes::columns`), so the population need not carry the fit's cells.
-    // One-level IOV fits have no `ebe_kappas_by_level` and keep their columns. A row
-    // whose labels name no group of the fit reads NaN.
+    // Nested levels (#1082): one column per kappa holding the κ̂ of the row's own
+    // group at that level (per-row, unlike η), found by the row's labels in
+    // `LevelKappaEbes::columns`. NaN when the labels name no group of the fit.
     for level in &result.ebe_kappas_by_level {
         for (k, name) in level.kappa_names.iter().enumerate() {
             let mut col = Vec::with_capacity(n_total);
@@ -2559,15 +2388,11 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         }
     }
 
-    // NOTE: sdtab intentionally does NOT emit ETA1..ETAn columns. Per-subject
-    // EBEs live in `fit$ebe_etas` on the R side; sdtab is strictly
-    // per-observation diagnostic data (see tests/map_estimates_outputs.rs::
-    // sdtab_omits_eta_columns_after_fit).
+    // sdtab intentionally emits no ETA columns (see
+    // tests/map_estimates_outputs.rs::sdtab_omits_eta_columns_after_fit).
 
-    // TAFD — mandatory, computed from dose records. Measured per reset-occasion
-    // (`occasion_first_dose_time`) so stacked occasions each restart their TAFD;
-    // `obs_times` is the internal clock, so the difference is offset-invariant
-    // and equals the raw time-after-first-dose.
+    // TAFD, per reset-occasion (`occasion_first_dose_time`), so stacked occasions
+    // each restart it; offset-invariant on the internal clock.
     {
         let vals: Vec<f64> = result
             .subjects
@@ -2600,11 +2425,9 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
                     if !sr.per_obs_tad.is_empty() {
                         return sr.per_obs_tad[j];
                     }
-                    // The data-derived TAD under NONMEM's record-order
-                    // convention (a dose at the observation's TIME is the most
-                    // recent dose), the same tie rule as the lag-aware column
-                    // above. The `[error_model]` `TAD` built-in reads Pharmpy's
-                    // grouping instead — see `Subject::time_after_dose` (#1182).
+                    // Data-derived TAD under NONMEM's record order (a dose at the
+                    // observation's TIME counts). The `[error_model]` `TAD` built-in
+                    // differs — see `Subject::time_after_dose` (#1182).
                     subj.time_after_dose_at_or_before(j)
                 })
             })
@@ -2647,24 +2470,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     cols
 }
 
-/// Append one sdtab row per discrete (binary) observation record, after the Gaussian
-/// rows (§8.8.5).
-///
-/// Every sdtab column above is built by its own independent pass over
-/// `result.subjects × sr.ipred.len()`, and [`write_sdtab_csv`] indexes each column by
-/// row — so a pass that forgot to extend would panic at write time. Rather than edit
-/// each pass (and risk missing one as columns are added later), this extends **whatever
-/// columns exist** in one place: a column it knows how to fill for a discrete record
-/// gets the value, everything else gets NaN, which the writer already renders as an
-/// empty cell. New columns therefore stay correct-by-default (blank on discrete rows)
-/// instead of silently truncating the table.
-///
-/// `CWRES` is deliberately blank: the conditional weighted residual is defined through
-/// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
-/// `IWRES` carries the standardized (Pearson) residual instead.
-/// Whether the fit's `[output]` asked for `MIXNUM` on a `[mixture]` model (#2784):
-/// `compute_extra_output_columns` then writes the class as an extra column of exactly
-/// that name.
+/// Whether `[output]` asked for `MIXNUM` on a `[mixture]` model (#2784), written by
+/// `compute_extra_output_columns` as an extra column of that name.
 fn mixnum_requested(result: &FitResult) -> bool {
     result
         .subjects
@@ -2672,16 +2479,19 @@ fn mixnum_requested(result: &FitResult) -> bool {
         .any(|sr| sr.extra_columns.iter().any(|(n, _)| n == "MIXNUM"))
 }
 
-/// The `MIXNUM` cell of subject `si`'s non-Gaussian rows: the class its data were
-/// simulated under (#2372) or, when `[output] MIXNUM` asked for the class on a mixture
-/// fit, its fitted `MIXEST` failing that (#2784) — the value the extra column carries on
-/// the subject's Gaussian rows. A subject-level scalar, like `EBE_OFV`.
+/// The `MIXNUM` cell of subject `si`'s non-Gaussian rows: its simulated class
+/// (#2372), else its fitted `MIXEST` when requested (#2784).
 fn subject_mixnum(result: &FitResult, population: &Population, si: usize, requested: bool) -> f64 {
     let simulated = population.subjects[si].simulated_mixnum;
     let fitted = requested.then(|| result.subjects[si].mixest).flatten();
     simulated.or(fitted).map_or(f64::NAN, |k| k as f64)
 }
 
+/// Append one sdtab row per discrete (binary) observation record, after the
+/// Gaussian rows (§8.8.5). Extends **whatever columns exist** in one place (each
+/// column is built by its own pass), filling known ones and NaN (blank) elsewhere,
+/// so new columns stay correct by default. `CWRES` is blank (no Gaussian residual
+/// variance); `IWRES` carries the Pearson residual.
 fn append_discrete_rows(
     cols: &mut [(String, Vec<f64>)],
     result: &FitResult,
@@ -2708,10 +2518,7 @@ fn append_discrete_rows(
                     // simulated under (#2372), or the fitted one under `[output]
                     // MIXNUM` (#2784).
                     "MIXNUM" => subject_mixnum(result, population, si, mixnum_requested),
-                    // `N_OBS` deliberately blank: `SubjectResult::n_obs` counts Gaussian
-                    // observations only, so a binary-only fit would write `N_OBS = 0` on
-                    // every row of a table plainly full of observations. Blank is honest;
-                    // 0 invites a reader to filter the dataset away.
+                    // Blank: `SubjectResult::n_obs` counts Gaussian observations only.
                     "N_OBS" => f64::NAN,
                     // CWRES, CENS, OCC, NPDE, NPD, TAFD, TAD and any [derived] /
                     // [output] column: undefined for a discrete record → blank cell.
@@ -2728,18 +2535,13 @@ fn append_discrete_rows(
 #[cfg(feature = "survival")]
 pub const TTE_RESIDUAL_COLUMNS: [&str; 4] = ["COXSNELL", "MARTINGALE", "DEVIANCE", "PIT"];
 
-/// Append one sdtab row per time-to-event record, after the Gaussian and the discrete
-/// rows (#901): rows are grouped by endpoint family, never interleaved by subject, so a
-/// reader that splits the table into per-family blocks by per-subject counts (ferx-r's
-/// `.fitrx` round trip) keeps working.
+/// Append one sdtab row per time-to-event record, after the Gaussian and discrete
+/// rows (#901), grouped by family so per-family splitting (ferx-r) keeps working.
 ///
-/// The `COXSNELL`, `MARTINGALE`, `DEVIANCE` and `PIT` columns are **created** here, and
-/// only when some subject has a TTE row, so a fit without a TTE endpoint writes the
-/// table it always did; every row above gets an empty cell in them. Every other column
-/// is extended as [`append_discrete_rows`] extends it: `ID`, `TIME`, `DV` (the event
-/// indicator), `CMT`, `EBE_OFV` and `MIXNUM` carry values, the rest — `PRED`, `IPRED`,
-/// `IWRES`, `CWRES`, `N_OBS` and any `[derived]` / `[output]` column — is blank, since a
-/// survival record has no concentration prediction or residual variance.
+/// Creates `COXSNELL`, `MARTINGALE`, `DEVIANCE` and `PIT` only when some subject has
+/// a TTE row. Other columns are extended as in [`append_discrete_rows`]: `ID`,
+/// `TIME`, `DV` (event indicator), `CMT`, `EBE_OFV`, `MIXNUM` carry values, the rest
+/// is blank.
 #[cfg(feature = "survival")]
 fn append_tte_rows(
     cols: &mut Vec<(String, Vec<f64>)>,
@@ -2786,20 +2588,10 @@ pub fn write_sdtab_csv(
     population: &Population,
     path: &str,
 ) -> Result<(), String> {
-    // A `.fitrx` bundle carries the per-record time-to-event rows (`predictions_tte.csv`,
-    // #911) and the discrete rows (`predictions_discrete.csv`, #2695), so a restored fit
-    // writes the table the live one did. A bundle written before #911 has no TTE entry:
-    // writing its fit anyway would emit a table silently missing every event row, so
-    // refuse.
-    //
-    // The discriminator is `restored_from_checkpoint` AND "the restored model declares a
-    // time-to-event endpoint" (read from the round-tripped `model_text`, since a restored
-    // fit may have no population to ask) AND "no subject carries a TTE row". The last
-    // stands in for "the bundle had no TTE entry", and the two coincide because a fit of a
-    // TTE model always has rows: `fit()` refuses a declared endpoint with no routed record
-    // (`E_ENDPOINT_NO_RECORDS`, `check_endpoint_routing`), and `tte_record_diagnostics`
-    // emits one row per event record, so the writer, which writes the entry whenever any
-    // subject has a row, always writes it for such a fit.
+    // A `.fitrx` bundle carries TTE (#911) and discrete (#2695) rows; one written
+    // before #911 has none, and writing its table would silently miss every event
+    // row, so refuse. "No subject carries a TTE row" stands in for "no TTE entry":
+    // a fit of a TTE model always has rows (`E_ENDPOINT_NO_RECORDS`).
     #[cfg(feature = "survival")]
     if result.restored_from_checkpoint {
         if let Some(msg) = result
@@ -2827,11 +2619,8 @@ pub fn write_sdtab_csv(
     let header: Vec<&str> = cols.iter().map(|(name, _)| name.as_str()).collect();
     writeln!(f, "{}", header.join(",")).map_err(|e| e.to_string())?;
 
-    // Rows. Any non-finite value — NaN (BLOQ IWRES/CWRES) or ±Inf (e.g. from a
-    // derived column) — is written as an empty cell so downstream tools handle
-    // it as missing rather than a sentinel. This is intentionally broader than
-    // the covariate-table writer below (which only blanks NaN via fmt_num), so
-    // adopting fmt_num here would silently change derived-column output.
+    // Any non-finite value is written as an empty cell. Broader than `fmt_num`
+    // (which blanks only NaN), so switching to it would change derived columns.
     for row in 0..n_rows {
         let vals: Vec<String> = cols
             .iter()
@@ -2850,10 +2639,8 @@ pub fn write_sdtab_csv(
     Ok(())
 }
 
-/// Why the restored fit `result` of `model` cannot write sdtab, or `None` when it can: the
-/// model declares a time-to-event endpoint but no subject carries a TTE row, which is a
-/// `.fitrx` bundle written before those rows were bundled (#911), so the table would
-/// silently lack them.
+/// Why the restored fit cannot write sdtab, or `None`: the model declares a TTE
+/// endpoint but no subject has a TTE row (a pre-#911 `.fitrx`).
 #[cfg(feature = "survival")]
 fn restored_sdtab_refusal(
     model: &crate::types::CompiledModel,
@@ -2870,13 +2657,9 @@ fn restored_sdtab_refusal(
     })
 }
 
-/// Write the covariate table (from a `[covariates]` block) as a CSV file.
-///
-/// Columns: `ID, TIME, EVID, <declared covariates...>`, one row per input
-/// dataset record. Missing values (`f64::NAN`) are written as empty cells so
-/// downstream tools read them as missing. Uses the `csv` writer so a subject ID
-/// (a free-form string) containing a comma or quote is properly escaped rather
-/// than corrupting column alignment.
+/// Write the covariate table (`[covariates]`) as CSV: `ID, TIME, EVID, <declared
+/// covariates...>`, one row per input record, `NaN` as empty cells, IDs escaped
+/// by the `csv` writer.
 pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Result<(), String> {
     let mut wtr = csv::WriterBuilder::new()
         .from_path(path)
@@ -2899,15 +2682,10 @@ pub fn write_covtab_csv(table: &crate::types::CovariateTable, path: &str) -> Res
     Ok(())
 }
 
-/// Write the SAEM conditional-distribution summary (`saem_conddist = true`,
-/// #257) as a long-format CSV: one row per subject per random effect.
-///
-/// Columns: `ID, ETA, COND_MEAN, COND_SD, COND_MODE` — the conditional mean and
-/// SD from the MCMC pass (`p(η_i | y_i; θ̂)`) alongside the conditional **mode**
-/// (the EBE, `SubjectResult.eta`) for direct comparison. This is the ferx
-/// analogue of saemix's `cond.mean.phi` / `cond.sd` and Monolix's
-/// `*_mean` / `*_sd` columns. Returns `Err` if the fit carries no
-/// conditional-distribution results.
+/// Write the SAEM conditional-distribution summary (`saem_conddist = true`, #257)
+/// as long-format CSV: `ID, ETA, COND_MEAN, COND_SD, COND_MODE` (MCMC mean / SD of
+/// `p(η_i | y_i; θ̂)` beside the EBE), the analogue of saemix's `cond.mean.phi`.
+/// `Err` without conditional-distribution results.
 pub fn write_conddist_csv(result: &FitResult, path: &str) -> Result<(), String> {
     let cd = result
         .cond_dist
@@ -2943,11 +2721,9 @@ pub fn write_conddist_csv(result: &FitResult, path: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// Write the retained per-subject conditional-distribution draws
-/// (`saem_conddist_keep_samples = true`) as a wide CSV: one row per draw.
-///
-/// Columns: `ID, SAMPLE, <eta_names...>`. The analogue of Monolix's
-/// `simulatedRandomEffects.txt`. Returns `Err` if no samples were retained.
+/// Write retained conditional-distribution draws as wide CSV:
+/// `ID, SAMPLE, <eta_names...>` (Monolix's `simulatedRandomEffects.txt`). `Err`
+/// if none were retained.
 pub fn write_conddist_samples_csv(result: &FitResult, path: &str) -> Result<(), String> {
     let cd = result
         .cond_dist
@@ -2984,14 +2760,10 @@ pub fn write_conddist_samples_csv(result: &FitResult, path: &str) -> Result<(), 
     Ok(())
 }
 
-/// Emit the conditional-distribution CSV outputs (#257) for a completed fit,
-/// returning the human-facing status/warning lines for the caller to print.
-///
-/// Returns an empty `Vec` when the fit carries no conditional-distribution
-/// results (the pass was not enabled). Otherwise it always attempts
-/// `{model}-conddist.csv`, and writes `{model}-conddist-samples.csv` only when
-/// draws were retained — surfacing any real write error rather than swallowing
-/// it. Pulling this out of the CLI `main()` keeps the dispatch unit-testable.
+/// Emit the conditional-distribution CSVs (#257), returning status / warning
+/// lines to print. Empty when the pass was off; otherwise writes
+/// `{model}-conddist.csv`, plus `{model}-conddist-samples.csv` when draws were
+/// retained, surfacing write errors.
 pub fn write_conddist_outputs(result: &FitResult, model_name: &str) -> Vec<String> {
     let mut messages = Vec::new();
     let Some(cd) = result.cond_dist.as_ref() else {

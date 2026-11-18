@@ -1,19 +1,14 @@
-//! Built-in absorption **input-rate functions** — `R_in(tad)` per model (#322).
+//! Built-in absorption **input-rate functions**, `R_in(tad)` per model (#322).
 //!
-//! Each returns the dose-driven appearance rate into the compartment it feeds,
-//! normalised so `∫₀^∞ R_in dt = dose`, where the caller folds bioavailability
-//! into `dose = F · amt`. `R_in = 0` for `tad ≤ 0` (the input starts after the
-//! dose); per-dose contributions are superposed by the caller.
+//! Each returns the dose-driven appearance rate into the compartment it feeds, normalised
+//! so `∫₀^∞ R_in dt = dose` (the caller folds bioavailability into `dose = F · amt`).
+//! `R_in = 0` for `tad ≤ 0`; per-dose contributions are superposed by the caller.
 //!
-//! These are the inherently-numerical absorption models that feed an explicit
-//! ODE disposition (see `plans/absorption-models.md`). They use only
-//! `+ − * /`, `.ln()`, `.exp()`, and `ln_gamma` — all on the `PkNum`
-//! trait. The input-rate forcing is **generic over `T: PkNum`** (the `sens/`
-//! `*_g<T>` convention), so `transit()` and `igd()` models are recorded into
-//! compiled plans by `sens/ode_provider.rs` and get **exact analytic** FOCE/FOCEI/Bayes
-//! sensitivities, not finite differences (#430). (The Enzyme `autodiff` path
-//! these once targeted was retired in #367/#381; the recording type handles `max`/`min` by
-//! comparison, so the old `f64::max`/`min` restriction no longer applies.)
+//! These inherently-numerical absorption models feed an explicit ODE disposition (see
+//! `plans/absorption-models.md`). They use only `+ − * /`, `.ln()`, `.exp()` and `ln_gamma`
+//! on the `PkNum` trait and are **generic over `T: PkNum`** (the `sens/` `*_g<T>`
+//! convention), so `sens/ode_provider.rs` records them into compiled plans with **exact
+//! analytic** FOCE/FOCEI/Bayes sensitivities, not finite differences (#430).
 
 #[cfg(test)]
 use crate::sens::num::NonRecording;
@@ -25,26 +20,24 @@ use crate::sens::num::PkNum;
 /// 1e-12, so a typo here cannot pass unnoticed.
 const LN_2PI: f64 = 1.837_877_066_409_345_5;
 
-/// Savic et al. (2007) transit-compartment input rate into the **depot**, for a
-/// *continuous* number of transit compartments `n`:
+/// Savic et al. (2007) transit-compartment input rate into the **depot**, for a *continuous*
+/// number of transit compartments `n`:
 ///
 /// ```text
 /// R_in(tad) = dose · KTR · (KTR·tad)^n · exp(−KTR·tad) / Γ(n + 1),
 ///   KTR = (n + 1) / mtt,   dose = F · amt.
 /// ```
 ///
-/// The depot then empties to central via first-order `ka` (applied in the ODE,
-/// not here). `∫₀^∞ R_in dt = dose`. Returns `0` for `tad ≤ 0` and for a
-/// non-positive `dose`.
+/// The depot empties to central via first-order `ka` (applied in the ODE). Returns `0` for
+/// `tad ≤ 0` and a non-positive `dose`. Domain: `mtt > 0`, `n ≥ 0` (enforce upstream with
+/// [`validate_transit`]); evaluated in the log domain for stability with large `n`.
 ///
-/// Domain: `mtt > 0`, `n ≥ 0` (enforce upstream with [`validate_transit`]).
-/// Evaluated in the log domain for stability with large `n` / `(KTR·tad)^n`.
-///
-/// This is the readable reference form (used by tests and one-shot callers); the
-/// ODE hot path goes through [`InputRateForcing::prepare`] +
-/// [`PreparedInputRate::rate`], which hoist the dose-invariant constants
-/// (`ln Γ`, `KTR`, `ln KTR`) out of the per-dose superposition loop.
-pub fn transit_input_rate(tad: f64, n: f64, mtt: f64, dose: f64) -> f64 {
+/// This readable reference form is used by tests and one-shot callers; the ODE hot path goes
+/// through [`InputRateForcing::prepare`] + [`PreparedInputRate::rate`], which hoist the
+/// dose-invariant constants (`ln Γ`, `KTR`, `ln KTR`) out of the per-dose loop (likewise for
+/// the other input-rate functions below).
+#[cfg(test)]
+pub(crate) fn transit_input_rate(tad: f64, n: f64, mtt: f64, dose: f64) -> f64 {
     PreparedInputRate::transit(n, mtt).rate(tad, dose)
 }
 
@@ -64,30 +57,22 @@ pub fn validate_transit(n: f64, mtt: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Freijer & Post (1997) inverse-Gaussian (convection–dispersion) absorption
-/// input rate into the **central** compartment, for mean absorption time `mat`
-/// and relative dispersion `cv2`:
+/// Freijer & Post (1997) inverse-Gaussian (convection–dispersion) absorption input rate into
+/// the **central** compartment, for mean absorption time `mat` and relative dispersion `cv2`:
 ///
 /// ```text
 /// R_in(tad) = dose · √(MAT / (2π·CV²·tad³)) · exp(−(tad−MAT)² / (2·CV²·MAT·tad)).
 /// ```
 ///
-/// This is the standard inverse-Gaussian density scaled by the dose, with mean
-/// `μ = MAT` and shape `λ = MAT/CV²` (`CV²` = relative dispersion, Var/mean²);
-/// unlike `transit`, it models the *entire* absorption delay and feeds central
-/// directly (no downstream `ka`). `∫₀^∞ R_in dt = dose`. Returns `0` for
-/// `tad ≤ 0` and for a non-positive `dose`.
-///
-/// Domain: `mat > 0`, `cv2 > 0` (enforce upstream with [`validate_igd`]).
-/// Evaluated in the log domain for stability: the essential singularity at
-/// `tad → 0` collapses to `R_in → 0` because the `−(tad−MAT)²/(2·CV²·MAT·tad)`
-/// term diverges like `−MAT/(2·CV²·tad)`, dominating the `−1.5·ln tad` term.
-///
-/// This is the readable reference form (used by tests and one-shot callers); the
-/// ODE hot path goes through [`InputRateForcing::prepare`] +
-/// [`PreparedInputRate::rate`], which hoist the dose-invariant constants
-/// (`c0`, `1/(2·CV²·MAT)`) out of the per-dose superposition loop.
-pub fn inverse_gaussian_input_rate(tad: f64, mat: f64, cv2: f64, dose: f64) -> f64 {
+/// The inverse-Gaussian density (mean `μ = MAT`, shape `λ = MAT/CV²`) scaled by the dose;
+/// unlike `transit` it models the *entire* delay and feeds central directly (no `ka`).
+/// Returns `0` for `tad ≤ 0` and a non-positive `dose`. Domain: `mat > 0`, `cv2 > 0`
+/// (enforce upstream with [`validate_igd`]). Evaluated in the log domain: the singularity at
+/// `tad → 0` collapses to `R_in → 0` because `−(tad−MAT)²/(2·CV²·MAT·tad)` diverges like
+/// `−MAT/(2·CV²·tad)`, dominating `−1.5·ln tad`. The hot path hoists `c0` and
+/// `1/(2·CV²·MAT)`.
+#[cfg(test)]
+pub(crate) fn inverse_gaussian_input_rate(tad: f64, mat: f64, cv2: f64, dose: f64) -> f64 {
     PreparedInputRate::inverse_gaussian(mat, cv2).rate(tad, dose)
 }
 
@@ -107,37 +92,27 @@ pub fn validate_igd(mat: f64, cv2: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Weibull absorption input rate into the compartment it feeds, for scale `td`
-/// (> 0) and shape `beta` (> 0):
+/// Weibull absorption input rate into the compartment it feeds, for scale `td` (> 0) and
+/// shape `beta` (> 0):
 ///
 /// ```text
 /// R_in(tad) = dose · (β/Td) · (tad/Td)^(β−1) · exp(−(tad/Td)^β),   dose = F · amt.
 /// ```
 ///
-/// This is the Weibull density scaled by the dose — the appearance-rate form of
-/// the cumulative absorbed fraction `1 − exp(−(tad/Td)^β)`. `∫₀^∞ R_in dt = dose`.
-/// Returns `0` for `tad ≤ 0` and for a non-positive `dose`.
+/// The Weibull density scaled by the dose (the appearance-rate form of the cumulative
+/// absorbed fraction `1 − exp(−(tad/Td)^β)`). Returns `0` for `tad ≤ 0` and a non-positive
+/// `dose`. Domain: `td > 0`, `beta > 0` (enforce upstream with [`validate_weibull`]).
+/// `(tad/Td)^β` is `exp(β·ln(tad/Td))`, so only `ln`/`exp`/`+ − * /` on [`PkNum`] are needed
+/// and a `weibull()` model carries exact analytic `Dual2` sensitivities.
 ///
-/// Domain: `td > 0`, `beta > 0` (enforce upstream with [`validate_weibull`]).
-/// Evaluated in the log domain so the power `(tad/Td)^β` is `exp(β·ln(tad/Td))` —
-/// **no `powf` / new special function** is needed, and the only building blocks are
-/// `ln`/`exp`/`+ − * /`, all on [`PkNum`], so a `weibull()` model carries exact
-/// analytic `Dual2` sensitivities through `sens/ode_provider.rs` (Phase 2).
-///
-/// Weibull has **no elementary closed form** with linear disposition, so it is
-/// permanently on the numerical ODE path; this `PkNum`-generic forcing is its only
-/// route to exact (rather than finite-difference) gradients. The shape `β` governs
-/// the `tad → 0⁺` edge: `β > 1 ⇒ R_in → 0`, `β = 1 ⇒` first-order with `ka = 1/Td`,
-/// `β < 1 ⇒ R_in → ∞` (an **integrable** spike — `∫R_in` stays `= dose`); the
-/// `tad ≤ 0 ⇒ 0` guard makes the input start at the dose, and the adaptive solver
-/// resolves the spike with small steps rather than the value being capped (a cap
-/// would break mass balance).
-///
-/// This is the readable reference form (used by tests and one-shot callers); the
-/// ODE hot path goes through [`InputRateForcing::prepare`] +
-/// [`PreparedInputRate::rate`], which hoist the dose-invariant constants
-/// (`ln β − ln Td`, `ln Td`) out of the per-dose superposition loop.
-pub fn weibull_input_rate(tad: f64, td: f64, beta: f64, dose: f64) -> f64 {
+/// Weibull has **no elementary closed form** with linear disposition, so it is permanently on
+/// the numerical ODE path; this forcing is its only route to exact gradients. The shape `β`
+/// governs the `tad → 0⁺` edge: `β > 1 ⇒ R_in → 0`, `β = 1 ⇒` first-order with `ka = 1/Td`,
+/// `β < 1 ⇒ R_in → ∞` (an **integrable** spike, `∫R_in = dose`); the adaptive solver resolves
+/// it with small steps rather than a cap (which would break mass balance). The hot path hoists
+/// `ln β − ln Td` and `ln Td`.
+#[cfg(test)]
+pub(crate) fn weibull_input_rate(tad: f64, td: f64, beta: f64, dose: f64) -> f64 {
     PreparedInputRate::weibull(td, beta).rate(tad, dose)
 }
 
@@ -153,29 +128,24 @@ pub fn validate_weibull(td: f64, beta: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Zero-order absorption input rate into the compartment it feeds, for a modeled
-/// duration `dur` (> 0):
+/// Zero-order absorption input rate into the compartment it feeds, for a modeled duration
+/// `dur` (> 0):
 ///
 /// ```text
 /// R_in(tad) = dose / dur   for 0 < tad ≤ dur,   0 otherwise,   dose = F · amt.
 /// ```
 ///
-/// A constant rate over `(0, dur]` — the zero-order (`D1`-style, #324) input
-/// reused as an absorption term. `∫₀^∞ R_in dt = (dose/dur)·dur = dose` exactly.
-/// Returns `0` for `tad ≤ 0` and for a non-positive `dose`.
-///
-/// Domain: `dur > 0` (enforce upstream with [`validate_zero_order`]). Unlike the
-/// smooth densities, the rate has a **hard cutoff at `tad = dur`**: callers on the
-/// ODE path must break the integration timeline there. The `∂R_in/∂dur` splits
-/// into a smooth magnitude term (carried by the pointwise `dur` dual) and a
-/// moving-boundary impulse at the cutoff, which the analytic ODE provider now
-/// injects as a rate-off saltation (#530) — so this kind is lifted to `Dual2`
-/// ([`InputRateKind::supported_over_dual`] = `true`), not FD-only.
-///
-/// This is the readable reference form (used by tests and one-shot callers); the
-/// ODE hot path goes through [`InputRateForcing::prepare`] +
-/// [`PreparedInputRate::rate`], which hoist `1/dur` out of the per-dose loop.
-pub fn zero_order_input_rate(tad: f64, dur: f64, dose: f64) -> f64 {
+/// A constant rate over `(0, dur]` (the `D1`-style zero-order input, #324, reused as an
+/// absorption term); `∫ R_in dt = dose` exactly. Returns `0` for `tad ≤ 0` and a
+/// non-positive `dose`. Domain: `dur > 0` (enforce upstream with [`validate_zero_order`]).
+/// Unlike the smooth densities the rate has a **hard cutoff at `tad = dur`**: callers on the
+/// ODE path must break the integration timeline there. `∂R_in/∂dur` splits into a smooth
+/// magnitude term (the pointwise `dur` dual) and a moving-boundary impulse at the cutoff,
+/// which the analytic ODE provider injects as a rate-off saltation (#530), so this kind is
+/// lifted to `Dual2` ([`InputRateKind::supported_over_dual`] = `true`). The hot path hoists
+/// `1/dur`.
+#[cfg(test)]
+pub(crate) fn zero_order_input_rate(tad: f64, dur: f64, dose: f64) -> f64 {
     PreparedInputRate::zero_order(dur).rate(tad, dose)
 }
 
@@ -188,33 +158,25 @@ pub fn validate_zero_order(dur: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// First-order absorption input rate into the compartment it feeds, for an
-/// absorption rate constant `ka` (> 0):
+/// First-order absorption input rate into the compartment it feeds, for an absorption rate
+/// constant `ka` (> 0):
 ///
 /// ```text
 /// R_in(tad) = dose · ka · exp(−ka·tad),   dose = F · amt.
 /// ```
 ///
-/// This is the classic first-order (Bateman) input — the same absorption the
-/// analytical `pk *_oral` solvers use, exposed here as an input-rate function so
-/// it can be **composed** in `[odes]` for parallel / mixed dual-pathway models
-/// (#505): `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)` (parallel) and
-/// `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)` (mixed). Standalone
-/// first-order absorption still uses the analytical `pk *_oral` path; this is for
-/// the multi-pathway case the closed forms can't express in one term.
-/// `∫₀^∞ R_in dt = dose`. Returns `0` for `tad ≤ 0` and for a non-positive `dose`.
-///
-/// Domain: `ka > 0` (enforce upstream with [`validate_first_order`]). The
-/// `tad → 0⁺` edge is finite (`R_in → dose·ka`), so there is no singularity to
-/// guard — unlike the densities above. The single building block is `exp` (on
-/// [`PkNum`]), so a `first_order()` model carries exact analytic `Dual2`
-/// sensitivities through `sens/ode_provider.rs` (it is identical to `transit`
-/// with `n = 0`, whose middle term `0·ln x` vanishes).
-///
-/// This is the readable reference form (used by tests and one-shot callers); the
-/// ODE hot path goes through [`InputRateForcing::prepare`] +
-/// [`PreparedInputRate::rate`], which hoist `ka` out of the per-dose loop.
-pub fn first_order_input_rate(tad: f64, ka: f64, dose: f64) -> f64 {
+/// The classic first-order (Bateman) input, exposed as an input-rate function so it can be
+/// **composed** in `[odes]` for parallel / mixed dual-pathway models (#505):
+/// `FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2)` (parallel) and
+/// `FZO1*first_order(ka=KA) + FZO*zero_order(dur=DUR)` (mixed). Standalone first-order
+/// absorption still uses the analytical `pk *_oral` path. Returns `0` for `tad ≤ 0` and a
+/// non-positive `dose`. Domain: `ka > 0` (enforce upstream with [`validate_first_order`]).
+/// The `tad → 0⁺` edge is finite (`R_in → dose·ka`), so there is no singularity to guard.
+/// Only `exp` is needed, so exact analytic `Dual2` sensitivities carry through
+/// `sens/ode_provider.rs` (identical to `transit` with `n = 0`, whose `0·ln x` term
+/// vanishes). The hot path hoists `ka`.
+#[cfg(test)]
+pub(crate) fn first_order_input_rate(tad: f64, ka: f64, dose: f64) -> f64 {
     PreparedInputRate::first_order(ka).rate(tad, dose)
 }
 
@@ -293,20 +255,19 @@ impl InputRateKind {
         }
     }
 
-    /// Whether a **per-route absorption lag** (`fn(..., lag=L)`, #859) on this kind
-    /// is served with exact analytic FOCE/FOCEI gradients on the event-driven walk,
-    /// or stays on the finite-difference fallback. The event-driven walk gives each
-    /// route its own onset saltation at `t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET`
-    /// in `sens/ode_provider.rs`): a finite `ka·dose` rate-on for `FirstOrder`, the
-    /// constant window rate for `ZeroOrder` (with a matching rate-off at `K_ZO_END`),
-    /// and a zero-magnitude no-op for the smooth `Transit`/`InverseGaussian` onsets
-    /// (which need only the timeline break plus the continuous `∂R_in/∂lag_route`).
-    /// `Weibull`'s onset **diverges** for shape `β < 1` (an integrable spike, no finite
-    /// rate-on saltation), so a plain bolus into it (like one into a `Transit`) has no rate-on
-    /// to cross: the walk anchors the segment after its onset at the true onset, and a lagged
-    /// `β < 1` bolus is delivered in the cumulative frame (`CumulativeInputs`). Exhaustive (no `_` arm), the sibling of [`Self::supported_over_dual`]:
-    /// adding a kind forces a decision here, and this must stay consistent with the
-    /// `K_ROUTE_ONSET` handler's per-kind onset magnitude.
+    /// Whether a **per-route absorption lag** (`fn(..., lag=L)`, #859) on this kind is served
+    /// with exact analytic FOCE/FOCEI gradients on the event-driven walk, or stays on the
+    /// finite-difference fallback. The walk gives each route its own onset saltation at
+    /// `t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET` in `sens/ode_provider.rs`): a finite
+    /// `ka·dose` rate-on for `FirstOrder`, the constant window rate for `ZeroOrder` (with a
+    /// rate-off at `K_ZO_END`), and a zero-magnitude no-op for the smooth `Transit`/
+    /// `InverseGaussian` onsets (only the timeline break plus the continuous `∂R_in/∂lag_route`).
+    /// `Weibull`'s onset **diverges** for `β < 1` (an integrable spike, no finite rate-on), so a
+    /// plain bolus into it (like one into a `Transit`) has no rate-on to cross: the walk anchors
+    /// the segment after its onset at the true onset, and a lagged `β < 1` bolus is delivered in
+    /// the cumulative frame (`CumulativeInputs`). Exhaustive (no `_` arm), like
+    /// [`Self::supported_over_dual`]: adding a kind forces a decision here, which must stay
+    /// consistent with the `K_ROUTE_ONSET` handler's per-kind onset magnitude.
     pub fn route_lag_analytic(self) -> bool {
         match self {
             InputRateKind::FirstOrder
@@ -320,23 +281,19 @@ impl InputRateKind {
 
 /// A built-in absorption input-rate term attached to one ODE compartment.
 ///
-/// Design A (see `plans/absorption-models.md`): the input-rate function is split
-/// out of the `[odes]` RHS at parse time and evaluated here with dose context,
-/// rather than threaded through the expression AST / bytecode VM / symbolic-AD
-/// machinery. `arg_slots` index the flat individual-parameter vector for this
-/// model's parameters — for [`InputRateKind::Transit`], `[n, mtt]`; for
-/// [`InputRateKind::InverseGaussian`], `[mat, cv2]`; for
-/// [`InputRateKind::Weibull`], `[td, beta]`; for [`InputRateKind::ZeroOrder`],
-/// the single `[dur]`.
+/// Design A (see `plans/absorption-models.md`): the input-rate function is split out of the
+/// `[odes]` RHS at parse time and evaluated here with dose context, rather than threaded
+/// through the expression AST / bytecode VM / symbolic-AD machinery. `arg_slots` index the
+/// flat individual-parameter vector: `[n, mtt]` for [`InputRateKind::Transit`], `[mat, cv2]`
+/// for [`InputRateKind::InverseGaussian`], `[td, beta]` for [`InputRateKind::Weibull`], the
+/// single `[dur]` for [`InputRateKind::ZeroOrder`].
 ///
-/// `frac_slot` is the optional **pathway fraction** multiplier for parallel /
-/// biphasic absorption (#388): when a `[odes]` term is written `FR*igd(...)`, the
-/// leading declared individual parameter `FR` is resolved to its slot here, and
-/// the delivered rate is `frac · R_in` (so the dose mass splits across pathways by
-/// linearity). `None` is the common single-pathway case (`frac = 1`). The fraction
-/// is required to be a single declared parameter — not an arbitrary expression
-/// like `(1-FR)` — so it binds to one slot; a two-pathway split is two terms whose
-/// fractions sum to 1 (validated at fit-init).
+/// `frac_slot` is the optional **pathway fraction** for parallel / biphasic absorption
+/// (#388): `FR*igd(...)` resolves the declared individual parameter `FR` to its slot and
+/// the delivered rate is `frac · R_in` (dose mass splits across pathways by linearity).
+/// `None` is the single-pathway case (`frac = 1`). It must be a single declared parameter
+/// (not an expression like `(1-FR)`); a two-pathway split is two terms whose fractions sum
+/// to 1 (validated at fit-init).
 #[derive(Debug, Clone)]
 pub struct InputRateForcing {
     /// 0-based ODE compartment that receives `R_in`.
@@ -614,25 +571,19 @@ impl<T: PkNum> PreparedInputRate<T> {
 
     /// Precompute the transit constants for `(n, mtt)`.
     ///
-    /// The arguments are **clamped to the valid domain** (`mtt > 0`, `n ≥ 0`).
-    /// The fit-time guard ([`validate_transit`], wired into
-    /// `check_absorption_dosing`) already rejects an out-of-domain *typical*
-    /// value loudly; but during estimation the inner BFGS perturbs `eta` and the
-    /// outer FD step perturbs `theta`, so an additive parameterisation
-    /// (`MTT = TVMTT + ETA_MTT`) or a wide FD step can drive a transient
-    /// `mtt ≤ 0` / `n < 0` *mid-search*. Left unclamped that yields
-    /// `ktr.ln()` / `ln Γ(n+1) = NaN`, which propagates through the ODE RHS into
-    /// an opaque `NaN` OFV instead of a recoverable step. Clamping keeps `R_in`
-    /// finite at the domain wall so the optimiser can climb back to the interior;
-    /// the converged optimum is interior, so reported estimates are unaffected.
-    /// `NaN` inputs also fall to the floor (`guard_floor` floors `NaN`, matching
-    /// `f64::max`; the `n` branch is false for `NaN`).
+    /// The arguments are **clamped to the valid domain** (`mtt > 0`, `n ≥ 0`; `NaN` falls to
+    /// the floor). The fit-time guard ([`validate_transit`], wired into
+    /// `check_absorption_dosing`) rejects an out-of-domain *typical* value, but the inner BFGS
+    /// perturbs `eta` and the outer FD step perturbs `theta`, so an additive parameterisation
+    /// (`MTT = TVMTT + ETA_MTT`) or a wide FD step can drive a transient `mtt ≤ 0` / `n < 0`
+    /// mid-search, giving `ktr.ln()` / `ln Γ(n+1) = NaN` and an opaque `NaN` OFV. Clamping keeps
+    /// `R_in` finite at the domain wall so the optimiser can climb back; the converged optimum is
+    /// interior, so reported estimates are unaffected. The other constructors clamp likewise.
     ///
-    /// Generic over `T` (the `sens/` `*_g<T>` convention) so a `transit()` model
-    /// gets exact analytic `Dual2` sensitivities via [`PkNum::ln_gamma`]
-    /// (digamma/trigamma) — #430 slice 2. For `T = f64` this is byte-identical to
-    /// the previous f64-only constructor (`guard_floor` ≡ `clamp_above_floor`,
-    /// `PkNum::ln_gamma` ≡ `special::ln_gamma`).
+    /// Generic over `T` so a `transit()` model gets exact analytic `Dual2` sensitivities via
+    /// [`PkNum::ln_gamma`] (digamma/trigamma, #430). For `T = f64` this is byte-identical to the
+    /// previous f64-only constructor (`guard_floor` ≡ `clamp_above_floor`, `PkNum::ln_gamma` ≡
+    /// `special::ln_gamma`).
     #[inline]
     fn transit(n: T, mtt: T) -> Self {
         let mtt = mtt.guard_floor(Self::MIN_PARAM);
@@ -650,23 +601,14 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
-    /// Precompute the Weibull constants for `(td, beta)`.
+    /// Precompute the Weibull constants for `(td, beta)`. Both are **clamped to the valid domain**
+    /// (floor [`Self::MIN_PARAM`]; see the transit constructor for why), and `NaN` falls to the
+    /// floor; [`validate_weibull`] rejects an out-of-domain typical value loudly.
     ///
-    /// Both arguments are **clamped to the valid domain** (`td > 0`, `beta > 0`,
-    /// floor [`Self::MIN_PARAM`]) for the same reason as the other constructors: a
-    /// transient mid-search excursion (additive `eta`, wide FD step) could drive
-    /// `td ≤ 0` or `beta ≤ 0`, turning `ln Td` / `ln β` into a `NaN` that would
-    /// poison the ODE RHS. The fit-time guard ([`validate_weibull`]) rejects an
-    /// out-of-domain *typical* value loudly; the clamp keeps `R_in` finite at the
-    /// domain wall so the optimiser can climb back to the interior, and the
-    /// converged optimum is interior so reported estimates are unaffected. `NaN`
-    /// inputs also fall to the floor.
-    ///
-    /// Generic over `T` (the `sens/` `*_g<T>` convention) so a `weibull()` model
-    /// gets exact analytic `Dual2` sensitivities for `td`/`beta`: the constants and
-    /// [`Self::rate`] use only `ln`/`exp`/`+ − * /`, all on [`PkNum`] — the power
-    /// `(tad/Td)^β` is evaluated as `exp(β·ln(tad/Td))`, so no `powf` rule is
-    /// needed. For `T = f64` this reduces to the scalar Weibull density.
+    /// Generic over `T`: the constants and [`Self::rate`] use only `ln`/`exp`/`+ − * /` on
+    /// [`PkNum`] (`(tad/Td)^β` is `exp(β·ln(tad/Td))`, no `powf` rule), so a `weibull()` model
+    /// gets exact analytic `Dual2` sensitivities for `td`/`beta`. For `T = f64` this reduces to
+    /// the scalar Weibull density.
     #[inline]
     fn weibull(td: T, beta: T) -> Self {
         let td = td.guard_floor(Self::MIN_PARAM);
@@ -679,23 +621,15 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
-    /// Precompute the zero-order constants for `dur`.
+    /// Precompute the zero-order constants for `dur`. `dur` is **clamped to the valid domain**
+    /// (floor [`Self::MIN_PARAM`], `NaN` to the floor; see the transit constructor) so a transient
+    /// mid-search `dur ≤ 0` cannot turn `1/dur` into `±∞`/`NaN`; [`validate_zero_order`] rejects
+    /// an out-of-domain typical value loudly.
     ///
-    /// `dur` is **clamped to the valid domain** (`dur > 0`, floor
-    /// [`Self::MIN_PARAM`]) for the same reason as the other constructors: a
-    /// transient mid-search excursion (additive `eta`, wide FD step) could drive
-    /// `dur ≤ 0`, turning `1/dur` into `±∞`/`NaN` that would poison the ODE RHS.
-    /// The fit-time guard ([`validate_zero_order`]) rejects an out-of-domain
-    /// *typical* value loudly; the clamp keeps `R_in` finite at the domain wall so
-    /// the optimiser can climb back to the interior, and the converged optimum is
-    /// interior so reported estimates are unaffected. `NaN` falls to the floor.
-    ///
-    /// Generic over `T` (the `sens/` `*_g<T>` convention). The pointwise `rate`
-    /// below carries the smooth *magnitude* part of `∂R_in/∂dur` via the `dur`/
-    /// `inv_dur` jets; the moving-boundary part at the `tad = dur` cutoff is supplied
-    /// separately by the analytic ODE walk's rate-off saltation (`integrate_g`, #530),
-    /// so a `zero_order()` model is now served analytically
-    /// ([`InputRateKind::supported_over_dual`] = `true`).
+    /// Generic over `T`. The pointwise `rate` carries the smooth *magnitude* part of
+    /// `∂R_in/∂dur` via the `dur`/`inv_dur` jets; the moving-boundary part at the `tad = dur`
+    /// cutoff comes from the analytic ODE walk's rate-off saltation (`integrate_g`, #530), so a
+    /// `zero_order()` model is served analytically ([`InputRateKind::supported_over_dual`] = `true`).
     #[inline]
     fn zero_order(dur: T) -> Self {
         let dur = dur.guard_floor(Self::MIN_PARAM);
@@ -705,20 +639,13 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
-    /// Precompute the first-order constant for `ka`.
+    /// Precompute the first-order constant for `ka`. `ka` is **clamped to the valid domain**
+    /// (`ka > 0`, floor [`Self::MIN_PARAM`], `NaN` to the floor; see the transit constructor) so
+    /// a transient mid-search `ka ≤ 0` cannot make the input rate negative; [`validate_first_order`]
+    /// rejects an out-of-domain typical value loudly.
     ///
-    /// `ka` is **clamped to the valid domain** (`ka > 0`, floor [`Self::MIN_PARAM`])
-    /// for the same reason as the other constructors: a transient mid-search
-    /// excursion (additive `eta`, wide FD step) could drive `ka ≤ 0`, turning the
-    /// input rate negative / non-physical. The fit-time guard
-    /// ([`validate_first_order`]) rejects an out-of-domain *typical* value loudly;
-    /// the clamp keeps `R_in` finite and positive at the domain wall so the
-    /// optimiser can climb back to the interior, and the converged optimum is
-    /// interior so reported estimates are unaffected. `NaN` falls to the floor.
-    ///
-    /// Generic over `T` (the `sens/` `*_g<T>` convention) so a `first_order()`
-    /// model gets exact analytic `Dual2` sensitivities for `ka` and the pathway
-    /// fraction: [`Self::rate`] uses only `exp`/`* −`, all on [`PkNum`]. For
+    /// Generic over `T` so a `first_order()` model gets exact analytic `Dual2` sensitivities for
+    /// `ka` and the pathway fraction: [`Self::rate`] uses only `exp`/`* −` on [`PkNum`]. For
     /// `T = f64` this reduces to the scalar first-order (Bateman) input rate.
     #[inline]
     fn first_order(ka: T) -> Self {
@@ -949,21 +876,21 @@ impl<T: PkNum> PreparedInputRate<T> {
 
     /// Appearance rate for a dose delivered as a **zero-order infusion** of duration `t_inf`
     /// (constant input rate `dose/t_inf` over `[0, t_inf]`) into this kernel, rather than an
-    /// instantaneous bolus (#719 gap 2). The input is smeared over the window, so `R_in` is the
-    /// convolution of the kernel density with the rectangle:
+    /// instantaneous bolus (#719 gap 2). `R_in` is the convolution of the kernel density with
+    /// the rectangle:
     ///
     /// ```text
     ///   R_in_inf(tad) = (dose/t_inf)·[G(tad) − G(max(tad − t_inf, 0))],
     /// ```
     ///
-    /// which is mass-exact (`∫₀^∞ R_in_inf dt = dose`) and reduces to the bolus [`Self::rate`] as
-    /// `t_inf → 0`. `tad ≤ 0` / `dose ≤ 0` / `t_inf ≤ 0 ⇒ 0`. Carries exact `Dual2` sensitivities
-    /// via [`Self::cdf`].
+    /// mass-exact (`∫₀^∞ R_in_inf dt = dose`) and reducing to the bolus [`Self::rate`] as
+    /// `t_inf → 0`. `tad ≤ 0` / `dose ≤ 0` / `t_inf ≤ 0 ⇒ 0`. Carries exact `Dual2`
+    /// sensitivities via [`Self::cdf`].
     ///
-    /// `tail_age` is the time since the window end for a segment that lies after it, `None`
-    /// for one before it: the window end is a break of every timeline and a kink of `R_in_inf`
-    /// (`∂R/∂T` jumps by `(dose/T)·g(0)`), so the segment — not each stage's rounding of
-    /// `tad − T` — says which side the stage is on, and the age is `≥ 0` on it.
+    /// `tail_age` is the time since the window end for a segment that lies after it, `None` for
+    /// one before it: the window end is a break of every timeline and a kink of `R_in_inf`
+    /// (`∂R/∂T` jumps by `(dose/T)·g(0)`), so the segment, not each stage's rounding of
+    /// `tad − T`, says which side the stage is on, and the age is `≥ 0` on it.
     #[inline]
     pub fn rate_infused(&self, tad: T, dose: T, t_inf: T, tail_age: Option<T>) -> T {
         self.rate_infused_from(tad, dose, t_inf, tail_age, false)
@@ -1043,26 +970,20 @@ impl<T: PkNum> PreparedInputRate<T> {
         self.rate_at_zero(dose) + self.rate_dtad_at_zero(dose) * tau
     }
 
-    /// The right-hand limit `lim_{tad→0⁺} R_in(tad, dose)` — the forcing's onset
-    /// value. [`Self::rate`]'s domain guard returns a flat zero *at* `tad = 0` by
-    /// convention ("not yet started"), so the onset is computed here, separately. The
-    /// event-driven ODE sensitivity walk crosses a dose's moving arrival (an estimated
-    /// lagtime, #486) with the all-orders continuation [`Self::rate_onset_continued`],
-    /// which falls back to this value plus [`Self::rate_dtad_at_zero`]'s slope where the
-    /// kernel has no Taylor series at the onset — the continuous `∂R_in/∂lag` for
-    /// `tad > 0` still flows through [`Self::rate`] itself when `tad` carries the lag
-    /// sensitivity.
+    /// The right-hand limit `lim_{tad→0⁺} R_in(tad, dose)`, the forcing's onset value.
+    /// [`Self::rate`]'s domain guard returns a flat zero *at* `tad = 0` ("not yet started"), so
+    /// the onset is computed here. The event-driven ODE sensitivity walk crosses a dose's moving
+    /// arrival (an estimated lagtime, #486) with [`Self::rate_onset_continued`], which falls back
+    /// to this value plus [`Self::rate_dtad_at_zero`]'s slope where the kernel has no Taylor
+    /// series at the onset; the continuous `∂R_in/∂lag` for `tad > 0` still flows through
+    /// [`Self::rate`] when `tad` carries the lag sensitivity.
     ///
-    /// `Transit` vanishes at onset for any `n > 0` (the Γ-density `n·ln(tad) → −∞`
-    /// dominates) and degenerates to `ktr·dose` at `n = 0` (pure first-order);
-    /// `InverseGaussian` vanishes at onset for *every* valid `(mat, cv2)` (the
-    /// essential singularity `−mat/(2·cv2·tad) → −∞` always dominates); `FirstOrder`
-    /// is finite (`dose·ka`) with no boundary case. `Weibull`'s onset **diverges**
-    /// for shape `β < 1` (an integrable spike, not a finite jump) — a plain bolus
-    /// is delivered in the cumulative frame and never asks; only a steady-state or infused
-    /// dose could, and an estimated lag on those is rejected upstream. `ZeroOrder`'s own onset/cutoff is
-    /// handled entirely by its separate moving-window mechanism (#530), not this
-    /// path.
+    /// `Transit` vanishes at onset for `n > 0` (the Γ-density `n·ln(tad) → −∞` dominates) and
+    /// is `ktr·dose` at `n = 0` (pure first-order); `InverseGaussian` vanishes for *every* valid
+    /// `(mat, cv2)`; `FirstOrder` is finite (`dose·ka`). `Weibull`'s onset **diverges** for
+    /// `β < 1` (an integrable spike): a plain bolus is delivered in the cumulative frame and never
+    /// asks; only a steady-state or infused dose could, and an estimated lag on those is rejected
+    /// upstream. `ZeroOrder`'s onset/cutoff is handled by its moving-window mechanism (#530).
     #[inline]
     pub(crate) fn rate_at_zero(&self, dose: T) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
@@ -1096,36 +1017,29 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
-    /// The right-hand limit `lim_{tad→0⁺} ∂R_in/∂tad(tad, dose)` — the forcing's
-    /// onset **slope**, the companion to [`Self::rate_at_zero`] (its onset value). Together
-    /// they are [`Self::rate_onset_continued`]'s second-order fallback where the kernel has
-    /// no Taylor series at the onset. A moving absorption boundary (estimated lagtime, #486)
-    /// that carries IIV lands a δ²-in-`δlag` term in the checked `d²f/∂η²` Hessian block,
-    /// whose coefficient is `½·jg + ½·∂R_in/∂tad` — the state-Jacobian part `jg = J·(Δr·e)`
-    /// **plus** the forcing's own explicit time-variation at the onset (#880). For a
-    /// **constant**-rate forcing (infusion, zero-order window) this slope is zero, so
-    /// the old `½·jg`-only coefficient was already exact there; it is the decaying
-    /// `first_order`/Bateman kernels where the omitted `∂R_in/∂tad` biased the
-    /// analytic Hessian (near sign-mirror of FD).
+    /// The right-hand limit `lim_{tad→0⁺} ∂R_in/∂tad(tad, dose)`, the forcing's onset **slope**,
+    /// companion to [`Self::rate_at_zero`]. Together they are [`Self::rate_onset_continued`]'s
+    /// second-order fallback where the kernel has no Taylor series at the onset. A moving
+    /// absorption boundary (estimated lagtime, #486) with IIV lands a δ²-in-`δlag` term in the
+    /// checked `d²f/∂η²` Hessian block, with coefficient `½·jg + ½·∂R_in/∂tad`: the
+    /// state-Jacobian part `jg = J·(Δr·e)` **plus** the forcing's explicit time-variation at the
+    /// onset (#880). For a **constant**-rate forcing (infusion, zero-order window) the slope is
+    /// zero; the decaying `first_order`/Bateman kernels are where omitting `∂R_in/∂tad` biased
+    /// the analytic Hessian (near sign-mirror of FD).
     ///
-    /// This is the companion to the jump in the **second** time-derivative `ẍ` at the
-    /// onset, which a boundary crossing's second-order (`δlag²`) term needs — NOT only to a
-    /// jump in the onset **value** `ẋ`. So it is non-zero in two cases:
-    /// - a **finite-value-jump** onset (`rate_at_zero ≠ 0`): `FirstOrder` (`−dose·ka²`),
-    ///   the degenerate `Transit` `n = 0` (pure first-order, `−dose·ktr²`), and `Weibull`
-    ///   `β = 1` (`−dose/Td²`); and
-    /// - a **continuous-but-kinked** onset: `Transit` `n = 1` (Erlang-2), whose onset
-    ///   value is `0` yet whose slope jumps from `0` to `+dose·ktr²` — a pure curvature
-    ///   saltation with no first-order term.
+    /// It pairs with the jump in the **second** time-derivative `ẍ` at the onset, so it is
+    /// non-zero for
+    /// - a **finite-value-jump** onset (`rate_at_zero ≠ 0`): `FirstOrder` (`−dose·ka²`), the
+    ///   degenerate `Transit` `n = 0` (`−dose·ktr²`), and `Weibull` `β = 1` (`−dose/Td²`); and
+    /// - a **continuous-but-kinked** onset: `Transit` `n = 1` (Erlang-2), whose onset value is
+    ///   `0` yet whose slope jumps from `0` to `+dose·ktr²` (a pure curvature saltation).
     ///
-    /// It returns `0` for the genuinely **flat**-onset arms: `Transit` `n > 1` (slope →0),
-    /// `InverseGaussian` and `ZeroOrder`. It deliberately returns `0` — a documented
-    /// limitation, leaving those Hessians on FD — for the **singular** `Transit`
-    /// `0 < n < 1` (slope →`+∞`, no finite companion). `Weibull` `β < 1` diverges
-    /// (mirrors `rate_at_zero`, `NaN`) and is unreachable (a plain bolus rides
-    /// the cumulative frame). The `Transit`
-    /// `n = 0`/`n = 1` and `Weibull` `β = 1` arms branch on **exact** `f64` equality
-    /// (as `rate_at_zero` does), since the slope is discontinuous across each.
+    /// It returns `0` for the **flat**-onset arms (`Transit` `n > 1`, `InverseGaussian`,
+    /// `ZeroOrder`), and deliberately `0` (a documented limitation, leaving those Hessians on
+    /// FD) for the **singular** `Transit` `0 < n < 1` (slope →`+∞`). `Weibull` `β < 1` diverges
+    /// (`NaN`, as `rate_at_zero`) and is unreachable (a plain bolus rides the cumulative frame).
+    /// The `Transit` `n = 0`/`n = 1` and `Weibull` `β = 1` arms branch on **exact** `f64`
+    /// equality (as `rate_at_zero` does), since the slope is discontinuous across each.
     #[inline]
     pub(crate) fn rate_dtad_at_zero(&self, dose: T) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
@@ -1503,7 +1417,7 @@ mod tests {
     // ── Inverse-Gaussian (Freijer & Post) `igd(mat, cv2)` ────────────────────
 
     /// Direct (non-log-domain) inverse-Gaussian density × dose, the independent
-    /// reference the log-domain [`inverse_gaussian_input_rate`] is checked against.
+    /// reference the log-domain `inverse_gaussian_input_rate` is checked against.
     fn ig_density_ref(tad: f64, mat: f64, cv2: f64, dose: f64) -> f64 {
         if tad <= 0.0 || dose <= 0.0 {
             return 0.0;
@@ -1720,7 +1634,7 @@ mod tests {
     // ── Weibull `weibull(td, beta)` ──────────────────────────────────────────
 
     /// Direct (non-log-domain) Weibull density × dose, via `powf` — the independent
-    /// reference the log-domain [`weibull_input_rate`] (which uses `exp(β·ln x)`) is
+    /// reference the log-domain `weibull_input_rate` (which uses `exp(β·ln x)`) is
     /// checked against, so a typo in either route is caught.
     fn weibull_density_ref(tad: f64, td: f64, beta: f64, dose: f64) -> f64 {
         if tad <= 0.0 || dose <= 0.0 {

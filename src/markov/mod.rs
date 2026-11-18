@@ -1,49 +1,38 @@
 //! Matrix-exponential primitives for continuous-time Markov models (CTMM).
 //!
-//! Gated behind the `markov` cargo feature. **Zero new dependencies**: the
-//! matrix exponential is nalgebra's built-in Higham (2005) scaling-and-squaring
-//! Padé approximant (`DMatrix::exp`), and the parameter gradient is the exact
-//! Van Loan (1978) block-matrix Fréchet derivative built on top of it. There is
-//! no hand-rolled Padé here — `plans/tte-survival-markov.md` D4 predates the
-//! discovery that nalgebra already ships a correct, well-tested `expm`.
+//! Gated behind the `markov` cargo feature. **Zero new dependencies**: the matrix exponential
+//! is nalgebra's Higham (2005) scaling-and-squaring Padé approximant (`DMatrix::exp`), and
+//! the parameter gradient is the exact Van Loan (1978) block-matrix Fréchet derivative on
+//! top of it.
 //!
-//! This module is a **pure numerical leaf**. It knows nothing about the model
-//! DSL, random effects, covariates, or the outer/inner optimizer. It provides:
+//! A **pure numerical leaf**: it knows nothing about the model DSL, random effects,
+//! covariates, or the optimizers. It provides:
 //!
-//! - [`matrix_exp`] — `P(Δt) = expm(Q·Δt)`, the CTMM transition-probability
-//!   matrix over an interval.
-//! - [`matrix_exp_frechet`] — `L(A, E) = d/dt expm(A + tE)|₀`, the *exact*
-//!   directional derivative of the matrix exponential (§3.4, §8.7, §9.7). This
-//!   is what differentiates the CTMM likelihood w.r.t. rate parameters and
-//!   random effects.
-//! - [`generator_rate_direction`] — the constrained perturbation direction for
-//!   one rate parameter of a generator (see "Why directional" below).
-//! - [`ctmm_data_term`] — the individual CTMM negative log-likelihood
-//!   `−Σ log P(Δtₘ)[sₘ, sₘ₊₁]` for a *prebuilt* generator, with a fail-loud
-//!   guard layer: structural/data problems return [`MarkovError`]; a
-//!   parameter-driven degeneracy returns the finite `1e20` sentinel (matching
-//!   the `survival` module's convention) rather than a silent `−inf`.
+//! - [`matrix_exp`]: `P(Δt) = expm(Q·Δt)`, the CTMM transition-probability matrix.
+//! - [`matrix_exp_frechet`]: `L(A, E) = d/dt expm(A + tE)|₀`, the *exact* directional
+//!   derivative of the matrix exponential (§3.4, §8.7, §9.7), which differentiates the CTMM
+//!   likelihood w.r.t. rate parameters and random effects.
+//! - [`generator_rate_direction`]: the constrained perturbation direction for one rate
+//!   parameter of a generator (see below).
+//! - [`ctmm_data_term`]: the individual CTMM negative log-likelihood
+//!   `−Σ log P(Δtₘ)[sₘ, sₘ₊₁]` for a *prebuilt* generator, with a fail-loud guard layer:
+//!   structural/data problems return [`MarkovError`]; a parameter-driven degeneracy returns
+//!   the finite `1e20` sentinel (as the `survival` module does), not a silent `−inf`.
 //!
-//! Building the generator `Q(η, θ)` from the model, the FOCEI/SAEM wiring, the
-//! `Population → StateObs` data reader, and the `msm`-anchored validation are
-//! **Phase 5** — see the plan. Because this leaf is a pure numerical primitive,
-//! its comparator is not NONMEM/`msm` (there is no fit here to anchor); it is
-//! validated in-repo, license-free, against the Taylor series, the closed-form
-//! 2-state transition matrix, and the *exact* Daleckii–Krein Fréchet reference.
+//! Building `Q(η, θ)` from the model, the FOCEI/SAEM wiring, the `Population → StateObs`
+//! reader and the `msm`-anchored validation are **Phase 5**. This leaf is validated in-repo,
+//! license-free, against the Taylor series, the closed-form 2-state transition matrix, and
+//! the exact Daleckii–Krein Fréchet reference.
 //!
 //! ## Why a directional Fréchet, not per-entry gradients
 //!
-//! A CTMM generator obeys the row-sum-zero constraint: the diagonal is fixed by
-//! the off-diagonals, `q_jj = −Σ_{k≠j} q_jk`. So a free **rate parameter**
-//! `q_jk` (an off-diagonal, `j ≠ k`) perturbs *two* entries of `Q` at once:
-//! `q_jk` up and `q_jj` down. The derivative of `expm(Q·Δt)` w.r.t. that rate is
-//! therefore the Fréchet derivative in the direction `(E_jk − E_jj)·Δt`, **not**
-//! the derivative w.r.t. a single independent matrix entry. An API that returns
-//! "one gradient per `Q` entry" (as an earlier draft of §8.7 proposed) silently
-//! computes the wrong thing for a constrained generator. [`matrix_exp_frechet`]
-//! takes the direction matrix explicitly, and [`generator_rate_direction`]
-//! constructs exactly the constrained direction, so the caller cannot get the
-//! constraint wrong.
+//! A generator obeys the row-sum-zero constraint `q_jj = −Σ_{k≠j} q_jk`, so a free **rate
+//! parameter** `q_jk` (`j ≠ k`) perturbs *two* entries of `Q` at once (`q_jk` up, `q_jj`
+//! down). The derivative of `expm(Q·Δt)` w.r.t. that rate is the Fréchet derivative in the
+//! direction `(E_jk − E_jj)·Δt`, **not** the derivative w.r.t. a single independent entry
+//! ("one gradient per `Q` entry" silently computes the wrong thing for a constrained
+//! generator). [`matrix_exp_frechet`] takes the direction explicitly and
+//! [`generator_rate_direction`] constructs exactly the constrained one.
 
 pub(crate) mod dtmm;
 pub mod endpoint;
@@ -57,20 +46,17 @@ use nalgebra::DMatrix;
 // reported as [`MarkovError`] instead.
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 
-/// Upper bound on the magnitude of any entry of the scaled generator `Q·Δt`
-/// before it is handed to `expm`.
+/// Upper bound on the magnitude of any entry of the scaled generator `Q·Δt` before it is
+/// handed to `expm`.
 ///
-/// nalgebra's `DMatrix::exp` forms internal matrix powers of its argument (up to
-/// `A^8`/`A^10`) to choose a scaling factor. For an argument whose entries exceed
-/// roughly `1e38`, those powers overflow to `+∞` **even though the argument
-/// itself is finite**; the overflow drives nalgebra's internal squaring count to
-/// `u64::MAX`, so `expm` then spins forever in a `for _ in 0..s` loop that never
-/// returns — a **hang**, not a catchable panic, and not something the post-`expm`
-/// finiteness check can rescue. A `Q·Δt` this large is a diverged parameter,
-/// never a real CTMM regime (it is orders of magnitude beyond any physical
-/// rate×time), so it is treated as the degenerate case and repels the optimizer.
-/// The bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and
-/// far above any legitimate argument.
+/// nalgebra's `DMatrix::exp` forms internal matrix powers (up to `A^8`/`A^10`) to choose a
+/// scaling factor. For entries above roughly `1e38` those powers overflow to `+∞` **even
+/// though the argument is finite**, driving the internal squaring count to `u64::MAX`, so
+/// `expm` spins forever in a `for _ in 0..s` loop: a **hang**, not a catchable panic, and not
+/// rescued by the post-`expm` finiteness check. A `Q·Δt` this large is a diverged parameter,
+/// never a real CTMM regime, so it is treated as degenerate and repels the optimizer. The
+/// bound sits far below the overflow point (`1e18^10 = 1e180 ≪ f64::MAX`) and far above any
+/// legitimate argument.
 pub(crate) const MAX_EXP_ARG_ABS: f64 = 1e18;
 
 /// A single continuous-time Markov state observation: the process was seen in
@@ -142,18 +128,14 @@ pub enum MarkovError {
 
 /// Transition-probability matrix `P(Δt) = expm(A)` for `A = Q·Δt`.
 ///
-/// Thin, documented wrapper over nalgebra's Higham (2005) scaling-and-squaring
-/// Padé approximant (`DMatrix::exp`). The caller passes the already-scaled
-/// argument `A = Q·Δt`; for a valid generator `Q` (off-diagonals `≥ 0`,
-/// row sums `0`) the result is a stochastic matrix (rows sum to 1, entries in
-/// `[0, 1]`) up to floating round-off. **Round-off is not clamped here** — the
-/// likelihood in [`ctmm_data_term`] inspects only the single selected entry and
-/// treats a non-positive value as the degenerate case, so a global clamp would
-/// add a code path without changing any result.
+/// A thin wrapper over nalgebra's Higham (2005) scaling-and-squaring Padé approximant
+/// (`DMatrix::exp`). For a valid generator (off-diagonals `≥ 0`, row sums `0`) the result is
+/// a stochastic matrix up to round-off. **Round-off is not clamped here**: [`ctmm_data_term`]
+/// reads one entry and treats a non-positive value as degenerate, so a global clamp would
+/// change no result.
 ///
 /// # Panics (debug builds only)
-/// Debug-asserts that `a` is square. `expm` is only defined for square matrices;
-/// nalgebra itself would panic on a non-square input.
+/// Debug-asserts that `a` is square.
 #[must_use]
 pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64> {
     debug_assert!(a.is_square(), "matrix_exp requires a square matrix");
@@ -164,8 +146,8 @@ pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64> {
 /// Fréchet derivative of the matrix exponential in direction `E`:
 /// `L(A, E) = d/dt expm(A + t·E)|_{t=0}`.
 ///
-/// Computed with the Van Loan (1978) block identity — this is **exact** (up to
-/// the exponential's own ~1e-15 round-off), not a finite difference:
+/// Computed with the Van Loan (1978) block identity, **exact** (up to the exponential's own
+/// ~1e-15 round-off), not a finite difference:
 ///
 /// ```text
 ///                 ⎛ ⎡ A  E ⎤ ⎞
@@ -173,12 +155,9 @@ pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64> {
 ///                 ⎝ ⎣ 0  A ⎦ ⎠
 /// ```
 ///
-/// For a generator rate parameter, pass `E = (E_jk − E_jj)·Δt`
-/// (see [`generator_rate_direction`]) and `A = Q·Δt`; then `L(A, E)` is exactly
-/// `∂P(Δt)/∂q_jk`. `L` is linear in `E`, so directions compose:
-/// `L(A, αE₁ + βE₂) = α·L(A, E₁) + β·L(A, E₂)`.
-///
-/// Cost: one `expm` of a `2S×2S` matrix per direction. Negligible for `S ≤ 10`.
+/// For a generator rate parameter pass `E = (E_jk − E_jj)·Δt` (see
+/// [`generator_rate_direction`]) and `A = Q·Δt`; `L(A, E)` is then `∂P(Δt)/∂q_jk`. `L` is
+/// linear in `E`. Cost: one `expm` of a `2S×2S` matrix per direction.
 ///
 /// # Panics (debug builds only)
 /// Debug-asserts that `a` is square and that `e` has the same shape as `a`.
@@ -200,22 +179,16 @@ pub fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64> {
     matrix_exp(&c).view((0, s), (s, s)).into_owned()
 }
 
-/// The constrained perturbation direction for one **rate parameter** `q_jk` of
-/// an `s`-state generator, scaled by `dt`: `(E_jk − E_jj)·dt`.
+/// The constrained perturbation direction for one **rate parameter** `q_jk` of an `s`-state
+/// generator, scaled by `dt`: `(E_jk − E_jj)·dt`.
 ///
-/// This encodes the row-sum-zero constraint (`q_jj = −Σ_{k≠j} q_jk`): raising
-/// the off-diagonal rate `q_jk` by `δ` lowers the diagonal `q_jj` by `δ` so the
-/// row still sums to zero. Feeding this direction (and `A = Q·dt`) to
-/// [`matrix_exp_frechet`] yields exactly `∂P(dt)/∂q_jk`.
-///
-/// Keeping this as its own function means Phase 5 assembles gradients without
-/// re-deriving — and cannot accidentally differentiate w.r.t. a bare matrix
-/// entry, which would ignore the constraint.
+/// It encodes the row-sum-zero constraint (`q_jj = −Σ_{k≠j} q_jk`): raising `q_jk` by `δ`
+/// lowers `q_jj` by `δ`. With `A = Q·dt`, [`matrix_exp_frechet`] then yields exactly
+/// `∂P(dt)/∂q_jk`, and callers cannot differentiate w.r.t. a bare matrix entry.
 ///
 /// # Panics
-/// Panics if `j == k` (a rate is strictly off-diagonal) or if `j` or `k` is
-/// `≥ s`. These are setup-time programming errors, checked unconditionally
-/// (the function is called `O(#rate params)` times, not in the hot loop).
+/// Panics if `j == k` (a rate is strictly off-diagonal) or if `j` or `k` is `≥ s`
+/// (setup-time programming errors, checked unconditionally: called `O(#rate params)` times).
 #[must_use]
 pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatrix<f64> {
     assert!(
@@ -363,18 +336,16 @@ fn gap_transition<T: crate::sens::num::PkNum>(
 
 /// Whether any off-diagonal entry of a generator is (past round-off) negative.
 ///
-/// A transition intensity is an unconstrained user expression, so a covariate /
-/// parameter regime (or a diverged η) can drive an off-diagonal rate negative,
-/// which makes `Q` a non-generator (`expm(Q·Δt)` is no longer stochastic and an
-/// observed transition can score `P > 1`). Callers treat that as the degenerate
-/// case and repel the optimizer with their own sentinel / `None`. The `1e-12`
-/// tolerance absorbs floating round-off on a rate that is physically zero.
+/// A transition intensity is an unconstrained user expression, so a covariate / parameter
+/// regime (or a diverged η) can drive an off-diagonal rate negative, making `Q` a
+/// non-generator (`expm(Q·Δt)` is no longer stochastic; an observed transition can score
+/// `P > 1`). Callers treat that as degenerate and repel the optimizer with their own
+/// sentinel / `None`. The `1e-12` tolerance absorbs round-off on a physically zero rate.
 ///
-/// Used by the three homogeneous endpoint sites in `markov/endpoint.rs`
-/// (`ctmm_endpoint_nll`, `ctmm_subject_eta_grad`, and the η-Hessian's `CtmmSubjectNll`
-/// through [`has_negative_offdiagonal_g`]). The inhomogeneous per-sub-node guard stays
-/// inline there because it shares a single pass with the finite/`MAX_EXP_ARG_ABS`
-/// magnitude check.
+/// Used by the three homogeneous endpoint sites in `markov/endpoint.rs` (`ctmm_endpoint_nll`,
+/// `ctmm_subject_eta_grad`, and the η-Hessian's `CtmmSubjectNll` via
+/// [`has_negative_offdiagonal_g`]). The inhomogeneous per-sub-node guard stays inline there
+/// because it shares one pass with the finite/`MAX_EXP_ARG_ABS` magnitude check.
 #[inline]
 pub(crate) fn has_negative_offdiagonal(q: &DMatrix<f64>) -> bool {
     has_negative_offdiagonal_g(q.as_slice(), q.nrows())
@@ -395,37 +366,33 @@ pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s:
 }
 
 /// Exact gradient of [`ctmm_data_term`] w.r.t. an arbitrary parameter vector, given the
-/// generator `q` and its derivatives `dq[a] = ∂Q/∂p_a` (#759).
-///
-/// This is the analytic replacement for finite-differencing the whole matrix-exponential
-/// likelihood. The chain is
+/// generator `q` and its derivatives `dq[a] = ∂Q/∂p_a` (#759): the analytic replacement for
+/// finite-differencing the whole matrix-exponential likelihood. The chain is
 ///
 /// ```text
 ///   ∂/∂p_a [ −log P(Δt)[u,v] ]  =  − L(QΔt, (∂Q/∂p_a)·Δt)[u,v] / P(Δt)[u,v]
 /// ```
 ///
-/// with `L` the Fréchet derivative ([`matrix_exp_frechet`]). Evaluating that literally
-/// would cost one `2S×2S` `expm` **per axis per gap** — which for a handful of axes is
-/// *slower* than the `S×S` FD it replaces. Instead we use the adjoint identity
+/// with `L` the Fréchet derivative ([`matrix_exp_frechet`]). Evaluated literally that costs one
+/// `2S×2S` `expm` **per axis per gap**, slower than the `S×S` FD it replaces. Instead use the
+/// adjoint identity
 ///
 /// ```text
 ///   ⟨C, L(A, E)⟩  =  ⟨L(Aᵀ, C), E⟩          (trace inner product)
 /// ```
 ///
-/// Only one *entry* `[u,v]` of `P` is ever read, so seeding `C = e_u e_vᵀ` gives a single
-/// matrix `G = L((QΔt)ᵀ, e_u e_vᵀ)` with `∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩` for **every**
-/// `a`. That is **one** Fréchet solve per observation gap regardless of the parameter count
-/// — cheaper than the FD path (`2·n_axes` `S×S` `expm`s per gap) as soon as there are a few
-/// axes, and it scales to the full `(θ, η)` width for free. `adjoint_frechet_matches_direct`
-/// pins the identity against the direct per-direction form.
+/// Only one *entry* `[u,v]` of `P` is read, so seeding `C = e_u e_vᵀ` gives a single matrix
+/// `G = L((QΔt)ᵀ, e_u e_vᵀ)` with `∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩` for **every** `a`: one
+/// Fréchet solve per gap regardless of the parameter count (FD needs `2·n_axes` `S×S`
+/// `expm`s per gap). `adjoint_frechet_matches_direct` pins the identity against the direct
+/// per-direction form.
 ///
-/// `dq[a]` must be a valid generator *direction* (zero row sums). The caller gets that for
-/// free by differentiating the intensities — see `CtmmGeneratorProgram::eval_generator_g`.
+/// `dq[a]` must be a valid generator *direction* (zero row sums), which differentiating the
+/// intensities gives for free (`CtmmGeneratorProgram::eval_generator_g`).
 ///
 /// Returns `Ok(None)` where [`ctmm_data_term`] returns `SUBJECT_SENTINEL_NLL`: at a degenerate
 /// generator the value is a flat repellent constant with no meaningful derivative, so the
-/// caller falls back to FD for that point rather than being handed a zero (or garbage)
-/// gradient. Errors mirror [`ctmm_data_term`] exactly.
+/// caller falls back to FD there. Errors mirror [`ctmm_data_term`].
 pub fn ctmm_data_term_grad(
     q: &DMatrix<f64>,
     dq: &[DMatrix<f64>],
@@ -495,25 +462,21 @@ pub fn ctmm_data_term_grad(
 /// Individual CTMM negative log-likelihood for a **prebuilt** generator `q`:
 /// `−Σ_m log P(Δt_m)[s_m, s_{m+1}]` over consecutive observation pairs.
 ///
-/// The generator is taken as given (Phase 5 builds `Q(η, θ)`); this function is
-/// the pure likelihood kernel plus its guard layer. It never returns `−inf` or
-/// panics on bad input:
+/// The pure likelihood kernel plus its guard layer; it never returns `−inf` or panics on bad
+/// input:
 ///
-/// - **Structural / data errors** → [`MarkovError`] (fail loud): non-square or
-///   too-small generator, a state index out of range, a non-finite time, times
-///   that decrease, or two different states reported at the same instant.
-/// - **Numerically degenerate likelihood** → `Ok(SUBJECT_SENTINEL_NLL)`: a
-///   parameter guess under which an *observed* transition has non-positive
-///   (underflowed) probability. This is a large finite objective that repels the
-///   optimizer, exactly as the `survival` module does with its `1e20` sentinel.
-/// - Fewer than two observations carry no transition, so the term is `0.0`.
-/// - A zero-length interval between two *identical* states contributes `0`
-///   (`P(0) = I`, `log 1 = 0`); the same interval between *different* states is
-///   the [`MarkovError::ZeroDtStateChange`] error above.
+/// - **Structural / data errors** → [`MarkovError`]: non-square or too-small generator, a
+///   state index out of range, a non-finite time, times that decrease, or two different
+///   states at the same instant.
+/// - **Numerically degenerate likelihood** → `Ok(SUBJECT_SENTINEL_NLL)`: an *observed*
+///   transition has non-positive (underflowed) probability; a large finite objective that
+///   repels the optimizer (as `survival` does with its `1e20` sentinel).
+/// - Fewer than two observations carry no transition: `0.0`.
+/// - A zero-length interval between two *identical* states contributes `0` (`P(0) = I`); between
+///   *different* states it is [`MarkovError::ZeroDtStateChange`].
 ///
-/// `q` must be a valid generator; validity of its *entries* (off-diagonals
-/// `≥ 0`, rows summing to `0`) is the model builder's responsibility and is not
-/// re-checked per-evaluation here.
+/// `q` must be a valid generator; validity of its entries (off-diagonals `≥ 0`, row sums `0`)
+/// is the model builder's responsibility and is not re-checked per evaluation.
 pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovError> {
     let s = validate_generator_and_obs(q, obs)?;
     // Underflow / non-positive probability, or a non-finite / enormous `expm` argument
@@ -563,9 +526,8 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
     Ok(Some(nll))
 }
 
-/// Time-**inhomogeneous** transition-probability matrix `P(Δt)` for a generator
-/// that varies within the interval — the drug-driven CTMM (`Q(t) = f(C(t))`),
-/// Phase 6, Track D (#817).
+/// Time-**inhomogeneous** transition-probability matrix `P(Δt)` for a generator that varies
+/// within the interval, the drug-driven CTMM (`Q(t) = f(C(t))`), Phase 6, Track D (#817).
 ///
 /// Solves the matrix occupancy ODE (forward Kolmogorov, right multiplication)
 ///
@@ -573,48 +535,34 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
 ///   dP/dτ = P·Q(τ),   P(0) = I,   τ ∈ [0, Δt]
 /// ```
 ///
-/// so `P(Δt)[from, to] = Pr(state = to at Δt | state = from at 0)`, matching the
-/// homogeneous `matrix_exp(Q·Δt)` indexing. (The backward form `Q(τ)·P` gives the
-/// transpose-ordered result and is only equal for a generator that commutes across
-/// time — constant `Q`, or `Q(τ)=g(τ)·Q₀`.)
+/// so `P(Δt)[from, to] = Pr(state = to at Δt | state = from at 0)`, matching the homogeneous
+/// `matrix_exp(Q·Δt)` indexing. (The backward form `Q(τ)·P` gives the transpose-ordered
+/// result, equal only for a generator that commutes across time.)
 ///
-/// on the shared Dormand–Prince RK45 engine ([`crate::ode::solve_ode`]) and
-/// returns `P(Δt)`. `q_at(τ)` supplies the `n_states × n_states` generator at
-/// **elapsed time `τ` within the interval** (`0` at the left endpoint); the
-/// caller maps `τ` to an absolute model time and hence to the PK state / drug
-/// concentration that drives `Q`. `dq_at(τ)` is its derivative `∂Q/∂τ` (the right
-/// derivative at a kink of `Q`), which a stiff method's exact `f_t = P·∂Q/∂τ` reads
-/// (`kolmogorov_jacobian`); `None` leaves the step's `J` and `f_t` to differences.
-/// Unlike the time-homogeneous
-/// [`ctmm_data_term`], there is no closed form here (the matrix exponential
-/// `expm(Q·Δt)` is exact only when `Q` is constant), so the interval transition
-/// is obtained by integration.
+/// Runs on the shared Dormand–Prince RK45 engine ([`crate::ode::solve_ode`]). `q_at(τ)`
+/// supplies the `n_states × n_states` generator at **elapsed time `τ` within the interval**
+/// (`0` at the left endpoint); the caller maps `τ` to an absolute model time and hence to the
+/// PK state / drug concentration that drives `Q`. `dq_at(τ)` is `∂Q/∂τ` (the right derivative
+/// at a kink), which a stiff method's exact `f_t = P·∂Q/∂τ` reads (`kolmogorov_jacobian`);
+/// `None` leaves the step's `J` and `f_t` to differences. Unlike the time-homogeneous
+/// [`ctmm_data_term`] there is no closed form (`expm(Q·Δt)` is exact only for constant `Q`).
 ///
-/// **Reduction to the matrix exponential.** When `q_at` returns a *constant* `Q`,
-/// the time-ordered solution collapses to `P(Δt) = expm(Q·Δt)` — this is the
-/// Tier-1 anchor (`ctmm_inhomogeneous_matches_matrix_exp_for_constant_q`), so the
-/// homogeneous and inhomogeneous paths agree in the limit they share. More
-/// generally, if `Q(τ) = g(τ)·Q₀` for a scalar `g` and a fixed `Q₀` (the family
-/// commutes across time), `P(Δt) = expm(Q₀ · ∫₀^{Δt} g)` — a second closed-form
-/// anchor independent of `expm`'s own definition.
+/// **Reduction to the matrix exponential.** For a *constant* `Q` the solution collapses to
+/// `P(Δt) = expm(Q·Δt)` (the Tier-1 anchor
+/// `ctmm_inhomogeneous_matches_matrix_exp_for_constant_q`). If `Q(τ) = g(τ)·Q₀` (a commuting
+/// family), `P(Δt) = expm(Q₀ · ∫₀^{Δt} g)`, a second anchor independent of `expm`.
 ///
-/// The likelihood term is unchanged: `−Σ_m log P(Δt_m)[s_m, s_{m+1}]`, with each
-/// `P(Δt_m)` from this function instead of `matrix_exp`.
-///
-/// The occupancy matrix is flattened **row-major** into the ODE state vector
-/// (length `n_states²`); the RHS reshapes it, forms `P·Q(τ)`, and flattens back.
-/// A non-positive `delta_t` returns the identity (`P(0) = I`; a zero-length gap
-/// between identical states contributes `log 1 = 0`, exactly as the homogeneous
-/// kernel treats it).
+/// The likelihood term is unchanged (`−Σ_m log P(Δt_m)[s_m, s_{m+1}]`). The occupancy matrix
+/// is flattened **row-major** into the ODE state (length `n_states²`). A non-positive
+/// `delta_t` returns the identity (`P(0) = I`; `log 1 = 0`, as in the homogeneous kernel).
 ///
 /// # Panics (debug builds only)
 /// Debug-asserts that `q_at(0)` is `n_states × n_states`.
 ///
-/// Integrates to near machine precision (`reltol 1e-10`) — the default for the
-/// Tier-1 closed-form anchors. The **fit path** instead uses
-/// [`ctmm_inhomogeneous_transition_with_opts`] with the model's own ODE tolerance
-/// (the same `reltol` the PK/TTE solves use), since integrating the whole
-/// likelihood to `1e-10` on every EBE/FD evaluation is needlessly slow.
+/// Integrates to near machine precision (`reltol 1e-10`), the default for the Tier-1
+/// closed-form anchors. The **fit path** uses [`ctmm_inhomogeneous_transition_with_opts`] with
+/// the model's own ODE tolerance (the same `reltol` as the PK/TTE solves), since `1e-10` on
+/// every EBE/FD evaluation is needlessly slow.
 #[must_use]
 pub fn ctmm_inhomogeneous_transition(
     q_at: impl Fn(f64) -> DMatrix<f64>,

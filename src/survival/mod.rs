@@ -1,12 +1,5 @@
-// TTE / survival non-Gaussian endpoint support — Phase 1.
-//
-// Public interface:
-//   tte_data_term         — negative log-likelihood for a TTE subject's records
-//   non_gaussian_eta_jets2 — exact (q, ∇q, ∇²q) in η of the whole non-Gaussian term, from
-//                           its plan (#2786)
-//   simulate_tte          — draw TTE event times (administratively right-censored at
-//                           each subject's observation window) into a SimulationResult vec
-//
+// TTE / survival non-Gaussian endpoint support: the TTE data term, its exact η-jets
+// (`non_gaussian_eta_jets2`, #2786) and TTE simulation.
 // See plans/tte-survival-markov.md §3.1, §2.3, §9.3, §8.8.2.
 
 pub mod parametric;
@@ -33,17 +26,11 @@ use crate::types::{
 //  TTE data term
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Round-off tolerance for the cumulative-hazard monotonicity guard in
-/// [`tte_nll_from_curves`]. A cumulative hazard is non-decreasing, so a negative
-/// increment `H(b) - H(a) < 0` is ill-posed - but each `H` read carries solver
-/// round-off, so an increment counts as a genuine violation only past
-/// `abstol + reltol * |H|`. This mirrors the ODE integrator's own per-step
-/// monotonicity tolerance (`mono_tol` in `src/ode/solver.rs`).
-///
-/// ODE-accumulated callers pass the *configured* solver tolerances
-/// ([`MonoTol::from_solver`]) so a user-tightened `ode_reltol` tightens the guard in
-/// lockstep; the analytic closed-form path passes a tight fixed floor
-/// ([`MonoTol::analytic`]) since it carries only f64 round-off, not solver error.
+/// Round-off tolerance for the cumulative-hazard monotonicity guard: an increment
+/// `H(b) - H(a) < 0` counts as a violation only past `abstol + reltol * |H|`, mirroring
+/// the ODE integrator's `mono_tol` (`src/ode/solver.rs`). ODE-accumulated callers pass
+/// the configured solver tolerances ([`MonoTol::from_solver`]); the closed-form path
+/// passes the tight [`MonoTol::analytic`] floor.
 #[derive(Clone, Copy, Debug)]
 pub struct MonoTol {
     pub reltol: f64,
@@ -51,14 +38,9 @@ pub struct MonoTol {
 }
 
 impl MonoTol {
-    /// Tight floor for closed-form hazard families. Their `H(t)` is evaluated in closed
-    /// form (no ODE solve), so the only round-off is f64 arithmetic - a few ULPs, i.e.
-    /// ~1e-15 relative. Valid families are monotone by construction, so this floor mainly
-    /// guards against sign-flipped parameters. `1e-9` is used for *both* terms, giving a
-    /// floor `1e-9 + 1e-9*|H|` that scales with `H` (so it does not over-reject a large
-    /// closed-form `H`) yet sits ~6 orders above the true round-off - tight enough to
-    /// still catch any genuine negative increment, loose enough never to fire on a
-    /// legitimate fit.
+    /// Tight floor for closed-form hazard families: `1e-9 + 1e-9*|H|`, ~6 orders above
+    /// the f64 round-off (~1e-15 relative) yet scaling with `H`, so it catches any genuine
+    /// negative increment without firing on a legitimate fit.
     pub fn analytic() -> Self {
         Self {
             reltol: 1e-9,
@@ -83,18 +65,13 @@ impl Default for MonoTol {
     }
 }
 
-/// Negative log-likelihood contribution of a TTE endpoint for one subject.
-///
-/// Handles all three EventType variants and left truncation (entry_time > 0).
-///
-/// Formula (§3.1 of plan):
-///   RightCensored:   H(T) − H(entry)
-///   Exact:           H(T) − H(entry) − log h(T)
+/// Negative log-likelihood of a TTE endpoint for one subject (analytic hazards only):
+///   RightCensored:    H(T) − H(entry)
+///   Exact:            H(T) − H(entry) − log h(T)
 ///   IntervalCensored: −log [ exp(−(H(left)−H(entry))) − exp(−(H(right)−H(entry))) ]
-///
-/// Returns 1e20 as a sentinel when the likelihood is numerically ill-defined
-/// (e.g. negative interval probability, non-positive hazard for an exact event).
-pub fn tte_data_term(
+/// Returns the 1e20 sentinel when the likelihood is numerically ill-defined.
+#[cfg(test)]
+pub(crate) fn tte_data_term(
     records: &[ObsRecord],
     hazard: &HazardSpec,
     recurrence: TteRecurrence,
@@ -107,18 +84,14 @@ pub fn tte_data_term(
             let params = param_fn(theta, eta, covariates);
             analytic_tte_nll_g(records, *family, recurrence, &params)
         }
-        // ODE-accumulated hazards are routed through `tte_endpoint_nll` → `tte_ode_nll`
-        // (which reads H(t)/h(t) from the integrated CHZ state); this closed-form entry
-        // point is analytic-only and returns the ill-defined sentinel if mis-called. Kept
-        // as an explicit, testable arm (not `unreachable!`/`debug_assert!`) so the dispatch
-        // contract is covered and behaves identically in debug and ci-test builds.
+        // ODE-accumulated hazards go through `tte_endpoint_nll` → `tte_ode_nll`; this
+        // arm is kept explicit (not `unreachable!`) so the dispatch contract is testable.
         HazardSpec::OdeAccumulated { .. } => SUBJECT_SENTINEL_NLL,
     }
 }
 
-/// The analytic-family TTE data term at given hazard parameters, over any [`PkNum`]: the
-/// `f64` instance is [`tte_data_term`]'s value, a dual instance seeded on the parameters
-/// gives their exact derivatives (#2437).
+/// The analytic-family TTE data term over any [`PkNum`]; a dual instance seeded on the
+/// parameters gives their exact derivatives (#2437).
 pub(crate) fn analytic_tte_nll_g<T: PkNum>(
     records: &[ObsRecord],
     family: HazardFamily,
@@ -157,10 +130,7 @@ pub(crate) fn analytic_tte_nll_visit_g<T: PkNum>(
             MonoTol::analytic(),
             visit,
         ),
-        // Clock-reset (gap-time / renewal) RTTE: the hazard clock resets at each
-        // event, so each inter-event gap is an independent contribution evaluated
-        // on its own duration (§3.3). For an analytic family this needs no ODE —
-        // the closures are evaluated at the gap `Δ_k`, not absolute time.
+        // Clock-reset RTTE: each inter-event gap is scored on its own duration `Δ_k` (§3.3).
         TteRecurrence::Repeated {
             clock: RtteClock::Reset,
         } => {
@@ -520,11 +490,9 @@ impl SubjectTerm for NonGaussianTerm<'_> {
     }
 }
 
-/// Exact `∂/∂η` of the subject's TTE data term (the sum [`tte_data_term`] gives over its
-/// analytic endpoints), at the same 1× scale as the value — the inner EBE gradient's TTE
-/// block, as [`crate::categorical::discrete_subject_eta_grad`] is the binary one. `None` —
-/// the caller keeps FD for the point — when an endpoint is not served exactly or the value
-/// is the repel sentinel.
+/// Exact `∂/∂η` of the subject's TTE data term at 1× scale: the inner EBE gradient's
+/// TTE block. `None` (caller keeps FD) when an endpoint is not served exactly or the
+/// value is the repel sentinel.
 pub(crate) fn tte_subject_eta_grad(
     model: &CompiledModel,
     subject: &Subject,
@@ -553,10 +521,7 @@ pub(crate) fn tte_record_served(model: &CompiledModel, subject: &Subject, cmt: u
 }
 
 /// Whether the TTE endpoint on `cmt` has an exact η-channel: an analytic hazard with a
-/// dual-evaluable program, or an ODE-accumulated one with a compiled RHS (the dual walk reads
-/// `h` as the RHS at the saved state, at the value path's clock anchors). Time-varying
-/// covariates, a lag and a steady-state dose are inside the walk's scope (#2786); a subject
-/// the walk still declines is a recorder defect, reported as such.
+/// dual-evaluable program, or an ODE-accumulated one with a compiled RHS (#2786).
 pub(crate) fn tte_endpoint_served(model: &CompiledModel, cmt: usize) -> bool {
     match model.endpoints.get(&cmt) {
         Some(crate::types::EndpointLikelihood::Tte {
@@ -595,22 +560,12 @@ pub(crate) fn strip_hazard_programs(mut model: CompiledModel) -> CompiledModel {
 /// Objectives at or above this are the `1e20` repel sentinel, not a likelihood.
 pub(crate) const REPEL_SENTINEL_FLOOR: f64 = 1e19;
 
-/// Per-record TTE negative log-likelihood from cumulative-hazard / hazard curves.
-///
-/// Shared by the analytic-family path ([`tte_data_term`]) and the ODE-accumulated
-/// path (joint PK-TTE); they differ only in *where* the curves come from.
-/// `cumhaz_at(t)` returns `H(t)`; `hazard_at(t)` returns the instantaneous hazard
-/// `h(t)`. Handles all three [`EventType`] variants and left truncation
-/// (entry_time > 0):
-///   RightCensored:    H(T) − H(entry)
-///   Exact:            H(T) − H(entry) − log h(T)
-///   IntervalCensored: −log [ exp(−(H(left)−H(entry))) − exp(−(H(right)−H(entry))) ]
-///
-/// Returns 1e20 as a sentinel when the likelihood is numerically ill-defined
-/// (e.g. negative interval probability, non-positive hazard for an exact event,
-/// or a **non-monotone cumulative hazard** — `H(b) < H(a)` for `b ≥ a`, which a
-/// negative drug-driven hazard produces and which would imply `S = exp(−ΔH) > 1`).
-pub fn tte_nll_from_curves(
+/// Per-record TTE negative log-likelihood from `H(t)` (`cumhaz_at`) and `h(t)`
+/// (`hazard_at`) curves, shared by the analytic and ODE-accumulated paths; formulas as
+/// in `tte_data_term`, with left truncation at `entry_time`. Returns the 1e20 sentinel
+/// when ill-defined, including a non-monotone `H` (`S = exp(−ΔH) > 1`).
+#[cfg(test)]
+pub(crate) fn tte_nll_from_curves(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> f64,
     hazard_at: impl Fn(f64) -> f64,
@@ -619,14 +574,10 @@ pub fn tte_nll_from_curves(
     tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, &mut |_| {})
 }
 
-/// [`tte_nll_from_curves`] over any [`PkNum`] curve values: the `f64` instance is the
-/// value path, a dual instance gives the data term's exact derivatives in whatever the
-/// curves are seeded on (#2437). Every guard reads the value only.
-///
-/// Each scored record's [`RecordTerm`] goes to `visit` before it is added, so the
-/// returned NLL is the in-order fold of exactly the terms the visitor saw (#901). On a
-/// sentinel return the visitor may already hold terms of earlier records; a caller that
-/// keeps them must check the return value first.
+/// `tte_nll_from_curves` over any [`PkNum`] curve values (#2437); every guard reads the
+/// value only. Each scored record's [`RecordTerm`] goes to `visit` before it is added, so
+/// the NLL is the in-order fold of the visited terms (#901). On a sentinel return the
+/// visitor may already hold earlier terms; check the return value first.
 pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> T,
@@ -636,17 +587,9 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
 ) -> T {
     let mut nll = T::from_f64(0.0);
 
-    // A cumulative hazard is non-decreasing: `H(b) ≥ H(a)` for `b ≥ a`. A drug-driven
-    // `[odes]` hazard is a free user expression with no `h ≥ 0` constraint, so a
-    // sign-flipped / non-monotone hazard can make an increment negative — `S = exp(−ΔH)
-    // > 1`, ill-posed. Treat an increment as a genuine violation only past the solver's
-    // own round-off band `abstol + reltol·|H|` (see `MonoTol`), so a near-zero hazard's
-    // quadrature noise on a flat `H` is tolerated while a larger negative step is not.
-    // The simulation path hard-errors on the same non-monotone CHZ; here, with an
-    // optimizer to steer, it folds into the shared 1e20 sentinel.
-    // #618: the previous fixed `1e-3·|H|` term was 10× looser than the default `reltol`
-    // and ignored a user-tightened `ode_reltol`, so a genuine negative step up to ~0.1%·H
-    // slipped past as round-off; tying the floor to `tol` closes that gap.
+    // A drug-driven `[odes]` hazard has no `h ≥ 0` constraint, so an increment can go
+    // negative (`S > 1`). Only a step past the `MonoTol` round-off band is a violation;
+    // it folds into the 1e20 sentinel (#618: a fixed `1e-3·|H|` floor was 10× too loose).
     let monotone_violation = |hi: T, lo: T| cumhaz_monotone_violation_g(hi, lo, tol);
 
     for (index, record) in records.iter().enumerate() {
@@ -685,11 +628,8 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
                     // Degenerate: right ≤ left, or hazard non-monotone (bad params).
                     return T::from_f64(SUBJECT_SENTINEL_NLL);
                 }
-                // log P(left < T ≤ right | T > entry) = −a + log(1 − exp(−delta))
-                // Use expm1 for numerical precision when delta is small (tight interval).
-                // Computing exp(-a) − exp(-b) in probability space would lose significant
-                // digits for small Δ or large hazards — the log-domain form avoids that.
-                // `expm1(−Δ)` with its exact derivatives (`eˣ` at every order), one primitive.
+                // log P(left < T ≤ right | T > entry) = −a + log(1 − exp(−delta)), in the
+                // log domain via expm1 to keep precision for a small Δ.
                 let em1 = (-delta).jet_unary(crate::sens::num::JetFn::ExpM1);
                 let log_prob = -a + em1.abs().ln();
                 if !log_prob.br_abs_lt(f64::INFINITY) {
@@ -713,15 +653,9 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
 }
 
 /// Round-off-tolerant non-monotonicity test for a cumulative-hazard increment
-/// `H(hi) − H(lo)` (`hi ≥ lo` in time). `H` is non-decreasing, but a drug-driven
-/// `[odes]` hazard is a free user expression with no `h ≥ 0` constraint, so a
-/// sign-flipped hazard can drive an increment negative — `S = exp(−ΔH) > 1`, which
-/// is ill-posed. Treat it as a genuine violation only past the solver's own round-off
-/// band `abstol + reltol·|H|` (see [`MonoTol`], #633). Shared by
-/// [`tte_nll_from_curves`] and [`rtte_forward_nll_from_curves`] so the floor lives in
-/// one place (see #618 re: decoupling it from a fixed `|H|` term).
-/// On any number type's values, through the branch API (a recording type, #2786, records
-/// the decision).
+/// `H(hi) − H(lo)`: a violation only past `abstol + reltol·|H|` ([`MonoTol`], #633, #618).
+/// Shared by every survival loop; goes through the branch API so a recording type
+/// records the decision (#2786).
 fn cumhaz_monotone_violation_g<T: PkNum>(hi: T, lo: T, tol: MonoTol) -> bool {
     use crate::sens::num::BranchCmp::{Ge, Lt};
     let (a, b) = (hi.abs(), lo.abs());
@@ -730,12 +664,9 @@ fn cumhaz_monotone_violation_g<T: PkNum>(hi: T, lo: T, tol: MonoTol) -> bool {
     (hi - lo).br_cmp(Lt, -scale)
 }
 
-/// Lower cumulative-hazard limit contributed by a left-truncation entry: `H(entry)` when the
-/// subject entered late (`entry > 0`), else `0` (no truncation). One definition of the
-/// delayed-entry conditioning shared by the single-event ([`tte_nll_from_curves`]),
-/// clock-forward ([`rtte_forward_nll_from_curves`]) and clock-reset first-sojourn
-/// ([`rtte_reset_nll_from_curves`]) paths, so `entry` means exactly one thing across every
-/// survival endpoint — condition on survival past entry, never restart the clock (#740).
+/// Lower cumulative-hazard limit from left truncation: `H(entry)` when `entry > 0`, else
+/// `0`. Shared by every survival path so `entry` always means "condition on survival
+/// past entry", never "restart the clock" (#740).
 #[inline]
 fn entry_lower_limit<T: PkNum>(entry_time: f64, cumhaz_at: impl Fn(f64) -> T) -> T {
     if entry_time > 0.0 {
@@ -745,15 +676,10 @@ fn entry_lower_limit<T: PkNum>(entry_time: f64, cumhaz_at: impl Fn(f64) -> T) ->
     }
 }
 
-/// One survival record's scored likelihood term, as the three survival loops
-/// ([`tte_nll_from_curves_g`], [`rtte_forward_nll_from_curves_g`],
-/// [`rtte_reset_nll_from_curves_g`]) hand it to their visitor (#901). A `Point`'s
-/// `index` is the record's position in the slice the loop was given.
-///
-/// The NLL those loops return is the in-order fold of these terms — `dh − log_h`
-/// (`dh` when censored) for a `Point`, `−log_prob` for an `Interval` — so a residual
-/// built from them reads the very `ΔH` the likelihood scored, lower-limit bookkeeping
-/// (entry, previous event, reset gap) included.
+/// One survival record's scored likelihood term, as the three survival loops hand it to
+/// their visitor (#901). A `Point`'s `index` is the record's position in the slice. The
+/// loops' NLL is the in-order fold `dh − log_h` (`dh` when censored) / `−log_prob`, so a
+/// residual reads the very `ΔH` the likelihood scored.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RecordTerm<T> {
     /// A right-censored (`log_h = None`) or exact (`Some(log h)`) record whose
@@ -763,9 +689,8 @@ pub(crate) enum RecordTerm<T> {
         dh: T,
         log_h: Option<T>,
     },
-    /// An interval-censored record, scored as `−log P(left < T ≤ right | T > entry)`.
-    /// No residual reads `log_prob`; it is carried for the tests' fold only, which
-    /// pins that interval records add to the NLL exactly what the visitor saw.
+    /// An interval-censored record, scored as `−log P(left < T ≤ right | T > entry)`;
+    /// `log_prob` is carried only for the tests' fold.
     Interval {
         #[cfg(test)]
         log_prob: T,
@@ -788,19 +713,11 @@ fn visit_point<T: PkNum>(
     }
 }
 
-/// Deviance residual of one record with event indicator `delta` and scored increment
-/// `dh` (#901): `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])` with `M = δ − ΔH`, and `−√(2ΔH)` for a
-/// censor, where the `δ·ln ΔH` term vanishes rather than forming `0·ln 0`.
-///
-/// A scored `ΔH` may sit a round-off band below zero (`MonoTol`), so it is clamped at 0.
-/// An event with `ΔH = 0` — the model gave it no hazard mass at all — is `+∞`, the limit
-/// and R's `survival` value.
-///
-/// The event radicand `x − 1 − ln x` is not clamped. It is non-negative in exact
-/// arithmetic and, with a correctly rounded `ln`, in floating point too (`x − 1` is exact
-/// near 1): no negative value in a ±2·10⁵-ulp sweep around 1 or in 10⁶ draws in
-/// 1 ± 1e-4. A `.max(0.0)` there would also have hidden a dropped censor branch, since
-/// `f64::max` discards the `NaN` that `0·ln 0` makes.
+/// Deviance residual of one record (#901): `sign(M)·√(2·[ΔH − δ − δ·ln ΔH])` with
+/// `M = δ − ΔH`, and `−√(2ΔH)` for a censor (no `0·ln 0`). `ΔH` is clamped at 0 (it may
+/// sit a `MonoTol` band below); an event with `ΔH = 0` is `+∞`, as in R's `survival`.
+/// The event radicand `x − 1 − ln x` is not clamped: no negative value in a ±2·10⁵-ulp
+/// sweep around 1 or in 10⁶ draws in 1 ± 1e-4, and a `.max(0.0)` would hide a `NaN`.
 pub(crate) fn deviance_residual(delta: f64, dh: f64) -> f64 {
     let dh = dh.max(0.0);
     if delta == 0.0 {
@@ -810,11 +727,9 @@ pub(crate) fn deviance_residual(delta: f64, dh: f64) -> f64 {
     (delta - dh).signum() * (2.0 * radicand).sqrt()
 }
 
-/// One endpoint's [`TteObsDiagnostic`] rows (#901): one per `Event` record of
-/// `records`, in record order, built from the [`RecordTerm`]s its likelihood scored.
-/// `terms = None` (the likelihood is the `1e20` sentinel) leaves every residual cell
-/// NaN; an interval-censored record has NaN `dv` and residuals. `written_time` maps the
-/// engine clock back to the data TIME (`Subject::param_time_at`).
+/// One endpoint's [`TteObsDiagnostic`] rows (#901), one per `Event` record in order.
+/// `terms = None` (the 1e20 sentinel) leaves residuals NaN; an interval-censored record
+/// has NaN `dv` and residuals. `written_time` maps the engine clock back to data TIME.
 pub(crate) fn tte_record_diagnostics(
     records: &[ObsRecord],
     terms: Option<&[RecordTerm<f64>]>,
@@ -863,24 +778,11 @@ pub(crate) fn tte_record_diagnostics(
     rows
 }
 
-/// Shared `RightCensored` / `Exact` scoring for one TTE event record, given the
-/// hazard-clock argument `arg` (absolute time or a reset gap) and the lower
-/// cumulative-hazard limit `h_lo` to subtract:
-///   RightCensored: `H(arg) − h_lo`
-///   Exact:         `H(arg) − h_lo − log h(arg)`
-///
-/// Returns `(ΔH, log h, H(arg))`: the increment `ΔH = H(arg) − h_lo`, `Some(log h(arg))`
-/// for an exact event (`None` when censored), and `H(arg) = cumhaz_at(arg)` (used by
-/// the clock-forward path to telescope `h_lo`). The record's NLL term `ΔH − log h` is
-/// formed by [`visit_point`]. `None` when the record is numerically ill-defined — a non-positive
-/// hazard at an exact event, or a non-monotone cumulative hazard past the
-/// [`MonoTol`] round-off band — which each caller folds into its `1e20` sentinel.
-///
-/// The three survival loops ([`tte_nll_from_curves`], [`rtte_forward_nll_from_curves`],
-/// [`rtte_reset_nll_from_curves`]) share these two arms verbatim and differ only in
-/// their lower-limit bookkeeping, which stays inline in each. `IntervalCensored` is
-/// **not** scored here — single-event TTE handles it inline and the RTTE paths reject
-/// it — so that arm is unreachable (folded to `None` for exhaustiveness).
+/// Shared `RightCensored` / `Exact` scoring of one record at hazard-clock argument `arg`
+/// with lower limit `h_lo`. Returns `(ΔH, Some(log h) for an exact event, H(arg))`, or
+/// `None` when ill-defined (non-positive hazard at an event, non-monotone `H` past
+/// [`MonoTol`]); callers fold `None` into the 1e20 sentinel. `IntervalCensored` is
+/// handled by the callers, so that arm is unreachable here.
 #[inline]
 fn score_event<T: PkNum>(
     event_type: &EventType,
@@ -914,33 +816,19 @@ fn score_event<T: PkNum>(
     }
 }
 
-/// Clock-forward (Andersen–Gill) **recurrent-event** (RTTE) negative log-likelihood
-/// from cumulative-hazard / hazard curves:
+/// Clock-forward (Andersen–Gill) recurrent-event (RTTE) negative log-likelihood:
 ///
 /// ```text
 ///   −log L = H(T) − H(entry) − Σ_k log h(t_k)
 /// ```
 ///
-/// Unlike [`tte_nll_from_curves`], which treats each record as an independent
-/// single-event term, the cumulative hazard here is integrated **once** across the
-/// subject's whole risk window (§3.3 of `plans/tte-survival-markov.md`): each record
-/// uses the *previous* record's time as the lower integration limit, so the per-record
-/// `H`-increments telescope to `H(T) − H(entry)`. Summing independent single-event
-/// terms instead would over-count the cumulative hazard by `Σ_k H(t_k)` — the classic
-/// "treat recurrent events as independent observations" error.
-///
-/// Preconditions (enforced upstream by `api::check_rtte_records` at the fit boundary):
-///   * `records` are in **nondecreasing, finite `time`** order (the last is typically
-///     the administrative right-censor at the horizon `T ≥ t_K`);
-///   * left truncation uses the **first** record's `entry_time` as the initial lower
-///     limit; per-record `entry_time` on later records is ignored (the previous event
-///     is the lower limit);
-///   * `IntervalCensored` is not supported for RTTE. Interval censoring is a *data*
-///     property (a DV=0→DV=2 pair) the parser cannot see, so it is rejected at the fit
-///     boundary; the `1e20` sentinel here is defense-in-depth for a direct caller.
-///
-/// Returns the `1e20` sentinel on a non-positive hazard at an event, a non-monotone
-/// cumulative hazard, or a non-finite total — matching [`tte_nll_from_curves`].
+/// The cumulative hazard is integrated once over the risk window: each record's lower
+/// limit is the previous record's time, so the increments telescope (summing independent
+/// single-event terms would over-count by `Σ_k H(t_k)`; §3.3). Preconditions, enforced by
+/// `api::check_rtte_records`: records in nondecreasing finite `time`; only the first
+/// record's `entry_time` is used; `IntervalCensored` is unsupported (sentinel here).
+/// Returns the 1e20 sentinel on a non-positive hazard at an event, a non-monotone `H`,
+/// or a non-finite total.
 pub fn rtte_forward_nll_from_curves(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> f64,
@@ -959,9 +847,7 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
     visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let mut nll = T::from_f64(0.0);
-    // Running lower integration limit as a cumulative hazard `H(lo)`. Seeded from the
-    // subject's left-truncation entry on the first record, then advanced to each
-    // record's `H(time)` so the increments telescope.
+    // Running lower limit `H(lo)`: seeded from the entry, then each record's `H(time)`.
     let mut h_lo = T::from_f64(0.0);
     let mut seeded = false;
 
@@ -993,9 +879,7 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
                     None => return T::from_f64(SUBJECT_SENTINEL_NLL),
                 }
             }
-            // RTTE + interval censoring is unsupported (rejected at the fit boundary by
-            // `api::check_rtte_records`, since DV-driven censoring is invisible to the
-            // parser); this sentinel is defense-in-depth for a direct caller.
+            // Unsupported for RTTE (rejected at the fit boundary); defense in depth.
             EventType::IntervalCensored { .. } => return T::from_f64(SUBJECT_SENTINEL_NLL),
         }
     }
@@ -1008,8 +892,7 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
     }
 }
 
-/// Clock-reset (gap-time / renewal) **recurrent-event** (RTTE) negative log-likelihood
-/// from cumulative-hazard / hazard curves:
+/// Clock-reset (gap-time / renewal) recurrent-event (RTTE) negative log-likelihood:
 ///
 /// ```text
 ///   −log L = [ H(t₁) − H(entry) − log h(t₁) ]      first sojourn, absolute clock from 0
@@ -1017,38 +900,14 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
 ///          + H(Δ_censor)
 /// ```
 ///
-/// The hazard clock **resets to 0 at each event**, so each *inter-event* gap
-/// `Δ_k = t_k − t_{k−1}` (k ≥ 2) is an independent single-event contribution evaluated on
-/// its own *duration* — `cumhaz_at`/`hazard_at` are called at `Δ_k`, not at absolute time.
-/// This is the renewal-process form (§3.3); for a time-homogeneous hazard (exponential) it
-/// coincides with the clock-forward likelihood, and differs once the hazard varies with
-/// time (Weibull/Gompertz).
+/// The hazard clock resets at each event, so later gaps are scored at their duration.
+/// For an exponential hazard this equals the clock-forward likelihood.
 ///
-/// **Left truncation (delayed entry, `entry_time > 0`), convention B (#740).** The *first*
-/// sojourn is the interval from the time origin (`t = 0`) to the first record, measured in
-/// **absolute** time and **conditioned on survival to `entry`**: its contribution is
-/// `H(t₁) − H(entry) [− log h(t₁)]` — the exact clock-forward first-record term, and the
-/// same delayed-entry conditioning used for single-event TTE and clock-forward RTTE (one
-/// left-truncation semantics across every path: `entry` always means "condition on survival
-/// past entry", never "restart the clock at entry"). For a memoryless (exponential) hazard
-/// this collapses to `H(t₁ − entry)` and coincides with the pure renewal form; for a
-/// time-varying hazard it does **not** — the rejected alternative (renewal clock restarting
-/// at `entry`, first gap `Δ = t₁ − entry` from 0) is a different, unanchored model. This
-/// convention assumes the time origin `t = 0` is the renewal origin of the first sojourn
-/// (the subject was event-free and at risk from 0); when `entry == 0` the term is exactly
-/// the pure renewal `H(t₁)` and this function is bit-identical to a clock from 0.
-///
-/// Preconditions match [`rtte_forward_nll_from_curves`]: records nondecreasing in `time`
-/// (enforced at data load), `IntervalCensored` unsupported (folds to the `1e20`
-/// sentinel). Returns the sentinel on a non-positive hazard at an event, a non-monotone
-/// cumulative hazard on a gap, or a non-finite total.
-///
-/// As on the clock-forward path, only the **first** record's `entry_time` conditions the
-/// likelihood; a per-record `entry_time` on a *later* record is ignored (that gap is a fresh
-/// renewal from 0, so re-conditioning on entry would double-count survival to entry). Real
-/// left-truncated data carries a single subject-level `TENTRY`, for which this is exactly
-/// convention B; an inconsistent per-row `TENTRY` is silently reduced to the first record's
-/// value rather than rejected — matching clock-forward, not the pre-#740 loud rejection.
+/// Left truncation follows convention B (#740): the first sojourn is in absolute time,
+/// conditioned on survival to `entry` (the clock-forward first-record term), never a
+/// renewal clock restarted at `entry`. With `entry == 0` it is the pure renewal form.
+/// Only the first record's `entry_time` is used; later gaps are fresh renewals.
+/// Preconditions and the 1e20 sentinel cases match [`rtte_forward_nll_from_curves`].
 pub fn rtte_reset_nll_from_curves(
     records: &[ObsRecord],
     cumhaz_at: impl Fn(f64) -> f64,
@@ -1083,13 +942,8 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
             continue;
         };
 
-        // Where to evaluate the hazard clock for this record (`arg`) and the lower
-        // cumulative-hazard limit to subtract (`h_lo`):
-        //   * first record  → absolute time `t₁` on the clock from the origin, lower limit
-        //     H(entry) (delayed-entry conditioning, convention B); reduces to (t₁, 0) when
-        //     entry == 0.
-        //   * later records → gap `t − t_prev` on a clock reset at the previous event,
-        //     lower limit H(0) = 0.
+        // First record: absolute `t₁` with lower limit H(entry) (convention B); later
+        // records: the gap `t − t_prev` with lower limit H(0) = 0.
         let (arg, h_lo) = match prev_time {
             None => {
                 let h_entry = entry_lower_limit(*entry_time, &cumhaz_at);
@@ -1097,10 +951,8 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
             }
             Some(prev) => (*time - prev, T::from_f64(0.0)),
         };
-        // A negative clock argument means out-of-order records (a later record's gap); the
-        // H(Δ) with Δ<0 is meaningless, so fail closed. An `entry > t₁` on the first record
-        // leaves `arg = t₁ ≥ 0` but drives `H(arg) < h_lo`, caught by the monotone check
-        // below (same fold as the clock-forward path).
+        // A negative gap means out-of-order records: fail closed. `entry > t₁` is
+        // caught by the monotone check below instead.
         if arg < 0.0 {
             return T::from_f64(SUBJECT_SENTINEL_NLL);
         }
@@ -1130,17 +982,10 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
 //  FD Hessian: the tests' reference stencil
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 4-point central-stencil finite-difference Hessian of `eval` at `eta_hat`, `eps[j]` the
-/// step of axis `j`: the reference the parity tests extrapolate against the plans' exact
-/// Hessians (#2786), and the safety net for a subject whose term no plan records
-/// (`stats::likelihood`'s non-Gaussian curvature).
-///
-/// The (j,k) entry is:
-///   (f(η+sj·ej+sk·ek) − f(η+sj·ej−sk·ek) − f(η−sj·ej+sk·ek) + f(η−sj·ej−sk·ek))
-///   ─────────────────────────────────────────────────────────────────────────────────
-///                              4 · sj · sk
-///
-/// For j==k this reduces to the standard central-difference second derivative with step 2·sj.
+/// 4-point central-stencil FD Hessian of `eval` at `eta_hat` with per-axis steps `eps`:
+/// the tests' reference for the plans' exact Hessians (#2786), and the fallback for a
+/// subject whose term no plan records. Entry (j,k) is
+/// `(f(+sj,+sk) − f(+sj,−sk) − f(−sj,+sk) + f(−sj,−sk)) / (4·sj·sk)`.
 pub(crate) fn data_term_hessian_fd(
     eval: impl Fn(&[f64]) -> f64,
     eta_hat: &[f64],
@@ -1173,12 +1018,9 @@ pub(crate) fn data_term_hessian_fd(
 //  Simulation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Draw one latent event time (uncensored) for a hazard family. Consumes exactly
-/// one uniform from `rng`. `entry_time > 0` draws conditionally on survival past
-/// entry (left truncation, §3.6). Returns `f64::MAX` for degenerate / improper
-/// cases (`λ = 0`; a Gompertz with `γ < 0` whose survival never reaches the drawn
-/// quantile) — that value never wins a competing-risks `min` and censors at the
-/// window in `draw_tte_outcome`.
+/// Draw one uncensored latent event time, consuming exactly one uniform. `entry_time > 0`
+/// draws conditional on survival past entry. Returns `f64::MAX` for degenerate / improper
+/// cases (`λ = 0`; a Gompertz with `γ < 0` that never reaches the quantile).
 fn draw_tte_latent<R: rand::Rng>(
     family: HazardFamily,
     params: &[f64],
@@ -1195,19 +1037,9 @@ fn draw_tte_latent<R: rand::Rng>(
     }
 }
 
-/// Draw one TTE outcome within the observation window `window`.
-///
-/// Returns `(time, observed)`:
-/// - an **event** at the drawn time when it falls before `window`
-///   (`observed = true`, `time = t_event`);
-/// - **administrative right-censoring** at `window` when the drawn event time
-///   reaches the window (`observed = false`, `time = window`).
-///
-/// The draw comes from [`draw_tte_latent`], whose `f64::MAX` degenerate / improper
-/// sentinel must not be reported as an event: an event is recorded only for a draw
-/// strictly below the window **and** below that sentinel, so a degenerate draw is
-/// censored even when `window` is unbounded (`+∞`, an event record carrying no
-/// administrative horizon; see [`observation_window`]).
+/// Draw one TTE outcome within `window`: `(t_event, true)` for a draw strictly below the
+/// window, else `(window, false)`. A `f64::MAX` degenerate draw is never an event, even
+/// with an unbounded window (see [`observation_window`]).
 fn draw_tte_outcome<R: rand::Rng>(
     family: HazardFamily,
     params: &[f64],
@@ -1216,11 +1048,8 @@ fn draw_tte_outcome<R: rand::Rng>(
     rng: &mut R,
 ) -> (f64, bool, bool) {
     let t_event = draw_tte_latent(family, params, entry_time, rng);
-    // The samplers return the `f64::MAX` sentinel for a degenerate / improper draw
-    // (non-positive or non-finite effective rate, #763) — reported as the third
-    // element so the caller can surface a per-subject diagnostic. A degenerate draw is
-    // never an observed event; the `!degenerate` guard also stops an unbounded window
-    // (`+∞`) from mis-reporting the sentinel as an event at `f64::MAX`.
+    // The `f64::MAX` degenerate sentinel (#763) is reported to the caller and never an
+    // observed event, even with an unbounded (`+∞`) window.
     let degenerate = t_event >= f64::MAX;
     if t_event < window && !degenerate {
         (t_event, true, false)
@@ -1229,20 +1058,9 @@ fn draw_tte_outcome<R: rand::Rng>(
     }
 }
 
-/// The administrative right-censoring horizon for a TTE record, or `+∞` when the
-/// record carries none.
-///
-/// Only a `RightCensored` record marks an administrative horizon: the subject
-/// was event-free through `time`, at which point observation ended, so a
-/// simulated draw reaching `time` is genuinely censored there. An `Exact` or
-/// `IntervalCensored` record instead marks an *event* — its `time` field is the
-/// realized event time (or interval upper bound), **not** a horizon. Censoring a
-/// re-simulated draw at a realized event time would truncate the simulated
-/// event-time distribution at the data's own event times (a re-simulation / VPC
-/// bias), so those records draw uncensored (`+∞`). Administrative censoring for
-/// such a design is supplied either by the design itself (right-censored
-/// template rows, as the SSE tests do) or by the forthcoming
-/// `[simulation] horizon` (Phase 2).
+/// The administrative right-censoring horizon for a TTE record, or `+∞` when it carries
+/// none. Only a `RightCensored` record marks a horizon; an `Exact` / `IntervalCensored`
+/// `time` is a realized event, and censoring a re-simulated draw there would bias a VPC.
 fn observation_window(event_type: &EventType, time: f64) -> f64 {
     match event_type {
         EventType::RightCensored => time,
@@ -1250,15 +1068,9 @@ fn observation_window(event_type: &EventType, time: f64) -> f64 {
     }
 }
 
-/// Resolve a competing-risks outcome from each cause's latent event time and the
-/// subject's administrative `window`. Returns `(winning cause index, observed
-/// time, event_observed)`: the earliest latent time wins, and an event is
-/// observed only if it precedes the window — otherwise the subject is censored at
-/// the window (the winning index is still the earliest cause but `event = false`).
-/// `total_cmp` makes ties and `f64::MAX` sentinels deterministic (lowest index).
-/// The `t_star < f64::MAX` guard prevents a degenerate / improper draw (the
-/// samplers' sentinel) from being reported as a spurious event when the window is
-/// unbounded (`+∞`, e.g. every cause is an event record carrying no horizon).
+/// Resolve a competing-risks outcome: the earliest latent time wins (`total_cmp`, lowest
+/// index on ties) and is observed only if before `window` and below the `f64::MAX`
+/// sentinel. Returns `(winning cause, time, event_observed)`.
 fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
     let (win_idx, &t_star) = latents
         .iter()
@@ -1269,16 +1081,9 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
     (win_idx, if event { t_star } else { window }, event)
 }
 
-/// Destructure a TTE endpoint and evaluate its hazard parameters at the given
-/// `(theta, eta, covariates)`. Returns `None` for any non-`Tte` endpoint so
-/// callers can `filter_map`/`?` over `model.endpoints` or a looked-up CMT.
-///
-/// This centralises the `EndpointLikelihood::Tte { HazardSpec::Analytic {
-/// family, param_fn } }` destructure and `param_fn` evaluation shared by
-/// `simulate_tte` (per `obs_record`) and `predict_survival` (per endpoint), so a
-/// new `HazardSpec`/`HazardFamily` variant only has to be handled here. Callers
-/// supply their own trailing per-cause fields (window/entry time vs. summary
-/// statistics).
+/// Destructure a TTE endpoint and evaluate its analytic hazard parameters at
+/// `(theta, eta, covariates)`; `None` for a non-`Tte` endpoint or an ODE-accumulated
+/// hazard. Shared by simulation and `predict_survival`.
 pub(crate) fn tte_cause_params(
     endpoint: &EndpointLikelihood,
     theta: &[f64],
@@ -1288,10 +1093,7 @@ pub(crate) fn tte_cause_params(
     let EndpointLikelihood::Tte { hazard, .. } = endpoint else {
         return None;
     };
-    // Analytic families expose closed-form cause params; the ODE-accumulated hazard
-    // does not (its H/h come from the integrated CHZ state), so it has no analytic
-    // cause params here. Simulation of ODE-accumulated TTE is guarded at the api
-    // layer (Slice 2.2 root-finder); this simply reports "no analytic cause".
+    // ODE-accumulated hazards have no closed-form cause params.
     let HazardSpec::Analytic {
         family, param_fn, ..
     } = hazard
@@ -1301,14 +1103,10 @@ pub(crate) fn tte_cause_params(
     Some((*family, param_fn(theta, eta, covariates)))
 }
 
-/// Solve a subject's augmented ODE at `(theta, eta)` and read the cumulative hazard
-/// `H(t) = u[chz_state]` and instantaneous hazard `h(t) = u̇[chz_state]` at each `times`
-/// point (joint PK-TTE, #564). `times` must be the exact f64 values the caller will look
-/// up. Returns `(H, h)` aligned to `times`; an entry is NaN where the solve did not reach
-/// that time (or there is no ODE / the solve length disagrees). Shared by the TTE
-/// likelihood (`stats::likelihood::tte_ode_nll`) and `api::predict_survival` so the
-/// H/h-extraction contract lives in one place; one reusable derivative buffer serves all
-/// `h(t)` evaluations.
+/// Solve a subject's augmented ODE at `(theta, eta)` and read `H(t) = u[chz_state]` and
+/// `h(t) = u̇[chz_state]` at each of `times` (joint PK-TTE, #564). Returns `(H, h)`
+/// aligned to `times`, NaN where the solve did not reach. Shared by `tte_ode_nll` and
+/// `api::predict_survival`.
 #[cfg(feature = "survival")]
 pub(crate) fn ode_cumhaz_hazard(
     model: &crate::types::CompiledModel,
@@ -1323,15 +1121,9 @@ pub(crate) fn ode_cumhaz_hazard(
     let Some(ode) = model.ode_spec.as_ref() else {
         return (cum, haz);
     };
-    // Single-pass hazard integration under one disposition snapshot. A time-dependent
-    // hazard RHS (e.g. a Weibull `TIME` term) is honoured by the integrator clock; the
-    // disposition and `init()` resolve the `TIME` built-in at the integration start
-    // (t=0). #610. Every dose-record quantity — absorption kernel, pathway fraction,
-    // route lag, zero-order `dur`, compartment lag, `F`, `D{n}`/`R{n}`, the SS run-in — is
-    // read at its own dose record instead, as the Gaussian predictions read it (#1575).
-    // Always per dose, with no "is this subject static?" gate in front: on a static
-    // subject the materializer's constant arm is one `$PK` call, and a gate's `true`
-    // mutation could not be killed by any test.
+    // Single-pass integration: the disposition and `init()` read `TIME` at t=0 (#610);
+    // every dose-record quantity (kernel, fractions, lags, `dur`, `F`, SS run-in) is read
+    // at its own dose record, as the Gaussian predictions do (#1575).
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let mut pk_at_dose = Vec::new();
     crate::pk::compute_dose_pk_params_into(model, subject, theta, eta, &mut pk_at_dose);
@@ -1342,10 +1134,7 @@ pub(crate) fn ode_cumhaz_hazard(
     if states.len() != n {
         return (cum, haz);
     }
-    // `h(t)` is the cumulative-hazard derivative: the bare hazard RHS at the integrated
-    // state (dose forcings touch PK compartments, not CHZ). One buffer, reused — only the
-    // `chz_state` slot is read, and the RHS always writes it. Its `TAD` anchor reads the
-    // per-dose lags the walk above ran under.
+    // `h(t)` is the hazard RHS at the integrated state; one buffer, only `chz_state` read.
     let mut du = vec![0.0; ode.n_states];
     let dose_lagtimes = crate::ode::predictions::dose_lagtimes_reading(subject, ode, dose_reads);
     let first_dose_time = crate::ode::predictions::earliest_dose_time(&subject.doses);
@@ -1364,24 +1153,11 @@ pub(crate) fn ode_cumhaz_hazard(
     (cum, haz)
 }
 
-/// Draw one **ODE-accumulated** (drug-driven) TTE latent event time for a single
-/// cause: sample `u ~ U(0,1)` and root-find the augmented ODE for the first time
-/// the cumulative hazard reaches `−log u` — the event-time analogue of the analytic
-/// inverse-CDF in [`draw_tte_latent`]. Returns the crossing time, or `f64::MAX` (the
-/// shared "did not fire" sentinel) when the hazard does not reach the threshold by
-/// `horizon`, so the caller's window logic censors it exactly as for an analytic
-/// cause.
-///
-/// `horizon` must be `Some` and finite — the `simulate` entry points validate this
-/// (a drug-driven hazard can vanish, so there is no implicit window). Left
-/// truncation (`entry_time > 0`) for an ODE hazard is a deferred follow-up and is
-/// rejected up front, so the search starts at 0. A solve that cannot yield a
-/// meaningful event time (a diverged `[odes]` state, a non-finite / non-monotone
-/// hazard, an exhausted step budget) returns `Err` with the solver's reason; the
-/// caller censors that subject and names it in a `W_TTE_SOLVE_FAILED` warning
-/// (#2087), so one bad parameter draw does not cost the rest of the population.
-/// `u` is drawn before the solve, so a failed draw consumes exactly the RNG a
-/// successful one does.
+/// Draw one ODE-accumulated TTE latent event time: draw `u ~ U(0,1)` and root-find the
+/// first time `H` reaches `−log u`. Returns `f64::MAX` when it does not fire by `horizon`
+/// (which must be finite; left truncation is rejected up front). A failed solve returns
+/// `Err` with the solver's reason; the caller censors the subject and warns
+/// (`W_TTE_SOLVE_FAILED`, #2087). `u` is drawn before the solve, so RNG use is fixed.
 #[cfg(feature = "survival")]
 fn draw_ode_tte_latent<R: rand::Rng>(
     model: &crate::types::CompiledModel,
@@ -1398,11 +1174,8 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     );
     let u: f64 = rng.sample(rand::distr::Open01);
     let threshold = -u.ln();
-    // Single-pass hazard integration, read exactly as `ode_cumhaz_hazard` reads it so a
-    // simulated event time is consistent with the fitted hazard: the hazard RHS `TIME`
-    // is honoured by the integrator clock; the disposition snapshot resolves the `TIME`
-    // built-in at the integration start (t=0), #610; every dose-record quantity is read
-    // at its own dose record (#1575).
+    // Integrated exactly as `ode_cumhaz_hazard` does (#610, #1575), so a simulated event
+    // time is consistent with the fitted hazard.
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let mut pk_at_dose = Vec::new();
     crate::pk::compute_dose_pk_params_into(model, subject, theta, eta, &mut pk_at_dose);
@@ -1425,20 +1198,10 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     }
 }
 
-/// Identify a subject's single **RTTE** (repeated-event) cause: its CMT, clock,
-/// hazard family, and the analytic hazard parameters at `(theta, eta,
-/// covariates)`. Returns `None` for a non-RTTE subject — the common single /
-/// competing single-TTE path in [`simulate_tte`].
-///
-/// An RTTE endpoint is a *recurrent* process: all of a subject's rows at that CMT
-/// belong to **one** stream, not a set of competing single events, so it must be
-/// detected and routed away from the competing-risks branch. Tight scope (Slice
-/// 3.3): a model reaching simulation has at most one RTTE CMT and no competing
-/// single-event TTE sibling — [`crate::api::validate_tte_simulatable`] rejects
-/// both up front. This re-establishes the load-bearing invariants rather than
-/// trust the caller: a non-analytic hazard (parser rejects `rtte` + ODE hazard)
-/// or a second distinct RTTE CMT slipping past the guard is a **bug**, so it
-/// panics rather than silently dropping a recurrent stream.
+/// A subject's single RTTE cause: `(cmt, clock, family, params, entry)`, or `None` for a
+/// non-RTTE subject. All rows at the RTTE CMT are one recurrent stream.
+/// `api::validate_tte_simulatable` rejects a second RTTE CMT or a competing single-TTE
+/// sibling; this panics if either (or a non-analytic hazard) slips through.
 #[cfg(feature = "survival")]
 fn rtte_cause(
     model: &crate::types::CompiledModel,
@@ -1496,48 +1259,20 @@ fn rtte_cause(
     found
 }
 
-/// Generate one subject's **RTTE** (repeated-event) stream to the administrative
-/// `horizon` and append the rows. Analytic hazard only (the parser rejects `rtte`
-/// + ODE hazard).
+/// Generate one subject's RTTE stream to `horizon` and append the rows (analytic hazard
+/// only).
 ///
-/// - **clock-forward** (Andersen–Gill, absolute time): each next event is drawn
-///   *conditional on survival past the previous event* via the closed-form
-///   [`sample_conditional_event_time`] (which solves `H(T) − H(t_prev) = −log U`).
-///   The hazard clock never resets, so a time-varying hazard (e.g. Weibull) keeps
-///   accumulating over `[0, horizon]`.
-/// - **clock-reset** (renewal, gap time): each inter-event gap is a fresh draw
-///   from `t = 0` via [`sample_event_time`]; event times accumulate the gaps. The
-///   hazard clock restarts at every event.
+/// - clock-forward: each event drawn conditional on survival past the previous one
+///   ([`sample_conditional_event_time`]); the clock never resets.
+/// - clock-reset: each gap a fresh draw from 0 ([`sample_event_time`]).
 ///
-/// **Left truncation (delayed entry, `entry > 0`), convention B (#740).** The stream
-/// is generated on the same time origin `t = 0`, conditioned on the subject having
-/// survived event-free to `entry` — the simulate-side dual of the fit-side
-/// [`rtte_reset_nll_from_curves`]. Under **clock-forward** the running conditioning
-/// limit simply starts at `entry` (`t_prev = entry`) so the first event is drawn from
-/// `H(t₁) − H(entry) = −log U`. Under **clock-reset** the *first* sojourn is the one
-/// conditioned on survival to `entry` (an absolute-time draw via
-/// [`sample_conditional_event_time`]); every later gap is a fresh renewal from 0. For
-/// `entry == 0` both clocks reduce to the pure-renewal / from-origin draws above and
-/// the RNG sequence is byte-identical (each iteration still consumes exactly one
-/// uniform, and the `entry > 0` branch is not taken). As on the fit side, only the
-/// subject-level entry conditions the first sojourn; the emitted rows carry the drawn
-/// event times (the trailing censor sits at `horizon`), matching single-event TTE
-/// simulation, which likewise conditions on `entry` without stamping it onto output.
+/// Left truncation (convention B, #740): forward seeds `t_prev = entry`; reset draws only
+/// the first sojourn conditional on survival to `entry`. With `entry == 0` the RNG
+/// sequence is byte-identical to the untruncated draw.
 ///
-/// Emits one `Event { observed = true }` row per event strictly before `horizon`,
-/// then one `Event { observed = false }` administrative-censoring row **at**
-/// `horizon`. A subject with no event before the horizon yields just the censor
-/// row. This is exactly the reference RTTE layout (`DV = 1` event rows followed by
-/// a trailing `DV = 0` at the horizon), so simulated data round-trips through the
-/// data reader back to the same records.
-///
-/// **Termination.** Each event strictly advances time by a positive amount (the
-/// samplers return `t > t_prev` or the degenerate `f64::MAX` sentinel, which is
-/// `≥ horizon` and stops the loop), and the horizon is finite, so the loop
-/// terminates. A pathological parameterization (vanishing inter-event gaps) is
-/// handled **per subject** (#762): the stream is skipped or truncated, the subject is
-/// censored at the horizon, and a diagnostic is pushed to `warnings` — the run is never
-/// aborted for one unlucky subject, and no ~`MAX_EVENTS` rows are materialised first.
+/// Emits one observed row per event strictly before `horizon`, then one censor row at
+/// `horizon` (the reference RTTE layout). A pathological parameterization is handled per
+/// subject (#762): the stream is skipped or truncated with a warning, never aborted.
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn simulate_rtte_stream<R: rand::Rng>(
@@ -1570,23 +1305,13 @@ fn simulate_rtte_stream<R: rand::Rng>(
     // Backstop against a degenerate hazard whose inter-event gaps vanish.
     const MAX_EVENTS: usize = 1_000_000;
 
-    // Pre-flight degeneracy guard (#762): estimate the expected number of events over the
-    // window and skip the stream up front — recording just the administrative censor plus a
-    // warning — rather than materialise ~1e6 rows only to abort, letting the rest of the
-    // population simulate. The estimate is clock-specific (#772 review):
-    //   * Forward clock — Poisson process with cumulative hazard, so `E[N] = H(horizon)`
-    //     exactly (`cum_hazard`).
-    //   * Reset clock — a renewal process with i.i.d. gaps, so `E[N] ≈ horizon / E[gap]`.
-    //     The forward-clock `H(horizon)` massively OVER-counts here for an increasing-hazard
-    //     family (e.g. an IFR Weibull, where `H(horizon)` can be ~1e6 while the true renewal
-    //     count is a few dozen), which would wrongly skip a perfectly legitimate subject. Use
-    //     the median gap — the family's inverse-survival at `u = 0.5`, the same inverse the
-    //     loop draws — as a cheap, family-agnostic proxy for the mean gap: a vanishing median
-    //     gap → `+∞` estimate → skip; a rate-0 (infinite) gap → `~0` estimate → not skipped
-    //     (correctly: no events, not a flood). It is a pure computation on the fixed `0.5`, so
-    //     it draws no RNG and leaves the sequence (and the SSE tests) untouched.
-    // Left truncation (#740): count only the observable, at-risk window past `entry`.
-    // `entry == 0` reduces each arm to the original expression bit-for-bit.
+    // Pre-flight degeneracy guard (#762): skip a stream whose expected event count is
+    // huge, recording the censor plus a warning. Clock-specific (#772):
+    //   * forward: `E[N] = H(horizon)` exactly;
+    //   * reset: `E[N] ≈ horizon / median gap` (`H(horizon)` over-counts an increasing
+    //     hazard, e.g. ~1e6 vs a few dozen). The median is computed at the fixed 0.5,
+    //     so no RNG is drawn.
+    // Left truncation (#740) counts only the window past `entry`.
     let expected = match clock {
         RtteClock::Forward => {
             let h_entry = if entry > 0.0 {
@@ -1609,13 +1334,8 @@ fn simulate_rtte_stream<R: rand::Rng>(
         return;
     }
 
-    // Clock-forward conditions every event on survival past the previous one on a single
-    // clock, so left truncation just seeds that clock at `entry` (`entry == 0` ⇒ `0`,
-    // identical to before). Clock-reset renews each gap from 0, so its FIRST sojourn is the
-    // only one conditioned on survival to `entry` (handled in the loop via `n_events == 0`).
-    // A non-positive `entry` means "no truncation" — clamp to 0 so it can never seed a
-    // pre-origin clock (matching the `expected` estimate above, the reset arm's `entry > 0.0`
-    // gate, and the fit side's `entry_lower_limit`; `entry == 0` stays `0.0`, bit-identical).
+    // Forward: left truncation seeds the clock at `entry`. Reset: only the first sojourn
+    // is conditioned (`n_events == 0` in the loop). A non-positive `entry` clamps to 0.
     let mut t_prev = match clock {
         RtteClock::Forward => entry.max(0.0),
         RtteClock::Reset => 0.0_f64,
@@ -1624,18 +1344,11 @@ fn simulate_rtte_stream<R: rand::Rng>(
     loop {
         let u: f64 = rng.sample(rand::distr::Open01);
         let t_next = match clock {
-            // Absolute-time hazard: condition the next event on survival past the
-            // previous one. From `t_prev = 0` this equals a fresh draw, from `t_prev =
-            // entry` the delayed-entry first draw, and for a memoryless (Exponential)
-            // hazard it equals the reset draw below.
+            // Condition the next event on survival past the previous one.
             RtteClock::Forward => sample_conditional_event_time(family, params, t_prev, u),
-            // Renewal: a fresh gap from 0, accumulated onto the previous event. A
-            // degenerate `f64::MAX` gap must stay `≥ horizon` (not overflow to a
-            // finite value), so guard the addition. Under left truncation (#740,
-            // convention B) the *first* sojourn (`n_events == 0`) is instead drawn from
-            // the origin conditioned on survival to `entry` (absolute time ≥ entry) — the
-            // simulate dual of the fit's `H(t₁) − H(entry)`; `entry == 0` skips this
-            // branch and is byte-identical to the pure renewal draw.
+            // Renewal: a fresh gap from 0; the addition is guarded so a `f64::MAX` gap
+            // stays `≥ horizon`. Under left truncation the first sojourn is drawn
+            // conditional on survival to `entry` (#740).
             RtteClock::Reset => {
                 if n_events == 0 && entry > 0.0 {
                     sample_conditional_event_time(family, params, entry, u)
@@ -1649,16 +1362,10 @@ fn simulate_rtte_stream<R: rand::Rng>(
                 }
             }
         };
-        // Record the event only while the draw lands strictly before the horizon. A
-        // draw that reaches the horizon, the degenerate `f64::MAX` sentinel, or a NaN
-        // all fail this test (`NaN < horizon` is false), ending the stream: the subject
-        // is administratively right-censored at the horizon.
+        // A draw at/after the horizon, the `f64::MAX` sentinel or NaN ends the stream.
         if t_next < horizon {
-            // In-loop backstop for a realisation that overshoots the pre-flight estimate
-            // (an unlucky draw sequence): truncate this subject's stream, warn, and let the
-            // run continue — never panic the whole `simulate()` call for one subject (#762).
-            // Checked *before* the push, so hitting the cap does not first pile up ~1e6 rows
-            // (and the branch is reachable in a test without generating them).
+            // Backstop for an unlucky realisation (#762): truncate and warn, checked
+            // before the push so no ~1e6 rows pile up.
             if n_events >= MAX_EVENTS {
                 warnings.push(format!(
                     "W_RTTE_DEGENERATE: subject '{id}' (CMT={cmt}) produced over {MAX_EVENTS} \
@@ -1680,42 +1387,18 @@ fn simulate_rtte_stream<R: rand::Rng>(
 
 /// Draw TTE event/censoring outcomes for a subject and append them to `results`.
 ///
-/// Called from `api::simulate_inner_with_draw` after the Gaussian path. Each
-/// `ObsRecord::Event` carries the subject's observation window in its `time`
-/// field.
+/// - Single endpoint: the draw is censored at the record's window.
+/// - Competing risks (§3.6): one latent per cause CMT; the earliest is the observed
+///   event, the others are censored at that time. The shared window is `+∞` if any
+///   record is an event, else the common censoring window. One row per cause CMT.
 ///
-/// - **Single endpoint:** the drawn event is administratively right-censored at
-///   the window when it would occur later, so simulated data reproduce the
-///   design's censoring pattern rather than every draw being an event.
-/// - **Competing risks** (≥2 TTE records, one per cause CMT — §3.6): a latent
-///   time is drawn for each cause; the **earliest** is the observed event (its
-///   CMT, `observed = true`) and every other cause is right-censored at that same
-///   time (`observed = false`). The subject's administrative horizon is shared
-///   across causes: a record carrying an observed event (`Exact`) imposes none
-///   (+∞), so only an all-`RightCensored` subject is censored, at its common
-///   window (the `max` of the per-cause windows — see the match arm). One row per
-///   cause CMT is emitted, giving the cause-specific layout the data reader expects.
-///
-/// `horizon` (`[simulation] horizon`, #522), when `Some(h)`, **overrides** the
-/// per-record `observation_window` for every cause: `h` becomes the shared
-/// administrative censoring window regardless of each record's `event_type`. This
-/// is what a competing-risks VPC needs — re-simulating event-bearing data
-/// (`Exact` records, which on their own draw unbounded) then censors at the
-/// *planned* study end `h` rather than at the data's own observed event times.
-/// `None` keeps the per-record window. The override changes only the censoring
-/// comparison, never the number of uniforms drawn, so the RNG sequence (and the
-/// SSE characterization tests) are unaffected.
-// Same flat (model, subject, params, replicate indices, RNG, output sink) shape
-// as the sole caller `emit_subject_rows`, which carries this same allow: the args
-// are heterogeneous with no cohesive struct to bundle, and splitting them would
-// only diverge from that sibling.
-///
-/// A degenerate analytic hazard draw (#763) is reported as one `W_TTE_DEGENERATE_HAZARD`
-/// line per affected cause of this call. The `simulate*` entry points, which call this
-/// once per replicate, go through `simulate_tte_reporting` instead and report each
-/// (subject, CMT) once for the whole run (#1648).
+/// `horizon` (`[simulation] horizon`, #522) overrides every per-record window, so a
+/// competing-risks VPC censors at the planned study end. It never changes the number of
+/// uniforms drawn. A degenerate analytic draw (#763) gives one `W_TTE_DEGENERATE_HAZARD`
+/// line per cause; the `simulate*` entry points use `simulate_tte_reporting` (#1648).
 #[allow(clippy::too_many_arguments)]
-pub fn simulate_tte<R: rand::Rng>(
+#[cfg(test)]
+pub(crate) fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,
     theta: &[f64],
@@ -1741,9 +1424,8 @@ pub fn simulate_tte<R: rand::Rng>(
         warnings,
         &mut degenerate,
     );
-    // After the call's other lines. A call never produces both kinds: a single cause is
-    // either an analytic draw or an ODE solve, and a competing-risks subject with a failed
-    // ODE cause returns before the degenerate check.
+    // A call never produces both kinds of warning: a failed ODE cause returns before the
+    // degenerate check.
     warnings.extend(
         degenerate
             .into_iter()
@@ -1751,10 +1433,9 @@ pub fn simulate_tte<R: rand::Rng>(
     );
 }
 
-/// The body of [`simulate_tte`], reporting each cause whose analytic hazard draw
-/// degenerated (#763) as its CMT in `degenerate` instead of as a warning line, so a caller
-/// that simulates many replicates can report a (subject, CMT) once (#1648). Rows, the RNG
-/// stream and every other warning are those of [`simulate_tte`].
+/// The body of `simulate_tte`, reporting each degenerate analytic cause (#763) as its CMT
+/// in `degenerate` instead of a warning line, so a many-replicate caller can report each
+/// (subject, CMT) once (#1648).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
     model: &crate::types::CompiledModel,
@@ -1769,13 +1450,8 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
     warnings: &mut Vec<String>,
     degenerate: &mut Vec<usize>,
 ) {
-    // Repeated events (RTTE, Slice 3.3) are a *recurrent* process, not competing
-    // single events: a subject's rows at the RTTE CMT are one stream to be
-    // regenerated to the horizon. Detect and route it first, so the single /
-    // competing path below stays byte-identical for non-RTTE models. The tight-scope
-    // invariants (single RTTE CMT, no competing single-TTE sibling, finite horizon) are
-    // enforced fail-loud in `api::validate_tte_simulatable`; left truncation (entry > 0)
-    // is supported (#740) and threaded through as `entry`.
+    // RTTE subjects are one recurrent stream, routed first so the single / competing path
+    // stays byte-identical. Invariants are enforced in `api::validate_tte_simulatable`.
     if let Some((cmt, clock, family, params, entry)) = rtte_cause(model, subject, theta, eta) {
         let horizon = horizon.expect(
             "RTTE simulation requires a finite horizon; the simulate entry points validate this \
@@ -1798,9 +1474,8 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
         return;
     }
 
-    // Each TTE cause (a record routed to a `Tte` endpoint) carries its observation
-    // window and the kind of hazard that draws its latent event time. A subject may
-    // also carry non-TTE records; those are skipped here.
+    // Each TTE cause carries its window and the kind of hazard that draws its latent;
+    // non-TTE records are skipped.
     enum CauseKind {
         Analytic {
             family: HazardFamily,
@@ -1827,9 +1502,7 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
         let Some(EndpointLikelihood::Tte { hazard, .. }) = model.endpoints.get(cmt) else {
             continue;
         };
-        // With an explicit `horizon`, every cause shares it as the administrative
-        // window (#522); otherwise only a right-censored record marks a horizon and
-        // an event record draws uncensored (+∞) — see `observation_window`.
+        // `horizon` overrides every window (#522); see `observation_window` otherwise.
         let window = horizon.unwrap_or_else(|| observation_window(event_type, *time));
         let kind = match hazard {
             HazardSpec::Analytic {
@@ -1861,9 +1534,8 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
 
     match causes.as_slice() {
         [] => {}
-        // Single endpoint: administrative censoring at its own window. Analytic
-        // stays on `draw_tte_outcome` (byte-identical RNG to the pre-ODE path); an
-        // ODE hazard root-finds its latent, then applies the same window rule.
+        // Single endpoint: censor at its own window (analytic draw byte-identical to the
+        // pre-ODE path; an ODE hazard root-finds its latent).
         [(cmt, window, kind)] => {
             let (t, observed) = match kind {
                 CauseKind::Analytic {
@@ -1900,10 +1572,8 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
             };
             push(*cmt, t, observed, results);
         }
-        // Competing risks: earliest latent event wins; the rest censor at that time.
-        // Draw in record order so the RNG sequence stays deterministic across the mix.
-        // Every cause is drawn even after an ODE cause fails, so a subject consumes the
-        // same RNG either way and later subjects' draws do not shift (#2087).
+        // Competing risks: draw every cause in record order (even after a failed ODE
+        // cause) so RNG consumption is fixed (#2087); the earliest wins.
         _ => {
             let drawn: Vec<Result<f64, String>> = causes
                 .iter()
@@ -1918,24 +1588,15 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
                     }
                 })
                 .collect();
-            // Shared administrative horizon across causes. `observation_window`
-            // already maps an event-bearing record (Exact / IntervalCensored) to
-            // +∞ — it carries no horizon — so a subject with any observed cause
-            // must draw uncensored (the #494 anti-truncation rule), and only an
-            // all-`RightCensored` subject is censored, at its common window.
-            // Folding with `max` realises exactly that: any +∞ wins ⇒ unbounded;
-            // otherwise the (shared) censoring time. `min` would instead re-censor
-            // a re-simulated event-bearing subject at its own observed event time
-            // (the sibling cause's `RightCensored` window = the event time),
-            // re-introducing the VPC bias #494 removed for single endpoints.
+            // `max` over windows: any event-bearing cause (+∞) makes the subject
+            // uncensored (the #494 anti-truncation rule); `min` would re-censor at an
+            // observed event time.
             let window = causes
                 .iter()
                 .map(|(_, w, _)| *w)
                 .fold(f64::NEG_INFINITY, f64::max);
-            // A failed ODE cause leaves no latent to compete with, so no cause of the
-            // subject can be resolved: every cause is censored at the shared window and
-            // each failed cause is named. The #763 degenerate check below is skipped —
-            // the subject's outcome is already flagged.
+            // A failed ODE cause leaves nothing to compete with: censor every cause at
+            // the window and name each failure; skip the #763 check.
             if drawn.iter().any(Result::is_err) {
                 for ((cmt, ..), d) in causes.iter().zip(&drawn) {
                     if let Err(why) = d {
@@ -1955,10 +1616,8 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
             }
             let latents: Vec<f64> = drawn.into_iter().map(Result::unwrap).collect();
             let (win_idx, obs_time, event) = resolve_competing_risks(&latents, window);
-            // A censored competing-risks outcome is spurious when it is driven by a
-            // degenerate *analytic* draw (the `f64::MAX` sentinel) rather than a genuine
-            // late event — an ODE cause's `f64::MAX` is a legitimate horizon censor, so
-            // only analytic causes are flagged (#763).
+            // Only an analytic `f64::MAX` latent is degenerate (#763); an ODE cause's is a
+            // legitimate horizon censor.
             if !event {
                 for (i, (cmt, _, kind)) in causes.iter().enumerate() {
                     if matches!(kind, CauseKind::Analytic { .. }) && latents[i] >= f64::MAX {
@@ -1981,13 +1640,9 @@ fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
     degenerate_hazard_text(id, cmt, "")
 }
 
-/// The one owner of the `W_TTE_DEGENERATE_HAZARD` text. `censored_in` says in which
-/// replicates the subject was censored because of the degenerate draw; it is empty for a
-/// single replicate, which gives the per-call line.
-///
-/// The count sits on the censoring claim, not on "drew", because that is what is counted:
-/// under competing risks a degenerate cause is reported only when the subject ends
-/// censored, and a replicate in which another cause fired is not (#1648 review r1).
+/// The one owner of the `W_TTE_DEGENERATE_HAZARD` text. `censored_in` lists the
+/// replicates the subject was censored in (empty for a single replicate). The count is of
+/// censorings, since a replicate where another cause fired is not reported (#1648).
 #[cfg(feature = "survival")]
 fn degenerate_hazard_text(id: &str, cmt: usize, censored_in: &str) -> String {
     format!(
@@ -2001,14 +1656,9 @@ fn degenerate_hazard_text(id: &str, cmt: usize, censored_in: &str) -> String {
 /// How many indices a `W_TTE_DEGENERATE_HAZARD` line names before it counts the rest.
 const DEGENERATE_INDEX_CAP: usize = 10;
 
-/// Every degenerate analytic hazard draw (#763) of one simulation run that left its subject
-/// censored, so the run reports each (subject, CMT) on one `W_TTE_DEGENERATE_HAZARD` line
-/// with the number of replicates affected, where it used to repeat an identical line per
-/// replicate (#1648).
-///
-/// One tally is threaded through the simulate chokepoint, as `SimulatedFlipFlopTally`
-/// is, and rendered once by the entry point that sees every draw. The row-only entry
-/// points drop it. It reads no random number and writes no row.
+/// Every degenerate analytic hazard draw (#763) of one simulation run that left its
+/// subject censored, so each (subject, CMT) gets one `W_TTE_DEGENERATE_HAZARD` line with
+/// its replicate count (#1648). Reads no random number and writes no row.
 #[derive(Default)]
 pub(crate) struct DegenerateHazardTally {
     /// Replicates simulated: every `sim` of every draw that ran.
@@ -2016,10 +1666,8 @@ pub(crate) struct DegenerateHazardTally {
     /// Draws simulated. An uncertainty draw that was skipped never reaches the chokepoint
     /// and is not counted.
     draws: usize,
-    /// Per (subject's position in the population, CMT): the subject's id and the
-    /// `(draw, sim)` of each affected replicate, in simulation order. Keyed on the
-    /// position, not the id: two subjects may share an id (the data reader starts a new
-    /// subject whenever `ID` changes, so `1, 2, 1` is two subjects named `1`).
+    /// Per (subject's position, CMT): id and the `(draw, sim)` of each affected replicate.
+    /// Keyed on position since two subjects may share an id.
     hits: Vec<(usize, usize, String, Vec<(usize, usize)>)>,
 }
 
@@ -2052,10 +1700,8 @@ impl DegenerateHazardTally {
         }
     }
 
-    /// Fold in the tally of a later run of the same population and parameter set whose
-    /// replicates continue this one's, so `sim` 0 of `later` is replicate `sim_offset` of
-    /// the whole. `compute_tte_npde` simulates its reference replicates in batches and
-    /// reports each (subject, CMT) once over all of them, not once per batch.
+    /// Fold in the tally of a later batch whose `sim` 0 is replicate `sim_offset` of the
+    /// whole (`compute_tte_npde` simulates in batches).
     pub(crate) fn absorb(&mut self, later: DegenerateHazardTally, sim_offset: usize) {
         self.replicates += later.replicates;
         self.draws = self.draws.max(later.draws);
@@ -2139,23 +1785,11 @@ fn index_list(label: &str, indices: &[usize]) -> String {
     format!("{label} {}{more}", shown.join(", "))
 }
 
-/// Diagnostic for a subject whose ODE-accumulated event-time solve failed (#2087):
-/// collected into [`crate::api::SimulationOutput::warnings`] in place of the panic that
-/// used to abort the whole simulation. `why` is the solver's reason
-/// ([`crate::ode::ThresholdOutcome::SolveFailed`]), with states labelled by
-/// `ode::predictions::chz_threshold_state_labels`. The reason decides which block the
-/// diagnosis and the advice point at, since the two failures live in different blocks of the
-/// model file:
-/// - an `[odes] state` that went non-finite → the `[odes]` right-hand side diverged;
-/// - a cumulative hazard that decreased → the `[event_model]` hazard went negative (the user
-///   wrote it there, not in `[odes]`), and the advice names that expression;
-/// - a cumulative hazard that went non-finite → the `[event_model]` hazard went non-finite,
-///   and the advice names both blocks (an `[odes]` state the hazard reads may be the cause);
-/// - neither (a step budget or stiff abort on finite states, a singular Jacobian, a
-///   non-finite break time) → no diagnosis sentence, and the advice names both blocks.
-///
-/// `competing` selects the competing-risks wording, where every cause of the subject is
-/// censored.
+/// Diagnostic for a subject whose ODE-accumulated event-time solve failed (#2087). The
+/// solver's reason `why` selects the diagnosis and advice: a non-finite `[odes]` state →
+/// `[odes]` diverged; a decreasing `H` → the `[event_model]` hazard went negative; a
+/// non-finite `H` → both blocks; anything else → no diagnosis, both blocks. `competing`
+/// selects the wording where every cause is censored.
 #[cfg(feature = "survival")]
 fn ode_solve_failed_warning(
     id: &str,
@@ -2179,10 +1813,7 @@ fn ode_solve_failed_warning(
             " The [event_model] hazard went non-finite for this subject's parameter draw."
         });
     }
-    // A negative hazard is the hazard expression's own doing. A non-finite one may be, or may
-    // come from an `[odes]` state the hazard reads (the accumulator guard fires before any
-    // unmonitored state is reported), so it points at both blocks, as does a reason naming
-    // neither.
+    // A non-finite hazard may come from an `[odes]` state it reads, so it names both.
     let check = match (odes_diverged, hazard, hazard_negative) {
         (true, false, _) => "the [odes] right-hand side",
         (false, true, true) => "the [event_model] hazard expression",
@@ -2202,24 +1833,11 @@ fn ode_solve_failed_warning(
     )
 }
 
-/// Cause-specific cumulative incidence functions (CIF) from per-cause cumulative
-/// hazards on a shared, **ascending** time grid (`cum_hazards[k][i] = H_k(t_i)`).
-///
-/// Uses the discrete Aalen–Johansen / actuarial allocation: at each grid step the
-/// drop in all-cause survival `ΔS = S_all(t_{i−1}) − S_all(t_i)` is split across
-/// causes in proportion to their cumulative-hazard increment share
-/// `ΔH_k / Σ_j ΔH_j` over that step. This guarantees the exact invariant
-/// `Σ_k F_k(t) + S_all(t) = 1` at every grid point (telescoping), reduces to
-/// `F = 1 − S` for a single cause, and is **exact** (grid-independent) for
-/// constant hazards. Because `ΔS` and `Σ_j ΔH_j` are derived from the *same*
-/// cumulative hazards, `ΔS > 0 ⟺ Σ_j ΔH_j > 0`: the degenerate-node guard can
-/// only skip a step whose `ΔS` is already 0, so the invariant never breaks.
-///
-/// `S_all(0) = 1` is assumed (parametric cumulative hazards vanish at `t = 0`), so
-/// the running cumulative hazard starts at 0 and the lower integration limit is 0.
-/// The grid must be ascending (the caller sorts it) so every increment is ≥ 0.
-///
-/// Returns `(cif[k][i], s_all[i])` where `s_all[i] = exp(−Σ_k H_k(t_i))`.
+/// Cause-specific cumulative incidence functions from per-cause cumulative hazards on an
+/// ascending grid (`cum_hazards[k][i] = H_k(t_i)`), by the discrete Aalen–Johansen
+/// allocation: each step's all-cause survival drop `ΔS` is split by `ΔH_k / Σ_j ΔH_j`.
+/// Guarantees `Σ_k F_k + S_all = 1` exactly, is `F = 1 − S` for one cause and exact for
+/// constant hazards. Assumes `S_all(0) = 1`. Returns `(cif[k][i], s_all[i])`.
 pub(crate) fn cif_curves(cum_hazards: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
     let n_cause = cum_hazards.len();
     let n_grid = cum_hazards.first().map_or(0, |h| h.len());
@@ -2236,10 +1854,8 @@ pub(crate) fn cif_curves(cum_hazards: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) 
     let mut cum_prev = vec![0.0_f64; n_cause]; // H_k(0) = 0
     let mut s_prev = 1.0_f64; // S_all(0)
     for i in 0..n_grid {
-        // ΔS_i ≥ 0, and the per-cause cumulative-hazard increment ΔH_k ≥ 0 on an
-        // ascending grid. `dh_tot` and `drop` are both functions of the same
-        // cumulative hazards, so `drop > 0 ⟺ dh_tot > 0`; the guard therefore only
-        // skips a node whose ΔS is 0 (e.g. t = 0) — never one carrying mass.
+        // `drop > 0 ⟺ dh_tot > 0` (same cumulative hazards), so the guard only skips a
+        // node carrying no mass.
         let drop = (s_prev - s_all[i]).max(0.0);
         let dh: Vec<f64> = (0..n_cause)
             .map(|k| (cum_hazards[k][i] - cum_prev[k]).max(0.0))
@@ -2381,10 +1997,7 @@ mod tests {
 
     #[test]
     fn tte_data_term_ode_accumulated_is_analytic_only_sentinel() {
-        // `tte_data_term` is the closed-form (Analytic) entry point. ODE-accumulated
-        // hazards are dispatched elsewhere (tte_endpoint_nll → tte_ode_nll), so calling
-        // this with an OdeAccumulated hazard returns the ill-defined sentinel rather than
-        // a real likelihood — documenting (and covering) the dispatch contract.
+        // The OdeAccumulated arm returns the sentinel (dispatched elsewhere).
         let records = vec![ObsRecord::Event {
             time: 10.0,
             event_type: EventType::Exact,
@@ -2436,11 +2049,8 @@ mod tests {
         assert_eq!(nll, SUBJECT_SENTINEL_NLL);
     }
 
-    /// A right-censored record whose cumulative hazard *decreased* (`H(T) < H(entry)`,
-    /// i.e. a negative / non-monotone drug-driven hazard) is ill-posed — `S(T) =
-    /// exp(−ΔH) > 1`. It must hit the 1e20 sentinel, not contribute a spurious
-    /// *negative* NLL that pulls the optimizer toward the negative-hazard region (the
-    /// simulation path hard-errors on the same non-monotone CHZ; #564 Slice 2.2 review).
+    /// A right-censored record with `H(T) < H(entry)` (`S > 1`) hits the 1e20 sentinel
+    /// instead of a spurious negative NLL (#564).
     #[test]
     fn tte_nll_from_curves_rejects_non_monotone_censored() {
         let records = vec![ObsRecord::Event {
@@ -2457,9 +2067,7 @@ mod tests {
         );
     }
 
-    /// The guard also covers an exact event with a non-monotone cumulative hazard:
-    /// a positive instantaneous `h(T)` is not enough — the accumulated `H` must be
-    /// non-decreasing too.
+    /// The guard also covers an exact event: a positive `h(T)` with a decreasing `H`.
     #[test]
     fn tte_nll_from_curves_rejects_non_monotone_exact() {
         let records = vec![ObsRecord::Event {
@@ -2475,10 +2083,7 @@ mod tests {
         );
     }
 
-    /// Phase 4.0 coexistence contract: a subject may carry non-TTE records
-    /// (discrete-state / count endpoints on other CMTs). The TTE NLL must skip
-    /// them — the `let ObsRecord::Event {..} = record else { continue }` guard —
-    /// so a mixed record slice yields exactly the Event-only NLL.
+    /// Non-TTE records in the slice are skipped: a mixed slice gives the Event-only NLL.
     #[test]
     fn tte_nll_from_curves_skips_non_event_records() {
         let event = ObsRecord::Event {
@@ -2589,10 +2194,7 @@ mod tests {
         assert_eq!(event_only, mixed_nll, "non-TTE records must be skipped");
     }
 
-    /// The monotonicity guard tolerates ODE quadrature round-off on a (near-)flat
-    /// cumulative hazard: a tiny negative dip within the relative floor is NOT
-    /// rejected, so a legitimate `h ≈ 0` model keeps a finite likelihood (guards the
-    /// floor against false positives that would derail a valid fit).
+    /// A tiny negative dip within the round-off floor is tolerated (finite NLL).
     #[test]
     fn tte_nll_from_curves_tolerates_flat_hazard_roundoff() {
         let records = vec![ObsRecord::Event {
@@ -2609,10 +2211,7 @@ mod tests {
         );
     }
 
-    /// And for an interval-censored record whose cumulative hazard is non-monotone
-    /// *before* the interval (`H(left) < H(entry)`): the guard fires before the
-    /// `delta` check, so this exercises the interval arm's monotonicity branch
-    /// (distinct from the degenerate `right ≤ left` case above).
+    /// Interval-censored with `H(left) < H(entry)`: the interval arm's monotone branch.
     #[test]
     fn tte_nll_from_curves_rejects_non_monotone_interval() {
         let records = vec![ObsRecord::Event {
@@ -2637,10 +2236,8 @@ mod tests {
         );
     }
 
-    /// #618: with a large accumulated `H`, a *genuine* negative increment (here 0.05% of
-    /// `H` - between the solver `reltol` and the old `1e-3` term) must hit the sentinel.
-    /// The previous magnitude-relative `1e-3·|H|` floor accepted it as round-off and let
-    /// the optimizer see a spurious finite (negative) NLL.
+    /// #618: a genuine negative increment of 0.05% of a large `H` (between `reltol` and
+    /// the old `1e-3` floor) hits the sentinel.
     #[test]
     fn tte_nll_from_curves_rejects_genuine_negative_increment_large_h() {
         let records = vec![ObsRecord::Event {
@@ -2677,9 +2274,7 @@ mod tests {
         );
     }
 
-    /// The tightened floor must NOT over-reject: a dip *within* the solver's round-off
-    /// band (ΔH = −0.005 on H = 100, i.e. 0.005% - below the reltol·100 = 0.01 floor)
-    /// stays finite, so a legitimate fit is not derailed by quadrature noise.
+    /// No over-rejection: ΔH = −0.005 on H = 100 (below the reltol·100 = 0.01 floor) is finite.
     #[test]
     fn tte_nll_from_curves_tolerates_solver_band_dip_large_h() {
         let records = vec![ObsRecord::Event {
@@ -2696,9 +2291,7 @@ mod tests {
         );
     }
 
-    /// The analytic path uses a tight fixed floor ([`MonoTol::analytic`]): a small
-    /// negative increment that the ODE-sized default floor would swallow is still
-    /// rejected, so a sign-flipped closed-form hazard cannot sneak `S > 1` through.
+    /// [`MonoTol::analytic`] rejects a small negative increment the default floor accepts.
     #[test]
     fn tte_nll_from_curves_analytic_floor_rejects_small_dip() {
         let records = vec![ObsRecord::Event {
@@ -2811,9 +2404,7 @@ mod tests {
     #[test]
     fn tte_data_term_interval_censored_tight_interval() {
         use crate::types::HazardFamily;
-        // Tight interval: left=10.0, right=10.0001, lambda=0.1.
-        // Old probability-space subtraction would lose ~4 significant digits here.
-        // The expm1 form should stay finite and positive.
+        // Tight interval (10, 10.0001), λ=0.1: the expm1 form stays finite and positive.
         let records = vec![ObsRecord::Event {
             time: 10.0001,
             event_type: EventType::IntervalCensored {
@@ -2875,11 +2466,8 @@ mod tests {
 
     #[test]
     fn rtte_forward_telescopes_cumulative_hazard() {
-        // Clock-forward RTTE (Andersen–Gill) integrates the cumulative hazard ONCE to
-        // the final time: −log L = H(T) − Σ_k log h(t_k) = 30λ − 2·log λ. Summing
-        // independent single-event terms (as the standard-TTE per-record accumulator
-        // does) would instead give Σ_k H(t_k) + H(T) − 2·log λ = 45λ − 2·log λ, an
-        // over-count of Σ_k H(t_k) = 15λ. This test pins the correct telescoping.
+        // Clock-forward telescopes: −log L = 30λ − 2·log λ, not the 45λ − 2·log λ of
+        // summing independent single-event terms.
         let lambda = 0.05_f64;
         let records = rtte_constant_hazard_records();
         let cumhaz_at = |t: f64| lambda * t;
@@ -2956,9 +2544,7 @@ mod tests {
 
     #[test]
     fn rtte_forward_rejects_non_monotone_hazard() {
-        // A non-monotone (negative-hazard) cumulative hazard makes an increment
-        // negative — S = exp(−ΔH) > 1, ill-posed. Must fold into the 1e20 sentinel,
-        // exactly like the single-event path.
+        // A decreasing `H` folds into the 1e20 sentinel, as on the single-event path.
         let records = rtte_constant_hazard_records();
         // Cumulative hazard that decreases after t = 6 (negative hazard region).
         let cumhaz_at = |t: f64| if t < 6.0 { t } else { 12.0 - t };
@@ -2973,9 +2559,7 @@ mod tests {
     #[test]
     fn tte_data_term_dispatches_rtte_forward() {
         use crate::types::{HazardFamily, RtteClock, TteRecurrence};
-        // Route a repeated-event subject through the public `tte_data_term` entry with
-        // an analytic exponential family and `Repeated { Forward }`; the result must
-        // match the telescoping curve helper (i.e. the dispatch is wired).
+        // `tte_data_term` with `Repeated { Forward }` matches the curve helper.
         let lambda = 0.05_f64;
         let records = rtte_constant_hazard_records();
         let param_fn: crate::types::HazardParamFn =
@@ -3002,9 +2586,7 @@ mod tests {
 
     #[test]
     fn rtte_reset_equals_forward_for_exponential() {
-        // A constant hazard is memoryless, so clock-reset (gap time) and clock-forward
-        // (total time) must give the SAME likelihood — the sharpest check that the reset
-        // gap bookkeeping is right.
+        // A memoryless hazard gives the same likelihood on both clocks.
         let lambda = 0.05_f64;
         let records = rtte_constant_hazard_records();
         let cumhaz_at = |t: f64| lambda * t;
@@ -3019,13 +2601,8 @@ mod tests {
 
     #[test]
     fn rtte_reset_weibull_gap_time_closed_form() {
-        // Weibull scale=10, shape=2: H(t) = (t/10)^2, h(t) = 0.2·(t/10). Events at 5 and
-        // 10, censor at 30. Clock-RESET evaluates each gap from 0: gaps are 5, 5, 20.
-        //   event  (Δ=5):  H(5)  − log h(5)  = 0.25 − log(0.1)
-        //   event  (Δ=5):  H(5)  − log h(5)  = 0.25 − log(0.1)   (clock reset ⇒ same as above)
-        //   censor (Δ=20): H(20)             = 4.0
-        // A time-varying hazard makes this DIFFER from clock-forward (which would use the
-        // absolute event times), so the two must not coincide here.
+        // Weibull scale=10, shape=2: H(t) = (t/10)^2, h(t) = 0.2·(t/10). Reset gaps 5, 5, 20:
+        //   2·(0.25 − log 0.1) + 4.0, which differs from clock-forward.
         let records = rtte_constant_hazard_records();
         let cumhaz_at = |t: f64| (t / 10.0).powi(2);
         let hazard_at = |t: f64| 0.2 * (t / 10.0);
@@ -3046,11 +2623,8 @@ mod tests {
 
     #[test]
     fn rtte_reset_left_truncation_conditions_on_entry() {
-        // Convention B (#740): with delayed entry the FIRST sojourn is measured in absolute
-        // time from the origin and conditioned on survival to `entry` — H(t₁) − H(entry) −
-        // log h(t₁), exactly the clock-forward first-record term. Every later gap is a fresh
-        // renewal draw from 0. Weibull scale=10, shape=2 is time-varying, so B differs from
-        // the rejected alternative (renewal clock restarting at entry, first gap t₁ − entry).
+        // Convention B (#740): first sojourn H(t₁) − H(entry) − log h(t₁) in absolute time,
+        // later gaps fresh renewals. Weibull (time-varying) separates B from convention A.
         let cumhaz_at = |t: f64| (t / 10.0).powi(2);
         let hazard_at = |t: f64| 0.2 * (t / 10.0);
         let entry = 8.0;
@@ -3083,9 +2657,7 @@ mod tests {
             + cumhaz_at(7.0); // censor gap 20−13
         assert_abs_diff_eq!(reset, expected_b, epsilon = 1e-12);
 
-        // The rejected convention A (renewal clock restarts at entry: first gap Δ = t₁ −
-        // entry evaluated from 0) would use the residual 2.0 for the first term — materially
-        // different for a time-varying hazard. Pin that the implementation is B, not A.
+        // Convention A (renewal restarting at entry) differs materially here.
         let convention_a = (cumhaz_at(10.0 - entry) - hazard_at(10.0 - entry).ln())
             + (cumhaz_at(3.0) - hazard_at(3.0).ln())
             + cumhaz_at(7.0);
@@ -3097,13 +2669,8 @@ mod tests {
 
     #[test]
     fn rtte_reset_left_truncation_equals_forward_for_exponential() {
-        // A constant hazard is memoryless, so convention B's entry-conditioned first sojourn
-        // (H(t₁) − H(entry)) coincides with the pure renewal form AND with clock-forward even
-        // under delayed entry. This pins B ≡ clock-forward for a memoryless hazard (the
-        // reduction-to-anchored-machinery invariant). It does NOT by itself discriminate B from
-        // the rejected convention A — the two are numerically identical when the hazard is
-        // memoryless; that discrimination is pinned by the time-varying Weibull test
-        // `rtte_reset_left_truncation_conditions_on_entry` (where B differs from A by > 1 nat).
+        // Memoryless hazard: convention B ≡ pure renewal ≡ clock-forward under delayed
+        // entry. B vs A is pinned by `rtte_reset_left_truncation_conditions_on_entry`.
         let lambda = 0.05_f64;
         let entry = 4.0;
         let records = vec![
@@ -3142,10 +2709,8 @@ mod tests {
 
     #[test]
     fn rtte_reset_left_truncation_censored_first_record() {
-        // A late entrant censored before any event: the single contribution is the entry-
-        // conditioned survival H(t) − H(entry) (convention B), exactly the clock-forward
-        // censored term. Guards the RightCensored-first-record path with a nonzero lower
-        // limit H(entry) (the other reset-truncation tests fire an event first).
+        // A late entrant censored before any event: H(t) − H(entry), the RightCensored
+        // first-record path with a nonzero lower limit.
         let cumhaz_at = |t: f64| (t / 10.0).powi(2);
         let hazard_at = |t: f64| 0.2 * (t / 10.0);
         let entry = 5.0;
@@ -3195,12 +2760,8 @@ mod tests {
 
     #[test]
     fn rtte_reset_folds_unsupported_inputs_to_sentinel() {
-        // Every ill-posed input to the gap-time renewal likelihood must fold into the
-        // 1e20 sentinel (a finite-but-poison objective the optimizer steers away from),
-        // never a finite silently-wrong contribution — matching the forward and
-        // single-event paths. This is the reset counterpart to the forward slice's
-        // `rtte_forward_rejects_non_monotone_hazard`, exercising each guard return in
-        // `rtte_reset_nll_from_curves` (Δ<0, h≤0, non-monotone H on either arm, interval).
+        // Every ill-posed input to the reset likelihood folds into the 1e20 sentinel:
+        // Δ<0, h≤0, non-monotone H on either arm, interval.
         let exact = |t: f64| ObsRecord::Event {
             time: t,
             event_type: EventType::Exact,
@@ -3354,11 +2915,7 @@ mod tests {
     #[test]
     fn draw_tte_unbounded_window_degenerate_does_not_emit_spurious_event() {
         use rand::SeedableRng;
-        // λ=0 ⇒ sampler returns f64::MAX. With an unbounded window (an event
-        // record carries no administrative horizon, so `observation_window`
-        // returns +∞) a bare `t_event < window` test would mis-report that
-        // sentinel as an observed event at f64::MAX. The `t_event < f64::MAX`
-        // guard must classify it as censored (no event) instead.
+        // λ=0 ⇒ f64::MAX; with an unbounded window it must still be censored.
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
         for _ in 0..100 {
             let (t, observed, _) = draw_tte_outcome(
@@ -3378,11 +2935,9 @@ mod tests {
 
     // ── simulate_rtte_stream: repeated-event streams to the horizon (Slice 3.3) ──
 
-    /// Run one RTTE stream and return its observed event times, asserting the
-    /// structural invariants every stream must satisfy: it always ends with an
-    /// unobserved administrative-censoring row at exactly the horizon, and every
-    /// preceding row is an observed event strictly inside `(0, horizon)` in
-    /// increasing order (on the given CMT, with a NaN ipred).
+    /// Run one RTTE stream and return its event times, asserting it ends with one censor
+    /// row at the horizon and every earlier row is an observed event, increasing in
+    /// `(0, horizon)`, on `cmt` with NaN ipred.
     fn rtte_stream_events<R: rand::Rng>(
         family: HazardFamily,
         params: &[f64],
@@ -3443,10 +2998,8 @@ mod tests {
     #[test]
     fn rtte_stream_degenerate_high_rate_warns_and_skips() {
         use rand::SeedableRng;
-        // A hazard so extreme it would fire far more than MAX_EVENTS times over the
-        // window is degenerate: the pre-flight guard (#762) skips the stream — it does
-        // NOT materialise ~1e6 rows, does NOT panic — records only the administrative
-        // censor, and names the subject in a warning so the run can continue.
+        // An extreme hazard is skipped by the pre-flight guard (#762): only the censor row
+        // plus a warning naming the subject, no panic.
         let mut rng = rand::rngs::StdRng::seed_from_u64(1);
         let horizon = 30.0_f64;
         for clock in [RtteClock::Forward, RtteClock::Reset] {
@@ -3498,12 +3051,8 @@ mod tests {
     #[test]
     fn rtte_reset_ifr_weibull_not_skipped_despite_large_forward_cum_hazard() {
         use rand::SeedableRng;
-        // #772 review (Finding 2): under the RESET clock an increasing-hazard (IFR) Weibull is
-        // a renewal of iid gaps, so its expected count is `horizon / mean_gap` — a few dozen,
-        // NOT degenerate. But the forward-clock cumulative hazard
-        // `H(100) = (100/5.49)^5 ≈ 2e6 ≫ MAX_EVENTS`, so using `H(horizon)` as the reset
-        // pre-flight threshold (the pre-fix bug) would wrongly skip this legitimate subject.
-        // The pre-flight is now clock-specific (reset uses the median gap), so the stream runs.
+        // #772: under the reset clock an IFR Weibull expects a few dozen events, though
+        // `H(100) = (100/5.49)^5 ≈ 2e6 ≫ MAX_EVENTS`; the clock-specific pre-flight runs it.
         let params = [5.49_f64, 5.0]; // Weibull [scale, shape], strongly increasing hazard.
         let horizon = 100.0_f64;
 
@@ -3538,9 +3087,7 @@ mod tests {
             "reset IFR Weibull is a legitimate subject, no degenerate warning: {warnings:?}"
         );
 
-        // Contrast: the SAME params under the FORWARD clock are genuinely pathological
-        // (`E[N] = H(horizon) ≈ 2e6`), so that stream IS still skipped with a warning — the
-        // guard is clock-specific, not disabled.
+        // The same params under the forward clock (`E[N] ≈ 2e6`) are still skipped.
         let mut rng2 = rand::rngs::StdRng::seed_from_u64(20);
         let mut fwd_results = Vec::new();
         let mut fwd_warnings = Vec::new();
@@ -3591,10 +3138,8 @@ mod tests {
     #[test]
     fn rtte_forward_exponential_count_is_poisson() {
         use rand::SeedableRng;
-        // A constant hazard is a homogeneous Poisson process: N(T) ~ Poisson(λT).
-        // λ=0.15, T=20 ⇒ mean = var = 3.0. N=4000 ⇒ SE(mean) = √(3/4000) ≈ 0.027,
-        // so |mean − 3| < 0.15 is ~5σ; the dispersion var/mean must be ≈ 1 (a
-        // gamma/NB counting process would inflate it).
+        // Homogeneous Poisson: λ=0.15, T=20 ⇒ mean = var = 3.0; N=4000 ⇒ SE ≈ 0.027, so
+        // |mean − 3| < 0.15 is ~5σ, and var/mean ≈ 1.
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0001);
         let (lambda, horizon, n) = (0.15_f64, 20.0_f64, 4000usize);
         let counts: Vec<f64> = (0..n)
@@ -3626,11 +3171,8 @@ mod tests {
     #[test]
     fn rtte_forward_weibull_count_is_poisson() {
         use rand::SeedableRng;
-        // Clock-forward with a time-varying hazard is a non-homogeneous Poisson
-        // process: N(T) ~ Poisson(H(T)) with H(T) = (T/scale)^shape. scale=10,
-        // shape=1.5, T=20 ⇒ H = 2^1.5 ≈ 2.828. This exercises the *conditional*
-        // sampling (each event drawn given survival past the previous) against the
-        // exact mean — a clock bug (e.g. resetting) would shift it.
+        // Non-homogeneous Poisson: N(T) ~ Poisson((T/scale)^shape), scale=10, shape=1.5,
+        // T=20 ⇒ H ≈ 2.828; pins the conditional sampling.
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0002);
         let (scale, shape, horizon, n) = (10.0_f64, 1.5_f64, 20.0_f64, 5000usize);
         let mean = (0..n)
@@ -3656,9 +3198,7 @@ mod tests {
     #[test]
     fn rtte_forward_equals_reset_for_exponential() {
         use rand::SeedableRng;
-        // Exponential is memoryless ⇒ clock-forward (condition on survival past the
-        // previous event) and clock-reset (fresh gap from 0) draw a *bit-identical*
-        // stream from the same seed.
+        // Exponential is memoryless ⇒ both clocks draw a bit-identical stream.
         let (lambda, horizon) = (0.3_f64, 25.0_f64);
         let mut r_fwd = rand::rngs::StdRng::seed_from_u64(0xABCD_1234);
         let mut r_rst = rand::rngs::StdRng::seed_from_u64(0xABCD_1234);
@@ -3725,10 +3265,7 @@ mod tests {
     #[test]
     fn rtte_reset_weibull_gaps_match_family_mean() {
         use rand::SeedableRng;
-        // Renewal (reset): inter-event gaps are iid Weibull(scale, shape) ⇒ mean gap
-        // = scale·Γ(1 + 1/shape). For shape=2, Γ(1.5) = √π/2, so the mean is
-        // scale·√π/2 with no hard-coded gamma. Horizon ≫ mean gap keeps the
-        // (censored final gap excluded) bias negligible.
+        // Reset: iid Weibull gaps with mean scale·Γ(1.5) = scale·√π/2; horizon ≫ mean gap.
         let mut rng = rand::rngs::StdRng::seed_from_u64(0xFACE_0FF0);
         let (scale, shape, horizon) = (3.0_f64, 2.0_f64, 80.0_f64);
         let mut gaps = Vec::new();
@@ -3844,13 +3381,8 @@ mod tests {
             .collect()
     }
 
-    /// Left truncation on a **memoryless** (exponential) hazard is a pure time shift: under
-    /// the same RNG seed the entry-conditioned stream is the non-truncated stream translated
-    /// by `entry` (convention B, #740). This pins the simulate-side conditioning — clock-forward
-    /// seeds its clock at `entry`, clock-reset conditions its first sojourn — for both clocks,
-    /// and that every event lands past `entry`. (Exponential residual life past `entry` is again
-    /// exponential with the same rate, so the shift is exact; a time-varying hazard is covered by
-    /// the Weibull test below.)
+    /// Left truncation on an exponential hazard is an exact time shift by `entry` under
+    /// the same seed (convention B, #740), on both clocks.
     #[test]
     fn rtte_left_truncation_exponential_is_entry_shift() {
         use rand::SeedableRng;
@@ -3893,12 +3425,9 @@ mod tests {
         }
     }
 
-    /// Clock-reset left truncation on a **time-varying** (Weibull) hazard, where convention B is
-    /// NOT a simple shift: the first simulated sojourn must land past `entry` (drawn conditional
-    /// on survival to entry), the stream must differ from the non-truncated one (the entry path is
-    /// genuinely exercised, not a no-op), and — round-tripping to the fit side — the realized
-    /// stream must be a valid convention-B likelihood input whose hand-recomputed value (first
-    /// term `H(t₁) − H(entry)`, then renewal gaps) matches `rtte_reset_nll_from_curves`.
+    /// Clock-reset left truncation on a Weibull hazard: the first sojourn lands past
+    /// `entry`, the stream differs from the untruncated one, and its hand-recomputed
+    /// convention-B likelihood matches `rtte_reset_nll_from_curves`.
     #[test]
     fn rtte_reset_left_truncation_weibull_conditions_on_entry() {
         use rand::SeedableRng;
@@ -3970,13 +3499,9 @@ mod tests {
         assert_abs_diff_eq!(nll, expected, epsilon = 1e-9);
     }
 
-    /// The discriminating pin (simulate dual of the fit-side `..._conditions_on_entry`): the
-    /// FIRST simulated sojourn under delayed entry must equal convention B's closed form
-    /// `sample_conditional_event_time(entry, u₁)` and must NOT equal the rejected
-    /// renewal-from-entry A (`entry + sample_event_time(u₁)`). A time-varying (Weibull) hazard
-    /// is essential — for the memoryless exponential A ≡ B, so the shift test cannot see this,
-    /// and the round-trip test above is convention-agnostic (it recomputes B on whatever was
-    /// drawn). Pins BOTH clocks (both draw the first event conditional on survival to entry).
+    /// On both clocks the first sojourn under delayed entry equals convention B's
+    /// `sample_conditional_event_time(entry, u₁)`, not A's `entry + sample_event_time(u₁)`
+    /// (Weibull, since A ≡ B for an exponential).
     #[test]
     fn rtte_left_truncation_first_sojourn_is_convention_b_not_a() {
         use rand::SeedableRng;
@@ -4017,12 +3542,8 @@ mod tests {
         }
     }
 
-    /// A non-positive `entry` means "no truncation" everywhere — the datareader clamps `TENTRY`
-    /// to `≥ 0`, and the fit's `entry_lower_limit` / the reset draw gate on `entry > 0`. A
-    /// hand-built `Population` can bypass the datareader and pass a negative entry straight to
-    /// `simulate()`; it must then behave exactly as `entry == 0` for BOTH clocks — never seed a
-    /// pre-origin clock or emit a negative-time event. (Guards the forward-clock `entry.max(0.0)`
-    /// clamp and the reset estimate clamp.)
+    /// A negative `entry` (a hand-built population) behaves exactly as `entry == 0` on both
+    /// clocks: no pre-origin clock, no negative-time event.
     #[test]
     fn rtte_left_truncation_negative_entry_is_no_truncation() {
         use rand::SeedableRng;
@@ -4126,9 +3647,7 @@ mod tests {
 
     #[test]
     fn cif_invariant_holds_for_mixed_families() {
-        // Weibull-like increasing hazard + a constant hazard on a coarse,
-        // irregular grid. The per-cause CIF is only approximate here, but the
-        // partition invariant Σ_k F_k + S_all = 1 must be exact (telescoping).
+        // On a coarse irregular grid Σ_k F_k + S_all = 1 must still be exact.
         let grid = [1.0_f64, 2.5, 4.0, 9.0, 20.0];
         // cause 0: Weibull scale=8, shape=1.7 ⇒ H=(t/8)^1.7
         let (sc, sh) = (8.0_f64, 1.7_f64);
@@ -4149,16 +3668,8 @@ mod tests {
 
     #[test]
     fn cif_time_varying_matches_independent_quadrature() {
-        // Numeric anchor for the *time-varying* per-cause CIF, which the partition
-        // invariant alone does not pin down (the constant-hazard values are pinned
-        // by `cif_two_cause_exponential_closed_form`). Two increasing hazards —
-        // Weibull + Gompertz — are compared against an INDEPENDENT high-resolution
-        // composite-Simpson integration of the defining integral
-        //   F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du,   S_all(u) = exp(−Σ_j H_j(u)),
-        // which uses a different numerical scheme (direct integrand quadrature)
-        // than `cif_curves`' actuarial ΔS-allocation, so agreement is a genuine
-        // cross-check rather than a restatement. This is the closed-form-free
-        // analogue of an R `cmprsk::cuminc` cross-check (see docs/estimation/tte.qmd).
+        // Time-varying CIF (Weibull + Gompertz) against an independent composite-Simpson
+        // integration of F_k(t) = ∫₀ᵗ h_k(u)·S_all(u) du, S_all(u) = exp(−Σ_j H_j(u)).
         let (sc, sh) = (10.0_f64, 1.6_f64); // cause 0: Weibull  H=(t/sc)^sh
         let (alpha, gamma) = (0.03_f64, 0.08_f64); // cause 1: Gompertz H=(α/γ)(e^{γt}−1)
         let h0 = |t: f64| (sh / sc) * (t / sc).powf(sh - 1.0);
@@ -4212,9 +3723,7 @@ mod tests {
     fn observation_window_only_right_censored_has_a_horizon() {
         // A right-censored record's `time` IS the administrative horizon.
         assert_eq!(observation_window(&EventType::RightCensored, 12.0), 12.0);
-        // Event records carry no administrative horizon: their `time` is an
-        // event time / interval bound, so they must draw uncensored (+∞) rather
-        // than truncate at a realized event time.
+        // Event records carry no horizon: they draw uncensored (+∞).
         assert_eq!(observation_window(&EventType::Exact, 12.0), f64::INFINITY);
         assert_eq!(
             observation_window(
@@ -4310,17 +3819,9 @@ mod tests {
     const BOTH: &str = "Check the [odes] right-hand side, the [event_model] hazard expression \
                         and the parameter values, including the drawn random effects.";
 
-    /// #2087 message input space: every producer class gets the code, the subject, the CMT,
-    /// the reason, the censoring sentence and the population sentence; and exactly the
-    /// diagnosis sentences and the advice its class calls for. Each diagnosis sentence is
-    /// asserted present where it belongs and absent everywhere else, so forcing any gate
-    /// either way reddens this test; the advice is asserted as the whole sentence, so a class
-    /// handed another class's advice reddens it too.
-    ///
-    /// Mutations that redden it (one per sentence or gate): drop the code / subject / CMT /
-    /// reason; delete or force any of the three diagnosis sentences; swap the negative and
-    /// non-finite hazard sentences; route any class to another advice; delete the censoring
-    /// sentence or its window; delete "The rest of the population still simulates.".
+    /// #2087: every producer class gets the code, subject, CMT, reason, censoring and
+    /// population sentences, and exactly its own diagnosis sentences and whole advice
+    /// sentence; each diagnosis is asserted present and absent elsewhere.
     #[cfg(feature = "survival")]
     #[test]
     fn ode_solve_failed_warning_covers_every_reason_class() {
@@ -4377,10 +3878,7 @@ mod tests {
         }
     }
 
-    /// #2087: the competing-risks wording says every cause is censored, the single-cause
-    /// wording does not — both sides of the `competing` gate on the same reason.
-    ///
-    /// Mutations that redden it: ignore `competing` (either wording on both legs).
+    /// #2087: only the competing-risks wording says every cause is censored.
     #[cfg(feature = "survival")]
     #[test]
     fn ode_solve_failed_warning_competing_wording_straddles_the_gate() {
@@ -4400,13 +3898,8 @@ mod tests {
         );
     }
 
-    /// #2087 T6: every reason class, as the real builder words it, classifies as a
-    /// `simulation` warning — not as the solver-health / optimizer / stiffness category its
-    /// interpolated solver text ("step budget", "non-finite", "stability-limited",
-    /// "singular Jacobian") would otherwise match.
-    ///
-    /// Mutations that redden it: delete the `w_tte_solve_failed` arm in `classify_warning`, or
-    /// move it below the prose arms; rename the code off its `W_TTE_SOLVE_FAILED` prefix.
+    /// #2087: every reason class classifies as a `simulation` warning, not the category
+    /// its interpolated solver text would otherwise match.
     #[cfg(feature = "survival")]
     #[test]
     fn ode_solve_failed_warning_classifies_as_simulation() {
@@ -4728,21 +4221,11 @@ mod ode_hazard_exact_tests {
         assert!(worst_g < 1e-6, "gradient {worst_g:.2e}");
     }
 
-    /// #1575's fixture (`tests/one_snapshot_dose_reads_survival.rs`) on the exact route: a
-    /// `TIME`-reading `$PK` whose `TIME = 0` disposition snapshot differs from every dose
-    /// record (`MTT = −9`, `ALAG1 = 10.5` there, `1` and `0.5` at the records), a transit
-    /// kernel and a compartment lag read per dose, a `TAD`-reading hazard, doses at 1 and 13
-    /// (the second on residual drug), η on `CL`, the lag and the kernel, and a `CL` the
-    /// disposition reads at `TIME = 0` (1.5×) but no dose record does; and a steady-state
-    /// twin (`SS=1`, the plain drug-driven hazard). Both take the event-driven dual walk with
-    /// every segment on the disposition (`ode_states_at_g`), which the static walk declined.
-    ///
-    /// Value: the walk's `(H, h)` against production's dense single-pass solve
-    /// (`ode_cumhaz_hazard`, a different engine) — dies if a dose quantity is read at the
-    /// disposition (the kernel then delivers nothing, the lag moves every arrival), if a
-    /// segment is integrated on a dose record's snapshot instead of the disposition (its `CL`),
-    /// or if the `TAD` anchor drops the lag. Gradients: the exact η-gradient and θ-score
-    /// against Richardson differences of the production objective.
+    /// #1575's fixture (`tests/one_snapshot_dose_reads_survival.rs`) on the exact route:
+    /// a `TIME`-reading `$PK` whose t=0 snapshot differs from every dose record, transit
+    /// kernel and lag read per dose, a `TAD`-reading hazard, doses at 1 and 13, plus an
+    /// `SS=1` twin. The walk's `(H, h)` matches production's dense solve; the exact
+    /// η-gradient and θ-score match Richardson differences of the production objective.
     #[test]
     fn a_time_reading_pk_with_an_ode_hazard_is_exact() {
         const MODEL: &str = r"

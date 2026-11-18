@@ -851,12 +851,9 @@ impl ScoringSettingsWire {
     /// Decoded and held to the `[fit_options]` domain, as [`SirSettingsWire`] is:
     /// `run_covariance` and `run_sir` adopt a recorded value wherever the caller left the
     /// default. `block` names the key the record was read from in a `Corrupt`.
-    ///
     /// The domain is `ScoringSettings::check_domain`, shared with `save_fit` and `fit()`
-    /// (#1770). It refuses `gradient_method = ad` too: `ad` parses as a token but no run
-    /// records it — `fit()` refuses it (`E_AD_RETIRED`) and `ScoringSettings::of_run`
-    /// records a post-hoc step's retired `ad` as the `auto` it ran — and a recorded value
-    /// is adopted wherever the caller left `auto`, so a hand-edited `ad` is refused here.
+    /// (#1770); it also refuses `gradient_method = ad` (retired, `E_AD_RETIRED`; no run
+    /// records it), so a hand-edited `ad` is refused here.
     fn into_settings(self, block: &str) -> Result<crate::ScoringSettings, FitrxError> {
         let settings = crate::ScoringSettings {
             inner_maxiter: self.inner_maxiter,
@@ -1134,18 +1131,12 @@ str_enum_map!(
 // ---------------------------------------------------------------------------
 
 /// Refuse a fit whose recorded settings the reader would reject (#1770), with the reader's
-/// own domain check and field naming, so a bundle that cannot load is never written: the
-/// failure is reported where the bad value is, not at a later `load_fit`.
-///
-/// `fit()` holds every value it records to that domain, so only a `FitResult` edited after
-/// the fit reaches this. The SIR seed is not checked: the writer derives `sir_seed` from
-/// `sir_settings.seed` (see `build_fit_wire`).
-///
-/// The fields a caller can set by hand get the same treatment: the covariate table's
-/// shape, each subject's `n_obs` against the prediction rows it heads, and
-/// `interface_extras`, which is opaque to core but has to be the JSON its entry's name
-/// promises to every other reader of the bundle. The wire's own invariants
-/// are checked by `save_fit` on the wire it builds.
+/// own domain check and field naming, so a bundle that cannot load is never written.
+/// Only a `FitResult` edited after the fit can fail it. The SIR seed is not checked (the
+/// writer derives `sir_seed` from `sir_settings.seed`, see `build_fit_wire`). Hand-set
+/// fields get the same treatment: the covariate table's shape, each subject's `n_obs`
+/// against its prediction rows, and `interface_extras` (opaque to core but must be valid
+/// JSON). The wire's own invariants are checked by `save_fit` on the wire it builds.
 fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
     let refuse = |block: &str, e: crate::estimation::fit_inputs::OutOfDomain| {
         FitrxError::Unwritable(e.in_block(block))
@@ -1314,13 +1305,10 @@ fn replace_file(
 
 /// Write a fit bundle to `path`.
 ///
-/// `model_source` is the verbatim text of the `.ferx` model; it is embedded so
-/// a future [`load_fit`] can recompile the model and run `predict()` against
-/// the loaded fit.
-///
-/// The bundle is built in memory and moved into place by rename, so a failed save
-/// leaves whatever was at `path` untouched. Data or model text that does not match
-/// the hash the fit recorded is refused with [`FitrxError::Unwritable`].
+/// `model_source` is the verbatim `.ferx` text, embedded so a later [`load_fit`] can
+/// recompile the model and `predict()`. The bundle is built in memory and renamed into
+/// place, so a failed save leaves `path` untouched. Data or model text that does not
+/// match the hash the fit recorded is refused with [`FitrxError::Unwritable`].
 pub fn save_fit(
     result: &FitResult,
     population: &Population,
@@ -1353,15 +1341,13 @@ pub fn save_fit_to_bytes(
 /// the bytes of the bundle it was loaded from.
 ///
 /// `predictions.csv`'s `TIME`, `DV` and `OCC` columns have no field on [`FitResult`], so
-/// they come from `bundle`, as does its `data.csv` unless
-/// [`SaveFitOptions::include_data`] names another file, and the model text when `result`
-/// has none. Otherwise this is [`save_fit`], with its atomic write and hash checks.
+/// they come from `bundle`, as does `data.csv` unless [`SaveFitOptions::include_data`]
+/// names another file, and the model text when `result` has none. Otherwise this is
+/// [`save_fit`] (atomic write, hash checks).
 ///
-/// Those columns only belong to `result` if its subjects are the bundle's, so anything
-/// else is refused with [`FitrxError::Unwritable`]: the subjects must have the same IDs in
-/// the same order and the same `PRED`, `IPRED`, `CWRES` and `IWRES`. The values are
-/// compared because IDs can repeat, and the residuals because they depend on `DV`. The
-/// save is also refused when `bundle` has no `TIME` or `DV` column.
+/// Anything but the bundle's own subjects is refused with [`FitrxError::Unwritable`]: same
+/// IDs in the same order and the same `PRED`, `IPRED`, `CWRES`, `IWRES` (IDs can repeat;
+/// residuals depend on `DV`). Also refused when `bundle` has no `TIME` or `DV` column.
 pub fn save_fit_from_bundle(
     result: &FitResult,
     bundle: &[u8],
@@ -2569,27 +2555,22 @@ fn parse_recorded_rows(preds_csv: &str, subjects: &[SubjectResult]) -> Vec<Recor
 
 /// Re-read a bundle's `data.csv` as the population the fit was given.
 ///
-/// A fit that records its reader settings and a population fingerprint (#1685) is
-/// read with those settings — its `[data_selection]` and any row filter its caller
-/// added included — given its level index columns from the fit's `data_bindings`,
-/// and checked against the fingerprint. When that read cannot reproduce the
-/// fingerprinted population, the bundle still loads: the population is `None` and
-/// the returned note says why (#1685 review r1 #2). The θ, Ω and σ do not depend on
-/// how this version reads a CSV, and `run_sir` / `run_covariance` refuse a wrong
-/// population where it is used.
+/// A fit that records reader settings and a population fingerprint (#1685) is read with
+/// those settings (its `[data_selection]`, row filter, level index columns from
+/// `data_bindings`) and checked against the fingerprint. If that cannot reproduce the
+/// fingerprinted population the bundle still loads, with population `None` and a note
+/// saying why: θ, Ω and σ do not depend on how a CSV is read, and `run_sir` /
+/// `run_covariance` refuse a wrong population where it is used.
 ///
-/// A fit made in memory (`prepare_run` + [`fit`](crate::fit)) records a fingerprint
-/// but no reader settings (#1941). Its `data.csv` is read with the settings the
-/// model file states ([`ReaderSettings::from_parsed`](crate::ReaderSettings::from_parsed):
-/// `[data]` renames, `[covariates]`, `iov_column`, `[data_selection]`) and checked
-/// against the fingerprint the same way, so an IOV fit reloads with its occasions —
-/// read routing-only, it came back with none and its occasion column as a
-/// covariate. A caller that built the population some other way gets `None` and the
-/// note, not a population known to be wrong.
+/// A fit made in memory (`prepare_run` + [`fit`](crate::fit)) records a fingerprint but no
+/// reader settings (#1941); its `data.csv` is read with the model file's settings
+/// ([`ReaderSettings::from_parsed`](crate::ReaderSettings::from_parsed): `[data]` renames,
+/// `[covariates]`, `iov_column`, `[data_selection]`) and checked the same way, so an IOV
+/// fit reloads with its occasions. A population built some other way gets `None` and the
+/// note.
 ///
-/// A fit with no current fingerprint is read with the model's `[data]` renames and
-/// endpoint routing only, unverified, since that read does not claim to reproduce the
-/// fit's.
+/// A fit with no current fingerprint is read with the `[data]` renames and endpoint
+/// routing only, unverified.
 fn read_bundled_population(
     bytes: &[u8],
     model_source: &str,
@@ -3380,19 +3361,14 @@ fn parse_ebe_kappas(
     Ok(out)
 }
 
-// Parses conddist.csv (ID,ETA,COND_MEAN,COND_SD,COND_MODE) back into a
-// `CondDist`. `samples`/`nsamp`/`burnin` aren't carried by this CSV — the
-// bundle only round-trips the mean/SD/mode summary, not retained MCMC draws —
-// so they come back empty/zero. `shrinkage` isn't stored either; it's a pure
-// function of `cond_mean` and Ω, so it's recomputed here with the same
-// formula as `saem_conddist::run_conditional_distribution`, giving a value
-// that matches the original bit-for-bit rather than a redundant serialized
-// copy.
+// Parses conddist.csv (ID,ETA,COND_MEAN,COND_SD,COND_MODE) back into a `CondDist`.
+// `samples`/`nsamp`/`burnin` are not carried by the CSV and come back empty/zero.
+// `shrinkage` is recomputed from `cond_mean` and Ω with the same formula as
+// `saem_conddist::run_conditional_distribution` (bit-identical to the original).
 //
-// The CSV must carry exactly one row per (subject, eta): duplicate or missing
-// rows are rejected rather than silently loaded as NaN, and each COND_MODE is
-// validated against the EBE already loaded from `ebes.csv`, so a truncated or
-// hand-edited bundle fails fast.
+// The CSV must carry exactly one row per (subject, eta): duplicate or missing rows are
+// rejected rather than loaded as NaN, and each COND_MODE is validated against the EBE
+// from `ebes.csv`, so a truncated or hand-edited bundle fails fast.
 fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError> {
     let n_subjects = fit.subjects.len();
     let n_eta = fit.eta_names.len();
@@ -3464,15 +3440,11 @@ fn parse_conddist_csv(csv: &str, fit: &FitResult) -> Result<CondDist, FitrxError
         };
         cond_mean[si][ei] = parse_or_nan(&fields[2])?;
         cond_sd[si][ei] = parse_or_nan(&fields[3])?;
-        // COND_MODE is the conditional mode = the EBE already carried on
-        // `fit.subjects[si].eta` (loaded from ebes.csv). It isn't re-stored, but
-        // we validate it agrees with that EBE so a mismatched or hand-edited
-        // bundle fails fast rather than passing off inconsistent data. Compared as
-        // the value both cells read back as, not as text: a consistent bundle
-        // writes both with one formatter, but which one depends on its writer
-        // (six decimals before #1847, the shortest round-trip text after, R's
-        // own shortest spelling in ferx-r). `+0` and `-0` agree, as in `run_covariance`'s
-        // EBE comparison, and two `NaN`s do.
+        // COND_MODE is the EBE already carried on `fit.subjects[si].eta` (from ebes.csv);
+        // validated for agreement, compared as the value both cells read back as, not as text
+        // (writers differ: six decimals before #1847, shortest round-trip after, R's own
+        // spelling in ferx-r). `+0` and `-0` agree, as in `run_covariance`'s EBE comparison,
+        // and two `NaN`s do.
         let ebe = fit.subjects[si].eta.get(ei).copied().unwrap_or(f64::NAN);
         let mode = parse_or_nan(&fields[4])?;
         if mode != ebe && !(mode.is_nan() && ebe.is_nan()) {
@@ -5528,15 +5500,11 @@ mod tests {
         );
     }
 
-    /// #2092 review Q1: a `conddist.csv` that ferx-r's `ferx_save_fit` writes loads. R
-    /// spells each double as the shortest of `%.15g` / `%.16g` / `%.17g` that reads back,
-    /// so a value is full precision and an exponent has two digits; the cells below are R's
-    /// own output for these doubles (`Rscript`, `.fitrx_double_text`'s rule). Before #1847
-    /// the check compared that text with the EBE at six decimals, so every R bundle whose
-    /// EBEs were not six-decimal numbers was refused as corrupt. The second CSV is R's `-0`
-    /// against an EBE of `+0`, which agree (review nit). Mutations: compare the text with
-    /// `fmt_f64` → the R-spelling half dies (`e-07` vs `e-7`); compare bits → the `-0` half
-    /// dies; the pre-#1847 six-decimal text compare → the R-spelling half dies.
+    /// #2092: a `conddist.csv` written by ferx-r's `ferx_save_fit` loads. R spells each
+    /// double as the shortest of `%.15g` / `%.16g` / `%.17g` that reads back (two-digit
+    /// exponent), and the cells below are R's own output. The check once compared text with
+    /// the EBE at six decimals and refused such bundles; the second CSV is R's `-0` against
+    /// an EBE of `+0`, which agree.
     #[test]
     fn parse_conddist_csv_accepts_r_written_spelling() {
         let mut fit = minimal_fit_result();
@@ -6223,15 +6191,9 @@ mod tests {
         assert!(old.iov_occasion.is_none());
     }
 
-    /// #1815 T1: the optimizer's packed vector round-trips through the bundle bit
-    /// for bit — including a non-finite element, which goes out as `null` and comes
-    /// back as `NaN` like every other float vector in `fit.json`. A fit without one
-    /// writes no key, and a bundle from before #1815 (key deleted) loads `None`.
-    ///
-    /// Mutations — read `packed_estimate: None` on load: the bit comparison dies;
-    /// drop `skip_serializing_if`: the absent-key assert dies (written as `null`);
-    /// drop the `opt_vec` adapter: the NaN element cannot be read back and
-    /// `load_fit` fails.
+    /// #1815: the optimizer's packed vector round-trips bit for bit, a non-finite element
+    /// going out as `null` and back as `NaN`. A fit without one writes no key, and a bundle
+    /// from before #1815 loads `None`.
     #[test]
     fn roundtrip_packed_estimate_bits() {
         let dir = tempfile::tempdir().unwrap();
@@ -6406,20 +6368,12 @@ mod tests {
         }
     }
 
-    /// #1685 T4, probe D (re-measured at `045ca1b2`: `load_fit` returned 30 subjects
-    /// for the fit's 29, and 60 doses for its 30). A bundle that records its reader
-    /// settings re-reads `data.csv` with them — `ignore_subjects`, a dose-row filter,
-    /// the level index columns from the fit's bindings — and the loaded population
-    /// is the fingerprinted one. Control: the same fit saved without the two fields
-    /// (what a bundle from before #1685 is), or with a fingerprint of another scheme,
-    /// loads as today. A bundle whose recorded settings no longer reproduce the
-    /// population loads its estimates with no population and a note naming the
-    /// difference (review r1 #2; it was `Corrupt`).
-    ///
-    /// Mutations — ignore the recorded settings in `load_fit`: `Select` / `DoseFilter`
-    /// load 30 subjects / 60 doses; skip the level bind: `Level` loads no population;
-    /// skip the verification: the tampered bundle loads its population; drop the
-    /// note: its equality dies.
+    /// #1685: a bundle that records its reader settings re-reads `data.csv` with them
+    /// (`ignore_subjects`, dose-row filter, level index columns) and the loaded population is
+    /// the fingerprinted one (previously 30 subjects / 60 doses against the fit's 29 / 30).
+    /// Controls: a fit saved without the two fields, or with a fingerprint of another scheme,
+    /// loads as before; recorded settings that no longer reproduce the population load the
+    /// estimates with no population and a note naming the difference.
     #[test]
     fn load_fit_reads_the_bundled_data_as_the_fit_did() {
         use crate::estimation::fit_inputs::test_fixtures::{case, Kind};
@@ -6504,21 +6458,12 @@ mod tests {
             .any(|w| w.starts_with("load_fit:")));
     }
 
-    /// #1941: a fit made in memory (`prepare_run` + `fit`) records a fingerprint but
-    /// no reader settings. Its bundled `data.csv` is read with the model file's
-    /// settings, so the IOV model's `iov_column` gives the reloaded population its
-    /// occasions and `OCC` is not read as a covariate; the read is checked against
-    /// the fingerprint. Measured on the old routing-only read: 0 occasions for the
-    /// fit's 220 and `covariate_names == ["OCC"]`, which `run_covariance` refused as
-    /// "extra `OCC`". Controls: with no fingerprint (a pre-#1685 bundle) the legacy
-    /// routing-only read is kept — and it is the occasion-less population, so the
-    /// fixture straddles the fix; with a fingerprint of another population the
-    /// bundle loads no population and a note naming the model file's settings.
-    ///
-    /// Mutations — route the settings-less arm back to `read_population_routed_by`:
-    /// the occasion count and the covariate names die; skip the verification: the
-    /// tampered bundle loads its population; drop the `read_with` branch: the note
-    /// equality dies.
+    /// #1941: a fit made in memory records a fingerprint but no reader settings. Its
+    /// `data.csv` is read with the model file's settings, so the IOV model's `iov_column`
+    /// gives the population its occasions and `OCC` is not a covariate (the old routing-only
+    /// read gave 0 occasions for the fit's 220 and `covariate_names == ["OCC"]`). Controls:
+    /// no fingerprint keeps the legacy routing-only read; a fingerprint of another population
+    /// loads no population and a note naming the model file's settings.
     #[test]
     fn load_fit_reads_an_in_memory_iov_fit_with_the_model_file_settings() {
         let prep =
@@ -7219,17 +7164,9 @@ mod tests {
 
     // ── Fix 3: omega_init backward-compat fallback ───────────────────────────
 
-    /// #1382: a bundle that stores a covariance matrix must also store which
-    /// estimator built it, as the same `r` / `s` / `rsr` token `[fit_options]`
-    /// accepts — a runlog reader can then paste the value straight back.
-    ///
-    /// `rsr`, not the default: a round trip through `Hessian` is also a round
-    /// trip through `CovarianceMethod::default()`, so a loader that dropped the
-    /// field and fell back to the default would pass.
-    ///
-    /// Mutation: drop `covariance_method` from `FitWire`, or write
-    /// `format!("{m:?}")` instead of `m.label()` → this fires (as `None` and as a
-    /// `Corrupt` load error respectively).
+    /// #1382: a bundle that stores a covariance matrix also stores the estimator that built it
+    /// as the `r` / `s` / `rsr` token `[fit_options]` accepts. `rsr`, not the default, so a
+    /// loader that dropped the field and fell back to the default would fail the round trip.
     #[test]
     fn covariance_method_roundtrips_as_the_fit_option_token() {
         let dir = tempfile::tempdir().unwrap();

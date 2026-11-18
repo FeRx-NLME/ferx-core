@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_bytes;
 use crate::types::ParsedModel;
@@ -77,7 +78,8 @@ impl ModelSource {
     /// `run_covariance` use (#2027): an unreadable or non-UTF-8 file is
     /// `E_MODEL_READ`, an edited one `E_FIT_INPUT_CHANGED`, one that does not parse
     /// the parse's own code. Its `Display` is the read's text, unchanged.
-    pub fn read_verified(
+    #[cfg(test)]
+    pub(crate) fn read_verified(
         path: impl AsRef<Path>,
         expected_hash: Option<&str>,
         entry: &str,
