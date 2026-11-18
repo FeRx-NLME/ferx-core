@@ -1046,8 +1046,9 @@ pub(crate) struct InnerSolvePolicy {
     /// for the cold placeholder at every evaluation and re-runs the guarded multi-start each
     /// time, which cannot move it: on `examples/mm_iv.ferx` with one unused η, 920 multi-starts
     /// in 470 solves, none of which moved an EBE. The IOV solve's seed and multi-start gates
-    /// read it too (#2900). Unlike `init_is_mode` it does not say the starts are modes *at these
-    /// parameters*, so the IOV solve's start certificates read only that. Set by
+    /// read it too, for a start that carries κ̂ as well as η̂ (#2900). Unlike `init_is_mode` it
+    /// does not say the starts are modes *at these parameters*, so the IOV solve's start
+    /// certificates read only that. Set by
     /// [`PrevEtas::Solved`]; `false`, the `Default`, otherwise.
     pub(crate) init_is_warm: bool,
     /// Return a warm start unchanged when [`FallbackCertifier::certifies_in_place`] already
@@ -4088,7 +4089,6 @@ fn find_ebe_iov_seeded(
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
-    let warm_start = is_warm_start(eta_init, init_is_mode || init_is_warm);
 
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
 
@@ -4158,6 +4158,10 @@ fn find_ebe_iov_seeded(
         None => eta_init,
     };
     let mut x = iov_initial_vector(n_eta, n_flat, &mu, warm);
+    // A solved start is warm only when it carries κ̂ too (#2900): an η̂-only one (the ODE+IOV
+    // cache's, a nested subject's) restarts κ at 0, which the multi-start still scans.
+    let joint = warm.is_some_and(|w| w.len() == n_flat);
+    let warm_start = is_warm_start(eta_init, init_is_mode || (init_is_warm && joint));
     #[cfg(test)]
     with_recording(|r| {
         r.starts.push(IovStart {

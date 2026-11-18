@@ -6933,15 +6933,21 @@ fn iov_multistart_runs_on_cold_solves_only() {
 
 /// #2900: an exactly-zero joint start an earlier pass returned (`PrevEtas::Solved`) is warm,
 /// as in the non-IOV solve (#2691), so it starts no multi-start; the same zeros as the cold
-/// placeholder do. (An IOV subject none of whose η and κ the predictions read is re-scanned
-/// at every evaluation otherwise: 134 times in a 10-subject `warfarin_iov` fit.)
+/// placeholder do, and so does a solved η̂ alone (the ODE+IOV cache's), whose κ restart at 0.
+/// (An IOV subject none of whose η and κ the predictions read is re-scanned at every
+/// evaluation otherwise: 134 times in a 10-subject `warfarin_iov` fit.)
 #[test]
 fn iov_solved_zero_start_runs_no_multistart() {
     let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
     let r = cold_iov_solve(&model, &subject, 0, 1e-6, None);
     let zero = vec![0.0; r.eta.len() + r.kappas.iter().map(|k| k.len()).sum::<usize>()];
     let started = || EBE_MULTISTARTS_STARTED.with(|n| n.get());
-    for (prev, runs) in [(PrevEtas::Solved, 0), (PrevEtas::Placeholder, 1)] {
+    let n_eta = r.eta.len();
+    for (prev, start, runs) in [
+        (PrevEtas::Solved, &zero[..], 0),
+        (PrevEtas::Placeholder, &zero[..], 1),
+        (PrevEtas::Solved, &zero[..n_eta], 1),
+    ] {
         let before = started();
         find_ebe_for_stage_with_prev(
             &model,
@@ -6949,13 +6955,18 @@ fn iov_solved_zero_start_runs_no_multistart() {
             &model.default_params,
             500,
             1e-6,
-            Some(&zero),
+            Some(start),
             None,
             4,
             &crate::types::FitOptions::default(),
             prev,
         );
-        assert_eq!(started() - before, runs, "{prev:?}");
+        assert_eq!(
+            started() - before,
+            runs,
+            "{prev:?}, start of {}",
+            start.len()
+        );
     }
 }
 
