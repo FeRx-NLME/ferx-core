@@ -2009,8 +2009,8 @@ fn retire_superseded_groups_in<T>(found: &mut Vec<(usize, String, T)>, stmts: &[
 ///   question for a joint M-step that freezes all of their `φ_i` at once
 ///   ([`CovariateMuRef::read_outside_groups`], #1620);
 /// - θ is shared when another block names θ itself or names any tainted name.
-///   The [`OUTSIDE_READER_BLOCKS`] (`[structural_model]`, `[odes]`, `[derived]`,
-///   `[error_model]`, the endpoint blocks, …) are where an individual parameter
+///   The [`OUTSIDE_READER_BLOCKS`] (`[structural_model]`, `[odes]`, `[error_model]`,
+///   `[mixture]`, the endpoint blocks, …) are where an individual parameter
 ///   becomes a prediction, so a taint that reaches none of them reaches no
 ///   observation either (a dead intermediate).
 ///
@@ -2128,7 +2128,7 @@ fn mu_fold_spec(
         }) else {
             continue;
         };
-        if outside_idents.contains(&name.to_ascii_uppercase()) {
+        if eta_named_by_another_block(name, outside_idents) {
             continue;
         }
         let readers: Vec<&Statement> = stmts
@@ -2221,6 +2221,14 @@ fn mu_fold_spec(
     }
 }
 
+/// Whether a block other than `[individual_parameters]` names this η: the η side of
+/// the exclusivity rule, read by both the mu-ref/group checks
+/// ([`eta_read_outside_the_group`]) and the covariance fold ([`mu_fold_spec`]), so the
+/// two cannot drift apart (#3014 review).
+fn eta_named_by_another_block(eta_name: &str, outside_idents: &HashSet<String>) -> bool {
+    outside_idents.contains(&eta_name.to_ascii_uppercase())
+}
+
 /// Whether an assignment **other than** the group's own typical value reads the
 /// group's eta — the eta-side twin of [`thetas_read_outside_the_group`], and
 /// the second precondition the exact M-step engine needs.
@@ -2268,7 +2276,7 @@ fn eta_read_outside_the_group(
 ) -> bool {
     if eta_names
         .get(eta_idx)
-        .is_some_and(|n| outside_idents.contains(&n.to_ascii_uppercase()))
+        .is_some_and(|n| eta_named_by_another_block(n, outside_idents))
     {
         return true;
     }
@@ -3761,7 +3769,7 @@ impl<'a> ScaleWalk<'a> {
     /// it before ending it).
     ///
     /// A variable a consuming block reads (`consumers`, built by
-    /// [`param_consumer_identifiers`]) is a parameter: the leaf takes
+    /// [`identifiers_of_blocks`] over [`PARAM_CONSUMER_BLOCKS`]) is a parameter: the leaf takes
     /// [`Pending::at_root`] on it — `Additive` for a sum, `LogNormal` for a
     /// product — and other readers (`K10 = CL / V`) do not change that. But a
     /// consumer sees the variable's **last** value, so a reader that reassigns
@@ -3892,9 +3900,8 @@ const OUTSIDE_READER_BLOCKS: &[&str] = &[
     "binary_model",
     "count_model",
     "markov_model",
-    // A readout, an observation model, a state noise, a class model or a dose rule:
-    // each reads θ, η or an individual parameter on the way to a prediction.
-    "derived",
+    // An observation model, a state noise, a class model or a dose rule: each reads
+    // θ, η or an individual parameter on the way to a prediction.
     "error_model",
     "diffusion",
     "mixture",
@@ -3918,7 +3925,9 @@ const NON_OUTSIDE_READER_BLOCKS: &[&str] = &[
     // Hessian after the per-subject data term is assembled (#254); SAEM and IMP
     // do not apply it. No group's data term and no fold reads it.
     "priors",
-    // Report a name, or set up a run.
+    // Report a name, or set up a run. `[derived]` columns are computed after the fit
+    // from its estimates and only appended to the sdtab, like `[output]`'s.
+    "derived",
     "output",
     "simulation",
     "covariates",
@@ -3948,16 +3957,30 @@ fn every_block_body(
 /// Upper-cased identifiers of every block in `kinds`, unnamed and named.
 fn identifiers_of_blocks(extracted: &ExtractedBlocks, kinds: &[&str]) -> HashSet<String> {
     let mut out = HashSet::new();
-    for (_, _, lines) in every_block_body(extracted).filter(|(ty, _, _)| kinds.contains(ty)) {
-        collect_referenced_identifiers(lines, &mut out);
+    for (ty, _, lines) in every_block_body(extracted).filter(|(ty, _, _)| kinds.contains(ty)) {
+        if ty == "mixture" {
+            let reads: Vec<String> = lines
+                .iter()
+                .filter(|l| !is_mixture_class_variance_line(l))
+                .cloned()
+                .collect();
+            collect_referenced_identifiers(&reads, &mut out);
+        } else {
+            collect_referenced_identifiers(lines, &mut out);
+        }
     }
     out
 }
 
-/// Upper-cased identifiers of every [`PARAM_CONSUMER_BLOCKS`] block, unnamed
-/// and named (`[event_model NAME]`).
-fn param_consumer_identifiers(extracted: &ExtractedBlocks) -> HashSet<String> {
-    identifiers_of_blocks(extracted, PARAM_CONSUMER_BLOCKS)
+/// A `[mixture]` per-class variance override, `omega(k) ETA_CL ~ 0.15` or
+/// `sigma(k) PROP ~ 0.02`: it declares class k's variance of a named η or ε and reads
+/// no value, so the outside scan skips it (#3014 review). The rest of the block, the
+/// mixing probabilities `logit(k) = …`, does read θ. Matches the prefix
+/// [`parse_mixture_block`] dispatches on.
+fn is_mixture_class_variance_line(line: &str) -> bool {
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)^\s*(omega|sigma)\s*\(").unwrap());
+    RE.is_match(line)
 }
 
 /// Classify every IOV kappa by the scale it enters its individual parameter on
@@ -5086,7 +5109,7 @@ pub fn parse_full_model_with(
     // kappa's nearest ancestor would be that `/`, i.e. `Custom`.
     // The stop set is the blocks that consume a parameter (#1662), not the
     // tier-2 `downstream_refs` above: `[derived]` only reports a value.
-    let param_consumers = param_consumer_identifiers(&extracted);
+    let param_consumers = identifiers_of_blocks(&extracted, PARAM_CONSUMER_BLOCKS);
     let mut kappa_param_types =
         classify_kappa_params(&indiv_stmts, n_eta, &kappa_names, &param_consumers);
     if !weighted_kappa_slots.is_empty() {
