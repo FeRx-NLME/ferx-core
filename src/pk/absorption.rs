@@ -829,8 +829,16 @@ impl<T: PkNum> PreparedInputRate<T> {
                 let z1 = sqrt_lam_over_s * (s_over_mu - T::from_f64(1.0));
                 let z2 = -sqrt_lam_over_s * (s_over_mu + T::from_f64(1.0));
                 let two_lambda_over_mu = T::from_f64(2.0) * lambda / mat;
-                crate::stats::special::normal_cdf_g(z1)
-                    + (two_lambda_over_mu + crate::stats::special::log_normal_cdf_g(z2)).exp()
+                // A recording type reads this inside an ODE step (the stage time moves `z`),
+                // where the branches of `Φ` would be guards that fail at another stage.
+                if T::RECORDS_BRANCHES {
+                    crate::stats::special::normal_cdf_stage(z1)
+                        + (two_lambda_over_mu + crate::stats::special::log_normal_cdf_stage(z2))
+                            .exp()
+                } else {
+                    crate::stats::special::normal_cdf_g(z1)
+                        + (two_lambda_over_mu + crate::stats::special::log_normal_cdf_g(z2)).exp()
+                }
             }
             PreparedInputRate::Weibull { beta, ln_td, .. } => {
                 // 1 − exp(−(s/Td)^β), with (s/Td)^β = exp(β·(ln s − ln Td)).

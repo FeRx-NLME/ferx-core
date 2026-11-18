@@ -2054,6 +2054,31 @@ fn an_infusion_into_an_absorption_kernel_matches_reconverged_fd() {
     }
 }
 
+/// An infusion (RATE > 0) into the compartment of an `igd` input kernel (#3004): the convolved
+/// `R_in_inf` evaluates the kernel's CDF, `Phi` and `ln Phi`, whose branches (the `erfc` tail,
+/// the Mills switch) used to be guards of the recorded ODE body, which fail at another stage of
+/// the segment, so every subject with an infusion declined to FD. A rate-defined infusion first,
+/// a bolus landing on its residual drug second, observations during the window and after it.
+/// (The `transit` and `weibull` kernels were measured exact on the same fixture: their CDF is
+/// one recorded primitive.)
+#[test]
+fn an_infusion_into_an_igd_kernel_matches_reconverged_fd() {
+    let times = [0.5, 1.0, 1.8, 2.5, 4.0, 6.5, 7.0, 9.0, 12.0, 18.0];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(6.0, 80.0, 1, 0.0, false, 0.0),
+    ];
+    // At reltol 1e-12, for the reason given at the Weibull / igd forcing test.
+    let m = with_tol(parse_model_string(IGD_ODE).unwrap(), 1e-12, 1e-14);
+    let s = subject(&m, doses, &times, &[0.1, -0.05]);
+    assert!(s.doses[0].is_infusion() && !s.doses[1].is_infusion());
+    let (jac, grad) = measure(&m, &s, &[0, 2, 3], "igd infusion");
+    // Measured 1.1e-11 / 5.3e-9 on Linux; ~10x headroom on the gradient, the jacobian bound
+    // sitting above the FD oracle's own noise.
+    assert!(jac < 1e-9, "igd infusion df/deta: {jac:.2e}");
+    assert!(grad < 5e-8, "igd infusion gradient: {grad:.2e}");
+}
+
 /// A first-order absorption model with the given extra `[parameters]` / individual
 /// parameters and `first_order` arguments, for the moving-window infusions below.
 fn kernel_infusion_model(theta: &str, omega: &str, ind: &str, args: &str) -> CompiledModel {
