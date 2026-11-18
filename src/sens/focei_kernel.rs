@@ -742,7 +742,7 @@ pub(crate) fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -
 }
 
 /// Whether [`foce_f`] takes its Woodbury form at `S = LᵀGᵀD⁻¹GL` with trace `tr_s` — the
-/// form the structured FOCE kernel is (#2980): otherwise production factors `R̃` itself.
+/// form the structured FOCE kernel is (#2980): otherwise it rotates the rows into `I + S` (#2988).
 pub(crate) fn foce_woodbury_ok(tr_s: f64) -> bool {
     1.0 + tr_s <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
 }
@@ -995,7 +995,7 @@ fn assemble_grad<T: PkNum>(
 /// A diagonal `R⁰` takes Woodbury's form, `rᵀR̃⁻¹r = rᵀR⁻¹r − bᵀA⁻¹b` and
 /// `log|R̃| = log|R| + log|Ω| + log|A|` with `A = Ω⁻¹ + GᵀR⁻¹G`, `b = GᵀR⁻¹r`: `N × N`
 /// work per subject instead of the `n × n` factorisation. A covariance coupling rows
-/// factors `R̃` directly.
+/// factors `R̃` directly; past the #1498 gate the rows are rotated into `I + S` (#2988).
 pub(crate) fn foce_f<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],

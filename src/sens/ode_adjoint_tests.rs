@@ -7708,7 +7708,7 @@ fn foce_kernel_declines_woodbury_on_a_near_singular_row() {
     // Measured on macOS arm64 (#2441, t = 20 h): ungated 7.4e-2 relative, gated 7.7e-12 (3.2e-11
     // since #2988 rotates the rows into `I + S` rather than factoring the dense `R̃`). The
     // ungated bound sits 10× inside its side; the gated one (kept from the Linux-measured
-    // t = 23 h fixture, 2.3e-11) has ~30× headroom here. Either reddens if the gate stops
+    // t = 23 h fixture, 2.3e-11) has ~8× headroom here. Either reddens if the gate stops
     // separating them.
     assert!(
         ungated.0 > 7e-3,
@@ -11970,8 +11970,8 @@ fn structured_reduce_is_shared_across_subjects_exactly() {
     });
 }
 
-/// A FOCE subject past the Woodbury gate (`1 + tr(LᵀSL) > 1e6`, where production factors `R̃`
-/// itself) is outside the structured kernel's form, so its passes take the recorded kernel
+/// A FOCE subject past the Woodbury gate (`1 + tr(LᵀSL) > 1e6`, where `foce_f` leaves
+/// Woodbury's form) is outside the structured kernel's form, so its passes take the recorded kernel
 /// rather than declining the subject (#2980 review). The pair straddles the gate: at the
 /// fixture's σ the subject takes the structured kernel, at a σ shrunk `1e-5`× (the trace far
 /// past `1e6`) none of its passes does — both asserted — and each Hessian matches the recorded
