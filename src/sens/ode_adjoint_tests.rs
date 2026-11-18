@@ -11944,13 +11944,15 @@ const ONE_CPT_D1_ODE: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// A point no plan of the subject serves — the infusion end moved by η across an observation —
-/// is the native predictor's in the objective's value pass: `plan_values` declines it without
-/// recording (#3010). Recording it there cost a whole recording (a few hundred thousand
-/// instructions) per objective value of an EBE search, and three quarters of a fit's time on a
-/// modeled-infusion model. The gradient's lookup (`with_plan`) still records the point, after
-/// which the value pass serves it. Mutation: `record_miss = true` in `plan_values` -> the moved
-/// point is served, by a recording.
+/// A point no plan of the subject serves is the native predictor's in the objective's value
+/// pass: `plan_values` declines it without recording (#3010). Recording it there cost a whole
+/// recording (a few hundred thousand instructions) per objective value of an EBE search. The
+/// gradient's lookup (`with_plan`) still records the point, after which the value pass serves
+/// it. Since an infusion end that moves across an observation no longer changes a plan's
+/// structure (`a_plan_serves_both_sides_of_a_moving_infusion_end`), the moved point here moves
+/// the first dose's end past the second dose's arrival, the one check a walked end keeps.
+/// Mutation: `record_miss = true` in `plan_values` -> the moved point is served, by a recording;
+/// drop the walked end's check (`end < until`) -> the first plan serves it, wrongly.
 #[test]
 fn plan_values_declines_a_point_no_plan_serves_without_recording() {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
@@ -11962,12 +11964,12 @@ fn plan_values_declines_a_point_no_plan_serves_without_recording() {
     let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
     let s = subject(&model, vec![d(0.0), d(12.0)], &times, &[0.0; 2]);
     let theta = moved_params(&model).theta;
-    let (e0, e1) = (vec![0.0, 0.0], vec![0.0, 0.2]);
-    // The straddle: the window ends before the observation at 2.5 at `e0`, after it at `e1`
-    // (and so for the second dose's at 14.5), so the two points have different structures.
     let end = |e: &[f64]| theta[2] * e[1].exp();
+    let (e0, e1) = (vec![0.0, 0.0], vec![0.0, (13.0 / theta[2]).ln()]);
+    // The straddle: the first window ends before the second dose arrives at `e0`, after it at
+    // `e1`.
     assert!(
-        end(&e0) < 2.5 && end(&e1) > 2.5,
+        end(&e0) < 12.0 && end(&e1) > 12.0,
         "{} {}",
         end(&e0),
         end(&e1)
@@ -12000,6 +12002,96 @@ fn plan_values_declines_a_point_no_plan_serves_without_recording() {
     let got = values(&e1).expect("the recorded variant serves the moved point");
     assert_eq!(planned(), 0);
     assert_eq!(got, native(&e1));
+}
+
+/// One plan serves an infusion end on both sides of an observation (#3010): the end of a
+/// modeled `D1` (`RATE=-2`) is walked without a timeline event (`integrate_tvcov_g`'s `soft`),
+/// each segment of its window cut where it falls (`AffinePieces`), so moving it past the
+/// observation at 2.5 h changes no structure. Before, the end was an event sorted against the
+/// observations, the recording kept that order as a check, and every crossing recorded the
+/// subject again — on #3010's 156-subject model, 2084 recordings and 7011 compiled kernels.
+///
+/// Three pairs, the recording made at the first point and run at the second: the end moves
+/// later across the observation, earlier, and with the other η moving too. At the second
+/// point: no recording, values bit-equal to the native predictor and to a fresh recording
+/// there, and each `∂f/∂η` against central differences of the native predictor (worst
+/// measured 1.3e-9 relative, the differences' own error at `h = 1e-6`; bound 2e-8).
+///
+/// Mutations, each run: the walked ends off (`soft` empty) → "no new recording at the moved
+/// point"; the cut without its lower clamp → a piece of negative length fails its check and the
+/// moved point records again; without its upper clamp → "a fresh recording at the moved point"
+/// disagrees; the rate left off the first piece → "value 0 against native"; the cut at the end's
+/// value only (`w.end.value_only()`) → `∂f/∂η_D1` off by 5.1 relative (the boundary term).
+#[test]
+fn a_plan_serves_both_sides_of_a_moving_infusion_end() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::types::RateMode::ModeledDuration;
+    let model = parse_model_string(ONE_CPT_D1_ODE).unwrap();
+    let d = |t| DoseEvent::modeled(t, 100.0, 1, false, 0.0, ModeledDuration);
+    let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
+    let s = subject(&model, vec![d(0.0), d(12.0)], &times, &[0.0; 2]);
+    let mut fresh_s = s.clone();
+    fresh_s.id = format!("{}-fresh", s.id);
+    let theta = moved_params(&model).theta;
+    let n = s.observations.len();
+    let end = |e: &[f64]| theta[2] * e[1].exp();
+    let planned = || kj::TEMPLATE_PROBE.with(|p| p.replace((false, 0, 0)).1);
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&model, &s, &theta, e);
+    let run = |s: &Subject, e: &[f64]| {
+        with_plan(&model, s, None, &theta, e, &mut |p| {
+            kjit_run(p, &theta, e, n)
+        })
+        .expect("served")
+        .du
+    };
+    let pairs = [
+        (vec![0.0, 0.0], vec![0.0, 0.2]),
+        (vec![0.0, 0.2], vec![0.0, 0.0]),
+        (vec![0.1, -0.3], vec![-0.1, 0.25]),
+    ];
+    for (i, (e0, e1)) in pairs.iter().enumerate() {
+        // The straddle: the first window's end on opposite sides of the observation at 2.5,
+        // and before the second dose at both points.
+        assert!(
+            (end(e0) < 2.5) != (end(e1) < 2.5) && end(e0).max(end(e1)) < 12.0,
+            "pair {i}: {} {}",
+            end(e0),
+            end(e1)
+        );
+        planned();
+        run(&s, e0);
+        // The first pair records the subject's plan; the later ones find it.
+        assert_eq!(planned(), usize::from(i == 0), "pair {i}: the first point");
+        let got = run(&s, e1);
+        assert_eq!(
+            planned(),
+            0,
+            "pair {i}: no new recording at the moved point"
+        );
+        let fresh = run(&fresh_s, e1);
+        assert_eq!(got, fresh, "pair {i}: a fresh recording at the moved point");
+        let nat = native(e1);
+        let l = 1 + e1.len();
+        let mut worst = 0.0f64;
+        for j in 0..n {
+            assert_eq!(got[j * l], nat[j], "pair {i}: value {j} against native");
+            for k in 0..e1.len() {
+                let h = 1e-6;
+                let (mut ep, mut em) = (e1.clone(), e1.clone());
+                ep[k] += h;
+                em[k] -= h;
+                let fd = (native(&ep)[j] - native(&em)[j]) / (2.0 * h);
+                let gap = (got[j * l + 1 + k] - fd).abs() / (1e-6 + fd.abs());
+                assert!(gap.is_finite(), "pair {i}: obs {j}, eta {k}: {gap}");
+                worst = worst.max(gap);
+            }
+        }
+        eprintln!("pair {i}: worst d/deta gap {worst:e}");
+        assert!(
+            worst < 2e-8,
+            "pair {i}: d/deta against central differences: {worst:e}"
+        );
+    }
 }
 
 /// The structured kernel's reduce is one plan shared by every subject (`kernel_run_shared`,
