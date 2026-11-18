@@ -409,13 +409,17 @@ pub(crate) fn obs_nll_subject_grad_iov(
         pk_scratch,
         false,
         None,
+        None,
     );
     (nll, grad)
 }
 
 /// The IOV score for the M-step solves: [`obs_nll_subject_grad_iov`] /
 /// [`obs_nll_subject_grad_iov_fisher`] by `want_fisher`, with the predictions served from a
-/// [`MemoSlot`] where it holds them for this `θ`.
+/// [`MemoSlot`] where it holds them for this `θ`, and computed with the subject's cached
+/// [`EventSchedule`](crate::pk::event_driven::EventSchedule) — the predictor the value objective
+/// ([`obs_nll_subject_into_iov_memo`]) uses, so one memo slot holds the same numbers whichever
+/// of the two filled it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_score_iov(
     model: &CompiledModel,
@@ -432,6 +436,7 @@ pub(crate) fn obs_nll_subject_score_iov(
     pk_scratch: &mut crate::pk::EventPkParams,
     want_fisher: bool,
     memo: Option<MemoSlot<'_>>,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     obs_nll_subject_grad_iov_impl(
         model,
@@ -448,6 +453,7 @@ pub(crate) fn obs_nll_subject_score_iov(
         pk_scratch,
         want_fisher,
         memo,
+        schedule,
     )
 }
 
@@ -486,6 +492,7 @@ pub(crate) fn obs_nll_subject_grad_iov_fisher(
         pk_scratch,
         true,
         None,
+        None,
     )
 }
 
@@ -505,6 +512,7 @@ fn obs_nll_subject_grad_iov_impl(
     pk_scratch: &mut crate::pk::EventPkParams,
     want_fisher: bool,
     memo: Option<MemoSlot<'_>>,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     // IOV + block_sigma is fitted by FOCE/FOCEI only (#979); the estimators that reach
@@ -605,7 +613,9 @@ fn obs_nll_subject_grad_iov_impl(
     // Non-M3 path: continuous per-occasion-aware base predictions (issue #104).
     let n_obs = subject.observations.len();
     let preds = memoized(memo, || {
-        crate::pk::predict_iov(model, subject, theta, eta, kappas)
+        crate::pk::predict_iov_with_scratch_and_schedule(
+            model, subject, theta, eta, kappas, pk_scratch, schedule,
+        )
     });
     // FREM covariate rows use EPSCOV, not the PK residual error (see
     // build_frem_r_override); their variance is η-independent so dvar_df = 0.
@@ -871,13 +881,16 @@ pub(crate) fn obs_nll_subject_grad(
         false,
         false,
         None,
+        None,
     );
     (nll, grad)
 }
 
 /// The score for the M-step solves: [`obs_nll_subject_grad`] /
 /// [`obs_nll_subject_grad_fisher`] by `want_fisher`, with the predictions served from a
-/// [`MemoSlot`] where it holds them for this `θ`.
+/// [`MemoSlot`] where it holds them for this `θ`, and computed with the subject's cached
+/// [`EventSchedule`](crate::pk::event_driven::EventSchedule) — the predictor the value
+/// objective uses, so one memo slot holds the same numbers whichever of the two filled it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_score(
     model: &CompiledModel,
@@ -893,6 +906,7 @@ pub(crate) fn obs_nll_subject_score(
     pk_scratch: &mut EventPkParams,
     want_fisher: bool,
     memo: Option<MemoSlot<'_>>,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     obs_nll_subject_grad_impl(
         model,
@@ -909,6 +923,7 @@ pub(crate) fn obs_nll_subject_score(
         want_fisher,
         true,
         memo,
+        schedule,
     )
 }
 
@@ -973,6 +988,7 @@ pub(crate) fn obs_nll_subject_grad_fisher(
         pk_scratch,
         true,
         false,
+        None,
         None,
     )
 }
@@ -1095,6 +1111,7 @@ fn obs_nll_subject_grad_impl(
     want_fisher: bool,
     exact_info_only: bool,
     memo: Option<MemoSlot<'_>>,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n = n_theta + n_sigma;
     let fd_all = matches!(model.bloq_in_force(), BloqMethod::M3) || model.residual_is_dense();
@@ -1110,7 +1127,9 @@ fn obs_nll_subject_grad_impl(
         // so solve the model once and reuse the base predictions across every σ
         // perturbation — only θ perturbations need a fresh solve (#557).
         let preds_base = memoized(memo, || {
-            crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch)
+            crate::pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, theta, eta, pk_scratch, schedule,
+            )
         });
         let nll_base = obs_nll_subject_from_preds(
             model,
@@ -1213,7 +1232,9 @@ fn obs_nll_subject_grad_impl(
 
     // Non-M3 path.
     let preds_base = memoized(memo, || {
-        crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, pk_scratch)
+        crate::pk::compute_predictions_with_tv_into_with_schedule(
+            model, subject, theta, eta, pk_scratch, schedule,
+        )
     });
 
     let mut nll_base = 0.0f64;

@@ -18,6 +18,7 @@
 
 use crate::estimation::saem::fold_nll_grad;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+use nalgebra::{Cholesky, DMatrix, DVector};
 
 /// One fused evaluation: objective value, packed gradient and row-major `n × n` information.
 pub(crate) struct ValueGradInfo {
@@ -88,39 +89,16 @@ const MAX_DAMPINGS: u32 = 30;
 
 /// Solve `(A + ridge·I) s = rhs` by Cholesky; `None` when not positive definite.
 fn cholesky_solve(a: &[f64], m: usize, ridge: f64, rhs: &[f64]) -> Option<Vec<f64>> {
-    let mut l = vec![0.0f64; m * m];
+    let mut mat = DMatrix::from_row_slice(m, m, a);
     for i in 0..m {
-        for j in 0..=i {
-            let mut s = a[i * m + j] + if i == j { ridge } else { 0.0 };
-            for k in 0..j {
-                s -= l[i * m + k] * l[j * m + k];
-            }
-            if i == j {
-                if !(s > 0.0) || !s.is_finite() {
-                    return None;
-                }
-                l[i * m + i] = s.sqrt();
-            } else {
-                l[i * m + j] = s / l[j * m + j];
-            }
-        }
+        mat[(i, i)] += ridge;
     }
-    let mut y = vec![0.0f64; m];
-    for i in 0..m {
-        let mut s = rhs[i];
-        for k in 0..i {
-            s -= l[i * m + k] * y[k];
-        }
-        y[i] = s / l[i * m + i];
-    }
-    for i in (0..m).rev() {
-        let mut s = y[i];
-        for k in i + 1..m {
-            s -= l[k * m + i] * y[k];
-        }
-        y[i] = s / l[i * m + i];
-    }
-    Some(y)
+    let chol = Cholesky::new(mat)?;
+    Some(
+        chol.solve(&DVector::from_column_slice(rhs))
+            .as_slice()
+            .to_vec(),
+    )
 }
 
 #[cfg(test)]
@@ -160,27 +138,41 @@ pub(crate) enum NewtonOutcome {
     /// answer.
     Converged,
     /// No admissible step was left although the tolerance was not met — the information
-    /// would not factor at any ridge (non-finite entries), no damped step decreased the
-    /// objective, or a later point lost its information. `x` is the last accepted point
-    /// (the start when none was); the caller continues from it with another solver.
+    /// would not factor at any ridge (non-finite entries), or no damped step decreased the
+    /// objective. `x` is the last accepted point (the start when none was); the caller
+    /// continues from it with another solver.
     Stalled,
+    /// An accepted point had no information (a subject the adjoint declined there), so the
+    /// next step could not be taken. `x` is the last accepted point; the caller continues from
+    /// it with another solver, and a fit says how many of its solves ended here.
+    Lost,
 }
 
 /// Minimise an objective over the box `[lower, upper]` from `x` (updated in place) by Fisher
-/// scoring.
+/// scoring. Returns how it ended and the evaluations it spent (see below).
 ///
 /// `fused(x)` returns the value, gradient and information in one pass, or `None` where the
 /// information is out of scope; `value(x)` is the same objective's value alone (a trial point
 /// is judged on it, and only an accepted point that the iteration continues from pays for the
-/// derivatives). Returns [`NewtonOutcome::Declined`] — `x` untouched — when the information is
-/// out of scope at the start point, and [`NewtonOutcome::Stalled`] when the iteration cannot
-/// take a step it has not converged for; in both the caller keeps the derivative-free solve
-/// (from `x`). `maxeval` bounds the evaluations of either kind (the budget BOBYQA gets in
-/// value evaluations).
+/// derivatives). Returns [`NewtonOutcome::Declined`] — `x` untouched, no evaluation spent —
+/// when the information is out of scope at the start point, and [`NewtonOutcome::Stalled`]
+/// when the iteration cannot take a step it has not converged for; in both the caller keeps
+/// the derivative-free solve (from `x`). `maxeval` bounds the evaluations of either kind (the
+/// budget BOBYQA gets in value evaluations); **every pass counts as one evaluation, a value
+/// pass and a fused pass alike**, and the count returned is what the caller subtracts from its
+/// budget before handing the remainder to the solve it continues with, so one M-step never
+/// spends more than `maxeval` in all.
 ///
 /// A coordinate with `lower == upper`, or at a bound with the gradient pushing outward, is held
 /// for that step; the step solves the remaining block of `I` (Levenberg-damped as far as needed
 /// to factor it and to decrease the objective) and a trial point is clamped into the box.
+///
+/// The tolerance is tested on the *undamped* step. The Levenberg ridge is carried over from
+/// earlier rejections, so a step at the carried ridge is shorter than the Fisher step and its
+/// predicted (and realised) decrease understates what the point still has to give; a solve is
+/// converged only when the plain Fisher step — or, where `I` does not factor, the one at the
+/// smallest ridge that does — predicts a decrease inside `ftol_rel`, and an accepted step that
+/// was damped never ends the solve on its own small decrease.
 pub(crate) fn fisher_scoring<V, F>(
     x: &mut [f64],
     lower: &[f64],
@@ -189,20 +181,21 @@ pub(crate) fn fisher_scoring<V, F>(
     ftol_rel: f64,
     mut value: V,
     mut fused: F,
-) -> NewtonOutcome
+) -> (NewtonOutcome, u32)
 where
     V: FnMut(&[f64]) -> f64,
     F: FnMut(&[f64]) -> Option<ValueGradInfo>,
 {
     let n = x.len();
     let Some(mut cur) = run_fused(&mut fused, x) else {
-        return NewtonOutcome::Declined;
+        return (NewtonOutcome::Declined, 0);
     };
     let mut evals = 1u32;
     // Persists across iterations (Levenberg-Marquardt): a rejected step raises it, an accepted
     // one lowers it, and below the floor it is exactly zero — the plain Fisher step.
     let mut ridge = 0.0f64;
     let mut stalled = false;
+    let mut lost = false;
     while evals < maxeval {
         let free: Vec<usize> = (0..n)
             .filter(|&i| {
@@ -227,14 +220,26 @@ where
             .fold(0.0f64, f64::max)
             .max(f64::MIN_POSITIVE);
         let neg_g: Vec<f64> = g.iter().map(|v| -v).collect();
-        // Levenberg damping: the plain Fisher step first; a block that does not factor, or a
-        // step the objective rejects, multiplies the ridge (relative to the largest diagonal
-        // entry) by ten from `RIDGE_FLOOR` — a larger ridge is a shorter, more
-        // gradient-like step, so the sequence ends in a decrease.
+        // The decrease the quadratic model predicts for the undamped step, ½ gᵀA⁻¹g (at the
+        // smallest ridge that factors, where A does not), against the tolerance: below it the
+        // point is not worth a pass — converged, not stalled.
+        let mut probe = 0.0f64;
+        for _ in 0..MAX_DAMPINGS {
+            if let Some(s) = cholesky_solve(&a, m, probe * max_diag, &neg_g) {
+                let predicted = -0.5 * g.iter().zip(&s).map(|(a, b)| a * b).sum::<f64>();
+                if !(predicted > ftol_rel * cur.val.abs()) {
+                    return (NewtonOutcome::Converged, evals);
+                }
+                break;
+            }
+            probe = (probe * 10.0).max(RIDGE_FLOOR);
+        }
+        // Levenberg damping: the carried ridge first (zero: the plain Fisher step); a block
+        // that does not factor, or a step the objective rejects, multiplies the ridge
+        // (relative to the largest diagonal entry) by ten from `RIDGE_FLOOR` — a larger ridge
+        // is a shorter, more gradient-like step, so the sequence ends in a decrease.
         let mut accepted = None;
-        let mut first = true;
-        // The first factored step is not worth a pass: converged, not stalled.
-        let mut not_worth_a_pass = false;
+        let mut damped = false;
         for _ in 0..MAX_DAMPINGS {
             if evals >= maxeval {
                 break;
@@ -243,16 +248,6 @@ where
                 ridge = (ridge * 10.0).max(RIDGE_FLOOR);
                 continue;
             };
-            if first {
-                first = false;
-                // The decrease the quadratic model predicts, ½ gᵀ(A + ridge)⁻¹ g, against
-                // the tolerance: below it the step is not worth a pass.
-                let predicted = -0.5 * g.iter().zip(&s).map(|(a, b)| a * b).sum::<f64>();
-                if !(predicted > ftol_rel * cur.val.abs()) {
-                    not_worth_a_pass = true;
-                    break;
-                }
-            }
             let mut trial = x.to_vec();
             for (p, &i) in free.iter().enumerate() {
                 trial[i] = (x[i] + s[p]).clamp(lower[i], upper[i]);
@@ -262,14 +257,15 @@ where
             evals += 1;
             if v.is_finite() && v <= cur.val + ARMIJO_C1 * slope {
                 accepted = Some((trial, v));
+                damped = ridge > 0.0;
                 break;
             }
             ridge = (ridge * 10.0).max(RIDGE_FLOOR);
         }
         let Some((trial, v)) = accepted else {
-            // Out of budget or a step not worth a pass is an ending; every damping tried
-            // with the budget left is a stall.
-            stalled = !not_worth_a_pass && evals < maxeval;
+            // Every damping tried with the budget left is a stall; the budget ending is an
+            // ending.
+            stalled = evals < maxeval;
             break;
         };
         // A damping so heavy that the step vanishes in rounding is "accepted" at the same
@@ -285,30 +281,126 @@ where
         };
         let decrease = cur.val - v;
         x.copy_from_slice(&trial);
-        // Inside the tolerance: this is the answer, and its derivatives are not needed.
-        if decrease < ftol_rel * v.abs() {
+        // Inside the tolerance on a plain Fisher step: this is the answer, and its
+        // derivatives are not needed. A damped step's small decrease says how short the step
+        // was, not how little is left; the undamped test at the next point decides.
+        if !damped && decrease < ftol_rel * v.abs() {
             break;
         }
-        // Another step from here needs the derivatives at the accepted point.
+        // Another step from here needs the derivatives at the accepted point — and the budget
+        // for the pass.
+        if evals >= maxeval {
+            break;
+        }
         evals += 1;
         match run_fused(&mut fused, x) {
             Some(nx) => cur = nx,
             None => {
-                stalled = true;
+                lost = true;
                 break;
             }
         }
     }
-    if stalled {
+    let outcome = if lost {
+        NewtonOutcome::Lost
+    } else if stalled {
         NewtonOutcome::Stalled
     } else {
         NewtonOutcome::Converged
+    };
+    (outcome, evals)
+}
+
+/// What a fit's Newton solves did, for the warning the fit reports (the solves run inside
+/// the M-steps, which return only their point). Counted by [`newton_solve`].
+#[derive(Default)]
+pub(crate) struct NewtonTally {
+    /// Solves that ran Newton.
+    solves: std::cell::Cell<u32>,
+    /// Solves that lost the information at run time — a subject whose recording the adjoint
+    /// declined at that point — and continued with the derivative-free solve.
+    lost_information: std::cell::Cell<u32>,
+    /// Solves that found no admissible step and continued with the derivative-free solve.
+    stalled: std::cell::Cell<u32>,
+}
+
+impl NewtonTally {
+    /// The fit's warning, `None` when every Newton solve ended on its own.
+    pub(crate) fn warning(&self, label: &str) -> Option<String> {
+        let (solves, lost, stalled) = (
+            self.solves.get(),
+            self.lost_information.get(),
+            self.stalled.get(),
+        );
+        if lost + stalled == 0 {
+            return None;
+        }
+        let mut causes = Vec::new();
+        if lost > 0 {
+            causes.push(format!(
+                "{lost} lost the expected information at run time (the adjoint declined a \
+                 subject's recording at that point)"
+            ));
+        }
+        if stalled > 0 {
+            causes.push(format!(
+                "{stalled} found no admissible damped step before the tolerance was met"
+            ));
+        }
+        Some(format!(
+            "{label}: `mstep_optimizer = newton` handed {} of {solves} numerical M-steps to \
+             `bobyqa` (the remainder of the M-step's evaluation budget, from the point Newton \
+             reached): {}.",
+            lost + stalled,
+            causes.join("; ")
+        ))
+    }
+}
+
+/// What [`newton_solve`] left for the caller.
+pub(crate) struct NewtonSolve {
+    /// The solve reached one of its own stopping rules: `x` is the M-step's answer.
+    pub converged: bool,
+    /// Evaluations spent (see [`fisher_scoring`]); `maxeval - evals` is what the derivative-free
+    /// continuation of a solve that did not converge may still use.
+    pub evals: u32,
+}
+
+/// [`fisher_scoring`] for an M-step, with the run-time information loss and stalls recorded in
+/// `tally`: the one place SAEM's and IMP/IMPMAP's solves share.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn newton_solve<V, F>(
+    x: &mut [f64],
+    lower: &[f64],
+    upper: &[f64],
+    maxeval: u32,
+    ftol_rel: f64,
+    value: V,
+    fused: F,
+    tally: Option<&NewtonTally>,
+) -> NewtonSolve
+where
+    V: FnMut(&[f64]) -> f64,
+    F: FnMut(&[f64]) -> Option<ValueGradInfo>,
+{
+    let (outcome, evals) = fisher_scoring(x, lower, upper, maxeval, ftol_rel, value, fused);
+    if let Some(t) = tally {
+        t.solves.set(t.solves.get() + 1);
+        if matches!(outcome, NewtonOutcome::Declined | NewtonOutcome::Lost) {
+            t.lost_information.set(t.lost_information.get() + 1);
+        } else if outcome == NewtonOutcome::Stalled {
+            t.stalled.set(t.stalled.get() + 1);
+        }
+    }
+    NewtonSolve {
+        converged: outcome == NewtonOutcome::Converged,
+        evals,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::NewtonOutcome::{Converged, Declined, Stalled};
+    use super::NewtonOutcome::{Converged, Declined, Lost, Stalled};
     use super::*;
 
     /// Gaussian regression `y_j = a·exp(b·t_j)`, additive σ fixed at 1: value, exact score and
@@ -351,7 +443,7 @@ mod tests {
         F: Fn(&[f64]) -> Option<ValueGradInfo>,
     {
         let calls = std::cell::Cell::new(0u32);
-        let ok = fisher_scoring(
+        let (ok, evals) = fisher_scoring(
             x,
             lo,
             hi,
@@ -365,6 +457,11 @@ mod tests {
                 calls.set(calls.get() + 1);
                 f(v)
             },
+        );
+        assert_eq!(
+            evals,
+            calls.get(),
+            "the evaluations reported are the passes made"
         );
         (ok, calls.get())
     }
@@ -405,7 +502,7 @@ mod tests {
         let mut x = [1.5, -0.4];
         assert_eq!(
             fisher_scoring(&mut x, &[-9.0; 2], &[9.0; 2], 10, 1e-9, |_| 0.0, |_| None),
-            Declined
+            (Declined, 0)
         );
         assert_eq!(x, [1.5, -0.4]);
         let mut z = [1.5, -0.4];
@@ -515,7 +612,7 @@ mod tests {
             })
         };
         let mut z = [2.9];
-        let out = fisher_scoring(
+        let (out, _) = fisher_scoring(
             &mut z,
             &[-9.0],
             &[9.0],
@@ -524,10 +621,7 @@ mod tests {
             |v| 1.0 + 0.5 * (v[0] - 3.0).powi(2),
             lost,
         );
-        assert!(
-            out == Stalled && (z[0] - 3.0).abs() < 1e-12,
-            "{out:?} {z:?}"
-        );
+        assert!(out == Lost && (z[0] - 3.0).abs() < 1e-12, "{out:?} {z:?}");
     }
 
     /// The endings that are not stalls: a first step not worth a pass, every coordinate held at
@@ -558,6 +652,156 @@ mod tests {
             solve(&mut budget, &[-9.0; 2], &[9.0; 2], 3, 1e-15, exp_fit).0,
             Converged
         );
+    }
+
+    /// `f = 1 + ½ a (x - x*)²` with an information `κ` that understates the curvature `a`: the
+    /// plain Fisher step overshoots, so the Levenberg ridge climbs until a step descends and
+    /// the *accepted* step is damped.
+    fn understated(a: f64, x_star: f64) -> impl Fn(&[f64]) -> Option<ValueGradInfo> {
+        move |v: &[f64]| {
+            Some(ValueGradInfo {
+                val: 1.0 + 0.5 * a * (v[0] - x_star).powi(2),
+                grad: vec![a * (v[0] - x_star)],
+                info: vec![1.0],
+            })
+        }
+    }
+
+    /// The tolerance is tested on the undamped step. With the information 100x too small the
+    /// ridge settles near 10-100 and is carried into every iteration: at `x = 3.1e-4` the
+    /// carried-ridge step predicts `4.4e-5`, inside `ftol_rel = 1e-4`, while the plain Fisher
+    /// step predicts `4.9e-4`, outside it — that point is not converged. Measured on this
+    /// fixture: the carried-ridge test stopped at `3.13e-4`; the undamped test ends at `3.1e-6`.
+    #[test]
+    fn a_ridge_carried_over_does_not_declare_convergence() {
+        let f = understated(100.0, 0.0);
+        let mut x = [0.0316];
+        let (out, _) = solve(&mut x, &[-9.0], &[9.0], 1000, 1e-4, f);
+        assert_eq!(out, Converged);
+        assert!(
+            x[0].abs() < 1e-4,
+            "stopped at {x:?}, a point still worth a pass"
+        );
+        // Non-vacuity: it did take the damped steps (the start was 316x further out).
+        assert!(x[0].abs() < 0.0316 / 10.0, "{x:?}");
+    }
+
+    /// A damped accepted step's small decrease says how short the step was, not how little is
+    /// left. The first 12 trials are rejected, so the step that is accepted carries ridge
+    /// `1e2` and decreases `f` by `1e-4`, inside `ftol_rel = 1e-3`; the point it lands on (`x =
+    /// 0.099` of a quadratic whose plain step would predict `4.9e-3`) is far from converged.
+    #[test]
+    fn a_damped_accepted_step_does_not_end_the_solve_on_its_small_decrease() {
+        let f = understated(1.0, 0.0);
+        let rejected = std::cell::Cell::new(0u32);
+        let mut x = [0.1];
+        let (out, _) = fisher_scoring(
+            &mut x,
+            &[-9.0],
+            &[9.0],
+            1000,
+            1e-3,
+            |v| {
+                rejected.set(rejected.get() + 1);
+                if rejected.get() <= 12 {
+                    f64::INFINITY
+                } else {
+                    f(v).unwrap().val
+                }
+            },
+            &f,
+        );
+        assert_eq!(out, Converged);
+        assert!(
+            rejected.get() > 13,
+            "the damped step was taken and not the last"
+        );
+        assert!(x[0].abs() < 0.05, "stopped at {x:?}, far from converged");
+    }
+
+    /// One budget: every pass is one evaluation, the count is returned, and the solve never
+    /// goes past `maxeval` — the pass for derivatives at an accepted point included.
+    #[test]
+    fn the_evaluations_spent_are_counted_and_never_exceed_the_budget() {
+        for maxeval in 1..=12u32 {
+            let mut x = [1.5, -0.4];
+            let (_, calls) = solve(&mut x, &[-9.0; 2], &[9.0; 2], maxeval, 1e-15, exp_fit);
+            assert!(calls <= maxeval, "budget {maxeval}: {calls} passes");
+        }
+    }
+
+    /// The Cholesky solve: a positive-definite block is solved, a ridge turns a singular block
+    /// into a solvable one, and a block that is not positive definite — or not finite — is
+    /// `None` rather than a step.
+    #[test]
+    fn the_cholesky_solve_is_none_unless_the_block_is_positive_definite() {
+        // [[4, 2], [2, 3]] s = [2, 1]  =>  s = [0.5, 0].
+        let a = [4.0, 2.0, 2.0, 3.0];
+        let s = cholesky_solve(&a, 2, 0.0, &[2.0, 1.0]).unwrap();
+        assert!((s[0] - 0.5).abs() < 1e-14 && s[1].abs() < 1e-14, "{s:?}");
+        // The ridge is added to the diagonal: (A + 1·I) s = [2, 1]  =>  [0.35, 0.05]·… by hand.
+        let r = cholesky_solve(&a, 2, 1.0, &[2.0, 1.0]).unwrap();
+        // [[5, 2], [2, 4]]: det 16, s = [(2*4 - 1*2)/16, (5*1 - 2*2)/16].
+        assert!((r[0] - 6.0 / 16.0).abs() < 1e-14 && (r[1] - 1.0 / 16.0).abs() < 1e-14);
+        // Singular: no solve at ridge 0, one with a ridge.
+        let sing = [1.0, 1.0, 1.0, 1.0];
+        assert!(cholesky_solve(&sing, 2, 0.0, &[1.0, 1.0]).is_none());
+        assert!(cholesky_solve(&sing, 2, 1e-6, &[1.0, 1.0]).is_some());
+        // Indefinite and non-finite.
+        assert!(cholesky_solve(&[1.0, 2.0, 2.0, 1.0], 2, 0.0, &[1.0, 1.0]).is_none());
+        assert!(cholesky_solve(&[f64::NAN], 1, 0.0, &[1.0]).is_none());
+        assert!(cholesky_solve(&[f64::NEG_INFINITY], 1, 0.0, &[1.0]).is_none());
+    }
+
+    /// The tally counts what each solve did, and its warning names each cause with the other's
+    /// negative: a solve that lost its information is not a stall, and a stall is not a loss.
+    #[test]
+    fn the_tally_names_a_lost_information_and_a_stall_apart() {
+        let tally = NewtonTally::default();
+        assert!(tally.warning("IMP").is_none(), "nothing ran");
+        let quad = understated(1.0, 3.0);
+        let run = |x0: f64, fused: &dyn Fn(&[f64]) -> Option<ValueGradInfo>| {
+            let mut x = [x0];
+            newton_solve(
+                &mut x,
+                &[-9.0],
+                &[9.0],
+                100,
+                1e-12,
+                |v| quad(v).unwrap().val,
+                fused,
+                Some(&tally),
+            )
+        };
+        // Converged on its own: counted as a solve, not as a hand-over.
+        assert!(run(2.9, &quad).converged);
+        assert!(tally.warning("IMP").is_none());
+        // A subject's information unavailable at the start: lost.
+        let declined = run(2.9, &|_| None);
+        assert!(!declined.converged && declined.evals == 0);
+        let w = tally.warning("IMP").expect("a lost solve");
+        assert!(
+            w.starts_with("IMP:")
+                && w.contains("1 of 2")
+                && w.contains("lost the expected information"),
+            "{w}"
+        );
+        assert!(!w.contains("no admissible"), "{w}");
+        // An information that does not factor at any ridge: a stall, not a loss.
+        let nan_info = |v: &[f64]| {
+            Some(ValueGradInfo {
+                val: 0.5 * (v[0] - 3.0).powi(2),
+                grad: vec![v[0] - 3.0],
+                info: vec![f64::NAN],
+            })
+        };
+        assert!(!run(2.9, &nan_info).converged);
+        let w = tally.warning("IMP").unwrap();
+        assert!(
+            w.contains("2 of 3") && w.contains("1 lost the expected information"),
+            "{w}"
+        );
+        assert!(w.contains("1 found no admissible damped step"), "{w}");
     }
 
     #[test]

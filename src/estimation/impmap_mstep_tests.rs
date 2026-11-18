@@ -150,6 +150,7 @@ impl WideSolve {
             maxiter,
             &vec![false; self.theta.len()],
             optimizer,
+            None,
         )
     }
 
@@ -794,7 +795,8 @@ fn weighted_gradient_gap(model: &CompiledModel, pop: &Population, scale: f64, h:
     };
     let (th, sg) = natural(&x);
     let score = weighted_mstep_score(
-        model, pop, &draws, &th, &sg, &mask, &lower, &upper, n_theta, n_sigma, false, None,
+        model, pop, &draws, &schedules, &th, &sg, &mask, &lower, &upper, n_theta, n_sigma, false,
+        None,
     )
     .expect("a score without the information always exists");
     let (v, g) = (score.val, score.grad);
@@ -1027,6 +1029,7 @@ fn the_memoised_weighted_objective_is_the_plain_one_bit_for_bit() {
             &w.model,
             &w.pop,
             &w.draws,
+            &w.schedules,
             &th,
             &sg,
             &mask,
@@ -1068,16 +1071,18 @@ fn the_memoised_weighted_objective_is_the_plain_one_bit_for_bit() {
 /// weighted solve acts on each: `Converged` is the answer (route `newton`); a start without
 /// information (`Declined`) and a solve that loses it after one accepted step (`Stalled`) both
 /// continue with BOBYQA — from the start, and from the point Newton reached — and the
-/// continuation is exactly BOBYQA's solve from there, not the start-point `x` Newton left.
+/// continuation is exactly BOBYQA's solve from there, with **what Newton left of the one
+/// evaluation budget**, not the start-point `x` Newton left nor a fresh budget.
 #[test]
 fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_stopped() {
-    use crate::estimation::mstep_newton::FUSED_PASSES_ALLOWED;
+    use crate::estimation::mstep_newton::{NewtonOutcome, FUSED_PASSES_ALLOWED};
     use crate::estimation::saem::MSTEP_ROUTE;
     use crate::types::MstepOptimizer::{Bobyqa, Newton};
     let w = WideSolve::new();
     let n_sigma = w.log_sigma.len();
     let n_theta = w.theta.len();
     let n = n_theta + n_sigma;
+    let budget = 4 * (n as u32 + 1);
     let x0: Vec<f64> = w.theta.iter().chain(&w.log_sigma).copied().collect();
     let lower: Vec<f64> = w
         .theta_lower
@@ -1101,6 +1106,7 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
             &w.model,
             &w.pop,
             &w.draws,
+            &w.schedules,
             &xv[..n_theta],
             &sg,
             &mask,
@@ -1112,7 +1118,7 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
             None,
         )
     };
-    let solve = |from: &[f64], optimizer, passes: Option<u32>| {
+    let solve = |from: &[f64], optimizer, passes: Option<u32>, maxeval: u32| {
         MSTEP_ROUTE.with(|c| c.set([0; 3]));
         FUSED_PASSES_ALLOWED.set(passes);
         let f: &dyn Fn(&[f64]) -> Option<ValueGradInfo> = &fused;
@@ -1122,9 +1128,10 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
             &lower,
             &upper,
             n_theta,
-            4,
+            maxeval,
             optimizer,
             (optimizer == Newton).then_some(f),
+            None,
         );
         FUSED_PASSES_ALLOWED.set(None);
         (MSTEP_ROUTE.with(|c| c.get()), step)
@@ -1133,44 +1140,94 @@ fn a_newton_solve_that_does_not_converge_continues_with_bobyqa_from_where_it_sto
         s.log_theta.iter().chain(&s.log_sigma).copied().collect()
     };
     // Converged: Newton's own answer, and not BOBYQA's.
-    let (route, newton) = solve(&x0, Newton, None);
+    let (route, newton) = solve(&x0, Newton, None, budget);
     assert_eq!(route, [0, 0, 1]);
-    // Declined at the start (no fused pass): BOBYQA from `x0`, exactly.
-    let (route, declined) = solve(&x0, Newton, Some(0));
-    let (_, bobyqa0) = solve(&x0, Bobyqa, None);
+    // Declined at the start (no fused pass): BOBYQA from `x0`, exactly, with the whole budget
+    // (a declined pass spent none).
+    let (route, declined) = solve(&x0, Newton, Some(0), budget);
+    let (_, bobyqa0) = solve(&x0, Bobyqa, None, budget);
     assert_eq!(route, [1, 0, 0]);
     assert_eq!(packed(&declined), packed(&bobyqa0));
     assert!(
         packed(&declined) != packed(&newton),
         "fixture: the routes must differ"
     );
-    // Stalled after one accepted step: BOBYQA from the point Newton reached.
+    // Stalled after one accepted step: BOBYQA from the point Newton reached, with the
+    // evaluations it did not spend.
     let mut x1 = x0.clone();
     FUSED_PASSES_ALLOWED.set(Some(1));
-    let outcome = crate::estimation::mstep_newton::fisher_scoring(
+    let (outcome, spent) = crate::estimation::mstep_newton::fisher_scoring(
         &mut x1,
         &lower,
         &upper,
-        4 * (n as u32 + 1),
+        budget,
         MSTEP_FTOL_REL,
         |xv| obj(xv, None, &mut ()),
         &fused,
     );
     FUSED_PASSES_ALLOWED.set(None);
-    assert_eq!(outcome, NewtonOutcome::Stalled);
+    assert_eq!(outcome, NewtonOutcome::Lost);
     assert!(x1 != x0, "Newton took a step before it stalled");
-    let (route, stalled) = solve(&x0, Newton, Some(1));
-    let (_, bobyqa1) = solve(&x1, Bobyqa, None);
+    assert!(
+        spent > 0 && spent < budget,
+        "fixture: Newton spent {spent} of {budget}"
+    );
+    let (route, stalled) = solve(&x0, Newton, Some(1), budget);
+    let (_, bobyqa1) = solve(&x1, Bobyqa, None, budget - spent);
     assert_eq!(route, [1, 0, 0]);
     assert_eq!(
         packed(&stalled),
         packed(&bobyqa1),
-        "BOBYQA continued from Newton's point"
+        "BOBYQA continued from Newton's point with the remainder of the budget"
     );
     assert!(
         packed(&stalled) != packed(&bobyqa0),
         "and not from the start"
     );
+    // Non-vacuity of the budget: a fresh budget from the same point is another solve (BOBYQA
+    // is far from converged at this size), so the remainder is what was used.
+    let (_, fresh) = solve(&x1, Bobyqa, None, budget);
+    assert!(
+        packed(&stalled) != packed(&fresh),
+        "fixture: the remainder must differ from a fresh budget"
+    );
+    // A budget Newton spends whole leaves BOBYQA none (NLopt reads 0 as no limit): the solve
+    // ends at Newton's point, whatever it is.
+    let (route, spent_all) = solve(&x0, Newton, Some(1), spent);
+    assert_eq!(route, [1, 0, 0]);
+    assert_eq!(
+        packed(&spent_all),
+        x1,
+        "no budget left: Newton's point stands"
+    );
+}
+
+/// What a weighted M-step keeps in memory is decided by the optimizer, not only by the solve's
+/// structure: the memo is `subjects × samples × n_obs` numbers (`imp_samples` is 1000 by
+/// default), so the derivative-free default keeps none even where every evaluation could be
+/// served from one (a σ-only solve, the pinned θ here). The opt-in gradient solvers keep it
+/// where an evaluation can repeat a θ: `newton` for the pinned-θ solve and for the free-θ one
+/// (whose value pass and fused pass share a point), `lbfgs` for the pinned-θ solve only — with
+/// a free θ it never sees one twice.
+#[test]
+fn only_an_opt_in_gradient_weighted_mstep_keeps_predictions() {
+    use crate::estimation::pred_memo::OPENED;
+    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs, Newton};
+    let mut pinned = WideSolve::new();
+    pinned.theta_lower = pinned.theta.clone();
+    pinned.theta_upper = pinned.theta.clone();
+    let free = WideSolve::new();
+    let opened = |w: &WideSolve, optimizer| {
+        OPENED.with(|c| c.set(0));
+        w.solve_with(1, optimizer);
+        OPENED.with(|c| c.get())
+    };
+    assert_eq!(opened(&pinned, Bobyqa), 0, "bobyqa, σ-only");
+    assert_eq!(opened(&free, Bobyqa), 0, "bobyqa, free θ");
+    assert_eq!(opened(&pinned, Lbfgs), 1, "lbfgs, σ-only");
+    assert_eq!(opened(&free, Lbfgs), 0, "lbfgs, free θ visits no θ twice");
+    assert_eq!(opened(&pinned, Newton), 1, "newton, σ-only");
+    assert_eq!(opened(&free, Newton), 1, "newton, free θ");
 }
 
 /// The test hook counts a weighted M-step once, however many branches of the solve read it:

@@ -176,6 +176,32 @@ fn maximiser_with(
     maxiter: u32,
     scale_params: bool,
 ) -> (Vec<f64>, Vec<f64>) {
+    maximiser_tallied(
+        model,
+        population,
+        p,
+        etas,
+        extra,
+        optimizer,
+        maxiter,
+        scale_params,
+        None,
+    )
+}
+
+/// [`maximiser_with`] recording what its Newton solve did in `tally`.
+#[allow(clippy::too_many_arguments)]
+fn maximiser_tallied(
+    model: &CompiledModel,
+    population: &Population,
+    p: &Packed,
+    etas: &[Vec<f64>],
+    extra: &[Vec<Vec<f64>>],
+    optimizer: crate::types::MstepOptimizer,
+    maxiter: u32,
+    scale_params: bool,
+    tally: Option<&crate::estimation::mstep_newton::NewtonTally>,
+) -> (Vec<f64>, Vec<f64>) {
     theta_sigma_mstep_light(
         model,
         population,
@@ -196,6 +222,7 @@ fn maximiser_with(
         &[],
         extra,
         optimizer,
+        tally,
     )
 }
 
@@ -1518,7 +1545,8 @@ fn lbfgs_mstep_at_the_production_budget_captures_the_converged_gain() {
 #[test]
 fn the_lbfgs_advisory_names_its_cause() {
     use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
-    let advisory = |o, sa, exact, label| resolve_mstep_optimizer_for(o, sa, exact, None, label).1;
+    let advisory =
+        |o, sa, exact, label| resolve_mstep_optimizer_for(o, sa, exact, None, true, label).1;
     assert!(advisory(Bobyqa, false, false, "SAEM").is_none());
     assert!(advisory(Bobyqa, true, false, "SAEM").is_none());
     assert!(advisory(Lbfgs, false, true, "SAEM").is_none());
@@ -1535,7 +1563,7 @@ fn the_lbfgs_advisory_names_its_cause() {
     );
     // The production wrapper reads the adjoint's scope: an analytic two-compartment model is in it.
     let model = no_eta_theta_model();
-    let prod = |sa| resolve_mstep_optimizer(&model, Lbfgs, sa, false, "SAEM");
+    let prod = |sa| resolve_mstep_optimizer(&model, Lbfgs, sa, false, true, "SAEM");
     assert_eq!(prod(false), (Lbfgs, None));
     assert!(prod(true).1.is_some());
 }
@@ -1726,7 +1754,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     ] {
         let gap = newton_scope_gap(model, mixture).unwrap_or_else(|| panic!("{label}: no gap"));
         assert!(gap.contains(reasons[want]), "{label}: {gap}");
-        let (opt, warning) = resolve_mstep_optimizer(model, Newton, false, mixture, "IMP");
+        let (opt, warning) = resolve_mstep_optimizer(model, Newton, false, mixture, true, "IMP");
         let w = warning.unwrap_or_else(|| panic!("{label}: silent"));
         assert_eq!(opt, Bobyqa, "{label}");
         assert!(
@@ -1747,14 +1775,14 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     // Inside it — a closed form, IOV (the adjoint records the stacked `[η | κ]`), FREM — newton
     // is the optimizer, with no warning.
     assert_eq!(
-        resolve_mstep_optimizer(&plain, Newton, false, false, "SAEM"),
+        resolve_mstep_optimizer(&plain, Newton, false, false, true, "SAEM"),
         (Newton, None)
     );
     assert_eq!(newton_scope_gap(&iov_model(), false), None);
     assert_eq!(newton_scope_gap(&frem_model(), false), None);
     // `score_sa` replaces the numerical solve: the option has nothing to act on, and says that
     // (not a scope reason).
-    let (opt, w) = resolve_mstep_optimizer(&plain, Newton, true, false, "SAEM");
+    let (opt, w) = resolve_mstep_optimizer(&plain, Newton, true, false, true, "SAEM");
     let w = w.expect("score_sa");
     assert!(
         opt == Bobyqa
@@ -1765,7 +1793,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     );
     // Bobyqa and lbfgs are not Newton's to change.
     assert_eq!(
-        resolve_mstep_optimizer(&m3, Bobyqa, false, true, "SAEM"),
+        resolve_mstep_optimizer(&m3, Bobyqa, false, true, true, "SAEM"),
         (Bobyqa, None)
     );
     assert_eq!(
@@ -1773,6 +1801,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
             &plain,
             crate::types::MstepOptimizer::Lbfgs,
             false,
+            true,
             true,
             "SAEM"
         )
@@ -1812,6 +1841,264 @@ fn a_stalled_newton_mstep_continues_with_bobyqa() {
             "{passes} pass(es): {gap:.3e} from the maximiser"
         );
     }
+}
+
+/// One budget, and the continuation is a continuation. A Newton solve that stalls after one
+/// accepted step hands BOBYQA its point (`x.copy_from_slice(&xn)`) *and* the evaluations it
+/// did not spend, so the whole M-step costs `maxiter·(n+1)` and no more. With a budget of 6
+/// (`maxiter = 1`, `n = 5`) Newton spends three passes (fused, value, the fused pass that
+/// declines) and BOBYQA — which needs 11 evaluations for its first design — spends the other
+/// three: the evaluation count says the budget was shared (a fresh budget makes it 9), and the
+/// objective reached says where BOBYQA started (from the start point it returns exactly what
+/// BOBYQA alone returns from three evaluations; from Newton's point it is a little further).
+#[test]
+fn a_stalled_newton_mstep_continues_from_its_point_within_one_budget() {
+    use crate::estimation::mstep_newton::FUSED_PASSES_ALLOWED;
+    use crate::estimation::saem::MSTEP_EVALS;
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let start = (p.log_theta.clone(), p.log_sigma.clone());
+    let budget = 6u32; // maxiter 1 × (n + 1), n = 4 θ + 1 σ
+    let run = |optimizer, passes: Option<u32>| {
+        MSTEP_ROUTE.with(|c| c.set([0; 3]));
+        MSTEP_EVALS.with(|c| c.set(0));
+        FUSED_PASSES_ALLOWED.set(passes);
+        let got = maximiser_with(&model, &population, &p, &draws[0], &[], optimizer, 1, false);
+        FUSED_PASSES_ALLOWED.set(None);
+        (
+            MSTEP_ROUTE.with(|c| c.get()),
+            MSTEP_EVALS.with(|c| c.get()),
+            got,
+        )
+    };
+    let (route, evals, stalled) = run(Newton, Some(1));
+    assert_eq!(route, [1, 0, 0], "BOBYQA continued");
+    assert!(
+        evals <= budget,
+        "Newton and its continuation spent {evals} evaluations of a budget of {budget}"
+    );
+    // Where it continued from, read off the objective it reaches: the share of the gain the
+    // converged maximiser offers.
+    let f_of =
+        |x: &(Vec<f64>, Vec<f64>)| conditional_objective(&model, &population, &draws[0], &[], x);
+    let (f_start, f_ref) = (f_of(&start), f_of(&reference));
+    let captured = |x: &(Vec<f64>, Vec<f64>)| (f_start - f_of(x)) / (f_start - f_ref);
+    let c_stalled = captured(&stalled);
+    eprintln!("stalled newton + bobyqa captured {c_stalled:.4} of the gain");
+    // Control: BOBYQA alone on this budget does not get there.
+    let (route, evals, alone) = run(Bobyqa, None);
+    assert_eq!(route, [1, 0, 0]);
+    assert!(evals > 0 && evals <= budget, "{evals}");
+    let c_alone = captured(&alone);
+    eprintln!("bobyqa alone, same budget, captured {c_alone:.4} of the gain");
+    // Measured on this fixture (Linux): 0.2030 against 0.1865. A continuation from the start
+    // instead of Newton's point returns exactly BOBYQA's three evaluations from the start, the
+    // same 0.1865 — Newton's step is the whole difference.
+    assert!(
+        c_stalled > c_alone + 0.01,
+        "stalled Newton + BOBYQA captured {c_stalled}, BOBYQA alone {c_alone}: the continuation \
+         must start from Newton's point"
+    );
+}
+
+/// What a fit's Newton solves did reaches its warnings: a solve that loses the information (the
+/// hook spends the fused passes at the start) is counted and named, with the other cause's
+/// negative; solves that converge leave no warning.
+#[test]
+fn a_newton_solve_that_loses_its_information_is_reported_by_the_fit() {
+    use crate::estimation::mstep_newton::{NewtonTally, FUSED_PASSES_ALLOWED};
+    use crate::types::MstepOptimizer::Newton;
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let tally = NewtonTally::default();
+    let _ = maximiser_tallied(
+        &model,
+        &population,
+        &p,
+        &draws[0],
+        &[],
+        Newton,
+        10,
+        false,
+        Some(&tally),
+    );
+    assert!(tally.warning("SAEM").is_none(), "converged: nothing to say");
+    FUSED_PASSES_ALLOWED.set(Some(0));
+    let _ = maximiser_tallied(
+        &model,
+        &population,
+        &p,
+        &draws[0],
+        &[],
+        Newton,
+        10,
+        false,
+        Some(&tally),
+    );
+    FUSED_PASSES_ALLOWED.set(None);
+    let w = tally
+        .warning("SAEM")
+        .expect("one solve lost its information");
+    assert!(
+        w.contains("handed 1 of 2 numerical M-steps")
+            && w.contains("lost the expected information"),
+        "{w}"
+    );
+    assert!(!w.contains("no admissible"), "{w}");
+    // The fit reports it: every Newton solve of a SAEM fit declines under the hook.
+    let mut opts = crate::types::FitOptions::default();
+    opts.method = crate::types::EstimationMethod::Saem;
+    opts.saem_n_exploration = 3;
+    opts.saem_n_convergence = 2;
+    opts.saem_seed = Some(7);
+    opts.run_covariance_step = false;
+    opts.mstep_optimizer = Newton;
+    let fit = |hook: Option<u32>| {
+        FUSED_PASSES_ALLOWED.set(hook);
+        let res = run_saem(&model, &population, &model.default_params, &opts);
+        FUSED_PASSES_ALLOWED.set(None);
+        res.expect("SAEM fit").warnings
+    };
+    let declined = fit(Some(0));
+    assert!(
+        declined
+            .iter()
+            .any(|w| w.starts_with("SAEM:") && w.contains("lost the expected information")),
+        "{declined:?}"
+    );
+    let clean = fit(None);
+    assert!(
+        !clean
+            .iter()
+            .any(|w| w.contains("lost the expected information")),
+        "{clean:?}"
+    );
+}
+
+/// An ODE one-compartment fixture the adjoint declines at run time (no compiled readout
+/// program), so the θ score of a fit on it is a forward difference. `v_expr` makes V either
+/// mu-referenced (`TVV * exp(ETA_V)`: every θ is the closed-form step's, a σ-only numerical
+/// M-step) or a plain θ the numerical M-step must estimate (`TVV`).
+fn declined_ode_model(v_expr: &str) -> CompiledModel {
+    let src = format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma EPS ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = {v_expr}\n\
+         [structural_model]\n  ode(states=[central])\n[odes]\n  \
+         d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n\
+         [error_model]\n  DV ~ proportional(EPS)\n"
+    );
+    let mut model = parse_model_string(&src).expect("ode fixture parses");
+    model.ode_spec.as_mut().unwrap().readout_program = None;
+    assert!(
+        !crate::sens::ode_provider::adjoint::recorder_in_scope(&model),
+        "premise: the adjoint declines this model"
+    );
+    model
+}
+
+fn declined_ode_population(n: usize) -> Population {
+    use crate::types::{DoseEvent, Subject};
+    let times = [0.5f64, 1.5, 4.0, 9.0, 20.0];
+    let mut st = 0x2931_u64;
+    let subjects: Vec<Subject> = (0..n)
+        .map(|i| {
+            let cl = 1.0 * (0.3 * lcg(&mut st)).exp();
+            let v = 10.0 * (0.2 * lcg(&mut st)).exp();
+            let obs: Vec<f64> = times
+                .iter()
+                .map(|t| 100.0 / v * (-(cl / v) * t).exp() * (1.0 + 0.04 * lcg(&mut st)))
+                .collect();
+            Subject {
+                id: format!("{}", i + 1),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                dose_occasions: vec![1],
+                occasions: vec![1; times.len()],
+                obs_times: times.to_vec(),
+                observations: obs,
+                obs_cmts: vec![1; times.len()],
+                cens: vec![0; times.len()],
+                ..Default::default()
+            }
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+/// The `lbfgs` forward-difference advisory is for a solve that has a θ to differentiate: a
+/// model the adjoint declines, fitted with every θ owned by the closed-form step (a σ-only
+/// numerical M-step, whose σ score is exact), has nothing to say; the same model with a θ the
+/// closed form does not own is the case the advisory is for. Each side of the gate, on SAEM
+/// and on IMP (whose gate reads its own closed-form set), with the other's negative.
+#[test]
+fn the_lbfgs_advisory_needs_a_theta_for_the_solve_to_differentiate() {
+    use crate::types::EstimationMethod::{Imp, Saem};
+    use crate::types::MstepOptimizer::Lbfgs;
+    let pop = declined_ode_population(8);
+    let advisory = |method, v_expr: &str| -> bool {
+        let model = declined_ode_model(v_expr);
+        let mut opts = crate::types::FitOptions::default();
+        opts.method = method;
+        opts.saem_n_exploration = 2;
+        opts.saem_n_convergence = 1;
+        opts.saem_seed = Some(3);
+        opts.imp_iterations = 2;
+        opts.imp_samples = 20;
+        opts.imp_auto = false;
+        opts.imp_seed = Some(3);
+        opts.run_covariance_step = false;
+        opts.mstep_optimizer = Lbfgs;
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{method:?} {v_expr}: {e}"));
+        res.warnings
+            .iter()
+            .any(|w| w.contains("running without an exact θ gradient"))
+    };
+    for method in [Saem, Imp] {
+        assert!(
+            !advisory(method, "TVV * exp(ETA_V)"),
+            "{method:?}: a σ-only solve has no θ score to be a forward difference"
+        );
+        assert!(
+            advisory(method, "TVV"),
+            "{method:?}: a θ the numerical M-step estimates is differenced"
+        );
+    }
+}
+
+/// The unit cases of the same gate: `theta_free` is the only thing that silences the advisory
+/// for a model out of the adjoint's scope, and an in-scope model is silent either way.
+#[test]
+fn the_lbfgs_advisory_gate_and_the_free_theta_predicate() {
+    use crate::types::MstepOptimizer::Lbfgs;
+    let advisory =
+        |exact, free| resolve_mstep_optimizer_for(Lbfgs, false, exact, None, free, "IMP").1;
+    assert!(advisory(false, true).is_some());
+    assert!(
+        advisory(false, false).is_none(),
+        "no θ free: nothing differenced"
+    );
+    assert!(advisory(true, true).is_none());
+    assert!(advisory(true, false).is_none());
+    // Free: not FIXed and not owned by a closed-form step.
+    assert!(mstep_has_free_theta(3, &[false; 3], &[0, 1]));
+    assert!(!mstep_has_free_theta(3, &[false; 3], &[0, 1, 2]));
+    assert!(!mstep_has_free_theta(3, &[false, false, true], &[0, 1]));
+    assert!(mstep_has_free_theta(3, &[false, false, true], &[0]));
+    assert!(!mstep_has_free_theta(0, &[], &[]));
 }
 
 /// The value path with a prediction memo is the memo-free `obs_nll_sum` bit for bit, serves an

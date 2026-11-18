@@ -23,6 +23,13 @@
 //!
 //! The memo returns exactly what the caller's own predictor returned the first time, so a
 //! solve that uses it scores bit-for-bit what the same solve without it does.
+//!
+//! What it holds is `n_obs` numbers per *scored* `(subject, sample)` — a sample nothing asks
+//! for (a zero importance weight) takes no space — which for SAEM (one η draw per subject,
+//! `mstep_draws` at most) is the size of the data, and for IMP/IMPMAP (`imp_samples` per
+//! subject, 1000 by default) is several times what the estimator itself holds. Which solves
+//! pay that is the caller's decision: IMP/IMPMAP open a memo under the opt-in gradient
+//! solvers (`mstep_optimizer = newton | lbfgs`) only, never under the default.
 
 use std::ops::{Deref, Range};
 use std::sync::{Mutex, MutexGuard};
@@ -42,15 +49,28 @@ struct ThetaKey {
     generation: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Memos opened on this thread (test builds): what a test reads to see whether a solve
+    /// kept predictions at all.
+    pub(crate) static OPENED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks a sample whose predictions are not stored for the current generation.
+const NOT_STORED: u32 = u32::MAX;
+
 /// One subject's predictions for each of its samples, in one buffer.
 pub(crate) struct SubjectPreds {
-    /// The [`ThetaKey`] generation the `filled` flags belong to.
+    /// The [`ThetaKey`] generation `start` and `data` belong to.
     generation: u64,
     /// Predictions per sample, known once the first one is stored.
     n_obs: Option<usize>,
-    /// Which samples hold predictions for the current generation.
-    filled: Vec<bool>,
-    /// `filled.len() × n_obs` predictions, sample-major; allocated at the first store.
+    /// Where each sample's predictions start in `data` for the current generation, or
+    /// [`NOT_STORED`].
+    start: Vec<u32>,
+    /// The predictions of the samples scored so far, `n_obs` each, in the order they were first
+    /// scored. A sample nothing scores (a zero importance weight) takes no space, and the
+    /// buffer's size is the scored samples' — never the sample count's.
     data: Vec<f64>,
 }
 
@@ -76,6 +96,8 @@ impl PredMemo {
             (true, true) => MemoMode::Track,
             (true, false) => return None,
         };
+        #[cfg(test)]
+        OPENED.with(|c| c.set(c.get() + 1));
         Some(Self {
             mode,
             key: Mutex::new(ThetaKey {
@@ -88,12 +110,22 @@ impl PredMemo {
                     Mutex::new(SubjectPreds {
                         generation: 0,
                         n_obs: None,
-                        filled: vec![false; k],
+                        start: vec![NOT_STORED; k],
                         data: Vec::new(),
                     })
                 })
                 .collect(),
         })
+    }
+
+    /// Samples of `subject` whose predictions are stored (test builds): what a short-circuit
+    /// test reads to see which samples were scored.
+    #[cfg(test)]
+    pub(crate) fn scored(&self, subject: usize) -> usize {
+        let g = self.subjects[subject]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        g.start.iter().filter(|&&s| s != NOT_STORED).count()
     }
 
     /// Open one evaluation at `theta`: the one place the θ key is read. `None` — evaluate
@@ -178,25 +210,32 @@ pub(crate) fn memoized<'a>(
         .unwrap_or_else(|e| e.into_inner());
     if g.generation != s.eval.generation {
         g.generation = s.eval.generation;
-        g.filled.iter_mut().for_each(|f| *f = false);
+        g.start.fill(NOT_STORED);
+        g.data.clear();
     }
-    if !g.filled[s.sample] {
+    if g.start[s.sample] == NOT_STORED {
         let preds = compute();
         let n_obs = *g.n_obs.get_or_insert(preds.len());
-        if n_obs != preds.len() {
-            // Predictions of another length than the subject's first: not storable.
+        let at = g.data.len();
+        if n_obs != preds.len() || at + n_obs >= NOT_STORED as usize {
+            // Predictions of another length than the subject's first, or a buffer past what
+            // a start can address: not storable.
             return Preds::Owned(preds);
         }
-        if g.data.is_empty() {
-            let len = g.filled.len() * n_obs;
-            g.data.resize(len, 0.0);
+        if g.data.capacity() == 0 {
+            // Exactly what scoring every sample would take, reserved (not touched) at once:
+            // the buffer then never doubles, so its footprint is the scored samples' and
+            // not up to twice that with a copy of it during each growth.
+            let all = g.start.len() * n_obs;
+            g.data.reserve_exact(all);
         }
-        g.data[s.sample * n_obs..(s.sample + 1) * n_obs].copy_from_slice(&preds);
-        g.filled[s.sample] = true;
+        g.data.extend_from_slice(&preds);
+        g.start[s.sample] = at as u32;
     }
     let n_obs = g.n_obs.unwrap_or(0);
+    let at = g.start[s.sample] as usize;
     Preds::Stored {
-        range: s.sample * n_obs..(s.sample + 1) * n_obs,
+        range: at..at + n_obs,
         guard: g,
     }
 }
@@ -295,5 +334,38 @@ mod tests {
         drop(kept);
         let fresh = memoized(Some(ev.slot(0, 1)), || vec![3.0, 4.0]);
         assert_eq!(fresh.to_vec(), [3.0, 4.0]);
+    }
+
+    /// What the memo holds is the scored samples', not the sample count's: a subject with 1000
+    /// samples of which two are scored (the rest carry a zero weight and nothing asks for
+    /// them) holds two samples of predictions, and a θ move empties it again. Each sample is
+    /// served from its own place whatever order they were first scored in.
+    #[test]
+    fn only_the_scored_samples_take_space() {
+        let memo = PredMemo::for_solve([1000usize], true, true).unwrap();
+        let held = || memo.subjects[0].lock().unwrap().data.len();
+        let ev = memo.begin(&[1.0]).unwrap();
+        assert_eq!(held(), 0, "nothing is allocated before a sample is scored");
+        memoized(Some(ev.slot(0, 700)), || vec![7.0, 7.5, 8.0]);
+        memoized(Some(ev.slot(0, 3)), || vec![3.0, 3.5, 4.0]);
+        assert_eq!(held(), 2 * 3);
+        let capacity = memo.subjects[0].lock().unwrap().data.capacity();
+        assert!(
+            (1000 * 3..1000 * 3 + 3).contains(&capacity),
+            "reserved once for the sample count, not grown by doubling: {capacity}"
+        );
+        assert_eq!(
+            memoized(Some(ev.slot(0, 700)), || unreachable!()).to_vec(),
+            [7.0, 7.5, 8.0]
+        );
+        assert_eq!(
+            memoized(Some(ev.slot(0, 3)), || unreachable!()).to_vec(),
+            [3.0, 3.5, 4.0]
+        );
+        assert_eq!(held(), 2 * 3, "a hit stores nothing");
+        // A moved θ starts the buffer over: one sample scored, one sample held.
+        let moved = memo.begin(&[2.0]).unwrap();
+        memoized(Some(moved.slot(0, 5)), || vec![5.0, 5.5, 6.0]);
+        assert_eq!(held(), 3);
     }
 }

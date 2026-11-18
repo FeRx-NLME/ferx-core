@@ -52,7 +52,7 @@ use crate::estimation::inner_optimizer::{
     InnerLoopStats,
 };
 use crate::estimation::mstep_newton::{
-    finite_value, fisher_scoring, fold_value_grad_info, nlopt_value_and_grad, NewtonOutcome,
+    finite_value, fold_value_grad_info, newton_solve, nlopt_value_and_grad, NewtonTally,
     ValueGradInfo,
 };
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
@@ -1811,17 +1811,6 @@ fn run_mcem(
     for n in &cov_mu_notes {
         warnings.push(format!("{label}: {n}"));
     }
-    // The optimizer the weighted M-steps run, decided once (`newton_scope_gap`): what the
-    // warning says is what every solve below is handed.
-    let (mstep_optimizer, mstep_optimizer_warning) =
-        crate::estimation::saem::resolve_mstep_optimizer(
-            model,
-            options.mstep_optimizer,
-            false,
-            false,
-            label,
-        );
-    warnings.extend(mstep_optimizer_warning);
     // Every member's eta (#1620): see the SAEM twin in `run_saem`.
     let cov_group_etas: Vec<usize> =
         crate::estimation::covariate_mu_ref::group_etas(&cov_mu_groups);
@@ -1942,6 +1931,29 @@ fn run_mcem(
     let use_closed_form = mu_ref_pairs
         .iter()
         .any(|&(t, _e)| !weak_mu_ref.contains(&t));
+    // The optimizer the weighted M-steps run, decided once (`newton_scope_gap`): what the
+    // warning says is what every solve below is handed. The θ the closed-form steps own are
+    // not the weighted M-step's (a σ-only solve has no θ score to be a forward difference).
+    let closed_form_owned: Vec<usize> = mu_ref_pairs
+        .iter()
+        .filter(|(t, _)| use_closed_form && !weak_mu_ref.contains(t))
+        .map(|&(t, _)| t)
+        .chain(cov_group_thetas.iter().copied())
+        .collect();
+    let (mstep_optimizer, mstep_optimizer_warning) =
+        crate::estimation::saem::resolve_mstep_optimizer(
+            model,
+            options.mstep_optimizer,
+            false,
+            false,
+            crate::estimation::saem::mstep_has_free_theta(
+                n_theta,
+                &init_params.theta_fixed,
+                &closed_form_owned,
+            ),
+            label,
+        );
+    warnings.extend(mstep_optimizer_warning);
     if !use_closed_form && cov_mu_groups.is_empty() {
         // No closed-form-eligible parameter: every typical value goes through the
         // weighted M-step, which cannot resolve the θ/η-mean confounding on its own.
@@ -2050,6 +2062,7 @@ fn run_mcem(
     let mut iterations_done = 0usize;
     let mut stopped_after: Option<f64> = None;
     let mut mstep_motion = MstepMotion::new(n_theta + n_sigma);
+    let newton_tally = NewtonTally::default();
     for k in 1..=n_iter {
         if crate::cancel::is_cancelled(cancel) {
             if verbose {
@@ -2565,6 +2578,7 @@ fn run_mcem(
             mstep_maxiter,
             &theta_packs_log_mask,
             mstep_optimizer,
+            Some(&newton_tally),
         );
         mstep_motion.record(
             &mstep_before,
@@ -3101,6 +3115,7 @@ fn run_mcem(
     if let Some(w) = gate_converged_on_mcem_objective(&mut converged, ofv) {
         warnings.push(w);
     }
+    warnings.extend(newton_tally.warning(label));
     warnings.extend(mstep_warnings(
         &mut converged,
         label,
@@ -3370,6 +3385,8 @@ fn run_mcem_mixture(
             model,
             options.mstep_optimizer,
             false,
+            true,
+            // Every class θ is the weighted M-step's here, but the mixing ones.
             true,
             label,
         );
@@ -4429,6 +4446,7 @@ fn draw_obs_score(
     scratch: &mut EventPkParams,
     want_fisher: bool,
     memo: Option<MemoSlot<'_>>,
+    schedule: Option<&EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n_eta = model.n_eta;
     if b.len() > n_eta {
@@ -4450,6 +4468,7 @@ fn draw_obs_score(
                 scratch,
                 want_fisher,
                 memo,
+                schedule,
             )
         })
     } else {
@@ -4467,6 +4486,7 @@ fn draw_obs_score(
             scratch,
             want_fisher,
             memo,
+            schedule,
         )
     }
 }
@@ -4476,13 +4496,18 @@ fn draw_obs_score(
 /// M-step uses ([`draw_obs_score`]): the adjoint θ score and the analytic σ score
 /// (`lower[i] == upper[i]` marks a pinned coordinate, which contributes zero). With
 /// `want_fisher` the expected information of the same objective comes with it, from the same
-/// recording; `None` then when any subject's is out of scope. Without it the result is the
-/// gradient solve's (`lbfgs`), its information empty and never `None`.
+/// recording; `None` then when any subject's is out of scope — and then at once: the
+/// information is all-or-nothing, so the first draw without one ends the pass (value and
+/// gradient of a declined pass are never read) instead of computing it for the rest.
+/// Without it the result is the gradient solve's (`lbfgs`), its information empty and never
+/// `None`. Each subject's draws are predicted with the subject's cached schedule, as the
+/// value objective's are.
 #[allow(clippy::too_many_arguments)]
 fn weighted_mstep_score(
     model: &CompiledModel,
     population: &Population,
     draws: &[SubjectDraws],
+    schedules: &[Option<EventSchedule>],
     theta: &[f64],
     sigma: &[f64],
     theta_packs_log_mask: &[bool],
@@ -4494,10 +4519,14 @@ fn weighted_mstep_score(
     memo: Option<EvalMemo<'_>>,
 ) -> Option<ValueGradInfo> {
     let n = n_theta + n_sigma;
+    let declined = std::sync::atomic::AtomicBool::new(false);
     let per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)> = crate::par::map_init(
         population.subjects.len().min(draws.len()),
         EventPkParams::default,
         |scratch, idx| {
+            if want_fisher && declined.load(std::sync::atomic::Ordering::Relaxed) {
+                return (0.0, Vec::new(), None);
+            }
             let (subject, d) = (&population.subjects[idx], &draws[idx]);
             let mut val = 0.0f64;
             let mut grad = vec![0.0f64; n];
@@ -4520,6 +4549,7 @@ fn weighted_mstep_score(
                     scratch,
                     want_fisher,
                     memo.map(|ev| ev.slot(idx, k)),
+                    schedules.get(idx).and_then(Option::as_ref),
                 );
                 val += w * v;
                 for (a, gi) in grad.iter_mut().zip(g) {
@@ -4532,7 +4562,11 @@ fn weighted_mstep_score(
                                 *a += w * ii;
                             }
                         }
-                        None => info = None,
+                        None => {
+                            info = None;
+                            declined.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
                     }
                 }
             }
@@ -4946,11 +4980,13 @@ fn solve_weighted_mstep<F>(
     lower: &[f64],
     upper: &[f64],
     n_theta: usize,
-    maxiter: u32,
+    // The M-step's evaluation budget, Newton's passes included.
+    maxeval: u32,
     mstep_optimizer: MstepOptimizer,
     // The fused value/score/information of the same objective, for `newton`; `None` where the
     // caller has none (a mixture, which the fit's scope decision keeps off `newton`).
     fused: Option<&dyn Fn(&[f64]) -> Option<ValueGradInfo>>,
+    tally: Option<&NewtonTally>,
 ) -> WeightedMstep
 where
     F: Fn(&[f64], Option<&mut [f64]>, &mut ()) -> f64,
@@ -4965,7 +5001,9 @@ where
     let mut opt = nlopt::Nlopt::new(algorithm, n, &obj, nlopt::Target::Minimize, ());
     opt.set_lower_bounds(lower).unwrap();
     opt.set_upper_bounds(upper).unwrap();
-    opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
+    // One budget for the whole M-step: Newton's evaluations come out of it and a stalled
+    // Newton leaves BOBYQA the rest (`fisher_scoring` states the convention).
+    opt.set_maxeval(maxeval).unwrap();
     opt.set_ftol_rel(MSTEP_FTOL_REL).unwrap();
     if mstep_optimizer != MstepOptimizer::Lbfgs {
         let initial_step: Vec<f64> = lower
@@ -4980,18 +5018,22 @@ where
     let forced_failure = mstep_solve_forced_to_fail();
     // A stalled Newton leaves `x` at its last accepted point and BOBYQA continues from it, so
     // the failure and frozen-coordinate accounting below sees what the continuation did.
+    let mut remaining = maxeval;
     let newton_solved = !forced_failure
         && mstep_optimizer == MstepOptimizer::Newton
         && fused.is_some_and(|f| {
-            fisher_scoring(
+            let solve = newton_solve(
                 &mut x,
                 lower,
                 upper,
-                maxiter * (n as u32 + 1),
+                maxeval,
                 MSTEP_FTOL_REL,
                 |xv| obj(xv, None, &mut ()),
                 f,
-            ) == NewtonOutcome::Converged
+                tally,
+            );
+            remaining = maxeval.saturating_sub(solve.evals);
+            solve.converged
         });
     #[cfg(test)]
     crate::estimation::saem::note_mstep_route(if newton_solved {
@@ -5003,7 +5045,11 @@ where
         None
     } else if forced_failure {
         Some(nlopt::FailState::Failure)
+    } else if remaining == 0 {
+        // Newton spent the whole budget (NLopt reads a maximum of 0 as no limit).
+        None
     } else {
+        opt.set_maxeval(remaining).unwrap();
         mstep_failure(&opt.optimize(&mut x))
     };
     // A configuration NLopt rejects is a bug here, not a property of the fit. A release
@@ -5045,6 +5091,7 @@ fn theta_sigma_weighted_mstep(
     maxiter: u32,
     theta_packs_log_mask: &[bool],
     mstep_optimizer: MstepOptimizer,
+    tally: Option<&NewtonTally>,
 ) -> WeightedMstep {
     let n = n_theta + n_sigma;
 
@@ -5075,15 +5122,24 @@ fn theta_sigma_weighted_mstep(
             .collect()
     };
 
-    // The solve's samples are fixed, so evaluations at one θ share one prediction pass per
-    // sample (`PredMemo`): every evaluation of a σ-only solve, and a Newton solve's value pass
-    // and fused pass at the same point. A solve that never sees a θ twice keeps no predictions.
+    // The solve's evaluations at one θ share one prediction pass per sample (`PredMemo`) —
+    // under the opt-in gradient solvers only. The samples are `K` per subject (`imp_samples`,
+    // 1000 by default, up to 10 000 under auto-sampling), so the predictions are
+    // `subjects × K × n_obs` numbers against the `subjects × K × n_eta` the estimator itself
+    // holds, and a default fit must not grow by that. The σ-only solve of the derivative-free
+    // default would be served by them on every evaluation — measured at 2.1× fewer
+    // instructions for a whole σ-only IMP or IMPMAP fit, for 112 MB at 2000 subjects × 1000
+    // samples × 7 observations — and recomputes instead.
     let theta_free = (0..n_theta).any(|i| lower[i] < upper[i]);
-    let pred_memo = PredMemo::for_solve(
-        draws.iter().map(|d| d.etas.len()),
-        theta_free,
-        mstep_optimizer == MstepOptimizer::Newton,
-    );
+    let pred_memo = if mstep_optimizer == MstepOptimizer::Bobyqa {
+        None
+    } else {
+        PredMemo::for_solve(
+            draws.iter().map(|d| d.etas.len()),
+            theta_free,
+            mstep_optimizer == MstepOptimizer::Newton,
+        )
+    };
     // One θ comparison per evaluation, then every `(subject, sample)` slot hangs off it.
     let begin = |th: &[f64]| pred_memo.as_ref().and_then(|m| m.begin(th));
 
@@ -5099,6 +5155,7 @@ fn theta_sigma_weighted_mstep(
                     model,
                     population,
                     draws,
+                    schedules,
                     &th,
                     &sg,
                     theta_packs_log_mask,
@@ -5125,6 +5182,7 @@ fn theta_sigma_weighted_mstep(
             model,
             population,
             draws,
+            schedules,
             &th,
             &sg,
             theta_packs_log_mask,
@@ -5145,9 +5203,10 @@ fn theta_sigma_weighted_mstep(
         &lower,
         &upper,
         n_theta,
-        maxiter,
+        maxiter * (n as u32 + 1),
         mstep_optimizer,
         Some(&fused),
+        tally,
     )
 }
 
@@ -5243,6 +5302,7 @@ fn theta_sigma_weighted_mstep_mixture(
                                 scratch,
                                 false,
                                 None,
+                                schedules[i].as_ref(),
                             );
                             val += p * w * v;
                             for (a, gi) in grad.iter_mut().zip(gr) {
@@ -5303,8 +5363,9 @@ fn theta_sigma_weighted_mstep_mixture(
         &lower,
         &upper,
         n_theta,
-        maxiter,
+        maxiter * (n as u32 + 1),
         mstep_optimizer,
+        None,
         None,
     )
 }
@@ -9217,6 +9278,342 @@ mod tests {
             assert!(cached.is_finite());
             assert_eq!(cached.to_bits(), rebuilt.to_bits());
         }
+    }
+
+    /// The bits of a prediction vector, so a comparison cannot be satisfied by rounding.
+    fn bits(v: &[f64]) -> Vec<u64> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// A schedule that is not the subject's own — its observation times ×1.5 (the schedule
+    /// holds the events' times; amounts and covariates are read from the subject) — so
+    /// predictions made with it differ from the rebuilt ones, and a pass that does not use the
+    /// schedule it was handed cannot agree with one that does.
+    fn foreign_schedule(model: &CompiledModel, subject: &Subject, iov: bool) -> EventSchedule {
+        let mut other = subject.clone();
+        for t in other
+            .obs_times
+            .iter_mut()
+            .chain(other.obs_raw_times.iter_mut())
+        {
+            *t *= 1.5;
+        }
+        let built = if iov {
+            cacheable_schedule_iov(model, &other)
+        } else {
+            cacheable_schedule(model, &other)
+        };
+        built.expect("premise: cacheable")
+    }
+
+    /// One memo slot is filled by two passes — the value objective's and the score's — and a
+    /// hit must return what the caller would have computed itself, so both predict the same
+    /// way: with the subject's cached schedule. Probed with a schedule that is not the
+    /// subject's own, in both fill orders (each pass fills, the other's reader finds it) on the
+    /// event-driven subject of a time-varying covariate and on an IOV subject; a pass that
+    /// ignored the schedule would leave the other half's predictions in the slot.
+    #[test]
+    fn the_score_and_value_passes_fill_a_memo_slot_with_the_same_predictions() {
+        let (tv, tv_pop) = tv_fixture();
+        let (iov, iov_pop) = (iov_model(), iov_pop());
+        for (label, model, subject, is_iov) in [
+            ("time-varying covariate", &tv, &tv_pop.subjects[0], false),
+            ("IOV", &iov, &iov_pop.subjects[0], true),
+        ] {
+            let foreign = foreign_schedule(model, subject, is_iov);
+            let theta = &model.default_params.theta;
+            let sigma = &model.default_params.sigma.values;
+            let (n_theta, n_sigma) = (theta.len(), sigma.len());
+            let mask = vec![true; n_theta];
+            let (lower, upper) = (
+                vec![-1e30; n_theta + n_sigma],
+                vec![1e30; n_theta + n_sigma],
+            );
+            let n_eta = model.n_eta;
+            // The stacked draw: η, then κ for each occasion (none off IOV).
+            let n_occ = if is_iov {
+                crate::stats::stacked_layout::group_count(subject)
+            } else {
+                0
+            };
+            let b: Vec<f64> = (0..n_eta + n_occ * model.n_kappa)
+                .map(|i| 0.1 - 0.05 * i as f64)
+                .collect();
+            let kappas: Vec<Vec<f64>> = b[n_eta..]
+                .chunks(model.n_kappa.max(1))
+                .map(<[f64]>::to_vec)
+                .collect();
+            let mut scratch = EventPkParams::default();
+            let predict = |schedule: Option<&EventSchedule>, scratch: &mut EventPkParams| {
+                if is_iov {
+                    crate::pk::predict_iov_with_scratch_and_schedule(
+                        model,
+                        subject,
+                        theta,
+                        &b[..n_eta],
+                        &kappas,
+                        scratch,
+                        schedule,
+                    )
+                } else {
+                    crate::pk::compute_predictions_with_tv_into_with_schedule(
+                        model, subject, theta, &b, scratch, schedule,
+                    )
+                }
+            };
+            let want = predict(Some(&foreign), &mut scratch);
+            assert!(
+                bits(&want) != bits(&predict(None, &mut scratch)),
+                "{label}: premise — the schedule reaches the predictor"
+            );
+            for score_fills in [true, false] {
+                let memo = PredMemo::for_solve([1usize], false, false).unwrap();
+                let slot = memo.begin(theta).unwrap().slot(0, 0);
+                if score_fills {
+                    draw_obs_score(
+                        model,
+                        subject,
+                        theta,
+                        sigma,
+                        &b,
+                        &mask,
+                        &lower,
+                        &upper,
+                        n_theta,
+                        n_sigma,
+                        &mut scratch,
+                        false,
+                        Some(slot),
+                        Some(&foreign),
+                    );
+                } else {
+                    draw_obs_nll_memo(
+                        model,
+                        subject,
+                        theta,
+                        sigma,
+                        &b,
+                        Some(&foreign),
+                        &mut scratch,
+                        slot,
+                    );
+                }
+                let held = memoized(Some(slot), || unreachable!("the slot is filled")).to_vec();
+                assert_eq!(
+                    bits(&held),
+                    bits(&want),
+                    "{label}: filled by the {} pass",
+                    if score_fills { "score" } else { "value" }
+                );
+            }
+        }
+    }
+
+    /// The M-step's value and score are one objective: with the same schedules the score pass
+    /// predicts exactly as the value pass does. The schedules are not the subjects' own
+    /// (observation times ×1.5), so a score that dropped them — rebuilding the event schedule per sample per
+    /// evaluation, as it once did — scores the unscheduled predictions and misses the value.
+    #[test]
+    fn the_weighted_score_predicts_with_the_cached_schedules() {
+        let (model, pop) = tv_fixture();
+        let schedules: Vec<Option<EventSchedule>> = pop
+            .subjects
+            .iter()
+            .map(|s| Some(foreign_schedule(&model, s, false)))
+            .collect();
+        let none: Vec<Option<EventSchedule>> = vec![None; pop.subjects.len()];
+        let draws: Vec<SubjectDraws> = pop
+            .subjects
+            .iter()
+            .map(|_| {
+                let mut d = SubjectDraws::cancelled(0);
+                d.etas = vec![vec![0.2, -0.1], vec![-0.3, 0.15], vec![0.05, 0.3]];
+                d.weights = vec![0.5, 0.3, 0.2];
+                d
+            })
+            .collect();
+        let theta = model.default_params.theta.clone();
+        let sigma = model.default_params.sigma.values.clone();
+        let (n_theta, n_sigma) = (theta.len(), sigma.len());
+        let mask = vec![true; n_theta];
+        let (lower, upper) = (
+            vec![-1e30; n_theta + n_sigma],
+            vec![1e30; n_theta + n_sigma],
+        );
+        let score = |sched: &[Option<EventSchedule>]| {
+            weighted_mstep_score(
+                &model, &pop, &draws, sched, &theta, &sigma, &mask, &lower, &upper, n_theta,
+                n_sigma, false, None,
+            )
+            .expect("a score without the information always exists")
+        };
+        let (scheduled, unscheduled) = (score(&schedules), score(&none));
+        let value = |sched: &[Option<EventSchedule>]| {
+            weighted_mstep_objective(&model, &pop, &draws, sched, &theta, &sigma)
+        };
+        let (v_scheduled, v_unscheduled) = (value(&schedules), value(&none));
+        assert!(
+            (v_scheduled - v_unscheduled).abs() > 1e-3 * v_unscheduled.abs(),
+            "premise: the schedules change the objective ({v_scheduled} vs {v_unscheduled})"
+        );
+        assert!(
+            (scheduled.val - v_scheduled).abs() < 1e-9 * v_scheduled.abs(),
+            "the score's value {} is the scheduled objective {v_scheduled}",
+            scheduled.val
+        );
+        assert!(
+            (unscheduled.val - v_unscheduled).abs() < 1e-9 * v_unscheduled.abs(),
+            "and the unscheduled score the unscheduled one"
+        );
+    }
+
+    /// The expected information is all-or-nothing, so the first draw without one ends the
+    /// fused pass: the rest of that subject's draws and every later subject are not scored.
+    /// A one-worker pool runs the subjects in order, so what was scored is read off the memo:
+    /// subject 0's first draw only (it is where the information is withheld — an ODE model the
+    /// adjoint declines), nothing of the rest.
+    #[test]
+    fn a_declined_information_ends_the_fused_pass_at_once() {
+        use crate::types::DoseEvent;
+        let src = "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+                   omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+                   [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+                   [structural_model]\n  ode(states=[central])\n[odes]\n  \
+                   d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n\
+                   [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+        let mut model = crate::parser::model_parser::parse_model_string(src).unwrap();
+        model.ode_spec.as_mut().unwrap().readout_program = None;
+        let subjects: Vec<Subject> = (0..4)
+            .map(|i| Subject {
+                id: format!("{i}"),
+                doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                dose_occasions: vec![1],
+                occasions: vec![1; 3],
+                obs_cmts: vec![1; 3],
+                cens: vec![0; 3],
+                obs_times: vec![1.0, 3.0, 6.0],
+                observations: vec![1.7, 1.2, 0.8],
+                ..Default::default()
+            })
+            .collect();
+        let pop = Population {
+            subjects,
+            covariate_names: Vec::new(),
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let draws: Vec<SubjectDraws> = pop
+            .subjects
+            .iter()
+            .map(|_| {
+                let mut d = SubjectDraws::cancelled(0);
+                d.etas = (0..5).map(|k| vec![0.05 * k as f64]).collect();
+                d.weights = vec![0.2; 5];
+                d
+            })
+            .collect();
+        let theta = [5.0f64, 50.0];
+        let sigma = [0.1f64];
+        let mask = vec![true; 2];
+        let (lower, upper) = (vec![-1e30; 3], vec![1e30; 3]);
+        let none: Vec<Option<EventSchedule>> = vec![None; pop.subjects.len()];
+        let memo = PredMemo::for_solve(draws.iter().map(|d| d.etas.len()), true, true).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let out = pool.install(|| {
+            weighted_mstep_score(
+                &model,
+                &pop,
+                &draws,
+                &none,
+                &theta,
+                &sigma,
+                &mask,
+                &lower,
+                &upper,
+                2,
+                1,
+                true,
+                memo.begin(&theta),
+            )
+        });
+        assert!(out.is_none(), "a declined subject declines the pass");
+        let scored: Vec<usize> = (0..4).map(|i| memo.scored(i)).collect();
+        assert_eq!(
+            scored,
+            [1, 0, 0, 0],
+            "only the first draw of the first subject"
+        );
+        // Control: in scope, the same pass scores every draw of every subject.
+        let in_scope = crate::parser::model_parser::parse_model_string(src).unwrap();
+        let memo = PredMemo::for_solve(draws.iter().map(|d| d.etas.len()), true, true).unwrap();
+        let out = pool.install(|| {
+            weighted_mstep_score(
+                &in_scope,
+                &pop,
+                &draws,
+                &none,
+                &theta,
+                &sigma,
+                &mask,
+                &lower,
+                &upper,
+                2,
+                1,
+                true,
+                memo.begin(&theta),
+            )
+        });
+        assert!(out.is_some(), "premise: the information is there in scope");
+        assert_eq!(
+            (0..4).map(|i| memo.scored(i)).collect::<Vec<_>>(),
+            [5, 5, 5, 5]
+        );
+    }
+
+    /// A Newton solve that loses its information at run time falls back to `bobyqa`, and the
+    /// fit says so (the hook withholds the fused passes, as a subject the adjoint declines
+    /// would): the count of M-steps handed over and the cause, with the other cause's negative;
+    /// without the hook there is no such warning.
+    #[test]
+    fn an_imp_fit_reports_the_newton_solves_that_lost_their_information() {
+        use crate::estimation::mstep_newton::FUSED_PASSES_ALLOWED;
+        use crate::types::MstepOptimizer::Newton;
+        let model = iov_model();
+        let pop = iov_pop();
+        let mut opts = FitOptions::default();
+        opts.impmap_iterations = 3;
+        opts.impmap_samples = 100;
+        opts.impmap_seed = Some(5);
+        opts.run_covariance_step = false;
+        opts.mstep_optimizer = Newton;
+        let run = |hook: Option<u32>| {
+            FUSED_PASSES_ALLOWED.set(hook);
+            let res = run_impmap(&model, &pop, &model.default_params, None, &opts);
+            FUSED_PASSES_ALLOWED.set(None);
+            res.expect("impmap").warnings
+        };
+        let declined = run(Some(0));
+        let w = declined
+            .iter()
+            .find(|w| w.contains("lost the expected information"))
+            .unwrap_or_else(|| panic!("{declined:?}"));
+        assert!(
+            w.starts_with("IMPMAP:") && w.contains("numerical M-steps to `bobyqa`"),
+            "{w}"
+        );
+        assert!(!w.contains("no admissible"), "{w}");
+        let clean = run(None);
+        assert!(
+            !clean
+                .iter()
+                .any(|w| w.contains("lost the expected information")),
+            "{clean:?}"
+        );
     }
 
     #[test]

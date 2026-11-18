@@ -11341,7 +11341,10 @@ pub enum MstepOptimizer {
     /// Fisher scoring (damped Gauss-Newton) on the same exact score and the expected
     /// information from the same adjoint recording (`estimation::mstep_newton`):
     /// a handful of fused value-gradient-information passes from the warm start. A subject
-    /// outside the information's closed form (and a mixture) keeps the BOBYQA solve.
+    /// outside the information's closed form (and a mixture) keeps the BOBYQA solve. A solve
+    /// that stalls or loses its information at run time continues with BOBYQA from the
+    /// point it reached on what is left of the one `maxiter * (n + 1)` budget (every pass,
+    /// value or fused, counts as one evaluation), and the fit's warnings count those M-steps.
     Newton,
 }
 

@@ -12,7 +12,7 @@ use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_score_iov,
 };
 use crate::estimation::mstep_newton::{
-    finite_grad, finite_value, nlopt_value_and_grad, NewtonOutcome,
+    finite_grad, finite_value, newton_solve, nlopt_value_and_grad, NewtonTally,
 };
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
 use crate::estimation::parameterization::{compute_mu_k, *};
@@ -2488,11 +2488,15 @@ pub(crate) fn newton_scope_gap(model: &CompiledModel, is_mixture: bool) -> Optio
 /// recorders serve the model (its θ score is exact, which is the point of the option) and with
 /// a warning otherwise — the θ score is then a forward difference (relative step `1e-5`), so
 /// the solve runs to the accuracy of its gradient, which a `1e-7` relative tolerance can exceed.
+/// That warning is for a solve with a θ to score: `theta_free` is whether the numerical
+/// M-steps have any θ the closed-form steps do not own (a σ-only solve's score is the exact σ
+/// score whatever the adjoint's scope).
 pub(crate) fn resolve_mstep_optimizer(
     model: &CompiledModel,
     requested: MstepOptimizer,
     score_sa_active: bool,
     is_mixture: bool,
+    theta_free: bool,
     label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     resolve_mstep_optimizer_for(
@@ -2500,17 +2504,26 @@ pub(crate) fn resolve_mstep_optimizer(
         score_sa_active,
         crate::sens::ode_provider::adjoint::recorder_in_scope(model),
         newton_scope_gap(model, is_mixture),
+        theta_free,
         label,
     )
 }
 
+/// Whether a numerical θ/σ M-step has a θ to estimate: one that is not FIXed and that the
+/// closed-form steps (`owned`) do not move.
+pub(crate) fn mstep_has_free_theta(n_theta: usize, theta_fixed: &[bool], owned: &[usize]) -> bool {
+    (0..n_theta).any(|t| !theta_fixed.get(t).copied().unwrap_or(false) && !owned.contains(&t))
+}
+
 /// [`resolve_mstep_optimizer`] with the model's scope decided by the caller: whether the
-/// adjoint serves it (`exact_theta_score`, what `lbfgs` reads) and [`newton_scope_gap`].
+/// adjoint serves it (`exact_theta_score`, what `lbfgs` reads), [`newton_scope_gap`] and
+/// whether any θ is left to the numerical solve.
 fn resolve_mstep_optimizer_for(
     optimizer: MstepOptimizer,
     score_sa_active: bool,
     exact_theta_score: bool,
     newton_gap: Option<&str>,
+    theta_free: bool,
     label: &str,
 ) -> (MstepOptimizer, Option<String>) {
     if optimizer == MstepOptimizer::Bobyqa {
@@ -2548,7 +2561,7 @@ fn resolve_mstep_optimizer_for(
             )),
         );
     }
-    if exact_theta_score {
+    if exact_theta_score || !theta_free {
         return (optimizer, None);
     }
     (
@@ -2568,6 +2581,9 @@ thread_local! {
     /// `[bobyqa, lbfgs, newton]` (a `newton` that declined counts as the `bobyqa` it fell to).
     /// What a routing test reads to see that `mstep_optimizer` reaches the solve.
     pub(crate) static MSTEP_ROUTE: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+    /// Test counter: objective evaluations (value, gradient or fused passes) the numerical
+    /// M-step solves spent on this thread — what a budget test compares with `maxiter·(n+1)`.
+    pub(crate) static MSTEP_EVALS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// Record which optimizer a numerical M-step solve ran (test builds only).
@@ -2618,6 +2634,8 @@ fn theta_sigma_mstep_light(
     // `bobyqa` (the default) or `lbfgs` on the exact fixed-η score (`obj` below already
     // returns it when NLopt asks for a gradient; BOBYQA never does).
     mstep_optimizer: MstepOptimizer,
+    // What a fit's Newton solves did, for its warning (`None`: not kept).
+    tally: Option<&NewtonTally>,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = n_theta + n_sigma;
 
@@ -2722,6 +2740,7 @@ fn theta_sigma_mstep_light(
                             scratch,
                             false,
                             ev.map(|e| e.slot(i, draw)),
+                            schedules.get(i).and_then(|s| s.as_ref()),
                         );
                         // A held σ override carries no information about the
                         // free base σ — zero that subject's contribution.
@@ -2764,6 +2783,7 @@ fn theta_sigma_mstep_light(
                         scratch,
                         false,
                         ev.map(|e| e.slot(i, draw)),
+                        schedules.get(i).and_then(|s| s.as_ref()),
                     );
                     for &(sidx, _) in over {
                         if n_theta + sidx < grad.len() {
@@ -2792,6 +2812,8 @@ fn theta_sigma_mstep_light(
         };
 
     let obj = |xv: &[f64], grad: Option<&mut [f64]>, _: &mut ()| -> f64 {
+        #[cfg(test)]
+        MSTEP_EVALS.with(|c| c.set(c.get() + 1));
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
         // The mean over this iteration's draw and the stored previous ones. The
@@ -2856,6 +2878,7 @@ fn theta_sigma_mstep_light(
                     scratch,
                     true,
                     ev.map(|e| e.slot(i, draw)),
+                    schedules.get(i).and_then(|s| s.as_ref()),
                 ),
                 None => obs_nll_subject_score(
                     model,
@@ -2871,6 +2894,7 @@ fn theta_sigma_mstep_light(
                     scratch,
                     true,
                     ev.map(|e| e.slot(i, draw)),
+                    schedules.get(i).and_then(|s| s.as_ref()),
                 ),
             }
         });
@@ -2882,6 +2906,8 @@ fn theta_sigma_mstep_light(
     // still declines at run time, or a solve that stalls, falls through to the derivative-free
     // solve below, from the point it reached.
     let fused_mean = |xv: &[f64]| -> Option<crate::estimation::mstep_newton::ValueGradInfo> {
+        #[cfg(test)]
+        MSTEP_EVALS.with(|c| c.set(c.get() + 1));
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
         let ev = begin(&th);
@@ -2907,30 +2933,39 @@ fn theta_sigma_mstep_light(
         acc.val = finite_value(acc.val);
         Some(acc)
     };
+    // One budget for the whole M-step: Newton's evaluations come out of it and a stalled Newton
+    // leaves BOBYQA the rest (`fisher_scoring` states the convention).
+    let budget = maxiter * (n as u32 + 1);
+    let mut remaining = budget;
     if mstep_optimizer == MstepOptimizer::Newton {
         debug_assert!(
             mix_mstep.is_none(),
             "a mixture is outside `newton_scope_gap`: the fit resolves it to bobyqa"
         );
         let mut xn = x.clone();
-        let outcome = crate::estimation::mstep_newton::fisher_scoring(
+        let solve = newton_solve(
             &mut xn,
             &lower,
             &upper,
-            maxiter * (n as u32 + 1),
+            budget,
             MSTEP_FTOL_REL,
             |xv| obj(xv, None, &mut ()),
             fused_mean,
+            tally,
         );
-        match outcome {
-            NewtonOutcome::Converged => {
-                #[cfg(test)]
-                note_mstep_route(2);
-                return (xn[..n_theta].to_vec(), xn[n_theta..].to_vec());
-            }
-            // BOBYQA continues from where Newton stopped (its start when it took no step).
-            NewtonOutcome::Stalled => x.copy_from_slice(&xn),
-            NewtonOutcome::Declined => {}
+        if solve.converged {
+            #[cfg(test)]
+            note_mstep_route(2);
+            return (xn[..n_theta].to_vec(), xn[n_theta..].to_vec());
+        }
+        // BOBYQA continues from where Newton stopped (its start when it took no step), with
+        // what is left of the M-step's budget.
+        x.copy_from_slice(&xn);
+        remaining = budget.saturating_sub(solve.evals);
+        if remaining == 0 {
+            #[cfg(test)]
+            note_mstep_route(0);
+            return (x[..n_theta].to_vec(), x[n_theta..].to_vec());
         }
     }
     // Compute per-element scale factors from the initial point.
@@ -2970,7 +3005,7 @@ fn theta_sigma_mstep_light(
     let mut opt = nlopt::Nlopt::new(algorithm, n, obj_s, nlopt::Target::Minimize, ());
     opt.set_lower_bounds(&lower_s).unwrap();
     opt.set_upper_bounds(&upper_s).unwrap();
-    opt.set_maxeval(maxiter * (n as u32 + 1)).unwrap();
+    opt.set_maxeval(remaining).unwrap();
     // The mixture arm keeps the pre-#1415 configuration — NLopt's default first design and the
     // 1e-4 tolerance. On the NONMEM anchor it no longer matters (the switched θ are
     // closed-form since #2458); it is kept for the mixtures without an orbit move, where no
@@ -5476,18 +5511,18 @@ pub fn run_saem(
     // with it. Whether the #1011 bias also affects mixture class θ (it plausibly
     // does) needs its own schedule and its own anchor, so it is left alone here
     // rather than half-fixed; the advisory above still fires for them.
+    let closed_form_owned: Vec<usize> = if !use_closed_form_mstep {
+        Vec::new()
+    } else if saem_mix.is_some() {
+        class_mu_ref_thetas.clone()
+    } else {
+        mu_ref_pairs
+            .iter()
+            .map(|&(t, _e)| t)
+            .chain(cov_group_thetas.iter().copied())
+            .collect()
+    };
     let numerically_estimated_theta = {
-        let pinned: Vec<usize> = if !use_closed_form_mstep {
-            Vec::new()
-        } else if saem_mix.is_some() {
-            class_mu_ref_thetas.clone()
-        } else {
-            mu_ref_pairs
-                .iter()
-                .map(|&(t, _e)| t)
-                .chain(cov_group_thetas.iter().copied())
-                .collect()
-        };
         // `cov_group_thetas` is the *resolved* group list, so a group the
         // resolver dropped (weak IIV, a conflicting anchor, all-FIXed) leaves
         // its thetas counted as numerically estimated — which they are.
@@ -5500,7 +5535,7 @@ pub fn run_saem(
             saem_mix.is_some(),
             n_theta,
             &init_params.theta_fixed,
-            &pinned,
+            &closed_form_owned,
             &theta_is_mu_ref_anchor,
         )
     };
@@ -5575,9 +5610,12 @@ pub fn run_saem(
         options.mstep_optimizer,
         use_score_sa,
         saem_mix.is_some(),
+        mstep_has_free_theta(n_theta, &init_params.theta_fixed, &closed_form_owned),
         "SAEM",
     );
     warnings.extend(mstep_optimizer_warning);
+    // What the numerical M-steps' Newton solves did, for the warning at the end of the fit.
+    let newton_tally = NewtonTally::default();
     if let Some(w) = imh_noeta_theta_warning(imh_mode, numerically_estimated_theta, use_score_sa) {
         warnings.push(w);
     }
@@ -6782,6 +6820,7 @@ pub fn run_saem(
                             &schedules,
                             &extra_eta_draws,
                             mstep_optimizer,
+                            Some(&newton_tally),
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                         damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
@@ -6885,6 +6924,7 @@ pub fn run_saem(
                     // always the historical single-draw objective.
                     &[],
                     mstep_optimizer,
+                    Some(&newton_tally),
                 );
                 damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                 damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
@@ -6939,6 +6979,7 @@ pub fn run_saem(
                             &schedules,
                             &extra_eta_draws,
                             mstep_optimizer,
+                            Some(&newton_tally),
                         );
                         damp_mstep(&mut log_theta, &theta_new, gamma_mstep);
                         damp_mstep_sigma_variance(&mut log_sigma, &sigma_new, &gamma_sigma);
@@ -7572,6 +7613,7 @@ pub fn run_saem(
         non_stationary_optimum: _,
     } = out;
     warnings.extend(cov_warnings);
+    warnings.extend(newton_tally.warning("SAEM"));
 
     let saem_mu_ref_m_step_evals_saved = if use_closed_form_mstep {
         Some(mstep_grad_step_evals_saved)
@@ -9854,6 +9896,7 @@ DV ~ proportional(EPS)
                 &[],
                 &[],
                 crate::types::MstepOptimizer::Bobyqa,
+                None,
             )
         };
         let objective = |lt: &[f64], ls: &[f64]| {
@@ -9939,6 +9982,7 @@ DV ~ proportional(EPS)
             &[],
             &[],
             crate::types::MstepOptimizer::Bobyqa,
+            None,
         );
         assert!(
             (theta_mix[0] - theta_ref[0]).abs() > 0.03,
@@ -10031,6 +10075,7 @@ DV ~ proportional(EPS)
             &[],
             &[],
             crate::types::MstepOptimizer::Bobyqa,
+            None,
         );
         let f_b = objective(&theta_b, &sigma_b);
         assert!(f_b.is_finite() && f_start.is_finite());

@@ -3386,6 +3386,7 @@ fn memoised_predictions_change_no_score_and_are_served_for_an_unchanged_theta() 
                     &mut scratch,
                     true,
                     memo,
+                    None,
                 )
             } else {
                 obs_nll_subject_score(
@@ -3402,6 +3403,7 @@ fn memoised_predictions_change_no_score_and_are_served_for_an_unchanged_theta() 
                     &mut scratch,
                     true,
                     memo,
+                    None,
                 )
             }
         };
@@ -3516,6 +3518,7 @@ fn the_solve_entry_withholds_a_differenced_information_where_score_sa_takes_it()
             n_sigma,
             &mut scratch,
             true,
+            None,
             None,
         );
         let score_sa = obs_nll_subject_grad_fisher(
