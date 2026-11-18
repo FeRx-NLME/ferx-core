@@ -43,7 +43,7 @@
 //!
 //! The fitted-ρ numbers are the Monte-Carlo disagreement of two independent
 //! 2000-draw empirical CDFs, largest in the tails: arm A's worst NPD is one record
-//! at `pd ≈ 0.998`. The bounds are 2× those. Both pre-#1733 configurations are
+//! at `pd ≈ 0.998`. The bounds are set from the 40-seed distribution (see the constants). Both pre-#1733 configurations are
 //! controls that must fail the bounds, so the anchor can fail.
 //!
 //! **NPD on the second row of an `L2` record is a NONMEM convention, not a ferx
@@ -63,12 +63,29 @@ use std::path::Path;
 const NSIM: usize = 2000;
 const SEED: u64 = 1733;
 
-/// Arm A: 2× the realised worst |ΔNPD| 0.43894 and |ΔNPDE| 0.28557.
-const A_NPD_TOL: f64 = 0.88;
-const A_NPDE_TOL: f64 = 0.57;
-/// Arm B: 2× the realised worst |ΔNPDE| 0.28835 and |ΔNPD| 0.11838 (`FREE = 0` rows).
+/// Bounds from the *distribution* of the worst-|Δ| statistic over 40 values of `SEED`
+/// (1..=40), not from one realisation (#3021 moved the per-subject streams from
+/// `seed + i` to a hash, which re-drew the default seed's stream and showed that a
+/// bound of 2× one draw is not a bound: arm A's |ΔNPDE| came out 0.674 against 0.286).
+/// The statistic is a maximum over 210-240 rows of two independent 2000-draw
+/// empirical CDFs, so it is heavy-tailed. Measured on Linux x86_64 (old `seed + i`
+/// streams / new hashed streams; the two distributions agree, so the change re-draws
+/// and does not shift them):
+///
+/// | statistic | median | max over 40 seeds (old / new) | bound | control min (ρ = 0.5, 0) |
+/// |---|---|---|---|---|
+/// | A \|ΔNPD\| | 0.359 | 0.762 / 0.762 | 1.0 | 1.21 / 1.31 |
+/// | A \|ΔNPDE\| | 0.35-0.48 | 0.674 / 0.674 | 1.0 | 1.55 / 1.55 |
+/// | B \|ΔNPDE\| (FREE = 0) | 0.25 | 0.397 / 0.389 | 0.58 | 1.52 / 1.56 |
+/// | B \|ΔNPD\| (FREE = 0) | 0.15 | 0.264 / 0.264 | 0.40 | not asserted |
+///
+/// Each bound sits ≥ 1.3× above the largest fitted-ρ value seen and below the
+/// smallest value the wrong-ρ draws (the pre-#1733 behaviour and ρ = 0) produced on
+/// any seed, so the straddle tests hold for every seed measured, not only the default.
+const A_NPD_TOL: f64 = 1.0;
+const A_NPDE_TOL: f64 = 1.0;
 const B_NPDE_TOL: f64 = 0.58;
-const B_NPD_TOL: f64 = 0.24;
+const B_NPD_TOL: f64 = 0.40;
 
 /// `(ID, TIME, FREE, NPD, NPDE)` per observation record (`MDV = 0`) of a table.
 fn nonmem_scores(file: &str) -> Vec<(String, f64, f64, f64, f64)> {
@@ -208,13 +225,13 @@ fn npde_at_the_fitted_within_observation_rho_matches_nonmem() {
     let w = run("a", -0.9, 210);
     assert!(
         w.npd_free0 < A_NPD_TOL,
-        "worst |dNPD| = {:.5} exceeds {A_NPD_TOL} (realised 0.43894): the residual \
+        "worst |dNPD| = {:.5} exceeds {A_NPD_TOL} (default seed on the old streams 0.43894; max over 40 seeds 0.762): the residual \
          draw is not at the fitted block_sigma rho",
         w.npd_free0
     );
     assert!(
         w.npde < A_NPDE_TOL,
-        "worst |dNPDE| = {:.5} exceeds {A_NPDE_TOL} (realised 0.28557)",
+        "worst |dNPDE| = {:.5} exceeds {A_NPDE_TOL} (default seed on the old streams 0.28557; max over 40 seeds 0.674)",
         w.npde
     );
 }
@@ -243,13 +260,13 @@ fn npde_of_an_l2_pair_at_the_fitted_rho_matches_nonmem() {
     let w = run("b", -0.8, 240);
     assert!(
         w.npde < B_NPDE_TOL,
-        "worst |dNPDE| = {:.5} exceeds {B_NPDE_TOL} (realised 0.28835): the paired \
+        "worst |dNPDE| = {:.5} exceeds {B_NPDE_TOL} (max over 40 seeds 0.397): the paired \
          residuals are not drawn jointly at the fitted rho",
         w.npde
     );
     assert!(
         w.npd_free0 < B_NPD_TOL,
-        "worst |dNPD| on FREE = 0 rows = {:.5} exceeds {B_NPD_TOL} (realised 0.11838)",
+        "worst |dNPD| on FREE = 0 rows = {:.5} exceeds {B_NPD_TOL} (max over 40 seeds 0.264)",
         w.npd_free0
     );
     // NONMEM's NPD on the second row of an L2 record tracks the partner row; ferx's
