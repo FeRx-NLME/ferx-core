@@ -12345,7 +12345,10 @@ fn a_declined_walked_segment_is_integrated_on_its_values() {
             let pairs = std::iter::once((a.value, b.value))
                 .chain(a.grad.iter().copied().zip(b.grad.iter().copied()));
             for (x, y) in pairs {
-                assert!(y.is_finite(), "eta {eta:?}, obs {j}: finite ({y})");
+                assert!(
+                    x.is_finite() && y.is_finite(),
+                    "eta {eta:?}, obs {j}: finite ({x}, {y})"
+                );
                 worst = worst.max((x - y).abs() / (1e-6 + x.abs()));
             }
         }
