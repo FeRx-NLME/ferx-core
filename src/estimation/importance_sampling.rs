@@ -962,58 +962,17 @@ pub fn run_importance_sampling(
         return Err("cancelled by user".to_string());
     }
 
-    // Reduce across subjects.
-    let mut ll = 0.0_f64;
-    let mut var_ll = 0.0_f64;
-    let mut ess_fracs: Vec<f64> = Vec::with_capacity(n_subjects);
-    let mut low_ess: Vec<(String, f64)> = Vec::new();
-    for (i, out) in per_subject.iter().enumerate() {
-        ll += out.log_marginal;
-        var_ll += out.var_log_marginal;
-        ess_fracs.push(out.ess_fraction);
-        if out.ess_fraction < threshold {
-            low_ess.push((population.subjects[i].id.clone(), out.ess_fraction));
-        }
-    }
-    let minus2_ll = -2.0 * ll;
-    // Var(−2 LL) = 4 · Var(LL) = 4 · Σᵢ Var(log p̂(yᵢ)).
-    let mc_se = 2.0 * var_ll.max(0.0).sqrt();
-
-    ess_fracs.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let ess_min = *ess_fracs.first().unwrap_or(&0.0);
-    let ess_median = if ess_fracs.is_empty() {
-        0.0
-    } else {
-        let mid = ess_fracs.len() / 2;
-        if ess_fracs.len().is_multiple_of(2) {
-            0.5 * (ess_fracs[mid - 1] + ess_fracs[mid])
-        } else {
-            ess_fracs[mid]
-        }
-    };
-
-    if options.verbose {
-        eprintln!(
-            "IS done. −2 log L = {:.4} ± {:.4} (ess_min/K = {:.3}, ess_med/K = {:.3}, low_ess = {})",
-            minus2_ll,
-            mc_se,
-            ess_min,
-            ess_median,
-            low_ess.len()
-        );
-    }
-
-    Ok(ImportanceSamplingResult {
-        minus2_log_likelihood: minus2_ll,
-        mc_standard_error: mc_se,
-        low_ess_subjects: low_ess,
-        n_samples: k_samples,
-        proposal_df: nu,
-        ess_min,
-        ess_median,
+    Ok(reduce_subjects(
+        "IS",
+        &per_subject,
+        population,
+        threshold,
+        options.verbose,
+        k_samples,
+        nu,
         kappa_treatment,
         adapt_passes,
-    })
+    ))
 }
 
 /// Minimum class responsibility for a class's per-class ESS to count toward the
@@ -1245,9 +1204,38 @@ pub fn run_importance_sampling_mixture(
         return Err("cancelled by user".to_string());
     }
 
+    Ok(reduce_subjects(
+        "IS (mixture)",
+        &per_subject,
+        population,
+        threshold,
+        options.verbose,
+        k_samples,
+        nu,
+        KappaTreatment::NotApplicable,
+        adapt_passes,
+    ))
+}
+
+/// The population result from the per-subject IS outputs: `−2 log L` (the subjects' log
+/// marginals summed), its Monte-Carlo SE (`Var(−2 LL) = 4 · Var(LL) = 4 · Σᵢ Var(log p̂(yᵢ))`),
+/// the ESS/K minimum and median, and the subjects below `threshold` — printed under `label`
+/// when verbose.
+#[allow(clippy::too_many_arguments)]
+fn reduce_subjects(
+    label: &str,
+    per_subject: &[SubjectIsOutput],
+    population: &Population,
+    threshold: f64,
+    verbose: bool,
+    k_samples: usize,
+    nu: f64,
+    kappa_treatment: KappaTreatment,
+    adapt_passes: usize,
+) -> ImportanceSamplingResult {
     let mut ll = 0.0_f64;
     let mut var_ll = 0.0_f64;
-    let mut ess_fracs: Vec<f64> = Vec::with_capacity(n_subjects);
+    let mut ess_fracs: Vec<f64> = Vec::with_capacity(per_subject.len());
     let mut low_ess: Vec<(String, f64)> = Vec::new();
     for (i, out) in per_subject.iter().enumerate() {
         ll += out.log_marginal;
@@ -1259,7 +1247,6 @@ pub fn run_importance_sampling_mixture(
     }
     let minus2_ll = -2.0 * ll;
     let mc_se = 2.0 * var_ll.max(0.0).sqrt();
-
     ess_fracs.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let ess_min = *ess_fracs.first().unwrap_or(&0.0);
     let ess_median = if ess_fracs.is_empty() {
@@ -1272,20 +1259,14 @@ pub fn run_importance_sampling_mixture(
             ess_fracs[mid]
         }
     };
-
-    if options.verbose {
+    if verbose {
         eprintln!(
-            "IS (mixture) done. −2 log L = {:.4} ± {:.4} (ess_min/K = {:.3}, ess_med/K = {:.3}, \
-             low_ess = {})",
-            minus2_ll,
-            mc_se,
-            ess_min,
-            ess_median,
+            "{label} done. −2 log L = {minus2_ll:.4} ± {mc_se:.4} (ess_min/K = {ess_min:.3}, \
+             ess_med/K = {ess_median:.3}, low_ess = {})",
             low_ess.len()
         );
     }
-
-    Ok(ImportanceSamplingResult {
+    ImportanceSamplingResult {
         minus2_log_likelihood: minus2_ll,
         mc_standard_error: mc_se,
         low_ess_subjects: low_ess,
@@ -1293,9 +1274,9 @@ pub fn run_importance_sampling_mixture(
         proposal_df: nu,
         ess_min,
         ess_median,
-        kappa_treatment: KappaTreatment::NotApplicable,
+        kappa_treatment,
         adapt_passes,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
