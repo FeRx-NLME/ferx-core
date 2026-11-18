@@ -3445,10 +3445,36 @@ fn find_ebe_solve(
         && use_analytic
         && !enable_stall
         && model.frem_config.is_none();
+    // EXPERIMENT (#2975): `FERX_INNER_NEWTON=gn|exact` — a fresh metric at every accepted
+    // point (Gauss–Newton `H̃`, or the exact conditional Hessian) instead of BFGS updates. Only
+    // where the seed itself is in scope (the dense route, a seed formed).
+    let newton_mode = std::env::var("FERX_INNER_NEWTON").ok();
+    let metric_fn = |e: &[f64]| -> Option<DMatrix<f64>> {
+        let m = analytic_inner_seed_hessian(
+            model,
+            subject,
+            params,
+            e,
+            schedule,
+            mult.as_deref(),
+            err_keys.as_ref(),
+            &mut obs_grad_recycle.borrow_mut(),
+            newton_mode.as_deref() == Some("exact"),
+            frozen,
+        );
+        // The seed pass wrote its own rows into the buffer the terminal Jacobian reuses.
+        if let Some(k) = rows_at.borrow_mut().as_mut() {
+            k.clear();
+        }
+        m.map(|(h, _)| h)
+    };
+    let metric: Option<&MetricFn<'_>> =
+        (newton_mode.is_some() && dense_bfgs_route && initial_hessian.is_some())
+            .then_some(&metric_fn as &MetricFn<'_>);
     let result = if start_certified {
         InnerExit::Converged
     } else {
-        inner_minimize_with_prime(
+        inner_minimize_with_metric(
             &obj,
             prime,
             &agrad,
@@ -3461,6 +3487,7 @@ fn find_ebe_solve(
             stop_precond,
             &stall_at,
             short_line_search,
+            metric,
         )
     };
 
@@ -6734,6 +6761,40 @@ fn inner_minimize_with_prime(
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
 ) -> InnerExit {
+    inner_minimize_with_metric(
+        obj,
+        prime,
+        grad,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        hessian_seed,
+        stop_precond,
+        stall_at,
+        short_line_search,
+        None,
+    )
+}
+
+/// [`inner_minimize_with_prime`] with an optional per-iterate metric for the dense driver.
+#[allow(clippy::too_many_arguments)]
+fn inner_minimize_with_metric(
+    obj: &dyn Fn(&[f64]) -> f64,
+    prime: Option<&PrimeFn<'_>>,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+    metric: Option<&MetricFn<'_>>,
+) -> InnerExit {
     if matches!(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
@@ -6776,7 +6837,7 @@ fn inner_minimize_with_prime(
             short_line_search,
         )
     } else {
-        dense_bfgs_run(
+        dense_bfgs_run_with_metric(
             obj,
             prime,
             grad,
@@ -6789,6 +6850,7 @@ fn inner_minimize_with_prime(
             stop_precond,
             stall_at,
             short_line_search,
+            metric,
         )
     };
     #[cfg(test)]
@@ -7144,6 +7206,16 @@ fn dense_bfgs_core(
     .converged()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test counter: steps whose metric came from [`MetricFn`] rather than a BFGS update.
+    pub(crate) static METRIC_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A curvature metric of the inner objective at a point (#2975 experiment): the Gauss–Newton
+/// `H̃` or the exact Hessian. `None` where it cannot be formed.
+pub(crate) type MetricFn<'a> = dyn Fn(&[f64]) -> Option<DMatrix<f64>> + 'a;
+
 /// [`dense_bfgs_core`], reporting how the search ended ([`InnerExit`]).
 #[allow(clippy::too_many_arguments)]
 fn dense_bfgs_run(
@@ -7159,6 +7231,42 @@ fn dense_bfgs_run(
     stop_precond: Option<&[f64]>,
     stall_at: &dyn Fn(&[f64]) -> bool,
     short_line_search: bool,
+) -> InnerExit {
+    dense_bfgs_run_with_metric(
+        obj,
+        prime,
+        grad,
+        x,
+        n,
+        max_iter,
+        tol,
+        precond,
+        hessian_seed,
+        stop_precond,
+        stall_at,
+        short_line_search,
+        None,
+    )
+}
+
+/// [`dense_bfgs_run`] with an optional per-iterate metric: at every accepted point a metric
+/// that forms replaces the BFGS update (a Newton / Fisher-scoring step under the same line
+/// search, stall logic and certificate).
+#[allow(clippy::too_many_arguments)]
+fn dense_bfgs_run_with_metric(
+    obj: &dyn Fn(&[f64]) -> f64,
+    prime: Option<&PrimeFn<'_>>,
+    grad: &dyn Fn(&[f64]) -> Vec<f64>,
+    x: &mut [f64],
+    n: usize,
+    max_iter: usize,
+    tol: f64,
+    precond: Option<&[f64]>,
+    hessian_seed: Option<&DMatrix<f64>>,
+    stop_precond: Option<&[f64]>,
+    stall_at: &dyn Fn(&[f64]) -> bool,
+    short_line_search: bool,
+    metric: Option<&MetricFn<'_>>,
 ) -> InnerExit {
     let seed_inv = seed_h_inv(n, hessian_seed);
     let mut h_inv = init_h_inv(n, precond, seed_inv.as_ref());
@@ -7325,7 +7433,16 @@ fn dense_bfgs_run(
         ) {
             return InnerExit::Stuck;
         }
-        if !reset {
+        // The metric at the new point, made saddle-free and inverted, replaces the update.
+        let fresh = metric
+            .and_then(|m| m(x))
+            .and_then(|h| seed_h_inv(n, Some(&crate::estimation::trust_region::saddle_free(&h))));
+        if let Some(hi) = fresh {
+            h_inv = hi;
+            h_unshaped = false;
+            #[cfg(test)]
+            METRIC_STEPS.with(|c| c.set(c.get() + 1));
+        } else if !reset {
             for i in 0..n {
                 y[i] = g_new[i] - g[i];
             }
