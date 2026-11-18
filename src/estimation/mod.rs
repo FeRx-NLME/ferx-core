@@ -30,6 +30,7 @@ pub mod saem_conddist;
 pub(crate) mod saem_exploration;
 pub(crate) mod saem_imh;
 pub(crate) mod saem_mixture;
+pub(crate) mod saem_px;
 pub mod sens_outer_gradient;
 pub mod sir;
 pub mod trace;

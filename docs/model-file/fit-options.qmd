@@ -874,6 +874,12 @@ Suits deep compartment models (`[covariate_nn]`), models where the FOCE inner lo
 | `saem_imh_defensive` | `0.05` | Weight of the prior `N(0, Ω)` component mixed into the IMH proposal, in `[0, 0.5]`. Without it a Laplace proposal can be stuck for a whole run on a conditional much flatter than its curvature at the mode; `0` disables it. |
 | `saem_imh_min_obs_per_eta` | `2.0` | Information gate for `saem_kernel = imh`: the fewest mean observations per subject per random effect at which the kernel runs. Below it the conditional is barely narrower than the prior and the kernel does not help; the fit runs `rw` and says so. `0` disables the gate. |
 
+### SAEM parameter expansion
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `saem_px` | `off` | Parameter-expanded Ω update (PX-SAEM; Liu, Rubin & Wu 1998, Biometrika 85; Lavielle & Meza 2007, Stat. Comput. 17): `off`, `exploration` (expanded update only while the exploration phase runs) or `all` (every iteration after the Ω burn-in). Each iteration the draws are rescaled by a lower-triangular matrix `A` that maximises the data part of the expected complete-data log-likelihood (one damped Newton step on the exact gradient and Hessian, backtracked on the objective), and Ω's statistic becomes `A·S·Aᵀ`. `A` has a free entry only where Ω has a free covariance, so a diagonal Ω keeps a diagonal `A` (only the variances rescale) and a `block_omega` block keeps its block, including its correlation. `A = I` is the plain update, and `A → I` at the maximum-likelihood estimate, so the same likelihood is maximised; near a variance boundary the data say little about the random effect and a scale below 1 contracts the variance in one step instead of at the (slow) missing-information rate. Not used with mixture models; if an exact derivative is unavailable for a subject the iteration takes `A = I`. Measured on a 5-eta two-compartment model: `all` closed the gap to the reference −2 log L (+2.9 to −0.6) for 1.3× the instructions. |
+
 ### The numerical θ/σ M-step
 
 The channel that estimates a theta the closed-form mu-reference update cannot

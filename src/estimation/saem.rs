@@ -6069,6 +6069,28 @@ pub fn run_saem(
             }
             eta_outer /= n_subjects as f64;
 
+            // `saem_px`: parameter-expanded Omega statistic `A S Aᵀ` (see `saem_px`); `A = I`
+            // (no change) when the exact derivatives are unavailable.
+            let px_now = match options.saem_px {
+                crate::types::SaemPx::Off => false,
+                crate::types::SaemPx::Exploration => k <= k1,
+                crate::types::SaemPx::All => true,
+            };
+            if px_now && k > omega_burnin && saem_mix.is_none() {
+                let pn = saem_state_to_params(&state, init_params, model.n_kappa);
+                let layout = crate::estimation::saem_px::PxLayout::block(&pn.omega);
+                if let Some(a) = crate::estimation::saem_px::px_matrix(
+                    model,
+                    population,
+                    &pn,
+                    &state.etas,
+                    &state.kappas,
+                    &layout,
+                ) {
+                    eta_outer = &a * &eta_outer * a.transpose();
+                }
+            }
+
             state.s2 = (1.0 - gamma_omega) * &state.s2 + gamma_omega * &eta_outer;
         }
 

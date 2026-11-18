@@ -2897,6 +2897,10 @@ pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
 pub ferx_core::types::SaemMstepSolver::ScoreSa
+pub enum ferx_core::types::SaemPx
+pub ferx_core::types::SaemPx::All
+pub ferx_core::types::SaemPx::Exploration
+pub ferx_core::types::SaemPx::Off
 pub enum ferx_core::types::ScaleAdaptation
 pub ferx_core::types::ScaleAdaptation::Interval
 pub ferx_core::types::ScaleAdaptation::RobbinsMonro
@@ -3429,6 +3433,7 @@ pub ferx_core::types::FitOptions::saem_n_exploration: core::option::Option<usize
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::types::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::types::FitOptions::saem_omega_burnin: usize
+pub ferx_core::types::FitOptions::saem_px: ferx_core::SaemPx
 pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::types::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::types::FitOptions::saem_seed: core::option::Option<u64>
@@ -4423,6 +4428,10 @@ pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa
 pub ferx_core::SaemMstepSolver::ScoreSa
+pub enum ferx_core::SaemPx
+pub ferx_core::SaemPx::All
+pub ferx_core::SaemPx::Exploration
+pub ferx_core::SaemPx::Off
 pub enum ferx_core::ScaleAdaptation
 pub ferx_core::ScaleAdaptation::Interval
 pub ferx_core::ScaleAdaptation::RobbinsMonro
@@ -5141,6 +5150,7 @@ pub ferx_core::FitOptions::saem_n_exploration: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::FitOptions::saem_n_mh_steps: usize
 pub ferx_core::FitOptions::saem_omega_burnin: usize
+pub ferx_core::FitOptions::saem_px: ferx_core::SaemPx
 pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
 pub ferx_core::FitOptions::saem_seed: core::option::Option<u64>
