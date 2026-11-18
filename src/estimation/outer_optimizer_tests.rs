@@ -6824,8 +6824,8 @@ pub(crate) mod outer_fd_fallback {
 
     /// A declined subject's gradient is one of four kinds, worst case over the fit: reconverged
     /// finite differences because no recorder serves it (structural), reconverged because the
-    /// exact route failed, zero (repelled, or dropped by the #1520 guard), or exact at its
-    /// re-solved EBE. The
+    /// exact route failed, zero (repelled, or dropped by the #1520 guard: two sentences, one per
+    /// producer), or exact at its re-solved EBE. The
     /// warning names each non-empty group with its count and the sentence true of it — never
     /// another's: "exact" for a subject that was not. Each cell asserts the sentence that
     /// must appear and the others that must not, so forcing any group reddens it; a subject
@@ -6844,9 +6844,13 @@ pub(crate) mod outer_fd_fallback {
              results are correct but slower.";
         const EXACT: &str = "were re-solved to their EBEs at the trial point and given the \
              exact analytic gradient there.";
-        const ZERO: &str = "contributed no gradient at the trial points where they declined: \
-             their objective there was non-finite or at the failed-subject sentinel (or the \
-             incumbent guard dropped them), so the optimizer rejects those points.";
+        const REPELLED: &str = "contributed no gradient at some of the trial points where \
+             they declined: their objective there was non-finite or at the failed-subject \
+             sentinel, so the population objective carries it and the optimizer rejects those \
+             points.";
+        const GUARDED: &str = "contributed no gradient at some of the trial points where they \
+             declined: the incumbent guard dropped them where the objective had blown up past \
+             the incumbent's, points the optimizer rejects.";
         const SKIPPED: &str = "1 of their salvage gradients were skipped";
         let warn_opt = |flags: &dyn Fn(&OuterFdDeclineLog), skipped: bool| {
             let log = OuterFdDeclineLog::new(2);
@@ -6866,7 +6870,8 @@ pub(crate) mod outer_fd_fallback {
                 ("STRUCT", STRUCT),
                 ("RECON", RECON),
                 ("EXACT", EXACT),
-                ("ZERO", ZERO),
+                ("REPELLED", REPELLED),
+                ("GUARDED", GUARDED),
             ] {
                 assert_eq!(
                     w.contains(sentence),
@@ -6877,29 +6882,81 @@ pub(crate) mod outer_fd_fallback {
         };
         // A decline nothing recorded a route for took no gradient: zero, never the held-EBE
         // sentence (#3009 review: the old fall-through said "held" for a zero-filled subject).
-        only(&warn(&|_| {}, false), ZERO);
+        // (Unreachable in a fit, every route records its kind; read as repelled.)
+        only(&warn(&|_| {}, false), REPELLED);
         only(
             &warn(
                 &|l| {
-                    l.record_zeroed(0);
-                    l.record_zeroed(1);
+                    l.record_repelled(0);
+                    l.record_repelled(1);
                 },
                 false,
             ),
-            ZERO,
+            REPELLED,
         );
-        // Zero on one evaluation, exact on another is a zero-contributing subject.
+        // The guard's drop is its own sentence: it names the guard, not the sentinel, and
+        // never claims an objective that was non-finite.
+        only(
+            &warn(
+                &|l| {
+                    l.record_guarded(0);
+                    l.record_guarded(1);
+                },
+                true,
+            ),
+            GUARDED,
+        );
+        // Zero on one evaluation, exact on another is a zero-contributing subject, and the
+        // sentence says "some of the trial points", not all.
         only(
             &warn(
                 &|l| {
                     l.record_exact(0);
                     l.record_exact(1);
-                    l.record_zeroed(0);
-                    l.record_zeroed(1);
+                    l.record_repelled(0);
+                    l.record_repelled(1);
                 },
                 false,
             ),
-            ZERO,
+            REPELLED,
+        );
+        only(
+            &warn(
+                &|l| {
+                    l.record_exact(0);
+                    l.record_exact(1);
+                    l.record_guarded(0);
+                    l.record_guarded(1);
+                },
+                false,
+            ),
+            GUARDED,
+        );
+        // A subject both repelled and guard-dropped is reported repelled (the worse: the
+        // sentinel is a property of the point, the guard's drop a choice at a rejected one).
+        only(
+            &warn(
+                &|l| {
+                    l.record_guarded(0);
+                    l.record_guarded(1);
+                    l.record_repelled(0);
+                    l.record_repelled(1);
+                },
+                false,
+            ),
+            REPELLED,
+        );
+        // Each subject reports what it got: one repelled, one guard-dropped.
+        let two = warn(
+            &|l| {
+                l.record_repelled(0);
+                l.record_guarded(1);
+            },
+            false,
+        );
+        assert!(
+            two.contains(&format!("of these, 1 {REPELLED} Another 1 {GUARDED}")),
+            "{two}"
         );
         // Every decline served exactly: no fallback ran, so nothing to warn about.
         assert!(
@@ -7253,6 +7310,101 @@ pub(crate) mod outer_fd_fallback {
         assert!(gap < 3e-6, "{gap:e}");
     }
 
+    /// #3009 review 3: the exact route returns the mode its gradient was taken at. A re-solve
+    /// left above `POLISH_TARGET_TOL` (here `inner_tol = 0.1`, so the tight twin stops at
+    /// 1e-3) is polished to the mode inside the adjoint pass, and the store must adopt that
+    /// polished mode, not the unpolished re-solve the pass started from: the gradient and the
+    /// stored `η̂` would then sit at different points.
+    ///
+    /// Asserted: the loose re-solve is off the true EBE (the premise, a straddle: a re-solve
+    /// the pass does not polish would pass the check below), the returned mode is the true EBE
+    /// to within the polish target, and the gradient is the exact one at the true EBE.
+    /// Mutation: returning the re-solve's own `η̂` (dropping the third element of
+    /// `subject_analytic_outer_gradient_dx`) puts the mode 1e-3 off, which reddens the mode
+    /// check and the premise's gap is what it is measured against.
+    #[test]
+    fn the_exact_route_returns_the_polished_mode_it_differentiated_at() {
+        use crate::estimation::inner_optimizer::find_ebe_for_stage;
+        let prep = crate::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+            .expect("prepare");
+        let model = &prep.parsed.model;
+        let subject = &prep.population.subjects[0];
+        let params = &prep.init_params;
+        let PackedStart { packed: x, .. } = pack_with_bounds(params);
+        let at = unpack_params(&x, params);
+        let gap = |a: &[f64], b: &[f64]| {
+            let mut w = 0.0f64;
+            for (u, v) in a.iter().zip(b) {
+                assert!(u.is_finite() && v.is_finite(), "{u} / {v}");
+                w = w.max((u - v).abs()); // nan-ok: every operand asserted finite above
+            }
+            w
+        };
+        // The inner solver finishes quadratically from a nearby start, so a loose tolerance does
+        // not by itself leave the re-solve off the mode: sweep tolerances and offsets, and test
+        // every case where it does (at least one must).
+        let mut straddled = 0;
+        for tol in [1.0, 100.0, 1e4, 1e6] {
+            for off in [0.5, 1.0, 2.0, 4.0] {
+                let loose = FitOptions {
+                    method: EstimationMethod::FoceI,
+                    interaction: true,
+                    inner_tol: tol,
+                    ..FitOptions::default()
+                };
+                let truth =
+                    find_ebe_for_stage(model, subject, &at, 500, 1e-12, None, None, 0, &loose);
+                let held = &truth.eta + DVector::from_element(model.n_eta, off);
+                let (_, resolve) = resolve_subject_ebe(
+                    &x,
+                    params,
+                    model,
+                    subject,
+                    held.as_slice(),
+                    crate::estimation::fd_resolution::tight_tol(loose.inner_tol),
+                    &loose,
+                );
+                if !crate::estimation::fd_resolution::ebe_resolved(&resolve) {
+                    continue;
+                }
+                let unpolished = gap(resolve.eta.as_slice(), truth.eta.as_slice());
+                let Some((g, mode)) =
+                    exact_at_resolved_ebe(&x, params, model, subject, &held, &loose)
+                else {
+                    continue;
+                };
+                let polished = gap(&mode, truth.eta.as_slice());
+                eprintln!(
+                    "MEASURE tol {tol} off {off}: unpolished re-solve {unpolished:.3e}, returned mode {polished:.3e}"
+                );
+                // Straddle: the pass polished this re-solve (it moved the mode), which a
+                // re-solve already within the polish target never triggers.
+                if gap(&mode, resolve.eta.as_slice()) == 0.0 {
+                    continue;
+                }
+                straddled += 1;
+                assert!(
+                    polished < unpolished * 0.1,
+                    "the returned mode is the polished one: {polished:e} vs unpolished {unpolished:e}"
+                );
+                let pt =
+                    crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).expect("pt");
+                let at_truth = subject_analytic_outer_gradient(
+                    model,
+                    subject,
+                    &pt,
+                    truth.eta.as_slice(),
+                    true,
+                )
+                .expect("served at the EBE");
+                let to_exact = worst_rel_gap(&g, &at_truth);
+                eprintln!("MEASURE gradient vs the exact one at the EBE {to_exact:.3e}");
+                assert!(to_exact < 1e-4, "{to_exact:e}");
+            }
+        }
+        assert!(straddled > 0, "premise: some loose re-solve is off the EBE");
+    }
+
     /// #3009 review 1, IOV: the joint `[η̂, κ̂]` mode comes back at the full stacked width,
     /// from an off-mode joint start, and is the re-solved one.
     #[test]
@@ -7303,7 +7455,7 @@ pub(crate) mod outer_fd_fallback {
     /// `η̂`) contributes zero and is recorded as such. The warning then says that, with the
     /// discriminator (the zero sentence) and its negatives (not the held-EBE remedy, not
     /// a reconverged difference). Without the flag the same log reads as exact and is silent
-    /// (second half), so dropping `record_zeroed` in [`non_iov_declined_salvage`] reddens it.
+    /// (second half), so dropping `record_repelled` in [`non_iov_declined_salvage`] reddens it.
     #[test]
     fn a_repelled_declined_subject_is_recorded_and_worded_as_zero() {
         let (model, _analytic, declining) = analytic_and_declining();
@@ -7344,8 +7496,8 @@ pub(crate) mod outer_fd_fallback {
         let w = outer_fd_fallback_warning(&pop, &log).expect("a zeroed decline warns");
         assert!(
             w.contains(
-                "of these, 1 were re-solved to their EBEs at the trial point and given the exact analytic gradient there. Another 1 contributed no gradient at the trial points where they declined"
-            ) && w.contains("Another 1 contributed"),
+                "of these, 1 were re-solved to their EBEs at the trial point and given the exact analytic gradient there. Another 1 contributed no gradient at some of the trial points where they declined: their objective there was non-finite or at the failed-subject sentinel"
+            ) && !w.contains("incumbent guard"),
             "{w}"
         );
         assert!(
@@ -7360,7 +7512,7 @@ pub(crate) mod outer_fd_fallback {
         log2.record(0);
         log2.record_exact(0);
         assert!(outer_fd_fallback_warning(&pop, &log2).is_none());
-        log2.record_zeroed(0);
+        log2.record_repelled(0);
         assert!(outer_fd_fallback_warning(&pop, &log2).is_some());
     }
 
@@ -9079,14 +9231,19 @@ pub(crate) mod outer_fd_fallback {
             1,
             "exactly one salvage skipped"
         );
-        // The dropped subject is recorded as a zero contribution (its worst kind is still
-        // structural, the worse of the two, so the sentence is the structural one).
+        // The dropped subject is recorded as a guard-dropped contribution (its worst kind is
+        // still structural, the worse of the two, so the sentence is the structural one), and
+        // not as repelled: the guard's drop is not a sentinel objective.
         assert!(
-            log_guarded.zeroed[1].load(Ordering::Relaxed),
-            "the guard's drop is recorded as zero"
+            log_guarded.guarded[1].load(Ordering::Relaxed),
+            "the guard's drop is recorded as guarded"
         );
         assert!(
-            !log_plain.zeroed[1].load(Ordering::Relaxed),
+            !log_guarded.repelled[1].load(Ordering::Relaxed),
+            "and not as repelled"
+        );
+        assert!(
+            !log_plain.guarded[1].load(Ordering::Relaxed),
             "and only the guard's"
         );
         let g0 = subject_analytic_outer_gradient(

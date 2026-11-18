@@ -5505,7 +5505,8 @@ fn ng_value_grad(
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
 pub(crate) use hessian::{
-    cov_non_gaussian_served, subject_adjoint_cov_block_at, subject_adjoint_cov_diag_at,
+    cov_non_gaussian_served, subject_adjoint_cov_block_at,
+    subject_adjoint_cov_block_with_gradient_at, subject_adjoint_cov_diag_at,
     subject_adjoint_cov_hessian_at,
 };
 #[cfg(test)]

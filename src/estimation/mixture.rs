@@ -595,7 +595,9 @@ pub(crate) fn mixture_gradient_with_modes(
 /// difference under class `k` ([`class_subject_reconverged_gradient`]) — `2·n_free`
 /// solves of one subject in one class, where the whole-objective
 /// [`mixture_gradient_fd`] re-solves every subject in every class per probe. A term
-/// whose posterior weight is exactly zero carries no gradient and is not differenced.
+/// whose posterior weight is exactly zero carries no gradient and is not differenced. Without
+/// `modes` (IOV only) the evaluation itself is re-solved, so the gradient is taken at one
+/// solve's joint modes and `eval` is not read.
 ///
 /// Each subject that took a salvage is recorded on `declines` (structural when no
 /// recorder serves the subject's data shape under that class, as
@@ -633,15 +635,17 @@ pub(crate) fn mixture_gradient_salvaged(
         ))
     };
     // An IOV gradient reads every class's κ̂. The caller's gate for producing them
-    // (`needs_class_modes`) is this one; a caller that did not have them gets them re-solved
-    // here from the same inputs, so the function is total over `modes`.
+    // (`needs_class_modes`) is this one; a caller that did not have them gets the evaluation
+    // re-solved here, η̂ and κ̂ together from one solve: a class's stacked `[η̂, κ̂]` is a joint
+    // stationary point only when both come from the same solve, and the caller's `eval` may
+    // have been warm-started to a different η̂, so its η̂ is not paired with a fresh κ̂.
     let resolved;
-    let modes = match modes {
+    let (eval, modes) = match modes {
         None if needs_class_modes(params) => {
-            resolved = mixture_ofv_with_modes(model, population, params, options, None).1;
-            Some(&resolved)
+            resolved = mixture_ofv_with_modes(model, population, params, options, None);
+            (&resolved.0, Some(&resolved.1))
         }
-        m => m,
+        m => (eval, m),
     };
     let rows = mixture_subject_gradients(
         model,
@@ -2059,6 +2063,73 @@ mod tests {
         assert!(with.iter().all(|g| g.is_finite()));
         assert_eq!(with.len(), without.len());
         for (a, b) in with.iter().zip(&without) {
+            assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+        }
+    }
+
+    /// #3009 review 3: an IOV mixture handed no class modes re-solves the evaluation, η̂ and κ̂
+    /// from one solve. The caller's `eval` here comes from a loose, warm-started solve whose η̂
+    /// differs from the cold one (asserted: the premise), so pairing its η̂ with a fresh κ̂ is
+    /// not a joint mode. The answer must be the gradient of the cold evaluation with its own
+    /// modes, bit for bit, and must not depend on the `eval` passed.
+    /// Mutation: keep the caller's `eval` and re-solve only the modes -> the bits differ.
+    #[test]
+    fn iov_mixture_gradient_without_class_modes_pairs_one_solves_eta_and_kappa() {
+        use crate::estimation::outer_optimizer::OuterFdDeclineLog;
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            inner_tol: 1e-10,
+            ..crate::types::FitOptions::default()
+        };
+        let loose = crate::types::FitOptions {
+            inner_tol: 1e-2,
+            inner_maxiter: 3,
+            ..crate::types::FitOptions::default()
+        };
+        let params = &model.default_params;
+        let (cold, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        let k = cold.etas_by_class.len();
+        let warm: Vec<Vec<nalgebra::DVector<f64>>> = (0..k)
+            .map(|_| {
+                (0..pop.subjects.len())
+                    .map(|_| nalgebra::DVector::from_element(model.n_eta, 0.7))
+                    .collect()
+            })
+            .collect();
+        let (warmed, _) = super::mixture_ofv_with_modes(&model, &pop, params, &loose, Some(&warm));
+        let mut apart = 0.0f64;
+        for (a, b) in cold
+            .etas_by_class
+            .iter()
+            .flatten()
+            .zip(warmed.etas_by_class.iter().flatten())
+        {
+            for (u, v) in a.iter().zip(b.iter()) {
+                assert!(u.is_finite() && v.is_finite());
+                apart = apart.max((u - v).abs()); // nan-ok: operands asserted finite above
+            }
+        }
+        eprintln!("MEASURE warm vs cold class eta apart {apart:.3e}");
+        assert!(
+            apart > 1e-3,
+            "premise: the warm eval's eta is off the cold one: {apart:e}"
+        );
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let want = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &cold,
+            Some(&modes),
+            &log,
+        );
+        let got =
+            super::mixture_gradient_salvaged(&model, &pop, params, &opts, &warmed, None, &log);
+        assert_eq!(want.len(), got.len());
+        for (a, b) in want.iter().zip(&got) {
+            assert!(a.is_finite() && b.is_finite());
             assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
         }
     }

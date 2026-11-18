@@ -3481,6 +3481,109 @@ fn log_packed_level_prep() -> (crate::api::PreparedRun, usize) {
     (p, k)
 }
 
+/// #3009 review 3: the log-packed conversions read their inputs once. `theta_derivative`
+/// takes θ unpacked once per call (it unpacked the whole parameter set per `(read, move)`
+/// pair), and the Newton matrix's `−∂/∂x` diagonal term comes out of the block's own pass
+/// (it recorded a second adjoint gradient only for it). Reference: the former formulas,
+/// reproduced here from the public adjoint entry points. The gradient is bit for bit the
+/// reference (the same values, unpacked once); the matrix is the reference to rounding of the
+/// `−∂/∂x` term (the block's `∇Ψ` against the standalone gradient: two different sweeps).
+/// Dies when the diagonal term is dropped, or θ is read from the wrong coordinate.
+#[test]
+fn log_packed_conversions_are_unchanged_by_reading_their_inputs_once() {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_block_at, subject_adjoint_gradient_at,
+    };
+    let (mut p, k) = log_packed_level_prep();
+    p.init_params.theta[k] = 2.0;
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let params = p.init_params.clone();
+    let x = pack_params(&params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
+    let zero = DVector::zeros(c.model.n_eta);
+    let reader = (0..p.population.subjects.len())
+        .find(|&i| {
+            layout.reads[i]
+                .iter()
+                .flat_map(|r| &r.moves)
+                .any(|&(j, _)| j == k)
+        })
+        .unwrap();
+    let s = c.resolve(reader, &params, &zero);
+    let subject = &p.population.subjects[reader];
+    let mode =
+        crate::estimation::covariance::stacked_mode(c.model, subject, &s.eta, Some(&s.kappas))
+            .unwrap();
+    let g = subject_adjoint_gradient_at(c.model, subject, &pt, &mode, c.objective()).unwrap();
+
+    // Gradient: the former per-pair unpack.
+    let want: Vec<f64> = layout.reads[reader]
+        .iter()
+        .map(|r| {
+            r.moves
+                .iter()
+                .map(|&(j, w)| {
+                    let packed = g[j];
+                    let d = if theta_packs_log(params.theta_lower[j]) {
+                        packed / unpack_params(&x, &params).theta[j]
+                    } else {
+                        packed
+                    };
+                    w * d
+                })
+                .sum()
+        })
+        .collect();
+    let got = c.total_gradient_adjoint(reader, &pt, &s).unwrap();
+    assert_eq!(want.len(), got.len());
+    assert!(
+        theta_packs_log(params.theta_lower[k]) && params.theta[k] != 1.0,
+        "fixture: the conversion is live"
+    );
+    for (a, b) in want.iter().zip(&got) {
+        assert!(a.is_finite() && b.is_finite());
+        assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+    }
+
+    // Matrix: the former second gradient for the diagonal term.
+    let mut touched: Vec<usize> = layout.reads[reader]
+        .iter()
+        .flat_map(|r| r.moves.iter().map(|&(j, _)| j))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let mut h = subject_adjoint_cov_block_at(c.model, subject, &pt, &mode, c.objective(), &touched)
+        .unwrap();
+    let gt: Vec<f64> = touched.iter().map(|&j| g[j]).collect();
+    ProfileCtx::theta_scale(&pt, &touched, 0, &gt, &mut h);
+    let m = DMatrix::from_fn(touched.len(), layout.reads[reader].len(), |t, a| {
+        layout.reads[reader][a]
+            .moves
+            .iter()
+            .filter(|&&(j, _)| j == touched[t])
+            .map(|&(_, w)| w)
+            .sum::<f64>()
+    });
+    let want_h = m.transpose() * h * &m;
+    let got_h = c.exact_hessian(reader, &pt, &s).unwrap();
+    let scale = want_h.iter().fold(0.0_f64, |a, v| {
+        assert!(v.is_finite());
+        a.max(v.abs())
+    });
+    let mut gap = 0.0_f64;
+    for (a, b) in want_h.iter().zip(got_h.iter()) {
+        assert!(a.is_finite() && b.is_finite());
+        gap = gap.max((a - b).abs()); // nan-ok: both operands asserted finite above
+    }
+    eprintln!(
+        "MEASURE one-pass Newton matrix vs two-pass: gap {:.3e} relative",
+        gap / scale
+    );
+    assert!(gap / scale < 1e-10, "{:.3e}", gap / scale);
+}
+
 /// A level that log-packs is served by the adjoint, not declined to re-solved differences
 /// (#2401 review row 1, #3004): the packed derivative is `∂/∂ln θ`, which
 /// [`ProfileCtx::theta_derivative`] divides by θ, and the Hessian's diagonal takes

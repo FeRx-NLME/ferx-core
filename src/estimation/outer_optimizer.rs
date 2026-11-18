@@ -10850,17 +10850,20 @@ fn exact_at_resolved_ebe(
         return None;
     }
     let stacked = joint_warm_start(&ebe.eta, &ebe.kappas);
-    let g = subject_analytic_outer_gradient_dx(
+    let (g, _, polished) = subject_analytic_outer_gradient_dx(
         model,
         subject,
         &pt,
         stacked.as_slice(),
         options.interaction,
         false,
-    )
-    .0
-    .ok()?;
-    Some((g, stacked.as_slice().to_vec()))
+    );
+    // A re-solve left above the polish target is polished inside the pass: the gradient is
+    // taken at that mode, so that is the mode the store must adopt, not the re-solve.
+    Some((
+        g.ok()?,
+        polished.unwrap_or_else(|| stacked.as_slice().to_vec()),
+    ))
 }
 
 /// A declined non-IOV subject's salvage ([`declined_salvage`]), unless it is **repelled** at
@@ -10898,7 +10901,7 @@ fn non_iov_declined_salvage(
     );
     match structural_fill(nll) {
         DeclinedFill::Zero => {
-            declines.record_zeroed(subj_idx);
+            declines.record_repelled(subj_idx);
             (vec![0.0; x.len()], None)
         }
         DeclinedFill::Reconverge => declined_salvage(
@@ -11476,7 +11479,7 @@ fn declined_subject_gradient(
     let n_obs = population.subjects[i].observations.len();
     if skip_fd_salvage(trial, i, n_obs, n_obs_total) {
         declines.record_skipped_salvage();
-        declines.record_zeroed(i);
+        declines.record_guarded(i);
         return (vec![0.0; np], None);
     }
     salvage()
@@ -11534,9 +11537,13 @@ pub(crate) struct OuterFdDeclineLog {
     /// The declined, non-structural subjects for which that failed too, so they took the
     /// reconverged finite-difference salvage.
     reconverged: Vec<std::sync::atomic::AtomicBool>,
-    /// The declined subjects that contributed **zero** at some trial point: repelled there
-    /// (non-finite or sentinel objective) or dropped by the #1520 guard.
-    zeroed: Vec<std::sync::atomic::AtomicBool>,
+    /// The declined subjects that contributed **zero** at some trial point because they were
+    /// repelled there (non-finite or sentinel objective at the held `η̂`).
+    repelled: Vec<std::sync::atomic::AtomicBool>,
+    /// The declined subjects the #1520 guard dropped at some trial point. Not
+    /// [`Self::repelled`]: the objective there was finite, the point merely blown up past the
+    /// incumbent's.
+    guarded: Vec<std::sync::atomic::AtomicBool>,
     /// How many `(subject, evaluation)` salvages [`skip_fd_salvage`] dropped (#1520). A
     /// count, not a per-subject flag: the same subject declining at two blown-up trials is
     /// two skipped salvages.
@@ -11576,9 +11583,11 @@ enum SalvageKind {
     Reconverged,
     /// The adjoint at its re-solved EBE: exact.
     Exact,
-    /// Nothing but zero: the subject was repelled at the trial points where it declined (or
-    /// the #1520 guard dropped it), so it contributed no gradient there.
-    Zero,
+    /// Zero at some trial point: the subject was repelled there (a non-finite or sentinel
+    /// objective at the held `η̂`), so it contributed no gradient.
+    Repelled,
+    /// Zero at some trial point because the #1520 guard dropped it there.
+    Guarded,
 }
 
 impl DeclineCause {
@@ -11609,7 +11618,10 @@ impl OuterFdDeclineLog {
             reconverged: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
-            zeroed: (0..n_subjects)
+            repelled: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            guarded: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
             skipped_salvages: AtomicUsize::new(0),
@@ -11712,10 +11724,17 @@ impl OuterFdDeclineLog {
         }
     }
 
-    /// Mark declined subject `i` as contributing zero at a trial point: repelled there, or
-    /// dropped by the #1520 guard. Rayon workers, `Relaxed`, as above.
-    pub(crate) fn record_zeroed(&self, i: usize) {
-        if let Some(flag) = self.zeroed.get(i) {
+    /// Mark declined subject `i` as contributing zero at a trial point because it was repelled
+    /// there. Rayon workers, `Relaxed`, as above.
+    pub(crate) fn record_repelled(&self, i: usize) {
+        if let Some(flag) = self.repelled.get(i) {
+            flag.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Mark declined subject `i` as dropped by the #1520 guard at a trial point.
+    pub(crate) fn record_guarded(&self, i: usize) {
+        if let Some(flag) = self.guarded.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
     }
@@ -11729,14 +11748,16 @@ impl OuterFdDeclineLog {
             SalvageKind::Structural
         } else if on(&self.reconverged) {
             SalvageKind::Reconverged
-        } else if on(&self.zeroed) {
-            SalvageKind::Zero
+        } else if on(&self.repelled) {
+            SalvageKind::Repelled
+        } else if on(&self.guarded) {
+            SalvageKind::Guarded
         } else if on(&self.exact) {
             SalvageKind::Exact
         } else {
             // Every route that declares a decline records its kind; a decline with none
-            // recorded took no gradient, which is what zero says.
-            SalvageKind::Zero
+            // recorded took no gradient, which is the repelled subject's outcome.
+            SalvageKind::Repelled
         }
     }
 
@@ -11793,8 +11814,10 @@ impl OuterFdDeclineLog {
 /// worst over the fit), so the consequence sentence names only what ran: reconverged
 /// finite differences for a subject no recorder serves ([`is_structural_decline`]) or whose
 /// exact route failed too (correct, slower); the exact gradient at the re-solved EBE
-/// (reported, but not a fallback, so alone it raises no warning); zero where the subject was
-/// repelled or the #1520 guard dropped it. The route is not passed in, so no caller can pair a log with the wrong sentence.
+/// (reported, but not a fallback, so alone it raises no warning); zero at some trial points
+/// where the subject was repelled (non-finite or sentinel objective) or where the #1520 guard
+/// dropped it, one sentence per producer, because the reason the optimizer rejects the point
+/// differs. The route is not passed in, so no caller can pair a log with the wrong sentence.
 ///
 /// "Could not be given" rather than "fell outside the provider's scope": the log records
 /// every failure of `subject_analytic_outer_gradient`, which includes a
@@ -11815,9 +11838,12 @@ pub(crate) fn outer_fd_fallback_warning(
         .and_then(|&i| population.subjects.get(i))
         .map(|s| format!(" (e.g. subject {})", s.id))
         .unwrap_or_default();
-    const ZERO: &str = "contributed no gradient at the trial points where they declined: \
-         their objective there was non-finite or at the failed-subject sentinel (or the \
-         incumbent guard dropped them), so the optimizer rejects those points.";
+    const REPELLED: &str = "contributed no gradient at some of the trial points where they \
+         declined: their objective there was non-finite or at the failed-subject sentinel, so \
+         the population objective carries it and the optimizer rejects those points.";
+    const GUARDED: &str = "contributed no gradient at some of the trial points where they \
+         declined: the incumbent guard dropped them where the objective had blown up past the \
+         incumbent's, points the optimizer rejects.";
     const STRUCTURAL: &str = "used reconverged finite-difference outer gradients because \
          no analytic recorder serves them: recording their exact derivatives failed, as it \
          will at every parameter point. Those gradients include the EBE-response term but \
@@ -11838,7 +11864,8 @@ pub(crate) fn outer_fd_fallback_warning(
         (count(SalvageKind::Structural), STRUCTURAL),
         (count(SalvageKind::Reconverged), RECONVERGED),
         (count(SalvageKind::Exact), EXACT),
-        (count(SalvageKind::Zero), ZERO),
+        (count(SalvageKind::Repelled), REPELLED),
+        (count(SalvageKind::Guarded), GUARDED),
     ]
     .into_iter()
     .filter(|&(n, _)| n > 0)

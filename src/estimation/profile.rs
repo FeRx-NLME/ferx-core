@@ -1210,9 +1210,7 @@ impl ProfileCtx<'_> {
         pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
         s: &SubjectState,
     ) -> Option<DMatrix<f64>> {
-        use crate::sens::ode_provider::adjoint::{
-            subject_adjoint_cov_block_at, subject_adjoint_gradient_at,
-        };
+        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_with_gradient_at;
         let subject = &self.population.subjects[i];
         let mode = crate::estimation::covariance::stacked_mode(
             self.model,
@@ -1227,7 +1225,8 @@ impl ProfileCtx<'_> {
             .collect();
         touched.sort_unstable();
         touched.dedup();
-        let mut h = subject_adjoint_cov_block_at(
+        // The diagonal's `−∂/∂x` of a log-packed θ is the block's own pass's gradient.
+        let (g, mut h) = subject_adjoint_cov_block_with_gradient_at(
             self.model,
             subject,
             pt,
@@ -1236,10 +1235,7 @@ impl ProfileCtx<'_> {
             &touched,
         )?;
         if self.reads_a_log_packed_level(i, pt.template) {
-            // The diagonal's `−∂/∂x` needs the packed gradient at the same mode.
-            let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, self.objective())?;
-            let gt: Vec<f64> = touched.iter().map(|&k| g[k]).collect();
-            Self::theta_scale(pt, &touched, 0, &gt, &mut h);
+            Self::theta_scale(pt, &touched, 0, &g, &mut h);
         }
         let m = DMatrix::from_fn(touched.len(), reads.len(), |t, a| {
             reads[a]
@@ -1351,16 +1347,13 @@ impl ProfileCtx<'_> {
         }
     }
 
-    /// `∂/∂θ_k` from the packed `∂/∂x_k`: `θ_k` is divided out where it log-packs.
-    fn theta_derivative(
-        pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
-        k: usize,
-        packed: f64,
-    ) -> f64 {
-        if !theta_packs_log(pt.template.theta_lower[k]) {
+    /// `∂/∂θ_k` from the packed `∂/∂x_k`: `θ_k` (`theta`, unpacked once by the caller) is
+    /// divided out where it log-packs.
+    fn theta_derivative(template: &ModelParameters, theta: &[f64], k: usize, packed: f64) -> f64 {
+        if !theta_packs_log(template.theta_lower[k]) {
             return packed;
         }
-        packed / unpack_params(pt.x, pt.template).theta[k]
+        packed / theta[k]
     }
 
     /// The exact total gradient of subject `i`'s term over its levels (#2109): one adjoint
@@ -1388,12 +1381,14 @@ impl ProfileCtx<'_> {
             Some(&s.kappas),
         )?;
         let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, self.objective())?;
+        // One unpack per call, not per (read, move) pair.
+        let theta = unpack_params(pt.x, pt.template).theta;
         let out: Vec<f64> = self.layout.reads[i]
             .iter()
             .map(|r| {
                 r.moves
                     .iter()
-                    .map(|&(k, c)| c * Self::theta_derivative(pt, k, g[k]))
+                    .map(|&(k, c)| c * Self::theta_derivative(pt.template, &theta, k, g[k]))
                     .sum()
             })
             .collect();
@@ -4429,9 +4424,7 @@ impl ProfileCtx<'_> {
         free: &[usize],
         solve: &ProfileSolve,
     ) -> Option<(DMatrix<f64>, DMatrix<f64>, DMatrix<f64>)> {
-        use crate::sens::ode_provider::adjoint::{
-            subject_adjoint_cov_block_at, subject_adjoint_gradient_at,
-        };
+        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_with_gradient_at;
         let subject = &self.population.subjects[i];
         let mode = crate::estimation::covariance::stacked_mode(
             self.model,
@@ -4448,12 +4441,16 @@ impl ProfileCtx<'_> {
         touched.dedup();
         let nf = free.len();
         let axes: Vec<usize> = free.iter().chain(&touched).copied().collect();
-        let mut h =
-            subject_adjoint_cov_block_at(self.model, subject, pt, &mode, self.objective(), &axes)?;
+        let (g, mut h) = subject_adjoint_cov_block_with_gradient_at(
+            self.model,
+            subject,
+            pt,
+            &mode,
+            self.objective(),
+            &axes,
+        )?;
         if self.reads_a_log_packed_level(i, pt.template) {
-            let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, self.objective())?;
-            let gt: Vec<f64> = touched.iter().map(|&k| g[k]).collect();
-            Self::theta_scale(pt, &axes, nf, &gt, &mut h);
+            Self::theta_scale(pt, &axes, nf, &g[nf..], &mut h);
         }
         let m = DMatrix::from_fn(touched.len(), reads.len(), |t, a| {
             reads[a]
