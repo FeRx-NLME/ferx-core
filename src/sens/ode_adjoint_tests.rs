@@ -11162,8 +11162,10 @@ const IV_LAG: &str = r#"
 /// The plan recorded at the first lag serves the second lag on its side of the branch and a
 /// third lag across it (where its guard must decline and the walk re-record, never serve the
 /// other side's shape): values against the native predictor, and the adjoint gradient against a
-/// fresh recording on a re-parse (own plan identity) of the model at the same point. Dies when the
-/// replay's phase or window end stops following the lag.
+/// fresh recording on a re-parse (own plan identity) of the model at the same point. The value
+/// pass records nothing (#3010), so its values are checked at every lag once the gradient has
+/// recorded that lag's structure. Dies when the replay's phase or window end stops following the
+/// lag.
 #[test]
 fn a_lagged_ss_infusion_plan_replays_at_other_lags_on_both_sides_of_the_window_end() {
     let model = parse_model_string(IV_LAG).unwrap();
@@ -11183,14 +11185,16 @@ fn a_lagged_ss_infusion_plan_replays_at_other_lags_on_both_sides_of_the_window_e
     );
     let doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 3.0)];
     let s = subject(&model, doses, &[0.5, 1.0, 2.0, 3.5, 5.0], &etas[0]);
-    // Values: the one plan (recorded at the first point) against the native predictor.
+    // Values: the plan recorded at the first point is the native predictor's bits there; a point
+    // its guard does not hold at is declined — never served the other side's shape — and the
+    // value pass leaves it to the native predictor without recording (#3010).
     let theta = params.theta.clone();
     let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&model, &s, &theta, e);
-    let (served, worst) = plan_values_ulps(&model, &s, None, &etas, &native);
-    eprintln!("lagged SS infusion replay: served {served}, worst {worst} ulp");
-    assert!(served, "the plan serves every lag (or re-records)");
-    // Measured 0 ulp (Linux x86_64): the replay is the native predictor's bits at every lag.
+    let (served, worst) = plan_values_ulps(&model, &s, None, &etas[..1], &native);
+    assert!(served, "the first point is served");
     assert_eq!(worst, 0, "values: {worst} ulp from the native predictor");
+    let (served, _) = plan_values_ulps(&model, &s, None, &etas[2..3], &native);
+    assert!(!served, "across the branch the value pass declines");
     // Gradients: replay on the recording model, fresh on a re-parse.
     let x = pack_params(&params);
     let grad = |m: &CompiledModel, e: &[f64]| {
@@ -11215,6 +11219,13 @@ fn a_lagged_ss_infusion_plan_replays_at_other_lags_on_both_sides_of_the_window_e
         gap < 1e-12,
         "replayed gradient off a fresh recording by {gap:e}"
     );
+    // The gradient recorded every lag's structure, both sides of the branch: now the value pass
+    // serves each lag from the plans, the native predictor's bits at every one.
+    let (served, worst) = plan_values_ulps(&model, &s, None, &etas, &native);
+    eprintln!("lagged SS infusion replay: served {served}, worst {worst} ulp");
+    assert!(served, "every lag served once its structure is recorded");
+    // Measured 0 ulp (Linux x86_64): the replay is the native predictor's bits at every lag.
+    assert_eq!(worst, 0, "values: {worst} ulp from the native predictor");
 }
 
 /// A subject's plan is keyed by its design, `DoseEvent::implied` included (#2786 review #4).
@@ -12093,6 +12104,87 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     );
     assert!(ran >= 60, "only {ran} subjects ran");
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
+}
+
+/// A linear `[odes]` model whose infusion end moves with η (`D1`, `RATE=-2`).
+const ONE_CPT_D1_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVD1(2.0, 0.1, 24.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_D1 ~ 0.09
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  D1 = TVD1 * exp(ETA_D1)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// A point no plan of the subject serves — the infusion end moved by η across an observation —
+/// is the native predictor's in the objective's value pass: `plan_values` declines it without
+/// recording (#3010). Recording it there cost a whole recording (a few hundred thousand
+/// instructions) per objective value of an EBE search, and three quarters of a fit's time on a
+/// modeled-infusion model. The gradient's lookup (`with_plan`) still records the point, after
+/// which the value pass serves it. Mutation: `record_miss = true` in `plan_values` -> the moved
+/// point is served, by a recording.
+#[test]
+fn plan_values_declines_a_point_no_plan_serves_without_recording() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::stats::likelihood::plan_value_route;
+    use crate::types::RateMode::ModeledDuration;
+    let model = parse_model_string(ONE_CPT_D1_ODE).unwrap();
+    assert!(plan_value_route(&model));
+    let d = |t| DoseEvent::modeled(t, 100.0, 1, false, 0.0, ModeledDuration);
+    let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
+    let s = subject(&model, vec![d(0.0), d(12.0)], &times, &[0.0; 2]);
+    let theta = moved_params(&model).theta;
+    let (e0, e1) = (vec![0.0, 0.0], vec![0.0, 0.2]);
+    // The straddle: the window ends before the observation at 2.5 at `e0`, after it at `e1`
+    // (and so for the second dose's at 14.5), so the two points have different structures.
+    let end = |e: &[f64]| theta[2] * e[1].exp();
+    assert!(
+        end(&e0) < 2.5 && end(&e1) > 2.5,
+        "{} {}",
+        end(&e0),
+        end(&e1)
+    );
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&model, &s, &theta, e);
+    let planned = || kj::TEMPLATE_PROBE.with(|p| p.replace((false, 0, 0)).1);
+    let values = |e: &[f64]| {
+        let mut out = Vec::new();
+        plan_values(&model, &s, None, &theta, e, &mut out).then_some(out)
+    };
+    planned();
+    // The first point records: the subject has no plan yet.
+    let got = values(&e0).expect("the first point is served");
+    assert_eq!(planned(), 1, "the subject's first plan is recorded");
+    assert_eq!(got, native(&e0));
+    // The moved point: no plan serves it, and the value pass does not record one.
+    assert!(values(&e1).is_none(), "the moved point is declined");
+    assert_eq!(planned(), 0, "declined without a recording");
+    // The gradient's lookup records it; then the value pass serves it.
+    let n = s.observations.len();
+    with_plan(&model, &s, None, &theta, &e1, &mut |p| {
+        kjit_run(p, &theta, &e1, n)
+    })
+    .expect("the gradient's lookup serves the moved point");
+    assert_eq!(
+        planned(),
+        1,
+        "the gradient's lookup records the moved point"
+    );
+    let got = values(&e1).expect("the recorded variant serves the moved point");
+    assert_eq!(planned(), 0);
+    assert_eq!(got, native(&e1));
 }
 
 /// The structured kernel's reduce is one plan shared by every subject (`kernel_run_shared`,

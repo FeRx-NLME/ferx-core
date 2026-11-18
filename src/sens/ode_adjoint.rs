@@ -2636,13 +2636,16 @@ pub(crate) fn plan_values(
     let n_obs = subject.observations.len();
     out.clear();
     out.resize(n_obs, 0.0);
-    let served = with_plan_in(
+    // A point no plan serves is the native predictor's (the same values): recording it would
+    // cost a full recording for one objective value.
+    let served = with_plan_in_or(
         eff,
         subject,
         lay.as_deref(),
         theta,
         None,
         &eta_p,
+        false,
         &mut |plan| {
             if plan.n_out() != n_obs {
                 return None;
@@ -2693,6 +2696,22 @@ fn with_plan_in<R>(
     eta: &[f64],
     serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
 ) -> Option<R> {
+    with_plan_in_or(model, subject, lay, theta, sigma, eta, true, serves)
+}
+
+/// [`with_plan_in`]; `record_miss = false` records only a subject that has no plan yet, and
+/// answers `None` where its plans do not serve the point ([`plan_or_record`]).
+#[allow(clippy::too_many_arguments)]
+fn with_plan_in_or<R>(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    sigma: Option<&[f64]>,
+    eta: &[f64],
+    record_miss: bool,
+    serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
+) -> Option<R> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
     // An endpoint-only subject has no prediction rows to record (its terms have their own
     // plans, `terms::term_plans`).
@@ -2719,6 +2738,7 @@ fn with_plan_in<R>(
         &build,
         &fits,
         &|key| kjit_record(model, subject, lay, theta, eta, None, sigma, key),
+        record_miss,
         serves,
     )
 }
@@ -2729,7 +2749,11 @@ fn with_plan_in<R>(
 /// it cannot (a recording whose predictions overflow) never evicts a good one. With a `hot` key
 /// the variants this thread last found for the subject are tried before the key's fingerprints
 /// and registry reads are paid for (`build` runs only on a hot miss, or to record); when they do
-/// not serve, the plans are not tried a second time through the lookup.
+/// not serve, the plans are not tried a second time through the lookup. With `record_miss`
+/// false a subject whose plans do not serve the point is answered `None`, not recorded again:
+/// a caller with another way to the answer (the value pass's native predictor,
+/// [`plan_values`]) does not pay a recording for a point whose structure — an infusion end
+/// that moved with η across an observation — no plan has.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_or_record<R>(
     model: &CompiledModel,
@@ -2741,6 +2765,7 @@ pub(super) fn plan_or_record<R>(
     record: &dyn Fn(
         &crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
     ) -> Option<(PlanArc, bool)>,
+    record_miss: bool,
     serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
 ) -> Option<R> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
@@ -2778,6 +2803,9 @@ pub(super) fn plan_or_record<R>(
             }
         }
         kj::STATS.guard_fail.fetch_add(1, Relaxed);
+        if !record_miss {
+            return None;
+        }
     }
     let key = key_cell.unwrap_or_else(build);
     let (plan, sane) = record(&key)?;
@@ -2831,6 +2859,7 @@ pub(super) fn with_plan_nn<R>(
         &build,
         &fits,
         &|key| kjit_record(model, subject, None, theta, eta, Some(nn_z), sigma, key),
+        true,
         serves,
     )
 }

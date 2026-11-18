@@ -930,7 +930,9 @@ const BEFORE_SHARED_SAEM_TH_WT: f64 = 0.010_075;
 const BEFORE_SHARED_IMPMAP_TH_CRCL: f64 = 0.358_114;
 const BEFORE_SHARED_IMPMAP_TVCL: f64 = 4.744_483;
 
-/// Bounds against the NONMEM anchors, from the realised errors on aarch64
+/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3021; the
+/// tables below are the pre-#3021 single-seed errors, whose seeds 1-3 shared 29 of 30
+/// subject streams), from the realised errors on aarch64
 /// (`ci-test`) at the time of writing:
 ///
 /// | arm | `THETA_WT` | `THETA_CRCL` | `TVCL` |
@@ -984,10 +986,60 @@ fn fit_shared(edit: impl FnOnce(&mut FitOptions)) -> FitResult {
     result
 }
 
+/// The seeds every #1620 / #1630 SAEM arm is run over, asserting on the **median** of the
+/// fits (#3021). The bounds below were tuned to the one Monte Carlo path of seed 1 (and a
+/// "spread over seeds 1/2/3", whose streams overlapped before #3021). Hashing the streams
+/// (#3021) moved seed 1 onto another path of the same noisy distribution: over 15 seeds
+/// `THETA_WT` has sd 0.058 (150/250), 0.051 (300/700) and 0.153 (`score_sa`, one seed at
+/// 1.20) — the pre-#3021 streams measured sd 0.074 / 0.070 / 0.048 on the same seeds, so the
+/// noise is the fixture's, not the change's — so no single seed can honour the 0.04
+/// bound. The median of 9 seeds can: its worst realised error over the 7 windows of
+/// consecutive seeds 1..15 is `THETA_WT` 0.016 / 0.020 / 0.028, `THETA_CRCL` ≤ 0.0042,
+/// `TVCL` ≤ 0.0050 (shared arms), A: `THETA_CRCL` 0.0002, `TVCL` 0.0014, typical V1 0.12
+/// (Linux x86_64, `ci-fast`) — each inside the bound with 1.4× or more headroom, and the
+/// pre-fix values stay far outside (below). Case B needs more seeds: [`ANCHOR_B_SEEDS`].
+const SAEM_SEEDS: std::ops::RangeInclusive<u64> = 1..=9;
+
+/// Case B's seeds: 25, not [`SAEM_SEEDS`]' 9. `THETA_WT_V1` is trimodal on this fixture
+/// (#3021 review; seeds 1..=40, macOS arm64 `ci-test`, the profile the slow-tests job
+/// runs): 20 of 40 seeds land within 0.05 of NONMEM's 0.591, 9 in a low mode 0.21–0.54
+/// around the pre-#1630 value, 11 high at 0.64–1.43. A 9-seed median failed the 0.05
+/// bound on 5 of the 32 windows of consecutive seeds (worst error 0.215), so seeds 1..=9
+/// passed by luck of the draw. Over every 25-seed window of 1..=40 the median's worst error
+/// is `THETA_WT_V1` 0.0226 (bound 0.05) and typical V1 0.529 (bound 1.2), and it stays at
+/// least 0.167 / 1.93 clear of the pre-#1630 values (margins 0.15 / 1.5). 0.55 s a fit.
+const ANCHOR_B_SEEDS: std::ops::RangeInclusive<u64> = 1..=25;
+
+fn median(mut v: Vec<f64>) -> f64 {
+    assert!(
+        v.iter().all(|x| x.is_finite()),
+        "non-finite fit values {v:?}"
+    );
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+fn median_theta(results: &[FitResult], name: &str) -> f64 {
+    median(results.iter().map(|r| theta(r, name)).collect())
+}
+
+/// [`fit_shared`] over [`SAEM_SEEDS`].
+fn fit_shared_seeds(edit: impl Fn(&mut FitOptions)) -> Vec<FitResult> {
+    SAEM_SEEDS
+        .map(|seed| {
+            fit_shared(|o| {
+                edit(o);
+                o.saem_seed = Some(seed);
+            })
+        })
+        .collect()
+}
+
 /// The SAEM arms share one body, so an arm cannot drift onto weaker
-/// assertions than its siblings.
-fn assert_saem_shared_arm(name: &str, result: &FitResult) {
-    let th_wt = theta(result, "THETA_WT");
+/// assertions than its siblings. `results` is one fit per seed of
+/// [`SAEM_SEEDS`]; the bounds apply to the median.
+fn assert_saem_shared_arm(name: &str, results: &[FitResult]) {
+    let th_wt = median_theta(results, "THETA_WT");
     assert_finite_close(
         &format!("{name}: THETA_WT"),
         th_wt,
@@ -1001,13 +1053,13 @@ fn assert_saem_shared_arm(name: &str, result: &FitResult) {
     );
     assert_finite_close(
         &format!("{name}: THETA_CRCL"),
-        theta(result, "THETA_CRCL"),
+        median_theta(results, "THETA_CRCL"),
         NM_SHARED_SAEM_TH_CRCL,
         SHARED_TH_CRCL_TOL,
     );
     assert_finite_close(
         &format!("{name}: TVCL"),
-        theta(result, "TVCL"),
+        median_theta(results, "TVCL"),
         NM_SHARED_SAEM_TVCL,
         SHARED_TVCL_TOL,
     );
@@ -1024,8 +1076,8 @@ fn assert_saem_shared_arm(name: &str, result: &FitResult) {
     ignore = "slow + NONMEM-anchored shared covariate theta (#1620): opt in with --features slow-tests"
 )]
 fn saem_recovers_a_shared_allometric_exponent() {
-    let result = fit_shared(|_| {});
-    assert_saem_shared_arm("SAEM 150/250", &result);
+    let results = fit_shared_seeds(|_| {});
+    assert_saem_shared_arm("SAEM 150/250", &results);
 }
 
 /// Tier-3, #1620 (T11). The same anchor through `score_sa` and through the
@@ -1037,9 +1089,9 @@ fn saem_recovers_a_shared_allometric_exponent() {
     ignore = "slow + NONMEM-anchored shared covariate theta (#1620): opt in with --features slow-tests"
 )]
 fn saem_recovers_a_shared_allometric_exponent_on_every_mstep_arm() {
-    let sa = fit_shared(|o| o.saem_mstep_solver = SaemMstepSolver::ScoreSa);
+    let sa = fit_shared_seeds(|o| o.saem_mstep_solver = SaemMstepSolver::ScoreSa);
     assert_saem_shared_arm("SAEM score_sa 150/250", &sa);
-    let long = fit_shared(|o| {
+    let long = fit_shared_seeds(|o| {
         o.saem_n_exploration = 300;
         o.saem_n_convergence = 700;
     });
@@ -1103,7 +1155,9 @@ const BEFORE_ANCHOR_A_TH_CRCL: f64 = 0.213_731;
 const BEFORE_ANCHOR_B_TH_WT_V1: f64 = 0.401_657;
 const BEFORE_ANCHOR_B_TVV1: f64 = 94.696_502 * 0.483_249;
 
-/// Bounds against the NONMEM anchors, from the realised errors (Linux x86_64,
+/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3021; the
+/// table below is the pre-#3021 single-seed errors, whose seeds 1-3 shared 29 of 30 subject
+/// streams), from the realised errors (Linux x86_64,
 /// release) at the time of writing, seed 1 being the tested arm:
 ///
 /// | arm | `THETA_CRCL` | `TVCL` | typical V1 | `THETA_WT_V1` |
@@ -1161,17 +1215,26 @@ fn fit_anchor_twin(file: &str, edit: impl FnOnce(&mut FitOptions)) -> (FitResult
     ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
 )]
 fn saem_merges_a_group_reading_a_superseded_anchor() {
-    let (result, notes) = fit_anchor_twin("covmuref_anchor_a_saem_fit.ferx", |_| {});
-    assert_eq!(
-        notes,
-        vec![
-            "SAEM: covariate mu-references on ETA_CL (reads TVCL, THETA_WT, THETA_CRCL) and \
-             ETA_V1 (reads TVCL, THETA_WT_V1, TH_R) share TVCL and take one joint M-step that \
-             re-centres both (#1620)."
-                .to_string()
-        ]
-    );
-    let th_crcl = theta(&result, "THETA_CRCL");
+    let fits: Vec<(FitResult, Vec<String>)> = SAEM_SEEDS
+        .map(|seed| {
+            fit_anchor_twin("covmuref_anchor_a_saem_fit.ferx", |o| {
+                o.saem_seed = Some(seed)
+            })
+        })
+        .collect();
+    for (_, notes) in &fits {
+        assert_eq!(
+            notes,
+            &vec![
+                "SAEM: covariate mu-references on ETA_CL (reads TVCL, THETA_WT, THETA_CRCL) and \
+                 ETA_V1 (reads TVCL, THETA_WT_V1, TH_R) share TVCL and take one joint M-step that \
+                 re-centres both (#1620)."
+                    .to_string()
+            ]
+        );
+    }
+    let results: Vec<FitResult> = fits.into_iter().map(|(r, _)| r).collect();
+    let th_crcl = median_theta(&results, "THETA_CRCL");
     assert_finite_close(
         "A: THETA_CRCL",
         th_crcl,
@@ -1179,17 +1242,20 @@ fn saem_merges_a_group_reading_a_superseded_anchor() {
         ANCHOR_TH_CRCL_TOL,
     );
     assert!(
-        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.3,
+        // 0.335, not the 0.328 the ±ANCHOR_TH_CRCL_TOL band already implies, so this
+        // check can fail on its own: the 9-seed median sat 0.0002 off NONMEM (0.3425 clear).
+        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.335,
         "A: THETA_CRCL = {th_crcl:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_A_TH_CRCL}"
     );
-    let tvcl = theta(&result, "TVCL");
+    let tvcl = median_theta(&results, "TVCL");
     assert_finite_close("A: TVCL", tvcl, NM_ANCHOR_A_TVCL, ANCHOR_TVCL_TOL);
-    assert_finite_close(
-        "A: TVCL·TH_R",
-        tvcl * theta(&result, "TH_R"),
-        NM_ANCHOR_A_TVV1,
-        ANCHOR_A_TVV1_TOL,
+    let v1 = median(
+        results
+            .iter()
+            .map(|r| theta(r, "TVCL") * theta(r, "TH_R"))
+            .collect(),
     );
+    assert_finite_close("A: TVCL·TH_R", v1, NM_ANCHOR_A_TVV1, ANCHOR_A_TVV1_TOL);
 }
 
 /// Tier-3, #1630 case B. `V1` reads `TVV2`, the plain anchor of `ETA_V2`,
@@ -1205,19 +1271,28 @@ fn saem_merges_a_group_reading_a_superseded_anchor() {
     ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
 )]
 fn saem_takes_a_colliding_plain_anchor_into_the_group() {
-    let (result, notes) = fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
-        o.saem_n_exploration = 300;
-        o.saem_n_convergence = 700;
-    });
-    assert_eq!(
-        notes,
-        vec![
-            "SAEM: mu-references on ETA_V1 (reads TVV2, THETA_WT_V1, TH_R) and ETA_V2 (anchored \
-             on TVV2) share TVV2 and take one joint M-step that re-centres both (#1620, #1630)."
-                .to_string()
-        ]
-    );
-    let th_wt_v1 = theta(&result, "THETA_WT_V1");
+    let fits: Vec<(FitResult, Vec<String>)> = ANCHOR_B_SEEDS
+        .map(|seed| {
+            fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
+                o.saem_seed = Some(seed);
+                o.saem_n_exploration = 300;
+                o.saem_n_convergence = 700;
+            })
+        })
+        .collect();
+    for (_, notes) in &fits {
+        assert_eq!(
+            notes,
+            &vec![
+                "SAEM: mu-references on ETA_V1 (reads TVV2, THETA_WT_V1, TH_R) and ETA_V2 \
+                 (anchored on TVV2) share TVV2 and take one joint M-step that re-centres both \
+                 (#1620, #1630)."
+                    .to_string()
+            ]
+        );
+    }
+    let results: Vec<FitResult> = fits.into_iter().map(|(r, _)| r).collect();
+    let th_wt_v1 = median_theta(&results, "THETA_WT_V1");
     assert_finite_close(
         "B: THETA_WT_V1",
         th_wt_v1,
@@ -1225,13 +1300,22 @@ fn saem_takes_a_colliding_plain_anchor_into_the_group() {
         ANCHOR_B_TH_WT_V1_TOL,
     );
     assert!(
+        // 0.15, above the 0.139 the ±ANCHOR_B_TH_WT_V1_TOL band implies: every measured
+        // 25-seed median sat ≥ 0.167 clear of the pre-#1630 value (see ANCHOR_B_SEEDS).
         (th_wt_v1 - BEFORE_ANCHOR_B_TH_WT_V1).abs() > 0.15,
         "B: THETA_WT_V1 = {th_wt_v1:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TH_WT_V1}"
     );
-    let tvv1 = theta(&result, "TVV2") * theta(&result, "TH_R");
+    let tvv1 = median(
+        results
+            .iter()
+            .map(|r| theta(r, "TVV2") * theta(r, "TH_R"))
+            .collect(),
+    );
     assert_finite_close("B: TVV2·TH_R", tvv1, NM_ANCHOR_B_TVV1, ANCHOR_B_TVV1_TOL);
     assert!(
-        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 2.0,
+        // 1.5, above the 1.26 the ±ANCHOR_B_TVV1_TOL band implies: every measured 25-seed
+        // median sat ≥ 1.93 clear of the pre-#1630 value (see ANCHOR_B_SEEDS).
+        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 1.5,
         "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
     );
 }

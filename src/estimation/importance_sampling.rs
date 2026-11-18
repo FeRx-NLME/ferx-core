@@ -12,8 +12,8 @@
 //! (sparse-data PK, strong nonlinearity).
 //!
 //! The kernel is rayon-parallel over subjects; per-subject RNGs are seeded
-//! from `options.imp_seed.wrapping_add(i as u64)` so the result is
-//! deterministic for a given seed.
+//! from `stream_seed(options.imp_seed, &[i])` (#3021: a hash, so runs under consecutive
+//! seeds share no subject stream) so the result is deterministic for a given seed.
 //!
 //! ## Adaptive evaluation (#2653)
 //!
@@ -70,13 +70,7 @@ pub(crate) fn inv_normal_cdf(u: f64) -> f64 {
     crate::stats::special::normal_inv_cdf(u.clamp(1e-15, 1.0 - 1e-15))
 }
 
-/// SplitMix64 finaliser: decorrelates the per-coordinate scramble seeds.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
+use crate::rng::{splitmix64, stream_seed};
 
 /// Hash-based nested uniform (Owen) scramble of a 32-bit Sobol coordinate
 /// (Burley 2020, "Practical Hash-based Owen Scrambling", after Laine & Karras
@@ -782,7 +776,7 @@ pub fn run_importance_sampling(
             }
             let eta_hat = &eta_hats[i];
             let kap = kappas.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            let subj_seed = seed.wrapping_add(i as u64);
+            let subj_seed = stream_seed(seed, &[i as u64]);
 
             if model.n_kappa > 0 && !kap.is_empty() {
                 // Joint (eta, kappa) sampling for IOV models. Ω_iov is guaranteed
@@ -1175,9 +1169,7 @@ pub fn run_importance_sampling_mixture(
                     scratch,
                 );
                 let defensive = DefensiveMixture::new(&omega_inv, n_eta, defensive_alpha);
-                let subj_seed = seed
-                    .wrapping_add(i as u64)
-                    .wrapping_add((c as u64).wrapping_shl(40));
+                let subj_seed = stream_seed(seed, &[i as u64, c as u64]);
                 let (center, h_final) = adapted_eta_proposal(
                     model,
                     subject,
@@ -2154,9 +2146,7 @@ fn iscale_pilot_grid_search(
         let frac = g as f64 / (N_GRID - 1) as f64;
         let scale = (log_min + frac * (log_max - log_min)).exp();
         // Use a different seed per scale to avoid correlations
-        let pilot_seed = seed
-            .wrapping_add(0x4953_4341_4C45_0000u64)
-            .wrapping_add(g as u64);
+        let pilot_seed = stream_seed(seed, &[0x4953_4341_4C45_0000u64, g as u64]);
         if let Some(ess) = pilot_ess(scale, pilot_seed) {
             if ess > best_ess {
                 best_ess = ess;

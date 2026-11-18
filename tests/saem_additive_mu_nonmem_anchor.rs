@@ -159,11 +159,12 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     );
 
     // #2544: the inline spelling is the split one's mu-reference, so SAEM takes the same
-    // path. Measured equal to the last bit at the default seed (and in every printed
-    // digit on seeds 12345, 2, 3, 7, 11), so it is asserted bit for bit; the bounds
-    // above then hold for it against both NONMEM streams, which are bit-identical.
+    // path: the estimates are asserted bit for bit, and the bounds above then hold for
+    // the inline spelling against both NONMEM streams, which are bit-identical. The OFV
+    // sums the same terms in a different association for the two spellings, so it may
+    // differ in the last bit (measured: 1 ULP, 165.82613916088266 vs …263); it is held
+    // to 1e-12 relative, which a different chain path would exceed by many orders.
     for (what, a, b) in [
-        ("OFV", inline.ofv, split.ofv),
         ("TVE0", inline.theta[0], split.theta[0]),
         ("omega2", inline.omega[(0, 0)], split.omega[(0, 0)]),
     ] {
@@ -173,6 +174,13 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
             "inline vs split {what}: {a} vs {b}"
         );
     }
+    let ofv_rel = (inline.ofv - split.ofv).abs() / split.ofv.abs();
+    assert!(
+        ofv_rel < 1e-12,
+        "inline vs split OFV: {} vs {} (relative {ofv_rel:e})",
+        inline.ofv,
+        split.ofv
+    );
     assert!(
         (inline.theta[0] - nm_inline["THETA1"]).abs() < 0.05,
         "TVE0: ferx inline {} vs NONMEM inline MU {}",
@@ -181,10 +189,15 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     );
 
     // The control: TVE0 also read in [structural_model], so it is not mu-referenced and
-    // stays on the ridge (measured 172.663 at the default seed, 168.54–172.76 over five,
-    // what the inline spelling gave before #2544).
+    // stays off the MLE. Before #3021 it measured 172.663 at the default seed and
+    // 168.54–172.76 over five (what the inline spelling gave before #2544). On the hashed
+    // streams (#3021) its distance above the MLE scatters widely: 0.845 at the default
+    // seed and 0.233–13.65 over seeds 1..=20, while the split mu-reference sits at most
+    // 0.00034 above (macOS aarch64; the default seed matches Linux x86_64 CI to the
+    // printed digit). 0.05 is 4.7x below the lowest control and ~150x above the highest
+    // mu-referenced fit, so it still separates the shapes on every seed measured.
     assert!(
-        shared.ofv > mle + 1.0,
+        shared.ofv > mle + 0.05,
         "shared BASE = TVE0 + PLAFIX + ETA_E0 with TVE0 read elsewhere must stay off the \
          MLE: {}",
         shared.ofv
