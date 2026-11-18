@@ -355,7 +355,9 @@ objective still falling. A variance whose objective rises when it is raised is a
 estimate and is left alone, bit for bit; only `n_iterations` counts the evaluations. A run that
 the [guard check](#variance-short-of-guard) below resumes is a full optimization too, so when it
 adopts one, this check reads that run again, for at most two rounds; a variance a last resumed
-run leaves collapsed and downhill is reported `converged = false` without a further restart. The
+run leaves collapsed and downhill is reported `converged = false` without a further restart.
+Every run either check resumes also goes through the [log-packing floor](#log-packing-floor)
+check again, since re-inflating a variance can put a THETA on that floor. The
 check costs nothing on a fit with no variance that far below its start. Starting a variance closer to its
 expected size, `optimizer = slsqp`, or `method = gn_hybrid` avoid the collapse in the first place.
 

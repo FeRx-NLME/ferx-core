@@ -450,10 +450,10 @@ pub(crate) fn below_start_params(
     p
 }
 
-/// How many collapse-then-rail rounds [`escape_floor`] runs while the rail stage keeps
-/// adopting a resumed run (#3005 review). Each round that repeats costs one or two full outer
-/// optimizations, so the bound is small; a run adopted in the last round is still verified
-/// for collapse, without a restart.
+/// How many rounds of completions [`escape_floor`] runs while an adopted restart leaves a
+/// run some completion has not read (#3005 review). Each round that repeats costs at most a
+/// few full outer optimizations, so the bound is small; what is still unread after the last
+/// round is verified without a restart.
 pub(crate) const COMPLETION_ROUNDS: usize = 2;
 
 /// Which short stop a completion probes: a variance just above its internal lower guard,
@@ -1065,6 +1065,46 @@ fn complete_short_stop<T: StoppedFit>(
     )
 }
 
+/// The θ floor escape ([`escape_floor_from`]) on a run a completion just adopted (#3005
+/// review, round 2): that run is a fresh outer optimization, so it can stop with a θ on the
+/// log-packing floor while the objective still falls as it rises, exactly the stop the first
+/// escape rejects. `carried` are the warnings of the stages behind it, as
+/// [`resolve_short_stop`] hands them on. Returns the fit to report, the warnings the next
+/// stage carries, and whether a θ restart was adopted.
+///
+/// An adopted θ restart is a new result: it carries `carried` ahead of its own escape
+/// warning, and when there are any, a `reported` they left not converged leaves it not
+/// converged too (the rule of [`resolve_short_stop`]). A θ restart that ended no lower keeps
+/// `reported` (which already holds `carried`), not converged, and its warning is carried on
+/// so a later adopted run keeps that verdict. No θ on the floor costs nothing.
+fn refloor<T: StoppedFit>(
+    reported: T,
+    carried: Vec<String>,
+    start: &ModelParameters,
+    options: &FitOptions,
+    run: impl Fn(&ModelParameters, &FitOptions) -> T,
+    penalty: impl Fn(&ModelParameters) -> f64,
+) -> (T, Vec<String>, bool) {
+    let mut reported = reported;
+    let was_converged = *reported.converged_mut();
+    let (mut out, warning, adopted) = escape_floor_from(reported, start, options, run, penalty);
+    let Some(w) = warning else {
+        return (out, carried, false);
+    };
+    let mut carried = carried;
+    if adopted {
+        if !carried.is_empty() && !was_converged {
+            *out.converged_mut() = false;
+        }
+        let warnings = out.warnings_mut();
+        let own = warnings.pop();
+        warnings.extend(carried.iter().cloned());
+        warnings.extend(own);
+    }
+    carried.push(w);
+    (out, carried, adopted)
+}
+
 /// Run `run` from `start`, then escape the log-packing floor as described in the module
 /// doc, then complete a variance collapsed far below its start while the objective still
 /// falls as it rises (#3005), then one stopped short of its guard (#2832), both through
@@ -1074,7 +1114,9 @@ fn complete_short_stop<T: StoppedFit>(
 /// re-score of the restart's point and probe of any θ it left below its probe point (#2629,
 /// two calls); for each completion, a re-score of the stop and one evaluation-only probe
 /// per candidate, and — only when a probe is downhill — the restart and the same re-score
-/// and probes of the restart's own candidates; and the start's re-score below. A fit with no
+/// and probes of the restart's own candidates; for each adopted restart, the θ escape again
+/// ([`refloor`]), and the other completion's checks, in at most [`COMPLETION_ROUNDS`] rounds
+/// and one verification pass; and the start's re-score below. A fit with no
 /// candidate of either kind spends nothing on the completions.
 /// `penalty` is added to `OuterResult::ofv` when the two fits are ranked (priors, NN
 /// regularisation), as `optimize_nlopt` ranks its attempts.
@@ -1096,69 +1138,68 @@ pub(crate) fn escape_floor<T: StoppedFit>(
 ) -> T {
     let first = run(start, options);
     let mut fit_start = *first.start_eval();
-    let (reported, escape) = escape_floor_from(first, start, options, &run, &penalty);
+    let (reported, escape, _) = escape_floor_from(first, start, options, &run, &penalty);
     // Collapse first: its restart re-inflates a variance from far below its start, and the
     // run it adopts can stop with a variance just above the guard, which rail completion
-    // then reads. A rail restart is itself a full outer optimization whose adopted run rail
-    // completion re-checks only for its own kind, so it can collapse a variance again (#3005
-    // review): while the rail stage adopts a new run, collapse completion reads it again,
-    // and rail completion follows only when that adopts a run of its own — at most
-    // `COMPLETION_ROUNDS` rounds; a run the rail stage adopted in the last round is then
-    // verified for collapse without another restart. Each stage hands the next the warnings
-    // it must carry; an adopted stage grows that list, which is how adoption is read here.
+    // then reads. Every restart a stage adopts is a full outer optimization, and the stage
+    // re-checks it only for its own kind (#3005 review): a rail restart can collapse a
+    // variance, and a restart of either kind can put a θ on the log-packing floor. So an
+    // adopted run is marked unread for the other completion and goes through the θ floor
+    // escape again ([`refloor`]); a θ restart that escape adopts is unread for both. The
+    // completions run while something is unread, at most `COMPLETION_ROUNDS` rounds; what is
+    // still unread after the last is verified without a restart, so a short stop there
+    // demotes `converged` instead of being reported as a minimum. Each stage hands the next
+    // the warnings it must carry; an adopted stage grows that list, which is how adoption is
+    // read here.
     let mut reported = reported;
     let mut carried: Vec<String> = escape.into_iter().collect();
-    let mut rail_adopted = false;
-    for round in 0..COMPLETION_ROUNDS {
-        let before = carried.len();
-        let (r, c) = complete_short_stop(
-            ShortStop::Collapse,
-            true,
-            reported,
-            carried,
-            start,
-            options,
-            &run,
-            &penalty,
-        );
-        reported = r;
-        carried = c;
-        // After the first round the run in hand is a rail restart that rail completion has
-        // already re-checked; only a new collapse restart gives it something new to read.
-        if round > 0 && carried.len() == before {
-            rail_adopted = false;
+    let (mut unread_collapse, mut unread_rail) = (true, true);
+    for _ in 0..COMPLETION_ROUNDS {
+        if !(unread_collapse || unread_rail) {
             break;
         }
-        let before = carried.len();
-        let (r, c) = complete_short_stop(
-            ShortStop::Rail,
-            true,
-            reported,
-            carried,
-            start,
-            options,
-            &run,
-            &penalty,
-        );
-        reported = r;
-        carried = c;
-        rail_adopted = carried.len() > before;
-        if !rail_adopted {
-            break;
+        for kind in [ShortStop::Collapse, ShortStop::Rail] {
+            let unread = match kind {
+                ShortStop::Collapse => &mut unread_collapse,
+                ShortStop::Rail => &mut unread_rail,
+            };
+            if !std::mem::replace(unread, false) {
+                continue;
+            }
+            let before = carried.len();
+            let (r, c) = complete_short_stop(
+                kind, true, reported, carried, start, options, &run, &penalty,
+            );
+            reported = r;
+            carried = c;
+            if carried.len() == before {
+                continue;
+            }
+            match kind {
+                ShortStop::Collapse => unread_rail = true,
+                ShortStop::Rail => unread_collapse = true,
+            }
+            let (r, c, theta_restarted) =
+                refloor(reported, carried, start, options, &run, &penalty);
+            reported = r;
+            carried = c;
+            if theta_restarted {
+                unread_collapse = true;
+                unread_rail = true;
+            }
         }
     }
-    if rail_adopted {
-        reported = complete_short_stop(
-            ShortStop::Collapse,
-            false,
-            reported,
-            carried,
-            start,
-            options,
-            &run,
-            &penalty,
-        )
-        .0;
+    for (kind, unread) in [
+        (ShortStop::Collapse, unread_collapse),
+        (ShortStop::Rail, unread_rail),
+    ] {
+        if unread {
+            let (r, c) = complete_short_stop(
+                kind, false, reported, carried, start, options, &run, &penalty,
+            );
+            reported = r;
+            carried = c;
+        }
     }
     let ranked = reported.ofv() + penalty(reported.params());
     if ranked.is_finite() {
@@ -1242,16 +1283,16 @@ fn escape_floor_from<T: StoppedFit>(
     options: &FitOptions,
     run: impl Fn(&ModelParameters, &FitOptions) -> T,
     penalty: impl Fn(&ModelParameters) -> f64,
-) -> (T, Option<String>) {
+) -> (T, Option<String>, bool) {
     if !runs_outer_optimizer(options)
         || crate::cancel::is_cancelled(&options.cancel)
         || !ofv_is_valid(first.ofv())
     {
-        return (first, None);
+        return (first, None, false);
     }
     let floored = floored_thetas(first.params(), start);
     if floored.is_empty() {
-        return (first, None);
+        return (first, None, false);
     }
     let escaped = std::cell::Cell::new(false);
     let eval_only = FitOptions {
@@ -1271,7 +1312,7 @@ fn escape_floor_from<T: StoppedFit>(
             })
             .collect()
     };
-    let mut out = resolve_floor_escape(
+    let (mut out, adopted) = resolve_floor_escape(
         first,
         &names_of(&floored),
         &probe,
@@ -1323,7 +1364,7 @@ fn escape_floor_from<T: StoppedFit>(
     } else {
         None
     };
-    (out, warning)
+    (out, warning, adopted)
 }
 
 /// What [`escape_floor`] and [`resolve_floor_escape`] read and write of a fit:
@@ -1379,7 +1420,7 @@ impl StoppedFit for OuterResult {
 
 /// The decision behind [`escape_floor`], pure so every branch is unit-testable without a
 /// fit: given the stopped fit, the names of its floored θ and the probe, return the fit to
-/// report. `restart` runs only when the probe's `ranked` objective is lower than the
+/// report, and whether it is the adopted restart (`true`) rather than `first`. `restart` runs only when the probe's `ranked` objective is lower than the
 /// stop's by more than [`FLOOR_PROBE_GAIN`] — ranked, so the gate and the adoption below
 /// judge the same objective when priors or an NN penalty are on (#2460 review, row 6). The
 /// restart is adopted only on a strictly lower `ranked` objective, so the escape never
@@ -1411,14 +1452,14 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     floored_in: impl Fn(&T) -> Vec<String>,
     near_floor: impl FnOnce(&T) -> Option<NearFloorProbe<T>>,
     verbose: bool,
-) -> T {
+) -> (T, bool) {
     let probe_ofv = probe.ofv();
     let mut first = first;
     if !(ofv_is_valid(probe_ofv) && ranked(&first) - ranked(probe) > FLOOR_PROBE_GAIN) {
         // The probe ran, so it is counted, whatever it scored — a non-finite one too
         // (#2839 review, row 8). Rail completion's rule: `resolve_rail_completion`.
         *first.evals_mut() += 1;
-        return first;
+        return (first, false);
     }
     let floor_ofv = first.ofv();
     if verbose {
@@ -1436,7 +1477,7 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
         first
             .warnings_mut()
             .push(floor_not_converged_warning(names, floor_ofv, probe_ofv));
-        return first;
+        return (first, false);
     }
     *second.evals_mut() += *first.evals_mut() + 1;
     *second.covariance_secs_mut() += *first.covariance_secs_mut();
@@ -1467,7 +1508,7 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
         )
     };
     second.warnings_mut().push(w);
-    second
+    (second, true)
 }
 
 #[cfg(test)]

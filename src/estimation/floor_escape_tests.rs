@@ -107,6 +107,7 @@ fn resolve_probe(first: Stub, probe: Stub, restart: impl FnOnce(&Stub) -> Stub) 
         near_probe,
         false,
     )
+    .0
 }
 
 /// The stub's `near_floor` hook: its near-floor θ, the restart's point re-scored (the same
@@ -1149,7 +1150,8 @@ fn the_near_floor_gate_ranks_on_the_penalized_objective() {
             })
         },
         false,
-    );
+    )
+    .0;
     assert!(r.converged, "{:?}", r.warnings);
 }
 
@@ -3419,5 +3421,96 @@ fn a_collapse_left_by_the_last_rail_restart_is_verified_and_not_converged() {
     assert!(
         last.contains("ETA_SLOPE") && last.contains("not resumed again"),
         "{last}"
+    );
+}
+
+/// The world of a collapse restart that floors a θ (#3005 review, round 2): the stop has
+/// `ETA_SLOPE` collapsed (raising it is downhill); the collapse restart re-inflates it, is
+/// lower, and leaves `TVE0` (start 55, `≥ 0`) on the log-packing floor, where the θ probe is
+/// downhill; the θ restart ends at `theta_restart_ofv` with TVE0 = 50. Returns the report
+/// and the call log (`outer_maxiter`, TVE0).
+fn collapse_then_floor_world(theta_restart_ofv: f64) -> (Stub, Vec<(usize, f64)>) {
+    use std::cell::RefCell;
+    let start = collapse_start();
+    let s = packed_of(&start, "ETA_SLOPE");
+    let stop = with_packed_at(&start, "ETA_SLOPE", 0.5 * 0.00622f64.ln());
+    let options = FitOptions::default();
+    let log: RefCell<Vec<(usize, f64)>> = RefCell::new(Vec::new());
+    let r = escape_floor(
+        &start,
+        &options,
+        44,
+        |p, o| {
+            let (tve0, slope) = (p.theta[0], packed_of(p, "ETA_SLOPE"));
+            log.borrow_mut().push((o.outer_maxiter, tve0));
+            let n = log.borrow().len();
+            let (ofv, params) = match (n, o.outer_maxiter) {
+                (1, _) => (100.0, stop.clone()),
+                (2, 0) => (100.0, p.clone()),
+                (3, 0) if (slope - (s - collapse_depth())).abs() < 1e-12 => (99.5, p.clone()),
+                (4, m) if m > 0 && (slope - s).abs() < 1e-12 => {
+                    let mut q = p.clone();
+                    q.theta[0] = LOG_PACK_FLOOR;
+                    (98.0, q)
+                }
+                // The θ floor escape on the adopted run: probe at 1/1000 of TVE0's start …
+                (5, 0) if (tve0 - FLOOR_PROBE_REL * 55.0).abs() < 1e-12 => (97.5, p.clone()),
+                // … and the restart from TVE0's start.
+                (6, m) if m > 0 && (tve0 - 55.0).abs() < 1e-9 => {
+                    let mut q = p.clone();
+                    q.theta[0] = 50.0;
+                    (theta_restart_ofv, q)
+                }
+                other => panic!("unexpected call {other:?} (TVE0 {tve0}, slope {slope})"),
+            };
+            Stub {
+                params,
+                ofv,
+                ..landed()
+            }
+        },
+        |_| 0.0,
+    );
+    (r, log.into_inner())
+}
+
+/// #3005 review, round 2: a run a completion adopts goes through the θ floor escape again.
+/// Here the collapse restart is lower but floors TVE0 with the objective still falling;
+/// the θ restart is adopted, carries the collapse warning ahead of its own, and — being a
+/// new run — is read by both completions again (no candidates, so no calls). When the θ
+/// restart ends no lower, the collapse restart is kept, not converged. Without the second
+/// escape this fit came back `converged` at 98 with TVE0 on the floor.
+#[test]
+fn a_completion_restart_that_floors_a_theta_goes_through_the_floor_escape_again() {
+    let _g = rail_lock();
+    let (r, log) = collapse_then_floor_world(96.0);
+    assert_eq!(
+        log.len(),
+        6,
+        "fit; collapse re-score, probe, restart; θ probe, θ restart: {log:?}"
+    );
+    assert_eq!(r.ofv, 96.0);
+    assert_eq!(r.params.theta[0], 50.0);
+    assert!(r.converged, "{:?}", r.warnings);
+    assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("re-inflated"), "{}", r.warnings[0]);
+    assert!(
+        r.warnings[1].contains("TVE0") && r.warnings[1].contains("log-packing floor"),
+        "{}",
+        r.warnings[1]
+    );
+
+    let (r, log) = collapse_then_floor_world(98.5);
+    assert_eq!(log.len(), 6, "{log:?}");
+    assert_eq!(r.ofv, 98.0, "the collapse restart is kept");
+    assert_eq!(r.params.theta[0], LOG_PACK_FLOOR);
+    assert!(!r.converged);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("re-inflated"))
+            && r.warnings
+                .last()
+                .is_some_and(|w| w.contains("TVE0") && w.contains("not reported as converged")),
+        "{:?}",
+        r.warnings
     );
 }
