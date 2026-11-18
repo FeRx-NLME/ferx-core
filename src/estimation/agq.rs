@@ -858,28 +858,6 @@ pub(crate) fn agq_subject_term(
     )
 }
 
-/// Whether [`agq_terms`] scores the node at stacked `b` as the sentinel (or a non-finite
-/// term): zero weight in the `logsumexp`. The adjoint's node-drop reads this for a node whose
-/// plan forward fails, so the two agree on what a diverged node is.
-pub(crate) fn node_is_sentinel(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta_hat: &[f64],
-    b: &[f64],
-) -> bool {
-    let n_occ = if model.n_kappa > 0 {
-        eta_hat.len().saturating_sub(model.n_eta) / model.n_kappa
-    } else {
-        0
-    };
-    let stack = Stack::new(model, params, n_occ);
-    let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    let schedule = cacheable_schedule(model, subject);
-    let nll = stack.nll_at(model, subject, params, b, &mut scratch, schedule.as_ref());
-    !nll.is_finite() || nll >= SUBJECT_SENTINEL_NLL
-}
-
 /// Population AGQ objective: `Σ_i agq_subject_nll_i`. The outer loop doubles this into an
 /// OFV, exactly as it does `crate::estimation::outer_optimizer::pop_nll`.
 ///

@@ -4563,19 +4563,6 @@ fn a_quadrature_node_with_nan_predictions_is_dropped_not_declined() {
         "CL = TVCL * exp(ETA_CL) * 16.0 * (0.008 - (ETA_CL ^ 3)) ^ 0.5",
     );
     let model = parse_model_string(&src).unwrap();
-    // The value-path predicate a failed forward is classified by: a node past the cliff is
-    // the sentinel, the mode and a lower node are not.
-    let params = moved_params(&model);
-    let one = subject(
-        &model,
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        &TIMES,
-        &[0.1, -0.05, 0.2],
-    );
-    let sentinel =
-        |b: &[f64]| crate::estimation::agq::node_is_sentinel(&model, &one, &params, &[0.0; 3], b);
-    assert!(sentinel(&[0.5, 0.0, 0.0]), "eta_CL = 0.5 is NaN");
-    assert!(!sentinel(&[0.0, 0.0, 0.0]) && !sentinel(&[-0.3, 0.0, 0.0]));
     let worst = dropped_node_parity(&model, &[0.1, -0.05, 0.2]);
     // Measured 2.6e-8 (Linux); ~20x headroom.
     assert!(worst < 6e-7, "{worst:.2e}");

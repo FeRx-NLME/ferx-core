@@ -28,12 +28,11 @@ type Node = (Vec<f64>, Fwd, Option<Fwd>);
 /// The quadrature (AGQ, Laplace) gradient of a subject through its plans; `None` where a
 /// plan cannot be recorded.
 ///
-/// Every node's forward is recorded once. A node whose forward fails is dropped when the value
-/// path scores it as the sentinel (`agq::agq_terms`), and declines the subject otherwise. The
-/// gradient is then formed over the rest; only when it does not form is each node's term
-/// examined, and it is re-run (over the same recorded forwards) only when that drops one: a
-/// diverged node (see below) is left out as the objective leaves it out, while a subject with
-/// no diverged node pays nothing for the check.
+/// Every node's forward is recorded once (a forward that fails declines the subject). The
+/// gradient is formed over every node; only when it does not form is each node's term examined,
+/// and it is re-run (over the same recorded forwards) only when that drops one: a diverged node
+/// (see below) is left out as the objective leaves it out, while a subject with no diverged node
+/// pays nothing for the check.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn agq_planned(
     model: &CompiledModel,
@@ -61,8 +60,8 @@ pub(super) fn agq_planned(
     let sigma = params.sigma.values.as_slice();
     // The node predictions, values only, each forward kept for its one reverse: a node's
     // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
-    // `G` itself is never formed. `None` is a node the value path scores as the sentinel.
-    let mut nodes: Vec<Option<Node>> = Vec::with_capacity(grid.len());
+    // `G` itself is never formed.
+    let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
     let mode_plan = mode_fwd.map(|m| &m.0);
     for (_, _, b) in grid {
         if n_obs == 0 {
@@ -81,22 +80,9 @@ pub(super) fn agq_planned(
             };
             Some((du, (plan, std::sync::Arc::new(f)), var))
         };
-        match rec() {
-            Some(node) => nodes.push(Some(node)),
-            // A forward that fails is a diverged node where the objective scores the node as
-            // its sentinel (zero weight), and a plan that cannot serve it otherwise.
-            None if crate::estimation::agq::node_is_sentinel(model, subject, params, eta, b) => {
-                nodes.push(None)
-            }
-            None => return None,
-        }
+        nodes.push(rec()?);
     }
-    let kept: Vec<usize> = (0..grid.len())
-        .filter(|&j| nodes.get(j).is_none_or(|n| n.is_some()))
-        .collect();
-    if kept.is_empty() && !grid.is_empty() {
-        return None;
-    }
+    let kept: Vec<usize> = (0..grid.len()).collect();
     let mut run = |keep: &[usize]| {
         agq_planned_over(
             model,
@@ -138,7 +124,7 @@ pub(super) fn agq_planned(
         .copied()
         .filter(|&j| {
             let (_, cw, b) = &grid[j];
-            let Some(Some((du, _, _))) = nodes.get(j) else {
+            let Some((du, _, _)) = nodes.get(j) else {
                 return true;
             };
             inner_l(ctx, du, b, pv, None).is_some_and(|l| {
@@ -170,7 +156,7 @@ fn agq_planned_over(
     so: &StackedOmega,
     pv: &ParT<f64>,
     grid: &[(Vec<f64>, f64, Vec<f64>)],
-    nodes: &[Option<Node>],
+    nodes: &[Node],
     keep: &[usize],
     h_exact: Option<&DMatrix<f64>>,
     exact: bool,
@@ -196,10 +182,7 @@ fn agq_planned_over(
     let n_rows = p1.rows();
     let n_th = theta.len();
     let n_cols = n_th + if sde { sigma.len() } else { 0 };
-    let nodes: Vec<&Node> = keep
-        .iter()
-        .filter_map(|&j| nodes.get(j).and_then(Option::as_ref))
-        .collect();
+    let nodes: Vec<&Node> = keep.iter().filter_map(|&j| nodes.get(j)).collect();
     let kept_grid;
     let grid: &[(Vec<f64>, f64, Vec<f64>)] = if keep.len() == grid.len() {
         grid
