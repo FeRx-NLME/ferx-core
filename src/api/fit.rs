@@ -3512,9 +3512,15 @@ fn fit_inner(
         use crate::estimation::ode_tolerance_check::{self as otc, FitSide};
         let (stage, fit_side) = match objective_stage_opts {
             Some((ref owner, side)) if owner.method == objective_stage => (owner.clone(), side),
+            // No recorded owner: the post-fit options with the owner's method, its
+            // interaction resolved for that method rather than for `final_method`.
             _ => (
                 FitOptions {
                     method: objective_stage,
+                    interaction: crate::types::interaction_for(
+                        objective_stage,
+                        options.interaction,
+                    ),
                     ..options.clone()
                 },
                 FitSide::Stored,
