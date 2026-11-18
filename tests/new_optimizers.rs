@@ -576,3 +576,80 @@ fn trust_region_remodels_when_the_free_set_changes() {
         tr.ofv
     );
 }
+
+/// #2975, Tier 3: a stop the noise test cannot settle gets one verification leg at a tight
+/// inner tolerance. From every θ × 0.99, `warfarin_logit_f`'s trust region collapses its radius
+/// with an exact decrement above the measured evaluation noise: the gradient disagrees with the
+/// objective at `inner_tol = 1e-5`. The leg at `1e-10` settles it (gain 1.0e-7 in the #2975
+/// benchmark), so the fit must be converged at the default optimizer's optimum.
+/// Regression it catches: without the leg the fit ends at the optimum but `converged = false`.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn trust_region_verifies_an_unsettled_stop_at_a_tight_inner_tolerance() {
+    let model = parse_model_file(Path::new("examples/warfarin_logit_f.ferx"))
+        .expect("warfarin_logit_f must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin_logit_f.csv"), None, None)
+        .expect("warfarin_logit_f data must load");
+    let mut start = model.default_params.clone();
+    for (i, t) in start.theta.iter_mut().enumerate() {
+        *t = (*t * 0.99).clamp(start.theta_lower[i], start.theta_upper[i]);
+    }
+    let mut opts = base_options();
+    opts.method = EstimationMethod::FoceI;
+    opts.optimizer = Optimizer::TrustRegion;
+    opts.outer_maxiter = 300;
+    let tr = fit(&model, &population, &start, &opts).expect("trust_region fit");
+    opts.optimizer = Optimizer::Auto;
+    let reference = fit(&model, &population, &start, &opts).expect("reference");
+    assert!(tr.converged, "warnings {:?}", tr.warnings);
+    assert!(
+        tr.ofv < reference.ofv + 1e-3,
+        "trust_region {} vs default {}",
+        tr.ofv,
+        reference.ofv
+    );
+}
+
+/// #2975, Tier 3: where the exact Hessian is not resolved at the very start (no model yet to
+/// keep), the trust region models with the finite-difference Hessian of the same objective.
+/// `per_route_lag_absorption` on its own simulated design: at the initial estimates the exact
+/// Hessian is non-finite (#3004), while it is fine at the optimum.
+/// Regression it catches: without the fallback the fit stops on its first iteration at the
+/// start values (`W_STALLED_AT_INIT`, about 11 OFV above the optimum).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn trust_region_starts_on_the_fd_hessian_where_the_exact_one_is_unresolved() {
+    let src = std::fs::read_to_string("examples/per_route_lag_absorption.ferx")
+        .expect("per_route_lag_absorption must read");
+    let dir = std::env::temp_dir().join(format!("ferx-tr-fd-start-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let fit_with = |optimizer: &str| {
+        let text = src.replacen(
+            "[fit_options]",
+            &format!("[fit_options]\n  optimizer = {optimizer}\n  threads = 1"),
+            1,
+        );
+        let path = dir.join(format!("m_{optimizer}.ferx"));
+        std::fs::write(&path, text).expect("write model");
+        ferx_core::run_model_simulate(path.to_str().unwrap())
+            .expect("simulate and fit")
+            .0
+    };
+    let tr = fit_with("trust_region");
+    let reference = fit_with("nlopt_lbfgs");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        tr.ofv < reference.ofv + 1e-3,
+        "trust_region {} vs nlopt_lbfgs {} (warnings {:?})",
+        tr.ofv,
+        reference.ofv,
+        tr.warnings
+    );
+    assert!(tr.n_iterations > 1, "the trust region must leave its start");
+}

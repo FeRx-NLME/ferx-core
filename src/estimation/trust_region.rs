@@ -391,7 +391,7 @@ fn exact_trust_region(
         if radius < 1e-10 {
             // The noise floor: no step can realise a predicted gain smaller than the
             // objective's measured evaluation noise, so a decrement within it is converged.
-            converged = exact_here && last_mismatch.is_finite() && last_decrement <= last_mismatch;
+            converged = settles_at_noise_floor(exact_here, last_mismatch, last_decrement);
             if options.verbose {
                 eprintln!(
                     "  TR: radius collapsed; decrement {last_decrement:.3e} vs measured noise \
@@ -414,6 +414,15 @@ fn exact_trust_region(
         kappas,
     };
     (converged, x, iters, last_g, held, f_start, f)
+}
+
+/// The noise-floor stop (#2975), at a collapsed radius: converged when the model is exact at
+/// this point and its Newton `decrement` is no larger than `mismatch`, the `|actual − predicted|`
+/// of the last rejected step. That step is so short that the model's own error (third order in
+/// it) is negligible, so the mismatch is the objective's evaluation noise, and no step can
+/// realise a gain below it. A non-finite mismatch (no step was rejected) never settles.
+pub(crate) fn settles_at_noise_floor(exact_here: bool, mismatch: f64, decrement: f64) -> bool {
+    exact_here && mismatch.is_finite() && decrement <= mismatch
 }
 
 /// `|H|`: `H` with its eigenvalues made absolute, floored at `1e-10·max|λ|`. The saddle-free
@@ -1145,6 +1154,38 @@ mod tests {
     /// eigenvalue counts by its magnitude, so the step descends where plain Newton would climb.
     /// Mutations: a wrong bisection bracket leaves the step off the boundary; dropping `.abs()`
     /// makes the indefinite row ascend; a `½` dropped from the decrement fails the first row.
+    /// The noise-floor stop settles only on an exact model whose decrement the measured noise
+    /// covers. Each case dies on its own mutation: dropping `exact_here` settles the secant row,
+    /// `<=` → `<` misses the inclusive boundary, dropping the finiteness check settles the
+    /// infinite-mismatch row.
+    #[test]
+    fn the_noise_floor_settles_only_an_exact_decrement_within_the_measured_noise() {
+        assert!(
+            settles_at_noise_floor(true, 5e-5, 3e-5),
+            "decrement inside the noise"
+        );
+        assert!(
+            settles_at_noise_floor(true, 3e-5, 3e-5),
+            "boundary is inclusive"
+        );
+        assert!(
+            !settles_at_noise_floor(true, 2e-7, 3.2),
+            "a real gain left: not noise"
+        );
+        assert!(
+            !settles_at_noise_floor(false, 5e-5, 3e-5),
+            "a secant model never settles"
+        );
+        assert!(
+            !settles_at_noise_floor(true, f64::NAN, 3e-5),
+            "no rejected step measured"
+        );
+        assert!(
+            !settles_at_noise_floor(true, f64::INFINITY, 3e-5),
+            "an unbounded mismatch is not a measurement"
+        );
+    }
+
     /// `|H|` is `H` on a positive-definite matrix and flips a negative eigenvalue, keeping its
     /// eigenvector and magnitude. This is what makes the BFGS seed positive definite: with the
     /// raw indefinite `H` every update along the negative direction has `sᵀBs < 0` and is
