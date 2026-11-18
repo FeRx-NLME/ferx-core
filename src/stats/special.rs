@@ -538,6 +538,136 @@ pub fn ln_gamma(x: f64) -> f64 {
     HALF_LN_2PI + (y + 0.5) * t.ln() - t + a.ln()
 }
 
+/// Largest count whose negative-binomial `ln Γ(r + k) − ln Γ(r)` is summed term by term
+/// (`k` logs per record) in [`negbin_log_pmf_g`]; a larger count takes a closed form.
+pub(crate) const NEGBIN_SUM_MAX_K: u32 = 256;
+
+/// Below this `x = λ/r`, [`r_log1p_ratio`] takes `r·log1p(x)` from its series.
+const LOG1P_SERIES_MAX: f64 = 1e-3;
+
+/// Smallest size at which [`ln_rising_over_power_g`] takes the Stirling difference for a
+/// count past [`NEGBIN_SUM_MAX_K`]; below it `ln Γ(r)` is small and the `ln Γ` difference
+/// keeps its digits.
+const NEGBIN_STIRLING_MIN_R: f64 = 20.0;
+
+/// `r·log1p(λ/r)`, generic over the number type (`PkNum` has no `log1p`). `r·ln(1 + λ/r)`
+/// loses `λ/r` entirely once it falls below machine epsilon (`λ = 1, r = 1e17` scored 0
+/// instead of 1). For `x = λ/r < 1e-3` it is `λ·(1 − x/2 + x²/3 − x³/4 + x⁴/5 − x⁵/6)`, whose
+/// dropped `x⁶/7` term is below 1.5e-19 relative and whose derivatives are a polynomial's.
+/// Above it, `λ·ln(u)/(u − 1)` with `u = 1 + x` (Goldberg), `log1p` to a few ulps: the ratio
+/// cancels the rounding of `u`, and `r·x = λ`. `λ ≥ 0`, `r > 0`.
+fn r_log1p_ratio<T: PkNum>(mu: T, r: T) -> T {
+    let x = mu / r;
+    if x.br_cmp_c(BranchCmp::Lt, LOG1P_SERIES_MAX) {
+        let c = |v: f64| T::from_f64(v);
+        let poly = c(1.0)
+            - x * (c(0.5) - x * (c(1.0 / 3.0) - x * (c(0.25) - x * (c(0.2) - x * c(1.0 / 6.0)))));
+        mu * poly
+    } else {
+        let u = T::from_f64(1.0) + x;
+        mu * u.ln() / (u - T::from_f64(1.0))
+    }
+}
+
+/// `ln[Γ(r + k) / (Γ(r)·r^k)] = Σ_{j<k} log1p(j/r)`, generic over the number type. Taking
+/// the `k·ln r` out is what keeps a large size exact: `ln Γ(r + k) − ln Γ(r)` is ~`k·ln r`,
+/// and its `−k·ln(r + λ)` partner in the PMF cancels it, so an NB near its Poisson limit was
+/// a difference of numbers ~`k·ln r` (and the `ln Γ` difference alone carries
+/// `|ln Γ(r)|·eps` — 335.7 for 3.69 at `λ = k = 257, r = 1e17`).
+///
+/// For `k ≤ NEGBIN_SUM_MAX_K` it is the sum, each term `ln(1 + j/r)` with absolute error
+/// ~eps. Past it, for `r ≥ 20`, it is the Stirling difference
+/// `(r + k − ½)·log1p(k/r) − k + S(r + k) − S(r)`, `S(z) = 1/(12z) − 1/(360z³) + 1/(1260z⁵)`
+/// (the first dropped term, `1/(1680z⁷)`, is below 4.7e-13 at `z ≥ 20`); a smaller `r` keeps
+/// `ln Γ(r + k) − ln Γ(r) − k·ln r`, where `|ln Γ(r)| < 40`.
+fn ln_rising_over_power_g<T: PkNum>(r: T, k: u32) -> T {
+    let c = |v: f64| T::from_f64(v);
+    if k <= NEGBIN_SUM_MAX_K {
+        let inv_r = c(1.0) / r;
+        (1..k).fold(c(0.0), |acc, j| {
+            acc + (c(1.0) + c(f64::from(j)) * inv_r).ln()
+        })
+    } else if r.br_cmp_c(BranchCmp::Ge, NEGBIN_STIRLING_MIN_R) {
+        let kt = c(f64::from(k));
+        let stirling = |z: T| {
+            let w = c(1.0) / z;
+            let w2 = w * w;
+            w * (c(1.0 / 12.0) - w2 * (c(1.0 / 360.0) - w2 * c(1.0 / 1260.0)))
+        };
+        // `r·log1p(k/r) − k` and `(k − ½)·log1p(k/r)`; both stay small as `r → ∞`.
+        let rl = r_log1p_ratio(kt, r);
+        (rl - kt) + (kt - c(0.5)) * (rl / r) + stirling(r + kt) - stirling(r)
+    } else {
+        let kt = c(f64::from(k));
+        (r + kt).ln_gamma() - r.ln_gamma() - kt * r.ln()
+    }
+}
+
+/// The negative-binomial log-PMF `ln P(Y = k)` at mean `μ = exp(log_mu)` and size `r`,
+/// generic over the number type — the one implementation the `[count_model]` likelihood
+/// kernel and [`count_log_pmf`] share. With `ρ = r·log1p(μ/r)` it is
+/// `ln[Γ(r+k)/(Γ(r)·r^k)] − ln k! + k·ln μ − ρ·(1 + k/r)`, every term of which stays
+/// bounded as `r → ∞`, where it tends to the Poisson `k·ln μ − μ − ln k!`.
+/// The caller checks `μ ≥ 0` (`> 0` unless `k = 0`) and `r` finite and positive.
+pub(crate) fn negbin_log_pmf_g<T: PkNum>(mu: T, log_mu: T, r: T, k: u32) -> T {
+    let kf = f64::from(k);
+    let rho = r_log1p_ratio(mu, r);
+    let mut out = ln_rising_over_power_g(r, k)
+        - T::from_f64(ln_gamma(kf + 1.0))
+        - rho * (T::from_f64(1.0) + T::from_f64(kf) / r);
+    if k > 0 {
+        out = out + T::from_f64(kf) * log_mu;
+    }
+    out
+}
+
+/// `log P(Y = k)` for a count endpoint (#2877): Poisson with mean `lambda` when `size` is
+/// `None`, negative binomial with mean `lambda` and size `r = size` otherwise (variance
+/// `λ + λ²/r`). A zero mean is the degenerate law at 0 (`0` for `k = 0`, `−∞` otherwise).
+/// `NaN` for a mean that is negative or not finite, a size that is not finite and positive,
+/// or a `k` that is not an integer in `0..=u32::MAX` (the counts a record carries) — the
+/// caller decides what an undefined law means.
+///
+/// The value side of the `[count_model]` record kernel, which differentiates the same
+/// formula on its own number type; this is the `f64` form the public
+/// [`Prediction::prob`](crate::types::Prediction::prob) and the tests read.
+pub fn count_log_pmf(lambda: f64, size: Option<f64>, k: f64) -> f64 {
+    let valid = |x: f64| x.is_finite() && x > 0.0;
+    // A count is a `u32` wherever ferx holds one (`ObsRecord::Count`); a larger `k` is outside
+    // the law's domain here rather than narrowed to `u32::MAX` by the cast below.
+    let in_domain = k >= 0.0 && k.fract() == 0.0 && k <= f64::from(u32::MAX);
+    if !(lambda.is_finite() && lambda >= 0.0) || !in_domain {
+        return f64::NAN;
+    }
+    if lambda == 0.0 {
+        // The zero-mean limit (a `log_lambda` that underflows): all mass at 0, for either
+        // family, as the `[count_model]` likelihood scores it.
+        return if size.is_none_or(valid) {
+            if k == 0.0 {
+                0.0
+            } else {
+                f64::NEG_INFINITY
+            }
+        } else {
+            f64::NAN
+        };
+    }
+    match size {
+        None => k * lambda.ln() - lambda - ln_gamma(k + 1.0),
+        Some(r) if valid(r) => {
+            // The `[count_model]` likelihood kernel's own implementation, so prediction and
+            // fitting score a record identically.
+            negbin_log_pmf_g(lambda, lambda.ln(), r, k as u32)
+        }
+        Some(_) => f64::NAN,
+    }
+}
+
+/// `P(Y = k)` for a count endpoint: `exp` of [`count_log_pmf`].
+pub fn count_pmf(lambda: f64, size: Option<f64>, k: f64) -> f64 {
+    count_log_pmf(lambda, size, k).exp()
+}
+
 /// Digamma ψ(x) = d/dx ln Γ(x) — the exact analytic derivative of [`ln_gamma`]'s
 /// Lanczos form (same `LANCZOS_COEF` / `LANCZOS_G`), so a finite difference of
 /// `ln_gamma` and `digamma` agree to ~1e-12 (an independent ψ approximation would

@@ -3812,6 +3812,7 @@ const PARAM_CONSUMER_BLOCKS: &[&str] = &[
     "initial_conditions",
     "event_model",
     "binary_model",
+    "count_model",
     "markov_model",
 ];
 
@@ -4636,9 +4637,20 @@ pub fn parse_full_model_with(
     #[cfg(not(feature = "markov"))]
     let has_markov_model_block = false;
 
-    // Fold the CTMM block into the same "endpoint present" predicate the binary
-    // block uses, so a CTMM-only model may omit the Gaussian PK blocks / empty Ω.
-    let has_binary_model_block = has_binary_model_block || has_markov_model_block;
+    // A `[count_model]` (#2877) endpoint likewise.
+    #[cfg(feature = "survival")]
+    let has_count_model_block = blocks.contains_key("count_model")
+        || extracted
+            .named
+            .get("count_model")
+            .is_some_and(|m| !m.is_empty());
+    #[cfg(not(feature = "survival"))]
+    let has_count_model_block = false;
+
+    // Fold the CTMM and count blocks into the same "endpoint present" predicate the binary
+    // block uses, so a CTMM-only or count-only model may omit the Gaussian PK blocks / empty Ω.
+    let has_binary_model_block =
+        has_binary_model_block || has_markov_model_block || has_count_model_block;
 
     let struct_lines_opt = blocks.get("structural_model");
     let error_lines_opt = blocks.get("error_model");
@@ -5628,19 +5640,40 @@ pub fn parse_full_model_with(
             &eta_names,
             &indiv_stmts,
         );
+        // #2877: so are a `[count_model]`'s mean and size, after the binary predictors.
+        let count_readouts = count_readout_exprs(
+            blocks,
+            &extracted.named,
+            &theta_names,
+            &eta_names,
+            &indiv_stmts,
+        );
+        let endpoint_labels: Vec<&'static str> =
+            std::iter::repeat_n(BINARY_READOUT, binary_readouts.len())
+                .chain(count_readouts.iter().map(|(label, _)| *label))
+                .collect();
         let mut readout = readout;
-        let n_binary = binary_readouts.len();
-        readout.extend(binary_readouts.iter().cloned());
-        readout_with_states.extend(binary_readouts.iter().cloned());
+        for e in binary_readouts
+            .iter()
+            .chain(count_readouts.iter().map(|(_, e)| e))
+        {
+            readout.push(e.clone());
+            readout_with_states.push(e.clone());
+        }
         for decl in level_block_decls.iter_mut() {
-            decl.scale_share =
-                block_shares_scale_with_eta(&indiv_stmts, &readout, n_binary, &decl.name, None);
+            decl.scale_share = block_shares_scale_with_eta(
+                &indiv_stmts,
+                &readout,
+                &endpoint_labels,
+                &decl.name,
+                None,
+            );
             decl.eta_couplings = (0..eta_names.len())
                 .map(|k| {
                     let mut c = level_block_eta_coupling(
                         &indiv_stmts,
                         &readout_with_states,
-                        n_binary,
+                        &endpoint_labels,
                         &decl.name,
                         k,
                         &eta_names[k],
@@ -5649,7 +5682,7 @@ pub fn parse_full_model_with(
                     c.share = block_shares_scale_with_eta(
                         &indiv_stmts,
                         &readout,
-                        n_binary,
+                        &endpoint_labels,
                         &decl.name,
                         Some(k),
                     );
@@ -5675,7 +5708,7 @@ pub fn parse_full_model_with(
         // divisor as `state / obs_scale` (#2103 review #1). An `obs_scale` is not a
         // `y` key, so without this a block in it reached no readout at all.
         let mut readouts: Vec<(String, Expression)> = readout_with_states
-            [..readout_with_states.len() - binary_readouts.len()]
+            [..readout_with_states.len() - endpoint_labels.len()]
             .iter()
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
@@ -5710,7 +5743,7 @@ pub fn parse_full_model_with(
         // refuses every such model). A block one of them reads is not "read by no
         // prediction" (#2562); one none of them reads still is.
         let mut endpoint_lines: Vec<String> = Vec::new();
-        for b in ["event_model", "markov_model"] {
+        for b in ["event_model", "markov_model", "count_model"] {
             endpoint_lines.extend(blocks.get(b).into_iter().flatten().cloned());
             if let Some(named) = extracted.named.get(b) {
                 endpoint_lines.extend(named.values().flatten().cloned());
@@ -7506,6 +7539,42 @@ pub fn parse_full_model_with(
             event_model_used_etas.extend(blk_etas);
         }
 
+        // ── [count_model] blocks (Poisson / negative binomial, #2877) ──────────────
+        // Unnamed `[count_model]` and any named `[count_model LABEL]`, each keyed by CMT.
+        let mut count_blocks: Vec<&Vec<String>> = Vec::new();
+        if let Some(lines) = blocks.get("count_model") {
+            count_blocks.push(lines);
+        }
+        if let Some(named_map) = extracted.named.get("count_model") {
+            for lines in named_map.values() {
+                count_blocks.push(lines);
+            }
+        }
+        for lines in count_blocks {
+            let (cmt, endpoint, cnt_covs, blk_thetas, blk_etas) = parse_count_model_block(
+                lines,
+                &theta_names,
+                &eta_names,
+                &indiv_stmts,
+                &model.kappa_names,
+                &model.error_spec,
+                &mut endpoint_stmts,
+            )?;
+            if model.endpoints.contains_key(&cmt) {
+                return Err(format!(
+                    "[count_model]: CMT={cmt} already declared by another endpoint"
+                ));
+            }
+            model.endpoints.insert(cmt, endpoint);
+            for cov in cnt_covs {
+                if !model.referenced_covariates.contains(&cov) {
+                    model.referenced_covariates.push(cov);
+                }
+            }
+            event_model_used_thetas.extend(blk_thetas);
+            event_model_used_etas.extend(blk_etas);
+        }
+
         // ── [markov_model] blocks (Phase 5 CTMM, #759) ────────────────────────────
         // Unnamed `[markov_model]` and any named `[markov_model LABEL]`, each keyed by CMT.
         #[cfg(feature = "markov")]
@@ -7593,6 +7662,9 @@ pub fn parse_full_model_with(
     {
         #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
         let mut level_capable_cmts = model.binary_cmts();
+        // Count records define a level like binary ones (#2877).
+        level_capable_cmts.extend(model.count_cmts());
+        level_capable_cmts.sort_unstable();
         #[cfg(feature = "markov")]
         {
             level_capable_cmts.extend(model.dtmm_cmts());
@@ -9002,6 +9074,7 @@ fn restrict_and_validate_indiv_stmts(
     let predictor = match block {
         "event_model" => "a hazard expression",
         "binary_model" => "the linear predictor",
+        "count_model" => "the count mean or size",
         "markov_model" => "a transition probability",
         _ => "a predictor expression",
     };
@@ -10040,6 +10113,223 @@ fn parse_binary_model_block(
         lp_covariates,
         lp_thetas,
         lp_etas,
+    ))
+}
+
+/// Parse one `[count_model]` block — a Poisson / negative-binomial count endpoint (#2877).
+/// Mirrors [`parse_binary_model_block`] with a mean expression (and, for a negative
+/// binomial, a size expression) in place of the linear predictor.
+///
+/// Supported keys:
+/// - `cmt`        — required; positive integer (data-file CMT column value)
+/// - `type`       — `poisson` (the default) or `negbin`
+/// - `lambda`     — the mean count `λ` per record (must evaluate finite and positive), or
+/// - `log_lambda` — instead of `lambda`: `log λ` (any finite value). Exactly one is given.
+/// - `r`          — negative binomial only, required there: the size `r > 0`
+///   (variance `λ + λ²/r`; the dispersion is `α = 1/r`)
+///
+/// Every expression reads the `[binary_model]` namespace: θ, η, covariates,
+/// `[individual_parameters]` and `TIME` (per record).
+#[cfg(feature = "survival")]
+fn parse_count_model_block(
+    lines: &[String],
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+    kappa_names: &[String],
+    error_spec: &ErrorSpec,
+    endpoint_stmts: &mut Vec<Statement>,
+) -> Result<
+    (
+        usize,
+        crate::types::EndpointLikelihood,
+        Vec<String>,
+        std::collections::HashSet<usize>,
+        std::collections::HashSet<usize>,
+    ),
+    String,
+> {
+    use crate::types::{CountFamily, CountMeanScale, EndpointLikelihood};
+
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
+
+    let mut cmt_opt: Option<usize> = None;
+    let mut family: Option<CountFamily> = None;
+    let mut mean: Option<(CountMeanScale, Expression)> = None;
+    let mut size: Option<Expression> = None;
+    let key_of = |sc: CountMeanScale| match sc {
+        CountMeanScale::Linear => "lambda",
+        CountMeanScale::Log => "log_lambda",
+    };
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.splitn(2, '=').map(|s| s.trim()).collect();
+        if parts.len() != 2 {
+            return Err(format!(
+                "[count_model]: invalid line `{trimmed}` — expected `key = value`"
+            ));
+        }
+        let (key, value) = (parts[0], parts[1]);
+        match key {
+            "cmt" => {
+                let c = value.parse::<usize>().map_err(|_| {
+                    format!("[count_model]: invalid cmt `{value}` — expected a positive integer")
+                })?;
+                if c == 0 {
+                    return Err(
+                        "[count_model]: cmt = 0 is invalid — compartment indices are 1-based"
+                            .to_string(),
+                    );
+                }
+                cmt_opt = Some(c);
+            }
+            "type" => {
+                family = Some(match value {
+                    "poisson" => CountFamily::Poisson,
+                    "negbin" => CountFamily::NegBin,
+                    other => {
+                        return Err(format!(
+                            "[count_model]: type `{other}` is not supported — the types are \
+                             `poisson` (the default) and `negbin`"
+                        ))
+                    }
+                });
+            }
+            "lambda" | "log_lambda" => {
+                let this = if key == "lambda" {
+                    CountMeanScale::Linear
+                } else {
+                    CountMeanScale::Log
+                };
+                if let Some((prev, _)) = mean {
+                    let given = if prev == this {
+                        format!("`{key}` is given twice")
+                    } else {
+                        format!("the mean is given twice (`{}` and `{key}`)", key_of(prev))
+                    };
+                    return Err(format!(
+                        "[count_model]: {given} — a block has one mean, written as `lambda = …` \
+                         or as `log_lambda = …`"
+                    ));
+                }
+                mean = Some((this, parse_scalar_expression(value, ctx)?));
+            }
+            "r" => {
+                if size.is_some() {
+                    return Err("[count_model]: `r` is given twice".to_string());
+                }
+                size = Some(parse_scalar_expression(value, ctx)?);
+            }
+            other => {
+                return Err(format!(
+                    "[count_model]: unknown key `{other}` — valid keys: cmt, type, lambda, \
+                     log_lambda, r"
+                ));
+            }
+        }
+    }
+
+    let cmt = cmt_opt.ok_or("[count_model]: missing required key `cmt`")?;
+    let family = family.unwrap_or(CountFamily::Poisson);
+    let (scale, mean_expr) = mean.ok_or(
+        "[count_model]: missing the mean — write `lambda = …` (the mean count per record) or \
+         `log_lambda = …` (its log)",
+    )?;
+    let size_expr = match (family, size) {
+        (CountFamily::NegBin, Some(e)) => Some(e),
+        (CountFamily::NegBin, None) => {
+            return Err(
+                "[count_model]: `type = negbin` needs the size `r = …` (r > 0, variance \
+                 λ + λ²/r)"
+                    .to_string(),
+            )
+        }
+        (CountFamily::Poisson, Some(_)) => {
+            return Err(
+                "[count_model]: `r` is the negative-binomial size, but the block is a Poisson \
+                 endpoint — add `type = negbin`, or drop `r`"
+                    .to_string(),
+            )
+        }
+        (CountFamily::Poisson, None) => None,
+    };
+
+    endpoint_stmts.push(Statement::Assign(
+        format!("__ferx_count_model_{cmt}_mean"),
+        mean_expr.clone(),
+    ));
+    if let Some(e) = &size_expr {
+        endpoint_stmts.push(Statement::Assign(
+            format!("__ferx_count_model_{cmt}_r"),
+            e.clone(),
+        ));
+    }
+
+    if let ErrorSpec::PerCmt(cmt_map) = error_spec {
+        if cmt_map.contains_key(&cmt) {
+            return Err(format!(
+                "[count_model]: CMT={cmt} is already declared as a Gaussian endpoint in \
+                 [error_model] — the same CMT cannot be both Gaussian and a count"
+            ));
+        }
+    }
+
+    let mut exprs: Vec<&Expression> = vec![&mean_expr];
+    if let Some(e) = &size_expr {
+        exprs.push(e);
+    }
+    let (count_thetas, count_etas) = {
+        let mut theta_set = std::collections::HashSet::new();
+        let mut eta_set = std::collections::HashSet::new();
+        for e in &exprs {
+            collect_theta_eta(e, &mut theta_set, &mut eta_set);
+        }
+        (theta_set, eta_set)
+    };
+    let (needed_indiv_stmts, count_covariates) = restrict_and_validate_indiv_stmts(
+        &exprs,
+        indiv_stmts,
+        eta_names,
+        kappa_names,
+        "count_model",
+    )?;
+    let param_program = build_endpoint_expr_program(
+        &exprs,
+        &needed_indiv_stmts,
+        &count_covariates,
+        theta_names.len(),
+        eta_names.len(),
+    );
+
+    let indiv = needed_indiv_stmts;
+    let param_fn: crate::types::CountParamFn = Box::new(
+        move |theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>| {
+            let vars = eval_indiv_param_vars(&indiv, theta, eta, covariates);
+            let m = eval_expression(&mean_expr, theta, eta, covariates, &vars, &[]);
+            let r = size_expr.as_ref().map_or(f64::NAN, |e| {
+                eval_expression(e, theta, eta, covariates, &vars, &[])
+            });
+            [m, r]
+        },
+    );
+
+    Ok((
+        cmt,
+        EndpointLikelihood::Count {
+            family,
+            scale,
+            param_fn,
+            param_program,
+            count_covariates: count_covariates.clone(),
+        },
+        count_covariates,
+        count_thetas,
+        count_etas,
     ))
 }
 
@@ -18227,6 +18517,7 @@ enum BlockForm {
 const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
     ("adaptive_dosing", BlockForm::Unnamed, None),
     ("binary_model", BlockForm::Either, Some("survival")),
+    ("count_model", BlockForm::Either, Some("survival")),
     ("covariate_model", BlockForm::Unnamed, None),
     ("covariate_nn", BlockForm::Named, None),
     ("covariates", BlockForm::Unnamed, None),
@@ -20527,6 +20818,9 @@ pub(crate) fn level_record_cmts(
         use crate::types::EndpointLikelihood as E;
         let reads = match ep {
             E::Binary { lp_covariates, .. } => lp_covariates.iter().any(|c| c == index),
+            E::Count {
+                count_covariates, ..
+            } => count_covariates.iter().any(|c| c == index),
             #[cfg(feature = "markov")]
             E::Dtmm {
                 prob_covariates, ..
@@ -25061,9 +25355,10 @@ pub(crate) struct ScaleShare {
     /// The variable that carried the random effect into that expression, when
     /// the expression does not read the η itself.
     pub(crate) eta_via: Option<String>,
-    /// With `param` `None`: the expression is a `[binary_model]` predictor, not the `y`
-    /// readout (#2562).
-    pub(crate) binary: bool,
+    /// With `param` `None`: the endpoint expression it is, by its readout label
+    /// ([`BINARY_READOUT`], [`COUNT_MEAN_READOUT`], [`COUNT_SIZE_READOUT`]), or `None` for the
+    /// `y` readout (#2562, #2877).
+    pub(crate) endpoint: Option<&'static str>,
 }
 
 /// How one random effect relates to a level block (#1649, #1650), as far as
@@ -25681,7 +25976,7 @@ fn map_condition_operands<'a>(
 fn block_shares_scale_with_eta(
     stmts: &[Statement],
     readout: &[Expression],
-    n_binary: usize,
+    endpoint_labels: &[&'static str],
     block: &str,
     only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
@@ -25708,7 +26003,7 @@ fn block_shares_scale_with_eta(
 
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
-    let n_y = readout.len() - n_binary;
+    let n_y = readout.len() - endpoint_labels.len();
     // `None` is the readout: it is read, never assigned to.
     assigns.extend(readout.iter().map(|e| (None, e)));
     let first_readout = assigns.len() - readout.len();
@@ -25739,8 +26034,12 @@ fn block_shares_scale_with_eta(
                     } else {
                         eta_via.map(str::to_string)
                     },
-                    // The trailing readouts are the `[binary_model]` predictors.
-                    binary: lhs.is_none() && at >= first_readout + n_y,
+                    // The trailing readouts are the endpoint expressions, one label each.
+                    endpoint: lhs
+                        .is_none()
+                        .then(|| at.checked_sub(first_readout + n_y))
+                        .flatten()
+                        .map(|i| endpoint_labels[i]),
                 });
             }
             if let Some(lhs) = *lhs {
@@ -26008,7 +26307,7 @@ fn coupling_assigns<'a>(
 fn level_block_eta_coupling(
     stmts: &[Statement],
     readout: &[Expression],
-    n_binary: usize,
+    endpoint_labels: &[&'static str],
     block: &str,
     k: usize,
     eta_name: &str,
@@ -26135,7 +26434,7 @@ fn level_block_eta_coupling(
                 site: ScaleShare {
                     param: Some(v.to_string()),
                     eta_via: via,
-                    binary: false,
+                    endpoint: None,
                 },
                 covariates,
             });
@@ -26146,11 +26445,13 @@ fn level_block_eta_coupling(
         let (reads_any, reads_both) = reads(tb_states, te_states, ctx.out());
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
-            // The trailing readouts are the `[binary_model]` predictors (#2562).
-            let binary = readout
+            // The trailing readouts are the endpoint expressions (#2562, #2877).
+            let n_y = readout.len() - endpoint_labels.len();
+            let endpoint = readout
                 .iter()
                 .position(|e| std::ptr::eq(e, *y))
-                .is_some_and(|i| i >= readout.len() - n_binary);
+                .and_then(|i| i.checked_sub(n_y))
+                .map(|i| endpoint_labels[i]);
             let mut covariates = Vec::new();
             let ops = ctx
                 .funnel_operands(y, &reads_any, &reads_both)
@@ -26172,7 +26473,7 @@ fn level_block_eta_coupling(
                     site: ScaleShare {
                         param: None,
                         eta_via: via,
-                        binary,
+                        endpoint,
                     },
                     covariates,
                 });
@@ -26599,6 +26900,49 @@ pub(crate) const Y_READOUT: &str = "the `y` readout";
 /// logit link is implicit: the predictor is the link's argument, walked as an affine read,
 /// and a block it reads is `linked`.
 pub(crate) const BINARY_READOUT: &str = "the `[binary_model]` predictor";
+
+/// The label the level-block walks give a `[count_model]` mean (`lambda` / `log_lambda`).
+pub(crate) const COUNT_MEAN_READOUT: &str = "the `[count_model]` mean";
+
+/// The label the level-block walks give a `[count_model]` size `r`.
+pub(crate) const COUNT_SIZE_READOUT: &str = "the `[count_model]` size `r`";
+
+/// Every `[count_model]` block's mean and size expressions, labelled, the unnamed block
+/// first and the named ones by label, for the walks that judge how a level block meets a
+/// random effect (#2877) — a count mean is a prediction exactly as a binary predictor is.
+/// A line that does not parse is left out here, since `parse_count_model_block` reports it.
+fn count_readout_exprs(
+    blocks: &HashMap<String, Vec<String>>,
+    named: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>>,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+) -> Vec<(&'static str, Expression)> {
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
+    let mut labelled: Vec<(&String, &Vec<String>)> = named
+        .get("count_model")
+        .map(|m| m.iter().collect())
+        .unwrap_or_default();
+    labelled.cold_sort_by(&|a, b| a.0.cmp(b.0));
+    blocks
+        .get("count_model")
+        .into_iter()
+        .chain(labelled.into_iter().map(|(_, lines)| lines))
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            let label = match key.trim() {
+                "lambda" | "log_lambda" => COUNT_MEAN_READOUT,
+                "r" => COUNT_SIZE_READOUT,
+                _ => return None,
+            };
+            parse_scalar_expression(value.trim(), ctx)
+                .ok()
+                .map(|e| (label, e))
+        })
+        .collect()
+}
 
 /// Every `[binary_model]` block's `logit` expression, the unnamed block first and the
 /// named ones by label, for the walks
@@ -27498,6 +27842,11 @@ const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
         "binary_model",
         "link",
         WordValue::Words(&["logit", "probit"]),
+    ),
+    (
+        "count_model",
+        "type",
+        WordValue::Words(&["poisson", "negbin"]),
     ),
     ("markov_model", "type", WordValue::Words(&["ctmm", "dtmm"])),
     ("markov_model", "states", WordValue::Labels),
