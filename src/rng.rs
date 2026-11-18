@@ -1,4 +1,4 @@
-//! Seed derivation for independent random streams (#3010).
+//! Seed derivation for independent random streams (#3021).
 //!
 //! Every per-subject, per-chain or per-start stream is `seed_from_u64` of a value derived
 //! from the user's seed and the stream's coordinates. Deriving it as `seed + i` made
@@ -51,7 +51,7 @@ mod tests {
     }
 
     /// Every site derives its stream seed through [`stream_seed`]: no non-test source line
-    /// seeds from `seed ± coordinate` arithmetic (the #3010 shape — `seed.wrapping_add(i as
+    /// seeds from `seed ± coordinate` arithmetic (the #3021 shape — `seed.wrapping_add(i as
     /// u64)`, `seed + i`), which no unit test of one estimator would catch for the others.
     #[test]
     fn no_site_derives_a_stream_seed_by_addition() {

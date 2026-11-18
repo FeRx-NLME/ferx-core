@@ -12390,10 +12390,10 @@ DV ~ additive(EPS)
     const SCALE1444_BURNIN: usize = 30;
 
     /// Seed of the #1444 fixtures below. The realised interval-rule tail rate on the
-    /// over-dispersed fixture scatters across seeds (60 seeds measured under #3010: 0.064 to
+    /// over-dispersed fixture scatters across seeds (60 seeds measured under #3021: 0.064 to
     /// 0.115, median 0.087, 14 of 60 at or above the 0.10 band edge), so the fixture needs a
     /// seed whose arms sit clear of the gates; 1444 landed at 0.1031 once the per-subject
-    /// streams were hashed (#3010). At this seed: interval 0.0833, RM 0.3309 (over-dispersed
+    /// streams were hashed (#3021). At this seed: interval 0.0833, RM 0.3309 (over-dispersed
     /// Omega); interval 0.6240, RM 0.4316 (sensible Omega).
     const SCALE1444_SEED: u64 = 22;
 
@@ -12572,7 +12572,7 @@ DV ~ additive(EPS)
         //
         //             both halves   componentwise half deleted   bound
         //   below       0.0729              0.1624               0.12
-        //   (the mutation columns were measured before #3010 re-seeded the streams;
+        //   (the mutation columns were measured before #3021 re-seeded the streams;
         //   the passing case is now 0.0691 below and 0.0316 above, same bounds)
         //   above       0.0324              0.0807               0.06
         //

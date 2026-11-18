@@ -160,9 +160,9 @@ fn saem_on_the_one_line_spelling_lands_with_the_split_one() {
     );
 }
 
-// Before #3010 the per-subject SAEM streams were `seed + i`: Linux aarch64 gave one-line
+// Before #3021 the per-subject SAEM streams were `seed + i`: Linux aarch64 gave one-line
 // 97.28–97.85, split 97.34–98.05; macOS arm64 one-line 97.21–98.88, split 97.33–98.39, and
-// the bound was 99.5 on every seed. Hashing the streams (#3010) moved the five runs on
+// the bound was 99.5 on every seed. Hashing the streams (#3021) moved the five runs on
 // Linux x86_64 to one-line 97.41–101.22 (median 98.74), split 97.30–100.53 (median
 // 98.76): a run at 100–101 appears under *both* spellings, so the old all-seeds bound was
 // a property of that stream set, not of the spelling. The median of the five is the

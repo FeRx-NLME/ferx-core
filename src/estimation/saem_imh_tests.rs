@@ -1838,7 +1838,7 @@ fn the_mixing_tally_leaves_the_imh_move_out() {
 }
 
 /// θ (2), Ω (2×2, column-major), σ (1), the SAEM objective. Originally captured on `main`
-/// f8955c24 (macOS arm64); re-captured on Linux x86_64 under #3010, which re-keyed the
+/// f8955c24 (macOS arm64); re-captured on Linux x86_64 under #3021, which re-keyed the
 /// per-subject E-step streams (`stream_seed`), so every draw moved (θ₁ 2.7158 → 2.6976).
 const FROZEN_LEN: usize = 8;
 const FROZEN_MAIN: [f64; FROZEN_LEN] = [

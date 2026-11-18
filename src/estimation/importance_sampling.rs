@@ -12,7 +12,7 @@
 //! (sparse-data PK, strong nonlinearity).
 //!
 //! The kernel is rayon-parallel over subjects; per-subject RNGs are seeded
-//! from `stream_seed(options.imp_seed, &[i])` (#3010: a hash, so runs under consecutive
+//! from `stream_seed(options.imp_seed, &[i])` (#3021: a hash, so runs under consecutive
 //! seeds share no subject stream) so the result is deterministic for a given seed.
 //!
 //! ## Adaptive evaluation (#2653)

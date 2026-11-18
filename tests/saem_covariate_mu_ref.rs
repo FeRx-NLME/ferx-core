@@ -930,8 +930,8 @@ const BEFORE_SHARED_SAEM_TH_WT: f64 = 0.010_075;
 const BEFORE_SHARED_IMPMAP_TH_CRCL: f64 = 0.358_114;
 const BEFORE_SHARED_IMPMAP_TVCL: f64 = 4.744_483;
 
-/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3010; the
-/// tables below are the pre-#3010 single-seed errors, whose seeds 1-3 shared 29 of 30
+/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3021; the
+/// tables below are the pre-#3021 single-seed errors, whose seeds 1-3 shared 29 of 30
 /// subject streams), from the realised errors on aarch64
 /// (`ci-test`) at the time of writing:
 ///
@@ -987,11 +987,11 @@ fn fit_shared(edit: impl FnOnce(&mut FitOptions)) -> FitResult {
 }
 
 /// The seeds every #1620 / #1630 SAEM arm is run over, asserting on the **median** of the
-/// fits (#3010). The bounds below were tuned to the one Monte Carlo path of seed 1 (and a
-/// "spread over seeds 1/2/3", whose streams overlapped before #3010). Hashing the streams
-/// (#3010) moved seed 1 onto another path of the same noisy distribution: over 15 seeds
+/// fits (#3021). The bounds below were tuned to the one Monte Carlo path of seed 1 (and a
+/// "spread over seeds 1/2/3", whose streams overlapped before #3021). Hashing the streams
+/// (#3021) moved seed 1 onto another path of the same noisy distribution: over 15 seeds
 /// `THETA_WT` has sd 0.058 (150/250), 0.051 (300/700) and 0.153 (`score_sa`, one seed at
-/// 1.20) — the pre-#3010 streams measured sd 0.074 / 0.070 / 0.048 on the same seeds, so the
+/// 1.20) — the pre-#3021 streams measured sd 0.074 / 0.070 / 0.048 on the same seeds, so the
 /// noise is the fixture's, not the change's — and B's `THETA_WT_V1` is bimodal (0.21–0.33
 /// on 5 of 15 seeds, 0.47–0.71 on the rest, sd 0.17), so no single seed can honour the
 /// 0.04 / 0.05 bounds. The median of 9 seeds can: its
@@ -1147,8 +1147,8 @@ const BEFORE_ANCHOR_A_TH_CRCL: f64 = 0.213_731;
 const BEFORE_ANCHOR_B_TH_WT_V1: f64 = 0.401_657;
 const BEFORE_ANCHOR_B_TVV1: f64 = 94.696_502 * 0.483_249;
 
-/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3010; the
-/// table below is the pre-#3010 single-seed errors, whose seeds 1-3 shared 29 of 30 subject
+/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3021; the
+/// table below is the pre-#3021 single-seed errors, whose seeds 1-3 shared 29 of 30 subject
 /// streams), from the realised errors (Linux x86_64,
 /// release) at the time of writing, seed 1 being the tested arm:
 ///

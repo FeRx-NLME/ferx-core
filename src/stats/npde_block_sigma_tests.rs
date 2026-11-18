@@ -197,7 +197,7 @@ fn npde_decorrelates_a_paired_block_sigma_at_the_fitted_correlation() {
 /// Its `R` is diagonal, so the shared correlated draw takes its per-row fast
 /// path, which consumes the RNG stream in the same order as the old scalar loop.
 /// The scores are pinned to the bit: first captured from `d43afca9` (before the draw
-/// moved), re-captured under #3010, which re-keyed the per-subject streams. A draw that perturbed the stream (an extra normal, or rows drawn in
+/// moved), re-captured under #3021, which re-keyed the per-subject streams. A draw that perturbed the stream (an extra normal, or rows drawn in
 /// another order) would move them. Turning the fast path off does not: the
 /// eigen square root of a diagonal `R` was measured to give the same bits, so
 /// the fast path is a cost saving, not a numerical one.

@@ -118,7 +118,7 @@ pub struct SubjectNpde {
 /// (`K`); `seed` makes the draw reproducible.
 ///
 /// Subjects are simulated in parallel, each with its own RNG seeded from
-/// `stream_seed(seed, &[subject_index])` (a hash: consecutive seeds share no stream, #3010), so the result is independent of the rayon schedule
+/// `stream_seed(seed, &[subject_index])` (a hash: consecutive seeds share no stream, #3021), so the result is independent of the rayon schedule
 /// and reproducible for a fixed `seed`.
 ///
 /// For an IOV model the reference distribution draws one independent occasion
