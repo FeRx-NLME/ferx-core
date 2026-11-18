@@ -87,9 +87,10 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 ///
 /// Each subject is classified on the engine that serves it at the fitted `(θ, η̂)`
 /// ([`pk::effective_model_for_eval`], the same call `compute_predictions_with_states`
-/// makes), so a closed-form transit/IG subject rerouted to its ODE twin is reported as
-/// ODE, not as NaN. IOV subjects (non-empty κ) are skipped: their states are empty for
-/// a different reason, `W_DERIVED_CMT_IOV_UNSUPPORTED`.
+/// makes). A closed-form transit/IG subject rerouted to its ODE twin has no states in the
+/// closed form's layout and gets `W_DERIVED_CMT_TWIN_ANALYTICAL` instead (#1580). IOV
+/// subjects (non-empty κ) are skipped: their states are empty for a different reason,
+/// `W_DERIVED_CMT_IOV_UNSUPPORTED`.
 ///
 /// | engine | TV covariate or `TIME`-reading individual params | states | warning |
 /// |---|---|---|---|
@@ -113,12 +114,17 @@ pub(crate) fn derived_cmt_time_varying_warnings(
     // (any subject with a TV covariate, any subject on a TIME-reading model), per engine.
     let mut analytical = (false, false);
     let mut ode = (false, false);
+    let mut twin = false;
     for (i, subject) in population.subjects.iter().enumerate() {
         if kappas.get(i).is_some_and(|k| !k.is_empty()) {
             continue;
         }
         let eta = eta_hats.get(i).map_or(&[][..], |e| e.as_slice());
         let m = pk::effective_model_for_eval(model, subject, theta, eta);
+        if model.ode_spec.is_none() && m.ode_spec.is_some() {
+            twin = true;
+            continue;
+        }
         let (slot, tv_cov, time) = if m.ode_spec.is_some() {
             if !pk::ode_cmt_states_approximate(m, subject) {
                 continue;
@@ -157,6 +163,16 @@ pub(crate) fn derived_cmt_time_varying_warnings(
              compartments[i] results with care for those subjects.",
             cause(ode)
         ));
+    }
+    if twin {
+        out.push(
+            "W_DERIVED_CMT_TWIN_ANALYTICAL: closed-form transit/IG model with subjects its \
+             ODE equivalent serves (for example a steady-state or infusion dose, a \
+             TIME-reading parameter, or the flip-flop regime) — compartment states are \
+             not available for those subjects; [derived] expressions that reference \
+             compartments[i] evaluate to NaN for them."
+                .to_string(),
+        );
     }
     out
 }
