@@ -3414,8 +3414,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if !result.profiled_blocks.is_empty() {
         writeln!(
             f,
-            "\nprofiled_blocks: [{}]",
-            result.profiled_blocks.join(", ")
+            "\nprofiled_blocks: {}",
+            estimates::yaml_flow_names(&result.profiled_blocks)
         )
         .map_err(|e| e.to_string())?;
     }
@@ -3423,7 +3423,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
         for (block, range) in &theta_blocks {
             let s = theta_block_summary(result, range.clone());
-            writeln!(f, "  {}:", block).map_err(|e| e.to_string())?;
+            writeln!(f, "  {}:", estimates::yaml_name(block, false)).map_err(|e| e.to_string())?;
             writeln!(f, "    n_free_coefficients: {}", s.n_free).map_err(|e| e.to_string())?;
             writeln!(f, "    n_fixed_coefficients: {}", s.n_fixed).map_err(|e| e.to_string())?;
             if result.profiled_blocks.contains(block) {
@@ -3438,6 +3438,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .strip_prefix(&format!("{block}["))
                     .and_then(|r| r.strip_suffix(']'))
                     .unwrap_or(&result.theta_names[i]);
+                // Quoted always, as before, but escaped: a label is data (#3006).
+                let label = yaml_quote(label);
                 // A FIX coefficient reads as a fixed scalar θ does above (#1891):
                 // flagged, with no SE — it was not estimated.
                 let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
@@ -3445,7 +3447,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 match se {
                     _ if is_fixed => writeln!(
                         f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
+                        "      - {{ label: {}, estimate: {:.6}, fixed: true, se: ~, rse_pct: ~ }}",
                         label, result.theta[i]
                     ),
                     // A profiled level held on its bound (#2112): estimated, but held by
@@ -3460,7 +3462,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                         };
                         writeln!(
                             f,
-                            "      - {{ label: \"{}\", estimate: {:.6}, {}se: ~, rse_pct: ~, held: {} }}",
+                            "      - {{ label: {}, estimate: {:.6}, {}se: ~, rse_pct: ~, held: {} }}",
                             label,
                             result.theta[i],
                             at_bound,
@@ -3469,7 +3471,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     }
                     Some(se) => writeln!(
                         f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
+                        "      - {{ label: {}, estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
                         label,
                         result.theta[i],
                         se,
@@ -3477,7 +3479,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     ),
                     None => writeln!(
                         f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, se: ~, rse_pct: ~ }}",
+                        "      - {{ label: {}, estimate: {:.6}, se: ~, rse_pct: ~ }}",
                         label, result.theta[i]
                     ),
                 }
@@ -3495,7 +3497,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if !result.neural_networks.is_empty() {
         writeln!(f, "\nneural_networks:").map_err(|e| e.to_string())?;
         for nn in &result.neural_networks {
-            writeln!(f, "  {}:", nn.name).map_err(|e| e.to_string())?;
+            writeln!(f, "  {}:", estimates::yaml_name(&nn.name, false))
+                .map_err(|e| e.to_string())?;
             writeln!(
                 f,
                 "    shape: [{}]",
@@ -3510,10 +3513,18 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    output_activation: {}", nn.output_activation)
                 .map_err(|e| e.to_string())?;
-            writeln!(f, "    inputs: [{}]", nn.input_names.join(", "))
-                .map_err(|e| e.to_string())?;
-            writeln!(f, "    outputs: [{}]", nn.output_names.join(", "))
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    inputs: {}",
+                estimates::yaml_flow_names(&nn.input_names)
+            )
+            .map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    outputs: {}",
+                estimates::yaml_flow_names(&nn.output_names)
+            )
+            .map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
             // Emitted only when the model actually normalises, so a plain network's
             // block is byte-identical to before. The reported weights are meaningless
@@ -3727,8 +3738,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         // posterior variance (see docs/estimation/vi.qmd). It is for individual-level
         // reporting and shrinkage, not a route to population standard errors.
         if !v.eta_means.is_empty() {
-            writeln!(f, "  eta_names: [{}]", result.eta_names.join(", "))
-                .map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "  eta_names: {}",
+                estimates::yaml_flow_names(&result.eta_names)
+            )
+            .map_err(|e| e.to_string())?;
             writeln!(f, "  eta_posterior:").map_err(|e| e.to_string())?;
             for (i, mean) in v.eta_means.iter().enumerate() {
                 let id = result
@@ -3789,7 +3804,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  ci_theta:").map_err(|e| e.to_string())?;
             for (i, name) in result.theta_names.iter().enumerate() {
                 if i < ci.len() {
-                    writeln!(f, "    {}:", name).map_err(|e| e.to_string())?;
+                    writeln!(f, "    {}:", estimates::yaml_name(name, false))
+                        .map_err(|e| e.to_string())?;
                     writeln!(f, "      lower: {:.6}", ci[i].0).map_err(|e| e.to_string())?;
                     writeln!(f, "      upper: {:.6}", ci[i].1).map_err(|e| e.to_string())?;
                 }
@@ -3803,7 +3819,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("omega_{}_{}", i + 1, i + 1));
-                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                writeln!(f, "    {}:", estimates::yaml_name(&key, false))
+                    .map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3816,7 +3833,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("sigma_{}", i + 1));
-                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                writeln!(f, "    {}:", estimates::yaml_name(&key, false))
+                    .map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3829,7 +3847,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(k)
                     .cloned()
                     .unwrap_or_else(|| format!("kappa_{}", k + 1));
-                writeln!(f, "    {}:", key).map_err(|e| e.to_string())?;
+                writeln!(f, "    {}:", estimates::yaml_name(&key, false))
+                    .map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3885,11 +3904,18 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  estimator: {} # {}", m.label(), m.formula())
                 .map_err(|e| e.to_string())?;
         }
-        writeln!(f, "  parameters: [{}]", names.join(", ")).map_err(|e| e.to_string())?;
+        writeln!(f, "  parameters: {}", estimates::yaml_flow_names(&names))
+            .map_err(|e| e.to_string())?;
         writeln!(f, "  rows:").map_err(|e| e.to_string())?;
         for i in 0..n {
             let row: Vec<String> = (0..n).map(|j| fmt_cov_entry(cov[(i, j)])).collect();
-            writeln!(f, "    {}: [{}]", names[i], row.join(", ")).map_err(|e| e.to_string())?;
+            writeln!(
+                f,
+                "    {}: [{}]",
+                estimates::yaml_name(&names[i], false),
+                row.join(", ")
+            )
+            .map_err(|e| e.to_string())?;
         }
     }
 
@@ -7579,6 +7605,50 @@ mod tests {
             draws: None,
         });
         r
+    }
+
+    /// #3006: a fit with a θ level block and the covariance step on wrote
+    /// `parameters: [INT, TEFF[TIME=0.5], …]`, whose `[` opens a nested flow sequence,
+    /// so no YAML parser could read the file. Parse the whole document back and check
+    /// every place a level name lands — the flow lists and the block keys — reads as
+    /// the name itself.
+    #[test]
+    fn write_estimates_yaml_with_level_names_parses_back() {
+        let mut r = comprehensive_result();
+        let names = ["TEFF[TIME=0.5]", "TEFF[TIME=1]"];
+        r.theta_names = names.iter().map(|s| s.to_string()).collect();
+        r.theta_fixed = vec![false, false];
+        r.profiled_blocks = vec!["TEFF".into()];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fit.yaml");
+        write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+        let yaml = std::fs::read_to_string(&path).expect("yaml read");
+        let doc: serde_json::Value = serde_saphyr::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("fit.yaml must parse: {e}\n{yaml}"));
+
+        let params = doc["covariance_matrix"]["parameters"]
+            .as_array()
+            .unwrap_or_else(|| panic!("parameters is a sequence:\n{yaml}"));
+        assert_eq!(params.len(), 10, "{params:?}");
+        assert_eq!(params[0], names[0], "{params:?}");
+        assert_eq!(params[1], names[1], "{params:?}");
+        assert_eq!(params[2], "log_chol_ETA_CL", "{params:?}");
+        for name in names {
+            let row = &doc["covariance_matrix"]["rows"][name];
+            assert_eq!(row.as_array().map(Vec::len), Some(10), "rows.{name}: {row}");
+            assert!(doc["theta"][name].is_object(), "theta.{name}");
+            assert!(
+                doc["sir"]["ci_theta"][name].is_object(),
+                "sir.ci_theta.{name}"
+            );
+        }
+        assert_eq!(doc["profiled_blocks"], serde_json::json!(["TEFF"]));
+        // Only the flow list needed quotes: block keys keep their bare spelling.
+        assert!(yaml.contains("\n    TEFF[TIME=0.5]: ["), "{yaml}");
+        assert!(
+            yaml.contains("  parameters: [\"TEFF[TIME=0.5]\", \"TEFF[TIME=1]\", log_chol_ETA_CL,"),
+            "{yaml}"
+        );
     }
 
     /// The `sir:` section of a fit YAML, through the line before the next
