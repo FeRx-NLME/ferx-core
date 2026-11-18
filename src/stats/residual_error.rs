@@ -3085,6 +3085,49 @@ mod tests {
     use approx::assert_relative_eq;
     use std::collections::HashMap;
 
+    /// `∂R/∂f_m` from `compute_dr_df_matrices` against a central difference (`h = 1e-4`) of
+    /// `compute_r_matrix_with_correlations`, for every observation `m` and entry of `R`.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_dr_df_matches_fd(
+        spec: &ErrorSpec,
+        ipreds: &[f64],
+        cmts: &[usize],
+        times: &[f64],
+        raw_times: &[f64],
+        occasions: &[u32],
+        obs_l2: &[i64],
+        sigma: &[f64],
+        corrs: &[crate::types::ResidualCorrelation],
+    ) {
+        let dr = compute_dr_df_matrices(
+            spec, ipreds, cmts, times, raw_times, occasions, obs_l2, sigma, corrs, None,
+        );
+        let n = ipreds.len();
+        let r_at = |f: &[f64]| {
+            compute_r_matrix_with_correlations(
+                spec, f, cmts, times, raw_times, occasions, obs_l2, sigma, corrs,
+            )
+        };
+        let h = 1e-4;
+        for m in 0..n {
+            let mut fp = ipreds.to_vec();
+            let mut fm = ipreds.to_vec();
+            fp[m] += h;
+            fm[m] -= h;
+            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
+            for p in 0..n {
+                for q in 0..n {
+                    assert_relative_eq!(
+                        dr[m][(p, q)],
+                        fd[(p, q)],
+                        epsilon = 1e-5,
+                        max_relative = 1e-4
+                    );
+                }
+            }
+        }
+    }
+
     /// `loading_shape` evaluated at `f` is exactly `sigma_loadings` and `sigma_loading_slopes`
     /// at `f` together — the two lists the likelihood kernel used to allocate per row — on
     /// every error form, every σ count a `Single` model can be declared with, every
@@ -4071,7 +4114,7 @@ mod tests {
 
         // The derivative builder must track the same all-to-all pairing: ∂R/∂f
         // matches a central difference of R for every observation.
-        let dr = compute_dr_df_matrices(
+        assert_dr_df_matches_fd(
             &spec,
             &ipreds,
             &cmts,
@@ -4081,40 +4124,7 @@ mod tests {
             &obs_l2,
             &sigma,
             &corrs,
-            None,
         );
-        let n = ipreds.len();
-        let r_at = |f: &[f64]| {
-            compute_r_matrix_with_correlations(
-                &spec,
-                f,
-                &cmts,
-                &times,
-                &[],
-                &[],
-                &obs_l2,
-                &sigma,
-                &corrs,
-            )
-        };
-        let h = 1e-4;
-        for m in 0..n {
-            let mut fp = ipreds.to_vec();
-            let mut fm = ipreds.to_vec();
-            fp[m] += h;
-            fm[m] -= h;
-            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
-            for p in 0..n {
-                for q in 0..n {
-                    assert_relative_eq!(
-                        dr[m][(p, q)],
-                        fd[(p, q)],
-                        epsilon = 1e-5,
-                        max_relative = 1e-4
-                    );
-                }
-            }
-        }
     }
 
     // #830: the pairing is structural (slot overlap), not value-based, so a
@@ -4215,7 +4225,7 @@ mod tests {
             sigma_j: 1,
             rho: 0.93,
         };
-        let dr = compute_dr_df_matrices(
+        assert_dr_df_matches_fd(
             &spec,
             &ipreds,
             &cmts,
@@ -4225,40 +4235,7 @@ mod tests {
             &[],
             &sigma,
             &[corr],
-            None,
         );
-        let n = ipreds.len();
-        let r_at = |f: &[f64]| {
-            compute_r_matrix_with_correlations(
-                &spec,
-                f,
-                &cmts,
-                &times,
-                &[],
-                &[],
-                &[],
-                &sigma,
-                &[corr],
-            )
-        };
-        let h = 1e-4;
-        for m in 0..n {
-            let mut fp = ipreds.to_vec();
-            let mut fm = ipreds.to_vec();
-            fp[m] += h;
-            fm[m] -= h;
-            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
-            for p in 0..n {
-                for q in 0..n {
-                    assert_relative_eq!(
-                        dr[m][(p, q)],
-                        fd[(p, q)],
-                        epsilon = 1e-5,
-                        max_relative = 1e-4
-                    );
-                }
-            }
-        }
     }
 
     // Central-difference check: ∂R/∂f_m from `compute_dr_df_matrices` must match
@@ -4291,7 +4268,7 @@ mod tests {
             sigma_j: 1,
             rho: 0.4,
         };
-        let dr = compute_dr_df_matrices(
+        assert_dr_df_matches_fd(
             &spec,
             &ipreds,
             &cmts,
@@ -4301,40 +4278,7 @@ mod tests {
             &[],
             &sigma,
             &[corr],
-            None,
         );
-        let n = ipreds.len();
-        let r_at = |f: &[f64]| {
-            compute_r_matrix_with_correlations(
-                &spec,
-                f,
-                &cmts,
-                &times,
-                &[],
-                &[],
-                &[],
-                &sigma,
-                &[corr],
-            )
-        };
-        let h = 1e-4;
-        for m in 0..n {
-            let mut fp = ipreds.to_vec();
-            let mut fm = ipreds.to_vec();
-            fp[m] += h;
-            fm[m] -= h;
-            let fd = (r_at(&fp) - r_at(&fm)) / (2.0 * h);
-            for p in 0..n {
-                for q in 0..n {
-                    assert_relative_eq!(
-                        dr[m][(p, q)],
-                        fd[(p, q)],
-                        epsilon = 1e-5,
-                        max_relative = 1e-4
-                    );
-                }
-            }
-        }
     }
 
     // With a #484 per-observation magnitude matrix, ∂R/∂f must track the

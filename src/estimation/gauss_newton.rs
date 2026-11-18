@@ -3475,7 +3475,6 @@ mod tests {
 
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let n = x.len();
 
         let n_obs = 3;
         let n_eta = 1;
@@ -3516,48 +3515,21 @@ mod tests {
             "nll mismatch: {nll_an} vs {nll_ref}"
         );
 
-        let eps = 1e-5;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-            let pp = unpack_params(&xp, template);
-            let pm = unpack_params(&xm, template);
-            let np = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &pp,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nm = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &pm,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (np - nm) / actual_2h;
-
-            // Omega and sigma components should be machine-accurate; theta can
-            // differ due to forward vs central FD — allow 1% relative tolerance.
-            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
-            assert!(
-                (grad_an[j] - ref_j).abs() < tol,
-                "analytical grad[{j}]: {:.6e}, fd ref: {:.6e}, diff: {:.2e}",
-                grad_an[j],
-                ref_j,
-                (grad_an[j] - ref_j).abs()
-            );
-        }
+        // Omega and sigma components should be machine-accurate; theta can
+        // differ due to forward vs central FD — allow 1% relative tolerance.
+        assert_grad_matches_central_fd(
+            "analytical",
+            &grad_an,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-5,
+            0.01,
+        );
     }
 
     /// Verify that the analytical gradient is correct when H is non-zero —
@@ -3571,7 +3543,6 @@ mod tests {
 
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let n = x.len();
 
         let n_obs = 3;
         let n_eta = 1;
@@ -3617,46 +3588,19 @@ mod tests {
         );
 
         // Gradient must agree with central-FD reference
-        let eps = 1e-5;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-            let pp = unpack_params(&xp, template);
-            let pm = unpack_params(&xm, template);
-            let np = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &pp,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nm = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &pm,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (np - nm) / actual_2h;
-
-            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
-            assert!(
-                (grad_an[j] - ref_j).abs() < tol,
-                "nonzero-H: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
-                grad_an[j],
-                ref_j,
-                (grad_an[j] - ref_j).abs()
-            );
-        }
+        assert_grad_matches_central_fd(
+            "nonzero-H: analytical",
+            &grad_an,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-5,
+            0.01,
+        );
     }
 
     /// (Previously verified the analytical gradient under `interaction=true`;
@@ -3672,7 +3616,6 @@ mod tests {
 
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let n = x.len();
 
         let n_obs = 3;
         let n_eta = 1;
@@ -3710,46 +3653,19 @@ mod tests {
             "interaction nll mismatch: {nll_an} vs {nll_ref}"
         );
 
-        let eps = 1e-5;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-            let pp = unpack_params(&xp, template);
-            let pm = unpack_params(&xm, template);
-            let np = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &pp,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nm = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &pm,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (np - nm) / actual_2h;
-
-            let tol = 0.01 * (1.0 + ref_j.abs()).max(1e-8);
-            assert!(
-                (grad_an[j] - ref_j).abs() < tol,
-                "interaction: analytical grad[{j}]={:.6e}, fd ref={:.6e}, diff={:.2e}",
-                grad_an[j],
-                ref_j,
-                (grad_an[j] - ref_j).abs()
-            );
-        }
+        assert_grad_matches_central_fd(
+            "interaction: analytical",
+            &grad_an,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-5,
+            0.01,
+        );
     }
 
     /// Verify that `subject_nll_pop_grad` returns (nll, gradient) where the
@@ -3763,7 +3679,6 @@ mod tests {
 
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let n = x.len();
 
         let n_obs = 3;
         let n_eta = 1;
@@ -3809,46 +3724,19 @@ mod tests {
         }
 
         // Each gradient component must agree with sequential central-FD reference
-        let eps = 1e-4;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-
-            let params_p = unpack_params(&xp, template);
-            let params_m = unpack_params(&xm, template);
-            let nll_p = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_p,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nll_m = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_m,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (nll_p - nll_m) / actual_2h;
-
-            let tol = 1e-4 * (1.0 + ref_j.abs());
-            assert!(
-                (grad[j] - ref_j).abs() < tol,
-                "grad[{j}]: subject_nll_pop_grad={:.6e}, ref={:.6e}",
-                grad[j],
-                ref_j,
-            );
-        }
+        assert_grad_matches_central_fd(
+            "grad",
+            &grad,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-4,
+            1e-4,
+        );
     }
 
     /// #2740 / #2974: on a Gaussian FOCEI model GN's per-subject row `dᵢ` must be the total
@@ -4529,7 +4417,6 @@ mod tests {
 
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let n = x.len();
 
         let n_obs = 3;
         let n_eta = 1;
@@ -4581,48 +4468,19 @@ mod tests {
             assert!(g.is_finite(), "Laplace grad[{j}] not finite");
         }
 
-        let eps = 1e-4;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-
-            let params_p = unpack_params(&xp, template);
-            let params_m = unpack_params(&xm, template);
-            let nll_p = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_p,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nll_m = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_m,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (nll_p - nll_m) / actual_2h;
-
-            let tol = 1e-4 * (1.0 + ref_j.abs());
-            assert!(
-                (grad[j] - ref_j).abs() < tol,
-                "Laplace grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
-                grad[j],
-                ref_j,
-                grad[j] - ref_j,
-                tol,
-            );
-        }
+        assert_grad_matches_central_fd(
+            "Laplace",
+            &grad,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-4,
+            1e-4,
+        );
     }
 
     /// Almquist Laplace analytical gradient — combined error variant. The
@@ -4713,7 +4571,6 @@ mod tests {
         }
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let n = x.len();
 
         let n_obs = 3;
         let n_eta = 1;
@@ -4752,46 +4609,19 @@ mod tests {
             "Laplace (combined) nll mismatch: {nll} vs {nll_ref}"
         );
 
-        let eps = 1e-4;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-            let params_p = unpack_params(&xp, template);
-            let params_m = unpack_params(&xm, template);
-            let nll_p = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_p,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nll_m = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_m,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (nll_p - nll_m) / actual_2h;
-            let tol = 1e-4 * (1.0 + ref_j.abs());
-            assert!(
-                (grad[j] - ref_j).abs() < tol,
-                "Laplace combined grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
-                grad[j],
-                ref_j,
-                grad[j] - ref_j,
-                tol,
-            );
-        }
+        assert_grad_matches_central_fd(
+            "Laplace combined",
+            &grad,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-4,
+            1e-4,
+        );
     }
 
     /// Almquist Laplace analytical gradient — **multi-eta block omega**. This
@@ -4964,46 +4794,19 @@ mod tests {
             "Laplace block-omega nll mismatch: {nll} vs {nll_ref}"
         );
 
-        let eps = 1e-4;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-            let params_p = unpack_params(&xp, template);
-            let params_m = unpack_params(&xm, template);
-            let nll_p = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_p,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nll_m = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_m,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (nll_p - nll_m) / actual_2h;
-            let tol = 1e-4 * (1.0 + ref_j.abs());
-            assert!(
-                (grad[j] - ref_j).abs() < tol,
-                "Laplace block-omega grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
-                grad[j],
-                ref_j,
-                grad[j] - ref_j,
-                tol,
-            );
-        }
+        assert_grad_matches_central_fd(
+            "Laplace block-omega",
+            &grad,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-4,
+            1e-4,
+        );
     }
 
     /// Almquist Laplace analytical gradient — **Additive error**. Exercises
@@ -5033,7 +4836,6 @@ mod tests {
         let population = make_population();
         let x = pack_params(template);
         let bounds = compute_bounds(template);
-        let n = x.len();
 
         let n_obs = 3;
         let n_eta = 1;
@@ -5072,40 +4874,63 @@ mod tests {
             "Laplace (additive) nll mismatch: {nll} vs {nll_ref}"
         );
 
-        let eps = 1e-4;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
+        assert_grad_matches_central_fd(
+            "Laplace additive",
+            &grad,
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hat,
+            &h_matrix,
+            &options,
+            1e-4,
+            1e-4,
+        );
+    }
+
+    // ── IOV analytical gradient tests ─────────────────────────────────────
+
+    /// Central-difference check of a packed gradient `grad` at `x` against
+    /// `subject_nll_at` for subject 0 at fixed `eta_hat` / `h_matrix`: coordinate `j` is
+    /// stepped by `eps·(1 + |x_j|)` each way and must agree within `rtol·(1 + |FD_j|)`.
+    #[allow(clippy::too_many_arguments)]
+    fn assert_grad_matches_central_fd(
+        label: &str,
+        grad: &[f64],
+        x: &[f64],
+        template: &ModelParameters,
+        model: &CompiledModel,
+        population: &Population,
+        eta_hat: &DVector<f64>,
+        h_matrix: &nalgebra::DMatrix<f64>,
+        options: &FitOptions,
+        eps: f64,
+        rtol: f64,
+    ) {
+        for j in 0..x.len() {
+            let mut xp = x.to_vec();
+            let mut xm = x.to_vec();
             xp[j] += eps * (1.0 + x[j].abs());
             xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-            let params_p = unpack_params(&xp, template);
-            let params_m = unpack_params(&xm, template);
-            let nll_p = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_p,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let nll_m = subject_nll_at(
-                &model,
-                &population,
-                0,
-                &params_m,
-                &eta_hat,
-                &h_matrix,
-                &[],
-                &options,
-            );
-            let ref_j = (nll_p - nll_m) / actual_2h;
-            let tol = 1e-4 * (1.0 + ref_j.abs());
+            let nll = |v: &[f64]| {
+                let params = unpack_params(v, template);
+                subject_nll_at(
+                    model,
+                    population,
+                    0,
+                    &params,
+                    eta_hat,
+                    h_matrix,
+                    &[],
+                    options,
+                )
+            };
+            let ref_j = (nll(&xp) - nll(&xm)) / (xp[j] - xm[j]);
+            let tol = rtol * (1.0 + ref_j.abs());
             assert!(
                 (grad[j] - ref_j).abs() < tol,
-                "Laplace additive grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
+                "{label} grad[{j}]: analytical={:.6e}, FD-ref={:.6e}, diff={:.3e}, tol={:.3e}",
                 grad[j],
                 ref_j,
                 grad[j] - ref_j,
@@ -5113,8 +4938,6 @@ mod tests {
             );
         }
     }
-
-    // ── IOV analytical gradient tests ─────────────────────────────────────
 
     fn make_iov_model_gn() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);

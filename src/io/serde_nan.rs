@@ -157,7 +157,14 @@ impl<'de> serde::Deserializer<'de> for NullAsNan {
                 entries: map.into_iter(),
                 value: None,
             }),
-            other => serde::Deserializer::deserialize_any(other, v),
+            // The scalars as `Value::deserialize_any` reads them. Not delegated to it: that
+            // would instantiate its array/object arms — every visitor's `visit_seq` /
+            // `visit_map` over serde_json's own Seq/MapDeserializer — for each type read
+            // here, a second copy of `FitResult`'s and `FitWire`'s visitors that never runs.
+            Value::Null => v.visit_unit(),
+            Value::Bool(b) => v.visit_bool(b),
+            Value::Number(n) => serde::Deserializer::deserialize_any(n, v),
+            Value::String(s) => v.visit_string(s),
         }
     }
 
