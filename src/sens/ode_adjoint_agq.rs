@@ -87,29 +87,21 @@ pub(super) fn agq_planned(
     // sentinel (`agq::agq_terms`), a log-term of ~−1e20 that `logsumexp` takes to exactly
     // zero weight; its derivative is then `0 · ∂(huge or non-finite)`, which the reverse
     // turns into a NaN and declines the whole subject (a `[covariate_nn]` DCM under 3-node
-    // AGQ, #3004). So a node whose term is non-finite, sentinel, or more than 745 below the
-    // largest (its weight underflows to exactly zero) is left out of the kernel, as it is out
-    // of the sum: the value and every gradient component are unchanged by it.
+    // AGQ, #3004). So a node whose term is non-finite or the sentinel is left out of the
+    // kernel, as it is out of the sum: the value and every gradient component are unchanged by
+    // it. A finite node whose weight merely underflows stays: its derivative is `0 · finite`.
     let keep: Vec<usize> = if !grid.is_empty() && nodes.len() == grid.len() {
-        let terms: Vec<Option<f64>> = grid
-            .iter()
+        grid.iter()
             .zip(&nodes)
             .enumerate()
-            .map(|(j, ((_, cw, b), (du, _, _)))| {
-                let l = inner_l(ctx, du, b, pv, None)?;
-                let t = *cw - (l + ng.map_or(0.0, |ng| ng.nodes[j].0));
-                (l.is_finite()
-                    && l < crate::stats::likelihood::SUBJECT_SENTINEL_NLL
-                    && t.is_finite())
-                .then_some(t)
+            .filter(|(j, ((_, cw, b), (du, _, _)))| {
+                inner_l(ctx, du, b, pv, None).is_some_and(|l| {
+                    l.is_finite()
+                        && l < crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+                        && (*cw - (l + ng.map_or(0.0, |ng| ng.nodes[*j].0))).is_finite()
+                })
             })
-            .collect();
-        let top = terms
-            .iter()
-            .flatten()
-            .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        (0..grid.len())
-            .filter(|&j| terms[j].is_some_and(|t| t > top - 745.0))
+            .map(|(j, _)| j)
             .collect()
     } else {
         (0..grid.len()).collect()
