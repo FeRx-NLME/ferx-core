@@ -5,23 +5,19 @@ use crate::types::{FitOptions, ModelParameters, OmegaMatrix, SigmaVector};
 fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) -> ModelParameters {
     let n = theta.len();
     ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta,
         theta_names: (0..n).map(|i| format!("T{i}")).collect(),
         theta_lower,
         theta_upper,
         theta_fixed: vec![false; n],
-        omega: OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
-        omega_fixed: vec![false],
         sigma: SigmaVector {
             values: vec![0.1],
             names: vec!["ERR".into()],
         },
-        sigma_fixed: vec![false],
-        omega_iov: None,
-        kappa_fixed: Vec::new(),
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+            &[0.04],
+            vec!["ETA_CL".into()],
+        ))
     }
 }
 

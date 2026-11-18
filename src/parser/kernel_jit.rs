@@ -7013,16 +7013,11 @@ fn lower_chunk_opt(
     opt: &str,
     spill: Option<&SegPlan>,
 ) -> Option<ChunkKernel> {
-    use super::ir::{Cc, Shim1};
-    use cranelift_codegen::ir::condcodes::FloatCC;
-    let _ = Shim1::Nan;
+    use super::ir::Shim1;
     use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_jit::{JITBuilder, JITModule};
     use cranelift_module::{default_libcall_names, Linkage, Module};
-    extern "C" fn sh_powf(x: f64, e: f64) -> f64 {
-        x.powf(e)
-    }
     let lanes = layout.lanes();
     // The target, per tier: built once (host feature detection, the flags' parse), shared.
     type Isa = Option<cranelift_codegen::isa::OwnedTargetIsa>;
@@ -7376,68 +7371,6 @@ fn lower_chunk_opt(
                             _ => return None,
                         }
                     }
-                    Inst::Const(bits) => b.ins().f64const(f64::from_bits(bits)),
-                    Inst::Add(x, y) => b.ins().fadd(r(x), r(y)),
-                    Inst::Sub(x, y) => b.ins().fsub(r(x), r(y)),
-                    Inst::Mul(x, y) => b.ins().fmul(r(x), r(y)),
-                    Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
-                    Inst::Neg(x) => b.ins().fneg(r(x)),
-                    Inst::Abs(x) => b.ins().fabs(r(x)),
-                    Inst::Floor(x) => b.ins().floor(r(x)),
-                    Inst::Ceil(x) => b.ins().ceil(r(x)),
-                    Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
-                    Inst::Call1(s, x) => {
-                        let fp = s.f();
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(uref, callee, &[r(x)]);
-                        b.inst_results(call)[0]
-                    }
-                    Inst::Powf(x, y) => {
-                        let fp: extern "C" fn(f64, f64) -> f64 = sh_powf;
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
-                        b.inst_results(call)[0]
-                    }
-                    Inst::Gamma {
-                        upper,
-                        i,
-                        j,
-                        a: x,
-                        x: y,
-                    } => {
-                        let fp = ir::gamma_shim(upper, i, j);
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
-                        b.inst_results(call)[0]
-                    }
-                    Inst::Cmp(cc, x, y) => {
-                        let cc = match cc {
-                            Cc::Lt => FloatCC::LessThan,
-                            Cc::Le => FloatCC::LessThanOrEqual,
-                            Cc::Gt => FloatCC::GreaterThan,
-                            Cc::Ge => FloatCC::GreaterThanOrEqual,
-                            Cc::Eq => FloatCC::Equal,
-                            Cc::Ne => FloatCC::NotEqual,
-                        };
-                        b.ins().fcmp(cc, r(x), r(y))
-                    }
-                    Inst::And(x, y) => b.ins().band(r(x), r(y)),
-                    Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
-                    Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
-                    Inst::StopGrad(x) => r(x),
-                    Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) => {
-                        let (fp, arg): (extern "C" fn(f64) -> f64, Value) = match *inst {
-                            Inst::HostArg(x) => (ir::host::arg_native, r(x)),
-                            Inst::Host(f) => {
-                                (ir::host::call_native, b.ins().f64const(f.index() as f64))
-                            }
-                            Inst::HostOut(k) => (ir::host::out_native, b.ins().f64const(k as f64)),
-                            _ => unreachable!(),
-                        };
-                        let callee = b.ins().iconst(ptr, fp as usize as i64);
-                        let call = b.ins().call_indirect(uref, callee, &[arg]);
-                        b.inst_results(call)[0]
-                    }
                     Inst::Store { arg, off, v: x } => {
                         let (j, lane) = (off as usize / lanes, off as usize % lanes);
                         let a = match arg {
@@ -7470,6 +7403,7 @@ fn lower_chunk_opt(
                         }
                         r(x)
                     }
+                    _ => super::jit::lower_value_inst(&mut b, inst, &r, ptr, uref, bref)?,
                 };
                 v[at] = Some(out);
                 if let Some(plan) = spill {

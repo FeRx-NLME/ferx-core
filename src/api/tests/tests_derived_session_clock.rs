@@ -8,12 +8,11 @@
 
 use super::*;
 use crate::types::{
-    AggFunction, BloqMethod, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind,
-    ErrorModel, ErrorSpec, GradientMethod, IndivParamPartials, IntegralStep, IntegralWindow,
-    ModelParameters, OmegaMatrix, PkModel, PkParams, Population, ScalingSpec, SigmaVector, Subject,
+    AggFunction, CompiledModel, DerivedContext, DerivedExprSpec, DerivedKind, ErrorModel,
+    ErrorSpec, IndivParamPartials, IntegralStep, IntegralWindow, ModelParameters, OmegaMatrix,
+    PkParams, Population, SigmaVector, Subject,
 };
 use nalgebra::DVector;
-use std::collections::HashMap;
 
 // ── shared helpers ────────────────────────────────────────────────────────
 
@@ -21,86 +20,37 @@ use std::collections::HashMap;
 /// Caller supplies `derived_exprs`.
 fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "test_session".into(),
-        pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Additive,
         error_spec: ErrorSpec::Single(ErrorModel::Additive),
-        residual_correlations: Vec::new(),
         pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
         n_theta: 0,
         n_eta: 0,
-        n_epsilon: 1,
-        n_kappa: 0,
-        kappa_names: Vec::new(),
         theta_names: Vec::new(),
         eta_names: Vec::new(),
         indiv_param_names: Vec::new(),
         indiv_param_partials: IndivParamPartials::empty(),
-        default_params: ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
-            theta: Vec::new(),
-            theta_names: Vec::new(),
-            theta_lower: Vec::new(),
-            theta_upper: Vec::new(),
-            theta_fixed: Vec::new(),
-            omega: OmegaMatrix::from_diagonal(&[], vec![]),
-            omega_fixed: Vec::new(),
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["ERR".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
-        },
         omega_init_as_sd: Vec::new(),
-        sigma_init_as_sd: vec![false],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
         tv_fn: Some(Box::new(|_t, _c| vec![])),
         pk_indices: Vec::new(),
         eta_map: Vec::new(),
         pk_idx_f64: Vec::new(),
         sel_flat: Vec::new(),
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
         derived_exprs,
         output_columns: Vec::new(),
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(ModelParameters {
+            theta: Vec::new(),
+            theta_names: Vec::new(),
+            theta_lower: Vec::new(),
+            theta_upper: Vec::new(),
+            theta_fixed: Vec::new(),
+            omega_fixed: Vec::new(),
+            sigma: SigmaVector {
+                values: vec![0.1],
+                names: vec!["ERR".into()],
+            },
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(&[], vec![]))
+        })
     }
 }
 

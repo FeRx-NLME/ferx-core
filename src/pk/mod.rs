@@ -2633,172 +2633,74 @@ fn single_dose_concentration(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &
     // call below through the reshaped copy.
     let dose = &dose.with_bioavailable_infusion(p.f_bio());
 
-    let raw = if dose.ss && dose.ii > 0.0 {
-        match pk_model {
-            // Transit / IG never reach this closed-form SS branch: an SS subject on such a
-            // model is rerouted to its `transit()`/`igd()` ODE twin by `effective_for`
-            // (#719) — the twin equilibrates the dose through the absorption kernel — so the
-            // closed-form dispatch below is only ever entered by non-SS subjects. (Before
-            // #719 these were rejected outright; now they are served, just on the ODE path.)
-            PkModel::OneCptTransit => {
-                unreachable!("one_cpt_transit SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::TwoCptTransit => {
-                unreachable!("two_cpt_transit SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::OneCptIg => {
-                unreachable!("one_cpt_ig SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::TwoCptIg => {
-                unreachable!("two_cpt_ig SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::OneCptIv => {
-                if infusion {
-                    one_cpt_infusion_ss(dose, tau, cl, v)
-                } else {
-                    one_cpt_iv_bolus_ss(dose, tau, cl, v)
-                }
-            }
-            PkModel::OneCptOral => {
-                // Infusions bypass the depot — use the IV infusion SS formula,
-                // matching single_dose_states and the TwoCptOral/ThreeCptOral fix.
-                if infusion {
-                    one_cpt_infusion_ss(dose, tau, cl, v)
-                } else {
-                    one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio())
-                }
-            }
-            PkModel::TwoCptIv => {
-                if infusion {
-                    two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
-                } else {
-                    two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2())
-                }
-            }
-            PkModel::TwoCptOral => {
-                // Infusions bypass the depot and enter central directly —
-                // use the IV infusion SS formula, matching single_dose_states.
-                if infusion {
-                    two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
-                } else {
-                    two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio())
-                }
-            }
-            PkModel::ThreeCptIv => {
-                if infusion {
-                    three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                } else {
-                    three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                }
-            }
-            PkModel::ThreeCptOral => {
-                // Same infusion-bypasses-depot logic as TwoCptOral.
-                if infusion {
-                    three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                } else {
-                    three_cpt_oral_f_ss(
-                        dose,
-                        tau,
-                        cl,
-                        v,
-                        p.q(),
-                        p.v2(),
-                        p.q3(),
-                        p.v3(),
-                        p.ka(),
-                        p.f_bio(),
-                    )
-                }
-            }
-        }
-    } else {
-        match pk_model {
-            PkModel::OneCptIv => {
-                if infusion {
-                    one_cpt_infusion(dose, tau, cl, v)
-                } else {
-                    one_cpt_iv_bolus(dose, tau, cl, v)
-                }
-            }
-            PkModel::OneCptOral => {
-                // Infusions bypass the depot — use the IV infusion formula.
-                if infusion {
-                    one_cpt_infusion(dose, tau, cl, v)
-                } else {
-                    one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio())
-                }
-            }
-            PkModel::OneCptTransit => {
-                // Transit rejects infusions at parse, so only the absorbed bolus exists.
-                one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio())
-            }
-            PkModel::TwoCptTransit => {
-                // Transit rejects infusions at parse, so only the absorbed bolus exists.
-                two_cpt_transit_f(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.n_transit(),
-                    p.mtt(),
-                    p.f_bio(),
-                )
-            }
-            PkModel::OneCptIg => {
-                // IG rejects infusions at parse, so only the absorbed bolus exists.
-                one_cpt_ig_f(dose, tau, cl, v, p.mat(), p.cv2(), p.f_bio())
-            }
-            PkModel::TwoCptIg => {
-                // IG rejects infusions at parse, so only the absorbed bolus exists.
-                two_cpt_ig_f(dose, tau, cl, v, p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio())
-            }
-            PkModel::TwoCptIv => {
-                if infusion {
-                    two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
-                } else {
-                    two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
-                }
-            }
-            PkModel::TwoCptOral => {
-                // Infusions bypass the depot — use the IV formula, matching single_dose_states.
-                if infusion {
-                    two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
-                } else {
-                    two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio())
-                }
-            }
-            PkModel::ThreeCptIv => {
-                if infusion {
-                    three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                } else {
-                    three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                }
-            }
-            PkModel::ThreeCptOral => {
-                // Same infusion-bypasses-depot logic as TwoCptOral.
-                if infusion {
-                    three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                } else {
-                    three_cpt_oral_f(
-                        dose,
-                        tau,
-                        cl,
-                        v,
-                        p.q(),
-                        p.v2(),
-                        p.q3(),
-                        p.v3(),
-                        p.ka(),
-                        p.f_bio(),
-                    )
-                }
-            }
-        }
-    };
+    f_scale * central_raw(pk_model, dose, tau, p, infusion)
+}
 
-    f_scale * raw
+/// The raw (pre-`f_scale`) central closed form of one dose at elapsed time `tau`: the
+/// value [`single_dose_concentration`] scales and the central entry of
+/// [`single_dose_states`]. `dose` is the bioavailability-reshaped copy and `infusion`
+/// its route. At steady state the central forms have separate `_ss` variants taking the
+/// same arguments. Infusions bypass an oral model's depot and use the IV infusion form.
+fn central_raw(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParams, infusion: bool) -> f64 {
+    let (cl, v) = (p.cl(), p.v());
+    let ss = dose.ss && dose.ii > 0.0;
+    macro_rules! pick {
+        ($f:ident, $f_ss:ident ($($a:expr),*)) => {
+            if ss {
+                $f_ss(dose, tau, cl, v, $($a),*)
+            } else {
+                $f(dose, tau, cl, v, $($a),*)
+            }
+        };
+    }
+    match pk_model {
+        // Transit / IG never reach the closed-form SS branch: an SS subject on such a model
+        // is rerouted to its `transit()`/`igd()` ODE twin by `effective_for` (#719) — the
+        // twin equilibrates the dose through the absorption kernel. (Before #719 these were
+        // rejected outright; now they are served, just on the ODE path.)
+        PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
+            if ss =>
+        {
+            unreachable!("{pk_model:?} SS doses reroute to the ODE twin (effective_for)")
+        }
+        // Transit / IG reject infusions at parse, so only the absorbed bolus exists.
+        PkModel::OneCptTransit => {
+            one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio())
+        }
+        PkModel::TwoCptTransit => {
+            let (q, v2, n, mtt, f) = (p.q(), p.v2(), p.n_transit(), p.mtt(), p.f_bio());
+            two_cpt_transit_f(dose, tau, cl, v, q, v2, n, mtt, f)
+        }
+        PkModel::OneCptIg => one_cpt_ig_f(dose, tau, cl, v, p.mat(), p.cv2(), p.f_bio()),
+        PkModel::TwoCptIg => {
+            two_cpt_ig_f(dose, tau, cl, v, p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio())
+        }
+        PkModel::OneCptIv | PkModel::OneCptOral if infusion => {
+            pick!(one_cpt_infusion, one_cpt_infusion_ss())
+        }
+        PkModel::OneCptIv => pick!(one_cpt_iv_bolus, one_cpt_iv_bolus_ss()),
+        PkModel::OneCptOral => pick!(one_cpt_oral_f, one_cpt_oral_f_ss(p.ka(), p.f_bio())),
+        PkModel::TwoCptIv | PkModel::TwoCptOral if infusion => {
+            pick!(two_cpt_infusion, two_cpt_infusion_ss(p.q(), p.v2()))
+        }
+        PkModel::TwoCptIv => pick!(two_cpt_iv_bolus, two_cpt_iv_bolus_ss(p.q(), p.v2())),
+        PkModel::TwoCptOral => {
+            let (q, v2, ka, f) = (p.q(), p.v2(), p.ka(), p.f_bio());
+            pick!(two_cpt_oral_f, two_cpt_oral_f_ss(q, v2, ka, f))
+        }
+        PkModel::ThreeCptIv | PkModel::ThreeCptOral if infusion => {
+            let (q, v2, q3, v3) = (p.q(), p.v2(), p.q3(), p.v3());
+            pick!(three_cpt_infusion, three_cpt_infusion_ss(q, v2, q3, v3))
+        }
+        PkModel::ThreeCptIv => {
+            let (q, v2, q3, v3) = (p.q(), p.v2(), p.q3(), p.v3());
+            pick!(three_cpt_iv_bolus, three_cpt_iv_bolus_ss(q, v2, q3, v3))
+        }
+        PkModel::ThreeCptOral => {
+            let (q, v2, q3, v3, ka, f) = (p.q(), p.v2(), p.q3(), p.v3(), p.ka(), p.f_bio());
+            pick!(three_cpt_oral_f, three_cpt_oral_f_ss(q, v2, q3, v3, ka, f))
+        }
+    }
 }
 
 // --- Compartment-state helpers for `compartment_states` in SubjectResult ---
@@ -2834,289 +2736,75 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
     let f_scale = route_f_scale(pk_model, infusion, p);
     let dose = &dose.with_bioavailable_infusion(p.f_bio());
 
-    // SS early-exit: mirrors single_dose_concentration's top-level guard.
-    //
-    // Peripheral and depot helpers (two_cpt_iv_peripheral, two_cpt_oral_peripheral,
-    // three_cpt_iv_peripherals, three_cpt_oral_peripherals, one_cpt_oral_depot) all
-    // handle SS internally via their own `dose.ss && dose.ii > 0.0` checks, so they
-    // are called with the same arguments regardless of SS — the correct SS value is
-    // returned automatically. Only the *central* concentration functions need explicit
-    // SS dispatch here (they lack the internal guard in their non-SS variants).
-    let mut state = if dose.ss && dose.ii > 0.0 {
-        match pk_model {
-            // Transit / IG reject SS doses at parse (#386/#790) — unreachable for a valid model.
-            PkModel::OneCptTransit => {
-                unreachable!("one_cpt_transit SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::TwoCptTransit => {
-                unreachable!("two_cpt_transit SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::OneCptIg => {
-                unreachable!("one_cpt_ig SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::TwoCptIg => {
-                unreachable!("two_cpt_ig SS doses reroute to the ODE twin (effective_for)")
-            }
-            PkModel::OneCptIv => {
-                let c = if infusion {
-                    one_cpt_infusion_ss(dose, tau, cl, v)
-                } else {
-                    one_cpt_iv_bolus_ss(dose, tau, cl, v)
-                };
-                vec![c]
-            }
-            PkModel::OneCptOral => {
-                // Infusions bypass the depot — treat as 1-cpt IV SS infusion,
-                // consistent with single_dose_concentration and TwoCptOral/ThreeCptOral.
-                if infusion {
-                    let c = one_cpt_infusion_ss(dose, tau, cl, v);
-                    vec![0.0, c]
-                } else {
-                    // one_cpt_oral_depot handles SS internally.
-                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                    let central = one_cpt_oral_f_ss(dose, tau, cl, v, p.ka(), p.f_bio());
-                    vec![depot, central]
-                }
-            }
-            PkModel::TwoCptIv => {
-                let central = if infusion {
-                    two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2())
-                } else {
-                    two_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2())
-                };
-                // two_cpt_iv_peripheral handles SS internally.
-                let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-                vec![central, periph]
-            }
-            PkModel::TwoCptOral => {
-                if infusion {
-                    // Infusions bypass depot; treat as 2-cpt IV SS infusion.
-                    let c = two_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2());
-                    let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-                    vec![0.0, c, periph]
-                } else {
-                    // Depot and peripheral handle SS internally.
-                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                    let central =
-                        two_cpt_oral_f_ss(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
-                    let periph =
-                        two_cpt_oral_peripheral(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
-                    vec![depot, central, periph]
-                }
-            }
-            PkModel::ThreeCptIv => {
-                let central = if infusion {
-                    three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                } else {
-                    three_cpt_iv_bolus_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                };
-                // three_cpt_iv_peripherals handles SS internally.
-                let [p1, p2] =
-                    three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                vec![central, p1, p2]
-            }
-            PkModel::ThreeCptOral => {
-                if infusion {
-                    // Infusions bypass depot; treat as 3-cpt IV SS infusion.
-                    let c = three_cpt_infusion_ss(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                    let [p1, p2] =
-                        three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                    vec![0.0, c, p1, p2]
-                } else {
-                    // Depot and peripherals handle SS internally.
-                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                    let central = three_cpt_oral_f_ss(
-                        dose,
-                        tau,
-                        cl,
-                        v,
-                        p.q(),
-                        p.v2(),
-                        p.q3(),
-                        p.v3(),
-                        p.ka(),
-                        p.f_bio(),
-                    );
-                    let [p1, p2] = three_cpt_oral_peripherals(
-                        dose,
-                        tau,
-                        cl,
-                        v,
-                        p.q(),
-                        p.v2(),
-                        p.q3(),
-                        p.v3(),
-                        p.ka(),
-                        p.f_bio(),
-                    );
-                    vec![depot, central, p1, p2]
-                }
-            }
+    // The central entry is `central_raw`'s (which owns the SS dispatch and rejects the
+    // transit / IG SS doses). The peripheral and depot helpers handle SS internally via
+    // their own `dose.ss && dose.ii > 0.0` checks, so they take the same arguments either
+    // way. Infusions bypass an oral model's depot: its states are the IV model's behind a
+    // zero depot.
+    let central = central_raw(pk_model, dose, tau, p, infusion);
+    let mut state = match pk_model {
+        PkModel::OneCptIv => vec![central],
+        PkModel::OneCptOral if infusion => vec![0.0, central],
+        PkModel::OneCptOral => vec![one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio()), central],
+        // [depot = lumped in-transit mass, central(, peripheral)].
+        PkModel::OneCptTransit => vec![
+            one_cpt_transit_depot(dose, tau, p.n_transit(), p.mtt(), p.f_bio()),
+            central,
+        ],
+        PkModel::TwoCptTransit => {
+            let (q, v2, n, mtt, f) = (p.q(), p.v2(), p.n_transit(), p.mtt(), p.f_bio());
+            vec![
+                two_cpt_transit_depot(dose, tau, cl, v, q, v2, n, mtt, f),
+                central,
+                two_cpt_transit_peripheral(dose, tau, cl, v, q, v2, n, mtt, f),
+            ]
         }
-    } else {
-        // Non-SS path.
-        match pk_model {
-            PkModel::OneCptIv => {
-                let c = if infusion {
-                    one_cpt_infusion(dose, tau, cl, v)
-                } else {
-                    one_cpt_iv_bolus(dose, tau, cl, v)
-                };
-                vec![c]
-            }
-            PkModel::OneCptOral => {
-                // Infusions bypass the depot — treat as 1-cpt IV, matching single_dose_concentration.
-                if infusion {
-                    let c = one_cpt_infusion(dose, tau, cl, v);
-                    vec![0.0, c]
-                } else {
-                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                    let central = one_cpt_oral_f(dose, tau, cl, v, p.ka(), p.f_bio());
-                    vec![depot, central]
-                }
-            }
-            PkModel::OneCptTransit => {
-                // [depot = lumped in-transit mass, central]; transit rejects infusions
-                // at parse, so only the absorbed bolus exists.
-                let depot = one_cpt_transit_depot(dose, tau, p.n_transit(), p.mtt(), p.f_bio());
-                let central =
-                    one_cpt_transit_f(dose, tau, cl, v, p.n_transit(), p.mtt(), p.f_bio());
-                vec![depot, central]
-            }
-            PkModel::TwoCptTransit => {
-                // [depot = lumped in-transit mass, central, peripheral]; transit rejects
-                // infusions at parse, so only the absorbed bolus exists.
-                let depot = two_cpt_transit_depot(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.n_transit(),
-                    p.mtt(),
-                    p.f_bio(),
-                );
-                let central = two_cpt_transit_f(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.n_transit(),
-                    p.mtt(),
-                    p.f_bio(),
-                );
-                let periph = two_cpt_transit_peripheral(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.n_transit(),
-                    p.mtt(),
-                    p.f_bio(),
-                );
-                vec![depot, central, periph]
-            }
-            PkModel::OneCptIg => {
-                // [depot = unabsorbed IG mass, central]; IG rejects infusions at
-                // parse, so only the absorbed bolus exists.
-                let depot = one_cpt_ig_depot(dose, tau, p.mat(), p.cv2(), p.f_bio());
-                let central = one_cpt_ig_f(dose, tau, cl, v, p.mat(), p.cv2(), p.f_bio());
-                vec![depot, central]
-            }
-            PkModel::TwoCptIg => {
-                // [depot = unabsorbed IG mass, central, peripheral]; IG rejects
-                // infusions at parse, so only the absorbed bolus exists.
-                let depot =
-                    two_cpt_ig_depot(dose, tau, cl, v, p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio());
-                let central =
-                    two_cpt_ig_f(dose, tau, cl, v, p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio());
-                let periph = two_cpt_ig_peripheral(
-                    dose,
-                    tau,
-                    cl,
-                    v,
-                    p.q(),
-                    p.v2(),
-                    p.mat(),
-                    p.cv2(),
-                    p.f_bio(),
-                );
-                vec![depot, central, periph]
-            }
-            PkModel::TwoCptIv => {
-                let central = if infusion {
-                    two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2())
-                } else {
-                    two_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2())
-                };
-                let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-                vec![central, periph]
-            }
-            PkModel::TwoCptOral => {
-                if infusion {
-                    // Infusions bypass depot; treat as 2-cpt IV
-                    let c = two_cpt_infusion(dose, tau, cl, v, p.q(), p.v2());
-                    let periph = two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2());
-                    vec![0.0, c, periph]
-                } else {
-                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                    let central =
-                        two_cpt_oral_f(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
-                    let periph =
-                        two_cpt_oral_peripheral(dose, tau, cl, v, p.q(), p.v2(), p.ka(), p.f_bio());
-                    vec![depot, central, periph]
-                }
-            }
-            PkModel::ThreeCptIv => {
-                let central = if infusion {
-                    three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                } else {
-                    three_cpt_iv_bolus(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3())
-                };
-                let [p1, p2] =
-                    three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                vec![central, p1, p2]
-            }
-            PkModel::ThreeCptOral => {
-                if infusion {
-                    let c = three_cpt_infusion(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                    let [p1, p2] =
-                        three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
-                    vec![0.0, c, p1, p2]
-                } else {
-                    let depot = one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio());
-                    let central = three_cpt_oral_f(
-                        dose,
-                        tau,
-                        cl,
-                        v,
-                        p.q(),
-                        p.v2(),
-                        p.q3(),
-                        p.v3(),
-                        p.ka(),
-                        p.f_bio(),
-                    );
-                    let [p1, p2] = three_cpt_oral_peripherals(
-                        dose,
-                        tau,
-                        cl,
-                        v,
-                        p.q(),
-                        p.v2(),
-                        p.q3(),
-                        p.v3(),
-                        p.ka(),
-                        p.f_bio(),
-                    );
-                    vec![depot, central, p1, p2]
-                }
-            }
+        // [depot = unabsorbed IG mass, central(, peripheral)].
+        PkModel::OneCptIg => vec![
+            one_cpt_ig_depot(dose, tau, p.mat(), p.cv2(), p.f_bio()),
+            central,
+        ],
+        PkModel::TwoCptIg => {
+            let (q, v2, mat, cv2, f) = (p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio());
+            vec![
+                two_cpt_ig_depot(dose, tau, cl, v, q, v2, mat, cv2, f),
+                central,
+                two_cpt_ig_peripheral(dose, tau, cl, v, q, v2, mat, cv2, f),
+            ]
+        }
+        PkModel::TwoCptIv => vec![
+            central,
+            two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2()),
+        ],
+        PkModel::TwoCptOral if infusion => {
+            vec![
+                0.0,
+                central,
+                two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2()),
+            ]
+        }
+        PkModel::TwoCptOral => {
+            let (q, v2, ka, f) = (p.q(), p.v2(), p.ka(), p.f_bio());
+            vec![
+                one_cpt_oral_depot(dose, tau, ka, f),
+                central,
+                two_cpt_oral_peripheral(dose, tau, cl, v, q, v2, ka, f),
+            ]
+        }
+        PkModel::ThreeCptIv => {
+            let [p1, p2] =
+                three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+            vec![central, p1, p2]
+        }
+        PkModel::ThreeCptOral if infusion => {
+            let [p1, p2] =
+                three_cpt_iv_peripherals(dose, tau, cl, v, p.q(), p.v2(), p.q3(), p.v3());
+            vec![0.0, central, p1, p2]
+        }
+        PkModel::ThreeCptOral => {
+            let (q, v2, q3, v3, ka, f) = (p.q(), p.v2(), p.q3(), p.v3(), p.ka(), p.f_bio());
+            let [p1, p2] = three_cpt_oral_peripherals(dose, tau, cl, v, q, v2, q3, v3, ka, f);
+            vec![one_cpt_oral_depot(dose, tau, ka, f), central, p1, p2]
         }
     };
 

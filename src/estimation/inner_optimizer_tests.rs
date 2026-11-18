@@ -2006,9 +2006,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
 /// declared once: a `CompiledModel` literal is ~50 fields wide and a second copy would
 /// have to be edited on every field addition.
 fn frem_model_and_subject() -> (CompiledModel, Subject) {
-    use crate::types::{
-        DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkModel, PkParams, SigmaVector,
-    };
+    use crate::types::{DoseEvent, ErrorModel, GradientMethod, OmegaMatrix, PkParams, SigmaVector};
     use std::collections::HashMap;
 
     // Build a minimal model with 3 etas: CL, V, COV_WT(FREM)
@@ -2017,36 +2015,23 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
     );
     let default_params = crate::types::ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![10.0, 100.0, 90.0],
         theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
         theta_lower: vec![0.01, 1.0, 0.0],
         theta_upper: vec![100.0, 500.0, 200.0],
         theta_fixed: vec![false, false, true],
-        omega,
         omega_fixed: vec![false, false, false],
         sigma: SigmaVector {
             values: vec![0.05],
             names: vec!["RUV".into()],
         },
-        sigma_fixed: vec![false],
-        omega_iov: None,
         kappa_fixed: vec![],
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(omega)
     };
     let model = CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
-        has_conditional_eta_params: false,
         name: "frem_jac_test".into(),
-        pk_model: PkModel::OneCptIv,
         error_model: ErrorModel::Additive,
         error_spec: crate::types::ErrorSpec::Single(ErrorModel::Additive),
-        residual_correlations: Vec::new(),
         pk_param_fn: Box::new(
             |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
                 let mut p = PkParams::default();
@@ -2057,47 +2042,16 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         ),
         n_theta: 3,
         n_eta: 3,
-        n_epsilon: 1,
-        n_kappa: 0,
         kappa_names: vec![],
         theta_names: vec!["TVCL".into(), "TVV".into(), "TV_WT".into()],
         eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_WT_FREM".into()],
         indiv_param_names: vec!["CL".into(), "V".into(), "COV_WT".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        default_params,
         omega_init_as_sd: vec![false; 3],
-        sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![],
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        tv_fn: None,
-        pk_indices: vec![0, 1],
         eta_map: vec![0, 1, 2],
-        pk_idx_f64: vec![0.0, 1.0],
-        sel_flat: vec![1.0, 0.0],
-        ode_spec: None,
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
         bloq_method: crate::types::BloqMethod::Drop,
-        referenced_covariates: Vec::new(),
         gradient_method: GradientMethod::default(),
-        parse_warnings: Vec::new(),
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
         scaling: crate::types::ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        dose_attr_map: Default::default(),
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
         frem_config: Some(crate::types::FremConfig {
             fremtype_to_indices: {
                 let mut m = std::collections::HashMap::new();
@@ -2106,12 +2060,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
             },
             covariate_sigma_index: 0,
         }),
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(default_params)
     };
 
     // Subject: 2 PK obs + 1 FREM obs

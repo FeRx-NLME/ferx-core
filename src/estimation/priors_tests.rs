@@ -43,18 +43,14 @@ impl Fixture {
             theta_lower: vec![theta_lower],
             theta_upper: vec![1e9],
             theta_fixed: vec![false],
-            omega: OmegaMatrix::from_diagonal(&[omega_var], vec!["ETA_CL".into()]),
-            omega_fixed: vec![false],
             sigma: SigmaVector {
                 values: vec![sigma_sd],
                 names: vec!["PROP_ERR".into()],
             },
-            sigma_fixed: vec![false],
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                &[omega_var],
+                vec!["ETA_CL".into()],
+            ))
         };
         model.omega_init_as_sd = vec![false];
         model.sigma_init_as_sd = vec![false];

@@ -1574,6 +1574,84 @@ fn run_loop_g(
     true
 }
 
+/// The reverse of the log entries that are linear in the outputs' adjoints — a saved point
+/// and an in-step read-out — over `nb` adjoint blocks of `out_adj` (a seed each in
+/// [`run_loop_rev`], a value or tangent block in [`run_loop_rev_rows`]). A read-out is
+/// linear in the step's carried state and its start state at its constant `(theta, dt)`;
+/// its reverse is the transpose of that map, the coefficients read off the method's
+/// [`sol::CarriedLayout`] by unit probes.
+#[allow(clippy::too_many_arguments)]
+fn rev_linear_entry(
+    e: &Entry,
+    spec: &LoopSpec,
+    l: usize,
+    nb: usize,
+    out_adj: &[f64],
+    ubar: &mut [f64],
+    cbar: &mut Vec<f64>,
+    probe: &mut Vec<f64>,
+    a_c: &mut Vec<f64>,
+) {
+    let n_hard = spec.saveat.len();
+    let nl = spec.n * l;
+    let out_w = out_adj.len() / nb;
+    match e {
+        Entry::Point {
+            soft,
+            idx: k,
+            diverged,
+        } => {
+            let at = (if *soft { n_hard + k } else { *k }) * nl;
+            for b in 0..nb {
+                let src = &out_adj[b * out_w + at..b * out_w + at + nl];
+                for (x, &g) in ubar[b * nl..(b + 1) * nl].iter_mut().zip(src) {
+                    *x += if *diverged { g * f64::NAN } else { g };
+                }
+            }
+        }
+        Entry::Interp {
+            m,
+            idx: k,
+            i,
+            theta,
+            dt,
+        } => {
+            let mb = &spec.methods[*m];
+            let cl = mb.c * l;
+            if cbar.len() != nb * cl {
+                cbar.clear();
+                cbar.resize(nb * cl, 0.0);
+            }
+            // The sample is `a_u·u_old[i] + Σ_j a_j·carried[j]`: probe each coefficient.
+            probe.clear();
+            probe.resize(mb.c, 0.0);
+            let a_u = mb
+                .cl
+                .interp(sol::Carried::new(probe, 1), *theta, 1.0, *dt, *i);
+            a_c.clear();
+            for j in 0..mb.c {
+                probe[j] = 1.0;
+                a_c.push(
+                    mb.cl
+                        .interp(sol::Carried::new(probe, 1), *theta, 0.0, *dt, *i),
+                );
+                probe[j] = 0.0;
+            }
+            let at = (n_hard + k) * nl + i * l;
+            for b in 0..nb {
+                for x in 0..l {
+                    let g = out_adj[b * out_w + at + x];
+                    ubar[b * nl + i * l + x] += g * a_u;
+                    for (j, &a) in a_c.iter().enumerate() {
+                        cbar[b * cl + j * l + x] += g * a;
+                    }
+                }
+            }
+        }
+        _ => unreachable!("only the linear entries"),
+    }
+}
+
 /// The reverse of a loop call over `rev`'s reverse kernels at `l` lanes: from the adjoints of its
 /// outputs `out_adj`, add those of its inputs into `in_adj` (both laid out as `run_loop`'s,
 /// one block per seed of `seeds`). `log` is the forward run's, at `hl ≥ l` lanes: a reverse at
@@ -1597,8 +1675,7 @@ pub(crate) fn run_loop_rev(
     in_adj: &mut [f64],
 ) -> bool {
     let n = spec.n;
-    let n_hard = spec.saveat.len();
-    let (out_w, in_w) = (out_adj.len() / seeds, in_adj.len() / seeds);
+    let in_w = in_adj.len() / seeds;
     let nl = n * l;
     let cap_w = spec.n_caps * l;
     let mut ubar = take_buf();
@@ -1609,58 +1686,9 @@ pub(crate) fn run_loop_rev(
     let (mut probe, mut a_c) = (take_buf(), take_buf());
     for e in log.entries.iter().rev() {
         match e {
-            Entry::Point {
-                soft,
-                idx: k,
-                diverged,
-            } => {
-                let at = (if *soft { n_hard + k } else { *k }) * nl;
-                for sd in 0..seeds {
-                    let src = &out_adj[sd * out_w + at..sd * out_w + at + nl];
-                    for (x, &g) in ubar[sd * nl..(sd + 1) * nl].iter_mut().zip(src) {
-                        *x += if *diverged { g * f64::NAN } else { g };
-                    }
-                }
-            }
-            Entry::Interp {
-                m,
-                idx: k,
-                i,
-                theta,
-                dt,
-            } => {
-                let mb = &spec.methods[*m];
-                let cl = mb.c * l;
-                if cbar.len() != seeds * cl {
-                    cbar.clear();
-                    cbar.resize(seeds * cl, 0.0);
-                }
-                // The sample is `a_u·u_old[i] + Σ_j a_j·carried[j]`: probe each coefficient.
-                probe.clear();
-                probe.resize(mb.c, 0.0);
-                let a_u = mb
-                    .cl
-                    .interp(sol::Carried::new(&probe, 1), *theta, 1.0, *dt, *i);
-                a_c.clear();
-                for j in 0..mb.c {
-                    probe[j] = 1.0;
-                    a_c.push(
-                        mb.cl
-                            .interp(sol::Carried::new(&probe, 1), *theta, 0.0, *dt, *i),
-                    );
-                    probe[j] = 0.0;
-                }
-                let at = (n_hard + k) * nl + i * l;
-                for sd in 0..seeds {
-                    for x in 0..l {
-                        let g = out_adj[sd * out_w + at + x];
-                        ubar[sd * nl + i * l + x] += g * a_u;
-                        for (j, &a) in a_c.iter().enumerate() {
-                            cbar[sd * cl + j * l + x] += g * a;
-                        }
-                    }
-                }
-            }
+            Entry::Point { .. } | Entry::Interp { .. } => rev_linear_entry(
+                e, spec, l, seeds, out_adj, &mut ubar, &mut cbar, &mut probe, &mut a_c,
+            ),
             Entry::NewStepper => cbar.clear(),
             // A jump (#2649): its new state's adjoint is the state's; its inputs' come back.
             Entry::Body { m, kind: 3, at } => {
@@ -1839,8 +1867,7 @@ pub(crate) fn run_loop_rev_rows(
     };
     let blocks = 1 + seeds;
     let n = spec.n;
-    let n_hard = spec.saveat.len();
-    let (out_w, in_w) = (out_adj.len() / blocks, in_adj.len() / blocks);
+    let in_w = in_adj.len() / blocks;
     let nl = n * l;
     let cap_w = spec.n_caps * l;
     let w_in = (n + spec.n_caps) * l;
@@ -1852,57 +1879,9 @@ pub(crate) fn run_loop_rev_rows(
     let (mut sh, mut ts, mut tbl) = (Vec::new(), Vec::new(), Vec::new());
     for e in log.entries.iter().rev() {
         match e {
-            Entry::Point {
-                soft,
-                idx: k,
-                diverged,
-            } => {
-                let at = (if *soft { n_hard + k } else { *k }) * nl;
-                for bk in 0..blocks {
-                    let src = &out_adj[bk * out_w + at..bk * out_w + at + nl];
-                    for (x, &g) in ubar[bk * nl..(bk + 1) * nl].iter_mut().zip(src) {
-                        *x += if *diverged { g * f64::NAN } else { g };
-                    }
-                }
-            }
-            Entry::Interp {
-                m,
-                idx: k,
-                i,
-                theta,
-                dt,
-            } => {
-                let mb = &spec.methods[*m];
-                let cl = mb.c * l;
-                if cbar.len() != blocks * cl {
-                    cbar.clear();
-                    cbar.resize(blocks * cl, 0.0);
-                }
-                probe.clear();
-                probe.resize(mb.c, 0.0);
-                let a_u = mb
-                    .cl
-                    .interp(sol::Carried::new(&probe, 1), *theta, 1.0, *dt, *i);
-                a_c.clear();
-                for j in 0..mb.c {
-                    probe[j] = 1.0;
-                    a_c.push(
-                        mb.cl
-                            .interp(sol::Carried::new(&probe, 1), *theta, 0.0, *dt, *i),
-                    );
-                    probe[j] = 0.0;
-                }
-                let at = (n_hard + k) * nl + i * l;
-                for bk in 0..blocks {
-                    for x in 0..l {
-                        let g = out_adj[bk * out_w + at + x];
-                        ubar[bk * nl + i * l + x] += g * a_u;
-                        for (j, &a) in a_c.iter().enumerate() {
-                            cbar[bk * cl + j * l + x] += g * a;
-                        }
-                    }
-                }
-            }
+            Entry::Point { .. } | Entry::Interp { .. } => rev_linear_entry(
+                e, spec, l, blocks, out_adj, &mut ubar, &mut cbar, &mut probe, &mut a_c,
+            ),
             Entry::NewStepper => cbar.clear(),
             Entry::Body { m, kind: 3, at } => {
                 let b = &spec.jumps[*m];

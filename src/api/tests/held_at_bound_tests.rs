@@ -36,26 +36,20 @@ fn diag_chol(l: &[f64], names: &[&str]) -> OmegaMatrix {
 /// PROP_ERR, K_A]`.
 fn params_with_every_kind_of_hit() -> ModelParameters {
     ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![1e-10, 5.0],
-        theta_names: vec!["TVCL".into(), "TVV".into()],
         theta_lower: vec![0.0, 5.0],
         theta_upper: vec![f64::INFINITY, 500.0],
-        theta_fixed: vec![false; 2],
-        omega: diag_chol(
-            &[OMEGA_RAIL_L.exp(), 6.0_f64.exp(), OMEGA_RAIL_L.exp()],
-            &["ETA_A", "ETA_B", "ETA_C"],
-        ),
         omega_fixed: vec![false, false, true],
         sigma: SigmaVector {
             values: vec![SIGMA_RAIL.exp()],
             names: vec!["PROP_ERR".into()],
         },
-        sigma_fixed: vec![false],
         omega_iov: Some(diag_chol(&[OMEGA_RAIL_L.exp()], &["K_A"])),
         kappa_fixed: vec![false],
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(diag_chol(
+            &[OMEGA_RAIL_L.exp(), 6.0_f64.exp(), OMEGA_RAIL_L.exp()],
+            &["ETA_A", "ETA_B", "ETA_C"],
+        ))
     }
 }
 

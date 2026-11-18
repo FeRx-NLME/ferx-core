@@ -402,75 +402,13 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
                     b.ins()
                         .load(types::F64, flags, args[arg as usize], (off * 8) as i32)
                 }
-                Inst::Const(bits) => b.ins().f64const(f64::from_bits(bits)),
-                Inst::Add(x, y) => b.ins().fadd(r(x), r(y)),
-                Inst::Sub(x, y) => b.ins().fsub(r(x), r(y)),
-                Inst::Mul(x, y) => b.ins().fmul(r(x), r(y)),
-                Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
-                Inst::Neg(x) => b.ins().fneg(r(x)),
-                Inst::Abs(x) => b.ins().fabs(r(x)),
-                Inst::Floor(x) => b.ins().floor(r(x)),
-                Inst::Ceil(x) => b.ins().ceil(r(x)),
-                Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
-                Inst::Call1(s, x) => {
-                    let f = s.f();
-                    let callee = b.ins().iconst(ptr, f as usize as i64);
-                    let call = b.ins().call_indirect(unary_ref, callee, &[r(x)]);
-                    b.inst_results(call)[0]
-                }
-                Inst::Powf(x, y) => {
-                    let f: extern "C" fn(f64, f64) -> f64 = shim_powf;
-                    let callee = b.ins().iconst(ptr, f as usize as i64);
-                    let call = b.ins().call_indirect(binary_ref, callee, &[r(x), r(y)]);
-                    b.inst_results(call)[0]
-                }
-                Inst::Gamma {
-                    upper,
-                    i,
-                    j,
-                    a: x,
-                    x: y,
-                } => {
-                    let f = ir::gamma_shim(upper, i, j);
-                    let callee = b.ins().iconst(ptr, f as usize as i64);
-                    let call = b.ins().call_indirect(binary_ref, callee, &[r(x), r(y)]);
-                    b.inst_results(call)[0]
-                }
-                Inst::Cmp(cc, x, y) => {
-                    let cc = match cc {
-                        Cc::Lt => FloatCC::LessThan,
-                        Cc::Le => FloatCC::LessThanOrEqual,
-                        Cc::Gt => FloatCC::GreaterThan,
-                        Cc::Ge => FloatCC::GreaterThanOrEqual,
-                        Cc::Eq => FloatCC::Equal,
-                        // `UN | LT | GT`: Rust's `!=`, true when either side is `NaN`.
-                        Cc::Ne => FloatCC::NotEqual,
-                    };
-                    b.ins().fcmp(cc, r(x), r(y))
-                }
-                Inst::And(x, y) => b.ins().band(r(x), r(y)),
-                Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
-                Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
-                Inst::StopGrad(x) => r(x),
-                Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) => {
-                    let (fp, arg): (extern "C" fn(f64) -> f64, Value) = match *inst {
-                        Inst::HostArg(x) => (ir::host::arg_native, r(x)),
-                        Inst::Host(f) => {
-                            (ir::host::call_native, b.ins().f64const(f.index() as f64))
-                        }
-                        Inst::HostOut(k) => (ir::host::out_native, b.ins().f64const(k as f64)),
-                        _ => unreachable!(),
-                    };
-                    let callee = b.ins().iconst(ptr, fp as usize as i64);
-                    let call = b.ins().call_indirect(unary_ref, callee, &[arg]);
-                    b.inst_results(call)[0]
-                }
                 Inst::Store { arg, off, v: x } => {
                     b.ins()
                         .store(flags, r(x), args[arg as usize], (off * 8) as i32);
                     // A store has no value; nothing reads this slot.
                     r(x)
                 }
+                _ => lower_value_inst(&mut b, inst, &r, ptr, unary_ref, binary_ref)?,
             };
             v.push(out);
         }
@@ -481,6 +419,79 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
     module.define_function(id, &mut ctx).ok()?;
     module.clear_context(&mut ctx);
     Some(id)
+}
+
+/// Lower one `Inst` that neither reads nor writes memory — arithmetic, the shims, a
+/// compare, a select, the host hooks — from its operands' values (`r`): `None` for
+/// `Load` / `Store`, whose addressing each JIT owns. Shared by this RHS JIT and the
+/// kernel JIT, so the two lower the instruction set identically.
+pub(super) fn lower_value_inst(
+    b: &mut FunctionBuilder,
+    inst: &Inst,
+    r: impl Fn(ir::V) -> Value,
+    ptr: cranelift_codegen::ir::Type,
+    unary: cranelift_codegen::ir::SigRef,
+    binary: cranelift_codegen::ir::SigRef,
+) -> Option<Value> {
+    type F1 = extern "C" fn(f64) -> f64;
+    type F2 = extern "C" fn(f64, f64) -> f64;
+    let call = |b: &mut FunctionBuilder, sig, fp: usize, args: &[Value]| {
+        let callee = b.ins().iconst(ptr, fp as i64);
+        let call = b.ins().call_indirect(sig, callee, args);
+        b.inst_results(call)[0]
+    };
+    Some(match *inst {
+        Inst::Load { .. } | Inst::Store { .. } => return None,
+        Inst::Const(bits) => b.ins().f64const(f64::from_bits(bits)),
+        Inst::Add(x, y) => b.ins().fadd(r(x), r(y)),
+        Inst::Sub(x, y) => b.ins().fsub(r(x), r(y)),
+        Inst::Mul(x, y) => b.ins().fmul(r(x), r(y)),
+        Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
+        Inst::Neg(x) => b.ins().fneg(r(x)),
+        Inst::Abs(x) => b.ins().fabs(r(x)),
+        Inst::Floor(x) => b.ins().floor(r(x)),
+        Inst::Ceil(x) => b.ins().ceil(r(x)),
+        Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
+        Inst::Call1(s, x) => call(b, unary, s.f() as usize, &[r(x)]),
+        Inst::Powf(x, y) => call(b, binary, shim_powf as F2 as usize, &[r(x), r(y)]),
+        Inst::Gamma {
+            upper,
+            i,
+            j,
+            a: x,
+            x: y,
+        } => call(
+            b,
+            binary,
+            ir::gamma_shim(upper, i, j) as usize,
+            &[r(x), r(y)],
+        ),
+        Inst::Cmp(cc, x, y) => {
+            let cc = match cc {
+                Cc::Lt => FloatCC::LessThan,
+                Cc::Le => FloatCC::LessThanOrEqual,
+                Cc::Gt => FloatCC::GreaterThan,
+                Cc::Ge => FloatCC::GreaterThanOrEqual,
+                Cc::Eq => FloatCC::Equal,
+                // `UN | LT | GT`: Rust's `!=`, true when either side is `NaN`.
+                Cc::Ne => FloatCC::NotEqual,
+            };
+            b.ins().fcmp(cc, r(x), r(y))
+        }
+        Inst::And(x, y) => b.ins().band(r(x), r(y)),
+        Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
+        Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
+        Inst::StopGrad(x) => r(x),
+        Inst::HostArg(x) => call(b, unary, ir::host::arg_native as F1 as usize, &[r(x)]),
+        Inst::Host(f) => {
+            let arg = b.ins().f64const(f.index() as f64);
+            call(b, unary, ir::host::call_native as F1 as usize, &[arg])
+        }
+        Inst::HostOut(k) => {
+            let arg = b.ins().f64const(k as f64);
+            call(b, unary, ir::host::out_native as F1 as usize, &[arg])
+        }
+    })
 }
 
 /// The native functions of one register program, built on first use per layout and shared

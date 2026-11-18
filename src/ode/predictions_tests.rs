@@ -8,24 +8,14 @@ use approx::assert_relative_eq;
 /// 1-cpt IV bolus ODE: dA/dt = -ke·A. RHS reads CL,V from pk_params_flat.
 fn one_cpt_ode_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ke * y[0];
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+            },
+        ))
     }
 }
 
@@ -53,23 +43,14 @@ fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
 /// prediction vector *is* the sequence of `TIME` values the readout saw (#1028).
 fn time_readout_ode_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
         readout: OdeReadout::Single(Box::new(|_state, _pk, _theta, _eta, _cov| {
             crate::parser::model_parser::current_model_time()
         })),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     }
 }
 
@@ -113,29 +94,22 @@ fn form_c_readout_time_is_the_raw_data_clock() {
 #[cfg(feature = "survival")]
 fn one_cpt_chz_ode_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ke * y[0];
-            dy[1] = 0.1 * y[0];
-        }),
         n_states: 2,
         state_names: vec!["central".into(), "chz".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
         solver_opts: OdeSolverOptions {
             abstol: 1e-10,
             reltol: 1e-9,
             ..OdeSolverOptions::default()
         },
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+                dy[1] = 0.1 * y[0];
+            },
+        ))
     }
 }
 
@@ -2965,23 +2939,14 @@ fn adaptive_decision_monitor_uses_observation_covariates() {
     // readout is `state * FREE`; with no decay the state stays at the dose
     // amount, so the monitored signal is driven purely by FREE.
     let ode = OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
         readout: OdeReadout::Single(Box::new(|state, _pk, _theta, _eta, covariates| {
             state[0] * covariates.get("FREE").copied().unwrap_or(0.0)
         })),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     };
     let pk = pk_one(0.0, 1.0); // ke = 0 -> state holds at the dose amount
     let monitors = [MonitorSpec::new("A", 1, ObserveMode::Ipred)];
@@ -3598,24 +3563,15 @@ fn one_cpt_lag_spec(lag_slot: usize) -> OdeSpec {
     let mut map = crate::types::DoseAttrMap::default();
     map.insert(crate::types::DoseAttr::Lag, 1, lag_slot);
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ke * y[0];
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
         dose_attr_map: map,
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+            },
+        ))
     }
 }
 
@@ -4828,22 +4784,16 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
 /// selects which compartment the observable reads.
 fn two_cpt_accumulator(readout_idx: usize, map: crate::types::DoseAttrMap) -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-            dy[1] = 0.0;
-        }),
         n_states: 2,
         state_names: vec!["c1".into(), "c2".into()],
         readout: OdeReadout::ObsCmt(readout_idx),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
         dose_attr_map: map,
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+                dy[1] = 0.0;
+            },
+        ))
     }
 }
 
@@ -4990,24 +4940,16 @@ fn dense_solve_ss_lagged_infusion_runs() {
 /// params: kin @ slot 0, kout @ slot 1. Observable reads R (state 0).
 fn turnover_ode_spec_with_init() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = p[0] - p[1] * y[0];
-        }),
-        n_states: 1,
         state_names: vec!["R".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
         init_fn: Some(Box::new(|p: &[f64]| {
             let (kin, kout) = (p[0], p[1]);
             vec![if kout > 0.0 { kin / kout } else { 0.0 }]
         })),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = p[0] - p[1] * y[0];
+            },
+        ))
     }
 }
 
@@ -5027,15 +4969,7 @@ use crate::pk::absorption::{InputRateForcing, InputRateKind};
 /// Transit args live at free slots: `n` @ 6, `mtt` @ 7.
 fn transit_accumulator_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
         state_names: vec!["depot".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Transit,
@@ -5043,11 +4977,11 @@ fn transit_accumulator_spec() -> OdeSpec {
             frac_slot: None,
             lag_slot: None,
         }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     }
 }
 
@@ -5073,18 +5007,6 @@ fn pk_transit_struct(n: f64, mtt: f64, f: f64) -> PkParams {
 /// dosing into a built-in absorption compartment against an explicit run-in (#719).
 fn first_order_one_cpt_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ke * y[0];
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![InputRateForcing {
             cmt: 0,
             kind: InputRateKind::FirstOrder,
@@ -5092,11 +5014,14 @@ fn first_order_one_cpt_spec() -> OdeSpec {
             frac_slot: None,
             lag_slot: None,
         }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+            },
+        ))
     }
 }
 
@@ -5156,20 +5081,9 @@ fn ss_into_first_order_absorption_matches_explicit_run_in() {
 /// (CL/V)·central`. `n,mtt` @ slots 6,7; `KA` @ slot 4. Observable is central (state 1).
 fn transit_one_cpt_oral_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ka = p[4];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ka * y[0];
-            dy[1] = ka * y[0] - ke * y[1];
-        }),
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
         readout: OdeReadout::ObsCmt(1),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Transit,
@@ -5177,11 +5091,16 @@ fn transit_one_cpt_oral_spec() -> OdeSpec {
             frac_slot: None,
             lag_slot: None,
         }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ka = p[4];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ka * y[0];
+                dy[1] = ka * y[0] - ke * y[1];
+            },
+        ))
     }
 }
 
@@ -5949,18 +5868,9 @@ fn simulated_event_time_is_consistent_with_the_guarded_hazard() {
     // state 0: central, fed by the `first_order` kernel. state 1: the CHZ accumulator.
     // Readout is the CHZ state, so `ode_predictions` reads H(t) off the guarded path.
     let make_spec = || OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let (cl, v) = (p[crate::types::PK_IDX_CL], p[crate::types::PK_IDX_V]);
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            let (h0, beta) = (p[6], p[7]);
-            dy[0] = -ke * y[0];
-            dy[1] = h0 * (beta * y[0] / v).exp();
-        }),
         n_states: 2,
         state_names: vec!["central".into(), "chz".into()],
         readout: OdeReadout::ObsCmt(1),
-        diffusion_var: Vec::new(),
         solver_opts: OdeSolverOptions {
             reltol: 1e-11,
             abstol: 1e-11,
@@ -5973,11 +5883,15 @@ fn simulated_event_time_is_consistent_with_the_guarded_hazard() {
             frac_slot: None,
             lag_slot: None,
         }],
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let (cl, v) = (p[crate::types::PK_IDX_CL], p[crate::types::PK_IDX_V]);
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                let (h0, beta) = (p[6], p[7]);
+                dy[0] = -ke * y[0];
+                dy[1] = h0 * (beta * y[0] / v).exp();
+            },
+        ))
     };
 
     let mut pk = PkParams::default();
@@ -6110,15 +6024,7 @@ fn input_rate_consumes_cmt_matches_forcing_compartment() {
 /// `(F·amt/dur)·t` (a direct probe that the cutoff break is placed correctly).
 fn zero_order_accumulator_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
         state_names: vec!["depot".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![InputRateForcing {
             cmt: 0,
             kind: InputRateKind::ZeroOrder,
@@ -6126,11 +6032,11 @@ fn zero_order_accumulator_spec() -> OdeSpec {
             frac_slot: None,
             lag_slot: None,
         }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     }
 }
 
@@ -6195,21 +6101,12 @@ fn push_route_lag_break_times_adds_route_onsets() {
         lag_slot,
     };
     let ode = OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![mk(Some(6)), mk(None)],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     };
     let mut params = vec![0.0; crate::types::MAX_PK_PARAMS];
     params[6] = 1.5; // per-route lag
@@ -6777,21 +6674,12 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         lag_slot: None,
     };
     let ode = OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![mk(0, vec![2, 3]), mk(1, vec![4, 5])],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     };
 
     let (fr1, fr2) = (0.7_f64, 0.3_f64);
@@ -7282,26 +7170,19 @@ fn ode_event_driven_picks_up_changing_cl() {
 /// Used to test infusion into the depot compartment (cmt=1).
 fn one_cpt_oral_ode_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ka = p[crate::types::PK_IDX_KA];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ka * y[0];
-            dy[1] = ka * y[0] - ke * y[1];
-        }),
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
         readout: OdeReadout::ObsCmt(1),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ka = p[crate::types::PK_IDX_KA];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ka * y[0];
+                dy[1] = ka * y[0] - ke * y[1];
+            },
+        ))
     }
 }
 
@@ -7365,23 +7246,14 @@ fn ode_event_driven_form_c_uses_observation_covariates() {
     // FREE=0 and FREE=1. Form C must see the observation snapshot, not the
     // subject-level first-row covariate.
     let ode = OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
         readout: OdeReadout::Single(Box::new(|state, _pk, _theta, _eta, covariates| {
             state[0] * covariates.get("FREE").copied().unwrap_or(0.0)
         })),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     };
     let mut subj = make_subject(
         vec![DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0)],
@@ -7743,23 +7615,13 @@ fn ss_linear_disposition_uses_exact_fixed_point() {
 /// also carries a `first_order` input rate and so exercises the input-rate branch instead.
 fn mm_disposition_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let vmax = p[crate::types::PK_IDX_CL];
-            let km = p[crate::types::PK_IDX_V];
-            dy[0] = -vmax * y[0] / (km + y[0]);
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let vmax = p[crate::types::PK_IDX_CL];
+                let km = p[crate::types::PK_IDX_V];
+                dy[0] = -vmax * y[0] / (km + y[0]);
+            },
+        ))
     }
 }
 
@@ -8305,21 +8167,13 @@ fn test_ode_predictions_still_clamps_negatives() {
 /// it. The reprex of #1020, reduced to a Tier-1 spec.
 fn signed_readout_clock_spec(readout: OdeReadout) -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 1.0;
-        }),
-        n_states: 1,
         state_names: vec!["clock".into()],
         readout,
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 1.0;
+            },
+        ))
     }
 }
 
@@ -9134,16 +8988,6 @@ fn ss_input_rate_linear_disposition_uses_fixed_point() {
     solver_opts.reltol = 1e-10;
     solver_opts.abstol = 1e-10;
     let ode = OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            dy[0] = -(cl / v) * y[0];
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
         solver_opts,
         input_rate: vec![InputRateForcing {
             cmt: 0,
@@ -9152,11 +8996,13 @@ fn ss_input_rate_linear_disposition_uses_fixed_point() {
             frac_slot: None,
             lag_slot: None,
         }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                dy[0] = -(cl / v) * y[0];
+            },
+        ))
     };
     let mut pk = PkParams::default();
     pk.values[crate::types::PK_IDX_CL] = 1.0;
@@ -9814,29 +9660,23 @@ fn a_seeded_ss_dose_reads_tad_from_the_previous_cycles_pulse() {
 /// `nonmem_anchor/dose_form_lag_ss.ctl` term for term.
 fn oral_depot_central_ode_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ka = p[crate::types::PK_IDX_KA];
-            dy[0] = -ka * y[0];
-            dy[1] = ka * y[0] - if v > 0.0 { cl / v } else { 0.0 } * y[1];
-        }),
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
         readout: OdeReadout::ObsCmt(1),
-        diffusion_var: Vec::new(),
         solver_opts: OdeSolverOptions {
             abstol: 1e-12,
             reltol: 1e-10,
             ..OdeSolverOptions::default()
         },
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ka = p[crate::types::PK_IDX_KA];
+                dy[0] = -ka * y[0];
+                dy[1] = ka * y[0] - if v > 0.0 { cl / v } else { 0.0 } * y[1];
+            },
+        ))
     }
 }
 
@@ -10402,28 +10242,22 @@ const SS_CHZ_II: f64 = 12.0;
 fn one_cpt_const_chz_spec() -> OdeSpec {
     OdeSpec {
         chz_state_slots: vec![1],
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ke * y[0];
-            dy[1] = SS_CHZ_H0;
-        }),
         n_states: 2,
         state_names: vec!["central".into(), "__chz_3".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
         solver_opts: OdeSolverOptions {
             abstol: 1e-11,
             reltol: 1e-9,
             ..OdeSolverOptions::default()
         },
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                dy[0] = -ke * y[0];
+                dy[1] = SS_CHZ_H0;
+            },
+        ))
     }
 }
 
@@ -11175,18 +11009,9 @@ mod break_collision_1186 {
         let mut map = crate::types::DoseAttrMap::default();
         map.insert(crate::types::DoseAttr::Lag, 1, ALAG1_SLOT);
         OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-                let cl = p[PK_IDX_CL];
-                let v = p[PK_IDX_V];
-                let ka = p[PK_IDX_KA];
-                dy[0] = -ka * y[0];
-                dy[1] = ka * y[0] - (cl / v) * y[1];
-            }),
             n_states: 2,
             state_names: vec!["depot".into(), "central".into()],
             readout: OdeReadout::ObsCmt(1),
-            diffusion_var: Vec::new(),
             // Tight enough that the engine comparison below is about event handling,
             // not integrator error: the doubled-dose signal is 100 mg against a 1e-6
             // bound, but the NONMEM anchor is asserted to the printed digits.
@@ -11202,11 +11027,16 @@ mod break_collision_1186 {
                 frac_slot: None,
                 lag_slot: Some(ROUTE_LAG_SLOT),
             }],
-            init_fn: None,
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
             dose_attr_map: map,
+            ..crate::types::test_helpers::bare_ode(Box::new(
+                |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                    let cl = p[PK_IDX_CL];
+                    let v = p[PK_IDX_V];
+                    let ka = p[PK_IDX_KA];
+                    dy[0] = -ka * y[0];
+                    dy[1] = ka * y[0] - (cl / v) * y[1];
+                },
+            ))
         }
     }
 
@@ -13732,15 +13562,7 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
 /// a reference outside every ferx engine. Free slots: 20 = `dur`, 21 = the route lag.
 fn lagged_zero_order_accumulator_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = 0.0;
-        }),
-        n_states: 1,
         state_names: vec!["depot".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![InputRateForcing {
             cmt: 0,
             kind: InputRateKind::ZeroOrder,
@@ -13748,11 +13570,11 @@ fn lagged_zero_order_accumulator_spec() -> OdeSpec {
             frac_slot: None,
             lag_slot: Some(21),
         }],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |_y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = 0.0;
+            },
+        ))
     }
 }
 
@@ -13854,20 +13676,8 @@ fn frozen_replay_delivers_the_exact_zero_order_mass() {
 /// 22 = the first-order route lag, 23 = the depot→central transfer rate.
 fn two_route_lagged_spec() -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            let ktr = p[23];
-            dy[0] = ktr * y[1] - ke * y[0];
-            dy[1] = -ktr * y[1];
-        }),
         n_states: 2,
         state_names: vec!["central".into(), "depot".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
         input_rate: vec![
             InputRateForcing {
                 cmt: 0,
@@ -13884,11 +13694,16 @@ fn two_route_lagged_spec() -> OdeSpec {
                 lag_slot: Some(22),
             },
         ],
-        init_fn: None,
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let cl = p[crate::types::PK_IDX_CL];
+                let v = p[crate::types::PK_IDX_V];
+                let ke = if v > 0.0 { cl / v } else { 0.0 };
+                let ktr = p[23];
+                dy[0] = ktr * y[1] - ke * y[0];
+                dy[1] = -ktr * y[1];
+            },
+        ))
     }
 }
 
@@ -15221,28 +15036,23 @@ fn depot_central_lag_spec(lag_slot: usize) -> OdeSpec {
     let mut map = crate::types::DoseAttrMap::default();
     map.insert(crate::types::DoseAttr::Lag, 1, lag_slot);
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
-            let ka = p[4];
-            dy[0] = -ka * y[0];
-            dy[1] = ka * y[0] - ke * y[1];
-        }),
         n_states: 2,
         state_names: vec!["depot".into(), "central".into()],
         readout: OdeReadout::ObsCmt(1),
-        diffusion_var: Vec::new(),
         solver_opts: OdeSolverOptions {
             reltol: 1e-11,
             abstol: 1e-11,
             ..OdeSolverOptions::default()
         },
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
         dose_attr_map: map,
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
+                let ke = p[crate::types::PK_IDX_CL] / p[crate::types::PK_IDX_V];
+                let ka = p[4];
+                dy[0] = -ka * y[0];
+                dy[1] = ka * y[0] - ke * y[1];
+            },
+        ))
     }
 }
 
@@ -15731,22 +15541,15 @@ fn a_reader_split_tie_is_read_on_every_ode_engine() {
 /// (t=1) sees a finite state and decision 1 (t=4) a diverged one.
 fn pole_ode_spec(readout: OdeReadout) -> OdeSpec {
     OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
-            dy[0] = -0.1 * y[0];
-            dy[1] = 0.5 * y[1] * y[1];
-        }),
         n_states: 2,
         state_names: vec!["central".into(), "x".into()],
         readout,
-        diffusion_var: Vec::new(),
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
+        ..crate::types::test_helpers::bare_ode(Box::new(
+            |y: &[f64], _p: &[f64], _t: f64, dy: &mut [f64]| {
+                dy[0] = -0.1 * y[0];
+                dy[1] = 0.5 * y[1] * y[1];
+            },
+        ))
     }
 }
 

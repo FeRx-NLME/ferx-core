@@ -357,23 +357,19 @@ fn the_messages_name_the_coordinate_both_objectives_and_the_outcome() {
 /// user's floor, not ferx's; one Ω diagonal; one σ.
 fn template() -> ModelParameters {
     ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta: vec![55.0, 8.0, 2.0],
         theta_names: vec!["TVE0".into(), "EMAX".into(), "ET50".into()],
         theta_lower: vec![0.0, 0.0, 0.5],
         theta_upper: vec![200.0, 100.0, 100.0],
         theta_fixed: vec![false; 3],
-        omega: OmegaMatrix::from_diagonal(&[0.25], vec!["ETA_EM".into()]),
-        omega_fixed: vec![false],
         sigma: SigmaVector {
             values: vec![1.0],
             names: vec!["ADD_ERR".into()],
         },
-        sigma_fixed: vec![false],
-        omega_iov: None,
-        kappa_fixed: Vec::new(),
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+            &[0.25],
+            vec!["ETA_EM".into()],
+        ))
     }
 }
 
