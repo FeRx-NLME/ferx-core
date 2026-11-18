@@ -841,7 +841,7 @@ pub(crate) fn check_endpoint_routing(
     population: &Population,
     require_records: bool,
 ) -> Vec<Diagnostic> {
-    use crate::types::EndpointLikelihood;
+    use crate::types::{EndpointLikelihood, ObsRecord};
     use std::collections::BTreeMap;
 
     // (what to call the endpoint in the message, the block the diagnostic points at)
@@ -871,6 +871,33 @@ pub(crate) fn check_endpoint_routing(
     if endpoints.is_empty() {
         return Vec::new();
     }
+    // The record variant an endpoint's likelihood scores (#2877 review round 6): every
+    // likelihood path matches on its own variant and skips the rest, so a record of another
+    // kind on its CMT — possible only in a hand-built population, the routed reader picks
+    // the variant from the endpoint — would be dropped from the objective without a word.
+    let scores = |ep: &EndpointLikelihood, r: &ObsRecord| -> bool {
+        match (ep, r) {
+            (EndpointLikelihood::Tte { .. }, ObsRecord::Event { .. })
+            | (EndpointLikelihood::Binary { .. }, ObsRecord::DiscreteState { .. })
+            | (EndpointLikelihood::Count { .. }, ObsRecord::Count { .. }) => true,
+            #[cfg(feature = "markov")]
+            (
+                EndpointLikelihood::Ctmm { .. } | EndpointLikelihood::Dtmm { .. },
+                ObsRecord::DiscreteState { .. },
+            ) => true,
+            _ => false,
+        }
+    };
+    let variant_of = |r: &ObsRecord| match r {
+        ObsRecord::Event { .. } => "`ObsRecord::Event`",
+        ObsRecord::DiscreteState { .. } => "`ObsRecord::DiscreteState`",
+        ObsRecord::Count { .. } => "`ObsRecord::Count`",
+    };
+    let expected_variant = |ep: &EndpointLikelihood| match ep {
+        EndpointLikelihood::Tte { .. } => "`ObsRecord::Event`",
+        EndpointLikelihood::Count { .. } => "`ObsRecord::Count`",
+        _ => "`ObsRecord::DiscreteState`",
+    };
 
     let mut diags = Vec::new();
     // cmt -> (first offending subject, number of Gaussian rows on it)
@@ -903,8 +930,42 @@ pub(crate) fn check_endpoint_routing(
             .with_block(block),
         );
     }
+    // cmt -> (first offending subject, its record's variant, number of such records)
+    let mut wrong_kind: BTreeMap<usize, (String, &'static str, usize)> = BTreeMap::new();
+    for subj in &population.subjects {
+        for r in &subj.obs_records {
+            let cmt = r.cmt();
+            if let Some(ep) = model.endpoints.get(&cmt) {
+                if endpoints.contains_key(&cmt) && !scores(ep, r) {
+                    wrong_kind
+                        .entry(cmt)
+                        .or_insert_with(|| (subj.id.clone(), variant_of(r), 0))
+                        .2 += 1;
+                }
+            }
+        }
+    }
+    for (cmt, (id, variant, n)) in &wrong_kind {
+        let (kind, block) = endpoints[cmt];
+        let want = expected_variant(&model.endpoints[cmt]);
+        diags.push(
+            Diagnostic::error(
+                "E_ENDPOINT_RECORD_KIND",
+                format!(
+                    "E_ENDPOINT_RECORD_KIND: CMT {cmt} is declared as a {kind} endpoint, but \
+                     {n} record(s) on it are {variant} (first: subject {id}), which its \
+                     likelihood does not score, so they would contribute nothing. A {kind} \
+                     record is {want}: build the population with \
+                     `read_population_for(&model, ...)`, which picks the record from the \
+                     endpoint, or construct those records as {want}."
+                ),
+            )
+            .with_block(block),
+        );
+    }
     if require_records {
-        // one pass over the records: cmt -> routed rows
+        // one pass over the records: cmt -> routed rows, of any kind — a CMT whose records
+        // are all of the wrong kind has its own, more precise, error above
         let mut routed: BTreeMap<usize, usize> = BTreeMap::new();
         for r in population
             .subjects

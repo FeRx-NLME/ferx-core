@@ -5015,14 +5015,20 @@ pub enum Prediction {
 }
 
 impl Prediction {
-    /// `P(Y = k)` for state index `k`, or `None` when this is not a categorical
-    /// prediction or `k` is out of range. Keeps callers from indexing `probs`
+    /// `P(Y = k)` for state index `k` (or count `k`), or `None` when this is not a
+    /// categorical or count prediction or `k` is out of range — for a count, above
+    /// `u32::MAX`, the largest count a record carries. Keeps callers from indexing `probs`
     /// directly and panicking on a shape they did not check.
     pub fn prob(&self, k: usize) -> Option<f64> {
         match self {
             Prediction::CatProbs { probs } => probs.get(k).copied(),
             Prediction::Rate { lambda, size } => {
-                Some(crate::stats::special::count_pmf(*lambda, *size, k as f64))
+                let k = u32::try_from(k).ok()?;
+                Some(crate::stats::special::count_pmf(
+                    *lambda,
+                    *size,
+                    f64::from(k),
+                ))
             }
             Prediction::Continuous { .. } => None,
         }

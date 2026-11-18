@@ -871,3 +871,36 @@ fn count_records_define_and_carry_theta_levels() {
     let got = super::super::discrete_subject_nll(model, s, &theta, &[]);
     assert!((got - want).abs() < 1e-10, "{got} vs {want}");
 }
+
+/// A count past `u32::MAX` — the largest a record carries — is outside the PMF's domain:
+/// `count_log_pmf` returns `NaN` for both families rather than narrowing it to `u32::MAX`
+/// (the negative binomial's cast saturated, so `2³²` was scored as `2³² − 1`), and
+/// `Prediction::prob` returns `None`. `u32::MAX` itself is still a count, finite on both.
+///
+/// Mutations: drop the domain bound and the NB value at `2³²` equals the one at `2³² − 1`;
+/// narrow in `prob` with `as` and it returns `Some`.
+#[test]
+fn counts_past_u32_max_are_out_of_domain_not_narrowed() {
+    let max = f64::from(u32::MAX);
+    for size in [None, Some(3.5)] {
+        let at_max = count_log_pmf(4e9, size, max);
+        assert!(
+            at_max.is_finite(),
+            "size {size:?}: P(Y = u32::MAX) = {at_max}"
+        );
+        let past = count_log_pmf(4e9, size, max + 1.0);
+        assert!(past.is_nan(), "size {size:?}: P(Y = 2³²) = {past}, not NaN");
+    }
+    let rate = Prediction::Rate {
+        lambda: 4e9,
+        size: Some(3.5),
+    };
+    assert!(rate.prob(u32::MAX as usize).is_some_and(|p| p.is_finite()));
+    if let Ok(big) = usize::try_from(1u64 << 32) {
+        assert_eq!(
+            rate.prob(big),
+            None,
+            "a count past u32::MAX is out of range"
+        );
+    }
+}

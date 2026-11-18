@@ -625,15 +625,18 @@ pub(crate) fn negbin_log_pmf_g<T: PkNum>(mu: T, log_mu: T, r: T, k: u32) -> T {
 /// `None`, negative binomial with mean `lambda` and size `r = size` otherwise (variance
 /// `λ + λ²/r`). A zero mean is the degenerate law at 0 (`0` for `k = 0`, `−∞` otherwise).
 /// `NaN` for a mean that is negative or not finite, a size that is not finite and positive,
-/// or a `k` that is not a non-negative integer — the caller decides what an undefined law
-/// means.
+/// or a `k` that is not an integer in `0..=u32::MAX` (the counts a record carries) — the
+/// caller decides what an undefined law means.
 ///
 /// The value side of the `[count_model]` record kernel, which differentiates the same
 /// formula on its own number type; this is the `f64` form the public
 /// [`Prediction::prob`](crate::types::Prediction::prob) and the tests read.
 pub fn count_log_pmf(lambda: f64, size: Option<f64>, k: f64) -> f64 {
     let valid = |x: f64| x.is_finite() && x > 0.0;
-    if !(lambda.is_finite() && lambda >= 0.0) || !(k >= 0.0 && k.fract() == 0.0 && k.is_finite()) {
+    // A count is a `u32` wherever ferx holds one (`ObsRecord::Count`); a larger `k` is outside
+    // the law's domain here rather than narrowed to `u32::MAX` by the cast below.
+    let in_domain = k >= 0.0 && k.fract() == 0.0 && k <= f64::from(u32::MAX);
+    if !(lambda.is_finite() && lambda >= 0.0) || !in_domain {
         return f64::NAN;
     }
     if lambda == 0.0 {
