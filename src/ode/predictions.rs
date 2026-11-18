@@ -38,45 +38,98 @@ macro_rules! register_run_in_jac {
 /// walks (#472).
 pub(crate) const INFUSION_EPS: f64 = 1e-12;
 
-/// Tolerance for matching a break time to the **event** it stands for (a dose arrival
-/// `dose.time + lag`, an SS record-time seed, an EVID=3/4 reset) on every engine that rescans the
-/// timeline (#716, #1186). Breaks are deduped at `1e-15`, so an event merged into a neighbour is
-/// still applied at that representative break.
+/// Tolerance for matching a break time to the **event** it stands for — a dose
+/// arrival (`dose.time + lag`), an SS dose's record-time seed, or a system-reset
+/// time (EVID=3/4) — on every engine that resolves its events by rescanning the
+/// timeline (#716, #1186). Each such time is pushed into `break_times`, which is
+/// then deduped at `1e-15`, so an event merged into a sub-`1e-15` neighbour is
+/// still applied at that representative break rather than dropped.
 ///
-/// **Invariant: `dedup (1e-15) ≤ EVENT_MATCH_TOL`, and a dose fires at one break within
-/// `EVENT_MATCH_TOL` and at no other**, enforced by the `seed_applied` / `applied` masks, not by the
-/// tolerance. Which break: the last one at or before the event where a walk hands [`event_on_break`]
-/// the real next break (#2532); the first one in the band elsewhere. A derived break
-/// (`dose.time + lag_cmt + lag_route`, an infusion end) lands 1-2 ULP from other breaks, so without
-/// the masks a bolus doubled (144.04 → 244.04 on the #1186 fixture); no pair of tolerances gives
-/// exactly one application. One value on every engine (it was `1e-12` vs `1e-10`, which doubled
-/// doses in sdtab/hazard paths only). Same magnitude as [`INFUSION_EPS`], a different role.
+/// **Invariant: `dedup (1e-15) ≤ EVENT_MATCH_TOL`, and a dose fires at one break
+/// within `EVENT_MATCH_TOL` and at no other** — enforced by the `seed_applied` /
+/// `applied` masks the rescanning loops carry, not by the tolerance. Which break:
+/// the last one at or before the event where a walk hands [`event_on_break`] the
+/// real next break (#2532); the first one in the band elsewhere.
+///
+/// #1186: a *derived* break (a route onset `dose.time + lag_cmt +
+/// lag_route`, an infusion end `dose.time + amt/rate`) is a multi-term float sum,
+/// so it routinely lands 1–2 ULP from another dose's own break — past the `1e-15`
+/// dedup and well inside this match. Every break in that gap used to re-apply the
+/// dose, doubling a bolus (144.04 → 244.04 on the #1186 fixture) or pushing an
+/// infusion into `active_infusions` twice. No pair of tolerances fixes that: with
+/// dedup `D` and match `M`, `D ≥ 2M` permits zero applications and `D ≤ M` permits
+/// two — only an apply-once mask gives exactly one. Widening `D` instead would also
+/// re-segment every engine and trip the adaptive exact-bit guards (#700).
+///
+/// One value on every engine, deliberately: it used to be `1e-12` on the objective
+/// path and `1e-10` on the sdtab / dense / hazard paths, a 100× asymmetry that let
+/// the same dataset double a dose in sdtab, the joint PK-TTE hazard, `[derived]`
+/// integrals and `simulate()` while the OFV was correct. Tightening the two `1e-10`s
+/// is safe under the same argument that bounds the mask: a dose's own break is
+/// pushed from the identical expression, so the distance is zero.
+///
+/// Same magnitude as [`INFUSION_EPS`], which stays separate — that is a containment
+/// epsilon on an infusion *window*, a different role.
 ///
 /// # The recording rule (#1226)
 ///
-/// The same tolerance decides where a *record* (observation, `saveat` point, soft CHZ sample) is
-/// read, **one-sided**. For a break `t_k` and its successor `t_{k+1}`:
+/// The same tolerance decides where a *record* — an observation, a `saveat` grid point,
+/// a soft (CHZ) sample — is read, and there it is deliberately **one-sided**. For a break
+/// `t_k` and its successor `t_{k+1}`:
 ///
-/// - **band**: `t_k ≤ t < t_k + EVENT_MATCH_TOL` is read **at `t_k`, after** that break's events
-///   (reset → dose → read), from `u(t_k⁺)`; see [`reads_at_break`]. Error against the true `u(t)`
-///   `≤ |f|·1e-12` (`lag_arrival_read_1226::band_read_is_continuous_across_the_tolerance_edge`).
-/// - **segment**: `t_k + EVENT_MATCH_TOL ≤ t ≤ t_{k+1}` is recorded off the integration of
-///   `(t_k, t_{k+1}]`; see [`reads_in_segment`].
+///  - **band** — `t_k ≤ t < t_k + EVENT_MATCH_TOL` is read **at `t_k`, after** that
+///    break's events (reset → dose → read), from the post-event state `u(t_k⁺)`; see
+///    [`reads_at_break`]. The shortcut error against the true `u(t)` is `≤ |f|·1e-12`,
+///    below every solver tolerance, and it is measured rather than argued in
+///    `lag_arrival_read_1226::band_read_is_continuous_across_the_tolerance_edge`.
+///  - **segment** — `t_k + EVENT_MATCH_TOL ≤ t ≤ t_{k+1}` is recorded off the
+///    integration of `(t_k, t_{k+1}]`; see [`reads_in_segment`].
 ///
-/// A record within tolerance *before* a break stays pre-event (NONMEM's ordering, anchored by
-/// `nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}`); #1226 read a sample `1.3e-13` after
-/// an `ALAG` arrival drug-free (45.38 vs NONMEM's 145.38). When two breaks are closer than
-/// `EVENT_MATCH_TOL` the loops visit them in ascending order so the **later** write wins.
+/// Not symmetric: a record within tolerance *before* a break stays on the pre-event
+/// side, because a dose record strictly earlier than an observation record is applied
+/// first and one strictly later is not — NONMEM's ordering, anchored on both sides by
+/// `nonmem_anchor/lag_arrival_read_{before,after}_advan{1,13}`.
+///
+/// The old segment bound was `t <= t_end + 1e-12`, which handed a within-tolerance-
+/// **after** record to the segment *ending* at the break — i.e. to the state before the
+/// dose was applied. #1226: an estimated `ALAG` whose arrival landed `1.3e-13` short of a
+/// sample made `ode_predictions`, `ode_predictions_with_states` and
+/// `ode_dense_solve_states` read that subject drug-free at a post-dose sample (45.38
+/// against NONMEM's 145.38), moving the OFV and not only a diagnostic. The mirror sign
+/// was wrong in the opposite direction on one site only — the #570 shared solve's CHZ
+/// boundary read used a *symmetric* `abs() < 1e-12`, so a hazard time `1.8e-15` **before**
+/// an arrival was overwritten with the post-dose state.
+///
+/// The two predicates partition `[t_k, t_{k+1}]` whenever adjacent breaks are at least
+/// `EVENT_MATCH_TOL` apart. When two breaks are closer than that, both bands can claim a
+/// time; the loops visit breaks in ascending order, so the **later** write wins, which is
+/// the right answer (the latest break at or before `t`).
 pub(crate) const EVENT_MATCH_TOL: f64 = 1e-12;
 
-/// True when a record time `t` is read **at** the break `t_break` (from `u(t_break⁺)`) rather than
-/// off the following integration. One-sided band `[t_break, t_break + EVENT_MATCH_TOL)`; see
-/// [`EVENT_MATCH_TOL`].
+/// True when a record time `t` is read **at** the break `t_break` — from the post-event
+/// state `u(t_break⁺)` — rather than off the integration that follows it.
 ///
-/// Written as a **difference** `t - t_break < TOL`, never as the sum: the sum rounds back to
-/// `t_break` once `ulp(t_break) > TOL` and the band becomes **empty** (measured: 0 ulp at
-/// `t_break = 16384.0` and `17520.0`, i.e. two years in hours; the difference form keeps 1 ulp,
-/// bit equality).
+/// One-sided: the band is the half-open `[t_break, t_break + EVENT_MATCH_TOL)`. See
+/// [`EVENT_MATCH_TOL`] for why the *before* side must stay on the pre-event state.
+///
+/// Written as a **difference**, `t - t_break < TOL`, never as the sum `t < t_break + TOL`.
+/// `EVENT_MATCH_TOL` is absolute, so the sum rounds back to `t_break` once `ulp(t_break)`
+/// exceeds it and the half-open band becomes **empty** — the predicate then fails even at
+/// bit equality, which the exact-bit `obs_map` lookups it replaced always matched. Measured:
+///
+/// | `t_break` | `ulp` | band width, sum form | difference form |
+/// |---|---|---|---|
+/// | `8.2` | 1.776e-15 | 563 ulp | 563 ulp |
+/// | `1000.0` | 1.137e-13 | 9 ulp | 9 ulp |
+/// | `8192.0` | 1.819e-12 | 1 ulp | 1 ulp |
+/// | `16384.0` | 3.638e-12 | **0 ulp — matches nothing** | 1 ulp (bit equality) |
+/// | `17520.0` | 3.638e-12 | **0 ulp** | 1 ulp |
+///
+/// `17520` is hours in two years, so this is an ordinary study timescale, not a corner.
+/// The difference form degrades gracefully: as `ulp` grows past the tolerance the band
+/// narrows to exactly the bit-equal set and never below it. That is the same shape as the
+/// dose-application predicate (`(dose.time - t_start).abs() < EVENT_MATCH_TOL`), which is
+/// why that one never had this failure mode.
 #[inline]
 pub(crate) fn reads_at_break(t: f64, t_break: f64) -> bool {
     t >= t_break && t - t_break < EVENT_MATCH_TOL
@@ -175,11 +228,21 @@ fn doses_next_break(break_times: &[f64], k: usize, bounded: bool) -> f64 {
     }
 }
 
-/// The save points handed to `solve_ode` for `(t_start, t_end]`: every time in `times` that
-/// [`reads_in_segment`] assigns to it, plus `t_end` (so the state advances through a segment that
-/// reads nothing), sorted. Duplicates are dropped only when **bit-identical**: callers map points
-/// back by `t.to_bits()`, and a `1e-15` dedup merged a record with the one a ULP below it (#614,
-/// #1810), leaving a `NaN` prediction.
+/// The save points handed to `solve_ode` for the segment `(t_start, t_end]`: every time in
+/// `times` that [`reads_in_segment`] assigns to it, plus `t_end` itself so the state still
+/// advances through a segment that reads nothing (two doses with no record between them),
+/// sorted so the solver's linear save cursor works on out-of-order input.
+///
+/// Duplicates are dropped only when **bit-identical**. Every caller maps the returned points
+/// back to its records by `t.to_bits()`, so a time dropped here is a record never written.
+/// The callers used to dedup at `1e-15`, which merges a time with the one a ULP below it at
+/// any time up to `8.0` (one ULP below `8.0` is `8.9e-16`), and one ULP is exactly how far
+/// the reader moves the first of two co-timed records below their tie (#614, #1810). The
+/// record left at the tie then kept a `NaN` prediction whenever no break sat at that time to
+/// read it instead: two observations at one `TIME` with an EVID=2 row listed after the
+/// first, or an observation each side of a lagged dose. The solver needs no merging of
+/// near-equal entries: after each accepted step it saves every entry within `1e-12`, each
+/// under its own time and with the same state.
 pub(crate) fn segment_saveat(times: &[f64], t_start: f64, t_end: f64) -> Vec<f64> {
     let mut saveat: Vec<f64> = times
         .iter()
@@ -194,10 +257,26 @@ pub(crate) fn segment_saveat(times: &[f64], t_start: f64, t_end: f64) -> Vec<f64
     saveat
 }
 
-/// A subject's record times sorted once, for resolving which records each break claims:
-/// `O(n log n) + n_breaks·(log n + k)` instead of `O(n_breaks · n)`. Measured against the linear
-/// scan: 0.20× at 5 records, 1.03× at 20, 16× at 1000, 103× at 5000 (dense grids for hazards,
-/// `[derived]` integrals and AUC horizons run to thousands). The one spelling of the band rule.
+/// A subject's record times sorted once, for resolving which records each break claims.
+///
+/// Built per subject and queried per break, so the whole break loop costs
+/// `O(n log n) + n_breaks·(log n + k)` instead of the `O(n_breaks · n)` a rescan per break
+/// costs. Measured over a full subject walk with `n_breaks == n_records`, this spelling
+/// against the linear scan it replaced:
+///
+/// | records | 5 | 10 | 20 | 50 | 100 | 1000 | 5000 |
+/// |---|---|---|---|---|---|---|---|
+/// | speedup | 0.20× | 0.35× | 1.03× | 2.27× | 3.91× | 16.0× | 102.8× |
+///
+/// Below ~20 records the sort does not pay for itself, but the absolute cost there is
+/// +140 ns per subject against an ODE solve of tens of microseconds. Above it the win is
+/// the one that matters: [`ode_dense_solve_states`] is driven by a *grid* — a hazard
+/// timeline, a `[derived]` integral, an AUC or `predict_survival` horizon — which routinely
+/// runs to hundreds or thousands of points.
+///
+/// This is also the one spelling of the band rule. `sens/ode_provider.rs` already resolved
+/// its boundary records by sorted binary search (#438 review); having the ODE engines rescan
+/// linearly meant the same rule was written twice, in two shapes that could drift.
 pub(crate) struct RecordIndex {
     sorted: Vec<(f64, usize)>,
 }
@@ -568,22 +647,46 @@ where
     Some(proj.embed(&u_red))
 }
 
-/// Extended parameters for **one window** of a steady-state run-in (#1139). The `[odes]` RHS reads
-/// `TAD` from `params[MAX_PK_PARAMS + 1]` and `TAFD` from `params[MAX_PK_PARAMS]`; a bare
-/// `PkParams::values` made both `NaN` and poisoned the run-in.
+/// Extended parameters for **one window** of a steady-state run-in (#1139).
 ///
-/// `pulse_at` is the **local-clock** time of the pulse this window measures `TAD` from (the
-/// run-in runs on a clock private to each window, so not `tad_anchor_for` of the walk):
+/// The compiled `[odes]` right-hand side reads `TAD` out of `params[MAX_PK_PARAMS + 1]`
+/// (`parser/model_parser.rs`, the model-time closure) as `t − anchor`, and `TAFD` out of
+/// `params[MAX_PK_PARAMS]`. Every SS-equilibration call site hands `solve_ode` a bare
+/// `PkParams::values`, which is exactly `MAX_PK_PARAMS` long, so both `.get()` calls
+/// returned `None`, the RHS injected `NaN`, and `0.0 * NaN = NaN` poisoned the whole
+/// run-in — merely *mentioning* `TAD` turned an otherwise ordinary `SS=1` fit into a
+/// non-finite objective.
 ///
-/// * a window opening **at** the pulse → `0.0` (propagator probes, forced bolus cycles, an
-///   infusion's active window, the input-rate one-cycle advance);
-/// * the **quiet** window of an infusion cycle → `−T_inf`, so `TAD` continues at `T_inf … II`;
-/// * the `(m·II, (m+1)·II)` segments of the capped input-rate train → `m·II`, from
-///   [`tad_anchor_for`] over that train's dose list.
+/// `pulse_at` is the **local-clock** time of the pulse this window measures `TAD` from,
+/// in the same units the window's own `solve_ode` span uses. The run-in does not run on
+/// the subject's clock — it expands a periodic train on a clock private to each window —
+/// so this is not a `tad_anchor_for` question and the walk's own `ext_params` must not be
+/// threaded in here. Three shapes, all of them live:
 ///
-/// **`TAFD` is deliberately left `NaN`** (no periodic steady state exists for it; measured, its
-/// explicit train diverges 0.294 per doubling). [`ss_state_at_phase_pk`]'s windows use this too
-/// since #1126.
+/// * a window opening **at** the pulse → `0.0`. That is `(0, II)` for the exact solve's
+///   propagator probes and its forced bolus cycle, `(0, II)` again for the capped train's
+///   bolus cycle, `(0, T_inf)` for an infusion's **active** window on both of those
+///   branches, and `(0, II)` for the input-rate path's one-cycle advance;
+/// * the **quiet** window an infusion cycle re-opens at local `0` after `T_inf` of active
+///   rate → `−T_inf`, so `TAD` continues at `T_inf … II` rather than restarting at zero;
+/// * the monotone `(m·II, (m+1)·II)` segments of the capped input-rate pulse train, whose
+///   pulses sit at local `0, II, 2·II, …` → `m·II`, taken from [`tad_anchor_for`] over
+///   that train's own dose list rather than re-spelled. A flat `0.0` there reads
+///   `TAD = m·II + τ`, wrong by up to `SS_EQUILIBRATION_CYCLES − 1 = 49` whole intervals.
+///
+/// **`TAFD` is deliberately left `NaN`**, which reproduces today's answer bit-for-bit for a
+/// `TAFD`-reading model. Anchoring it at the run-in's own origin would hand back a finite,
+/// plausible number for a quantity that has no periodic steady state at all — measured, its
+/// explicit train diverges 0.294 per doubling — i.e. it would silently redefine `TAFD` as
+/// `TAD` inside the run-in, which is the very defect class this function removes. `TAFD`,
+/// `T` and `TIME` under `SS=1` are #1139's other half and are handled separately.
+///
+/// [`ss_state_at_phase_pk`]'s three windows call this too since #1126 — the phase advance
+/// is a run-in window like any other, opening at its cycle's pulse (`0.0`) with the same
+/// `−T_inf` quiet window for an infusion. It stayed on the bare slice for one release
+/// because anchoring it *alone* converts a loud `NaN` into a number 2.7 % wrong on every
+/// observation; see the note at the top of that function for why the other half is the
+/// walk's anchor and not this one.
 #[inline]
 pub(crate) fn ss_run_in_params(
     pk_params_flat: &[f64],
@@ -1505,13 +1608,28 @@ fn ss_state_at_phase_pk(
 ) -> Vec<f64> {
     // ### The phase advance is a run-in window too, and it is the pre-arrival one
     //
-    // The three `solve_ode` calls below hand the RHS [`ss_run_in_params`] (as
-    // [`equilibrate_ss_pk_state`]'s windows do, #1139), so a `TAD`-reading RHS reads a real anchor.
-    // This shipped together with [`crate::dosing::tad_referent`] (#1126): anchoring it alone was
-    // measured 2.733 % high at every post-arrival observation. Both windows measure from the pulse
-    // this advance starts at (local `0`); an infusion's quiet window anchors at `−T_inf`. The
-    // `crate::dosing::last_ss_equilibration_branch()` tag left after this belongs to the
-    // `equilibrate_ss_pk_state` call below.
+    // Like [`equilibrate_ss_pk_state`]'s windows (#1139), the three `solve_ode` calls below
+    // hand the RHS an extended array via [`ss_run_in_params`] rather than a bare
+    // `PkParams::values`, so a `TAD`-reading RHS reads a real anchor instead of `NaN`.
+    // Until #1126 they did not, deliberately: this function is reachable only through
+    // `ss_seeded_at_record` (`lag > 0`), and anchoring it *alone* replaced a loud `NaN`
+    // with a plausible number **2.733 % high at every post-arrival observation** — the seed
+    // it returns was already right, but the walk then integrated `[t_dose, t_dose + lag)`
+    // under a `TAD` anchored at the *first arrival*, and #1121 flows that state to the
+    // arrival rather than re-equilibrating there, so the error multiplied into the whole
+    // subject by a uniform 1.0273332950. That measurement is why the two halves ship
+    // together: [`crate::dosing::tad_referent`] gives the walk the previous cycle's pulse,
+    // and this function stops handing it `NaN` to carry.
+    //
+    // Both windows measure from the **pulse this advance starts at**, which sits at local
+    // `0`: `equilibrate_ss_pk_state` returns the pre-pulse trough and the bolus (or the
+    // infusion's first `T_inf`) lands at the origin of the spans below. An infusion's quiet
+    // window re-opens at local `0` a further `T_inf` after that pulse, so it anchors at
+    // `−T_inf`, exactly as the sibling's group-B windows do.
+    //
+    // Note for anyone asserting `crate::dosing::last_ss_equilibration_branch()` after this
+    // function: the tag it leaves belongs to the `equilibrate_ss_pk_state` call below, not to
+    // the phase advance, which records nothing of its own.
     let chz = &ode.chz_state_slots[..];
     let base_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
         (ode.rhs)(y, p, t, dy);
@@ -2242,20 +2360,43 @@ fn ss_periodic_forcing_shifted<T: crate::sens::num::PkNum>(
     local
 }
 
-/// The `SS=1` reset (#1576) of one integration segment, built once per segment and read by
-/// [`add_prepared_input_rate_forcing`] on every RHS evaluation. A dose preceding the latest `SS=1`
-/// record reached by the segment start contributes nothing
-/// ([`crate::dosing::ss_reset_cutoff`]), nor does an `SS=1` train before its own record. Gated
-/// **per segment, not pointwise**: Dormand–Prince's last stage sits on the right end of the step.
+/// The `SS=1` reset (#1576) of one integration segment, built once per segment and read
+/// by [`add_prepared_input_rate_forcing`] on every RHS evaluation.
 ///
-/// "Reached" is **within [`EVENT_MATCH_TOL`]**: dedup keeps the lower value, so a segment can start
-/// 1 ulp below its record (PR #1589 review: −51 % at t = 6 with an exact compare).
-/// [`Self::at_segment`] and [`Self::at_segment_indexed`] both add the tolerance in `with_cutoff`.
+/// A dose that precedes the latest `SS=1` record reached by the segment start in (time,
+/// row order) contributes nothing ([`crate::dosing::ss_reset_cutoff`]), and an `SS=1`
+/// dose's implied pulse train contributes nothing before its own record. Both are gated
+/// **per segment, not pointwise**: the gate changes exactly at a dose record, which is
+/// always a break, and Dormand–Prince evaluates its last stage at the right end of the
+/// step, so a pointwise `t ≥ t_s` gate would feed the next regimen's tails into the last
+/// stage of the segment that *ends* at `t_s` (the same reason `reset_floor` is per
+/// segment). The record is the dose row's own time: `SS=1` + lag into a forcing is
+/// rejected up front.
 ///
-/// Also carries the **EVID=3/4 reset** (#1587), keyed on the dose *record*, never its lagged
-/// arrival (NONMEM, `nonmem_anchor/evid_reset_lag`). `reset_floor` is the latest reset the walker
-/// has visited (`NEG_INFINITY` before any); a dose recorded *at* the floor is live. Generic over
-/// the segment's time type (#2786).
+/// "Reached" is **within [`EVENT_MATCH_TOL`]**, the tolerance the walkers already fire a
+/// dose at a break with. It cannot be exact: breaks are deduplicated at `1e-15` keeping
+/// the *lower* value, so a segment can start 1 ulp below the record it belongs to (an
+/// infusion ending at `0.1 + 0.7 = 0.7999999999999999` merges with an `SS=1` record at
+/// `0.8`). The walker still equilibrates the record's state there, and an exact
+/// comparison read the record as not reached for the whole segment — train off, earlier
+/// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] and its
+/// indexed twin [`Self::at_segment_indexed`] are the only constructors, and both add the
+/// tolerance in one place (`with_cutoff`), so no caller can apply the gate without it.
+///
+/// It also carries the **EVID=3/4 reset** (#1587), keyed the same way: on the dose
+/// *record*, never its lagged arrival. NONMEM cancels a dose whose record precedes a reset
+/// even when `record + ALAG` lands after it (measured, `nonmem_anchor/evid_reset_lag`), so
+/// a dose is dead once the most recent EVID=3/4 reset reached by the segment is later than
+/// its record. The caller passes that reset as `reset_floor` — the floor every walker
+/// already tracks, `NEG_INFINITY` before the first reset — because only the walker knows
+/// which resets it has visited. A dose recorded *at* the floor is live: an EVID=4 row's
+/// own dose, and a dose row after a co-timed EVID=3 row (the reader shifts a reset that
+/// lands at or before an earlier dose past it, `RESET_SEGMENT_GAP`, so a dose row
+/// *before* a co-timed reset reaches the engines with `record < reset`).
+///
+/// Generic over the segment's time type (#2786): `f64` on every walk but a recording
+/// type's, whose segment times can move with the inputs — its decisions then go through
+/// the branch API, the same comparisons on the same values.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResetGate<G = f64> {
     cutoff: Option<usize>,

@@ -912,8 +912,10 @@ fn grid_point(k: f64, s: f64) -> f64 {
     }
 }
 
-/// The dose grid of one subject (#944): the step and the grid-aligned bounds, clamped
-/// inside the written `[lo, hi]` (`3 · 0.1` exceeds a high of `0.3` by an ulp).
+/// The dose grid of one subject (#944): the step and the grid-aligned bounds
+/// `[ceil(lo/s)·s, floor(hi/s)·s]`, each kept inside the written `[lo, hi]` — `k · s`
+/// can miss a bound on the grid by an ulp (`3 · 0.1` is `0.30000000000000004`, above a
+/// high of `0.3`), so the clamp is what keeps a dose inside `dose_bounds`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct DoseGrid {
     pub step: f64,
@@ -1884,8 +1886,13 @@ mod tests {
         assert_eq!(round_to_grid(0.0, 250.0).to_bits(), 0.0f64.to_bits());
     }
 
-    /// A step dividing 1 gives the decimal multiple (`0.7`, `0.3`, multiples of 0.25); an
-    /// integer step is `k * s` bit for bit (#2805).
+    /// A step that divides 1 gives the decimal multiple, not `k * s`: `7 * 0.1` is
+    /// `0.7000000000000001`, but the grid dose for 0.7 at `s = 0.1` is `0.7` exactly, as
+    /// are `0.3` (`3 * 0.1 = 0.30000000000000004`) and the multiples of 0.25. An integer
+    /// step is `k * s` bit for bit, so integer grids (and D2) are unchanged (#2805 review
+    /// r1 row 7).
+    ///
+    /// Mutation: `grid_point` back to `k * s` (the decimal cases print ulp noise).
     #[test]
     fn a_step_dividing_one_gives_the_decimal_multiple() {
         assert_eq!(7.0 * 0.1, 0.7000000000000001, "premise: k * s is noisy");
@@ -1907,8 +1914,15 @@ mod tests {
         }
     }
 
-    /// Snapped bounds: `0.3 / 0.1` floors to 3 (high 0.3 kept), `2.1 / 0.3` ceils to 7,
-    /// and `[0.3, 0.3]` holds exactly one multiple.
+    /// `hi = 0.3, s = 0.1, x = 0.3 → 0.3`: `0.3 / 0.1` is `2.9999999999999996`, which a
+    /// bare `floor` takes to 2 (an aligned high of 0.2). The snap takes it to 3, and the
+    /// clamp keeps `3 · 0.1 = 0.30000000000000004` at the written 0.3. On the low side
+    /// `2.1 / 0.3` is `7.000000000000001`, which a bare `ceil` takes to 8; the snap
+    /// keeps it at 7. `[0.3, 0.3]` holds exactly one multiple, which a bare `floor`
+    /// would lose (V7 on a valid block).
+    ///
+    /// Mutations: a bare `floor` for the high bound; a bare `ceil` for the low bound; the
+    /// aligned bound not kept inside the written bounds.
     #[test]
     fn dose_grid_snaps_a_decimal_bound_onto_the_grid() {
         let g = DoseGrid::new(0.1, (0.0, 0.3)).expect("0, 0.1, 0.2 and 0.3 lie inside");
@@ -2079,10 +2093,22 @@ mod tests {
         assert_eq!(absorbed(&no_grid), None);
     }
 
-    /// The lowest raised multiple by hand at `s = 250` (25% → 500, 10% → 1250, 50% → 250,
-    /// 49% → 500) and on `0.1`; small percentages at `s = 1` (#2890): 16667 for 0.003%,
-    /// 49996 for 0.001%, 45454546 for 1e-6%, and `1e-310%` returns. Each is checked
-    /// against the engine.
+    /// The lowest multiple an increase raises, by hand: at `s = 250`, 25% needs
+    /// `d >= 500`, 10% needs `d >= 1250`, 50% raises 250 itself (375 is a tie) and 49%
+    /// does not (372.5), so it starts at 500. On a decimal grid, `0.1` under 25%: 0.1
+    /// gives 0.125 (back to 0.1), 0.2 gives 0.25, a tie, up to 0.3.
+    ///
+    /// Small percentages (#2890 review r1 rows 1 and 2): the tie nudge is relative, so
+    /// the engine raises a dose below `50 * s / p`. At `s = 1` the reviewer's bisection
+    /// gave 16667 for 0.003%, 49996 for 0.001% (not 50000) and 45454546 for 1e-6% (not
+    /// 50000000). `1e-310%` must return: `50 / p` is infinite there.
+    ///
+    /// Each value is also checked against the engine: it is raised and the multiple
+    /// below it is not.
+    ///
+    /// Mutations: returning `50 * s / p` unrounded gives 510.2 for 49%; ties down gives
+    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000 for 0.001% and
+    /// does not return for 1e-310%.
     #[test]
     fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
         let open = |s: f64| DoseGrid {

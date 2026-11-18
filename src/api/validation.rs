@@ -1652,17 +1652,24 @@ impl CmtConsumer {
 
 /// Whether a `[data_selection]` clause compares the `CMT` column (#1409).
 ///
-/// The filter is fed the *defaulted* `CMT` (`resolve_row_cmt`), so a clause naming it
-/// decides which rows are scored on a compartment the reader invented. Measured on
-/// `pk one_cpt_iv` with `[data_selection] ignore = CMT == 2`, one observation cell
-/// spelled `2` against `x`: 3 records scored at −5.7650 against 4 at −5.2516, with
-/// `ferx check` reporting `ok — 0 warning(s)` both ways (the numbers of
-/// `tests/cmt_data_selection_scope.rs`).
+/// `resolve_row_cmt`'s own doc says it is shared by "the dose row, the observation
+/// row **and the `[data]` selection filter's `RowContext`**" — the filter is fed the
+/// *defaulted* value, so a clause naming `CMT` decides which rows are scored on a
+/// compartment the reader invented. Measured on `pk one_cpt_iv` with
+/// `[data_selection] ignore = CMT == 2`, one observation cell spelled `2` against
+/// `x` and nothing else changed: 3 records scored at −5.7650 against 4 at −5.2516,
+/// with `ferx check` reporting `ok — 0 warning(s)` both ways. The row the filter was
+/// told to drop is silently kept and scored. (Those are the realised numbers of
+/// `tests/cmt_data_selection_scope.rs`, printed by it on every run. #1409's own
+/// reprex reports −4.6162 / −6.9517 — the same defect on its own dataset, not this
+/// fixture; quoting those here described a measurement nothing in the tree makes.)
 ///
-/// Asked of the compiled clauses, not the raw strings, so it tracks what the filter
-/// parses (case-folding, `&&`-joined sub-expressions, the `IGNORE=C` shorthand). A
-/// clause that does not parse answers **true**: the read fails on it anyway, so an
-/// extra warning masks nothing.
+/// Asked of the compiled clauses rather than of the raw strings, so the answer
+/// tracks what the filter actually parses (`CMT`/`cmt` case-folding, `&&`-joined
+/// sub-expressions, the bare-identifier `IGNORE=C` shorthand) instead of a second
+/// spelling of it here. A clause that does not parse answers **true**: the read is
+/// about to fail on it anyway, so an extra warning can mask nothing, while `false`
+/// would silently narrow the predicate on an expression nobody has inspected.
 fn data_selection_reads_cmt(options: &FitOptions) -> bool {
     match crate::io::datareader::SelectionFilter::from_opts(
         &options.ignore_exprs,

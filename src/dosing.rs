@@ -954,14 +954,23 @@ pub(crate) fn ss_overlap_split_g<G: crate::sens::num::PkNum>(t_inf: G, ii: f64) 
 /// periodic state is installed — at the record for a seeded dose (`lag > 0`), else at the
 /// arrival — as `(first, n)`: they stop at `dose.time + first − j·II`, `j = 0 … n − 1`.
 ///
-/// The installed state is at phase `ψ` (`ss_seed_phase` when seeded, else `II`), so pulse `j`
-/// still infuses while `ψ + j·II < T_inf` and a walk must carry its `+rate` after the record.
-/// Seeded, this includes the previous cycle crossing the record when `lag > II − T_inf`
-/// (#1121, `nonmem_anchor/results/ss_lag_infusion.tab`). `t_inf` is the `F`-reshaped window
-/// (#419).
+/// The state installed is the cycle's phase `ψ` (`ss_seed_phase` when seeded, `II` — the
+/// trough before the dose's own pulse — otherwise), so pulse `j` arrived `ψ + j·II` before the
+/// record and still infuses while `ψ + j·II < T_inf`. A walk must carry `+rate` for each of them
+/// after the record: the installed state has them mid-flight. Unseeded, that is the overlapping
+/// case alone (`T_inf > II`); seeded, it is also the previous cycle crossing the record whenever
+/// `lag > II − T_inf` (#1121, confirmed against NONMEM 7.6.0 in
+/// `nonmem_anchor/results/ss_lag_infusion.tab`: `II = 12`, `T_inf = 6`, `ALAG1 = 8` rises from
+/// `6.5468` at the record to `6.8754` at `t = 0.5` and turns over at `t = 2 = 8 − 12 + 6`).
+/// `t_inf` is the dose's `F`-reshaped window (#419), the one its own window uses.
 ///
-/// `lag ≥ II` with an infusion deliberately differs from NONMEM, which delivers
-/// `T_inf + (lag − II)` hours (800 mg for a 600 mg dose); ferx stays mass-balanced, see
+/// # `lag ≥ II` with an infusion is ferx's answer, not NONMEM's
+///
+/// Under the [`ss_seed_phase`] clamp the phase is 0: the previous cycle's infusion starts on
+/// the record, which is what the clamped phase means and is mass-balanced. NONMEM instead
+/// delivers `T_inf + (lag − II)` hours of drug for that geometry (measured: an `AMT = 600`,
+/// `RATE = 100`, `II = 12`, `ALAG1 = 14` dose infuses over `[0, 8]`, i.e. 800 mg), which is
+/// not a physical reading of a 600 mg dose. ferx does not reproduce it; see
 /// `docs/model-file/lagtime.qmd`.
 pub(crate) fn ss_residual_infusions_g<G: crate::sens::num::PkNum>(
     dose: &DoseEvent,

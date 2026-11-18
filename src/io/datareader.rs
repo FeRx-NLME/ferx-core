@@ -1571,19 +1571,37 @@ enum CmtCell {
     Unparseable,
 }
 
-/// Parse a `CMT` cell: an integer or a float-formatted integer (`"2.0"`, as
-/// [`parse_l2_id`]). A negative, fractional or out-of-range value is `Unparseable`
-/// rather than rounded, so the caller defaults it *and reports it* (#1009). A whole
-/// negative number on a record that uses it is an on/off row or `E_NEGATIVE_CMT`
-/// ([`negative_cmt`], #2732).
+/// Parse a `CMT` cell. Accepts an integer literal or a *float-formatted integer*
+/// (`"2.0"`), for the same reason [`parse_l2_id`] does (#830): the three `CMT`
+/// sites used a bare `parse::<usize>()` that fell through to compartment 1 —
+/// silently dosing the wrong compartment rather than failing (#1009).
 ///
-/// Two measured range traps, closed by the guard below:
-/// - **`-0`**: `(0.0..=usize::MAX as f64).contains(&-0.0)` is true and casts to 0;
-///   `is_sign_negative()` rejects it like `-1`.
-/// - **2^64**: `usize::MAX as f64` rounds up to 2^64, so an inclusive range admits
-///   one past the end; the strict `<` rejects it. As a side effect
-///   `"18446744073709551615.0"` is `Unparseable` while the integer literal is a
-///   `Value` — left as is, both are far beyond any declared compartment.
+/// A negative, fractional or out-of-range value is `Unparseable` rather than
+/// rounded: the caller defaults it *and reports it*, so a mistyped compartment is
+/// loud instead of wrong.
+///
+/// A whole negative number does not get that far on a record that uses it: it is an
+/// on/off row or `E_NEGATIVE_CMT` ([`negative_cmt`], #2732).
+///
+/// Two range traps, both measured, both closed by the guard below rather than by a
+/// `contains` range:
+///
+/// - **`-0`.** `(0.0..=usize::MAX as f64).contains(&-0.0)` is `true`, because IEEE
+///   says `-0.0 == 0.0`, and `(-0.0f64) as usize` is `0`. So `-0` used to read as
+///   compartment 0 — the *default dose compartment*, silently accepted — while
+///   `-1` in the same column was reported. `is_sign_negative()` rejects both alike.
+/// - **2^64.** `usize::MAX as f64` rounds *up* to 18446744073709551616.0, so an
+///   inclusive range against it admits a value one past the end, which `as usize`
+///   then saturates to `usize::MAX`. The strict `<` rejects it. (`f as u64 as f64
+///   == f` does **not** close this: the saturated `u64::MAX` rounds back to 2^64
+///   and compares equal.)
+///
+/// That rounding makes the strict `<` reject `usize::MAX` written in float form too
+/// — `"18446744073709551615"` is `Value`, `"18446744073709551615.0"` is
+/// `Unparseable` — since the literal rounds to the same 2^64. Measured, and left
+/// as it is: the two spellings disagree only for a compartment index 1.8e19 past
+/// anything a model can declare, and both ends of the disagreement are reported
+/// rather than silently defaulted.
 fn parse_cmt_cell(s: &str) -> CmtCell {
     let t = s.trim();
     if is_missing_cell(t) {
@@ -2428,9 +2446,13 @@ fn parse_subject(
                 }
             }
         }
-        // No finite value in an existing column: record `NaN`, not an absent key —
-        // an absent key reads as `0.0` everywhere, indistinguishable from a real
-        // zero. `NaN` is what `present(COV)` reads and it propagates loudly.
+        // The column exists but this subject has no finite value in it. Record
+        // that as `NaN` rather than leaving the key absent: an absent key
+        // resolves to the covariate map's `0.0` default at every evaluation
+        // site, so the gap would be indistinguishable from a genuine zero and
+        // e.g. `(WT/70)^0.75` would silently contribute `0` for that subject
+        // (division underflows here, it does not blow up). `NaN` is what
+        // `present(COV)` reads, and it propagates loudly everywhere else.
         if !found {
             covariates.insert(name.clone(), f64::NAN);
         }

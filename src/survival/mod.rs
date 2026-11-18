@@ -587,9 +587,17 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
 ) -> T {
     let mut nll = T::from_f64(0.0);
 
-    // A drug-driven `[odes]` hazard has no `h ≥ 0` constraint, so an increment can go
-    // negative (`S > 1`). Only a step past the `MonoTol` round-off band is a violation;
-    // it folds into the 1e20 sentinel (#618: a fixed `1e-3·|H|` floor was 10× too loose).
+    // A cumulative hazard is non-decreasing: `H(b) ≥ H(a)` for `b ≥ a`. A drug-driven
+    // `[odes]` hazard is a free user expression with no `h ≥ 0` constraint, so a
+    // sign-flipped / non-monotone hazard can make an increment negative — `S = exp(−ΔH)
+    // > 1`, ill-posed. Treat an increment as a genuine violation only past the solver's
+    // own round-off band `abstol + reltol·|H|` (see `MonoTol`), so a near-zero hazard's
+    // quadrature noise on a flat `H` is tolerated while a larger negative step is not.
+    // The simulation path hard-errors on the same non-monotone CHZ; here, with an
+    // optimizer to steer, it folds into the shared 1e20 sentinel.
+    // #618: the previous fixed `1e-3·|H|` term was 10× looser than the default `reltol`
+    // and ignored a user-tightened `ode_reltol`, so a genuine negative step up to ~0.1%·H
+    // slipped past as round-off; tying the floor to `tol` closes that gap.
     let monotone_violation = |hi: T, lo: T| cumhaz_monotone_violation_g(hi, lo, tol);
 
     for (index, record) in records.iter().enumerate() {
@@ -4221,11 +4229,21 @@ mod ode_hazard_exact_tests {
         assert!(worst_g < 1e-6, "gradient {worst_g:.2e}");
     }
 
-    /// #1575's fixture (`tests/one_snapshot_dose_reads_survival.rs`) on the exact route:
-    /// a `TIME`-reading `$PK` whose t=0 snapshot differs from every dose record, transit
-    /// kernel and lag read per dose, a `TAD`-reading hazard, doses at 1 and 13, plus an
-    /// `SS=1` twin. The walk's `(H, h)` matches production's dense solve; the exact
-    /// η-gradient and θ-score match Richardson differences of the production objective.
+    /// #1575's fixture (`tests/one_snapshot_dose_reads_survival.rs`) on the exact route: a
+    /// `TIME`-reading `$PK` whose `TIME = 0` disposition snapshot differs from every dose
+    /// record (`MTT = −9`, `ALAG1 = 10.5` there, `1` and `0.5` at the records), a transit
+    /// kernel and a compartment lag read per dose, a `TAD`-reading hazard, doses at 1 and 13
+    /// (the second on residual drug), η on `CL`, the lag and the kernel, and a `CL` the
+    /// disposition reads at `TIME = 0` (1.5×) but no dose record does; and a steady-state
+    /// twin (`SS=1`, the plain drug-driven hazard). Both take the event-driven dual walk with
+    /// every segment on the disposition (`ode_states_at_g`), which the static walk declined.
+    ///
+    /// Value: the walk's `(H, h)` against production's dense single-pass solve
+    /// (`ode_cumhaz_hazard`, a different engine) — dies if a dose quantity is read at the
+    /// disposition (the kernel then delivers nothing, the lag moves every arrival), if a
+    /// segment is integrated on a dose record's snapshot instead of the disposition (its `CL`),
+    /// or if the `TAD` anchor drops the lag. Gradients: the exact η-gradient and θ-score
+    /// against Richardson differences of the production objective.
     #[test]
     fn a_time_reading_pk_with_an_ode_hazard_is_exact() {
         const MODEL: &str = r"

@@ -21,34 +21,128 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
     crate::parser::model_parser::compiled_model_uses_time_builtin(model)
 }
 
-/// Does this model depend on model time *anywhere*: the individual-parameter program (as
-/// [`model_uses_time_builtin`] alone reports) **or** the `[odes]` right-hand side itself?
+/// Does this model depend on model time *anywhere* — the individual-parameter
+/// program (as [`model_uses_time_builtin`] alone reports) **or** the `[odes]`
+/// right-hand side itself?
 ///
-/// A non-autonomous RHS (`TAD`/`TAFD`/`T`/`TIME`) cannot go through the closed form (its
-/// two-time probe pins `tad = 0`, so a `TAD` term was dropped: 8× wrong at 12 h, #1124) and
-/// is routed to the event-driven predictor, which places doses at `d.time + lag` (validated
-/// by `nonmem_anchor/tad_lag_{A,B}`; dense path: #1110/#1073).
+/// The routing guards that pick between the event-driven predictor, the
+/// modified-release closed form, and the plain dense integration used to ask
+/// only the first question. An `[odes]` RHS reading `TAD`/`TAFD`/`T`/`TIME` is
+/// just as non-autonomous, and neither of the two static paths can represent it:
 ///
-/// Measured dense vs event-driven worst relative difference for models moved off the dense
-/// path: bare `TAFD` RHS `6e-13`; `init(central)` + `TAFD` `4.8e-11`; `TAD` under lagtime
-/// `5.8e-12` (`lag = 3.0`: `5.3e-12`). Not comparable: an SS dose whose RHS reads an absolute clock (`T`/`TIME` 67% off,
-/// `TAFD` `NaN`; #1139). `TAD` under `SS=1` reproduces its explicit train to 3.8e-13 and
-/// NONMEM to 7.4e-9. Pinned by `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions` and
-/// `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
+///   - the **closed form** identifies the disposition by probing the RHS at two
+///     times with `tad` pinned to `0.0`, so a `TAD` term is invisible to it and
+///     was silently dropped from the predictions — 8× wrong at 12 h (#1124);
+///   - the **dense** predictor started its first segment at the dose *record*
+///     rather than the arrival, so under a lagtime its `TAD` anchor had no
+///     qualifying dose and it returned `NaN` for every observation (#1110).
+///     #1073 has since given it a pre-arrival anchor, so that path is finite
+///     too; the reroute stands on the closed-form defect above, and on keeping
+///     one engine answering a non-autonomous RHS rather than two.
 ///
-/// Deliberately whole-class (not narrowed to `!spec.input_rate.is_empty()`) so one engine
-/// answers a non-autonomous RHS for value, gradient and `[derived]`. Cost (`ci-fast`, 2-state,
-/// 2 doses, `reltol = 1e-8`, event-driven/dense): 8 obs 1.04×, 16 obs 1.15×, 32 obs 1.38×
-/// (the event-driven walk restarts the step history per record).
+/// Routing these models to the event-driven predictor — which places doses on
+/// its timeline at `d.time + lag`, so `TAD` anchors correctly — is what both
+/// defects have in common, and it is the path the NONMEM `TAD`-in-`$DES` anchors
+/// (`nonmem_anchor/tad_lag_{A,B}`) already validate.
 ///
-/// The `[odes]` half asks the narrow [`OdeRhsProgram::pk_reads_model_time`], which excludes
-/// the injected joint-PK-TTE `__chz_<cmt>` hazard lines (#1166): a time-reading baseline
-/// hazard must not decline #570's shared solve (measured 1.82×). The SS gradient gates ask
-/// `pk_reads_absolute_time()` (#2093), safe because a joint PK-TTE subject with an SS dose is
-/// declined first (#1210). The Form C `readout_program` is not folded in (both engines
-/// evaluate it under a `ModelTimeGuard`). A joint model is kept out of the closed form by
-/// `identify_disposition` (triangular disposition), not by this predicate; pinned by
-/// `pk::modified_release::tests::a_joint_pk_tte_model_never_reaches_the_closed_form` (#1209).
+/// **What the reroute is measured to preserve.** The predicate also moves models
+/// the closed form declined for reasons of its own — `init(...)`, a
+/// `dose_attr_map`, steady-state or infusion doses — off the *dense* path, which
+/// they were on before. Measured, dense vs event-driven, worst relative
+/// difference over the observations:
+///
+/// | model | measured |
+/// |---|---|
+/// | bare `TAFD` RHS, no lagtime, plain bolus | `6e-13` |
+/// | `init(central) = BASE` + `TAFD` RHS | `4.8e-11` |
+/// | `TAD` RHS **under a lagtime**, obs post-arrival | `5.8e-12` |
+/// | …same, `lag = 3.0` (a larger anchor shift) | `5.3e-12` |
+///
+/// The lagtime rows are only measurable since #1073: before it the dense path
+/// returned `NaN` for every observation on such a model — that being #1110, the
+/// defect this reroute exists to route around — so there was nothing to compare
+/// against. #1073 gave the dense predictor the same pre-arrival anchor, and the
+/// two engines now agree.
+///
+/// One case where the two are still **not** comparable, so no agreement is
+/// claimed for it: **a steady-state dose** whose RHS reads an *absolute* clock.
+/// `T`/`TIME` under `SS=1` sits 67% from its own explicit dose train — an absolute
+/// clock has no periodic limit for the run-in to converge to — and `TAFD` reads
+/// `NaN`; both are #1139's remaining half. `TAD` under `SS=1` *is* comparable
+/// since #1139: it reproduces its own explicit train to 3.8e-13 and NONMEM to
+/// 7.4e-9. Rerouting neither caused nor cured any of this.
+///
+/// Regression tests: `rerouting_a_bare_tafd_rhs_does_not_move_the_predictions`
+/// and `rerouting_an_init_seeded_rhs_does_not_move_the_predictions`.
+///
+/// **What the reroute costs, and why it is still whole-class.** The predicate is
+/// deliberately not narrowed to the MR-eligible shape (`!spec.input_rate.
+/// is_empty()`), even though that is the only shape #1124 itself could reach — a
+/// model with no built-in forcing was declined by `mr_scope` anyway and was
+/// already on the *dense* path. Measured, `ci-fast`, 2-state `[odes]`, two doses
+/// over 24 h at `reltol = 1e-8`, dense vs event-driven:
+///
+/// | observations | ratio |
+/// |---|---|
+/// | 8  | 1.04× |
+/// | 16 | 1.15× |
+/// | 32 | 1.38× |
+///
+/// It grows with observation density because the dense driver breaks only at
+/// dose/reset boundaries and reads observations through `saveat`, while the
+/// event-driven walk calls `solve_ode` once per record and each call restarts the
+/// step-size history. (For the MR-shaped cell the fix is actually about, the cost
+/// is far larger and unavoidable — ~40×, closed form to integration.)
+///
+/// That is paid to keep **one** engine answering a non-autonomous RHS. Both
+/// engines are correct here since #1073, but they are correct *differently*: they
+/// break the timeline at different points, so value, gradient, and the `[derived]`
+/// grid would agree only to solver tolerance and would drift apart under a
+/// lagtime. Splitting the class by `input_rate` re-creates exactly the
+/// value-vs-gradient and value-vs-`[derived]` engine splits that the gates in
+/// `stats/likelihood.rs`, `api/output_columns.rs` and `sens/ode_provider.rs` each
+/// had to be widened to close. Revisit with a measurement on a dense-sampling
+/// design if the ratio starts to matter; the predicate itself is not a hot-loop
+/// cost (both flags are resolved once in `build_ode_spec` at parse time, and this
+/// is `#[inline]` over three `bool` reads).
+/// **Which flag the `[odes]` half asks, and why it is the narrow one.** This
+/// predicate asks whether the *PK dynamics* are non-autonomous, so it asks
+/// [`OdeRhsProgram::pk_reads_model_time`] — the same walk with the injected
+/// joint-PK-TTE `d/dt(__chz_<cmt>)` hazard lines excluded (#1166). A standard
+/// joint model has a Weibull or Gompertz baseline hazard, which reads `TIME` by
+/// definition, while its PK block is time-invariant; asking the wide flag made
+/// every such model decline #570's shared solve (measured 1.82× on one objective
+/// evaluation) and leave the dense driver, for a property it does not have.
+///
+/// The steady-state gradient gates (`sens/ode_provider.rs`) ask the PK-only
+/// `pk_reads_absolute_time()` (#2093), which is safe only because a joint
+/// PK-TTE subject with an SS dose is declined before them (#1210): SS
+/// equilibration integrates the *augmented* system, `__chz` included, and a
+/// time-reading hazard line breaks that state's cycle recurrence just as a
+/// time-reading PK line would.
+///
+/// The Form C `readout_program` is deliberately **not** folded in either. Both
+/// engines evaluate the readout under a `ModelTimeGuard`, so a `TIME`-reading
+/// readout is already correct on the dense driver and folding it in would decline
+/// the shared solve for nothing. `pk/modified_release.rs` hand-pairs it for a
+/// closed-form-only reason (its linearity probe cannot see the readout's time
+/// term), which does not apply here.
+///
+/// **What keeps a joint model out of the closed form is `identify_disposition`,
+/// not this predicate.** `mr_scope` asks this predicate too, so before #1166 a
+/// time-dependent hazard declined the closed form here; now it does not, and the
+/// decline rests entirely on `identify_disposition`. That bails at
+/// `n_states > 2`, which covers every joint model with two or more PK states —
+/// but a *one*-state PK block plus the injected accumulator is exactly two and
+/// reaches the probe. Measured on such a model (one state, a built-in forcing, a
+/// Form C readout, and a hazard linear in the state so it clears the "no
+/// autonomous term" check): `identify_disposition` still returns `None`, because
+/// the accumulator makes the disposition triangular — the hazard row reads the
+/// state but nothing returns from it — and that is not a disposition the closed
+/// form recognises. So the exposure is closed, by a different gate than the one
+/// that used to close it. The invariant is pinned by
+/// `pk::modified_release::tests::a_joint_pk_tte_model_never_reaches_the_closed_form`
+/// rather than enforced; whether to enforce it is #1209.
 #[inline]
 pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
     model_uses_time_builtin(model)
@@ -1389,24 +1483,69 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
     occ
 }
 
-/// Occasion-aware per-event PK for the adaptive IOV path (#701): like
-/// [`compute_event_pk_params`] but each record uses the eta of the decision window active at
-/// its time ([`occasion_of`]), or `eta_baseline` (κ = 0) before the first decision.
-/// Covariate snapshots are per record as usual (#700).
+/// Occasion-aware per-event PK for the adaptive IOV path (#701).
 ///
-/// - **Doses** (#931): a base dose takes the occasion active at administration (baseline F
-///   before the first decision).
-/// - **pk-only (EVID=2)** rows take the decision window, not their `OCC`
-///   ([`predict_iov`] reads `OCC`, [`pk_only_row_occasion`], #1876), consistent with the
-///   driver's `governing_segment_occ_at`.
-/// - **Base dose at an occasion boundary** agrees with [`predict_iov`] (end-of-interval rule,
-///   #1073/#1148): 2e-16 relative on #2771's fixture.
-/// - **Controller dose / hold**: every decision is a driver record (#2895), so the run equals
-///   [`predict_iov`] with an `EVID=2` row per decision
-///   (`the_run_equals_predict_iov_on_the_realized_doses_plus_a_record_per_decision`).
-/// - **`ADDL`-implied dose** (#2371) takes its governing record's occasion, resolved at
-///   [`Subject::dose_occasion_time`] ([`crate::types::ImpliedDose`]); the dose's own time
-///   was 5.6 % off `predict_iov` on the regression fixture.
+/// Like [`compute_event_pk_params`] but each observation / pk-only record is
+/// evaluated with the eta of the **occasion (decision window)** active at its time
+/// ([`occasion_of`]): `eta_occ[g]` for the window `g` containing the record, or
+/// `eta_baseline` (BSV η with κ = 0) before the first decision. This is the IOV
+/// analogue of [`predict_iov`]'s per-event occasion-κ selection, with occasion =
+/// decision window instead of the OCC column. **Doses** are resolved the same way
+/// (#931): a pre-scheduled base dose (#702) carries the PK of the occasion (decision
+/// window) active at its administration time, so its bioavailability F resolves under
+/// that occasion's κ — symmetric with a controller-injected dose, whose F is fixed
+/// from the driver's per-decision LOCF snapshot at injection. A base dose administered
+/// **before the first decision** has no open window, so — like an observation before the
+/// first decision — it takes the baseline κ = 0 for its F; its disposition still flows
+/// through the per-segment occasion PK (the standard event-driven split of dose-time
+/// attributes from running clearance), so a loading dose given at t=0 with the first
+/// decision at t>0 is dosed at baseline F but decays under the first window's occasion.
+/// On the (common) dose-free
+/// base subject `subject.doses` is empty, so `dose` stays empty and the result is
+/// byte-identical to the pre-#931 path. It composes with #700's time-varying
+/// covariates: each record's *covariate* snapshot (`dose_cov` / `obs_cov` /
+/// `pk_only_cov`) is used alongside its occasion eta, so a model with both a TV
+/// covariate and IOV κ is per-event correct in both.
+///
+/// **pk-only (EVID=2) convention — the decision window, not the `OCC` column.** Here
+/// a pk-only record takes the κ of the decision window containing its time (like any
+/// obs record), because in the reactive setting that observation genuinely occurs
+/// *during* that occasion. The static [`predict_iov`] instead reads the row's own `OCC`
+/// label ([`pk_only_row_occasion`], #1876). The two are consistent *within* their own
+/// path (the adaptive driver's `governing_segment_occ_at` also uses [`occasion_of`], so
+/// materialiser and driver agree); a future oracle that validates an adaptive IOV run
+/// *with EVID=2 rows* against `predict_iov` agrees only where the row's `OCC` names the
+/// decision window containing it.
+///
+/// **Base dose at an occasion boundary — agreement with [`predict_iov`].** The driver
+/// assigns a *segment's* occasion from the record that ENDS it
+/// (`governing_segment_occ_at`, #1073), and a base dose row is a record (#1148). So the
+/// segment ending at a base dose takes that dose's occasion, as under `predict_iov`'s
+/// end-of-interval rule. Measured on #2771: base doses at 0 and 24, observations at 12,
+/// 36 and 60, decisions at 0, 24, 48 and 72 give `predict_iov`'s predictions to 2e-16
+/// relative. (This `dose` snapshot only fixes each dose's *F* at its administration
+/// occasion; the running disposition occasion is `governing_segment_occ_at`'s job.)
+///
+/// **A controller dose, and a hold.** Neither is a data record, but every decision is a
+/// record of the driver (#2895), and in [`predict_iov`] on the run's static equivalent an
+/// `EVID=2` row at each decision with no data row is too. The two then agree to the bit on
+/// every record layout, a held decision included
+/// (`the_run_equals_predict_iov_on_the_realized_doses_plus_a_record_per_decision`). Before
+/// #2895 they parted wherever a decision had no data record before the next one.
+///
+/// **An `ADDL`-implied dose takes its governing record's occasion — agreement with
+/// [`predict_iov`], not a third divergence** (#2371). Since #1909 an implied dose's
+/// covariates and `TIME` are its governing record's (the first record at or after it;
+/// [`crate::types::ImpliedDose`]), and so is its κ here: the occasion is resolved at
+/// [`Subject::dose_occasion_time`], the governing record's engine time, not at the dose's
+/// own. `predict_iov` takes that record's `OCC`, so the two agree. Resolving κ at the
+/// dose's own time instead gave one snapshot two occasions whenever a decision fell
+/// between the dose and its governing record — window `g`'s κ with window `g + 1`'s
+/// covariates — 5.6 % off `predict_iov` at the next observation on the regression
+/// fixture, and 4.7 % with the covariate held constant, since the κ alone moves the
+/// interval the implied dose ends. The parent-row alternative (covariates and `TIME` at
+/// the dose's own time, as before #1909) fails that oracle on the κ alone. A dose record
+/// is its own governing record, so nothing else moves.
 pub(crate) fn compute_event_pk_params_iov(
     model: &CompiledModel,
     subject: &Subject,
@@ -3237,23 +3376,29 @@ mod tests {
 
     // ── the doses-only materializer is the full one's `dose` vector (#1235) ──
 
-    /// `compute_dose_pk_params_into` must be **bit-identical** to `compute_event_pk_params(..).dose`:
-    /// it exists only to skip the observation snapshots a doses-only caller never reads. Both arms
-    /// of the gate are exercised and the subjects straddle it (**asserted**, so this cannot become
-    /// a one-arm test).
+    /// `compute_dose_pk_params_into` must be **bit-identical** to
+    /// `compute_event_pk_params(..).dose` — it exists only to skip the observation
+    /// snapshots a doses-only caller never reads, never to answer differently.
     ///
-    /// The two callers share `fill_dose_pk_params`, so a mutation inside the shared body moves both
-    /// sides together and bit-equality is blind to it (the tautological-twin shape). Measured:
+    /// Both arms of the gate are exercised, and the subjects below straddle it —
+    /// **asserted, not assumed**, so this cannot silently become a one-arm test.
+    ///
+    /// **What this can and cannot see, measured rather than assumed.** The two callers
+    /// share `fill_dose_pk_params`, so a mutation *inside the shared body* moves both
+    /// sides of the comparison together and a bit-equality test is blind to it by
+    /// construction — the tautological-twin shape. Running the three mutations:
     ///
     /// | mutation | this test | `tests/typical_value_snapshot_sets.rs` |
     /// |---|---|---|
-    /// | shared body reads `&subject.covariates` | **dies** (on the `assert_ne!`, not the bit compare) | arm A + both `D`/`R` arms |
-    /// | shared body reads `0.0` for the time | **survives** (a tautology on that axis) | arm B |
+    /// | shared body reads `&subject.covariates` | **dies** — on the `assert_ne!` below, not the bit compare | arm A + both `D`/`R` arms |
+    /// | shared body reads `0.0` for the time | **survives** — a true tautology on that axis | arm B |
     /// | the two callers diverge (doses-only always freezes) | **dies** | arms A, B + both `D`/`R` |
     ///
-    /// So the `assert_ne!` non-degeneracy check is the only reason row 1 is visible here, and the
-    /// time axis is covered by arm B. This is the Tier-1 statement of the contract at the code's own
-    /// site, where `cargo test --lib` reaches it.
+    /// So the `assert_ne!` non-degeneracy check is not decoration: it is the only reason
+    /// row 1 is visible here at all. And row 2 is the honest limit — the time axis is
+    /// covered by arm B, not by this test. This is not the sole guard against row 3
+    /// either; it is the Tier-1 statement of the contract at the code's own site, where
+    /// `cargo test --lib` reaches it.
     #[test]
     fn dose_only_snapshots_match_the_full_event_builder() {
         let src = r#"

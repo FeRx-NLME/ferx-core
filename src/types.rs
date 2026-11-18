@@ -10956,11 +10956,26 @@ pub enum Optimizer {
     TrustRegion,
 }
 
-/// The default [`FitOptions::saem_scale_deadband`]: no Robbins-Monro step while an
-/// iteration's acceptance is in 15%–60%. Measured (#1449) on IS −2 log L, seven benches ×
-/// 6 seeds: −8.75 summed vs −4.37 (`0.25,0.60`), −5.84 (`0.05,0.75`), −3.66
-/// (`0.30,0.55`); the only band better on vancomycin (`−0.13` vs `+0.98`, sd `0.94`).
-/// Band edges only matter where they separate attainable `n_accepted / n_proposals`.
+/// The default [`FitOptions::saem_scale_deadband`]: the Robbins-Monro step is
+/// skipped while an iteration's acceptance is between 15% and 60%.
+///
+/// Measured rather than picked (#1449): four candidate bands were compared on
+/// the importance-sampled −2 log L over seven benchmarks × 6 seeds. All four
+/// are tie-or-better than the shipped defaults everywhere; this one has the
+/// best total (−8.75 summed over the seven, against −4.37 for `0.25,0.60`,
+/// −5.84 for `0.05,0.75` and −3.66 for `0.30,0.55`) and it is the only one
+/// that is *better* rather than merely tie on vancomycin, the bench the
+/// unbanded rule loses (`+0.98` against a `0.94` cross-seed sd, versus `−0.13`
+/// here).
+///
+/// Two of those four candidates — `0.25,0.60` and `0.30,0.55` — produced
+/// **bit-identical** fits on all four benches whose kernel resolves to 6
+/// proposals and 2 componentwise sweeps, and differed only on the three that
+/// resolve to 9 or 7. That is the quantisation of a per-iteration rate showing
+/// through: at 6 proposals both bands contain `1/3` and `1/2` and exclude
+/// `1/6` and `2/3`, so they are the *same band*, while at 7 they part over
+/// `4/7 = 0.571`. A band's edges only matter where they separate two attainable
+/// `n_accepted / n_proposals`.
 pub(crate) const DEFAULT_SCALE_DEADBAND: (f64, f64) = (0.15, 0.60);
 
 /// How SAEM adapts its per-subject MH step scales `δ` (`scale_adaptation`). On
@@ -10968,8 +10983,14 @@ pub(crate) const DEFAULT_SCALE_DEADBAND: (f64, f64) = (0.15, 0.60);
 /// 40% target for 400 iterations (#1444).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScaleAdaptation {
-    /// Every `adapt_interval` iterations, `δ` ×1.1 above target, ×0.9 otherwise (opt-in since
-    /// #1449). At the default interval it moves at most `1.1^8 ≈ 2.1×` in 400 iterations.
+    /// The historical rule, opt-in since #1449 as `scale_adaptation =
+    /// interval`: every `adapt_interval` iterations, multiply `δ` by 1.1 if
+    /// the window's acceptance is above target and by 0.9 otherwise.
+    ///
+    /// Note its reach. Over a 400-iteration run at the default
+    /// `adapt_interval = 50` it fires **8** times, each by a fixed factor, so
+    /// `δ` can move by at most `1.1^8 ≈ 2.1×` up or `0.9^8 ≈ 0.43×` down no
+    /// matter how far from target the chain is.
     Interval,
     /// Robbins-Monro every iteration: `log δ += c·k^-0.6·(accept_k − target)` (diminishing
     /// adaptation, Roberts & Rosenthal 2007). Default since #1449, with the dead band of
@@ -11006,16 +11027,32 @@ pub enum SaemMstepSolver {
     /// this iteration's η draw; the maximiser is assigned (or blended under `mstep_damping`).
     #[default]
     Bobyqa,
-    /// Stochastic approximation on the score and expected information, one LM-damped Newton
-    /// step per M-step (Kuhn & Lavielle 2005; #1458). Both averages are linear in the
-    /// per-draw contribution, so there is no Jensen bias (an average of maximisers converges
-    /// to `E[θ*(η)]`, not the maximiser of `E[Q]`).
+    /// Stochastic approximation on the **score and expected information**, with
+    /// one Levenberg-Marquardt-damped Newton step per M-step on the averaged
+    /// quantities (Kuhn & Lavielle 2005; #1458).
     ///
-    /// Opt-in; restricted to the plain Gaussian residual scope (no IOV, mixture, M3, TTE,
-    /// `block_sigma`, `[covariate_nn]` θ or residual magnitude; FREM since #1421), else falls
-    /// back to [`SaemMstepSolver::Bobyqa`] with a warning. Not the default (#1449): on the
-    /// #1445 sparse combined-error fixture it scatters `σ_add` (0.85 / 0.38 / 2.66 over three
-    /// seeds vs truth 1.8; `bobyqa` 1.99 / 1.62 / 1.59).
+    /// Both averaged quantities are *linear* in the per-draw contribution, so
+    /// the recursion has no Jensen term — unlike an average of maximisers,
+    /// which converges to `E[θ*(η)]` rather than to the maximiser of
+    /// `E[Q(θ, η)]`. That bias is what makes a θ with no ETA (a covariate
+    /// effect, a structural parameter left without IIV) land away from its
+    /// optimum, and it grows when the E-step mixes better.
+    ///
+    /// Opt-in, and **restricted to the plain Gaussian residual scope** the
+    /// expected information has a closed form on: no IOV, no mixture, no M3, no
+    /// TTE endpoint, no `block_sigma` residual correlation, no `[covariate_nn]`
+    /// θ, no residual magnitude. FREM is in scope since #1421. A fit outside
+    /// that scope falls back to [`SaemMstepSolver::Bobyqa`] with a warning
+    /// naming the reason.
+    ///
+    /// It was a **candidate default** in #1449 and did not become one: it is
+    /// tie-or-better than `bobyqa` on the importance-sampled −2 log L of all
+    /// eight SAEM benchmarks at 25–54 % less CPU, but on the sparse
+    /// combined-error fixture of #1445 it scatters a weakly identified
+    /// *minority* `σ_add` that the objective barely sees — 0.85 / 0.38 / 2.66
+    /// over three seeds against a simulation truth of 1.8, where `bobyqa`
+    /// returns 1.99 / 1.62 / 1.59. See
+    /// `tests/saem_combined_error.rs::score_sa_does_not_bring_back_the_additive_sigma_collapse`.
     ScoreSa,
 }
 
