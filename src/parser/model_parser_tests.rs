@@ -40220,3 +40220,183 @@ fn a_named_endpoint_block_is_an_outside_reader_like_its_unnamed_spelling() {
         );
     }
 }
+
+/// Every registered block is decided as an outside reader or not (#3014 review): the
+/// exclusivity checks' scan is an allow-list, so a new block that reads θ or η and is left
+/// off it would make a shared group look exclusive. Mirrors
+/// `every_block_is_sorted_into_param_consumer_or_not`.
+#[test]
+fn every_block_is_sorted_into_outside_reader_or_not() {
+    use std::collections::BTreeSet;
+    let registry: BTreeSet<&str> = BLOCK_REGISTRY.iter().map(|(name, _, _)| *name).collect();
+    let yes: BTreeSet<&str> = OUTSIDE_READER_BLOCKS.iter().copied().collect();
+    let no: BTreeSet<&str> = NON_OUTSIDE_READER_BLOCKS.iter().copied().collect();
+    assert_eq!(yes.len(), OUTSIDE_READER_BLOCKS.len(), "duplicate reader");
+    assert_eq!(
+        no.len(),
+        NON_OUTSIDE_READER_BLOCKS.len(),
+        "duplicate non-reader"
+    );
+    assert!(
+        yes.is_disjoint(&no),
+        "{:?}",
+        yes.intersection(&no).collect::<Vec<_>>()
+    );
+    let sorted: BTreeSet<&str> = yes.union(&no).copied().collect();
+    assert_eq!(sorted, registry);
+    // Every parameter consumer turns a parameter into a prediction, so it reads too.
+    for b in PARAM_CONSUMER_BLOCKS {
+        assert!(
+            yes.contains(b),
+            "[{b}] consumes a parameter but is no reader"
+        );
+    }
+}
+
+/// The outside scan reads a reader block whether it is unnamed or named, and skips a block
+/// that only declares or reports a name, named or not (#3014 review). The blocks are built
+/// directly rather than parsed, so the test needs no feature: every named reader block
+/// (`[event_model NAME]`, `[markov_model NAME]`, …) is behind `survival` or `markov`, and
+/// `extract_blocks` refuses one without its feature.
+#[test]
+fn the_outside_scan_reads_reader_blocks_of_either_spelling_and_nothing_else() {
+    let lines = |s: &[&str]| s.iter().map(|l| l.to_string()).collect::<Vec<String>>();
+    let mut extracted = ExtractedBlocks::default();
+    for (ty, body) in [
+        ("odes", lines(&["d/dt(central) = -IN_ODES * central"])),
+        ("event_model", lines(&["scale = IN_UNNAMED"])),
+        (
+            "covariate_model",
+            lines(&["CL ~ WT power(center = 70) => COV_THETA(0.6)"]),
+        ),
+        ("output", lines(&["REPORTED"])),
+        ("simulation", lines(&["covariate SIM_COV = 70"])),
+    ] {
+        extracted.unnamed.insert(ty.to_string(), body);
+    }
+    for (ty, inst, body) in [
+        (
+            "event_model",
+            "death",
+            lines(&["scale = IN_NAMED * exp(ETA_HAZ)"]),
+        ),
+        ("markov_model", "sleep", lines(&["rate = IN_MARKOV"])),
+        (
+            "covariate_nn",
+            "TYPICAL_PK",
+            lines(&["inputs = [NN_IN]", "outputs = [NN_OUT]"]),
+        ),
+    ] {
+        extracted
+            .named
+            .entry(ty.to_string())
+            .or_default()
+            .insert(inst.to_string(), body);
+    }
+    let seen = identifiers_of_blocks(&extracted, OUTSIDE_READER_BLOCKS);
+    for read in ["IN_ODES", "IN_UNNAMED", "IN_NAMED", "ETA_HAZ", "IN_MARKOV"] {
+        assert!(seen.contains(read), "{read} is read: {seen:?}");
+    }
+    for declared in ["NN_IN", "NN_OUT", "COV_THETA", "REPORTED", "SIM_COV"] {
+        assert!(
+            !seen.contains(declared),
+            "{declared} is only declared or reported: {seen:?}"
+        );
+    }
+}
+
+/// Tabling a group's typical value is no read of its θ (#3014 review): `[output]` reports a
+/// column and feeds no prediction, so `TVCL` listed there leaves the CL group exclusive, as the
+/// same model without the listing is. The straddle: the same name in `[derived]`, a reader
+/// block, is a read.
+#[test]
+fn a_reported_typical_value_is_no_outside_read() {
+    let model = |extra: &str| {
+        format!(
+            "[parameters]\n  theta THETA_CL(5.0, 0.1, 100.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVV(50.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  TVCL = THETA_CL * (WT / 70)^THETA_WT\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{extra}"
+        )
+    };
+    let shared = |extra: &str| {
+        parse_full_model(&model(extra))
+            .unwrap_or_else(|e| panic!("model must parse ({extra}): {e}"))
+            .model
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .expect("the CL group is recorded")
+            .shared_thetas
+            .clone()
+    };
+    assert!(shared("").is_empty(), "control: the group is exclusive");
+    assert!(
+        shared("[output]\n  TVCL CL\n").is_empty(),
+        "a reported typical value is no read"
+    );
+    assert_eq!(
+        shared("[derived]\n  TV_REPORT = TVCL * 1\n"),
+        ["THETA_CL", "THETA_WT"],
+        "a [derived] readout of it is"
+    );
+}
+
+/// The η side of the exclusivity check reads the other blocks too (#3014 review): a `[derived]`
+/// readout of a group's η, or of an additive mu-ref's η, is a second use of that η, so SAEM's
+/// joint M-step (which re-centres it by Δ_i) must not take the group, and the additive anchor
+/// is dropped. The control without the readout keeps both.
+#[test]
+fn an_eta_read_by_another_block_is_a_second_use() {
+    let model = |extra: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVV(50.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)\n  V = TVV + ETA_V\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{extra}"
+        )
+    };
+    let seen = |extra: &str| {
+        let m = parse_full_model(&model(extra))
+            .unwrap_or_else(|e| panic!("model must parse ({extra}): {e}"))
+            .model;
+        let cl = m
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .expect("the CL group is recorded")
+            .eta_shared;
+        (cl, m.mu_refs.contains_key("ETA_V"))
+    };
+    assert_eq!(
+        seen(""),
+        (false, true),
+        "control: both η are exclusive to their line"
+    );
+    assert_eq!(
+        seen("[derived]\n  SHRINK_CL = ETA_CL * 2\n  SHRINK_V = ETA_V * 2\n"),
+        (true, false),
+        "a [derived] read of each η is a second use"
+    );
+}
+
+/// The same η read through a hazard, unnamed and named: the named spelling is the one the
+/// unnamed-only scan missed (#3014 review).
+#[cfg(feature = "survival")]
+#[test]
+fn an_eta_read_by_a_named_hazard_is_a_second_use_like_its_unnamed_spelling() {
+    let model = |header: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 1.0, 500.0)\n  theta THETA_WT(0.75, 0.01, 5.0)\n  theta TVLAMBDA(0.05, 0.001, 10.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V ~ 0.1\n  sigma PROP ~ 0.1\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_WT * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n[covariates]\n  WT continuous\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n{header}\n  cmt    = 2\n  family = exponential\n  scale  = TVLAMBDA * exp(0.5 * ETA_CL)\n"
+        )
+    };
+    for header in ["[event_model]", "[event_model death]"] {
+        let m = parse_full_model(&model(header))
+            .unwrap_or_else(|e| panic!("{header}: model must parse: {e}"))
+            .model;
+        let cl = m
+            .covariate_mu_refs
+            .iter()
+            .find(|g| g.eta_name == "ETA_CL")
+            .unwrap_or_else(|| panic!("{header}: the CL group is recorded"));
+        assert!(cl.eta_shared, "{header}: the hazard reads ETA_CL: {cl:?}");
+        assert!(
+            cl.read_outside_groups.is_empty(),
+            "{header}: no θ of the group is read outside it: {cl:?}"
+        );
+    }
+}

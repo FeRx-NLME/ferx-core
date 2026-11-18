@@ -157,6 +157,17 @@ fn the_block_is_the_classical_model_it_desugars_to() {
 fn saem_takes_the_same_route_for_both_forms() {
     let hand = parse_full_model(&classical()).expect("classical model must parse");
     let block = parse_full_model(&declarative()).expect("block-declared model must parse");
+    // Non-degeneracy: the hand form must actually reach the joint M-step, or both arms taking
+    // the data-term route would agree just as well. Both relation lines are covariate groups
+    // and no group θ is read outside its own line.
+    let groups = &hand.model.covariate_mu_refs;
+    let mut etas: Vec<&str> = groups.iter().map(|g| g.eta_name.as_str()).collect();
+    etas.sort_unstable();
+    assert_eq!(etas, ["ETA_CL", "ETA_V1"], "both relations are groups");
+    assert!(
+        groups.iter().all(|g| g.shared_thetas.is_empty()),
+        "the hand form's relation θ are exclusive to their groups: {groups:?}"
+    );
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("covariate dataset must load");
     // Tier-2: a few SAEM iterations, never a convergence loop.
     let opts = FitOptions {
