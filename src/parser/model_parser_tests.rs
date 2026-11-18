@@ -40095,34 +40095,91 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
     assert_eq!(names(&m), ["TVCL", "TVV"], "an additive line");
 }
 
-/// A `[covariate_model]` relation folds exactly as the expression it desugars to (#2980): the
-/// block's text declares its θ, it does not read them, so a block-declared covariate θ must not
-/// count as an outside read. Each form against the other, and the hand form against its own
-/// expectation, so a fold lost on both sides cannot pass as agreement.
+/// A `[covariate_model]` relation is read by every exclusivity check exactly as the expression it
+/// desugars to (#2980, #3014): the block's text declares its θ, it does not read them. The mu
+/// fold, the plain and covariate mu-refs and the covariate groups' outside reads (SAEM's joint
+/// M-step) must agree between the two spellings, and the hand form must actually be exclusive,
+/// so a check lost on both sides cannot pass as agreement. The straddle: a `[derived]` readout
+/// naming a relation θ is a real outside read, and both spellings must still see it.
 #[test]
-fn a_block_declared_covariate_theta_folds_as_its_hand_written_relation() {
+fn a_covariate_model_block_is_read_through_its_statements_by_every_exclusivity_check() {
     let head = "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV1(50.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.1\n  omega ETA_V1 ~ 0.1\n  sigma PROP ~ 0.1\n";
     let tail = "[structural_model]\n  pk one_cpt_iv(cl=CL, v=V1)\n[error_model]\n  DV ~ proportional(PROP)\n";
-    let hand = format!("{head}  theta THETA_CL_WT(0.6, 0.01, 5.0)\n  theta THETA_CL_CRCL(0.3, 0.01, 5.0)\n  theta THETA_V1_WT(0.9, 0.01, 5.0)\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_CL_WT * (CRCL / 100)^THETA_CL_CRCL * exp(ETA_CL)\n  V1 = TVV1 * (WT / 70)^THETA_V1_WT * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n{tail}");
-    let block = format!("{head}[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n[covariate_model]\n  CL ~ WT   power(center = 70)  => THETA_CL_WT(0.6, 0.01, 5.0)\n  CL ~ CRCL power(center = 100) => THETA_CL_CRCL(0.3, 0.01, 5.0)\n  V1 ~ WT   power(center = 70)  => THETA_V1_WT(0.9, 0.01, 5.0)\n{tail}");
-    let fold = |t: &str| {
-        let m = parse_full_model(t).expect("model must parse").model;
-        let f = &m.indiv_param_partials.mu_fold;
-        (
-            m.theta_names.clone(),
-            f.lines.clone(),
-            f.thetas.clone(),
-            f.reach.clone(),
-        )
+    let hand = |extra: &str| {
+        format!("{head}  theta THETA_CL_WT(0.6, 0.01, 5.0)\n  theta THETA_CL_CRCL(0.3, 0.01, 5.0)\n  theta THETA_V1_WT(0.9, 0.01, 5.0)\n[individual_parameters]\n  CL = TVCL * (WT / 70)^THETA_CL_WT * (CRCL / 100)^THETA_CL_CRCL * exp(ETA_CL)\n  V1 = TVV1 * (WT / 70)^THETA_V1_WT * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n{tail}{extra}")
     };
-    let (h, b) = (fold(&hand), fold(&block));
+    let block = |extra: &str| {
+        format!("{head}[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n[covariates]\n  WT continuous\n  CRCL continuous\n[covariate_model]\n  CL ~ WT   power(center = 70)  => THETA_CL_WT(0.6, 0.01, 5.0)\n  CL ~ CRCL power(center = 100) => THETA_CL_CRCL(0.3, 0.01, 5.0)\n  V1 ~ WT   power(center = 70)  => THETA_V1_WT(0.9, 0.01, 5.0)\n{tail}{extra}")
+    };
+    #[derive(Debug, PartialEq)]
+    struct Seen {
+        thetas: Vec<String>,
+        mu_refs: Vec<(String, String)>,
+        groups: Vec<(String, Vec<String>, Vec<String>, Vec<String>)>,
+        fold: (
+            Vec<(usize, usize, crate::types::MuTransform)>,
+            Vec<usize>,
+            Vec<Vec<usize>>,
+        ),
+    }
+    let seen = |t: &str| {
+        let m = parse_full_model(t).expect("model must parse").model;
+        let mut mu_refs: Vec<(String, String)> = m
+            .mu_refs
+            .iter()
+            .map(|(e, r)| (e.clone(), r.theta_name.clone()))
+            .collect();
+        mu_refs.sort();
+        let groups = m
+            .covariate_mu_refs
+            .iter()
+            .map(|g| {
+                (
+                    g.eta_name.clone(),
+                    g.theta_names.clone(),
+                    g.shared_thetas.clone(),
+                    g.read_outside_groups.clone(),
+                )
+            })
+            .collect();
+        let f = &m.indiv_param_partials.mu_fold;
+        Seen {
+            thetas: m.theta_names.clone(),
+            mu_refs,
+            groups,
+            fold: (f.lines.clone(), f.thetas.clone(), f.reach.clone()),
+        }
+    };
+
+    let (h, b) = (seen(&hand("")), seen(&block("")));
     assert_eq!(
-        h.0, b.0,
-        "the two forms must name the same θ in the same order"
+        h.groups.len(),
+        2,
+        "both lines are covariate mu-ref groups: {h:?}"
     );
-    assert_eq!(h.2, vec![0, 1, 2, 3, 4], "the hand form folds every θ");
+    assert!(
+        h.groups.iter().all(|g| g.3.is_empty()),
+        "the hand form's relation θ are read by nothing outside the groups: {h:?}"
+    );
+    assert_eq!(h.fold.1, vec![0, 1, 2, 3, 4], "the hand form folds every θ");
+    assert_eq!(h, b, "the block form must be read exactly as the hand form");
+
+    // The straddle: a real outside reader of THETA_CL_WT.
+    let derived = "[derived]\n  WT_EFFECT = THETA_CL_WT * 2\n";
+    let (h, b) = (seen(&hand(derived)), seen(&block(derived)));
+    let cl = b
+        .groups
+        .iter()
+        .find(|g| g.0 == "ETA_CL")
+        .expect("the CL group is recorded");
     assert_eq!(
-        h, b,
-        "the block form must fold exactly what the hand form folds"
+        cl.3,
+        vec!["THETA_CL_WT"],
+        "a [derived] read is outside every group"
     );
+    assert!(
+        !b.fold.1.contains(&2),
+        "a θ read outside is not folded: {b:?}"
+    );
+    assert_eq!(h, b, "both spellings see the outside read alike");
 }

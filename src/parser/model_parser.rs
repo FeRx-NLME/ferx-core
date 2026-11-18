@@ -6106,10 +6106,18 @@ pub fn parse_full_model_with(
     // mu-refs' (#2544) and the covariate groups' (#619). `[parameters]` is
     // excluded because it is where the thetas are declared; the only theta a
     // model may name there is a FIXed one in a kappa weight, which no M-step
-    // moves.
+    // moves. `[covariate_model]` is excluded for the same reason (#3014): its
+    // text declares its relation thetas, and the relations themselves are read
+    // through the `[individual_parameters]` statements it desugars to (#1111),
+    // which every check below already walks. Scanning it made a block-declared
+    // covariate theta look shared where the same relation written by hand is
+    // exclusive, so the two spellings of one model took different engines.
     let mut outside_idents: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, lines) in blocks.iter() {
-        if key == "parameters" || key == "individual_parameters" {
+        if matches!(
+            key.as_str(),
+            "parameters" | "individual_parameters" | "covariate_model"
+        ) {
             continue;
         }
         collect_referenced_identifiers(lines, &mut outside_idents);
@@ -6152,25 +6160,12 @@ pub fn parse_full_model_with(
         eta_names_bsv.len(),
         &outside_idents,
     );
-    // The fold reads `[covariate_model]` through the statements it desugars to (#619, already in
-    // `indiv_stmts`): its text declares the relation θ rather than reading them, so counting it
-    // as an outside read would leave a block-declared covariate θ unfolded where the same
-    // relation written by hand folds (#2980).
-    let mut fold_outside: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (key, lines) in blocks.iter() {
-        if !matches!(
-            key.as_str(),
-            "parameters" | "individual_parameters" | "covariate_model"
-        ) {
-            collect_referenced_identifiers(lines, &mut fold_outside);
-        }
-    }
     let mu_fold = mu_fold_spec(
         &indiv_stmts,
         &theta_names,
         &all_eta_names,
         eta_names_bsv.len(),
-        &fold_outside,
+        &outside_idents,
         &mu_refs,
         &covariate_mu_refs,
         &indiv_var_names,
