@@ -2035,6 +2035,76 @@ fn a_structure_other_than_the_template_is_recorded_afresh() {
     close(du[0], want, "the afresh recording's value");
 }
 
+/// A family whose structure changes at every point (an event time that moves with η: a modeled
+/// infusion duration crossing the observations) keeps a bounded set of templates. Once
+/// `UNSTABLE_AFTER` of its replays have met another structure it records afresh and keeps
+/// none, so twenty structures leave `UNSTABLE_AFTER + 1` templates, not twenty — each one a
+/// recording kept for the rest of the fit — and every plan still computes its own structure.
+/// Mutation: drop the `misses >= UNSTABLE_AFTER` early return in `recorded` -> twenty
+/// templates are kept.
+#[test]
+fn a_family_whose_structure_keeps_changing_keeps_a_bounded_set_of_templates() {
+    let subject = crate::types::Subject::default();
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let family = SubjectKey::new(&m, &subject, 1, 2)
+        .with_variant(Desc::of_value(&0x7e_4412u64))
+        .family();
+    let owner = Some((family.scope, family.model));
+    let kept = || {
+        templates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .filter(|t| t.owner == owner)
+            .count()
+    };
+    let chain = |n: usize| {
+        move || {
+            let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
+            let mut x = et[0];
+            for _ in 0..n {
+                x = x * et[1] + et[0];
+            }
+            Some(vec![x.reg()])
+        }
+    };
+    let (e0, e1) = (0.3, 0.2);
+    let l = l2().lanes();
+    let mut u = vec![0.0; 2 * l];
+    for (k, e) in [e0, e1].into_iter().enumerate() {
+        u[k * l] = e;
+        u[k * l + 1 + k] = 1.0;
+    }
+    for n in 1..=20 {
+        let plan = recorded(&family, chain(n))
+            .expect("records")
+            .plan(l2(), 2, 0)
+            .expect("plans");
+        let mut want = e0;
+        for _ in 0..n {
+            want = want * e1 + e0;
+        }
+        let mut du = vec![0.0; 2 * l];
+        plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
+        close(du[0], want, "each structure's own value");
+    }
+    let f = lock_families()
+        .get(&family)
+        .cloned()
+        .expect("the family is known");
+    assert_eq!(
+        f.misses, UNSTABLE_AFTER,
+        "replays stop once the family is unstable"
+    );
+    assert!(f.alts.len() <= MAX_VARIANTS);
+    assert_eq!(
+        kept(),
+        UNSTABLE_AFTER as usize + 1,
+        "an unstable family keeps no further template"
+    );
+}
+
 /// What a recording that declines the exact linear path leaves behind: nothing. The state of
 /// the recording after `restore` is what it was at `snapshot` — instructions, registers, the
 /// literal pool, hash-consing, loop calls, chunk marks, the guard and the template trace — and
