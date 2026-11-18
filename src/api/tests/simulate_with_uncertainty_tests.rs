@@ -199,34 +199,14 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
     let n = snaps.len();
     let base = snaps.first().cloned().unwrap_or_default();
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: id.to_string(),
-        doses: Vec::new(),
         obs_times: vec![0.0; n],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: vec![2; n],
         covariates: base,
-        dose_covariates: Vec::new(),
         obs_covariates: snaps,
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: Vec::new(),
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     Population {
         subjects: vec![subject],
@@ -661,34 +641,15 @@ pub(super) fn tiny_population() -> Population {
     let obs_times = vec![1.0, 2.0, 3.0];
     let subjects: Vec<Subject> = (0..2)
         .map(|i| Subject {
-            obs_rgroup: Vec::new(),
             id: format!("S{}", i + 1),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![30.0, 22.0, 16.0],
             obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
     Population {

@@ -143,34 +143,19 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     m.insert("WT".to_string(), 70.0);
     dose_covs.push(m);
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "TVS".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![10.0, 5.0, 2.5], // placeholders; values don't matter for the IPRED check
+        observations: vec![10.0, 5.0, 2.5],
+        // placeholders; values don't matter for the IPRED check
         obs_cmts: vec![1, 1, 1],
         covariates: subj_cov,
         dose_covariates: dose_covs,
         obs_covariates: obs_covs,
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     // Sanity: this subject must be classified TV — that's the regime the
     // bug lived in.
@@ -322,34 +307,15 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
     assert_eq!(model.residual_correlations.len(), 1);
 
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0],
         obs_cmts: vec![1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let eta = DVector::from_vec(vec![0.0]);
     let ipred = crate::pk::compute_predictions_with_tv(
@@ -504,34 +470,18 @@ fn test_simulate_honours_tv_covariates() {
         HashMap::from([("WT".to_string(), 210.0)]),
     ];
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "SIMTV".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0, 0.0],
         obs_cmts: vec![1, 1, 1],
         covariates: baseline_cov,
         dose_covariates,
         obs_covariates,
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     assert!(subject.has_tv_covariates());
 

@@ -70,38 +70,21 @@ fn population(cmts: [usize; 4], tv_wt: bool) -> Population {
     ];
     let n = OBS.len();
     let s = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         dose_occasions: vec![1u32; doses.len()],
         doses,
         obs_times: OBS.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: cmts.to_vec(),
         covariates: wt(70.0),
-        dose_covariates: Vec::new(),
         obs_covariates: if tv_wt {
             vec![wt(70.0), wt(90.0), wt(90.0), wt(90.0)]
         } else {
             Vec::new()
         },
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
-        obs_l2: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     Population {
         subjects: vec![s],

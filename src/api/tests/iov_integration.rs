@@ -120,37 +120,18 @@ fn make_iov_population() -> Population {
     let subjects: Vec<Subject> = subject_data
         .iter()
         .map(|(id, obs)| Subject {
-            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
                 DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
             ],
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: obs.clone(),
             obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: occasions.clone(),
-            obs_l2: Vec::new(),
             dose_occasions: dose_occ.clone(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
     Population {
@@ -1448,7 +1429,6 @@ fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
 #[test]
 fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -1488,34 +1468,13 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1552,7 +1511,6 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
 #[test]
 fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -1578,34 +1536,13 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
     let mut subjects = Vec::new();
     for (id, dose_amt, obs) in [("1", 100.0, vec![8.0, 6.0]), ("2", 80.0, vec![6.5, 4.9])] {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1682,7 +1619,6 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
 #[test]
 fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -1731,34 +1667,13 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1799,7 +1714,6 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
 #[test]
 fn test_imp_accepts_block_sigma_cross_endpoint() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -1839,34 +1753,13 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
         ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
     ] {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1904,7 +1797,6 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
 #[test]
 fn test_saem_block_sigma_ofv_matches_foce() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     // Single-endpoint combined error with a fixed correlated $SIGMA block —
     // the docs validation model (NONMEM FOCE OFV 18.7158, ferx FOCE 18.7274).
@@ -1936,34 +1828,13 @@ fn test_saem_block_sigma_ofv_matches_foce() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -2013,7 +1884,6 @@ fn test_saem_block_sigma_ofv_matches_foce() {
 #[test]
 fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -2043,34 +1913,13 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
         ("3", vec![8.8, 7.9, 6.7]),
     ] {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -2146,39 +1995,22 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
     // exact fixture `test_selected_error_block_sigma_cross_branch_covariance`
     // uses to pin the estimation-side dense `R`.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
         // The first record's value, as the reader fills it: a covariate is present
         // only when the subject-static map carries it (#2181).
         covariates: HashMap::from([("FREE".to_string(), 0.0)]),
-        dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),
             HashMap::from([("FREE".to_string(), 1.0)]),
         ],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -2635,34 +2467,13 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
     // One subject with an explicit zero-order infusion into the depot (cmt 1):
     // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.8, 1.4, 1.6, 0.9, 0.4],
         obs_cmts: vec![2; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let pop = Population {
         subjects: vec![subject],
@@ -2890,31 +2701,14 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                     DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
                 ],
                 obs_times,
-                obs_raw_times: Vec::new(),
                 observations,
                 obs_cmts: vec![1; 8],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                pk_only_occasions: Vec::new(),
                 reset_times: vec![12.0],
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0; 8],
                 occasions: vec![1, 1, 1, 1, 2, 2, 2, 2],
-                obs_l2: Vec::new(),
-                obs_rgroup: Vec::new(),
                 dose_occasions: vec![1, 2],
                 reset_occasions: reset_label.into_iter().collect(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             }
         })
         .collect();

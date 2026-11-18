@@ -56,6 +56,67 @@ pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
     }
 }
 
+/// The packed `[θ | σ]` start and box of the EM-family M-steps (SAEM, MCEM and its
+/// mixture variant): θ per [`theta_packs_log`] (log for `theta_lower >= 0`, identity
+/// otherwise, so covariate exponents with negative lower bounds are not pinned to ~0),
+/// σ always log. θ bounds take the same packing (upper capped at `1e9` before the log);
+/// σ lives in `[-8, 5]`. A FIX θ or σ is pinned at its start (`lower == upper`), which is
+/// what the M-step optimizers read as a constant — the FOCE/FOCEI treatment.
+pub(crate) struct EmPacking {
+    pub(crate) theta_packs_log_mask: Vec<bool>,
+    pub(crate) log_theta: Vec<f64>,
+    pub(crate) log_sigma: Vec<f64>,
+    pub(crate) log_theta_lower: Vec<f64>,
+    pub(crate) log_theta_upper: Vec<f64>,
+    pub(crate) log_sigma_lower: Vec<f64>,
+    pub(crate) log_sigma_upper: Vec<f64>,
+}
+
+impl EmPacking {
+    /// Pack the start `theta` / `sigma` against `init`'s θ bounds and FIX flags.
+    pub(crate) fn new(init: &ModelParameters, theta: &[f64], sigma: &[f64]) -> Self {
+        let mask: Vec<bool> = init
+            .theta_lower
+            .iter()
+            .map(|&lo| theta_packs_log(lo))
+            .collect();
+        let pack = |i: usize, t: f64, log_t: fn(f64) -> f64| if mask[i] { log_t(t) } else { t };
+        let log_theta: Vec<f64> = (0..theta.len())
+            .map(|i| pack(i, theta[i], |t| t.max(1e-10).ln()))
+            .collect();
+        let log_sigma: Vec<f64> = sigma.iter().map(|&s| s.max(1e-10).ln()).collect();
+        let mut log_theta_lower: Vec<f64> = (0..theta.len())
+            .map(|i| pack(i, init.theta_lower[i], |t| t.max(1e-10).ln()))
+            .collect();
+        let mut log_theta_upper: Vec<f64> = (0..theta.len())
+            .map(|i| pack(i, init.theta_upper[i], |t| t.min(1e9).ln()))
+            .collect();
+        let mut log_sigma_lower = vec![-8.0f64; sigma.len()];
+        let mut log_sigma_upper = vec![5.0f64; sigma.len()];
+        for i in 0..theta.len() {
+            if init.theta_fixed.get(i).copied().unwrap_or(false) {
+                log_theta_lower[i] = log_theta[i];
+                log_theta_upper[i] = log_theta[i];
+            }
+        }
+        for i in 0..sigma.len() {
+            if init.sigma_fixed.get(i).copied().unwrap_or(false) {
+                log_sigma_lower[i] = log_sigma[i];
+                log_sigma_upper[i] = log_sigma[i];
+            }
+        }
+        EmPacking {
+            theta_packs_log_mask: mask,
+            log_theta,
+            log_sigma,
+            log_theta_lower,
+            log_theta_upper,
+            log_sigma_lower,
+            log_sigma_upper,
+        }
+    }
+}
+
 /// The floor `sₖ` of packed coordinate `k`'s finite-difference step `eps·(sₖ + |xₖ|)`
 /// ([`fd_step`], #2147).
 ///

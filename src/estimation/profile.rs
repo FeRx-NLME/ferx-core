@@ -3216,7 +3216,6 @@ pub(crate) fn optimize_profiled(
     params.theta_fixed = fit_template.theta_fixed.clone();
     let ebe = ebe_accum.into_inner().unwrap();
     OuterResult {
-        params,
         ofv: solve.ofv,
         converged,
         n_iterations: n_evals.load(Ordering::Relaxed),
@@ -3227,32 +3226,17 @@ pub(crate) fn optimize_profiled(
         covariance_method: cov.as_ref().and_then(|c| c.method),
         covariance_wall_time_secs: cov.as_ref().map_or(0.0, |c| c.wall_time_secs),
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
         total_ebe_nm_polished: ebe.total_nm_polished as u32,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal: cov.and_then(|c| c.sir_fallback_proposal),
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         packed_estimate: Some(x_hat),
         left_init: start_verdict.0,
         stationary_start: start_verdict.1,
-        mixture_posteriors: None,
-        vi: None,
         start_eval: start_eval.into_inner().unwrap(),
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
-        newton_decrement: None,
-        optimizer_stop: None,
         eval_budget_spent,
+        ..OuterResult::from_params(params)
     }
 }
 
@@ -3401,10 +3385,7 @@ fn failed_result(
 ) -> OuterResult {
     let n = population.subjects.len();
     OuterResult {
-        params,
         ofv: f64::INFINITY,
-        converged: false,
-        n_iterations: 0,
         eta_hats: vec![DVector::zeros(model.n_eta); n],
         h_matrices: population
             .subjects
@@ -3412,36 +3393,12 @@ fn failed_result(
             .map(|s| DMatrix::zeros(s.obs_times.len(), model.n_eta))
             .collect(),
         kappas: vec![Vec::new(); n],
-        covariance_matrix: None,
-        covariance_method: None,
-        covariance_wall_time_secs: 0.0,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
         total_ebe_nm_polished: ebe.total_nm_polished as u32,
-        final_gradient: None,
-        final_gradient_source: None,
-        sir_fallback_proposal: None,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
-        packed_estimate: None,
-        left_init: None,
-        stationary_start: false,
-        mixture_posteriors: None,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
-        newton_decrement: None,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(params)
     }
 }
 

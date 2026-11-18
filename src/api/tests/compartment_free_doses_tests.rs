@@ -12,7 +12,6 @@ use crate::api::validation::{
 };
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{CompiledModel, DoseEvent, Population, RateMode, Subject};
-use std::collections::HashMap;
 
 /// An Emax time-course with no compartments — the #811 base case.
 fn compartment_free_model() -> CompiledModel {
@@ -42,34 +41,13 @@ fn population(dose_lists: Vec<Vec<DoseEvent>>) -> Population {
             .into_iter()
             .enumerate()
             .map(|(i, doses)| Subject {
-                obs_rgroup: Vec::new(),
                 id: format!("{}", i + 1),
                 doses,
                 obs_times: vec![1.0],
-                obs_raw_times: Vec::new(),
                 observations: vec![8.0],
                 obs_cmts: vec![1],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             })
             .collect(),
         covariate_names: Vec::new(),

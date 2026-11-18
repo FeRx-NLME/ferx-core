@@ -1,7 +1,6 @@
 use super::fit;
 use crate::parser::model_parser::parse_full_model;
 use crate::types::*;
-use std::collections::HashMap;
 
 /// 1-cpt IV ODE model with a [diffusion] block on the central compartment.
 /// Sigma (ADD) is fixed so that the diffusion parameter must absorb residual
@@ -89,34 +88,15 @@ fn make_sde_population() -> Population {
     let subjects = dvs
         .iter()
         .map(|(id, obs)| Subject {
-            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: obs.clone(),
             obs_cmts: vec![1; 3],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1u32; 3],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1u32],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
     Population {
@@ -229,34 +209,13 @@ fn sde_gn_returns_error() {
         // Minimal single-subject population (no data needed — error fires before fitting).
         use crate::types::{DoseEvent, Population, Subject};
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0],
-            obs_raw_times: Vec::new(),
             observations: vec![1.0],
             obs_cmts: vec![1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         Population {
             subjects: vec![subj],

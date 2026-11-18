@@ -18,39 +18,17 @@ use crate::types::GradientMethod;
 #[test]
 fn obs_nll_subject_grad_matches_obs_nll_sum_fd() {
     use crate::types::{DoseEvent, Population};
-    use std::collections::HashMap;
 
     let model = analytical_model(GradientMethod::Auto);
 
     let make_subj = |id: &str, obs: f64| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![obs, obs * 0.6, obs * 0.3],
         obs_cmts: vec![1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let population = Population {
@@ -250,7 +228,6 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // One subject, 2 occasions (times 1–3 occ 1, 4–6 occ 2), one dose each.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -260,27 +237,10 @@ fn obs_nll_subject_grad_iov_matches_fd() {
         obs_raw_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
         observations: vec![36.0, 28.0, 21.0, 34.0, 26.0, 19.0],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: Vec::new(),
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let theta = vec![5.0f64, 50.0];
@@ -361,7 +321,6 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 fn obs_nll_subject_grad_per_cmt_matches_fd() {
     use crate::parser::model_parser::parse_model_string;
     use crate::types::{DoseEvent, Population};
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -398,11 +357,9 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
 
     // obs at CMT=1 (PK) and CMT=2 (PD), interleaved.
     let make_subj = |id: &str, scale: f64| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0, 4.0, 4.0],
-        obs_raw_times: Vec::new(),
         observations: vec![
             8.0 * scale,
             2.0 * scale,
@@ -412,27 +369,8 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
             3.5 * scale,
         ],
         obs_cmts: vec![1, 2, 1, 2, 1, 2],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![make_subj("1", 1.0), make_subj("2", 1.1)],
@@ -522,7 +460,6 @@ fn obs_nll_subject_grad_per_cmt_matches_fd() {
 fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
     use crate::parser::model_parser::parse_model_string;
     use crate::types::{DoseEvent, Population};
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -557,34 +494,13 @@ fn obs_nll_subject_grad_block_sigma_cross_endpoint_matches_fd() {
     .expect("cross-endpoint block_sigma ODE model parses");
 
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0, 2.0, 2.0],
-        obs_raw_times: Vec::new(),
         observations: vec![17.0, 8.0, 15.0, 7.0],
         obs_cmts: vec![1, 2, 1, 2],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject.clone()],

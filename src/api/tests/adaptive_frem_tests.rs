@@ -14,7 +14,6 @@ use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
     DoseAction, DoseStep, MonitorSpec, ObserveMode,
 };
-use std::collections::HashMap;
 
 /// 1-cpt ODE plus an independent second state (so Form B has two observed CMTs), with
 /// one FREM covariate `WT`: `TV_WT` + `ETA_WT` predict the `FREMTYPE = 100` rows. With
@@ -102,34 +101,16 @@ fn subject(id: &str, cmts: [usize; 6], occasions: Vec<u32>) -> Subject {
     ];
     let n = OBS.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.to_string(),
         dose_occasions: vec![occasions[0]; doses.len()],
         doses,
         obs_times: OBS.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: cmts.to_vec(),
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions,
-        obs_l2: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
         fremtype: FREMTYPE.to_vec(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

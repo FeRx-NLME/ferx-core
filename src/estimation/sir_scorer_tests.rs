@@ -788,7 +788,6 @@ fn ode_iov_start_reject_inputs(scale: f64) -> (CompiledModel, Population) {
             })
     };
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -796,29 +795,11 @@ fn ode_iov_start_reject_inputs(scale: f64) -> (CompiledModel, Population) {
         ],
         observations: obs_times.iter().map(|&t| scale * typical(t)).collect(),
         obs_times,
-        obs_raw_times: Vec::new(),
         obs_cmts: vec![1; 4],
-        covariates: std::collections::HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let pop = Population {
         subjects: vec![subject],

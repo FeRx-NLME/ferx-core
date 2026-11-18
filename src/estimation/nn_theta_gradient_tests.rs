@@ -71,34 +71,14 @@ fn static_subject() -> Subject {
     cov.insert("WT".to_string(), 72.0);
     cov.insert("CRCL".to_string(), 95.0);
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 4.0, 8.0, 12.0],
-        obs_raw_times: Vec::new(),
         observations: vec![7.5, 6.0, 3.8, 2.1],
         obs_cmts: vec![1, 1, 1, 1],
         covariates: cov,
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
         cens: vec![0, 0, 0, 0],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

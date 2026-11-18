@@ -84,37 +84,21 @@ fn wt(w: f64) -> HashMap<String, f64> {
 fn subject_from(doses: &[(f64, u32, f64)], obs: &[(f64, u32, f64)]) -> Subject {
     let n = obs.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: doses
             .iter()
             .map(|&(t, _, _)| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
             .collect(),
         obs_times: obs.iter().map(|&(t, _, _)| t).collect(),
-        obs_raw_times: vec![],
         observations: vec![1.0; n],
         obs_cmts: vec![1; n],
         covariates: wt(70.0),
         dose_covariates: doses.iter().map(|&(_, _, w)| wt(w)).collect(),
         obs_covariates: obs.iter().map(|&(_, _, w)| wt(w)).collect(),
-        pk_only_times: vec![],
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: vec![],
-        reset_times: vec![],
-        reset_covariates: vec![],
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: obs.iter().map(|&(_, o, _)| o).collect(),
-        obs_l2: vec![],
         dose_occasions: doses.iter().map(|&(_, o, _)| o).collect(),
-        reset_occasions: vec![],
-        pk_only_occasions: Vec::new(),
-        fremtype: vec![],
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

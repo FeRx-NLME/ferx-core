@@ -808,7 +808,6 @@ pub fn run_foce_gn(
 
         let (final_gradient, final_gradient_source) = final_gradient.unzip();
         return OuterResult {
-            params: gn_params,
             ofv: gn_ofv_clean,
             converged,
             n_iterations: maxiter,
@@ -819,36 +818,17 @@ pub fn run_foce_gn(
             covariance_method,
             covariance_wall_time_secs,
             warnings,
-            saem_mu_ref_m_step_evals_saved: None,
-            saem_objective_value: None,
-            saem_n_subjects_hmc: None,
-            saem_mh_accept_tail: None,
-            mstep_optimizer_used: None,
-            ebe_convergence_warnings: 0,
-            max_unconverged_subjects: 0,
-            total_ebe_fallbacks: 0,
-            total_ebe_nm_polished: 0,
             final_gradient,
             final_gradient_source,
             sir_fallback_proposal,
-            impmap_trace: None,
-            bayes: None,
-            cond_dist: None,
             // Exact packed vector this cov step used (`compute_covariance(&x, …)`).
             // Pure GN optimizes in packed Cholesky space, so `x`'s omega block is
             // the exact factor `L`; reused by `run_covariance` for a bit-for-bit
             // covariance instead of re-decomposing `omega` (#816 follow-up).
             packed_estimate: Some(x.clone()),
-            left_init: None,
-            stationary_start: false,
-            mixture_posteriors: None,
-            vi: None,
-            start_eval: None,
-            mcem_lowest_objective: None,
-            mcem_objective_trail: None,
             newton_decrement,
-            optimizer_stop: None,
             eval_budget_spent: gn_budget_spent,
+            ..OuterResult::from_params(gn_params)
         };
     }
 
@@ -1003,7 +983,6 @@ pub fn run_foce_gn(
 
     let (final_gradient, final_gradient_source) = final_gradient.unzip();
     OuterResult {
-        params: final_params,
         ofv: final_ofv,
         converged,
         n_iterations: maxiter,
@@ -1014,37 +993,14 @@ pub fn run_foce_gn(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
         final_gradient,
         final_gradient_source,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         // Exact packed vector this stage's covariance step used (see above);
         // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
         packed_estimate: Some(final_packed),
-        left_init: None,
-        stationary_start: false,
-        mixture_posteriors: None,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
         newton_decrement,
-        optimizer_stop: None,
-        // The hybrid's estimate is the FOCEI polish's or the GN phase's; the polish runs its
-        // own fixed 100-evaluation budget, not the user's `maxiter`, so neither half's budget
-        // is the fit's to report (#2799).
-        eval_budget_spent: false,
+        ..OuterResult::from_params(final_params)
     }
 }
 

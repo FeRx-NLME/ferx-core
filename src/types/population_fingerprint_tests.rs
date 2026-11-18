@@ -21,7 +21,6 @@ fn subject() -> Subject {
         gov_time: 12.0,
     });
     Subject {
-        obs_rgroup: Vec::new(),
         id: "7".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0), modeled],
         obs_times: vec![1.0, 2.0],
@@ -32,12 +31,9 @@ fn subject() -> Subject {
         dose_covariates: vec![cov(&[("WT", 70.0)]), cov(&[("WT", 71.0)])],
         obs_covariates: vec![cov(&[("WT", 70.0)]), cov(&[("WT", 72.0)])],
         pk_only_times: vec![5.0],
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
         pk_only_covariates: vec![cov(&[("WT", 73.0)])],
         reset_times: vec![30.0],
         reset_covariates: vec![cov(&[("WT", 74.0)])],
-        cmt_toggles: Vec::new(),
         cens: vec![0, 1],
         occasions: vec![1, 2],
         obs_l2: vec![0, 3],
@@ -71,7 +67,7 @@ fn subject() -> Subject {
         ],
         endpoint_covariates: vec![cov(&[("WT", 76.0)])],
         filled_cells: vec![("WT".to_string(), 3.0)],
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

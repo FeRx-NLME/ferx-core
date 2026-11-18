@@ -84,34 +84,14 @@ fn population(n_studies: usize, n_times: usize) -> Population {
             let mut covariates = HashMap::new();
             covariates.insert("STUDY".to_string(), (s + 1) as f64);
             Subject {
-                obs_rgroup: Vec::new(),
                 id: format!("{}", s + 1),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: (1..=n_times).map(|t| t as f64).collect(),
-                obs_raw_times: Vec::new(),
                 observations: vec![1.0; n_times],
                 obs_cmts: vec![1; n_times],
                 covariates,
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0; n_times],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             }
         })
         .collect();
@@ -919,11 +899,9 @@ mod theta_gather_index_check {
         let mut covariates = HashMap::new();
         covariates.insert("PLA_IDX".to_string(), indices[0]);
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: (1..=n).map(|t| t as f64).collect(),
-            obs_raw_times: Vec::new(),
             observations: vec![1.0; n],
             obs_cmts: vec![1; n],
             covariates: covariates.clone(),
@@ -932,24 +910,8 @@ mod theta_gather_index_check {
                 .iter()
                 .map(|&i| HashMap::from([("PLA_IDX".to_string(), i)]))
                 .collect(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: Vec::new(),
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         Population {
             subjects: vec![subject],

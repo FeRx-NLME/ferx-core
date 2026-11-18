@@ -91,11 +91,9 @@ fn age(a: f64) -> HashMap<String, f64> {
 fn subject(id: &str, ages: [f64; 4]) -> Subject {
     let tv = ages.iter().any(|&a| a != ages[0]);
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0],
-        obs_raw_times: Vec::new(),
         observations: vec![1.0, 1.0, 1.0],
         obs_cmts: vec![1, 1, 1],
         covariates: age(ages[0]),
@@ -105,24 +103,10 @@ fn subject(id: &str, ages: [f64; 4]) -> Subject {
         } else {
             Vec::new()
         },
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

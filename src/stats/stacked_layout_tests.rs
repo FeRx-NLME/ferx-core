@@ -9,7 +9,6 @@ const N_KAPPA: usize = 3;
 /// pk-only row, which does not create a group of its own.
 fn subject() -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".to_string(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -17,30 +16,13 @@ fn subject() -> Subject {
             DoseEvent::new(4.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 2.5, 3.0, 5.0, 6.0],
-        obs_raw_times: Vec::new(),
         observations: vec![50.0, 40.0, 30.0, 45.0, 35.0],
         obs_cmts: vec![1; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
         pk_only_times: vec![0.5],
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![2, 2, 5, 5, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![7, 2, 9],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

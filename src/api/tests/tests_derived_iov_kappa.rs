@@ -112,34 +112,14 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
 /// Subject with two occasions: obs 0,1 on occasion 1; obs 2,3 on occasion 2.
 fn two_occasion_subject() -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
-        doses: Vec::new(),
         obs_times: vec![0.0, 1.0, 2.0, 3.0],
         obs_raw_times: vec![0.0, 1.0, 2.0, 3.0],
         observations: vec![1.0; 4],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -321,8 +301,6 @@ fn tad_uses_per_dose_occasion_lag() {
     );
 
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -332,26 +310,10 @@ fn tad_uses_per_dose_occasion_lag() {
         obs_raw_times: vec![2.0, 13.0],
         observations: vec![1.0, 1.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -433,34 +395,16 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 
     // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
         obs_times: vec![3.0],
         obs_raw_times: vec![3.0],
         observations: vec![1.0],
         obs_cmts: vec![2],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -494,8 +438,6 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 /// at t = 30 on that compartment.
 fn neg_lag_population(cmt: usize, dose_times: &[f64]) -> Population {
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: dose_times
             .iter()
@@ -505,26 +447,10 @@ fn neg_lag_population(cmt: usize, dose_times: &[f64]) -> Population {
         obs_raw_times: vec![30.0],
         observations: vec![1.0],
         obs_cmts: vec![cmt],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1; dose_times.len()],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     Population {
         subjects: vec![subject],
@@ -872,34 +798,17 @@ fn block_sigma_two_endpoint_model() -> CompiledModel {
 fn obs_only_subject(cmts: Vec<usize>, times: Vec<f64>, l2: Vec<i64>) -> Subject {
     let n = cmts.len();
     Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: times.clone(),
         obs_raw_times: times,
         observations: vec![1.0; n],
         obs_cmts: cmts,
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: l2,
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -1050,34 +959,14 @@ fn ss_dose_with_analytical_init_warns() {
 
     // Subject with a steady-state dose (ss=true, ii=24).
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
         obs_times: vec![1.0, 6.0],
         obs_raw_times: vec![1.0, 6.0],
         observations: vec![1.0, 1.0],
         obs_cmts: vec![1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -1123,34 +1012,14 @@ fn non_ss_dose_with_analytical_init_does_not_warn() {
         .expect("parse ok")
         .model;
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0],
         obs_raw_times: vec![1.0],
         observations: vec![1.0],
         obs_cmts: vec![1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -1192,34 +1061,18 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
     let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![3.0],
         obs_raw_times: vec![3.0],
         observations: vec![1.0],
         obs_cmts: vec![1],
-        covariates: HashMap::new(),
         dose_covariates: vec![cov_dose],
         obs_covariates: vec![cov_obs],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -1279,34 +1132,16 @@ fn combined_endpoint_model() -> CompiledModel {
 fn subject_with_obs(cmt: usize, dvs: Vec<f64>) -> Subject {
     let n = dvs.len();
     Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: (0..n).map(|i| (i + 1) as f64).collect(),
         obs_raw_times: (0..n).map(|i| (i + 1) as f64).collect(),
         observations: dvs,
         obs_cmts: vec![cmt; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

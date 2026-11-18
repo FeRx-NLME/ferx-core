@@ -5030,18 +5030,15 @@ pub fn run_saem(
     // `t.max(1e-10).ln()` packing and could never be estimated —
     // visible regression: SAD_SCEN4 SAEM left γ_CL stuck at 0 (truth
     // -0.8), letting the rest of the fit drift to compensate.
-    let theta_packs_log_mask: Vec<bool> = init_params
-        .theta_lower
-        .iter()
-        .map(|&lo| crate::estimation::parameterization::theta_packs_log(lo))
-        .collect();
-    let pack_theta = |i: usize, t: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            t.max(1e-10).ln()
-        } else {
-            t
-        }
-    };
+    let crate::estimation::parameterization::EmPacking {
+        theta_packs_log_mask,
+        mut log_theta,
+        mut log_sigma,
+        log_theta_lower,
+        log_theta_upper,
+        log_sigma_lower,
+        log_sigma_upper,
+    } = crate::estimation::parameterization::EmPacking::new(&init_params, &theta_cur, &sigma_cur);
     let unpack_theta = |i: usize, packed: f64| -> f64 {
         if theta_packs_log_mask[i] {
             packed.exp()
@@ -5049,47 +5046,6 @@ pub fn run_saem(
             packed
         }
     };
-
-    // Pack initial theta (per-mask) and sigma (always log).
-    let mut log_theta: Vec<f64> = (0..n_theta).map(|i| pack_theta(i, theta_cur[i])).collect();
-    let mut log_sigma: Vec<f64> = sigma_cur.iter().map(|&s| s.max(1e-10).ln()).collect();
-
-    // Bounds in packed space — log when log-packed, identity otherwise.
-    let mut log_theta_lower: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_lower[i].max(1e-10).ln()
-            } else {
-                init_params.theta_lower[i]
-            }
-        })
-        .collect();
-    let mut log_theta_upper: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_upper[i].min(1e9).ln()
-            } else {
-                init_params.theta_upper[i]
-            }
-        })
-        .collect();
-    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
-    let mut log_sigma_upper = vec![5.0f64; n_sigma];
-
-    // Pin FIX parameters: set lower == upper == packed_value so the inner
-    // NLopt M-step treats them as constants. Matches the FOCE/FOCEI treatment.
-    for i in 0..n_theta {
-        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
-            log_theta_lower[i] = log_theta[i];
-            log_theta_upper[i] = log_theta[i];
-        }
-    }
-    for i in 0..n_sigma {
-        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            log_sigma_lower[i] = log_sigma[i];
-            log_sigma_upper[i] = log_sigma[i];
-        }
-    }
 
     // #895: iiv_on_ruv creates a σ × ω_RUV ridge (residual var = σ²·exp(2·η_RUV)),
     // so a poorly-mixing E-step can let the M-step ride σ up to its e⁵ ceiling.
@@ -7767,7 +7723,6 @@ pub fn run_saem(
     }
 
     Ok(OuterResult {
-        params: final_params,
         ofv,
         converged,
         n_iterations: n_iter,
@@ -7787,27 +7742,11 @@ pub fn run_saem(
         // (`scalar_residual_model`; the solve is skipped at both of its call sites).
         mstep_optimizer_used: (!use_score_sa && scalar_residual_model.is_none())
             .then(|| mstep_optimizer.as_str().to_string()),
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
         cond_dist,
-        packed_estimate: None,
-        left_init: None,
-        stationary_start: false,
         mixture_posteriors,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
         newton_decrement,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(final_params)
     })
 }
 

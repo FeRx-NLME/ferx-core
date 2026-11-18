@@ -1,38 +1,14 @@
-#![allow(unused_imports)]
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
+use crate::diagnostics::{first_error, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
-};
+use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
-use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
-    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
-};
 use crate::pk;
-use crate::propensity_match::MatchMethod;
-use crate::sim::adaptive::{
-    AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
-    DoseLedgerEntry, MonitorSpec,
-};
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
-use crate::types::*;
 use nalgebra::{DMatrix, DVector};
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
-use std::collections::HashMap;
-use std::path::Path;
 use std::time::Instant;
 
 /// Where a run's optimizer trace is written when `FitOptions::optimizer_trace`
@@ -2586,45 +2562,15 @@ fn fit_inner(
                             ofv,
                         );
                     result = Some(crate::estimation::outer_optimizer::OuterResult {
-                        params: stage_params.clone(),
                         ofv,
                         converged,
-                        n_iterations: 0,
                         eta_hats,
                         h_matrices,
                         kappas,
-                        covariance_matrix: None,
-                        // No covariance step on an evaluation-only stage, so no
-                        // estimator to name (#1382).
-                        covariance_method: None,
-                        covariance_wall_time_secs: 0.0,
                         warnings: gate_warning.into_iter().collect(),
-                        saem_mu_ref_m_step_evals_saved: None,
-                        saem_objective_value: None,
-                        saem_n_subjects_hmc: None,
-                        saem_mh_accept_tail: None,
-                        mstep_optimizer_used: None,
-                        ebe_convergence_warnings: 0,
-                        max_unconverged_subjects: 0,
-                        total_ebe_fallbacks: 0,
-                        total_ebe_nm_polished: 0,
-                        final_gradient: None,
-                        final_gradient_source: None,
-                        sir_fallback_proposal: None,
-                        impmap_trace: None,
-                        bayes: None,
-                        cond_dist: None,
-                        packed_estimate: None,
-                        left_init: None,
-                        stationary_start: false,
-                        vi: None,
-                        start_eval: None,
-                        mcem_lowest_objective: None,
-                        mcem_objective_trail: None,
-                        mixture_posteriors: None,
-                        newton_decrement: None,
-                        optimizer_stop: None,
-                        eval_budget_spent: false,
+                        ..crate::estimation::outer_optimizer::OuterResult::from_params(
+                            stage_params.clone(),
+                        )
                     });
                 }
             }
@@ -2691,45 +2637,15 @@ fn fit_inner(
                     ofv,
                 );
                 result = Some(crate::estimation::outer_optimizer::OuterResult {
-                    params: stage_params.clone(),
                     ofv,
                     converged,
-                    n_iterations: 0,
                     eta_hats,
                     h_matrices,
                     kappas,
-                    covariance_matrix: None,
-                    // No covariance step on an evaluation-only stage, so no
-                    // estimator to name (#1382).
-                    covariance_method: None,
-                    covariance_wall_time_secs: 0.0,
                     warnings: gate_warning.into_iter().collect(),
-                    saem_mu_ref_m_step_evals_saved: None,
-                    saem_objective_value: None,
-                    saem_n_subjects_hmc: None,
-                    saem_mh_accept_tail: None,
-                    mstep_optimizer_used: None,
-                    ebe_convergence_warnings: 0,
-                    max_unconverged_subjects: 0,
-                    total_ebe_fallbacks: 0,
-                    total_ebe_nm_polished: 0,
-                    final_gradient: None,
-                    final_gradient_source: None,
-                    sir_fallback_proposal: None,
-                    impmap_trace: None,
-                    bayes: None,
-                    cond_dist: None,
-                    packed_estimate: None,
-                    left_init: None,
-                    stationary_start: false,
-                    mixture_posteriors: None,
-                    vi: None,
-                    start_eval: None,
-                    mcem_lowest_objective: None,
-                    mcem_objective_trail: None,
-                    newton_decrement: None,
-                    optimizer_stop: None,
-                    eval_budget_spent: false,
+                    ..crate::estimation::outer_optimizer::OuterResult::from_params(
+                        stage_params.clone(),
+                    )
                 });
             }
             let prev = result.as_ref().expect(

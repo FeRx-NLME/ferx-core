@@ -64,37 +64,18 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
         .expect("parse ODE IOV");
     let population = Population {
         subjects: vec![Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
                 DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
             ],
             obs_times: vec![1.0, 6.0, 25.0, 30.0],
-            obs_raw_times: Vec::new(),
             observations: vec![8.0, 6.0, 7.0, 5.0],
             obs_cmts: vec![1; 4],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: vec![1, 1, 2, 2],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
@@ -203,35 +184,17 @@ fn tvcov_ltbs_reports_analytic_inner() {
     assert!(model.log_transform);
     let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
     let tvcov_subj = || Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 8.0, 24.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0, 6.0, 7.0, 5.0, 3.0],
         obs_cmts: vec![1; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
         // Time-varying WT → routes to the event-driven walk, which now serves LTBS.
         obs_covariates: vec![wt(70.0), wt(72.0), wt(80.0), wt(85.0), wt(90.0)],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let subject = tvcov_subj();
     assert!(subject.has_tv_covariates(), "fixture must be TV-cov");
@@ -277,7 +240,6 @@ fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
     // Every subject carries a modeled-duration dose with no `D1`: a shape no recorder serves.
     let n_wide = 2;
     let wide_subject = |id: &str| Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::modeled(
             0.0,
@@ -288,30 +250,12 @@ fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
             crate::types::RateMode::ModeledDuration,
         )],
         obs_times: (0..n_wide).map(|i| i as f64 * 24.0 + 1.0).collect(),
-        obs_raw_times: Vec::new(),
         observations: vec![8.0; n_wide],
         obs_cmts: vec![1; n_wide],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n_wide],
         occasions: (1..=n_wide as u32).collect(),
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![wide_subject("1"), wide_subject("2")],
@@ -411,35 +355,16 @@ fn iov_inner_subject_route_admits_steady_state_lagtime() {
         "model should carry a LAGTIME individual parameter"
     );
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         // Steady-state bolus (ss, ii > 0) under an estimated lagtime.
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0)],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0, 6.0, 7.0, 5.0],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     assert!(
         iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
@@ -458,7 +383,6 @@ fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
         )
         .expect("parse ODE IOV + modeled D1");
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::modeled(
             0.0,
@@ -469,30 +393,12 @@ fn iov_inner_subject_route_admits_modeled_dose_steady_state() {
             crate::types::RateMode::ModeledDuration,
         )],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0, 6.0, 7.0, 5.0],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     assert!(
         iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
@@ -568,34 +474,15 @@ fn transit_twin_ss_forcing_is_analytic_under_iov() {
         "the closed-form transit primary is analytic"
     );
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0, 6.0, 7.0, 5.0],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     assert!(
         iov_inner_subject_route(&model, &subject, &model.default_params.theta).is_some(),
@@ -706,34 +593,14 @@ fn make_iov_model() -> CompiledModel {
 
 fn make_iov_subject() -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-        obs_raw_times: Vec::new(),
         observations: vec![40.0, 32.0, 25.0, 38.0, 30.0, 22.0],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -848,34 +715,14 @@ fn repro555_subject22() -> Subject {
     ];
     let n = obs_times.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: "22".into(),
         doses: vec![DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![2; n],
         covariates,
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -1148,37 +995,18 @@ fn ode_iov_start_reject_exempts_a_start_certified_as_the_mode() {
     // Observations ~80× the prediction (≈10), so the NLL near any reachable mode is far
     // above the 4-observation threshold of 1000.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
         observations: vec![800.0, 600.0, 700.0, 500.0],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     // η-only, `[η_CL, η_V]`: the shape the pre-flight hands the first evaluation (it drops
@@ -1252,37 +1080,18 @@ fn ode_iov_start_reject_retries_a_joint_start_at_kappa_zero() {
         )
         .expect("parse ODE IOV");
     let subject_with = |observations: Vec<f64>| Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     // η̂ then each cell's κ̂ (#2261). κ_CL = 5 multiplies CL by ~150, so the second sample
@@ -1364,37 +1173,18 @@ fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
     // takes it and it needs the stall. Both sides are asserted here, at the same subject.
     use crate::parser::model_parser::parse_model_string;
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 25.0, 30.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0, 6.0, 7.0, 5.0],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     // Plain closed-form IOV (no twin): objective is exact → no stall (bit-identical path).
@@ -1473,34 +1263,14 @@ fn inner_optimizer_pin_reaches_same_ebe() {
         )
         .expect("parse");
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
-        obs_raw_times: Vec::new(),
         observations: vec![18.0, 16.0, 13.0, 9.0, 4.5, 2.2],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1; 6],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
 
@@ -1555,34 +1325,14 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv() {
         .expect("parse");
     assert_eq!(model.residual_error_eta, Some(3));
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-        obs_raw_times: Vec::new(),
         observations: vec![2.1, 3.4, 4.0, 3.1, 1.8, 1.1, 0.4],
         obs_cmts: vec![1; 7],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     // A genuinely non-zero η, including the residual-error component.
     check_inner_ruv_grad(&model, &subject, &[0.20, -0.15, 0.30, 0.25]);
@@ -1602,34 +1352,14 @@ fn analytic_eta_gradient_matches_fd_iiv_on_ruv_ode() {
     assert_eq!(model.residual_error_eta, Some(2));
     assert!(model.ode_spec.is_some());
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-        obs_raw_times: Vec::new(),
         observations: vec![28.0, 25.0, 20.0, 13.0, 5.5, 2.4, 0.5],
         obs_cmts: vec![1; 7],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     check_inner_ruv_grad(&model, &subject, &[0.15, -0.10, 0.25]);
 }
@@ -1695,34 +1425,14 @@ fn dense_residual_inner_grad_matches_fd() {
     );
 
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 5],
         obs_cmts: vec![1; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     // Nonzero residuals: predictions at η=0.1 nudged, scored at a different η.
     let preds = crate::pk::compute_predictions_with_tv(
@@ -1749,34 +1459,14 @@ fn dense_residual_ode_inner_grad_matches_fd() {
     assert!(!model.residual_correlations.is_empty());
     assert!(model.ode_spec.is_some());
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 5],
         obs_cmts: vec![1; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     assert!(
         analytic_inner_grad_supported(&model, &subject),
@@ -1810,34 +1500,14 @@ fn dense_expression_scale_inner_grad_matches_fd() {
     ));
     assert!(!analytic_inner_common_bail(&model));
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 5],
         obs_cmts: vec![1; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -1862,34 +1532,14 @@ fn ode_ltbs_ruv_model_and_subject() -> (CompiledModel, Subject) {
     // Predictions for an LTBS model are on the log scale; perturb them so the
     // residual is nonzero.
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 7],
         obs_cmts: vec![1; 7],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -1955,34 +1605,14 @@ fn ode_ltbs_inner_ebe_matches_fd() {
 fn ode_custom_magnitude_takes_analytic_inner_gradient() {
     use crate::parser::model_parser::parse_model_string;
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0],
-        obs_raw_times: Vec::new(),
         observations: vec![5.0, 4.0, 3.0, 2.0, 1.0],
         obs_cmts: vec![1; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: vec![1; 5],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     // Control: plain proportional ODE → analytic inner gradient.
@@ -2027,34 +1657,14 @@ fn magnitude_inner_eta_gradient_matches_fd() {
         .expect("parse magnitude model");
     assert!(model.has_custom_ruv_magnitude());
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 24.0, 48.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 7],
         obs_cmts: vec![1; 7],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let theta = vec![0.22, 11.0, 1.4, 1.6];
     let preds =
@@ -2197,34 +1807,14 @@ fn ode_ltbs_no_ruv_model_and_subject() -> (CompiledModel, Subject) {
     assert!(model.log_transform, "log_additive must set LTBS");
     assert_eq!(model.residual_error_eta, None, "no iiv_on_ruv");
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 7],
         obs_cmts: vec![1; 7],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -2283,34 +1873,14 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
     let src = "[parameters]\n  theta TVCL(4.0,0.1,100.0)\n  theta TVV(30.0,1.0,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_RUV ~ 0.10\n  sigma ADD_ERR ~ 0.05\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  C0 = 5.0\n[structural_model]\n  ode(states=[central])\n[odes]\n  init(central) = C0 * V\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ log_additive(ADD_ERR)\n  iiv_on_ruv = ETA_RUV\n[fit_options]\n  ode_reltol = 1e-11\n  ode_abstol = 1e-13\n";
     let model = parse_model_string(src).expect("parse");
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 7],
         obs_cmts: vec![1; 7],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 7],
         occasions: vec![1; 7],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let preds = crate::pk::compute_predictions_with_tv(
         &model,
@@ -2491,34 +2061,14 @@ fn no_iov_1cpt_model() -> CompiledModel {
 
 fn no_iov_subject(reset_times: Vec<f64>) -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0],
-        obs_raw_times: Vec::new(),
         observations: vec![40.0, 32.0, 20.0],
         obs_cmts: vec![1; 3],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
         reset_times,
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -2656,34 +2206,13 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
         endpoints: std::collections::BTreeMap::new(),
     };
     let subject = Subject {
-        obs_rgroup: Vec::new(),
-        fremtype: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0],
-        obs_raw_times: Vec::new(),
         observations: vec![40.0, 32.0, 20.0],
         obs_cmts: vec![1; 3],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     let r_none = find_ebe(&model, &subject, &params, 200, 1e-6, None, None, 0);
@@ -2965,37 +2494,18 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
     // Two occasions, one 100 mg IV bolus each; observations simulated at
     // CL = 5·exp(−1.5), V = 50 (see the test doc) so the mode is far from the zero seed.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![2.0, 6.0, 26.0, 30.0],
-        obs_raw_times: Vec::new(),
         observations: vec![1.913, 1.749, 3.032, 2.773],
         obs_cmts: vec![1; 4],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
         cens: vec![0; 4],
         occasions: vec![1, 1, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     let cold_nll = individual_nll_iov(
@@ -3543,37 +3053,18 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     use crate::parser::model_parser::parse_model_string;
     let model = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![0.5, 1.0, 2.0, 6.0, 12.0, 24.5, 25.0, 26.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
         observations: vec![3.0, 6.0, 8.0, 9.0, 8.5, 12.0, 14.0, 16.0, 15.0, 14.0],
         obs_cmts: vec![1; 10],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 10],
         occasions: vec![1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     let solve = |tol: f64| {
@@ -4309,37 +3800,18 @@ fn analytic_iov_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
 
     for cens_sign in [1i8, -1] {
         let mut subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
                 DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
             ],
             obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; 6],
             obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
             occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let params = model.default_params.clone();
         let preds = crate::pk::predict_iov(
@@ -4432,37 +3904,18 @@ fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
     // Both tails: occasion-2 tail left-censored (CENS=1), then right-censored (CENS=-1).
     for cens_sign in [1i8, -1] {
         let mut subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
                 DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
             ],
             obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; 6],
             obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0, 0, 0, cens_sign, cens_sign],
             occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let params = model.default_params.clone();
         // Carry the censoring limit at 0.85·f so z = (f − LIMIT)/√v sits in the
@@ -4542,37 +3995,18 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
         .expect("parse ODE IOV");
     assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0, 6.0, 4.0, 7.0, 5.0, 3.0],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     let n_eta = model.n_eta;
@@ -4638,37 +4072,18 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
         .expect("parse closed-form IOV + obs_scale");
     assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     let n_eta = model.n_eta;
@@ -4781,37 +4196,18 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
         );
 
         let subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
                 DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
             ],
             obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.8, 0.6, 0.4, 0.7, 0.5, 0.3],
             obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: vec![1, 1, 1, 2, 2, 2],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1, 2],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let params = model.default_params.clone();
         let n_eta = model.n_eta;
@@ -4885,37 +4281,18 @@ fn iov_iiv_on_ruv_inner_grad_matches_fd() {
     assert!(!analytic_inner_common_bail(&model));
 
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
         observations: vec![8.0, 6.0, 4.0, 7.0, 5.0, 3.0],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     let n_eta = model.n_eta;
@@ -4989,38 +4366,19 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
     assert!(!analytic_inner_common_bail(&model));
 
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 6],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         // Occasion-2 tail rows M3 left-censored, co-occurring with iiv_on_ruv.
         cens: vec![0, 0, 0, 0, 1, 1],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     // Shallow censoring (≈ 0.85·f → z ≈ −0.75), the regime where the A&S CDF and the
@@ -5112,39 +4470,20 @@ fn iov_m3_inner_grad_matches_fd() {
     assert!(!analytic_inner_common_bail(&model));
 
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 6],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         // The last two rows (occasion 2 tail) are M3 left-censored; the `−logΦ`
         // term differentiates them.
         cens: vec![0, 0, 0, 0, 1, 1],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     // Synthesize observations from the model at a reference (η, κ), scaled to 0.85·f
@@ -5233,38 +4572,19 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
     assert!(crate::sens::ode_provider::adjoint::model_in_scope(&model));
 
     let mut subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
         ],
         obs_times: vec![1.0, 6.0, 12.0, 25.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; 6],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         // Occasion-2 tail is M3 *right*-censored (above ULOQ): upper tail.
         cens: vec![0, 0, 0, 0, -1, -1],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let params = model.default_params.clone();
     // Carry ULOQ at 0.85·f for the censored rows, so z = (f − ULOQ)/√v ≈ +0.15·f/√v

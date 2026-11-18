@@ -209,35 +209,14 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
     });
 
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "S".into(),
-        doses: vec![],
         obs_times: vec![1.0, 2.0],
-        obs_raw_times: vec![],
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
-        covariates: std::collections::HashMap::new(),
-        dose_covariates: vec![],
-        obs_covariates: vec![],
-        pk_only_times: vec![],
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: vec![],
-        reset_times: vec![],
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
         // Row 0 = PK observation, row 1 = covariate pseudo-observation.
         fremtype: vec![0, 100],
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
 
     let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
@@ -270,34 +249,13 @@ fn sim_residual_variance_applies_custom_magnitude() {
     model.frem_config = None;
 
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "S".into(),
-        doses: vec![],
         obs_times: vec![1.0],
-        obs_raw_times: vec![],
         observations: vec![0.0],
         obs_cmts: vec![1],
-        covariates: std::collections::HashMap::new(),
-        dose_covariates: vec![],
-        obs_covariates: vec![],
-        pk_only_times: vec![],
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: vec![],
-        reset_times: vec![],
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0],
-        occasions: vec![],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
         fremtype: vec![0],
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let sigma = vec![0.3];
     let f = 2.0;
@@ -2597,34 +2555,8 @@ fn impmap_proposal_df_default_is_finite_t() {
 /// exercise.
 fn bare_subject(id: &str) -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.to_string(),
-        doses: Vec::new(),
-        obs_times: Vec::new(),
-        obs_raw_times: Vec::new(),
-        observations: Vec::new(),
-        obs_cmts: Vec::new(),
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
-        cens: Vec::new(),
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: Vec::new(),
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

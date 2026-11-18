@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
+use std::collections::HashMap;
 
 /// A 1-cpt IV ODE model. `cl` is the CL line, `rhs_factor` multiplies the elimination
 /// rate. The elimination is saturable with a `Km` far above any amount in the data, so
@@ -85,7 +86,6 @@ fn subject(cell: Cell) -> Subject {
     let n = obs_times.len();
     let wt = |w: f64| HashMap::from([("WT".to_string(), w)]);
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -106,25 +106,9 @@ fn subject(cell: Cell) -> Subject {
             Vec::new()
         },
         obs_times,
-        obs_raw_times: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
         reset_times: if cell.reset { vec![26.0] } else { Vec::new() },
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

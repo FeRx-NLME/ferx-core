@@ -11,40 +11,18 @@
 use super::check_dose_compartments;
 use crate::types::test_helpers::{analytical_model, ode_model};
 use crate::types::{CompiledModel, DoseEvent, GradientMethod, PkModel, Population, Subject};
-use std::collections::HashMap;
 
 /// A one-subject population carrying exactly the doses under test.
 fn population_with_doses(doses: Vec<DoseEvent>) -> Population {
     Population {
         subjects: vec![Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses,
             obs_times: vec![1.0],
-            obs_raw_times: Vec::new(),
             observations: vec![0.0],
             obs_cmts: vec![1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),

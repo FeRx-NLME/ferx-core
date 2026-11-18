@@ -1015,7 +1015,6 @@ pub(crate) fn optimize_trust_region_seeded(
     );
 
     OuterResult {
-        params: final_params,
         ofv: final_ofv,
         converged,
         // Outer trust-region iterations actually run. This is the number the
@@ -1030,37 +1029,18 @@ pub(crate) fn optimize_trust_region_seeded(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
         final_gradient_source: final_gradient.as_ref().map(|_| "optimizer".to_string()),
         final_gradient,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         // The exact packed vector this stage's inline covariance step used
         // (`compute_covariance(&best_x, …)` above). The trust-region optimizer
         // works in packed Cholesky space, so `best_x`'s omega block is the exact
         // factor `L`; carrying it lets `run_covariance` reproduce this covariance
         // step bit-for-bit instead of re-decomposing `omega` (#816 follow-up).
         packed_estimate: Some(best_x.clone()),
-        left_init: None,
-        stationary_start: false,
-        mixture_posteriors: None,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
         newton_decrement,
-        optimizer_stop: None,
         eval_budget_spent: tr_budget_spent,
+        ..OuterResult::from_params(final_params)
     }
 }
 

@@ -57,34 +57,15 @@ fn tv_subject() -> Subject {
     let base = HashMap::from([("CRCL".to_string(), 100.0)]);
     let lo = HashMap::from([("CRCL".to_string(), 50.0)]);
     Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".into(),
-        doses: Vec::new(),
         obs_times: vec![6.0, 24.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
         covariates: base,
-        dose_covariates: Vec::new(),
         obs_covariates: vec![lo.clone(), lo],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -521,34 +502,15 @@ fn wired_into_a_real_reactive_tvcov_iov_run() {
         .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
         .collect();
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".into(),
-        doses: Vec::new(),
         obs_times: decisions.clone(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; decisions.len()],
         obs_cmts: vec![1; decisions.len()],
         covariates: base,
-        dose_covariates: Vec::new(),
         obs_covariates,
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; decisions.len()],
         occasions: vec![1; decisions.len()],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let pop = Population {
         subjects: vec![subject],

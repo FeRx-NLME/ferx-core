@@ -56,7 +56,7 @@ use crate::estimation::mstep_newton::{
     ValueGradInfo,
 };
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
-use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
+use crate::estimation::parameterization::{compute_mu_k, pack_params, EmPacking};
 use crate::estimation::pred_memo::{memoized, EvalMemo, MemoSlot, PredMemo};
 use crate::estimation::saem::{
     classify_mixture_mu_ref_pairs, classify_mu_ref_pairs, floor_omega_diagonal, fold_nll_grad,
@@ -1707,66 +1707,16 @@ fn run_mcem(
         );
     }
 
-    // ---- Packing scaffolding (mirrors SAEM) ----
-    // Per-theta packing: log for `theta_lower >= 0`, identity otherwise (so
-    // covariate exponents with negative lower bounds are not pinned to ~0).
-    let theta_packs_log_mask: Vec<bool> = init_params
-        .theta_lower
-        .iter()
-        .map(|&lo| theta_packs_log(lo))
-        .collect();
-    let pack_theta = |i: usize, t: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            t.max(1e-10).ln()
-        } else {
-            t
-        }
-    };
-
-    let mut log_theta: Vec<f64> = (0..n_theta)
-        .map(|i| pack_theta(i, init_params.theta[i]))
-        .collect();
-    let mut log_sigma: Vec<f64> = init_params
-        .sigma
-        .values
-        .iter()
-        .map(|&s| s.max(1e-10).ln())
-        .collect();
-
-    let mut log_theta_lower: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_lower[i].max(1e-10).ln()
-            } else {
-                init_params.theta_lower[i]
-            }
-        })
-        .collect();
-    let mut log_theta_upper: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_upper[i].min(1e9).ln()
-            } else {
-                init_params.theta_upper[i]
-            }
-        })
-        .collect();
-    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
-    let mut log_sigma_upper = vec![5.0f64; n_sigma];
-
-    // Pin FIX parameters: lower == upper == packed value.
-    for i in 0..n_theta {
-        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
-            log_theta_lower[i] = log_theta[i];
-            log_theta_upper[i] = log_theta[i];
-        }
-    }
-    for i in 0..n_sigma {
-        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            log_sigma_lower[i] = log_sigma[i];
-            log_sigma_upper[i] = log_sigma[i];
-        }
-    }
+    // ---- Packing scaffolding (shared with SAEM and the mixture MCEM) ----
+    let EmPacking {
+        theta_packs_log_mask,
+        mut log_theta,
+        mut log_sigma,
+        log_theta_lower,
+        log_theta_upper,
+        log_sigma_lower,
+        log_sigma_upper,
+    } = EmPacking::new(&init_params, &init_params.theta, &init_params.sigma.values);
 
     // Closed-form mu-referencing M-step: shift `packed θ += mean(η)` for eligible
     // mu-ref pairs (log-packed lognormal, identity-packed logit — #918), with those
@@ -3132,7 +3082,6 @@ fn run_mcem(
     }
 
     Ok(OuterResult {
-        params: final_params,
         ofv,
         converged,
         n_iterations: iterations_done,
@@ -3143,27 +3092,9 @@ fn run_mcem(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
         mstep_optimizer_used: Some(mstep_optimizer.as_str().to_string()),
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
         impmap_trace,
-        bayes: None,
-        cond_dist: None,
-        packed_estimate: None,
-        left_init: None,
-        stationary_start: false,
-        mixture_posteriors: None,
-        vi: None,
-        start_eval: None,
         mcem_lowest_objective: lowest_iteration_objective,
         // A run `max_time` stopped did not reach the limit the settling verdict is about,
         // and already says why it is not converged.
@@ -3171,8 +3102,7 @@ fn run_mcem(
             .is_none()
             .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
         newton_decrement,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(final_params)
     })
 }
 
@@ -3277,60 +3207,16 @@ fn run_mcem_mixture(
     let cancel = &options.cancel;
     let n_classes = spec.n_classes;
 
-    // ---- Packing scaffolding (mirrors run_mcem / SAEM) ----
-    let theta_packs_log_mask: Vec<bool> = init_params
-        .theta_lower
-        .iter()
-        .map(|&lo| theta_packs_log(lo))
-        .collect();
-    let pack_theta = |i: usize, t: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            t.max(1e-10).ln()
-        } else {
-            t
-        }
-    };
-    let mut log_theta: Vec<f64> = (0..n_theta)
-        .map(|i| pack_theta(i, init_params.theta[i]))
-        .collect();
-    let mut log_sigma: Vec<f64> = init_params
-        .sigma
-        .values
-        .iter()
-        .map(|&s| s.max(1e-10).ln())
-        .collect();
-    let mut log_theta_lower: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_lower[i].max(1e-10).ln()
-            } else {
-                init_params.theta_lower[i]
-            }
-        })
-        .collect();
-    let mut log_theta_upper: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_upper[i].min(1e9).ln()
-            } else {
-                init_params.theta_upper[i]
-            }
-        })
-        .collect();
-    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
-    let mut log_sigma_upper = vec![5.0f64; n_sigma];
-    for i in 0..n_theta {
-        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
-            log_theta_lower[i] = log_theta[i];
-            log_theta_upper[i] = log_theta[i];
-        }
-    }
-    for i in 0..n_sigma {
-        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            log_sigma_lower[i] = log_sigma[i];
-            log_sigma_upper[i] = log_sigma[i];
-        }
-    }
+    // ---- Packing scaffolding (shared with run_mcem / SAEM) ----
+    let EmPacking {
+        theta_packs_log_mask,
+        mut log_theta,
+        mut log_sigma,
+        log_theta_lower,
+        log_theta_upper,
+        log_sigma_lower,
+        log_sigma_upper,
+    } = EmPacking::new(&init_params, &init_params.theta, &init_params.sigma.values);
     let unpack_theta = |i: usize, v: f64| -> f64 {
         if theta_packs_log_mask[i] {
             v.exp()
@@ -4155,7 +4041,6 @@ fn run_mcem_mixture(
     }
 
     Ok(OuterResult {
-        params: final_params,
         ofv,
         converged,
         n_iterations: iterations_done,
@@ -4166,27 +4051,9 @@ fn run_mcem_mixture(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
         mstep_optimizer_used: Some(mstep_optimizer.as_str().to_string()),
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
-        packed_estimate: None,
-        left_init: None,
-        stationary_start: false,
         mixture_posteriors,
-        vi: None,
-        start_eval: None,
         mcem_lowest_objective: lowest_iteration_objective,
         // A run `max_time` stopped did not reach the limit the settling verdict is about,
         // and already says why it is not converged.
@@ -4194,8 +4061,7 @@ fn run_mcem_mixture(
             .is_none()
             .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
         newton_decrement,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(final_params)
     })
 }
 

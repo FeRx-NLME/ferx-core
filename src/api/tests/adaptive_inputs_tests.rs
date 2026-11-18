@@ -9,7 +9,6 @@ use super::*;
 use crate::diagnostics::EngineError;
 use crate::parser::model_parser::parse_model_string;
 use crate::sim::adaptive::{ControllerCtx, DoseAction, MonitorSpec, ObserveMode};
-use std::collections::HashMap;
 
 // 1-cpt IV ODE with BSV on CL, so a subject's IPRED reads its η.
 const ODE_IIV: &str = r#"
@@ -65,34 +64,15 @@ fn subject(id: &str) -> Subject {
     let n = OBS.len();
     let n_dose = doses.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses,
         obs_times: OBS.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: vec![1; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1u32; n_dose],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 

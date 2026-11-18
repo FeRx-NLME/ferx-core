@@ -1,39 +1,17 @@
-#![allow(unused_imports)]
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
 use crate::cold_sort::ColdSort;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
-use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_cholesky_jacobian, omega_packed_len, rho_chain,
-    rho_packed_start, theta_packs_log, PackedCoordKind,
-};
-use crate::estimation::saem;
-use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
-    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
-};
-use crate::pk;
-use crate::propensity_match::MatchMethod;
-use crate::sim::adaptive::{
-    AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
-    DoseLedgerEntry, MonitorSpec,
+    chol_lt_idx, omega_cholesky_jacobian, omega_packed_len, rho_chain, rho_packed_start,
+    PackedCoordKind,
 };
 use crate::stats::likelihood::{
     build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov_cov,
     foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
-use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
-use crate::types::*;
+use crate::stats::residual_error::compute_iwres_with_correlations;
 use nalgebra::{DMatrix, DVector};
-use rand::{RngExt, SeedableRng};
-use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::Instant;
 
 /// Rebuild `warnings_structured` from the current `warnings` vec.
 ///

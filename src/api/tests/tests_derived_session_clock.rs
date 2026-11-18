@@ -113,35 +113,16 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
 /// `reset_times[0] = 5.0` marks the boundary.
 fn two_session_subject() -> Subject {
     Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".into(),
-        doses: Vec::new(),
         // Session 0 at 0,1,4 — Session 1 shifted by 5 to 5,6,9
         obs_times: vec![0.0, 1.0, 4.0, 5.0, 6.0, 9.0],
         obs_raw_times: vec![0.0, 1.0, 4.0, 0.0, 1.0, 4.0],
         observations: vec![1.0; 6],
         obs_cmts: vec![1; 6],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: vec![5.0], // boundary at shifted t=5
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
+        reset_times: vec![5.0],
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -370,34 +351,14 @@ fn derived_integral_single_session_unchanged() {
     }];
     let model = minimal_model(derived_exprs);
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "SINGLE".into(),
-        doses: Vec::new(),
         obs_times: vec![0.0, 1.0, 4.0],
         obs_raw_times: vec![0.0, 1.0, 4.0],
         observations: vec![1.0; 3],
         obs_cmts: vec![1; 3],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
         occasions: vec![1, 1, 1],
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],

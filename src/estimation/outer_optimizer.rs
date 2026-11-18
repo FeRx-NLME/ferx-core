@@ -179,6 +179,54 @@ pub struct OuterResult {
     pub(crate) mcem_objective_trail: Option<crate::estimation::impmap::McemObjectiveTrail>,
 }
 
+impl OuterResult {
+    /// An unconverged result at `params` with every other field empty, zero or `None`:
+    /// the base each estimator's literal fills in with struct-update syntax
+    /// (`OuterResult { ofv, converged, .., ..OuterResult::from_params(params) }`), so a
+    /// field one estimator does not report needs no line in all the others.
+    pub(crate) fn from_params(params: ModelParameters) -> Self {
+        OuterResult {
+            params,
+            ofv: 0.0,
+            converged: false,
+            n_iterations: 0,
+            eta_hats: Vec::new(),
+            h_matrices: Vec::new(),
+            kappas: Vec::new(),
+            covariance_matrix: None,
+            covariance_method: None,
+            covariance_wall_time_secs: 0.0,
+            warnings: Vec::new(),
+            saem_mu_ref_m_step_evals_saved: None,
+            saem_objective_value: None,
+            saem_n_subjects_hmc: None,
+            saem_mh_accept_tail: None,
+            mstep_optimizer_used: None,
+            ebe_convergence_warnings: 0,
+            max_unconverged_subjects: 0,
+            total_ebe_fallbacks: 0,
+            total_ebe_nm_polished: 0,
+            final_gradient: None,
+            final_gradient_source: None,
+            newton_decrement: None,
+            optimizer_stop: None,
+            eval_budget_spent: false,
+            sir_fallback_proposal: None,
+            impmap_trace: None,
+            bayes: None,
+            cond_dist: None,
+            packed_estimate: None,
+            left_init: None,
+            stationary_start: false,
+            mixture_posteriors: None,
+            vi: None,
+            start_eval: None,
+            mcem_lowest_objective: None,
+            mcem_objective_trail: None,
+        }
+    }
+}
+
 /// Run the outer optimization loop (population parameter estimation).
 /// Whether this fit runs an outer optimizer at all.
 ///
@@ -1256,17 +1304,8 @@ fn evaluate_at_initial_params(
         // fallback (`chol(L·Lᵀ) ≠ L`) would otherwise diverge on an ill-conditioned
         // init omega just as it does for a converged fit (#816 follow-up).
         packed_estimate: Some(x.clone()),
-        left_init: None,
-        stationary_start: false,
         mixture_posteriors,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
-        params,
         ofv,
-        converged: false,
-        n_iterations: 0,
         eta_hats,
         h_matrices,
         kappas,
@@ -1274,24 +1313,9 @@ fn evaluate_at_initial_params(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         newton_decrement,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(params)
     }
 }
 
@@ -9419,7 +9443,6 @@ fn optimize_nlopt_attempt_probed(
 
     let ebe_final = ebe_accum.lock().unwrap();
     let result = OuterResult {
-        params: final_params,
         ofv: final_ofv,
         converged,
         // NLopt doesn't expose an "iteration" count (BOBYQA/SLSQP don't have
@@ -9435,11 +9458,6 @@ fn optimize_nlopt_attempt_probed(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
         ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
@@ -9447,27 +9465,20 @@ fn optimize_nlopt_attempt_probed(
         final_gradient,
         final_gradient_source,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         // The exact packed vector this stage's inline covariance step used (#816
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x0.clone()),
         left_init: Some(published_left_init),
-        // Set by `settle_start_probe` on the probe's result, never on an attempt's own.
-        stationary_start: false,
         mixture_posteriors: final_mixture_posteriors,
-        vi: None,
         // A restart leg publishes the fit's start, not its own (see `OuterResult::start_eval`).
         start_eval: inherited_start.unwrap_or(start_eval.get()),
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop,
         // #2799: the final budget state — after the polish (`PolishEnd::BudgetSpent`), a
         // verified stop and a stagnation latch on the last permitted eval have each had their
         // say above, so it is the same fact the "increase maxiter" warning is gated on.
         eval_budget_spent: max_eval_reached,
+        ..OuterResult::from_params(final_params)
     };
     (
         result,
@@ -10149,14 +10160,6 @@ fn optimize_bfgs(
         // The exact packed vector this stage's inline covariance step used (#816
         // follow-up): reused by `run_covariance` to avoid re-decomposing omega.
         packed_estimate: Some(x_final.clone()),
-        left_init: None,
-        stationary_start: false,
-        mixture_posteriors: None,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
-        params: final_params,
         ofv: final_ofv,
         converged,
         n_iterations,
@@ -10167,27 +10170,13 @@ fn optimize_bfgs(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         newton_decrement,
-        optimizer_stop: None,
         eval_budget_spent: crate::estimation::gauss_newton::gn_loop_budget_spent(
             options.outer_maxiter,
             exited_early,
         ),
+        ..OuterResult::from_params(final_params)
     }
 }
 

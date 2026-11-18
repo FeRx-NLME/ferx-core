@@ -2225,24 +2225,13 @@ pub fn run_bayes(
     }
 
     Ok(OuterResult {
-        params: mean_params,
         ofv,
         converged,
         n_iterations: n_warmup + n_sample,
         eta_hats,
         h_matrices,
         kappas,
-        covariance_matrix: None,
-        // A Bayesian fit reports posterior credible intervals, never a Hessian
-        // covariance, so there is no estimator to name (#1382).
-        covariance_method: None,
-        covariance_wall_time_secs: 0.0,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        mstep_optimizer_used: None,
         // Post-loop EBE health at the posterior mean. Non-convergence is likelier
         // on the mixture path (K multimodal inner solves per subject), so report it
         // instead of hardcoding a clean run (#985).
@@ -2250,23 +2239,9 @@ pub fn run_bayes(
         max_unconverged_subjects: ebe_stats.n_unconverged as u32,
         total_ebe_fallbacks: ebe_stats.n_fallback as u32,
         total_ebe_nm_polished: ebe_stats.n_nm_polished as u32,
-        final_gradient: None,
-        final_gradient_source: None,
-        sir_fallback_proposal: None,
-        impmap_trace: None,
         bayes: Some(bayes),
-        cond_dist: None,
-        packed_estimate: None,
-        left_init: None,
-        stationary_start: false,
         mixture_posteriors,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
-        newton_decrement: None,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(mean_params)
     })
 }
 
