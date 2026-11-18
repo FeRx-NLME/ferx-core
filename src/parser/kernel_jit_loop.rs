@@ -526,7 +526,7 @@ pub(super) fn record_segment(
     let mut out = vec![0.0; spec.n_out()];
     // No kernel for this segment is structural (the subject's); a run that fails on its values
     // is this point's.
-    let Some(kernels) = LoopKernels::resolve(&spec, Layout::F64, false) else {
+    let Some(kernels) = LoopKernels::resolve(&spec, Layout::F64, Sweep::Forward) else {
         fail_subject("an ODE segment has no kernels");
         return None;
     };
@@ -611,10 +611,15 @@ pub(crate) struct LoopKernels {
 }
 
 impl LoopKernels {
-    /// The kernels at `layout`, the bodies' reverse passes when `rev`.
-    pub(crate) fn resolve(spec: &LoopSpec, layout: Layout, rev: bool) -> Option<Arc<LoopKernels>> {
-        let get = |b: &LoopBody| b.prog.get(layout, rev);
-        let rhs_f64 = spec.rhs.prog.get(Layout::F64, false)?;
+    /// The kernels at `layout` for `sweep` (the bodies' passes; the right-hand side and the
+    /// switch functions are always the value forward).
+    pub(crate) fn resolve(
+        spec: &LoopSpec,
+        layout: Layout,
+        sweep: Sweep,
+    ) -> Option<Arc<LoopKernels>> {
+        let get = |b: &LoopBody| b.prog.get(layout, sweep);
+        let rhs_f64 = spec.rhs.prog.get(Layout::F64, Sweep::Forward)?;
         let methods = spec
             .methods
             .iter()
@@ -644,7 +649,7 @@ impl LoopKernels {
             .collect::<Option<Vec<_>>>()?;
         let sw_f64 = match &spec.sw_g {
             Some(b) => Some((
-                b.prog.get(Layout::F64, false)?,
+                b.prog.get(Layout::F64, Sweep::Forward)?,
                 (0..slots(b) as u32).collect(),
             )),
             None => None,
@@ -846,6 +851,22 @@ struct LoopRun {
     /// `[u0 (n), captures]`, `l` lanes each.
     inputs: Vec<f64>,
     st: RefCell<RunState>,
+    /// A run along several directions at once (#2980): per seed every slot's tangents, which
+    /// follow `buf` through every operation the run applies to it.
+    rows: Option<Rows>,
+}
+
+/// A rows run's tangents ([`run_loop_rows`]): per seed its slots' tangent lanes (`sl.total ×
+/// l` each), its inputs' tangents, and what the run takes per seed — points, the pending
+/// continuous extension, and the bodies' inputs as a one-tangent run's log holds them.
+struct Rows {
+    seeds: usize,
+    tb: RefCell<Vec<f64>>,
+    tin: Vec<f64>,
+    hard: RefCell<Vec<Vec<f64>>>,
+    soft: RefCell<Vec<Vec<f64>>>,
+    pend: RefCell<Vec<Vec<f64>>>,
+    vars: RefCell<Vec<Vec<f64>>>,
 }
 
 #[derive(Default)]
@@ -872,6 +893,7 @@ impl LoopRun {
         l: usize,
         inputs: &[f64],
         log: Option<Log>,
+        rows: Option<(&[f64], usize)>,
     ) -> Self {
         let (n, nc) = (spec.n, spec.n_caps);
         let sl = kern.sl;
@@ -881,7 +903,26 @@ impl LoopRun {
         buf[caps * l..(caps + nc) * l].copy_from_slice(&inputs[n * l..(n + nc) * l]);
         let mut ins = take_buf();
         ins.extend_from_slice(inputs);
+        let rows = rows.map(|(tin, seeds)| {
+            let (stride, w_in) = (sl.total * l, (n + nc) * l);
+            let mut tb = vec![0.0; seeds * stride];
+            for sd in 0..seeds {
+                tb[sd * stride + caps * l..sd * stride + (caps + nc) * l]
+                    .copy_from_slice(&tin[sd * w_in + n * l..(sd + 1) * w_in]);
+            }
+            let per = || RefCell::new(vec![Vec::new(); seeds]);
+            Rows {
+                seeds,
+                tb: RefCell::new(tb),
+                tin: tin.to_vec(),
+                hard: per(),
+                soft: per(),
+                pend: per(),
+                vars: per(),
+            }
+        });
         LoopRun {
+            rows,
             spec: spec.clone(),
             kern: kern.clone(),
             l,
@@ -913,6 +954,17 @@ impl LoopRun {
                 }
                 log.entries.push(Entry::Body { m, kind, at });
             }
+            if let (Some(r), true) = (self.rows.as_ref(), st.log.is_some()) {
+                let tb = r.tb.borrow();
+                let stride = self.sl.total * l;
+                for (sd, v) in r.vars.borrow_mut().iter_mut().enumerate() {
+                    for &s in &table[..b.n_vars] {
+                        let s = s as usize;
+                        v.extend_from_slice(&buf[s * l..(s + 1) * l]);
+                        v.extend_from_slice(&tb[sd * stride + s * l..sd * stride + (s + 1) * l]);
+                    }
+                }
+            }
         }
         debug_assert!(
             buf.len() >= self.sl.total * l && table.iter().all(|&s| (s as usize) < self.sl.total),
@@ -922,14 +974,27 @@ impl LoopRun {
         );
         // SAFETY: every slot in `table` is below `sl.total`, whose `l` lanes each `buf` holds,
         // laid out as the kernel's layout reads them.
-        unsafe {
-            k.call(
-                buf.as_mut_ptr(),
-                std::ptr::null_mut(),
-                table.as_ptr(),
-                b.lits.as_ptr(),
-            )
-        };
+        match self.rows.as_ref() {
+            // SAFETY: as above, each seed's block of `tb` laid out like `buf`.
+            Some(r) => unsafe {
+                k.call_seeds(
+                    buf.as_mut_ptr(),
+                    r.tb.borrow_mut().as_mut_ptr(),
+                    self.sl.total * l,
+                    r.seeds,
+                    table.as_ptr(),
+                    b.lits.as_ptr(),
+                )
+            },
+            None => unsafe {
+                k.call(
+                    buf.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    table.as_ptr(),
+                    b.lits.as_ptr(),
+                )
+            },
+        }
         let ok = !b.guarded || buf[self.sl.guard * l] == 1.0;
         if !ok && super::debug() {
             let vars: Vec<f64> = table[..b.n_vars]
@@ -953,6 +1018,23 @@ impl LoopRun {
             dst.extend(u.iter().map(|&v| v * f64::NAN));
         } else {
             dst.extend_from_slice(u);
+        }
+        if let Some(r) = self.rows.as_ref() {
+            let tb = r.tb.borrow();
+            let stride = self.sl.total * l;
+            let mut pts = if soft {
+                r.soft.borrow_mut()
+            } else {
+                r.hard.borrow_mut()
+            };
+            for (sd, d) in pts.iter_mut().enumerate() {
+                let tu = &tb[sd * stride + self.sl.u * l..sd * stride + (self.sl.u + n) * l];
+                if diverged {
+                    d.extend(tu.iter().map(|&v| v * f64::NAN));
+                } else {
+                    d.extend_from_slice(tu);
+                }
+            }
         }
         if let Some(log) = st.log.as_mut() {
             log.entries.push(Entry::Point {
@@ -1007,6 +1089,14 @@ impl sol::LaneHook for Hook {
             let l = run.l;
             let mut buf = run.buf.borrow_mut();
             buf[sl.carried[0] * l..(sl.carried[1] + c) * l].fill(0.0);
+            if let Some(r) = run.rows.as_ref() {
+                let stride = sl.total * l;
+                let mut tb = r.tb.borrow_mut();
+                for sd in 0..r.seeds {
+                    tb[sd * stride + sl.carried[0] * l..sd * stride + (sl.carried[1] + c) * l]
+                        .fill(0.0);
+                }
+            }
         }
         Box::new(Lanes {
             u_new: vec![0.0; run.spec.n],
@@ -1022,6 +1112,25 @@ impl sol::LaneHook for Hook {
         let (n, l) = (run.spec.n, run.l);
         run.buf.borrow_mut()[run.sl.u * l..(run.sl.u + n) * l]
             .copy_from_slice(&run.inputs[..n * l]);
+        if let Some(r) = run.rows.as_ref() {
+            let (stride, w_in) = (run.sl.total * l, (n + run.spec.n_caps) * l);
+            let mut tb = r.tb.borrow_mut();
+            for sd in 0..r.seeds {
+                tb[sd * stride + run.sl.u * l..sd * stride + (run.sl.u + n) * l]
+                    .copy_from_slice(&r.tin[sd * w_in..sd * w_in + n * l]);
+            }
+            for v in r
+                .hard
+                .borrow_mut()
+                .iter_mut()
+                .chain(r.soft.borrow_mut().iter_mut())
+            {
+                v.clear();
+            }
+            for v in r.vars.borrow_mut().iter_mut() {
+                v.clear();
+            }
+        }
         let mut st = run.st.borrow_mut();
         st.hard.clear();
         st.soft.clear();
@@ -1063,11 +1172,34 @@ impl sol::LaneHook for Hook {
             let u_old = buf[(sl.u + i) * l + lane];
             st.pend[i * l + lane] = cl.interp(c, theta, u_old, dt, i);
         }
+        // The extension is linear in the lanes, so each seed's tangent is the same map of its
+        // carried state's tangents.
+        if let Some(r) = run.rows.as_ref() {
+            let stride = sl.total * l;
+            let tb = r.tb.borrow();
+            for (sd, p) in r.pend.borrow_mut().iter_mut().enumerate() {
+                if p.len() != n * l {
+                    p.clear();
+                    p.resize(n * l, 0.0);
+                }
+                let t = &tb[sd * stride..(sd + 1) * stride];
+                for lane in 0..l {
+                    let c = sol::Carried::new(&t[base + lane..], l);
+                    let u_old = t[(sl.u + i) * l + lane];
+                    p[i * l + lane] = cl.interp(c, theta, u_old, dt, i);
+                }
+            }
+        }
     }
     fn interp_done(&self) {
         let mut st = self.0.st.borrow_mut();
         let st = &mut *st;
         st.soft.extend_from_slice(&st.pend);
+        if let Some(r) = self.0.rows.as_ref() {
+            for (s, p) in r.soft.borrow_mut().iter_mut().zip(r.pend.borrow().iter()) {
+                s.extend_from_slice(p);
+            }
+        }
     }
     fn tail(&self, soft: bool, diverged: bool) {
         let mut st = self.0.st.borrow_mut();
@@ -1119,6 +1251,14 @@ impl sol::LaneHook for Hook {
         }
         let src = sl.carried[0] * l;
         run.buf.borrow_mut().copy_within(src..src + n * l, sl.u * l);
+        if let Some(r) = run.rows.as_ref() {
+            let stride = sl.total * l;
+            let mut tb = r.tb.borrow_mut();
+            for sd in 0..r.seeds {
+                let o = sd * stride;
+                tb.copy_within(o + src..o + src + n * l, o + sl.u * l);
+            }
+        }
     }
 }
 
@@ -1240,6 +1380,80 @@ pub(crate) fn run_loop(
     auto: &mut sol::OdeAutoSwitchState,
     log: Option<&mut Log>,
 ) -> bool {
+    run_loop_g(spec, kern, l, inputs, out, auto, log, None)
+}
+
+/// A loop call along `seeds` directions at once (#2980): `kern` the kernels at the base layout
+/// for [`super::Sweep::TangentRows`], `tin` per seed its inputs' tangents (laid out as
+/// `inputs`), `tout` per seed its outputs' tangents (as `out`). The step decisions read the
+/// values alone, so every seed takes the run's steps; each body runs its primal once and each
+/// seed's tangent. `logs`, when given, receive per seed the log a one-tangent run would have
+/// written (its packed lanes), for that seed's reverse.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_loop_rows(
+    spec: &Arc<LoopSpec>,
+    kern: &Arc<LoopKernels>,
+    l: usize,
+    inputs: &[f64],
+    tin: &[f64],
+    seeds: usize,
+    out: &mut [f64],
+    tout: &mut [f64],
+    auto: &mut sol::OdeAutoSwitchState,
+    logs: Option<&mut [Log]>,
+) -> bool {
+    let mut main = logs.as_ref().map(|_| Log::take());
+    let rows = RowsIo {
+        tin,
+        seeds,
+        tout,
+        vars_out: Vec::new(),
+    };
+    let mut io = Some(rows);
+    let ok = run_loop_g(spec, kern, l, inputs, out, auto, main.as_mut(), io.as_mut());
+    if let (true, Some(logs), Some(main)) = (ok, logs, main) {
+        let vars = io.map(|r| r.vars_out).unwrap_or_default();
+        for (sd, lg) in logs.iter_mut().enumerate() {
+            lg.clear();
+            // A seed's log holds each body input as a one-tangent run's: its values, then its
+            // tangents — twice the lanes of the run's own, so every body's offset doubles.
+            lg.entries.extend(main.entries.iter().map(|e| match *e {
+                Entry::Body { m, kind, at } => Entry::Body {
+                    m,
+                    kind,
+                    at: 2 * at,
+                },
+                ref e => e.clone(),
+            }));
+            if let Some(v) = vars.get(sd) {
+                lg.vars.extend_from_slice(v);
+            }
+        }
+        main.give();
+    }
+    ok
+}
+
+/// A rows run's inputs and outputs ([`run_loop_rows`]).
+struct RowsIo<'a> {
+    tin: &'a [f64],
+    seeds: usize,
+    tout: &'a mut [f64],
+    /// Per seed its bodies' inputs, packed as a one-tangent run's log holds them.
+    vars_out: Vec<Vec<f64>>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop_g(
+    spec: &Arc<LoopSpec>,
+    kern: &Arc<LoopKernels>,
+    l: usize,
+    inputs: &[f64],
+    out: &mut [f64],
+    auto: &mut sol::OdeAutoSwitchState,
+    log: Option<&mut Log>,
+    rows: Option<&mut RowsIo<'_>>,
+) -> bool {
     if sol::current_ode_override() != spec.ov {
         return false;
     }
@@ -1250,6 +1464,7 @@ pub(crate) fn run_loop(
         l,
         inputs,
         log.as_deref_mut().map(std::mem::take),
+        rows.as_ref().map(|r| (r.tin, r.seeds)),
     ));
     let n = spec.n;
     // The driver's own right-hand side (its stiffness probes): the body at the value layout,
@@ -1343,6 +1558,19 @@ pub(crate) fn run_loop(
     let nh = st.hard.len();
     out[..nh].copy_from_slice(&st.hard);
     out[nh..nh + st.soft.len()].copy_from_slice(&st.soft);
+    if let (Some(io), Some(r)) = (rows, run.rows.as_ref()) {
+        let w = nh + st.soft.len();
+        let (hard, soft) = (r.hard.borrow(), r.soft.borrow());
+        for sd in 0..io.seeds {
+            let (h, s) = (&hard[sd], &soft[sd]);
+            if h.len() != nh || s.len() != st.soft.len() {
+                return false;
+            }
+            io.tout[sd * w..sd * w + nh].copy_from_slice(h);
+            io.tout[sd * w + nh..(sd + 1) * w].copy_from_slice(s);
+        }
+        io.vars_out = std::mem::take(&mut *r.vars.borrow_mut());
+    }
     true
 }
 
@@ -1583,4 +1811,271 @@ pub(crate) fn run_loop_rev(
         give_buf(b);
     }
     true
+}
+
+/// [`run_loop_rev`] for a rows forward (#2980, `super::Sweep::TangentReverseRows` kernels at
+/// the base layout, `l` lanes): forward over reverse with the adjoint seed every seed shares.
+/// The adjoints are blocks — block 0 their values, block `1 + s` seed `s`'s tangents of them —
+/// and every step of the reverse that is linear in them (points, the continuous extension, a
+/// fresh stepper, the inputs at the start) applies to each block as `run_loop_rev`'s seeds;
+/// a body runs its reverse once and each seed's tangent of it, on the shared `[values |
+/// adjoint values]` and each seed's `[tangents | adjoint tangents]` through a doubled slot
+/// table. `inputs`/`tin` the values and per-seed tangents of the call's inputs, `logs` each
+/// seed's one-tangent log ([`run_loop_rows`]), `out_adj`/`in_adj` laid out by block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_loop_rev_rows(
+    spec: &LoopSpec,
+    rev: &LoopKernels,
+    l: usize,
+    inputs: &[f64],
+    tin: &[f64],
+    logs: &[&Log],
+    out_adj: &[f64],
+    in_adj: &mut [f64],
+) -> bool {
+    let seeds = logs.len();
+    let Some(log) = logs.first() else {
+        return false;
+    };
+    let blocks = 1 + seeds;
+    let n = spec.n;
+    let n_hard = spec.saveat.len();
+    let (out_w, in_w) = (out_adj.len() / blocks, in_adj.len() / blocks);
+    let nl = n * l;
+    let cap_w = spec.n_caps * l;
+    let w_in = (n + spec.n_caps) * l;
+    let mut ubar = vec![0.0; blocks * nl];
+    let mut capbar = vec![0.0; blocks * cap_w];
+    let (mut cbar, mut probe, mut a_c) = (Vec::new(), Vec::new(), Vec::new());
+    // A body's reverse: the shared buffer and each seed's, through the doubled table — buffers
+    // reused across the run's bodies.
+    let (mut sh, mut ts, mut tbl) = (Vec::new(), Vec::new(), Vec::new());
+    for e in log.entries.iter().rev() {
+        match e {
+            Entry::Point {
+                soft,
+                idx: k,
+                diverged,
+            } => {
+                let at = (if *soft { n_hard + k } else { *k }) * nl;
+                for bk in 0..blocks {
+                    let src = &out_adj[bk * out_w + at..bk * out_w + at + nl];
+                    for (x, &g) in ubar[bk * nl..(bk + 1) * nl].iter_mut().zip(src) {
+                        *x += if *diverged { g * f64::NAN } else { g };
+                    }
+                }
+            }
+            Entry::Interp {
+                m,
+                idx: k,
+                i,
+                theta,
+                dt,
+            } => {
+                let mb = &spec.methods[*m];
+                let cl = mb.c * l;
+                if cbar.len() != blocks * cl {
+                    cbar.clear();
+                    cbar.resize(blocks * cl, 0.0);
+                }
+                probe.clear();
+                probe.resize(mb.c, 0.0);
+                let a_u = mb
+                    .cl
+                    .interp(sol::Carried::new(&probe, 1), *theta, 1.0, *dt, *i);
+                a_c.clear();
+                for j in 0..mb.c {
+                    probe[j] = 1.0;
+                    a_c.push(
+                        mb.cl
+                            .interp(sol::Carried::new(&probe, 1), *theta, 0.0, *dt, *i),
+                    );
+                    probe[j] = 0.0;
+                }
+                let at = (n_hard + k) * nl + i * l;
+                for bk in 0..blocks {
+                    for x in 0..l {
+                        let g = out_adj[bk * out_w + at + x];
+                        ubar[bk * nl + i * l + x] += g * a_u;
+                        for (j, &a) in a_c.iter().enumerate() {
+                            cbar[bk * cl + j * l + x] += g * a;
+                        }
+                    }
+                }
+            }
+            Entry::NewStepper => cbar.clear(),
+            Entry::Body { m, kind: 3, at } => {
+                let b = &spec.jumps[*m];
+                let k = &rev.jumps[*m].0;
+                let n_in = b.n_vars + b.caps.len();
+                let w = rows_body_inputs(b, l, n, w_in, logs, inputs, tin, *at, &mut sh, &mut ts);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    a[n_in * l..n_in * l + nl].copy_from_slice(&ubar[bk * nl..(bk + 1) * nl]);
+                }
+                rows_body_call(k, b, l, seeds, &mut sh, &mut ts, &mut tbl);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    for (j, &cp) in b.caps.iter().enumerate() {
+                        for x in 0..l {
+                            capbar[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
+                        }
+                    }
+                    ubar[bk * nl..(bk + 1) * nl].copy_from_slice(&a[..nl]);
+                }
+            }
+            Entry::Begin => {
+                for bk in 0..blocks {
+                    for (x, &g) in in_adj[bk * in_w..bk * in_w + nl]
+                        .iter_mut()
+                        .zip(&ubar[bk * nl..(bk + 1) * nl])
+                    {
+                        *x += g;
+                    }
+                }
+                break;
+            }
+            Entry::Body { m, kind, at } => {
+                let mb = &spec.methods[*m];
+                let c = mb.c;
+                let cl = c * l;
+                if cbar.len() != blocks * cl {
+                    cbar.clear();
+                    cbar.resize(blocks * cl, 0.0);
+                }
+                let (b, k) = match kind {
+                    0 => (&mb.start, &rev.methods[*m][0]),
+                    1 => (&mb.step, &rev.methods[*m][1]),
+                    2 => (&mb.accept, &rev.methods[*m][2]),
+                    j => (
+                        &mb.forced[*j as usize - 4],
+                        &rev.forced[*m][*j as usize - 4].0,
+                    ),
+                };
+                let n_in = b.n_vars + b.caps.len();
+                let accept = *kind == 2;
+                let w = rows_body_inputs(b, l, n, w_in, logs, inputs, tin, *at, &mut sh, &mut ts);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    a[n_in * l..n_in * l + cl].copy_from_slice(&cbar[bk * cl..(bk + 1) * cl]);
+                    if accept {
+                        a[n_in * l + cl..n_in * l + cl + nl]
+                            .copy_from_slice(&ubar[bk * nl..(bk + 1) * nl]);
+                    }
+                }
+                rows_body_call(k, b, l, seeds, &mut sh, &mut ts, &mut tbl);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    for (j, &cp) in b.caps.iter().enumerate() {
+                        for x in 0..l {
+                            capbar[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
+                        }
+                    }
+                    let (u, c) = (
+                        &mut ubar[bk * nl..(bk + 1) * nl],
+                        &mut cbar[bk * cl..(bk + 1) * cl],
+                    );
+                    if accept {
+                        c.copy_from_slice(&a[..cl]);
+                        u.fill(0.0);
+                    } else {
+                        for (x, &g) in u.iter_mut().zip(&a[..nl]) {
+                            *x += g;
+                        }
+                        c.copy_from_slice(&a[nl..nl + cl]);
+                    }
+                }
+            }
+        }
+    }
+    for bk in 0..blocks {
+        for (x, &g) in in_adj[bk * in_w + nl..(bk + 1) * in_w]
+            .iter_mut()
+            .zip(&capbar[bk * cap_w..(bk + 1) * cap_w])
+        {
+            *x += g;
+        }
+    }
+    true
+}
+
+/// A rows reverse body's inputs (#2980): the shared `[values | ·]` from the first seed's log and
+/// each seed's `[tangents | ·]` from its own, the captures from the call's inputs; the adjoint
+/// halves zeroed. Returns the half width `w` (`n_slots × l`).
+#[allow(clippy::too_many_arguments)]
+fn rows_body_inputs(
+    b: &LoopBody,
+    l: usize,
+    n: usize,
+    w_in: usize,
+    logs: &[&Log],
+    inputs: &[f64],
+    tin: &[f64],
+    at: usize,
+    sh: &mut Vec<f64>,
+    ts: &mut Vec<f64>,
+) -> usize {
+    let hl = 2 * l;
+    let seeds = logs.len();
+    let n_slots = b.n_vars + b.caps.len() + b.n_out + b.guarded as usize;
+    let w = n_slots * l;
+    sh.clear();
+    sh.resize(2 * w, 0.0);
+    ts.clear();
+    ts.resize(seeds * 2 * w, 0.0);
+    for j in 0..b.n_vars {
+        sh[j * l..(j + 1) * l].copy_from_slice(&logs[0].vars[at + j * hl..at + j * hl + l]);
+        for (sd, lg) in logs.iter().enumerate() {
+            ts[sd * 2 * w + j * l..sd * 2 * w + (j + 1) * l]
+                .copy_from_slice(&lg.vars[at + j * hl + l..at + (j + 1) * hl]);
+        }
+    }
+    for (j, &cp) in b.caps.iter().enumerate() {
+        let o = (b.n_vars + j) * l;
+        sh[o..o + l].copy_from_slice(&inputs[(n + cp) * l..(n + cp + 1) * l]);
+        for sd in 0..seeds {
+            ts[sd * 2 * w + o..sd * 2 * w + o + l]
+                .copy_from_slice(&tin[sd * w_in + (n + cp) * l..sd * w_in + (n + cp + 1) * l]);
+        }
+    }
+    w
+}
+
+/// Block `bk`'s adjoint half: the shared buffer's for block 0, seed `bk − 1`'s after.
+fn rows_block<'a>(sh: &'a mut [f64], ts: &'a mut [f64], w: usize, bk: usize) -> &'a mut [f64] {
+    if bk == 0 {
+        &mut sh[w..2 * w]
+    } else {
+        let o = (bk - 1) * 2 * w;
+        &mut ts[o + w..o + 2 * w]
+    }
+}
+
+/// A rows reverse body's kernel over the shared buffer and every seed's, through its doubled
+/// table (built into `tbl`).
+fn rows_body_call(
+    k: &Tiered,
+    b: &LoopBody,
+    l: usize,
+    seeds: usize,
+    sh: &mut [f64],
+    ts: &mut [f64],
+    tbl: &mut Vec<u32>,
+) {
+    let n_slots = b.n_vars + b.caps.len() + b.n_out + b.guarded as usize;
+    let iota: Vec<u32> = (0..n_slots as u32).collect();
+    k.doubled(&iota, n_slots as u32, tbl);
+    let t2 = &tbl[..];
+    // SAFETY: `t2` names slots below `2·n_slots`, whose `l` lanes `sh` and each seed's block of
+    // `ts` hold.
+    unsafe {
+        k.call_seeds(
+            sh.as_mut_ptr(),
+            ts.as_mut_ptr(),
+            2 * n_slots * l,
+            seeds,
+            t2.as_ptr(),
+            b.lits.as_ptr(),
+        )
+    };
 }

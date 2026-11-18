@@ -841,6 +841,10 @@ the unprofiled one (#2136):
   genuine second mode at OFV ≈ 104.68, where ω(ETA_EM) has collapsed, and both ferx and
   NONMEM report it as converged from a start near it. Try more than one start when the
   baseline's start is uncertain.
+- **A collapsed variance.** A free variance that the optimizer leaves below 1/1000 of
+  its initial value while the objective still falls as it rises is re-inflated to its
+  initial value and the fit resumed, or the fit is reported not converged (#3005,
+  [A variance collapsed far below its start](../estimation/optimizers.qmd#variance-collapsed-below-start)).
 - **A variance short of its guard.** A free variance that the optimizer leaves just above
   its internal lower guard while the objective is lower on the guard is resumed from the
   guard, or the fit is reported not converged (#2832,

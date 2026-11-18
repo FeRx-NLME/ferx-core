@@ -8247,6 +8247,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // #2832's adopted rail completion; its not-converged twin says "not reported as
         // converged" and is filed by the convergence arm above first.
         || lower.contains("resumed from just above the guard")
+        // #3005's adopted collapse completion, the same shape.
+        || lower.contains("re-inflated to the initial value")
     {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {

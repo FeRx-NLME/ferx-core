@@ -281,6 +281,10 @@ fn superpose_doses<T: PkNum>(
         let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
             continue;
         };
+        // Each dose's term its own chunk: its code depends on the dose's kind and the model, not
+        // on how many doses came before, so subjects with different designs share it (their
+        // times and amounts are the chunk's literals) and it is compiled once per model (#2980).
+        T::chunk_mark();
         // A degenerate `CL` or `V` drops the dose and a `NaN` one makes it `NaN`: the value
         // path's own override in `pk::single_dose_concentration`, from the same helper, so
         // this recording and the prediction it differentiates serve the same constant
