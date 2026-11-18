@@ -632,6 +632,17 @@ pub(crate) fn mixture_gradient_salvaged(
             model, subject, params, d.cls, d.eta, options,
         ))
     };
+    // An IOV gradient reads every class's κ̂. The caller's gate for producing them
+    // (`needs_class_modes`) is this one; a caller that did not have them gets them re-solved
+    // here from the same inputs, so the function is total over `modes`.
+    let resolved;
+    let modes = match modes {
+        None if needs_class_modes(params) => {
+            resolved = mixture_ofv_with_modes(model, population, params, options, None).1;
+            Some(&resolved)
+        }
+        m => m,
+    };
     let rows = mixture_subject_gradients(
         model,
         population,
@@ -642,7 +653,7 @@ pub(crate) fn mixture_gradient_salvaged(
         Some(&salvage),
         |f| f(),
     )
-    .expect("an IOV mixture gradient needs the class modes (`modes`)");
+    .expect("a mixture model's params carry the mixture (the caller holds a `MixtureEval`)");
     let mut grad = vec![0.0f64; packed_segments(params).total()];
     for row in &rows {
         for (g, v) in grad.iter_mut().zip(row) {
@@ -650,6 +661,13 @@ pub(crate) fn mixture_gradient_salvaged(
         }
     }
     grad
+}
+
+/// Whether the mixture gradient needs every class's modes ([`MixtureClassModes`]) — an IOV
+/// mixture's κ̂, which the eval keeps for the MIXEST class only. The one condition the
+/// producer (the outer loop) and the consumer ([`mixture_subject_gradients`]) both read.
+pub(crate) fn needs_class_modes(params: &ModelParameters) -> bool {
+    params.omega_iov.is_some()
 }
 
 /// One (subject × class) term the adjoint declined: what its salvage needs.
@@ -690,7 +708,7 @@ pub(crate) fn mixture_subject_gradients(
     use crate::sens::ode_provider::adjoint::PackedPoint;
     let spec = model.mixture.as_ref()?;
     let mp = params.mixture.as_ref()?;
-    let iov = params.omega_iov.is_some();
+    let iov = needs_class_modes(params);
     if iov && modes.is_none() {
         return None;
     }
@@ -827,15 +845,9 @@ fn class_subject_reconverged_gradient(
     let x_k = pack_params(&cp);
     let bounds = crate::estimation::parameterization::compute_bounds(&cp);
     let _guard = MixtureClassGuard::enter(cls + 1);
-    if cp.omega_iov.is_some() {
-        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
-            &x_k, &cp, model, subject, eta, &bounds, options,
-        )
-    } else {
-        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
-            &x_k, &cp, model, subject, eta, &bounds, options,
-        )
-    }
+    crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+        &x_k, &cp, model, subject, eta, &bounds, options,
+    )
 }
 
 /// θ → packed chain factor `dθ_j/dx_j`: `θ_j` for a log-packed θ, 1 for an identity one.
@@ -2013,6 +2025,42 @@ mod tests {
         }
         eprintln!("IOV mixture_gradient vs reconverged FD: worst {worst:.2e}");
         assert!(worst < 1e-7, "{worst:.2e}");
+    }
+
+    /// #3004 review: an IOV mixture handed no class modes used to panic
+    /// [`super::mixture_gradient_salvaged`] (`.expect` on a `None` the two gates produced
+    /// separately: the outer loop's `n_kappa > 0`, the gradient's `omega_iov.is_some()`). The
+    /// modes are now re-solved from the same inputs, so the answer is the one with the modes
+    /// supplied, bit for bit. Mutation: drop the `None if needs_class_modes` arm -> panic.
+    #[test]
+    fn iov_mixture_gradient_without_class_modes_resolves_them() {
+        use crate::estimation::outer_optimizer::OuterFdDeclineLog;
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            inner_tol: 1e-10,
+            ..crate::types::FitOptions::default()
+        };
+        let params = &model.default_params;
+        assert!(super::needs_class_modes(params), "premise: IOV");
+        let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let with = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            &log,
+        );
+        let without =
+            super::mixture_gradient_salvaged(&model, &pop, params, &opts, &eval, None, &log);
+        assert!(with.iter().all(|g| g.is_finite()));
+        assert_eq!(with.len(), without.len());
+        for (a, b) in with.iter().zip(&without) {
+            assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+        }
     }
 
     /// #3009 review 4: a class mode whose κ̂ count does not match the subject's occasions (a

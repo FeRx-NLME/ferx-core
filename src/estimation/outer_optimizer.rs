@@ -7339,17 +7339,18 @@ fn optimize_nlopt_attempt_probed(
             let solved = if params.mixture.is_some() {
                 let warm = (!state.cached_etas_by_class.is_empty())
                     .then_some(state.cached_etas_by_class.as_slice());
-                let mut m = if grad.is_some() && model.n_kappa > 0 {
-                    let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-                        model, population, &params, options, warm,
-                    );
-                    mixmodes = Some(modes);
-                    m
-                } else {
-                    crate::estimation::mixture::mixture_ofv(
-                        model, population, &params, options, warm,
-                    )
-                };
+                let mut m =
+                    if grad.is_some() && crate::estimation::mixture::needs_class_modes(&params) {
+                        let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+                            model, population, &params, options, warm,
+                        );
+                        mixmodes = Some(modes);
+                        m
+                    } else {
+                        crate::estimation::mixture::mixture_ofv(
+                            model, population, &params, options, warm,
+                        )
+                    };
                 let stats = InnerLoopStats {
                     n_unconverged: m.ebe_stats.n_unconverged,
                     n_fallback: m.ebe_stats.n_fallback,
@@ -10372,7 +10373,7 @@ fn reporting_gradient(
 /// so it is the marginal's gradient, as the stencil's re-solved EBEs make that one), plus the
 /// NN-penalty and prior gradients. `None` — the caller takes the stencil — outside the
 /// analytic gradient's model scope, under `reconverge_gradient_interval`, when any subject
-/// would take a finite-difference or held-EBE salvage (the label would then claim more than
+/// would take a finite-difference salvage (the label would then claim more than
 /// it delivers; a subject served exactly at its re-solved EBE, [`declined_salvage`], is
 /// exact), or on a non-finite component. A mixture differentiates its K-fold objective at every class's
 /// modes, re-solved once at the estimates.
@@ -10691,19 +10692,15 @@ fn central_diff_packed(
 }
 
 /// Per-subject packed gradient `dᵢ = d(nllᵢ)/dx` at the **held** EBE `η̂ᵢ` and held
-/// prediction Jacobian — the per-subject term of [`ad_population_gradient`], and the fill
-/// for a subject `subject_analytic_outer_gradient` declines inside
-/// [`population_gradient_sens_mixed_dx`] (#1529).
+/// prediction Jacobian — the per-subject term of [`ad_population_gradient`] and of the
+/// fixed-EBE scores the Gauss-Newton and trust-region paths difference. No declined subject
+/// takes it any more ([`declined_salvage`], #3004).
 ///
 /// It costs `2·n_free` objective evaluations of this one subject (or one closed-form
 /// Laplace / Sheiner–Beal pass where `subject_nll_pop_grad` has one) and **no** inner
 /// re-solve. For FOCEI the envelope theorem makes the held-η̂ data/prior gradient exact;
 /// what it omits is the `½·∂log|H̃|/∂η · dη̂/dx` EBE response, the same term the
 /// `reconverge_gradient_interval` schedule governs for every other fixed-EBE gradient.
-/// A declined subject therefore follows that schedule like the rest of the fit: an
-/// evaluation the schedule reconverges never reaches the mixed assembly (the whole
-/// population takes [`reconverged_fd_gradient`]), and the evaluations in between charge a
-/// declined subject the cheap gradient rather than `2·n_free` full `find_ebe` solves.
 ///
 /// Returns `(nllᵢ, d(nllᵢ)/dx)`, the gradient of length `x.len()`; the caller scales by
 /// 2 and zeroes fixed coordinates, matching the analytic per-subject convention. `nllᵢ`
@@ -10744,8 +10741,8 @@ fn subject_fixed_ebe_gradient(
 /// at every parameter point of the fit, rather than the parameter-dependent decline
 /// (non-PD inner Hessian at a blown-up trial) #1529 made cheap? (#1536)
 ///
-/// For such a subject the held-EBE gradient would not be an occasional stand-in but the
-/// **only** gradient it ever contributes, and its missing EBE-response term then biases
+/// For such a subject a fixed-EBE gradient would not be an occasional stand-in but the
+/// **only** gradient it ever contributes, and its missing EBE-response term would then bias
 /// every step (on `fluconazole_radboudumc`, before the dense assembly served its paired
 /// rows, L-BFGS stalled at `‖g‖ ≈ 655`, OFV 807.88–810.28 against 738.05; NONMEM 734.64).
 /// The adjoint's kernel scores dense residual covariances itself, so the one structural
@@ -10833,17 +10830,13 @@ fn exact_at_resolved_ebe(
     options: &FitOptions,
 ) -> Option<(Vec<f64>, Vec<f64>)> {
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x)?;
-    let params = unpack_params(x, init_params);
-    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let ebe = find_ebe_for_stage(
+    let (_, ebe) = resolve_subject_ebe(
+        x,
+        init_params,
         model,
         subject,
-        &params,
-        options.inner_maxiter,
+        warm.as_slice(),
         crate::estimation::fd_resolution::tight_tol(options.inner_tol),
-        Some(warm.as_slice()),
-        Some(&mu_k),
-        0,
         options,
     );
     if !crate::estimation::fd_resolution::ebe_resolved(&ebe) {
@@ -10936,7 +10929,10 @@ fn structural_fill(nll: f64) -> DeclinedFill {
 
 /// Central-FD per-subject packed gradient `dᵢ = d(nllᵢ)/dx` that **re-converges that
 /// subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
-/// included. Since #1529 it serves two callers here: a structural decline
+/// included. `warm` is the subject's mode: `η̂`, or the stacked joint mode (`η̂` then each
+/// cell's κ̂, [`joint_warm_start`]) under IOV, so every probe starts at κ̂ rather than κ = 0
+/// (#2261); [`subject_mode_probe`] dispatches the IOV marginal on `n_kappa > 0`. IOV fits
+/// reconverge unconditionally and ignore `reconverge_gradient_interval` (#1529). Since #1529 it serves two callers here: a structural decline
 /// ([`non_iov_declined_salvage`], #1536), and the last resort of [`declined_salvage`] for
 /// a subject the exact route cannot serve at its re-solved EBE (#3004). GN,
 /// trust-region and the covariance step's `S` read it for a subject the adjoint declines
@@ -10947,12 +10943,44 @@ pub(crate) fn subject_reconverged_fd_gradient(
     init_params: &ModelParameters,
     model: &CompiledModel,
     subject: &Subject,
-    warm_eta: &DVector<f64>,
+    warm: &DVector<f64>,
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let probe = subject_mode_probe(init_params, model, subject, warm_eta.as_slice(), options);
+    let probe = subject_mode_probe(init_params, model, subject, warm.as_slice(), options);
     subject_central_diff(x, init_params, model, bounds, options, probe)
+}
+
+/// The subject's EBE re-solved at the packed point `x` to `tol`, warm-started from `warm` (the
+/// stacked `[η̂, κ̂…]` under IOV), with the parameters `x` unpacks to: the one re-solve the
+/// reconverged difference ([`subject_mode_probe`]) and the exact salvage
+/// ([`exact_at_resolved_ebe`]) both start from.
+fn resolve_subject_ebe(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    subject: &Subject,
+    warm: &[f64],
+    tol: f64,
+    options: &FitOptions,
+) -> (
+    ModelParameters,
+    crate::estimation::inner_optimizer::EbeResult,
+) {
+    let params = unpack_params(x, init_params);
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let ebe = find_ebe_for_stage(
+        model,
+        subject,
+        &params,
+        options.inner_maxiter,
+        tol,
+        Some(warm),
+        Some(&mu_k),
+        0,
+        options,
+    );
+    (params, ebe)
 }
 
 /// The subject's marginal NLL at a packed point with its mode re-solved there (warm-started
@@ -10968,19 +10996,8 @@ pub(crate) fn subject_mode_probe<'a>(
     options: &'a FitOptions,
 ) -> impl Fn(&[f64], f64) -> (f64, bool) + 'a {
     move |xv: &[f64], tol: f64| -> (f64, bool) {
-        let params = unpack_params(xv, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let ebe = find_ebe_for_stage(
-            model,
-            subject,
-            &params,
-            options.inner_maxiter,
-            tol,
-            Some(warm),
-            Some(&mu_k),
-            0,
-            options,
-        );
+        let (params, ebe) =
+            resolve_subject_ebe(xv, init_params, model, subject, warm, tol, options);
         let nll = if model.n_kappa > 0 {
             crate::stats::likelihood::foce_subject_nll_iov_cov(
                 model,
@@ -11035,29 +11052,6 @@ fn subject_central_diff(
     };
     let floor = fd_step_floors(init_params, model);
     central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
-}
-
-/// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
-/// one subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
-/// included. Used to salvage subjects outside the analytic IOV scope without dropping the
-/// whole population to FD (#466 review round 2). IOV fits reconverge unconditionally and
-/// ignore `reconverge_gradient_interval`, so unlike the non-IOV
-/// [`subject_fixed_ebe_gradient`] this salvage keeps the reconverged form (#1529). `find_ebe`
-/// dispatches to the IOV joint (η_bsv, κ) EBE for `n_kappa > 0`, and the marginal uses the
-/// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums). `warm` is the
-/// subject's joint mode (`η̂` then each cell's κ̂, [`joint_warm_start`]), so every probe
-/// starts at κ̂ rather than κ = 0 (#2261).
-pub(crate) fn subject_reconverged_fd_gradient_iov(
-    x: &[f64],
-    init_params: &ModelParameters,
-    model: &CompiledModel,
-    subject: &Subject,
-    warm: &DVector<f64>,
-    bounds: &PackedBounds,
-    options: &FitOptions,
-) -> Vec<f64> {
-    let probe = subject_mode_probe(init_params, model, subject, warm.as_slice(), options);
-    subject_central_diff(x, init_params, model, bounds, options, probe)
 }
 
 /// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the
@@ -11403,7 +11397,7 @@ fn blown_up(excess: f64, n_obs: usize) -> bool {
     excess > BLOWN_UP_EXCESS_PER_OBS * n_obs.max(1) as f64
 }
 
-/// Whether subject `i`'s per-subject salvage (held-EBE, or reconverged FD under IOV) is
+/// Whether subject `i`'s per-subject salvage (the exact re-solve or reconverged FD) is
 /// skipped at this trial point, its contribution to the population gradient dropped
 /// instead (#1520). Both gates must hold:
 ///
@@ -11520,6 +11514,13 @@ pub(crate) struct OuterFdDeclineLog {
     /// finite-difference salvage (#1536). A subset of `declined`, so the warning can say
     /// which subjects got which gradient.
     structural: Vec<std::sync::atomic::AtomicBool>,
+    /// The declined subjects whose [`is_structural_decline`] probe answered "not structural"
+    /// once, so [`Self::is_structural`] does not record them again. Only the negative answer
+    /// is kept: it routes the subject to the exact re-solve, which falls back to the same
+    /// reconverged gradient a structural decline takes, so a kept answer can never change which
+    /// gradient a subject gets; a kept *positive* one could pin a point-specific recording
+    /// failure into the whole fit.
+    not_structural: Vec<std::sync::atomic::AtomicBool>,
     /// The declined subjects served exactly at their EBE re-solved at the trial point
     /// ([`declined_salvage`]).
     exact: Vec<std::sync::atomic::AtomicBool>,
@@ -11544,6 +11545,9 @@ pub(crate) struct OuterFdDeclineLog {
     /// test can reach a *numerical* decline on a fixture the adjoint serves.
     #[cfg(test)]
     forced: Vec<std::sync::atomic::AtomicBool>,
+    /// Test hook: how many times [`Self::is_structural`] ran its probe (a recording).
+    #[cfg(test)]
+    structural_probes: AtomicUsize,
 }
 
 /// Why the analytic outer gradient declined a subject (#2713). A large fallback share has
@@ -11595,6 +11599,9 @@ impl OuterFdDeclineLog {
             structural: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
+            not_structural: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
             exact: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
@@ -11615,7 +11622,33 @@ impl OuterFdDeclineLog {
             forced: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
                 .collect(),
+            #[cfg(test)]
+            structural_probes: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether declined subject `i`'s decline is structural, asking `probe`
+    /// ([`is_structural_decline`], one adjoint recording) only until it has answered "no" once:
+    /// a subject that declines at every evaluation under IOV would otherwise pay a recording
+    /// per evaluation for an answer that does not depend on the trial point. A structural
+    /// subject is asked every time (see [`Self::not_structural`] for why).
+    pub(crate) fn is_structural(&self, i: usize, probe: impl FnOnce() -> bool) -> bool {
+        if self
+            .not_structural
+            .get(i)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return false;
+        }
+        #[cfg(test)]
+        self.structural_probes.fetch_add(1, Ordering::Relaxed);
+        let structural = probe();
+        if !structural {
+            if let Some(f) = self.not_structural.get(i) {
+                f.store(true, Ordering::Relaxed);
+            }
+        }
+        structural
     }
 
     /// Treat subject `i`'s analytic outer gradient as declined (tests only).
@@ -11727,7 +11760,7 @@ impl OuterFdDeclineLog {
     }
 
     /// Whether every declined subject was served exactly: no finite-difference or held-EBE
-    /// salvage ran, so a gradient assembled over them is the exact one.
+    /// (quadrature) salvage ran, so a gradient assembled over them is the exact one.
     pub(crate) fn all_declines_exact(&self) -> bool {
         self.declined_indices()
             .into_iter()
@@ -11922,26 +11955,22 @@ pub(crate) fn population_gradient_sens_mixed(
 
 /// Non-IOV population gradient assembled **per subject**: the exact analytic
 /// (Almquist) gradient — including the EBE response on every θ/Ω/σ block — for
-/// every subject inside the provider's scope, and a per-subject
-/// [`subject_fixed_ebe_gradient`] for each subject outside it (or whose analytic
-/// gradient came back non-finite). This replaced the all-or-nothing
-/// `population_gradient_sens` (since retired): previously a single out-of-scope subject forced
-/// the whole population onto the θ-only fixed-EBE gradient, whose biased Ω/σ
-/// block left the variance components pinned at their start and stalled
-/// SLSQP/L-BFGS/MMA above the derivative-free optimum
-/// (focei-slsqp-fixed-ebe-gradient-bias). The in-scope subjects keep the exact
-/// gradient, so only the declined ones carry the fixed-EBE approximation.
+/// every subject inside the provider's scope, and [`declined_salvage`] for each subject
+/// outside it (or whose analytic gradient came back non-finite): the adjoint at the EBE
+/// re-solved at the trial point, else the reconverged finite-difference score, never the
+/// held-EBE gradient, whose missing `log|H̃|` EBE response biased every step it entered
+/// (#1529, #3004). This replaced the all-or-nothing `population_gradient_sens` (since
+/// retired): previously a single out-of-scope subject forced the whole population onto the
+/// θ-only fixed-EBE gradient, whose biased Ω/σ block left the variance components pinned at
+/// their start and stalled SLSQP/L-BFGS/MMA above the derivative-free optimum
+/// (focei-slsqp-fixed-ebe-gradient-bias).
 ///
-/// A declined subject used to be filled with a per-subject *reconverged* FD
-/// gradient — `2·n_free` full `find_ebe` solves each — regardless of
-/// `reconverge_gradient_interval`. Decline rates are parameter-dependent (the
-/// assembly needs a positive-definite inner Hessian), and at a blown-up
-/// line-search trial most of a population can decline at once: on
-/// cyclophosphamide 46 of 55 subjects did, ~1200 inner re-solves for one gradient
-/// and 82% of the fit's wall time (#1529). Evaluations that the schedule
-/// reconverges never get here, so a declined subject now follows that schedule
-/// like every other fixed-EBE gradient — except a **structural** decline
-/// ([`is_structural_decline`]), which still takes the reconverged gradient (#1536).
+/// Decline rates are parameter-dependent (the assembly needs a positive-definite inner
+/// Hessian), and at a blown-up line-search trial most of a population can decline at once: on
+/// cyclophosphamide 46 of 55 subjects did (#1529). The #1520 guard ([`skip_fd_salvage`])
+/// drops the salvage at such a trial, and the exact route costs one inner solve and one
+/// adjoint pass where the reconverged difference costs `2·n_free` solves. A **structural**
+/// decline ([`is_structural_decline`]) takes the reconverged gradient directly (#1536).
 /// Returns the packed `2·Σᵢ dᵢ` with fixed coordinates zeroed.
 ///
 /// `trial` serves the #1520 guard only: a declined subject at a blown-up trial point
@@ -11997,14 +12026,15 @@ pub(crate) fn population_gradient_sens_mixed_dx(
             let g = match analytic {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
                 Ok(g) => g,
-                // Out-of-scope (or non-finite analytic) → per-subject salvage (held-EBE,
-                // or reconverged for a structural decline, #1536), unless the trial point
-                // has blown up (#1520).
+                // Out-of-scope (or non-finite analytic) → per-subject salvage (exact at the
+                // re-solved EBE, or reconverged FD for a structural decline, #1536), unless
+                // the trial point has blown up (#1520).
                 Err(cause) => {
                     declines.record(i);
                     declines.record_cause(i, cause);
-                    let structural =
-                        is_structural_decline(model, subject, init_params, ehs[i].as_slice());
+                    let structural = declines.is_structural(i, || {
+                        is_structural_decline(model, subject, init_params, ehs[i].as_slice())
+                    });
                     if structural {
                         declines.record_structural(i);
                     }
@@ -12070,7 +12100,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
 /// data at all (no observations, no endpoint records) keeps the zero gradient it gives one.
 ///
 /// The analytic half of an IOV subject's outer gradient (the reconverged-FD salvage
-/// [`subject_reconverged_fd_gradient_iov`] is the other), kept separate so
+/// [`subject_reconverged_fd_gradient`] is the other), kept separate so
 /// [`population_gradient_sens_iov_polished`] can put its #1520 guard between the two halves.
 /// The second element is the stacked `η̂` a polished pass took its gradient at.
 fn subject_iov_analytic_gradient(
@@ -12100,7 +12130,7 @@ fn subject_iov_analytic_gradient(
 /// **IOV** population gradient assembled **per subject** — the IOV analogue of
 /// [`population_gradient_sens_mixed_dx`]: the exact analytic stacked-η / block-Ω gradient for
 /// every in-scope subject, and a per-subject reconverged-FD gradient
-/// ([`subject_reconverged_fd_gradient_iov`]) for any out-of-scope (or non-finite) one.
+/// ([`subject_reconverged_fd_gradient`]) for any out-of-scope (or non-finite) one.
 /// Replaces the former all-or-nothing IOV outer gradient, which dropped the *whole*
 /// population to FD on the first out-of-scope subject — so a single infusion / steady-state
 /// / wide-axis subject no longer forces the entire fit onto FD (#466 review round 2).
@@ -12167,8 +12197,9 @@ pub(crate) fn population_gradient_sens_iov_polished(
                 Err(cause) => {
                     declines.record(i);
                     declines.record_cause(i, cause);
-                    let structural =
-                        is_structural_decline(model, subject, init_params, stacked.as_slice());
+                    let structural = declines.is_structural(i, || {
+                        is_structural_decline(model, subject, init_params, stacked.as_slice())
+                    });
                     if structural {
                         declines.record_structural(i);
                     }
@@ -12476,11 +12507,11 @@ fn population_gradient_with_agq_evaluation(
             Some(g)
         } else {
             // Non-IOV: assemble per subject — exact analytic for in-scope
-            // subjects, held-EBE per-subject gradient for out-of-scope ones (#1529).
-            // Always `Some`; the finiteness backstop below still guards it. This
-            // is the fix for focei-slsqp-fixed-ebe-gradient-bias: one out-of-scope
-            // subject no longer drops the whole population to the biased θ-only
-            // fixed-EBE fallback (`ad_population_gradient`).
+            // subjects, the exact gradient at the re-solved EBE (else reconverged FD) for
+            // out-of-scope ones (#1529, #3004). Always `Some`; the finiteness backstop
+            // below still guards it. This is the fix for focei-slsqp-fixed-ebe-gradient-bias:
+            // one out-of-scope subject no longer drops the whole population to the biased
+            // θ-only fixed-EBE fallback (`ad_population_gradient`).
             let (g, dx, polished) = population_gradient_sens_mixed_dx(
                 x,
                 init_params,

@@ -2280,3 +2280,86 @@ fn the_analytic_r_matrix_skips_held_axes_and_keeps_the_free_block_bit_identical(
         }
     }
 }
+
+/// A mixture fit whose covariance step is asked for under Laplace/AGQ (`run_covariance` with a
+/// caller-supplied `n_agq`) reaches `mixture_cov_hessian`, which serves the FOCE/FOCEI class
+/// objectives only and returns `None` for the rest. The walk therefore has to name it
+/// beforehand (`CovScopeDecline::Mixture`), or the route is predicted Analytic and the
+/// stencil's drift is reported as a per-subject bail. Both sides of the gate in one test: FOCE,
+/// FOCEI and a non-mixture model under the same quadrature must not carry the clause.
+#[test]
+fn a_mixture_under_quadrature_is_declined_by_name_and_predicts_the_stencil() {
+    use crate::estimation::cov_diagnostics::CovScopeDecline;
+    use crate::estimation::covariance::PredictedRRoute;
+    use crate::types::{EstimationMethod, FitOptions};
+    let mixture = parse_model_string(
+        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
+         theta MIXL(0.2, -10.0, 10.0)\n  omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
+         [mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.15\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .unwrap();
+    let plain = parse_model_string(
+        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
+         omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .unwrap();
+    let opts = |method, n_agq| FitOptions {
+        method,
+        n_agq,
+        ..FitOptions::default()
+    };
+    for (label, o) in [
+        ("laplace", opts(EstimationMethod::Laplace, 1)),
+        ("agq", opts(EstimationMethod::Laplace, 3)),
+        ("focei+agq", opts(EstimationMethod::FoceI, 3)),
+    ] {
+        assert!(
+            o.agq_nodes().is_some(),
+            "{label}: premise, a quadrature objective"
+        );
+        assert_eq!(
+            super::analytic_cov_model_declines(&mixture, &o),
+            vec![CovScopeDecline::Mixture],
+            "{label}"
+        );
+        assert_eq!(
+            super::predicted_r_route(&mixture, &o),
+            PredictedRRoute::Stencil,
+            "{label}"
+        );
+        assert_eq!(
+            super::analytic_cov_declines(&mixture, &o),
+            vec![CovScopeDecline::Mixture],
+            "{label}: named, not the per-subject-bail fallback"
+        );
+        assert_eq!(
+            super::analytic_cov_model_declines(&plain, &o),
+            Vec::new(),
+            "{label}: the clause is the mixture's, not the quadrature's"
+        );
+    }
+    for (label, o) in [
+        ("foce", opts(EstimationMethod::Foce, 1)),
+        ("focei", opts(EstimationMethod::FoceI, 1)),
+    ] {
+        assert!(o.agq_nodes().is_none(), "{label}");
+        assert_eq!(
+            super::analytic_cov_model_declines(&mixture, &o),
+            Vec::new(),
+            "{label}"
+        );
+        assert_eq!(
+            super::predicted_r_route(&mixture, &o),
+            PredictedRRoute::Analytic,
+            "{label}"
+        );
+    }
+    assert!(
+        CovScopeDecline::Mixture.clause().contains("mixture"),
+        "the message names the mixture"
+    );
+}

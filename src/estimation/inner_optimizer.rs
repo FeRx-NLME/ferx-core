@@ -233,11 +233,12 @@ pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Su
     )
 }
 
-/// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
-/// all-FD guard on it (#1861).
-const IOV_SURVIVAL_REASON: &str = "survival/TTE observations";
+/// [`iov_fd_reason`]'s non-Gaussian cause, named once so [`iov_fd_fallback_warning`] can lift
+/// its all-FD guard on it (#1861): a TTE, binary, CTMM or count record without an exact
+/// channel (`non_gaussian_eta_grad_served`), not survival alone.
+const IOV_SURVIVAL_REASON: &str = "non-Gaussian records without an exact channel";
 
-fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
+pub(crate) fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
@@ -252,6 +253,10 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     }
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         return "model outside IOV analytic scope";
+    }
+    // `iov_inner_rule`'s FREM clause: the IOV marginal refuses the subject's FREM rows.
+    if crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        return "FREM rows (the IOV marginal refuses them)";
     }
     // A nested-level subject never given its cells has no compact axes (#1082): every
     // recording declines it (`StackedLayout::sens_of` is `None`), on every model class.

@@ -95,6 +95,9 @@ impl CovHessianSource {
 pub(crate) enum CovScopeDecline {
     /// `analytic_cov_hessian = false` in `[fit_options]`.
     Disabled,
+    /// Mixture model under an objective its exact assembly does not serve (Laplace / AGQ:
+    /// `mixture_ofv` scores the classes with FOCE/FOCEI).
+    Mixture,
     /// No recorder serves the model (`sens::ode_provider::adjoint::recorder_in_scope`).
     ModelOutOfScope,
     /// `gradient = fd` — the user's explicit opt-out from analytic sensitivities.
@@ -113,8 +116,9 @@ impl CovScopeDecline {
     /// in production enumerates the enum — without it the lib target reports it dead and
     /// `preflight.sh`'s `-Dunused` turns that into a hard error.
     #[cfg(test)]
-    pub(crate) const ALL: [CovScopeDecline; 5] = [
+    pub(crate) const ALL: [CovScopeDecline; 6] = [
         CovScopeDecline::Disabled,
+        CovScopeDecline::Mixture,
         CovScopeDecline::ModelOutOfScope,
         CovScopeDecline::GradientFd,
         CovScopeDecline::NonGaussianEndpoint,
@@ -125,6 +129,7 @@ impl CovScopeDecline {
     pub(crate) fn clause(self) -> &'static str {
         match self {
             CovScopeDecline::Disabled => "analytic_cov_hessian = false",
+            CovScopeDecline::Mixture => "the model is a mixture model under Laplace/AGQ",
             CovScopeDecline::ModelOutOfScope => {
                 "the model is outside the analytic recorders' scope"
             }

@@ -2928,6 +2928,24 @@ fn an_iov_frem_subject_is_reported_the_route_its_search_runs() {
     }
 }
 
+/// The FD reason an IOV + FREM subject is reported under is the FREM refusal, and the
+/// non-Gaussian cause is named for what it covers. Discriminator and negatives: the refused
+/// subject reads the FREM reason and neither the generic scope reason nor the non-Gaussian
+/// one. Mutation: drop the FREM clause from `iov_fd_reason` -> the refused subject reads
+/// "subject outside IOV analytic scope" and the equality dies.
+#[test]
+fn an_iov_frem_subject_is_reported_its_true_fd_reason() {
+    use crate::estimation::inner_optimizer::iov_fd_reason;
+    let model = frem_iov_ode();
+    let (_, refused) = frem_iov_pair(&model);
+    let reason = iov_fd_reason(&model, &refused);
+    assert_eq!(reason, "FREM rows (the IOV marginal refuses them)");
+    assert!(
+        !reason.contains("outside IOV analytic scope") && !reason.contains("non-Gaussian"),
+        "{reason}"
+    );
+}
+
 /// The `frem_iov_ode` subject pair: an ordinary IOV subject and the same one with its last
 /// observation a FREM weight row (the one the IOV marginal refuses).
 fn frem_iov_pair(model: &CompiledModel) -> (Subject, Subject) {

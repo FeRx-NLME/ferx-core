@@ -5787,7 +5787,7 @@ fn iov_fd_fallback_warning_names_the_survival_cause_on_an_all_tte_population() {
     assert!(
         w.starts_with(&format!(
             "{n} of {n} subjects use finite-difference inner gradients in the IOV loop \
-             (survival/TTE observations: {n})"
+             (non-Gaussian records without an exact channel: {n})"
         )),
         "{w}"
     );

@@ -7680,7 +7680,7 @@ pub(crate) mod outer_fd_fallback {
             stacked.extend_from_slice(k.as_slice());
         }
         let warm = DVector::from_column_slice(&stacked);
-        let salvage = subject_reconverged_fd_gradient_iov(&x, p, model, s, &warm, &bounds, &stage);
+        let salvage = subject_reconverged_fd_gradient(&x, p, model, s, &warm, &bounds, &stage);
         let analytic = crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
             model, s, p, &x, &stacked,
         )
@@ -10901,7 +10901,7 @@ fn nested_packed_gradients_match_the_reconverged_fd_gradient() {
             // BFGS cannot certify `inner_tol` from a point already there and every re-solve
             // falls back to Nelder–Mead (2.5 s each, measured), to the same mode.
             let warm = DVector::zeros(stacked.len());
-            let fd = subject_reconverged_fd_gradient_iov(&x, p, model, s, &warm, &bounds, &stage);
+            let fd = subject_reconverged_fd_gradient(&x, p, model, s, &warm, &bounds, &stage);
             assert_eq!(analytic.len(), fd.len());
             let mut worst = 0.0_f64;
             for (i, (a, f)) in analytic.iter().zip(&fd).enumerate() {
@@ -18803,5 +18803,40 @@ fn the_newton_step_is_formed_for_agq_and_mixture_models_and_withheld_under_fd() 
             step_for(&fd, o).is_none(),
             "{label}: gradient = fd forms no Newton step"
         );
+    }
+}
+
+/// #3004 review: whether a decline is structural does not depend on the trial point, so a
+/// subject that declines at every evaluation pays the recording once, not once per evaluation.
+/// `OuterFdDeclineLog::is_structural` keeps the negative answer (which cannot change the gradient
+/// the subject gets: the exact re-solve it routes to falls back to the same reconverged
+/// difference) and asks again for a structural one. Mutation: drop the early return -> the
+/// second ask probes again and the count reads 2; keep a positive answer too -> the structural
+/// subject stops probing and its count reads 1.
+#[test]
+fn a_declined_subject_is_probed_for_structure_once_per_fit() {
+    let log = OuterFdDeclineLog::new(2);
+    let probes = || log.structural_probes.load(Ordering::Relaxed);
+    assert!(!log.is_structural(0, || false));
+    assert_eq!(probes(), 1);
+    assert!(!log.is_structural(0, || panic!("asked again after a negative answer")));
+    assert_eq!(
+        probes(),
+        1,
+        "the second decline of the same subject does not re-record"
+    );
+    // Another subject is its own question.
+    assert!(!log.is_structural(1, || false));
+    assert_eq!(probes(), 2);
+}
+
+/// The other half: a structural answer is asked every time, and the subject keeps the
+/// structural gradient.
+#[test]
+fn a_structural_decline_is_asked_every_evaluation() {
+    let log = OuterFdDeclineLog::new(1);
+    for k in 1..=3 {
+        assert!(log.is_structural(0, || true));
+        assert_eq!(log.structural_probes.load(Ordering::Relaxed), k);
     }
 }

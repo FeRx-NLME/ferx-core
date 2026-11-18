@@ -449,7 +449,7 @@ pub(crate) fn subject_adjoint_held_ebe_score_at(
 /// `H` held as given: `F(θ, Ω, σ; η̂, H)` — the analytic kernel's FOCE (`interaction =
 /// false`, `R⁰` at `f(η = 0)` where the variance is f-dependent) or FOCEI objective, with
 /// `H` and `η̂` constants. This is the score the outer optimizer's fixed-EBE paths
-/// difference (GN, trust region, the S-matrix, the held-EBE salvage), taken exactly: one
+/// difference (GN, trust region, the S-matrix), taken exactly: one
 /// reverse of the objective's kernel plan gives its adjoints in the predictions, `Ω` and `σ`,
 /// and the predictions' θ-derivatives are contracted with them by one recording and one
 /// reverse sweep each ([`fixed_eta_theta_contractions`]). Every feature the kernel scores —

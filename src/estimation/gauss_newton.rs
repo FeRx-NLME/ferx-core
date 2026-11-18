@@ -7332,7 +7332,7 @@ mod tests {
         }
 
         /// The FD-salvage side: `gradient_method = fd` declines the adjoint, so every
-        /// subject takes `subject_reconverged_fd_gradient_iov`.
+        /// subject takes `subject_reconverged_fd_gradient`.
         #[test]
         fn gn_takes_the_fd_salvage_iov_outer_gradient() {
             let (mut model, pop) = warfarin_iov(4);

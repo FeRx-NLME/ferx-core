@@ -263,7 +263,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     let g = match g {
                         Some(g) if g.iter().all(|v| v.is_finite()) => g,
                         // Warm at the subject's joint mode, κ̂ included (#2261).
-                        _ if iov => subject_reconverged_fd_gradient_iov(
+                        _ if iov => subject_reconverged_fd_gradient(
                             &x,
                             params,
                             &model,

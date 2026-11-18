@@ -110,7 +110,7 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// the analytic outer gradient", not "did it":
 ///
 /// - A subject the adjoint declines at runtime is salvaged onto a per-subject gradient —
-///   held-EBE in `population_gradient_sens_mixed` (#1529), reconverged FD in `_iov_mixed` —
+///   the adjoint at its EBE re-solved at the trial point, else reconverged FD (#3004) —
 ///   while this keeps reporting `Analytic` — correctly, for the model.
 /// - A `reconverge_gradient_interval` override forces the reconverged-FD gradient without
 ///   changing this report, as the paragraph above already notes.

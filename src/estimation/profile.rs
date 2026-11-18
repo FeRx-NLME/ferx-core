@@ -1307,7 +1307,7 @@ impl ProfileCtx<'_> {
     }
 
     /// Whether subject `i` reads a level whose θ log-packs in `template`. The adjoint's
-    /// packed derivatives are in `x = ln θ` there, so [`Self::theta_derivatives`] converts
+    /// packed derivatives are in `x = ln θ` there, so [`Self::theta_scale`] converts
     /// them to θ. A parsed profiled block never log-packs (its template box is open, even
     /// under #2402's bounds); a hand-built template can.
     fn reads_a_log_packed_level(&self, i: usize, template: &ModelParameters) -> bool {
