@@ -185,17 +185,14 @@ fn resolve_gradient_method_for_reporting(
     }
 }
 
-fn iov_inner_subject_route(
+pub(crate) fn iov_inner_subject_route(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
     // The search's own rule (`analytic_iov_inner_supported`): an endpoint term the exact
     // programs serve folds into the BSV block, so such a subject is not an FD one.
-    if model.default_params.omega_iov.is_none()
-        || analytic_inner_common_bail(model)
-        || !non_gaussian_eta_grad_served(model, subject)
-    {
+    if !iov_inner_rule(model, subject, model.default_params.omega_iov.is_some()) {
         return None;
     }
     if subject.obs_times.is_empty() && subject_has_survival_records(subject) {
@@ -4731,11 +4728,17 @@ fn refused_iov_ebe(model: &CompiledModel, subject: &Subject) -> EbeResult {
 
 /// Is the IOV solve's η-gradient (and its H) analytic for this subject? The guards are
 /// explained where `find_ebe_iov` reads this.
-fn analytic_iov_inner_supported(
+pub(crate) fn analytic_iov_inner_supported(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
 ) -> bool {
+    iov_inner_rule(model, subject, params.omega_iov.is_some())
+}
+
+/// The one rule behind both the search ([`analytic_iov_inner_supported`]) and the route report
+/// ([`iov_inner_subject_route`]): whether an IOV subject's inner solve is analytic.
+fn iov_inner_rule(model: &CompiledModel, subject: &Subject, has_omega_iov: bool) -> bool {
     // The inner recorder's scope, as the non-IOV inner (`analytic_inner_grad_supported`):
     // `model_in_scope` is the *outer* adjoint's, which refuses every non-Gaussian model —
     // a TTE + IOV model would then report an analytic label and run FD. A subject with no
@@ -4745,7 +4748,7 @@ fn analytic_iov_inner_supported(
         // by the covariate variance over the *PK* prediction, which is not the kernel's
         // `θ_i + η_e` row), so no exact inner gradient is the gradient of what is solved.
         && !crate::stats::likelihood::iov_refuses_frem(model, subject)
-        && params.omega_iov.is_some()
+        && has_omega_iov
         && !analytic_inner_common_bail(model)
         && non_gaussian_eta_grad_served(model, subject)
 }

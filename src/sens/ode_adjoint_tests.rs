@@ -2893,6 +2893,41 @@ fn frem_with_kappa_on_an_ode_is_served_exactly() {
     }
 }
 
+/// The route the inner-solve report gives an IOV + FREM subject is what the search runs. The
+/// IOV marginal refuses a FREM subject's rows, so its search takes finite differences
+/// (`analytic_iov_inner_supported`); the report (`iov_inner_subject_route`) must say so rather
+/// than call it analytic. The control, the same subject without FREM rows, is analytic on
+/// both. Mutation: drop `!iov_refuses_frem` from `iov_inner_rule` -> the refused subject's
+/// route and search both read analytic and the `is_none` assertion dies; read the route
+/// without the shared rule -> the two disagree on the refused subject.
+#[test]
+fn an_iov_frem_subject_is_reported_the_route_its_search_runs() {
+    use crate::estimation::inner_optimizer::{
+        analytic_iov_inner_supported, iov_inner_subject_route,
+    };
+    let model = frem_iov_ode();
+    let params = &model.default_params;
+    let mut plain = iov_subject(&model);
+    plain.fremtype = vec![0; plain.observations.len()];
+    let mut refused = plain.clone();
+    let last = refused.observations.len() - 1;
+    refused.fremtype[last] = 100;
+    assert!(crate::stats::likelihood::iov_refuses_frem(&model, &refused));
+    assert!(!crate::stats::likelihood::iov_refuses_frem(&model, &plain));
+    for (name, s, analytic) in [("plain", &plain, true), ("refused", &refused, false)] {
+        assert_eq!(
+            analytic_iov_inner_supported(&model, s, params),
+            analytic,
+            "{name}: the search"
+        );
+        assert_eq!(
+            iov_inner_subject_route(&model, s, &params.theta).is_some(),
+            analytic,
+            "{name}: the route report"
+        );
+    }
+}
+
 /// The `frem_iov_ode` subject pair: an ordinary IOV subject and the same one with its last
 /// observation a FREM weight row (the one the IOV marginal refuses).
 fn frem_iov_pair(model: &CompiledModel) -> (Subject, Subject) {
@@ -4487,6 +4522,63 @@ fn agq_adjoint_matches_reconverged_fd_both_anchors() {
             "n_agq = {n_agq}, exact = {exact}: {worst:.2e}"
         );
     }
+}
+
+/// One subject's 3-node AGQ gradient against the reconverged-FD oracle, for a model some of
+/// whose quadrature nodes the value path scores as the sentinel (zero weight in the
+/// `logsumexp`, `agq::agq_terms`). The subject must be served, over the nodes that remain,
+/// and the oracle scores the same nodes the same way.
+fn dropped_node_parity(model: &CompiledModel, etas: &[f64]) -> f64 {
+    let s = subject(
+        model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        etas,
+    );
+    let mut worst = 0.0f64;
+    for exact in [true, false] {
+        let w = fd_oracle_agq(model, &s, 3, exact);
+        eprintln!("dropped nodes, exact = {exact}: worst {w:.2e}");
+        assert!(w.is_finite());
+        worst = worst.max(w);
+    }
+    worst
+}
+
+/// A quadrature node whose predictions are `NaN` is dropped, as the objective drops it: the
+/// subject is served exactly, not declined to finite differences. `CL = 16*TVCL*e^eta*(c -
+/// eta^3)^(1/2)` (the parser's `sqrt` clamps at 0; `^` does not) is `NaN` for `eta_CL^3 > c`,
+/// `c = 0.008`: the mode `eta_CL ~ 0.01` and the lower nodes are finite, and 9 of the 27 nodes
+/// (the upper `eta_CL` third) are not. Those nodes' forwards record, with `NaN` predictions,
+/// so the first gradient does not form and the retry over the 18 live nodes serves it.
+/// Mutations: never retrying (`return None` after the first run), or keeping every node in
+/// the retry, each kill it.
+#[test]
+fn a_quadrature_node_with_nan_predictions_is_dropped_not_declined() {
+    let src = ONE_CPT_ORAL.replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = TVCL * exp(ETA_CL) * 16.0 * (0.008 - (ETA_CL ^ 3)) ^ 0.5",
+    );
+    let model = parse_model_string(&src).unwrap();
+    // The value-path predicate a failed forward is classified by: a node past the cliff is
+    // the sentinel, the mode and a lower node are not.
+    let params = moved_params(&model);
+    let one = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let sentinel =
+        |b: &[f64]| crate::estimation::agq::node_is_sentinel(&model, &one, &params, &[0.0; 3], b);
+    assert!(sentinel(&[0.5, 0.0, 0.0]), "eta_CL = 0.5 is NaN");
+    assert!(!sentinel(&[0.0, 0.0, 0.0]) && !sentinel(&[-0.3, 0.0, 0.0]));
+    let worst = dropped_node_parity(&model, &[0.1, -0.05, 0.2]);
+    // Measured 2.6e-8 (Linux); ~20x headroom.
+    assert!(worst < 6e-7, "{worst:.2e}");
 }
 
 /// A packed vector of the wrong length is declined (`None`), not read past its end:
@@ -8358,7 +8450,6 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         } else {
             1e-14
         };
-        eprintln!("MEASURE {name}: {worst:e}");
         assert!(worst < bound, "{name}: worst relative difference {worst:e}");
         worst_all = worst_all.max(worst);
     }

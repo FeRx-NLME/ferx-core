@@ -1994,6 +1994,73 @@ mod tests {
         }
     }
 
+    /// The `z` grid of the stage-form parity: every arm of `normal_cdf_stage` (the erf germ
+    /// `|z| < √2·1e-3`, the `P` region both signs, the `Q` tail `x > 1` i.e. `z < −√2`, and
+    /// `x < −1`, i.e. `z > √2`, where `Φ = ½(1 + erf)`), the points a relative 1e-9 each side of
+    /// the three seams (not the seams themselves: the two forms compare `x` and `x²` against
+    /// the same threshold, which can round to opposite arms at the exact value), and the Mills switch of `log_normal_cdf_stage` (`z = −10`) with the
+    /// Mills arm well below it.
+    fn stage_parity_grid() -> Vec<f64> {
+        let germ_edge = std::f64::consts::SQRT_2 * ERF_GERM_HALF_WIDTH;
+        let mut zs = vec![
+            0.0, 1e-4, -1e-4, 0.5, -0.5, 1.0, -1.0, 2.5, -2.5, 6.0, -6.0, -9.9, -10.0, -10.1,
+            -15.0, -30.0, -100.0,
+        ];
+        for edge in [
+            germ_edge,
+            std::f64::consts::SQRT_2,
+            LOG_NORMAL_CDF_MILLS_SWITCH,
+        ] {
+            for e in [edge, -edge] {
+                zs.extend([e * (1.0 + 1e-9), e * (1.0 - 1e-9)]);
+            }
+        }
+        zs
+    }
+
+    /// [`normal_cdf_stage`] / [`log_normal_cdf_stage`] are the branching [`normal_cdf_g`] /
+    /// [`log_normal_cdf_g`] with the branches turned into selections: the same value, gradient
+    /// and Hessian on every arm and across every seam (#3004). Regression caught: an arm of
+    /// the selection form that drifts from its branching twin (a sign, a threshold, the safe
+    /// argument of the arm not taken). Measured over the grid, at `f64` and in `Dual2<1>`
+    /// jets: the two forms are bit-identical (worst relative difference 0, Linux), so the 1e-13
+    /// bound is headroom for another libm, not the observed error.
+    #[test]
+    fn the_stage_cdfs_match_the_branching_forms_on_every_arm() {
+        use crate::sens::dual2::Dual2;
+        let note = |what: &str, z: f64, a: f64, b: f64| {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{what} at z = {z}: {a} vs {b}"
+            );
+            assert!(
+                (a - b).abs() <= 1e-13 * (1e-300 + a.abs().max(b.abs())),
+                "{what} at z = {z}: stage {a:e} vs branching {b:e}"
+            );
+        };
+        for z in stage_parity_grid() {
+            note("Phi value", z, normal_cdf_stage(z), normal_cdf_g(z));
+            note(
+                "ln Phi value",
+                z,
+                log_normal_cdf_stage(z),
+                log_normal_cdf_g(z),
+            );
+            let (s, g) = (
+                normal_cdf_stage(Dual2::<1>::var(z, 0)),
+                normal_cdf_g(Dual2::<1>::var(z, 0)),
+            );
+            note("Phi grad", z, s.grad[0], g.grad[0]);
+            note("Phi hess", z, s.hess[0][0], g.hess[0][0]);
+            let (s, g) = (
+                log_normal_cdf_stage(Dual2::<1>::var(z, 0)),
+                log_normal_cdf_g(Dual2::<1>::var(z, 0)),
+            );
+            note("ln Phi grad", z, s.grad[0], g.grad[0]);
+            note("ln Phi hess", z, s.hess[0][0], g.hess[0][0]);
+        }
+    }
+
     /// `erfc_g`'s two branches — `1 − erf` (`x ≤ 1`) and `Q(½,x²)` (`x > 1`) — must
     /// agree **at the same point** (value and dual derivative) across the `x = 1`
     /// seam, so the branch switch is a no-op on the gradient path. Evaluated

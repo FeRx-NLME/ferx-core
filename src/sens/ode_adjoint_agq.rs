@@ -19,12 +19,21 @@ use super::*;
 use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, wsum3};
 
+/// A quadrature node's plan forward, kept for its one reverse.
+type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
+/// Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
+/// produced them (the predictions', the variances').
+type Node = (Vec<f64>, Fwd, Option<Fwd>);
+
 /// The quadrature (AGQ, Laplace) gradient of a subject through its plans; `None` where a
 /// plan cannot be recorded.
 ///
-/// Every node first. Only when that gradient does not form (a diverged node: see
-/// [`agq_planned_over`]'s `drop_dropped`) is it re-run without the nodes the objective itself
-/// drops, so a subject with no diverged node pays nothing for the check.
+/// Every node's forward is recorded once. A node whose forward fails is dropped when the value
+/// path scores it as the sentinel (`agq::agq_terms`), and declines the subject otherwise. The
+/// gradient is then formed over the rest; only when it does not form is each node's term
+/// examined, and it is re-run (over the same recorded forwards) only when that drops one: a
+/// diverged node (see below) is left out as the objective leaves it out, while a subject with
+/// no diverged node pays nothing for the check.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn agq_planned(
     model: &CompiledModel,
@@ -47,7 +56,48 @@ pub(super) fn agq_planned(
     var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
     p1: &PredLanes<&[f64]>,
 ) -> Option<Vec<f64>> {
-    let mut run = |drop_dropped: bool| {
+    let theta = &params.theta;
+    let n_obs = subject.observations.len();
+    let sigma = params.sigma.values.as_slice();
+    // The node predictions, values only, each forward kept for its one reverse: a node's
+    // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
+    // `G` itself is never formed. `None` is a node the value path scores as the sentinel.
+    let mut nodes: Vec<Option<Node>> = Vec::with_capacity(grid.len());
+    let mode_plan = mode_fwd.map(|m| &m.0);
+    for (_, _, b) in grid {
+        if n_obs == 0 {
+            break;
+        }
+        let rec = || -> Option<Node> {
+            let (plan, mut du, f) =
+                plan_forward_f64(mode_plan, model, subject, lay, theta, &b[..])?;
+            let var = if var_fwd.is_some() {
+                let (pp, dp, pf) =
+                    plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
+                du.extend(dp);
+                Some((pp, std::sync::Arc::new(pf)))
+            } else {
+                None
+            };
+            Some((du, (plan, std::sync::Arc::new(f)), var))
+        };
+        match rec() {
+            Some(node) => nodes.push(Some(node)),
+            // A forward that fails is a diverged node where the objective scores the node as
+            // its sentinel (zero weight), and a plan that cannot serve it otherwise.
+            None if crate::estimation::agq::node_is_sentinel(model, subject, params, eta, b) => {
+                nodes.push(None)
+            }
+            None => return None,
+        }
+    }
+    let kept: Vec<usize> = (0..grid.len())
+        .filter(|&j| nodes.get(j).is_none_or(|n| n.is_some()))
+        .collect();
+    if kept.is_empty() && !grid.is_empty() {
+        return None;
+    }
+    let mut run = |keep: &[usize]| {
         agq_planned_over(
             model,
             subject,
@@ -60,6 +110,8 @@ pub(super) fn agq_planned(
             so,
             pv,
             grid,
+            &nodes,
+            keep,
             h_exact,
             exact,
             held,
@@ -68,15 +120,43 @@ pub(super) fn agq_planned(
             mode_fwd,
             var_fwd,
             p1,
-            drop_dropped,
         )
         .filter(|g| g.iter().all(|v| v.is_finite()))
     };
-    run(false).or_else(|| run(true))
+    if let Some(g) = run(&kept) {
+        return Some(g);
+    }
+    // The nodes the objective itself drops. A diverged node scores `individual_nll`'s `1e20`
+    // sentinel (`agq::agq_terms`), a log-term of ~-1e20 that `logsumexp` takes to exactly
+    // zero weight; its derivative is then `0 * d(huge or non-finite)`, which the reverse
+    // turns into a NaN and declines the whole subject (a `[covariate_nn]` DCM under 3-node
+    // AGQ, #3004). So a node whose term is non-finite or the sentinel is left out of the
+    // kernel, as it is out of the sum: the value and every gradient component are unchanged by
+    // it. A finite node whose weight merely underflows stays: its derivative is `0 * finite`.
+    let live: Vec<usize> = kept
+        .iter()
+        .copied()
+        .filter(|&j| {
+            let (_, cw, b) = &grid[j];
+            let Some(Some((du, _, _))) = nodes.get(j) else {
+                return true;
+            };
+            inner_l(ctx, du, b, pv, None).is_some_and(|l| {
+                l.is_finite()
+                    && l < crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+                    && (*cw - (l + ng.map_or(0.0, |ng| ng.nodes[j].0))).is_finite()
+            })
+        })
+        .collect();
+    if live.len() < kept.len() && !live.is_empty() {
+        run(&live)
+    } else {
+        None
+    }
 }
 
-/// [`agq_planned`] over the nodes it keeps: every node, or with `drop_dropped` only those whose
-/// term the objective keeps.
+/// [`agq_planned`] over the nodes `keep` names (indices into `grid`; `nodes` holds their recorded
+/// forwards, none when the subject has no prediction rows).
 #[allow(clippy::too_many_arguments)]
 fn agq_planned_over(
     model: &CompiledModel,
@@ -90,6 +170,8 @@ fn agq_planned_over(
     so: &StackedOmega,
     pv: &ParT<f64>,
     grid: &[(Vec<f64>, f64, Vec<f64>)],
+    nodes: &[Option<Node>],
+    keep: &[usize],
     h_exact: Option<&DMatrix<f64>>,
     exact: bool,
     held: bool,
@@ -98,7 +180,6 @@ fn agq_planned_over(
     mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
     var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
     p1: &PredLanes<&[f64]>,
-    drop_dropped: bool,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
@@ -115,67 +196,14 @@ fn agq_planned_over(
     let n_rows = p1.rows();
     let n_th = theta.len();
     let n_cols = n_th + if sde { sigma.len() } else { 0 };
-    // The node predictions, values only, each forward kept for its one reverse: a node's
-    // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
-    // `G` itself is never formed.
-    type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
-    // Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
-    // produced them (the predictions', the variances').
-    type Node = (Vec<f64>, Fwd, Option<Fwd>);
-    let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
-    let mode_plan = mode_fwd.map(|m| &m.0);
-    for (_, _, b) in grid {
-        if n_obs == 0 {
-            continue;
-        }
-        let (plan, mut du, f) = plan_forward_f64(mode_plan, model, subject, lay, theta, &b[..])?;
-        let var = if sde {
-            let (pp, dp, pf) =
-                plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
-            du.extend(dp);
-            Some((pp, std::sync::Arc::new(pf)))
-        } else {
-            None
-        };
-        nodes.push((du, (plan, std::sync::Arc::new(f)), var));
-    }
-
-    // The nodes the objective itself drops. A diverged node scores `individual_nll`'s `1e20`
-    // sentinel (`agq::agq_terms`), a log-term of ~−1e20 that `logsumexp` takes to exactly
-    // zero weight; its derivative is then `0 · ∂(huge or non-finite)`, which the reverse
-    // turns into a NaN and declines the whole subject (a `[covariate_nn]` DCM under 3-node
-    // AGQ, #3004). So a node whose term is non-finite or the sentinel is left out of the
-    // kernel, as it is out of the sum: the value and every gradient component are unchanged by
-    // it. A finite node whose weight merely underflows stays: its derivative is `0 · finite`.
-    let keep: Vec<usize> = if drop_dropped && !grid.is_empty() && nodes.len() == grid.len() {
-        grid.iter()
-            .zip(&nodes)
-            .enumerate()
-            .filter(|(j, ((_, cw, b), (du, _, _)))| {
-                inner_l(ctx, du, b, pv, None).is_some_and(|l| {
-                    l.is_finite()
-                        && l < crate::stats::likelihood::SUBJECT_SENTINEL_NLL
-                        && (*cw - (l + ng.map_or(0.0, |ng| ng.nodes[*j].0))).is_finite()
-                })
-            })
-            .map(|(j, _)| j)
-            .collect()
-    } else {
-        (0..grid.len()).collect()
-    };
-    if keep.is_empty() && !grid.is_empty() {
-        return None;
-    }
+    let nodes: Vec<&Node> = keep
+        .iter()
+        .filter_map(|&j| nodes.get(j).and_then(Option::as_ref))
+        .collect();
     let kept_grid;
     let grid: &[(Vec<f64>, f64, Vec<f64>)] = if keep.len() == grid.len() {
         grid
     } else {
-        let mut mask = vec![false; grid.len()];
-        for &j in &keep {
-            mask[j] = true;
-        }
-        let mut flags = mask.iter();
-        nodes.retain(|_| flags.next().copied().unwrap_or(false));
         kept_grid = keep.iter().map(|&j| grid[j].clone()).collect::<Vec<_>>();
         &kept_grid
     };

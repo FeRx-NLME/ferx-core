@@ -1038,9 +1038,7 @@ fn adjoint_gradient(
         if first.is_some() || held {
             return first;
         }
-        polish_mode(&sc.eta, o, polish_steps(subject), |eta, o| {
-            attempt(eta, Some(o))
-        })
+        polish_mode(&sc.eta, o, polish_steps(), |eta, o| attempt(eta, Some(o)))
     }
     go(&sc, subject, template, x, objective, held, eta_dx)
 }
@@ -1112,8 +1110,7 @@ impl Drop for PolishOff {
     }
 }
 
-fn polish_steps(subject: &Subject) -> usize {
-    let _ = subject;
+fn polish_steps() -> usize {
     #[cfg(test)]
     return POLISH_BUDGET.with(|c| c.get());
     #[cfg(not(test))]

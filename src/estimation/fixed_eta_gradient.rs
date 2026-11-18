@@ -14,8 +14,8 @@
 //!   ([`crate::estimation::vi`]).
 //!
 //! The θ/σ score is the adjoint's exact one (`exact_theta_score`); the per-θ forward
-//! finite difference below runs only where it declines (a model no recorder serves, an SDE
-//! subject with no σ, a non-finite result).
+//! finite difference below runs only where it declines (a model no recorder serves, a
+//! non-finite result).
 //!
 //! Both entry points return `(nll, grad)` so the caller gets the objective for
 //! free alongside its gradient. `lower[i] == upper[i]` marks a pinned coordinate:
