@@ -4030,6 +4030,10 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 // its derivative.
                 let lo = T::select_if(Le, w.end, cur_t, cur_t, w.end);
                 let m = T::select_if(Gt, lo, t_event, t_event, lo);
+                let with_rate = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+                    rhs(us, ps, t, du);
+                    du[w.cmt] = du[w.cmt] + w.rate;
+                };
                 let flowed = crate::ode::linear::AffinePieces::new(&rhs, &u, t_ref, params)
                     .and_then(|sys| {
                         let x = sys.flow(&u, m - cur_t, Some((w.cmt, w.rate)))?;
@@ -4037,7 +4041,76 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                     });
                 match flowed {
                     Some(x) => u.copy_from_slice(&x),
-                    // Not finite: the subject is (the walk's other declines fill the same).
+                    // A type that does not record reads `A` by probing, and its self-check may
+                    // decline a finite segment (jets lost to cancellation): integrate it as the
+                    // end's event would have, on the values — up to the end with the rate,
+                    // across it with the rate-off saltation, on without.
+                    None if !T::RECORDS_BRANCHES => {
+                        let (t0, t1) = (t_ref, t_event.plain());
+                        let e = w.end.plain();
+                        let mut solve =
+                            |u: &mut [T], f: &crate::ode::solver::RhsG<'_, T>, a: f64, b: f64| {
+                                if b > a {
+                                    if let Some(last) = solve_ode_g_with_auto_state(
+                                        f,
+                                        u,
+                                        (a, b),
+                                        params,
+                                        &[b],
+                                        opts,
+                                        &mut auto_state,
+                                    )
+                                    .last()
+                                    {
+                                        u.copy_from_slice(&last.u);
+                                    }
+                                }
+                            };
+                        if e <= t0 {
+                            solve(&mut u, &rhs, t0, t1);
+                        } else {
+                            let cut = e.min(t1);
+                            solve(&mut u, &with_rate, t0, cut);
+                            if e <= t1 {
+                                let at = tf(e);
+                                let mut pre = |x: &[T], s: T, out: &mut [T]| {
+                                    out.copy_from_slice(&boundary_velocity(
+                                        x,
+                                        params,
+                                        at,
+                                        s,
+                                        last_dose_eff,
+                                        reset_floor,
+                                        false,
+                                    ));
+                                    out[w.cmt] = out[w.cmt] + w.rate;
+                                };
+                                let mut post = |x: &[T], s: T, out: &mut [T]| {
+                                    out.copy_from_slice(&boundary_velocity(
+                                        x,
+                                        params,
+                                        at,
+                                        s,
+                                        last_dose_eff,
+                                        reset_floor,
+                                        false,
+                                    ));
+                                };
+                                cross_moving_boundary(
+                                    &mut u,
+                                    jet_only(w.end),
+                                    &mut pre,
+                                    &mut post,
+                                    &|_| {},
+                                );
+                                solve(&mut u, &rhs, cut, t1);
+                            }
+                        }
+                    }
+                    // A recording reads `A` and `b` off its recording exactly, and the walk is
+                    // on the exact linear path only for a right-hand side certified affine
+                    // (`OdeSpec::linear_eligible`): what it declines is a part or a state that is
+                    // not finite, and so is the subject (the walk's other declines fill the same).
                     None => u.fill(T::from_f64(f64::NAN)),
                 }
                 cur_t = t_event;

@@ -12300,3 +12300,56 @@ fn the_covariance_bases_take_the_shared_primal_kernels() {
         assert_eq!(loops > 0, ode, "ode {ode}: rows loop runs {loops}");
     }
 }
+
+/// A walked infusion end's segment that the exact pieces decline (a type that does not record
+/// probes `A`, and its self-check can refuse a finite segment) is integrated on the values, as
+/// the end's event would have been — not filled with `NaN` (#3010 review). Forced
+/// (`FORCE_LINEAR_DECLINE`) on the `Dual2` walk, with the end inside a segment (2.47 h, between
+/// the 2.1 and 2.5 h samples) and outside every segment's interior (2.24 h): values and
+/// `∂f/∂η` against the exact pieces, the fallback's adaptive solver at 1e-12: measured worst
+/// 9.8e-13 relative (4.0e-5 at the default tolerance, the solver's own error); bound 1e-10.
+/// Mutations: the decline filled with `NaN` again → "finite"; the fallback's rate-off saltation
+/// dropped → `∂f/∂η_D1` past the end.
+#[test]
+fn a_declined_walked_segment_is_integrated_on_its_values() {
+    use crate::types::RateMode::ModeledDuration;
+    let mut model = parse_model_string(ONE_CPT_D1_ODE).unwrap();
+    // The fallback integrates adaptively: tight enough that its error is far below a wrong
+    // crossing's.
+    let ode = model.ode_spec.as_mut().unwrap();
+    ode.solver_opts.reltol = 1e-12;
+    ode.solver_opts.abstol = 1e-12;
+    let d = |t| DoseEvent::modeled(t, 100.0, 1, false, 0.0, ModeledDuration);
+    let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
+    let s = subject(&model, vec![d(0.0), d(12.0)], &times, &[0.0; 2]);
+    let theta = moved_params(&model).theta;
+    let th: Vec<Dual2<2>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
+    let walk = |eta: &[f64]| -> Vec<Dual2<2>> {
+        let et: Vec<Dual2<2>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| Dual2::var(v, k))
+            .collect();
+        record(&model, &s, None, &theta, eta, &ThetaLeaves::theta(&th), &et).expect("in scope")
+    };
+    for eta in [[0.05, 0.1], [-0.05, 0.0]] {
+        let exact = walk(&eta);
+        let declined = {
+            let prev = crate::ode::solver::FORCE_LINEAR_DECLINE.replace(true);
+            let r = walk(&eta);
+            crate::ode::solver::FORCE_LINEAR_DECLINE.set(prev);
+            r
+        };
+        let mut worst = 0.0f64;
+        for (j, (a, b)) in exact.iter().zip(&declined).enumerate() {
+            let pairs = std::iter::once((a.value, b.value))
+                .chain(a.grad.iter().copied().zip(b.grad.iter().copied()));
+            for (x, y) in pairs {
+                assert!(y.is_finite(), "eta {eta:?}, obs {j}: finite ({y})");
+                worst = worst.max((x - y).abs() / (1e-6 + x.abs()));
+            }
+        }
+        eprintln!("eta {eta:?}: declined vs exact {worst:e}");
+        assert!(worst < 1e-10, "eta {eta:?}: {worst:e}");
+    }
+}

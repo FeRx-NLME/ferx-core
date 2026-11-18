@@ -1352,6 +1352,12 @@ impl<T: PkNum> AffinePieces<T> {
         t_ref: f64,
         params: &[T],
     ) -> Option<Self> {
+        // The test seam every exact linear segment honours (`FORCE_LINEAR_DECLINE`): a decline a
+        // model file cannot produce on finite values, for the caller's fallback to be seen.
+        #[cfg(test)]
+        if crate::ode::solver::FORCE_LINEAR_DECLINE.get() {
+            return None;
+        }
         // A chunk of its own (#2786), as each of [`segment_span`]'s steps: every segment's
         // system is the same code, so a recording type shares one compiled kernel.
         T::chunk_mark();
