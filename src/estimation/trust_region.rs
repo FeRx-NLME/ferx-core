@@ -73,7 +73,7 @@ fn exact_trust_region(
     bounds: &PackedBounds,
     options: &FitOptions,
     budget_spent: &mut bool,
-) -> (bool, Vec<f64>, usize, Option<Vec<f64>>, HeldEbes) {
+) -> (bool, Vec<f64>, usize, Option<Vec<f64>>, HeldEbes, f64, f64) {
     use crate::estimation::covariance::{
         exact_candidate_hessian, exact_gradient_at_modes, fd_candidate_hessian, ExactDecline,
     };
@@ -122,12 +122,20 @@ fn exact_trust_region(
         vec![DVector::zeros(model.n_eta); n_subj]
     };
     let (mut f, mut etas, mut hms, mut kappas) = eval(&x, &start_warm);
+    let f_start = f;
     let mut radius = 1.0_f64;
     let mut d_scale = vec![0.0_f64; axes.len()];
     // The BFGS model on `axes`, and the point and gradient it was last updated at.
     let mut model_b: Option<DMatrix<f64>> = None;
     let mut last: Option<(Vec<f64>, Vec<f64>)> = None;
     let mut refresh = true;
+    // The point the model's exact Hessian was formed at: a refresh there would recompute it.
+    let mut exact_at: Option<Vec<f64>> = None;
+    // `|actual − predicted|` of the last rejected step: once the radius has collapsed the step
+    // is so short that the model's own error (third order in it) is negligible, and this is the
+    // objective's evaluation noise at the incumbent, measured.
+    let mut last_mismatch = f64::NAN;
+    let mut last_decrement = f64::INFINITY;
     let mut prev_free: Option<Vec<usize>> = None;
     let mut n_exact = 0usize;
     let mut converged = false;
@@ -236,6 +244,27 @@ fn exact_trust_region(
                             used_quasi = true;
                             gb
                         }
+                        // No model yet to keep (the first iterate): the same quantity at FD
+                        // precision, so the fit can start at all.
+                        None if model_b.is_none() && model.n_kappa == 0 => {
+                            let Some(h) = fd_candidate_hessian(
+                                model,
+                                population,
+                                problem.init_params,
+                                &x,
+                                &warm,
+                                options,
+                                &axes,
+                            ) else {
+                                break;
+                            };
+                            if options.verbose {
+                                eprintln!(
+                                    "  TR iter {it:>3}: exact Hessian not resolved at the start; FD Hessian"
+                                );
+                            }
+                            (rows_gradient(&x, &etas), h)
+                        }
                         _ => break,
                     },
                     Err(ExactDecline::OutOfScope) => break,
@@ -243,6 +272,10 @@ fn exact_trust_region(
             }
         };
         refresh = false;
+        if !used_quasi {
+            exact_at = Some(x.clone());
+        }
+        let exact_here = exact_at.as_ref() == Some(&x);
         model_b = Some(if used_quasi {
             h_ax.clone()
         } else {
@@ -304,8 +337,9 @@ fn exact_trust_region(
                 if used_quasi { "" } else { "  (exact Hessian)" }
             );
         }
+        last_decrement = decrement;
         if decrement <= TR_EXACT_DECREMENT_TOL {
-            if used_quasi {
+            if !exact_here {
                 // A stop is certified on the exact Hessian only.
                 refresh = true;
                 continue;
@@ -324,8 +358,9 @@ fn exact_trust_region(
         let pred = -(gy.dot(&sy) + 0.5 * sy.dot(&(&sub.habs * &sy)));
         let (fnew, en, hn, kn) = eval(&xn, &trial_warm);
         let rho = if pred > 0.0 { (f - fnew) / pred } else { -1.0 };
-        if rho < 0.25 {
-            // The model predicted badly here: re-model on the exact Hessian.
+        if rho < 0.25 && !exact_here {
+            // The secant model predicted badly here: re-model on the exact Hessian. An exact
+            // model at this very point is kept; only the radius shrinks.
             refresh = true;
         }
         let snorm = sy.norm();
@@ -349,8 +384,18 @@ fn exact_trust_region(
             }
         } else {
             radius = 0.25 * snorm.max(1e-12);
+            last_mismatch = ((f - fnew) - pred).abs();
         }
         if radius < 1e-10 {
+            // The noise floor: no step can realise a predicted gain smaller than the
+            // objective's measured evaluation noise, so a decrement within it is converged.
+            converged = exact_here && last_mismatch.is_finite() && last_decrement <= last_mismatch;
+            if options.verbose {
+                eprintln!(
+                    "  TR: radius collapsed; decrement {last_decrement:.3e} vs measured noise \
+                     {last_mismatch:.3e} → converged = {converged}"
+                );
+            }
             break;
         }
     }
@@ -366,7 +411,7 @@ fn exact_trust_region(
         h_mats: hms,
         kappas,
     };
-    (converged, x, iters, last_g, held)
+    (converged, x, iters, last_g, held, f_start, f)
 }
 
 /// `|H|`: `H` with its eigenvalues made absolute, floored at `1e-10·max|λ|`. The saddle-free
@@ -790,7 +835,7 @@ pub(crate) fn optimize_trust_region_seeded(
     }
 
     let mut tr_budget_spent = false;
-    let (mut converged, mut best_x, mut n_iterations, mut final_gradient, mut held) =
+    let (mut converged, mut best_x, mut n_iterations, mut final_gradient, mut held, _, _) =
         exact_trust_region(
             &problem,
             &x0,
@@ -851,7 +896,7 @@ pub(crate) fn optimize_trust_region_seeded(
         *problem.grad_cache.lock().unwrap() = None;
         let mut leg_options = options.clone();
         leg_options.outer_maxiter = options.outer_maxiter - n_iterations;
-        let (c, bx, it, fg, h) = exact_trust_region(
+        let (c, bx, it, fg, h, _, _) = exact_trust_region(
             &problem,
             &best_x,
             &post_run_bounds,

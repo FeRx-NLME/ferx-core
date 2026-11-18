@@ -81,13 +81,19 @@ Welsch 1981; Gay 1983) with exact second-order information where PORT has none (
    negative directions, and the fit crawls.
 2. **Exact refresh.** $B$ is replaced by a fresh exact $|H|$ when a step was predicted poorly
    (actual-to-predicted ratio below ¼) and when the set of coordinates held at a bound changes,
-   since the secant curvature was learned in the old subspace.
+   since the secant curvature was learned in the old subspace. A model that is already exact at
+   the current point is kept, and only the radius shrinks.
 3. **Step.** Coordinates on a bound with the gradient pushing outward are held. The subproblem
    $\min_s g^\top s + \tfrac12 s^\top B s$, $\lVert D s\rVert \le \Delta$, is solved exactly on
    $B$'s eigenbasis, with $D = \sqrt{\operatorname{diag} B}$ at its running maximum (Moré's
    scaling, as in PORT). The step is projected onto the box and accepted when the objective falls.
 4. **Stop.** When the model's Newton decrement $\tfrac12 g^\top B^{-1} g$ falls to $10^{-6}$, a
-   fresh exact Hessian certifies it: the fit stops only on the exact decrement.
+   fresh exact Hessian certifies it: the fit stops only on the exact decrement. On a model whose
+   objective cannot be evaluated that precisely (ODE or SDE integration, the inner solve), the
+   radius collapses first. The trust region then measures the noise: once a rejected step is
+   tiny, its gap between actual and predicted change is the evaluation noise (the model's own
+   error is third order in the step). An exact decrement no larger than that noise is converged,
+   since no step could resolve the gain.
 5. **Basin shift.** A converged leg re-solves the EBEs cold. If that scores more than 0.05 below
    the objective it minimised, some subjects sat in a higher individual mode, and the trust
    region resumes from the same point with the cold EBEs: the rules `nlopt_lbfgs` uses (#1565).
