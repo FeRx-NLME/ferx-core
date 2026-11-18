@@ -1045,10 +1045,9 @@ pub(crate) struct InnerSolvePolicy {
     /// zero — a subject with no observations, a random effect no prediction reads — is taken
     /// for the cold placeholder at every evaluation and re-runs the guarded multi-start each
     /// time, which cannot move it: on `examples/mm_iv.ferx` with one unused η, 920 multi-starts
-    /// in 470 solves, none of which moved an EBE. Unlike `init_is_mode` it does not say the
-    /// starts are modes *at these parameters*, so the IOV solve's start gates — its seed gate
-    /// and, since #2730, its multi-start gate — read only that and still apply: an IOV
-    /// subject's exactly-zero mode is cold there at every evaluation. Set by
+    /// in 470 solves, none of which moved an EBE. The IOV solve's seed and multi-start gates
+    /// read it too (#2900). Unlike `init_is_mode` it does not say the starts are modes *at these
+    /// parameters*, so the IOV solve's start certificates read only that. Set by
     /// [`PrevEtas::Solved`]; `false`, the `Default`, otherwise.
     pub(crate) init_is_warm: bool,
     /// Return a warm start unchanged when [`FallbackCertifier::certifies_in_place`] already
@@ -2796,6 +2795,7 @@ fn find_ebe_impl_from(
             restarts,
             policy.ebe_variance,
             policy.init_is_mode,
+            policy.init_is_warm,
             if policy.unseeded_iov_warm {
                 InnerHessianSeed::None
             } else {
@@ -2883,8 +2883,8 @@ type ScreenDescent = Option<(Vec<f64>, InnerExit, f64)>;
 /// `init_is_mode` is the caller's certificate that `eta_init` came from a solve, which makes
 /// any `Some` warm, zeros included: a converged mode at these parameters
 /// ([`InnerSolvePolicy::init_is_mode`], #2076) or a mode an earlier inner pass returned
-/// ([`InnerSolvePolicy::init_is_warm`]); the non-IOV solve passes either
-/// ([`InnerSolvePolicy::is_warm`]), the IOV solve the first.
+/// ([`InnerSolvePolicy::init_is_warm`]); the solve's start gates pass either
+/// ([`InnerSolvePolicy::is_warm`]), the IOV solve's start certificates the first.
 fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
     eta_init.is_some_and(|w| init_is_mode || w.iter().any(|&v| v != 0.0))
 }
@@ -4064,6 +4064,7 @@ fn find_ebe_iov(
         0,
         ebe_variance,
         init_is_mode,
+        false,
         InnerHessianSeed::GaussNewton,
     )
 }
@@ -4082,10 +4083,12 @@ fn find_ebe_iov_seeded(
     restarts: usize,
     ebe_variance: EbeVariance,
     init_is_mode: bool,
+    init_is_warm: bool,
     seed: InnerHessianSeed,
 ) -> EbeResult {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
+    let warm_start = is_warm_start(eta_init, init_is_mode || init_is_warm);
 
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
 
@@ -4454,7 +4457,7 @@ fn find_ebe_iov_seeded(
             crate::types::InnerOptimizer::NelderMead
         )
         && !inner_use_lbfgs(n_flat);
-    let iov_seed = (seeded && is_warm_start(eta_init, init_is_mode))
+    let iov_seed = (seeded && warm_start)
         .then(|| {
             let mut st: Vec<f64> = x[..n_eta]
                 .iter()
@@ -4573,7 +4576,7 @@ fn find_ebe_iov_seeded(
     // Cost: `2·restarts` descents per scanned coordinate, so linear in the occasions, and
     // on cold solves only; the probes are objective evaluations, `2` per seed. The Sobol
     // screen and the twin seed stay off this path.
-    if restarts > 0 && !is_warm_start(eta_init, init_is_mode) {
+    if restarts > 0 && !warm_start {
         #[cfg(test)]
         EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
         let mut nll = obj(&x);

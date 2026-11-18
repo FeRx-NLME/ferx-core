@@ -6361,6 +6361,7 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
             0,
             EbeVariance::Conditional,
             false,
+            false,
             InnerHessianSeed::None,
         )
     };
@@ -6928,6 +6929,34 @@ fn iov_multistart_runs_on_cold_solves_only() {
     assert!(r.kappas[1][0] > 0.0, "and stays put: {:?}", r.kappas);
     cold_iov_solve(&model, &subject, 1, 1e-6, None);
     assert_eq!(started(), before + 1, "a cold one does");
+}
+
+/// #2900: an exactly-zero joint start an earlier pass returned (`PrevEtas::Solved`) is warm,
+/// as in the non-IOV solve (#2691), so it starts no multi-start; the same zeros as the cold
+/// placeholder do. (An IOV subject none of whose η and κ the predictions read is re-scanned
+/// at every evaluation otherwise: 134 times in a 10-subject `warfarin_iov` fit.)
+#[test]
+fn iov_solved_zero_start_runs_no_multistart() {
+    let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
+    let r = cold_iov_solve(&model, &subject, 0, 1e-6, None);
+    let zero = vec![0.0; r.eta.len() + r.kappas.iter().map(|k| k.len()).sum::<usize>()];
+    let started = || EBE_MULTISTARTS_STARTED.with(|n| n.get());
+    for (prev, runs) in [(PrevEtas::Solved, 0), (PrevEtas::Placeholder, 1)] {
+        let before = started();
+        find_ebe_for_stage_with_prev(
+            &model,
+            &subject,
+            &model.default_params,
+            500,
+            1e-6,
+            Some(&zero),
+            None,
+            4,
+            &crate::types::FitOptions::default(),
+            prev,
+        );
+        assert_eq!(started() - before, runs, "{prev:?}");
+    }
 }
 
 /// The issue's second validation: a unimodal IOV subject stays bit-identical, across a
