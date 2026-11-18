@@ -8515,7 +8515,8 @@ fn compute_jacobian_fd(
 
 /// Run inner loop for all subjects (parallel via rayon).
 /// Warm-starts from previous EBEs when available.
-pub fn run_inner_loop(
+#[cfg(test)]
+pub(crate) fn run_inner_loop(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
