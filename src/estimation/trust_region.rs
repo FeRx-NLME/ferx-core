@@ -358,7 +358,9 @@ fn exact_trust_region(
         let pred = -(gy.dot(&sy) + 0.5 * sy.dot(&(&sub.habs * &sy)));
         let (fnew, en, hn, kn) = eval(&xn, &trial_warm);
         let rho = if pred > 0.0 { (f - fnew) / pred } else { -1.0 };
-        if rho < 0.25 && !exact_here {
+        // EXPERIMENT (#2975): `FERX_TR_NO_RHO_REFRESH=1` keeps the secant model on a poor step
+        // (PORT's secant mode), refreshing only on a free-set change and to certify.
+        if rho < 0.25 && !exact_here && std::env::var("FERX_TR_NO_RHO_REFRESH").is_err() {
             // The secant model predicted badly here: re-model on the exact Hessian. An exact
             // model at this very point is kept; only the radius shrinks.
             refresh = true;
