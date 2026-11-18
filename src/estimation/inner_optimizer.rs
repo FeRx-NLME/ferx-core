@@ -368,8 +368,8 @@ pub(crate) fn fd_fallback_warning_skipping(
 /// Why [`subject_inner_fd_reason`] puts a subject on the FD inner gradient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InnerFdReason {
-    /// A non-Gaussian record the analytic inner gradient cannot serve — a TTE / count
-    /// term, or an endpoint without a dual program.
+    /// A non-Gaussian record the analytic inner gradient cannot serve — a TTE term without
+    /// an exact channel, or an endpoint without a dual program.
     Survival,
     /// A data or model shape the Gaussian recorder declines.
     Shape,
@@ -394,7 +394,7 @@ fn subject_inner_fd_reason(
 /// [`fd_fallback_warning`] counts it: the probe has to follow the route `find_ebe` takes.
 ///
 /// A subject carrying non-Gaussian records is FD whenever [`analytic_inner_grad_supported`]
-/// declines it — a TTE / count term, or an endpoint without a dual program — however well
+/// declines it — a TTE term without an exact channel, or an endpoint without a dual program — however well
 /// the Gaussian recorder serves its other rows (before #2024 the probe asked only the
 /// recorder, so a joint PK-TTE subject read as analytic, #1861). One with no Gaussian rows
 /// that the predicate admits is analytic without any recorder (prior plus the served
@@ -5267,8 +5267,9 @@ pub(crate) fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subj
 /// [`discrete_subject_eta_grad`](crate::categorical::discrete_subject_eta_grad)).
 ///
 /// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
-/// subject that also carries a TTE or count record would silently drop that term's
-/// contribution — a wrong gradient, not a slow one. A TTE record is served when its
+/// subject that also carries a record whose term has no exact channel would silently drop
+/// that term's contribution — a wrong gradient, not a slow one. A count record (#2877) is
+/// served like a binary one, by its endpoint's `param_program`. A TTE record is served when its
 /// endpoint has an exact channel ([`crate::survival::tte_subject_eta_grad`]): an analytic
 /// hazard with a dual-evaluable program, or an ODE-accumulated one whose subject the dual
 /// walk serves (`survival::tte_record_served`). A record without one keeps FD for the whole
@@ -5285,6 +5286,7 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         let served = |cmt: usize| -> bool {
             match model.endpoints.get(&cmt) {
                 Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
+                Some(EndpointLikelihood::Count { param_program, .. }) => param_program.is_some(),
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
@@ -5299,10 +5301,10 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         let mut last: Option<(bool, usize, bool)> = None;
         subject.obs_records.iter().all(|r| {
             let (event, cmt) = match r {
-                ObsRecord::DiscreteState { cmt, .. } => (false, *cmt),
+                ObsRecord::DiscreteState { cmt, .. } | ObsRecord::Count { cmt, .. } => {
+                    (false, *cmt)
+                }
                 ObsRecord::Event { cmt, .. } => (true, *cmt),
-                #[allow(unreachable_patterns)]
-                _ => return false,
             };
             if let Some((e, c, ok)) = last {
                 if (e, c) == (event, cmt) {
@@ -5498,8 +5500,9 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // to the Gaussian block; binary records likewise since #2024 (the closed-form Bernoulli
     // score over a dual-evaluable linear predictor). `non_gaussian_records_fully_analytic`
     // is deliberately strict — it demands that *every* record on the subject be one a
-    // program can serve, so a subject that also carries a TTE / count record (whose terms
-    // remain FD-only) still declines the whole gradient rather than silently omitting them.
+    // program can serve, so a subject that also carries a record whose term is FD-only (a
+    // TTE endpoint without an exact channel, an endpoint without a program) still declines
+    // the whole gradient rather than silently omitting it.
     if !non_gaussian_eta_grad_served(model, subject) {
         return false;
     }

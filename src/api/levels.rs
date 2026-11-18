@@ -1270,7 +1270,9 @@ fn rows_on<'a>(
         .iter()
         .enumerate()
         .filter_map(|(r, rec)| match rec {
-            ObsRecord::DiscreteState { cmt, .. } if record_cmts.contains(cmt) => {
+            ObsRecord::DiscreteState { cmt, .. } | ObsRecord::Count { cmt, .. }
+                if record_cmts.contains(cmt) =>
+            {
                 Some(LevelRow::Record(r))
             }
             _ => None,
@@ -1295,7 +1297,10 @@ fn row_value(
         LevelRow::Record(r) => {
             if column.eq_ignore_ascii_case(TIME_COLUMN) {
                 return match subject.obs_records.get(r) {
-                    Some(ObsRecord::DiscreteState { raw_time, .. }) => Some(*raw_time),
+                    Some(
+                        ObsRecord::DiscreteState { raw_time, .. }
+                        | ObsRecord::Count { raw_time, .. },
+                    ) => Some(*raw_time),
                     _ => None,
                 };
             }
@@ -1389,15 +1394,15 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 }
 
 /// The sentence [`no_levels_message`] closes the unread and the non-definer arms with,
-/// when the data has no discrete-state record on a binary or DTMM endpoint
+/// when the data has no record on a binary, count or DTMM endpoint
 /// ([`LevelBlockDecl::level_capable_cmts`], #2808): then no reader the user could add
 /// defines a level on it, so the block cannot be estimated. Each arm follows it with its
 /// own next step (#2819). The definer arm never appends it: there, that the data has no
 /// record on the reading endpoint is the fact the user can act on.
-const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the discrete-state records of a \
-                                   `[binary_model]` or DTMM `[markov_model]` endpoint define a \
-                                   level, and this data has neither, so it cannot estimate the \
-                                   block.";
+const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the records of a `[binary_model]`, \
+                                   `[count_model]` or DTMM `[markov_model]` endpoint define a \
+                                   level, and this data has none of them, so it cannot estimate \
+                                   the block.";
 
 /// The part both next steps share (#2819): rows that would define a level.
 const ADD_DEFINING_ROWS: &str = "add rows that define a level, scored by an expression that \
@@ -1408,8 +1413,8 @@ const ADD_DEFINING_ROWS: &str = "add rows that define a level, scored by an expr
 /// kind either, it has no observation rows, and the refusal says that. Otherwise it names
 /// each record kind present and why it defined no level: a discrete-state record is on no
 /// endpoint that reads the block through its implicit index
-/// ([`LevelBlockDecl::record_cmts`]) (#2623), while a time-to-event or count record never
-/// defines one (#2751). Then why, which depends on whether any expression reads the block
+/// ([`LevelBlockDecl::record_cmts`]) (#2623), and likewise a count record (#2877), while a
+/// time-to-event record never defines one (#2751). Then why, which depends on whether any expression reads the block
 /// bare ([`LevelBlockDecl::read_bare`]): if none does, nothing reads it at all, since the
 /// parse refuses a subscripted `NAME[COLUMN]` read (#2744); if one does, its reader defines
 /// no level on this data — a level-defining endpoint with no records here, or only a
@@ -1425,8 +1430,8 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     // One exhaustive pass, so a new `ObsRecord` variant fails to compile here rather than
     // falling through to "no observation rows" (#2751 review r1 #4).
     let mut discrete = false;
-    // A discrete-state record some reader could make define a level: one on a binary or
-    // DTMM endpoint.
+    // A record some reader could make define a level: one on a binary, count or DTMM
+    // endpoint.
     let mut definable = false;
     // Only the `survival` build has an `Event` variant to set it.
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
@@ -1442,7 +1447,11 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
             }
             #[cfg(feature = "survival")]
             ObsRecord::Event { .. } => events = true,
-            ObsRecord::Count { .. } => counts = true,
+            ObsRecord::Count { cmt, .. } => {
+                counts = true;
+                // A count record on a `[count_model]` endpoint can define a level (#2877).
+                definable |= decl.level_capable_cmts.contains(cmt);
+            }
         }
     }
     if !(discrete || events || counts) {
@@ -1461,7 +1470,8 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     }
     if counts {
         message.push_str(
-            ", and its count records define no level, since no endpoint scores a count record",
+            ", and none of its count records is on an endpoint whose expression reads the \
+             block through its implicit index",
         );
     }
     message.push('.');
@@ -1503,8 +1513,8 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
         );
         if definable {
             message.push_str(
-                " Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` \
-                 transition.",
+                " Read the block in a `[binary_model]` predictor, a `[count_model]` mean or a \
+                 DTMM `[markov_model]` transition.",
             );
         } else {
             // Not "drop the block": the bare `NAME` would then read as a covariate (#2819
@@ -1683,12 +1693,20 @@ fn records_replicate(
     r: usize,
 ) -> bool {
     let key = |r: usize| match subject.obs_records.get(r) {
-        Some(ObsRecord::DiscreteState {
-            time,
-            raw_time,
-            cmt,
-            ..
-        }) => Some((raw_time.to_bits(), time.to_bits(), *cmt)),
+        Some(
+            ObsRecord::DiscreteState {
+                time,
+                raw_time,
+                cmt,
+                ..
+            }
+            | ObsRecord::Count {
+                time,
+                raw_time,
+                cmt,
+                ..
+            },
+        ) => Some((raw_time.to_bits(), time.to_bits(), *cmt)),
         _ => None,
     };
     key(r0).is_some()
@@ -6029,10 +6047,10 @@ fn share_site(share: &ScaleShare) -> String {
                 "the individual parameter `{p}` reads this block and carries a random effect{via}"
             )
         }
-        None if share.binary => {
-            format!("the `[binary_model]` predictor reads this block and a random effect{via}")
-        }
-        None => format!("the `y` readout reads this block and a random effect{via}"),
+        None => match share.endpoint {
+            Some(label) => format!("{label} reads this block and a random effect{via}"),
+            None => format!("the `y` readout reads this block and a random effect{via}"),
+        },
     }
 }
 

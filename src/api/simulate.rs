@@ -1330,6 +1330,19 @@ fn emit_subject_rows<R: rand::Rng>(
         results,
         warnings,
     );
+    // Count endpoints (#2877), on the same stream right after the binary draws.
+    #[cfg(feature = "survival")]
+    crate::categorical::simulate_count(
+        model,
+        subject,
+        &params.theta,
+        eta_slice,
+        draw,
+        sim,
+        rng,
+        results,
+        warnings,
+    );
 
     DrawnPrediction { ipreds, kappas }
 }
