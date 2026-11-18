@@ -1416,9 +1416,9 @@ impl ProfileCtx<'_> {
             Some(&mu_k),
             self.options.min_obs_for_convergence_check as usize,
             self.options.inner_restarts,
-            // Every `Some` start is a solve's modes (`ProfileWarm::from_solve` and the step's
-            // and held re-solve's), so an exactly-zero one is warm, not the cold placeholder
-            // (#2691, #2899).
+            // Every `Some` start is a solve's modes (`ProfileWarm::from_solve`, the step's and
+            // held re-solve's, the covariance step's from the fit's EBEs), so an exactly-zero
+            // one is warm, not the cold placeholder (#2691, #2899).
             InnerSolvePolicy {
                 seed: InnerHessianSeed::for_options(self.options),
                 unseeded_iov_warm: true,
