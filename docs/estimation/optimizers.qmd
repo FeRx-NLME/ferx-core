@@ -93,7 +93,9 @@ Welsch 1981; Gay 1983) with exact second-order information where PORT has none (
    radius collapses first. The trust region then measures the noise: once a rejected step is
    tiny, its gap between actual and predicted change is the evaluation noise (the model's own
    error is third order in the step). An exact decrement no larger than that noise is converged,
-   since no step could resolve the gain.
+   since no step could resolve the gain. A larger one means the gradient disagrees with the
+   objective the inner loop scores (EBEs not tight enough for it), and one verification leg runs
+   at `inner_tol = 1e-10` on the rules [`nlopt_lbfgs`'s stop](#gradient-stop-verification) uses.
 5. **Basin shift.** A converged leg re-solves the EBEs cold. If that scores more than 0.05 below
    the objective it minimised, some subjects sat in a higher individual mode, and the trust
    region resumes from the same point with the cold EBEs: the rules `nlopt_lbfgs` uses (#1565).

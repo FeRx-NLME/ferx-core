@@ -911,6 +911,52 @@ pub(crate) fn optimize_trust_region_seeded(
         final_gradient = fg;
         held = h;
     }
+    // A stop that is neither converged nor out of budget is a collapsed radius whose decrement
+    // exceeds the measured noise: the model promises a gain no short step realises, so the
+    // gradient disagrees with the objective the inner loop scores. That is the NLopt leg's
+    // verification case (#2462): one leg from the best point with the inner loop at
+    // `UNPROFILED_VERIFY_INNER_TOL`, settling when the leg converges or gains at most
+    // `UNPROFILED_FIRST_LEG_GAIN` (#2507). The leg starts at the incumbent and only descends,
+    // so its point is kept either way.
+    if !converged
+        && !tr_budget_spent
+        && n_iterations < options.outer_maxiter
+        && !crate::cancel::is_cancelled(&options.cancel)
+    {
+        use crate::estimation::outer_optimizer::{
+            UNPROFILED_FIRST_LEG_GAIN, UNPROFILED_VERIFY_INNER_TOL,
+        };
+        let mut leg_options = options.clone();
+        leg_options.inner_tol = options.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL);
+        leg_options.cov_inner_tol = Some(
+            options
+                .effective_cov_inner_tol(model.uses_closed_form_ltbs_inner())
+                .min(UNPROFILED_VERIFY_INNER_TOL),
+        );
+        leg_options.outer_maxiter = options.outer_maxiter - n_iterations;
+        *problem.cached_etas.lock().unwrap() = held.etas.clone();
+        *problem.cached_etas_kind.lock().unwrap() = PrevEtas::ModesHere;
+        *problem.grad_cache.lock().unwrap() = None;
+        let (c, bx, it, fg, h, f0, f1) = exact_trust_region(
+            &problem,
+            &best_x,
+            &post_run_bounds,
+            &leg_options,
+            &mut tr_budget_spent,
+        );
+        let gain = f0 - f1;
+        if options.verbose {
+            eprintln!(
+                "Trust region: verification leg at inner_tol {:e}: gain {gain:.3e}, converged = {c}",
+                leg_options.inner_tol
+            );
+        }
+        converged = c || (gain.is_finite() && gain <= UNPROFILED_FIRST_LEG_GAIN);
+        best_x = bx;
+        n_iterations += it;
+        final_gradient = fg;
+        held = h;
+    }
     if crate::cancel::is_cancelled(&options.cancel) {
         warnings.push("Trust-region did not converge: cancelled by user".to_string());
     } else if !converged {
