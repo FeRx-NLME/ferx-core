@@ -287,7 +287,7 @@ fn sigma_fd_step(h: f64, s: f64) -> f64 {
 }
 
 /// The exact fixed-η θ score by the adjoint
-/// ([`fixed_eta_theta_adjoint`](crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint)),
+/// ([`fixed_eta_theta_adjoint_cols`](crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint_cols)),
 /// shared by the IOV and non-IOV scores: one recording of the predictions with θ as tape
 /// leaves and one sweep seeded with `∂(obs_nll)/∂f_j`, whatever the number of θ. Writes the
 /// packed `grad` (one entry per θ) and, with `df_packed`, the packed `∂f_j/∂θ` rows the
@@ -328,12 +328,15 @@ fn exact_theta_score(
         }
         return true;
     }
-    let Some(x) = crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint(
+    // The information's rows are wanted over the free coordinates only: a pinned one is
+    // skipped below, so its derivative is never read.
+    let free: Vec<usize> = (0..n_theta).filter(|&i| lower[i] != upper[i]).collect();
+    let Some(x) = crate::sens::ode_provider::adjoint::fixed_eta_theta_adjoint_cols(
         model,
         subject,
         theta,
         eta,
-        df_packed.is_some(),
+        df_packed.is_some().then_some(&free),
         d_nll_d_f,
     )
     .filter(|x| {

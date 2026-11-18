@@ -3362,6 +3362,7 @@ pub(crate) struct FixedEtaTheta {
     pub(crate) jac: Option<Vec<f64>>,
 }
 
+#[cfg(test)]
 pub(crate) fn fixed_eta_theta_adjoint(
     model: &CompiledModel,
     subject: &Subject,
@@ -3370,10 +3371,40 @@ pub(crate) fn fixed_eta_theta_adjoint(
     want_jac: bool,
     weights: &[f64],
 ) -> Option<FixedEtaTheta> {
-    let (mut rows, jac) =
-        fixed_eta_theta_sweeps(model, subject, theta, None, eta, want_jac, |f| {
-            (weights.len() == f.len()).then(|| vec![weights.to_vec()])
-        })?;
+    let all: Vec<usize> = (0..theta.len()).collect();
+    fixed_eta_theta_adjoint_cols(
+        model,
+        subject,
+        theta,
+        eta,
+        want_jac.then_some(&all),
+        weights,
+    )
+}
+
+/// `fixed_eta_theta_adjoint` with the Jacobian over the θ coordinates `jac_cols` alone
+/// (`None`: no Jacobian, the gradient over every θ). With `Some`, the gradient and the
+/// Jacobian are exact for those coordinates and unspecified for every other θ — a caller
+/// that holds them pinned reads neither. That is what lets the Jacobian be read off one
+/// forward pass carrying one tangent per coordinate instead of one reverse per observation
+/// ([`tangent_jac_wins`]).
+pub(crate) fn fixed_eta_theta_adjoint_cols(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    jac_cols: Option<&Vec<usize>>,
+    weights: &[f64],
+) -> Option<FixedEtaTheta> {
+    let (mut rows, jac) = fixed_eta_theta_sweeps(
+        model,
+        subject,
+        theta,
+        None,
+        eta,
+        jac_cols.map(Vec::as_slice),
+        |f| (weights.len() == f.len()).then(|| vec![weights.to_vec()]),
+    )?;
     let grad = rows.pop()?;
     Some(FixedEtaTheta {
         jac: jac.map(|j| j.into_iter().flatten().collect()),
@@ -3395,7 +3426,7 @@ pub(crate) fn fixed_eta_theta_contractions(
     eta: &[f64],
     weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
 ) -> Option<Vec<Vec<f64>>> {
-    fixed_eta_theta_sweeps(model, subject, theta, None, eta, false, weights).map(|(rows, _)| rows)
+    fixed_eta_theta_sweeps(model, subject, theta, None, eta, None, weights).map(|(rows, _)| rows)
 }
 
 /// [`fixed_eta_theta_contractions`] of an SDE subject's kernel rows: `weights` gets the `2n`
@@ -3411,11 +3442,84 @@ pub(crate) fn fixed_eta_theta_sigma_contractions(
     eta: &[f64],
     weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
 ) -> Option<Vec<Vec<f64>>> {
-    fixed_eta_theta_sweeps(model, subject, theta, Some(sigma), eta, false, weights)
+    fixed_eta_theta_sweeps(model, subject, theta, Some(sigma), eta, None, weights)
         .map(|(rows, _)| rows)
 }
 
-/// The plan reverses behind [`fixed_eta_theta_contractions`] and [`fixed_eta_theta_adjoint`]:
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the Jacobian by one reverse per observation even where forward
+    /// tangents serve it, for the test pinning the two against each other.
+    pub(crate) static JAC_REVERSE_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test counter: the Jacobians [`fixed_eta_theta_sweeps`] took from forward tangents, so a
+    /// parity test can assert the tangent path ran rather than the reverse one it compares with.
+    pub(crate) static TANGENT_JACS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the Jacobian over `d` θ coordinates of `n_obs` predictions is cheaper by forward
+/// tangents than by reverse seeds: a tangent pass carries one direction per coordinate and a
+/// reverse sweep one seed per observation, each added to the same recorded trajectory, but the
+/// tangents need no kept forward, no run log and no second pass. The forward kernels exist for
+/// up to 48 directions (`rhs_ir::MAX_N`).
+fn tangent_jac_wins(d: usize, n_obs: usize) -> bool {
+    #[cfg(test)]
+    if JAC_REVERSE_FORCE.with(|c| c.get()) {
+        return false;
+    }
+    (1..=n_obs.min(48)).contains(&d)
+}
+
+/// The predictions and `∂f_j/∂θ_{cols[c]}` (row-major `n_obs × cols.len()`) from one forward
+/// of the subject's plan with a tangent per column, θ's unit tangents seeded in `params` and
+/// η's zero. `None` where the plan cannot run that layout — it still serves the F64 forward,
+/// so the caller's reverse path runs — or where the guard fails at this point.
+fn tangent_forward(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    axes: &[f64],
+    cols: &[usize],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    use crate::sens::num::vm::Layout;
+    let n_obs = subject.observations.len();
+    let d = cols.len();
+    let layout = Layout {
+        tan: u8::try_from(d).ok()?,
+        ..Layout::F64
+    };
+    let l = layout.lanes();
+    // `Some(None)`: the plan serves, but not at this layout — it must stay in the cache
+    // (a `None` from `serves` is a guard failure, and a plan failing at its own recording
+    // point is marked bad for every caller).
+    let du = with_plan_width(model, subject, lay, theta, axes, &mut |pn, plan| {
+        let mut u = vec![0.0; pn * l];
+        for (k, &a) in axes.iter().enumerate() {
+            u[k * l] = a;
+        }
+        let mut p = vec![0.0; theta.len() * l];
+        for (i, &t) in theta.iter().enumerate() {
+            p[i * l] = t;
+        }
+        for (c, &m) in cols.iter().enumerate() {
+            p[m * l + 1 + c] = 1.0;
+        }
+        let mut du = vec![0.0; (n_obs + 1) * l];
+        match plan.forward_unkept(layout, &u, &p, &mut du) {
+            None => Some(None),
+            Some(true) => Some(Some(du)),
+            Some(false) => None,
+        }
+    })??;
+    let vals = (0..n_obs).map(|j| du[j * l]).collect();
+    let mut jac = vec![0.0; n_obs * d];
+    for j in 0..n_obs {
+        jac[j * d..(j + 1) * d].copy_from_slice(&du[j * l + 1..j * l + 1 + d]);
+    }
+    Some((vals, jac))
+}
+
+/// The plan reverses behind [`fixed_eta_theta_contractions`] and [`fixed_eta_theta_adjoint_cols`]:
 /// the subject's plan, its value forward at `(θ, eta)` kept, and one value
 /// reverse seeded with every weight row (and, with `want_jac`, one with every observation's
 /// unit seed): the rows' contractions over raw θ.
@@ -3425,10 +3529,11 @@ fn fixed_eta_theta_sweeps(
     theta: &[f64],
     sigma: Option<&[f64]>,
     eta: &[f64],
-    want_jac: bool,
+    jac_cols: Option<&[usize]>,
     weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
 ) -> Option<(Vec<Vec<f64>>, Option<Vec<Vec<f64>>>)> {
     use crate::sens::num::vm::Layout;
+    let want_jac = jac_cols.is_some();
     // An SDE subject's score has variance rows beside the predictions: the callers that hand σ
     // ([`fixed_eta_theta_sigma_contractions`]) weight them; the rest contract the predictions
     // alone (FOCE's population prediction at η = 0, whose variance rows are not in the score).
@@ -3451,6 +3556,83 @@ fn fixed_eta_theta_sweeps(
         let zero = |n: usize| vec![vec![0.0; theta.len() + n_sig]; n];
         return Some((zero(rows.len()), want_jac.then(|| zero(0))));
     }
+    // A FREM covariate pseudo-observation predicts `θ_i + η_e` (the recorders return the
+    // PK prediction there, as every caller of theirs patches): its derivative is the unit
+    // vector on `θ_i`, added after the reverse rather than seeded.
+    let frem: Vec<Option<usize>> = (0..n_obs)
+        .map(|j| {
+            let fc = model.frem_config.as_ref()?;
+            let ft = subject.fremtype.get(j).filter(|&&ft| ft != 0)?;
+            fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
+        })
+        .collect();
+    let patch = |vals: &[f64]| -> Vec<f64> {
+        (0..n_obs)
+            .map(|j| match (frem[j], model.frem_config.as_ref()) {
+                (Some(ti), Some(fc)) => {
+                    let ei = fc.fremtype_to_indices[&subject.fremtype[j]].1;
+                    theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0)
+                }
+                _ => vals[j],
+            })
+            .collect()
+    };
+    // The Jacobian by forward tangents where that is the cheaper exact route: one pass gives
+    // the predictions and every `∂f_j/∂θ_m` of the wanted coordinates, the gradient is the
+    // weights' contraction of its rows, and no reverse sweep is made at all.
+    let tangents = match jac_cols {
+        Some(cols) if sigma.is_none() && tangent_jac_wins(cols.len(), n_obs) => {
+            tangent_forward(rec_model, subject, lay.as_deref(), theta, &axes, cols)
+        }
+        _ => None,
+    };
+    if let (Some((vals, jac_c)), Some(cols)) = (tangents, jac_cols) {
+        let rows = weights(&patch(&vals))?;
+        if rows.iter().any(|w| w.len() != n_obs) {
+            return None;
+        }
+        let (n_th, d) = (theta.len(), cols.len());
+        let dense: Vec<Vec<f64>> = rows
+            .iter()
+            .map(|w| {
+                let mut g = vec![0.0; n_th];
+                for (c, &m) in cols.iter().enumerate() {
+                    g[m] = (0..n_obs)
+                        .filter(|&j| frem[j].is_none())
+                        .map(|j| w[j] * jac_c[j * d + c])
+                        .sum();
+                }
+                for (j, ti) in frem.iter().enumerate() {
+                    if let Some(gm) = ti.and_then(|ti| g.get_mut(ti)) {
+                        *gm += w[j];
+                    }
+                }
+                g
+            })
+            .collect();
+        let jac: Vec<Vec<f64>> = (0..n_obs)
+            .map(|j| {
+                let mut row = vec![0.0; n_th];
+                match frem[j] {
+                    Some(ti) => {
+                        if let Some(r) = row.get_mut(ti) {
+                            *r = 1.0;
+                        }
+                    }
+                    None => {
+                        for (c, &m) in cols.iter().enumerate() {
+                            row[m] = jac_c[j * d + c];
+                        }
+                    }
+                }
+                row
+            })
+            .collect();
+        let finite = |x: &Vec<Vec<f64>>| x.iter().flatten().all(|v| v.is_finite());
+        #[cfg(test)]
+        TANGENT_JACS.with(|c| c.set(c.get() + 1));
+        return (finite(&dense) && finite(&jac)).then_some((dense, Some(jac)));
+    }
     let (n_eta, plan, vals, fwd) = with_plan_width(
         rec_model,
         subject,
@@ -3465,25 +3647,7 @@ fn fixed_eta_theta_sweeps(
             (du[n_obs] == 1.0).then(|| (pn, plan.clone(), du[..n_obs].to_vec(), fwd))
         },
     )?;
-    // A FREM covariate pseudo-observation predicts `θ_i + η_e` (the recorders return the
-    // PK prediction there, as every caller of theirs patches): its derivative is the unit
-    // vector on `θ_i`, added after the reverse rather than seeded.
-    let frem: Vec<Option<usize>> = (0..n_obs)
-        .map(|j| {
-            let fc = model.frem_config.as_ref()?;
-            let ft = subject.fremtype.get(j).filter(|&&ft| ft != 0)?;
-            fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
-        })
-        .collect();
-    let f: Vec<f64> = (0..n_obs)
-        .map(|j| match (frem[j], model.frem_config.as_ref()) {
-            (Some(ti), Some(fc)) => {
-                let ei = fc.fremtype_to_indices[&subject.fremtype[j]].1;
-                theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0)
-            }
-            _ => vals[j],
-        })
-        .collect();
+    let f = patch(&vals);
     // An SDE subject's variance rows: the EKF's `p_obs` at the same point, a plan of their
     // own over θ then σ, scored after the predictions.
     let planned_p = match sigma {

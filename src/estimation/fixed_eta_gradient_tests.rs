@@ -3214,7 +3214,17 @@ fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
         n_sigma,
         &mut scratch,
     );
-    assert_eq!((v0, &g0), (v1, &g1), "the score is the same call");
+    // The objective is the same call; the gradient is the same derivative taken two ways —
+    // one reverse sweep seeded with the weights, or (with the information, whose rows it
+    // needs anyway) the weights' contraction of the forward-tangent Jacobian — so it agrees
+    // to rounding, not in the bits (measured: 7e-15 relative).
+    assert_eq!(v0, v1, "the objective is the same call");
+    for (a, b) in g0.iter().zip(&g1) {
+        assert!(
+            (a - b).abs() <= 1e-12 * (1.0 + a.abs()),
+            "the score is the same derivative: {g0:?} vs {g1:?}"
+        );
+    }
     let info = info.expect("a parsed IOV model is inside the information's scope");
 
     // Independent assembly: ∂f_j/∂(log θ_a) by central differences of the IOV predictions.

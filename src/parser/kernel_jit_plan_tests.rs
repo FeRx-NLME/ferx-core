@@ -2843,3 +2843,49 @@ fn a_plans_kernels_keep_only_what_runs_them() {
     }
     assert!(seen[0] > 0 && seen[1] > 0, "kernels seen {seen:?}");
 }
+
+/// An unkept forward (`Plan::forward_unkept`, the exact tangent Jacobian of the M-step's
+/// fixed-η score) writes the outputs' lanes and the guard exactly as the kept forward does —
+/// here the value and both θ-tangents of `c = θ₁θ₀² + θ₀`, checked against their closed
+/// forms — reports the guard as its result, and holds no run log or buffer afterwards.
+#[test]
+fn an_unkept_forward_writes_what_the_kept_one_does() {
+    begin();
+    let th: Vec<Tr> = (0..2).map(|j| Tr::theta(j, [2.0, 1.5][j])).collect();
+    let a = th[0] * th[0];
+    assert!(a.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1.0));
+    Tr::chunk_mark();
+    let c = th[1] * a + th[0];
+    let rec = end(Some(vec![c.reg()])).expect("records");
+    let plan = rec.plan(Layout::F64, 0, 2).expect("plans");
+    let layout = Layout {
+        tan: 2,
+        ..Layout::F64
+    };
+    let l = layout.lanes();
+    for (theta, held) in [([2.0_f64, 1.5], true), ([0.5, 1.5], false)] {
+        let mut p = vec![0.0; 2 * l];
+        for j in 0..2 {
+            p[j * l] = theta[j];
+            p[j * l + 1 + j] = 1.0;
+        }
+        let (mut kept, mut unkept) = (vec![0.0; 2 * l], vec![0.0; 2 * l]);
+        let f = plan
+            .forward_layout(layout, &[], &p, &mut kept)
+            .expect("runs");
+        assert_eq!(plan.kept_guard(&f), held);
+        assert_eq!(
+            plan.forward_unkept(layout, &[], &p, &mut unkept),
+            Some(held),
+            "the result is the guard"
+        );
+        assert_eq!(unkept[l], f64::from(u8::from(held)), "the guard lane");
+        if held {
+            assert_eq!(unkept, kept, "the same lanes, bit for bit");
+            let (t0, t1) = (theta[0], theta[1]);
+            close(unkept[0], t1 * t0 * t0 + t0, "value");
+            close(unkept[1], 2.0 * t0 * t1 + 1.0, "∂/∂θ₀");
+            close(unkept[2], t0 * t0, "∂/∂θ₁");
+        }
+    }
+}
