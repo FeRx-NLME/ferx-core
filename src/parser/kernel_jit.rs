@@ -1090,6 +1090,10 @@ impl PkNum for Tr {
 }
 
 impl RecHooks for Tr {
+    #[cfg(feature = "markov")]
+    fn note_declined() {
+        note_nonfinite();
+    }
     /// A chunk boundary: sharing (hash-consing) restarts, so a chunk's text depends only
     /// on its own event, never on which values an earlier event happened to compute.
     fn chunk_mark() {
