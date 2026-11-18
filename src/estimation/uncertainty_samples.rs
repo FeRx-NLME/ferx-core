@@ -737,7 +737,8 @@ pub(crate) fn admissible_values(p: &ModelParameters) -> bool {
 ///
 /// Out-of-bounds or invalid draws are rejected and resampled, up to
 /// `10 * n_draws` total attempts.
-pub fn draw_parameter_samples(
+#[cfg(test)]
+pub(crate) fn draw_parameter_samples(
     fit_result: &FitResult,
     template: &ModelParameters,
     n_draws: usize,
@@ -748,7 +749,7 @@ pub fn draw_parameter_samples(
         .map_err(|e| e.to_string())
 }
 
-/// [`draw_parameter_samples`], refusing with an [`EngineError`] that carries the code of
+/// `draw_parameter_samples`, refusing with an [`EngineError`] that carries the code of
 /// a refusal of its input (#2044): `E_FIT_INPUT_MISSING` for a covariance matrix or SIR
 /// pool the fit does not carry (or an empty pool), `E_FIT_INPUT_MODEL` for one that is
 /// not the size of the template's packed parameters, and `E_LOGIT_THETA_OUT_OF_RANGE` on

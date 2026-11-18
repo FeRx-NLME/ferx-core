@@ -14,7 +14,8 @@ use crate::types::{CompiledModel, ModelParameters, Population, Subject};
 use nalgebra::DVector;
 
 /// The exact per-subject FOCEI gradient `dFᵢ/dx` in the **packed** optimizer space, or
-/// `None` outside the adjoint's scope. `eta_hat` must be the EBE for `unpack_params(x)`.
+/// `None` outside the adjoint's scope. `eta_hat` must be the EBE for `unpack_params(x)`;
+/// an IOV subject passes the stacked EBE `[η_bsv, κ₁ … κ_K]`.
 pub fn subject_packed_gradient(
     model: &CompiledModel,
     subject: &Subject,
@@ -25,21 +26,10 @@ pub fn subject_packed_gradient(
     subject_gradient(model, subject, template, x, eta_hat, true)
 }
 
-/// [`subject_packed_gradient`] for an **IOV** subject, over the stacked EBE
-/// `[η_bsv, κ₁ … κ_K]`.
-pub fn subject_packed_gradient_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    stacked_eta_hat: &[f64],
-) -> Option<Vec<f64>> {
-    subject_gradient(model, subject, template, x, stacked_eta_hat, true)
-}
-
 /// The exact per-subject **FOCE** (Sheiner–Beal, no interaction) gradient `dFᵢ/dx` in the
 /// packed space, at FOCE's frozen-variance EBE.
-pub fn subject_packed_gradient_foce(
+#[cfg(test)]
+pub(crate) fn subject_packed_gradient_foce(
     model: &CompiledModel,
     subject: &Subject,
     template: &ModelParameters,
@@ -49,8 +39,9 @@ pub fn subject_packed_gradient_foce(
     subject_gradient(model, subject, template, x, eta_hat, false)
 }
 
-/// [`subject_packed_gradient_foce`] for an **IOV** subject, over the stacked EBE.
-pub fn subject_packed_gradient_foce_iov(
+/// `subject_packed_gradient_foce` for an **IOV** subject, over the stacked EBE.
+#[cfg(test)]
+pub(crate) fn subject_packed_gradient_foce_iov(
     model: &CompiledModel,
     subject: &Subject,
     template: &ModelParameters,

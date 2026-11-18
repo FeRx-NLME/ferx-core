@@ -540,7 +540,8 @@ pub(crate) fn mixture_ofv_with_modes(
 /// mixture is served exactly like any other. The fit itself holds the modes already and
 /// calls `mixture_gradient_with_modes` directly. `None` only when
 /// `mixture_gradient_with_modes` declines.
-pub fn mixture_gradient(
+#[cfg(test)]
+pub(crate) fn mixture_gradient(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -560,7 +561,7 @@ pub fn mixture_gradient(
     mixture_gradient_with_modes(model, population, params, options, eval, None)
 }
 
-/// [`mixture_gradient`] with every class's modes from the same evaluation
+/// `mixture_gradient` with every class's modes from the same evaluation
 /// ([`mixture_ofv_with_modes`]): under IOV each class's subject gradient is taken at its
 /// stacked `[η̂, κ̂]`, so an IOV mixture is exact too. The base Ω may be a block: a class
 /// override can only name a diagonal base Ω's coordinate (a parse-time rule), so a block
@@ -868,7 +869,7 @@ fn theta_chain_factors(params: &ModelParameters) -> Vec<f64> {
 }
 
 /// Add `scale ·` one class's packed gradient `g_c` into the mixture's packed gradient
-/// `grad` — the one routing both [`mixture_gradient`] and the covariance step's
+/// `grad` — the one routing both `mixture_gradient` and the covariance step's
 /// per-subject score (#1956) use.
 ///
 /// `g_c` is over the class-`cls` layout `pack_params(&class_params(params, cls))`, whose
@@ -1073,7 +1074,7 @@ struct ClassScoreView {
 /// gᵢ = Σₖ wᵢₖ (∂nllᵢₖ/∂x − ∂ln pᵢₖ/∂x),   wᵢₖ = PMIXᵢₖ
 /// ```
 ///
-/// on the −logL scale (S's scale; [`mixture_gradient`] is the same sum ×2 over
+/// on the −logL scale (S's scale; `mixture_gradient` is the same sum ×2 over
 /// subjects). Each `dnllᵢₖ/dx` is the single-population total-derivative score
 /// (`covariance::subject_total_score`, the class mode re-estimated at every `x` — NONMEM's
 /// `MATRIX=S` convention, the one every other S uses since #2974) evaluated under

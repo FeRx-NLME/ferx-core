@@ -10704,9 +10704,7 @@ fn nested_packed_gradient(
         stacked.extend_from_slice(k.as_slice());
     }
     let g = if interaction {
-        crate::estimation::sens_outer_gradient::subject_packed_gradient_iov(
-            model, s, p, &x, &stacked,
-        )
+        crate::estimation::sens_outer_gradient::subject_packed_gradient(model, s, p, &x, &stacked)
     } else {
         crate::estimation::sens_outer_gradient::subject_packed_gradient_foce_iov(
             model, s, p, &x, &stacked,
