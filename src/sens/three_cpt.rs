@@ -495,9 +495,10 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
 
 /// Central-compartment concentration contribution of a single dose at elapsed
 /// time `t`, dispatching bolus / infusion / oral and their SS variants — the
-/// 3-cpt counterpart to [`super::two_cpt::two_cpt_conc_g`].
+/// 3-cpt counterpart to `super::two_cpt::two_cpt_conc_g`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub fn three_cpt_conc_g<T: PkNum>(
+pub(crate) fn three_cpt_conc_g<T: PkNum>(
     dose: &DoseEvent,
     t: T,
     cl: T,
@@ -520,7 +521,7 @@ pub fn three_cpt_conc_g<T: PkNum>(
     )
 }
 
-/// [`three_cpt_conc_g`] over a precomputed disposition (its macro rates computed once per
+/// `three_cpt_conc_g` over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_conc_d<T: PkNum>(

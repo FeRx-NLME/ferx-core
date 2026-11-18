@@ -248,7 +248,8 @@ impl<const N: usize> Add<f64> for Dual2<N> {
 }
 
 /// `s / dual` (scalar numerator).
-pub fn scalar_div<const N: usize>(s: f64, d: Dual2<N>) -> Dual2<N> {
+#[cfg(test)]
+pub(crate) fn scalar_div<const N: usize>(s: f64, d: Dual2<N>) -> Dual2<N> {
     d.recip() * s
 }
 

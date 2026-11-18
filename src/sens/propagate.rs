@@ -844,6 +844,7 @@ pub struct OneCptPk<T: PkNum> {
     pub f: T,
 }
 
+#[cfg(test)]
 impl<T: PkNum> OneCptPk<T> {
     fn to_pk_dual(self) -> PkDual<T> {
         PkDual {
@@ -2675,7 +2676,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
 /// 1-cpt convenience wrapper around [`event_driven_sens_g`] (maps `oral` to the
 /// `PkModel` and lifts [`OneCptPk`] to [`PkDual`]). Kept for the focused 1-cpt
 /// tests and terse 1-cpt callers.
-pub fn event_driven_sens_one_cpt_g<T: PkNum>(
+#[cfg(test)]
+pub(crate) fn event_driven_sens_one_cpt_g<T: PkNum>(
     oral: bool,
     subject: &Subject,
     schedule: &EventSchedule,
