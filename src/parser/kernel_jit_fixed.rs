@@ -500,10 +500,23 @@ impl RepeatSpec {
         out: &mut [f64],
         log: Option<&mut Option<FixedLog>>,
     ) -> bool {
+        self.run_why(layout, inputs, out, log).is_ok()
+    }
+
+    /// [`Self::run`], saying whether the failure is the body declining at the values (`Err(true)`:
+    /// an iterate overflowed, so the value path's own repeat declines there too) or the call's
+    /// (`Err(false)`: a count out of range, a body guard that does not hold).
+    fn run_why(
+        &self,
+        layout: Layout,
+        inputs: &[f64],
+        out: &mut [f64],
+        log: Option<&mut Option<FixedLog>>,
+    ) -> Result<(), bool> {
         let (n, l) = (self.n, layout.lanes());
         let count = inputs[n * l];
         if !(count >= 0.0 && count <= 64.0 && count.fract() == 0.0) {
-            return false;
+            return Err(false);
         }
         let caps = &inputs[(n + 1) * l..];
         let mut x = inputs[..n * l].to_vec();
@@ -514,10 +527,10 @@ impl RepeatSpec {
             p.extend_from_slice(caps);
             let mut du = vec![0.0; (self.body.n_out() + 1) * l];
             let Some(f) = self.body.forward_layout(layout, &[], &p, &mut du) else {
-                return false;
+                return Err(true);
             };
             if du[self.body.n_out() * l] != 1.0 {
-                return false;
+                return Err(false);
             }
             x.copy_from_slice(&du[..n * l]);
             if log.is_some() {
@@ -532,7 +545,7 @@ impl RepeatSpec {
                 m: Vec::new(),
             });
         }
-        true
+        Ok(())
     }
 
     /// The reverse: `out_adj` the final state's adjoints per seed, into `in_adj` per seed the
@@ -599,7 +612,12 @@ pub(crate) fn record_repeat(
             .collect::<Vec<f64>>()
     }));
     let mut out = vec![0.0; n];
-    if !spec.run(Layout::F64, &inputs, &mut out, None) {
+    if let Err(declined) = spec.run_why(Layout::F64, &inputs, &mut out, None) {
+        if declined {
+            // The body overflowed (or declined) at these values: the value path's own repeat does
+            // too, so the point cannot be scored and nothing needs its derivative.
+            note_nonfinite();
+        }
         fail_here("a repeat call's record-time run failed");
         return None;
     }

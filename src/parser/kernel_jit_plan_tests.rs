@@ -2653,3 +2653,52 @@ fn the_hot_table_compares_the_layout_structure() {
     assert!(t.get(&key, stamp, None).is_some(), "none vs none");
     assert!(t.get(&key, stamp, Some(&l_a)).is_none(), "none vs layout");
 }
+
+/// A matrix call or a repeat call whose record-time run overflows is at a point the value path
+/// cannot score (its own `exp` returns `None` on the non-finite power), so the recording fails
+/// as repelled, not counted as a plan failure: a diverged trial point (an extreme η) made the
+/// squaring of a Padé approximant overflow and the subject reported `W_PLAN_FD_FALLBACK` for a
+/// point nothing needed a derivative at (#3004). The controls on the other side of each gate
+/// stay the point's: a count out of range (the repeat) and a finite product that is simply
+/// recorded. Mutations: drop `note_nonfinite` from `record_mat` -> the product row reads
+/// `Point`; drop it from `record_repeat` (or make `run_why` return `Err(false)` for a body
+/// that declines) -> the repeat row reads `Point`.
+#[test]
+fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_scope() {
+    use crate::sens::num::RecHooks;
+    let square = |v: &[Tr]| {
+        <Tr as RecHooks>::mat_mul(v, v, 1)
+            .flatten()
+            .expect("records")
+    };
+    let repeat = |x: f64, count: f64| {
+        begin();
+        let (x0, n) = (Tr::eta(0, x), Tr::eta(1, count));
+        let out = <Tr as RecHooks>::repeat(&[x0], n, &square);
+        assert_eq!(
+            matches!(out, Some(Some(_))),
+            x.abs() < 1e50 && count <= 64.0
+        );
+        end(Some(vec![]))
+    };
+    // The product: finite records, an overflow is repelled.
+    begin();
+    let x = Tr::eta(0, 2.0);
+    assert!(<Tr as RecHooks>::mat_mul(&[x], &[x], 1).flatten().is_some());
+    assert!(end(Some(vec![])).is_ok(), "a finite product records");
+    begin();
+    let x = Tr::eta(0, 1e200);
+    assert!(<Tr as RecHooks>::mat_mul(&[x], &[x], 1).flatten().is_none());
+    assert_eq!(
+        end(Some(vec![])).err().expect("fails").1,
+        FailScope::Repelled
+    );
+    // The repeat: finite records, an overflowing iterate is repelled, a count out of range is
+    // the point's.
+    assert!(repeat(2.0, 3.0).is_ok(), "a finite repeat records");
+    assert_eq!(
+        repeat(1e100, 3.0).err().expect("fails").1,
+        FailScope::Repelled
+    );
+    assert_eq!(repeat(2.0, 100.0).err().expect("fails").1, FailScope::Point);
+}

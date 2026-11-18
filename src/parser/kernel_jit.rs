@@ -420,6 +420,13 @@ fn fail_subject(why: &str) {
     })
 }
 
+/// Note that this recording's point is one the value path cannot score (a record-time run
+/// produced a non-finite value, or declined: an overflowed trial point): a failure here is then
+/// repelled, not counted ([`FailScope::Repelled`]).
+pub(crate) fn note_nonfinite() {
+    rec(|r| r.nonfinite = true);
+}
+
 /// Fail the recording at this subject's point only (a record-time run whose outcome depends on
 /// this point's values: a search that did not converge, a count out of range).
 pub(crate) fn fail_here(why: &str) {

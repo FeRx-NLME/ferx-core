@@ -535,6 +535,10 @@ pub(crate) fn record_mat(op: MatOp, a: &[Tr], b: &[Tr], n: usize) -> Option<Vec<
     // guard, so the plan would replay it where the factorization is regular. Failing the
     // recording costs this subject the FD fallback at a singular point, never a wrong answer.
     if !spec.run(Layout::F64, &inputs, &mut out) {
+        // A non-finite result (an overflowed product) is a point the value path cannot score.
+        if out.iter().any(|v| !v.is_finite()) {
+            note_nonfinite();
+        }
         fail_here("a matrix call's record-time run failed");
         return None;
     }
