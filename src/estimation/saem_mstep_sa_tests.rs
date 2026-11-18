@@ -2419,16 +2419,22 @@ fn auto_is_bobyqa_for_a_sigma_only_saem_solve_and_newton_for_imp() {
             "an explicit newton is the request"
         );
     }
+    use crate::types::EstimationMethod::{Imp, Saem};
     let pop = declined_ode_population(8);
-    let src = "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
-               omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma EPS ~ 0.04\n\
-               [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
-               [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
-               [error_model]\n  DV ~ proportional(EPS)\n";
-    let model = parse_model_string(src).expect("parses");
-    let used = |method| {
+    let model = |error: &str, extra_sigma: &str| {
+        let src = format!(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  sigma EPS ~ 0.04\n{extra_sigma}\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  {error}\n"
+        );
+        parse_model_string(&src).expect("parses")
+    };
+    let used = |model: &crate::types::CompiledModel, method, optimizer| {
         let mut opts = crate::types::FitOptions::default();
         opts.method = method;
+        opts.mstep_optimizer = optimizer;
         opts.saem_n_exploration = 2;
         opts.saem_n_convergence = 1;
         opts.saem_seed = Some(3);
@@ -2437,18 +2443,29 @@ fn auto_is_bobyqa_for_a_sigma_only_saem_solve_and_newton_for_imp() {
         opts.imp_auto = false;
         opts.imp_seed = Some(3);
         opts.run_covariance_step = false;
-        crate::api::fit(&model, &pop, &model.default_params, &opts)
+        crate::api::fit(model, &pop, &model.default_params, &opts)
             .expect("fits")
             .mstep_optimizer_used
     };
-    assert_eq!(
-        used(crate::types::EstimationMethod::Saem).as_deref(),
-        Some("bobyqa")
-    );
-    assert_eq!(
-        used(crate::types::EstimationMethod::Imp).as_deref(),
-        Some("newton")
-    );
+    // One σ, additive or proportional, every θ mu-referenced: SAEM updates σ in closed form
+    // and runs no numerical solve, so the fit reports none — whatever was asked (an explicit
+    // `newton` included), not the optimizer the unused option resolved to.
+    let closed = model("DV ~ proportional(EPS)", "");
+    for optimizer in [Auto, Bobyqa, Newton] {
+        assert_eq!(
+            used(&closed, Saem, optimizer),
+            None,
+            "closed-form σ, {optimizer:?}: no numerical solve ran"
+        );
+    }
+    // IMP/IMPMAP have no closed-form σ: the same model runs the numerical solve.
+    assert_eq!(used(&closed, Imp, Auto).as_deref(), Some("newton"));
+    // Two σ (combined): SAEM's σ-only numerical solve *does* run — `auto` keeps BOBYQA for it
+    // (its evaluations are memo-served), an explicit `newton` is run as asked.
+    let numerical = model("DV ~ combined(EPS, ADD)", "  sigma ADD ~ 0.1\n");
+    assert_eq!(used(&numerical, Saem, Auto).as_deref(), Some("bobyqa"));
+    assert_eq!(used(&numerical, Saem, Newton).as_deref(), Some("newton"));
+    assert_eq!(used(&numerical, Imp, Auto).as_deref(), Some("newton"));
 }
 
 /// The BOBYQA solve stops on NLopt's absolute floor too ([`MSTEP_FTOL_ABS`], the same number as

@@ -7782,7 +7782,11 @@ pub fn run_saem(
         saem_objective_value: saemobj.value(),
         saem_n_subjects_hmc,
         saem_mh_accept_tail,
-        mstep_optimizer_used: (!use_score_sa).then(|| mstep_optimizer.as_str().to_string()),
+        // The optimizer of the numerical M-step when one runs: not under `score_sa`, and not
+        // where the closed-form σ update leaves no numerical θ/σ solve to run
+        // (`scalar_residual_model`; the solve is skipped at both of its call sites).
+        mstep_optimizer_used: (!use_score_sa && scalar_residual_model.is_none())
+            .then(|| mstep_optimizer.as_str().to_string()),
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,

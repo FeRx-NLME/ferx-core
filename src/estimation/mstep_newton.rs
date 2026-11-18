@@ -139,9 +139,13 @@ where
 /// How [`fisher_scoring`] ended.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NewtonOutcome {
-    /// The information was out of scope at the start point: `x` is untouched and nothing was
-    /// solved.
+    /// The information was out of scope at the start point (a subject the adjoint declined
+    /// there): `x` is untouched and nothing was solved.
     Declined,
+    /// The objective at the start point is the sentinel (a subject's prediction is not finite
+    /// there): `x` is untouched and nothing was solved. The adjoint declined nothing; the
+    /// derivative-free solve, which looks for a finite point, takes it from here.
+    NonFinite,
     /// The iteration reached one of its own stopping rules — the tolerance (the step it would
     /// take is not worth a pass, or the one it took changed the objective by less than
     /// `ftol_rel`), every coordinate held at a bound, or the evaluation budget. `x` is the
@@ -166,8 +170,9 @@ pub(crate) enum NewtonOutcome {
 /// is judged on it, and only an accepted point that the iteration continues from pays for the
 /// derivatives). Returns [`NewtonOutcome::Declined`] — `x` untouched, no evaluation spent —
 /// when the information is out of scope at the start point, and [`NewtonOutcome::Stalled`]
-/// when the iteration cannot take a step it has not converged for; in both the caller keeps
-/// the derivative-free solve (from `x`). `maxeval` bounds the evaluations of either kind (the
+/// when the iteration cannot take a step it has not converged for ([`NewtonOutcome::NonFinite`]
+/// at a start whose objective is the sentinel); in each the caller keeps the derivative-free
+/// solve (from `x`). `maxeval` bounds the evaluations of either kind (the
 /// budget BOBYQA gets in value evaluations); **every pass counts as one evaluation, a value
 /// pass and a fused pass alike**, and the count returned is what the caller subtracts from its
 /// budget before handing the remainder to the solve it continues with, so one M-step never
@@ -207,7 +212,7 @@ where
     // which would read as converged. It is not a solve of anything — the derivative-free
     // solve, which looks for a finite point, takes it from here.
     if cur.val >= SUBJECT_SENTINEL_NLL {
-        return (NewtonOutcome::Declined, evals);
+        return (NewtonOutcome::NonFinite, evals);
     }
     // Persists across iterations (Levenberg-Marquardt): a rejected step raises it, an accepted
     // one lowers it, and below the floor it is exactly zero — the plain Fisher step.
@@ -288,7 +293,19 @@ where
                 // Stationary to the bit: nothing to confirm.
                 return (NewtonOutcome::Converged, evals);
             }
+            // The Armijo test needs a descent direction. The trial is the Fisher step clamped
+            // into the box, and a clamped coordinate's shortened move can leave
+            // `gᵀ(trial − x) ≥ 0` (a coordinate with a large step against its gradient
+            // clamped to a small one, the others still moving uphill): then the sufficient-
+            // decrease bound would admit an *increase* of the objective. That trial is not
+            // judged — it costs no pass — and the ridge climbs toward the projected gradient
+            // step, which is a descent direction (every free coordinate moves against its own
+            // gradient, shortened or not).
             let slope: f64 = (0..n).map(|i| cur.grad[i] * (trial[i] - x[i])).sum();
+            if slope >= 0.0 || slope.is_nan() {
+                ridge = (ridge * 10.0).max(RIDGE_FLOOR);
+                continue;
+            }
             let v = value(&trial);
             evals += 1;
             if v.is_finite() && v <= cur.val + ARMIJO_C1 * slope {
@@ -359,9 +376,12 @@ where
 pub(crate) struct NewtonTally {
     /// Solves that ran Newton.
     solves: std::cell::Cell<u32>,
-    /// Solves that lost the information at run time — a subject whose recording the adjoint
-    /// declined at that point — and continued with the derivative-free solve.
+    /// Solves that lost the information — a subject whose recording the adjoint declined at the
+    /// start or at an accepted point — and continued with the derivative-free solve.
     lost_information: std::cell::Cell<u32>,
+    /// Solves that started where the objective is not finite (a subject's prediction is not
+    /// finite there) and went to the derivative-free solve, which looks for a finite point.
+    non_finite_start: std::cell::Cell<u32>,
     /// Solves that found no admissible step and continued with the derivative-free solve.
     stalled: std::cell::Cell<u32>,
 }
@@ -369,12 +389,13 @@ pub(crate) struct NewtonTally {
 impl NewtonTally {
     /// The fit's warning, `None` when every Newton solve ended on its own.
     pub(crate) fn warning(&self, label: &str) -> Option<String> {
-        let (solves, lost, stalled) = (
+        let (solves, lost, non_finite, stalled) = (
             self.solves.get(),
             self.lost_information.get(),
+            self.non_finite_start.get(),
             self.stalled.get(),
         );
-        if lost + stalled == 0 {
+        if lost + non_finite + stalled == 0 {
             return None;
         }
         let mut causes = Vec::new();
@@ -382,6 +403,12 @@ impl NewtonTally {
             causes.push(format!(
                 "{lost} lost the expected information at run time (the adjoint declined a \
                  subject's recording at that point)"
+            ));
+        }
+        if non_finite > 0 {
+            causes.push(format!(
+                "{non_finite} started where the objective is not finite (a subject's \
+                 prediction at that point is not finite)"
             ));
         }
         if stalled > 0 {
@@ -393,7 +420,7 @@ impl NewtonTally {
             "{label}: `mstep_optimizer = newton` handed {} of {solves} numerical M-steps to \
              `bobyqa` (the remainder of the M-step's evaluation budget, from the point Newton \
              reached): {}.",
-            lost + stalled,
+            lost + non_finite + stalled,
             causes.join("; ")
         ))
     }
@@ -430,6 +457,8 @@ where
         t.solves.set(t.solves.get() + 1);
         if matches!(outcome, NewtonOutcome::Declined | NewtonOutcome::Lost) {
             t.lost_information.set(t.lost_information.get() + 1);
+        } else if outcome == NewtonOutcome::NonFinite {
+            t.non_finite_start.set(t.non_finite_start.get() + 1);
         } else if outcome == NewtonOutcome::Stalled {
             t.stalled.set(t.stalled.get() + 1);
         }
@@ -442,7 +471,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::NewtonOutcome::{Converged, Declined, Lost, Stalled};
+    use super::NewtonOutcome::{Converged, Declined, Lost, NonFinite, Stalled};
     use super::*;
 
     /// Gaussian regression `y_j = a·exp(b·t_j)`, additive σ fixed at 1: value, exact score and
@@ -566,7 +595,7 @@ mod tests {
             })
         };
         let (outcome, _) = solve(&mut x, &[-9.0; 2], &[9.0; 2], 100, 1e-9, sentinel);
-        assert_eq!(outcome, Declined);
+        assert_eq!(outcome, NonFinite);
         assert_eq!(x, [1.5, -0.4]);
         // The same flat information at a finite value *is* converged: the sentinel is the
         // discriminator, not the zero gradient.
@@ -957,6 +986,103 @@ mod tests {
             "{w}"
         );
         assert!(w.contains("1 found no admissible damped step"), "{w}");
+    }
+
+    /// The warning names the cause each hand-over had, with the other causes' negatives: a start at
+    /// the sentinel objective is not "the adjoint declined a subject's recording" (nothing was
+    /// declined; a prediction is not finite) and a declined recording is not a non-finite start.
+    /// Mutation: counting the sentinel start as `lost_information` fails the first block.
+    #[test]
+    fn the_tally_names_a_non_finite_start_apart_from_a_declined_recording() {
+        let sentinel = |_: &[f64]| {
+            Some(ValueGradInfo {
+                val: SUBJECT_SENTINEL_NLL,
+                grad: vec![0.0],
+                info: vec![1.0],
+            })
+        };
+        let run = |tally: &NewtonTally, fused: &dyn Fn(&[f64]) -> Option<ValueGradInfo>| {
+            let mut x = [2.9];
+            let s = newton_solve(
+                &mut x,
+                &[-9.0],
+                &[9.0],
+                100,
+                1e-12,
+                |_| 1.0,
+                fused,
+                Some(tally),
+            );
+            assert!(!s.converged);
+            assert_eq!(x, [2.9], "nothing was solved");
+        };
+        let t = NewtonTally::default();
+        run(&t, &sentinel);
+        let w = t.warning("SAEM").expect("a hand-over");
+        assert!(
+            w.contains("1 of 1") && w.contains("started where the objective is not finite"),
+            "{w}"
+        );
+        assert!(
+            !w.contains("lost the expected information") && !w.contains("adjoint declined"),
+            "{w}"
+        );
+        let t = NewtonTally::default();
+        run(&t, &|_| None);
+        let w = t.warning("SAEM").expect("a hand-over");
+        assert!(
+            w.contains("1 lost the expected information") && w.contains("adjoint declined"),
+            "{w}"
+        );
+        assert!(!w.contains("not finite"), "{w}");
+    }
+
+    /// The Armijo test is on a descent direction. Two free coordinates, `I = [[1, .9], [.9, 1]]`,
+    /// `g = [1, .5]`: the Fisher step `[-2.89, +2.11]` clamps to `[-0.1, +2.11]` at the lower
+    /// bound of the first, a projected step with `gᵀs = +0.95`. The objective at the start is 10
+    /// and `5e-5` higher at every trial, which the bound `cur + 1e-4·slope` admitted for that
+    /// slope — an increase accepted at ridge 0, then reported as converged. The solve must keep
+    /// its start (stalled: no trial decreases the objective) rather than accept the increase.
+    /// Mutation: dropping the `slope < 0` check makes the outcome `Converged` at a moved `x`.
+    #[test]
+    fn a_clamped_step_that_is_not_a_descent_direction_is_not_accepted() {
+        let fused = |_: &[f64]| {
+            Some(ValueGradInfo {
+                val: 10.0,
+                grad: vec![1.0, 0.5],
+                info: vec![1.0, 0.9, 0.9, 1.0],
+            })
+        };
+        let mut x = [0.1, 0.0];
+        let (out, _) = fisher_scoring(
+            &mut x,
+            &[0.0, -9.0],
+            &[9.0, 9.0],
+            200,
+            1e-9,
+            |_| 10.0 + 5e-5,
+            fused,
+        );
+        assert_eq!((out, x), (Stalled, [0.1, 0.0]));
+        // A real objective with those derivatives at the start (`f = ½(x − x*)ᵀ I (x − x*)`,
+        // `x*` below the bound on the first coordinate): it descends, on the bound, and never
+        // ends above where it started.
+        let xs = [-2.79, 2.105];
+        let f = move |v: &[f64]| {
+            let d = [v[0] - xs[0], v[1] - xs[1]];
+            let id = [d[0] + 0.9 * d[1], 0.9 * d[0] + d[1]];
+            Some(ValueGradInfo {
+                val: 0.5 * (d[0] * id[0] + d[1] * id[1]),
+                grad: id.to_vec(),
+                info: vec![1.0, 0.9, 0.9, 1.0],
+            })
+        };
+        let start = f(&[0.1, 0.0]).unwrap().val;
+        let mut y = [0.1, 0.0];
+        let (out, _) = solve(&mut y, &[0.0, -9.0], &[9.0, 9.0], 200, 1e-12, f);
+        assert_eq!(out, Converged);
+        assert_eq!(y[0], 0.0, "held on the bound");
+        assert!(f(&y).unwrap().val < start, "{y:?}");
     }
 
     #[test]

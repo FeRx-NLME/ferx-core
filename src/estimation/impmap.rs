@@ -4946,6 +4946,12 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The evaluation budget the last [`solve_weighted_mstep`] on this thread was handed.
+    static LAST_WEIGHTED_MAXEVAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether [`FAIL_MSTEP_SOLVES_AFTER`] fails this solve.
 #[cfg(test)]
 fn mstep_solve_forced_to_fail() -> bool {
@@ -4980,10 +4986,12 @@ fn mstep_failure(
 /// model every M-step then ended `FtolReached` with 2–3 coordinates moved. The first step
 /// is the main lever; loosening the tolerance alone moved 4–6.
 ///
-/// The mixture M-step shares this configuration. SAEM's mixture arm keeps the old one
-/// (`MSTEP_MIXTURE_FTOL_REL`) because it solves on hard class assignments. This solve is
-/// weighted by the soft responsibilities, so it is an ordinary EM step and a converged
-/// solve is the right target.
+/// The mixture M-step shares this configuration (first design, tolerance) and keeps the
+/// pre-#3001 evaluation budget `maxiter·(n + 1)` that SAEM's mixture arm keeps
+/// (`mstep_budget`), so a default mixture fit's M-step is what it was. SAEM's mixture arm also
+/// keeps the old tolerance (`MSTEP_MIXTURE_FTOL_REL`) because it solves on hard class
+/// assignments; this solve is weighted by the soft responsibilities, so it is an ordinary EM
+/// step and a converged solve is the right target.
 fn solve_weighted_mstep<F>(
     obj: F,
     mut x: Vec<f64>,
@@ -5006,6 +5014,8 @@ where
 {
     let n = x.len();
     let start = x.clone();
+    #[cfg(test)]
+    LAST_WEIGHTED_MAXEVAL.set(maxeval);
     let algorithm = match mstep_optimizer {
         MstepOptimizer::Lbfgs => nlopt::Algorithm::Lbfgs,
         // Newton keeps BOBYQA for what it declines or stalls on.
@@ -5396,7 +5406,10 @@ fn theta_sigma_weighted_mstep_mixture(
             n,
             (0..n).filter(|&i| lower[i] < upper[i]).count(),
             mstep_optimizer,
-            false,
+            // The mixture arm keeps its budget, `maxiter·(n + 1)`, as SAEM's does
+            // (`mstep_budget`): only the budget — the weighted solve's first design and
+            // tolerance are the ordinary ones (see `solve_weighted_mstep`).
+            true,
         ),
         mstep_optimizer,
         None,

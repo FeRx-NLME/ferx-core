@@ -8916,8 +8916,9 @@ pub struct FitResult {
     pub saem_mh_accept_tail: Option<f64>,
     /// The numerical θ/σ M-step optimizer a SAEM, IMP or IMPMAP fit actually ran
     /// (`newton`, `bobyqa` or `lbfgs`): what `[fit_options] mstep_optimizer = auto`
-    /// (the default) resolved to for this model. `None` for other methods and where
-    /// `mstep_solver = score_sa` replaces the numerical solve.
+    /// (the default) resolved to for this model. `None` for other methods and where no
+    /// numerical solve runs: `mstep_solver = score_sa` replaces it, and a single free
+    /// additive/proportional σ with every free θ mu-referenced is updated in closed form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mstep_optimizer_used: Option<String>,
     /// Gradient method used in the inner (per-subject EBE) BFGS loop.

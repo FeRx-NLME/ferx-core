@@ -203,8 +203,44 @@ fn a_budgeted_solve_moves_a_many_coordinate_problem() {
     }
 }
 
+/// The weighted M-step's budget: BOBYQA runs to its tolerance under a runaway guard of 100
+/// evaluations per interpolation point, and the **mixture** arm keeps the pre-#3001
+/// `maxiter·(n + 1)` as SAEM's mixture arm does (the changelog says mixtures keep the old
+/// budget). 14 coordinates, `maxiter = 4`: 2900 against 60. Mutation: the mixture call passing
+/// `mixture = false` to `mstep_budget` fails the second assertion.
+#[test]
+fn the_mixture_weighted_mstep_keeps_its_old_budget() {
+    let w = WideSolve::new();
+    let n_sigma = w.log_sigma.len();
+    let n = w.theta.len() + n_sigma;
+    assert_eq!(n, 14, "premise: the fixture's coordinate count");
+    w.solve(4);
+    assert_eq!(LAST_WEIGHTED_MAXEVAL.get(), 100 * (2 * 14 + 1));
+    theta_sigma_weighted_mstep_mixture(
+        &w.model,
+        &w.pop,
+        std::slice::from_ref(&w.draws),
+        &w.schedules,
+        &vec![vec![1.0]; w.pop.subjects.len()],
+        &w.theta,
+        &w.log_sigma,
+        &w.theta_lower,
+        &w.theta_upper,
+        &vec![-8.0; n_sigma],
+        &vec![5.0; n_sigma],
+        w.theta.len(),
+        n_sigma,
+        4,
+        &vec![false; w.theta.len()],
+        crate::types::MstepOptimizer::Bobyqa,
+    );
+    assert_eq!(LAST_WEIGHTED_MAXEVAL.get(), 4 * (14 + 1));
+}
+
 /// #2718: the mixture M-step runs the same solver, so one class with all the
-/// responsibility reproduces the single-population solve exactly.
+/// responsibility reproduces the single-population solve exactly. The budgets differ
+/// (the mixture's is `maxiter·(n + 1)`, [`the_mixture_weighted_mstep_keeps_its_old_budget`]), so
+/// `maxiter` is large enough that neither binds: both stop on the tolerance.
 #[test]
 fn the_mixture_mstep_shares_the_solver() {
     let w = WideSolve::new();
@@ -224,11 +260,11 @@ fn the_mixture_mstep_shares_the_solver() {
         &vec![5.0; n_sigma],
         w.theta.len(),
         n_sigma,
-        4,
+        100,
         &vec![false; w.theta.len()],
         crate::types::MstepOptimizer::Bobyqa,
     );
-    let single = w.solve(4);
+    let single = w.solve(100);
     assert_eq!(mixture.log_theta, single.log_theta);
     assert_eq!(mixture.log_sigma, single.log_sigma);
     assert_eq!(w.moved(&mixture), 14);

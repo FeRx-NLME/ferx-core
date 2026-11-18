@@ -500,7 +500,7 @@ evaluations are all served by the prediction memo (below) and Newton's fused pas
 work for no fewer evaluations. IMP and IMPMAP keep `newton` for a σ-only solve: their
 BOBYQA keeps no memo, so there Newton's is the gain. It is a rule, not a request the model
 can fail, so it is silent; the fit file records the result (`mstep_optimizer: newton` under `model`)
-and `FitResult::mstep_optimizer_used` carries it. BOBYQA reads only objective *values*: it
+and `FitResult::mstep_optimizer_used` carries it (both are absent where SAEM runs no numerical solve at all: a single additive or proportional σ with every free θ mu-referenced is updated in closed form). BOBYQA reads only objective *values*: it
 spends `2n + 1` of them on its first interpolation model and several more per step. The
 same fit can instead read the exact derivatives, which the adjoint produces from one
 recording of the predictions:
@@ -595,8 +595,10 @@ fit's instructions, 2.1× on the benchmarks, for 112 MB at 2000 subjects × 1000
 observations; under the opt-in solvers the cost is the documented price of the option.) A sample takes
 space only once it is scored (a zero importance weight takes none), and a subject's buffer grows
 with the samples scored, never with the sample count. A Newton solve that stalls and hands over
-to BOBYQA drops its memo first: BOBYQA evaluates each θ once, so the memo could only copy
-predictions in and never serve one. The θ is
+to BOBYQA drops a memo that follows θ (free θ) first: BOBYQA evaluates each θ once, so
+that memo could only copy predictions in and never serve one. A memo that holds a pinned θ
+(a σ-only solve) is kept: the continuation sees the same θ bit for bit and every one of its
+evaluations is a hit. The θ is
 compared once per evaluation and a subject's samples share one buffer that a hit borrows.
 It returns the predictions the solve's own predictor returned the first time,
 so the fit file and the sdtab of all 90 fits (6 sets, 3 optimizers, 5 seeds) are
@@ -817,8 +819,8 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
   [#1445](https://github.com/FeRx-NLME/ferx-core/issues/1445) policy the
   derivative-free arms use, not a second copy of it. That is a smaller *gain* on
   the step, not the blend stacked on top of it (which really would move σ at
-  `γ²`). One gradient sweep is cheaper than the `mstep_maxiter·(n+1)` population
-  passes the derivative-free solve costs, so this M-step runs every iteration
+  `γ²`). One gradient sweep is cheaper than the population passes a derivative-free
+  solve run to its tolerance costs (tens to hundreds of value evaluations per M-step), so this M-step runs every iteration
   rather than every third during exploration. The score's θ block, and the
   per-observation `∂f/∂θ` the expected information is built from, are exact: one
   recording of the subject's predictions with θ on the adjoint's tape and one
@@ -877,7 +879,8 @@ SAEM benchmarks, 6 seeds each, single-threaded, it is tie-or-better than `bobyqa
 importance-sampled −2 log L on every one — best on busulfan (−5.14), busulfan-`TVQ`-FIX
 (−5.58) and the thiotepa ODE bench (−11.07) — and it costs **25–54 % less CPU** (cefepime
 5.36 → 2.45 s, thiotepa 215 → 94 s), because one gradient sweep per iteration replaces a
-derivative-free solve whose cost is `mstep_maxiter·(n+1)` population passes.
+derivative-free solve whose cost is the population passes of a BOBYQA solve run to its
+tolerance (tens to hundreds of value evaluations per M-step).
 
 **Against — the σ half, fixed in
 [#1480](https://github.com/FeRx-NLME/ferx-core/issues/1480).** As #1458 shipped it,
