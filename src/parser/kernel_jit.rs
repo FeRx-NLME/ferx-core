@@ -1541,10 +1541,13 @@ pub(crate) fn recorded(
     // A family whose structure keeps changing (an event time that moves with η: a modeled
     // infusion duration crossing its observations) would keep a template per structure it
     // meets, and replay against each of them first: recorded afresh, it keeps none.
-    if known.as_ref().is_some_and(|k| k.misses >= UNSTABLE_AFTER) {
+    let transient = || {
         begin();
         rec(|r| r.transient = true);
-        return end(f());
+        end(f())
+    };
+    if known.as_ref().is_some_and(|k| k.misses >= UNSTABLE_AFTER) {
+        return transient();
     }
     if let Some(alts) = known.map(|k| k.alts).filter(|a| !a.is_empty()) {
         begin();
@@ -1561,8 +1564,8 @@ pub(crate) fn recorded(
                 return Ok(r);
             }
             Err((why, _)) if why == TEMPLATE_MISMATCH => {
-                if let Some(k) = lock_families().get_mut(family) {
-                    k.misses += 1;
+                if missed(family) {
+                    return transient();
                 }
             }
             Err(_) => {}
@@ -1571,6 +1574,34 @@ pub(crate) fn recorded(
     begin();
     rec(|r| r.family = Some(family.clone()));
     end(f())
+}
+
+/// Count a replay of `family` that met another structure; at the [`UNSTABLE_AFTER`]th, release
+/// the templates it kept — from its replay list and from the template map, where nothing but
+/// another family's list holds them now — and answer `true`: from here it keeps none. A
+/// template is a cache, so dropping it costs a later recording a plan, never a value.
+fn missed(family: &SubjectKey) -> bool {
+    let alts = {
+        let mut m = lock_families();
+        let Some(k) = m.get_mut(family) else {
+            return false;
+        };
+        k.misses += 1;
+        if k.misses < UNSTABLE_AFTER {
+            return false;
+        }
+        std::mem::take(&mut k.alts)
+    };
+    if !alts.is_empty() {
+        let mut t = templates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.retain(|_, v| {
+            v.retain(|o| !alts.iter().any(|a| Arc::ptr_eq(a, o)));
+            !v.is_empty()
+        });
+    }
+    true
 }
 
 /// Per family of plans ([`SubjectKey::family`]), the templates its recordings were planned

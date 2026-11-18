@@ -2036,14 +2036,16 @@ fn a_structure_other_than_the_template_is_recorded_afresh() {
 }
 
 /// A family whose structure changes at every point (an event time that moves with η: a modeled
-/// infusion duration crossing the observations) keeps a bounded set of templates. Once
-/// `UNSTABLE_AFTER` of its replays have met another structure it records afresh and keeps
-/// none, so twenty structures leave `UNSTABLE_AFTER + 1` templates, not twenty — each one a
-/// recording kept for the rest of the fit — and every plan still computes its own structure.
-/// Mutation: drop the `misses >= UNSTABLE_AFTER` early return in `recorded` -> twenty
-/// templates are kept.
+/// infusion duration crossing the observations) keeps no template once it is unstable. Its first
+/// structure leaves one; at the `UNSTABLE_AFTER`th replay that meets another structure the
+/// templates it kept are released — from its replay list and from the template map, whose key is
+/// the structure and so bounds nothing — and twenty structures leave none, each of which would
+/// otherwise be a recording kept for the rest of the fit. Every plan still computes its own
+/// structure. Mutations: drop the `misses >= UNSTABLE_AFTER` early return in `recorded` -> the
+/// replays go on and `misses` passes `UNSTABLE_AFTER`; drop the release in `missed` -> the
+/// templates of the first structures stay kept.
 #[test]
-fn a_family_whose_structure_keeps_changing_keeps_a_bounded_set_of_templates() {
+fn an_unstable_family_releases_its_templates() {
     let subject = crate::types::Subject::default();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let family = SubjectKey::new(&m, &subject, 1, 2)
@@ -2088,6 +2090,9 @@ fn a_family_whose_structure_keeps_changing_keeps_a_bounded_set_of_templates() {
         let mut du = vec![0.0; 2 * l];
         plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
         close(du[0], want, "each structure's own value");
+        if n == 1 {
+            assert_eq!(kept(), 1, "a family's first structure leaves a template");
+        }
     }
     let f = lock_families()
         .get(&family)
@@ -2097,12 +2102,8 @@ fn a_family_whose_structure_keeps_changing_keeps_a_bounded_set_of_templates() {
         f.misses, UNSTABLE_AFTER,
         "replays stop once the family is unstable"
     );
-    assert!(f.alts.len() <= MAX_VARIANTS);
-    assert_eq!(
-        kept(),
-        UNSTABLE_AFTER as usize + 1,
-        "an unstable family keeps no further template"
-    );
+    assert!(f.alts.is_empty(), "an unstable family replays nothing");
+    assert_eq!(kept(), 0, "an unstable family's templates are released");
 }
 
 /// What a recording that declines the exact linear path leaves behind: nothing. The state of
