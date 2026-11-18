@@ -1750,3 +1750,74 @@ fn count_records_on_a_count_endpoint_are_level_capable() {
     assert!(!m.contains(BARE_ADVICE), "{m}");
     assert!(m.contains(BARE_NO_DEFINER_DATA), "{m}");
 }
+
+/// [`BINARY`] as a `[count_model]`: the same block and study η, read in the log mean (the
+/// fixture's 0/1 DVs are valid counts).
+fn count_model_text() -> String {
+    BINARY.replace(
+        "[binary_model]\n  cmt   = 1\n  logit = TVL + PLACEBO + ETA_S + EMAX * TRT",
+        "[count_model]\n  cmt        = 1\n  type       = negbin\n  log_lambda = TVL + PLACEBO + ETA_S + EMAX * TRT\n  r          = exp(EMAX)",
+    )
+}
+
+/// `contrast = auto` sees the study η a `[count_model]` mean reads beside the block, as
+/// for a binary predictor (#2877 review round 5): the block absorbs it, so auto resolves
+/// to the within-study contrast, not a global sum-to-zero.
+///
+/// Mutations: leave the count expressions out of the coupling walk's readouts and auto
+/// resolves to a global sum-to-zero; leave them out of the scale-share walk and the block
+/// shares no expression with the η.
+#[test]
+fn auto_sees_the_eta_the_count_mean_reads_with_the_block() {
+    let text = count_model_text().replace(", contrast = sum_to_zero_within", "");
+    assert!(text.contains("[count_model]") && !text.contains("[binary_model]"));
+    let (parsed, _) = bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{e}"));
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(decl.contrast(), LevelContrast::SumToZeroWithin);
+    assert!(
+        decl.shares_scale_with_eta(),
+        "the count mean reads the block and the η in one expression"
+    );
+}
+
+/// The identifiability refusal names the count expression where the block meets the
+/// random effect — the mean, or the size `r` — not `y` and not a binary predictor.
+///
+/// Mutations: give count expressions the binary label, or swap the mean and size labels,
+/// and one of the two messages names the wrong expression.
+#[test]
+fn the_share_site_names_the_count_expression() {
+    let text = count_model_text().replace(
+        "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
+        "PLACEBO[STUDY]",
+    );
+    let err = bound(&text, &csv(&[0, 4], true))
+        .err()
+        .expect("not identified");
+    assert!(
+        err.contains("the `[count_model]` mean reads this block and a random effect"),
+        "{err}"
+    );
+    assert!(!err.contains("the `y` readout"), "{err}");
+    assert!(!err.contains("[binary_model]"), "{err}");
+    assert!(!err.contains("size `r`"), "{err}");
+
+    // The block and the η met in the size instead.
+    let size = text
+        .replace(
+            "log_lambda = TVL + PLACEBO + ETA_S + EMAX * TRT",
+            "log_lambda = TVL + EMAX * TRT",
+        )
+        .replace(
+            "r          = exp(EMAX)",
+            "r          = exp(PLACEBO + ETA_S)",
+        );
+    let err = bound(&size, &csv(&[0, 4], true))
+        .err()
+        .expect("not identified");
+    assert!(
+        err.contains("the `[count_model]` size `r` reads this block and a random effect"),
+        "{err}"
+    );
+    assert!(!err.contains("`[count_model]` mean"), "{err}");
+}

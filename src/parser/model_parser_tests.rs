@@ -32472,7 +32472,7 @@ fn coupling_counted(src: &str) -> (EtaCoupling, usize) {
     )];
     let states = StateInputs::new(&[], true, None, PkModel::OneCptIv, &HashMap::new(), &[]);
     super::DEF_CONSTANT_CALLS.with(|c| c.set(0));
-    let c = level_block_eta_coupling(&stmts, &readout, 0, "PLACEBO", 0, "ETA_E0", &states);
+    let c = level_block_eta_coupling(&stmts, &readout, &[], "PLACEBO", 0, "ETA_E0", &states);
     (c, super::DEF_CONSTANT_CALLS.with(|c| c.get()))
 }
 
@@ -32496,7 +32496,7 @@ fn the_coupling_walk_is_linear_on_a_diamond() {
             site: ScaleShare {
                 param: None,
                 eta_via: Some("E0".to_string()),
-                binary: false,
+                endpoint: None,
             },
             covariates: vec!["WT".to_string()],
         }];
@@ -32573,7 +32573,7 @@ fn a_funnel_records_only_its_operands_covariates() {
         site: ScaleShare {
             param: Some("E0".to_string()),
             eta_via: None,
-            binary: false,
+            endpoint: None,
         },
         covariates: covs.iter().map(|s| s.to_string()).collect(),
     };
@@ -32581,7 +32581,7 @@ fn a_funnel_records_only_its_operands_covariates() {
         site: ScaleShare {
             param: None,
             eta_via: Some("E0".to_string()),
-            binary: false,
+            endpoint: None,
         },
         covariates: covs.iter().map(|s| s.to_string()).collect(),
     };
@@ -32632,7 +32632,7 @@ fn the_coupling_walk_terminates_on_a_self_reassignment() {
         site: ScaleShare {
             param: None,
             eta_via: Some("E0".to_string()),
-            binary: false,
+            endpoint: None,
         },
         covariates: vec![],
     }];

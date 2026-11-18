@@ -50,7 +50,8 @@ covariates (each record's own value, as a `$PRED` reads the current record), val
 `r = R` with `theta R(5, 0.01, 1000)`, or put a covariate or random effect on it.
 A θ level block (`theta PLACEBO[STUDY, TIME](0.0)`) read bare in the mean is scored at
 each record's own level, and the count records define the block's levels, as binary
-records do (see [θ level blocks](parameters.qmd)).
+records do (see [θ level blocks](parameters.qmd)); `contrast = auto` sees a random effect
+the mean or `r` reads beside the block, as it does in a binary predictor.
 
 ### Exposure and offsets
 

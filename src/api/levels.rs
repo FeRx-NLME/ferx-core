@@ -6047,10 +6047,10 @@ fn share_site(share: &ScaleShare) -> String {
                 "the individual parameter `{p}` reads this block and carries a random effect{via}"
             )
         }
-        None if share.binary => {
-            format!("the `[binary_model]` predictor reads this block and a random effect{via}")
-        }
-        None => format!("the `y` readout reads this block and a random effect{via}"),
+        None => match share.endpoint {
+            Some(label) => format!("{label} reads this block and a random effect{via}"),
+            None => format!("the `y` readout reads this block and a random effect{via}"),
+        },
     }
 }
 

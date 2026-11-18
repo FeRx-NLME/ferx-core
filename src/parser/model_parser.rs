@@ -5461,19 +5461,40 @@ pub fn parse_full_model_with(
             &eta_names,
             &indiv_stmts,
         );
+        // #2877: so are a `[count_model]`'s mean and size, after the binary predictors.
+        let count_readouts = count_readout_exprs(
+            blocks,
+            &extracted.named,
+            &theta_names,
+            &eta_names,
+            &indiv_stmts,
+        );
+        let endpoint_labels: Vec<&'static str> =
+            std::iter::repeat_n(BINARY_READOUT, binary_readouts.len())
+                .chain(count_readouts.iter().map(|(label, _)| *label))
+                .collect();
         let mut readout = readout;
-        let n_binary = binary_readouts.len();
-        readout.extend(binary_readouts.iter().cloned());
-        readout_with_states.extend(binary_readouts.iter().cloned());
+        for e in binary_readouts
+            .iter()
+            .chain(count_readouts.iter().map(|(_, e)| e))
+        {
+            readout.push(e.clone());
+            readout_with_states.push(e.clone());
+        }
         for decl in level_block_decls.iter_mut() {
-            decl.scale_share =
-                block_shares_scale_with_eta(&indiv_stmts, &readout, n_binary, &decl.name, None);
+            decl.scale_share = block_shares_scale_with_eta(
+                &indiv_stmts,
+                &readout,
+                &endpoint_labels,
+                &decl.name,
+                None,
+            );
             decl.eta_couplings = (0..eta_names.len())
                 .map(|k| {
                     let mut c = level_block_eta_coupling(
                         &indiv_stmts,
                         &readout_with_states,
-                        n_binary,
+                        &endpoint_labels,
                         &decl.name,
                         k,
                         &eta_names[k],
@@ -5482,7 +5503,7 @@ pub fn parse_full_model_with(
                     c.share = block_shares_scale_with_eta(
                         &indiv_stmts,
                         &readout,
-                        n_binary,
+                        &endpoint_labels,
                         &decl.name,
                         Some(k),
                     );
@@ -5508,7 +5529,7 @@ pub fn parse_full_model_with(
         // divisor as `state / obs_scale` (#2103 review #1). An `obs_scale` is not a
         // `y` key, so without this a block in it reached no readout at all.
         let mut readouts: Vec<(String, Expression)> = readout_with_states
-            [..readout_with_states.len() - binary_readouts.len()]
+            [..readout_with_states.len() - endpoint_labels.len()]
             .iter()
             .map(|e| (Y_READOUT.to_string(), e.clone()))
             .collect();
@@ -25131,9 +25152,10 @@ pub(crate) struct ScaleShare {
     /// The variable that carried the random effect into that expression, when
     /// the expression does not read the η itself.
     pub(crate) eta_via: Option<String>,
-    /// With `param` `None`: the expression is a `[binary_model]` predictor, not the `y`
-    /// readout (#2562).
-    pub(crate) binary: bool,
+    /// With `param` `None`: the endpoint expression it is, by its readout label
+    /// ([`BINARY_READOUT`], [`COUNT_MEAN_READOUT`], [`COUNT_SIZE_READOUT`]), or `None` for the
+    /// `y` readout (#2562, #2877).
+    pub(crate) endpoint: Option<&'static str>,
 }
 
 /// How one random effect relates to a level block (#1649, #1650), as far as
@@ -25751,7 +25773,7 @@ fn map_condition_operands<'a>(
 fn block_shares_scale_with_eta(
     stmts: &[Statement],
     readout: &[Expression],
-    n_binary: usize,
+    endpoint_labels: &[&'static str],
     block: &str,
     only_eta: Option<usize>,
 ) -> Option<ScaleShare> {
@@ -25778,7 +25800,7 @@ fn block_shares_scale_with_eta(
 
     let mut assigns = Vec::new();
     assignments(stmts, &mut assigns);
-    let n_y = readout.len() - n_binary;
+    let n_y = readout.len() - endpoint_labels.len();
     // `None` is the readout: it is read, never assigned to.
     assigns.extend(readout.iter().map(|e| (None, e)));
     let first_readout = assigns.len() - readout.len();
@@ -25809,8 +25831,12 @@ fn block_shares_scale_with_eta(
                     } else {
                         eta_via.map(str::to_string)
                     },
-                    // The trailing readouts are the `[binary_model]` predictors.
-                    binary: lhs.is_none() && at >= first_readout + n_y,
+                    // The trailing readouts are the endpoint expressions, one label each.
+                    endpoint: lhs
+                        .is_none()
+                        .then(|| at.checked_sub(first_readout + n_y))
+                        .flatten()
+                        .map(|i| endpoint_labels[i]),
                 });
             }
             if let Some(lhs) = *lhs {
@@ -26078,7 +26104,7 @@ fn coupling_assigns<'a>(
 fn level_block_eta_coupling(
     stmts: &[Statement],
     readout: &[Expression],
-    n_binary: usize,
+    endpoint_labels: &[&'static str],
     block: &str,
     k: usize,
     eta_name: &str,
@@ -26205,7 +26231,7 @@ fn level_block_eta_coupling(
                 site: ScaleShare {
                     param: Some(v.to_string()),
                     eta_via: via,
-                    binary: false,
+                    endpoint: None,
                 },
                 covariates,
             });
@@ -26216,11 +26242,13 @@ fn level_block_eta_coupling(
         let (reads_any, reads_both) = reads(tb_states, te_states, ctx.out());
         let touched: Vec<&Expression> = readout.iter().filter(|e| reads_any(e)).collect();
         if let [y] = touched.as_slice() {
-            // The trailing readouts are the `[binary_model]` predictors (#2562).
-            let binary = readout
+            // The trailing readouts are the endpoint expressions (#2562, #2877).
+            let n_y = readout.len() - endpoint_labels.len();
+            let endpoint = readout
                 .iter()
                 .position(|e| std::ptr::eq(e, *y))
-                .is_some_and(|i| i >= readout.len() - n_binary);
+                .and_then(|i| i.checked_sub(n_y))
+                .map(|i| endpoint_labels[i]);
             let mut covariates = Vec::new();
             let ops = ctx
                 .funnel_operands(y, &reads_any, &reads_both)
@@ -26242,7 +26270,7 @@ fn level_block_eta_coupling(
                     site: ScaleShare {
                         param: None,
                         eta_via: via,
-                        binary,
+                        endpoint,
                     },
                     covariates,
                 });
@@ -26669,6 +26697,49 @@ pub(crate) const Y_READOUT: &str = "the `y` readout";
 /// logit link is implicit: the predictor is the link's argument, walked as an affine read,
 /// and a block it reads is `linked`.
 pub(crate) const BINARY_READOUT: &str = "the `[binary_model]` predictor";
+
+/// The label the level-block walks give a `[count_model]` mean (`lambda` / `log_lambda`).
+pub(crate) const COUNT_MEAN_READOUT: &str = "the `[count_model]` mean";
+
+/// The label the level-block walks give a `[count_model]` size `r`.
+pub(crate) const COUNT_SIZE_READOUT: &str = "the `[count_model]` size `r`";
+
+/// Every `[count_model]` block's mean and size expressions, labelled, the unnamed block
+/// first and the named ones by label, for the walks that judge how a level block meets a
+/// random effect (#2877) — a count mean is a prediction exactly as a binary predictor is.
+/// A line that does not parse is left out here, since `parse_count_model_block` reports it.
+fn count_readout_exprs(
+    blocks: &HashMap<String, Vec<String>>,
+    named: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<String>>>,
+    theta_names: &[String],
+    eta_names: &[String],
+    indiv_stmts: &[Statement],
+) -> Vec<(&'static str, Expression)> {
+    let indiv_param_names = assigned_vars_in_order(indiv_stmts);
+    let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
+    let mut labelled: Vec<(&String, &Vec<String>)> = named
+        .get("count_model")
+        .map(|m| m.iter().collect())
+        .unwrap_or_default();
+    labelled.cold_sort_by(&|a, b| a.0.cmp(b.0));
+    blocks
+        .get("count_model")
+        .into_iter()
+        .chain(labelled.into_iter().map(|(_, lines)| lines))
+        .flat_map(|lines| lines.iter())
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            let label = match key.trim() {
+                "lambda" | "log_lambda" => COUNT_MEAN_READOUT,
+                "r" => COUNT_SIZE_READOUT,
+                _ => return None,
+            };
+            parse_scalar_expression(value.trim(), ctx)
+                .ok()
+                .map(|e| (label, e))
+        })
+        .collect()
+}
 
 /// Every `[binary_model]` block's `logit` expression, the unnamed block first and the
 /// named ones by label, for the walks

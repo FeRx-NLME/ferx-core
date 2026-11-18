@@ -23,16 +23,14 @@
 use crate::parser::model_parser::with_model_time;
 use crate::sens::num::{BranchCmp, PkNum};
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
-use crate::stats::special::ln_gamma;
+#[cfg(test)]
+use crate::stats::special::NEGBIN_SUM_MAX_K;
+use crate::stats::special::{ln_gamma, negbin_log_pmf_g};
 use crate::types::{
     CompiledModel, CountFamily, CountMeanScale, CountParamFn, DiscreteObsDiagnostic,
     EndpointLikelihood, EndpointPredictionResult, ObsRecord, Prediction, Subject,
 };
 use std::collections::HashMap;
-
-/// Largest count whose negative-binomial `ln Γ(k + r) − ln Γ(r)` is summed term by term in
-/// [`count_record_nll_g`] (`k` logs per record); a larger count takes the `ln Γ` difference.
-const NEGBIN_SUM_MAX_K: u32 = 256;
 
 /// One count record's negative log-likelihood, over any [`PkNum`] — `None` when the law is
 /// undefined at this point: a mean (or `log λ`) that is not finite, a `lambda =` mean that is
@@ -76,46 +74,8 @@ pub(crate) fn count_record_nll_g<T: PkNum>(
             if !(size.br_abs_lt(inf) && size.br_cmp_c(BranchCmp::Gt, 0.0)) {
                 return None;
             }
-            let r = size;
-            // `ln Γ(k + r) − ln Γ(r)`: for the counts a record carries, the exact finite sum
-            // `Σ_{j<k} ln(r + j)`, which does not cancel. The `ln Γ` difference loses
-            // `|ln Γ(r)|·1e-13` to cancellation — 2e-3 at `r = 1e9`, where the law is a
-            // Poisson to 1e-8 — so it is kept only past `NEGBIN_SUM_MAX_K`.
-            let lg = if k <= NEGBIN_SUM_MAX_K {
-                (0..k).fold(T::from_f64(0.0), |acc, j| {
-                    acc + (r + T::from_f64(f64::from(j))).ln()
-                })
-            } else {
-                (r + k_t).ln_gamma() - r.ln_gamma()
-            };
-            // `r·log(r/(r+λ)) = −r·log1p(λ/r)`, which keeps its digits as `r` grows.
-            let log_p = lg - ln_k_fact - r_log1p_ratio(mu, r) + k_t * (log_mu - (r + mu).ln());
-            Some(T::from_f64(0.0) - log_p)
+            Some(T::from_f64(0.0) - negbin_log_pmf_g(mu, log_mu, size, k))
         }
-    }
-}
-
-/// Below this `x = λ/r` the NB's `r·log1p(x)` is taken from its series rather than `ln(1 + x)`.
-const LOG1P_SERIES_MAX: f64 = 1e-3;
-
-/// `r·log1p(λ/r)` for a negative binomial, generic over the number type. `PkNum` has no
-/// `log1p`, and `r·ln(1 + λ/r)` loses `λ/r` entirely once it falls below machine epsilon
-/// (`λ = 1, r = 1e17` scored 0 instead of 1). For `x = λ/r < 1e-3` it is
-/// `λ·(1 − x/2 + x²/3 − x³/4 + x⁴/5 − x⁵/6)`, whose dropped `x⁶/7` term is below 1.5e-19
-/// relative; each derivative the dual carries is that of a polynomial, so it is exact too.
-/// Above it, `λ·ln(u)/(u − 1)` with `u = 1 + x`, which is `log1p` to a few ulps.
-fn r_log1p_ratio<T: PkNum>(mu: T, r: T) -> T {
-    let x = mu / r;
-    if x.br_cmp_c(BranchCmp::Lt, LOG1P_SERIES_MAX) {
-        let c = |v: f64| T::from_f64(v);
-        let poly = c(1.0)
-            - x * (c(0.5) - x * (c(1.0 / 3.0) - x * (c(0.25) - x * (c(0.2) - x * c(1.0 / 6.0)))));
-        mu * poly
-    } else {
-        // `r·ln(u)` with `u = 1 + x` carries the rounding of `u`, `eps/x` relative; the
-        // ratio `ln(u)/(u − 1)` cancels it (Goldberg), and `r·x = λ`. `u − 1 ≥ 1e-3` here.
-        let u = T::from_f64(1.0) + x;
-        mu * u.ln() / (u - T::from_f64(1.0))
     }
 }
 

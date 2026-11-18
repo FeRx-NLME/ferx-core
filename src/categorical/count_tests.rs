@@ -125,6 +125,100 @@ fn negbin_keeps_its_digits_at_huge_size() {
     eprintln!("NB huge-size worst relative value gap {worst:.2e}");
 }
 
+/// Counts past `NEGBIN_SUM_MAX_K` at sizes where the `ln Γ(r + k) − ln Γ(r)` difference
+/// cancels catastrophically. The kernel and `count_log_pmf` are checked against two outside
+/// references: R's `-dnbinom(k, size = r, mu = λ, log = TRUE)` (the `pmx` container; its
+/// saddle-point form shares no code with ferx) and the definition summed directly in the
+/// test with `f64::ln_1p`. The rows visit the Stirling branch at a huge and a moderate size
+/// (`r = 1e17, 1e9, 25`) and at its edge (`r = 20`), and the `ln Γ` branch below it; the
+/// first is the review's case, which the `ln Γ` difference scored 335.69 for 3.69. The `∂/∂r`, `∂²/∂r²` the dual
+/// carries on the Stirling branch match central differences at sizes FD can resolve (at
+/// `r = 1e9` the derivative is ~`1/r²`, below FD noise). Measured worst relative gaps:
+/// vs R 5.9e-12 (R's own: at `r = 1e9, k = 300` it is 4e-11 off a direct `fsum`, where the
+/// kernel is within 3e-13), vs the direct sum 1.5e-13 (the truncated Stirling series at
+/// `r = 20`), `∂r` 2.3e-9, `∂²r` 1.1e-8.
+#[test]
+fn negbin_high_counts_keep_their_digits_at_any_size() {
+    let rows: [(f64, f64, u32, f64); 7] = [
+        (257.0, 1e17, 257, 3.6938008297041853),
+        (257.0, 1e9, 300, 7.1830237020439816),
+        (5.0, 1e17, 600, 2281.6125879189144),
+        (400.0, 25.0, 300, 5.9378328801361855),
+        (300.0, 20.0, 300, 5.1613078124376628),
+        (400.0, 25.0, 1000, 20.155978554065801),
+        (40.0, 3.3, 700, 49.900385769055134),
+    ];
+    // The definition summed directly, `Σ_{j<k} ln_1p(j/r)` with `f64::ln_1p` — no branch
+    // of the kernel's, and exact to ~`k·eps` plus `ln Γ(k + 1)`'s own rounding.
+    let direct = |lam: f64, r: f64, k: u32| {
+        let s: f64 = (0..k).map(|j| (f64::from(j) / r).ln_1p()).sum();
+        let kf = f64::from(k);
+        -(s - ln_gamma(kf + 1.0) + kf * lam.ln() - r * (lam / r).ln_1p() * (1.0 + kf / r))
+    };
+    let (mut worst_r, mut worst_d) = (0.0f64, 0.0f64);
+    for (lam, r, k, want) in rows {
+        assert!(k > NEGBIN_SUM_MAX_K);
+        let got = count_record_nll_g(NB, LIN, lam, r, k).unwrap();
+        let log = count_record_nll_g(NB, LOG, lam.ln(), r, k).unwrap();
+        let pmf = -count_log_pmf(lam, Some(r), f64::from(k));
+        let dir = direct(lam, r, k);
+        assert!(got.is_finite() && log.is_finite() && pmf.is_finite() && dir.is_finite());
+        let gap_r = (got - want).abs() / want.abs().max(1.0);
+        let gap_d = (got - dir).abs() / dir.abs().max(1.0);
+        assert!(gap_r.is_finite() && gap_d.is_finite());
+        worst_r = worst_r.max(gap_r);
+        worst_d = worst_d.max(gap_d);
+        assert!(
+            gap_r < 1e-10,
+            "λ={lam} r={r} k={k}: kernel {got} vs R {want}"
+        );
+        assert!(
+            gap_d < 1e-12,
+            "λ={lam} r={r} k={k}: kernel {got} vs direct sum {dir}"
+        );
+        assert!(
+            (log - got).abs() / got < 1e-13,
+            "λ={lam} r={r} k={k}: log scale {log}"
+        );
+        assert_eq!(
+            got, pmf,
+            "λ={lam} r={r} k={k}: kernel and count_log_pmf differ"
+        );
+    }
+    eprintln!("NB high-count worst relative gap: vs R {worst_r:.2e}, vs direct sum {worst_d:.2e}");
+    let mut worst_g = 0.0f64;
+    let mut worst_h = 0.0f64;
+    for (lam, r, k) in [
+        (400.0, 25.0, 1000u32),
+        (30.0, 60.0, 400),
+        (300.0, 500.0, 700),
+    ] {
+        let d =
+            count_record_nll_g(NB, LIN, Dual2::<1>::constant(lam), Dual2::var(r, 0), k).unwrap();
+        let f = |rr: f64| count_record_nll_g(NB, LIN, lam, rr, k).unwrap();
+        let g = |rr: f64| {
+            count_record_nll_g(NB, LIN, Dual2::<1>::constant(lam), Dual2::var(rr, 0), k)
+                .unwrap()
+                .grad[0]
+        };
+        let h1 = 1e-5 * r;
+        let fd = (f(r + h1) - f(r - h1)) / (2.0 * h1);
+        // The Hessian against central differences of the dual gradient (itself pinned to
+        // the value above): a second difference of the value is noise-bound here.
+        let fd2 = (g(r + h1) - g(r - h1)) / (2.0 * h1);
+        assert!(d.grad[0].is_finite() && d.hess[0][0].is_finite());
+        assert!(fd.is_finite() && fd2.is_finite());
+        let eg = (d.grad[0] - fd).abs() / fd.abs().max(1e-12);
+        let eh = (d.hess[0][0] - fd2).abs() / fd2.abs().max(1e-12);
+        assert!(eg.is_finite() && eh.is_finite());
+        worst_g = worst_g.max(eg);
+        worst_h = worst_h.max(eh);
+    }
+    eprintln!("NB high-count ∂r {worst_g:.2e}, ∂²r {worst_h:.2e}");
+    assert!(worst_g < 1e-7, "∂r gap {worst_g:.2e}");
+    assert!(worst_h < 1e-6, "∂²r gap {worst_h:.2e}");
+}
+
 /// Both sides of `NEGBIN_SUM_MAX_K`: the term-by-term sum and the `ln Γ` difference agree
 /// with each other and with `count_log_pmf` at a count either side of the switch (an
 /// off-by-one in either branch, or a sum over the wrong range, moves the value by `ln(r+k)`).
