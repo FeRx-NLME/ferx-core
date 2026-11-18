@@ -96,13 +96,7 @@ fn prog_covers_required_pk_slots(
 fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
     use crate::sens::num::BranchCmp as B;
     let t_eff = dose.time + lag_val;
-    // A recording decides on its own lag, through the branch API (#2786): the same sum.
-    let arrived = if T::RECORDS_BRANCHES {
-        lag_d.br_shift_cmp(dose.time, B::Le, t_obs)
-    } else {
-        t_eff <= t_obs
-    };
-    if arrived {
+    if arrived(dose, t_obs, lag_val, lag_d) {
         // `elapsed = (t_obs − dose.time) − lagtime`.
         Some(T::from_f64(t_obs - dose.time) - lag_d)
     } else if dose.ss && dose.ii > 0.0 && t_obs >= dose.time {
@@ -146,13 +140,22 @@ fn ss_lag_past_ii<T: PkNum>(
     if !(dose.ss && dose.ii > 0.0 && t_obs >= dose.time && lag_d.br_cmp_c(B::Gt, dose.ii)) {
         return None;
     }
-    let arrived = if T::RECORDS_BRANCHES {
-        lag_d.br_shift_cmp(dose.time, B::Le, t_obs)
+    let since = T::from_f64(t_obs - dose.time);
+    Some((
+        since,
+        arrived(dose, t_obs, lag_val, lag_d).then(|| since - lag_d),
+    ))
+}
+
+/// Whether `dose` has arrived by `t_obs` (`dose.time + lag ≤ t_obs`); a recording decides on its
+/// own lag, through the branch API (#2786): the same sum.
+#[inline]
+fn arrived<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> bool {
+    if T::RECORDS_BRANCHES {
+        lag_d.br_shift_cmp(dose.time, crate::sens::num::BranchCmp::Le, t_obs)
     } else {
         dose.time + lag_val <= t_obs
-    };
-    let since = T::from_f64(t_obs - dose.time);
-    Some((since, arrived.then(|| since - lag_d)))
+    }
 }
 
 /// The seven PK-class booleans that select which closed-form concentration kernel a dose
@@ -279,7 +282,8 @@ fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
 /// (a dose **recorded** before `reset_floor` is excluded, even one whose lagged arrival
 /// comes after the reset: NONMEM cancels it, and so does the event-driven walk, #1587 —
 /// before which both kept it, PR #381 #2). `elapsed`
-/// carries the lagtime shift and the SS pre-arrival tail wrap (`lagged_elapsed`).
+/// carries the lagtime shift and the SS pre-arrival tail ([`lagged_elapsed`], or
+/// [`ss_lag_past_ii`] with its arrival as a term of its own).
 /// Generic over the seeded number type, so every recording the adjoint makes through
 /// `analytic_static_predictions` shares the one dispatch ladder.
 #[inline]
@@ -306,7 +310,8 @@ fn superpose_doses<T: PkNum>(
                 None => continue,
             },
         };
-        // Each dose's term its own chunk: its code depends on the dose's kind and the model, not
+        // Each dose's term its own chunk (an arrival past `lag = II` one more): its code depends on
+        // the dose's kind and the model, not
         // on how many doses came before, so subjects with different designs share it (their
         // times and amounts are the chunk's literals) and it is compiled once per model (#2980).
         T::chunk_mark();
@@ -340,6 +345,7 @@ fn superpose_doses<T: PkNum>(
         };
         fd = fd + conc(dose, elapsed);
         if let Some(a) = arrival {
+            T::chunk_mark();
             let mut single = dose.clone();
             single.ss = false;
             fd = fd + conc(&single, a);
