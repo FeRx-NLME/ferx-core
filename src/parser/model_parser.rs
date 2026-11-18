@@ -10296,13 +10296,14 @@ fn parse_count_model_block(
         kappa_names,
         "count_model",
     )?;
-    let param_program = build_endpoint_expr_program(
+    // Total (#3004): every parsed count predictor compiles, so the endpoint is served exactly.
+    let param_program = Some(build_endpoint_expr_program(
         &exprs,
         &needed_indiv_stmts,
         &count_covariates,
         theta_names.len(),
         eta_names.len(),
-    );
+    ));
 
     let indiv = needed_indiv_stmts;
     let param_fn: crate::types::CountParamFn = Box::new(
