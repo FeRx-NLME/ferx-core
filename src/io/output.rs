@@ -3497,8 +3497,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if !result.neural_networks.is_empty() {
         writeln!(f, "\nneural_networks:").map_err(|e| e.to_string())?;
         for nn in &result.neural_networks {
-            writeln!(f, "  {}:", estimates::yaml_name(&nn.name, false))
-                .map_err(|e| e.to_string())?;
+            let key = estimates::yaml_name(&nn.name, false);
+            writeln!(f, "  {key}:").map_err(|e| e.to_string())?;
             writeln!(
                 f,
                 "    shape: [{}]",
@@ -3513,18 +3513,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    output_activation: {}", nn.output_activation)
                 .map_err(|e| e.to_string())?;
-            writeln!(
-                f,
-                "    inputs: {}",
-                estimates::yaml_flow_names(&nn.input_names)
-            )
-            .map_err(|e| e.to_string())?;
-            writeln!(
-                f,
-                "    outputs: {}",
-                estimates::yaml_flow_names(&nn.output_names)
-            )
-            .map_err(|e| e.to_string())?;
+            let inputs = estimates::yaml_flow_names(&nn.input_names);
+            writeln!(f, "    inputs: {inputs}").map_err(|e| e.to_string())?;
+            let outputs = estimates::yaml_flow_names(&nn.output_names);
+            writeln!(f, "    outputs: {outputs}").map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
             // Emitted only when the model actually normalises, so a plain network's
             // block is byte-identical to before. The reported weights are meaningless
@@ -3738,12 +3730,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         // posterior variance (see docs/estimation/vi.qmd). It is for individual-level
         // reporting and shrinkage, not a route to population standard errors.
         if !v.eta_means.is_empty() {
-            writeln!(
-                f,
-                "  eta_names: {}",
-                estimates::yaml_flow_names(&result.eta_names)
-            )
-            .map_err(|e| e.to_string())?;
+            let eta_names = estimates::yaml_flow_names(&result.eta_names);
+            writeln!(f, "  eta_names: {eta_names}").map_err(|e| e.to_string())?;
             writeln!(f, "  eta_posterior:").map_err(|e| e.to_string())?;
             for (i, mean) in v.eta_means.iter().enumerate() {
                 let id = result
@@ -3804,8 +3792,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  ci_theta:").map_err(|e| e.to_string())?;
             for (i, name) in result.theta_names.iter().enumerate() {
                 if i < ci.len() {
-                    writeln!(f, "    {}:", estimates::yaml_name(name, false))
-                        .map_err(|e| e.to_string())?;
+                    let key = estimates::yaml_name(name, false);
+                    writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                     writeln!(f, "      lower: {:.6}", ci[i].0).map_err(|e| e.to_string())?;
                     writeln!(f, "      upper: {:.6}", ci[i].1).map_err(|e| e.to_string())?;
                 }
@@ -3819,8 +3807,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("omega_{}_{}", i + 1, i + 1));
-                writeln!(f, "    {}:", estimates::yaml_name(&key, false))
-                    .map_err(|e| e.to_string())?;
+                let key = estimates::yaml_name(&key, false);
+                writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3833,8 +3821,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("sigma_{}", i + 1));
-                writeln!(f, "    {}:", estimates::yaml_name(&key, false))
-                    .map_err(|e| e.to_string())?;
+                let key = estimates::yaml_name(&key, false);
+                writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3847,8 +3835,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(k)
                     .cloned()
                     .unwrap_or_else(|| format!("kappa_{}", k + 1));
-                writeln!(f, "    {}:", estimates::yaml_name(&key, false))
-                    .map_err(|e| e.to_string())?;
+                let key = estimates::yaml_name(&key, false);
+                writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
             }
@@ -3904,18 +3892,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  estimator: {} # {}", m.label(), m.formula())
                 .map_err(|e| e.to_string())?;
         }
-        writeln!(f, "  parameters: {}", estimates::yaml_flow_names(&names))
-            .map_err(|e| e.to_string())?;
+        let params = estimates::yaml_flow_names(&names);
+        writeln!(f, "  parameters: {params}").map_err(|e| e.to_string())?;
         writeln!(f, "  rows:").map_err(|e| e.to_string())?;
         for i in 0..n {
             let row: Vec<String> = (0..n).map(|j| fmt_cov_entry(cov[(i, j)])).collect();
-            writeln!(
-                f,
-                "    {}: [{}]",
-                estimates::yaml_name(&names[i], false),
-                row.join(", ")
-            )
-            .map_err(|e| e.to_string())?;
+            let key = estimates::yaml_name(&names[i], false);
+            writeln!(f, "    {key}: [{}]", row.join(", ")).map_err(|e| e.to_string())?;
         }
     }
 
@@ -7623,12 +7606,13 @@ mod tests {
         let path = dir.path().join("fit.yaml");
         write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
         let yaml = std::fs::read_to_string(&path).expect("yaml read");
-        let doc: serde_json::Value = serde_saphyr::from_str(&yaml)
-            .unwrap_or_else(|e| panic!("fit.yaml must parse: {e}\n{yaml}"));
+        let parsed = serde_saphyr::from_str::<serde_json::Value>(&yaml);
+        assert!(parsed.is_ok(), "fit.yaml must parse: {parsed:?}\n{yaml}");
+        let doc = parsed.unwrap();
 
-        let params = doc["covariance_matrix"]["parameters"]
-            .as_array()
-            .unwrap_or_else(|| panic!("parameters is a sequence:\n{yaml}"));
+        let params = doc["covariance_matrix"]["parameters"].as_array();
+        assert!(params.is_some(), "parameters is a sequence:\n{yaml}");
+        let params = params.unwrap();
         assert_eq!(params.len(), 10, "{params:?}");
         assert_eq!(params[0], names[0], "{params:?}");
         assert_eq!(params[1], names[1], "{params:?}");
