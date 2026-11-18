@@ -90,12 +90,8 @@ fn prog_covers_required_pk_slots(
 /// the dose does not contribute at `t_obs`. `lag_d` is the seeded lagtime dual;
 /// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
 ///
-/// Known divergence, confined to `ALAG > II`: this *wraps* the pre-arrival phase where
-/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
-/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and always takes the collapsed
-/// `C_ss(t − t_eff)` where production splits into tail + arrival once
-/// `!crate::dosing::ss_arrival_is_trough`; predictions measured up to ~19 % from production's
-/// there. It needs its own fix and its own anchor.
+/// Past `ALAG > II` this *wraps* the pre-arrival phase, as the depot amounts' production twin
+/// (`pk::analytical_state_at_times`) does; the concentrations take [`ss_lag_past_ii`] there.
 #[inline]
 fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
     use crate::sens::num::BranchCmp as B;
@@ -132,6 +128,31 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
     } else {
         None
     }
+}
+
+/// An `SS=1` dose whose lag is past `II`, as `crate::pk::predict_concentration` reads it
+/// (#1121): the train from its pulse on the record (`crate::dosing::ss_seed_phase` is `0`),
+/// plus the one real dose arriving at `t_eff` once it has — `(ss_elapsed, arrival_elapsed)`.
+/// `None` for every other dose, which [`lagged_elapsed`] serves (#1353: its wrap and collapsed
+/// arrival put the jets ~19 % from these predictions, the outer gradient 100 % off).
+#[inline]
+fn ss_lag_past_ii<T: PkNum>(
+    dose: &DoseEvent,
+    t_obs: f64,
+    lag_val: f64,
+    lag_d: T,
+) -> Option<(T, Option<T>)> {
+    use crate::sens::num::BranchCmp as B;
+    if !(dose.ss && dose.ii > 0.0 && t_obs >= dose.time && lag_d.br_cmp_c(B::Gt, dose.ii)) {
+        return None;
+    }
+    let arrived = if T::RECORDS_BRANCHES {
+        lag_d.br_shift_cmp(dose.time, B::Le, t_obs)
+    } else {
+        dose.time + lag_val <= t_obs
+    };
+    let since = T::from_f64(t_obs - dose.time);
+    Some((since, arrived.then(|| since - lag_d)))
 }
 
 /// The seven PK-class booleans that select which closed-form concentration kernel a dose
@@ -278,8 +299,12 @@ fn superpose_doses<T: PkNum>(
         {
             continue;
         }
-        let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
-            continue;
+        let (elapsed, arrival) = match ss_lag_past_ii(dose, t_obs, d.lag_val, d.lag_d) {
+            Some(terms) => terms,
+            None => match lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) {
+                Some(e) => (e, None),
+                None => continue,
+            },
         };
         // Each dose's term its own chunk: its code depends on the dose's kind and the model, not
         // on how many doses came before, so subjects with different designs share it (their
@@ -290,28 +315,35 @@ fn superpose_doses<T: PkNum>(
         // this recording and the prediction it differentiates serve the same constant
         // (#2104). First in the ladder, so a disposition `with_disposition` declined to
         // build is never asked for.
-        let c = if let Some(v) = d.dose_override(flags) {
-            v
-        } else if flags.transit {
-            one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
-        } else if flags.two_cpt_transit {
-            two_cpt_transit_conc_g(
-                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.n_d, d.mtt_d, d.f_d,
-            )
-        } else if flags.ig {
-            one_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.mat_d, d.cv2_d, d.f_d)
-        } else if flags.two_cpt_ig {
-            two_cpt_ig_conc_g(
-                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.mat_d, d.cv2_d, d.f_d,
-            )
-        } else if let Some(disp) = d.three.as_ref().filter(|_| flags.three_cpt) {
-            three_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
-        } else if let Some(disp) = d.two.as_ref().filter(|_| flags.two_cpt) {
-            two_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
-        } else {
-            one_cpt_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.ka_d, d.f_d, flags.oral)
+        let conc = |dose: &DoseEvent, elapsed: T| {
+            if let Some(v) = d.dose_override(flags) {
+                v
+            } else if flags.transit {
+                one_cpt_transit_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.n_d, d.mtt_d, d.f_d)
+            } else if flags.two_cpt_transit {
+                two_cpt_transit_conc_g(
+                    dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.n_d, d.mtt_d, d.f_d,
+                )
+            } else if flags.ig {
+                one_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.mat_d, d.cv2_d, d.f_d)
+            } else if flags.two_cpt_ig {
+                two_cpt_ig_conc_g(
+                    dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.mat_d, d.cv2_d, d.f_d,
+                )
+            } else if let Some(disp) = d.three.as_ref().filter(|_| flags.three_cpt) {
+                three_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
+            } else if let Some(disp) = d.two.as_ref().filter(|_| flags.two_cpt) {
+                two_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
+            } else {
+                one_cpt_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.ka_d, d.f_d, flags.oral)
+            }
         };
-        fd = fd + c;
+        fd = fd + conc(dose, elapsed);
+        if let Some(a) = arrival {
+            let mut single = dose.clone();
+            single.ss = false;
+            fd = fd + conc(&single, a);
+        }
     }
     fd
 }
