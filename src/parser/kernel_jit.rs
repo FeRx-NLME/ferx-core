@@ -3776,6 +3776,7 @@ const TIER3_MAX_INSTS: usize = 4096;
 
 impl Tiered {
     fn new(f: Func, layout: Layout, n_in: usize, rev: bool, prefix: usize) -> Arc<Self> {
+        let f = f.into_kernel();
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
             spill: OnceLock::new(),
@@ -3797,6 +3798,7 @@ impl Tiered {
 
     /// [`Self::new`] for a rows reverse kernel splitting its slot table at `entries`.
     fn new_rows(f: Func, layout: Layout, n_in: usize, prefix: usize, entries: usize) -> Arc<Self> {
+        let f = f.into_kernel();
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
             spill: OnceLock::new(),
@@ -4594,7 +4596,11 @@ fn build_chunk(
         }
         None => {
             let p = Arc::new(ChunkProgram {
-                code,
+                code: {
+                    let mut code = code;
+                    code.shrink_to_fit();
+                    code
+                },
                 n_regs: next as usize,
                 spec,
                 n_in: ins.len(),
@@ -7619,6 +7625,19 @@ mod seg_tests {
         (0..(M + 1) * l)
             .map(|k| 0.5 + (k as f64 * 0.37).sin())
             .collect()
+    }
+
+    /// A rows reverse kernel keeps what runs it, as every kernel does (#3010): no `live`, its
+    /// instructions at their length. (A plan's kernels: `a_plans_kernels_keep_only_what_runs_them`.)
+    /// Mutation: drop `into_kernel` from `Tiered::new_rows` → this fails.
+    #[test]
+    fn a_rows_kernel_keeps_only_what_runs_it() {
+        let mut f = sum_func_n(8, layout().lanes());
+        f.insts.reserve(64);
+        assert!(!f.live.is_empty() && f.insts.capacity() > f.insts.len());
+        let t = Tiered::new_rows(f, layout(), 8, 0, 8);
+        assert!(t.f.live.is_empty());
+        assert_eq!(t.f.insts.capacity(), t.f.insts.len());
     }
 
     #[test]
