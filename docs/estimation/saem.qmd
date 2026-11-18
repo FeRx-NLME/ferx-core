@@ -490,10 +490,13 @@ When `mu_referencing = false`, the full NLopt M-step runs for all thetas as befo
 
 The numerical θ/σ M-step minimises a sum of per-observation Gaussian negative
 log-likelihoods at the iteration's frozen η (SAEM) or at importance-weighted samples
-(IMP, IMPMAP). BOBYQA, the default, reads only objective *values*: it spends `n + 1`
-of them on its first interpolation model and several more per step, 8 to 15 per M-step
-on the benchmarks below. The same fit can instead read the exact derivatives, which the
-adjoint produces from one recording of the predictions:
+(IMP, IMPMAP). `mstep_optimizer = auto`, the default, runs `newton` wherever its scope
+(below) holds and `bobyqa` elsewhere. It is a rule, not a request the model can fail, so it
+is silent; the fit file records the result (`mstep_optimizer: newton` under `model`)
+and `FitResult::mstep_optimizer_used` carries it. BOBYQA reads only objective *values*: it
+spends `2n + 1` of them on its first interpolation model and several more per step. The
+same fit can instead read the exact derivatives, which the adjoint produces from one
+recording of the predictions:
 
 - `mstep_optimizer = newton` takes Fisher-scoring (Gauss-Newton) steps. One pass returns
   the objective, its exact score (the adjoint θ score and the analytic σ score) and the
@@ -505,16 +508,26 @@ adjoint produces from one recording of the predictions:
   relative tolerance — on an accepted plain Fisher step, and at any point on the decrease
   the *undamped* Fisher step predicts for it (a damping carried over from earlier
   rejections shortens a step, so a step at that damping understates what is left and never
-  decides convergence) — within the same `maxiter · (n + 1)` budget, in which every pass,
-  value or fused, counts as one evaluation. A warm-started M-step is typically one fused
+  decides convergence) — within the evaluation budget BOBYQA gets (below), in which every
+  pass, value or fused, counts as one evaluation. A warm-started M-step is typically one fused
   pass plus one or two value passes.
 - `mstep_optimizer = lbfgs` runs NLopt L-BFGS on the same score. It needs a gradient
   pass per iteration and has no curvature to start from (see the table); it is kept as
   the quasi-Newton alternative.
 
-Both solve the same problem as BOBYQA — same objective, packed space, bounds, budget and
-tolerance — so they move to the same optimum; they are not a different estimator. The
-option is opt-in and `bobyqa` is the default.
+All three solve the same problem — same objective, packed space, bounds and tolerance — so
+they move to the same optimum; they are not a different estimator. An explicit `newton` on
+a model outside its scope still warns and runs `bobyqa`; `auto` does not.
+
+BOBYQA runs to its tolerance (`1e-7` relative) wherever it runs: `bobyqa` itself, the
+out-of-scope models under `auto`, and Newton's continuation. Its evaluation budget is a
+runaway guard of 100 evaluations per interpolation point of its model (`2n + 1` points for
+`n` free coordinates), not the `mstep_maxiter · (n + 1)` of a gradient method, which BOBYQA's
+own first design (`2n + 1` evaluations) used up: with nine numerical θ nearly every M-step
+stopped on that budget, far from the maximiser. The 100 is not tuned: it is 3 times the
+largest need measured, and the stop-reason census below shows the guard binding on none of
+the benchmark M-steps. `lbfgs` (a gradient method, `n + 1` evaluations per gradient) and
+SAEM's mixture arm (which keeps its pre-#1415 configuration) keep `maxiter · (n + 1)`.
 
 `newton` serves exactly the models whose expected information has a closed form from the
 adjoint: the adjoint in scope, a plain Gaussian likelihood (no M3 censoring, TTE endpoint,
@@ -584,6 +597,54 @@ only numerical coordinate the solve is one-dimensional and every optimizer conve
 the same point, so identical anchor rows are the expected reading, not a sign that the
 option did nothing (`mstep_optimizer` reaches the M-step on each of the three estimators,
 the IOV score included; a unit test counts the solver that actually ran).
+
+##### Newton as the default {#saem-mstep-default}
+
+`mstep_optimizer = auto` (#3001) makes Newton the default M-step and BOBYQA run to its
+tolerance the rule everywhere else. This changes default results. Measured against the
+previous default (`bobyqa` on a `maxiter · (n + 1)` budget): seeds 1 and 2, `--threads 1`,
+instructions retired in user space, importance-sampled −2 log L (`K = 20000`) at the final
+estimates, so a negative difference is a better fit.
+
+| model | numerical coordinates | instructions, new / old | −2 log L, new − old |
+|---|---|---|---|
+| `pk2_big_nomu` (SAEM) | 11 | 0.69 | −133.5, −128.6 |
+| `warfarin_nomu` | 4 θ + σ | 0.75 | −25.0, −15.9 |
+| `mm` (ODE) | 2 | 0.66 | −28.9, −21.4 |
+| `anchor_a_nomu` | 9 | 0.51 | −2.4, −23.9 |
+| `shared_nomu` | 8 | 0.57 | −5.0, −6.2 |
+| `pk1_nomu` (5 seeds) | 5 | 0.68 | −1.5 to +2.9 |
+| `imp_non_mu_ref` (IMP) | 14 θ | 0.23 | −1.5, −2.6 |
+| IMPMAP, σ only (3 models) | 1 | 0.39 to 0.54 | 0.000 |
+| SAEM, σ only (10 models) | 0 to 1 | 1.00 to 1.05 (`sparse_combined` 1.09 with 2, `frac_ode` 1.14 with 3) | within ±1.3 |
+
+The gain on the multi-θ models is mostly BOBYQA's old budget, not Newton: BOBYQA spends
+`2n + 1` evaluations on its first design, so on nine numerical θ nearly every M-step stopped
+on the budget far from the maximiser. Run to its tolerance (explicit `bobyqa` now) it
+reaches the same −2 log L (−3501 against Newton's −3502 on a nine-θ model); Newton gets there in 0.5 to 0.7 times the instructions. Where
+the M-step is σ only, BOBYQA's solve is already served by the prediction memo and Newton's
+fused value-score-information pass is the extra work: 0 to 5 percent more instructions, up to
+14 percent on `frac_ode` (three coordinates).
+
+Newton's M-step is as exact as BOBYQA's at the same tolerance. On `pk1_nomu`, `pk2_big`,
+`warfarin_iov` and `wiov` (304 M-steps each) a converged reference solve from the same start
+puts Newton's objective within 3.4e-4 of it at the worst M-step (median 4e-9 to 9e-6), against
+0.14 for BOBYQA at its worst on `pk1_nomu`; in a one-coordinate σ solve BOBYQA is the tighter (median
+1e-14 to 3e-12 against 4e-9 to 7e-7) and both are far inside the E-step's Monte Carlo noise. The census of
+BOBYQA's stop reasons over the same fits finds `FtolReached` on every M-step of every
+model but the mixture arm, at most 33 evaluations per interpolation point, so the 100 of the
+runaway guard never binds.
+
+The standing seed-to-seed spread decides what a paired difference means. Over 15 seeds
+`warfarin_iov` gives −2 log L 310.75 (Newton), 310.72 (BOBYQA to tolerance) and 310.56
+(previous default), standard deviation 0.5; the worst |z| of an ω against NONMEM is 8.1,
+6.9 and 5.7 (the ω have a small NONMEM standard error, so the SAEM's own noise reads as
+several z). `pk2_big` gives −3492.6 (Newton, sd 16.4) and −3492.9 (BOBYQA, sd 7.5): the same
+mean and median, with Newton's bad tail heavier (worst seed −3443.9 against −3478.2).
+
+NONMEM anchors that run a numerical M-step, worst |z| before to after (median of two
+seeds): `warfarin_saem` SAEM 0.73 to 0.73 and IMPMAP 0.74 to 0.74, `warfarin_iov` IMPMAP 0.70
+to 0.70, `imp_non_mu_ref` IMP 2.15 to 0.30, `warfarin_nomu` SAEM 17.4 to 4.2.
 
 #### Thetas the closed-form update cannot reach {#saem-mstep-no-closed-form}
 

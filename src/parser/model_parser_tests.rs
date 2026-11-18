@@ -3980,14 +3980,23 @@ fn test_mstep_solver_and_draws_round_trip_and_validate() {
     assert_eq!(opts.saem_mstep_draws, 1);
 }
 
-/// `mstep_optimizer` round-trips, defaults to the derivative-free solve, rejects
+/// `mstep_optimizer` round-trips, defaults to `auto` (#3001), rejects
 /// what it cannot act on without clobbering the last good value, is accepted by the
 /// three estimators whose numerical M-step it drives and warns under any other.
 #[test]
 fn test_mstep_optimizer_round_trips_validates_and_is_scoped() {
     use crate::types::MstepOptimizer;
     let mut opts = FitOptions::default();
-    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Bobyqa);
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Auto);
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_optimizer", "newton"),
+        Ok(true)
+    );
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_optimizer", "AUTO"),
+        Ok(true)
+    );
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Auto);
     assert_eq!(
         apply_fit_option(&mut opts, "mstep_optimizer", "LBFGS"),
         Ok(true)
@@ -4005,7 +4014,7 @@ fn test_mstep_optimizer_round_trips_validates_and_is_scoped() {
     let err = apply_fit_option(&mut opts, "mstep_optimizer", "adam")
         .expect_err("an unknown optimizer must be rejected");
     assert!(
-        err.contains("bobyqa/lbfgs/newton") && err.contains("adam"),
+        err.contains("auto/bobyqa/lbfgs/newton") && err.contains("adam"),
         "got: {err}"
     );
     assert_eq!(opts.mstep_optimizer, MstepOptimizer::Lbfgs);

@@ -380,9 +380,18 @@ described [above](#impmap-stale-warm-start) existed:
 ## Cost
 
 Per iteration ≈ one MAP inner loop (parallel over subjects) plus
-`K × n_subjects` predicts for the IS step plus a short weighted BOBYQA M-step.
+`K × n_subjects` predicts for the IS step plus a short weighted M-step.
 Total cost is roughly `impmap_iterations ×` the cost of a single `imp`
 evaluation. Everything is parallelized over subjects via the shared Rayon pool.
+
+The weighted M-step's optimizer is `mstep_optimizer = auto` by default (#3001): Fisher
+scoring (`newton`) wherever the model is in its scope, BOBYQA run to its tolerance elsewhere
+(mixtures, M3 censoring, correlated residuals, models outside the adjoint's scope). Fisher
+scoring keeps one prediction per importance sample across the solve (`subjects × K × n_obs`
+numbers: 112 MB at 2000 subjects × 1000 samples × 7 observations); on the benchmarks it
+costs 0.23 to 0.54 times the instructions of the previous BOBYQA default, and the NONMEM
+anchors keep their worst |z|. See [the SAEM page](saem.qmd#saem-mstep-default) for the
+measurements, and `mstep_optimizer = bobyqa` to keep the derivative-free solve.
 
 ## Standard errors on a non-Gaussian model
 

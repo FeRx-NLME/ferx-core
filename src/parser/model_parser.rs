@@ -13301,12 +13301,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "mstep_optimizer" => {
             opts.mstep_optimizer = match value.to_lowercase().as_str() {
+                "auto" => crate::types::MstepOptimizer::Auto,
                 "bobyqa" => crate::types::MstepOptimizer::Bobyqa,
                 "lbfgs" | "l-bfgs" | "l_bfgs" => crate::types::MstepOptimizer::Lbfgs,
                 "newton" | "fisher" => crate::types::MstepOptimizer::Newton,
                 other => {
                     return Err(format!(
-                        "fit option `{key}`: unknown value `{other}` — expected bobyqa/lbfgs/newton"
+                        "fit option `{key}`: unknown value `{other}` — expected auto/bobyqa/lbfgs/newton"
                     ));
                 }
             };

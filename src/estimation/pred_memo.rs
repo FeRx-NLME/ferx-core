@@ -28,8 +28,9 @@
 //! for (a zero importance weight) takes no space — which for SAEM (one η draw per subject,
 //! `mstep_draws` at most) is the size of the data, and for IMP/IMPMAP (`imp_samples` per
 //! subject, 1000 by default) is several times what the estimator itself holds. Which solves
-//! pay that is the caller's decision: IMP/IMPMAP open a memo under the opt-in gradient
-//! solvers (`mstep_optimizer = newton | lbfgs`) only, never under the default.
+//! pay that is the caller's decision: IMP/IMPMAP open a memo under the gradient solvers
+//! (`mstep_optimizer = newton | lbfgs`; the default `auto` is `newton` wherever its scope
+//! holds) only, never under BOBYQA.
 
 use std::ops::{Deref, Range};
 use std::sync::{Mutex, MutexGuard};

@@ -2579,7 +2579,7 @@ fn imh_runs_an_sde_fit() {
 #[test]
 fn mstep_optimizer_reaches_the_saem_m_step() {
     use crate::estimation::saem::MSTEP_ROUTE;
-    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs, Newton};
+    use crate::types::MstepOptimizer::{Auto, Bobyqa, Lbfgs, Newton};
     // `TVV` has no ETA, so the closed-form steps do not own it: a numerical θ/σ M-step runs.
     let model = parse_model_string(
         &IV_MODEL
@@ -2589,7 +2589,7 @@ fn mstep_optimizer_reaches_the_saem_m_step() {
     .expect("parse");
     let pop = population_of(&well_conditioned_subject(), 6);
     let mut ofv = Vec::new();
-    for opt in [Bobyqa, Lbfgs, Newton] {
+    for opt in [Auto, Bobyqa, Lbfgs, Newton] {
         MSTEP_ROUTE.with(|c| c.set([0; 3]));
         let o = FitOptions {
             method: EstimationMethod::Saem,
@@ -2605,11 +2605,18 @@ fn mstep_optimizer_reaches_the_saem_m_step() {
         let want = match opt {
             Bobyqa => used[0] > 0 && used[1] == 0 && used[2] == 0,
             Lbfgs => used[0] == 0 && used[1] > 0 && used[2] == 0,
-            Newton => used[0] == 0 && used[1] == 0 && used[2] > 0,
+            // `auto` is `newton` on this in-scope model, and the fit records it.
+            Newton | Auto => used[0] == 0 && used[1] == 0 && used[2] > 0,
         };
         assert!(
             want,
             "{opt:?}: solves by [bobyqa, lbfgs, newton] = {used:?}"
+        );
+        let resolved = if opt == Auto { Newton } else { opt };
+        assert_eq!(
+            r.mstep_optimizer_used.as_deref(),
+            Some(resolved.as_str()),
+            "{opt:?}"
         );
         ofv.push(r.ofv);
     }

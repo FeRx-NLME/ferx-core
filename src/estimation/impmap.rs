@@ -60,7 +60,7 @@ use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs
 use crate::estimation::pred_memo::{memoized, EvalMemo, MemoSlot, PredMemo};
 use crate::estimation::saem::{
     classify_mixture_mu_ref_pairs, classify_mu_ref_pairs, floor_omega_diagonal, fold_nll_grad,
-    get_mixture_mu_ref_pairs, mixture_mu_ref_means, mstep_initial_step,
+    get_mixture_mu_ref_pairs, mixture_mu_ref_means, mstep_budget, mstep_initial_step,
     mu_ref_pairs_for_cov_groups, MixtureMuRefPairs, MuRefPairs, MSTEP_FTOL_REL,
 };
 use crate::pk::event_driven::EventSchedule;
@@ -3144,6 +3144,7 @@ fn run_mcem(
         saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: Some(mstep_optimizer.as_str().to_string()),
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -4165,6 +4166,7 @@ fn run_mcem_mixture(
         saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: Some(mstep_optimizer.as_str().to_string()),
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -5123,13 +5125,13 @@ fn theta_sigma_weighted_mstep(
     };
 
     // The solve's evaluations at one θ share one prediction pass per sample (`PredMemo`) —
-    // under the opt-in gradient solvers only. The samples are `K` per subject (`imp_samples`,
-    // 1000 by default, up to 10 000 under auto-sampling), so the predictions are
+    // under the gradient solvers (`newton`, which `auto` resolves to inside its scope, and
+    // `lbfgs`), not under BOBYQA. The samples are `K` per subject (`imp_samples`, 1000 by
+    // default, up to 10 000 under auto-sampling), so the predictions are
     // `subjects × K × n_obs` numbers against the `subjects × K × n_eta` the estimator itself
-    // holds, and a default fit must not grow by that. The σ-only solve of the derivative-free
-    // default would be served by them on every evaluation — measured at 2.1× fewer
-    // instructions for a whole σ-only IMP or IMPMAP fit, for 112 MB at 2000 subjects × 1000
-    // samples × 7 observations — and recomputes instead.
+    // holds: 112 MB at 2000 subjects × 1000 samples × 7 observations. A σ-only BOBYQA solve
+    // (an out-of-scope model) would be served by them on every evaluation — measured at 2.1×
+    // fewer instructions for a whole σ-only IMP or IMPMAP fit — and recomputes instead.
     let theta_free = (0..n_theta).any(|i| lower[i] < upper[i]);
     let pred_memo = if mstep_optimizer == MstepOptimizer::Bobyqa {
         None
@@ -5203,7 +5205,13 @@ fn theta_sigma_weighted_mstep(
         &lower,
         &upper,
         n_theta,
-        maxiter * (n as u32 + 1),
+        mstep_budget(
+            maxiter,
+            n,
+            (0..n).filter(|&i| lower[i] < upper[i]).count(),
+            mstep_optimizer,
+            false,
+        ),
         mstep_optimizer,
         Some(&fused),
         tally,
@@ -5363,7 +5371,13 @@ fn theta_sigma_weighted_mstep_mixture(
         &lower,
         &upper,
         n_theta,
-        maxiter * (n as u32 + 1),
+        mstep_budget(
+            maxiter,
+            n,
+            (0..n).filter(|&i| lower[i] < upper[i]).count(),
+            mstep_optimizer,
+            false,
+        ),
         mstep_optimizer,
         None,
         None,
@@ -6102,6 +6116,12 @@ mod tests {
         opts.imp_auto = false;
         opts.imp_seed = Some(918);
         opts.run_covariance_step = false;
+        // The pin logic is under test, so the M-step must be free to move what it is handed.
+        // Under `auto` (Newton) this start — the lowest-CRCL subject's `CL` is −6, so the
+        // objective is a finite 1.2e13 — is "converged" at once: the undamped Fisher step
+        // predicts a decrease of order 1 against the relative tolerance 1e-7·1.2e13 = 1.2e6.
+        // BOBYQA moves because its first design is evaluated (#3001).
+        opts.mstep_optimizer = crate::types::MstepOptimizer::Bobyqa;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
 
         let tvcl0 = model.default_params.theta[0];
@@ -6850,11 +6870,11 @@ mod tests {
     #[test]
     fn mstep_optimizer_reaches_the_imp_and_impmap_m_steps() {
         use crate::estimation::saem::MSTEP_ROUTE;
-        use crate::types::MstepOptimizer::{Bobyqa, Lbfgs, Newton};
+        use crate::types::MstepOptimizer::{Auto, Bobyqa, Lbfgs, Newton};
         let model = iov_model();
         let pop = iov_pop();
         for (stage, impmap) in [("impmap", true), ("imp", false)] {
-            for opt in [Bobyqa, Lbfgs, Newton] {
+            for opt in [Auto, Bobyqa, Lbfgs, Newton] {
                 let mut opts = FitOptions::default();
                 opts.impmap_iterations = 3;
                 opts.impmap_samples = 100;
@@ -6870,16 +6890,23 @@ mod tests {
                 } else {
                     run_imp(&model, &pop, &model.default_params, None, &opts)
                 };
-                res.unwrap_or_else(|e| panic!("{stage} {opt:?}: {e}"));
+                let res = res.unwrap_or_else(|e| panic!("{stage} {opt:?}: {e}"));
                 let used = MSTEP_ROUTE.with(|c| c.get());
                 let ok = match opt {
                     Bobyqa => used[0] > 0 && used[1] == 0 && used[2] == 0,
                     Lbfgs => used[0] == 0 && used[1] > 0 && used[2] == 0,
-                    Newton => used[0] == 0 && used[1] == 0 && used[2] > 0,
+                    // The IOV fixture is inside Newton's scope, so `auto` is `newton`.
+                    Newton | Auto => used[0] == 0 && used[1] == 0 && used[2] > 0,
                 };
                 assert!(
                     ok,
                     "{stage} {opt:?}: solves by [bobyqa, lbfgs, newton] = {used:?}"
+                );
+                let resolved = if opt == Auto { Newton } else { opt };
+                assert_eq!(
+                    res.mstep_optimizer_used.as_deref(),
+                    Some(resolved.as_str()),
+                    "{stage} {opt:?}"
                 );
             }
         }

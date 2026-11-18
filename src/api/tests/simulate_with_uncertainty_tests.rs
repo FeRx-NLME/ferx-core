@@ -775,6 +775,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: None,
         gradient_method_inner: String::new(),
         gradient_method_outer: String::new(),
         uses_ode_solver: false,

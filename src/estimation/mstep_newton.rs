@@ -191,6 +191,14 @@ where
         return (NewtonOutcome::Declined, 0);
     };
     let mut evals = 1u32;
+    // A start whose objective is the sentinel (a subject's prediction is not finite there, as at
+    // a start where a covariate-adjusted typical value is negative) has a flat value and
+    // zeroed derivatives ([`finite_value`], [`finite_grad`]): every step predicts no decrease,
+    // which would read as converged. It is not a solve of anything — the derivative-free
+    // solve, which looks for a finite point, takes it from here.
+    if cur.val >= SUBJECT_SENTINEL_NLL {
+        return (NewtonOutcome::Declined, evals);
+    }
     // Persists across iterations (Levenberg-Marquardt): a rejected step raises it, an accepted
     // one lowers it, and below the floor it is exactly zero — the plain Fisher step.
     let mut ridge = 0.0f64;
@@ -508,6 +516,38 @@ mod tests {
         let mut z = [1.5, -0.4];
         let (_, calls) = solve(&mut z, &[-9.0; 2], &[9.0; 2], 3, 1e-15, exp_fit);
         assert!(calls <= 4, "{calls}");
+    }
+
+    /// A start at the sentinel objective is declined, not converged: its zeroed derivatives
+    /// predict no decrease, which `fisher_scoring` would otherwise read as a solved M-step with
+    /// `x` untouched (#3001). Mutation: delete the sentinel check and the first assertion fails.
+    #[test]
+    fn a_start_at_the_sentinel_objective_is_declined_not_converged() {
+        let mut x = [1.5, -0.4];
+        let sentinel = |_: &[f64]| {
+            Some(ValueGradInfo {
+                val: SUBJECT_SENTINEL_NLL,
+                grad: vec![0.0; 2],
+                info: vec![0.0; 4],
+            })
+        };
+        let (outcome, _) = solve(&mut x, &[-9.0; 2], &[9.0; 2], 100, 1e-9, sentinel);
+        assert_eq!(outcome, Declined);
+        assert_eq!(x, [1.5, -0.4]);
+        // The same flat information at a finite value *is* converged: the sentinel is the
+        // discriminator, not the zero gradient.
+        let flat = |_: &[f64]| {
+            Some(ValueGradInfo {
+                val: 5.0,
+                grad: vec![0.0; 2],
+                info: vec![0.0; 4],
+            })
+        };
+        let mut y = [1.5, -0.4];
+        assert_eq!(
+            solve(&mut y, &[-9.0; 2], &[9.0; 2], 100, 1e-9, flat).0,
+            Converged
+        );
     }
 
     #[test]

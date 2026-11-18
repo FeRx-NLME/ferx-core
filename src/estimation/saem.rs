@@ -82,6 +82,52 @@ pub(crate) fn mstep_initial_step(lower: f64, upper: f64) -> f64 {
     }
 }
 
+/// Evaluations a BOBYQA M-step may spend per interpolation point of its model (`2·n + 1`
+/// for `n` free coordinates): the cap on a solve that normally stops on
+/// [`MSTEP_FTOL_REL`] well before it.
+///
+/// The M-step of SAEM is the *maximiser* of the conditional objective. The budget it was
+/// given before, `maxiter·(n+1)`, is a gradient method's accounting (one finite-difference
+/// gradient is `n + 1` evaluations), and BOBYQA spends `2n + 1` of it before its first
+/// trust-region step: with `maxiter = 3` and `n = 11` that is 23 of 36 evaluations on the
+/// initial design and 13 on the search, where a converged solve needs 300–650. Measured on
+/// `pk2_big` with every θ numerical, 293 of 304 M-steps ended on the budget, at the exit
+/// ~100 objective units short of the converged value early on and 0.3–2 late, and the fit's
+/// importance-sampling −2 log L was −3371 where Newton's exact M-step reaches −3502; run to
+/// [`MSTEP_FTOL_REL`] (this cap) it is −3501 and the budget only guards against a runaway.
+///
+/// 100 is a guard derived from the measured need, not a tuned constant. Over every
+/// benchmark M-step (34 model/estimator points, 1–11 free coordinates, ~300 SAEM or 150 IMP
+/// M-steps each; all but the mixture arm ended on the tolerance, none on the budget) the
+/// largest need was 33 evaluations per point (`warfarin_nomu`, 4 free: 297 evaluations; 1
+/// free coordinate: up to 91 = 30 per point; 9 free: 434), so the cap is at least 3× the worst
+/// observed solve at every `n`. A cap proportional to the points is the natural unit — it is
+/// what BOBYQA's model costs to build — and the need per point is largest for small `n`, where
+/// the first design is cheap and the search is not. It never binds on a healthy solve; it
+/// bounds the cost of a runaway one.
+pub(crate) const MSTEP_EVALS_PER_POINT: u32 = 100;
+
+/// The evaluation budget of one numerical θ/σ M-step over `n` coordinates of which `n_free`
+/// are free (a pinned coordinate costs NLopt nothing).
+///
+/// * BOBYQA, Newton's continuation included: [`MSTEP_EVALS_PER_POINT`] per interpolation
+///   point — the solve stops on its tolerance, not on `maxiter`.
+/// * `lbfgs` (an `(n + 1)`-evaluation gradient per iteration) and the mixture arm, which keeps
+///   its pre-#1415 configuration ([`MSTEP_MIXTURE_FTOL_REL`]): `maxiter·(n + 1)`.
+pub(crate) fn mstep_budget(
+    maxiter: u32,
+    n: usize,
+    n_free: usize,
+    optimizer: MstepOptimizer,
+    mixture: bool,
+) -> u32 {
+    if mixture || optimizer == MstepOptimizer::Lbfgs {
+        maxiter * (n as u32 + 1)
+    } else {
+        MSTEP_EVALS_PER_POINT * (2 * n_free as u32 + 1)
+    }
+}
+
 /// Relative objective tolerance of the numerical θ/σ M-step (#1415).
 ///
 /// Was `1e-4`: on a conditional objective of a few thousand units that stops
@@ -2481,8 +2527,10 @@ pub(crate) fn newton_scope_gap(model: &CompiledModel, is_mixture: bool) -> Optio
 }
 
 /// The `mstep_optimizer` a fit runs (SAEM, IMP and IMPMAP), decided once, with the warning for
-/// where it differs from the request or does not do what it says. `bobyqa` (the default) is
-/// silent. `newton` outside [`newton_scope_gap`] runs `bobyqa`, and says which property of
+/// where it differs from the request or does not do what it says. `auto` (the default) is
+/// `newton` inside [`newton_scope_gap`] and `bobyqa` outside it, silently — it is a rule, not a
+/// request the model fails; the fit reports the result (`FitResult::mstep_optimizer_used`).
+/// `bobyqa` is silent. An explicit `newton` outside [`newton_scope_gap`] runs `bobyqa`, and says which property of
 /// the model put it there; under `mstep_solver = score_sa`, which replaces the numerical solve
 /// altogether, the option has nothing to act on. `lbfgs` runs as asked, silently where the
 /// recorders serve the model (its θ score is exact, which is the point of the option) and with
@@ -2529,6 +2577,18 @@ fn resolve_mstep_optimizer_for(
     if optimizer == MstepOptimizer::Bobyqa {
         return (optimizer, None);
     }
+    if optimizer == MstepOptimizer::Auto {
+        // The documented rule, applied silently: Newton wherever its scope holds. Under
+        // `score_sa` there is no numerical solve to choose for.
+        return (
+            if score_sa_active || newton_gap.is_some() {
+                MstepOptimizer::Bobyqa
+            } else {
+                MstepOptimizer::Newton
+            },
+            None,
+        );
+    }
     if optimizer == MstepOptimizer::Newton {
         return if score_sa_active {
             (
@@ -2570,7 +2630,7 @@ fn resolve_mstep_optimizer_for(
             "{label}: `mstep_optimizer = lbfgs` is running without an exact θ gradient — this \
              model is outside the adjoint's scope, so the M-step's θ score is a forward \
              difference (relative step 1e-5) and L-BFGS converges only to that accuracy. \
-             `mstep_optimizer = bobyqa` (the default) does not read a gradient."
+             `mstep_optimizer = bobyqa` does not read a gradient."
         )),
     )
 }
@@ -2935,7 +2995,8 @@ fn theta_sigma_mstep_light(
     };
     // One budget for the whole M-step: Newton's evaluations come out of it and a stalled Newton
     // leaves BOBYQA the rest (`fisher_scoring` states the convention).
-    let budget = maxiter * (n as u32 + 1);
+    let n_free = (0..n).filter(|&i| lower[i] < upper[i]).count();
+    let budget = mstep_budget(maxiter, n, n_free, mstep_optimizer, mix_mstep.is_some());
     let mut remaining = budget;
     if mstep_optimizer == MstepOptimizer::Newton {
         debug_assert!(
@@ -7689,6 +7750,7 @@ pub fn run_saem(
         saem_objective_value: saemobj.value(),
         saem_n_subjects_hmc,
         saem_mh_accept_tail,
+        mstep_optimizer_used: (!use_score_sa).then(|| mstep_optimizer.as_str().to_string()),
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,

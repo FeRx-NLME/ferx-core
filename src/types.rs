@@ -8914,6 +8914,12 @@ pub struct FitResult {
     /// across whichever ran (issue #1444).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saem_mh_accept_tail: Option<f64>,
+    /// The numerical θ/σ M-step optimizer a SAEM, IMP or IMPMAP fit actually ran
+    /// (`newton`, `bobyqa` or `lbfgs`): what `[fit_options] mstep_optimizer = auto`
+    /// (the default) resolved to for this model. `None` for other methods and where
+    /// `mstep_solver = score_sa` replaces the numerical solve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mstep_optimizer_used: Option<String>,
     /// Gradient method used in the inner (per-subject EBE) BFGS loop.
     pub gradient_method_inner: String,
     /// Gradient method used in the outer (population parameter) optimizer.
@@ -10083,8 +10089,8 @@ pub struct FitOptions {
     /// so an existing fit's estimates do not change.
     pub saem_mstep_solver: SaemMstepSolver,
     /// Optimizer of the numerical θ/σ M-step, shared by SAEM (`bobyqa` solver),
-    /// IMP and IMPMAP. Defaults to [`MstepOptimizer::Bobyqa`], the historical
-    /// derivative-free solve, so an existing fit's estimates do not change.
+    /// IMP and IMPMAP. Defaults to [`MstepOptimizer::Auto`]: Fisher scoring where the
+    /// model is in its scope, BOBYQA run to its tolerance elsewhere.
     /// `[fit_options] mstep_optimizer`.
     pub mstep_optimizer: MstepOptimizer,
     /// Number of E-step draws the **`bobyqa`** M-step objective is averaged over
@@ -11321,15 +11327,21 @@ pub enum SaemMstepSolver {
 /// Optimizer of the numerical θ/σ M-step of SAEM, IMP and IMPMAP, set via
 /// `[fit_options] mstep_optimizer`.
 ///
-/// Both arms minimise the same smooth, deterministic frozen-η (SAEM) or
+/// Every arm minimises the same smooth, deterministic frozen-η (SAEM) or
 /// importance-weighted (IMP/IMPMAP) observation objective, in the same packed
-/// log/identity space, over the same bounds, with the same evaluation budget
-/// (`maxiter * (n + 1)`) and relative tolerance. They differ in what the solve
-/// reads from the objective.
+/// log/identity space, over the same bounds and relative tolerance. They differ in what
+/// the solve reads from the objective. BOBYQA (and Newton's continuation) runs to its
+/// tolerance under a runaway guard of 100 evaluations per interpolation point; `lbfgs`
+/// keeps the `mstep_maxiter * (n + 1)` budget of a gradient method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MstepOptimizer {
-    /// NLopt BOBYQA, derivative-free (the default).
+    /// `newton` where the model is inside Newton's scope (the adjoint serves it and the
+    /// likelihood is a plain Gaussian one, not a mixture), `bobyqa` otherwise. Silent: the
+    /// fit's `mstep_optimizer` output line and `FitResult::mstep_optimizer_used` record what
+    /// it resolved to (the default).
     #[default]
+    Auto,
+    /// NLopt BOBYQA, derivative-free, run to its tolerance.
     Bobyqa,
     /// NLopt L-BFGS on the exact fixed-η score: the per-subject adjoint θ score
     /// and the analytic σ score (the one `mstep_solver = score_sa` already
@@ -11343,9 +11355,21 @@ pub enum MstepOptimizer {
     /// a handful of fused value-gradient-information passes from the warm start. A subject
     /// outside the information's closed form (and a mixture) keeps the BOBYQA solve. A solve
     /// that stalls or loses its information at run time continues with BOBYQA from the
-    /// point it reached on what is left of the one `maxiter * (n + 1)` budget (every pass,
+    /// point it reached on what is left of the one BOBYQA budget (every pass,
     /// value or fused, counts as one evaluation), and the fit's warnings count those M-steps.
     Newton,
+}
+
+impl MstepOptimizer {
+    /// The `[fit_options] mstep_optimizer` token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MstepOptimizer::Auto => "auto",
+            MstepOptimizer::Bobyqa => "bobyqa",
+            MstepOptimizer::Lbfgs => "lbfgs",
+            MstepOptimizer::Newton => "newton",
+        }
+    }
 }
 
 /// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the

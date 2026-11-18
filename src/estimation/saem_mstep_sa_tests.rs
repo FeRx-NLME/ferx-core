@@ -1810,6 +1810,56 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
     );
 }
 
+/// `auto` (the default, #3001) is the scope rule itself: `newton` exactly where
+/// [`newton_scope_gap`] is `None`, `bobyqa` everywhere else, and silent in both — an `auto` is
+/// not a request the model fails, unlike an explicit `newton` (which warns, above). Each
+/// out-of-scope input is its own row, so a rule keyed on one reason only fails the others; the
+/// explicit-`newton` warning is asserted still present beside it.
+#[test]
+fn auto_is_newton_inside_the_scope_and_silent_bobyqa_outside() {
+    use crate::types::BloqMethod;
+    use crate::types::MstepOptimizer::{Auto, Bobyqa, Newton};
+    assert_eq!(crate::types::FitOptions::default().mstep_optimizer, Auto);
+    let plain = no_eta_theta_model();
+    let mut m3 = no_eta_theta_model();
+    m3.bloq_method = BloqMethod::M3;
+    let ode_out = out_of_adjoint_model();
+    for (label, model, sa, mixture, want) in [
+        ("plain", &plain, false, false, Newton),
+        ("iov", &iov_model(), false, false, Newton),
+        ("frem", &frem_model(), false, false, Newton),
+        ("mixture", &plain, false, true, Bobyqa),
+        ("M3", &m3, false, false, Bobyqa),
+        ("out of the adjoint", &ode_out, false, false, Bobyqa),
+        (
+            "correlated residual",
+            &correlated_residual_model(),
+            false,
+            false,
+            Bobyqa,
+        ),
+        ("score_sa", &plain, true, false, Bobyqa),
+    ] {
+        assert_eq!(
+            resolve_mstep_optimizer(model, Auto, sa, mixture, true, "SAEM"),
+            (want, None),
+            "{label}"
+        );
+        assert_eq!(
+            want == Newton,
+            newton_scope_gap(model, mixture).is_none() && !sa,
+            "{label}: auto is the scope rule"
+        );
+    }
+    // The explicit request out of scope still says why.
+    assert!(
+        resolve_mstep_optimizer(&m3, Newton, false, false, true, "SAEM")
+            .1
+            .is_some()
+    );
+    assert_eq!(Auto.as_str(), "auto");
+}
+
 /// A Newton solve whose fused pass loses its information after one accepted step (a stall) is
 /// not a solved one: the route is `bobyqa`, and the solve reaches BOBYQA's maximiser — the
 /// start-point stall (`0` passes: declined at the start) takes the same route, so the two
@@ -1845,12 +1895,10 @@ fn a_stalled_newton_mstep_continues_with_bobyqa() {
 
 /// One budget, and the continuation is a continuation. A Newton solve that stalls after one
 /// accepted step hands BOBYQA its point (`x.copy_from_slice(&xn)`) *and* the evaluations it
-/// did not spend, so the whole M-step costs `maxiter·(n+1)` and no more. With a budget of 6
-/// (`maxiter = 1`, `n = 5`) Newton spends three passes (fused, value, the fused pass that
-/// declines) and BOBYQA — which needs 11 evaluations for its first design — spends the other
-/// three: the evaluation count says the budget was shared (a fresh budget makes it 9), and the
-/// objective reached says where BOBYQA started (from the start point it returns exactly what
-/// BOBYQA alone returns from three evaluations; from Newton's point it is a little further).
+/// did not spend, so the whole M-step costs [`mstep_budget`] and no more. Newton spends three
+/// passes (fused, value, the fused pass that declines) and BOBYQA the rest: the evaluation
+/// count stays inside the budget and — BOBYQA being from Newton's better point — below what
+/// BOBYQA alone needs from the start; the continuation is no further from the maximiser.
 #[test]
 fn a_stalled_newton_mstep_continues_from_its_point_within_one_budget() {
     use crate::estimation::mstep_newton::FUSED_PASSES_ALLOWED;
@@ -1862,7 +1910,7 @@ fn a_stalled_newton_mstep_continues_from_its_point_within_one_budget() {
     let draws = eta_draws();
     let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
     let start = (p.log_theta.clone(), p.log_sigma.clone());
-    let budget = 6u32; // maxiter 1 × (n + 1), n = 4 θ + 1 σ
+    let budget = crate::estimation::saem::mstep_budget(1, 5, 5, Bobyqa, false);
     let run = |optimizer, passes: Option<u32>| {
         MSTEP_ROUTE.with(|c| c.set([0; 3]));
         MSTEP_EVALS.with(|c| c.set(0));
@@ -1875,34 +1923,113 @@ fn a_stalled_newton_mstep_continues_from_its_point_within_one_budget() {
             got,
         )
     };
-    let (route, evals, stalled) = run(Newton, Some(1));
+    let (route, evals_stalled, stalled) = run(Newton, Some(1));
     assert_eq!(route, [1, 0, 0], "BOBYQA continued");
     assert!(
-        evals <= budget,
-        "Newton and its continuation spent {evals} evaluations of a budget of {budget}"
+        evals_stalled <= budget,
+        "Newton and its continuation spent {evals_stalled} evaluations of a budget of {budget}"
     );
-    // Where it continued from, read off the objective it reaches: the share of the gain the
-    // converged maximiser offers.
+    let (route, evals_alone, alone) = run(Bobyqa, None);
+    assert_eq!(route, [1, 0, 0]);
+    assert!(evals_alone > 0 && evals_alone <= budget, "{evals_alone}");
     let f_of =
         |x: &(Vec<f64>, Vec<f64>)| conditional_objective(&model, &population, &draws[0], &[], x);
     let (f_start, f_ref) = (f_of(&start), f_of(&reference));
     let captured = |x: &(Vec<f64>, Vec<f64>)| (f_start - f_of(x)) / (f_start - f_ref);
-    let c_stalled = captured(&stalled);
-    eprintln!("stalled newton + bobyqa captured {c_stalled:.4} of the gain");
-    // Control: BOBYQA alone on this budget does not get there.
-    let (route, evals, alone) = run(Bobyqa, None);
-    assert_eq!(route, [1, 0, 0]);
-    assert!(evals > 0 && evals <= budget, "{evals}");
-    let c_alone = captured(&alone);
-    eprintln!("bobyqa alone, same budget, captured {c_alone:.4} of the gain");
-    // Measured on this fixture (Linux): 0.2030 against 0.1865. A continuation from the start
-    // instead of Newton's point returns exactly BOBYQA's three evaluations from the start, the
-    // same 0.1865 — Newton's step is the whole difference.
-    assert!(
-        c_stalled > c_alone + 0.01,
-        "stalled Newton + BOBYQA captured {c_stalled}, BOBYQA alone {c_alone}: the continuation \
-         must start from Newton's point"
+    let (c_stalled, c_alone) = (captured(&stalled), captured(&alone));
+    eprintln!(
+        "stalled newton + bobyqa: {evals_stalled} evaluations, captured {c_stalled:.6}; bobyqa \
+         alone: {evals_alone}, {c_alone:.6}; budget {budget}"
     );
+    // Both converge now, so the continuation's start shows in what it cost: BOBYQA from the
+    // point of Newton's accepted step needs fewer evaluations than from the start.
+    assert!(
+        evals_stalled < evals_alone,
+        "the continuation ({evals_stalled}) must start from Newton's point, not the start \
+         ({evals_alone})"
+    );
+    assert!(
+        c_stalled > 0.999 && c_alone > 0.999,
+        "{c_stalled} {c_alone}"
+    );
+}
+
+/// The default M-step solve is run to its tolerance: `maxiter` does not cut it off. BOBYQA
+/// spends `2n + 1` evaluations on its first design, so the old budget `maxiter·(n + 1)` left a
+/// search of 7 evaluations to `maxiter = 3` on this fixture's five free coordinates — a
+/// fraction of the gain, and on a larger model (nine θ and two σ: 293 of 304 M-steps ended on
+/// the budget) a fit −130 in −2 log L from the mu-referenced one. Now the result neither
+/// depends on `maxiter` nor falls short of the converged maximiser; the budget a pinned
+/// coordinate does not enlarge, `lbfgs` and the mixture arm keep `maxiter·(n + 1)`.
+#[test]
+fn a_bobyqa_mstep_is_run_to_its_tolerance_not_cut_off_by_maxiter() {
+    use crate::estimation::saem::{mstep_budget, MSTEP_EVALS_PER_POINT};
+    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs, Newton};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let start = (p.log_theta.clone(), p.log_sigma.clone());
+    let at = |maxiter| {
+        maximiser_with(
+            &model,
+            &population,
+            &p,
+            &draws[0],
+            &[],
+            Bobyqa,
+            maxiter,
+            false,
+        )
+    };
+    let (cut_off, long) = (at(3), at(900));
+    let f_of =
+        |x: &(Vec<f64>, Vec<f64>)| conditional_objective(&model, &population, &draws[0], &[], x);
+    let (f_start, f_ref) = (f_of(&start), f_of(&long));
+    assert!(
+        f_start - f_ref > 1.0,
+        "a non-degenerate fixture: {}",
+        f_start - f_ref
+    );
+    let captured = (f_start - f_of(&cut_off)) / (f_start - f_ref);
+    eprintln!("maxiter 3 captures {captured:.6} of the converged gain");
+    assert!(
+        captured > 0.9999,
+        "maxiter 3 reaches {captured} of the converged gain: the budget is cutting the solve off"
+    );
+    assert_eq!(cut_off, long, "the budget does not depend on maxiter");
+
+    // The budget itself, by arm.
+    let per = MSTEP_EVALS_PER_POINT;
+    assert_eq!(mstep_budget(3, 11, 11, Bobyqa, false), per * 23);
+    assert_eq!(
+        mstep_budget(5, 11, 11, Bobyqa, false),
+        per * 23,
+        "not by maxiter"
+    );
+    assert_eq!(
+        mstep_budget(3, 11, 11, Newton, false),
+        per * 23,
+        "its continuation's too"
+    );
+    assert_eq!(
+        mstep_budget(3, 11, 4, Bobyqa, false),
+        per * 9,
+        "pinned coordinates cost nothing"
+    );
+    assert_eq!(
+        mstep_budget(3, 11, 11, Lbfgs, false),
+        36,
+        "a gradient method's accounting"
+    );
+    assert_eq!(
+        mstep_budget(3, 11, 11, Bobyqa, true),
+        36,
+        "the mixture arm keeps its budget"
+    );
+    // It is a guard, not a target: more than a converged solve needed on the largest model
+    // measured (650 evaluations at n = 11).
+    assert!(mstep_budget(3, 11, 11, Bobyqa, false) > 650);
 }
 
 /// What a fit's Newton solves did reaches its warnings: a solve that loses the information (the
