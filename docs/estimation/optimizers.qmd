@@ -352,8 +352,11 @@ The outcomes are those of the guard check. A resumed run that ends lower is repo
 it reaches 3326.856470, NONMEM's 3326.8565. One that ends no lower leaves the first stop
 `converged = false` with a `convergence` warning, and so does one that collapses again with the
 objective still falling. A variance whose objective rises when it is raised is a genuine near-zero
-estimate and is left alone, bit for bit; only `n_iterations` counts the evaluations. The check
-costs nothing on a fit with no variance that far below its start. Starting a variance closer to its
+estimate and is left alone, bit for bit; only `n_iterations` counts the evaluations. A run that
+the [guard check](#variance-short-of-guard) below resumes is a full optimization too, so when it
+adopts one, this check reads that run again, for at most two rounds; a variance a last resumed
+run leaves collapsed and downhill is reported `converged = false` without a further restart. The
+check costs nothing on a fit with no variance that far below its start. Starting a variance closer to its
 expected size, `optimizer = slsqp`, or `method = gn_hybrid` avoid the collapse in the first place.
 
 ### A variance stopped short of its guard {#variance-short-of-guard}

@@ -450,6 +450,12 @@ pub(crate) fn below_start_params(
     p
 }
 
+/// How many collapse-then-rail rounds [`escape_floor`] runs while the rail stage keeps
+/// adopting a resumed run (#3005 review). Each round that repeats costs one or two full outer
+/// optimizations, so the bound is small; a run adopted in the last round is still verified
+/// for collapse, without a restart.
+pub(crate) const COMPLETION_ROUNDS: usize = 2;
+
 /// Which short stop a completion probes: a variance just above its internal lower guard,
 /// probed on it (#2832), or one collapsed far below its start, probed back up (#3005). The
 /// decision ([`resolve_short_stop`]) is the same; the probe point, the restart point and the
@@ -630,6 +636,24 @@ fn short_not_converged_warning(
     )
 }
 
+/// The warning of a verification-only stage whose probe was downhill (#3005 review): the
+/// point was reached by a run a completion had already resumed, the restart budget is
+/// spent, so it is reported as it stands and is not converged. Filed under `convergence` on
+/// "not reported as converged".
+fn short_unresolved_warning(
+    kind: ShortStop,
+    downhill: &[(RailCandidate, f64)],
+    stop_ofv: f64,
+    at: RailScore,
+) -> String {
+    format!(
+        "{} It was reached by a run that had already been resumed, so it was not resumed \
+         again; the fit is not reported as converged: {}.",
+        rail_stop_sentence(kind, downhill, stop_ofv, at),
+        short_remedy(kind),
+    )
+}
+
 /// The warning of a rail completion whose resumed run ended no lower (#2832). See
 /// [`short_not_converged_warning`].
 #[cfg(test)]
@@ -777,7 +801,7 @@ pub(crate) fn resolve_rail_completion<T: StoppedFit>(
         candidates_of,
         score,
         probe,
-        restart,
+        |t: &T, idx: &[usize]| Some(restart(t, idx)),
         ranked,
         inner_maxiter,
         verbose,
@@ -801,6 +825,10 @@ pub(crate) fn resolve_rail_completion<T: StoppedFit>(
 /// first stop — but not converged, as the θ escape treats a restart that lands on the floor
 /// again.
 ///
+/// A `restart` that returns `None` makes the stage verification-only (#3005 review): a
+/// downhill probe then keeps the stop, not converged, with
+/// [`short_unresolved_warning`]'s text, and no run is resumed.
+///
 /// `carried` are the warnings of the earlier stages that produced `first` — the θ floor
 /// escape's, a collapse completion's — when they adopted a new run: an adopted resumed run
 /// is a new result, so it carries them ahead of its own, and when there are any, a `first`
@@ -816,7 +844,7 @@ pub(crate) fn resolve_short_stop<T: StoppedFit>(
     candidates_of: impl Fn(&T) -> Vec<RailCandidate>,
     score: impl Fn(&T) -> T,
     probe: impl Fn(&T, usize) -> T,
-    restart: impl FnOnce(&T, &[usize]) -> T,
+    restart: impl FnOnce(&T, &[usize]) -> Option<T>,
     ranked: impl Fn(&T) -> f64,
     inner_maxiter: usize,
     verbose: bool,
@@ -858,7 +886,16 @@ pub(crate) fn resolve_short_stop<T: StoppedFit>(
         );
     }
     let idx: Vec<usize> = downhill.iter().map(|(c, _)| c.index).collect();
-    let mut second = restart(&first, &idx);
+    let Some(mut second) = restart(&first, &idx) else {
+        // Verification only: the restart budget is spent, so the stop is kept and, having
+        // a downhill probe, is not a minimum.
+        *first.evals_mut() += n_probes;
+        *first.converged_mut() = false;
+        first
+            .warnings_mut()
+            .push(short_unresolved_warning(kind, &downhill, stop_ofv, at));
+        return (first, carried);
+    };
     if !(ofv_is_valid(second.ofv()) && ranked(&second) < ranked(&first)) {
         *first.evals_mut() += *second.evals_mut() + n_probes;
         *first.covariance_secs_mut() += *second.covariance_secs_mut();
@@ -953,9 +990,13 @@ fn completion_enabled(kind: ShortStop) -> bool {
 /// and a non-finite objective. The candidates, probe and restart points are the kind's:
 /// [`near_rail_variances`] probed on the guard and resumed from [`RAIL_RESTART_ABOVE`] over
 /// it (#2832), or [`collapsed_variances`] probed at [`collapse_depth`] below their start and
-/// resumed from the start itself (#3005). Returns what [`resolve_short_stop`] does.
+/// resumed from the start itself (#3005). With `restart_allowed` false the stage only
+/// verifies: a downhill probe demotes `converged` and nothing is resumed. Returns what
+/// [`resolve_short_stop`] does.
+#[allow(clippy::too_many_arguments)]
 fn complete_short_stop<T: StoppedFit>(
     kind: ShortStop,
+    restart_allowed: bool,
     reported: T,
     carried: Vec<String>,
     start: &ModelParameters,
@@ -1016,7 +1057,7 @@ fn complete_short_stop<T: StoppedFit>(
                 ShortStop::Rail => at_rail_params(r.params(), start, idx, RAIL_RESTART_ABOVE),
                 ShortStop::Collapse => below_start_params(r.params(), start, idx, 0.0),
             };
-            run(&resumed, options)
+            restart_allowed.then(|| run(&resumed, options))
         },
         |r| r.ofv() + penalty(r.params()),
         inner_maxiter,
@@ -1058,25 +1099,67 @@ pub(crate) fn escape_floor<T: StoppedFit>(
     let (reported, escape) = escape_floor_from(first, start, options, &run, &penalty);
     // Collapse first: its restart re-inflates a variance from far below its start, and the
     // run it adopts can stop with a variance just above the guard, which rail completion
-    // then reads. The reverse order would leave a rail restart's collapsed variance unread.
-    let (reported, carried) = complete_short_stop(
-        ShortStop::Collapse,
-        reported,
-        escape.into_iter().collect(),
-        start,
-        options,
-        &run,
-        &penalty,
-    );
-    let (mut reported, _) = complete_short_stop(
-        ShortStop::Rail,
-        reported,
-        carried,
-        start,
-        options,
-        &run,
-        &penalty,
-    );
+    // then reads. A rail restart is itself a full outer optimization whose adopted run rail
+    // completion re-checks only for its own kind, so it can collapse a variance again (#3005
+    // review): while the rail stage adopts a new run, collapse completion reads it again,
+    // and rail completion follows only when that adopts a run of its own — at most
+    // `COMPLETION_ROUNDS` rounds; a run the rail stage adopted in the last round is then
+    // verified for collapse without another restart. Each stage hands the next the warnings
+    // it must carry; an adopted stage grows that list, which is how adoption is read here.
+    let mut reported = reported;
+    let mut carried: Vec<String> = escape.into_iter().collect();
+    let mut rail_adopted = false;
+    for round in 0..COMPLETION_ROUNDS {
+        let before = carried.len();
+        let (r, c) = complete_short_stop(
+            ShortStop::Collapse,
+            true,
+            reported,
+            carried,
+            start,
+            options,
+            &run,
+            &penalty,
+        );
+        reported = r;
+        carried = c;
+        // After the first round the run in hand is a rail restart that rail completion has
+        // already re-checked; only a new collapse restart gives it something new to read.
+        if round > 0 && carried.len() == before {
+            rail_adopted = false;
+            break;
+        }
+        let before = carried.len();
+        let (r, c) = complete_short_stop(
+            ShortStop::Rail,
+            true,
+            reported,
+            carried,
+            start,
+            options,
+            &run,
+            &penalty,
+        );
+        reported = r;
+        carried = c;
+        rail_adopted = carried.len() > before;
+        if !rail_adopted {
+            break;
+        }
+    }
+    if rail_adopted {
+        reported = complete_short_stop(
+            ShortStop::Collapse,
+            false,
+            reported,
+            carried,
+            start,
+            options,
+            &run,
+            &penalty,
+        )
+        .0;
+    }
     let ranked = reported.ofv() + penalty(reported.params());
     if ranked.is_finite() {
         fit_start = rescored_start(fit_start, start, options, &run);
