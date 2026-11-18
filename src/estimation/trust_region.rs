@@ -12,7 +12,7 @@ use crate::estimation::parameterization::{
 use crate::types::{CompiledModel, FitOptions, ModelParameters, Population};
 
 /// Per-call cache for per-subject NLL gradients: a BHHH iteration's gradient and curvature
-/// ([`FoceiProblem::likelihood_gradient`], [`FoceiProblem::bhhh`]) share one inner solve and
+/// ([`FoceiProblem::data_gradient`]) reuses the iterate's inner solve and
 /// one sweep.
 struct GradCache {
     x: Vec<f64>,
@@ -45,15 +45,28 @@ struct FoceiProblem<'a> {
     priors: crate::estimation::priors::PriorSet,
 }
 
-/// The trust region (#2975): a dense, scaled trust-region Newton on the exact Hessian. Each iteration
-/// forms the exact gradient and Hessian of the penalized OFV at the incumbent (EBEs, and κ̂ under
-/// IOV, re-solved), measures the step in the norm `‖D s‖` with `D = √diag|H|` kept at its running
-/// maximum (Moré's scaling: the curvature scale of every coordinate), makes the scaled Hessian
-/// saddle-free (`|H|`), fixes the coordinates held at a bound by the gradient, solves the
-/// trust-region subproblem exactly on the eigenbasis, projects onto the box and accepts on the
-/// actual-to-predicted ratio. Where the exact Hessian cannot be formed at an iterate, BHHH from
-/// the exact per-subject gradients stands in for that iteration. Stops when the exact Newton
-/// decrement is at most [`TR_EXACT_DECREMENT_TOL`].
+/// The trust region (#2975): PORT's model/trust-region method (the `DMNGB` family behind R's
+/// `nlminb`: Dennis, Gay & Welsch 1981; Gay 1983) with exact second-order information.
+///
+/// - **Model.** `m(s) = f + gᵀs + ½ sᵀBs`, with `g` the exact adjoint gradient at the iterate's
+///   own modes and `B` a BFGS matrix **seeded with the exact Hessian made saddle-free**, `|H|`
+///   (eigenvalues by absolute value): positive definite, so every secant update applies (a raw
+///   indefinite seed has `sᵀBs < 0` along its negative directions and never learns them).
+///   Updates are Powell-damped (`y` blended toward `Bs` when `sᵀy < 0.2·sᵀBs`), since a trust
+///   region, unlike a Wolfe line search, does not guarantee `sᵀy > 0`.
+/// - **Exact refresh.** `B` is replaced by a fresh exact `|H|` when its step predicted badly
+///   (`ρ < ¼`) and when the set of coordinates free of their bounds changes (the secant
+///   curvature was learned in the old subspace).
+/// - **Step.** Coordinates held at a bound by the gradient are fixed; the subproblem is solved
+///   exactly on `B`'s eigenbasis in the norm `‖D s‖`, `D = √diag|B|` at its running maximum
+///   (Moré's scaling, PORT's `DD7DUP`); the step is projected onto the box and accepted on the
+///   actual-to-predicted ratio.
+/// - **Stop.** A model Newton decrement `½ gᵀB⁻¹g ≤` [`TR_EXACT_DECREMENT_TOL`] is certified on a
+///   fresh exact Hessian: the fit stops only on the exact decrement.
+///
+/// Where the exact Hessian is out of scope (a model or subject the exact derivatives do not
+/// cover), the same rule runs on the finite-difference Hessian of the same objective and the
+/// #2974 rows' gradient (non-IOV models): one rule, two precisions.
 fn exact_trust_region(
     problem: &FoceiProblem<'_>,
     x0: &[f64],
@@ -61,6 +74,9 @@ fn exact_trust_region(
     options: &FitOptions,
     budget_spent: &mut bool,
 ) -> (bool, Vec<f64>, usize, Option<Vec<f64>>, HeldEbes) {
+    use crate::estimation::covariance::{
+        exact_candidate_hessian, exact_gradient_at_modes, fd_candidate_hessian, ExactDecline,
+    };
     use crate::estimation::outer_optimizer::{joint_warm_starts, outer_cache_warm_starts};
     let n = x0.len();
     let model = problem.model;
@@ -108,10 +124,23 @@ fn exact_trust_region(
     let (mut f, mut etas, mut hms, mut kappas) = eval(&x, &start_warm);
     let mut radius = 1.0_f64;
     let mut d_scale = vec![0.0_f64; axes.len()];
+    // The BFGS model on `axes`, and the point and gradient it was last updated at.
+    let mut model_b: Option<DMatrix<f64>> = None;
+    let mut last: Option<(Vec<f64>, Vec<f64>)> = None;
+    let mut refresh = true;
+    let mut prev_free: Option<Vec<usize>> = None;
+    let mut n_exact = 0usize;
     let mut converged = false;
     let mut iters = 0usize;
     let mut last_g: Option<Vec<f64>> = None;
     let at = |b: f64, v: f64| b.is_finite() && (v - b).abs() <= 1e-10 * (1.0 + b.abs());
+    // The #2974 rows' gradient along `axes` at `x`, from `x`'s own modes: where the exact
+    // adjoint gradient is out of scope (non-IOV only; the rows carry no κ̂).
+    let rows_gradient = |x: &[f64], etas: &[DVector<f64>]| -> Vec<f64> {
+        *problem.cached_etas.lock().unwrap() = etas.to_vec();
+        let g = problem.data_gradient(x);
+        axes.iter().map(|&k| g[k]).collect()
+    };
     for it in 0..options.outer_maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
             break;
@@ -130,32 +159,96 @@ fn exact_trust_region(
             .add_packed_hessian(&params.theta, &mut |i, j, v| ph[(i, j)] += v);
         problem.priors.add_gradient(&x, &mut pg);
         problem.priors.add_hessian(&mut |i, j, v| ph[(i, j)] += v);
-        let exact = crate::estimation::covariance::exact_candidate_hessian(
-            model,
-            problem.population,
-            problem.init_params,
-            &x,
-            &warm,
-            options,
-            &axes,
-        );
-        let (g_ax, h_ax): (Vec<f64>, DMatrix<f64>) = match exact {
-            Some(gh) => gh,
-            None if model.n_kappa == 0 => {
-                // BHHH from the exact per-subject gradients, for this iteration only.
-                *problem.cached_etas.lock().unwrap() = etas.clone();
-                let g = problem.likelihood_gradient(&x);
-                let h = problem.bhhh(&x);
-                if options.verbose {
-                    eprintln!("  TR iter {it:>3}: exact Hessian unavailable, BHHH this iteration");
+        // The secant model: the exact gradient at the iterate's own modes (no re-solve), and
+        // `B` updated with the step since the last model point.
+        let secant = || {
+            model_b.as_ref().and_then(|b| {
+                let g: Vec<f64> = match &last {
+                    Some((xl, gl)) if *xl == x => gl.clone(),
+                    _ => exact_gradient_at_modes(
+                        model,
+                        population,
+                        problem.init_params,
+                        &x,
+                        &etas,
+                        &kappas,
+                        options,
+                        &axes,
+                    )
+                    .or_else(|| (model.n_kappa == 0).then(|| rows_gradient(&x, &etas)))?,
+                };
+                let mut b = b.clone();
+                if let Some((xl, gl)) = last.as_ref().filter(|(xl, _)| *xl != x) {
+                    let s = DVector::from_iterator(axes.len(), axes.iter().map(|&k| x[k] - xl[k]));
+                    let y =
+                        DVector::from_iterator(axes.len(), (0..axes.len()).map(|i| g[i] - gl[i]));
+                    damped_bfgs_update(&mut b, &s, &y);
                 }
-                (
-                    axes.iter().map(|&k| g[k]).collect(),
-                    DMatrix::from_fn(axes.len(), axes.len(), |i, j| h[(axes[i], axes[j])]),
-                )
-            }
-            None => break,
+                Some((g, b))
+            })
         };
+        let quasi = if refresh { None } else { secant() };
+        let mut used_quasi = quasi.is_some();
+        let (g_ax, h_ax): (Vec<f64>, DMatrix<f64>) = match quasi {
+            Some(gb) => gb,
+            None => {
+                n_exact += 1;
+                match exact_candidate_hessian(
+                    model,
+                    population,
+                    problem.init_params,
+                    &x,
+                    &warm,
+                    options,
+                    &axes,
+                ) {
+                    Ok(gh) => gh,
+                    // Out of the exact scope: the same model from the finite-difference
+                    // Hessian of the same objective, and the #2974 rows' gradient.
+                    Err(ExactDecline::OutOfScope) if model.n_kappa == 0 => {
+                        let Some(h) = fd_candidate_hessian(
+                            model,
+                            population,
+                            problem.init_params,
+                            &x,
+                            &warm,
+                            options,
+                            &axes,
+                        ) else {
+                            break;
+                        };
+                        if options.verbose {
+                            eprintln!("  TR iter {it:>3}: exact Hessian out of scope, FD Hessian");
+                        }
+                        (rows_gradient(&x, &etas), h)
+                    }
+                    // In scope but not resolved at this point (an EBE that does not re-converge
+                    // at the covariance tolerance, a non-finite term): a property of the point,
+                    // not of the model, so the FD twin would meet the same trouble ~2n² times.
+                    // Keep the secant model here; the next refresh trigger tries again.
+                    Err(ExactDecline::NotResolved) => match secant() {
+                        Some(gb) if !crate::cancel::is_cancelled(&options.cancel) => {
+                            if options.verbose {
+                                eprintln!(
+                                    "  TR iter {it:>3}: exact Hessian not resolved here; secant model"
+                                );
+                            }
+                            used_quasi = true;
+                            gb
+                        }
+                        _ => break,
+                    },
+                    Err(ExactDecline::OutOfScope) => break,
+                }
+            }
+        };
+        refresh = false;
+        model_b = Some(if used_quasi {
+            h_ax.clone()
+        } else {
+            saddle_free(&h_ax)
+        });
+        last = Some((x.clone(), g_ax.clone()));
         let g_full: Vec<f64> = (0..n)
             .map(|k| axes.iter().position(|&a| a == k).map_or(0.0, |i| g_ax[i]) + pg[k])
             .collect();
@@ -167,6 +260,14 @@ fn exact_trust_region(
                     && !(at(bounds.upper[k], x[k]) && g_full[k] < 0.0)
             })
             .collect();
+        // A change of the free set changes the subspace the model lives in; the secant
+        // curvature was learned in the old one. Re-model here on the exact Hessian.
+        let free_changed = prev_free.as_ref().is_some_and(|p| *p != fr);
+        prev_free = Some(fr.clone());
+        if used_quasi && free_changed {
+            refresh = true;
+            continue;
+        }
         if fr.is_empty() {
             converged = true;
             break;
@@ -178,7 +279,7 @@ fn exact_trust_region(
         if h.iter().chain(g_full.iter()).any(|v| !v.is_finite()) {
             break;
         }
-        // Moré's scaling: `D` at its running maximum of `√|H_aa|`.
+        // Moré's scaling: `D` at its running maximum of `√|B_aa|`.
         for (i, &fi) in fr.iter().enumerate() {
             let hd = h[(i, i)].abs().sqrt();
             if hd.is_finite() && hd > d_scale[fi] {
@@ -198,19 +299,24 @@ fn exact_trust_region(
         let decrement = sub.decrement;
         if options.verbose {
             eprintln!(
-                "  TR iter {it:>3}: OFV = {f:.6}  decrement {decrement:.3e}  radius {radius:.3e}  free {m}/{}",
-                axes.len()
+                "  TR iter {it:>3}: OFV = {f:.6}  decrement {decrement:.3e}  radius {radius:.3e}  free {m}/{}{}",
+                axes.len(),
+                if used_quasi { "" } else { "  (exact Hessian)" }
             );
         }
         if decrement <= TR_EXACT_DECREMENT_TOL {
+            if used_quasi {
+                // A stop is certified on the exact Hessian only.
+                refresh = true;
+                continue;
+            }
             converged = true;
             break;
         }
-        let py = &sub.step;
         let mut xn = x.clone();
         for (i, &fi) in fr.iter().enumerate() {
             let k = axes[fi];
-            xn[k] = (x[k] + py[i] / d[i]).clamp(bounds.lower[k], bounds.upper[k]);
+            xn[k] = (x[k] + sub.step[i] / d[i]).clamp(bounds.lower[k], bounds.upper[k]);
         }
         // The step actually taken, in the scaled norm, and the model's prediction for it.
         let sy =
@@ -218,6 +324,10 @@ fn exact_trust_region(
         let pred = -(gy.dot(&sy) + 0.5 * sy.dot(&(&sub.habs * &sy)));
         let (fnew, en, hn, kn) = eval(&xn, &trial_warm);
         let rho = if pred > 0.0 { (f - fnew) / pred } else { -1.0 };
+        if rho < 0.25 {
+            // The model predicted badly here: re-model on the exact Hessian.
+            refresh = true;
+        }
         let snorm = sy.norm();
         if fnew < f && rho > 1e-4 {
             x = xn;
@@ -225,6 +335,13 @@ fn exact_trust_region(
             etas = en;
             hms = hn;
             kappas = kn;
+            // The rows' gradient at the next iterate starts from this point's own modes.
+            *problem.grad_cache.lock().unwrap() = Some(GradCache {
+                x: x.clone(),
+                etas: etas.clone(),
+                h_mats: hms.clone(),
+                per_subj_grads: vec![],
+            });
             if rho > 0.75 && snorm >= 0.99 * radius {
                 radius = (2.0 * radius).min(1e3);
             } else if rho < 0.25 {
@@ -238,6 +355,9 @@ fn exact_trust_region(
         }
     }
     *problem.cached_etas.lock().unwrap() = etas.clone();
+    if options.verbose {
+        eprintln!("  TR: {iters} iterations, {n_exact} exact Hessians");
+    }
     if iters == options.outer_maxiter && !converged {
         *budget_spent = true;
     }
@@ -247,6 +367,40 @@ fn exact_trust_region(
         kappas,
     };
     (converged, x, iters, last_g, held)
+}
+
+/// `|H|`: `H` with its eigenvalues made absolute, floored at `1e-10·max|λ|`. The saddle-free
+/// metric (Dauphin et al. 2014): `H` itself where `H` is positive definite; positive definite
+/// always, with every curvature magnitude kept.
+pub(crate) fn saddle_free(h: &DMatrix<f64>) -> DMatrix<f64> {
+    let e = h.clone().symmetric_eigen();
+    let top = e.eigenvalues.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let lam = e.eigenvalues.map(|v| v.abs().max(1e-10 * top));
+    &e.eigenvectors * DMatrix::from_diagonal(&lam) * e.eigenvectors.transpose()
+}
+
+/// Powell's damped BFGS update of `b` for the step `s` and gradient change `y` (Nocedal &
+/// Wright §18.3; PORT's `DW7ZBF` damps the same way): `y` is blended toward `Bs` when
+/// `sᵀy < 0.2·sᵀBs`, so `B` stays positive definite and no update is skipped. Afterwards
+/// `B⁺s` equals the blended `y`.
+pub(crate) fn damped_bfgs_update(b: &mut DMatrix<f64>, s: &DVector<f64>, y: &DVector<f64>) {
+    let bs = &*b * s;
+    let sbs = s.dot(&bs);
+    if !(sbs > 0.0) {
+        return;
+    }
+    let sy = s.dot(y);
+    let theta = if sy >= 0.2 * sbs {
+        1.0
+    } else {
+        0.8 * sbs / (sbs - sy)
+    };
+    let r = y * theta + &bs * (1.0 - theta);
+    let sr = s.dot(&r);
+    if sr > 0.0 {
+        *b -= &bs * bs.transpose() / sbs;
+        *b += &r * r.transpose() / sr;
+    }
 }
 
 /// The exact solution of one trust-region subproblem (#2975), in scaled coordinates.
@@ -418,15 +572,23 @@ impl FoceiProblem<'_> {
     /// `grad(OFV) = 2 · Σᵢ dᵢ`, `dᵢ` each subject's total derivative (#2974): the EBE response
     /// included — a fixed-η̂ score drops the FOCEI `log|H̃|` response, and a gradient optimizer
     /// descending on it stalls above the minimum (warfarin FOCEI −276.6 instead of −286.0).
-    fn likelihood_gradient(&self, p: &[f64]) -> Vec<f64> {
+    /// Without the penalties, which the caller adds.
+    fn data_gradient(&self, p: &[f64]) -> Vec<f64> {
         let (_, _, per_subj) = self.compute_ad_grads(p);
-        let n = p.len();
-        let mut g = vec![0.0_f64; n];
+        let mut g = vec![0.0_f64; p.len()];
         for di in &per_subj {
-            for k in 0..n {
-                g[k] += 2.0 * di[k];
+            for (gk, dk) in g.iter_mut().zip(di) {
+                *gk += 2.0 * dk;
             }
         }
+        g
+    }
+
+    /// The penalized gradient the BHHH fallback models: [`Self::data_gradient`] plus the
+    /// penalties'. The tests pin it against finite differences of the objective.
+    #[cfg(test)]
+    fn likelihood_gradient(&self, p: &[f64]) -> Vec<f64> {
+        let mut g = self.data_gradient(p);
         // NN penalty gradient. NN weights are identity-packed, so a natural-space
         // weight coordinate is a packed coordinate and the raw-weight gradient
         // maps 1:1 into `g`. Its curvature goes into `hessian()` below.
@@ -436,38 +598,6 @@ impl FoceiProblem<'_> {
         // `p` is already the right space.
         self.priors.add_gradient(p, &mut g);
         g
-    }
-
-    /// The BHHH curvature `4 Σ dᵢdᵢᵀ` from the gradient's own rows (#2974) with the penalties'
-    /// exact curvature: what an iteration whose exact Hessian cannot be formed models the
-    /// objective with (#2975).
-    fn bhhh(&self, p: &[f64]) -> DMatrix<f64> {
-        let (_, _, per_subj) = self.compute_ad_grads(p);
-        let n = p.len();
-        let mut h = DMatrix::<f64>::zeros(n, n);
-        for gi in &per_subj {
-            for i in 0..n {
-                for j in 0..n {
-                    h[(i, j)] += 4.0 * gi[i] * gi[j];
-                }
-            }
-        }
-        // Covariate-NN penalty curvature: exact `2λ` on the L2 weight diagonal
-        // and the Gauss–Newton `2λ·Σ ∂C/∂w ∂C/∂wᵀ` for the curvature term. The
-        // gradient carries ∇P, so a quadratic model without this would predict
-        // zero curvature along every NN-weight direction under a large λ, ρ
-        // would read poor on each step and the radius would shrink for no
-        // reason. Both pieces are PSD, so the BHHH model stays PSD.
-        let params = unpack_params(p, self.init_params);
-        self.nn_reg
-            .add_packed_hessian(&params.theta, &mut |i, j, v| h[(i, j)] += v);
-        // Parameter-prior curvature (#254): the exact `2/s²` diagonal, not an
-        // approximation. Same reason it has to be here as the NN term — the
-        // gradient carries the prior's pull, so a quadratic model without its
-        // curvature would read every priored direction as flat and shrink the
-        // radius on steps that were fine. PSD, so the BHHH model stays PSD.
-        self.priors.add_hessian(&mut |i, j, v| h[(i, j)] += v);
-        h
     }
 }
 
@@ -660,13 +790,80 @@ pub(crate) fn optimize_trust_region_seeded(
     }
 
     let mut tr_budget_spent = false;
-    let (converged, best_x, n_iterations, final_gradient, held) = exact_trust_region(
-        &problem,
-        &x0,
-        &post_run_bounds,
-        options,
-        &mut tr_budget_spent,
-    );
+    let (mut converged, mut best_x, mut n_iterations, mut final_gradient, mut held) =
+        exact_trust_region(
+            &problem,
+            &x0,
+            &post_run_bounds,
+            options,
+            &mut tr_budget_spent,
+        );
+    // The NLopt leg's basin-shift restart (#1565, #2093), on its rules: a converged leg whose
+    // cold EBE re-solve scores more than `BASIN_SHIFT_ABS_TOL` below the objective it minimised
+    // held some subjects in a higher individual mode; resume from the same point with the cold
+    // EBEs, on the remaining budget, at most `MAX_BASIN_RESTARTS` times. A trust region takes few,
+    // large steps, so warm EBEs carried along it have fewer chances to drop into the lower mode
+    // than along L-BFGS's many short evaluations.
+    for _ in 0..crate::estimation::outer_optimizer::MAX_BASIN_RESTARTS {
+        if !converged
+            || n_iterations >= options.outer_maxiter
+            || crate::cancel::is_cancelled(&options.cancel)
+        {
+            break;
+        }
+        let params = unpack_params(&best_x, init_params);
+        let incumbent = score_final_ebes(
+            model,
+            population,
+            &params,
+            (held.etas.clone(), held.h_mats.clone(), held.kappas.clone()),
+            options,
+        );
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let cold_solve = crate::estimation::outer_optimizer::final_inner_solve(
+            model, population, &params, &mu_k, None, options,
+        );
+        let cold = score_final_ebes(
+            model,
+            population,
+            &params,
+            (cold_solve.etas, cold_solve.h_mats, cold_solve.kappas),
+            options,
+        );
+        if !(cold.3.is_finite()
+            && incumbent.3 - cold.3 > crate::estimation::outer_optimizer::BASIN_SHIFT_ABS_TOL)
+        {
+            break;
+        }
+        if options.verbose {
+            eprintln!(
+                "Trust region: cold EBEs score {:.6} below the objective it minimised ({:.6}); \
+                 resuming from the same point with them",
+                incumbent.3 - cold.3,
+                incumbent.3
+            );
+        }
+        warnings.push(
+            crate::estimation::outer_optimizer::basin_shift_restart_warning(cold.3, n_iterations),
+        );
+        *problem.cached_etas.lock().unwrap() = cold.0;
+        *problem.cached_etas_kind.lock().unwrap() = PrevEtas::ModesHere;
+        *problem.grad_cache.lock().unwrap() = None;
+        let mut leg_options = options.clone();
+        leg_options.outer_maxiter = options.outer_maxiter - n_iterations;
+        let (c, bx, it, fg, h) = exact_trust_region(
+            &problem,
+            &best_x,
+            &post_run_bounds,
+            &leg_options,
+            &mut tr_budget_spent,
+        );
+        converged = c;
+        best_x = bx;
+        n_iterations += it;
+        final_gradient = fg;
+        held = h;
+    }
     if crate::cancel::is_cancelled(&options.cancel) {
         warnings.push("Trust-region did not converge: cancelled by user".to_string());
     } else if !converged {
@@ -843,14 +1040,6 @@ mod tests {
         fn gradient(&self, p: &[f64]) -> Result<Vec<f64>, ()> {
             Ok(self.likelihood_gradient(p))
         }
-
-        #[cfg(feature = "nn")]
-        fn hessian(&self, p: &[f64]) -> Result<Vec<Vec<f64>>, ()> {
-            let h = self.bhhh(p);
-            Ok((0..h.nrows())
-                .map(|i| (0..h.ncols()).map(|j| h[(i, j)]).collect())
-                .collect())
-        }
     }
     // Production code goes through `pack_with_bounds` (#1252); these two are
     // still the clearest way for a test to build a box or a packed vector on
@@ -863,6 +1052,68 @@ mod tests {
     /// eigenvalue counts by its magnitude, so the step descends where plain Newton would climb.
     /// Mutations: a wrong bisection bracket leaves the step off the boundary; dropping `.abs()`
     /// makes the indefinite row ascend; a `½` dropped from the decrement fails the first row.
+    /// `|H|` is `H` on a positive-definite matrix and flips a negative eigenvalue, keeping its
+    /// eigenvector and magnitude. This is what makes the BFGS seed positive definite: with the
+    /// raw indefinite `H` every update along the negative direction has `sᵀBs < 0` and is
+    /// skipped, and the trust region crawled at ρ ≈ 1 for 9999 iterations (`syn_pcm_int`).
+    /// Mutations: dropping `.abs()` leaves the `−2` eigenvalue (the second assertion); dropping
+    /// the floor leaves a zero eigenvalue (the third).
+    #[test]
+    fn saddle_free_keeps_pd_curvature_and_flips_negative_curvature() {
+        let pd = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
+        assert!(
+            (saddle_free(&pd) - &pd).norm() < 1e-12,
+            "|H| = H on a PD matrix"
+        );
+        // Eigenvalues 3 and −2 on the basis (1, 1)/√2, (1, −1)/√2.
+        let ind = DMatrix::from_row_slice(2, 2, &[0.5, 2.5, 2.5, 0.5]);
+        let e = saddle_free(&ind).symmetric_eigen();
+        let mut lam: Vec<f64> = e.eigenvalues.iter().copied().collect();
+        lam.sort_by(f64::total_cmp);
+        assert!(
+            (lam[0] - 2.0).abs() < 1e-12 && (lam[1] - 3.0).abs() < 1e-12,
+            "{lam:?}"
+        );
+        let v = DVector::from_vec(vec![1.0, -1.0]) / 2f64.sqrt();
+        assert!(
+            (saddle_free(&ind) * &v - &v * 2.0).norm() < 1e-12,
+            "same eigenvector"
+        );
+        let singular = DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 0.0]);
+        let min = saddle_free(&singular).symmetric_eigen().eigenvalues.min();
+        assert!(min > 0.0 && min <= 1e-10, "floored at 1e-10·max|λ|: {min}");
+    }
+
+    /// Powell's damped BFGS: with ample curvature (`sᵀy ≥ 0.2·sᵀBs`) the update satisfies the
+    /// secant condition `B⁺s = y` exactly; with negative curvature (`sᵀy < 0`) it does not skip,
+    /// stays positive definite and puts `sᵀB⁺s` at exactly `0.2·sᵀBs`.
+    /// Mutations: removing the damping (θ = 1 always) makes `B⁺` indefinite in the second case;
+    /// skipping the update when `sᵀy ≤ 0` leaves `sᵀB⁺s = sᵀBs`; a wrong blend constant moves
+    /// the `0.2`.
+    #[test]
+    fn damped_bfgs_meets_the_secant_condition_and_stays_positive_definite() {
+        let b0 = DMatrix::from_row_slice(2, 2, &[2.0, 0.3, 0.3, 1.0]);
+        let s = DVector::from_vec(vec![0.4, -0.2]);
+        let y = DVector::from_vec(vec![1.1, 0.1]);
+        assert!(s.dot(&y) >= 0.2 * s.dot(&(&b0 * &s)));
+        let mut b = b0.clone();
+        damped_bfgs_update(&mut b, &s, &y);
+        assert!((&b * &s - &y).norm() < 1e-12, "secant: B⁺s = y");
+        let y_neg = DVector::from_vec(vec![-0.5, 0.2]);
+        assert!(s.dot(&y_neg) < 0.0);
+        let mut b = b0.clone();
+        damped_bfgs_update(&mut b, &s, &y_neg);
+        assert!(
+            b.clone().symmetric_eigen().eigenvalues.min() > 0.0,
+            "stays PD"
+        );
+        let sbs0 = s.dot(&(&b0 * &s));
+        assert!(
+            (s.dot(&(&b * &s)) - 0.2 * sbs0).abs() < 1e-12,
+            "damped to 0.2·sᵀBs"
+        );
+    }
+
     #[test]
     fn the_subproblem_is_solved_exactly_and_saddle_free() {
         let h = DMatrix::from_row_slice(2, 2, &[4.0, 1.0, 1.0, 3.0]);
@@ -1331,82 +1582,6 @@ mod tests {
             );
             if !(w_lo..w_hi).contains(&k) {
                 assert_eq!(pen_grad[k], 0.0, "penalty gradient leaked to coord {k}");
-            }
-        }
-
-        // Hessian seam: H(λ) − H(0) must be exactly the regularizer's own packed
-        // Hessian (index placement into the `Vec<Vec<f64>>` the trust region
-        // consumes), confined to the NN block. The kernel itself — Gauss–Newton
-        // for the curvature term, exact for L2 — is pinned against FD of the
-        // penalty gradient in `nn::regularization_tests`, where it is cheap;
-        // here the point is that `hessian()` carries it at all, at the right
-        // indices, and adds nothing anywhere else.
-        let h_pen: Vec<Vec<f64>> = {
-            let hl = fresh(&model, &population, init, &options)
-                .hessian(&x)
-                .unwrap();
-            let h0 = fresh(&model, &population, init, &zero).hessian(&x).unwrap();
-            hl.iter()
-                .zip(&h0)
-                .map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect())
-                .collect()
-        };
-        let mut expected = vec![vec![0.0; x.len()]; x.len()];
-        let theta = unpack_params(&x, init).theta;
-        crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options)
-            .add_packed_hessian(&theta, &mut |i, j, v| expected[i][j] += v);
-        assert!(
-            (w_lo..w_hi).any(|k| expected[k][k] > 0.0),
-            "penalty Hessian must be live on the NN block"
-        );
-        for k in 0..x.len() {
-            for j in 0..x.len() {
-                if !((w_lo..w_hi).contains(&k) && (w_lo..w_hi).contains(&j)) {
-                    assert_eq!(h_pen[k][j], 0.0, "penalty Hessian leaked to ({k}, {j})");
-                }
-                assert!(
-                    (h_pen[k][j] - expected[k][j]).abs() <= 1e-9 * (1.0 + expected[k][j].abs()),
-                    "penalty Hessian ({k}, {j}): hessian() diff {} vs regularizer {}",
-                    h_pen[k][j],
-                    expected[k][j]
-                );
-            }
-        }
-        // …and with the curvature term off, the L2 block is exact: `2λ` on weight
-        // entries, `0` on biases, nothing off-diagonal.
-        let l2_only = mk_options(3e-2, 0.0);
-        let hl2: Vec<Vec<f64>> = {
-            let hl = fresh(&model, &population, init, &l2_only)
-                .hessian(&x)
-                .unwrap();
-            let h0 = fresh(&model, &population, init, &zero).hessian(&x).unwrap();
-            hl.iter()
-                .zip(&h0)
-                .map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect())
-                .collect()
-        };
-        let weight_idx: std::collections::HashSet<usize> = nn
-            .mapper
-            .mlp()
-            .weight_param_indices()
-            .into_iter()
-            .map(|i| w_lo + i)
-            .collect();
-        for k in 0..x.len() {
-            for j in 0..x.len() {
-                let expect = if k == j && weight_idx.contains(&k) {
-                    2.0 * 3e-2
-                } else {
-                    0.0
-                };
-                // 1e-8 absolute: the BHHH likelihood part cancels between the two
-                // `hessian()` calls only up to rayon reduction-order noise (~1e-12
-                // on entries of O(1e3)); the L2 term itself is exact.
-                assert!(
-                    (hl2[k][j] - expect).abs() < 1e-8,
-                    "L2 Hessian ({k}, {j}): {} vs {expect}",
-                    hl2[k][j]
-                );
             }
         }
     }

@@ -3924,7 +3924,7 @@ pub(crate) fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
 /// problem the two solves agree to the inner loop's precision (the #1565 MM fixture's
 /// 195 untrapped subjects agreed to 1e-4 each), so 0.05 sits well above that noise and
 /// two orders of magnitude below the 88-unit gap it exists to catch.
-const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
+pub(crate) const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 
 /// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
 /// — a logarithmic number of cold passes per leg, none before the trajectory has had a
@@ -6125,7 +6125,7 @@ pub(crate) mod forced_stop_at_start {
 /// How many basin-shift restarts [`optimize_nlopt`] runs at most after the first (#2093).
 /// Each must be adopted and the legs share the fit's budget, so this only bounds the work
 /// on a fit whose warm EBEs keep re-trapping.
-const MAX_BASIN_RESTARTS: usize = 3;
+pub(crate) const MAX_BASIN_RESTARTS: usize = 3;
 
 /// Restart a run that stopped mid-descent from the best point it reached, and
 /// report whichever attempt ended lower (#1277).
@@ -9766,7 +9766,7 @@ fn mid_descent_restart_warning(
 /// files it under `optimizer_health` with the #1277 notice: the gap itself was
 /// resolved (had it survived, the restart's own `W_EBE_START_DEPENDENT` would say so),
 /// so what remains to report is that the fit took a second leg, and why.
-fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> String {
+pub(crate) fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> String {
     format!(
         "Outer optimization had minimised against empirical Bayes estimates that some \
          subjects held in a higher individual mode than a cold re-solve finds (cold OFV = \

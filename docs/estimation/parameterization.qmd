@@ -325,9 +325,9 @@ start (no faster), a scale bounded below by the diagonal Newton step (fixes thes
 others more), seeding L-BFGS with the full exact start Hessian (slower, and its bound handling
 broke fits), and a closed-form Newton step on every variance before the start (fixes them in
 iterations, costs more wall time on the larger models than it saves). `optimizer = trust_region`
-— a Newton method that re-forms the exact Hessian every iteration ([How `trust_region`
-works](optimizers.qmd#trust-region-method)) — is not affected: 17, 19 and 39 iterations on the
-three.
+— which models the objective on the exact Hessian ([How `trust_region`
+works](optimizers.qmd#trust-region-method)) — handles all three in fewer iterations than the
+magnitude rules.
 
 ## Bounds
 

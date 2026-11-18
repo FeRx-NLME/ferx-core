@@ -1054,7 +1054,7 @@ NONMEM comparison.
 | `lbfgs` | **Deprecated alias** → `nlopt_lbfgs` | — (was the built-in L-BFGS; see [#483](https://github.com/FeRx-NLME/ferx-core/issues/483)) |
 | `bfgs` | **Deprecated alias** → `nlopt_lbfgs` | — (was the built-in BFGS) |
 | `mma` | Method of Moving Asymptotes (NLopt) | Constrained problems |
-| `trust_region` | Newton trust-region with Steihaug CG subproblem (argmin) | Well-conditioned problems where second-order curvature helps convergence |
+| `trust_region` | Trust-region quasi-Newton on exact second-order information (a modified PORT / `nlminb`; [details](../estimation/optimizers.qmd#trust-region-method)) | Poor starting values; large models where the exact Hessian is cheap |
 
 Notes:
 - `auto` (the default) chooses between `nlopt_lbfgs` and `bobyqa` from the model:

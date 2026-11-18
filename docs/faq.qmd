@@ -143,10 +143,10 @@ Reach for a different optimizer when the default misbehaves:
   analytical PK models with many parameters. Can stall above the true minimum
   on ill-conditioned fits unless paired with `reconverge_gradient_interval = 1`
   (5–6× cost per gradient).
-- **`trust_region`** — a scaled trust-region Newton on the exact Hessian
-  (#2975): about a fifth of L-BFGS's iterations, each one exact Hessian. Robust
-  from poor starting values; on ODE models slower in wall time than
-  `nlopt_lbfgs`, because an exact Hessian costs several gradients there. See
+- **`trust_region`** — a trust-region quasi-Newton on exact second-order
+  information (#2975; a modified PORT / `nlminb`): about 0.4× L-BFGS's
+  iterations and about five exact Hessians per fit. The most robust from poor
+  starting values; fast where the exact Hessian is cheap (#2980). See
   [How `trust_region` works](estimation/optimizers.qmd#trust-region-method).
 - **`nlopt_lbfgs`** — gradient-based L-BFGS; what `auto` already picks when the
   analytic gradient is available. `lbfgs` and `bfgs` are deprecated aliases for it.
@@ -305,7 +305,7 @@ Both produce IPRED, PRED, IWRES, and CWRES on the log scale (back-transform with
 
 **`slsqp`** is the right pick when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can take many quadratic-interpolation samples to triangulate a high-dimensional surface). Pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
 
-**`trust_region`** takes the fewest iterations of any optimizer and is the most robust from poor starting values (a variance started far from its estimate, a θ that must travel far); each iteration costs one exact Hessian, so on ODE models it is slower in wall time than the default.
+**`trust_region`** takes the fewest iterations of the gradient-based optimizers and is the most robust from poor starting values (a variance started far from its estimate, a θ that must travel far). It spends about five exact Hessians per fit, so its speed against the default depends on what an exact Hessian costs on the model (#2980).
 
 **`gn` / `gn_hybrid`** for fast iteration during model development: Gauss-Newton converges in 10–30 steps vs 100+ for gradient methods. `gn_hybrid` adds a FOCEI polish pass for robustness; that polish stage uses the configured `optimizer` (default `auto`).
 

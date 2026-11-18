@@ -67,44 +67,51 @@ aliases for `nlopt_lbfgs`. The built-in implementation is slated for removal.
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `trust_region` | Scaled trust-region Newton on the exact Hessian | Each iteration forms the exact gradient and Hessian of the objective (the covariance step's R-matrix) at the current estimates, and solves the trust-region subproblem exactly. Few iterations, but each costs one exact Hessian. See [below](#trust-region-method). |
+| `trust_region` | Trust-region quasi-Newton on exact second-order information (a modified PORT / `nlminb`) | Exact gradient every iteration; a BFGS model seeded with, refreshed from, and certified on the exact Hessian (the covariance step's R-matrix). About 0.4× the iterations of L-BFGS. See [below](#trust-region-method). |
 
 ### How `trust_region` works {#trust-region-method}
 
-Every iteration (#2975):
+It is the model/trust-region method of the PORT library behind R's `nlminb` (Dennis, Gay &
+Welsch 1981; Gay 1983) with exact second-order information where PORT has none (#2975):
 
-1. The EBEs (and, under IOV, the κ̂) are re-solved at the current estimates, and the exact
-   gradient $g$ and Hessian $H$ of the penalized OFV are formed from them — the same exact
-   derivatives the covariance step's R-matrix uses.
-2. Coordinates sitting on a bound with the gradient pushing outward are held for the step.
-3. The step is measured in the scaled norm $\lVert D s\rVert$, with
-   $D = \sqrt{\operatorname{diag}|H|}$ kept at its running maximum (Moré's scaling): the
-   same per-coordinate curvature scale the [L-BFGS scaling](parameterization.qmd#outer-curvature-scaling)
-   uses, so a coordinate that must travel far is not held back by a ball sized for the others.
-4. In those coordinates the Hessian is made saddle-free ($|H|$: absolute eigenvalues), and the
-   subproblem $\min_s g^\top s + \tfrac12 s^\top |H| s$, $\lVert D s\rVert \le \Delta$, is solved
-   exactly on the eigenbasis — not by truncated conjugate gradients, which stop short of the
-   Newton step on an ill-conditioned problem.
-5. The step is projected onto the box and accepted when the objective falls; the radius
-   $\Delta$ grows on a good prediction and shrinks on a poor one.
+1. **Model.** $m(s) = f + g^\top s + \tfrac12 s^\top B s$, with $g$ the exact gradient at the
+   current EBEs (and κ̂ under IOV). $B$ starts as the exact Hessian made saddle-free, $|H|$
+   (absolute eigenvalues), and is updated by Powell-damped BFGS from the change in $g$ along each
+   step. A positive-definite start matters: an indefinite one skips every update along its
+   negative directions, and the fit crawls.
+2. **Exact refresh.** $B$ is replaced by a fresh exact $|H|$ when a step was predicted poorly
+   (actual-to-predicted ratio below ¼) and when the set of coordinates held at a bound changes,
+   since the secant curvature was learned in the old subspace.
+3. **Step.** Coordinates on a bound with the gradient pushing outward are held. The subproblem
+   $\min_s g^\top s + \tfrac12 s^\top B s$, $\lVert D s\rVert \le \Delta$, is solved exactly on
+   $B$'s eigenbasis, with $D = \sqrt{\operatorname{diag} B}$ at its running maximum (Moré's
+   scaling, as in PORT). The step is projected onto the box and accepted when the objective falls.
+4. **Stop.** When the model's Newton decrement $\tfrac12 g^\top B^{-1} g$ falls to $10^{-6}$, a
+   fresh exact Hessian certifies it: the fit stops only on the exact decrement.
+5. **Basin shift.** A converged leg re-solves the EBEs cold. If that scores more than 0.05 below
+   the objective it minimised, some subjects sat in a higher individual mode, and the trust
+   region resumes from the same point with the cold EBEs: the rules `nlopt_lbfgs` uses (#1565).
 
-IOV models are supported (#2975): the inner solves, the exact Hessian and the final EBE check
-carry each subject's κ̂. The quadrature objectives (`laplace`, `focei` with `n_agq > 1`) are
-still refused (`E_OPTIMIZER_AGQ`).
+Where the exact Hessian cannot be formed at an iterate, BHHH from each subject's exact total
+derivative ([#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)) stands in for that
+iteration (non-IOV models). IOV models are supported. The quadrature objectives (`laplace`,
+`focei` with `n_agq > 1`) are still refused (`E_OPTIMIZER_AGQ`). `steihaug_max_iters` has no
+effect.
 
-It stops when the exact Newton decrement $\tfrac12 g^\top |H|^{-1} g$ — the objective drop the
-next Newton step predicts — is at most $10^{-6}$. An iteration whose exact Hessian cannot be
-formed (a subject's EBE does not re-converge there) uses BHHH, `4 Σ dᵢdᵢᵀ` from each subject's
-exact total derivative ([#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)), for that step. `steihaug_max_iters` no longer has an effect.
+Measured (#2975; FOCEI, 26 bundled and synthetic models) against `nlopt_lbfgs` with
+[curvature scaling](parameterization.qmd#outer-curvature-scaling):
 
-Measured (#2975; FOCEI, 26 bundled and synthetic models, 5 perturbed starts each, against
-`nlopt_lbfgs` before #2975): about a fifth of the iterations and half the EBE solves, every
-model faster in both, no fit ending above the best OFV. Wall time is another matter: an exact
-Hessian is $n$ Hessian-vector passes, so on an ODE model an iteration costs several L-BFGS
-evaluations — `transit_2cpt` takes 12 iterations against L-BFGS's 43 and three times the wall
-time. On closed-form models the two are about level. `auto` therefore keeps `nlopt_lbfgs`.
+- **Iterations:** 0.38× L-BFGS before #2975, typically, and fewer on every model. About five
+  exact Hessians per fit.
+- **Robustness:** no fit above the best OFV on 130 runs from perturbed starts, nor on 104 from
+  starts off by 2× in θ or 10× in Ω and σ. `nlopt_lbfgs` ended 3 of those 104 at a worse point
+  it reported as converged.
+- **Cost:** it is limited by the exact Hessian. With the structured exact Hessian of #2980 it
+  took 13% fewer CPU cycles than `nlopt_lbfgs` over the 26 models, and fewer on every large one.
+  Without it, an ODE model's Hessian costs about 16 evaluations, and `trust_region` took 1.7×
+  the cycles of `nlopt_lbfgs` on `transit_2cpt`.
 
-A run that spends `maxiter`, or whose radius collapses without the decrement falling to the
+A run that spends `maxiter`, or whose radius collapses before the exact decrement falls to the
 tolerance, is reported as **`Converged: NO`**, with a warning naming the reason and the final
 gradient norm.
 
@@ -116,7 +123,7 @@ gradient norm.
 
 **`slsqp`** — switch to this when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can need many quadratic-interpolation samples to triangulate a high-dimensional surface). Gradient-based, handles box constraints cleanly; pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
 
-**`trust_region`** — for models with many parameters (large θ + Ω) or when combined with `inits_from_nca`. The second-order curvature information helps when starting values are already in the basin.
+**`trust_region`** — the most robust choice when starts may be far off, and the fastest on large models once the exact Hessian is cheap (#2980). It needs the exact Hessian's scope (closed-form, compartment-free and `[odes]` models, FOCE / FOCEI, IOV included).
 
 **`gn` / `gn_hybrid`** — these are [Gauss-Newton estimation methods](gauss-newton.qmd), not outer optimizers in the same sense. They replace the FOCE outer loop entirely rather than selecting an algorithm within it. (`gn_hybrid` polishes via FOCEI and inherits the `optimizer` setting for that stage — so the polish runs with the `auto`-selected optimizer unless overridden.)
 

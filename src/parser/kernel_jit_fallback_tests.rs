@@ -196,8 +196,12 @@ fn gauss_newton_and_trust_region_fall_back_to_fd() {
         ..opts(EstimationMethod::FoceI)
     };
     let (e, f) = pair(&m, &p, &o);
-    // Measured 1.8e-5 / 3.7e-7 / 4.0e-4.
-    check("trust-region", &e, &f, [2e-4, 4e-6, 3e-3]);
+    // Measured 4.2e-3 / 4.5e-5 / 6.0e-4 (#2975). The trust region models with the exact Hessian;
+    // with every plan failing it models with the finite-difference Hessian of the same objective
+    // (`fd_candidate_hessian`), one rule at two precisions. Three iterations from the start
+    // (gradient norm ~155), the steps differ by that precision. A different model on the
+    // fallback (it used BHHH before) puts the forced fit 50 OFV away.
+    check("trust-region", &e, &f, [1e-2, 1e-4, 3e-3]);
 }
 
 #[test]

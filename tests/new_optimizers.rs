@@ -500,3 +500,79 @@ fn trust_region_reaches_the_default_optimum_on_an_iov_model() {
         reference.ofv
     );
 }
+
+/// #2975, Tier 3: the trust region's basin-shift restart. From every θ at half its start
+/// value, `two_cpt_oral_cov` carries four subjects' EBEs in a higher individual mode along the
+/// trust region's few, large steps; the leg converges (exact decrement ~5e-10) about 22 OFV
+/// above the optimum, where a cold re-solve scores lower. The restart chain (the NLopt leg's
+/// #1565 / #2093 rules) must resume with the cold EBEs and reach the default optimizer's optimum
+/// from the same start, and say it resumed.
+/// Regression it catches: without the chain the fit ends at −1176.8 against −1199.3, reported
+/// not converged (`W_EBE_START_DEPENDENT`).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn trust_region_resumes_with_cold_ebes_after_a_basin_shift() {
+    let model = parse_model_file(Path::new("examples/two_cpt_oral_cov.ferx"))
+        .expect("two_cpt_oral_cov must parse");
+    let population = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+        .expect("two_cpt_oral_cov data must load");
+    let mut start = model.default_params.clone();
+    for (i, t) in start.theta.iter_mut().enumerate() {
+        *t = (*t * 0.5).clamp(start.theta_lower[i], start.theta_upper[i]);
+    }
+    let mut opts = base_options();
+    opts.method = EstimationMethod::FoceI;
+    opts.optimizer = Optimizer::TrustRegion;
+    opts.outer_maxiter = 300;
+    let tr = fit(&model, &population, &start, &opts).expect("trust_region fit");
+    opts.optimizer = Optimizer::Auto;
+    let reference = fit(&model, &population, &start, &opts).expect("reference");
+    assert!(
+        tr.ofv < reference.ofv + 1e-3,
+        "trust_region {} vs default {} (warnings {:?})",
+        tr.ofv,
+        reference.ofv,
+        tr.warnings
+    );
+    assert!(tr.converged, "warnings {:?}", tr.warnings);
+    assert!(
+        tr.warnings
+            .iter()
+            .any(|w| w.contains("resumed from the best point seen with cold EBEs")),
+        "the fit must report the restart: {:?}",
+        tr.warnings
+    );
+}
+
+/// #2975, Tier 3: the trust region re-models on the exact Hessian when the set of coordinates
+/// free of their bounds changes. `bioavailability` starts at OFV 7.6e6 and pins coordinates to
+/// their bounds one after another on the way in. Without the refresh, the BFGS model carried
+/// curvature learned in the larger subspace (model decrement 2.5 where the exact one was 121) and
+/// 2 of 5 starts converged to the second minimum at OFV 1104.4 instead of 647.3. The default
+/// start was one of them.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn trust_region_remodels_when_the_free_set_changes() {
+    let model = parse_model_file(Path::new("examples/bioavailability.ferx"))
+        .expect("bioavailability must parse");
+    let population = read_nonmem_csv(Path::new("data/bioavailability.csv"), None, None)
+        .expect("bioavailability data must load");
+    let mut opts = base_options();
+    opts.method = EstimationMethod::FoceI;
+    opts.optimizer = Optimizer::TrustRegion;
+    opts.outer_maxiter = 500;
+    let tr = fit(&model, &population, &model.default_params, &opts).expect("trust_region fit");
+    assert!(tr.converged, "warnings {:?}", tr.warnings);
+    // The two minima are 457 OFV apart, so any bound well inside that gap separates them.
+    assert!(
+        (tr.ofv - 647.343).abs() < 0.01,
+        "trust_region must reach the global minimum 647.343, got {}",
+        tr.ofv
+    );
+}

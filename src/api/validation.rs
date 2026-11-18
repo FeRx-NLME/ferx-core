@@ -6897,8 +6897,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // `pop_nll_opts`. Only the *gradient* differs: `optimize_nlopt` and `optimize_bfgs` both
     // go through `population_gradient`, which branches on `agq_nodes()` and hands the job to
     // `agq::agq_population_gradient`. The trust-region path forms its own exact gradient and
-    // Hessian (`covariance::exact_candidate_hessian`, and BHHH from
-    // `trust_region::FoceiProblem` as a fallback) with no such branch.
+    // Hessian (`covariance::exact_candidate_hessian`, and its finite-difference twin
+    // `covariance::fd_candidate_hessian` out of the exact scope) with no such branch.
     //
     // That mismatch does not fail loudly. `FitOptions::agq_nodes` and `population_gradient`
     // both spell out what it does instead: "an outer loop minimising the AGQ objective while
