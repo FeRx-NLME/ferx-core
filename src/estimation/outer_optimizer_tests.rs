@@ -8867,13 +8867,13 @@ pub(crate) mod outer_fd_fallback {
         }
     }
 
-    // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
-
     /// #2776: once the fit is cancelled, the reconverged FD gradients' probes are missing,
     /// not solved. Their re-solves do not poll the flag, so before this the #2406 gate grew a
     /// floored step through every one of them. On fixture A (`BETA` declared at `1e-4`, so
-    /// the gate runs), each of the three gradients returns the live gradient with no flag
-    /// and solves nothing (an all-zero gradient) with the flag already set.
+    /// the gate runs), each of the three gradients returns the live gradient with no flag,
+    /// solves nothing (an all-zero gradient) with the flag already set, and, with the cancel
+    /// landing partway, keeps the coordinates it finished bit for bit and zeroes the rest:
+    /// none is made up from one live probe and one missing one.
     #[test]
     fn a_cancelled_fd_gradient_solves_no_probe() {
         let (model, pop) = two_cpt_cov_beta(1e-4, 0.68 - 1e-4);
@@ -8885,10 +8885,10 @@ pub(crate) mod outer_fd_fallback {
             interaction: true,
             ..FitOptions::default()
         };
-        let flag = crate::cancel::CancelFlag::new();
-        flag.cancel();
-        let cancelled = FitOptions {
-            cancel: Some(flag),
+        // A fresh flag per gradient: `trip_after(0)` is cancelled from the first poll, and
+        // `trip_after(6)` after six probes.
+        let with = |flag: Option<fn() -> crate::cancel::CancelFlag>| FitOptions {
+            cancel: flag.map(|f| f()),
             ..live.clone()
         };
         crate::api::with_fit_scope(&live, || {
@@ -8897,11 +8897,29 @@ pub(crate) mod outer_fd_fallback {
                 run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
             let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &live);
             let priors = build_prior_set(&model, params);
-            let grads = |o: &FitOptions| {
+            let grads = |flag: Option<fn() -> crate::cancel::CancelFlag>| {
                 [
-                    reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, o),
+                    reconverged_fd_gradient(
+                        &x,
+                        params,
+                        &model,
+                        &pop,
+                        &ehs,
+                        &kappas,
+                        &bounds,
+                        &with(flag),
+                    ),
                     reporting_fd_gradient(
-                        &x, params, &model, &pop, &ehs, &kappas, &bounds, o, &nn_reg, &priors,
+                        &x,
+                        params,
+                        &model,
+                        &pop,
+                        &ehs,
+                        &kappas,
+                        &bounds,
+                        &with(flag),
+                        &nn_reg,
+                        &priors,
                     ),
                     subject_reconverged_fd_gradient(
                         &x,
@@ -8910,12 +8928,18 @@ pub(crate) mod outer_fd_fallback {
                         &pop.subjects[0],
                         &ehs[0],
                         &bounds,
-                        o,
+                        &with(flag),
                     ),
                 ]
             };
             let names = ["population", "reporting", "per-subject"];
-            for ((name, g), c) in names.iter().zip(grads(&live)).zip(grads(&cancelled)) {
+            let (lives, cuts, parts) = (
+                grads(None),
+                grads(Some(|| crate::cancel::CancelFlag::trip_after(0))),
+                grads(Some(|| crate::cancel::CancelFlag::trip_after(6))),
+            );
+            for (k, name) in names.iter().enumerate() {
+                let (g, c, p) = (&lives[k], &cuts[k], &parts[k]);
                 assert!(
                     g.iter().any(|v| *v != 0.0),
                     "fixture: {name} gradient is live"
@@ -8924,10 +8948,22 @@ pub(crate) mod outer_fd_fallback {
                     c.iter().all(|v| *v == 0.0),
                     "{name}: a probe ran after the cancel: {c:?}"
                 );
+                let kept = |a: &f64, b: &f64| a.to_bits() == b.to_bits();
+                assert!(
+                    p.iter().zip(g).all(|(a, b)| kept(a, b) || *a == 0.0),
+                    "{name}: a value made up after the cancel: {p:?} vs {g:?}"
+                );
+                assert!(
+                    p.iter().zip(g).any(|(a, b)| *b != 0.0 && kept(a, b))
+                        && p.iter().zip(g).any(|(a, b)| *b != 0.0 && *a == 0.0),
+                    "fixture: the cancel lands partway through {name}: {p:?} vs {g:?}"
+                );
             }
         })
         .expect("the fit scope runs");
     }
+
+    // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
 }
 
 // ── #1934: the BHHH Newton decrement and the latch-time veto ───────────────────────
