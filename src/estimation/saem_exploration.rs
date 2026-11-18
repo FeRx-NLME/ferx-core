@@ -10,12 +10,14 @@
 //!
 //! # The stop rule
 //!
-//! Monolix ends the phase by a convergence test, between a minimum of 150 and a
-//! maximum of 500 iterations; NONMEM's SAEM burn-in stops (`CTYPE`, `CITER`,
-//! `CALPHA`) when a linear regression of each monitored quantity on the
-//! iteration number over a trailing window has a slope that is not
-//! significantly non-zero. This module is that test with the one correction the
-//! statistics demand: SAEM trajectories are **autocorrelated** (θ is the
+//! Monolix ends the phase by an automatic stop (on by default), between a
+//! minimum of 150 and a maximum of 500 iterations, watching the complete-data
+//! log-likelihood, Ω and the error-model parameters. NONMEM can end its SAEM
+//! burn-in early (`CTYPE` = 1–3, `CITER`, `CALPHA`, `CINTERVAL`) when a linear
+//! regression of each monitored quantity on the iteration number over a trailing
+//! window has a slope that is not significantly non-zero; its default
+//! (`CTYPE = 0`) has no test and runs the whole `NBURN`. This module is that
+//! test with the one correction the statistics demand: SAEM trajectories are **autocorrelated** (θ is the
 //! M-step of a Markov chain; Ω is further smoothed by the exploration step cap
 //! `γ_Ω ≤ OMEGA_SA_MAX_STEP = 0.1`, an exponential filter with a time constant
 //! of 10 iterations), and an ordinary least-squares standard error treats the
@@ -35,7 +37,9 @@
 //! the rule stop *sooner*, the wrong direction for a rule whose failure is
 //! stopping early; the maximum bounds the cost of the opposite error.
 //!
-//! Tracked coordinates (scale-free in the test): log Ω_jj, the correlations
+//! Tracked coordinates (scale-free in the test): the complete-data −log L
+//! (Σᵢ −log p(yᵢ, ηᵢ; θ, Ω, σ), Monolix's "convergence indicator"; NONMEM's
+//! `CTYPE` tests also include the objective), log Ω_jj, the correlations
 //! Ω_jk/√(Ω_jjΩ_kk), log σ, and θ. A series that is exactly constant (fixed
 //! parameters, structural zeros) cannot drift.
 
@@ -163,15 +167,19 @@ impl ExplorationMonitor {
     }
 }
 
-/// The tracked coordinates of one iterate: θ, log Ω_jj, correlations, log σ
-/// (and the same for Ω_IOV when present).
+/// The tracked coordinates of one iterate: the complete-data −log L, θ,
+/// log Ω_jj, correlations (and the same for Ω_IOV when present), log σ.
+/// [`exploration_coord_names`] names them in the same order.
 pub(crate) fn exploration_coords(
+    complete_nll: f64,
     theta: &[f64],
     omega: &DMatrix<f64>,
     omega_iov: Option<&DMatrix<f64>>,
     sigma: &[f64],
 ) -> Vec<f64> {
-    let mut out: Vec<f64> = theta.to_vec();
+    let mut out: Vec<f64> = Vec::with_capacity(1 + theta.len() + sigma.len());
+    out.push(complete_nll);
+    out.extend_from_slice(theta);
     for m in std::iter::once(omega).chain(omega_iov) {
         let n = m.nrows();
         for j in 0..n {
@@ -186,6 +194,50 @@ pub(crate) fn exploration_coords(
     }
     out.extend(sigma.iter().map(|s| s.abs().max(1e-300).ln()));
     out
+}
+
+/// Names of the coordinates [`exploration_coords`] returns, in its order, for
+/// the maximum-reached warning.
+pub(crate) fn exploration_coord_names(
+    theta: &[String],
+    eta: &[String],
+    kappa: Option<&[String]>,
+    sigma: &[String],
+) -> Vec<String> {
+    let mut out = vec!["complete-data -logL".to_string()];
+    out.extend(theta.iter().cloned());
+    for (label, names) in std::iter::once(("OMEGA", eta)).chain(kappa.map(|k| ("OMEGA_IOV", k))) {
+        for n in names {
+            out.push(format!("{label}({n})"));
+        }
+        for j in 0..names.len() {
+            for k in 0..j {
+                out.push(format!("corr {label}({},{})", names[k], names[j]));
+            }
+        }
+    }
+    out.extend(sigma.iter().map(|n| format!("SIGMA({n})")));
+    out
+}
+
+/// Comma-separated names of the drifting coordinates, at most `max_listed`,
+/// then "and N more". An index without a name is printed as `#i`. Empty
+/// `drifting` at the maximum means the trend window never filled.
+pub(crate) fn drifting_summary(drifting: &[usize], names: &[String], max_listed: usize) -> String {
+    if drifting.is_empty() {
+        return format!(
+            "not tested, the maximum is shorter than the {TREND_WINDOW}-iteration trend window"
+        );
+    }
+    let mut parts: Vec<String> = drifting
+        .iter()
+        .take(max_listed)
+        .map(|&i| names.get(i).cloned().unwrap_or_else(|| format!("#{i}")))
+        .collect();
+    if drifting.len() > max_listed {
+        parts.push(format!("and {} more", drifting.len() - max_listed));
+    }
+    parts.join(", ")
 }
 
 #[cfg(test)]

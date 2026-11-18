@@ -178,16 +178,60 @@ fn bounds_precedence_explicit_length_overrides_the_automatic_stop() {
 #[test]
 fn tracked_coordinates_are_log_variance_correlation_and_log_sigma() {
     let omega = DMatrix::from_row_slice(2, 2, &[0.04, 0.012, 0.012, 0.09]);
-    let c = exploration_coords(&[1.5, -2.0], &omega, None, &[0.2]);
+    let c = exploration_coords(-812.5, &[1.5, -2.0], &omega, None, &[0.2]);
     let corr = 0.012 / (0.04_f64 * 0.09).sqrt();
-    assert_eq!(c.len(), 2 + 2 + 1 + 1);
-    assert_eq!(&c[..2], &[1.5, -2.0]);
-    assert!((c[2] - 0.04_f64.ln()).abs() < 1e-14);
-    assert!((c[3] - 0.09_f64.ln()).abs() < 1e-14);
-    assert!((c[4] - corr).abs() < 1e-14);
-    assert!((c[5] - 0.2_f64.ln()).abs() < 1e-14);
+    assert_eq!(c.len(), 1 + 2 + 2 + 1 + 1);
+    // The complete-data −log L leads (Monolix's convergence indicator).
+    assert_eq!(c[0], -812.5);
+    assert_eq!(&c[1..3], &[1.5, -2.0]);
+    assert!((c[3] - 0.04_f64.ln()).abs() < 1e-14);
+    assert!((c[4] - 0.09_f64.ln()).abs() < 1e-14);
+    assert!((c[5] - corr).abs() < 1e-14);
+    assert!((c[6] - 0.2_f64.ln()).abs() < 1e-14);
     // IOV block appended after the BSV block, before sigma.
     let iov = DMatrix::from_row_slice(1, 1, &[0.5]);
-    let c = exploration_coords(&[], &omega, Some(&iov), &[0.2]);
+    let c = exploration_coords(0.0, &[], &omega, Some(&iov), &[0.2]);
     assert!((c[c.len() - 2] - 0.5_f64.ln()).abs() < 1e-14);
+}
+
+#[test]
+fn coordinate_names_follow_the_coordinate_order() {
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let theta = s(&["TVCL", "TVV"]);
+    let eta = s(&["ETA_CL", "ETA_V", "ETA_KA"]);
+    let kappa = s(&["KAPPA_CL"]);
+    let sigma = s(&["PROP"]);
+    let names = exploration_coord_names(&theta, &eta, Some(&kappa), &sigma);
+    let omega = DMatrix::from_diagonal_element(3, 3, 0.1);
+    let iov = DMatrix::from_diagonal_element(1, 1, 0.1);
+    let coords = exploration_coords(0.0, &[1.0, 2.0], &omega, Some(&iov), &[0.1]);
+    assert_eq!(names.len(), coords.len());
+    assert_eq!(
+        names,
+        s(&[
+            "complete-data -logL",
+            "TVCL",
+            "TVV",
+            "OMEGA(ETA_CL)",
+            "OMEGA(ETA_V)",
+            "OMEGA(ETA_KA)",
+            "corr OMEGA(ETA_CL,ETA_V)",
+            "corr OMEGA(ETA_CL,ETA_KA)",
+            "corr OMEGA(ETA_V,ETA_KA)",
+            "OMEGA_IOV(KAPPA_CL)",
+            "SIGMA(PROP)",
+        ])
+    );
+}
+
+#[test]
+fn drifting_summary_names_caps_and_explains_an_unfilled_window() {
+    let names: Vec<String> = (0..12).map(|i| format!("p{i}")).collect();
+    assert_eq!(drifting_summary(&[3, 7], &names, 8), "p3, p7");
+    assert_eq!(
+        drifting_summary(&[0, 1, 2], &names, 2),
+        "p0, p1, and 1 more"
+    );
+    assert_eq!(drifting_summary(&[20], &names, 8), "#20");
+    assert!(drifting_summary(&[], &names, 8).contains("trend window"));
 }

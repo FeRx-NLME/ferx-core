@@ -6803,7 +6803,10 @@ pub fn run_saem(
         // approaches either ceiling.
         if auto_exploration && k <= k1 {
             let omega_iov = (n_kappa > 0).then_some(&state.omega_iov_mat);
+            // `nll_cache` was refreshed at this iteration's Ω/σ just above and holds
+            // each subject's −log p(yᵢ, ηᵢ) (η prior included): the complete-data −log L.
             exploration_monitor.push(&crate::estimation::saem_exploration::exploration_coords(
+                state.nll_cache.iter().sum(),
                 &state.theta,
                 &state.omega_mat,
                 omega_iov,
@@ -6993,13 +6996,26 @@ pub fn run_saem(
     }
 
     if exploration_hit_max {
+        let names = crate::estimation::saem_exploration::exploration_coord_names(
+            &init_params.theta_names,
+            &init_params.omega.eta_names,
+            init_params
+                .omega_iov
+                .as_ref()
+                .map(|m| m.eta_names.as_slice()),
+            &init_params.sigma.names,
+        );
         warnings.push(format!(
             "SAEM: the exploration phase reached its maximum of {k_max} iterations while a \
-             parameter trajectory still trended (parameters still drifting: {}). The \
-             convergence phase averaged from there, so weakly identified variance \
-             components may be frozen above their optimum; raise `n_exploration_max` \
-             (or set `n_exploration`) and compare.",
-            exploration_monitor.drifting().len()
+             parameter trajectory still trended (still drifting: {}). The convergence \
+             phase averaged from there, so weakly identified variance components may be \
+             frozen above their optimum; raise `n_exploration_max` (or set \
+             `n_exploration`) and compare.",
+            crate::estimation::saem_exploration::drifting_summary(
+                &exploration_monitor.drifting(),
+                &names,
+                8,
+            )
         ));
     }
     if verbose && auto_exploration {

@@ -114,6 +114,12 @@ fn maximum_is_respected_and_reported() {
     });
     assert_eq!(r.saem_n_exploration_used, Some(15));
     assert!(max_warning(&r), "{:?}", r.warnings);
+    // The window never filled, and the warning says so rather than naming nothing.
+    assert!(
+        r.warnings.iter().any(|w| w.contains("trend window")),
+        "{:?}",
+        r.warnings
+    );
 }
 
 /// Stationary, well-identified model: the rule needs one full window, so the
