@@ -800,7 +800,40 @@ struct RunState {
     force: Option<usize>,
 }
 
+/// How far a run's logs reached at one point ([`LoopRun::mark`]): the event log's entries and
+/// body inputs, and per seed a rows run's body inputs.
+struct LogMark {
+    entries: usize,
+    vars: usize,
+    rows_vars: Vec<usize>,
+}
+
 impl LoopRun {
+    /// Where the logs stand now.
+    fn mark(&self) -> LogMark {
+        let st = self.st.borrow();
+        let (entries, vars) = st.log.as_ref().map_or((0, 0), |l| (l.entries.len(), l.vars.len()));
+        let rows_vars = self
+            .rows
+            .as_ref()
+            .map(|r| r.vars.borrow().iter().map(Vec::len).collect())
+            .unwrap_or_default();
+        LogMark { entries, vars, rows_vars }
+    }
+
+    /// Drop what the logs took since `m`.
+    fn rewind(&self, m: &LogMark) {
+        if let Some(log) = self.st.borrow_mut().log.as_mut() {
+            log.entries.truncate(m.entries);
+            log.vars.truncate(m.vars);
+        }
+        if let Some(r) = self.rows.as_ref() {
+            for (v, &n) in r.vars.borrow_mut().iter_mut().zip(&m.rows_vars) {
+                v.truncate(n);
+            }
+        }
+    }
+
     fn new(
         spec: &Arc<LoopSpec>, kern: &Arc<LoopKernels>, l: usize, inputs: &[f64], log: Option<Log>,
         rows: Option<(&[f64], usize)>,
@@ -991,7 +1024,15 @@ impl sol::LaneHook for Hook {
                 }
             }
         }
-        Box::new(Lanes { u_new: vec![0.0; run.spec.n], run, m, cl, started: false, cur: 0 })
+        Box::new(Lanes {
+            u_new: vec![0.0; run.spec.n],
+            run,
+            m,
+            cl,
+            started: false,
+            cur: 0,
+            attempt_mark: None,
+        })
     }
     fn begin(&self) {
         let run = &self.0;
@@ -1143,6 +1184,9 @@ struct Lanes {
     u_new: Vec<f64>,
     /// Which carried region holds the current state.
     cur: usize,
+    /// Where the run's logs stood before the last attempt's step body, while the driver has
+    /// not yet accepted or rejected it ([`LoopRun::rewind`]).
+    attempt_mark: Option<LogMark>,
 }
 
 impl Lanes {
@@ -1190,6 +1234,7 @@ impl sol::Stepper<f64> for Lanes {
             self.body(0);
         }
         let force = self.run.st.borrow().force;
+        self.attempt_mark = Some(self.run.mark());
         self.body(force.map_or(1, |j| 4 + j));
         self.started = true;
         self.run.st.borrow_mut().active_cur = self.cur;
@@ -1208,10 +1253,25 @@ impl sol::Stepper<f64> for Lanes {
         self.value(|c| self.cl.interp(c, theta, u_old[i], dt, i))
     }
     fn on_accept(&mut self) {
+        self.attempt_mark = None;
         self.body(2);
         self.started = self.cl.start_kept_on_accept();
     }
-    fn on_reject(&mut self) {}
+    /// A rejected attempt leaves no trace (#3065): its step body leaves the logs, and the
+    /// carried region it read is current again. The trial may have produced non-finite stages
+    /// (a stage state overshooting where the right-hand side has no real value, as `f64::powf`
+    /// of a negative base at a non-integer exponent), which the driver rejects on the value
+    /// lane exactly as the `f64` stepper does; but kept in the log, the reverse carried the
+    /// retry's adjoints back through that body's vector–Jacobian product, `0 · NaN = NaN` in
+    /// every term of a stage nothing read, and every derivative of the subject came back `NaN`.
+    /// The retry then reads the region the rejected attempt read, not the copies the attempt
+    /// passed through, so nothing rests on a step body passing its inputs through bit for bit.
+    fn on_reject(&mut self) {
+        if let Some(m) = self.attempt_mark.take() {
+            self.run.rewind(&m);
+            self.cur = 1 - self.cur;
+        }
+    }
     fn err_exp(&self) -> f64 {
         self.cl.err_exp()
     }
