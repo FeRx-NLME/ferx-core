@@ -5,10 +5,29 @@
 //! `absorption_fixed_at_dose_quadrature.{py,csv}` for 2-cpt), and the ODE twin at
 //! `ode_reltol = 1e-12`. The walk shares no code with either: the quadrature integrates the
 //! kernel density numerically, and the twin integrates the `transit()`/`igd()` forcing.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::pk::analytical_absorption::windowed_tilted_term;
+use ferx_model::pk::analytical_absorption::IgAbsorption;
+use ferx_model::pk::analytical_absorption::TiltedAbsorption;
+use ferx_model::pk::analytical_absorption::TransitAbsorption;
+use ferx_model::pk::event_driven::is_record;
+use ferx_model::pk::event_driven::EventKind;
+use ferx_model::pk::event_driven::EventSchedule;
+use ferx_model::sens::num::BranchCmp::Gt;
+use ferx_model::sens::num::BranchCmp::Le;
+use ferx_model::sens::num::BranchCmp::Lt;
+use ferx_model::sens::num::PkNum;
+use ferx_model::sens::propagate::propagate_two_cpt_core_g;
+use ferx_model::sens::propagate::PkDual;
+use ferx_model::sens::propagate::TwoCptEigen;
+use ferx_model::types::CompiledModel;
+use ferx_model::types::PkModel;
+use ferx_model::types::PkParams;
+use ferx_model::types::Subject;
 
-use super::*;
 use crate::parser::model_parser::parse_model_string;
 use crate::types::DoseEvent;
+use ferx_model::pk::absorption_walk::*;
 use std::collections::HashMap;
 
 /// `(dose, obs, pk_only)` per-event parameters for an IOV subject, built as `predict_iov`

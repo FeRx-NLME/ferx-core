@@ -1620,7 +1620,7 @@ pub fn rk4_dual<T: crate::sens::num::PkNum>(
     (0..n).map(|i| u[i] + sixth * (k1[i] + T::from_f64(2.0) * (k2[i] + k3[i]) + k4[i])).collect()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: a Weibull / transit onset is never anchored (`onset_shift`), so its segment
     /// integrates on the fixed grid with the kernel's age carrying the lag's jet — the
@@ -1645,14 +1645,14 @@ thread_local! {
 fn next_event_is_later<T: crate::sens::num::PkNum>(
     tl: &[(T, u8, usize)], p: usize, t_event: T,
 ) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if ONSET_SHIFT_OFF.with(|c| c.get()) {
         return false;
     }
     let later = tl
         .get(p + 1)
         .is_some_and(|e| e.0.br_cmp(crate::sens::num::BranchCmp::Gt, t_event + T::from_f64(1e-9)));
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if ONSET_ALONE_ON.with(|c| c.get()) {
         let alone = p == 0
             || tl[p - 1].0.br_cmp(crate::sens::num::BranchCmp::Lt, t_event - T::from_f64(1e-9));

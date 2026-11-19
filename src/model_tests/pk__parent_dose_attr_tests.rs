@@ -1,7 +1,17 @@
 //! #1909: an `ADDL`-implied dose takes its lag from its parent row and everything else
 //! from the record that governs it.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::pk::one_compartment::*;
+use ferx_model::pk::three_compartment::*;
+use ferx_model::pk::two_compartment::*;
+use ferx_model::types::CompiledModel;
+use ferx_model::types::DoseEvent;
+use ferx_model::types::PkModel;
+use ferx_model::types::PkParams;
+use ferx_model::types::ScalingSpec;
+use ferx_model::types::Subject;
 
-use super::*;
+use ferx_model::pk::*;
 use std::io::Write as _;
 
 const MODEL: &str = r#"

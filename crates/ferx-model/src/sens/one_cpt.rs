@@ -414,7 +414,7 @@ pub fn one_cpt_ig_conc_g<T: PkNum>(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
 

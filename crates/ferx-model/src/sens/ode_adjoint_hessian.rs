@@ -41,10 +41,10 @@ use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, PkNum};
 
 #[path = "ode_adjoint_hessian_basis.rs"]
-pub(super) mod basis;
+pub mod basis;
 use basis::{Basis, Lanes, Moved, MuFold, PlanKey, PlanRun};
 #[path = "ode_adjoint_hessian_struct.rs"]
-pub(super) mod st;
+pub mod st;
 
 /// A direction of a pass: the packed coordinate it moves, the `[covariate_nn]` raw output
 /// it moves (the reduced basis, [`NnReduction`]), and its η tangent (empty: none).
@@ -75,7 +75,7 @@ impl Dir {
 /// (`pack_params` order; the per-subject NLL Hessian, which the caller scales by 2 to the
 /// OFV), or `None` outside the adjoint's scope. `eta_hat` is the mode (the stacked
 /// `[η, κ]` under IOV) for `unpack_params(x)`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn subject_adjoint_cov_hessian(
     model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     eta_hat: &[f64], objective: Objective,
@@ -198,7 +198,7 @@ fn cov_hessian(
 /// The exact mode response `dη̂/dx` (one `n_eta`-vector, stacked `[η, κ]` under IOV, per
 /// packed coordinate) at the EBE `eta_hat` of `unpack_params(x)`: the EBE warm-start
 /// predictor's Jacobian (Almquist Eq. 48), FOCE's frozen-variance mode included.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn subject_adjoint_eta_dx(
     model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     eta_hat: &[f64], interaction: bool,
@@ -208,7 +208,7 @@ pub fn subject_adjoint_eta_dx(
 }
 
 /// `subject_adjoint_eta_dx` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn subject_adjoint_eta_dx_at(
     model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
     interaction: bool,
@@ -238,7 +238,7 @@ pub fn cov_non_gaussian_served(model: &CompiledModel, objective: Objective) -> b
 }
 
 /// The packed axes as pass directions, without an η tangent.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn x_dirs(n: usize) -> Vec<Dir> {
     (0..n).map(|i| Dir::x(i, Vec::new())).collect()
 }
@@ -289,7 +289,7 @@ fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix
 /// whatever the directions. A recorded kernel's pass carries one: that kernel's code grows with
 /// the width a pass carries while its arithmetic does not (#2980).
 fn pass_width(structured: bool, n_dirs: usize) -> usize {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(w) = PASS_WIDTH.with(std::cell::Cell::get) {
         return w.max(1);
     }
@@ -301,7 +301,7 @@ fn pass_width(structured: bool, n_dirs: usize) -> usize {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: every pass carries exactly this many directions (the last one fewer).
     pub static PASS_WIDTH: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -440,7 +440,7 @@ fn psi_passes(
     Some(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch (#2980): the columns by a reverse per direction (reverse over forward), the
     /// forward-over-reverse sweep's oracle.
@@ -449,13 +449,13 @@ thread_local! {
 }
 
 fn reverse_per_direction() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     return REVERSE_PER_DIRECTION.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     false
 }
 
-#[cfg(all(test, feature = "nn"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "nn"))]
 thread_local! {
     /// Covariance Hessians assembled in [`NnReduction`]'s basis on this thread.
     pub static NN_REDUCED_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -531,7 +531,7 @@ impl<'s> NnReduction<'s> {
         (n_w > n_z).then_some(NnReduction { z, nets })
     }
 
-    fn hessian(
+    pub fn hessian(
         &self, model: &CompiledModel, plan: &CovPlan<'_>, template: &ModelParameters, x: &[f64],
         width: usize, sel: HessianSel<'_>,
     ) -> Option<HessianOut> {
@@ -786,7 +786,7 @@ struct Slots {
 
 impl Slots {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         n: usize, n_obs: usize, n_rows: usize, lb: usize, has_pop: bool, nb: Option<usize>,
         nx: usize, n_nodes: usize,
     ) -> Self {
@@ -955,7 +955,7 @@ impl CovRun {
 
 impl<'a> CovPlan<'a> {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    pub fn new(
         ctx: &'a LikCtx<'a>, sc: &'a Scoped<'a>, subject: &'a Subject,
         template: &'a ModelParameters, x: &'a [f64], objective: Objective, so: &'a StackedOmega,
         nn_z: Option<&'a [Vec<f64>]>,
@@ -1520,7 +1520,7 @@ impl<'a> CovPlan<'a> {
 
     /// The kernel's computation on the recording type from its inputs `lv`: stage 1 (`nodes`)
     /// the quadrature's nodes `b_j`, else `[F, g_0 … g_{N−1}]`.
-    fn record(&self, sl: &Slots, lv: &[kj::Tr], nodes: bool) -> Option<Vec<kj::Tr>> {
+    pub fn record(&self, sl: &Slots, lv: &[kj::Tr], nodes: bool) -> Option<Vec<kj::Tr>> {
         type T = kj::Tr;
         let c = |v: f64| <T as PkNum>::from_f64(v);
         let (ctx, sc, subject, template) = (self.ctx, self.sc, self.subject, self.template);

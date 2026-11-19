@@ -250,4 +250,4 @@ fn named(starts: &[(usize, f64)]) -> String {
 
 #[cfg(test)]
 #[path = "types_multi_start_tests.rs"]
-mod tests;
+pub mod tests;

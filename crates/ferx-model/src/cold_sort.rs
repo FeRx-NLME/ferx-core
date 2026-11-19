@@ -25,7 +25,7 @@ impl<T> ColdSort<T> for [T] {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

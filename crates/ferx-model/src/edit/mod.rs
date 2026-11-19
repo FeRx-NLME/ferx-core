@@ -53,7 +53,7 @@ mod variability;
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]
-mod tests;
+pub mod tests;
 
 pub use spec::{
     ErrorForm, ErrorSpecText, EtaDecl, IivForm, ModelEdit, NewParameter, ParameterVariability,

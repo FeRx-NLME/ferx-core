@@ -203,4 +203,4 @@ pub(super) fn stmts_affine_in_states(stmts: &[Statement], states: &[String]) -> 
 
 #[cfg(test)]
 #[path = "ode_linearity_tests.rs"]
-mod tests;
+pub mod tests;

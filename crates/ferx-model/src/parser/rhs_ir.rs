@@ -274,7 +274,7 @@ impl Cc {
 /// One scalar instruction. `f64`-valued unless it is a condition ([`Inst::Cmp`],
 /// [`Inst::And`], [`Inst::Or`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) enum Inst {
+pub enum Inst {
     /// `arg[off]`.
     Load {
         arg: u8,
@@ -325,7 +325,7 @@ pub(super) enum Inst {
 
 /// A straight-line function of `n_args` pointer arguments.
 #[derive(Clone, Debug, Default)]
-pub(super) struct Func {
+pub struct Func {
     pub(super) insts: Vec<Inst>,
     pub(super) n_args: u8,
     /// Per instruction: the condition under which its value is used — the arm of an `if` it
@@ -337,7 +337,7 @@ pub(super) struct Func {
 }
 
 impl Func {
-    pub(super) fn new(n_args: u8) -> Self {
+    pub fn new(n_args: u8) -> Self {
         Func { insts: Vec::new(), n_args, live: Vec::new(), cur: None }
     }
     fn push(&mut self, i: Inst) -> V {
@@ -445,7 +445,7 @@ pub(super) struct Lower<'a> {
 }
 
 impl<'a> Lower<'a> {
-    pub(super) fn new(f: &'a mut Func, layout: Layout, n_regs: usize) -> Self {
+    pub fn new(f: &'a mut Func, layout: Layout, n_regs: usize) -> Self {
         Lower { f, layout, regs: vec![Vec::new(); n_regs], arms: Vec::new() }
     }
     /// Close every `if` that ends at instruction `at`: each value its arms write becomes the

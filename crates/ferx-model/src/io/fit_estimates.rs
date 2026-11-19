@@ -198,7 +198,7 @@ pub fn from_fit_result(fit: &FitResult) -> Vec<SourceEstimate> {
 /// `0.0` is the value `se_theta` and friends carry for a coordinate the
 /// covariance step could not reach (`idx < n` fails, or the variance came back
 /// non-positive), so it is "no SE", not "an infinitely sharp prior".
-fn se_of(se: Option<f64>) -> Option<f64> {
+pub fn se_of(se: Option<f64>) -> Option<f64> {
     se.filter(|s| s.is_finite() && *s > 0.0)
 }
 
@@ -318,7 +318,7 @@ pub fn parse_estimates_yaml(text: &str) -> Result<Vec<SourceEstimate>, String> {
 /// An entry name as the writer spelled it: bare, or — for a name YAML would misread
 /// bare, such as `YES` or `NULL` (#2911) — double-quoted by `yaml_quote`, whose escapes
 /// are JSON's.
-fn unquote_name(name: &str) -> String {
+pub fn unquote_name(name: &str) -> String {
     if name.len() >= 2 && name.starts_with('"') && name.ends_with('"') {
         if let Ok(s) = serde_json::from_str::<String>(name) {
             return s;
@@ -328,20 +328,16 @@ fn unquote_name(name: &str) -> String {
 }
 
 /// `~` (the writer's null) and anything unparseable read as absent.
-fn parse_scalar(value: &str) -> Option<f64> {
+pub fn parse_scalar(value: &str) -> Option<f64> {
     value.parse::<f64>().ok()
 }
 
 /// Drop a trailing `#` comment. The writer emits two (`sigma:  # error model: …`
 /// and the two `# aic/bic are computed from ofv_data` lines), and the first of
 /// those sits on a section header this reader must still recognise.
-fn strip_comment(line: &str) -> &str {
+pub fn strip_comment(line: &str) -> &str {
     match line.find('#') {
         Some(i) => &line[..i],
         None => line,
     }
 }
-
-#[cfg(test)]
-#[path = "fit_estimates_tests.rs"]
-mod tests;

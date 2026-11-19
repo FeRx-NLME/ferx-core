@@ -22,7 +22,7 @@ pub(super) fn layout2(n: usize) -> Layout {
 }
 
 /// The first-order layout over `n` random effects.
-pub(super) fn layout1(n: usize) -> Layout {
+pub fn layout1(n: usize) -> Layout {
     Layout { n: n as u16, m: 0, th: false, wide: false, tan: 0 }
 }
 
@@ -130,7 +130,7 @@ pub enum TermKind {
     #[cfg(feature = "markov")]
     Ctmm,
     Discrete,
-    #[cfg(all(test, feature = "markov"))]
+    #[cfg(all(any(test, feature = "test-support"), feature = "markov"))]
     Dtmm,
 }
 
@@ -143,7 +143,7 @@ impl TermKind {
             #[cfg(feature = "markov")]
             TermKind::Ctmm => 3,
             TermKind::Discrete => 4,
-            #[cfg(all(test, feature = "markov"))]
+            #[cfg(all(any(test, feature = "test-support"), feature = "markov"))]
             TermKind::Dtmm => 5,
         }
     }
@@ -166,7 +166,7 @@ pub(super) fn non_gaussian_plans(
 }
 
 /// `(q, ∇q, ∇²q)` of a subject term from its plan's second-order forward.
-#[cfg(all(test, feature = "survival"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "survival"))]
 pub fn term_jets2_planned<S>(
     model: &CompiledModel, subject: &Subject, kind: TermKind, term: &S, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>, Vec<Vec<f64>>)>

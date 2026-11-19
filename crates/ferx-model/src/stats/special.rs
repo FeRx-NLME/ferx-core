@@ -1218,7 +1218,7 @@ fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     /// `pentagamma` is `tetragamma`'s derivative (central FD, both sides of the reflection) and
     /// hits ψ‴(1) = π⁴/15.
     #[test]

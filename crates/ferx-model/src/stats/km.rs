@@ -505,4 +505,4 @@ fn band_over(
 
 #[cfg(test)]
 #[path = "km_tests.rs"]
-mod tests;
+pub mod tests;

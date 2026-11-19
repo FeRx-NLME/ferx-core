@@ -149,7 +149,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>) -> Self {
         Entry { name: name.into(), fields: Vec::new() }
     }
 
@@ -185,7 +185,9 @@ enum SeState {
 
 impl SeState {
     /// A base θ/Ω/σ/κ's state: FIX first, then [`se_held`], else its SE.
-    fn of(result: &FitResult, kind: ParameterKind, i: usize, fixed: bool, se: Option<f64>) -> Self {
+    pub fn of(
+        result: &FitResult, kind: ParameterKind, i: usize, fixed: bool, se: Option<f64>,
+    ) -> Self {
         if fixed {
             SeState::Fixed
         } else if let Some(reason) = se_held(result, kind, i) {
@@ -206,7 +208,7 @@ pub struct Section {
 }
 
 impl Section {
-    fn new(key: &'static str) -> Self {
+    pub fn new(key: &'static str) -> Self {
         Section { key, comment: None, entries: Vec::new() }
     }
 

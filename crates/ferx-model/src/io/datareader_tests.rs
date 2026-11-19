@@ -2911,7 +2911,8 @@ fn keep_as_design_still_rejects_an_out_of_range_integer_dv() {
 #[test]
 fn routed_reader_never_places_an_endpoint_cmt_in_the_gaussian_grid() {
     use std::collections::HashSet;
-    let path = std::path::Path::new("data/pktte_joint.csv");
+    let path =
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/pktte_joint.csv"));
     let read = |routing: &ObsRouting| -> (usize, usize) {
         let (pop, _) = read_nonmem_csv_routed(path, None, None, &[], None, None, routing, &[])
             .expect("fixture reads");
@@ -2998,7 +2999,10 @@ fn interval_right_bound_without_its_own_cmt_left_bound_is_rejected() {
 #[test]
 fn routed_reader_never_places_a_discrete_endpoint_cmt_in_the_gaussian_grid() {
     use std::collections::HashSet;
-    let path = std::path::Path::new("data/binary_logistic.csv");
+    let path = std::path::Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../data/binary_logistic.csv"
+    ));
     let read = |routing: &ObsRouting| -> (usize, usize) {
         let (pop, _) = read_nonmem_csv_routed(path, None, None, &[], None, None, routing, &[])
             .expect("fixture reads");

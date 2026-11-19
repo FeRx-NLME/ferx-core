@@ -1067,7 +1067,7 @@ pub fn mr_predictions(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     fn forcing(

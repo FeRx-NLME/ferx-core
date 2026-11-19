@@ -577,7 +577,7 @@ enum IntDvKind {
 }
 
 impl IntDvKind {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             IntDvKind::DiscreteState => "discrete-state",
             IntDvKind::Count => "count",
@@ -3331,4 +3331,4 @@ fn parse_subject(
 
 #[cfg(test)]
 #[path = "datareader_tests.rs"]
-mod tests;
+pub mod tests;

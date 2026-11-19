@@ -1,8 +1,12 @@
 //! Tier-1 tests for the `[priors] from_fit` fit-file readers (#254 phase 2).
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::types::FitResult;
+use ferx_model::types::ParameterKind as EstimateKind;
+use std::path::Path;
 
-use super::*;
 use crate::types::test_helpers::minimal_fit_result;
 use crate::types::Population;
+use ferx_model::io::fit_estimates::*;
 use nalgebra::DMatrix;
 
 /// Look one estimate up by kind and name.

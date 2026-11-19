@@ -128,7 +128,7 @@ impl MuFold {
     /// another way the parse cannot see (covariate networks, mixtures, IOV), where the
     /// subject's covariates vary over its records (`μ` would be per record), or where the
     /// program does not reproduce `g⁻¹(μ + η)` at this `η`. One program run per folded θ.
-    pub(super) fn at(
+    pub fn at(
         model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
     ) -> Option<Self> {
         let spec = &model.indiv_param_partials.mu_fold;
@@ -187,7 +187,7 @@ impl MuFold {
     }
 
     /// θ `i`'s lines, if the fold carries it.
-    pub(super) fn of(&self, i: usize) -> Option<&[(usize, f64)]> {
+    pub fn of(&self, i: usize) -> Option<&[(usize, f64)]> {
         self.d1.get(i).map(Vec::as_slice).filter(|d| !d.is_empty())
     }
 
@@ -316,7 +316,7 @@ pub(super) enum PlanRun {
     Basis(BasisUse),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch (#2980): every plan along the pass's directions — the basis's oracle.
     pub static PLAN_PER_DIRECTION: std::cell::Cell<bool> =
@@ -330,16 +330,16 @@ thread_local! {
 }
 
 fn plan_per_direction() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     return PLAN_PER_DIRECTION.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     false
 }
 
 pub(super) fn mu_fold_off() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     return MU_FOLD_OFF.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     false
 }
 
@@ -532,7 +532,7 @@ impl CovPlan<'_> {
         }
         let (lb, vals) = (b.lb, b.vals.clone());
         drop(bases);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         BASIS_PLANS.with(|c| c.set(c.get() + 1));
         Some(PlanRun::Basis(BasisUse { key, coef, folded, lb, vals, tan }))
     }
@@ -680,7 +680,7 @@ impl CovPlan<'_> {
                         .map(|&(k, mk)| mk * g[k])
                         .fold((0.0, gi.abs()), |(s, z), v| (s + v, z + v.abs()));
                     let gap = (gi - sum).abs();
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     FOLD_CHECK_WORST.with(|c| {
                         let rel = gap / size.max(1e-300);
                         if !(rel <= c.get()) {

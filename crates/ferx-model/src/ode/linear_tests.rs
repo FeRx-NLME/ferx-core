@@ -1325,7 +1325,7 @@ fn a_full_pool_entry_count_is_forgotten_at_the_next_segment() {
 /// the spectral path on, their diagonalisable segments would never reach it.
 struct PadeOnly;
 impl PadeOnly {
-    fn new() -> Self {
+    pub fn new() -> Self {
         SPECTRAL_OFF.with(|c| c.set(true));
         PadeOnly
     }

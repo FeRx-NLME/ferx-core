@@ -489,7 +489,7 @@ impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::vm::VmA
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     type T3 = Taylor<2, 3, 10>;

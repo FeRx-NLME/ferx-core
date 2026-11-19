@@ -334,4 +334,4 @@ pub fn resolve_method<T: PkNum>(
 
 #[cfg(test)]
 #[path = "stiffness_tests.rs"]
-mod tests;
+pub mod tests;

@@ -88,7 +88,7 @@ pub fn ess_from_weights(weights: &[f64]) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

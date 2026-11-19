@@ -5,11 +5,20 @@
 //! compile holding that endpoint alone, through the same code path), recompiling the full
 //! model `COMPILES` times, and asserts the straddle: some subject's terms give other bits
 //! in another order, so a walk in map order cannot pass.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::pk;
+use ferx_model::stats::residual_error::residual_rd;
+use ferx_model::stats::residual_error::residual_rd2;
+use ferx_model::stats::residual_error::ResidualCov;
+use ferx_model::stats::special::log_normal_cdf;
+use ferx_model::types::*;
+use nalgebra::DMatrix;
+use nalgebra::DVector;
 
-use super::*;
-use crate::survival::endpoint_order_test_helpers::{
+use crate::model_tests::survival::endpoint_order_test_helpers::{
     fold, order_sensitive, EndpointOrderFixture, COMPILES, ETA,
 };
+use ferx_model::stats::likelihood::*;
 
 /// `accumulate_non_gaussian_nll` adds one `factor · raw` per TTE endpoint into `acc`, in
 /// ascending CMT order, on every compile — for the three-cause model from `acc = 0`, and

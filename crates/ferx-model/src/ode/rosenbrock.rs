@@ -502,7 +502,7 @@ struct RhsEntry {
     direct: Option<*const DirectStep<'static>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: call a registered right-hand side through its closure, not directly.
     pub static DIRECT_STEP_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -565,7 +565,7 @@ pub fn registered_direct<T: PkNum>(
     if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f64>() {
         return None;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if DIRECT_STEP_OFF.with(|c| c.get()) {
         return None;
     }
@@ -661,7 +661,7 @@ enum StepFailure {
 }
 
 impl<T: PkNum> RosWorkspace<T> {
-    fn new(n: usize, stages: usize) -> Self {
+    pub fn new(n: usize, stages: usize) -> Self {
         let zero = T::from_f64(0.0);
         Self {
             n,
@@ -719,7 +719,7 @@ impl<T: PkNum> RosWorkspace<T> {
     fn registered_jacobian_g(
         &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: T,
     ) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if EXACT_JAC_OFF.with(|c| c.get()) {
             return false;
         }
@@ -743,7 +743,7 @@ impl<T: PkNum> RosWorkspace<T> {
     fn registered_jacobian(
         &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64,
     ) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if EXACT_JAC_OFF.with(|c| c.get()) {
             return false;
         }
@@ -1202,4 +1202,4 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
 
 #[cfg(test)]
 #[path = "rosenbrock_tests.rs"]
-mod tests;
+pub mod tests;

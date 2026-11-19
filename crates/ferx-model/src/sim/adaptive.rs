@@ -39,7 +39,7 @@ impl DoseAction {
     /// The [`DoseEvent`] for an action issued at `time`, or `None` for `Hold` / `Stop`.
     /// Bioavailability and lag are applied downstream. Assumes [`DoseAction::validate`]
     /// passed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn to_dose_event(&self, time: f64) -> Option<DoseEvent> {
         match *self {
             DoseAction::Bolus { amt, cmt } => Some(DoseEvent::new(time, amt, cmt, 0.0, false, 0.0)),
@@ -243,7 +243,7 @@ pub struct DoseLedgerEntry {
 /// `[Bolus, Stop]` list. `#[non_exhaustive]`: read it downstream through
 /// [`DecisionOutcome::label`] and [`DecisionOutcome::n_dosed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 pub enum DecisionOutcome {
     /// The controller issued `n >= 1` realized doses (all-`Hold`/zero-amount is `Hold`).
     Dosed { n: usize },
@@ -657,7 +657,7 @@ pub struct AssayRow<'a> {
 /// `with_assay_error = false`) **or** `with_assay_error = true` naming a model
 /// output via `assay_cmt` — never both.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 pub struct AdaptiveDosingSpec {
     /// The latent (Ipred) signal expression over states and individual parameters, e.g.
     /// `central / V`; `None` under `with_assay_error`. Rules compare `signal` to it.
@@ -1572,7 +1572,7 @@ pub enum AdaptiveRoute {
 ///
 /// `#[non_exhaustive]`: new rule effects land additively.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 pub struct AdaptiveRule {
     /// The comparison applied to the observed `signal`.
     pub op: Comparison,
@@ -1600,7 +1600,7 @@ pub enum IntervalStep {
 }
 
 impl IntervalStep {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             IntervalStep::Lengthen => "lengthen",
             IntervalStep::Shorten => "shorten",
@@ -1667,7 +1667,7 @@ impl Comparison {
 
 impl AdaptiveAction {
     /// The action's source-like label (`"increase 25%"`, `"hold"`, …).
-    fn label(&self) -> String {
+    pub fn label(&self) -> String {
         match self {
             AdaptiveAction::Increase(DoseStep::Percent(p)) => format!("increase {p}%"),
             AdaptiveAction::Increase(DoseStep::Level) => "increase".to_string(),
@@ -1695,7 +1695,7 @@ impl AdaptiveRule {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

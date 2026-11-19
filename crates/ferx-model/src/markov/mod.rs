@@ -624,7 +624,7 @@ pub fn kolmogorov_jacobian<T: crate::sens::num::PkNum>(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use nalgebra::DMatrix;
 

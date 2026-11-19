@@ -43,7 +43,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::io::Write;
 

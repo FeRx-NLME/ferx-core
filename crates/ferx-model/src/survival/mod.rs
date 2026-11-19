@@ -64,7 +64,7 @@ impl Default for MonoTol {
 ///   Exact:            H(T) − H(entry) − log h(T)
 ///   IntervalCensored: −log [ exp(−(H(left)−H(entry))) − exp(−(H(right)−H(entry))) ]
 /// Returns the 1e20 sentinel when the likelihood is numerically ill-defined.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn tte_data_term(
     records: &[ObsRecord], hazard: &HazardSpec, recurrence: TteRecurrence, theta: &[f64],
     eta: &[f64], covariates: &HashMap<String, f64>,
@@ -136,7 +136,7 @@ pub fn non_gaussian_eta_jets2(
 
 /// `(q, ∇²q)` of one subject term from its plan (#2786), `None` on the declines of
 /// [`non_gaussian_eta_jets2`]: the per-endpoint curvature the tests pin.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn term_eta_hessian<S: crate::sens::ode_provider::adjoint::terms::TermEval>(
     model: &CompiledModel, subject: &Subject,
     kind: crate::sens::ode_provider::adjoint::terms::TermKind, term: &S, theta: &[f64],
@@ -154,7 +154,7 @@ pub fn term_eta_hessian<S: crate::sens::ode_provider::adjoint::terms::TermEval>(
 /// The sorted-unique times an ODE-accumulated endpoint's likelihood reads `H` (and `h`) at:
 /// each record's time (or interval ends), and its entry when left-truncated — as
 /// `tte_ode_nll` collects them.
-fn ode_hazard_times(records: &[ObsRecord]) -> Vec<f64> {
+pub fn ode_hazard_times(records: &[ObsRecord]) -> Vec<f64> {
     let mut times: Vec<f64> = Vec::new();
     for r in records {
         let ObsRecord::Event { time, event_type, entry_time, .. } = r else {
@@ -180,7 +180,7 @@ fn ode_hazard_times(records: &[ObsRecord]) -> Vec<f64> {
 /// type: the cumulative hazard and hazard from the dual walk
 /// ([`crate::sens::ode_provider::adjoint::cumhaz_hazard_from_states`]) through the shared curve
 /// scoring, at the model's own monotone tolerance. `None` outside that walk's scope.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord], theta: &[T],
     eta: &[T],
@@ -240,7 +240,7 @@ pub struct TteTerm<'a> {
     ode_times: Vec<f64>,
 }
 
-struct TteEndpoint<'a> {
+pub struct TteEndpoint<'a> {
     hazard: &'a HazardSpec,
     /// An analytic hazard's dual-evaluable parameter program (#2437); `None` for an
     /// ODE-accumulated hazard.
@@ -460,7 +460,7 @@ pub fn tte_endpoint_served(model: &CompiledModel, cmt: usize) -> bool {
 /// `model` with every analytic hazard's program removed: its TTE terms then have no exact
 /// η-channel, the shape of an ODE-accumulated hazard or a hand-built `param_fn`. For tests
 /// that pin the FD route and its warnings.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn strip_hazard_programs(mut model: CompiledModel) -> CompiledModel {
     for ep in model.endpoints.values_mut() {
         if let crate::types::EndpointLikelihood::Tte {
@@ -482,7 +482,7 @@ pub const REPEL_SENTINEL_FLOOR: f64 = 1e19;
 /// (`hazard_at`) curves, shared by the analytic and ODE-accumulated paths; formulas as
 /// in `tte_data_term`, with left truncation at `entry_time`. Returns the 1e20 sentinel
 /// when ill-defined, including a non-monotone `H` (`S = exp(−ΔH) > 1`).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn tte_nll_from_curves(
     records: &[ObsRecord], cumhaz_at: impl Fn(f64) -> f64, hazard_at: impl Fn(f64) -> f64,
     tol: MonoTol,
@@ -551,7 +551,7 @@ pub fn tte_nll_from_curves_g<T: PkNum>(
                     return T::from_f64(SUBJECT_SENTINEL_NLL);
                 }
                 visit(RecordTerm::Interval {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     log_prob,
                 });
                 nll = nll - log_prob;
@@ -571,7 +571,7 @@ pub fn tte_nll_from_curves_g<T: PkNum>(
 /// `H(hi) − H(lo)`: a violation only past `abstol + reltol·|H|` ([`MonoTol`], #633, #618).
 /// Shared by every survival loop; goes through the branch API so a recording type
 /// records the decision (#2786).
-fn cumhaz_monotone_violation_g<T: PkNum>(hi: T, lo: T, tol: MonoTol) -> bool {
+pub fn cumhaz_monotone_violation_g<T: PkNum>(hi: T, lo: T, tol: MonoTol) -> bool {
     use crate::sens::num::BranchCmp::{Ge, Lt};
     let (a, b) = (hi.abs(), lo.abs());
     let m = if a.br_cmp(Ge, b) { a } else { b };
@@ -583,7 +583,7 @@ fn cumhaz_monotone_violation_g<T: PkNum>(hi: T, lo: T, tol: MonoTol) -> bool {
 /// `0`. Shared by every survival path so `entry` always means "condition on survival
 /// past entry", never "restart the clock" (#740).
 #[inline]
-fn entry_lower_limit<T: PkNum>(entry_time: f64, cumhaz_at: impl Fn(f64) -> T) -> T {
+pub fn entry_lower_limit<T: PkNum>(entry_time: f64, cumhaz_at: impl Fn(f64) -> T) -> T {
     if entry_time > 0.0 {
         cumhaz_at(entry_time)
     } else {
@@ -603,7 +603,7 @@ pub enum RecordTerm<T> {
     /// An interval-censored record, scored as `−log P(left < T ≤ right | T > entry)`;
     /// `log_prob` is carried only for the tests' fold.
     Interval {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         log_prob: T,
     },
 }
@@ -611,7 +611,7 @@ pub enum RecordTerm<T> {
 /// Hand a `Point` record to `visit` and return its NLL term `dh − log_h` (`dh` when
 /// censored) — the one place that term is formed, so the fold and the visitor agree.
 #[inline]
-fn visit_point<T: PkNum>(
+pub fn visit_point<T: PkNum>(
     visit: &mut impl FnMut(RecordTerm<T>), index: usize, dh: T, log_h: Option<T>,
 ) -> T {
     visit(RecordTerm::Point { index, dh, log_h });
@@ -684,7 +684,7 @@ pub fn tte_record_diagnostics(
 /// [`MonoTol`]); callers fold `None` into the 1e20 sentinel. `IntervalCensored` is
 /// handled by the callers, so that arm is unreachable here.
 #[inline]
-fn score_event<T: PkNum>(
+pub fn score_event<T: PkNum>(
     event_type: &EventType, arg: f64, h_lo: T, cumhaz_at: impl Fn(f64) -> T,
     hazard_at: impl Fn(f64) -> T, tol: MonoTol,
 ) -> Option<(T, Option<T>, T)> {
@@ -893,7 +893,7 @@ pub fn data_term_hessian_fd(
 /// Draw one uncensored latent event time, consuming exactly one uniform. `entry_time > 0`
 /// draws conditional on survival past entry. Returns `f64::MAX` for degenerate / improper
 /// cases (`λ = 0`; a Gompertz with `γ < 0` that never reaches the quantile).
-fn draw_tte_latent<R: rand::Rng>(
+pub fn draw_tte_latent<R: rand::Rng>(
     family: HazardFamily, params: &[f64], entry_time: f64, rng: &mut R,
 ) -> f64 {
     // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
@@ -909,7 +909,7 @@ fn draw_tte_latent<R: rand::Rng>(
 /// Draw one TTE outcome within `window`: `(t_event, true)` for a draw strictly below the
 /// window, else `(window, false)`. A `f64::MAX` degenerate draw is never an event, even
 /// with an unbounded window (see [`observation_window`]).
-fn draw_tte_outcome<R: rand::Rng>(
+pub fn draw_tte_outcome<R: rand::Rng>(
     family: HazardFamily, params: &[f64], entry_time: f64, window: f64, rng: &mut R,
 ) -> (f64, bool, bool) {
     let t_event = draw_tte_latent(family, params, entry_time, rng);
@@ -926,7 +926,7 @@ fn draw_tte_outcome<R: rand::Rng>(
 /// The administrative right-censoring horizon for a TTE record, or `+∞` when it carries
 /// none. Only a `RightCensored` record marks a horizon; an `Exact` / `IntervalCensored`
 /// `time` is a realized event, and censoring a re-simulated draw there would bias a VPC.
-fn observation_window(event_type: &EventType, time: f64) -> f64 {
+pub fn observation_window(event_type: &EventType, time: f64) -> f64 {
     match event_type {
         EventType::RightCensored => time,
         EventType::Exact | EventType::IntervalCensored { .. } => f64::INFINITY,
@@ -936,7 +936,7 @@ fn observation_window(event_type: &EventType, time: f64) -> f64 {
 /// Resolve a competing-risks outcome: the earliest latent time wins (`total_cmp`, lowest
 /// index on ties) and is observed only if before `window` and below the `f64::MAX`
 /// sentinel. Returns `(winning cause, time, event_observed)`.
-fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
+pub fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
     let (win_idx, &t_star) = latents
         .iter()
         .enumerate()
@@ -1014,7 +1014,7 @@ pub fn ode_cumhaz_hazard(
 /// `Err` with the solver's reason; the caller censors the subject and warns
 /// (`W_TTE_SOLVE_FAILED`, #2087). `u` is drawn before the solve, so RNG use is fixed.
 #[cfg(feature = "survival")]
-fn draw_ode_tte_latent<R: rand::Rng>(
+pub fn draw_ode_tte_latent<R: rand::Rng>(
     model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
     eta: &[f64], chz_state: usize, horizon: Option<f64>, rng: &mut R,
 ) -> Result<f64, String> {
@@ -1050,7 +1050,7 @@ fn draw_ode_tte_latent<R: rand::Rng>(
 /// `api::validate_tte_simulatable` rejects a second RTTE CMT or a competing single-TTE
 /// sibling; this panics if either (or a non-analytic hazard) slips through.
 #[cfg(feature = "survival")]
-fn rtte_cause(
+pub fn rtte_cause(
     model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
     eta: &[f64],
 ) -> Option<(usize, RtteClock, HazardFamily, Vec<f64>, f64)> {
@@ -1114,7 +1114,7 @@ fn rtte_cause(
 /// subject (#762): the stream is skipped or truncated with a warning, never aborted.
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
-fn simulate_rtte_stream<R: rand::Rng>(
+pub fn simulate_rtte_stream<R: rand::Rng>(
     family: HazardFamily, params: &[f64], clock: RtteClock, horizon: f64, entry: f64, cmt: usize,
     id: &str, draw: usize, sim: usize, rng: &mut R,
     results: &mut Vec<crate::sim_result::SimulationResult>, warnings: &mut Vec<String>,
@@ -1420,7 +1420,7 @@ pub fn simulate_tte_reporting<R: rand::Rng>(
 /// non-positive / non-finite effective rate, yielding the `f64::MAX` sentinel and so
 /// no event) — collected into [`crate::api::SimulationOutput::warnings`] (#763).
 #[cfg(feature = "survival")]
-fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
+pub fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
     degenerate_hazard_text(id, cmt, "")
 }
 
@@ -1428,7 +1428,7 @@ fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
 /// replicates the subject was censored in (empty for a single replicate). The count is of
 /// censorings, since a replicate where another cause fired is not reported (#1648).
 #[cfg(feature = "survival")]
-fn degenerate_hazard_text(id: &str, cmt: usize, censored_in: &str) -> String {
+pub fn degenerate_hazard_text(id: &str, cmt: usize, censored_in: &str) -> String {
     format!(
         "W_TTE_DEGENERATE_HAZARD: subject '{id}' (CMT={cmt}) drew a non-positive / non-finite \
          effective hazard rate; no event was generated and the subject is censored at the \
@@ -1438,7 +1438,7 @@ fn degenerate_hazard_text(id: &str, cmt: usize, censored_in: &str) -> String {
 }
 
 /// How many indices a `W_TTE_DEGENERATE_HAZARD` line names before it counts the rest.
-const DEGENERATE_INDEX_CAP: usize = 10;
+pub const DEGENERATE_INDEX_CAP: usize = 10;
 
 /// Every degenerate analytic hazard draw (#763) of one simulation run that left its
 /// subject censored, so each (subject, CMT) gets one `W_TTE_DEGENERATE_HAZARD` line with
@@ -1545,7 +1545,7 @@ impl DegenerateHazardTally {
 
 /// `"sim 3, 17, 41"`: the first [`DEGENERATE_INDEX_CAP`] indices under the row field's
 /// name, then how many more there are.
-fn index_list(label: &str, indices: &[usize]) -> String {
+pub fn index_list(label: &str, indices: &[usize]) -> String {
     let shown: Vec<String> =
         indices.iter().take(DEGENERATE_INDEX_CAP).map(usize::to_string).collect();
     let rest = indices.len().saturating_sub(DEGENERATE_INDEX_CAP);
@@ -1559,7 +1559,7 @@ fn index_list(label: &str, indices: &[usize]) -> String {
 /// non-finite `H` → both blocks; anything else → no diagnosis, both blocks. `competing`
 /// selects the wording where every cause is censored.
 #[cfg(feature = "survival")]
-fn ode_solve_failed_warning(
+pub fn ode_solve_failed_warning(
     id: &str, cmt: usize, why: &str, window: f64, competing: bool,
 ) -> String {
     let odes_diverged = why.contains("[odes] state `");
@@ -1647,20 +1647,12 @@ pub fn cif_curves(cum_hazards: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
 #[path = "residual_tests.rs"]
 mod residual_tests;
 
-#[cfg(any(test, feature = "test-support"))]
-#[path = "endpoint_order_test_helpers.rs"]
-pub mod endpoint_order_test_helpers;
-
-#[cfg(test)]
-#[path = "endpoint_order_tests.rs"]
-mod endpoint_order_tests;
-
 #[cfg(test)]
 #[path = "degenerate_tally_tests.rs"]
 mod degenerate_tally_tests;
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
 
@@ -3446,453 +3438,5 @@ mod tests {
                 assert_eq!(e.severity, crate::types::WarningSeverity::Warning, "{w}");
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod exact_eta_hessian_tests {
-    use super::*;
-    use crate::types::{EndpointLikelihood, HazardSpec};
-
-    /// The exponential family in closed form: with `λ = θ·e^η`, `−log L = Σ λ t_i − Σ_exact
-    /// (log λ)` (no truncation in the fixture), so `∂²/∂η² = λ Σ t_i` — the exact Hessian
-    /// must match it to rounding.
-    #[test]
-    fn the_exact_eta_hessian_is_the_closed_form_on_an_exponential_hazard() {
-        let root = env!("CARGO_MANIFEST_DIR");
-        let prep = crate::api::prepare_run(
-            &format!("{root}/examples/tte_exponential.ferx"),
-            Some(&format!("{root}/data/tte_exponential.csv")),
-        )
-        .unwrap();
-        let model = &prep.parsed.model;
-        let theta = &model.default_params.theta;
-        let (cmt, ep) = model.endpoints.iter().next().unwrap();
-        assert!(
-            matches!(ep, EndpointLikelihood::Tte { hazard: HazardSpec::Analytic { .. }, .. }),
-            "an analytic exponential endpoint"
-        );
-        let mut checked = 0;
-        for s in prep.population.subjects.iter().take(8) {
-            let recs: Vec<ObsRecord> = s
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
-            if recs.is_empty() {
-                continue;
-            }
-            let eta = [0.13];
-            let term = TteTerm::new(model, s);
-            let kind = crate::sens::ode_provider::adjoint::terms::TermKind::Tte;
-            let (_, h) = term_eta_hessian(model, s, kind, &term, theta, &eta).unwrap();
-            let lambda = theta[0] * eta[0].exp();
-            let t_sum: f64 = recs
-                .iter()
-                .map(|r| match r {
-                    ObsRecord::Event { time, entry_time, .. } => {
-                        assert_eq!(*entry_time, 0.0, "the closed form assumes no truncation");
-                        *time
-                    }
-                    _ => 0.0,
-                })
-                .sum();
-            let want = lambda * t_sum;
-            assert!(((h[(0, 0)] - want) / want).abs() < 1e-14, "{} vs {want}", h[(0, 0)]);
-            checked += 1;
-        }
-        assert!(checked > 0);
-    }
-
-    /// The inner gradient's TTE block in closed form on the exponential hazard:
-    /// `∂/∂η [λ Σ t_i − Σ_exact log λ] = λ Σ t_i − n_exact`, matched to rounding, with the
-    /// value equal to the production data term's.
-    #[test]
-    fn the_tte_eta_gradient_is_the_closed_form_on_an_exponential_hazard() {
-        let root = env!("CARGO_MANIFEST_DIR");
-        let prep = crate::api::prepare_run(
-            &format!("{root}/examples/tte_exponential.ferx"),
-            Some(&format!("{root}/data/tte_exponential.csv")),
-        )
-        .unwrap();
-        let model = &prep.parsed.model;
-        let theta = &model.default_params.theta;
-        let mut checked = 0;
-        for s in prep.population.subjects.iter().take(8) {
-            if s.obs_records.is_empty() {
-                continue;
-            }
-            let eta = [-0.21];
-            let (v, g) = tte_subject_eta_grad(model, s, theta, &eta).expect("in scope");
-            let lambda = theta[0] * eta[0].exp();
-            let (mut t_sum, mut n_exact) = (0.0, 0.0);
-            for r in &s.obs_records {
-                if let ObsRecord::Event { time, event_type, .. } = r {
-                    t_sum += time;
-                    if matches!(event_type, EventType::Exact) {
-                        n_exact += 1.0;
-                    }
-                }
-            }
-            let want = lambda * t_sum - n_exact;
-            assert!((g[0] - want).abs() <= 1e-13 * (1.0 + want.abs()), "{} vs {want}", g[0]);
-            let (cmt, ep) = model.endpoints.iter().next().unwrap();
-            let crate::types::EndpointLikelihood::Tte { hazard, recurrence, .. } = ep else {
-                unreachable!()
-            };
-            let recs: Vec<ObsRecord> = s
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if c == cmt))
-                .cloned()
-                .collect();
-            let f = tte_data_term(&recs, hazard, *recurrence, theta, &eta, &s.covariates);
-            assert!((v - f).abs() <= 1e-12 * (1.0 + f.abs()), "value {v} vs {f}");
-            checked += 1;
-        }
-        assert!(checked > 0);
-    }
-}
-
-#[cfg(test)]
-mod ode_hazard_exact_tests {
-    use super::*;
-    use crate::types::{EndpointLikelihood, HazardSpec};
-
-    /// The joint PK-TTE (drug-driven, ODE-accumulated) hazard's η-Hessian is exact: the dual
-    /// walk's curves through the shared scoring, against the stencil it replaces, to the
-    /// stencil's accuracy; and its value against the production `tte_endpoint_nll`, to the
-    /// two engines' solver agreement.
-    #[test]
-    fn the_ode_hazard_eta_hessian_is_exact() {
-        let root = env!("CARGO_MANIFEST_DIR");
-        let prep = crate::api::prepare_run(
-            &format!("{root}/examples/pktte_joint.ferx"),
-            Some(&format!("{root}/data/pktte_joint.csv")),
-        )
-        .unwrap();
-        let model = &prep.parsed.model;
-        let theta = &model.default_params.theta;
-        let (cmt, chz) = model
-            .endpoints
-            .iter()
-            .find_map(|(c, ep)| match ep {
-                EndpointLikelihood::Tte {
-                    hazard: HazardSpec::OdeAccumulated { chz_state },
-                    ..
-                } => Some((*c, *chz_state)),
-                _ => None,
-            })
-            .expect("an ODE-accumulated endpoint");
-        assert!(tte_endpoint_served(model, cmt));
-        let (mut worst_h, mut worst_v, mut n) = (0.0f64, 0.0f64, 0);
-        for s in prep.population.subjects.iter().take(5) {
-            let recs: Vec<ObsRecord> = s
-                .obs_records
-                .iter()
-                .filter(|r| matches!(r, ObsRecord::Event { cmt: c, .. } if *c == cmt))
-                .cloned()
-                .collect();
-            if recs.is_empty() {
-                continue;
-            }
-            let eta = [0.12];
-            let term = TteTerm::new(model, s);
-            let kind = crate::sens::ode_provider::adjoint::terms::TermKind::Tte;
-            let (_, exact) =
-                term_eta_hessian(model, s, kind, &term, theta, &eta).expect("in scope");
-            let f = |e: &[f64]| {
-                crate::stats::likelihood::tte_endpoint_nll_for_tests(model, s, cmt, &recs, theta, e)
-            };
-            // Richardson of the exact η-gradient (`O(h⁴)`), not a stencil of the value.
-            let g = |e: f64| tte_subject_eta_grad(model, s, theta, &[e]).unwrap().1[0];
-            let d = |h: f64| (g(eta[0] + h) - g(eta[0] - h)) / (2.0 * h);
-            let fd = (4.0 * d(5e-4) - d(1e-3)) / 3.0;
-            worst_h = worst_h.max((exact[(0, 0)] - fd).abs() / fd.abs().max(1e-12));
-            let v = ode_tte_nll_g::<f64>(model, s, chz, &recs, theta, &eta).unwrap();
-            worst_v = worst_v.max((v - f(&eta)).abs() / (1.0 + f(&eta).abs()));
-            n += 1;
-        }
-        assert!(n > 2, "too few subjects ({n})");
-        eprintln!(
-            "ODE hazard: Hessian vs Richardson {worst_h:.2e}, value vs production {worst_v:.2e}"
-        );
-        // Measured: the value bit-identical to production's (0.0), the Hessian 3.65e-6 off
-        // Richardson of the exact gradient — the frozen-step derivative against the adaptive
-        // solve's slope at default tolerances. 2e-5 is 5× that; a dropped `h` term or CHZ
-        // readout misses by O(1).
-        assert!(worst_v < 1e-10, "value {worst_v:.2e}");
-        assert!(worst_h < 2e-5, "Hessian {worst_h:.2e}");
-    }
-
-    /// A drug-driven hazard that also reads `TIME` (Gompertz-shaped, `H0·e^{GAM·TIME}·e^{BETA·C}`)
-    /// is exact too: the dual walk integrates the clock, and `h(t)` reads the value path's
-    /// anchors. The value matches production's non-Gaussian term; the η-gradient and the
-    /// θ-score (`GAM` among them, the clock's own channel) match Richardson differences of it.
-    #[test]
-    fn a_time_dependent_ode_hazard_is_exact() {
-        let root = env!("CARGO_MANIFEST_DIR");
-        // The anchor's model with a random effect on CL (the anchor itself has none), so the
-        // hazard's drug channel carries an η.
-        let src = std::fs::read_to_string(format!("{root}/nonmem_anchor/pktte_tdep_fit.ferx"))
-            .unwrap()
-            .replace("  sigma PROP_ERR", "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR")
-            .replace("CL   = TVCL\n", "CL   = TVCL * exp(ETA_CL)\n");
-        let mut model = crate::parser::model_parser::parse_model_string(&src).unwrap();
-        assert_eq!(model.n_eta, 1);
-        if let Some(ode) = model.ode_spec.as_mut() {
-            ode.solver_opts.reltol = 1e-12;
-            ode.solver_opts.abstol = 1e-14;
-        }
-        let (population, _) = crate::api::read_population_for(
-            &model,
-            &None,
-            &format!("{root}/nonmem_anchor/pktte_tdep.csv"),
-            None,
-            None,
-            None,
-            &[],
-        )
-        .unwrap();
-        let model = &model;
-        let theta = model.default_params.theta.clone();
-        let cmt = *model
-            .endpoints
-            .iter()
-            .find(|(_, ep)| matches!(ep, EndpointLikelihood::Tte { .. }))
-            .unwrap()
-            .0;
-        assert!(tte_endpoint_served(model, cmt), "a TIME-reading hazard is served");
-        let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
-            let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
-            // Relative to `x` itself: a small parameter (a baseline hazard of 0.02) under an
-            // absolute step is the oracle's own error, not the derivative's.
-            let h = 1e-3 * x.abs().max(1e-2);
-            (4.0 * d(h / 2.0) - d(h)) / 3.0
-        };
-        let nll = |s: &Subject, th: &[f64], e: &[f64]| {
-            let mut acc = 0.0;
-            crate::stats::likelihood::accumulate_non_gaussian_nll(
-                model, s, th, e, None, 1.0, &mut acc,
-            );
-            acc
-        };
-        let (mut worst_v, mut worst_g, mut n) = (0.0f64, 0.0f64, 0);
-        for s in population.subjects.iter().filter(|s| !s.obs_records.is_empty()).take(4) {
-            assert!(tte_record_served(model, s, cmt), "subject {} is served", s.id);
-            let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.05 * k as f64).collect();
-            let (v, g) = tte_subject_eta_grad(model, s, &theta, &eta).expect("exact");
-            let v_ref = nll(s, &theta, &eta);
-            worst_v = worst_v.max((v - v_ref).abs() / (1.0 + v_ref.abs()));
-            for k in 0..eta.len() {
-                let fd = rich(
-                    &|x| {
-                        let mut e = eta.clone();
-                        e[k] = x;
-                        nll(s, &theta, &e)
-                    },
-                    eta[k],
-                );
-                worst_g = worst_g.max((g[k] - fd).abs() / (1.0 + fd.abs()));
-            }
-            let (_, gt) = crate::sens::ode_provider::adjoint::non_gaussian_theta_score(
-                model, s, &theta, &eta,
-            )
-            .expect("exact");
-            for i in 0..theta.len() {
-                let fd = rich(
-                    &|x| {
-                        let mut th = theta.clone();
-                        th[i] = x;
-                        nll(s, &th, &eta)
-                    },
-                    theta[i],
-                );
-                worst_g = worst_g.max((gt[i] - fd).abs() / (1.0 + fd.abs()));
-            }
-            n += 1;
-        }
-        assert!(n >= 3, "too few subjects ({n})");
-        eprintln!("TIME-reading ODE hazard: value {worst_v:.2e}, gradients {worst_g:.2e}");
-        assert!(worst_v < 1e-8, "value {worst_v:.2e}");
-        assert!(worst_g < 1e-6, "gradient {worst_g:.2e}");
-    }
-
-    /// #1575's fixture (`tests/one_snapshot_dose_reads_survival.rs`) on the exact route: a
-    /// `TIME`-reading `$PK` whose `TIME = 0` disposition snapshot differs from every dose
-    /// record (`MTT = −9`, `ALAG1 = 10.5` there, `1` and `0.5` at the records), a transit
-    /// kernel and a compartment lag read per dose, a `TAD`-reading hazard, doses at 1 and 13
-    /// (the second on residual drug), η on `CL`, the lag and the kernel, and a `CL` the
-    /// disposition reads at `TIME = 0` (1.5×) but no dose record does; and a steady-state
-    /// twin (`SS=1`, the plain drug-driven hazard). Both take the event-driven dual walk with
-    /// every segment on the disposition (`ode_states_at_g`), which the static walk declined.
-    ///
-    /// Value: the walk's `(H, h)` against production's dense single-pass solve
-    /// (`ode_cumhaz_hazard`, a different engine) — dies if a dose quantity is read at the
-    /// disposition (the kernel then delivers nothing, the lag moves every arrival), if a
-    /// segment is integrated on a dose record's snapshot instead of the disposition (its `CL`),
-    /// or if the `TAD` anchor drops the lag. Gradients: the exact η-gradient and θ-score
-    /// against Richardson differences of the production objective.
-    #[test]
-    fn a_time_reading_pk_with_an_ode_hazard_is_exact() {
-        const MODEL: &str = r"
-[parameters]
-  theta TVCL(1.0, FIX)
-  theta TVV(10.0, FIX)
-  theta TVKA(1.0, FIX)
-  theta TVMTT(1.0, FIX)
-  theta TVN(3.0, FIX)
-  theta TVLAG(0.5, FIX)
-  theta TVH0(0.02, FIX)
-  theta TVBETA(0.1, FIX)
-  omega ETA_CL ~ 0.09
-  omega ETA_LAG ~ 0.09
-  omega ETA_MTT ~ 0.09
-  sigma PROP_ERR ~ 0.01
-[individual_parameters]
-  CL    = TVCL * exp(ETA_CL) * (if (TIME < 0.5) 1.5 else 1.0)
-  V     = TVV
-  KA    = TVKA
-  MTT   = TVMTT * exp(ETA_MTT) - 10.0 * (if (TIME < 0.5) 1.0 else 0.0)
-  NTR   = TVN
-  ALAG1 = TVLAG * exp(ETA_LAG) + 10.0 * (if (TIME < 0.5) 1.0 else 0.0)
-  H0    = TVH0
-  BETA  = TVBETA
-[structural_model]
-  ode(obs_cmt=central, states=[depot, central])
-[odes]
-  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA * depot
-  d/dt(central) = KA * depot - (CL/V) * central
-[scaling]
-  obs_scale = V
-[event_model]
-  cmt    = 3
-  hazard = H0 * exp(BETA * (central / V)) + 0.002 * TAD
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  ode_reltol = 1e-11
-  ode_abstol = 1e-13
-";
-        use std::io::Write;
-        // The steady-state twin: #1575's lag and transit kernel are rejected under `SS=1`
-        // (`E_ABSORPTION_SS_LAG`), so it is the plain drug-driven hazard.
-        let ss_model = MODEL
-            .replace("  omega ETA_LAG ~ 0.09\n  omega ETA_MTT ~ 0.09\n", "")
-            .replace("transit(n=NTR, mtt=MTT) - KA * depot", "-KA * depot")
-            .replace("  MTT   = TVMTT * exp(ETA_MTT) - 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n", "")
-            .replace("  ALAG1 = TVLAG * exp(ETA_LAG) + 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n", "")
-            .replace(" + 0.002 * TAD", "")
-            .replace(" * (if (TIME < 0.5) 1.5 else 1.0)", "");
-        let (mut worst_v, mut worst_g) = (0.0f64, 0.0f64);
-        for (src, ss) in [(MODEL, "0,0"), (ss_model.as_str(), "1,12")] {
-            let model = crate::parser::model_parser::parse_model_string(src).unwrap();
-            let (cmt, chz) = model
-                .endpoints
-                .iter()
-                .find_map(|(c, ep)| match ep {
-                    EndpointLikelihood::Tte {
-                        hazard: HazardSpec::OdeAccumulated { chz_state },
-                        ..
-                    } => Some((*c, *chz_state)),
-                    _ => None,
-                })
-                .unwrap();
-            let theta = model.default_params.theta.clone();
-            let eta = [0.1, -0.2, 0.15][..model.n_eta].to_vec();
-            let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
-                let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
-                let h = 1e-3 * x.abs().max(1e-1);
-                (4.0 * d(h / 2.0) - d(h)) / 3.0
-            };
-            let nll = |s: &Subject, th: &[f64], e: &[f64]| {
-                let mut acc = 0.0;
-                crate::stats::likelihood::accumulate_non_gaussian_nll(
-                    &model, s, th, e, None, 1.0, &mut acc,
-                );
-                acc
-            };
-            {
-                let data = format!(
-                    "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
-                 1,1,.,1,100,1,0,1,{ss}\n\
-                 1,8,5,0,.,2,0,0,0,0\n\
-                 1,13,.,1,100,1,0,1,0,0\n\
-                 1,20,1,0,0,3,0,0,0,0\n"
-                );
-                let mut f = tempfile::NamedTempFile::new().unwrap();
-                f.write_all(data.as_bytes()).unwrap();
-                let (pop, _) = crate::api::read_population_for(
-                    &model,
-                    &None,
-                    f.path().to_str().unwrap(),
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .unwrap();
-                let s = &pop.subjects[0];
-                assert!(tte_record_served(&model, s, cmt), "SS={ss}: served exactly");
-                let times = [20.0];
-                let walk = crate::sens::ode_provider::adjoint::ode_states_at_g::<f64>(
-                    &model, s, &theta, &eta, &times,
-                )
-                .expect("the event walk serves it");
-                let (cum, haz) = crate::sens::ode_provider::adjoint::cumhaz_hazard_from_states(
-                    &model, s, chz, &times, &walk,
-                )
-                .unwrap();
-                let (cum_d, haz_d) = ode_cumhaz_hazard(&model, s, chz, &theta, &eta, &times);
-                assert!(
-                    cum[0].is_finite()
-                        && haz[0].is_finite()
-                        && cum_d[0].is_finite()
-                        && haz_d[0].is_finite()
-                );
-                worst_v = worst_v // nan-ok: all four values asserted finite above; the divisors are the dense cumulative hazard and hazard
-                    .max((cum[0] - cum_d[0]).abs() / cum_d[0].abs())
-                    .max((haz[0] - haz_d[0]).abs() / haz_d[0].abs());
-                let (_, g) = tte_subject_eta_grad(&model, s, &theta, &eta).expect("exact");
-                for k in 0..eta.len() {
-                    let fd = rich(
-                        &|x| {
-                            let mut e = eta.clone();
-                            e[k] = x;
-                            nll(s, &theta, &e)
-                        },
-                        eta[k],
-                    );
-                    assert!(fd.is_finite() && g[k].is_finite());
-                    // Every η is live: the lag and the kernel move the hazard at 20.
-                    assert!(fd.abs() > 1e-4, "SS={ss}: η[{k}] is not live ({fd:.2e})");
-                    worst_g = worst_g.max((g[k] - fd).abs() / (1.0 + fd.abs()));
-                }
-                let (_, gt) = crate::sens::ode_provider::adjoint::non_gaussian_theta_score(
-                    &model, s, &theta, &eta,
-                )
-                .expect("exact");
-                for i in 0..theta.len() {
-                    let fd = rich(
-                        &|x| {
-                            let mut th = theta.clone();
-                            th[i] = x;
-                            nll(s, &th, &eta)
-                        },
-                        theta[i],
-                    );
-                    assert!(fd.is_finite() && gt[i].is_finite());
-                    worst_g = worst_g.max((gt[i] - fd).abs() / (1.0 + fd.abs()));
-                }
-            }
-        }
-        eprintln!(
-            "TIME-reading $PK ODE hazard: value vs dense {worst_v:.2e}, gradients {worst_g:.2e}"
-        );
-        // Measured on Linux: value 2.0e-15 against the dense engine (the same arithmetic on
-        // another walk), gradients 2.2e-10 (Richardson's own error at these tolerances).
-        assert!(worst_v < 1e-12, "value {worst_v:.2e}");
-        assert!(worst_g < 5e-9, "gradient {worst_g:.2e}");
     }
 }

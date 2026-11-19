@@ -41,7 +41,7 @@ use crate::sens::focei_kernel::{
 /// σ packed coordinates.
 const NL: usize = 5;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: every pass through the recorded likelihood kernel — the structured
     /// kernel's oracle.
@@ -51,9 +51,9 @@ thread_local! {
 }
 
 fn struct_off() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     return STRUCT_OFF.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     false
 }
 
@@ -98,7 +98,7 @@ impl Family {
     }
     /// The family whose rows this one reads: FOCEI's `(ℓ, ∂ℓ/∂f, α)` under the Gauss–Newton
     /// anchor, the exact anchor's `(ℓ, ℓ′, ℓ″)` and `Q`.
-    fn rows(self) -> Family {
+    pub fn rows(self) -> Family {
         match self {
             Family::LaplaceGn | Family::AgqGn => Family::Focei,
             Family::AgqExact => Family::Laplace,
@@ -232,7 +232,7 @@ struct Preps {
 impl Preps {
     /// The prepared adjoints of `n` adjoint vectors, vector `v`'s aggregate `k` read from
     /// `src(v)[at[k]..]`.
-    fn new<'s>(
+    pub fn new<'s>(
         aggs: &[(usize, Mono)], at: &[usize], m: usize, n: usize, src: impl Fn(usize) -> &'s [f64],
     ) -> Self {
         let mut off = Vec::with_capacity(aggs.len());
@@ -405,7 +405,7 @@ impl CovPlan<'_> {
     /// predictions `f(j)`, the population predictions `fp(j)` (FOCE under an `f`-dependent
     /// variance), the η-gradients `g(j, k)` and the packed coordinates `x(i)`. `None` where the
     /// structured form does not hold here (a row off its domain, FOCE off its Woodbury gate).
-    fn rows(
+    pub fn rows(
         &self, f: &dyn Fn(usize) -> f64, fp: &dyn Fn(usize) -> Option<f64>,
         gv: &dyn Fn(usize, usize) -> f64, qv: &dyn Fn(usize, usize) -> f64,
         xv: &dyn Fn(usize) -> f64,
@@ -1181,7 +1181,7 @@ impl CovPlan<'_> {
                 }
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STRUCT_PASSES.with(|c| c.set(c.get() + 1));
         Some((adj, psi, Pending { at, a_val, a_tan }))
     }

@@ -347,7 +347,7 @@ const ANALYTIC_MIXED_N: [usize; 2] = [4, 6];
 
 const _: () = assert!(ANALYTIC_MIXED_N[0] == 4 && ANALYTIC_MIXED_N[1] == 6);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static MIXED_ANALYTIC_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Observations whose jet came from the explicit-kernel loop in the retired (#2093) `run_obs`

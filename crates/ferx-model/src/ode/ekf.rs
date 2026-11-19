@@ -529,7 +529,7 @@ pub struct EkfObsPoint<T = f64> {
 }
 
 impl<T: VmNum> EkfObsPoint<T> {
-    fn of(v: f64) -> Self {
+    pub fn of(v: f64) -> Self {
         EkfObsPoint { ipred: T::from_f64(v), p_obs: T::from_f64(v) }
     }
 }
@@ -951,7 +951,7 @@ pub fn solve_ekf_g<T: VmNum, R: EkfRhs>(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::sens::num::PkNum;
     use approx::assert_relative_eq;

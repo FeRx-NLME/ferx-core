@@ -137,3 +137,6 @@ mod debug_assertion_canary;
 /// Model texts shared by test modules (written once instead of per test).
 #[cfg(test)]
 pub(crate) use ferx_model::test_models;
+
+#[cfg(test)]
+mod model_tests;

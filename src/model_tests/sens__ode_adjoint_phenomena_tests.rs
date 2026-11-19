@@ -11,15 +11,54 @@
 //! check is against an oracle that shares no derivative code with the adjoint: the
 //! reconverged-FD objective gradient ([`fd_oracle`]) and a Richardson difference of the
 //! production predictor for `∂f/∂η`. Each bound is the measured worst with ~10× headroom.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::estimation::parameterization::lower_tri_entries;
+use ferx_model::estimation::parameterization::unpack_params;
+use ferx_model::ode::predictions::input_rate_consumes_cmt;
+use ferx_model::ode::predictions::OdeReadout;
+use ferx_model::ode::predictions::OdeSpec;
+use ferx_model::ode::predictions::PreparedForcings;
+use ferx_model::ode::solver::solve_ode_g_certified;
+use ferx_model::ode::solver::solve_ode_g_with_auto_state;
+use ferx_model::ode::solver::OdeAutoSwitchState;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit as kj_fwd;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit as kj_tr;
+use ferx_model::pk::absorption::InputRateForcing;
+use ferx_model::pk::absorption::PreparedInputRate;
+use ferx_model::sens::focei_kernel::data_l;
+use ferx_model::sens::focei_kernel::foce_f;
+use ferx_model::sens::focei_kernel::focei_f_grad;
+use ferx_model::sens::focei_kernel::inner_grad;
+use ferx_model::sens::focei_kernel::inner_l;
+use ferx_model::sens::focei_kernel::LikCtx;
+use ferx_model::sens::focei_kernel::ParT;
+use ferx_model::sens::num::vm::VmNum;
+use ferx_model::sens::num::NonRecRead;
+use ferx_model::sens::ode_provider::adjoint::hessian::cov_non_gaussian_served;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_block_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_block_with_gradient_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_diag_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_hessian;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_hessian_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_eta_dx;
+use ferx_model::sens::ode_provider::*;
+use ferx_model::types::CompiledModel;
+use ferx_model::types::ModelParameters;
+use ferx_model::types::ScalingSpec;
+use ferx_model::types::PK_IDX_F;
+use ferx_model::types::PK_IDX_LAGTIME;
+use nalgebra::DMatrix;
+use nalgebra::DVector;
+use std::cell::RefCell;
 
-use super::tests::{
+use crate::estimation::parameterization::pack_params;
+use crate::model_tests::sens::ode_provider::adjoint::tests::{
     censor, ebe_for, fd_oracle, hessian_gaps, hessian_gaps_for, laplace_prod, moved_params,
     objective_gaps, oracle_jacobian, parity, subject, subject_shell, tight, with_tol,
 };
-use super::*;
-use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{DoseEvent, RateMode, Subject};
+use ferx_model::sens::ode_provider::adjoint::*;
 use std::collections::HashMap;
 
 // ---- shared measurement ---------------------------------------------------------------
@@ -1569,7 +1608,12 @@ fn third_order_derivatives_across_an_ode_moving_boundary_are_exact() {
         assert!(fd.is_finite() && fd < 1e-5, "{label}: R-matrix vs FD {fd:.2e}");
     }
     let m = tight(parse_model_string(ODE_LAG).unwrap());
-    let g = super::tests::fd_oracle_agq(&m, &two_dose_subject(&m), 1, true);
+    let g = crate::model_tests::sens::ode_provider::adjoint::tests::fd_oracle_agq(
+        &m,
+        &two_dose_subject(&m),
+        1,
+        true,
+    );
     eprintln!("depot LAGTIME: Laplace gradient vs FD {g:.2e}");
     assert!(g.is_finite() && g < 1e-5, "Laplace gradient vs FD {g:.2e}");
 
@@ -1596,7 +1640,14 @@ fn third_order_derivatives_across_an_ode_moving_boundary_are_exact() {
             std::thread::Builder::new()
                 .stack_size(crate::FIT_RAYON_STACK_SIZE)
                 .spawn_scoped(scope, || {
-                    super::subject_adjoint_cov_hessian(m, s, &params, &x, e, Objective::Focei)
+                    ferx_model::sens::ode_provider::adjoint::subject_adjoint_cov_hessian(
+                        m,
+                        s,
+                        &params,
+                        &x,
+                        e,
+                        Objective::Focei,
+                    )
                 })
                 .expect("spawn")
                 .join()
@@ -2059,7 +2110,11 @@ fn joint_pktte_serves_ss_gaussian_rows_and_the_ss_hazard() {
     let mut worst = 0.0f64;
     for (label, s) in [("Gaussian rows", &ss), ("with the hazard", &ss_tte)] {
         for interaction in [true, false] {
-            let w = super::tests::fd_oracle(&m, s, interaction);
+            let w = crate::model_tests::sens::ode_provider::adjoint::tests::fd_oracle(
+                &m,
+                s,
+                interaction,
+            );
             eprintln!("joint PK-TTE SS {label} interaction={interaction}: worst {w:.2e}");
             assert!(w.is_finite(), "{label} interaction={interaction}: {w}");
             worst = worst.max(w);
@@ -2470,7 +2525,8 @@ fn absolute_clock_rhs_across_an_estimated_lag_is_exact_at_third_order() {
         // Linux — the FD references' own noise on a time-dependent field (the TAD fixture
         // above moves 1.2e-5–3.0e-5 with the FD step) — so ~10× headroom over that.
         assert!(h.is_finite() && h < 8e-5, "{label}: R-matrix {h:.2e}");
-        let g = super::tests::fd_oracle_agq(&m, &s, 1, true);
+        let g =
+            crate::model_tests::sens::ode_provider::adjoint::tests::fd_oracle_agq(&m, &s, 1, true);
         eprintln!("{label} RHS, lag: Laplace gradient vs reconverged FD {g:.2e}");
         assert!(g.is_finite() && g < 4e-5, "{label}: Laplace gradient {g:.2e}");
     }
@@ -2517,9 +2573,10 @@ fn eta_dependent_obs_scale_under_ltbs_on_an_ode_is_analytic() {
         assert!(g < 1e-7, "{name}: {g:.2e}");
     }
     let m = tight(parse_model_string(&src(true)).unwrap());
-    let s = super::tests::iov_subject(&m);
+    let s = crate::model_tests::sens::ode_provider::adjoint::tests::iov_subject(&m);
     for (interaction, name) in [(true, "FOCEI"), (false, "FOCE")] {
-        let g = super::tests::iov_parity(&m, &s, interaction);
+        let g =
+            crate::model_tests::sens::ode_provider::adjoint::tests::iov_parity(&m, &s, interaction);
         eprintln!("obs_scale × LTBS (ODE, IOV) {name}: gradient vs reconverged FD {g:.2e}");
         // Measured 1.9e-7 on Linux, both; ~10× headroom.
         assert!(g < 2e-6, "IOV {name}: {g:.2e}");
@@ -2576,7 +2633,7 @@ fn a_subject_past_24_stacked_random_effects_is_served() {
 #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_subject_past_24_stacked_random_effects_matches_reconverged_fd() {
     let (m, s) = wide_iov_fixture();
-    let g = super::tests::iov_parity(&m, &s, true);
+    let g = crate::model_tests::sens::ode_provider::adjoint::tests::iov_parity(&m, &s, true);
     eprintln!("30 stacked: FOCEI gradient vs reconverged FD {g:.2e}");
     // Measured 3.4e-7 on Linux; ~10× headroom.
     assert!(g < 3.4e-6, "{g:.2e}");
@@ -2681,14 +2738,14 @@ fn a_tte_subject_served_from_anothers_template_matches_its_fresh_plan_bitwise() 
         entry_time: 0.0,
         cmt: 3,
     }];
-    let mut b = super::tests::other_data(&a);
+    let mut b = crate::model_tests::sens::ode_provider::adjoint::tests::other_data(&a);
     b.obs_records = vec![crate::types::ObsRecord::Event {
         time: 11.5,
         event_type: crate::types::EventType::Exact,
         entry_time: 0.0,
         cmt: 3,
     }];
-    let (n, k) = super::tests::templated_twin(&m, &a, &b);
+    let (n, k) = crate::model_tests::sens::ode_provider::adjoint::tests::templated_twin(&m, &a, &b);
     assert!(k > 0 && k == n, "PK-TTE: {k} of {n} plans from a template");
 }
 
@@ -4439,7 +4496,7 @@ fn cf_readout_src(lines: &str) -> String {
 /// fails.
 #[test]
 fn a_closed_form_readout_over_an_init_baseline_is_served_and_matches_reconverged_fd() {
-    let src = super::tests::CF_INIT.replace(
+    let src = crate::model_tests::sens::ode_provider::adjoint::tests::CF_INIT.replace(
         "[error_model]",
         "[scaling]\n  y = central / V + 0.2 * central / (V * V)\n[error_model]",
     );
@@ -4565,12 +4622,12 @@ fn a_depot_reading_readout_beside_an_infusion_into_central_matches_reconverged_f
 #[test]
 fn a_depot_reading_closed_form_readout_under_iov_matches_reconverged_fd() {
     // κ_V also moves `KA`, so each occasion's depot differs from the others'.
-    let src = super::tests::CF_IOV
+    let src = crate::model_tests::sens::ode_provider::adjoint::tests::CF_IOV
         .replace("  KA = TVKA\n", "  KA = TVKA * exp(KAPPA_V)\n")
         .replace("[error_model]", "[scaling]\n  y = (central + 0.3 * depot) / V\n[error_model]");
     let m = tight(parse_model_string(&src).unwrap());
     assert!(m.analytic_readout.as_ref().unwrap().references_depot());
-    let s = super::tests::iov_subject(&m);
+    let s = crate::model_tests::sens::ode_provider::adjoint::tests::iov_subject(&m);
     assert!(recorder_in_scope(&m) && served(&m, &s), "scope");
     let jac =
         iov_jacobian_gap(&m, &s, &[0.06, -0.04, 0.05, -0.03, 0.04, 0.02, -0.05, 0.03], "iov depot");
@@ -4656,7 +4713,7 @@ fn an_ode_readout_gather_indexed_by_a_state_is_served_on_every_walk() {
 /// -> the stacked Jacobian gap is O(1).
 #[test]
 fn a_closed_form_readout_over_an_init_baseline_under_iov_matches_reconverged_fd() {
-    let src = super::tests::CF_IOV
+    let src = crate::model_tests::sens::ode_provider::adjoint::tests::CF_IOV
         .replace(
             "  omega ETA_CL ~ 0.09\n",
             "  theta TVC0(0.4, 0.01, 10.0)\n  omega ETA_CL ~ 0.09\n",
@@ -4668,7 +4725,7 @@ fn a_closed_form_readout_over_an_init_baseline_under_iov_matches_reconverged_fd(
         );
     let m = tight(parse_model_string(&src).unwrap());
     assert!(!m.analytical_init.is_empty() && m.analytic_readout.is_some());
-    let s = super::tests::iov_subject(&m);
+    let s = crate::model_tests::sens::ode_provider::adjoint::tests::iov_subject(&m);
     assert!(recorder_in_scope(&m) && served(&m, &s), "scope");
     let jac = iov_jacobian_gap(
         &m,

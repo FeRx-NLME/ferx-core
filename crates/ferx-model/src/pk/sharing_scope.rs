@@ -75,14 +75,14 @@ thread_local! {
     static NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Indices built on this thread, for the tests that count reuse.
     static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The number of indices built on this thread so far.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn builds() -> usize {
     BUILDS.with(|b| b.get())
 }
@@ -164,7 +164,7 @@ pub fn first_record_with_same_pk_inputs<'r>(
     if let Lookup::Hit(first) = lookup {
         return first;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     BUILDS.with(|b| b.set(b.get() + 1));
     let first: Option<Rc<[usize]>> =
         super::first_record_with_same_pk_inputs(model, records.clone()).map(Rc::from);

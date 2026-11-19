@@ -434,7 +434,7 @@ pub const fn tri(k: usize, l: usize) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// #2093 review (round 2, finding 12): a constant exponent is the power rule, finite at a

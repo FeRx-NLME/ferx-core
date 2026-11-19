@@ -4,11 +4,21 @@
 //! A model can carry several CTMM endpoints: the parser reads the unnamed `[markov_model]`
 //! and every named `[markov_model LABEL]`, each keyed by its CMT. Each test recompiles the
 //! model inside its loop — one compile reuses one map and cannot fail.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::markov::ctmm_data_term;
+use ferx_model::markov::StateObs;
+use ferx_model::sens::num::NonRecRead;
+use ferx_model::stats::likelihood::SUBJECT_SENTINEL_NLL;
+use ferx_model::types::EndpointLikelihood;
+use ferx_model::types::GeneratorFn;
+use std::collections::HashMap;
 
-use super::{ctmm_subject_nll, CtmmTerm};
+use crate::model_tests::survival::endpoint_order_test_helpers::{
+    fold, order_sensitive, COMPILES, ETA,
+};
 use crate::parser::model_parser::parse_model_string;
-use crate::survival::endpoint_order_test_helpers::{fold, order_sensitive, COMPILES, ETA};
 use crate::types::{CompiledModel, ObsRecord, Population, Subject};
+use ferx_model::markov::endpoint::{ctmm_subject_nll, CtmmTerm};
 
 /// Three two-state CTMM endpoints on CMT 5, 6, 7, declared in descending CMT order, with
 /// different intensities and one shared η.

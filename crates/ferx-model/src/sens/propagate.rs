@@ -1666,7 +1666,7 @@ pub fn ss_dual_cycle_should_stop<T: PkNum>(
 /// converges, as in the `f64` test.
 fn ss_cycle_converged_recorded<T: PkNum>(cycle: usize, u: &[T], prev: &mut Vec<T>) -> bool {
     use crate::sens::num::BranchCmp as B;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if crate::dosing::force_full_ss_equilibration() {
         prev.clear();
         prev.extend_from_slice(u);
@@ -2449,7 +2449,7 @@ pub fn event_driven_sens_one_cpt_g<T: PkNum>(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::pk::event_driven::event_driven_predictions;
     use crate::sens::dual2::Dual2;
@@ -2821,7 +2821,7 @@ mod tests {
 
     // ── Full 1-cpt event-driven sensitivity walk ─────────────────────
 
-    fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
+    pub fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         let n_obs = obs_times.len();
         Subject {
             id: "1".into(),

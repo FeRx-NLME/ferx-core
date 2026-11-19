@@ -490,7 +490,7 @@ fn slots<F>() -> Box<[OnceLock<Option<Compiled<F>>>]> {
 }
 
 impl JitCode {
-    pub(super) fn new(code: &[Flat], n_regs: usize) -> Self {
+    pub fn new(code: &[Flat], n_regs: usize) -> Self {
         let inner = Arc::new(JitInner {
             code: code.to_vec(),
             n_regs,

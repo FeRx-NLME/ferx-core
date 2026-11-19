@@ -1,5 +1,21 @@
-use super::*;
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::parser::model_parser::IndivParamPartials;
+use ferx_model::parser::model_parser::ThetaBlocks;
+use ferx_model::types::fit_status::FitStatus;
+use ferx_model::types::fit_status::StatusReason;
+use ferx_model::types::multi_start::StartRecord;
+use ferx_model::types::multi_start::StartSpread;
+use ferx_model::types::multi_start::START_AGREE_OFV;
+use ferx_model::types::population_fingerprint::subject_list_difference;
+use ferx_model::types::population_fingerprint::Difference as PopulationDifference;
+use ferx_model::types::population_fingerprint::PopulationFingerprint;
+use ferx_model::types::population_fingerprint::SCHEME as POPULATION_FINGERPRINT_SCHEME;
+use nalgebra::DMatrix;
+use nalgebra::DVector;
+use std::collections::HashMap;
+
 use approx::assert_relative_eq;
+use ferx_model::types::*;
 
 /// `CompiledModel.endpoints` iterates in ascending CMT order — not declaration order, not
 /// a hash order — on every compile (#2531): the contract every sum, row and message over
@@ -9,7 +25,7 @@ use approx::assert_relative_eq;
 #[cfg(feature = "survival")]
 #[test]
 fn endpoints_iterate_in_ascending_cmt_order_on_every_compile() {
-    use crate::survival::endpoint_order_test_helpers::COMPILES;
+    use crate::model_tests::survival::endpoint_order_test_helpers::COMPILES;
     let src = "[parameters]\n  theta TVA(0.10, 0.001, 10.0)\n\
                [event_model c]\n  cmt = 4\n  family = exponential\n  scale = TVA\n\
                [event_model b]\n  cmt = 3\n  family = exponential\n  scale = TVA\n\
@@ -765,7 +781,7 @@ fn classify_warning_flat_parameter_is_warning() {
 /// pasted copy, so a reworded message cannot drift away from the token it is keyed on.
 #[test]
 fn classify_warning_absorption_twin_declined_is_warning() {
-    let w = classify_warning(&super::absorption_twin_declined_warning(
+    let w = classify_warning(&ferx_model::types::absorption_twin_declined_warning(
         "[odes]: name `CENTRAL` collides with a previously-declared state (case-insensitive); \
          state, individual-parameter, and ODE-block intermediate names must all be distinct.",
     ));
@@ -785,7 +801,7 @@ fn classify_warning_twin_decline_beats_prose_arms_in_the_reason() {
         "covariance failed to parse",
         "condition number check rejected the block",
     ] {
-        let w = classify_warning(&super::absorption_twin_declined_warning(reason));
+        let w = classify_warning(&ferx_model::types::absorption_twin_declined_warning(reason));
         assert_eq!(
             w.category.as_str(),
             "absorption_twin_declined",
@@ -803,20 +819,21 @@ fn classify_warning_twin_decline_beats_prose_arms_in_the_reason() {
 fn absorption_twin_decline_reason_round_trips() {
     let mut model = test_helpers::analytical_model(GradientMethod::Fd);
     assert_eq!(
-        super::absorption_twin_decline_reason(&model),
+        ferx_model::types::absorption_twin_decline_reason(&model),
         None,
         "a model with no decline warning has no reason"
     );
-    model
-        .parse_warnings
-        .push(super::absorption_twin_declined_warning("two parameters map to the V slot"));
+    model.parse_warnings.push(ferx_model::types::absorption_twin_declined_warning(
+        "two parameters map to the V slot",
+    ));
     assert_eq!(
-        super::absorption_twin_decline_reason(&model),
+        ferx_model::types::absorption_twin_decline_reason(&model),
         Some("two parameters map to the V slot."),
         "the reason comes back verbatim, with a terminator added"
     );
     // An already-terminated reason is not double-punctuated.
-    let terminated = super::absorption_twin_declined_warning("names must all be distinct.");
+    let terminated =
+        ferx_model::types::absorption_twin_declined_warning("names must all be distinct.");
     assert!(terminated.ends_with("names must all be distinct."), "got: {terminated}");
 }
 

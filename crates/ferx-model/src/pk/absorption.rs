@@ -36,7 +36,7 @@ const LN_2PI: f64 = 1.837_877_066_409_345_5;
 /// through [`InputRateForcing::prepare`] + [`PreparedInputRate::rate`], which hoist the
 /// dose-invariant constants (`ln Γ`, `KTR`, `ln KTR`) out of the per-dose loop (likewise for
 /// the other input-rate functions below).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn transit_input_rate(tad: f64, n: f64, mtt: f64, dose: f64) -> f64 {
     PreparedInputRate::transit(n, mtt).rate(tad, dose)
 }
@@ -67,7 +67,7 @@ pub fn validate_transit(n: f64, mtt: f64) -> Result<(), String> {
 /// `tad → 0` collapses to `R_in → 0` because `−(tad−MAT)²/(2·CV²·MAT·tad)` diverges like
 /// `−MAT/(2·CV²·tad)`, dominating `−1.5·ln tad`. The hot path hoists `c0` and
 /// `1/(2·CV²·MAT)`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn inverse_gaussian_input_rate(tad: f64, mat: f64, cv2: f64, dose: f64) -> f64 {
     PreparedInputRate::inverse_gaussian(mat, cv2).rate(tad, dose)
 }
@@ -1008,7 +1008,7 @@ impl<T: PkNum> PreparedInputRate<T> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use approx::assert_relative_eq;
 

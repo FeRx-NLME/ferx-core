@@ -1,8 +1,36 @@
 //! `theta NAME[COL, ...]` binding (#1064).
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::diagnostics::Diagnostic;
+use ferx_model::diagnostics::EngineError;
+use ferx_model::estimation::parameterization::theta_from_packed;
+use ferx_model::estimation::parameterization::theta_packing_jacobian;
+use ferx_model::estimation::parameterization::theta_se_from_packed;
+use ferx_model::estimation::sir_settings::percentile_ci;
+use ferx_model::occasions::apply_iov_occasion_rule;
+use ferx_model::parser::model_parser::eval_gather;
+use ferx_model::parser::model_parser::level_index_column;
+use ferx_model::parser::model_parser::parse_full_model_with;
+use ferx_model::parser::model_parser::DataBindings;
+use ferx_model::parser::model_parser::EtaCoupling;
+use ferx_model::parser::model_parser::EtaRoute;
+use ferx_model::parser::model_parser::LevelBinding;
+use ferx_model::parser::model_parser::LevelBindings;
+use ferx_model::parser::model_parser::LevelBlockDecl;
+use ferx_model::parser::model_parser::LevelContrast;
+use ferx_model::parser::model_parser::LevelRule;
+use ferx_model::parser::model_parser::ParseBindings;
+use ferx_model::parser::model_parser::ScaleShare;
+use ferx_model::stats::nested_levels::label_path;
+use ferx_model::stats::nested_levels::NestedLayout;
+use ferx_model::types::IovOccasionRule;
+use ferx_model::types::NestedLevels;
+use ferx_model::types::ObsRecord;
+use ferx_model::types::ParsedModel;
+use std::collections::HashMap;
 
-use super::*;
 use crate::parser::model_parser::parse_full_model;
 use crate::types::{CompiledModel, DoseEvent, FitOptions, Population, Subject};
+use ferx_model::levels::*;
 
 /// An MBMA-shaped model: an unstructured placebo effect per (STUDY, TIME) cell,
 /// added to a typical value that also carries between-study variability.
@@ -919,8 +947,8 @@ mod theta_gather_index_check {
 
 // ── #1064: binder helpers, branch by branch ────────────────────────────────
 mod binder_helpers {
-    use super::super::{cmp_levels, contrast_token, format_level_value, free_count, Level};
     use super::*;
+    use ferx_model::levels::{cmp_levels, contrast_token, format_level_value, free_count, Level};
 
     #[test]
     fn level_values_render_without_a_trailing_point_zero() {
@@ -951,7 +979,7 @@ mod binder_helpers {
     /// table repeating a level gives the first entry's index.
     #[test]
     fn the_index_lookup_is_level_equality_under_eq() {
-        use super::super::write_index_column;
+        use ferx_model::levels::write_index_column;
         let parsed = parse_full_model(&no_eta_model()).unwrap();
         let decl = parsed.model.theta_blocks().level_blocks()[0].clone();
         let index_at = |study: f64, table: &[(Level, usize)]| -> Result<f64, String> {
@@ -8195,7 +8223,7 @@ mod absorption {
     /// named in `others` coded sum-to-zero.
     fn carried_fixed(
         text: &str, pop0: &Population, fixed: &[&str], others: &[&str],
-    ) -> super::super::Carried {
+    ) -> ferx_model::levels::Carried {
         let none = regex::Regex::new(r",\s*contrast\s*=\s*\w+\s*\]")
             .unwrap()
             .replace_all(text, ", contrast = none]")
@@ -8214,13 +8242,13 @@ mod absorption {
             model.default_params.theta_fixed[k] = true;
         }
         let at = |name: &str| decls.iter().position(|d| d.name() == name).unwrap();
-        let coded: Vec<super::super::Coded> = others
+        let coded: Vec<ferx_model::levels::Coded> = others
             .iter()
-            .map(|o| super::super::Coded {
+            .map(|o| ferx_model::levels::Coded {
                 decl: &decls[at(o)],
                 levels: &levels[at(o)],
                 contrast: LevelContrast::SumToZero,
-                groups: super::super::assign_groups(
+                groups: ferx_model::levels::assign_groups(
                     &decls[at(o)],
                     &levels[at(o)],
                     LevelContrast::SumToZero,
@@ -8228,7 +8256,7 @@ mod absorption {
             })
             .collect();
         let p = at("PLACEBO");
-        super::super::carried(
+        ferx_model::levels::carried(
             &model,
             &decls[p],
             &levels[p],
@@ -8254,7 +8282,7 @@ mod absorption {
     /// level-1 row gives `Held`).
     #[test]
     fn a_fixed_level_codes_no_column_in_its_own_block() {
-        use super::super::Carried;
+        use ferx_model::levels::Carried;
         let pop = three_pop();
         let r = row_1836("fix", format!("  E0 = {NO_INTERCEPT} + TVB * D1"), false);
         let text = with_thetas(row_text(&r)("sum_to_zero"), &[("TVB", 0.5)]);
@@ -8293,7 +8321,7 @@ mod absorption {
     /// fixed row gives `Held`).
     #[test]
     fn a_fixed_level_codes_no_column_in_another_block() {
-        use super::super::Carried;
+        use ferx_model::levels::Carried;
         let pop = three_pop();
         let decl = level_decl("B2[OCC]", "sum_to_zero");
         let text = |c: &str| {
@@ -13295,23 +13323,23 @@ mod level_uncertainty {
 
 /// A level block read by a discrete-state endpoint (#2562).
 #[cfg(feature = "survival")]
-#[path = "theta_levels_binary_tests.rs"]
+#[path = "api__tests__theta_levels_binary_tests.rs"]
 mod binary_records;
 
 /// A level `TIME` key reads the time as written (#1959, #1796).
-#[path = "theta_levels_written_time_tests.rs"]
+#[path = "api__tests__theta_levels_written_time_tests.rs"]
 mod written_time_keys;
 
 /// A level block against kappas at nested levels (#2034).
-#[path = "theta_levels_nested_units_tests.rs"]
+#[path = "api__tests__theta_levels_nested_units_tests.rs"]
 mod nested_units;
 
 /// The span certificate on an ODE model's carried-over state (#1877).
-#[path = "theta_levels_carry_over_tests.rs"]
+#[path = "api__tests__theta_levels_carry_over_tests.rs"]
 mod carry_over;
 
 /// The span certificate on a random effect that scales the residual error (#1879).
-#[path = "theta_levels_residual_scale_tests.rs"]
+#[path = "api__tests__theta_levels_residual_scale_tests.rs"]
 mod residual_scale;
 
 mod carried_scale {
@@ -13371,11 +13399,11 @@ mod carried_scale {
         let text = scale_model();
         let mut p = pop.clone();
         let mut parsed = parse_full_model(&text).unwrap();
-        super::super::DENSE_COUNTS.with(|d| d.borrow_mut().clear());
+        ferx_model::levels::DENSE_COUNTS.with(|d| d.borrow_mut().clear());
         let err = crate::api::bind_theta_levels(&mut parsed, &text, &mut p)
             .expect_err("the intercept carries the levels' mean: refused")
             .to_string();
-        let counts = super::super::DENSE_COUNTS.with(|d| d.borrow().clone());
+        let counts = ferx_model::levels::DENSE_COUNTS.with(|d| d.borrow().clone());
         assert!(!counts.is_empty(), "the refusal never reached the certificate: {err}");
         assert!(counts.iter().all(|&c| c <= 5), "population-wide vectors per basis: {counts:?}");
         assert!(err.starts_with("theta PLACEBO[STUDY]: "), "{err}");

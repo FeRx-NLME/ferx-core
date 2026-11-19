@@ -1,9 +1,48 @@
-use super::*;
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::cold_sort::ColdSort;
+use ferx_model::dosing::first_record;
+use ferx_model::dosing::is_real_infusion;
+use ferx_model::dosing::note_ss_nonconvergence_if_capped;
+use ferx_model::dosing::record_ss_equilibration_cycles;
+use ferx_model::dosing::resolve_subject_doses;
+use ferx_model::dosing::resolve_subject_doses_with;
+use ferx_model::dosing::ss_equilibrates_at_arrival;
+use ferx_model::dosing::ss_residual_infusion_ends;
+use ferx_model::dosing::ss_seed_phase;
+use ferx_model::dosing::ss_seeded_at_record;
+use ferx_model::dosing::FirstRecord;
+use ferx_model::dosing::SsStopTracker;
+use ferx_model::dosing::SS_EQUILIBRATION_CYCLES;
+use ferx_model::ode::solver::solve_ode_certified;
+use ferx_model::ode::solver::solve_ode_dense_with_auto_state;
+use ferx_model::ode::solver::OdeAutoSwitchState;
+use ferx_model::ode::solver::OdeSolverOptions;
+use ferx_model::ode::solver::OdeSolverStats;
+use ferx_model::pk::absorption::PreparedInputRate;
+use ferx_model::sens::num::NonRecRead;
+use ferx_model::sim::adaptive::assay_standard_normal;
+use ferx_model::sim::adaptive::AdaptiveMonitor;
+use ferx_model::sim::adaptive::AdaptiveRun;
+use ferx_model::sim::adaptive::AssayNoise;
+use ferx_model::sim::adaptive::ControllerCtx;
+use ferx_model::sim::adaptive::ControllerDecision;
+use ferx_model::sim::adaptive::DecisionLogEntry;
+use ferx_model::sim::adaptive::DecisionOutcome;
+use ferx_model::sim::adaptive::DoseAction;
+use ferx_model::sim::adaptive::DoseLedgerEntry;
+use ferx_model::sim::adaptive::MonitorSpec;
+use ferx_model::sim::adaptive::ObserveMode;
+use ferx_model::sim::adaptive::ObservedSignal;
+use ferx_model::types::PkParams;
+use ferx_model::types::Subject;
+use std::collections::HashMap;
+
 #[cfg(test)]
 use crate::sens::num::NonRecording;
 use crate::sim::adaptive::AssayRow;
 use crate::types::DoseEvent;
 use approx::assert_relative_eq;
+use ferx_model::ode::predictions::*;
 
 /// 1-cpt IV bolus ODE: dA/dt = -ke·A. RHS reads CL,V from pk_params_flat.
 fn one_cpt_ode_spec() -> OdeSpec {
@@ -1726,7 +1765,7 @@ fn locf_decision_cov_carries_forward_prefers_obs_and_falls_back() {
 /// it, moves at least one row of the table.
 #[test]
 fn the_adaptive_record_index_resolves_in_force_and_governing_records() {
-    use super::AdaptiveRecord::{Dose, Obs, PkOnly, Reset};
+    use ferx_model::ode::predictions::AdaptiveRecord::{Dose, Obs, PkOnly, Reset};
 
     let mut s =
         make_subject(vec![DoseEvent::new(40.0, 10.0, 1, 0.0, false, 0.0)], vec![0.0, 24.0, 48.0]);
@@ -1784,7 +1823,7 @@ fn the_adaptive_record_index_resolves_in_force_and_governing_records() {
 /// implied dose @24, where the row is still a record.
 #[test]
 fn the_adaptive_record_index_skips_an_implied_dose_for_in_force_only() {
-    use super::AdaptiveRecord::{Dose, Obs};
+    use ferx_model::ode::predictions::AdaptiveRecord::{Dose, Obs};
 
     let implied = |t: f64, gov: f64| {
         let mut d = DoseEvent::new(t, 10.0, 1, 0.0, false, 0.0);
@@ -2173,10 +2212,12 @@ fn adaptive_tv_pk_only_records_drive_per_event_pk() {
 /// The decision records (#2895) of a covariate-free IOV driver test: each decision's PK is
 /// the occasion PK it reads (`decision_covariates = locf` with no covariate, so the record
 /// and the readout are one `pk_param_fn` call in production).
-fn iov_decision_records<'a>(times: &'a [f64], pk: &[PkParams]) -> super::DecisionRecords<'a> {
+fn iov_decision_records<'a>(
+    times: &'a [f64], pk: &[PkParams],
+) -> ferx_model::ode::predictions::DecisionRecords<'a> {
     static NO_COVARIATES: std::sync::LazyLock<HashMap<String, f64>> =
         std::sync::LazyLock::new(HashMap::new);
-    super::DecisionRecords {
+    ferx_model::ode::predictions::DecisionRecords {
         times,
         pk: pk.to_vec(),
         cov: vec![&*NO_COVARIATES; times.len()],
@@ -8654,7 +8695,9 @@ fn an_infusion_end_between_records_runs_on_the_terminating_record() {
 /// three-way choice.
 #[test]
 fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
-    use super::{governing_segment_occ_at, governing_segment_pk_at, AdaptiveRecordIndex};
+    use ferx_model::ode::predictions::{
+        governing_segment_occ_at, governing_segment_pk_at, AdaptiveRecordIndex,
+    };
 
     let records = AdaptiveRecordIndex::new(&make_subject(vec![], vec![0.0, 30.0]), 0);
 
@@ -8666,8 +8709,10 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
         pk_only: vec![],
         reset: Vec::new(),
     };
-    let occ_of =
-        super::AdaptiveRecordOcc { obs: vec![Some(0_usize), Some(1_usize)], ..Default::default() };
+    let occ_of = ferx_model::ode::predictions::AdaptiveRecordOcc {
+        obs: vec![Some(0_usize), Some(1_usize)],
+        ..Default::default()
+    };
     // The LOCF carry the walk holds when it reaches the t=24 break: the earlier window.
     let (last_pk, last_occ) = (pk_one(99.0, 100.0), Some(0_usize));
 
@@ -8707,7 +8752,7 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
     with_reset.reset_times = vec![27.0];
     let records = AdaptiveRecordIndex::new(&with_reset, 0);
     let event_pk = crate::pk::EventPkParams { reset: vec![pk_one(33.0, 100.0)], ..event_pk };
-    let occ_of = super::AdaptiveRecordOcc {
+    let occ_of = ferx_model::ode::predictions::AdaptiveRecordOcc {
         reset: vec![Some(1_usize)],
         obs: vec![Some(0_usize), Some(2_usize)],
         ..Default::default()
@@ -13638,7 +13683,7 @@ fn absorbed_fraction(
 /// must absorb exactly its own mass.
 #[test]
 fn an_in_flight_dose_absorbs_exactly_its_mass_when_its_kernel_parameter_switches() {
-    use InputRateKind::*;
+    use ferx_model::pk::absorption::InputRateKind::*;
     // (kind, arg slots, parameters at the dose, parameters after the switch, switch time)
     let cases: [(InputRateKind, &[usize], [f64; 2], [f64; 2], f64); 6] = [
         (Transit, &[ARG_1, ARG_2], [3.0, 4.0], [3.0, 2.5], 5.0),
@@ -15440,7 +15485,8 @@ fn every_raw_observable_reader_names_who_converts_it() {
         ("adaptive_frozen_replay_tv", "none: the verifier compares raw readouts by design"),
         ("adaptive_monitor_signal", "itself: AdaptiveMonitor::scale_readout"),
     ];
-    let readers = raw_observable_readers(include_str!("predictions.rs"));
+    let readers =
+        raw_observable_readers(include_str!("../../crates/ferx-model/src/ode/predictions.rs"));
     let mut found: Vec<&str> = readers.iter().map(String::as_str).collect();
     let mut listed: Vec<&str> = CONVERTED_BY.iter().map(|(n, _)| *n).collect();
     found.sort_unstable();

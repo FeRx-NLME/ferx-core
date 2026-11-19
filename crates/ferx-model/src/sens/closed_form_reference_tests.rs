@@ -30,7 +30,7 @@ fn cases() -> Vec<Case> {
     let nums = |s: &str| -> Vec<f64> {
         s.split(',').filter(|x| !x.is_empty()).map(|x| x.parse().expect("number")).collect()
     };
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/closed_form_mpmath.txt");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/closed_form_mpmath.txt");
     std::fs::read_to_string(path)
         .expect("fixture")
         .lines()

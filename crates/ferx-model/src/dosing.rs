@@ -44,7 +44,7 @@ pub fn resolve_subject_doses_with<'a>(
 
 /// Whether `d` is a plain `SS=1` bolus record into a compartment fed by one `zero_order()`
 /// window and nothing else (#2786) — the doses [`lower_zero_order_ss`] rewrites.
-fn is_zero_order_ss_record(attr_map: &crate::types::DoseAttrMap, d: &DoseEvent) -> bool {
+pub fn is_zero_order_ss_record(attr_map: &crate::types::DoseAttrMap, d: &DoseEvent) -> bool {
     d.ss && d.ii > 0.0
         && d.amt > 0.0
         && matches!(d.rate_mode, crate::types::RateMode::Fixed)
@@ -81,11 +81,12 @@ pub fn lower_zero_order_ss<'a>(
 
 /// Test seam: subjects lowered whose first dose carries the marker amount of this module's fit
 /// fixture, so a test counts its own fit's lowerings among the parallel suite's.
-#[cfg(test)]
-static MARKER_LOWERINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(any(test, feature = "test-support"))]
+pub static MARKER_LOWERINGS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::DoseAttrMap) {
-    #[cfg(test)]
+pub fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::DoseAttrMap) {
+    #[cfg(any(test, feature = "test-support"))]
     if subject.doses.first().is_some_and(|d| d.amt == 4321.5) {
         MARKER_LOWERINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -315,7 +316,7 @@ where
 /// (`f64::max` would otherwise drop a `NaN`).
 pub fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
     // Test-only: force the full cycle budget to compare against the early stop (#532).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get()) {
         return false;
     }
@@ -328,7 +329,7 @@ pub fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
 }
 
 /// The test-only full-budget switch, for the recording type's convergence test.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn force_full_ss_equilibration() -> bool {
     FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get())
 }
@@ -373,24 +374,24 @@ impl SsStopTracker {
 
 /// Absolute L∞ change `max|cur − prev|` between SS cycles (#867); see
 /// [`SsStopTracker::abs_increments`].
-fn ss_abs_increment(cur: &[f64], prev: &[f64]) -> f64 {
+pub fn ss_abs_increment(cur: &[f64], prev: &[f64]) -> f64 {
     cur.iter().zip(prev).fold(0.0_f64, |m, (&a, &b)| m.max((a - b).abs()))
 }
 
 /// L∞ magnitude `max|cur|` of a cycle state — the scale the absolute tail is normalised against
 /// (#867). `0.0` when `cur` is all-zero (nothing has accumulated).
-fn ss_max_magnitude(cur: &[f64]) -> f64 {
+pub fn ss_max_magnitude(cur: &[f64]) -> f64 {
     cur.iter().fold(0.0_f64, |m, &x| m.max(x.abs()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Cycles the most recent SS-equilibration call ran (test-only observation of the #519
     /// early stop; end-value tolerances alone would absorb a too-early exit, #532).
     static LAST_SS_EQUILIBRATION_CYCLES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
     /// Branch the most recent SS equilibration took — see [`SsBranch`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     static LAST_SS_EQUILIBRATION_BRANCH: std::cell::Cell<SsBranch> =
         const { std::cell::Cell::new(SsBranch::None) };
 
@@ -413,7 +414,7 @@ thread_local! {
 
 /// Whether the most recent SS equilibration on this thread warned (test observation; see
 /// [`LAST_SS_NONCONVERGENCE_WARNING`]). Use this, never the sink, in a lib test (#1289, #2071).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn last_ss_equilibration_warned() -> bool {
     LAST_SS_NONCONVERGENCE_WARNING.with(|c| c.borrow().is_some())
 }
@@ -422,14 +423,14 @@ pub fn last_ss_equilibration_warned() -> bool {
 /// observation; see [`LAST_SS_NONCONVERGENCE_WARNING`]). The same string
 /// [`note_ss_nonconvergence_if_capped`] inserts into the sink, so a lib test can check the
 /// message without racing the draining `api` entry points (#2071).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn last_ss_equilibration_warning() -> Option<String> {
     LAST_SS_NONCONVERGENCE_WARNING.with(|c| c.borrow().clone())
 }
 
 /// How many times this thread has cleared or drained the SS non-convergence sink (test
 /// observation; see [`SS_SINK_DRAINS`]).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn ss_sink_drains_on_this_thread() -> usize {
     SS_SINK_DRAINS.with(|c| c.get())
 }
@@ -439,12 +440,12 @@ pub fn ss_sink_drains_on_this_thread() -> usize {
 ///
 /// Called with `None` at the top of every top-level equilibration, so paths that never reach
 /// the capped fallback do not report a stale warning from an earlier call on this thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn record_ss_nonconvergence_warning(warning: Option<&str>) {
     LAST_SS_NONCONVERGENCE_WARNING.with(|c| *c.borrow_mut() = warning.map(str::to_owned));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn record_ss_equilibration_cycles(n: usize) {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.set(n));
 }
@@ -475,26 +476,26 @@ pub enum SsBranch {
     InputRateTrain,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn record_ss_equilibration_branch(b: SsBranch) {
     LAST_SS_EQUILIBRATION_BRANCH.with(|c| c.set(b));
 }
 
 /// Branch the most recent SS equilibration took (test observation; see [`SsBranch`]).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn last_ss_equilibration_branch() -> SsBranch {
     LAST_SS_EQUILIBRATION_BRANCH.with(|c| c.get())
 }
 
 /// Cycles the most recent SS-equilibration call ran (test observation; see above).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn last_ss_equilibration_cycles() -> usize {
     LAST_SS_EQUILIBRATION_CYCLES.with(|c| c.get())
 }
 
 /// Run `f` with every SS-equilibration path forced to the full cycle budget (#532). A drop
 /// guard restores the prior value, so a panic or a nested call cannot leak the flag.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
     struct Reset(bool);
     impl Drop for Reset {
@@ -508,17 +509,17 @@ pub fn with_full_ss_equilibration<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// No-op in non-test builds (zero cost on the hot path).
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 #[inline(always)]
 pub fn record_ss_equilibration_cycles(_n: usize) {}
 
 /// Non-test counterpart (same signature, so call sites are unconditional).
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 #[inline(always)]
 pub fn record_ss_equilibration_branch(_b: SsBranch) {}
 
 /// Non-test counterpart (same signature, so call sites are unconditional).
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 #[inline(always)]
 pub fn record_ss_nonconvergence_warning(_warning: Option<&str>) {}
 
@@ -546,15 +547,16 @@ pub const SS_WARN_REL_TOL: f64 = 1e-2;
 /// wrap their `_diag` forms, so they drain too and discard the note. Writers that do not drain
 /// (e.g. `pk::compute_predictions_with_states`) leave their note for the next draining entry
 /// point of the same run, whose clear discards it.
-type SsSink = std::sync::Mutex<std::collections::HashMap<u64, std::collections::BTreeSet<String>>>;
+pub type SsSink =
+    std::sync::Mutex<std::collections::HashMap<u64, std::collections::BTreeSet<String>>>;
 
-fn ss_nonconvergence_sink() -> &'static SsSink {
+pub fn ss_nonconvergence_sink() -> &'static SsSink {
     static SINK: std::sync::OnceLock<SsSink> = std::sync::OnceLock::new();
     SINK.get_or_init(std::sync::Mutex::default)
 }
 
 /// The sink bucket of the run the calling thread belongs to.
-fn ss_run_key() -> u64 {
+pub fn ss_run_key() -> u64 {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
     kj::run_of(kj::current_fit())
 }
@@ -608,7 +610,7 @@ pub fn note_ss_nonconvergence_if_capped(
 /// tail `rel_last·ρ/(1−ρ)`. `ρ ≥ 1` (not contracting, no periodic SS) warns only past the
 /// `rel_last ≤ SS_WARN_REL_TOL` noise floor, where solver jitter makes `ρ` meaningless. The
 /// floor is not applied to the `ρ < 1` branch: a near-1 ratio has a small step but a large tail.
-fn ss_equilibration_tail_warning(
+pub fn ss_equilibration_tail_warning(
     early_stopped: bool, abs_prev: f64, abs_last: f64, mag: f64,
 ) -> Option<String> {
     if early_stopped || abs_last <= 0.0 {
@@ -662,7 +664,7 @@ fn ss_equilibration_tail_warning(
 /// this after its prediction pass and appends the result to `FitResult.warnings`. See
 /// [`ss_nonconvergence_sink`].
 pub fn take_ss_nonconvergence_warnings() -> Vec<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
     ss_nonconvergence_sink()
         .lock()
@@ -675,7 +677,7 @@ pub fn take_ss_nonconvergence_warnings() -> Vec<String> {
 /// Clear any residual SS non-convergence warnings so a top-level `api` call starts from a clean
 /// sink (#867). See [`ss_nonconvergence_sink`].
 pub fn clear_ss_nonconvergence_warnings() {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
     drop_ss_run(ss_run_key());
 }
@@ -1114,7 +1116,7 @@ pub fn ss_arrival_is_trough(dose: &DoseEvent, lag: f64) -> bool {
 /// TAD folds already used before they were collapsed onto this function; it is deliberately
 /// *not* [`crate::ode::predictions::EVENT_MATCH_TOL`], which answers a different question
 /// (does this break time *name* this event) on a much looser scale.
-const TAD_EPS: f64 = 1e-12;
+pub const TAD_EPS: f64 = 1e-12;
 
 /// **The** rule for what `TAD` at time `t` is measured from, for one dose — `None` when
 /// this dose has no referent at `t` yet.
@@ -1717,119 +1719,6 @@ mod dose_index_tests {
 }
 
 #[cfg(test)]
-mod first_record_tests {
-    use super::{first_record, FirstRecord};
-    use crate::types::Subject;
-    use std::io::Write;
-
-    /// Each subject is a tie at TIME 0 between two records of the kinds in its name, in
-    /// the file order its name gives, followed by an observation at TIME 2. The first row
-    /// of every tie carries WT = 70 and the second WT = 140, so the first record in file
-    /// order — NONMEM's `A_0` seed (`nonmem_anchor/init_seed_tie`) — is the one with
-    /// WT = 70.
-    const TIES: &str = "\
-ID,TIME,DV,MDV,EVID,AMT,CMT,WT
-1,0,1,0,0,0,1,70
-1,0,1,0,0,0,1,140
-1,2,1,0,0,0,1,140
-2,0,0,1,2,0,1,70
-2,0,0,1,2,0,1,140
-2,2,1,0,0,0,1,140
-3,0,0,1,1,100,1,70
-3,0,0,1,1,100,1,140
-3,2,1,0,0,0,1,140
-4,0,0,1,2,0,1,70
-4,0,1,0,0,0,1,140
-4,2,1,0,0,0,1,140
-5,0,1,0,0,0,1,70
-5,0,0,1,2,0,1,140
-5,2,1,0,0,0,1,140
-6,0,0,1,1,100,1,70
-6,0,1,0,0,0,1,140
-6,2,1,0,0,0,1,140
-7,0,1,0,0,0,1,70
-7,0,0,1,1,100,1,140
-7,2,1,0,0,0,1,140
-8,0,0,1,1,100,1,70
-8,0,0,1,2,0,1,140
-8,2,1,0,0,0,1,140
-9,0,0,1,2,0,1,70
-9,0,0,1,1,100,1,140
-9,2,1,0,0,0,1,140
-";
-
-    fn wt(s: &Subject, rec: FirstRecord) -> f64 {
-        let cov = match rec {
-            FirstRecord::Dose(k) => s.dose_cov(k),
-            FirstRecord::PkOnly(m) => s.pk_only_cov(m),
-            FirstRecord::Obs(j) => s.obs_cov(j),
-        };
-        cov["WT"]
-    }
-
-    fn kind(rec: FirstRecord) -> &'static str {
-        match rec {
-            FirstRecord::Dose(_) => "dose",
-            FirstRecord::PkOnly(_) => "pk-only",
-            FirstRecord::Obs(_) => "obs",
-        }
-    }
-
-    /// #2121: the selector returns the first record in file order for every pair of kinds
-    /// and both file orders, on the reader's own output (so after its #614/#1810 ULP
-    /// moves, which are what turn file order into the walk's order).
-    #[test]
-    fn first_record_is_first_in_file_order_for_every_kind_pair() {
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(TIES.as_bytes()).unwrap();
-        let pop = crate::read_nonmem_csv(f.path(), None, None).unwrap();
-        // (ID, kind of the first row in file order).
-        let want = [
-            ("1", "obs"),
-            ("2", "pk-only"),
-            ("3", "dose"),
-            ("4", "pk-only"),
-            ("5", "obs"),
-            ("6", "dose"),
-            ("7", "obs"),
-            ("8", "dose"),
-            ("9", "pk-only"),
-        ];
-        for (id, want_kind) in want {
-            let s = pop.subjects.iter().find(|s| s.id == id).expect(id);
-            let rec = first_record(s, s.doses.len()).expect("records");
-            assert_eq!(
-                (kind(rec), wt(s, rec)),
-                (want_kind, 70.0),
-                "ID {id}: the seed must be the tie's first row in file order"
-            );
-        }
-        // The straddle: each mixed pair is in the file in both orders, and the two orders
-        // pick records of different kinds. A rule that ignored file order (a fixed kind
-        // preference, or last-wins) cannot satisfy both halves of a pair.
-        for (a, b) in [("4", "5"), ("6", "7"), ("8", "9")] {
-            let k = |id: &str| {
-                let s = pop.subjects.iter().find(|s| s.id == id).unwrap();
-                kind(first_record(s, s.doses.len()).unwrap())
-            };
-            assert_ne!(k(a), k(b), "IDs {a}/{b}: the two file orders pick one kind");
-        }
-    }
-
-    /// `n_doses` caps the dose candidates (the adaptive replay's appended controller doses
-    /// are not records), and a subject with no record has no seed.
-    #[test]
-    fn first_record_skips_doses_past_n_doses_and_is_none_without_records() {
-        let mut s = Subject { id: "1".into(), obs_times: vec![1.0], ..Default::default() };
-        s.doses.push(crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
-        assert_eq!(first_record(&s, 1), Some(FirstRecord::Dose(0)));
-        assert_eq!(first_record(&s, 0), Some(FirstRecord::Obs(0)));
-        let empty = Subject::default();
-        assert_eq!(first_record(&empty, 0), None);
-    }
-}
-
-#[cfg(test)]
 mod governing_record_tests {
     use super::governing_record_indices;
 
@@ -2404,77 +2293,6 @@ mod residual_pulse_count_tests {
         assert_eq!(re.count_ending_after(100.0), n - 9);
         assert_eq!(re.count_ending_at_or_after(0.0), n);
         assert_eq!(re.count_ending_at_or_after(100.0), n - 8);
-    }
-}
-
-#[cfg(test)]
-mod zero_order_binding_tests {
-    //! A fit lowers an `SS=1` dose into a `zero_order()` window once, where it binds the data,
-    //! not by a clone of the subject in every walk (#2786 review).
-    use super::*;
-    use std::path::Path;
-    use std::sync::atomic::Ordering::Relaxed;
-
-    const DATA: &str = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,II,SS
-1,0,1,1,0,4321.5,0,1,12,1
-1,2,0,0,80.0,0,0,1,0,0
-1,6,0,0,55.0,0,0,1,0,0
-1,10,0,0,40.0,0,0,1,0,0
-2,0,1,1,0,4321.5,0,1,12,1
-2,2,0,0,90.0,0,0,1,0,0
-2,6,0,0,60.0,0,0,1,0,0
-2,10,0,0,45.0,0,0,1,0,0
-";
-
-    fn fixture(amt: &str) -> (crate::types::CompiledModel, crate::types::Population) {
-        let model = crate::parser::model_parser::parse_model_file(Path::new(
-            "examples/zero_order_absorption.ferx",
-        ))
-        .expect("model");
-        let dir = tempfile::tempdir().expect("tmp");
-        let csv = dir.path().join("d.csv");
-        std::fs::write(&csv, DATA.replace("4321.5", amt)).expect("write");
-        let pop = crate::read_nonmem_csv(&csv, None, None).expect("data");
-        (model, pop)
-    }
-
-    /// Mutation: return `Cow::Borrowed` from `lower_population_zero_order_ss` -> the bound
-    /// population is not lowered and every walk clones its subject.
-    #[test]
-    fn a_bound_population_is_lowered_once_and_its_walks_borrow() {
-        let (model, pop) = fixture("4321.25");
-        let map = model.active_dose_attr_map();
-        assert!(
-            matches!(lower_zero_order_ss(&pop.subjects[0], map), Cow::Owned(_)),
-            "fixture: the data as read is rewritten by every walk"
-        );
-        let bound = lower_population_zero_order_ss(&pop, map);
-        assert!(matches!(bound, Cow::Owned(_)));
-        for s in &bound.subjects {
-            assert!(matches!(lower_zero_order_ss(s, map), Cow::Borrowed(_)));
-            assert!(is_lowered_zero_order_ss(map, &s.doses[0]));
-        }
-        assert!(matches!(lower_population_zero_order_ss(&bound, map), Cow::Borrowed(_)));
-        // The data as read is untouched: the lowering is the fit's own.
-        assert!(!pop.subjects[0].doses[0].is_infusion());
-    }
-
-    /// A whole fit lowers each affected subject exactly once. Mutation: drop the binding in
-    /// `fit_inner` -> every walk lowers (thousands of lowerings, not 2).
-    #[test]
-    fn a_fit_lowers_each_subject_once() {
-        let (model, pop) = fixture("4321.5");
-        let o = crate::types::FitOptions {
-            method: crate::types::EstimationMethod::FoceI,
-            outer_maxiter: 2,
-            threads: Some(1),
-            verbose: false,
-            ..crate::types::FitOptions::default()
-        };
-        let before = MARKER_LOWERINGS.load(Relaxed);
-        crate::api::fit(&model, &pop, &model.default_params, &o).expect("fit");
-        let n = MARKER_LOWERINGS.load(Relaxed) - before;
-        assert_eq!(n, pop.subjects.len(), "lowerings per fit");
     }
 }
 

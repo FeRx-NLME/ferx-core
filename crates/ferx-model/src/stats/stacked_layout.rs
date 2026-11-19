@@ -73,7 +73,7 @@ pub fn block_diag_stack(a: &DMatrix<f64>, b: &DMatrix<f64>, n_groups: usize) -> 
     m
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Layouts built on this thread — every [`StackedLayout::new`] and
     /// [`NestedLayout::of`]. The layout depends on the subject alone, so a search that
@@ -85,7 +85,7 @@ thread_local! {
 /// Count one layout build (test builds only); see `LAYOUT_BUILDS`.
 #[inline]
 pub fn count_build() {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     LAYOUT_BUILDS.with(|c| c.set(c.get() + 1));
 }
 
@@ -350,4 +350,4 @@ impl StackedLayout {
 
 #[cfg(test)]
 #[path = "stacked_layout_tests.rs"]
-mod tests;
+pub mod tests;

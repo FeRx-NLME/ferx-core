@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 // `FERX_PROFILE=1` accumulates the count and wall-time of the f64 event-driven
 // prediction across the whole fit (printed by the CLI via [`profile_report`]).
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test-only count of [`EventSchedule::for_subject`] calls on **this thread**. It is the
     /// assertion that distinguishes "a schedule was built" from "a schedule was *reused*" (an
@@ -40,13 +40,13 @@ thread_local! {
 }
 
 /// Test-only: this thread's [`EventSchedule::for_subject`] count.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn schedule_build_count() -> u64 {
     SCHEDULE_BUILDS.with(|c| c.get())
 }
 
 /// Test-only: zero this thread's [`EventSchedule::for_subject`] count.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn reset_schedule_build_count() {
     SCHEDULE_BUILDS.with(|c| c.set(0));
 }
@@ -218,7 +218,7 @@ impl EventSchedule {
         subject: &Subject, pk_model: PkModel, doses: &[DoseEvent], dose_lagtimes: &[f64],
     ) -> Self {
         // A plan's recording builds what its runs replay: runtime work only (#2786).
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if !crate::parser::model_parser::rhs_regcode::kernel_jit::recording_open() {
             SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
         }
@@ -1366,7 +1366,7 @@ pub fn propagate_one_cpt_oral(
 // ─── 3-compartment models ────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::types::DoseEvent;
     use approx::assert_relative_eq;
@@ -1387,7 +1387,7 @@ mod tests {
         p
     }
 
-    fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
+    pub fn make_subject(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Subject {
         let n_obs = obs_times.len();
         Subject {
             id: "1".into(),

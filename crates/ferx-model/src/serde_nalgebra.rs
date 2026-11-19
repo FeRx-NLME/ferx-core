@@ -112,7 +112,7 @@ pub mod vec_vec_dvector {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
 

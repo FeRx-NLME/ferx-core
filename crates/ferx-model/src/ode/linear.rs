@@ -488,7 +488,7 @@ fn pooled_pade_entries<T: PkNum>() -> usize {
 }
 
 /// [`Expm::exp`] of one matrix.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn expm_g<T: PkNum>(a: &[T], n: usize) -> Option<Vec<T>> {
     debug_assert_eq!(a.len(), n * n, "expm_g: matrix must be n×n row-major");
     if n == 0 {
@@ -563,7 +563,7 @@ const SPECTRAL_CHECK_RTOL: f64 = 1e-11;
 /// carries four.
 const SPECTRAL_JET_STEPS: usize = 5;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: propagate every segment by Padé, as before the spectral path.
     pub static SPECTRAL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -581,11 +581,11 @@ thread_local! {
 
 #[inline]
 fn spectral_enabled() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         !SPECTRAL_OFF.with(|c| c.get())
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         true
     }
@@ -606,7 +606,7 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
             m | (1 << i)
         }
     });
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let ty = std::any::type_name::<T>();
         let recorded = ty.ends_with("kernel_jit::Tr");
@@ -1290,7 +1290,7 @@ impl<T: PkNum> AffinePieces<T> {
     ) -> Option<Self> {
         // The test seam every exact linear segment honours (`FORCE_LINEAR_DECLINE`): a decline a
         // model file cannot produce on finite values, for the caller's fallback to be seen.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if crate::ode::solver::FORCE_LINEAR_DECLINE.get() {
             return None;
         }
@@ -1588,7 +1588,7 @@ fn segment_span<T: PkNum>(
                 states.extend_from_slice(x);
             }
             if ok {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 SPECTRAL_HITS.with(|c| c.set(c.get() + 1));
                 return Some(points(saveat, interp_at, &pos, states, n));
             }
@@ -1638,7 +1638,7 @@ fn segment_span<T: PkNum>(
         );
     }
     let nl = live.len();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     DORMANT_STATES.with(|c| c.set(c.get() + (n - nl)));
     let m = nl + 1;
     for (li, &i) in live.iter().enumerate() {
@@ -1780,7 +1780,7 @@ struct LinWs<T> {
 }
 
 impl<T: PkNum> LinWs<T> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         LinWs {
             probe: Vec::new(),
             b: Vec::new(),
@@ -1819,7 +1819,7 @@ impl<T: PkNum> LinWs<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Dormant states left out of an exponential, summed over this thread's segments: what
     /// lets a test tell that the reduction ran, rather than a fixture with none to reduce.
@@ -1848,4 +1848,4 @@ fn with_workspace<T: PkNum, R>(f: impl FnOnce(&mut LinWs<T>) -> R) -> R {
 
 #[cfg(test)]
 #[path = "linear_tests.rs"]
-mod tests;
+pub mod tests;

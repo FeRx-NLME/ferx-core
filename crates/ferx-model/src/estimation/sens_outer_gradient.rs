@@ -25,7 +25,7 @@ pub fn subject_packed_gradient(
 
 /// The exact per-subject **FOCE** (Sheiner–Beal, no interaction) gradient `dFᵢ/dx` in the
 /// packed space, at FOCE's frozen-variance EBE.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn subject_packed_gradient_foce(
     model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     eta_hat: &[f64],
@@ -34,7 +34,7 @@ pub fn subject_packed_gradient_foce(
 }
 
 /// `subject_packed_gradient_foce` for an **IOV** subject, over the stacked EBE.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn subject_packed_gradient_foce_iov(
     model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     stacked_eta_hat: &[f64],

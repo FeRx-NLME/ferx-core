@@ -1,9 +1,32 @@
 //! #2531: [`TteTerm`] sums its endpoints in ascending CMT order on every compile.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::sens::num::PkNum;
+use ferx_model::stats::likelihood::SUBJECT_SENTINEL_NLL;
+use ferx_model::survival::parametric::cum_hazard;
+use ferx_model::survival::parametric::hazard_and_cum_hazard;
+use ferx_model::survival::parametric::hazard_and_cum_hazard_g;
+use ferx_model::survival::parametric::mean_survival;
+use ferx_model::survival::parametric::median_survival;
+use ferx_model::survival::parametric::sample_conditional_event_time;
+use ferx_model::survival::parametric::sample_event_time;
+use ferx_model::types::CompiledModel;
+use ferx_model::types::EndpointLikelihood;
+use ferx_model::types::EventType;
+use ferx_model::types::HazardFamily;
+use ferx_model::types::HazardSpec;
+use ferx_model::types::ObsRecord;
+use ferx_model::types::RtteClock;
+use ferx_model::types::SimOutcome;
+use ferx_model::types::Subject;
+use ferx_model::types::TteRecurrence;
+use nalgebra::DMatrix;
+use rand::RngExt;
+use std::collections::HashMap;
 
-use super::endpoint_order_test_helpers::{
+use crate::model_tests::survival::endpoint_order_test_helpers::{
     fold, order_sensitive, EndpointOrderFixture, COMPILES, ETA,
 };
-use super::TteTerm;
+use ferx_model::survival::TteTerm;
 
 /// `TteTerm::new(..).eval_shared::<f64>` — the dual walk's per-subject TTE sum — is the
 /// ascending-CMT sum of the per-endpoint terms, bit for bit, on every one of `COMPILES`

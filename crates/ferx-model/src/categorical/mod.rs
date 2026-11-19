@@ -29,12 +29,12 @@ use crate::types::{
 use rand::RngExt;
 use std::collections::HashMap;
 
-mod count;
+pub mod count;
 pub use count::{count_diagnostics, count_pearson_residual, predict_count, simulate_count};
 
 /// `log(1 + eˣ)`, computed without overflow: `max(x, 0) + log1p(e^{−|x|})`.
 #[inline]
-fn softplus(x: f64) -> f64 {
+pub fn softplus(x: f64) -> f64 {
     x.max(0.0) + (-x.abs()).exp().ln_1p()
 }
 
@@ -45,7 +45,7 @@ fn softplus(x: f64) -> f64 {
 /// The same function as the `[covariate_nn]` sigmoid, and the same code: it delegates to
 /// `nn::activation::sigmoid`, which is compiled in every build (#1331), so the two cannot drift.
 #[inline]
-fn inv_logit(x: f64) -> f64 {
+pub fn inv_logit(x: f64) -> f64 {
     crate::nn::activation::sigmoid(x)
 }
 
@@ -63,7 +63,7 @@ fn inv_logit(x: f64) -> f64 {
 /// [`neg_log_normal_cdf_jet`], whose value and derivatives never form `Φ` in the lower tail
 /// (below `x = −2`), where it would underflow.
 #[inline]
-fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
+pub fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
     // A recording type (#2786) records each term as one primitive of its jet.
     if T::RECORDS_BRANCHES {
         use crate::sens::num::JetFn;
@@ -93,7 +93,7 @@ fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) 
 }
 
 /// Below this `x`, [`neg_log_normal_cdf_jet`] takes the lower-tail continued fraction.
-const PROBIT_CF_BELOW: f64 = -2.0;
+pub const PROBIT_CF_BELOW: f64 = -2.0;
 
 /// `g(x) = −log Φ(x)` and its first four derivatives, the probit record term of
 /// [`binary_record_nll_g`] (#2603). Accurate to `f64` rounding in both tails, which the
@@ -170,7 +170,7 @@ pub fn neg_log_normal_cdf_jet(x: f64) -> [f64; 5] {
 /// Filtering by CMT here (rather than trusting the caller) keeps a second binary
 /// CMT's rows from being double-counted and lets callers pass a subject's full
 /// `obs_records` with zero allocation.
-fn for_each_binary_lp<F>(
+pub fn for_each_binary_lp<F>(
     lp_fn: &LinearPredictorFn, cmt: usize, records: &[ObsRecord], theta: &[f64], eta: &[f64],
     snaps: Option<&[HashMap<String, f64>]>, baseline: &HashMap<String, f64>, mut f: F,
 ) where
@@ -210,7 +210,7 @@ fn for_each_binary_lp<F>(
 /// reset-delimited occasions, where the internal timeline is shifted to stay monotonic.
 /// The predictor itself is always evaluated on the internal clock; only reporting uses
 /// this field.
-struct BinaryRecordLp<'a> {
+pub struct BinaryRecordLp<'a> {
     /// Internal (occasion-shifted) clock — what `with_model_time` must be given for any
     /// *further* predictor evaluation on this record, so it agrees with `lp` above.
     model_time: f64,
@@ -228,7 +228,9 @@ struct BinaryRecordLp<'a> {
 /// order; this helper exists to filter to the binary family. RNG consumption order,
 /// emitted row order, and therefore `simulate_with_seed`'s reproducibility all depend on
 /// visiting endpoints in that fixed order.
-fn binary_endpoints(model: &CompiledModel) -> impl Iterator<Item = (usize, &EndpointLikelihood)> {
+pub fn binary_endpoints(
+    model: &CompiledModel,
+) -> impl Iterator<Item = (usize, &EndpointLikelihood)> {
     model
         .binary_cmts()
         .into_iter()
@@ -277,7 +279,7 @@ pub fn binary_data_term(
 
 /// `P(Y = 1)` for one record's linear predictor under `link`.
 #[inline]
-fn binary_prob(link: LinkFn, lp: f64) -> f64 {
+pub fn binary_prob(link: LinkFn, lp: f64) -> f64 {
     match link {
         LinkFn::Logit => inv_logit(lp),
         LinkFn::Probit => crate::stats::special::pnorm(lp),
@@ -456,7 +458,7 @@ impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
 
 /// Exact `(value, ∂²/∂η²)` of [`discrete_subject_nll`] from the subject's [`DiscreteTerm`]
 /// plan (#2786). `None` when the term does not record or on a non-finite derivative.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn discrete_subject_eta_hessian(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, nalgebra::DMatrix<f64>)> {
@@ -710,7 +712,7 @@ pub fn validate_binary_states(cmt: usize, records: &[ObsRecord]) -> Result<(), S
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     fn const_lp(value: f64) -> LinearPredictorFn {
@@ -942,84 +944,6 @@ mod tests {
         assert_eq!(p.prob(1), Some(0.7));
         assert_eq!(p.prob(2), None, "out-of-range index must be None, not a panic");
         assert_eq!(Prediction::Continuous { pred: 1.0 }.prob(0), None);
-    }
-}
-
-#[cfg(test)]
-pub mod exact_eta_hessian_tests {
-    use super::*;
-
-    /// A model string against an example dataset, through the production loader.
-    pub fn load(src: &str, data: &str) -> crate::api::PreparedRun {
-        let root = env!("CARGO_MANIFEST_DIR");
-        let f = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
-        std::fs::write(f.path(), src).unwrap();
-        crate::api::prepare_run(f.path().to_str().unwrap(), Some(&format!("{root}/{data}")))
-            .unwrap()
-    }
-
-    /// The binary η-Hessian is exact. With `lp = TH0 + ETA_0 + THX·X + THT·TIME·exp(ETA_1)`
-    /// it is `Σ p(1−p)∇lp∇lpᵀ + (p − y)∇²lp`, `∇lp = (1, THT·TIME·e^{η₁})`, `∇²lp` nonzero
-    /// only at `(1,1)` (`= ∇lp₁`): built here by hand and matched to rounding; and the
-    /// production route takes it (the stencil agrees to its own accuracy).
-    #[test]
-    fn the_binary_eta_hessian_is_exact() {
-        let prep = load(
-            r"
-[parameters]
-  theta TH0(0.2, -10.0, 10.0)
-  theta THX(0.4, -10.0, 10.0)
-  theta THT(0.05, -10.0, 10.0)
-  omega ETA_0 ~ 0.3
-  omega ETA_1 ~ 0.2
-[covariates]
-  X continuous
-[binary_model]
-  cmt   = 3
-  logit = TH0 + ETA_0 + THX * X + THT * TIME * exp(ETA_1)
-",
-            "data/binary_logistic.csv",
-        );
-        let model = &prep.parsed.model;
-        let theta = &model.default_params.theta;
-        let eta = [0.11, -0.07];
-        let mut worst_closed = 0.0f64;
-        let mut n = 0;
-        for s in prep.population.subjects.iter().take(6) {
-            if s.obs_records.is_empty() {
-                continue;
-            }
-            let (_, h) = discrete_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
-            // By hand.
-            let mut want = nalgebra::DMatrix::<f64>::zeros(2, 2);
-            for r in &s.obs_records {
-                let ObsRecord::DiscreteState { time, state, .. } = r else {
-                    continue;
-                };
-                let x = s.covariates.get("X").copied().unwrap_or(0.0);
-                let tt = theta[2] * time * eta[1].exp();
-                let lp = theta[0] + eta[0] + theta[1] * x + tt;
-                let p = inv_logit(lp);
-                let y = (*state as f64).min(1.0);
-                let g = [1.0, tt];
-                for k in 0..2 {
-                    for l in 0..2 {
-                        want[(k, l)] += p * (1.0 - p) * g[k] * g[l];
-                    }
-                }
-                want[(1, 1)] += (p - y) * tt;
-            }
-            let scale = want.iter().fold(1e-300f64, |a, &v| a.max(v.abs()));
-            for (a, b) in h.iter().zip(want.iter()) {
-                worst_closed = worst_closed.max((a - b).abs() / scale);
-            }
-            n += 1;
-        }
-        assert!(n > 2, "too few subjects ({n})");
-        eprintln!("binary η-Hessian: vs closed form {worst_closed:.2e}");
-        // Measured 1.4e-17 against the closed form (`non_gaussian_eta_hessian_tests` pins the
-        // same Hessian against a Richardson stencil of the value path).
-        assert!(worst_closed < 1e-12, "{worst_closed:.2e}");
     }
 }
 

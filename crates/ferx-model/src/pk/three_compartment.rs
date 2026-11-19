@@ -228,7 +228,7 @@ pub fn three_cpt_predict(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use approx::assert_relative_eq;
 

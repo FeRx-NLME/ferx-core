@@ -233,7 +233,7 @@ pub fn ess_tail(chains: &[Vec<f64>]) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use rand::rngs::StdRng;
     use rand::SeedableRng;

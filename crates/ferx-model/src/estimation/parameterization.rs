@@ -2208,7 +2208,7 @@ pub fn step_held(cov: Option<&DMatrix<f64>>, p: usize) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use approx::assert_relative_eq;
 

@@ -38,7 +38,7 @@ use crate::types::{
 
 /// The record time, addressable as a level column even though it is not a
 /// covariate.
-const TIME_COLUMN: &str = "TIME";
+pub const TIME_COLUMN: &str = "TIME";
 
 /// Bind every level block in `parsed` against `population`, mutating
 /// both: the population gains the synthesized index columns, and `parsed.model`
@@ -83,7 +83,7 @@ pub fn level_binding_error(message: impl Into<String>) -> Diagnostic {
 }
 
 /// The body of [`bind_theta_levels`]; every refusal is the level half's.
-fn bind_levels_on_data(
+pub fn bind_levels_on_data(
     parsed: &mut ParsedModel, model_text: &str, population: &mut Population,
 ) -> Result<(), String> {
     // Every level-block name and column is the declared one, whatever contrast a
@@ -329,7 +329,7 @@ pub fn bind_theta_levels_from_fit(
 }
 
 /// The body of [`bind_theta_levels_from_fit`]; every refusal is the level half's.
-fn bind_levels_from_fit_layout(
+pub fn bind_levels_from_fit_layout(
     parsed: &mut ParsedModel, model_text: &str, population: &mut Population, fitted: &LevelBindings,
 ) -> Result<(), String> {
     let decls: Vec<LevelBlockDecl> =
@@ -570,7 +570,7 @@ pub fn levels_hold_on(
 }
 
 /// A model re-parsed on a fit's bindings, not yet installed in its `ParsedModel`.
-struct FitLayout {
+pub struct FitLayout {
     /// The level blocks `model_text` declares.
     decls: Vec<LevelBlockDecl>,
     model: CompiledModel,
@@ -591,7 +591,7 @@ impl FitLayout {
 /// [`layout_from_fit`]: validate `fitted` against the model and re-parse on it. `None` when the model declares nothing data-derived and
 /// the fit carries nothing, which leaves `parsed` as it is. Reads `parsed` only for
 /// its non-data bindings and name, and writes nothing.
-fn lay_out_on_fit(
+pub fn lay_out_on_fit(
     parsed: &ParsedModel, model_text: &str, fitted: &DataBindings,
 ) -> Result<Option<FitLayout>, Diagnostic> {
     use crate::covariate_stats::stats_binding_error;
@@ -663,7 +663,7 @@ pub fn write_fitted_level_columns(
 /// The refusal for a fit that carries no data-derived bindings at all, on a model
 /// that needs them (#1619). One clause per half the model actually has, so a
 /// level-only model hears nothing about statistics and the reverse.
-fn no_fit_bindings_message(decls: &[LevelBlockDecl], symbolic: &[String]) -> String {
+pub fn no_fit_bindings_message(decls: &[LevelBlockDecl], symbolic: &[String]) -> String {
     let mut needs: Vec<String> = Vec::new();
     if !decls.is_empty() {
         needs.push(format!(
@@ -695,7 +695,7 @@ fn no_fit_bindings_message(decls: &[LevelBlockDecl], symbolic: &[String]) -> Str
 /// (#1730). It names actions, not functions, since a wrapper passes it through
 /// verbatim; it does not say the data's levels differ from the fit's, which is not
 /// checked and is false on the fit's own data.
-fn fit_bound_message(decls: &[LevelBlockDecl]) -> String {
+pub fn fit_bound_message(decls: &[LevelBlockDecl]) -> String {
     format!(
         "{}: this model is laid out on a fit's levels, so binding it to the levels of \
          this data would read the fitted theta at other positions. To run this data on \
@@ -716,7 +716,9 @@ fn fit_bound_message(decls: &[LevelBlockDecl]) -> String {
 /// group) is refused here, with the fault placed in the bindings. Some of these the
 /// re-parse would accept silently; for the others this gives the message, and the
 /// guarantee that nothing was written first.
-fn validate_fitted_levels(decls: &[LevelBlockDecl], fitted: &LevelBindings) -> Result<(), String> {
+pub fn validate_fitted_levels(
+    decls: &[LevelBlockDecl], fitted: &LevelBindings,
+) -> Result<(), String> {
     let mut extra: Vec<&str> = fitted
         .keys()
         .filter(|name| !decls.iter().any(|d| d.name() == name.as_str()))
@@ -770,7 +772,7 @@ fn validate_fitted_levels(decls: &[LevelBlockDecl], fitted: &LevelBindings) -> R
 /// of the right length and reads the fitted values under the other convention (#1680
 /// review). A split group the parser refuses too; the check here gives the message,
 /// and the guarantee that nothing was written first.
-fn check_binding_shape(decl: &LevelBlockDecl, binding: &LevelBinding) -> Result<(), String> {
+pub fn check_binding_shape(decl: &LevelBlockDecl, binding: &LevelBinding) -> Result<(), String> {
     if binding.contrast == LevelContrast::Auto {
         return Err(format!(
             "theta {}[{}]: the fit's level bindings are malformed: they record the contrast \
@@ -810,7 +812,7 @@ fn check_binding_shape(decl: &LevelBlockDecl, binding: &LevelBinding) -> Result<
 /// never observed. Computed for every block before any column is written, so a
 /// refusal leaves `population` untouched. `fitted` has passed
 /// [`validate_fitted_levels`], so every block has an entry.
-fn fitted_level_tables(
+pub fn fitted_level_tables(
     decls: &[LevelBlockDecl], population: &Population, fitted: &LevelBindings,
 ) -> Result<Vec<Vec<(Level, usize)>>, String> {
     let mut tables: Vec<Vec<(Level, usize)>> = Vec::with_capacity(decls.len());
@@ -829,7 +831,7 @@ fn fitted_level_tables(
 /// order. [`bind_from_fit`] writes a population's index columns from the table, and
 /// [`level_index_finding`] re-derives from it the index each record should carry, so
 /// the binder and the check cannot disagree about what a label is.
-fn match_level_table(
+pub fn match_level_table(
     decl: &LevelBlockDecl, population: &Population, labels: &[String],
 ) -> Result<(Vec<(Level, usize)>, Vec<String>), String> {
     // Keyed, not `position`: at MBMA scale (thousands of levels) a linear search per level
@@ -855,7 +857,7 @@ fn match_level_table(
 /// keys are equal exactly when the values are `==`, for values holding no `NaN`. The
 /// one spelling of level equality the binder ([`write_index_column`]) and the level-table
 /// check ([`match_level_table`]) share (#1799).
-fn level_key(values: &[f64]) -> Vec<u64> {
+pub fn level_key(values: &[f64]) -> Vec<u64> {
     values.iter().map(|v| (v + 0.0).to_bits()).collect()
 }
 
@@ -975,7 +977,7 @@ pub fn level_index_finding(
 /// [`level_index_finding`]'s arm for subjects with no Gaussian observation (#1797): the
 /// first whose baseline columns name a level of the model's table but whose index is not
 /// that level's position. The level is matched by label, as [`match_level_table`] does.
-fn no_gaussian_misindexed(
+pub fn no_gaussian_misindexed(
     decl: &LevelBlockDecl, population: &Population, column: &str,
 ) -> Option<LevelIndexFinding> {
     for subject in population.subjects.iter().filter(|s| level_rows(decl, s).next().is_none()) {
@@ -1002,7 +1004,7 @@ fn no_gaussian_misindexed(
 
 /// Each label that occurs more than once in `labels`, once, in order of first
 /// occurrence.
-fn repeated_labels(labels: &[String]) -> Vec<&str> {
+pub fn repeated_labels(labels: &[String]) -> Vec<&str> {
     let mut repeated: Vec<&str> = Vec::new();
     for (i, label) in labels.iter().enumerate() {
         if labels[..i].contains(label) && !repeated.contains(&label.as_str()) {
@@ -1018,7 +1020,7 @@ fn repeated_labels(labels: &[String]) -> Vec<&str> {
 /// the model grows a θ the fit never had and the design reads the first copy.
 /// The fault is in the bindings, not the design, so the message says nothing
 /// about the design's levels.
-fn repeated_labels_message(decl: &LevelBlockDecl, repeated: &[&str]) -> String {
+pub fn repeated_labels_message(decl: &LevelBlockDecl, repeated: &[&str]) -> String {
     format!(
         "theta {}[{}]: the fit's level bindings list {} level(s) more than once: {}. \
          Each level has exactly one fitted theta, so the bindings are malformed — they \
@@ -1033,7 +1035,7 @@ fn repeated_labels_message(decl: &LevelBlockDecl, repeated: &[&str]) -> String {
 /// The refusal for design levels the fit never observed. Every label is listed — a
 /// caller (the R wrapper) passes the text through verbatim, and a list cut short would
 /// leave the user guessing which records to drop.
-fn unseen_levels_message(decl: &LevelBlockDecl, unseen: &[String]) -> String {
+pub fn unseen_levels_message(decl: &LevelBlockDecl, unseen: &[String]) -> String {
     let mut message = format!(
         "theta {}[{}]: the design has {} level(s) the fit estimated no theta for: {}. \
          A level's theta exists only for a combination the fit's data observed.",
@@ -1059,13 +1061,13 @@ fn unseen_levels_message(decl: &LevelBlockDecl, unseen: &[String]) -> String {
 
 /// A level: the tuple of column values that defines it.
 #[derive(Debug, Clone, PartialEq)]
-struct Level {
-    values: Vec<f64>,
+pub struct Level {
+    pub values: Vec<f64>,
 }
 
 impl Level {
     /// `STUDY=7,TIME=4` — the label the θ is reported under.
-    fn label(&self, columns: &[String]) -> String {
+    pub fn label(&self, columns: &[String]) -> String {
         columns
             .iter()
             .zip(&self.values)
@@ -1083,7 +1085,7 @@ impl Level {
 
 /// Render a level value without a trailing `.0` on integers, which is what
 /// study ids and visit numbers almost always are.
-fn format_level_value(v: f64) -> String {
+pub fn format_level_value(v: f64) -> String {
     if v.fract() == 0.0 && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {
@@ -1094,7 +1096,7 @@ fn format_level_value(v: f64) -> String {
 /// Compare two level tuples lexicographically. `total_cmp` rather than
 /// `partial_cmp` so the order is total even if a column carries a NaN — the
 /// binding must be reproducible run to run.
-fn cmp_levels(a: &Level, b: &Level) -> std::cmp::Ordering {
+pub fn cmp_levels(a: &Level, b: &Level) -> std::cmp::Ordering {
     for (x, y) in a.values.iter().zip(&b.values) {
         let ord = x.total_cmp(y);
         if ord != std::cmp::Ordering::Equal {
@@ -1109,14 +1111,14 @@ fn cmp_levels(a: &Level, b: &Level) -> std::cmp::Ordering {
 /// reads the block ([`LevelBlockDecl::record_cmts`], #2562). A record of either kind is
 /// scored at its own level, so each one names a level the block must hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LevelRow {
+pub enum LevelRow {
     Obs(usize),
     Record(usize),
 }
 
 /// The rows of `subject` that define `decl`'s levels: every Gaussian observation, then
 /// every discrete-state record on one of the block's [`LevelBlockDecl::record_cmts`].
-fn level_rows<'a>(
+pub fn level_rows<'a>(
     decl: &'a LevelBlockDecl, subject: &'a Subject,
 ) -> impl Iterator<Item = LevelRow> + 'a {
     rows_on(&decl.record_cmts, subject)
@@ -1124,7 +1126,7 @@ fn level_rows<'a>(
 
 /// [`level_rows`] for a block whose discrete-state readers are the endpoints on
 /// `record_cmts`.
-fn rows_on<'a>(
+pub fn rows_on<'a>(
     record_cmts: &'a [usize], subject: &'a Subject,
 ) -> impl Iterator<Item = LevelRow> + 'a {
     let records = subject.obs_records.iter().enumerate().filter_map(|(r, rec)| match rec {
@@ -1142,7 +1144,7 @@ fn rows_on<'a>(
 /// observation; for a discrete-state record, its `TIME` as written (`raw_time`, the
 /// clock [`column_value`] keys on too) or the column in its own covariate snapshot
 /// (`snaps`, the subject's [`Subject::record_covariate_snapshots`]), else the baseline.
-fn row_value(
+pub fn row_value(
     subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, column: &str, row: LevelRow,
 ) -> Option<f64> {
     match row {
@@ -1164,7 +1166,7 @@ fn row_value(
 
 /// The level index the predictors read on `row`: the observation's snapshot
 /// ([`Subject::obs_cov`]) or the record's ([`Subject::record_cov`]).
-fn row_index(
+pub fn row_index(
     subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, column: &str, row: LevelRow,
 ) -> Option<f64> {
     match row {
@@ -1174,7 +1176,7 @@ fn row_index(
 }
 
 /// The time a message names for `row`: the written time either way.
-fn row_time(subject: &Subject, row: LevelRow) -> Option<f64> {
+pub fn row_time(subject: &Subject, row: LevelRow) -> Option<f64> {
     match row {
         LevelRow::Obs(j) => Some(subject.readout_time(j)),
         LevelRow::Record(_) => row_value(subject, None, TIME_COLUMN, row),
@@ -1189,7 +1191,7 @@ fn row_time(subject: &Subject, row: LevelRow) -> Option<f64> {
 /// stacked-reset subject's later periods sit on a shifted clock. Keyed on that, one
 /// written time split into two cells, and a reset period's label named a time the
 /// data never holds (#1796).
-fn column_value(subject: &Subject, column: &str, j: usize) -> Option<f64> {
+pub fn column_value(subject: &Subject, column: &str, j: usize) -> Option<f64> {
     if column.eq_ignore_ascii_case(TIME_COLUMN) {
         return (j < subject.obs_times.len()).then(|| subject.readout_time(j));
     }
@@ -1203,7 +1205,9 @@ fn column_value(subject: &Subject, column: &str, j: usize) -> Option<f64> {
 
 /// The observed level combinations, sorted so each group's levels are
 /// contiguous and the binding is reproducible.
-fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec<Level>, String> {
+pub fn discover_levels(
+    decl: &LevelBlockDecl, population: &Population,
+) -> Result<Vec<Level>, String> {
     let mut levels: Vec<Level> = Vec::new();
     // Deduplicated by key rather than `Vec::contains`, which was O(records × levels) and
     // ran on every call through the level-table check (#1762). The first-seen values of a
@@ -1249,13 +1253,13 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 /// defines a level on it, so the block cannot be estimated. Each arm follows it with its
 /// own next step (#2819). The definer arm never appends it: there, that the data has no
 /// record on the reading endpoint is the fact the user can act on.
-const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the records of a `[binary_model]`, \
+pub const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the records of a `[binary_model]`, \
                                    `[count_model]` or DTMM `[markov_model]` endpoint define a \
                                    level, and this data has none of them, so it cannot estimate \
                                    the block.";
 
 /// The part both next steps share (#2819): rows that would define a level.
-const ADD_DEFINING_ROWS: &str = "add rows that define a level, scored by an expression that \
+pub const ADD_DEFINING_ROWS: &str = "add rows that define a level, scored by an expression that \
                                  reads it.";
 
 /// The refusal for a block [`discover_levels`] found no level of. Every Gaussian
@@ -1274,7 +1278,7 @@ const ADD_DEFINING_ROWS: &str = "add rows that define a level, scored by an expr
 /// would turn the bare name into a covariate, so the step is to declare it as one scalar
 /// θ. There the reason for the Gaussian reader is not restated, since the closing
 /// sentence gives it.
-fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
+pub fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
     // One exhaustive pass, so a new `ObsRecord` variant fails to compile here rather than
@@ -1379,7 +1383,7 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
 
 /// The columns that would key a block's levels to subjects: the leading ones,
 /// or for a one-column block the column itself.
-fn subject_key_columns(decl: &LevelBlockDecl) -> &[String] {
+pub fn subject_key_columns(decl: &LevelBlockDecl) -> &[String] {
     match decl.columns().len() {
         1 => decl.columns(),
         n => &decl.columns()[..n - 1],
@@ -1390,7 +1394,7 @@ fn subject_key_columns(decl: &LevelBlockDecl) -> &[String] {
 /// one subject for a kappa, or under nested levels (#1082) a group of the
 /// kappa's own level within one subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Unit {
+pub enum Unit {
     Subject,
     Occasion,
     /// A group of nested level `L` (outermost 0): the records whose label path
@@ -1405,7 +1409,7 @@ enum Unit {
 /// [`Unit::Level`]. `None` when the row has none — no occasions, or a missing
 /// label — so a kappa counts nowhere there (`fit()` reports the missing
 /// occasions or labels later).
-fn unit_of(
+pub fn unit_of(
     subject: &Subject, unit: Unit, j: usize, nested: Option<&NestedLevels>,
 ) -> Option<Vec<u64>> {
     match unit {
@@ -1421,7 +1425,7 @@ fn unit_of(
 /// [`unit_of`] for a [`LevelRow`]. A discrete-state record carries no occasion, so on
 /// [`Unit::Occasion`] it lies in none, and a kappa counts nowhere there; under nested
 /// levels its label path is read off its own snapshot (#2562).
-fn unit_of_row(
+pub fn unit_of_row(
     subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, unit: Unit, row: LevelRow,
     nested: Option<&NestedLevels>,
 ) -> Option<Vec<u64>> {
@@ -1448,7 +1452,7 @@ fn unit_of_row(
 /// unit's (#1649). It does not ask the leading columns to identify subjects:
 /// two subjects of one study on disjoint times nest a `[STUDY, TIME]` block in
 /// subjects while sharing its `STUDY` key.
-fn levels_nest_in_units(
+pub fn levels_nest_in_units(
     decl: &LevelBlockDecl, population: &Population, unit: Unit, nested: Option<&NestedLevels>,
 ) -> bool {
     let mut owner: HashMap<Vec<u64>, (usize, Vec<u64>)> = HashMap::new();
@@ -1487,7 +1491,7 @@ fn levels_nest_in_units(
 /// Such a block is a free curve per subject at the observed times, so it
 /// reproduces any per-subject effect at all, whatever route a random effect
 /// takes to `y`.
-fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged: bool) -> bool {
+pub fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged: bool) -> bool {
     if decl.columns().len() < 2 {
         return false;
     }
@@ -1522,7 +1526,7 @@ fn resolves_observations(decl: &LevelBlockDecl, population: &Population, lagged:
 /// the predictor's `TIME` reads), one compartment and one covariate snapshot, so the data
 /// gives a random effect no way to move one and not the other. A record carries no
 /// occasion and no lag acts on it.
-fn records_replicate(
+pub fn records_replicate(
     subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, r0: usize, r: usize,
 ) -> bool {
     let key = |r: usize| match subject.obs_records.get(r) {
@@ -1555,7 +1559,7 @@ fn records_replicate(
 /// separates at all are not replicates, and the span certificate measures
 /// them; two at one exact engine time still are, since every arrival at that
 /// time acts on both or on neither.
-fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
+pub fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
     fn same<T: PartialEq>(v: &[T], j: usize, k: usize) -> bool {
         v.get(j) == v.get(k)
     }
@@ -1578,7 +1582,7 @@ fn replicates(subject: &Subject, j: usize, k: usize, lagged: bool) -> bool {
 /// (`EtaCoupling::funnels`): within each subject for an η, within each
 /// occasion of a subject for a kappa, and within each group of its level for a
 /// kappa of a nested model.
-fn constant_within_units(
+pub fn constant_within_units(
     decl: &LevelBlockDecl, covariates: &[String], population: &Population, unit: Unit,
     nested: Option<&NestedLevels>,
 ) -> bool {
@@ -1607,7 +1611,7 @@ fn constant_within_units(
 
 /// A random effect a block absorbs, and where the binder found it, for its
 /// diagnostics.
-struct Absorbed<'a> {
+pub struct Absorbed<'a> {
     coupling: &'a EtaCoupling,
     /// The parameters that read the random effect directly
     /// (`LevelBlockDecl::eta_readers`).
@@ -1619,7 +1623,7 @@ struct Absorbed<'a> {
     unit_kind: Unit,
 }
 
-enum How<'a> {
+pub enum How<'a> {
     /// An expression that reads the block and the random effect.
     Site(&'a ScaleShare),
     /// The random effect reaching `y` by a route that never meets the block, on
@@ -1639,7 +1643,7 @@ enum How<'a> {
 /// random effect on the residual error, measured in the residual channel too
 /// (#1879).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Absorption {
+pub struct Absorption {
     span: Span,
     with: Vec<usize>,
     residual: bool,
@@ -1648,7 +1652,7 @@ struct Absorption {
 /// What the span certificate measured for one random effect (#1834): in every
 /// unit, its effect on `y` is a combination of the block's level effects there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Span {
+pub enum Span {
     /// Some combination: a contrast that leaves each group's mean free absorbs
     /// it, and `sum_to_zero_within` may not.
     Levels,
@@ -1706,7 +1710,7 @@ impl Absorbed<'_> {
 
 /// `, moved together with `A` and `B`,` — the partners of a random effect the
 /// span certificate measured jointly (#1878); empty when it has none.
-fn together(with: &[String]) -> String {
+pub fn together(with: &[String]) -> String {
     let names: Vec<String> = with.iter().map(|n| format!("`{n}`")).collect();
     match names.split_last() {
         None => String::new(),
@@ -1717,7 +1721,7 @@ fn together(with: &[String]) -> String {
 
 /// What one unit is called in a refusal: `subject`, `occasion`, or under
 /// nested levels the level's group (`` `STUDY` group ``).
-fn unit_noun(unit: Unit, nested: Option<&NestedLevels>) -> String {
+pub fn unit_noun(unit: Unit, nested: Option<&NestedLevels>) -> String {
     match unit {
         Unit::Subject => "subject".to_string(),
         Unit::Occasion => "occasion".to_string(),
@@ -1732,7 +1736,9 @@ fn unit_noun(unit: Unit, nested: Option<&NestedLevels>) -> String {
 /// first): a subject for an η; for a kappa, an occasion, or under nested levels
 /// (#1082) a group of the level the kappa is declared `at`
 /// (`NestedLevels::kappa_level`).
-fn unit_of_random_effect(decl: &LevelBlockDecl, k: usize, nested: Option<&NestedLevels>) -> Unit {
+pub fn unit_of_random_effect(
+    decl: &LevelBlockDecl, k: usize, nested: Option<&NestedLevels>,
+) -> Unit {
     if !decl.eta_couplings[k].kappa {
         return Unit::Subject;
     }
@@ -1750,7 +1756,7 @@ fn unit_of_random_effect(decl: &LevelBlockDecl, k: usize, nested: Option<&Nested
 /// levels nest in ([`levels_nest_in_units`]) — a subject for an η, an occasion
 /// for a kappa, a group of its level for a kappa of a nested model — or `None`
 /// when they do not, and the block cannot absorb it.
-fn nesting_units(
+pub fn nesting_units(
     decl: &LevelBlockDecl, population: &Population, nested: Option<&NestedLevels>,
 ) -> Vec<Option<Unit>> {
     let mut verdicts: Vec<(Unit, bool)> = Vec::new();
@@ -1775,7 +1781,7 @@ fn nesting_units(
 /// block that resolves the observations, any route the random effect takes to
 /// `y`. `None` when the walk names no site, which is where the span certificate
 /// is measured ([`spanned`]).
-fn structural_site<'a>(
+pub fn structural_site<'a>(
     decl: &LevelBlockDecl, c: &'a EtaCoupling, population: &Population, unit: Unit,
     nested: Option<&NestedLevels>, resolving: bool,
 ) -> Option<How<'a>> {
@@ -1794,7 +1800,7 @@ fn structural_site<'a>(
 }
 
 /// Where the structural walk leaves one random effect of a block on this data.
-enum Placement<'a> {
+pub enum Placement<'a> {
     /// The block's levels do not nest in its units: the block cannot absorb it.
     Unnested,
     /// Nested, and the walk names the site ([`structural_site`]) on this unit.
@@ -1809,7 +1815,7 @@ enum Placement<'a> {
 /// random effects [`measure_levels`] measures, and where [`absorbed`] takes a
 /// site from the walk and where from the measurement — so the two cannot
 /// disagree on which random effects are silent (#1874 review, F12).
-fn placements<'a>(
+pub fn placements<'a>(
     decl: &'a LevelBlockDecl, population: &Population, lagged: bool, nested: Option<&NestedLevels>,
 ) -> Vec<Placement<'a>> {
     let units = nesting_units(decl, population, nested);
@@ -1833,7 +1839,7 @@ fn placements<'a>(
 /// none, `spanned` — parallel to `eta_couplings`, from [`spanned`] — measured
 /// the absorption. A named site is preferred: it tells the user where to look.
 /// An η and a kappa follow the same rule, each on its own unit.
-fn absorbed<'a>(
+pub fn absorbed<'a>(
     decl: &'a LevelBlockDecl, population: &Population, measured: &Measured,
 ) -> Vec<Absorbed<'a>> {
     let spanned = &measured.spanned;
@@ -1869,7 +1875,7 @@ fn absorbed<'a>(
 /// binary endpoint, a mixture, or an EKF diffusion term reads the block through
 /// something it does not compare, so a level it calls dead could be live there.
 /// Such a model is not checked at all — a skipped check binds, it never refuses.
-fn dead_check_reads_every_channel(model: &CompiledModel) -> bool {
+pub fn dead_check_reads_every_channel(model: &CompiledModel) -> bool {
     model.mixture.is_none() && !model.is_sde() && !model.has_non_gaussian()
 }
 
@@ -1878,7 +1884,7 @@ fn dead_check_reads_every_channel(model: &CompiledModel) -> bool {
 /// a bound — never onto a bound, and never back to `x` unless `lo == x == hi`
 /// leaves no room at all, which the dead-level check reads as "cannot step"
 /// (#1702 review, F2).
-fn toward_interior(x: f64, lo: f64, hi: f64, step: f64) -> f64 {
+pub fn toward_interior(x: f64, lo: f64, hi: f64, step: f64) -> f64 {
     if x + step < hi {
         x + step
     } else if x - step > lo {
@@ -1892,7 +1898,7 @@ fn toward_interior(x: f64, lo: f64, hi: f64, step: f64) -> f64 {
 
 /// How far the dead-level check moves a random effect to see whether it reads
 /// a record.
-const RE_STEP: f64 = 0.1;
+pub const RE_STEP: f64 = 0.1;
 
 /// The values the likelihood reads from one subject: per record, its
 /// prediction and its residual-magnitude multipliers. The η and κ are spread
@@ -1900,7 +1906,7 @@ const RE_STEP: f64 = 0.1;
 /// check spread them, so a read gated by a difference of random effects does
 /// not cancel at the moved point (#1852); random effect `bump` (an η index, or
 /// `n_eta` + a κ index, on every occasion group) is moved by `RE_STEP` more.
-fn record_values(
+pub fn record_values(
     model: &CompiledModel, subject: &Subject, theta: &[f64], re: f64, bump: Option<usize>,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let groups = match model.n_kappa {
@@ -1918,7 +1924,7 @@ fn record_values(
 
 /// [`record_values`] at explicit random effects: `eta`, and `kappa` per
 /// occasion group in [`crate::stats::likelihood::iov_occasion_groups`] order.
-fn values_at(
+pub fn values_at(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let mult = model.ruv_obs_mult(subject, theta).unwrap_or_default();
@@ -1926,7 +1932,7 @@ fn values_at(
 }
 
 /// The predictions of [`values_at`] alone.
-fn predictions_at(
+pub fn predictions_at(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> Vec<f64> {
     if model.n_kappa > 0 {
@@ -1947,7 +1953,7 @@ fn predictions_at(
 /// a proportional error at prediction 0, a record before the dose) reads 0: the
 /// likelihood substitutes a constant there, which no level reaches, so the
 /// random effect's 2 on it is the guard's and not the model's (#1879 review, F1).
-fn residual_values(
+pub fn residual_values(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], pred: &[f64],
 ) -> Vec<f64> {
     let params = &model.default_params;
@@ -1976,7 +1982,7 @@ fn residual_values(
 /// The predictions the span certificate judges ([`carried`]): under each
 /// class of a mixture in turn, as the likelihood scores them (#2421 review),
 /// so a random effect is held only where every class holds it.
-fn mean_values(
+pub fn mean_values(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> Vec<f64> {
     let Some(spec) = &model.mixture else {
@@ -2003,7 +2009,7 @@ fn mean_values(
 /// measurement reads these; the span certificate judges the predictions
 /// alone. A diffusion variance θ moves the EKF variance alone, so it has a
 /// column of its own there.
-fn likelihood_values(
+pub fn likelihood_values(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappa: &[Vec<f64>],
 ) -> Vec<f64> {
     // Everything a class can change, evaluated under that class as the
@@ -2064,7 +2070,7 @@ fn likelihood_values(
 /// would read as aliased. Empty without the `survival` feature, or without a
 /// non-Gaussian endpoint.
 #[allow(unused_variables)]
-fn non_gaussian_record_values(
+pub fn non_gaussian_record_values(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {
     #[cfg(feature = "survival")]
@@ -2095,7 +2101,7 @@ fn non_gaussian_record_values(
 /// Whether two [`record_values`] agree bitwise on the records `rows` (every
 /// record when `None`), every value finite. A non-finite value is not an
 /// agreement: it measures nothing.
-fn same_records(
+pub fn same_records(
     a: &(Vec<f64>, Vec<Vec<f64>>), b: &(Vec<f64>, Vec<Vec<f64>>), rows: Option<&[usize]>,
 ) -> bool {
     let same = |x: &f64, y: &f64| x.is_finite() && y.is_finite() && x.to_bits() == y.to_bits();
@@ -2127,7 +2133,7 @@ fn same_records(
 
 /// The level indices (1-based) a subject's records carry for `column`, on
 /// every kind of record: a level's θ is read by exactly these subjects.
-fn indices_read(subject: &Subject, column: &str) -> Vec<f64> {
+pub fn indices_read(subject: &Subject, column: &str) -> Vec<f64> {
     let mut out: Vec<f64> = subject.covariates.get(column).copied().into_iter().collect();
     for maps in [
         &subject.obs_covariates,
@@ -2145,7 +2151,7 @@ fn indices_read(subject: &Subject, column: &str) -> Vec<f64> {
 }
 
 /// The observation rows of `subject` whose `column` index is `index`.
-fn rows_of(subject: &Subject, column: &str, index: f64) -> Vec<usize> {
+pub fn rows_of(subject: &Subject, column: &str, index: f64) -> Vec<usize> {
     (0..subject.obs_times.len())
         .filter(|&j| {
             subject
@@ -2160,7 +2166,7 @@ fn rows_of(subject: &Subject, column: &str, index: f64) -> Vec<usize> {
 
 /// What rule 1 measured on one block (#1679).
 #[derive(Default)]
-struct DeadLevels {
+pub struct DeadLevels {
     /// The dead levels, as indices into the block's levels.
     dead: Vec<usize>,
     /// Parallel to `dead`: the random effects (by name) that move some record
@@ -2186,7 +2192,7 @@ impl DeadLevels {
 /// (#1822); the second element is the random-effect level, which every check
 /// spreads per random effect the same way ([`probe_res`], [`probe_etas`]), so a
 /// difference of random effects does not cancel at the moved point (#1852).
-fn probe_points(model: &CompiledModel) -> [(Vec<f64>, f64); 2] {
+pub fn probe_points(model: &CompiledModel) -> [(Vec<f64>, f64); 2] {
     let p = &model.default_params;
     let theta0 = p.theta.clone();
     let mut jittered = theta0.clone();
@@ -2200,7 +2206,7 @@ fn probe_points(model: &CompiledModel) -> [(Vec<f64>, f64); 2] {
 
 /// How far the level checks move θ `k` from `x`: distinct per θ, so no two
 /// jitters cancel and no two levels of a block moved together coincide.
-fn jitter_step(k: usize, x: f64) -> f64 {
+pub fn jitter_step(k: usize, x: f64) -> f64 {
     (0.13 + 0.07 * (k % 5) as f64) * x.abs().max(1.0)
 }
 
@@ -2208,7 +2214,7 @@ fn jitter_step(k: usize, x: f64) -> f64 {
 /// level is `re`: 0 at the initial point, and distinct per index at the moved one, so
 /// a read gated by a difference of random effects (`ETA_CL − ETA_V`) does not cancel
 /// there — the same reason `jitter_step` is distinct per θ (#1822 review r1).
-fn probe_etas(re: f64, n_eta: usize) -> Vec<f64> {
+pub fn probe_etas(re: f64, n_eta: usize) -> Vec<f64> {
     (0..n_eta).map(|j| re * (1.0 + 0.3 * j as f64)).collect()
 }
 
@@ -2217,7 +2223,7 @@ fn probe_etas(re: f64, n_eta: usize) -> Vec<f64> {
 /// that θ is `FIX` or absent. A fixed level is never measured: it has no
 /// direction for the data to estimate. Shared by [`dead_levels`] and
 /// [`spanned`], so the two checks read the same levels (#1874 review, F12).
-fn free_level_thetas(
+pub fn free_level_thetas(
     model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level],
 ) -> Vec<Option<usize>> {
     let p = &model.default_params;
@@ -2229,7 +2235,7 @@ fn free_level_thetas(
 
 /// [`free_level_thetas`] with the `FIX` levels kept: `None` only for a level
 /// with no θ in `model`.
-fn level_theta_indices(
+pub fn level_theta_indices(
     model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level],
 ) -> Vec<Option<usize>> {
     levels
@@ -2258,7 +2264,7 @@ fn level_theta_indices(
 /// Values are compared per record under a step of `0.1·max(|θ|, 1)`, not
 /// summed into an objective under a tiny step: a live level whose effect is
 /// small against the rest of `y` must still move its own record.
-fn dead_levels(
+pub fn dead_levels(
     model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
 ) -> DeadLevels {
     let p = &model.default_params;
@@ -2334,11 +2340,11 @@ fn dead_levels(
 /// (#1878), over the same tests on macOS arm64 debug, fall on the same sides:
 /// absorbed at most 3.0e-11 (`ETA_E0` and `ETA_X` under `(ETA_E0 - ETA_X)²`),
 /// identified at least 9.3e-3.
-const SPAN_TOL: f64 = 1e-6;
+pub const SPAN_TOL: f64 = 1e-6;
 
 /// The central-difference step of the span certificate: on a random effect,
 /// and, times `max(|θ|, 1)`, on a level's θ.
-const SPAN_STEP: f64 = 1e-5;
+pub const SPAN_STEP: f64 = 1e-5;
 
 /// Per record, the central difference of the values `plus` and `minus`; `None`
 /// when the two sides differ in length. The span certificate passes the
@@ -2349,7 +2355,7 @@ const SPAN_STEP: f64 = 1e-5;
 /// residual error, which moves no prediction, has the log residual variances
 /// stacked under its predictions, and so do the levels it is compared with
 /// (#1879, [`residual_values`]).
-fn record_diffs(plus: &[f64], minus: &[f64], h: f64) -> Option<Vec<f64>> {
+pub fn record_diffs(plus: &[f64], minus: &[f64], h: f64) -> Option<Vec<f64>> {
     (plus.len() == minus.len())
         .then(|| plus.iter().zip(minus).map(|(a, b)| (a - b) / (2.0 * h)).collect())
 }
@@ -2357,7 +2363,7 @@ fn record_diffs(plus: &[f64], minus: &[f64], h: f64) -> Option<Vec<f64>> {
 /// `‖g − P g‖ / ‖g‖`, `P` the orthogonal projection onto the span of `cols`;
 /// `None` when `g` is zero, so the unit measures nothing. A non-finite entry
 /// comes back as `NaN`, which no tolerance accepts.
-fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
+pub fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
     let dot = |a: &[f64], b: &[f64]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
     let norm = |a: &[f64]| dot(a, a).sqrt();
     // One modified Gram–Schmidt pass: a unit's level columns are nearly
@@ -2463,7 +2469,7 @@ fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// columns inside each within-group, the directions that contrast leaves free.
 /// A random effect inside those is [`Span::Within`], absorbed under every
 /// contrast; one only inside the full span is [`Span::Levels`].
-fn spanned(
+pub fn spanned(
     model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
     silent: &[(usize, Unit)],
 ) -> Vec<Option<Absorption>> {
@@ -2774,7 +2780,7 @@ fn spanned(
 /// `re`: the η by [`probe_etas`], and each κ distinct from them and per
 /// occasion group, so a read gated by a difference of random effects does not
 /// cancel at the moved point (#1874 review, F3; #1822 review r1).
-fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
+pub fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
     let eta = probe_etas(re, model.n_eta);
     let kappa = (0..groups)
         .map(|g| {
@@ -2790,7 +2796,7 @@ fn probe_res(re: f64, model: &CompiledModel, groups: usize) -> (Vec<f64>, Vec<Ve
 /// levels (#1082) the κ are spread by the group of each κ's own level, not by
 /// cell, so every cell of one group reads the same value: the probe is a point
 /// the model can take, where a study's κ is one number shared by its arms.
-fn subject_probe_res(
+pub fn subject_probe_res(
     re: f64, model: &CompiledModel, cells: Option<&NestedLayout>, n_groups: usize,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let (eta, mut kappa) = probe_res(re, model, n_groups.max(1));
@@ -2814,7 +2820,7 @@ fn subject_probe_res(
 /// occasion's own group, or under nested levels every cell of the level's group
 /// (#1082), a cell with no observation in it too. Empty when the key names no
 /// group.
-fn unit_groups(
+pub fn unit_groups(
     layout: &crate::stats::stacked_layout::StackedLayout, cells: Option<&NestedLayout>, unit: Unit,
     key: &[u64],
 ) -> Vec<usize> {
@@ -2841,7 +2847,7 @@ fn unit_groups(
 /// groups it moves ([`unit_groups`]): each occasion group on its own, or under
 /// nested levels the cells of each group of the kappa's level. `None` for a
 /// nested model whose subject has no cells, which measures nothing.
-fn kappa_units(
+pub fn kappa_units(
     model: &CompiledModel, cells: Option<&NestedLayout>, n_groups: usize, q: usize,
 ) -> Option<Vec<Vec<usize>>> {
     let Some(levels) = model.nested_levels() else {
@@ -2862,8 +2868,8 @@ fn kappa_units(
 /// far from orthogonal (a θ read on every record against the levels'), where
 /// one pass loses the orthogonality the residual relies on. A zero or
 /// non-finite column, or one already in the span, adds no direction.
-#[cfg(test)]
-fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
     let mut basis: Vec<Vec<f64>> = Vec::new();
     for c in cols {
         let c_norm = dot(c, c).sqrt();
@@ -2880,19 +2886,19 @@ fn orthonormal_basis(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
     basis
 }
 
-fn dot(a: &[f64], b: &[f64]) -> f64 {
+pub fn dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// `v` minus its projection on the orthonormal `basis`, projected twice (one
 /// re-orthogonalisation pass, as [`orthonormal_basis`] builds it).
-fn project_out(v: &mut [f64], basis: &[Vec<f64>]) {
+pub fn project_out(v: &mut [f64], basis: &[Vec<f64>]) {
     project_out_coefs(v, basis);
 }
 
 /// [`project_out`], returning the coefficient of `v` on each basis vector,
 /// both passes summed.
-fn project_out_coefs(v: &mut [f64], basis: &[Vec<f64>]) -> Vec<f64> {
+pub fn project_out_coefs(v: &mut [f64], basis: &[Vec<f64>]) -> Vec<f64> {
     let mut coefs = vec![0.0; basis.len()];
     for _ in 0..2 {
         for (b, c) in basis.iter().zip(coefs.iter_mut()) {
@@ -2907,10 +2913,10 @@ fn project_out_coefs(v: &mut [f64], basis: &[Vec<f64>]) -> Vec<f64> {
 /// A population-wide column of [`carried`], as its nonzero per-subject
 /// pieces: `(subject, values on that subject's records)`. A level's, a
 /// unit's or a θ read by one subject alone is one piece.
-type Pieces = Vec<(usize, Vec<f64>)>;
+pub type Pieces = Vec<(usize, Vec<f64>)>;
 
 /// `a − b`, piece by piece; a subject in both keeps one piece.
-fn pieces_minus(a: &Pieces, b: &Pieces) -> Pieces {
+pub fn pieces_minus(a: &Pieces, b: &Pieces) -> Pieces {
     let mut out = a.clone();
     for (s, v) in b {
         match out.iter_mut().find(|(t, _)| t == s) {
@@ -2924,7 +2930,7 @@ fn pieces_minus(a: &Pieces, b: &Pieces) -> Pieces {
 /// Whether two columns are the same vector — `a − b` is zero. A raw column
 /// holds only pieces with a nonzero entry, so that is the same subjects with
 /// the same values.
-fn pieces_equal(a: &Pieces, b: &Pieces) -> bool {
+pub fn pieces_equal(a: &Pieces, b: &Pieces) -> bool {
     fn sorted(p: &Pieces) -> Vec<&(usize, Vec<f64>)> {
         let mut v: Vec<&(usize, Vec<f64>)> = p.iter().collect();
         v.sort_by_key(|(s, _)| *s);
@@ -2946,24 +2952,24 @@ fn pieces_equal(a: &Pieces, b: &Pieces) -> bool {
 /// In the same run the loose rank count's direction test ([`SPAN_TOL`] on a
 /// group's last column against `A`) saw at most 5.3e-11 where the column is
 /// held and at least 1.4e-2 where it adds a direction.
-const CONSISTENT_TOL: f64 = 1e-6;
+pub const CONSISTENT_TOL: f64 = 1e-6;
 
 /// A column keeping at most this fraction of its norm against the columns
 /// before it adds no direction to a [`BlockBasis`].
-const DROP_TOL: f64 = 1e-12;
+pub const DROP_TOL: f64 = 1e-12;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Per [`BlockBasis`] built on this thread, its population-wide vector
     /// count: the scale #1962 bounds, read by the tests without a clock.
-    static DENSE_COUNTS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub static DENSE_COUNTS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// A column of a [`BlockBasis`] as Gram–Schmidt took it: its coefficients on
 /// the basis vectors before it, as `(first coordinate, coefficients)`
 /// segments, and the coordinate and norm of the basis vector it added, if it
 /// added one.
-struct Taken {
+pub struct Taken {
     coefs: Vec<(usize, Vec<f64>)>,
     added: Option<(usize, f64)>,
     norm: f64,
@@ -2998,11 +3004,11 @@ struct Taken {
 /// the `λ` whose dropped equations hold (to [`CONSISTENT_TOL`]) give `T`. A
 /// group none of whose functionals is representable — the intercept that
 /// carries the levels' mean — removes nothing, and `A = Q` there.
-struct BlockBasis {
+pub struct BlockBasis {
     /// Per subject, the orthonormal basis of its one-subject columns.
     local: Vec<Vec<Vec<f64>>>,
     /// The orthonormal population-wide part.
-    dense: Vec<Vec<f64>>,
+    pub dense: Vec<Vec<f64>>,
     offsets: Vec<usize>,
     n_rows: usize,
     /// Per nonzero finite column, `‖c − P c‖ / ‖c‖` against the columns
@@ -3012,18 +3018,18 @@ struct BlockBasis {
     /// population-wide ones follow every subject's.
     local_at: Vec<usize>,
     /// `T`, orthonormal, in the coordinates of the basis.
-    removed: Vec<Vec<f64>>,
+    pub removed: Vec<Vec<f64>>,
     /// What the grouped columns change in [`BlockBasis::aliased`]'s count
     /// against the raw columns' remnants.
     coded_shift: isize,
     /// How many groups the joint solve for `T` took: the scale review r1 of
     /// #1962 bounds.
-    #[cfg(test)]
-    joint: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    pub joint: usize,
 }
 
 impl BlockBasis {
-    fn new(cols: &[Pieces], lens: &[usize], offsets: &[usize]) -> Self {
+    pub fn new(cols: &[Pieces], lens: &[usize], offsets: &[usize]) -> Self {
         Self::grouped(cols, &vec![None; cols.len()], lens, offsets)
     }
 
@@ -3038,7 +3044,7 @@ impl BlockBasis {
     /// `sum_to_zero_within` with one group per subject that is none of them;
     /// a group that crosses subjects has at least one population-wide
     /// difference column, so `T` never costs more than those did.
-    fn grouped(
+    pub fn grouped(
         cols: &[Pieces], groups: &[Option<usize>], lens: &[usize], offsets: &[usize],
     ) -> Self {
         // Per group: its last column, and whether every column sits on one
@@ -3168,11 +3174,11 @@ impl BlockBasis {
             local_at,
             removed: Vec::new(),
             coded_shift: 0,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             joint: 0,
         };
         basis.remove_groups(cols, groups, &taken, dense_at);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         DENSE_COUNTS.with(|d| d.borrow_mut().push(basis.dense.len()));
         basis
     }
@@ -3326,7 +3332,7 @@ impl BlockBasis {
     /// against its last (#1962): those number one fewer than its raw columns,
     /// and its last column adds back what they lack unless the rest already
     /// holds it.
-    fn aliased(&self) -> usize {
+    pub fn aliased(&self) -> usize {
         let raw = self.remnants.iter().filter(|r| **r < SPAN_TOL).count() as isize;
         (raw + self.coded_shift).max(0) as usize
     }
@@ -3334,7 +3340,7 @@ impl BlockBasis {
     /// `‖z − P z‖ / ‖z‖`, `P` the projection on the coded span `A`; `None`
     /// when `z` is zero. A non-finite value comes back as `NaN`, which no
     /// tolerance accepts.
-    fn residual(&self, z: &Pieces) -> Option<f64> {
+    pub fn residual(&self, z: &Pieces) -> Option<f64> {
         let z_norm = z.iter().map(|(_, v)| dot(v, v)).sum::<f64>().sqrt();
         if z_norm == 0.0 {
             return None;
@@ -3349,7 +3355,7 @@ impl BlockBasis {
 /// group's last taken against that last one: the columns
 /// [`BlockBasis::grouped`] spans without building them, and what
 /// [`coded_aliased`] recounts a grouped deficiency on (#2421).
-fn coded_differences(cols: &[Pieces], groups: &[Option<usize>]) -> Vec<Pieces> {
+pub fn coded_differences(cols: &[Pieces], groups: &[Option<usize>]) -> Vec<Pieces> {
     let mut out = Vec::new();
     for (j, (c, g)) in cols.iter().zip(groups).enumerate() {
         match g {
@@ -3367,7 +3373,7 @@ fn coded_differences(cols: &[Pieces], groups: &[Option<usize>]) -> Vec<Pieces> {
 
 /// `t · c`, `t` dense in the coordinates of a [`BlockBasis`] and `c` as
 /// segments.
-fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
+pub fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
     c.iter().map(|(at, v)| dot(v, &t[*at..*at + v.len()])).sum()
 }
 
@@ -3381,7 +3387,7 @@ fn dot_coords(t: &[f64], c: &[(usize, Vec<f64>)]) -> f64 {
 /// The grouped basis counts one deficiency there, the differences none, and
 /// the coded model is full rank. Only a count the grouped basis already found
 /// nonzero pays for the difference columns, which cross subjects (#1962).
-fn coded_aliased(
+pub fn coded_aliased(
     cols: &[Pieces], tags: &[Option<usize>], lens: &[usize], offsets: &[usize],
 ) -> usize {
     match BlockBasis::grouped(cols, tags, lens, offsets).aliased() {
@@ -3481,7 +3487,7 @@ fn coded_aliased(
 /// held, and aliased at either point wins over held (#1991 review): the
 /// random effect's refusal would advise dropping it, which leaves the alias.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Alias {
+pub struct Alias {
     with: Vec<String>,
     /// Whether removing the block alone gives the rest of the model its
     /// rank: the other θ, with the other blocks as coded, full rank at both
@@ -3501,7 +3507,7 @@ struct Alias {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Carried {
+pub enum Carried {
     /// Every unit column of the random effect lies in the span: the contrast
     /// absorbs it.
     Held,
@@ -3522,22 +3528,22 @@ enum Carried {
 /// Another level block as the certificate counts it (#1963): resolved to
 /// `contrast` over `groups`, so among the other θ it contributes the
 /// directions that contrast leaves, not every level.
-struct Coded<'a> {
-    decl: &'a LevelBlockDecl,
-    levels: &'a [Level],
-    contrast: LevelContrast,
-    groups: Vec<usize>,
+pub struct Coded<'a> {
+    pub decl: &'a LevelBlockDecl,
+    pub levels: &'a [Level],
+    pub contrast: LevelContrast,
+    pub groups: Vec<usize>,
 }
 
 /// What one probe point's columns difference, per subject: the predictions
 /// for the span certificate ([`carried`]), every value the likelihood reads
 /// for the global rank check ([`RankColumns`], #2421).
-type Values<'a> = dyn Fn(&Subject, &[f64], &[f64], &[Vec<f64>]) -> Vec<f64> + 'a;
+pub type Values<'a> = dyn Fn(&Subject, &[f64], &[f64], &[Vec<f64>]) -> Vec<f64> + 'a;
 
 /// One probe point of [`probe_points`], as [`carried`] and the global rank
 /// check ([`RankColumns`]) build their columns at it: θ, and per subject its
 /// random effects spread by [`subject_probe_res`].
-struct Probe<'a> {
+pub struct Probe<'a> {
     population: &'a Population,
     theta: Vec<f64>,
     res: Vec<(Vec<f64>, Vec<Vec<f64>>)>,
@@ -3550,7 +3556,7 @@ struct Probe<'a> {
 impl Probe<'_> {
     /// `point` (θ, and the spread around which the random effects sit) on
     /// `population`.
-    fn at<'a>(
+    pub fn at<'a>(
         model: &CompiledModel, population: &'a Population, (theta, re): (Vec<f64>, f64),
         lens: &'a [usize], values: &'a Values<'a>,
     ) -> Probe<'a> {
@@ -3646,7 +3652,7 @@ impl Probe<'_> {
 /// [`BlockBasis::grouped`] spans on those tags (#1962). A fixed level coded as
 /// `−last` there would add a column for a θ that does not exist. `None` when
 /// a dependent level has no column.
-fn code_levels(
+pub fn code_levels(
     raw: &[Option<Pieces>], free: &[bool], groups: &[usize], contrast: LevelContrast,
 ) -> Option<Vec<(Pieces, Option<usize>)>> {
     let first = |i: usize| i == 0 || groups[i - 1] != groups[i];
@@ -3685,7 +3691,7 @@ fn code_levels(
 
 /// Append a block's coded columns to `cols`, numbering its sum-to-zero groups
 /// after every group already in `tags`.
-fn push_coded(
+pub fn push_coded(
     coded: Vec<(Pieces, Option<usize>)>, cols: &mut Vec<Pieces>, tags: &mut Vec<Option<usize>>,
 ) {
     let base = tags.iter().flatten().map(|g| g + 1).max().unwrap_or(0);
@@ -3697,7 +3703,7 @@ fn push_coded(
 
 /// Per subject, how many `values` it gives at the initial estimates, and the
 /// offset of its first one in a population-wide column.
-fn value_lens(
+pub fn value_lens(
     model: &CompiledModel, population: &Population, values: &Values,
 ) -> (Vec<usize>, Vec<usize>) {
     let lens: Vec<usize> = population
@@ -3740,7 +3746,7 @@ fn value_lens(
 /// magnitude (`proportional_branches_are_measured`). The global rank check
 /// ([`RankColumns`]) reads every likelihood value instead.
 #[allow(clippy::too_many_arguments)]
-fn carried(
+pub fn carried(
     model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
     name: &str, kappa: bool, contrast: LevelContrast, others: &[Coded],
 ) -> Carried {
@@ -4050,7 +4056,7 @@ fn carried(
 /// every level block, by index, or a level block whole, by declaration
 /// position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Member {
+pub enum Member {
     Theta(usize),
     Block(usize),
 }
@@ -4069,7 +4075,7 @@ enum Member {
 /// point. A point where some value is not finite measures nothing, and a
 /// layout that cannot be measured at both points is never refused: the model
 /// binds as it did before the check.
-struct RankColumns {
+pub struct RankColumns {
     /// Per point: the free θ outside the blocks (in `thetas` order), and per
     /// block its raw level columns. `None` for a point that could not be
     /// evaluated.
@@ -4224,7 +4230,7 @@ impl RankColumns {
 /// at most once (#1840). `None` model: the likelihood reads a channel the
 /// certificate does not compare, so nothing is measured and every contrast is
 /// [`Carried::Inconclusive`], held like [`Carried::Held`] — the refusal stands.
-struct Certificate<'a> {
+pub struct Certificate<'a> {
     model: Option<&'a CompiledModel>,
     decl: &'a LevelBlockDecl,
     levels: &'a [Level],
@@ -4265,7 +4271,7 @@ impl Certificate<'_> {
     /// The alias of the coded block with other θ under `contrast`
     /// ([`Carried::Aliased`], #1991); `None` when it keeps its rank, or the
     /// certificate stopped before measuring it.
-    fn aliased(&self, contrast: LevelContrast) -> Option<Alias> {
+    pub fn aliased(&self, contrast: LevelContrast) -> Option<Alias> {
         match self.under(contrast) {
             Carried::Aliased(alias) => Some(alias),
             _ => None,
@@ -4279,7 +4285,7 @@ impl Certificate<'_> {
 /// effect, parallel to `eta_couplings`, whether the span certificate measured
 /// it absorbed (#1834). `model` is that model, kept for [`carried`], which only
 /// a refusing branch asks for.
-struct Measured {
+pub struct Measured {
     dead: DeadLevels,
     spanned: Vec<Option<Absorption>>,
     model: Option<std::rc::Rc<CompiledModel>>,
@@ -4303,7 +4309,7 @@ struct Measured {
 /// engines never apply moves no arrival, so it does not count;
 /// `the_lag_predicate_sees_every_lag_the_engine_applies` pins the two
 /// together over every spelling.
-fn lagged_arrivals(model: &CompiledModel) -> bool {
+pub fn lagged_arrivals(model: &CompiledModel) -> bool {
     model.has_lagtime()
         || model.dose_attr_map.has_indexed_attr(crate::types::DoseAttr::Lag)
         || model.has_route_absorption_lag()
@@ -4316,7 +4322,7 @@ fn lagged_arrivals(model: &CompiledModel) -> bool {
 /// class says within. Its partners are every class's (#1878): the refusal
 /// names each random effect some class moves with it. Without a mixture,
 /// [`spanned`] itself.
-fn spanned_per_class(
+pub fn spanned_per_class(
     model: &CompiledModel, decl: &LevelBlockDecl, levels: &[Level], population: &Population,
     silent: &[(usize, Unit)],
 ) -> Vec<Option<Absorption>> {
@@ -4359,7 +4365,7 @@ fn spanned_per_class(
 /// level's own θ whatever contrast the block will take. A model whose
 /// likelihood reads a channel the check does not compare is not measured:
 /// every block comes back with no dead level and no measured absorption.
-fn measure_levels(
+pub fn measure_levels(
     base: &ParseBindings, model_text: &str, decls: &[LevelBlockDecl], discovered: &[Vec<Level>],
     population: &Population,
 ) -> Result<Vec<Measured>, String> {
@@ -4413,7 +4419,7 @@ fn measure_levels(
 }
 
 /// Why a contrast cannot carry a block's dead levels (#1679, #1702 review F1).
-enum DeadFailure {
+pub enum DeadFailure {
     /// The coded block loses rank: a free θ moves only dead levels. Under
     /// `none` that is any dead level; under `ref` one that is not its group's
     /// reference; under sum-to-zero two in one group.
@@ -4429,7 +4435,7 @@ enum DeadFailure {
 /// gives it a direction of its own: the reference level under `ref`, and one
 /// level per group under sum-to-zero, are coded through the other levels, so a
 /// dead one there loses nothing.
-fn dead_failure(
+pub fn dead_failure(
     groups: &[usize], contrast: LevelContrast, dead: &DeadLevels, absorbed: Option<&Absorbed>,
 ) -> Option<DeadFailure> {
     if dead.dead.is_empty() {
@@ -4463,7 +4469,7 @@ fn dead_failure(
 }
 
 /// How many dead labels a refusal lists before it counts the rest.
-const DEAD_LABELS_SHOWN: usize = 5;
+pub const DEAD_LABELS_SHOWN: usize = 5;
 
 /// The refusal for a block whose dead levels `contrast` cannot carry: every
 /// level dead (the block estimates nothing), or the levels at fault, listed,
@@ -4471,7 +4477,7 @@ const DEAD_LABELS_SHOWN: usize = 5;
 /// them, when there is one. The `TIME = 0` advice appears only when every
 /// listed level holds only records at `TIME = 0`.
 #[allow(clippy::too_many_arguments)]
-fn dead_levels_message(
+pub fn dead_levels_message(
     block: &str, decl: &LevelBlockDecl, levels: &[Level], dead: &DeadLevels, failure: &DeadFailure,
     contrast: LevelContrast, alt: Option<LevelContrast>, absorbed: Option<&Absorbed>,
     population: &Population,
@@ -4569,7 +4575,7 @@ fn dead_levels_message(
 /// `others` is `None` for a block that absorbs nothing, which
 /// [`bind_levels_on_data`] resolves first and which never reads the
 /// certificate; for an absorbing block, the blocks resolved that way (#1963).
-fn resolve_contrast(
+pub fn resolve_contrast(
     decl: &LevelBlockDecl, levels: &[Level], measured: &Measured, population: &Population,
     others: Option<&[Coded]>,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
@@ -4602,7 +4608,7 @@ fn resolve_contrast(
 /// The contrasts `decl` can take in place of `current`, in `auto`'s order —
 /// `sum_to_zero`, `sum_to_zero_within` (a nested block only), `ref`, `none` —
 /// each leaving a free θ and carrying the block's dead levels (#2421).
-fn alternatives(
+pub fn alternatives(
     decl: &LevelBlockDecl, levels: &[Level], measured: &Measured, current: LevelContrast,
 ) -> Vec<LevelContrast> {
     let nested = decl.columns().len() >= 2;
@@ -4629,7 +4635,7 @@ fn alternatives(
 /// cured by moving a different block — are cured move by move (#2421 review).
 /// A move that lowers nothing is not made. An absorbing block keeps the
 /// contrast its certificate resolved it to. Whether any block moved.
-fn settle_auto(
+pub fn settle_auto(
     rank: &RankColumns, decls: &[LevelBlockDecl], discovered: &[Vec<Level>], measured: &[Measured],
     absorbing: &[bool], layout: &mut [(LevelContrast, Vec<usize>)],
 ) -> bool {
@@ -4678,7 +4684,7 @@ fn settle_auto(
 /// `contrast = none` — bound silently, and every refusal advising a change of
 /// model had to prove the result identified (#1991). The advice now does not
 /// have to: whatever the user does next meets this check again.
-fn refuse_rank_deficient(
+pub fn refuse_rank_deficient(
     rank: &RankColumns, decls: &[LevelBlockDecl], discovered: &[Vec<Level>], measured: &[Measured],
     absorbing: &[bool], layout: &[(LevelContrast, Vec<usize>)],
 ) -> Result<(), String> {
@@ -4704,19 +4710,19 @@ fn refuse_rank_deficient(
 }
 
 /// The θ names of the model the rank check measured on.
-fn rank_model_names(measured: &[Measured]) -> &[String] {
+pub fn rank_model_names(measured: &[Measured]) -> &[String] {
     measured.first().map(|m| m.rank_model.theta_names.as_slice()).unwrap_or_default()
 }
 
 /// `theta NAME[COLS]`, as every level refusal names a block.
-fn block_label(decl: &LevelBlockDecl) -> String {
+pub fn block_label(decl: &LevelBlockDecl) -> String {
     format!("theta {}[{}]", decl.name(), decl.columns().join(", "))
 }
 
 /// The global rank check's refusal (#2421): the dependent `set`, and what to
 /// do — remove a member, or change a block's contrast, naming `alt` (a block
 /// and a contrast under which the layout keeps its rank) when there is one.
-fn rank_message(
+pub fn rank_message(
     set: &[Member], theta_names: &[String], decls: &[LevelBlockDecl],
     layout: &[(LevelContrast, Vec<usize>)], alt: Option<(usize, LevelContrast)>,
 ) -> String {
@@ -4795,7 +4801,7 @@ fn rank_message(
 /// group means; the second keeps two of them from competing for the same means,
 /// which a kappa does with an η on one occasion per subject (K3′), or with the
 /// kappa of an outer level whose groups each hold one group of its level.
-fn within_parts_them(
+pub fn within_parts_them(
     decl: &LevelBlockDecl, levels: &[Level], absorbed: &[Absorbed], population: &Population,
     nested: Option<&NestedLevels>,
 ) -> bool {
@@ -4847,7 +4853,7 @@ fn within_parts_them(
 
 /// [`resolve_contrast`] for a block that absorbs at most the one random effect
 /// `absorbed`.
-fn resolve_absorbing(
+pub fn resolve_absorbing(
     decl: &LevelBlockDecl, levels: &[Level], measured: &Measured, population: &Population,
     others: Option<&[Coded]>, absorbed: Option<Absorbed>,
 ) -> Result<(LevelContrast, Vec<usize>), String> {
@@ -5209,7 +5215,7 @@ fn resolve_absorbing(
 /// what that contrast leaves it. The global contrasts were refused already, so
 /// no contrast rescues it; dropping the random effect leaves a block whose
 /// rank the binder checks.
-fn within_held_message(block: &str, found: &Absorbed) -> String {
+pub fn within_held_message(block: &str, found: &Absorbed) -> String {
     format!(
         "{block}: under `contrast = sum_to_zero_within` the rest of the model also carries \
          what that contrast leaves to `{re}` {}, so the levels and the other θ reproduce \
@@ -5227,7 +5233,7 @@ fn within_held_message(block: &str, found: &Absorbed) -> String {
 /// intercept) — and the refusal says so for every contrast. With `alt` a
 /// contrast that does (#1840), the refusal names what `resolved` loses and
 /// that contrast.
-fn one_column_message(
+pub fn one_column_message(
     block: &str, decl: &LevelBlockDecl, found: &Absorbed, resolved: LevelContrast,
     alt: Option<LevelContrast>,
 ) -> String {
@@ -5276,7 +5282,7 @@ fn one_column_message(
 }
 
 /// `` `A` ``, `` `A` and `B` ``, `` `A`, `B` and `C` ``.
-fn and_list(names: &[String]) -> String {
+pub fn and_list(names: &[String]) -> String {
     let ticked: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
     match ticked.split_last() {
         None => String::new(),
@@ -5287,7 +5293,7 @@ fn and_list(names: &[String]) -> String {
 
 /// `` `A` `` alone, or `a combination of `A` and `B``: what the coded levels
 /// move `y` exactly as, given the members `with` of a [`Carried::Aliased`].
-fn alias_who(with: &[String]) -> String {
+pub fn alias_who(with: &[String]) -> String {
     match with.len() {
         0 => "some combination of the model's other θ".to_string(),
         1 => and_list(with),
@@ -5297,7 +5303,7 @@ fn alias_who(with: &[String]) -> String {
 
 /// Where an alias was measured: at both probe points, or at the one the
 /// model could be evaluated at (#1991 review, round 4).
-fn alias_measured(both: bool) -> &'static str {
+pub fn alias_measured(both: bool) -> &'static str {
     match both {
         true => "(measured at the initial estimates and at a point near them)",
         false => {
@@ -5309,7 +5315,7 @@ fn alias_measured(both: bool) -> &'static str {
 
 /// The members `with` of an alias as the refusal names them: as "them", and
 /// as what to remove — the θ by name, or generically when none is named.
-fn alias_names(with: &[String]) -> (String, String) {
+pub fn alias_names(with: &[String]) -> (String, String) {
     match with.is_empty() {
         true => ("those θ".to_string(), "the θ that duplicate the levels".to_string()),
         false => (and_list(with), and_list(with)),
@@ -5321,7 +5327,7 @@ fn alias_names(with: &[String]) -> (String, String) {
 /// the model its rank, otherwise remove the members — which gives the coded
 /// block its rank back — and drop the random effect the levels reproduce
 /// (#1991 review, round 4).
-fn alias_remedy(alias: &Alias) -> String {
+pub fn alias_remedy(alias: &Alias) -> String {
     match alias.alone {
         true => "remove the block".to_string(),
         false => format!("remove {} and drop the random effect", alias_names(&alias.with).1),
@@ -5331,7 +5337,7 @@ fn alias_remedy(alias: &Alias) -> String {
 /// The nested refusal's note on an aliased coded block (#1991): under
 /// `contrast` some combination of the coded levels moves `y` exactly as the
 /// members of `alias`, so dropping random effect `re` leaves them aliased.
-fn alias_sentence(contrast: &str, alias: &Alias, re: &str) -> String {
+pub fn alias_sentence(contrast: &str, alias: &Alias, re: &str) -> String {
     format!(
         "Under `contrast = {contrast}` some combination of the coded levels also moves `y` \
          exactly as {} does {}, so dropping `{re}` would leave {} aliased.",
@@ -5348,7 +5354,9 @@ fn alias_sentence(contrast: &str, alias: &Alias, re: &str) -> String {
 /// remove those θ, or the block when that leaves the rest of the model its
 /// rank. Every contrast `aliased` does not name leaves the random effect
 /// reproduced, so the refusal speaks for them all.
-fn aliased_message(block: &str, found: &Absorbed, aliased: &[(LevelContrast, Alias)]) -> String {
+pub fn aliased_message(
+    block: &str, found: &Absorbed, aliased: &[(LevelContrast, Alias)],
+) -> String {
     let mut names: Vec<String> = Vec::new();
     for name in aliased.iter().flat_map(|(_, a)| &a.with) {
         if !names.contains(name) {
@@ -5415,7 +5423,7 @@ fn aliased_message(block: &str, found: &Absorbed, aliased: &[(LevelContrast, Ali
 /// site while every subject has a single occasion. The kappa is then the η by
 /// another name, so the model is unidentified with or without the block, and
 /// the refusal says so instead of blaming it.
-fn jointly_absorbed_message(
+pub fn jointly_absorbed_message(
     block: &str, decl: &LevelBlockDecl, absorbed: &[Absorbed], population: &Population,
 ) -> String {
     let one_occasion = population
@@ -5519,7 +5527,7 @@ fn jointly_absorbed_message(
 
 /// The free θ a contrast leaves over `groups`: every level under `none`, one
 /// fewer per group otherwise (the group's dependent or reference level).
-fn free_count(groups: &[usize], contrast: LevelContrast) -> usize {
+pub fn free_count(groups: &[usize], contrast: LevelContrast) -> usize {
     if matches!(contrast, LevelContrast::Unconstrained) {
         return groups.len();
     }
@@ -5532,7 +5540,7 @@ fn free_count(groups: &[usize], contrast: LevelContrast) -> usize {
 }
 
 /// The expression where a block meets a random effect, as a diagnostic clause.
-fn share_site(share: &ScaleShare) -> String {
+pub fn share_site(share: &ScaleShare) -> String {
     let via = share.eta_via.as_ref().map(|v| format!(" (through `{v}`)")).unwrap_or_default();
     match &share.param {
         Some(p) => {
@@ -5548,7 +5556,7 @@ fn share_site(share: &ScaleShare) -> String {
 }
 
 /// The `contrast = ...` token for a resolved convention, for diagnostics.
-fn contrast_token(c: LevelContrast) -> &'static str {
+pub fn contrast_token(c: LevelContrast) -> &'static str {
     match c {
         LevelContrast::Auto => "auto",
         LevelContrast::SumToZero => "sum_to_zero",
@@ -5561,7 +5569,9 @@ fn contrast_token(c: LevelContrast) -> &'static str {
 /// Group id per level. Levels are sorted by their full tuple, so grouping by
 /// the leading columns yields contiguous groups — which is what lets each
 /// group's sum-to-zero contrast be a single `NegSum` range.
-fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContrast) -> Vec<usize> {
+pub fn assign_groups(
+    decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContrast,
+) -> Vec<usize> {
     let within = matches!(contrast, LevelContrast::SumToZeroWithin) && decl.columns().len() >= 2;
     if !within {
         return vec![0; levels.len()];
@@ -5601,7 +5611,7 @@ fn assign_groups(decl: &LevelBlockDecl, levels: &[Level], contrast: LevelContras
 /// baseline `covariates` name — the values its likelihood reads. When `table` holds no
 /// such level (or the block is keyed on `TIME`, which such a subject cannot name) it
 /// gets index 1 and is returned, for [`refuse_read_unindexed`] to measure.
-fn write_index_column(
+pub fn write_index_column(
     decl: &LevelBlockDecl, table: &[(Level, usize)], subjects: &mut [Subject],
 ) -> Result<Vec<Unindexed>, String> {
     let column = level_index_column(decl.name());
@@ -5785,7 +5795,7 @@ fn write_index_column(
 /// it also carries time-to-event records, which a data row can yield zero or two of —
 /// cannot carry one index per record, so it is refused rather than scored at its first
 /// level.
-fn write_record_index(
+pub fn write_record_index(
     decl: &LevelBlockDecl, subject: &mut Subject, column: &str, first: f64,
     record_index: &[(usize, f64)], table: &[(Level, usize)],
 ) -> Result<(), String> {
@@ -5837,14 +5847,14 @@ fn write_record_index(
 /// (#1797): [`write_index_column`] gave it index 1, a value only a likelihood that
 /// does not read the block may carry.
 #[derive(Debug, Clone, PartialEq)]
-struct Unindexed {
+pub struct Unindexed {
     id: String,
     why: Why,
 }
 
 /// Why a subject with no Gaussian observation has no index of its own.
 #[derive(Debug, Clone, PartialEq)]
-enum Why {
+pub enum Why {
     /// Its baseline columns name this level, which the table does not hold.
     NoLevel(String),
     /// The block is keyed on `TIME`, and the subject has no observation time.
@@ -5865,7 +5875,7 @@ impl Why {
 
 /// The level a subject with no Gaussian observation names: its baseline value in each
 /// level column, the first non-missing one in its records (`Subject::covariates`).
-fn baseline_level(decl: &LevelBlockDecl, subject: &Subject) -> Result<Vec<f64>, Why> {
+pub fn baseline_level(decl: &LevelBlockDecl, subject: &Subject) -> Result<Vec<f64>, Why> {
     decl.columns()
         .iter()
         .map(|c| {
@@ -5884,7 +5894,7 @@ fn baseline_level(decl: &LevelBlockDecl, subject: &Subject) -> Result<Vec<f64>, 
 
 /// Where a binding's level table came from, for [`refuse_read_unindexed`]'s text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LevelSource {
+pub enum LevelSource {
     /// Discovered from the population itself ([`bind_theta_levels`]).
     Data,
     /// A fit's bindings ([`bind_from_fit`] and the re-read of a fit's data).
@@ -5917,7 +5927,7 @@ enum LevelSource {
 ///
 /// Reads `population` and writes nothing: only the subjects with no Gaussian
 /// observation are copied, so a binder can call this before it writes any column.
-fn refuse_read_unindexed(
+pub fn refuse_read_unindexed(
     model: &CompiledModel, decls: &[LevelBlockDecl], tables: &[Vec<(Level, usize)>],
     population: &Population, source: LevelSource,
 ) -> Result<(), String> {
@@ -5998,7 +6008,7 @@ fn refuse_read_unindexed(
 }
 
 /// `index` on every record of `subject`, for the readership measurement.
-fn set_index(subject: &mut Subject, column: &str, index: f64) {
+pub fn set_index(subject: &mut Subject, column: &str, index: f64) {
     subject.covariates.insert(column.to_string(), index);
     for maps in [
         &mut subject.obs_covariates,
@@ -6014,7 +6024,7 @@ fn set_index(subject: &mut Subject, column: &str, index: f64) {
 
 /// The refusal for subjects with no Gaussian observation that read a level block at a
 /// level it has no θ for (#1797). Every subject is listed, as for unseen levels.
-fn unindexed_read_message(
+pub fn unindexed_read_message(
     decl: &LevelBlockDecl, read: &[&Unindexed], source: LevelSource,
 ) -> String {
     let items: Vec<String> = read.iter().map(|u| u.why.item(&u.id)).collect();
@@ -6249,7 +6259,7 @@ pub fn theta_level_values(
 /// that form is negative or not finite: it has no `se_theta` entry to agree with, so
 /// it is not clamped to `0`, which would report a certainty the matrix does not
 /// carry. Whether `se_theta`'s own `0.0` convention should change is #1895.
-fn level_se(
+pub fn level_se(
     rule: LevelRule, c: &nalgebra::DMatrix<f64>, theta: &[f64], lower: &[f64],
 ) -> Option<f64> {
     match rule {
@@ -6296,7 +6306,7 @@ pub fn active_levels(model: &CompiledModel, population: &Population) -> Vec<Acti
 
 /// [`ActiveLevels`] for every θ block of `model` that `keep` selects, in declaration
 /// order, by the rule [`active_levels`] states.
-fn levels_read(
+pub fn levels_read(
     model: &CompiledModel, population: &Population,
     keep: impl Fn(&crate::parser::model_parser::VectorThetaDecl) -> bool,
 ) -> Vec<ActiveLevels> {
@@ -6420,7 +6430,7 @@ pub fn rsr_one_subject_levels_warning(
 /// endpoint that reads the column for another reason than the block (`STUDY` in a second
 /// term) is counted too; that over-includes levels, which [`active_levels`] documents as
 /// safe.
-fn record_cmts_reading(model: &CompiledModel, column: &str) -> Vec<usize> {
+pub fn record_cmts_reading(model: &CompiledModel, column: &str) -> Vec<usize> {
     #[cfg(feature = "survival")]
     return crate::parser::model_parser::level_record_cmts(&model.endpoints, column);
     #[cfg(not(feature = "survival"))]
@@ -6432,7 +6442,7 @@ fn record_cmts_reading(model: &CompiledModel, column: &str) -> Vec<usize> {
 
 /// Of `record_cmts`, those of a DTMM endpoint: its likelihood scores the transitions into
 /// each record from the one before, so a chain's first record reads no level.
-fn chained_cmts(model: &CompiledModel, record_cmts: &[usize]) -> Vec<usize> {
+pub fn chained_cmts(model: &CompiledModel, record_cmts: &[usize]) -> Vec<usize> {
     #[cfg(feature = "markov")]
     return record_cmts
         .iter()
@@ -6456,7 +6466,7 @@ fn chained_cmts(model: &CompiledModel, record_cmts: &[usize]) -> Vec<usize> {
 ///
 /// Unlike [`level_rows`], whose records *define* levels (a chain's first record names a
 /// level the data hold), these are the levels the subject's objective *reads*.
-fn subject_levels(
+pub fn subject_levels(
     record_cmts: &[usize], chained: &[usize], subject: &Subject, column: &str, n_levels: usize,
 ) -> Vec<usize> {
     let snaps = subject.record_covariate_snapshots();
@@ -6486,11 +6496,3 @@ fn subject_levels(
     out.dedup();
     out
 }
-
-#[cfg(test)]
-#[path = "api/tests/theta_levels_tests.rs"]
-mod tests;
-
-#[cfg(test)]
-#[path = "api/tests/profiled_levels_tests.rs"]
-mod profiled_levels_tests;

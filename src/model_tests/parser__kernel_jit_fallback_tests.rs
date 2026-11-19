@@ -3,10 +3,40 @@
 //!
 //! Every test fits one fixture twice — plans working, then every plan failing
 //! ([`FORCE_PLAN_FAIL`] on a one-worker pool) — and compares the two to a measured bound.
-use super::FORCE_PLAN_FAIL;
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::parser::model_parser::rhs_regcode::ir;
+use ferx_model::parser::model_parser::rhs_regcode::ir::Func;
+use ferx_model::parser::model_parser::rhs_regcode::ir::Inst;
+use ferx_model::parser::model_parser::rhs_regcode::ir::Layout;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::fixed::record_fixed;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::fixed::record_repeat;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::fixed::Found;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::fixed::SolveFn;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::matrix::record_mat;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::matrix::MatOp;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::ode_loop::LoopSpec;
+use ferx_model::parser::model_parser::rhs_regcode::Flat;
+use ferx_model::parser::model_parser::rhs_regcode::Unary;
+use ferx_model::sens::num::PkNum;
+use ferx_model::sens::num::RecHooks;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Add;
+use std::ops::Div;
+use std::ops::Mul;
+use std::ops::Neg;
+use std::ops::Sub;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::RwLock;
+
 use crate::types::{
     CompiledModel, EstimationMethod, FitOptions, FitResult, Optimizer, Population, WarningCode,
 };
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
 use std::path::Path;
 
 const TOKEN: &str = "W_PLAN_FD_FALLBACK";
@@ -111,7 +141,7 @@ fn check(label: &str, exact: &FitResult, forced: &FitResult, tol: [f64; 3]) {
         "W_PLAN_FD_FALLBACK: {n} of {n} subjects fell back to finite-difference derivatives \
          because their compiled plan failed ({}); results are correct but slower — please \
          report this as a bug.",
-        super::FORCED_FAILURE
+        ferx_model::parser::model_parser::rhs_regcode::kernel_jit::FORCED_FAILURE
     );
     assert_eq!(*w[0], want, "{label}");
     let entry =
@@ -466,7 +496,10 @@ fn standalone_covariance_and_sir_report_the_fallback() {
         assert_eq!(of_step(&forced), 1, "{label}: {:?}", forced.warnings);
         assert!(forced.warnings.contains(&own), "{label}: the fit's report is kept");
         let w = forced.warnings.iter().find(|w| w.starts_with(&tag)).unwrap();
-        assert!(w.contains(super::FORCED_FAILURE), "{label}: the reason: {w}");
+        assert!(
+            w.contains(ferx_model::parser::model_parser::rhs_regcode::kernel_jit::FORCED_FAILURE),
+            "{label}: the reason: {w}"
+        );
         assert!(w.contains(name), "{label}: names the step: {w}");
         let e = forced
             .warnings_structured
@@ -780,7 +813,7 @@ const TWO_CPT_AMOUNTS: &str = r#"[data]
 
 // ---- Code-review findings on the failure report (#2786) -------------------------------------
 
-use super::{
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::{
     current_fit, in_fit, note_failure, note_model_failure, plan_failure_counts, register, state_of,
     SubjectKey,
 };
@@ -882,7 +915,9 @@ fn overlapping_fits_of_one_model_keep_their_failures_apart() {
     let (pa, pb) = (p.clone(), p.clone());
     // Each fit's registration on a thread that runs no fit (a registration inside a fit of the
     // model joins it), and each fit's calls under its own id, as its pool's tasks run them.
-    fn reg<'a>(m: &'a CompiledModel, pop: &'a Population) -> (super::Prints<'a>, u64) {
+    fn reg<'a>(
+        m: &'a CompiledModel, pop: &'a Population,
+    ) -> (ferx_model::parser::model_parser::rhs_regcode::kernel_jit::Prints<'a>, u64) {
         in_fit(0, || {
             let g = register(m, &pop.subjects);
             (g, current_fit())
@@ -966,7 +1001,7 @@ fn fits_over_the_same_objects_keep_their_plan_failures_apart() {
 /// its id set -> the restored assertions.
 #[test]
 fn registration_scopes_are_per_fit_and_nested_ones_join() {
-    use super::registered;
+    use ferx_model::parser::model_parser::rhs_regcode::kernel_jit::registered;
     let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
     let addr = p.subjects.as_ptr() as usize;
     assert_eq!(current_fit(), 0);
@@ -1065,7 +1100,10 @@ fn a_point_failure_counts_the_subject_that_failed_not_its_design_twins() {
     let _g = register(&m, &p.subjects);
     let key = |s: &crate::types::Subject| SubjectKey::new(&m, s, 2, 6);
     assert_eq!(key(&p.subjects[0]), key(&p.subjects[1]), "fixture: one design, one shared plan");
-    super::note_point_failure(&key(&p.subjects[1]), "point");
+    ferx_model::parser::model_parser::rhs_regcode::kernel_jit::note_point_failure(
+        &key(&p.subjects[1]),
+        "point",
+    );
     let c = plan_failure_counts(&m, &p.subjects).expect("counted");
     assert_eq!((c.any, c.inner, c.outer), (1, 1, 1));
     // A condemned design is both subjects'.

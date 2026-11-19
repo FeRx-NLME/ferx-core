@@ -78,7 +78,7 @@ pub fn count_record_nll_g<T: PkNum>(
 /// `(mean λ, size)` on the natural scale from a record's raw `[mean, size]`: `None` when the
 /// law is undefined there (the same points [`count_record_nll_g`] declines). `size` is `None`
 /// for a Poisson endpoint.
-fn natural_params(
+pub fn natural_params(
     family: CountFamily, scale: CountMeanScale, raw: [f64; 2],
 ) -> Option<(f64, Option<f64>)> {
     let lambda = match scale {
@@ -101,7 +101,7 @@ fn natural_params(
 /// The count endpoints of `model`, ascending CMT (`endpoints` is a `BTreeMap`), as
 /// `(cmt, family, scale, param_fn)`. The fixed order is what keeps a multi-endpoint OFV sum
 /// and the simulation RNG stream reproducible.
-fn count_endpoints(
+pub fn count_endpoints(
     model: &CompiledModel,
 ) -> impl Iterator<Item = (usize, CountFamily, CountMeanScale, &CountParamFn)> {
     model.endpoints.iter().filter_map(|(cmt, ep)| match ep {
@@ -113,7 +113,7 @@ fn count_endpoints(
 }
 
 /// One count record as seen by [`for_each_count_param`].
-struct CountRecordEval<'a> {
+pub struct CountRecordEval<'a> {
     /// Internal (occasion-shifted) clock, for any further evaluation on this record.
     model_time: f64,
     /// The covariate map the parameters were evaluated with.
@@ -129,7 +129,7 @@ struct CountRecordEval<'a> {
 /// record-selection, time-scoping and covariate-snapshot rule for the count family: the
 /// likelihood, the sampler, the predictor and the diagnostics all walk records through here,
 /// so they cannot disagree about which rows belong to the endpoint or what `λ` a row carries.
-fn for_each_count_param<F>(
+pub fn for_each_count_param<F>(
     param_fn: &CountParamFn, cmt: usize, subject: &Subject, theta: &[f64], eta: &[f64], mut f: F,
 ) where
     F: FnMut(CountRecordEval<'_>),
@@ -157,7 +157,7 @@ fn for_each_count_param<F>(
 /// Negative log-likelihood of one subject's records on one count endpoint. A record whose law
 /// is undefined (see [`count_record_nll_g`]) adds the `1e20` sentinel, as an overflowed binary
 /// predictor does, so the optimizer is repelled rather than handed a `NaN`.
-fn count_data_term(
+pub fn count_data_term(
     family: CountFamily, scale: CountMeanScale, param_fn: &CountParamFn, cmt: usize,
     subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> f64 {
@@ -226,7 +226,7 @@ pub fn all_count_endpoints_analytic(model: &CompiledModel) -> bool {
 /// One draw from the endpoint's law at `(lambda, size)`: Poisson, or the negative binomial as
 /// its gamma–Poisson mixture (`λ' ~ Gamma(shape r, scale λ/r)`, then `Poisson(λ')`). `None`
 /// when the draw does not fit a `u32` count.
-fn draw_count<R: rand::Rng>(lambda: f64, size: Option<f64>, rng: &mut R) -> Option<u32> {
+pub fn draw_count<R: rand::Rng>(lambda: f64, size: Option<f64>, rng: &mut R) -> Option<u32> {
     use rand_distr::Distribution;
     if lambda <= 0.0 {
         // The zero-mean limit (a `log_lambda` that underflows): zero with probability one,
@@ -365,7 +365,3 @@ pub fn count_diagnostics(
     }
     rows
 }
-
-#[cfg(test)]
-#[path = "count_tests.rs"]
-mod tests;

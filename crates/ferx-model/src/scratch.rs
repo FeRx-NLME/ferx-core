@@ -78,7 +78,7 @@ pub fn give<T: 'static>(mut v: Vec<T>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// A returned buffer is handed out again, empty, with its capacity; a taken one is out

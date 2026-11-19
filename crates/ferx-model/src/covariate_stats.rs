@@ -89,7 +89,7 @@ pub fn stats_binding_error(message: impl Into<String>) -> Diagnostic {
 }
 
 /// The body of [`bind_covariate_stats`]; every refusal is the statistics half's.
-fn bind_stats_on_data(
+pub fn bind_stats_on_data(
     parsed: &mut ParsedModel, model_text: &str, population: &Population,
 ) -> Result<(), String> {
     if parsed.model.bound_from_fit() {
@@ -201,7 +201,7 @@ pub fn assert_covariate_model_bound(model: &CompiledModel) -> Result<(), String>
 
 /// The source line of every relation of `model` still waiting on data-derived
 /// statistics, one per line and indented; `None` when there is none.
-fn unresolved_lines(model: &CompiledModel) -> Option<String> {
+pub fn unresolved_lines(model: &CompiledModel) -> Option<String> {
     let unresolved = model.covariate_model.as_ref()?.unresolved();
     if unresolved.is_empty() {
         return None;
@@ -303,7 +303,7 @@ pub fn check_stats_on(
 
 /// The first field, in the order median, mean, min, max, mode, levels, where two
 /// summaries differ, with both values formatted.
-fn first_difference(
+pub fn first_difference(
     model: &CovariateSummary, data: &CovariateSummary,
 ) -> Option<(&'static str, String, String)> {
     let scalars = [
@@ -320,7 +320,7 @@ fn first_difference(
         .then(|| ("levels", format!("{:?}", model.levels), format!("{:?}", data.levels)))
 }
 
-fn backticked(names: &[String]) -> String {
+pub fn backticked(names: &[String]) -> String {
     names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
 }
 
@@ -337,7 +337,7 @@ fn backticked(names: &[String]) -> String {
 /// actually evaluates at must not be missing from `min`/`max` (which become
 /// default θ bounds) or from `levels = auto` (where an omitted level silently
 /// collapses to the reference factor).
-fn summarize(name: &str, population: &Population) -> Result<CovariateSummary, String> {
+pub fn summarize(name: &str, population: &Population) -> Result<CovariateSummary, String> {
     let mut values: Vec<f64> = Vec::with_capacity(population.subjects.len());
     for subject in &population.subjects {
         values.extend(subject_covariate_values(subject, name));
@@ -399,7 +399,7 @@ pub fn subject_covariate_values(subject: &Subject, name: &str) -> Vec<f64> {
 /// The most common value in a sorted slice. Ties break toward the smaller
 /// value, so the reference level a `categorical(ref = mode)` picks is
 /// reproducible run to run rather than a function of iteration order.
-fn mode_of(sorted: &[f64]) -> f64 {
+pub fn mode_of(sorted: &[f64]) -> f64 {
     let mut best = sorted[0];
     let mut best_count = 0usize;
     let mut current = sorted[0];
@@ -420,7 +420,7 @@ fn mode_of(sorted: &[f64]) -> f64 {
 }
 
 /// Distinct values of a sorted slice, ascending — what `levels = auto` binds to.
-fn distinct(sorted: &[f64]) -> Vec<f64> {
+pub fn distinct(sorted: &[f64]) -> Vec<f64> {
     let mut out: Vec<f64> = Vec::new();
     for v in sorted {
         if out.last() != Some(v) {
@@ -429,7 +429,3 @@ fn distinct(sorted: &[f64]) -> Vec<f64> {
     }
     out
 }
-
-#[cfg(test)]
-#[path = "api/tests/covariate_stats_tests.rs"]
-mod tests;

@@ -1599,7 +1599,7 @@ enum DoseRoute {
 }
 
 impl DoseRoute {
-    fn of(text: &ModelText) -> Option<DoseRoute> {
+    pub fn of(text: &ModelText) -> Option<DoseRoute> {
         text.block_lines("structural_model").iter().find_map(|l| {
             match l.split(['(', ' ', '\t']).next() {
                 Some("pk") => Some(DoseRoute::Analytic),

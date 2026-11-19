@@ -298,7 +298,7 @@ pub fn convolve_2cpt_peripheral<T: PkNum, A: TiltedAbsorption<T>>(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
     use crate::stats::special::ln_gamma;

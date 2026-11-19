@@ -2692,7 +2692,7 @@ fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64
 mod serial_tests;
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::types::{EndpointError, GradientMethod};
     use approx::assert_relative_eq;
@@ -4154,7 +4154,7 @@ mod tests {
         assert_relative_eq!(unit[1], bare[1], epsilon = 1e-12);
     }
 
-    fn make_subject(iwres: Vec<f64>) -> SubjectResult {
+    pub fn make_subject(iwres: Vec<f64>) -> SubjectResult {
         use nalgebra::DVector;
         SubjectResult {
             id: "1".to_string(),

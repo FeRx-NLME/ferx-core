@@ -16,7 +16,7 @@ pub struct CancelFlag(
     Arc<AtomicBool>,
     /// Test-only countdown: polls left before the flag trips itself (#574). Lets a test
     /// land a cancel at an exact poll inside a fit instead of racing a second thread.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Option<Arc<std::sync::atomic::AtomicUsize>>,
 );
 
@@ -30,7 +30,7 @@ impl CancelFlag {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(left) = &self.1 {
             let before = left
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -44,7 +44,7 @@ impl CancelFlag {
 
     /// A flag that reads `false` on its first `polls` polls and cancels itself on the
     /// next one (`trip_after(0)` is a pre-cancelled flag).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn trip_after(polls: usize) -> Self {
         Self(Arc::default(), Some(Arc::new(std::sync::atomic::AtomicUsize::new(polls))))
     }
@@ -58,8 +58,8 @@ pub fn is_cancelled(flag: &Option<CancelFlag>) -> bool {
     matches!(flag, Some(f) if f.is_cancelled())
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any(test, feature = "test-support"))]
+pub mod tests {
     use super::*;
 
     #[test]

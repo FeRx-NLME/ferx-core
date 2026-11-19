@@ -190,7 +190,7 @@ impl std::fmt::Display for Difference {
 
 impl PopulationFingerprint {
     /// The fingerprint of `population`, occasion labels included.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn of(population: &Population) -> Self {
         Self::of_with(population, false)
     }
@@ -290,7 +290,7 @@ impl PopulationFingerprint {
     }
 
     /// This fingerprint under another scheme, for the tests of the scheme gate.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn with_scheme(mut self, scheme: u32) -> Self {
         self.scheme = scheme;
         self
@@ -577,4 +577,4 @@ impl Encoder {
 
 #[cfg(test)]
 #[path = "population_fingerprint_tests.rs"]
-mod tests;
+pub mod tests;

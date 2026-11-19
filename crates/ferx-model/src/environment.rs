@@ -69,7 +69,7 @@ fn username_from_env(user: Option<String>, username: Option<String>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

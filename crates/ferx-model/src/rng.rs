@@ -26,7 +26,7 @@ pub fn stream_seed(seed: u64, words: &[u64]) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::collections::HashSet;
 
@@ -105,7 +105,7 @@ mod tests {
                 "replicate_seed: collides only for seeds differing by a multiple of the constant",
             ),
         ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
         let mut files = Vec::new();
         walk(&root.join("src"), &mut files);
         walk(&root.join("crates"), &mut files);

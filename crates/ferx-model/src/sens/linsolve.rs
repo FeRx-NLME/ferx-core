@@ -46,14 +46,14 @@ pub fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Option<Vec
 /// nothing is skipped for it.
 #[inline]
 pub fn structural_zero<T: PkNum>(x: T) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if T::RECORDS_BRANCHES && RECORDED_ZEROS_KEPT.with(|c| c.get()) {
         return false;
     }
     x.is_constant() && x.nonrec_val() == Some(0.0)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: a plan recording (#2786) reads no zero as a structural one, so `ode::linear`
     /// builds its generator with every entry an edge and keeps every state live — the
@@ -464,7 +464,7 @@ fn lu_solve_body<T: PkNum>(m: &[T], piv: &[T], n: usize, b: &mut [T]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
 

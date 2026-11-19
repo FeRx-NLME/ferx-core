@@ -248,7 +248,7 @@ fn iov_likelihood_with_scratch_matches_fresh_calls_at_changed_parameters() {
 #[test]
 fn the_iov_record_table_predicts_what_per_record_copies_predict() {
     use crate::pk::IOV_TABLE_OFF;
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let mut state = 0x1047_u64;
     let mut rnd = || {
         state ^= state << 13;

@@ -596,7 +596,7 @@ impl std::fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

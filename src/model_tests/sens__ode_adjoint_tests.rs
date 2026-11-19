@@ -2,13 +2,52 @@
 //! oracles: Richardson differences of the production objective with the EBE re-solved at
 //! every point (which shares no derivative code with the adjoint), and of the production
 //! predictor.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::estimation::parameterization::lower_tri_entries;
+use ferx_model::estimation::parameterization::unpack_params;
+use ferx_model::ode::predictions::input_rate_consumes_cmt;
+use ferx_model::ode::predictions::OdeReadout;
+use ferx_model::ode::predictions::OdeSpec;
+use ferx_model::ode::predictions::PreparedForcings;
+use ferx_model::ode::solver::solve_ode_g_certified;
+use ferx_model::ode::solver::solve_ode_g_with_auto_state;
+use ferx_model::ode::solver::OdeAutoSwitchState;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit as kj_fwd;
+use ferx_model::parser::model_parser::rhs_regcode::kernel_jit as kj_tr;
+use ferx_model::pk::absorption::InputRateForcing;
+use ferx_model::pk::absorption::PreparedInputRate;
+use ferx_model::sens::focei_kernel::data_l;
+use ferx_model::sens::focei_kernel::foce_f;
+use ferx_model::sens::focei_kernel::focei_f_grad;
+use ferx_model::sens::focei_kernel::inner_grad;
+use ferx_model::sens::focei_kernel::inner_l;
+use ferx_model::sens::focei_kernel::LikCtx;
+use ferx_model::sens::focei_kernel::ParT;
+use ferx_model::sens::num::vm::VmNum;
+use ferx_model::sens::num::NonRecRead;
+use ferx_model::sens::ode_provider::adjoint::hessian::cov_non_gaussian_served;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_block_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_block_with_gradient_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_diag_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_hessian;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_cov_hessian_at;
+use ferx_model::sens::ode_provider::adjoint::hessian::subject_adjoint_eta_dx;
+use ferx_model::sens::ode_provider::*;
+use ferx_model::types::CompiledModel;
+use ferx_model::types::ModelParameters;
+use ferx_model::types::ScalingSpec;
+use ferx_model::types::PK_IDX_F;
+use ferx_model::types::PK_IDX_LAGTIME;
+use nalgebra::DMatrix;
+use nalgebra::DVector;
+use std::cell::RefCell;
 
-use super::*;
 use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
 use crate::sens::dual2::Dual2;
 use crate::types::{DoseEvent, Subject};
+use ferx_model::sens::ode_provider::adjoint::*;
 use std::collections::HashMap;
 
 pub(super) fn subject(
@@ -3119,7 +3158,9 @@ fn the_iov_outer_gradient_is_exact_with_a_non_gaussian_term() {
     // The quadrature over the stacked `[η, κ]`, the term on its BSV block: Laplace, and the
     // Gauss–Newton anchor on a 2-node grid.
     for (n_agq, exact) in [(1, true), (2, false)] {
-        let w = super::phenomena_tests::fd_oracle_agq_iov(&model, &s, n_agq, exact);
+        let w = crate::model_tests::sens::ode_provider::adjoint::phenomena_tests::fd_oracle_agq_iov(
+            &model, &s, n_agq, exact,
+        );
         eprintln!("IOV + TTE n_agq={n_agq} exact={exact}: worst {w:.2e}");
         worst = worst.max(w);
     }
@@ -3701,7 +3742,7 @@ fn runtime_declined_subject_is_served_exactly(n_agq: usize) {
         &TIMES,
         &[0.1, -0.05, 0.2],
     );
-    let _off = super::PolishOff::new();
+    let _off = ferx_model::sens::ode_provider::adjoint::PolishOff::new();
     let params = &one.default_params;
     let x = pack_params(params);
     let indefinite = |eta: &[f64]| {
@@ -3937,7 +3978,7 @@ fn a_mode_system_decline_is_named() {
     for want_dx in [false, true] {
         let mut out = ModeOut { want_dx, ..ModeOut::default() };
         // The decline itself, with the polish off.
-        let off = super::PolishOff::new();
+        let off = ferx_model::sens::ode_provider::adjoint::PolishOff::new();
         let g =
             subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
         drop(off);
@@ -4151,7 +4192,8 @@ fn a_population_sweep_unpacks_the_packed_point_once() {
     let x = pack_params(&params);
     let etas: Vec<nalgebra::DVector<f64>> =
         pop.subjects.iter().map(|s| ebe_for(&model, s, &params, 1e-10, true)).collect();
-    let count = |f: &dyn Fn()| super::watch_packed_points(&params, f);
+    let count =
+        |f: &dyn Fn()| ferx_model::sens::ode_provider::adjoint::watch_packed_points(&params, f);
     let grads = std::cell::RefCell::new(Vec::new());
     let n = count(&|| {
         *grads.borrow_mut() =
@@ -4908,9 +4950,14 @@ pub(super) fn hessian_gaps_for(
             std::thread::Builder::new()
                 .stack_size(crate::FIT_RAYON_STACK_SIZE)
                 .spawn_scoped(scope, || {
-                    use super::hessian::basis::{BASIS_PLANS, MU_FOLD_OFF, PLAN_PER_DIRECTION};
-                    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
-                    super::hessian::REVERSE_PER_DIRECTION.with(|c| c.set(per_direction));
+                    use ferx_model::sens::ode_provider::adjoint::hessian::basis::{
+                        BASIS_PLANS, MU_FOLD_OFF, PLAN_PER_DIRECTION,
+                    };
+                    use ferx_model::sens::ode_provider::adjoint::hessian::st::{
+                        STRUCT_OFF, STRUCT_PASSES,
+                    };
+                    ferx_model::sens::ode_provider::adjoint::hessian::REVERSE_PER_DIRECTION
+                        .with(|c| c.set(per_direction));
                     PLAN_PER_DIRECTION.with(|c| c.set(plan_dirs));
                     MU_FOLD_OFF.with(|c| c.set(fold_off));
                     STRUCT_OFF.with(|c| c.set(struct_off));
@@ -5272,7 +5319,7 @@ fn cov_block_on_axes_is_the_full_hessians_block() {
 #[cfg(feature = "nn")]
 #[test]
 fn cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block() {
-    use super::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
+    use ferx_model::sens::ode_provider::adjoint::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
     let (model, s) = covariate_nn_fixture();
     let params = moved_params(&model);
     let x = pack_params(&params);
@@ -5319,7 +5366,7 @@ fn cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block() {
 #[cfg(feature = "nn")]
 #[test]
 fn cov_diag_on_a_covariate_nn_subject_runs_in_the_reduced_basis() {
-    use super::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
+    use ferx_model::sens::ode_provider::adjoint::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
     let (model, s) = covariate_nn_fixture();
     let params = moved_params(&model);
     let x = pack_params(&params);
@@ -5417,7 +5464,7 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
 /// reference. Measured: equal to rounding (a column's arithmetic does not see the other
 /// tangent); a misplaced column moves the matrix by O(1) of its largest entry.
 fn narrow_equals_production(label: &str, model: &CompiledModel, s: &Subject, o: Objective) {
-    use super::hessian::PASS_WIDTH;
+    use ferx_model::sens::ode_provider::adjoint::hessian::PASS_WIDTH;
     let params = moved_params(model);
     let x = pack_params(&params);
     let eta = ebe_for(model, s, &params, 1e-12, o != Objective::Foce);
@@ -5735,7 +5782,7 @@ fn the_probit_binary_term_is_exact_on_every_adjoint_route() {
         Objective::Agq { n_agq: 3, exact: true },
     ] {
         assert!(
-            super::cov_non_gaussian_served(&model, objective),
+            ferx_model::sens::ode_provider::adjoint::cov_non_gaussian_served(&model, objective),
             "{objective:?}: the model-level gate serves the probit term"
         );
         gaps.push((format!("cov {objective:?}"), hessian_gaps_for(&model, &s, objective).0));
@@ -6022,7 +6069,7 @@ fn covariate_nn_reduced_hessian_equals_the_full_one() {
 
 #[cfg(feature = "nn")]
 fn reduced_hessian_equals_the_full_one(model: &CompiledModel, s: &Subject) {
-    use super::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
+    use ferx_model::sens::ode_provider::adjoint::hessian::{NN_REDUCED_HITS, NN_REDUCE_OFF};
     let sde = if model.is_sde() { "SDE " } else { "" };
     let params = moved_params(&model);
     let x = pack_params(&params);
@@ -6554,21 +6601,25 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
     assert!(h.clone().cholesky().is_none(), "the fixture must be indefinite");
     let b = DVector::from_column_slice(&[1.0, -3.0]);
     let stationary = [0.0, 3e-6];
-    let w = super::mode_solve(&h, &b, &stationary, || None).expect("nonsingular");
+    let w = ferx_model::sens::ode_provider::adjoint::mode_solve(&h, &b, &stationary, || None)
+        .expect("nonsingular");
     let r = &h * &w - &b;
     assert!(r.norm() < 1e-14, "residual {:.2e}", r.norm());
     // A strict mode keeps the Cholesky solve.
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
-    let w = super::mode_solve(&spd, &b, &stationary, || None).expect("definite");
+    let w = ferx_model::sens::ode_provider::adjoint::mode_solve(&spd, &b, &stationary, || None)
+        .expect("definite");
     assert!((&spd * &w - &b).norm() < 1e-14);
     // Singular at a stationary point: the pseudo-inverse response, not a non-finite `w`.
     // `H = [[1,1],[1,1]]` has eigenpair (2, (1,1)/sqrt 2), so `H+ b = (1,1)(b0+b1)/4`.
     let sing = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
-    let w = super::mode_solve(&sing, &b, &stationary, || None).expect("pseudo-inverse");
+    let w = ferx_model::sens::ode_provider::adjoint::mode_solve(&sing, &b, &stationary, || None)
+        .expect("pseudo-inverse");
     assert!((w[0] + 0.5).abs() < 1e-14 && (w[1] + 0.5).abs() < 1e-14, "{w}");
     // Nearly singular (rcond 1e-14): the plain solve is rounding, the range part is kept.
     let near = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0 - 1e-14]);
-    let w = super::mode_solve(&near, &b, &stationary, || None).expect("pseudo-inverse");
+    let w = ferx_model::sens::ode_provider::adjoint::mode_solve(&near, &b, &stationary, || None)
+        .expect("pseudo-inverse");
     assert!(w.norm() < 1.0, "the null direction is not amplified: {w}");
 }
 
@@ -6582,11 +6633,15 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
 fn mode_solve_declines_an_indefinite_hessian_off_the_mode() {
     let h = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
     let b = DVector::from_column_slice(&[1.0, -3.0]);
-    assert!(super::mode_solve(&h, &b, &[0.0, 5e-5], || None).is_some());
-    assert!(super::mode_solve(&h, &b, &[1e-2, 0.0], || None).is_none());
-    assert!(super::mode_solve(&h, &b, &[f64::NAN, 0.0], || None).is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(&h, &b, &[0.0, 5e-5], || None)
+        .is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(&h, &b, &[1e-2, 0.0], || None)
+        .is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(&h, &b, &[f64::NAN, 0.0], || None)
+        .is_none());
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
-    assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0], || None).is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(&spd, &b, &[1e-2, 0.0], || None)
+        .is_some());
 }
 
 /// #2557: `MODE_STATIONARY_TOL` is a gradient gate of its own, and a point the inner
@@ -6620,17 +6675,18 @@ fn a_certified_point_can_fail_the_indefinite_stationarity_gate() {
     let g = grad(&x);
     let g_inf = g.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
     assert!(
-        g_inf > super::MODE_STATIONARY_TOL,
+        g_inf > ferx_model::sens::ode_provider::adjoint::MODE_STATIONARY_TOL,
         "the certified point is above the gate: {g_inf:.2e}"
     );
     let indefinite = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
     let b = DVector::from_column_slice(&[1.0, -3.0]);
     assert!(
-        super::mode_solve(&indefinite, &b, &g, || None).is_none(),
+        ferx_model::sens::ode_provider::adjoint::mode_solve(&indefinite, &b, &g, || None).is_none(),
         "a certified point above the gate declines"
     );
     let under: Vec<f64> = g.iter().map(|v| v * 0.4).collect();
-    assert!(super::mode_solve(&indefinite, &b, &under, || None).is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(&indefinite, &b, &under, || None)
+        .is_some());
 }
 
 /// A declined stationarity gate is judged again by the inner search's own gradient, which
@@ -6653,23 +6709,70 @@ fn mode_solve_judges_a_declined_gate_by_the_inner_search_gradient() {
         }
     };
     // The recording reads 1e-2, the search 5e-5: taken, by the search's gradient.
-    let w = super::mode_solve(&indefinite, &b, &[1e-2, 0.0], inner([5e-5, 0.0]));
+    let w = ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &indefinite,
+        &b,
+        &[1e-2, 0.0],
+        inner([5e-5, 0.0]),
+    );
     assert!(w.is_some());
     assert_eq!(calls.get(), 1);
     // Both non-stationary: declined.
-    assert!(super::mode_solve(&indefinite, &b, &[1e-2, 0.0], inner([1e-2, 0.0])).is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &indefinite,
+        &b,
+        &[1e-2, 0.0],
+        inner([1e-2, 0.0])
+    )
+    .is_none());
     // No inner gradient: declined.
-    assert!(super::mode_solve(&indefinite, &b, &[1e-2, 0.0], || None).is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &indefinite,
+        &b,
+        &[1e-2, 0.0],
+        || None
+    )
+    .is_none());
     // A definite Hessian and a stationary recording never ask.
     calls.set(0);
-    assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0], inner([1.0, 1.0])).is_some());
-    assert!(super::mode_solve(&indefinite, &b, &[0.0, 5e-5], inner([1.0, 1.0])).is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &spd,
+        &b,
+        &[1e-2, 0.0],
+        inner([1.0, 1.0])
+    )
+    .is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &indefinite,
+        &b,
+        &[0.0, 5e-5],
+        inner([1.0, 1.0])
+    )
+    .is_some());
     // A singular `H` is judged by the same gate (its pseudo-inverse response is the limit at
     // a stationary point only): off the mode it declines to the polish.
     let singular = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
-    assert!(super::mode_solve(&singular, &b, &[1e-2, 0.0], || None).is_none());
-    assert!(super::mode_solve(&singular, &b, &[1e-2, 0.0], inner([5e-5, 0.0])).is_some());
-    assert!(super::mode_solve(&singular, &b, &[0.0, 0.0], || None).is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &singular,
+        &b,
+        &[1e-2, 0.0],
+        || None
+    )
+    .is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &singular,
+        &b,
+        &[1e-2, 0.0],
+        inner([5e-5, 0.0])
+    )
+    .is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::mode_solve(
+        &singular,
+        &b,
+        &[0.0, 0.0],
+        || None
+    )
+    .is_some());
 }
 
 /// `inner_search_gradient` is the inner search's gradient: `exact_inner_gradient`, under
@@ -6692,15 +6795,24 @@ fn the_gate_gradient_is_the_inner_search_gradient() {
     let pv = ParT::of(&model, &s, &params);
     let mut pv = pv;
     pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
-        super::stacked_omega(&model, &s, &params, &params, 3).chol,
+        ferx_model::sens::ode_provider::adjoint::stacked_omega(&model, &s, &params, &params, 3)
+            .chol,
     )
     .unwrap();
     let jets = canonical_jets1(&model, &s, None, &params.theta, None, &[0.0; 3]).unwrap();
     let fpop: Vec<f64> = (0..jets.rows()).map(|j| jets.v(j)).collect();
     for frozen in [None, Some(fpop.as_slice())] {
-        let got =
-            super::inner_search_gradient(&model, &s, None, &params.theta, &eta, &ctx, &pv, frozen)
-                .unwrap();
+        let got = ferx_model::sens::ode_provider::adjoint::inner_search_gradient(
+            &model,
+            &s,
+            None,
+            &params.theta,
+            &eta,
+            &ctx,
+            &pv,
+            frozen,
+        )
+        .unwrap();
         let want = exact_inner_gradient(&model, &s, &params, &eta, frozen).unwrap();
         assert!(got.iter().any(|g| g.abs() > 1e-3), "a vanishing gradient tests nothing");
         for (a, b) in got.iter().zip(&want) {
@@ -7151,12 +7263,12 @@ fn production_sites_take_the_closed_form_inner_hessian() {
     // (#2980) and calls neither routine; with it off, the recorded kernel takes the closed form.
     // Never the generic route: the straddle shows the count is the route's, not a constant.
     let cov_route = |off: bool| {
-        super::hessian::st::STRUCT_OFF.with(|c| c.set(off));
+        ferx_model::sens::ode_provider::adjoint::hessian::st::STRUCT_OFF.with(|c| c.set(off));
         let r = hessian_route(&s, &|| {
             subject_adjoint_cov_hessian(&one, &s, &params, &x, eta.as_slice(), laplace)
                 .expect("served");
         });
-        super::hessian::st::STRUCT_OFF.with(|c| c.set(false));
+        ferx_model::sens::ode_provider::adjoint::hessian::st::STRUCT_OFF.with(|c| c.set(false));
         r
     };
     assert_eq!(cov_route(false), (0, 0), "Laplace covariance step, structured");
@@ -7782,7 +7894,13 @@ fn an_agq_node_with_an_unusable_endpoint_term_is_served_exactly() {
                 .iter()
                 .map(|d| {
                     let e = [eta[0] + d, eta[1]];
-                    super::ng_value_grad(&model, s, &params.theta, &e).map_or(f64::NAN, |r| r.0)
+                    ferx_model::sens::ode_provider::adjoint::ng_value_grad(
+                        &model,
+                        s,
+                        &params.theta,
+                        &e,
+                    )
+                    .map_or(f64::NAN, |r| r.0)
                 })
                 .collect();
             let unusable = |v: f64| !crate::stats::likelihood::is_usable_subject_nll(v);
@@ -7881,7 +7999,7 @@ fn the_cov_hessian_is_exact_with_a_non_gaussian_term() {
             Objective::Agq { n_agq: 3, exact: false },
         ] {
             assert!(
-                super::cov_non_gaussian_served(model, objective),
+                ferx_model::sens::ode_provider::adjoint::cov_non_gaussian_served(model, objective),
                 "{tag}: the model-level gate serves it"
             );
             let (gap, _) = hessian_gaps_for(model, s, objective);
@@ -8177,10 +8295,10 @@ fn a_failed_mode_response_keeps_the_gradient() {
                 let (_, live) =
                     subject_adjoint_gradient_with_eta_dx_at(&model, &s, &pt, eta.as_slice(), true);
                 assert!(live.is_some(), "the fixture's fused pass forms a response");
-                super::FAIL_RESPONSE_LANES.with(|f| f.set(true));
+                ferx_model::sens::ode_provider::adjoint::FAIL_RESPONSE_LANES.with(|f| f.set(true));
                 let (g, r) =
                     subject_adjoint_gradient_with_eta_dx_at(&model, &s, &pt, eta.as_slice(), true);
-                super::FAIL_RESPONSE_LANES.with(|f| f.set(false));
+                ferx_model::sens::ode_provider::adjoint::FAIL_RESPONSE_LANES.with(|f| f.set(false));
                 (plain, g, r)
             })
             .unwrap()
@@ -10155,7 +10273,15 @@ fn a_variant_that_overflows_at_a_trial_point_does_not_condemn_the_subject() {
     );
     // A serve that declines wherever the predictions are not finite, as every consumer does.
     let declines = &mut |_: &PlanArc| None::<()>;
-    assert!(super::with_plan(&model, &s, None, &params.theta, &extreme, declines).is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::with_plan(
+        &model,
+        &s,
+        None,
+        &params.theta,
+        &extreme,
+        declines
+    )
+    .is_none());
     let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
     assert!(failed.is_none(), "the overflowing trial point condemned the subject: {failed:?}");
     // The next point of the line search, sane: served by a plan.
@@ -10172,7 +10298,15 @@ fn a_variant_that_overflows_at_a_trial_point_does_not_condemn_the_subject() {
         &[0.1, -0.05],
     );
     let sane = [0.1, -0.05];
-    assert!(super::with_plan(&model, &t, None, &params.theta, &sane, declines).is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::with_plan(
+        &model,
+        &t,
+        None,
+        &params.theta,
+        &sane,
+        declines
+    )
+    .is_none());
     assert!(
         kj::plan_failures(&model, std::slice::from_ref(&t)).is_some(),
         "a plan that fails to serve at a sane point is condemned"
@@ -10216,7 +10350,15 @@ fn a_finite_trial_eta_with_no_steady_state_declines_the_point_not_the_subject() 
     );
     let key = plan_key(&model, &s, 3, params.theta.len());
     let served = &mut |_: &PlanArc| Some(());
-    assert!(super::with_plan(&model, &s, None, &params.theta, &trial, served).is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::with_plan(
+        &model,
+        &s,
+        None,
+        &params.theta,
+        &trial,
+        served
+    )
+    .is_none());
     assert!(
         matches!(kj::lookup(&key), kj::Lookup::Missing),
         "the trial point recorded nothing and marked nothing"
@@ -10224,7 +10366,15 @@ fn a_finite_trial_eta_with_no_steady_state_declines_the_point_not_the_subject() 
     assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
     // The next, sane point is recorded and served by a plan.
     let sane = [0.1, -0.05, 0.02];
-    assert!(super::with_plan(&model, &s, None, &params.theta, &sane, served).is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::with_plan(
+        &model,
+        &s,
+        None,
+        &params.theta,
+        &sane,
+        served
+    )
+    .is_some());
     assert!(matches!(kj::lookup(&key), kj::Lookup::Found(_)));
     assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
 }
@@ -10246,14 +10396,30 @@ fn an_overflowing_kappa_declines_the_point_not_the_subject() {
     let trial = [0.1, -0.05, 800.0, 800.0, 0.0, 0.0, 0.0, 0.0];
     let key = plan_key(&model, &s, trial.len(), params.theta.len());
     let served = &mut |_: &PlanArc| Some(());
-    assert!(super::with_plan(&model, &s, None, &params.theta, &trial, served).is_none());
+    assert!(ferx_model::sens::ode_provider::adjoint::with_plan(
+        &model,
+        &s,
+        None,
+        &params.theta,
+        &trial,
+        served
+    )
+    .is_none());
     assert!(
         matches!(kj::lookup(&key), kj::Lookup::Missing),
         "the trial point recorded nothing and marked nothing"
     );
     assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
     let sane = [0.1, -0.05, 0.1, -0.05, -0.08, 0.04, 0.05, 0.06];
-    assert!(super::with_plan(&model, &s, None, &params.theta, &sane, served).is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::with_plan(
+        &model,
+        &s,
+        None,
+        &params.theta,
+        &sane,
+        served
+    )
+    .is_some());
     assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
 }
 
@@ -10275,7 +10441,15 @@ fn insane_probes_do_not_evict_the_serving_variant() {
     let params = moved_params(&model);
     let key = plan_key(&model, &s, 2, params.theta.len());
     let sane = [0.1, -0.05];
-    assert!(super::with_plan(&model, &s, None, &params.theta, &sane, &mut |_| Some(())).is_some());
+    assert!(ferx_model::sens::ode_provider::adjoint::with_plan(
+        &model,
+        &s,
+        None,
+        &params.theta,
+        &sane,
+        &mut |_| Some(())
+    )
+    .is_some());
     let serving = match kj::lookup(&key) {
         kj::Lookup::Found(ks) => ks[0].clone(),
         _ => panic!("fixture: the sane point cached a variant"),
@@ -10283,7 +10457,14 @@ fn insane_probes_do_not_evict_the_serving_variant() {
     let extreme = [EXTREME.0, EXTREME.1];
     for _ in 0..(kj::MAX_VARIANTS + 3) {
         // A serve that declines wherever the predictions are not finite, as every consumer does.
-        let r = super::with_plan(&model, &s, None, &params.theta, &extreme, &mut |_| None::<()>);
+        let r = ferx_model::sens::ode_provider::adjoint::with_plan(
+            &model,
+            &s,
+            None,
+            &params.theta,
+            &extreme,
+            &mut |_| None::<()>,
+        );
         assert!(r.is_none());
     }
     match kj::lookup(&key) {
@@ -10316,10 +10497,18 @@ fn the_reduced_basis_plan_honours_a_model_level_bad_mark() {
         kj::SubjectKey::new(&model, &s, 2, params.theta.len()).with_kind(9).with_variant(shape);
     kj::mark_model_bad(&key, "a code path the recorder cannot take");
     let mut called = false;
-    let r = super::with_plan_nn(&model, &s, &params.theta, &eta, &[], None, &mut |_| {
-        called = true;
-        Some(())
-    });
+    let r = ferx_model::sens::ode_provider::adjoint::with_plan_nn(
+        &model,
+        &s,
+        &params.theta,
+        &eta,
+        &[],
+        None,
+        &mut |_| {
+            called = true;
+            Some(())
+        },
+    );
     assert!(r.is_none() && !called, "declined without recording");
     assert!(matches!(kj::lookup(&key), kj::Lookup::Bad));
 }
@@ -10359,7 +10548,14 @@ fn an_overflowing_eta_does_not_condemn_a_plain_or_a_steady_state_subject() {
                 &mut (|_: &PlanArc| None::<()>) as &mut dyn FnMut(&PlanArc) -> Option<()>,
                 &mut |_: &PlanArc| Some(()),
             ] {
-                let _ = super::with_plan(&model, &s, None, &params.theta, &extreme, serves);
+                let _ = ferx_model::sens::ode_provider::adjoint::with_plan(
+                    &model,
+                    &s,
+                    None,
+                    &params.theta,
+                    &extreme,
+                    serves,
+                );
             }
             let key = plan_key(&model, &s, 2, params.theta.len());
             assert!(
@@ -10953,7 +11149,7 @@ fn a_plan_serves_both_sides_of_a_moving_infusion_end() {
 /// variant) → the second subject's Hessian moves.
 #[test]
 fn structured_reduce_is_shared_across_subjects_exactly() {
-    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
+    use ferx_model::sens::ode_provider::adjoint::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
     let model = parse_model_string(ONE_CPT_ORAL).unwrap();
     let s1 = subject(
         &model,
@@ -11013,7 +11209,7 @@ fn structured_reduce_is_shared_across_subjects_exactly() {
 /// Hessian is `None` (its structured sweep cannot form the rows).
 #[test]
 fn foce_past_the_woodbury_gate_takes_the_recorded_kernel() {
-    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
+    use ferx_model::sens::ode_provider::adjoint::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
     let model = parse_model_string(ONE_CPT_ORAL).unwrap();
     let s = subject(
         &model,
@@ -11084,10 +11280,19 @@ fn shared_kernel_serves_both_sides_of_a_recorded_branch() {
         taken.borrow_mut().push(pos);
         Some(vec![if pos { x * x } else { x * <kj::Tr as PkNum>::from_f64(-3.0) }])
     };
-    let variant = super::kernel::variant_of(&("branch test", 1u8));
+    let variant =
+        ferx_model::sens::ode_provider::adjoint::kernel::variant_of(&("branch test", 1u8));
     let run = |v: f64| {
-        super::kernel::kernel_run_shared(&model, &s, variant.clone(), Layout::F64, &[v], 1, &f)
-            .map(|k| k.value(0))
+        ferx_model::sens::ode_provider::adjoint::kernel::kernel_run_shared(
+            &model,
+            &s,
+            variant.clone(),
+            Layout::F64,
+            &[v],
+            1,
+            &f,
+        )
+        .map(|k| k.value(0))
     };
     let a = run(2.0).expect("first point records");
     let b = run(-2.0).expect("the other branch is served by its own recording");

@@ -576,7 +576,7 @@ fn rtte_records_out_of_order_are_coded() {
 #[cfg(feature = "survival")]
 #[test]
 fn rtte_records_refusal_names_the_lowest_bad_cmt_on_every_compile() {
-    use crate::survival::endpoint_order_test_helpers::COMPILES;
+    use crate::model_tests::survival::endpoint_order_test_helpers::COMPILES;
     use crate::types::{EventType, ObsRecord};
     let src = "[parameters]\n  theta TVA(0.15, 0.001, 10.0)\n  theta TVB(0.10, 0.001, 10.0)\n\
                [event_model a]\n  cmt = 2\n  type = rtte\n  family = exponential\n  scale = TVA\n\

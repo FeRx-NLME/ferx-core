@@ -1409,4 +1409,4 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 #[cfg(test)]
 #[path = "covariate_model_tests.rs"]
-mod tests;
+pub mod tests;

@@ -11,9 +11,25 @@
 //! - **Parity** (`nn` only). The exported model evaluated against the network it
 //!   came from, bit for bit: the same function written two ways, so the target
 //!   is equality, not a tolerance.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::nn::Activation;
+use ferx_model::parser::model_parser::block_disabled_feature;
+use ferx_model::parser::model_parser::block_header;
+use ferx_model::parser::model_parser::folds_onto_block_declaration;
+use ferx_model::parser::model_parser::is_plain_identifier;
+use ferx_model::parser::model_parser::parse_nn_block_fields;
+use ferx_model::parser::model_parser::scaling_intermediate_reserved;
+use ferx_model::parser::model_parser::strip_line_comment;
+use ferx_model::parser::model_parser::NnBlockSpec;
+use ferx_model::parser::model_parser::CONTINUATION_BLOCKS;
+use ferx_model::parser::model_parser::CONTINUATION_LEADERS;
+use ferx_model::parser::model_parser::CONTINUATION_TRAILERS;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
-use super::*;
 use crate::parser::model_parser::{parse_model_string, SUPPORTED_UNARY_FNS};
+use ferx_model::nn::export::*;
 
 const FIXTURE_MODEL: &str = include_str!("../../tests/data/dcm_export/model.ferx");
 const FIXTURE_THETA: &str = include_str!("../../tests/data/dcm_export/theta.csv");

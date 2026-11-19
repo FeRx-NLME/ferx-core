@@ -366,7 +366,7 @@ pub fn sample_conditional_event_time(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

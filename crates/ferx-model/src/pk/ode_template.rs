@@ -362,7 +362,7 @@ pub fn generate_variant(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {

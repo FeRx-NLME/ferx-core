@@ -17,7 +17,7 @@ use std::sync::Arc;
 pub(super) const KERNEL_KIND: u8 = 8;
 
 /// A kernel plan's forward at one point: its outputs, and what its reverse passes read.
-pub(super) struct KernelRun {
+pub struct KernelRun {
     plan: Arc<kj::Plan>,
     fwd: kj::Fwd,
     layout: Layout,
@@ -47,7 +47,7 @@ impl KernelRun {
     }
 
     /// Output `o`'s value.
-    pub(super) fn value(&self, o: usize) -> f64 {
+    pub fn value(&self, o: usize) -> f64 {
         self.out[o * self.layout.lanes()]
     }
 
@@ -198,7 +198,7 @@ pub(super) fn kernel_run(
 /// parameter values it reads as literals): one plan per configuration serves every subject, so
 /// a subject neither records nor first-tier runs it (#2980: the structured covariance kernel's
 /// reduce). A thread's plans are kept in a small table, oldest dropped first.
-pub(super) fn kernel_run_shared(
+pub fn kernel_run_shared(
     model: &CompiledModel, subject: &Subject, variant: kj::Desc, layout: Layout, inputs: &[f64],
     n_out: usize, f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
 ) -> Option<KernelRun> {
@@ -243,7 +243,7 @@ pub(super) fn kernel_run_shared(
 
 /// A kernel configuration's [`kj::SubjectKey`] variant: everything that shapes the kernel's
 /// code and is not one of its leaves, as its canonical bytes (compared exactly).
-pub(super) fn variant_of(parts: &impl std::hash::Hash) -> kj::Desc {
+pub fn variant_of(parts: &impl std::hash::Hash) -> kj::Desc {
     kj::Desc::of_value(parts)
 }
 
@@ -291,7 +291,7 @@ impl Inputs {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// A kernel plan replays at new leaves: `x₀·x₁ + exp(x₂)` recorded at one point, then run

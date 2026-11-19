@@ -425,7 +425,7 @@ fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
     // A drug-driven hazard: `examples/pktte_joint.ferx`'s, one dose, one exact event.
     let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/examples/pktte_joint.ferx"
+        "/../../examples/pktte_joint.ferx"
     )))
     .expect("example parses");
     let (cmt, hazard, recurrence) = model
@@ -465,7 +465,7 @@ fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
     {
         let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/examples/ctmm_pd_2state.ferx"
+            "/../../examples/ctmm_pd_2state.ferx"
         )))
         .expect("example parses");
         assert!(model.endpoints.values().any(|e| matches!(

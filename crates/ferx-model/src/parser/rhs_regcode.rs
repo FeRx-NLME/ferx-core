@@ -62,7 +62,7 @@ enum Arith {
 }
 
 impl Arith {
-    fn of(op: Op) -> Option<Self> {
+    pub fn of(op: Op) -> Option<Self> {
         Some(match op {
             Op::Add => Arith::Add,
             Op::Sub => Arith::Sub,
@@ -76,7 +76,7 @@ impl Arith {
 
 /// A unary operation applied to a materialised value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Unary {
+pub enum Unary {
     Exp,
     Ln,
     /// `PkNum::ln`, unguarded: kernel recordings only. [`Unary::Ln`] is the interpreter's
@@ -252,12 +252,12 @@ impl KeyBits for f64 {
 macro_rules! flat_enum {
     ($($(#[$m:meta])* $v:ident { $($f:ident : $t:ty),* $(,)? }),* $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq)]
-        enum Flat {
+        pub enum Flat {
             $($(#[$m])* $v { $($f: $t),* }),*
         }
         /// [`Flat`] with literals by their bits (`-0.0` is not `0.0`, a `NaN` is itself).
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-        enum FlatKey {
+        pub enum FlatKey {
             $($v { $($f: <$t as KeyBits>::Bits),* }),*
         }
         impl Flat {
@@ -820,7 +820,7 @@ impl NativeTan<'_> {
 
 /// A compiled straight-line RHS; see the module docs.
 #[derive(Clone, Debug)]
-pub(super) struct RhsRegProgram {
+pub struct RhsRegProgram {
     code: Vec<Flat>,
     n_regs: usize,
     /// The same program as native code, built per lane count on first use (see `rhs_jit`).
@@ -833,7 +833,7 @@ impl RhsRegProgram {
     pub(super) fn compile_unless_disabled(
         stmts: &[Statement], layout: &RhsLayout<'_>,
     ) -> Result<Self, RhsRefusal> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if super::RHS_REGCODE_DISABLED.with(|c| c.get()) {
             return Err(RhsRefusal { construct: RhsConstruct::Shape, site: RhsSite::IfBlock });
         }
@@ -923,7 +923,7 @@ impl RhsRegProgram {
     /// Whether an `f64` native function exists (built on first use).
     #[inline]
     pub(super) fn has_native_f64(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return false;
         }
@@ -933,7 +933,7 @@ impl RhsRegProgram {
     /// The `f64` native function, resolved once for a caller that runs it many times
     /// (`DirectRhsF64`). `None` where [`Self::has_native_f64`] is `false`.
     pub(super) fn native_f64(&self) -> Option<NativeF64<'_>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return None;
         }
@@ -943,7 +943,7 @@ impl RhsRegProgram {
     /// The `f64` RHS over `k` forward tangent directions as one native function (built on
     /// first use); `None` where there is no native code for it.
     pub(super) fn native_tangent(&self, k: usize) -> Option<NativeTan<'_>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return None;
         }
@@ -971,7 +971,7 @@ impl RhsRegProgram {
         let Some(jit) = self.jit.as_ref() else {
             return false;
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if RHS_JIT_DISABLED.with(|c| c.get()) {
             return false;
         }
@@ -1798,7 +1798,7 @@ impl Builder {
 }
 
 #[path = "rhs_ir.rs"]
-mod ir;
+pub mod ir;
 #[path = "rhs_jit.rs"]
 mod jit;
 #[path = "kernel_jit.rs"]
@@ -1809,7 +1809,7 @@ thread_local! {
     static LANE_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: run the register code even where a native function exists, so a test
     /// can compare the two.
@@ -1818,4 +1818,4 @@ thread_local! {
 
 #[cfg(test)]
 #[path = "rhs_regcode_tests.rs"]
-mod tests;
+pub mod tests;

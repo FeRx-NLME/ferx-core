@@ -1,5 +1,13 @@
-use super::*;
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::parser::model_parser::with_model_time;
+use ferx_model::stats::likelihood::SUBJECT_SENTINEL_NLL;
+use ferx_model::types::CompiledModel;
+use ferx_model::types::EndpointLikelihood;
+use ferx_model::types::ObsRecord;
+use ferx_model::types::Subject;
+
 use crate::parser::model_parser::parse_model_string;
+use ferx_model::markov::dtmm::*;
 use std::collections::HashMap;
 
 fn disc(time: f64, state: usize, cmt: usize) -> ObsRecord {

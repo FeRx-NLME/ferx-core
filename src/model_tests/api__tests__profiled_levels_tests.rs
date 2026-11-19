@@ -1,9 +1,37 @@
 //! `profile`d θ level blocks (#1065): the per-subject active sets, the route and
 //! scope refusals, the parameter count and the output fields.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::diagnostics::Diagnostic;
+use ferx_model::diagnostics::EngineError;
+use ferx_model::estimation::parameterization::theta_from_packed;
+use ferx_model::estimation::parameterization::theta_packing_jacobian;
+use ferx_model::estimation::parameterization::theta_se_from_packed;
+use ferx_model::estimation::sir_settings::percentile_ci;
+use ferx_model::occasions::apply_iov_occasion_rule;
+use ferx_model::parser::model_parser::eval_gather;
+use ferx_model::parser::model_parser::level_index_column;
+use ferx_model::parser::model_parser::parse_full_model_with;
+use ferx_model::parser::model_parser::DataBindings;
+use ferx_model::parser::model_parser::EtaCoupling;
+use ferx_model::parser::model_parser::EtaRoute;
+use ferx_model::parser::model_parser::LevelBinding;
+use ferx_model::parser::model_parser::LevelBindings;
+use ferx_model::parser::model_parser::LevelBlockDecl;
+use ferx_model::parser::model_parser::LevelContrast;
+use ferx_model::parser::model_parser::LevelRule;
+use ferx_model::parser::model_parser::ParseBindings;
+use ferx_model::parser::model_parser::ScaleShare;
+use ferx_model::stats::nested_levels::label_path;
+use ferx_model::stats::nested_levels::NestedLayout;
+use ferx_model::types::IovOccasionRule;
+use ferx_model::types::NestedLevels;
+use ferx_model::types::ObsRecord;
+use ferx_model::types::ParsedModel;
+use std::collections::HashMap;
 
-use super::*;
 use crate::parser::model_parser::parse_full_model;
 use crate::types::{CompiledModel, Population, Subject};
+use ferx_model::levels::*;
 
 /// An algebraic MBMA model: `BASE = TVE0 + <read> + ETA_E0`, additive error. `decl`
 /// is the block's declaration line.

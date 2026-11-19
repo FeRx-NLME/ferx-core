@@ -10,8 +10,9 @@
 //! Central FD is also *more* accurate than the forward FD this work replaces,
 //! so `hybrid_is_closer_to_central_fd_than_forward_fd` can assert the direction
 //! of the change rather than merely bounding the disagreement.
+// --- the imports of the original parent module (relocated test, #3041) ---
+use nalgebra::DMatrix;
 
-use super::*;
 use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
 };
@@ -19,6 +20,7 @@ use crate::parser::model_parser::parse_model_string;
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::obs_nll_subject_into;
 use crate::types::{CompiledModel, DoseEvent, Subject};
+use ferx_model::estimation::nn_theta_gradient::*;
 use std::collections::HashMap;
 
 /// A DCM small enough for a unit test but structurally identical to

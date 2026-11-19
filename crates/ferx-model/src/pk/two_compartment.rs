@@ -328,7 +328,7 @@ pub fn two_cpt_oral_peripheral(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use approx::assert_relative_eq;
 

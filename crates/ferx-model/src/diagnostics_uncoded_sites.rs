@@ -38,7 +38,7 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "runtime: a subject's posthoc EBE is non-finite",
     ),
     (
-        "src/stats/nested_levels.rs",
+        "crates/ferx-model/src/stats/nested_levels.rs",
         "of",
         1,
         "internal only (#1082 PR4): `KappaDraw::of` on a nested subject without its level \
@@ -171,7 +171,7 @@ pub(super) fn production_lines(text: &str) -> Vec<&str> {
 /// error-code registry check (#1051), so the two scans agree on what test code is.
 pub(super) fn production_files(root: &Path) -> Vec<(String, String)> {
     let mut files = Vec::new();
-    let mut stack = vec![root.join("src")];
+    let mut stack = vec![root.join("src"), root.join("crates/ferx-model/src")];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read a src dir") {
             let path = entry.expect("a dir entry").path();
@@ -217,7 +217,7 @@ fn scan(root: &Path) -> BTreeMap<(String, String), usize> {
 /// delete a listed site, or add one to a listed fn → red ("listed … but found …").
 #[test]
 fn every_uncoded_site_is_listed() {
-    let found = scan(Path::new(env!("CARGO_MANIFEST_DIR")));
+    let found = scan(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../..")));
     let listed: BTreeMap<(String, String), usize> = UNCODED_SITES
         .iter()
         .map(|(f, func, n, _)| ((f.to_string(), func.to_string()), *n))
@@ -288,7 +288,7 @@ fn the_scan_sees_a_planted_site_and_skips_test_code() {
 struct Probe<T, S>(std::marker::PhantomData<(T, S)>);
 
 impl<T, S> Probe<T, S> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Probe(std::marker::PhantomData)
     }
 }

@@ -1,4 +1,16 @@
 //! Binding `[covariate_model]` statistics to data (#1111).
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::diagnostics::Diagnostic;
+use ferx_model::diagnostics::EngineError;
+use ferx_model::levels::declared_model;
+use ferx_model::levels::levels_hold_on;
+use ferx_model::levels::unbound_bindings;
+use ferx_model::levels::Reads;
+use ferx_model::parser::covariate_model::CovariateStatBindings;
+use ferx_model::parser::model_parser::parse_full_model_with;
+use ferx_model::types::CovariateSummary;
+use ferx_model::types::ParsedModel;
+use std::collections::HashSet;
 
 use std::collections::HashMap;
 
@@ -1233,7 +1245,7 @@ fn the_stat_comparison_names_the_first_field_that_differs() {
         mode: 60.0,
         levels: vec![50.0, 60.0, 95.0],
     };
-    assert_eq!(super::first_difference(&base, &base.clone()), None);
+    assert_eq!(ferx_model::covariate_stats::first_difference(&base, &base.clone()), None);
 
     let fields = ["median", "mean", "min", "max", "mode", "levels"];
     for (i, want) in fields.iter().enumerate() {
@@ -1248,8 +1260,8 @@ fn the_stat_comparison_names_the_first_field_that_differs() {
                 _ => other.levels.push(99.0),
             }
         }
-        let (field, model, data) =
-            super::first_difference(&base, &other).unwrap_or_else(|| panic!("{want}: no diff"));
+        let (field, model, data) = ferx_model::covariate_stats::first_difference(&base, &other)
+            .unwrap_or_else(|| panic!("{want}: no diff"));
         assert_eq!(field, *want);
         if *want == "levels" {
             // A categorical `levels = auto` can differ in its level set alone.
@@ -1263,7 +1275,7 @@ fn the_stat_comparison_names_the_first_field_that_differs() {
     let mut shifted = base.clone();
     shifted.median = 92.105;
     assert_eq!(
-        super::first_difference(&base, &shifted),
+        ferx_model::covariate_stats::first_difference(&base, &shifted),
         Some(("median", "70".to_string(), "92.105".to_string()))
     );
 }
@@ -1287,7 +1299,7 @@ fn check_stats_on_re_summarises_the_population() {
     }
     pop.covariate_names.push("AGE".to_string());
     let bound = bind(&text, &pop).expect("binds");
-    assert_eq!(super::check_stats_on(&bound, &pop).unwrap(), None);
+    assert_eq!(ferx_model::covariate_stats::check_stats_on(&bound, &pop).unwrap(), None);
 
     let mut other = pop.clone();
     for s in &mut other.subjects {
@@ -1299,7 +1311,8 @@ fn check_stats_on_re_summarises_the_population() {
     // probability 1 − 2⁻⁸.
     for _ in 0..8 {
         let bound = bind(&text, &pop).expect("binds");
-        let got = super::check_stats_on(&bound, &other).unwrap().expect("differs");
+        let got =
+            ferx_model::covariate_stats::check_stats_on(&bound, &other).unwrap().expect("differs");
         assert_eq!(
             (got.covariate.as_str(), got.field, got.model.as_str(), got.data.as_str()),
             ("AGE", "median", "40", "41")
@@ -1311,7 +1324,7 @@ fn check_stats_on_re_summarises_the_population() {
         s.covariates.remove("AGE");
     }
     // #1774: the binder's own refusal, with its code.
-    let err = super::check_stats_on(&bound, &absent).unwrap_err();
+    let err = ferx_model::covariate_stats::check_stats_on(&bound, &absent).unwrap_err();
     assert_eq!(
         (err.code.as_str(), err.block.as_deref()),
         ("E_COVARIATE_STATS_BINDING", Some("covariate_model")),
@@ -1353,7 +1366,7 @@ fn a_from_fit_reparse_refusal_on_a_stats_only_model_is_the_stats_code() {
 /// auto` / `[covariate_model]` statistics cannot drop the later level (review r2 #1).
 #[test]
 fn covariate_values_include_count_record_snapshots() {
-    let prep = crate::categorical::exact_eta_hessian_tests::load(
+    let prep = crate::model_tests::categorical::exact_eta_hessian_tests::load(
         "[parameters]\n  theta BASE(4.0, 0.01, 100.0)\n  theta GAM(-0.5, -10.0, 10.0)\n\
          [covariates]\n  TRT continuous\n[count_model]\n  cmt = 1\n  \
          log_lambda = log(BASE) + GAM * TRT\n",
@@ -1362,7 +1375,7 @@ fn covariate_values_include_count_record_snapshots() {
     let s = &prep.population.subjects[0];
     assert_eq!(s.covariates.get("TRT"), Some(&0.0), "baseline is the first row's");
     assert!(s.obs_covariates.is_empty(), "no Gaussian rows carry TRT");
-    let mut vals = super::subject_covariate_values(s, "TRT");
+    let mut vals = ferx_model::covariate_stats::subject_covariate_values(s, "TRT");
     vals.sort_by(f64::total_cmp);
     assert_eq!(vals, vec![0.0, 1.0]);
 }

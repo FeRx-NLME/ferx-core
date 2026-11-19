@@ -308,7 +308,7 @@ struct Lu {
 }
 
 impl Lu {
-    fn of(m: &[f64], n: usize, l: usize, lane: usize) -> Option<Self> {
+    pub fn of(m: &[f64], n: usize, l: usize, lane: usize) -> Option<Self> {
         let mut f: Vec<f64> = (0..n * n).map(|e| m[e * l + lane]).collect();
         let mut piv = vec![0.0; crate::sens::linsolve::lu_piv_len::<f64>(n)];
         crate::sens::linsolve::lu_factor_in_place_g(&mut f, &mut piv, n).then_some(Lu { n, f, piv })

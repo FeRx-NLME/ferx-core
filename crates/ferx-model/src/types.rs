@@ -12,7 +12,7 @@ pub use crate::parser::model_parser::ThetaBlocks;
 // A child module, so its exhaustive destructure of `DoseEvent` can name the
 // private `cmt` field (#1685).
 pub mod estimates_json;
-mod population_fingerprint;
+pub mod population_fingerprint;
 pub use population_fingerprint::subject_list_difference;
 pub use population_fingerprint::Difference as PopulationDifference;
 pub use population_fingerprint::PopulationFingerprint;
@@ -132,7 +132,7 @@ impl BicInputs {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub use population_fingerprint::SCHEME as POPULATION_FINGERPRINT_SCHEME;
 
 /// How a dose's infusion `rate`/`duration` are determined.
@@ -230,7 +230,7 @@ pub struct DoseEvent {
     /// (the literal authored value). Keeping the field private is what makes the
     /// recurring `cmt - 1` underflow bug (#899) unrepresentable at the call site —
     /// a bare `- 1` cannot be written against it.
-    cmt: usize,
+    pub cmt: usize,
     pub rate: f64,
     pub duration: f64,
     pub ss: bool,
@@ -1252,7 +1252,7 @@ impl PkParams {
     }
 
     /// Build from named HashMap (bridge for parser compatibility)
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_hashmap(map: &HashMap<String, f64>) -> Self {
         let mut p = Self::default();
         if let Some(&v) = map.get("cl") {
@@ -2867,12 +2867,12 @@ impl OmegaMatrix {
 /// parameterisation round trip; `a_fit_carried_fix_zero_is_recovered_from_the_declaration`
 /// bounds it). Twice the floor clears that by ~1e-8 and stays far below any variance a
 /// caller would supply on purpose; that test also pins a supplied `3e-8` as honoured.
-const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
+pub const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
 
 /// [`OmegaMatrix::sim_chol`] for an input `m` whose Cholesky failed: `Some` when
 /// `m` has structural zeros (diagonal exactly `0`, whole row and column exactly
 /// `0`) and the rest factors on its own; `None` otherwise (#1605).
-fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
+pub fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
     let n = m.nrows();
     let zeros: Vec<bool> =
         (0..n).map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0)).collect();
@@ -2887,7 +2887,7 @@ fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
 /// the remaining block is not positive definite. Off-diagonal entries between a
 /// zero and a non-zero η are ignored: on a declared zero they are `0` by
 /// definition, and on a fit-carried one they are the regularisation's residue.
-fn factor_with_zeros(m: &DMatrix<f64>, zeros: &[bool]) -> Option<DMatrix<f64>> {
+pub fn factor_with_zeros(m: &DMatrix<f64>, zeros: &[bool]) -> Option<DMatrix<f64>> {
     let n = m.nrows();
     let keep: Vec<usize> = (0..n).filter(|&i| !zeros[i]).collect();
     let k = keep.len();
@@ -3177,7 +3177,7 @@ pub struct MixtureParams {
 
 impl ModelParameters {
     /// Return `true` if any parameter is marked FIX.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn has_any_fixed(&self) -> bool {
         self.theta_fixed.iter().any(|&b| b)
             || self.omega_fixed.iter().any(|&b| b)
@@ -3241,7 +3241,7 @@ pub struct MixtureClassOverride {
 /// addition non-breaking; construct it inside this crate (where literals are
 /// still allowed) or read it field-by-field.
 #[derive(Debug, Clone)]
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 pub struct MixtureSpec {
     /// Number of subpopulations K (>= 2).
     pub n_classes: usize,
@@ -4101,7 +4101,7 @@ pub struct AnalyticalInit {
 /// supported paths).
 ///
 /// `#[non_exhaustive]`: constructed only inside the crate (the parser).
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 pub struct AnalyticReadout {
     /// The compiled readout: `OdeReadout::Single` for uniform `y = <expr>`,
     /// `OdeReadout::PerCmt` for per-CMT `y[CMT=N] = <expr>`. Reuses the ODE
@@ -4280,7 +4280,7 @@ impl ScalingSpec {
     /// compatibility (e.g. a future variant that genuinely can't fold
     /// into a Const slice).
     #[inline]
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn requires_fd(&self) -> bool {
         match self {
             Self::None | Self::ScalarScale(_) | Self::ExpressionScale { .. } | Self::PerCmt(_) => {
@@ -5560,7 +5560,7 @@ impl AbsorptionOdeEquivalent {
 /// [`absorption_twin_decline_reason`], so the round-trip is one constant rather than two
 /// independent substring guesses. The fixed text contains no other occurrence, so splitting on
 /// the first one recovers the reason exactly — including a reason that itself says "Reason:".
-const TWIN_DECLINE_REASON_MARKER: &str = " Reason: ";
+pub const TWIN_DECLINE_REASON_MARKER: &str = " Reason: ";
 
 /// The parse warning recorded when an absorption model's ODE twin was reconstructed but its own
 /// parse rejected it (#1008).
@@ -6960,7 +6960,7 @@ pub struct TteObsDiagnostic {
 /// Serde default of an optional score: NaN, "not computed". The derive default of an
 /// `f64` is `0.0`, a valid-looking score.
 #[cfg(feature = "survival")]
-fn nan_f64() -> f64 {
+pub fn nan_f64() -> f64 {
     f64::NAN
 }
 
@@ -7290,7 +7290,7 @@ pub struct PosteriorSummary {
 /// `method = [vi, imp]` chain with [`FitOptions::imp_eval_only`], to obtain a
 /// genuine marginal likelihood.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 pub struct ViResult {
     /// `−2 × ELBO` at the reported (Polyak-averaged) estimate. Scaled by `−2` so
     /// it moves in the same direction as an OFV; see the type docs for why it is
@@ -7544,7 +7544,7 @@ pub enum WarningSeverity {
 /// warning classes appear; never repurpose an existing token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 pub enum WarningCode {
     /// Optimizer did not reach the convergence criterion.
     Convergence,
@@ -8389,7 +8389,7 @@ pub struct LevelGroupEbe {
 /// Not to be confused with [`MixtureClassOverride`], the parsed declaration.
 /// `#[non_exhaustive]` so a later field is not a breaking change; ferx builds it, a caller
 /// reads it.
-#[non_exhaustive]
+#[cfg_attr(not(feature = "test-support"), non_exhaustive)]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MixtureOverrideParam {
     /// The override's name, as
@@ -11616,7 +11616,7 @@ pub fn deprecated_keys() -> &'static [(&'static str, &'static str)] {
 }
 
 /// The [`deprecated_keys`] notice for `key`, if it is deprecated.
-fn deprecated_key_notice(key: &str) -> Option<&'static str> {
+pub fn deprecated_key_notice(key: &str) -> Option<&'static str> {
     deprecated_keys().iter().find(|(k, _)| *k == key).map(|(_, notice)| *notice)
 }
 
@@ -11960,12 +11960,12 @@ pub struct ParsedModel {
 
 // #2799: the usability verdict beside `converged`, in its own file.
 #[path = "types_fit_status.rs"]
-mod fit_status;
+pub mod fit_status;
 pub use fit_status::{FitStatus, StatusReason};
 
 // #2867: what each start of a multi-start fit did, and the summary of their spread.
 #[path = "types_multi_start.rs"]
-mod multi_start;
+pub mod multi_start;
 pub use multi_start::StartRecord;
 pub use multi_start::{StartSpread, START_AGREE_OFV};
 
@@ -11973,7 +11973,3 @@ pub use multi_start::{StartSpread, START_AGREE_OFV};
 #[cfg(any(test, feature = "test-support"))]
 #[path = "types_test_helpers.rs"]
 pub mod test_helpers;
-
-#[cfg(test)]
-#[path = "types_tests.rs"]
-mod tests;

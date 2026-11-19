@@ -67,7 +67,7 @@ thread_local! {
     /// a single entry would miss on every alternation.
     static OMEGA_CACHE: std::cell::RefCell<Vec<OmegaT<f64>>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Factorisations the cache had to compute (test seam).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     static OMEGA_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -87,7 +87,7 @@ impl OmegaT<f64> {
             }) {
                 return Some(OmegaT { chol, inv: o.inv.clone(), log_det: o.log_det });
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             OMEGA_MISSES.with(|m| m.set(m.get() + 1));
             let o = Self::from_chol(chol)?;
             match at {
@@ -1001,7 +1001,7 @@ pub fn foce_f<T: PkNum>(
 /// smallest 1.2e11 (error 0.16–0.27). Anywhere in `[1e5, 1e9]` separates them.
 const WOODBURY_MAX_INFO_TRACE: f64 = 1e6;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Test switch: take the Woodbury branch whatever `1 + tr(S)` says, to show a fixture
     /// can expose the loss the gate exists for.
@@ -1010,9 +1010,9 @@ thread_local! {
 
 #[inline]
 fn woodbury_forced() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     return FORCE_WOODBURY.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     false
 }
 
@@ -1211,12 +1211,12 @@ fn reads_eta_directly(ctx: &LikCtx) -> bool {
 /// path (losing the speedup) would leave every test green. Counted where each runs, not at the
 /// dispatch, so a fallback inside a branch is seen too; a list, so concurrent tests watching
 /// their own subjects do not overwrite each other.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub static INNER_HESSIAN_ROUTE: std::sync::Mutex<Vec<(usize, usize, usize)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Count one run of an implementation for `subject` if a test watches it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn note_inner_hessian_route(subject: &Subject, generic: bool) {
     if let Ok(mut watch) = INNER_HESSIAN_ROUTE.lock() {
         let addr = subject as *const Subject as usize;
@@ -1263,7 +1263,7 @@ pub fn exact_inner_hessian_kernel<T: PkNum>(
 pub fn inner_hessian_through_predictions<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], q: &[Vec<T>], p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     note_inner_hessian_route(ctx.subject, false);
     let n = p.omega.inv.len();
     // The width is Ω⁻¹'s own, so a `ParT` without Ω (`map_rows`) would give `n = 0` and a
@@ -1307,7 +1307,7 @@ pub fn inner_hessian_through_predictions<T: PkNum>(
 pub fn inner_hessian_generic<T: PkNum>(
     ctx: &LikCtx, f: &[T], g: &[Vec<T>], q: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     note_inner_hessian_route(ctx.subject, true);
     let n = eta.len();
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
@@ -1455,7 +1455,7 @@ pub fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
 

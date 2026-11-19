@@ -642,7 +642,7 @@ impl NestedLayout {
 
 #[cfg(test)]
 #[path = "nested_levels_tests.rs"]
-mod tests;
+pub mod tests;
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "nested_levels_test_helpers.rs"]

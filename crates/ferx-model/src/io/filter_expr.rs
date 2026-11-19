@@ -383,7 +383,7 @@ pub struct RowContext<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::collections::HashMap;
 

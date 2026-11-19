@@ -1,5 +1,27 @@
-use super::*;
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::cold_sort::ColdSort;
+use ferx_model::parser::covariate_model::CovariateStatBindings;
+use ferx_model::sim::adaptive::round_to_message;
+use ferx_model::sim::adaptive::validate_increasing_finite;
+use ferx_model::sim::adaptive::AdaptiveAction;
+use ferx_model::sim::adaptive::AdaptiveDosingSpec;
+use ferx_model::sim::adaptive::AdaptiveRoute;
+use ferx_model::sim::adaptive::AdaptiveRule;
+use ferx_model::sim::adaptive::Comparison;
+use ferx_model::sim::adaptive::DecisionCovariates;
+use ferx_model::sim::adaptive::DoseKnowledge;
+use ferx_model::sim::adaptive::DoseStep;
+use ferx_model::sim::adaptive::DoseValue;
+use ferx_model::sim::adaptive::IntervalStep;
+use ferx_model::types::*;
+use regex::Regex;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
+use std::sync::LazyLock;
+
 use crate::sens::num::NonRecRead;
+use ferx_model::parser::model_parser::*;
 
 // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 
@@ -1109,7 +1131,8 @@ fn test_required_params_present_parses_ok() {
     ];
     for line in ok_lines {
         assert!(
-            super::parse_full_model(&structural_model_with(line)).is_ok(),
+            ferx_model::parser::model_parser::parse_full_model(&structural_model_with(line))
+                .is_ok(),
             "`{line}` should parse without a structural error"
         );
     }
@@ -1144,8 +1167,8 @@ fn test_unused_pk_param_warns() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed =
-        super::parse_full_model(model_str).expect("unused params are a warning, not a parse error");
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str)
+        .expect("unused params are a warning, not a parse error");
     let warn =
         parsed.model.parse_warnings.iter().find(|w| w.contains("does not use")).unwrap_or_else(
             || panic!("expected an unused-param warning, got: {:?}", parsed.model.parse_warnings),
@@ -1192,7 +1215,7 @@ fn test_f_lagtime_warning_matrix() {
         )
     };
     let warns = |indiv: &str, pk: &str| -> Vec<String> {
-        super::parse_full_model(&model(indiv, pk))
+        ferx_model::parser::model_parser::parse_full_model(&model(indiv, pk))
             .unwrap_or_else(|e| panic!("`{pk}` should parse: {e}"))
             .model
             .parse_warnings
@@ -1223,7 +1246,7 @@ fn test_f_lagtime_warning_matrix() {
 
     // (4) Oral + `f` mapped to an UNDEFINED variable → parse error (#308).
     assert!(
-        super::parse_full_model(&model(
+        ferx_model::parser::model_parser::parse_full_model(&model(
             "  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = 1.0",
             "pk one_cpt_oral(cl=CL, v=V, ka=KA, f=FNOPE)",
         ))
@@ -1275,14 +1298,17 @@ fn test_param_used_only_in_derived_not_flagged_dead() {
         )
     };
     // KEL is referenced in [derived] → used → no dead warning.
-    let p = super::parse_full_model(&model("\n[derived]\n  RATE = KEL * 2\n")).expect("parse ok");
+    let p = ferx_model::parser::model_parser::parse_full_model(&model(
+        "\n[derived]\n  RATE = KEL * 2\n",
+    ))
+    .expect("parse ok");
     assert!(
         !p.model.parse_warnings.iter().any(|w| w.contains("computed but never used")),
         "KEL is used in [derived] and must not be flagged dead: {:?}",
         p.model.parse_warnings
     );
     // Negative control: with no [derived] reference, KEL IS dead.
-    let p2 = super::parse_full_model(&model("")).expect("parse ok");
+    let p2 = ferx_model::parser::model_parser::parse_full_model(&model("")).expect("parse ok");
     assert!(
         p2.model
             .parse_warnings
@@ -1321,7 +1347,7 @@ fn direct_pk_time_synth_param_not_flagged_unused() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let p = super::parse_full_model(src).expect("parse ok");
+    let p = ferx_model::parser::model_parser::parse_full_model(src).expect("parse ok");
     assert!(
         !p.model.parse_warnings.iter().any(|w| w.contains("computed but never used")),
         "direct pk(q=TIME) must not flag the synthetic __ferx_pktime_q as dead: {:?}",
@@ -1349,7 +1375,9 @@ fn reserved_pktime_prefix_rejected_with_correct_message() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let err = super::parse_full_model(src).err().expect("reserved prefix must be rejected");
+    let err = ferx_model::parser::model_parser::parse_full_model(src)
+        .err()
+        .expect("reserved prefix must be rejected");
     assert!(err.contains(PKTIME_SYNTH_PREFIX), "message must name the pktime prefix: {err}");
     assert!(
         err.contains("pk(...=TIME)"),
@@ -1386,7 +1414,7 @@ fn test_ode_dead_indiv_param_warns() {
 [error_model]
   DV ~ proportional(EPS)
 "#;
-    let ws = super::parse_full_model(content)
+    let ws = ferx_model::parser::model_parser::parse_full_model(content)
         .expect("a dead ODE param is a warning, not an error")
         .model
         .parse_warnings;
@@ -1444,7 +1472,7 @@ fn indexed_dose_attributes_are_not_flagged_dead_on_the_engine_that_reads_them() 
         (ode, "  F1 = TVX\n  ALAG2 = TVX\n  D1 = TVX\n  R2 = TVX"),
         (analytic, "  D1 = TVX\n  R2 = TVX"),
     ] {
-        let ws = super::parse_full_model(&model(structural, attrs))
+        let ws = ferx_model::parser::model_parser::parse_full_model(&model(structural, attrs))
             .expect("a read-by-name dose attribute must parse")
             .model
             .parse_warnings;
@@ -1454,7 +1482,10 @@ fn indexed_dose_attributes_are_not_flagged_dead_on_the_engine_that_reads_them() 
         );
     }
     // The control: the census is live on this fixture.
-    let ws = super::parse_full_model(&model(ode, "  UNUSED = TVX")).unwrap().model.parse_warnings;
+    let ws = ferx_model::parser::model_parser::parse_full_model(&model(ode, "  UNUSED = TVX"))
+        .unwrap()
+        .model
+        .parse_warnings;
     assert!(
         ws.iter().any(|w| w.contains("`UNUSED`") && w.contains("computed but never used")),
         "{ws:?}"
@@ -1495,7 +1526,7 @@ fn test_ode_engine_applied_f_lagtime_not_flagged_dead() {
 [error_model]
   DV ~ proportional(EPS)
 "#;
-    let ws = super::parse_full_model(content)
+    let ws = ferx_model::parser::model_parser::parse_full_model(content)
         .expect("engine-applied F/lagtime on an ODE model must parse")
         .model
         .parse_warnings;
@@ -2342,8 +2373,9 @@ fn adaptive_observe_does_not_reach_the_absorption_twin() {
     // The drop, asserted where it happens. `AbsorptionOdeEquivalent` keeps only the
     // built model since #1008, so the reconstruction is re-run here rather than read
     // off the twin — same function, same blocks, and it fails if the block comes back.
-    let extracted = super::extract_blocks(&ok_src).expect("the model file extracts");
-    let twin_src = super::absorption_ode_equivalent_source(&extracted)
+    let extracted =
+        ferx_model::parser::model_parser::extract_blocks(&ok_src).expect("the model file extracts");
+    let twin_src = ferx_model::parser::model_parser::absorption_ode_equivalent_source(&extracted)
         .expect("a plain transit model reconstructs a twin source");
     assert!(
         !twin_src.contains("[adaptive_dosing]"),
@@ -2722,7 +2754,7 @@ fn case_distinct_names_under_two_roles_keep_their_own_slots() {
     // Several parses, because `HashMap` ordering is per-instance.
     let src = analytical_dose_attr_src("f=X, lagtime=x", "X  = TVF\n  x  = TVLAG", "");
     for _ in 0..16 {
-        let m = super::parse_full_model(&src).unwrap().model;
+        let m = ferx_model::parser::model_parser::parse_full_model(&src).unwrap().model;
         let slot_of = |name: &str| {
             let i = m.indiv_param_names.iter().position(|n| n == name).unwrap();
             m.pk_indices[i]
@@ -2747,7 +2779,7 @@ fn pk_slot_noun_names_every_slot_name_to_index_hands_out() {
     for name in names {
         let slot = crate::types::PkParams::name_to_index(name)
             .unwrap_or_else(|| panic!("`{name}` must be a role key"));
-        let noun = super::pk_slot_noun(slot);
+        let noun = ferx_model::parser::model_parser::pk_slot_noun(slot);
         assert_ne!(noun, "the same PK parameter", "slot {slot} (`{name}`) has no noun");
         assert!(noun.starts_with("the "), "`{noun}` must read as a noun phrase");
         seen.insert(slot);
@@ -2755,7 +2787,7 @@ fn pk_slot_noun_names_every_slot_name_to_index_hands_out() {
     // Every slot name_to_index can produce was visited (13 distinct slots).
     assert_eq!(seen.len(), 13, "{seen:?}");
     // And the fallback still exists for a slot outside the table.
-    assert_eq!(super::pk_slot_noun(usize::MAX), "the same PK parameter");
+    assert_eq!(ferx_model::parser::model_parser::pk_slot_noun(usize::MAX), "the same PK parameter");
 }
 
 #[test]
@@ -2765,7 +2797,7 @@ fn one_variable_under_two_spellings_of_one_role_stays_legal() {
     // collapses it before the variable is looked at a second time. A model that
     // parsed on `main` must keep parsing.
     let src = analytical_dose_attr_src("lagtime=X, alag=X", "X = TVLAG", "");
-    let parsed = super::parse_full_model(&src)
+    let parsed = ferx_model::parser::model_parser::parse_full_model(&src)
         .unwrap_or_else(|e| panic!("two spellings of one role must stay legal: {e}"));
     assert!(parsed.model.has_lagtime());
     assert!(!parsed.model.has_bioavailability());
@@ -2785,7 +2817,7 @@ fn analytical_unbound_lagtime_and_f_are_not_a_lag_or_bioavailability() {
     // event schedule) for nothing. Fails on `main`; restoring the bare-name arm
     // reddens it.
     let src = analytical_dose_attr_src("", "LAGTIME = TVLAG\n  F = TVF", "");
-    let parsed = super::parse_full_model(&src).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(&src).unwrap();
     let m = &parsed.model;
     assert!(
         m.indiv_param_names.iter().any(|n| n == "LAGTIME")
@@ -2812,7 +2844,7 @@ fn analytical_unbound_lagtime_and_f_are_not_a_lag_or_bioavailability() {
     // Control — the same declarations *bound* on the `pk(...)` line are live on
     // every predicate, via `pk_indices` alone.
     let src = analytical_dose_attr_src("lagtime=LAGTIME, f=F", "LAGTIME = TVLAG\n  F = TVF", "");
-    let m = super::parse_full_model(&src).unwrap().model;
+    let m = ferx_model::parser::model_parser::parse_full_model(&src).unwrap().model;
     assert!(m.has_lagtime() && m.has_lagtime_on_cmt(1) && m.has_bioavailability());
 }
 
@@ -3005,7 +3037,7 @@ fn test_ode_multiple_dead_params_use_plural_message() {
 [error_model]
   DV ~ proportional(EPS)
 "#;
-    let ws = super::parse_full_model(content)
+    let ws = ferx_model::parser::model_parser::parse_full_model(content)
         .expect("dead ODE params are a warning, not an error")
         .model
         .parse_warnings;
@@ -3055,7 +3087,8 @@ fn test_undeclared_name_in_derived_is_accepted_silently() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(src).expect("undeclared name in [derived] should parse");
+    let parsed = ferx_model::parser::model_parser::parse_full_model(src)
+        .expect("undeclared name in [derived] should parse");
     assert!(
         !parsed.model.parse_warnings.iter().any(|w| w.contains("MYSTERY_NAME")),
         "undeclared name in [derived] is a silent Variable, no warning: {:?}",
@@ -3204,9 +3237,12 @@ fn test_pk_key_relevance_matrix() {
                 'R' => {
                     // Map every required key EXCEPT this one → error naming it.
                     let keys: Vec<&str> = required.iter().copied().filter(|k| *k != key).collect();
-                    let err = super::parse_full_model(&build(model, &keys))
-                        .err()
-                        .unwrap_or_else(|| panic!("{model}: omitting required `{key}` must error"));
+                    let err =
+                        ferx_model::parser::model_parser::parse_full_model(&build(model, &keys))
+                            .err()
+                            .unwrap_or_else(|| {
+                                panic!("{model}: omitting required `{key}` must error")
+                            });
                     assert!(
                         err.contains(&format!("`{key}`")),
                         "{model}: omitting `{key}` should name it, got: {err}"
@@ -3216,8 +3252,9 @@ fn test_pk_key_relevance_matrix() {
                     // Map every required key PLUS this one → warn iff unused.
                     let mut keys: Vec<&str> = required.clone();
                     keys.push(key);
-                    let parsed = super::parse_full_model(&build(model, &keys))
-                        .unwrap_or_else(|e| panic!("{model} + `{key}` should parse: {e}"));
+                    let parsed =
+                        ferx_model::parser::model_parser::parse_full_model(&build(model, &keys))
+                            .unwrap_or_else(|e| panic!("{model} + `{key}` should parse: {e}"));
                     let warned = parsed
                         .model
                         .parse_warnings
@@ -4589,7 +4626,7 @@ fn every_apply_fit_option_arm_is_advertised_or_deliberately_exempt() {
     // `\r`, so this is line-ending agnostic. Searching for a literal "\n}\n" is not —
     // on a CRLF checkout it never matches, the body silently becomes the rest of the
     // file, and the scraper picks up arms from unrelated functions.
-    let src = include_str!("model_parser.rs");
+    let src = include_str!("../../crates/ferx-model/src/parser/model_parser.rs");
     let mut body: Vec<&str> = Vec::new();
     let mut inside = false;
     for line in src.lines() {
@@ -11409,7 +11446,7 @@ fn test_mu_ref_warning_for_conditional_param() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     assert!(
         !parsed.model.parse_warnings.is_empty(),
         "expected a parse warning about mu-ref disabled; got: {:?}",
@@ -11484,7 +11521,7 @@ fn test_indiv_param_names_populated_in_declaration_order() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     assert_eq!(
         parsed.model.indiv_param_names,
         vec!["CL".to_string(), "V".to_string(), "KA".to_string()]
@@ -11515,7 +11552,7 @@ fn minimal_model_with_indiv(indiv_block: &str) -> crate::types::CompiledModel {
 ",
         indiv_block
     );
-    super::parse_full_model(&model_str).unwrap().model
+    ferx_model::parser::model_parser::parse_full_model(&model_str).unwrap().model
 }
 
 fn minimal_logit_model() -> crate::types::CompiledModel {
@@ -11534,7 +11571,7 @@ fn minimal_logit_model() -> crate::types::CompiledModel {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    super::parse_full_model(model_str).unwrap().model
+    ferx_model::parser::model_parser::parse_full_model(model_str).unwrap().model
 }
 
 #[test]
@@ -11584,7 +11621,7 @@ fn test_classify_iov_combined() {
 [fit_options]
   iov_column = OCC
 ";
-    let model = super::parse_full_model(src).unwrap().model;
+    let model = ferx_model::parser::model_parser::parse_full_model(src).unwrap().model;
     let cl_info = model
         .eta_param_info
         .iter()
@@ -11643,7 +11680,7 @@ fn test_classify_covariate_product() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let model = super::parse_full_model(src).unwrap().model;
+    let model = ferx_model::parser::model_parser::parse_full_model(src).unwrap().model;
     let cl_info = model
         .eta_param_info
         .iter()
@@ -11690,7 +11727,7 @@ fn test_classify_logit_probability_scale() {
     // inv_logit(logit(THETA_F) + ETA_F) — THETA_F on probability scale (0,1)
     use crate::types::{EtaParamType, ThetaTransform};
     let model_str = crate::test_models::ONE_CPT_IV_20;
-    let model = super::parse_full_model(model_str).unwrap().model;
+    let model = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap().model;
     let f_info = model.eta_param_info.iter().find(|i| i.eta_name == "ETA_F").unwrap();
     assert_eq!(f_info.param_type, EtaParamType::LogitProbability);
     assert_eq!(f_info.linked_theta, Some("THETA_F".to_string()));
@@ -11701,7 +11738,7 @@ fn test_classify_logit_probability_scale() {
 fn test_inv_logit_logit_theta_evaluates() {
     // inv_logit(logit(0.70) + 0) should equal 0.70
     let model_str = crate::test_models::ONE_CPT_IV_20;
-    let model = super::parse_full_model(model_str).unwrap().model;
+    let model = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap().model;
     let tv = model.tv_fn.as_ref().unwrap()(&[0.70], &Default::default());
     assert!((tv[0] - 0.70).abs() < 1e-10, "inv_logit(logit(0.70)) should be 0.70, got {}", tv[0]);
 }
@@ -12401,7 +12438,7 @@ fn test_iiv_on_ruv_resolves_eta_index() {
 /// End to end, a mixed-case `IIV_On_Ruv` and a spaced `log ( DV )` still parse.
 #[test]
 fn statement_prefilters_accept_every_line_their_regex_matches() {
-    use super::{leads_with_keyword_ci, leads_with_literal};
+    use ferx_model::parser::model_parser::{leads_with_keyword_ci, leads_with_literal};
     let ci = [
         (r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$", "iiv_on_ruv"),
         (r"(?i)^\s*correlation\b", "correlation"),
@@ -12731,7 +12768,7 @@ fn test_lagtime_in_structural_model_block() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let pk_indices = &parsed.model.pk_indices;
     // LAGTIME should map to slot 8.
     assert!(
@@ -12774,7 +12811,7 @@ fn test_alag_alias_in_structural_model_block() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     assert!(parsed.model.pk_indices.contains(&crate::types::PK_IDX_LAGTIME));
 
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
@@ -12813,7 +12850,8 @@ fn alias_model_src(indiv_extra: &str, pk_line: &str) -> String {
 
 /// Evaluate a parsed model's `pk_param_fn` at its default theta and `eta = 0`.
 fn alias_model_pk(src: &str) -> crate::types::PkParams {
-    let parsed = super::parse_full_model(src).unwrap_or_else(|e| panic!("expected Ok, got: {e}"));
+    let parsed = ferx_model::parser::model_parser::parse_full_model(src)
+        .unwrap_or_else(|e| panic!("expected Ok, got: {e}"));
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0)
@@ -13023,7 +13061,7 @@ fn test_literal_pk_param_binds_constant() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
@@ -13055,7 +13093,8 @@ fn test_valid_structural_param_still_parses() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).expect("model with CL defined should parse");
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str)
+        .expect("model with CL defined should parse");
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
@@ -13194,7 +13233,7 @@ fn test_lagtime_in_ode_model_routes_to_canonical_slot() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     // A bare LAGTIME is a canonical name, so `ode_param_slots` routes it to
     // PK_IDX_LAGTIME and `pk_indices` carries the slot on the ODE layout too.
     assert!(
@@ -13244,7 +13283,7 @@ fn test_bioavailability_in_ode_model_routes_to_canonical_slot() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
@@ -13289,7 +13328,7 @@ fn test_ode_structural_param_does_not_alias_bioavailability_slot() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let theta: Vec<f64> = parsed.model.default_params.theta.clone();
     let eta: Vec<f64> = vec![0.0; parsed.model.n_eta];
     let pk = (parsed.model.pk_param_fn)(&theta, &eta, &std::collections::HashMap::new(), 0.0);
@@ -13413,7 +13452,7 @@ fn test_ode_pk_indices_are_name_slotted_not_positional() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let m = &parsed.model;
     assert_eq!(m.indiv_param_names, vec!["V", "KA", "KE", "LAGTIME"]);
     assert_eq!(
@@ -15485,7 +15524,9 @@ fn test_clamp_rejects_inverted_literal_bounds() {
 #[test]
 fn test_join_continuation_lines() {
     let join = |lines: &[&str]| -> Vec<String> {
-        super::join_continuation_lines(&lines.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        ferx_model::parser::model_parser::join_continuation_lines(
+            &lines.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        )
     };
     // Leading operator continues the previous line...
     assert_eq!(
@@ -18203,7 +18244,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let m = &parsed.model;
     let partials = &m.indiv_param_partials;
     assert_eq!(partials.names, vec!["CL", "V", "KA"]);
@@ -18269,7 +18310,7 @@ fn indiv_partials_zero_for_cross_axis() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let partials = &parsed.model.indiv_param_partials;
     // After simplify, ∂CL/∂η_V is exactly Literal(0). Even if a future
     // simplifier rule leaves it as a tree, eval must produce 0.0.
@@ -18316,7 +18357,7 @@ fn indiv_partials_logit_inv_logit_chain() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let m = &parsed.model;
     let partials = &m.indiv_param_partials;
     assert_eq!(partials.names, vec!["CL", "V", "KA", "F"]);
@@ -18379,7 +18420,7 @@ fn indiv_partials_chain_rule_through_intermediate() {
 [error_model]
   DV ~ proportional(EPS)
 ";
-    let parsed = super::parse_full_model(model_str).unwrap();
+    let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let m = &parsed.model;
     let partials = &m.indiv_param_partials;
     // ka_mult IS a top-level Assign so it has a row; ordering must match
@@ -21422,7 +21463,7 @@ fn test_weight_modifier_rejects_eta_dependence() {
 fn test_split_weight_modifier_ignores_a_weight_inside_the_sigma_parens() {
     // A covariate literally named `WEIGHT` inside a magnitude expression is at
     // paren depth 1 and must not be mistaken for the modifier.
-    let (stmt, w) = super::split_weight_modifier(
+    let (stmt, w) = ferx_model::parser::model_parser::split_weight_modifier(
         "DV ~ additive(ADD * WEIGHT)",
         "error_model",
         "a `DV ~ TYPE(...)` statement",
@@ -21434,7 +21475,7 @@ fn test_split_weight_modifier_ignores_a_weight_inside_the_sigma_parens() {
 
 #[test]
 fn test_split_weight_modifier_ignores_a_comparison() {
-    let (stmt, w) = super::split_weight_modifier(
+    let (stmt, w) = ferx_model::parser::model_parser::split_weight_modifier(
         "DV ~ additive(ADD) weight == 2",
         "error_model",
         "a `DV ~ TYPE(...)` statement",
@@ -21446,7 +21487,7 @@ fn test_split_weight_modifier_ignores_a_comparison() {
 
 #[test]
 fn test_split_weight_modifier_ignores_a_longer_identifier() {
-    let (stmt, w) = super::split_weight_modifier(
+    let (stmt, w) = ferx_model::parser::model_parser::split_weight_modifier(
         "DV ~ additive(ADD) weighted = 2",
         "error_model",
         "a `DV ~ TYPE(...)` statement",
@@ -21458,7 +21499,7 @@ fn test_split_weight_modifier_ignores_a_longer_identifier() {
 
 #[test]
 fn test_split_weight_modifier_requires_a_statement_before_it() {
-    let err = super::split_weight_modifier(
+    let err = ferx_model::parser::model_parser::split_weight_modifier(
         "weight = WPSE",
         "error_model",
         "a `DV ~ TYPE(...)` statement",
@@ -22159,7 +22200,7 @@ fn test_weighted_kappa_left_of_the_bsv_eta_keeps_the_bsv_mu_reference() {
 
 #[test]
 fn test_split_weight_modifier_peels_a_kappa_declaration() {
-    let (stmt, w) = super::split_weight_modifier(
+    let (stmt, w) = ferx_model::parser::model_parser::split_weight_modifier(
         "kappa KAPPA_EMAX ~ 2.0 (sd) weight = NARM",
         "parameters",
         "a `kappa NAME ~ VALUE` declaration",
@@ -27739,7 +27780,7 @@ fn kappa_scale_walk_agrees_with_eta_patterns() {
             for s in &stmts {
                 if let Statement::Assign(n, e) = s {
                     if *n == info.individual_param_name {
-                        super::classify_kappa_scale(e, slot, &mut got);
+                        ferx_model::parser::model_parser::classify_kappa_scale(e, slot, &mut got);
                     }
                 }
             }
@@ -28386,10 +28427,10 @@ fn walk_counted(src: &str) -> (Vec<crate::types::EtaParamType>, crate::types::Et
     let stmts = walk_stmts(src);
     let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
     let consumers: HashSet<String> = ["CL".to_string()].into();
-    super::ROOT_SCALE_CALLS.with(|c| c.set(0));
+    ferx_model::parser::model_parser::ROOT_SCALE_CALLS.with(|c| c.set(0));
     let (infos, _) = classify_indiv_params(&stmts, &tn, &["ETA_CL".to_string()], &consumers);
     let kappa = classify_kappa_params(&stmts, 1, &["K".to_string()], &consumers);
-    let calls = super::ROOT_SCALE_CALLS.with(|c| c.get());
+    let calls = ferx_model::parser::model_parser::ROOT_SCALE_CALLS.with(|c| c.get());
     (infos.iter().map(|i| i.param_type).collect(), kappa[0], calls)
 }
 
@@ -28684,10 +28725,10 @@ fn inline_counted(src: &str) -> (HashMap<String, MuRef>, Vec<CovariateMuRef>, us
     let tn: Vec<String> = ["TVCL", "TVV"].iter().map(|s| s.to_string()).collect();
     let en: Vec<String> = vec!["ETA_CL".to_string()];
     let stmts = stmts_of(src, &tn, &en);
-    super::INLINED_NODES.with(|c| c.set(0));
+    ferx_model::parser::model_parser::INLINED_NODES.with(|c| c.set(0));
     let mu = detect_mu_refs(&stmts, &tn, &en, &[]);
     let groups = detect_covariate_mu_refs(&stmts, &tn, &en, 1, &HashSet::new());
-    (mu, groups, super::INLINED_NODES.with(|c| c.get()))
+    (mu, groups, ferx_model::parser::model_parser::INLINED_NODES.with(|c| c.get()))
 }
 
 /// #1684: the mu-reference scans read local definitions through an
@@ -28949,7 +28990,9 @@ fn if_block_model(body: &str) -> crate::types::CompiledModel {
          [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
          [error_model]\n  DV ~ proportional(EPS)\n"
     );
-    super::parse_full_model(&src).unwrap_or_else(|e| panic!("parses:\n{body}\n{e:?}")).model
+    ferx_model::parser::model_parser::parse_full_model(&src)
+        .unwrap_or_else(|e| panic!("parses:\n{body}\n{e:?}"))
+        .model
 }
 
 /// Run `m`'s derivative program along `axis` with covariate `WT = wt`: the
@@ -29286,9 +29329,9 @@ fn coupling_counted(src: &str) -> (EtaCoupling, usize) {
         Box::new(block),
     )];
     let states = StateInputs::new(&[], true, None, PkModel::OneCptIv, &HashMap::new(), &[]);
-    super::DEF_CONSTANT_CALLS.with(|c| c.set(0));
+    ferx_model::parser::model_parser::DEF_CONSTANT_CALLS.with(|c| c.set(0));
     let c = level_block_eta_coupling(&stmts, &readout, &[], "PLACEBO", 0, "ETA_E0", &states);
-    (c, super::DEF_CONSTANT_CALLS.with(|c| c.get()))
+    (c, ferx_model::parser::model_parser::DEF_CONSTANT_CALLS.with(|c| c.get()))
 }
 
 /// #1676: `def_constant` is memoised per assignment for one
@@ -29650,12 +29693,13 @@ fn the_inliner_matches_the_eager_one() {
     paths.sort();
     let (mut models, mut seen, mut changed) = (0, 0, 0);
     for p in &paths {
-        super::MU_REF_SCAN_INPUT.with(|c| *c.borrow_mut() = None);
+        ferx_model::parser::model_parser::MU_REF_SCAN_INPUT.with(|c| *c.borrow_mut() = None);
         let text = std::fs::read_to_string(p).unwrap();
         if parse_full_model(&text).is_err() {
             continue; // a feature this build lacks
         }
-        let Some((stmts, tn, en, n_bsv)) = super::MU_REF_SCAN_INPUT.with(|c| c.borrow_mut().take())
+        let Some((stmts, tn, en, n_bsv)) =
+            ferx_model::parser::model_parser::MU_REF_SCAN_INPUT.with(|c| c.borrow_mut().take())
         else {
             continue;
         };
@@ -34992,7 +35036,7 @@ fn keyword_gate_is_the_case_insensitive_prefix_regex() {
                 for tail in ["", " x", "(1)", "_tail"] {
                     let line = format!("{lead}{sp}{tail}");
                     assert_eq!(
-                        super::leads_with_keyword_ci(&line, kw),
+                        ferx_model::parser::model_parser::leads_with_keyword_ci(&line, kw),
                         re.is_match(&line),
                         "gate and regex disagree on {line:?} for {kw}"
                     );
@@ -35002,9 +35046,9 @@ fn keyword_gate_is_the_case_insensitive_prefix_regex() {
         }
     }
     // The cases that make the gate non-trivial are in the corpus, on both sides.
-    assert!(super::leads_with_keyword_ci("\u{a0}\u{212A}APPA", "kappa"));
-    assert!(super::leads_with_keyword_ci("\u{17F}igma ~ 1", "sigma"));
-    assert!(!super::leads_with_keyword_ci("\u{200b}theta", "theta"));
+    assert!(ferx_model::parser::model_parser::leads_with_keyword_ci("\u{a0}\u{212A}APPA", "kappa"));
+    assert!(ferx_model::parser::model_parser::leads_with_keyword_ci("\u{17F}igma ~ 1", "sigma"));
+    assert!(!ferx_model::parser::model_parser::leads_with_keyword_ci("\u{200b}theta", "theta"));
     assert!(checked > 1000);
 }
 

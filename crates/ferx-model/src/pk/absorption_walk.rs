@@ -46,7 +46,7 @@ use crate::sens::num::PkNum;
 use crate::sens::propagate::{propagate_two_cpt_core_g, PkDual, TwoCptEigen};
 use crate::types::{CompiledModel, PkModel, PkParams, Subject};
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Runs of [`closed_form_sens_walk_g`]'s transit/IG branch. The twin's ODE provider and
     /// the walk both return `Some`, so a route test reads this to know which one served.
@@ -68,13 +68,13 @@ pub struct AbsDose<T: PkNum> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kernel {
+pub enum Kernel {
     Transit,
     Ig,
 }
 
 /// `(kernel, two_cpt)` for a closed-form absorption model, `None` for any other.
-fn kernel_of(pk_model: PkModel) -> Option<(Kernel, bool)> {
+pub fn kernel_of(pk_model: PkModel) -> Option<(Kernel, bool)> {
     match pk_model {
         PkModel::OneCptTransit => Some((Kernel::Transit, false)),
         PkModel::TwoCptTransit => Some((Kernel::Transit, true)),
@@ -107,19 +107,19 @@ pub enum WalkDomain {
 /// A `NaN` in an interval's disposition (`CL`, `V`, and `V2` on a 2-cpt model). The walk
 /// serves `NaN` from that interval on (#2134). A `NaN` `Q` is left to [`fastest_rate`],
 /// whose `NaN` macro-rates send the subject to the twin, which serves the same `NaN`.
-fn disposition_is_nan<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> bool {
+pub fn disposition_is_nan<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> bool {
     p.cl.br_is_nan() || p.v.br_is_nan() || (two_cpt && p.v2.br_is_nan())
 }
 
 /// A `NaN` in a dose's kernel parameters (`n`/`MTT`, `MAT`/`CV²`): the walk serves `NaN`
 /// from the first interval that evaluates the dose (#2134).
-fn kernel_is_nan<T: PkNum>(d: &AbsDose<T>) -> bool {
+pub fn kernel_is_nan<T: PkNum>(d: &AbsDose<T>) -> bool {
     d.a.br_is_nan() || d.b.br_is_nan()
 }
 
 /// The MGF abscissa of one dose's kernel: `KTR = (n+1)/MTT` (transit) or
 /// `1/(2·MAT·CV²)` (IG). `None` for non-physical kernel parameters.
-fn abscissa<T: PkNum>(kernel: Kernel, a: T, b: T) -> Option<T> {
+pub fn abscissa<T: PkNum>(kernel: Kernel, a: T, b: T) -> Option<T> {
     use crate::sens::num::BranchCmp::{Ge, Gt};
     let one = T::from_f64(1.0);
     match kernel {
@@ -132,7 +132,7 @@ fn abscissa<T: PkNum>(kernel: Kernel, a: T, b: T) -> Option<T> {
 
 /// The largest disposition rate the tilting factorisation evaluates on an interval —
 /// `ke` (1-cpt) or `α` (2-cpt) — or the reason there is none.
-fn fastest_rate<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> Result<T, WalkDomain> {
+pub fn fastest_rate<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> Result<T, WalkDomain> {
     use crate::sens::num::BranchCmp::{Eq, Gt, Lt};
     if !(p.cl.br_cmp_c(Gt, 0.0) && p.v.br_cmp_c(Gt, 0.0)) {
         return Err(WalkDomain::Invalid);
@@ -156,7 +156,7 @@ fn fastest_rate<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> Result<T, WalkDomain>
 
 /// The parameters governing each event's interval: the record terminating it (#1073).
 /// `None` only for a timeline with no record at all.
-fn governing<'a, T: PkNum>(
+pub fn governing<'a, T: PkNum>(
     schedule: &EventSchedule, pk_at_dose: &'a [PkDual<T>], pk_at_obs: &'a [PkDual<T>],
     pk_at_pk_only: &'a [PkDual<T>],
 ) -> Vec<Option<&'a PkDual<T>>> {
@@ -183,7 +183,7 @@ fn governing<'a, T: PkNum>(
 /// co-timed with the previous event) never acts, so it is not an onset, as on the
 /// event-driven and ODE engines. The one owner of the rule: [`walk_domain`] stops there,
 /// and [`absorption_walk_g`] serves `NaN` from there on, whatever the verdict before it.
-fn nan_onset<T: PkNum>(
+pub fn nan_onset<T: PkNum>(
     schedule: &EventSchedule, doses: &[AbsDose<T>], gov: &[Option<&PkDual<T>>], two_cpt: bool,
 ) -> Option<(usize, f64)> {
     let mut cur_t = schedule.events.first()?.time;
@@ -271,7 +271,7 @@ pub fn walk_domain<T: PkNum>(
 
 /// Add one dose's delivery over `[s0, s1]` to the state, at the interval's disposition.
 /// `t0`, `t1` are the window limits in the dose's own clock (`s − arrival`).
-fn add_window<T: PkNum, A: TiltedAbsorption<T>>(
+pub fn add_window<T: PkNum, A: TiltedAbsorption<T>>(
     abs: &A, mass: T, t0: T, t1: T, disp: &Disp<T>, state: &mut [T],
 ) {
     match *disp {
@@ -292,14 +292,14 @@ fn add_window<T: PkNum, A: TiltedAbsorption<T>>(
 
 /// The interval's disposition in the form the step reads.
 #[derive(Clone, Copy)]
-enum Disp<T: PkNum> {
+pub enum Disp<T: PkNum> {
     One { ke: T },
     Two(TwoCptEigen<T>),
 }
 
 /// Amount of `d` still in the absorption kernel at `t`: `F·D·(1 − CDF(t − a_d))`, the
 /// untilted CDF being `G(·; 0)`. The analytical `depot` state (`one_cpt_transit_depot`).
-fn undelivered<T: PkNum>(kernel: Kernel, d: &AbsDose<T>, t: f64) -> T {
+pub fn undelivered<T: PkNum>(kernel: Kernel, d: &AbsDose<T>, t: f64) -> T {
     let tau = T::from_f64(t) - d.arrival;
     let zero = T::from_f64(0.0);
     let cdf = match kernel {
@@ -481,7 +481,7 @@ pub fn closed_form_sens_walk_g<T: PkNum>(
             pk_at_pk_only,
         ));
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     ABSORPTION_SENS_WALK_RUNS.with(|c| c.set(c.get() + 1));
     let (slot_a, slot_b) = match kernel {
         Kernel::Transit => (PK_IDX_N, PK_IDX_MTT),
@@ -571,7 +571,7 @@ pub fn walk_schedule(
 }
 
 /// The walk's `f64` inputs, built once from per-event `PkParams`.
-struct F64Inputs {
+pub struct F64Inputs {
     schedule: EventSchedule,
     doses: Vec<AbsDose<f64>>,
     dose_disp: Vec<PkDual<f64>>,
@@ -579,7 +579,7 @@ struct F64Inputs {
     only_disp: Vec<PkDual<f64>>,
 }
 
-fn f64_inputs(
+pub fn f64_inputs(
     pk_model: PkModel, subject: &Subject, pk_at_dose: &[PkParams], pk_at_obs: &[PkParams],
     pk_at_pk_only: &[PkParams],
 ) -> F64Inputs {
@@ -626,7 +626,3 @@ pub fn absorption_walk_predictions(
         states,
     )
 }
-
-#[cfg(test)]
-#[path = "absorption_walk_tests.rs"]
-mod tests;

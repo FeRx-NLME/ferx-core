@@ -45,11 +45,11 @@ use crate::types::{CompiledModel, EndpointLikelihood, ObsRecord, Subject};
 /// Round-off allowance on the probability bounds: a declared probability may sit this far
 /// outside `[0, 1]`, and a row's off-diagonals may sum this far past 1, before the matrix is
 /// treated as invalid. Matches the CTMM's off-diagonal tolerance.
-const PROB_TOL: f64 = 1e-12;
+pub const PROB_TOL: f64 = 1e-12;
 
 /// One scored record of a DTMM chain.
 #[derive(Clone, Copy)]
-struct ChainRecord {
+pub struct ChainRecord {
     /// Index into `Subject::obs_records` — and into an aligned covariate snapshot.
     idx: usize,
     /// The TIME the input carried (not the reader's occasion-shifted internal clock): what a probability's `TIME` reads, and what messages name.
@@ -60,7 +60,7 @@ struct ChainRecord {
 
 /// Every `DiscreteState` row on `cmt`, in record order. `Err(code)` on a DV code outside
 /// `state_codes` (refused before the fit by [`validate_dtmm_records`]).
-fn collect_states(
+pub fn collect_states(
     cmt: usize, state_codes: &[usize], records: &[ObsRecord],
 ) -> Result<Vec<ChainRecord>, usize> {
     let mut out = Vec::new();
@@ -81,7 +81,7 @@ fn collect_states(
 /// Whether the declared probabilities `probs` (parallel to `transitions`) define a
 /// stochastic `n_states × n_states` matrix: every one finite and in `[0, 1]`, and every
 /// row's off-diagonals summing to at most 1 (so every stay probability is in `[0, 1]`).
-fn is_stochastic<T: crate::sens::num::PkNum>(
+pub fn is_stochastic<T: crate::sens::num::PkNum>(
     transitions: &[(usize, usize)], probs: &[T], n_states: usize,
 ) -> bool {
     use crate::sens::num::BranchCmp::{Ge, Le};
@@ -102,7 +102,7 @@ fn is_stochastic<T: crate::sens::num::PkNum>(
 /// The probability of the observed step `from → to` in a matrix already checked by
 /// [`is_stochastic`]: the declared off-diagonal, or the filled-in stay probability. `None`
 /// when it is `≤ 0` — an observed step the parameters make impossible.
-fn step_probability<T: crate::sens::num::PkNum>(
+pub fn step_probability<T: crate::sens::num::PkNum>(
     transitions: &[(usize, usize)], probs: &[T], from: usize, to: usize,
 ) -> Option<T> {
     use crate::sens::num::BranchCmp::{Gt, Lt};
@@ -124,7 +124,7 @@ fn step_probability<T: crate::sens::num::PkNum>(
 /// Negative DTMM log-likelihood for one subject on one `Dtmm` endpoint. Raw (positive);
 /// the caller applies the OFV-scale factor.
 #[allow(clippy::too_many_arguments)]
-fn dtmm_endpoint_nll(
+pub fn dtmm_endpoint_nll(
     subject: &Subject, cmt: usize, n_states: usize, state_codes: &[usize],
     transitions: &[(usize, usize)], prob_fn: &crate::types::TransitionProbFn, theta: &[f64],
     eta: &[f64],
@@ -157,7 +157,7 @@ fn dtmm_endpoint_nll(
 
 /// The `Dtmm` endpoints of `model`, in ascending CMT order (the order `model.endpoints`,
 /// a `BTreeMap`, iterates in — #2531), so a multi-endpoint sum is reproducible.
-fn dtmm_endpoints(model: &CompiledModel) -> impl Iterator<Item = (usize, &EndpointLikelihood)> {
+pub fn dtmm_endpoints(model: &CompiledModel) -> impl Iterator<Item = (usize, &EndpointLikelihood)> {
     model
         .dtmm_cmts()
         .into_iter()
@@ -263,7 +263,7 @@ impl crate::survival::SubjectTerm for DtmmTerm<'_> {
 
 /// Exact `∂/∂η` of [`dtmm_subject_nll`] — [`DtmmTerm`] at fixed θ on a first-order η-jet —
 /// at the same 1× scale as the value. `None` as for [`DtmmTerm`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn dtmm_subject_eta_grad(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
@@ -312,7 +312,3 @@ pub fn validate_dtmm_records(
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "dtmm_tests.rs"]
-mod tests;

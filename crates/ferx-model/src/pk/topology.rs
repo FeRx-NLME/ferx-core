@@ -220,7 +220,7 @@ static THREE_CPT_ORAL: PkTopology = PkTopology {
 };
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     const ALL: [PkModel; 10] = [

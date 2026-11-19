@@ -8,7 +8,7 @@ use super::uncoded_sites::{production_files, production_lines};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-const REGISTRY: &str = "src/diagnostics.rs";
+const REGISTRY: &str = "crates/ferx-model/src/diagnostics.rs";
 const DOCS: &str = "docs/file-formats/check-report.qmd";
 
 /// Whether `word` is a code: `E_` or `W_`, an uppercase letter, then `[A-Z0-9_]`, not
@@ -148,7 +148,7 @@ fn registry_problems(
 /// → red; list a code twice, or under the wrong severity in the docs → red.
 #[test]
 fn every_emitted_code_has_a_row_in_both_registries() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."));
     let emitted = emitted(root);
     let info = info_emitted(root);
     assert!(info.contains("W_LEVEL_SUMMARY"), "the info scan missed W_LEVEL_SUMMARY: {info:?}");

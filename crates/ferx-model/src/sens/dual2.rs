@@ -230,7 +230,7 @@ pub fn scalar_div<const N: usize>(s: f64, d: Dual2<N>) -> Dual2<N> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// `sqrt` at a zero (or rounded-negative) argument with a seeded gradient must

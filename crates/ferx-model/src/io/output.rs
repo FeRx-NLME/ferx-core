@@ -3463,7 +3463,7 @@ pub fn parameter_table(result: &FitResult) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use nalgebra::DMatrix;
 
@@ -8949,7 +8949,7 @@ mod mixture_override_tests;
 /// under it. For tests pinning the top-level estimate sections by counting a key across
 /// the whole file — the block repeats those sections, and `output_estimates_tests` pins
 /// it field for field against them.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn top_level_yaml(yaml: &str) -> String {
     let mut out = String::new();
     let mut skipping = false;

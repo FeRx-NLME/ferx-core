@@ -76,13 +76,9 @@ use nalgebra::DMatrix;
 #[cfg(feature = "nn")]
 use std::collections::HashMap;
 
-#[cfg(all(test, feature = "nn"))]
-#[path = "nn_theta_gradient_tests.rs"]
-mod tests;
-
 /// One `[covariate_nn]` block's contribution, resolved at this subject's
 /// covariates.
-struct NnBlock {
+pub struct NnBlock {
     /// First θ index of this block's contiguous weight run.
     weights_offset: usize,
     /// Length of that run.

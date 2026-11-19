@@ -178,4 +178,4 @@ fn status_reasons(r: &FitResult) -> Vec<StatusReason> {
 
 #[cfg(test)]
 #[path = "types_fit_status_tests.rs"]
-mod tests;
+pub mod tests;

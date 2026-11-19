@@ -48,7 +48,7 @@ use std::collections::HashMap;
 /// — a data/model mismatch [`validate_ctmm_states`] rejects before the fit, so
 /// the caller treats it as the [`SUBJECT_SENTINEL_NLL`] backstop rather than a
 /// per-iteration failure.
-fn collect_state_obs(
+pub fn collect_state_obs(
     cmt: usize, state_codes: &[usize], records: &[ObsRecord],
 ) -> Result<Vec<StateObs>, usize> {
     let mut obs = Vec::new();
@@ -79,7 +79,7 @@ fn collect_state_obs(
 /// separate gradient plumbing (the FD path differentiates through
 /// `generator_fn`).
 #[allow(clippy::too_many_arguments)]
-fn ctmm_endpoint_nll(
+pub fn ctmm_endpoint_nll(
     cmt: usize, n_states: usize, state_codes: &[usize], generator_fn: &GeneratorFn,
     records: &[ObsRecord], covariates: &HashMap<String, f64>, theta: &[f64], eta: &[f64],
 ) -> f64 {
@@ -203,7 +203,7 @@ impl CtmmTerm<'_> {
 /// `None` for a point the value path scores as its repel sentinel: a recording there fails as a
 /// repelled point ([`RecHooks::note_declined`](crate::sens::num::RecHooks::note_declined)), not as
 /// a subject whose plan cannot be made.
-fn repelled<T: crate::sens::num::RecHooks, R>() -> Option<R> {
+pub fn repelled<T: crate::sens::num::RecHooks, R>() -> Option<R> {
     T::note_declined();
     None
 }
@@ -211,7 +211,7 @@ fn repelled<T: crate::sens::num::RecHooks, R>() -> Option<R> {
 /// Exact `(value, ∂²/∂η²)` of [`ctmm_subject_nll`] from the subject's [`CtmmTerm`] plan
 /// (#2786) — a drug-driven generator through its occupancy ODE in the same recording. `None`
 /// on exactly the subjects [`ctmm_subject_eta_grad`] declines.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn ctmm_subject_eta_hessian(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, nalgebra::DMatrix<f64>)> {
@@ -279,7 +279,7 @@ pub fn ctmm_subject_nll(
 /// and it is refined for free by the adaptive occupancy stepper on top. The
 /// degenerate `SLOPE = 0` case (state-independent `Q`) is exact regardless.
 #[cfg(feature = "markov")]
-const INHOMOGENEOUS_SUBNODES_PER_GAP: usize = 16;
+pub const INHOMOGENEOUS_SUBNODES_PER_GAP: usize = 16;
 
 /// Negative CTMM log-likelihood for one subject on a **time-inhomogeneous** (drug/
 /// PD-driven `Q(t)`) endpoint (Phase 6, #817).
@@ -296,7 +296,7 @@ const INHOMOGENEOUS_SUBNODES_PER_GAP: usize = 16;
 /// plumbing.
 #[cfg(feature = "markov")]
 #[allow(clippy::too_many_arguments)]
-fn ctmm_endpoint_nll_inhomogeneous(
+pub fn ctmm_endpoint_nll_inhomogeneous(
     model: &CompiledModel, subject: &Subject, cmt: usize, n_states: usize, state_codes: &[usize],
     generator_fn: &GeneratorFn, prog: Option<&crate::parser::model_parser::CtmmGeneratorProgram>,
     theta: &[f64], eta: &[f64],
@@ -443,7 +443,7 @@ fn ctmm_endpoint_nll_inhomogeneous(
 /// The value path's sub-grid over the observation gaps — `n_sub + 1` uniform nodes per gap
 /// (`INHOMOGENEOUS_SUBNODES_PER_GAP`), adjacent gaps sharing their boundary time — or `None`
 /// for out-of-order records (the value path repels them).
-fn gap_grid(obs: &[StateObs]) -> Option<Vec<f64>> {
+pub fn gap_grid(obs: &[StateObs]) -> Option<Vec<f64>> {
     let n_sub = INHOMOGENEOUS_SUBNODES_PER_GAP;
     let mut grid: Vec<f64> = Vec::with_capacity(obs.len().saturating_sub(1) * (n_sub + 1));
     for w in obs.windows(2) {
@@ -461,7 +461,7 @@ fn gap_grid(obs: &[StateObs]) -> Option<Vec<f64>> {
 /// The sub-nodes bracketing elapsed time `tau` in a gap of length `dt` (`gap_grid`'s
 /// `n_sub + 1` uniform nodes) and the weight of the upper one: the state there is
 /// `x_lo + (x_hi − x_lo)·w`. `(0, 0, 0)` — the gap's start — for `dt ≤ 0`.
-fn sub_bracket(tau: f64, dt: f64) -> (usize, usize, f64) {
+pub fn sub_bracket(tau: f64, dt: f64) -> (usize, usize, f64) {
     if dt <= 0.0 {
         return (0, 0, 0.0);
     }
@@ -472,7 +472,7 @@ fn sub_bracket(tau: f64, dt: f64) -> (usize, usize, f64) {
 }
 
 /// A one-direction jet over `T`: the value and one tangent.
-type Jet<T> = crate::sens::jet::DualT<1, T>;
+pub type Jet<T> = crate::sens::jet::DualT<1, T>;
 
 /// `Q` (row-major) at elapsed time `τ` in a gap of length `dt`, as the values, and `∂Q/∂τ`, as
 /// the tangents: the generator program at the interpolated state `x + (y − x)·w` between the
@@ -480,7 +480,7 @@ type Jet<T> = crate::sens::jet::DualT<1, T>;
 /// `(y − x)·n_sub/dt` — θ, η and the `[individual_parameters]` slots `vars`
 /// (`CtmmGeneratorProgram::vars_g`) constant. The right derivative at a sub-node, the bracket the value path takes.
 #[allow(clippy::too_many_arguments)]
-fn generator_tau_jet<T: crate::sens::num::vm::VmNum>(
+pub fn generator_tau_jet<T: crate::sens::num::vm::VmNum>(
     prog: &crate::parser::model_parser::CtmmGeneratorProgram, theta: &[T], eta: &[T],
     cov_vec: &[f64], vars: &[T], x: &[T], y: &[T], w: f64, dt: f64,
 ) -> Vec<Jet<T>> {
@@ -526,7 +526,7 @@ pub fn ctmm_state_grid(model: &CompiledModel, subject: &Subject) -> Vec<f64> {
 /// degeneracy guards (the sentinel there), outside the dual state solve's scope, or on a
 /// non-positive probability.
 #[allow(clippy::too_many_arguments)]
-fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
+pub fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
     model: &CompiledModel, subject: &Subject,
     prog: &crate::parser::model_parser::CtmmGeneratorProgram, s: usize, obs: &[StateObs],
     theta: &[T], eta: &[T],
@@ -738,12 +738,8 @@ pub fn validate_ctmm_times(cmt: usize, records: &[ObsRecord]) -> Result<(), Stri
     Ok(())
 }
 
-#[cfg(all(test, feature = "survival"))]
-#[path = "endpoint_order_tests.rs"]
-mod endpoint_order_tests;
-
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::types::GeneratorFn;
     use nalgebra::DMatrix;
@@ -2015,83 +2011,5 @@ mod tests {
         );
         let v = ctmm_subject_nll(&model, &subject, &ok, &[]);
         assert!(v.is_finite() && v > 0.0 && v < 1e6, "valid cuts: NLL {v}");
-    }
-}
-
-#[cfg(test)]
-mod exact_eta_hessian_tests {
-    use super::*;
-
-    /// The homogeneous CTMM η-Hessian (second derivative of `expm` on a dual) against the
-    /// stencil it replaces, to the stencil's accuracy; and the inhomogeneous (drug-driven)
-    /// endpoint, which has no generator program, declines to it.
-    #[test]
-    fn the_ctmm_eta_hessian_is_exact_on_a_homogeneous_generator() {
-        let prep = crate::categorical::exact_eta_hessian_tests::load(
-            r"
-[parameters]
-  theta LQ01(-0.7, -6.0, 3.0)
-  theta LQ10(-1.2, -6.0, 3.0)
-  omega ETA_A ~ 0.2
-  omega ETA_B ~ 0.3
-[markov_model]
-  type   = ctmm
-  cmt    = 5
-  states = [awake=0, asleep=1]
-  transition awake  -> asleep = exp(LQ01 + ETA_A)
-  transition asleep -> awake  = exp(LQ10 + 0.5 * ETA_A + ETA_B)
-",
-            "data/ctmm_2state.csv",
-        );
-        let model = &prep.parsed.model;
-        let theta = &model.default_params.theta;
-        let eta = [0.09, -0.12];
-        let mut worst = 0.0f64;
-        let mut n = 0;
-        for s in prep.population.subjects.iter().take(6) {
-            if s.obs_records.is_empty() {
-                continue;
-            }
-            let (_, h) = ctmm_subject_eta_hessian(model, s, theta, &eta).expect("in scope");
-            // Each column by a Richardson difference of the exact gradient (`O(h⁴)`).
-            let grad = |e: &[f64]| ctmm_subject_eta_grad(model, s, theta, e).unwrap().1;
-            let fd = nalgebra::DMatrix::from_fn(2, 2, |l, k| {
-                let d = |step: f64| {
-                    let (mut a, mut b) = (eta.to_vec(), eta.to_vec());
-                    a[k] += step;
-                    b[k] -= step;
-                    (grad(&a)[l] - grad(&b)[l]) / (2.0 * step)
-                };
-                (4.0 * d(5e-4) - d(1e-3)) / 3.0
-            });
-            let scale = fd.iter().fold(1e-300f64, |a, &v| a.max(v.abs()));
-            for (a, b) in h.iter().zip(fd.iter()) {
-                assert!(a.is_finite());
-                worst = worst.max((a - b).abs() / scale);
-            }
-            n += 1;
-        }
-        assert!(n > 2, "too few subjects ({n})");
-        eprintln!("CTMM η-Hessian vs Richardson of the exact gradient: worst {worst:.2e}");
-        // Bound to be set from the measured value (see the eprintln). A dropped clamp or gap
-        // misses by O(1).
-        assert!(worst < 1e-6, "{worst:.2e}");
-
-        let root = env!("CARGO_MANIFEST_DIR");
-        let pd = crate::api::prepare_run(
-            &format!("{root}/examples/ctmm_pd_2state.ferx"),
-            Some(&format!("{root}/data/ctmm_pd_2state.csv")),
-        )
-        .unwrap();
-        let m = &pd.parsed.model;
-        if m.n_eta > 0 {
-            let s = pd.population.subjects.iter().find(|s| !s.obs_records.is_empty()).unwrap();
-            let e = vec![0.0; m.n_eta];
-            // The drug-driven example is served too (`a_drug_driven_ctmm_is_differentiated_exactly`
-            // pins the values).
-            let (_, h) = ctmm_subject_eta_hessian(m, s, &m.default_params.theta, &e)
-                .expect("a drug-driven generator is served exactly");
-            assert!(h.iter().all(|v| v.is_finite()));
-        }
     }
 }

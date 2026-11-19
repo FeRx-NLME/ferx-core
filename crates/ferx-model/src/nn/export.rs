@@ -119,11 +119,11 @@ pub fn export_dcm_as_analytic(
 }
 
 /// The header line on the other parameters, for each entry point.
-const OTHERS_AS_WRITTEN: &str =
+pub const OTHERS_AS_WRITTEN: &str =
     "# Every other theta / omega / sigma keeps the value this file declared.\n";
-const OTHERS_FITTED: &str = "# Every other theta / omega / sigma is the fit's estimate.\n";
+pub const OTHERS_FITTED: &str = "# Every other theta / omega / sigma is the fit's estimate.\n";
 
-fn export_networks(
+pub fn export_networks(
     model_text: &str, theta_names: &[String], theta: &[f64], opts: &DcmExportOptions, others: &str,
 ) -> Result<String, String> {
     if theta_names.len() != theta.len() {
@@ -211,7 +211,7 @@ fn export_networks(
 /// reads that instead of the column, which is a different model with nothing to
 /// show for it. `check_exportable` refuses the names that cannot work at all;
 /// this catches the ones only the whole model can.
-fn check_exported(
+pub fn check_exported(
     text: &str, nets: &[(NnBlockSpec, Vec<f64>)], names: &NameTable,
 ) -> Result<(), String> {
     let model = parse_for_validation(text)?;
@@ -283,7 +283,7 @@ fn check_exported(
 /// refusing it would make a joint DCM unexportable from the default-feature
 /// `ferx` binary. The rest of the model is still validated. The returned export
 /// keeps every block verbatim either way.
-fn validation_text(text: &str) -> String {
+pub fn validation_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut skip = false;
     for line in text.lines() {
@@ -299,7 +299,7 @@ fn validation_text(text: &str) -> String {
 }
 
 /// Parse the export for validation (see [`validation_text`]).
-fn parse_for_validation(text: &str) -> Result<crate::types::CompiledModel, String> {
+pub fn parse_for_validation(text: &str) -> Result<crate::types::CompiledModel, String> {
     parse_model_string(&validation_text(text))
         .map_err(|e| format!("the exported model does not parse, so it is not returned: {e}"))
 }
@@ -356,7 +356,7 @@ pub fn export_dcm_from_fit(
 }
 
 /// Every `[covariate_nn]` block of `text`, read by the parser's field reader.
-fn network_specs(text: &str) -> Result<Vec<NnBlockSpec>, String> {
+pub fn network_specs(text: &str) -> Result<Vec<NnBlockSpec>, String> {
     let lines: Vec<&str> = text.lines().collect();
     BlockLayout::scan(&lines)
         .nn_blocks
@@ -366,7 +366,7 @@ fn network_specs(text: &str) -> Result<Vec<NnBlockSpec>, String> {
 }
 
 /// The definition check behind [`export_dcm_from_fit`].
-fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String> {
+pub fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String> {
     let ours = network_specs(model_text)?;
     let theirs = network_specs(fitted_text)
         .map_err(|e| format!("the fit's own model text does not read: {e}"))?;
@@ -447,7 +447,7 @@ fn check_same_networks(model_text: &str, fitted_text: &str) -> Result<(), String
 /// which parameters exist and which are `FIX`, `[fit_options]` — must match.
 /// A `[covariate_nn]` block is a set of `key = value` fields, as the parser
 /// reads it: its keys compare case-blind and its lines in sorted order.
-fn model_lines(text: &str) -> Vec<(String, &str)> {
+pub fn model_lines(text: &str) -> Vec<(String, &str)> {
     let mut out = Vec::new();
     // A header counts only once a line of its block does, so a block left empty
     // by the exclusions (a `[data]` holding only a path) is no difference.
@@ -494,7 +494,7 @@ fn model_lines(text: &str) -> Vec<(String, &str)> {
 /// (`CONTINUATION_BLOCKS`) when it starts with an operator or the one before
 /// ends with one — the parser's own rules, so a statement laid out over several
 /// lines compares equal to the same statement on one.
-fn logical_lines(text: &str) -> Vec<(String, String, &str)> {
+pub fn logical_lines(text: &str) -> Vec<(String, String, &str)> {
     let mut out: Vec<(String, String, &str)> = Vec::new();
     let mut block = String::new();
     for line in text.lines() {
@@ -529,7 +529,7 @@ fn logical_lines(text: &str) -> Vec<(String, String, &str)> {
 }
 
 /// `(` / `[` left open in `code`, outside quoted spans.
-fn open_groups(code: &str) -> i32 {
+pub fn open_groups(code: &str) -> i32 {
     let bytes = code.as_bytes();
     let (mut depth, mut i) = (0, 0);
     while i < bytes.len() {
@@ -549,7 +549,7 @@ fn open_groups(code: &str) -> i32 {
 
 /// `code` with its whitespace removed outside quoted spans: a quoted string —
 /// a column header such as `"BODY WEIGHT"` — keeps its spaces.
-fn without_whitespace(code: &str) -> String {
+pub fn without_whitespace(code: &str) -> String {
     let bytes = code.as_bytes();
     let mut out = String::with_capacity(code.len());
     let mut i = 0;
@@ -573,7 +573,7 @@ fn without_whitespace(code: &str) -> String {
 /// value, bounds and inline `prior(...)` arguments, which the export overwrites
 /// or which shape only a refit. A `weight = …` expression (it scales κ, so it is
 /// part of the model) and a vector θ's `[size]` are kept as written.
-fn mask_parameter_values(norm: &str) -> String {
+pub fn mask_parameter_values(norm: &str) -> String {
     static NUMBER: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"[A-Za-z_]\w*|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][-+]?[0-9]+)?").unwrap()
     });
@@ -607,7 +607,7 @@ fn mask_parameter_values(norm: &str) -> String {
 /// text must be the one the fit was made with, up to what [`model_lines`]
 /// leaves out. The network check alone would let a changed structural equation
 /// or error model through and export it at estimates made for another model.
-fn check_same_model(model_text: &str, fitted_text: &str) -> Result<(), String> {
+pub fn check_same_model(model_text: &str, fitted_text: &str) -> Result<(), String> {
     let ours = model_lines(model_text);
     let theirs = model_lines(fitted_text);
     let differ = ours
@@ -638,7 +638,7 @@ fn check_same_model(model_text: &str, fitted_text: &str) -> Result<(), String> {
 
 /// What one physical line of the model is, for the rewrite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LineRole {
+pub enum LineRole {
     /// Header or body of a `[covariate_nn]` block — dropped.
     NnBlock,
     /// Header or body of `[individual_parameters]` — `NAME.OUT` rewritten.
@@ -653,10 +653,10 @@ enum LineRole {
 /// Blocks whose lines are settings and paths, not expressions: nothing in them
 /// can read a network output or a weight θ, and a path such as
 /// `path = "TYPICAL_PK.CL.csv"` must survive byte for byte.
-const VERBATIM_BLOCKS: &[&str] = &["data", "priors", "fit_options"];
+pub const VERBATIM_BLOCKS: &[&str] = &["data", "priors", "fit_options"];
 
 /// Where the blocks of the model sit, line by line.
-struct BlockLayout {
+pub struct BlockLayout {
     role: Vec<LineRole>,
     /// Each `[covariate_nn NAME]` block's body as the parser sees it (comment
     /// stripped, trimmed, blank lines and `end` dropped), keyed by name so
@@ -727,7 +727,7 @@ impl BlockLayout {
 }
 
 /// The block's weights out of the fit, in the network's flat order.
-fn lookup_weights(
+pub fn lookup_weights(
     spec: &NnBlockSpec, theta_names: &[String], theta: &[f64],
 ) -> Result<Vec<f64>, String> {
     spec.weight_theta_names()
@@ -759,7 +759,7 @@ fn lookup_weights(
 /// The normalisation checks repeat `NamedMlpMapper::with_normalization`'s, which
 /// the `nn` build applies to the same values: in a build without `nn` nothing
 /// else has looked at them, and the emission indexes them by input.
-fn check_exportable(spec: &NnBlockSpec) -> Result<(), String> {
+pub fn check_exportable(spec: &NnBlockSpec) -> Result<(), String> {
     // Each generates one variable per entry, so a repeat (in any case — the
     // collision scan folds case) would be declared twice.
     for (field, names) in [("inputs", &spec.inputs), ("outputs", &spec.outputs)] {
@@ -831,29 +831,29 @@ fn check_exportable(spec: &NnBlockSpec) -> Result<(), String> {
 
 /// The generated variable names, fixed up front so collisions are found before
 /// anything is written.
-struct NameTable {
+pub struct NameTable {
     /// `(network, output)` → the variable a `NAME.OUTPUT` reference becomes.
-    outputs: BTreeMap<(String, String), String>,
+    pub outputs: BTreeMap<(String, String), String>,
 }
 
 /// Normalised input `j` of network `name`.
-fn input_var(name: &str, input: &str) -> String {
+pub fn input_var(name: &str, input: &str) -> String {
     format!("Z_{name}_{input}")
 }
 
 /// Post-activation of unit `i` (1-based) of hidden layer `l` (1-based).
-fn hidden_var(name: &str, l: usize, i: usize) -> String {
+pub fn hidden_var(name: &str, l: usize, i: usize) -> String {
     format!("H{l}_{name}_{i}")
 }
 
 /// Pre-activation of unit `i` of layer `l`, emitted only for `relu`, whose
 /// `if (z > 0) z else 0` reads `z` twice.
-fn preact_var(name: &str, l: usize, i: usize) -> String {
+pub fn preact_var(name: &str, l: usize, i: usize) -> String {
     format!("P{l}_{name}_{i}")
 }
 
 /// The variable holding output `out` of network `name`.
-fn output_var(name: &str, out: &str) -> String {
+pub fn output_var(name: &str, out: &str) -> String {
     format!("{name}_{out}")
 }
 
@@ -934,7 +934,7 @@ impl NameTable {
 /// the end of `bytes` when it is not closed. A quoted span is a string — a path,
 /// a label — never a name, so neither the rewrite nor the collision scan looks
 /// inside one.
-fn quoted_span_end(bytes: &[u8], i: usize) -> usize {
+pub fn quoted_span_end(bytes: &[u8], i: usize) -> usize {
     let q = bytes[i];
     bytes[i + 1..].iter().position(|&b| b == q).map_or(bytes.len(), |k| i + 1 + k + 1)
 }
@@ -942,7 +942,7 @@ fn quoted_span_end(bytes: &[u8], i: usize) -> usize {
 /// The identifiers in a line of code (letters, digits, `_`, not starting with a
 /// digit). A number's exponent (`1e5`) is skipped with the number, and a quoted
 /// string is skipped whole.
-fn identifiers(code: &str) -> impl Iterator<Item = &str> {
+pub fn identifiers(code: &str) -> impl Iterator<Item = &str> {
     let bytes = code.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -971,7 +971,7 @@ fn identifiers(code: &str) -> impl Iterator<Item = &str> {
 /// replaced by the generated output variable, and every weight θ named in
 /// `weight_literals` by its value. Quoted strings and the comment, if any, are
 /// kept verbatim.
-fn rewrite_refs(
+pub fn rewrite_refs(
     line: &str, nets: &[(NnBlockSpec, Vec<f64>)], names: &NameTable,
     weight_literals: &HashMap<String, f64>,
 ) -> Result<String, String> {
@@ -1053,14 +1053,14 @@ fn rewrite_refs(
 
 /// A weight or bias as the emitted text refers to it: its θ name under
 /// `FixedTheta`, its value under `Literal`.
-fn coefficient(form: DcmWeightForm, theta_name: &str, value: f64) -> Coefficient<'_> {
+pub fn coefficient(form: DcmWeightForm, theta_name: &str, value: f64) -> Coefficient<'_> {
     match form {
         DcmWeightForm::Literal => Coefficient::Literal(value),
         DcmWeightForm::FixedTheta => Coefficient::Theta(theta_name),
     }
 }
 
-enum Coefficient<'a> {
+pub enum Coefficient<'a> {
     Literal(f64),
     Theta(&'a str),
 }
@@ -1068,7 +1068,7 @@ enum Coefficient<'a> {
 /// Shortest round-trip spelling of `|v|` (`{:?}`): reads back as the same `f64`.
 /// Never a fixed precision — a truncated weight is a different model, and the
 /// truncation would be invisible in the output.
-fn magnitude(v: f64) -> String {
+pub fn magnitude(v: f64) -> String {
     format!("{:?}", v.abs())
 }
 
@@ -1080,7 +1080,7 @@ fn magnitude(v: f64) -> String {
 /// is `(−|c|)·a` exactly, so the sign moves into the operator without changing a
 /// bit. The first term keeps its sign on the literal, which the tokenizer reads
 /// as one negative number. The opening `(` is the caller's ([`act_call`]).
-fn preactivation(
+pub fn preactivation(
     terms: &[(Coefficient<'_>, String)], bias: Coefficient<'_>, indent: &str,
 ) -> String {
     let mut s = String::new();
@@ -1118,7 +1118,7 @@ fn preactivation(
 
 /// The function an activation is written as, up to and including the `(` that
 /// opens the pre-activation (`relu` and `identity` are a bare parenthesis).
-fn act_call(act: Activation) -> &'static str {
+pub fn act_call(act: Activation) -> &'static str {
     match act {
         Activation::Identity | Activation::Relu => "(",
         Activation::Softplus => "softplus(",
@@ -1131,7 +1131,7 @@ fn act_call(act: Activation) -> &'static str {
 
 /// The statement(s) assigning `var = activation(pre)`. `relu` reads its argument
 /// twice, so it gets the pre-activation as its own variable `pre_var`.
-fn activate(out: &mut String, act: Activation, var: &str, pre: &str, pre_var: &str) {
+pub fn activate(out: &mut String, act: Activation, var: &str, pre: &str, pre_var: &str) {
     match act {
         // `Activation::Relu` is `if z > 0 { z } else { 0.0 }`; `max(z, 0)` is
         // `z >= 0`, which differs at `z = -0.0`. Spell the network's own branch.
@@ -1145,14 +1145,14 @@ fn activate(out: &mut String, act: Activation, var: &str, pre: &str, pre_var: &s
 
 /// `theta NAME(value, lower, upper) FIX`, with a box that contains `value` (the
 /// parser's default box is positive, and most weights are not).
-fn fixed_theta_declaration(name: &str, value: f64) -> String {
+pub fn fixed_theta_declaration(name: &str, value: f64) -> String {
     let lo = if value > -1e9 { -1e9 } else { 2.0 * value };
     let hi = if value < 1e9 { 1e9 } else { 2.0 * value };
     format!("theta {name}({value:?}, {lo:?}, {hi:?}) FIX")
 }
 
 /// Indent of the statements inside a network's `if (0 == 0) { … }` block.
-const BODY: &str = "    ";
+pub const BODY: &str = "    ";
 
 /// Write one network's forward pass as statements.
 ///
@@ -1166,7 +1166,7 @@ const BODY: &str = "    ";
 /// no slot. Only the outputs are read after the block, which is why the `else`
 /// arm assigns exactly those — a name read after an `if` must be assigned in
 /// every arm. The arm is never taken; it exists to satisfy that rule.
-fn emit_network(
+pub fn emit_network(
     out: &mut String, spec: &NnBlockSpec, weights: &[f64], names: &NameTable, form: DcmWeightForm,
 ) {
     let name = spec.name.as_str();
@@ -1251,7 +1251,3 @@ fn emit_network(
     }
     out.push_str("  }\n");
 }
-
-#[cfg(test)]
-#[path = "export_tests.rs"]
-mod tests;

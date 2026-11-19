@@ -1,10 +1,29 @@
 //! Tier-1 tests for the count endpoint (#2877).
+// --- the imports of the original parent module (relocated test, #3041) ---
+use ferx_model::parser::model_parser::with_model_time;
+use ferx_model::sens::num::BranchCmp;
+use ferx_model::sens::num::PkNum;
+use ferx_model::stats::likelihood::SUBJECT_SENTINEL_NLL;
+use ferx_model::stats::special::ln_gamma;
+use ferx_model::stats::special::negbin_log_pmf_g;
+use ferx_model::stats::special::NEGBIN_SUM_MAX_K;
+use ferx_model::types::CompiledModel;
+use ferx_model::types::CountFamily;
+use ferx_model::types::CountMeanScale;
+use ferx_model::types::CountParamFn;
+use ferx_model::types::DiscreteObsDiagnostic;
+use ferx_model::types::EndpointLikelihood;
+use ferx_model::types::EndpointPredictionResult;
+use ferx_model::types::ObsRecord;
+use ferx_model::types::Prediction;
+use ferx_model::types::Subject;
+use std::collections::HashMap;
 
-use super::*;
-use crate::categorical::exact_eta_hessian_tests::load;
+use crate::model_tests::categorical::exact_eta_hessian_tests::load;
 use crate::sens::dual2::Dual2;
 use crate::stats::special::count_log_pmf;
 use crate::types::SimOutcome;
+use ferx_model::categorical::count::*;
 
 const P: CountFamily = CountFamily::Poisson;
 const NB: CountFamily = CountFamily::NegBin;
@@ -313,7 +332,7 @@ fn loaded_data_term_sums_the_records_at_their_own_covariates() {
         want -= count_log_pmf(lam, Some(theta[3]), f64::from(*count));
         lams.push(lam);
     }
-    let got = super::super::discrete_subject_nll(model, s, theta, &eta);
+    let got = ferx_model::categorical::discrete_subject_nll(model, s, theta, &eta);
     assert!((got - want).abs() < 1e-10, "{got} vs {want}");
     // The record pair straddling TRT must differ, or the snapshot test above is vacuous.
     assert!((lams[2] - lams[3]).abs() > 0.1, "{lams:?}");
@@ -352,13 +371,14 @@ fn planned_eta_gradient_and_hessian_match_fd() {
     assert!(crate::categorical::all_discrete_endpoints_analytic(model));
     let theta = &model.default_params.theta;
     let eta = [0.13, -0.2];
-    let nll = |s: &Subject, e: &[f64]| super::super::discrete_subject_nll(model, s, theta, e);
+    let nll =
+        |s: &Subject, e: &[f64]| ferx_model::categorical::discrete_subject_nll(model, s, theta, e);
     let (mut wg, mut wh) = (0.0f64, 0.0f64);
     for s in prep.population.subjects.iter().take(5) {
-        let (v, g) = super::super::discrete_subject_eta_grad(model, s, theta, &eta)
+        let (v, g) = ferx_model::categorical::discrete_subject_eta_grad(model, s, theta, &eta)
             .expect("the count term records");
         assert!((v - nll(s, &eta)).abs() < 1e-9);
-        let (_, h) = super::super::discrete_subject_eta_hessian(model, s, theta, &eta)
+        let (_, h) = ferx_model::categorical::discrete_subject_eta_hessian(model, s, theta, &eta)
             .expect("the count term records");
         for i in 0..2 {
             let mut p = eta;
@@ -395,16 +415,17 @@ fn planned_eta_gradient_and_hessian_match_fd() {
 fn count_records_route_by_program_presence() {
     let prep = load(NB_MODEL, "nonmem_anchor/count_nb.csv");
     let mut model = prep.parsed.model;
-    assert!(super::all_count_endpoints_analytic(&model));
+    assert!(ferx_model::categorical::count::all_count_endpoints_analytic(&model));
     if let Some(EndpointLikelihood::Count { param_program, .. }) = model.endpoints.get_mut(&1) {
         *param_program = None;
     }
-    assert!(!super::all_count_endpoints_analytic(&model));
+    assert!(!ferx_model::categorical::count::all_count_endpoints_analytic(&model));
     assert!(!crate::categorical::all_discrete_endpoints_analytic(&model));
     let s = &prep.population.subjects[0];
     let theta = model.default_params.theta.clone();
     assert!(
-        super::super::discrete_subject_eta_grad(&model, s, &theta, &[0.0, 0.0]).is_none(),
+        ferx_model::categorical::discrete_subject_eta_grad(&model, s, &theta, &[0.0, 0.0])
+            .is_none(),
         "no program, no planned gradient"
     );
 }
@@ -420,9 +441,11 @@ fn an_undefined_record_is_the_sentinel_and_declined_by_the_plan() {
     let model = &prep.parsed.model;
     let theta = &model.default_params.theta; // BASE = 4.3 ⇒ λ < 0
     let s = &prep.population.subjects[0];
-    let v = super::super::discrete_subject_nll(model, s, theta, &[0.0, 0.0]);
+    let v = ferx_model::categorical::discrete_subject_nll(model, s, theta, &[0.0, 0.0]);
     assert!(v >= SUBJECT_SENTINEL_NLL && v.is_finite(), "{v}");
-    assert!(super::super::discrete_subject_eta_grad(model, s, theta, &[0.0, 0.0]).is_none());
+    assert!(
+        ferx_model::categorical::discrete_subject_eta_grad(model, s, theta, &[0.0, 0.0]).is_none()
+    );
 }
 
 /// The simulated counts follow their law: Poisson variance ≈ mean, NB variance ≈
@@ -563,8 +586,8 @@ fn lambda_and_log_lambda_spell_the_same_mean() {
     ));
     let th = &a.parsed.model.default_params.theta;
     for (sa, sb) in a.population.subjects.iter().zip(&b.population.subjects).take(4) {
-        let va = super::super::discrete_subject_nll(&a.parsed.model, sa, th, &[0.3]);
-        let vb = super::super::discrete_subject_nll(&b.parsed.model, sb, th, &[0.3]);
+        let va = ferx_model::categorical::discrete_subject_nll(&a.parsed.model, sa, th, &[0.3]);
+        let vb = ferx_model::categorical::discrete_subject_nll(&b.parsed.model, sb, th, &[0.3]);
         assert!((va - vb).abs() < 1e-10, "{va} vs {vb}");
     }
 }
@@ -734,7 +757,7 @@ fn count_records_define_and_carry_theta_levels() {
         let eff = if k < 3 { theta[1] } else { -theta[1] };
         want -= count_log_pmf(4.0 * eff.exp(), None, f64::from(*count));
     }
-    let got = super::super::discrete_subject_nll(model, s, &theta, &[]);
+    let got = ferx_model::categorical::discrete_subject_nll(model, s, &theta, &[]);
     assert!((got - want).abs() < 1e-10, "{got} vs {want}");
 }
 

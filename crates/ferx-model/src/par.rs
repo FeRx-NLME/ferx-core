@@ -70,7 +70,7 @@ pub fn map_init<S, T: Send>(
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     #[test]

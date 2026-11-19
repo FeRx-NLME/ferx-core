@@ -639,7 +639,7 @@ struct Slots {
 }
 
 impl Slots {
-    fn of(spec: &LoopSpec) -> Slots {
+    pub fn of(spec: &LoopSpec) -> Slots {
         let (n, nc) = (spec.n, spec.n_caps);
         // A jump's new state goes into a carried region too.
         let cm = spec.methods.iter().map(|m| m.c).max().unwrap_or(0).max(n);
@@ -799,7 +799,7 @@ struct RunState {
 }
 
 impl LoopRun {
-    fn new(
+    pub fn new(
         spec: &Arc<LoopSpec>, kern: &Arc<LoopKernels>, l: usize, inputs: &[f64], log: Option<Log>,
         rows: Option<(&[f64], usize)>,
     ) -> Self {
@@ -1166,7 +1166,7 @@ impl Lanes {
         self.cur = 1 - self.cur;
     }
     /// Read `f` off the value lane of the current carried state.
-    fn value<R>(&self, f: impl FnOnce(sol::Carried<'_>) -> R) -> R {
+    pub fn value<R>(&self, f: impl FnOnce(sol::Carried<'_>) -> R) -> R {
         let (l, base) = (self.run.l, self.run.sl.carried[self.cur]);
         let buf = self.run.buf.borrow();
         f(sol::Carried::new(&buf[base * l..], l))

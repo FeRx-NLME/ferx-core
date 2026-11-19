@@ -148,7 +148,7 @@ impl Walker<'_> {
     }
 
     /// Record condition `c`, which reads `r`, with its moving switches.
-    fn record(&mut self, c: &Condition, r: &Reads) {
+    pub fn record(&mut self, c: &Condition, r: &Reads) {
         if r.params.is_empty() {
             return;
         }
@@ -531,4 +531,4 @@ pub(super) fn instrument(stmts: &mut Vec<Statement>, leaves: &[String]) {
 
 #[cfg(test)]
 #[path = "ode_switch_tests.rs"]
-mod tests;
+pub mod tests;

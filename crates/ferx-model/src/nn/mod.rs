@@ -36,6 +36,6 @@ pub mod export;
 pub use activation::Activation;
 
 #[cfg(feature = "nn")]
-mod mlp;
+pub mod mlp;
 #[cfg(feature = "nn")]
 pub use mlp::*;

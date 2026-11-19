@@ -185,8 +185,8 @@ pub(super) fn tv_refusal(model: &CompiledModel, pop: &Population, block: &str) -
 #[cfg(feature = "survival")]
 #[test]
 fn binary_tv_covariate_refusal_names_the_lowest_cmt_on_every_compile() {
+    use crate::model_tests::survival::endpoint_order_test_helpers::COMPILES;
     use crate::parser::model_parser::parse_model_string;
-    use crate::survival::endpoint_order_test_helpers::COMPILES;
     let block = |name: &str, cmt: usize| {
         format!("[binary_model {name}]\n  cmt   = {cmt}\n  logit = TH0 + THX * X\n")
     };
