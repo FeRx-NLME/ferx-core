@@ -3956,7 +3956,7 @@ pub(crate) fn parse_full_model_source(content: &str, path: &Path) -> Result<Pars
 /// A relative path resolves against the process's working directory; resolve it
 /// yourself first if it should be relative to something else.
 pub fn expand_prior_from_fit(model: &mut CompiledModel) -> Result<(), String> {
-    crate::estimation::priors::expand_prior_from_fit(model)
+    crate::estimation::prior_import::expand_prior_from_fit(model)
 }
 
 /// Join a model-file-relative path onto `dir`, leaving an absolute one alone.
@@ -5993,7 +5993,7 @@ pub fn parse_full_model_with(
     // moved between the fit and `run_covariance` silently un-penalized the
     // standard errors. Doing it at parse time also closes the window in which
     // the file could change mid-fit. See `estimation::priors::expand_prior_from_fit`.
-    crate::estimation::priors::expand_prior_from_fit(&mut model)?;
+    crate::estimation::prior_import::expand_prior_from_fit(&mut model)?;
     // Class-aware mu-references (#996): detected here rather than in
     // `parse_mixture_block` because the scan needs both the parsed
     // `[individual_parameters]` statements and the mixture's class count.
@@ -11925,7 +11925,7 @@ fn parse_scale_deadband(key: &str, value: &str) -> Result<Option<(f64, f64)>, St
     // object as no band) lives in the sanitiser `run_saem` applies to a band
     // built in Rust, so the two front ends cannot drift (#1479 review).
     let band = Some((lo, hi));
-    Ok(crate::estimation::saem::sanitize_scale_deadband(band).unwrap_or(band))
+    Ok(crate::estimation::saem_settings::sanitize_scale_deadband(band).unwrap_or(band))
 }
 
 pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result<bool, String> {
@@ -12132,7 +12132,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         // rather than left as a bare 0 so a model file can say what it means.
         "n_mh_steps" => {
             opts.saem_n_mh_steps = if value.eq_ignore_ascii_case("auto") {
-                crate::estimation::saem::SAEM_N_MH_STEPS_AUTO
+                crate::estimation::saem_settings::SAEM_N_MH_STEPS_AUTO
             } else {
                 parse_usize("n_mh_steps")?
             }
@@ -12402,10 +12402,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             if v < 1 {
                 return Err("n_agq must be >= 1 (1 = the Laplace approximation)".to_string());
             }
-            if v > crate::estimation::agq::MAX_AGQ_NODES {
+            if v > crate::estimation::gauss_hermite::MAX_AGQ_NODES {
                 return Err(format!(
                     "n_agq must be <= {}, got {v}",
-                    crate::estimation::agq::MAX_AGQ_NODES
+                    crate::estimation::gauss_hermite::MAX_AGQ_NODES
                 ));
             }
             opts.n_agq = v;
@@ -12459,10 +12459,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "saem_ofv_nodes" => {
             let v = parse_usize("saem_ofv_nodes")?;
-            if !(2..=crate::estimation::agq::MAX_AGQ_NODES).contains(&v) {
+            if !(2..=crate::estimation::gauss_hermite::MAX_AGQ_NODES).contains(&v) {
                 return Err(format!(
                     "saem_ofv_nodes must be in 2..={}, got {v}",
-                    crate::estimation::agq::MAX_AGQ_NODES
+                    crate::estimation::gauss_hermite::MAX_AGQ_NODES
                 ));
             }
             opts.saem_ofv_nodes = v;
@@ -12641,7 +12641,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.report_final_gradient = parse_bool("report_final_gradient")?
         }
         "inits_from_nca" => {
-            use crate::suggest_start::NcaInit;
+            use crate::types::NcaInit;
             opts.inits_from_nca = match value.to_lowercase().as_str() {
                 "false" | "off" | "none" | "no" | "0" => None,
                 "true" | "yes" | "1" | "nca_sweep" | "sweep" => Some(NcaInit::Sweep),

@@ -374,7 +374,7 @@ struct FitWire {
     /// The settings the fit read its data with, and a fingerprint of the
     /// population it was given (#1685). Absent for a fit that has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    reader_settings: Option<crate::api::ReaderSettings>,
+    reader_settings: Option<crate::types::ReaderSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     population_fingerprint: Option<crate::types::PopulationFingerprint>,
     /// The IOV occasion rule the fit ran under (#1783).
@@ -664,7 +664,7 @@ struct SirWire {
     settings: Option<SirSettingsWire>,
 }
 
-/// [`SirSettings`](crate::estimation::sir::SirSettings) on the wire. The enums
+/// [`SirSettings`](crate::estimation::sir_settings::SirSettings) on the wire. The enums
 /// travel as their `[fit_options]` tokens and are decoded here, so an unknown
 /// token is `Corrupt` like every other enum on this wire (#1382) rather than a
 /// bare JSON error.
@@ -734,8 +734,8 @@ fn enum_from_token<T: serde::de::DeserializeOwned>(
 /// token for `df = ∞` (#1819). `"mvn"` is also read, as the parser reads it.
 const SIR_DF_NORMAL: &str = "normal";
 
-impl From<&crate::estimation::sir::SirSettings> for SirSettingsWire {
-    fn from(s: &crate::estimation::sir::SirSettings) -> Self {
+impl From<&crate::estimation::sir_settings::SirSettings> for SirSettingsWire {
+    fn from(s: &crate::estimation::sir_settings::SirSettings) -> Self {
         Self {
             samples: s.samples,
             resamples: s.resamples,
@@ -783,7 +783,7 @@ impl SirSettingsWire {
     /// (#1767): `run_sir` adopts a recorded value wherever its caller left the
     /// default, so a value the parser would reject must not enter through the bundle.
     /// The domain is `SirSettings::check_domain`, the one `save_fit` writes under (#1770).
-    fn into_settings(self) -> Result<crate::estimation::sir::SirSettings, FitrxError> {
+    fn into_settings(self) -> Result<crate::estimation::sir_settings::SirSettings, FitrxError> {
         let not_a_df = |got: &dyn std::fmt::Display| {
             FitrxError::Corrupt(format!("sir.settings.df must be >= 1 or \"normal\", got {got}"))
         };
@@ -796,7 +796,7 @@ impl SirSettingsWire {
             serde_json::Value::Number(n) => n.as_f64().ok_or_else(|| not_a_df(n))?,
             other => return Err(not_a_df(other)),
         };
-        let settings = crate::estimation::sir::SirSettings {
+        let settings = crate::estimation::sir_settings::SirSettings {
             samples: self.samples,
             resamples: self.resamples,
             seed: self.seed,
@@ -1099,7 +1099,7 @@ str_enum_map!(
 /// against its prediction rows, and `interface_extras` (opaque to core but must be valid
 /// JSON). The wire's own invariants are checked by `save_fit` on the wire it builds.
 fn check_writable(r: &FitResult) -> Result<(), FitrxError> {
-    let refuse = |block: &str, e: crate::estimation::fit_inputs::OutOfDomain| {
+    let refuse = |block: &str, e: crate::estimation::population_check::OutOfDomain| {
         FitrxError::Unwritable(e.in_block(block))
     };
     if let Some(s) = &r.scoring_settings {
@@ -2461,7 +2461,7 @@ fn read_bundled_population(
             // since the routing-only read gave an IOV fit no occasions.
             let settings = match recorded {
                 Some(settings) => settings.clone(),
-                None => crate::api::ReaderSettings::from_parsed(&parsed),
+                None => crate::types::ReaderSettings::from_parsed(&parsed),
             };
             let replayed = (|| -> Result<Population, String> {
                 // Both codes below are dropped on purpose: the text only feeds the
@@ -5145,8 +5145,8 @@ mod tests {
 
     /// A SIR record with every field, and every enum, off its default — so a
     /// wire that dropped a field, or decoded a token to the default, differs.
-    fn off_default_sir_settings() -> crate::estimation::sir::SirSettings {
-        crate::estimation::sir::SirSettings {
+    fn off_default_sir_settings() -> crate::estimation::sir_settings::SirSettings {
+        crate::estimation::sir_settings::SirSettings {
             samples: 321,
             resamples: 123,
             seed: 4242,
@@ -5199,7 +5199,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sir_settings.fitrx");
         let r = sir_fit_with_settings();
-        assert_ne!(r.sir_settings, Some(crate::estimation::sir::SirSettings::default()));
+        assert_ne!(r.sir_settings, Some(crate::estimation::sir_settings::SirSettings::default()));
         let p = dummy_population(&["S1", "S2"], 3);
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
         let loaded = load_fit(&path).unwrap();
@@ -5278,7 +5278,7 @@ mod tests {
     /// half. Mutations: delete any one check; `> 1.0` for `df`; `1..MAX` for `n_agq`.
     #[test]
     fn sir_settings_out_of_domain_values_are_corrupt() {
-        let max_agq = crate::estimation::agq::MAX_AGQ_NODES;
+        let max_agq = crate::estimation::gauss_hermite::MAX_AGQ_NODES;
         let agq_shows = format!("got {}", max_agq + 1);
         let rows: [(&str, serde_json::Value, serde_json::Value, &str); 6] = [
             ("df", serde_json::json!(0.5), serde_json::json!(1.0), "0.5"),
@@ -5312,7 +5312,7 @@ mod tests {
     /// file exists).
     #[test]
     fn save_fit_refuses_settings_the_reader_would_reject() {
-        type Edit = fn(&mut crate::estimation::sir::SirSettings, bool);
+        type Edit = fn(&mut crate::estimation::sir_settings::SirSettings, bool);
         let rows: [(&str, Edit, &str); 7] = [
             ("df", |s, bad| s.df = if bad { 0.5 } else { 1.0 }, "got 0.5"),
             ("n_agq", |s, bad| s.scoring.n_agq = if bad { 0 } else { 1 }, "got 0"),
@@ -5677,7 +5677,7 @@ mod tests {
         let path = dir.path().join("provenance.fitrx");
         let p = dummy_population(&["S1", "S2"], 3);
         let mut r = minimal_fit_result();
-        let mut settings = crate::api::ReaderSettings::default();
+        let mut settings = crate::types::ReaderSettings::default();
         settings.column_map = vec![("DV".into(), "CONC".into())];
         settings.iov_column = Some("OCC".into());
         settings.ignore_exprs = vec!["TIME > 24".into()];

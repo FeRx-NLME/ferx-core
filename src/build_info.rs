@@ -79,7 +79,7 @@ impl GradientMethodKind {
 /// (#2786), so a subject on finite differences is either the user's `gradient = fd` or a
 /// recorder defect, which `W_PLAN_FD_FALLBACK` names.
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
-    if crate::estimation::inner_optimizer::inner_reports_analytic_model(model) {
+    if crate::estimation::inner_settings::inner_reports_analytic_model(model) {
         GradientMethodKind::Analytic
     } else {
         GradientMethodKind::FiniteDifferences
@@ -140,7 +140,7 @@ pub fn gradient_method_outer(
         // (a model no recorder serves, a plan failure at a point). Report that distinction, not a scope gate — there isn't one.
         // Laplace is AGQ at one node — same objective, same gradient, so same report.
         EstimationMethod::Laplace => {
-            if crate::estimation::agq::analytic_score_supported_model(model) {
+            if crate::estimation::gauss_hermite::analytic_score_supported_model(model) {
                 GradientMethodKind::Analytic
             } else {
                 GradientMethodKind::FiniteDifferences
@@ -160,7 +160,7 @@ pub fn gradient_method_outer(
             // Resolved by the outer loop's own dispatch rule (#1540), so a mixture
             // model's `auto` → BOBYQA downgrade reports "no outer gradient" here too.
             let analytic = crate::sens::provider::analytic_outer_gradient_available(model);
-            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+            let (resolved, _) = crate::estimation::outer_policy::resolve_outer_optimizer(
                 optimizer,
                 model,
                 model.mixture.is_some(),

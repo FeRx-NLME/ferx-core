@@ -1468,7 +1468,7 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
 
     let control = evaluate(&model, &warfarin_with_wt(NegativeWt::Nowhere));
     assert!(
-        crate::estimation::outer_optimizer::ofv_is_valid(control.ofv),
+        crate::estimation::outer_policy::ofv_is_valid(control.ofv),
         "premise: WT = 70 everywhere is a healthy fit; ofv = {}",
         control.ofv
     );
@@ -2303,7 +2303,7 @@ fn an_overflowing_hazard_names_its_time_to_event_term() {
     ] {
         let control = run(method, false);
         assert!(
-            crate::estimation::outer_optimizer::ofv_is_valid(control.ofv),
+            crate::estimation::outer_policy::ofv_is_valid(control.ofv),
             "{method:?}: premise: Z = 0 is a healthy fit; ofv = {}",
             control.ofv
         );
@@ -2642,7 +2642,7 @@ fn each_branch_records_the_parts_of_its_own_contribution() {
     let twice_sum = |list: &[(String, f64)]| list.iter().map(|(_, v)| 2.0 * v).sum::<f64>();
     let failing = |list: &[(String, f64)]| -> Vec<String> {
         list.iter()
-            .filter(|(_, v)| !crate::estimation::outer_optimizer::ofv_is_valid(2.0 * v))
+            .filter(|(_, v)| !crate::estimation::outer_policy::ofv_is_valid(2.0 * v))
             .map(|(n, _)| n.clone())
             .collect()
     };
@@ -2869,7 +2869,7 @@ fn an_iov_subjects_parts_sum_to_its_stacked_contribution() {
     .expect("one κ per occasion");
     let failing = |list: &[(String, f64)]| -> Vec<String> {
         list.iter()
-            .filter(|(_, v)| !crate::estimation::outer_optimizer::ofv_is_valid(2.0 * v))
+            .filter(|(_, v)| !crate::estimation::outer_policy::ofv_is_valid(2.0 * v))
             .map(|(n, _)| n.clone())
             .collect()
     };

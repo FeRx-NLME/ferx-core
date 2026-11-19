@@ -740,7 +740,7 @@ fn a_nested_model_reports_the_analytic_walks_on_every_class() {
     for (label, m) in [("algebraic", model()), ("transit", transit)] {
         assert!(m.has_nested_levels(), "{label}");
         assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(&m), "{label}");
-        assert!(crate::estimation::inner_optimizer::inner_reports_analytic_model(&m), "{label}");
+        assert!(crate::estimation::inner_settings::inner_reports_analytic_model(&m), "{label}");
         assert!(crate::sens::provider::analytic_outer_gradient_in_scope(&m), "{label}");
     }
 }

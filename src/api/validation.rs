@@ -4116,7 +4116,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         && chain
             .iter()
             .rposition(|&m| m == EstimationMethod::FoceGn)
-            .is_some_and(|idx| crate::api::is_last_estimating_stage(&chain, idx, &eval_only))
+            .is_some_and(|idx| crate::types::is_last_estimating_stage(&chain, idx, &eval_only))
     {
         diags.push(
             Diagnostic::warning(
@@ -4432,7 +4432,9 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // run, with the code and text `run_sir` refuses it with: the in-fit SIR would
     // otherwise only report it as a `SIR failed:` warning after the whole fit.
     if options.sir || options.covariance_fallback == crate::types::CovarianceFallback::Sir {
-        if let Err(e) = crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df) {
+        if let Err(e) =
+            crate::estimation::population_check::sir_df_in_domain("sir_df", options.sir_df)
+        {
             diags.push(Diagnostic::error("E_SIR_OPTIONS", e.to_string()));
         }
     }
@@ -4444,7 +4446,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // or a pure-TTE endpoint), reject up front rather than fail deep in the objective.
     if chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI))
         && options.n_agq > 1
-        && !crate::estimation::agq::analytic_score_supported(model)
+        && !crate::estimation::gauss_hermite::analytic_score_supported(model)
     {
         diags.push(
             Diagnostic::error(
@@ -4472,7 +4474,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // The per-dimension node cap below, for a chain no quadrature reads `n_agq` in: the
     // value goes unused but is recorded in `scoring_settings`, and a `.fitrx` holding one
     // past the cap does not load (#1770).
-    if !(laplace_stage || focei_quadrature) && options.n_agq > crate::estimation::agq::MAX_AGQ_NODES
+    if !(laplace_stage || focei_quadrature)
+        && options.n_agq > crate::estimation::gauss_hermite::MAX_AGQ_NODES
     {
         diags.push(
             Diagnostic::error(
@@ -4481,8 +4484,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                     "n_agq = {} exceeds the {}-node per-dimension limit. No stage of this fit \
                      reads it; remove n_agq or set it within 1..={}.",
                     options.n_agq,
-                    crate::estimation::agq::MAX_AGQ_NODES,
-                    crate::estimation::agq::MAX_AGQ_NODES,
+                    crate::estimation::gauss_hermite::MAX_AGQ_NODES,
+                    crate::estimation::gauss_hermite::MAX_AGQ_NODES,
                 ),
             )
             .with_block("fit_options"),
@@ -4508,7 +4511,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         // bypasses that path — so re-check here, alongside the grid cap, or an
         // out-of-range `n_agq` (e.g. 100 with a single η, which slips under the grid
         // cap) would reach `gauss_hermite` past the point Golub–Welsch stays accurate.
-        if n_nodes > crate::estimation::agq::MAX_AGQ_NODES {
+        if n_nodes > crate::estimation::gauss_hermite::MAX_AGQ_NODES {
             diags.push(
                 Diagnostic::error(
                     "E_AGQ_NODES_TOO_LARGE",
@@ -4517,7 +4520,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                          limit: beyond ~20 nodes the Golub–Welsch rule loses its extreme nodes to \
                          round-off and the marginal gains nothing. Lower n_agq (n_agq = 1 is the \
                          Laplace approximation, i.e. FOCEI-equivalent cost).",
-                        crate::estimation::agq::MAX_AGQ_NODES,
+                        crate::estimation::gauss_hermite::MAX_AGQ_NODES,
                     ),
                 )
                 .with_block("fit_options"),
@@ -4635,7 +4638,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         let has_mixture = model.default_params.mixture.is_some();
         let in_scope = crate::sens::provider::analytic_outer_gradient_in_scope(model);
         let resolve = |analytic: bool| {
-            crate::estimation::outer_optimizer::resolve_outer_optimizer(
+            crate::estimation::outer_policy::resolve_outer_optimizer(
                 Optimizer::Auto,
                 model,
                 has_mixture,

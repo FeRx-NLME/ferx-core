@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use crate::diagnostics::{Diagnostic, EngineError};
 use crate::estimation::parameterization::theta_se_from_packed;
 use crate::estimation::parameterization::{theta_from_packed, theta_packing_jacobian};
-use crate::estimation::sir::percentile_ci;
+use crate::estimation::sir_settings::percentile_ci;
 use crate::occasions::apply_iov_occasion_rule;
 use crate::parser::model_parser::{
     eval_gather, level_index_column, parse_full_model_with, DataBindings, EtaCoupling, EtaRoute,

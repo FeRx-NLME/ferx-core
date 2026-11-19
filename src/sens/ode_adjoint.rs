@@ -79,7 +79,7 @@ pub(crate) fn model_in_scope(model: &CompiledModel) -> bool {
 pub(crate) fn outer_model_in_scope(model: &CompiledModel) -> bool {
     (recorder_in_scope(model) || endpoint_only(model))
         && (!model.has_non_gaussian()
-            || crate::estimation::inner_optimizer::non_gaussian_endpoints_served(model))
+            || crate::estimation::inner_settings::non_gaussian_endpoints_served(model))
 }
 
 /// A model with no structural part — only non-Gaussian endpoints (`[markov_model]`,
@@ -3814,7 +3814,7 @@ pub(crate) fn exact_inner_hessian_or_decline(
 /// The terms read BSV η only, so under IOV they occupy the leading block of the stacked
 /// `[η, κ]`.
 fn non_gaussian_terms_supported(model: &CompiledModel, subject: &Subject) -> bool {
-    crate::estimation::inner_optimizer::non_gaussian_eta_grad_served(model, subject)
+    crate::estimation::inner_settings::non_gaussian_eta_grad_served(model, subject)
 }
 
 /// [`crate::survival::non_gaussian_eta_hessian`], `None` without the `survival` feature.
@@ -4915,7 +4915,7 @@ fn run_agq(
 /// The tensor Gauss–Hermite grid over `n` dimensions: per node its `z` and
 /// `c = Σ log w + ‖z‖²`.
 fn agq_grid(n_agq: usize, n: usize) -> Vec<(Vec<f64>, f64)> {
-    let (nodes, _, logw) = crate::estimation::agq::cached_gauss_hermite(n_agq);
+    let (nodes, _, logw) = crate::estimation::gauss_hermite::cached_gauss_hermite(n_agq);
     let mut out = Vec::new();
     let mut idx = vec![0usize; n];
     loop {

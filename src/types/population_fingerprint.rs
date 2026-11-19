@@ -326,7 +326,7 @@ impl PopulationFingerprint {
     pub fn verify(
         &self, model: &crate::types::CompiledModel, population: &Population,
     ) -> Result<Vec<String>, crate::EngineError> {
-        crate::estimation::fit_inputs::verify_given_population(self, model, population)
+        crate::estimation::population_check::verify_given_population(self, model, population)
     }
 }
 

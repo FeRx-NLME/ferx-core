@@ -3246,7 +3246,7 @@ fn test_parse_method_single() {
 
 #[test]
 fn test_parse_inits_from_nca() {
-    use crate::suggest_start::NcaInit;
+    use crate::types::NcaInit;
     // Default is off.
     assert_eq!(FitOptions::default().inits_from_nca, None);
     // Boolean true maps to the sweep strategy.
@@ -3518,7 +3518,7 @@ fn test_n_mh_steps_accepts_auto_and_a_count() {
     let mut opts = FitOptions::default();
     assert_eq!(
         opts.saem_n_mh_steps,
-        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        crate::estimation::saem_settings::SAEM_N_MH_STEPS_AUTO,
         "the default is the sentinel"
     );
 
@@ -3529,7 +3529,7 @@ fn test_n_mh_steps_accepts_auto_and_a_count() {
         assert_eq!(apply_fit_option(&mut opts, "n_mh_steps", spelling), Ok(true));
         assert_eq!(
             opts.saem_n_mh_steps,
-            crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+            crate::estimation::saem_settings::SAEM_N_MH_STEPS_AUTO,
             "`{spelling}` must reach the sentinel"
         );
         // Put it back to a count so the next spelling has to move it again —

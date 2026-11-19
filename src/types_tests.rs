@@ -2260,12 +2260,12 @@ fn saem_n_mh_steps_default_is_auto() {
     let opts = FitOptions::default();
     assert_eq!(
         opts.saem_n_mh_steps,
-        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        crate::estimation::saem_settings::SAEM_N_MH_STEPS_AUTO,
         "saem_n_mh_steps default changed — see comment above this test for the \
              basin-trap and block-Ω-collapse regression rationale before adjusting."
     );
     assert_eq!(
-        crate::estimation::saem::SAEM_N_MH_STEPS_AUTO,
+        crate::estimation::saem_settings::SAEM_N_MH_STEPS_AUTO,
         0,
         "the sentinel is 0 — a model file writes it as `n_mh_steps = auto`"
     );
@@ -3891,7 +3891,7 @@ fn pk_slot_rows_keeps_its_range_guard() {
 
 // ── #2122 / #2101: kappa with a residual `correlation` line is analytic ──────────────────
 mod kappa_correlation_auto_route {
-    use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+    use crate::estimation::outer_policy::resolve_outer_optimizer;
     use crate::sens::provider::analytic_outer_gradient_in_scope;
     use crate::types::{Optimizer, BOBYQA_MAX_DIM};
 

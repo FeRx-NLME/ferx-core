@@ -103,7 +103,7 @@ fn data_ofv(fit: &FitResult) -> f64 {
 ///   the `iov_column` constraint above for IOV models), routed by the model so
 ///   a joint model's event rows come back as event records (#1199). A supplied
 ///   population read without that routing is rejected (`E_ENDPOINT_UNROUTED`).
-/// - `options`: the settings recorded in [`SirSettings`](crate::estimation::sir::SirSettings)
+/// - `options`: the settings recorded in [`SirSettings`](crate::estimation::sir_settings::SirSettings)
 ///   (`sir_samples`, `sir_resamples`, `sir_seed`, `sir_df`, `sir_scale`,
 ///   `sir_keep_samples`, `inner_maxiter`, `inner_tol`, `mu_referencing`, `n_agq`,
 ///   `inner_optimizer`, `ebe_warm_start` and the six `ode_*` overrides), plus
@@ -892,8 +892,8 @@ mod tests {
 
     /// A record with every field off its default, so each `recorded!` line has a
     /// value to take that the caller's default options do not already hold.
-    fn off_default_settings() -> crate::estimation::sir::SirSettings {
-        crate::estimation::sir::SirSettings {
+    fn off_default_settings() -> crate::estimation::sir_settings::SirSettings {
+        crate::estimation::sir_settings::SirSettings {
             samples: 321,
             resamples: 123,
             seed: 4242,
@@ -937,13 +937,13 @@ mod tests {
         fit.sir_settings = Some(rec.clone());
         let d = FitOptions::default();
         assert_ne!(
-            crate::estimation::sir::SirSettings::from_options(&d),
+            crate::estimation::sir_settings::SirSettings::from_options(&d),
             rec,
             "premise: the record differs from the defaults"
         );
 
         let resolved = resolve_sir_options(&fit, &d);
-        assert_eq!(crate::estimation::sir::SirSettings::from_options(&resolved), rec);
+        assert_eq!(crate::estimation::sir_settings::SirSettings::from_options(&resolved), rec);
 
         // The caller's explicit, non-default value wins over the record.
         let caller = FitOptions {
@@ -968,8 +968,8 @@ mod tests {
         fit.sir_settings = None;
         let resolved = resolve_sir_options(&fit, &caller);
         assert_eq!(
-            crate::estimation::sir::SirSettings::from_options(&resolved),
-            crate::estimation::sir::SirSettings::from_options(&caller)
+            crate::estimation::sir_settings::SirSettings::from_options(&resolved),
+            crate::estimation::sir_settings::SirSettings::from_options(&caller)
         );
     }
 
@@ -1009,7 +1009,7 @@ mod tests {
             sir.scoring != stage && stage != caller && sir.scoring != caller,
             "premise: three distinct sources"
         );
-        let scored = |sir_rec: Option<&crate::estimation::sir::SirSettings>,
+        let scored = |sir_rec: Option<&crate::estimation::sir_settings::SirSettings>,
                       stage_rec: Option<&crate::ScoringSettings>| {
             let mut fit = crate::types::test_helpers::minimal_fit_result();
             fit.sir_settings = sir_rec.cloned();
@@ -1051,7 +1051,7 @@ mod tests {
         assert!(ess_fit.is_finite(), "{row}: in-fit ESS {ess_fit}");
         assert_eq!(
             fit.sir_settings,
-            Some(crate::estimation::sir::SirSettings::from_options(opts)),
+            Some(crate::estimation::sir_settings::SirSettings::from_options(opts)),
             "{row}: the fit records what it scored under"
         );
 

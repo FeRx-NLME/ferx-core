@@ -31,6 +31,7 @@ pub(crate) mod scratch;
 pub mod sens;
 pub(crate) mod serde_nalgebra;
 pub mod sim;
+pub(crate) mod sim_result;
 pub mod stats;
 pub mod suggest_start;
 #[cfg(feature = "survival")]

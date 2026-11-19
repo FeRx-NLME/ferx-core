@@ -151,7 +151,7 @@ use crate::types::SimOutcome;
 use crate::SimulateOptions;
 
 /// The Gaussian value on a simulated row, or a panic for a non-Gaussian one.
-fn continuous(r: &crate::api::SimulationResult) -> f64 {
+fn continuous(r: &crate::sim_result::SimulationResult) -> f64 {
     match r.outcome {
         SimOutcome::Continuous { value } => value,
         _ => panic!("expected a Gaussian row"),

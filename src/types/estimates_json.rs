@@ -16,7 +16,7 @@
 //! carries the full `f64` and writes `null`, including for a non-finite value, matching
 //! [`FitResult::to_json_value`]'s convention for every other float.
 
-use super::*;
+use crate::types::*;
 
 /// One value of an estimate entry, tagged with how the YAML prints it.
 #[derive(Debug, Clone, PartialEq)]
@@ -619,6 +619,234 @@ pub(crate) fn estimates_json(result: &FitResult) -> serde_json::Value {
     }
 }
 
-#[cfg(test)]
-#[path = "output_estimates_tests.rs"]
-mod tests;
+/// Relative standard error as a percent: `|se / est| · 100`, or `NaN` when the
+/// estimate is ~0 (guards the divide-by-zero for a parameter pinned at 0).
+pub(crate) fn rse_pct(est: f64, se: f64) -> f64 {
+    if est.abs() > 1e-12 {
+        (se / est.abs()) * 100.0
+    } else {
+        f64::NAN
+    }
+}
+
+/// Why parameter `i` of family `kind` has no standard error (#2797), or `None`: it is
+/// in `FitResult::held_at_bound` (a profiled level on its bound, #2112, or a coordinate
+/// collapsed on the internal guard). The one predicate every renderer reads. A
+/// hand-built result setting only the deprecated `profiled_levels_at_bound` is honoured.
+pub(crate) fn se_held(result: &FitResult, kind: ParameterKind, i: usize) -> Option<HeldReason> {
+    result
+        .held_at_bound
+        .iter()
+        // A `[mixture]` override's `(kind, index)` names its base parameter (#2809).
+        .find(|h| h.class.is_none() && h.kind == kind && h.index == i)
+        .map(|h| h.reason)
+        .or_else(|| {
+            (kind == ParameterKind::Theta && result.profiled_levels_at_bound.contains(&i))
+                .then_some(HeldReason::ProfiledBound)
+        })
+}
+
+/// The CV% of `P = TV · exp(η)`, `η ~ N(0, var)`: `sqrt(exp(var) − 1) · 100` exactly
+/// (#1858), `0` for a non-positive variance. Not the first-order `sqrt(var) · 100`
+/// (0.2: 44.7 vs 47.1; 2.37: 154 vs 311). `exp_m1` keeps a tiny variance's digits;
+/// above `var ≈ 709.78` this is `+∞` (YAML: [`yaml_cv_pct`]).
+pub(crate) fn cv_pct(var: f64) -> f64 {
+    if var > 0.0 {
+        var.exp_m1().sqrt() * 100.0
+    } else {
+        0.0
+    }
+}
+
+/// A CV% as a YAML scalar: `{:.2}` when finite, else `.inf` — YAML's own
+/// spelling of infinity, which a numeric reader parses as a float. Rust's
+/// `inf` would be read back as a string.
+pub(crate) fn yaml_cv_pct(cv: f64) -> String {
+    if cv.is_finite() {
+        format!("{:.2}", cv)
+    } else {
+        ".inf".to_string()
+    }
+}
+
+/// SD from a variance: `sqrt(var)`, or `0` for a non-positive variance.
+pub(crate) fn sd_from_var(var: f64) -> f64 {
+    if var > 0.0 {
+        var.sqrt()
+    } else {
+        0.0
+    }
+}
+
+/// The type of the ETA called `name`, looked up **by name** in `eta_param_info`
+/// (statement order, one entry per use): all agree → that type; disagreement →
+/// `Custom`; none → `None`.
+pub(crate) fn eta_type(result: &FitResult, name: &str) -> Option<EtaParamType> {
+    let mut types =
+        result.eta_param_info.iter().filter(|i| i.eta_name == name).map(|i| i.param_type);
+    let first = types.next()?;
+    Some(if types.all(|t| t == first) { first } else { EtaParamType::Custom })
+}
+
+/// Why `[mixture]` override `o` has no SE (#2833), or `None`: a
+/// [`FitResult::held_at_bound`] entry of **its** class, family and base index.
+pub(crate) fn override_held(result: &FitResult, o: &MixtureOverrideParam) -> Option<HeldReason> {
+    result
+        .held_at_bound
+        .iter()
+        .find(|h| h.class == Some(o.class) && h.kind == o.kind && h.index == o.index)
+        .map(|h| h.reason)
+}
+
+/// The SE state of one override row, in render precedence (#2833).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OverrideSe {
+    /// In `held_at_bound`: `N/A` (console, table), `se: ~` + `held:` (YAML).
+    Held(HeldReason),
+    /// Fixed by the model or held at its initial value by the estimator: `---`.
+    Fixed,
+    /// Free: its SE, or `None` when the covariance step produced none.
+    Free(Option<f64>),
+}
+
+/// One `[mixture]` per-class override as every renderer shows it (#2833).
+pub(crate) struct OverrideRow<'a> {
+    pub(crate) param: &'a MixtureOverrideParam,
+    /// The fitted value: a class variance (Ω) or σ (Σ), as `mixture_overrides` reports it.
+    pub(crate) value: f64,
+    pub(crate) se: OverrideSe,
+}
+
+impl OverrideRow<'_> {
+    /// The base parameter's name, e.g. `ETA_CL` for `ETA_CL_MIX2`.
+    pub(crate) fn base_name<'r>(&self, result: &'r FitResult) -> &'r str {
+        let names = match self.param.kind {
+            ParameterKind::Omega => &result.eta_names,
+            _ => &result.sigma_names,
+        };
+        names.get(self.param.index).map_or("", String::as_str)
+    }
+
+    /// `---` / `N/A` / the SE, for the console.
+    pub(crate) fn se_text(&self) -> String {
+        match self.se {
+            OverrideSe::Held(_) => "N/A".to_string(),
+            OverrideSe::Fixed => "---".to_string(),
+            OverrideSe::Free(se) => se_cell(se),
+        }
+    }
+}
+
+/// The override rows of `result` (#2833), in `mixture_overrides` order; empty
+/// without one descriptor per value (such a row cannot be named).
+pub(crate) fn override_rows(result: &FitResult) -> Vec<OverrideRow<'_>> {
+    let Some(values) = result.mixture_overrides.as_deref() else {
+        return Vec::new();
+    };
+    if result.mixture_override_params.len() != values.len() {
+        return Vec::new();
+    }
+    result
+        .mixture_override_params
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(k, (param, &value))| {
+            // Held first: a held override is never also fixed (the guard hold is not in
+            // the model's FIX mask), so the order matters only for a hand-built result.
+            let se = if let Some(reason) = override_held(result, param) {
+                OverrideSe::Held(reason)
+            } else if param.fixed {
+                OverrideSe::Fixed
+            } else {
+                OverrideSe::Free(
+                    result.se_mixture_overrides.as_ref().and_then(|v| v.get(k).copied()),
+                )
+            };
+            OverrideRow { param, value, se }
+        })
+        .collect()
+}
+
+/// A weighted kappa's (#1031) weight source and, with a typical weight `n > 0` and
+/// non-negative variance, `(n, var / n)`. `None` when unweighted. Shared by the
+/// console weight line and the YAML `weight*` keys (#1660).
+pub(crate) fn kappa_weight_facts<'a>(
+    weights: &'a [Option<String>], weight_typical: &[Option<f64>], i: usize, var: f64,
+) -> Option<(&'a str, Option<(f64, f64)>)> {
+    let w = weights.get(i).and_then(|w| w.as_deref())?;
+    let typical = match weight_typical.get(i).copied().flatten() {
+        Some(n) if n > 0.0 && var >= 0.0 => Some((n, var / n)),
+        _ => None,
+    };
+    Some((w, typical))
+}
+
+/// Parameter correlation for the off-diagonal `(i, j)`: prefer the precomputed
+/// `param_corr` matrix entry when present, else fall back to
+/// `cov / (sqrt(var_i) · sqrt(var_j))` (0 when either variance is non-positive).
+pub(crate) fn param_corr_fallback(
+    m: Option<&nalgebra::DMatrix<f64>>, cov: f64, var_i: f64, var_j: f64, i: usize, j: usize,
+) -> f64 {
+    m.map(|m| m[(i, j)]).unwrap_or_else(|| {
+        if var_i > 0.0 && var_j > 0.0 {
+            cov / (var_i.sqrt() * var_j.sqrt())
+        } else {
+            0.0
+        }
+    })
+}
+
+/// Number of coefficients at or above which a θ vector or level block (#1064) is
+/// reported in its own compact section. Counts the block's θ in `theta_names`
+/// (`FIX` included, #1891), not its levels: a 21-level `sum_to_zero` block (20 θ)
+/// is compacted. Use [`compact_theta_blocks`] rather than this constant (#1623).
+pub const THETA_BLOCK_COMPACT_MIN: usize = 20;
+
+/// The θ index ranges of the vector / level blocks in `names` with
+/// [`THETA_BLOCK_COMPACT_MIN`] or more coefficients. Blocks are runs of
+/// `NAME[…]` names (a scalar θ name never contains a bracket); levels are
+/// contiguous by construction.
+pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
+    let block_of = |n: &String| -> Option<String> {
+        n.strip_suffix(']').and_then(|r| r.split_once('[')).map(|(b, _)| b.to_string())
+    };
+    let mut out: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    let mut i = 0;
+    while i < names.len() {
+        let Some(block) = block_of(&names[i]) else {
+            i += 1;
+            continue;
+        };
+        let start = i;
+        while i < names.len() && block_of(&names[i]).as_deref() == Some(block.as_str()) {
+            i += 1;
+        }
+        if i - start >= THETA_BLOCK_COMPACT_MIN {
+            out.push((block, start..i));
+        }
+    }
+    out
+}
+
+/// Quote and escape a free-form string for embedding as a YAML double-quoted
+/// scalar. Used for values sourced from the OS/environment (e.g.
+/// `environment.username`) that aren't under ferx's control and may contain
+/// YAML-significant characters — `:`/`#` are harmless once quoted, but a
+/// literal newline or backslash/quote would otherwise corrupt the line or
+/// (for a raw newline) get silently folded away by YAML's line-folding rules.
+pub(crate) fn yaml_quote(s: &str) -> String {
+    let escaped =
+        s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
+    format!("\"{escaped}\"")
+}
+
+/// The `SE = …` text of a console row: the SE to six decimals, or `N/A` when
+/// there is none or it is not finite (#2225) — a `NaN` entry in an otherwise
+/// present `se_*` vector prints the same as a missing one, not `NaN`/`inf`.
+pub(crate) fn se_cell(se: Option<f64>) -> String {
+    match se.filter(|s| s.is_finite()) {
+        Some(s) => format!("{:.6}", s),
+        None => "N/A".to_string(),
+    }
+}

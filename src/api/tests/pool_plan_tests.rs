@@ -546,8 +546,8 @@ fn jobs_read<T: Send>(read: impl Fn() -> T + Sync + Send) -> Vec<T> {
         .collect()
 }
 
-fn lbfgs_warm() -> crate::estimation::inner_optimizer::InnerSettings {
-    crate::estimation::inner_optimizer::InnerSettings {
+fn lbfgs_warm() -> crate::estimation::inner_settings::InnerSettings {
+    crate::estimation::inner_settings::InnerSettings {
         mode: crate::types::InnerOptimizer::Lbfgs,
         warm: true,
     }

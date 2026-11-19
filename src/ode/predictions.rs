@@ -2,6 +2,7 @@
 //! boluses are state discontinuities, and infusions add `+rate` to their compartment's derivative
 //! between breaks at their start and end (as Julia's `_ode_predictions`).
 
+use crate::cold_sort::ColdSort;
 use crate::ode::solver::{
     solve_ode_certified, solve_ode_dense_with_auto_state, OdeAutoSwitchState, OdeSolverOptions,
     OdeSolverStats,
@@ -15,6 +16,28 @@ use crate::sim::adaptive::{
 };
 // `MonitorSpec` is named only by the `#[cfg(test)]` cmt-only wrapper and the
 // driver's unit tests (production pairs it inside `AdaptiveMonitor`).
+/// Trapezoid integration over (time, value) pairs.
+/// Observation times are not guaranteed to be sorted (preserved in input row
+/// order), so sort by time before integrating to prevent negative dt windows.
+///
+/// `pub(crate)` so the reactive driver's window AUC (`auc_target_attainment`, #391
+/// S2.5b, #943) shares this one implementation rather than carrying a second copy of
+/// the rule. The sort is stable, so two nodes at one time — the value a break found and
+/// the value it left — keep their order and form a zero-width panel.
+pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
+    if points.len() < 2 {
+        return f64::NAN;
+    }
+    let mut sorted = points.to_vec();
+    sorted.cold_sort_by(&|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut auc = 0.0;
+    for w in sorted.windows(2) {
+        let dt = w[1].0 - w[0].0;
+        auc += dt * (w[0].1 + w[1].1) * 0.5;
+    }
+    auc
+}
+
 #[cfg(test)]
 use crate::sim::adaptive::MonitorSpec;
 use crate::types::{DoseEvent, PkParams, Subject};
@@ -8030,7 +8053,7 @@ impl<'d> AdaptiveWindowAucs<'d> {
     }
 
     /// The AUCs of the first `n_realized - 1` windows, each reduced by the shared trapezoid
-    /// rule ([`crate::api::trapezoid`]; its stable sort keeps a break's `b⁻` before its
+    /// rule ([`crate::ode::predictions::trapezoid`]; its stable sort keeps a break's `b⁻` before its
     /// `a⁺`). After a `Stop` no decision is logged, so the realized decisions are a prefix
     /// of the schedule, and a window past the last realized decision is discontinuation,
     /// not exposure.
@@ -8038,7 +8061,7 @@ impl<'d> AdaptiveWindowAucs<'d> {
         self.points
             .iter()
             .take(n_realized.saturating_sub(1))
-            .map(|pts| crate::api::trapezoid(pts))
+            .map(|pts| crate::ode::predictions::trapezoid(pts))
             .collect()
     }
 }

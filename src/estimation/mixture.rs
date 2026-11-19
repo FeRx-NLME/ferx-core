@@ -2656,7 +2656,7 @@ mod tests {
 
     #[test]
     fn mixture_replacement_warning_covers_every_optimizer() {
-        use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+        use crate::estimation::outer_policy::resolve_outer_optimizer;
         use crate::types::Optimizer;
         const ALL_OPTIMIZERS: [Optimizer; 8] = [
             Optimizer::Auto,

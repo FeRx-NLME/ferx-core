@@ -5392,7 +5392,7 @@ fn the_envelope_gradient_is_the_profile_gradient_under_laplace() {
         assert_eq!(o.agq_nodes(), Some(1));
         assert_eq!(
             profile_gradient_is_analytic(&p.parsed.model),
-            crate::estimation::agq::analytic_score_supported(&p.parsed.model),
+            crate::estimation::gauss_hermite::analytic_score_supported(&p.parsed.model),
             "fd={fd}: one predicate"
         );
         assert_eq!(profile_gradient_is_analytic(&p.parsed.model), !fd);
@@ -5647,7 +5647,7 @@ fn the_envelope_gradient_is_the_profile_gradient_under_quadrature() {
             assert_agq3(name, &p, anchor);
             assert_eq!(
                 profile_gradient_is_analytic(&p.parsed.model),
-                crate::estimation::agq::analytic_score_supported(&p.parsed.model) && !fd,
+                crate::estimation::gauss_hermite::analytic_score_supported(&p.parsed.model) && !fd,
                 "{name} fd={fd}: one predicate"
             );
             envelope_matches_fd(arm, !fd);

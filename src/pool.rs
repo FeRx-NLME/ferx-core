@@ -149,7 +149,7 @@ use cache::{FitPoolLease, PoolCache, SharedPoolCache};
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct FitScope {
     pub(crate) ode: crate::ode::solver::OdeSolverOverride,
-    pub(crate) inner: crate::estimation::inner_optimizer::InnerSettings,
+    pub(crate) inner: crate::estimation::inner_settings::InnerSettings,
     /// Beside `inner` rather than inside it: it gates the outer gradient, the `auto` optimizer
     /// pick and the covariance R-matrix scope too, not only the EBE solve.
     pub(crate) fd: bool,

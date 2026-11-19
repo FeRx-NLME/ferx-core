@@ -270,7 +270,7 @@ fn the_iov_record_table_predicts_what_per_record_copies_predict() {
         .expect("bundled IOV data reads");
         for subject in &pop.subjects {
             let Some(schedule) =
-                crate::estimation::inner_optimizer::cacheable_schedule_iov(&model, subject)
+                crate::estimation::inner_settings::cacheable_schedule_iov(&model, subject)
             else {
                 continue;
             };

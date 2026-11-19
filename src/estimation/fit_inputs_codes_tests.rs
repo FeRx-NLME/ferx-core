@@ -152,7 +152,7 @@ fn assert_check_agrees(what: &str, model: &Path, data: Option<&Path>, e: &Engine
 /// taken from `read_population_with` would pass through `data_read_diagnostic`, the
 /// code under test, so a classifier that rewrote the message would agree with itself
 /// (review r1 #1).
-fn raw_read(model: &CompiledModel, settings: &crate::api::ReaderSettings, path: &Path) -> String {
+fn raw_read(model: &CompiledModel, settings: &crate::types::ReaderSettings, path: &Path) -> String {
     assert!(
         settings.ignore_exprs.is_empty()
             && settings.accept_exprs.is_empty()

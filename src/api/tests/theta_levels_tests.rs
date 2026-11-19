@@ -12897,7 +12897,7 @@ mod level_uncertainty {
     use crate::api::postfit::extract_standard_errors;
     use crate::api::{theta_level_values, ThetaLevelValue};
     use crate::estimation::parameterization::unpack_params;
-    use crate::estimation::sir::percentile_ci;
+    use crate::estimation::sir_settings::percentile_ci;
     use nalgebra::DMatrix;
 
     /// Rows past θ in every covariance below: the model's one Ω and one σ.

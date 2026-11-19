@@ -1139,7 +1139,10 @@ pub(crate) fn cov_fixed_mask(
     // SEs are not conditional on it, so it is not marked.
     for h in &fit.held_at_bound {
         if h.reason == crate::types::HeldReason::CollapsedAtGuard
-            && crate::api::step_held(fit.covariance_matrix.as_ref(), h.packed_index)
+            && crate::estimation::parameterization::step_held(
+                fit.covariance_matrix.as_ref(),
+                h.packed_index,
+            )
         {
             if let Some(m) = mask.get_mut(h.packed_index) {
                 *m = true;
@@ -2196,6 +2199,14 @@ pub(crate) fn chol_lt_idx(i: usize, j: usize, n: usize) -> usize {
 pub(crate) fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f64 {
     let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
     theta_packing_jacobian(theta, theta_lower) * se_packed
+}
+
+/// Whether the covariance step held packed coordinate `p` (#2797): it produced a matrix
+/// and `p`'s row is the zero row [`crate::estimation::covariance::condition_on_held`]
+/// embeds. Read only for a coordinate [`held_guard_coordinates`] lists: a free coordinate
+/// the step did not hold has the positive diagonal of a positive-definite inverse.
+pub(crate) fn step_held(cov: Option<&DMatrix<f64>>, p: usize) -> bool {
+    cov.is_some_and(|m| p < m.nrows() && m[(p, p)] == 0.0)
 }
 
 #[cfg(test)]

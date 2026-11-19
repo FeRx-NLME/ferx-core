@@ -244,7 +244,7 @@ fn both_forms(
     let model = crate::parser::model_parser::parse_model_string(src).expect("parse");
     let subject = censored_subject(cmts);
     let theta = model.default_params.theta.clone();
-    let rows_of = |rows: &[crate::api::SimulationResult]| {
+    let rows_of = |rows: &[crate::sim_result::SimulationResult]| {
         rows.iter()
             .map(|r| format!("{} {} {:?}", r.cmt, r.time.to_bits(), r.outcome))
             .collect::<Vec<_>>()

@@ -13,6 +13,8 @@
 //!   Bayes estimates (etas ≠ 0); more accurate under large IIV. Falls back to
 //!   `Sweep` for ODE models.
 
+pub use crate::types::NcaInit;
+
 mod nca;
 mod pooling;
 mod sweep;
@@ -42,22 +44,6 @@ pub struct SuggestedStart {
     pub params: ModelParameters,
     /// Per-theta (and per-omega) notes about what was and wasn't estimated.
     pub warnings: Vec<String>,
-}
-
-/// Which NCA-based starting-value strategy [`inits_from_nca`] should run.
-///
-/// User-facing names (fit option, CLI flag, R argument): `nca`, `nca_sweep`,
-/// `nca_ebe`. A boolean `true` maps to [`NcaInit::Sweep`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NcaInit {
-    /// Non-compartmental analysis arithmetic only (fastest).
-    Nca,
-    /// NCA, then an etas = 0 rRMSE grid sweep for parameters NCA can't estimate.
-    #[default]
-    Sweep,
-    /// NCA, then an EBE-based (etas ≠ 0) rRMSE grid sweep; falls back to
-    /// `Sweep` for ODE models.
-    Ebe,
 }
 
 /// Derive NCA-based starting values from the data, using the strategy selected

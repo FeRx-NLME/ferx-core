@@ -11,10 +11,109 @@ pub use crate::parser::model_parser::ThetaBlocks;
 
 // A child module, so its exhaustive destructure of `DoseEvent` can name the
 // private `cmt` field (#1685).
+pub(crate) mod estimates_json;
 mod population_fingerprint;
 pub(crate) use population_fingerprint::subject_list_difference;
 pub(crate) use population_fingerprint::Difference as PopulationDifference;
 pub use population_fingerprint::PopulationFingerprint;
+/// Which NCA-based starting-value strategy [`inits_from_nca`] should run.
+///
+/// User-facing names (fit option, CLI flag, R argument): `nca`, `nca_sweep`,
+/// `nca_ebe`. A boolean `true` maps to [`NcaInit::Sweep`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NcaInit {
+    /// Non-compartmental analysis arithmetic only (fastest).
+    Nca,
+    /// NCA, then an etas = 0 rRMSE grid sweep for parameters NCA can't estimate.
+    #[default]
+    Sweep,
+    /// NCA, then an EBE-based (etas ≠ 0) rRMSE grid sweep; falls back to
+    /// `Sweep` for ODE models.
+    Ebe,
+}
+
+/// Everything the dataset reader reads a file with besides the model's endpoint
+/// routing: the `[data]` column renames, the covariate declarations (or, without
+/// them, the explicit covariate columns), the IOV column and the `[data_selection]`
+/// clauses, the model file's merged with any a caller added (#1685).
+///
+/// A file entry point builds one, reads with it through [`read_population_with`],
+/// and records it on [`FitResult::reader_settings`], so the recorded settings are
+/// the ones the data were read with by construction. `run_sir`, `run_covariance`
+/// and `load_fit` re-read `fit.data_path` with them: a row filter the model file
+/// does not state (a `fit_from_files` option, `ferx_fit(settings = list(ignore =
+/// ...))` in R) is then applied again, where re-reading with the model file's
+/// settings dropped it.
+///
+/// Build one with [`ReaderSettings::from_parsed`] and adjust its fields; it is
+/// `#[non_exhaustive]`, so a struct literal outside ferx-core does not compile.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub struct ReaderSettings {
+    /// `[data]` renames, `(model name, CSV column)`.
+    #[serde(default)]
+    pub column_map: Vec<(String, String)>,
+    /// The `[covariates]` block. When `Some`, it decides which columns are read as
+    /// covariates and `fallback_columns` is not read.
+    #[serde(default)]
+    pub covariate_decls: Option<Vec<CovariateDecl>>,
+    /// Covariate columns for a model with no `[covariates]` block (the
+    /// `covariate_columns` argument of [`fit_from_files`](crate::fit_from_files));
+    /// `None` auto-detects.
+    #[serde(default)]
+    pub fallback_columns: Option<Vec<String>>,
+    /// The occasion column for an IOV model.
+    #[serde(default)]
+    pub iov_column: Option<String>,
+    /// `[data_selection] ignore` clauses, OR'd.
+    #[serde(default)]
+    pub ignore_exprs: Vec<String>,
+    /// `[data_selection] accept` clauses, AND'd.
+    #[serde(default)]
+    pub accept_exprs: Vec<String>,
+    /// `[data_selection] ignore_subjects`.
+    #[serde(default)]
+    pub ignore_subjects: Vec<String>,
+}
+
+impl ReaderSettings {
+    /// The settings a fit of the model file reads its data with: its `[data]`
+    /// renames, `[covariates]`, `[fit_options] iov_column` and `[data_selection]`.
+    pub fn from_parsed(parsed: &ParsedModel) -> Self {
+        ReaderSettings {
+            column_map: parsed.column_map.clone(),
+            covariate_decls: parsed.covariate_decls.clone(),
+            fallback_columns: None,
+            iov_column: parsed.fit_options.iov_column.clone(),
+            ignore_exprs: parsed.fit_options.ignore_exprs.clone(),
+            accept_exprs: parsed.fit_options.accept_exprs.clone(),
+            ignore_subjects: parsed.fit_options.ignore_subjects.clone(),
+        }
+    }
+}
+
+/// Whether `stage_idx` is the last *estimating* stage of `chain` — the single
+/// stage that owns the covariance / SIR step. Running it on every stage is
+/// wasteful and not expected (#615); only the final estimate needs SEs.
+///
+/// An evaluation-only IMP (`imp_eval_only`, NONMEM `IMP EONLY=1`) is a likelihood
+/// evaluation, not an estimator, so trailing eval-only IMP stages cede the
+/// covariance step to the preceding estimator. A default (estimating) IMP is a
+/// real estimator that owns the step itself, so it must not be skipped. Split out
+/// of `fit()` so the per-stage gating is unit-testable.
+pub(crate) fn is_last_estimating_stage(
+    chain: &[EstimationMethod], stage_idx: usize, eval_only: &[EstimationMethod],
+) -> bool {
+    let is_last = stage_idx + 1 == chain.len();
+    // Every remaining stage is a pure evaluator, so *this* one is the last that estimates.
+    // `eval_only` is the set of methods running in evaluation-only mode for this fit —
+    // `imp` under `imp_eval_only`, `laplace` under `agq_eval_only`. An empty slice means
+    // nothing is an evaluator, so only the literal last stage qualifies.
+    let trailing_all_eval_only = !chain[stage_idx + 1..].is_empty()
+        && chain[stage_idx + 1..].iter().all(|m| eval_only.contains(m));
+    is_last || trailing_all_eval_only
+}
+
 #[cfg(test)]
 pub(crate) use population_fingerprint::SCHEME as POPULATION_FINGERPRINT_SCHEME;
 
@@ -8866,7 +8965,7 @@ pub struct FitResult {
     /// `data_path` with these. `Some` when the fit was launched from a data file
     /// (`fit_from_files`, `prepare_run`, the CLI); `None` for an in-memory `fit()`.
     #[serde(default)]
-    pub reader_settings: Option<crate::api::ReaderSettings>,
+    pub reader_settings: Option<crate::types::ReaderSettings>,
     /// A fingerprint of the population `fit()` was given (#1685). Every post-hoc
     /// step refuses a population that does not match it. `None` on a hand-built
     /// result; a fingerprint from another encoding scheme is treated as absent, with a
@@ -9039,7 +9138,7 @@ pub struct FitResult {
     /// default is taken from here, so `run_sir` on this fit with default options
     /// repeats the reported SIR.
     #[serde(default)]
-    pub sir_settings: Option<crate::estimation::sir::SirSettings>,
+    pub sir_settings: Option<crate::estimation::sir_settings::SirSettings>,
     /// The inner-loop and ODE settings of the stage that produced the estimates (and ran
     /// the inline covariance step) (#426): on a `method = [..]` chain, the last stage that
     /// estimates, with its own `inner_tol` (a quadrature stage runs at 1e-8 or tighter)
@@ -9330,7 +9429,7 @@ impl FitResult {
             // `estimates.theta.CL.estimate` is the YAML's `theta.CL.estimate` — so a reader
             // of final estimates does not branch on which file it was handed. Derived, like
             // `status`: `from_json_str` ignores it and reads the vectors above.
-            map.insert("estimates".to_string(), crate::io::output::estimates_json(self));
+            map.insert("estimates".to_string(), estimates_json::estimates_json(self));
         }
         v
     }
@@ -9994,7 +10093,7 @@ pub struct FitOptions {
     /// exact-anchor path unbiased on strongly non-Gaussian integrands. The tensor grid costs
     /// `n_agq^n_eta` likelihood evaluations per subject per outer iteration, so raise it
     /// deliberately — odd values are conventional (they keep a node exactly at the mode).
-    /// Capped by [`crate::estimation::agq::MAX_AGQ_NODES`], with the *grid* additionally
+    /// Capped by [`crate::estimation::gauss_hermite::MAX_AGQ_NODES`], with the *grid* additionally
     /// capped by [`crate::estimation::agq::MAX_AGQ_GRID`].
     pub n_agq: usize,
 
@@ -10348,7 +10447,7 @@ pub struct FitOptions {
     /// optimisers (e.g. MMA).
     pub ebe_warm_start: bool,
     /// Run [`crate::suggest_start::inits_from_nca`] with this strategy before the optimizer.
-    pub inits_from_nca: Option<crate::suggest_start::NcaInit>,
+    pub inits_from_nca: Option<crate::types::NcaInit>,
     /// `[data_selection] ignore` / `ignore_subjects` expressions (`&&`-joined clauses); a
     /// record is excluded when any clause is true. Compiled to `FilterClause` at read time.
     pub ignore_exprs: Vec<String>,
@@ -11150,8 +11249,8 @@ pub(crate) fn interaction_for(method: EstimationMethod, inherited: bool) -> bool
 
 impl FitOptions {
     /// The inner-loop settings for this call's EBE solves (#426).
-    pub(crate) fn inner_settings(&self) -> crate::estimation::inner_optimizer::InnerSettings {
-        crate::estimation::inner_optimizer::InnerSettings {
+    pub(crate) fn inner_settings(&self) -> crate::estimation::inner_settings::InnerSettings {
+        crate::estimation::inner_settings::InnerSettings {
             mode: self.inner_optimizer,
             warm: self.ebe_warm_start,
         }
@@ -11202,7 +11301,7 @@ impl FitOptions {
     }
 
     /// The methods running as pure evaluators (`imp` under `imp_eval_only`, `laplace` under
-    /// `agq_eval_only`), chain-wide. Feeds [`crate::api::is_last_estimating_stage`].
+    /// `agq_eval_only`), chain-wide. Feeds [`crate::types::is_last_estimating_stage`].
     pub(crate) fn eval_only_methods(&self) -> Vec<EstimationMethod> {
         let mut v = Vec::new();
         if self.imp_eval_only {
@@ -11237,7 +11336,7 @@ impl FitOptions {
         let chain = self.method_chain();
         let eval_only = self.eval_only_methods();
         (0..chain.len())
-            .find(|&i| crate::api::is_last_estimating_stage(&chain, i, &eval_only))
+            .find(|&i| crate::types::is_last_estimating_stage(&chain, i, &eval_only))
             .map(|i| chain[i])
     }
 

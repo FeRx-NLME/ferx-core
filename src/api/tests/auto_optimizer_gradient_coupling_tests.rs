@@ -383,7 +383,7 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
         sigma_override_fixed: Vec::new(),
     });
     assert_eq!(
-        crate::estimation::outer_optimizer::resolve_outer_optimizer(
+        crate::estimation::outer_policy::resolve_outer_optimizer(
             Optimizer::Auto,
             &model,
             true,

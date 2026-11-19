@@ -196,7 +196,8 @@ pub fn fit_from_files(
     // caller's selection clauses merged in. The file's `[fit_options]` are ignored
     // here by design — its `iov_column` included, so none is read — but its
     // `[data_selection]` is not.
-    let mut reader_settings = ReaderSettings::from_parsed(&parsed).with_call_selection(&opts);
+    let mut reader_settings =
+        super::run::with_call_selection(ReaderSettings::from_parsed(&parsed), &opts);
     reader_settings.fallback_columns =
         covariate_columns.map(|c| c.iter().map(|s| s.to_string()).collect::<Vec<String>>());
     reader_settings.iov_column = None;
@@ -278,7 +279,7 @@ pub(crate) fn reported_optimizer_label(
         EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
         EstimationMethod::Imp => "imp-bobyqa".to_string(),
         _ => {
-            let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
+            let (resolved, _) = crate::estimation::outer_policy::resolve_outer_optimizer(
                 options.optimizer,
                 model,
                 has_mixture,
@@ -774,7 +775,7 @@ pub(crate) fn per_start_options(options: &FitOptions, k: usize) -> FitOptions {
 /// OFV is non-finite and therefore also invalid, so it can never block a finite
 /// valid candidate. See `estimation::outer_optimizer::ofv_is_valid`.
 pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: bool) -> bool {
-    let valid = crate::estimation::outer_optimizer::ofv_is_valid;
+    let valid = crate::estimation::outer_policy::ofv_is_valid;
     match (valid(b_ofv), valid(c_ofv)) {
         (false, true) => true,
         (true, false) => false,
@@ -1596,10 +1597,10 @@ fn saem_reported_objective(
             }
             // The model-file parser checks this range; a `FitOptions` built in code does not
             // pass through it, and `gauss_hermite` asserts it.
-            if !(2..=crate::estimation::agq::MAX_AGQ_NODES).contains(&n_nodes) {
+            if !(2..=crate::estimation::gauss_hermite::MAX_AGQ_NODES).contains(&n_nodes) {
                 return Err(format!(
                     "saem_ofv_nodes must be in 2..={}, got {n_nodes}",
-                    crate::estimation::agq::MAX_AGQ_NODES
+                    crate::estimation::gauss_hermite::MAX_AGQ_NODES
                 ));
             }
             // IOV stacks every occasion's κ into the grid (d = n_η + n_occ·n_κ), which the
@@ -3870,7 +3871,7 @@ fn fit_inner(
         outer_maxiter: options.outer_maxiter,
         outer_gtol: options.outer_gtol,
         inits_from_nca: options.inits_from_nca.map(|m| {
-            use crate::suggest_start::NcaInit;
+            use crate::types::NcaInit;
             match m {
                 NcaInit::Nca => "nca",
                 NcaInit::Sweep => "nca_sweep",

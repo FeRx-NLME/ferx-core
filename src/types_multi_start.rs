@@ -84,7 +84,7 @@ impl StartRecord {
     /// compared on its unpenalized OFV against the others' penalized values.
     fn ranked(&self, penalized: bool) -> Option<f64> {
         if penalized { self.objective } else { self.ofv }
-            .filter(|v| crate::estimation::outer_optimizer::ofv_is_valid(*v))
+            .filter(|v| crate::estimation::outer_policy::ofv_is_valid(*v))
     }
 
     fn ran(&self) -> bool {

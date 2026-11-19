@@ -417,12 +417,12 @@ impl OdeSolverOverride {
     /// reach a worker pool through the public Rust API.
     ///
     /// The domain is the one the `.fitrx` reader holds a recorded `ScoringSettings` to
-    /// (`fit_inputs::ode_tol_in_domain` and siblings), so a fit that runs records a bundle
+    /// (`population_check::ode_tol_in_domain` and siblings), so a fit that runs records a bundle
     /// that loads (#1770). `ode_stiff_abort_after = Some(0)` is refused with them: the
     /// parser reads `0` as "off", and a run on `Some(0)` would record a value no model
     /// file can spell.
     pub(crate) fn validate(&self) -> Result<(), String> {
-        use crate::estimation::fit_inputs::{
+        use crate::estimation::population_check::{
             ode_max_steps_in_domain, ode_stiff_abort_after_in_domain, ode_tol_in_domain,
         };
         let check = || {

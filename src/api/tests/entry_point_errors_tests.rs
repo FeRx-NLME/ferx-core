@@ -521,7 +521,7 @@ fn fit_carries_the_options_check_code() {
 fn fit_refuses_recorded_settings_outside_the_fit_options_domain() {
     let model = parse_model_string(ONE_CPT_IV).expect("parse");
     let pop = accepted_population();
-    let max = crate::estimation::agq::MAX_AGQ_NODES;
+    let max = crate::estimation::gauss_hermite::MAX_AGQ_NODES;
     let foce = |set: &dyn Fn(&mut FitOptions)| {
         let mut o = FitOptions { method: EstimationMethod::Foce, ..FitOptions::default() };
         set(&mut o);

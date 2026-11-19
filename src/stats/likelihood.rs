@@ -825,8 +825,7 @@ pub(crate) fn population_variance_preds_iov(
         model.n_kappa,
         subject,
     );
-    let schedule =
-        crate::estimation::inner_optimizer::cacheable_schedule_iov_cached(model, subject);
+    let schedule = crate::estimation::inner_settings::cacheable_schedule_iov_cached(model, subject);
     Some(pk::predict_iov_in(
         model,
         subject,
@@ -2932,8 +2931,7 @@ pub(crate) fn iov_linearization(
         &model_width
     };
     let mut scratch = pk::EventPkParams::default();
-    let schedule =
-        crate::estimation::inner_optimizer::cacheable_schedule_iov_cached(model, subject);
+    let schedule = crate::estimation::inner_settings::cacheable_schedule_iov_cached(model, subject);
     let mut predict = |k: &[Vec<f64>]| {
         pk::predict_iov_in(
             model,

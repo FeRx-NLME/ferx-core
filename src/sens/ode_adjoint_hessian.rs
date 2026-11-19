@@ -234,7 +234,7 @@ pub(crate) fn cov_non_gaussian_served(model: &CompiledModel, objective: Objectiv
         && match objective {
             Objective::Foce | Objective::Focei | Objective::Agq { .. } => true,
         }
-        && crate::estimation::inner_optimizer::non_gaussian_endpoints_served(model)
+        && crate::estimation::inner_settings::non_gaussian_endpoints_served(model)
 }
 
 /// The packed axes as pass directions, without an η tangent.

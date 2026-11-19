@@ -749,7 +749,7 @@ fn draw_asymptotic(
         if matches!(
             h.reason,
             crate::types::HeldReason::CollapsedAtGuard | crate::types::HeldReason::Unknown
-        ) && crate::api::step_held(Some(cov), h.packed_index)
+        ) && crate::estimation::parameterization::step_held(Some(cov), h.packed_index)
         {
             if let Some(f) = fixed_mask.get_mut(h.packed_index) {
                 *f = true;

@@ -1,45 +1,16 @@
 use crate::cold_sort::ColdSort;
 use crate::types::*;
 
+pub use crate::types::estimates_json::{compact_theta_blocks, THETA_BLOCK_COMPACT_MIN};
+pub(crate) use crate::types::estimates_json::{
+    cv_pct, eta_type, kappa_weight_facts, override_rows, param_corr_fallback, rse_pct, sd_from_var,
+    se_held, yaml_quote, OverrideSe,
+};
+
+pub(crate) use crate::types::estimates_json::se_cell;
+
 fn fixed_label(name: &str) -> String {
     format!("{} [FIX]", name)
-}
-
-/// Relative standard error as a percent: `|se / est| · 100`, or `NaN` when the
-/// estimate is ~0 (guards the divide-by-zero for a parameter pinned at 0).
-fn rse_pct(est: f64, se: f64) -> f64 {
-    if est.abs() > 1e-12 {
-        (se / est.abs()) * 100.0
-    } else {
-        f64::NAN
-    }
-}
-
-/// The `SE = …` text of a console row: the SE to six decimals, or `N/A` when
-/// there is none or it is not finite (#2225) — a `NaN` entry in an otherwise
-/// present `se_*` vector prints the same as a missing one, not `NaN`/`inf`.
-fn se_cell(se: Option<f64>) -> String {
-    match se.filter(|s| s.is_finite()) {
-        Some(s) => format!("{:.6}", s),
-        None => "N/A".to_string(),
-    }
-}
-
-/// Why parameter `i` of family `kind` has no standard error (#2797), or `None`: it is
-/// in `FitResult::held_at_bound` (a profiled level on its bound, #2112, or a coordinate
-/// collapsed on the internal guard). The one predicate every renderer reads. A
-/// hand-built result setting only the deprecated `profiled_levels_at_bound` is honoured.
-pub(crate) fn se_held(result: &FitResult, kind: ParameterKind, i: usize) -> Option<HeldReason> {
-    result
-        .held_at_bound
-        .iter()
-        // A `[mixture]` override's `(kind, index)` names its base parameter (#2809).
-        .find(|h| h.class.is_none() && h.kind == kind && h.index == i)
-        .map(|h| h.reason)
-        .or_else(|| {
-            (kind == ParameterKind::Theta && result.profiled_levels_at_bound.contains(&i))
-                .then_some(HeldReason::ProfiledBound)
-        })
 }
 
 /// Whether θ `i` is held ([`se_held`]).
@@ -69,18 +40,6 @@ fn theta_se_cells(est: f64, se: Option<f64>) -> (String, String) {
     }
 }
 
-/// The CV% of `P = TV · exp(η)`, `η ~ N(0, var)`: `sqrt(exp(var) − 1) · 100` exactly
-/// (#1858), `0` for a non-positive variance. Not the first-order `sqrt(var) · 100`
-/// (0.2: 44.7 vs 47.1; 2.37: 154 vs 311). `exp_m1` keeps a tiny variance's digits;
-/// above `var ≈ 709.78` this is `+∞` (YAML: [`yaml_cv_pct`]).
-fn cv_pct(var: f64) -> f64 {
-    if var > 0.0 {
-        var.exp_m1().sqrt() * 100.0
-    } else {
-        0.0
-    }
-}
-
 /// Above this a console CV% switches from `{:.1}` to scientific notation (#1883):
 /// `{:.1}` printed a 36-digit CV% for a variance near 156.
 const CV_PCT_FIXED_MAX: f64 = 1e6;
@@ -93,17 +52,6 @@ fn console_cv_pct(cv: f64) -> String {
         format!("{:.2e}", cv)
     } else {
         format!("{:.1}", cv)
-    }
-}
-
-/// A CV% as a YAML scalar: `{:.2}` when finite, else `.inf` — YAML's own
-/// spelling of infinity, which a numeric reader parses as a float. Rust's
-/// `inf` would be read back as a string.
-fn yaml_cv_pct(cv: f64) -> String {
-    if cv.is_finite() {
-        format!("{:.2}", cv)
-    } else {
-        ".inf".to_string()
     }
 }
 
@@ -168,15 +116,6 @@ pub(crate) fn status_line(result: &FitResult) -> String {
     }
 }
 
-/// SD from a variance: `sqrt(var)`, or `0` for a non-positive variance.
-fn sd_from_var(var: f64) -> f64 {
-    if var > 0.0 {
-        var.sqrt()
-    } else {
-        0.0
-    }
-}
-
 /// The console note for a random-effect variance on its scale (#1643): CV% for
 /// log-normal, SD for additive and logit, nothing for custom; `None` type
 /// (unknown, e.g. a pre-#1643 `.fitrx`) keeps the log-normal CV%. `weighted`
@@ -206,30 +145,22 @@ fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
 }
 
 /// The YAML line for a random-effect variance on its scale (#1643), rendered from
-/// [`estimates::spread_field`]: `cv_pct` (log-normal / unknown), `sd` (additive,
+/// [`crate::types::estimates_json::spread_field`]: `cv_pct` (log-normal / unknown), `sd` (additive,
 /// logit), nothing for custom. For a weighted kappa it is the weight-1 figure
 /// (#1666); see [`typical_cv_yaml_line`] for the typical arm (#1858).
 #[cfg(test)]
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
-    estimates::spread_field(t, var).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
+    crate::types::estimates_json::spread_field(t, var)
+        .map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
 /// A weighted kappa's `cv_pct_at_typical_weight` YAML line (`cv_pct(var / n)`) for
 /// log-normal and unknown types, else `None`. Rendered from
-/// [`estimates::typical_cv_field`].
+/// [`crate::types::estimates_json::typical_cv_field`].
 #[cfg(test)]
 fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> {
-    estimates::typical_cv_field(t, var_at).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
-}
-
-/// The type of the ETA called `name`, looked up **by name** in `eta_param_info`
-/// (statement order, one entry per use): all agree → that type; disagreement →
-/// `Custom`; none → `None`.
-fn eta_type(result: &FitResult, name: &str) -> Option<EtaParamType> {
-    let mut types =
-        result.eta_param_info.iter().filter(|i| i.eta_name == name).map(|i| i.param_type);
-    let first = types.next()?;
-    Some(if types.all(|t| t == first) { first } else { EtaParamType::Custom })
+    crate::types::estimates_json::typical_cv_field(t, var_at)
+        .map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
 /// `"  (note)"` for a row, or `""` when there is nothing to say or the
@@ -502,86 +433,6 @@ fn format_sigma_rows(result: &FitResult) -> String {
     out
 }
 
-/// Why `[mixture]` override `o` has no SE (#2833), or `None`: a
-/// [`FitResult::held_at_bound`] entry of **its** class, family and base index.
-pub(crate) fn override_held(result: &FitResult, o: &MixtureOverrideParam) -> Option<HeldReason> {
-    result
-        .held_at_bound
-        .iter()
-        .find(|h| h.class == Some(o.class) && h.kind == o.kind && h.index == o.index)
-        .map(|h| h.reason)
-}
-
-/// The SE state of one override row, in render precedence (#2833).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum OverrideSe {
-    /// In `held_at_bound`: `N/A` (console, table), `se: ~` + `held:` (YAML).
-    Held(HeldReason),
-    /// Fixed by the model or held at its initial value by the estimator: `---`.
-    Fixed,
-    /// Free: its SE, or `None` when the covariance step produced none.
-    Free(Option<f64>),
-}
-
-/// One `[mixture]` per-class override as every renderer shows it (#2833).
-struct OverrideRow<'a> {
-    param: &'a MixtureOverrideParam,
-    /// The fitted value: a class variance (Ω) or σ (Σ), as `mixture_overrides` reports it.
-    value: f64,
-    se: OverrideSe,
-}
-
-impl OverrideRow<'_> {
-    /// The base parameter's name, e.g. `ETA_CL` for `ETA_CL_MIX2`.
-    fn base_name<'r>(&self, result: &'r FitResult) -> &'r str {
-        let names = match self.param.kind {
-            ParameterKind::Omega => &result.eta_names,
-            _ => &result.sigma_names,
-        };
-        names.get(self.param.index).map_or("", String::as_str)
-    }
-
-    /// `---` / `N/A` / the SE, for the console.
-    fn se_text(&self) -> String {
-        match self.se {
-            OverrideSe::Held(_) => "N/A".to_string(),
-            OverrideSe::Fixed => "---".to_string(),
-            OverrideSe::Free(se) => se_cell(se),
-        }
-    }
-}
-
-/// The override rows of `result` (#2833), in `mixture_overrides` order; empty
-/// without one descriptor per value (such a row cannot be named).
-fn override_rows(result: &FitResult) -> Vec<OverrideRow<'_>> {
-    let Some(values) = result.mixture_overrides.as_deref() else {
-        return Vec::new();
-    };
-    if result.mixture_override_params.len() != values.len() {
-        return Vec::new();
-    }
-    result
-        .mixture_override_params
-        .iter()
-        .zip(values)
-        .enumerate()
-        .map(|(k, (param, &value))| {
-            // Held first: a held override is never also fixed (the guard hold is not in
-            // the model's FIX mask), so the order matters only for a hand-built result.
-            let se = if let Some(reason) = override_held(result, param) {
-                OverrideSe::Held(reason)
-            } else if param.fixed {
-                OverrideSe::Fixed
-            } else {
-                OverrideSe::Free(
-                    result.se_mixture_overrides.as_ref().and_then(|v| v.get(k).copied()),
-                )
-            };
-            OverrideRow { param, value, se }
-        })
-        .collect()
-}
-
 /// The `--- Mixture per-class overrides ---` section (#2833), or `""`. Rows read
 /// like OMEGA / SIGMA rows; `SE = ---` when fixed, `SE = N/A` when held.
 fn format_mixture_override_rows(result: &FitResult) -> String {
@@ -616,20 +467,6 @@ fn format_mixture_override_rows(result: &FitResult) -> String {
         };
     }
     out
-}
-
-/// A weighted kappa's (#1031) weight source and, with a typical weight `n > 0` and
-/// non-negative variance, `(n, var / n)`. `None` when unweighted. Shared by the
-/// console weight line and the YAML `weight*` keys (#1660).
-fn kappa_weight_facts<'a>(
-    weights: &'a [Option<String>], weight_typical: &[Option<f64>], i: usize, var: f64,
-) -> Option<(&'a str, Option<(f64, f64)>)> {
-    let w = weights.get(i).and_then(|w| w.as_deref())?;
-    let typical = match weight_typical.get(i).copied().flatten() {
-        Some(n) if n > 0.0 && var >= 0.0 => Some((n, var / n)),
-        _ => None,
-    };
-    Some((w, typical))
 }
 
 /// The facts a `--- KAPPA (IOV) Estimates ---` row reads, from a [`FitResult`]
@@ -939,21 +776,6 @@ fn format_kappa_corr_rows(result: &FitResult) -> String {
     out
 }
 
-/// Parameter correlation for the off-diagonal `(i, j)`: prefer the precomputed
-/// `param_corr` matrix entry when present, else fall back to
-/// `cov / (sqrt(var_i) · sqrt(var_j))` (0 when either variance is non-positive).
-fn param_corr_fallback(
-    m: Option<&nalgebra::DMatrix<f64>>, cov: f64, var_i: f64, var_j: f64, i: usize, j: usize,
-) -> f64 {
-    m.map(|m| m[(i, j)]).unwrap_or_else(|| {
-        if var_i > 0.0 && var_j > 0.0 {
-            cov / (var_i.sqrt() * var_j.sqrt())
-        } else {
-            0.0
-        }
-    })
-}
-
 /// Summary statistics over an NN's flat weight vector for the compact
 /// Comma-separated `{:.6}` rendering of a float vector, for the
 /// `center:` / `scale:` lines of the `neural_networks:` YAML block.
@@ -986,38 +808,6 @@ fn weight_summary(w: &[f64]) -> (f64, f64, f64, f64) {
     let mean = sum / n;
     let var = w.iter().map(|&v| (v - mean) * (v - mean)).sum::<f64>() / n;
     (mn, mx, mean, var.sqrt())
-}
-
-/// Number of coefficients at or above which a θ vector or level block (#1064) is
-/// reported in its own compact section. Counts the block's θ in `theta_names`
-/// (`FIX` included, #1891), not its levels: a 21-level `sum_to_zero` block (20 θ)
-/// is compacted. Use [`compact_theta_blocks`] rather than this constant (#1623).
-pub const THETA_BLOCK_COMPACT_MIN: usize = 20;
-
-/// The θ index ranges of the vector / level blocks in `names` with
-/// [`THETA_BLOCK_COMPACT_MIN`] or more coefficients. Blocks are runs of
-/// `NAME[…]` names (a scalar θ name never contains a bracket); levels are
-/// contiguous by construction.
-pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<usize>)> {
-    let block_of = |n: &String| -> Option<String> {
-        n.strip_suffix(']').and_then(|r| r.split_once('[')).map(|(b, _)| b.to_string())
-    };
-    let mut out: Vec<(String, std::ops::Range<usize>)> = Vec::new();
-    let mut i = 0;
-    while i < names.len() {
-        let Some(block) = block_of(&names[i]) else {
-            i += 1;
-            continue;
-        };
-        let start = i;
-        while i < names.len() && block_of(&names[i]).as_deref() == Some(block.as_str()) {
-            i += 1;
-        }
-        if i - start >= THETA_BLOCK_COMPACT_MIN {
-            out.push((block, start..i));
-        }
-    }
-    out
 }
 
 /// `(min, median, max)` of a block's values, as every writer prints for a block
@@ -1298,7 +1088,7 @@ fn standard_error_source_note(result: &FitResult) -> Option<String> {
 
 /// The console line naming the settings a SIR block was produced under
 /// (#1758): scale, degrees of freedom, draw counts and seed.
-fn sir_settings_line(st: &crate::estimation::sir::SirSettings) -> String {
+fn sir_settings_line(st: &crate::estimation::sir_settings::SirSettings) -> String {
     format!(
         "Settings: scale {}, df {}, {} samples / {} resamples, seed {}",
         st.scale.label(),
@@ -2540,18 +2330,6 @@ fn fmt_cov_entry(v: f64) -> String {
     s
 }
 
-/// Quote and escape a free-form string for embedding as a YAML double-quoted
-/// scalar. Used for values sourced from the OS/environment (e.g.
-/// `environment.username`) that aren't under ferx's control and may contain
-/// YAML-significant characters — `:`/`#` are harmless once quoted, but a
-/// literal newline or backslash/quote would otherwise corrupt the line or
-/// (for a raw newline) get silently folded away by YAML's line-folding rules.
-fn yaml_quote(s: &str) -> String {
-    let escaped =
-        s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r");
-    format!("\"{escaped}\"")
-}
-
 /// Whether the fit's Ω and κ blocks are packed as diagonals or full Cholesky
 /// lower triangles, as `(omega_diagonal, kappa_diagonal)`.
 ///
@@ -2964,21 +2742,27 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // nuisance, so a large block is emitted below as a compact coefficient list
     // under `theta_blocks:` rather than as top-level keys.
     // The per-θ listing skips those, and `[covariate_nn]` weights, which go to a compact
-    // `neural_networks:` block (`estimates::listed_theta_indices`).
+    // `neural_networks:` block (`crate::types::estimates_json::listed_theta_indices`).
     let theta_blocks = compact_theta_blocks(&result.theta_names);
 
-    write!(f, "{}", estimates::theta_section(result).yaml()).map_err(|e| e.to_string())?;
+    write!(f, "{}", crate::types::estimates_json::theta_section(result).yaml())
+        .map_err(|e| e.to_string())?;
 
     // #1065: every profiled block, compacted below or not.
     if !result.profiled_blocks.is_empty() {
-        writeln!(f, "\nprofiled_blocks: {}", estimates::yaml_flow_names(&result.profiled_blocks))
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            f,
+            "\nprofiled_blocks: {}",
+            crate::types::estimates_json::yaml_flow_names(&result.profiled_blocks)
+        )
+        .map_err(|e| e.to_string())?;
     }
     if !theta_blocks.is_empty() {
         writeln!(f, "\ntheta_blocks:").map_err(|e| e.to_string())?;
         for (block, range) in &theta_blocks {
             let s = theta_block_summary(result, range.clone());
-            writeln!(f, "  {}:", estimates::yaml_name(block, false)).map_err(|e| e.to_string())?;
+            writeln!(f, "  {}:", crate::types::estimates_json::yaml_name(block, false))
+                .map_err(|e| e.to_string())?;
             writeln!(f, "    n_free_coefficients: {}", s.n_free).map_err(|e| e.to_string())?;
             writeln!(f, "    n_fixed_coefficients: {}", s.n_fixed).map_err(|e| e.to_string())?;
             if result.profiled_blocks.contains(block) {
@@ -3052,7 +2836,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if !result.neural_networks.is_empty() {
         writeln!(f, "\nneural_networks:").map_err(|e| e.to_string())?;
         for nn in &result.neural_networks {
-            let key = estimates::yaml_name(&nn.name, false);
+            let key = crate::types::estimates_json::yaml_name(&nn.name, false);
             writeln!(f, "  {key}:").map_err(|e| e.to_string())?;
             writeln!(
                 f,
@@ -3064,9 +2848,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                 .map_err(|e| e.to_string())?;
             writeln!(f, "    output_activation: {}", nn.output_activation)
                 .map_err(|e| e.to_string())?;
-            let inputs = estimates::yaml_flow_names(&nn.input_names);
+            let inputs = crate::types::estimates_json::yaml_flow_names(&nn.input_names);
             writeln!(f, "    inputs: {inputs}").map_err(|e| e.to_string())?;
-            let outputs = estimates::yaml_flow_names(&nn.output_names);
+            let outputs = crate::types::estimates_json::yaml_flow_names(&nn.output_names);
             writeln!(f, "    outputs: {outputs}").map_err(|e| e.to_string())?;
             writeln!(f, "    n_weights: {}", nn.n_weights).map_err(|e| e.to_string())?;
             // Emitted only when the model actually normalises, so a plain network's
@@ -3148,19 +2932,22 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     }
 
     // #2911: the estimate sections, built once and shared with `fit.json`'s `estimates`.
-    write!(f, "{}", estimates::omega_section(result).yaml()).map_err(|e| e.to_string())?;
-    write!(f, "{}", estimates::sigma_section(result).yaml()).map_err(|e| e.to_string())?;
-    if let Some(s) = estimates::block_sigma_section(result)? {
+    write!(f, "{}", crate::types::estimates_json::omega_section(result).yaml())
+        .map_err(|e| e.to_string())?;
+    write!(f, "{}", crate::types::estimates_json::sigma_section(result).yaml())
+        .map_err(|e| e.to_string())?;
+    if let Some(s) = crate::types::estimates_json::block_sigma_section(result)? {
         write!(f, "{}", s.yaml()).map_err(|e| e.to_string())?;
     }
-    if let Some(s) = estimates::omega_iov_section(result) {
+    if let Some(s) = crate::types::estimates_json::omega_iov_section(result) {
         write!(f, "{}", s.yaml()).map_err(|e| e.to_string())?;
     }
-    if let Some(s) = estimates::mixture_overrides_section(result) {
+    if let Some(s) = crate::types::estimates_json::mixture_overrides_section(result) {
         write!(f, "{}", s.yaml()).map_err(|e| e.to_string())?;
     }
     // The same sections under `estimates:`, the path `fit.json` uses too (#2911).
-    write!(f, "{}", estimates::estimates_yaml(result)?).map_err(|e| e.to_string())?;
+    write!(f, "{}", crate::types::estimates_json::estimates_yaml(result)?)
+        .map_err(|e| e.to_string())?;
 
     // Importance-sampling marginal log-likelihood section
     if let Some(ref imp) = result.importance_sampling {
@@ -3271,7 +3058,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         // posterior variance (see docs/estimation/vi.qmd). It is for individual-level
         // reporting and shrinkage, not a route to population standard errors.
         if !v.eta_means.is_empty() {
-            let eta_names = estimates::yaml_flow_names(&result.eta_names);
+            let eta_names = crate::types::estimates_json::yaml_flow_names(&result.eta_names);
             writeln!(f, "  eta_names: {eta_names}").map_err(|e| e.to_string())?;
             writeln!(f, "  eta_posterior:").map_err(|e| e.to_string())?;
             for (i, mean) in v.eta_means.iter().enumerate() {
@@ -3329,7 +3116,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  ci_theta:").map_err(|e| e.to_string())?;
             for (i, name) in result.theta_names.iter().enumerate() {
                 if i < ci.len() {
-                    let key = estimates::yaml_name(name, false);
+                    let key = crate::types::estimates_json::yaml_name(name, false);
                     writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                     writeln!(f, "      lower: {:.6}", ci[i].0).map_err(|e| e.to_string())?;
                     writeln!(f, "      upper: {:.6}", ci[i].1).map_err(|e| e.to_string())?;
@@ -3344,7 +3131,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("omega_{}_{}", i + 1, i + 1));
-                let key = estimates::yaml_name(&key, false);
+                let key = crate::types::estimates_json::yaml_name(&key, false);
                 writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
@@ -3358,7 +3145,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(i)
                     .cloned()
                     .unwrap_or_else(|| format!("sigma_{}", i + 1));
-                let key = estimates::yaml_name(&key, false);
+                let key = crate::types::estimates_json::yaml_name(&key, false);
                 writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
@@ -3372,7 +3159,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     .get(k)
                     .cloned()
                     .unwrap_or_else(|| format!("kappa_{}", k + 1));
-                let key = estimates::yaml_name(&key, false);
+                let key = crate::types::estimates_json::yaml_name(&key, false);
                 writeln!(f, "    {key}:").map_err(|e| e.to_string())?;
                 writeln!(f, "      lower: {:.6}", lo).map_err(|e| e.to_string())?;
                 writeln!(f, "      upper: {:.6}", hi).map_err(|e| e.to_string())?;
@@ -3428,12 +3215,12 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
             writeln!(f, "  estimator: {} # {}", m.label(), m.formula())
                 .map_err(|e| e.to_string())?;
         }
-        let params = estimates::yaml_flow_names(&names);
+        let params = crate::types::estimates_json::yaml_flow_names(&names);
         writeln!(f, "  parameters: {params}").map_err(|e| e.to_string())?;
         writeln!(f, "  rows:").map_err(|e| e.to_string())?;
         for i in 0..n {
             let row: Vec<String> = (0..n).map(|j| fmt_cov_entry(cov[(i, j)])).collect();
-            let key = estimates::yaml_name(&names[i], false);
+            let key = crate::types::estimates_json::yaml_name(&names[i], false);
             writeln!(f, "    {key}: [{}]", row.join(", ")).map_err(|e| e.to_string())?;
         }
     }
@@ -4727,7 +4514,7 @@ mod tests {
     /// all distinct, so the strings differ).
     #[test]
     fn sir_block_reports_the_settings_it_ran_under() {
-        let st = crate::estimation::sir::SirSettings {
+        let st = crate::estimation::sir_settings::SirSettings {
             samples: 200,
             resamples: 100,
             seed: 7,
@@ -9177,6 +8964,10 @@ pub(crate) fn top_level_yaml(yaml: &str) -> String {
     out
 }
 
-#[path = "output_estimates.rs"]
-mod estimates;
-pub(crate) use estimates::{estimates_json, listed_theta_indices};
+pub(crate) use crate::types::estimates_json::listed_theta_indices;
+
+#[cfg(test)]
+use crate::types::estimates_json::{yaml_flow_name, yaml_flow_names, yaml_name};
+#[cfg(test)]
+#[path = "output_estimates_tests.rs"]
+mod estimates_tests;

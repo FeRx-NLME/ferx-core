@@ -297,7 +297,7 @@ fn dtmm_routes_to_the_analytic_inner_gradient() {
         let model = parse_model_string(&src).expect("parse");
         assert!(model.has_dtmm() && model.has_discrete() && !model.has_ctmm());
         assert!(all_dtmm_endpoints_analytic(&model));
-        assert!(crate::estimation::inner_optimizer::analytic_inner_grad_supported_model(&model));
+        assert!(crate::estimation::inner_settings::analytic_inner_grad_supported_model(&model));
     }
 }
 

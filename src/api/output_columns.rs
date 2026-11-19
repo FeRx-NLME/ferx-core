@@ -1,9 +1,10 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::cold_sort::ColdSort;
 use nalgebra::DVector;
 use std::collections::HashMap;
+
+pub(crate) use crate::ode::predictions::trapezoid;
 
 /// Time after the most recent **absorbed** dose at time `t` (SS-aware), shifting
 /// each dose by its own lag from `dose_lagtimes`. Missing entries — a slice
@@ -54,28 +55,6 @@ pub fn tafd_tad_for_subject(
     let tafd = if first_dose_time.is_finite() { obs_time - first_dose_time } else { f64::NAN };
     let tad = tad_at_time(subject, obs_time, dose_lagtimes);
     (tafd, tad)
-}
-
-/// Trapezoid integration over (time, value) pairs.
-/// Observation times are not guaranteed to be sorted (preserved in input row
-/// order), so sort by time before integrating to prevent negative dt windows.
-///
-/// `pub(crate)` so the reactive driver's window AUC (`auc_target_attainment`, #391
-/// S2.5b, #943) shares this one implementation rather than carrying a second copy of
-/// the rule. The sort is stable, so two nodes at one time — the value a break found and
-/// the value it left — keep their order and form a zero-width panel.
-pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
-    if points.len() < 2 {
-        return f64::NAN;
-    }
-    let mut sorted = points.to_vec();
-    sorted.cold_sort_by(&|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    let mut auc = 0.0;
-    for w in sorted.windows(2) {
-        let dt = w[1].0 - w[0].0;
-        auc += dt * (w[0].1 + w[1].1) * 0.5;
-    }
-    auc
 }
 
 /// Compute all [derived] and [output] columns post-fit, storing results in

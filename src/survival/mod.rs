@@ -1117,20 +1117,21 @@ fn rtte_cause(
 fn simulate_rtte_stream<R: rand::Rng>(
     family: HazardFamily, params: &[f64], clock: RtteClock, horizon: f64, entry: f64, cmt: usize,
     id: &str, draw: usize, sim: usize, rng: &mut R,
-    results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
+    results: &mut Vec<crate::sim_result::SimulationResult>, warnings: &mut Vec<String>,
 ) {
-    let push = |time: f64, observed: bool, results: &mut Vec<crate::api::SimulationResult>| {
-        results.push(crate::api::SimulationResult {
-            draw,
-            sim,
-            id: id.to_string(),
-            time,
-            cmt,
-            ipred: f64::NAN,
-            outcome: SimOutcome::Event { time, observed },
-            mixnum: None, // stamped by the caller that holds the class (#2372)
-        });
-    };
+    let push =
+        |time: f64, observed: bool, results: &mut Vec<crate::sim_result::SimulationResult>| {
+            results.push(crate::sim_result::SimulationResult {
+                draw,
+                sim,
+                id: id.to_string(),
+                time,
+                cmt,
+                ipred: f64::NAN,
+                outcome: SimOutcome::Event { time, observed },
+                mixnum: None, // stamped by the caller that holds the class (#2372)
+            });
+        };
 
     // Backstop against a degenerate hazard whose inter-event gaps vanish.
     const MAX_EVENTS: usize = 1_000_000;
@@ -1227,7 +1228,7 @@ fn simulate_rtte_stream<R: rand::Rng>(
 pub(crate) fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
     eta: &[f64], draw: usize, sim: usize, horizon: Option<f64>, rng: &mut R,
-    results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
+    results: &mut Vec<crate::sim_result::SimulationResult>, warnings: &mut Vec<String>,
 ) {
     let mut degenerate = Vec::new();
     simulate_tte_reporting(
@@ -1255,7 +1256,7 @@ pub(crate) fn simulate_tte<R: rand::Rng>(
 pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
     model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
     eta: &[f64], draw: usize, sim: usize, horizon: Option<f64>, rng: &mut R,
-    results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
+    results: &mut Vec<crate::sim_result::SimulationResult>, warnings: &mut Vec<String>,
     degenerate: &mut Vec<usize>,
 ) {
     // RTTE subjects are one recurrent stream, routed first so the single / competing path
@@ -1312,7 +1313,7 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
     }
 
     let push = |cmt: usize, time: f64, observed: bool, results: &mut Vec<_>| {
-        results.push(crate::api::SimulationResult {
+        results.push(crate::sim_result::SimulationResult {
             draw,
             sim,
             id: subject.id.clone(),

@@ -254,7 +254,8 @@ fn draw_count<R: rand::Rng>(lambda: f64, size: Option<f64>, rng: &mut R) -> Opti
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_count<R: rand::Rng>(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize,
-    rng: &mut R, results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
+    rng: &mut R, results: &mut Vec<crate::sim_result::SimulationResult>,
+    warnings: &mut Vec<String>,
 ) {
     if subject.obs_records.is_empty() {
         return;
@@ -270,7 +271,7 @@ pub fn simulate_count<R: rand::Rng>(
                 n_skipped += 1;
                 return;
             };
-            results.push(crate::api::SimulationResult {
+            results.push(crate::sim_result::SimulationResult {
                 draw,
                 sim,
                 id: subject.id.clone(),

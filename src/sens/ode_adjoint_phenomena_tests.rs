@@ -2085,7 +2085,7 @@ fn analytic_terminal_work_routes_as_documented() {
     let s = subject(&m, doses, &[1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0], &[0.1, -0.05]);
     let p = m.default_params.clone();
     let eta = probe_eta(m.n_eta);
-    assert!(crate::estimation::agq::analytic_score_supported(&m));
+    assert!(crate::estimation::gauss_hermite::analytic_score_supported(&m));
     let (jac, h) = analytic_terminal_work(&m, &s, &p, &eta).expect("served");
     let direct = exact_eta_jacobian(&m, &s, &p.theta, &eta).unwrap();
     assert_eq!(jac.shape(), direct.shape());
