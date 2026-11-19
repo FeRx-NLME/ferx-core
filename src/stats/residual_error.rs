@@ -1184,18 +1184,24 @@ pub(crate) fn residual_rd2_corr(
 /// any residual-magnitude parameters), and `σ`, the `block_sigma` ρ's (`rho(k)` for
 /// correlation `k`) and the serial ρ are generic too, so on the adjoint's tape `R`
 /// carries exact derivatives in `f` and in every residual parameter.
+///
+/// It also returns `R`'s coupling blocks ([`RBlocks`]): the connected components of the
+/// pairs it wrote, read from the same pair lists, so an entry between two blocks is the
+/// structural zero `T::from_f64(0.0)` it was initialised to. A factorisation that skips
+/// those entries does the same arithmetic on every nonzero one (#3060).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
     loadings: impl Fn(usize) -> Vec<(usize, T)>, n: usize, subject: &Subject, sigma: &[T],
     cov: ResidualCov<'_>, rho: impl Fn(usize) -> T, serial_rho: Option<T>,
-) -> Vec<Vec<T>> {
+) -> (Vec<Vec<T>>, RBlocks) {
     let lt: Vec<Vec<(usize, T)>> = (0..n).map(&loadings).collect();
     let mut r = vec![vec![T::from_f64(0.0); n]; n];
     for j in 0..n {
         r[j][j] = loadings_variance_g(&lt[j], sigma, cov.pairs, &rho);
     }
+    let mut blocks = RBlocks::singletons(n);
     if !cov.is_dense() {
-        return r;
+        return (r, blocks);
     }
     // The pairing reads the loadings' slots only (the value covariance it also returns is
     // recomputed below on `T`): no value of a generic number is read.
@@ -1214,6 +1220,7 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
         let c = cross_observation_covariance(&lt[j], &lt[k], sigma, cov.pairs, &rho);
         r[j][k] = c;
         r[k][j] = c;
+        blocks.join(j, k);
     }
     if let (Some(serial), Some(rho_t)) = (cov.serial, serial_rho) {
         match serial_pairs_shape(
@@ -1230,6 +1237,7 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
                     let v = shape.coefficient(rho_t) * same_slot_covariance(&lt[j], &lt[k], sigma);
                     r[j][k] = r[j][k] + v;
                     r[k][j] = r[k][j] + v;
+                    blocks.join(j, k);
                 }
             }
             None => {
@@ -1238,10 +1246,99 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
                         *x = T::from_f64(f64::NAN);
                     }
                 }
+                // Every entry is written: one block.
+                blocks = RBlocks::one(n);
             }
         }
     }
-    r
+    (r, blocks.finish())
+}
+
+/// The coupling blocks of a residual covariance `R` ([`r_matrix_g`]): rows in different
+/// blocks have a structural zero between them, so `R` is block diagonal up to a permutation
+/// and its Cholesky factor, inverse and every `R⁻¹·X` with `X` sharing the pattern are too.
+/// A model whose correlation couples pairs of observations (`correlation cs(RHO) by PAIR`,
+/// a `block_sigma` pair at one time) has `n/2` blocks of 2 where the dense factorisation does
+/// `n³/6` work and the solves behind `∂R` another `n³` per random effect (#3060).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RBlocks {
+    /// Per row, its block's representative (a union–find parent until [`Self::finish`], then
+    /// the block's smallest row).
+    of: Vec<usize>,
+    /// Per representative, the rows of its block in ascending order (after
+    /// [`Self::finish`]; empty for a row that represents no block).
+    rows: Vec<Vec<usize>>,
+}
+
+impl RBlocks {
+    /// Every row its own block (a diagonal `R`).
+    pub(crate) fn singletons(n: usize) -> Self {
+        RBlocks { of: (0..n).collect(), rows: Vec::new() }.finish()
+    }
+
+    /// One block of every row (a dense `R`).
+    pub(crate) fn one(n: usize) -> Self {
+        RBlocks { of: vec![0; n], rows: Vec::new() }.finish()
+    }
+
+    fn root(&mut self, mut j: usize) -> usize {
+        while self.of[j] != j {
+            self.of[j] = self.of[self.of[j]];
+            j = self.of[j];
+        }
+        j
+    }
+
+    fn join(&mut self, j: usize, k: usize) {
+        let (a, b) = (self.root(j), self.root(k));
+        // The smaller row is the root, so a finished block's representative is its first row.
+        let (lo, hi) = (a.min(b), a.max(b));
+        self.of[hi] = lo;
+    }
+
+    fn finish(mut self) -> Self {
+        let n = self.of.len();
+        for j in 0..n {
+            let r = self.root(j);
+            self.of[j] = r;
+        }
+        let mut rows: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for j in 0..n {
+            rows[self.of[j]].push(j);
+        }
+        self.rows = rows;
+        self
+    }
+
+    /// The rows `R` couples row `j` to, `j` included, ascending.
+    pub(crate) fn rows(&self, j: usize) -> &[usize] {
+        &self.rows[self.of[j]]
+    }
+
+    /// Blocks given per row as a group label (a test's fixture, no `R` built).
+    #[cfg(test)]
+    pub(crate) fn from_groups(group: &[usize]) -> Self {
+        let mut b = RBlocks { of: (0..group.len()).collect(), rows: Vec::new() };
+        for j in 0..group.len() {
+            for k in 0..j {
+                if group[k] == group[j] {
+                    b.join(k, j);
+                }
+            }
+        }
+        b.finish()
+    }
+
+    /// Whether rows `j` and `k` are in one block (`R[j][k]` may be nonzero).
+    #[cfg(test)]
+    pub(crate) fn same(&self, j: usize, k: usize) -> bool {
+        self.of[j] == self.of[k]
+    }
+
+    /// The number of rows.
+    pub(crate) fn len(&self) -> usize {
+        self.of.len()
+    }
 }
 
 fn cross_observation_covariance<T: crate::sens::num::PkNum>(
