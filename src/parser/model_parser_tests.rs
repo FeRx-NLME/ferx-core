@@ -1246,6 +1246,44 @@ fn test_f_lagtime_warning_matrix() {
     );
 }
 
+/// #1455: an individual parameter read only by a named `[event_model LABEL]` predictor is used,
+/// not "computed but never used": the census read unnamed blocks only, and its advice (remove
+/// it) would break the hazard. `DEAD` is the control that keeps the census live. Mutation: drop
+/// the named blocks from the census -> `LAM` is reported dead.
+#[cfg(feature = "survival")]
+#[test]
+fn a_parameter_only_a_named_endpoint_reads_is_not_dead() {
+    let src = "
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta TVLAM(0.1, 0.001, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.1 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  LAM = TVLAM
+  DEAD = 2 * TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[event_model drop]
+  cmt    = 2
+  family = exponential
+  scale  = LAM
+";
+    let ws = super::parse_full_model(src).expect("parses").model.parse_warnings;
+    let dead: Vec<_> = ws.iter().filter(|w| w.contains("computed but never used")).collect();
+    assert_eq!(dead.len(), 1, "{ws:?}");
+    assert!(dead[0].contains("`DEAD`") && !dead[0].contains("`LAM`"), "{}", dead[0]);
+}
+
 #[test]
 fn test_param_used_only_in_derived_not_flagged_dead() {
     // An individual parameter referenced only in [derived] — not mapped into
