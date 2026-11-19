@@ -2031,3 +2031,35 @@ fn the_eval_only_warning_classifies_as_a_start_side_finding() {
         assert_eq!(c.severity, WarningSeverity::Warning, "{msg}");
     }
 }
+
+/// #2896: a fit's own estimate at a declared bound is not a start outside it. A log-packed θ
+/// at a bound packs onto `ln(bound)` and unpacks as `exp(ln(bound))`, which is not the
+/// identity: 10 comes back as 10.000000000000002 and 500 as 499.99999999999983. Passed back
+/// as a start, each read as outside its own declared range, so a search refused it
+/// (`E_THETA_INIT_OUTSIDE_BOUNDS`) and an eval-only run warned on it. The estimates here
+/// come from a real `fit()` at `maxiter = 0` started on the bounds, which reports exactly
+/// that round trip; one ULP past it is still outside.
+#[test]
+fn a_fit_estimate_on_a_log_packed_bound_is_not_a_start_outside_it_2896() {
+    let model = model_with_parameters(
+        "  theta TVCL(10.0, 0.001, 10.0)\n  theta TVV(500.0, 500.0, 1e4)\n  \
+         omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n",
+    );
+    let csv = "ID,TIME,DV,EVID,AMT,MDV\n1,0,0,1,100,1\n1,1,0.2,0,0,0\n1,4,0.15,0,0,0\n";
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    std::io::Write::write_all(&mut f, csv.as_bytes()).unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(f.path(), None, None).unwrap();
+    let fitted = crate::api::fit(&model, &pop, &model.default_params, &eval_only()).unwrap();
+    let mut p = model.default_params.clone();
+    p.theta = fitted.theta.clone();
+    // Premise: the fit reports the round trip, one ULP outside each declared bound.
+    assert!(p.theta[0] > 10.0 && p.theta[1] < 500.0, "{:?}", p.theta);
+    for opts in [eval_only(), FitOptions::default()] {
+        let d = check_packed_start_in_box(&p, &opts);
+        assert!(d.is_empty(), "a fit's own estimates are a valid start: {d:#?}");
+    }
+    p.theta[0] = p.theta[0].next_up();
+    let out: Vec<_> =
+        crate::estimation::parameterization::theta_outside_declared_range(&p).collect();
+    assert_eq!(out.len(), 1, "one ULP past the round trip is still outside: {out:?}");
+}

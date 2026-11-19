@@ -1638,7 +1638,10 @@ pub(crate) struct OutOfDeclaredRange {
 /// On the declared sides this predicate is **strictly stronger** than the
 /// packed one and never weaker: for a log-packed θ with `theta_lower >
 /// LOG_PACK_FLOOR`, `packed < lower` holds exactly when `theta < theta_lower`
-/// up to `ln`'s rounding, which can only lose hits, never invent them. Measured
+/// up to `ln`'s rounding. That rounding used to invent hits: an estimate on a bound
+/// unpacks as `exp(ln(bound))`, one ULP either side of it, so a fit's own estimates read
+/// as outside their range when passed back as a start (#2896). A bound's round trip
+/// counts as inside, so the rounding can only lose hits. Measured
 /// over every `.ferx` in the tree at the time of writing — 154 that parse — it
 /// finds **zero** violations, the same answer the packed walk gives.
 ///
@@ -1675,9 +1678,12 @@ pub(crate) fn theta_outside_declared_range(
         if params.theta_fixed.get(index).copied().unwrap_or(false) {
             return None;
         }
-        let (side, bound) = if lower.is_finite() && value < lower {
+        // A log-packed bound unpacks as `exp(ln(bound))`, one ULP either side of it (#2896):
+        // what a fit reports for an estimate on the bound, so it is inside.
+        let rt = |b: f64| if theta_packs_log(lower) { b.ln().exp() } else { b };
+        let (side, bound) = if lower.is_finite() && value < lower.min(rt(lower)) {
             (BoxSide::Below, lower)
-        } else if upper.is_finite() && value > upper {
+        } else if upper.is_finite() && value > upper.max(rt(upper)) {
             (BoxSide::Above, upper)
         } else {
             return None;
