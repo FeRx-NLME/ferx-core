@@ -6000,10 +6000,7 @@ fn first_order_kernel_with_obs_scale_under_ltbs_matches_reconverged_fd() {
                 for interaction in [true, false] {
                     let g = fd_oracle(&m, &s, interaction);
                     eprintln!("obs_scale={scale} etav={eta_v} {err} FOCEI={interaction}: {g:.2e}");
-                    assert!(
-                        g.is_finite() && g < 1e-5,
-                        "{scale} etav={eta_v} {err}: {g:.2e}"
-                    );
+                    assert!(g.is_finite() && g < 1e-5, "{scale} etav={eta_v} {err}: {g:.2e}");
                 }
             }
         }
