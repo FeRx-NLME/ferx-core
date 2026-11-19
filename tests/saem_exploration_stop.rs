@@ -248,3 +248,68 @@ fn nonmem_kernels_fit_and_differ_from_the_random_walk() {
         assert!((got / truth - 1.0).abs() < 0.15, "{name}: {got} vs simulated {truth}");
     }
 }
+
+/// #2986: `saem_kernel = hmc | nuts` replace NONMEM's kernels 2 and 3 by a gradient move whose
+/// η-gradient the AD engine gives. On this closed-form model it must give one for every subject
+/// (no "gave no η-gradient" warning), the move must reach the E-step (a different fit from
+/// NONMEM's kernels on the same seed), and the fit must recover the simulated CL and V.
+#[test]
+fn gradient_kernels_are_served_differ_and_recover_the_truth() {
+    use ferx_core::types::SaemKernel;
+    let fixed = |o: &mut FitOptions| {
+        o.saem_n_exploration = Some(60);
+        o.saem_n_convergence = 60;
+    };
+    let nm = run(fixed);
+    for kernel in [SaemKernel::Hmc, SaemKernel::Nuts] {
+        let r = run(|o| {
+            fixed(o);
+            o.saem_kernel = kernel;
+        });
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("gave no subject's η-gradient")),
+            "{kernel:?}: the AD engine serves this model: {:?}",
+            r.warnings
+        );
+        assert_ne!(r.theta, nm.theta, "{kernel:?} reaches the E-step");
+        for (name, got, truth) in [("CL", r.theta[0], 5.0), ("V", r.theta[1], 50.0)] {
+            assert!(
+                (got / truth - 1.0).abs() < 0.15,
+                "{kernel:?} {name}: {got} vs simulated {truth}"
+            );
+        }
+    }
+}
+
+/// #2986: under IOV the gradient move is joint over `[η, κ₁..κ_K]`, on the stacked IOV gradient
+/// the AD engine gives. `warfarin_iov_saem` (three η, one κ over occasions) must be served — no
+/// "gave no η-gradient" warning — and fit to a finite objective different from NONMEM's kernels.
+#[test]
+fn the_gradient_kernel_serves_an_iov_model() {
+    use ferx_core::types::SaemKernel;
+    let prep = ferx_core::prepare_run(
+        "examples/warfarin_iov_saem.ferx",
+        Some("data/warfarin_iov_saem.csv"),
+    )
+    .expect("prepare");
+    let fit_with = |kernel: SaemKernel| {
+        let mut o = prep.parsed.fit_options.clone();
+        o.saem_kernel = kernel;
+        o.saem_n_exploration = Some(40);
+        o.saem_n_convergence = 40;
+        o.saem_ofv = ferx_core::types::SaemOfv::Focei;
+        o.run_covariance_step = false;
+        o.verbose = false;
+        o.threads = Some(1);
+        fit(&prep.parsed.model, &prep.population, &prep.init_params, &o).expect("fit")
+    };
+    let hmc = fit_with(SaemKernel::Hmc);
+    let nm = fit_with(SaemKernel::Nonmem);
+    assert!(
+        !hmc.warnings.iter().any(|w| w.contains("gave no subject's η-gradient")),
+        "the IOV gradient is served: {:?}",
+        hmc.warnings
+    );
+    assert!(hmc.ofv.is_finite());
+    assert_ne!(hmc.theta, nm.theta, "the joint move reaches the E-step");
+}

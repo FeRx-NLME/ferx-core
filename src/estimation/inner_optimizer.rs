@@ -5682,27 +5682,18 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
         }
         ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
         if value_ok {
-            // The objective's own row term (`individual_nll_into_prepared_with_schedule_frozen`):
-            // the same variance, the same expression.
-            let f_var = frozen_var_preds.map_or(obs.f, |f0| f0[j]);
-            let v_resid = match mult.and_then(|m| m.get(j)).map(Vec::as_slice) {
-                Some(m) => model.error_spec.variance_at_scaled(
-                    err_keys[j],
-                    f_var,
-                    sigma,
-                    residual_cov.pairs,
-                    m,
-                ),
-                None => model.error_spec.variance_at_with_correlations(
-                    err_keys[j],
-                    f_var,
-                    sigma,
-                    residual_cov.pairs,
-                ),
-            } * ruv_scale;
-            let v = v_resid + p.map_or(0.0, |p| p.f);
-            let resid = subject.observations[j] - obs.f;
-            data_ll += resid * resid / v + v.ln();
+            data_ll += gaussian_row_value(
+                model,
+                err_keys[j],
+                subject.observations[j],
+                obs.f,
+                frozen_var_preds.map_or(obs.f, |f0| f0[j]),
+                sigma,
+                residual_cov,
+                mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+                ruv_scale,
+                p.map_or(0.0, |p| p.f),
+            );
         }
     }
     if let Some(r) = ruv_idx {
@@ -5724,6 +5715,32 @@ pub(crate) fn analytic_eta_nll_value_gradient_with_schedule(
     let result = Some(add_nongaussian(grad));
     *obs_grad_recycle = sens;
     result
+}
+
+/// One Gaussian row's term of the objective (`individual_nll_into_prepared_with_schedule_frozen`):
+/// `ε²/v + ln v`, with `v` the same residual variance at `f_var` (scaled by the magnitude
+/// multiplier `mult` and `iiv_on_ruv`'s `ruv_scale`) plus an SDE row's `p`, the same expression.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn gaussian_row_value(
+    model: &CompiledModel, err_key: usize, y: f64, f: f64, f_var: f64, sigma: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, mult: Option<&[f64]>,
+    ruv_scale: f64, p: f64,
+) -> f64 {
+    let v_resid = match mult {
+        Some(m) => {
+            model.error_spec.variance_at_scaled(err_key, f_var, sigma, residual_cov.pairs, m)
+        }
+        None => model.error_spec.variance_at_with_correlations(
+            err_key,
+            f_var,
+            sigma,
+            residual_cov.pairs,
+        ),
+    } * ruv_scale;
+    let v = v_resid + p;
+    let resid = y - f;
+    resid * resid / v + v.ln()
 }
 
 /// Dense-`R` (`block_sigma`, #627) analytic inner η-gradient — the correlated-residual

@@ -2899,8 +2899,10 @@ pub enum ferx_core::types::RtteClock
 pub ferx_core::types::RtteClock::Forward
 pub ferx_core::types::RtteClock::Reset
 pub enum ferx_core::types::SaemKernel
+pub ferx_core::types::SaemKernel::Hmc
 pub ferx_core::types::SaemKernel::Imh
 pub ferx_core::types::SaemKernel::Nonmem
+pub ferx_core::types::SaemKernel::Nuts
 pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
@@ -4472,8 +4474,10 @@ pub enum ferx_core::RtteClock
 pub ferx_core::RtteClock::Forward
 pub ferx_core::RtteClock::Reset
 pub enum ferx_core::SaemKernel
+pub ferx_core::SaemKernel::Hmc
 pub ferx_core::SaemKernel::Imh
 pub ferx_core::SaemKernel::Nonmem
+pub ferx_core::SaemKernel::Nuts
 pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa

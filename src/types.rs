@@ -10837,6 +10837,21 @@ pub enum SaemKernel {
     /// `ISCALE` bounds `[1e-6, 1e6]`. The default (#2986).
     #[default]
     Nonmem,
+    /// NONMEM's independence kernels 1 and 1B, then one **preconditioned HMC** transition in
+    /// place of kernels 2 and 3 (#2986). The mass matrix is the inverse of the chain's running
+    /// conditional covariance (kernel 1B's moments; `Ω` before it has them), so the
+    /// near-Gaussian posterior is close to `N(0, I)` in the integrator's coordinates; the
+    /// integration time is about `π/2` (jittered), which there gives a nearly independent
+    /// draw in a few leapfrog steps; the step size is adapted per chain towards a Metropolis
+    /// acceptance probability of 0.8 during exploration and frozen after. The η-gradient is
+    /// the AD engine's exact one (with IOV, the stacked `[η, κ]` gradient's η block at the
+    /// chain's κ); a subject it gives none for takes kernels 2 and 3 instead.
+    Hmc,
+    /// As [`SaemKernel::Hmc`], with a **NUTS** transition (Stan's multinomial No-U-Turn
+    /// sampler: trajectories doubled until they U-turn, diverge or reach depth 5) in place of
+    /// the fixed-length HMC one; the step size adapts towards a mean acceptance statistic of
+    /// 0.8.
+    Nuts,
 }
 
 /// Which solver moves the SAEM numerical θ/σ M-step (`[fit_options] mstep_solver`,

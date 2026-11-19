@@ -2277,6 +2277,448 @@ pub(crate) fn independence_steps(
     (n_accepted, nll)
 }
 
+/// `saem_kernel = hmc` (#2986): the integration time of one transition, before jitter — a
+/// quarter period of the whitened Gaussian's flow, where a draw is independent of its start.
+const HMC_TIME: f64 = std::f64::consts::FRAC_PI_2;
+/// Leapfrog steps of one HMC transition at most.
+const HMC_MAX_LEAPFROG: usize = 8;
+/// `saem_kernel = nuts`: the deepest tree (`2^5 − 1 = 31` leapfrog steps at most).
+const NUTS_MAX_DEPTH: usize = 5;
+/// An energy error above this is a divergence (Stan's `Δ_max`).
+const NUTS_MAX_DELTA_H: f64 = 1000.0;
+/// A chain's step size in whitened coordinates: start, bounds (leapfrog is unstable on a unit
+/// Gaussian beyond 2), adaptation target and gain.
+const HMC_EPS_INIT: f64 = 0.5;
+const HMC_EPS_LO: f64 = 0.02;
+const HMC_EPS_HI: f64 = 1.9;
+const HMC_TARGET_ACCEPT: f64 = 0.8;
+const HMC_EPS_GAIN: f64 = 0.1;
+
+/// A subject's η potential `U(η) = NLL(η)` (κ held at the chain's draw) and its gradient from
+/// the AD engine, for the gradient kernels (`saem_kernel = hmc | nuts`, #2986). Built once per
+/// transition: everything the gradient needs that does not depend on η — the prepared residual
+/// dispatch and magnitudes, the residual covariance, the IOV layout — and its buffers.
+///
+/// Without IOV the gradient and value come from one pass (value/gradient fusion,
+/// `analytic_eta_nll_value_gradient_with_schedule`); the value falls back to the native NLL
+/// where the fused pass does not score the subject. With IOV the gradient is the stacked
+/// `[η, κ₁..κ_K]` one's η block, the value the IOV NLL every other kernel scores with. Whether
+/// a gradient exists is the engine's call: `None` from it declines the transition.
+struct EtaPotential<'a> {
+    model: &'a CompiledModel,
+    subject: &'a Subject,
+    theta: &'a [f64],
+    omega: &'a OmegaMatrix,
+    sigma: &'a [f64],
+    schedule: Option<&'a crate::pk::event_driven::EventSchedule>,
+    kappas: Option<(&'a [Vec<f64>], &'a OmegaMatrix)>,
+    prep: &'a IndividualNllPrep,
+    nll_scratch: &'a mut IndividualNllScratch,
+    residual_cov: crate::stats::residual_error::ResidualCov<'a>,
+    recycle: Vec<crate::sens::provider::ObsGrad>,
+    eta_work: DVector<f64>,
+    prior_work: DVector<f64>,
+    stacked: Vec<f64>,
+    /// Under IOV, whether the state is the stacked `[η, κ₁..κ_K]` (a joint move, #2986) rather
+    /// than η alone at the chain's κ; `kappa_buf` holds the κ split back out of it.
+    joint: bool,
+    n_eta: usize,
+    kappa_buf: Vec<Vec<f64>>,
+}
+
+impl<'a> EtaPotential<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        model: &'a CompiledModel, subject: &'a Subject, theta: &'a [f64], omega: &'a OmegaMatrix,
+        sigma: &'a [f64], schedule: Option<&'a crate::pk::event_driven::EventSchedule>,
+        kappas: Option<(&'a [Vec<f64>], &'a OmegaMatrix)>, scratch: &'a mut MhScratch,
+        n_eta: usize, joint: bool,
+    ) -> Self {
+        let MhScratch { nll: nll_scratch, prep, .. } = scratch;
+        EtaPotential {
+            model,
+            subject,
+            theta,
+            omega,
+            sigma,
+            schedule,
+            kappas,
+            prep,
+            nll_scratch,
+            residual_cov: model.residual_cov_theta(theta),
+            recycle: Vec::new(),
+            eta_work: DVector::zeros(n_eta),
+            prior_work: DVector::zeros(n_eta),
+            stacked: Vec::new(),
+            joint: joint && kappas.is_some(),
+            n_eta,
+            kappa_buf: kappas.map(|(k, _)| k.to_vec()).unwrap_or_default(),
+        }
+    }
+
+    /// The NLL every other kernel scores with, at the state `x` (η, or the stacked `[η, κ]` of
+    /// a joint move).
+    fn value(&mut self, x: &[f64]) -> f64 {
+        match self.kappas {
+            Some((kappas, omega_iov)) => {
+                let (eta, kappas): (&[f64], &[Vec<f64>]) = if self.joint {
+                    let mut at = self.n_eta;
+                    for k in self.kappa_buf.iter_mut() {
+                        let w = k.len();
+                        k.copy_from_slice(&x[at..at + w]);
+                        at += w;
+                    }
+                    (&x[..self.n_eta], &self.kappa_buf)
+                } else {
+                    (x, kappas)
+                };
+                individual_nll_iov_with_scratch_and_schedule(
+                    self.model,
+                    self.subject,
+                    self.theta,
+                    eta,
+                    kappas,
+                    self.omega,
+                    Some(omega_iov),
+                    self.sigma,
+                    &mut self.nll_scratch.pk,
+                    self.schedule,
+                )
+            }
+            None => individual_nll_prepared(
+                self.model,
+                self.subject,
+                self.theta,
+                x,
+                self.omega,
+                self.sigma,
+                self.prep,
+                self.schedule,
+                self.nll_scratch,
+            ),
+        }
+    }
+
+    /// `∇_η U` at `eta`, and with `want_value` also `U(eta)`: `None` where the AD engine
+    /// gives no gradient. The value is the fused pass's where it scores the subject (equal
+    /// to the native NLL within the bound `fused_value_is_the_native_objective_value` pins,
+    /// ~1e-13 relative), else [`Self::value`].
+    fn grad(&mut self, eta: &[f64], want_value: bool) -> Option<(Vec<f64>, f64)> {
+        let n = eta.len();
+        let (g, fused) = match self.kappas {
+            Some((kappas, omega_iov)) => {
+                self.stacked.clear();
+                self.stacked.extend_from_slice(eta);
+                if !self.joint {
+                    for k in kappas {
+                        self.stacked.extend_from_slice(k);
+                    }
+                }
+                let g = crate::estimation::inner_optimizer::analytic_eta_nll_gradient_iov(
+                    self.model,
+                    self.subject,
+                    self.theta,
+                    &self.stacked,
+                    self.omega,
+                    omega_iov,
+                    self.sigma,
+                    self.prep.ruv_mult(),
+                )?;
+                // The η block leads the stacked vector unless the layout compacts it (nested
+                // levels); then the engine's axes are not ours, and we take no gradient.
+                if g.len() != self.stacked.len() {
+                    return None;
+                }
+                // A joint move takes the whole stacked gradient.
+                (if self.joint { g } else { g[..n].to_vec() }, None)
+            }
+            None => {
+                let mut fused: Option<f64> = None;
+                let g = crate::estimation::inner_optimizer::analytic_eta_nll_value_gradient_with_schedule(
+                    self.model,
+                    self.subject,
+                    self.theta,
+                    eta,
+                    self.omega,
+                    self.sigma,
+                    self.residual_cov,
+                    self.schedule,
+                    self.prep.ruv_mult(),
+                    self.prep.err_keys(),
+                    &mut self.recycle,
+                    &mut self.eta_work,
+                    &mut self.prior_work,
+                    None,
+                    want_value.then_some(&mut fused),
+                )?;
+                (g, fused)
+            }
+        };
+        if !g.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        let u = if want_value { fused.unwrap_or_else(|| self.value(eta)) } else { f64::NAN };
+        Some((g, u))
+    }
+}
+
+/// `η = L z` and `Lᵀ g`: the whitening of the gradient kernels.
+fn lower_mul(l: &DMatrix<f64>, z: &[f64], out: &mut [f64]) {
+    let n = z.len();
+    for i in 0..n {
+        out[i] = (0..=i).map(|j| l[(i, j)] * z[j]).sum();
+    }
+}
+fn lower_t_mul(l: &DMatrix<f64>, g: &[f64], out: &mut [f64]) {
+    let n = g.len();
+    for j in 0..n {
+        out[j] = (j..n).map(|i| l[(i, j)] * g[i]).sum();
+    }
+}
+
+/// One preconditioned HMC transition of a subject's η (`saem_kernel = hmc`, #2986): the
+/// Hamiltonian `U(η) + ½‖p‖²` in the coordinates `z = L⁻¹η` (mass matrix `(LLᵀ)⁻¹`), so
+/// `ż = p`, `ṗ = −Lᵀ∇_η U`. `L` is the lower Cholesky factor of the chain's conditional
+/// covariance. `ceil(T/eps)` leapfrog steps with `T = HMC_TIME·U(0.8, 1.2)` (the jitter keeps a
+/// fixed path length from resonating with a period), capped at `max_leapfrog`; `L + 1`
+/// gradients, the last of which also scores the endpoint. Returns `(α, nll)` — the Metropolis
+/// acceptance probability `min(1, e^{−ΔH})` the caller adapts `eps` on, and the chain's NLL
+/// after the transition — or `None` when the engine gives no gradient at the start (the caller
+/// then runs kernels 2 and 3). A gradient declined mid-trajectory rejects with `α = 0`.
+#[allow(clippy::too_many_arguments)]
+fn preconditioned_hmc_step(
+    eta: &mut [f64], nll_current: f64, l: &DMatrix<f64>, eps: f64, max_leapfrog: usize,
+    pot: &mut EtaPotential<'_>, rng: &mut impl Rng,
+) -> Option<(f64, f64)> {
+    let n = eta.len();
+    if n == 0 || (0..n).any(|j| !(l[(j, j)] > 0.0)) || !(eps > 0.0) {
+        return None;
+    }
+    let (g0, _) = pot.grad(eta, false)?;
+    let mut lg = vec![0.0; n];
+    lower_t_mul(l, &g0, &mut lg);
+    let p0: Vec<f64> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
+    let t = HMC_TIME * (0.8 + 0.4 * rng.random::<f64>());
+    let n_steps = ((t / eps).ceil() as usize).clamp(1, max_leapfrog.max(1));
+    let mut q = eta.to_vec();
+    let mut p = p0.clone();
+    let mut lp = vec![0.0; n];
+    let mut u_end = f64::NAN;
+    for step in 0..n_steps {
+        for j in 0..n {
+            p[j] -= 0.5 * eps * lg[j];
+        }
+        lower_mul(l, &p, &mut lp);
+        for i in 0..n {
+            q[i] += eps * lp[i];
+        }
+        let Some((g, u)) = pot.grad(&q, step + 1 == n_steps) else {
+            return Some((0.0, nll_current));
+        };
+        u_end = u;
+        lower_t_mul(l, &g, &mut lg);
+        for j in 0..n {
+            p[j] -= 0.5 * eps * lg[j];
+        }
+    }
+    let kin = |v: &[f64]| 0.5 * v.iter().map(|x| x * x).sum::<f64>();
+    let delta_h = (nll_current + kin(&p0)) - (u_end + kin(&p));
+    let alpha = if delta_h.is_finite() { delta_h.min(0.0).exp() } else { 0.0 };
+    if rng.random::<f64>() < alpha {
+        eta.copy_from_slice(&q);
+        Some((alpha, u_end))
+    } else {
+        Some((alpha, nll_current))
+    }
+}
+
+/// One end of a NUTS trajectory: whitened position, momentum, whitened gradient.
+#[derive(Clone)]
+struct NutsEdge {
+    z: Vec<f64>,
+    p: Vec<f64>,
+    gz: Vec<f64>,
+}
+
+/// A NUTS subtree: its two ends, its multinomial proposal and weight, the summed momentum
+/// `ρ` the U-turn criterion reads, and the acceptance statistics the step size adapts on.
+struct NutsTree {
+    minus: NutsEdge,
+    plus: NutsEdge,
+    z_prop: Vec<f64>,
+    u_prop: f64,
+    log_w: f64,
+    rho: Vec<f64>,
+    n_leapfrog: usize,
+    sum_accept: f64,
+    /// A divergence, a declined gradient or a U-turn inside: stop building.
+    stop: bool,
+}
+
+fn log_add_exp(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
+    }
+    if b == f64::NEG_INFINITY {
+        return a;
+    }
+    let m = a.max(b);
+    m + ((a - m).exp() + (b - m).exp()).ln()
+}
+
+/// The U-turn criterion of a span with summed momentum `rho` between end momenta `p_minus`,
+/// `p_plus` (identity metric in the whitened coordinates): it turns when either end's momentum
+/// points against `rho`.
+fn nuts_turning(rho: &[f64], p_minus: &[f64], p_plus: &[f64]) -> bool {
+    let d = |a: &[f64]| a.iter().zip(rho).map(|(x, r)| x * r).sum::<f64>();
+    d(p_minus) <= 0.0 || d(p_plus) <= 0.0
+}
+
+/// A NUTS subtree of `2^depth` leapfrog steps from `edge` in direction `dir` (Stan's
+/// multinomial NUTS, Betancourt 2017): uniform-progressive sampling inside, the U-turn
+/// criterion at every merge, divergence at `ΔH > NUTS_MAX_DELTA_H`.
+#[allow(clippy::too_many_arguments)]
+fn nuts_build(
+    edge: &NutsEdge, dir: f64, depth: usize, eps: f64, h0: f64, l: &DMatrix<f64>,
+    pot: &mut EtaPotential<'_>, rng: &mut impl Rng, eta_buf: &mut [f64],
+) -> NutsTree {
+    let n = edge.z.len();
+    if depth == 0 {
+        let e = eps * dir;
+        let mut p: Vec<f64> = (0..n).map(|j| edge.p[j] - 0.5 * e * edge.gz[j]).collect();
+        let z: Vec<f64> = (0..n).map(|j| edge.z[j] + e * p[j]).collect();
+        lower_mul(l, &z, eta_buf);
+        let fail = |edge: &NutsEdge| NutsTree {
+            minus: edge.clone(),
+            plus: edge.clone(),
+            z_prop: edge.z.clone(),
+            u_prop: f64::NAN,
+            log_w: f64::NEG_INFINITY,
+            rho: vec![0.0; n],
+            n_leapfrog: 1,
+            sum_accept: 0.0,
+            stop: true,
+        };
+        let Some((g, u)) = pot.grad(eta_buf, true) else {
+            return fail(edge);
+        };
+        let mut gz = vec![0.0; n];
+        lower_t_mul(l, &g, &mut gz);
+        for j in 0..n {
+            p[j] -= 0.5 * e * gz[j];
+        }
+        let h = u + 0.5 * p.iter().map(|x| x * x).sum::<f64>();
+        if !h.is_finite() || h - h0 > NUTS_MAX_DELTA_H {
+            return fail(edge);
+        }
+        let leaf = NutsEdge { z: z.clone(), p: p.clone(), gz };
+        return NutsTree {
+            minus: leaf.clone(),
+            plus: leaf,
+            z_prop: z,
+            u_prop: u,
+            log_w: h0 - h,
+            rho: p,
+            n_leapfrog: 1,
+            sum_accept: (h0 - h).min(0.0).exp(),
+            stop: false,
+        };
+    }
+    let first = nuts_build(edge, dir, depth - 1, eps, h0, l, pot, rng, eta_buf);
+    if first.stop {
+        return first;
+    }
+    let from = if dir > 0.0 { &first.plus } else { &first.minus };
+    let second = nuts_build(&from.clone(), dir, depth - 1, eps, h0, l, pot, rng, eta_buf);
+    let n_leapfrog = first.n_leapfrog + second.n_leapfrog;
+    let sum_accept = first.sum_accept + second.sum_accept;
+    if second.stop {
+        return NutsTree { n_leapfrog, sum_accept, stop: true, ..first };
+    }
+    let log_w = log_add_exp(first.log_w, second.log_w);
+    // Uniform-progressive (multinomial) sampling within the subtree.
+    let take_second = rng.random::<f64>().ln() < second.log_w - log_w;
+    let rho: Vec<f64> = first.rho.iter().zip(&second.rho).map(|(a, b)| a + b).collect();
+    let (minus, plus) =
+        if dir > 0.0 { (first.minus, second.plus) } else { (second.minus, first.plus) };
+    let stop = nuts_turning(&rho, &minus.p, &plus.p);
+    let (z_prop, u_prop) =
+        if take_second { (second.z_prop, second.u_prop) } else { (first.z_prop, first.u_prop) };
+    NutsTree { minus, plus, z_prop, u_prop, log_w, rho, n_leapfrog, sum_accept, stop }
+}
+
+/// One NUTS transition of a subject's η (`saem_kernel = nuts`, #2986), in the whitened
+/// coordinates of [`preconditioned_hmc_step`]: trees doubled in a random direction until the
+/// trajectory U-turns, diverges or reaches `NUTS_MAX_DEPTH`, each new subtree's proposal taken
+/// with probability `min(1, w_new / w_old)` (biased progressive sampling). Every state's
+/// potential comes from its gradient's own pass. Returns `(mean acceptance statistic, nll)`,
+/// or `None` when the engine gives no gradient at the start.
+fn nuts_step(
+    eta: &mut [f64], nll_current: f64, l: &DMatrix<f64>, eps: f64, pot: &mut EtaPotential<'_>,
+    rng: &mut impl Rng,
+) -> Option<(f64, f64)> {
+    let n = eta.len();
+    if n == 0 || (0..n).any(|j| !(l[(j, j)] > 0.0)) || !(eps > 0.0) {
+        return None;
+    }
+    let (g0, _) = pot.grad(eta, false)?;
+    // z₀ = L⁻¹η by forward substitution.
+    let mut z0 = vec![0.0; n];
+    for i in 0..n {
+        let mut v = eta[i];
+        for j in 0..i {
+            v -= l[(i, j)] * z0[j];
+        }
+        z0[i] = v / l[(i, i)];
+    }
+    let mut gz0 = vec![0.0; n];
+    lower_t_mul(l, &g0, &mut gz0);
+    let p0: Vec<f64> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
+    let h0 = nll_current + 0.5 * p0.iter().map(|x| x * x).sum::<f64>();
+    let start = NutsEdge { z: z0.clone(), p: p0.clone(), gz: gz0 };
+    let mut minus = start.clone();
+    let mut plus = start;
+    let mut z_prop = z0;
+    let mut u_prop = nll_current;
+    let mut log_w = 0.0;
+    let mut rho = p0;
+    let (mut n_leapfrog, mut sum_accept) = (0_usize, 0.0);
+    let mut eta_buf = vec![0.0; n];
+    let mut moved = false;
+    for depth in 0..NUTS_MAX_DEPTH {
+        let dir = if rng.random::<bool>() { 1.0 } else { -1.0 };
+        let edge = if dir > 0.0 { plus.clone() } else { minus.clone() };
+        let t = nuts_build(&edge, dir, depth, eps, h0, l, pot, rng, &mut eta_buf);
+        n_leapfrog += t.n_leapfrog;
+        sum_accept += t.sum_accept;
+        if t.stop {
+            break;
+        }
+        if rng.random::<f64>().ln() < t.log_w - log_w {
+            z_prop = t.z_prop;
+            u_prop = t.u_prop;
+            moved = true;
+        }
+        log_w = log_add_exp(log_w, t.log_w);
+        for (r, v) in rho.iter_mut().zip(&t.rho) {
+            *r += v;
+        }
+        if dir > 0.0 {
+            plus = t.plus;
+        } else {
+            minus = t.minus;
+        }
+        if nuts_turning(&rho, &minus.p, &plus.p) {
+            break;
+        }
+    }
+    // A chain that kept its start keeps its η bit for bit (no `L·L⁻¹` round trip).
+    if moved {
+        lower_mul(l, &z_prop, eta);
+    }
+    Some((sum_accept / n_leapfrog.max(1) as f64, u_prop))
+}
+
 /// Kernel 1B's proposal from a subject's running draw moments `(Σ η, Σ ηηᵀ, n)`: the mean
 /// and the lower Cholesky factor of the covariance, or `None` before
 /// [`NONMEM_M1B_MIN_DRAWS`] draws. A covariance that is not positive definite falls back to
@@ -4710,7 +5152,16 @@ pub fn run_saem(
     let omega_burnin = options.saem_omega_burnin.min(k_min);
     // NONMEM's kernels (#2986): kernel 2's proposals and kernel 3's sweeps are NONMEM's
     // counts; kernels 1 and 1B run before them in the E-step.
-    let nonmem_kernel = options.saem_kernel == crate::types::SaemKernel::Nonmem;
+    // `hmc` / `nuts` run NONMEM's kernels 1 and 1B and their settings, with a gradient
+    // kernel in place of 2 and 3 wherever the AD engine gives the subject's η-gradient.
+    let nuts_kernel = options.saem_kernel == crate::types::SaemKernel::Nuts;
+    let hmc_in_scope = matches!(
+        options.saem_kernel,
+        crate::types::SaemKernel::Hmc | crate::types::SaemKernel::Nuts
+    );
+    let nonmem_kernel = options.saem_kernel == crate::types::SaemKernel::Nonmem || hmc_in_scope;
+    // Gradient-kernel transitions the engine served, for the warning when it served none.
+    let gradient_served = std::sync::atomic::AtomicUsize::new(0);
     let n_mh_steps = if nonmem_kernel {
         options.saem_isample_m2
     } else {
@@ -4741,6 +5192,11 @@ pub fn run_saem(
     } else {
         Vec::new()
     };
+    // `saem_kernel = hmc`: each chain's step size, and the last transition's acceptance
+    // probability (`NaN` where no transition ran), read after the parallel E-step.
+    let mut hmc_eps: Vec<f64> = vec![HMC_EPS_INIT; if hmc_in_scope { n_subjects } else { 0 }];
+    let hmc_alpha: Vec<std::sync::atomic::AtomicU64> =
+        (0..hmc_eps.len()).map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())).collect();
     let adapt_interval = options.saem_adapt_interval;
     // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
     // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
@@ -4791,7 +5247,16 @@ pub fn run_saem(
         // The block count is data-derived unless the caller pinned it, so say
         // which of the two a run is using — otherwise a reader cannot tell the
         // resolved count from a coincidence.
-        if nonmem_kernel {
+        if hmc_in_scope {
+            eprintln!(
+                "SAEM: per chain and iteration {} from N(0, Ω) (M1), {} from the running \
+                 conditional moments (M1B), then one {} transition preconditioned by them (M2 \
+                 and M3 where the AD engine gives no η-gradient)",
+                options.saem_isample_m1,
+                options.saem_isample_m1b,
+                if nuts_kernel { "NUTS" } else { "HMC" }
+            );
+        } else if nonmem_kernel {
             eprintln!(
                 "SAEM: NONMEM kernels per chain and iteration: {} from N(0, Ω) (M1), {} from \
                  the running conditional moments (M1B), {} block random-walk (M2), {} \
@@ -5861,6 +6326,9 @@ pub fn run_saem(
             };
             let imh_counters_ref = &imh_counters;
             let m1b_ref = &m1b_moments;
+            let hmc_eps_ref = &hmc_eps;
+            let hmc_alpha_ref = &hmc_alpha;
+            let gradient_served_ref = &gradient_served;
             let e_step_fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
             #[cfg(test)]
             let rw_block_calls_ref = &rw_block_calls;
@@ -5879,6 +6347,7 @@ pub fn run_saem(
                 bool,
                 usize,
                 crate::estimation::saem_imh::ImhSlot,
+                Option<Vec<Vec<f64>>>,
             )> = state
                 .etas
                 .par_iter()
@@ -6001,6 +6470,7 @@ pub fn run_saem(
                         // then from the chain's running conditional mean and covariance;
                         // kernel 2 (the block random walk, `n_mh_steps = isample_m2`) and
                         // kernel 3 (the componentwise sweep, `isample_m3`) follow below.
+                        let mut m1b_chol: Option<DMatrix<f64>> = None;
                         if nonmem_kernel {
                             let zero = vec![0.0_f64; eta_work.len()];
                             let (_, nll_m1) = independence_steps(
@@ -6039,6 +6509,83 @@ pub fn run_saem(
                                     kappas_mh_opt,
                                 );
                                 nll_cur = nll_m1b;
+                                m1b_chol = Some(l);
+                            }
+                        }
+                        // ---- `saem_kernel = hmc`: HMC in place of kernels 2 and 3 (#2986) ----
+                        // Preconditioned by the chain's conditional covariance (kernel 1B's
+                        // moments), or by Ω before it has them.
+                        let mut hmc_served = false;
+                        let mut kappas_new: Option<Vec<Vec<f64>>> = None;
+                        if hmc_in_scope {
+                            let l_eta = m1b_chol.as_ref().unwrap_or(&omega_ref.chol);
+                            // Under IOV the move is joint over `[η, κ₁..κ_K]` (#2986), its
+                            // metric block-diagonal: η's, then Ω_IOV's factor per occasion.
+                            let joint = kappas_mh_opt.filter(|(k, _)| !k.is_empty());
+                            let (mut x, l_joint) = match joint {
+                                Some((kap, oiov)) => {
+                                    let n_e = eta_work.len();
+                                    let n_k = oiov.chol.nrows();
+                                    let dim = n_e + kap.len() * n_k;
+                                    let mut lj = DMatrix::<f64>::zeros(dim, dim);
+                                    lj.view_mut((0, 0), (n_e, n_e)).copy_from(l_eta);
+                                    let mut x = eta_work.clone();
+                                    for (g, kg) in kap.iter().enumerate() {
+                                        let at = n_e + g * n_k;
+                                        lj.view_mut((at, at), (n_k, n_k)).copy_from(&oiov.chol);
+                                        x.extend_from_slice(kg);
+                                    }
+                                    (x, Some(lj))
+                                }
+                                None => (eta_work.clone(), None),
+                            };
+                            let l = l_joint.as_ref().unwrap_or(l_eta);
+                            let mut pot = EtaPotential::new(
+                                model,
+                                subject,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                schedules[i].as_ref(),
+                                kappas_mh_opt,
+                                mh_scratch,
+                                eta_work.len(),
+                                joint.is_some(),
+                            );
+                            let step = if nuts_kernel {
+                                nuts_step(&mut x, nll_cur, l, hmc_eps_ref[i], &mut pot, &mut rng)
+                            } else {
+                                preconditioned_hmc_step(
+                                    &mut x,
+                                    nll_cur,
+                                    l,
+                                    hmc_eps_ref[i],
+                                    HMC_MAX_LEAPFROG,
+                                    &mut pot,
+                                    &mut rng,
+                                )
+                            };
+                            if let Some((alpha, nll_h)) = step {
+                                gradient_served_ref
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let n_e = eta_work.len();
+                                eta_work.copy_from_slice(&x[..n_e]);
+                                if let Some((kap, _)) = joint {
+                                    let mut at = n_e;
+                                    kappas_new = Some(
+                                        kap.iter()
+                                            .map(|kg| {
+                                                let v = x[at..at + kg.len()].to_vec();
+                                                at += kg.len();
+                                                v
+                                            })
+                                            .collect(),
+                                    );
+                                }
+                                nll_cur = nll_h;
+                                hmc_served = true;
+                                hmc_alpha_ref[i]
+                                    .store(alpha.to_bits(), std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         // HMC path: one gradient-guided proposal per SAEM iteration.
@@ -6094,7 +6641,7 @@ pub fn run_saem(
                             None => false,
                         };
 
-                        let did_hmc = if using_hmc && !did_imh {
+                        let did_hmc = if using_hmc && !did_imh && !hmc_served {
                             if let Some((new_eta, new_nll, accepted, _divergent)) =
                                 crate::estimation::hmc::hmc_step(
                                     subject, &eta_work, nll, model, theta_ref, omega_ref,
@@ -6113,7 +6660,7 @@ pub fn run_saem(
                             false
                         };
 
-                        if !did_hmc && !did_imh {
+                        if !did_hmc && !did_imh && !hmc_served {
                             #[cfg(test)]
                             rw_block_calls_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let (n_acc, nll_new) = mh_steps(
@@ -6149,7 +6696,7 @@ pub fn run_saem(
                             cw_sc_i,
                             cw_sd_ref,
                             &mut rng,
-                            n_cw_sweeps,
+                            if hmc_served { 0 } else { n_cw_sweeps },
                             mh_scratch,
                             schedules[i].as_ref(),
                             kappas_mh_opt,
@@ -6162,9 +6709,10 @@ pub fn run_saem(
                             n_prop_primary,
                             per_eta_acc_cw,
                             n_prop_cw,
-                            did_hmc,
+                            did_hmc || hmc_served,
                             mix_class,
                             imh_slot,
+                            kappas_new,
                         )
                     },
                 )
@@ -6188,9 +6736,14 @@ pub fn run_saem(
                     used_hmc,
                     mix_class,
                     imh_slot,
+                    kappas_new,
                 ),
             ) in results.into_iter().enumerate()
             {
+                // A joint gradient move under IOV moved the chain's κ with its η (#2986).
+                if let Some(kap) = kappas_new {
+                    state.kappas[i] = kap;
+                }
                 // A proposal came back <=> the IMH kernel served this subject's
                 // primary move this iteration.
                 let used_imh = imh_slot.prop.is_some();
@@ -6226,11 +6779,14 @@ pub fn run_saem(
                     state.accept_counts[i] += n_acc;
                     state.proposal_counts[i] += n_prop;
                 }
-                // Accumulate per-eta CW acceptance counts
+                // Accumulate per-eta CW acceptance counts. A subject `saem_kernel = hmc`
+                // served ran no sweep: no counts, so its sweep scales stay as they were for
+                // an iteration it falls back.
+                let n_cw_ran = if hmc_in_scope && used_hmc { 0 } else { n_cw_sweeps };
                 let cw_acc_i: usize = per_eta_acc_cw.iter().sum();
                 for j in 0..n_eta {
                     state.cw_accept_counts[i][j] += per_eta_acc_cw[j];
-                    state.cw_proposal_counts[i][j] += n_cw_sweeps;
+                    state.cw_proposal_counts[i][j] += n_cw_ran;
                 }
                 hmc_subjects[i] |= used_hmc;
                 // ---- Robbins-Monro step-scale adaptation (#1444, opt-in) ----
@@ -6244,7 +6800,7 @@ pub fn run_saem(
                     // above skip it: this controller steers the random walk's
                     // scale, and the IMH kernel's acceptance is not on that scale.
                     let rw_block = rw_scale_has_evidence(used_imh, n_prop);
-                    if rw_block || (n_cw_sweeps > 0 && !per_eta_acc_cw.is_empty()) {
+                    if rw_block || (n_cw_ran > 0 && !per_eta_acc_cw.is_empty()) {
                         first_scale_adapt.get_or_insert(k);
                     }
                     if rw_block {
@@ -6267,9 +6823,9 @@ pub fn run_saem(
                     // Per-η, for the same reason the interval rule adapts each
                     // coordinate separately: a FREM covariate η and a PK η have
                     // posterior SDs orders of magnitude apart.
-                    if n_cw_sweeps > 0 {
+                    if n_cw_ran > 0 {
                         for j in 0..n_eta.min(per_eta_acc_cw.len()) {
-                            let rate = per_eta_acc_cw[j] as f64 / n_cw_sweeps as f64;
+                            let rate = per_eta_acc_cw[j] as f64 / n_cw_ran as f64;
                             if inside_scale_deadband(rate, scale_deadband) {
                                 continue;
                             }
@@ -7238,6 +7794,18 @@ pub fn run_saem(
             }
         }
 
+        // ---- `saem_kernel = hmc`: each chain's step size (#2986) ----
+        // A Robbins-Monro step on `log ε` toward the acceptance probability target, during
+        // exploration only: the averaging phase runs a fixed kernel.
+        for (i, a) in hmc_alpha.iter().enumerate() {
+            let alpha =
+                f64::from_bits(a.swap(f64::NAN.to_bits(), std::sync::atomic::Ordering::Relaxed));
+            if k <= k1 && alpha.is_finite() {
+                hmc_eps[i] = (hmc_eps[i] * (HMC_EPS_GAIN * (alpha - HMC_TARGET_ACCEPT)).exp())
+                    .clamp(HMC_EPS_LO, HMC_EPS_HI);
+            }
+        }
+
         // ---- Adapt MH step sizes ----
         if state.steps_since_adapt >= adapt_interval {
             for i in 0..n_subjects {
@@ -7259,7 +7827,8 @@ pub fn run_saem(
                 // to the random walk the moment a refresh declines. So adapt only
                 // on evidence there; `imh_mode` is false by default, which keeps
                 // the default path's arithmetic untouched.
-                let rw_evidence = !imh_mode || state.proposal_counts[i] > 0;
+                // `saem_kernel = hmc` records no random-walk proposals for a subject it served.
+                let rw_evidence = !(imh_mode || hmc_in_scope) || state.proposal_counts[i] > 0;
                 if !rm_scale_adaptation && rw_evidence {
                     first_scale_adapt.get_or_insert(k);
                     state.step_scales[i] = interval_scale_update(
@@ -7282,6 +7851,9 @@ pub fn run_saem(
                 // posterior SD may be orders of magnitude below √Ω_jj.
                 if n_cw_sweeps > 0 {
                     for j in 0..n_eta {
+                        if hmc_in_scope && state.cw_proposal_counts[i][j] == 0 {
+                            continue;
+                        }
                         let cw_total = state.cw_proposal_counts[i][j].max(1);
                         let cw_rate = state.cw_accept_counts[i][j] as f64 / cw_total as f64;
                         // Same split as the block scale above.
@@ -7391,6 +7963,13 @@ pub fn run_saem(
             mix.classes.truncate(n_subjects_data);
             mix.rbar.truncate(n_subjects_data);
         }
+    }
+    if hmc_in_scope && gradient_served.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        warnings.push(format!(
+            "saem_kernel = {}: the AD engine gave no subject's η-gradient, so NONMEM's kernels \
+             2 and 3 ran in its place",
+            if nuts_kernel { "nuts" } else { "hmc" }
+        ));
     }
 
     // ---- Post-SAEM: build final parameters ----

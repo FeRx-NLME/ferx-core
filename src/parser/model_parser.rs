@@ -12321,9 +12321,11 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 "rw" | "random_walk" | "random-walk" | "mh" => crate::types::SaemKernel::RandomWalk,
                 "imh" | "fsaem" | "f-saem" => crate::types::SaemKernel::Imh,
                 "nonmem" | "nm" => crate::types::SaemKernel::Nonmem,
+                "hmc" => crate::types::SaemKernel::Hmc,
+                "nuts" => crate::types::SaemKernel::Nuts,
                 other => {
                     return Err(format!(
-                        "fit option `{key}`: unknown value `{other}` — expected rw/imh/nonmem"
+                        "fit option `{key}`: unknown value `{other}` — expected rw/imh/nonmem/hmc/nuts"
                     ));
                 }
             };
