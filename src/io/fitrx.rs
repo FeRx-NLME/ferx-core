@@ -223,6 +223,10 @@ struct FitWire {
     saem_mh_accept_tail: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     saem_n_exploration_used: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saem_gradient_kernel: Option<crate::types::SaemGradientKernelStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    saem_kernels: Option<String>,
     /// The M-step optimizer `mstep_optimizer = auto` resolved to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mstep_optimizer_used: Option<String>,
@@ -1628,6 +1632,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         saem_n_subjects_hmc: r.saem_n_subjects_hmc,
         saem_mh_accept_tail: r.saem_mh_accept_tail,
         saem_n_exploration_used: r.saem_n_exploration_used,
+        saem_gradient_kernel: r.saem_gradient_kernel.clone(),
+        saem_kernels: r.saem_kernels.clone(),
         mstep_optimizer_used: r.mstep_optimizer_used.clone(),
         theta: ThetaWire {
             names: r.theta_names.clone(),
@@ -3752,6 +3758,8 @@ fn wire_to_fit_result(
         saem_n_subjects_hmc: w.saem_n_subjects_hmc,
         saem_mh_accept_tail: w.saem_mh_accept_tail,
         saem_n_exploration_used: w.saem_n_exploration_used,
+        saem_gradient_kernel: w.saem_gradient_kernel,
+        saem_kernels: w.saem_kernels,
         mstep_optimizer_used: w.mstep_optimizer_used,
         gradient_method_inner: w.gradient_method_inner,
         gradient_method_outer: w.gradient_method_outer,

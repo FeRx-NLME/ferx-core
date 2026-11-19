@@ -77,6 +77,10 @@ pub struct OuterResult {
     /// non-SAEM methods and when no post-burn-in proposal was made.
     pub saem_mh_accept_tail: Option<f64>,
     pub saem_n_exploration_used: Option<usize>,
+    /// How the gradient E-step kernel ran (`saem_kernel = hmc | nuts`).
+    pub saem_gradient_kernel: Option<crate::types::SaemGradientKernelStats>,
+    /// The SAEM E-step's kernels as they ran (`FitResult::saem_kernels`).
+    pub saem_kernels: Option<String>,
     /// The numerical M-step optimizer a SAEM / IMP / IMPMAP fit resolved `mstep_optimizer` to
     /// (`newton`, `bobyqa` or `lbfgs`); `None` for other methods.
     pub mstep_optimizer_used: Option<String>,
@@ -185,6 +189,8 @@ impl OuterResult {
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
             saem_n_exploration_used: None,
+            saem_gradient_kernel: None,
+            saem_kernels: None,
             mstep_optimizer_used: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,

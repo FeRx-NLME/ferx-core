@@ -8654,6 +8654,14 @@ pub struct FitResult {
     /// iteration the automatic stop chose). `None` for non-SAEM methods.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saem_n_exploration_used: Option<usize>,
+    /// How the gradient E-step kernel ran (`saem_kernel = hmc | nuts`); `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saem_gradient_kernel: Option<SaemGradientKernelStats>,
+    /// The SAEM E-step's kernels as they ran, per chain per iteration (`imh 1, hmc 1`): the
+    /// `saem_kernel` preset with the `isample_*` counts the caller set. `None` for non-SAEM
+    /// methods and the legacy `rw` / `imh` kernels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saem_kernels: Option<String>,
     /// The numerical θ/σ M-step optimizer a SAEM, IMP or IMPMAP fit actually ran
     /// (`newton`, `bobyqa` or `lbfgs`): what `[fit_options] mstep_optimizer = auto`
     /// (the default) resolved to for this model. `None` for other methods and where no
@@ -9735,16 +9743,33 @@ pub struct FitOptions {
     /// replicated `n` times for the SAEM iterations, and the final EBEs, OFV and
     /// covariance step use the original subjects. `1` is the single-chain SAEM.
     pub saem_n_chains: usize,
-    /// [`SaemKernel::Nonmem`]: independence proposals from `N(0, Ω)` per chain per
-    /// iteration (NONMEM `ISAMPLE_M1`, default 2).
-    pub saem_isample_m1: usize,
-    /// [`SaemKernel::Nonmem`]: independence proposals from the subject's running
-    /// conditional mean and covariance (NONMEM `ISAMPLE_M1B`, default 2).
-    pub saem_isample_m1b: usize,
-    /// [`SaemKernel::Nonmem`]: block random-walk proposals (NONMEM `ISAMPLE_M2`, default 2).
-    pub saem_isample_m2: usize,
-    /// [`SaemKernel::Nonmem`]: componentwise sweeps (NONMEM `ISAMPLE_M3`, default 2).
-    pub saem_isample_m3: usize,
+    /// The SAEM E-step's kernels, as counts per chain per iteration (#2986): any combination,
+    /// run in the fixed order `m1, imh, m1b, hmc, nuts, m2, m3`, every one of them leaving the
+    /// subject's conditional posterior invariant. A count left `None` is taken from the
+    /// [`Self::saem_kernel`] preset (see [`SaemKernel`]); a count set here overrides it.
+    /// `0` turns a kernel off. Ignored under the legacy presets `rw` and `imh`.
+    ///
+    /// `m1`: independence proposals from the population density `N(0, Ω)` (NONMEM
+    /// `ISAMPLE_M1`).
+    pub saem_isample_m1: Option<usize>,
+    /// `imh`: f-SAEM independence proposals from the subject's Laplace approximation
+    /// `N(η̂_i, c·Γ_i)` (Karimi, Lavielle & Moulines 2020), refreshed every
+    /// `saem_imh_refresh` iterations. Where the model is outside its scope its count runs as
+    /// `m1`.
+    pub saem_isample_imh: Option<usize>,
+    /// `m1b`: independence proposals from the chain's running conditional mean and covariance
+    /// (NONMEM `ISAMPLE_M1B`).
+    pub saem_isample_m1b: Option<usize>,
+    /// `hmc`: preconditioned Hamiltonian Monte Carlo transitions on the AD engine's exact
+    /// η-gradient (joint with κ under IOV). A chain the engine gives no gradient for runs two
+    /// `m2` and two `m3` moves in their place that iteration.
+    pub saem_isample_hmc: Option<usize>,
+    /// `nuts`: No-U-Turn transitions, otherwise as `hmc`.
+    pub saem_isample_nuts: Option<usize>,
+    /// `m2`: block random-walk proposals `η + s·chol(Ω)·z` (NONMEM `ISAMPLE_M2`).
+    pub saem_isample_m2: Option<usize>,
+    /// `m3`: componentwise random-walk sweeps (NONMEM `ISAMPLE_M3`).
+    pub saem_isample_m3: Option<usize>,
     /// [`SaemKernel::Nonmem`]: target acceptance of the random-walk kernels (NONMEM
     /// `IACCEPT`, default 0.4).
     pub saem_iaccept: f64,
@@ -10482,10 +10507,13 @@ impl Default for FitOptions {
             saem_smoothing_exponent: 1.0,
             saem_n_convergence: 1000,
             saem_n_chains: 2,
-            saem_isample_m1: 2,
-            saem_isample_m1b: 2,
-            saem_isample_m2: 2,
-            saem_isample_m3: 2,
+            saem_isample_m1: None,
+            saem_isample_m1b: None,
+            saem_isample_m2: None,
+            saem_isample_m3: None,
+            saem_isample_imh: None,
+            saem_isample_hmc: None,
+            saem_isample_nuts: None,
             saem_iaccept: 0.4,
             saem_mceta: 0,
             // 0 = `auto`: resolved from the dataset by
@@ -11197,6 +11225,29 @@ pub enum SaemOfv {
     Focei,
 }
 
+/// How a SAEM fit's gradient E-step kernel ran (`saem_kernel = hmc | nuts`, #2986), so a
+/// caller can see a sampler that struggled without parsing a warning.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
+pub struct SaemGradientKernelStats {
+    /// Gradient transitions run (per chain per iteration where the AD engine gave the
+    /// η-gradient).
+    pub transitions: u64,
+    /// Chain-iterations the engine gave no gradient for, which ran NONMEM's kernels 2 and 3.
+    pub declined: u64,
+    /// Transitions in the averaging phase whose energy error exceeded 1000 or went
+    /// non-finite, or whose gradient failed mid-trajectory (rejected; Stan's divergences).
+    /// Exploration's are not counted: it starts far from the posterior.
+    pub divergences: u64,
+    /// Mean leapfrog steps per transition.
+    pub mean_leapfrog: f64,
+    /// Mean acceptance probability (HMC) or acceptance statistic (NUTS) over the averaging
+    /// phase, where the step size is frozen; `None` when that phase ran no transition.
+    pub mean_accept: Option<f64>,
+    /// Median over chains of the frozen step size, in the metric's whitened coordinates
+    /// (bounded to `[0.02, 1.9]`).
+    pub median_step_size: f64,
+}
+
 /// What the OFV of a SAEM fit is, when it is not the FOCE/Laplace value (#2973). Surfaced on
 /// [`FitResult::saem_objective`]; `None` there means `ofv` is the FOCE/Laplace objective.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
@@ -11819,6 +11870,9 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "isample_m1b",
             "isample_m2",
             "isample_m3",
+            "isample_imh",
+            "isample_hmc",
+            "isample_nuts",
             "iaccept",
             "mceta",
             "n_mh_steps",

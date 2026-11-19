@@ -12217,11 +12217,14 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.saem_smoothing_exponent = v;
         }
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
-        "isample_m1" => opts.saem_isample_m1 = parse_usize(key)?,
+        "isample_m1" => opts.saem_isample_m1 = Some(parse_usize(key)?),
         "mceta" => opts.saem_mceta = parse_usize(key)?,
-        "isample_m1b" => opts.saem_isample_m1b = parse_usize(key)?,
-        "isample_m2" => opts.saem_isample_m2 = parse_usize(key)?,
-        "isample_m3" => opts.saem_isample_m3 = parse_usize(key)?,
+        "isample_m1b" => opts.saem_isample_m1b = Some(parse_usize(key)?),
+        "isample_m2" => opts.saem_isample_m2 = Some(parse_usize(key)?),
+        "isample_m3" => opts.saem_isample_m3 = Some(parse_usize(key)?),
+        "isample_imh" => opts.saem_isample_imh = Some(parse_usize(key)?),
+        "isample_hmc" => opts.saem_isample_hmc = Some(parse_usize(key)?),
+        "isample_nuts" => opts.saem_isample_nuts = Some(parse_usize(key)?),
         "iaccept" => {
             let v = parse_f64(key)?;
             if !(v.is_finite() && v > 0.0 && v < 1.0) {

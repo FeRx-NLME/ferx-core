@@ -3777,6 +3777,8 @@ fn fit_inner(
         saem_n_subjects_hmc: result.saem_n_subjects_hmc,
         saem_mh_accept_tail: result.saem_mh_accept_tail,
         saem_n_exploration_used: result.saem_n_exploration_used,
+        saem_gradient_kernel: result.saem_gradient_kernel.clone(),
+        saem_kernels: result.saem_kernels.clone(),
         mstep_optimizer_used: result.mstep_optimizer_used,
         gradient_method_inner: grad_inner.as_str().to_string(),
         gradient_method_outer: grad_outer.as_str().to_string(),

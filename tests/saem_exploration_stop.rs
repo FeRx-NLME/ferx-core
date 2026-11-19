@@ -272,6 +272,10 @@ fn gradient_kernels_are_served_differ_and_recover_the_truth() {
             r.warnings
         );
         assert_ne!(r.theta, nm.theta, "{kernel:?} reaches the E-step");
+        let want = if kernel == SaemKernel::Hmc { "imh 1, hmc 1" } else { "imh 1, nuts 1" };
+        assert_eq!(r.saem_kernels.as_deref(), Some(want), "the fit reports the schedule it ran");
+        let g = r.saem_gradient_kernel.as_ref().expect("gradient diagnostics");
+        assert!(g.transitions > 0 && g.declined == 0, "{g:?}");
         for (name, got, truth) in [("CL", r.theta[0], 5.0), ("V", r.theta[1], 50.0)] {
             assert!(
                 (got / truth - 1.0).abs() < 0.15,
@@ -312,4 +316,44 @@ fn the_gradient_kernel_serves_an_iov_model() {
     );
     assert!(hmc.ofv.is_finite());
     assert_ne!(hmc.theta, nm.theta, "the joint move reaches the E-step");
+}
+
+/// #2986: a user picks the kernels. A combination no preset names — f-SAEM jumps, HMC and a
+/// componentwise sweep — runs, is reported in its order, and differs from HMC alone; the
+/// default reports NONMEM's schedule; every count at 0 is refused with a message naming the
+/// counts.
+#[test]
+fn a_user_chosen_kernel_combination_runs_and_all_zero_is_refused() {
+    use ferx_core::types::SaemKernel;
+    let fixed = |o: &mut FitOptions| {
+        o.saem_n_exploration = Some(40);
+        o.saem_n_convergence = 40;
+    };
+    let nm = run(fixed);
+    assert_eq!(nm.saem_kernels.as_deref(), Some("m1 2, m1b 2, m2 2, m3 2"));
+    let hmc = run(|o| {
+        fixed(o);
+        o.saem_kernel = SaemKernel::Hmc;
+    });
+    let mix = run(|o| {
+        fixed(o);
+        o.saem_kernel = SaemKernel::Hmc;
+        o.saem_isample_imh = Some(0);
+        o.saem_isample_m3 = Some(1);
+    });
+    assert_eq!(mix.saem_kernels.as_deref(), Some("hmc 1, m3 1"));
+    assert_ne!(mix.theta, hmc.theta, "the added kernels reach the E-step");
+    let model = parse_model_string(MODEL).expect("parses");
+    let pop = population(&model);
+    let mut o = FitOptions {
+        method: EstimationMethod::Saem,
+        saem_isample_m1: Some(0),
+        saem_isample_m1b: Some(0),
+        saem_isample_m2: Some(0),
+        saem_isample_m3: Some(0),
+        ..FitOptions::default()
+    };
+    fixed(&mut o);
+    let err = fit(&model, &pop, &model.default_params, &o).expect_err("no kernel moves η");
+    assert!(format!("{err}").contains("every E-step kernel count is 0"), "{err}");
 }

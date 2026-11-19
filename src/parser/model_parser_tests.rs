@@ -3844,7 +3844,7 @@ fn test_apply_fit_option_saem_exploration_stop_and_smoothing() {
     }
     assert_eq!(
         (opts.saem_isample_m1, opts.saem_isample_m1b, opts.saem_isample_m2, opts.saem_isample_m3),
-        (3, 0, 4, 1)
+        (Some(3), Some(0), Some(4), Some(1))
     );
     assert_eq!(opts.saem_mceta, 0, "NONMEM's default MCETA");
     assert_eq!(apply_fit_option(&mut opts, "mceta", "100"), Ok(true));
