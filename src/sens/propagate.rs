@@ -1091,7 +1091,20 @@ fn propagate_bounds_g<T: PkNum>(
     // A covariate-change record at the interval's left / right edge (see below).
     rec_left: bool,
     rec_right: bool,
+    // The windows walked without a break at their end (#3033, `walked_ends`); `doses` carries
+    // each as a zero-length, zero-rate dose, and `index` is over those `doses`.
+    walked: &[WalkedEnd<T>],
 ) -> Option<EdgeGroup<T>> {
+    // The schedule's bounds hold a walked end at the value it had where the schedule was built:
+    // the interval's own bounds over the walk's doses, which have none.
+    let own_bounds;
+    let bounds = match (bounds.first(), bounds.last()) {
+        (Some(&lo), Some(&hi)) if bounds.len() > 2 && !walked.is_empty() => {
+            own_bounds = crate::pk::event_driven::compute_propagation_bounds(lo, hi, index);
+            &own_bounds[..]
+        }
+        _ => bounds,
+    };
     let lo = bounds.first().copied();
     let hi = bounds.last().copied();
     let mut moving_bounds = collect_breaks(
@@ -1197,8 +1210,14 @@ fn propagate_bounds_g<T: PkNum>(
             Vec::new()
         };
         if group.len() < 2 {
-            let dt = dual_pos(w[1]) - dual_pos(w[0]);
-            apply_step_g(state, dt, pk, pk_model, rates);
+            let (a, b) = (dual_pos(w[0]), dual_pos(w[1]));
+            match walked
+                .iter()
+                .find(|we| we.start <= w[0] && w[1] <= we.until)
+            {
+                Some(we) => walk_cut(state, a, b, we, pk, pk_model, rates),
+                None => apply_step_g(state, b - a, pk, pk_model, rates),
+            }
             continue;
         }
         // Several breaks at this instant, each carrying its own jet. The flow is linear in
@@ -1243,6 +1262,147 @@ enum BrkKind {
 struct EdgeGroup<T> {
     pos: T,
     last: BrkKind,
+}
+
+/// A modeled infusion window walked without a break at its end (#3033). As a break, the end
+/// was sorted against the observations, and a recording keeps the walk's order of its breaks as
+/// a guard: every point of an EBE search that moved the end across a sample recorded and
+/// compiled the subject again. Walked, each sub-interval between the dose's arrival and the
+/// next infusion's is cut where the end falls ([`walk_cut`]), chosen on every evaluation, so the
+/// end can move anywhere inside that span under one recording.
+pub(crate) struct WalkedEnd<T> {
+    /// The dose this window belongs to.
+    dose: usize,
+    /// Its arrival, and the next infusion's (`∞` past the last): the span the end is walked in.
+    start: f64,
+    until: f64,
+    /// The end, with its derivatives.
+    end: T,
+    /// The channel the rate enters, and the rate.
+    ch: Channel,
+    rate: T,
+}
+
+/// The windows of `eff_doses` the walk can carry without a break at their end (#3033): a
+/// modeled window (its end moves with `D`/`R`, or with `F` on a rate-defined dose) on a subject
+/// with no lag in scope, no steady-state dose and no reset, whose dose is the only infusion
+/// arriving at its instant. Two checks stay, recorded as guards since they decide the
+/// structure: the end comes before the next infusion's arrival, so the windows walked are
+/// disjoint and none holds another's arrival; and no moving end left as a break (an earlier
+/// window this does not walk) lies past this one's arrival, inside its span. Anything else keeps
+/// its end as a break, as before.
+fn walked_ends<T: PkNum>(
+    subject: &Subject,
+    schedule: &EventSchedule,
+    eff_doses: &[DoseEvent],
+    dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>],
+    pk_model: PkModel,
+) -> Vec<WalkedEnd<T>> {
+    use crate::sens::num::BranchCmp as B;
+    if !dose_lag_dual.is_empty()
+        || !dose_inf_dual.iter().any(Option::is_some)
+        || !subject.reset_times.is_empty()
+        || eff_doses.iter().any(|d| d.ss)
+    {
+        return Vec::new();
+    }
+    let arrival =
+        |k: usize| eff_doses[k].time + schedule.dose_lagtimes.get(k).copied().unwrap_or(0.0);
+    let infusing = |d: &DoseEvent| d.rate > 0.0 && d.duration > 0.0;
+    let mut order: Vec<usize> = (0..eff_doses.len()).collect();
+    order.sort_by(|&i, &j| arrival(i).total_cmp(&arrival(j)).then(i.cmp(&j)));
+    let mut walked = Vec::new();
+    // The moving ends left as breaks: a later span must not hold one.
+    let mut hard_ends: Vec<T> = Vec::new();
+    for &k in &order {
+        let d = &eff_doses[k];
+        if !infusing(d) {
+            continue;
+        }
+        // A fixed window's end does not move with no lag in scope.
+        let Some((rate, dur)) = dose_inf_dual.get(k).copied().flatten() else {
+            continue;
+        };
+        let start = arrival(k);
+        let end = T::from_f64(start) + dur;
+        let others = || {
+            eff_doses
+                .iter()
+                .enumerate()
+                .filter(move |&(j, o)| j != k && infusing(o))
+                .map(|(j, _)| arrival(j))
+        };
+        let until = others()
+            .filter(|&t| t > start)
+            .fold(f64::INFINITY, f64::min); // nan-ok: arrivals are finite event times
+        let alone = others().all(|t| t != start);
+        let ch = pk_model.topology().dose_channel(d.cmt_raw());
+        let ok = alone
+            && ch.is_some()
+            && hard_ends
+                .iter()
+                .all(|e| e.br_cmp(B::Le, T::from_f64(start)))
+            && (until == f64::INFINITY || end.br_cmp(B::Lt, T::from_f64(until)));
+        match ch.filter(|_| ok) {
+            Some(ch) => walked.push(WalkedEnd {
+                dose: k,
+                start,
+                until,
+                end,
+                ch,
+                rate,
+            }),
+            None => {
+                if !end.is_constant() {
+                    hard_ends.push(end);
+                }
+            }
+        }
+    }
+    walked
+}
+
+/// One sub-interval `[a, b]` of a walked window's span ([`WalkedEnd`]), under the other
+/// infusions' `rates`: the window's rate on throughout where its end is at or past `b`, off
+/// throughout where the end is before `a`, and otherwise on up to the end and off after it.
+/// The three are chosen per evaluation (`select_if`), so moving the end across `a` or `b` (a
+/// sample, a record, a fixed break) changes no structure.
+///
+/// The two whole-interval arms are the steps the value walk takes on a sub-interval that holds
+/// no window end, and the cut arm the two it takes on one that does, so the values are the value
+/// walk's bit for bit. Only the cut arm reads the end: its pieces' lengths `m − a` and `b − m`
+/// carry the end's derivatives, and their exact closed-form flows differentiate through `m` to
+/// the rate-off boundary term with no saltation to add. `m` is clamped into `[a, b]`, so the
+/// arm not chosen never steps backwards. An end exactly on `a` is cut there (a zero-length
+/// first piece carrying its derivative) and one exactly on `b` leaves the rate on: the end
+/// belongs to the later sub-interval, production's convention for a window end on a sample (the
+/// window still contributes) and on a covariate change (crossed after the new parameters hold).
+#[allow(clippy::too_many_arguments)]
+fn walk_cut<T: PkNum>(
+    state: &mut [T],
+    a: T,
+    b: T,
+    we: &WalkedEnd<T>,
+    pk: &PkDual<T>,
+    pk_model: PkModel,
+    rates: (T, T, T, T),
+) {
+    use crate::sens::num::BranchCmp as B;
+    let on = add_rate(rates, we.ch, we.rate);
+    let lo = T::select_if(B::Lt, we.end, a, a, we.end);
+    let m = T::select_if(B::Gt, lo, b, b, lo);
+    let mut cut = state.to_vec();
+    apply_step_g(&mut cut, m - a, pk, pk_model, on);
+    apply_step_g(&mut cut, b - m, pk, pk_model, rates);
+    let mut whole_on = state.to_vec();
+    apply_step_g(&mut whole_on, b - a, pk, pk_model, on);
+    let mut whole_off = state.to_vec();
+    apply_step_g(&mut whole_off, b - a, pk, pk_model, rates);
+    for (i, x) in state.iter_mut().enumerate() {
+        let inside = T::select_if(B::Lt, we.end, a, whole_off[i], cut[i]);
+        *x = T::select_if(B::Ge, we.end, b, whole_on[i], inside);
+    }
 }
 
 /// The channel and signed rate a break switches: an infusing dose's window opening adds its
@@ -1840,6 +2000,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             false,
             false,
+            &[],
         );
         Some(s)
     };
@@ -1884,6 +2045,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             false,
             false,
+            &[],
         );
         cycles_run = cycle + 1;
         if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev, &mut prev_t) {
@@ -1977,6 +2139,7 @@ fn ss_state_at_phase_g<T: PkNum>(
         &[(phase_v, record_end)],
         false,
         false,
+        &[],
     );
     state
 }
@@ -2109,6 +2272,62 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     }
     let (n_states, central_slot) = state_layout_g(pk_model);
 
+    // Whether a modeled dose infuses at all is read off its resolved `eff_doses` entry, a plain
+    // value: a recording keeps it as the structure, with no guard of its own. A window that
+    // overflows (`D = TVD1·e^η` at an `η` an EBE search's runaway step reaches) resolves to
+    // `rate = amt/∞ = 0`, a dose that does not infuse, and that recording then served every
+    // finite window as one that does not either — predictions near zero, and an objective the
+    // inner search could not leave (#3033's `ADVAN1` anchor). The same decision taken on the
+    // dual window is recorded as the guard; here, at the recording's own point, it is the
+    // resolved dose's (`resolve_eff_doses` divides the same values).
+    if T::RECORDS_BRANCHES {
+        use crate::sens::num::BranchCmp as B;
+        for &(rate, dur) in dose_inf_dual.iter().flatten() {
+            let _infuses = rate.br_cmp_c(B::Gt, 0.0) && dur.br_cmp_c(B::Gt, 0.0);
+        }
+    }
+
+    // #3033: a modeled window whose end moves with the inputs is walked without a break at its
+    // end (`walked_ends`). The rest of the walk sees its dose as a zero-length, zero-rate one —
+    // no window, no end, no rate of its own in `active_rates_g` — and each sub-interval of its
+    // window adds the rate where the end leaves it on (`walk_cut`). The arrival is still the
+    // dose event it was.
+    let walked = walked_ends(
+        subject,
+        schedule,
+        eff_doses,
+        dose_lag_dual,
+        dose_inf_dual,
+        pk_model,
+    );
+    let (walk_doses, walk_inf);
+    let (eff_doses, dose_inf_dual): (&[DoseEvent], &[Option<(T, T)>]) = if walked.is_empty() {
+        (eff_doses, dose_inf_dual)
+    } else {
+        walk_doses = eff_doses
+            .iter()
+            .enumerate()
+            .map(|(k, d)| {
+                let mut d = d.clone();
+                if walked.iter().any(|w| w.dose == k) {
+                    d.rate = 0.0;
+                    d.duration = 0.0;
+                }
+                d
+            })
+            .collect::<Vec<_>>();
+        walk_inf = (0..eff_doses.len())
+            .map(|k| {
+                if walked.iter().any(|w| w.dose == k) {
+                    None
+                } else {
+                    dose_inf_dual.get(k).copied().flatten()
+                }
+            })
+            .collect::<Vec<_>>();
+        (&walk_doses, &walk_inf)
+    };
+
     // A recording keeps the order of the walk's breaks, which the lagged arrivals and the
     // infusion window ends (moving with a lag, a modeled `D`/`R` or `F`) decide: each adjacent
     // pair's relation (earlier, or tied) is a guard on the recorded times (#2786).
@@ -2234,6 +2453,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 &[],
                 rec_left,
                 rec_right,
+                &walked,
             );
             cur_t = ev.time;
         }
@@ -2272,6 +2492,11 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     continue;
                 }
                 dosed = true;
+                // A walked window's rate is added by its sub-intervals (`walk_cut`): its zeroed
+                // dose here is no bolus.
+                if walked.iter().any(|w| w.dose == ev.orig_idx) {
+                    continue;
+                }
                 // Dose attributes belong to the dose row, so `F` and the SS
                 // equilibration read that row's snapshot — never `pk_now`, which
                 // after #1073 is the next record's (#1073).

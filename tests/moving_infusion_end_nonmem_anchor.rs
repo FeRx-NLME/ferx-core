@@ -1,7 +1,10 @@
 //! NONMEM anchor for an infusion end that moves with the parameters across observations
 //! (#3010): a duration-modeled infusion (`RATE=-2`, `D1 = TVD1·exp(η)`) on a linear `[odes]`
 //! model, whose ends ferx walks inside their dosing interval rather than sorting them against
-//! the observations (`integrate_tvcov_g`'s `soft`, `ode::linear::AffinePieces`).
+//! the observations (`integrate_tvcov_g`'s `soft`, `ode::linear::AffinePieces`) — and the same
+//! model on the closed form, `pk one_cpt_iv` (#3033), whose analytic event walk walks them the
+//! same way (`sens::propagate`'s `walked_ends` / `walk_cut`). The control stream is an
+//! `ADVAN1 TRANS2` one, so the closed-form test is its literal twin.
 //!
 //! The kit is `nonmem_anchor/moving_infusion_end*`: the dataset (60 subjects, four doses q12h,
 //! sampled 1, 2, 2.5, 3, 6 and 11.5 h after each, simulated from the closed form by
@@ -76,9 +79,43 @@ fn nonmem_obj() -> Vec<(String, f64)> {
 /// are what ran.
 #[test]
 fn objective_matches_nonmem_with_infusion_ends_crossing_observations() {
-    let model = parse_full_model(MODEL_AT_NONMEM_ESTIMATES)
+    objective_matches_nonmem(MODEL_AT_NONMEM_ESTIMATES, &[]);
+}
+
+/// The same anchor on the closed form (#3033): [`MODEL_AT_NONMEM_ESTIMATES`] with its `[odes]`
+/// block swapped for `pk one_cpt_iv`, the model `ADVAN1 TRANS2` itself computes. Its inner
+/// searches move the ends across the samples through the analytic event walk's walked ends
+/// (`sens::propagate`'s `walked_ends`).
+///
+/// Measured: 58 subjects equal to NONMEM's objective within 9.8e-8 (bound 1e-6). On two the
+/// closed form's inner search stops **lower** than the point NONMEM evaluated, which started
+/// from the `[odes]` fit's EBEs (`MCETA=1`), so those two are held to "not above NONMEM":
+/// ID 32 in another mode, 0.164 lower (−51.7303 against −51.5658; the subject whose modes
+/// NONMEM's cold search also split); and ID 27 by 1.7e-6, whose mode is a corner — its first
+/// infusion end sits on the 3 h sample (2.99999999999999 h), where the objective has a kink,
+/// so the 1e-6 differences in η between the two points show to first order rather than second.
+///
+/// Before #3033 this test failed on 41 subjects: a plan recorded where a runaway EBE step had
+/// overflowed `D` to `∞` served every finite `D` as no infusion
+/// (`a_plan_recorded_at_an_overflowed_window_does_not_serve_a_finite_one`).
+#[test]
+fn closed_form_objective_matches_nonmem_with_infusion_ends_crossing_observations() {
+    let ode = "  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n";
+    assert!(MODEL_AT_NONMEM_ESTIMATES.contains(ode));
+    let closed_form = MODEL_AT_NONMEM_ESTIMATES.replace(ode, "  pk one_cpt_iv(cl=CL, v=V)\n");
+    objective_matches_nonmem(&closed_form, &["27", "32"]);
+}
+
+/// The anchor on the model `src`: every subject's objective equal to NONMEM's, except the
+/// subjects in `lower`, whose objective may only be at or below it (a better point of the
+/// subject's own objective than the one NONMEM evaluated) — and must be: one that matches is a
+/// stale exemption.
+fn objective_matches_nonmem(src: &str, lower: &[&str]) {
+    let model = parse_full_model(src)
         .expect("the anchor model parses")
         .model;
+    // The engine the test names: the closed form has no ODE system.
+    assert_eq!(model.ode_spec.is_some(), src.contains("[odes]"));
     let pop = read_nonmem_csv(
         Path::new("nonmem_anchor/moving_infusion_end.csv"),
         None,
@@ -126,6 +163,18 @@ fn objective_matches_nonmem_with_infusion_ends_crossing_observations() {
             .unwrap_or_else(|| panic!("subject {id} in the fit"));
         let gap = (s.ofv_contribution - obj).abs();
         assert!(gap.is_finite(), "subject {id}: {}", s.ofv_contribution);
+        if lower.contains(&id.as_str()) {
+            eprintln!(
+                "subject {id}: ferx {:.10} vs NONMEM {obj:.10}",
+                s.ofv_contribution
+            );
+            assert!(
+                s.ofv_contribution < obj - 1e-6,
+                "subject {id}: below NONMEM, ferx {:.10} vs {obj:.10}",
+                s.ofv_contribution
+            );
+            continue;
+        }
         assert!(
             gap < 1e-6,
             "subject {id}: ferx {:.10} vs NONMEM {obj:.10}",
@@ -133,14 +182,24 @@ fn objective_matches_nonmem_with_infusion_ends_crossing_observations() {
         );
         worst = worst.max(gap);
     }
-    let total: f64 = want.iter().map(|w| w.1).sum();
+    // The total over the subjects held to equality.
+    let total: f64 = want
+        .iter()
+        .filter(|w| !lower.contains(&w.0.as_str()))
+        .map(|w| w.1)
+        .sum();
+    let ours: f64 = result
+        .subjects
+        .iter()
+        .filter(|s| !lower.contains(&s.id.as_str()))
+        .map(|s| s.ofv_contribution)
+        .sum();
     eprintln!(
-        "worst subject {worst:e}; ferx {:.10} vs NONMEM {total:.10}; ends early {early} late {late}",
+        "worst subject {worst:e}; ferx {ours:.10} vs NONMEM {total:.10} (OFV {:.10}); ends early {early} late {late}",
         result.ofv
     );
     assert!(
-        (result.ofv - total).abs() < 1e-5,
-        "ferx {:.10} vs NONMEM {total:.10}",
-        result.ofv
+        (ours - total).abs() < 1e-5,
+        "ferx {ours:.10} vs NONMEM {total:.10}"
     );
 }
