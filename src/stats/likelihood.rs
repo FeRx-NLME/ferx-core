@@ -3601,8 +3601,8 @@ pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -
     c
 }
 
-/// Build a block-diagonal omega from BSV omega and K copies of IOV omega.
-/// Used for the extended H-matrix in the FOCE outer loop with IOV.
+/// Build a block-diagonal omega from BSV omega and K copies of IOV omega (a test oracle
+/// for the stacked `[η | κ_1 … κ_K]` covariance).
 #[cfg(test)]
 pub(crate) fn build_block_diag_omega(
     omega_bsv: &DMatrix<f64>, omega_iov: &DMatrix<f64>, n_occasions: usize,

@@ -1199,8 +1199,7 @@ fn equilibrate_ss_pk_state(
             .collect();
         let local_f_bio = vec![f_bio; n_pulses];
         // One empty slice serves both callees: `wrap_rhs_with_forcings` and `tad_anchor_for` read
-        // lags
-        // with `.get(k)`, so `&[]` means "no lag" (pinned by
+        // lags with `.get(k)`, so `&[]` means "no lag" (pinned by
         // `ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice`).
         //
         // A lagged dose (#2786) staggers each synthetic pulse's arrival by the same lag, clamped so

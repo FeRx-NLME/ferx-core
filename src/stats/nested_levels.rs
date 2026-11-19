@@ -325,7 +325,7 @@ fn cells_assigned(subject: &Subject) -> bool {
 
 /// A nested-level model with a subject that has no [`NestedLayout`]: the population was
 /// not prepared for the fit (`fitted_population` never ran, as on the lower-level entry
-/// points `optimize_population` / `run_inner_loop` handed a population as read), or a
+/// point `optimize_population` handed a population as read), or a
 /// record kept a missing label. The estimator must not fall back to one-level IOV for it,
 /// which would integrate κ per record kind as read, or drop κ altogether; each site
 /// refuses the subject with its own sentinel instead (review r1 #6 on #2028).

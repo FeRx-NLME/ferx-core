@@ -1034,7 +1034,10 @@ pub(crate) fn record_pk_inputs(
 ///
 /// A `TIME`-reading program shares nothing (sharing found almost nothing and was 9–13%
 /// slower, #2543 review r1). A model without a parsed program shares nothing either; a
-/// parsed model is trusted to have the `pk_param_fn` its program describes.
+/// parsed model is trusted to have the `pk_param_fn` its program describes: `pk_param_fn` is a
+/// public field, and replacing it on a parsed model with a closure that reads a column the
+/// program does not reference would share records that differ in that column, silently. No
+/// code outside tests replaces it.
 pub(crate) fn first_record_with_same_pk_inputs<'a>(
     model: &CompiledModel,
     records: impl IntoIterator<Item = (Option<usize>, &'a std::collections::HashMap<String, f64>)>,
@@ -1481,6 +1484,18 @@ pub(crate) fn ltbs_log_g<T: crate::sens::num::PkNum>(p: T) -> T {
     p.guard_floor(LTBS_FLOOR).ln()
 }
 
+/// IOV predictions with per-dose occasion accounting (#104): per-event PK parameters carry
+/// each event's occasion κ and the event-driven solver runs once. Its end-of-interval
+/// convention eliminates a dose's carryover into a later occasion with the *later*
+/// occasion's clearance, as NONMEM's continuous integration does.
+///
+/// `eta_bsv` is the BSV η (length `n_eta`); `kappas[k]` is the κ vector for the k-th
+/// occasion group in `iov_occasion_groups` order, including dose-only, pk-only-only and
+/// reset-only occasions. A dose, pk-only (`EVID=2`, or `EVID=0` with `MDV=1`) or reset
+/// (`EVID=3/4`) row runs under its own occasion; zero κ only for a row with no label
+/// (#1876, #1153). Every model has event-driven or ODE support, so the dispatch is total.
+/// A Form C output (`y = <expr>`) referencing `KAPPA_*` would see κ = 0, so the parser
+/// rejects it for IOV models (#107).
 pub fn predict_iov(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta_bsv: &[f64], kappas: &[Vec<f64>],
 ) -> Vec<f64> {

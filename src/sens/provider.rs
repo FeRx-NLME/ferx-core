@@ -567,7 +567,7 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
 // boundary, then the carried-over amount continues with occasion-2 params. Dose
 // superposition with a single per-subject `pk` (the static path)
 // cannot represent that, so IOV runs through the **event-driven sensitivity
-// walk** (`crate::sens::propagate::event_driven_sens_one_cpt_g`) instead — the
+// walk** (`crate::sens::propagate::event_driven_sens_g`) instead — the
 // same engine production's `predict_iov` uses for the f64 prediction, here over
 // `Dual2`.
 //

@@ -300,8 +300,10 @@ where
 ///
 /// Mixed test on the per-cycle **increment** (#532): `|cur − prev| ≤ tol·|cur| + tol·max_mag`.
 /// Testing the increment keeps a small compartment still in transit from passing for being
-/// small; the `tol·max_mag` floor lets a settled near-zero compartment pass. Gradients matched a
-/// full budget to `< 1e-6`.
+/// small; the `tol·max_mag` floor lets a settled near-zero compartment pass (without it the loop
+/// could never stop). The stop fires only once every increment is below f64-relative precision,
+/// so predictions are unchanged to f64 precision; gradients matched a full budget to `< 1e-6`
+/// (measured pre-#2093; since #914 this early stop runs only on the nonlinear fallback).
 ///
 /// A non-finite compartment never converges, so a blow-up runs the full budget and surfaces
 /// (`f64::max` would otherwise drop a `NaN`).

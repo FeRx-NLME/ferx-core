@@ -174,7 +174,7 @@ pub(crate) fn three_cpt_oral_peripherals(
 ) -> [f64; 2] {
     // This function implements the bolus-only oral formula (depot → central → peripherals).
     // Infusion doses bypass the depot compartment entirely and must be routed through
-    // `three_cpt_infusion`/`three_cpt_iv_peripherals` by the caller — see `three_cpt_predict`.
+    // `three_cpt_infusion`/`three_cpt_iv_peripherals` by the caller (as `single_dose_states` does).
     debug_assert!(
         !dose.is_infusion(),
         "three_cpt_oral_peripherals called with an infusion dose — route infusions through three_cpt_iv_peripherals"

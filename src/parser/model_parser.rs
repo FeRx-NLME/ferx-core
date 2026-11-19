@@ -624,7 +624,7 @@ fn reads_unresolved_local<'a, V: RhsView<'a>>(v: V) -> bool {
     }
 }
 
-/// `k` for a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition; anything else is `None`,
+/// The 1-based class index `k` for a `MIXNUM == <k>` (or `<k> == MIXNUM`) condition; anything else is `None`,
 /// rejecting the chain to the numerical M-step (#996).
 fn mixnum_eq_class(cond: &Condition) -> Option<usize> {
     let Condition::Compare(lhs, CmpOp::Eq, rhs) = cond else {

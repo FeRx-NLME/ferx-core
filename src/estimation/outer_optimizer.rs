@@ -3670,9 +3670,12 @@ fn settle_start_probe(
 }
 
 /// The result for a start the probe verified (#2506): the probe's `converged` and warnings
-/// at the **lower** of the two points (the probe's `ftol` can end ~1e-3 above an optimal
-/// start, `two_cpt_iv`). When `start_wins`, everything tied to the point is the unmoved
-/// run's. `left`: whether the estimates moved by [`INIT_ESCAPE_STEP_S`]; if not, published
+/// at the **lower** of the two points. `start_wins` says the unmoved run's penalized
+/// objective is at or below the probe's (the probe's `ftol` can end ~1e-3 above an optimal
+/// start, `two_cpt_iv`), and a fit must not publish a point worse than one it already
+/// evaluated. When `start_wins`, everything tied to the point (estimates, objective, EBEs,
+/// covariance, final gradient) is the unmoved run's. `left`: whether the estimates moved by
+/// [`INIT_ESCAPE_STEP_S`] (never, when the start wins); if not, published
 /// `left_init = Some(false)`, `stationary_start = true` (a warm start for
 /// `model_selection::stalled_at_init`). The unmoved run's evaluations count and its
 /// `start_eval` is published (#2461).
@@ -3684,9 +3687,9 @@ fn verified_start_result(
     probe.left_init = Some(left);
     probe.stationary_start = !left;
     probe.n_iterations += unmoved.n_iterations;
-    // The covariance quartet goes with `packed_estimate` (#816). Off NLopt the covariance
-    // warnings stay the probe's (a point within `START_PROBE_TOL`); on NLopt the step is
-    // deferred to the reported point. The probe's restart cause stays (adopted only when lower).
+    // The covariance quartet goes with `packed_estimate` (#816). The covariance step's warnings
+    // cannot be told apart from the probe's others, so off NLopt they stay the probe's (a point
+    // within `START_PROBE_TOL`); on NLopt the step is deferred to the reported point. The probe's restart cause stays (adopted only when lower).
     if start_wins {
         probe.params = unmoved.params;
         probe.ofv = unmoved.ofv;
@@ -4732,19 +4735,22 @@ const MAX_BASIN_RESTARTS: usize = 3;
 /// after an EBE mode switch degenerated the curvature pair.
 ///
 /// Safeguards:
-/// - runs **only** on `mid_descent_stall`, on what the stalled leg left of the budget
+/// - runs **only** on `mid_descent_stall` (a converged fit, a plateaued `Failure` and a
+///   `MaxEvalReached` success are untouched), on what the stalled leg left of the budget
 ///   ([`RestartLeg::spent_evals`], #1428), so both legs are bounded by `outer_maxiter`
 ///   (L-BFGS may overshoot by a few evals);
 /// - adopted only on a **strictly lower** penalized objective;
-/// - `cancelled` short-circuits.
+/// - `cancelled` short-circuits: a cancelled run stops through the objective's 1e20 short-
+///   circuit, not at a minimum, and would look like a stall.
 ///
-/// One restart per stall; a basin-shift restart may repeat (`MAX_BASIN_RESTARTS`, #2093) on
-/// the same budget. Not gated on the optimizer (SLSQP and derivative-free methods can stall
+/// One restart per stall (a second stall reports as a stall); a basin-shift restart may
+/// repeat (`MAX_BASIN_RESTARTS`, #2093) on the same budget. The ceiling for the whole of
+/// [`optimize_nlopt`] is three, since the `left_init` retry can fire first. Not gated on the optimizer (SLSQP and derivative-free methods can stall
 /// too). An adopted restart is named by [`mid_descent_restart_warning`].
 ///
 /// **Basin shift** ([`RestartCause::BasinShift`], #1565): the cold re-solve beat the
 /// minimised objective, so the restart (cold first solve) optimizes the reported objective.
-/// Ties go to the **restart**: its verdict is the honest one, as the stalled run's
+/// It still never reports a higher objective. Ties go to the **restart**: its verdict is the honest one, as the stalled run's
 /// `converged` was demoted ([`ebe_basin_shift_warning`]).
 ///
 /// Pure (`restart` maps the stalled result to its successor). Returns the reported result
@@ -10627,7 +10633,13 @@ fn population_gradient_with_agq_evaluation(
     // EBE response on every θ/Ω/σ block — no fixed-EBE bias, no FD noise, so it
     // supersedes both branches below where it applies. Gated on
     // `analytic_outer_gradient_available`; a subject the adjoint declines takes a
-    // per-subject salvage inside the mixed assembly (#466, #1529). (#381, #6)
+    // per-subject salvage inside the mixed assembly (#466, #1529). FOCEI differentiates the
+    // Almquist Laplace marginal, plain FOCE the Sheiner–Beal one (R̃ = JΩJᵀ + R⁰), on the same
+    // EBE/inner-Hessian core; IOV models route to the stacked-η / block-Ω assembly.
+    //
+    // `reconverge` (from `reconverge_gradient_interval`) overrides the analytic path: it is
+    // the documented escape hatch (#381 review findings #6/#7). `reconverge_gradient_interval
+    // = 1` forces the reconverged-FD gradient on every eval even for analytical models.
     let iov_analytic = model.n_kappa > 0;
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner
     // EBE gradient honours it via `analytic_inner_grad_supported`), so the option

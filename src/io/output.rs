@@ -1023,7 +1023,9 @@ pub fn compact_theta_blocks(names: &[String]) -> Vec<(String, std::ops::Range<us
 /// `(min, median, max)` of a block's values, as every writer prints for a block
 /// from [`compact_theta_blocks`]. The median is the **lower** middle value on an
 /// even count. Public so bindings print the same median (#1812). Ordered by
-/// [`f64::total_cmp`] (`NaN` is not dropped); empty → `(NaN, NaN, NaN)`.
+/// [`f64::total_cmp`]: a `NaN` sorts past `+inf` (or, sign bit set, below `-inf`) rather
+/// than being dropped. Empty → `(NaN, NaN, NaN)`; `compact_theta_blocks` never yields an
+/// empty block.
 pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
     if values.is_empty() {
         return (f64::NAN, f64::NAN, f64::NAN);

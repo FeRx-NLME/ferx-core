@@ -494,7 +494,7 @@ pub(crate) fn all_discrete_endpoints_analytic(model: &CompiledModel) -> bool {
 /// exactly as the Gaussian grid does; only the generative step differs
 /// (`p = link⁻¹(lp@η)`, then one Bernoulli draw) .
 ///
-/// Called from `emit_subject_rows` alongside `crate::survival::simulate_tte`, on the
+/// Called from `emit_subject_rows` alongside `crate::survival::simulate_tte_reporting`, on the
 /// same RNG stream and after the Gaussian rows, so a mixed PK + binary model emits both.
 /// Before this producer existed, a binary endpoint contributed **zero** rows to
 /// `simulate()` with no error — the discrete records live in `obs_records`, which the

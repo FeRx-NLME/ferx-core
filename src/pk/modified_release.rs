@@ -691,7 +691,8 @@ pub(crate) fn mr_scope<'a>(
 ///
 /// The gate is `#[cfg(debug_assertions)]`; the per-PR coverage jobs build `[profile.ci-cov]`
 /// (release-optimised, guards live, #1248), so it runs in CI (`--workspace --tests`: 133 s
-/// with the gate on or off). It does not run in a user's fit, so it is a development aid
+/// with the gate on or off). Do not read the 577 s figure below as its cost in CI: that was
+/// the unoptimised `dev` profile. It does not run in a user's fit, so it is a development aid
 /// rather than the reason admitting a closed form is safe.
 #[cfg(debug_assertions)]
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -908,7 +909,8 @@ impl Drop for MrVerifyClaim {
 /// make debug and release disagree about what ferx predicts. Release compiles it out.
 ///
 /// Non-finite twin entries are skipped (a twin that fails to integrate is its own defect,
-/// `ode/predictions.rs`). A skip can make a call **vacuous or partial**, so only a call that
+/// `ode/predictions.rs`, not evidence against the closed form; panicking here would
+/// misattribute it). A skip can make a call **vacuous or partial**, so only a call that
 /// compared *every* observation retires its memo key; otherwise a twin diverging to `NaN`
 /// after obs 3 of 30 would retire the key with 27 observations never compared.
 #[cfg(debug_assertions)]

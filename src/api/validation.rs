@@ -67,8 +67,9 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
 ///
 /// "Carries" means the *predictor* can resolve the name: a name every subject carries
 /// in its `Subject::covariates` map counts as present even if `Population::covariate_names`
-/// is empty (in-memory populations); a name missing from some subject is missing (#2181),
-/// since the predictor reads it as 0 there (#1028).
+/// is empty (in-memory populations): without that, `predict()` gaining this check (#1028)
+/// would have started panicking on those callers. A name missing from some subject is
+/// missing (#2181), since the predictor reads it as 0 there.
 ///
 /// A bound level block's synthesized index column is never named here:
 /// [`check_level_index_columns`] reports an unbound population first (#1647).
@@ -4737,7 +4738,8 @@ pub(crate) fn check_survival_tv_covariates(
 /// record, so what stays frozen is the disposition the `[odes]` RHS integrates (CL, V, …), the
 /// parameters the hazard expression reads, and `init()`.
 ///
-/// A subject of such a model takes its *Gaussian* predictions from the per-record event-driven
+/// A subject of such a model declines the #570 one-solve share (`model_uses_time_anywhere`) and
+/// takes its *Gaussian* predictions from the per-record event-driven
 /// walk (`$PK` at every record), so the two halves of one objective read two concentration
 /// curves. Measured on a 1-cpt IV model with `CL = TVCL·(1 + 0.05·TIME)`, `V = 10`, a 100 mg
 /// bolus and `hazard = H0·exp(BETA·C)` (`tests/survival_time_dependent_pk.rs`): at `t = 8` the
@@ -4747,7 +4749,8 @@ pub(crate) fn check_survival_tv_covariates(
 /// *bit-identical* across `KT = 0` and `KT = 0.05`.
 ///
 /// Until a per-record disposition reaches the hazard pass (#1920), refuse. **The granularity is per
-/// parameter and per endpoint**, so the refusal fires only where freezing *that* parameter can reach
+/// parameter and per endpoint**, so the refusal fires only where freezing *that* parameter can
+/// reach
 /// *that* accumulator, sparing a quantity read at each dose record (`MTT`, `ALAG1`, `F`,
 /// `D{n}`/`R{n}`, #1575) and a parameter the accumulator does not depend on (`CL` when
 /// `hazard = H0`, an `init()` of a state the hazard never sees).
@@ -4758,25 +4761,31 @@ pub(crate) fn check_survival_tv_covariates(
 /// (`CL = TVCL + 0.0 * TIME`) is still refused; deciding that would mean constant-folding, and the
 /// remedy (delete the term) is right anyway. Both analyses are also flow-insensitive with respect
 /// to *kills* (#1931): a `TIME`-dependent definition a later unconditional assignment discards is
-/// still followed. That errs loud; a kill-aware pass could false-*accept* by mistaking a conditional
+/// still followed. That errs loud; a kill-aware pass could false-*accept* by mistaking a
+/// conditional
 /// write for a kill. Pinned by `the_time_mask_and_the_slice_ignore_a_killed_definition`.
 ///
 /// Returns `None` for a model with no `OdeAccumulated` hazard or none of whose `TIME`-dependent
 /// individual parameters can reach one. `fit()` and every predict / simulate entry point surface it
 /// as an `Err`.
 ///
-/// **Not wired into `predict_categorical`**: #741's check is there because the logit predictor itself
+/// **Not wired into `predict_categorical`**: #741's check is there because the logit predictor
+/// itself
 /// is evaluated at a frozen snapshot, while this freeze is read only by `ode_cumhaz_hazard` and
-/// `draw_ode_tte_latent`, which that entry point never calls.
+/// `draw_ode_tte_latent`, which that entry point never calls; a call there would refuse a
+/// categorical prediction whose own answer is unaffected.
 ///
 /// **Not a complete guard on the low-level public surface**, as for #741:
-/// `stats::likelihood::individual_nll*` is `pub` and reaches the frozen snapshot directly; a model-level walk inside `individual_nll` would run millions of times. Widening
-/// the guard there is one decision for both checks (#1926).
+/// `stats::likelihood::individual_nll*` is `pub` and reaches the frozen snapshot directly; a
+/// model-level walk inside `individual_nll` would run millions of times. Widening the guard
+/// there is one decision for both checks (#1926).
 ///
 /// **One gate, not two.** A `compiled_model_uses_time_builtin` fast exit in front of the loop would
 /// read as the load-bearing narrow-vs-wide choice but is not: swapping the narrow flag for the wide
-/// one left all seven unit tests green because `params_reading_time` already answers all-`false` for
-/// a model whose `TIME`-reading is only in the `[odes]` RHS (honoured by the integrator clock, #610).
+/// one left all seven unit tests green because `params_reading_time` already answers all-`false`
+/// for
+/// a model whose `TIME`-reading is only in the `[odes]` RHS (honoured by the integrator clock,
+/// #610).
 /// The mask is the gate; `.min()?` on the endpoint list is the cheap discriminator in front of it.
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<String> {
