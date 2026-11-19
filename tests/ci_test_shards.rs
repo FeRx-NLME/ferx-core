@@ -121,10 +121,7 @@ fn check_plan(suite: &str, unit: &[&str], expected: &[String], n: usize, p: usiz
             if inv.first().is_some_and(|a| a == "--test") {
                 let mut it = inv.iter();
                 while let Some(flag) = it.next() {
-                    assert_eq!(
-                        flag, "--test",
-                        "{suite} {k}/{n}: unexpected `{flag}` in {inv:?}"
-                    );
+                    assert_eq!(flag, "--test", "{suite} {k}/{n}: unexpected `{flag}` in {inv:?}");
                     seen.entry(it.next().unwrap().clone()).or_default().push(k);
                 }
                 continue;
@@ -133,21 +130,13 @@ fn check_plan(suite: &str, unit: &[&str], expected: &[String], n: usize, p: usiz
                 Some(i) => (inv[..i].to_vec(), inv[i + 1..].to_vec()),
                 None => (inv.clone(), Vec::new()),
             };
-            let mut part = LibPart {
-                shard: k,
-                unit: targets,
-                filters: vec![],
-                skips: vec![],
-            };
+            let mut part = LibPart { shard: k, unit: targets, filters: vec![], skips: vec![] };
             let mut it = harness.into_iter();
             while let Some(a) = it.next() {
                 if a == "--skip" {
                     part.skips.push(it.next().expect("`--skip` with no filter"));
                 } else {
-                    assert!(
-                        !a.starts_with('-'),
-                        "{suite} {k}/{n}: unexpected harness flag `{a}`"
-                    );
+                    assert!(!a.starts_with('-'), "{suite} {k}/{n}: unexpected harness flag `{a}`");
                     part.filters.push(a);
                 }
             }
@@ -164,20 +153,11 @@ fn check_plan(suite: &str, unit: &[&str], expected: &[String], n: usize, p: usiz
     );
 
     let missing: Vec<_> = expected.iter().filter(|t| !seen.contains_key(*t)).collect();
-    assert!(
-        missing.is_empty(),
-        "{tag}: test binaries no shard runs: {missing:?}"
-    );
+    assert!(missing.is_empty(), "{tag}: test binaries no shard runs: {missing:?}");
     let twice: Vec<_> = seen.iter().filter(|(_, ks)| ks.len() > 1).collect();
-    assert!(
-        twice.is_empty(),
-        "{tag}: test binaries run on several shards: {twice:?}"
-    );
+    assert!(twice.is_empty(), "{tag}: test binaries run on several shards: {twice:?}");
     let unknown: Vec<_> = seen.keys().filter(|t| !expected.contains(t)).collect();
-    assert!(
-        unknown.is_empty(),
-        "{tag}: shards name tests outside the suite: {unknown:?}"
-    );
+    assert!(unknown.is_empty(), "{tag}: shards name tests outside the suite: {unknown:?}");
 
     assert_eq!(
         parts.iter().map(|x| x.shard).collect::<Vec<_>>(),
@@ -185,11 +165,7 @@ fn check_plan(suite: &str, unit: &[&str], expected: &[String], n: usize, p: usiz
         "{tag}: lib part i must run once, on shard i"
     );
     for x in &parts {
-        assert_eq!(
-            x.unit, unit,
-            "{tag}: lib part on shard {} runs other targets",
-            x.shard
-        );
+        assert_eq!(x.unit, unit, "{tag}: lib part on shard {} runs other targets", x.shard);
     }
     if p == 1 {
         let x = &parts[0];
@@ -200,10 +176,7 @@ fn check_plan(suite: &str, unit: &[&str], expected: &[String], n: usize, p: usiz
         return;
     }
     let (rest, named) = parts.split_last().unwrap();
-    assert!(
-        rest.filters.is_empty(),
-        "{tag}: the last lib part must be `--skip`-only"
-    );
+    assert!(rest.filters.is_empty(), "{tag}: the last lib part must be `--skip`-only");
     for x in named {
         assert!(
             !x.filters.is_empty(),
@@ -212,10 +185,7 @@ fn check_plan(suite: &str, unit: &[&str], expected: &[String], n: usize, p: usiz
         );
         assert!(x.skips.is_empty(), "{tag}: a filtered lib part also skips");
     }
-    let union: BTreeSet<_> = named
-        .iter()
-        .flat_map(|x| x.filters.iter().cloned())
-        .collect();
+    let union: BTreeSet<_> = named.iter().flat_map(|x| x.filters.iter().cloned()).collect();
     let skipped: BTreeSet<_> = rest.skips.iter().cloned().collect();
     assert_eq!(
         skipped, union,
@@ -245,10 +215,7 @@ fn the_core_shards_run_every_test_exactly_once() {
 #[test]
 fn the_endpoint_shards_run_every_listed_test_exactly_once() {
     let listed = endpoint_list();
-    assert!(
-        listed.len() > 10,
-        "tools/ci-endpoint-tests.txt lists only {listed:?}"
-    );
+    assert!(listed.len() > 10, "tools/ci-endpoint-tests.txt lists only {listed:?}");
     for n in 1..=4 {
         for p in 1..=n {
             check_plan("endpoints", &["--lib"], &listed, n, p);
@@ -286,22 +253,8 @@ fn run_reports_once_over_every_invocation_and_fails_if_any_did() {
     let (k, n, p) = (2, 3, 2);
     let out = Command::new("python3")
         .arg(repo_root().join("tools/ci-test-shard.py"))
-        .args([
-            "run",
-            "core",
-            &k.to_string(),
-            &n.to_string(),
-            "--lib-parts",
-            &p.to_string(),
-        ])
-        .args([
-            "--output",
-            "out.info",
-            "--",
-            "--workspace",
-            "--profile",
-            "ci-cov",
-        ])
+        .args(["run", "core", &k.to_string(), &n.to_string(), "--lib-parts", &p.to_string()])
+        .args(["--output", "out.info", "--", "--workspace", "--profile", "ci-cov"])
         .env("CI_TEST_SHARD_CARGO", &fake)
         .current_dir(repo_root())
         .output()
@@ -311,11 +264,8 @@ fn run_reports_once_over_every_invocation_and_fails_if_any_did() {
         "a failing invocation left the shard green: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let calls: Vec<String> = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect();
+    let calls: Vec<String> =
+        std::fs::read_to_string(&log).unwrap().lines().map(str::to_owned).collect();
     let planned = invocations("core", k, n, p);
     assert_eq!(
         calls.len(),
@@ -328,10 +278,7 @@ fn run_reports_once_over_every_invocation_and_fails_if_any_did() {
             call.starts_with("llvm-cov --no-report --no-fail-fast --workspace --profile ci-cov "),
             "an invocation without `--no-report` deletes the earlier profiles: `{call}`"
         );
-        assert!(
-            call.ends_with(&inv.join(" ")),
-            "`{call}` is not the planned {inv:?}"
-        );
+        assert!(call.ends_with(&inv.join(" ")), "`{call}` is not the planned {inv:?}");
     }
     assert_eq!(
         report, "llvm-cov --no-run --workspace --profile ci-cov --lcov --output-path out.info",
@@ -349,10 +296,7 @@ fn job_body(name: &str) -> String {
 fn job_body_in(workflow: &str, name: &str) -> String {
     let yml = std::fs::read_to_string(repo_root().join(workflow)).unwrap();
     let header = format!("\n  {name}:\n");
-    let start = yml
-        .find(&header)
-        .unwrap_or_else(|| panic!("no job `{name}`"))
-        + header.len();
+    let start = yml.find(&header).unwrap_or_else(|| panic!("no job `{name}`")) + header.len();
     yml[start..]
         .lines()
         .take_while(|l| l.is_empty() || l.starts_with("   ") || l.trim_start().starts_with('#'))
@@ -370,16 +314,8 @@ fn job_body_in(workflow: &str, name: &str) -> String {
 #[test]
 fn each_required_coverage_check_goes_red_with_any_shard() {
     for (upload, shards, check) in [
-        (
-            "coverage-pr-upload",
-            "coverage-pr",
-            "Tests + coverage (core)",
-        ),
-        (
-            "endpoints-upload",
-            "endpoints",
-            "Tests + coverage (TTE/CTMM endpoints)",
-        ),
+        ("coverage-pr-upload", "coverage-pr", "Tests + coverage (core)"),
+        ("endpoints-upload", "endpoints", "Tests + coverage (TTE/CTMM endpoints)"),
     ] {
         let body = job_body(upload);
         assert!(
@@ -411,9 +347,8 @@ fn each_required_coverage_check_goes_red_with_any_shard() {
         });
         // The guard step must actually fail: its body runs up to the next step.
         let step = &body[at..];
-        let step = &step[..step[guard.len()..]
-            .find("\n      - ")
-            .map_or(step.len(), |i| i + guard.len())];
+        let step =
+            &step[..step[guard.len()..].find("\n      - ").map_or(step.len(), |i| i + guard.len())];
         assert!(
             step.lines().any(|l| l.trim() == "exit 1"),
             "`{upload}`'s shard-result step no longer exits non-zero, so it reports and \
@@ -464,9 +399,7 @@ fn top_level_keys(yml: &str, section: &str) -> Vec<String> {
         .filter_map(|l| {
             let key = l.strip_prefix("  ")?.strip_suffix(':')?;
             (!key.starts_with([' ', '#', '-'])
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
             .then(|| key.to_owned())
         })
         .collect()
@@ -505,18 +438,12 @@ fn codecov_waits_for_every_report_of_an_event() {
         .unwrap();
     let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     let events = top_level_keys(&ci, "on");
-    assert!(
-        events.iter().any(|e| e == "pull_request"),
-        "trigger parse found {events:?}"
-    );
+    assert!(events.iter().any(|e| e == "pull_request"), "trigger parse found {events:?}");
     let uploaders: Vec<(String, Option<String>)> = top_level_keys(&ci, "jobs")
         .into_iter()
         .flat_map(|job| {
             let body = job_body(&job);
-            let cond = body
-                .lines()
-                .find(|l| l.starts_with("    if:"))
-                .map(|l| l.trim().to_owned());
+            let cond = body.lines().find(|l| l.starts_with("    if:")).map(|l| l.trim().to_owned());
             // One row per upload STEP, so a second upload in one job counts twice.
             let rows: Vec<_> = body
                 .match_indices("codecov/codecov-action@")
@@ -536,15 +463,9 @@ fn codecov_waits_for_every_report_of_an_event() {
             rows
         })
         .collect();
-    assert!(
-        uploaders.len() >= 2,
-        "found only {uploaders:?} uploading to Codecov"
-    );
+    assert!(uploaders.len() >= 2, "found only {uploaders:?} uploading to Codecov");
     for event in &events {
-        let n = uploaders
-            .iter()
-            .filter(|(_, c)| runs_on(c.as_deref(), event))
-            .count();
+        let n = uploaders.iter().filter(|(_, c)| runs_on(c.as_deref(), event)).count();
         assert!(
             n == 0 || n == want,
             "on `{event}` ci.yml uploads {n} Codecov report(s) but codecov.yml waits for \
@@ -672,13 +593,7 @@ fn the_slow_lib_runs_unfiltered() {
     );
     let out = refused_run(
         &["slow", "1", "4", "--lib-parts", "2"],
-        &[
-            "--workspace",
-            "--exclude",
-            "docs-lint",
-            "--exclude",
-            "patterns-lint",
-        ],
+        &["--workspace", "--exclude", "docs-lint", "--exclude", "patterns-lint"],
     );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -860,14 +775,10 @@ fn run_writes_a_manifest_and_fails_if_any_did() {
     }
     let rows = manifest_rows(&man_dir.join("manifest.tsv"));
     let of = |t: &str| -> BTreeSet<String> {
-        rows.iter()
-            .filter(|r| r[0] == t)
-            .map(|r| r[1].clone())
-            .collect()
+        rows.iter().filter(|r| r[0] == t).map(|r| r[1].clone()).collect()
     };
-    let mut want: BTreeSet<String> = ["ferx_core[unit]", "doctest:ferx_core"]
-        .map(str::to_owned)
-        .into();
+    let mut want: BTreeSet<String> =
+        ["ferx_core[unit]", "doctest:ferx_core"].map(str::to_owned).into();
     for inv in &planned {
         for w in inv.windows(2) {
             if w[0] == "--test" {
@@ -875,23 +786,11 @@ fn run_writes_a_manifest_and_fails_if_any_did() {
             }
         }
     }
-    assert_eq!(
-        of("B"),
-        want,
-        "the manifest's listed binaries are not the shard's"
-    );
-    assert_eq!(
-        of("S"),
-        want,
-        "the manifest's `test result:` binaries are not the shard's"
-    );
+    assert_eq!(of("B"), want, "the manifest's listed binaries are not the shard's");
+    assert_eq!(of("S"), want, "the manifest's `test result:` binaries are not the shard's");
     let count = |t: &str| rows.iter().filter(|r| r[0] == t).count();
     assert_eq!(count("L"), 2 * want.len(), "two `--list` tests per binary");
-    assert_eq!(
-        count("I"),
-        want.len(),
-        "one `--list --ignored` test per binary"
-    );
+    assert_eq!(count("I"), want.len(), "one `--list --ignored` test per binary");
     assert!(
         rows.iter().any(|r| r[0] == "R"
             && r[1] == "ferx_core[unit]"
@@ -899,11 +798,7 @@ fn run_writes_a_manifest_and_fails_if_any_did() {
             && r[3] == "FAILED"),
         "the failing test is not in the manifest"
     );
-    let meta = |k: &str| {
-        rows.iter()
-            .find(|r| r[0] == "M" && r[1] == k)
-            .map(|r| r[2].clone())
-    };
+    let meta = |k: &str| rows.iter().find(|r| r[0] == "M" && r[1] == k).map(|r| r[2].clone());
     assert_eq!(meta("status").as_deref(), Some("failed"));
     assert_eq!(meta("done").as_deref(), Some("1"));
     assert!(
@@ -918,13 +813,7 @@ fn run_writes_a_manifest_and_fails_if_any_did() {
 fn run_slow_refuses_a_mismatched_exclude() {
     for build in [
         vec!["--workspace"],
-        vec![
-            "--workspace",
-            "--exclude",
-            "docs-lint",
-            "--exclude",
-            "ferx-cli",
-        ],
+        vec!["--workspace", "--exclude", "docs-lint", "--exclude", "ferx-cli"],
         vec!["--exclude", "docs-lint"],
     ] {
         let out = refused_run(&["slow", "1", "4", "--lib-parts", "1"], &build);
@@ -978,14 +867,7 @@ fn write_manifest(dir: &Path, k: usize, n: usize, bins: &[Bin], done: bool) {
 /// [`write_manifest`] into `dir/name`, for suite `suite`, with `elapsed` seconds.
 #[allow(clippy::too_many_arguments)]
 fn write_manifest_as(
-    dir: &Path,
-    name: &str,
-    suite: &str,
-    k: usize,
-    n: usize,
-    bins: &[Bin],
-    done: bool,
-    elapsed: f64,
+    dir: &Path, name: &str, suite: &str, k: usize, n: usize, bins: &[Bin], done: bool, elapsed: f64,
 ) {
     let d = dir.join(name);
     std::fs::create_dir_all(&d).unwrap();
@@ -1017,11 +899,7 @@ fn write_manifest_as(
     }
     s += &format!("M\telapsed\t{elapsed}\n");
     if done {
-        let status = if bins.iter().any(|b| b.failed > 0) {
-            "failed"
-        } else {
-            "ok"
-        };
+        let status = if bins.iter().any(|b| b.failed > 0) { "failed" } else { "ok" };
         s += &format!("M\tstatus\t{status}\nM\tdone\t1\n");
     }
     std::fs::write(d.join("manifest.tsv"), s).unwrap();
@@ -1037,15 +915,9 @@ fn valid_shards() -> Vec<Vec<Bin>> {
 }
 
 fn run_check(
-    case: &str,
-    shards: &[Vec<Bin>],
-    present: &[usize],
-    done: &[bool],
-    result: &str,
+    case: &str, shards: &[Vec<Bin>], present: &[usize], done: &[bool], result: &str,
 ) -> (bool, String) {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join("ci_test_shards_check")
-        .join(case);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ci_test_shards_check").join(case);
     let _ = std::fs::remove_dir_all(&dir);
     for (i, bins) in shards.iter().enumerate() {
         if present.contains(&(i + 1)) {
@@ -1077,10 +949,7 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
     let all = [1, 2];
     let both = [true, true];
     let (ok, text) = run_check("valid", &valid_shards(), &all, &both, "success");
-    assert!(
-        ok && !text.contains("::error::"),
-        "the valid fixture is red:\n{text}"
-    );
+    assert!(ok && !text.contains("::error::"), "the valid fixture is red:\n{text}");
 
     let mut cases: Vec<(&str, Vec<Vec<Bin>>, Vec<usize>, [bool; 2], &str, &str)> = Vec::new();
     // (5) a target in no manifest
@@ -1107,11 +976,7 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
     ));
     // (7) a binary whose --list is non-empty but which ran nothing
     let mut s = valid_shards();
-    s[0][0] = Bin {
-        passed: 0,
-        ignored: 0,
-        ..Bin::ok("a", 3, 1)
-    };
+    s[0][0] = Bin { passed: 0, ignored: 0, ..Bin::ok("a", 3, 1) };
     cases.push((
         "t7",
         s,
@@ -1122,11 +987,7 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
     ));
     // (8) ran + ignored != --list (a filter that matched part of it)
     let mut s = valid_shards();
-    s[0][0] = Bin {
-        passed: 1,
-        filtered: 1,
-        ..Bin::ok("a", 3, 1)
-    };
+    s[0][0] = Bin { passed: 1, filtered: 1, ..Bin::ok("a", 3, 1) };
     cases.push((
         "t8",
         s,
@@ -1164,11 +1025,7 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
     ));
     // a failing test
     let mut s = valid_shards();
-    s[1][0] = Bin {
-        passed: 0,
-        failed: 1,
-        ..Bin::ok("b", 1, 0)
-    };
+    s[1][0] = Bin { passed: 0, failed: 1, ..Bin::ok("b", 1, 0) };
     cases.push((
         "failed",
         s,
@@ -1201,12 +1058,7 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
     ));
     // a binary that aborted after 2 of its 3 tests reported: no `test result:` line
     let mut s = valid_shards();
-    s[0][0] = Bin {
-        passed: 2,
-        ignored: 0,
-        reported: false,
-        ..Bin::ok("a", 3, 1)
-    };
+    s[0][0] = Bin { passed: 2, ignored: 0, reported: false, ..Bin::ok("a", 3, 1) };
     cases.push((
         "crashed",
         s,
@@ -1221,18 +1073,12 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
         let (ok, text) = run_check(case, shards, present, done, result);
         assert!(!ok, "{case}: check passed a corrupted fixture:\n{text}");
         assert!(text.contains(marker), "{case}: no `{marker}` in:\n{text}");
-        assert!(
-            !text.contains("Traceback"),
-            "{case}: check crashed:\n{text}"
-        );
+        assert!(!text.contains("Traceback"), "{case}: check crashed:\n{text}");
         // Distinct: no OTHER case's condition fires on this one, except (9)'s absent
         // shard, whose own targets necessarily also read as run nowhere.
         for other in &markers {
             if other != marker && !(*case == "t9" && other.contains("no shard ran")) {
-                assert!(
-                    !text.contains(other),
-                    "{case} also reports `{other}`:\n{text}"
-                );
+                assert!(!text.contains(other), "{case} also reports `{other}`:\n{text}");
             }
         }
     }
@@ -1240,37 +1086,19 @@ fn check_names_each_way_a_sharded_run_can_be_incomplete() {
     // Two cases a `Vec<Bin>` per shard cannot spell: a second manifest for one
     // shard, and a manifest of another suite in the download directory.
     for (case, name, suite, marker) in [
-        (
-            "duplicate",
-            "copy-of-1",
-            "slow",
-            "::error::two manifests for shard 1/2",
-        ),
-        (
-            "foreign",
-            "stray",
-            "slow-nn",
-            "a manifest of suite slow-nn N=2, not slow N=2",
-        ),
+        ("duplicate", "copy-of-1", "slow", "::error::two manifests for shard 1/2"),
+        ("foreign", "stray", "slow-nn", "a manifest of suite slow-nn N=2, not slow N=2"),
     ] {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("ci_test_shards_check")
-            .join(case);
+        let dir =
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ci_test_shards_check").join(case);
         let _ = std::fs::remove_dir_all(&dir);
         for (i, bins) in valid_shards().iter().enumerate() {
             write_manifest(&dir, i + 1, 2, bins, true);
         }
         write_manifest_as(&dir, name, suite, 1, 2, &valid_shards()[0], true, 60.0);
         let out = shard_tool(
-            &[
-                "check",
-                "slow",
-                "2",
-                &dir.display().to_string(),
-                "--result",
-                "success",
-            ]
-            .map(|s| s.to_string()),
+            &["check", "slow", "2", &dir.display().to_string(), "--result", "success"]
+                .map(|s| s.to_string()),
         );
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(
@@ -1298,46 +1126,26 @@ fn check_warns_when_a_shard_nears_its_budget_or_a_binary_outgrows_its_weight() {
     };
     let (bin, unit) = (weight("run_covariance_per_engine"), weight("<unit>"));
     let run = |case: &str, factor: f64, elapsed: f64| -> (bool, String) {
-        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("ci_test_shards_budget")
-            .join(case);
+        let dir =
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ci_test_shards_budget").join(case);
         let _ = std::fs::remove_dir_all(&dir);
         let shards = [
-            vec![Bin {
-                secs: factor * unit,
-                ..Bin::ok("u[unit]", 2, 0)
-            }],
-            vec![Bin {
-                secs: factor * bin,
-                ..Bin::ok("run_covariance_per_engine", 1, 0)
-            }],
+            vec![Bin { secs: factor * unit, ..Bin::ok("u[unit]", 2, 0) }],
+            vec![Bin { secs: factor * bin, ..Bin::ok("run_covariance_per_engine", 1, 0) }],
         ];
         for (i, bins) in shards.iter().enumerate() {
             let name = format!("slow-manifest-core-{}", i + 1);
             write_manifest_as(&dir, &name, "slow", i + 1, 2, bins, true, elapsed);
         }
         let out = shard_tool(
-            &[
-                "check",
-                "slow",
-                "2",
-                &dir.display().to_string(),
-                "--budget-min",
-                "60",
-            ]
-            .map(|s| s.to_string()),
+            &["check", "slow", "2", &dir.display().to_string(), "--budget-min", "60"]
+                .map(|s| s.to_string()),
         );
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
     };
     // 70% of 60 min is 2520 s.
     let (_, quiet) = run("under", 1.5, 2500.0);
-    assert!(
-        !quiet.contains("::warning::"),
-        "warned under every threshold:\n{quiet}"
-    );
+    assert!(!quiet.contains("::warning::"), "warned under every threshold:\n{quiet}");
     let (_, loud) = run("over", 2.5, 2600.0);
     for marker in [
         "::warning::shard 1/2 took 43.3 min, over 70% of its 60.0 min budget".to_owned(),
@@ -1378,23 +1186,11 @@ fn check_nn_requires_exactly_the_binaries_nn_adds_a_test_to() {
         let (mut core, mut nn) = (String::new(), String::from("M\tsuite\tslow-nn\n"));
         for (b, cl, ci, nl, ni) in table {
             core += &format!("B\t{b}\n");
-            core += &cl
-                .iter()
-                .map(|t| format!("L\t{b}\t{t}\n"))
-                .collect::<String>();
-            core += &ci
-                .iter()
-                .map(|t| format!("I\t{b}\t{t}\n"))
-                .collect::<String>();
+            core += &cl.iter().map(|t| format!("L\t{b}\t{t}\n")).collect::<String>();
+            core += &ci.iter().map(|t| format!("I\t{b}\t{t}\n")).collect::<String>();
             nn += &format!("XB\t{b}\n");
-            nn += &nl
-                .iter()
-                .map(|t| format!("XL\t{b}\t{t}\n"))
-                .collect::<String>();
-            nn += &ni
-                .iter()
-                .map(|t| format!("XI\t{b}\t{t}\n"))
-                .collect::<String>();
+            nn += &nl.iter().map(|t| format!("XL\t{b}\t{t}\n")).collect::<String>();
+            nn += &ni.iter().map(|t| format!("XI\t{b}\t{t}\n")).collect::<String>();
         }
         if nn_only {
             nn += "XB\tnew_bin\n";
@@ -1415,17 +1211,11 @@ fn check_nn_requires_exactly_the_binaries_nn_adds_a_test_to() {
             ]
             .map(|s| s.to_string()),
         );
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-        )
+        (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned())
     };
     let (ok, text) = run("valid", &["gains"], &["ferx_core[unit]", "gains"], false);
     assert!(ok, "the valid fixture is red:\n{text}");
-    assert!(
-        !text.contains("loses"),
-        "a binary that only loses tests was required:\n{text}"
-    );
+    assert!(!text.contains("loses"), "a binary that only loses tests was required:\n{text}");
 
     let (ok, text) = run("missing", &[], &["ferx_core[unit]"], false);
     assert!(
@@ -1433,12 +1223,7 @@ fn check_nn_requires_exactly_the_binaries_nn_adds_a_test_to() {
             .contains("::error::gains: gains 1 test(s) under nn but the nn leg does not run it"),
         "a binary gaining a test under nn, absent from the list, passed:\n{text}"
     );
-    let (ok, text) = run(
-        "extra",
-        &["gains", "same"],
-        &["ferx_core[unit]", "gains", "same"],
-        false,
-    );
+    let (ok, text) = run("extra", &["gains", "same"], &["ferx_core[unit]", "gains", "same"], false);
     assert!(
         !ok && text.contains("::error::same: listed in tools/slow-nn-tests.txt but gains no test"),
         "a listed binary that gains nothing under nn passed:\n{text}"
@@ -1533,10 +1318,7 @@ fn each_slow_summary_goes_red_with_any_shard() {
         ),
     ] {
         let body = job_body_in(SLOW_YML, job);
-        assert!(
-            body.contains(needs),
-            "`{job}` does not wait for its shards ({needs:?})"
-        );
+        assert!(body.contains(needs), "`{job}` does not wait for its shards ({needs:?})");
         let cond = body
             .lines()
             .find(|l| l.starts_with("    if:"))
@@ -1553,9 +1335,7 @@ fn each_slow_summary_goes_red_with_any_shard() {
         );
     }
     let nn = job_body_in(SLOW_YML, "nn-summary");
-    let at = nn
-        .find("check-nn core-manifests nn-manifest")
-        .expect("`nn-summary` runs no check-nn");
+    let at = nn.find("check-nn core-manifests nn-manifest").expect("`nn-summary` runs no check-nn");
     let step = &nn[nn[..at].rfind("\n      - ").unwrap()..at];
     assert!(
         step.contains("if: success() || failure()"),
@@ -1570,12 +1350,7 @@ fn the_nn_leg_runs_exactly_the_listed_binaries_and_the_lib() {
     let mut want = vec![vec!["--lib".to_owned()]];
     let mut listed = slow_nn_list();
     listed.sort();
-    want.push(
-        listed
-            .iter()
-            .flat_map(|t| ["--test".to_owned(), t.clone()])
-            .collect(),
-    );
+    want.push(listed.iter().flat_map(|t| ["--test".to_owned(), t.clone()]).collect());
     assert_eq!(
         invocations("slow-nn", 1, 1, 1),
         want,
@@ -1591,10 +1366,7 @@ fn the_nn_leg_runs_exactly_the_listed_binaries_and_the_lib() {
         run.starts_with("python3 tools/ci-test-shard.py run slow-nn 1 1 --lib-parts 1 --list-all "),
         "the nn job must run `run slow-nn 1 1 --list-all`: `{run}`"
     );
-    assert!(
-        body.contains("ferx-core/nn"),
-        "the nn job does not turn `nn` on"
-    );
+    assert!(body.contains("ferx-core/nn"), "the nn job does not turn `nn` on");
 }
 
 /// The canakinumab fetch keys on the planner: the anchor runs on exactly one shard
@@ -1627,10 +1399,7 @@ fn has_target_finds_the_one_shard_running_a_target() {
         assert_eq!(hits.len(), 1, "N={n}: the anchor is on shards {hits:?}");
     }
     let out = shard_tool(&["has-target", "slow", "1", "4", "no_such_target"].map(str::to_owned));
-    assert!(
-        !out.status.success(),
-        "an unknown target read as a plain `false`"
-    );
+    assert!(!out.status.success(), "an unknown target read as a plain `false`");
 }
 
 /// T13. `weights` reads a log fetched with `gh run view --log`, which writes colour
@@ -1660,14 +1429,8 @@ fn weights_parse_a_gh_log() {
     );
     let text = std::fs::read_to_string(&out_path).unwrap();
     let body: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
-    assert!(
-        body.contains(&"693 <unit>"),
-        "no unit-bundle weight:\n{text}"
-    );
-    assert!(
-        body.contains(&"32 agq"),
-        "no integration-binary weight:\n{text}"
-    );
+    assert!(body.contains(&"693 <unit>"), "no unit-bundle weight:\n{text}");
+    assert!(body.contains(&"32 agq"), "no integration-binary weight:\n{text}");
     assert!(
         body.iter().any(|l| l.ends_with(" lib:estimation::agq")),
         "no per-module unit-test weight — the timestamps were not read:\n{text}"

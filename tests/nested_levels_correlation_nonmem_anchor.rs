@@ -80,15 +80,10 @@ fn twin(kind: &str, rho: f64) -> String {
     } else {
         format!("  theta RHO({rho}, {lo}, 0.99) FIX\n")
     };
-    MODEL
-        .replace(
-            "  sigma ADD ~ 0.255164\n",
-            &format!("  sigma ADD ~ 0.255164\n{theta}"),
-        )
-        .replace(
-            "  DV ~ additive(ADD)\n",
-            &format!("  DV ~ additive(ADD)\n  correlation {kind}(RHO) by ARM\n"),
-        )
+    MODEL.replace("  sigma ADD ~ 0.255164\n", &format!("  sigma ADD ~ 0.255164\n{theta}")).replace(
+        "  DV ~ additive(ADD)\n",
+        &format!("  DV ~ additive(ADD)\n  correlation {kind}(RHO) by ARM\n"),
+    )
 }
 
 fn eval(src: &str) -> FitResult {
@@ -140,11 +135,8 @@ fn cells_per_subject() -> Vec<(u32, Vec<(usize, usize)>)> {
     let mut out: Vec<(u32, Vec<(usize, usize)>)> = Vec::new();
     for l in text.lines().skip(1) {
         let f: Vec<&str> = l.split(',').collect();
-        let (id, study, slot) = (
-            f[0].parse().unwrap(),
-            f[1].parse().unwrap(),
-            f[5].parse().unwrap(),
-        );
+        let (id, study, slot) =
+            (f[0].parse().unwrap(), f[1].parse().unwrap(), f[5].parse().unwrap());
         if out.last().is_none_or(|(i, _)| *i != id) {
             out.push((id, Vec::new()));
         }
@@ -169,11 +161,7 @@ fn nested_levels_with_a_residual_correlation_match_nonmem() {
         .take(4)
         .map(|l| l.split(',').nth(3).unwrap().to_string())
         .collect();
-    assert_eq!(
-        first,
-        ["111", "112", "121", "122"],
-        "arms interleave in TIME order"
-    );
+    assert_eq!(first, ["111", "112", "121", "122"], "arms interleave in TIME order");
 
     let cells = cells_per_subject();
     let mut worst_ofv = 0.0f64;
@@ -182,15 +170,8 @@ fn nested_levels_with_a_residual_correlation_match_nonmem() {
     for &(probe, kind, rho, nm_ofv) in PROBES {
         let r = eval(&twin(kind, rho));
         let d = (r.ofv - nm_ofv).abs();
-        eprintln!(
-            "{probe}: ferx {:.14}  NONMEM {nm_ofv:.14}  |Δ| {d:.3e}",
-            r.ofv
-        );
-        assert!(
-            r.ofv.is_finite() && d < OFV_TOL,
-            "{probe}: OFV {} vs {nm_ofv}",
-            r.ofv
-        );
+        eprintln!("{probe}: ferx {:.14}  NONMEM {nm_ofv:.14}  |Δ| {d:.3e}", r.ofv);
+        assert!(r.ofv.is_finite() && d < OFV_TOL, "{probe}: OFV {} vs {nm_ofv}", r.ofv);
         worst_ofv = worst_ofv.max(d);
         if rho == 0.0 {
             control = r.ofv;
@@ -214,16 +195,8 @@ fn nested_levels_with_a_residual_correlation_match_nonmem() {
             };
             check(r.subjects[i].eta[0], nm[0], format!("subject {id} η"));
             for (g, &(study, slot)) in cell.iter().enumerate() {
-                check(
-                    kappas[g][0],
-                    nm[study],
-                    format!("subject {id} κ_study {study}"),
-                );
-                check(
-                    kappas[g][1],
-                    nm[2 + slot],
-                    format!("subject {id} κ_arm {slot}"),
-                );
+                check(kappas[g][0], nm[study], format!("subject {id} κ_study {study}"));
+                check(kappas[g][1], nm[2 + slot], format!("subject {id} κ_arm {slot}"));
             }
         }
         assert_eq!(compared, 12 * 9, "{probe}");

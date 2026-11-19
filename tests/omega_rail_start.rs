@@ -132,10 +132,7 @@ fn fit_warfarin(dir: &Path, omega_cl: &str) -> FitResult {
 /// `DIVERGENCE_OFV` / `BASE_OPTIMUM_OFV` checks below still separate a solved fit
 /// from a repelled one by eleven orders of magnitude.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn upper_omega_rail_start_still_reaches_the_base_optimum() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -162,11 +159,7 @@ fn upper_omega_rail_start_still_reaches_the_base_optimum() {
     const DIVERGENCE_OFV: f64 = 1e14;
     const BASE_OPTIMUM_OFV: f64 = -280.359_507;
     for (label, arm) in [("base", &base), ("upper rail", &railed)] {
-        assert!(
-            arm.converged,
-            "{label} arm did not converge (OFV {})",
-            arm.ofv
-        );
+        assert!(arm.converged, "{label} arm did not converge (OFV {})", arm.ofv);
         assert!(
             arm.ofv.is_finite() && arm.ofv < DIVERGENCE_OFV,
             "{label} arm OFV {} is not a solved objective — at or above the \
@@ -182,10 +175,7 @@ fn upper_omega_rail_start_still_reaches_the_base_optimum() {
             assert!(v.is_finite(), "{label} arm {name} is not finite: {v}");
         }
         for (i, v) in arm.omega.diagonal().iter().enumerate() {
-            assert!(
-                v.is_finite(),
-                "{label} arm omega[{i},{i}] is not finite: {v}"
-            );
+            assert!(v.is_finite(), "{label} arm omega[{i},{i}] is not finite: {v}");
         }
     }
 

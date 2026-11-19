@@ -20,12 +20,9 @@ const MODEL: &str = "\
 #[test]
 fn fit_result_carries_fixed_block_sigma_correlations() {
     let model = parse_model_string(MODEL).expect("block_sigma model must parse");
-    let population = read_nonmem_csv(
-        Path::new("data/correlated_residual_combined.csv"),
-        None,
-        None,
-    )
-    .expect("correlated residual data must load");
+    let population =
+        read_nonmem_csv(Path::new("data/correlated_residual_combined.csv"), None, None)
+            .expect("correlated residual data must load");
     let options = FitOptions {
         outer_maxiter: 0,
         run_covariance_step: false,
@@ -41,10 +38,7 @@ fn fit_result_carries_fixed_block_sigma_correlations() {
     // `tanh(atanh(rho))` — exact `assert_eq!` on the f64 is a last-ULP coin flip
     // that depends on the codegen (it held locally and failed under the coverage
     // build). The value itself is checked to tolerance just below.
-    assert_eq!(
-        result.residual_correlations.len(),
-        model.residual_correlations.len()
-    );
+    assert_eq!(result.residual_correlations.len(), model.residual_correlations.len());
     let corr = result.residual_correlations[0];
     let declared = model.residual_correlations[0];
     assert_eq!(corr.sigma_i, declared.sigma_i);
@@ -71,12 +65,9 @@ fn fit_result_marks_a_bare_block_sigma_correlation_free() {
 
     let src = MODEL.replace("1.00] FIX", "1.00]");
     let model = parse_model_string(&src).expect("free block_sigma model must parse");
-    let population = read_nonmem_csv(
-        Path::new("data/correlated_residual_combined.csv"),
-        None,
-        None,
-    )
-    .expect("correlated residual data must load");
+    let population =
+        read_nonmem_csv(Path::new("data/correlated_residual_combined.csv"), None, None)
+            .expect("correlated residual data must load");
     let options = FitOptions {
         outer_maxiter: 0,
         run_covariance_step: false,
@@ -147,9 +138,7 @@ fn block_sigma_chain_after_focei_is_allowed_when_fixed() {
         ..FitOptions::default()
     };
     let diags = ferx_core::check_model_options(&model, &options);
-    assert!(!diags
-        .iter()
-        .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
+    assert!(!diags.iter().any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
 }
 
 /// A non-estimating stage placed **first** is fine: rho has not moved yet, so it
@@ -163,9 +152,7 @@ fn block_sigma_chain_before_focei_is_allowed() {
         ..FitOptions::default()
     };
     let diags = ferx_core::check_model_options(&model, &options);
-    assert!(!diags
-        .iter()
-        .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
+    assert!(!diags.iter().any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
 }
 
 /// #847: a **free** block_sigma once had to decline AGQ's analytic score, because the
@@ -183,9 +170,7 @@ fn agq_keeps_the_analytic_gradient_for_a_free_block_sigma() {
         ferx_core::estimation::agq::analytic_score_supported(&model),
         "a free block_sigma must stay on the analytic AGQ/Laplace score"
     );
-    assert!(ferx_core::estimation::agq::analytic_gradient_available(
-        &model
-    ));
+    assert!(ferx_core::estimation::agq::analytic_gradient_available(&model));
 }
 
 /// A `FIX`ed block carries no free rho coordinate for the score to miss, so the
@@ -195,9 +180,7 @@ fn agq_keeps_the_analytic_gradient_for_a_free_block_sigma() {
 fn agq_keeps_the_analytic_gradient_for_a_fixed_block_sigma() {
     let model = parse_model_string(MODEL).expect("block_sigma model must parse");
     assert_eq!(model.default_params.residual_correlation_fixed, vec![true]);
-    assert!(ferx_core::estimation::agq::analytic_gradient_available(
-        &model
-    ));
+    assert!(ferx_core::estimation::agq::analytic_gradient_available(&model));
 }
 
 /// The chain guard keys on "can this stage move rho", which is not the same set as
@@ -212,9 +195,7 @@ fn block_sigma_chain_after_laplace_is_rejected() {
         ..FitOptions::default()
     };
     let diags = ferx_core::check_model_options(&model, &options);
-    assert!(diags
-        .iter()
-        .any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
+    assert!(diags.iter().any(|d| d.code == "E_BLOCK_SIGMA_CHAIN_UNSUPPORTED"));
 }
 
 /// #1307. A `FIX`-ed correlation **above the Fisher-z estimation rail** reaches
@@ -241,12 +222,9 @@ fn a_fixed_block_sigma_correlation_above_the_rail_is_held_at_the_declared_value(
     const DECLARED_RHO: f64 = 0.999;
     let src = MODEL.replace("[0.04, 0.10, 1.00] FIX", "[0.04, 0.05994, 0.09] FIX");
     let model = parse_model_string(&src).expect("block_sigma model must parse");
-    let population = read_nonmem_csv(
-        Path::new("data/correlated_residual_combined.csv"),
-        None,
-        None,
-    )
-    .expect("correlated residual data must load");
+    let population =
+        read_nonmem_csv(Path::new("data/correlated_residual_combined.csv"), None, None)
+            .expect("correlated residual data must load");
     let options = FitOptions {
         outer_maxiter: 0,
         run_covariance_step: false,
@@ -258,10 +236,7 @@ fn a_fixed_block_sigma_correlation_above_the_rail_is_held_at_the_declared_value(
     // test is capable of observing the fix. Without it the whole thing passes
     // whether the rail is consulted or not.
     let rail = 3.0_f64.tanh();
-    assert!(
-        DECLARED_RHO > rail,
-        "the fixture must declare a ρ above the {rail} rail"
-    );
+    assert!(DECLARED_RHO > rail, "the fixture must declare a ρ above the {rail} rail");
     assert!((model.residual_correlations[0].rho - DECLARED_RHO).abs() < 1e-12);
 
     let result = fit(&model, &population, &model.default_params, &options)
@@ -284,10 +259,7 @@ fn a_fixed_block_sigma_correlation_above_the_rail_is_held_at_the_declared_value(
     // …and the warning the free spelling earns is absent here, because there is
     // nothing to warn about: the declared value survived.
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_INIT_NOT_REPRESENTABLE")),
+        !result.warnings.iter().any(|w| w.contains("W_INIT_NOT_REPRESENTABLE")),
         "{:#?}",
         result.warnings
     );
@@ -304,12 +276,9 @@ fn a_fixed_block_sigma_correlation_above_the_rail_is_held_at_the_declared_value(
 fn a_free_block_sigma_correlation_above_the_rail_is_railed_and_reported() {
     let src = MODEL.replace("[0.04, 0.10, 1.00] FIX", "[0.04, 0.05994, 0.09]");
     let model = parse_model_string(&src).expect("free block_sigma model must parse");
-    let population = read_nonmem_csv(
-        Path::new("data/correlated_residual_combined.csv"),
-        None,
-        None,
-    )
-    .expect("correlated residual data must load");
+    let population =
+        read_nonmem_csv(Path::new("data/correlated_residual_combined.csv"), None, None)
+            .expect("correlated residual data must load");
     let options = FitOptions {
         outer_maxiter: 0,
         run_covariance_step: false,

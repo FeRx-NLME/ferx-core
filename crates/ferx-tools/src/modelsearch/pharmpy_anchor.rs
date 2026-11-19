@@ -76,16 +76,8 @@ enum Divergence {
 }
 
 const DIVERGENCES: &[(&str, &str, Divergence)] = &[
-    (
-        "PERIPHERALS(0..2); LAGTIME([OFF,ON])",
-        "exhaustive_stepwise",
-        Divergence::DefaultFilledBase,
-    ),
-    (
-        "ABSORPTION([INST,FO]); LAGTIME([OFF,ON])",
-        "exhaustive_stepwise",
-        Divergence::LagOnBolusBase,
-    ),
+    ("PERIPHERALS(0..2); LAGTIME([OFF,ON])", "exhaustive_stepwise", Divergence::DefaultFilledBase),
+    ("ABSORPTION([INST,FO]); LAGTIME([OFF,ON])", "exhaustive_stepwise", Divergence::LagOnBolusBase),
     (
         "ABSORPTION(FO); PERIPHERALS(0..2); LAGTIME([OFF,ON])",
         "reduced_stepwise",
@@ -113,11 +105,7 @@ impl StepFitter for Uniform {
                 fit: Some(converged_fit(100.0)),
                 ofv: Some(100.0),
                 converged: Some(true),
-                verdict: StrictnessVerdict {
-                    passed: true,
-                    failures: vec![],
-                    skipped: vec![],
-                },
+                verdict: StrictnessVerdict { passed: true, failures: vec![], skipped: vec![] },
                 criterion: 100.0,
                 seconds: 0.0,
                 error: None,
@@ -149,11 +137,8 @@ fn sorted(v: &[String]) -> Vec<String> {
 /// parent of a collector-joined child carries the same set, so the first
 /// one stands for the group.
 fn pharmpy_edges(case: &Case) -> Vec<Edge> {
-    let by_name: BTreeMap<&str, &PharmpyCandidate> = case
-        .candidates
-        .iter()
-        .map(|c| (c.name.as_str(), c))
-        .collect();
+    let by_name: BTreeMap<&str, &PharmpyCandidate> =
+        case.candidates.iter().map(|c| (c.name.as_str(), c)).collect();
     let mut edges: Vec<Edge> = case
         .candidates
         .iter()
@@ -184,12 +169,7 @@ fn ferx_edges(result: &ModelsearchResult) -> Vec<Edge> {
         .rows
         .iter()
         .filter(|r| r.layer >= 1)
-        .map(|r| {
-            (
-                path_of(&r.id),
-                r.parent.as_deref().map(path_of).unwrap_or_default(),
-            )
-        })
+        .map(|r| (path_of(&r.id), r.parent.as_deref().map(path_of).unwrap_or_default()))
         .collect();
     edges.sort();
     edges
@@ -231,11 +211,8 @@ fn run_case(case: &Case) -> (Vec<String>, String, ModelsearchResult) {
         "reduced_stepwise" => Algorithm::ReducedStepwise,
         other => panic!("unknown algorithm {other}"),
     };
-    let options = ModelsearchOptions {
-        algorithm,
-        rank: RankType::Ofv,
-        ..ModelsearchOptions::default()
-    };
+    let options =
+        ModelsearchOptions { algorithm, rank: RankType::Ofv, ..ModelsearchOptions::default() };
     let result = search(&Uniform, space, &options, None).expect("search");
     (funcs, onto.join(";"), result)
 }
@@ -255,10 +232,7 @@ fn the_anchor_is_pharmpy_2() {
     // Every divergence names a case that exists.
     for (space, alg, _) in DIVERGENCES {
         assert!(
-            anchor
-                .cases
-                .iter()
-                .any(|c| c.space == *space && c.algorithm == *alg),
+            anchor.cases.iter().any(|c| c.space == *space && c.algorithm == *alg),
             "divergence for a case not in the anchor: {space} / {alg}"
         );
     }
@@ -299,10 +273,7 @@ fn the_enumeration_matches_pharmpy_or_differs_where_stated() {
                 let collector_children = case.candidates.iter().filter(|c| c.via_collector).count();
                 let not_continued = result.rows.iter().filter(|r| !r.continued).count();
                 if case.algorithm == "reduced_stepwise" {
-                    assert!(
-                        collector_children > 0,
-                        "{label}: no collector in the anchor"
-                    );
+                    assert!(collector_children > 0, "{label}: no collector in the anchor");
                     assert_eq!(not_continued, collector_children, "{label}");
                 } else {
                     assert_eq!(collector_children, 0, "{label}");
@@ -324,10 +295,7 @@ fn the_enumeration_matches_pharmpy_or_differs_where_stated() {
                     .collect();
                 assert_ne!(expected, pharmpy, "{label}: the divergence has disappeared");
                 assert_eq!(ferx, expected, "{label}");
-                assert!(result
-                    .notes
-                    .iter()
-                    .any(|n| n.starts_with("not generated: LAGTIME(ON)")));
+                assert!(result.notes.iter().any(|n| n.starts_with("not generated: LAGTIME(ON)")));
             }
             Some(Divergence::SingleGroupNotCollapsed) => {
                 assert!(case.candidates.iter().all(|c| !c.via_collector), "{label}");
@@ -366,10 +334,8 @@ fn exhaustive_numbers_its_candidates_as_pharmpy_does() {
         .find(|c| c.algorithm == "exhaustive" && divergence(c).is_none())
         .unwrap();
     let (_, _, result) = run_case(case);
-    let ferx: Vec<Vec<String>> = result
-        .layer_rows(1)
-        .map(|r| r.path.iter().map(|k| k.to_string()).collect())
-        .collect();
+    let ferx: Vec<Vec<String>> =
+        result.layer_rows(1).map(|r| r.path.iter().map(|k| k.to_string()).collect()).collect();
     let pharmpy: Vec<Vec<String>> = case.candidates.iter().map(|c| c.feature.clone()).collect();
     assert_eq!(ferx, pharmpy);
     for (row, c) in result.layer_rows(1).zip(&case.candidates) {

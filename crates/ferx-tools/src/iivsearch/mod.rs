@@ -225,10 +225,9 @@ impl IivsearchOptions {
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
         config.require_space("iivsearch", "IIV / COVARIANCE statements")?;
         let section = match config.tools.get("iivsearch") {
-            Some(table) => table
-                .clone()
-                .try_into::<Section>()
-                .map_err(|e| format!("[iivsearch]: {e}"))?,
+            Some(table) => {
+                table.clone().try_into::<Section>().map_err(|e| format!("[iivsearch]: {e}"))?
+            }
             None => Section::default(),
         };
         let options = IivsearchOptions {
@@ -252,32 +251,23 @@ impl IivsearchOptions {
     /// Pharmpy's `validate_input`, plus the file's own consistency.
     pub fn validate(&self) -> Result<(), String> {
         if self.algorithm == Algorithm::Skip
-            && matches!(
-                self.correlation_algorithm,
-                None | Some(CorrelationAlgorithm::Skip)
-            )
+            && matches!(self.correlation_algorithm, None | Some(CorrelationAlgorithm::Skip))
         {
-            return Err(
-                "[iivsearch] algorithm = \"skip\" needs correlation_algorithm = \
+            return Err("[iivsearch] algorithm = \"skip\" needs correlation_algorithm = \
                  \"top_down_exhaustive\"; with both skipped there is nothing to search"
-                    .into(),
-            );
+                .into());
         }
         if self.algorithm == Algorithm::SimultaneousStepwise && self.correlation_algorithm.is_some()
         {
-            return Err(
-                "[iivsearch] correlation_algorithm cannot be set with algorithm = \
+            return Err("[iivsearch] correlation_algorithm cannot be set with algorithm = \
                  \"simultaneous_stepwise\": that algorithm decides the block structure as \
                  it adds η, and has no second stage"
-                    .into(),
-            );
+                .into());
         }
         if self.as_fullblock && self.algorithm == Algorithm::SimultaneousStepwise {
-            return Err(
-                "[iivsearch] as_fullblock does not apply to simultaneous_stepwise, which \
+            return Err("[iivsearch] as_fullblock does not apply to simultaneous_stepwise, which \
                  tries the block structures itself"
-                    .into(),
-            );
+                .into());
         }
         if let Some(c) = self.cutoff {
             if !(c.is_finite() && c >= 0.0) {
@@ -347,11 +337,8 @@ impl IivStructure {
     /// Pharmpy's description: blocks first, then the diagonal η, each
     /// bracketed — `[CL,V]+[KA]`; the empty string for no η at all.
     pub fn description(&self) -> String {
-        let mut parts: Vec<String> = self
-            .blocks
-            .iter()
-            .map(|b| format!("[{}]", b.join(",")))
-            .collect();
+        let mut parts: Vec<String> =
+            self.blocks.iter().map(|b| format!("[{}]", b.join(","))).collect();
         for p in &self.etas {
             if !self.blocks.iter().any(|b| b.contains(p)) {
                 parts.push(format!("[{p}]"));
@@ -371,18 +358,12 @@ impl IivStructure {
     /// so such a candidate was fitted as a larger block than its description).
     pub fn is_partial_block(&self) -> bool {
         !self.blocks.is_empty()
-            && self
-                .etas
-                .iter()
-                .any(|p| !self.blocks.iter().any(|b| b.contains(p)))
+            && self.etas.iter().any(|p| !self.blocks.iter().any(|b| b.contains(p)))
     }
 
     /// The block a parameter is in, if any.
     pub fn block_of(&self, param: &str) -> Option<&[String]> {
-        self.blocks
-            .iter()
-            .find(|b| b.iter().any(|p| p == param))
-            .map(Vec::as_slice)
+        self.blocks.iter().find(|b| b.iter().any(|p| p == param)).map(Vec::as_slice)
     }
 
     fn has_eta(&self, param: &str) -> bool {
@@ -393,11 +374,7 @@ impl IivStructure {
     pub fn feature_vector(&self) -> FeatureVector {
         FeatureVector::new().with("iiv", self.etas.join(",")).with(
             "blocks",
-            self.blocks
-                .iter()
-                .map(|b| format!("[{}]", b.join(",")))
-                .collect::<Vec<_>>()
-                .join("+"),
+            self.blocks.iter().map(|b| format!("[{}]", b.join(","))).collect::<Vec<_>>().join("+"),
         )
     }
 }
@@ -433,9 +410,7 @@ impl Space {
     /// The space from the input model and the *resolved* features — the
     /// seam the unit tests use.
     pub(crate) fn build<'f>(
-        input_model: ModelText,
-        features: impl Iterator<Item = &'f Feature>,
-        mut notes: Vec<String>,
+        input_model: ModelText, features: impl Iterator<Item = &'f Feature>, mut notes: Vec<String>,
     ) -> Result<Space, String> {
         let variability = VariabilityText::read(&input_model)
             .map_err(|e| format!("iivsearch cannot read the base model's variability: {e}"))?;
@@ -445,11 +420,7 @@ impl Space {
         let mut any = false;
         for f in features {
             match f {
-                Feature::Iiv {
-                    optional,
-                    parameters,
-                    effects,
-                } => {
+                Feature::Iiv { optional, parameters, effects } => {
                     any = true;
                     if let Modes::List(list) = effects {
                         if let Some(e) = list.iter().find(|e| **e != VariabilityEffect::Exp) {
@@ -465,16 +436,10 @@ impl Space {
                         // A kept η wins over a searched one for the same
                         // parameter (Pharmpy's forced feature).
                         let forced = !*optional;
-                        iiv.entry(p)
-                            .and_modify(|kept| *kept |= forced)
-                            .or_insert(forced);
+                        iiv.entry(p).and_modify(|kept| *kept |= forced).or_insert(forced);
                     }
                 }
-                Feature::Covariance {
-                    optional,
-                    level,
-                    parameters,
-                } => {
+                Feature::Covariance { optional, level, parameters } => {
                     let levels = level.expand();
                     if !levels.contains(&VariabilityLevel::Iiv) {
                         return Err(format!(
@@ -523,11 +488,9 @@ impl Space {
             }
         }
         if !any {
-            return Err(
-                "iivsearch: the space has no IIV or COVARIANCE statement, so there is no \
+            return Err("iivsearch: the space has no IIV or COVARIANCE statement, so there is no \
                  variability structure to search"
-                    .into(),
-            );
+                .into());
         }
 
         // Every named parameter must exist, and be written in the canonical
@@ -548,19 +511,12 @@ impl Space {
                     if pv.mentions.is_empty() {
                         "no random effect in a form an η can be appended to".to_string()
                     } else {
-                        pv.mentions
-                            .iter()
-                            .map(|m| format!("`{m}`"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        pv.mentions.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ")
                     }
                 ));
             }
             let (name, variance) = match &pv.eta {
-                Some(eta) => (
-                    eta.clone(),
-                    variability.variance(eta).unwrap_or(NEW_ETA_VARIANCE),
-                ),
+                Some(eta) => (eta.clone(), variability.variance(eta).unwrap_or(NEW_ETA_VARIANCE)),
                 None => (fresh_eta_name(&variability, p), NEW_ETA_VARIANCE),
             };
             eta_of.insert(p.clone(), (name, variance));
@@ -572,10 +528,9 @@ impl Space {
         // silently missed one would half-split the block.
         for pv in variability.with_eta() {
             let eta = pv.eta.clone().expect("with_eta");
-            eta_of.entry(pv.name.clone()).or_insert((
-                eta.clone(),
-                variability.variance(&eta).unwrap_or(NEW_ETA_VARIANCE),
-            ));
+            eta_of
+                .entry(pv.name.clone())
+                .or_insert((eta.clone(), variability.variance(&eta).unwrap_or(NEW_ETA_VARIANCE)));
         }
         // A `FIX`ed η is a statement about the model: never removed, never
         // blocked (Pharmpy excludes fixed η from both moves).
@@ -632,30 +587,19 @@ impl Space {
 
     /// The parameters whose η is searched, alphabetical.
     fn searched(&self) -> Vec<&str> {
-        self.iiv
-            .iter()
-            .filter(|(_, kept)| !kept)
-            .map(|(p, _)| p.as_str())
-            .collect()
+        self.iiv.iter().filter(|(_, kept)| !kept).map(|(p, _)| p.as_str()).collect()
     }
 
     /// The parameters whose η is kept, alphabetical.
     fn kept(&self) -> Vec<&str> {
-        self.iiv
-            .iter()
-            .filter(|(_, kept)| *kept)
-            .map(|(p, _)| p.as_str())
-            .collect()
+        self.iiv.iter().filter(|(_, kept)| *kept).map(|(p, _)| p.as_str()).collect()
     }
 
     /// The blocks every candidate carries: the connected components of the
     /// forced pairs among `etas`.
     fn forced_blocks(&self, etas: &[String]) -> Vec<Vec<String>> {
         components(
-            self.forced_pairs
-                .iter()
-                .filter(|(a, b)| etas.contains(a) && etas.contains(b))
-                .cloned(),
+            self.forced_pairs.iter().filter(|(a, b)| etas.contains(a) && etas.contains(b)).cloned(),
         )
     }
 }
@@ -677,17 +621,9 @@ fn fresh_eta_name(v: &VariabilityText, param: &str) -> String {
         .omegas
         .iter()
         .map(|d| d.name.as_str())
-        .chain(
-            v.omega_blocks
-                .iter()
-                .flat_map(|b| b.names.iter().map(String::as_str)),
-        )
+        .chain(v.omega_blocks.iter().flat_map(|b| b.names.iter().map(String::as_str)))
         .chain(v.kappas.iter().map(|d| d.name.as_str()))
-        .chain(
-            v.kappa_blocks
-                .iter()
-                .flat_map(|b| b.names.iter().map(String::as_str)),
-        )
+        .chain(v.kappa_blocks.iter().flat_map(|b| b.names.iter().map(String::as_str)))
         .collect();
     let base = format!("ETA_{param}");
     if !taken.contains(base.as_str()) {
@@ -713,12 +649,7 @@ fn structure_of<'a>(v: &VariabilityText, params: impl Iterator<Item = &'a String
     let blocks: Vec<Vec<String>> = v
         .omega_blocks
         .iter()
-        .map(|b| {
-            b.names
-                .iter()
-                .filter_map(|n| eta_to_param.get(n).cloned())
-                .collect::<Vec<_>>()
-        })
+        .map(|b| b.names.iter().filter_map(|n| eta_to_param.get(n).cloned()).collect::<Vec<_>>())
         .filter(|b| b.len() > 1)
         .collect();
     IivStructure::new(etas, blocks)
@@ -931,9 +862,7 @@ pub struct IivsearchRun<'a> {
 /// its base model. Writes `models.csv`, `models/<id>.ferx` and `final.ferx`
 /// into `run.dir` when given.
 pub fn run_iivsearch(
-    config: &SearchConfig,
-    base: &BaseModel,
-    run: IivsearchRun<'_>,
+    config: &SearchConfig, base: &BaseModel, run: IivsearchRun<'_>,
 ) -> Result<IivsearchResult, String> {
     let options = IivsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
@@ -980,10 +909,7 @@ struct Node {
 
 impl Node {
     fn from_result(
-        result: &CandidateResult,
-        report: &RunReport,
-        model: ModelText,
-        structure: IivStructure,
+        result: &CandidateResult, report: &RunReport, model: ModelText, structure: IivStructure,
         criterion: Criterion,
     ) -> Result<Node, String> {
         let fit = resolve_fit(result, report)?;
@@ -1006,8 +932,7 @@ impl Node {
 /// row whose cached fit is gone an error naming the fix (the reasoning is
 /// `modelsearch::resolve_fit`'s).
 pub(crate) fn resolve_fit(
-    result: &CandidateResult,
-    report: &RunReport,
+    result: &CandidateResult, report: &RunReport,
 ) -> Result<Option<FitResult>, String> {
     if let Some(fit) = &result.fit {
         return Ok(Some(fit.clone()));
@@ -1039,11 +964,7 @@ pub(crate) fn resolve_fit(
 /// The candidate with `target`'s structure, derived from `parent` by the η
 /// and block edits and seeded from the parent's estimates.
 fn derive(
-    id: &str,
-    parent: &Node,
-    target: &IivStructure,
-    space: &Space,
-    options: &IivsearchOptions,
+    id: &str, parent: &Node, target: &IivStructure, space: &Space, options: &IivsearchOptions,
 ) -> Result<Candidate, String> {
     let mut model = parent.model.clone();
     if let Some(fit) = &parent.fit {
@@ -1055,20 +976,14 @@ fn derive(
     // then the block the text carries.
     for p in &from.etas {
         if !target.has_eta(p) {
-            model
-                .apply(ModelEdit::DropIiv { param: p.clone() })
-                .map_err(err)?;
+            model.apply(ModelEdit::DropIiv { param: p.clone() }).map_err(err)?;
         }
     }
     // A surviving block the target does not carry comes apart, so its η can
     // be re-blocked from diagonal declarations; the target's blocks are made
     // at the end.
     let survived = IivStructure::new(
-        from.etas
-            .iter()
-            .filter(|p| target.has_eta(p))
-            .cloned()
-            .collect(),
+        from.etas.iter().filter(|p| target.has_eta(p)).cloned().collect(),
         from.blocks.clone(),
     );
     let mut to_split: Vec<String> = Vec::new();
@@ -1082,9 +997,7 @@ fn derive(
         }
     }
     if !to_split.is_empty() {
-        model
-            .apply(ModelEdit::SplitOmegaBlock(to_split))
-            .map_err(err)?;
+        model.apply(ModelEdit::SplitOmegaBlock(to_split)).map_err(err)?;
     }
     for p in &target.etas {
         if !from.has_eta(p) {
@@ -1119,9 +1032,7 @@ fn derive(
                     .ok_or_else(|| format!("{id}: `{p}` has no η to block"))
             })
             .collect::<Result<_, _>>()?;
-        model
-            .apply(ModelEdit::SetOmegaBlock(etas.clone()))
-            .map_err(err)?;
+        model.apply(ModelEdit::SetOmegaBlock(etas.clone())).map_err(err)?;
         new_blocks.push(etas);
     }
     // A new block's correlations start from the parent's empirical Bayes
@@ -1239,9 +1150,7 @@ fn ebe_correlation(fit: &FitResult, idx: &[usize]) -> Option<nalgebra::DMatrix<f
 
 /// The search proper, over an injected fitter.
 pub(crate) fn search(
-    fitter: &dyn StepFitter,
-    space: Space,
-    options: &IivsearchOptions,
+    fitter: &dyn StepFitter, space: Space, options: &IivsearchOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<IivsearchResult, String> {
     let mut driver = Driver {
@@ -1303,18 +1212,10 @@ impl Driver<'_> {
         self.emit(IivsearchEvent::InputStarted);
         let candidate = Candidate::new("input", space.input_model.clone())
             .features(space.input_structure.feature_vector())
-            .starts(
-                self.options
-                    .starts_for(space.input_structure.largest_block()),
-            );
-        let report = self
-            .fitter
-            .fit_step("input", std::slice::from_ref(&candidate))?;
+            .starts(self.options.starts_for(space.input_structure.largest_block()));
+        let report = self.fitter.fit_step("input", std::slice::from_ref(&candidate))?;
         self.notes.extend(report.warnings.iter().cloned());
-        let result = report
-            .results
-            .first()
-            .ok_or("the input model was not fitted")?;
+        let result = report.results.first().ok_or("the input model was not fitted")?;
         if let Some(e) = &result.error {
             return Err(format!("the input model could not be fitted: {e}"));
         }
@@ -1325,10 +1226,8 @@ impl Driver<'_> {
             space.input_structure.clone(),
             self.criterion,
         )?;
-        self.rows
-            .push(self.row_of(result, 0, None, &input.structure, &candidate));
-        self.store
-            .insert(input.id.clone(), (input.model.clone(), input.fit.clone()));
+        self.rows.push(self.row_of(result, 0, None, &input.structure, &candidate));
+        self.store.insert(input.id.clone(), (input.model.clone(), input.fit.clone()));
         self.emit(IivsearchEvent::InputFinished {
             ofv: input.fit.as_ref().map(|f| f.ofv).unwrap_or(f64::NAN),
             criterion: input.criterion,
@@ -1341,9 +1240,7 @@ impl Driver<'_> {
         if !self.cancelled && base_structure != input.structure {
             self.emit(IivsearchEvent::BaseStarted);
             let candidate = derive("base", &input, &base_structure, space, self.options)?;
-            let report = self
-                .fitter
-                .fit_step("base", std::slice::from_ref(&candidate))?;
+            let report = self.fitter.fit_step("base", std::slice::from_ref(&candidate))?;
             self.notes.extend(report.warnings.iter().cloned());
             // A run cancelled *during* this one fit comes back with no result
             // at all: `Runner` drops a candidate whose `fit()` failed while
@@ -1380,8 +1277,7 @@ impl Driver<'_> {
                         &base.structure,
                         &candidate,
                     ));
-                    self.store
-                        .insert(base.id.clone(), (base.model.clone(), base.fit.clone()));
+                    self.store.insert(base.id.clone(), (base.model.clone(), base.fit.clone()));
                     self.emit(IivsearchEvent::BaseFinished {
                         ofv: base.fit.as_ref().map(|f| f.ofv).unwrap_or(f64::NAN),
                         criterion: base.criterion,
@@ -1441,9 +1337,7 @@ impl Driver<'_> {
                     describe(&selected.structure),
                     self.criterion.label()
                 ));
-                self.emit(IivsearchEvent::Reverted {
-                    criterion: input.criterion,
-                });
+                self.emit(IivsearchEvent::Reverted { criterion: input.criterion });
                 selected = input.clone();
             }
         }
@@ -1451,15 +1345,10 @@ impl Driver<'_> {
         if let Some(r) = self.rows.iter_mut().find(|r| r.id == final_id) {
             r.selected = true;
         }
-        let models: BTreeMap<String, ModelText> = self
-            .store
-            .iter()
-            .map(|(id, (text, _))| (id.clone(), text.clone()))
-            .collect();
-        let (final_model, final_fit) = self
-            .store
-            .remove(&final_id)
-            .expect("every fitted model is stored");
+        let models: BTreeMap<String, ModelText> =
+            self.store.iter().map(|(id, (text, _))| (id.clone(), text.clone())).collect();
+        let (final_model, final_fit) =
+            self.store.remove(&final_id).expect("every fitted model is stored");
         Ok(IivsearchResult {
             options: self.options.clone(),
             criterion: self.criterion,
@@ -1529,10 +1418,7 @@ impl Driver<'_> {
     /// Fit one step's candidates and rank them against `parent`; returns
     /// the winner (the parent when nothing beat it).
     fn step(
-        &mut self,
-        kind: StepKind,
-        parent: &Node,
-        targets: Vec<IivStructure>,
+        &mut self, kind: StepKind, parent: &Node, targets: Vec<IivStructure>,
     ) -> Result<Node, String> {
         if targets.is_empty() {
             return Ok(parent.clone());
@@ -1544,11 +1430,7 @@ impl Driver<'_> {
             let id = self.new_id();
             candidates.push(derive(&id, parent, target, self.space, self.options)?);
         }
-        self.emit(IivsearchEvent::StepStarted {
-            step,
-            kind,
-            candidates: candidates.len(),
-        });
+        self.emit(IivsearchEvent::StepStarted { step, kind, candidates: candidates.len() });
         let dir = format!("step-{step}");
         let report = self.fitter.fit_step(&dir, &candidates)?;
         self.notes.extend(report.warnings.iter().cloned());
@@ -1557,8 +1439,7 @@ impl Driver<'_> {
             let Some(result) = report.results.iter().find(|r| r.id == candidate.id) else {
                 continue; // cancelled before this candidate was reached
             };
-            self.rows
-                .push(self.row_of(result, step, Some(&parent.id), target, candidate));
+            self.rows.push(self.row_of(result, step, Some(&parent.id), target, candidate));
             let node = Node::from_result(
                 result,
                 &report,
@@ -1566,26 +1447,17 @@ impl Driver<'_> {
                 target.clone(),
                 self.criterion,
             )?;
-            self.store
-                .insert(node.id.clone(), (node.model.clone(), node.fit.clone()));
+            self.store.insert(node.id.clone(), (node.model.clone(), node.fit.clone()));
             nodes.push(node);
         }
         let (ranked, best) = self.rank(parent, &nodes);
         for r in &ranked {
-            if let Some(row) = self
-                .rows
-                .iter_mut()
-                .find(|row| row.id == r.id && row.step == step)
-            {
+            if let Some(row) = self.rows.iter_mut().find(|row| row.id == r.id && row.step == step) {
                 row.d_criterion = r.d_criterion.map(|d| -d);
                 row.rank = r.rank;
             }
         }
-        let winner = nodes
-            .iter()
-            .find(|n| n.id == best)
-            .cloned()
-            .unwrap_or_else(|| parent.clone());
+        let winner = nodes.iter().find(|n| n.id == best).cloned().unwrap_or_else(|| parent.clone());
         self.steps.push(StepSummary {
             step,
             kind,
@@ -1606,27 +1478,16 @@ impl Driver<'_> {
 
     /// [`rank_models`] with the parent as reference.
     fn rank(&self, parent: &Node, candidates: &[Node]) -> (Vec<StepRank>, String) {
-        let cands: Vec<(String, f64, bool)> = candidates
-            .iter()
-            .map(|n| (n.id.clone(), n.criterion, n.eligible))
-            .collect();
-        rank_models(
-            (&parent.id, parent.criterion, parent.eligible),
-            &cands,
-            self.options.cutoff,
-        )
+        let cands: Vec<(String, f64, bool)> =
+            candidates.iter().map(|n| (n.id.clone(), n.criterion, n.eligible)).collect();
+        rank_models((&parent.id, parent.criterion, parent.eligible), &cands, self.options.cutoff)
     }
 
     /// `top_down_exhaustive` over the number of η: one candidate per subset
     /// of the searched η, largest first, lexicographic within a size; the
     /// parent's own structure skipped.
     fn top_down_etas(&mut self, parent: Node) -> Result<Node, String> {
-        let searched: Vec<String> = self
-            .space
-            .searched()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let searched: Vec<String> = self.space.searched().iter().map(|s| s.to_string()).collect();
         let mut targets = Vec::new();
         for size in (0..=searched.len()).rev() {
             for combo in combinations(&searched, size) {
@@ -1657,17 +1518,10 @@ impl Driver<'_> {
     /// `bottom_up_stepwise`: add one η at a time to the parameter that
     /// improves the parent most, until none does.
     fn bottom_up_etas(&mut self, mut parent: Node) -> Result<Node, String> {
-        let searched: Vec<String> = self
-            .space
-            .searched()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let searched: Vec<String> = self.space.searched().iter().map(|s| s.to_string()).collect();
         loop {
-            let to_add: Vec<&String> = searched
-                .iter()
-                .filter(|p| !parent.structure.has_eta(p))
-                .collect();
+            let to_add: Vec<&String> =
+                searched.iter().filter(|p| !parent.structure.has_eta(p)).collect();
             if to_add.is_empty() || self.cancelled {
                 return Ok(parent);
             }
@@ -1713,18 +1567,10 @@ impl Driver<'_> {
     /// `simultaneous_stepwise`: each new η tried diagonal, inside each
     /// existing block, and paired with each single η.
     fn simultaneous(&mut self, mut parent: Node) -> Result<Node, String> {
-        let searched: Vec<String> = self
-            .space
-            .searched()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let searched: Vec<String> = self.space.searched().iter().map(|s| s.to_string()).collect();
         loop {
-            let to_add: Vec<String> = searched
-                .iter()
-                .filter(|p| !parent.structure.has_eta(p))
-                .cloned()
-                .collect();
+            let to_add: Vec<String> =
+                searched.iter().filter(|p| !parent.structure.has_eta(p)).cloned().collect();
             if to_add.is_empty() || self.cancelled {
                 return Ok(parent);
             }
@@ -1751,12 +1597,8 @@ impl Driver<'_> {
                     }
                     let mut joined = block.clone();
                     joined.push(p.clone());
-                    let mut blocks: Vec<Vec<String>> = diagonal
-                        .blocks
-                        .iter()
-                        .filter(|b| *b != block)
-                        .cloned()
-                        .collect();
+                    let mut blocks: Vec<Vec<String>> =
+                        diagonal.blocks.iter().filter(|b| *b != block).cloned().collect();
                     blocks.push(joined);
                     targets.push(IivStructure::new(diagonal.etas.clone(), blocks));
                     singles.retain(|q| !block.contains(q));
@@ -1802,11 +1644,7 @@ impl Driver<'_> {
                     .collect::<Vec<_>>()
                     .join(" and "),
                 if untouchable.len() == 1 { "s" } else { "" },
-                if untouchable.len() == 1 {
-                    "it is"
-                } else {
-                    "they are"
-                }
+                if untouchable.len() == 1 { "it is" } else { "they are" }
             ));
         }
         let members: Vec<String> = self
@@ -1855,12 +1693,8 @@ impl Driver<'_> {
     }
 
     fn row_of(
-        &self,
-        result: &CandidateResult,
-        step: usize,
-        parent: Option<&str>,
-        structure: &IivStructure,
-        candidate: &Candidate,
+        &self, result: &CandidateResult, step: usize, parent: Option<&str>,
+        structure: &IivStructure, candidate: &Candidate,
     ) -> ModelRow {
         ModelRow {
             id: result.id.clone(),
@@ -1896,9 +1730,7 @@ impl Driver<'_> {
 /// the parent, else the parent (which is the winner too when it fails the
 /// gate and nothing passes).
 pub(crate) fn rank_models(
-    parent: (&str, f64, bool),
-    candidates: &[(String, f64, bool)],
-    cutoff: Option<f64>,
+    parent: (&str, f64, bool), candidates: &[(String, f64, bool)], cutoff: Option<f64>,
 ) -> (Vec<StepRank>, String) {
     let (parent_id, parent_criterion, parent_eligible) = parent;
     let cutoff = cutoff.unwrap_or(0.0);
@@ -1906,11 +1738,8 @@ pub(crate) fn rank_models(
         std::iter::once((parent_id, parent_criterion, parent_eligible))
             .chain(candidates.iter().map(|(id, c, e)| (id.as_str(), *c, *e)))
             .collect();
-    let mut eligible: Vec<(&str, f64)> = all
-        .iter()
-        .filter(|(_, c, e)| *e && c.is_finite())
-        .map(|(id, c, _)| (*id, *c))
-        .collect();
+    let mut eligible: Vec<(&str, f64)> =
+        all.iter().filter(|(_, c, e)| *e && c.is_finite()).map(|(id, c, _)| (*id, *c)).collect();
     eligible.sort_by(|a, b| a.1.total_cmp(&b.1));
     let delta = |c: f64| (parent_eligible && c.is_finite()).then_some(parent_criterion - c);
     let mut ranked: Vec<StepRank> = eligible
@@ -1958,11 +1787,7 @@ pub fn describe(s: &IivStructure) -> String {
 /// Every `size`-subset of `items`, in lexicographic order of positions.
 pub(crate) fn combinations<T: Clone>(items: &[T], size: usize) -> Vec<Vec<T>> {
     fn go<T: Clone>(
-        items: &[T],
-        size: usize,
-        start: usize,
-        cur: &mut Vec<T>,
-        out: &mut Vec<Vec<T>>,
+        items: &[T], size: usize, start: usize, cur: &mut Vec<T>, out: &mut Vec<Vec<T>>,
     ) {
         if cur.len() == size {
             out.push(cur.clone());

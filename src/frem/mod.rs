@@ -123,20 +123,14 @@ fn reject_non_gaussian_endpoints(base_model: &CompiledModel) -> Result<(), Strin
 }
 
 pub fn transform_dataset_for_frem(
-    population: &Population,
-    base_model: &CompiledModel,
-    covariates: &[String],
-    categorical_covariates: &[String],
-    missing_value: Option<f64>,
+    population: &Population, base_model: &CompiledModel, covariates: &[String],
+    categorical_covariates: &[String], missing_value: Option<f64>,
 ) -> Result<(String, FremDataInfo), String> {
     let missing_val = missing_value.unwrap_or(-99.0);
     reject_non_gaussian_endpoints(base_model)?;
     // Validate covariates exist in the dataset.
     for cov in covariates {
-        let found = population
-            .covariate_names
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(cov));
+        let found = population.covariate_names.iter().any(|n| n.eq_ignore_ascii_case(cov));
         if !found {
             return Err(format!(
                 "FREM covariate '{}' not found in dataset (available: {:?})",
@@ -165,24 +159,15 @@ pub fn transform_dataset_for_frem(
         }
 
         // Reference level = most frequent.
-        let reference = *level_counts
-            .iter()
-            .max_by_key(|(_, &count)| count)
-            .unwrap()
-            .0;
+        let reference = *level_counts.iter().max_by_key(|(_, &count)| count).unwrap().0;
 
         // Non-reference levels, sorted ascending.
-        let mut other_levels: Vec<i64> = level_counts
-            .keys()
-            .copied()
-            .filter(|&l| l != reference)
-            .collect();
+        let mut other_levels: Vec<i64> =
+            level_counts.keys().copied().filter(|&l| l != reference).collect();
         other_levels.sort();
 
-        let indicator_names: Vec<String> = other_levels
-            .iter()
-            .map(|l| format!("{}_{}", cat_name, l))
-            .collect();
+        let indicator_names: Vec<String> =
+            other_levels.iter().map(|l| format!("{}_{}", cat_name, l)).collect();
         let indicator_levels: Vec<f64> = other_levels.iter().map(|&l| l as f64).collect();
 
         expansions.insert(
@@ -219,11 +204,7 @@ pub fn transform_dataset_for_frem(
                     return None;
                 }
                 let level = exp.indicator_levels[pos];
-                return Some(if (*original_val - level).abs() < 0.5 {
-                    1.0
-                } else {
-                    0.0
-                });
+                return Some(if (*original_val - level).abs() < 0.5 { 1.0 } else { 0.0 });
             }
         }
         // Not an indicator — look up the original covariate.
@@ -360,16 +341,8 @@ pub fn transform_dataset_for_frem(
                     RateMode::Fixed => format!("{}", dose.rate),
                 },
                 "1".to_string(), // MDV
-                if dose.ii > 0.0 {
-                    format!("{}", dose.ii)
-                } else {
-                    "0".to_string()
-                }, // II
-                if dose.ss {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                }, // SS
+                if dose.ii > 0.0 { format!("{}", dose.ii) } else { "0".to_string() }, // II
+                if dose.ss { "1".to_string() } else { "0".to_string() }, // SS
                 "0".to_string(), // CENS
                 "0".to_string(), // FREMTYPE
             ];
@@ -404,11 +377,8 @@ pub fn transform_dataset_for_frem(
         }
 
         // Original PK observation rows.
-        for (j, (&time, &dv)) in subject
-            .obs_times
-            .iter()
-            .zip(subject.observations.iter())
-            .enumerate()
+        for (j, (&time, &dv)) in
+            subject.obs_times.iter().zip(subject.observations.iter()).enumerate()
         {
             let cmt = subject.obs_cmts.get(j).copied().unwrap_or(1);
             let cens_flag = subject.cens.get(j).copied().unwrap_or(0);
@@ -433,9 +403,7 @@ pub fn transform_dataset_for_frem(
         // Sort by (time, evid_priority) to ensure chronological order.
         // Within the same time: doses first, then pseudo-obs, then PK obs.
         records.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.cmp(&b.1))
+            a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then(a.1.cmp(&b.1))
         });
 
         for (_, _, row_str) in &records {
@@ -465,11 +433,8 @@ pub fn transform_dataset_for_frem(
 /// - Individual parameters for covariates: `COV_X = TV_X + ETA_X_FREM`
 /// - FREM fit options mapping FREMTYPE → (theta, eta) predictions
 pub fn generate_frem_model(
-    base_model_text: &str,
-    base_model: &CompiledModel,
-    frem_info: &FremDataInfo,
-    output_data_path: &Path,
-    fit_init: Option<&FremFitInit>,
+    base_model_text: &str, base_model: &CompiledModel, frem_info: &FremDataInfo,
+    output_data_path: &Path, fit_init: Option<&FremFitInit>,
 ) -> Result<String, String> {
     // Parse the base model text to extract blocks.
     let blocks = parse_blocks(base_model_text)?;
@@ -504,11 +469,7 @@ pub fn generate_frem_model(
     // Add fixed covariate thetas.
     for (k, cov_name) in frem_info.covariate_names.iter().enumerate() {
         let mean = frem_info.covariate_means[k];
-        model.push_str(&format!(
-            "  theta TV_{}({}, FIX)\n",
-            cov_name.to_uppercase(),
-            mean
-        ));
+        model.push_str(&format!("  theta TV_{}({}, FIX)\n", cov_name.to_uppercase(), mean));
     }
     model.push('\n');
 
@@ -545,13 +506,7 @@ pub fn generate_frem_model(
     let free = &base_model.default_params.omega.free_mask;
     let standalone_ruv = ruv_eta.filter(|&k| (0..n_base).all(|j| j == k || !free[(k, j)]));
     if let Some(k) = standalone_ruv {
-        let fix = if base_model
-            .default_params
-            .omega_fixed
-            .get(k)
-            .copied()
-            .unwrap_or(false)
-        {
+        let fix = if base_model.default_params.omega_fixed.get(k).copied().unwrap_or(false) {
             " FIX"
         } else {
             ""
@@ -565,10 +520,8 @@ pub fn generate_frem_model(
     let n_pk = block_base.len();
     let n_total = n_pk + n_cov;
 
-    let mut all_eta_names: Vec<String> = block_base
-        .iter()
-        .map(|&i| base_model.eta_names[i].clone())
-        .collect();
+    let mut all_eta_names: Vec<String> =
+        block_base.iter().map(|&i| base_model.eta_names[i].clone()).collect();
     for cov_name in &frem_info.covariate_names {
         all_eta_names.push(format!("ETA_{}_FREM", cov_name.to_uppercase()));
     }
@@ -647,10 +600,7 @@ pub fn generate_frem_model(
     // Add covariate individual parameters.
     for cov_name in &frem_info.covariate_names {
         let upper = cov_name.to_uppercase();
-        model.push_str(&format!(
-            "  COV_{} = TV_{} + ETA_{}_FREM\n",
-            upper, upper, upper
-        ));
+        model.push_str(&format!("  COV_{} = TV_{} + ETA_{}_FREM\n", upper, upper, upper));
     }
     model.push('\n');
 
@@ -675,10 +625,7 @@ pub fn generate_frem_model(
     // of ~7 on the workshop FREM model). Copy each block as-is when present.
     for block_name in ["scaling", "odes"] {
         if let Some(block_lines) = blocks.get(block_name) {
-            if block_lines
-                .iter()
-                .any(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
-            {
+            if block_lines.iter().any(|l| !l.trim().is_empty() && !l.trim().starts_with('#')) {
                 model.push_str(&format!("[{}]\n", block_name));
                 for line in block_lines {
                     let trimmed = line.trim();
@@ -730,12 +677,8 @@ pub fn generate_frem_model(
     let mut frem_preds: Vec<String> = Vec::new();
     for cov_name in &frem_info.covariate_names {
         let upper = cov_name.to_uppercase();
-        let ft = frem_info
-            .fremtype_map
-            .iter()
-            .find(|(n, _)| n == cov_name)
-            .map(|(_, v)| *v)
-            .unwrap();
+        let ft =
+            frem_info.fremtype_map.iter().find(|(n, _)| n == cov_name).map(|(_, v)| *v).unwrap();
         frem_preds.push(format!("TV_{}/ETA_{}_FREM:{}", upper, upper, ft));
     }
     model.push_str(&format!("  frem_predictions = {}\n", frem_preds.join(", ")));
@@ -754,14 +697,8 @@ pub fn generate_frem_model(
 /// malformed `FremFitInit` whose `eta_names` is longer than the matrix is
 /// dimensioned — so an inconsistent public-API input degrades gracefully.
 fn fit_omega_value(fit_init: &FremFitInit, name_i: &str, name_j: &str) -> Option<f64> {
-    let idx_i = fit_init
-        .eta_names
-        .iter()
-        .position(|n| n.eq_ignore_ascii_case(name_i))?;
-    let idx_j = fit_init
-        .eta_names
-        .iter()
-        .position(|n| n.eq_ignore_ascii_case(name_j))?;
+    let idx_i = fit_init.eta_names.iter().position(|n| n.eq_ignore_ascii_case(name_i))?;
+    let idx_j = fit_init.eta_names.iter().position(|n| n.eq_ignore_ascii_case(name_j))?;
     if idx_i >= fit_init.omega.nrows() || idx_j >= fit_init.omega.ncols() {
         return None;
     }
@@ -811,21 +748,12 @@ fn override_theta_init(line: &str, fit_init: &FremFitInit, re: &Regex) -> String
         return line.to_string();
     };
     let name = &caps[1];
-    let value = match fit_init
-        .theta
-        .iter()
-        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-    {
+    let value = match fit_init.theta.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
         Some((_, v)) => *v,
         None => return line.to_string(),
     };
     let init_span = caps.get(2).unwrap();
-    format!(
-        "{}{}{}",
-        &line[..init_span.start()],
-        value,
-        &line[init_span.end()..]
-    )
+    format!("{}{}{}", &line[..init_span.start()], value, &line[init_span.end()..])
 }
 
 /// Resolve which covariates (and their categorical/continuous split) go into the
@@ -843,8 +771,7 @@ fn override_theta_init(line: &str, fit_init: &FremFitInit, re: &Regex) -> String
 ///   (an escape hatch for callers that don't go through a `[covariates]` block's
 ///   kinds).
 fn resolve_frem_covariates(
-    covariate_filter: &[String],
-    categorical_override: Option<&[String]>,
+    covariate_filter: &[String], categorical_override: Option<&[String]>,
     covariate_decls: Option<&[crate::types::CovariateDecl]>,
 ) -> Result<(Vec<String>, Vec<String>), String> {
     use crate::types::CovariateKind;
@@ -854,19 +781,15 @@ fn resolve_frem_covariates(
     let decls = match covariate_decls {
         Some(d) if !d.is_empty() => d,
         Some(_) => {
-            return Err(
-                "The model's [covariates] block is empty. Declare at least one \
+            return Err("The model's [covariates] block is empty. Declare at least one \
                         covariate (each tagged continuous or categorical) for FREM to fold in."
-                    .to_string(),
-            );
+                .to_string());
         }
         None => {
-            return Err(
-                "FREM needs covariates declared in the model's [covariates] block (each \
+            return Err("FREM needs covariates declared in the model's [covariates] block (each \
                         tagged continuous or categorical). The model has no [covariates] block — \
                         add one listing the covariates to fold into the FREM model."
-                    .to_string(),
-            );
+                .to_string());
         }
     };
 
@@ -879,20 +802,14 @@ fn resolve_frem_covariates(
             // Match the declaration case-insensitively, consistent with how
             // covariates are matched against the dataset elsewhere; the declared
             // (canonical) name is what gets used downstream.
-            let decl = decls
-                .iter()
-                .find(|d| d.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| {
+            let decl =
+                decls.iter().find(|d| d.name.eq_ignore_ascii_case(name)).ok_or_else(|| {
                     format!(
                         "FREM covariate '{}' is not declared in the model's [covariates] block. \
                          The `covariates` argument selects a subset of the declared covariates \
                          (declared: {}).",
                         name,
-                        decls
-                            .iter()
-                            .map(|d| d.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
                     )
                 })?;
             // Reject duplicates so we never emit a covariate (and its eta /
@@ -986,25 +903,17 @@ fn unanchored_theta_warnings(with_eta: &[String], no_eta: &[String]) -> Vec<Stri
 /// prior behaviour of copying the declared inits verbatim.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_frem(
-    model_path: &Path,
-    data_path: &Path,
-    covariates: &[String],
-    categorical_covariates: Option<&[String]>,
-    output_model_path: Option<&Path>,
-    output_data_path: Option<&Path>,
-    missing_value: Option<f64>,
-    fit_init: Option<&FremFitInit>,
+    model_path: &Path, data_path: &Path, covariates: &[String],
+    categorical_covariates: Option<&[String]>, output_model_path: Option<&Path>,
+    output_data_path: Option<&Path>, missing_value: Option<f64>, fit_init: Option<&FremFitInit>,
 ) -> Result<FremPrepareResult, String> {
     use crate::io::datareader::read_nonmem_csv_mapped;
 
     // Full parse so the optional `[covariates]` block is available for fallback.
     // One read (#1752): the FREM model is generated from the same text that was
     // parsed, not from a later read of the file.
-    let crate::io::model_source::ModelSource {
-        text: base_text,
-        parsed,
-        ..
-    } = crate::io::model_source::ModelSource::read(model_path)?;
+    let crate::io::model_source::ModelSource { text: base_text, parsed, .. } =
+        crate::io::model_source::ModelSource::read(model_path)?;
     let base_model = &parsed.model;
     reject_non_gaussian_endpoints(base_model)?;
     // Honour the model's `[data]` column mapping (#730) so FREM prep reads the
@@ -1030,10 +939,7 @@ pub fn prepare_frem(
     )?;
 
     // Determine output paths.
-    let model_stem = model_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model");
+    let model_stem = model_path.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
     let model_dir = model_path.parent().unwrap_or_else(|| Path::new("."));
 
     let default_model_path = model_dir.join(format!("{}_frem.ferx", model_stem));
@@ -1160,17 +1066,11 @@ mod tests {
         let ws = unanchored_theta_warnings(&names(&["TVCL", "LAMBDA"]), &[]);
         assert_eq!(ws.len(), 1, "{ws:?}");
         let w = &ws[0];
-        assert!(
-            w.starts_with("FREM conversion: estimated parameter(s) [TVCL, LAMBDA] "),
-            "{w}"
-        );
+        assert!(w.starts_with("FREM conversion: estimated parameter(s) [TVCL, LAMBDA] "), "{w}");
         for frag in with_eta_sentences {
             assert!(w.contains(frag), "missing {frag:?} in: {w}");
         }
-        assert!(
-            !w.contains("no associated ETA") && !w.contains("Add an ETA"),
-            "{w}"
-        );
+        assert!(!w.contains("no associated ETA") && !w.contains("Add an ETA"), "{w}");
 
         let ws = unanchored_theta_warnings(&[], &names(&["TVKA"]));
         assert_eq!(ws.len(), 1, "{ws:?}");
@@ -1180,14 +1080,9 @@ mod tests {
 
         let ws = unanchored_theta_warnings(&names(&["LAMBDA"]), &names(&["TVKA"]));
         assert_eq!(ws.len(), 2, "{ws:?}");
+        assert!(ws.iter().any(|w| w.contains("[TVKA] have no associated ETA")), "{ws:?}");
         assert!(
-            ws.iter()
-                .any(|w| w.contains("[TVKA] have no associated ETA")),
-            "{ws:?}"
-        );
-        assert!(
-            ws.iter()
-                .any(|w| w.contains("[LAMBDA]") && w.contains(with_eta_sentences[0])),
+            ws.iter().any(|w| w.contains("[LAMBDA]") && w.contains(with_eta_sentences[0])),
             "{ws:?}"
         );
     }
@@ -1264,7 +1159,6 @@ mod tests {
     fn make_test_population() -> Population {
         let subjects = vec![
             Subject {
-                obs_rgroup: Vec::new(),
                 id: "1".to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0, 4.0],
@@ -1277,29 +1171,10 @@ mod tests {
                     m.insert("AGE".to_string(), 30.0);
                     m
                 },
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0, 0, 0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             },
             Subject {
-                obs_rgroup: Vec::new(),
                 id: "2".to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0, 2.0],
@@ -1312,26 +1187,8 @@ mod tests {
                     m.insert("AGE".to_string(), 40.0);
                     m
                 },
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0, 0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             },
         ];
         Population {
@@ -1346,89 +1203,35 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
-            plan_id: Default::default(),
-            residual_serial: None,
-            priors: Vec::new(),
-            prior_from_fit: None,
-            covariate_model: None,
-            has_conditional_eta_params: false,
-            name: "test".into(),
             pk_model: PkModel::OneCptOral,
-            error_model: ErrorModel::Proportional,
             error_spec: ErrorSpec::Single(ErrorModel::Proportional),
-            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
             n_theta: 3,
             n_eta: 3,
-            n_epsilon: 1,
-            n_kappa: 0,
             theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
             eta_names: vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
-            kappa_names: Vec::new(),
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
             indiv_param_partials: IndivParamPartials::empty(),
-            default_params: ModelParameters {
-                residual_correlations: Vec::new(),
-                residual_correlation_fixed: Vec::new(),
-                theta: vec![0.2, 10.0, 1.5],
-                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
-                theta_lower: vec![0.001, 0.1, 0.01],
-                theta_upper: vec![10.0, 500.0, 50.0],
-                theta_fixed: vec![false, false, false],
-                omega: OmegaMatrix::from_diagonal(
-                    &[0.09, 0.04, 0.30],
-                    vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
-                ),
-                omega_fixed: vec![false, false, false],
-                sigma: SigmaVector {
-                    values: vec![0.02],
-                    names: vec!["PROP_ERR".into()],
-                },
-                sigma_fixed: vec![false],
-                omega_iov: None,
-                kappa_fixed: Vec::new(),
-                mixture: None,
-            },
             omega_init_as_sd: vec![false, false, false],
-            sigma_init_as_sd: vec![false],
-            kappa_init_as_sd: Vec::new(),
-            kappa_weights: Vec::new(),
-            mu_refs: HashMap::new(),
-            covariate_mu_refs: Vec::new(),
-            kappa_mu_refs: HashMap::new(),
             tv_fn: Some(Box::new(|_t, _c| vec![0.2, 10.0, 1.5])),
             pk_indices: vec![0, 1, 4],
             eta_map: vec![0, 1, 2],
             pk_idx_f64: vec![0.0, 1.0, 4.0],
             sel_flat: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
-            dose_attr_map: Default::default(),
-            ode_spec: None,
-            diffusion_theta_start: None,
-            diffusion_state_indices: Vec::new(),
-            bloq_method: BloqMethod::Drop,
             referenced_covariates: vec![],
-            gradient_method: GradientMethod::Fd,
-            parse_warnings: Vec::new(),
-            eta_param_info: Vec::new(),
-            kappa_param_types: Vec::new(),
-            theta_transform: Vec::new(),
-            theta_eta_linked: Vec::new(),
-            #[cfg(feature = "nn")]
-            covariate_nns: Vec::new(),
-            scaling: ScalingSpec::None,
-            log_transform: false,
-            dv_pre_logged: false,
-            derived_exprs: vec![],
-            output_columns: vec![],
-            #[cfg(feature = "survival")]
-            endpoints: std::collections::BTreeMap::new(),
-            frem_config: None,
-            residual_error_eta: None,
-            analytical_init: Vec::new(),
-            analytic_readout: None,
-            ruv_magnitude: None,
-            absorption_ode_equivalent: None,
-            mixture: None,
+            ..crate::types::test_helpers::bare_model(ModelParameters {
+                theta: vec![0.2, 10.0, 1.5],
+                theta_names: vec!["TVCL".into(), "TVV".into(), "TVKA".into()],
+                theta_lower: vec![0.001, 0.1, 0.01],
+                theta_upper: vec![10.0, 500.0, 50.0],
+                theta_fixed: vec![false, false, false],
+                omega_fixed: vec![false, false, false],
+                sigma: SigmaVector { values: vec![0.02], names: vec!["PROP_ERR".into()] },
+                ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                    &[0.09, 0.04, 0.30],
+                    vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
+                ))
+            })
         }
     }
 
@@ -1481,23 +1284,11 @@ mod tests {
         // parameters (e.g. MAT) drift when the FREM model is re-fit.
         let mut pop = make_test_population();
         // Subject 1: RATE=-2 (ModeledDuration, D{cmt}).
-        pop.subjects[0].doses = vec![DoseEvent::modeled(
-            0.0,
-            100.0,
-            1,
-            false,
-            0.0,
-            RateMode::ModeledDuration,
-        )];
+        pop.subjects[0].doses =
+            vec![DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration)];
         // Subject 2: RATE=-1 (ModeledRate, R{cmt}).
-        pop.subjects[1].doses = vec![DoseEvent::modeled(
-            0.0,
-            100.0,
-            1,
-            false,
-            0.0,
-            RateMode::ModeledRate,
-        )];
+        pop.subjects[1].doses =
+            vec![DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate)];
         let model = make_test_model();
         let covs = vec!["WT".to_string(), "AGE".to_string()];
         let (csv, _) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
@@ -1605,13 +1396,8 @@ mod tests {
         let covs = vec!["WT".to_string(), "AGE".to_string()];
         let (_, info) = transform_dataset_for_frem(&pop, &model, &covs, &[], None).unwrap();
 
-        let result = generate_frem_model(
-            base_text,
-            &model,
-            &info,
-            Path::new("test_frem_data.csv"),
-            None,
-        );
+        let result =
+            generate_frem_model(base_text, &model, &info, Path::new("test_frem_data.csv"), None);
         assert!(result.is_ok());
 
         let model_text = result.unwrap();
@@ -1641,27 +1427,7 @@ mod tests {
 
     #[test]
     fn test_generate_frem_model_omega_dimensions() {
-        let base_text = r"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.02
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+        let base_text = crate::test_models::ONE_CPT_ORAL_2;
 
         let pop = make_test_population();
         let model = make_test_model();
@@ -1676,10 +1442,7 @@ mod tests {
         let bracket_start = model_text[block_start..].find('[').unwrap() + block_start;
         let bracket_end = model_text[bracket_start..].find(']').unwrap() + bracket_start;
         let values_str = &model_text[bracket_start + 1..bracket_end];
-        let n_values: usize = values_str
-            .split(',')
-            .filter(|s| !s.trim().is_empty())
-            .count();
+        let n_values: usize = values_str.split(',').filter(|s| !s.trim().is_empty()).count();
         assert_eq!(n_values, 10); // 4*(4+1)/2
     }
 
@@ -1688,27 +1451,7 @@ mod tests {
         // Issue #239: when a prior fit is supplied, its theta/omega estimates
         // seed the generated FREM model's PK init values instead of the base
         // model file's declared inits.
-        let base_text = r"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.02
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+        let base_text = crate::test_models::ONE_CPT_ORAL_2;
 
         let pop = make_test_population();
         let model = make_test_model();
@@ -1725,14 +1468,9 @@ mod tests {
             omega: DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.11, 0.05, 0.28])),
         };
 
-        let model_text = generate_frem_model(
-            base_text,
-            &model,
-            &info,
-            Path::new("test.csv"),
-            Some(&fit_init),
-        )
-        .unwrap();
+        let model_text =
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv"), Some(&fit_init))
+                .unwrap();
 
         // Fitted theta values replace the declared inits, bounds untouched.
         assert!(
@@ -1758,27 +1496,11 @@ mod tests {
             .lines()
             .map(|l| l.trim().trim_end_matches(','))
             .filter(|l| !l.is_empty())
-            .map(|l| {
-                l.split(',')
-                    .map(|v| v.trim().parse::<f64>().unwrap())
-                    .collect()
-            })
+            .map(|l| l.split(',').map(|v| v.trim().parse::<f64>().unwrap()).collect())
             .collect();
-        assert!(
-            (rows[0][0] - 0.11).abs() < 1e-9,
-            "ETA_CL diag: {:?}",
-            rows[0]
-        );
-        assert!(
-            (rows[1][1] - 0.05).abs() < 1e-9,
-            "ETA_V diag: {:?}",
-            rows[1]
-        );
-        assert!(
-            (rows[2][2] - 0.28).abs() < 1e-9,
-            "ETA_KA diag: {:?}",
-            rows[2]
-        );
+        assert!((rows[0][0] - 0.11).abs() < 1e-9, "ETA_CL diag: {:?}", rows[0]);
+        assert!((rows[1][1] - 0.05).abs() < 1e-9, "ETA_V diag: {:?}", rows[1]);
+        assert!((rows[2][2] - 0.28).abs() < 1e-9, "ETA_KA diag: {:?}", rows[2]);
     }
 
     #[test]
@@ -1788,27 +1510,7 @@ mod tests {
         // declared omega) instead of panicking on an out-of-bounds index inside
         // `fit_omega_value`. The base model has 3 PK etas; here `omega` is only
         // 2x2, so the ETA_KA lookup (index 2) is out of range.
-        let base_text = r"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.02
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
+        let base_text = crate::test_models::ONE_CPT_ORAL_2;
 
         let pop = make_test_population();
         let model = make_test_model();
@@ -1825,14 +1527,9 @@ mod tests {
 
         // Must not panic; the in-range ETA_CL/ETA_V entries are seeded from the
         // fit, ETA_KA falls back to the declared 0.30.
-        let model_text = generate_frem_model(
-            base_text,
-            &model,
-            &info,
-            Path::new("test.csv"),
-            Some(&fit_init),
-        )
-        .unwrap();
+        let model_text =
+            generate_frem_model(base_text, &model, &info, Path::new("test.csv"), Some(&fit_init))
+                .unwrap();
 
         let block_start = model_text.find("block_omega").unwrap();
         let bracket_start = model_text[block_start..].find('[').unwrap() + block_start;
@@ -1841,28 +1538,12 @@ mod tests {
             .lines()
             .map(|l| l.trim().trim_end_matches(','))
             .filter(|l| !l.is_empty())
-            .map(|l| {
-                l.split(',')
-                    .map(|v| v.trim().parse::<f64>().unwrap())
-                    .collect()
-            })
+            .map(|l| l.split(',').map(|v| v.trim().parse::<f64>().unwrap()).collect())
             .collect();
-        assert!(
-            (rows[0][0] - 0.11).abs() < 1e-9,
-            "ETA_CL diag: {:?}",
-            rows[0]
-        );
-        assert!(
-            (rows[1][1] - 0.05).abs() < 1e-9,
-            "ETA_V diag: {:?}",
-            rows[1]
-        );
+        assert!((rows[0][0] - 0.11).abs() < 1e-9, "ETA_CL diag: {:?}", rows[0]);
+        assert!((rows[1][1] - 0.05).abs() < 1e-9, "ETA_V diag: {:?}", rows[1]);
         // ETA_KA out of range in fit omega -> declared 0.30 retained.
-        assert!(
-            (rows[2][2] - 0.30).abs() < 1e-9,
-            "ETA_KA diag: {:?}",
-            rows[2]
-        );
+        assert!((rows[2][2] - 0.30).abs() < 1e-9, "ETA_KA diag: {:?}", rows[2]);
     }
 
     #[test]
@@ -1900,11 +1581,7 @@ mod tests {
         assert!(w[0].contains("eta names"));
 
         // Nothing to compare (empty fit) -> no advisory.
-        let empty = FremFitInit {
-            theta: vec![],
-            eta_names: vec![],
-            omega: DMatrix::zeros(0, 0),
-        };
+        let empty = FremFitInit { theta: vec![], eta_names: vec![], omega: DMatrix::zeros(0, 0) };
         assert!(fit_init_name_warnings(&model, &empty).is_empty());
     }
 
@@ -1931,10 +1608,7 @@ mod tests {
             "theta TVV(10.0, 0.1, 500.0)"
         );
         // Line the regex cannot parse -> returned unchanged.
-        assert_eq!(
-            override_theta_init("theta MALFORMED", &fit, &re),
-            "theta MALFORMED"
-        );
+        assert_eq!(override_theta_init("theta MALFORMED", &fit, &re), "theta MALFORMED");
     }
 
     #[test]
@@ -2013,8 +1687,7 @@ mod tests {
 
     /// FREM-converts `base_text` (covariates WT, AGE) and parses the result.
     fn frem_convert_and_parse(
-        base_text: &str,
-        fit_init: Option<&FremFitInit>,
+        base_text: &str, fit_init: Option<&FremFitInit>,
     ) -> (String, CompiledModel) {
         let base =
             crate::parser::model_parser::parse_model_string(base_text).expect("base model parses");
@@ -2087,11 +1760,7 @@ mod tests {
         );
 
         let ruv = eta_index(&m, "ETA_RUV");
-        assert_eq!(
-            m.residual_error_eta,
-            Some(ruv),
-            "iiv_on_ruv no longer binds ETA_RUV"
-        );
+        assert_eq!(m.residual_error_eta, Some(ruv), "iiv_on_ruv no longer binds ETA_RUV");
         let om = &m.default_params.omega.matrix;
         let (cl, v) = (eta_index(&m, "ETA_CL"), eta_index(&m, "ETA_V"));
         assert_eq!(om[(cl, cl)], 0.11, "ETA_CL lost its fitted variance");
@@ -2129,17 +1798,10 @@ mod tests {
         let (text, m) = frem_convert_and_parse(&base, None);
 
         let block_line = text.lines().find(|l| l.contains("block_omega")).unwrap();
-        assert!(
-            block_line.contains("ETA_RUV"),
-            "correlated ETA_RUV left the block:\n{text}"
-        );
+        assert!(block_line.contains("ETA_RUV"), "correlated ETA_RUV left the block:\n{text}");
         let om = &m.default_params.omega.matrix;
         let (cl, ruv) = (eta_index(&m, "ETA_CL"), eta_index(&m, "ETA_RUV"));
-        assert_eq!(
-            om[(cl, ruv)],
-            0.01,
-            "ETA_CL × ETA_RUV covariance lost:\n{text}"
-        );
+        assert_eq!(om[(cl, ruv)], 0.01, "ETA_CL × ETA_RUV covariance lost:\n{text}");
         for cov in ["ETA_WT_FREM", "ETA_AGE_FREM"] {
             let c = eta_index(&m, cov);
             assert_eq!(om[(ruv, c)], 0.0, "ETA_RUV × {cov} is not zero:\n{text}");
@@ -2184,10 +1846,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(100u16, (0usize, 1usize)); // FREMTYPE 100 -> (theta 0, eta 1) OBSERVED
         map.insert(300u16, (0usize, 3usize)); // FREMTYPE 300 -> (theta 0, eta 3) MISSING
-        let fc = FremConfig {
-            fremtype_to_indices: map,
-            covariate_sigma_index: 0,
-        };
+        let fc = FremConfig { fremtype_to_indices: map, covariate_sigma_index: 0 };
         let mut subj = make_test_population().subjects.remove(0);
         subj.obs_times = vec![1.0, 1.0];
         subj.obs_raw_times = vec![1.0, 1.0];
@@ -2207,11 +1866,7 @@ mod tests {
             )
             .expect("Some when at least one covariate observed");
 
-        assert_eq!(
-            sampled,
-            vec![0, 2, 3],
-            "missing cov eta 3 joins the sampled PK set"
-        );
+        assert_eq!(sampled, vec![0, 2, 3], "missing cov eta 3 joins the sampled PK set");
         assert_eq!(observed, vec![1], "only eta 1 (FREMTYPE 100) is observed");
         assert_eq!(d.len(), 1);
         assert!((d[0] - (7.0 - 0.2)).abs() < 1e-12, "d = cov_obs - TV");
@@ -2277,11 +1932,7 @@ mod tests {
     }
 
     fn decl(name: &str, kind: CovariateKind) -> CovariateDecl {
-        CovariateDecl {
-            levels: None,
-            name: name.to_string(),
-            kind,
-        }
+        CovariateDecl { levels: None, name: name.to_string(), kind }
     }
 
     #[test]
@@ -2305,10 +1956,7 @@ mod tests {
         // Map FREMTYPE 100 -> (theta TVCL idx 0, eta ETA_V idx 1).
         let mut map = std::collections::HashMap::new();
         map.insert(100u16, (0usize, 1usize));
-        model.frem_config = Some(FremConfig {
-            fremtype_to_indices: map,
-            covariate_sigma_index: 0,
-        });
+        model.frem_config = Some(FremConfig { fremtype_to_indices: map, covariate_sigma_index: 0 });
 
         let mut subj = make_test_population().subjects.remove(0); // 3 obs
         subj.fremtype = vec![0, 100, 0];
@@ -2344,19 +1992,14 @@ mod tests {
         // Filtering to a covariate not in the block is an error.
         let decls = vec![decl("WT", CovariateKind::Continuous)];
         let err = resolve_frem_covariates(&["AGE".to_string()], None, Some(&decls)).unwrap_err();
-        assert!(
-            err.contains("AGE") && err.contains("[covariates]"),
-            "got: {err}"
-        );
+        assert!(err.contains("AGE") && err.contains("[covariates]"), "got: {err}");
     }
 
     #[test]
     fn resolve_covariates_categorical_override() {
         // The override forces the categorical split regardless of block kinds.
-        let decls = vec![
-            decl("WT", CovariateKind::Continuous),
-            decl("SEX", CovariateKind::Categorical),
-        ];
+        let decls =
+            vec![decl("WT", CovariateKind::Continuous), decl("SEX", CovariateKind::Categorical)];
         let (covs, cats) =
             resolve_frem_covariates(&[], Some(&["WT".to_string()]), Some(&decls)).unwrap();
         assert_eq!(covs, vec!["WT", "SEX"]);
@@ -2374,15 +2017,11 @@ mod tests {
 
     #[test]
     fn resolve_covariates_filter_rejects_duplicates() {
-        let decls = vec![
-            decl("WT", CovariateKind::Continuous),
-            decl("AGE", CovariateKind::Continuous),
-        ];
+        let decls =
+            vec![decl("WT", CovariateKind::Continuous), decl("AGE", CovariateKind::Continuous)];
         // Exact and case-variant duplicates both error.
-        assert!(
-            resolve_frem_covariates(&["WT".to_string(), "WT".to_string()], None, Some(&decls))
-                .is_err()
-        );
+        assert!(resolve_frem_covariates(&["WT".to_string(), "WT".to_string()], None, Some(&decls))
+            .is_err());
         let err =
             resolve_frem_covariates(&["WT".to_string(), "wt".to_string()], None, Some(&decls))
                 .unwrap_err();
@@ -2392,17 +2031,12 @@ mod tests {
     #[test]
     fn resolve_covariates_categorical_override_must_be_selected() {
         // An override naming a covariate that isn't in the FREM set is an error.
-        let decls = vec![
-            decl("WT", CovariateKind::Continuous),
-            decl("SEX", CovariateKind::Categorical),
-        ];
+        let decls =
+            vec![decl("WT", CovariateKind::Continuous), decl("SEX", CovariateKind::Categorical)];
         // SEX is excluded by the filter, so overriding it categorical is invalid.
-        let err = resolve_frem_covariates(
-            &["WT".to_string()],
-            Some(&["SEX".to_string()]),
-            Some(&decls),
-        )
-        .unwrap_err();
+        let err =
+            resolve_frem_covariates(&["WT".to_string()], Some(&["SEX".to_string()]), Some(&decls))
+                .unwrap_err();
         assert!(err.contains("not among the selected"), "got: {err}");
     }
 
@@ -2411,7 +2045,6 @@ mod tests {
         // 3 subjects with RACE: 1 (most common), 2, 3
         for (id, race) in &[("1", 1.0), ("2", 1.0), ("3", 2.0), ("4", 3.0)] {
             subjects.push(Subject {
-                obs_rgroup: Vec::new(),
                 id: id.to_string(),
                 doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
                 obs_times: vec![1.0],
@@ -2424,26 +2057,8 @@ mod tests {
                     m.insert("RACE".to_string(), *race);
                     m
                 },
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: Vec::new(),
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             });
         }
         Population {
@@ -2512,8 +2127,7 @@ mod tests {
         // NCI-like binary covariate (levels 0, 1) should NOT be expanded.
         let mut pop = make_test_population();
         for (i, subj) in pop.subjects.iter_mut().enumerate() {
-            subj.covariates
-                .insert("NCI".to_string(), if i == 0 { 0.0 } else { 1.0 });
+            subj.covariates.insert("NCI".to_string(), if i == 0 { 0.0 } else { 1.0 });
         }
         pop.covariate_names.push("NCI".to_string());
 
@@ -2563,10 +2177,7 @@ mod tests {
             let parts: Vec<&str> = l.split(',').collect();
             parts[id_col] == "2" && parts[ft_col] == "200"
         });
-        assert!(
-            subj2_ht.is_none(),
-            "Subject 2 should not have HT pseudo-obs (HT is missing)"
-        );
+        assert!(subj2_ht.is_none(), "Subject 2 should not have HT pseudo-obs (HT is missing)");
 
         // Subject 1 should have the HT pseudo-obs row.
         let subj1_ht = lines.iter().find(|l| {
@@ -2583,7 +2194,6 @@ mod tests {
         let mut pop = make_test_population();
         // Add a third subject.
         pop.subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: "3".to_string(),
             observations: vec![3.0],
             obs_times: vec![1.0],
@@ -2597,26 +2207,8 @@ mod tests {
                 m.insert("RACE".to_string(), 2.0);
                 m
             },
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: Vec::new(),
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
         // Subject 1: RACE=1, Subject 2: RACE=-99
         pop.subjects[0].covariates.insert("RACE".to_string(), 1.0);
@@ -2647,10 +2239,7 @@ mod tests {
             let parts: Vec<&str> = l.split(',').collect();
             parts[id_col] == "2" && parts[ft_col] == "200"
         });
-        assert!(
-            subj2_race.is_none(),
-            "Subject 2 should not have RACE pseudo-obs (missing)"
-        );
+        assert!(subj2_race.is_none(), "Subject 2 should not have RACE pseudo-obs (missing)");
     }
 
     #[test]
@@ -2673,9 +2262,7 @@ mod tests {
     #[test]
     fn a_non_gaussian_endpoint_is_rejected_by_name() {
         let src = std::fs::read_to_string("examples/pktte_joint.ferx").unwrap();
-        let m = crate::parser::model_parser::parse_full_model(&src)
-            .unwrap()
-            .model;
+        let m = crate::parser::model_parser::parse_full_model(&src).unwrap().model;
         let (pop, _) = crate::api::read_population_for(
             &m,
             &None,
@@ -2688,10 +2275,7 @@ mod tests {
         .unwrap();
         let err = transform_dataset_for_frem(&pop, &m, &["WT".to_string()], &[], None)
             .expect_err("joint model must be refused");
-        assert!(
-            err.contains("E_FREM_NON_GAUSSIAN_ENDPOINT") && err.contains("CMT [3]"),
-            "{err}"
-        );
+        assert!(err.contains("E_FREM_NON_GAUSSIAN_ENDPOINT") && err.contains("CMT [3]"), "{err}");
 
         let err = prepare_frem(
             Path::new("examples/pktte_joint.ferx"),
@@ -2708,9 +2292,7 @@ mod tests {
 
         // The binary arm of `has_non_gaussian()` trips the same guard.
         let src = std::fs::read_to_string("examples/binary_logistic.ferx").unwrap();
-        let m = crate::parser::model_parser::parse_full_model(&src)
-            .unwrap()
-            .model;
+        let m = crate::parser::model_parser::parse_full_model(&src).unwrap().model;
         let (pop, _) = crate::api::read_population_for(
             &m,
             &None,
@@ -2723,9 +2305,6 @@ mod tests {
         .unwrap();
         let err = transform_dataset_for_frem(&pop, &m, &["X".to_string()], &[], None)
             .expect_err("binary model must be refused");
-        assert!(
-            err.contains("E_FREM_NON_GAUSSIAN_ENDPOINT") && err.contains("CMT [3]"),
-            "{err}"
-        );
+        assert!(err.contains("E_FREM_NON_GAUSSIAN_ENDPOINT") && err.contains("CMT [3]"), "{err}");
     }
 }

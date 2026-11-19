@@ -92,15 +92,8 @@ fn nonmem_obs(path: &str) -> Vec<NmRow> {
     text.lines()
         .skip(2)
         .map(|l| {
-            let c: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
-            assert_eq!(
-                c.len(),
-                12,
-                "ID TIME OCC EVID DV PRED IPRED IWRES CWRES ETA1 ETA2 ETA3"
-            );
+            let c: Vec<f64> = l.split_whitespace().map(|x| x.parse().expect("number")).collect();
+            assert_eq!(c.len(), 12, "ID TIME OCC EVID DV PRED IPRED IWRES CWRES ETA1 ETA2 ETA3");
             c
         })
         .filter(|c| c[3] == 0.0)
@@ -116,12 +109,9 @@ fn nonmem_obs(path: &str) -> Vec<NmRow> {
 }
 
 fn run(method: EstimationMethod, interaction: bool) -> FitResult {
-    let pop = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv_iov.csv"),
-        Some(&["WT"]),
-        Some("OCC"),
-    )
-    .expect("data");
+    let pop =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv_iov.csv"), Some(&["WT"]), Some("OCC"))
+            .expect("data");
     let model = parse_model_string(MODEL).expect("model");
     assert_eq!(model.n_kappa, 1, "one IOV kappa on CL");
     let opts = FitOptions {
@@ -187,11 +177,7 @@ fn assert_matches_nonmem(label: &str, r: &FitResult, tab: &str, nm_ofv: f64) {
         d_pred < PRED_TOL,
         "{label}: PRED off NONMEM by {d_pred:e} — the point or row order is wrong"
     );
-    assert!(
-        r.ofv.is_finite() && d_ofv < OFV_TOL,
-        "{label}: OFV {} vs NONMEM {nm_ofv}",
-        r.ofv
-    );
+    assert!(r.ofv.is_finite() && d_ofv < OFV_TOL, "{label}: OFV {} vs NONMEM {nm_ofv}", r.ofv);
     // The fit's objective and the post-fit pass's per-subject OFV are two evaluations of
     // the same marginal at the same point. They agree to the bit on macOS arm64 and Linux
     // x86_64 (the MEASURE line's two bit patterns), so `OFV_SUM_TOL` leaves room only for
@@ -205,10 +191,7 @@ fn assert_matches_nonmem(label: &str, r: &FitResult, tab: &str, nm_ofv: f64) {
         r.ofv
     );
     assert!(d_ebe < EBE_TOL, "{label}: EBEs off NONMEM by {d_ebe:e}");
-    assert!(
-        d_ipred < IPRED_TOL,
-        "{label}: IPRED off NONMEM by {d_ipred:e}"
-    );
+    assert!(d_ipred < IPRED_TOL, "{label}: IPRED off NONMEM by {d_ipred:e}");
     assert!(
         d_cwres < CWRES_TOL,
         "{label}: CWRES off NONMEM by {d_cwres:e} (> {CWRES_TOL}): the residual pass is not \
@@ -220,12 +203,7 @@ fn assert_matches_nonmem(label: &str, r: &FitResult, tab: &str, nm_ofv: f64) {
 fn iov_cwres_matches_nonmem_focei() {
     let r = run(EstimationMethod::FoceI, true);
     assert!(r.interaction, "FOCEI fixture premise");
-    assert_matches_nonmem(
-        "focei",
-        &r,
-        "tests/nonmem/iov_cwres_focei.tab",
-        NM_OFV_FOCEI,
-    );
+    assert_matches_nonmem("focei", &r, "tests/nonmem/iov_cwres_focei.tab", NM_OFV_FOCEI);
 }
 
 #[test]

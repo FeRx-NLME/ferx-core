@@ -74,11 +74,7 @@ fn a_simulate_run_reports_each_model_data_finding_exactly_once() {
     let (result, _population) =
         ferx_core::run_model_simulate(model_path.to_str().unwrap()).expect("simulate");
 
-    let n = result
-        .warnings
-        .iter()
-        .filter(|w| w.contains(FLIP_FLOP))
-        .count();
+    let n = result.warnings.iter().filter(|w| w.contains(FLIP_FLOP)).count();
     assert!(
         n > 0,
         "the model/data bundle must reach a --simulate run at all: {:?}",
@@ -92,11 +88,8 @@ fn a_simulate_run_reports_each_model_data_finding_exactly_once() {
     );
 
     // The structured channel is rebuilt from `warnings`, so it inherits the count.
-    let structured = result
-        .warnings_structured
-        .iter()
-        .filter(|e| e.message.contains(FLIP_FLOP))
-        .count();
+    let structured =
+        result.warnings_structured.iter().filter(|e| e.message.contains(FLIP_FLOP)).count();
     assert_eq!(
         structured, 1,
         "the typed / JSON surface is rebuilt from `warnings` and must agree with it"

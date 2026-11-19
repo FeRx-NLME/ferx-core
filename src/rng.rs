@@ -20,9 +20,9 @@ pub(crate) fn splitmix64(mut x: u64) -> u64 {
 /// under the user's `seed`. Order-sensitive; the seed is hashed before any word is folded
 /// in, so `(s, [i])` and `(s ± d, [i ∓ d])` do not coincide.
 pub(crate) fn stream_seed(seed: u64, words: &[u64]) -> u64 {
-    words.iter().fold(splitmix64(seed), |acc, &w| {
-        splitmix64(acc ^ splitmix64(w ^ 0xA076_1D64_78BD_642F))
-    })
+    words
+        .iter()
+        .fold(splitmix64(seed), |acc, &w| splitmix64(acc ^ splitmix64(w ^ 0xA076_1D64_78BD_642F)))
 }
 
 #[cfg(test)]
@@ -36,10 +36,7 @@ mod tests {
         let mut seen = HashSet::new();
         for s in 0..8u64 {
             for i in 0..500u64 {
-                assert!(
-                    seen.insert(stream_seed(s, &[i])),
-                    "stream ({s},{i}) repeats"
-                );
+                assert!(seen.insert(stream_seed(s, &[i])), "stream ({s},{i}) repeats");
             }
         }
         for s in 1..8u64 {
@@ -173,10 +170,7 @@ mod tests {
             bad.join("\n")
         );
         for ((p, text, why), n) in EXEMPT.iter().zip(&used) {
-            assert_eq!(
-                *n, 1,
-                "exemption `{p}` / `{text}` ({why}) matched {n} lines"
-            );
+            assert_eq!(*n, 1, "exemption `{p}` / `{text}` ({why}) matched {n} lines");
         }
         // Every file that seeds per-subject / per-chain / per-start streams must also name
         // the helper.

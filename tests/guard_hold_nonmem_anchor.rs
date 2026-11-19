@@ -59,11 +59,7 @@ fn ext_row(iteration: &str) -> std::collections::HashMap<String, f64> {
         .expect("the row")
         .split_whitespace()
         .collect();
-    header
-        .iter()
-        .zip(&row)
-        .map(|(h, v)| (h.to_string(), v.parse::<f64>().unwrap()))
-        .collect()
+    header.iter().zip(&row).map(|(h, v)| (h.to_string(), v.parse::<f64>().unwrap())).collect()
 }
 
 fn evaluate() -> FitResult {
@@ -83,22 +79,14 @@ fn held_standard_errors_match_nonmem_with_the_coordinate_fixed() {
     // Same point, same objective. Measured: ferx 353.754540470156, NONMEM
     // 353.75454052250410 (Δ 5.2e-8).
     let d_ofv = (f.ofv - est["OBJ"]).abs();
-    assert!(
-        d_ofv < 1e-6,
-        "OFV {} vs NONMEM {} (Δ {d_ofv:e})",
-        f.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv < 1e-6, "OFV {} vs NONMEM {} (Δ {d_ofv:e})", f.ofv, est["OBJ"]);
 
     // ferx held ETA_KA; NONMEM had it FIX.
     assert_eq!(f.held_at_bound.len(), 1);
     assert_eq!(f.held_at_bound[0].name, "ETA_KA");
     assert_eq!(f.held_at_bound[0].reason, HeldReason::CollapsedAtGuard);
     assert!(f.cov_fixed[5], "{:?}", f.cov_fixed);
-    assert_eq!(
-        se["OMEGA(3,3)"], 1e10,
-        "NONMEM reports no SE for a FIX element"
-    );
+    assert_eq!(se["OMEGA(3,3)"], 1e10, "NONMEM reports no SE for a FIX element");
 
     let st = f.se_theta.as_ref().unwrap();
     let so = f.se_omega.as_ref().unwrap();
@@ -114,10 +102,7 @@ fn held_standard_errors_match_nonmem_with_the_coordinate_fixed() {
     ];
     let mut worst = (0.0_f64, "");
     for (name, ferx, nm) in pairs {
-        assert!(
-            ferx.is_finite() && nm.is_finite() && nm > 0.0,
-            "{name}: {ferx} vs {nm}"
-        );
+        assert!(ferx.is_finite() && nm.is_finite() && nm > 0.0, "{name}: {ferx} vs {nm}");
         let rel = (ferx - nm).abs() / nm;
         eprintln!("{name}: ferx {ferx:.6e}  NONMEM {nm:.5e}  rel {rel:.2e}");
         if rel > worst.0 {
@@ -131,10 +116,5 @@ fn held_standard_errors_match_nonmem_with_the_coordinate_fixed() {
     // and cannot fail this bound; one that dropped a coordinate or conditioned on the
     // wrong one moves them by orders more.
     const BOUND: f64 = 2.5e-3;
-    assert!(
-        worst.0 < BOUND,
-        "worst relative SE gap {:.3e} at {}",
-        worst.0,
-        worst.1
-    );
+    assert!(worst.0 < BOUND, "worst relative SE gap {:.3e} at {}", worst.0, worst.1);
 }

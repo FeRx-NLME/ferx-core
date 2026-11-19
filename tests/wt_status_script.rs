@@ -15,9 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn script() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tools")
-        .join("wt-status.sh")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools").join("wt-status.sh")
 }
 
 /// `git` isolated from the developer's and runner's configuration, so a global
@@ -52,41 +50,15 @@ fn fixture(slot: &str) -> (PathBuf, PathBuf) {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let origin = root.join("origin.git");
-    git(
-        &root,
-        &[
-            "init",
-            "-q",
-            "--bare",
-            "-b",
-            "main",
-            origin.to_str().unwrap(),
-        ],
-    );
+    git(&root, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
     let seed = root.join("seed");
-    git(
-        &root,
-        &[
-            "clone",
-            "-q",
-            origin.to_str().unwrap(),
-            seed.to_str().unwrap(),
-        ],
-    );
+    git(&root, &["clone", "-q", origin.to_str().unwrap(), seed.to_str().unwrap()]);
     git(&seed, &["checkout", "-q", "-b", "main"]);
     commit_file(&seed, "a.txt", "one\n", "a");
     commit_file(&seed, "b.txt", "two\n", "b");
     git(&seed, &["push", "-q", "origin", "main"]);
     let work = root.join("work");
-    git(
-        &root,
-        &[
-            "clone",
-            "-q",
-            origin.to_str().unwrap(),
-            work.to_str().unwrap(),
-        ],
-    );
+    git(&root, &["clone", "-q", origin.to_str().unwrap(), work.to_str().unwrap()]);
     git(&work, &["checkout", "-q", "-b", "topic"]);
     (seed, work)
 }
@@ -145,10 +117,7 @@ fn conflicts_name_the_path_and_a_disjoint_edit_reports_none() {
         assert_eq!(field(&rep, "changed"), "1", "{slot}:\n{rep}");
         if want_conflict {
             assert_eq!(field(&rep, "conflicts"), "yes", "{slot}:\n{rep}");
-            assert!(
-                rep.lines().any(|l| l == "  a.txt"),
-                "{slot}: path not listed:\n{rep}"
-            );
+            assert!(rep.lines().any(|l| l == "  a.txt"), "{slot}: path not listed:\n{rep}");
         } else {
             assert_eq!(field(&rep, "conflicts"), "none", "{slot}:\n{rep}");
             assert!(!rep.contains("  a.txt"), "{slot}:\n{rep}");
@@ -190,10 +159,7 @@ fn upstream_reports_none_in_sync_and_ahead() {
     git(&work, &["push", "-q", "-u", "origin", "topic"]);
     let synced = report(&work, &[]);
     let up = field(&synced, "upstream");
-    assert!(
-        up.starts_with("origin/topic ") && up.ends_with("(in sync)"),
-        "{synced}"
-    );
+    assert!(up.starts_with("origin/topic ") && up.ends_with("(in sync)"), "{synced}");
     commit_file(&work, "e.txt", "five\n", "topic 2");
     let ahead = report(&work, &[]);
     assert!(field(&ahead, "upstream").ends_with("(ahead 1)"), "{ahead}");
@@ -206,10 +172,7 @@ fn missing_base_exits_2_and_an_existing_one_succeeds() {
     let (_seed, work) = fixture("base");
     let bad = run(&work, &["--base", "origin/nope"]);
     assert_eq!(bad.status.code(), Some(2), "{bad:?}");
-    assert!(
-        String::from_utf8_lossy(&bad.stderr).contains("origin/nope"),
-        "{bad:?}"
-    );
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("origin/nope"), "{bad:?}");
     let good = report(&work, &["--base", "origin/main"]);
     assert!(field(&good, "base").starts_with("origin/main "), "{good}");
 }

@@ -36,9 +36,7 @@ const CODE: &str = "W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT";
 /// loop use?". This sets both, as the stamped engine path does — the *unstamped* path each source covers alone is
 /// what `an_unstamped_model_still_warns…` and `an_engine_forced_fd_is_silent…` take.
 fn coupled_case(
-    gradient: GradientMethod,
-    optimizer: Optimizer,
-    method: EstimationMethod,
+    gradient: GradientMethod, optimizer: Optimizer, method: EstimationMethod,
 ) -> Vec<Diagnostic> {
     let model = analytical_model(gradient);
     let opts = FitOptions {
@@ -48,10 +46,7 @@ fn coupled_case(
         interaction: matches!(method, EstimationMethod::FoceI),
         ..Default::default()
     };
-    check_model_options(&model, &opts)
-        .into_iter()
-        .filter(|d| d.code == CODE)
-        .collect()
+    check_model_options(&model, &opts).into_iter().filter(|d| d.code == CODE).collect()
 }
 
 /// The reported case: an analytic-scope model, `gradient = fd`, `optimizer` left at
@@ -73,11 +68,7 @@ fn fd_on_an_analytic_model_warns_and_names_both_optimizers() {
     // The optimizer that ran, and the one the unforced arm will run. Asserted by
     // the labels the rest of the output uses (`FitResult.optimizer` prints
     // `auto (bobyqa)`), so the user can match the two up without the docs.
-    assert!(
-        d.message.contains("bobyqa"),
-        "must name what auto resolved to: {}",
-        d.message
-    );
+    assert!(d.message.contains("bobyqa"), "must name what auto resolved to: {}", d.message);
     assert!(
         d.message.contains("nlopt_lbfgs"),
         "must name what auto would have resolved to under gradient = auto: {}",
@@ -95,12 +86,7 @@ fn fd_on_an_analytic_model_warns_and_names_both_optimizers() {
 #[test]
 fn auto_gradient_is_silent() {
     assert!(
-        coupled_case(
-            GradientMethod::Auto,
-            Optimizer::Auto,
-            EstimationMethod::FoceI
-        )
-        .is_empty(),
+        coupled_case(GradientMethod::Auto, Optimizer::Auto, EstimationMethod::FoceI).is_empty(),
         "no gradient override, no coupling"
     );
 }
@@ -148,9 +134,7 @@ fn an_out_of_scope_model_is_silent_because_fd_changed_nothing() {
         ..Default::default()
     };
     assert!(
-        !check_model_options(&model, &opts)
-            .iter()
-            .any(|d| d.code == CODE),
+        !check_model_options(&model, &opts).iter().any(|d| d.code == CODE),
         "auto resolves to bobyqa on this model with or without the override"
     );
 }
@@ -183,9 +167,7 @@ fn an_engine_forced_fd_is_silent_because_the_user_set_nothing() {
         "fixture must be one the counterfactual gate alone would flag"
     );
     assert!(
-        !check_model_options(&model, &opts)
-            .iter()
-            .any(|d| d.code == CODE),
+        !check_model_options(&model, &opts).iter().any(|d| d.code == CODE),
         "the user did not write `gradient = fd`; do not report a coupling they did not cause"
     );
 }
@@ -210,11 +192,8 @@ fn methods_that_never_consult_resolve_auto_are_silent() {
         );
     }
     // …and the three that do.
-    for method in [
-        EstimationMethod::Foce,
-        EstimationMethod::FoceI,
-        EstimationMethod::FoceGnHybrid,
-    ] {
+    for method in [EstimationMethod::Foce, EstimationMethod::FoceI, EstimationMethod::FoceGnHybrid]
+    {
         assert_eq!(
             coupled_case(GradientMethod::Fd, Optimizer::Auto, method).len(),
             1,
@@ -257,9 +236,7 @@ fn above_the_bobyqa_dimension_threshold_nothing_is_coupled() {
         ..Default::default()
     };
     assert!(
-        !check_model_options(&model, &opts)
-            .iter()
-            .any(|d| d.code == CODE),
+        !check_model_options(&model, &opts).iter().any(|d| d.code == CODE),
         "the optimizer did not move, so there is no coupling to report"
     );
 }
@@ -284,10 +261,7 @@ fn the_warning_is_warning_severity_so_fit_forwards_it() {
 #[test]
 fn resolve_auto_is_unchanged_by_the_split() {
     for (model, expected) in [
-        (
-            analytical_model(GradientMethod::Auto),
-            Optimizer::NloptLbfgs,
-        ),
+        (analytical_model(GradientMethod::Auto), Optimizer::NloptLbfgs),
         (analytical_model(GradientMethod::Fd), Optimizer::Bobyqa),
         (ode_model(GradientMethod::Auto), Optimizer::Bobyqa),
         (ode_model(GradientMethod::Fd), Optimizer::Bobyqa),
@@ -334,15 +308,9 @@ fn an_unstamped_model_still_warns_because_the_options_carry_the_fd() {
         GradientMethod::Auto,
         "fixture must be UNSTAMPED, else it cannot reproduce the ferx check path"
     );
-    let diags: Vec<_> = check_model_options(&model, &opts)
-        .into_iter()
-        .filter(|d| d.code == CODE)
-        .collect();
-    assert_eq!(
-        diags.len(),
-        1,
-        "ferx check must see the coupling it advertises, got {diags:?}"
-    );
+    let diags: Vec<_> =
+        check_model_options(&model, &opts).into_iter().filter(|d| d.code == CODE).collect();
+    assert_eq!(diags.len(), 1, "ferx check must see the coupling it advertises, got {diags:?}");
     assert!(diags[0].message.contains("bobyqa"));
 }
 
@@ -373,9 +341,7 @@ fn an_sde_model_keeps_the_requested_gradient_and_stays_silent() {
         "an SDE model has an analytic-sensitivity path; the engine forces nothing"
     );
     assert!(
-        !check_model_options(&model, &user_asked_auto)
-            .iter()
-            .any(|d| d.code == CODE),
+        !check_model_options(&model, &user_asked_auto).iter().any(|d| d.code == CODE),
         "the user wrote no `gradient` line; do not report a coupling they did not cause"
     );
 }
@@ -402,10 +368,7 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
     };
     // Without the mixture this model is the warning's positive case…
     assert_eq!(
-        check_model_options(&model, &opts)
-            .iter()
-            .filter(|d| d.code == CODE)
-            .count(),
+        check_model_options(&model, &opts).iter().filter(|d| d.code == CODE).count(),
         1,
         "the non-mixture twin must warn, or this test proves nothing about mixtures"
     );
@@ -431,9 +394,7 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
         "a mixture resolves `auto` to BOBYQA even with an analytic gradient available"
     );
     assert!(
-        !check_model_options(&model, &opts)
-            .iter()
-            .any(|d| d.code == CODE),
+        !check_model_options(&model, &opts).iter().any(|d| d.code == CODE),
         "a mixture's `auto` is BOBYQA with or without the gradient override"
     );
 }
@@ -462,21 +423,14 @@ fn an_evaluation_only_fit_is_silent_because_no_optimizer_runs() {
         !crate::estimation::outer_optimizer::runs_outer_optimizer(&mk(0)),
         "maxiter = 0 constructs no optimizer"
     );
-    assert!(crate::estimation::outer_optimizer::runs_outer_optimizer(
-        &mk(1)
-    ));
+    assert!(crate::estimation::outer_optimizer::runs_outer_optimizer(&mk(1)));
 
     assert!(
-        !check_model_options(&model, &mk(0))
-            .iter()
-            .any(|d| d.code == CODE),
+        !check_model_options(&model, &mk(0)).iter().any(|d| d.code == CODE),
         "no optimizer ran, so none of it moved"
     );
     assert_eq!(
-        check_model_options(&model, &mk(1))
-            .iter()
-            .filter(|d| d.code == CODE)
-            .count(),
+        check_model_options(&model, &mk(1)).iter().filter(|d| d.code == CODE).count(),
         1,
         "the straddle: one outer iteration is enough to reach the optimizer"
     );

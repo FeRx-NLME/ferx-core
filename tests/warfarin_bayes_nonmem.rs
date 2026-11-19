@@ -54,10 +54,7 @@ fn rel(a: f64, b: f64) -> f64 {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn ferx_bayes_matches_nonmem_bayes_on_warfarin() {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
@@ -76,51 +73,19 @@ fn ferx_bayes_matches_nonmem_bayes_on_warfarin() {
 
     // Chains must have mixed.
     let bayes = r.bayes.as_ref().expect("BayesResult present");
-    assert!(
-        bayes.max_rhat < 1.05,
-        "chains did not mix: max R-hat = {}",
-        bayes.max_rhat
-    );
+    assert!(bayes.max_rhat < 1.05, "chains did not mix: max R-hat = {}", bayes.max_rhat);
 
     // Population means: CL/V well-identified (8%), KA poorly-identified (15%).
-    assert!(
-        rel(r.theta[0], NM_TVCL) < 0.08,
-        "TVCL {} vs NM {NM_TVCL}",
-        r.theta[0]
-    );
-    assert!(
-        rel(r.theta[1], NM_TVV) < 0.08,
-        "TVV {} vs NM {NM_TVV}",
-        r.theta[1]
-    );
-    assert!(
-        rel(r.theta[2], NM_TVKA) < 0.15,
-        "TVKA {} vs NM {NM_TVKA}",
-        r.theta[2]
-    );
+    assert!(rel(r.theta[0], NM_TVCL) < 0.08, "TVCL {} vs NM {NM_TVCL}", r.theta[0]);
+    assert!(rel(r.theta[1], NM_TVV) < 0.08, "TVV {} vs NM {NM_TVV}", r.theta[1]);
+    assert!(rel(r.theta[2], NM_TVKA) < 0.15, "TVKA {} vs NM {NM_TVKA}", r.theta[2]);
 
     // Residual error: ferx σ (SD) ≈ √(NONMEM SIGMA variance).
-    assert!(
-        rel(r.sigma[0], NM_SIGMA_SD) < 0.15,
-        "sigma_SD {} vs NM {NM_SIGMA_SD}",
-        r.sigma[0]
-    );
+    assert!(rel(r.sigma[0], NM_SIGMA_SD) < 0.15, "sigma_SD {} vs NM {NM_SIGMA_SD}", r.sigma[0]);
 
     // Ω posterior means: loosely banded (prior-spec sensitive; see docstring).
     // Assert same order of magnitude (within a factor of ~2) of the NONMEM means.
-    assert!(
-        rel(r.omega[(0, 0)], NM_OMEGA_CL) < 0.6,
-        "omega_CL {}",
-        r.omega[(0, 0)]
-    );
-    assert!(
-        rel(r.omega[(1, 1)], NM_OMEGA_V) < 0.6,
-        "omega_V {}",
-        r.omega[(1, 1)]
-    );
-    assert!(
-        rel(r.omega[(2, 2)], NM_OMEGA_KA) < 0.6,
-        "omega_KA {}",
-        r.omega[(2, 2)]
-    );
+    assert!(rel(r.omega[(0, 0)], NM_OMEGA_CL) < 0.6, "omega_CL {}", r.omega[(0, 0)]);
+    assert!(rel(r.omega[(1, 1)], NM_OMEGA_V) < 0.6, "omega_V {}", r.omega[(1, 1)]);
+    assert!(rel(r.omega[(2, 2)], NM_OMEGA_KA) < 0.6, "omega_KA {}", r.omega[(2, 2)]);
 }

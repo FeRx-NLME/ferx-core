@@ -116,8 +116,7 @@ fn options(l2: f64, smooth: f64, analytic: bool, method: CovarianceMethod) -> Fi
 /// `fit_method`.
 fn step(
     fit_method: EstimationMethod,
-    (model, params, population): &(CompiledModel, ModelParameters, Population),
-    o: &FitOptions,
+    (model, params, population): &(CompiledModel, ModelParameters, Population), o: &FitOptions,
 ) -> (DMatrix<f64>, Vec<String>) {
     let x_hat = pack_params(params);
     // The fit's modes and `H` matrices at this point, as a finalizer would hand them over —
@@ -136,9 +135,7 @@ fn step(
 
 fn free_idx(params: &ModelParameters) -> Vec<usize> {
     let packed = pack_with_bounds(params);
-    (0..packed.fixed.len())
-        .filter(|&i| !packed.fixed[i])
-        .collect()
+    (0..packed.fixed.len()).filter(|&i| !packed.fixed[i]).collect()
 }
 
 /// The OFV-scale Hessian `H = 2·R⁻¹` over the free block.
@@ -161,13 +158,8 @@ fn the_l2_penalty_adds_exactly_two_lambda_to_the_weight_curvature_on_both_routes
     let (model, params, _) = &fx;
     let free = free_idx(params);
     let nn = &model.covariate_nns[0];
-    let weight_coords: Vec<usize> = nn
-        .mapper
-        .mlp()
-        .weight_param_indices()
-        .into_iter()
-        .map(|i| nn.weights_offset + i)
-        .collect();
+    let weight_coords: Vec<usize> =
+        nn.mapper.mlp().weight_param_indices().into_iter().map(|i| nn.weights_offset + i).collect();
     assert_eq!(weight_coords.len(), 2, "W1 and W2");
     let (lambda_a, lambda_b) = (5.0, 12.0);
     for analytic in [false, true] {
@@ -234,20 +226,14 @@ fn the_l2_penalty_adds_exactly_two_lambda_to_the_weight_curvature_on_both_routes
         }
         let cov_want = h_want.try_inverse().expect("PD") * 2.0;
         for (a, &i) in free.iter().enumerate() {
-            let (se_a, se_b, se_want) = (
-                cov_a[(i, i)].sqrt(),
-                cov_b[(i, i)].sqrt(),
-                cov_want[(a, a)].sqrt(),
-            );
+            let (se_a, se_b, se_want) =
+                (cov_a[(i, i)].sqrt(), cov_b[(i, i)].sqrt(), cov_want[(a, a)].sqrt());
             assert!(
                 (se_b / se_want - 1.0).abs() < 1e-8,
                 "{route}: SE of coordinate {i}: {se_b} vs closed form {se_want}"
             );
             if weight_coords.contains(&i) {
-                assert!(
-                    se_b < se_a,
-                    "{route}: a more penalized weight's SE must shrink"
-                );
+                assert!(se_b < se_a, "{route}: a more penalized weight's SE must shrink");
             }
         }
     }
@@ -318,10 +304,7 @@ fn the_penalty_curvature_is_gated_on_the_estimator_that_applied_it() {
     let (cov0, _) = step(EstimationMethod::Saem, &fx, &o0);
     let (saem, w_saem) = step(EstimationMethod::Saem, &fx, &o1);
     let (focei, _) = step(EstimationMethod::FoceI, &fx, &o1);
-    assert_eq!(
-        saem, cov0,
-        "SAEM never applied the penalty, so R must not carry it"
-    );
+    assert_eq!(saem, cov0, "SAEM never applied the penalty, so R must not carry it");
     assert!(
         !w_saem.iter().any(|w| w.contains("W_COV_NN_PENALTY")),
         "no penalty note on an unregularized estimate: {w_saem:?}"
@@ -348,25 +331,17 @@ fn the_score_estimators_say_what_they_do_with_the_penalty() {
     assert_eq!(s0, s1, "S⁻¹ cannot depend on the penalty");
     assert!(w0.is_empty(), "{w0:?}");
     assert!(
-        w1.iter()
-            .any(|w| w.contains("not represented") && w.contains("covariance_method = r")),
+        w1.iter().any(|w| w.contains("not represented") && w.contains("covariance_method = r")),
         "{w1:?}"
     );
-    let (_, ws) = step(
-        EstimationMethod::FoceI,
-        &fx,
-        &options(0.5, 0.0, false, CovarianceMethod::Sandwich),
-    );
-    assert!(
-        ws.iter().any(|w| w.contains("penalized-ML sandwich")),
-        "{ws:?}"
-    );
+    let (_, ws) =
+        step(EstimationMethod::FoceI, &fx, &options(0.5, 0.0, false, CovarianceMethod::Sandwich));
+    assert!(ws.iter().any(|w| w.contains("penalized-ML sandwich")), "{ws:?}");
 }
 
 /// A regularized fit, run briefly with its inline covariance step.
 fn regularized_fit(
-    fx: &(CompiledModel, ModelParameters, Population),
-    l2: f64,
+    fx: &(CompiledModel, ModelParameters, Population), l2: f64,
 ) -> crate::types::FitResult {
     let (model, params, population) = fx;
     let o = FitOptions {
@@ -389,10 +364,7 @@ fn run_covariance_restores_the_fitted_penalty_strengths() {
     let fx = fixture();
     let (model, _, population) = &fx;
     let fit = regularized_fit(&fx, 5.0);
-    let rec = fit
-        .scoring_settings
-        .as_ref()
-        .expect("a fit records its scoring settings");
+    let rec = fit.scoring_settings.as_ref().expect("a fit records its scoring settings");
     assert_eq!(rec.nn_l2_lambda, Some(5.0));
     assert_eq!(rec.nn_smooth_lambda, Some(0.0));
     let inline = fit.covariance_matrix.clone().expect("inline covariance");
@@ -403,20 +375,14 @@ fn run_covariance_restores_the_fitted_penalty_strengths() {
 
     // `analytic_cov_hessian` says how the caller asks the step to be computed — not recorded,
     // so passed as the inline step ran it; everything else is the default.
-    let step_opts = FitOptions {
-        analytic_cov_hessian: false,
-        ..FitOptions::default()
-    };
+    let step_opts = FitOptions { analytic_cov_hessian: false, ..FitOptions::default() };
     let out = post(&fit, &step_opts);
     assert_eq!(
         out.covariance_matrix.as_ref(),
         Some(&inline),
         "default options must reproduce the inline penalized covariance"
     );
-    let caller_l2 = FitOptions {
-        nn_l2_lambda: 0.5,
-        ..step_opts.clone()
-    };
+    let caller_l2 = FitOptions { nn_l2_lambda: 0.5, ..step_opts.clone() };
     assert_eq!(
         post(&fit, &caller_l2).covariance_matrix.as_ref(),
         Some(&inline),
@@ -455,15 +421,11 @@ fn the_penalty_notes_are_covariance_step_warnings_and_are_replaced() {
     let (model, _, population) = &fx;
     let fit = regularized_fit(&fx, 5.0);
     let count = |ws: &[String], needle: &str| {
-        ws.iter()
-            .filter(|w| w.starts_with("W_COV_NN_PENALTY") && w.contains(needle))
-            .count()
+        ws.iter().filter(|w| w.starts_with("W_COV_NN_PENALTY") && w.contains(needle)).count()
     };
     assert_eq!(count(&fit.warnings, "includes the penalty"), 1);
-    let s = FitOptions {
-        covariance_method: CovarianceMethod::CrossProduct,
-        ..FitOptions::default()
-    };
+    let s =
+        FitOptions { covariance_method: CovarianceMethod::CrossProduct, ..FitOptions::default() };
     let out = crate::run_covariance(&fit, Some(model), Some(population), &s).unwrap();
     assert_eq!(
         count(&out.warnings, "includes the penalty"),
@@ -471,12 +433,7 @@ fn the_penalty_notes_are_covariance_step_warnings_and_are_replaced() {
         "the inline r note must not survive a rerun under s: {:?}",
         out.warnings
     );
-    assert_eq!(
-        count(&out.warnings, "not represented"),
-        1,
-        "{:?}",
-        out.warnings
-    );
+    assert_eq!(count(&out.warnings, "not represented"), 1, "{:?}", out.warnings);
     let again =
         crate::run_covariance(&fit, Some(model), Some(population), &FitOptions::default()).unwrap();
     assert_eq!(
@@ -514,16 +471,10 @@ fn the_stationarity_gradient_carries_the_penalty_exactly_when_the_estimator_appl
     let reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, &o1);
     assert!(reg.is_active());
     let grad = |o: &FitOptions, reg| {
-        cov_objective_gradient(
-            &x, params, model, population, &etas, &h, &kappas, &bounds, o, reg,
-        )
+        cov_objective_gradient(&x, params, model, population, &etas, &h, &kappas, &bounds, o, reg)
     };
     let unpenalized = grad(&o1, None);
-    assert_eq!(
-        unpenalized,
-        grad(&o0, None),
-        "λ must not reach an unpenalized g"
-    );
+    assert_eq!(unpenalized, grad(&o0, None), "λ must not reach an unpenalized g");
     let penalized = grad(&o1, Some(&reg));
     let mut penalty = vec![0.0; x.len()];
     reg.add_packed_gradient(&params.theta, &mut penalty);
@@ -541,10 +492,7 @@ fn the_stationarity_gradient_carries_the_penalty_exactly_when_the_estimator_appl
 
     // Through the step, under VI.
     let (cov, warnings) = step(EstimationMethod::Vi, &fx, &o1);
-    let w: Vec<&String> = warnings
-        .iter()
-        .filter(|w| w.starts_with(NON_STATIONARY_TOKEN))
-        .collect();
+    let w: Vec<&String> = warnings.iter().filter(|w| w.starts_with(NON_STATIONARY_TOKEN)).collect();
     assert_eq!(w.len(), 1, "the fixture is not an optimum: {warnings:?}");
     assert!(!w[0].contains("eigenvalue floor"), "R kept: {}", w[0]);
     let printed: f64 = w[0]

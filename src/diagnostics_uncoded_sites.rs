@@ -110,10 +110,8 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
 
 /// The spellings counted as an uncoded site, built with `concat!` so this file does not
 /// match itself.
-const PATTERNS: &[&str] = &[
-    concat!("EngineError::", "uncoded"),
-    concat!(".map_err(|d| d", ".message)"),
-];
+const PATTERNS: &[&str] =
+    &[concat!("EngineError::", "uncoded"), concat!(".map_err(|d| d", ".message)")];
 
 /// The name of the nearest `fn` at or above line `i`.
 fn enclosing_fn(lines: &[&str], i: usize) -> String {
@@ -125,10 +123,8 @@ fn enclosing_fn(lines: &[&str], i: usize) -> String {
         if !(before.is_empty() || before.ends_with(' ') || before.ends_with('(')) {
             continue;
         }
-        let name: String = line[pos + 3..]
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_')
-            .collect();
+        let name: String =
+            line[pos + 3..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
         if !name.is_empty() {
             return name;
         }
@@ -194,11 +190,7 @@ pub(super) fn production_files(root: &Path) -> Vec<(String, String)> {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read a source file");
-            let rel = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
             files.push((rel, text));
         }
     }
@@ -214,9 +206,7 @@ fn scan(root: &Path) -> BTreeMap<(String, String), usize> {
         for (i, line) in lines.iter().enumerate() {
             let n: usize = PATTERNS.iter().map(|p| line.matches(p).count()).sum();
             if n > 0 {
-                *found
-                    .entry((rel.clone(), enclosing_fn(&lines, i)))
-                    .or_insert(0) += n;
+                *found.entry((rel.clone(), enclosing_fn(&lines, i))).or_insert(0) += n;
             }
         }
     }
@@ -278,26 +268,16 @@ fn the_scan_sees_a_planted_site_and_skips_test_code() {
         ),
     )
     .unwrap();
-    std::fs::write(
-        src.join("a_tests.rs"),
-        format!("fn t() {{ {site}\"z\"); }}\n"),
-    )
-    .unwrap();
-    std::fs::write(
-        src.join("tests").join("b.rs"),
-        format!("fn t() {{ {site}\"z\"); }}\n"),
-    )
-    .unwrap();
+    std::fs::write(src.join("a_tests.rs"), format!("fn t() {{ {site}\"z\"); }}\n")).unwrap();
+    std::fs::write(src.join("tests").join("b.rs"), format!("fn t() {{ {site}\"z\"); }}\n"))
+        .unwrap();
     let found = scan(&dir);
     std::fs::remove_dir_all(&dir).ok();
     let want: BTreeMap<(String, String), usize> = [
         (("src/a.rs".to_string(), "leaks".to_string()), 1),
         (("src/a.rs".to_string(), "drops".to_string()), 2),
         // Production code after a mid-file test module is still scanned.
-        (
-            ("src/a.rs".to_string(), "after_the_test_module".to_string()),
-            1,
-        ),
+        (("src/a.rs".to_string(), "after_the_test_module".to_string()), 1),
     ]
     .into();
     assert_eq!(found, want);

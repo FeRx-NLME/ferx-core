@@ -78,9 +78,7 @@ fn model_file(stem: &str) -> (tempfile::TempDir, String) {
 }
 
 fn override_warning(warnings: &[String]) -> Option<&String> {
-    warnings
-        .iter()
-        .find(|w| w.contains("thread count overridden"))
+    warnings.iter().find(|w| w.contains("thread count overridden"))
 }
 
 #[test]
@@ -103,10 +101,7 @@ fn the_data_path_honours_an_explicit_thread_count_over_the_model_file() {
     );
 
     // The bug: `--threads 1` against a file that says 2.
-    let overrides = RunOverrides {
-        threads: Some(1),
-        ..Default::default()
-    };
+    let overrides = RunOverrides { threads: Some(1), ..Default::default() };
     let (pinned, _) =
         run_model_with_overrides(&path, Some(DATA), &overrides).expect("overridden fit");
     assert_eq!(
@@ -122,10 +117,7 @@ fn the_data_path_honours_an_explicit_thread_count_over_the_model_file() {
     // And it must reach the typed surface the YAML/JSON output is built from,
     // not only the raw string list.
     assert!(
-        pinned
-            .warnings_structured
-            .iter()
-            .any(|w| w.message.contains("thread count overridden")),
+        pinned.warnings_structured.iter().any(|w| w.message.contains("thread count overridden")),
         "the appended warning must be in `warnings_structured` too"
     );
 }
@@ -141,10 +133,7 @@ fn the_data_path_honours_an_explicit_thread_count_over_the_model_file() {
 /// landed.
 #[test]
 fn an_explicitly_requested_default_overrides_the_model_file_on_both_callers() {
-    let overrides = RunOverrides {
-        threads: Some(0),
-        ..Default::default()
-    };
+    let overrides = RunOverrides { threads: Some(0), ..Default::default() };
 
     let (_dir, path) = model_file("threads_zero_data");
     let (fitted, _) =
@@ -181,10 +170,7 @@ fn simulate_honours_an_explicit_thread_count_over_the_model_file() {
         "the simulate path must honour the model file when nothing overrides it"
     );
 
-    let overrides = RunOverrides {
-        threads: Some(1),
-        ..Default::default()
-    };
+    let overrides = RunOverrides { threads: Some(1), ..Default::default() };
     let (pinned, _) = run_model_simulate_with_overrides(&path, &overrides).expect("overridden sim");
     assert_eq!(pinned.n_threads_used, 1);
     assert!(

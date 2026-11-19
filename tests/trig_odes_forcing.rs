@@ -74,9 +74,7 @@ fn closed_form(t: f64) -> f64 {
 
 #[test]
 fn sin_cos_forcing_in_odes_matches_the_closed_form() {
-    let model = parse_full_model(SRC)
-        .expect("an [odes] RHS with sin/cos parses")
-        .model;
+    let model = parse_full_model(SRC).expect("an [odes] RHS with sin/cos parses").model;
     assert!(model.ode_spec.is_some(), "the model must integrate");
 
     let obs_times: Vec<f64> = (0..=16).map(|k| 3.0 * k as f64).collect();
@@ -87,32 +85,19 @@ fn sin_cos_forcing_in_odes_matches_the_closed_form() {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![],
-            obs_times.clone(),
-            vec![0.0; n],
-            vec![1; n],
-        )],
+        subjects: vec![common::subject("1", vec![], obs_times.clone(), vec![0.0; n], vec![1; n])],
     };
     let rows = predict(&model, &pop, &model.default_params).expect("predict");
     assert_eq!(rows.len(), n);
 
     // The fixture is live: the harmonic part moves R well away from its baseline.
-    let swing = obs_times
-        .iter()
-        .map(|&t| (closed_form(t) - 25.0).abs())
-        .fold(0.0, f64::max); // nan-ok: closed_form is finite by construction, asserted below
+    let swing = obs_times.iter().map(|&t| (closed_form(t) - 25.0).abs()).fold(0.0, f64::max); // nan-ok: closed_form is finite by construction, asserted below
     assert!(swing > 2.0, "the forcing must move R, swing {swing}");
 
     let mut worst = 0.0f64;
     for (row, &t) in rows.iter().zip(&obs_times) {
         let want = closed_form(t);
-        assert!(
-            row.pred.is_finite() && want.is_finite(),
-            "t={t}: PRED {} vs {want}",
-            row.pred
-        );
+        assert!(row.pred.is_finite() && want.is_finite(), "t={t}: PRED {} vs {want}", row.pred);
         let rel = (row.pred - want).abs() / want.abs();
         assert!(rel.is_finite(), "t={t}: relative error {rel}");
         worst = worst.max(rel);

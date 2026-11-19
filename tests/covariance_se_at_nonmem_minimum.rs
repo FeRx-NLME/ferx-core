@@ -86,10 +86,7 @@ fn focei_covariance_se_matches_nonmem_at_its_own_minimum() {
         result.omega[(2, 2)]
     );
 
-    assert!(
-        result.covariance_matrix.is_some(),
-        "covariance step must succeed"
-    );
+    assert!(result.covariance_matrix.is_some(), "covariance step must succeed");
     let se_theta = result.se_theta.as_ref().expect("theta SEs present");
     let se_sigma = result.se_sigma.as_ref().expect("sigma SEs present");
     let omega_se =

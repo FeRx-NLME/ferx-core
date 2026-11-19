@@ -80,13 +80,7 @@ fn population(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            doses,
-            obs_times,
-            vec![0.0; n],
-            vec![2; n],
-        )],
+        subjects: vec![common::subject("1", doses, obs_times, vec![0.0; n], vec![2; n])],
     }
 }
 
@@ -123,10 +117,7 @@ fn assert_equiv(label: &str, lag: bool, fbio: bool, pop: &Population, rtol: f64)
 
 #[test]
 fn transit_single_dose_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     assert_equiv("single", false, false, &pop, RTOL);
 }
 
@@ -134,13 +125,7 @@ fn transit_single_dose_matches_ode() {
 fn transit_multidose_matches_ode() {
     let doses = vec![bolus(0.0, 100.0), bolus(12.0, 100.0), bolus(24.0, 100.0)];
     let obs = vec![0.5, 2.0, 6.0, 11.5, 13.0, 18.0, 23.5, 26.0, 36.0, 48.0];
-    assert_equiv(
-        "multidose",
-        false,
-        false,
-        &population(doses, obs),
-        ACCUM_RTOL,
-    );
+    assert_equiv("multidose", false, false, &population(doses, obs), ACCUM_RTOL);
 }
 
 /// A transit model with a mid-profile `TIME` switch on CL. The closed-form shorthand
@@ -180,9 +165,7 @@ fn transit_time_desugar_matches_hand_written_ode() {
          [scaling]\n  obs_scale = V\n\n\
          [error_model]\n  DV ~ proportional(PROP)\n"
     );
-    let sh = parse_full_model(&shorthand)
-        .expect("shorthand transit+TIME parses")
-        .model;
+    let sh = parse_full_model(&shorthand).expect("shorthand transit+TIME parses").model;
     let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
     // The shorthand stays a closed-form transit model but carries the ODE equivalent that
     // predict()/the gradient route TIME/TV-cov subjects to.
@@ -191,10 +174,7 @@ fn transit_time_desugar_matches_hand_written_ode() {
         "transit + TIME shorthand carries an ODE equivalent (primary stays closed-form)"
     );
 
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0]);
     let ps = predict(&sh, &pop, &sh.default_params).unwrap();
     let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
@@ -295,9 +275,7 @@ fn transit_flip_flop_routes_to_ode_twin() {
          [scaling]\n  obs_scale = V\n\n\
          [error_model]\n  DV ~ proportional(PROP)\n"
     );
-    let sh = parse_full_model(&shorthand)
-        .expect("flip-flop shorthand parses")
-        .model;
+    let sh = parse_full_model(&shorthand).expect("flip-flop shorthand parses").model;
     let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
     // Primary stays closed-form; it carries the ODE twin the flip-flop reroute uses.
     assert!(
@@ -305,10 +283,7 @@ fn transit_flip_flop_routes_to_ode_twin() {
         "flip-flop transit shorthand keeps a closed-form primary + an ODE twin"
     );
 
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![1.0, 4.0, 8.0, 16.0, 24.0, 48.0, 72.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 8.0, 16.0, 24.0, 48.0, 72.0]);
     let ps = predict(&sh, &pop, &sh.default_params).unwrap();
     let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
@@ -352,10 +327,7 @@ fn transit_flip_flop_routes_to_ode_twin() {
 /// shorthand's gradient fit converges off the floor, and the hand ODE fitted by BOBYQA
 /// (−228.192) lands on the same optimum within the band.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn transit_flip_flop_fit_matches_ode_twin() {
     let header = "\
 [parameters]
@@ -399,10 +371,7 @@ fn transit_flip_flop_fit_matches_ode_twin() {
             )
         })
         .collect();
-    let mut pop = Population {
-        subjects,
-        ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
-    };
+    let mut pop = Population { subjects, ..population(vec![bolus(0.0, 100.0)], obs_t.clone()) };
     let sims = ferx_core::simulate_with_seed(&hd, &pop, &hd.default_params, 1, 4321).unwrap();
     for s in pop.subjects.iter_mut() {
         s.observations = sims
@@ -432,10 +401,7 @@ fn transit_flip_flop_fit_matches_ode_twin() {
         at.omega.diagonal,
     );
     at.sigma.values = ra.sigma.clone();
-    let eval = FitOptions {
-        outer_maxiter: 0,
-        ..opts.clone()
-    };
+    let eval = FitOptions { outer_maxiter: 0, ..opts.clone() };
     let e = fit(&hd, &pop, &at, &eval).expect("ODE eval ok");
     assert!(
         e.ofv.is_finite() && (e.ofv - ra.ofv).abs() < 1e-4,
@@ -456,10 +422,7 @@ fn transit_flip_flop_fit_matches_ode_twin() {
     // than the plateau bound, and a run that does carries `W_ABOVE_START`.
     let from_opt = fit(&hd, &pop, &at, &opts).expect("ODE fit from the optimum ok");
     let bound = e.ofv + 1e-3 * (1.0 + e.ofv.abs());
-    let above = from_opt
-        .warnings
-        .iter()
-        .any(|w| w.contains("W_ABOVE_START"));
+    let above = from_opt.warnings.iter().any(|w| w.contains("W_ABOVE_START"));
     eprintln!(
         "hand ODE L-BFGS from the optimum: OFV {:.6} (start {:.6}), converged {}, W_ABOVE_START {}",
         from_opt.ofv, e.ofv, from_opt.converged, above
@@ -478,10 +441,7 @@ fn transit_flip_flop_fit_matches_ode_twin() {
         &hd,
         &pop,
         &hd.default_params,
-        &FitOptions {
-            optimizer: ferx_core::types::Optimizer::Bobyqa,
-            ..opts.clone()
-        },
+        &FitOptions { optimizer: ferx_core::types::Optimizer::Bobyqa, ..opts.clone() },
     )
     .expect("flip-flop ODE fit ok");
     assert!(ro.converged, "hand ODE BOBYQA fit: {:?}", ro.warnings);
@@ -503,19 +463,13 @@ fn transit_flip_flop_fit_matches_ode_twin() {
 
 #[test]
 fn transit_with_lagtime_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     assert_equiv("lagtime", true, false, &pop, RTOL);
 }
 
 #[test]
 fn transit_with_bioavailability_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     assert_equiv("fbio", false, true, &pop, RTOL);
 }
 
@@ -544,13 +498,8 @@ fn transit_ofv_matches_ode() {
     let n = obs_t.len();
     let mut subjects = Vec::new();
     for (i, fac) in [0.85_f64, 1.0, 1.15].into_iter().enumerate() {
-        let mut s = common::subject(
-            &format!("{}", i + 1),
-            dose(),
-            obs_t.clone(),
-            vec![0.0; n],
-            vec![2; n],
-        );
+        let mut s =
+            common::subject(&format!("{}", i + 1), dose(), obs_t.clone(), vec![0.0; n], vec![2; n]);
         s.observations = preds.iter().map(|p| (p.pred * fac).max(1e-6)).collect();
         subjects.push(s);
     }
@@ -580,9 +529,7 @@ fn transit_ofv_matches_ode() {
 /// `fit()` the basic analytic transit model on `pop`, expecting an early `Err`.
 fn transit_fit_err(pop: &Population) -> String {
     let (an_src, _) = build_pair(false, false);
-    let model = parse_full_model(&an_src)
-        .expect("transit model parses")
-        .model;
+    let model = parse_full_model(&an_src).expect("transit model parses").model;
     fit(&model, pop, &model.default_params, &FitOptions::default())
         .expect_err("fit should reject the unsupported transit configuration")
         .to_string()
@@ -645,10 +592,8 @@ fn build_iov_pair() -> (String, String) {
 /// t=0) still has drug on board when occ 1's observations (t=13, 18) are taken, so occ 1's
 /// `KAPPA_CL` governs that tail — exactly the case a per-dose superposition gets wrong (#104).
 fn iov_subject() -> Population {
-    let mut pop = population(
-        vec![bolus(0.0, 100.0), bolus(12.0, 100.0)],
-        vec![1.0, 6.0, 13.0, 18.0],
-    );
+    let mut pop =
+        population(vec![bolus(0.0, 100.0), bolus(12.0, 100.0)], vec![1.0, 6.0, 13.0, 18.0]);
     pop.subjects[0].occasions = vec![0, 0, 1, 1];
     pop.subjects[0].dose_occasions = vec![0, 1];
     pop
@@ -666,12 +611,7 @@ fn transit_iov_multidose_matches_hand_written_ode_forcing() {
     let ode = parse_full_model(&ode_src).expect("ODE parses").model;
     // Occasion 0 = [0,24): doses at 0, 12; occasion 1 = [24,48): doses at 24, 36.
     let mut pop = population(
-        vec![
-            bolus(0.0, 100.0),
-            bolus(12.0, 100.0),
-            bolus(24.0, 100.0),
-            bolus(36.0, 100.0),
-        ],
+        vec![bolus(0.0, 100.0), bolus(12.0, 100.0), bolus(24.0, 100.0), bolus(36.0, 100.0)],
         vec![1.0, 6.0, 13.0, 20.0, 25.0, 30.0, 37.0, 44.0],
     );
     pop.subjects[0].occasions = vec![0, 0, 0, 0, 1, 1, 1, 1];
@@ -726,12 +666,8 @@ fn transit_iov_now_served_by_ode_equivalent() {
 #[test]
 fn transit_iov_matches_hand_written_ode_forcing() {
     let (an_src, ode_src) = build_iov_pair();
-    let an = parse_full_model(&an_src)
-        .expect("analytic IOV transit parses")
-        .model;
-    let ode = parse_full_model(&ode_src)
-        .expect("ODE IOV transit parses")
-        .model;
+    let an = parse_full_model(&an_src).expect("analytic IOV transit parses").model;
+    let ode = parse_full_model(&ode_src).expect("ODE IOV transit parses").model;
     let pop = iov_subject();
     let subject = &pop.subjects[0];
 
@@ -743,11 +679,7 @@ fn transit_iov_matches_hand_written_ode_forcing() {
     let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
     let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
     assert_eq!(pa.len(), po.len(), "prediction count mismatch");
-    assert_eq!(
-        pa.len(),
-        subject.obs_times.len(),
-        "one prediction per observation"
-    );
+    assert_eq!(pa.len(), subject.obs_times.len(), "one prediction per observation");
     // Kappa must actually move the predictions (guards against a silent kappa=0 path).
     let pa0 = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
     assert!(
@@ -802,12 +734,8 @@ fn build_iov_on_v_pair() -> (String, String) {
 #[test]
 fn transit_iov_on_v_matches_hand_written_ode_forcing() {
     let (an_src, ode_src) = build_iov_on_v_pair();
-    let an = parse_full_model(&an_src)
-        .expect("analytic IOV-on-V transit parses")
-        .model;
-    let ode = parse_full_model(&ode_src)
-        .expect("ODE IOV-on-V transit parses")
-        .model;
+    let an = parse_full_model(&an_src).expect("analytic IOV-on-V transit parses").model;
+    let ode = parse_full_model(&ode_src).expect("ODE IOV-on-V transit parses").model;
     let pop = iov_subject();
     let subject = &pop.subjects[0];
     let theta = &an.default_params.theta;
@@ -816,11 +744,7 @@ fn transit_iov_on_v_matches_hand_written_ode_forcing() {
 
     let pa = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &kappas);
     let po = ferx_core::pk::predict_iov(&ode, subject, theta, &eta_bsv, &kappas);
-    assert_eq!(
-        pa.len(),
-        subject.obs_times.len(),
-        "one prediction per observation"
-    );
+    assert_eq!(pa.len(), subject.obs_times.len(), "one prediction per observation");
     // κ on V must move the predictions (the κ-dependent obs_scale=V divisor and ke=CL/V).
     let pa0 = ferx_core::pk::predict_iov(&an, subject, theta, &eta_bsv, &[vec![0.0], vec![0.0]]);
     assert!(
@@ -852,21 +776,13 @@ fn transit_iov_without_twin_rejected() {
         CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n  NTR = TVNTR\n  MTT = TVMTT\n\n\
         [structural_model]\n  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n\n\
         [error_model]\n  DV ~ proportional(PROP)\n";
-    let model = parse_full_model(src)
-        .expect("transit + [scaling] parses")
-        .model;
-    assert!(
-        model.absorption_ode_equivalent.is_none(),
-        "a [scaling] block suppresses the ODE twin"
-    );
+    let model = parse_full_model(src).expect("transit + [scaling] parses").model;
+    assert!(model.absorption_ode_equivalent.is_none(), "a [scaling] block suppresses the ODE twin");
     let pop = iov_subject();
     let e = fit(&model, &pop, &model.default_params, &FitOptions::default())
         .expect_err("twin-less IOV transit should be rejected")
         .to_string();
-    assert!(
-        e.contains("IOV"),
-        "expected an IOV-rejection message, got: {e}"
-    );
+    assert!(e.contains("IOV"), "expected an IOV-rejection message, got: {e}");
 }
 
 /// A plain `one_cpt_transit` model with time-varying covariates now **works**: the closed
@@ -878,10 +794,7 @@ fn transit_iov_without_twin_rejected() {
 fn transit_tv_covariate_now_served_by_ode_equivalent() {
     let (an_src, _) = build_pair(false, false);
     let model = parse_full_model(&an_src).expect("parses").model;
-    assert!(
-        model.absorption_ode_equivalent.is_some(),
-        "plain transit carries an ODE equivalent"
-    );
+    assert!(model.absorption_ode_equivalent.is_some(), "plain transit carries an ODE equivalent");
     let mut pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0]);
     // Give the subject time-varying covariates (non-empty per-observation maps).
     pop.subjects[0].obs_covariates = vec![
@@ -944,32 +857,20 @@ fn transit_cmt_zero_is_the_default_depot_not_rejected() {
     let obs = vec![1.0, 4.0, 8.0];
     let depot = predict(
         &model,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs.clone(),
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], obs.clone()),
         &model.default_params,
     )
     .unwrap();
     let default_cmt = predict(
         &model,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)],
-            obs.clone(),
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)], obs.clone()),
         &model.default_params,
     )
     .unwrap();
-    assert!(
-        depot.iter().any(|p| p.pred > 0.0),
-        "control must be non-trivial"
-    );
+    assert!(depot.iter().any(|p| p.pred > 0.0), "control must be non-trivial");
     assert_eq!(default_cmt.len(), depot.len());
     for (a, b) in default_cmt.iter().zip(depot.iter()) {
-        assert_eq!(
-            a.pred, b.pred,
-            "CMT=0 must predict like the CMT=1 depot dose"
-        );
+        assert_eq!(a.pred, b.pred, "CMT=0 must predict like the CMT=1 depot dose");
     }
     // CMT=2 is a genuine non-depot target and stays rejected.
     let central = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
@@ -999,13 +900,8 @@ fn transit_ode_template_matches_pk() {
          [error_model]\n  DV ~ proportional(PROP)\n"
     );
     let pk = parse_full_model(&pk_src).expect("pk parses").model;
-    let tmpl = parse_full_model(&tmpl_src)
-        .expect("ode_template parses")
-        .model;
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let tmpl = parse_full_model(&tmpl_src).expect("ode_template parses").model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let pp = predict(&pk, &pop, &pk.default_params).unwrap();
     let pt = predict(&tmpl, &pop, &tmpl.default_params).unwrap();
     for (x, y) in pp.iter().zip(pt.iter()) {
@@ -1117,19 +1013,14 @@ fn transit_ss_dose_predicts_via_ode_twin() {
 /// record of the speed-up (#386). Runtimes are logged for the nightly record; the analytic
 /// path is the fast one (~28× locally at 50×12). Gated out of the per-PR job.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn transit_analytic_vs_ode_fit_benchmark() {
     use ferx_core::simulate_with_seed;
     use std::time::Instant;
     let (an_src, ode_src) = build_pair(false, false);
     let an = parse_full_model(&an_src).unwrap().model;
     let ode = parse_full_model(&ode_src).unwrap().model;
-    let obs_t = vec![
-        0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0,
-    ];
+    let obs_t = vec![0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0];
     let n = obs_t.len();
     let subjects: Vec<_> = (1..=30)
         .map(|i| {
@@ -1142,10 +1033,7 @@ fn transit_analytic_vs_ode_fit_benchmark() {
             )
         })
         .collect();
-    let mut pop = Population {
-        subjects,
-        ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
-    };
+    let mut pop = Population { subjects, ..population(vec![bolus(0.0, 100.0)], obs_t.clone()) };
     let sims = simulate_with_seed(&ode, &pop, &ode.default_params, 1, 12345).unwrap();
     for s in pop.subjects.iter_mut() {
         s.observations = sims
@@ -1266,10 +1154,7 @@ fn assert_equiv_2cpt(label: &str, lag: bool, fbio: bool, pop: &Population, rtol:
 
 #[test]
 fn two_cpt_transit_single_dose_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     assert_equiv_2cpt("2cpt single", false, false, &pop, RTOL);
 }
 
@@ -1284,19 +1169,13 @@ fn two_cpt_transit_multidose_matches_ode() {
 
 #[test]
 fn two_cpt_transit_with_lagtime_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     assert_equiv_2cpt("2cpt lagtime", true, false, &pop, RTOL);
 }
 
 #[test]
 fn two_cpt_transit_with_bioavailability_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     assert_equiv_2cpt("2cpt fbio", false, true, &pop, RTOL);
 }
 
@@ -1350,17 +1229,12 @@ fn two_cpt_transit_time_desugar_matches_hand_written_ode() {
     let sh = parse_full_model(&shorthand)
         .expect("2-cpt transit + TIME parses (was rejected before the twin existed)")
         .model;
-    let hd = parse_full_model(&hand_ode)
-        .expect("hand 2-cpt ODE parses")
-        .model;
+    let hd = parse_full_model(&hand_ode).expect("hand 2-cpt ODE parses").model;
     assert!(
         sh.ode_spec.is_none() && sh.absorption_ode_equivalent.is_some(),
         "2-cpt transit + TIME shorthand must carry an ODE equivalent (primary stays closed-form)"
     );
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0]);
     let ps = predict(&sh, &pop, &sh.default_params).unwrap();
     let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
@@ -1395,13 +1269,8 @@ fn two_cpt_transit_ofv_matches_ode() {
     let n = obs_t.len();
     let mut subjects = Vec::new();
     for (i, fac) in [0.85_f64, 1.0, 1.15].into_iter().enumerate() {
-        let mut s = common::subject(
-            &format!("{}", i + 1),
-            dose(),
-            obs_t.clone(),
-            vec![0.0; n],
-            vec![2; n],
-        );
+        let mut s =
+            common::subject(&format!("{}", i + 1), dose(), obs_t.clone(), vec![0.0; n], vec![2; n]);
         s.observations = preds.iter().map(|p| (p.pred * fac).max(1e-6)).collect();
         subjects.push(s);
     }
@@ -1457,11 +1326,7 @@ fn two_cpt_transit_short_fit_drives_analytic_sens() {
     opts.run_covariance_step = false;
     let r = fit(&model, &pop, &model.default_params, &opts)
         .expect("short 2cpt transit FOCEI fit should return Ok");
-    assert!(
-        r.ofv.is_finite(),
-        "2cpt transit fit OFV not finite: {}",
-        r.ofv
-    );
+    assert!(r.ofv.is_finite(), "2cpt transit fit OFV not finite: {}", r.ofv);
 }
 
 /// Two-compartment closed-form transit with an `SS=1` dose reroutes to its 2-cpt ODE twin
@@ -1484,12 +1349,8 @@ fn two_cpt_transit_flip_flop_warns() {
     use ferx_core::api::check_model_data_warnings;
     let (an_src, _) = build_pair_2cpt(false, false);
     let mut model = parse_full_model(&an_src).expect("parses").model;
-    let mtt_i = model
-        .default_params
-        .theta_names
-        .iter()
-        .position(|n| n == "TVMTT")
-        .expect("has TVMTT");
+    let mtt_i =
+        model.default_params.theta_names.iter().position(|n| n == "TVMTT").expect("has TVMTT");
     model.default_params.theta[mtt_i] = 50.0; // KTR = 4/50 = 0.08 < α ≈ 0.19
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 8.0]);
     let diags = check_model_data_warnings(&model, &pop, &model.default_params);
@@ -1515,18 +1376,11 @@ fn two_cpt_transit_flip_flop_warns() {
 #[test]
 fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
     let (an_src, ode_src) = build_pair_2cpt(false, false);
-    let mut an = parse_full_model(&an_src)
-        .expect("2-cpt transit parses")
-        .model;
+    let mut an = parse_full_model(&an_src).expect("2-cpt transit parses").model;
     let mut ode = parse_full_model(&ode_src).expect("2-cpt ODE parses").model;
     // MTT = 50 ⇒ KTR = (n+1)/mtt = 0.08 < α ≈ 0.19 (flip-flop), on both models.
     for m in [&mut an, &mut ode] {
-        let i = m
-            .default_params
-            .theta_names
-            .iter()
-            .position(|n| n == "TVMTT")
-            .expect("has TVMTT");
+        let i = m.default_params.theta_names.iter().position(|n| n == "TVMTT").expect("has TVMTT");
         m.default_params.theta[i] = 50.0;
     }
     assert!(
@@ -1534,10 +1388,7 @@ fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
         "2-cpt flip-flop shorthand keeps a closed-form primary + an ODE twin"
     );
 
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![2.0, 8.0, 24.0, 48.0, 96.0, 168.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![2.0, 8.0, 24.0, 48.0, 96.0, 168.0]);
     let pa = predict(&an, &pop, &an.default_params).unwrap();
     let po = predict(&ode, &pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
@@ -1557,10 +1408,7 @@ fn two_cpt_transit_flip_flop_routes_to_ode_twin() {
 
     // Twin-carrying flip-flop: the warning is the *informational* auto-routed one.
     let diags = ferx_core::api::check_model_data_warnings(&an, &pop, &an.default_params);
-    let w = diags
-        .iter()
-        .find(|d| d.code == "W_TRANSIT_FLIP_FLOP")
-        .expect("flip-flop warns");
+    let w = diags.iter().find(|d| d.code == "W_TRANSIT_FLIP_FLOP").expect("flip-flop warns");
     assert!(
         w.message.contains("automatically evaluates"),
         "twin flip-flop must be informational (auto-routed), got: {}",
@@ -1579,19 +1427,14 @@ fn transit_flip_flop_without_twin_is_rejected() {
     // ke = CL/V = 0.5 ≥ KTR = 4/20 = 0.2 (flip-flop); the [scaling] block declines the
     // desugar, so there is no ODE twin to reroute to — a hard error (#776), not a warning.
     let src = TWIN_LESS_FLIP_FLOP_SRC;
-    let model = parse_full_model(src)
-        .expect("[scaling] transit parses")
-        .model;
+    let model = parse_full_model(src).expect("[scaling] transit parses").model;
     assert!(
         model.absorption_ode_equivalent.is_none(),
         "a [scaling] transit model has no ODE twin (the desugar declines it)"
     );
     // The inert `obs_scale = 1` must not double-scale the closed form (no #712 warning).
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("divides by")),
+        !model.parse_warnings.iter().any(|w| w.contains("divides by")),
         "twin-less fixture must not emit the obs_scale double-scale warning: {:?}",
         model.parse_warnings
     );
@@ -1619,16 +1462,11 @@ fn transit_flip_flop_without_twin_is_rejected() {
 /// mirroring the other transit-support rejects (`assert_transit_support`) (#776).
 #[test]
 fn transit_flip_flop_without_twin_errs_in_predict() {
-    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
-        .expect("[scaling] transit parses")
-        .model;
+    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC).expect("[scaling] transit parses").model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("flip-flop regime"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// The reject also fires on the `simulate()` path — a panic through the
@@ -1636,16 +1474,11 @@ fn transit_flip_flop_without_twin_errs_in_predict() {
 /// rejects (#776).
 #[test]
 fn transit_flip_flop_without_twin_errs_in_simulate() {
-    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC)
-        .expect("[scaling] transit parses")
-        .model;
+    let model = parse_full_model(TWIN_LESS_FLIP_FLOP_SRC).expect("[scaling] transit parses").model;
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err = ferx_core::simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(
-        err.to_string().contains("flip-flop regime"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// #735: a FLIP-FLOP transit model carrying `lagtime=` and `f=` now auto-routes to its
@@ -1692,10 +1525,7 @@ fn transit_flipflop_lag_f_autoroutes_and_matches_twin() {
         "a flip-flop lag/f transit closed form must now auto-route to an ODE twin (#735)"
     );
     let ode = parse_full_model(&ode_src).expect("ODE parses").model;
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let pa = predict(&an, &pop, &an.default_params).unwrap();
     let po = predict(&ode, &pop, &ode.default_params).unwrap();
     assert_eq!(pa.len(), po.len());
@@ -1735,17 +1565,10 @@ fn transit_flipflop_noncanonical_lag_f_alias_matches_canonical() {
              [error_model]\n  DV ~ proportional(PROP)\n"
         )
     };
-    let canonical = parse_full_model(&mk("LAGTIME", "F"))
-        .expect("canonical parses")
-        .model;
-    let aliased = parse_full_model(&mk("LAG", "FBIO"))
-        .expect("aliased parses")
-        .model;
+    let canonical = parse_full_model(&mk("LAGTIME", "F")).expect("canonical parses").model;
+    let aliased = parse_full_model(&mk("LAG", "FBIO")).expect("aliased parses").model;
     assert!(aliased.absorption_ode_equivalent.is_some());
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let pc = predict(&canonical, &pop, &canonical.default_params).unwrap();
     let pl = predict(&aliased, &pop, &aliased.default_params).unwrap();
     assert_eq!(pc.len(), pl.len());
@@ -1846,10 +1669,7 @@ V1 = TVF\n\n\
     let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 4.0, 12.0]);
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("flip-flop regime"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("flip-flop regime"), "unexpected Err: {err}");
 }
 
 /// #735 shadow guard, **stray reserved-name** case (exercises the `f` arm's decline branch): an
@@ -1977,17 +1797,10 @@ fn build_iov_pair_2cpt() -> (String, String) {
 #[test]
 fn two_cpt_transit_iov_matches_hand_written_ode_forcing() {
     let (an_src, ode_src) = build_iov_pair_2cpt();
-    let an = parse_full_model(&an_src)
-        .expect("analytic 2cpt IOV transit parses")
-        .model;
-    let ode = parse_full_model(&ode_src)
-        .expect("ODE 2cpt IOV transit parses")
-        .model;
+    let an = parse_full_model(&an_src).expect("analytic 2cpt IOV transit parses").model;
+    let ode = parse_full_model(&ode_src).expect("ODE 2cpt IOV transit parses").model;
     assert_eq!(an.n_kappa, 1);
-    assert!(
-        an.absorption_ode_equivalent.is_some(),
-        "2cpt IOV transit carries an ODE twin"
-    );
+    assert!(an.absorption_ode_equivalent.is_some(), "2cpt IOV transit carries an ODE twin");
     let pop = iov_subject();
     let subject = &pop.subjects[0];
     assert!(
@@ -2051,19 +1864,14 @@ fn two_cpt_transit_tv_covariate_now_served_by_ode_equivalent() {
 /// forcing on a 2-cpt disposition must converge to the **same** estimates on identical
 /// simulated data (fit-level equivalence + the speed record, #386 PR D). Gated.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn two_cpt_transit_analytic_vs_ode_fit_benchmark() {
     use ferx_core::simulate_with_seed;
     use std::time::Instant;
     let (an_src, ode_src) = build_pair_2cpt(false, false);
     let an = parse_full_model(&an_src).unwrap().model;
     let ode = parse_full_model(&ode_src).unwrap().model;
-    let obs_t = vec![
-        0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0,
-    ];
+    let obs_t = vec![0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0];
     let n = obs_t.len();
     let subjects: Vec<_> = (1..=30)
         .map(|i| {
@@ -2076,10 +1884,7 @@ fn two_cpt_transit_analytic_vs_ode_fit_benchmark() {
             )
         })
         .collect();
-    let mut pop = Population {
-        subjects,
-        ..population(vec![bolus(0.0, 100.0)], obs_t.clone())
-    };
+    let mut pop = Population { subjects, ..population(vec![bolus(0.0, 100.0)], obs_t.clone()) };
     let sims = simulate_with_seed(&ode, &pop, &ode.default_params, 1, 12345).unwrap();
     for s in pop.subjects.iter_mut() {
         s.observations = sims
@@ -2138,13 +1943,8 @@ fn two_cpt_transit_ode_template_matches_pk() {
          [error_model]\n  DV ~ proportional(PROP)\n"
     );
     let pk = parse_full_model(&pk_src).expect("pk parses").model;
-    let tmpl = parse_full_model(&tmpl_src)
-        .expect("ode_template parses")
-        .model;
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let tmpl = parse_full_model(&tmpl_src).expect("ode_template parses").model;
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let pp = predict(&pk, &pop, &pk.default_params).unwrap();
     let pt = predict(&tmpl, &pop, &tmpl.default_params).unwrap();
     for (x, y) in pp.iter().zip(pt.iter()) {
@@ -2168,10 +1968,6 @@ fn two_cpt_transit_compartment_names() {
     let m = parse_full_model(&an_src).unwrap().model;
     assert_eq!(
         m.analytical_compartment_names(),
-        &[
-            "depot".to_string(),
-            "central".to_string(),
-            "peripheral".to_string()
-        ]
+        &["depot".to_string(), "central".to_string(), "peripheral".to_string()]
     );
 }

@@ -70,18 +70,10 @@ fn nm_ofv(stem: &str) -> f64 {
 
 /// ferx's objective for `nonmem_anchor/<model>.ferx` on `nonmem_anchor/<data>.csv`.
 fn ferx_ofv(model: &str, data: &str) -> f64 {
-    let run = prepare_run(
-        &anchor(&format!("{model}.ferx")),
-        Some(&anchor(&format!("{data}.csv"))),
-    )
-    .unwrap_or_else(|e| panic!("{model}: the anchor model and dataset load: {e}"));
-    let r = fit(
-        &run.parsed.model,
-        &run.population,
-        &run.init_params,
-        &run.parsed.fit_options,
-    )
-    .unwrap_or_else(|e| panic!("{model}: the evaluation runs: {e}"));
+    let run = prepare_run(&anchor(&format!("{model}.ferx")), Some(&anchor(&format!("{data}.csv"))))
+        .unwrap_or_else(|e| panic!("{model}: the anchor model and dataset load: {e}"));
+    let r = fit(&run.parsed.model, &run.population, &run.init_params, &run.parsed.fit_options)
+        .unwrap_or_else(|e| panic!("{model}: the evaluation runs: {e}"));
     assert!(r.ofv.is_finite(), "{model}: OFV {}", r.ofv);
     r.ofv
 }
@@ -109,19 +101,13 @@ fn dtmm_2state_matches_nonmem() {
     assert!(d <= OFV_TOL_NM_2STATE, "dtmm_2state |dOFV| {d:.3e}");
     let e = (ferx - EXACT_LAPLACE_2STATE).abs();
     eprintln!("dtmm_2state: exact Laplace {EXACT_LAPLACE_2STATE:.10} |dOFV| {e:.3e}");
-    assert!(
-        e <= OFV_TOL_EXACT_2STATE,
-        "dtmm_2state vs exact |dOFV| {e:.3e}"
-    );
+    assert!(e <= OFV_TOL_EXACT_2STATE, "dtmm_2state vs exact |dOFV| {e:.3e}");
 }
 
 #[test]
 fn dtmm_3state_matches_nonmem() {
-    let d = report(
-        "dtmm_3state",
-        ferx_ofv("dtmm_3state_fit", "dtmm_3state"),
-        nm_ofv("dtmm_3state"),
-    );
+    let d =
+        report("dtmm_3state", ferx_ofv("dtmm_3state_fit", "dtmm_3state"), nm_ofv("dtmm_3state"));
     assert!(d <= OFV_TOL_NM_3STATE, "dtmm_3state |dOFV| {d:.3e}");
 }
 
@@ -132,22 +118,15 @@ fn dtmm_3state_matches_nonmem() {
 #[test]
 fn previous_state_is_load_bearing() {
     let src = std::fs::read_to_string(anchor("dtmm_3state_fit.ferx")).unwrap();
-    let flat = src
-        .replace(" - G1 + ETA", " + ETA")
-        .replace(" - G2 + ETA", " + ETA");
+    let flat = src.replace(" - G1 + ETA", " + ETA").replace(" - G2 + ETA", " + ETA");
     assert_ne!(src, flat);
     let dir = std::env::temp_dir().join(format!("ferx_dtmm_flat_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let model = dir.join("flat.ferx");
     std::fs::write(&model, flat).unwrap();
     let run = prepare_run(model.to_str().unwrap(), Some(&anchor("dtmm_3state.csv"))).expect("load");
-    let r = fit(
-        &run.parsed.model,
-        &run.population,
-        &run.init_params,
-        &run.parsed.fit_options,
-    )
-    .expect("evaluation runs");
+    let r = fit(&run.parsed.model, &run.population, &run.init_params, &run.parsed.fit_options)
+        .expect("evaluation runs");
     let _ = std::fs::remove_dir_all(&dir);
     let gap = (r.ofv - nm_ofv("dtmm_3state")).abs();
     eprintln!("previous state dropped: OFV {:.6}, gap {gap:.3e}", r.ofv);
@@ -157,28 +136,17 @@ fn previous_state_is_load_bearing() {
 /// Fitted to convergence from NONMEM's initial estimates, ferx reaches at least NONMEM's
 /// optimum, with the same fixed effects.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn dtmm_2state_fit_converges_to_nonmem() {
     let run = prepare_run(
         &format!("{}/examples/dtmm_2state.ferx", env!("CARGO_MANIFEST_DIR")),
         Some(&anchor("dtmm_2state.csv")),
     )
     .expect("load");
-    let r = fit(
-        &run.parsed.model,
-        &run.population,
-        &run.init_params,
-        &run.parsed.fit_options,
-    )
-    .expect("fit");
+    let r = fit(&run.parsed.model, &run.population, &run.init_params, &run.parsed.fit_options)
+        .expect("fit");
     let nm = nm_ofv("dtmm_2state");
-    eprintln!(
-        "dtmm_2state fit: OFV {:.6} θ {:?} ω {:?}",
-        r.ofv, r.theta, r.omega
-    );
+    eprintln!("dtmm_2state fit: OFV {:.6} θ {:?} ω {:?}", r.ofv, r.theta, r.omega);
     // The objective is flat along the ω split: NONMEM moved ω²_AS 0.22 → 0.06 for 0.9 OFV
     // between two stopping rules, and ferx goes further, to 1046.894167 at ω² = (0.185,
     // 0.092) on Linux x86_64 (macOS arm64: 1046.893878), 2.5 below NONMEM's stopping point.
@@ -186,11 +154,7 @@ fn dtmm_2state_fit_converges_to_nonmem() {
     // at ferx's Linux estimates gives 1046.894052. So the comparison is one-sided on the
     // objective, and on the fixed effects (measured |Δθ| 0.001 / 0.026 / 0.011 on Linux).
     assert!(r.ofv <= nm + 0.05, "ferx OFV {} vs NONMEM {nm}", r.ofv);
-    let nm_theta = [
-        -1.0065933892463419,
-        0.88239637849927277,
-        -0.64393697409745099,
-    ];
+    let nm_theta = [-1.0065933892463419, 0.88239637849927277, -0.64393697409745099];
     for (i, (f, n)) in r.theta.iter().zip(nm_theta).enumerate() {
         assert!((f - n).abs() < 0.05, "θ{i}: ferx {f} NONMEM {n}");
     }

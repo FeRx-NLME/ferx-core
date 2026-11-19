@@ -36,26 +36,18 @@ pub(super) struct PoolCache {
 
 impl PoolCache {
     pub(super) fn new(max_idle_workers: usize) -> Self {
-        Self {
-            idle: Mutex::new(VecDeque::new()),
-            max_idle_workers,
-        }
+        Self { idle: Mutex::new(VecDeque::new()), max_idle_workers }
     }
 
     pub(super) fn acquire(
-        &self,
-        threads: usize,
-        scope: FitScope,
+        &self, threads: usize, scope: FitScope,
     ) -> Result<FitPoolLease<'_>, String> {
         if threads == 0 {
             return Err("thread count must be positive".to_string());
         }
         scope.validate()?;
         let cached = {
-            let mut idle = self
-                .idle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut idle = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // Search newest first to keep recently used workers hot.
             idle.iter()
                 .rposition(|p| {
@@ -72,19 +64,13 @@ impl PoolCache {
                 scope,
             },
         };
-        Ok(FitPoolLease {
-            entry: Some(entry),
-            cache: self,
-        })
+        Ok(FitPoolLease { entry: Some(entry), cache: self })
     }
 
     fn release(&self, entry: CachedPool) {
         let mut evicted = Vec::new();
         {
-            let mut idle = self
-                .idle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut idle = self.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             idle.push_back(entry);
             let mut workers: usize = idle.iter().map(|p| p.pool.current_num_threads()).sum();
             // Keep at least the newest pool even when it alone exceeds the
@@ -123,33 +109,23 @@ impl SharedPoolCache {
     }
 
     pub(super) fn acquire(
-        &self,
-        threads: usize,
-        scope: FitScope,
+        &self, threads: usize, scope: FitScope,
     ) -> Result<Arc<rayon::ThreadPool>, String> {
         if threads == 0 {
             return Err("thread count must be positive".to_string());
         }
         scope.validate()?;
         let entry = {
-            let mut pools = self
-                .pools
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(index) = pools
-                .iter()
-                .rposition(|p| p.threads == threads && p.scope.same_pool_key(&scope))
+            let mut pools = self.pools.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(index) =
+                pools.iter().rposition(|p| p.threads == threads && p.scope.same_pool_key(&scope))
             {
                 let entry = pools.remove(index).expect("matching shared pool");
                 let entry = Arc::clone(&entry);
                 pools.push_back(Arc::clone(&entry));
                 entry
             } else {
-                let entry = Arc::new(SharedCachedPool {
-                    pool: OnceLock::new(),
-                    threads,
-                    scope,
-                });
+                let entry = Arc::new(SharedCachedPool { pool: OnceLock::new(), threads, scope });
                 pools.push_back(Arc::clone(&entry));
                 let mut workers: usize = pools.iter().map(|p| p.threads).sum();
                 while workers > self.max_cached_workers && pools.len() > 1 {
@@ -173,10 +149,7 @@ impl SharedPoolCache {
             })
             .clone();
         if result.is_err() {
-            let mut pools = self
-                .pools
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pools = self.pools.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(index) = pools.iter().position(|p| Arc::ptr_eq(p, &entry)) {
                 pools.remove(index);
             }

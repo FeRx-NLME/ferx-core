@@ -85,11 +85,7 @@ impl OmegaT<f64> {
                     .zip(&chol)
                     .all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
             }) {
-                return Some(OmegaT {
-                    chol,
-                    inv: o.inv.clone(),
-                    log_det: o.log_det,
-                });
+                return Some(OmegaT { chol, inv: o.inv.clone(), log_det: o.log_det });
             }
             #[cfg(test)]
             OMEGA_MISSES.with(|m| m.set(m.get() + 1));
@@ -149,12 +145,8 @@ impl ParT<f64> {
             subject,
             params,
             OmegaT {
-                chol: (0..n)
-                    .map(|r| (0..n).map(|c| l[(r, c)]).collect())
-                    .collect(),
-                inv: (0..n)
-                    .map(|r| (0..n).map(|c| params.omega.inv[(r, c)]).collect())
-                    .collect(),
+                chol: (0..n).map(|r| (0..n).map(|c| l[(r, c)]).collect()).collect(),
+                inv: (0..n).map(|r| (0..n).map(|c| params.omega.inv[(r, c)]).collect()).collect(),
                 log_det: params.omega.log_det,
             },
         )
@@ -163,10 +155,7 @@ impl ParT<f64> {
     /// [`Self::of`] with Ω given (the stacked prior's factor, [`OmegaT::from_chol`]): the
     /// params' own Ω is not copied just to be replaced.
     pub(crate) fn of_with_omega(
-        model: &CompiledModel,
-        subject: &Subject,
-        params: &ModelParameters,
-        omega: OmegaT<f64>,
+        model: &CompiledModel, subject: &Subject, params: &ModelParameters, omega: OmegaT<f64>,
     ) -> Self {
         ParT {
             omega,
@@ -211,11 +200,7 @@ impl<T> ParT<T> {
 impl<T: Copy> ParT<T> {
     /// The same parameters through `f` (lifting to a dual over `T`, say).
     pub(crate) fn map<U: Copy>(&self, f: impl Fn(T) -> U) -> ParT<U> {
-        let mm = |m: &Vec<Vec<T>>| {
-            m.iter()
-                .map(|r| r.iter().map(|&x| f(x)).collect())
-                .collect()
-        };
+        let mm = |m: &Vec<Vec<T>>| m.iter().map(|r| r.iter().map(|&x| f(x)).collect()).collect();
         ParT {
             omega: OmegaT {
                 chol: mm(&self.omega.chol),
@@ -226,11 +211,10 @@ impl<T: Copy> ParT<T> {
             rho: self.rho.iter().map(|&x| f(x)).collect(),
             serial_rho: self.serial_rho.map(&f),
             theta: self.theta.iter().map(|&x| f(x)).collect(),
-            ruv_mult: self.ruv_mult.as_ref().map(|m| {
-                m.iter()
-                    .map(|r| r.iter().map(|&x| f(x)).collect())
-                    .collect()
-            }),
+            ruv_mult: self
+                .ruv_mult
+                .as_ref()
+                .map(|m| m.iter().map(|r| r.iter().map(|&x| f(x)).collect()).collect()),
         }
     }
 }
@@ -241,20 +225,15 @@ impl<T: Copy> ParT<T> {
     /// from the unlifted `ParT`). Saves the `2n + 2` allocations of lifting Ω at every call.
     pub(crate) fn map_rows<U: Copy>(&self, f: impl Fn(T) -> U) -> ParT<U> {
         ParT {
-            omega: OmegaT {
-                chol: Vec::new(),
-                inv: Vec::new(),
-                log_det: f(self.omega.log_det),
-            },
+            omega: OmegaT { chol: Vec::new(), inv: Vec::new(), log_det: f(self.omega.log_det) },
             sigma: self.sigma.iter().map(|&x| f(x)).collect(),
             rho: self.rho.iter().map(|&x| f(x)).collect(),
             serial_rho: self.serial_rho.map(&f),
             theta: self.theta.iter().map(|&x| f(x)).collect(),
-            ruv_mult: self.ruv_mult.as_ref().map(|m| {
-                m.iter()
-                    .map(|r| r.iter().map(|&x| f(x)).collect())
-                    .collect()
-            }),
+            ruv_mult: self
+                .ruv_mult
+                .as_ref()
+                .map(|m| m.iter().map(|r| r.iter().map(|&x| f(x)).collect()).collect()),
         }
     }
 }
@@ -262,18 +241,12 @@ impl<T: Copy> ParT<T> {
 impl<T: PkNum> ParT<T> {
     /// Lift to a first-order dual over `T` (constant in the dual's directions).
     pub(crate) fn wrap<const K: usize>(&self) -> ParT<DualT<K, T>> {
-        self.map(|x| DualT {
-            v: x,
-            g: [T::from_f64(0.0); K],
-        })
+        self.map(|x| DualT { v: x, g: [T::from_f64(0.0); K] })
     }
 
     /// [`Self::wrap`] for the row passes ([`Self::map_rows`]): Ω is not lifted.
     pub(crate) fn wrap_rows<const K: usize>(&self) -> ParT<DualT<K, T>> {
-        self.map_rows(|x| DualT {
-            v: x,
-            g: [T::from_f64(0.0); K],
-        })
+        self.map_rows(|x| DualT { v: x, g: [T::from_f64(0.0); K] })
     }
 }
 
@@ -299,20 +272,11 @@ const MAX_LOADINGS: usize = crate::stats::residual_error::MAX_SIGMA_LOADINGS;
 
 impl<'a> LikCtx<'a> {
     pub(crate) fn new(
-        model: &'a CompiledModel,
-        subject: &'a Subject,
-        params: &'a ModelParameters,
+        model: &'a CompiledModel, subject: &'a Subject, params: &'a ModelParameters,
     ) -> Self {
         let keys = model.error_spec.obs_keys(subject);
         let cov = model.residual_cov_with(&params.residual_correlations, &params.theta);
-        LikCtx {
-            model,
-            subject,
-            params,
-            cov,
-            keys,
-            sde: model.is_sde(),
-        }
+        LikCtx { model, subject, params, cov, keys, sde: model.is_sde() }
     }
 
     /// The subject's observation rows (the kernel's `f` holds `2n` under an SDE).
@@ -355,18 +319,13 @@ impl<'a> LikCtx<'a> {
         if ft == 0 {
             return None;
         }
-        fc.fremtype_to_indices
-            .get(&ft)
-            .map(|&(ti, ei)| (ti, ei, fc.covariate_sigma_index))
+        fc.fremtype_to_indices.get(&ft).map(|&(ti, ei)| (ti, ei, fc.covariate_sigma_index))
     }
 
     /// A FREM row's `(prediction, variance)`: `θ_i + η_e` and `max(σ_c², 1e-12)`
     /// (`build_frem_r_override`).
     fn frem_pred_var<T: PkNum>(
-        &self,
-        (ti, ei, ci): (usize, usize, usize),
-        eta: &[T],
-        p: &ParT<T>,
+        &self, (ti, ei, ci): (usize, usize, usize), eta: &[T], p: &ParT<T>,
     ) -> (T, T) {
         let s = p.sigma[ci];
         (p.theta[ti] + eta[ei], (s * s).guard_floor(1e-12))
@@ -388,35 +347,23 @@ impl<'a> LikCtx<'a> {
     /// of derivative in `f`, `θ` and `η` is exact without a hand-written rule. Returned
     /// in a fixed buffer with its length (no allocation per row).
     fn loadings<T: PkNum>(
-        &self,
-        j: usize,
-        f: T,
-        p: &ParT<T>,
+        &self, j: usize, f: T, p: &ParT<T>,
     ) -> ([(usize, T); MAX_LOADINGS], usize) {
         let n_sigma = p.sigma.len();
         let mult = p.ruv_mult.as_ref().and_then(|m| m.get(j));
         let mut out = [(0usize, T::from_f64(0.0)); MAX_LOADINGS];
-        let shape = self
-            .model
-            .error_spec
-            .loading_shape(self.keys[j], self.params.sigma.values.len());
+        let shape =
+            self.model.error_spec.loading_shape(self.keys[j], self.params.sigma.values.len());
         let len = shape.len();
         for (o, &(idx, form)) in out.iter_mut().zip(shape.iter()) {
             let c = if form == LoadingForm::Prop {
                 // `slot_exponent`: the exponent half of the row, when present.
-                match mult
-                    .filter(|m| m.len() == 2 * n_sigma)
-                    .map(|m| m[n_sigma + idx])
-                {
+                match mult.filter(|m| m.len() == 2 * n_sigma).map(|m| m[n_sigma + idx]) {
                     Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
                         if f.br_cmp_c(BranchCmp::Eq, 0.0) {
                             T::from_f64(0.0)
                         } else {
-                            let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) {
-                                -1.0
-                            } else {
-                                1.0
-                            };
+                            let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) { -1.0 } else { 1.0 };
                             T::from_f64(sign) * f.abs().pow(pw)
                         }
                     }
@@ -425,9 +372,7 @@ impl<'a> LikCtx<'a> {
             } else {
                 form.coeff_g(f)
             };
-            let m = mult
-                .and_then(|m| m.get(idx).copied())
-                .unwrap_or(T::from_f64(1.0));
+            let m = mult.and_then(|m| m.get(idx).copied()).unwrap_or(T::from_f64(1.0));
             *o = (idx, m * c);
         }
         (out, len)
@@ -508,9 +453,7 @@ fn log_phi<T: PkNum>(z: T) -> T {
     // at `z = +∞` the chain `0 · z′` is `0 · ∞ = NaN` for a `z` whose own derivatives overflow
     // (`z = r/w` with `r ≈ 1e308`), so the value alone is returned. A recordable test.
     if inv_mills(z).br_cmp_c(BranchCmp::Eq, 0.0) {
-        return z
-            .jet_unary(crate::sens::num::JetFn::LogNormCdf)
-            .value_only();
+        return z.jet_unary(crate::sens::num::JetFn::LogNormCdf).value_only();
     }
     z.jet_unary(crate::sens::num::JetFn::LogNormCdf)
 }
@@ -553,17 +496,10 @@ fn m3_terms<T: PkNum>(y: f64, f: T, v: T, d: T, d2: T, cens: i8) -> (T, T, T, T)
 /// row, in the directions the row reads (its prediction, and `η_r` under RUV IIV), gives
 /// `ℓ_j`, `∂ℓ_j/∂f`, `∂ℓ_j/∂η_r`, `V` and `∂V/∂f` at once, and both assemble from them.
 pub(crate) fn focei_f_grad<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<(T, Vec<T>)> {
     if ctx.dense() {
-        return Some((
-            focei_f_dense(ctx, f, g, eta, p)?.0,
-            inner_grad(ctx, f, g, eta, p, None)?,
-        ));
+        return Some((focei_f_dense(ctx, f, g, eta, p)?.0, inner_grad(ctx, f, g, eta, p, None)?));
     }
     let (fv, grad, _) = focei_parts(ctx, f, g, eta, p)?;
     Some((fv, grad))
@@ -586,12 +522,7 @@ pub(crate) struct NonGauss<T> {
 /// failed factorisation.
 #[cfg(feature = "survival")]
 pub(crate) fn focei_f_grad_ng<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
-    ng: &NonGauss<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>, ng: &NonGauss<T>,
     interaction: bool,
 ) -> Option<(T, Vec<T>)> {
     if ctx.dense() {
@@ -603,11 +534,7 @@ pub(crate) fn focei_f_grad_ng<T: PkNum>(
 
 /// FOCEI's Gauss–Newton Hessian `H̃` (the AGQ Gauss–Newton anchor).
 pub(crate) fn focei_htilde<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
     Some(focei_parts(ctx, f, g, eta, p)?.2)
 }
@@ -615,11 +542,7 @@ pub(crate) fn focei_htilde<T: PkNum>(
 /// `(F, ∇_η l, H̃)` — `∇l` is left zero on the dense path, whose callers take it from
 /// [`inner_grad`].
 fn focei_parts<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<(T, Vec<T>, Vec<Vec<T>>)> {
     if ctx.dense() {
         let (fv, ht) = focei_f_dense(ctx, f, g, eta, p)?;
@@ -649,20 +572,11 @@ fn focei_alpha<T: PkNum>(v: T, vf: T) -> T {
 /// FREM ([`structured_rows_supported`]). `T` carries the derivatives the caller needs (a dual
 /// over the row's local inputs); the arithmetic is [`focei_rows`]'.
 pub(crate) fn focei_gauss_row<T: PkNum>(
-    ctx: &LikCtx,
-    j: usize,
-    f: T,
-    p: &ParT<T>,
+    ctx: &LikCtx, j: usize, f: T, p: &ParT<T>,
 ) -> Option<(T, T, T)> {
     let pk = p.wrap_rows::<1>();
-    let fd = DualT::<1, T> {
-        v: f,
-        g: [T::from_f64(1.0)],
-    };
-    let ruv = DualT::<1, T> {
-        v: T::from_f64(1.0),
-        g: [T::from_f64(0.0)],
-    };
+    let fd = DualT::<1, T> { v: f, g: [T::from_f64(1.0)] };
+    let ruv = DualT::<1, T> { v: T::from_f64(1.0), g: [T::from_f64(0.0)] };
     let vd = ctx.variance_v(j, fd, ruv, &pk);
     if !positive_finite(vd.v) {
         return None;
@@ -706,11 +620,7 @@ pub(crate) fn structured_rows_supported(ctx: &LikCtx) -> bool {
 /// [`foce_f`]'s aggregates over these: `Σ iv·res²` with `res = e + G·η`, `b = Σ iv·G·res`,
 /// `S = Σ iv·GGᵀ`, `Σ log V`.
 pub(crate) fn foce_row<T: PkNum>(
-    ctx: &LikCtx,
-    j: usize,
-    f: T,
-    r_eval: T,
-    p: &ParT<T>,
+    ctx: &LikCtx, j: usize, f: T, r_eval: T, p: &ParT<T>,
 ) -> Option<[T; 4]> {
     let v = ctx.variance_v(j, r_eval, T::from_f64(1.0), p);
     if !positive_finite(v) {
@@ -728,16 +638,8 @@ pub(crate) fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -
     let pl = p.map_rows(d2_const);
     let el: [D2<T>; 1] = [d2_const(T::from_f64(0.0))];
     let fj = d2_seed(f);
-    let l = row_l(
-        ctx,
-        j,
-        fj,
-        fj,
-        d2_const(T::from_f64(0.0)),
-        d2_const(T::from_f64(1.0)),
-        &el,
-        &pl,
-    )?;
+    let l =
+        row_l(ctx, j, fj, fj, d2_const(T::from_f64(0.0)), d2_const(T::from_f64(1.0)), &el, &pl)?;
     Some([l.v.v, l.v.g[0], l.g[0].g[0]])
 }
 
@@ -755,12 +657,7 @@ pub(crate) fn prior_of<T: PkNum>(ctx: &LikCtx, eta: &[T], p: &ParT<T>) -> T {
 /// [`focei_rows`] at the dual width the subject needs: direction 0 is the prediction, then
 /// `η_r` under RUV IIV, then the row's `p_obs` under an SDE.
 fn focei_rows_k<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
-    ng: Option<&NonGauss<T>>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>, ng: Option<&NonGauss<T>>,
     interaction: bool,
 ) -> Option<(T, Vec<T>, Vec<Vec<T>>)> {
     let rr = ctx.model.residual_error_eta;
@@ -779,24 +676,15 @@ fn focei_rows_k<T: PkNum>(
 /// beside a non-Gaussian term), and `ng` adds that term (see [`NonGauss`]).
 #[allow(clippy::too_many_arguments)]
 fn focei_rows<T: PkNum, const K: usize>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
-    rr: Option<usize>,
-    ng: Option<&NonGauss<T>>,
-    interaction: bool,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>, rr: Option<usize>,
+    ng: Option<&NonGauss<T>>, interaction: bool,
 ) -> Option<(T, Vec<T>, Vec<Vec<T>>)> {
     let c = |x: f64| T::from_f64(x);
     let one = c(1.0);
     let nn = eta.len();
     let unit =
         |k: usize| -> Vec<T> { (0..nn).map(|l| c(if l == k { 1.0 } else { 0.0 })).collect() };
-    let lift = |x: T| DualT::<K, T> {
-        v: x,
-        g: [c(0.0); K],
-    };
+    let lift = |x: T| DualT::<K, T> { v: x, g: [c(0.0); K] };
     let pk = p.wrap_rows::<K>();
     let ed: Vec<DualT<K, T>> = (0..nn)
         .map(|k| {
@@ -825,16 +713,7 @@ fn focei_rows<T: PkNum, const K: usize>(
             let e = row.1;
             let mut el: Vec<DualT<K, T>> = eta.iter().map(|&x| lift(x)).collect();
             el[e].g[0] = one;
-            let d = row_l(
-                ctx,
-                j,
-                lift(f[j]),
-                lift(f[j]),
-                lift(c(0.0)),
-                lift(one),
-                &el,
-                &pk,
-            )?;
+            let d = row_l(ctx, j, lift(f[j]), lift(f[j]), lift(c(0.0)), lift(one), &el, &pk)?;
             data = data + d.v;
             explicit[e] = explicit[e] + d.g[0];
             terms.push((
@@ -882,9 +761,8 @@ fn focei_rows<T: PkNum, const K: usize>(
                         Cow::Borrowed(gj),
                     )),
                     (Some(r), true) => {
-                        let ck: Vec<T> = (0..nn)
-                            .map(|k| if k == r { c(2.0) } else { cs * gj[k] })
-                            .collect();
+                        let ck: Vec<T> =
+                            (0..nn).map(|k| if k == r { c(2.0) } else { cs * gj[k] }).collect();
                         terms.push((iv, Cow::Borrowed(gj), Cow::Borrowed(gj)));
                         terms.push((c(0.5), Cow::Owned(ck.clone()), Cow::Owned(ck)));
                     }
@@ -967,11 +845,7 @@ fn focei_rows<T: PkNum, const K: usize>(
 
 /// `∇_k l = Σ_l Ω⁻¹_kl η_l + ½·Σ_j (∂ℓ_j/∂f)·G_jk + ½·explicit_k`.
 fn assemble_grad<T: PkNum>(
-    oi: &[Vec<T>],
-    eta: &[T],
-    g: &[Vec<T>],
-    dl: &[T],
-    explicit: &[T],
+    oi: &[Vec<T>], eta: &[T], g: &[Vec<T>], dl: &[T], explicit: &[T],
 ) -> Vec<T> {
     let one = T::from_f64(1.0);
     let half = T::from_f64(0.5);
@@ -997,12 +871,7 @@ fn assemble_grad<T: PkNum>(
 /// work per subject instead of the `n × n` factorisation. A covariance coupling rows
 /// factors `R̃` directly.
 pub(crate) fn foce_f<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    fpop: Option<&[T]>,
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], fpop: Option<&[T]>, p: &ParT<T>,
 ) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
     let one = c(1.0);
@@ -1020,11 +889,7 @@ pub(crate) fn foce_f<T: PkNum>(
             None => (f[j], g[j].clone()),
         };
         f0.push(fj - wsum3(0.0, (0..nn).map(|k| (one, gj[k], eta[k]))));
-        lg.push(
-            (0..nn)
-                .map(|cc| wsum3(0.0, (cc..nn).map(|r| (one, lch[r][cc], gj[r]))))
-                .collect(),
-        );
+        lg.push((0..nn).map(|cc| wsum3(0.0, (cc..nn).map(|r| (one, lch[r][cc], gj[r])))).collect());
     }
     let r_eval: Vec<T> = match fpop {
         Some(fp) => fp.to_vec(),
@@ -1066,10 +931,7 @@ pub(crate) fn foce_f<T: PkNum>(
             _ => quant.push(j),
         }
     }
-    let res: Vec<T> = quant
-        .iter()
-        .map(|&j| c(ctx.subject.observations[j]) - f0[j])
-        .collect();
+    let res: Vec<T> = quant.iter().map(|&j| c(ctx.subject.observations[j]) - f0[j]).collect();
     let nq = quant.len();
     // Woodbury on a diagonal `R⁰` is a subtractive identity, accurate to `≈ eps·(1 + tr S)`
     // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is on the variance
@@ -1123,9 +985,8 @@ pub(crate) fn foce_f<T: PkNum>(
             a[l][k] = e;
         }
     }
-    let b: Vec<T> = (0..nn)
-        .map(|k| wsum3(0.0, (0..nq).map(|i| (iv[i], lg[quant[i]][k], res[i]))))
-        .collect();
+    let b: Vec<T> =
+        (0..nn).map(|k| wsum3(0.0, (0..nq).map(|i| (iv[i], lg[quant[i]][k], res[i])))).collect();
     let la = chol(&a)?;
     let ab = chol_solve(&la, &b);
     let quad = wsum3(0.0, (0..nq).map(|i| (iv[i], res[i], res[i])))
@@ -1163,34 +1024,19 @@ fn woodbury_forced() -> bool {
 /// `G_jk` and `η_m` the unit vector `e_k`, so a quantity built from them has `∂/∂η_k` in its
 /// tangent. One pass per `k` replaces a dual wide in every η, so no width is baked into a type.
 fn direction_duals<T: PkNum>(
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    k: usize,
+    f: &[T], g: &[Vec<T>], eta: &[T], k: usize,
 ) -> (Vec<DualT<1, T>>, Vec<DualT<1, T>>) {
     let c = |x: f64| T::from_f64(x);
-    let fd = (0..f.len())
-        .map(|j| DualT {
-            v: f[j],
-            g: [g[j][k]],
-        })
-        .collect();
+    let fd = (0..f.len()).map(|j| DualT { v: f[j], g: [g[j][k]] }).collect();
     let ed = (0..eta.len())
-        .map(|m| DualT {
-            v: eta[m],
-            g: [c(if m == k { 1.0 } else { 0.0 })],
-        })
+        .map(|m| DualT { v: eta[m], g: [c(if m == k { 1.0 } else { 0.0 })] })
         .collect();
     (fd, ed)
 }
 
 /// Dense-`R` FOCEI `F`: `½(rᵀR⁻¹r + log|R| + ηᵀΩ⁻¹η + log|Ω| + log|H̃|)`.
 fn focei_f_dense<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<(T, Vec<Vec<T>>)> {
     let c = |x: f64| T::from_f64(x);
     let n = ctx.n();
@@ -1205,9 +1051,7 @@ fn focei_f_dense<T: PkNum>(
         rv[j][j] = rv[j][j] + ctx.extra(f, j);
     }
     let l = chol(&rv)?;
-    let res: Vec<T> = (0..n)
-        .map(|j| c(ctx.subject.observations[j]) - f[j])
-        .collect();
+    let res: Vec<T> = (0..n).map(|j| c(ctx.subject.observations[j]) - f[j]).collect();
     let z = chol_solve(&l, &res);
     let mut data = chol_logdet(&l);
     for j in 0..n {
@@ -1216,9 +1060,8 @@ fn focei_f_dense<T: PkNum>(
     // R⁻¹G (n × N) and R⁻¹·∂_kR (n × n per k). `∂_kR` comes from `R` over a one-direction
     // dual per `k` ([`direction_duals`]): its tangent is exactly `Σ_m G_mk ∂R/∂f_m`, plus
     // `∂R/∂η_r` through the `exp(2η_r)` scale.
-    let rg: Vec<Vec<T>> = (0..nn)
-        .map(|k| chol_solve(&l, &(0..n).map(|j| g[j][k]).collect::<Vec<T>>()))
-        .collect();
+    let rg: Vec<Vec<T>> =
+        (0..nn).map(|k| chol_solve(&l, &(0..n).map(|j| g[j][k]).collect::<Vec<T>>())).collect();
     let rd_k: Vec<Vec<Vec<T>>> = (0..nn)
         .map(|k| {
             let (fd, ed) = direction_duals(f, g, eta, k);
@@ -1267,14 +1110,7 @@ fn focei_f_dense<T: PkNum>(
 /// and its η-gradient.
 #[allow(clippy::too_many_arguments)]
 fn row_l<T: PkNum>(
-    ctx: &LikCtx,
-    j: usize,
-    f: T,
-    vf: T,
-    extra: T,
-    ruv: T,
-    eta: &[T],
-    p: &ParT<T>,
+    ctx: &LikCtx, j: usize, f: T, vf: T, extra: T, ruv: T, eta: &[T], p: &ParT<T>,
 ) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
     let y = ctx.subject.observations[j];
@@ -1303,11 +1139,7 @@ fn row_l<T: PkNum>(
 /// convention (`EbeVariance::Population`): the residual variance held at the population
 /// prediction, with no RUV-IIV scale; `None` is the conditional objective.
 pub(crate) fn inner_l<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    eta: &[T],
-    p: &ParT<T>,
-    frozen: Option<&[T]>,
+    ctx: &LikCtx, f: &[T], eta: &[T], p: &ParT<T>, frozen: Option<&[T]>,
 ) -> Option<T> {
     let data = data_l(ctx, f, eta, p, frozen)?;
     Some(T::from_f64(0.5) * (ctx.prior(eta, p) + data))
@@ -1318,18 +1150,10 @@ pub(crate) fn inner_l<T: PkNum>(
 /// their own variance), with the random effects entering only through `f` and the
 /// residual-error η's scale. `inner_l` is `½(prior + data_l)`.
 pub(crate) fn data_l<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    eta: &[T],
-    p: &ParT<T>,
-    frozen: Option<&[T]>,
+    ctx: &LikCtx, f: &[T], eta: &[T], p: &ParT<T>, frozen: Option<&[T]>,
 ) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
-    let ruv = if frozen.is_some() {
-        c(1.0)
-    } else {
-        ctx.ruv_scale(eta)
-    };
+    let ruv = if frozen.is_some() { c(1.0) } else { ctx.ruv_scale(eta) };
     let vf = frozen.unwrap_or(f);
     if ctx.dense() {
         let n = ctx.n();
@@ -1342,9 +1166,7 @@ pub(crate) fn data_l<T: PkNum>(
             r[j][j] = r[j][j] + ctx.extra(f, j);
         }
         let l = chol(&r)?;
-        let res: Vec<T> = (0..n)
-            .map(|j| c(ctx.subject.observations[j]) - f[j])
-            .collect();
+        let res: Vec<T> = (0..n).map(|j| c(ctx.subject.observations[j]) - f[j]).collect();
         let z = chol_solve(&l, &res);
         let mut data = chol_logdet(&l);
         for j in 0..n {
@@ -1365,19 +1187,13 @@ type D2<T> = DualT<1, DualT<1, T>>;
 /// `x` as a [`D2`] constant.
 fn d2_const<T: PkNum>(x: T) -> D2<T> {
     let zero = T::from_f64(0.0);
-    DualT {
-        v: DualT { v: x, g: [zero] },
-        g: [DualT { v: zero, g: [zero] }],
-    }
+    DualT { v: DualT { v: x, g: [zero] }, g: [DualT { v: zero, g: [zero] }] }
 }
 
 /// `x` as the [`D2`] variable: unit first derivative, zero second.
 fn d2_seed<T: PkNum>(x: T) -> D2<T> {
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
-    DualT {
-        v: DualT { v: x, g: [one] },
-        g: [DualT { v: one, g: [zero] }],
-    }
+    DualT { v: DualT { v: x, g: [one] }, g: [DualT { v: one, g: [zero] }] }
 }
 
 /// Whether some row of the conditional [`inner_l`] reads η other than through its own
@@ -1430,12 +1246,7 @@ fn note_inner_hessian_route(subject: &Subject, generic: bool) {
 /// valid variance): the generic path fails at the same row, so it is not re-run.
 ///
 pub(crate) fn exact_inner_hessian_kernel<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    q: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], q: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
     if reads_eta_directly(ctx) {
         inner_hessian_generic(ctx, f, g, q, eta, p)
@@ -1454,11 +1265,7 @@ pub(crate) fn exact_inner_hessian_kernel<T: PkNum>(
 /// one 4-component pass plus the `n(n+1)/2` assembly. The caller has established that no row
 /// reads η directly ([`exact_inner_hessian_kernel`]); `None` is an undefined row.
 pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    q: &[Vec<T>],
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], q: &[Vec<T>], p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
     #[cfg(test)]
     note_inner_hessian_route(ctx.subject, false);
@@ -1475,9 +1282,8 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
     let el: [D2<T>; 1] = [d2_const(T::from_f64(0.0))];
     let ruv = d2_const(T::from_f64(1.0));
     let oi = &p.omega.inv;
-    let mut h: Vec<Vec<T>> = (0..n)
-        .map(|a| (0..n).map(|b| half * (oi[a][b] + oi[b][a])).collect())
-        .collect();
+    let mut h: Vec<Vec<T>> =
+        (0..n).map(|a| (0..n).map(|b| half * (oi[a][b] + oi[b][a])).collect()).collect();
     for j in 0..f.len() {
         let fj = d2_seed(f[j]);
         let l = row_l(ctx, j, fj, fj, d2_const(T::from_f64(0.0)), ruv, &el, &pl)?;
@@ -1503,12 +1309,7 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
 /// direction is `η_a` and the inner `η_b`, the predictions carry `(f, G_·b, G_·a, Q_·ab)` and
 /// η its two unit vectors, so `l`'s `∂²/∂η_a∂η_b` is the entry. `None` where `inner_l` is.
 pub(crate) fn inner_hessian_generic<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    q: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], q: &[Vec<T>], eta: &[T], p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
     #[cfg(test)]
     note_inner_hessian_route(ctx.subject, true);
@@ -1521,26 +1322,14 @@ pub(crate) fn inner_hessian_generic<T: PkNum>(
             let t = crate::sens::jet::tri(a, b);
             let fh: Vec<D2<T>> = (0..f.len())
                 .map(|j| DualT {
-                    v: DualT {
-                        v: f[j],
-                        g: [g[j][b]],
-                    },
-                    g: [DualT {
-                        v: g[j][a],
-                        g: [q[j][t]],
-                    }],
+                    v: DualT { v: f[j], g: [g[j][b]] },
+                    g: [DualT { v: g[j][a], g: [q[j][t]] }],
                 })
                 .collect();
             let eh: Vec<D2<T>> = (0..n)
                 .map(|m| DualT {
-                    v: DualT {
-                        v: eta[m],
-                        g: [if m == b { one } else { zero }],
-                    },
-                    g: [DualT {
-                        v: if m == a { one } else { zero },
-                        g: [zero],
-                    }],
+                    v: DualT { v: eta[m], g: [if m == b { one } else { zero }] },
+                    g: [DualT { v: if m == a { one } else { zero }, g: [zero] }],
                 })
                 .collect();
             let e = inner_l(ctx, &fh, &eh, &pd, None)?.g[0].g[0];
@@ -1558,12 +1347,7 @@ pub(crate) fn inner_hessian_generic<T: PkNum>(
 /// [`focei_f_grad`]'s row pass); the prior adds `Ω⁻¹η`. The dense path couples rows, so
 /// there `l` itself is evaluated over an η-dual whose predictions carry `G`.
 pub(crate) fn inner_grad<T: PkNum>(
-    ctx: &LikCtx,
-    f: &[T],
-    g: &[Vec<T>],
-    eta: &[T],
-    p: &ParT<T>,
-    frozen: Option<&[T]>,
+    ctx: &LikCtx, f: &[T], g: &[Vec<T>], eta: &[T], p: &ParT<T>, frozen: Option<&[T]>,
 ) -> Option<Vec<T>> {
     let c = |x: f64| T::from_f64(x);
     if ctx.dense() {
@@ -1590,34 +1374,14 @@ pub(crate) fn inner_grad<T: PkNum>(
         let mut el: Vec<DualT<1, T>> = eta.iter().map(|&x| lift(x)).collect();
         if let Some((_, e, _)) = ctx.frem_row(j) {
             el[e].g[0] = c(1.0);
-            let d = row_l(
-                ctx,
-                j,
-                lift(f[j]),
-                lift(f[j]),
-                lift(c(0.0)),
-                lift(c(1.0)),
-                &el,
-                &p1,
-            )?;
+            let d = row_l(ctx, j, lift(f[j]), lift(f[j]), lift(c(0.0)), lift(c(1.0)), &el, &p1)?;
             explicit[e] = explicit[e] + d.g[0];
             continue;
         }
         let px = lift(ctx.extra(f, j));
-        dl[j] = row_l(
-            ctx,
-            j,
-            DualT {
-                v: f[j],
-                g: [c(1.0)],
-            },
-            lift(fz[j]),
-            px,
-            lift(c(1.0)),
-            &el,
-            &p1,
-        )?
-        .g[0];
+        dl[j] =
+            row_l(ctx, j, DualT { v: f[j], g: [c(1.0)] }, lift(fz[j]), px, lift(c(1.0)), &el, &p1)?
+                .g[0];
         if ctx.sde {
             // ∂ℓ/∂p_obs times the row's η-jet of `p_obs`.
             let dp = row_l(
@@ -1625,10 +1389,7 @@ pub(crate) fn inner_grad<T: PkNum>(
                 j,
                 lift(f[j]),
                 lift(fz[j]),
-                DualT {
-                    v: px.v,
-                    g: [c(1.0)],
-                },
+                DualT { v: px.v, g: [c(1.0)] },
                 lift(c(1.0)),
                 &el,
                 &p1,
@@ -1712,11 +1473,7 @@ mod tests {
     /// (compare against the first entry) → a width change serves the wrong inverse.
     #[test]
     fn omega_cache_returns_exactly_what_from_chol_computes() {
-        let m3 = vec![
-            vec![0.3, 0.0, 0.0],
-            vec![0.0, 0.5, 0.0],
-            vec![-0.2, 0.05, 0.4],
-        ];
+        let m3 = vec![vec![0.3, 0.0, 0.0], vec![0.0, 0.5, 0.0], vec![-0.2, 0.05, 0.4]];
         let mut b = m3.clone();
         b[0][0] = 0.31;
         let mut z = m3.clone();
@@ -1725,15 +1482,7 @@ mod tests {
         let m2 = vec![vec![0.3, 0.0], vec![0.1, 0.5]];
         let m4: Vec<Vec<f64>> = (0..4)
             .map(|i| {
-                (0..4)
-                    .map(|j| {
-                        if j <= i {
-                            0.2 + 0.1 * (i + j) as f64
-                        } else {
-                            0.0
-                        }
-                    })
-                    .collect()
+                (0..4).map(|j| if j <= i { 0.2 + 0.1 * (i + j) as f64 } else { 0.0 }).collect()
             })
             .collect();
         let misses = || OMEGA_MISSES.with(std::cell::Cell::get);
@@ -1878,19 +1627,10 @@ mod tests {
             assert_eq!(z(inf, cens), f64::INFINITY, "{inf:e}");
             for x in [near, sq_over, inf] {
                 let got = terms(x, cens);
-                for (name, g) in [
-                    ("value", got.0),
-                    ("g2", got.1),
-                    ("cz", got.2),
-                    ("cm", got.3),
-                ] {
+                for (name, g) in [("value", got.0), ("g2", got.1), ("cz", got.2), ("cm", got.3)] {
                     assert!(g.val() == 0.0, "{name} at {x:e}: {}", g.val());
                     assert!(g.grad[0] == 0.0, "∂{name}/∂f at {x:e}: {}", g.grad[0]);
-                    assert!(
-                        g.hess[0][0] == 0.0,
-                        "∂²{name}/∂f² at {x:e}: {}",
-                        g.hess[0][0]
-                    );
+                    assert!(g.hess[0][0] == 0.0, "∂²{name}/∂f² at {x:e}: {}", g.hess[0][0]);
                 }
             }
         }

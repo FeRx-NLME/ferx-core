@@ -97,10 +97,7 @@ fn csv(spelling: &str) -> String {
 }
 
 fn temp(contents: &str, suffix: &str) -> NamedTempFile {
-    let mut f = tempfile::Builder::new()
-        .suffix(suffix)
-        .tempfile()
-        .expect("temp file");
+    let mut f = tempfile::Builder::new().suffix(suffix).tempfile().expect("temp file");
     write!(f, "{contents}").expect("write");
     f.flush().expect("flush");
     f
@@ -136,14 +133,8 @@ fn scored(src: &str, data: &str) -> (usize, f64) {
     let omega: &OmegaMatrix = &params.omega;
     let mut nll = 0.0;
     for s in &population.subjects {
-        let v = individual_nll(
-            &parsed.model,
-            s,
-            &params.theta,
-            &zero_eta,
-            omega,
-            &params.sigma.values,
-        );
+        let v =
+            individual_nll(&parsed.model, s, &params.theta, &zero_eta, omega, &params.sigma.values);
         // Folded with an explicit finiteness guard rather than through a running
         // `max`/`+` that would absorb a `NaN`: a non-finite objective is the
         // likeliest way to break what this measures, and a silent absorption would
@@ -193,21 +184,10 @@ fn warns_on_read(src: &str, data: &str) -> bool {
         &parsed.column_map,
     )
     .expect("dataset loads");
-    let fit_opts = FitOptions {
-        outer_maxiter: 0,
-        ..opts.clone()
-    };
-    let result = fit(
-        &parsed.model,
-        &population,
-        &parsed.model.default_params,
-        &fit_opts,
-    )
-    .expect("a 0-iteration evaluation returns");
-    result
-        .warnings
-        .iter()
-        .any(|w| w.starts_with("W_CMT_DEFAULTED"))
+    let fit_opts = FitOptions { outer_maxiter: 0, ..opts.clone() };
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &fit_opts)
+        .expect("a 0-iteration evaluation returns");
+    result.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED"))
 }
 
 /// A `[data_selection]` block, or nothing at all.
@@ -330,20 +310,12 @@ fn warning_text(src: &str, data: &str) -> Option<String> {
         &parsed.column_map,
     )
     .expect("dataset loads");
-    let fit_opts = FitOptions {
-        outer_maxiter: 0,
-        ..opts.clone()
-    };
-    fit(
-        &parsed.model,
-        &population,
-        &parsed.model.default_params,
-        &fit_opts,
-    )
-    .expect("a 0-iteration evaluation returns")
-    .warnings
-    .into_iter()
-    .find(|w| w.starts_with("W_CMT_DEFAULTED"))
+    let fit_opts = FitOptions { outer_maxiter: 0, ..opts.clone() };
+    fit(&parsed.model, &population, &parsed.model.default_params, &fit_opts)
+        .expect("a 0-iteration evaluation returns")
+        .warnings
+        .into_iter()
+        .find(|w| w.starts_with("W_CMT_DEFAULTED"))
 }
 
 #[test]
@@ -491,11 +463,7 @@ fn check_warning_text(src: &str, data: &str) -> Option<String> {
          because the check stopped early: {:?}",
         report.diagnostics
     );
-    report
-        .diagnostics
-        .into_iter()
-        .find(|x| x.code == "W_CMT_DEFAULTED")
-        .map(|x| x.message)
+    report.diagnostics.into_iter().find(|x| x.code == "W_CMT_DEFAULTED").map(|x| x.message)
 }
 
 #[test]
@@ -516,10 +484,7 @@ fn ferx_check_and_the_fit_report_the_same_defaulted_row_sentence() {
     let check_msg =
         check_warning_text(&src, &csv("x")).expect("ferx check reports the defaulted row");
     let fit_msg = warning_text(&src, &csv("x")).expect("and fit() reports it too");
-    assert_eq!(
-        check_msg, fit_msg,
-        "both entry points describe the same read"
-    );
+    assert_eq!(check_msg, fit_msg, "both entry points describe the same read");
     // The equality alone pins routing, not content: the same producer writes both,
     // so two empty strings would satisfy it. This is the half the unfiltered read
     // could not produce — before #1465 check's sentence said the row was *kept*.
@@ -551,10 +516,7 @@ fn fit_from_files_reports_the_filter_its_own_read_applied() {
     let d = temp(&csv("x"), ".csv");
     // No `[data_selection]` in the caller's options at all — the whole point is that
     // the clause reaches the predicate from the *model file*.
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 0, ..FitOptions::default() };
     assert!(
         opts.ignore_exprs.is_empty() && opts.accept_exprs.is_empty(),
         "the caller must supply no clauses, or this passes for the wrong reason"
@@ -575,10 +537,7 @@ fn fit_from_files_reports_the_filter_its_own_read_applied() {
         unfiltered.path().to_str().unwrap(),
         Some(d.path().to_str().unwrap()),
         None,
-        Some(FitOptions {
-            outer_maxiter: 0,
-            ..FitOptions::default()
-        }),
+        Some(FitOptions { outer_maxiter: 0, ..FitOptions::default() }),
     )
     .expect("baseline returns");
     assert_eq!(
@@ -589,10 +548,7 @@ fn fit_from_files_reports_the_filter_its_own_read_applied() {
     );
 
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        result.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "fit_from_files must report the compartment it guessed, since its own read \
          filtered on it: {:?}",
         result.warnings
@@ -646,9 +602,7 @@ fn a_filter_deleted_row_is_reported_by_every_entry_point_including_predict() {
     let out =
         ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params).unwrap();
     assert!(
-        out.warnings
-            .iter()
-            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        out.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "predict() must report a compartment guess that deleted rows from the data it \
          was handed: {:?}",
         out.warnings
@@ -675,18 +629,13 @@ fn predict_still_suppresses_a_cmt_guess_that_addresses_nothing() {
     )
     .expect("dataset loads");
     assert!(
-        population
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        population.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "the reader still counts the guess — it is the model-aware filter that drops it"
     );
     let out =
         ferx_core::predict_diag(&parsed.model, &population, &parsed.model.default_params).unwrap();
     assert!(
-        !out.warnings
-            .iter()
-            .any(|w| w.starts_with("W_CMT_DEFAULTED")),
+        !out.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED")),
         "nothing on this model reads CMT, so the guess changed no number: {:?}",
         out.warnings
     );
@@ -827,8 +776,5 @@ fn an_endpoint_model_that_routes_more_than_the_default_is_still_reported() {
         warns_on_read(&src, &tte_csv("x", 2)),
         "a defaulted row lands on cause_a although the dataset named cause_b"
     );
-    assert!(
-        !warns_on_read(&src, &tte_csv("1", 2)),
-        "control: no defaulted cell, no finding"
-    );
+    assert!(!warns_on_read(&src, &tte_csv("1", 2)), "control: no defaulted cell, no finding");
 }

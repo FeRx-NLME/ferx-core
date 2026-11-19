@@ -110,9 +110,7 @@ fn write_steps(path: &Path, result: &RuvsearchResult) -> Result<(), String> {
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// A human-readable rendering of the search: the input and base, each
@@ -159,15 +157,9 @@ pub fn render_summary(result: &RuvsearchResult) -> String {
                 let _ = writeln!(
                     out,
                     "  {:<16} {:>12} {:>10}  {:<13} {}",
-                    r.feature
-                        .map(|f| f.label())
-                        .unwrap_or_else(|| "cwres base".to_string()),
-                    r.ofv
-                        .map(|v| format!("{v:.3}"))
-                        .unwrap_or_else(|| "-".into()),
-                    r.cwres_dofv
-                        .map(|v| format!("{v:.3}"))
-                        .unwrap_or_else(|| "-".into()),
+                    r.feature.map(|f| f.label()).unwrap_or_else(|| "cwres base".to_string()),
+                    r.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                    r.cwres_dofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
                     status(r),
                     if r.selected { "REFIT" } else { "" }
                 );
@@ -200,18 +192,10 @@ pub fn render_summary(result: &RuvsearchResult) -> String {
                     out,
                     "  {:<16} {:>12} {:>10} {:>3} {:>10}  {:<13} {}",
                     r.feature.map(|f| f.label()).unwrap_or_default(),
-                    r.ofv
-                        .map(|v| format!("{v:.3}"))
-                        .unwrap_or_else(|| "-".into()),
-                    r.lrt
-                        .map(|t| format!("{:.3}", t.dofv))
-                        .unwrap_or_else(|| "-".into()),
-                    r.lrt
-                        .map(|t| t.df.to_string())
-                        .unwrap_or_else(|| "-".into()),
-                    r.lrt
-                        .map(|t| format!("{:.4}", t.p_value))
-                        .unwrap_or_else(|| "-".into()),
+                    r.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+                    r.lrt.map(|t| format!("{:.3}", t.dofv)).unwrap_or_else(|| "-".into()),
+                    r.lrt.map(|t| t.df.to_string()).unwrap_or_else(|| "-".into()),
+                    r.lrt.map(|t| format!("{:.4}", t.p_value)).unwrap_or_else(|| "-".into()),
                     status(r),
                     decision
                 );
@@ -221,12 +205,7 @@ pub fn render_summary(result: &RuvsearchResult) -> String {
     let features = if result.features.is_empty() {
         "none".to_string()
     } else {
-        result
-            .features
-            .iter()
-            .map(|f| f.label())
-            .collect::<Vec<_>>()
-            .join(" + ")
+        result.features.iter().map(|f| f.label()).collect::<Vec<_>>().join(" + ")
     };
     let _ = writeln!(
         out,
@@ -234,11 +213,7 @@ pub fn render_summary(result: &RuvsearchResult) -> String {
         result.final_id,
         result.final_ofv,
         result.final_ofv - result.input_ofv,
-        if result.cancelled {
-            " (search cancelled)"
-        } else {
-            ""
-        }
+        if result.cancelled { " (search cancelled)" } else { "" }
     );
     if !result.notes.is_empty() {
         let _ = writeln!(out, "\nNotes:");

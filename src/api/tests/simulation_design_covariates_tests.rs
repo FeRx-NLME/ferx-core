@@ -60,10 +60,7 @@ fn a_design_that_omits_a_referenced_weight_is_refused_by_name() {
         .expect_err("an unresolved weight must not be defaulted");
     assert!(err.starts_with("[simulation]:"), "got: {err}");
     assert!(err.contains("`WPSE`"), "got: {err}");
-    assert!(
-        err.contains("covariate WPSE = <value>"),
-        "the message must name the fix: {err}"
-    );
+    assert!(err.contains("covariate WPSE = <value>"), "the message must name the fix: {err}");
 }
 
 #[test]
@@ -114,21 +111,12 @@ fn a_missing_level_column_gets_the_nested_advice_and_a_missing_weight_the_generi
         ),
         "got: {err}"
     );
-    assert!(
-        err.contains("Stating `covariate STUDY = <value>`"),
-        "got: {err}"
-    );
+    assert!(err.contains("Stating `covariate STUDY = <value>`"), "got: {err}");
     assert!(!err.contains("`WT`"), "got: {err}");
 
-    let levels = vec![
-        ("STUDY".to_string(), vec![1.0, 2.0]),
-        ("ARM".to_string(), vec![1.0, 1.0]),
-    ];
+    let levels = vec![("STUDY".to_string(), vec![1.0, 2.0]), ("ARM".to_string(), vec![1.0, 1.0])];
     let err =
         simulation_design_covariates(&spec(2, levels), &model).expect_err("the weight is missing");
-    assert!(
-        err.starts_with("[simulation]: the model references covariate(s) `WT`"),
-        "got: {err}"
-    );
+    assert!(err.starts_with("[simulation]: the model references covariate(s) `WT`"), "got: {err}");
     assert!(!err.contains("nested level"), "got: {err}");
 }

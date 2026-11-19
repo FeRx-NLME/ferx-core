@@ -56,7 +56,7 @@ use crate::estimation::mstep_newton::{
     ValueGradInfo,
 };
 use crate::estimation::outer_optimizer::{pop_nll, OuterResult};
-use crate::estimation::parameterization::{compute_mu_k, pack_params, theta_packs_log};
+use crate::estimation::parameterization::{compute_mu_k, pack_params, EmPacking};
 use crate::estimation::pred_memo::{memoized, EvalMemo, MemoSlot, PredMemo};
 use crate::estimation::saem::{
     classify_mixture_mu_ref_pairs, classify_mu_ref_pairs, floor_omega_diagonal, fold_nll_grad,
@@ -205,13 +205,8 @@ fn next_sample_count(k: usize, k_start: usize, se_per_subject: f64, may_raise: b
 /// below the cap means either [`raises_pay`] stopped the ramp or the run ran out of iterations rather than out of samples, which the hold on
 /// raising makes a real case (#2687).
 fn under_sampling_advice(
-    auto: bool,
-    final_k: usize,
-    se_history: &[(f64, usize)],
-    k_start: usize,
-    sample_opt: &str,
-    auto_opt: &str,
-    only_left_out_noisy: bool,
+    auto: bool, final_k: usize, se_history: &[(f64, usize)], k_start: usize, sample_opt: &str,
+    auto_opt: &str, only_left_out_noisy: bool,
 ) -> String {
     if auto && only_left_out_noisy {
         format!(
@@ -248,10 +243,7 @@ fn under_sampling_advice(
 /// was made on. `se_history` ends with the iteration just run, whose K is current;
 /// `hold_over` is whether [`auto_hold_ends`] has passed.
 fn auto_step(
-    objectives: &[f64],
-    se_history: &[(f64, usize)],
-    k_start: usize,
-    n_subjects: usize,
+    objectives: &[f64], se_history: &[(f64, usize)], k_start: usize, n_subjects: usize,
     hold_over: bool,
 ) -> (usize, f64) {
     let k = se_history.last().map_or(k_start, |&(_, k)| k);
@@ -322,10 +314,7 @@ impl StuckSubjects {
 /// doublings toward the cap. [`raises_pay`] compares against its own baseline the
 /// same way, so the whole history is rebuilt on the current set.
 fn ramp_se_history(ess_history: &[(Vec<f64>, usize)], stuck: &[bool]) -> Vec<(f64, usize)> {
-    ess_history
-        .iter()
-        .map(|(fracs, k)| (ramp_se_per_subject(fracs, *k, stuck).0, *k))
-        .collect()
+    ess_history.iter().map(|(fracs, k)| (ramp_se_per_subject(fracs, *k, stuck).0, *k)).collect()
 }
 
 /// The per-subject objective MC SE over the subjects `auto` acts on, and how many
@@ -335,9 +324,7 @@ fn ramp_se_per_subject(ess_fracs: &[f64], k: usize, stuck: &[bool]) -> (f64, usi
         .iter()
         .zip(stuck)
         .filter(|(_, &s)| !s)
-        .fold((0.0, 0usize), |(v, n), (&f, _)| {
-            (v + log_marginal_mc_variance(f, k), n + 1)
-        });
+        .fold((0.0, 0usize), |(v, n), (&f, _)| (v + log_marginal_mc_variance(f, k), n + 1));
     (2.0 * var.sqrt() / (n.max(1) as f64).sqrt(), n)
 }
 
@@ -396,9 +383,9 @@ fn stuck_subjects_sentence(auto: bool, auto_opt: &str, ids: &[&str]) -> String {
 /// Refuse an unusable wall-clock limit rather than let a `NaN` never trip it.
 fn check_max_time(label: &str, key: &str, limit: Option<f64>) -> Result<(), String> {
     match limit {
-        Some(s) if !(s.is_finite() && s > 0.0) => Err(format!(
-            "{label}: `{key}` must be a positive number of seconds, got {s}"
-        )),
+        Some(s) if !(s.is_finite() && s > 0.0) => {
+            Err(format!("{label}: `{key}` must be a positive number of seconds, got {s}"))
+        }
         _ => Ok(()),
     }
 }
@@ -414,12 +401,7 @@ fn time_limit_reached(started: std::time::Instant, limit: Option<f64>) -> Option
 /// `n_acc` is how many iterations of the averaging window were reached, which
 /// decides what the reported estimate is.
 fn time_limit_warning(
-    label: &str,
-    key: &str,
-    elapsed: f64,
-    iterations_done: usize,
-    n_iter: usize,
-    n_acc: usize,
+    label: &str, key: &str, elapsed: f64, iterations_done: usize, n_iter: usize, n_acc: usize,
 ) -> String {
     let estimate = if n_acc > 0 {
         format!("the mean of the {n_acc} averaging iteration(s) reached")
@@ -725,23 +707,12 @@ impl McemObjectiveTrail {
         let material = |se: f64| MCEM_SETTLE_MIN_GAP.max(MCEM_SETTLE_NOISE_RATIO * se);
         let fall = previous_floor - floor - sampling_bias_excess(previous_mc_se, mc_se);
         if fall > material(mc_se.hypot(previous_mc_se)) {
-            return McemSettling::Falling {
-                window,
-                previous_floor,
-                floor,
-                previous_mc_se,
-                mc_se,
-            };
+            return McemSettling::Falling { window, previous_floor, floor, previous_mc_se, mc_se };
         }
         // Filtered first: `f64::max` would discard a `NaN` SE and leave the bare minimum.
         match marginal.filter(|m| m.value.is_finite() && m.mc_se.is_finite()) {
             Some(marginal) if floor - marginal.value > material(mc_se.hypot(marginal.mc_se)) => {
-                McemSettling::AboveMarginal {
-                    window,
-                    floor,
-                    marginal,
-                    mc_se,
-                }
+                McemSettling::AboveMarginal { window, floor, marginal, mc_se }
             }
             _ => McemSettling::Settled,
         }
@@ -766,9 +737,7 @@ fn log_marginal_mc_variance(ess_fraction: f64, k_samples: usize) -> f64 {
 /// method class `c` enters with its responsibility squared, so a class the subject does
 /// not belong to adds nothing however poor its proposal.
 fn mixture_log_marginal_mc_variance(
-    responsibilities: &[f64],
-    ess_fractions: impl Iterator<Item = f64>,
-    k_samples: usize,
+    responsibilities: &[f64], ess_fractions: impl Iterator<Item = f64>, k_samples: usize,
 ) -> f64 {
     responsibilities
         .iter()
@@ -798,10 +767,7 @@ impl ProposalRecenter {
     /// Bundle a finished run's per-iteration record with the option names its warning
     /// should cite.
     fn objective_trail(
-        self,
-        objectives: Vec<f64>,
-        mc_se: Vec<f64>,
-        label: &str,
+        self, objectives: Vec<f64>, mc_se: Vec<f64>, label: &str,
     ) -> McemObjectiveTrail {
         let (iterations_option, samples_option, proposal_option) = match self {
             ProposalRecenter::Map => ("impmap_iterations", "impmap_samples", "impmap_proposal_df"),
@@ -859,9 +825,7 @@ impl ProposalRecenter {
 /// positive-definite `1e−10·I`, a proposal SD of 1e5 (#2650). A zero matrix remains
 /// only for an Ω that is itself not positive-definite.
 fn covariance_to_proposal_hessian(
-    cov: &DMatrix<f64>,
-    omega: &DMatrix<f64>,
-    floor: f64,
+    cov: &DMatrix<f64>, omega: &DMatrix<f64>, floor: f64,
 ) -> DMatrix<f64> {
     let n = cov.nrows();
     let mut c = cov.clone();
@@ -957,16 +921,11 @@ fn shift_draws(d: &mut SubjectDraws, shift: &[f64]) {
 /// M-step alone — exactly the situation these consumers exist for (#996
 /// review). Pass `&[]` where no class-aware shift runs.
 pub(crate) fn theta_is_mu_ref_anchor_mask(
-    model: &CompiledModel,
-    cov_group_thetas: &[usize],
-    class_mu_ref_thetas: &[usize],
+    model: &CompiledModel, cov_group_thetas: &[usize], class_mu_ref_thetas: &[usize],
 ) -> Vec<bool> {
     use std::collections::HashSet;
-    let mut with_eta: HashSet<&str> = model
-        .mu_refs
-        .values()
-        .map(|m| m.theta_name.as_str())
-        .collect();
+    let mut with_eta: HashSet<&str> =
+        model.mu_refs.values().map(|m| m.theta_name.as_str()).collect();
     // Every theta of a covariate mu-reference group (#619) is an anchor: the
     // group step moves it through its eta's population of individual values.
     // Like `class_mu_ref_thetas`, these are the thetas of the groups the run
@@ -976,20 +935,12 @@ pub(crate) fn theta_is_mu_ref_anchor_mask(
     // the theta really is estimated by the weighted M-step alone, which is the
     // situation these consumers exist for (#918 review).
     with_eta.extend(
-        cov_group_thetas
-            .iter()
-            .filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
+        cov_group_thetas.iter().filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
     );
     with_eta.extend(
-        class_mu_ref_thetas
-            .iter()
-            .filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
+        class_mu_ref_thetas.iter().filter_map(|&t| model.theta_names.get(t).map(String::as_str)),
     );
-    model
-        .theta_names
-        .iter()
-        .map(|name| with_eta.contains(name.as_str()))
-        .collect()
+    model.theta_names.iter().map(|name| with_eta.contains(name.as_str())).collect()
 }
 
 /// Names of non-fixed thetas that do **not** anchor a mu-reference this fit, so
@@ -1008,9 +959,7 @@ pub(crate) fn theta_is_mu_ref_anchor_mask(
 /// See [`theta_is_mu_ref_anchor_mask`] for the exact anchor predicate and for
 /// what `cov_group_thetas` and `class_mu_ref_thetas` must contain.
 pub(crate) fn non_fixed_unanchored_thetas(
-    model: &CompiledModel,
-    theta_fixed: &[bool],
-    cov_group_thetas: &[usize],
+    model: &CompiledModel, theta_fixed: &[bool], cov_group_thetas: &[usize],
     class_mu_ref_thetas: &[usize],
 ) -> Vec<String> {
     let anchored = theta_is_mu_ref_anchor_mask(model, cov_group_thetas, class_mu_ref_thetas);
@@ -1042,8 +991,7 @@ pub(crate) fn non_fixed_unanchored_thetas(
 /// mu-referenceable form, where it is not — removing a Box-Cox transform the
 /// user chose on purpose would change the model, not fix the fit.
 pub(crate) fn partition_by_eta(
-    model: &CompiledModel,
-    names: Vec<String>,
+    model: &CompiledModel, names: Vec<String>,
 ) -> (Vec<String>, Vec<String>) {
     names.into_iter().partition(|n| {
         model
@@ -1058,9 +1006,7 @@ pub(crate) fn partition_by_eta(
 /// cannot move, split by whether it carries an ETA (#1715). Empty when both
 /// lists are. `label` prefixes each message (`IMPMAP`, `FREM conversion`, …).
 pub(crate) fn imp_unanchored_theta_warnings(
-    label: &str,
-    with_eta: &[String],
-    without_eta: &[String],
+    label: &str, with_eta: &[String], without_eta: &[String],
 ) -> Vec<String> {
     let mut out = Vec::new();
     if !without_eta.is_empty() {
@@ -1101,10 +1047,7 @@ pub(crate) fn imp_unanchored_theta_warnings(
 /// shifted, with no path back, since θ never moves so the responsibilities never
 /// recover. Those are returned in the second group and left free.
 fn split_mu_ref_pins(pinned: &[usize], shift: &[Option<f64>]) -> (Vec<usize>, Vec<usize>) {
-    pinned
-        .iter()
-        .copied()
-        .partition(|&t| shift.get(t).copied().flatten().is_some())
+    pinned.iter().copied().partition(|&t| shift.get(t).copied().flatten().is_some())
 }
 
 /// One subject's multi-start MAP: the warm-start (or cold-start) solve, a cold
@@ -1131,40 +1074,16 @@ fn split_mu_ref_pins(pinned: &[usize], shift: &[Option<f64>]) -> (Vec<usize>, Ve
 /// subject's rayon task (so `MIXNUM` stays correct on the worker thread).
 #[allow(clippy::too_many_arguments)]
 fn find_ebe_multistart(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    inner_maxiter: usize,
-    inner_tol: f64,
-    warm: Option<&[f64]>,
-    mu: Option<&[f64]>,
-    inner_restarts: usize,
-    mceta: usize,
-    omega_chol: Option<&DMatrix<f64>>,
-    subj_seed: u64,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, inner_maxiter: usize,
+    inner_tol: f64, warm: Option<&[f64]>, mu: Option<&[f64]>, inner_restarts: usize, mceta: usize,
+    omega_chol: Option<&DMatrix<f64>>, subj_seed: u64,
 ) -> EbeResult {
     // Baseline: warm-start (or cold-start from η = 0).
-    let mut best = find_ebe(
-        model,
-        subject,
-        params,
-        inner_maxiter,
-        inner_tol,
-        warm,
-        mu,
-        inner_restarts,
-    );
+    let mut best =
+        find_ebe(model, subject, params, inner_maxiter, inner_tol, warm, mu, inner_restarts);
     if warm.is_some() {
-        let cold = find_ebe(
-            model,
-            subject,
-            params,
-            inner_maxiter,
-            inner_tol,
-            None,
-            mu,
-            inner_restarts,
-        );
+        let cold =
+            find_ebe(model, subject, params, inner_maxiter, inner_tol, None, mu, inner_restarts);
         if cold.nll + 1e-9 < best.nll {
             best = cold;
         }
@@ -1173,9 +1092,8 @@ fn find_ebe_multistart(
         return best;
     };
     let l_iov = kappa_start_chol(model, subject, params, mceta);
-    let kappa_draw = l_iov
-        .as_ref()
-        .map(|l| (l, crate::stats::stacked_layout::group_count(subject)));
+    let kappa_draw =
+        l_iov.as_ref().map(|l| (l, crate::stats::stacked_layout::group_count(subject)));
     let mut rng = StdRng::seed_from_u64(subj_seed);
     for _start in 0..mceta {
         let eta_slice = random_start(&mut rng, l_omega, kappa_draw);
@@ -1201,19 +1119,12 @@ fn find_ebe_multistart(
 /// from, or `None` for a subject that samples η alone (no IOV, no occasions, no
 /// restarts, or an Ω_iov that is not positive definite).
 fn kappa_start_chol(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    mceta: usize,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, mceta: usize,
 ) -> Option<DMatrix<f64>> {
     if mceta == 0 || model.n_kappa == 0 || subject.occasions.is_empty() {
         return None;
     }
-    params
-        .omega_iov
-        .as_ref()
-        .and_then(|o| o.matrix.clone().cholesky())
-        .map(|c| c.l())
+    params.omega_iov.as_ref().and_then(|o| o.matrix.clone().cholesky()).map(|c| c.l())
 }
 
 /// One `mceta` random start: η = L_Ω·z and, for an IOV subject, each of its
@@ -1221,9 +1132,7 @@ fn kappa_start_chol(
 /// starts from (#2301). Without `kappa`, η alone — the draw sequence is then
 /// exactly the pre-IOV one.
 fn random_start(
-    rng: &mut StdRng,
-    l_omega: &DMatrix<f64>,
-    kappa: Option<(&DMatrix<f64>, usize)>,
+    rng: &mut StdRng, l_omega: &DMatrix<f64>, kappa: Option<(&DMatrix<f64>, usize)>,
 ) -> Vec<f64> {
     let mut draw = |l: &DMatrix<f64>| -> Vec<f64> {
         let z: Vec<f64> = (0..l.nrows()).map(|_| StandardNormal.sample(rng)).collect();
@@ -1250,29 +1159,14 @@ fn random_start(
 /// `[η̂, κ̂₁..κ̂_K]` of the previous sweep, which warm-starts κ too (#2301).
 #[allow(clippy::too_many_arguments)]
 fn run_map_multistart(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    inner_maxiter: usize,
-    inner_tol: f64,
-    prev_etas: Option<&[DVector<f64>]>,
-    mu_k: &[f64],
-    mceta: usize,
-    seed: u64,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, inner_maxiter: usize,
+    inner_tol: f64, prev_etas: Option<&[DVector<f64>]>, mu_k: &[f64], mceta: usize, seed: u64,
     iteration: usize,
-) -> (
-    Vec<DVector<f64>>,
-    Vec<DMatrix<f64>>,
-    Vec<Vec<DVector<f64>>>,
-    InnerLoopStats,
-) {
+) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>, InnerLoopStats) {
     // Cholesky of Ω for drawing random starts (computed once, outside the
     // per-subject parallel loop).
-    let omega_chol = if mceta > 0 {
-        params.omega.matrix.clone().cholesky().map(|c| c.l())
-    } else {
-        None
-    };
+    let omega_chol =
+        if mceta > 0 { params.omega.matrix.clone().cholesky().map(|c| c.l()) } else { None };
 
     let results: Vec<EbeResult> = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
@@ -1312,19 +1206,13 @@ fn run_map_multistart(
 /// reports it. `fit()` publishes it, and a direct [`run_imp`] / [`run_impmap`] call reads
 /// it for its verdict. `options` are the stage's. A mixture uses its own evaluator.
 pub(crate) fn evaluate_final_marginal(
-    model: &CompiledModel,
-    population: &Population,
-    result: &OuterResult,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, result: &OuterResult, options: &FitOptions,
     method: EstimationMethod,
 ) -> Result<crate::types::ImportanceSamplingResult, String> {
     use crate::estimation::importance_sampling::{
         run_importance_sampling, run_importance_sampling_mixture,
     };
-    debug_assert!(matches!(
-        method,
-        EstimationMethod::Imp | EstimationMethod::Impmap
-    ));
+    debug_assert!(matches!(method, EstimationMethod::Imp | EstimationMethod::Impmap));
     let mut marg_opts = options.clone();
     // `run_importance_sampling` reads the `imp_*` knobs; for IMPMAP map the
     // `impmap_*` knobs onto them so the final eval mirrors the method's
@@ -1361,22 +1249,16 @@ pub(crate) fn evaluate_final_marginal(
 /// its stages (#2686), which needs the final marginal a stage does not compute. If the
 /// marginal fails, the falling-floor test still runs and a warning says so.
 fn apply_settling_verdict(
-    mut result: OuterResult,
-    model: &CompiledModel,
-    population: &Population,
-    options: &FitOptions,
+    mut result: OuterResult, model: &CompiledModel, population: &Population, options: &FitOptions,
     method: EstimationMethod,
 ) -> OuterResult {
     use crate::api::postfit::mcem_settling_warning;
     let marginal = match evaluate_final_marginal(model, population, &result, options, method) {
-        Ok(is) => Some(FinalMarginal {
-            value: is.minus2_log_likelihood,
-            mc_se: is.mc_standard_error,
-        }),
+        Ok(is) => {
+            Some(FinalMarginal { value: is.minus2_log_likelihood, mc_se: is.mc_standard_error })
+        }
         Err(e) => {
-            result
-                .warnings
-                .push(format!("marginal −2 log L eval skipped: {e}"));
+            result.warnings.push(format!("marginal −2 log L eval skipped: {e}"));
             None
         }
     };
@@ -1393,31 +1275,19 @@ fn apply_settling_verdict(
 ///
 /// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_impmap(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    warm_etas: Option<&[DVector<f64>]>,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>, options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let result = run_impmap_stage(model, population, init_params, warm_etas, options)?;
-    Ok(apply_settling_verdict(
-        result,
-        model,
-        population,
-        options,
-        EstimationMethod::Impmap,
-    ))
+    Ok(apply_settling_verdict(result, model, population, options, EstimationMethod::Impmap))
 }
 
 /// One IMPMAP stage of a `fit()`, which scores the marginal and gives the settling
 /// verdict itself. Thin wrapper over the shared MCEM core with mode re-centering on
 /// every iteration; resolves the `impmap_*` options.
 pub(crate) fn run_impmap_stage(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    warm_etas: Option<&[DVector<f64>]>,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>, options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let nu = options.impmap_proposal_df;
     run_mcem(
@@ -1450,33 +1320,21 @@ pub(crate) fn run_impmap_stage(
 ///
 /// `converged` includes the settling verdict, so this also scores the final marginal.
 pub fn run_imp(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    warm_etas: Option<&[DVector<f64>]>,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>, options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let _prints =
         crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
     let result = run_imp_stage(model, population, init_params, warm_etas, options)?;
-    Ok(apply_settling_verdict(
-        result,
-        model,
-        population,
-        options,
-        EstimationMethod::Imp,
-    ))
+    Ok(apply_settling_verdict(result, model, population, options, EstimationMethod::Imp))
 }
 
 /// One IMP stage of a `fit()`, which scores the marginal and gives the settling verdict
 /// itself. Thin wrapper over the shared MCEM core with sample-moment re-centering
 /// (conditional mode found only on the first iteration); resolves the `imp_*` options.
 pub(crate) fn run_imp_stage(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    warm_etas: Option<&[DVector<f64>]>,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>, options: &FitOptions,
 ) -> Result<OuterResult, String> {
     run_mcem(
         model,
@@ -1511,12 +1369,7 @@ pub(crate) fn run_imp_stage(
 ///   `CHI_SQ_INV_MAX_NU`; a t with more degrees of freedom is a normal for
 ///   every practical purpose, so the message points there.
 fn check_sobol_config(
-    label: &str,
-    df_key: &str,
-    n_eta: usize,
-    use_sobol: bool,
-    nu: f64,
-    mixture: bool,
+    label: &str, df_key: &str, n_eta: usize, use_sobol: bool, nu: f64, mixture: bool,
 ) -> Result<(), String> {
     use crate::estimation::importance_sampling::SOBOL_MAX_DIMS;
     use crate::stats::special::CHI_SQ_INV_MAX_NU;
@@ -1529,16 +1382,8 @@ fn check_sobol_config(
             "{label}: Sobol draws need {dims} quasi-random coordinates here ({n_eta} random \
              effects{}{}) but support at most {SOBOL_MAX_DIMS}; turn off `impmap_sobol` / \
              `imp_sobol`.",
-            if nu.is_finite() {
-                " + the Student-t scale"
-            } else {
-                ""
-            },
-            if mixture {
-                " + the defensive-mixture component"
-            } else {
-                ""
-            },
+            if nu.is_finite() { " + the Student-t scale" } else { "" },
+            if mixture { " + the defensive-mixture component" } else { "" },
         ));
     }
     if nu.is_finite() && nu > CHI_SQ_INV_MAX_NU {
@@ -1555,24 +1400,10 @@ fn check_sobol_config(
 /// only behavioural difference; `label`/`df_key` tag warnings and verbose output.
 #[allow(clippy::too_many_arguments)]
 fn run_mcem(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    warm_etas: Option<&[DVector<f64>]>,
-    options: &FitOptions,
-    recenter: ProposalRecenter,
-    label: &str,
-    df_key: &str,
-    n_iter_opt: usize,
-    k_opt: usize,
-    nu: f64,
-    n_avg_opt: usize,
-    seed: u64,
-    threshold: f64,
-    mceta: usize,
-    use_sobol: bool,
-    collect_trace: bool,
-    auto: bool,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>, options: &FitOptions, recenter: ProposalRecenter,
+    label: &str, df_key: &str, n_iter_opt: usize, k_opt: usize, nu: f64, n_avg_opt: usize,
+    seed: u64, threshold: f64, mceta: usize, use_sobol: bool, collect_trace: bool, auto: bool,
     max_time: Option<f64>,
 ) -> Result<OuterResult, String> {
     let n_subjects = population.subjects.len();
@@ -1584,14 +1415,7 @@ fn run_mcem(
 
     // ---- Validation ----
     check_max_time(label, max_time_key, max_time)?;
-    check_sobol_config(
-        label,
-        df_key,
-        n_eta,
-        use_sobol,
-        nu,
-        options.imp_defensive_alpha > 0.0,
-    )?;
+    check_sobol_config(label, df_key, n_eta, use_sobol, nu, options.imp_defensive_alpha > 0.0)?;
     // Mixture (#985): estimating IMP/IMPMAP runs a class-partitioned MCEM
     // (per-class IS E-step + responsibility-weighted M-step). Delegate to the
     // mixture core, which reuses this function's option resolution via the same
@@ -1687,86 +1511,28 @@ fn run_mcem(
     let cancel = &options.cancel;
 
     if verbose {
-        let prop = if nu.is_finite() {
-            format!("t_{nu}")
-        } else {
-            "normal".to_string()
-        };
+        let prop = if nu.is_finite() { format!("t_{nu}") } else { "normal".to_string() };
         let recenter_desc = match recenter {
             ProposalRecenter::Map => "MAP recenter/iter",
             ProposalRecenter::SampleMoments => "sample-moment recenter",
         };
-        let mceta_msg = if mceta > 0 {
-            format!(", MCETA={}", mceta)
-        } else {
-            String::new()
-        };
+        let mceta_msg = if mceta > 0 { format!(", MCETA={}", mceta) } else { String::new() };
         eprintln!(
             "{}: {} subjects, {} ETAs, {} iters, K={}/subject, {} proposal, {}, seed={}{}",
             label, n_subjects, n_eta, n_iter, k_samples, prop, recenter_desc, seed, mceta_msg
         );
     }
 
-    // ---- Packing scaffolding (mirrors SAEM) ----
-    // Per-theta packing: log for `theta_lower >= 0`, identity otherwise (so
-    // covariate exponents with negative lower bounds are not pinned to ~0).
-    let theta_packs_log_mask: Vec<bool> = init_params
-        .theta_lower
-        .iter()
-        .map(|&lo| theta_packs_log(lo))
-        .collect();
-    let pack_theta = |i: usize, t: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            t.max(1e-10).ln()
-        } else {
-            t
-        }
-    };
-
-    let mut log_theta: Vec<f64> = (0..n_theta)
-        .map(|i| pack_theta(i, init_params.theta[i]))
-        .collect();
-    let mut log_sigma: Vec<f64> = init_params
-        .sigma
-        .values
-        .iter()
-        .map(|&s| s.max(1e-10).ln())
-        .collect();
-
-    let mut log_theta_lower: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_lower[i].max(1e-10).ln()
-            } else {
-                init_params.theta_lower[i]
-            }
-        })
-        .collect();
-    let mut log_theta_upper: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_upper[i].min(1e9).ln()
-            } else {
-                init_params.theta_upper[i]
-            }
-        })
-        .collect();
-    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
-    let mut log_sigma_upper = vec![5.0f64; n_sigma];
-
-    // Pin FIX parameters: lower == upper == packed value.
-    for i in 0..n_theta {
-        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
-            log_theta_lower[i] = log_theta[i];
-            log_theta_upper[i] = log_theta[i];
-        }
-    }
-    for i in 0..n_sigma {
-        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            log_sigma_lower[i] = log_sigma[i];
-            log_sigma_upper[i] = log_sigma[i];
-        }
-    }
+    // ---- Packing scaffolding (shared with SAEM and the mixture MCEM) ----
+    let EmPacking {
+        theta_packs_log_mask,
+        mut log_theta,
+        mut log_sigma,
+        log_theta_lower,
+        log_theta_upper,
+        log_sigma_lower,
+        log_sigma_upper,
+    } = EmPacking::new(&init_params, &init_params.theta, &init_params.sigma.values);
 
     // Closed-form mu-referencing M-step: shift `packed θ += mean(η)` for eligible
     // mu-ref pairs (log-packed lognormal, identity-packed logit — #918), with those
@@ -1814,10 +1580,8 @@ fn run_mcem(
     // Every member's eta (#1620): see the SAEM twin in `run_saem`.
     let cov_group_etas: Vec<usize> =
         crate::estimation::covariate_mu_ref::group_etas(&cov_mu_groups);
-    let cov_group_thetas: Vec<usize> = cov_mu_groups
-        .iter()
-        .flat_map(|g| g.theta_idx.iter().copied())
-        .collect();
+    let cov_group_thetas: Vec<usize> =
+        cov_mu_groups.iter().flat_map(|g| g.theta_idx.iter().copied()).collect();
 
     // STRONG warning: any estimated (non-fixed) θ the closed-form mu-ref shift
     // cannot move is handled only by the weighted M-step, which is biased for
@@ -1833,24 +1597,14 @@ fn run_mcem(
         model,
         non_fixed_unanchored_thetas(model, &init_params.theta_fixed, &cov_group_thetas, &[]),
     );
-    warnings.extend(imp_unanchored_theta_warnings(
-        label,
-        &thetas_with_eta,
-        &thetas_without_eta,
-    ));
+    warnings.extend(imp_unanchored_theta_warnings(label, &thetas_with_eta, &thetas_without_eta));
 
-    let mu_ref_pairs: Vec<(usize, usize)> = mu_ref_pairs
-        .into_iter()
-        .filter(|(_t, e)| !cov_group_etas.contains(e))
-        .collect();
-    let identity_packed_log: Vec<usize> = identity_packed_log
-        .into_iter()
-        .filter(|t| !cov_group_thetas.contains(t))
-        .collect();
-    let log_packed_logit: Vec<usize> = log_packed_logit
-        .into_iter()
-        .filter(|t| !cov_group_thetas.contains(t))
-        .collect();
+    let mu_ref_pairs: Vec<(usize, usize)> =
+        mu_ref_pairs.into_iter().filter(|(_t, e)| !cov_group_etas.contains(e)).collect();
+    let identity_packed_log: Vec<usize> =
+        identity_packed_log.into_iter().filter(|t| !cov_group_thetas.contains(t)).collect();
+    let log_packed_logit: Vec<usize> =
+        log_packed_logit.into_iter().filter(|t| !cov_group_thetas.contains(t)).collect();
     let theta_name_list = |idx: &[usize]| -> String {
         let mut n: Vec<&str> = idx
             .iter()
@@ -1890,10 +1644,8 @@ fn run_mcem(
     // `classify_mu_ref_pairs`); both its pairs are dropped, so it is estimated by
     // the weighted M-step alone.
     // A covariate group that took both pairs in moves the θ instead (#1630).
-    let shared_theta: Vec<usize> = shared_theta
-        .into_iter()
-        .filter(|t| !cov_group_thetas.contains(t))
-        .collect();
+    let shared_theta: Vec<usize> =
+        shared_theta.into_iter().filter(|t| !cov_group_thetas.contains(t)).collect();
     if !shared_theta.is_empty() {
         warnings.push(format!(
             "{label}: typical value(s) {} are the mu-reference anchor of more than one ETA, so \
@@ -1928,9 +1680,7 @@ fn run_mcem(
         ));
     }
     // Closed-form mu-ref shift is used as long as at least one pair has real IIV.
-    let use_closed_form = mu_ref_pairs
-        .iter()
-        .any(|&(t, _e)| !weak_mu_ref.contains(&t));
+    let use_closed_form = mu_ref_pairs.iter().any(|&(t, _e)| !weak_mu_ref.contains(&t));
     // The optimizer the weighted M-steps run, decided once (`newton_scope_gap`): what the
     // warning says is what every solve below is handed. The θ the closed-form steps own are
     // not the weighted M-step's (a σ-only solve has no θ score to be a forward difference).
@@ -2027,11 +1777,8 @@ fn run_mcem(
     };
 
     // ---- Trace: collect per-iteration parameters (analogous to NONMEM .ext) ----
-    let mut trace_rows: Vec<ImpmapTraceRow> = if collect_trace {
-        Vec::with_capacity(n_iter + 2)
-    } else {
-        Vec::new()
-    };
+    let mut trace_rows: Vec<ImpmapTraceRow> =
+        if collect_trace { Vec::with_capacity(n_iter + 2) } else { Vec::new() };
 
     // ESS state from the final completed E-step, used to flag importance-sampling
     // moment bias (which scales as 1/(K·ESS) and is severe in high dimensions).
@@ -2403,10 +2150,7 @@ fn run_mcem(
         // Objective Monte-Carlo standard error from the self-normalized ESS
         // (Geweke: Var(log p̂ᵢ) ≈ (1/ESS_frac − 1)/K; degenerate subjects get a
         // finite fallback). −2 log L scales this by 2.
-        let var_ll: f64 = ess_fracs
-            .iter()
-            .map(|&f| log_marginal_mc_variance(f, k_samples))
-            .sum();
+        let var_ll: f64 = ess_fracs.iter().map(|&f| log_marginal_mc_variance(f, k_samples)).sum();
         let mc_se = 2.0 * var_ll.sqrt();
         iteration_objectives.push(minus2ll);
         iteration_mc_se.push(mc_se);
@@ -2438,15 +2182,9 @@ fn run_mcem(
                 k >= auto_hold_end,
             );
             if verbose && new_k != k_samples {
-                let verb = if new_k > k_samples {
-                    "raising"
-                } else {
-                    "lowering"
-                };
-                let n_degenerate = ess_fracs
-                    .iter()
-                    .filter(|&&f| is_degenerate(f, k_samples))
-                    .count();
+                let verb = if new_k > k_samples { "raising" } else { "lowering" };
+                let n_degenerate =
+                    ess_fracs.iter().filter(|&&f| is_degenerate(f, k_samples)).count();
                 eprintln!(
                     "{label}: auto-sampling — iteration {k}, per-subject objective MC SE \
                      {se:.3} (target {AUTO_STDOBJ_TARGET:.2}), {verb} K {k_samples} → {new_k}; \
@@ -2461,16 +2199,10 @@ fn run_mcem(
         // Track the final E-step's ESS health for the post-fit bias warning.
         // `f ≥ 1/K` whenever any draw has weight, so `f ≤ 1e-6` alone would only
         // count failed subjects; ESS < 2 also counts a one-draw subject (#2690).
-        final_n_collapsed = ess_fracs
-            .iter()
-            .filter(|&&f| is_degenerate(f, final_k_samples))
-            .count();
-        final_stuck_ids = subject_ids
-            .iter()
-            .zip(&stuck)
-            .filter(|(_, &s)| s)
-            .map(|(&id, _)| id)
-            .collect();
+        final_n_collapsed =
+            ess_fracs.iter().filter(|&&f| is_degenerate(f, final_k_samples)).count();
+        final_stuck_ids =
+            subject_ids.iter().zip(&stuck).filter(|(_, &s)| s).map(|(&id, _)| id).collect();
         ess_fracs.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         final_ess_median = ess_fracs.get(ess_fracs.len() / 2).copied().unwrap_or(1.0);
 
@@ -2540,13 +2272,7 @@ fn run_mcem(
         // M-step, so pinning it anyway freezes those thetas for the whole
         // iteration with nothing left to move them (#918 review).
         let theta_now_premstep: Vec<f64> = (0..n_theta)
-            .map(|i| {
-                if theta_packs_log_mask[i] {
-                    log_theta[i].exp()
-                } else {
-                    log_theta[i]
-                }
-            })
+            .map(|i| if theta_packs_log_mask[i] { log_theta[i].exp() } else { log_theta[i] })
             .collect();
         let group_can_step: Vec<bool> = cov_mu_groups
             .iter()
@@ -2639,13 +2365,7 @@ fn run_mcem(
         if !cov_mu_groups.is_empty() {
             let unpack_all = |lt: &[f64]| -> Vec<f64> {
                 (0..n_theta)
-                    .map(|i| {
-                        if theta_packs_log_mask[i] {
-                            lt[i].exp()
-                        } else {
-                            lt[i]
-                        }
-                    })
+                    .map(|i| if theta_packs_log_mask[i] { lt[i].exp() } else { lt[i] })
                     .collect()
             };
             let pack_one = |i: usize, v: f64| -> f64 {
@@ -2765,13 +2485,7 @@ fn run_mcem(
         }
 
         theta_cur = (0..n_theta)
-            .map(|i| {
-                if theta_packs_log_mask[i] {
-                    log_theta[i].exp()
-                } else {
-                    log_theta[i]
-                }
-            })
+            .map(|i| if theta_packs_log_mask[i] { log_theta[i].exp() } else { log_theta[i] })
             .collect();
         sigma_cur = log_sigma.iter().map(|&s| s.exp()).collect();
 
@@ -2882,10 +2596,8 @@ fn run_mcem(
         let collapse = collapse_sentence(final_n_collapsed.saturating_sub(named));
         let stuck = stuck_subjects_sentence(auto, auto_opt, &final_stuck_ids);
         // The noise is all theirs when the subjects `auto` acts on met the target.
-        let only_left_out_noisy = named > 0
-            && iteration_se
-                .last()
-                .is_some_and(|&(se, _)| se <= AUTO_STDOBJ_TARGET);
+        let only_left_out_noisy =
+            named > 0 && iteration_se.last().is_some_and(|&(se, _)| se <= AUTO_STDOBJ_TARGET);
         let advice = under_sampling_advice(
             auto,
             final_k_samples,
@@ -2949,9 +2661,7 @@ fn run_mcem(
         (theta_cur.clone(), sigma_cur.clone(), omega_mat.clone())
     };
     let final_omega_iov_mat: Option<DMatrix<f64>> = if n_acc > 0 {
-        omega_iov_mat
-            .as_ref()
-            .map(|_| &acc_omega_iov / n_acc as f64)
+        omega_iov_mat.as_ref().map(|_| &acc_omega_iov / n_acc as f64)
     } else {
         omega_iov_mat.clone()
     };
@@ -2969,10 +2679,7 @@ fn run_mcem(
         theta_fixed: init_params.theta_fixed.clone(),
         omega: final_omega,
         omega_fixed: init_params.omega_fixed.clone(),
-        sigma: SigmaVector {
-            values: final_sigma,
-            names: init_params.sigma.names.clone(),
-        },
+        sigma: SigmaVector { values: final_sigma, names: init_params.sigma.names.clone() },
         sigma_fixed: init_params.sigma_fixed.clone(),
         // IMP/IMPMAP does not update the `block_sigma` off-diagonals
         // (#847); carry them so the sampled residual `R` keeps its
@@ -2985,11 +2692,7 @@ fn run_mcem(
     };
 
     // ---- Final EBEs (warm-started) + FOCE Laplace OFV for comparability ----
-    let warm = if last_eta_hats.is_empty() {
-        None
-    } else {
-        Some(last_eta_hats.as_slice())
-    };
+    let warm = if last_eta_hats.is_empty() { None } else { Some(last_eta_hats.as_slice()) };
     let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
     let (eta_hats, h_matrices, final_kappas, _stats) = run_map_multistart(
         model,
@@ -3059,18 +2762,10 @@ fn run_mcem(
             let n_omega_lt = lower_triangle(&final_params.omega.matrix).len();
             let n_free_sigma = final_params.sigma.values.len();
             let se_theta: Vec<f64> = se.iter().take(n_free_theta).copied().collect();
-            let se_omega: Vec<f64> = se
-                .iter()
-                .skip(n_free_theta)
-                .take(n_omega_lt)
-                .copied()
-                .collect();
-            let se_sigma: Vec<f64> = se
-                .iter()
-                .skip(n_free_theta + n_omega_lt)
-                .take(n_free_sigma)
-                .copied()
-                .collect();
+            let se_omega: Vec<f64> =
+                se.iter().skip(n_free_theta).take(n_omega_lt).copied().collect();
+            let se_sigma: Vec<f64> =
+                se.iter().skip(n_free_theta + n_omega_lt).take(n_free_sigma).copied().collect();
             trace_rows.push(ImpmapTraceRow {
                 iteration: -1_000_000_001,
                 theta: se_theta,
@@ -3093,12 +2788,7 @@ fn run_mcem(
         };
         let sigma_names: Vec<String> = (1..=n_sigma).map(|i| format!("SIGMA({i},{i})")).collect();
 
-        Some(ImpmapTrace {
-            rows: trace_rows,
-            theta_names,
-            omega_names,
-            sigma_names,
-        })
+        Some(ImpmapTrace { rows: trace_rows, theta_names, omega_names, sigma_names })
     } else {
         None
     };
@@ -3132,7 +2822,6 @@ fn run_mcem(
     }
 
     Ok(OuterResult {
-        params: final_params,
         ofv,
         converged,
         n_iterations: iterations_done,
@@ -3143,27 +2832,9 @@ fn run_mcem(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
         mstep_optimizer_used: Some(mstep_optimizer.as_str().to_string()),
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
         impmap_trace,
-        bayes: None,
-        cond_dist: None,
-        packed_estimate: None,
-        left_init: None,
-        stationary_start: false,
-        mixture_posteriors: None,
-        vi: None,
-        start_eval: None,
         mcem_lowest_objective: lowest_iteration_objective,
         // A run `max_time` stopped did not reach the limit the settling verdict is about,
         // and already says why it is not converged.
@@ -3171,8 +2842,7 @@ fn run_mcem(
             .is_none()
             .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
         newton_decrement,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(final_params)
     })
 }
 
@@ -3195,24 +2865,10 @@ fn run_mcem(
 /// (`mixture_ofv`) at the estimates, matching FOCEI/SAEM.
 #[allow(clippy::too_many_arguments)]
 fn run_mcem_mixture(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    warm_etas: Option<&[DVector<f64>]>,
-    options: &FitOptions,
-    recenter: ProposalRecenter,
-    label: &str,
-    df_key: &str,
-    n_iter_opt: usize,
-    k_opt: usize,
-    nu: f64,
-    n_avg_opt: usize,
-    seed: u64,
-    threshold: f64,
-    mceta: usize,
-    use_sobol: bool,
-    collect_trace: bool,
-    auto: bool,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
+    warm_etas: Option<&[DVector<f64>]>, options: &FitOptions, recenter: ProposalRecenter,
+    label: &str, df_key: &str, n_iter_opt: usize, k_opt: usize, nu: f64, n_avg_opt: usize,
+    seed: u64, threshold: f64, mceta: usize, use_sobol: bool, collect_trace: bool, auto: bool,
     max_time: Option<f64>,
 ) -> Result<OuterResult, String> {
     use crate::estimation::importance_sampling::{
@@ -3225,10 +2881,7 @@ fn run_mcem_mixture(
     let n_eta = model.n_eta;
     let n_theta = init_params.theta.len();
     let n_sigma = init_params.sigma.values.len();
-    let spec = model
-        .mixture
-        .as_ref()
-        .expect("run_mcem_mixture on non-mixture model");
+    let spec = model.mixture.as_ref().expect("run_mcem_mixture on non-mixture model");
     let mp0 = init_params
         .mixture
         .as_ref()
@@ -3236,9 +2889,7 @@ fn run_mcem_mixture(
 
     // ---- Validation (mixture scope) ----
     if recenter.method().requires_random_effects() && n_eta == 0 {
-        return Err(format!(
-            "{label} requires at least one random effect (n_eta = 0)."
-        ));
+        return Err(format!("{label} requires at least one random effect (n_eta = 0)."));
     }
     if model.n_kappa > 0 {
         return Err(format!(
@@ -3247,14 +2898,10 @@ fn run_mcem_mixture(
         ));
     }
     if model.frem_config.is_some() {
-        return Err(format!(
-            "{label} for a mixture does not support FREM models (#985)."
-        ));
+        return Err(format!("{label} for a mixture does not support FREM models (#985)."));
     }
     if model.is_sde() {
-        return Err(format!(
-            "{label} for a mixture does not support SDE / [diffusion] models."
-        ));
+        return Err(format!("{label} for a mixture does not support SDE / [diffusion] models."));
     }
     if !mp0.omega_override_addr.is_empty() || !mp0.sigma_override_addr.is_empty() {
         return Err(format!(
@@ -3264,9 +2911,7 @@ fn run_mcem_mixture(
         ));
     }
     if nu.is_finite() && nu < 1.0 {
-        return Err(format!(
-            "{label}: {df_key} must be >= 1.0 (or +inf), got {nu}"
-        ));
+        return Err(format!("{label}: {df_key} must be >= 1.0 (or +inf), got {nu}"));
     }
 
     let started = std::time::Instant::now();
@@ -3277,60 +2922,16 @@ fn run_mcem_mixture(
     let cancel = &options.cancel;
     let n_classes = spec.n_classes;
 
-    // ---- Packing scaffolding (mirrors run_mcem / SAEM) ----
-    let theta_packs_log_mask: Vec<bool> = init_params
-        .theta_lower
-        .iter()
-        .map(|&lo| theta_packs_log(lo))
-        .collect();
-    let pack_theta = |i: usize, t: f64| -> f64 {
-        if theta_packs_log_mask[i] {
-            t.max(1e-10).ln()
-        } else {
-            t
-        }
-    };
-    let mut log_theta: Vec<f64> = (0..n_theta)
-        .map(|i| pack_theta(i, init_params.theta[i]))
-        .collect();
-    let mut log_sigma: Vec<f64> = init_params
-        .sigma
-        .values
-        .iter()
-        .map(|&s| s.max(1e-10).ln())
-        .collect();
-    let mut log_theta_lower: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_lower[i].max(1e-10).ln()
-            } else {
-                init_params.theta_lower[i]
-            }
-        })
-        .collect();
-    let mut log_theta_upper: Vec<f64> = (0..n_theta)
-        .map(|i| {
-            if theta_packs_log_mask[i] {
-                init_params.theta_upper[i].min(1e9).ln()
-            } else {
-                init_params.theta_upper[i]
-            }
-        })
-        .collect();
-    let mut log_sigma_lower = vec![-8.0f64; n_sigma];
-    let mut log_sigma_upper = vec![5.0f64; n_sigma];
-    for i in 0..n_theta {
-        if init_params.theta_fixed.get(i).copied().unwrap_or(false) {
-            log_theta_lower[i] = log_theta[i];
-            log_theta_upper[i] = log_theta[i];
-        }
-    }
-    for i in 0..n_sigma {
-        if init_params.sigma_fixed.get(i).copied().unwrap_or(false) {
-            log_sigma_lower[i] = log_sigma[i];
-            log_sigma_upper[i] = log_sigma[i];
-        }
-    }
+    // ---- Packing scaffolding (shared with run_mcem / SAEM) ----
+    let EmPacking {
+        theta_packs_log_mask,
+        mut log_theta,
+        mut log_sigma,
+        log_theta_lower,
+        log_theta_upper,
+        log_sigma_lower,
+        log_sigma_upper,
+    } = EmPacking::new(&init_params, &init_params.theta, &init_params.sigma.values);
     let unpack_theta = |i: usize, v: f64| -> f64 {
         if theta_packs_log_mask[i] {
             v.exp()
@@ -3363,11 +2964,7 @@ fn run_mcem_mixture(
         let names: Vec<String> = overlap
             .iter()
             .map(|&j| {
-                init_params
-                    .theta_names
-                    .get(j)
-                    .cloned()
-                    .unwrap_or_else(|| format!("theta[{j}]"))
+                init_params.theta_names.get(j).cloned().unwrap_or_else(|| format!("theta[{j}]"))
             })
             .collect();
         return Err(format!(
@@ -3428,10 +3025,8 @@ fn run_mcem_mixture(
     // filters below decide which shifts actually run. Used to tell an
     // anchor-with-a-disabled-shift apart from a genuinely ETA-less θ in the #406
     // advisory (#996 review).
-    let all_class_anchors: Vec<usize> = get_mixture_mu_ref_pairs(model)
-        .iter()
-        .flat_map(|p| p.theta_idx.iter().copied())
-        .collect();
+    let all_class_anchors: Vec<usize> =
+        get_mixture_mu_ref_pairs(model).iter().flat_map(|p| p.theta_idx.iter().copied()).collect();
     // A θ whose packed scale is not its mu scale — an identity-packed lognormal
     // anchor (`theta_lower < 0`), or a log-packed logit anchor (#918) — cannot
     // take the additive shift, so `classify_mixture_mu_ref_pairs` routes it to
@@ -3531,11 +3126,7 @@ fn run_mcem_mixture(
             .filter(|n| !mixing_names.contains(n.as_str()))
             .partition(|n| anchor_names.contains(n.as_str()));
     let (thetas_with_eta, thetas_without_eta) = partition_by_eta(model, unanchored);
-    warnings.extend(imp_unanchored_theta_warnings(
-        label,
-        &thetas_with_eta,
-        &thetas_without_eta,
-    ));
+    warnings.extend(imp_unanchored_theta_warnings(label, &thetas_with_eta, &thetas_without_eta));
     if !shift_disabled.is_empty() {
         warnings.push(format!(
             "{label}: class typical value(s) [{}] carry an ETA, but their class-aware mu-ref \
@@ -3651,11 +3242,8 @@ fn run_mcem_mixture(
         let prev_mean = prev_means.as_ref();
         // Cholesky of the shared Ω for the MCETA random restarts (computed once
         // per iteration, outside the parallel loop). `None` when MCETA is off.
-        let omega_chol = if mceta > 0 && run_inner {
-            omega_mat.clone().cholesky().map(|c| c.l())
-        } else {
-            None
-        };
+        let omega_chol =
+            if mceta > 0 && run_inner { omega_mat.clone().cholesky().map(|c| c.l()) } else { None };
 
         // ---- E-step: per subject, per class IS draws + class responsibilities ----
         // Parallel over subjects; the class loop runs inside each worker so the
@@ -3673,9 +3261,8 @@ fn run_mcem_mixture(
                 // Mirrors `run_mcem`; the driver breaks right after the collect,
                 // so the placeholder draws never reach an M-step.
                 if crate::cancel::is_cancelled(cancel) {
-                    let class_draws: Vec<SubjectDraws> = (0..n_classes)
-                        .map(|_| SubjectDraws::cancelled(n_eta))
-                        .collect();
+                    let class_draws: Vec<SubjectDraws> =
+                        (0..n_classes).map(|_| SubjectDraws::cancelled(n_eta)).collect();
                     return (class_draws, vec![1.0 / n_classes as f64; n_classes], 0.0);
                 }
                 let logp = eval_mixing_log_probs(spec, &theta_cur, &subject.covariates);
@@ -3783,9 +3370,8 @@ fn run_mcem_mixture(
         }
 
         // Reorganize into [class][subject] draws + [subject][class] responsibilities.
-        let mut draws_by_class: Vec<Vec<SubjectDraws>> = (0..n_classes)
-            .map(|_| Vec::with_capacity(n_subjects))
-            .collect();
+        let mut draws_by_class: Vec<Vec<SubjectDraws>> =
+            (0..n_classes).map(|_| Vec::with_capacity(n_subjects)).collect();
         let mut pmix: Vec<Vec<f64>> = Vec::with_capacity(n_subjects);
         let mut ofv = 0.0f64;
         for (class_draws, pmix_i, contribution) in per_subject {
@@ -3913,9 +3499,7 @@ fn run_mcem_mixture(
             applied_shift[t] = log_theta[t] - before;
         }
 
-        theta_cur = (0..n_theta)
-            .map(|i| unpack_theta(i, log_theta[i]))
-            .collect();
+        theta_cur = (0..n_theta).map(|i| unpack_theta(i, log_theta[i])).collect();
         sigma_cur = log_sigma.iter().map(|&v| v.exp()).collect();
 
         // (b) mixing coefficients from the class responsibilities.
@@ -3930,11 +3514,8 @@ fn run_mcem_mixture(
             mstep_maxiter,
         );
         for &j in &mix.mixing_theta_idx {
-            log_theta[j] = if theta_packs_log_mask[j] {
-                theta_cur[j].max(1e-12).ln()
-            } else {
-                theta_cur[j]
-            };
+            log_theta[j] =
+                if theta_packs_log_mask[j] { theta_cur[j].max(1e-12).ln() } else { theta_cur[j] };
         }
 
         // (c) Ω (class-shared): responsibility-weighted second moment, masked/floored.
@@ -4046,14 +3627,8 @@ fn run_mcem_mixture(
     // ---- Point estimate: average over the final n_avg iterations ----
     let (final_theta, final_sigma, final_omega_mat) = if n_acc > 0 {
         (
-            acc_theta
-                .iter()
-                .map(|&v| v / n_acc as f64)
-                .collect::<Vec<_>>(),
-            acc_sigma
-                .iter()
-                .map(|&v| v / n_acc as f64)
-                .collect::<Vec<_>>(),
+            acc_theta.iter().map(|&v| v / n_acc as f64).collect::<Vec<_>>(),
+            acc_sigma.iter().map(|&v| v / n_acc as f64).collect::<Vec<_>>(),
             acc_omega / n_acc as f64,
         )
     } else {
@@ -4084,10 +3659,7 @@ fn run_mcem_mixture(
         theta_fixed: init_params.theta_fixed.clone(),
         omega: final_omega,
         omega_fixed: init_params.omega_fixed.clone(),
-        sigma: SigmaVector {
-            values: final_sigma,
-            names: init_params.sigma.names.clone(),
-        },
+        sigma: SigmaVector { values: final_sigma, names: init_params.sigma.names.clone() },
         sigma_fixed: init_params.sigma_fixed.clone(),
         // IMP/IMPMAP does not update the `block_sigma` off-diagonals
         // (#847); carry them so the sampled residual `R` keeps its
@@ -4155,7 +3727,6 @@ fn run_mcem_mixture(
     }
 
     Ok(OuterResult {
-        params: final_params,
         ofv,
         converged,
         n_iterations: iterations_done,
@@ -4166,27 +3737,9 @@ fn run_mcem_mixture(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_objective_value: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
         mstep_optimizer_used: Some(mstep_optimizer.as_str().to_string()),
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
-        final_gradient: None,
-        final_gradient_source: None,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
-        packed_estimate: None,
-        left_init: None,
-        stationary_start: false,
         mixture_posteriors,
-        vi: None,
-        start_eval: None,
         mcem_lowest_objective: lowest_iteration_objective,
         // A run `max_time` stopped did not reach the limit the settling verdict is about,
         // and already says why it is not converged.
@@ -4194,8 +3747,7 @@ fn run_mcem_mixture(
             .is_none()
             .then(|| recenter.objective_trail(iteration_objectives, iteration_mc_se, label)),
         newton_decrement,
-        optimizer_stop: None,
-        eval_budget_spent: false,
+        ..OuterResult::from_params(final_params)
     })
 }
 
@@ -4220,8 +3772,7 @@ fn sampled_dimension_phrase(n_eta: usize, n_kappa: usize, max_occ: usize) -> Str
 /// structural mask (as SAEM does: a free off-diagonal that happens to be 0 must
 /// not be read as structural), or the template unchanged without IOV.
 fn omega_iov_snapshot(
-    init_params: &ModelParameters,
-    current: Option<&DMatrix<f64>>,
+    init_params: &ModelParameters, current: Option<&DMatrix<f64>>,
 ) -> Option<OmegaMatrix> {
     match (init_params.omega_iov.as_ref(), current) {
         (Some(t), Some(m)) => Some(OmegaMatrix::from_matrix_with_mask(
@@ -4238,10 +3789,7 @@ fn omega_iov_snapshot(
 /// samples (`n_occ_of`), or the stacked mode would be mis-assembled. The same
 /// guard `run_importance_sampling` applies, here on every sweep.
 fn check_kappa_blocks(
-    population: &Population,
-    kappas: &[Vec<DVector<f64>>],
-    n_occ_of: &[usize],
-    label: &str,
+    population: &Population, kappas: &[Vec<DVector<f64>>], n_occ_of: &[usize], label: &str,
 ) -> Result<(), String> {
     for (i, subject) in population.subjects.iter().enumerate() {
         let got = kappas.get(i).map_or(0, Vec::len);
@@ -4286,10 +3834,7 @@ pub(crate) struct JointPriors(std::collections::BTreeMap<usize, JointPrior>);
 
 impl JointPriors {
     pub(crate) fn build(
-        omega: &OmegaMatrix,
-        iov: &OmegaMatrix,
-        n_occ_of: &[usize],
-        alpha: f64,
+        omega: &OmegaMatrix, iov: &OmegaMatrix, n_occ_of: &[usize], alpha: f64,
     ) -> Self {
         let (n_eta, n_kappa) = (omega.matrix.nrows(), iov.matrix.nrows());
         let mut map = std::collections::BTreeMap::new();
@@ -4347,13 +3892,8 @@ fn split_kappas(kappa_part: &[f64], n_kappa: usize, buf: &mut Vec<Vec<f64>>) -> 
 /// `[η, κ₁..κ_K]`, scored with per-occasion predictions — the observation NLL
 /// SAEM's IOV M-step uses.
 pub(crate) fn draw_obs_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    b: &[f64],
-    schedule: Option<&EventSchedule>,
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], b: &[f64],
+    schedule: Option<&EventSchedule>, scratch: &mut EventPkParams,
 ) -> f64 {
     let n_eta = model.n_eta;
     if b.len() > n_eta {
@@ -4391,14 +3931,8 @@ pub(crate) fn draw_obs_nll(
 /// this `θ`; the scoring is the same code on the same values either way.
 #[allow(clippy::too_many_arguments)]
 fn draw_obs_nll_memo(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    b: &[f64],
-    schedule: Option<&EventSchedule>,
-    scratch: &mut EventPkParams,
-    memo: MemoSlot<'_>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], b: &[f64],
+    schedule: Option<&EventSchedule>, scratch: &mut EventPkParams, memo: MemoSlot<'_>,
 ) -> f64 {
     let n_eta = model.n_eta;
     if b.len() > n_eta {
@@ -4439,19 +3973,9 @@ fn draw_obs_nll_memo(
 /// through the IOV score, the rest through the plain one.
 #[allow(clippy::too_many_arguments)]
 fn draw_obs_score(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    b: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    scratch: &mut EventPkParams,
-    want_fisher: bool,
-    memo: Option<MemoSlot<'_>>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], b: &[f64],
+    theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize,
+    scratch: &mut EventPkParams, want_fisher: bool, memo: Option<MemoSlot<'_>>,
     schedule: Option<&EventSchedule>,
 ) -> (f64, Vec<f64>, Option<Vec<f64>>) {
     let n_eta = model.n_eta;
@@ -4510,19 +4034,10 @@ fn draw_obs_score(
 /// value objective's are.
 #[allow(clippy::too_many_arguments)]
 fn weighted_mstep_score(
-    model: &CompiledModel,
-    population: &Population,
-    draws: &[SubjectDraws],
-    schedules: &[Option<EventSchedule>],
-    theta: &[f64],
-    sigma: &[f64],
-    theta_packs_log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    want_fisher: bool,
-    memo: Option<EvalMemo<'_>>,
+    model: &CompiledModel, population: &Population, draws: &[SubjectDraws],
+    schedules: &[Option<EventSchedule>], theta: &[f64], sigma: &[f64],
+    theta_packs_log_mask: &[bool], lower: &[f64], upper: &[f64], n_theta: usize, n_sigma: usize,
+    want_fisher: bool, memo: Option<EvalMemo<'_>>,
 ) -> Option<ValueGradInfo> {
     let n = n_theta + n_sigma;
     let declined = std::sync::atomic::AtomicBool::new(false);
@@ -4589,9 +4104,7 @@ fn weighted_mstep_score(
 /// was the largest single cost of a fixed-K run (#2687). An IOV subject walks the
 /// IOV funnel whatever its covariates, hence its own gate.
 fn mcem_schedule_cache(
-    model: &CompiledModel,
-    population: &Population,
-    n_occ_of: &[usize],
+    model: &CompiledModel, population: &Population, n_occ_of: &[usize],
 ) -> Vec<Option<EventSchedule>> {
     population
         .subjects
@@ -4615,10 +4128,7 @@ fn mcem_schedule_cache(
 /// diagonal floored. `None` when no subject has an occasion (nothing to
 /// estimate from — Ω_iov is left where it was).
 fn omega_iov_mstep(
-    draws: &[SubjectDraws],
-    n_occ_of: &[usize],
-    n_eta: usize,
-    template: &OmegaMatrix,
+    draws: &[SubjectDraws], n_occ_of: &[usize], n_eta: usize, template: &OmegaMatrix,
     kappa_fixed: &[bool],
 ) -> Option<DMatrix<f64>> {
     let n_kappa = template.matrix.nrows();
@@ -4684,12 +4194,8 @@ fn schedule_of(schedules: &[Option<EventSchedule>], idx: usize) -> Option<&Event
 /// samples are scored with their own κ (#2301).
 #[cfg(test)]
 fn weighted_mstep_objective(
-    model: &CompiledModel,
-    population: &Population,
-    draws: &[SubjectDraws],
-    schedules: &[Option<EventSchedule>],
-    theta: &[f64],
-    sigma: &[f64],
+    model: &CompiledModel, population: &Population, draws: &[SubjectDraws],
+    schedules: &[Option<EventSchedule>], theta: &[f64], sigma: &[f64],
 ) -> f64 {
     weighted_mstep_objective_memo(model, population, draws, schedules, theta, sigma, None)
 }
@@ -4697,13 +4203,8 @@ fn weighted_mstep_objective(
 /// [`weighted_mstep_objective`] with the predictions served from the evaluation's memo (the
 /// solve's evaluations at one `θ`).
 fn weighted_mstep_objective_memo(
-    model: &CompiledModel,
-    population: &Population,
-    draws: &[SubjectDraws],
-    schedules: &[Option<EventSchedule>],
-    theta: &[f64],
-    sigma: &[f64],
-    memo: Option<EvalMemo<'_>>,
+    model: &CompiledModel, population: &Population, draws: &[SubjectDraws],
+    schedules: &[Option<EventSchedule>], theta: &[f64], sigma: &[f64], memo: Option<EvalMemo<'_>>,
 ) -> f64 {
     // Reduce in subject order (collect then serial sum) so the objective is
     // reproducible regardless of rayon worker count — a parallel `.sum()`
@@ -4713,10 +4214,8 @@ fn weighted_mstep_objective_memo(
         weighted_mstep_subjects(population, draws),
         EventPkParams::default,
         |scratch, idx| {
-            let ((subject, d), schedule) = (
-                (&population.subjects[idx], &draws[idx]),
-                schedule_of(schedules, idx),
-            );
+            let ((subject, d), schedule) =
+                ((&population.subjects[idx], &draws[idx]), schedule_of(schedules, idx));
             {
                 let mut s = 0.0f64;
                 for (k, (w, b)) in d.weights.iter().zip(d.etas.iter()).enumerate() {
@@ -4815,10 +4314,7 @@ impl MstepMotion {
 /// Demote `converged` when the weighted M-step left a parameter it owns at its start
 /// although moving it would have paid (#2718), and say why.
 fn gate_converged_on_mstep_motion(
-    converged: &mut bool,
-    label: &str,
-    motion: &MstepMotion,
-    model: &CompiledModel,
+    converged: &mut bool, label: &str, motion: &MstepMotion, model: &CompiledModel,
 ) -> Option<String> {
     let frozen = motion.frozen();
     if frozen.is_empty() {
@@ -4853,9 +4349,7 @@ fn gate_converged_on_mstep_motion(
 /// [`mstep_failure`] lets through, it only reports bad arguments, memory and a forced
 /// stop. So one is enough, and there is no count to calibrate.
 fn gate_converged_on_mstep_failures(
-    converged: &mut bool,
-    label: &str,
-    motion: &MstepMotion,
+    converged: &mut bool, label: &str, motion: &MstepMotion,
 ) -> Option<String> {
     let state = motion.last_failure?;
     *converged = false;
@@ -4872,11 +4366,7 @@ fn gate_converged_on_mstep_failures(
 /// stopped is not judged on motion: it may have had too few solves to tell, and it
 /// already reports why it is not converged. A failure stands either way.
 fn mstep_warnings(
-    converged: &mut bool,
-    label: &str,
-    motion: &MstepMotion,
-    model: &CompiledModel,
-    stopped: bool,
+    converged: &mut bool, label: &str, motion: &MstepMotion, model: &CompiledModel, stopped: bool,
 ) -> Vec<String> {
     let failed = gate_converged_on_mstep_failures(converged, label, motion);
     let frozen = if stopped {
@@ -4897,11 +4387,7 @@ fn mstep_warnings(
 /// about half of it of its optimum reads `false`, as does one the objective is flat in, and
 /// one on a bound with its optimum outside. Moved and pinned coordinates read `false`.
 fn improvable_coordinates<F>(
-    obj: &F,
-    start: &[f64],
-    x: &[f64],
-    lower: &[f64],
-    upper: &[f64],
+    obj: &F, start: &[f64], x: &[f64], lower: &[f64], upper: &[f64],
 ) -> Vec<bool>
 where
     F: Fn(&[f64], Option<&mut [f64]>, &mut ()) -> f64,
@@ -5030,11 +4516,8 @@ where
     opt.set_ftol_rel(MSTEP_FTOL_REL).unwrap();
     opt.set_ftol_abs(MSTEP_FTOL_ABS).unwrap();
     if mstep_optimizer != MstepOptimizer::Lbfgs {
-        let initial_step: Vec<f64> = lower
-            .iter()
-            .zip(upper)
-            .map(|(&lo, &hi)| mstep_initial_step(lo, hi))
-            .collect();
+        let initial_step: Vec<f64> =
+            lower.iter().zip(upper).map(|(&lo, &hi)| mstep_initial_step(lo, hi)).collect();
         opt.set_initial_step(&initial_step).unwrap();
     }
 
@@ -5088,12 +4571,7 @@ where
     );
     let improvable = improvable_coordinates(&obj, &start, &x, lower, upper);
     let log_sigma = x.split_off(n_theta);
-    WeightedMstep {
-        log_theta: x,
-        log_sigma,
-        failure,
-        improvable,
-    }
+    WeightedMstep { log_theta: x, log_sigma, failure, improvable }
 }
 
 /// Weighted θ/σ M-step: minimize the importance-weighted observation NLL
@@ -5103,22 +4581,12 @@ where
 /// the `K` weighted samples per subject instead of a single EBE.
 #[allow(clippy::too_many_arguments)]
 fn theta_sigma_weighted_mstep(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
     draws: &[crate::estimation::importance_sampling::SubjectDraws],
-    schedules: &[Option<EventSchedule>],
-    log_theta_init: &[f64],
-    log_sigma_init: &[f64],
-    log_theta_lower: &[f64],
-    log_theta_upper: &[f64],
-    log_sigma_lower: &[f64],
-    log_sigma_upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    maxiter: u32,
-    theta_packs_log_mask: &[bool],
-    mstep_optimizer: MstepOptimizer,
-    tally: Option<&NewtonTally>,
+    schedules: &[Option<EventSchedule>], log_theta_init: &[f64], log_sigma_init: &[f64],
+    log_theta_lower: &[f64], log_theta_upper: &[f64], log_sigma_lower: &[f64],
+    log_sigma_upper: &[f64], n_theta: usize, n_sigma: usize, maxiter: u32,
+    theta_packs_log_mask: &[bool], mstep_optimizer: MstepOptimizer, tally: Option<&NewtonTally>,
 ) -> WeightedMstep {
     let n = n_theta + n_sigma;
 
@@ -5139,13 +4607,7 @@ fn theta_sigma_weighted_mstep(
 
     let unpack_thetas = |packed: &[f64]| -> Vec<f64> {
         (0..n_theta)
-            .map(|i| {
-                if theta_packs_log_mask[i] {
-                    packed[i].exp()
-                } else {
-                    packed[i]
-                }
-            })
+            .map(|i| if theta_packs_log_mask[i] { packed[i].exp() } else { packed[i] })
             .collect()
     };
 
@@ -5258,22 +4720,12 @@ fn theta_sigma_weighted_mstep(
 /// draws for subject `i`; `pmix[i][c]` is the class responsibility.
 #[allow(clippy::too_many_arguments)]
 fn theta_sigma_weighted_mstep_mixture(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
     draws: &[Vec<crate::estimation::importance_sampling::SubjectDraws>],
-    schedules: &[Option<EventSchedule>],
-    pmix: &[Vec<f64>],
-    log_theta_init: &[f64],
-    log_sigma_init: &[f64],
-    log_theta_lower: &[f64],
-    log_theta_upper: &[f64],
-    log_sigma_lower: &[f64],
-    log_sigma_upper: &[f64],
-    n_theta: usize,
-    n_sigma: usize,
-    maxiter: u32,
-    theta_packs_log_mask: &[bool],
-    mstep_optimizer: MstepOptimizer,
+    schedules: &[Option<EventSchedule>], pmix: &[Vec<f64>], log_theta_init: &[f64],
+    log_sigma_init: &[f64], log_theta_lower: &[f64], log_theta_upper: &[f64],
+    log_sigma_lower: &[f64], log_sigma_upper: &[f64], n_theta: usize, n_sigma: usize, maxiter: u32,
+    theta_packs_log_mask: &[bool], mstep_optimizer: MstepOptimizer,
 ) -> WeightedMstep {
     use crate::parser::model_parser::MixtureClassGuard;
     let n = n_theta + n_sigma;
@@ -5294,13 +4746,7 @@ fn theta_sigma_weighted_mstep_mixture(
 
     let unpack_thetas = |packed: &[f64]| -> Vec<f64> {
         (0..n_theta)
-            .map(|i| {
-                if theta_packs_log_mask[i] {
-                    packed[i].exp()
-                } else {
-                    packed[i]
-                }
-            })
+            .map(|i| if theta_packs_log_mask[i] { packed[i].exp() } else { packed[i] })
             .collect()
     };
 
@@ -5428,10 +4874,7 @@ mod tests {
     #[test]
     fn proposal_recenter_names_its_method_and_both_require_random_effects() {
         assert_eq!(ProposalRecenter::Map.method(), EstimationMethod::Impmap);
-        assert_eq!(
-            ProposalRecenter::SampleMoments.method(),
-            EstimationMethod::Imp
-        );
+        assert_eq!(ProposalRecenter::SampleMoments.method(), EstimationMethod::Imp);
         for r in [ProposalRecenter::Map, ProposalRecenter::SampleMoments] {
             assert!(r.method().requires_random_effects());
         }
@@ -5458,20 +4901,15 @@ mod tests {
         let (max_iter, tol) = (200, 1e-5);
         let mu_k = compute_mu_k(&model, &p.theta, true);
         let sweep = |mode| {
-            let opts = FitOptions {
-                inner_optimizer: mode,
-                ..Default::default()
-            };
+            let opts = FitOptions { inner_optimizer: mode, ..Default::default() };
             crate::api::with_fit_scope(&opts, || {
                 run_map_multistart(&model, &pop, p, max_iter, tol, None, &mu_k, 0, 1, 0).3
             })
             .expect("the scope builds")
         };
         let expected = {
-            let _armed = arm_inner_settings(InnerSettings {
-                mode: InnerOptimizer::NelderMead,
-                warm: false,
-            });
+            let _armed =
+                arm_inner_settings(InnerSettings { mode: InnerOptimizer::NelderMead, warm: false });
             pop.subjects
                 .iter()
                 .filter(|s| find_ebe(&model, s, p, max_iter, tol, None, Some(&mu_k), 0).nm_polished)
@@ -5594,9 +5032,7 @@ mod tests {
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("no class-aware mu-referencing was applied")),
+            !res.warnings.iter().any(|w| w.contains("no class-aware mu-referencing was applied")),
             "class-aware shift should be active, got {:?}",
             res.warnings
         );
@@ -5617,9 +5053,7 @@ mod tests {
         opts.mu_referencing = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
         assert!(
-            res.warnings
-                .iter()
-                .any(|w| w.contains("no class-aware mu-referencing was applied")),
+            res.warnings.iter().any(|w| w.contains("no class-aware mu-referencing was applied")),
             "expected the fallback warning with mu_referencing off, got {:?}",
             res.warnings
         );
@@ -5686,10 +5120,7 @@ mod tests {
                 panic!("expected the identity-pack warning, got {:?}", res.warnings)
             });
         assert!(hit.contains("TVCL"), "TVCL named in the warning: {hit}");
-        assert!(
-            !hit.contains("TVV"),
-            "TVV is log-packed and must not be listed: {hit}"
-        );
+        assert!(!hit.contains("TVV"), "TVV is log-packed and must not be listed: {hit}");
     }
 
     /// The IMP twin of SAEM's `saem_shared_anchor_warning_drops_a_theta_a_group_took_in`:
@@ -5716,9 +5147,7 @@ mod tests {
             res.warnings
         );
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("mu-reference anchor of more than one ETA")),
+            !res.warnings.iter().any(|w| w.contains("mu-reference anchor of more than one ETA")),
             "{:?}",
             res.warnings
         );
@@ -5783,31 +5212,7 @@ mod tests {
     /// and this warning fired (#918).
     #[test]
     fn impmap_mixture_takes_a_class_shared_logit_anchor() {
-        let src = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta LOGIT_F(-0.405465, -10.0, 10.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_F ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 else TVCL2
-  V  = TVV
-  F  = inv_logit(LOGIT_F + ETA_F)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V, f=F)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_7;
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
@@ -5818,16 +5223,12 @@ mod tests {
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("no class-aware mu-referencing was applied")),
+            !res.warnings.iter().any(|w| w.contains("no class-aware mu-referencing was applied")),
             "the logit anchor is an eligible class-shared pair, got {:?}",
             res.warnings
         );
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("packed on the log scale")),
+            !res.warnings.iter().any(|w| w.contains("packed on the log scale")),
             "LOGIT_F is identity-packed; no packing advisory expected, got {:?}",
             res.warnings
         );
@@ -5875,13 +5276,10 @@ mod tests {
         opts.impmap_seed = Some(918);
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
-        let hit = res
-            .warnings
-            .iter()
-            .find(|w| w.contains("packed on the log scale"))
-            .unwrap_or_else(|| {
-                panic!("expected the #918 packing advisory, got {:?}", res.warnings)
-            });
+        let hit =
+            res.warnings.iter().find(|w| w.contains("packed on the log scale")).unwrap_or_else(
+                || panic!("expected the #918 packing advisory, got {:?}", res.warnings),
+            );
         assert!(hit.contains("LOGIT_F"), "LOGIT_F named: {hit}");
     }
 
@@ -5917,9 +5315,7 @@ mod tests {
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("packed on the identity scale")),
+            !res.warnings.iter().any(|w| w.contains("packed on the identity scale")),
             "no identity-pack warning expected, got {:?}",
             res.warnings
         );
@@ -5932,26 +5328,7 @@ mod tests {
     /// it, while the ordinary log-packed lognormal `TVCL` stays unlisted.
     #[test]
     fn imp_log_packed_logit_mu_ref_routes_to_weighted_mstep() {
-        let src = r"
-[parameters]
-  theta TVCL(1.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta LOGIT_F(0.5, 0.0, 5.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_F ~ 0.04
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  F  = inv_logit(LOGIT_F + ETA_F)
-  CL = TVCL * exp(ETA_CL) * F
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_8;
         let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
         assert_eq!(
             model.mu_refs.get("ETA_F").map(|m| m.transform),
@@ -5967,25 +5344,14 @@ mod tests {
         opts.imp_seed = Some(918);
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMP Ok");
-        let hit = res
-            .warnings
-            .iter()
-            .find(|w| w.contains("packed on the log scale"))
-            .unwrap_or_else(|| {
-                panic!("expected the #918 packing advisory, got {:?}", res.warnings)
-            });
+        let hit =
+            res.warnings.iter().find(|w| w.contains("packed on the log scale")).unwrap_or_else(
+                || panic!("expected the #918 packing advisory, got {:?}", res.warnings),
+            );
+        assert!(hit.contains("LOGIT_F"), "LOGIT_F named in the advisory: {hit}");
+        assert!(!hit.contains("TVCL"), "TVCL is a log-packed lognormal, not listed: {hit}");
         assert!(
-            hit.contains("LOGIT_F"),
-            "LOGIT_F named in the advisory: {hit}"
-        );
-        assert!(
-            !hit.contains("TVCL"),
-            "TVCL is a log-packed lognormal, not listed: {hit}"
-        );
-        assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("packed on the identity scale")),
+            !res.warnings.iter().any(|w| w.contains("packed on the identity scale")),
             "no identity-pack advisory for this model, got {:?}",
             res.warnings
         );
@@ -5997,17 +5363,11 @@ mod tests {
     /// iterations. `V = 50`.
     fn covmuref_csv(with_v_eta: bool) -> String {
         let mut s = String::from("ID,TIME,DV,AMT,EVID,CMT,CRCL\n");
-        for (i, crcl) in [40.0_f64, 55.0, 70.0, 85.0, 95.0, 110.0, 125.0, 140.0]
-            .iter()
-            .enumerate()
+        for (i, crcl) in [40.0_f64, 55.0, 70.0, 85.0, 95.0, 110.0, 125.0, 140.0].iter().enumerate()
         {
             let id = i + 1;
             let cl = 5.0 + (crcl - 90.0) * 0.05;
-            let v = if with_v_eta {
-                50.0 * (0.1 * ((id as f64) - 4.5) / 4.5).exp()
-            } else {
-                50.0
-            };
+            let v = if with_v_eta { 50.0 * (0.1 * ((id as f64) - 4.5) / 4.5).exp() } else { 50.0 };
             s.push_str(&format!("{id},0,0,100,1,1,{crcl}\n"));
             for (ti, t) in [1.0_f64, 4.0, 8.0, 16.0, 24.0].iter().enumerate() {
                 let c = 100.0 / v * (-(cl / v) * t).exp();
@@ -6029,24 +5389,7 @@ mod tests {
     /// The #619 additive form with the covariate group as the **only**
     /// eta-bearing parameter (`V` carries no eta), so a closed-form channel
     /// exists if and only if the group is active.
-    const COVMUREF_ONLY_MODEL: &str = r"
-[parameters]
-  theta TVCL(4.0, 0.0, 100.0)
-  theta TH_CRCL(0.02, 0.0, 5.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.01 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const COVMUREF_ONLY_MODEL: &str = crate::test_models::ONE_CPT_IV_9;
 
     /// #619 under IMP: the group's thetas are pinned out of the weighted M-step
     /// and moved by the group step; the "no closed-form mu-referenced
@@ -6074,41 +5417,19 @@ mod tests {
             res.warnings
         );
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("covariate mu-reference on")),
+            !res.warnings.iter().any(|w| w.contains("covariate mu-reference on")),
             "no group should be dropped, got {:?}",
             res.warnings
         );
         let slope = res.theta[1];
-        assert!(
-            slope > 0.02,
-            "TH_CRCL must move from its 0.02 start: {slope}"
-        );
+        assert!(slope > 0.02, "TH_CRCL must move from its 0.02 start: {slope}");
     }
 
     /// [`COVMUREF_ONLY_MODEL`] started where the additive typical value is
     /// negative for the lowest-CRCL subject: `TVCL + (40 − 90)·TH_CRCL =
     /// 4 − 50·0.2 = −6`, so the lognormal `mu` is `NaN` for that subject and
     /// both group engines decline.
-    const COVMUREF_INADMISSIBLE_START: &str = r"
-[parameters]
-  theta TVCL(4.0, 0.0, 100.0)
-  theta TH_CRCL(0.2, 0.0, 5.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.01 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const COVMUREF_INADMISSIBLE_START: &str = crate::test_models::ONE_CPT_IV_10;
 
     /// A group that cannot step must not have its thetas pinned out of the
     /// weighted M-step (#918 review).
@@ -6162,9 +5483,7 @@ mod tests {
             res.theta[1]
         );
         assert!(
-            res.warnings
-                .iter()
-                .any(|w| w.contains("had no admissible step")),
+            res.warnings.iter().any(|w| w.contains("had no admissible step")),
             "the skipped step must be reported, got {:?}",
             res.warnings
         );
@@ -6191,14 +5510,9 @@ mod tests {
             .iter()
             .find(|w| w.contains("class-aware mu-ref shift is disabled"))
             .unwrap_or_else(|| panic!("expected the #406 advisory, got {:?}", res.warnings));
+        assert!(hit.contains("TVCL1") && hit.contains("TVCL2"), "both class anchors listed: {hit}");
         assert!(
-            hit.contains("TVCL1") && hit.contains("TVCL2"),
-            "both class anchors listed: {hit}"
-        );
-        assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("NO associated ETA") && w.contains("TVCL1")),
+            !res.warnings.iter().any(|w| w.contains("NO associated ETA") && w.contains("TVCL1")),
             "class anchors must not be reported as ETA-less, got {:?}",
             res.warnings
         );
@@ -6294,9 +5608,7 @@ mod tests {
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("class-aware mu-ref shift is disabled")),
+            !res.warnings.iter().any(|w| w.contains("class-aware mu-ref shift is disabled")),
             "shift is active — no advisory expected, got {:?}",
             res.warnings
         );
@@ -6344,9 +5656,7 @@ mod tests {
         opts.run_covariance_step = false;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("IMPMAP Ok");
         assert!(
-            res.warnings
-                .iter()
-                .any(|w| w.contains("negligible variance") && w.contains("TVCL1")),
+            res.warnings.iter().any(|w| w.contains("negligible variance") && w.contains("TVCL1")),
             "expected the weak-IIV warning, got {:?}",
             res.warnings
         );
@@ -6533,14 +5843,8 @@ mod tests {
             settling(&CEFEPIME_NORMAL, 2.54, 4288.06, 1.09),
             McemSettling::AboveMarginal { window: 50, .. }
         ));
-        assert_eq!(
-            settling(&THIOGUANINE_NORMAL_S777, 0.69, -249.82, 0.23),
-            McemSettling::Settled
-        );
-        assert_eq!(
-            settling(&CEFEPIME_CHAINED, 2.24, 4277.29, 1.26),
-            McemSettling::Settled
-        );
+        assert_eq!(settling(&THIOGUANINE_NORMAL_S777, 0.69, -249.82, 0.23), McemSettling::Settled);
+        assert_eq!(settling(&CEFEPIME_CHAINED, 2.24, 4277.29, 1.26), McemSettling::Settled);
     }
 
     /// Cefepime's trace alone says nothing, which is why the test sits in `fit()`: its
@@ -6555,25 +5859,16 @@ mod tests {
     fn a_gap_must_clear_both_the_minimum_and_the_noise() {
         // Falling arm. 3.0 is 30 SEs and under the minimum, 5.0 clears both, and with
         // an SE of 2 the 5.0 is under 4 SEs.
-        assert_eq!(
-            two_windows(103.0, 100.0, 0.1).settling(None),
-            McemSettling::Settled
-        );
+        assert_eq!(two_windows(103.0, 100.0, 0.1).settling(None), McemSettling::Settled);
         assert!(matches!(
             two_windows(105.0, 100.0, 0.1).settling(None),
             McemSettling::Falling { .. }
         ));
-        assert_eq!(
-            two_windows(105.0, 100.0, 2.0).settling(None),
-            McemSettling::Settled
-        );
+        assert_eq!(two_windows(105.0, 100.0, 2.0).settling(None), McemSettling::Settled);
         // Marginal arm, the same three cases.
         let flat = |se| two_windows(100.0, 100.0, se);
         assert_eq!(flat(0.1).settling(exact(97.0)), McemSettling::Settled);
-        assert!(matches!(
-            flat(0.1).settling(exact(95.0)),
-            McemSettling::AboveMarginal { .. }
-        ));
+        assert!(matches!(flat(0.1).settling(exact(95.0)), McemSettling::AboveMarginal { .. }));
         assert_eq!(flat(2.0).settling(exact(95.0)), McemSettling::Settled);
     }
 
@@ -6593,17 +5888,12 @@ mod tests {
             }
         );
         assert_eq!(
-            two_windows(100.0, 100.0, 0.5).settling(Some(FinalMarginal {
-                value: 90.0,
-                mc_se: 0.25,
-            })),
+            two_windows(100.0, 100.0, 0.5)
+                .settling(Some(FinalMarginal { value: 90.0, mc_se: 0.25 })),
             McemSettling::AboveMarginal {
                 window: 50,
                 floor: 100.0,
-                marginal: FinalMarginal {
-                    value: 90.0,
-                    mc_se: 0.25,
-                },
+                marginal: FinalMarginal { value: 90.0, mc_se: 0.25 },
                 mc_se: 0.5,
             }
         );
@@ -6613,14 +5903,8 @@ mod tests {
     /// "floor above the marginal": `W_MCEM_OBJECTIVE_ROSE` owns that direction.
     #[test]
     fn settling_is_one_sided() {
-        assert_eq!(
-            two_windows(100.0, 120.0, 0.1).settling(None),
-            McemSettling::Settled
-        );
-        assert_eq!(
-            two_windows(100.0, 100.0, 0.1).settling(exact(120.0)),
-            McemSettling::Settled
-        );
+        assert_eq!(two_windows(100.0, 120.0, 0.1).settling(None), McemSettling::Settled);
+        assert_eq!(two_windows(100.0, 100.0, 0.1).settling(exact(120.0)), McemSettling::Settled);
     }
 
     /// Five of 50 iterations can sit anywhere below the floor without moving it, and any
@@ -6649,18 +5933,9 @@ mod tests {
             ProposalRecenter::SampleMoments.objective_trail(o, vec![0.1; n], "IMP")
         };
         assert_eq!(trail(29).settling(None), McemSettling::TooShort);
-        assert!(matches!(
-            trail(30).settling(None),
-            McemSettling::Falling { window: 10, .. }
-        ));
-        assert!(matches!(
-            trail(90).settling(None),
-            McemSettling::Falling { window: 30, .. }
-        ));
-        assert!(matches!(
-            trail(150).settling(None),
-            McemSettling::Falling { window: 50, .. }
-        ));
+        assert!(matches!(trail(30).settling(None), McemSettling::Falling { window: 10, .. }));
+        assert!(matches!(trail(90).settling(None), McemSettling::Falling { window: 30, .. }));
+        assert!(matches!(trail(150).settling(None), McemSettling::Falling { window: 50, .. }));
         // The window stops growing at 50: both of them now sit in the flat last third.
         assert_eq!(trail(600).settling(None), McemSettling::Settled);
     }
@@ -6705,10 +5980,7 @@ mod tests {
                 column(&mut t)[start..start + 41].fill(poison);
                 assert_eq!(
                     t.settling(None),
-                    McemSettling::Unusable {
-                        window: 50,
-                        usable: expected
-                    },
+                    McemSettling::Unusable { window: 50, usable: expected },
                     "column at {start}"
                 );
             }
@@ -6754,10 +6026,7 @@ mod tests {
             t
         };
         assert_eq!(ramped(6.0).settling(None), McemSettling::Settled);
-        assert!(matches!(
-            ramped(0.1).settling(None),
-            McemSettling::Falling { .. }
-        ));
+        assert!(matches!(ramped(0.1).settling(None), McemSettling::Falling { .. }));
         // The SEs combine, so a gap clearing each alone can fall short of both: 4 · 3 = 12
         // and 4 · 3√2 = 16.97, with no bias between equal SEs.
         let both = |gap: f64| two_windows(100.0 + gap, 100.0, 3.0).settling(None);
@@ -6802,14 +6071,8 @@ mod tests {
             flat(0.1).settling(marginal(80.0, 0.1)),
             McemSettling::AboveMarginal { .. }
         ));
-        assert_eq!(
-            flat(0.1).settling(marginal(80.0, 6.0)),
-            McemSettling::Settled
-        );
-        assert_eq!(
-            flat(1.0).settling(marginal(95.0, 1.0)),
-            McemSettling::Settled
-        );
+        assert_eq!(flat(0.1).settling(marginal(80.0, 6.0)), McemSettling::Settled);
+        assert_eq!(flat(1.0).settling(marginal(95.0, 1.0)), McemSettling::Settled);
         assert!(matches!(
             flat(1.0).settling(marginal(94.0, 1.0)),
             McemSettling::AboveMarginal { .. }
@@ -6819,10 +6082,7 @@ mod tests {
     /// The marginal's SE judges only the marginal: two floors share no such noise.
     #[test]
     fn a_noisy_marginal_does_not_excuse_a_falling_floor() {
-        let noisy = Some(FinalMarginal {
-            value: 100.0,
-            mc_se: 50.0,
-        });
+        let noisy = Some(FinalMarginal { value: 100.0, mc_se: 50.0 });
         assert!(matches!(
             two_windows(120.0, 100.0, 0.1).settling(noisy),
             McemSettling::Falling { .. }
@@ -6926,10 +6186,7 @@ mod tests {
                     // The IOV fixture is inside Newton's scope, so `auto` is `newton`.
                     Newton | Auto => used[0] == 0 && used[1] == 0 && used[2] > 0,
                 };
-                assert!(
-                    ok,
-                    "{stage} {opt:?}: solves by [bobyqa, lbfgs, newton] = {used:?}"
-                );
+                assert!(ok, "{stage} {opt:?}: solves by [bobyqa, lbfgs, newton] = {used:?}");
                 let resolved = if opt == Auto { Newton } else { opt };
                 assert_eq!(
                     res.mstep_optimizer_used.as_deref(),
@@ -6954,19 +6211,11 @@ mod tests {
         opts.run_covariance_step = false;
         let res = run_impmap(&model, &pop, &model.default_params, None, &opts).expect("impmap");
         let trace = res.impmap_trace.as_ref().expect("impmap_trace requested");
-        let rows: Vec<f64> = trace
-            .rows
-            .iter()
-            .filter(|r| r.iteration > 0)
-            .map(|r| r.ofv)
-            .collect();
+        let rows: Vec<f64> = trace.rows.iter().filter(|r| r.iteration > 0).map(|r| r.ofv).collect();
         assert_eq!(rows.len(), 4);
         assert!(rows.iter().all(|v| v.is_finite()), "rows {rows:?}");
         let lowest = rows.iter().copied().fold(f64::INFINITY, f64::min); // nan-ok: asserted finite above
-        assert!(
-            lowest < rows[0],
-            "premise: the objective falls, rows {rows:?}"
-        );
+        assert!(lowest < rows[0], "premise: the objective falls, rows {rows:?}");
         assert_eq!(res.mcem_lowest_objective, Some(lowest));
     }
 
@@ -7040,10 +6289,7 @@ mod tests {
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let fixed = &model.default_params.theta_fixed;
         let flagged = non_fixed_unanchored_thetas(&model, fixed, &[], &[]);
-        assert!(
-            flagged.contains(&"FRAC".to_string()),
-            "FRAC flagged: {flagged:?}"
-        );
+        assert!(flagged.contains(&"FRAC".to_string()), "FRAC flagged: {flagged:?}");
         assert!(!flagged.contains(&"TVCL".to_string()), "TVCL has ETA");
         assert!(!flagged.contains(&"TVV".to_string()), "TVV has ETA");
         assert!(!flagged.contains(&"TVFIX".to_string()), "TVFIX is FIX");
@@ -7071,10 +6317,7 @@ mod tests {
         let ws = imp_unanchored_theta_warnings("IMPMAP", &names(&["TVCL", "LAMBDA"]), &[]);
         assert_eq!(ws.len(), 1, "{ws:?}");
         let w = &ws[0];
-        assert!(
-            w.starts_with("IMPMAP: estimated parameter(s) [TVCL, LAMBDA] "),
-            "{w}"
-        );
+        assert!(w.starts_with("IMPMAP: estimated parameter(s) [TVCL, LAMBDA] "), "{w}");
         for frag in IMP_WITH_ETA_SENTENCES {
             assert!(w.contains(frag), "missing {frag:?} in: {w}");
         }
@@ -7084,28 +6327,16 @@ mod tests {
         let ws = imp_unanchored_theta_warnings("IMP", &[], &names(&["TVKA"]));
         assert_eq!(ws.len(), 1, "{ws:?}");
         let w = &ws[0];
-        assert!(
-            w.starts_with("IMP: estimated parameter(s) [TVKA] have NO associated ETA"),
-            "{w}"
-        );
+        assert!(w.starts_with("IMP: estimated parameter(s) [TVKA] have NO associated ETA"), "{w}");
         assert!(w.contains("STRONGLY add an ETA"), "{w}");
         assert!(!w.contains(IMP_WITH_ETA_SENTENCES[0]), "{w}");
 
         let ws = imp_unanchored_theta_warnings("IMP", &names(&["LAMBDA"]), &names(&["TVKA"]));
         assert_eq!(ws.len(), 2, "{ws:?}");
         let no_eta = ws.iter().find(|w| w.contains("NO associated ETA")).unwrap();
-        let with_eta = ws
-            .iter()
-            .find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0]))
-            .unwrap();
-        assert!(
-            no_eta.contains("[TVKA]") && !no_eta.contains("LAMBDA"),
-            "{no_eta}"
-        );
-        assert!(
-            with_eta.contains("[LAMBDA]") && !with_eta.contains("TVKA"),
-            "{with_eta}"
-        );
+        let with_eta = ws.iter().find(|w| w.contains(IMP_WITH_ETA_SENTENCES[0])).unwrap();
+        assert!(no_eta.contains("[TVKA]") && !no_eta.contains("LAMBDA"), "{no_eta}");
+        assert!(with_eta.contains("[LAMBDA]") && !with_eta.contains("TVKA"), "{with_eta}");
     }
 
     /// The covariate exponent `TH_WT` of the #1415 fixture shape shares `CL` with
@@ -7185,25 +6416,7 @@ mod tests {
     /// argument and nothing else.
     #[test]
     fn mu_ref_anchor_mask_reads_the_resolved_groups_not_the_parsed_ones() {
-        let src = r"
-[parameters]
-  theta TVCL(150.0, 0.0, 1000.0)
-  theta TH_CRCL(2.0, 0.0, 50.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  omega ETA_CL ~ 0.2
-  omega ETA_V ~ 0.1
-  sigma EPS ~ 0.04 FIX
-
-[individual_parameters]
-  CL = (TVCL + (CRCL - 90.0) * TH_CRCL) * exp(ETA_CL)
-  V  = TVV * exp(ETA_V)
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        let src = crate::test_models::ONE_CPT_IV_19;
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         assert_eq!(
             model.covariate_mu_refs.len(),
@@ -7266,25 +6479,13 @@ mod tests {
         // The samples moved with the moments: the shifted mean is still the
         // weighted mean of the shifted samples.
         for (k, (got, was)) in d.etas.iter().zip(&etas).enumerate() {
-            assert!(
-                (got[0] - (was[0] - 0.35)).abs() < 1e-15,
-                "sample {k} η₀ = {}",
-                got[0]
-            );
+            assert!((got[0] - (was[0] - 0.35)).abs() < 1e-15, "sample {k} η₀ = {}", got[0]);
             assert_eq!(got[1], was[1], "sample {k}: an unshifted η keeps its value");
         }
         assert_eq!(d.weights, weights, "weights are unchanged");
         let wmean: f64 = d.etas.iter().zip(&d.weights).map(|(e, w)| w * e[0]).sum();
-        assert!(
-            (wmean - d.mean[0]).abs() < 1e-15,
-            "{wmean} vs {}",
-            d.mean[0]
-        );
-        assert!(
-            (d.mean[0] - (mean[0] - 0.35)).abs() < 1e-15,
-            "mean[0] = {}",
-            d.mean[0]
-        );
+        assert!((wmean - d.mean[0]).abs() < 1e-15, "{wmean} vs {}", d.mean[0]);
+        assert!((d.mean[0] - (mean[0] - 0.35)).abs() < 1e-15, "mean[0] = {}", d.mean[0]);
         assert_eq!(d.mean[1], mean[1], "an unshifted η keeps its mean");
         let m_new = DVector::from_column_slice(&d.mean);
         let cov_new = &d.second_moment - &m_new * m_new.transpose();
@@ -7325,10 +6526,7 @@ mod tests {
         let cov = DMatrix::from_row_slice(2, 2, &[0.0, 0.0, 0.0, 0.2]);
         let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[1.0, 1.0]));
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
-        assert!(
-            h.iter().all(|v| v.is_finite()),
-            "floored result must be finite"
-        );
+        assert!(h.iter().all(|v| v.is_finite()), "floored result must be finite");
         let expected = 1.0 / IMP_PROPOSAL_COV_FLOOR;
         assert!(
             (h[(0, 0)] - expected).abs() / expected < 1e-9,
@@ -7350,9 +6548,7 @@ mod tests {
         let cov = DMatrix::from_row_slice(2, 2, &[0.0362, -0.0335, -0.0335, 0.0322]);
         let omega = DMatrix::from_diagonal(&DVector::from_row_slice(&[0.034, 0.031]));
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
-        let capped = h
-            .try_inverse()
-            .expect("capped covariance must stay invertible");
+        let capped = h.try_inverse().expect("capped covariance must stay invertible");
         assert!((capped[(0, 0)] - 0.034).abs() < 1e-12);
         assert!((capped[(1, 1)] - 0.031).abs() < 1e-12);
         assert!(
@@ -7403,10 +6599,7 @@ mod tests {
         let omega = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 4.0]);
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
         let want = omega.clone().try_inverse().expect("Ω is invertible");
-        assert!(
-            (&h - &want).abs().max() < 1e-12,
-            "got {h}, want Ω⁻¹ = {want}"
-        );
+        assert!((&h - &want).abs().max() < 1e-12, "got {h}, want Ω⁻¹ = {want}");
     }
 
     #[test]
@@ -7426,37 +6619,12 @@ mod tests {
         let cov = DMatrix::from_row_slice(2, 2, &[1.0, 5.0, 5.0, 1.0]);
         let omega = DMatrix::from_row_slice(2, 2, &[1.0, 2.0, 2.0, 1.0]);
         let h = covariance_to_proposal_hessian(&cov, &omega, IMP_PROPOSAL_COV_FLOOR);
-        assert!(
-            h.iter().all(|&v| v == 0.0),
-            "a non-PD Ω must yield the zero matrix, got {h}"
-        );
+        assert!(h.iter().all(|&v| v == 0.0), "a non-PD Ω must yield the zero matrix, got {h}");
     }
 
     // ── Estimating IMP/IMPMAP under a mixture (#985) ──
 
-    const MIX_MODEL: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+    const MIX_MODEL: &str = crate::test_models::ONE_CPT_IV_5;
 
     fn mix_pop() -> Population {
         use std::io::Write;
@@ -7514,30 +6682,7 @@ mod tests {
     /// Estimating IMP/IMPMAP rejects a mixture with per-class Ω/Σ overrides.
     #[test]
     fn estimating_imp_rejects_per_class_overrides() {
-        const OV: &str = r"
-[parameters]
-  theta TVCL1(1.0, 0.01, 100.0)
-  theta TVCL2(3.0, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09
-  sigma EPS ~ 0.04
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL
-  omega(2) ETA_CL ~ 0.15
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+        const OV: &str = crate::test_models::ONE_CPT_IV_6;
         let model = crate::parser::model_parser::parse_model_string(OV).unwrap();
         let pop = mix_pop();
         let opts = FitOptions::default();
@@ -7545,10 +6690,7 @@ mod tests {
             Ok(_) => panic!("per-class overrides must be rejected"),
             Err(e) => e,
         };
-        assert!(
-            err.contains("per-class Omega/Sigma overrides"),
-            "got: {err}"
-        );
+        assert!(err.contains("per-class Omega/Sigma overrides"), "got: {err}");
     }
     /// A theta that drives both the mixing expression and a structural typical
     /// value is rejected up front: the weighted θ/σ M-step would fit it from the
@@ -7838,12 +6980,9 @@ mod tests {
     #[test]
     fn sobol_config_guard_counts_the_coordinates_each_form_uses() {
         let inf = f64::INFINITY;
-        for (t, mix, n_ok) in [
-            (false, false, 1000),
-            (true, false, 999),
-            (false, true, 999),
-            (true, true, 998),
-        ] {
+        for (t, mix, n_ok) in
+            [(false, false, 1000), (true, false, 999), (false, true, 999), (true, true, 998)]
+        {
             let nu = if t { 4.0 } else { inf };
             let tag = format!("t={t} mixture={mix}");
             assert!(
@@ -7866,10 +7005,7 @@ mod tests {
         assert!(check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max, false).is_ok());
         let e =
             check_sobol_config("IMP", "imp_proposal_df", 3, true, nu_max * 2.0, false).unwrap_err();
-        assert!(
-            e.contains("imp_proposal_df = normal") && e.contains("2000"),
-            "{e}"
-        );
+        assert!(e.contains("imp_proposal_df = normal") && e.contains("2000"), "{e}");
         assert!(check_sobol_config("IMP", "imp_proposal_df", 3, false, 1e9, false).is_ok());
     }
 
@@ -7903,12 +7039,7 @@ mod tests {
         let pmix: Vec<Vec<f64>> = pop.subjects.iter().map(|_| vec![0.5, 0.5]).collect();
 
         let log_theta: Vec<f64> = params.theta.iter().map(|&t| t.max(1e-10).ln()).collect();
-        let log_sigma: Vec<f64> = params
-            .sigma
-            .values
-            .iter()
-            .map(|&s| s.max(1e-10).ln())
-            .collect();
+        let log_sigma: Vec<f64> = params.sigma.values.iter().map(|&s| s.max(1e-10).ln()).collect();
         let mask = vec![true; n_theta];
         let mut lower = vec![-10.0; n_theta];
         let mut upper = vec![10.0; n_theta];
@@ -7954,12 +7085,8 @@ mod tests {
     }
 
     fn iov_pop() -> Population {
-        crate::read_nonmem_csv(
-            std::path::Path::new("data/warfarin_iov.csv"),
-            None,
-            Some("OCC"),
-        )
-        .expect("warfarin_iov.csv reads")
+        crate::read_nonmem_csv(std::path::Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+            .expect("warfarin_iov.csv reads")
     }
 
     /// A draw set carrying only the given stacked second moment (the Ω_iov
@@ -8121,14 +7248,8 @@ mod tests {
             weighted_mstep_objective(&model, &pop, &draws_with(0.3), &no_schedules, theta, sigma);
         let zero =
             weighted_mstep_objective(&model, &pop, &draws_with(0.0), &no_schedules, theta, sigma);
-        assert!(
-            live.is_finite() && live < 1e19,
-            "objective must be real: {live}"
-        );
-        assert!(
-            zero.is_finite() && zero < 1e19,
-            "objective must be real: {zero}"
-        );
+        assert!(live.is_finite() && live < 1e19, "objective must be real: {live}");
+        assert!(zero.is_finite() && zero < 1e19, "objective must be real: {zero}");
         assert!(
             (live - zero).abs() > 1e-2,
             "κ must enter the M-step objective: {live} vs {zero} at κ = 0"
@@ -8184,16 +7305,11 @@ mod tests {
     #[test]
     fn iov_with_vanishing_omega_iov_matches_the_eta_only_fit() {
         let src = include_str!("../../examples/warfarin_iov.ferx");
-        let parse = |s: &str| {
-            crate::parser::model_parser::parse_full_model(s)
-                .expect("parses")
-                .model
-        };
+        let parse =
+            |s: &str| crate::parser::model_parser::parse_full_model(s).expect("parses").model;
         let degenerate = parse(&src.replace("kappa KAPPA_CL ~ 0.01", "kappa KAPPA_CL ~ 1e-8 FIX"));
-        let eta_only = parse(
-            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
-                .replace(" + KAPPA_CL", ""),
-        );
+        let eta_only =
+            parse(&src.replace("  kappa KAPPA_CL ~ 0.01\n", "").replace(" + KAPPA_CL", ""));
         assert_eq!(degenerate.n_kappa, 1);
         assert_eq!(eta_only.n_kappa, 0);
         let pop = iov_pop();
@@ -8252,9 +7368,7 @@ mod tests {
     /// samples around the EBEs found there — the separate estimator the IMPMAP
     /// trace is checked against below.
     fn joint_is_at(
-        model: &CompiledModel,
-        pop: &Population,
-        params: &ModelParameters,
+        model: &CompiledModel, pop: &Population, params: &ModelParameters,
     ) -> ImportanceSamplingResult {
         // Adapting routes through the E-step's own draw code; this check needs
         // `subject_is_estimate_joint`, the separate estimator.
@@ -8262,10 +7376,7 @@ mod tests {
     }
 
     fn joint_is_with(
-        model: &CompiledModel,
-        pop: &Population,
-        params: &ModelParameters,
-        passes: usize,
+        model: &CompiledModel, pop: &Population, params: &ModelParameters, passes: usize,
         alpha: f64,
     ) -> ImportanceSamplingResult {
         let mut opts = FitOptions::default();
@@ -8301,9 +7412,7 @@ mod tests {
     /// `run_importance_sampling` at `params` with 2000 samples around the EBEs
     /// found there, after `tweak` has adjusted the evaluator's options.
     fn is_at_with(
-        model: &CompiledModel,
-        pop: &Population,
-        params: &ModelParameters,
+        model: &CompiledModel, pop: &Population, params: &ModelParameters,
         tweak: impl Fn(&mut FitOptions),
     ) -> ImportanceSamplingResult {
         let mut opts = FitOptions::default();
@@ -8344,9 +7453,7 @@ mod tests {
         let src = include_str!("../../examples/warfarin_iov.ferx")
             .replace("  kappa KAPPA_CL ~ 0.01\n", "")
             .replace(" + KAPPA_CL", "");
-        let model = crate::parser::model_parser::parse_full_model(&src)
-            .expect("parses")
-            .model;
+        let model = crate::parser::model_parser::parse_full_model(&src).expect("parses").model;
         assert_eq!(model.n_kappa, 0, "the κ edit must take");
         model
     }
@@ -8472,22 +7579,15 @@ mod tests {
 
         let res = run_impmap(&model, &pop, &params, None, &opts).expect("impmap on an IOV model");
         let trace = res.impmap_trace.as_ref().expect("impmap_trace requested");
-        let row = trace
-            .rows
-            .iter()
-            .find(|r| r.iteration == 1)
-            .expect("iteration 1 row");
+        let row = trace.rows.iter().find(|r| r.iteration == 1).expect("iteration 1 row");
         assert!(row.ofv.is_finite(), "trace ofv {}", row.ofv);
 
         let is = joint_is_at(&model, &pop, &params);
         assert!(is.minus2_log_likelihood.is_finite());
 
         let iov = params.omega_iov.as_ref().expect("IOV model");
-        let n_occ_total: usize = pop
-            .subjects
-            .iter()
-            .map(crate::stats::stacked_layout::group_count)
-            .sum();
+        let n_occ_total: usize =
+            pop.subjects.iter().map(crate::stats::stacked_layout::group_count).sum();
         let m1_shift = n_occ_total as f64 * iov.log_det.abs();
         let gap = (row.ofv - is.minus2_log_likelihood).abs();
         eprintln!(
@@ -8496,16 +7596,8 @@ mod tests {
         );
         // Measured (macOS arm64, 2000 samples each): gap 0.029 against an IS MC SE
         // of 0.10; dropping the κ log-det moves the trace by 92. 0.5 is ~5 MC SE.
-        assert!(
-            gap < 0.5,
-            "trace {} vs IS {}: gap {gap}",
-            row.ofv,
-            is.minus2_log_likelihood
-        );
-        assert!(
-            m1_shift > 10.0,
-            "the fixture must make the κ log-det term visible"
-        );
+        assert!(gap < 0.5, "trace {} vs IS {}: gap {gap}", row.ofv, is.minus2_log_likelihood);
+        assert!(m1_shift > 10.0, "the fixture must make the κ log-det term visible");
     }
 
     #[test]
@@ -8528,16 +7620,11 @@ mod tests {
     #[test]
     fn imp_sample_count_warning_counts_the_stacked_kappa_dimensions() {
         let src = include_str!("../../examples/warfarin_iov.ferx");
-        let parse = |s: &str| {
-            crate::parser::model_parser::parse_full_model(s)
-                .expect("parses")
-                .model
-        };
+        let parse =
+            |s: &str| crate::parser::model_parser::parse_full_model(s).expect("parses").model;
         let iov = parse(src);
-        let eta_only = parse(
-            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
-                .replace(" + KAPPA_CL", ""),
-        );
+        let eta_only =
+            parse(&src.replace("  kappa KAPPA_CL ~ 0.01\n", "").replace(" + KAPPA_CL", ""));
         let pop = iov_pop();
         let mut opts = FitOptions::default();
         opts.impmap_iterations = 2;
@@ -8550,9 +7637,7 @@ mod tests {
         let sample_warning = |model: &CompiledModel| -> Option<String> {
             let res =
                 run_impmap(model, &pop, &model.default_params, None, &opts).expect("impmap runs");
-            res.warnings
-                .into_iter()
-                .find(|w| w.contains("importance samples for"))
+            res.warnings.into_iter().find(|w| w.contains("importance samples for"))
         };
         let w =
             sample_warning(&iov).expect("an IOV fit at K = 400 is under-sampled for 5 dimensions");
@@ -8560,11 +7645,7 @@ mod tests {
             w.contains("400 importance samples for a 3-ETA model with 1 κ on each of up to 2 occasions (5 sampled dimensions per subject)"),
             "{w}"
         );
-        assert_eq!(
-            sample_warning(&eta_only),
-            None,
-            "3 dimensions at K = 400 is enough"
-        );
+        assert_eq!(sample_warning(&eta_only), None, "3 dimensions at K = 400 is enough");
     }
 
     /// An `mceta` random start for an IOV subject covers κ (#2301): it is the
@@ -8599,10 +7680,7 @@ mod tests {
         let want = [0.09, 0.04, 0.25, 0.25, 0.25];
         for (k, (got, w)) in var.iter().zip(want).enumerate() {
             // 20 000 draws: relative SE of a variance is sqrt(2/n) = 1%; 5% bound.
-            assert!(
-                (got / w - 1.0).abs() < 0.05,
-                "coordinate {k}: var {got} vs {w}"
-            );
+            assert!((got / w - 1.0).abs() < 0.05, "coordinate {k}: var {got} vs {w}");
         }
     }
 
@@ -8617,15 +7695,11 @@ mod tests {
         let l = kappa_start_chol(&model, subject, params, 3).expect("IOV subject, mceta = 3");
         let var = params.omega_iov.as_ref().unwrap().matrix[(0, 0)];
         assert!((l[(0, 0)] * l[(0, 0)] - var).abs() < 1e-15);
-        assert!(
-            kappa_start_chol(&model, subject, params, 0).is_none(),
-            "no restarts"
-        );
+        assert!(kappa_start_chol(&model, subject, params, 0).is_none(), "no restarts");
 
         let src = include_str!("../../examples/warfarin_iov.ferx");
         let eta_only = crate::parser::model_parser::parse_full_model(
-            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "")
-                .replace(" + KAPPA_CL", ""),
+            &src.replace("  kappa KAPPA_CL ~ 0.01\n", "").replace(" + KAPPA_CL", ""),
         )
         .expect("parses")
         .model;
@@ -8658,12 +7732,7 @@ mod tests {
                 7,
             );
             assert!(base.nll.is_finite() && multi.nll.is_finite());
-            assert!(
-                multi.nll <= base.nll + 1e-12,
-                "{} vs {}",
-                multi.nll,
-                base.nll
-            );
+            assert!(multi.nll <= base.nll + 1e-12, "{} vs {}", multi.nll, base.nll);
             assert_eq!(multi.kappas.len(), n_occ, "subject {}", subject.id);
         }
     }
@@ -8699,10 +7768,7 @@ mod tests {
                 largest = largest.max(k.abs());
             }
         }
-        assert!(
-            largest > 0.005,
-            "no restart carried a drawn κ: max |κ̂| = {largest}"
-        );
+        assert!(largest > 0.005, "no restart carried a drawn κ: max |κ̂| = {largest}");
     }
 
     /// The per-K cache holds exactly what each IOV subject built for itself
@@ -8724,11 +7790,7 @@ mod tests {
         assert_eq!(priors.0.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
         for k in [1usize, 2, 3] {
             let p = priors.get(k);
-            assert_eq!(
-                p.inv,
-                build_joint_omega_inv(&omega.inv, &iov.inv, 2, 1, k),
-                "K = {k}"
-            );
+            assert_eq!(p.inv, build_joint_omega_inv(&omega.inv, &iov.inv, 2, 1, k), "K = {k}");
             assert_eq!(p.log_det, omega.log_det + k as f64 * iov.log_det, "K = {k}");
             assert_eq!(
                 p.matrix,
@@ -8736,10 +7798,7 @@ mod tests {
                 "K = {k}"
             );
             assert_eq!(p.inv.nrows(), 2 + k, "K = {k}");
-            assert!(
-                p.mixture.is_some(),
-                "α = 0.1 builds the defensive component"
-            );
+            assert!(p.mixture.is_some(), "α = 0.1 builds the defensive component");
         }
     }
 
@@ -8780,10 +7839,8 @@ mod tests {
             subjects.push(s.clone());
             subjects.push(narrow);
         }
-        let widths: Vec<usize> = subjects
-            .iter()
-            .map(crate::stats::stacked_layout::group_count)
-            .collect();
+        let widths: Vec<usize> =
+            subjects.iter().map(crate::stats::stacked_layout::group_count).collect();
         assert!(
             widths.windows(2).any(|w| w[0] > w[1]),
             "the fixture must score a narrower subject after a wider one: {widths:?}"
@@ -8796,12 +7853,7 @@ mod tests {
             );
             let got = draw_obs_nll(&model, subject, theta, sigma, &b, None, &mut scratch);
             assert!(got.is_finite());
-            assert_eq!(
-                got,
-                fresh(subject, &b, &mut scratch),
-                "subject {} (call {n})",
-                subject.id
-            );
+            assert_eq!(got, fresh(subject, &b, &mut scratch), "subject {} (call {n})", subject.id);
         }
     }
 
@@ -8811,10 +7863,7 @@ mod tests {
     #[test]
     fn split_kappas_refills_the_reused_blocks_and_counts_only_this_sample() {
         let mut buf = Vec::new();
-        assert_eq!(
-            split_kappas(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, &mut buf),
-            3
-        );
+        assert_eq!(split_kappas(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, &mut buf), 3);
         assert_eq!(buf, vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]]);
         assert_eq!(split_kappas(&[7.0, 8.0], 2, &mut buf), 1);
         assert_eq!(buf[..1], [vec![7.0, 8.0]]);
@@ -8835,9 +7884,7 @@ mod tests {
     fn objective_settled_compares_the_last_two_windows_to_the_mc_se() {
         // Thioguanine's iterations 1-10: a descent of hundreds against a total SE
         // near 2.8 (0.5 per subject, 31 subjects).
-        let cold = [
-            65.7, -86.8, -145.2, -177.6, -212.4, -231.0, -240.0, -245.0, -247.0, -248.4,
-        ];
+        let cold = [65.7, -86.8, -145.2, -177.6, -212.4, -231.0, -240.0, -245.0, -247.0, -248.4];
         assert!(!objective_settled(&cold, 2.8));
         // Only the last 2w iterations count: the same descent followed by a plateau.
         let mut settled = cold.to_vec();
@@ -8873,23 +7920,11 @@ mod tests {
     #[test]
     fn windowed_se_takes_the_median_over_the_window() {
         // A spike in either direction does not move it.
-        let spike = [
-            (0.05, 1000),
-            (0.05, 1000),
-            (0.5, 1000),
-            (0.05, 1000),
-            (0.001, 1000),
-        ];
+        let spike = [(0.05, 1000), (0.05, 1000), (0.5, 1000), (0.05, 1000), (0.001, 1000)];
         assert!((windowed_se(&spike, 1000) - 0.05).abs() < 1e-12);
         // Only the last window counts.
-        let old = [
-            (9.0, 1000),
-            (0.05, 1000),
-            (0.05, 1000),
-            (0.05, 1000),
-            (0.05, 1000),
-            (0.05, 1000),
-        ];
+        let old =
+            [(9.0, 1000), (0.05, 1000), (0.05, 1000), (0.05, 1000), (0.05, 1000), (0.05, 1000)];
         assert!((windowed_se(&old, 1000) - 0.05).abs() < 1e-12);
         // A short history still answers, and an empty one reads as no signal.
         assert!((windowed_se(&[(0.2, 100)], 100) - 0.2).abs() < 1e-12);
@@ -8900,13 +7935,7 @@ mod tests {
     fn windowed_se_rescales_across_a_change_of_k() {
         // The same per-draw variance, sampled at K and then 4K: the SE halves, and
         // the window reads one value at each count.
-        let h = [
-            (0.2, 1000),
-            (0.2, 1000),
-            (0.1, 4000),
-            (0.1, 4000),
-            (0.1, 4000),
-        ];
+        let h = [(0.2, 1000), (0.2, 1000), (0.1, 4000), (0.1, 4000), (0.1, 4000)];
         assert!((windowed_se(&h, 4000) - 0.1).abs() < 1e-12);
         assert!((windowed_se(&h, 1000) - 0.2).abs() < 1e-12);
     }
@@ -9049,10 +8078,7 @@ mod tests {
         let (without, n_without) = ramp_se_per_subject(&fracs, k, &stuck);
         assert_eq!(n_without, 100);
         // Each healthy term is (1/0.8 − 1)/1000 = 2.5e-4, so the SE is 2·√2.5e-4.
-        assert!(
-            (without - 2.0 * (2.5e-4f64).sqrt()).abs() < 1e-12,
-            "{without}"
-        );
+        assert!((without - 2.0 * (2.5e-4f64).sqrt()).abs() < 1e-12, "{without}");
         assert!(without < AUTO_STDOBJ_TARGET && with > AUTO_STDOBJ_TARGET);
         // With every subject left out there is nothing to raise for.
         assert_eq!(ramp_se_per_subject(&fracs, k, &[true; 101]), (0.0, 0));
@@ -9095,10 +8121,7 @@ mod tests {
         // Doubling and the cap both still bound the step.
         assert_eq!(next_sample_count(4000, 1000, 0.09, true), 8000);
         assert_eq!(next_sample_count(8000, 1000, 0.09, true), AUTO_SAMPLES_MAX);
-        assert_eq!(
-            next_sample_count(AUTO_SAMPLES_MAX, 1000, 0.09, true),
-            AUTO_SAMPLES_MAX
-        );
+        assert_eq!(next_sample_count(AUTO_SAMPLES_MAX, 1000, 0.09, true), AUTO_SAMPLES_MAX);
         // A configured count above the cap is the user's, and `auto` keeps it.
         assert_eq!(next_sample_count(20_000, 20_000, 0.09, true), 20_000);
     }
@@ -9181,10 +8204,7 @@ mod tests {
         let s = collapse_sentence(3);
         assert!(s.contains("3 subject(s)") && s.contains("ESS < 2"), "{s}");
         assert!(s.contains("at this sample count"), "{s}");
-        assert!(
-            !s.contains("regardless") && !s.contains("not more samples"),
-            "{s}"
-        );
+        assert!(!s.contains("regardless") && !s.contains("not more samples"), "{s}");
     }
 
     /// `n` iterations at `k` with a constant `SE²·K` of `scale`.
@@ -9320,15 +8340,8 @@ mod tests {
         let mut scratch = EventPkParams::default();
         for (subject, schedule) in pop.subjects.iter().zip(&schedules) {
             let eta = [0.2, -0.1];
-            let cached = draw_obs_nll(
-                &model,
-                subject,
-                theta,
-                sigma,
-                &eta,
-                schedule.as_ref(),
-                &mut scratch,
-            );
+            let cached =
+                draw_obs_nll(&model, subject, theta, sigma, &eta, schedule.as_ref(), &mut scratch);
             let rebuilt = draw_obs_nll(&model, subject, theta, sigma, &eta, None, &mut scratch);
             assert!(cached.is_finite());
             assert_eq!(cached.to_bits(), rebuilt.to_bits());
@@ -9346,11 +8359,7 @@ mod tests {
     /// schedule it was handed cannot agree with one that does.
     fn foreign_schedule(model: &CompiledModel, subject: &Subject, iov: bool) -> EventSchedule {
         let mut other = subject.clone();
-        for t in other
-            .obs_times
-            .iter_mut()
-            .chain(other.obs_raw_times.iter_mut())
-        {
+        for t in other.obs_times.iter_mut().chain(other.obs_raw_times.iter_mut()) {
             *t *= 1.5;
         }
         let built = if iov {
@@ -9380,24 +8389,14 @@ mod tests {
             let sigma = &model.default_params.sigma.values;
             let (n_theta, n_sigma) = (theta.len(), sigma.len());
             let mask = vec![true; n_theta];
-            let (lower, upper) = (
-                vec![-1e30; n_theta + n_sigma],
-                vec![1e30; n_theta + n_sigma],
-            );
+            let (lower, upper) = (vec![-1e30; n_theta + n_sigma], vec![1e30; n_theta + n_sigma]);
             let n_eta = model.n_eta;
             // The stacked draw: η, then κ for each occasion (none off IOV).
-            let n_occ = if is_iov {
-                crate::stats::stacked_layout::group_count(subject)
-            } else {
-                0
-            };
-            let b: Vec<f64> = (0..n_eta + n_occ * model.n_kappa)
-                .map(|i| 0.1 - 0.05 * i as f64)
-                .collect();
-            let kappas: Vec<Vec<f64>> = b[n_eta..]
-                .chunks(model.n_kappa.max(1))
-                .map(<[f64]>::to_vec)
-                .collect();
+            let n_occ = if is_iov { crate::stats::stacked_layout::group_count(subject) } else { 0 };
+            let b: Vec<f64> =
+                (0..n_eta + n_occ * model.n_kappa).map(|i| 0.1 - 0.05 * i as f64).collect();
+            let kappas: Vec<Vec<f64>> =
+                b[n_eta..].chunks(model.n_kappa.max(1)).map(<[f64]>::to_vec).collect();
             let mut scratch = EventPkParams::default();
             let predict = |schedule: Option<&EventSchedule>, scratch: &mut EventPkParams| {
                 if is_iov {
@@ -9471,11 +8470,8 @@ mod tests {
     #[test]
     fn the_weighted_score_predicts_with_the_cached_schedules() {
         let (model, pop) = tv_fixture();
-        let schedules: Vec<Option<EventSchedule>> = pop
-            .subjects
-            .iter()
-            .map(|s| Some(foreign_schedule(&model, s, false)))
-            .collect();
+        let schedules: Vec<Option<EventSchedule>> =
+            pop.subjects.iter().map(|s| Some(foreign_schedule(&model, s, false))).collect();
         let none: Vec<Option<EventSchedule>> = vec![None; pop.subjects.len()];
         let draws: Vec<SubjectDraws> = pop
             .subjects
@@ -9491,10 +8487,7 @@ mod tests {
         let sigma = model.default_params.sigma.values.clone();
         let (n_theta, n_sigma) = (theta.len(), sigma.len());
         let mask = vec![true; n_theta];
-        let (lower, upper) = (
-            vec![-1e30; n_theta + n_sigma],
-            vec![1e30; n_theta + n_sigma],
-        );
+        let (lower, upper) = (vec![-1e30; n_theta + n_sigma], vec![1e30; n_theta + n_sigma]);
         let score = |sched: &[Option<EventSchedule>]| {
             weighted_mstep_score(
                 &model, &pop, &draws, sched, &theta, &sigma, &mask, &lower, &upper, n_theta,
@@ -9545,18 +8538,12 @@ mod tests {
         let sigma = model.default_params.sigma.values.clone();
         let (n_theta, n_sigma) = (theta.len(), sigma.len());
         let mask = vec![true; n_theta];
-        let (lower, upper) = (
-            vec![-1e30; n_theta + n_sigma],
-            vec![1e30; n_theta + n_sigma],
-        );
+        let (lower, upper) = (vec![-1e30; n_theta + n_sigma], vec![1e30; n_theta + n_sigma]);
         let none: Vec<Option<EventSchedule>> = vec![None; pop.subjects.len()];
         let one: Vec<Option<EventSchedule>> =
             vec![Some(foreign_schedule(&model, &pop.subjects[0], false))];
-        for (label, sched) in [
-            ("empty", &[][..]),
-            ("short", &one[..]),
-            ("full of None", &none[..]),
-        ] {
+        for (label, sched) in [("empty", &[][..]), ("short", &one[..]), ("full of None", &none[..])]
+        {
             let value = weighted_mstep_objective(&model, &pop, &draws, sched, &theta, &sigma);
             let score = weighted_mstep_score(
                 &model, &pop, &draws, sched, &theta, &sigma, &mask, &lower, &upper, n_theta,
@@ -9631,10 +8618,7 @@ mod tests {
         let (lower, upper) = (vec![-1e30; 3], vec![1e30; 3]);
         let none: Vec<Option<EventSchedule>> = vec![None; pop.subjects.len()];
         let memo = PredMemo::for_solve(draws.iter().map(|d| d.etas.len()), true, true).unwrap();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
         let out = pool.install(|| {
             weighted_mstep_score(
                 &model,
@@ -9654,11 +8638,7 @@ mod tests {
         });
         assert!(out.is_none(), "a declined subject declines the pass");
         let scored: Vec<usize> = (0..4).map(|i| memo.scored(i)).collect();
-        assert_eq!(
-            scored,
-            [1, 0, 0, 0],
-            "only the first draw of the first subject"
-        );
+        assert_eq!(scored, [1, 0, 0, 0], "only the first draw of the first subject");
         // Control: in scope, the same pass scores every draw of every subject.
         let in_scope = crate::parser::model_parser::parse_model_string(src).unwrap();
         let memo = PredMemo::for_solve(draws.iter().map(|d| d.etas.len()), true, true).unwrap();
@@ -9680,10 +8660,7 @@ mod tests {
             )
         });
         assert!(out.is_some(), "premise: the information is there in scope");
-        assert_eq!(
-            (0..4).map(|i| memo.scored(i)).collect::<Vec<_>>(),
-            [5, 5, 5, 5]
-        );
+        assert_eq!((0..4).map(|i| memo.scored(i)).collect::<Vec<_>>(), [5, 5, 5, 5]);
     }
 
     /// A Newton solve that loses its information at run time falls back to `bobyqa`, and the
@@ -9713,18 +8690,10 @@ mod tests {
             .iter()
             .find(|w| w.contains("lost the expected information"))
             .unwrap_or_else(|| panic!("{declined:?}"));
-        assert!(
-            w.starts_with("IMPMAP:") && w.contains("numerical M-steps to `bobyqa`"),
-            "{w}"
-        );
+        assert!(w.starts_with("IMPMAP:") && w.contains("numerical M-steps to `bobyqa`"), "{w}");
         assert!(!w.contains("no admissible"), "{w}");
         let clean = run(None);
-        assert!(
-            !clean
-                .iter()
-                .any(|w| w.contains("lost the expected information")),
-            "{clean:?}"
-        );
+        assert!(!clean.iter().any(|w| w.contains("lost the expected information")), "{clean:?}");
     }
 
     #[test]
@@ -9750,10 +8719,7 @@ mod tests {
         use crate::pk::event_driven::{reset_schedule_build_count, schedule_build_count};
         let (model, pop) = tv_fixture();
         let count = |iterations: usize| -> u64 {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(1)
-                .build()
-                .unwrap();
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
             pool.install(|| {
                 // Each count from an empty plan cache: the second run would otherwise reuse
                 // the first's recordings (the same model and subjects) and build fewer.
@@ -9802,10 +8768,7 @@ mod tests {
     #[test]
     fn imp_max_time_stops_cleanly_and_reports_not_converged() {
         let (model, pop) = tv_fixture();
-        let opts = FitOptions {
-            imp_max_time: Some(1e-9),
-            ..tv_imp_options(5)
-        };
+        let opts = FitOptions { imp_max_time: Some(1e-9), ..tv_imp_options(5) };
         let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
         assert_eq!(res.n_iterations, 1);
         assert!(!res.converged);
@@ -9841,9 +8804,7 @@ mod tests {
             assert!(!res.converged, "{methods:?}");
             assert!(res.ofv.is_finite(), "{methods:?}");
             assert!(
-                res.warnings
-                    .iter()
-                    .any(|w| w.contains("stopped by `imp_max_time`")),
+                res.warnings.iter().any(|w| w.contains("stopped by `imp_max_time`")),
                 "{methods:?}: {:?}",
                 res.warnings
             );
@@ -9860,16 +8821,13 @@ mod tests {
     #[test]
     fn imp_max_time_reports_the_averaged_estimate_inside_the_window() {
         let (model, pop) = tv_fixture();
-        let opts = FitOptions {
-            imp_max_time: Some(1e-9),
-            imp_averaging: 3,
-            ..tv_imp_options(3)
-        };
+        let opts = FitOptions { imp_max_time: Some(1e-9), imp_averaging: 3, ..tv_imp_options(3) };
         let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
         assert!(
-            res.warnings.iter().any(|w| w
-                .contains("the mean of the 1 averaging iteration(s) reached")
-                && !w.contains("unaveraged")),
+            res.warnings
+                .iter()
+                .any(|w| w.contains("the mean of the 1 averaging iteration(s) reached")
+                    && !w.contains("unaveraged")),
             "{:?}",
             res.warnings
         );
@@ -9881,27 +8839,15 @@ mod tests {
     #[test]
     fn imp_max_time_that_stops_nothing_changes_nothing() {
         let (model, pop) = tv_fixture();
-        let plain = run_imp(
-            &model,
-            &pop,
-            &model.default_params,
-            None,
-            &tv_imp_options(3),
-        )
-        .expect("IMP Ok");
-        let roomy = FitOptions {
-            imp_max_time: Some(1e9),
-            ..tv_imp_options(3)
-        };
+        let plain =
+            run_imp(&model, &pop, &model.default_params, None, &tv_imp_options(3)).expect("IMP Ok");
+        let roomy = FitOptions { imp_max_time: Some(1e9), ..tv_imp_options(3) };
         let roomy = run_imp(&model, &pop, &model.default_params, None, &roomy).expect("IMP Ok");
         assert_eq!(roomy.n_iterations, 3);
         assert!(roomy.converged && plain.converged);
         assert_eq!(roomy.ofv.to_bits(), plain.ofv.to_bits());
 
-        let last = FitOptions {
-            imp_max_time: Some(1e-9),
-            ..tv_imp_options(1)
-        };
+        let last = FitOptions { imp_max_time: Some(1e-9), ..tv_imp_options(1) };
         let last = run_imp(&model, &pop, &model.default_params, None, &last).expect("IMP Ok");
         assert!(last.converged, "{:?}", last.warnings);
         assert!(!last.warnings.iter().any(|w| w.contains("_max_time")));
@@ -9921,27 +8867,19 @@ mod tests {
         };
         let res = run_impmap(&model, &pop, &model.default_params, None, &opts).expect("Ok");
         assert_eq!(res.n_iterations, 1);
-        assert!(res
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("IMPMAP: stopped by `impmap_max_time`")));
+        assert!(res.warnings.iter().any(|w| w.starts_with("IMPMAP: stopped by `impmap_max_time`")));
     }
 
     #[test]
     fn imp_max_time_stops_a_mixture_fit() {
         let model = mix996_model("TVV * exp(ETA_V)");
         let pop = mix996_pop(3);
-        let opts = FitOptions {
-            imp_max_time: Some(1e-9),
-            ..tv_imp_options(4)
-        };
+        let opts = FitOptions { imp_max_time: Some(1e-9), ..tv_imp_options(4) };
         let res = run_imp(&model, &pop, &model.default_params, None, &opts).expect("IMP Ok");
         assert_eq!(res.n_iterations, 1);
         assert!(!res.converged);
         assert!(
-            res.warnings
-                .iter()
-                .any(|w| w.contains("stopped by `imp_max_time`")),
+            res.warnings.iter().any(|w| w.contains("stopped by `imp_max_time`")),
             "{:?}",
             res.warnings
         );
@@ -9952,10 +8890,7 @@ mod tests {
     fn a_max_time_that_cannot_trip_is_refused() {
         let (model, pop) = tv_fixture();
         for bad in [f64::NAN, f64::INFINITY, 0.0, -1.0] {
-            let opts = FitOptions {
-                imp_max_time: Some(bad),
-                ..tv_imp_options(2)
-            };
+            let opts = FitOptions { imp_max_time: Some(bad), ..tv_imp_options(2) };
             let err = run_imp(&model, &pop, &model.default_params, None, &opts)
                 .err()
                 .unwrap_or_else(|| panic!("{bad} must be refused"));

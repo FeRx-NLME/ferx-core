@@ -11,10 +11,7 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
-fn data_and_model() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn data_and_model() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin example must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -39,11 +36,7 @@ fn slsqp_reaches_a_sane_ofv() {
     opts.optimizer = Optimizer::Slsqp;
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("slsqp fit must succeed");
-    assert!(
-        result.ofv.is_finite(),
-        "SLSQP OFV should be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "SLSQP OFV should be finite, got {}", result.ofv);
 }
 
 #[test]
@@ -56,11 +49,7 @@ fn bobyqa_fit_converges_to_finite_ofv() {
     opts.outer_maxiter = 200;
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("bobyqa fit must succeed");
-    assert!(
-        result.ofv.is_finite(),
-        "BOBYQA OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "BOBYQA OFV must be finite, got {}", result.ofv);
     // Theta should stay inside the declared bounds from the model file.
     for (i, &th) in result.theta.iter().enumerate() {
         let lo = model.default_params.theta_lower[i];
@@ -77,11 +66,7 @@ fn trust_region_fit_converges_to_finite_ofv() {
     opts.steihaug_max_iters = Some(30);
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("trust_region fit must succeed");
-    assert!(
-        result.ofv.is_finite(),
-        "trust_region OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "trust_region OFV must be finite, got {}", result.ofv);
     for (i, &th) in result.theta.iter().enumerate() {
         let lo = model.default_params.theta_lower[i];
         let hi = model.default_params.theta_upper[i];
@@ -201,10 +186,8 @@ fn final_ofv_no_worse_than_best_seen_during_trace() {
         fit(&model, &population, &model.default_params, &opts).expect("slsqp fit must succeed");
     assert!(result.ofv.is_finite());
 
-    let trace_path = result
-        .trace_path
-        .clone()
-        .expect("optimizer_trace=true must produce a trace path");
+    let trace_path =
+        result.trace_path.clone().expect("optimizer_trace=true must produce a trace path");
     let csv = std::fs::read_to_string(&trace_path).expect("trace file must be readable");
     assert_eq!(
         result.trace_csv.as_deref(),
@@ -222,10 +205,7 @@ fn final_ofv_no_worse_than_best_seen_during_trace() {
         .filter(|x| x.is_finite())
         .fold(f64::INFINITY, f64::min);
 
-    assert!(
-        min_trace_ofv.is_finite(),
-        "trace must record at least one finite OFV"
-    );
+    assert!(min_trace_ofv.is_finite(), "trace must record at least one finite OFV");
     // Tolerance absorbs the slight OFV change from the final fresh-start
     // inner loop (vs the warm-started ones during the trace). Without the
     // best-seen restoration, the gap can blow up arbitrarily as the
@@ -254,15 +234,8 @@ fn gn_tr_warmstart_returns_finite_ofv() {
     opts.outer_maxiter = 5;
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("GN trust-region must not panic");
-    assert!(
-        result.ofv.is_finite(),
-        "GN-TR OFV must be finite after 5 iters, got {}",
-        result.ofv
-    );
-    assert!(
-        !result.theta.iter().any(|x| x.is_nan()),
-        "GN-TR theta must not contain NaN"
-    );
+    assert!(result.ofv.is_finite(), "GN-TR OFV must be finite after 5 iters, got {}", result.ofv);
+    assert!(!result.theta.iter().any(|x| x.is_nan()), "GN-TR theta must not contain NaN");
 }
 
 /// Verify that the pre-warm cache change in `cost()` is transparent end-to-end:
@@ -278,11 +251,7 @@ fn trust_region_cost_prewarm_cache_is_transparent() {
     opts.outer_maxiter = 5;
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("trust_region must not panic with cost() pre-warm cache");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite after cost() pre-warm, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite after cost() pre-warm, got {}", result.ofv);
     assert!(
         !result.theta.iter().any(|x| x.is_nan()),
         "theta must not contain NaN after cost() pre-warm"
@@ -326,11 +295,7 @@ fn iov_analytical_gradient_path_returns_finite_ofv() {
     opts.verbose = false;
     let result =
         fit(&model, &population, &model.default_params, &opts).expect("IOV fit must not error");
-    assert!(
-        result.ofv.is_finite(),
-        "IOV fit OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "IOV fit OFV must be finite, got {}", result.ofv);
 }
 
 /// Fast coverage for the `Rescale2` scaling path and the non-mu-ref (covariate)
@@ -394,15 +359,10 @@ fn flat_theta_is_frozen_and_fit_proceeds() {
 
     // Flat theta: frozen (FIX) and held exactly at its initial value.
     assert!(r.theta_fixed[i_flat], "TVFLAT must be frozen");
-    assert_eq!(
-        r.theta[i_flat], init.theta[i_flat],
-        "frozen TVFLAT must stay at its initial value"
-    );
+    assert_eq!(r.theta[i_flat], init.theta[i_flat], "frozen TVFLAT must stay at its initial value");
     // A warning names the flat param and its lack of effect on the objective.
     assert!(
-        r.warnings
-            .iter()
-            .any(|w| w.contains("TVFLAT") && w.contains("no effect")),
+        r.warnings.iter().any(|w| w.contains("TVFLAT") && w.contains("no effect")),
         "a flat-theta warning must be emitted: {:?}",
         r.warnings
     );
@@ -434,10 +394,7 @@ fn flat_theta_is_frozen_and_fit_proceeds() {
 /// NLopt optimizers report their own `xtol`/`ftol` stops; what #1000 fixed is the
 /// separate case of *budget exhaustion* being labelled converged.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn trust_region_reports_converged_when_it_settles() {
     let (model, population) = data_and_model();
     let mut opts = base_options();
@@ -453,10 +410,7 @@ fn trust_region_reports_converged_when_it_settles() {
         result.ofv, result.warnings
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("iteration budget")),
+        !result.warnings.iter().any(|w| w.contains("iteration budget")),
         "a settled fit must not carry the budget-exhaustion warning: {:?}",
         result.warnings
     );

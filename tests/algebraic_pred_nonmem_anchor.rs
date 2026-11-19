@@ -87,10 +87,7 @@ fn algebraic_structural_model_matches_nonmem_pred() {
     let nm_csv = std::fs::read_to_string("nonmem_anchor/algebraic_emax.csv")
         .expect("NONMEM's copy of the anchor data");
     let ferx_csv = std::fs::read_to_string("data/emax_timecourse.csv").expect("the example's copy");
-    assert_eq!(
-        nm_csv, ferx_csv,
-        "the NONMEM and ferx copies of the anchor dataset have diverged"
-    );
+    assert_eq!(nm_csv, ferx_csv, "the NONMEM and ferx copies of the anchor dataset have diverged");
 
     let pop = read_nonmem_csv(Path::new("data/emax_timecourse.csv"), None, None)
         .expect("anchor data must load");
@@ -110,22 +107,11 @@ fn algebraic_structural_model_matches_nonmem_pred() {
         .expect("compartment-free fit must converge");
 
     // OFV. A gap here means the prediction itself differs, not just the path to it.
-    assert!(
-        (result.ofv - NM_OFV).abs() < 1e-3,
-        "ferx OFV {:.6} vs NONMEM {NM_OFV:.6}",
-        result.ofv
-    );
+    assert!((result.ofv - NM_OFV).abs() < 1e-3, "ferx OFV {:.6} vs NONMEM {NM_OFV:.6}", result.ofv);
 
-    for (i, (&nm, name)) in NM_THETA
-        .iter()
-        .zip(["TVE0", "TVEMAX", "TVET50"])
-        .enumerate()
-    {
+    for (i, (&nm, name)) in NM_THETA.iter().zip(["TVE0", "TVEMAX", "TVET50"]).enumerate() {
         let got = result.theta[i];
-        assert!(
-            (got - nm).abs() / nm.abs() < 1e-3,
-            "{name}: ferx {got:.6} vs NONMEM {nm:.6}"
-        );
+        assert!((got - nm).abs() / nm.abs() < 1e-3, "{name}: ferx {got:.6} vs NONMEM {nm:.6}");
     }
 
     let omega = result.omega[(0, 0)];
@@ -143,20 +129,11 @@ fn algebraic_structural_model_matches_nonmem_pred() {
     // SEs — ferx's covariance is pure R⁻¹, matching `$COV MATRIX=R`. These are the
     // part that exercises the second-order blocks of the analytic jet, so a wrong
     // `∂²f/∂η²` or `∂²f/∂η∂θ` shows up here even when the estimates agree.
-    let se_theta = result
-        .se_theta
-        .as_ref()
-        .expect("covariance step must succeed on a compartment-free model");
-    for (i, (&nm, name)) in NM_SE_THETA
-        .iter()
-        .zip(["TVE0", "TVEMAX", "TVET50"])
-        .enumerate()
-    {
+    let se_theta =
+        result.se_theta.as_ref().expect("covariance step must succeed on a compartment-free model");
+    for (i, (&nm, name)) in NM_SE_THETA.iter().zip(["TVE0", "TVEMAX", "TVET50"]).enumerate() {
         let got = se_theta[i];
-        assert!(
-            (got - nm).abs() / nm.abs() < 5e-3,
-            "SE({name}): ferx {got:.6} vs NONMEM {nm:.6}"
-        );
+        assert!((got - nm).abs() / nm.abs() < 5e-3, "SE({name}): ferx {got:.6} vs NONMEM {nm:.6}");
     }
     let se_omega = result.se_omega.as_ref().expect("omega SEs")[0];
     assert!(
@@ -200,11 +177,7 @@ fn algebraic_structural_model_recovers_the_simulation_truth() {
 
     // 5% on the structural parameters, 20% on the variance components — the usual
     // sampling-noise band for 30 subjects × 8 observations.
-    for (i, (&truth, name)) in TRUTH_THETA
-        .iter()
-        .zip(["TVE0", "TVEMAX", "TVET50"])
-        .enumerate()
-    {
+    for (i, (&truth, name)) in TRUTH_THETA.iter().zip(["TVE0", "TVEMAX", "TVET50"]).enumerate() {
         let got = result.theta[i];
         assert!(
             (got - truth).abs() / truth < 0.05,

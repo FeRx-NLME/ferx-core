@@ -51,10 +51,7 @@ fn per_subject_objective_matches_nonmem_for_tte_only_subjects() {
         .expect("anchor data reads");
     bind_theta_levels(&mut parsed, &text, &mut pop).expect("the block binds");
     let m = &parsed.model;
-    assert!(
-        m.eta_names.is_empty(),
-        "evaluated at eta = 0, as NONMEM's `$OMEGA 0 FIX`"
-    );
+    assert!(m.eta_names.is_empty(), "evaluated at eta = 0, as NONMEM's `$OMEGA 0 FIX`");
 
     let mut p = m.default_params.clone();
     for (name, v) in [("PLACEBO[STUDY=2]", 0.5), ("PLACEBO[STUDY=3]", 1.0)] {
@@ -66,10 +63,7 @@ fn per_subject_objective_matches_nonmem_for_tte_only_subjects() {
     assert_eq!(obj.len(), 8, "eight subjects in the reference run");
     for id in ["98", "99"] {
         let s = pop.subjects.iter().find(|s| s.id == id).unwrap();
-        assert!(
-            s.obs_times.is_empty(),
-            "subject {id} has no Gaussian observation"
-        );
+        assert!(s.obs_times.is_empty(), "subject {id} has no Gaussian observation");
     }
 
     let (mut worst_joint, mut worst_tte_only) = (0.0f64, 0.0f64);

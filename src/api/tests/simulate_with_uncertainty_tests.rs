@@ -11,8 +11,7 @@ use std::collections::HashMap;
 /// The guard warning with no covariance matrix (#2797: no SE sentence), as these tests
 /// predate the matrix argument.
 fn runaway_guard_warning(
-    converged: &mut bool,
-    params: &ModelParameters,
+    converged: &mut bool, params: &ModelParameters,
 ) -> Option<(String, crate::types::WarningEntry)> {
     super::runaway_guard_warning_for(converged, params, None)
 }
@@ -20,94 +19,18 @@ fn runaway_guard_warning(
 fn tiny_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
-        theta: vec![5.0, 50.0],
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        theta_lower: vec![0.1, 5.0],
-        theta_upper: vec![50.0, 500.0],
-        theta_fixed: vec![false; 2],
-        omega,
-        omega_fixed: vec![false],
-        sigma: SigmaVector {
-            values: vec![0.1],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
-        kappa_fixed: Vec::new(),
-        mixture: None,
+        sigma: SigmaVector { values: vec![0.1], names: vec!["PROP_ERR".into()] },
+        ..crate::types::test_helpers::bare_params(omega)
     };
     CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "uncertainty_smoke".into(),
-        pk_model: PkModel::OneCptIv,
-        error_model: ErrorModel::Proportional,
-        error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                p.values[0] = theta[0] * eta[0].exp();
-                p.values[1] = theta[1];
-                p
-            },
-        ),
-        n_theta: 2,
-        n_eta: 1,
-        n_epsilon: 1,
-        n_kappa: 0,
-        kappa_names: Vec::new(),
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        eta_names: vec!["ETA_CL".into()],
-        indiv_param_names: vec!["CL".into(), "V".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        default_params,
-        omega_init_as_sd: vec![false],
-        sigma_init_as_sd: vec![false],
-        kappa_init_as_sd: Vec::new(),
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        tv_fn: None,
-        pk_indices: vec![0, 1],
-        eta_map: vec![0],
-        pk_idx_f64: vec![0.0, 1.0],
-        sel_flat: vec![1.0, 0.0],
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            p.values[0] = theta[0] * eta[0].exp();
+            p.values[1] = theta[1];
+            p
+        }),
+        ..crate::types::test_helpers::bare_model(default_params)
     }
 }
 
@@ -199,34 +122,14 @@ fn tte_cov_snapshot_pop(id: &str, snaps: Vec<HashMap<String, f64>>) -> Populatio
     let n = snaps.len();
     let base = snaps.first().cloned().unwrap_or_default();
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: id.to_string(),
-        doses: Vec::new(),
         obs_times: vec![0.0; n],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: vec![2; n],
         covariates: base,
-        dose_covariates: Vec::new(),
         obs_covariates: snaps,
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: Vec::new(),
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     Population {
         subjects: vec![subject],
@@ -340,12 +243,7 @@ fn binary_logit_time_varying_covariate_is_rejected_only_without_aligned_snapshot
         "a constant logit covariate must not be rejected"
     );
     // The same varying X on binary records whose snapshots align: accepted (#2562).
-    let state = |time: f64| ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state: 1,
-        cmt: 3,
-    };
+    let state = |time: f64| ObsRecord::DiscreteState { time, raw_time: time, state: 1, cmt: 3 };
     let mut aligned = tte_cov_snapshot_pop("S1", Vec::new());
     let s = &mut aligned.subjects[0];
     s.covariates = x(1.0);
@@ -449,10 +347,7 @@ fn ode_accumulated_hazard_rejects_any_time_varying_covariate() {
     );
     let pop = tte_cov_snapshot_pop(
         "S9",
-        vec![
-            HashMap::from([("WT".to_string(), 70.0)]),
-            HashMap::from([("WT".to_string(), 90.0)]),
-        ],
+        vec![HashMap::from([("WT".to_string(), 70.0)]), HashMap::from([("WT".to_string(), 90.0)])],
     );
     let msg = tv_refusal(&model, &pop, "event_model");
     assert_eq!(
@@ -483,16 +378,9 @@ fn ctmm_intensity_time_varying_covariate_is_rejected() {
     )
     .expect("CTMM + covariate-on-intensity model parses");
     let snaps = |wt2: f64| {
-        vec![
-            HashMap::from([("WT".to_string(), 70.0)]),
-            HashMap::from([("WT".to_string(), wt2)]),
-        ]
+        vec![HashMap::from([("WT".to_string(), 70.0)]), HashMap::from([("WT".to_string(), wt2)])]
     };
-    let msg = tv_refusal(
-        &model,
-        &tte_cov_snapshot_pop("S3", snaps(90.0)),
-        "markov_model",
-    );
+    let msg = tv_refusal(&model, &tte_cov_snapshot_pop("S3", snaps(90.0)), "markov_model");
     assert_eq!(
         msg,
         "[markov_model] on CMT=2: a transition intensity references covariate `WT`, which is \
@@ -614,10 +502,7 @@ fn ctmm_drug_driven_tv_covariate_refusal_is_per_parameter() {
     );
     let on_cl = drug_driven_ctmm("TVCL * WT / 70", "TVKA", "TVKE * AGE / 40", "TVB0");
     let msg = tv_refusal(&on_cl, &pop, "markov_model");
-    assert!(
-        msg.contains("`CL` reads covariate `WT`"),
-        "must name CL and WT: {msg}"
-    );
+    assert!(msg.contains("`CL` reads covariate `WT`"), "must name CL and WT: {msg}");
 }
 
 /// An `init(central)` seed reading a TV covariate is the same freeze, through `init()`
@@ -661,34 +546,15 @@ pub(super) fn tiny_population() -> Population {
     let obs_times = vec![1.0, 2.0, 3.0];
     let subjects: Vec<Subject> = (0..2)
         .map(|i| Subject {
-            obs_rgroup: Vec::new(),
             id: format!("S{}", i + 1),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![30.0, 22.0, 16.0],
             obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0, 0, 0],
             occasions: vec![1, 1, 1],
-            obs_l2: Vec::new(),
             dose_occasions: vec![1],
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
     Population {
@@ -955,9 +821,7 @@ const PLAIN_TWIN_TRANSIT_SRC: &str = "\
 ";
 
 pub(super) fn parse_fixture(src: &str) -> CompiledModel {
-    crate::parser::model_parser::parse_full_model(src)
-        .expect("fixture model parses")
-        .model
+    crate::parser::model_parser::parse_full_model(src).expect("fixture model parses").model
 }
 
 fn eta_vec(values: &[f64]) -> nalgebra::DVector<f64> {
@@ -971,18 +835,12 @@ fn eta_vec(values: &[f64]) -> nalgebra::DVector<f64> {
 #[test]
 fn flip_flop_ebe_warning_fires_for_twinless_transit_crosser() {
     let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
-    assert!(
-        model.absorption_ode_equivalent.is_none(),
-        "a [scaling] transit model is twin-less"
-    );
+    assert!(model.absorption_ode_equivalent.is_none(), "a [scaling] transit model is twin-less");
     // The inert `obs_scale = 1` must not double-scale the `pk` block's built-in concentration
     // output: no #712 volume double-scale warning (reverting to `obs_scale = V` would
     // reintroduce it and this pins that regression).
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("divides by")),
+        !model.parse_warnings.iter().any(|w| w.contains("divides by")),
         "twin-less fixture must not emit the obs_scale double-scale warning: {:?}",
         model.parse_warnings
     );
@@ -997,16 +855,10 @@ fn flip_flop_ebe_warning_fires_for_twinless_transit_crosser() {
     assert!(msg.contains("flip-flop regime"), "wording: {msg}");
     assert!(msg.contains("transit()"), "transit ODE hint: {msg}");
     assert!(msg.contains("S2"), "must name the crossing subject: {msg}");
-    assert!(
-        !msg.contains("S1"),
-        "must not name the in-domain subject: {msg}"
-    );
+    assert!(!msg.contains("S1"), "must not name the in-domain subject: {msg}");
     // The real emitter's message must itself classify to `flip_flop` — pins the
     // classify branch against wording drift (not a hand-copied proxy string).
-    assert_eq!(
-        crate::types::classify_warning(&msg).category,
-        crate::types::WarningCode::FlipFlop
-    );
+    assert_eq!(crate::types::classify_warning(&msg).category, crate::types::WarningCode::FlipFlop);
     let details = entry.details.expect("native entry carries details");
     assert_eq!(details["phase"], "ebe");
     assert_eq!(details["subjects"], serde_json::json!(["S2"]));
@@ -1020,10 +872,7 @@ fn flip_flop_ebe_warning_fires_for_twinless_ig_crosser() {
     assert!(model.absorption_ode_equivalent.is_none());
     // The inert `obs_scale = 1` must not double-scale the IG closed form (no #712 warning).
     assert!(
-        !model
-            .parse_warnings
-            .iter()
-            .any(|w| w.contains("divides by")),
+        !model.parse_warnings.iter().any(|w| w.contains("divides by")),
         "twin-less IG fixture must not emit the obs_scale double-scale warning: {:?}",
         model.parse_warnings
     );
@@ -1044,10 +893,8 @@ fn flip_flop_ebe_warning_silent_when_all_in_domain() {
     let pop = tiny_population();
     // CL/V = 0.5·e^{0.1}/4 = 0.138 < 0.2 for both.
     let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.1])];
-    assert!(
-        absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
-            .is_none()
-    );
+    assert!(absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+        .is_none());
 }
 
 /// #785: a twin-*carrying* model reroutes per-eval, so even a crossing EBE must
@@ -1055,16 +902,11 @@ fn flip_flop_ebe_warning_silent_when_all_in_domain() {
 #[test]
 fn flip_flop_ebe_warning_silent_for_twin_carrying() {
     let model = parse_fixture(PLAIN_TWIN_TRANSIT_SRC);
-    assert!(
-        model.absorption_ode_equivalent.is_some(),
-        "a plain transit model carries an ODE twin"
-    );
+    assert!(model.absorption_ode_equivalent.is_some(), "a plain transit model carries an ODE twin");
     let pop = tiny_population();
     let eta_hats = [eta_vec(&[0.0]), eta_vec(&[0.6])];
-    assert!(
-        absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
-            .is_none()
-    );
+    assert!(absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+        .is_none());
 }
 
 /// #785: a non-absorption model has no flip-flop regime → no warning.
@@ -1077,10 +919,8 @@ fn flip_flop_ebe_warning_silent_for_non_absorption() {
     ));
     let pop = tiny_population();
     let eta_hats = [eta_vec(&[0.0]), eta_vec(&[3.0])];
-    assert!(
-        absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
-            .is_none()
-    );
+    assert!(absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+        .is_none());
 }
 
 /// #785: an EBE whose length ≠ `n_eta + n_kappa` is defensively skipped rather
@@ -1093,10 +933,8 @@ fn flip_flop_ebe_warning_skips_wrong_length_eta() {
     let pop = tiny_population();
     // S1 valid (in-domain, len 1); S2 has a zero-length eta (≠ n_eta = 1).
     let eta_hats = [eta_vec(&[0.0]), eta_vec(&[])];
-    assert!(
-        absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
-            .is_none()
-    );
+    assert!(absorption_flip_flop_ebe_warning(&model, &pop, &model.default_params.theta, &eta_hats)
+        .is_none());
 }
 
 /// #786: `simulate_with_uncertainty` on a twin-less transit model whose point
@@ -1124,18 +962,11 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
     // Must return Ok rather than panicking (the #786 regression).
     let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts)
         .expect("flip-flop draws must be skipped, not panic the run");
-    assert!(
-        !rows.is_empty(),
-        "surviving in-domain draws must still yield rows"
-    );
+    assert!(!rows.is_empty(), "surviving in-domain draws must still yield rows");
     let mut draws: Vec<usize> = rows.iter().map(|r| r.draw).collect();
     draws.sort();
     draws.dedup();
-    assert!(
-        draws.len() < 30,
-        "some flip-flop draws must be skipped (got {} of 30)",
-        draws.len()
-    );
+    assert!(draws.len() < 30, "some flip-flop draws must be skipped (got {} of 30)", draws.len());
 
     // #1485: the `_diag` form reports the skips as ONE warning carrying the count and the
     // 1-based indices of exactly the draws missing from the rows — no per-draw lines.
@@ -1146,10 +977,7 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
     assert!(msg.contains("6 of 30 uncertainty draws"), "{msg}");
     assert!(msg.contains("(draws 7, 16, 19, 22, 23, 24)"), "{msg}");
     assert!(
-        !diag
-            .warnings
-            .iter()
-            .any(|w| w.starts_with("uncertainty draw ")),
+        !diag.warnings.iter().any(|w| w.starts_with("uncertainty draw ")),
         "the per-draw lines are gone: {:#?}",
         diag.warnings
     );
@@ -1180,10 +1008,8 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
 
 /// The single `W_UNCERTAINTY_DRAWS_SKIPPED` warning in `warnings` (#1485).
 fn only_skip_warning(warnings: &[String]) -> &str {
-    let hits: Vec<&String> = warnings
-        .iter()
-        .filter(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED"))
-        .collect();
+    let hits: Vec<&String> =
+        warnings.iter().filter(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED")).collect();
     assert_eq!(hits.len(), 1, "exactly one skip warning: {warnings:#?}");
     hits[0]
 }
@@ -1204,9 +1030,8 @@ fn skip_run(model: &CompiledModel, var: f64, n: usize, seed: u64) -> (String, Ve
         horizon: None,
     };
     let out = simulate_with_uncertainty_diag(model, &pop, &fit, &opts).expect("some draws run");
-    let skipped: Vec<usize> = (1..=n)
-        .filter(|k| !out.results.iter().any(|r| r.draw == *k))
-        .collect();
+    let skipped: Vec<usize> =
+        (1..=n).filter(|k| !out.results.iter().any(|r| r.draw == *k)).collect();
     (only_skip_warning(&out.warnings).to_string(), skipped)
 }
 
@@ -1309,15 +1134,8 @@ fn uncertainty_skip_warning_wording_per_family() {
         (&t2, &t2_skipped, "two_cpt_transit"),
     ] {
         // Count + indices sentence: exactly the draws missing from the rows.
-        let list = skipped
-            .iter()
-            .map(|k| k.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        assert!(
-            !skipped.is_empty() && skipped.len() < 30,
-            "{n_name}: {skipped:?}"
-        );
+        let list = skipped.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ");
+        assert!(!skipped.is_empty() && skipped.len() < 30, "{n_name}: {skipped:?}");
         assert!(
             msg.contains(&format!(
                 "{} of 30 uncertainty draws were skipped (draws {list})",
@@ -1327,24 +1145,15 @@ fn uncertainty_skip_warning_wording_per_family() {
         );
         // Cause sentence.
         assert!(msg.contains("flip-flop regime"), "{n_name}: {msg}");
-        assert!(
-            msg.contains(&format!("twin-less {n_name} closed form")),
-            "{msg}"
-        );
+        assert!(msg.contains(&format!("twin-less {n_name} closed form")), "{msg}");
         // Bias sentence.
-        assert!(
-            msg.contains("exclude the tail of the parameter uncertainty"),
-            "{n_name}: {msg}"
-        );
+        assert!(msg.contains("exclude the tail of the parameter uncertainty"), "{n_name}: {msg}");
         assert!(msg.contains("biased, not just noisier"), "{n_name}: {msg}");
         // The remaining rows are not claimed correct, and CL is not named as the cause.
         assert!(!msg.contains("high CL"), "{n_name}: {msg}");
         // A token-carrying message classifies on the token, not the "flip-flop" prose.
         let entry = crate::types::classify_warning(msg);
-        assert_eq!(
-            entry.category,
-            crate::types::WarningCode::UncertaintyDrawsSkipped
-        );
+        assert_eq!(entry.category, crate::types::WarningCode::UncertaintyDrawsSkipped);
         assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
     }
     // Transit vs IG: the domain and the ODE rewrite.
@@ -1357,10 +1166,7 @@ fn uncertainty_skip_warning_wording_per_family() {
     assert!(ig1.contains("explicit ODE `igd()` model"), "{ig1}");
     assert!(!ig1.contains("KTR") && !ig1.contains("transit()"), "{ig1}");
     // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge.
-    assert!(
-        t2.contains("or with coincident disposition eigenvalues"),
-        "{t2}"
-    );
+    assert!(t2.contains("or with coincident disposition eigenvalues"), "{t2}");
     assert!(!t1.contains("coincident"), "{t1}");
     assert!(!ig1.contains("coincident"), "{ig1}");
 }
@@ -1398,10 +1204,7 @@ fn uncertainty_skip_warning_carries_the_twin_decline_clause() {
     let (with, _) = skip_run(&declined, 4.0, 30, 7);
     let (without, _) = skip_run(&scaling, 4.0, 30, 7);
     assert!(with.contains(clause), "{with}");
-    assert!(
-        with.contains("CENTRAL"),
-        "the twin parser's reason is quoted: {with}"
-    );
+    assert!(with.contains("CENTRAL"), "the twin parser's reason is quoted: {with}");
     assert!(!without.contains(clause), "{without}");
 }
 
@@ -1430,30 +1233,18 @@ fn uncertainty_refuses_when_every_draw_is_skipped() {
         .expect_err("every draw skipped must be refused");
     assert_eq!(err.code(), Some("E_TRANSIT_FLIP_FLOP"), "{err}");
     let msg = err.to_string();
-    assert!(
-        msg.contains(&format!("all {ALL_SKIP_N} uncertainty draws")),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("although the point estimate is in-domain"),
-        "{msg}"
-    );
+    assert!(msg.contains(&format!("all {ALL_SKIP_N} uncertainty draws")), "{msg}");
+    assert!(msg.contains("although the point estimate is in-domain"), "{msg}");
     assert!(msg.contains("First draw: one_cpt_transit"), "{msg}");
     assert!(!msg.contains("W_UNCERTAINTY_DRAWS_SKIPPED"), "{msg}");
     // Straddle on the `k = n` boundary: the same fixture at a seed that skips n − 1 draws
     // still runs, and says so — a refusal at `k ≥ n − 1` reddens this half.
-    let partial = SimulateUncertaintyOptions {
-        seed: Some(ALL_BUT_ONE_SKIP_SEED),
-        ..opts
-    };
+    let partial = SimulateUncertaintyOptions { seed: Some(ALL_BUT_ONE_SKIP_SEED), ..opts };
     let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &partial)
         .expect("a run with a surviving draw is not refused");
     let warn = only_skip_warning(&out.warnings);
     assert!(
-        warn.contains(&format!(
-            "{} of {ALL_SKIP_N} uncertainty draws",
-            ALL_SKIP_N - 1
-        )),
+        warn.contains(&format!("{} of {ALL_SKIP_N} uncertainty draws", ALL_SKIP_N - 1)),
         "{warn}"
     );
 }
@@ -1464,10 +1255,7 @@ fn uncertainty_refuses_when_every_draw_is_skipped() {
 #[test]
 fn uncertainty_without_skips_carries_no_skip_warning() {
     let pop = tiny_population();
-    for (name, model) in [
-        ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC)),
-        ("tiny", tiny_model()),
-    ] {
+    for (name, model) in [("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC)), ("tiny", tiny_model())] {
         let mut fit = synthetic_fit(&model.default_params);
         if name == "twin" {
             if let Some(cov) = fit.covariance_matrix.as_mut() {
@@ -1488,9 +1276,7 @@ fn uncertainty_without_skips_carries_no_skip_warning() {
             draws.dedup();
             assert_eq!(draws, (1..=n).collect::<Vec<_>>(), "{name} n={n}");
             assert!(
-                !out.warnings
-                    .iter()
-                    .any(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED")),
+                !out.warnings.iter().any(|w| w.contains("W_UNCERTAINTY_DRAWS_SKIPPED")),
                 "{name} n={n}: {:#?}",
                 out.warnings
             );
@@ -1574,9 +1360,7 @@ fn dose_free_matches(a: &[SimulationResult], b: &[SimulationResult]) -> (usize, 
             (y.draw, y.sim, &y.id, y.time),
             "the dose-free twin must emit the same grid in the same order"
         );
-        let same = per_individual
-            .entry((x.draw, x.sim, x.id.clone()))
-            .or_insert(true);
+        let same = per_individual.entry((x.draw, x.sim, x.id.clone())).or_insert(true);
         *same &= x.ipred.to_bits() == y.ipred.to_bits();
     }
     let matched = per_individual.values().filter(|m| **m).count();
@@ -1617,13 +1401,8 @@ fn the_documented_warning_example_is_the_message_the_code_emits() {
     let page = std::fs::read_to_string(root.join("docs/api/simulation.qmd"))
         .expect("docs/ is present, so the simulation page must be too");
     // The one fenced block that quotes this warning.
-    let start = page
-        .find("W_SIMULATED_FLIP_FLOP: 27 of 600")
-        .expect("the page quotes the warning");
-    let end = start
-        + page[start..]
-            .find("\n```")
-            .expect("the quote sits in a fenced block");
+    let start = page.find("W_SIMULATED_FLIP_FLOP: 27 of 600").expect("the page quotes the warning");
+    let end = start + page[start..].find("\n```").expect("the quote sits in a fenced block");
     let quoted = normalize_ws(&page[start..end]);
 
     // The real thing, at the fixture and seed the page names.
@@ -1635,10 +1414,7 @@ fn the_documented_warning_example_is_the_message_the_code_emits() {
     // floor passes on a truncated quote — dropping the last three sentences still leaves a
     // 200-character prefix — so it would not notice the page quoting half the message. This
     // fixture carries no twin-decline clause, so the page's block is the whole thing.
-    assert_eq!(
-        emitted, quoted,
-        "the documented example has drifted from the emitted message"
-    );
+    assert_eq!(emitted, quoted, "the documented example has drifted from the emitted message");
 }
 
 /// Collapse every run of whitespace to one space, so a hard-wrapped quote in a `.qmd` page
@@ -1723,10 +1499,7 @@ fn simulated_flip_flop_tally_skips_a_nonfinite_individual() {
     // different fixture and not a restatement of the first.
     let theta = cl_and_v.default_params.theta.clone();
     let pk = (cl_and_v.pk_param_fn)(&theta, &[0.6], &subject.covariates, 0.0);
-    assert!(
-        (pk.cl() / pk.v() - 0.125).abs() < 1e-12,
-        "CL/V is η-independent here"
-    );
+    assert!((pk.cl() / pk.v() - 0.125).abs() < 1e-12, "CL/V is η-independent here");
     let mut tally = SimulatedFlipFlopTally::default();
     tally.observe(&cl_and_v, subject, &theta, &[0.6]);
     assert_eq!(tally.warning(&cl_and_v), None);
@@ -1744,9 +1517,7 @@ fn simulated_flip_flop_tally_skips_a_nonfinite_individual() {
     let mut mixed = SimulatedFlipFlopTally::default();
     mixed.observe(&cl_only, subject, &theta, &[0.6]); // finite crosser
     mixed.observe(&cl_only, subject, &theta, &[710.0]); // eligible, overflowed
-    let msg = mixed
-        .warning(&cl_only)
-        .expect("the finite crosser is reported");
+    let msg = mixed.warning(&cl_only).expect("the finite crosser is reported");
     assert!(
         msg.contains("1 of 2 simulated individuals dosed before one of their observations"),
         "the overflowed individual stays in the denominator: {msg}"
@@ -1819,10 +1590,7 @@ fn simulated_flip_flop_message_holds_where_the_clamp_was_not_the_cause() {
         msg.contains("because the dose never arrived"),
         "the message names this alternative cause: {msg}"
     );
-    assert!(
-        !msg.contains("so their entire dose-driven concentration was clamped"),
-        "{msg}"
-    );
+    assert!(!msg.contains("so their entire dose-driven concentration was clamped"), "{msg}");
 
     // ── 2. an η-dependent obs_scale going non-positive ──────────────────────────────
     let scaled = parse_fixture(
@@ -1870,23 +1638,16 @@ fn dose_free_oracle_rejects_a_degenerate_fixture() {
 fn zeroed_individuals(results: &[SimulationResult]) -> (usize, usize) {
     let mut per_individual: HashMap<(usize, usize, String), bool> = HashMap::new();
     for r in results {
-        let all_zero = per_individual
-            .entry((r.draw, r.sim, r.id.clone()))
-            .or_insert(true);
+        let all_zero = per_individual.entry((r.draw, r.sim, r.id.clone())).or_insert(true);
         *all_zero &= r.ipred == 0.0;
     }
-    (
-        per_individual.values().filter(|z| **z).count(),
-        per_individual.len(),
-    )
+    (per_individual.values().filter(|z| **z).count(), per_individual.len())
 }
 
 /// The single `W_SIMULATED_FLIP_FLOP` warning in `warnings`, or `None`.
 fn flip_flop_warning(warnings: &[String]) -> Option<String> {
-    let hits: Vec<&String> = warnings
-        .iter()
-        .filter(|w| w.contains("W_SIMULATED_FLIP_FLOP"))
-        .collect();
+    let hits: Vec<&String> =
+        warnings.iter().filter(|w| w.contains("W_SIMULATED_FLIP_FLOP")).collect();
     assert!(hits.len() <= 1, "at most one tally warning: {warnings:#?}");
     hits.first().map(|w| (*w).clone())
 }
@@ -1898,21 +1659,14 @@ fn flip_flop_warning(warnings: &[String]) -> Option<String> {
 /// in-domain by construction (the entry points refuse it otherwise), so the crossing has
 /// to come from the η draw, which is exactly the gap under test.
 fn flip_flop_run(
-    model: &CompiledModel,
-    var: f64,
-    n_sim: usize,
-    seed: u64,
+    model: &CompiledModel, var: f64, n_sim: usize, seed: u64,
     match_method: Option<crate::propensity_match::MatchMethod>,
 ) -> (Option<String>, usize, usize) {
     let pop = tiny_population();
     assert_eq!(model.n_eta, 1, "every fixture here carries one η");
     let mut params = model.default_params.clone();
     params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
-    let opts = SimulateOptions {
-        seed: Some(seed),
-        match_method,
-        ..Default::default()
-    };
+    let opts = SimulateOptions { seed: Some(seed), match_method, ..Default::default() };
     let out = simulate_with_options_diag(model, &pop, &params, n_sim, &opts)
         .expect("an in-domain point estimate simulates");
     // The row-only wrapper is the same rows, so the tally cannot have perturbed the draw
@@ -1928,17 +1682,11 @@ fn flip_flop_run(
 
 /// `simulate_with_options_diag`'s rows at ω² = `var`, for an oracle that needs them twice.
 fn flip_flop_rows(
-    model: &CompiledModel,
-    var: f64,
-    n_sim: usize,
-    seed: u64,
+    model: &CompiledModel, var: f64, n_sim: usize, seed: u64,
 ) -> Vec<SimulationResult> {
     let mut params = model.default_params.clone();
     params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
-    let opts = SimulateOptions {
-        seed: Some(seed),
-        ..Default::default()
-    };
+    let opts = SimulateOptions { seed: Some(seed), ..Default::default() };
     simulate_with_options_diag(model, &tiny_population(), &params, n_sim, &opts)
         .expect("an in-domain point estimate simulates")
         .results
@@ -1949,18 +1697,12 @@ fn flip_flop_rows(
 /// a baseline / readout / log transform on the closed form's output, where a clamped
 /// individual is not zero at all (#1823 review r1).
 fn clamped_run(
-    model: &CompiledModel,
-    var: f64,
-    n_sim: usize,
-    seed: u64,
+    model: &CompiledModel, var: f64, n_sim: usize, seed: u64,
 ) -> (Option<String>, usize, usize) {
     assert_eq!(model.n_eta, 1, "every fixture here carries one η");
     let mut params = model.default_params.clone();
     params.omega = OmegaMatrix::from_diagonal(&[var], model.eta_names.clone());
-    let opts = SimulateOptions {
-        seed: Some(seed),
-        ..Default::default()
-    };
+    let opts = SimulateOptions { seed: Some(seed), ..Default::default() };
     let dosed = simulate_with_options_diag(model, &tiny_population(), &params, n_sim, &opts)
         .expect("an in-domain point estimate simulates");
     let undosed =
@@ -2005,10 +1747,8 @@ const TWINLESS_TRANSIT_INIT_SRC: &str = "\
 /// adds a constant: `apply_analytic_readout` replaces the output after the clamp, so a
 /// clamped individual reads 2.5, not 0.
 fn twinless_transit_form_c_src() -> String {
-    INDOMAIN_TWINLESS_TRANSIT_SRC.replace(
-        "[scaling]\n  obs_scale = 1\n",
-        "[scaling]\n  y = central/V + 2.5\n",
-    )
+    INDOMAIN_TWINLESS_TRANSIT_SRC
+        .replace("[scaling]\n  obs_scale = 1\n", "[scaling]\n  y = central/V + 2.5\n")
 }
 
 /// The same fixture with a Form-C readout that **preserves** zero: the readout sees the
@@ -2019,10 +1759,8 @@ fn twinless_transit_form_c_src() -> String {
 /// `analytic_readout.is_some()` for both — and the opposite row value. This pair is why the
 /// message makes no claim about what a clamped row contains (#1823 review r2).
 fn twinless_transit_form_c_zero_preserving_src() -> String {
-    INDOMAIN_TWINLESS_TRANSIT_SRC.replace(
-        "[scaling]\n  obs_scale = 1\n",
-        "[scaling]\n  y = central/V\n",
-    )
+    INDOMAIN_TWINLESS_TRANSIT_SRC
+        .replace("[scaling]\n  obs_scale = 1\n", "[scaling]\n  y = central/V\n")
 }
 
 /// The M1 fixture under log-transform-both-sides: `apply_log_transform` maps the clamped
@@ -2159,10 +1897,7 @@ fn simulated_flip_flop_warning_claims_nothing_about_the_row_values() {
     // The decisive pair, stated as its own assertion so the structural
     // indistinguishability cannot quietly stop being true.
     assert_eq!(
-        (
-            form_c_zero.analytic_readout.is_some(),
-            form_c_add.analytic_readout.is_some()
-        ),
+        (form_c_zero.analytic_readout.is_some(), form_c_add.analytic_readout.is_some()),
         (true, true),
         "both Form-C fixtures present identically to any structural predicate"
     );
@@ -2211,10 +1946,7 @@ fn simulated_flip_flop_tally_skips_an_undosed_subject() {
     half.subjects[1].doses[0].amt = 0.0;
     let mut params = model.default_params.clone();
     params.omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
-    let opts = SimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = SimulateOptions { seed: Some(7), ..Default::default() };
     let out = simulate_with_options_diag(&model, &half, &params, 300, &opts).expect("sim");
     let reported = flip_flop_warning(&out.warnings).expect("the dosed subject still crosses");
     // S1 is dosed and S2 is not, so the denominator is 300, not 600 — and the placebo
@@ -2225,10 +1957,7 @@ fn simulated_flip_flop_tally_skips_an_undosed_subject() {
         "{reported}"
     );
     assert_eq!(
-        out.results
-            .iter()
-            .filter(|r| r.id == "S2" && r.ipred == 0.0)
-            .count(),
+        out.results.iter().filter(|r| r.id == "S2" && r.ipred == 0.0).count(),
         900,
         "every placebo row is zero, crossing or not"
     );
@@ -2412,17 +2141,9 @@ fn simulated_flip_flop_count_equals_the_zeroed_individuals() {
 #[test]
 fn simulated_flip_flop_count_covers_the_propensity_matched_branch() {
     let model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
-    let (msg, zeroed, total) = flip_flop_run(
-        &model,
-        0.09,
-        300,
-        7,
-        Some(crate::propensity_match::MatchMethod::Optimal),
-    );
-    assert!(
-        zeroed > 0,
-        "the matched run must produce crossers or this proves nothing"
-    );
+    let (msg, zeroed, total) =
+        flip_flop_run(&model, 0.09, 300, 7, Some(crate::propensity_match::MatchMethod::Optimal));
+    assert!(zeroed > 0, "the matched run must produce crossers or this proves nothing");
     assert_eq!(total, 600);
     let msg = msg.expect("a matched run reports its crossers too");
     assert!(
@@ -2455,18 +2176,8 @@ fn simulated_flip_flop_warning_wording_per_family() {
     // them from it reddens here (#1823 review r6 — before `ig2` existed, dropping
     // `TwoCptIg` left the suite green).
     assert_eq!(
-        [
-            transit.pk_model,
-            ig.pk_model,
-            transit2.pk_model,
-            ig2.pk_model
-        ],
-        [
-            PkModel::OneCptTransit,
-            PkModel::OneCptIg,
-            PkModel::TwoCptTransit,
-            PkModel::TwoCptIg
-        ]
+        [transit.pk_model, ig.pk_model, transit2.pk_model, ig2.pk_model],
+        [PkModel::OneCptTransit, PkModel::OneCptIg, PkModel::TwoCptTransit, PkModel::TwoCptIg]
     );
 
     // ω² chosen per family so each produces crossers: the IG abscissa sits at 0.833 (vs
@@ -2510,10 +2221,7 @@ fn simulated_flip_flop_warning_wording_per_family() {
             msg.contains("Those rows are still returned and still summarised"),
             "{name}: {msg}"
         );
-        assert!(
-            msg.contains("describes an undosed subject"),
-            "{name}: {msg}"
-        );
+        assert!(msg.contains("describes an undosed subject"), "{name}: {msg}");
         // Sentence 3 — why a zero row is not the way to find them
         // (`..._claims_nothing_about_the_row_values` is what makes this sentence necessary).
         assert!(
@@ -2546,10 +2254,7 @@ fn simulated_flip_flop_warning_wording_per_family() {
     }
     // 1-cpt vs 2-cpt: only a 2-cpt model has a confluent-eigenvalue edge — on both families.
     for m in [&t2, &ig2m] {
-        assert!(
-            m.contains("or with coincident disposition eigenvalues"),
-            "{m}"
-        );
+        assert!(m.contains("or with coincident disposition eigenvalues"), "{m}");
     }
     for m in [&t1, &ig1] {
         assert!(!m.contains("coincident"), "{m}");
@@ -2578,10 +2283,7 @@ fn simulated_flip_flop_warning_carries_the_twin_decline_clause() {
     let with = with.expect("declined-twin crossers");
     let without = without.expect("scaling crossers");
     assert!(with.contains(clause), "{with}");
-    assert!(
-        with.contains("CENTRAL"),
-        "the twin parser's own reason is quoted: {with}"
-    );
+    assert!(with.contains("CENTRAL"), "the twin parser's own reason is quoted: {with}");
     assert!(!without.contains(clause), "{without}");
 }
 
@@ -2596,21 +2298,16 @@ fn simulated_flip_flop_warning_carries_the_twin_decline_clause() {
 #[test]
 fn simulated_flip_flop_warning_classifies_on_its_token_not_the_reason() {
     let mut model = parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC);
-    model
-        .parse_warnings
-        .push(crate::types::absorption_twin_declined_warning(
-            "[odes]: the Jacobian is ill-conditioned at the initial state",
-        ));
+    model.parse_warnings.push(crate::types::absorption_twin_declined_warning(
+        "[odes]: the Jacobian is ill-conditioned at the initial state",
+    ));
     let pop = tiny_population();
     let theta = model.default_params.theta.clone();
     let mut tally = SimulatedFlipFlopTally::default();
     // CL/V = 0.5·e^0.6/4 = 0.228 ≥ KTR = 0.2.
     tally.observe(&model, &pop.subjects[0], &theta, &[0.6]);
     let msg = tally.warning(&model).expect("a crossing individual");
-    assert!(
-        msg.contains("ill-conditioned"),
-        "the reason is quoted: {msg}"
-    );
+    assert!(msg.contains("ill-conditioned"), "the reason is quoted: {msg}");
     let entry = crate::types::classify_warning(&msg);
     assert_eq!(entry.category, crate::types::WarningCode::FlipFlop, "{msg}");
     assert_eq!(entry.severity, crate::types::WarningSeverity::Warning);
@@ -2622,11 +2319,7 @@ fn simulated_flip_flop_warning_classifies_on_its_token_not_the_reason() {
 #[test]
 fn simulated_flip_flop_warning_silent_without_a_crosser() {
     for (name, model, var) in [
-        (
-            "narrow ω",
-            parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC),
-            1e-4,
-        ),
+        ("narrow ω", parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC), 1e-4),
         ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC), 4.0),
         ("non-absorption", tiny_model(), 4.0),
     ] {
@@ -2650,9 +2343,7 @@ fn simulated_flip_flop_tally_skips_a_wrong_length_eta() {
     tally.observe(&model, &pop.subjects[0], theta, &crosser);
     tally.observe(&model, &pop.subjects[1], theta, &[]);
     tally.observe(&model, &pop.subjects[1], theta, &[0.6, 0.6]);
-    let msg = tally
-        .warning(&model)
-        .expect("the well-shaped crosser is counted");
+    let msg = tally.warning(&model).expect("the well-shaped crosser is counted");
     assert!(
         msg.contains("1 of 1 simulated individuals dosed before"),
         "the two mis-shaped etas count on neither side: {msg}"
@@ -2713,10 +2404,7 @@ fn row_only_simulate_still_returns_the_diag_rows_when_individuals_cross() {
     let pop = tiny_population();
     let mut params = model.default_params.clone();
     params.omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
-    let opts = SimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = SimulateOptions { seed: Some(7), ..Default::default() };
     let diag = simulate_with_options_diag(&model, &pop, &params, 300, &opts).expect("diag");
     assert!(
         flip_flop_warning(&diag.warnings).is_some(),
@@ -2824,9 +2512,7 @@ fn fit_rejects_ltbs_with_proportional_error() {
     model.log_transform = true;
     let pop = tiny_population();
     let opts = FitOptions::default();
-    let err = fit(&model, &pop, &model.default_params, &opts)
-        .unwrap_err()
-        .to_string();
+    let err = fit(&model, &pop, &model.default_params, &opts).unwrap_err().to_string();
     assert!(
         err.contains("LTBS") && err.contains("Additive"),
         "expected LTBS+proportional rejection, got: {err}"
@@ -2838,11 +2524,7 @@ fn diagnostic_details_covers_numeric_codes() {
     use crate::types::WarningCode;
     // Shim for the scalar codes (no ETA/eigenvalue inputs).
     fn dd(
-        code: &crate::types::WarningCode,
-        dw: f64,
-        lag1: f64,
-        eps: f64,
-        cond: Option<f64>,
+        code: &crate::types::WarningCode, dw: f64, lag1: f64, eps: f64, cond: Option<f64>,
     ) -> Option<serde_json::Value> {
         super::diagnostic_details(
             code,
@@ -2864,56 +2546,27 @@ fn diagnostic_details_covers_numeric_codes() {
     assert_eq!(d["eps_shrinkage"], -0.083);
     assert!((d["eps_shrinkage_pct"].as_f64().unwrap() + 8.3).abs() < 1e-9);
     // Condition number: from the Option.
-    let d = dd(
-        &WarningCode::ConditionNumber,
-        f64::NAN,
-        0.0,
-        f64::NAN,
-        Some(1.4e6),
-    )
-    .expect("cond details");
+    let d = dd(&WarningCode::ConditionNumber, f64::NAN, 0.0, f64::NAN, Some(1.4e6))
+        .expect("cond details");
     assert_eq!(d["condition_number"], 1.4e6);
     // None cases: missing stat, non-finite stat, and non-numeric code.
     assert!(dd(&WarningCode::ConditionNumber, 0.0, 0.0, 0.0, None).is_none());
-    assert!(dd(
-        &WarningCode::DwAutocorrelation,
-        f64::INFINITY,
-        0.0,
-        0.0,
-        None
-    )
-    .is_none());
+    assert!(dd(&WarningCode::DwAutocorrelation, f64::INFINITY, 0.0, 0.0, None).is_none());
     assert!(dd(&WarningCode::Convergence, 1.0, 0.0, 0.0, Some(1.0)).is_none());
 
     // Non-finite *contributing* stats omit details rather than emit a
     // null-valued payload (serde_json maps non-finite floats to null).
     // cov_condition_number = +Inf (documented for near-singular spaces):
-    assert!(dd(
-        &WarningCode::ConditionNumber,
-        f64::NAN,
-        0.0,
-        f64::NAN,
-        Some(f64::INFINITY)
-    )
-    .is_none());
+    assert!(
+        dd(&WarningCode::ConditionNumber, f64::NAN, 0.0, f64::NAN, Some(f64::INFINITY)).is_none()
+    );
     // finite Durbin-Watson but non-finite lag-1 autocorrelation:
-    assert!(dd(
-        &WarningCode::DwAutocorrelation,
-        1.20,
-        f64::NAN,
-        f64::NAN,
-        None
-    )
-    .is_none());
+    assert!(dd(&WarningCode::DwAutocorrelation, 1.20, f64::NAN, f64::NAN, None).is_none());
 }
 
 #[test]
 fn eta_shrinkage_warning_fires_above_threshold_only() {
-    let names = vec![
-        "eta_CL".to_string(),
-        "eta_V".to_string(),
-        "eta_KA".to_string(),
-    ];
+    let names = vec!["eta_CL".to_string(), "eta_V".to_string(), "eta_KA".to_string()];
     // All low → no warning.
     assert!(super::eta_shrinkage_warning(&[0.01, 0.05, 0.10], &names).is_none());
     // NaN is ignored (not treated as high).
@@ -2932,11 +2585,7 @@ fn eta_shrinkage_details_lists_high_etas() {
     let ed = |shrink: &[f64], names: &[String]| {
         super::diagnostic_details(
             &WarningCode::EtaShrinkage,
-            &super::DiagStats {
-                shrinkage_eta: shrink,
-                eta_names: names,
-                ..Default::default()
-            },
+            &super::DiagStats { shrinkage_eta: shrink, eta_names: names, ..Default::default() },
         )
     };
     let names = vec!["eta_CL".to_string(), "eta_V".to_string()];
@@ -2974,10 +2623,7 @@ fn covariance_details_reports_eigenvalues_and_condition() {
     // CovarianceFailed shares the same payload builder.
     assert!(super::diagnostic_details(
         &WarningCode::CovarianceFailed,
-        &super::DiagStats {
-            cov_condition_number: Some(9.9),
-            ..Default::default()
-        },
+        &super::DiagStats { cov_condition_number: Some(9.9), ..Default::default() },
     )
     .is_some());
     // Nothing available (hard failure: no matrix → no eigenvalues, no cond)
@@ -3094,10 +2740,7 @@ fn rebuild_native_key_reconstructs_chain_prefix() {
     }];
     super::rebuild_warnings_structured(&mut fit);
     // Native entry (with details) is preferred despite the prefix.
-    assert_eq!(
-        fit.warnings_structured[0].category,
-        crate::types::WarningCode::BoundaryEstimate
-    );
+    assert_eq!(fit.warnings_structured[0].category, crate::types::WarningCode::BoundaryEstimate);
     assert_eq!(fit.warnings_structured[0].details.as_ref().unwrap()["k"], 1);
 }
 
@@ -3114,10 +2757,7 @@ fn boundary_estimate_warning_emits_typed_entry_with_details() {
     assert_eq!(entry.category, WarningCode::BoundaryEstimate);
     let d = entry.details.as_ref().expect("details");
     assert_eq!(d["parameters"][0]["side"], "lower");
-    assert_eq!(
-        d["parameters"][0]["parameter"],
-        params.theta_names[0].as_str()
-    );
+    assert_eq!(d["parameters"][0]["parameter"], params.theta_names[0].as_str());
 
     // A fixed theta at its bound is not reported.
     params.theta_fixed[0] = true;
@@ -3126,24 +2766,15 @@ fn boundary_estimate_warning_emits_typed_entry_with_details() {
 
 #[test]
 fn packed_guard_side_requires_an_exact_non_degenerate_hit() {
-    assert_eq!(
-        super::packed_guard_side(-8.0, -8.0, 5.0),
-        Some(("lower", -8.0))
-    );
-    assert_eq!(
-        super::packed_guard_side(5.0, -8.0, 5.0),
-        Some(("upper", 5.0))
-    );
+    assert_eq!(super::packed_guard_side(-8.0, -8.0, 5.0), Some(("lower", -8.0)));
+    assert_eq!(super::packed_guard_side(5.0, -8.0, 5.0), Some(("upper", 5.0)));
     assert_eq!(super::packed_guard_side(5.0 - 1e-12, -8.0, 5.0), None);
     // An optimizer can hit the rail exactly in scaled space but recover a
     // packed value one ULP away through `(bound / scale) * scale`.
     let scale = 10.0_f64.ln();
     let recovered = (-8.0 / scale) * scale;
     assert_ne!(recovered, -8.0);
-    assert_eq!(
-        super::packed_guard_side(recovered, -8.0, 5.0),
-        Some(("lower", -8.0))
-    );
+    assert_eq!(super::packed_guard_side(recovered, -8.0, 5.0), Some(("lower", -8.0)));
     assert_eq!(super::packed_guard_side(1.0, 1.0, 1.0), None);
     assert_eq!(super::packed_guard_side(f64::NAN, -8.0, 5.0), None);
 }
@@ -3286,20 +2917,14 @@ fn omega_off_diagonal_lower_rail_is_a_runaway_not_a_collapse() {
         "runaway",
         "but a symmetric rail means it ran away, not collapsed"
     );
-    assert!(
-        !converged,
-        "a runaway must demote convergence on either rail"
-    );
+    assert!(!converged, "a runaway must demote convergence on either rail");
     assert_eq!(entry.severity, WarningSeverity::Critical);
     assert!(msg.contains("implementation rail"));
     assert!(!msg.contains("collapsed toward zero"));
 
     // The classifier must reach the same severity from the flat message alone,
     // which is all a spliced multi-start warning carries.
-    assert_eq!(
-        crate::types::classify_warning(&msg).severity,
-        WarningSeverity::Critical
-    );
+    assert_eq!(crate::types::classify_warning(&msg).severity, WarningSeverity::Critical);
 }
 
 /// #1328 (PR #1406 review): the fit-end guard walk does **not** read the
@@ -3351,16 +2976,10 @@ fn a_block_omega_off_diagonal_at_the_rail_survives_pack_clamp_unpack() {
             .iter()
             .position(|k| *k == PackedCoordKind::OmegaOffDiagonal)
             .expect("the fixture must contain an Ω off-diagonal coordinate");
-        let PackedStart {
-            mut packed, bounds, ..
-        } = pack_with_bounds(&params);
+        let PackedStart { mut packed, bounds, .. } = pack_with_bounds(&params);
         assert_eq!(packed[k], rail, "rail {rail}: the packed start is the rail");
         assert_eq!(
-            if rail > 0.0 {
-                bounds.upper[k]
-            } else {
-                bounds.lower[k]
-            },
+            if rail > 0.0 { bounds.upper[k] } else { bounds.lower[k] },
             rail,
             "rail {rail}: and the rail is that coordinate's own bound"
         );
@@ -3382,18 +3001,11 @@ fn a_block_omega_off_diagonal_at_the_rail_survives_pack_clamp_unpack() {
         let mut converged = true;
         let (_msg, entry) = runaway_guard_warning(&mut converged, &round_tripped)
             .unwrap_or_else(|| panic!("rail {rail}: the round-tripped point is still at the rail"));
-        assert!(
-            !converged,
-            "rail {rail}: a rail that survives the round trip must still demote"
-        );
+        assert!(!converged, "rail {rail}: a rail that survives the round trip must still demote");
         let hit = &entry.details.as_ref().unwrap()["parameters"][0];
         assert_eq!(hit["parameter"], "ETA_V~ETA_CL", "rail {rail}");
         assert_eq!(hit["verdict"], "runaway", "rail {rail}");
-        assert_eq!(
-            hit["packed_estimate"].as_f64().unwrap(),
-            rail,
-            "rail {rail}"
-        );
+        assert_eq!(hit["packed_estimate"].as_f64().unwrap(), rail, "rail {rail}");
     }
 }
 
@@ -3429,10 +3041,7 @@ fn hidden_theta_caps_use_internal_guard_warning_not_user_boundary_warning() {
         runaway_guard_warning(&mut converged, &params).expect("hidden theta lower cap");
     assert!(lower_msg.contains("collapsed toward zero"));
     assert!(converged);
-    assert_eq!(
-        lower_entry.details.as_ref().unwrap()["parameters"][0]["side"],
-        "lower"
-    );
+    assert_eq!(lower_entry.details.as_ref().unwrap()["parameters"][0]["side"], "lower");
 
     // A genuine finite user bound keeps the existing warning and remediation.
     params.theta_lower[0] = 0.1;
@@ -3466,10 +3075,7 @@ fn inflated_rse_warning_emits_typed_entry_with_details() {
     assert_eq!(entry.category, WarningCode::InflatedRse);
     let d = entry.details.as_ref().expect("details");
     assert_eq!(d["threshold_pct"], 50.0);
-    assert_eq!(
-        d["parameters"][0]["parameter"],
-        params.theta_names[0].as_str()
-    );
+    assert_eq!(d["parameters"][0]["parameter"], params.theta_names[0].as_str());
     assert!((d["parameters"][0]["rse_pct"].as_f64().unwrap() - 100.0).abs() < 1e-6);
     // A fixed theta with a huge SE is not reported.
     params.theta_fixed[0] = true;
@@ -3508,10 +3114,7 @@ fn rebuild_prefers_native_entry_and_is_idempotent() {
     super::rebuild_warnings_structured(&mut fit);
     // Native entry preferred over re-classifying the string (details kept).
     assert_eq!(fit.warnings_structured.len(), 1);
-    assert_eq!(
-        fit.warnings_structured[0].category,
-        crate::types::WarningCode::BoundaryEstimate
-    );
+    assert_eq!(fit.warnings_structured[0].category, crate::types::WarningCode::BoundaryEstimate);
     assert_eq!(
         fit.warnings_structured[0].details.as_ref().unwrap()["parameters"][0]["parameter"],
         "CL"
@@ -3639,10 +3242,7 @@ fn asymptotic_refuses_a_logit_theta_outside_the_unit_interval_with_its_code() {
          inv_logit(logit(TVV) + ETA), so it must lie strictly inside \
          (0, 1), but its estimate is 50."
     );
-    assert_eq!(
-        e.suggestion(),
-        Some("declare its upper bound below 1 (e.g. 0.999) and refit")
-    );
+    assert_eq!(e.suggestion(), Some("declare its upper bound below 1 (e.g. 0.999) and refit"));
     assert_eq!(
         e.to_string(),
         "Cannot draw parameter uncertainty for TVV: it is used as \
@@ -3650,11 +3250,9 @@ fn asymptotic_refuses_a_logit_theta_outside_the_unit_interval_with_its_code() {
          (0, 1), but its estimate is 50. Declare its upper bound below 1 \
          (e.g. 0.999) and refit."
     );
-    assert!(
-        simulate_with_uncertainty(&model, &pop, &fit, &opts(0, UncertaintyMethod::Asymptotic))
-            .unwrap()
-            .is_empty()
-    );
+    assert!(simulate_with_uncertainty(&model, &pop, &fit, &opts(0, UncertaintyMethod::Asymptotic))
+        .unwrap()
+        .is_empty());
     let sir = simulate_with_uncertainty(&model, &pop, &fit, &opts(2, UncertaintyMethod::Sir))
         .unwrap_err();
     assert_eq!(sir.code(), Some("E_FIT_INPUT_MISSING"), "{sir}");
@@ -3707,9 +3305,7 @@ fn spread_default_matches_exhaustive_literal() {
 
     // Non-degenerate: the comparison is worthless on an empty or all-zero run.
     assert_eq!(a.len(), 3 * 2 * 2 * 3);
-    assert!(a
-        .iter()
-        .all(|r| r.ipred.is_finite() && r.outcome.continuous_value().is_finite()));
+    assert!(a.iter().all(|r| r.ipred.is_finite() && r.outcome.continuous_value().is_finite()));
     assert!(a.iter().any(|r| r.ipred != 0.0));
 
     assert_eq!(a.len(), b.len());
@@ -3719,10 +3315,7 @@ fn spread_default_matches_exhaustive_literal() {
         assert_eq!(x.draw, y.draw);
         assert_eq!(x.sim, y.sim);
         assert_eq!(x.ipred.to_bits(), y.ipred.to_bits());
-        assert_eq!(
-            x.outcome.continuous_value().to_bits(),
-            y.outcome.continuous_value().to_bits()
-        );
+        assert_eq!(x.outcome.continuous_value().to_bits(), y.outcome.continuous_value().to_bits());
     }
 }
 
@@ -3840,11 +3433,7 @@ fn npde_reference_reports_its_flip_flop_crossers() {
 fn npde_reference_flip_flop_silent_without_a_crosser() {
     assert_eq!(npde_reference_crossers(1e-4, 300, 7), 0);
     for (name, model, var) in [
-        (
-            "narrow ω",
-            parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC),
-            1e-4,
-        ),
+        ("narrow ω", parse_fixture(INDOMAIN_TWINLESS_TRANSIT_SRC), 1e-4),
         ("twin", parse_fixture(PLAIN_TWIN_TRANSIT_SRC), 4.0),
         ("non-absorption", tiny_model(), 4.0),
     ] {
@@ -3871,15 +3460,9 @@ fn fit_surfaces_the_npde_reference_flip_flop_count() {
         .expect("an in-domain fit evaluates");
     let msg = flip_flop_warning(&res.warnings).expect("the fit reports the reference crossers");
     let want = npde_reference_crossers(0.09, nsim, seed);
-    assert!(
-        msg.contains(&format!("{want} of 2000 NPDE/NPD reference replicates")),
-        "{msg}"
-    );
+    assert!(msg.contains(&format!("{want} of 2000 NPDE/NPD reference replicates")), "{msg}");
     // The same fit without NPDE has nothing to report: the warning is the reference's.
-    let off = crate::types::FitOptions {
-        npde_nsim: 0,
-        ..opts
-    };
+    let off = crate::types::FitOptions { npde_nsim: 0, ..opts };
     let res = crate::api::fit(&model, &tiny_population(), &model.default_params, &off)
         .expect("an in-domain fit evaluates");
     assert_eq!(flip_flop_warning(&res.warnings), None);
@@ -3920,18 +3503,12 @@ fn draw_independent_preconditions_run_once_per_call() {
     assert!(draws.len() > 1, "several draws must have run: {draws:?}");
     assert_eq!(runs, 1, "once for {} simulated draws", draws.len());
 
-    let sim_opts = SimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let sim_opts = SimulateOptions { seed: Some(7), ..Default::default() };
     let (out, runs) = draw_independent_runs(|| {
         simulate_with_options_diag(&model, &pop, &model.default_params, 3, &sim_opts)
     });
     out.expect("simulate_with_options_diag");
-    assert_eq!(
-        runs, 1,
-        "simulate_with_options_diag: once, not up front and again"
-    );
+    assert_eq!(runs, 1, "simulate_with_options_diag: once, not up front and again");
 
     // `simulate` hands the chokepoint no proof, so it runs the list itself, once.
     let (out, runs) =
@@ -4100,11 +3677,7 @@ fn uncertainty_draw_at_the_point_estimate_reproduces_simulate_with_options() {
             &pop,
             p,
             6,
-            &SimulateOptions {
-                seed: Some(SEED),
-                horizon: Some(h),
-                ..Default::default()
-            },
+            &SimulateOptions { seed: Some(SEED), horizon: Some(h), ..Default::default() },
         )
         .unwrap_or_else(|e| panic!("{name}: options path: {e}"));
         assert_straddles_horizon(name, &want, h);
@@ -4171,10 +3744,7 @@ fn uncertainty_horizon_censors_every_draw_at_the_horizon() {
                 .iter()
                 .filter(|r| r.draw == draw)
                 .filter_map(|r| match r.outcome {
-                    crate::types::SimOutcome::Event {
-                        observed: false,
-                        time,
-                    } => Some(time),
+                    crate::types::SimOutcome::Event { observed: false, time } => Some(time),
                     _ => None,
                 })
                 .collect();
@@ -4210,10 +3780,7 @@ fn uncertainty_horizon_overrides_the_record_window_of_a_single_event_hazard() {
             .expect("simulate")
             .iter()
             .filter_map(|r| match r.outcome {
-                crate::types::SimOutcome::Event {
-                    observed: false,
-                    time,
-                } => Some(time),
+                crate::types::SimOutcome::Event { observed: false, time } => Some(time),
                 _ => None,
             })
             .collect()
@@ -4243,10 +3810,6 @@ fn uncertainty_horizon_leaves_gaussian_rows_bit_identical() {
             .collect()
     };
     let without = run(None);
-    assert_eq!(
-        without.len(),
-        3 * 2 * 2 * 3,
-        "3 draws x 2 sims x 2 subjects x 3 obs"
-    );
+    assert_eq!(without.len(), 3 * 2 * 2 * 3, "3 draws x 2 sims x 2 subjects x 3 obs");
     assert_eq!(run(Some(2.0)), without);
 }

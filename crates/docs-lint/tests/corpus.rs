@@ -19,13 +19,7 @@ fn docs_tree_passes_all_four_rules() {
 
     let mut report = String::new();
     for v in &filtered.failing {
-        report.push_str(&format!(
-            "{}:{}: {}: {}\n",
-            v.file,
-            v.line,
-            v.rule.as_str(),
-            v.message
-        ));
+        report.push_str(&format!("{}:{}: {}: {}\n", v.file, v.line, v.rule.as_str(), v.message));
     }
     for key in &filtered.stale {
         report.push_str(&format!(
@@ -49,14 +43,8 @@ fn baseline_entries_all_name_a_live_section() {
         return;
     }
     // A very large limit yields every chunk in the corpus, keyed the same way.
-    let all = lint_tree(
-        &root.join("docs"),
-        &root,
-        &Config {
-            max_chars: usize::MAX,
-        },
-    )
-    .expect("read docs/");
+    let all = lint_tree(&root.join("docs"), &root, &Config { max_chars: usize::MAX })
+        .expect("read docs/");
     // With no size violations possible, anything left is another rule; the keys
     // we need come from a zero-limit run instead.
     assert!(all.iter().all(|v| v.chunk.is_none()));

@@ -45,30 +45,17 @@ pub(crate) fn log_sum_exp_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
         return (f64::NEG_INFINITY, Vec::new());
     }
 
-    let n_pos_inf = xs
-        .iter()
-        .filter(|x| x.is_infinite() && x.is_sign_positive())
-        .count();
+    let n_pos_inf = xs.iter().filter(|x| x.is_infinite() && x.is_sign_positive()).count();
     if n_pos_inf > 0 {
         let w = 1.0 / n_pos_inf as f64;
         let weights = xs
             .iter()
-            .map(|x| {
-                if x.is_infinite() && x.is_sign_positive() {
-                    w
-                } else {
-                    0.0
-                }
-            })
+            .map(|x| if x.is_infinite() && x.is_sign_positive() { w } else { 0.0 })
             .collect();
         return (f64::INFINITY, weights);
     }
 
-    let m = xs
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite())
-        .fold(f64::NEG_INFINITY, f64::max);
+    let m = xs.iter().copied().filter(|x| x.is_finite()).fold(f64::NEG_INFINITY, f64::max);
     if !m.is_finite() {
         return (f64::NEG_INFINITY, vec![0.0; xs.len()]);
     }
@@ -80,11 +67,8 @@ pub(crate) fn log_sum_exp_normalised(xs: &[f64]) -> (f64, Vec<f64>) {
         sum += s;
     }
     let lse = m + sum.ln();
-    let weights: Vec<f64> = if sum > 0.0 {
-        shifted.iter().map(|&s| s / sum).collect()
-    } else {
-        vec![0.0; xs.len()]
-    };
+    let weights: Vec<f64> =
+        if sum > 0.0 { shifted.iter().map(|&s| s / sum).collect() } else { vec![0.0; xs.len()] };
     (lse, weights)
 }
 
@@ -123,10 +107,7 @@ mod tests {
         assert!((log_sum_exp2(a, b) - want).abs() < 1e-12);
         assert!((log_sum_exp2(f64::NEG_INFINITY, 5.0) - 5.0).abs() < 1e-12);
         assert!((log_sum_exp2(5.0, f64::NEG_INFINITY) - 5.0).abs() < 1e-12);
-        assert_eq!(
-            log_sum_exp2(f64::NEG_INFINITY, f64::NEG_INFINITY),
-            f64::NEG_INFINITY
-        );
+        assert_eq!(log_sum_exp2(f64::NEG_INFINITY, f64::NEG_INFINITY), f64::NEG_INFINITY);
         assert!(
             (log_sum_exp2(1000.0, 1001.0) - (1001.0 + (1.0 + (-1.0_f64).exp()).ln())).abs() < 1e-9
         );

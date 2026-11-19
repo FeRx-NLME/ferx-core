@@ -94,11 +94,7 @@ fn bloq_m3_analytic_covariance_at_nonmem_minimum() {
         eprintln!("M3 SE[{i}] ferx={a} NONMEM={n} rel={rel}");
         assert!(a.is_finite() && *a > 0.0);
         let tolerance = if i < 3 { 0.01 } else { 0.20 };
-        assert!(
-            rel < tolerance,
-            "M3 SE[{i}] exceeds the {:.0}% NONMEM band",
-            100.0 * tolerance
-        );
+        assert!(rel < tolerance, "M3 SE[{i}] exceeds the {:.0}% NONMEM band", 100.0 * tolerance);
     }
 }
 
@@ -113,17 +109,11 @@ fn bloq_m3_analytic_covariance_at_nonmem_minimum() {
 fn bloq_m3_analytic_lbfgs_matches_nonmem() {
     let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
         .expect("warfarin BLOQ model must parse");
-    assert!(
-        matches!(model.bloq_method, ferx_core::BloqMethod::M3),
-        "model must be M3"
-    );
+    assert!(matches!(model.bloq_method, ferx_core::BloqMethod::M3), "model must be M3");
     let population = read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
         .expect("warfarin BLOQ data must load");
     assert!(
-        population
-            .subjects
-            .iter()
-            .any(|s| s.cens.iter().any(|&c| c != 0)),
+        population.subjects.iter().any(|s| s.cens.iter().any(|&c| c != 0)),
         "data must contain censored rows"
     );
 
@@ -140,11 +130,7 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
 
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("analytic M3 fit must succeed");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
 
     // NONMEM 7.5.1 LAPLACE M3 MLE (tests/nonmem/warfarin_bloq.lst). The OFV is not
     // compared (F_FLAG likelihood constant offset); the estimates are pinned.
@@ -156,42 +142,14 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
     const NM_OM_CL: f64 = 0.0288494;
     const NM_OM_V: f64 = 0.00954401;
     const NM_OM_KA: f64 = 0.335772;
-    assert!(
-        rel(result.theta[0], NM_TVCL) < 0.01,
-        "TVCL {} vs NM {NM_TVCL}",
-        result.theta[0]
-    );
-    assert!(
-        rel(result.theta[1], NM_TVV) < 0.01,
-        "TVV {} vs NM {NM_TVV}",
-        result.theta[1]
-    );
-    assert!(
-        rel(result.theta[2], NM_TVKA) < 0.02,
-        "TVKA {} vs NM {NM_TVKA}",
-        result.theta[2]
-    );
-    assert!(
-        rel(result.sigma[0], NM_PROP_SD) < 0.02,
-        "PROP {} vs NM {NM_PROP_SD}",
-        result.sigma[0]
-    );
+    assert!(rel(result.theta[0], NM_TVCL) < 0.01, "TVCL {} vs NM {NM_TVCL}", result.theta[0]);
+    assert!(rel(result.theta[1], NM_TVV) < 0.01, "TVV {} vs NM {NM_TVV}", result.theta[1]);
+    assert!(rel(result.theta[2], NM_TVKA) < 0.02, "TVKA {} vs NM {NM_TVKA}", result.theta[2]);
+    assert!(rel(result.sigma[0], NM_PROP_SD) < 0.02, "PROP {} vs NM {NM_PROP_SD}", result.sigma[0]);
     let om: Vec<f64> = (0..3).map(|i| result.omega[(i, i)]).collect();
-    assert!(
-        rel(om[0], NM_OM_CL) < 0.05,
-        "ω²(CL) {} vs NM {NM_OM_CL}",
-        om[0]
-    );
-    assert!(
-        rel(om[1], NM_OM_V) < 0.05,
-        "ω²(V) {} vs NM {NM_OM_V}",
-        om[1]
-    );
-    assert!(
-        rel(om[2], NM_OM_KA) < 0.05,
-        "ω²(KA) {} vs NM {NM_OM_KA}",
-        om[2]
-    );
+    assert!(rel(om[0], NM_OM_CL) < 0.05, "ω²(CL) {} vs NM {NM_OM_CL}", om[0]);
+    assert!(rel(om[1], NM_OM_V) < 0.05, "ω²(V) {} vs NM {NM_OM_V}", om[1]);
+    assert!(rel(om[2], NM_OM_KA) < 0.05, "ω²(KA) {} vs NM {NM_OM_KA}", om[2]);
 }
 
 /// FOCE-M3 (no interaction) on the analytic FOCE censored gradient.
@@ -211,10 +169,7 @@ fn bloq_m3_analytic_lbfgs_matches_nonmem() {
 /// (The censored inner-EBE gradient is separately FD-checked by the
 /// `analytic_inner_gradient_m3_matches_fd_on_warfarin_bloq` unit test.)
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn bloq_m3_foce_analytic_matches_fd() {
     let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
         .expect("warfarin BLOQ model must parse");

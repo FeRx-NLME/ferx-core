@@ -119,10 +119,7 @@ mod tests {
 
     #[test]
     fn username_prefers_user_over_username() {
-        assert_eq!(
-            username_from_env(Some("alice".into()), Some("BOB".into())),
-            "alice"
-        );
+        assert_eq!(username_from_env(Some("alice".into()), Some("BOB".into())), "alice");
     }
 
     #[test]
