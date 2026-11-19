@@ -276,8 +276,8 @@ pub(crate) fn verify_given_population(
 fn check_lent_stats(
     m: &CompiledModel, population: &Population, supplied: bool, with_model_file: bool,
 ) -> Result<(), EngineError> {
-    let mismatch =
-        crate::api::check_stats_on(m, population).map_err(EngineError::from_diagnostic)?;
+    let mismatch = crate::covariate_stats::check_stats_on(m, population)
+        .map_err(EngineError::from_diagnostic)?;
     let Some(d) = mismatch else {
         return Ok(());
     };
@@ -516,7 +516,7 @@ fn resolve_fit_inputs_unattributed<'a>(
             } else {
                 Some(population.to_mut())
             };
-            crate::api::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
+            crate::levels::bind_from_fit_on(&mut parsed, &text, pop, &fit.data_bindings)
                 .map_err(EngineError::from_diagnostic)?;
             ModelRef::Built(Box::new(parsed.model))
         }
@@ -531,7 +531,7 @@ fn resolve_fit_inputs_unattributed<'a>(
                 ));
             }
             if let Cow::Owned(p) = &mut population {
-                crate::api::write_fitted_level_columns(m, p, &m.data_bindings().levels)
+                crate::levels::write_fitted_level_columns(m, p, &m.data_bindings().levels)
                     .map_err(EngineError::from_diagnostic)?;
             }
             crate::diagnostics::first_error(&crate::api::check_covariate_model_bound(m))?;

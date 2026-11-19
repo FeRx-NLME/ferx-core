@@ -370,7 +370,7 @@ fn run_covariance_scoped(
         &mut out.warnings,
     );
     out.warnings.extend(resolved_warning);
-    out.warnings.extend(crate::api::rsr_one_subject_levels_warning(
+    out.warnings.extend(crate::levels::rsr_one_subject_levels_warning(
         model_ref,
         pop_ref,
         out.covariance_method,
@@ -1611,7 +1611,8 @@ mod from_fit_bindings {
             let text = std::fs::read_to_string(&c.model_path).unwrap();
             let mut parsed =
                 crate::parser::model_parser::parse_full_model_file(&c.model_path).unwrap();
-            crate::api::bind_covariate_stats(&mut parsed, &text, &c.prep.population).unwrap();
+            crate::covariate_stats::bind_covariate_stats(&mut parsed, &text, &c.prep.population)
+                .unwrap();
             let fresh = run_covariance(&fit, Some(&parsed.model), pop, &c.opts);
             if levels {
                 let err = fresh.map(|_| ()).expect_err("the level block stays unbound");

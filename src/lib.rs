@@ -4,6 +4,7 @@ pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
 pub(crate) mod cold_sort;
+pub(crate) mod covariate_stats;
 pub mod diagnostics;
 pub(crate) mod dosing;
 pub mod edit;
@@ -12,10 +13,12 @@ pub mod environment;
 pub mod estimation;
 pub mod frem;
 pub mod io;
+pub(crate) mod levels;
 #[cfg(feature = "markov")]
 pub mod markov;
 pub mod model_selection;
 pub mod nn;
+pub(crate) mod occasions;
 pub mod ode;
 pub(crate) mod par;
 pub mod parser;

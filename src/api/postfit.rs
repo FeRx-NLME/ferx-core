@@ -2,6 +2,7 @@
 //! doc / Key Modules table for the split rationale.
 use super::*;
 use crate::cold_sort::ColdSort;
+use crate::estimation::parameterization::theta_se_from_packed;
 use crate::estimation::parameterization::{
     chol_lt_idx, omega_cholesky_jacobian, omega_packed_len, rho_chain, rho_packed_start,
     PackedCoordKind,
@@ -4289,16 +4290,6 @@ pub(crate) fn ode_solver_diagnostics_warning(
     );
     let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), details);
     Some((msg, entry))
-}
-
-/// A θ's standard error on its own scale from its packed-scale variance `var`: the
-/// packed SE (`0.0` for a non-positive variance, as every `se_*` vector reports it)
-/// times the packing Jacobian. The one rule behind `se_theta` and a free level's
-/// standard error in `theta_level_values` (#1890), so the two are equal by
-/// construction rather than by a second formula.
-pub(crate) fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f64 {
-    let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
-    crate::estimation::parameterization::theta_packing_jacobian(theta, theta_lower) * se_packed
 }
 
 /// Extract standard errors from covariance matrix on the packed parameter scale,

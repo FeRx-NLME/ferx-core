@@ -280,7 +280,7 @@ fn bound_on_its_own(c: &Case, relabel: fn(f64) -> f64) -> Population {
             }
         }
     }
-    crate::api::bind_theta_levels(&mut parsed, &text, &mut pop).expect("bound on its own");
+    crate::levels::bind_theta_levels(&mut parsed, &text, &mut pop).expect("bound on its own");
     pop
 }
 
@@ -545,7 +545,7 @@ fn a_population_bound_for_other_levels_hears_the_fingerprint_refusal() {
             }
         }
     }
-    crate::api::bind_theta_levels(&mut parsed, &text, &mut other).expect("bound on its own");
+    crate::levels::bind_theta_levels(&mut parsed, &text, &mut other).expect("bound on its own");
     let model = &c.prep.parsed.model;
     let codes: Vec<_> =
         crate::api::check_level_index_columns(model, &other, crate::api::LevelDataEntry::Run)
@@ -1086,7 +1086,7 @@ mod fitted_population_1783 {
         // fixture differently.
         let derive = |rule: &IovOccasionRule| {
             let mut p = f.prep.population.clone();
-            crate::api::apply_iov_occasion_rule(&mut p, rule, false, &mut Vec::new());
+            crate::occasions::apply_iov_occasion_rule(&mut p, rule, false, &mut Vec::new());
             p.subjects[0].occasions.clone()
         };
         assert_ne!(
