@@ -373,10 +373,12 @@ fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
 
 /// #2994 review r2, end to end on real solves: a tighter pass that clamps at `min_dt` returns
 /// a finite objective that never met its tolerance, so it is reported as unchecked rather than
-/// compared. `min_dt = 0.5` is where the fit's own tolerance (1e-8) integrates cleanly — the
-/// post-fit solver pass carries no `W_ODE_SOLVER_DIAGNOSTICS` — while 1e-9 force-accepts steps
-/// there (measured: macOS arm64). The straddle is asserted, so the fixture cannot quietly turn
-/// into one where the fit itself is unclean.
+/// compared. `min_dt = 0.5` is where the fit's own tolerance (1e-6) integrates cleanly — the
+/// post-fit solver pass carries no `W_ODE_SOLVER_DIAGNOSTICS`, and the fit-side re-solve, EBE
+/// search included, is clean (the reason names the tighter side) — while 1e-7 force-accepts
+/// 144 steps there (measured: macOS arm64). At 1e-8 the fit-side re-solve clamps too (#2994
+/// review r7), which is why the fixture sits lower. The straddle is asserted, so the fixture
+/// cannot quietly turn into one where the fit side is unclean.
 #[test]
 fn a_tight_pass_that_clamped_is_reported_unchecked_not_compared() {
     let mut prep = mm_iv();
@@ -387,7 +389,7 @@ fn a_tight_pass_that_clamped_is_reported_unchecked_not_compared() {
         .unwrap()
         .solver_opts
         .min_dt = 0.5;
-    let r = evaluate(&prep, 1e-8);
+    let r = evaluate(&prep, 1e-6);
     assert!(
         !r.warnings
             .iter()
@@ -553,74 +555,81 @@ fn an_ebe_pass_failing_the_convergence_guard_is_reported_unchecked() {
     );
 }
 
-/// #2994 review r4: the fit-tolerance side scored at the fit's own stored modes is checked
-/// for solver health too, per subject and over every AGQ node, not taken from `pop_nll_opts`
-/// unseen. With a minimum step the fit's own tolerance cannot honour, that side clamps, and
-/// the check reports itself unchecked naming the fit side, rather than comparing a finite,
-/// wrong objective.
+/// #2994 review r7: both sides re-find the EBEs the same way, so the extra optimization a
+/// re-solve does is not read as tolerance error. On a model propagated exactly (nothing in
+/// its objective integrates), starting from modes far from converged — η = 0 — with the inner
+/// solve cut to two iterations and every subject allowed to stay unconverged, the two sides
+/// still agree to roundoff. The straddle is asserted too: the objective at the stored modes
+/// is more than the threshold away from the re-solved one, so a check that scored them on one
+/// side, as before, would have warned on this model.
 #[test]
-fn a_stored_fit_side_that_did_not_integrate_cleanly_is_reported_unchecked() {
-    let mut prep = mm_iv();
-    {
-        let spec = prep.parsed.model.ode_spec.as_mut().unwrap();
-        spec.solver_opts.min_dt = 2.0;
-        spec.solver_opts.reltol = 1e-6;
-        spec.solver_opts.abstol = 1e-6;
-    }
+fn both_sides_resolve_the_ebes_alike_so_ebe_movement_is_not_a_shift() {
+    let prep = crate::api::prepare_run("examples/one_cpt_iv_ode.ferx", Some("data/one_cpt_iv.csv"))
+        .expect("prepare one_cpt_iv_ode");
     let model = &prep.parsed.model;
+    assert_eq!(
+        model
+            .integrator_spec()
+            .expect("an ODE model")
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "fixture: the model must be propagated exactly"
+    );
     let n = prep.population.subjects.len();
     let etas: Vec<DVector<f64>> = (0..n).map(|_| DVector::zeros(model.n_eta)).collect();
-    let hs: Vec<DMatrix<f64>> = (0..n)
-        .map(|_| DMatrix::identity(model.n_eta, model.n_eta))
-        .collect();
     let kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n];
     let opts = FitOptions {
         method: EstimationMethod::Laplace,
-        n_agq: 3,
+        inner_maxiter: 2,
+        max_unconverged_frac: 1.0,
         ..FitOptions::default()
     };
-    let (_, st) = score_stored_counted(
+    let s = ofv_tolerance_shift(
         model,
         &prep.population,
         &prep.init_params,
         &etas,
-        &hs,
         &kappas,
         &opts,
-    );
-    assert!(
-        unclean_integration(&st).is_some(),
-        "fixture: the stored-mode score must clamp: {st:?}"
-    );
-    let why = ofv_tolerance_shift(
-        model,
-        &prep.population,
-        &prep.init_params,
-        &etas,
-        &hs,
-        &kappas,
-        &opts,
-        FitSide::Stored,
     )
     .expect("the check applies")
-    .expect_err("an unclean fit side is not compared");
-    assert!(why.starts_with("at the fit's own tolerance, "), "{why}");
+    .expect("the check completes");
     assert!(
-        why.contains("the objective at the fit's modes did not integrate cleanly:"),
-        "{why}"
+        s.shift().is_finite() && s.shift().abs() < 1e-9,
+        "an exact objective moved by {} between tolerances",
+        s.shift()
     );
+    assert!(not_settled_warning(&s).is_none());
+
+    let h: Vec<DMatrix<f64>> = (0..n)
+        .map(|_| DMatrix::identity(model.n_eta, model.n_eta))
+        .collect();
+    let at_stored = 2.0
+        * pop_nll_opts(
+            model,
+            &prep.population,
+            &prep.init_params,
+            &etas,
+            &h,
+            &kappas,
+            &opts,
+        );
     assert!(
-        why.contains("steps clamped at the minimum step size"),
-        "{why}"
+        (at_stored - s.fit_ofv).abs() > OFV_SHIFT_WARN,
+        "fixture: the re-solve must move the modes ({at_stored} at the stored modes vs {} \
+         re-solved)",
+        s.fit_ofv
     );
 }
 
 /// #2994 review r6: a model whose PK is routed to the exact matrix exponential is still
 /// checked, because its objective can integrate at the tolerance — here a drug-driven
 /// (time-inhomogeneous) CTMM likelihood, which solves its occupancy ODE per gap. Measured on
-/// this fixture (macOS arm64) at `outer_maxiter = 0`: `1e-1` → `1e-2` moves the OFV by +0.984,
-/// and at `1e-6` the OFV is within 1e-4 of its `1e-8` value, so the pair sits ~10× above and
-/// far below the threshold. With the old `Linear` early return the loose half is silent.
+/// this fixture (macOS arm64) at `outer_maxiter = 0`: `5e-2` → `5e-3` moves the OFV by +0.624
+/// with every re-solved EBE passing the guard (at `1e-1` and `3e-2` 14 and 12 of 60 do not,
+/// and the check reports itself unchecked), and at `1e-6` the OFV is within 1e-4 of its `1e-8`
+/// value, so the pair sits ~6× above and far below the threshold. With the old `Linear` early return the loose half is silent.
 #[cfg(feature = "markov")]
 #[test]
 fn a_linear_routed_model_with_an_integrated_likelihood_is_checked() {
@@ -656,11 +665,11 @@ fn a_linear_routed_model_with_an_integrated_likelihood_is_checked() {
         )
         .expect("the evaluation runs")
     };
-    let loose = at(1e-1);
+    let loose = at(5e-2);
     let msg = not_settled(&loose)
         .unwrap_or_else(|| panic!("no W_ODE_OFV_NOT_SETTLED in {:?}", loose.warnings));
     assert!(
-        msg.contains("ode_reltol = 1e-2 / ode_abstol = 1e-2 instead of the fit's 1e-1 / 1e-1"),
+        msg.contains("ode_reltol = 5e-3 / ode_abstol = 5e-3 instead of the fit's 5e-2 / 5e-2"),
         "{msg}"
     );
     let settled = at(1e-6);
@@ -669,4 +678,53 @@ fn a_linear_routed_model_with_an_integrated_likelihood_is_checked() {
         "a settled objective warned: {:?}",
         settled.warnings
     );
+}
+
+/// #2994 review r7: a cancelled fit does not wait for the check. Each subject's task reads
+/// the token before solving, so a cancelled pass integrates nothing, and the check is then
+/// skipped (`None`), not reported unchecked: the fit is returning "cancelled by user".
+#[test]
+fn a_cancelled_fit_skips_the_check_without_solving() {
+    let prep = mm_iv();
+    let model = &prep.parsed.model;
+    let n = prep.population.subjects.len();
+    let etas: Vec<DVector<f64>> = (0..n).map(|_| DVector::zeros(model.n_eta)).collect();
+    let kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n];
+    let flag = crate::cancel::CancelFlag::new();
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        cancel: Some(flag.clone()),
+        ..FitOptions::default()
+    };
+    let (_, _, live) = rescore_counted(
+        model,
+        &prep.population,
+        &prep.init_params,
+        &etas,
+        &kappas,
+        &opts,
+    );
+    assert!(
+        live.accepted_steps > 0,
+        "fixture: an uncancelled pass integrates"
+    );
+    flag.cancel();
+    let (_, _, st) = rescore_counted(
+        model,
+        &prep.population,
+        &prep.init_params,
+        &etas,
+        &kappas,
+        &opts,
+    );
+    assert_eq!(st.accepted_steps, 0, "a cancelled pass integrated");
+    assert!(ofv_tolerance_shift(
+        model,
+        &prep.population,
+        &prep.init_params,
+        &etas,
+        &kappas,
+        &opts
+    )
+    .is_none());
 }

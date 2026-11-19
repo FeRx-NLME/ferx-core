@@ -68,7 +68,8 @@ pub(crate) struct OdeToleranceShift {
     pub(crate) fit_abstol: f64,
     pub(crate) tight_reltol: f64,
     pub(crate) tight_abstol: f64,
-    /// The objective (−2LL, without penalties) at the fit's tolerance.
+    /// The objective (−2LL, without penalties) at the fit's tolerance, EBEs re-found from the
+    /// fit's modes exactly as on the tight side.
     pub(crate) fit_ofv: f64,
     /// The same objective, EBEs re-found, at the tighter tolerance.
     pub(crate) tight_ofv: f64,
@@ -181,9 +182,12 @@ pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Op
 ///   `max_unconverged_frac` allows. Such a pass is rejected by every objective evaluation
 ///   of the fit, and scoring it here would blame EBE error on the ODE tolerance.
 ///
-/// The solve is the seeded warm one an `agq_eval_only` stage runs, per subject, so on the
-/// fit-tolerance side it reproduces that stage's objective; the score is `pop_nll_opts`' term
+/// The solve is the seeded warm one an `agq_eval_only` stage runs, per subject, on both sides
+/// of the check; the score is `pop_nll_opts`' term
 /// for that subject (the AGQ marginal when the stage has nodes, the FOCE/FOCEI one otherwise).
+///
+/// `None` when the fit was cancelled during the pass: its subjects stopped solving, so there
+/// is nothing to judge, and the check is skipped rather than reported.
 ///
 /// [`ebe_guard_rejects`]: crate::estimation::outer_optimizer::ebe_guard_rejects
 fn rescore_checked(
@@ -193,9 +197,12 @@ fn rescore_checked(
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Result<f64, String> {
+) -> Option<Result<f64, String>> {
     let (ofv, ebe_stats, solver) =
         rescore_counted(model, population, params, eta_hats, kappas, options);
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
     // Every reason, not the first: a clamped trajectory usually also stalls the EBE search,
     // and the clamp is the cause the user can act on.
     let mut why = Vec::new();
@@ -217,11 +224,11 @@ fn rescore_checked(
     if let Some(counters) = unclean_integration(&solver) {
         why.push(format!("the solve did not integrate cleanly: {counters}"));
     }
-    if why.is_empty() {
+    Some(if why.is_empty() {
         Ok(ofv)
     } else {
         Err(why.join("; "))
-    }
+    })
 }
 
 /// [`rescore_checked`]'s objective, with the EBE pass's statistics and the solver counters of
@@ -251,6 +258,16 @@ fn rescore_counted(
     .with_prev_etas(PrevEtas::Solved);
     let min_obs = (options.min_obs_for_convergence_check as usize).max(1);
     let per_subject = crate::par::map(population.subjects.len(), |i| {
+        // A cancelled fit stops solving: the remaining subjects return at once, and the
+        // caller discards the pass (`ofv_tolerance_shift` reads the token after it).
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return (
+                f64::NAN,
+                false,
+                false,
+                crate::ode::solver::OdeSolverStats::default(),
+            );
+        }
         let subject = &population.subjects[i];
         let scope = crate::ode::solver::SolverStatsScope::enter();
         let schedule = cacheable_schedule(model, subject);
@@ -324,111 +341,41 @@ fn score_subject(
     }
 }
 
-/// `pop_nll_opts` at the fit's own stored modes, scored subject by subject so the solver
-/// counters of every integration behind it — every AGQ node and its anchor — are collected,
-/// one [`crate::ode::solver::SolverStatsScope`] per subject task (#2994 review r4).
-fn score_stored_counted(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
-) -> (f64, crate::ode::solver::OdeSolverStats) {
-    let per_subject = crate::par::map(population.subjects.len(), |i| {
-        let scope = crate::ode::solver::SolverStatsScope::enter();
-        let nll = score_subject(
-            model,
-            &population.subjects[i],
-            params,
-            &eta_hats[i],
-            &h_matrices[i],
-            kappas.get(i).map_or(&[], Vec::as_slice),
-            options,
-        );
-        (nll, scope.collected())
-    });
-    let mut ofv = 0.0;
-    let mut solver = crate::ode::solver::OdeSolverStats::default();
-    for (nll, st) in &per_subject {
-        ofv += 2.0 * nll;
-        solver.merge(st);
-    }
-    (ofv, solver)
-}
-
-/// The fit-tolerance objective at the stored modes, `Err` when an integration behind it was
-/// not clean: a clamped or unfinished AGQ node returns a finite, wrong term, and comparing it
-/// would read as settled whenever the tight side happens to land within the threshold.
-fn score_stored_checked(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
-) -> Result<f64, String> {
-    let (ofv, solver) = score_stored_counted(
-        model, population, params, eta_hats, h_matrices, kappas, options,
-    );
-    match unclean_integration(&solver) {
-        Some(counters) => Err(format!(
-            "the objective at the fit's modes did not integrate cleanly: {counters}"
-        )),
-        None => Ok(ofv),
-    }
-}
-
-/// Which modes the fit-tolerance side of the check scores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FitSide {
-    /// The fit's own η̂, `H` and κ̂, as they are: they are the modes the reported OFV was
-    /// scored at (an estimating stage owns it).
-    Stored,
-    /// Re-found at the fit's tolerance from the stored modes, as the tight side is: the stored
-    /// modes belong to a different objective than the one published — an `agq_eval_only`
-    /// readout re-found its own and kept only the OFV.
-    Resolved,
-}
-
 /// The check itself (#2994): `None` when it does not apply ([`tightened_override`]), `Err`
 /// with the reason when the tighter scope could not be built, or a re-scored side cannot be
 /// trusted ([`rescore_checked`]).
 ///
 /// `options` must be the options of the stage that owns the published OFV (its `method`,
 /// `interaction`, `n_agq` and inner settings), so the objective re-scored is the one the fit
-/// reported. The tight side always re-finds the modes from the stored ones; `fit_side` says
-/// what the fit-tolerance side scores.
-#[allow(clippy::too_many_arguments)]
+/// reported.
+///
+/// Both sides re-find the EBEs the same way — one warm solve per subject from the fit's
+/// stored modes, under the same inner settings — and differ only in the ODE tolerance armed
+/// (#2994 review r7). Scoring the stored modes on one side and re-optimized ones on the other
+/// would put the extra EBE optimization into the shift, which could then warn on a model whose
+/// objective integrates nothing, or cancel a real tolerance shift.
+///
+/// `None` as well when the fit is cancelled during the check: it is skipped, not reported.
 pub(crate) fn ofv_tolerance_shift(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-    fit_side: FitSide,
 ) -> Option<Result<OdeToleranceShift, String>> {
     let eff = model.integrator_spec()?.effective_solver_opts();
     let tight = tightened_override(model, options)?;
-    let fit_ofv = match fit_side {
-        FitSide::Stored => score_stored_checked(
-            model, population, params, eta_hats, h_matrices, kappas, options,
-        ),
-        FitSide::Resolved => rescore_checked(model, population, params, eta_hats, kappas, options),
-    };
-    let fit_ofv = match fit_ofv {
+    let fit_ofv = match rescore_checked(model, population, params, eta_hats, kappas, options)? {
         Ok(v) => v,
         Err(why) => return Some(Err(format!("at the fit's own tolerance, {why}"))),
     };
     let tight_ofv = match crate::api::with_fit_scope_ode(options, tight, || {
         rescore_checked(model, population, params, eta_hats, kappas, options)
     }) {
-        Ok(Ok(v)) => v,
-        Ok(Err(why)) => return Some(Err(format!("at the tighter tolerance, {why}"))),
+        Ok(None) => return None,
+        Ok(Some(Ok(v))) => v,
+        Ok(Some(Err(why))) => return Some(Err(format!("at the tighter tolerance, {why}"))),
         Err(e) => return Some(Err(format!("its scope could not be set up: {e}"))),
     };
     Some(Ok(OdeToleranceShift {
