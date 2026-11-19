@@ -264,7 +264,8 @@ uncovered compartment that a clause deletes, with a non-zero exit code.
   which records the filter removes. This matters only when filtering on a
   time-varying covariate whose value differs on the rows being excluded.
 - A column name that is not present in the dataset always evaluates to false
-  (never fires). This is surfaced as a `W_FILTER_COLUMN_ABSENT` warning naming
+  (never fires): an `ignore` condition on it excludes nothing, and an `accept`
+  condition on it excludes every record. This is surfaced as a `W_FILTER_COLUMN_ABSENT` warning naming
   the missing column(s), so a typo (e.g. `ignore = Coment`) no longer silently
   has no effect. (Covariate columns referenced by a condition are read even when
   a `[covariates]` block does not declare them, so filtering on an undeclared

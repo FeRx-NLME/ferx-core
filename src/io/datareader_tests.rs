@@ -631,6 +631,28 @@ fn filter_referencing_absent_column_warns() {
     assert_eq!(pop.subjects[0].observations, vec![5.0]);
 }
 
+/// #1492: what a condition on an absent column costs depends on its key, and the warning says
+/// which: an `ignore` excludes nothing, an `accept` every record. It used to say "no rows are
+/// excluded" for both, over a read that had excluded all of them. Mutation: swap the two
+/// sentences -> both asserts on the text fail.
+#[test]
+fn an_absent_column_warning_says_what_each_key_excludes() {
+    let f = write_csv("ID,TIME,DV,EVID,AMT\n1,0,.,1,100\n1,1,5.0,0,.\n");
+    let filter =
+        SelectionFilter::from_opts(&["COMENT == X".into()], &["STUDY == 7".into()], &[]).unwrap();
+    let pop = read_nonmem_csv_filtered(f.path(), None, None, &filter).unwrap();
+    assert!(pop.subjects.is_empty(), "the accept clause excludes every record");
+    let w = pop.warnings.iter().find(|w| w.contains("W_FILTER_COLUMN_ABSENT")).expect("warns");
+    assert!(
+        w.contains("`ignore` conditions on coment never match, so they exclude nothing"),
+        "{w}"
+    );
+    assert!(
+        w.contains("`accept` conditions on study never match, so they exclude every record"),
+        "{w}"
+    );
+}
+
 #[test]
 fn filter_on_present_column_does_not_warn_absent() {
     // Control: a filter naming a real column must NOT emit the absent warning.
