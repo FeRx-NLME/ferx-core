@@ -353,6 +353,16 @@ impl Func {
     fn k(&mut self, c: f64) -> V {
         self.push(Inst::Const(c.to_bits()))
     }
+
+    /// This function as a kernel keeps it to run and lower: its instructions at their length,
+    /// without `live`, which only the transforms read ([`reverse`], [`tangent`],
+    /// [`dedup_calls`]). A fit keeps thousands of kernels' IR live (#3010), and `live` is a
+    /// third of it.
+    pub(super) fn into_kernel(mut self) -> Self {
+        self.live = Vec::new();
+        self.insts.shrink_to_fit();
+        self
+    }
 }
 
 pub(crate) use crate::sens::num::vm::Layout;

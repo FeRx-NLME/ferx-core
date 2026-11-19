@@ -430,7 +430,6 @@ fn mixture_falls_back_to_fd() {
         crate::estimation::mixture::mixture_gradient_salvaged(
             &model, &pop, params, &o, &eval, None, &log,
         )
-        .expect("a mixture gradient")
     };
     let exact = grad();
     let fd = plans_failing(grad);

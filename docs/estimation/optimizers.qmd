@@ -159,7 +159,7 @@ gradient norm.
 `optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
 
 - **`trust_region`** (since #2976; `nlopt_lbfgs` before) — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`, and the **exact Hessian** serves the fit (the covariance step's analytic R-matrix route). Where it does not (`analytic_cov_hessian = false`, or a subject outside its scope) every model the trust region builds would be a finite-difference Hessian, so `auto` takes **`nlopt_lbfgs`** there.
-- **`bobyqa`** — otherwise: any model outside the analytic scope (for example an out-of-scope ODE/PD model or an SDE model), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
+- **`bobyqa`** — otherwise: a model the recorders cannot serve (a hand-built `CompiledModel` with no compiled individual-parameter program), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
 
 Three cases override that rule:
 
@@ -202,8 +202,7 @@ pinned; a model out of analytic scope anyway, where `auto` picks `bobyqa` either
 way; a model above `BOBYQA_MAX_DIM`, where `auto` takes `nlopt_lbfgs` on a
 finite-difference gradient regardless; a [mixture](mixture.qmd) model, whose
 `auto` is `bobyqa` whatever the gradient; an evaluation-only
-(`maxiter = 0`) run, which constructs no optimizer at all; and an SDE model,
-which the engine forces onto finite differences whatever you asked for.
+(`maxiter = 0`) run, which constructs no optimizer at all.
 
 Two related fields record the *effect* after the fact rather than the coupling:
 `optimizer` reports the compound `"auto (bobyqa)"`, and `final_gradient_source`

@@ -1,0 +1,17 @@
+$PROBLEM moving infusion end, evaluated at the estimates of moving_infusion_end.ctl from ferx's EBEs (#3010)
+$INPUT ID TIME AMT RATE DV MDV EVID CMT
+$DATA moving_infusion_end.csv IGNORE=@
+$SUBROUTINE ADVAN1 TRANS2
+$PK
+  CL = THETA(1) * EXP(ETA(1))
+  V  = THETA(2) * EXP(ETA(2))
+  D1 = THETA(3) * EXP(ETA(3))
+  S1 = V
+$ERROR
+  IPRED = F
+  Y = IPRED * (1 + EPS(1))
+$THETA 3.98653 FIX 28.3574 FIX 1.88514 FIX
+$OMEGA 0.0979076 FIX 0.0873419 FIX 0.0997316 FIX
+$SIGMA 0.0101129 FIX
+$ETAS FILE=moving_infusion_end_etas.txt
+$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0 MCETA=1 POSTHOC

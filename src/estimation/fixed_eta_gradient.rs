@@ -11,14 +11,15 @@
 //!
 //! - SAEM's M-step, where η is a draw from the E-step ([`crate::estimation::saem`]);
 //! - variational inference, where η is a reparameterized draw from `q_φ`
-//!   (the next consumer; not yet in the tree).
+//!   ([`crate::estimation::vi`]).
 //!
-//! Extracted verbatim from `saem.rs` so the next consumer shares one copy; SAEM's
-//! behaviour is unchanged.
+//! The θ/σ score is the adjoint's exact one (`exact_theta_score`); the per-θ forward
+//! finite difference below runs only where it declines (a model no recorder serves, a
+//! non-finite result).
 //!
 //! Both entry points return `(nll, grad)` so the caller gets the objective for
 //! free alongside its gradient. `lower[i] == upper[i]` marks a pinned coordinate:
-//! it contributes 0 and skips its finite-difference evaluation.
+//! it contributes 0 and skips its evaluation.
 
 use crate::estimation::nn_theta_gradient::NnGradPlan;
 use crate::pk::EventPkParams;

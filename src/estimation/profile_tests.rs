@@ -2155,20 +2155,15 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     );
 }
 
-/// #10, the envelope gradient's reconverge override, keyed on the route each subject
-/// took. F2 without κ is analytic at model level; every subject is forced to decline the
-/// analytic gradient at runtime, the numerical decline `sens/provider.rs` names. On the
-/// reconverging log `optimize_profiled` builds — taken from the same
-/// [`profiled_decline_log`] the driver calls, so a driver built on a plain log fails
-/// here — the declined subjects are reconverged
-/// and the gradient is still the profile gradient (G1's bound); on a plain log they take
-/// the held-EBE salvage, which drops `dη̂/dθ`, and it is not — the straddle, asserted so
-/// the test cannot pass on a fixture where the two agree. Dies when the profiled loop
-/// keys the override on the model-level predicate alone (a plain log). Measured (F2,
-/// three studies, macOS arm64): reconverged 2.1e-5, held-EBE 2.2 — the bound sits 24×
-/// above one and 4500× below the other.
+/// #10, the envelope gradient of a subject that declines at runtime. F2 without κ is
+/// analytic at model level; every subject is forced to decline the analytic gradient at
+/// runtime, the numerical decline `sens/provider.rs` names. The salvage serves each at its
+/// EBE re-solved at the trial point (#3004), so the gradient is still the profile gradient
+/// (G1's bound) and the log says every decline was served exactly. The held-EBE salvage
+/// this replaced dropped `dη̂/dθ` and was 2.2 off (F2, three studies, macOS arm64, #2136),
+/// 4500× over the bound, so a salvage that returned it fails here.
 #[test]
-fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
+fn a_subject_that_declines_at_runtime_gets_the_exact_envelope_gradient() {
     let p = prep(F2, F2_DATA, Some(3), |t| {
         t.replace("  kappa KAPPA_ARM ~ 1.0\n", "")
             .replace(" + KAPPA_ARM", "")
@@ -2206,6 +2201,7 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
             n_subj,
             "every subject declined"
         );
+        assert!(log.all_declines_exact(), "every decline served exactly");
         let mut worst = 0.0_f64;
         for i in (0..x.len()).filter(|&i| !fixed[i]) {
             let h = 1e-4 * (1.0 + x[i].abs());
@@ -2221,20 +2217,16 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
         }
         worst
     };
-    let reconverged = worst(profiled_decline_log(n_subj));
-    let held = worst(OuterFdDeclineLog::new(n_subj));
-    eprintln!("#2136 #10: reconverged {reconverged:.3e}, held-EBE {held:.3e}");
-    assert!(reconverged < G1_HANDED_BOUND, "{reconverged}");
-    assert!(held > G1_HANDED_BOUND, "the straddle: held-EBE {held}");
+    let exact = worst(profiled_decline_log(n_subj));
+    eprintln!("#2136 #10: exact salvage {exact:.3e}");
+    assert!(exact < G1_HANDED_BOUND, "{exact}");
 }
 
-/// A profiled fit reports the subjects that declined the analytic outer gradient at
-/// runtime, as an unprofiled fit does (#1154): before, `optimize_profiled` built its own
-/// decline log and never read it, so the fallback was silent. Non-IOV F2 (analytic at
-/// model level), every subject forced to decline: the warning counts them and names the
-/// **reconverged** salvage that log gives them, not the held-EBE one. The same fit without
-/// the switch is the straddle — no warning. Dies when the warning is not emitted, or is
-/// emitted from a plain log's wording.
+/// A profiled fit reads the decline log it builds, as an unprofiled fit does (#1154): non-IOV
+/// F2 (analytic at model level), every subject forced to decline. Each decline is served
+/// exactly at its re-solved EBE (#3004), so no fallback ran and no warning is emitted
+/// (#3009 review 3); the same fit without the switch likewise. The warning's text for
+/// declines that are not served exactly is pinned in `outer_optimizer_tests`.
 #[test]
 fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
     let p = prep(F2, F2_DATA, Some(2), |t| {
@@ -2266,18 +2258,10 @@ fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
     FORCE_PROFILED_DECLINES.with(|c| c.set(false));
     let forced = forced.unwrap_or_else(|e| std::panic::resume_unwind(e));
     let w = fallback(&forced);
-    assert_eq!(w.len(), 1, "{:?}", forced.warnings);
-    assert!(
-        w[0].starts_with(&format!("{n} of {n} subjects")),
-        "{}",
-        w[0]
-    );
-    assert!(
-        w[0].contains("used reconverged finite-difference outer gradients")
-            && !w[0].contains("fixed-EBE"),
-        "the profiled log reconverges every decline: {}",
-        w[0]
-    );
+    // Every decline is served exactly at its re-solved EBE (#3004), so no fallback ran and
+    // there is nothing to warn about (#3009 review 3): the old sentence claimed both.
+    assert!(w.is_empty(), "{:?}", forced.warnings);
+    let _ = n;
 
     let plain = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     assert!(fallback(&plain).is_empty(), "{:?}", plain.warnings);
@@ -3482,26 +3466,145 @@ fn a_verbose_profiled_fit_sums_its_profile_work() {
     assert!(work.adjoint_gradients >= n, "{work:?}");
 }
 
-/// A level that would log-pack declines the adjoint level gradient (#2401 review row 1):
-/// the packed gradient is `∂/∂x`, and reading it as `∂/∂θ` would be off by a factor of θ.
-/// One template gives both sides: a lower bound of 0 on the first level makes it log-pack,
-/// so a subject reading it declines while a subject reading only other levels is still
-/// served. Dies when the check is dropped (the reader is served) or widened to every
-/// subject (the other one declines).
+/// F2 whose first level log-packs: a lower bound of 0 on it (the hand-built template a parsed
+/// profiled block never produces, its box being open) and a positive value, so the packed
+/// coordinate is `ln θ` and the adjoint's packed derivatives need converting to θ.
+fn log_packed_level_prep() -> (crate::api::PreparedRun, usize) {
+    let mut p = prep(F2, F2_DATA, Some(3), |t| t);
+    let k = layout_of(&p).coords[0];
+    p.init_params.theta[k] = 1.0;
+    p.init_params.theta_lower[k] = 0.0;
+    assert!(
+        theta_packs_log(p.init_params.theta_lower[k]),
+        "fixture: the level log-packs"
+    );
+    (p, k)
+}
+
+/// #3009 review 3: the log-packed conversions read their inputs once. `theta_derivative`
+/// takes θ unpacked once per call (it unpacked the whole parameter set per `(read, move)`
+/// pair), and the Newton matrix's `−∂/∂x` diagonal term comes out of the block's own pass
+/// (it recorded a second adjoint gradient only for it). Reference: the former formulas,
+/// reproduced here from the public adjoint entry points. The gradient is bit for bit the
+/// reference (the same values, unpacked once); the matrix is the reference to rounding of the
+/// `−∂/∂x` term (the block's `∇Ψ` against the standalone gradient: two different sweeps).
+/// Dies when the diagonal term is dropped, or θ is read from the wrong coordinate.
 #[test]
-fn a_level_that_log_packs_declines_the_adjoint_gradient() {
-    let p = prep(F2, F2_DATA, Some(3), |t| t);
+fn log_packed_conversions_are_unchanged_by_reading_their_inputs_once() {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_block_at, subject_adjoint_gradient_at,
+    };
+    let (mut p, k) = log_packed_level_prep();
+    p.init_params.theta[k] = 2.0;
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
-    let k = layout.coords[0];
-    let mut params = p.init_params.clone();
-    params.theta[k] = 1.0;
-    params.theta_lower[k] = 0.0;
+    let params = p.init_params.clone();
+    let x = pack_params(&params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
+    let zero = DVector::zeros(c.model.n_eta);
+    let reader = (0..p.population.subjects.len())
+        .find(|&i| {
+            layout.reads[i]
+                .iter()
+                .flat_map(|r| &r.moves)
+                .any(|&(j, _)| j == k)
+        })
+        .unwrap();
+    let s = c.resolve(reader, &params, &zero);
+    let subject = &p.population.subjects[reader];
+    let mode =
+        crate::estimation::covariance::stacked_mode(c.model, subject, &s.eta, Some(&s.kappas))
+            .unwrap();
+    let g = subject_adjoint_gradient_at(c.model, subject, &pt, &mode, c.objective()).unwrap();
+
+    // Gradient: the former per-pair unpack.
+    let want: Vec<f64> = layout.reads[reader]
+        .iter()
+        .map(|r| {
+            r.moves
+                .iter()
+                .map(|&(j, w)| {
+                    let packed = g[j];
+                    let d = if theta_packs_log(params.theta_lower[j]) {
+                        packed / unpack_params(&x, &params).theta[j]
+                    } else {
+                        packed
+                    };
+                    w * d
+                })
+                .sum()
+        })
+        .collect();
+    let got = c.total_gradient_adjoint(reader, &pt, &s).unwrap();
+    assert_eq!(want.len(), got.len());
     assert!(
-        theta_packs_log(params.theta_lower[k]),
-        "fixture: the level log-packs"
+        theta_packs_log(params.theta_lower[k]) && params.theta[k] != 1.0,
+        "fixture: the conversion is live"
     );
+    for (a, b) in want.iter().zip(&got) {
+        assert!(a.is_finite() && b.is_finite());
+        assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+    }
+
+    // Matrix: the former second gradient for the diagonal term.
+    let mut touched: Vec<usize> = layout.reads[reader]
+        .iter()
+        .flat_map(|r| r.moves.iter().map(|&(j, _)| j))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let mut h = subject_adjoint_cov_block_at(c.model, subject, &pt, &mode, c.objective(), &touched)
+        .unwrap();
+    let gt: Vec<f64> = touched.iter().map(|&j| g[j]).collect();
+    ProfileCtx::theta_scale(&pt, &touched, 0, &gt, &mut h);
+    let m = DMatrix::from_fn(touched.len(), layout.reads[reader].len(), |t, a| {
+        layout.reads[reader][a]
+            .moves
+            .iter()
+            .filter(|&&(j, _)| j == touched[t])
+            .map(|&(_, w)| w)
+            .sum::<f64>()
+    });
+    let want_h = m.transpose() * h * &m;
+    let got_h = c.exact_hessian(reader, &pt, &s).unwrap();
+    let scale = want_h.iter().fold(0.0_f64, |a, v| {
+        assert!(v.is_finite());
+        a.max(v.abs())
+    });
+    let mut gap = 0.0_f64;
+    for (a, b) in want_h.iter().zip(got_h.iter()) {
+        assert!(a.is_finite() && b.is_finite());
+        gap = gap.max((a - b).abs()); // nan-ok: both operands asserted finite above
+    }
+    eprintln!(
+        "MEASURE one-pass Newton matrix vs two-pass: gap {:.3e} relative",
+        gap / scale
+    );
+    assert!(gap / scale < 1e-10, "{:.3e}", gap / scale);
+}
+
+/// A level that log-packs is served by the adjoint, not declined to re-solved differences
+/// (#2401 review row 1, #3004): the packed derivative is `∂/∂ln θ`, which
+/// [`ProfileCtx::theta_derivative`] divides by θ, and the Hessian's diagonal takes
+/// `(∂²/∂x² − ∂/∂x)/θ²`. The subject reading the level has its gradient (against the
+/// reconverged differences, in SEs, as G2) and its Newton matrix
+/// ([`ProfileCtx::exact_hessian`], against [`ProfileCtx::resolved_hessian`]) exact, and a
+/// subject reading other levels only is unaffected. Dies when the factor is dropped (the
+/// gradient is off by θ ≠ 1 only where θ ≠ 1: the level starts at 1, so a second level at 2
+/// is set below to make the factor visible), or the diagonal's `−∂/∂x` is dropped.
+#[test]
+fn a_level_that_log_packs_gets_the_exact_adjoint_gradient_and_matrix() {
+    let (mut p, k) = log_packed_level_prep();
+    // θ ≠ 1, or dividing by θ cannot be told from not dividing.
+    p.init_params.theta[k] = 2.0;
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let params = p.init_params.clone();
+    let x = pack_params(&params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
+    let zero = DVector::zeros(c.model.n_eta);
     let reads = |i: usize| {
         layout.reads[i]
             .iter()
@@ -3511,21 +3614,52 @@ fn a_level_that_log_packs_declines_the_adjoint_gradient() {
     let reader = (0..p.population.subjects.len())
         .find(|&i| reads(i))
         .unwrap();
+    assert!(c.reads_a_log_packed_level(reader, &params));
+    let s = c.resolve(reader, &params, &zero);
+    let m = layout.reads[reader].len();
+    let held = c.held_hessian(reader, &params, &s, &vec![1.0; m]);
+    let se: Vec<f64> = (0..m).map(|a| 1.0 / held[(a, a)].sqrt()).collect();
+    let steps: Vec<f64> = se.iter().map(|v| FD_STEP_SE * v).collect();
+    let fd = c.total_gradient_fd(reader, &params, &s, &steps);
+    let ad = c
+        .total_gradient_adjoint(reader, &pt, &s)
+        .expect("a log-packed level is served");
+    let (mut gap, mut size) = (0.0_f64, 0.0_f64);
+    for a in 0..m {
+        assert!(fd[a].is_finite() && ad[a].is_finite(), "level {a}");
+        gap = gap.max(((ad[a] - fd[a]) * se[a]).abs()); // nan-ok: fd, ad finite asserted above; se is 1/sqrt of a positive held curvature
+        size = size.max((fd[a] * se[a]).abs()); // nan-ok: as the line above
+    }
+    eprintln!("log-packed level gradient: gap {gap:.3e} SE, size {size:.3e} SE");
+    assert!(size > G2_LIVE, "the gradient is live: {size:.3e}");
+    assert!(gap < G2_BOUND, "{gap:.3e}");
+
+    let ad_h = c
+        .exact_hessian(reader, &pt, &s)
+        .expect("a log-packed level's matrix is served");
+    let fd_h = c.resolved_hessian(reader, &params, &s, &steps);
+    let scale = fd_h.iter().fold(0.0_f64, |m, v| {
+        assert!(v.is_finite());
+        m.max(v.abs())
+    });
+    let mut hgap = 0.0_f64;
+    for (x, y) in ad_h.iter().zip(fd_h.iter()) {
+        assert!(x.is_finite(), "{x}");
+        hgap = hgap.max((x - y).abs()); // nan-ok: x asserted finite above, fd_h finite in the scale loop
+    }
+    eprintln!(
+        "log-packed level matrix: gap {:.3e} (relative)",
+        hgap / scale
+    );
+    assert!(hgap / scale < 1e-3, "{:.3e}", hgap / scale);
+
     let other = (0..p.population.subjects.len())
         .find(|&i| !reads(i) && !layout.reads[i].is_empty())
         .expect("fixture: a subject reading other levels only");
-    let x = pack_params(&params);
-    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
-    let zero = DVector::zeros(c.model.n_eta);
-    let at = |i: usize| c.total_gradient_adjoint(i, &pt, &c.resolve(i, &params, &zero));
-    assert!(
-        at(reader).is_none(),
-        "the log-packed level's reader must decline"
-    );
-    assert!(
-        at(other).is_some(),
-        "a subject not reading it is still served"
-    );
+    assert!(!c.reads_a_log_packed_level(other, &params));
+    assert!(c
+        .total_gradient_adjoint(other, &pt, &c.resolve(other, &params, &zero))
+        .is_some());
 }
 
 /// A subject whose inner solve stops short of its mode takes the re-solved differences for
@@ -6594,7 +6728,7 @@ fn forced_fd_agq(t: String) -> String {
 /// G3-A. A subject whose adjoint level gradient is declined under quadrature takes the
 /// **reconverged** differences, and the solve lands where the all-adjoint one does, at
 /// both anchors. Dies when a declined subject's gradient is taken with its EBE held (the
-/// quadrature's held-EBE salvage, `subject_adjoint_held_ebe_score`).
+/// held-EBE salvage `subject_adjoint_held_ebe_score` computes, a test oracle now).
 #[test]
 fn a_declined_subject_takes_the_reconverged_gradient_under_quadrature() {
     for (name, edit, anchor) in AGQ3 {

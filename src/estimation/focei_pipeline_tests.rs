@@ -263,7 +263,7 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                     let g = match g {
                         Some(g) if g.iter().all(|v| v.is_finite()) => g,
                         // Warm at the subject's joint mode, κ̂ included (#2261).
-                        _ if iov => subject_reconverged_fd_gradient_iov(
+                        _ if iov => subject_reconverged_fd_gradient(
                             &x,
                             params,
                             &model,
@@ -273,24 +273,28 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                             &opts,
                         ),
                         // The production dispatch: reconverged for a structural decline
-                        // (#1536), held-EBE otherwise.
-                        _ => non_iov_declined_salvage(
-                            is_structural_decline(
-                                &model,
-                                &pop.subjects[i],
+                        // (#1536), exact at the re-solved EBE otherwise.
+                        _ => {
+                            non_iov_declined_salvage(
+                                is_structural_decline(
+                                    &model,
+                                    &pop.subjects[i],
+                                    params,
+                                    etas[i].as_slice(),
+                                ),
+                                &x,
                                 params,
-                                etas[i].as_slice(),
-                            ),
-                            &x,
-                            params,
-                            &model,
-                            &pop,
-                            i,
-                            &etas[i],
-                            &hms[i],
-                            &bounds,
-                            &opts,
-                        ),
+                                &model,
+                                &pop,
+                                i,
+                                &etas[i],
+                                &hms[i],
+                                &bounds,
+                                &opts,
+                                &OuterFdDeclineLog::new(pop.subjects.len()),
+                            )
+                            .0
+                        }
                     };
                     for (acc, value) in expected.iter_mut().zip(g) {
                         *acc += 2.0 * value;
@@ -685,7 +689,7 @@ fn a_cancelled_inner_pass_scores_no_objective() {
             agq,
             "fixture: one arm per branch"
         );
-        let gradient_inputs = agq.then_some((params, x.as_slice(), &bounds, false));
+        let gradient_inputs = agq.then_some((params, x.as_slice(), &bounds, false, None));
         let run = |cancel| {
             run_inner_loop_and_nll_prepared(
                 &model,

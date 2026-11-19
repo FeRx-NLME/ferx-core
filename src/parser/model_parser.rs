@@ -9925,8 +9925,7 @@ fn parse_event_model_block(
 
     // The same parameters in dual-evaluable form, for the exact η-Hessian of the FOCEI
     // Laplace term (#2437), in the `param_fn` layout below: the family's parameters, then
-    // `loghr` (an absent `loghr` is the `0.0` default either way). `None` keeps the endpoint
-    // on the FD Hessian (see `build_endpoint_expr_program`).
+    // `loghr` (an absent `loghr` is the `0.0` default either way).
     let hazard_program = {
         let family_exprs: [&Option<Expression>; 2] = match family {
             HazardFamily::Exponential => [&scale_expr, &None],
@@ -9938,13 +9937,13 @@ fn parse_event_model_block(
             .flatten()
             .chain(loghr_expr.as_ref())
             .collect();
-        build_endpoint_expr_program(
+        Some(build_endpoint_expr_program(
             &ordered,
             &needed_indiv_stmts,
             &event_model_covariates,
             theta_names.len(),
             eta_names.len(),
-        )
+        ))
     };
 
     // Build the param_fn closure that evaluates hazard parameters from (θ, η, covariates).
@@ -10181,14 +10180,13 @@ fn parse_binary_model_block(
     )?;
 
     // The same predictor in dual-evaluable form, for the analytic inner gradient (#2024).
-    // `None` keeps the endpoint on FD (see `build_endpoint_expr_program`).
-    let lp_program = build_endpoint_expr_program(
+    let lp_program = Some(build_endpoint_expr_program(
         &lp_exprs,
         &needed_indiv_stmts,
         &lp_covariates,
         theta_names.len(),
         eta_names.len(),
-    );
+    ));
 
     // Build the lp_fn closure over (θ, η, covariates). Expression nodes hold only indices, so
     // they are safe to move; `TIME` resolves via the model-time guard `binary_data_term` sets
@@ -10397,13 +10395,14 @@ fn parse_count_model_block(
         kappa_names,
         "count_model",
     )?;
-    let param_program = build_endpoint_expr_program(
+    // Total (#3004): every parsed count predictor compiles, so the endpoint is served exactly.
+    let param_program = Some(build_endpoint_expr_program(
         &exprs,
         &needed_indiv_stmts,
         &count_covariates,
         theta_names.len(),
         eta_names.len(),
-    );
+    ));
 
     let indiv = needed_indiv_stmts;
     let param_fn: crate::types::CountParamFn = Box::new(
@@ -11074,7 +11073,7 @@ fn parse_markov_model_block(
     // An intensity that reads an ODE state makes `Q` a functional of the PK trajectory: the
     // program reads each such state through a var slot, which the likelihood fills with the
     // dual state solve's values, so the occupancy ODE carries their sensitivities.
-    let generator_program = build_ctmm_generator_program(
+    let generator_program = Some(build_ctmm_generator_program(
         &transitions,
         &needed_indiv_stmts,
         &generator_covariates,
@@ -11082,7 +11081,7 @@ fn parse_markov_model_block(
         n_states,
         theta_names.len(),
         eta_names.len(),
-    );
+    ));
 
     let tree = CtmmGeneratorTree::new(
         &needed_indiv_stmts,
@@ -11413,14 +11412,14 @@ fn build_dtmm_endpoint(
     }
 
     // The same probabilities in dual-evaluable form (one output per transition), for the
-    // analytic inner gradient. `None` keeps the endpoint on FD.
-    let prob_program = build_endpoint_expr_program(
+    // analytic inner gradient.
+    let prob_program = Some(build_endpoint_expr_program(
         &exprs,
         &needed_indiv_stmts,
         &prob_covariates,
         theta_names.len(),
         eta_names.len(),
-    );
+    ));
 
     let pairs: Vec<(usize, usize)> = transitions.iter().map(|&(j, k, _)| (j, k)).collect();
     let prob_exprs: Vec<Expression> = transitions.into_iter().map(|(_, _, e)| e).collect();
@@ -34258,12 +34257,9 @@ impl CtmmGeneratorProgram {
 }
 
 /// Resolve + compile a `[markov_model]`'s intensities into a [`CtmmGeneratorProgram`].
-/// `None` when the program cannot be represented exactly, in which case the endpoint keeps
-/// its FD gradient: an intensity or an `[individual_parameters]` value that reads an
-/// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
-/// a silently-wrong derivative), or no `(θ, η)` axis at all. A width past the gradient's
-/// dual dispatch cap still gets a program: the η-Hessian runs it on η alone (#2437), and
-/// [`CtmmGeneratorProgram::gradient_in_scope`] routes the gradient.
+/// Total (see `compile_endpoint_exprs`): a zero `(θ, η)` width is a constant program. A
+/// width past the gradient's dual dispatch cap still gets a program: the η-Hessian runs it on
+/// η alone (#2437), and the gradient's own scope check routes it.
 #[cfg(feature = "markov")]
 fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
@@ -34273,10 +34269,7 @@ fn build_ctmm_generator_program(
     n_states: usize,
     n_theta: usize,
     n_eta: usize,
-) -> Option<CtmmGeneratorProgram> {
-    if n_theta + n_eta == 0 {
-        return None;
-    }
+) -> CtmmGeneratorProgram {
     // A state an intensity reads parses as a `Covariate` leaf; read it through a var slot
     // instead, so it carries the state's own derivatives.
     let state_names: Vec<String> = generator_states.iter().map(|(n, _)| n.clone()).collect();
@@ -34295,19 +34288,19 @@ fn build_ctmm_generator_program(
         })
         .collect();
     let exprs: Vec<&Expression> = rewritten.iter().collect();
-    let (stmts, n_vars, bcs) = compile_endpoint_exprs(
+    let (stmts, n_vars, bcs, cov_names) = compile_endpoint_exprs(
         &exprs,
         needed_indiv_stmts,
         generator_covariates,
         &state_names,
-    )?;
+    );
     let rates: Vec<(usize, usize, Bytecode)> = transitions
         .iter()
         .zip(bcs)
         .map(|((j, k, _), bc)| (*j, *k, bc))
         .collect();
     let first_state_slot = n_vars - state_names.len();
-    Some(CtmmGeneratorProgram {
+    CtmmGeneratorProgram {
         stmts,
         n_vars,
         rates,
@@ -34317,29 +34310,32 @@ fn build_ctmm_generator_program(
             .enumerate()
             .map(|(i, (_, idx))| (first_state_slot + i, *idx))
             .collect(),
-        cov_names: generator_covariates.to_vec(),
+        cov_names,
         n_theta,
         n_eta,
-    })
+    }
 }
 
 /// Resolve the `[individual_parameters]` statements a non-Gaussian endpoint reads and
 /// compile each of `exprs` to bytecode against them — the shared front half of every
 /// dual-evaluable endpoint program ([`CtmmGeneratorProgram`], [`EndpointExprProgram`]).
 ///
-/// Returns `(resolved statements, var-slot count, one bytecode per expression)`, or `None`
-/// when any expression or needed statement reads an identifier we cannot bind. An
-/// unresolved `Variable`/`Covariate` leaf lowers to a constant `0.0` in `compile_bytecode`
-/// (its documented fall-through). That is survivable for a *value* path that never sees
-/// one, but here it would hand back a confidently wrong gradient, so refuse the program
-/// instead and let FD serve the endpoint.
+/// Returns `(resolved statements, var-slot count, one bytecode per expression, covariate
+/// names)`. Total: every leaf the `f64` closure (`MapEnv`) can read binds to what the
+/// closure reads, so the program evaluates the same function:
+///
+/// * `MACHEPS` (any case) is machine epsilon, whether or not a statement assigns it;
+/// * a `Variable` nothing assigns reads `0.0`;
+/// * a covariate is read by name from the subject's map (`0.0` when absent), so the returned
+///   list is `covariates` plus any covariate leaf the caller left out of it — the list the
+///   program's own cov slice is built from.
 #[cfg(feature = "survival")]
 fn compile_endpoint_exprs(
     exprs: &[&Expression],
     needed_indiv_stmts: &[Statement],
     covariates: &[String],
     extra_vars: &[String],
-) -> Option<(Vec<Statement>, usize, Vec<Bytecode>)> {
+) -> (Vec<Statement>, usize, Vec<Bytecode>, Vec<String>) {
     // Var slots for the `[individual_parameters]` values the expressions read, in the
     // order they are assigned (so a later value may read an earlier one), then the
     // caller's `extra_vars` (the ODE states a CTMM intensity reads), which it fills itself.
@@ -34351,44 +34347,75 @@ fn compile_endpoint_exprs(
         .map(|(i, n)| (n.clone(), i))
         .collect();
     let n_vars = var_names.len();
-    let cov_idx: HashMap<String, usize> = covariates
+
+    let mut stmts: Vec<Statement> = needed_indiv_stmts.to_vec();
+    let mut outs: Vec<Expression> = exprs.iter().map(|e| (*e).clone()).collect();
+    // The closure's name binding, made explicit: constants for the leaves with no slot.
+    let mut bind = |e: &mut Expression| {
+        visit_expr_nodes_mut(e, &mut |n: &mut Expression| {
+            if let Expression::Variable(name) = n {
+                if name.eq_ignore_ascii_case("MACHEPS") {
+                    *n = Expression::Literal(f64::EPSILON);
+                } else if !var_idx.contains_key(name) {
+                    *n = Expression::Literal(0.0);
+                }
+            }
+        })
+    };
+    fn each_expr_mut(stmts: &mut [Statement], f: &mut dyn FnMut(&mut Expression)) {
+        for s in stmts {
+            match s {
+                Statement::Assign(_, e)
+                | Statement::AssignIdx(_, e)
+                | Statement::DiffEq(_, e)
+                | Statement::DiffEqIdx(_, e) => f(e),
+                Statement::AssignBc(..) | Statement::DiffEqBc(..) => {}
+                Statement::If {
+                    branches,
+                    else_body,
+                } => {
+                    for (cond, body) in branches {
+                        let mut g = |e: &mut Expression| f(e);
+                        visit_condition_nodes_mut(cond, &mut g);
+                        each_expr_mut(body, f);
+                    }
+                    if let Some(eb) = else_body {
+                        each_expr_mut(eb, f);
+                    }
+                }
+            }
+        }
+    }
+    each_expr_mut(&mut stmts, &mut bind);
+    outs.iter_mut().for_each(&mut bind);
+
+    let mut cov_names: Vec<String> = covariates.to_vec();
+    {
+        let mut leaves = |e: &Expression| {
+            if let Expression::Covariate(name) = e {
+                if !cov_names.contains(name) {
+                    cov_names.push(name.clone());
+                }
+            }
+        };
+        visit_stmt_nodes(&stmts, &mut leaves);
+        outs.iter().for_each(|e| visit_expr_nodes(e, &mut leaves));
+    }
+    let cov_idx: HashMap<String, usize> = cov_names
         .iter()
         .enumerate()
         .map(|(i, n)| (n.clone(), i))
         .collect();
 
-    let resolvable = |e: &Expression| -> bool {
-        let mut ok = true;
-        visit_expr_nodes(e, &mut |node: &Expression| match node {
-            Expression::Variable(name) => ok &= var_idx.contains_key(name),
-            Expression::Covariate(name) => ok &= cov_idx.contains_key(name),
-            _ => {}
-        });
-        ok
-    };
-    if !exprs.iter().all(|e| resolvable(e)) {
-        return None;
-    }
-    let mut indiv_ok = true;
-    visit_stmt_nodes(needed_indiv_stmts, &mut |e: &Expression| {
-        indiv_ok &= resolvable(e);
-    });
-    if !indiv_ok {
-        return None;
-    }
-
-    let mut stmts: Vec<Statement> = needed_indiv_stmts.to_vec();
     resolve_variable_indices(&mut stmts, &var_idx, &cov_idx, None);
-
-    let bcs: Vec<Bytecode> = exprs
-        .iter()
-        .map(|expr| {
-            let mut e = (*expr).clone();
-            resolve_expr_indices(&mut e, &var_idx, &cov_idx);
-            compile_bytecode(&e)
+    let bcs: Vec<Bytecode> = outs
+        .iter_mut()
+        .map(|e| {
+            resolve_expr_indices(e, &var_idx, &cov_idx);
+            compile_bytecode(e)
         })
         .collect();
-    Some((stmts, n_vars, bcs))
+    (stmts, n_vars, bcs, cov_names)
 }
 
 /// Evaluate a compiled endpoint program over any VM number type, with θ and η carrying
@@ -34486,11 +34513,10 @@ impl EndpointExprProgram {
 }
 
 /// Resolve + compile a non-Gaussian endpoint's scalar expressions into an
-/// [`EndpointExprProgram`]. `None` — the endpoint keeps its FD gradient — when an
-/// expression cannot be represented exactly (an identifier we cannot bind) or the
-/// `(θ, η)` width is zero. A width past the gradient's dual dispatch cap still gets a
-/// program: the η-Hessian runs it on η alone (#2437), and
-/// [`EndpointExprProgram::gradient_in_scope`] routes the gradient.
+/// [`EndpointExprProgram`]. Total (see `compile_endpoint_exprs`): a zero `(θ, η)` width is a
+/// constant program, not a missing one. A width past the gradient's dual dispatch cap still
+/// gets a program: the η-Hessian runs it on η alone (#2437), and
+/// the gradient's own scope check routes it.
 #[cfg(feature = "survival")]
 fn build_endpoint_expr_program(
     exprs: &[&Expression],
@@ -34498,20 +34524,17 @@ fn build_endpoint_expr_program(
     covariates: &[String],
     n_theta: usize,
     n_eta: usize,
-) -> Option<EndpointExprProgram> {
-    if n_theta + n_eta == 0 {
-        return None;
-    }
-    let (stmts, n_vars, outputs) =
-        compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates, &[])?;
-    Some(EndpointExprProgram {
+) -> EndpointExprProgram {
+    let (stmts, n_vars, outputs, cov_names) =
+        compile_endpoint_exprs(exprs, needed_indiv_stmts, covariates, &[]);
+    EndpointExprProgram {
         stmts,
         n_vars,
         outputs,
-        cov_names: covariates.to_vec(),
+        cov_names,
         n_theta,
         n_eta,
-    })
+    }
 }
 
 /// Compiled `[individual_parameters]` block + var layout, exposed so the

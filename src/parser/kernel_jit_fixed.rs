@@ -514,6 +514,8 @@ impl RepeatSpec {
             p.extend_from_slice(caps);
             let mut du = vec![0.0; (self.body.n_out() + 1) * l];
             let Some(f) = self.body.forward_layout(layout, &[], &p, &mut du) else {
+                // A failed body call: when it was an overflow the call said so itself
+                // (`MatSpec::run` notes a non-finite result to an open recording).
                 return false;
             };
             if du[self.body.n_out() * l] != 1.0 {

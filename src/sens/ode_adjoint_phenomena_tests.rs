@@ -2054,6 +2054,31 @@ fn an_infusion_into_an_absorption_kernel_matches_reconverged_fd() {
     }
 }
 
+/// An infusion (RATE > 0) into the compartment of an `igd` input kernel (#3004): the convolved
+/// `R_in_inf` evaluates the kernel's CDF, `Phi` and `ln Phi`, whose branches (the `erfc` tail,
+/// the Mills switch) used to be guards of the recorded ODE body, which fail at another stage of
+/// the segment, so every subject with an infusion declined to FD. A rate-defined infusion first,
+/// a bolus landing on its residual drug second, observations during the window and after it.
+/// (The `transit` and `weibull` kernels were measured exact on the same fixture: their CDF is
+/// one recorded primitive.)
+#[test]
+fn an_infusion_into_an_igd_kernel_matches_reconverged_fd() {
+    let times = [0.5, 1.0, 1.8, 2.5, 4.0, 6.5, 7.0, 9.0, 12.0, 18.0];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(6.0, 80.0, 1, 0.0, false, 0.0),
+    ];
+    // At reltol 1e-12, for the reason given at the Weibull / igd forcing test.
+    let m = with_tol(parse_model_string(IGD_ODE).unwrap(), 1e-12, 1e-14);
+    let s = subject(&m, doses, &times, &[0.1, -0.05]);
+    assert!(s.doses[0].is_infusion() && !s.doses[1].is_infusion());
+    let (jac, grad) = measure(&m, &s, &[0, 2, 3], "igd infusion");
+    // Measured 1.1e-11 / 5.3e-9 on Linux; ~10x headroom on the gradient, the jacobian bound
+    // sitting above the FD oracle's own noise.
+    assert!(jac < 1e-9, "igd infusion df/deta: {jac:.2e}");
+    assert!(grad < 5e-8, "igd infusion gradient: {grad:.2e}");
+}
+
 /// A first-order absorption model with the given extra `[parameters]` / individual
 /// parameters and `first_order` arguments, for the moving-window infusions below.
 fn kernel_infusion_model(theta: &str, omega: &str, ind: &str, args: &str) -> CompiledModel {
@@ -3990,8 +4015,9 @@ fn an_sde_infusion_with_an_estimated_window_is_one_plan_across_a_fit() {
 /// `(label, source, undefined identifier read)` of the non-Gaussian endpoint kinds whose term
 /// evaluators return `None` without a compiled program: a binary linear predictor
 /// (`DiscreteTerm::eval`, `lp_program?`), an analytic hazard (`TteTerm::eval_shared`,
-/// `ep.program?`) and a CTMM intensity (`CtmmTerm`, `generator_program`). Each program is `None`
-/// only for an identifier it cannot bind, or a zero `(θ, η)` width.
+/// `ep.program?`) and a CTMM intensity (`CtmmTerm`, `generator_program`). A parsed endpoint
+/// always carries its program (the binder is total, #3004); a program is absent only for an
+/// opaque Rust closure endpoint.
 #[cfg(feature = "survival")]
 fn unbound_identifier_sources() -> Vec<(&'static str, String)> {
     let head = "[parameters]\n  theta TVL(-0.3, -5.0, 5.0)\n  omega ETA_S ~ 0.25\n";
@@ -4022,8 +4048,8 @@ fn unbound_identifier_sources() -> Vec<(&'static str, String)> {
 /// A binary / hazard / CTMM endpoint reading a name nothing defines is refused by the parser, so
 /// the term evaluators' `lp_program?` / `ep.program?` / generator-program `None` is unreachable
 /// for an accepted model; declaring the name as a covariate (the control) parses and carries the
-/// program. Mutation: let the parser accept the unbound name (build the program as `None`
-/// instead of refusing) -> the first assertion fails for that kind.
+/// program (`endpoint_programs_are_total` in `inner_optimizer_tests.rs` covers the one leaf the
+/// parser accepts and the binder once could not place, `MACHEPS`).
 #[cfg(feature = "survival")]
 #[test]
 fn an_endpoint_program_is_missing_only_for_a_model_the_parser_refuses() {
@@ -6181,4 +6207,54 @@ fn a_lagged_ss_absorption_kink_on_a_clock_reading_rhs_has_the_exact_inner_hessia
         bad.is_empty(),
         "d2l/deta2 vs FD of the exact gradient: {bad:?}"
     );
+}
+
+/// #3004: `examples/per_route_lag_absorption.ferx` at its **start values** — the point the
+/// outer optimizer's pre-flights evaluate the exact gradient, `R` diagonal and Hessian at —
+/// with an observation exactly ON the delayed route's lagged arrival (`TVLAG2 = 3`, `t = 3`),
+/// one either side of it, and a second dose on residual drug. The arrival is a kink in the
+/// lag; the exact derivative follows the value path's convention, so the gradient, the full
+/// Hessian and the diagonal along every packed axis are finite under both objectives (the
+/// report of a non-finite start-value Hessian did not reproduce on the PR head), and the
+/// Hessian matches the reconverged FD oracle at a point off the kink (`hessian_gaps_for`,
+/// which moves the θ).
+#[test]
+fn per_route_lag_example_start_values_are_exact_and_finite() {
+    let src = std::fs::read_to_string("examples/per_route_lag_absorption.ferx").unwrap();
+    let m = parse_model_string(&src).unwrap();
+    assert!(m.has_route_absorption_lag());
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.25, 1.0, 2.9, 3.0, 3.1, 4.0, 8.0, 13.0, 15.1, 15.5, 24.0];
+    let s = subject(&m, doses.clone(), &times, &[0.1, -0.05]);
+    let params = m.default_params.clone();
+    let x = pack_params(&params);
+    assert_eq!(
+        params.theta[5], 3.0,
+        "the start value sits on the observation"
+    );
+    let pt = PackedPoint::new(&params, &x).unwrap();
+    let axes: Vec<usize> = (0..x.len()).collect();
+    for obj in [Objective::Focei, Objective::Foce] {
+        let eta = ebe_for(&m, &s, &params, 1e-10, obj != Objective::Foce);
+        let eta = eta.as_slice();
+        let g = subject_adjoint_gradient(&m, &s, &params, &x, eta, obj).expect("gradient served");
+        let h = subject_adjoint_cov_hessian(&m, &s, &params, &x, eta, obj).expect("H served");
+        let d = subject_adjoint_cov_diag_at(&m, &s, &pt, eta, obj, &axes).expect("diag served");
+        assert!(g.iter().all(|v| v.is_finite()), "{obj:?} gradient {g:?}");
+        assert!(h.iter().all(|v| v.is_finite()), "{obj:?} Hessian");
+        assert!(d.iter().all(|v| v.is_finite()), "{obj:?} diagonal {d:?}");
+        for (k, &a) in axes.iter().enumerate() {
+            let gap = (d[k] - h[(a, a)]).abs() / (1.0 + h[(a, a)].abs());
+            assert!(gap < 1e-9, "{obj:?} diag[{a}] {} vs H {}", d[k], h[(a, a)]);
+        }
+    }
+    let m = with_tol(m, 1e-12, 1e-14);
+    let off_kink = [0.25, 1.0, 2.5, 3.5, 4.0, 8.0, 13.0, 15.5, 24.0];
+    let s = subject(&m, doses, &off_kink, &[0.1, -0.05]);
+    let (gap, _) = hessian_gaps_for(&m, &s, Objective::Focei);
+    // Measured 1.6e-9 on Linux; ~10x headroom.
+    assert!(gap < 2e-8, "Hessian vs reconverged FD: {gap:.2e}");
 }
