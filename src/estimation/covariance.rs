@@ -1098,6 +1098,17 @@ pub(crate) fn analytic_r_expected(model: &CompiledModel, options: &FitOptions) -
     predicted_r_route(model, options) == PredictedRRoute::Analytic
 }
 
+/// [`analytic_r_expected`] with the gradient left at `auto`: every clause of the walk but
+/// `gradient = fd`'s. The counterfactual the `gradient = fd` ⇒ `optimizer = auto` coupling
+/// warning asks (#1381, #2976) — what would `auto` have picked with the gradient unforced —
+/// reads the exact Hessian through this, so it cannot disagree with the walk the real route
+/// takes.
+pub(crate) fn analytic_r_expected_unforced(model: &CompiledModel, options: &FitOptions) -> bool {
+    analytic_cov_model_declines(model, options)
+        .iter()
+        .all(|d| matches!(d, CovScopeDecline::GradientFd))
+}
+
 /// The clauses of [`analytic_cov_declines`] — every one that sends the whole population to
 /// the stencil, whatever the subjects look like. Empty when none fires.
 fn analytic_cov_model_declines(
