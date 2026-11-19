@@ -13,7 +13,7 @@ pub(crate) use crate::model_checks::{
     model_routes_rows_by_cmt, obs_routing_for, referenced_columns,
 };
 
-pub use crate::types::ReaderSettings;
+pub use ferx_model::types::ReaderSettings;
 
 /// Log-transform every observation (including M3 LLOQ values carried on CENS
 /// rows — they live in the same `observations` vector) in place, for LTBS case 2

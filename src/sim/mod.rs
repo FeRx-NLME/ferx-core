@@ -6,5 +6,14 @@
 //! driver lives in [`crate::ode::predictions`] and the public
 //! [`crate::api::simulate_adaptive`] entry point wraps it.
 
-pub use ferx_model::sim::adaptive;
+pub mod adaptive {
+    #[allow(unused_imports)]
+    pub(crate) use ferx_model::sim::adaptive::*;
+    pub use ferx_model::sim::adaptive::{
+        AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, AdaptiveRun,
+        AdaptiveSubjectMetrics, Comparison, ControllerCtx, DecisionCovariates, DecisionLogEntry,
+        DecisionOutcome, DoseAction, DoseKnowledge, DoseLedgerEntry, DoseStep, DoseValue,
+        IntervalStep, MonitorSpec, ObserveMode, ObservedSignal,
+    };
+}
 pub mod adaptive_control;

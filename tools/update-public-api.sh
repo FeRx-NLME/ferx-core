@@ -48,6 +48,9 @@ SIMPLIFY="-sss"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 baseline="$repo_root/api/ferx-core-public-api.txt"
+# The shape of the items ferx-core re-exports from ferx-model (#3041): `cargo public-api`
+# lists those in ferx-core only as `pub use` lines.
+model_baseline="$repo_root/api/ferx-model-public-api.txt"
 
 # Validate the argument BEFORE doing any work. The check/write choice below is a
 # bare `if --check ... else write`, so without this any unrecognised argument —
@@ -81,7 +84,9 @@ if ! cargo public-api --version 2>/dev/null | grep -q "$PUBLIC_API_VERSION"; the
 fi
 
 generated="$(mktemp)"
-trap 'rm -f "$generated"' EXIT
+model_raw="$(mktemp)"
+model_generated="$(mktemp)"
+trap 'rm -f "$generated" "$model_raw" "$model_generated"' EXIT
 
 RUSTUP_TOOLCHAIN="$PINNED_TOOLCHAIN" cargo public-api \
   --manifest-path "$repo_root/Cargo.toml" \
@@ -90,9 +95,17 @@ RUSTUP_TOOLCHAIN="$PINNED_TOOLCHAIN" cargo public-api \
   --no-default-features \
   --features "$FEATURES" \
   >"$generated"
+RUSTUP_TOOLCHAIN="$PINNED_TOOLCHAIN" cargo public-api \
+  --manifest-path "$repo_root/Cargo.toml" \
+  --package ferx-model \
+  $SIMPLIFY \
+  --no-default-features \
+  --features "$FEATURES" \
+  >"$model_raw"
+python3 "$repo_root/tools/public-api-model-filter.py" "$repo_root" "$generated" "$model_raw" >"$model_generated"
 
 if [ "${1:-}" = "--check" ]; then
-  if diff -u "$baseline" "$generated"; then
+  if diff -u "$baseline" "$generated" && diff -u "$model_baseline" "$model_generated"; then
     echo "public API matches the committed baseline."
   else
     cat >&2 <<'MSG'
@@ -115,5 +128,6 @@ MSG
   fi
 else
   cp "$generated" "$baseline"
-  echo "wrote $baseline"
+  cp "$model_generated" "$model_baseline"
+  echo "wrote $baseline and $model_baseline"
 fi

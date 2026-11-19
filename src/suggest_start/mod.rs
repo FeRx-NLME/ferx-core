@@ -13,7 +13,7 @@
 //!   Bayes estimates (etas ≠ 0); more accurate under large IIV. Falls back to
 //!   `Sweep` for ODE models.
 
-pub use crate::types::NcaInit;
+pub use ferx_model::types::NcaInit;
 
 mod nca;
 mod pooling;
