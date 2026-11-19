@@ -11503,3 +11503,81 @@ fn the_tangent_jacobian_patches_a_frem_row_like_the_reverse_one() {
     assert_eq!(by_tangents.grad[ti], weights[0], "TV_WT's score is the FREM row's weight");
     assert!((1..4).any(|j| jt[j * n_theta] != 0.0), "fixture: the PK rows depend on θ");
 }
+
+// ---- a rejected trial step whose stages are not finite (#3065) --------------------------
+
+/// A fast-decaying `central` drives `eff` through `central^GAM`, the exponent a θ: once
+/// `central` has decayed to the order of `abstol` the adaptive step grows until a trial
+/// stage overshoots it below zero, where `powf` of a negative base at a non-integer exponent
+/// is `NaN`. The driver rejects that attempt on its `NaN` error norm and retries, as the
+/// `f64` predictor does, so the predictions are finite; the pemetrexed neutropenia model's
+/// Hill term `(C/IC50)^GAMMA` (`GAMMA` fixed at 20, unpacked as `19.999999999999996`) hit
+/// this on every subject.
+const REJECTED_NAN_STAGE: &str = r#"
+[parameters]
+  theta TVK(3.0, 0.1, 50.0)
+  theta TVE(0.5, 0.01, 10.0)
+  theta TVKOUT(0.2, 0.01, 10.0)
+  theta GAM(1.7, 0.5, 5.0)
+  omega ETA_K ~ 0.09
+  omega ETA_E ~ 0.1
+  sigma ADD_ERR ~ 0.05 (sd)
+[individual_parameters]
+  K = TVK * exp(ETA_K)
+  E = TVE * exp(ETA_E)
+  KOUT = TVKOUT
+  G = GAM
+[structural_model]
+  ode(obs_cmt=eff, states=[central, eff])
+[odes]
+  d/dt(central) = -K * central
+  d/dt(eff) = E * central^G - KOUT * eff
+[error_model]
+  DV ~ additive(ADD_ERR)
+[fit_options]
+  ode_method = rk45
+"#;
+
+fn rejected_nan_stage_fixture() -> (CompiledModel, Subject) {
+    let model = parse_model_string(REJECTED_NAN_STAGE).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 10.0, 1, 0.0, false, 0.0)],
+        &[0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 24.0, 48.0],
+        &[0.1, -0.1],
+    );
+    (model, s)
+}
+
+/// The rejected attempt leaves the reverse's log: kept, its body's vector–Jacobian product
+/// carried the passed-through slots' adjoints back as `0 · NaN`, so every derivative of the
+/// subject was `NaN`, the outer gradient declined every subject to the reconverged
+/// finite-difference salvage, and a FOCEI fit stalled (#3065).
+#[test]
+fn a_rejected_step_with_non_finite_stages_leaves_the_derivatives_finite() {
+    let (model, s) = rejected_nan_stage_fixture();
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-10, true);
+    let preds = crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, eta.as_slice());
+    assert!(preds.iter().all(|p| p.is_finite()), "predictions {preds:?}");
+    let g = subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true)
+        .expect("subject must be in adjoint scope");
+    assert!(g.iter().all(|v| v.is_finite()), "gradient {g:?}");
+    let h = exact_inner_hessian(&model, &s, &params, eta.as_slice()).expect("an exact H");
+    assert!(h.iter().all(|v| v.is_finite()), "H {h}");
+}
+
+/// The same fixture's gradient against the reconverged-FD oracle at tight tolerances, where
+/// the integrator's error sits below the oracle's: the trial steps still overshoot `central`
+/// below zero and are rejected on their `NaN` stages, and the derivative the plan's reverse
+/// carries past them is the trajectory's own (#3065).
+#[test]
+fn a_rejected_step_with_non_finite_stages_matches_reconverged_fd() {
+    let (model, s) = rejected_nan_stage_fixture();
+    let worst = parity(&tight(model), &s);
+    // Measured 1.4e-8 vs reconverged FD (Richardson, EBE re-solved per point); 7× headroom.
+    // With the rejected attempt kept in the log every adjoint component is `NaN` and the
+    // oracle's finiteness assert fails first.
+    assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
+}
