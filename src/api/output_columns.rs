@@ -664,6 +664,19 @@ pub(crate) fn compute_extra_output_columns(
                                 // window (#2732). NaN, like every case here with no valid
                                 // answer.
                                 vec![]
+                            } else if model.ode_spec.is_none()
+                                && crate::pk::effective_model_for_eval(
+                                    model,
+                                    subject,
+                                    theta,
+                                    grid_eta_full,
+                                )
+                                .ode_spec
+                                .is_some()
+                            {
+                                // A closed-form transit/IG subject its ODE twin serves: no
+                                // states in the closed form's layout, as per-obs (#1580).
+                                vec![]
                             } else if let Some(ref ode) = model.ode_spec {
                                 // Time-independent params: the disposition is one snapshot
                                 // (t=0) across the grid; the ODE solver supplies its own clock.

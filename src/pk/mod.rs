@@ -3236,11 +3236,12 @@ pub fn compute_predictions_with_states(
     theta: &[f64],
     eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
-    // A `one_cpt_transit` subject the closed form can't serve (TIME switch / TV covariates)
-    // routes to its ODE `transit()` equivalent — so the compartment/state columns come from
-    // the ODE integration (the `ode_spec` branch below) instead of the analytical
-    // superposition path, which has no valid states for those subjects and would otherwise
-    // return NaN. Matches the IPRED routing in `compute_predictions_with_tv` (#486).
+    // A transit/IG subject the closed form can't serve routes to its ODE twin, for IPRED as
+    // in `compute_predictions_with_tv` (#486). The twin's states (`[central(, periph)]`
+    // amounts) are not the closed form's `[depot, central(, peripheral)]` concentrations
+    // `[derived]` names them by, so such a subject reports none (#1580,
+    // `W_DERIVED_CMT_TWIN_ANALYTICAL`).
+    let closed_form = model.ode_spec.is_none();
     let model = effective_model_for_eval(model, subject, theta, eta);
     let uses_time = model_uses_time_anywhere(model);
     if let Some(ref ode) = model.ode_spec {
@@ -3278,7 +3279,7 @@ pub fn compute_predictions_with_states(
         // θ_k + η_m (#2259). For Form C (ODE output_fn) models, model.scaling is
         // ScalingSpec::None, so the scaling step is a no-op there.
         to_observation_scale(model, subject, theta, eta, &mut ipred);
-        (ipred, states)
+        (ipred, if closed_form { vec![] } else { states })
     } else {
         // Analytical path: ipred via compute_predictions_with_tv (handles SS, resets,
         // TV covariates); states via predict_all_states (superposition only — valid
