@@ -274,7 +274,7 @@ fn fitted_mixture_values(
     }
     if let Some(values) = fit_result.mixture_overrides.as_deref() {
         if values.len() != n_overrides {
-            return Err(crate::api::fit_input_model(format!(
+            return Err(crate::entry_refusals::fit_input_model(format!(
                 "the fit records {} [mixture] override value(s) but this model declares {} \
                  per-class override(s). Supply the model the fit was estimated with.",
                 values.len(),
@@ -284,7 +284,7 @@ fn fitted_mixture_values(
         // Zero is a legal override (`sigma(2) EPS ~ 0 FIX`, which SAEM holds as is), as
         // the parser accepts any non-negative declaration.
         if let Some(bad) = values.iter().find(|v| !(v.is_finite() && **v >= 0.0)) {
-            return Err(crate::api::fit_input_model(format!(
+            return Err(crate::entry_refusals::fit_input_model(format!(
                 "the fit's recorded [mixture] override values include {bad}, which is not a \
                  non-negative finite variance or sigma, so the per-class Omega/Sigma cannot \
                  be rebuilt from them."
@@ -300,14 +300,14 @@ fn fitted_mixture_values(
             sigma,
             &v[segs.mixture_omega_start()..segs.rho_start()],
         )),
-        PackedEstimate::WrongLength(n) => Err(crate::api::fit_input_model(format!(
+        PackedEstimate::WrongLength(n) => Err(crate::entry_refusals::fit_input_model(format!(
             "the fit's packed estimate has {} coordinates but this model's parameter layout \
              has {}, so the [mixture] override values cannot be read from it. Supply the \
              model the fit was estimated with.",
             n,
             segs.total()
         ))),
-        PackedEstimate::Stale => Err(crate::api::fit_input_model(
+        PackedEstimate::Stale => Err(crate::entry_refusals::fit_input_model(
             "the fit's packed estimate does not reproduce its reported estimates (theta / \
              Omega / Sigma / Omega_IOV / residual correlations), so the [mixture] override \
              values it carries cannot be trusted: the estimates or the packed estimate were \
@@ -324,7 +324,7 @@ fn fitted_mixture_values(
                         .map(|&(c, si)| format!("sigma({}) {}", c + 1, template.sigma.names[si])),
                 )
                 .collect();
-            Err(crate::api::fit_input_missing(format!(
+            Err(crate::entry_refusals::fit_input_missing(format!(
                 "this [mixture] fit estimates the per-class override(s) {}, and the fit \
                  records neither their fitted values (mixture_overrides) nor a packed \
                  estimate holding them. A fit() result records them, and so does a .fitrx \
@@ -458,7 +458,7 @@ pub(crate) fn logit_theta_coords(
         let t = template.theta[i];
         if !(t > 0.0 && t < 1.0) {
             let name = template.theta_names.get(i).map(String::as_str).unwrap_or("?");
-            return Err(crate::api::logit_theta_out_of_range(name, t));
+            return Err(crate::entry_refusals::logit_theta_out_of_range(name, t));
         }
         coords.push(LogitThetaCoord {
             index: i,
@@ -720,7 +720,7 @@ fn draw_asymptotic(
     fit_result: &FitResult, template: &ModelParameters, n_draws: usize, rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, EngineError> {
     let cov = fit_result.covariance_matrix.as_ref().ok_or_else(|| {
-        crate::api::fit_input_missing(
+        crate::entry_refusals::fit_input_missing(
             "Asymptotic uncertainty requires FitResult.covariance_matrix; run the \
              fit with `covariance = true` and ensure the covariance step succeeds.",
         )
@@ -758,7 +758,7 @@ fn draw_asymptotic(
     }
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed || cov.ncols() != n_packed {
-        return Err(crate::api::fit_input_model(format!(
+        return Err(crate::entry_refusals::fit_input_model(format!(
             "Covariance matrix ({}x{}) doesn't match packed parameters ({})",
             cov.nrows(),
             cov.ncols(),
@@ -808,17 +808,17 @@ fn draw_sir(
     fit_result: &FitResult, template: &ModelParameters, n_draws: usize, rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, EngineError> {
     let pool = fit_result.sir_resamples_packed.as_ref().ok_or_else(|| {
-        crate::api::fit_input_missing(
+        crate::entry_refusals::fit_input_missing(
             "SIR uncertainty requires FitResult.sir_resamples_packed; run the fit \
              with `sir = true` and `sir_keep_samples = true`.",
         )
     })?;
     if pool.is_empty() {
-        return Err(crate::api::fit_input_missing("SIR resample pool is empty"));
+        return Err(crate::entry_refusals::fit_input_missing("SIR resample pool is empty"));
     }
     let expected_len = crate::estimation::parameterization::packed_len(template);
     if pool[0].len() != expected_len {
-        return Err(crate::api::fit_input_model(format!(
+        return Err(crate::entry_refusals::fit_input_model(format!(
             "SIR resample length ({}) doesn't match packed parameters ({}) — \
              the FitResult and template may come from different models",
             pool[0].len(),

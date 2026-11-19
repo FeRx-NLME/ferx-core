@@ -21,7 +21,7 @@ use std::collections::HashMap;
 /// than emit NaN observations.
 pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
     if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
-        return Err(super::entry_refusals::adaptive_unsupported(
+        return Err(crate::entry_refusals::adaptive_unsupported(
             Some("error_model"),
             "adaptive-dosing simulation does not support a covariate-selected `[error_model]` \
              (`if (COV …) { … } else { … }`): the assay keys residual error by the monitored \
@@ -44,7 +44,7 @@ pub(crate) fn check_adaptive_model_data(
     model: &CompiledModel, population: &Population,
 ) -> Result<(), EngineError> {
     if model.has_nested_levels() {
-        return Err(super::entry_refusals::nested_level_simulate_unsupported());
+        return Err(crate::entry_refusals::nested_level_simulate_unsupported());
     }
     first_error(&check_simulation_data(model, population))?;
     reject_selected_error_for_adaptive(model)
@@ -72,7 +72,7 @@ pub(crate) fn reject_unsupported_adaptive(
     model: &CompiledModel, _population: &Population,
 ) -> Result<(), EngineError> {
     if model.is_sde() {
-        return Err(super::entry_refusals::adaptive_unsupported(
+        return Err(crate::entry_refusals::adaptive_unsupported(
             Some("diffusion"),
             "adaptive-dosing simulation does not support stochastic (`[diffusion]` / SDE) \
              models: the reactive integrator is deterministic and would silently drop the \
@@ -83,7 +83,7 @@ pub(crate) fn reject_unsupported_adaptive(
     // (`assay_resid_var`), which carries no between-row term: repeated readings in
     // one block would come out independent (#1081).
     if let Some(line) = crate::api::validation::residual_correlation_line(model) {
-        return Err(super::entry_refusals::adaptive_unsupported(
+        return Err(crate::entry_refusals::adaptive_unsupported(
             Some("error_model"),
             format!(
                 "adaptive-dosing simulation does not support `{line}`: the controller draws its \
@@ -97,7 +97,7 @@ pub(crate) fn reject_unsupported_adaptive(
     // signal would carry a log-scale σ on a linear value and every trajectory row
     // would disagree with `simulate()` (#2129).
     if model.log_transform {
-        return Err(super::entry_refusals::adaptive_unsupported(
+        return Err(crate::entry_refusals::adaptive_unsupported(
             Some("error_model"),
             "adaptive-dosing simulation does not support a log-transformed error model \
              (`log(DV) ~ …` / `DV ~ log_additive(…)`): the controller reads and noises the \
@@ -329,7 +329,7 @@ where
 {
     let params = inputs.params;
     let ode = model.ode_spec.as_ref().ok_or_else(|| {
-        super::entry_refusals::adaptive_unsupported(
+        crate::entry_refusals::adaptive_unsupported(
             None,
             "simulate_adaptive requires an ODE model (the reactive driver runs on the ODE \
              engine); this model has no [odes] block",
@@ -356,7 +356,7 @@ where
     // defaults to empty), so reject it rather than return a silent no-op — the
     // same "never a silent wrong answer" contract as the other preconditions.
     if opts.decision_times.is_empty() {
-        return Err(super::entry_refusals::adaptive_options(
+        return Err(crate::entry_refusals::adaptive_options(
             "simulate_adaptive requires a non-empty decision schedule \
              (`AdaptiveSimulateOptions::decision_times`); with no decision times the controller \
              is never consulted and no dose is ever issued",
@@ -425,7 +425,7 @@ impl AdaptiveEntry {
     /// `assay_cmt` on the other.
     fn dv_without_error_model(self, m: &crate::sim::adaptive::MonitorSpec) -> EngineError {
         match self {
-            AdaptiveEntry::Programmatic => super::entry_refusals::adaptive_options(format!(
+            AdaptiveEntry::Programmatic => crate::entry_refusals::adaptive_options(format!(
                 "monitor '{}' requests DV observation on compartment {} but no [error_model] \
                  defines residual error there",
                 m.name, m.cmt
@@ -448,7 +448,7 @@ impl AdaptiveEntry {
             (AdaptiveEntry::Spec { .. }, crate::ode::AdaptiveRefusalKind::ControllerAction) => {
                 spec_refusal(message)
             }
-            _ => super::entry_refusals::adaptive_driver_refusal(kind, message),
+            _ => crate::entry_refusals::adaptive_driver_refusal(kind, message),
         }
     }
 
@@ -567,7 +567,7 @@ fn subject_dose_plan(
     let r = exprs.resolve(spec, model, theta, covs, values.as_ref());
     match r.violation {
         None => Ok(r.plan),
-        Some(v) => Err(super::entry_refusals::adaptive_dose_value(v.subject_message(
+        Some(v) => Err(crate::entry_refusals::adaptive_dose_value(v.subject_message(
             spec,
             &r.plan,
             &subject.id,
@@ -624,7 +624,7 @@ fn dose_knowledge_refusal(
     } else {
         ("these are".to_string(), "them", "the known values", "data columns", "those")
     };
-    super::entry_refusals::adaptive_dose_knowledge(format!(
+    crate::entry_refusals::adaptive_dose_knowledge(format!(
         "[adaptive_dosing] {what}, but the random effects of {} of {n_subjects} subject(s) \
          are drawn by the simulation ({}), so {truth} the simulated truth, which no \
          prescriber knows at dosing time. To dose from {it}: carry {value} as {column} \
@@ -802,7 +802,7 @@ fn frem_drawn_remedy(dose_covariates: &[(&str, &str)]) -> String {
 
 /// `E_ADAPTIVE_SPEC` (block `adaptive_dosing`) in `simulate_adaptive_from_spec`'s context.
 fn spec_refusal(message: String) -> EngineError {
-    EngineError::from_diagnostic(super::entry_refusals::adaptive_spec(message))
+    EngineError::from_diagnostic(crate::entry_refusals::adaptive_spec(message))
         .in_context("simulate_adaptive_from_spec")
 }
 
@@ -1019,7 +1019,7 @@ where
     // here too, at the shared funnel, with the *same* validator (finite + strictly
     // ascending ⇒ no duplicates) so the two paths cannot drift.
     crate::sim::adaptive::validate_increasing_finite(decision_times, "`decision_times`")
-        .map_err(super::entry_refusals::adaptive_options)?;
+        .map_err(crate::entry_refusals::adaptive_options)?;
     // Data-only, so once per run, not per replicate (#2559).
     let moved_reset_warnings = decisions_before_moved_reset_warnings(population, decision_times);
 
@@ -1078,7 +1078,7 @@ where
     // running infusion, an EVID=4 dose and a dose train across the reset
     // (`adaptive_base_regimen_with_reset_under_{tv_covariate,iov}_…`).
     if decision_times.len() > opts.max_decisions {
-        return Err(super::entry_refusals::adaptive_options(format!(
+        return Err(crate::entry_refusals::adaptive_options(format!(
             "decision schedule has {} points, exceeding max_decisions = {} (runaway guard); \
              raise `max_decisions` in the simulate options if the schedule is intentional",
             decision_times.len(),
@@ -1086,12 +1086,12 @@ where
         )));
     }
     if let Some(d) = opts.start_interval {
-        check_start_interval(decision_times, d).map_err(super::entry_refusals::adaptive_options)?;
+        check_start_interval(decision_times, d).map_err(crate::entry_refusals::adaptive_options)?;
     }
     for am in monitors {
         let m = am.spec;
         if m.cmt == 0 || m.cmt > ode.n_states {
-            return Err(super::entry_refusals::adaptive_options(format!(
+            return Err(crate::entry_refusals::adaptive_options(format!(
                 "monitor '{}' observes compartment {} but the model has {} state(s)",
                 m.name, m.cmt, ode.n_states
             )));
@@ -2331,26 +2331,26 @@ pub fn simulate_adaptive_from_spec_with_inputs(
     // monitored signal; an `opts` that *also* sets them is ambiguous (two
     // schedules, two monitors) — reject it rather than silently pick one.
     if !opts.decision_times.is_empty() {
-        return Err(super::entry_refusals::adaptive_options(
+        return Err(crate::entry_refusals::adaptive_options(
             "simulate_adaptive_from_spec takes its decision schedule from the \
              [adaptive_dosing] block's `at`; leave `opts.decision_times` empty",
         ));
     }
     if !opts.monitors.is_empty() {
-        return Err(super::entry_refusals::adaptive_options(
+        return Err(crate::entry_refusals::adaptive_options(
             "simulate_adaptive_from_spec takes its monitor from the [adaptive_dosing] \
              block's `observe`; leave `opts.monitors` empty",
         ));
     }
     if opts.start_interval.is_some() {
-        return Err(super::entry_refusals::adaptive_options(
+        return Err(crate::entry_refusals::adaptive_options(
             "simulate_adaptive_from_spec takes its dosing interval from the \
              [adaptive_dosing] block's `intervals` / `start_interval`; leave \
              `opts.start_interval` empty",
         ));
     }
     if opts.decision_covariates.is_some() {
-        return Err(super::entry_refusals::adaptive_options(
+        return Err(crate::entry_refusals::adaptive_options(
             "simulate_adaptive_from_spec takes its decision covariates from the \
              [adaptive_dosing] block's `decision_covariates`; leave \
              `opts.decision_covariates` empty",
@@ -2393,7 +2393,7 @@ pub fn simulate_adaptive_from_spec_with_inputs(
     if !missing.is_empty() {
         let available = super::validation::available_covariate_columns(population);
         // The same cause as `ferx check`'s `E_MISSING_COVARIATE`, so the same code (#1774).
-        return Err(super::entry_refusals::observe_covariate_missing(format!(
+        return Err(crate::entry_refusals::observe_covariate_missing(format!(
             "[adaptive_dosing] `observe` references covariate(s) not found in data \
              (case-sensitive): {}. Available covariate columns: {}.",
             missing.join(", "),
@@ -2415,7 +2415,7 @@ pub fn simulate_adaptive_from_spec_with_inputs(
             .map(|&(_, name)| name)
             .collect();
         let available = super::validation::available_covariate_columns(population);
-        return Err(super::entry_refusals::observe_covariate_missing(format!(
+        return Err(crate::entry_refusals::observe_covariate_missing(format!(
             "[adaptive_dosing] `{key}` references covariate(s) not found in data \
              (case-sensitive): {}. Available covariate columns: {}.",
             missing.join(", "),

@@ -152,7 +152,7 @@ pub fn run_covariance(
     // file's. #426: the scope carries this call's `inner_optimizer` / `ebe_warm_start` the
     // same way, so the reconverged EBEs use the resolved inner solver — the same source as
     // `inner_maxiter` / `inner_tol` — and not whatever another fit in the process last set.
-    crate::api::with_fit_scope(options, || run_covariance_scoped(fit, model, population, options))?
+    crate::pool::with_fit_scope(options, || run_covariance_scoped(fit, model, population, options))?
 }
 
 fn run_covariance_scoped(
@@ -216,7 +216,7 @@ fn run_covariance_scoped(
 
     // --- Sanity-check dimensions ------------------------------------------
     if !fit.subjects.is_empty() && fit.subjects[0].eta.len() != model_ref.n_eta {
-        return Err(crate::api::fit_input_model(format!(
+        return Err(crate::entry_refusals::fit_input_model(format!(
             "fit.subjects[0] has eta dim {} but model has n_eta = {}. \
              Subject EBEs are inconsistent with the supplied model.",
             fit.subjects[0].eta.len(),

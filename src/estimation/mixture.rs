@@ -1718,7 +1718,7 @@ mod tests {
                     inner_tol: tol,
                     ..Default::default()
                 };
-                crate::api::with_fit_scope(&opts, || {
+                crate::pool::with_fit_scope(&opts, || {
                     super::mixture_ofv(&model, &pop, params, &opts, None)
                 })
                 .expect("the scope builds")

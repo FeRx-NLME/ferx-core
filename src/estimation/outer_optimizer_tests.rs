@@ -6893,7 +6893,7 @@ pub(crate) mod outer_fd_fallback {
             let x = pack_params(params);
             let bounds = compute_bounds(params);
             let fixed = packed_fixed_mask(params);
-            let (one_sided, worst) = crate::api::with_fit_scope(&opts, || {
+            let (one_sided, worst) = crate::pool::with_fit_scope(&opts, || {
                 let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
                 let (ehs, _, _, kappas) =
                     run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
@@ -7124,7 +7124,7 @@ pub(crate) mod outer_fd_fallback {
             let x = pack_params(params);
             assert_eq!(x[iv], params.theta[1], "fixture: TVV_S is identity-packed");
             let bounds = compute_bounds(params);
-            crate::api::with_fit_scope(&opts, || {
+            crate::pool::with_fit_scope(&opts, || {
                 let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
                 let (ehs, _, _, kappas) =
                     run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
@@ -7232,7 +7232,7 @@ pub(crate) mod outer_fd_fallback {
         let x = pack_params(params);
         assert_eq!(x[w], 1e-4, "fixture: the weight is identity-packed at its θ₀");
         let bounds = compute_bounds(params);
-        let (fd, exact) = crate::api::with_fit_scope(&opts, || {
+        let (fd, exact) = crate::pool::with_fit_scope(&opts, || {
             let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
             let (ehs, _, _, kappas) =
                 run_inner_loop_warm(&model, &pop, params, 500, 1e-10, None, Some(&mu), 0, 0);
@@ -7499,7 +7499,7 @@ pub(crate) mod outer_fd_fallback {
         let floors = fd_step_floors(params, model);
         let mut only = vec![true; x.len()];
         only[ib] = false;
-        crate::api::with_fit_scope(opts, || {
+        crate::pool::with_fit_scope(opts, || {
             let mu = compute_mu_k(model, &params.theta, opts.mu_referencing);
             let (ehs, _, _, kappas) =
                 run_inner_loop_warm(model, pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
@@ -7668,7 +7668,7 @@ pub(crate) mod outer_fd_fallback {
             let params = &m.default_params;
             let x = pack_params(params);
             let bounds = compute_bounds(params);
-            crate::api::with_fit_scope(&opts, || {
+            crate::pool::with_fit_scope(&opts, || {
                 let mu = compute_mu_k(m, &params.theta, opts.mu_referencing);
                 let (ehs, _, _, kappas) =
                     run_inner_loop_warm(m, p, params, 500, 1e-8, None, Some(&mu), 0, 0);
@@ -8852,7 +8852,7 @@ fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished
     let p = &m.default_params;
     let ov = decrement_ode_override(&m, &opts).expect("integrated");
     assert_eq!(ov.max_steps, Some(100), "fixture's tight budget");
-    let (converged, unchecked, checked) = crate::api::with_fit_scope_ode(&opts, ov, || {
+    let (converged, unchecked, checked) = crate::pool::with_fit_scope_ode(&opts, ov, || {
         let pp = unpack_params(&x, p);
         let mu_k = compute_mu_k(&m, &pp.theta, opts.mu_referencing);
         let warm = joint_warm_starts(&ehs, &kappas);

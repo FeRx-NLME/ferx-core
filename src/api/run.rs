@@ -167,7 +167,7 @@ pub fn prepare_run_with_inits(
     }
 
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)
-        .map_err(super::entry_refusals::data_path_missing)?;
+        .map_err(crate::entry_refusals::data_path_missing)?;
 
     // The settings this read uses are the ones the fit records (#1685).
     let reader_settings = ReaderSettings::from_parsed(&parsed);
@@ -493,7 +493,7 @@ pub fn run_model_simulate_with_overrides(
         text: model_text, hash: model_hash, mut parsed, ..
     } = read_model_source(model_path)?;
     let sim_spec =
-        parsed.simulation.clone().ok_or_else(super::entry_refusals::simulation_block_missing)?;
+        parsed.simulation.clone().ok_or_else(crate::entry_refusals::simulation_block_missing)?;
     set_model_name(&mut parsed.model, model_path);
 
     eprintln!("Model: {}", parsed.model.name);
@@ -508,7 +508,7 @@ pub fn run_model_simulate_with_overrides(
     let tte_cmts: Vec<usize> = parsed.model.tte_cmts();
     #[cfg(feature = "survival")]
     if !tte_cmts.is_empty() && sim_spec.horizon.is_none() {
-        return Err(super::entry_refusals::simulate_horizon(
+        return Err(crate::entry_refusals::simulate_horizon(
             "[simulation] with a TTE endpoint requires `horizon = <t>` \
              (the administrative censoring time at which event-free subjects are \
              right-censored)",
@@ -535,7 +535,7 @@ pub fn run_model_simulate_with_overrides(
     // (with `times`); the library `simulate()` chokepoint panics on the same case.
     #[cfg(feature = "markov")]
     if parsed.model.has_dtmm() {
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "[simulation]: a [markov_model] `type = dtmm` endpoint cannot be simulated yet — \
              sampling a discrete-time state chain is a later slice. fit() supports DTMM; \
              --simulate does not.",
@@ -544,7 +544,7 @@ pub fn run_model_simulate_with_overrides(
     #[cfg(feature = "markov")]
     if parsed.model.has_ctmm() {
         // `E_CTMM_UNSUPPORTED`, the code `simulate*` gives it (#2062 review N2).
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "[simulation]: a [markov_model] (CTMM) endpoint cannot be simulated yet — \
              sampling a discrete-state trajectory from the generator is a later slice. \
              fit() supports CTMM; --simulate does not.",
@@ -565,7 +565,7 @@ pub fn run_model_simulate_with_overrides(
     let count_cmts: Vec<usize> = Vec::new();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
-            return Err(super::entry_refusals::simulation_design(
+            return Err(crate::entry_refusals::simulation_design(
                 "[simulation] has no `times`, but the model has a continuous \
                  (residual-error) endpoint that needs observation times — add \
                  `times = [...]` (a joint PK + TTE design needs both `times` and a \
@@ -573,14 +573,14 @@ pub fn run_model_simulate_with_overrides(
             ));
         }
         if !count_cmts.is_empty() {
-            return Err(super::entry_refusals::simulation_design(
+            return Err(crate::entry_refusals::simulation_design(
                 "[simulation] has no `times`, but the model has a [count_model] endpoint. \
                  A count is observed on a fixed schedule, so it needs `times = [...]` (a \
                  `horizon` alone gives it nothing to observe)",
             ));
         }
         if !binary_cmts.is_empty() {
-            return Err(super::entry_refusals::simulation_design(
+            return Err(crate::entry_refusals::simulation_design(
                 "[simulation] has no `times`, but the model has a [binary_model] endpoint. \
                  A binary outcome is observed on a fixed schedule, not located in time like \
                  a TTE event, so it needs `times = [...]` (a `horizon` alone gives it nothing \
@@ -588,7 +588,7 @@ pub fn run_model_simulate_with_overrides(
             ));
         }
         if !model_has_tte {
-            return Err(super::entry_refusals::simulation_design(
+            return Err(crate::entry_refusals::simulation_design(
                 "[simulation] has no `times` and the model has no TTE endpoint \
                  to observe at a `horizon` — nothing to simulate",
             ));
@@ -606,7 +606,7 @@ pub fn run_model_simulate_with_overrides(
     // Per-subject covariate values from `[simulation] covariate NAME = ...` (#1083).
     let (sim_covariate_names, sim_subject_covariates) =
         simulation_design_covariates(&sim_spec, &parsed.model)
-            .map_err(super::entry_refusals::simulation_covariate_missing)?;
+            .map_err(crate::entry_refusals::simulation_covariate_missing)?;
     let subject_covariates = |i: usize| -> HashMap<String, f64> {
         sim_subject_covariates.get(i - 1).cloned().unwrap_or_default()
     };

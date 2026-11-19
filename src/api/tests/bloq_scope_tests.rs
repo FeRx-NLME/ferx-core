@@ -9,7 +9,7 @@
 //!
 //! **The rule.** `FitOptions::bloq_method` is an `Option`: `Some(m)` runs this call under `m`,
 //! `None` under the model's own method. `fit` arms it (`types::arm_bloq_override`, carried to
-//! the workers by `api::pool::FitScope::bloq`) and every reader asks
+//! the workers by `pool::FitScope::bloq`) and every reader asks
 //! `CompiledModel::bloq_in_force` (pinned by `tests/bloq_in_force_is_the_one_reader.rs`).
 //!
 //! Every case reads **which method the fit reports** (`FitResult::bloq_method`, built from

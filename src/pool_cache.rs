@@ -182,5 +182,5 @@ impl Drop for FitPoolLease<'_> {
 }
 
 #[cfg(test)]
-#[path = "tests/pool_cache_tests.rs"]
+#[path = "api/tests/pool_cache_tests.rs"]
 mod tests;

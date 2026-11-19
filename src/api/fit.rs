@@ -212,7 +212,7 @@ pub fn fit_from_files(
         ..opts
     };
     let (data_path, data_path_warning) = resolve_data_path(parsed.data_path.as_deref(), data_path)
-        .map_err(super::entry_refusals::data_path_missing)?;
+        .map_err(crate::entry_refusals::data_path_missing)?;
     let data_path = data_path.as_str();
     // One read of the dataset (#2140): the population and `data_hash` are the same
     // bytes, so a CSV edited while the fit runs is not recorded as the fitted data.
@@ -2879,7 +2879,7 @@ fn fit_inner(
     // Thread warnings (post-chain, uses n_threads_used captured above): where the count
     // came from, an unusable `RAYON_NUM_THREADS`, oversubscribed cores (#2800, #1811), and
     // more workers than subjects.
-    result.warnings.extend(super::pool::fit_thread_warnings(
+    result.warnings.extend(crate::pool::fit_thread_warnings(
         options.threads,
         n_threads_used,
         population.subjects.len(),

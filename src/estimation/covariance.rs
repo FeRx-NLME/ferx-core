@@ -2018,7 +2018,7 @@ fn tightened_covariance_step(
         let out = (out, FD_OBJECTIVE_EVALS.with(|c| c.replace(evals_before)) - evals_before);
         out
     };
-    match crate::api::with_fit_scope_ode(options, tight, run) {
+    match crate::pool::with_fit_scope_ode(options, tight, run) {
         #[cfg(test)]
         Ok((out, evals)) => {
             FD_OBJECTIVE_EVALS.with(|c| c.set(c.get() + evals));
@@ -4057,7 +4057,7 @@ mod tests {
             threads: Some(1),
             ..FitOptions::default()
         };
-        let posthoc = crate::api::with_fit_scope(&fd_opts, has_fd).expect("scope");
+        let posthoc = crate::pool::with_fit_scope(&fd_opts, has_fd).expect("scope");
         assert!(posthoc, "run_covariance's scope must carry gradient = fd");
         assert!(!has_fd(), "the guard and the scope disarm on exit");
     }

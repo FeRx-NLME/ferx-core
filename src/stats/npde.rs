@@ -203,7 +203,7 @@ pub fn compute_npde_npd_diag(
     crate::diagnostics::first_error(&crate::api::check_level_labels(model, population))?;
     if let Some(levels) = model.nested_levels() {
         if iov_occasion.is_some_and(|r| *r != IovOccasionRule::Column) {
-            return Err(crate::api::level_mixed_with_iov_rule(&levels.levels[0].name));
+            return Err(crate::entry_refusals::level_mixed_with_iov_rule(&levels.levels[0].name));
         }
     }
     // An unbound level block gathers `NaN` on every record (#1763); before the θ length,
@@ -256,7 +256,7 @@ pub fn compute_npde_npd_diag(
     // each replicate first draws the subject's class, keyed off `base_seed` (#2163), so the
     // reference is the fitted mixture's predictive distribution rather than class 1's.
     let classes = crate::api::SimClasses::new(model, params, base_seed)?;
-    let scores = crate::api::install_on_engine_pool(|| {
+    let scores = crate::pool::install_on_engine_pool(|| {
         crate::par::map(population.subjects.len(), |i| {
             let subject = &population.subjects[i];
             let mut rng =

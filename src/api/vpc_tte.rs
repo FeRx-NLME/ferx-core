@@ -340,7 +340,7 @@ pub(super) fn simulate_replicates(
 }
 
 pub(super) fn refuse(message: String) -> EngineError {
-    super::entry_refusals::vpc_tte_input(message)
+    crate::entry_refusals::vpc_tte_input(message)
 }
 
 /// The option checks both entry points make: the band probabilities, enough

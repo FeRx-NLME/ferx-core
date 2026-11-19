@@ -59,7 +59,7 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
         "runtime: the sampler finds too few valid draws in the pool; its input refusals are coded (#2044)",
     ),
     (
-        "src/api/pool.rs",
+        "src/pool.rs",
         "with_scope",
         2,
         "runtime: the fit-scoped worker pool could not be built; its ODE-option refusal is coded (#2044)",
@@ -93,7 +93,7 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
          here, #2073); every input refusal is coded (#1788)",
     ),
     (
-        "src/api/pool.rs",
+        "src/pool.rs",
         "install_on_fit_pool",
         3,
         "runtime: the fit's worker pool could not be built (scoped, shared or leased); its \
