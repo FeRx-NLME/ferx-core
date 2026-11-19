@@ -9867,9 +9867,10 @@ pub struct FitOptions {
     /// Length of SAEM's exploration phase (step size γ = 1).
     ///
     /// `None` (the default, `n_exploration` absent from the model file) ends the
-    /// phase by a convergence test: at least [`Self::saem_exploration_min`]
-    /// iterations, then as soon as no tracked Ω / σ / θ trajectory shows a
-    /// significant trend over a trailing window, but never beyond
+    /// phase by NONMEM's termination test with an autocorrelation-chosen interval:
+    /// at least [`Self::saem_exploration_min`] iterations, then as soon as no
+    /// tracked trajectory (complete-data −log L, θ, Ω, σ) shows a significant trend
+    /// over its latest ten spaced iterates, but never beyond
     /// [`Self::saem_exploration_max`]. `Some(n)` — `n_exploration = n` — is a
     /// fixed length and takes precedence over both bounds. The length a run
     /// used is reported in [`FitResult::saem_n_exploration_used`].
@@ -9878,8 +9879,9 @@ pub struct FitOptions {
     /// former fixed length and Monolix's minimum). Ignored when
     /// `saem_n_exploration` is `Some`.
     pub saem_exploration_min: usize,
-    /// Maximum exploration length under the automatic stop (default 500, Monolix's
-    /// maximum). Ignored when `saem_n_exploration` is `Some`.
+    /// Maximum exploration length under the automatic stop (default 2000, between
+    /// NONMEM's default `NBURN` of 1000 and its `AUTO=1` value of 4000; the test's
+    /// longest window is 500). Ignored when `saem_n_exploration` is `Some`.
     pub saem_exploration_max: usize,
     /// Exponent `a` of the convergence-phase step `γ_k = 1/(k − K1)^a`
     /// (default `1.0`, the classical Kuhn–Lavielle choice; Monolix uses `0.7`).
@@ -10759,7 +10761,7 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: None,
             saem_exploration_min: 150,
-            saem_exploration_max: 500,
+            saem_exploration_max: 2000,
             saem_smoothing_exponent: 1.0,
             saem_n_convergence: 250,
             // 0 = `auto`: resolved from the dataset by

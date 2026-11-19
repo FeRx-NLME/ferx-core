@@ -29,63 +29,97 @@ fn series(seed: u64, n: usize, rho: f64, sd: f64, drift: f64) -> Vec<f64> {
         .collect()
 }
 
-fn detection_rate(rho: f64, drift: f64, trials: u64) -> f64 {
+/// Share of `trials` AR(1) series of length `n` the test does *not* call stationary
+/// (`Some(true)` or not yet testable), with a linear drift totalling `drift_sd`
+/// marginal standard deviations over the series.
+fn flag_rate(n: usize, rho: f64, drift_sd: f64, trials: u64) -> f64 {
+    let sd = 0.1;
+    let per_step = drift_sd * sd / n as f64;
     let hits = (1..=trials)
-        .filter(|&s| trend_detected(&series(s, TREND_WINDOW, rho, 0.1, drift)))
+        .filter(|&s| trend_test(&series(s, n, rho, sd, per_step)) != Some(false))
         .count();
     hits as f64 / trials as f64
 }
 
-/// Regression this exists to catch: an OLS slope test that ignores
-/// autocorrelation flags stationary SAEM trajectories (measured 20-40 % of
-/// windows on real log-Ω traces), so the stop never fires. Measured here over
-/// 2000 AR(1) windows: 0.051 / 0.058 / 0.087 at rho = 0 / 0.5 / 0.9 against the
-/// nominal 0.05; the 0.12 bound has the headroom of a 4-sigma binomial band.
+/// Regression this exists to catch: a test whose points are closer together than
+/// the series' autocorrelation time reads wander as trend. The previous rule (five
+/// 20-iteration batch means) flagged 12–23 % of stationary SAEM coordinates. With
+/// the spacing taken from the autocorrelation time the null rate stays near the
+/// nominal 1 % up to rho = 0.97 (autocorrelation time ~66, clamped to 50). Bounds:
+/// measured value (in the comment) plus a ~4-sigma binomial band.
 #[test]
 fn stationary_autocorrelated_noise_is_not_flagged_beyond_nominal() {
-    let r0 = detection_rate(0.0, 0.0, 2000);
-    let r5 = detection_rate(0.5, 0.0, 2000);
-    let r9 = detection_rate(0.9, 0.0, 2000);
-    assert!((0.03..0.08).contains(&r0), "iid null rate {r0}");
-    assert!(r5 < 0.09, "rho 0.5 null rate {r5}");
-    assert!(r9 < 0.12, "rho 0.9 null rate {r9}");
+    let r0 = flag_rate(2000, 0.0, 0.0, 400);
+    let r9 = flag_rate(2000, 0.9, 0.0, 400);
+    let r97 = flag_rate(2000, 0.97, 0.0, 400);
+    eprintln!("null rates: rho 0 {r0}, 0.9 {r9}, 0.97 {r97}");
+    assert!(r0 < 0.04, "iid null rate {r0}");
+    assert!(r9 < 0.06, "rho 0.9 null rate {r9}");
+    assert!(r97 < 0.12, "rho 0.97 null rate {r97}");
 }
 
-/// The other half: a real drift must be seen. Total drift over the window of
-/// 4 marginal sds (0.004 * 100 / 0.1) is detected 75 % of the time at rho = 0.9
-/// (measured 0.751), and a 10 sd drift essentially always (the bounds are the
-/// measured value minus a binomial band).
+/// The other half: a real drift must be seen, more often the larger it is. The test
+/// reads only its latest ten points (about 170 iterations at rho = 0.9, spacing ~19),
+/// so a drift of `D` sd over the 600-iteration series is ~0.29·D sd across them:
+/// 15 sd there is ~4.3 sd in the window, 30 sd ~8.6.
 #[test]
 fn drift_is_detected_with_power_growing_in_its_size() {
-    let weak = detection_rate(0.9, 0.004, 2000);
-    let strong = detection_rate(0.9, 0.01, 500);
-    assert!(weak > 0.65, "4-sd drift power {weak}");
-    assert!(strong > 0.99, "10-sd drift power {strong}");
-    // Monotone in the drift: a smaller one is flagged less often.
-    assert!(detection_rate(0.9, 0.001, 2000) < weak);
+    let weak = flag_rate(600, 0.9, 5.0, 300);
+    let mid = flag_rate(600, 0.9, 15.0, 300);
+    let strong = flag_rate(600, 0.9, 30.0, 200);
+    eprintln!("power: 5 sd {weak}, 15 sd {mid}, 30 sd {strong}");
+    assert!(weak < mid && mid <= strong, "{weak} {mid} {strong}");
+    assert!(mid > 0.5, "15-sd drift power {mid}");
+    assert!(strong > 0.95, "30-sd drift power {strong}");
 }
 
 #[test]
 fn decaying_variance_trajectory_is_a_trend_and_its_plateau_is_not() {
-    // log omega decaying as exp(-k/80) towards a plateau, plus rho = 0.9 noise.
-    let noise = series(7, 400, 0.9, 0.05, 0.0);
-    let y: Vec<f64> = (0..400)
-        .map(|k| -2.0 - 3.0 * (-(k as f64) / 80.0).exp() + noise[k])
-        .collect();
-    assert!(trend_detected(&y[..120]), "still decaying at 120");
-    assert!(!trend_detected(&y[300..]), "settled by 300");
+    // log omega decaying as exp(-k/150) towards a plateau, plus rho = 0.9 noise: the
+    // slow decay of a weakly identified variance this rule exists for.
+    let still = (1..=40u64)
+        .filter(|&s| {
+            let noise = series(s, 300, 0.9, 0.05, 0.0);
+            let y: Vec<f64> = (0..300)
+                .map(|k| -2.0 - 3.0 * (-(k as f64) / 150.0).exp() + noise[k])
+                .collect();
+            trend_test(&y) != Some(false)
+        })
+        .count();
+    let settled = (1..=40u64)
+        .filter(|&s| {
+            let noise = series(s, 2000, 0.9, 0.05, 0.0);
+            let y: Vec<f64> = (0..2000)
+                .map(|k| -2.0 - 3.0 * (-(k as f64) / 150.0).exp() + noise[k])
+                .collect();
+            trend_test(&y) == Some(false)
+        })
+        .count();
+    eprintln!("decay: still flagged at 300 in {still}/40, settled at 2000 in {settled}/40");
+    assert!(still >= 38, "still decaying at 300: {still}/40");
+    assert!(settled >= 36, "settled by 2000: {settled}/40");
 }
 
 #[test]
 fn constant_short_and_nonfinite_series() {
-    assert!(!trend_detected(&vec![0.3; TREND_WINDOW]), "fixed parameter");
-    assert!(!trend_detected(&vec![0.0; TREND_WINDOW]), "structural zero");
-    assert!(!trend_detected(&[1.0, 2.0, 3.0]), "shorter than a window");
-    let mut y = series(1, TREND_WINDOW, 0.5, 0.1, 0.0);
-    y[10] = f64::NAN;
-    assert!(trend_detected(&y), "a diverged coordinate is not converged");
-    y[10] = f64::INFINITY;
-    assert!(trend_detected(&y));
+    assert_eq!(trend_test(&vec![0.3; 200]), Some(false), "fixed parameter");
+    assert_eq!(trend_test(&vec![0.0; 200]), Some(false), "structural zero");
+    assert_eq!(trend_test(&[1.0, 2.0, 3.0]), None, "shorter than a window");
+    assert_eq!(
+        trend_test(&vec![0.3; MIN_TEST_WINDOW - 1]),
+        None,
+        "one short of the shortest window"
+    );
+    let mut y = series(1, 600, 0.0, 0.1, 0.0);
+    let last = y.len() - 1;
+    y[last] = f64::NAN;
+    assert_eq!(
+        trend_test(&y),
+        Some(true),
+        "a diverged coordinate is not converged"
+    );
+    y[last] = f64::INFINITY;
+    assert_eq!(trend_test(&y), Some(true));
 }
 
 /// A parameter that is fixed but wobbles in the last bits (a value round-tripped through
@@ -93,19 +127,34 @@ fn constant_short_and_nonfinite_series() {
 /// huge: the constant guard, not the t-test, must call it constant.
 #[test]
 fn rounding_level_ramp_is_constant_not_a_trend() {
-    let y: Vec<f64> = (0..TREND_WINDOW).map(|i| 0.3 + 1e-15 * i as f64).collect();
-    assert!(!trend_detected(&y));
+    // 600 long: a noiseless ramp's detrended residual is rounding noise, which reads as
+    // maximally autocorrelated (spacing 50), so it needs the longest window (500).
+    let y: Vec<f64> = (0..600).map(|i| 0.3 + 1e-15 * i as f64).collect();
+    assert_eq!(trend_test(&y), Some(false));
     // The same ramp at a visible scale is a trend (so the guard is what decides above).
-    let y: Vec<f64> = (0..TREND_WINDOW).map(|i| 0.3 + 1e-3 * i as f64).collect();
-    assert!(trend_detected(&y));
+    let y: Vec<f64> = (0..600).map(|i| 0.3 + 1e-3 * i as f64).collect();
+    assert_eq!(trend_test(&y), Some(true));
 }
 
 #[test]
-fn only_the_trailing_window_is_read() {
-    // A long steep history followed by a flat window: not a trend.
-    let mut y: Vec<f64> = (0..200).map(|k| 10.0 - 0.05 * k as f64).collect();
-    y.extend(series(3, TREND_WINDOW, 0.5, 0.01, 0.0));
-    assert!(!trend_detected(&y));
+fn only_the_latest_points_are_tested() {
+    // A long steep history followed by a long flat stretch: not a trend.
+    let mut y: Vec<f64> = (0..300).map(|k| 10.0 - 0.05 * k as f64).collect();
+    y.extend(series(3, 1200, 0.0, 0.01, 0.0).iter().map(|v| v - 6.0));
+    assert_eq!(trend_test(&y), Some(false));
+}
+
+#[test]
+fn spacing_follows_the_autocorrelation_time_within_its_bounds() {
+    // iid: autocorrelation time 1, raised to the minimum spacing.
+    assert_eq!(spacing(&series(5, 2000, 0.0, 0.1, 0.0)), SPACING_MIN);
+    // rho = 0.8: time (1 + 0.8)/(1 - 0.8) = 9, so around the minimum.
+    let s8 = spacing(&series(6, 2000, 0.8, 0.1, 0.0));
+    assert!((SPACING_MIN..=16).contains(&s8), "rho 0.8 spacing {s8}");
+    // rho = 0.97: time ~66, clamped to the maximum.
+    assert_eq!(spacing(&series(7, 2000, 0.97, 0.1, 0.0)), SPACING_MAX);
+    // A linear trend is removed before the estimate: it does not inflate the spacing.
+    assert_eq!(spacing(&series(5, 2000, 0.0, 0.1, 0.001)), SPACING_MIN);
 }
 
 fn push_all(m: &mut ExplorationMonitor, cols: &[Vec<f64>], upto: usize) {
@@ -116,14 +165,13 @@ fn push_all(m: &mut ExplorationMonitor, cols: &[Vec<f64>], upto: usize) {
 }
 
 #[test]
-fn monitor_stationary_stops_at_the_minimum_and_names_nothing() {
+fn monitor_stationary_stops_on_a_check_after_the_minimum_and_names_nothing() {
     let cols: Vec<Vec<f64>> = (0..6)
-        .map(|c| series(100 + c, 400, 0.5, 0.05, 0.0))
+        .map(|c| series(100 + c, 800, 0.0, 0.05, 0.0))
         .collect();
-    // Find the first stop for a given seed set by replaying the loop.
     let mut m = ExplorationMonitor::default();
     let mut stop = None;
-    for k in 1..=400 {
+    for k in 1..=800 {
         push_all(&mut m, &cols, k);
         if m.may_stop_at(k, 150) {
             stop = Some(k);
@@ -132,26 +180,37 @@ fn monitor_stationary_stops_at_the_minimum_and_names_nothing() {
     }
     let stop = stop.expect("stationary coordinates must pass the test");
     assert!(stop >= 150, "never before the minimum, got {stop}");
+    assert_eq!(
+        stop % CHECK_EVERY,
+        0,
+        "only on a check iteration, got {stop}"
+    );
     assert!(m.drifting().is_empty());
-    // Before a full window nothing can be declared converged.
+    // Before the shortest window nothing can be declared converged.
     let mut early = ExplorationMonitor::default();
-    push_all(&mut early, &cols, TREND_WINDOW - 1);
+    push_all(&mut early, &cols, MIN_TEST_WINDOW - 1);
     assert!(!early.converged());
-    assert!(!early.may_stop_at(TREND_WINDOW - 1, 0));
+    assert!(!early.may_stop_at(MIN_TEST_WINDOW - 1, 0));
+    assert_eq!(
+        early.drifting().len(),
+        cols.len(),
+        "untestable coordinates are listed"
+    );
 }
 
 #[test]
 fn monitor_one_drifting_coordinate_blocks_the_stop_and_is_named() {
     let mut cols: Vec<Vec<f64>> = (0..4)
-        .map(|c| series(200 + c, 300, 0.5, 0.05, 0.0))
+        .map(|c| series(200 + c, 600, 0.0, 0.05, 0.0))
         .collect();
-    // Coordinate 2 decays steadily: -0.01 per iteration against sd 0.05 noise.
-    cols[2] = series(9, 300, 0.5, 0.05, -0.01);
+    // Coordinate 2 decays steadily: -0.01 per iteration against sd 0.05 noise (20 sd
+    // across its 100-iteration test window).
+    cols[2] = series(9, 600, 0.0, 0.05, -0.01);
     let mut m = ExplorationMonitor::default();
-    push_all(&mut m, &cols, 300);
+    push_all(&mut m, &cols, 600);
     assert!(!m.converged());
     assert_eq!(m.drifting(), vec![2]);
-    assert!(!m.may_stop_at(300, 150));
+    assert!(!m.may_stop_at(600, 150));
 }
 
 #[test]
@@ -159,7 +218,7 @@ fn bounds_precedence_explicit_length_overrides_the_automatic_stop() {
     let mut o = FitOptions::default();
     assert_eq!(
         exploration_bounds(&o),
-        (true, 150, 500),
+        (true, 150, 2000),
         "default is automatic"
     );
     o.saem_exploration_min = 100;
@@ -225,7 +284,7 @@ fn coordinate_names_follow_the_coordinate_order() {
 }
 
 #[test]
-fn drifting_summary_names_caps_and_explains_an_unfilled_window() {
+fn drifting_summary_names_and_caps() {
     let names: Vec<String> = (0..12).map(|i| format!("p{i}")).collect();
     assert_eq!(drifting_summary(&[3, 7], &names, 8), "p3, p7");
     assert_eq!(
@@ -233,5 +292,5 @@ fn drifting_summary_names_caps_and_explains_an_unfilled_window() {
         "p0, p1, and 1 more"
     );
     assert_eq!(drifting_summary(&[20], &names, 8), "#20");
-    assert!(drifting_summary(&[], &names, 8).contains("trend window"));
+    assert_eq!(drifting_summary(&[], &names, 8), "none");
 }

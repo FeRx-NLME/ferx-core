@@ -5,7 +5,7 @@
 //! `estimation/saem_exploration_tests.rs`; these tests pin the wiring through
 //! `fit()`: precedence of the explicit length, the minimum/maximum, the
 //! `FitResult::saem_n_exploration_used` report, the maximum-reached warning, and
-//! the smoothing exponent. Every fit returns after at most ~150 iterations of a
+//! the smoothing exponent. Every fit returns after at most ~700 iterations of a
 //! 40-subject model.
 
 use ferx_core::parser::model_parser::parse_model_string;
@@ -104,8 +104,8 @@ fn explicit_n_exploration_is_a_fixed_length() {
 }
 
 /// The automatic stop never ends before the minimum and never exceeds the
-/// maximum. With `max = min` the trend window (100 iterations) can never fill,
-/// so the run is cut off by the maximum and says so.
+/// maximum. With `max = min = 15` no coordinate can be tested (the shortest test
+/// window is 100 iterations), so the run is cut off by the maximum and says so.
 #[test]
 fn maximum_is_respected_and_reported() {
     let r = run(|o| {
@@ -114,12 +114,12 @@ fn maximum_is_respected_and_reported() {
     });
     assert_eq!(r.saem_n_exploration_used, Some(15));
     assert!(max_warning(&r), "{:?}", r.warnings);
-    // The window never filled: the max-reached warning says so rather than naming
-    // nothing, and a separate warning says the settings make the test impossible.
+    // The max-reached warning names the coordinates not shown stationary (here all of
+    // them, untestable), and a separate warning says the settings make the test impossible.
     assert!(
         r.warnings
             .iter()
-            .any(|w| w.contains("reached its maximum") && w.contains("trend window")),
+            .any(|w| w.contains("reached its maximum") && w.contains("complete-data -logL")),
         "{:?}",
         r.warnings
     );
@@ -130,27 +130,28 @@ fn maximum_is_respected_and_reported() {
     );
 }
 
-/// Stationary, well-identified model: the rule needs one full window, so the
-/// run ends between the window length and the maximum, and the maximum-reached
-/// warning appears exactly when the length equals the maximum.
+/// Well-identified model: the rule needs ten points per coordinate at a spacing of
+/// at least 10, so the run ends between the shortest window (100) and the maximum,
+/// on a check iteration, and without the maximum-reached warning.
 #[test]
 fn automatic_stop_lies_between_the_bounds() {
     let r = run(|o| {
         o.saem_exploration_min = 20;
-        o.saem_exploration_max = 160;
+        o.saem_exploration_max = 700;
     });
     let used = r
         .saem_n_exploration_used
         .expect("SAEM reports its exploration length");
-    // Measured: this stationary fixture stops at 100, the first iteration a full trend window
-    // exists. Requiring a stop strictly before the maximum is what makes the test fail if the
+    // Requiring a stop strictly before the maximum is what makes the test fail if the
     // automatic stop is never taken (which would also yield a length inside the bounds).
-    assert!((100..160).contains(&used), "used {used}");
+    eprintln!("automatic stop used {used}");
+    assert!((100..700).contains(&used), "used {used}");
+    assert_eq!(used % 10, 0, "stops only on a check iteration, used {used}");
     assert!(!max_warning(&r), "{:?}", r.warnings);
 }
 
 /// The report is SAEM-only and survives to the result of the default
-/// configuration (automatic, 150..500).
+/// configuration (automatic, 150..2000).
 #[test]
 fn default_is_automatic_and_non_saem_reports_nothing() {
     assert!(FitOptions::default().saem_n_exploration.is_none());

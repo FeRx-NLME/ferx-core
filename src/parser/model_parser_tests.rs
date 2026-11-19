@@ -4175,7 +4175,7 @@ fn test_apply_fit_option_saem_exploration_stop_and_smoothing() {
     let mut opts = FitOptions::default();
     assert_eq!(opts.saem_n_exploration, None);
     assert_eq!(opts.saem_exploration_min, 150);
-    assert_eq!(opts.saem_exploration_max, 500);
+    assert_eq!(opts.saem_exploration_max, 2000);
     assert_eq!(opts.saem_smoothing_exponent, 1.0);
 
     assert_eq!(

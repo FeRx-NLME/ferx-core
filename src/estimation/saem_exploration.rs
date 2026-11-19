@@ -4,96 +4,128 @@
 //! (γ = 1) so the iterates can travel to the neighbourhood of the maximiser;
 //! the convergence phase then averages with γ_k = 1/(k − K1)^a and freezes
 //! whatever the iterates had reached. Ending the first phase too early freezes
-//! a *still-moving* parameter: weakly identified Ω entries decay slowly under
-//! the exploration step cap (`OMEGA_SA_MAX_STEP`) and the averaging then pins
-//! them well above their optimum (pk2_big: ω²_Q 0.019 against ≈ 0.003).
+//! a *still-moving* parameter: weakly identified Ω entries decay slowly and the
+//! averaging then pins them above their optimum (pk2_big: ω²_Q 0.019 against
+//! ≈ 0.003).
 //!
-//! # The stop rule
+//! # The stop rule: NONMEM's termination test, with its interval chosen per coordinate
 //!
-//! Monolix ends the phase by an automatic stop (on by default), between a
-//! minimum of 150 and a maximum of 500 iterations, watching the complete-data
-//! log-likelihood, Ω and the error-model parameters. NONMEM can end its SAEM
-//! burn-in early (`CTYPE` = 1–3, `CITER`, `CALPHA`, `CINTERVAL`) when a linear
-//! regression of each monitored quantity on the iteration number over a trailing
-//! window has a slope that is not significantly non-zero; its default
-//! (`CTYPE = 0`) has no test and runs the whole `NBURN`. This module is that
-//! test with the one correction the statistics demand: SAEM trajectories are **autocorrelated** (θ is the
-//! M-step of a Markov chain; Ω is further smoothed by the exploration step cap
-//! `γ_Ω ≤ OMEGA_SA_MAX_STEP = 0.1`, an exponential filter with a time constant
-//! of 10 iterations), and an ordinary least-squares standard error treats the
-//! iterates as independent, reading every wobble as a trend (measured on
-//! stationary SAEM traces: 20-40 % of windows flagged for log Ω at a nominal
-//! 5 %, so the rule would essentially never stop).
+//! NONMEM's SAEM termination test (`$EST … CTYPE=3 CITER=10 CINTERVAL=… CALPHA=…`,
+//! Users Guide §I.46) takes, for each monitored quantity, the latest `CITER = 10`
+//! iterates spaced `CINTERVAL` apart, regresses them on the iteration number, and
+//! ends burn-in when no slope is significant. The guide's point is the spacing:
+//! consecutive SAEM iterates are highly correlated, so the points must be spread
+//! over a long stretch (`CINTERVAL` 10–100; `CINTERVAL=0` lets NONMEM pick it).
+//! An earlier version of this module used a 100-iteration window of five 20-iteration
+//! batch means; on traced runs the integrated autocorrelation time of the iterates is
+//! ~35 iterations at the median and 90–170 at the 90th percentile, so that window
+//! flagged 12–23 % of stationary coordinates (nominal 5 %) and stopped mostly by chance.
 //!
-//! The standard remedy is **batch means** (Glynn & Iglehart 1990; Geweke 1992
-//! for MCMC diagnostics): the trailing window is cut into [`N_BATCHES`]
-//! batches of [`BATCH_LEN`] iterations, each at least twice the Ω filter's time
-//! constant so the batch means are close to independent, and the least-squares
-//! slope of the batch means on the batch index is tested with a Student t
-//! (`N_BATCHES − 2` degrees of freedom, two-sided 5 %). A coordinate "drifts"
-//! when that test rejects. Exploration stops at the first iteration ≥ the
-//! minimum at which **no** tracked coordinate drifts. The level is
-//! deliberately not multiplicity-corrected: a Bonferroni correction would make
-//! the rule stop *sooner*, the wrong direction for a rule whose failure is
-//! stopping early; the maximum bounds the cost of the opposite error.
+//! Here each coordinate gets its own interval: its integrated autocorrelation time
+//! τ̂ (Geyer, on the linearly detrended series after the first [`TAU_SKIP`]
+//! iterations), clamped to [[`SPACING_MIN`], [`SPACING_MAX`]] — NONMEM's
+//! recommended range. With spacing ≈ τ the ten points are close to independent, and
+//! the OLS slope is tested with a Student t (`CITER − 2 = 8` df) at two-sided 1 %
+//! (`CALPHA = 0.01`, the level NONMEM's guide recommends for MCMC methods). A
+//! coordinate whose series is shorter than `CITER × spacing` is *not yet testable*
+//! and blocks the stop like a drifting one. The test runs every [`CHECK_EVERY`]
+//! iterations; exploration ends at the first check ≥ the minimum where every
+//! coordinate is testable and none drifts, never later than the maximum.
 //!
-//! Tracked coordinates (scale-free in the test): the complete-data −log L
-//! (Σᵢ −log p(yᵢ, ηᵢ; θ, Ω, σ), Monolix's "convergence indicator"; NONMEM's
-//! `CTYPE` tests also include the objective), log Ω_jj, the correlations
-//! Ω_jk/√(Ω_jjΩ_kk), log σ, and θ. A series that is exactly constant (fixed
+//! Calibration on simulated AR(1) noise (2000 iterations): false-trend rate 0.7 % /
+//! 1.3 % / 4.0 % / 6.7 % at lag-1 correlation 0 / 0.9 / 0.97 / 0.99. On traced
+//! SAEM runs it stopped pk2s at 830–1350 with ω²_Q at its plateau, where the
+//! 100-iteration rule stopped at 273–442 with ω²_Q still 40–90 % above it.
+//!
+//! Tracked coordinates (NONMEM's `CTYPE=3` set, scale-free in the test): the
+//! complete-data −log L (Σᵢ −log p(yᵢ, ηᵢ; θ, Ω, σ), Monolix's "convergence
+//! indicator", NONMEM's objective), θ, log Ω_jj, the correlations Ω_jk/√(Ω_jjΩ_kk)
+//! (and the same for Ω_IOV), log σ. A series that is exactly constant (fixed
 //! parameters, structural zeros) cannot drift.
 
 use nalgebra::DMatrix;
 
-/// Batches per test window.
-pub(crate) const N_BATCHES: usize = 5;
-/// Iterations per batch: twice the time constant `1/γ_Ω = 10` of the capped Ω
-/// stochastic-approximation filter (`OMEGA_SA_MAX_STEP`).
-pub(crate) const BATCH_LEN: usize = 20;
-/// Trailing window (iterations) of the trend test.
-pub(crate) const TREND_WINDOW: usize = N_BATCHES * BATCH_LEN;
-/// Two-sided 5 % Student-t quantile, `N_BATCHES − 2 = 3` degrees of freedom.
-pub(crate) const TREND_T: f64 = 3.182_446_305_284_263;
+/// Points per regression (NONMEM `CITER`).
+pub(crate) const CITER: usize = 10;
+/// Bounds on a coordinate's point spacing (NONMEM `CINTERVAL`), in iterations.
+pub(crate) const SPACING_MIN: usize = 10;
+/// See [`SPACING_MIN`]. The upper bound keeps the longest window (`CITER ×
+/// SPACING_MAX` = 500 iterations) inside a practical maximum.
+pub(crate) const SPACING_MAX: usize = 50;
+/// Shortest series on which any coordinate can be tested.
+pub(crate) const MIN_TEST_WINDOW: usize = CITER * SPACING_MIN;
+/// Leading iterations left out of the autocorrelation estimate (the Ω burn-in).
+pub(crate) const TAU_SKIP: usize = 20;
+/// The stop is evaluated every this many iterations.
+pub(crate) const CHECK_EVERY: usize = 10;
+/// Two-sided 1 % Student-t quantile, `CITER − 2 = 8` degrees of freedom.
+pub(crate) const TREND_T: f64 = 3.355_387_331_333_396;
 
-/// `true` when the least-squares slope of the batch means of `y` (the last
-/// [`TREND_WINDOW`] values) is significantly non-zero, see the module docs. A
-/// non-finite series counts as drifting; an exactly constant one does not.
-pub(crate) fn trend_detected(y: &[f64]) -> bool {
-    if y.len() < TREND_WINDOW {
-        return false;
+/// Point spacing for series `y`: its integrated autocorrelation time on the
+/// linearly detrended values after [`TAU_SKIP`], clamped to
+/// [[`SPACING_MIN`], [`SPACING_MAX`]].
+pub(crate) fn spacing(y: &[f64]) -> usize {
+    let y = &y[TAU_SKIP.min(y.len())..];
+    let n = y.len();
+    if n < 4 {
+        return SPACING_MAX;
     }
-    let y = &y[y.len() - TREND_WINDOW..];
-    if y.iter().any(|v| !v.is_finite()) {
-        return true;
-    }
-    let m: Vec<f64> = y
-        .chunks(BATCH_LEN)
-        .map(|c| c.iter().sum::<f64>() / c.len() as f64)
+    let xbar = (n - 1) as f64 / 2.0;
+    let ybar = y.iter().sum::<f64>() / n as f64;
+    let sxx: f64 = (0..n).map(|i| (i as f64 - xbar).powi(2)).sum();
+    let slope = y
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as f64 - xbar) * (v - ybar))
+        .sum::<f64>()
+        / sxx;
+    let resid: Vec<f64> = y
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v - ybar - slope * (i as f64 - xbar))
         .collect();
-    let b = m.len() as f64;
+    let tau = crate::stats::convergence::integrated_autocorr_time(&resid, SPACING_MAX as f64);
+    (tau.ceil() as usize).clamp(SPACING_MIN, SPACING_MAX)
+}
+
+/// Termination test of one coordinate's series `y` (all exploration iterates so
+/// far): `Some(true)` when the slope of its latest [`CITER`] points, spaced by
+/// [`spacing`], is significant at 1 %; `Some(false)` when it is not, or the
+/// points are numerically constant; `None` when the series is still shorter than
+/// `CITER × spacing` (not yet testable). A non-finite point counts as drifting.
+pub(crate) fn trend_test(y: &[f64]) -> Option<bool> {
+    let c = spacing(y);
+    let n = y.len();
+    if n < CITER * c {
+        return None;
+    }
+    let pts: Vec<f64> = (0..CITER).rev().map(|j| y[n - 1 - j * c]).collect();
+    if pts.iter().any(|v| !v.is_finite()) {
+        return Some(true);
+    }
+    let b = CITER as f64;
     let xbar = (b - 1.0) / 2.0;
-    let mbar = m.iter().sum::<f64>() / b;
-    let sxx: f64 = (0..m.len()).map(|i| (i as f64 - xbar).powi(2)).sum();
-    let slope = m
+    let mbar = pts.iter().sum::<f64>() / b;
+    let sxx: f64 = (0..CITER).map(|i| (i as f64 - xbar).powi(2)).sum();
+    let slope = pts
         .iter()
         .enumerate()
         .map(|(i, v)| (i as f64 - xbar) * (v - mbar))
         .sum::<f64>()
         / sxx;
-    let intercept = mbar - slope * xbar;
-    let ss: f64 = m
+    let ss: f64 = pts
         .iter()
         .enumerate()
-        .map(|(i, v)| (v - intercept - slope * i as f64).powi(2))
+        .map(|(i, v)| (v - mbar - slope * (i as f64 - xbar)).powi(2))
         .sum();
-    // Numerically constant: the fitted change across the window is at rounding level of the
+    // Numerically constant: the fitted change across the points is at rounding level of the
     // series scale. (Not "zero residual": a noiseless exact ramp has zero residual and is a trend.)
-    let scale = y.iter().fold(0.0_f64, |a, v| a.max(v.abs())).max(1e-300);
+    let scale = pts.iter().fold(0.0_f64, |a, v| a.max(v.abs())).max(1e-300);
     if slope.abs() * (b - 1.0) <= 1e-12 * scale {
-        return false;
+        return Some(false);
     }
     let se = (ss / (b - 2.0) / sxx).sqrt();
-    slope.abs() > TREND_T * se
+    Some(slope.abs() > TREND_T * se)
 }
 
 /// `(automatic, minimum, maximum)` exploration length for a run.
@@ -132,30 +164,28 @@ impl ExplorationMonitor {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.series.first().map_or(0, Vec::len)
     }
 
-    /// No tracked coordinate drifts over the trailing window. `false` until a
-    /// full window exists.
+    /// Every tracked coordinate is testable and none drifts.
     pub(crate) fn converged(&self) -> bool {
-        self.len() >= TREND_WINDOW && self.drifting().is_empty()
+        !self.series.is_empty() && self.series.iter().all(|s| trend_test(s) == Some(false))
     }
 
-    /// Whether exploration may end after iteration `k` (1-based): the minimum
-    /// has been run and no tracked coordinate drifts.
+    /// Whether exploration may end after iteration `k` (1-based): the minimum has
+    /// been run, `k` is a check iteration ([`CHECK_EVERY`]), and the monitor has
+    /// converged.
     pub(crate) fn may_stop_at(&self, k: usize, k_min: usize) -> bool {
-        k >= k_min && self.converged()
+        k >= k_min && k.is_multiple_of(CHECK_EVERY) && self.converged()
     }
 
-    /// Indices of the coordinates that still drift (diagnostics / tests).
+    /// Indices of the coordinates not yet shown stationary: drifting, or still
+    /// too short to test at their spacing (diagnostics / warning).
     pub(crate) fn drifting(&self) -> Vec<usize> {
-        if self.len() < TREND_WINDOW {
-            return Vec::new();
-        }
-        // `trend_detected` reads the trailing window itself.
         (0..self.series.len())
-            .filter(|&c| trend_detected(&self.series[c]))
+            .filter(|&c| trend_test(&self.series[c]) != Some(false))
             .collect()
     }
 }
@@ -214,13 +244,10 @@ pub(crate) fn exploration_coord_names(
 }
 
 /// Comma-separated names of the drifting coordinates, at most `max_listed`,
-/// then "and N more". An index without a name is printed as `#i`. Empty
-/// `drifting` at the maximum means the trend window never filled.
+/// then "and N more". An index without a name is printed as `#i`.
 pub(crate) fn drifting_summary(drifting: &[usize], names: &[String], max_listed: usize) -> String {
     if drifting.is_empty() {
-        return format!(
-            "not tested, the maximum is shorter than the {TREND_WINDOW}-iteration trend window"
-        );
+        return "none".to_string();
     }
     let mut parts: Vec<String> = drifting
         .iter()

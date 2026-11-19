@@ -24,7 +24,7 @@ SAEM replaces the deterministic inner loop of FOCE with stochastic sampling, fol
 
 Step size $\gamma_k = 1$. The algorithm explores the parameter space rapidly, with the sufficient statistics being fully replaced each iteration. This allows fast movement toward the basin of the MLE.
 
-By default K1 is **chosen by the run** (see [the automatic stop](#exploration-stop)): at least 150 iterations (`n_exploration_min`), at most 500 (`n_exploration_max`). Setting `n_exploration = n` instead fixes K1 = n and turns the automatic stop off.
+By default K1 is **chosen by the run** (see [the automatic stop](#exploration-stop)): at least 150 iterations (`n_exploration_min`), at most 2000 (`n_exploration_max`). Setting `n_exploration = n` instead fixes K1 = n and turns the automatic stop off.
 
 ### Phase 2: Convergence (iterations K1+1 to K1+K2)
 
@@ -36,45 +36,44 @@ Default: 250 iterations.
 
 The convergence phase *freezes* whatever the exploration phase reached: with $a = 1$ the averaging weight of iteration $K_1 + 1$ is 1 and the weights then decay, so a parameter that is still moving at $K_1$ is pinned near where it was. Weakly identified Ω entries are the ones that move slowly: under the exploration cap on the Ω step ($\gamma^\Omega \le 0.1$) a variance component whose optimum is far below its start decays over hundreds of iterations. On the 5-η, 9-θ `pk2_big` benchmark the fixed 150 iterations ended while $\omega^2_Q$ was still at 0.019 (optimum ≈ 0.003), and the importance-sampled −2 log L stayed 10.6 above the optimum (median of 5 seeds); a longer averaging phase barely helps, a longer *exploration* does.
 
-Monolix ends exploration by an automatic stop (on by default) between a minimum of 150 and a maximum of 500 iterations; its criterion watches the stability of the convergence indicator (the complete-data log-likelihood), the Ω parameters and the error-model parameters. NONMEM *can* end its SAEM burn-in early (`CTYPE` = 1–3, `CITER`, `CALPHA`, `CINTERVAL`): a linear regression of each monitored quantity (objective, θ, σ, and Ω for `CTYPE` ≥ 2) on the iteration number over the last `CITER` retained iterations, stopping when no slope differs significantly from zero; `CINTERVAL` thins the iterations so the regression points are less correlated. Its default, `CTYPE = 0`, has no test and runs the whole `NBURN`. ferx follows Monolix (automatic by default, the same bounds) and tests the quantities of NONMEM's `CTYPE = 3`, with batch means rather than thinning as the correction for the autocorrelation of SAEM trajectories.
+Monolix ends exploration by an automatic stop (on by default) between a minimum of 150 and a maximum of 500 iterations; the minimum is also "the interval length over which the auto-stop criteria are tested", and the criterion watches the stability of the convergence indicator (the complete-data log-likelihood), the Ω parameters and the error-model parameters — the test itself is not published. NONMEM's termination test (Users Guide 7.5.1, §I.46) is opt-in: `CTYPE=0`, the default, runs the whole `NBURN` (default 1000). With `CTYPE` = 1–3 it regresses each monitored quantity (objective, θ, σ; Ω diagonals from `CTYPE=2`, all of Ω at `3`) on the iteration number over the latest `CITER = 10` iterates spaced `CINTERVAL` apart and ends burn-in when no slope is significant at `CALPHA`. The guide stresses the spacing — consecutive SAEM iterates "can be highly correlated", so it advises `CINTERVAL` 10–100, and `CINTERVAL=0` lets NONMEM pick it; `AUTO=1` sets `CTYPE=3 NBURN=4000 CINTERVAL=0 CALPHA=0.05`; and it warns that the test "can often be very conservative", recommending `CALPHA` 0.01 and a large `NBURN`. ferx runs NONMEM's test, `CTYPE=3`, with the interval chosen per coordinate from its autocorrelation.
 
 #### The rule {#exploration-stop-rule}
 
 - **Tracked coordinates.** The complete-data −log L $\sum_i -\log p(y_i, \eta_i;\theta,\Omega,\sigma)$ at the current draws (the `condNLL` that `verbose` prints), θ, log Ω<sub>jj</sub>, the correlations $\Omega_{jk}/\sqrt{\Omega_{jj}\Omega_{kk}}$ (and the same for Ω<sub>IOV</sub>), and log σ. A fixed parameter or structural zero is constant and cannot drift.
-- **Test.** The trailing 100 iterations are cut into five batches of 20. The least-squares slope of the five batch means on the batch index is tested against zero with a Student t (3 degrees of freedom, two-sided 5 %). The batch length is twice the time constant (10 iterations) of the capped Ω step, so the batch means are close to independent; an ordinary regression on the raw iterates treats autocorrelated draws as independent and reads wobble as trend (on stationary SAEM traces it flagged 20–40 % of windows at a nominal 5 %, so the phase would never end). Calibration on simulated AR(1) noise: 5.1 % / 5.8 % / 8.7 % false trend rate at lag-1 correlation 0 / 0.5 / 0.9; a drift of 4 marginal standard deviations over the window is caught 75 % of the time at 0.9.
-- **Rule.** Exploration ends at the first iteration ≥ `n_exploration_min` at which *no* tracked coordinate trends, and never later than `n_exploration_max`. The test needs a full 100-iteration window, so the effective minimum is max(`n_exploration_min`, 100); an `n_exploration_max` below 100 can never be tested and the fit warns. The level is not multiplicity-corrected, deliberately: a correction would make the rule stop *sooner*, the direction in which it can fail.
+- **Test.** For each coordinate, its latest ten iterates spaced `c` apart (NONMEM `CITER=10`, `CINTERVAL=c`) are regressed on the iteration number, and the slope is tested against zero with a Student t (8 degrees of freedom, two-sided 1 %, NONMEM `CALPHA=0.01`). The spacing `c` is the coordinate's integrated autocorrelation time (Geyer initial-positive sequence, on the linearly detrended series after the 20 burn-in iterations), clamped to 10–50, so the ten points are close to independent. A coordinate whose series is still shorter than `10 × c` is not yet testable and blocks the stop. The test runs every 10 iterations.
+- **Why the spacing.** An earlier version of this rule tested five 20-iteration batch means over the trailing 100 iterations. Traced long runs showed integrated autocorrelation times of ~35 iterations at the median and 90–170 at the 90th percentile, so those batches were far from independent: on the stationary tail of the traces each coordinate was flagged 12–23 % of the time against a nominal 5 %, and the rule stopped when, by chance, every coordinate passed in the same window (on the pk2_big stand-in below, ω²<sub>Q</sub> was still 40–90 % above its plateau at the stop). Calibration of the spaced test on simulated AR(1) noise, 2000 iterations: false-trend rate 1.0 % / 1.5 % / 2.8 % at lag-1 correlation 0 / 0.9 / 0.97.
+- **Rule.** Exploration ends at the first check ≥ `n_exploration_min` at which every tracked coordinate is testable and none trends, and never later than `n_exploration_max`. The shortest test window is 100 iterations (ten points at spacing 10), the longest 500; an `n_exploration_max` below 100 can never be tested and the fit warns.
 - **The Ω exploration step cap is kept.** Removing it alone made the E-step unstable in the investigation that led here; with the automatic stop the cap only slows the decay, and the stop waits for it.
 - **Precedence.** `n_exploration` present in the model file (or `saem_n_exploration = Some(n)` in code) is a *fixed* length: `n_exploration_min` / `n_exploration_max` are ignored, no test runs. Absent, the stop is automatic.
-- **Reporting.** The length used is `saem_n_exploration` in `-fit.yaml` (`FitResult::saem_n_exploration_used`; `verbose` prints it). If the maximum is reached while a coordinate still trends, a warning says so and names the coordinates that still drift (for example `OMEGA(ETA_Q)`) — raise `n_exploration_max` and compare.
+- **Reporting.** The length used is `saem_n_exploration` in `-fit.yaml` (`FitResult::saem_n_exploration_used`; `verbose` prints it). If the maximum is reached before every coordinate was shown stationary, a warning says so and names them (still drifting, or too few iterations to test at their autocorrelation; for example `OMEGA(ETA_Q)`) — raise `n_exploration_max` and compare.
 
 #### Measured {#exploration-stop-measured}
 
-Five seeds each, `--threads 1`; gap = importance-sampled −2 log L above the model's reference optimum — `pk1_sparse` against its AGQ optimum 1412.34, whose TVCL sits on its lower bound, so that gap has a floor; instructions in billions; the exploration length each seed chose is listed.
+A public stand-in for `pk2_big` (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples), the `warfarin_iov_saem` example and the 5-η `two_cpt_oral_cov` example; `--threads 2`, gap = importance-sampled −2 log L (3000 samples) above the best value reached — for the stand-in, an IMP estimate started from FOCEI (−4802.85, $\omega^2_Q$ 0.0057).
 
-| set | schedule | gap median (range) | gap SD | param. distance, RMS in SE | Ginstr | K1 chosen |
-|---|---|---|---|---|---|---|
-| pk1 (3 η) | fixed 150 | +0.03 (0.01–0.06) | 0.02 | 0.06 | 28.1 | 150 |
-| | automatic | +0.04 (0.03–0.06) | 0.01 | 0.08 | 28.7 | 150, 203, 150, 157, 150 |
-| pk1 ODE | fixed 150 | +0.03 (0.01–0.06) | 0.02 | 0.06 | 81.3 | 150 |
-| | automatic | +0.04 (0.03–0.06) | 0.01 | 0.08 | 82.7 | 150, 203, 150, 157, 150 |
-| pk2_big (5 η, block Ω) | fixed 150 | +10.63 (8.68–18.64) | 3.86 | 1.01 | 42.2 | 150 |
-| | automatic | +2.94 (1.65–3.08) | 0.61 | 0.42 | 67.5 | 500 (all: cap reached) |
-| pk1_sparse | fixed 150 | +2.62 (2.52–3.25) | 0.30 | 0.51 | 11.4 | 150 |
-| | automatic | +2.53 (2.28–4.22) | 0.78 | 0.68 | 14.1 | 211, 415, 349, 208, 208 |
-| wiov | fixed 150 | +0.06 (−0.07–0.42) | 0.21 | 0.24 | 83.6 | 150 |
-| | automatic | +0.08 (−0.23–0.11) | 0.17 | 0.16 | 105.9 | 340, 252, 284, 275, 253 |
-| corr | fixed 150 | +0.15 (0.09–0.92) | 0.36 | 0.10 | 8.2 | 150 |
-| | automatic | +0.16 (0.11–0.41) | 0.13 | 0.12 | 9.2 | 160, 191, 153, 194, 308 |
+| set (seeds) | schedule | gap median (range) | K1 | CPU / fit |
+|---|---|---|---|---|
+| pk2s (15) | fixed 150 (old default) | +5.17 (3.42–6.64) | 150 | 7.2 s |
+| | 100-iteration batch-means rule (earlier version) | +3.00 (1.23–4.20) | 273–500 | 8.4 s |
+| | fixed 500 | +2.00 (1.20–2.65) | 500 | 8.7 s |
+| | **automatic (this rule)** | +1.80 (0.97–4.52) | 830–1700 | 11.7 s |
+| wiov (5) | fixed 150 | +0.10 (0.02–0.28) | 150 | 1.0 s |
+| | fixed 500 | +0.44 (0.22–0.61) | 500 | 1.3 s |
+| | **automatic** | +0.46 (0.20–0.61) | 310–560 | 1.3 s |
+| two_cpt_oral_cov (5) | fixed 150 | +0.42 (0.02–37.11) | 150 | 0.9 s |
+| | fixed 500 | +0.41 (0.00–37.32) | 500 | 1.1 s |
+| | **automatic** | +0.52 (0.11–36.91) | 540–690 | 1.2 s |
 
-The easy models stop at or just after the minimum (+2 % instructions); the one set the old default got wrong improves 3.6× with +60 % instructions. `pk1_sparse` is a degenerate ridge, not a schedule problem: its gap is unchanged in the median and its spread grew.
+The automatic stop brings $\omega^2_Q$ closest to the IMP estimate (median 0.0158 against 0.0198 at fixed 500 and 0.0318 at 150), but paired by seed its −2 log L is not distinguishable from fixed 500 (better on 7 of 15 seeds, median paired difference +0.5 against an IS noise of ~0.4) at +35 % CPU; on the two easier sets every schedule from 500 iterations up lies within a few tenths of each other. The remaining ~2 on pk2s is not an exploration-length effect: a fixed 1500 gives +1.97. Seeds 2 and 4 of `two_cpt_oral_cov` end in a V1–KA trade-off mode under every schedule.
 
 #### Maximum and smoothing exponent {#exploration-stop-max}
 
-**Maximum.** `pk2_big` reaches the 500 cap on every seed; `n_exploration_max = 800` gives +2.00 (range 1.36–2.97) at 85.7 Ginstr (K1 = 615, 800, 738, 800, 800) against +2.94 at 67.5 for 500. 500 is Monolix's cap and bounds an automatic fit at 750 iterations against the old 400 (measured +60 % instructions on pk2_big); raise it when the fit warns that it was reached.
+**Maximum.** 2000, between NONMEM's default `NBURN` (1000) and its `AUTO=1` value (4000). The stand-in needed 830–1700; the longest test window is 500, so a maximum near 500 would turn the rule into a fixed length for any coordinate with an autocorrelation time of 50 or more.
 
-**Smoothing exponent.** `smoothing_exponent = 0.7` (Monolix's $\gamma_k = 1/(k-K_1)^{0.7}$) was measured on the same sets and is *not* the default, because it is worse on an easy model: wiov +0.08 → +0.45 (median gap, automatic exploration), pk1 +0.04 → +0.05, pk1_sparse +2.53 → +2.91, against pk2_big +2.94 → +2.54 and corr +0.16 → +0.11. The option is there for users who want it.
+**Smoothing exponent.** `smoothing_exponent = 0.7` (Monolix's $\gamma_k = 1/(k-K_1)^{0.7}$) was measured with the earlier 150–500 rule and is *not* the default, because it was worse on an easy model: wiov +0.08 → +0.45 (median gap), pk1 +0.04 → +0.05, pk1_sparse +2.53 → +2.91, against pk2_big +2.94 → +2.54 and corr +0.16 → +0.11. The option is there for users who want it.
 
-**Annealing instead of the Ω step cap.** Monolix keeps the variances large early with *simulated annealing* — each variance may fall by at most 5 % per iteration, $\Omega_{jj,k} \ge 0.95\,\Omega_{jj,k-1}$ — rather than ferx's damped Ω step ($\gamma^\Omega \le 0.1$), which slows every Ω move tenfold. Replacing the cap with that rule (full γ for the Ω statistic in exploration, decrease bounded at 0.95, correlations kept) was measured with the automatic stop and is *not* adopted. On a public pk2_big stand-in (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples; 15 seeds; gap against an IMP estimate, −2 log L −4802.85, MC SE 0.37) the median gap was +3.12 (range 0.99–6.08) against +3.00 (1.23–4.20) with the cap, and +5.17 for the old fixed 150. On the 5-η `two_cpt_oral_cov` example it sent two of five seeds into a worse basin (+18, +16) that the capped runs avoided. Tracking the complete-data −log L alongside the parameters changed no stopping iteration on any of these runs.
+**Annealing instead of the Ω step cap.** Monolix keeps the variances large early with *simulated annealing* — each variance may fall by at most 5 % per iteration, $\Omega_{jj,k} \ge 0.95\,\Omega_{jj,k-1}$ — rather than ferx's damped Ω step ($\gamma^\Omega \le 0.1$), which slows every Ω move tenfold. Replacing the cap with that rule (full γ for the Ω statistic in exploration, decrease bounded at 0.95, correlations kept) was measured with the automatic stop and is *not* adopted. On a public pk2_big stand-in (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples; 15 seeds; gap against an IMP estimate, −2 log L −4802.85, MC SE 0.37) the median gap was +3.12 (range 0.99–6.08) against +3.00 (1.23–4.20) with the cap, and +5.17 for the old fixed 150. On the 5-η `two_cpt_oral_cov` example it sent two of five seeds into a worse basin (+18, +16) that the capped runs avoided. (Measured with the earlier 100-iteration rule.)
 
 ## Per-Iteration Steps
 
@@ -1545,9 +1544,9 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 ```
 [fit_options]
   method        = saem
-  # n_exploration = 150    # Phase 1 length; omit for the automatic stop (150..500)
+  # n_exploration = 150    # Phase 1 length; omit for the automatic stop (150..2000)
   n_exploration_min = 150  # automatic stop only
-  n_exploration_max = 500  # automatic stop only
+  n_exploration_max = 2000 # automatic stop only
   smoothing_exponent = 1.0 # Phase 2 step 1/(k-K1)^a
   n_convergence = 250      # Phase 2 iterations
   n_mh_steps    = auto     # block-MH steps/subject/iteration, or `auto` (see above)
@@ -1569,7 +1568,7 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 
 ### Not Converging
 
-- If the fit warns that exploration reached its maximum, raise `n_exploration_max` (e.g., 800); to force a length instead, set `n_exploration` (e.g., 300)
+- If the fit warns that exploration reached its maximum, raise `n_exploration_max` (e.g., 4000, NONMEM's `AUTO` value); to force a length instead, set `n_exploration` (e.g., 500)
 - Increase `n_convergence` (e.g., 500) for a longer averaging window
 - Raise `n_mh_steps` above what `auto` resolves to (e.g. 30-50) for better
   mixing in the E-step on hard surfaces. The rule caps at 20, the count

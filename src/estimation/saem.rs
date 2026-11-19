@@ -4380,13 +4380,13 @@ pub fn run_saem(
     }
 
     let mut warnings = Vec::new();
-    if auto_exploration && k_max < crate::estimation::saem_exploration::TREND_WINDOW {
+    if auto_exploration && k_max < crate::estimation::saem_exploration::MIN_TEST_WINDOW {
         warnings.push(format!(
             "SAEM: `n_exploration_max` = {k_max} is shorter than the automatic stop's \
-             {}-iteration trend window, so the stop can never be tested and exploration \
-             always runs {k_max} iterations; set `n_exploration = {k_max}` for a fixed \
-             length, or raise `n_exploration_max`.",
-            crate::estimation::saem_exploration::TREND_WINDOW
+             shortest test window ({} iterations), so the stop can never be tested and \
+             exploration always runs {k_max} iterations; set `n_exploration = {k_max}` for a \
+             fixed length, or raise `n_exploration_max`.",
+            crate::estimation::saem_exploration::MIN_TEST_WINDOW
         ));
     }
     // Acceptance window in which the Robbins-Monro step is skipped entirely
@@ -7046,7 +7046,8 @@ pub fn run_saem(
         }
         warnings.push(format!(
             "SAEM: the exploration phase reached its maximum of {k_max} iterations while a \
-             parameter trajectory still trended (still drifting: {}). The convergence \
+             parameter trajectory had not been shown stationary (still drifting, or too few \
+             iterations to test at its autocorrelation: {}). The convergence \
              phase averaged from there, so weakly identified variance components may be \
              frozen above their optimum; raise `n_exploration_max` (or set \
              `n_exploration`) and compare.",
