@@ -458,13 +458,13 @@ fn trust_region_reports_converged_when_it_settles() {
     // job red — so only the shortfall is bounded.
     let mut ref_opts = base_options();
     ref_opts.method = EstimationMethod::FoceI;
-    ref_opts.optimizer = Optimizer::Auto;
+    ref_opts.optimizer = Optimizer::NloptLbfgs; // the reference: `auto` is `trust_region` since #2976
     ref_opts.outer_maxiter = 1000;
     let reference = fit(&model, &population, &model.default_params, &ref_opts)
         .expect("reference fit must succeed");
     assert!(
         result.ofv < reference.ofv + 1e-3,
-        "trust_region reported converged at OFV {} but the default optimizer reaches {}",
+        "trust_region reported converged at OFV {} but L-BFGS reaches {}",
         result.ofv,
         reference.ofv
     );
@@ -491,11 +491,11 @@ fn trust_region_reaches_the_default_optimum_on_an_iov_model() {
     opts.outer_maxiter = 300;
     let tr = fit(&model, &population, &model.default_params, &opts).expect("trust_region fit");
     assert!(tr.converged, "warnings {:?}", tr.warnings);
-    opts.optimizer = Optimizer::Auto;
+    opts.optimizer = Optimizer::NloptLbfgs; // the reference: `auto` is `trust_region` since #2976
     let reference = fit(&model, &population, &model.default_params, &opts).expect("reference");
     assert!(
         tr.ofv < reference.ofv + 1e-3,
-        "trust_region {} vs default {}",
+        "trust_region {} vs L-BFGS {}",
         tr.ofv,
         reference.ofv
     );
@@ -528,7 +528,7 @@ fn trust_region_resumes_with_cold_ebes_after_a_basin_shift() {
     opts.optimizer = Optimizer::TrustRegion;
     opts.outer_maxiter = 300;
     let tr = fit(&model, &population, &start, &opts).expect("trust_region fit");
-    opts.optimizer = Optimizer::Auto;
+    opts.optimizer = Optimizer::NloptLbfgs; // the reference: `auto` is `trust_region` since #2976
     let reference = fit(&model, &population, &start, &opts).expect("reference");
     assert!(
         tr.ofv < reference.ofv + 1e-3,
@@ -602,12 +602,12 @@ fn trust_region_verifies_an_unsettled_stop_at_a_tight_inner_tolerance() {
     opts.optimizer = Optimizer::TrustRegion;
     opts.outer_maxiter = 300;
     let tr = fit(&model, &population, &start, &opts).expect("trust_region fit");
-    opts.optimizer = Optimizer::Auto;
+    opts.optimizer = Optimizer::NloptLbfgs; // the reference: `auto` is `trust_region` since #2976
     let reference = fit(&model, &population, &start, &opts).expect("reference");
     assert!(tr.converged, "warnings {:?}", tr.warnings);
     assert!(
         tr.ofv < reference.ofv + 1e-3,
-        "trust_region {} vs default {}",
+        "trust_region {} vs L-BFGS {}",
         tr.ofv,
         reference.ofv
     );

@@ -158,7 +158,7 @@ gradient norm.
 
 `optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
 
-- **`trust_region`** (since #2976; `nlopt_lbfgs` before) — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`.
+- **`trust_region`** (since #2976; `nlopt_lbfgs` before) — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`, and the **exact Hessian** serves the fit (the covariance step's analytic R-matrix route). Where it does not (`analytic_cov_hessian = false`, or a subject outside its scope) every model the trust region builds would be a finite-difference Hessian, so `auto` takes **`nlopt_lbfgs`** there.
 - **`bobyqa`** — otherwise: any model outside the analytic scope (for example an out-of-scope ODE/PD model or an SDE model), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
 
 Three cases override that rule:

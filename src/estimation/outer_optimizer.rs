@@ -202,11 +202,18 @@ pub(crate) fn runs_outer_optimizer(options: &FitOptions) -> bool {
 /// `analytic_outer_gradient` is passed in rather than read off `model` so the
 /// same function answers the counterfactual — "what would `auto` have picked had
 /// the gradient not been forced?" — without a re-spelled copy of the rule.
+///
+/// `exact_hessian` says whether the exact Hessian serves this fit
+/// ([`exact_hessian_serves`]). `auto` takes the trust region on an exact gradient only
+/// where it does (#2976): the trust region's model is that Hessian, and without it every
+/// refresh is a finite-difference Hessian of ~2n² reconverged population solves, where
+/// L-BFGS needs none.
 pub(crate) fn resolve_outer_optimizer(
     requested: Optimizer,
     model: &CompiledModel,
     has_mixture: bool,
     analytic_outer_gradient: bool,
+    exact_hessian: bool,
 ) -> (Optimizer, Option<String>) {
     // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
     // choice — robust against the mixture's label-switching multimodality. Since
@@ -246,10 +253,24 @@ pub(crate) fn resolve_outer_optimizer(
         });
         return (resolved, warning);
     }
-    (
-        requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
-        None,
-    )
+    let resolved = requested.resolve_auto_given_analytic(model, analytic_outer_gradient);
+    if requested == Optimizer::Auto && resolved == Optimizer::TrustRegion && !exact_hessian {
+        return (Optimizer::NloptLbfgs, None);
+    }
+    (resolved, None)
+}
+
+/// Whether the exact Hessian serves `model` under `options`: the covariance step's own
+/// prediction of its R-matrix route ([`crate::estimation::covariance::predicted_r_route`]),
+/// which is the Hessian the trust region models with. `false` under
+/// `analytic_cov_hessian = false` and wherever a subject is outside the exact scope.
+pub(crate) fn exact_hessian_serves(
+    model: &CompiledModel,
+    options: &FitOptions,
+    has_mixture: bool,
+) -> bool {
+    crate::estimation::covariance::predicted_r_route(model, options, has_mixture)
+        == crate::estimation::covariance::PredictedRRoute::Analytic
 }
 
 /// Run the outer optimizer for one stage from `init_params`.
@@ -292,6 +313,7 @@ pub fn optimize_population(
         model,
         init_params.mixture.is_some(),
         crate::sens::provider::analytic_outer_gradient_available(model),
+        exact_hessian_serves(model, options, init_params.mixture.is_some()),
     );
     let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;
@@ -460,16 +482,24 @@ pub fn optimize_population(
                     &bounds.upper,
                     &x0,
                 ) {
-                    Ok(best) => Some(unpack_params(&best, init_params)),
+                    // A pre-search that kept the declared start leaves it, and the
+                    // pre-flight's modes solved there, as they were.
+                    Ok(best) if best != x0 => Some((
+                        unpack_params(&best, init_params),
+                        // Escape is judged from the declared start, as the NLopt leg judges
+                        // it (`x0_start_s`): a pre-search move counts as leaving it.
+                        !(max_scaled_deviation(&best, &x0) < INIT_ESCAPE_STEP_S),
+                    )),
+                    Ok(_) => None,
                     Err(e) => {
                         presearch_warning = Some(format!("global_search disabled: {e}"));
                         None
                     }
                 }
             });
-            let (init_params, first_eval_etas) = match presearched.flatten() {
-                Some(ref start) => (start.clone(), None),
-                None => (init_params.clone(), first_eval_etas),
+            let (init_params, first_eval_etas, presearch_moved) = match presearched.flatten() {
+                Some((start, moved)) => (start, None, moved),
+                None => (init_params.clone(), first_eval_etas, false),
             };
             let init_params = &init_params;
             let mut result = crate::estimation::trust_region::optimize_trust_region_seeded(
@@ -481,6 +511,11 @@ pub fn optimize_population(
             );
             if let Some(w) = presearch_warning {
                 result.warnings.insert(0, w);
+            }
+            if presearch_moved {
+                // The fit left the declared start (the pre-search moved it), whatever the local
+                // search did from there, so there is no unmoved start to probe either.
+                result.left_init = Some(true);
             }
             // A start with no feasible objective (#1617) already carries its verdict; the
             // #2506 probe asks whether an unmoved *feasible* start is an optimum, and a rerun
@@ -5100,7 +5135,9 @@ pub(crate) fn verify_unmoved_start(
             stalled
         }
         Some(true) => {
-            let left = probe.left_init.unwrap_or_else(|| off_start(&probe));
+            // Against the declared start: the probe's own `left_init` measures its move
+            // from the perturbation it was started at.
+            let left = off_start(&probe);
             verified_start_result(probe, left, result, start_ofv <= probe_ofv)
         }
         None => OuterResult {

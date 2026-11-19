@@ -425,6 +425,7 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
             &model,
             true,
             true,
+            true,
         )
         .0,
         Optimizer::Bobyqa,

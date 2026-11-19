@@ -318,6 +318,11 @@ pub(crate) fn reported_optimizer_label(
                 model,
                 has_mixture,
                 crate::sens::provider::analytic_outer_gradient_available(model),
+                crate::estimation::outer_optimizer::exact_hessian_serves(
+                    model,
+                    options,
+                    has_mixture,
+                ),
             );
             if options.optimizer == Optimizer::Auto {
                 format!("auto ({})", resolved.label())

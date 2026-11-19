@@ -4509,9 +4509,21 @@ mod kappa_correlation_auto_route {
                 Optimizer::Auto,
                 &on,
                 false,
-                analytic_outer_gradient_in_scope(&on)
+                analytic_outer_gradient_in_scope(&on),
+                true,
             )
             .0,
+            Optimizer::TrustRegion
+        );
+        // #2976: on an exact gradient without the exact Hessian, the trust region's every
+        // model would be a finite-difference Hessian, so `auto` takes L-BFGS there; an explicit
+        // `trust_region` is honoured either way.
+        assert_eq!(
+            resolve_outer_optimizer(Optimizer::Auto, &on, false, true, false).0,
+            Optimizer::NloptLbfgs
+        );
+        assert_eq!(
+            resolve_outer_optimizer(Optimizer::TrustRegion, &on, false, true, false).0,
             Optimizer::TrustRegion
         );
     }

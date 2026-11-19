@@ -7085,6 +7085,11 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 model,
                 has_mixture,
                 analytic,
+                crate::estimation::outer_optimizer::exact_hessian_serves(
+                    model,
+                    options,
+                    has_mixture,
+                ),
             )
             .0
         };

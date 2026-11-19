@@ -52,6 +52,10 @@ struct FoceiProblem<'a> {
     /// `left_init` escape test (#751) reads a move in, as NLopt reads it in its curvature-scaled
     /// space (#2975).
     curvature_scale: std::sync::Mutex<Vec<f64>>,
+    /// The `optimizer_trace`'s running row index across every leg of the fit, and the point
+    /// its last row was written at (a leg starting where the last one stopped writes no
+    /// second row there).
+    trace_rows: std::sync::Mutex<(usize, Option<Vec<f64>>)>,
 }
 
 /// Per-evaluation tallies of the trust region's objective, for the #1617 verdict
@@ -207,11 +211,8 @@ fn exact_trust_region(
     // held modes) declines that way, it is not asked again this leg. `NotResolved` is one of
     // the point: the exact Hessian is not asked again at the point it declined at.
     let mut hessian_out_of_scope = false;
-    let gradient_out_of_scope = std::cell::Cell::new(false);
     let mut unresolved_at: Option<Vec<f64>> = None;
-    // The optimizer trace: the last point a row was written at, and the packed norm of the
-    // accepted step that reached the current iterate.
-    let mut traced_at: Option<Vec<f64>> = None;
+    // The packed norm of the accepted step that reached the current iterate, for the trace.
     let mut last_step: Option<f64> = None;
     // The first radius is set from the seed model's own Newton step (below).
     let mut radius_set = false;
@@ -227,24 +228,38 @@ fn exact_trust_region(
     // scores: the #2974 rows' total derivative of the FOCE/FOCEI marginal, and otherwise (IOV,
     // or a quadrature objective, which the rows do not differentiate) the reconverged central
     // difference of `pop_nll_opts`, which re-solves the EBEs and κ̂ at every probe.
-    let rows_gradient = |x: &[f64], etas: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]| {
-        let g = if model.n_kappa == 0 && options.agq_nodes().is_none() {
-            *problem.cached_etas.lock().unwrap() = etas.to_vec();
-            problem.data_gradient(x)
-        } else {
-            crate::estimation::outer_optimizer::reconverged_fd_gradient(
-                x,
-                problem.init_params,
-                model,
-                population,
-                etas,
-                kappas,
-                bounds,
-                options,
-            )
+    let rows_gradient =
+        |x: &[f64], etas: &[DVector<f64>], hms: &[DMatrix<f64>], kappas: &[Vec<DVector<f64>>]| {
+            let g = if model.n_kappa == 0 && options.agq_nodes().is_none() {
+                // The rows at the iterate's own modes, solved at the tolerance this leg runs at:
+                // a cache miss would re-solve them at the problem's (looser) `inner_tol`.
+                {
+                    let mut cache = problem.grad_cache.lock().unwrap();
+                    if cache.as_ref().is_none_or(|c| c.x != x) {
+                        *cache = Some(GradCache {
+                            x: x.to_vec(),
+                            etas: etas.to_vec(),
+                            h_mats: hms.to_vec(),
+                            per_subj_grads: vec![],
+                        });
+                    }
+                }
+                *problem.cached_etas.lock().unwrap() = etas.to_vec();
+                problem.data_gradient(x)
+            } else {
+                crate::estimation::outer_optimizer::reconverged_fd_gradient(
+                    x,
+                    problem.init_params,
+                    model,
+                    population,
+                    etas,
+                    kappas,
+                    bounds,
+                    options,
+                )
+            };
+            axes.iter().map(|&k| g[k]).collect::<Vec<f64>>()
         };
-        axes.iter().map(|&k| g[k]).collect::<Vec<f64>>()
-    };
     for it in 0..options.outer_maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
             break;
@@ -269,7 +284,10 @@ fn exact_trust_region(
             model_b.as_ref().and_then(|b| {
                 let g: Vec<f64> = match &last {
                     Some((xl, gl)) if *xl == x => gl.clone(),
-                    _ => (!gradient_out_of_scope.get())
+                    // A model the exact Hessian declined as out of scope is outside the
+                    // recorders' scope; a `None` here at another model is a property of
+                    // the point (a non-finite subject term), so it is asked again next time.
+                    _ => (!hessian_out_of_scope)
                         .then(|| {
                             exact_gradient_at_modes(
                                 model,
@@ -283,10 +301,7 @@ fn exact_trust_region(
                             )
                         })
                         .flatten()
-                        .unwrap_or_else(|| {
-                            gradient_out_of_scope.set(true);
-                            rows_gradient(&x, &etas, &kappas)
-                        }),
+                        .unwrap_or_else(|| rows_gradient(&x, &etas, &hms, &kappas)),
                 };
                 let mut b = b.clone();
                 if let Some((xl, gl)) = last.as_ref().filter(|(xl, _)| *xl != x) {
@@ -343,7 +358,7 @@ fn exact_trust_region(
                         if options.verbose {
                             eprintln!("  TR iter {it:>3}: exact Hessian out of scope, FD Hessian");
                         }
-                        (rows_gradient(&x, &etas, &kappas), h)
+                        (rows_gradient(&x, &etas, &hms, &kappas), h)
                     }
                     // In scope but not resolved at this point (an EBE that does not re-converge
                     // at the covariance tolerance, a non-finite term): a property of the point,
@@ -378,7 +393,7 @@ fn exact_trust_region(
                                     "  TR iter {it:>3}: exact Hessian not resolved at the start; FD Hessian"
                                 );
                             }
-                            (rows_gradient(&x, &etas, &kappas), h)
+                            (rows_gradient(&x, &etas, &hms, &kappas), h)
                         }
                         _ => break,
                     },
@@ -403,12 +418,19 @@ fn exact_trust_region(
         // `optimizer_trace`: one row per iteration, at the point its model is built, as the
         // built-in descents write theirs (the unpenalized OFV, the gradient there, and the
         // packed norm of the step that led to it).
-        if crate::estimation::trace::is_active() && traced_at.as_ref() != Some(&x) {
-            traced_at = Some(x.clone());
+        let trace_row = crate::estimation::trace::is_active().then(|| {
+            let mut rows = problem.trace_rows.lock().unwrap();
+            (rows.1.as_ref() != Some(&x)).then(|| {
+                rows.1 = Some(x.clone());
+                rows.0 += 1;
+                rows.0 - 1
+            })
+        });
+        if let Some(Some(row)) = trace_row {
             let p = unpack_params(&x, problem.init_params);
             let clean = f - problem.nn_reg.penalty_value(&p.theta) - problem.priors.penalty(&x);
             crate::estimation::trace::write_foce(
-                it,
+                row,
                 crate::estimation::trace::method_label(options),
                 clean,
                 Some(l2_norm(&g_full)),
@@ -531,7 +553,9 @@ fn exact_trust_region(
         }
         let snorm = sy.norm();
         if fnew < f && rho > 1e-4 {
-            // The noise floor is measured at the incumbent: a new one starts unmeasured.
+            // The noise floor is measured at the incumbent: a new one starts unmeasured, so the
+            // radius it is left with must allow one more step there before a collapse can be
+            // judged against its noise.
             last_mismatch = f64::NAN;
             last_step = Some(l2_norm(
                 &xn.iter().zip(&x).map(|(a, b)| a - b).collect::<Vec<f64>>(),
@@ -559,7 +583,7 @@ fn exact_trust_region(
             if rho > 0.75 && snorm >= 0.99 * radius {
                 radius = (2.0 * radius).min(1e3);
             } else if rho < 0.25 {
-                radius = 0.25 * snorm.max(1e-12);
+                radius = (0.25 * snorm).max(1e-9);
             }
         } else {
             radius = 0.25 * snorm.max(1e-12);
@@ -1022,6 +1046,7 @@ pub(crate) fn optimize_trust_region_seeded(
         nn_reg,
         feasibility: std::sync::Mutex::new(TrFeasibility::default()),
         curvature_scale: std::sync::Mutex::new(Vec::new()),
+        trace_rows: std::sync::Mutex::new((0, None)),
     };
 
     if options.verbose {
@@ -1088,9 +1113,11 @@ pub(crate) fn optimize_trust_region_seeded(
         warnings.push(
             crate::estimation::outer_optimizer::basin_shift_restart_warning(cold.3, n_iterations),
         );
-        // The cold modes whole, κ̂ included, in the layout every trial warm-starts from.
+        // The cold modes whole, κ̂ included: they are the modes at this point, which is what
+        // `ModesHere` tells the first evaluation (the κ = 0 restart of an ODE + IOV *trial*,
+        // `outer_cache_warm_starts`, is for a moved point).
         *problem.cached_etas.lock().unwrap() =
-            crate::estimation::outer_optimizer::outer_cache_warm_starts(model, &cold.0, &cold.2);
+            crate::estimation::outer_optimizer::joint_warm_starts(&cold.0, &cold.2);
         *problem.cached_etas_kind.lock().unwrap() = PrevEtas::ModesHere;
         *problem.grad_cache.lock().unwrap() = None;
         let mut leg_options = options.clone();
@@ -1140,11 +1167,7 @@ pub(crate) fn optimize_trust_region_seeded(
         );
         leg_options.outer_maxiter = options.outer_maxiter - n_iterations;
         *problem.cached_etas.lock().unwrap() =
-            crate::estimation::outer_optimizer::outer_cache_warm_starts(
-                model,
-                &held.etas,
-                &held.kappas,
-            );
+            crate::estimation::outer_optimizer::joint_warm_starts(&held.etas, &held.kappas);
         *problem.cached_etas_kind.lock().unwrap() = PrevEtas::ModesHere;
         *problem.grad_cache.lock().unwrap() = None;
         let (c, bx, it, fg, h, f0, f1) = exact_trust_region(
@@ -1618,6 +1641,7 @@ mod tests {
             cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
             feasibility: std::sync::Mutex::new(TrFeasibility::default()),
             curvature_scale: std::sync::Mutex::new(Vec::new()),
+            trace_rows: std::sync::Mutex::new((0, None)),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1820,6 +1844,7 @@ mod tests {
                 cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
                 feasibility: std::sync::Mutex::new(TrFeasibility::default()),
                 curvature_scale: std::sync::Mutex::new(Vec::new()),
+                trace_rows: std::sync::Mutex::new((0, None)),
                 grad_cache: std::sync::Mutex::new(None),
                 priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
@@ -1917,6 +1942,7 @@ mod tests {
                 cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
                 feasibility: std::sync::Mutex::new(TrFeasibility::default()),
                 curvature_scale: std::sync::Mutex::new(Vec::new()),
+                trace_rows: std::sync::Mutex::new((0, None)),
                 grad_cache: std::sync::Mutex::new(None),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
                 priors: crate::estimation::outer_optimizer::build_prior_set(model, init),
