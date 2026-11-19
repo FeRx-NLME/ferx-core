@@ -129,10 +129,34 @@ impl<'m> GroupMember<'m> {
         self.names.iter().map(|n| subject.covariates.get(n).copied().unwrap_or(0.0)).collect()
     }
 
-    /// [`Self::covariate_slots`] of every subject, read once for a solve that evaluates
-    /// [`Self::mu_at`] at many θ.
-    fn slots(&self, population: &Population) -> Vec<Vec<f64>> {
-        population.subjects.iter().map(|s| self.covariate_slots(s)).collect()
+    /// The distinct [`Self::covariate_slots`] of the population, and each subject's index
+    /// into them, read once for a solve that evaluates [`Self::mu_at`] at many θ. A typical
+    /// value depends on θ and these slots alone, so a solve evaluates it once per distinct
+    /// vector: SAEM's chain copies share their subject's covariates (#2986), and a covariate
+    /// with few levels collapses further. Bit for bit the per-subject values.
+    fn distinct_slots(&self, population: &Population) -> DistinctSlots {
+        let mut index: std::collections::HashMap<Vec<u64>, usize> =
+            std::collections::HashMap::new();
+        let mut uniq: Vec<Vec<f64>> = Vec::new();
+        let of = population
+            .subjects
+            .iter()
+            .map(|s| {
+                let slots = self.covariate_slots(s);
+                let key: Vec<u64> = slots.iter().map(|v| v.to_bits()).collect();
+                *index.entry(key).or_insert_with(|| {
+                    uniq.push(slots);
+                    uniq.len() - 1
+                })
+            })
+            .collect();
+        DistinctSlots { uniq, of }
+    }
+
+    /// [`Self::mu_at`] at every distinct slot vector, or `None` at the first non-finite one —
+    /// the same verdict as a walk over the subjects, which reach exactly these vectors.
+    fn mus_distinct(&self, theta: &[f64], d: &DistinctSlots) -> Option<Vec<f64>> {
+        d.uniq.iter().map(|c| Some(self.mu_at(theta, c)).filter(|m| m.is_finite())).collect()
     }
 
     /// [`Self::mu`] at one subject's [`Self::covariate_slots`].
@@ -209,10 +233,19 @@ impl<'m> GroupMember<'m> {
         &self.spec.theta_names
     }
 
-    /// [`Self::mu`] over the population.
+    /// [`Self::mu`] over the population, evaluated once per distinct covariate vector.
     pub fn mus(&self, theta: &[f64], population: &Population) -> Vec<f64> {
-        population.subjects.iter().map(|s| self.mu(theta, s)).collect()
+        let d = self.distinct_slots(population);
+        let mu: Vec<f64> = d.uniq.iter().map(|c| self.mu_at(theta, c)).collect();
+        d.of.iter().map(|&u| mu[u]).collect()
     }
+}
+
+/// A member's distinct covariate vectors over a population and each subject's index into
+/// them ([`GroupMember::distinct_slots`]).
+struct DistinctSlots {
+    uniq: Vec<Vec<f64>>,
+    of: Vec<usize>,
 }
 
 /// The covariate mu-references one M-step moves together, resolved against the
@@ -970,8 +1003,15 @@ impl CovariateMuGroup<'_> {
             Some(c) => c.l().transpose(),
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
-        let slots: Vec<Vec<Vec<f64>>> = self.members.iter().map(|m| m.slots(population)).collect();
+        let slots: Vec<DistinctSlots> =
+            self.members.iter().map(|m| m.distinct_slots(population)).collect();
         let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
+            let mu_new: Vec<Vec<f64>> = self
+                .members
+                .iter()
+                .zip(&slots)
+                .map(|(m, d)| m.mus_distinct(theta, d))
+                .collect::<Option<_>>()?;
             let mut r = Vec::with_capacity(population.subjects.len() * q);
             let mut ss = 0.0;
             for i in 0..population.subjects.len() {
@@ -980,10 +1020,7 @@ impl CovariateMuGroup<'_> {
                     e[l] = *v;
                 }
                 for (m, member) in self.members.iter().enumerate() {
-                    let mu = member.mu_at(theta, &slots[m][i]);
-                    if !mu.is_finite() {
-                        return None;
-                    }
+                    let mu = mu_new[m][slots[m].of[i]];
                     if member.eta_idx < q {
                         e[member.eta_idx] += mu_old[m][i] - mu;
                     }
@@ -998,6 +1035,15 @@ impl CovariateMuGroup<'_> {
         // `∂r_i/∂θ_j = Lᵀ d_ij`, `d_ij` zero but `−∂μ_m/∂θ_j` at each member's eta.
         let jacobian = |theta: &[f64]| -> Option<DMatrix<f64>> {
             let d = free.len();
+            // `∂μ/∂θ` once per member and distinct covariate vector.
+            let grads: Vec<Vec<Vec<f64>>> = self
+                .members
+                .iter()
+                .zip(&slots)
+                .map(|(m, ds)| {
+                    ds.uniq.iter().map(|c| m.mu_grad(theta, c, free)).collect::<Option<Vec<_>>>()
+                })
+                .collect::<Option<_>>()?;
             let mut jac = DMatrix::<f64>::zeros(population.subjects.len() * q, d);
             for i in 0..population.subjects.len() {
                 let mut di = DMatrix::<f64>::zeros(q, d);
@@ -1005,7 +1051,7 @@ impl CovariateMuGroup<'_> {
                     if member.eta_idx >= q {
                         continue;
                     }
-                    let g = member.mu_grad(theta, &slots[m][i], free)?;
+                    let g = &grads[m][slots[m].of[i]];
                     for j in 0..d {
                         di[(member.eta_idx, j)] -= g[j];
                     }
@@ -1167,16 +1213,13 @@ fn solve_exact_single(
             t
         })
         .collect();
-    let slots = member.slots(population);
+    let slots = member.distinct_slots(population);
     let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
+        let mu = member.mus_distinct(theta, &slots)?;
         let mut r = Vec::with_capacity(n);
         let mut ss = 0.0;
         for i in 0..n {
-            let m = member.mu_at(theta, &slots[i]);
-            if !m.is_finite() {
-                return None;
-            }
-            let ri = target[i] - m;
+            let ri = target[i] - mu[slots.of[i]];
             ss += ri * ri;
             r.push(ri);
         }
@@ -1184,9 +1227,11 @@ fn solve_exact_single(
     };
     // `∂r_i/∂θ_j = −∂μ_i/∂θ_j`: the target is constant.
     let jacobian = |theta: &[f64]| -> Option<DMatrix<f64>> {
+        let grads: Vec<Vec<f64>> =
+            slots.uniq.iter().map(|c| member.mu_grad(theta, c, free)).collect::<Option<_>>()?;
         let mut jac = DMatrix::<f64>::zeros(n, free.len());
         for i in 0..n {
-            for (j, g) in member.mu_grad(theta, &slots[i], free)?.into_iter().enumerate() {
+            for (j, g) in grads[slots.of[i]].iter().enumerate() {
                 jac[(i, j)] = -g;
             }
         }
