@@ -107,6 +107,8 @@ impl MixingGradCache {
 thread_local! {
     /// The recordings `mixture_subject_gradients` made in its last call on this thread.
     pub(crate) static MIXING_RECORDINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The (class x subject) inner solves `mixture_ofv` ran on this thread (its class loop is serial).
+    pub(crate) static CLASS_SOLVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Result of one mixture-objective evaluation.
@@ -330,7 +332,7 @@ pub fn mixture_ofv(
     options: &FitOptions,
     warm: Option<&[Vec<DVector<f64>>]>,
 ) -> MixtureEval {
-    mixture_ofv_impl(model, population, params, options, warm, false).0
+    mixture_ofv_impl(model, population, params, options, warm, None).0
 }
 
 /// Every class's inner modes at one mixture evaluation, `[class][subject]`: the
@@ -339,9 +341,6 @@ pub fn mixture_ofv(
 /// per-subject mixture score (#1956) differentiates every class's `nll_ik` at its own
 /// mode, so it needs them all.
 pub(crate) struct MixtureClassModes {
-    /// Every class's EBE `η̂` per subject, `[class][subject]` ([`MixtureEval::etas_by_class`]):
-    /// what a re-solve warm-starts from ([`mixture_candidate_hessian`]).
-    pub(crate) etas: Vec<Vec<DVector<f64>>>,
     /// Per-occasion κ̂ per class per subject (empty inner `Vec` without IOV).
     pub(crate) kappas: Vec<Vec<Vec<DVector<f64>>>>,
 }
@@ -354,18 +353,34 @@ pub(crate) fn mixture_ofv_with_modes(
     options: &FitOptions,
     warm: Option<&[Vec<DVector<f64>>]>,
 ) -> (MixtureEval, MixtureClassModes) {
-    mixture_ofv_impl(model, population, params, options, warm, true)
+    mixture_ofv_impl(model, population, params, options, warm, None)
 }
 
-/// [`mixture_ofv_with_modes`]; `snapshot_etas` copies every class's `η̂` into the modes
-/// (`MixtureClassModes::etas`), which only the callers that warm-start from them read.
+/// The per-subject event-schedule cache [`build_schedule_cache`] makes: fit-invariant, so a fit
+/// builds it once and passes it to every [`mixture_ofv_cached`] evaluation. Only the quadrature
+/// objective reads it.
+pub(crate) type ScheduleCache = [Option<crate::pk::event_driven::EventSchedule>];
+
+/// [`mixture_ofv_with_modes`] with the fit's hoisted schedule cache (without one, a quadrature
+/// evaluation builds its own).
+pub(crate) fn mixture_ofv_cached(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    warm: Option<&[Vec<DVector<f64>>]>,
+    schedules: &ScheduleCache,
+) -> (MixtureEval, MixtureClassModes) {
+    mixture_ofv_impl(model, population, params, options, warm, Some(schedules))
+}
+
 fn mixture_ofv_impl(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     options: &FitOptions,
     warm: Option<&[Vec<DVector<f64>>]>,
-    snapshot_etas: bool,
+    hoisted: Option<&ScheduleCache>,
 ) -> (MixtureEval, MixtureClassModes) {
     let spec = model
         .mixture
@@ -397,16 +412,16 @@ fn mixture_ofv_impl(
     // its own mode, the single population's `agq_subject_term` on the class parameters, and
     // solved under the single population's quadrature inner policy (Hessian seed, terminal
     // exact Hessian). FOCE/FOCEI keep the historical solve and score untouched.
+    let built = (options.agq_nodes().is_some() && hoisted.is_none())
+        .then(|| build_schedule_cache(model, population));
     let quad = options.agq_nodes().map(|n_nodes| {
         let policy =
             crate::estimation::outer_optimizer::agq_inner_solve_policy(model, options, false)
                 .with_prev_etas(PrevEtas::Solved);
-        (
-            n_nodes,
-            options.hessian_anchor(),
-            policy,
-            build_schedule_cache(model, population),
-        )
+        let schedules = hoisted
+            .or(built.as_deref())
+            .expect("a quadrature evaluation has a schedule cache");
+        (n_nodes, options.hessian_anchor(), policy, schedules)
     });
 
     for cls in 0..k {
@@ -417,6 +432,8 @@ fn mixture_ofv_impl(
         let mut hmats_c = Vec::with_capacity(n);
         let mut kappas_c = Vec::with_capacity(n);
         for (i, subject) in population.subjects.iter().enumerate() {
+            #[cfg(test)]
+            CLASS_SOLVES.with(|c| c.set(c.get() + 1));
             let warm_i = warm
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
@@ -566,11 +583,6 @@ fn mixture_ofv_impl(
         mixest.push(best);
     }
 
-    let etas_snapshot = if snapshot_etas {
-        etas_by_class.clone()
-    } else {
-        Vec::new()
-    };
     let eval = MixtureEval {
         ofv,
         mixest_etas,
@@ -589,7 +601,6 @@ fn mixture_ofv_impl(
         class_nll,
     };
     let modes = MixtureClassModes {
-        etas: etas_snapshot,
         kappas: kappas_by_class,
     };
     (eval, modes)
@@ -921,7 +932,8 @@ fn class_subject_reconverged_gradient(
     let _guard = MixtureClassGuard::enter(cls + 1);
     if options.agq_nodes().is_some() {
         // The quadrature objective's own reconverged difference, as a single population's
-        // salvage takes it; a subject repelled at `x` contributes zero, as the FOCE one does.
+        // salvage takes it. Only a subject repelled at `x` itself (`None`) contributes zero, as
+        // the FOCE one does; a probe that fails at a live `x` is differenced one-sidedly.
         let context = crate::estimation::agq::SubjectScoreContext::new(
             model, &cp, &x_k, options, &bounds, true,
         );
@@ -1014,8 +1026,11 @@ fn class_route(cls: usize, params: &ModelParameters, mp: &MixtureParams) -> Vec<
 /// outside the adjoint's scope, a class mode does not re-converge, or the mixing map declines.
 ///
 /// One cold `mixture_ofv` at the covariance inner tolerance finds the class modes, and
-/// [`mixture_candidate_hessian`] — the one implementation the trust region shares — takes the
-/// derivatives at `x_hat` along every axis, warm from them.
+/// [`mixture_derivatives_at_modes`] — the assembly the trust region's
+/// [`mixture_candidate_hessian`] shares — takes the derivatives at `x_hat` along every axis at
+/// those modes, converged or not: the covariance step has no iterate to refuse, and the R at a
+/// cold mode is what it always assembled. The point-specific not-resolved gate is
+/// [`mixture_candidate_hessian`]'s own.
 pub(crate) fn mixture_cov_hessian(
     model: &CompiledModel,
     population: &Population,
@@ -1029,9 +1044,9 @@ pub(crate) fn mixture_cov_hessian(
         return None;
     }
     let score_options = cov_score_options(model, options);
-    let (_, modes) = mixture_ofv_with_modes(model, population, &params, &score_options, None);
+    let (eval, modes) = mixture_ofv_with_modes(model, population, &params, &score_options, None);
     let axes: Vec<usize> = (0..n).collect();
-    mixture_candidate_hessian(model, population, template, x_hat, &modes, options, &axes)
+    mixture_derivatives_at_modes(model, population, &params, &eval, &modes, options, &axes)
         .ok()
         .map(|(_, h)| h)
 }
@@ -1047,7 +1062,7 @@ fn cov_score_options(model: &CompiledModel, options: &FitOptions) -> FitOptions 
 
 /// The exact gradient and Hessian of the mixture objective `OFV = −2 Σᵢ log Σₖ pᵢₖ e^{−F_ik}`
 /// along `axes` (mixture packed coordinates, in `axes` order), at `x`, both from one pass at
-/// the class modes `warm` re-solved **warm** at the covariance inner tolerance — the
+/// the class modes `warm` (every class's `η̂`, `[class][subject]`) re-solved **warm** at the covariance inner tolerance — the
 /// derivatives the trust region models each iterate with, and (at `x̂`, every axis) the
 /// covariance step's R-matrix. The same objective as [`mixture_ofv`]: the same class
 /// probabilities, class parameters and inner-tolerance handling, the class objective being
@@ -1058,12 +1073,19 @@ fn cov_score_options(model: &CompiledModel, options: &FitOptions) -> FitOptions 
 /// Hessian of the same objective. [`ExactDecline::NotResolved`]: in scope but not at this
 /// point — a class mode that did not re-converge (the start is not re-searched from cold, so a
 /// class cannot jump basins), a non-finite term, or a cancelled run.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the trust region's mixture branch (#2976 follow-up, #3025) is its production caller"
+    )
+)]
 pub(crate) fn mixture_candidate_hessian(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
     x: &[f64],
-    warm: &MixtureClassModes,
+    warm: &[Vec<DVector<f64>>],
     options: &FitOptions,
     axes: &[usize],
 ) -> Result<(Vec<f64>, DMatrix<f64>), ExactDecline> {
@@ -1071,8 +1093,8 @@ pub(crate) fn mixture_candidate_hessian(
     let n_subjects = population.subjects.len();
     let k_classes = params.mixture.as_ref().map(|m| m.omega.len());
     if x.len() != packed_segments(&params).total()
-        || k_classes != Some(warm.etas.len())
-        || warm.etas.iter().any(|c| c.len() != n_subjects)
+        || k_classes != Some(warm.len())
+        || warm.iter().any(|c| c.len() != n_subjects)
     {
         return Err(ExactDecline::OutOfScope);
     }
@@ -1082,7 +1104,7 @@ pub(crate) fn mixture_candidate_hessian(
         ..cov_score_options(model, options)
     };
     let (eval, modes) =
-        mixture_ofv_with_modes(model, population, &params, &score_options, Some(&warm.etas));
+        mixture_ofv_with_modes(model, population, &params, &score_options, Some(warm));
     if crate::cancel::is_cancelled(&options.cancel) || eval.ebe_stats.n_unconverged > 0 {
         return Err(ExactDecline::NotResolved);
     }
@@ -1102,9 +1124,8 @@ pub(crate) fn mixture_candidate_hessian(
 /// `∇F_k`, `∇²F_k` are the adjoint's exact profile gradient and Hessian on the class layout
 /// (class modes, `MIXNUM = k`), routed onto the mixture layout by [`class_route`]; `∇ ln p_k`,
 /// `∇² ln p_k` are the mixing programs' exact θ-derivatives, chained through θ's packing. The
-/// OFV is `2 Σᵢ`. Along a proper subset of the axes each class's Hessian is the adjoint's block
-/// on just the class coordinates that route onto an axis (the full Hessian's sub-block to the
-/// bit); along all of them it is the full Hessian.
+/// OFV is `2 Σᵢ`. Each class's gradient and Hessian are the adjoint's one pass on just the class
+/// coordinates that route onto an axis (the full Hessian's sub-block to the bit).
 fn mixture_derivatives_at_modes(
     model: &CompiledModel,
     population: &Population,
@@ -1115,8 +1136,7 @@ fn mixture_derivatives_at_modes(
     axes: &[usize],
 ) -> Result<(Vec<f64>, DMatrix<f64>), ExactDecline> {
     use crate::sens::ode_provider::adjoint::{
-        subject_adjoint_cov_block_at, subject_adjoint_cov_hessian_at, subject_adjoint_gradient_at,
-        PackedPoint,
+        subject_adjoint_cov_block_with_gradient_at, PackedPoint,
     };
     if !options.analytic_cov_hessian
         || !crate::sens::ode_provider::adjoint::recorder_in_scope(model)
@@ -1133,7 +1153,6 @@ fn mixture_derivatives_at_modes(
     for (p, &a) in axes.iter().enumerate() {
         *pos.get_mut(a).ok_or(ExactDecline::OutOfScope)? = Some(p);
     }
-    let full = axes.len() == n && pos.iter().all(Option::is_some);
     let m = axes.len();
     let classes: Vec<(ModelParameters, Vec<f64>, Vec<Option<usize>>, Vec<usize>)> =
         (0..mp.omega.len())
@@ -1177,16 +1196,12 @@ fn mixture_derivatives_at_modes(
                 modes.kappas[cls].get(i),
             )
             .ok_or(ExactDecline::NotResolved)?;
-            let g_c = subject_adjoint_gradient_at(model, subject, &pt, &b, objective)
-                .ok_or(ExactDecline::OutOfScope)?;
-            let h_c = if full {
-                subject_adjoint_cov_hessian_at(model, subject, &pt, &b, objective)
-            } else {
-                subject_adjoint_cov_block_at(model, subject, &pt, &b, objective, cax)
-            }
-            .ok_or(ExactDecline::OutOfScope)?;
-            if g_c.len() != route.len() || h_c.nrows() != if full { route.len() } else { cax.len() }
-            {
+            // One pass: the gradient and the Hessian block on the class coordinates that land
+            // on an axis, both in `cax` order.
+            let (g_c, h_c) =
+                subject_adjoint_cov_block_with_gradient_at(model, subject, &pt, &b, objective, cax)
+                    .ok_or(ExactDecline::OutOfScope)?;
+            if g_c.len() != cax.len() || h_c.nrows() != cax.len() {
                 return Err(ExactDecline::OutOfScope);
             }
             // ∇u_k = ∇ln p_k − ∇F_k on the axes; the class Hessian scattered onto them.
@@ -1195,13 +1210,12 @@ fn mixture_derivatives_at_modes(
                 let Some(pa) = route[sa].and_then(|d| pos[d]) else {
                     continue;
                 };
-                du[pa] -= g_c[sa];
+                du[pa] -= g_c[ia];
                 for (ic, &sc) in cax.iter().enumerate() {
                     let Some(pc) = route[sc].and_then(|d| pos[d]) else {
                         continue;
                     };
-                    let v = if full { h_c[(sa, sc)] } else { h_c[(ia, ic)] };
-                    h[(pa, pc)] += w * v;
+                    h[(pa, pc)] += w * h_c[(ia, ic)];
                 }
             }
             for j in 0..n_theta {
@@ -1284,6 +1298,10 @@ pub(crate) struct MixtureScoreContext {
     /// The covariance step's options: the inner tolerance the modes were solved at, and the one
     /// the reconverged fallback's probes re-solve at (#2261).
     score_options: FitOptions,
+    /// `score_options` for the quadrature class scores, which reconverge warm from the class
+    /// mode (`inner_restarts: 0`) as the single population's quadrature S does; the cold modes
+    /// keep the fit's restarts.
+    warm_options: FitOptions,
     /// The mixing derivatives at `params.theta`, shared by the subjects' scores.
     mixing: MixingGradCache,
 }
@@ -1297,10 +1315,7 @@ impl MixtureScoreContext {
         options: &FitOptions,
     ) -> Self {
         let params = unpack_params(x_hat, template);
-        let score_options = FitOptions {
-            inner_tol: options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
-            ..options.clone()
-        };
+        let score_options = cov_score_options(model, options);
         let (eval, modes) =
             mixture_ofv_with_modes(model, population, &params, &score_options, None);
         let mp = params
@@ -1348,6 +1363,10 @@ impl MixtureScoreContext {
             modes,
             classes,
             dtheta_dx,
+            warm_options: FitOptions {
+                inner_restarts: 0,
+                ..score_options.clone()
+            },
             score_options,
             mixing: MixingGradCache::new(model),
         }
@@ -1358,6 +1377,7 @@ impl MixtureScoreContext {
     /// class template (#3025).
     pub(crate) fn class_scorers<'a>(&'a self, model: &'a CompiledModel) -> Vec<ClassScorer<'a>> {
         let quadrature = self.score_options.agq_nodes().is_some();
+        let warm_options = &self.warm_options;
         self.classes
             .iter()
             .map(|v| {
@@ -1369,14 +1389,14 @@ impl MixtureScoreContext {
                                 model,
                                 &v.template,
                                 &v.x,
-                                &self.score_options,
+                                warm_options,
                                 &v.bounds,
                                 crate::estimation::outer_optimizer::reconverge_this_eval(
-                                    &self.score_options,
+                                    warm_options,
                                     0,
                                 ),
                             )
-                            .with_fd_inner_tol(self.score_options.inner_tol),
+                            .with_fd_inner_tol(warm_options.inner_tol),
                         ),
                     }
                 } else {
@@ -2422,7 +2442,6 @@ mod tests {
         };
         assert!(eval.pmix[0][cls] > 0.1, "fixture: a live term");
         let mut bad = super::MixtureClassModes {
-            etas: modes.etas.clone(),
             kappas: modes.kappas.clone(),
         };
         assert!(bad.kappas[cls][0].len() >= 2, "fixture: several occasions");
@@ -3205,9 +3224,15 @@ mod tests {
                 .map(|(i, v)| v + 0.04 * (1.0 + v.abs()) * if i % 2 == 0 { 1.0 } else { -1.0 })
                 .collect();
             for (kind, opts) in objective_cases() {
-                let (_, warm) = super::mixture_ofv_with_modes(&model, &pop, params0, &opts, None);
+                let (warm, _) = super::mixture_ofv_with_modes(&model, &pop, params0, &opts, None);
                 let (g, h) = super::mixture_candidate_hessian(
-                    &model, &pop, params0, &x1, &warm, &opts, &axes,
+                    &model,
+                    &pop,
+                    params0,
+                    &x1,
+                    &warm.etas_by_class,
+                    &opts,
+                    &axes,
                 )
                 .unwrap_or_else(|e| panic!("{tag} {kind}: {e:?}"));
                 let p1 = unpack_params(&x1, params0);
@@ -3242,6 +3267,79 @@ mod tests {
         );
     }
 
+    /// #3034 review 4 + 6: the covariance step's exact R takes the cold class modes as they are
+    /// (it has no iterate to refuse), as it did before the candidate API existed, while the trust
+    /// region's `mixture_candidate_hessian` still reports the same unconverged modes as
+    /// `NotResolved`; and it costs ONE evaluation's class solves, not a second warm re-solve.
+    /// Mutation: route `mixture_cov_hessian` back through `mixture_candidate_hessian` -> the
+    /// `Some` assertion (item 4) and the solve count (item 6) both die.
+    #[test]
+    fn the_cov_hessian_assembles_at_unconverged_cold_modes_in_one_evaluation() {
+        use crate::estimation::covariance::ExactDecline;
+        use crate::estimation::parameterization::{pack_params, packed_fixed_mask};
+        let model = crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let n_solves = 2 * pop.subjects.len();
+        let axes: Vec<usize> = (0..x.len()).collect();
+        let free = packed_fixed_mask(params).iter().filter(|f| !**f).count();
+        assert!(free > 0);
+        for (kind, opts) in objective_cases() {
+            let starved = crate::types::FitOptions {
+                inner_maxiter: 1,
+                ..opts.clone()
+            };
+            let cold_opts = super::cov_score_options(&model, &starved);
+            let (eval, modes) =
+                super::mixture_ofv_with_modes(&model, &pop, params, &cold_opts, None);
+            assert!(
+                eval.ebe_stats.n_unconverged > 0,
+                "{kind}: premise: a class mode is unconverged"
+            );
+            // Warm modes far from the mode, under the same one-iteration budget: they do not
+            // re-converge (the cold modes themselves would, being a fixed point of the solve).
+            let lost: Vec<Vec<nalgebra::DVector<f64>>> = eval
+                .etas_by_class
+                .iter()
+                .map(|c| {
+                    c.iter()
+                        .map(|e| nalgebra::DVector::from_element(e.len(), 9.0))
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                super::mixture_candidate_hessian(&model, &pop, params, &x, &lost, &starved, &axes)
+                    .err(),
+                Some(ExactDecline::NotResolved),
+                "{kind}: the trust region keeps the point-specific refusal"
+            );
+            let want = super::mixture_derivatives_at_modes(
+                &model, &pop, params, &eval, &modes, &starved, &axes,
+            )
+            .unwrap_or_else(|e| panic!("{kind}: {e:?}"))
+            .1;
+            super::CLASS_SOLVES.with(|c| c.set(0));
+            let got = super::mixture_cov_hessian(&model, &pop, params, &x, &starved)
+                .unwrap_or_else(|| panic!("{kind}: the covariance step assembles the exact R"));
+            assert_eq!(
+                super::CLASS_SOLVES.with(|c| c.get()),
+                n_solves,
+                "{kind}: one cold evaluation, no second re-solve"
+            );
+            assert!(got.iter().all(|v| v.is_finite()), "{kind}");
+            assert!(want.iter().all(|v| v.is_finite()), "{kind}");
+            // The cold solve inside `mixture_cov_hessian` is a second run of the same solve, so
+            // the two agree to rounding, not bit for bit (measured 3.1e-12 on FOCE).
+            let scale = want.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            let gap = (&got - &want).iter().fold(0.0f64, |m, v| m.max(v.abs())); // nan-ok: got and want are asserted finite above
+            assert!(
+                gap <= 1e-9 * scale,
+                "{kind}: same assembly at the same modes, {gap:.2e} (scale {scale:.2e})"
+            );
+        }
+    }
+
     /// Each decline kind of `mixture_candidate_hessian`, and only through its own cause.
     /// `OutOfScope`: the user's opt-outs (`analytic_cov_hessian = false`, `gradient = fd`) and a
     /// warm start that does not match the population. `NotResolved`: a warm class mode that
@@ -3259,9 +3357,10 @@ mod tests {
         let fixed = packed_fixed_mask(params);
         let axes: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
         for (kind, opts) in objective_cases() {
-            let (_, warm) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+            let (warm, _) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+            let warm = warm.etas_by_class;
             let call = |model: &crate::types::CompiledModel,
-                        warm: &super::MixtureClassModes,
+                        warm: &[Vec<nalgebra::DVector<f64>>],
                         o: &crate::types::FitOptions| {
                 super::mixture_candidate_hessian(model, &pop, params, &x, warm, o, &axes)
             };
@@ -3287,29 +3386,22 @@ mod tests {
                 Some(ExactDecline::OutOfScope),
                 "{kind}: gradient = fd"
             );
-            let mut short = super::MixtureClassModes {
-                etas: warm.etas.clone(),
-                kappas: warm.kappas.clone(),
-            };
-            short.etas[0].pop();
+            let mut short = warm.clone();
+            short[0].pop();
             assert_eq!(
                 call(&model, &short, &opts).err(),
                 Some(ExactDecline::OutOfScope),
                 "{kind}: warm start of the wrong shape"
             );
 
-            let lost = super::MixtureClassModes {
-                etas: warm
-                    .etas
-                    .iter()
-                    .map(|c| {
-                        c.iter()
-                            .map(|e| nalgebra::DVector::from_element(e.len(), 9.0))
-                            .collect()
-                    })
-                    .collect(),
-                kappas: warm.kappas.clone(),
-            };
+            let lost: Vec<Vec<nalgebra::DVector<f64>>> = warm
+                .iter()
+                .map(|c| {
+                    c.iter()
+                        .map(|e| nalgebra::DVector::from_element(e.len(), 9.0))
+                        .collect()
+                })
+                .collect();
             let starved = crate::types::FitOptions {
                 inner_maxiter: 1,
                 ..opts.clone()
