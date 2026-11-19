@@ -5557,7 +5557,7 @@ pub(crate) fn install_worker_forced_fd(fd: bool) {
 
 /// Arms this call's `gradient = fd` on this thread until the guard drops, restoring whatever
 /// was in force before on every exit path. Arming reaches this thread only; the fan-out is
-/// carried by `api::pool::FitScope`, exactly as for the inner settings.
+/// carried by `pool::FitScope`, exactly as for the inner settings.
 #[must_use = "the forced-FD flag is disarmed as soon as this guard drops"]
 pub(crate) struct ForcedFdGuard {
     prev: Option<bool>,
@@ -10626,7 +10626,7 @@ pub(crate) fn install_worker_bloq_override(bloq: Option<BloqMethod>) {
 }
 
 /// Arms this call's `bloq_method` override on this thread until dropped (fan-out via
-/// `api::pool::FitScope`).
+/// `pool::FitScope`).
 #[must_use = "the bloq_method override is disarmed as soon as this guard drops"]
 pub(crate) struct BloqOverrideGuard {
     prev: Option<BloqMethod>,

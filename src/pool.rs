@@ -1,6 +1,6 @@
-//! Extracted verbatim from `api/mod.rs` (production peel). See the module-
-//! doc / Key Modules table for the split rationale.
-use super::*;
+//! The fit-scoped Rayon pools and thread-count policy. A crate-level module (not under `api`)
+//! so the estimators below `api` can open a fit scope without depending on it (#3041).
+use crate::types::*;
 
 /// Worker-stack size for ferx-managed Rayon pools.
 ///
@@ -363,7 +363,7 @@ fn with_scope<R: Send>(
     scope: FitScope, threads: Option<usize>, f: impl FnOnce() -> R + Send,
 ) -> Result<R, crate::diagnostics::EngineError> {
     use crate::diagnostics::EngineError;
-    scope.validate().map_err(super::entry_refusals::ode_solver_options)?;
+    scope.validate().map_err(crate::entry_refusals::ode_solver_options)?;
     let requested_threads = threads.filter(|&n| n > 0).unwrap_or_else(effective_default_threads);
     // `current_num_threads()` is only meaningful — and only safe to call — on a worker:
     // off one it reports (and *initializes*) Rayon's global pool, at one worker per logical
@@ -445,7 +445,7 @@ pub(crate) fn install_on_fit_pool<R: Send>(
     let scope = FitScope::of(options);
     // ODE solver settings no solver can run with are `E_ODE_SOLVER_OPTIONS`, as in
     // `with_fit_scope` (#2044), so `fit()` carries the code too (#2062 review 2, F2).
-    scope.validate().map_err(super::entry_refusals::ode_solver_options)?;
+    scope.validate().map_err(crate::entry_refusals::ode_solver_options)?;
     let f = scope.armed(f);
     let resolved = fit_thread_resolution(options.threads);
     let pinned = resolved.source == ThreadSource::Pinned;
@@ -878,5 +878,5 @@ impl Default for PoolPlan {
 }
 
 #[cfg(test)]
-#[path = "tests/pool_plan_tests.rs"]
+#[path = "api/tests/pool_plan_tests.rs"]
 mod pool_plan_tests;

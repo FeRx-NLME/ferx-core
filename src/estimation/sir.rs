@@ -986,7 +986,7 @@ pub(crate) fn run_sir_core_coded(
     // `inner_optimizer` / `ebe_warm_start` the scope carries — the same `options`
     // `SirSettings` is stamped from — on this thread and on every worker, and nothing
     // outlives the call. Inside `fit()` the worker already carries these values.
-    crate::api::with_fit_scope(options, || {
+    crate::pool::with_fit_scope(options, || {
         run_sir_core_scoped(model, population, params, eta_hats, proposal_cov, ofv_hat, options)
     })?
 }
@@ -1017,14 +1017,14 @@ fn run_sir_in_box(
     // parameters whose shape is not the model's, so `E_PARAM_SHAPE` (#2044).
     match (model.mixture.is_some(), params.mixture.is_some()) {
         (true, false) => {
-            return Err(crate::api::param_shape(
+            return Err(crate::entry_refusals::param_shape(
                 "run_sir_core: the model declares [mixture] but the parameters carry \
                  no per-class Ω/Σ (ModelParameters::mixture is None); build them with \
                  fitted_params_from_result or pass the fit's own parameters.",
             ))
         }
         (false, true) => {
-            return Err(crate::api::param_shape(
+            return Err(crate::entry_refusals::param_shape(
                 "run_sir_core: the parameters carry per-class Ω/Σ \
                  (ModelParameters::mixture) but the model declares no [mixture].",
             ))
@@ -1033,12 +1033,12 @@ fn run_sir_in_box(
     }
 
     if n_resamples > n_samples {
-        return Err(crate::api::sir_options("sir_resamples must be <= sir_samples"));
+        return Err(crate::entry_refusals::sir_options("sir_resamples must be <= sir_samples"));
     }
     // `[fit_options]`' domain, not `ChiSquared`'s (`nu > 0`): a df in (0, 1) would run, and
     // be recorded in a `sir.settings` the `.fitrx` reader refuses (#1770).
     crate::estimation::fit_inputs::sir_df_in_domain("sir_df", options.sir_df)
-        .map_err(|e| crate::api::sir_options(e.to_string()))?;
+        .map_err(|e| crate::entry_refusals::sir_options(e.to_string()))?;
 
     // Pack ML estimates as the proposal center. The FIX mask and the box come
     // out of the same walk (#1252) — both are consulted below, and building the
@@ -1082,7 +1082,7 @@ fn run_sir_in_box(
     // already `L · p(x)` with no flat prior left to move to the reported scale;
     // the natural Jacobian would tilt the prior the fit was estimated under.
     if options.sir_scale == SirScale::Natural && priors.is_active() {
-        return Err(crate::api::sir_options(
+        return Err(crate::entry_refusals::sir_options(
             "sir_scale = natural is not defined for a model with prior(...): the SIR \
              target is already the likelihood times the declared prior on the packed scale, \
              so there is no flat prior to move to the reported scale. Use sir_scale = packed.",
@@ -1090,7 +1090,7 @@ fn run_sir_in_box(
     }
 
     if proposal_cov.nrows() != n_packed || proposal_cov.ncols() != n_packed {
-        return Err(crate::api::fit_input_model(format!(
+        return Err(crate::entry_refusals::fit_input_model(format!(
             "Covariance matrix dimensions ({},{}) don't match packed parameters ({})",
             proposal_cov.nrows(),
             proposal_cov.ncols(),
@@ -1122,7 +1122,7 @@ fn run_sir_in_box(
     let free_idx: Vec<usize> = (0..n_packed).filter(|&i| !fixed_mask[i]).collect();
     let n_free = free_idx.len();
     if n_free == 0 {
-        return Err(crate::api::sir_nothing_to_sample(
+        return Err(crate::entry_refusals::sir_nothing_to_sample(
             "run_sir_core: every packed parameter is FIX — nothing to sample.",
         ));
     }
@@ -1224,7 +1224,7 @@ fn run_sir_in_box(
     } else {
         Some(
             ChiSquared::new(nu)
-                .map_err(|e| crate::api::sir_options(format!("sir_df invalid: {e}")))?,
+                .map_err(|e| crate::entry_refusals::sir_options(format!("sir_df invalid: {e}")))?,
         )
     };
 

@@ -302,7 +302,7 @@ fn check_lent_stats(
         "`prepare_run` on the fit's model and data files. The model has a theta level \
          block, which `bind_covariate_stats` does not bind."
     };
-    Err(crate::api::fit_input_model(format!(
+    Err(crate::entry_refusals::fit_input_model(format!(
         "this fit records no data-derived bindings (an older `.fitrx`), so the \
          supplied model's covariate statistics were checked against {against}, and they \
          differ: the {field} of `{cov}` is {mv} in the model but {dv} in {there}. The model \
@@ -374,7 +374,7 @@ fn check_lent_stats(
 /// (`E_POPULATION_MISMATCH`, `E_FIT_SUBJECTS_MISMATCH`, #1813), an input neither
 /// passed nor recorded (`E_FIT_INPUT_MISSING`), a file changed since the fit
 /// (`E_FIT_INPUT_CHANGED`), a model that is not the fit's (`E_FIT_INPUT_MODEL`, and
-/// `E_THETA_LENGTH` for its θ count), from `crate::api::entry_refusals`.
+/// `E_THETA_LENGTH` for its θ count), from `crate::entry_refusals`.
 pub(crate) fn resolve_fit_inputs<'a>(
     fit: &FitResult, model: Option<&'a CompiledModel>, population: Option<&'a Population>,
     entry: &str,
@@ -407,7 +407,7 @@ fn resolve_fit_inputs_unattributed<'a>(
     // `iov_column` the fit read with, so they need no refusal.
     if let (Some(m), None, None) = (model, population, settings) {
         if m.n_kappa > 0 {
-            return Err(crate::api::fit_input_missing(
+            return Err(crate::entry_refusals::fit_input_missing(
                 "caller-supplied `model` for an IOV (n_kappa > 0) model \
                  requires `population` to also be supplied — the model carries no \
                  `iov_column`, and per-occasion kappas are parsed with it.",
@@ -421,7 +421,7 @@ fn resolve_fit_inputs_unattributed<'a>(
     let mut file: Option<(ParsedModel, String)> = None;
     if model.is_none() {
         let path = fit.model_path.as_deref().ok_or_else(|| {
-            crate::api::fit_input_missing(
+            crate::entry_refusals::fit_input_missing(
                 "no model supplied and fit.model_path is None. \
                  Either pass `model = Some(&model)` or re-fit via fit_from_files \
                  so the path is recorded.",
@@ -439,7 +439,7 @@ fn resolve_fit_inputs_unattributed<'a>(
         Some(p) => Cow::Borrowed(p),
         None => {
             let path = fit.data_path.as_deref().ok_or_else(|| {
-                crate::api::fit_input_missing(
+                crate::entry_refusals::fit_input_missing(
                     "no population supplied and fit.data_path is None. \
                      Either pass `population = Some(&pop)` or re-fit via fit_from_files \
                      so the path is recorded.",
@@ -452,7 +452,7 @@ fn resolve_fit_inputs_unattributed<'a>(
             if let Some(expected) = &fit.data_hash {
                 let actual = sha256_file(Path::new(path)).map_err(read_failed)?;
                 if &actual != expected {
-                    return Err(crate::api::fit_input_changed(format!(
+                    return Err(crate::entry_refusals::fit_input_changed(format!(
                         "data hash mismatch for {path}. Stored: {expected}, current: \
                          {actual}. The dataset has changed since the fit was produced — \
                          refusing to run against stale data."
@@ -522,7 +522,7 @@ fn resolve_fit_inputs_unattributed<'a>(
         }
         Some(m) => {
             if !fit.data_bindings.is_empty() && m.data_bindings() != &fit.data_bindings {
-                return Err(crate::api::fit_input_model(
+                return Err(crate::entry_refusals::fit_input_model(
                     "the supplied model is not bound with this fit's bindings: its \
                      data-derived bindings (level layout, covariate statistics) differ from \
                      the fit's `data_bindings`. Pass `model = None` to rebuild it from the \
@@ -550,7 +550,7 @@ fn resolve_fit_inputs_unattributed<'a>(
 
     let inputs = FitInputs { model, population, warnings };
     if inputs.model().n_theta != fit.theta.len() {
-        return Err(crate::api::theta_length(format!(
+        return Err(crate::entry_refusals::theta_length(format!(
             "the model has n_theta = {} but the fit has {} θ. Verify you supplied \
              the same model the fit used, bound the way the fit was (`bind_from_fit` with \
              the fit's `data_bindings`).",
@@ -627,7 +627,7 @@ fn unrecorded_rule_refusal(fit: &FitResult, file_rule: Option<&IovOccasionRule>)
          occasion labels the fit ran with, set `fit.iov_occasion` to the rule the fit \
          ran with, or refit so the rule is recorded.",
     );
-    crate::api::fit_input_missing(msg)
+    crate::entry_refusals::fit_input_missing(msg)
 }
 
 /// A rule in the DSL's spelling: `dose`, `time(24, 48)`.

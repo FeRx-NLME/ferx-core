@@ -372,7 +372,7 @@ impl Default for RunOptions {
 /// arrive here are not the same statement. A model that does not compile will
 /// not compile on the next machine either — remembering that saves the parse
 /// and, more importantly, keeps the candidate in the report. A fit that died
-/// because `install_on_fit_pool` could not build a pool (`api/pool.rs`) says
+/// because `install_on_fit_pool` could not build a pool (`pool.rs`) says
 /// nothing about the model at all, and writing *that* down as final would let
 /// one bad minute mark a fittable model dead for the rest of the search's life.
 ///

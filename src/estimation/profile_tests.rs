@@ -5014,7 +5014,7 @@ fn the_profile_solve_counts_its_own_moved_states() {
     let params = &p.init_params;
     let counts = |mode| {
         let scoped = FitOptions { inner_optimizer: mode, ..o.clone() };
-        crate::api::with_fit_scope(&scoped, || {
+        crate::pool::with_fit_scope(&scoped, || {
             let warm = ProfileWarm::from_template(&layout, params);
             let mut ps = params.clone();
             for (pos, (&k, &b)) in layout.coords.iter().zip(&warm.beta).enumerate() {
@@ -5132,7 +5132,7 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
     assert!(moved > 0, "no NM stop needed the certificate");
     let solve_moved = |mode| {
         let o = FitOptions { inner_optimizer: mode, ..o.clone() };
-        crate::api::with_fit_scope(&o, || {
+        crate::pool::with_fit_scope(&o, || {
             cf.solve(params, &ProfileWarm::from_template(&layout, params))
                 .expect("the solve converges")
                 .ebe

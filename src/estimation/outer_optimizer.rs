@@ -1263,7 +1263,7 @@ fn subject_nlls(
             interaction,
         )
     };
-    if crate::api::parallelize_cheap_subject_pass(population.subjects.len()) {
+    if crate::pool::parallelize_cheap_subject_pass(population.subjects.len()) {
         let subjects = &population.subjects;
         crate::par::map(subjects.len(), |i| eval((i, &subjects[i])))
     } else {
@@ -4283,7 +4283,7 @@ fn tight_per_subject_gradients(
     ehs: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], options: &FitOptions,
     ode: crate::ode::solver::OdeSolverOverride,
 ) -> Option<Vec<Vec<f64>>> {
-    crate::api::with_fit_scope_ode(options, ode, || {
+    crate::pool::with_fit_scope_ode(options, ode, || {
         if init_params.mixture.is_some() {
             // A mixture solves its class modes itself, under this scope.
             return per_subject_outer_gradients_checked(
@@ -9543,7 +9543,7 @@ fn warm_predictor_serves(
 }
 
 /// Whether [`WARM_PREDICTOR_OFF`] is set on this thread (never outside tests). The fit pool
-/// carries it onto the thread that runs a fit (`api::pool`'s scope arming).
+/// carries it onto the thread that runs a fit (`pool`'s scope arming).
 pub(crate) fn warm_predictor_off() -> bool {
     #[cfg(test)]
     return WARM_PREDICTOR_OFF.with(|c| c.get());

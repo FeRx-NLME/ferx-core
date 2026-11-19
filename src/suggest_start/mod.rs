@@ -409,7 +409,7 @@ fn run_nca(model: &CompiledModel, population: &Population) -> (PopNca, Vec<Strin
     // `par_iter` would otherwise land on Rayon's global pool at one worker per logical
     // CPU regardless of the requested thread count (#1460).
     let per_subject: Vec<SubjectNca> =
-        crate::api::install_on_engine_pool(|| match model.pk_model {
+        crate::pool::install_on_engine_pool(|| match model.pk_model {
             PkModel::OneCptOral
             | PkModel::OneCptTransit
             | PkModel::OneCptIg

@@ -4715,7 +4715,7 @@ impl InnerSettings {
 // thread could switch the inner solver of a fit, SIR or covariance step running in another,
 // mid-run. The per-subject solves fan out over rayon, so arming the calling thread is not
 // enough: a call with non-default settings runs on a pool whose workers were started with the
-// same value installed (`api::pool::FitScope`), and a worker of the shared pool installs
+// same value installed (`pool::FitScope`), and a worker of the shared pool installs
 // nothing and reads the default.
 thread_local! {
     /// `None` outside any fit-scoped call (and on every worker of the shared pool), which
@@ -4744,8 +4744,8 @@ pub(crate) fn install_worker_inner_settings(s: InnerSettings) {
 
 /// Arms the inner settings on this thread until the guard drops, restoring whatever was in
 /// force before — on every exit path, a panic included. Arming reaches this thread only; work
-/// that fans out over rayon goes through `api::pool::with_fit_scope` or
-/// `api::pool::install_on_fit_pool`, which also put it on a pool carrying the same value.
+/// that fans out over rayon goes through `pool::with_fit_scope` or
+/// `pool::install_on_fit_pool`, which also put it on a pool carrying the same value.
 #[must_use = "the inner settings are disarmed as soon as this guard drops"]
 pub(crate) struct InnerSettingsGuard {
     prev: Option<InnerSettings>,

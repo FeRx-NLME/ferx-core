@@ -5434,7 +5434,7 @@ fn nelder_mead_primary_flags_the_subjects_the_certificate_moved() {
             },
             ..Default::default()
         };
-        crate::api::with_fit_scope(&opts, || run_inner_loop(&model, &pop, p, max_iter, tol).2)
+        crate::pool::with_fit_scope(&opts, || run_inner_loop(&model, &pop, p, max_iter, tol).2)
             .expect("the scope builds")
     };
     let s = stats(true);
