@@ -106,6 +106,9 @@ pub(crate) struct GroupMember<'m> {
     /// The typical value compiled once (#2986): bit for bit the interpreter's value, and the
     /// generic VM the M-step's exact ∂A/∂θ runs on.
     compiled: CompiledTypical,
+    /// [`Self::distinct_slots`] of the last population asked for, keyed by its address and
+    /// size: a fit asks for the same one every iteration, and its covariates do not change.
+    slots_cache: std::sync::Mutex<Option<(usize, usize, std::sync::Arc<DistinctSlots>)>>,
 }
 
 impl<'m> GroupMember<'m> {
@@ -120,7 +123,14 @@ impl<'m> GroupMember<'m> {
     fn new(eta_idx: usize, spec: &'m CovariateMuRef) -> Self {
         let names = spec.typical.covariate_names();
         let compiled = spec.typical.compile(&names);
-        GroupMember { eta_idx, transform: spec.transform, spec, names, compiled }
+        GroupMember {
+            eta_idx,
+            transform: spec.transform,
+            spec,
+            names,
+            compiled,
+            slots_cache: std::sync::Mutex::new(None),
+        }
     }
 
     /// The covariates this member's typical value reads, from one subject, in slot order
@@ -134,7 +144,20 @@ impl<'m> GroupMember<'m> {
     /// value depends on θ and these slots alone, so a solve evaluates it once per distinct
     /// vector: SAEM's chain copies share their subject's covariates (#2986), and a covariate
     /// with few levels collapses further. Bit for bit the per-subject values.
-    fn distinct_slots(&self, population: &Population) -> DistinctSlots {
+    fn distinct_slots(&self, population: &Population) -> std::sync::Arc<DistinctSlots> {
+        let key = (population as *const Population as usize, population.subjects.len());
+        let mut cache = self.slots_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((a, n, d)) = cache.as_ref() {
+            if (*a, *n) == key {
+                return d.clone();
+            }
+        }
+        let d = std::sync::Arc::new(self.build_distinct_slots(population));
+        *cache = Some((key.0, key.1, d.clone()));
+        d
+    }
+
+    fn build_distinct_slots(&self, population: &Population) -> DistinctSlots {
         let mut index: std::collections::HashMap<Vec<u64>, usize> =
             std::collections::HashMap::new();
         let mut uniq: Vec<Vec<f64>> = Vec::new();
@@ -1003,7 +1026,7 @@ impl CovariateMuGroup<'_> {
             Some(c) => c.l().transpose(),
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
-        let slots: Vec<DistinctSlots> =
+        let slots: Vec<std::sync::Arc<DistinctSlots>> =
             self.members.iter().map(|m| m.distinct_slots(population)).collect();
         let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
             let mu_new: Vec<Vec<f64>> = self
