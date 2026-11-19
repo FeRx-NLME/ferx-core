@@ -13762,6 +13762,60 @@ fn a_genuine_unprofiled_plateau_stays_converged_after_one_leg() {
     assert!((with.ofv - without.ofv).abs() < 1e-6, "{} vs {}", with.ofv, without.ofv);
 }
 
+/// A leg from a genuine optimum ends at its first point: warfarin FOCEI / L-BFGS, the
+/// fixture above, whose leg gains nothing. The BHHH prediction there is far below
+/// [`UNPROFILED_LEG_SETTLED_PREDICTION`], so the leg scores one point instead of running
+/// its line searches at `UNPROFILED_VERIFY_INNER_TOL`, and the fit reports the same
+/// objective. Mutation (`LEG_SETTLE_OFF`): the leg runs to its own stop.
+#[test]
+fn a_leg_predicted_to_gain_nothing_ends_at_its_first_point() {
+    use crate::parser::model_parser::parse_model_file;
+    let model = parse_model_file(std::path::Path::new("examples/warfarin.ferx")).expect("model");
+    let pop = crate::read_nonmem_csv(std::path::Path::new("data/warfarin.csv"), None, None)
+        .expect("data");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        optimizer: Optimizer::NloptLbfgs,
+        run_covariance_step: false,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let fit = |settle: bool| {
+        LEG_SETTLE_OFF.with(|o| o.set(!settle));
+        LEG_FEASIBLE_EVALS.with(|c| c.set(0));
+        let (r, legs) = with_verify_leg(true, || {
+            optimize_population(&model, &pop, &model.default_params, &opts)
+        });
+        LEG_SETTLE_OFF.with(|o| o.set(false));
+        (r, legs, LEG_FEASIBLE_EVALS.with(|c| c.get()))
+    };
+    let (settled, legs, evals) = fit(true);
+    let (ran, ran_legs, ran_evals) = fit(false);
+    eprintln!(
+        "warfarin: settled {:.10} in {evals} leg evaluation(s) {legs:?}; ran {:.10} in \
+         {ran_evals} {ran_legs:?}",
+        settled.ofv, ran.ofv
+    );
+    assert!(settled.converged, "{:?}", settled.warnings);
+    assert_eq!(legs.len(), 1, "{legs:?}");
+    assert_eq!(evals, 1, "the leg scores its first point only");
+    assert!(ran_evals > 1, "the fixture's leg must search when not settled: {ran_evals}");
+    // The leg the rule cuts short gains nothing: the two fits report one objective.
+    assert!((settled.ofv - ran.ofv).abs() < 1e-9, "{} vs {}", settled.ofv, ran.ofv);
+}
+
+/// [`leg_settles_on_prediction`]: at or below the threshold, never without a prediction or
+/// on a `NaN` one, and not at A2's smallest needed leg (predicted 1.3e-6).
+#[test]
+fn a_leg_settles_only_on_a_small_finite_prediction() {
+    assert!(leg_settles_on_prediction(Some(0.0)));
+    assert!(leg_settles_on_prediction(Some(UNPROFILED_LEG_SETTLED_PREDICTION)));
+    assert!(!leg_settles_on_prediction(Some(1.3e-6)));
+    assert!(!leg_settles_on_prediction(Some(f64::NAN)));
+    assert!(!leg_settles_on_prediction(None));
+}
+
 /// #1564: an NLopt fit runs its covariance step once, on the attempt it reports, not once per
 /// attempt of its retry and restart chain. A warfarin FOCE refit from its own optimum under
 /// L-BFGS never leaves its start, so the #751 held-cap retry runs a second attempt (asserted:
