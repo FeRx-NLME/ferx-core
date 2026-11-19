@@ -5968,7 +5968,7 @@ fn block_value(stmts: &[Statement], theta: &[f64], covs: &[(&str, f64)], name: &
 /// A group's typical value at `covs`.
 fn group_typical(g: &CovariateMuRef, theta: &[f64], covs: &[(&str, f64)]) -> f64 {
     let map: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-    eval_typical_value(&g.typical, theta, &map)
+    g.typical.eval(theta, &map)
 }
 
 /// The issue's melphalan model: `CRCLR` is assigned in both arms of an
@@ -35939,13 +35939,13 @@ fn a_theta_dependent_gather_index_selects_its_level_in_the_recording() {
     }
 }
 
-/// A snapshot of a subject's covariates evaluates a typical value bit-for-bit as the map does,
-/// an absent covariate reads `0.0` in both, a program with more definitions than the stack
-/// buffer holds agrees too, and the names are each covariate once in first-read order. Dies when
-/// the snapshot resolves a name to another's slot (`WT` and `AGE` swapped changes the value) or
-/// the snapshot drops the absent-is-zero rule (`GHOST` would be NaN or panic).
+/// A typical value compiled to the VM ([`CompiledTypical`], #2986) evaluates bit-for-bit as the
+/// map does, an absent covariate reads `0.0` in both, a program with more definitions than the
+/// interpreter's stack buffer holds agrees too, and the names are each covariate once in
+/// first-read order. Dies when compilation resolves a name to another's slot (`WT` and `AGE`
+/// swapped changes the value) or drops the absent-is-zero rule (`GHOST` would be NaN or panic).
 #[test]
-fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() {
+fn a_compiled_typical_value_evaluates_bit_for_bit_as_the_map_does() {
     let cov = |n: &str| Expression::Covariate(n.to_string());
     let bin = |l, op, r| Expression::BinOp(Box::new(l), op, Box::new(r));
     let root = bin(
@@ -35977,11 +35977,13 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
         let names = prog.covariate_names();
         assert_eq!(names.len(), 3);
         assert!(names.contains(&"GHOST".to_string()));
-        let snap = CovariateSnapshot::new(&names, &covs);
+        let compiled = prog.compile(&names);
+        let slots = covariate_slots(&names, &covs);
         for theta in [[0.3], [-1.7]] {
             assert_eq!(
-                prog.eval_snapshot(&theta, &snap).to_bits(),
-                prog.eval(&theta, &covs).to_bits()
+                compiled.eval(&theta, &slots).to_bits(),
+                prog.eval(&theta, &covs).to_bits(),
+                "the compiled typical value (#2986) is the interpreter's, bit for bit"
             );
         }
     }
@@ -36047,13 +36049,58 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
         names,
         ["CA", "CB", "CC", "CD", "CE", "CF", "LVL", "UF", "PB", "PE"].map(String::from)
     );
-    let snap = CovariateSnapshot::new(&names, &covs);
+    let compiled = nested.compile(&names);
+    let slots = covariate_slots(&names, &covs);
     for theta in [[0.3, 1.9], [-1.7, 2.5]] {
-        assert_eq!(
-            nested.eval_snapshot(&theta, &snap).to_bits(),
-            nested.eval(&theta, &covs).to_bits()
-        );
+        assert_eq!(compiled.eval(&theta, &slots).to_bits(), nested.eval(&theta, &covs).to_bits());
     }
+}
+
+/// A subject's covariate vector in `names` order, absent reading `0.0`: what
+/// [`CompiledTypical::eval`] reads.
+fn covariate_slots(names: &[String], covs: &HashMap<String, f64>) -> Vec<f64> {
+    names.iter().map(|n| covs.get(n).copied().unwrap_or(0.0)).collect()
+}
+
+/// The compiled typical value's generic VM on a forward dual seeded on θ (#2986) gives the
+/// exact gradient: `A = θ₀·(WT/70)^θ₁ + MACHEPS` has `∂A/∂θ₀ = (WT/70)^θ₁`,
+/// `∂A/∂θ₁ = θ₀·(WT/70)^θ₁·ln(WT/70)`, and its value lane is the `f64` VM's. A seed on an
+/// unread θ₂ reads exactly `0`. Dies when a covariate or `MACHEPS` is lowered to the wrong
+/// read, or when the θ reads lose their seeds.
+#[test]
+fn a_compiled_typical_value_differentiates_through_the_forward_dual() {
+    use crate::sens::jet::DualT;
+    use crate::sens::num::PkNum;
+    let cov = |n: &str| Expression::Covariate(n.to_string());
+    let bin = |l, op, r| Expression::BinOp(Box::new(l), op, Box::new(r));
+    let prog = TypicalProgram::of(bin(
+        bin(
+            Expression::Theta(0),
+            BinOp::Mul,
+            Expression::Power(
+                Box::new(bin(cov("WT"), BinOp::Div, Expression::Literal(70.0))),
+                Box::new(Expression::Theta(1)),
+            ),
+        ),
+        BinOp::Add,
+        Expression::Variable("MACHEPS".into()),
+    ));
+    let names = prog.covariate_names();
+    let covs: HashMap<String, f64> = [("WT".to_string(), 83.5)].into();
+    let slots = covariate_slots(&names, &covs);
+    let compiled = prog.compile(&names);
+    let theta = [4.2, 0.75, 9.0];
+    let seeded: Vec<DualT<3, f64>> =
+        theta.iter().enumerate().map(|(j, &v)| <DualT<3, f64> as PkNum>::var(v, j)).collect();
+    let a = compiled.eval_g(&seeded, &slots);
+    assert_eq!(a.v.to_bits(), compiled.eval(&theta, &slots).to_bits());
+    assert_eq!(a.v.to_bits(), prog.eval(&theta, &covs).to_bits());
+    let r: f64 = 83.5 / 70.0;
+    let p = r.powf(0.75);
+    assert!((a.g[0] - p).abs() <= 1e-14 * p, "∂A/∂θ₀ {} vs {p}", a.g[0]);
+    let d1 = 4.2 * p * r.ln();
+    assert!((a.g[1] - d1).abs() <= 1e-14 * d1.abs(), "∂A/∂θ₁ {} vs {d1}", a.g[1]);
+    assert_eq!(a.g[2], 0.0, "an unread θ has no derivative");
 }
 
 /// The covariance Hessian's mu fold (#2982) carries a θ on the η lanes only when every route it
