@@ -9259,7 +9259,7 @@ pub struct FitResult {
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
     /// `optimizer = auto` default resolved the choice, the label is the compound
-    /// form `"auto (<resolved>)"` — e.g. `"auto (nlopt_lbfgs)"` — recording both
+    /// form `"auto (<resolved>)"` — e.g. `"auto (trust_region)"` — recording both
     /// the setting and what actually ran. An explicit choice is reported as what
     /// ran too: a `[mixture]` model replaces an optimizer that cannot carry the
     /// mixture objective with BOBYQA, reported `"bobyqa"` (#1540). SAEM/GN/IMP
@@ -10591,10 +10591,8 @@ pub struct FitOptions {
     /// RNG seed for the NPDE/NPD simulation. `None` falls back to a fixed
     /// default so the diagnostic is reproducible across invocations.
     pub npde_seed: Option<u64>,
-    /// Maximum CG iterations for the Steihaug subproblem solver (trust-region only).
-    /// `None` (default) uses a size-adaptive budget of `ceil(sqrt(n_params)).clamp(5, n_params)`,
-    /// which is 5 for typical NLME problems (n_params ≈ 7–15) and grows with model size.
-    /// `Some(n)` pins the budget to `n` — set to `50` to recover the previous fixed behaviour.
+    /// No effect since #2975: `optimizer = trust_region` solves its subproblem exactly on the
+    /// exact Hessian's eigenbasis. Kept so existing model files and callers still parse.
     pub steihaug_max_iters: Option<usize>,
     /// If true (default), use automatically detected mu-referencing to centre
     /// ETA starting points on the current population mean at each outer step.
@@ -10703,11 +10701,10 @@ pub struct FitOptions {
     /// supersedes [`FitOptions::scale_params`]: `Rescale2` (nlmixr2-style bound-half-width
     /// normalisation) is the recommended setting for gradient-based optimizers
     /// and substantially improves cold-start convergence (see
-    /// [`ParameterScaling`]). **Default: `Auto`** — applies `Rescale2` to the
-    /// gradient-based optimizers that benefit (`Bfgs`/`Lbfgs`/`NloptLbfgs`/`Slsqp`)
-    /// and leaves the derivative-free `Bobyqa` unscaled (where `Rescale2`
-    /// distorts its trust-region model). Set via `[fit_options]` key
-    /// `parameter_scaling = none|abs|rescale2` to override.
+    /// [`ParameterScaling`]). **Default: `Auto`** — scales each free coordinate of
+    /// `NloptLbfgs` and `Slsqp` by its exact curvature at the start (#2975), applies `Abs` to
+    /// the built-in `Bfgs`/`Lbfgs`, and leaves `Bobyqa`, `Mma` and `TrustRegion` unscaled.
+    /// Set via `[fit_options]` key `parameter_scaling = none|abs|rescale2` to override.
     pub parameter_scaling: ParameterScaling,
     /// Fraction of subjects allowed to have unconverged EBEs before the outer
     /// optimizer rejects the current parameter step (returns OFV = ∞).  Set to
@@ -11151,17 +11148,18 @@ impl CompiledModel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Optimizer {
     /// Pick the outer optimizer automatically from the model (the default).
-    /// Resolves to [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI
+    /// Resolves to [`Optimizer::TrustRegion`] when the exact analytic FOCE/FOCEI
     /// gradient is available (the model is in the analytic (adjoint) gradient's scope
     /// and the user did not force `gradient_method = fd`), and to
     /// [`Optimizer::Bobyqa`] otherwise (a model outside the analytic scope, or
     /// `gradient_method = fd`, where the outer loop must fall back to finite
     /// differences). Above [`BOBYQA_MAX_DIM`] free packed parameters it takes
     /// `NloptLbfgs` even on an FD gradient, and mixture models always take
-    /// `Bobyqa` (that override lives in the outer optimizer's dispatch, not here). Benchmarking across ~10 real FOCEI datasets (#490) found
-    /// NLopt L-BFGS fastest-to-optimum on every analytic-gradient problem, while
-    /// BOBYQA was both fastest and most reliable when only finite differences
-    /// are available. See [`Optimizer::resolve_auto`].
+    /// `Bobyqa` (that override lives in the outer optimizer's dispatch, not here).
+    /// On an exact gradient the trust region reached the best OFV from every start of a
+    /// 61-model benchmark in fewer iterations and cycles than L-BFGS (#2975); BOBYQA was
+    /// both fastest and most reliable when only finite differences are available (#490).
+    /// See [`Optimizer::resolve_auto`].
     Auto,
     Bfgs,
     Lbfgs,
@@ -11188,7 +11186,11 @@ pub enum Optimizer {
     /// `docs/estimation/optimizers.qmd` for the cefepime and Emax PKPD
     /// validations behind that choice.
     Bobyqa,
-    /// Newton trust-region with Steihaug CG subproblem (via argmin)
+    /// PORT-style model/trust-region method on exact second-order information (#2975):
+    /// a saddle-free exact Hessian seeds a damped BFGS model, refreshed exactly on a
+    /// poor step or a change of the active bound set, with an exact eigen-subproblem
+    /// and a stop certified on the exact Newton decrement. What [`Optimizer::Auto`]
+    /// resolves to on an exact gradient.
     TrustRegion,
 }
 
@@ -11410,17 +11412,15 @@ pub enum InnerOptimizer {
 /// Crucially, `Rescale2` is **harmful to the derivative-free `Bobyqa`**
 /// (e.g. it drops `emax_pkpd` from OFV −36.76 to −13.51 and `three_cpt_iv` from
 /// −730.6 to −715.9): rescaling the trust region of a gradient-free optimizer
-/// distorts its quadratic model. Hence the default is [`Auto`](Self::Auto),
-/// which applies `Rescale2` only to the gradient-based optimizers that benefit.
+/// distorts its quadratic model. Hence the default is [`Auto`](Self::Auto), which
+/// scales only the gradient-based optimizers (see its variant docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ParameterScaling {
-    /// **Default.** Apply `Rescale2` for the gradient-based optimizers that
-    /// benefit from it (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and no scaling
-    /// otherwise — so the derivative-free `Bobyqa` (where `Rescale2` is
-    /// harmful) and `Mma`/`TrustRegion` are left unscaled, with the legacy
+    /// **Default.** `NloptLbfgs` and `Slsqp` scale each free coordinate by its exact
+    /// curvature at the start, `1/√|∂²OFV/∂x²|` (#2975); the built-in `Bfgs`/`Lbfgs` take
+    /// `Abs`; the derivative-free `Bobyqa` (where scaling is harmful) and `Mma` /
+    /// `TrustRegion` (which scales its own model) are left unscaled, with the legacy
     /// `scale_params` / IOV-auto-enable still applying in that unscaled branch.
-    /// `Slsqp` is scaled because the bound-half-width rescaling fixes its
-    /// cold-start convergence on IOV models (#335).
     #[default]
     Auto,
     /// No scaling: fall back to the legacy `scale_params` bool (and the IOV+SLSQP
@@ -11456,7 +11456,7 @@ impl Optimizer {
 
     /// Resolve [`Optimizer::Auto`] to a concrete optimizer for `model`; every
     /// other variant is returned unchanged (idempotent). `auto` picks
-    /// [`Optimizer::NloptLbfgs`] when the exact analytic FOCE/FOCEI gradient is
+    /// [`Optimizer::TrustRegion`] when the exact analytic FOCE/FOCEI gradient is
     /// available — the model is in the analytic (adjoint) gradient's scope and the user
     /// did not force `gradient_method = fd` — and [`Optimizer::Bobyqa`]
     /// otherwise, with one exception that takes L-BFGS on a finite-difference
@@ -11510,8 +11510,11 @@ impl Optimizer {
         // outer loop's actual gradient dispatch (#490 review): resolving to a
         // gradient-based optimizer while the loop ran FD would feed it a noisy
         // gradient.
+        // With an exact gradient, `auto` takes the trust region (#2975): measured on 61
+        // models from 9 starts it reached the best OFV on every start where L-BFGS missed
+        // three times silently, in 0.41× L-BFGS's iterations and the fewest cycles.
         if analytic_outer_gradient {
-            Optimizer::NloptLbfgs
+            Optimizer::TrustRegion
         } else {
             Optimizer::Bobyqa
         }

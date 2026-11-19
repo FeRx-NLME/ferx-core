@@ -668,7 +668,11 @@ fn a_cancelled_run_stops_scheduling_and_resumes_into_the_uninterrupted_run() {
 #[test]
 fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
     let mut p = prepared();
-    p.parsed.fit_options.outer_maxiter = 2;
+    // Three iterations: the replicates must move off their start without converging. Under
+    // `trust_region` (`auto` since #2976) the first step from the base estimates is the exact
+    // model's full Newton step, which overshoots there and is refused, and so is the next,
+    // a quarter of it; at two iterations the replicates had not moved (`Stalled`).
+    p.parsed.fit_options.outer_maxiter = 3;
 
     let dir = tempfile::tempdir().expect("temp dir");
     let flag = CancelFlag::new();
@@ -736,7 +740,7 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
         assert!(ofv.is_finite());
         assert_eq!(ofv.to_bits(), r.ofv.to_bits(), "sample {sample}");
         // The outcome agrees with the row `raw_results.csv` writes: a
-        // two-iteration fit has not converged, and has moved off its start.
+        // three-iteration fit has not converged, and has moved off its start.
         assert!(!r.converged, "premise: sample {sample} did not converge");
         assert_eq!(outcome, ReplicateOutcome::NotConverged, "sample {sample}");
         // …and the default `skip_minimization_terminated` leaves it out of the

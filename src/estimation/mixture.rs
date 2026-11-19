@@ -3056,7 +3056,7 @@ mod tests {
             // value may change what a mixture runs or whether a warning is owed.
             for analytic in [true, false] {
                 let (resolved, warning) =
-                    resolve_outer_optimizer(requested, &model, true, analytic);
+                    resolve_outer_optimizer(requested, &model, true, analytic, true);
                 match on_mixture(requested) {
                     OnMixture::Honoured => {
                         assert_eq!(resolved, requested, "{requested:?} runs as requested");
@@ -3103,7 +3103,7 @@ mod tests {
                 // Without a mixture nothing is ever replaced: no warning for any
                 // optimizer, and an explicit choice is returned unchanged.
                 let (resolved, warning) =
-                    resolve_outer_optimizer(requested, &model, false, analytic);
+                    resolve_outer_optimizer(requested, &model, false, analytic, true);
                 assert_eq!(warning, None, "{requested:?} without a mixture: no warning");
                 if requested == Optimizer::Auto {
                     assert_ne!(

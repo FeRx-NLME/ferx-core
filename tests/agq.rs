@@ -921,94 +921,62 @@ fn focei_quadrature_out_of_analytic_scope_is_rejected() {
     );
 }
 
-/// `optimizer = trust_region` must be rejected on a quadrature stage.
+/// `optimizer = trust_region` runs the quadrature objective (#2976, retiring #1034's
+/// `E_OPTIMIZER_AGQ`). Every optimizer scores the quadrature marginal (`pop_nll_opts`), and
+/// the trust region's model is now that objective's own: its exact gradient and Hessian come
+/// from `per_subject_adjoint`, which differentiates `cov_objective(options)` (the AGQ marginal
+/// whenever `agq_nodes()` is set), its FD twin differences `pop_nll_opts`, and its fallback
+/// gradient there is the reconverged central difference of the same. So it must reach the
+/// optimum the AGQ-routed L-BFGS reaches, and accept the stage at check time.
 ///
-/// Every optimizer *scores* the quadrature marginal (`pop_nll_opts` dispatches on
-/// `agq_nodes()`), but only `optimize_nlopt` and `optimize_bfgs` route the matching
-/// gradient — both go through `population_gradient`, which hands AGQ to
-/// `agq::agq_population_gradient`. `trust_region` has its own `Gradient` impl with no such
-/// branch, so it would descend on the FOCE/Laplace closed form while reporting quadrature
-/// OFVs — the silent wrong answer `FitOptions::agq_nodes` and `population_gradient` both
-/// warn about in as many words. Rejecting at check time is the guard; #1034 review.
+/// Mutation (run): the old FOCE-only rows gradient as the fallback, or a FOCE objective in
+/// the exact derivatives, would descend on a different function and stop away from L-BFGS.
 #[test]
-fn trust_region_with_a_quadrature_stage_is_rejected() {
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two AGQ fits to convergence; opt in with --features slow-tests"
+)]
+fn trust_region_reaches_the_quadrature_optimum_lbfgs_reaches() {
     use ferx_core::api::check_model_options;
     use ferx_core::Optimizer;
 
-    let model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
-    let has_agq_guard = |opts: &FitOptions| {
-        check_model_options(&model, opts)
-            .iter()
-            .any(|d| d.code == "E_OPTIMIZER_AGQ")
-    };
-
-    // `laplace` is a quadrature stage at any node count, including the n_agq = 1 default.
-    for n_agq in [1, 3] {
+    let prep = ferx_core::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
+        .expect("warfarin example must load");
+    let run = |optimizer: Optimizer| -> FitResult {
         let opts = FitOptions {
-            method: EstimationMethod::Laplace,
-            optimizer: Optimizer::TrustRegion,
-            n_agq,
-            ..FitOptions::default()
-        };
-        assert!(
-            has_agq_guard(&opts),
-            "laplace + trust_region must be rejected at n_agq = {n_agq}"
-        );
-    }
-
-    // `focei` is one only above n_agq = 1; plain FOCEI keeps working with trust_region.
-    let focei_quad = FitOptions {
-        method: EstimationMethod::FoceI,
-        optimizer: Optimizer::TrustRegion,
-        n_agq: 3,
-        ..FitOptions::default()
-    };
-    assert!(has_agq_guard(&focei_quad));
-    let plain_focei = FitOptions {
-        method: EstimationMethod::FoceI,
-        optimizer: Optimizer::TrustRegion,
-        n_agq: 1,
-        ..FitOptions::default()
-    };
-    assert!(
-        !has_agq_guard(&plain_focei),
-        "plain FOCEI (n_agq = 1) is not a quadrature stage and must stay allowed"
-    );
-
-    // The guard is about this optimizer, not about quadrature: the AGQ-aware optimizers
-    // must be untouched.
-    for optimizer in [
-        Optimizer::Bobyqa,
-        Optimizer::Slsqp,
-        Optimizer::NloptLbfgs,
-        Optimizer::Lbfgs,
-        Optimizer::Bfgs,
-        Optimizer::Mma,
-        Optimizer::Auto,
-    ] {
-        let opts = FitOptions {
-            method: EstimationMethod::Laplace,
-            optimizer,
+            verbose: false,
+            method: EstimationMethod::FoceI,
             n_agq: 3,
+            optimizer,
+            run_covariance_step: false,
             ..FitOptions::default()
         };
         assert!(
-            !has_agq_guard(&opts),
-            "{optimizer:?} routes the quadrature gradient and must not be rejected"
+            check_model_options(&prep.parsed.model, &opts)
+                .iter()
+                .all(|d| d.code != "E_OPTIMIZER_AGQ"),
+            "{optimizer:?}: the quadrature stage is accepted"
         );
-    }
-
-    // A chained fit whose *later* stage is the quadrature one is caught too — the guard
-    // reads the chain, not just `method`.
-    let chained = FitOptions {
-        method: EstimationMethod::Foce,
-        methods: vec![EstimationMethod::Foce, EstimationMethod::Laplace],
-        optimizer: Optimizer::TrustRegion,
-        ..FitOptions::default()
+        fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+        )
+        .unwrap_or_else(|e| panic!("{optimizer:?}: {e}"))
     };
+    let tr = run(Optimizer::TrustRegion);
+    let lb = run(Optimizer::NloptLbfgs);
+    eprintln!("#2976 AGQ-3: trust region {} vs L-BFGS {}", tr.ofv, lb.ofv);
+    assert!(tr.converged, "trust region: {:?}", tr.warnings);
+    assert!(tr.ofv.is_finite() && lb.ofv.is_finite());
+    // Measured 2.5e-7 (−285.97388017 vs −285.97388042, Linux x86_64): 1e-5 is 40× that, and
+    // two orders under the 1e-3 a descent on the FOCE gradient would be off by.
     assert!(
-        has_agq_guard(&chained),
-        "a laplace stage anywhere in the chain must be caught"
+        (tr.ofv - lb.ofv).abs() < 1e-5,
+        "trust region {} vs L-BFGS {} on the AGQ-3 objective",
+        tr.ofv,
+        lb.ofv
     );
 }
 
@@ -1135,6 +1103,13 @@ fn focei_agq_analytic_covariance_matches_the_fd_stencil() {
             sir: false,
             outer_maxiter: 3,
             analytic_cov_hessian: analytic,
+            // The covariance route is under test, at one point. `trust_region` (the `auto`
+            // pick since #2976) models on the FD Hessian when `analytic_cov_hessian = false`,
+            // so its two 3-iteration runs would stop at different estimates. L-BFGS reads the
+            // flag only for its start scales, and was measured at this headroom.
+            optimizer: ferx_core::types::Optimizer::NloptLbfgs,
+            // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+            parameter_scaling: ferx_core::types::ParameterScaling::Abs,
             ..FitOptions::default()
         };
         fit(

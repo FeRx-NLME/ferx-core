@@ -168,6 +168,9 @@ pub fn gradient_method_outer(
                 model,
                 model.mixture.is_some(),
                 analytic,
+                // Whether the gradient is analytic does not depend on which gradient-based
+                // optimizer `auto` lands on.
+                true,
             );
             match resolved {
                 Optimizer::Bobyqa => GradientMethodKind::NotApplicable,

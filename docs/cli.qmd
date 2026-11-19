@@ -229,7 +229,7 @@ that author model files programmatically.
 
 - Without `--data`, parse / structural and model–option compatibility checks
   run (no data is read) — e.g. an SDE model paired with SAEM, or
-  `optimizer = trust_region` on an IOV model.
+  `optimizer = trust_region` with `method = laplace`.
 - With `--data`, the dataset is read and the data-dependent checks run too:
   referenced covariates present, per-CMT scaling / error-model coverage,
   steady-state dosing well-formed, and non-negative typical-value lag time.

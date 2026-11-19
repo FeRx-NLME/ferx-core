@@ -193,7 +193,7 @@ fn ode_inner_stays_analytic_past_the_cap_at_loose_ode_tolerances() {
 
 /// #2048: an immediate route probe at 24 and 25 axes — six subjects, `outer_maxiter = 0`
 /// (one objective and gradient evaluation at the start values), no covariance step. Both
-/// twins report an analytic outer gradient, resolve `auto` to L-BFGS and carry no
+/// twins report an analytic outer gradient, resolve `auto` to the trust region and carry no
 /// finite-difference warning, and the OFV agrees bit for bit. Before #2093 the 25-axis
 /// twin read `N/A` / `auto (bobyqa)` here. The covariance step's route is not visible on
 /// `FitResult` (a `Computed` status is reached by the FD stencil too), so it is pinned by
@@ -221,8 +221,8 @@ fn outer_route_is_the_same_past_the_cap() {
             "{label}: the adjoint outer gradient has no θ + η cap"
         );
         assert_eq!(
-            r.optimizer, "auto (nlopt_lbfgs)",
-            "{label}: `auto` takes L-BFGS on an analytic outer gradient"
+            r.optimizer, "auto (trust_region)",
+            "{label}: `auto` takes the trust region on an analytic outer gradient"
         );
         let fd: Vec<&String> = r
             .warnings

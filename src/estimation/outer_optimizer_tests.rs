@@ -209,6 +209,7 @@ fn freeze_flat_thetas_freezes_only_the_unmapped_theta() {
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         false,
+        false,
     )
     .frozen
     .expect("the unmapped TVFLAT must be detected and frozen");
@@ -1767,7 +1768,7 @@ fn test_polish_is_wired_and_an_unfinished_polish_is_not_converged() {
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
             None,
-            &[],
+            &OuterScales::default(),
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
         (
@@ -1884,7 +1885,7 @@ fn test_short_window_latch_is_wired_and_plateau_checked() {
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
             None,
-            &[],
+            &OuterScales::default(),
         )
     };
     let (on, on_outcome) = run(true);
@@ -2185,6 +2186,7 @@ fn preflight_freezes_flat_theta() {
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         false,
+        false,
     )
     .frozen
     .expect("flat TVV must be detected");
@@ -2213,6 +2215,7 @@ fn preflight_no_freeze_when_all_thetas_active() {
             &model.default_params,
             &options,
             &OuterFdDeclineLog::new(pop.subjects.len()),
+            false,
             false,
         )
         .frozen
@@ -2248,6 +2251,7 @@ fn preflight_freezes_out_of_bounds_flat_theta_at_clamped_value() {
         &model.default_params,
         &options,
         &OuterFdDeclineLog::new(pop.subjects.len()),
+        false,
         false,
     )
     .frozen
@@ -3513,7 +3517,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         &declines,
         None,
         None,
-        &[],
+        &OuterScales::default(),
     )
     .0
     .params;
@@ -3527,7 +3531,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
         &declines,
         None,
         None,
-        &[],
+        &OuterScales::default(),
     );
     let (from_reference, reference_outcome) = optimize_nlopt_once(
         &model,
@@ -3542,7 +3546,7 @@ fn test_published_escape_verdict_uses_the_original_start() {
             start_eval: None,
         }),
         None,
-        &[],
+        &OuterScales::default(),
     );
 
     // The straddle itself, asserted so it cannot silently become a tautology: the
@@ -4711,6 +4715,9 @@ fn non_convergence_reports_directly_without_second_optimization() {
         method: EstimationMethod::FoceI,
         interaction: true,
         optimizer: Optimizer::NloptLbfgs,
+        // The mid-descent shape is tied to the pre-#2975 L-BFGS search path (magnitude
+        // scaling): under the curvature scaling stage 1 already ends within 0.1 of the optimum.
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         outer_maxiter,
         run_covariance_step: false,
         mu_referencing: true,
@@ -10918,7 +10925,7 @@ fn latch_veto_is_wired_on(label: &str, model: &CompiledModel, escaped_below: f64
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
         None,
-        &[],
+        &OuterScales::default(),
     );
     eprintln!("{label}: OFV {}", result.ofv);
     assert!(
@@ -11455,6 +11462,10 @@ fn the_basin_probe_absorbs_one_switched_subject_of_ten() {
     .unwrap();
     let opts = FitOptions {
         verbose: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..parsed.fit_options.clone()
     };
     let _off = WarmPredictorOff::new();
@@ -11561,6 +11572,10 @@ fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
     .unwrap();
     let opts = FitOptions {
         verbose: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..parsed.fit_options.clone()
     };
     let _off = WarmPredictorOff::new();
@@ -11835,6 +11850,7 @@ fn first_evaluation_seeded_from_preflight_skips_the_multistart() {
             &opts,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             false,
+            false,
         )
     });
     assert!(
@@ -11859,7 +11875,7 @@ fn first_evaluation_seeded_from_preflight_skips_the_multistart() {
                 &OuterFdDeclineLog::new(pop.subjects.len()),
                 None,
                 seed,
-                &[],
+                &OuterScales::default(),
             )
             .0
         })
@@ -11910,7 +11926,15 @@ fn measure_preflight_reuse(
     };
     let declines = || OuterFdDeclineLog::new(pop.subjects.len());
     let (preflight, pre_n) = count_multistarts(|| {
-        freeze_flat_thetas(model, pop, &model.default_params, &opts, &declines(), false)
+        freeze_flat_thetas(
+            model,
+            pop,
+            &model.default_params,
+            &opts,
+            &declines(),
+            false,
+            false,
+        )
     });
     let (fit, fit_n) =
         count_multistarts(|| optimize_population(model, pop, &model.default_params, &opts));
@@ -11920,7 +11944,15 @@ fn measure_preflight_reuse(
         .as_ref()
         .map_or(&model.default_params, |(p, _)| p);
     let cold_n = count_multistarts(|| match optimizer {
-        Optimizer::Bobyqa => optimize_nlopt(model, pop, init, &opts, &declines(), None, &[]),
+        Optimizer::Bobyqa => optimize_nlopt(
+            model,
+            pop,
+            init,
+            &opts,
+            &declines(),
+            None,
+            &OuterScales::default(),
+        ),
         Optimizer::Bfgs => optimize_bfgs(model, pop, init, &opts, &declines(), None),
         _ => crate::estimation::trust_region::optimize_trust_region(model, pop, init, &opts),
     })
@@ -12088,7 +12120,15 @@ fn an_exactly_zero_solved_ebe_is_not_multistarted_at_every_evaluation() {
                             &model, &pop, init, &opts,
                         )
                     }
-                    _ => optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[]),
+                    _ => optimize_nlopt(
+                        &model,
+                        &pop,
+                        init,
+                        &opts,
+                        &declines,
+                        None,
+                        &OuterScales::default(),
+                    ),
                 }
                 .ofv
             })
@@ -12161,7 +12201,15 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
         let (r, rec) = pool.install(|| {
             GUARD_STOP_DISABLED.with(|c| c.set(true));
             let out = record_inner_solves(|| {
-                optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[])
+                optimize_nlopt(
+                    &model,
+                    &pop,
+                    init,
+                    &opts,
+                    &declines,
+                    None,
+                    &OuterScales::default(),
+                )
             });
             GUARD_STOP_DISABLED.with(|c| c.set(false));
             out
@@ -12581,6 +12629,7 @@ fn assert_first_eval_starts_at_preflight_mode(
                     &opts,
                     &declines,
                     false,
+                    false,
                 )
                 .etas
                 .unwrap_or_else(|| panic!("{label}: every subject converged"));
@@ -12689,7 +12738,16 @@ fn preflight_etas_stack_kappa_only_for_subjects_with_kappa_cells() {
     let preflight = |model: &CompiledModel, pop: &Population, opts: &FitOptions| {
         let declines = OuterFdDeclineLog::new(pop.subjects.len());
         on_one_thread(|| {
-            freeze_flat_thetas(model, pop, &model.default_params, opts, &declines, false).etas
+            freeze_flat_thetas(
+                model,
+                pop,
+                &model.default_params,
+                opts,
+                &declines,
+                false,
+                false,
+            )
+            .etas
         })
     };
     let bits = |v: &DVector<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
@@ -13220,6 +13278,7 @@ fn preflight_scales_a_near_zero_volume_theta_but_not_a_near_zero_slope() {
             &opts,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             probe,
+            false,
         )
     };
 
@@ -13278,6 +13337,7 @@ fn preflight_decides_identity_scales_from_exact_derivatives_without_probe_solves
             &opts,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             true,
+            false,
         )
         .identity_scales;
         IDENTITY_EXACT_OFF.with(|c| c.set(false));
@@ -13663,7 +13723,10 @@ fn bobyqa_reads_the_identity_theta_scale() {
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
             None,
-            scales,
+            &OuterScales {
+                identity: (scales).to_vec(),
+                curvature: None,
+            },
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
         out.0
@@ -13742,6 +13805,7 @@ fn preflight_keeps_a_near_zero_slope_unscaled_on_a_replicated_population() {
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         true,
+        false,
     );
     assert_eq!(
         got.identity_scales,
@@ -13846,6 +13910,7 @@ fn preflight_probes_the_penalized_objective() {
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         true,
+        false,
     );
     assert_eq!(got.identity_scales, vec![(5, 0.001)], "THETA_WT is scaled");
 }
@@ -13911,6 +13976,7 @@ fn preflight_reads_the_ebe_guard_on_real_solves() {
             &opts,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             true,
+            false,
         )
         .identity_scales
     };
@@ -14706,7 +14772,17 @@ fn scale_vector_for(
         ..
     } = pack_with_bounds(params);
     clamp_to_bounds(&mut x0, &bounds);
-    nlopt_scale_vector(&x0, params, &bounds, options, false, identity_scales)
+    nlopt_scale_vector(
+        &x0,
+        params,
+        &bounds,
+        options,
+        false,
+        &OuterScales {
+            identity: (identity_scales).to_vec(),
+            curvature: None,
+        },
+    )
 }
 
 /// An identity-packed θ above 10 in magnitude is divided by |θ₀|, both signs, while
@@ -15707,6 +15783,10 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..prep.parsed.fit_options.clone()
     };
     // Through #2460's floor restart, as `fit` runs it: the start's first attempt ends with
@@ -15784,6 +15864,10 @@ fn an_unprofiled_leg_ranks_its_own_incumbent() {
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..prep.parsed.fit_options.clone()
     };
     let fit = |on| {
@@ -16162,7 +16246,7 @@ mod above_start {
             &OuterFdDeclineLog::new(pop.subjects.len()),
             restart,
             None,
-            &[],
+            &OuterScales::default(),
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
         r
@@ -16364,7 +16448,7 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
         None,
-        &[],
+        &OuterScales::default(),
         false,
         Some(&probe),
     );
@@ -16400,7 +16484,7 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
         None,
-        &[],
+        &OuterScales::default(),
         false,
         Some(&probe),
     );
@@ -16430,7 +16514,7 @@ fn the_attempt_hands_an_unmoved_start_to_the_probe() {
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
         None,
-        &[],
+        &OuterScales::default(),
         false,
         Some(&probe),
     );
@@ -17290,7 +17374,7 @@ fn a_leg_that_is_not_kept_hands_back_the_kept_ebe_state() {
             &opts,
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
-            &[],
+            &OuterScales::default(),
         )
     });
     UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(false));
@@ -17383,7 +17467,7 @@ fn cold_mode_fit(
         &opts,
         &OuterFdDeclineLog::new(pop.subjects.len()),
         None,
-        &[],
+        &OuterScales::default(),
     );
     LEG_PASSES_OFF.with(|o| o.set(&[]));
     (
@@ -17810,7 +17894,7 @@ fn the_reported_covariance_step_reproduces_the_inline_one() {
             &declines(),
             None,
             None,
-            &[],
+            &OuterScales::default(),
         )
     };
     let (inline, inline_outcome) = once(true);
@@ -17836,7 +17920,7 @@ fn the_reported_covariance_step_reproduces_the_inline_one() {
         &opts(true),
         &declines(),
         None,
-        &[],
+        &OuterScales::default(),
     );
     assert_eq!(
         covariance_steps_run_on(&pop) - before,
@@ -17887,6 +17971,10 @@ fn a_restarted_fit_runs_one_covariance_step() {
         run_covariance_step: true,
         verbose: false,
         threads: Some(1),
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..parsed.fit_options.clone()
     };
     // Diffed, not read absolute: an earlier test's population may have had this address.
@@ -18318,7 +18406,7 @@ mod start_warm_rescore {
             &opts,
             &OuterFdDeclineLog::new(n_subj),
             None,
-            &[],
+            &OuterScales::default(),
         );
         (
             r.start_eval.expect("the unprofiled loop records its start"),
@@ -18450,7 +18538,7 @@ mod guard_stop {
                     &opts,
                     &OuterFdDeclineLog::new(population.subjects.len()),
                     None,
-                    &[],
+                    &OuterScales::default(),
                 )
             });
             let stops = GUARD_STOPS.with(std::cell::Cell::get);
@@ -18625,7 +18713,7 @@ mod guard_stop {
                     &opts,
                     &OuterFdDeclineLog::new(prep.population.subjects.len()),
                     None,
-                    &[],
+                    &OuterScales::default(),
                 );
                 let stops = GUARD_STOPS.with(std::cell::Cell::get);
                 GUARD_STOP_DISABLED.with(|c| c.set(false));
@@ -18778,7 +18866,7 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
             &OuterFdDeclineLog::new(pop.subjects.len()),
             None,
             None,
-            &[],
+            &OuterScales::default(),
         );
         EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
         UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
@@ -18944,6 +19032,92 @@ fn the_newton_step_is_formed_for_agq_and_mixture_models_and_withheld_under_fd() 
             step_for(&fd, o).is_none(),
             "{label}: gradient = fd forms no Newton step"
         );
+    }
+}
+
+// ── curvature_scales: one scale per packed coordinate from the curvature (#2975) ──────
+
+fn unit_bounds(n: usize) -> PackedBounds {
+    PackedBounds {
+        lower: vec![-100.0; n],
+        upper: vec![100.0; n],
+    }
+}
+
+/// `1/√|H|` on every axis with a usable curvature, positive or negative; the median of
+/// those for a zero or non-finite one; 1 for a held axis; capped at half the bound range.
+#[test]
+fn curvature_scales_rule() {
+    let h = [
+        Some(4.0),      // 0.5
+        Some(-100.0),   // 0.1: a concave axis takes its magnitude
+        Some(1e4),      // 0.01
+        Some(0.0),      // no curvature: the median of the usable {0.5, 0.1, 0.01, 1000} = 0.5
+        Some(f64::NAN), // the same
+        None,           // held: 1
+        Some(1e-6),     // 1000, capped at half the range below
+    ];
+    let mut bounds = unit_bounds(h.len());
+    bounds.lower[6] = -2.0;
+    bounds.upper[6] = 2.0;
+    let got = curvature_scales(&h, &bounds).expect("usable curvatures");
+    let want = [0.5, 0.1, 0.01, 0.5, 0.5, 1.0, 2.0];
+    for (a, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= 1e-12 * w, "axis {a}: {g} vs {w}");
+    }
+    assert_eq!(curvature_scales(&[None, Some(0.0)], &unit_bounds(2)), None);
+}
+
+/// A tenth of the coordinate's own size (0.1 on a log axis, 0.1·|θ₀| on an identity θ),
+/// shrunk to stay inside the box, refused when the box leaves under a tenth of that.
+#[test]
+fn fd_curvature_step_sizes() {
+    assert_eq!(fd_curvature_step(1.6, false, -10.0, 10.0), Some(0.1));
+    assert_eq!(fd_curvature_step(-3.0, false, -10.0, 10.0), Some(0.1));
+    let s = fd_curvature_step(0.004, true, -1.0, 1.0).unwrap();
+    assert!((s - 4e-4).abs() < 1e-15);
+    assert_eq!(fd_curvature_step(0.0, true, -1.0, 1.0), Some(0.1));
+    let near = fd_curvature_step(1.0, false, 0.95, 10.0).unwrap();
+    assert!((near - 0.045).abs() < 1e-12, "{near}");
+    assert_eq!(fd_curvature_step(1.0, false, 0.995, 10.0), None);
+}
+
+/// The pre-flight forms the curvature scales from either derivative source with one rule:
+/// the exact R-matrix diagonal, or the central second difference that stands in for it
+/// (`analytic_cov_hessian = false`). On warfarin the two agree within 3% on every axis.
+#[test]
+fn curvature_scales_agree_between_exact_and_finite_differences() {
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    let model = parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin parses");
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("data loads");
+    let scales = |analytic: bool| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::NloptLbfgs,
+            analytic_cov_hessian: analytic,
+            threads: Some(1),
+            ..FitOptions::default()
+        };
+        freeze_flat_thetas(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            true,
+            true,
+        )
+        .curvature_scales
+        .expect("curvature scales formed")
+    };
+    let (exact, fd) = (scales(true), scales(false));
+    assert_eq!(exact.len(), fd.len());
+    for (a, (e, f)) in exact.iter().zip(&fd).enumerate() {
+        assert!((e - f).abs() <= 0.03 * e, "axis {a}: exact {e:e}, fd {f:e}");
     }
 }
 

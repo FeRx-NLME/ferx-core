@@ -37,7 +37,7 @@ The default `optimizer = auto` picks the algorithm per model (see [`auto`](#the-
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `auto` | Per-model selection | **Default.** Resolves to `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or the model is a mixture. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
+| `auto` | Per-model selection | **Default.** Resolves to `trust_region` when the exact analytic FOCE/FOCEI gradient is available, and `bobyqa` when only finite differences are or the model is a mixture. The fit output records the resolved pick as `auto (<resolved>)`. See [The `auto` default](#the-auto-default). |
 
 ### NLopt algorithms
 
@@ -67,93 +67,90 @@ aliases for `nlopt_lbfgs`. The built-in implementation is slated for removal.
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ dᵢdᵢᵀ` built from the same per-subject total derivatives `dᵢ` the gradient sums (always positive semi-definite; [#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. Stops when it can no longer make progress — see [convergence reporting](#trust-region-convergence-reporting). |
+| `trust_region` | Trust-region quasi-Newton on exact second-order information (a modified PORT / `nlminb`) | Exact gradient every iteration; a BFGS model seeded with, refreshed from, and certified on the exact Hessian (the covariance step's R-matrix). About 0.4× the iterations of L-BFGS. See [below](#trust-region-method). |
 
-### Trust-region convergence reporting {#trust-region-convergence-reporting}
+### How `trust_region` works {#trust-region-method}
 
-`trust_region` stops once it has gone 20 consecutive iterations without
-measurable progress — no objective improvement beyond `outer_ftol` and no
-parameter movement beyond `outer_xtol` (default `1e-4`, relative). `outer_ftol`
-is resolved exactly as it is for `bobyqa`: `1e-8` for a pure non-Gaussian
-(TTE / categorical) non-ODE objective and `1e-6` otherwise, with an explicit
-`[fit_options] outer_ftol` always winning. A run that instead exhausts `maxiter`
-is reported as **`Converged: NO`**, with a warning naming the budget it ran out
-of and the gradient norm it stopped at.
+It is the model/trust-region method of the PORT library behind R's `nlminb` (Dennis, Gay &
+Welsch 1981; Gay 1983) with exact second-order information where PORT has none (#2975):
 
-Because progress is an *or* — the objective improved **or** the parameters moved
-— and a rejected trust-region step moves neither, 20 no-progress iterations means
-20 consecutive *rejections*: the radius has shrunk by roughly `0.25²⁰ ≈ 1e-12`
-from the last accepted step. That is the real content of the count, and it is why
-it does not need tuning per model.
+1. **Model.** $m(s) = f + g^\top s + \tfrac12 s^\top B s$, with $g$ the exact gradient at the
+   current EBEs (and κ̂ under IOV). $B$ starts as the exact Hessian made saddle-free, $|H|$
+   (absolute eigenvalues), and is updated by Powell-damped BFGS from the change in $g$ along each
+   step. A positive-definite start matters: an indefinite one skips every update along its
+   negative directions, and the fit crawls.
+2. **Exact refresh.** $B$ is replaced by a fresh exact $|H|$ when a step was predicted poorly
+   (actual-to-predicted ratio below ¼) and when the set of coordinates held at a bound changes,
+   since the secant curvature was learned in the old subspace. A model that is already exact at
+   the current point is kept, and only the radius shrinks.
+3. **Step.** Coordinates on a bound with the gradient pushing outward are held. The subproblem
+   $\min_s g^\top s + \tfrac12 s^\top B s$, $\lVert D s\rVert \le \Delta$, is solved exactly on
+   $B$'s eigenbasis, with $D = \sqrt{\operatorname{diag} B}$ at its running maximum (Moré's
+   scaling, as in PORT). The step is projected onto the box and accepted when the objective falls.
+4. **Stop.** When the model's Newton decrement $\tfrac12 g^\top B^{-1} g$ falls to $10^{-6}$, a
+   fresh exact Hessian certifies it: the fit stops only on the exact decrement. On a model whose
+   objective cannot be evaluated that precisely (ODE or SDE integration, the inner solve), the
+   radius collapses first. The trust region then measures the noise: once a rejected step is
+   tiny, its gap between actual and predicted change is the evaluation noise (the model's own
+   error is third order in the step). An exact decrement no larger than that noise is converged,
+   since no step could resolve the gain. A larger one means the gradient disagrees with the
+   objective the inner loop scores (EBEs not tight enough for it), and one verification leg runs
+   at `inner_tol = 1e-10` on the rules [`nlopt_lbfgs`'s stop](#gradient-stop-verification) uses.
+5. **Basin shift.** A converged leg re-solves the EBEs cold. If that scores more than 0.05 below
+   the objective it minimised, some subjects sat in a higher individual mode, and the trust
+   region resumes from the same point with the cold EBEs: the rules `nlopt_lbfgs` uses (#1565).
 
-Two consequences worth knowing:
+Where the exact Hessian is out of scope, or not resolved at the start, the same rule runs on the
+finite-difference Hessian of the same objective, with the exact gradient of each subject's total
+derivative ([#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)) or, under IOV or a
+quadrature objective, the reconverged central difference. IOV models and the quadrature
+objectives (`laplace`, `focei` with `n_agq > 1`) are supported: the exact derivatives are those
+of the objective the fit scores.
 
-- Demonstrating settling costs at least 21 outer iterations, so a fit run with
-  `maxiter` below that can never report `Converged: YES` however good it is. The
-  warning says so explicitly rather than blaming the fit.
-- A run that rejects *every* step from the first iteration has not converged, it
-  failed to start. That is reported as its own non-convergence reason — pointing
-  at the starting values, not the budget — and the fit bails out there instead of
-  spending the rest of `maxiter` on a frozen state.
+The rest follows the other outer optimizers:
 
-Before [#1000](https://github.com/FeRx-NLME/ferx-core/issues/1000) every
-`trust_region` run reported `Converged: YES`, including one that had simply run
-out of iterations: the underlying solver has no convergence criterion of its own,
-so hitting `maxiter` was its only way to stop. On `examples/one_cpt_iv_pooled.ferx`
-with `data/one_cpt_iv.csv`:
+- A trial point the EBE convergence guard rejects (`max_unconverged_frac`) is refused like a
+  failed step. A start with no feasible objective stops there, not converged, with
+  `W_NO_FEASIBLE_EVAL` ([#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617)).
+- Checkpoints are written as for every outer optimizer.
+- The first radius is the length of the exact model's Newton step, so a tightly curved
+  coordinate far from its optimum (a strong prior, say) is not walked there in doublings.
+- `maxiter` counts trust-region iterations. NLopt's budget is `maxiter × (n + 1)` evaluations,
+  so a short fit set by `maxiter` stops at a different place under each.
+- `steihaug_max_iters` has no effect.
 
-| `maxiter` | OFV | reported (before) | reported (now) |
-|---|---|---|---|
-| 5 | 11325.8283 | `Converged: YES` | `Converged: NO` (budget below the 21-iteration floor) |
-| 300 | 8504.4349 | `Converged: YES` | `Converged: NO` |
-| 2000 | −269.6370 | `Converged: YES` | `Converged: YES` (at iteration 1920) |
+Measured (#2975; FOCEI, 26 bundled and synthetic models) against `nlopt_lbfgs` with
+[curvature scaling](parameterization.qmd#outer-curvature-scaling):
 
-The true optimum is −269.6370 (NONMEM `$OMEGA 0 FIX` anchors it at −269.63700440),
-so the first two rows were 8 000–11 000 OFV units off and reported as converged,
-with standard errors computed at a non-stationary point.
+- **Iterations:** 0.38× L-BFGS before #2975, typically, and fewer on every model. About five
+  exact Hessians per fit.
+- **Robustness:** no fit above the best OFV on 130 runs from perturbed starts, nor on 104 from
+  starts off by 2× in θ or 10× in Ω and σ. `nlopt_lbfgs` ended 3 of those 104 at a worse point
+  it reported as converged.
+- **Cost:** it is limited by the exact Hessian. With the structured exact Hessian of #2980 it
+  took 13% fewer CPU cycles than `nlopt_lbfgs` over the 26 models, and fewer on every large one.
+  Without it, an ODE model's Hessian costs about 16 evaluations, and `trust_region` took 1.7×
+  the cycles of `nlopt_lbfgs` on `transit_2cpt`.
 
-The stopping rule is deliberately **not** a gradient test. The outer gradient is
-evaluated at EBEs held fixed within the iteration, which makes its norm an
-unreliable stationarity measure on an ODE model: on `one_cpt_iv_ode` the norm at
-the optimum the default optimizer reaches (OFV −387.0737) is 43.2, while a
-*worse* point 0.73 OFV units away carries 4.0 — not monotone in solution quality,
-so no threshold separates the two. Objective and step size are the noise-robust
-measures, and they are what `bobyqa` already stops on.
-
-Stopping early also saves work: the warfarin fit settles at iteration 59 and now
-returns there rather than grinding out the remaining budget.
-
-Note that "converged" still means *this optimizer stopped making progress*, not
-that the point is a verified global optimum — a `trust_region` fit can settle
-slightly above the optimum other optimizers reach
-([#864](https://github.com/FeRx-NLME/ferx-core/issues/864)). Compare against a
-second optimizer when the OFV matters.
-
-One more thing changes for multi-start users: `n_starts` ranks candidates by
-validity, then by *converged*, then by OFV. Every `trust_region` start used to
-report `Converged: YES`, so that middle key was inert and selection came down to
-OFV. Now that budget exhaustion reports honestly, a start that settled can be
-preferred over one that was still descending when it ran out of iterations, even
-if the latter reached a lower OFV. Give `trust_region` multi-starts a `maxiter`
-generous enough that the good start is allowed to settle.
-
----
+A run that spends `maxiter`, or whose radius collapses before the exact decrement falls to the
+tolerance, is reported as **`Converged: NO`**, with a warning naming the reason and the final
+gradient norm.
 
 ## When to use which
 
-**`auto` (default)** — leave this in place for most fits. It inspects the model and picks `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is available and `bobyqa` when only finite differences are — the two choices that came out fastest-and-most-reliable in the #490 benchmarking (see [The `auto` default](#the-auto-default)). Override it only when you have a model-specific reason to pin a particular optimizer.
+**`auto` (default)** — leave this in place for most fits. It inspects the model and picks `trust_region` when the exact analytic FOCE/FOCEI gradient is available and `bobyqa` when only finite differences are — the choices that came out most reliable and fastest in the #2975 and #490 benchmarking (see [The `auto` default](#the-auto-default)). Override it only when you have a model-specific reason to pin a particular optimizer.
 
 **`bobyqa`** — what `auto` selects on FD-only problems, and a fine explicit choice there. Derivative-free quadratic trust-region; re-evaluates EBEs at every trial point so it avoids the fixed-EBE gradient bias that stalls gradient-based optimizers on ill-conditioned fits. On the cefepime 2-cpt benchmark below it reaches a lower OFV than `slsqp` (even reconverged at full cost) in less wall time. Works equally well on smooth analytical PK models — converges more slowly than gradient methods per iteration but each iteration is cheap (no FD gradient sweep).
 
 **`slsqp`** — switch to this when `bobyqa` is too slow on a smooth, well-conditioned model with many parameters (it can need many quadratic-interpolation samples to triangulate a high-dimensional surface). Gradient-based, handles box constraints cleanly; pair with `reconverge_gradient_interval = 1` if it stalls above an expected OFV.
 
-**`trust_region`** — for models with many parameters (large θ + Ω) or when combined with `inits_from_nca`. The second-order curvature information helps when starting values are already in the basin.
+**`trust_region`** — the most robust choice when starts may be far off, and the fastest on large models once the exact Hessian is cheap (#2980). It needs the exact Hessian's scope (closed-form, compartment-free and `[odes]` models, FOCE / FOCEI, IOV included).
 
 **`gn` / `gn_hybrid`** — these are [Gauss-Newton estimation methods](gauss-newton.qmd), not outer optimizers in the same sense. They replace the FOCE outer loop entirely rather than selecting an algorithm within it. (`gn_hybrid` polishes via FOCEI and inherits the `optimizer` setting for that stage — so the polish runs with the `auto`-selected optimizer unless overridden.)
 
 **`lbfgs` / `nlopt_lbfgs`** — strong choices wherever the exact analytic gradient applies: FOCE, FOCEI, Laplace and AGQ on closed-form, compartment-free and user-`[odes]` models, with or without IOV (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)). The gradient is exact and bias-free, so they reach the true optimum. Models outside that scope (the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) fall back to the finite-difference gradient and its fixed-EBE bias; prefer `bobyqa` for those. TTE, binary and CTMM endpoints are inside it: their outer gradient is the exact marginal one, EBE response included ([TTE: the outer gradient](tte.qmd#outer-gradient-reconverged)). **`mma`** is rarely needed.
 
-> **Why these two?** `bobyqa` doesn't use the gradient, so it never sees the fixed-EBE FD gradient bias that drives gradient-based optimizers to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data (the Emax PKPD benchmark in [`saem.md`](saem.qmd) and the cefepime validation below). On analytical PK models the gradient is exact and bias-free, and `nlopt_lbfgs` exploits it to reach the optimum faster than the derivative-free search. `auto` (default since #490) routes each model to the right one of the two automatically; before `auto` the standalone default was `bobyqa`, and before that `slsqp`.
+> **Why these two?** `bobyqa` doesn't use the gradient, so it never sees the fixed-EBE FD gradient bias that drives gradient-based optimizers to local minima hundreds of OFV units above the true optimum on ODE/PD models and sparse data (the Emax PKPD benchmark in [`saem.md`](saem.qmd) and the cefepime validation below). On analytical PK models the gradient is exact and bias-free, and `nlopt_lbfgs` exploits it to reach the optimum faster than the derivative-free search. `auto` (default since #490) routes each model to the right one of the two automatically; its exact-gradient pick was `nlopt_lbfgs` until #2975 made it `trust_region`. Before `auto` the standalone default was `bobyqa`, and before that `slsqp`.
 
 ---
 
@@ -161,17 +158,18 @@ generous enough that the good start is allowed to settle.
 
 `optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
 
-- **`nlopt_lbfgs`** — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`.
+- **`trust_region`** (since #2976; `nlopt_lbfgs` before) — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`, and the **exact Hessian** serves the fit (the covariance step's analytic R-matrix route). Where it does not (`analytic_cov_hessian = false`, or a subject outside its scope) every model the trust region builds would be a finite-difference Hessian, so `auto` takes **`nlopt_lbfgs`** there.
 - **`bobyqa`** — otherwise: a model the recorders cannot serve (a hand-built `CompiledModel` with no compiled individual-parameter program), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
 
-Two cases override that rule:
+Three cases override that rule:
 
 - **More than 64 free packed parameters** (`BOBYQA_MAX_DIM`) → `nlopt_lbfgs` even on a finite-difference gradient. BOBYQA's interpolation set grows quadratically with the parameter count, so above that size O(n) FD passes are cheaper (#1064).
 - **Mixture models** (`[mixture]`) → `bobyqa` regardless of gradient availability, as the robust choice against label-switching multimodality (#977).
+- **`method = laplace`** → `nlopt_lbfgs`, which `fit()` sets for a Laplace stage left on `auto` (#317).
 
-Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
+Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. On an exact gradient, `trust_region` reached the best OFV from every one of 9 starts on a 26-model benchmark (234 fits), where `nlopt_lbfgs` stopped above it three times while reporting convergence, and it took 0.41× L-BFGS's iterations and the fewest CPU cycles (#2975; see [How `trust_region` works](#trust-region-method)). Earlier, limited benchmarking across ~10 real FOCEI datasets (#490) had found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
 
-For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a mixture model — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit `bobyqa` or NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured, with no warning. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (trust_region)`, or `auto (bobyqa)` for a mixture model — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit `bobyqa` or NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured, with no warning. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
 ### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
 
@@ -445,7 +443,7 @@ a clean stationary point. If the OFV matters, compare against a second optimizer
 
 ### An L-BFGS / SLSQP stop is verified at a tight inner tolerance {#gradient-stop-verification}
 
-A FOCE / FOCEI fit with `nlopt_lbfgs` or `slsqp` (including `optimizer = auto` when it picks L-BFGS)
+A FOCE / FOCEI fit with `nlopt_lbfgs` or `slsqp` 
 has stopping rules it cannot reach. It stops when its line search can no longer find a lower
 objective, and the plateau check then decides whether that stop is converged. At the default
 `inner_tol = 1e-5`, though, the EBE re-solve noise can hide the remaining descent on an

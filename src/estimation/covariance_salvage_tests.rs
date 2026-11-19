@@ -1146,8 +1146,8 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
         for interaction in [true, false] {
             assert_eq!(
                 Optimizer::Auto.resolve_auto(&m),
-                Optimizer::NloptLbfgs,
-                "{axes} axes, interaction = {interaction}: `auto` must take L-BFGS"
+                Optimizer::TrustRegion,
+                "{axes} axes, interaction = {interaction}: `auto` must take the trust region"
             );
         }
         assert_eq!(

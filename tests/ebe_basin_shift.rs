@@ -73,6 +73,11 @@
 //! same commit. Linux stays the reference for the bands; if a future re-pick is needed,
 //! intersect the trapping draws on both platforms rather than taking a Linux-only one.
 //!
+//! **#2976: the trap tests pin `optimizer = nlopt_lbfgs`.** The gate and the mid-leg probe they
+//! exercise are the NLopt leg's. Since #2976 `auto` resolves to `trust_region`, which on the
+//! #2441 subset does not trap at all: it goes straight to the optimum (63.2880).
+//! [`the_default_trust_region_reaches_the_optimum_on_the_trapping_subset`] pins that.
+//!
 //! The unit tests in `outer_optimizer_tests.rs` own the gate itself
 //! (`cold_solve_beats_best_seen`, the restart resolver's tie rule, the message); this
 //! file pins what a fit publishes.
@@ -107,6 +112,9 @@ fn fit_fixture(data: &str, outer_maxiter: Option<usize>) -> FitResult {
     let population = read_nonmem_csv(Path::new(data), None, None).expect("fixture data must load");
     let mut opts = parsed.fit_options.clone();
     opts.verbose = false;
+    // The NLopt leg's gate and probe are under test (see the module docs).
+    opts.optimizer = ferx_core::types::Optimizer::NloptLbfgs;
+    opts.parameter_scaling = ferx_core::types::ParameterScaling::Abs;
     if let Some(m) = outer_maxiter {
         opts.outer_maxiter = m;
     }
@@ -259,4 +267,46 @@ fn mm_benchmark_reaches_the_optimum() {
         result.ofv
     );
     assert!(result.converged);
+}
+
+/// The default optimizer on the same trapping subset and the same unpredicted warm start:
+/// `trust_region` (#2976) does not trap. It reaches the optimum the NLopt leg needs its
+/// restart for, and reports it converged with no start-dependence warning.
+#[test]
+fn the_default_trust_region_reaches_the_optimum_on_the_trapping_subset() {
+    let _env = PREDICTOR_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("FERX_EBE_PREDICTOR", "0");
+    let text = std::fs::read_to_string(MODEL).expect("fixture model must exist");
+    let parsed = parse_full_model(&text).expect("fixture model must parse");
+    let population = read_nonmem_csv(
+        Path::new("tests/fixtures/mm_basin_shift/mm_basin10.csv"),
+        None,
+        None,
+    )
+    .expect("fixture data must load");
+    let mut opts = parsed.fit_options.clone();
+    opts.verbose = false;
+    let result = fit(
+        &parsed.model,
+        &population,
+        &parsed.model.default_params,
+        &opts,
+    )
+    .expect("the fixture fit returns a result");
+    std::env::remove_var("FERX_EBE_PREDICTOR");
+    assert_eq!(result.optimizer, "auto (trust_region)");
+    assert!(
+        result.ofv < 63.4,
+        "the optimum is 63.2880; the NLopt leg's trapped cold objective is 68.083. Got {}",
+        result.ofv
+    );
+    assert!(result.converged, "warnings: {:?}", result.warnings);
+    assert!(
+        !result
+            .warnings_structured
+            .iter()
+            .any(|w| w.category == WarningCode::EbeStartDependent),
+        "no start-dependence warning: {:?}",
+        result.warnings
+    );
 }

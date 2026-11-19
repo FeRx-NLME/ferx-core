@@ -4350,8 +4350,13 @@ pub(crate) fn compute_cwres_cov(
         live.iter().map(|&j| subject.observations[j] - f0[j]),
     );
     let sub = r_tilde.select_rows(&live).select_columns(&live);
-    let eig = nalgebra::SymmetricEigen::new(sub);
-    if eig.eigenvalues.iter().all(|&l| l > 0.0 && l.is_finite()) {
+    // A diagonal `R̃` (no η, independent residuals) has `V = I`, where all three
+    // decorrelations coincide: the marginal standardisation below is that value exactly, and
+    // the eigen solver's would be the same value rounded through `V·Λ^{-1/2}·Vᵀ`, an ULP off
+    // the IWRES it equals (#2976: CWRES ≠ IWRES by 1 ULP on a zero-η fit).
+    let diagonal = (0..sub.nrows()).all(|i| (0..sub.ncols()).all(|k| i == k || sub[(i, k)] == 0.0));
+    let eig = (!diagonal).then(|| nalgebra::SymmetricEigen::new(sub));
+    if let Some(eig) = eig.filter(|e| e.eigenvalues.iter().all(|&l| l > 0.0 && l.is_finite())) {
         let vt_r = eig.eigenvectors.transpose() * &resid;
         let scaled = DVector::from_iterator(
             live.len(),

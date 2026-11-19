@@ -45,6 +45,12 @@ fn example(model: &str, data: &str) -> (CompiledModel, Population) {
 fn opts(method: EstimationMethod) -> FitOptions {
     FitOptions {
         method,
+        // The routes are compared after a short fit, measured on NLopt's evaluation budget
+        // (`auto` is `trust_region` since #2976, whose own FD fallback is pinned in
+        // `gauss_newton_and_trust_region_fall_back_to_fd`).
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         outer_maxiter: 3,
         threads: Some(1),
         verbose: false,
@@ -191,13 +197,28 @@ fn gauss_newton_and_trust_region_fall_back_to_fd() {
     let (e, f) = pair(&m, &p, &opts(EstimationMethod::FoceGn));
     // Measured 2.2e-6 / 1.1e-8 / 2.7e-4.
     check("gn", &e, &f, [2e-5, 1e-6, 2e-3]);
+    // To convergence: both routes must reach the same optimum. A short fit measures the path
+    // instead (#2976): from this start the first step overshoots and is refused on both
+    // routes, so one iteration compares the start with itself, and the next, a step on the
+    // boundary of the trust region, goes a measurably different way on the exact and the FD
+    // Hessian (|ΔOFV| = 0.44 after two or three iterations).
     let o = FitOptions {
         optimizer: Optimizer::TrustRegion,
+        outer_maxiter: 200,
         ..opts(EstimationMethod::FoceI)
     };
     let (e, f) = pair(&m, &p, &o);
-    // Measured 1.8e-5 / 3.7e-7 / 4.0e-4.
-    check("trust-region", &e, &f, [2e-4, 4e-6, 3e-3]);
+    assert!(
+        e.converged && f.converged,
+        "both routes converge: {:?} / {:?}",
+        e.warnings,
+        f.warnings
+    );
+    // Measured 1.5e-8 / 7.9e-6 / 2.6e-6 (#2976, Linux x86_64). The trust region models with
+    // the exact Hessian; with every plan failing it models with the finite-difference Hessian
+    // of the same objective (`fd_candidate_hessian`), one rule at two precisions, and both
+    // stop on the exact-or-FD decrement at one optimum. Bounds ~10–60× the measurement.
+    check("trust-region", &e, &f, [1e-6, 1e-4, 1e-4]);
 }
 
 #[test]
@@ -849,8 +870,12 @@ fn an_ode_expression_scale_on_an_individual_parameter_plans_without_fallback() {
     let model = TWO_CPT_AMOUNTS;
     let data = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT\n1,0,1,1,.,100,100,1\n1,0.5,0,0,4.2931,0,0,1\n1,1.0,0,0,4.2024,0,0,1\n1,2.0,0,0,3.2577,0,0,1\n1,4.0,0,0,2.9236,0,0,1\n1,8.0,0,0,1.9541,0,0,1\n1,24.0,0,0,0.5111,0,0,1\n2,0,1,1,.,100,100,1\n2,0.5,0,0,3.9917,0,0,1\n2,1.0,0,0,3.9186,0,0,1\n2,2.0,0,0,3.6982,0,0,1\n2,4.0,0,0,2.7256,0,0,1\n2,8.0,0,0,1.8316,0,0,1\n2,24.0,0,0,0.5425,0,0,1\n3,0,1,1,.,100,100,1\n3,0.5,0,0,3.6904,0,0,1\n3,1.0,0,0,3.6348,0,0,1\n3,2.0,0,0,3.4465,0,0,1\n3,4.0,0,0,2.5276,0,0,1\n3,8.0,0,0,1.7090,0,0,1\n3,24.0,0,0,0.5245,0,0,1\n4,0,1,1,.,100,100,1\n4,0.5,0,0,4.2177,0,0,1\n4,1.0,0,0,4.1315,0,0,1\n4,2.0,0,0,3.1948,0,0,1\n4,4.0,0,0,2.8741,0,0,1\n4,8.0,0,0,1.9235,0,0,1\n4,24.0,0,0,0.5066,0,0,1\n5,0,1,1,.,100,100,1\n5,0.5,0,0,3.9164,0,0,1\n5,1.0,0,0,3.8477,0,0,1\n5,2.0,0,0,3.6353,0,0,1\n5,4.0,0,0,2.6761,0,0,1\n5,8.0,0,0,1.8009,0,0,1\n5,24.0,0,0,0.5380,0,0,1\n6,0,1,1,.,100,100,1\n6,0.5,0,0,4.4438,0,0,1\n6,1.0,0,0,3.5639,0,0,1\n6,2.0,0,0,3.3836,0,0,1\n6,4.0,0,0,3.0226,0,0,1\n6,8.0,0,0,1.6784,0,0,1\n6,24.0,0,0,0.5200,0,0,1";
     let (m, p) = from_text(model, data);
+    // 40, not 25 (#2975): both Ω collapse onto their floor here and θ end on their bounds, a
+    // crawl the curvature-scaled L-BFGS takes ~230 evaluations over (Linux x86_64) against the
+    // magnitude rules' ~80 — over the 25 × 8 = 200 the old budget allowed. The test is about
+    // the plan, not the optimizer's speed; 40 × 8 = 320 leaves ~40% headroom.
     let o = FitOptions {
-        outer_maxiter: 25,
+        outer_maxiter: 40,
         ..opts(EstimationMethod::FoceI)
     };
     let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");

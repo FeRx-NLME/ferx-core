@@ -316,14 +316,14 @@ fn sim_residual_variance_applies_custom_magnitude() {
 }
 
 #[test]
-fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
+fn resolve_auto_picks_trust_region_when_analytic() {
     // Analytical PK model with `gradient = auto` → exact FOCE gradient is
-    // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
+    // available, so `auto` resolves to the trust region (#2975).
     let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
     assert_eq!(
         Optimizer::Auto.resolve_auto(&m),
-        Optimizer::NloptLbfgs,
-        "analytic-gradient model should resolve auto → nlopt_lbfgs"
+        Optimizer::TrustRegion,
+        "analytic-gradient model should resolve auto → trust_region"
     );
 }
 
@@ -354,12 +354,12 @@ fn resolve_auto_analytic_for_custom_magnitude_both_loops() {
     assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
     assert_eq!(
         Optimizer::Auto.resolve_auto(&m),
-        Optimizer::NloptLbfgs,
+        Optimizer::TrustRegion,
         "FOCE + custom magnitude now has the analytic gradient"
     );
     assert_eq!(
         Optimizer::Auto.resolve_auto(&m),
-        Optimizer::NloptLbfgs,
+        Optimizer::TrustRegion,
         "FOCEI + custom magnitude has the analytic gradient"
     );
 }
@@ -3585,7 +3585,7 @@ mod theta_block_scale_guards {
         // resolves to the gradient-based optimizer exactly as it would without
         // the block.
         let model = wide_model(4);
-        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::TrustRegion);
     }
 
     #[test]
@@ -4497,7 +4497,7 @@ mod kappa_correlation_auto_route {
         for m in [&on, &kappa_only, &corr_only] {
             assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
             assert!(analytic_outer_gradient_in_scope(m));
-            assert_eq!(Optimizer::Auto.resolve_auto(m), Optimizer::NloptLbfgs);
+            assert_eq!(Optimizer::Auto.resolve_auto(m), Optimizer::TrustRegion);
             assert_eq!(
                 Optimizer::Auto.resolve_auto_given_analytic(m, false),
                 Optimizer::Bobyqa
@@ -4509,10 +4509,22 @@ mod kappa_correlation_auto_route {
                 Optimizer::Auto,
                 &on,
                 false,
-                analytic_outer_gradient_in_scope(&on)
+                analytic_outer_gradient_in_scope(&on),
+                true,
             )
             .0,
+            Optimizer::TrustRegion
+        );
+        // #2976: on an exact gradient without the exact Hessian, the trust region's every
+        // model would be a finite-difference Hessian, so `auto` takes L-BFGS there; an explicit
+        // `trust_region` is honoured either way.
+        assert_eq!(
+            resolve_outer_optimizer(Optimizer::Auto, &on, false, true, false).0,
             Optimizer::NloptLbfgs
+        );
+        assert_eq!(
+            resolve_outer_optimizer(Optimizer::TrustRegion, &on, false, true, false).0,
+            Optimizer::TrustRegion
         );
     }
 

@@ -3526,6 +3526,10 @@ mod regularizer_fit_tests {
         let mut o = options.clone();
         o.nn_l2_lambda = 0.0;
         o.outer_maxiter = 1;
+        // L-BFGS's first line search and its restart are under test, on NLopt's
+        // `maxiter × (n + 1)` evaluation budget (`auto` is `trust_region` since #2976).
+        o.optimizer = crate::types::Optimizer::NloptLbfgs;
+        o.parameter_scaling = crate::types::ParameterScaling::Abs;
         let fit = crate::fit(&model, &population, &model.default_params, &o)
             .unwrap_or_else(|e| panic!("fit failed: {e}"));
         // Abort point measured at 7974.86 (best-seen) / 7901.99 (reported) on

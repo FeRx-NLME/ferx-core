@@ -173,6 +173,11 @@ const STARVED: usize = 0;
 fn opts(inner_maxiter: usize) -> FitOptions {
     FitOptions {
         method: EstimationMethod::FoceI,
+        // The NLopt leg's restore, budget and checkpoints are under test here; `auto` is
+        // `trust_region` since #2976 (its #1617 verdict is pinned at the end of this file).
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         outer_maxiter: 200,
         inner_maxiter,
         run_covariance_step: false,
@@ -893,6 +898,10 @@ fn seed_checkpoint(path: &str, model: &CompiledModel, packed: Vec<f64>, ofv: f64
 /// The `FitOptions` that make `fit()` resume from `path`.
 fn resuming_opts(path: &str, inner_maxiter: usize) -> FitOptions {
     FitOptions {
+        // `auto` is `trust_region` since #2976; this pins the NLopt path it was measured on.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         checkpoint: true,
         checkpoint_path: Some(path.to_string()),
         checkpoint_model_hash: Some("mh".to_string()),
@@ -1296,6 +1305,45 @@ fn the_token_classifies_critical_convergence() {
          being load-bearing — which is fine, but then this test is asserting nothing: {msg}"
     );
     let entry = crate::types::classify_warning(&msg);
+    assert_eq!(entry.severity, WarningSeverity::Critical, "{entry:?}");
+    assert_eq!(entry.category, WarningCode::Convergence, "{entry:?}");
+}
+
+/// #1617 on the default optimizer: `trust_region` (#2976) starts on an infeasible objective
+/// here — the starved inner loop leaves every subject unconverged, so the EBE guard rejects
+/// the start — and has nothing to model or improve on. It must stop at the declared initial
+/// estimates, not converged, publish the unconverged count, and carry the same typed
+/// `W_NO_FEASIBLE_EVAL` verdict the NLopt leg does.
+///
+/// Mutation (run): drop the `no_feasible_eval_warning` call in `optimize_trust_region_seeded`
+/// → the warning assertion fires; drop the guard in the trust region's `eval` → the start is
+/// scored as an objective, the fit moves and the initials assertion fires.
+#[test]
+fn the_trust_region_reports_an_infeasible_start_as_no_feasible_evaluation() {
+    let model = starvable_model();
+    let pop = two_subjects();
+    let options = FitOptions {
+        optimizer: Optimizer::TrustRegion,
+        ..opts(STARVED)
+    };
+    let result = fit(&model, &pop, &model.default_params, &options).expect("fit");
+    assert!(
+        result.max_unconverged_subjects > 0,
+        "the fixture must starve the inner loop"
+    );
+    assert!(!result.converged, "no feasible objective: not converged");
+    for (i, init) in [2.0_f64, 10.0].iter().enumerate() {
+        assert!(
+            (result.theta[i] - init).abs() <= 1e-12 * init,
+            "theta[{i}] = {} where {init} was declared",
+            result.theta[i],
+        );
+    }
+    let entry = result
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.contains(NO_FEASIBLE_EVAL_TOKEN))
+        .unwrap_or_else(|| panic!("W_NO_FEASIBLE_EVAL expected: {:?}", result.warnings));
     assert_eq!(entry.severity, WarningSeverity::Critical, "{entry:?}");
     assert_eq!(entry.category, WarningCode::Convergence, "{entry:?}");
 }

@@ -5,7 +5,7 @@
 //! while the outer loop dispatches on
 //! `estimation::outer_optimizer::resolve_outer_optimizer`, which sends every mixture
 //! model left on `auto` to BOBYQA. A mixture model in analytic scope therefore ran
-//! BOBYQA and reported `auto (nlopt_lbfgs)`.
+//! BOBYQA and reported `auto (trust_region)`.
 //!
 //! Every test here is a pair straddling the mixture gate on one analytic-scope model,
 //! and asserts the analytic scope itself: without it the non-mixture arm also resolves
@@ -66,7 +66,7 @@ fn parse(src: &str) -> CompiledModel {
 }
 
 /// The premise both tests rest on: the model is in analytic outer-gradient scope,
-/// so `Optimizer::resolve_auto` alone picks the gradient-based L-BFGS. If this ever
+/// so `Optimizer::resolve_auto` alone picks the gradient-based trust region. If this ever
 /// stops holding, the mixture assertions below turn tautological.
 fn assert_analytic_scope(model: &CompiledModel) {
     assert!(
@@ -75,8 +75,8 @@ fn assert_analytic_scope(model: &CompiledModel) {
     );
     assert_eq!(
         Optimizer::Auto.resolve_auto(model),
-        Optimizer::NloptLbfgs,
-        "the mixture-blind resolver must pick L-BFGS here, or the pair does not straddle"
+        Optimizer::TrustRegion,
+        "the mixture-blind resolver must pick the trust region here, or the pair does not straddle"
     );
 }
 
@@ -84,7 +84,7 @@ fn assert_analytic_scope(model: &CompiledModel) {
 ///
 /// Mutation that must redden this: building the label from
 /// `options.optimizer.resolve_auto(model)` again (the pre-#1540
-/// code) — the mixture arm then reads `auto (nlopt_lbfgs)`.
+/// code) — the mixture arm then reads `auto (trust_region)`.
 #[test]
 fn auto_label_follows_the_mixture_downgrade() {
     let model = parse(MIXTURE);
@@ -107,8 +107,8 @@ fn auto_label_follows_the_mixture_downgrade() {
         );
         assert_eq!(
             reported_optimizer_label(method, &opts, &model, false),
-            "auto (nlopt_lbfgs)",
-            "{method:?}: the same model with the mixture gate off resolves to L-BFGS"
+            "auto (trust_region)",
+            "{method:?}: the same model with the mixture gate off resolves to the trust region"
         );
     }
 }
@@ -230,7 +230,7 @@ fn fit_reports_auto_bobyqa_for_a_mixture_model() {
     };
     for (src, want) in [
         (MIXTURE, "auto (bobyqa)"),
-        (NO_MIXTURE, "auto (nlopt_lbfgs)"),
+        (NO_MIXTURE, "auto (trust_region)"),
     ] {
         let model = parse(src);
         assert_analytic_scope(&model);

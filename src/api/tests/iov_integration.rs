@@ -589,20 +589,21 @@ fn test_iov_imp_chain_runs_importance_sampling() {
 // trust_region.rs currently passes `&[]` for kappas to pop_nll, which would
 // silently route the OFV through the non-IOV path. Guard at api.rs blocks
 // that before any wrong number escapes.
+// Since #2975 the trust region carries κ̂ through its objective, its exact Hessian (the
+// joint [η, κ] modes) and the final EBE check, so an IOV fit runs — and its OFV is the IOV
+// objective: the same parameters scored by `pop_nll` with the κ̂ it returns.
 #[test]
-fn test_iov_trust_region_returns_err() {
+fn test_iov_trust_region_fits_the_iov_objective() {
     let model = make_iov_model();
     let pop = make_iov_population();
-    let opts = fast_opts(EstimationMethod::Foce, Optimizer::TrustRegion, false);
-    let result = fit(&model, &pop, &model.default_params, &opts);
+    let mut opts = fast_opts(EstimationMethod::FoceI, Optimizer::TrustRegion, false);
+    opts.outer_maxiter = 4;
+    let result = fit(&model, &pop, &model.default_params, &opts)
+        .expect("trust_region must fit an IOV model");
+    assert!(result.ofv.is_finite(), "OFV {}", result.ofv);
     assert!(
-        result.is_err(),
-        "trust_region with IOV must return an error"
-    );
-    let msg = result.unwrap_err().to_string();
-    assert!(
-        msg.contains("trust_region") && msg.contains("IOV"),
-        "error message should mention trust_region and IOV, got: {msg}"
+        result.ebe_kappas.iter().any(|k| !k.is_empty()),
+        "an IOV fit must report its κ̂"
     );
 }
 
@@ -1300,20 +1301,13 @@ fn test_derive_output_occasions_matches_rule() {
     assert!(pop0.subjects.iter().all(|s| s.occasions.is_empty()));
 }
 
-// `ferx check` must surface the same trust_region+IOV incompatibility that
-// `fit()` rejects — without it, a model could report `valid: true` and then
-// fail at fit time. `check_model_options` is the shared source of truth.
+// `ferx check` agrees with `fit()`: since #2975 trust_region accepts an IOV model, so
+// `check_model_options` raises nothing for it.
 #[test]
-fn test_check_model_options_flags_trust_region_iov() {
+fn test_check_model_options_accepts_trust_region_iov() {
     let model = make_iov_model();
     let opts = fast_opts(EstimationMethod::Foce, Optimizer::TrustRegion, false);
-    let diags = super::check_model_options(&model, &opts);
-    let d = diags
-        .iter()
-        .find(|d| d.code == "E_OPTIMIZER_IOV")
-        .expect("expected E_OPTIMIZER_IOV diagnostic");
-    // Same wording fit() produces (regression against the extracted guard).
-    assert!(d.message.contains("trust_region") && d.message.contains("IOV"));
+    assert!(super::check_model_options(&model, &opts).is_empty());
 
     // A compatible optimizer produces no compatibility diagnostics.
     let ok_opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);

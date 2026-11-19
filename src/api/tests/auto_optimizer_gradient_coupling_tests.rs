@@ -79,7 +79,7 @@ fn fd_on_an_analytic_model_warns_and_names_both_optimizers() {
         d.message
     );
     assert!(
-        d.message.contains("nlopt_lbfgs"),
+        d.message.contains("trust_region"),
         "must name what auto would have resolved to under gradient = auto: {}",
         d.message
     );
@@ -286,7 +286,7 @@ fn resolve_auto_is_unchanged_by_the_split() {
     for (model, expected) in [
         (
             analytical_model(GradientMethod::Auto),
-            Optimizer::NloptLbfgs,
+            Optimizer::TrustRegion,
         ),
         (analytical_model(GradientMethod::Fd), Optimizer::Bobyqa),
         (ode_model(GradientMethod::Auto), Optimizer::Bobyqa),
@@ -423,6 +423,7 @@ fn a_mixture_fit_is_silent_because_auto_is_bobyqa_either_way() {
         crate::estimation::outer_optimizer::resolve_outer_optimizer(
             Optimizer::Auto,
             &model,
+            true,
             true,
             true,
         )

@@ -1098,6 +1098,17 @@ pub(crate) fn analytic_r_expected(model: &CompiledModel, options: &FitOptions) -
     predicted_r_route(model, options) == PredictedRRoute::Analytic
 }
 
+/// [`analytic_r_expected`] with the gradient left at `auto`: every clause of the walk but
+/// `gradient = fd`'s. The counterfactual the `gradient = fd` ⇒ `optimizer = auto` coupling
+/// warning asks (#1381, #2976) — what would `auto` have picked with the gradient unforced —
+/// reads the exact Hessian through this, so it cannot disagree with the walk the real route
+/// takes.
+pub(crate) fn analytic_r_expected_unforced(model: &CompiledModel, options: &FitOptions) -> bool {
+    analytic_cov_model_declines(model, options)
+        .iter()
+        .all(|d| matches!(d, CovScopeDecline::GradientFd))
+}
+
 /// The clauses of [`analytic_cov_declines`] — every one that sends the whole population to
 /// the stencil, whatever the subjects look like. Empty when none fires.
 fn analytic_cov_model_declines(
@@ -1407,6 +1418,176 @@ pub(crate) fn exact_candidate_derivatives(
         }
     }
     Some(acc)
+}
+
+/// Why [`exact_candidate_hessian`] gave no Hessian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactDecline {
+    /// The exact derivatives do not cover the model or a subject (or the user turned them off
+    /// with `analytic_cov_hessian = false`): the finite-difference twin
+    /// ([`fd_candidate_hessian`]) is the same quantity at FD precision.
+    OutOfScope,
+    /// In scope, but not resolved at this point: a subject's EBE did not re-converge, a result
+    /// was non-finite, or the run was cancelled. A property of the point, not of the model.
+    NotResolved,
+}
+
+/// [`exact_candidate_derivatives`] with the dense curvature block: the exact gradient along
+/// `axes` and `∂²OFV/∂x_a∂x_b` for `a, b ∈ axes` (in `axes` order), both at the same tightly
+/// reconverged modes. What `optimizer = trust_region` models each iterate with (#2975).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exact_candidate_hessian(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Result<(Vec<f64>, DMatrix<f64>), ExactDecline> {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_block_at, subject_adjoint_gradient_at,
+    };
+    if !options.analytic_cov_hessian || warm.len() != population.subjects.len() {
+        return Err(ExactDecline::OutOfScope);
+    }
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+    let (_, ehs, _, kaps, all_converged, _) = reconverge_population_checked(
+        x,
+        model,
+        population,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        true,
+    );
+    if !all_converged {
+        return Err(ExactDecline::NotResolved);
+    }
+    // Per subject: `None` when the recorders do not serve it (scope), `Some(None)` when they
+    // do but a result is non-finite (this point).
+    let per_subject = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x,
+        &ehs,
+        &kaps,
+        options,
+        |subject, pt, b, objective| {
+            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
+            let h = subject_adjoint_cov_block_at(model, subject, pt, b, objective, axes)?;
+            let g: Vec<f64> = axes
+                .iter()
+                .map(|&a| g.get(a).copied().unwrap_or(f64::NAN))
+                .collect();
+            Some(
+                (g.iter().all(|v| v.is_finite()) && h.iter().all(|v| v.is_finite()))
+                    .then_some((g, h)),
+            )
+        },
+    )
+    .ok_or(ExactDecline::OutOfScope)?;
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return Err(ExactDecline::NotResolved);
+    }
+    let n = axes.len();
+    let (mut g, mut h) = (vec![0.0; n], DMatrix::zeros(n, n));
+    for r in per_subject {
+        let (gi, hi) = r
+            .ok_or(ExactDecline::OutOfScope)?
+            .ok_or(ExactDecline::NotResolved)?;
+        for k in 0..n {
+            g[k] += 2.0 * gi[k];
+        }
+        h += 2.0 * hi;
+    }
+    Ok((g, h))
+}
+
+/// [`exact_candidate_hessian`]'s finite-difference twin, for where the exact one is out of
+/// scope: the Hessian along `axes` of the same objective, re-solved at the covariance step's
+/// inner tolerance from `warm` at every point, by the covariance step's own stencil
+/// ([`fd_ofv_hessian`], its step floors and `fd_hessian_step`). The trust region models with it
+/// where it would model with the exact Hessian, so the two paths run one rule and differ only
+/// in precision. `None` on a non-finite base objective or a cancelled stencil.
+pub(crate) fn fd_candidate_hessian(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Option<DMatrix<f64>> {
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+    let ofv = |xv: &[f64]| -> f64 {
+        let (params, ehs, hms, kaps) = reconverge_population(
+            xv,
+            model,
+            population,
+            template,
+            warm,
+            options,
+            cov_inner_tol,
+            false,
+        );
+        2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kaps, options)
+    };
+    let f0 = ofv(x);
+    let eps = options.fd_hessian_step;
+    if !f0.is_finite() || !(eps > 0.0 && eps.is_finite()) {
+        return None;
+    }
+    let floor = fd_step_floors(template, model);
+    let stencil = fd_ofv_hessian(x.len(), x, axes, &floor, eps, f0, &ofv, options)?;
+    let n = axes.len();
+    let h = DMatrix::from_fn(n, n, |i, j| stencil.hess[(axes[i], axes[j])]);
+    h.iter().all(|v| v.is_finite()).then_some(h)
+}
+
+/// The exact OFV gradient along `axes` at `x`, at modes the caller already holds (converged
+/// EBEs and κ̂, IOV included), from the same per-subject adjoint as [`exact_candidate_hessian`]
+/// without its Hessian block and without re-solving the modes. `None` where that path is out
+/// of scope.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exact_gradient_at_modes(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    ehs: &[DVector<f64>],
+    kaps: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Option<Vec<f64>> {
+    use crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at;
+    let per_subject = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x,
+        ehs,
+        kaps,
+        options,
+        |subject, pt, b, objective| {
+            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
+            let g: Vec<f64> = axes
+                .iter()
+                .map(|&a| g.get(a).copied().unwrap_or(f64::NAN))
+                .collect();
+            g.iter().all(|v| v.is_finite()).then_some(g)
+        },
+    )?;
+    let mut g = vec![0.0; axes.len()];
+    for r in per_subject {
+        let gi = r?;
+        for k in 0..axes.len() {
+            g[k] += 2.0 * gi[k];
+        }
+    }
+    Some(g)
 }
 
 /// The packed axes [`analytic_cov_assembly`] differentiates along, when that is fewer than all

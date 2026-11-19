@@ -144,6 +144,15 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
                 .unwrap_or_else(|e| panic!("data must load: {e}"));
         let opts = FitOptions {
             outer_maxiter: 2,
+            // Bit-identity is a claim about the value and gradient paths, which the two
+            // spellings share exactly. The exact Hessian's two compiled kernels round apart by
+            // 1 ULP, so the comparison runs on what reads only the first two: `trust_region`
+            // (`auto` since #2976) steps on that Hessian (22.07454547612304 vs
+            // 22.074545476123042 after two steps), and L-BFGS's curvature scaling reads its
+            // diagonal at the start (-9.572820025972268 vs -9.572820025973291), so L-BFGS
+            // unscaled.
+            optimizer: ferx_core::types::Optimizer::NloptLbfgs,
+            parameter_scaling: ferx_core::types::ParameterScaling::None,
             ..Default::default()
         };
         fit(&m, &pop, &m.default_params, &opts).expect("fit")

@@ -186,7 +186,7 @@ fn run(dir: &Path, name: &str, model: &str, maxiter: usize, data: &Path) -> ferx
 }
 
 /// Fit the 24-axis twin and the estimated and FIX 25-axis twins. With an outer budget all
-/// three must take the analytic route on both loops, resolve `auto` to L-BFGS and carry no
+/// three must take the analytic route on both loops, resolve `auto` to the trust region and carry no
 /// finite-difference warning; evaluated at the start values they must agree subject by
 /// subject.
 fn assert_straddle(engine: &str, model: fn(usize, bool) -> String, n_at_cap: usize, data: &Path) {
@@ -214,8 +214,8 @@ fn assert_straddle(engine: &str, model: fn(usize, bool) -> String, n_at_cap: usi
             "{engine}, {label}: outer route"
         );
         assert_eq!(
-            r.optimizer, "auto (nlopt_lbfgs)",
-            "{engine}, {label}: `auto` takes L-BFGS on an analytic outer gradient"
+            r.optimizer, "auto (trust_region)",
+            "{engine}, {label}: `auto` takes the trust region on an analytic outer gradient"
         );
         let fd: Vec<&String> = r
             .warnings

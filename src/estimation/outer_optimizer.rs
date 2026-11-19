@@ -205,11 +205,18 @@ pub(crate) fn runs_outer_optimizer(options: &FitOptions) -> bool {
 /// `analytic_outer_gradient` is passed in rather than read off `model` so the
 /// same function answers the counterfactual — "what would `auto` have picked had
 /// the gradient not been forced?" — without a re-spelled copy of the rule.
+///
+/// `exact_hessian` says whether the exact Hessian serves this fit
+/// ([`exact_hessian_serves`]). `auto` takes the trust region on an exact gradient only
+/// where it does (#2976): the trust region's model is that Hessian, and without it every
+/// refresh is a finite-difference Hessian of ~2n² reconverged population solves, where
+/// L-BFGS needs none.
 pub(crate) fn resolve_outer_optimizer(
     requested: Optimizer,
     model: &CompiledModel,
     has_mixture: bool,
     analytic_outer_gradient: bool,
+    exact_hessian: bool,
 ) -> (Optimizer, Option<String>) {
     // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
     // choice — robust against the mixture's label-switching multimodality. Since
@@ -249,10 +256,19 @@ pub(crate) fn resolve_outer_optimizer(
         });
         return (resolved, warning);
     }
-    (
-        requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
-        None,
-    )
+    let resolved = requested.resolve_auto_given_analytic(model, analytic_outer_gradient);
+    if requested == Optimizer::Auto && resolved == Optimizer::TrustRegion && !exact_hessian {
+        return (Optimizer::NloptLbfgs, None);
+    }
+    (resolved, None)
+}
+
+/// Whether the exact Hessian serves `model` under `options`: the covariance step's own
+/// prediction of its R-matrix route (`covariance::analytic_r_expected`),
+/// which is the Hessian the trust region models with. `false` under
+/// `analytic_cov_hessian = false` and wherever a subject is outside the exact scope.
+pub(crate) fn exact_hessian_serves(model: &CompiledModel, options: &FitOptions) -> bool {
+    crate::estimation::covariance::analytic_r_expected(model, options)
 }
 
 /// Run the outer optimizer for one stage from `init_params`.
@@ -299,6 +315,7 @@ pub fn optimize_population(
         model,
         init_params.mixture.is_some(),
         crate::sens::provider::analytic_outer_gradient_available(model),
+        exact_hessian_serves(model, options),
     );
     let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;
@@ -354,14 +371,26 @@ pub fn optimize_population(
         options.parameter_scaling,
         ParameterScaling::Auto | ParameterScaling::Abs
     );
-    let (init_params, preflight_warnings, first_eval_etas, identity_scales) =
+    // #2975: under `auto`, the gradient-based NLopt optimizers scale every free coordinate by
+    // its exact curvature at the start ([`curvature_scales`]); the pre-flight forms it.
+    let curvature_scaling = matches!(resolved, Optimizer::Slsqp | Optimizer::NloptLbfgs)
+        && matches!(options.parameter_scaling, ParameterScaling::Auto);
+    let (init_params, preflight_warnings, first_eval_etas, outer_scales) =
         if init_params.mixture.is_some() {
-            let scales = if probe_identity_scales {
+            let identity = if probe_identity_scales {
                 mixture_identity_theta_scales(model, population, init_params, options)
             } else {
                 Vec::new()
             };
-            (init_params, Vec::new(), None, scales)
+            (
+                init_params,
+                Vec::new(),
+                None,
+                OuterScales {
+                    identity,
+                    curvature: None,
+                },
+            )
         } else {
             let preflight = freeze_flat_thetas(
                 model,
@@ -370,18 +399,18 @@ pub fn optimize_population(
                 options,
                 &preflight_declines,
                 probe_identity_scales,
+                curvature_scaling,
             );
+            let scales = OuterScales {
+                identity: preflight.identity_scales,
+                curvature: preflight.curvature_scales,
+            };
             match preflight.frozen {
                 Some((fp, w)) => {
                     frozen_params = fp;
-                    (&frozen_params, w, None, preflight.identity_scales)
+                    (&frozen_params, w, None, scales)
                 }
-                None => (
-                    init_params,
-                    Vec::new(),
-                    preflight.etas,
-                    preflight.identity_scales,
-                ),
+                None => (init_params, Vec::new(), preflight.etas, scales),
             }
         };
     let first_eval_etas = first_eval_etas.as_deref();
@@ -399,7 +428,7 @@ pub fn optimize_population(
             options,
             &declines,
             first_eval_etas,
-            &identity_scales,
+            &outer_scales,
         ),
         // #2506: these publish no `left_init`, so a run that did not move is probed here,
         // on what is left of `outer_maxiter`.
@@ -425,14 +454,76 @@ pub fn optimize_population(
             )
         }
         Optimizer::TrustRegion => {
-            let result = crate::estimation::trust_region::optimize_trust_region_seeded(
+            // `global_search`: the NLopt leg's CRS2-LM pre-search, on the packed coordinates
+            // the trust region works in, and the local search from its best point. The
+            // pre-flight's modes were solved at the declared start, so a moved start is solved
+            // cold.
+            let mut presearch_warning = None;
+            let presearched = options.global_search.then(|| {
+                let PackedStart {
+                    packed: mut x0,
+                    bounds,
+                    ..
+                } = pack_with_bounds(init_params);
+                clamp_to_bounds(&mut x0, &bounds);
+                let unit = vec![1.0; x0.len()];
+                match run_global_presearch(
+                    model,
+                    population,
+                    init_params,
+                    options,
+                    &unit,
+                    &bounds.lower,
+                    &bounds.upper,
+                    &x0,
+                ) {
+                    // A pre-search that kept the declared start leaves it, and the
+                    // pre-flight's modes solved there, as they were.
+                    Ok(best) if best != x0 => Some((
+                        unpack_params(&best, init_params),
+                        // Escape is judged from the declared start, as the NLopt leg judges
+                        // it (`x0_start_s`): a pre-search move counts as leaving it.
+                        !(max_scaled_deviation(&best, &x0) < INIT_ESCAPE_STEP_S),
+                    )),
+                    Ok(_) => None,
+                    Err(e) => {
+                        presearch_warning = Some(format!("global_search disabled: {e}"));
+                        None
+                    }
+                }
+            });
+            let (init_params, first_eval_etas, presearch_moved) = match presearched.flatten() {
+                Some((start, moved)) => (start, None, moved),
+                None => (init_params.clone(), first_eval_etas, false),
+            };
+            let init_params = &init_params;
+            let mut result = crate::estimation::trust_region::optimize_trust_region_seeded(
                 model,
                 population,
                 init_params,
                 options,
                 first_eval_etas,
             );
-            let budget = options.outer_maxiter.saturating_sub(result.n_iterations);
+            if let Some(w) = presearch_warning {
+                result.warnings.insert(0, w);
+            }
+            if presearch_moved {
+                // The fit left the declared start (the pre-search moved it), whatever the local
+                // search did from there, so there is no unmoved start to probe either.
+                result.left_init = Some(true);
+            }
+            // A start with no feasible objective (#1617) already carries its verdict; the
+            // #2506 probe asks whether an unmoved *feasible* start is an optimum, and a rerun
+            // from its perturbation would only repeat the infeasible solve.
+            let budget = if result
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(NO_FEASIBLE_EVAL_TOKEN))
+            {
+                0
+            } else {
+                options.outer_maxiter.saturating_sub(result.n_iterations)
+            };
             verify_unmoved_start(
                 model,
                 population,
@@ -487,6 +578,21 @@ struct FlatThetaPreflight {
     /// divides by its initial magnitude — see [`identity_theta_scales`] (#2159).
     /// Empty unless the caller asked for the probe.
     identity_scales: Vec<(usize, f64)>,
+    /// One scale per packed coordinate from the exact curvature at the start — see
+    /// [`curvature_scales`] (#2975). `None` unless the caller asked for it and every
+    /// subject's exact derivatives were available.
+    curvature_scales: Option<Vec<f64>>,
+}
+
+/// The per-coordinate scales the pre-flight hands the NLopt outer loop.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct OuterScales {
+    /// `(θ index, scale)` for each near-zero identity-packed θ (#2159,
+    /// [`identity_theta_scales`]).
+    pub(crate) identity: Vec<(usize, f64)>,
+    /// The curvature scale of every packed coordinate (#2975, [`curvature_scales`]); when
+    /// present it replaces the magnitude rules of [`nlopt_scale_vector`].
+    pub(crate) curvature: Option<Vec<f64>>,
 }
 
 /// Pre-flight flat-theta detection (#826). Computes the outer gradient at the
@@ -511,6 +617,7 @@ fn freeze_flat_thetas(
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
     probe_identity_scales: bool,
+    curvature_scaling: bool,
 ) -> FlatThetaPreflight {
     let n_theta = init_params.theta.len();
     // Nothing to freeze if every theta is already fixed.
@@ -519,6 +626,7 @@ fn freeze_flat_thetas(
             frozen: None,
             etas: None,
             identity_scales: Vec::new(),
+            curvature_scales: None,
         };
     }
 
@@ -566,14 +674,12 @@ fn freeze_flat_thetas(
         })
     };
     // With the inner-loop statistics, which the #2159 probe hands to the EBE guard.
-    let reconverged = |theta_i: usize, value: f64| -> (f64, InnerLoopStats) {
-        let mut p = params.clone();
-        p.theta[theta_i] = value;
+    let reconverged_at = |p: &ModelParameters| -> (f64, InnerLoopStats) {
         let mu = compute_mu_k(model, &p.theta, options.mu_referencing);
         let (e, h, stats, k) = run_inner_loop_warm_seeded(
             model,
             population,
-            &p,
+            p,
             options.inner_maxiter,
             options.inner_tol,
             Some(&cold_etas),
@@ -585,9 +691,14 @@ fn freeze_flat_thetas(
             PrevEtas::Placeholder,
         );
         (
-            2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options),
+            2.0 * pop_nll_opts(model, population, p, &e, &h, &k, options),
             stats,
         )
+    };
+    let reconverged = |theta_i: usize, value: f64| -> (f64, InnerLoopStats) {
+        let mut p = params.clone();
+        p.theta[theta_i] = value;
+        reconverged_at(&p)
     };
     let reconverged_ofv = |theta_i: usize, value: f64| reconverged(theta_i, value).0;
     // The clean −2LL gradient at the start: the flat-θ test below, and the slope of the
@@ -669,7 +780,7 @@ fn freeze_flat_thetas(
     // evaluation repeats the cold solve exactly as before #2076.
     // #2159: probed at the same start, after the flat-θ freeze so a θ it froze is not
     // probed again.
-    let identity_scales = if probe_identity_scales {
+    let (identity_scales, curvature_scales) = if probe_identity_scales {
         let held = |i: usize| {
             init_params.theta_fixed.get(i).copied().unwrap_or(false)
                 || frozen.as_ref().is_some_and(|(fp, _)| fp.theta_fixed[i])
@@ -718,7 +829,78 @@ fn freeze_flat_thetas(
                 + identity_probe_penalty(&p, &nn_reg, &priors);
             ofv_is_valid(v)
         };
-        identity_theta_scales(
+        // #2975: the exact slope and curvature along every free axis, once; the curvature
+        // scales read the curvatures, and the #2159 probe below its candidates' pairs.
+        let free_axes: Vec<usize> = (0..x.len())
+            .filter(|&a| bounds.lower[a] < bounds.upper[a])
+            .collect();
+        let all_axes = curvature_scaling
+            .then(|| {
+                #[cfg(test)]
+                if IDENTITY_EXACT_OFF.with(std::cell::Cell::get) {
+                    return None;
+                }
+                exact(&free_axes)
+            })
+            .flatten();
+        // The same curvature from either source: the exact R-matrix diagonal, or — when a
+        // subject is outside the recorders' scope, the exact R-matrix is off, or under
+        // `gradient = fd` — a central second difference of the same objective along the
+        // axis, EBEs re-solved (`fd_curvature_step`). One rule; only the precision differs.
+        let curvature = curvature_scaling
+            .then(|| {
+                let mut per_axis = vec![None; x.len()];
+                match &all_axes {
+                    Some(d) => {
+                        for (&a, &(_, h)) in free_axes.iter().zip(d) {
+                            per_axis[a] = Some(h);
+                        }
+                    }
+                    None => {
+                        let f0 = objective(base_ofv(), &params, &base_stats);
+                        for &a in &free_axes {
+                            let identity =
+                                a < n_theta && !theta_packs_log(init_params.theta_lower[a]);
+                            let Some(delta) =
+                                fd_curvature_step(x[a], identity, bounds.lower[a], bounds.upper[a])
+                            else {
+                                continue;
+                            };
+                            let at = |v: f64| {
+                                let mut xp = x.clone();
+                                xp[a] = v;
+                                let p = unpack_params(&xp, init_params);
+                                let (clean, stats) = reconverged_at(&p);
+                                objective(clean, &p, &stats)
+                            };
+                            let (fm, fp) = (at(x[a] - delta), at(x[a] + delta));
+                            if [f0, fm, fp].iter().all(|&v| ofv_is_valid(v)) {
+                                per_axis[a] = Some((fp - 2.0 * f0 + fm) / (delta * delta));
+                            }
+                        }
+                    }
+                }
+                let scales = curvature_scales(&per_axis, &bounds);
+                if options.verbose {
+                    if let Some(sc) = &scales {
+                        eprintln!(
+                            "Outer scaling: curvature ({}), per packed coordinate: [{}]",
+                            if all_axes.is_some() {
+                                "exact"
+                            } else {
+                                "finite differences"
+                            },
+                            sc.iter()
+                                .map(|v| format!("{v:.3e}"))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                    }
+                }
+                scales
+            })
+            .flatten();
+        let identity = identity_theta_scales(
             &params.theta,
             &init_params.theta_lower,
             &init_params.theta_upper,
@@ -729,7 +911,13 @@ fn freeze_flat_thetas(
                 if IDENTITY_EXACT_OFF.with(std::cell::Cell::get) {
                     return None;
                 }
-                exact(candidates)
+                match &all_axes {
+                    Some(d) => candidates
+                        .iter()
+                        .map(|c| free_axes.iter().position(|a| a == c).map(|k| d[k]))
+                        .collect(),
+                    None => exact(candidates),
+                }
             },
             feasible,
             |i, value| {
@@ -738,9 +926,10 @@ fn freeze_flat_thetas(
                 let (clean, stats) = reconverged(i, value);
                 objective(clean, &with_theta(i, value), &stats)
             },
-        )
+        );
+        (identity, curvature)
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     FlatThetaPreflight {
         frozen,
@@ -749,6 +938,7 @@ fn freeze_flat_thetas(
             .all(|&c| c)
             .then(|| joint_warm_starts(&ehs, &kappas)),
         identity_scales,
+        curvature_scales,
     }
 }
 
@@ -2968,9 +3158,24 @@ fn nlopt_scale_vector(
     bounds: &PackedBounds,
     options: &FitOptions,
     auto_scale_iov: bool,
-    identity_scales: &[(usize, f64)],
+    scales: &OuterScales,
 ) -> Vec<f64> {
     let n = x0.len();
+    // #2975: the exact curvature at the start, when the pre-flight formed it (under `auto`,
+    // for L-BFGS / SLSQP). Only the #2146 guard is kept on top: a restart leg starts where
+    // a stalled leg left the θ, and an identity-packed θ that grew past
+    // [`LARGE_IDENTITY_THETA`] is a coordinate far larger than its start-time scale (#2272).
+    if let Some(curvature) = scales.curvature.as_ref().filter(|c| c.len() == n) {
+        if matches!(options.parameter_scaling, ParameterScaling::Auto) {
+            let mut scale = curvature.clone();
+            for (i, &lo) in init_params.theta_lower.iter().enumerate() {
+                if lo < 0.0 && x0[i].abs() > LARGE_IDENTITY_THETA {
+                    scale[i] = scale[i].max(x0[i].abs());
+                }
+            }
+            return scale;
+        }
+    }
     let has_identity_theta = init_params.theta_lower.iter().any(|&lo| lo < 0.0);
     let mut scale = match resolve_scaling(options.parameter_scaling, options.optimizer) {
         ParameterScaling::Rescale2 => compute_rescale2_scale(bounds),
@@ -3009,10 +3214,89 @@ fn nlopt_scale_vector(
     // the θ's current magnitude, not a replacement for it. On the first leg the two are
     // equal (the probe scales by |θ₀| and `x0[i]` is θ₀), and a θ that shrank keeps its
     // probed scale rather than chasing zero.
-    for &(i, s) in identity_scales {
+    for &(i, s) in &scales.identity {
         scale[i] = s.max(x0[i].abs());
     }
     scale
+}
+
+/// The step of the central second difference that stands in for the exact R-matrix diagonal
+/// in [`curvature_scales`] when exact derivatives are not available (#2975): a tenth of the
+/// coordinate's own size — `0.1·|θ₀|` for an identity-packed θ (`0.1` at θ₀ = 0), `0.1` on a
+/// log / log-Cholesky axis (a 10% move) — so the difference stands well above the EBE
+/// re-solve noise, shrunk to keep both points inside the box. `None` when the box leaves no
+/// room for a tenth of that.
+pub(crate) fn fd_curvature_step(x: f64, identity: bool, lower: f64, upper: f64) -> Option<f64> {
+    let full = if identity && x != 0.0 {
+        0.1 * x.abs()
+    } else {
+        0.1
+    };
+    let room = (x - lower).min(upper - x);
+    let delta = full.min(0.9 * room);
+    (delta.is_finite() && delta >= 0.1 * full).then_some(delta)
+}
+
+/// The #2975 curvature scale of each packed coordinate: `1/√|∂²OFV/∂xₐ²|` at the start, from
+/// the exact R-matrix diagonal ([`identity_exact_derivatives`]) or, without exact derivatives,
+/// a central second difference of the same objective ([`fd_curvature_step`]), capped at half
+/// the axis's
+/// bound range. `curvature[a]` is `None` for a coordinate the optimizer does not move (its
+/// scale is 1).
+///
+/// In scaled coordinates every diagonal curvature is then 1, which is what L-BFGS's
+/// identity start assumes, so its first step is the diagonal Newton step on every axis at
+/// once. The scale follows from the objective, not from the start value: a near-zero
+/// covariate effect, a volume in odd units and a log-packed clearance are treated alike.
+/// That replaces the magnitude rules ([`compute_scale_packed`], the identity-θ switch-off,
+/// the #2146 / #2159 adjustments) for the gradient optimizers.
+///
+/// A negative curvature (a concave axis at the start, common for an Ω or an additive σ far
+/// from its optimum) takes its magnitude: measured against the median of the other axes'
+/// scales on 29 models, the magnitude ended 13 iterations lower in total. A zero or
+/// non-finite curvature takes the median of the axes that have one. `None` when no axis
+/// has a usable curvature.
+///
+/// Measured (#2975, FOCEI, L-BFGS, 4 threads): 29 models — 21 bundled examples, the #2159
+/// fixtures, synthetic and two real-data FOCEI benchmarks — 1570 → 1214 iterations (−23%),
+/// 236k → 164k EBE solves (−31%), every fit at the same optimum.
+pub(crate) fn curvature_scales(
+    curvature: &[Option<f64>],
+    bounds: &PackedBounds,
+) -> Option<Vec<f64>> {
+    let cap = |a: usize| {
+        let half_range = 0.5 * (bounds.upper[a] - bounds.lower[a]).abs();
+        if half_range.is_finite() && half_range > 0.0 {
+            half_range
+        } else {
+            f64::INFINITY
+        }
+    };
+    let raw: Vec<Option<f64>> = curvature
+        .iter()
+        .map(|h| {
+            h.filter(|h| h.is_finite() && *h != 0.0)
+                .map(|h| 1.0 / h.abs().sqrt())
+        })
+        .collect();
+    let mut usable: Vec<f64> = raw.iter().flatten().copied().collect();
+    if usable.is_empty() {
+        return None;
+    }
+    usable.sort_by(f64::total_cmp);
+    let median = usable[usable.len() / 2];
+    Some(
+        curvature
+            .iter()
+            .zip(&raw)
+            .enumerate()
+            .map(|(a, (h, s))| match (h, s) {
+                (None, _) => 1.0,
+                (Some(_), Some(s)) => s.min(cap(a)),
+                (Some(_), None) => median.min(cap(a)),
+            })
+            .collect(),
+    )
 }
 
 /// Resolve the derivative-free `bobyqa` outer optimizer's `ftol_rel` stop tolerance.
@@ -3725,7 +4009,7 @@ pub(crate) fn ebe_screen_moved_warning(ids: &[String]) -> Option<String> {
 /// problem the two solves agree to the inner loop's precision (the #1565 MM fixture's
 /// 195 untrapped subjects agreed to 1e-4 each), so 0.05 sits well above that noise and
 /// two orders of magnitude below the 88-unit gap it exists to catch.
-const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
+pub(crate) const BASIN_SHIFT_ABS_TOL: f64 = 0.05;
 
 /// Whether the mid-leg basin probe runs at this feasible-evaluation count: 32, 64, 128, …
 /// — a logarithmic number of cold passes per leg, none before the trajectory has had a
@@ -4791,8 +5075,12 @@ pub(crate) fn verify_unmoved_start(
             &x0_free,
         ) < INIT_ESCAPE_STEP_S)
     };
-    // `!(… < …)` so a non-finite deviation counts as moved: nothing to probe.
-    if off_start(&result)
+    // `!(… < …)` so a non-finite deviation counts as moved: nothing to probe. An optimizer
+    // that publishes its own escape verdict (`left_init`, measured in the units it steps in:
+    // the trust region's curvature scaling) is read by it, so the probe and the reported
+    // `left_init` cannot disagree about whether the fit moved.
+    let moved = result.left_init.unwrap_or_else(|| off_start(&result));
+    if moved
         || budget == 0
         || crate::cancel::is_cancelled(&options.cancel)
         || !ofv_is_valid(result.ofv)
@@ -4843,6 +5131,8 @@ pub(crate) fn verify_unmoved_start(
             stalled
         }
         Some(true) => {
+            // Against the declared start: the probe's own `left_init` measures its move
+            // from the perturbation it was started at.
             let left = off_start(&probe);
             verified_start_result(probe, left, result, start_ofv <= probe_ofv)
         }
@@ -5659,7 +5949,7 @@ pub(crate) fn optimize_nlopt(
     options: &FitOptions,
     declines: &OuterFdDeclineLog,
     first_eval_etas: Option<&[DVector<f64>]>,
-    identity_scales: &[(usize, f64)],
+    scales: &OuterScales,
 ) -> OuterResult {
     // The attempts minimised the *penalized* objective (covariate-NN
     // regularization, parameter priors), so they are ranked on it too:
@@ -5687,7 +5977,7 @@ pub(crate) fn optimize_nlopt(
             declines,
             None,
             first_eval_etas,
-            identity_scales,
+            scales,
             true,
             probe,
         );
@@ -5715,7 +6005,7 @@ pub(crate) fn optimize_nlopt(
                 start_eval: None,
             }),
             None,
-            identity_scales,
+            scales,
             true,
         );
         let verdict = start_probe_verdict(start_ofv, penalized(&result), result.converged);
@@ -5776,7 +6066,7 @@ pub(crate) fn optimize_nlopt(
                 declines,
                 Some(RestartLeg::continuing(init_params, stalled)),
                 None,
-                identity_scales,
+                scales,
                 true,
             );
             // `n_iterations` reports the evaluations the fit spent, and the
@@ -5926,7 +6216,7 @@ pub(crate) mod forced_stop_at_start {
 /// How many basin-shift restarts [`optimize_nlopt`] runs at most after the first (#2093).
 /// Each must be adopted and the legs share the fit's budget, so this only bounds the work
 /// on a fit whose warm EBEs keep re-trapping.
-const MAX_BASIN_RESTARTS: usize = 3;
+pub(crate) const MAX_BASIN_RESTARTS: usize = 3;
 
 /// Restart a run that stopped mid-descent from the best point it reached, and
 /// report whichever attempt ended lower (#1277).
@@ -6887,7 +7177,7 @@ fn optimize_nlopt_once(
     declines: &OuterFdDeclineLog,
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
-    identity_scales: &[(usize, f64)],
+    scales: &OuterScales,
 ) -> (OuterResult, AttemptOutcome) {
     optimize_nlopt_attempt(
         model,
@@ -6898,7 +7188,7 @@ fn optimize_nlopt_once(
         declines,
         restart,
         first_eval_etas,
-        identity_scales,
+        scales,
         false,
     )
 }
@@ -6941,7 +7231,7 @@ fn optimize_nlopt_attempt(
     declines: &OuterFdDeclineLog,
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
-    identity_scales: &[(usize, f64)],
+    scales: &OuterScales,
     defer_covariance: bool,
 ) -> (OuterResult, AttemptOutcome) {
     optimize_nlopt_attempt_probed(
@@ -6953,7 +7243,7 @@ fn optimize_nlopt_attempt(
         declines,
         restart,
         first_eval_etas,
-        identity_scales,
+        scales,
         defer_covariance,
         None,
     )
@@ -6975,7 +7265,7 @@ fn optimize_nlopt_attempt_probed(
     declines: &OuterFdDeclineLog,
     restart: Option<RestartLeg<'_>>,
     first_eval_etas: Option<&[DVector<f64>]>,
-    identity_scales: &[(usize, f64)],
+    scales: &OuterScales,
     defer_covariance: bool,
     start_probe: Option<&StartProbe<'_>>,
 ) -> (OuterResult, AttemptOutcome) {
@@ -7044,14 +7334,7 @@ fn optimize_nlopt_attempt_probed(
     // intentional. This auto-enable now only fires for an explicit
     // `optimizer = slsqp` on IOV models (the path it was originally written for).
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
-    let scale = nlopt_scale_vector(
-        &x0,
-        init_params,
-        &bounds,
-        options,
-        auto_scale_iov,
-        identity_scales,
-    );
+    let scale = nlopt_scale_vector(&x0, init_params, &bounds, options, auto_scale_iov, scales);
     // The EBE warm-start predictor (`NloptState::pred_jac`) where the adjoint forms the mode
     // response: FOCE/FOCEI, and Laplace (AGQ with one node), on a BSV-only, non-mixture
     // model the outer gradient serves; not AGQ with more than one node. An IOV
@@ -9568,7 +9851,7 @@ fn mid_descent_restart_warning(
 /// files it under `optimizer_health` with the #1277 notice: the gap itself was
 /// resolved (had it survived, the restart's own `W_EBE_START_DEPENDENT` would say so),
 /// so what remains to report is that the fit took a second leg, and why.
-fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> String {
+pub(crate) fn basin_shift_restart_warning(first_cold_ofv: f64, first_evals: usize) -> String {
     format!(
         "Outer optimization had minimised against empirical Bayes estimates that some \
          subjects held in a higher individual mode than a cold re-solve finds (cold OFV = \
