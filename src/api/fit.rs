@@ -2175,6 +2175,12 @@ fn fit_inner(
     //
     // `None` only until the first stage writes one.
     let mut objective_stage: Option<EstimationMethod> = None;
+    // The options of the stage that owns the published objective, so the post-fit ODE
+    // tolerance check (#2994) re-scores *that* objective under that stage's own method,
+    // `n_agq` and inner settings — an estimating Laplace stage tightens `inner_tol`, which the
+    // top-level options do not carry (#2994 review r2). `None` while no stage the check can
+    // re-score owns it.
+    let mut objective_stage_opts: Option<FitOptions> = None;
     // A VI stage's result must survive later stages of a chain: `method = [vi, imp]`
     // is the *recommended* way to finish a VI fit, and reading `vi` off only the
     // final stage would silently discard it exactly when it was used correctly.
@@ -2434,6 +2440,7 @@ fn fit_inner(
             // This stage writes `result.ofv` on both branches, so it owns the
             // published objective even though it estimates nothing (#1303).
             objective_stage = Some(method);
+            objective_stage_opts = Some(stage_opts.clone());
             match result.as_mut() {
                 // Chained: keep the estimator's parameters and replace only the OFV, so the
                 // reported objective is the quadrature marginal at the point it reached.
@@ -2522,6 +2529,7 @@ fn fit_inner(
                 // `result.ofv` alone, so `objective_stage` must stay pointing at
                 // that estimator — which is the #1303 review's P1.
                 objective_stage = Some(method);
+                objective_stage_opts = None;
                 let ofv = 2.0 * nll;
                 let mut converged = true;
                 let gate_warning = crate::estimation::outer_optimizer::gate_converged_on_objective(
@@ -2743,6 +2751,7 @@ fn fit_inner(
         // An estimating stage replaces the whole `OuterResult`, objective included,
         // so it becomes the owner of the published `ofv` (#1303).
         objective_stage = Some(method);
+        objective_stage_opts = Some(stage_opts.clone());
         result = Some(stage_result);
 
         // SAEM's reported objective (#2973): by default NONMEM's SAEM objective (SAEMOBJ),
@@ -3549,6 +3558,47 @@ fn fit_inner(
     {
         warnings.push(msg);
         native_warnings.push(entry);
+    }
+    // Whether the OFV is settled at the ODE tolerance the fit integrated at (#2994): the EBEs
+    // and the objective re-solved once at one decade tighter. The objective checked is the
+    // one published, so its stage is the tracked owner of `ofv` (`objective_stage`), not
+    // `final_method`: a trailing `agq_eval_only` readout publishes its quadrature marginal
+    // while the stored modes stay the estimator's, so its check runs under the readout's own
+    // options; an estimating owner is checked under its own stage options too, not the
+    // top-level ones. Both sides re-find the modes the same way from the stored ones, so only
+    // the tolerance differs between them (#2994 review r7). A mixture's
+    // objective is the K-class marginal, which this single-population re-score would not
+    // reproduce, and the Monte-Carlo estimators publish an objective it does not compute, so
+    // both are out of scope.
+    {
+        use crate::estimation::ode_tolerance_check as otc;
+        // The owner's options are recorded by every stage this check can re-score; an
+        // `imp_eval_only` owner records none and is out of scope anyway.
+        let stage = objective_stage_opts.filter(|o| otc::method_in_scope(o.method));
+        if let (Some(stage), None) = (stage, &result.mixture_posteriors) {
+            match otc::ofv_tolerance_shift(
+                model,
+                population,
+                &result.params,
+                &result.eta_hats,
+                &result.kappas,
+                &stage,
+            ) {
+                Some(Ok(shift)) => {
+                    if let Some((msg, entry)) = super::postfit::ode_ofv_not_settled_warning(&shift)
+                    {
+                        warnings.push(msg);
+                        native_warnings.push(entry);
+                    }
+                }
+                Some(Err(reason)) => {
+                    let (msg, entry) = super::postfit::ode_ofv_not_checked_warning(&reason);
+                    warnings.push(msg);
+                    native_warnings.push(entry);
+                }
+                None => {}
+            }
+        }
     }
     // Twin-less transit/IG absorption closed form whose fitted per-subject EBE crosses
     // into the flip-flop regime — a silently degenerate subject the η = 0 fit-start

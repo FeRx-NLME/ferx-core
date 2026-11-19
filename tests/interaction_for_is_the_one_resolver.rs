@@ -88,6 +88,12 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     ("src/estimation/mixture.rs", 1, "the mixture outer loop, run on a stage's options"),
     (
+        "src/estimation/ode_tolerance_check.rs",
+        1,
+        "the settlement check (#2994) scores under the options of the stage that owns the \
+         published OFV: the stage loop's `stage_opts`, resolved through `interaction_for`",
+    ),
+    (
         "src/estimation/outer_optimizer.rs",
         15,
         "the outer optimizer and objective, run on a stage's options; \

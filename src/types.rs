@@ -7956,6 +7956,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // because the Jacobian's tighter solve could not finish. Its own token, ahead of the
         // prose arms: the message says "finite-difference" and "objective".
         (WarningSeverity::Warning, WarningCode::OdeSolver)
+    } else if lower.contains("w_ode_ofv_not_settled")
+        || lower.contains("w_ode_ofv_settlement_unchecked")
+    {
+        // #2994: re-solving at one decade tighter ODE tolerance moved the OFV, or could not be
+        // set up. Own tokens, ahead of the prose arms: the messages say "objective" and
+        // "non-finite".
+        (WarningSeverity::Warning, WarningCode::OdeSolver)
     } else if lower.contains("w_nonfinite_objective") {
         // #1303: the convergence verdict was demoted because the objective at
         // the final estimates is `NaN`, infinite, or the clamped divergence

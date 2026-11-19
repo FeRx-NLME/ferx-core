@@ -403,6 +403,67 @@ equations by default, and integrates non-stiff systems with an adaptive Dormand-
 
 The solver automatically adapts step sizes based on local error estimates.
 
+### Is the OFV settled at the tolerance? {#ofv-tolerance-check}
+
+The default tolerance is accurate enough for most models, but not for all of them. On a
+stiff PK–neutrophil model with a `(BASE/neut)^GAM` feedback term the default left about 4 OFV
+units of error against NONMEM, and the sign of the error changed with the data
+([#2994](https://github.com/FeRx-NLME/ferx-core/issues/2994)). An error that size is more than
+the 3.84 of a 1-df likelihood-ratio test, so a model comparison made at the default can come
+out the wrong way.
+
+So after a fit of a model that integrates an ODE, ferx re-finds the EBEs and re-scores the
+objective once at the final estimates, with `ode_reltol` and `ode_abstol` one decade tighter
+(and ten times `ode_max_steps`). When the OFV moves by more than 0.1 units, or the tighter
+solve gives a non-finite objective, the fit carries `W_ODE_OFV_NOT_SETTLED` (category
+`ode_solver`), with both objectives and both tolerance pairs in its `details`. The remedy is
+to refit at the tighter tolerance and compare again, until the OFV stops moving. The
+estimates and the reported OFV are not changed by the check.
+
+On `examples/mm_iv.ferx` at its initial estimates, the shift for one decade is 0.052 at the
+default (its error against `ode_reltol = 1e-10` is 0.050), 1.41 at `1e-3` and 3e-8 at `1e-10`.
+So that model has no warning at the default and gets one at `1e-3`.
+
+Scope and limits:
+
+- It checks the objective the fit publishes, so it runs when that objective comes from
+  `foce`, `focei`, `gn`, `gn_hybrid` or `laplace` (also with `n_agq > 1`). A trailing
+  `agq_eval_only` readout owns the published OFV, so `method = [focei, laplace]` is checked on
+  the quadrature marginal and `method = [vi, laplace]` is checked too, under the readout's
+  settings. A `[mixture]` model and an objective published by
+  a Monte-Carlo estimator are not checked. A model whose PK is solved exactly by the
+  [matrix exponential](#linear-exact) is checked: its objective can still integrate at the
+  tolerance (a drug-driven CTMM likelihood, or a segment that falls back to integration),
+  and where nothing integrates both sides agree and no warning is given.
+- A re-scored objective is used only if it can be trusted. The fit carries
+  `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, naming every reason, when the tighter solve
+  cannot be set up (its worker pool cannot be built), or when either side has
+  - an integration that is not clean: a step forced at the minimum step size, a segment
+    left unfinished (which includes stiff-aborted and diverged ones), or an abandoned
+    timeline. Every integration
+    behind the objective is counted, including the EBE search, `H` and each AGQ node, not
+    only the prediction at the mode;
+  - or EBEs that fail the fit's own convergence guard: a subject hard-rejected at its
+    start, or more unconverged subjects than `max_unconverged_frac` allows.
+
+  Each of those can still return a finite OFV, so a check that did not really run never
+  reads as a settled objective.
+- Both sides re-find the EBEs the same way: one warm solve per subject from the fit's modes,
+  under the settings of the stage that published the OFV (such as the tighter `inner_tol` a
+  `laplace` stage uses). Only the ODE tolerance differs between them, so further movement of
+  the EBEs is not reported as a tolerance shift. The fit-tolerance side therefore agrees
+  with the reported OFV only as closely as the fit's EBEs were converged.
+- It costs two inner-loop passes over all subjects, one at each tolerance. A cancelled fit
+  stops the check and does not report it.
+- Neither tolerance goes below its floor (`ode_reltol = 1e-12`, `ode_abstol = 1e-14`), since
+  one more decade would measure round-off. A tolerance already at its floor stays there while
+  the other is tightened, and only a fit with both at their floors is not checked.
+- One decade estimates the remaining error. It does not bound it. When something other
+  than the tolerance limits the step size, such as the spacing of the output times or the
+  initial step, two tolerances can accept the same steps. On `mm_iv`, `ode_reltol = 1e-1`
+  and `1e-2` score within 1e-8 of each other and 1.47 units from the converged value. So no
+  warning does not prove the tolerance is tight enough, but a warning does mean it is too loose.
+
 ### Native right-hand side {#native-rhs}
 
 The equations in `[odes]` are evaluated at every stage of every step of every solve, so their
