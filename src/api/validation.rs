@@ -7079,15 +7079,22 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
             });
         let has_mixture = model.default_params.mixture.is_some();
         let in_scope = crate::sens::provider::analytic_outer_gradient_in_scope(model);
+        let unforced_options = FitOptions {
+            gradient_method: crate::types::GradientMethod::Auto,
+            ..options.clone()
+        };
         let resolve = |analytic: bool| {
             crate::estimation::outer_optimizer::resolve_outer_optimizer(
                 Optimizer::Auto,
                 model,
                 has_mixture,
                 analytic,
+                // The exact Hessian as the unforced fit would have it: `gradient = fd` also
+                // moves the covariance step to the stencil, and the counterfactual asks what
+                // `auto` picks with the gradient left at `auto`.
                 crate::estimation::outer_optimizer::exact_hessian_serves(
                     model,
-                    options,
+                    &unforced_options,
                     has_mixture,
                 ),
             )

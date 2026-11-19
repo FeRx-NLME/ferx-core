@@ -889,7 +889,12 @@ fn transit_tv_covariate_now_served_by_ode_equivalent() {
         std::collections::HashMap::from([("WT".to_string(), 72.0)]),
     ];
     assert!(pop.subjects[0].has_tv_covariates());
-    fit(&model, &pop, &model.default_params, &FitOptions::default())
+    // A routing check (Tier 2): the reroute serves the first evaluation; see the 2-cpt twin.
+    let opts = FitOptions {
+        outer_maxiter: 3,
+        ..FitOptions::default()
+    };
+    fit(&model, &pop, &model.default_params, &opts)
         .expect("transit + time-varying covariates now fits via the ODE equivalent");
 }
 
@@ -2043,7 +2048,14 @@ fn two_cpt_transit_tv_covariate_now_served_by_ode_equivalent() {
         std::collections::HashMap::from([("WT".to_string(), 72.0)]),
     ];
     assert!(pop.subjects[0].has_tv_covariates());
-    fit(&model, &pop, &model.default_params, &FitOptions::default())
+    // A routing check, not a convergence fit (Tier 2): the reroute serves the first
+    // evaluation. One subject with two records against eight parameters has no interior
+    // optimum to converge to, and a full default fit descended for minutes (#2976).
+    let opts = FitOptions {
+        outer_maxiter: 3,
+        ..FitOptions::default()
+    };
+    fit(&model, &pop, &model.default_params, &opts)
         .expect("2cpt transit + time-varying covariates now fits via the ODE equivalent");
 }
 

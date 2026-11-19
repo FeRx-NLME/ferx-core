@@ -205,7 +205,7 @@ fn exact_trust_region(
     // `|actual − predicted|` of the last rejected step: once the radius has collapsed the step
     // is so short that the model's own error (third order in it) is negligible, and this is the
     // objective's evaluation noise at the incumbent, measured.
-    let mut last_mismatch = f64::NAN;
+    let mut last_mismatch: f64;
     let mut last_decrement: f64;
     // `OutOfScope` is a property of the model: once the exact Hessian (or the exact gradient at
     // held modes) declines that way, it is not asked again this leg. `NotResolved` is one of
