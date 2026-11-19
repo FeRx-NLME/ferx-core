@@ -206,10 +206,6 @@ fn via_adaptive(m: &CompiledModel, pop: &Population, skip: &[&str]) -> Vec<(Stri
 // smallest defect it guards is 14.
 const IPRED_BOUND: f64 = 1e-6;
 
-/// #2126: an observation listed before a co-timed SS=1 dose reads post-SS in ferx (2.862)
-/// and the pre-SS seed in NONMEM (28). A reader ordering question, not the seed's.
-const CELLS_SKIP: &[&str] = &["15"];
-
 #[test]
 fn predict_seeds_init_from_the_first_record_in_file_order_matches_nonmem() {
     let m = model("init_seed_tie_fit").0;
@@ -224,7 +220,7 @@ fn predict_seeds_init_from_the_first_record_in_file_order_matches_nonmem() {
         "predict, init_seed_tie_cells",
         &via_predict(&m, &data("init_seed_tie_cells")),
         &nonmem_ipred("init_seed_tie_cells"),
-        CELLS_SKIP,
+        &[],
         IPRED_BOUND,
     );
 }
@@ -239,18 +235,18 @@ fn dual_walk_seeds_init_from_the_first_record_in_file_order_matches_nonmem() {
         &[],
         IPRED_BOUND,
     );
-    // The cells' EVID=3 ties and the dose/EVID=2 pair (IDs 16, 17, 19, 20). ID 15 is #2126,
-    // and ID 18's SS=1 dose replaces the state, so its seed is not observable.
+    // The cells' EVID=3 ties, the dose/EVID=2 pair (IDs 16, 17, 19, 20) and ID 15, an
+    // observation listed before a co-timed SS=1 dose, which reads the pre-SS seed 28 as
+    // NONMEM does (#2126; 2.862 until #2567). ID 18's SS=1 dose replaces the state, so its
+    // seed is not observable.
     let mut cells = data("init_seed_tie_cells");
-    cells
-        .subjects
-        .retain(|s| !["15", "18"].contains(&s.id.as_str()));
-    assert_eq!(cells.subjects.len(), 4, "cells subjects on the dual leg");
+    cells.subjects.retain(|s| s.id != "18");
+    assert_eq!(cells.subjects.len(), 5, "cells subjects on the dual leg");
     assert_matches(
         "dual, init_seed_tie_cells",
         &via_dual(&m, &cells),
         &nonmem_ipred("init_seed_tie_cells"),
-        &["15", "18"],
+        &["18"],
         IPRED_BOUND,
     );
 }
@@ -365,15 +361,11 @@ fn state_pass_seeds_init_from_the_first_record_and_each_reset_matches_nonmem() {
         STATES_SKIP,
         IPRED_BOUND,
     );
-    let mut cells = data("init_seed_tie_cells");
-    cells
-        .subjects
-        .retain(|s| !CELLS_SKIP.contains(&s.id.as_str()));
     assert_matches(
         "states, init_seed_tie_cells",
-        &via_states(&m, &cells),
+        &via_states(&m, &data("init_seed_tie_cells")),
         &nonmem_ipred("init_seed_tie_cells"),
-        CELLS_SKIP,
+        &[],
         IPRED_BOUND,
     );
 }
