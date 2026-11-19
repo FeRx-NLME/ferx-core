@@ -203,6 +203,16 @@ fn exact_trust_region(
     // objective's evaluation noise at the incumbent, measured.
     let mut last_mismatch = f64::NAN;
     let mut last_decrement: f64;
+    // `OutOfScope` is a property of the model: once the exact Hessian (or the exact gradient at
+    // held modes) declines that way, it is not asked again this leg. `NotResolved` is one of
+    // the point: the exact Hessian is not asked again at the point it declined at.
+    let mut hessian_out_of_scope = false;
+    let gradient_out_of_scope = std::cell::Cell::new(false);
+    let mut unresolved_at: Option<Vec<f64>> = None;
+    // The optimizer trace: the last point a row was written at, and the packed norm of the
+    // accepted step that reached the current iterate.
+    let mut traced_at: Option<Vec<f64>> = None;
+    let mut last_step: Option<f64> = None;
     // The first radius is set from the seed model's own Newton step (below).
     let mut radius_set = false;
     let mut prev_free: Option<Vec<usize>> = None;
@@ -259,17 +269,24 @@ fn exact_trust_region(
             model_b.as_ref().and_then(|b| {
                 let g: Vec<f64> = match &last {
                     Some((xl, gl)) if *xl == x => gl.clone(),
-                    _ => exact_gradient_at_modes(
-                        model,
-                        population,
-                        problem.init_params,
-                        &x,
-                        &etas,
-                        &kappas,
-                        options,
-                        &axes,
-                    )
-                    .unwrap_or_else(|| rows_gradient(&x, &etas, &kappas)),
+                    _ => (!gradient_out_of_scope.get())
+                        .then(|| {
+                            exact_gradient_at_modes(
+                                model,
+                                population,
+                                problem.init_params,
+                                &x,
+                                &etas,
+                                &kappas,
+                                options,
+                                &axes,
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or_else(|| {
+                            gradient_out_of_scope.set(true);
+                            rows_gradient(&x, &etas, &kappas)
+                        }),
                 };
                 let mut b = b.clone();
                 if let Some((xl, gl)) = last.as_ref().filter(|(xl, _)| *xl != x) {
@@ -286,16 +303,28 @@ fn exact_trust_region(
         let (g_ax, h_ax): (Vec<f64>, DMatrix<f64>) = match quasi {
             Some(gb) => gb,
             None => {
-                n_exact += 1;
-                match exact_candidate_hessian(
-                    model,
-                    population,
-                    problem.init_params,
-                    &x,
-                    &warm,
-                    options,
-                    &axes,
-                ) {
+                let exact = if hessian_out_of_scope {
+                    Err(ExactDecline::OutOfScope)
+                } else if unresolved_at.as_ref() == Some(&x) {
+                    Err(ExactDecline::NotResolved)
+                } else {
+                    n_exact += 1;
+                    exact_candidate_hessian(
+                        model,
+                        population,
+                        problem.init_params,
+                        &x,
+                        &warm,
+                        options,
+                        &axes,
+                    )
+                };
+                match exact {
+                    Err(ExactDecline::OutOfScope) => hessian_out_of_scope = true,
+                    Err(ExactDecline::NotResolved) => unresolved_at = Some(x.clone()),
+                    Ok(_) => {}
+                }
+                match exact {
                     Ok(gh) => gh,
                     // Out of the exact scope: the same model from the finite-difference
                     // Hessian of the same objective, and the #2974 rows' gradient.
@@ -371,6 +400,26 @@ fn exact_trust_region(
             .map(|k| axes.iter().position(|&a| a == k).map_or(0.0, |i| g_ax[i]) + pg[k])
             .collect();
         last_g = Some(g_full.clone());
+        // `optimizer_trace`: one row per iteration, at the point its model is built, as the
+        // built-in descents write theirs (the unpenalized OFV, the gradient there, and the
+        // packed norm of the step that led to it).
+        if crate::estimation::trace::is_active() && traced_at.as_ref() != Some(&x) {
+            traced_at = Some(x.clone());
+            let p = unpack_params(&x, problem.init_params);
+            let clean = f - problem.nn_reg.penalty_value(&p.theta) - problem.priors.penalty(&x);
+            crate::estimation::trace::write_foce(
+                it,
+                crate::estimation::trace::method_label(options),
+                clean,
+                Some(l2_norm(&g_full)),
+                last_step.take(),
+                "trust_region",
+                None,
+                None,
+                &crate::estimation::parameterization::coordinate_values(&p),
+                Some(&g_full),
+            );
+        }
         let fr: Vec<usize> = (0..axes.len())
             .filter(|&i| {
                 let k = axes[i];
@@ -447,6 +496,13 @@ fn exact_trust_region(
         }
         last_decrement = decrement;
         if decrement <= TR_EXACT_DECREMENT_TOL {
+            if !exact_here && unresolved_at.as_ref() == Some(&x) {
+                // The exact Hessian cannot be formed at this point (an EBE that does not
+                // re-converge at the covariance tolerance), so the stop rests on the secant
+                // model's decrement, with the exact gradient. Asking again here would spin.
+                converged = true;
+                break;
+            }
             if !exact_here {
                 // A stop is certified on the exact Hessian only.
                 refresh = true;
@@ -475,6 +531,11 @@ fn exact_trust_region(
         }
         let snorm = sy.norm();
         if fnew < f && rho > 1e-4 {
+            // The noise floor is measured at the incumbent: a new one starts unmeasured.
+            last_mismatch = f64::NAN;
+            last_step = Some(l2_norm(
+                &xn.iter().zip(&x).map(|(a, b)| a - b).collect::<Vec<f64>>(),
+            ));
             x = xn;
             f = fnew;
             etas = en;
@@ -1027,21 +1088,29 @@ pub(crate) fn optimize_trust_region_seeded(
         warnings.push(
             crate::estimation::outer_optimizer::basin_shift_restart_warning(cold.3, n_iterations),
         );
-        *problem.cached_etas.lock().unwrap() = cold.0;
+        // The cold modes whole, κ̂ included, in the layout every trial warm-starts from.
+        *problem.cached_etas.lock().unwrap() =
+            crate::estimation::outer_optimizer::outer_cache_warm_starts(model, &cold.0, &cold.2);
         *problem.cached_etas_kind.lock().unwrap() = PrevEtas::ModesHere;
         *problem.grad_cache.lock().unwrap() = None;
         let mut leg_options = options.clone();
         leg_options.outer_maxiter = options.outer_maxiter - n_iterations;
-        let (c, bx, it, fg, h, _, _) = exact_trust_region(
+        let (c, bx, it, fg, h, f0, _) = exact_trust_region(
             &problem,
             &best_x,
             &post_run_bounds,
             &leg_options,
             &mut tr_budget_spent,
         );
+        n_iterations += it;
+        if f0 >= 1e20 {
+            // The cold modes did not score a feasible start at this point: keep the leg it
+            // was to resume, unconverged, rather than adopt modes the guard refused.
+            converged = false;
+            break;
+        }
         converged = c;
         best_x = bx;
-        n_iterations += it;
         final_gradient = fg;
         held = h;
     }
@@ -1070,7 +1139,12 @@ pub(crate) fn optimize_trust_region_seeded(
                 .min(UNPROFILED_VERIFY_INNER_TOL),
         );
         leg_options.outer_maxiter = options.outer_maxiter - n_iterations;
-        *problem.cached_etas.lock().unwrap() = held.etas.clone();
+        *problem.cached_etas.lock().unwrap() =
+            crate::estimation::outer_optimizer::outer_cache_warm_starts(
+                model,
+                &held.etas,
+                &held.kappas,
+            );
         *problem.cached_etas_kind.lock().unwrap() = PrevEtas::ModesHere;
         *problem.grad_cache.lock().unwrap() = None;
         let (c, bx, it, fg, h, f0, f1) = exact_trust_region(
@@ -1080,18 +1154,24 @@ pub(crate) fn optimize_trust_region_seeded(
             &leg_options,
             &mut tr_budget_spent,
         );
-        let gain = f0 - f1;
+        // A leg that never scored a feasible start, or stopped before its first iteration,
+        // verified nothing: its zero gain is not a measurement.
+        let ran = it > 0 && f0 < 1e20 && f1 < 1e20;
+        let gain = if ran { f0 - f1 } else { f64::NAN };
         if options.verbose {
             eprintln!(
                 "Trust region: verification leg at inner_tol {:e}: gain {gain:.3e}, converged = {c}",
                 leg_options.inner_tol
             );
         }
-        converged = c || (gain.is_finite() && gain <= UNPROFILED_FIRST_LEG_GAIN);
-        best_x = bx;
         n_iterations += it;
-        final_gradient = fg;
-        held = h;
+        // A leg that did not run keeps the first leg's point, modes and gradient.
+        if ran {
+            converged = c || gain <= UNPROFILED_FIRST_LEG_GAIN;
+            best_x = bx;
+            final_gradient = fg;
+            held = h;
+        }
     }
     if crate::cancel::is_cancelled(&options.cancel) {
         warnings.push("Trust-region did not converge: cancelled by user".to_string());

@@ -437,13 +437,51 @@ pub fn optimize_population(
             )
         }
         Optimizer::TrustRegion => {
-            let result = crate::estimation::trust_region::optimize_trust_region_seeded(
+            // `global_search`: the NLopt leg's CRS2-LM pre-search, on the packed coordinates
+            // the trust region works in, and the local search from its best point. The
+            // pre-flight's modes were solved at the declared start, so a moved start is solved
+            // cold.
+            let mut presearch_warning = None;
+            let presearched = options.global_search.then(|| {
+                let PackedStart {
+                    packed: mut x0,
+                    bounds,
+                    ..
+                } = pack_with_bounds(init_params);
+                clamp_to_bounds(&mut x0, &bounds);
+                let unit = vec![1.0; x0.len()];
+                match run_global_presearch(
+                    model,
+                    population,
+                    init_params,
+                    options,
+                    &unit,
+                    &bounds.lower,
+                    &bounds.upper,
+                    &x0,
+                ) {
+                    Ok(best) => Some(unpack_params(&best, init_params)),
+                    Err(e) => {
+                        presearch_warning = Some(format!("global_search disabled: {e}"));
+                        None
+                    }
+                }
+            });
+            let (init_params, first_eval_etas) = match presearched.flatten() {
+                Some(ref start) => (start.clone(), None),
+                None => (init_params.clone(), first_eval_etas),
+            };
+            let init_params = &init_params;
+            let mut result = crate::estimation::trust_region::optimize_trust_region_seeded(
                 model,
                 population,
                 init_params,
                 options,
                 first_eval_etas,
             );
+            if let Some(w) = presearch_warning {
+                result.warnings.insert(0, w);
+            }
             // A start with no feasible objective (#1617) already carries its verdict; the
             // #2506 probe asks whether an unmoved *feasible* start is an optimum, and a rerun
             // from its perturbation would only repeat the infeasible solve.
@@ -5006,8 +5044,12 @@ pub(crate) fn verify_unmoved_start(
             &x0_free,
         ) < INIT_ESCAPE_STEP_S)
     };
-    // `!(… < …)` so a non-finite deviation counts as moved: nothing to probe.
-    if off_start(&result)
+    // `!(… < …)` so a non-finite deviation counts as moved: nothing to probe. An optimizer
+    // that publishes its own escape verdict (`left_init`, measured in the units it steps in:
+    // the trust region's curvature scaling) is read by it, so the probe and the reported
+    // `left_init` cannot disagree about whether the fit moved.
+    let moved = result.left_init.unwrap_or_else(|| off_start(&result));
+    if moved
         || budget == 0
         || crate::cancel::is_cancelled(&options.cancel)
         || !ofv_is_valid(result.ofv)
@@ -5058,7 +5100,7 @@ pub(crate) fn verify_unmoved_start(
             stalled
         }
         Some(true) => {
-            let left = off_start(&probe);
+            let left = probe.left_init.unwrap_or_else(|| off_start(&probe));
             verified_start_result(probe, left, result, start_ofv <= probe_ofv)
         }
         None => OuterResult {

@@ -158,13 +158,14 @@ gradient norm.
 
 `optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
 
-- **`nlopt_lbfgs`** — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`.
+- **`trust_region`** (since #2976; `nlopt_lbfgs` before) — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`.
 - **`bobyqa`** — otherwise: any model outside the analytic scope (for example an out-of-scope ODE/PD model or an SDE model), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
 
-Two cases override that rule:
+Three cases override that rule:
 
 - **More than 64 free packed parameters** (`BOBYQA_MAX_DIM`) → `nlopt_lbfgs` even on a finite-difference gradient. BOBYQA's interpolation set grows quadratically with the parameter count, so above that size O(n) FD passes are cheaper (#1064).
 - **Mixture models** (`[mixture]`) → `bobyqa` regardless of gradient availability, as the robust choice against label-switching multimodality (#977).
+- **`method = laplace`** → `nlopt_lbfgs`, which `fit()` sets for a Laplace stage left on `auto` (#317).
 
 Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. On an exact gradient, `trust_region` reached the best OFV from every one of 9 starts on a 26-model benchmark (234 fits), where `nlopt_lbfgs` stopped above it three times while reporting convergence, and it took 0.41× L-BFGS's iterations and the fewest CPU cycles (#2975; see [How `trust_region` works](#trust-region-method)). Earlier, limited benchmarking across ~10 real FOCEI datasets (#490) had found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
 

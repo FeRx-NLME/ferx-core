@@ -197,8 +197,11 @@ fn gauss_newton_and_trust_region_fall_back_to_fd() {
     let (e, f) = pair(&m, &p, &opts(EstimationMethod::FoceGn));
     // Measured 2.2e-6 / 1.1e-8 / 2.7e-4.
     check("gn", &e, &f, [2e-5, 1e-6, 2e-3]);
-    // To convergence, not three iterations: mid-descent the two routes' steps differ by the
-    // precision of their models, and the comparison would measure the path, not the answer.
+    // To convergence: both routes must reach the same optimum. A short fit measures the path
+    // instead (#2976): from this start the first step overshoots and is refused on both
+    // routes, so one iteration compares the start with itself, and the next, a step on the
+    // boundary of the trust region, goes a measurably different way on the exact and the FD
+    // Hessian (|ΔOFV| = 0.44 after two or three iterations).
     let o = FitOptions {
         optimizer: Optimizer::TrustRegion,
         outer_maxiter: 200,
@@ -211,12 +214,11 @@ fn gauss_newton_and_trust_region_fall_back_to_fd() {
         e.warnings,
         f.warnings
     );
-    // MEASURE (#2976). The trust region models with the exact Hessian; with every plan failing
-    // it models with the finite-difference Hessian of the same objective
-    // (`fd_candidate_hessian`), one rule at two precisions, and both must reach the same
-    // optimum. A different model on the fallback (it used BHHH before) put the forced fit 50
-    // OFV away.
-    check("trust-region", &e, &f, [1e-2, 1e-4, 3e-3]);
+    // Measured 1.5e-8 / 7.9e-6 / 2.6e-6 (#2976, Linux x86_64). The trust region models with
+    // the exact Hessian; with every plan failing it models with the finite-difference Hessian
+    // of the same objective (`fd_candidate_hessian`), one rule at two precisions, and both
+    // stop on the exact-or-FD decrement at one optimum. Bounds ~10–60× the measurement.
+    check("trust-region", &e, &f, [1e-6, 1e-4, 1e-4]);
 }
 
 #[test]

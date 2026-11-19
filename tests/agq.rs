@@ -932,6 +932,10 @@ fn focei_quadrature_out_of_analytic_scope_is_rejected() {
 /// Mutation (run): the old FOCE-only rows gradient as the fallback, or a FOCE objective in
 /// the exact derivatives, would descend on a different function and stop away from L-BFGS.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: two AGQ fits to convergence; opt in with --features slow-tests"
+)]
 fn trust_region_reaches_the_quadrature_optimum_lbfgs_reaches() {
     use ferx_core::api::check_model_options;
     use ferx_core::Optimizer;
@@ -963,11 +967,13 @@ fn trust_region_reaches_the_quadrature_optimum_lbfgs_reaches() {
     };
     let tr = run(Optimizer::TrustRegion);
     let lb = run(Optimizer::NloptLbfgs);
+    eprintln!("#2976 AGQ-3: trust region {} vs L-BFGS {}", tr.ofv, lb.ofv);
     assert!(tr.converged, "trust region: {:?}", tr.warnings);
     assert!(tr.ofv.is_finite() && lb.ofv.is_finite());
-    // MEASURE (#2976)
+    // Measured 2.5e-7 (−285.97388017 vs −285.97388042, Linux x86_64): 1e-5 is 40× that, and
+    // two orders under the 1e-3 a descent on the FOCE gradient would be off by.
     assert!(
-        (tr.ofv - lb.ofv).abs() < 1e-3,
+        (tr.ofv - lb.ofv).abs() < 1e-5,
         "trust region {} vs L-BFGS {} on the AGQ-3 objective",
         tr.ofv,
         lb.ofv
