@@ -107,6 +107,22 @@ the exact mixture gradient for every method (FOCE, FOCEI, Laplace, AGQ). An expl
 would replace the mixture objective with a one-class value; an estimating `laplace` stage
 already reports the mixture objective.
 
+Cross-checked against NONMEM 7.5.1 (`$MIX NSPOP=2`, `$EST METHOD=COND LAPLACIAN INTER`,
+`$COV MATRIX=R`; `nonmem_anchor/mixture_laplace.ctl` and the Tier-2
+`tests/mixture_laplace_nonmem_anchor.rs`) on the two-class clearance fixture of
+[Validation against NONMEM](#validation-against-nonmem):
+
+| Quantity | NONMEM | ferx |
+|---|---|---|
+| OFV (without constant) | 301.772953 | 301.772952 (at NONMEM's estimate: −3.8e-7) |
+| `TVCL1` (SE) | 0.949834 (0.1039) | 0.949848 (0.1042) |
+| `TVCL2` (SE) | 2.81952 (0.2533) | 2.81959 (0.2515) |
+| `V` (SE) | 10.0110 (0.1868) | 10.0110 (0.1867) |
+| `p(1)` (SE, delta-method) | 0.470531 (0.1021) | 0.470538 (0.1021) |
+
+The SEs are ferx's exact R and NONMEM's finite-difference R, evaluated at NONMEM's estimate;
+they agree to < 1 %, with `TVCL2` the largest gap, as under FOCEI below.
+
 ## Output
 
 For a mixture fit, `sdtab` gains two per-subject diagnostics, matching the

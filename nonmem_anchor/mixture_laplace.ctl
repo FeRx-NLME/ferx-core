@@ -2,9 +2,9 @@ $PROBLEM 2-class CL mixture, 1-cpt IV, LAPLACIAN (#3025 ferx Laplace mixture anc
 ; The `tests/nonmem/mixture_iv.ctl` model (two latent subpopulations differing only in
 ; clearance, constant mixing fraction, OMEGA / SIGMA fixed at the data-generating values)
 ; under NONMEM's Laplacian conditional estimation. ferx: `method = laplace`.
-; Reference run PENDING: NONMEM is not available where this was written, so no .lst / .ext
-; is committed; run it on tests/nonmem/mixture_iv.csv (copied next to this file) and compare
-; the OFV and the $COV SEs with `ferx` `method = laplace` on the same data.
+; Data: mixture_iv.csv next to this file (a copy of tests/nonmem/mixture_iv.csv). Run with
+; NONMEM 7.5.1 (nmfe75); outputs in results/mixture_laplace.{lst,ext}, compared with the
+; ferx twin mixture_laplace.ferx in tests/mixture_laplace_nonmem_anchor.rs.
 $INPUT ID TIME DV AMT EVID CMT WT
 $DATA mixture_iv.csv IGNORE=@
 $SUBROUTINES ADVAN1 TRANS2
