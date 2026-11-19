@@ -588,6 +588,12 @@ pub(crate) trait RecHooks: Sized {
     /// instead of the values it saw; every other type ignores it.
     #[inline]
     fn span_hint(_t0: Self, _t1: Self) {}
+    /// The point being recorded is one the value path declines (its repel sentinel: a rate or
+    /// state that overflowed, a probability that underflowed), so a recording that fails here is
+    /// a repelled point, not a failed plan. Nothing but a recording type has anything to note.
+    #[cfg(feature = "markov")]
+    #[inline]
+    fn note_declined() {}
     /// The span [`Self::span_hint`] left, taken (`None` once taken, and on every type but a
     /// recording one).
     #[inline]

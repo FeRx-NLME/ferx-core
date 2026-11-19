@@ -111,7 +111,7 @@ pub(crate) fn subject_adjoint_cov_hessian_at(
 ) -> Option<DMatrix<f64>> {
     match cov_hessian(model, subject, pt, eta_hat, objective, HessianSel::Full)? {
         HessianOut::Full(h) => Some(h),
-        HessianOut::Diag(_) => None,
+        HessianOut::Diag(_) | HessianOut::Block(..) => None,
     }
 }
 
@@ -139,7 +139,7 @@ pub(crate) fn subject_adjoint_cov_diag_at(
         HessianSel::Diag(axes),
     )? {
         HessianOut::Diag(d) => Some(d),
-        HessianOut::Full(_) => None,
+        HessianOut::Full(_) | HessianOut::Block(..) => None,
     }
 }
 
@@ -155,6 +155,22 @@ pub(crate) fn subject_adjoint_cov_block_at(
     objective: Objective,
     axes: &[usize],
 ) -> Option<DMatrix<f64>> {
+    subject_adjoint_cov_block_with_gradient_at(model, subject, pt, eta_hat, objective, axes)
+        .map(|(_, h)| h)
+}
+
+/// [`subject_adjoint_cov_block_at`] and, from the same pass, the total packed gradient along
+/// `axes` (`dFᵢ/dx_a`, in `axes` order): the `∇Ψ_w` the block's sweeps form anyway. A caller
+/// that needs both (a log-packed coordinate's second derivative takes `−∂/∂x` on its diagonal)
+/// records one pass, not a Hessian and a second gradient.
+pub(crate) fn subject_adjoint_cov_block_with_gradient_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+    axes: &[usize],
+) -> Option<(Vec<f64>, DMatrix<f64>)> {
     if axes.iter().any(|&i| i >= pt.x.len()) {
         return None;
     }
@@ -166,8 +182,8 @@ pub(crate) fn subject_adjoint_cov_block_at(
         objective,
         HessianSel::Block(axes),
     )? {
-        HessianOut::Full(h) => Some(h),
-        HessianOut::Diag(_) => None,
+        HessianOut::Block(g, h) => Some((g, h)),
+        HessianOut::Full(_) | HessianOut::Diag(_) => None,
     }
 }
 
@@ -182,10 +198,12 @@ enum HessianSel<'a> {
     Block(&'a [usize]),
 }
 
-/// A covariance Hessian, or the diagonal a [`HessianSel::Diag`] asked for.
+/// A covariance Hessian, the diagonal a [`HessianSel::Diag`] asked for, or the block a
+/// [`HessianSel::Block`] asked for with the total gradient along its axes.
 enum HessianOut {
     Full(DMatrix<f64>),
     Diag(Vec<f64>),
+    Block(Vec<f64>, DMatrix<f64>),
 }
 
 impl HessianOut {
@@ -193,6 +211,9 @@ impl HessianOut {
         match self {
             HessianOut::Full(h) => h.iter().all(|v| v.is_finite()),
             HessianOut::Diag(d) => d.iter().all(|v| v.is_finite()),
+            HessianOut::Block(g, h) => {
+                g.iter().all(|v| v.is_finite()) && h.iter().all(|v| v.is_finite())
+            }
         }
     }
 }
@@ -213,9 +234,10 @@ fn cov_hessian(
         return match sel {
             HessianSel::Full => Some(HessianOut::Full(DMatrix::zeros(n, n))),
             HessianSel::Diag(axes) => Some(HessianOut::Diag(vec![0.0; axes.len()])),
-            HessianSel::Block(axes) => {
-                Some(HessianOut::Full(DMatrix::zeros(axes.len(), axes.len())))
-            }
+            HessianSel::Block(axes) => Some(HessianOut::Block(
+                vec![0.0; axes.len()],
+                DMatrix::zeros(axes.len(), axes.len()),
+            )),
         };
     }
     let sc = super::scope(model, subject, pt, eta_hat)?;
@@ -395,7 +417,11 @@ fn hessian_with(
         .map(|(c, &i)| Dir::x(i, (0..sc.width).map(|k| eta_x[(k, c)]).collect()))
         .collect();
     let out = match sel {
-        HessianSel::Full | HessianSel::Block(_) => HessianOut::Full(psi_along(&plan, &w, &dirs)?.1),
+        HessianSel::Full => HessianOut::Full(psi_along(&plan, &w, &dirs)?.1),
+        HessianSel::Block(_) => {
+            let (g, h) = psi_along(&plan, &w, &dirs)?;
+            HessianOut::Block(g.as_slice().to_vec(), h)
+        }
         HessianSel::Diag(_) => HessianOut::Diag(psi_diag(&plan, &w, &dirs)?),
     };
     out.all_finite().then_some(out)

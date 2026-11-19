@@ -976,8 +976,8 @@ fn collect_breaks<T: PkNum>(
     // review #3), and a cancelled lagged dose's arrival moves nothing.
     //
     // Breaks that coincide at the value level each keep their own jet: a group's crossing is
-    // taken below (the provider's `moving_bounds_separable` declines only a break on a reset or
-    // a covariate change, and a sample on several).
+    // taken below (no coincidence declines: a reset or covariate change on a moving break and
+    // a sample on several are served, `coincident_moving_breaks_are_served_and_match_fd`).
     //
     // Only boundaries that genuinely *move* are recorded: with no lagtime and no modeled
     // window nothing does, so this stays empty and `dual_pos` below is the same no-op scan it
@@ -1519,8 +1519,7 @@ fn apply_step_g<T: PkNum>(
 ///
 /// `None` (the overwhelmingly common case) when the sample sits on no moving boundary, or when
 /// nothing about the coincident boundary actually moves (a fixed window with no lagtime). The
-/// caller declines subjects where *several* moving boundaries coincide with one observation, so at
-/// most one applies here.
+/// a sample on several coincident boundaries applies each in turn.
 fn obs_boundary_correction<T: PkNum>(
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],

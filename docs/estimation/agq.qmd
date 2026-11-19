@@ -356,10 +356,12 @@ The fit output reports which route ran.
 
 A subject inside the scope can still miss the exact gradient at one trial point. If the inner
 search stops short of the mode (a Nelder–Mead fallback, for example) and the exact Hessian there
-is indefinite, the identity behind the exact score does not hold. The subject then takes the
-analytic gradient at its held EBE, which leaves out the EBE-response term, the same salvage
-FOCE and FOCEI use. The outer gradient fallback warning counts these subjects. The covariance
-step never uses a held-EBE score: it takes the exact score or the reconverged one.
+is indefinite, the identity behind the exact score does not hold. The subject then takes
+the exact score at its EBE re-solved at the trial point, which is stationary, so the identity
+holds there; where no recorder serves it either, it takes the reconverged finite-difference
+score. Neither leaves out the EBE-response term, which a held-EBE gradient would, and the
+outer gradient fallback warning counts only the reconverged subjects. The covariance step
+takes the exact score or the reconverged one the same way.
 
 ### Where AGQ stops
 

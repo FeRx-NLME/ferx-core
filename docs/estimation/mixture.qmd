@@ -169,8 +169,8 @@ assignment is identical for every subject.
 ### Standard errors
 
 A mixture fit runs the covariance step like any other fit: the Hessian is built on the
-**mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix under
-FOCE/FOCEI, the finite-difference stencil under Laplace/AGQ — and
+**mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix (a
+mixture under Laplace/AGQ is rejected, `E_MIXTURE_METHOD`) — and
 the standard errors are $\sqrt{\operatorname{diag}(R^{-1})}$. The mixing-fraction
 SE is reported on the scale the mixing form is written in — the coefficients of a
 `logit(k) = …` form carry a logit-scale SE, a `p(k) = …` probability an SE

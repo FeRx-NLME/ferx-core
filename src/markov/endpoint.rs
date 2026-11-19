@@ -219,12 +219,23 @@ impl CtmmTerm<'_> {
             let s = *n_states;
             let q = prog.eval_generator_colmajor_g(th, et, &self.subject.covariates)?;
             if super::has_negative_offdiagonal_g(&q, s) {
-                return None;
+                return repelled::<T, _>();
             }
-            nll = nll + crate::markov::ctmm_data_term_g(&q, s, &obs).ok()??;
+            let Some(term) = crate::markov::ctmm_data_term_g(&q, s, &obs).ok()? else {
+                return repelled::<T, _>();
+            };
+            nll = nll + term;
         }
         Some(nll)
     }
+}
+
+/// `None` for a point the value path scores as its repel sentinel: a recording there fails as a
+/// repelled point ([`RecHooks::note_declined`](crate::sens::num::RecHooks::note_declined)), not as
+/// a subject whose plan cannot be made.
+fn repelled<T: crate::sens::num::RecHooks, R>() -> Option<R> {
+    T::note_declined();
+    None
 }
 
 /// Exact `(value, ∂²/∂η²)` of [`ctmm_subject_nll`] from the subject's [`CtmmTerm`] plan
@@ -631,7 +642,7 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
         use crate::sens::num::BranchCmp::{Gt, Lt};
         for st in &nodes {
             if st.iter().any(|x| !x.br_abs_lt(f64::INFINITY)) {
-                return None;
+                return repelled::<T, _>();
             }
             let q = prog.generator_at_g(theta, eta, &cov_vec, &mut vars, st);
             for j in 0..s {
@@ -640,10 +651,10 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
                     if !v.br_abs_lt(f64::INFINITY)
                         || (v.abs() * T::from_f64(dt)).br_cmp_c(Gt, crate::markov::MAX_EXP_ARG_ABS)
                     {
-                        return None;
+                        return repelled::<T, _>();
                     }
                     if j != k && v.br_cmp_c(Lt, -1e-12) {
-                        return None;
+                        return repelled::<T, _>();
                     }
                 }
             }
@@ -718,7 +729,7 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
         );
         let p = sol.last()?.u[w[0].state * s + w[1].state];
         if !(p.br_abs_lt(f64::INFINITY) && p.br_cmp_c(Gt, 0.0)) {
-            return None;
+            return repelled::<T, _>();
         }
         let one = T::from_f64(1.0);
         let p = if T::RECORDS_BRANCHES {
@@ -1082,6 +1093,23 @@ mod tests {
         abstol: f64,
         method: Option<crate::ode::OdeMethod>,
     ) -> (CompiledModel, Subject) {
+        drug_driven_ctmm_with(
+            "-CL/V * central",
+            "exp(LQ01 + SLOPE * (central / V))",
+            reltol,
+            abstol,
+            method,
+        )
+    }
+
+    /// [`drug_driven_ctmm`] with the `central` right-hand side and the `s0 -> s1` intensity given.
+    fn drug_driven_ctmm_with(
+        rhs: &str,
+        q01: &str,
+        reltol: f64,
+        abstol: f64,
+        method: Option<crate::ode::OdeMethod>,
+    ) -> (CompiledModel, Subject) {
         use crate::types::DoseEvent;
         let src = r"
 [parameters]
@@ -1101,7 +1129,7 @@ mod tests {
   ode(obs_cmt=central, states=[central])
 
 [odes]
-  d/dt(central) = -CL/V * central
+  d/dt(central) = @RHS@
 
 [error_model]
   DV ~ proportional(PROP)
@@ -1110,10 +1138,11 @@ mod tests {
   type   = ctmm
   cmt    = 5
   states = [s0=0, s1=1]
-  transition s0 -> s1 = exp(LQ01 + SLOPE * (central / V))
+  transition s0 -> s1 = @Q01@
   transition s1 -> s0 = exp(LQ10)
 ";
-        let mut model = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let src = src.replace("@RHS@", rhs).replace("@Q01@", q01);
+        let mut model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
         if let Some(ode) = model.ode_spec.as_mut() {
             ode.solver_opts.reltol = reltol;
             ode.solver_opts.abstol = abstol;
@@ -1128,6 +1157,123 @@ mod tests {
             DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
         ];
         (model, subject)
+    }
+
+    /// #3004: a trial point the value path repels (its `1e20` sentinel) is not a failed plan. The
+    /// recorder declines there as the value path does — a rate whose `Δt·|q|` overflows, an
+    /// observed transition whose probability underflows — and before the fix that decline was
+    /// counted against the subject, which then took finite differences at every later point
+    /// (`W_PLAN_FD_FALLBACK`, 23 of 60 subjects on `examples/ctmm_pd_2state.ferx` under L-BFGS).
+    /// One model and subject throughout: the point of each assertion is what the repelled point
+    /// leaves behind. Each point sits on one guard of `inhomogeneous_nll_g`, so a mutation of
+    /// either site's note reddens its own point; the control after both (the ordinary point of
+    /// [`a_drug_driven_ctmm_is_differentiated_exactly`], gradient, θ-score and Hessian against
+    /// Richardson differences) says the plan still serves, which a poisoned subject would not.
+    #[test]
+    fn a_repelled_drug_driven_trial_point_does_not_fail_the_subjects_plan() {
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures;
+        let (model, subject) = drug_driven_ctmm(1e-12, 1e-14, None);
+        // (θ, which guard): `exp(-6 + 0.15·C)` with `C = 1000` is a finite rate past
+        // `MAX_EXP_ARG_ABS` once scaled by the gap; slope −5 drives it to `exp(-5000) = 0`, so
+        // the observed `s0 → s1` probability underflows.
+        for (th, guard) in [
+            ([0.05, 0.1, -6.0, -0.7, 0.15], "rate overflow"),
+            ([0.05, 0.1, -6.0, -0.7, -5.0], "probability underflow"),
+        ] {
+            let sentinel = ctmm_subject_nll(&model, &subject, &th, &[0.0]);
+            assert!(
+                sentinel >= 1e19,
+                "{guard}: the value path repels: {sentinel}"
+            );
+            assert!(
+                ctmm_subject_eta_grad(&model, &subject, &th, &[0.0]).is_none(),
+                "{guard}: nothing to differentiate at a repelled point"
+            );
+            let failed = plan_failures(&model, std::slice::from_ref(&subject));
+            assert!(
+                failed.is_none(),
+                "{guard}: a repelled point is not a failed plan: {failed:?}"
+            );
+        }
+        let (worst_v, worst_g, worst_h) = drug_driven_gaps(&model, &subject);
+        assert!(worst_v < 1e-12, "value {worst_v:.2e}");
+        assert!(worst_g < 3e-6, "gradient {worst_g:.2e}");
+        assert!(worst_h < 1e-6, "Hessian {worst_h:.2e}");
+        assert!(plan_failures(&model, std::slice::from_ref(&subject)).is_none());
+
+        // The other two declines, each on a model of its own. A growing `central` (rate
+        // `CL/V = 1000`) overflows its dense state solve; an unconstrained intensity
+        // `LQ01 + SLOPE·C` driven negative is the value path's negative off-diagonal. Each is
+        // followed on the same subject by an ordinary point the plan must still serve.
+        for (rhs, q01, bad, good, what) in [
+            (
+                "CL/V * central",
+                "exp(LQ01 + SLOPE * (central / V))",
+                [100.0, 0.1, -0.7, -1.2, 0.1],
+                [1.0, 10.0, -0.7, -1.2, 0.1],
+                "a non-finite dense state (a recorded value, so flagged without a note of its own)",
+            ),
+            (
+                "-CL/V * central",
+                "LQ01 + SLOPE * (central / V)",
+                [1.0, 10.0, -6.0, -1.2, -5.0],
+                [1.0, 10.0, 3.0, -1.2, 0.1],
+                "a negative off-diagonal rate",
+            ),
+        ] {
+            let (model, subject) = drug_driven_ctmm_with(rhs, q01, 1e-10, 1e-12, None);
+            assert!(ctmm_subject_nll(&model, &subject, &bad, &[0.0]) >= 1e19);
+            assert!(ctmm_subject_eta_grad(&model, &subject, &bad, &[0.0]).is_none());
+            let failed = plan_failures(&model, std::slice::from_ref(&subject));
+            assert!(
+                failed.is_none(),
+                "{what}: a repelled point is not a failed plan: {failed:?}"
+            );
+            let (v, _) = ctmm_subject_eta_grad(&model, &subject, &good, &[0.0])
+                .unwrap_or_else(|| panic!("{what}: the plan still serves at an ordinary point"));
+            assert!((v - ctmm_subject_nll(&model, &subject, &good, &[0.0])).abs() < 1e-9);
+        }
+    }
+
+    /// [`a_repelled_drug_driven_trial_point_does_not_fail_the_subjects_plan`] for a
+    /// time-homogeneous generator: `η = 50` puts the rate at `exp(49) ≈ 2e21`, past the `expm`
+    /// argument guard, where [`ctmm_data_term_g`](crate::markov::ctmm_data_term_g) declines.
+    #[test]
+    fn a_repelled_homogeneous_trial_point_does_not_fail_the_subjects_plan() {
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures;
+        let model = crate::parser::model_parser::parse_model_string(MIXED_CTMM).expect("parse");
+        let subject = ctmm_subject(&[(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0)]);
+        let theta = [-0.7_f64, -1.2];
+        assert!(ctmm_subject_nll(&model, &subject, &theta, &[50.0]) >= 1e19);
+        assert!(ctmm_subject_eta_grad(&model, &subject, &theta, &[50.0]).is_none());
+        let failed = plan_failures(&model, std::slice::from_ref(&subject));
+        assert!(
+            failed.is_none(),
+            "a repelled point is not a failed plan: {failed:?}"
+        );
+        // An unconstrained intensity driven negative: the value path's negative off-diagonal.
+        let linear = MIXED_CTMM.replace("exp(LQ01 + ETA_Q)", "LQ01 + ETA_Q");
+        let model_l = crate::parser::model_parser::parse_model_string(&linear).expect("parse");
+        assert!(ctmm_subject_nll(&model_l, &subject, &theta, &[0.0]) >= 1e19);
+        assert!(ctmm_subject_eta_grad(&model_l, &subject, &theta, &[0.0]).is_none());
+        let failed = plan_failures(&model_l, std::slice::from_ref(&subject));
+        assert!(
+            failed.is_none(),
+            "a negative off-diagonal is not a failed plan: {failed:?}"
+        );
+        assert!(ctmm_subject_eta_grad(&model_l, &subject, &[2.0, -1.2], &[0.3]).is_some());
+        let (v, g) = ctmm_subject_eta_grad(&model, &subject, &theta, &[0.3])
+            .expect("the plan still serves at an ordinary point");
+        let h = 1e-6;
+        let fd = (ctmm_subject_nll(&model, &subject, &theta, &[0.3 + h])
+            - ctmm_subject_nll(&model, &subject, &theta, &[0.3 - h]))
+            / (2.0 * h);
+        assert!((v - ctmm_subject_nll(&model, &subject, &theta, &[0.3])).abs() < 1e-12);
+        assert!(
+            (g[0] - fd).abs() < 1e-6 && g[0].abs() > 1e-3,
+            "{} vs {fd}",
+            g[0]
+        );
     }
 
     /// The worst relative gaps of the drug-driven fixture: the exact path's value against the
