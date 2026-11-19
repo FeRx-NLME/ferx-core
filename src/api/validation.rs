@@ -506,7 +506,10 @@ fn reader_warning_code(w: &str) -> &str {
 fn check_per_cmt_scaling(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     match pk::validate_per_cmt_scaling(model, &population.subjects) {
         Ok(()) => Vec::new(),
-        Err(msg) => vec![Diagnostic::error("E_PER_CMT_SCALING", msg).with_block("scaling")],
+        Err(msg) => {
+            let block = if model.is_algebraic() { "structural_model" } else { "scaling" };
+            vec![Diagnostic::error("E_PER_CMT_SCALING", msg).with_block(block)]
+        }
     }
 }
 
