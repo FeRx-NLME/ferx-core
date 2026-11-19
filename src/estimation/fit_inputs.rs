@@ -238,12 +238,14 @@ fn check_levels_and_content(
     fingerprint: Option<&PopulationFingerprint>, model: &CompiledModel, population: &Population,
     source: PopulationSource,
 ) -> Result<(), EngineError> {
-    crate::diagnostics::first_error(&crate::api::check_covariate_levels(model, population))?;
+    crate::diagnostics::first_error(&crate::model_checks::check_covariate_levels(
+        model, population,
+    ))?;
     let Some(fingerprint) = fingerprint else {
-        return crate::diagnostics::first_error(&crate::api::check_level_index_columns(
+        return crate::diagnostics::first_error(&crate::model_checks::check_level_index_columns(
             model,
             population,
-            crate::api::LevelDataEntry::PostHoc,
+            crate::model_checks::LevelDataEntry::PostHoc,
         ));
     };
     match fingerprint.first_content_difference(population) {
@@ -534,7 +536,7 @@ fn resolve_fit_inputs_unattributed<'a>(
                 crate::levels::write_fitted_level_columns(m, p, &m.data_bindings().levels)
                     .map_err(EngineError::from_diagnostic)?;
             }
-            crate::diagnostics::first_error(&crate::api::check_covariate_model_bound(m))?;
+            crate::diagnostics::first_error(&crate::model_checks::check_covariate_model_bound(m))?;
             // No recorded bindings to compare (an older `.fitrx`): the population
             // decides. After the level index write, so a population with a level the
             // model never saw keeps that refusal.
@@ -695,7 +697,7 @@ fn population_mismatch(
 ) -> EngineError {
     // A population read without the model's endpoint routing keeps `fit()`'s own
     // refusal and code (`E_ENDPOINT_UNROUTED`, #1199): it names the reader to use.
-    let unrouted = crate::api::check_endpoint_routing(model, population, true);
+    let unrouted = crate::model_checks::check_endpoint_routing(model, population, true);
     if let Err(e) = crate::diagnostics::first_error(&unrouted) {
         return e;
     }
@@ -704,11 +706,14 @@ fn population_mismatch(
     // "`k` of `n`"): a population bound for other levels is not the fit's, and hears
     // so below — `E_THETA_LEVELS_DATA_MISMATCH`'s "a fit of a model bound on this
     // population" is advice for new data, not for a post-hoc step on this fit.
-    let unbound: Vec<_> =
-        crate::api::check_level_index_columns(model, population, crate::api::LevelDataEntry::Run)
-            .into_iter()
-            .filter(|d| d.code == "E_THETA_LEVELS_DATA_UNBOUND")
-            .collect();
+    let unbound: Vec<_> = crate::model_checks::check_level_index_columns(
+        model,
+        population,
+        crate::model_checks::LevelDataEntry::Run,
+    )
+    .into_iter()
+    .filter(|d| d.code == "E_THETA_LEVELS_DATA_UNBOUND")
+    .collect();
     if let Err(e) = crate::diagnostics::first_error(&unbound) {
         return e;
     }

@@ -651,7 +651,7 @@ pub enum DoseAttrConsumption {
     /// (modeled duration), `R{n}` on `RATE=-1` (modeled rate). On an ordinary
     /// dataset the parameter is inert, so `R1` as a plain rate constant is a
     /// perfectly correct model; the collision can only be judged with the data, in
-    /// `crate::api::check_modeled_dose_rates`.
+    /// `crate::model_checks::check_modeled_dose_rates`.
     CodedRateOnly,
 }
 
@@ -1556,7 +1556,7 @@ impl Subject {
     /// discrete-state or count row yields exactly one record and one snapshot, so the two
     /// lists are parallel, unless the subject also carries time-to-event rows, which can
     /// yield zero or two records per row. Those subjects, and an in-memory subject whose
-    /// snapshot length does not match, return `None`. `crate::api::check_survival_tv_covariates`
+    /// snapshot length does not match, return `None`. `crate::model_checks::check_survival_tv_covariates`
     /// refuses such a subject when a predictor covariate varies, so `None` only ever stands
     /// for "the baseline is exact". Shared by the binary predictor (#2562) and the DTMM
     /// probabilities (#2473).
@@ -4610,7 +4610,7 @@ pub enum EndpointLikelihood {
         /// (analytic families — scale/shape/alpha/gamma/loghr). The analytic hazard
         /// is evaluated once per record with a *baseline* covariate snapshot (the
         /// [`HazardParamFn`] takes no time argument), so a time-varying covariate
-        /// here would be silently frozen; `crate::api::check_survival_tv_covariates`
+        /// here would be silently frozen; `crate::model_checks::check_survival_tv_covariates`
         /// rejects that up front (#741). Empty for [`HazardSpec::OdeAccumulated`],
         /// whose covariate dependencies flow through the ODE system and are guarded
         /// by the whole-subject time-varying-covariate check instead.
@@ -4646,7 +4646,7 @@ pub enum EndpointLikelihood {
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
         /// snapshot (the [`LinearPredictorFn`] takes no time argument), so a covariate
         /// listed here that turns out to be time-varying in the data is rejected at fit
-        /// setup by `crate::api::check_survival_tv_covariates` — the categorical
+        /// setup by `crate::model_checks::check_survival_tv_covariates` — the categorical
         /// analogue of [`Self::Tte`]'s `hazard_covariates` (#741).
         lp_covariates: Vec<String>,
     },
@@ -4683,7 +4683,7 @@ pub enum EndpointLikelihood {
         /// reached transitively through `[individual_parameters]`). Evaluated at a
         /// baseline snapshot, so a covariate listed here that is time-varying in
         /// the data is rejected at fit setup by
-        /// `crate::api::check_survival_tv_covariates` — the CTMM analogue of
+        /// `crate::model_checks::check_survival_tv_covariates` — the CTMM analogue of
         /// [`Self::Tte`]'s `hazard_covariates` and [`Self::Binary`]'s
         /// `lp_covariates` (#741).
         generator_covariates: Vec<String>,
@@ -4733,7 +4733,7 @@ pub enum EndpointLikelihood {
         /// reached through `[individual_parameters]`). Read at the **record being scored**,
         /// from the reader's per-row snapshot (`Subject::endpoint_covariates`); a subject
         /// whose snapshot cannot be aligned with its records while one of these varies is
-        /// refused at fit setup by `crate::api::check_survival_tv_covariates` (#741).
+        /// refused at fit setup by `crate::model_checks::check_survival_tv_covariates` (#741).
         prob_covariates: Vec<String>,
     },
     /// Count endpoint (#2877): a non-negative integer DV observed via

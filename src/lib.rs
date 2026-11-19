@@ -16,6 +16,7 @@ pub mod io;
 pub(crate) mod levels;
 #[cfg(feature = "markov")]
 pub mod markov;
+pub(crate) mod model_checks;
 pub mod model_selection;
 pub mod nn;
 pub(crate) mod occasions;

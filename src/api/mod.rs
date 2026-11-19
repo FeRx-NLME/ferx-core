@@ -77,7 +77,6 @@ pub use adaptive::{
 };
 pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
 pub use fit::{fit, fit_from_files};
-pub(crate) use validation::check_level_labels;
 // The fit-scoped pools live at the crate root (#3041); `api` keeps their public paths.
 pub(crate) use crate::pool::install_on_fit_pool;
 pub use crate::pool::{
@@ -244,12 +243,7 @@ pub(crate) fn model_preds(
 
 // ── Step 7: [output] validation and TAFD/TAD helpers ────────────────────────
 
-/// Mandatory sdtab column names that are always written — declaring them in
-/// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
-const OUTPUT_MANDATORY: &[&str] = &[
-    "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
-    "EPRED", "PWRES", "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
-];
+use crate::model_checks::OUTPUT_MANDATORY;
 
 // ── Step 8: post-fit extra column computation ────────────────────────────────
 
