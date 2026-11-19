@@ -61,8 +61,7 @@ const WARFARIN_F: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// [`WARFARIN_F`] with a two-class `[mixture]`, so `optimizer = auto` resolves to BOBYQA
-/// via `resolve_outer_optimizer` while `gradient_method_outer` still reports analytic.
+/// [`WARFARIN_F`] with a two-class `[mixture]`.
 const MIXTURE_F: &str = r#"
 [parameters]
   theta TVCL1(0.15, 0.001, 10.0)
@@ -217,8 +216,8 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
     );
 }
 
-/// PR #1418 review, finding 2. A mixture model with `optimizer = auto` runs **BOBYQA**:
-/// `resolve_outer_optimizer` downgrades `Auto` silently for `[mixture]`. A
+/// PR #1418 review, finding 2. A mixture model with an explicit `optimizer = bobyqa`
+/// (honoured, #2852; before #3025 `auto` resolved here too) runs **BOBYQA**. A
 /// derivative-free fit requests no outer gradient at all, so no subject can have taken an
 /// FD *outer* gradient and the warning must stay silent even with a subject the provider
 /// would decline.
@@ -230,7 +229,7 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
 /// which is asserted below alongside `FitResult::optimizer`. The warning's silence still
 /// comes from its runtime log, not from either report.
 #[test]
-fn a_derivative_free_mixture_auto_fit_does_not_warn() {
+fn a_derivative_free_mixture_fit_does_not_warn() {
     let model = crate::parse_model_string(MIXTURE_F).expect("mixture model parses");
     let mut population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
@@ -239,8 +238,8 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
     let options = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
-        // The knob under test: `auto` on a mixture model resolves to BOBYQA.
-        optimizer: Optimizer::Auto,
+        // The knob under test: BOBYQA on a mixture model.
+        optimizer: Optimizer::Bobyqa,
         outer_maxiter: 1,
         run_covariance_step: false,
         ..Default::default()
@@ -250,7 +249,7 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
 
     // Both reports describe the BOBYQA run (#1540), so the fixture is the derivative-free
     // fit this test is about.
-    assert_eq!(result.optimizer, "auto (bobyqa)");
+    assert_eq!(result.optimizer, "bobyqa");
     assert_eq!(
         result.gradient_method_outer, "N/A",
         "a derivative-free fit has no outer gradient to report"

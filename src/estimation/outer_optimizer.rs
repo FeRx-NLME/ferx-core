@@ -208,16 +208,14 @@ pub(crate) fn resolve_outer_optimizer(
     has_mixture: bool,
     analytic_outer_gradient: bool,
 ) -> (Optimizer, Option<String>) {
-    // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
-    // choice — robust against the mixture's label-switching multimodality. Since
-    // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
-    // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
-    // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. An explicit `bobyqa` is honoured too: it is
-    // the optimizer the mixture path runs, so nothing was replaced and no warning
-    // is owed (#2852). Every other choice (including `auto`, and the built-in
-    // BFGS / trust-region paths, which do not carry the mixture objective) falls
-    // back to BOBYQA.
+    // Mixture models (#977, #3025). An analytic posterior-weighted outer gradient exists
+    // for the mixture objective, so `auto` resolves exactly as for a single population
+    // (NLopt L-BFGS on the exact gradient where it is available, BOBYQA where it is
+    // not), and an explicit NLopt optimizer -- gradient-based or BOBYQA -- is honoured
+    // without a warning (#2852): those route through `optimize_nlopt`, whose objective
+    // closure branches to `mixture_gradient`. The built-in BFGS / L-BFGS and
+    // trust-region paths do not carry the mixture objective and fall back to NLopt
+    // L-BFGS, with a warning.
     if has_mixture {
         // Exhaustive, no wildcard: a new variant must say here whether it carries
         // the mixture objective.
@@ -225,11 +223,10 @@ pub(crate) fn resolve_outer_optimizer(
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
                 requested
             }
-            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
-            // trust-region paths do not carry the mixture objective.
-            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
-                Optimizer::Bobyqa
+            Optimizer::Auto => {
+                requested.resolve_auto_given_analytic(model, analytic_outer_gradient)
             }
+            Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => Optimizer::NloptLbfgs,
         };
         // The warning is owed exactly when an *explicit* choice did not run — keyed
         // on the outcome, not on a second list of variants, so "replaced" can never
@@ -238,9 +235,9 @@ pub(crate) fn resolve_outer_optimizer(
         let replaced = requested != Optimizer::Auto && resolved != requested;
         let warning = replaced.then(|| {
             format!(
-                "Mixture models are optimized with BOBYQA or an NLopt gradient method \
-                 (SLSQP / L-BFGS / MMA); the requested `{}` optimizer does not carry \
-                 the mixture objective and was replaced by BOBYQA.",
+                "Mixture models are optimized with an NLopt method (L-BFGS / SLSQP / MMA / \
+                 BOBYQA); the requested `{}` optimizer does not carry the mixture \
+                 objective and was replaced by NLopt L-BFGS.",
                 requested.label()
             )
         });
@@ -5339,27 +5336,45 @@ fn quadrature_predicted_remaining_gain(
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
     let formed: Vec<Vec<f64>>;
-    let per_subject: &[Vec<f64>] = match scores.filter(|s| s.len() == population.subjects.len()) {
-        Some(s) => s,
-        None => {
-            let context = crate::estimation::agq::SubjectScoreContext::new(
-                model,
-                init_params,
-                x,
-                options,
-                bounds,
-                false,
-            );
-            let subjects = &population.subjects;
-            formed = crate::par::map(subjects.len(), |i| {
-                let k = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                context
-                    .score_routed(&subjects[i], ehs.get(i)?.as_slice(), k, false)
-                    .map(|(g, _)| g)
-            })
-            .into_iter()
-            .collect::<Option<_>>()?;
-            &formed
+    // A mixture's rows are its class log-sum-exp gradients at every class's own mode, not the
+    // single-population score at the MIXEST class's `ehs` (which, read as one, predicts a
+    // phantom gain at the mixture's own optimum, #3025).
+    let mixture_rows;
+    let per_subject: &[Vec<f64>] = if init_params.mixture.is_some() {
+        mixture_rows = per_subject_outer_gradients_checked(
+            model,
+            population,
+            init_params,
+            x,
+            ehs,
+            kappas,
+            options,
+            false,
+        )?;
+        &mixture_rows
+    } else {
+        match scores.filter(|s| s.len() == population.subjects.len()) {
+            Some(s) => s,
+            None => {
+                let context = crate::estimation::agq::SubjectScoreContext::new(
+                    model,
+                    init_params,
+                    x,
+                    options,
+                    bounds,
+                    false,
+                );
+                let subjects = &population.subjects;
+                formed = crate::par::map(subjects.len(), |i| {
+                    let k = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    context
+                        .score_routed(&subjects[i], ehs.get(i)?.as_slice(), k, false)
+                        .map(|(g, _)| g)
+                })
+                .into_iter()
+                .collect::<Option<_>>()?;
+                &formed
+            }
         }
     };
     let n = x.len();
@@ -8640,7 +8655,10 @@ fn optimize_nlopt_attempt_probed(
                 if verbose {
                     eprintln!(
                         "Quadrature tolerance stop: a Newton step from the best point is \
-                         predicted to gain {gain:?} (polished above {polish_min_gain:e})."
+                         predicted to gain {} (polished above {polish_min_gain:e}).",
+                        gain.map_or("an amount that cannot be formed".to_string(), |g| format!(
+                            "{g:.3e}"
+                        ))
                     );
                 }
                 let polish = gain.is_none_or(|g| g > polish_min_gain);

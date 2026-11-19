@@ -954,22 +954,21 @@ fn run_model_simulate_survival_design_refusals_are_coded() {
     );
 }
 
-/// #3025 review item 3: `optimizer = auto` on a Laplace stage is NLopt L-BFGS for a single
-/// population but must resolve exactly as a FOCE/FOCEI mixture does (BOBYQA) for a
-/// mixture, while an explicit `nlopt_lbfgs` is honoured. Keyed on the model, not the method.
+/// #3025: `optimizer = auto` on a mixture is NLopt L-BFGS on the exact mixture gradient for
+/// every method (Laplace, FOCE, FOCEI), the same as a single population; an explicit
+/// `bobyqa` is honoured. One rule in `resolve_outer_optimizer`, keyed on the model.
 #[test]
-fn laplace_mixture_auto_resolves_to_bobyqa_and_explicit_lbfgs_is_honoured() {
+fn mixture_auto_resolves_to_lbfgs_for_every_method_and_explicit_bobyqa_is_honoured() {
     use crate::api::fit::stage_optimizer_request;
     use crate::estimation::outer_optimizer::resolve_outer_optimizer;
     use crate::types::Optimizer;
     let mix = parse_model_string(MIXTURE).expect("parse");
     let single = parse_model_string(ONE_CPT_IV).expect("parse");
     let resolve = |m: &CompiledModel, method, req| {
-        let request = stage_optimizer_request(m, method, req);
+        let request = stage_optimizer_request(method, req);
         resolve_outer_optimizer(request, m, m.mixture.is_some(), true).0
     };
-    // The single-population control: the L-BFGS promotion still happens, so the
-    // mixture exemption below is a real straddle of the model predicate.
+    // The single-population control resolves the same way.
     assert_eq!(
         resolve(&single, EstimationMethod::Laplace, Optimizer::Auto),
         Optimizer::NloptLbfgs
@@ -981,13 +980,15 @@ fn laplace_mixture_auto_resolves_to_bobyqa_and_explicit_lbfgs_is_honoured() {
     ] {
         assert_eq!(
             resolve(&mix, method, Optimizer::Auto),
-            Optimizer::Bobyqa,
-            "{method:?}: a mixture under `auto` is BOBYQA whatever the method"
+            Optimizer::NloptLbfgs,
+            "{method:?}: a mixture under `auto` is L-BFGS whatever the method"
         );
     }
-    assert_eq!(
-        resolve(&mix, EstimationMethod::Laplace, Optimizer::NloptLbfgs),
-        Optimizer::NloptLbfgs,
-        "an explicit nlopt_lbfgs is honoured"
-    );
+    for method in [EstimationMethod::Laplace, EstimationMethod::FoceI] {
+        assert_eq!(
+            resolve(&mix, method, Optimizer::Bobyqa),
+            Optimizer::Bobyqa,
+            "{method:?}: an explicit bobyqa is honoured"
+        );
+    }
 }

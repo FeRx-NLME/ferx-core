@@ -18981,3 +18981,47 @@ fn a_structural_decline_is_asked_every_evaluation() {
         assert_eq!(log.structural_probes.load(Ordering::Relaxed), k);
     }
 }
+
+/// #3025: the quadrature tolerance stop's predicted remaining gain, formed on a Laplace
+/// mixture, must read the mixture's own per-subject gradients. It used to form the
+/// single-population quadrature score of each subject at the MIXEST class's mode and
+/// predicted a gain of 5.43 OFV at the anchor optimum (`nonmem_anchor/mixture_laplace.ferx`,
+/// OFV 301.7730, which BOBYQA, L-BFGS and a 2000-evaluation BOBYQA all reach), sending an
+/// already-converged fit through polish legs. At the optimum (estimates to 5 digits) the
+/// decrement is the size of the rounding of those digits.
+///
+/// Mutation that must redden this: dropping the mixture branch of
+/// `quadrature_predicted_remaining_gain` (the single-population `score_routed` rows).
+#[test]
+fn quadrature_remaining_gain_of_a_laplace_mixture_is_zero_at_its_optimum() {
+    let (model, pop) = mixture_iv_fixture();
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        ..Default::default()
+    };
+    let gain_at = |theta: [f64; 4]| {
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+        let x = crate::estimation::parameterization::pack_params(&params);
+        quadrature_predicted_remaining_gain(
+            &model,
+            &pop,
+            &params,
+            &x,
+            &[],
+            &[],
+            None,
+            &compute_bounds(&params),
+            &opts,
+            &crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts),
+            &build_prior_set(&model, &params),
+        )
+        .expect("the mixture's exact per-subject gradients form")
+    };
+    let gain = gain_at([0.94985, 2.81959, 10.01103, -0.11795]);
+    eprintln!("w19 gain {gain}");
+    assert!(gain < 0.05, "predicted gain {gain} at the optimum");
+    // Moved off the optimum the same call predicts a real gain, so the number is live.
+    let gain_off = gain_at([1.2, 2.81959, 10.01103, -0.11795]);
+    assert!(gain_off > 1.0, "off-optimum gain {gain_off}");
+}

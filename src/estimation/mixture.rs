@@ -273,8 +273,7 @@ pub(crate) fn merged_classes_warning(findings: &[ClassCollapse]) -> Option<Strin
     Some(format!(
         "W_MIXTURE_MERGED_CLASSES: at the final estimates {}. The fit has fewer distinct \
          classes than `nsub`, which is often a local optimum rather than the best mixture: \
-         refit with class starts further apart, or with `optimizer = bobyqa`, and compare the \
-         objective (#2907).",
+         refit with class starts further apart and compare the objective (#2907).",
         parts.join("; ")
     ))
 }
@@ -3559,7 +3558,7 @@ mod tests {
     fn mixture_downgraded_optimizer_warns() {
         // #984 regression: a mixture cannot be driven by the built-in BFGS /
         // trust-region / Gauss-Newton optimizers (none carry the mixture objective),
-        // so an *explicit* such choice is run under BOBYQA — but must say so in
+        // so an *explicit* such choice is run under NLopt L-BFGS — but must say so in
         // FitResult.warnings rather than dropping the choice invisibly.
         let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
         let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
@@ -3573,7 +3572,7 @@ mod tests {
         assert!(
             res.warnings
                 .iter()
-                .any(|w| w.contains("BOBYQA") && w.contains("`bfgs`")),
+                .any(|w| w.contains("replaced by NLopt L-BFGS") && w.contains("`bfgs`")),
             "expected an optimizer-downgrade warning, got {:?}",
             res.warnings
         );
@@ -3581,7 +3580,7 @@ mod tests {
 
     #[test]
     fn mixture_default_optimizer_does_not_warn() {
-        // The default `auto` optimizer downgrades to BOBYQA by design and must stay
+        // The default `auto` optimizer is L-BFGS (#3025) and must stay
         // silent — only an explicitly-chosen unsupported optimizer warns.
         let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
         let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
@@ -3626,9 +3625,10 @@ mod tests {
     enum OnMixture {
         /// Runs as requested, no warning.
         Honoured,
-        /// `auto`: runs BOBYQA, silently.
-        SilentBobyqa,
-        /// Runs BOBYQA and says so, naming the requested optimizer as the user spells it
+        /// `auto`: resolves silently as for a single population (L-BFGS when the exact
+        /// gradient is available, BOBYQA when it is not; #3025).
+        SilentAuto,
+        /// Runs NLopt L-BFGS and says so, naming the requested optimizer as the user spells it
         /// in a model file (`Optimizer::label`), written out here so the test does not
         /// borrow the spelling from the code under test.
         Replaced(&'static str),
@@ -3640,7 +3640,7 @@ mod tests {
     fn on_mixture(requested: crate::types::Optimizer) -> OnMixture {
         use crate::types::Optimizer;
         match requested {
-            Optimizer::Auto => OnMixture::SilentBobyqa,
+            Optimizer::Auto => OnMixture::SilentAuto,
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
                 OnMixture::Honoured
             }
@@ -3666,8 +3666,8 @@ mod tests {
         ];
         let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
         for requested in ALL_OPTIMIZERS {
-            // The analytic flag is read only by the non-mixture `auto` rule; neither
-            // value may change what a mixture runs or whether a warning is owed.
+            // The analytic flag is read only by `auto`; neither value may change what an
+            // explicit choice runs or whether a warning is owed.
             for analytic in [true, false] {
                 let (resolved, warning) =
                     resolve_outer_optimizer(requested, &model, true, analytic);
@@ -3676,39 +3676,44 @@ mod tests {
                         assert_eq!(resolved, requested, "{requested:?} runs as requested");
                         assert_eq!(warning, None, "{requested:?} is honoured: no warning");
                     }
-                    OnMixture::SilentBobyqa => {
-                        assert_eq!(resolved, Optimizer::Bobyqa);
-                        assert_eq!(warning, None, "auto downgrades silently");
+                    OnMixture::SilentAuto => {
+                        let want = if analytic {
+                            Optimizer::NloptLbfgs
+                        } else {
+                            Optimizer::Bobyqa
+                        };
+                        assert_eq!(resolved, want, "auto follows the exact gradient");
+                        assert_eq!(warning, None, "auto resolves silently");
                     }
                     OnMixture::Replaced(name) => {
-                        assert_eq!(resolved, Optimizer::Bobyqa, "{requested:?} runs BOBYQA");
+                        assert_eq!(resolved, Optimizer::NloptLbfgs, "{requested:?} runs L-BFGS");
                         let w = warning
                             .unwrap_or_else(|| panic!("{requested:?} on a mixture must warn"));
                         assert!(
                             w.contains("does not carry the mixture objective")
-                                && w.contains("was replaced by BOBYQA"),
+                                && w.contains("was replaced by NLopt L-BFGS"),
                             "{requested:?}: {w}"
                         );
                         // The advice half: what the user can pick instead.
                         assert!(
                             w.starts_with(
-                                "Mixture models are optimized with BOBYQA or an NLopt gradient \
-                                 method (SLSQP / L-BFGS / MMA);"
+                                "Mixture models are optimized with an NLopt method \
+                                 (L-BFGS / SLSQP / MMA / BOBYQA);"
                             ),
                             "{requested:?}: message must say what a mixture can run: {w}"
                         );
                         // The discriminator and its negatives: the message names the
                         // optimizer that was asked for, in option spelling; never the
-                        // one that ran ("the requested `bobyqa` optimizer ... was
-                        // replaced by BOBYQA"); and never a Rust `Debug` name such as
+                        // one that ran ("the requested `nlopt_lbfgs` optimizer ... was
+                        // replaced by NLopt L-BFGS"); and never a Rust `Debug` name such as
                         // `TrustRegion`, which no model file contains.
                         assert!(
                             w.contains(&format!("the requested `{name}` optimizer")),
                             "{requested:?}: message must name {name}: {w}"
                         );
-                        assert!(!w.contains("`bobyqa`"), "{requested:?}: {w}");
+                        assert!(!w.contains("`nlopt_lbfgs`"), "{requested:?}: {w}");
                         assert!(
-                            !w.contains(&format!("{requested:?}")) && !w.contains("Bobyqa"),
+                            !w.contains(&format!("{requested:?}")) && !w.contains("NloptLbfgs"),
                             "{requested:?}: no Debug spelling in a user-facing message: {w}"
                         );
                     }
