@@ -3416,6 +3416,10 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         writeln!(f, "  saem_n_subjects_hmc: {n_hmc}").map_err(|e| e.to_string())?;
         writeln!(f, "  saem_n_subjects_mh: {n_mh}").map_err(|e| e.to_string())?;
     }
+    // The numerical M-step optimizer `mstep_optimizer = auto` resolved to (SAEM / IMP / IMPMAP).
+    if let Some(opt) = &result.mstep_optimizer_used {
+        writeln!(f, "  mstep_optimizer: {opt}").map_err(|e| e.to_string())?;
+    }
     // Effective seed of the NPDE/NPD simulation (only when those diagnostics
     // ran), so the sdtab NPDE/NPD columns can be regenerated exactly.
     if let Some(seed) = result.npde_seed {
@@ -4357,6 +4361,7 @@ mod tests {
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
+            mstep_optimizer_used: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
@@ -5885,6 +5890,7 @@ mod tests {
             saem_mu_ref_m_step_evals_saved: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
+            mstep_optimizer_used: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,

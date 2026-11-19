@@ -2572,3 +2572,53 @@ fn imh_runs_an_sde_fit() {
     assert!(rate > 0.5, "IMH acceptance {rate:.3}");
     assert!(r.ofv.is_finite());
 }
+
+/// `mstep_optimizer` reaches the numerical M-step of a SAEM fit: each value runs the solver it
+/// names and no other (`[bobyqa, lbfgs, newton]` solves on this thread), and every fit
+/// finishes with a finite objective.
+#[test]
+fn mstep_optimizer_reaches_the_saem_m_step() {
+    use crate::estimation::saem::MSTEP_ROUTE;
+    use crate::types::MstepOptimizer::{Auto, Bobyqa, Lbfgs, Newton};
+    // `TVV` has no ETA, so the closed-form steps do not own it: a numerical θ/σ M-step runs.
+    let model = parse_model_string(
+        &IV_MODEL
+            .replace("V  = TVV  * exp(ETA_V)", "V  = TVV")
+            .replace("  omega ETA_V  ~ 0.09\n", ""),
+    )
+    .expect("parse");
+    let pop = population_of(&well_conditioned_subject(), 6);
+    let mut ofv = Vec::new();
+    for opt in [Auto, Bobyqa, Lbfgs, Newton] {
+        MSTEP_ROUTE.with(|c| c.set([0; 3]));
+        let o = FitOptions {
+            method: EstimationMethod::Saem,
+            saem_n_exploration: 6,
+            saem_n_convergence: 6,
+            saem_seed: Some(3),
+            run_covariance_step: false,
+            mstep_optimizer: opt,
+            ..Default::default()
+        };
+        let r = run_saem(&model, &pop, &model.default_params, &o).expect("SAEM runs");
+        let used = MSTEP_ROUTE.with(|c| c.get());
+        let want = match opt {
+            Bobyqa => used[0] > 0 && used[1] == 0 && used[2] == 0,
+            Lbfgs => used[0] == 0 && used[1] > 0 && used[2] == 0,
+            // `auto` is `newton` on this in-scope model, and the fit records it.
+            Newton | Auto => used[0] == 0 && used[1] == 0 && used[2] > 0,
+        };
+        assert!(
+            want,
+            "{opt:?}: solves by [bobyqa, lbfgs, newton] = {used:?}"
+        );
+        let resolved = if opt == Auto { Newton } else { opt };
+        assert_eq!(
+            r.mstep_optimizer_used.as_deref(),
+            Some(resolved.as_str()),
+            "{opt:?}"
+        );
+        ofv.push(r.ofv);
+    }
+    assert!(ofv.iter().all(|v| v.is_finite()), "{ofv:?}");
+}
