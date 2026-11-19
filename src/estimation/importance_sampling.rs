@@ -12,8 +12,8 @@
 //! (sparse-data PK, strong nonlinearity).
 //!
 //! The kernel is rayon-parallel over subjects; per-subject RNGs are seeded
-//! from `options.imp_seed.wrapping_add(i as u64)` so the result is
-//! deterministic for a given seed.
+//! from `stream_seed(options.imp_seed, &[i])` (#3021: a hash, so runs under consecutive
+//! seeds share no subject stream) so the result is deterministic for a given seed.
 //!
 //! ## Adaptive evaluation (#2653)
 //!
@@ -70,13 +70,7 @@ pub(crate) fn inv_normal_cdf(u: f64) -> f64 {
     crate::stats::special::normal_inv_cdf(u.clamp(1e-15, 1.0 - 1e-15))
 }
 
-/// SplitMix64 finaliser: decorrelates the per-coordinate scramble seeds.
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    x ^ (x >> 31)
-}
+use crate::rng::{splitmix64, stream_seed};
 
 /// Hash-based nested uniform (Owen) scramble of a 32-bit Sobol coordinate
 /// (Burley 2020, "Practical Hash-based Owen Scrambling", after Laine & Karras
@@ -145,7 +139,7 @@ pub(crate) fn for_each_sobol_uniform(
         dim <= SOBOL_MAX_DIMS,
         "Sobol draws support at most {SOBOL_MAX_DIMS} dimensions but {dim} were requested"
     );
-    let dirs = &sobol_directions()[..dim];
+    let dirs = &sobol_directions(dim)[..dim];
     let seeds = owen_coordinate_seeds(dim, seed);
     let mut x = vec![0u32; dim];
     let mut u = vec![0.0f64; dim];
@@ -164,15 +158,36 @@ pub(crate) fn for_each_sobol_uniform(
     }
 }
 
-/// The 32-bit direction numbers of every coordinate [`sobol_params`] carries,
-/// built once. A coordinate's directions do not depend on how many follow it,
-/// so one table serves every dimension.
-fn sobol_directions() -> &'static [Vec<u32>] {
+/// The 32-bit direction numbers of the first `dim` coordinates, built once per process per
+/// table. A coordinate's directions do not depend on how many follow it, so one table serves
+/// every dimension up to its size. Up to [`SOBOL_MIN_DIMS`] coordinates — a random-effect
+/// screen or an importance-sampling draw of a model with at most that many ηs — the 100-row
+/// `minimal()` table is the one decompressed and expanded (a tenth of the work of the
+/// 1000-row one); it is the 1000-row table's own first 100 rows
+/// (`standard_sobol_table_extends_the_minimal_one`). Once the full table exists every call
+/// reads it, so a process never builds both for a small dimension.
+fn sobol_directions(dim: usize) -> &'static [Vec<u32>] {
+    use sobol::params::JoeKuoD6;
+    static SMALL: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
     static DIRS: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
-    DIRS.get_or_init(|| {
-        sobol::Sobol::<u32>::init_direction_vals(SOBOL_MAX_DIMS, 32, sobol_params())
-    })
+    if let Some(full) = DIRS.get() {
+        return full;
+    }
+    if dim <= SOBOL_MIN_DIMS {
+        SMALL.get_or_init(|| {
+            sobol::Sobol::<u32>::init_direction_vals(SOBOL_MIN_DIMS, 32, &JoeKuoD6::minimal())
+        })
+    } else {
+        DIRS.get_or_init(|| {
+            sobol::Sobol::<u32>::init_direction_vals(SOBOL_MAX_DIMS, 32, &JoeKuoD6::standard())
+        })
+    }
 }
+
+/// The rows of the `minimal()` Joe–Kuo table (`JoeKuoD6::minimal().max_dims()`, pinned by
+/// `the_small_and_full_direction_tables_agree_on_every_shared_coordinate`): the dimensions
+/// [`sobol_directions`] serves without the full one.
+const SOBOL_MIN_DIMS: usize = 100;
 
 /// Largest Sobol dimension [`sobol_params`] supports. A quasi-random draw uses
 /// `n_eta` coordinates plus one for a Student-t scale and one for a mixture
@@ -180,11 +195,10 @@ fn sobol_directions() -> &'static [Vec<u32>] {
 /// more, up front, rather than let `Sobol::new` panic.
 pub(crate) const SOBOL_MAX_DIMS: usize = 1000;
 
-/// Joe–Kuo D6 direction numbers for up to [`SOBOL_MAX_DIMS`] dimensions, parsed
-/// once. `JoeKuoD6::standard()` decompresses and parses its table on every
-/// call, and the samplers run once per subject per iteration. The 1000-row
-/// table is the 100-row `minimal()` table extended, so the first 100
-/// coordinates — every pre-#1965 Sobol draw — are unchanged.
+/// Joe–Kuo D6 direction numbers for up to [`SOBOL_MAX_DIMS`] dimensions, parsed once, for the
+/// tests that compare against the crate's own sequence. Production reads the expanded
+/// direction table ([`sobol_directions`]) and keeps no parsed parameters.
+#[cfg(test)]
 fn sobol_params() -> &'static sobol::params::JoeKuoD6 {
     static PARAMS: std::sync::OnceLock<sobol::params::JoeKuoD6> = std::sync::OnceLock::new();
     PARAMS.get_or_init(sobol::params::JoeKuoD6::standard)
@@ -318,10 +332,67 @@ fn eval_defensive_alpha(options: &FitOptions) -> f64 {
     }
 }
 
+/// What a pilot pass keeps of its draws: the ESS fraction and the weighted moments.
+struct PilotMoments {
+    ess_fraction: f64,
+    mean: Vec<f64>,
+    second_moment: DMatrix<f64>,
+}
+
+/// One pilot pass: [`subject_is_draws_with`] at unit scale, without the per-draw `Vec`s it
+/// retains for the M-step (the draws are stored flat), so the same draws and weights, and the
+/// same moments bit for bit. A pass with no usable proposal reports ESS 0.
+#[allow(clippy::too_many_arguments)]
+fn subject_pilot_moments(
+    obs_nll: &SampleObsNll<'_>,
+    eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>,
+    omega_inv: &DMatrix<f64>,
+    log_det_omega: f64,
+    d: usize,
+    k_samples: usize,
+    nu: f64,
+    seed: u64,
+    scratch: &mut EventPkParams,
+    mixture: Option<&DefensiveMixture>,
+) -> PilotMoments {
+    let mut flat: Vec<f64> = Vec::with_capacity(k_samples * d);
+    let Some(log_w) = is_log_weights(
+        obs_nll,
+        eta_hat,
+        h,
+        omega_inv,
+        log_det_omega,
+        d,
+        k_samples,
+        nu,
+        seed,
+        scratch,
+        1.0,
+        false,
+        mixture,
+        Some(&mut flat),
+    ) else {
+        return PilotMoments {
+            ess_fraction: 0.0,
+            mean: vec![0.0; d],
+            second_moment: DMatrix::zeros(d, d),
+        };
+    };
+    let (_, weights) = logsumexp_with_normalised(&log_w);
+    let ess_fraction = ess_from_weights(&weights) / (k_samples as f64);
+    let (mean, second_moment) = weighted_moments(&weights, &flat, d);
+    PilotMoments {
+        ess_fraction,
+        mean,
+        second_moment,
+    }
+}
+
 /// The proposal centre and precision a pilot's weighted moments give, or `None`
 /// when they cannot be used: too few effective draws, a non-finite moment, or a
 /// covariance that is not positive-definite.
-fn proposal_from_moments(draws: &SubjectDraws, k: usize) -> Option<(DVector<f64>, DMatrix<f64>)> {
+fn proposal_from_moments(draws: &PilotMoments, k: usize) -> Option<(DVector<f64>, DMatrix<f64>)> {
     let d = draws.mean.len();
     let min_ess = IS_ADAPT_MIN_ESS_PER_DIM * (d + 1) as f64;
     if !(draws.ess_fraction * k as f64 >= min_ess) {
@@ -367,7 +438,7 @@ fn adapt_proposal(
         if crate::cancel::is_cancelled(cancel) {
             break;
         }
-        let draws = subject_is_draws_with(
+        let draws = subject_pilot_moments(
             obs_nll,
             &center,
             &h,
@@ -378,8 +449,6 @@ fn adapt_proposal(
             nu,
             pilot_seed(seed, pass),
             scratch,
-            1.0,
-            false,
             mixture,
         );
         match proposal_from_moments(&draws, k_samples) {
@@ -596,6 +665,13 @@ pub fn run_importance_sampling(
     if k_samples < 2 {
         return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
     }
+    // Draws per pilot pass: `imp_adapt_samples`, or the full `imp_samples` when unset (0).
+    // After the `k_samples >= 2` check: `clamp` panics when its bounds cross.
+    let pilot_k = if options.imp_adapt_samples == 0 {
+        k_samples
+    } else {
+        options.imp_adapt_samples.clamp(2, k_samples)
+    };
     if nu.is_nan() || nu < 1.0 {
         return Err(format!(
             "IS: imp_proposal_df must be >= 1.0 or `normal`, got {}",
@@ -700,7 +776,7 @@ pub fn run_importance_sampling(
             }
             let eta_hat = &eta_hats[i];
             let kap = kappas.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            let subj_seed = seed.wrapping_add(i as u64);
+            let subj_seed = stream_seed(seed, &[i as u64]);
 
             if model.n_kappa > 0 && !kap.is_empty() {
                 // Joint (eta, kappa) sampling for IOV models. Ω_iov is guaranteed
@@ -757,7 +833,7 @@ pub fn run_importance_sampling(
                         &prior.inv,
                         prior.log_det,
                         n_b,
-                        k_samples,
+                        pilot_k,
                         nu,
                         subj_seed,
                         scratch,
@@ -853,7 +929,7 @@ pub fn run_importance_sampling(
                     &omega_inv,
                     log_det_omega,
                     n_eta,
-                    k_samples,
+                    pilot_k,
                     nu,
                     subj_seed,
                     scratch,
@@ -1093,9 +1169,7 @@ pub fn run_importance_sampling_mixture(
                     scratch,
                 );
                 let defensive = DefensiveMixture::new(&omega_inv, n_eta, defensive_alpha);
-                let subj_seed = seed
-                    .wrapping_add(i as u64)
-                    .wrapping_add((c as u64).wrapping_shl(40));
+                let subj_seed = stream_seed(seed, &[i as u64, c as u64]);
                 let (center, h_final) = adapted_eta_proposal(
                     model,
                     subject,
@@ -1813,7 +1887,7 @@ fn is_log_weights(
     iscale: f64,
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
-    mut keep: Option<&mut Vec<Vec<f64>>>,
+    mut keep: Option<&mut Vec<f64>>,
 ) -> Option<Vec<f64>> {
     let mut rng = StdRng::seed_from_u64(seed);
 
@@ -1912,7 +1986,7 @@ fn is_log_weights(
 
         log_w.push(log_p_y + log_p_eta - log_q);
         if let Some(etas) = keep.as_deref_mut() {
-            etas.push(eta_sample.clone());
+            etas.extend_from_slice(&eta_sample);
         }
     }
 
@@ -1940,7 +2014,7 @@ pub(crate) fn subject_is_draws_with(
     use_sobol: bool,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
-    let mut etas: Vec<Vec<f64>> = Vec::with_capacity(k_samples);
+    let mut flat: Vec<f64> = Vec::with_capacity(k_samples * d);
     let Some(log_w) = is_log_weights(
         obs_nll,
         eta_hat,
@@ -1955,7 +2029,7 @@ pub(crate) fn subject_is_draws_with(
         iscale,
         use_sobol,
         mixture,
-        Some(&mut etas),
+        Some(&mut flat),
     ) else {
         return SubjectDraws {
             log_marginal: 0.0,
@@ -1971,18 +2045,8 @@ pub(crate) fn subject_is_draws_with(
     let log_marginal = lse - (k_samples as f64).ln();
     let ess = ess_from_weights(&weights);
     let ess_fraction = ess / (k_samples as f64);
-
-    // Weighted first and second moments Σₖ w̃ₖ ηₖ and Σₖ w̃ₖ ηₖ ηₖᵀ.
-    let mut mean = vec![0.0_f64; d];
-    let mut second_moment = DMatrix::<f64>::zeros(d, d);
-    for (w, eta) in weights.iter().zip(etas.iter()) {
-        for i in 0..d {
-            mean[i] += w * eta[i];
-            for j in 0..d {
-                second_moment[(i, j)] += w * eta[i] * eta[j];
-            }
-        }
-    }
+    let (mean, second_moment) = weighted_moments(&weights, &flat, d);
+    let etas: Vec<Vec<f64>> = flat.chunks_exact(d).map(<[f64]>::to_vec).collect();
 
     SubjectDraws {
         log_marginal,
@@ -1992,6 +2056,22 @@ pub(crate) fn subject_is_draws_with(
         mean,
         second_moment,
     }
+}
+
+/// Weighted first and second moments `Σₖ w̃ₖ ηₖ` and `Σₖ w̃ₖ ηₖ ηₖᵀ` of draws stored flat,
+/// `d` per sample.
+fn weighted_moments(weights: &[f64], flat: &[f64], d: usize) -> (Vec<f64>, DMatrix<f64>) {
+    let mut mean = vec![0.0_f64; d];
+    let mut second_moment = DMatrix::<f64>::zeros(d, d);
+    for (w, eta) in weights.iter().zip(flat.chunks_exact(d)) {
+        for i in 0..d {
+            mean[i] += w * eta[i];
+            for j in 0..d {
+                second_moment[(i, j)] += w * eta[i] * eta[j];
+            }
+        }
+    }
+    (mean, second_moment)
 }
 
 /// The evaluation-only readout of [`subject_is_draws_with`]'s draws: the same
@@ -2066,9 +2146,7 @@ fn iscale_pilot_grid_search(
         let frac = g as f64 / (N_GRID - 1) as f64;
         let scale = (log_min + frac * (log_max - log_min)).exp();
         // Use a different seed per scale to avoid correlations
-        let pilot_seed = seed
-            .wrapping_add(0x4953_4341_4C45_0000u64)
-            .wrapping_add(g as u64);
+        let pilot_seed = stream_seed(seed, &[0x4953_4341_4C45_0000u64, g as u64]);
         if let Some(ess) = pilot_ess(scale, pilot_seed) {
             if ess > best_ess {
                 best_ess = ess;
@@ -3532,6 +3610,26 @@ mod tests {
         assert_eq!(old.len(), 100);
         assert!(old.iter().all(|v| v.len() == 32));
         assert_eq!(old, new);
+    }
+
+    /// [`sobol_directions`]' routing: [`SOBOL_MIN_DIMS`] is the `minimal()` table's size, a
+    /// dimension above it gets the full table (at 101 and at [`SOBOL_MAX_DIMS`]), and once the
+    /// full table exists a small dimension reads it too. The tables' agreement on their shared
+    /// rows is `standard_sobol_table_extends_the_minimal_one`'s. Mutations: `SOBOL_MIN_DIMS =
+    /// 128` -> the `max_dims` pin fails; routing on `SOBOL_MAX_DIMS` -> dims 101 and 1000 get 100 rows;
+    /// dropping the `DIRS.get()` early return -> the small dimensions read the small table.
+    #[test]
+    fn sobol_directions_routes_by_the_minimal_tables_size() {
+        use sobol::{params::JoeKuoD6, SobolParams};
+        assert_eq!(JoeKuoD6::minimal().max_dims(), SOBOL_MIN_DIMS);
+        for dim in [SOBOL_MIN_DIMS + 1, SOBOL_MAX_DIMS] {
+            assert_eq!(sobol_directions(dim).len(), SOBOL_MAX_DIMS, "dim {dim}");
+        }
+        // The full table now exists: every dimension reads it.
+        let full = sobol_directions(SOBOL_MAX_DIMS);
+        for dim in [1, SOBOL_MIN_DIMS] {
+            assert!(std::ptr::eq(sobol_directions(dim), full), "dim {dim}");
+        }
     }
 
     /// The defining property of Owen's nested scramble: points that share their
@@ -5102,12 +5200,9 @@ mod tests {
         assert_eq!(center[0], 0.26);
     }
 
-    fn pilot(ess_fraction: f64, mean: f64, second_moment: f64) -> SubjectDraws {
-        SubjectDraws {
-            log_marginal: 0.0,
+    fn pilot(ess_fraction: f64, mean: f64, second_moment: f64) -> PilotMoments {
+        PilotMoments {
             ess_fraction,
-            etas: Vec::new(),
-            weights: Vec::new(),
             mean: vec![mean],
             second_moment: scalar(second_moment),
         }

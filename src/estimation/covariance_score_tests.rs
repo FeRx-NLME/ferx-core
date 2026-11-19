@@ -10,9 +10,7 @@
 
 use super::{assemble_score_cross_product, pack_with_bounds, subject_total_score, PackedStart};
 use crate::estimation::inner_optimizer::find_ebe_for_stage;
-use crate::estimation::outer_optimizer::{
-    joint_warm_start, subject_reconverged_fd_gradient, subject_reconverged_fd_gradient_iov,
-};
+use crate::estimation::outer_optimizer::{joint_warm_start, subject_reconverged_fd_gradient};
 use crate::estimation::parameterization::compute_mu_k;
 use crate::sens::ode_provider::adjoint::PackedPoint;
 use crate::types::{CompiledModel, FitOptions, Population};
@@ -68,12 +66,13 @@ fn score_vs_oracle(
             &bounds,
             opts,
         );
-        let fd = if model.n_kappa > 0 {
-            let warm = joint_warm_start(&etas[i], &kappas[i]);
-            subject_reconverged_fd_gradient_iov(&x, template, model, subject, &warm, &bounds, opts)
+        let warm = if model.n_kappa > 0 {
+            joint_warm_start(&etas[i], &kappas[i])
         } else {
-            subject_reconverged_fd_gradient(&x, template, model, subject, &etas[i], &bounds, opts)
+            etas[i].clone()
         };
+        let fd =
+            subject_reconverged_fd_gradient(&x, template, model, subject, &warm, &bounds, opts);
         let (_, held) = crate::estimation::gauss_newton::subject_nll_pop_grad(
             &x, template, model, pop, i, &etas[i], &hs[i], &kappas[i], &bounds, opts,
         );

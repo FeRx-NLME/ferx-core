@@ -627,6 +627,11 @@ pub fn run_model_simulate_with_overrides(
     let binary_cmts: Vec<usize> = parsed.model.binary_cmts();
     #[cfg(not(feature = "survival"))]
     let binary_cmts: Vec<usize> = Vec::new();
+    // Count endpoints (#2877) observe on the same fixed grid.
+    #[cfg(feature = "survival")]
+    let count_cmts: Vec<usize> = parsed.model.count_cmts();
+    #[cfg(not(feature = "survival"))]
+    let count_cmts: Vec<usize> = Vec::new();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
             return Err(super::entry_refusals::simulation_design(
@@ -634,6 +639,13 @@ pub fn run_model_simulate_with_overrides(
                  (residual-error) endpoint that needs observation times — add \
                  `times = [...]` (a joint PK + TTE design needs both `times` and a \
                  `horizon`)",
+            ));
+        }
+        if !count_cmts.is_empty() {
+            return Err(super::entry_refusals::simulation_design(
+                "[simulation] has no `times`, but the model has a [count_model] endpoint. \
+                 A count is observed on a fixed schedule, so it needs `times = [...]` (a \
+                 `horizon` alone gives it nothing to observe)",
             ));
         }
         if !binary_cmts.is_empty() {
@@ -746,6 +758,19 @@ pub fn run_model_simulate_with_overrides(
                             cmt,
                         }
                     })
+                }))
+                // Count template rows (#2877), the same shape: `count = 0` is overwritten
+                // by the draw in the write-back below.
+                .chain(count_cmts.iter().flat_map(|&cmt| {
+                    sim_spec
+                        .obs_times
+                        .iter()
+                        .map(move |&time| crate::types::ObsRecord::Count {
+                            time,
+                            raw_time: time,
+                            count: 0,
+                            cmt,
+                        })
                 }))
                 .collect(),
             // `obs_records` is unconditional since Phase 4.0, but the only records
@@ -1011,6 +1036,44 @@ pub fn run_model_simulate_with_overrides(
                     }
                 });
             }
+        }
+
+        // Count write-back (#2877): the binary write-back's shape on `Count` rows —
+        // paired by `(cmt, raw_time)` with a queue per key, and a template that received
+        // no draw (a record with no count law, warned at draw time) dropped rather than
+        // fitted as an observed 0.
+        #[cfg(feature = "survival")]
+        if !count_cmts.is_empty() {
+            let mut drawn: HashMap<(usize, u64), std::collections::VecDeque<u32>> = HashMap::new();
+            for s in sims {
+                if let crate::types::SimOutcome::Count { count } = s.outcome {
+                    drawn
+                        .entry((s.cmt, s.time.to_bits()))
+                        .or_default()
+                        .push_back(count);
+                }
+            }
+            subject.retain_records(|rec| {
+                let crate::types::ObsRecord::Count {
+                    count,
+                    cmt,
+                    raw_time,
+                    ..
+                } = rec
+                else {
+                    return true;
+                };
+                match drawn
+                    .get_mut(&(*cmt, raw_time.to_bits()))
+                    .and_then(|q| q.pop_front())
+                {
+                    Some(next) => {
+                        *count = next;
+                        true
+                    }
+                    None => false,
+                }
+            });
         }
     }
 
@@ -1293,7 +1356,14 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
         .unwrap_or_default();
 
+    // Count CMTs (#2877) route to `ObsRecord::Count`.
+    #[cfg(feature = "survival")]
+    let count_cmts: std::collections::HashSet<usize> = model.count_cmts().into_iter().collect();
+    #[cfg(not(feature = "survival"))]
+    let count_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
+        .with_count(count_cmts)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
         .with_no_carry_forward(no_carry_forward)

@@ -281,6 +281,10 @@ fn superpose_doses<T: PkNum>(
         let Some(elapsed) = lagged_elapsed(dose, t_obs, d.lag_val, d.lag_d) else {
             continue;
         };
+        // Each dose's term its own chunk: its code depends on the dose's kind and the model, not
+        // on how many doses came before, so subjects with different designs share it (their
+        // times and amounts are the chunk's literals) and it is compiled once per model (#2980).
+        T::chunk_mark();
         // A degenerate `CL` or `V` drops the dose and a `NaN` one makes it `NaN`: the value
         // path's own override in `pk::single_dose_concentration`, from the same helper, so
         // this recording and the prediction it differentiates serve the same constant
@@ -314,7 +318,9 @@ fn superpose_doses<T: PkNum>(
 
 /// The model-level closed-form scope check behind `tvcov_analytical_supported` (and,
 /// before #2093, the retired `analytical_supported`) — everything except the
-/// `TIME`-routing clause (#637 review #1).
+/// `TIME`-routing clause (#637 review #1). It decides only whether the transit/IG absorption
+/// walk serves a subject or the exact ODE twin does (`walk_eligible`); a model it declines
+/// is differentiated by the twin, not by finite differences.
 fn analytical_supported_core(model: &CompiledModel) -> bool {
     // A compartment-free model (#811) carries a *placeholder* `pk_model` that the
     // `matches!` below would happily admit — and then every walk here would
@@ -342,16 +348,13 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         && scaling_supported(model)
         && init_supported(model)
         // Every individual-parameter slot must be one we differentiate; a slot outside
-        // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) routes to FD.
+        // `slot_to_dim`'s map (e.g. a modeled-dose `D{cmt}`/`R{cmt}` slot) is not served by
+        // the absorption walk: `walk_eligible` keeps such a subject on the exact ODE twin.
         && model.pk_indices.iter().all(|&s| slot_to_dim(s).is_some())
         && closed_form_slot_count_supported(model)
 }
 
-/// Widest differentiated-slot count the closed-form scope admits. Historically (before
-/// #2093) the forward provider's outer (`subject_sensitivities` → `run_obs`) and inner
-/// (`run_obs_grad`) dispatch tables enumerated `1..=9` and a wider model fell through their
-/// `_ => None` arm; the bound is kept so the absorption-walk scope
-/// (`absorption_walk_sens_in_scope`) is unchanged.
+/// Widest differentiated-slot count `closed_form_slot_count_supported` admits.
 const MAX_CLOSED_FORM_SLOTS: usize = 9;
 
 const ANALYTIC_MIXED_N: [usize; 2] = [4, 6];
@@ -368,22 +371,11 @@ thread_local! {
 
 /// Whether the model's differentiated-slot count fits the closed-form dispatch tables.
 ///
-/// Without this the count is unbounded: `analytical_supported_core` checks only that every
-/// slot *maps* via `slot_to_dim`, never how many there are. A readout that claims several
-/// spare slots (`allocate_readout_extra_slots` — text-referenced parameters, and synthetic
-/// direct θ/η as of #486) can push `pk_slots_ref()` past 9 on top of the structural set, so
-/// (before #2093) the then-predicate `analytical_supported` returned `true`, `build_info::gradient_method{,_inner}` persisted
-/// "analytic", and then *every* subject fell through `const_dispatch!`'s `_ => None` to
-/// finite differences at ~10× the cost — precisely the "claim analytic then FD every
-/// subject" drift the route predicates exist to prevent (#637). Declining
-/// here changes no numbers (those subjects already ran on FD); it makes the reported method
-/// match the route (PR #950 review #2).
-///
-/// Bounds the **program** slot list, which is what the readout allocator grows. (From #1899
-/// until its retirement in #2093 the `lognormal_param_derivatives` fallback dispatched on the
-/// same list — `CompiledModel::pk_slot_rows` is the program's `(pk_slot, var_slot)` pairs
-/// whenever a program exists — so the bound covered both routes; before #1899 it keyed on
-/// `model.pk_indices`, which this gate never saw.)
+/// `analytical_supported_core` checks only that every slot *maps* via `slot_to_dim`, never how
+/// many there are; a readout that claims several spare slots (`allocate_readout_extra_slots`)
+/// can push `pk_slots_ref()` past 9 on top of the structural set. Bounds the **program** slot
+/// list, which is what the readout allocator grows. Past the cap the walk declines and
+/// `walk_eligible` keeps the exact ODE twin (no finite differences).
 fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
     model
         .indiv_param_partials
@@ -531,7 +523,7 @@ pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
 /// walks differentiate exactly (#524): every init carries a compiled
 /// `amount_deriv` program and the `(θ, η)` axis count fits the init dispatch
 /// table (`1..=MAX_SCALE_AXES`, shared with the scale program). An init-free
-/// model is trivially supported; a hand-built init with no program routes to FD.
+/// model is trivially supported; a hand-built init with no program is not served by the walk.
 fn init_supported(model: &CompiledModel) -> bool {
     model.analytical_init.is_empty()
         || (model
@@ -544,7 +536,7 @@ fn init_supported(model: &CompiledModel) -> bool {
 /// `None` / constant `ScalarScale` (a per-jet divisor, `∂k/∂η = ∂k/∂θ = 0`), or an
 /// `ExpressionScale` carrying a `Dual2`-differentiable program whose axis counts
 /// match the model. `ExpressionScale` without a program
-/// and `PerCmt` route to FD.
+/// and `PerCmt` are not served by the walk.
 fn scaling_supported(model: &CompiledModel) -> bool {
     match &model.scaling {
         ScalingSpec::None | ScalingSpec::ScalarScale(_) => true,
@@ -587,9 +579,8 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
 /// forced?" — off the *same* predicate the live decision uses, rather than a second
 /// copy of the scope list that would drift from it.
 pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
-    // The adjoint gradient's model scope: it carries none of the retired (pre-#2093) forward
-    // provider's width or slot limits, and serves kappa with a residual `correlation … by` line (#1082 PR5,
-    // #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
+    // The adjoint gradient's model scope: it serves kappa with a residual `correlation … by`
+    // line (#1082 PR5, #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
     crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
 }
 
@@ -608,9 +599,8 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
 //   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
 // with `K = iov_occasion_groups(subject).len()`. The adjoint differentiates over that
 // stacked vector (the subject's own `[η, κ]` width, uncapped), so the caller's block-Ω
-// (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the clause-by-clause history
-// below describes the pre-#2093 forward provider; the predicate now only gates the
-// absorption-walk routing, `absorption_walk_sens_in_scope`.)
+// (BSV ⊕ K·IOV) assembly consumes it directly. (The clause-by-clause predicates below now
+// only gate the absorption-walk routing, `absorption_walk_sens_in_scope`.)
 
 /// Dual width of one IOV program evaluation on the outer builder: the declared θ, the
 /// combined `[η_bsv, κ]`, and — for a `[covariate_nn]` model — one axis per network
@@ -804,7 +794,8 @@ pub(crate) fn absorption_walk_sens_in_scope(model: &CompiledModel, subject: &Sub
 /// same shape as IOV, handled by the event-driven Dual2 walk rather than dose
 /// superposition).
 ///
-/// First cut (the rest routes to FD until the per-event dual walk is extended):
+/// First cut (the rest stays on the exact ODE twin, `walk_eligible`, until the per-event dual
+/// walk is extended):
 /// no IOV (the analytical gate already requires `n_kappa == 0`), no dose lagtime,
 /// no LTBS, and only `None` / constant `ScalarScale` output scaling. A constant
 /// `ScalarScale` divisor is covariate-independent, so it divides the whole jet
@@ -831,9 +822,9 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // the subject-static `t = 0` snapshot — BEFORE scaling, matching production's
     // `add_analytical_init` on `compute_predictions_with_tv` (which uses that same snapshot for
     // both amount and decay, so the impulse is independent of the TV-cov switching). Require
-    // `init_supported`: a hand-built init with no `amount_deriv` program still routes to FD
-    // there (before #2093 it also bounded the `(θ,η)` axis count to the retired
-    // `dispatch_init_impulse!` table).
+    // `init_supported`: a hand-built init with no `amount_deriv` program is not walk-served
+    // there (the subject stays on the exact ODE twin; before #2093 it also bounded the
+    // `(θ,η)` axis count to the retired `dispatch_init_impulse!` table).
     if !init_supported(model) {
         return false;
     }
@@ -855,7 +846,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     }
     // A model that reads a generated weight θ *directly* (`… + B_TYPICAL_PK_2_1`) breaks
     // the output-channel factorization the weight chain relies on; the parser records it
-    // and the model routes to FD, loudly (same predicate `nn_theta_gradient` uses).
+    // and the model is not walk-served (same predicate `nn_theta_gradient` uses).
     if nn_weight_theta_count(model) > 0 && !nn_output_chain_supported(model) {
         return false;
     }
@@ -863,7 +854,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // η-dependent `ExpressionScale` whose subject-static quotient is applied post-walk by
     // the adjoint's `closed_form_finish` (the same output stage the dose-superposition path
     // uses, #486 — closes the TV-cov + expression-scale gap). `scaling_supported` bounds the
-    // scale program to the dispatch table; `PerCmt` still routes to FD. LTBS is now admitted
+    // scale program to the dispatch table; `PerCmt` is still not walk-served. LTBS is now admitted
     // (#486): `closed_form_finish` applies the `ln(f)` transform LAST, after any
     // scale quotient — reproducing production's scale-then-log order `ln(f/s)` exactly (the
     // whole transform is post-walk on the closed-form path, unlike the ODE in-walk log). The

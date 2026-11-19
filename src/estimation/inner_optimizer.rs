@@ -18,18 +18,16 @@ const OBJ_MEMO: usize = 4;
 /// The inner-loop η-gradient route resolved for a subject. Reported in the
 /// startup banner ([`gradient_route_summary`]) and used by [`find_ebe`].
 ///
-/// The Enzyme AD path was retired; the two live routes are the exact analytic
-/// `Dual2` η-gradient ([`analytic_eta_nll_gradient`]) and central finite
-/// differences. The choice is [`analytic_inner_grad_supported`].
+/// The two routes are the exact adjoint η-gradient and central finite differences. The
+/// choice is [`analytic_inner_grad_supported`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InnerGradientMethod {
     /// Exact analytic η-gradient from the adjoint's unified recorder
     /// (`exact_obs_grads_into` / `exact_inner_gradient`) — one
     /// recorder evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
     Analytic,
-    /// Central finite differences. Used when the provider can't serve the model
-    /// (ODE, LTBS, time-varying covariates, SDE) or the `FERX_NO_ANALYTIC_INNER`
-    /// escape hatch is set. (η-dependent `ExpressionScale` is now analytic, #486.)
+    /// Central finite differences. Used when no recorder serves the model, or on the
+    /// `gradient = fd` / `FERX_NO_ANALYTIC_INNER` opt-outs.
     Fd,
 }
 
@@ -187,16 +185,18 @@ fn resolve_gradient_method_for_reporting(
     }
 }
 
-fn iov_inner_subject_route(
+pub(crate) fn iov_inner_subject_route(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
-    if model.default_params.omega_iov.is_none()
-        || analytic_inner_common_bail(model)
-        || subject_has_survival_records(subject)
-    {
+    // The search's own rule (`analytic_iov_inner_supported`): an endpoint term the exact
+    // programs serve folds into the BSV block, so such a subject is not an FD one.
+    if !iov_inner_rule(model, subject, model.default_params.omega_iov.is_some()) {
         return None;
+    }
+    if subject.obs_times.is_empty() && subject_has_survival_records(subject) {
+        return Some(Vec::new());
     }
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
     let stacked = vec![0.0; stacked_width(model.n_eta, model.n_kappa, k_occasions)];
@@ -233,11 +233,12 @@ pub(crate) fn iov_inner_residual_correlation(model: &CompiledModel, subject: &Su
     )
 }
 
-/// [`iov_fd_reason`]'s survival cause, named once so [`iov_fd_fallback_warning`] can lift its
-/// all-FD guard on it (#1861).
-const IOV_SURVIVAL_REASON: &str = "survival/TTE observations";
+/// [`iov_fd_reason`]'s non-Gaussian cause, named once so [`iov_fd_fallback_warning`] can lift
+/// its all-FD guard on it (#1861): a TTE, binary, CTMM or count record without an exact
+/// channel (`non_gaussian_eta_grad_served`), not survival alone.
+const IOV_SURVIVAL_REASON: &str = "non-Gaussian records without an exact channel";
 
-fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
+pub(crate) fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
@@ -247,11 +248,15 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if model.default_params.omega_iov.is_none() {
         return "missing omega_iov";
     }
-    if subject_has_survival_records(subject) {
+    if !non_gaussian_eta_grad_served(model, subject) {
         return IOV_SURVIVAL_REASON;
     }
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         return "model outside IOV analytic scope";
+    }
+    // `iov_inner_rule`'s FREM clause: the IOV marginal refuses the subject's FREM rows.
+    if crate::stats::likelihood::iov_refuses_frem(model, subject) {
+        return "FREM rows (the IOV marginal refuses them)";
     }
     // A nested-level subject never given its cells has no compact axes (#1082): every
     // recording declines it (`StackedLayout::sens_of` is `None`), on every model class.
@@ -365,8 +370,8 @@ pub(crate) fn fd_fallback_warning_skipping(
 /// Why [`subject_inner_fd_reason`] puts a subject on the FD inner gradient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InnerFdReason {
-    /// A non-Gaussian record the analytic inner gradient cannot serve — a TTE / count
-    /// term, or an endpoint without a dual program.
+    /// A non-Gaussian record the analytic inner gradient cannot serve — a TTE term without
+    /// an exact channel, or an endpoint without a dual program.
     Survival,
     /// A data or model shape the Gaussian recorder declines.
     Shape,
@@ -391,7 +396,7 @@ fn subject_inner_fd_reason(
 /// [`fd_fallback_warning`] counts it: the probe has to follow the route `find_ebe` takes.
 ///
 /// A subject carrying non-Gaussian records is FD whenever [`analytic_inner_grad_supported`]
-/// declines it — a TTE / count term, or an endpoint without a dual program — however well
+/// declines it — a TTE term without an exact channel, or an endpoint without a dual program — however well
 /// the Gaussian recorder serves its other rows (before #2024 the probe asked only the
 /// recorder, so a joint PK-TTE subject read as analytic, #1861). One with no Gaussian rows
 /// that the predicate admits is analytic without any recorder (prior plus the served
@@ -4355,8 +4360,10 @@ fn find_ebe_iov_seeded(
             };
         }
         let Some(layout) = &layout else {
-            // An unprepared nested subject: no axes, so no walk (`sens_of` declines it).
-            return fd(p);
+            // An unprepared nested subject (only a direct caller reaches it: `find_ebe_solve`
+            // refuses it first): its objective is the constant refusal sentinel, whose
+            // gradient is exactly zero.
+            return vec![0.0; n_flat];
         };
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
         // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`; the
@@ -4761,11 +4768,17 @@ fn refused_iov_ebe(model: &CompiledModel, subject: &Subject) -> EbeResult {
 
 /// Is the IOV solve's η-gradient (and its H) analytic for this subject? The guards are
 /// explained where `find_ebe_iov` reads this.
-fn analytic_iov_inner_supported(
+pub(crate) fn analytic_iov_inner_supported(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
 ) -> bool {
+    iov_inner_rule(model, subject, params.omega_iov.is_some())
+}
+
+/// The one rule behind both the search ([`analytic_iov_inner_supported`]) and the route report
+/// ([`iov_inner_subject_route`]): whether an IOV subject's inner solve is analytic.
+fn iov_inner_rule(model: &CompiledModel, subject: &Subject, has_omega_iov: bool) -> bool {
     // The inner recorder's scope, as the non-IOV inner (`analytic_inner_grad_supported`):
     // `model_in_scope` is the *outer* adjoint's, which refuses every non-Gaussian model —
     // a TTE + IOV model would then report an analytic label and run FD. A subject with no
@@ -4775,7 +4788,7 @@ fn analytic_iov_inner_supported(
         // by the covariate variance over the *PK* prediction, which is not the kernel's
         // `θ_i + η_e` row), so no exact inner gradient is the gradient of what is solved.
         && !crate::stats::likelihood::iov_refuses_frem(model, subject)
-        && params.omega_iov.is_some()
+        && has_omega_iov
         && !analytic_inner_common_bail(model)
         && non_gaussian_eta_grad_served(model, subject)
 }
@@ -5297,8 +5310,9 @@ pub(crate) fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subj
 /// [`discrete_subject_eta_grad`](crate::categorical::discrete_subject_eta_grad)).
 ///
 /// Strict on purpose. The inner gradient is a *sum* of term gradients, so admitting a
-/// subject that also carries a TTE or count record would silently drop that term's
-/// contribution — a wrong gradient, not a slow one. A TTE record is served when its
+/// subject that also carries a record whose term has no exact channel would silently drop
+/// that term's contribution — a wrong gradient, not a slow one. A count record (#2877) is
+/// served like a binary one, by its endpoint's `param_program`. A TTE record is served when its
 /// endpoint has an exact channel ([`crate::survival::tte_subject_eta_grad`]): an analytic
 /// hazard with a dual-evaluable program, or an ODE-accumulated one whose subject the dual
 /// walk serves (`survival::tte_record_served`). A record without one keeps FD for the whole
@@ -5310,12 +5324,12 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
     {
         use crate::types::{EndpointLikelihood, ObsRecord};
         // The CMTs whose endpoint term we can differentiate exactly. A binary endpoint with
-        // no `lp_program`, or a CTMM endpoint with no `generator_program` — a
-        // time-inhomogeneous (drug-driven) generator, whose likelihood is an occupancy ODE
-        // rather than an `expm` — is not one of them.
+        // no `lp_program`, or a CTMM endpoint with no `generator_program`, is not one of
+        // them; a parsed endpoint always has its program, so that is an opaque Rust closure.
         let served = |cmt: usize| -> bool {
             match model.endpoints.get(&cmt) {
                 Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
+                Some(EndpointLikelihood::Count { param_program, .. }) => param_program.is_some(),
                 #[cfg(feature = "markov")]
                 Some(EndpointLikelihood::Ctmm {
                     generator_program, ..
@@ -5330,10 +5344,10 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
         let mut last: Option<(bool, usize, bool)> = None;
         subject.obs_records.iter().all(|r| {
             let (event, cmt) = match r {
-                ObsRecord::DiscreteState { cmt, .. } => (false, *cmt),
+                ObsRecord::DiscreteState { cmt, .. } | ObsRecord::Count { cmt, .. } => {
+                    (false, *cmt)
+                }
                 ObsRecord::Event { cmt, .. } => (true, *cmt),
-                #[allow(unreachable_patterns)]
-                _ => return false,
             };
             if let Some((e, c, ok)) = last {
                 if (e, c) == (event, cmt) {
@@ -5442,8 +5456,9 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
         return false;
     }
     // CTMM (#759): a subject's CTMM term is analytic only when its generator carries a
-    // dual-evaluable program. Without one — a drug-driven `Q(t)`, a `(θ, η)` width past the
-    // dual dispatch cap, an intensity we could not resolve — *every* subject declines at the
+    // dual-evaluable program. A parsed generator always has one (a drug-driven `Q(t)` and a
+    // wide `(θ, η)` included); only an opaque Rust-closure endpoint lacks it, and then
+    // *every* subject declines at the
     // survival-record guard in `analytic_inner_grad_supported`, so reporting "analytic" here
     // would be a pure misreport.
     //
@@ -5528,8 +5543,9 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     // to the Gaussian block; binary records likewise since #2024 (the closed-form Bernoulli
     // score over a dual-evaluable linear predictor). `non_gaussian_records_fully_analytic`
     // is deliberately strict — it demands that *every* record on the subject be one a
-    // program can serve, so a subject that also carries a TTE / count record (whose terms
-    // remain FD-only) still declines the whole gradient rather than silently omitting them.
+    // program can serve, so a subject that also carries a record whose term is FD-only (a
+    // TTE endpoint without an exact channel, an endpoint without a program) still declines
+    // the whole gradient rather than silently omitting it.
     if !non_gaussian_eta_grad_served(model, subject) {
         return false;
     }
@@ -5543,8 +5559,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     //
     // **Ordering is load-bearing:** this branch is only sound *after* the guard above. A
     // CTMM subject always carries `DiscreteState` records, so an endpoint-only CTMM whose
-    // generator has no dual-evaluable program (past the axis cap, or an intensity we could
-    // not resolve) is already rejected there — it can never fall through to here and claim
+    // generator has no dual-evaluable program (an opaque Rust closure) is already rejected there — it can never fall through to here and claim
     // an analytic route the gradient cannot supply. Reaching this line therefore means the
     // subject's non-Gaussian term is either absent or exactly served, and the only thing
     // left is the prior. (Pinned by `program_less_endpoint_only_ctmm_stays_fd`.)
@@ -8672,6 +8687,10 @@ pub fn run_inner_loop_warm(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
+    // A population handed as read has no level cells under nested levels; give them here, as
+    // `fit()` does, rather than have every subject refused (#3004).
+    let cells = crate::stats::nested_levels::with_level_cells(model, population);
+    let population = &*cells;
     let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
         model,
         population,

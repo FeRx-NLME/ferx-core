@@ -89,6 +89,7 @@ website:
           - model-file/adaptive-dosing.qmd
           - model-file/event-model.qmd
           - model-file/categorical.qmd
+          - model-file/count.qmd
           - model-file/markov-model.qmd
       - text: "Estimation Methods"
         href: estimation/index.qmd

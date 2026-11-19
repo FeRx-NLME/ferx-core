@@ -1,0 +1,20 @@
+# #2877 Poisson count endpoint with a random intercept (fixture for
+# tests/count_nonmem_anchor.rs; data from simulate_count.R).
+[parameters]
+  theta BASE(3.0, 0.01, 100.0)
+  theta BETA(0.0, -10.0, 10.0)
+  theta GAM(0.0, -10.0, 10.0)
+  omega ETA_C ~ 0.1
+
+[covariates]
+  WT continuous
+  TRT continuous
+
+[count_model]
+  cmt        = 1
+  type       = poisson
+  log_lambda = log(BASE) + BETA * (WT / 70 - 1) + GAM * TRT + ETA_C
+
+[fit_options]
+  method  = laplace
+  maxiter = 300

@@ -100,8 +100,8 @@ mod ctmm_inner {
         );
     }
 
-    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program must stay on
-    /// FD, on *both* the model-level predicate `build_info` reports and the per-subject gate
+    /// An endpoint-only CTMM whose generator has **no** dual-evaluable program (the shape of
+    /// a hand-built Rust-closure endpoint: a parsed one always has it) must stay on FD, on *both* the model-level predicate `build_info` reports and the per-subject gate
     /// `find_ebe` runs. The two must agree, or the fit reports a gradient method it does not
     /// use. (A wide generator no longer lacks one — the η-only dual has no width cap — so
     /// the program is removed here explicitly; `a_wide_ctmm_generator_is_served` is the
@@ -8607,5 +8607,267 @@ fn small_bfgs_update_and_direction_match_nalgebra_bit_for_bit() {
                 assert_eq!(a.to_bits(), b.to_bits(), "update n={n}");
             }
         }
+    }
+}
+
+/// #3004: a parsed non-Gaussian endpoint always carries its dual-evaluable program, and the
+/// program evaluates the same function as the `f64` closure (value equality, per kind). The
+/// fixtures read a data covariate and an `[individual_parameters]` value beside θ / η, so a
+/// binder that drops either to a constant disagrees with the closure here. The model reports
+/// and takes the exact route, and the exact inner gradient matches a central FD of
+/// `individual_nll`.
+#[cfg(feature = "markov")]
+mod endpoint_programs_are_total {
+    use super::*;
+    use crate::types::{EndpointLikelihood, EventType, ObsRecord};
+
+    /// A data-covariate term (`X = 1.3` on the fixtures' subjects).
+    const EPS: &str = "X * 0.4";
+
+    fn parse(src: &str) -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(src).expect("parse")
+    }
+
+    fn discrete_subject(cmt: usize, states: &[(f64, usize)]) -> Subject {
+        Subject {
+            id: "1".into(),
+            obs_records: states
+                .iter()
+                .map(|&(time, state)| ObsRecord::DiscreteState {
+                    time,
+                    raw_time: time,
+                    state,
+                    cmt,
+                })
+                .collect(),
+            covariates: [("X".to_string(), 1.3)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    fn tte_subject() -> Subject {
+        Subject {
+            id: "1".into(),
+            obs_records: vec![ObsRecord::Event {
+                time: 7.0,
+                event_type: EventType::Exact,
+                entry_time: 0.0,
+                cmt: 3,
+            }],
+            covariates: [("X".to_string(), 1.3)].into_iter().collect(),
+            ..Default::default()
+        }
+    }
+
+    /// The endpoint-only inner gradient (prior + the one data term).
+    fn analytic_grad(model: &CompiledModel, s: &Subject, eta: &[f64]) -> Option<Vec<f64>> {
+        let p = &model.default_params;
+        let keys = model.error_spec.obs_keys(s);
+        super::super::analytic_eta_nll_gradient_with_schedule(
+            model,
+            s,
+            &p.theta,
+            eta,
+            &p.omega,
+            &p.sigma.values,
+            model.residual_cov_at(p),
+            None,
+            None,
+            keys.as_ref(),
+            &mut Vec::new(),
+            &mut nalgebra::DVector::zeros(model.n_eta),
+            &mut nalgebra::DVector::zeros(model.n_eta),
+            None,
+        )
+    }
+
+    /// The route the model reports and the subject takes, and the gradient against FD.
+    fn assert_served_and_matches_fd(model: &CompiledModel, s: &Subject, etas: &[&[f64]]) {
+        assert!(
+            super::super::non_gaussian_endpoints_served(model),
+            "model-level: every endpoint has an exact channel"
+        );
+        assert!(super::super::analytic_inner_grad_supported_model(model));
+        assert!(super::super::analytic_inner_grad_supported(model, s));
+        let p = &model.default_params;
+        for eta in etas {
+            let g = analytic_grad(model, s, eta).expect("served exactly");
+            let nll = |e: &[f64]| {
+                crate::stats::likelihood::individual_nll(
+                    model,
+                    s,
+                    &p.theta,
+                    e,
+                    &p.omega,
+                    &p.sigma.values,
+                )
+            };
+            for k in 0..eta.len() {
+                let (mut ep, mut em) = (eta.to_vec(), eta.to_vec());
+                ep[k] += 1e-6;
+                em[k] -= 1e-6;
+                let fd = (nll(&ep) - nll(&em)) / 2e-6;
+                assert!(g[k].is_finite() && fd.is_finite());
+                assert!(
+                    (g[k] - fd).abs() < 1e-6,
+                    "η = {eta:?} axis {k}: exact {} vs FD {fd}",
+                    g[k]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn binary_reads_a_covariate() {
+        let model = parse(&format!(
+            "[parameters]\n  theta TH0(-0.3, -10.0, 10.0)\n  omega ETA_I ~ 0.3\n\
+             [binary_model]\n  cmt = 3\n  logit = TH0 + ETA_I + {EPS}\n"
+        ));
+        let s = discrete_subject(3, &[(0.5, 0), (1.0, 1), (2.0, 1), (3.0, 0)]);
+        let EndpointLikelihood::Binary {
+            lp_fn, lp_program, ..
+        } = &model.endpoints[&3]
+        else {
+            panic!("binary")
+        };
+        let theta = &model.default_params.theta;
+        let eta = [0.2];
+        let want = lp_fn(theta, &eta, &s.covariates);
+        let got = lp_program
+            .as_ref()
+            .expect("program")
+            .eval_g(theta, &eta, &s.covariates);
+        assert!((got.expect("width ok")[0] - want).abs() < 1e-15);
+        assert_served_and_matches_fd(&model, &s, &[&[0.0], &[0.3]]);
+    }
+
+    #[test]
+    fn dtmm_reads_a_covariate() {
+        let model = parse(&format!(
+            "[parameters]\n  theta A_AS(-0.8, -6.0, 3.0)\n  theta A_SA(-1.3, -6.0, 3.0)\n  \
+             omega ETA_AS ~ 0.3\n[markov_model]\n  type = dtmm\n  cmt = 5\n  \
+             states = [awake=0, asleep=1]\n  \
+             transition awake -> asleep = inv_logit(A_AS + ETA_AS + {EPS})\n  \
+             transition asleep -> awake = inv_logit(A_SA)\n"
+        ));
+        let s = discrete_subject(5, &[(0.0, 0), (1.0, 0), (2.0, 1), (3.0, 1), (4.0, 0)]);
+        let EndpointLikelihood::Dtmm {
+            prob_fn,
+            prob_program,
+            ..
+        } = &model.endpoints[&5]
+        else {
+            panic!("dtmm")
+        };
+        let theta = &model.default_params.theta;
+        let eta = [0.2];
+        let want = prob_fn(theta, &eta, &s.covariates);
+        let got = prob_program
+            .as_ref()
+            .expect("program")
+            .eval_g(theta, &eta, &s.covariates)
+            .expect("width ok");
+        assert_eq!(got.len(), want.len());
+        // Bytecode against the tree walk: equal to the last bit or two, not pinned bitwise.
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-15, "{g} vs {w}");
+        }
+        assert_served_and_matches_fd(&model, &s, &[&[0.0], &[0.3]]);
+    }
+
+    #[test]
+    fn ctmm_reads_a_covariate() {
+        let model = parse(&format!(
+            "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
+             omega ETA_Q ~ 0.1\n[markov_model]\n  type = ctmm\n  cmt = 5\n  \
+             states = [awake=0, asleep=1]\n  \
+             transition awake -> asleep = exp(LQ01 + ETA_Q) + {EPS}\n  \
+             transition asleep -> awake = exp(LQ10)\n"
+        ));
+        let s = discrete_subject(5, &[(0.0, 0), (1.0, 0), (2.3, 1), (3.1, 1), (5.0, 0)]);
+        let EndpointLikelihood::Ctmm {
+            generator_fn,
+            generator_program,
+            ..
+        } = &model.endpoints[&5]
+        else {
+            panic!("ctmm")
+        };
+        let theta = &model.default_params.theta;
+        let eta = [0.2];
+        let want = generator_fn(theta, &eta, &s.covariates, &[]);
+        // The closure's generator is column-major, the program's row-major twin is its transpose.
+        let got = generator_program
+            .as_ref()
+            .expect("program")
+            .eval_generator_colmajor_g(theta, &eta, &s.covariates)
+            .expect("width ok");
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-14, "{g} vs {w}");
+        }
+        assert_served_and_matches_fd(&model, &s, &[&[0.0], &[0.3]]);
+    }
+
+    #[test]
+    fn tte_hazard_reads_a_covariate() {
+        let model = parse(&format!(
+            "[parameters]\n  theta TL(-2.0, -8.0, 3.0)\n  omega ETA_L ~ 0.3\n\
+             [event_model]\n  cmt = 3\n  family = exponential\n  \
+             scale = exp(TL + ETA_L) + {EPS}\n"
+        ));
+        let s = tte_subject();
+        let EndpointLikelihood::Tte {
+            hazard: crate::types::HazardSpec::Analytic { param_fn, .. },
+            hazard_program,
+            ..
+        } = &model.endpoints[&3]
+        else {
+            panic!("tte")
+        };
+        let theta = &model.default_params.theta;
+        let eta = [0.2];
+        let want = param_fn(theta, &eta, &s.covariates);
+        let got = hazard_program
+            .as_ref()
+            .expect("program")
+            .eval_g(theta, &eta, &s.covariates)
+            .expect("width ok");
+        assert!((got[0] - want[0]).abs() < 1e-15);
+        assert_served_and_matches_fd(&model, &s, &[&[0.0], &[0.3]]);
+    }
+
+    /// The same through an `[individual_parameters]` value, the one place a `Variable` leaf
+    /// reaches an endpoint expression.
+    #[test]
+    fn tte_hazard_through_an_individual_parameter() {
+        let model = parse(&format!(
+            "[parameters]\n  theta TL(-2.0, -8.0, 3.0)\n  theta DC(0.2, 0.01, 5.0)\n  \
+             theta DV(5.0, 0.1, 50.0)\n  omega ETA_L ~ 0.3\n  sigma S ~ 0.1\n\
+             [individual_parameters]\n  LAM = exp(TL + ETA_L) + {EPS}\n  CL = DC\n  V = DV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ additive(S)\n\
+             [event_model]\n  cmt = 3\n  family = exponential\n  scale = LAM\n"
+        ));
+        let s = tte_subject();
+        let EndpointLikelihood::Tte {
+            hazard: crate::types::HazardSpec::Analytic { param_fn, .. },
+            hazard_program,
+            ..
+        } = &model.endpoints[&3]
+        else {
+            panic!("tte")
+        };
+        let theta = &model.default_params.theta;
+        let eta = [0.2];
+        let want = param_fn(theta, &eta, &s.covariates);
+        let got = hazard_program
+            .as_ref()
+            .expect("program")
+            .eval_g(theta, &eta, &s.covariates)
+            .expect("width ok");
+        assert!((want[0] - ((theta[0] + 0.2).exp() + 0.52)).abs() < 1e-14);
+        assert!((got[0] - want[0]).abs() < 1e-15);
+        assert_served_and_matches_fd(&model, &s, &[&[0.0], &[0.3]]);
     }
 }

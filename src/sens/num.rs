@@ -588,6 +588,12 @@ pub(crate) trait RecHooks: Sized {
     /// instead of the values it saw; every other type ignores it.
     #[inline]
     fn span_hint(_t0: Self, _t1: Self) {}
+    /// The point being recorded is one the value path declines (its repel sentinel: a rate or
+    /// state that overflowed, a probability that underflowed), so a recording that fails here is
+    /// a repelled point, not a failed plan. Nothing but a recording type has anything to note.
+    #[cfg(feature = "markov")]
+    #[inline]
+    fn note_declined() {}
     /// The span [`Self::span_hint`] left, taken (`None` once taken, and on every type but a
     /// recording one).
     #[inline]
@@ -620,6 +626,16 @@ pub(crate) trait RecHooks: Sized {
         _count: Self,
         _body: &dyn Fn(&[Self]) -> Vec<Self>,
     ) -> Option<Option<Vec<Self>>> {
+        None
+    }
+    /// `x·y` of `n×n` row-major matrices as one call of a recording (#2980,
+    /// `kernel_jit::record_mat`): `None` for every type that is not a recording type (the caller
+    /// multiplies), `Some(None)` when the recording cannot take the call.
+    fn mat_mul(_x: &[Self], _y: &[Self], _n: usize) -> Option<Option<Vec<Self>>> {
+        None
+    }
+    /// `q⁻¹·p` of `n×n` row-major matrices as one call of a recording (as [`Self::mat_mul`]).
+    fn mat_solve(_q: &[Self], _p: &[Self], _n: usize) -> Option<Option<Vec<Self>>> {
         None
     }
     /// A steady state recorded as one fixed-point call (#2786, `kernel_jit::record_fixed`):
