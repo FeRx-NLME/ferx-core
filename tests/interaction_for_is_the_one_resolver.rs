@@ -86,7 +86,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         1,
         "`InnerMode::for_options` is documented as taking a stage's resolved options",
     ),
-    ("src/estimation/mixture.rs", 2, "the mixture outer loop, run on a stage's options"),
+    ("src/estimation/mixture.rs", 1, "the mixture outer loop, run on a stage's options"),
     (
         "src/estimation/outer_optimizer.rs",
         15,
