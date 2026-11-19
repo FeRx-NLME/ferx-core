@@ -33,9 +33,7 @@ pub fn sha256_file(path: &Path) -> Result<String, String> {
     let mut h = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("reading {}: {}", path.display(), e))?;
+        let n = f.read(&mut buf).map_err(|e| format!("reading {}: {}", path.display(), e))?;
         if n == 0 {
             break;
         }

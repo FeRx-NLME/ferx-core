@@ -120,12 +120,8 @@ fn transit_iov_objective_matches_nonmem() {
     );
 
     let model = parse_model_string(&fixed).expect("fixed-param transit IOV model parses");
-    let pop = read_nonmem_csv(
-        Path::new("nonmem_anchor/transit_iov.csv"),
-        None,
-        Some("OCC"),
-    )
-    .expect("transit_iov anchor data loads");
+    let pop = read_nonmem_csv(Path::new("nonmem_anchor/transit_iov.csv"), None, Some("OCC"))
+        .expect("transit_iov anchor data loads");
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
@@ -174,9 +170,8 @@ fn transit_iov_objective_matches_nonmem() {
     let mut max_eta_dev = 0.0_f64;
     let mut max_obj_dev = 0.0_f64;
     for subj in &result.subjects {
-        let (nm_eta1, nm_obj) = phi
-            .get(&subj.id)
-            .unwrap_or_else(|| panic!("subject {} missing from .phi", subj.id));
+        let (nm_eta1, nm_obj) =
+            phi.get(&subj.id).unwrap_or_else(|| panic!("subject {} missing from .phi", subj.id));
         let eta_dev = (subj.eta[0] - nm_eta1).abs();
         let obj_dev = (subj.ofv_contribution - nm_obj).abs();
         max_eta_dev = max_eta_dev.max(eta_dev);

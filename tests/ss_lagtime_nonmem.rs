@@ -101,12 +101,7 @@ fn predict_matches_nonmem_ss_oral_with_lagtime() {
     assert_eq!(preds.len(), nonmem.len());
 
     for (p, &(t, expected)) in preds.iter().zip(nonmem) {
-        assert!(
-            (p.time - t).abs() < 1e-9,
-            "prediction time {} != expected {}",
-            p.time,
-            t
-        );
+        assert!((p.time - t).abs() < 1e-9, "prediction time {} != expected {}", p.time, t);
         let rel = (p.pred - expected).abs() / expected;
         assert!(
             rel < 1e-4,

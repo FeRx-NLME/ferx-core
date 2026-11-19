@@ -34,11 +34,7 @@ fn moved_subject(column: &str, values: [f64; 3]) -> Population {
         dose_occasions: vec![1],
         ..Default::default()
     };
-    assert_eq!(
-        format!("{}", subject.obs_times[1]),
-        MOVED,
-        "the fixture moves it"
-    );
+    assert_eq!(format!("{}", subject.obs_times[1]), MOVED, "the fixture moves it");
     Population {
         subjects: vec![subject],
         covariate_names: vec![column.to_string()],
@@ -152,8 +148,7 @@ fn the_kappa_weight_check_evaluates_a_time_reading_weight_at_the_written_time() 
 /// `dose_values` are the `column` values at the two doses; the observation carries `obs_value`.
 fn reset_period_dose(column: &str, obs_value: f64, dose_values: [Option<f64>; 2]) -> Population {
     let snap = |v: Option<f64>| -> HashMap<String, f64> {
-        v.map(|v| HashMap::from([(column.to_string(), v)]))
-            .unwrap_or_default()
+        v.map(|v| HashMap::from([(column.to_string(), v)])).unwrap_or_default()
     };
     let (reset, engine) = (73.1, 24.3 + 73.1);
     let subject = Subject {

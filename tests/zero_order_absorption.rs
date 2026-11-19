@@ -93,21 +93,13 @@ fn pop_single(obs_times: Vec<f64>, rate: f64) -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![dose],
-            obs_times,
-            vec![0.0; n],
-            vec![1; n],
-        )],
+        subjects: vec![common::subject("1", vec![dose], obs_times, vec![0.0; n], vec![1; n])],
     }
 }
 
 #[test]
 fn zero_order_curve_recovers_dose_auc_and_has_flat_input_onset() {
-    let model = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
+    let model = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
 
     // 0, 0.25, …, 72.0 — fine enough for trapezoidal AUC, long enough that the
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
@@ -137,10 +129,8 @@ fn zero_order_curve_recovers_dose_auc_and_has_flat_input_onset() {
     );
 
     // (3) Mass balance via the absorption-independent invariant ∫A dt = Dose/ke.
-    let auc: f64 = preds
-        .windows(2)
-        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
-        .sum();
+    let auc: f64 =
+        preds.windows(2).map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time)).sum();
     let auc_inf = 100.0 * 50.0 / 5.0; // F·Dose/ke = Dose·V/CL with F = 1
     let rel = (auc - auc_inf).abs() / auc_inf;
     assert!(
@@ -157,12 +147,8 @@ fn zero_order_equals_explicit_infusion_of_the_same_duration() {
     // the whole curve, including the in-window ramp, the window-end kink, and the
     // post-window decay. This pins the value path (not just the total mass) and is
     // the in-engine analogue of a NONMEM zero-order-infusion anchor.
-    let zo = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
-    let plain = parse_full_model(PLAIN_1CPT_MODEL)
-        .expect("plain 1-cpt model parses")
-        .model;
+    let zo = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
+    let plain = parse_full_model(PLAIN_1CPT_MODEL).expect("plain 1-cpt model parses").model;
 
     let obs_times: Vec<f64> = (0..=120).map(|i| i as f64 * 0.25).collect();
     let zo_preds = predict(&zo, &pop_single(obs_times.clone(), 0.0), &zo.default_params).unwrap();
@@ -264,9 +250,7 @@ fn zero_order_restarts_after_reset_event_driven_path() {
     // t=0 (window [0,4]); reset at t=12 zeros the state; re-dose at t=12 (window
     // [12,16]). From a freshly-zeroed system the second cycle reproduces the first,
     // so the concentration at matched offsets after each dose must coincide.
-    let model = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
+    let model = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
 
     let obs_times = vec![2.0, 4.0, 8.0, 14.0, 16.0, 20.0]; // offsets 2/4/8 in each cycle
     let n = obs_times.len();
@@ -325,12 +309,8 @@ fn zero_order_window_open_at_reset_stops_like_a_cut_infusion() {
     // post-reset decay from the zeroed state. A regression that kept the
     // zero-order window alive past the reset would inject extra mass and diverge
     // here, while the cycle-mirror test above would still pass.
-    let zo = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
-    let plain = parse_full_model(PLAIN_1CPT_MODEL)
-        .expect("plain 1-cpt model parses")
-        .model;
+    let zo = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
+    let plain = parse_full_model(PLAIN_1CPT_MODEL).expect("plain 1-cpt model parses").model;
 
     let obs_times: Vec<f64> = (0..=80).map(|i| i as f64 * 0.25).collect(); // 0..20h
     let n = obs_times.len();
@@ -384,10 +364,7 @@ fn zero_order_window_open_at_reset_stops_like_a_cut_infusion() {
         .filter(|p| p.time > reset_at + 1e-9)
         .map(|p| p.pred)
         .fold(0.0_f64, f64::max);
-    assert!(
-        pre_reset > 10.0,
-        "expected a real pre-reset partial fill, got {pre_reset}"
-    );
+    assert!(pre_reset > 10.0, "expected a real pre-reset partial fill, got {pre_reset}");
     assert!(
         post_reset < 1e-6,
         "the window must be OFF after the reset (no further input); got post-reset max {post_reset}"
@@ -439,29 +416,18 @@ fn zero_order_with_lagtime_is_the_unlagged_curve_shifted_by_the_lag() {
     // input, so the lagged curve at `t` must equal the *unlagged* curve at `t - lag`
     // for t >= lag (before which the lagged system is empty). Compare the two
     // predict() curves on grids offset by exactly the lag.
-    let lagged = parse_full_model(ZERO_ORDER_LAGGED_MODEL)
-        .expect("lagged zero_order model parses")
-        .model;
-    let unlagged = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
+    let lagged =
+        parse_full_model(ZERO_ORDER_LAGGED_MODEL).expect("lagged zero_order model parses").model;
+    let unlagged = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
     let lag = 2.0;
 
     let base: Vec<f64> = (0..=112).map(|i| i as f64 * 0.25).collect(); // 0..28h
     let lagged_times: Vec<f64> = base.iter().map(|&t| t + lag).collect();
 
-    let unlagged_preds = predict(
-        &unlagged,
-        &pop_single(base.clone(), 0.0),
-        &unlagged.default_params,
-    )
-    .unwrap();
-    let lagged_preds = predict(
-        &lagged,
-        &pop_single(lagged_times, 0.0),
-        &lagged.default_params,
-    )
-    .unwrap();
+    let unlagged_preds =
+        predict(&unlagged, &pop_single(base.clone(), 0.0), &unlagged.default_params).unwrap();
+    let lagged_preds =
+        predict(&lagged, &pop_single(lagged_times, 0.0), &lagged.default_params).unwrap();
 
     // (1) Nothing absorbed before the lag: at the first lagged sample (t = lag) the
     //     amount is still 0 — the window has not opened yet.
@@ -530,9 +496,7 @@ const SEQUENTIAL_MODEL: &str = r#"
 
 #[test]
 fn sequential_model_parses_and_delivers_full_mass_to_central() {
-    let model = parse_full_model(SEQUENTIAL_MODEL)
-        .expect("sequential model parses")
-        .model;
+    let model = parse_full_model(SEQUENTIAL_MODEL).expect("sequential model parses").model;
 
     // Dose into the depot (CMT 1); observe central (CMT 2).
     let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
@@ -557,10 +521,8 @@ fn sequential_model_parses_and_delivers_full_mass_to_central() {
     // central starts empty (the zero-order input fills the depot first, then ka
     // transfers) and the full dose still reaches central: ∫central dt = Dose/ke.
     assert!(preds[0].pred.abs() < 1e-12, "central(0) should be 0");
-    let auc: f64 = preds
-        .windows(2)
-        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
-        .sum();
+    let auc: f64 =
+        preds.windows(2).map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time)).sum();
     let auc_inf = 100.0 * 50.0 / 5.0;
     let rel = (auc - auc_inf).abs() / auc_inf;
     assert!(
@@ -598,14 +560,8 @@ fn zero_order_on_analytical_pk_is_rejected_pointing_at_ode_template() {
         Ok(_) => panic!("pk + zero_order() must be rejected"),
         Err(e) => e,
     };
-    assert!(
-        err.contains("ode_template"),
-        "error should point at ode_template, got: {err}"
-    );
-    assert!(
-        err.contains("zero_order"),
-        "error should name the zero_order function, got: {err}"
-    );
+    assert!(err.contains("ode_template"), "error should point at ode_template, got: {err}");
+    assert!(err.contains("zero_order"), "error should name the zero_order function, got: {err}");
 }
 
 #[test]
@@ -613,9 +569,7 @@ fn zero_order_normal_dosing_passes_data_checks() {
     // Positive control: ordinary (non-SS, bolus) dosing into the zero_order
     // compartment raises no absorption diagnostic.
     use ferx_core::check_model_data;
-    let model = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
+    let model = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
     let pop = pop_single(vec![0.5, 1.0, 2.0, 4.0, 8.0], 0.0);
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -631,9 +585,7 @@ fn zero_order_steady_state_dosing_is_accepted() {
     // (#719) and is served since #2786: the dose is lowered to a duration-modeled SS infusion.
     // Values: `tests/ss_absorption_lag_anchor.rs`.
     use ferx_core::check_model_data;
-    let model = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
+    let model = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
     let mut ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
     ss_dose.ii = 12.0;
     let pop = Population {
@@ -665,9 +617,7 @@ fn infusion_into_zero_order_compartment_is_rejected() {
     // the convolution `R_in_inf`, but a zero_order input is itself a spanning window, so infusing
     // it is a window-with-window convolution (a follow-up).
     use ferx_core::check_model_data;
-    let model = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
+    let model = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
     // RATE=25 → an infusion window of AMT/RATE = 4 h into the zero_order compartment (CMT 1).
     let inf_dose = DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0);
     let pop = Population {
@@ -686,9 +636,7 @@ fn infusion_into_zero_order_compartment_is_rejected() {
     };
     let diags = check_model_data(&model, &pop);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == "E_ABSORPTION_RATE_ZERO_ORDER"),
+        diags.iter().any(|d| d.code == "E_ABSORPTION_RATE_ZERO_ORDER"),
         "infusion into a zero_order compartment must raise E_ABSORPTION_RATE_ZERO_ORDER, got: {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
@@ -706,17 +654,10 @@ fn infusion_into_zero_order_compartment_is_rejected() {
 #[test]
 fn zero_order_ss_fit_warnings_do_not_name_the_lowered_rate_minus_2_construct() {
     use ferx_core::{fit, FitOptions};
-    let src = ZERO_ORDER_MODEL.replace(
-        "theta TVDUR(4.0, 0.05,  24.0)",
-        "theta TVDUR(1e-9, 1e-10, 24.0)",
-    );
-    assert_ne!(
-        src, ZERO_ORDER_MODEL,
-        "fixture drift: the DUR theta line moved"
-    );
-    let model = parse_full_model(&src)
-        .expect("zero_order model parses")
-        .model;
+    let src =
+        ZERO_ORDER_MODEL.replace("theta TVDUR(4.0, 0.05,  24.0)", "theta TVDUR(1e-9, 1e-10, 24.0)");
+    assert_ne!(src, ZERO_ORDER_MODEL, "fixture drift: the DUR theta line moved");
+    let model = parse_full_model(&src).expect("zero_order model parses").model;
     let mut ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
     ss_dose.ii = 12.0;
     let pop = Population {
@@ -733,21 +674,11 @@ fn zero_order_ss_fit_warnings_do_not_name_the_lowered_rate_minus_2_construct() {
             vec![1; 3],
         )],
     };
-    let opts = FitOptions {
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 1, run_covariance_step: false, ..FitOptions::default() };
     let fitted = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
-    let named: Vec<&String> = fitted
-        .warnings
-        .iter()
-        .filter(|w| w.contains("RATE=-2") || w.contains("D1"))
-        .collect();
-    assert!(
-        named.is_empty(),
-        "a warning names the lowered RATE=-2 / D1 construct: {named:?}"
-    );
+    let named: Vec<&String> =
+        fitted.warnings.iter().filter(|w| w.contains("RATE=-2") || w.contains("D1")).collect();
+    assert!(named.is_empty(), "a warning names the lowered RATE=-2 / D1 construct: {named:?}");
 }
 
 /// Generates a noise-free single-dose curve at the truth (`DUR = 4 h`), then fits
@@ -756,26 +687,17 @@ fn zero_order_ss_fit_warnings_do_not_name_the_lowered_rate_minus_2_construct() {
 /// This exercises the FD sensitivity of the moving-boundary `dur` end-to-end (the
 /// gradient path #504 ships, ahead of the analytic boundary impulse in #530).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn zero_order_fit_recovers_duration() {
     use ferx_core::{fit, FitOptions};
 
-    let model = parse_full_model(ZERO_ORDER_MODEL)
-        .expect("zero_order model parses")
-        .model;
+    let model = parse_full_model(ZERO_ORDER_MODEL).expect("zero_order model parses").model;
 
     // Noise-free data at the truth: predictions at the typical values become the
     // observations, so the likelihood optimum sits at the data-generating params.
     let obs_times: Vec<f64> = (1..=40).map(|i| i as f64 * 0.5).collect();
-    let truth = predict(
-        &model,
-        &pop_single(obs_times.clone(), 0.0),
-        &model.default_params,
-    )
-    .unwrap();
+    let truth =
+        predict(&model, &pop_single(obs_times.clone(), 0.0), &model.default_params).unwrap();
     let obs: Vec<f64> = truth.iter().map(|p| p.pred).collect();
     let n = obs_times.len();
     let dose = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);

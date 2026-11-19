@@ -164,10 +164,9 @@ impl IovsearchOptions {
     /// Read `[iovsearch]`, `[rank]` and `[run]` off a loaded file.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
         let section = match config.tools.get("iovsearch") {
-            Some(table) => table
-                .clone()
-                .try_into::<Section>()
-                .map_err(|e| format!("[iovsearch]: {e}"))?,
+            Some(table) => {
+                table.clone().try_into::<Section>().map_err(|e| format!("[iovsearch]: {e}"))?
+            }
             None => Section::default(),
         };
         let options = IovsearchOptions {
@@ -259,9 +258,7 @@ pub struct IovStructure {
 
 impl IovStructure {
     fn new(
-        mut etas: Vec<String>,
-        eta_blocks: Vec<Vec<String>>,
-        mut kappas: Vec<String>,
+        mut etas: Vec<String>, eta_blocks: Vec<Vec<String>>, mut kappas: Vec<String>,
         kappa_blocks: Vec<Vec<String>>,
     ) -> Self {
         etas.sort();
@@ -281,12 +278,7 @@ impl IovStructure {
         };
         let eta_blocks = tidy(eta_blocks, &etas);
         let kappa_blocks = tidy(kappa_blocks, &kappas);
-        IovStructure {
-            etas,
-            eta_blocks,
-            kappas,
-            kappa_blocks,
-        }
+        IovStructure { etas, eta_blocks, kappas, kappa_blocks }
     }
 
     /// Pharmpy's description: `IIV([CL]+[V]+[KA]);IOV([CL])`.
@@ -332,10 +324,7 @@ fn family(members: &[String], blocks: &[Vec<String>]) -> String {
     if members.is_empty() {
         return "[]".into();
     }
-    let mut parts: Vec<String> = blocks
-        .iter()
-        .map(|b| format!("[{}]", b.join(",")))
-        .collect();
+    let mut parts: Vec<String> = blocks.iter().map(|b| format!("[{}]", b.join(","))).collect();
     for p in members {
         if !blocks.iter().any(|b| b.contains(p)) {
             parts.push(format!("[{p}]"));
@@ -367,18 +356,11 @@ const KAPPA_FRACTION: f64 = 0.1;
 
 impl Space {
     fn from_config(
-        config: &SearchConfig,
-        base: &BaseModel,
-        options: &IovsearchOptions,
+        config: &SearchConfig, base: &BaseModel, options: &IovsearchOptions,
     ) -> Result<Space, String> {
         let column = base.prepared.parsed.fit_options.iov_column.clone();
         let features: Vec<Feature> = if config.has_space() {
-            config
-                .resolve_space(base)?
-                .mfl
-                .features()
-                .cloned()
-                .collect()
+            config.resolve_space(base)?.mfl.features().cloned().collect()
         } else {
             Vec::new()
         };
@@ -395,12 +377,8 @@ impl Space {
     /// The space from its parts — the seam the unit tests use. `features`
     /// are the resolved `[space]` statements (empty for Pharmpy's default).
     pub(crate) fn build(
-        input_model: ModelText,
-        features: &[Feature],
-        base_column: Option<&str>,
-        population: &Population,
-        options: &IovsearchOptions,
-        mut notes: Vec<String>,
+        input_model: ModelText, features: &[Feature], base_column: Option<&str>,
+        population: &Population, options: &IovsearchOptions, mut notes: Vec<String>,
     ) -> Result<Space, String> {
         // The occasions are read by `prepare_run` from the base's own
         // `iov_column`; a base without one has a population without
@@ -421,11 +399,8 @@ impl Space {
                 ));
             }
         }
-        let mut levels: Vec<u32> = population
-            .subjects
-            .iter()
-            .flat_map(|s| s.occasions.iter().copied())
-            .collect();
+        let mut levels: Vec<u32> =
+            population.subjects.iter().flat_map(|s| s.occasions.iter().copied()).collect();
         levels.sort_unstable();
         levels.dedup();
         if levels.len() < 2 {
@@ -445,11 +420,7 @@ impl Space {
         let mut stated_groups: Vec<Vec<String>> = Vec::new();
         for f in features {
             match f {
-                Feature::Iov {
-                    optional,
-                    parameters,
-                    effects,
-                } => {
+                Feature::Iov { optional, parameters, effects } => {
                     if let Modes::List(list) = effects {
                         if let Some(e) = list.iter().find(|e| **e != VariabilityEffect::Exp) {
                             return Err(format!(
@@ -461,17 +432,10 @@ impl Space {
                     }
                     for p in names_of(parameters, f)? {
                         let forced = !*optional;
-                        params
-                            .entry(p)
-                            .and_modify(|kept| *kept |= forced)
-                            .or_insert(forced);
+                        params.entry(p).and_modify(|kept| *kept |= forced).or_insert(forced);
                     }
                 }
-                Feature::Covariance {
-                    optional,
-                    level,
-                    parameters,
-                } => {
+                Feature::Covariance { optional, level, parameters } => {
                     if *optional {
                         return Err(format!(
                             "iovsearch: `{f}` — the κ block structure is not searched; state it \
@@ -504,12 +468,10 @@ impl Space {
                 }
             }
             if params.is_empty() {
-                return Err(
-                    "iovsearch: the base model has no parameter with a free η to add \
+                return Err("iovsearch: the base model has no parameter with a free η to add \
                      inter-occasion variability to, and the file names none (`[space] mfl = \
                      \"IOV?([CL,V], EXP)\"`)"
-                        .into(),
-                );
+                    .into());
             }
         }
         // A parameter that already carries a κ is left as it is.
@@ -525,17 +487,9 @@ impl Space {
             notes.push(format!(
                 "{} already {} a κ in the base model and {} left as {}",
                 already.join(", "),
-                if already.len() == 1 {
-                    "carries"
-                } else {
-                    "carry"
-                },
+                if already.len() == 1 { "carries" } else { "carry" },
                 if already.len() == 1 { "is" } else { "are" },
-                if already.len() == 1 {
-                    "it is"
-                } else {
-                    "they are"
-                }
+                if already.len() == 1 { "it is" } else { "they are" }
             ));
         }
         if params.is_empty() {
@@ -561,18 +515,11 @@ impl Space {
                     if pv.mentions.is_empty() {
                         "no random effect in a form a κ can be appended to".to_string()
                     } else {
-                        pv.mentions
-                            .iter()
-                            .map(|m| format!("`{m}`"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
+                        pv.mentions.iter().map(|m| format!("`{m}`")).collect::<Vec<_>>().join(", ")
                     }
                 ));
             }
-            names.insert(
-                p.clone(),
-                (pv.eta.clone(), fresh_kappa_name(&variability, p)),
-            );
+            names.insert(p.clone(), (pv.eta.clone(), fresh_kappa_name(&variability, p)));
         }
         // Every parameter that already carries a κ is named too, at the κ it
         // has. It is never added or removed — it is not a candidate — but it
@@ -580,9 +527,7 @@ impl Space {
         // rebuilding that block has to name every member.
         for pv in variability.with_kappa() {
             if let Some(kappa) = &pv.kappa {
-                names
-                    .entry(pv.name.clone())
-                    .or_insert((pv.eta.clone(), kappa.clone()));
+                names.entry(pv.name.clone()).or_insert((pv.eta.clone(), kappa.clone()));
             }
         }
         // The κ blocks the candidates declare.
@@ -651,12 +596,7 @@ impl Space {
 
         let free_eta: Vec<String> = params
             .keys()
-            .filter(|p| {
-                names[*p]
-                    .0
-                    .as_deref()
-                    .is_some_and(|eta| !variability.is_fixed(eta))
-            })
+            .filter(|p| names[*p].0.as_deref().is_some_and(|eta| !variability.is_fixed(eta)))
             .cloned()
             .collect();
         // The structure is read over every parameter, not only the
@@ -676,20 +616,12 @@ impl Space {
 
     /// The κ every candidate keeps, alphabetical.
     fn kept(&self) -> Vec<String> {
-        self.params
-            .iter()
-            .filter(|(_, kept)| *kept)
-            .map(|(p, _)| p.clone())
-            .collect()
+        self.params.iter().filter(|(_, kept)| *kept).map(|(p, _)| p.clone()).collect()
     }
 
     /// The κ the search may remove, alphabetical.
     fn searched(&self) -> Vec<String> {
-        self.params
-            .iter()
-            .filter(|(_, kept)| !kept)
-            .map(|(p, _)| p.clone())
-            .collect()
+        self.params.iter().filter(|(_, kept)| !kept).map(|(p, _)| p.clone()).collect()
     }
 }
 
@@ -711,17 +643,9 @@ fn fresh_kappa_name(v: &VariabilityText, param: &str) -> String {
         .omegas
         .iter()
         .map(|d| d.name.as_str())
-        .chain(
-            v.omega_blocks
-                .iter()
-                .flat_map(|b| b.names.iter().map(String::as_str)),
-        )
+        .chain(v.omega_blocks.iter().flat_map(|b| b.names.iter().map(String::as_str)))
         .chain(v.kappas.iter().map(|d| d.name.as_str()))
-        .chain(
-            v.kappa_blocks
-                .iter()
-                .flat_map(|b| b.names.iter().map(String::as_str)),
-        )
+        .chain(v.kappa_blocks.iter().flat_map(|b| b.names.iter().map(String::as_str)))
         .collect();
     let base = format!("KAPPA_{param}");
     if !taken.contains(&base.as_str()) {
@@ -756,12 +680,7 @@ fn structure_of<'a>(v: &VariabilityText, params: impl Iterator<Item = &'a String
                       to: &HashMap<String, String>| {
         blocks
             .iter()
-            .map(|b| {
-                b.names
-                    .iter()
-                    .filter_map(|n| to.get(n).cloned())
-                    .collect::<Vec<_>>()
-            })
+            .map(|b| b.names.iter().filter_map(|n| to.get(n).cloned()).collect::<Vec<_>>())
             .filter(|b| b.len() > 1)
             .collect::<Vec<_>>()
     };
@@ -883,9 +802,7 @@ pub struct IovsearchRun<'a> {
 /// file and its base model. Writes `models.csv`, `models/<id>.ferx` and
 /// `final.ferx` into `run.dir` when given.
 pub fn run_iovsearch(
-    config: &SearchConfig,
-    base: &BaseModel,
-    run: IovsearchRun<'_>,
+    config: &SearchConfig, base: &BaseModel, run: IovsearchRun<'_>,
 ) -> Result<IovsearchResult, String> {
     let options = IovsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
@@ -932,10 +849,7 @@ struct Node {
 
 impl Node {
     fn from_result(
-        result: &CandidateResult,
-        report: &RunReport,
-        model: ModelText,
-        structure: IovStructure,
+        result: &CandidateResult, report: &RunReport, model: ModelText, structure: IovStructure,
         criterion: Criterion,
     ) -> Result<Node, String> {
         let fit = resolve_fit(result, report)?;
@@ -956,11 +870,7 @@ impl Node {
 /// The candidate with `target`'s structure, derived from `parent` by the κ
 /// and η edits and seeded from the parent's estimates.
 fn derive(
-    id: &str,
-    parent: &Node,
-    target: &IovStructure,
-    space: &Space,
-    options: &IovsearchOptions,
+    id: &str, parent: &Node, target: &IovStructure, space: &Space, options: &IovsearchOptions,
 ) -> Result<Candidate, String> {
     let mut model = parent.model.clone();
     if let Some(fit) = &parent.fit {
@@ -971,20 +881,14 @@ fn derive(
     // κ that go: their block shrinks around the survivors.
     for p in &from.kappas {
         if !target.has_kappa(p) {
-            model
-                .apply(ModelEdit::DropIov { param: p.clone() })
-                .map_err(err)?;
+            model.apply(ModelEdit::DropIov { param: p.clone() }).map_err(err)?;
         }
     }
     // A surviving κ block the target does not carry comes apart.
     let survived = IovStructure::new(
         from.etas.clone(),
         from.eta_blocks.clone(),
-        from.kappas
-            .iter()
-            .filter(|p| target.has_kappa(p))
-            .cloned()
-            .collect(),
+        from.kappas.iter().filter(|p| target.has_kappa(p)).cloned().collect(),
         from.kappa_blocks.clone(),
     );
     let mut to_split: Vec<String> = Vec::new();
@@ -998,16 +902,12 @@ fn derive(
         }
     }
     if !to_split.is_empty() {
-        model
-            .apply(ModelEdit::SplitKappaBlock(to_split))
-            .map_err(err)?;
+        model.apply(ModelEdit::SplitKappaBlock(to_split)).map_err(err)?;
     }
     // η that go — the κ stays in the `exp(…)`.
     for p in &from.etas {
         if !target.has_eta(p) {
-            model
-                .apply(ModelEdit::DropIiv { param: p.clone() })
-                .map_err(err)?;
+            model.apply(ModelEdit::DropIiv { param: p.clone() }).map_err(err)?;
         }
     }
     // κ that come, at a tenth of the η's variance as the parent fitted it.
@@ -1015,19 +915,10 @@ fn derive(
         if from.has_kappa(p) {
             continue;
         }
-        let (eta, kappa) = space
-            .names
-            .get(p)
-            .cloned()
-            .ok_or_else(|| format!("{id}: `{p}` has no κ to add"))?;
+        let (eta, kappa) =
+            space.names.get(p).cloned().ok_or_else(|| format!("{id}: `{p}` has no κ to add"))?;
         let variance = eta_variance(parent, eta.as_deref(), &model) * KAPPA_FRACTION;
-        model
-            .apply(ModelEdit::AddIov {
-                param: p.clone(),
-                kappa,
-                variance,
-            })
-            .map_err(err)?;
+        model.apply(ModelEdit::AddIov { param: p.clone(), kappa, variance }).map_err(err)?;
     }
     for block in &target.kappa_blocks {
         if survived.kappa_blocks.contains(block) {
@@ -1076,9 +967,7 @@ fn eta_variance(parent: &Node, eta: Option<&str>, model: &ModelText) -> f64 {
 
 /// The search proper, over an injected fitter.
 pub(crate) fn search(
-    fitter: &dyn StepFitter,
-    space: Space,
-    options: &IovsearchOptions,
+    fitter: &dyn StepFitter, space: Space, options: &IovsearchOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<IovsearchResult, String> {
     let emit = |event: IovsearchEvent| {
@@ -1105,10 +994,7 @@ pub(crate) fn search(
         .starts(options.starts_for(space.input_structure.largest_kappa_block()));
     let report = fitter.fit_step("input", std::slice::from_ref(&candidate))?;
     notes.extend(report.warnings.iter().cloned());
-    let result = report
-        .results
-        .first()
-        .ok_or("the input model was not fitted")?;
+    let result = report.results.first().ok_or("the input model was not fitted")?;
     if let Some(e) = &result.error {
         return Err(format!("the input model could not be fitted: {e}"));
     }
@@ -1119,15 +1005,7 @@ pub(crate) fn search(
         space.input_structure.clone(),
         criterion,
     )?;
-    rows.push(row_of(
-        result,
-        0,
-        None,
-        &input.structure,
-        &candidate,
-        options,
-        criterion,
-    ));
+    rows.push(row_of(result, 0, None, &input.structure, &candidate, options, criterion));
     store.insert(input.id.clone(), (input.model.clone(), input.fit.clone()));
     emit(IovsearchEvent::InputFinished {
         ofv: input.fit.as_ref().map(|f| f.ofv).unwrap_or(f64::NAN),
@@ -1165,9 +1043,7 @@ pub(crate) fn search(
             with_existing(all.clone()),
             kappa_blocks.clone(),
         );
-        emit(IovsearchEvent::FullIovStarted {
-            parameters: all.len(),
-        });
+        emit(IovsearchEvent::FullIovStarted { parameters: all.len() });
         let id = new_id();
         let candidate = derive(&id, &input, &full, &space, options)?;
         let report = fitter.fit_step("iov-all", std::slice::from_ref(&candidate))?;
@@ -1186,35 +1062,17 @@ pub(crate) fn search(
                      input is the last completed model"
                         .into(),
                 );
-                return Ok(cancelled_at_input(
-                    options, &space, input, rows, steps, store, notes,
-                ));
+                return Ok(cancelled_at_input(options, &space, input, rows, steps, store, notes));
             }
             None => return Err("the full-IOV model was not fitted".into()),
         };
         if let Some(e) = &result.error {
             return Err(format!("the full-IOV model could not be fitted: {e}"));
         }
-        let full_node = Node::from_result(
-            result,
-            &report,
-            candidate.model.clone(),
-            full.clone(),
-            criterion,
-        )?;
-        rows.push(row_of(
-            result,
-            1,
-            Some("input"),
-            &full,
-            &candidate,
-            options,
-            criterion,
-        ));
-        store.insert(
-            full_node.id.clone(),
-            (full_node.model.clone(), full_node.fit.clone()),
-        );
+        let full_node =
+            Node::from_result(result, &report, candidate.model.clone(), full.clone(), criterion)?;
+        rows.push(row_of(result, 1, Some("input"), &full, &candidate, options, criterion));
+        store.insert(full_node.id.clone(), (full_node.model.clone(), full_node.fit.clone()));
         emit(IovsearchEvent::FullIovFinished {
             ofv: full_node.fit.as_ref().map(|f| f.ofv).unwrap_or(f64::NAN),
             criterion: full_node.criterion,
@@ -1234,11 +1092,8 @@ pub(crate) fn search(
             // Pharmpy's proper subsets.
             let searched = space.searched();
             let kept = space.kept();
-            let max_removed = if kept.is_empty() {
-                searched.len().saturating_sub(1)
-            } else {
-                searched.len()
-            };
+            let max_removed =
+                if kept.is_empty() { searched.len().saturating_sub(1) } else { searched.len() };
             let mut targets = Vec::new();
             for size in 1..=max_removed {
                 for removed in combinations(&searched, size) {
@@ -1263,10 +1118,7 @@ pub(crate) fn search(
                 let id = new_id();
                 candidates.push(derive(&id, &full_node, target, &space, options)?);
             }
-            emit(IovsearchEvent::StepStarted {
-                step: 1,
-                candidates: candidates.len() + 1,
-            });
+            emit(IovsearchEvent::StepStarted { step: 1, candidates: candidates.len() + 1 });
             if !candidates.is_empty() {
                 let report = fitter.fit_step("step-1", &candidates)?;
                 notes.extend(report.warnings.iter().cloned());
@@ -1298,11 +1150,7 @@ pub(crate) fn search(
         }
         let (ranked, best) = rank_nodes(&input, &nodes, options.cutoff);
         annotate(&mut rows, 1, &ranked);
-        let winner = nodes
-            .iter()
-            .find(|n| n.id == best)
-            .cloned()
-            .unwrap_or_else(|| input.clone());
+        let winner = nodes.iter().find(|n| n.id == best).cloned().unwrap_or_else(|| input.clone());
         emit(IovsearchEvent::StepFinished {
             step: 1,
             best: (best.clone(), winner.criterion),
@@ -1356,10 +1204,7 @@ pub(crate) fn search(
                 let id = new_id();
                 candidates.push(derive(&id, &selected, target, &space, options)?);
             }
-            emit(IovsearchEvent::StepStarted {
-                step: 2,
-                candidates: candidates.len(),
-            });
+            emit(IovsearchEvent::StepStarted { step: 2, candidates: candidates.len() });
             let report = fitter.fit_step("step-2", &candidates)?;
             notes.extend(report.warnings.iter().cloned());
             let mut nodes = Vec::new();
@@ -1389,11 +1234,8 @@ pub(crate) fn search(
             cancelled |= report.cancelled;
             let (ranked, best) = rank_nodes(&selected, &nodes, options.cutoff);
             annotate(&mut rows, 2, &ranked);
-            let winner = nodes
-                .iter()
-                .find(|n| n.id == best)
-                .cloned()
-                .unwrap_or_else(|| selected.clone());
+            let winner =
+                nodes.iter().find(|n| n.id == best).cloned().unwrap_or_else(|| selected.clone());
             emit(IovsearchEvent::StepFinished {
                 step: 2,
                 best: (best.clone(), winner.criterion),
@@ -1414,13 +1256,9 @@ pub(crate) fn search(
     if let Some(r) = rows.iter_mut().find(|r| r.id == final_id) {
         r.selected = true;
     }
-    let models: BTreeMap<String, ModelText> = store
-        .iter()
-        .map(|(id, (text, _))| (id.clone(), text.clone()))
-        .collect();
-    let (final_model, final_fit) = store
-        .remove(&final_id)
-        .expect("every fitted model is stored");
+    let models: BTreeMap<String, ModelText> =
+        store.iter().map(|(id, (text, _))| (id.clone(), text.clone())).collect();
+    let (final_model, final_fit) = store.remove(&final_id).expect("every fitted model is stored");
     Ok(IovsearchResult {
         options: options.clone(),
         criterion,
@@ -1445,24 +1283,17 @@ pub(crate) fn search(
 /// returns here from inside a step, where the candidate that would have
 /// become the final model does not exist.
 fn cancelled_at_input(
-    options: &IovsearchOptions,
-    space: &Space,
-    input: Node,
-    mut rows: Vec<ModelRow>,
-    steps: Vec<StepSummary>,
-    mut store: HashMap<String, (ModelText, Option<FitResult>)>,
+    options: &IovsearchOptions, space: &Space, input: Node, mut rows: Vec<ModelRow>,
+    steps: Vec<StepSummary>, mut store: HashMap<String, (ModelText, Option<FitResult>)>,
     notes: Vec<String>,
 ) -> IovsearchResult {
     if let Some(r) = rows.iter_mut().find(|r| r.id == input.id) {
         r.selected = true;
     }
-    let models: BTreeMap<String, ModelText> = store
-        .iter()
-        .map(|(id, (text, _))| (id.clone(), text.clone()))
-        .collect();
-    let (final_model, final_fit) = store
-        .remove(&input.id)
-        .expect("the input model is stored before any candidate is fitted");
+    let models: BTreeMap<String, ModelText> =
+        store.iter().map(|(id, (text, _))| (id.clone(), text.clone())).collect();
+    let (final_model, final_fit) =
+        store.remove(&input.id).expect("the input model is stored before any candidate is fitted");
     IovsearchResult {
         options: options.clone(),
         criterion: options.criterion(),
@@ -1483,24 +1314,15 @@ fn cancelled_at_input(
 
 /// Pharmpy's `rank_models` with `parent` as reference.
 fn rank_nodes(parent: &Node, candidates: &[Node], cutoff: Option<f64>) -> (Vec<StepRank>, String) {
-    let cands: Vec<(String, f64, bool)> = candidates
-        .iter()
-        .map(|n| (n.id.clone(), n.criterion, n.eligible))
-        .collect();
-    rank_models(
-        (&parent.id, parent.criterion, parent.eligible),
-        &cands,
-        cutoff,
-    )
+    let cands: Vec<(String, f64, bool)> =
+        candidates.iter().map(|n| (n.id.clone(), n.criterion, n.eligible)).collect();
+    rank_models((&parent.id, parent.criterion, parent.eligible), &cands, cutoff)
 }
 
 /// Write a step's ranks and Δ onto its rows.
 fn annotate(rows: &mut [ModelRow], step: usize, ranked: &[StepRank]) {
     for r in ranked {
-        if let Some(row) = rows
-            .iter_mut()
-            .find(|row| row.id == r.id && row.step == step)
-        {
+        if let Some(row) = rows.iter_mut().find(|row| row.id == r.id && row.step == step) {
             row.d_criterion = r.d_criterion.map(|d| -d);
             row.rank = r.rank;
         }
@@ -1509,13 +1331,8 @@ fn annotate(rows: &mut [ModelRow], step: usize, ranked: &[StepRank]) {
 
 #[allow(clippy::too_many_arguments)]
 fn row_of(
-    result: &CandidateResult,
-    step: usize,
-    parent: Option<&str>,
-    structure: &IovStructure,
-    candidate: &Candidate,
-    options: &IovsearchOptions,
-    criterion: Criterion,
+    result: &CandidateResult, step: usize, parent: Option<&str>, structure: &IovStructure,
+    candidate: &Candidate, options: &IovsearchOptions, criterion: Criterion,
 ) -> ModelRow {
     ModelRow {
         id: result.id.clone(),

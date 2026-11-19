@@ -28,10 +28,7 @@ pub(crate) trait StepFitter {
     /// the parent's conditional weighted residuals. A fitter that serves one
     /// dataset only declines with an error rather than fitting the wrong data.
     fn fit_step_on(
-        &self,
-        step_dir: &str,
-        _candidates: &[Candidate],
-        _data: &Population,
+        &self, step_dir: &str, _candidates: &[Candidate], _data: &Population,
     ) -> Result<RunReport, String> {
         Err(format!(
             "{step_dir}: this fitter fits the search's dataset only; a step on another dataset \
@@ -61,10 +58,7 @@ impl StepFitter for RunnerFitter<'_> {
     }
 
     fn fit_step_on(
-        &self,
-        step_dir: &str,
-        candidates: &[Candidate],
-        data: &Population,
+        &self, step_dir: &str, candidates: &[Candidate], data: &Population,
     ) -> Result<RunReport, String> {
         let mut runner = Runner::new().threads(self.threads);
         if let Some(dir) = &self.dir {

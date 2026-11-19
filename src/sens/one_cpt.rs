@@ -172,10 +172,7 @@ pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_b
     if !(ke.br_cmp(crate::sens::num::BranchCmp::Lt, abscissa)) {
         return T::from_f64(0.0);
     }
-    let abs = IgAbsorption {
-        mat,
-        lambda: mat / cv2,
-    };
+    let abs = IgAbsorption { mat, lambda: mat / cv2 };
     convolve_1cpt(&abs, t, ke, (f_bio * amt) / v)
 }
 
@@ -262,13 +259,7 @@ pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, 
 /// [`crate::pk::one_cpt_infusion_ss`]; the `dur > ii` branch superposes the
 /// infinite past pulse train (`N` simultaneously-active infusions at phase `t`).
 pub fn one_cpt_infusion_ss_g<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    ii: f64,
-    cl: T,
-    v: T,
+    rate: f64, dur: f64, amt: f64, t: T, ii: f64, cl: T, v: T,
 ) -> T {
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -296,9 +287,7 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
 
 /// `Σ c·f(λ)` over the `(c, λ)` modes.
 pub(crate) fn modal_sum<T: PkNum>(modes: &[(T, T)], f: impl Fn(T) -> T) -> T {
-    modes
-        .iter()
-        .fold(T::from_f64(0.0), |acc, &(c, lam)| acc + c * f(lam))
+    modes.iter().fold(T::from_f64(0.0), |acc, &(c, lam)| acc + c * f(lam))
 }
 
 /// One mode's response at `t` to a zero-order input of `r_v` (rate per central volume) over
@@ -368,13 +357,7 @@ pub(crate) fn mode_infusion_ss<T: PkNum>(lam: T, r_v: T, dur: f64, ii: f64, t: T
 /// and get `F` by post-multiplying the linear-in-dose result — seeded through
 /// `f_bio` so `∂C/∂F` is exact (#327).
 pub fn one_cpt_conc_g<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    cl: T,
-    v: T,
-    ka: T,
-    f_bio: T,
-    oral: bool,
+    dose: &DoseEvent, t: T, cl: T, v: T, ka: T, f_bio: T, oral: bool,
 ) -> T {
     // The shared #2104 rule decides an arrived dose before `F` scales it, as
     // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
@@ -415,13 +398,7 @@ pub fn one_cpt_conc_g<T: PkNum>(
 /// `oral_bolus` branch of [`one_cpt_conc_g`]). Generic over [`PkNum`] so prediction
 /// (`T = f64`) and the `Dual2` sensitivity share one definition.
 pub fn one_cpt_transit_conc_g<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    cl: T,
-    v: T,
-    n: T,
-    mtt: T,
-    f_bio: T,
+    dose: &DoseEvent, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T,
 ) -> T {
     one_cpt_transit_amt_g(T::from_f64(dose.amt), t, cl, v, n, mtt, f_bio)
 }
@@ -431,13 +408,7 @@ pub fn one_cpt_transit_conc_g<T: PkNum>(
 /// [`one_cpt_ig_amt_g`] with `F` baked into the kernel. Generic over [`PkNum`] so
 /// prediction (`T = f64`) and the `Dual2` sensitivity share one definition.
 pub fn one_cpt_ig_conc_g<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    cl: T,
-    v: T,
-    mat: T,
-    cv2: T,
-    f_bio: T,
+    dose: &DoseEvent, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T,
 ) -> T {
     one_cpt_ig_amt_g(T::from_f64(dose.amt), t, cl, v, mat, cv2, f_bio)
 }
@@ -462,12 +433,7 @@ mod tests {
 
     /// `(f, ∂f/∂[CL,V,KA,F], ∂²f/∂[CL,V,KA,F]²)` for oral.
     fn oral_sens(
-        amt: f64,
-        t: f64,
-        cl: f64,
-        v: f64,
-        ka: f64,
-        f_bio: f64,
+        amt: f64, t: f64, cl: f64, v: f64, ka: f64, f_bio: f64,
     ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
         let f = one_cpt_oral_g::<Dual2<4>>(
             amt,
@@ -492,10 +458,7 @@ mod tests {
         let grad = [f * (-t / v), f * (k * t - 1.0) / v];
         let hess = [
             [f * t * t / v2, f * t * (2.0 - k * t) / v2],
-            [
-                f * t * (2.0 - k * t) / v2,
-                f * (k * k * t * t - 4.0 * k * t + 2.0) / v2,
-            ],
+            [f * t * (2.0 - k * t) / v2, f * (k * k * t * t - 4.0 * k * t + 2.0) / v2],
         ];
         (f, grad, hess)
     }
@@ -558,9 +521,8 @@ mod tests {
     fn oral_dual_matches_fd() {
         let (amt, t, cl, v, ka, fb) = (100.0, 2.0, 1.2, 12.0, 0.8, 0.9);
         let (_, gd, hd) = oral_sens(amt, t, cl, v, ka, fb);
-        let (gfd, hfd) = fd([cl, v, ka, fb], |p| {
-            one_cpt_oral_g::<f64>(amt, t, p[0], p[1], p[2], p[3])
-        });
+        let (gfd, hfd) =
+            fd([cl, v, ka, fb], |p| one_cpt_oral_g::<f64>(amt, t, p[0], p[1], p[2], p[3]));
         for i in 0..4 {
             approx::assert_relative_eq!(gd[i], gfd[i], max_relative = 1e-4, epsilon = 1e-9);
             // `epsilon` is the FD Hessian's own noise floor, `ε·|f|/h² ≈ 2e-6` at `h ≈ 2e-5`
@@ -628,20 +590,11 @@ mod tests {
     fn one_cpt_transit_amt_guards_return_zero() {
         let z = 0.0_f64;
         // n < 0 → invalid-param guard
-        assert_eq!(
-            one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, -0.5, 1.5, 1.0),
-            z
-        );
+        assert_eq!(one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, -0.5, 1.5, 1.0), z);
         // mtt = 0 → invalid-param guard
-        assert_eq!(
-            one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, 3.0, 0.0, 1.0),
-            z
-        );
+        assert_eq!(one_cpt_transit_g::<f64>(100.0, 1.0, 1.0, 10.0, 3.0, 0.0, 1.0), z);
         // ke = CL/V = 3.0 ≥ KTR = (3+1)/1.5 ≈ 2.67 → flip-flop guard
-        assert_eq!(
-            one_cpt_transit_g::<f64>(100.0, 1.0, 30.0, 10.0, 3.0, 1.5, 1.0),
-            z
-        );
+        assert_eq!(one_cpt_transit_g::<f64>(100.0, 1.0, 30.0, 10.0, 3.0, 1.5, 1.0), z);
     }
 
     /// #2134: a `NaN` `CL`, `V` or kernel parameter is served as `NaN` by the static
@@ -665,20 +618,11 @@ mod tests {
         let ig =
             |cl: f64, v: f64, a: f64, b: f64| one_cpt_ig_g::<f64>(100.0, 1.0, cl, v, a, b, 1.0);
         for (kernel, f, a, b) in [
-            (
-                "transit",
-                &transit as &dyn Fn(f64, f64, f64, f64) -> f64,
-                3.0,
-                1.5,
-            ),
+            ("transit", &transit as &dyn Fn(f64, f64, f64, f64) -> f64, 3.0, 1.5),
             ("ig", &ig, 2.0, 0.5),
         ] {
             assert!(f(cl, v, a, b) > 0.0, "{kernel}: the valid control");
-            assert_eq!(
-                f(30.0, 10.0, a, b),
-                0.0,
-                "{kernel}: a finite flip-flop reads 0"
-            );
+            assert_eq!(f(30.0, 10.0, a, b), 0.0, "{kernel}: a finite flip-flop reads 0");
             for (label, p) in [
                 ("CL", (nan, v, a, b)),
                 ("V", (cl, nan, a, b)),
@@ -706,11 +650,7 @@ mod tests {
         // The jet is `NaN` too, or a finite `∂f/∂η` lets FOCEI's `H̃` factor and the
         // subject's `NaN` objective escape the `1e20` repel (measured on the CLI).
         assert!(
-            d.value.is_nan()
-                && d.grad
-                    .iter()
-                    .chain(d.hess.iter().flatten())
-                    .all(|g| g.is_nan()),
+            d.value.is_nan() && d.grad.iter().chain(d.hess.iter().flatten()).all(|g| g.is_nan()),
             "transit Dual2 must be NaN in every component: {d:?}"
         );
         let d = one_cpt_ig_g::<Dual2<2>>(
@@ -725,11 +665,7 @@ mod tests {
         // The jet is `NaN` too, or a finite `∂f/∂η` lets FOCEI's `H̃` factor and the
         // subject's `NaN` objective escape the `1e20` repel (measured on the CLI).
         assert!(
-            d.value.is_nan()
-                && d.grad
-                    .iter()
-                    .chain(d.hess.iter().flatten())
-                    .all(|g| g.is_nan()),
+            d.value.is_nan() && d.grad.iter().chain(d.hess.iter().flatten()).all(|g| g.is_nan()),
             "IG Dual2 must be NaN in every component: {d:?}"
         );
     }
@@ -805,33 +741,20 @@ mod tests {
         };
 
         eprintln!("IV bolus (2 active params: CL, V) — f + grad + hess:");
-        let exp = time_it("Option B (explicit f64)", &|t| {
-            iv_bolus_explicit_reduce(amt, t, cl, v)
-        });
-        let d2 = time_it("Dual2<2> (minimal width)", &|t| {
-            iv_bolus_width::<2>(amt, t, cl, v)
-        });
+        let exp = time_it("Option B (explicit f64)", &|t| iv_bolus_explicit_reduce(amt, t, cl, v));
+        let d2 = time_it("Dual2<2> (minimal width)", &|t| iv_bolus_width::<2>(amt, t, cl, v));
         let _d4 = time_it("Dual2<4>", &|t| iv_bolus_width::<4>(amt, t, cl, v));
-        let d8 = time_it("Dual2<8> (provider width)", &|t| {
-            iv_bolus_width::<8>(amt, t, cl, v)
-        });
+        let d8 = time_it("Dual2<8> (provider width)", &|t| iv_bolus_width::<8>(amt, t, cl, v));
         eprintln!(
             "  → explicit is {:.1}x faster than Dual2<2>, {:.1}x faster than Dual2<8>",
             d2 / exp,
             d8 / exp
         );
-        eprintln!(
-            "  → Dual2<8> is {:.1}x slower than Dual2<2> (O(N^2) width penalty)\n",
-            d8 / d2
-        );
+        eprintln!("  → Dual2<8> is {:.1}x slower than Dual2<2> (O(N^2) width penalty)\n", d8 / d2);
 
         eprintln!("1-cpt oral (3-4 active params: CL, V, KA[, F]) — f + grad + hess:");
-        let o4 = time_it("Dual2<4> (minimal width)", &|t| {
-            oral_width::<4>(amt, t, cl, v, ka, fb)
-        });
-        let o8 = time_it("Dual2<8> (provider width)", &|t| {
-            oral_width::<8>(amt, t, cl, v, ka, fb)
-        });
+        let o4 = time_it("Dual2<4> (minimal width)", &|t| oral_width::<4>(amt, t, cl, v, ka, fb));
+        let o8 = time_it("Dual2<8> (provider width)", &|t| oral_width::<8>(amt, t, cl, v, ka, fb));
         eprintln!(
             "  → Dual2<8> is {:.1}x slower than Dual2<4> for oral (provider over-seeds)\n",
             o8 / o4

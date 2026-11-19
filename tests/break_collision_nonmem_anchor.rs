@@ -58,11 +58,8 @@ fn nonmem_pred_table(tab: &str) -> HashMap<(String, u64), f64> {
     let text = std::fs::read_to_string(anchor(tab)).expect("the committed NONMEM table reads");
     let mut lines = text.lines();
     lines.next(); // "TABLE NO.  1"
-    let header: Vec<&str> = lines
-        .next()
-        .expect("the table has a header row")
-        .split_whitespace()
-        .collect();
+    let header: Vec<&str> =
+        lines.next().expect("the table has a header row").split_whitespace().collect();
     let col = |name: &str| {
         header
             .iter()
@@ -117,10 +114,7 @@ fn assert_pred_matches_nonmem(model: &str, data: &str, tab: &str, max_relative: 
         let Some(&want) = nm.get(&(id.clone(), time.to_bits())) else {
             panic!("no NONMEM PRED row for ID {id} at TIME {time} in {tab}");
         };
-        assert!(
-            pred.is_finite(),
-            "ID {id} t={time}: ferx PRED is not finite"
-        );
+        assert!(pred.is_finite(), "ID {id} t={time}: ferx PRED is not finite");
         let rel = (pred - want).abs() / want.abs().max(f64::MIN_POSITIVE);
         assert!(
             rel < max_relative,
@@ -226,10 +220,7 @@ fn the_gated_engines_match_nonmem_when_a_route_onset_collides_with_an_infusion()
     )
     .expect("the anchor dataset loads");
     let model = &parsed.model;
-    let ode = model
-        .ode_spec
-        .as_ref()
-        .expect("the anchor model is an ODE model");
+    let ode = model.ode_spec.as_ref().expect("the anchor model is an ODE model");
     let theta = &model.default_params.theta;
     let subject = &population.subjects[0];
     let eta = vec![0.0; model.n_eta];

@@ -26,10 +26,7 @@ fn population(subject: Subject, covariate_names: Vec<String>) -> Population {
 
 fn with_rho(model: &CompiledModel, rho: f64) -> Vec<ResidualCorrelation> {
     assert_eq!(model.residual_correlations.len(), 1);
-    vec![ResidualCorrelation {
-        rho,
-        ..model.residual_correlations[0].clone()
-    }]
+    vec![ResidualCorrelation { rho, ..model.residual_correlations[0].clone() }]
 }
 
 /// Arm A: one observation, `combined(PROP, ADD)`, σ = (0.2, 1.0), declared
@@ -54,9 +51,7 @@ const ARM_B: &str =
     [covariates]\n  FREE continuous\n";
 
 fn parse(text: &str) -> CompiledModel {
-    crate::parser::model_parser::parse_full_model(text)
-        .expect("parse")
-        .model
+    crate::parser::model_parser::parse_full_model(text).expect("parse").model
 }
 
 fn arm_a_subject() -> Subject {
@@ -165,10 +160,7 @@ fn npde_decorrelates_a_paired_block_sigma_at_the_fitted_correlation() {
     for seed in 1..=SEEDS {
         let out = compute_npde_npd(&model, &pop, &params, NSIM, Some(seed), None).expect("npde");
         let (npde, npd) = (out[0].npde[1], out[0].npd[1]);
-        assert!(
-            npde.is_finite() && npd.is_finite(),
-            "seed {seed}: {npde} {npd}"
-        );
+        assert!(npde.is_finite() && npd.is_finite(), "seed {seed}: {npde} {npd}");
         eprintln!("arm B seed {seed}: npde2 = {npde}, npd2 = {npd}");
         worst_npde = worst_npde.max((npde - cf_fit).abs());
         worst_npd = worst_npd.max((npd - z2).abs());
@@ -186,18 +178,15 @@ fn npde_decorrelates_a_paired_block_sigma_at_the_fitted_correlation() {
         "row 2 NPDE not decorrelated at the fitted ρ: worst |npde − {cf_fit}| = {worst_npde} \
          (independent rows give {cf_indep}, the declared ρ gives {cf_decl})"
     );
-    assert!(
-        worst_npd < TOL_A,
-        "row 2 NPD moved off its marginal {z2}: worst {worst_npd}"
-    );
+    assert!(worst_npd < TOL_A, "row 2 NPD moved off its marginal {z2}: worst {worst_npd}");
 }
 
 /// The unchanged half (#1733): a `FIX` `block_sigma` whose parameter set carries
 /// the declared ρ (or none, falling back to it), on rows that are never paired.
 /// Its `R` is diagonal, so the shared correlated draw takes its per-row fast
 /// path, which consumes the RNG stream in the same order as the old scalar loop.
-/// The scores are the ones `d43afca9` produced before the draw moved, pinned to
-/// the bit. A draw that perturbed the stream (an extra normal, or rows drawn in
+/// The scores are pinned to the bit: first captured from `d43afca9` (before the draw
+/// moved), re-captured under #3021, which re-keyed the per-subject streams. A draw that perturbed the stream (an extra normal, or rows drawn in
 /// another order) would move them. Turning the fast path off does not: the
 /// eigen square root of a diagonal `R` was measured to give the same bits, so
 /// the fast path is a cost saving, not a numerical one.
@@ -216,12 +205,8 @@ fn a_fixed_block_sigma_scores_exactly_as_before_the_shared_draw() {
     .expect("read data");
     let mut params = model.default_params.clone();
     assert_eq!(model.residual_correlations.len(), 1);
-    let pinned: [f64; 4] = [
-        0.15096921547331393,
-        0.12566134687610309,
-        -0.2793190341322942,
-        0.2793190341322942,
-    ];
+    let pinned: [f64; 4] =
+        [0.12566134687610309, 0.10043372055919272, -0.2275449764238035, 0.17637416469849554];
     for corr in [model.residual_correlations.clone(), vec![]] {
         params.residual_correlations = corr;
         let out = compute_npde_npd(&model, &pop, &params, 200, Some(1), None).expect("npde");
@@ -285,10 +270,7 @@ fn a_frem_subject_draws_its_pk_rows_at_the_fitted_correlation() {
         .map(|r| r.outcome.continuous_value() - r.ipred)
         .collect();
     assert_eq!(pk.len(), NSIM);
-    assert!(
-        pk.iter().all(|e| e.is_finite()),
-        "simulate: non-finite residual"
-    );
+    assert!(pk.iter().all(|e| e.is_finite()), "simulate: non-finite residual");
     let sd = (pk.iter().map(|e| e * e).sum::<f64>() / NSIM as f64).sqrt();
     // sd of 2000 normal draws is within ~1.6% of σ at 1 se; 8% is 5 se, while the
     // declared ρ is 124% away (sd_decl / sd_fit = 2.24).
@@ -312,10 +294,7 @@ fn npd_carries_iiv_on_ruv_through_the_correlated_draw() {
         "omega ETA_CL ~ 1e-10 FIX\n  omega ETA_RUV ~ 0.5 FIX\n",
     ) + "  iiv_on_ruv = ETA_RUV\n";
     let model = parse(&text);
-    assert!(
-        model.residual_error_eta.is_some(),
-        "the fixture must carry η_RUV"
-    );
+    assert!(model.residual_error_eta.is_some(), "the fixture must carry η_RUV");
     let mut params = model.default_params.clone();
     params.residual_correlations = with_rho(&model, -0.9);
     let mut subject = arm_a_subject();
@@ -339,10 +318,7 @@ fn npd_carries_iiv_on_ruv_through_the_correlated_draw() {
         .sum();
     let cf = crate::stats::special::normal_inv_cdf(pd);
     let cf_unscaled = 2.0;
-    assert!(
-        (cf - cf_unscaled).abs() > 3.0 * TOL_A,
-        "degenerate fixture: cf {cf}"
-    );
+    assert!((cf - cf_unscaled).abs() > 3.0 * TOL_A, "degenerate fixture: cf {cf}");
     let pop = population(subject, vec![]);
     let mut worst = 0.0f64;
     for seed in 1..=SEEDS {
@@ -370,10 +346,7 @@ fn npd_carries_a_custom_magnitude_through_the_correlated_draw() {
             "theta TVV(10.0, 0.1, 100.0) FIX\n",
             "theta TVV(10.0, 0.1, 100.0) FIX\n  theta MAG(2.0, 0.1, 10.0) FIX\n",
         )
-        .replace(
-            "combined(PROP_ERR, ADD_ERR)",
-            "combined(PROP_ERR * MAG, ADD_ERR)",
-        );
+        .replace("combined(PROP_ERR, ADD_ERR)", "combined(PROP_ERR * MAG, ADD_ERR)");
     let model = parse(&text);
     let mut params = model.default_params.clone();
     params.residual_correlations = with_rho(&model, -0.9);
@@ -388,10 +361,7 @@ fn npd_carries_a_custom_magnitude_through_the_correlated_draw() {
     let sd_fit = var(0.4).sqrt();
     subject.observations = vec![f + sd_fit];
     let cf_unscaled = sd_fit / var(0.2).sqrt();
-    assert!(
-        (1.0 - cf_unscaled).abs() > 3.0 * TOL_A,
-        "degenerate fixture"
-    );
+    assert!((1.0 - cf_unscaled).abs() > 3.0 * TOL_A, "degenerate fixture");
     let pop = population(subject, vec![]);
     let mut worst = 0.0f64;
     for seed in 1..=SEEDS {

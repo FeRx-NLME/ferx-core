@@ -138,10 +138,8 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
             .iter()
             .position(|l| l.starts_with("mod ") && l.contains("test") && l.ends_with('{'))
             .unwrap_or(lines.len());
-        let code: Vec<&str> = lines[..end]
-            .iter()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect();
+        let code: Vec<&str> =
+            lines[..end].iter().map(|l| l.split("//").next().unwrap_or("")).collect();
 
         /// A site is correctly paired when the two values agree about whether a
         /// matrix exists: `None` beside `None` (an exit that runs no covariance
@@ -167,9 +165,7 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
                     // two different results.
                     let lo = i.saturating_sub(30);
                     let hi = (i + 30).min(code.len());
-                    let method = code[lo..hi]
-                        .iter()
-                        .find_map(|l| writes(l, "covariance_method"));
+                    let method = code[lo..hi].iter().find_map(|l| writes(l, "covariance_method"));
                     if paired(v, method) {
                         labelled += 1;
                     }
@@ -177,9 +173,8 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
                 }
             }
             // (b) struct-literal form
-            let is_literal = ["OuterResult {", "FitResult {", "FitWire {"]
-                .iter()
-                .any(|s| line.contains(s));
+            let is_literal =
+                ["OuterResult {", "FitResult {", "FitWire {"].iter().any(|s| line.contains(s));
             if !is_literal || line.contains("struct ") {
                 continue;
             }
@@ -203,16 +198,12 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
                     break;
                 }
             }
-            let Some(matrix) = own_fields
-                .iter()
-                .find_map(|l| writes(l, "covariance_matrix"))
+            let Some(matrix) = own_fields.iter().find_map(|l| writes(l, "covariance_matrix"))
             else {
                 continue;
             };
             sites += 1;
-            let method = own_fields
-                .iter()
-                .find_map(|l| writes(l, "covariance_method"));
+            let method = own_fields.iter().find_map(|l| writes(l, "covariance_method"));
             if paired(matrix, method) {
                 labelled += 1;
             }
@@ -222,27 +213,28 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
         }
     }
 
+    // An exit that runs no covariance step (Bayes, the profiled loop's never-solved exit,
+    // `fit()`'s two synthetic evaluation-only stages) names neither field: it inherits the
+    // `None`/`None` pair of `OuterResult::from_params`, which is itself a site.
     let expected: BTreeMap<String, (usize, usize)> = [
-        // Every estimator exit publishes its own `OuterResult`.
-        ("src/estimation/bayes.rs", (1, 1)),
+        // Every estimator exit that ran a covariance step publishes it with its estimator.
         ("src/estimation/gauss_newton.rs", (2, 2)),
         ("src/estimation/impmap.rs", (2, 2)),
-        // The NLopt exit, the built-in-BFGS exit, the `outer_maxiter = 0`
-        // evaluation exit, and `optimize_nlopt`'s one covariance step on the attempt it
-        // reports (#1564), and a verified warm start that reports the unmoved run's
-        // point with its covariance (#2506) — plus `CovStepOutcome`'s constructions
+        // `OuterResult::from_params`, the NLopt exit, the built-in-BFGS exit, the
+        // `outer_maxiter = 0` evaluation exit, and `optimize_nlopt`'s one covariance step on
+        // the attempt it reports (#1564), and a verified warm start that reports the unmoved
+        // run's point with its covariance (#2506) — plus `CovStepOutcome`'s constructions
         // live in `covariance.rs`, not here.
-        ("src/estimation/outer_optimizer.rs", (5, 5)),
-        // The profiled outer loop (#1065) and its never-solved exit.
-        ("src/estimation/profile.rs", (2, 2)),
+        ("src/estimation/outer_optimizer.rs", (6, 6)),
+        // The profiled outer loop (#1065).
+        ("src/estimation/profile.rs", (1, 1)),
         ("src/estimation/saem.rs", (1, 1)),
         ("src/estimation/trust_region.rs", (1, 1)),
         ("src/estimation/vi/run.rs", (1, 1)),
         // The standalone re-run, which assigns onto a cloned `FitResult`.
         ("src/estimation/run_covariance.rs", (1, 1)),
-        // Two synthetic evaluation-only `OuterResult`s plus the `FitResult`
-        // `fit_inner` assembles.
-        ("src/api/fit.rs", (3, 3)),
+        // The `FitResult` `fit_inner` assembles.
+        ("src/api/fit.rs", (1, 1)),
         // The `.fitrx` wire: the `FitWire` the save side builds, and the
         // `FitResult` the load side rebuilds.
         ("src/io/fitrx.rs", (2, 2)),

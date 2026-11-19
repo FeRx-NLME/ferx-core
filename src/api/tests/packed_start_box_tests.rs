@@ -111,10 +111,7 @@ fn box_diags(params_block: &str) -> Vec<Diagnostic> {
 
 /// An evaluation-only run: `maxiter = 0` and no stage that searches anyway.
 fn eval_only() -> FitOptions {
-    FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    }
+    FitOptions { outer_maxiter: 0, ..FitOptions::default() }
 }
 
 /// The check on an evaluation-only run.
@@ -151,10 +148,7 @@ fn a_theta_start_strictly_outside_its_declared_range_is_an_error() {
     let below = box_diags(&params_with_theta("theta TVCL(0.05, 0.1, 10.0)"));
     let msg = only_message(&below);
     assert_eq!(below[0].code, "E_THETA_INIT_OUTSIDE_BOUNDS");
-    assert!(
-        below[0].is_error(),
-        "a declared bound is the user's own: {msg}"
-    );
+    assert!(below[0].is_error(), "a declared bound is the user's own: {msg}");
     assert!(msg.contains("TVCL"), "{msg}");
     assert!(msg.contains("below"), "{msg}");
 
@@ -237,10 +231,7 @@ fn a_theta_below_a_declared_lower_bound_of_zero_is_still_an_error() {
     assert_eq!(diags[0].code, "E_THETA_INIT_OUTSIDE_BOUNDS");
     assert!(diags[0].is_error(), "{msg}");
     assert!(msg.contains("starts at -5e0"), "{msg}");
-    assert!(
-        msg.contains("below its own declared lower bound of 0e0"),
-        "{msg}"
-    );
+    assert!(msg.contains("below its own declared lower bound of 0e0"), "{msg}");
     // The message names where the fit really begins — the floor, not the
     // declared bound. `1e-10` formats as `1e-10` under `{:e}`.
     assert!(
@@ -257,11 +248,7 @@ fn a_theta_below_a_declared_lower_bound_of_zero_is_still_an_error() {
         "1e-12 is inside [0, 10]; nothing here is an error — {control:#?}"
     );
     assert_eq!(
-        control
-            .iter()
-            .map(|d| d.code.as_str())
-            .collect::<Vec<_>>()
-            .as_slice(),
+        control.iter().map(|d| d.code.as_str()).collect::<Vec<_>>().as_slice(),
         ["W_INIT_NOT_REPRESENTABLE"],
         "the floor moving 1e-12 to 1e-10 is #1307's object, not this error's"
     );
@@ -290,10 +277,7 @@ fn a_fixed_theta_outside_its_declared_range_is_left_alone() {
     assert!(p.theta_fixed[0], "premise: the declaration is FIX-ed");
     let start = pack_with_bounds(p);
     assert_eq!(
-        (
-            start.bounds.lower[0].to_bits(),
-            start.bounds.upper[0].to_bits()
-        ),
+        (start.bounds.lower[0].to_bits(), start.bounds.upper[0].to_bits()),
         (start.packed[0].to_bits(), start.packed[0].to_bits()),
         "premise: the box is pinned to the packed start, so the fit runs at \
          the declared 0.05 and the clamp moves nothing"
@@ -361,19 +345,14 @@ fn the_theta_remedy_never_advertises_a_bound_ferx_cannot_represent() {
 /// that had simply stopped firing.
 #[test]
 fn a_theta_start_exactly_on_a_declared_bound_is_left_alone() {
-    for (line, on_upper) in [
-        ("theta TVCL(1.0, 0.01, 1.0)", true),
-        ("theta TVCL(0.0, 0.0, 12.0)", false),
-    ] {
+    for (line, on_upper) in
+        [("theta TVCL(1.0, 0.01, 1.0)", true), ("theta TVCL(0.0, 0.0, 12.0)", false)]
+    {
         let params = params_with_theta(line);
         let model = model_with_parameters(&params);
         let p = &model.default_params;
         let start = pack_with_bounds(p);
-        let bound = if on_upper {
-            start.bounds.upper[0]
-        } else {
-            start.bounds.lower[0]
-        };
+        let bound = if on_upper { start.bounds.upper[0] } else { start.bounds.lower[0] };
         assert_eq!(
             start.packed[0].to_bits(),
             bound.to_bits(),
@@ -413,19 +392,10 @@ fn a_theta_start_exactly_on_a_declared_bound_is_left_alone() {
 fn a_theta_start_past_the_hidden_upper_cap_is_a_warning_not_an_error() {
     let diags = box_diags(&params_with_theta("theta TVCL(1e11, 0.001, 1e12)"));
     let msg = only_message(&diags);
-    assert!(
-        !diags[0].is_error(),
-        "the cap is ferx's, not the user's: {msg}"
-    );
+    assert!(!diags[0].is_error(), "the cap is ferx's, not the user's: {msg}");
     assert_eq!(diags[0].code, "W_INIT_OUTSIDE_BOUNDS");
-    assert!(
-        msg.contains("internal"),
-        "the message must say whose bound this is: {msg}"
-    );
-    assert!(
-        !msg.contains("its own declared"),
-        "must not blame the declaration: {msg}"
-    );
+    assert!(msg.contains("internal"), "the message must say whose bound this is: {msg}");
+    assert!(!msg.contains("its own declared"), "must not blame the declaration: {msg}");
 
     // The premise, stated rather than assumed: the start really is inside the
     // declared box, and it is the cap that excludes it.
@@ -449,10 +419,7 @@ fn a_theta_start_past_the_hidden_upper_cap_is_a_warning_not_an_error() {
 fn a_free_omega_start_above_the_upper_rail_is_reported_as_a_warning() {
     let diags = box_diags(&params_with_omega("omega ETA_CL ~ 1e8"));
     let msg = only_message(&diags);
-    assert!(
-        !diags[0].is_error(),
-        "the rail recovers, so: warning — {msg}"
-    );
+    assert!(!diags[0].is_error(), "the rail recovers, so: warning — {msg}");
     assert_eq!(diags[0].code, "W_INIT_OUTSIDE_BOUNDS");
     assert!(msg.contains("ETA_CL"), "{msg}");
     assert!(msg.contains("above"), "{msg}");
@@ -484,10 +451,7 @@ fn a_fixed_omega_start_is_never_out_of_box_because_the_box_is_pinned_to_it() {
     assert!(start.fixed[i], "premise: the coordinate is FIX-ed");
     assert_eq!(start.bounds.lower[i].to_bits(), start.packed[i].to_bits());
     assert_eq!(start.bounds.upper[i].to_bits(), start.packed[i].to_bits());
-    assert!(
-        box_diags(&params).is_empty(),
-        "a pinned box cannot be strictly escaped"
-    );
+    assert!(box_diags(&params).is_empty(), "a pinned box cannot be strictly escaped");
     // The same declaration *without* `FIX` is reported — so the silence above
     // is the pin, not the predicate having stopped working.
     assert_eq!(box_diags(&params_with_omega("omega ETA_CL ~ 1e8")).len(), 1);
@@ -522,10 +486,7 @@ fn a_sigma_start_outside_either_rail_is_a_warning_that_does_not_refuse_the_fit()
     ] {
         let diags = box_diags(&params_with_sigma(line));
         let msg = only_message(&diags);
-        assert!(
-            !diags[0].is_error(),
-            "{line}: Σ recovers from its rails — {msg}"
-        );
+        assert!(!diags[0].is_error(), "{line}: Σ recovers from its rails — {msg}");
         assert_eq!(diags[0].code, "W_INIT_OUTSIDE_BOUNDS");
         assert!(msg.contains("PROP_ERR"), "{msg}");
         // The number itself, so a change of scale or of format reddens this.
@@ -575,25 +536,16 @@ fn an_eval_only_run_warns_where_a_searching_run_refuses() {
     let model = model_with_parameters(&params_with_theta("theta TVCL(0.05, 0.1, 10.0)"));
     let p = &model.default_params;
 
-    let searching = FitOptions {
-        outer_maxiter: 1,
-        ..FitOptions::default()
-    };
+    let searching = FitOptions { outer_maxiter: 1, ..FitOptions::default() };
     let at_zero = check_packed_start_in_box(p, &eval_only());
     assert_eq!(
-        at_zero
-            .iter()
-            .map(|d| (d.code.as_str(), d.severity))
-            .collect::<Vec<_>>(),
+        at_zero.iter().map(|d| (d.code.as_str(), d.severity)).collect::<Vec<_>>(),
         [("W_THETA_INIT_OUTSIDE_BOUNDS", Severity::Warning)],
         "an eval-only run is warned, not refused"
     );
     let with_search = check_packed_start_in_box(p, &searching);
     assert_eq!(
-        with_search
-            .iter()
-            .map(|d| (d.code.as_str(), d.severity))
-            .collect::<Vec<_>>(),
+        with_search.iter().map(|d| (d.code.as_str(), d.severity)).collect::<Vec<_>>(),
         [("E_THETA_INIT_OUTSIDE_BOUNDS", Severity::Error)],
         "and one outer iteration is enough to make it a refusal"
     );
@@ -646,9 +598,8 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 
     let start = pack_with_bounds(p);
     let kinds = coordinate_kinds(p);
-    let all: Vec<(usize, BoxSide)> = coordinates_outside_bounds(&start, &kinds)
-        .map(|h| (h.index, h.side))
-        .collect();
+    let all: Vec<(usize, BoxSide)> =
+        coordinates_outside_bounds(&start, &kinds).map(|h| (h.index, h.side)).collect();
     // Four kinds+sides, or the fixture has stopped exercising the partition.
     // Four of the nine reachable combinations, not all of them — see the doc
     // comment.
@@ -662,11 +613,7 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
     // diagonals, i.e. the `Below` half of the out-of-box set on those.
     let rails = check_variance_init_rails(p, &opts);
     let boxed = check_packed_start_in_box(p, &opts);
-    assert_eq!(
-        rails.len(),
-        1,
-        "ETA_CL below its rail, and only that: {rails:#?}"
-    );
+    assert_eq!(rails.len(), 1, "ETA_CL below its rail, and only that: {rails:#?}");
     assert_eq!(
         boxed.len(),
         3,
@@ -767,11 +714,7 @@ fn no_shipped_model_file_starts_outside_its_box_except_the_known_fourteen() {
         };
         for e in entries.flatten() {
             let path = e.path();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             if path.is_dir() {
                 // `target/` holds build output, `.claude/worktrees/` holds
                 // whole other checkouts of this repo — neither is this tree.
@@ -807,11 +750,7 @@ fn no_shipped_model_file_starts_outside_its_box_except_the_known_fourteen() {
         let start = pack_with_bounds(p);
         let kinds = coordinate_kinds(p);
         let names = crate::estimation::parameterization::coordinate_names(p);
-        let file = path
-            .strip_prefix("./")
-            .unwrap_or(path)
-            .to_string_lossy()
-            .to_string();
+        let file = path.strip_prefix("./").unwrap_or(path).to_string_lossy().to_string();
         for hit in coordinates_outside_bounds(&start, &kinds) {
             assert_eq!(
                 (hit.kind, hit.side),
@@ -858,10 +797,7 @@ fn no_shipped_model_file_starts_outside_its_box_except_the_known_fourteen() {
          `E_THETA_INIT_OUTSIDE_BOUNDS` refuses these: {declared:?}"
     );
     let found_refs: std::collections::BTreeSet<&str> = found.iter().map(String::as_str).collect();
-    assert_eq!(
-        found_refs, allowed,
-        "the set of shipped out-of-box coordinates changed"
-    );
+    assert_eq!(found_refs, allowed, "the set of shipped out-of-box coordinates changed");
 }
 
 // ── T15 (#1309 review): an EMPTY box, which used to abort the process ──────
@@ -932,10 +868,7 @@ fn a_theta_whose_packed_box_is_empty_is_an_error_not_a_panic() {
         crate::diagnostics::first_error(&control).is_ok(),
         "an upper bound above the 1e-10 floor leaves a representable box — {control:#?}"
     );
-    assert!(
-        !control.iter().any(|d| d.code == "E_INIT_BOUNDS_INVERTED"),
-        "{control:#?}"
-    );
+    assert!(!control.iter().any(|d| d.code == "E_INIT_BOUNDS_INVERTED"), "{control:#?}");
 }
 
 /// The empty-box error is **not** exempt at `outer_maxiter = 0`, unlike every
@@ -948,10 +881,7 @@ fn a_theta_whose_packed_box_is_empty_is_an_error_not_a_panic() {
 /// out-of-box error on the same fixture shape, which *is* exempt.
 #[test]
 fn the_empty_box_error_survives_the_eval_only_exemption() {
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
+    let eval_only = FitOptions { outer_maxiter: 0, ..FitOptions::default() };
 
     let empty = model_with_parameters(&params_with_theta("theta TVCL(1.0, 5.0, 2.0)"));
     let d = check_packed_start_in_box(&empty.default_params, &eval_only);
@@ -992,9 +922,8 @@ fn an_omega_off_diagonal_above_its_rail_is_reported_as_a_warning() {
     // of box and it is the off-diagonal.
     let start = pack_with_bounds(p);
     let kinds = coordinate_kinds(p);
-    let hits: Vec<_> = coordinates_outside_bounds(&start, &kinds)
-        .map(|h| (h.kind, h.side))
-        .collect();
+    let hits: Vec<_> =
+        coordinates_outside_bounds(&start, &kinds).map(|h| (h.kind, h.side)).collect();
     assert_eq!(
         hits,
         vec![(PackedCoordKind::OmegaOffDiagonal, BoxSide::Above)],
@@ -1003,19 +932,13 @@ fn an_omega_off_diagonal_above_its_rail_is_reported_as_a_warning() {
 
     let diags = check_packed_start_in_box(p, &FitOptions::default());
     let msg = only_message(&diags);
-    assert!(
-        !diags[0].is_error(),
-        "either rail is a runaway, not a collapse"
-    );
+    assert!(!diags[0].is_error(), "either rail is a runaway, not a collapse");
     assert_eq!(diags[0].code, "W_INIT_OUTSIDE_BOUNDS");
     assert!(
         msg.contains("Cholesky element"),
         "the off-diagonal arm names the coordinate it clamps: {msg}"
     );
-    assert!(
-        msg.contains("1.500e1"),
-        "the element, at three digits: {msg}"
-    );
+    assert!(msg.contains("1.500e1"), "the element, at three digits: {msg}");
     assert!(msg.contains("rail of 1e1"), "the rail: {msg}");
     assert!(msg.contains("covariances"), "the remedy: {msg}");
 
@@ -1051,10 +974,8 @@ fn a_block_omega_diagonal_is_reported_as_a_cholesky_diagonal_not_a_variance() {
     let p = &model.default_params;
     let diags = check_packed_start_in_box(p, &FitOptions::default());
 
-    let diag = diags
-        .iter()
-        .find(|d| d.message.contains("Cholesky diagonal"))
-        .unwrap_or_else(|| {
+    let diag =
+        diags.iter().find(|d| d.message.contains("Cholesky diagonal")).unwrap_or_else(|| {
             panic!(
                 "a block Ω diagonal must be described as one: {:#?}",
                 diags.iter().map(|d| &d.message).collect::<Vec<_>>()
@@ -1064,11 +985,7 @@ fn a_block_omega_diagonal_is_reported_as_a_cholesky_diagonal_not_a_variance() {
     assert!(diag.message.contains("`block_omega`"), "{}", diag.message);
     // The mechanism, not just the wording: the number quoted is L₂₂², and the
     // message says so rather than calling it ETA_V's variance.
-    assert!(
-        diag.message.contains("L² = 2.889e5"),
-        "quote L², at three digits: {}",
-        diag.message
-    );
+    assert!(diag.message.contains("L² = 2.889e5"), "quote L², at three digits: {}", diag.message);
     assert!(
         !diag.message.contains("a variance of"),
         "must not claim the declared variance on a block: {}",
@@ -1091,16 +1008,10 @@ fn a_block_omega_diagonal_is_reported_as_a_cholesky_diagonal_not_a_variance() {
         "a diagonal Ω keeps the variance wording, and there L_ii² *is* the \
          declared 1e8: {dmsg}"
     );
-    assert!(
-        !dmsg.contains("Cholesky diagonal"),
-        "and does not borrow the block wording: {dmsg}"
-    );
+    assert!(!dmsg.contains("Cholesky diagonal"), "and does not borrow the block wording: {dmsg}");
     // #1309 review: every computed number is at three digits. `{:e}` printed
     // this rail as `1.6275479141900392e5`.
-    assert!(
-        dmsg.contains("rail of 1.628e5"),
-        "the rail, at three digits: {dmsg}"
-    );
+    assert!(dmsg.contains("rail of 1.628e5"), "the rail, at three digits: {dmsg}");
 }
 
 // ── T18 (#1309 review round 2): an empty box silences one coordinate ───────
@@ -1213,10 +1124,8 @@ fn an_inverted_theta_is_not_also_reported_against_its_declared_range() {
 /// swapping in a silent one is process-global and races the parallel harness.
 #[test]
 fn clamping_into_an_empty_box_names_its_guarantor() {
-    let bounds = crate::estimation::parameterization::PackedBounds {
-        lower: vec![5.0],
-        upper: vec![2.0],
-    };
+    let bounds =
+        crate::estimation::parameterization::PackedBounds { lower: vec![5.0], upper: vec![2.0] };
     let caught = std::panic::catch_unwind(|| {
         let mut x = [3.0];
         crate::estimation::parameterization::clamp_to_bounds(&mut x, &bounds);
@@ -1233,10 +1142,7 @@ fn clamping_into_an_empty_box_names_its_guarantor() {
             "the guard must name the check that is supposed to have stopped the \
              fit first — got {msg:?}"
         );
-        assert!(
-            msg.contains("coordinate 0"),
-            "…and which coordinate — got {msg:?}"
-        );
+        assert!(msg.contains("coordinate 0"), "…and which coordinate — got {msg:?}");
     } else {
         assert!(
             msg.contains("min > max"),
@@ -1362,9 +1268,7 @@ fn a_fixed_theta_at_zero_is_reported_because_the_log_packing_cannot_hold_it() {
     // spelling takes a default lower bound of 1e-9, which selects log packing.
     assert!(p.theta_fixed[0]);
     assert_eq!(p.theta[0], 0.0);
-    assert!(crate::estimation::parameterization::theta_packs_log(
-        p.theta_lower[0]
-    ));
+    assert!(crate::estimation::parameterization::theta_packs_log(p.theta_lower[0]));
 
     let start = pack_with_bounds(p);
     assert_eq!(start.moves.len(), 1);
@@ -1422,10 +1326,7 @@ fn a_free_theta_below_the_log_floor_is_reported_where_both_box_walks_are_blind()
          equality is the blind spot"
     );
     assert_eq!(coordinates_outside_bounds(&start, &kinds).count(), 0);
-    assert_eq!(
-        crate::estimation::parameterization::theta_outside_declared_range(p).count(),
-        0
-    );
+    assert_eq!(crate::estimation::parameterization::theta_outside_declared_range(p).count(), 0);
 
     let diags = box_diags(&params);
     assert_eq!(only_message(&diags).is_empty(), false);
@@ -1474,10 +1375,7 @@ fn a_coordinate_the_box_also_moves_is_left_to_the_box_check() {
 /// *is* exempt, so it cannot pass by the predicate having stopped firing.
 #[test]
 fn a_value_the_packer_moved_is_reported_even_at_maxiter_zero() {
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
+    let eval_only = FitOptions { outer_maxiter: 0, ..FitOptions::default() };
 
     let held_zero = model_with_parameters(&params_with_theta("theta TVCL(0.0, FIX)"));
     let d = check_packed_start_in_box(&held_zero.default_params, &eval_only);
@@ -1513,10 +1411,7 @@ fn the_not_representable_warning_classifies_as_its_own_code() {
         msg.contains(START_OUT_OF_BOX_TOKEN),
         "the collision this test is about must actually be present — {msg}"
     );
-    assert_eq!(
-        classify_warning(&msg).category,
-        WarningCode::InitNotRepresentable
-    );
+    assert_eq!(classify_warning(&msg).category, WarningCode::InitNotRepresentable);
 }
 
 /// Regression: this check becoming noise.
@@ -1543,9 +1438,7 @@ fn only_one_shipped_model_file_declares_a_value_the_packer_cannot_hold() {
     // numerically indistinguishable from `0` in `exp(TVBETA · conc)` and is why
     // the anchor was green without anyone noticing (#1307).
     let allowed: std::collections::BTreeSet<String> =
-        ["./nonmem_anchor/ss_chz_const_fit.ferx::TVBETA".to_string()]
-            .into_iter()
-            .collect();
+        ["./nonmem_anchor/ss_chz_const_fit.ferx::TVBETA".to_string()].into_iter().collect();
 
     fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -1553,11 +1446,7 @@ fn only_one_shipped_model_file_declares_a_value_the_packer_cannot_hold() {
         };
         for e in entries.flatten() {
             let path = e.path();
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
+            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
             if path.is_dir() {
                 if matches!(name.as_str(), "target" | ".git" | ".claude" | "_site") {
                     continue;
@@ -1585,10 +1474,7 @@ fn only_one_shipped_model_file_declares_a_value_the_packer_cannot_hold() {
         let p = &model.default_params;
         let names = crate::estimation::parameterization::coordinate_names(p);
         for mv in &pack_with_bounds(p).moves {
-            let name = names
-                .get(mv.index)
-                .cloned()
-                .unwrap_or_else(|| format!("#{}", mv.index));
+            let name = names.get(mv.index).cloned().unwrap_or_else(|| format!("#{}", mv.index));
             found.insert(format!("{}::{name}", path.display()));
         }
     }
@@ -1637,10 +1523,7 @@ fn a_correlation_at_the_unit_boundary_is_reported_with_its_own_remedy() {
 
     let start = pack_with_bounds(&params);
     let idx = start.packed.len() - 1;
-    assert!(
-        start.packed[idx].is_finite(),
-        "atanh(1) is +inf and must not reach the optimizer"
-    );
+    assert!(start.packed[idx].is_finite(), "atanh(1) is +inf and must not reach the optimizer");
     assert_eq!(start.moves.len(), 1, "one guard, not the rail as well");
 
     let diags = check_packed_start_in_box(&params, &FitOptions::default());
@@ -1715,11 +1598,7 @@ fn a_fixed_correlation_above_the_old_unit_clamp_is_still_held_exactly() {
         "a FIX-ed ρ must be held exactly across the whole open interval; got {seen} \
          (the pre-review value was 0.999999)"
     );
-    assert!(
-        start.moves.is_empty(),
-        "an admissible ρ is not a guard hit: {:#?}",
-        start.moves
-    );
+    assert!(start.moves.is_empty(), "an admissible ρ is not a guard hit: {:#?}", start.moves);
     assert!(
         check_packed_start_in_box(p, &FitOptions::default()).is_empty(),
         "nothing was moved, so nothing is reported"
@@ -1754,10 +1633,7 @@ fn a_doubly_claimed_coordinate_is_reported_exactly_once_on_every_run() {
 
     // Premise: this coordinate really is claimed by the declared-range walk, so
     // the suppression path is the one under test.
-    assert_eq!(
-        crate::estimation::parameterization::theta_outside_declared_range(p).count(),
-        1
-    );
+    assert_eq!(crate::estimation::parameterization::theta_outside_declared_range(p).count(), 1);
     assert_eq!(pack_with_bounds(p).moves.len(), 1);
 
     // Eval-only: the declared-range warning speaks, once, and names the floor.
@@ -1777,10 +1653,7 @@ fn a_doubly_claimed_coordinate_is_reported_exactly_once_on_every_run() {
     // down and the coordinate is reported exactly once.
     let searching = check_packed_start_in_box(p, &FitOptions::default());
     assert_eq!(
-        searching
-            .iter()
-            .map(|x| x.code.as_str())
-            .collect::<Vec<_>>(),
+        searching.iter().map(|x| x.code.as_str()).collect::<Vec<_>>(),
         ["E_THETA_INIT_OUTSIDE_BOUNDS"],
         "a searching run reports the declared violation, once — {searching:#?}"
     );
@@ -1802,17 +1675,11 @@ fn a_double_move_names_the_value_the_fit_actually_uses() {
     let model = model_with_parameters(&params);
     let p = &model.default_params;
 
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
+    let eval_only = FitOptions { outer_maxiter: 0, ..FitOptions::default() };
     let d = check_packed_start_in_box(p, &eval_only);
     let msg = only_message(&d);
     assert_eq!(d[0].code, "W_INIT_NOT_REPRESENTABLE");
-    assert!(
-        msg.contains("3.354626e-4"),
-        "must quote the rail the fit lands on — {msg}"
-    );
+    assert!(msg.contains("3.354626e-4"), "must quote the rail the fit lands on — {msg}");
     assert!(
         msg.contains("clamps to"),
         "and must name the second move rather than blaming the floor for a \
@@ -1853,10 +1720,7 @@ fn the_eval_only_warning_names_the_theta_its_start_the_bound_and_the_value_score
         below.contains("`theta TVCL` starts at 5e-2, below its own declared lower bound of 1e-1."),
         "{below}"
     );
-    assert!(
-        !below.contains("above") && !below.contains("upper"),
-        "{below}"
-    );
+    assert!(!below.contains("above") && !below.contains("upper"), "{below}");
     assert!(
         below.contains("those of TVCL = 1e-1, not of the declared 5e-2."),
         "must name the value scored and the value declared: {below}"
@@ -1867,14 +1731,8 @@ fn the_eval_only_warning_names_the_theta_its_start_the_bound_and_the_value_score
         above.contains("`theta TVCL` starts at 5e-1, above its own declared upper bound of 2e-1."),
         "{above}"
     );
-    assert!(
-        !above.contains("below") && !above.contains("lower"),
-        "{above}"
-    );
-    assert!(
-        above.contains("those of TVCL = 2e-1, not of the declared 5e-1."),
-        "{above}"
-    );
+    assert!(!above.contains("below") && !above.contains("lower"), "{above}");
+    assert!(above.contains("those of TVCL = 2e-1, not of the declared 5e-1."), "{above}");
 
     for msg in [&below, &above] {
         // Why the number is the bound's: nothing searches, and the clamp runs.
@@ -1891,22 +1749,10 @@ fn the_eval_only_warning_names_the_theta_its_start_the_bound_and_the_value_score
     }
 
     // The remedy, both ways, with this fixture's own numbers on each.
-    assert!(
-        below.contains("To score 5e-2, widen the declared range to include it;"),
-        "{below}"
-    );
-    assert!(
-        below.contains("to score 1e-1, declare that as the start."),
-        "{below}"
-    );
-    assert!(
-        above.contains("To score 5e-1, widen the declared range to include it;"),
-        "{above}"
-    );
-    assert!(
-        above.contains("to score 2e-1, declare that as the start."),
-        "{above}"
-    );
+    assert!(below.contains("To score 5e-2, widen the declared range to include it;"), "{below}");
+    assert!(below.contains("to score 1e-1, declare that as the start."), "{below}");
+    assert!(above.contains("To score 5e-1, widen the declared range to include it;"), "{above}");
+    assert!(above.contains("to score 2e-1, declare that as the start."), "{above}");
 }
 
 /// Regression: the last sentence of the message going stale.
@@ -1945,38 +1791,20 @@ fn the_eval_only_warning_says_when_the_value_scored_is_not_the_declared_bound() 
 
     // Declared lower of 0: scored at the floor.
     let floor = only_message(&eval_only_diags("theta TVCL(-5.0, 0.0, 10.0)"));
-    assert!(
-        floor.contains("below its own declared lower bound of 0e0."),
-        "{floor}"
-    );
-    assert!(
-        floor.contains("those of TVCL = 1e-10, not of the declared -5e0."),
-        "{floor}"
-    );
+    assert!(floor.contains("below its own declared lower bound of 0e0."), "{floor}");
+    assert!(floor.contains("those of TVCL = 1e-10, not of the declared -5e0."), "{floor}");
     assert!(floor.contains(&format!(" 1e-10 {STAND_IN}")), "{floor}");
     // The remedy's second half names the value scored, not the declared bound:
     // declaring `0` as the start would be scored at `1e-10` again.
-    assert!(
-        floor.contains("to score 1e-10, declare that as the start."),
-        "{floor}"
-    );
+    assert!(floor.contains("to score 1e-10, declare that as the start."), "{floor}");
     assert!(!floor.contains("to score 0e0"), "{floor}");
 
     // Declared upper of 1e12: scored at the cap.
     let cap = only_message(&eval_only_diags("theta TVCL(1e13, 0.001, 1e12)"));
-    assert!(
-        cap.contains("above its own declared upper bound of 1e12."),
-        "{cap}"
-    );
-    assert!(
-        cap.contains("those of TVCL = 1e9, not of the declared 1e13."),
-        "{cap}"
-    );
+    assert!(cap.contains("above its own declared upper bound of 1e12."), "{cap}");
+    assert!(cap.contains("those of TVCL = 1e9, not of the declared 1e13."), "{cap}");
     assert!(cap.contains(&format!(" 1e9 {STAND_IN}")), "{cap}");
-    assert!(
-        cap.contains("to score 1e9, declare that as the start."),
-        "{cap}"
-    );
+    assert!(cap.contains("to score 1e9, declare that as the start."), "{cap}");
     assert!(!cap.contains("to score 1e12"), "{cap}");
 
     // The ordinary case: the value scored *is* the declared bound.
@@ -2060,11 +1888,7 @@ fn a_stage_that_searches_at_maxiter_zero_is_still_refused() {
     let codes = |methods: &[EstimationMethod]| {
         let opts = FitOptions {
             method: methods[methods.len() - 1],
-            methods: if methods.len() > 1 {
-                methods.to_vec()
-            } else {
-                Vec::new()
-            },
+            methods: if methods.len() > 1 { methods.to_vec() } else { Vec::new() },
             ..eval_only()
         };
         check_packed_start_in_box(&model.default_params, &opts)
@@ -2113,10 +1937,7 @@ fn the_eval_only_warning_offers_a_widening_only_where_it_scores_the_start() {
     let one = |line: &str| {
         let d = eval_only_diags(line);
         assert_eq!(d.len(), 1, "`{line}`: {d:#?}");
-        (
-            d[0].message.clone(),
-            d[0].suggestion.clone().expect("a help line"),
-        )
+        (d[0].message.clone(), d[0].suggestion.clone().expect("a help line"))
     };
     const NO: &str = "cannot be scored while the lower bound is 0 or more: such a theta is \
                       held on the log scale, between 1e-10 and 1e9;";
@@ -2143,9 +1964,7 @@ fn the_eval_only_warning_offers_a_widening_only_where_it_scores_the_start() {
     ] {
         let (msg, got_help) = one(line);
         assert!(
-            msg.contains(&format!(
-                "To score {value}, widen the declared range to include it;"
-            )),
+            msg.contains(&format!("To score {value}, widen the declared range to include it;")),
             "`{line}`: {msg}"
         );
         assert!(!msg.contains("cannot be scored"), "`{line}`: {msg}");
@@ -2160,11 +1979,7 @@ fn the_eval_only_warning_offers_a_widening_only_where_it_scores_the_start() {
             "1e13",
             "move TVCL's initial estimate inside (1e-3, 1e9)",
         ),
-        (
-            "theta TVCL(0.0, 0.1, 10.0)",
-            "0e0",
-            "move TVCL's initial estimate inside (1e-1, 1e1)",
-        ),
+        ("theta TVCL(0.0, 0.1, 10.0)", "0e0", "move TVCL's initial estimate inside (1e-1, 1e1)"),
         (
             "theta TVCL(1e-12, 0.1, 10.0)",
             "1e-12",

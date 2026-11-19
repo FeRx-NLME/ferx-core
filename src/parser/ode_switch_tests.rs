@@ -42,11 +42,7 @@ fn analyse(body: &str) -> Vec<ConditionReads> {
 }
 
 fn lagt(moves: bool) -> Vec<ConditionReads> {
-    vec![ConditionReads {
-        params: vec!["LAGT".to_string()],
-        moves,
-        leaves: Vec::new(),
-    }]
+    vec![ConditionReads { params: vec!["LAGT".to_string()], moves, leaves: Vec::new() }]
 }
 
 #[test]
@@ -310,9 +306,7 @@ fn assert_served(m: &CompiledModel, n: usize, why: &str) {
     assert!(outer_model_in_scope(m), "{why}: the outer must serve it");
     assert_eq!(switches(m), n, "{why}");
     assert!(
-        !m.parse_warnings
-            .iter()
-            .any(|w| w.contains("`if` condition")),
+        !m.parse_warnings.iter().any(|w| w.contains("`if` condition")),
         "{why}: {:?}",
         m.parse_warnings
     );
@@ -333,29 +327,16 @@ fn a_switch_moved_by_an_estimated_parameter_is_located() {
     // The issue's model: a θ reaching the equations only through the condition.
     assert_located(&model(TLAG, "LAGT = TLAG", SWITCH), "θ only");
     // Through an intermediate of `[individual_parameters]`.
-    assert_located(
-        &model(TLAG, "TV = 2 * TLAG\n  LAGT = TV", SWITCH),
-        "θ via an intermediate",
-    );
+    assert_located(&model(TLAG, "TV = 2 * TLAG\n  LAGT = TV", SWITCH), "θ via an intermediate");
     // A condition in the arms as well.
     assert_located(
-        &model(
-            TLAG,
-            "LAGT = TLAG",
-            "if (tau > LAGT) -KE * a * LAGT else 0.0",
-        ),
+        &model(TLAG, "LAGT = TLAG", "if (tau > LAGT) -KE * a * LAGT else 0.0"),
         "θ in the condition and an arm",
     );
     // An η on the switch, with no θ behind it.
-    assert_located(
-        &model("omega ETA_L ~ 0.1", "LAGT = 2 * exp(ETA_L)", SWITCH),
-        "η only",
-    );
+    assert_located(&model("omega ETA_L ~ 0.1", "LAGT = 2 * exp(ETA_L)", SWITCH), "η only");
     // FIX is the caller's to lift at `fit()`: the switch is located whatever is estimated.
-    assert_located(
-        &model("theta TLAG(1.13, FIX)", "LAGT = TLAG", SWITCH),
-        "a FIX θ",
-    );
+    assert_located(&model("theta TLAG(1.13, FIX)", "LAGT = TLAG", SWITCH), "a FIX θ");
     // Covariates alone place the switch per subject; locating it is exact, with no jump.
     assert_located(&model("", "LAGT = WT / 10", SWITCH), "covariates alone");
 }
@@ -364,19 +345,11 @@ fn a_switch_moved_by_an_estimated_parameter_is_located() {
 #[test]
 fn a_moving_switch_with_meeting_arms_stays_analytic() {
     assert_analytic(
-        &model(
-            TLAG,
-            "LAGT = TLAG",
-            "if (tau > LAGT) KE * (LAGT - tau) else 0.0",
-        ),
+        &model(TLAG, "LAGT = TLAG", "if (tau > LAGT) KE * (LAGT - tau) else 0.0"),
         "a hinge at a moved switch",
     );
     assert_analytic(
-        &model(
-            TLAG,
-            "LAGT = TLAG",
-            "-KE * a * (if (tau < LAGT) (LAGT / tau)^0.16 else 1.0)",
-        ),
+        &model(TLAG, "LAGT = TLAG", "-KE * a * (if (tau < LAGT) (LAGT / tau)^0.16 else 1.0)"),
         "a feedback ratio at a moved switch",
     );
 }
@@ -384,10 +357,7 @@ fn a_moving_switch_with_meeting_arms_stays_analytic() {
 /// A switch moved through a state: the condition itself names no parameter.
 #[test]
 fn a_switch_moved_through_a_state_is_located() {
-    assert_located(
-        &model("", "", "if (a > 2.0) -KE * a else 0.0"),
-        "the state's own equation",
-    );
+    assert_located(&model("", "", "if (a > 2.0) -KE * a else 0.0"), "the state's own equation");
     let clocked = |rhs_tau: &str, extra: &str, indiv: &str| {
         let src = format!(
             "[parameters]
@@ -411,10 +381,7 @@ fn a_switch_moved_through_a_state_is_located() {
     };
     assert_located(&clocked("R", "", ""), "the review's d/dt(tau) = RATE");
     assert_located(&clocked("1.0", "init(tau) = R", ""), "init(...)");
-    assert_located(
-        &clocked("1.0 + first_order(ka=R)", "", ""),
-        "an input-rate term",
-    );
+    assert_located(&clocked("1.0 + first_order(ka=R)", "", ""), "an input-rate term");
     assert_located(&clocked("1.0", "", "F = R"), "a dose attribute");
     assert_located(&clocked("1.0", "", "ALAG1 = R"), "a lag");
     // The control for all five: the clock is free of `R`.
@@ -500,24 +467,14 @@ fn a_switch_free_model_takes_no_new_path() {
         crate::ode::solver::take_switches();
         (ode.rhs)(&[1.0, 0.5], &p, 0.0, &mut du);
         let direct = prog.direct_f64(&*ode.rhs).is_some();
-        (
-            crate::ode::solver::take_switches(),
-            direct,
-            prog.direct_f64_native(),
-        )
+        (crate::ode::solver::take_switches(), direct, prog.direct_f64_native())
     };
     let free = model(TLAG, "LAGT = TLAG", "-KE * a");
     assert_eq!(switches(&free), 0);
     let (noted, direct, native) = eval_notes(&free);
     assert_eq!(noted, 0, "a switch-free model notes no switch");
-    assert_eq!(
-        direct, native,
-        "a switch-free model keeps its direct native call"
-    );
-    assert!(
-        native,
-        "the fixture has a native function, so the direct path is live"
-    );
+    assert_eq!(direct, native, "a switch-free model keeps its direct native call");
+    assert!(native, "the fixture has a native function, so the direct path is live");
     let moving = model(TLAG, "LAGT = TLAG", SWITCH);
     assert_eq!(switches(&moving), 1);
     let (noted, direct, _) = eval_notes(&moving);

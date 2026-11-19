@@ -144,22 +144,10 @@ mod tests {
         let cases = [
             (CovariateEffect::Lin, CovariateForm::Linear, "linear"),
             (CovariateEffect::PieceLin, CovariateForm::Hockey, "hockey"),
-            (
-                CovariateEffect::Exp,
-                CovariateForm::Exponential,
-                "exponential",
-            ),
+            (CovariateEffect::Exp, CovariateForm::Exponential, "exponential"),
             (CovariateEffect::Pow, CovariateForm::Power, "power"),
-            (
-                CovariateEffect::Cat,
-                CovariateForm::Categorical,
-                "categorical",
-            ),
-            (
-                CovariateEffect::Cat2,
-                CovariateForm::Categorical2,
-                "categorical2",
-            ),
+            (CovariateEffect::Cat, CovariateForm::Categorical, "categorical"),
+            (CovariateEffect::Cat2, CovariateForm::Categorical2, "categorical2"),
         ];
         for (mfl, form, label) in cases {
             let e = Effect::from_spec(&spec(mfl, CovariateOp::Multiply)).unwrap();

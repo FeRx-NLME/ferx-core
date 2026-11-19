@@ -1,37 +1,14 @@
-#![allow(unused_imports)]
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
-use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
-};
-use crate::estimation::saem;
-use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
-    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
-};
+use crate::diagnostics::{first_error, EngineError};
 use crate::pk;
 use crate::propensity_match::MatchMethod;
-use crate::sim::adaptive::{
-    AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
-    DoseLedgerEntry, MonitorSpec,
-};
-use crate::stats::likelihood::{build_frem_r_override, foce_subject_nll_iov};
 use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations_cov,
-    compute_r_matrix_with_correlations_scaled_cov, iwres_autocorrelation,
+    compute_r_matrix_with_correlations_cov, compute_r_matrix_with_correlations_scaled_cov,
 };
-use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
-use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::Instant;
 
 /// Simulate observations from a model with given parameters (random seed).
 ///
@@ -53,10 +30,7 @@ use std::time::Instant;
 /// simulation path yet. The text is exactly the `Err` [`simulate_with_options`] returns for
 /// the same input (#898).
 pub fn simulate(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     let mut rng = rand::rng();
     simulate_inner(model, population, params, n_sim, run_root(None), &mut rng)
@@ -71,22 +45,12 @@ pub fn simulate(
 /// As [`simulate`]: a precondition failure is the `Err` [`simulate_with_options`] returns for
 /// the same input (#898).
 pub fn simulate_with_seed(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
     seed: u64,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     use rand::SeedableRng;
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
-    simulate_inner(
-        model,
-        population,
-        params,
-        n_sim,
-        run_root(Some(seed)),
-        &mut rng,
-    )
+    simulate_inner(model, population, params, n_sim, run_root(Some(seed)), &mut rng)
 }
 
 /// The root a run's keyed substreams derive from (the mixture class, #2163): its seed, or
@@ -191,7 +155,7 @@ fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(
         return Ok(());
     };
     if !h.is_finite() || h <= 0.0 {
-        return Err(super::entry_refusals::simulate_horizon(format!(
+        return Err(crate::entry_refusals::simulate_horizon(format!(
             "{option_name} must be finite and > 0 (got {h})"
         )));
     }
@@ -206,7 +170,7 @@ fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(
                 continue;
             };
             if *entry_time > h {
-                return Err(super::entry_refusals::simulate_horizon(format!(
+                return Err(crate::entry_refusals::simulate_horizon(format!(
                     "{option_name} ({h}) is below subject '{}' entry_time \
                      ({entry_time}); the administrative horizon must be ≥ every \
                      subject's entry time",
@@ -262,11 +226,9 @@ fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(
 /// for `simulate_with_uncertainty` (#2003).
 #[cfg(feature = "survival")]
 pub(crate) fn validate_tte_simulatable(
-    model: &CompiledModel,
-    population: &Population,
-    horizon: TteHorizon,
+    model: &CompiledModel, population: &Population, horizon: TteHorizon,
 ) -> Result<(), EngineError> {
-    use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
+    use crate::entry_refusals::{simulate_horizon, tte_not_simulatable};
     // The refusal for a required horizon that is missing or not finite and positive.
     // `what` names the endpoint kind, `why` the reason it needs one.
     let set_it = horizon.how_to_set();
@@ -287,29 +249,17 @@ pub(crate) fn validate_tte_simulatable(
     let is_rtte = |cmt: &usize| {
         matches!(
             model.endpoints.get(cmt),
-            Some(EndpointLikelihood::Tte {
-                recurrence: TteRecurrence::Repeated { .. },
-                ..
-            })
+            Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
         )
     };
     let is_single_tte = |cmt: &usize| {
         matches!(
             model.endpoints.get(cmt),
-            Some(EndpointLikelihood::Tte {
-                recurrence: TteRecurrence::Single,
-                ..
-            })
+            Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Single, .. })
         )
     };
     let has_rtte = model.endpoints.values().any(|e| {
-        matches!(
-            e,
-            EndpointLikelihood::Tte {
-                recurrence: TteRecurrence::Repeated { .. },
-                ..
-            }
-        )
+        matches!(e, EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
     });
     if has_rtte {
         // A finite, positive administrative horizon bounds the recurrent stream.
@@ -374,20 +324,11 @@ pub(crate) fn validate_tte_simulatable(
     let is_ode_tte = |cmt: &usize| {
         matches!(
             model.endpoints.get(cmt),
-            Some(EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. },
-                ..
-            })
+            Some(EndpointLikelihood::Tte { hazard: HazardSpec::OdeAccumulated { .. }, .. })
         )
     };
     if !model.endpoints.values().any(|e| {
-        matches!(
-            e,
-            EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. },
-                ..
-            }
-        )
+        matches!(e, EndpointLikelihood::Tte { hazard: HazardSpec::OdeAccumulated { .. }, .. })
     }) {
         return Ok(());
     }
@@ -443,8 +384,7 @@ pub(crate) fn validate_tte_simulatable(
 /// boundary. Silently substituting the model's *initial* Ω_IOV is not an option: it
 /// would under- or over-disperse every simulated occasion with no diagnostic.
 pub(crate) fn validate_iov_simulatable(
-    model: &CompiledModel,
-    params: &ModelParameters,
+    model: &CompiledModel, params: &ModelParameters,
 ) -> Result<(), EngineError> {
     if model.n_kappa > 0 && params.omega_iov.is_none() {
         // `E_PARAM_SHAPE`'s cause, "no Ω_IOV on a model with κ", so its code (#1774); the
@@ -455,7 +395,7 @@ pub(crate) fn validate_iov_simulatable(
              with the fitted IOV covariance (see `fitted_params_from_result`) before simulating",
             model.n_kappa
         );
-        return Err(super::entry_refusals::param_shape(message));
+        return Err(crate::entry_refusals::param_shape(message));
     }
     if let Some(omega_iov) = &params.omega_iov {
         crate::stats::nested_levels::check_cross_level_omega_iov(model, &omega_iov.matrix)?;
@@ -488,25 +428,16 @@ pub(crate) fn check_theta_length(model: &CompiledModel, theta: &[f64]) -> Result
          theta by position, so these values would be read against the wrong parameters",
         theta.len()
     );
-    let blocks: Vec<&str> = model
-        .theta_blocks()
-        .level_blocks()
-        .iter()
-        .map(|d| d.name())
-        .collect();
+    let blocks: Vec<&str> = model.theta_blocks().level_blocks().iter().map(|d| d.name()).collect();
     if !blocks.is_empty() {
         message.push_str(&format!(
             ". The model declares the theta level block(s) {}, whose theta count is set by \
              the data the model was bound against. A fit's theta fits only a design bound \
              against that fit's level bindings, which give the design the fit's theta layout",
-            blocks
-                .iter()
-                .map(|b| format!("`{b}`"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            blocks.iter().map(|b| format!("`{b}`")).collect::<Vec<_>>().join(", ")
         ));
     }
-    Err(super::entry_refusals::theta_length(message))
+    Err(crate::entry_refusals::theta_length(message))
 }
 
 /// The shape of one random-effect or residual block a caller supplied, for
@@ -557,8 +488,7 @@ impl ParamBlock {
 /// do not call this; `compute_npde_npd` leaves out an absent Ω_IOV, which it documents
 /// as κ = 0.
 pub(crate) fn check_param_shape(
-    model: &CompiledModel,
-    supplied: &[ParamBlock],
+    model: &CompiledModel, supplied: &[ParamBlock],
 ) -> Result<(), EngineError> {
     let by_position = |what: &str| {
         format!(
@@ -587,27 +517,26 @@ pub(crate) fn check_param_shape(
                 want.sigma.values.len(),
                 by_position("residual errors")
             ),
-            ParamBlock::OmegaIov(got) => match (
-                got.map(|(r, _)| r),
-                want.omega_iov.as_ref().map(|m| m.dim()),
-            ) {
-                (Some(g), Some(w)) if g != w => format!(
-                    "the supplied omega_iov is {g}×{g} but this model has {w} kappa; {}",
-                    by_position("random effects")
-                ),
-                (None, Some(w)) => format!(
-                    "the supplied parameters carry no omega_iov but this model has {w} kappa; \
+            ParamBlock::OmegaIov(got) => {
+                match (got.map(|(r, _)| r), want.omega_iov.as_ref().map(|m| m.dim())) {
+                    (Some(g), Some(w)) if g != w => format!(
+                        "the supplied omega_iov is {g}×{g} but this model has {w} kappa; {}",
+                        by_position("random effects")
+                    ),
+                    (None, Some(w)) => format!(
+                        "the supplied parameters carry no omega_iov but this model has {w} kappa; \
                      without it every occasion would get the same parameters"
-                ),
-                (Some(g), None) => format!(
-                    "the supplied parameters carry a {g}×{g} omega_iov but this model has no \
+                    ),
+                    (Some(g), None) => format!(
+                        "the supplied parameters carry a {g}×{g} omega_iov but this model has no \
                      kappa; the inter-occasion variability it describes would be dropped"
-                ),
-                _ => continue,
-            },
+                    ),
+                    _ => continue,
+                }
+            }
             _ => continue,
         };
-        return Err(super::entry_refusals::param_shape(message));
+        return Err(crate::entry_refusals::param_shape(message));
     }
     Ok(())
 }
@@ -639,9 +568,7 @@ pub(crate) fn check_param_shape(
 /// verdict each time. A `checked` for any other model or population is ignored, so the
 /// argument can save work but never a check. The return is the proof for the next call.
 fn check_simulate_preconditions<'a>(
-    model: &'a CompiledModel,
-    population: &'a Population,
-    params: &ModelParameters,
+    model: &'a CompiledModel, population: &'a Population, params: &ModelParameters,
     checked: Option<DrawIndependentChecked<'_>>,
 ) -> Result<DrawIndependentChecked<'a>, EngineError> {
     let theta = &params.theta;
@@ -654,14 +581,10 @@ fn check_simulate_preconditions<'a>(
         _ => DrawIndependentChecked::run(model, population)?,
     };
     // ρ's range at the value drawn at (#1976).
-    first_error(&super::validation::check_residual_correlation_value(
-        model, population, params,
-    ))?;
+    first_error(&super::validation::check_residual_correlation_value(model, population, params))?;
     // The one closed-form guard that reads θ: a draw can land in the flip-flop regime
     // its point estimate is clear of.
-    first_error(&check_absorption_flip_flop_no_twin_diags(
-        model, population, theta,
-    ))?;
+    first_error(&check_absorption_flip_flop_no_twin_diags(model, population, theta))?;
     Ok(checked)
 }
 
@@ -683,14 +606,10 @@ impl<'a> DrawIndependentChecked<'a> {
         // record with none is refused, as `fit()` refuses it.
         first_error(&super::validation::check_level_labels(model, population))?;
         // The `correlation` line (#1976): the data checks `fit()` runs (RESET / TIES).
-        first_error(&super::validation::check_residual_correlation_data(
-            model, population,
-        ))?;
+        first_error(&super::validation::check_residual_correlation_data(model, population))?;
         first_error(&check_modeled_dose_rates(model, population))?;
         first_error(&check_dose_compartments(model, population))?;
-        first_error(&check_absorption_closed_form_support_diags(
-            model, population,
-        ))?;
+        first_error(&check_absorption_closed_form_support_diags(model, population))?;
         #[cfg(feature = "survival")]
         first_error(&check_survival_tv_covariates(model, population))?;
         // Same freeze on the `TIME` axis — `draw_ode_tte_latent` root-finds the same frozen
@@ -719,10 +638,7 @@ impl<'a> DrawIndependentChecked<'a> {
 /// simulation diagnostics ([`SimulationOutput::warnings`]). Use the `_diag` form when a
 /// degenerate-subject warning (#762 / #763) must be surfaced (e.g. a population VPC).
 pub fn simulate_with_options(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
     opts: &SimulateOptions,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     simulate_with_options_impl(model, population, params, n_sim, opts, false).map(|o| o.results)
@@ -767,10 +683,7 @@ pub fn simulate_with_options(
 /// `[derived]` / `[output]` values each simulated subject was drawn with, one row per
 /// `(draw, sim, id)` (#2505); [`SimulatedParameters`] documents the convention.
 pub fn simulate_with_options_diag(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
     opts: &SimulateOptions,
 ) -> Result<SimulationOutput, EngineError> {
     simulate_with_options_impl(model, population, params, n_sim, opts, true)
@@ -780,22 +693,10 @@ pub fn simulate_with_options_diag(
 /// `with_parameters` (#2505): the row-only wrapper discards it, so it does not pay for it.
 /// `vpc_tte` calls it for the rows and warnings without the table (#1886).
 pub(super) fn simulate_with_options_impl(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
-    opts: &SimulateOptions,
-    with_parameters: bool,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
+    opts: &SimulateOptions, with_parameters: bool,
 ) -> Result<SimulationOutput, EngineError> {
-    simulate_with_options_tallied(
-        model,
-        population,
-        params,
-        n_sim,
-        opts,
-        with_parameters,
-        None,
-    )
+    simulate_with_options_tallied(model, population, params, n_sim, opts, with_parameters, None)
 }
 
 /// [`simulate_with_options_impl`], handing the run's `W_TTE_DEGENERATE_HAZARD` tally to
@@ -804,12 +705,8 @@ pub(super) fn simulate_with_options_impl(
 /// tallies with `DegenerateHazardTally::absorb` and renders once, so each (subject, CMT)
 /// is one line counted over every replicate, not one line per run.
 pub(crate) fn simulate_with_options_tallied(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
-    opts: &SimulateOptions,
-    with_parameters: bool,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
+    opts: &SimulateOptions, with_parameters: bool,
     mut degenerate_out: Option<&mut DegenerateHazardTally>,
 ) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
@@ -823,14 +720,8 @@ pub(crate) fn simulate_with_options_tallied(
     // A derived rule on a nested model would regroup its level cells (#1082 PR4), the
     // refusal `fit()` gives the same rule.
     if let Some(levels) = model.nested_levels() {
-        if opts
-            .iov_occasion
-            .as_ref()
-            .is_some_and(|r| *r != IovOccasionRule::Column)
-        {
-            return Err(super::entry_refusals::level_mixed_with_iov_rule(
-                &levels.levels[0].name,
-            ));
+        if opts.iov_occasion.as_ref().is_some_and(|r| *r != IovOccasionRule::Column) {
+            return Err(crate::entry_refusals::level_mixed_with_iov_rule(&levels.levels[0].name));
         }
     }
     // A model-side occasion rule's labels come first (#1955), so every step below sees
@@ -952,11 +843,7 @@ pub(crate) fn simulate_with_options_tallied(
                 &stats,
                 super::SolverStatsPhase::Simulate,
             ));
-            return Ok(SimulationOutput {
-                results,
-                warnings,
-                parameters: table,
-            });
+            return Ok(SimulationOutput { results, warnings, parameters: table });
         }
     };
 
@@ -964,7 +851,7 @@ pub(crate) fn simulate_with_options_tallied(
     // model both belong to a class: the posthoc pass below estimates every subject under
     // class 1, and the pool is drawn from one Ω (#2163).
     if model.mixture.is_some() {
-        return Err(super::entry_refusals::propensity_input(
+        return Err(crate::entry_refusals::propensity_input(
             "propensity-score matching is not supported on a [mixture] model: each \
              subject's posthoc eta would be estimated under class 1 rather than its own \
              class. Simulate without `match_method`; each subject then draws its class from \
@@ -972,16 +859,12 @@ pub(crate) fn simulate_with_options_tallied(
         ));
     }
     if population.subjects.is_empty() {
-        return Err(super::entry_refusals::propensity_input(
+        return Err(crate::entry_refusals::propensity_input(
             "propensity-score matching requires a non-empty observed population",
         ));
     }
-    if let Some(s) = population
-        .subjects
-        .iter()
-        .find(|s| s.observations.is_empty())
-    {
-        return Err(super::entry_refusals::propensity_input(format!(
+    if let Some(s) = population.subjects.iter().find(|s| s.observations.is_empty()) {
+        return Err(crate::entry_refusals::propensity_input(format!(
             "propensity-score matching requires observations for every subject \
              (to compute posthoc etas); subject '{}' has none",
             s.id
@@ -994,12 +877,10 @@ pub(crate) fn simulate_with_options_tallied(
     // converge", or (if the inner optimizer hands back its finite starting eta)
     // matching every subject on all-zero etas and returning an arbitrary
     // assignment. Reject it here with the real cause.
-    if let Some(s) = population
-        .subjects
-        .iter()
-        .find(|s| s.observations.iter().any(|v| !v.is_finite()))
+    if let Some(s) =
+        population.subjects.iter().find(|s| s.observations.iter().any(|v| !v.is_finite()))
     {
-        return Err(super::entry_refusals::propensity_input(format!(
+        return Err(crate::entry_refusals::propensity_input(format!(
             "propensity-score matching requires finite observations for every subject \
              (to compute posthoc etas); subject '{}' has non-finite DV values. A `DV = .` \
              design template carries NaN placeholders — match against the observed dataset \
@@ -1022,10 +903,8 @@ pub(crate) fn simulate_with_options_tallied(
     // would poison the Mahalanobis cost matrix and make the optimal-assignment
     // solver spin forever (NaN compares false against every candidate), so fail
     // loudly here instead.
-    if let Some((i, _)) = eta_hats
-        .iter()
-        .enumerate()
-        .find(|(_, e)| e.iter().any(|x| !x.is_finite()))
+    if let Some((i, _)) =
+        eta_hats.iter().enumerate().find(|(_, e)| e.iter().any(|x| !x.is_finite()))
     {
         return Err(EngineError::uncoded(format!(
             "propensity-score matching: the posthoc eta for subject '{}' is \
@@ -1075,11 +954,7 @@ pub(crate) fn simulate_with_options_tallied(
         &stats,
         super::SolverStatsPhase::Simulate,
     ));
-    Ok(SimulationOutput {
-        results,
-        warnings,
-        parameters: table,
-    })
+    Ok(SimulationOutput { results, warnings, parameters: table })
 }
 
 #[cfg(feature = "survival")]
@@ -1105,12 +980,8 @@ impl DegenerateHazardTally {
 }
 
 fn simulate_inner<R: rand::Rng>(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
-    class_root: u64,
-    rng: &mut R,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
+    class_root: u64, rng: &mut R,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     // `simulate` / `simulate_with_seed` carry no horizon; the per-record window
     // applies. An explicit `[simulation] horizon` enters via `simulate_with_options`.
@@ -1209,13 +1080,7 @@ fn emit_subject_rows<R: rand::Rng>(
         kappas = kappa_draw
             .expect("simulate_inner_with_draw builds a KappaDraw per subject of a kappa model")
             .draw(&kappa_factor, normal, rng);
-        pk::predict_iov(
-            model,
-            subject,
-            &params.theta,
-            &eta_slice[..model.n_eta],
-            &kappas,
-        )
+        pk::predict_iov(model, subject, &params.theta, &eta_slice[..model.n_eta], &kappas)
     } else {
         pk::compute_predictions_with_tv(model, subject, &params.theta, eta_slice)
     };
@@ -1330,6 +1195,19 @@ fn emit_subject_rows<R: rand::Rng>(
         results,
         warnings,
     );
+    // Count endpoints (#2877), on the same stream right after the binary draws.
+    #[cfg(feature = "survival")]
+    crate::categorical::simulate_count(
+        model,
+        subject,
+        &params.theta,
+        eta_slice,
+        draw,
+        sim,
+        rng,
+        results,
+        warnings,
+    );
 
     DrawnPrediction { ipreds, kappas }
 }
@@ -1353,8 +1231,7 @@ struct DrawnPrediction {
 /// independent draws for a model that asks for correlated ones — is the worse of
 /// the two failures.
 pub(crate) fn draw_correlations<'a>(
-    model: &'a CompiledModel,
-    params: &'a ModelParameters,
+    model: &'a CompiledModel, params: &'a ModelParameters,
 ) -> crate::stats::residual_error::ResidualCov<'a> {
     if model.residual_cov_at(params).is_dense() {
         model.residual_cov_at(params)
@@ -1376,16 +1253,10 @@ pub(crate) fn draw_correlations<'a>(
 /// rows) take a cheap per-row draw and skip the factorization entirely.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn correlated_residual_draw<R: rand::Rng>(
-    model: &CompiledModel,
-    subject: &Subject,
-    sigma_values: &[f64],
+    model: &CompiledModel, subject: &Subject, sigma_values: &[f64],
     /* live correlations, resolved by the caller */
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    ipreds: &[f64],
-    ruv_scale: f64,
-    ruv_mult: Option<&[Vec<f64>]>,
-    normal: rand_distr::Normal<f64>,
-    rng: &mut R,
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, ipreds: &[f64], ruv_scale: f64,
+    ruv_mult: Option<&[Vec<f64>]>, normal: rand_distr::Normal<f64>, rng: &mut R,
 ) -> DVector<f64> {
     let err_keys = model.error_spec.obs_keys(subject);
     // A `correlation` line's blocks are the subject's `obs_rgroup`: assigned once per
@@ -1457,19 +1328,11 @@ pub(crate) fn correlated_residual_draw<R: rand::Rng>(
 /// by [`correlated_residual_draw`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_correlated_residual_rows<R: rand::Rng>(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters,
     /* live correlations, resolved by the caller */
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    ipreds: &[f64],
-    ruv_scale: f64,
-    ruv_mult: Option<&[Vec<f64>]>,
-    draw: usize,
-    sim: usize,
-    normal: rand_distr::Normal<f64>,
-    rng: &mut R,
-    results: &mut Vec<SimulationResult>,
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, ipreds: &[f64], ruv_scale: f64,
+    ruv_mult: Option<&[Vec<f64>]>, draw: usize, sim: usize, normal: rand_distr::Normal<f64>,
+    rng: &mut R, results: &mut Vec<SimulationResult>,
 ) {
     let eps = correlated_residual_draw(
         model,
@@ -1509,10 +1372,7 @@ const MIXTURE_CLASS_PURPOSE_SALT: u64 = 0x4D1C_C1A5_5E5E_0001;
 /// cannot change a subject's class.
 pub(crate) fn mixture_class_uniform(root: u64, subject_id: &str, draw: usize, sim: usize) -> f64 {
     use crate::sim::adaptive::{combine_seed, stable_hash_str};
-    let s = combine_seed(
-        root ^ MIXTURE_CLASS_PURPOSE_SALT,
-        stable_hash_str(subject_id),
-    );
+    let s = combine_seed(root ^ MIXTURE_CLASS_PURPOSE_SALT, stable_hash_str(subject_id));
     let key = combine_seed(combine_seed(s, draw as u64), sim as u64);
     rand::rngs::StdRng::seed_from_u64(key).random::<f64>()
 }
@@ -1545,13 +1405,11 @@ pub(crate) fn pick_mixture_class(logp: &[f64], u: f64) -> usize {
 /// the residual variance. `ModelParameters` is a public struct, so a hand-built one can
 /// carry any of these.
 pub(crate) fn check_mixture_param_shape(
-    model: &CompiledModel,
-    spec: &MixtureSpec,
-    params: &ModelParameters,
+    model: &CompiledModel, spec: &MixtureSpec, params: &ModelParameters,
 ) -> Result<(), EngineError> {
     let k = spec.n_classes;
     let Some(mp) = params.mixture.as_ref() else {
-        return Err(super::entry_refusals::param_shape(format!(
+        return Err(crate::entry_refusals::param_shape(format!(
             "this model declares a [mixture] of {k} classes, but the supplied parameters carry \
              no per-class omega/sigma (`mixture: None`); every class would be simulated at the \
              base omega and sigma, dropping any omega(k)/sigma(k) override. Pass the parsed \
@@ -1590,7 +1448,7 @@ pub(crate) fn check_mixture_param_shape(
         })
     };
     match message {
-        Some(m) => Err(super::entry_refusals::param_shape(m)),
+        Some(m) => Err(crate::entry_refusals::param_shape(m)),
         None => Ok(()),
     }
 }
@@ -1607,16 +1465,9 @@ pub(crate) fn check_mixture_param_shape(
 /// per-class block of another shape, as `E_PARAM_SHAPE` ([`check_mixture_param_shape`]).
 pub(crate) enum SimClasses<'a> {
     /// No `[mixture]`: `params`, and the factor η is drawn with.
-    Single {
-        params: &'a ModelParameters,
-        eta_factor: std::borrow::Cow<'a, DMatrix<f64>>,
-    },
+    Single { params: &'a ModelParameters, eta_factor: std::borrow::Cow<'a, DMatrix<f64>> },
     /// A `[mixture]` model: each class's parameters and η factor, 0-based.
-    Mixture {
-        spec: &'a MixtureSpec,
-        root: u64,
-        classes: Vec<(ModelParameters, DMatrix<f64>)>,
-    },
+    Mixture { spec: &'a MixtureSpec, root: u64, classes: Vec<(ModelParameters, DMatrix<f64>)> },
 }
 
 /// One simulated subject's class: its parameters, the factor its η is drawn with, and,
@@ -1645,9 +1496,7 @@ impl<'a> SimClasses<'a> {
     /// class ([`check_mixture_param_shape`]); this is the one gate every simulate path —
     /// `simulate*`, the adaptive driver and the NPDE reference — passes through.
     pub(crate) fn new(
-        model: &'a CompiledModel,
-        params: &'a ModelParameters,
-        root: u64,
+        model: &'a CompiledModel, params: &'a ModelParameters, root: u64,
     ) -> Result<Self, EngineError> {
         let declared = &model.default_params;
         let Some(spec) = model.mixture.as_ref() else {
@@ -1685,11 +1534,7 @@ impl<'a> SimClasses<'a> {
                 (class_params, factor)
             })
             .collect();
-        Ok(SimClasses::Mixture {
-            spec,
-            root,
-            classes,
-        })
+        Ok(SimClasses::Mixture { spec, root, classes })
     }
 
     /// How many classes [`SimClass::index`] ranges over: 1 without a `[mixture]`.
@@ -1704,17 +1549,10 @@ impl<'a> SimClasses<'a> {
     /// long as the subject is being simulated: its guard is what `MIXNUM` reads.
     pub(crate) fn enter(&self, subject: &Subject, draw: usize, sim: usize) -> SimClass<'_> {
         match self {
-            SimClasses::Single { params, eta_factor } => SimClass {
-                index: 0,
-                params,
-                eta_factor,
-                _mixnum: None,
-            },
-            SimClasses::Mixture {
-                spec,
-                root,
-                classes,
-            } => {
+            SimClasses::Single { params, eta_factor } => {
+                SimClass { index: 0, params, eta_factor, _mixnum: None }
+            }
+            SimClasses::Mixture { spec, root, classes } => {
                 let logp = crate::parser::model_parser::eval_mixing_log_probs(
                     spec,
                     &classes[0].0.theta,
@@ -1742,20 +1580,11 @@ impl<'a> SimClasses<'a> {
 /// order).
 #[allow(clippy::too_many_arguments)]
 fn simulate_inner_with_draw<R: rand::Rng>(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    n_sim: usize,
-    draw: usize,
-    matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
-    horizon: Option<f64>,
-    checked: Option<DrawIndependentChecked<'_>>,
-    class_root: u64,
-    rng: &mut R,
-    warnings: &mut Vec<String>,
-    flip_flop: &mut SimulatedFlipFlopTally,
-    degenerate: &mut DegenerateHazardTally,
-    mut table: Option<&mut SimulatedParameters>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, n_sim: usize,
+    draw: usize, matched: Option<(&[DVector<f64>], &nalgebra::DMatrix<f64>, MatchMethod)>,
+    horizon: Option<f64>, checked: Option<DrawIndependentChecked<'_>>, class_root: u64,
+    rng: &mut R, warnings: &mut Vec<String>, flip_flop: &mut SimulatedFlipFlopTally,
+    degenerate: &mut DegenerateHazardTally, mut table: Option<&mut SimulatedParameters>,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     use rand_distr::Normal;
 
@@ -1790,7 +1619,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     // visits, so a simulation would silently drop them.
     #[cfg(feature = "markov")]
     if model.has_dtmm() {
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "simulate()/predict() does not support a [markov_model] `type = dtmm` endpoint yet \
              — its discrete-time state chain has no simulation path, so its records would be \
              silently dropped. DTMM simulation is a later slice.",
@@ -1798,7 +1627,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     }
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
-        return Err(super::entry_refusals::ctmm_unsupported(
+        return Err(crate::entry_refusals::ctmm_unsupported(
             "simulate()/predict() does not support a [markov_model] (CTMM) endpoint yet — its \
              discrete-state trajectory has no simulation path, so the Gaussian emitter would \
              produce meaningless all-zero observations. CTMM simulation is a later slice.",
@@ -1984,15 +1813,10 @@ struct DrawnSubject {
 impl DrawnSubject {
     /// `rows` are the rows the subject emitted, Gaussian ones first, one per IPRED.
     fn new(
-        eta: &[f64],
-        predicted: DrawnPrediction,
-        mixnum: Option<usize>,
-        rows: &[SimulationResult],
+        eta: &[f64], predicted: DrawnPrediction, mixnum: Option<usize>, rows: &[SimulationResult],
     ) -> Self {
-        let values = rows[..predicted.ipreds.len()]
-            .iter()
-            .map(|r| r.outcome.continuous_value())
-            .collect();
+        let values =
+            rows[..predicted.ipreds.len()].iter().map(|r| r.outcome.continuous_value()).collect();
         Self {
             eta: eta.to_vec(),
             kappas: predicted.kappas,
@@ -2006,9 +1830,7 @@ impl DrawnSubject {
     /// occasion's κ, or zeros for one with no group — the selection
     /// `compute_extra_output_columns` makes for the sdtab.
     fn eta_at(
-        &self,
-        model: &CompiledModel,
-        layout: &crate::stats::stacked_layout::StackedLayout,
+        &self, model: &CompiledModel, layout: &crate::stats::stacked_layout::StackedLayout,
         occ: u32,
     ) -> Vec<f64> {
         let mut full = Vec::with_capacity(self.eta.len() + model.n_kappa);
@@ -2042,13 +1864,8 @@ fn reported_individual_indices(model: &CompiledModel) -> Vec<usize> {
 /// value. A column whose value differs across one subject's observation rows is named in
 /// [`SimulatedParameters::varying`].
 fn append_drawn_parameters(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    draw: usize,
-    sim: usize,
-    drawn: &[DrawnSubject],
-    table: &mut SimulatedParameters,
+    model: &CompiledModel, population: &Population, theta: &[f64], draw: usize, sim: usize,
+    drawn: &[DrawnSubject], table: &mut SimulatedParameters,
 ) {
     let reported = reported_individual_indices(model);
     let derived = drawn_derived_columns(model, population, theta, drawn);
@@ -2126,10 +1943,7 @@ fn same_value(a: f64, b: f64) -> bool {
 /// draws in place of the EBEs: its η and κ, the class it ran under, its IPRED, and its
 /// simulated values as `DV`. Empty when the model declares neither block.
 fn drawn_derived_columns(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    drawn: &[DrawnSubject],
+    model: &CompiledModel, population: &Population, theta: &[f64], drawn: &[DrawnSubject],
 ) -> Vec<Vec<(String, Vec<f64>)>> {
     if model.derived_exprs.is_empty() && model.output_columns.is_empty() {
         return Vec::new();
@@ -2146,9 +1960,7 @@ fn drawn_derived_columns(
         .iter()
         .zip(drawn)
         .map(|(subject, d)| {
-            let _mix_guard = d
-                .mixnum
-                .map(crate::parser::model_parser::MixtureClassGuard::enter);
+            let _mix_guard = d.mixnum.map(crate::parser::model_parser::MixtureClassGuard::enter);
             let n_obs = d.ipreds.len();
             // States are not reconstructed on the IOV path, as for a fitted IOV subject.
             let compartment_states = if model.n_kappa == 0 {
@@ -2183,19 +1995,12 @@ fn drawn_derived_columns(
         .collect();
     let kappas: Vec<Vec<DVector<f64>>> = drawn
         .iter()
-        .map(|d| {
-            d.kappas
-                .iter()
-                .map(|k| DVector::from_column_slice(k))
-                .collect()
-        })
+        .map(|d| d.kappas.iter().map(|k| DVector::from_column_slice(k)).collect())
         .collect();
-    let mixest: Option<Vec<usize>> = model.mixture.is_some().then(|| {
-        drawn
-            .iter()
-            .map(|d| d.mixnum.map_or(0, |k| k - 1))
-            .collect()
-    });
+    let mixest: Option<Vec<usize>> = model
+        .mixture
+        .is_some()
+        .then(|| drawn.iter().map(|d| d.mixnum.map_or(0, |k| k - 1)).collect());
     super::compute_extra_output_columns(
         model,
         &simulated,
@@ -2258,9 +2063,7 @@ pub struct SimulateUncertaintyOptions {
 /// Thin wrapper over [`simulate_with_uncertainty_diag`] that discards its
 /// [`SimulationOutput::warnings`]; the rows are the same, bit for bit.
 pub fn simulate_with_uncertainty(
-    model: &CompiledModel,
-    population: &Population,
-    fit_result: &FitResult,
+    model: &CompiledModel, population: &Population, fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     simulate_with_uncertainty_impl(model, population, fit_result, opts, false).map(|o| o.results)
@@ -2298,9 +2101,7 @@ pub fn simulate_with_uncertainty(
 /// individual parameters and `[derived]` / `[output]` values each subject was simulated
 /// with, under its draw's θ (#2505). A skipped draw has no rows.
 pub fn simulate_with_uncertainty_diag(
-    model: &CompiledModel,
-    population: &Population,
-    fit_result: &FitResult,
+    model: &CompiledModel, population: &Population, fit_result: &FitResult,
     opts: &SimulateUncertaintyOptions,
 ) -> Result<SimulationOutput, EngineError> {
     simulate_with_uncertainty_impl(model, population, fit_result, opts, true)
@@ -2309,11 +2110,8 @@ pub fn simulate_with_uncertainty_diag(
 /// [`simulate_with_uncertainty_diag`], building the drawn-parameter table only when
 /// `with_parameters` (#2505).
 fn simulate_with_uncertainty_impl(
-    model: &CompiledModel,
-    population: &Population,
-    fit_result: &FitResult,
-    opts: &SimulateUncertaintyOptions,
-    with_parameters: bool,
+    model: &CompiledModel, population: &Population, fit_result: &FitResult,
+    opts: &SimulateUncertaintyOptions, with_parameters: bool,
 ) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
 
@@ -2370,11 +2168,7 @@ fn simulate_with_uncertainty_impl(
     // The point estimate itself must be simulatable (#1485): `simulate()` refuses a θ in the
     // flip-flop regime of a twin-less transit / IG closed form, and drawing around it would
     // otherwise skip most draws and return the rest as if the point estimate were sound.
-    first_error(&check_absorption_flip_flop_no_twin_diags(
-        model,
-        population,
-        &template.theta,
-    ))?;
+    first_error(&check_absorption_flip_flop_no_twin_diags(model, population, &template.theta))?;
     // The sampler's input refusals carry their codes (#2044).
     let draws = crate::estimation::uncertainty_samples::draw_parameter_samples_coded(
         fit_result,
@@ -2427,11 +2221,7 @@ fn simulate_with_uncertainty_impl(
         &stats,
         super::SolverStatsPhase::SimulateUncertainty,
     ));
-    Ok(SimulationOutput {
-        results,
-        warnings: sim_warnings,
-        parameters: table,
-    })
+    Ok(SimulationOutput { results, warnings: sim_warnings, parameters: table })
 }
 
 /// The per-draw loop of [`simulate_with_uncertainty_diag`], appending each draw's rows to
@@ -2441,14 +2231,9 @@ fn simulate_with_uncertainty_impl(
 /// point estimate be compared with `simulate_with_options` at the same RNG position (#2003).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn simulate_uncertainty_draws(
-    model: &CompiledModel,
-    population: &Population,
-    draws: &[ModelParameters],
-    opts: &SimulateUncertaintyOptions,
-    class_root: u64,
-    rng: &mut rand::rngs::StdRng,
-    results: &mut Vec<SimulationResult>,
-    sim_warnings: &mut Vec<String>,
+    model: &CompiledModel, population: &Population, draws: &[ModelParameters],
+    opts: &SimulateUncertaintyOptions, class_root: u64, rng: &mut rand::rngs::StdRng,
+    results: &mut Vec<SimulationResult>, sim_warnings: &mut Vec<String>,
     mut table: Option<&mut SimulatedParameters>,
 ) -> Result<(), EngineError> {
     // 1-based indices of the skipped draws, and the first one's reason (#1485).
@@ -2511,17 +2296,9 @@ pub(super) fn simulate_uncertainty_draws(
     sim_warnings.extend(degenerate.warnings_by_draw());
     if let Some(reason) = first_reason {
         if skipped.len() == draws.len() {
-            first_error(&all_uncertainty_draws_skipped_diags(
-                model,
-                draws.len(),
-                &reason,
-            ))?;
+            first_error(&all_uncertainty_draws_skipped_diags(model, draws.len(), &reason))?;
         }
-        sim_warnings.push(uncertainty_draws_skipped_warning(
-            model,
-            &skipped,
-            draws.len(),
-        ));
+        sim_warnings.push(uncertainty_draws_skipped_warning(model, &skipped, draws.len()));
     }
     // After the skip warning, so the coarser finding (a θ the closed form cannot serve at
     // all) is read first. Not before the `?` above: a run whose every draw was skipped is

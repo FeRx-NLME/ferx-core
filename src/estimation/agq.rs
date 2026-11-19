@@ -110,27 +110,21 @@ pub(crate) fn cached_gauss_hermite(n: usize) -> (&'static [f64], &'static [f64],
 fn cached_log_weights_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("FERX_NO_AGQ_LOG_WEIGHT_CACHE")
-            .map(|v| v != "1")
-            .unwrap_or(true)
+        std::env::var("FERX_NO_AGQ_LOG_WEIGHT_CACHE").map(|v| v != "1").unwrap_or(true)
     })
 }
 
 fn laplace_one_point_fast_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("FERX_NO_LAPLACE_ONE_POINT_FAST")
-            .map(|v| v != "1")
-            .unwrap_or(true)
+        std::env::var("FERX_NO_LAPLACE_ONE_POINT_FAST").map(|v| v != "1").unwrap_or(true)
     })
 }
 
 fn laplace_mode_nll_reuse_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("FERX_NO_LAPLACE_MODE_NLL_REUSE")
-            .map(|v| v != "1")
-            .unwrap_or(true)
+        std::env::var("FERX_NO_LAPLACE_MODE_NLL_REUSE").map(|v| v != "1").unwrap_or(true)
     })
 }
 
@@ -250,11 +244,13 @@ pub(crate) struct PopulationEvaluation {
 pub(crate) enum ScoreRoute {
     /// The adjoint's exact `dFᵢ/dx`.
     Exact,
-    /// The adjoint's held-EBE score (no EBE response):
-    /// `adjoint::subject_adjoint_held_ebe_score`.
-    HeldEbe,
-    /// The reconverged finite-difference score.
-    Reconverged,
+    /// The adjoint's exact `dFᵢ/dx` at the subject's EBE re-solved at the trial point (the
+    /// runtime-declined subject's salvage; the re-solved mode is handed back as polished).
+    ResolvedExact,
+    /// The reconverged finite-difference score. `structural`: no recorder serves the
+    /// subject at any point ([`crate::estimation::outer_optimizer::is_structural_decline`]),
+    /// as against a runtime decline whose re-solved exact route failed too.
+    Reconverged { structural: bool },
 }
 
 impl ScoreRoute {
@@ -262,10 +258,17 @@ impl ScoreRoute {
     fn record(self, log: &crate::estimation::outer_optimizer::OuterFdDeclineLog, i: usize) {
         match self {
             ScoreRoute::Exact => {}
-            ScoreRoute::HeldEbe => log.record(i),
-            ScoreRoute::Reconverged => {
+            ScoreRoute::ResolvedExact => {
                 log.record(i);
-                log.record_structural(i);
+                log.record_exact(i);
+            }
+            ScoreRoute::Reconverged { structural } => {
+                log.record(i);
+                if structural {
+                    log.record_structural(i);
+                } else {
+                    log.record_reconverged(i);
+                }
             }
         }
     }
@@ -299,19 +302,11 @@ impl Stack {
                 (inv, sd)
             }
             _ => {
-                let sd = (0..n_eta)
-                    .map(|i| params.omega.matrix[(i, i)].max(0.0).sqrt())
-                    .collect();
+                let sd = (0..n_eta).map(|i| params.omega.matrix[(i, i)].max(0.0).sqrt()).collect();
                 (params.omega.inv.clone(), sd)
             }
         };
-        Self {
-            n_eta,
-            n_kappa,
-            n_occ,
-            omega_joint_inv,
-            prior_sd,
-        }
+        Self { n_eta, n_kappa, n_occ, omega_joint_inv, prior_sd }
     }
 
     /// Dimension of the integration variable.
@@ -325,9 +320,8 @@ impl Stack {
 
     fn split<'a>(&self, b: &'a [f64]) -> (&'a [f64], Vec<&'a [f64]>) {
         let eta = &b[..self.n_eta];
-        let kappas = (0..self.n_occ)
-            .map(|k| &b[kappa_range(self.n_eta, self.n_kappa, k)])
-            .collect();
+        let kappas =
+            (0..self.n_occ).map(|k| &b[kappa_range(self.n_eta, self.n_kappa, k)]).collect();
         (eta, kappas)
     }
 
@@ -335,20 +329,14 @@ impl Stack {
     /// IOV-aware likelihood when the subject has occasions; both are the model's *real*
     /// likelihood, not a surrogate.
     fn nll_at(
-        &self,
-        model: &CompiledModel,
-        subject: &Subject,
-        params: &ModelParameters,
-        b: &[f64],
-        scratch: &mut pk::EventPkParams,
-        schedule: Option<&pk::event_driven::EventSchedule>,
+        &self, model: &CompiledModel, subject: &Subject, params: &ModelParameters, b: &[f64],
+        scratch: &mut pk::EventPkParams, schedule: Option<&pk::event_driven::EventSchedule>,
     ) -> f64 {
         // Low-call-count sites (FD sweeps, single-node scoring): hoist nothing, just
         // allocate scratch for this one call and dispatch through the shared branch.
         let err_keys = (!self.is_iov()).then(|| model.error_spec.obs_keys(subject));
-        let ruv_mult = (!self.is_iov())
-            .then(|| model.ruv_obs_mult(subject, &params.theta))
-            .flatten();
+        let ruv_mult =
+            (!self.is_iov()).then(|| model.ruv_obs_mult(subject, &params.theta)).flatten();
         self.nll_at_with_recycle(
             model,
             subject,
@@ -372,18 +360,10 @@ impl Stack {
     /// kept in sync.
     #[allow(clippy::too_many_arguments)]
     fn nll_at_with_recycle(
-        &self,
-        model: &CompiledModel,
-        subject: &Subject,
-        params: &ModelParameters,
-        b: &[f64],
-        scratch: &mut pk::EventPkParams,
-        schedule: Option<&pk::event_driven::EventSchedule>,
-        err_keys: Option<&[usize]>,
-        ruv_mult: Option<&[Vec<f64>]>,
-        pred_recycle: &mut Vec<f64>,
-        eta_work: &mut DVector<f64>,
-        prior_work: &mut DVector<f64>,
+        &self, model: &CompiledModel, subject: &Subject, params: &ModelParameters, b: &[f64],
+        scratch: &mut pk::EventPkParams, schedule: Option<&pk::event_driven::EventSchedule>,
+        err_keys: Option<&[usize]>, ruv_mult: Option<&[Vec<f64>]>, pred_recycle: &mut Vec<f64>,
+        eta_work: &mut DVector<f64>, prior_work: &mut DVector<f64>,
     ) -> f64 {
         if !self.is_iov() {
             return individual_nll_into_prepared_with_schedule(
@@ -456,21 +436,16 @@ impl Stack {
 /// that is each coordinate's natural unit. The `1e-4` floor keeps a near-zero (or FIXed-small)
 /// prior variance from driving `h` so small that `ε/h²` swamps the curvature.
 fn fd_posterior_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-    scratch: &mut pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, stack: &Stack,
+    b_hat: &[f64], scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> DMatrix<f64> {
     let d = stack.d();
     let mut nll_at =
         |b: &[f64]| -> f64 { stack.nll_at(model, subject, params, b, scratch, schedule) };
 
-    let steps: Vec<f64> = (0..d)
-        .map(|i| (f64::EPSILON.powf(0.25) * stack.prior_sd[i]).max(1e-4))
-        .collect();
+    let steps: Vec<f64> =
+        (0..d).map(|i| (f64::EPSILON.powf(0.25) * stack.prior_sd[i]).max(1e-4)).collect();
 
     let f0 = nll_at(b_hat);
     let mut h = DMatrix::<f64>::zeros(d, d);
@@ -532,13 +507,8 @@ fn fd_posterior_hessian(
 /// where the Hessian declines at a point the objective itself repels (non-finite or the
 /// sentinel): the consistent repel, with no finite difference of a value that is not there.
 fn anchor_hessian(
-    anchor: HessianAnchor,
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-    scratch: &mut pk::EventPkParams,
+    anchor: HessianAnchor, model: &CompiledModel, subject: &Subject, params: &ModelParameters,
+    stack: &Stack, b_hat: &[f64], scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Option<DMatrix<f64>> {
     match anchor {
@@ -569,14 +539,8 @@ fn anchor_hessian(
 /// population rather than once per subject.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_subject_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
-    anchor: HessianAnchor,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, stack: &Stack,
+    b_hat: &[f64], nodes: &[f64], log_weights: &[f64], anchor: HessianAnchor,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
     agq_subject_evaluate(
@@ -600,9 +564,7 @@ pub(crate) fn agq_subject_nll(
 /// prior-scale fallback. `build_proposal` keeps the jitter for its importance-sampling
 /// callers, whose proposal is a sampling density, not part of the objective.
 pub(crate) fn agq_proposal(
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    d: usize,
+    h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize,
 ) -> Option<crate::estimation::importance_sampling::Proposal> {
     crate::estimation::importance_sampling::Proposal::from_precision(h, d)
         .or_else(|| build_proposal(h, omega_inv, d))
@@ -618,25 +580,14 @@ pub(crate) fn agq_proposal(
 /// [`cacheable_schedule`] path.
 #[allow(clippy::too_many_arguments)]
 fn agq_subject_evaluate(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
-    anchor: HessianAnchor,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    terminal_hessian: Option<&DMatrix<f64>>,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, stack: &Stack,
+    b_hat: &[f64], nodes: &[f64], log_weights: &[f64], anchor: HessianAnchor,
+    schedule: Option<&pk::event_driven::EventSchedule>, terminal_hessian: Option<&DMatrix<f64>>,
     terminal_mode_nll: Option<f64>,
 ) -> f64 {
     let d = stack.d();
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    let local_schedule = if schedule.is_none() {
-        cacheable_schedule(model, subject)
-    } else {
-        None
-    };
+    let local_schedule = if schedule.is_none() { cacheable_schedule(model, subject) } else { None };
     let schedule = schedule.or(local_schedule.as_ref());
 
     // No random effects: the "integral" is a point mass and AGQ degenerates to the
@@ -650,16 +601,7 @@ fn agq_subject_evaluate(
         .then(|| terminal_hessian.cloned())
         .flatten()
         .or_else(|| {
-            anchor_hessian(
-                anchor,
-                model,
-                subject,
-                params,
-                stack,
-                b_hat,
-                &mut scratch,
-                schedule,
-            )
+            anchor_hessian(anchor, model, subject, params, stack, b_hat, &mut scratch, schedule)
         });
     let Some(h) = h else {
         // Gauss-Newton anchor out of the recorder's scope (guarded up front by
@@ -685,11 +627,7 @@ fn agq_subject_evaluate(
         let mode_nll = reusable_nll
             .unwrap_or_else(|| stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule));
         let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
-        return if nll.is_finite() {
-            nll
-        } else {
-            SUBJECT_SENTINEL_NLL
-        };
+        return if nll.is_finite() { nll } else { SUBJECT_SENTINEL_NLL };
     }
 
     let terms = agq_terms(
@@ -717,15 +655,9 @@ fn agq_subject_evaluate(
 /// with `logsumexp`.
 #[allow(clippy::too_many_arguments)]
 fn agq_terms(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    stack: &Stack,
-    b_hat: &[f64],
-    nodes: &[f64],
-    log_weights: &[f64],
-    proposal: &crate::estimation::importance_sampling::Proposal,
-    scratch: &mut pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, stack: &Stack,
+    b_hat: &[f64], nodes: &[f64], log_weights: &[f64],
+    proposal: &crate::estimation::importance_sampling::Proposal, scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> Vec<f64> {
     let d = stack.d();
@@ -736,9 +668,7 @@ fn agq_terms(
     let mut step = vec![0.0f64; d];
     let mut b = vec![0.0f64; d];
     let err_keys = (!stack.is_iov()).then(|| model.error_spec.obs_keys(subject));
-    let ruv_mult = (!stack.is_iov())
-        .then(|| model.ruv_obs_mult(subject, &params.theta))
-        .flatten();
+    let ruv_mult = (!stack.is_iov()).then(|| model.ruv_obs_mult(subject, &params.theta)).flatten();
     let mut pred_recycle = Vec::new();
     let mut eta_work = DVector::zeros(stack.n_eta);
     let mut prior_work = DVector::zeros(stack.n_eta);
@@ -793,27 +723,13 @@ fn agq_terms(
 /// [`agq_subject_nll`] under a chosen Hessian anchor (`Exact` is Laplace's).
 #[cfg(test)]
 pub(crate) fn agq_subject_objective_anchored(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta_hat: &[f64],
-    n_agq: usize,
-    anchor: HessianAnchor,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta_hat: &[f64],
+    n_agq: usize, anchor: HessianAnchor,
 ) -> f64 {
     let stack = Stack::new(model, params, 0);
     let (nodes, weights) = gauss_hermite(n_agq);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    agq_subject_nll(
-        model,
-        subject,
-        params,
-        &stack,
-        eta_hat,
-        &nodes,
-        &log_weights,
-        anchor,
-        None,
-    )
+    agq_subject_nll(model, subject, params, &stack, eta_hat, &nodes, &log_weights, anchor, None)
 }
 
 /// One subject's term of [`agq_population_nll`] at its joint mode `(η̂, κ̂)`: the same
@@ -822,13 +738,8 @@ pub(crate) fn agq_subject_objective_anchored(
 /// [`agq_population_nll`] term for term. The profile solve scores each subject with it
 /// under `laplace` (#2107).
 pub(crate) fn agq_subject_term(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta_hat: &[f64],
-    kappas: &[nalgebra::DVector<f64>],
-    n_nodes: usize,
-    anchor: HessianAnchor,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta_hat: &[f64],
+    kappas: &[nalgebra::DVector<f64>], n_nodes: usize, anchor: HessianAnchor,
 ) -> f64 {
     let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
     let uncached_log_weights;
@@ -863,12 +774,8 @@ pub(crate) fn agq_subject_term(
 /// folds along thread-count-dependent split boundaries and f64 addition is not associative,
 /// which would make the OFV depend on the thread count (#703).
 pub fn agq_population_nll(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[nalgebra::DVector<f64>],
-    kappas: &[Vec<nalgebra::DVector<f64>>],
-    n_nodes: usize,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[nalgebra::DVector<f64>], kappas: &[Vec<nalgebra::DVector<f64>>], n_nodes: usize,
     anchor: HessianAnchor,
 ) -> f64 {
     agq_population_nll_impl(
@@ -889,14 +796,9 @@ pub fn agq_population_nll(
 /// on the same `analytic_score_supported` predicate for exactly that reason.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_population_nll_prepared(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[nalgebra::DVector<f64>],
-    kappas: &[Vec<nalgebra::DVector<f64>>],
-    n_nodes: usize,
-    anchor: HessianAnchor,
-    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[nalgebra::DVector<f64>], kappas: &[Vec<nalgebra::DVector<f64>>], n_nodes: usize,
+    anchor: HessianAnchor, schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     terminal_work: Option<&[TerminalLaplaceWork]>,
 ) -> f64 {
     agq_population_nll_impl(
@@ -914,14 +816,9 @@ pub(crate) fn agq_population_nll_prepared(
 
 #[allow(clippy::too_many_arguments)]
 fn agq_population_nll_impl(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[nalgebra::DVector<f64>],
-    kappas: &[Vec<nalgebra::DVector<f64>>],
-    n_nodes: usize,
-    anchor: HessianAnchor,
-    schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[nalgebra::DVector<f64>], kappas: &[Vec<nalgebra::DVector<f64>>], n_nodes: usize,
+    anchor: HessianAnchor, schedules: Option<&[Option<pk::event_driven::EventSchedule>]>,
     terminal_work: Option<&[TerminalLaplaceWork]>,
 ) -> f64 {
     let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
@@ -960,18 +857,12 @@ fn agq_population_nll_impl(
 /// only the small per-subject objective and packed score survive for ordered reduction.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_population_evaluate(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[nalgebra::DVector<f64>],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    template: &ModelParameters, x: &[f64], eta_hats: &[nalgebra::DVector<f64>],
     kappas: &[Vec<nalgebra::DVector<f64>>],
-    bounds: &crate::estimation::parameterization::PackedBounds,
-    options: &crate::types::FitOptions,
-    n_nodes: usize,
-    anchor: HessianAnchor,
-    want_eta_dx: bool,
+    bounds: &crate::estimation::parameterization::PackedBounds, options: &crate::types::FitOptions,
+    n_nodes: usize, anchor: HessianAnchor, want_eta_dx: bool,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -988,6 +879,7 @@ pub(crate) fn agq_population_evaluate(
         None,
         None,
         want_eta_dx,
+        declines,
     )
 }
 
@@ -996,20 +888,13 @@ pub(crate) fn agq_population_evaluate(
 /// [`agq_population_nll_prepared`]. Used only by the FOCEI/Laplace/AGQ outer hot loop.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn agq_population_evaluate_with_schedules(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[nalgebra::DVector<f64>],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    template: &ModelParameters, x: &[f64], eta_hats: &[nalgebra::DVector<f64>],
     kappas: &[Vec<nalgebra::DVector<f64>>],
-    bounds: &crate::estimation::parameterization::PackedBounds,
-    options: &crate::types::FitOptions,
-    n_nodes: usize,
-    anchor: HessianAnchor,
-    schedules: &[Option<pk::event_driven::EventSchedule>],
-    terminal_work: &[TerminalLaplaceWork],
-    want_eta_dx: bool,
+    bounds: &crate::estimation::parameterization::PackedBounds, options: &crate::types::FitOptions,
+    n_nodes: usize, anchor: HessianAnchor, schedules: &[Option<pk::event_driven::EventSchedule>],
+    terminal_work: &[TerminalLaplaceWork], want_eta_dx: bool,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -1026,6 +911,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
         Some(schedules),
         Some(terminal_work),
         want_eta_dx,
+        declines,
     )
 }
 
@@ -1046,10 +932,13 @@ fn agq_population_evaluate_impl(
     terminal_work: Option<&[TerminalLaplaceWork]>,
     // Whether each subject's mode response `dη̂ᵢ/dx` is formed with its score (#2549).
     want_eta_dx: bool,
+    // The fit's decline log: a declined subject's structural probe is asked once per fit.
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, false)
+        .with_declines(declines);
 
     let exact_anchor = matches!(anchor, HessianAnchor::Exact);
     let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> =
@@ -1059,21 +948,16 @@ fn agq_population_evaluate_impl(
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
             let cached_schedule = schedules.and_then(|s| s[i].as_ref());
-            let local_schedule = if cached_schedule.is_none() {
-                cacheable_schedule(model, subject)
-            } else {
-                None
-            };
+            let local_schedule =
+                if cached_schedule.is_none() { cacheable_schedule(model, subject) } else { None };
             let schedule = cached_schedule.or(local_schedule.as_ref());
             // The score first: under the exact anchor its pass forms the exact inner Hessian
             // at the mode, which the objective's anchor then takes instead of recomputing it
             // (#2549) — the same kernel on the same mode.
-            let mut mode = ModeOut {
-                want_dx: want_eta_dx,
-                want_hessian: exact_anchor,
-                ..ModeOut::default()
-            };
+            let mut mode =
+                ModeOut { want_dx: want_eta_dx, want_hessian: exact_anchor, ..ModeOut::default() };
             let score = context.score_routed_with_mode(
+                Some(i),
                 subject,
                 eta_hats[i].as_slice(),
                 subj_kappas,
@@ -1083,11 +967,8 @@ fn agq_population_evaluate_impl(
             // A pass that polished the start to the mode took its score, and formed its exact
             // Hessian, there: the objective is evaluated at that same mode, so the value and
             // the gradient are of one function.
-            let b_eval = mode
-                .eta_polished
-                .as_deref()
-                .filter(|p| p.len() == b_hat.len())
-                .unwrap_or(&b_hat);
+            let b_eval =
+                mode.eta_polished.as_deref().filter(|p| p.len() == b_hat.len()).unwrap_or(&b_hat);
             let nll = agq_subject_evaluate(
                 model,
                 subject,
@@ -1115,20 +996,13 @@ fn agq_population_evaluate_impl(
     );
     let routes = per_subject
         .iter()
-        .map(|(_, s, _)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
+        .map(|(_, s, _)| s.as_ref().map_or(ScoreRoute::Reconverged { structural: true }, |s| s.1))
         .collect();
-    let scores: Option<Vec<Vec<f64>>> = per_subject
-        .iter()
-        .map(|(_, s, _)| s.as_ref().map(|(g, _)| g.clone()))
-        .collect();
-    let polished = per_subject
-        .iter()
-        .map(|(_, _, m)| m.eta_polished.clone())
-        .collect();
-    let (eta_dx, mode_hessians): (Vec<_>, Vec<_>) = per_subject
-        .into_iter()
-        .map(|(_, _, m)| (m.eta_dx, m.hessian))
-        .unzip();
+    let scores: Option<Vec<Vec<f64>>> =
+        per_subject.iter().map(|(_, s, _)| s.as_ref().map(|(g, _)| g.clone())).collect();
+    let polished = per_subject.iter().map(|(_, _, m)| m.eta_polished.clone()).collect();
+    let (eta_dx, mode_hessians): (Vec<_>, Vec<_>) =
+        per_subject.into_iter().map(|(_, _, m)| (m.eta_dx, m.hessian)).unzip();
     PopulationEvaluation {
         nll,
         gradient,
@@ -1196,20 +1070,13 @@ pub fn analytic_gradient_available(model: &CompiledModel) -> bool {
 ///
 /// `out` is the population accumulator; this adds `∂F_i/∂x` into it.
 fn agq_subject_packed_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
-    b_hat: &[f64],
-    n_agq: usize,
-    anchor: HessianAnchor,
-    out: &mut [f64],
+    model: &CompiledModel, subject: &Subject,
+    pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>, b_hat: &[f64], n_agq: usize,
+    anchor: HessianAnchor, out: &mut [f64],
 ) -> Option<()> {
     // AGQ (either anchor, any node count) by the adjoint (`sens::ode_provider::adjoint`).
     use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_at, Objective};
-    let objective = Objective::Agq {
-        n_agq,
-        exact: matches!(anchor, HessianAnchor::Exact),
-    };
+    let objective = Objective::Agq { n_agq, exact: matches!(anchor, HessianAnchor::Exact) };
     let g = subject_adjoint_gradient_at(model, subject, pt, b_hat, objective)?;
     if g.len() != out.len() || !g.iter().all(|v| v.is_finite()) {
         return None;
@@ -1240,16 +1107,20 @@ pub(crate) struct SubjectScoreContext<'a> {
     /// `x` unpacked once for every subject this context scores (`None` when `x` is not
     /// `template`'s packed length, which the adjoint declines).
     point: Option<crate::sens::ode_provider::adjoint::PackedPoint<'a>>,
+    /// The fit's decline log, which remembers a subject whose structural probe answered "no"
+    /// ([`crate::estimation::outer_optimizer::OuterFdDeclineLog::is_structural`]) so a declined
+    /// subject pays the recording once per fit, not once per evaluation.
+    declines: Option<&'a crate::estimation::outer_optimizer::OuterFdDeclineLog>,
+    /// Test hook: how many structural probes (recordings) this context ran.
+    #[cfg(test)]
+    pub(crate) probes: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> SubjectScoreContext<'a> {
     pub(crate) fn new(
-        model: &'a CompiledModel,
-        template: &'a ModelParameters,
-        x: &'a [f64],
+        model: &'a CompiledModel, template: &'a ModelParameters, x: &'a [f64],
         options: &'a crate::types::FitOptions,
-        bounds: &'a crate::estimation::parameterization::PackedBounds,
-        force_fd: bool,
+        bounds: &'a crate::estimation::parameterization::PackedBounds, force_fd: bool,
     ) -> Self {
         let (nodes, weights, _) =
             cached_gauss_hermite(options.agq_nodes().expect("quadrature stage"));
@@ -1265,64 +1136,66 @@ impl<'a> SubjectScoreContext<'a> {
             force_fd: force_fd || !analytic_gradient_available(model),
             fd_inner_tol: crate::estimation::inner_optimizer::stencil_inner_tol(options.inner_tol),
             point: crate::sens::ode_provider::adjoint::PackedPoint::new(template, x),
+            declines: None,
+            #[cfg(test)]
+            probes: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// This context asking `log` before it probes whether a decline is structural.
+    pub(crate) fn with_declines(
+        self, log: Option<&'a crate::estimation::outer_optimizer::OuterFdDeclineLog>,
+    ) -> Self {
+        Self { declines: log, ..self }
     }
 
     /// This context with its finite-difference score re-solving at `tol`.
     pub(crate) fn with_fd_inner_tol(self, tol: f64) -> Self {
-        Self {
-            fd_inner_tol: tol,
-            ..self
-        }
+        Self { fd_inner_tol: tol, ..self }
     }
 
     /// Negative-log-likelihood score: the exact `dFᵢ/dx`, else the reconverged
-    /// finite-difference score. The covariance step's form, which never takes a held-EBE
-    /// score into `S`.
+    /// finite-difference score. The covariance step's form, which re-solves per probe rather
+    /// than take the re-solved-EBE score into `S`.
     pub(crate) fn score(
-        &self,
-        subject: &Subject,
-        eta: &[f64],
-        kappas: &[nalgebra::DVector<f64>],
+        &self, subject: &Subject, eta: &[f64], kappas: &[nalgebra::DVector<f64>],
     ) -> Option<Vec<f64>> {
-        self.score_routed(subject, eta, kappas, false)
-            .map(|(g, _)| g)
+        self.score_routed(subject, eta, kappas, false).map(|(g, _)| g)
     }
 
-    /// [`Self::score`], and with `held_ok` the optimizer's salvage between the two: a
-    /// subject whose mode identity the adjoint declines takes the held-EBE score
-    /// ([`ScoreRoute::HeldEbe`]) rather than `2·n_x` EBE re-solves — what FOCE/FOCEI do with
-    /// the same subject. Not under IOV, whose FOCEI salvage is the reconverged one.
+    /// [`Self::score`], and with `resolve_ok` the optimizer's salvage between the two: a
+    /// subject the adjoint declines at the held mode is scored exactly at its EBE re-solved
+    /// at the trial point ([`ScoreRoute::ResolvedExact`]), one inner solve and one adjoint
+    /// pass rather than `2·n_x` re-solves; the covariance step's form re-solves per probe.
     pub(crate) fn score_routed(
-        &self,
-        subject: &Subject,
-        eta: &[f64],
-        kappas: &[nalgebra::DVector<f64>],
-        held_ok: bool,
+        &self, subject: &Subject, eta: &[f64], kappas: &[nalgebra::DVector<f64>], resolve_ok: bool,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
-        self.score_routed_with_mode(subject, eta, kappas, held_ok, &mut ModeOut::default())
+        self.score_routed_with_mode(None, subject, eta, kappas, resolve_ok, &mut ModeOut::default())
     }
 
     /// [`Self::score_routed`], with what `mode` asks for about the subject's mode
     /// ([`ModeOut`]: its response, its exact inner Hessian) formed by the same adjoint pass.
-    /// Exact route only; on any other `mode` comes back empty (#2549).
+    /// Exact route only; on any other `mode` comes back empty (#2549). `index` is the subject's
+    /// place in the fit, which keys the decline log's kept answer.
+    ///
+    /// Whether a decline is structural is asked (a recording) only where the answer is used: the
+    /// optimizer's salvage (`resolve_ok`) routes on it, and the label it puts on a reconverged
+    /// score is what the fit's warning reports. Without `resolve_ok` (the covariance step, the
+    /// predicted-gain scores) the label is discarded and reads `structural: false`.
     pub(crate) fn score_routed_with_mode(
-        &self,
-        subject: &Subject,
-        eta: &[f64],
-        kappas: &[nalgebra::DVector<f64>],
-        held_ok: bool,
-        mode: &mut ModeOut,
+        &self, index: Option<usize>, subject: &Subject, eta: &[f64],
+        kappas: &[nalgebra::DVector<f64>], resolve_ok: bool, mode: &mut ModeOut,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
         mode.clear();
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return None;
         }
         let joint_warm = stack_mode(eta, kappas);
+        let mut structural = true;
         if !self.force_fd {
             // The adjoint (any node count, either anchor): the exact `dFᵢ/dx`.
             use crate::sens::ode_provider::adjoint::{
-                subject_adjoint_gradient_and_mode_at, subject_adjoint_held_ebe_score_at, Objective,
+                subject_adjoint_gradient_and_mode_at, Objective,
             };
             let objective = Objective::Agq {
                 n_agq: self.nodes.len(),
@@ -1341,25 +1214,87 @@ impl<'a> SubjectScoreContext<'a> {
                 Some(g)
             };
             if let Some(pt) = &self.point {
-                let b = &joint_warm[..];
                 let exact = subject_adjoint_gradient_and_mode_at(
-                    self.model, subject, pt, b, objective, mode,
+                    self.model,
+                    subject,
+                    pt,
+                    &joint_warm,
+                    objective,
+                    mode,
                 );
                 if let Some(g) = accept(exact) {
                     return Some((g, ScoreRoute::Exact));
                 }
                 mode.clear();
-                if held_ok && self.model.n_kappa == 0 {
-                    let held =
-                        subject_adjoint_held_ebe_score_at(self.model, subject, pt, b, objective);
-                    if let Some(g) = accept(held) {
-                        return Some((g, ScoreRoute::HeldEbe));
+                structural = resolve_ok && {
+                    let probe = || {
+                        #[cfg(test)]
+                        self.probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::estimation::outer_optimizer::is_structural_decline(
+                            self.model,
+                            subject,
+                            self.template,
+                            &joint_warm,
+                        )
+                    };
+                    match (self.declines, index) {
+                        (Some(log), Some(i)) => log.is_structural(i, probe),
+                        _ => probe(),
                     }
+                };
+                if resolve_ok && !structural {
+                    // The EBE re-solved at the trial point is stationary, so the mode
+                    // identity the held `η̂` lacked holds there: the exact score, with the
+                    // EBE response. The mode is handed back as polished, so the objective
+                    // is evaluated at the `η̂` the gradient differentiated at.
+                    if let Some((g, b)) = self.exact_at_resolved_ebe(subject, pt, &joint_warm, mode)
+                    {
+                        if let Some(g) = accept(Some(g)) {
+                            mode.eta_polished.get_or_insert(b);
+                            return Some((g, ScoreRoute::ResolvedExact));
+                        }
+                    }
+                    mode.clear();
                 }
             }
         }
         self.finite_difference_score(subject, &joint_warm)
-            .map(|g| (g, ScoreRoute::Reconverged))
+            .map(|g| (g, ScoreRoute::Reconverged { structural }))
+    }
+
+    /// The exact score at the subject's EBE re-solved at `self.x` (warm from `warm`, the
+    /// stacked `[η̂, κ̂…]`) at the FD stencil's tight tolerance, with the stacked mode it was
+    /// taken at. `None` when the re-solve is unresolved or the adjoint declines there too.
+    fn exact_at_resolved_ebe(
+        &self, subject: &Subject, pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+        warm: &[f64], mode: &mut ModeOut,
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        use crate::estimation::parameterization::{compute_mu_k, unpack_params};
+        let p = unpack_params(self.x, self.template);
+        let mu = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
+        let ebe = crate::estimation::inner_optimizer::find_ebe_for_stage(
+            self.model,
+            subject,
+            &p,
+            self.options.inner_maxiter,
+            crate::estimation::fd_resolution::tight_tol(self.options.inner_tol),
+            Some(warm),
+            Some(&mu),
+            0,
+            self.options,
+        );
+        if !crate::estimation::fd_resolution::ebe_resolved(&ebe) {
+            return None;
+        }
+        let b = stack_mode(ebe.eta.as_slice(), &ebe.kappas);
+        let objective = crate::sens::ode_provider::adjoint::Objective::Agq {
+            n_agq: self.nodes.len(),
+            exact: matches!(self.options.hessian_anchor(), HessianAnchor::Exact),
+        };
+        let g = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_and_mode_at(
+            self.model, subject, pt, &b, objective, mode,
+        )?;
+        Some((g, b))
     }
 
     fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
@@ -1467,15 +1402,13 @@ pub(crate) fn population_gradient_mixed(
     }
     let want_eta_dx = eta_dx.as_ref().is_some_and(|s| s.want_dx);
     let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd)
+        .with_declines(declines);
     let scores: Vec<_> = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
-        let mut mode = ModeOut {
-            want_dx: want_eta_dx,
-            want_hessian,
-            ..ModeOut::default()
-        };
+        let mut mode = ModeOut { want_dx: want_eta_dx, want_hessian, ..ModeOut::default() };
         let score = context.score_routed_with_mode(
+            Some(i),
             subject,
             eta_hats[i].as_slice(),
             kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
@@ -1517,9 +1450,7 @@ pub(crate) fn population_gradient_mixed(
 /// reach (declined, a held or finite-difference score, a singular inner Hessian) is
 /// predicted not to move, as under FOCE(I).
 fn assemble_eta_dx(
-    per: Vec<Option<Vec<nalgebra::DVector<f64>>>>,
-    eta_hats: &[nalgebra::DVector<f64>],
-    np: usize,
+    per: Vec<Option<Vec<nalgebra::DVector<f64>>>>, eta_hats: &[nalgebra::DVector<f64>], np: usize,
 ) -> Vec<Vec<nalgebra::DVector<f64>>> {
     per.into_iter()
         .zip(eta_hats)
@@ -1538,15 +1469,9 @@ fn assemble_eta_dx(
 /// order** so the result cannot depend on the thread count (#703), exactly as
 /// [`agq_population_nll`] does for the objective.
 pub fn agq_population_gradient(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[nalgebra::DVector<f64>],
-    kappas: &[Vec<nalgebra::DVector<f64>>],
-    n_nodes: usize,
-    anchor: HessianAnchor,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    template: &ModelParameters, x: &[f64], eta_hats: &[nalgebra::DVector<f64>],
+    kappas: &[Vec<nalgebra::DVector<f64>>], n_nodes: usize, anchor: HessianAnchor,
 ) -> Option<Vec<f64>> {
     let n_packed = x.len();
     let _ = params;
@@ -1578,6 +1503,44 @@ pub fn agq_population_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3009 review 2: a runtime-declined subject served at its re-solved EBE records as
+    /// exact; a reconverged route records "structural" only when no recorder serves the
+    /// subject, and a runtime decline whose exact route failed as plain reconverged. Each
+    /// kind and its negatives in one test, so forcing a route onto another's record reddens it.
+    #[test]
+    fn score_routes_are_recorded_as_their_own_kind() {
+        use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
+        let mut pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin.csv"),
+            None,
+            None,
+        )
+        .expect("data");
+        pop.subjects.truncate(1);
+        let record = |route: ScoreRoute| {
+            let log = OuterFdDeclineLog::new(1);
+            route.record(&log, 0);
+            log
+        };
+        let warn = |route: ScoreRoute| outer_fd_fallback_warning(&pop, &record(route));
+        assert!(warn(ScoreRoute::Exact).is_none(), "an exact route is no decline");
+        // Served exactly at the re-solved EBE: no fallback ran, so no warning, and the log
+        // counts it exact; the reconverged routes are not.
+        let resolved = record(ScoreRoute::ResolvedExact);
+        assert!(outer_fd_fallback_warning(&pop, &resolved).is_none());
+        assert!(resolved.all_declines_exact());
+        assert!(!record(ScoreRoute::Reconverged { structural: false }).all_declines_exact());
+        let structural = warn(ScoreRoute::Reconverged { structural: true }).expect("warns");
+        assert!(structural.contains("no analytic recorder serves them"), "{structural}");
+        let runtime = warn(ScoreRoute::Reconverged { structural: false }).expect("warns");
+        assert!(
+            runtime.contains("reconverged finite-difference outer gradients")
+                && !runtime.contains("no analytic recorder serves them")
+                && !runtime.contains("every parameter point"),
+            "{runtime}"
+        );
+    }
 
     #[test]
     fn inline_iov_slice_table_is_bitwise_identical_to_legacy_allocation() {
@@ -1634,24 +1597,7 @@ mod tests {
     // reference carries no inner-solver noise floor and the step can be chosen for
     // truncation alone.
 
-    const M3_MODEL: &str = r#"
-[parameters]
-  theta TVCL(0.2, 0.001, 10.0)
-  theta TVV(10.0, 0.1, 500.0)
-  theta TVKA(1.5, 0.01, 50.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.04
-  omega ETA_KA ~ 0.30
-  sigma PROP_ERR ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=KA)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-"#;
+    const M3_MODEL: &str = crate::test_models::ONE_CPT_ORAL_4;
 
     const RUV_MODEL: &str = r#"
 [parameters]
@@ -1696,37 +1642,17 @@ mod tests {
     /// A subject with realistic nonzero residuals, built from the model at a reference eta.
     fn score_subject(model: &CompiledModel, theta: &[f64], times: &[f64]) -> Subject {
         use crate::types::DoseEvent;
-        use std::collections::HashMap;
+
         let n = times.len();
         let mut subject = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".to_string(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; n],
             obs_cmts: vec![1; n],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let eta_ref = [0.12, -0.08, 0.2];
         let preds = crate::pk::compute_predictions_with_tv(model, &subject, theta, &eta_ref);
@@ -1764,11 +1690,7 @@ mod tests {
             (EstimationMethod::FoceI, HessianAnchor::GaussNewton),
             (EstimationMethod::Laplace, HessianAnchor::Exact),
         ] {
-            let options = FitOptions {
-                method,
-                n_agq: 3,
-                ..FitOptions::default()
-            };
+            let options = FitOptions { method, n_agq: 3, ..FitOptions::default() };
             let evaluation = agq_population_evaluate(
                 &model,
                 &population,
@@ -1782,6 +1704,7 @@ mod tests {
                 3,
                 anchor,
                 false,
+                None,
             );
             let terms_only =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
@@ -1892,10 +1815,7 @@ mod tests {
         for n in 1..=MAX_AGQ_NODES {
             let (x, w) = gauss_hermite(n);
             let total: f64 = w.iter().sum();
-            assert!(
-                (total - PI.sqrt()).abs() < 1e-10,
-                "n={n}: weights sum to {total}, want √π"
-            );
+            assert!((total - PI.sqrt()).abs() < 1e-10, "n={n}: weights sum to {total}, want √π");
             // ∫ x² e^{−x²} dx = √π/2 — needs degree 2, exact for every n ≥ 2.
             if n >= 2 {
                 let m2: f64 = x.iter().zip(w.iter()).map(|(xi, wi)| wi * xi * xi).sum();
@@ -1934,10 +1854,7 @@ mod tests {
             .collect();
         let agq = 0.5 * PI.ln() + 0.5 * h.ln() - logsumexp(&terms);
         let laplace = nll(m) + 0.5 * h.ln();
-        assert!(
-            (agq - laplace).abs() < 1e-12,
-            "1-node AGQ {agq} != Laplace {laplace}"
-        );
+        assert!((agq - laplace).abs() < 1e-12, "1-node AGQ {agq} != Laplace {laplace}");
     }
 
     /// With enough nodes AGQ must recover the *exact* marginal on an integrand where the
@@ -1993,15 +1910,10 @@ mod tests {
         // genuine Gauss–Hermite truncation, not a defect: the transformed integrand here is
         // exp(−z⁴/3), which no finite polynomial rule integrates exactly. A regression in
         // the transform or the constants would miss by O(0.1), not O(1e-6).
-        let errs: Vec<f64> = [1usize, 3, 7, 21]
-            .iter()
-            .map(|&n| (agq_with(n) - want).abs())
-            .collect();
+        let errs: Vec<f64> =
+            [1usize, 3, 7, 21].iter().map(|&n| (agq_with(n) - want).abs()).collect();
         for w in errs.windows(2) {
-            assert!(
-                w[1] < w[0],
-                "AGQ error must shrink with node count, got {errs:?}"
-            );
+            assert!(w[1] < w[0], "AGQ error must shrink with node count, got {errs:?}");
         }
         assert!(
             *errs.last().unwrap() < 1e-5,
@@ -2199,9 +2111,7 @@ mod tests {
         assert!(!no_reset.has_resets());
 
         let mut reset_subject = score_subject(&model, &params.theta, &[0.5, 1.0, 2.0, 4.0, 8.0]);
-        reset_subject
-            .doses
-            .push(DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0));
+        reset_subject.doses.push(DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0));
         reset_subject.reset_times = vec![12.0];
         let preds = crate::pk::compute_predictions_with_tv(
             &model,
@@ -2236,11 +2146,7 @@ mod tests {
             (EstimationMethod::FoceI, HessianAnchor::GaussNewton),
             (EstimationMethod::Laplace, HessianAnchor::Exact),
         ] {
-            let options = FitOptions {
-                method,
-                n_agq: 3,
-                ..FitOptions::default()
-            };
+            let options = FitOptions { method, n_agq: 3, ..FitOptions::default() };
             let uncached_nll =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
             let cached_nll = agq_population_nll_prepared(
@@ -2386,6 +2292,7 @@ mod tests {
                 3,
                 anchor,
                 false,
+                None,
             );
             let cached_eval = agq_population_evaluate_with_schedules(
                 &model,
@@ -2402,6 +2309,7 @@ mod tests {
                 &schedules,
                 &terminal_work,
                 false,
+                None,
             );
             assert_eq!(uncached_eval.nll.to_bits(), cached_eval.nll.to_bits());
             let (uncached_grad, cached_grad) = (
@@ -2433,6 +2341,7 @@ mod tests {
                     Some(&schedules),
                     None,
                     false,
+                    None,
                 );
                 let reused_one = agq_population_evaluate_impl(
                     &model,
@@ -2449,6 +2358,7 @@ mod tests {
                     Some(&schedules),
                     Some(&terminal_work),
                     false,
+                    None,
                 );
                 assert_eq!(fresh_one.nll.to_bits(), reused_one.nll.to_bits());
                 for (fresh, reused) in fresh_one
@@ -2474,10 +2384,8 @@ mod tests {
             warfarin_iov_fixture,
         };
         let (model, pop, opts) = warfarin_iov_fixture();
-        let opts = crate::types::FitOptions {
-            method: crate::types::EstimationMethod::Laplace,
-            ..opts
-        };
+        let opts =
+            crate::types::FitOptions { method: crate::types::EstimationMethod::Laplace, ..opts };
         let p = &model.default_params;
         let x = crate::estimation::parameterization::pack_params(p);
         let bounds = crate::estimation::parameterization::compute_bounds(p);
@@ -2488,9 +2396,7 @@ mod tests {
         let rec = on_one_thread(|| {
             record_inner_solves(|| {
                 let context = SubjectScoreContext::new(&model, p, &x, &opts, &bounds, true);
-                context
-                    .score(subject, etas[0].as_slice(), &kappas[0])
-                    .expect("the FD score")
+                context.score(subject, etas[0].as_slice(), &kappas[0]).expect("the FD score")
             })
             .1
         });

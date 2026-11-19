@@ -12,10 +12,7 @@ fn grid_median_interpolates_and_handles_no_crossing() {
     // (frac = (ln2 − 0.5·ln2)/(1.5·ln2 − 0.5·ln2) = 0.5).
     let cum = [0.0, ln2 * 0.5, ln2 * 1.5, ln2 * 3.0];
     let m = grid_median_from_cumhaz(&grid, &cum);
-    assert!(
-        (m - 1.5).abs() < 1e-9,
-        "median should interpolate to 1.5; got {m}"
-    );
+    assert!((m - 1.5).abs() < 1e-9, "median should interpolate to 1.5; got {m}");
     // H never reaches ln2 on the grid → NaN.
     let never = grid_median_from_cumhaz(&grid, &[0.0, 0.1, 0.2, 0.3]);
     assert!(never.is_nan(), "no crossing → NaN; got {never}");
@@ -65,10 +62,7 @@ fn has(warnings: &[String], token: &str) -> bool {
 /// `warnings` without the process-global SS non-convergence note, which a concurrent lib test
 /// can leave in the sink this entry point drains (see `non_fit_diagnostics_tests`).
 fn without_ss_sink_note(warnings: &[String]) -> Vec<&String> {
-    warnings
-        .iter()
-        .filter(|w| !w.contains("Steady-state (SS=1) equilibration"))
-        .collect()
+    warnings.iter().filter(|w| !w.contains("Steady-state (SS=1) equilibration")).collect()
 }
 
 /// A clean pure-TTE run is silent, and the wrapper's rows are the `_diag` form's bit for bit.
@@ -80,11 +74,7 @@ fn without_ss_sink_note(warnings: &[String]) -> Vec<&String> {
 fn predict_survival_is_its_diag_forms_rows_and_a_clean_run_is_silent() {
     let m = pure_tte(2, "");
     let p = read(&m, &clean_csv(2));
-    assert!(
-        p.warnings.is_empty(),
-        "fixture must read clean: {:?}",
-        p.warnings
-    );
+    assert!(p.warnings.is_empty(), "fixture must read clean: {:?}", p.warnings);
     let out = predict_survival_diag(&m, &p, &m.default_params, &GRID).unwrap();
     assert!(
         without_ss_sink_note(&out.warnings).is_empty(),
@@ -128,14 +118,8 @@ fn predict_survival_is_its_diag_forms_rows_and_a_clean_run_is_silent() {
 #[test]
 fn predict_survival_diag_carries_parse_and_reader_findings() {
     let m = pure_tte(2, "  theta UNUSED(1.0, 0.1, 10.0)\n");
-    assert!(
-        !m.parse_warnings.is_empty(),
-        "fixture must carry a parse warning"
-    );
-    let p = read(
-        &m,
-        "ID,TIME,DV,EVID,CMT\n1,5,.,0,1\n1,7,1,0,2\n2,30,0,0,2\n",
-    );
+    assert!(!m.parse_warnings.is_empty(), "fixture must carry a parse warning");
+    let p = read(&m, "ID,TIME,DV,EVID,CMT\n1,5,.,0,1\n1,7,1,0,2\n2,30,0,0,2\n");
     assert!(has(&p.warnings, "W_MISSING_DV"), "{:?}", p.warnings);
     let out = predict_survival_diag(&m, &p, &m.default_params, &GRID).unwrap();
     assert!(
@@ -232,9 +216,7 @@ fn predict_survival_diag_reports_the_ode_hazards_solver_diagnostics() {
     let p = read(&clean, JOINT_CSV);
     let out = predict_survival_diag(&clean, &p, &clean.default_params, &GRID).unwrap();
     assert!(
-        out.results
-            .iter()
-            .all(|r| r.cum_hazard.is_finite() && r.cum_hazard > 0.0),
+        out.results.iter().all(|r| r.cum_hazard.is_finite() && r.cum_hazard > 0.0),
         "the clean twin must integrate a live hazard: {:?}",
         out.results
     );
@@ -276,9 +258,7 @@ fn supplied(names: &[&str], rows: &[(&str, &[f64])]) -> SuppliedEtas {
 }
 
 fn rows_of<'a>(
-    rows: &'a [SurvivalPredictionResult],
-    id: &str,
-    cmt: usize,
+    rows: &'a [SurvivalPredictionResult], id: &str, cmt: usize,
 ) -> Vec<&'a SurvivalPredictionResult> {
     rows.iter().filter(|r| r.id == id && r.cmt == cmt).collect()
 }
@@ -298,12 +278,7 @@ fn all_bits(r: &SurvivalPredictionResult) -> [u64; 8] {
 }
 
 fn event(time: f64, event_type: EventType, cmt: usize) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time: 0.0,
-        cmt,
-    }
+    ObsRecord::Event { time, event_type, entry_time: 0.0, cmt }
 }
 
 fn hazard_of(m: &CompiledModel, cmt: usize) -> &HazardSpec {
@@ -426,10 +401,7 @@ fn competing_risks_cif_is_built_at_the_ebe() {
             b_p[k].cum_hazard.to_bits(),
             "cause B reads no η: its H must not move"
         );
-        assert!(
-            a_i[k].cum_hazard > 2.0 * a_p[k].cum_hazard,
-            "cause A must move"
-        );
+        assert!(a_i[k].cum_hazard > 2.0 * a_p[k].cum_hazard, "cause A must move");
         assert!(a_i[k].cif > a_p[k].cif, "cause A's CIF must rise");
         assert!(
             b_i[k].cif < b_p[k].cif,
@@ -459,11 +431,7 @@ const IOV_TTE: &str =
 #[test]
 fn kappa_padding_is_exact_because_no_hazard_reads_kappa() {
     let m = parse_model_string(IOV_TTE).expect("parse");
-    assert_eq!(
-        (m.n_eta, m.n_kappa),
-        (1, 1),
-        "fixture carries one η and one κ"
-    );
+    assert_eq!((m.n_eta, m.n_kappa), (1, 1), "fixture carries one η and one κ");
     let endpoint = m.endpoints.get(&2).expect("endpoint");
     let at = |eta: f64, kappa: f64| {
         crate::survival::tte_cause_params(
@@ -543,19 +511,13 @@ fn supplied_eta_survival_refusals_carry_their_text() {
     // …and the order.
     let two = pure_tte(2, "  omega ETA_X ~ 0.04\n");
     assert_eq!(two.eta_names, ["ETA_X", "ETA_SCALE"]);
-    let swapped = supplied(
-        &["ETA_SCALE", "ETA_X"],
-        &[("1", &[0.1, 0.0]), ("2", &[0.1, 0.0])],
-    );
+    let swapped = supplied(&["ETA_SCALE", "ETA_X"], &[("1", &[0.1, 0.0]), ("2", &[0.1, 0.0])]);
     assert_eq!(
         refused(run(&two, &swapped)),
         "the supplied η are named [ETA_SCALE, ETA_X] but the model's are [ETA_X, ETA_SCALE]; \
          supply every η of the model, in the model's order"
     );
-    let ordered = supplied(
-        &["ETA_X", "ETA_SCALE"],
-        &[("1", &[0.0, 0.1]), ("2", &[0.0, 0.1])],
-    );
+    let ordered = supplied(&["ETA_X", "ETA_SCALE"], &[("1", &[0.0, 0.1]), ("2", &[0.0, 0.1])]);
     assert!(run(&two, &ordered).is_ok(), "the model's order is accepted");
 
     // A population subject with no row is refused; an extra supplied ID ('9') is not.
@@ -566,10 +528,7 @@ fn supplied_eta_survival_refusals_carry_their_text() {
          each subject's η: supply theirs, drop them from the population, or call \
          `predict_survival_diag` for the population (η = 0) curve"
     );
-    let full = supplied(
-        &["ETA_SCALE"],
-        &[("2", &[0.1]), ("9", &[0.0]), ("1", &[0.2])],
-    );
+    let full = supplied(&["ETA_SCALE"], &[("2", &[0.1]), ("9", &[0.0]), ("1", &[0.2])]);
     assert!(run(&m, &full).is_ok(), "an extra supplied ID is ignored");
 
     // The predict_survival_diag checks run first: a short θ is E_THETA_LENGTH even with
@@ -578,10 +537,7 @@ fn supplied_eta_survival_refusals_carry_their_text() {
     short.theta.pop();
     let first = predict_survival_at_etas_diag(&m, &p, &short, &renamed, &GRID).unwrap_err();
     let diag = predict_survival_diag(&m, &p, &short, &GRID).unwrap_err();
-    assert_eq!(
-        (first.code(), first.to_string()),
-        (diag.code(), diag.to_string())
-    );
+    assert_eq!((first.code(), first.to_string()), (diag.code(), diag.to_string()));
 }
 
 /// T7, the `[mixture]` cell: refused with this entry's wording, and the same η on the
@@ -599,13 +555,7 @@ fn supplied_eta_survival_on_a_mixture_model_is_refused() {
     let p = read(&mix, &clean_csv(2));
     let e = supplied(&["ETA_SCALE"], &[("1", &[0.1]), ("2", &[0.1])]);
     assert_eq!(
-        refused(predict_survival_at_etas_diag(
-            &mix,
-            &p,
-            &mix.default_params,
-            &e,
-            &GRID
-        )),
+        refused(predict_survival_at_etas_diag(&mix, &p, &mix.default_params, &e, &GRID)),
         "supplied η are not supported on a [mixture] model: each subject's η was estimated \
          under its own mixture class, and `predict_survival_at_etas_diag` has no class to \
          evaluate it under"
@@ -673,11 +623,7 @@ fn predict_survival_rows_are_in_ascending_cmt_order_on_every_compile() {
             let (m, pop) = fx.compile();
             let rows = predict_survival(&m, &pop, &m.default_params, &GRID).expect("predict");
             let blocks = cmt_blocks(&rows);
-            assert_eq!(
-                blocks.len(),
-                pop.subjects.len(),
-                "{label}: one run per subject"
-            );
+            assert_eq!(blocks.len(), pop.subjects.len(), "{label}: one run per subject");
             assert!(
                 blocks.iter().any(|(_, b)| b.len() == cmts.len()),
                 "{label}: no subject carries rows on every CMT: the order is unobservable"
@@ -712,22 +658,12 @@ fn predict_survival_cif_bits_are_the_same_on_every_compile() {
     use crate::survival::endpoint_order_test_helpers::permutations;
     const CIF_GRID: [f64; 4] = [0.7, 1.3, 5.0, 14.0];
     let bits = |r: &SurvivalPredictionResult| {
-        (
-            r.id.clone(),
-            r.cmt,
-            r.survival_all.to_bits(),
-            r.cif.to_bits(),
-        )
+        (r.id.clone(), r.cmt, r.survival_all.to_bits(), r.cif.to_bits())
     };
     let fx = EndpointOrderFixture::three_cause();
     let (m, pop) = fx.compile();
     let first = predict_survival(&m, &pop, &m.default_params, &CIF_GRID).expect("predict");
-    assert!(
-        first
-            .iter()
-            .all(|r| r.cif.is_finite() && r.survival_all.is_finite()),
-        "{first:?}"
-    );
+    assert!(first.iter().all(|r| r.cif.is_finite() && r.survival_all.is_finite()), "{first:?}");
     // Straddle: some subject's `(S_all, CIF)` bits depend on the order of the causes.
     let straddles = pop.subjects.iter().any(|s| {
         // The subject's per-cause H(t) curves, ascending CMT (the emitted order).
@@ -748,18 +684,12 @@ fn predict_survival_cif_bits_are_the_same_on_every_compile() {
             for (k, &i) in order.iter().enumerate() {
                 by_cause[i] = cif[k].iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             }
-            (
-                s_all.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                by_cause,
-            )
+            (s_all.iter().map(|x| x.to_bits()).collect::<Vec<_>>(), by_cause)
         };
         let ascending = curve_bits(&[0, 1, 2]);
         permutations(3).iter().any(|p| curve_bits(p) != ascending)
     });
-    assert!(
-        straddles,
-        "no subject's S_all / CIF depends on the cause order: the pin cannot fail"
-    );
+    assert!(straddles, "no subject's S_all / CIF depends on the cause order: the pin cannot fail");
     let mut want: Vec<_> = first.iter().map(bits).collect();
     // Compared as sets of rows, so this test sees the values and not the row order.
     want.sort_unstable();
@@ -804,11 +734,7 @@ fn focei_objective_of_a_three_cause_model_is_the_same_bits_on_every_compile() {
     };
     for (label, fx, order_matters) in [
         ("three-cause", EndpointOrderFixture::three_cause(), true),
-        (
-            "two-cause (negative control)",
-            EndpointOrderFixture::two_cause(),
-            false,
-        ),
+        ("two-cause (negative control)", EndpointOrderFixture::two_cause(), false),
     ] {
         let mut ofvs: Vec<u64> = Vec::new();
         let mut last = None;
@@ -895,12 +821,8 @@ fn named_event_model_blocks_parse_in_the_same_order_on_every_compile() {
         )
     };
     let tail = "[error_model]\n  DV ~ proportional(PROP_ERR)\n";
-    let src = format!(
-        "{head}{}{}{}{tail}",
-        block("a", 3, ""),
-        block("b", 4, ""),
-        block("c", 5, "")
-    );
+    let src =
+        format!("{head}{}{}{}{tail}", block("a", 3, ""), block("b", 4, ""), block("c", 5, ""));
     let bad = format!(
         "{head}{}{}{}{tail}",
         block("a", 3, "\n  bogus_key = 1"),
@@ -939,9 +861,7 @@ fn named_event_model_blocks_parse_in_the_same_order_on_every_compile() {
     let layout = first.ode_spec.as_ref().expect("ode").state_names.clone();
     let chz: Vec<&String> = layout.iter().filter(|s| s.starts_with("__chz_")).collect();
     assert_eq!(chz.len(), 3, "three hazard accumulators: {layout:?}");
-    let ofv = super::fit(&first, &pop, &first.default_params, &opts)
-        .expect("fit")
-        .ofv;
+    let ofv = super::fit(&first, &pop, &first.default_params, &opts).expect("fit").ofv;
     assert!(ofv.is_finite(), "{ofv}");
     for k in 0..COMPILES {
         let m = parse_model_string(&src).expect("parse");
@@ -950,9 +870,7 @@ fn named_event_model_blocks_parse_in_the_same_order_on_every_compile() {
             layout,
             "compile {k}: the ODE state layout moved"
         );
-        let err = parse_model_string(&bad)
-            .err()
-            .expect("bad model must not parse");
+        let err = parse_model_string(&bad).err().expect("bad model must not parse");
         assert!(
             err.contains("`bogus_key`") && !err.contains("other_bogus"),
             "compile {k}: the first error must be block `a`'s: {err}"

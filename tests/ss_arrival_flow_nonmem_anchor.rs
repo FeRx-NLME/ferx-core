@@ -85,10 +85,7 @@ const CENTRAL_ID: &str = "6";
 const DEPOT_IDS: &[&str] = &["1", "2", "3", "4", "5"];
 
 fn table(lag: f64) -> String {
-    format!(
-        "nonmem_anchor/results/ss_arrival_flow_lag{}.sdtab",
-        lag as i64
-    )
+    format!("nonmem_anchor/results/ss_arrival_flow_lag{}.sdtab", lag as i64)
 }
 
 /// ID 5 at lag 13 (`lag > II` infusion) is NONMEM's `T_inf + (lag − II)` reading, which
@@ -218,10 +215,7 @@ fn nonmem_obs(path: &str) -> Vec<(String, f64, f64)> {
     text.lines()
         .skip(2)
         .map(|l| {
-            let c: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
+            let c: Vec<f64> = l.split_whitespace().map(|x| x.parse().expect("number")).collect();
             (c[0], c[1], c[2], c[3])
         })
         .filter(|&(_, _, evid, _)| evid == 0.0)
@@ -234,20 +228,11 @@ fn nonmem_obs(path: &str) -> Vec<(String, f64, f64)> {
 /// names them. Each value is asserted finite before it is folded (`f64::max` discards `NaN`),
 /// and a skip list naming an ID the table lacks, or a check of nothing, panics outright.
 fn check_matches(
-    label: &str,
-    got: &[(String, f64, f64)],
-    table: &str,
-    bound: f64,
-    skip: &[&str],
+    label: &str, got: &[(String, f64, f64)], table: &str, bound: f64, skip: &[&str],
 ) -> Result<(), String> {
-    let want: Vec<_> = nonmem_obs(table)
-        .into_iter()
-        .filter(|(id, _, _)| !skip.contains(&id.as_str()))
-        .collect();
-    let got: Vec<_> = got
-        .iter()
-        .filter(|(id, _, _)| !skip.contains(&id.as_str()))
-        .collect();
+    let want: Vec<_> =
+        nonmem_obs(table).into_iter().filter(|(id, _, _)| !skip.contains(&id.as_str())).collect();
+    let got: Vec<_> = got.iter().filter(|(id, _, _)| !skip.contains(&id.as_str())).collect();
     for s in skip {
         assert!(
             nonmem_obs(table).iter().any(|(id, _, _)| id == s),
@@ -266,10 +251,7 @@ fn check_matches(
         assert!(g.is_finite(), "{label}: ID {id} t={t} non-finite ({g})");
         let rel = (g - w).abs() / w.abs();
         if !(rel < bound) {
-            bad.push(format!(
-                "ID {id} t={t}: ferx {g} vs NONMEM {w} (rel {:+.3e})",
-                (g - w) / w
-            ));
+            bad.push(format!("ID {id} t={t}: ferx {g} vs NONMEM {w} (rel {:+.3e})", (g - w) / w));
         }
         worst = worst.max(rel);
     }
@@ -290,11 +272,8 @@ fn check_matches(
 /// Run `check` at every lag, then fail once naming every red cell: a failure at lag 11 must
 /// not hide whether lag 12 is red too and the lag-13 control green.
 fn every_lag(mut check: impl FnMut(f64) -> Vec<Result<(), String>>) {
-    let fails: Vec<String> = LAGS
-        .iter()
-        .flat_map(|&lag| check(lag))
-        .filter_map(Result::err)
-        .collect();
+    let fails: Vec<String> =
+        LAGS.iter().flat_map(|&lag| check(lag)).filter_map(Result::err).collect();
     assert!(fails.is_empty(), "{}", fails.join("\n"));
 }
 
@@ -379,10 +358,7 @@ fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f6
     )
     .expect("adaptive sim runs and passes the frozen-replay verifier");
     assert!(res.ledger.is_empty(), "the no-op controller dosed");
-    res.trajectories
-        .into_iter()
-        .map(|r| (r.id, r.time, r.ipred))
-        .collect()
+    res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)).collect()
 }
 
 type OdeCase = (&'static str, CompiledModel, Population, Vec<&'static str>);
@@ -398,18 +374,8 @@ fn ode_cases(lag: f64, pop: Population) -> Vec<OdeCase> {
         p
     };
     vec![
-        (
-            "",
-            ode_depot(lag),
-            only(&|id| id != CENTRAL_ID),
-            skip_plus(lag, &[CENTRAL_ID]),
-        ),
-        (
-            " [ID 6, central SS]",
-            ode_central(lag),
-            only(&|id| id == CENTRAL_ID),
-            DEPOT_IDS.to_vec(),
-        ),
+        ("", ode_depot(lag), only(&|id| id != CENTRAL_ID), skip_plus(lag, &[CENTRAL_ID])),
+        (" [ID 6, central SS]", ode_central(lag), only(&|id| id == CENTRAL_ID), DEPOT_IDS.to_vec()),
     ]
 }
 
@@ -439,11 +405,8 @@ fn the_window_dose_is_live_after_the_arrival_in_nonmem() {
                 .map(|r| r.2)
                 .unwrap_or_else(|| panic!("no ID {id} t={t}"))
         };
-        let post: Vec<f64> = rows
-            .iter()
-            .filter(|(i, t, _)| i == "1" && *t > 10.0 + lag)
-            .map(|r| r.1)
-            .collect();
+        let post: Vec<f64> =
+            rows.iter().filter(|(i, t, _)| i == "1" && *t > 10.0 + lag).map(|r| r.1).collect();
         assert!(post.len() >= 3, "lag {lag}: need post-arrival samples");
         for t in post {
             let rel = at("1", t) / at("2", t) - 1.0;

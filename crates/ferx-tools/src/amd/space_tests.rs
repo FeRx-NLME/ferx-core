@@ -30,13 +30,7 @@ fn every_statement_lands_in_exactly_one_step() {
             // `COVARIANCE` has no single owner — it is narrowed per level —
             // so it belongs to the variability steps and to nothing else.
             let expected = owner(feature).unwrap().unwrap_or(step);
-            assert_eq!(
-                expected,
-                step,
-                "{} was routed to {}",
-                feature.keyword(),
-                step.label()
-            );
+            assert_eq!(expected, step, "{} was routed to {}", feature.keyword(), step.label());
             if owner(feature).unwrap().is_none() {
                 assert!(
                     matches!(step, Step::Iivsearch | Step::Iovsearch),
@@ -55,10 +49,7 @@ fn every_statement_lands_in_exactly_one_step() {
 #[test]
 fn the_structural_subspace_is_what_modelsearch_takes() {
     let sub = subspace(&mfl(FULL), Step::Structural).unwrap();
-    assert_eq!(
-        sub.render(),
-        "ABSORPTION([INST,FO]);PERIPHERALS(0..1);LAGTIME([OFF,ON])"
-    );
+    assert_eq!(sub.render(), "ABSORPTION([INST,FO]);PERIPHERALS(0..1);LAGTIME([OFF,ON])");
     crate::modelsearch::structure::space_features(&sub)
         .expect("modelsearch reads its own subspace");
 }
@@ -85,10 +76,7 @@ fn a_two_level_covariance_is_narrowed_to_each_level() {
     assert_eq!(iov.render(), "IOV?(CL,EXP);COVARIANCE?(IOV,[CL,V])");
     // And a single-level covariance goes to its own level only.
     let one = mfl("IIV?([CL,V],EXP);COVARIANCE?(IIV,[CL,V])");
-    assert_eq!(
-        subspace(&one, Step::Iovsearch).unwrap().features().count(),
-        0
-    );
+    assert_eq!(subspace(&one, Step::Iovsearch).unwrap().features().count(), 0);
 }
 
 /// Every subspace re-parses to itself, so the rendered text a tool is handed
@@ -133,10 +121,7 @@ fn let_travels_with_the_statements_but_never_alone() {
 fn a_pd_statement_is_refused_by_name() {
     let space = mfl("DIRECTEFFECT(LINEAR)");
     let error = check(&space).unwrap_err();
-    assert!(
-        error.contains("DIRECTEFFECT") && error.contains("structsearch"),
-        "{error}"
-    );
+    assert!(error.contains("DIRECTEFFECT") && error.contains("structsearch"), "{error}");
     // And through the subspace path too, so no caller can bypass the check.
     assert!(subspace(&space, Step::Structural).is_err());
 }

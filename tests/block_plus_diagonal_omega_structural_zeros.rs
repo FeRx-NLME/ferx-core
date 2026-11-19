@@ -103,13 +103,8 @@ fn full_block_kappa_src() -> String {
 /// (`outer_maxiter = 0`) that reports the start as the fit sees it.
 #[allow(clippy::too_many_arguments)]
 fn fit_with(
-    src: &str,
-    data: DataSet,
-    method: EstimationMethod,
-    interaction: bool,
-    optimizer: Optimizer,
-    eval_only: bool,
-    covariance: bool,
+    src: &str, data: DataSet, method: EstimationMethod, interaction: bool, optimizer: Optimizer,
+    eval_only: bool, covariance: bool,
 ) -> FitResult {
     let model = parse_model_string(src).expect("model parses");
     let pop = read_nonmem_csv(Path::new(data.0), None, data.1).expect("data loads");
@@ -125,31 +120,16 @@ fn fit_with(
 
 /// The FOCE (no interaction) arm most of this file uses.
 fn capped_fit(
-    src: &str,
-    data: DataSet,
-    optimizer: Optimizer,
-    eval_only: bool,
-    covariance: bool,
+    src: &str, data: DataSet, optimizer: Optimizer, eval_only: bool, covariance: bool,
 ) -> FitResult {
-    fit_with(
-        src,
-        data,
-        EstimationMethod::Foce,
-        false,
-        optimizer,
-        eval_only,
-        covariance,
-    )
+    fit_with(src, data, EstimationMethod::Foce, false, optimizer, eval_only, covariance)
 }
 
 /// The four cross-block entries of a mixed block + diagonal matrix are all
 /// exactly 0. `at` reads the matrix under test (Ω or Ω_IOV), `names` are its
 /// row labels.
 fn assert_cross_zeros(
-    label: &str,
-    names: &[String],
-    at: impl Fn(usize, usize) -> f64,
-    block: (&str, &str),
+    label: &str, names: &[String], at: impl Fn(usize, usize) -> f64, block: (&str, &str),
     diag: &str,
 ) {
     let (ia, ib, id) = (idx(names, block.0), idx(names, block.1), idx(names, diag));
@@ -165,10 +145,7 @@ fn assert_cross_zeros(
 }
 
 fn idx(names: &[String], name: &str) -> usize {
-    names
-        .iter()
-        .position(|n| n == name)
-        .unwrap_or_else(|| panic!("{name} not in {names:?}"))
+    names.iter().position(|n| n == name).unwrap_or_else(|| panic!("{name} not in {names:?}"))
 }
 
 /// A free covariance moved off its start. The reference is an evaluation-only
@@ -267,20 +244,8 @@ fn partial_block_holds_structural_zeros_and_the_full_block_does_not() {
 fn partial_block_kappa_holds_structural_zeros_and_the_full_block_does_not() {
     let iov = |f: &FitResult| f.omega_iov.clone().expect("fit carries omega_iov");
 
-    let start = capped_fit(
-        PARTIAL_BLOCK_KAPPA_SRC,
-        WARFARIN_IOV,
-        Optimizer::Lbfgs,
-        true,
-        false,
-    );
-    let r = capped_fit(
-        PARTIAL_BLOCK_KAPPA_SRC,
-        WARFARIN_IOV,
-        Optimizer::Lbfgs,
-        false,
-        false,
-    );
+    let start = capped_fit(PARTIAL_BLOCK_KAPPA_SRC, WARFARIN_IOV, Optimizer::Lbfgs, true, false);
+    let r = capped_fit(PARTIAL_BLOCK_KAPPA_SRC, WARFARIN_IOV, Optimizer::Lbfgs, false, false);
     let (cl, v, ka) = (
         idx(&r.kappa_names, "KAPPA_CL"),
         idx(&r.kappa_names, "KAPPA_V"),
@@ -297,21 +262,11 @@ fn partial_block_kappa_holds_structural_zeros_and_the_full_block_does_not() {
             om
         );
     }
-    assert_moved(
-        "in-block Cov(KAPPA_CL, KAPPA_V)",
-        om[(v, cl)],
-        iov(&start)[(v, cl)],
-    );
+    assert_moved("in-block Cov(KAPPA_CL, KAPPA_V)", om[(v, cl)], iov(&start)[(v, cl)]);
     // 3 θ + 3 Ω + 3 κ variances + 1 in-block κ covariance + 1 σ.
     assert_eq!(r.n_parameters, 11);
 
-    let full = capped_fit(
-        &full_block_kappa_src(),
-        WARFARIN_IOV,
-        Optimizer::Lbfgs,
-        false,
-        false,
-    );
+    let full = capped_fit(&full_block_kappa_src(), WARFARIN_IOV, Optimizer::Lbfgs, false, false);
     let fom = iov(&full);
     let (fcl, fv, fka) = (
         idx(&full.kappa_names, "KAPPA_CL"),
@@ -352,14 +307,7 @@ fn focei_and_gauss_newton_builders_hold_structural_zeros() {
             WARFARIN,
             PARTIAL_BLOCK_SRC,
         ),
-        (
-            "gn",
-            EstimationMethod::FoceGn,
-            false,
-            Optimizer::Lbfgs,
-            WARFARIN,
-            PARTIAL_BLOCK_SRC,
-        ),
+        ("gn", EstimationMethod::FoceGn, false, Optimizer::Lbfgs, WARFARIN, PARTIAL_BLOCK_SRC),
         (
             "gn / IOV (finite-difference fallback)",
             EstimationMethod::FoceGn,
@@ -406,24 +354,15 @@ fn focei_and_gauss_newton_builders_hold_structural_zeros() {
 fn partial_block_covariance_step_reports_zero_se_on_structural_zeros() {
     let r = capped_fit(PARTIAL_BLOCK_SRC, WARFARIN, Optimizer::Lbfgs, false, true);
     assert_eq!(r.n_parameters, 8);
-    let se = r
-        .se_omega
-        .as_ref()
-        .expect("covariance step produced omega SEs");
+    let se = r.se_omega.as_ref().expect("covariance step produced omega SEs");
     assert_eq!(se.len(), 6, "full lower triangle of a 3×3 Ω");
     for (i, j) in [(2, 0), (2, 1)] {
         let s = omega_se_at(&r.se_omega, 3, i, j).expect("lower-triangle SE present");
-        assert!(
-            s == 0.0,
-            "SE(Ω[{i},{j}]) = {s:e} must be 0 for a structural zero"
-        );
+        assert!(s == 0.0, "SE(Ω[{i},{j}]) = {s:e} must be 0 for a structural zero");
     }
     for (i, j) in [(0, 0), (1, 0), (1, 1), (2, 2)] {
         let s = omega_se_at(&r.se_omega, 3, i, j).expect("lower-triangle SE present");
-        assert!(
-            s.is_finite() && s > 0.0,
-            "SE(Ω[{i},{j}]) = {s:e} must be a positive estimate"
-        );
+        assert!(s.is_finite() && s > 0.0, "SE(Ω[{i},{j}]) = {s:e} must be a positive estimate");
     }
     let cov = r.covariance_matrix.as_ref().expect("covariance matrix");
     // Free packed coordinates carry a non-zero diagonal; the two structural

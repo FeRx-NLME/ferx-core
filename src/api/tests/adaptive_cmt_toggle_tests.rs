@@ -94,10 +94,7 @@ fn bolus(t: f64, amt: f64, cmt: i32) -> Row {
 }
 
 fn run(
-    model: &CompiledModel,
-    rows: &[Row],
-    decisions: &[f64],
-    monitors: Vec<MonitorSpec>,
+    model: &CompiledModel, rows: &[Row], decisions: &[f64], monitors: Vec<MonitorSpec>,
     controller: impl Fn(&ControllerCtx) -> Vec<DoseAction> + Clone + Send + Sync,
 ) -> Result<AdaptiveSimulationResult, EngineError> {
     let pop = read_pop(&csv(rows), &[]);
@@ -118,11 +115,7 @@ fn depot_bolus(_: &ControllerCtx) -> Vec<DoseAction> {
 /// `predict()` on `rows` plus the realized ledger as dose rows.
 fn static_preds(model: &CompiledModel, rows: &[Row], res: &AdaptiveSimulationResult) -> Vec<f64> {
     let mut all = rows.to_vec();
-    all.extend(
-        res.ledger
-            .iter()
-            .map(|e| (e.time, 1, e.amt, e.cmt as i32, e.rate)),
-    );
+    all.extend(res.ledger.iter().map(|e| (e.time, 1, e.amt, e.cmt as i32, e.rate)));
     all.sort_by(|a, b| a.0.total_cmp(&b.0));
     let pop = read_pop(&csv(&all), &[]);
     predict(model, &pop, &model.default_params)
@@ -135,14 +128,8 @@ fn static_preds(model: &CompiledModel, rows: &[Row], res: &AdaptiveSimulationRes
 /// Worst relative gap, every value asserted finite first (a `NaN` must not hide in the fold).
 fn worst_rel(got: &[f64], want: &[f64]) -> f64 {
     assert_eq!(got.len(), want.len());
-    assert!(
-        got.iter().chain(want).all(|x| x.is_finite()),
-        "{got:?} / {want:?}"
-    );
-    got.iter()
-        .zip(want)
-        .map(|(g, w)| ((g - w) / w).abs())
-        .fold(0.0, f64::max) // nan-ok: every operand asserted finite above
+    assert!(got.iter().chain(want).all(|x| x.is_finite()), "{got:?} / {want:?}");
+    got.iter().zip(want).map(|(g, w)| ((g - w) / w).abs()).fold(0.0, f64::max) // nan-ok: every operand asserted finite above
 }
 
 fn ipreds(res: &AdaptiveSimulationResult) -> Vec<f64> {
@@ -185,10 +172,7 @@ fn adaptive_cmt_toggle_matches_static_predict() {
 
     let untoggled: Vec<Row> = rows.iter().copied().filter(|r| r.1 != 2).collect();
     let free = static_preds(&m, &untoggled, &res);
-    assert!(
-        worst_rel(&free, &want) > 0.1,
-        "the on/off rows must move the answer"
-    );
+    assert!(worst_rel(&free, &want) > 0.1, "the on/off rows must move the answer");
 }
 
 /// A decision exactly at an off row (#2753, decision 1 of the plan): the row applies first,
@@ -211,17 +195,10 @@ fn adaptive_decision_at_an_off_row_reads_after_it_and_its_dose_lands() {
     let before = cell(3.0f64.next_down());
     let tie = cell(3.0);
     let after = cell(3.0f64.next_up());
-    let held = run(&m, &rows, &[3.0], mon(), |_: &ControllerCtx| {
-        vec![DoseAction::Hold]
-    })
-    .unwrap();
+    let held = run(&m, &rows, &[3.0], mon(), |_: &ControllerCtx| vec![DoseAction::Hold]).unwrap();
 
     assert!(read(&before) > 40.0, "before the row: {}", read(&before));
-    assert_eq!(
-        read(&tie),
-        0.0,
-        "at the row the monitor reads the off state"
-    );
+    assert_eq!(read(&tie), 0.0, "at the row the monitor reads the off state");
     assert_eq!(read(&after), 0.0);
     // Before: the 1-ULP-early dose lands and the row wipes it, so central at 4 is the held
     // run's to round-off. At the tie it lands after the row, as one ULP later does.
@@ -263,14 +240,8 @@ fn adaptive_decision_at_an_off_row_reads_after_it_and_its_dose_lands() {
     };
     let dosed = |off_first: bool| run(&m, &listed(off_first), &[3.0], mon(), depot_bolus).unwrap();
     let hold = |off_first: bool| {
-        run(
-            &m,
-            &listed(off_first),
-            &[3.0],
-            mon(),
-            |_: &ControllerCtx| vec![DoseAction::Hold],
-        )
-        .unwrap()
+        run(&m, &listed(off_first), &[3.0], mon(), |_: &ControllerCtx| vec![DoseAction::Hold])
+            .unwrap()
     };
     let (after_dose, before_dose) = (dosed(false), dosed(true));
     assert!(
@@ -278,11 +249,7 @@ fn adaptive_decision_at_an_off_row_reads_after_it_and_its_dose_lands() {
         "row listed after a co-timed dose: the decision reads before it, got {}",
         read(&after_dose)
     );
-    assert_eq!(
-        c4(&after_dose),
-        c4(&hold(false)),
-        "and its dose is wiped by the row"
-    );
+    assert_eq!(c4(&after_dose), c4(&hold(false)), "and its dose is wiped by the row");
     assert_eq!(
         read(&before_dose),
         0.0,
@@ -307,39 +274,19 @@ fn adaptive_monitor_on_an_off_compartment_reads_zero() {
     let m = parse_model_string(GUT).expect("parse");
     let rows = vec![bolus(0.0, 100.0, 1), obs(1.0, 2), off(3.0, 3), obs(8.0, 2)];
     let hold = |_: &ControllerCtx| vec![DoseAction::Hold];
-    let res = run(
-        &m,
-        &rows,
-        &[2.0, 6.0],
-        vec![MonitorSpec::new("U", 3, ObserveMode::Ipred)],
-        hold,
-    )
-    .expect("runs");
+    let res = run(&m, &rows, &[2.0, 6.0], vec![MonitorSpec::new("U", 3, ObserveMode::Ipred)], hold)
+        .expect("runs");
     let u = |i: usize| res.decisions[i].observed_signals[0].value;
     assert!(u(0) > 1.0, "urine before the off row: {}", u(0));
-    assert_eq!(
-        u(1),
-        0.0,
-        "urine while off, with central still eliminating into it"
-    );
+    assert_eq!(u(1), 0.0, "urine while off, with central still eliminating into it");
 
-    let dv = run(
-        &m,
-        &rows,
-        &[2.0, 6.0],
-        vec![MonitorSpec::new("U", 3, ObserveMode::Dv)],
-        hold,
-    )
-    .expect("a Dv monitor on an off compartment runs");
+    let dv = run(&m, &rows, &[2.0, 6.0], vec![MonitorSpec::new("U", 3, ObserveMode::Dv)], hold)
+        .expect("a Dv monitor on an off compartment runs");
     let d = |i: usize| dv.decisions[i].observed_signals[0].value;
     assert_ne!(d(0), u(0), "before the row the assay draw is live");
     // While off the latent is 0, the proportional variance 0, floored to `MIN_VARIANCE`
     // (1e-12): the reading is that floor's noise, σ = 1e-6 (measured −8.6e-7 at this seed).
-    assert!(
-        d(1).abs() < 6e-6,
-        "while off: only the variance floor's noise, got {}",
-        d(1)
-    );
+    assert!(d(1).abs() < 6e-6, "while off: only the variance floor's noise, got {}", d(1));
 }
 
 /// A reset turns every compartment back on (#2753; the static walk's rule, measured in
@@ -367,10 +314,7 @@ fn adaptive_cmt_toggle_with_reset_and_base_regimen() {
         depot_bolus,
     )
     .expect("runs and passes the frozen replay");
-    assert!(
-        res.decisions[1].observed_signals[0].value > 1.0,
-        "urine after the reset is on again"
-    );
+    assert!(res.decisions[1].observed_signals[0].value > 1.0, "urine after the reset is on again");
     let want = static_preds(&m, &rows, &res);
     let worst = worst_rel(&ipreds(&res), &want);
     eprintln!("reset × base × toggle: worst rel {worst:e}");
@@ -382,28 +326,7 @@ fn adaptive_cmt_toggle_with_reset_and_base_regimen() {
 /// check (#2753). CL steps at the EVID=2 rows, which carry their own covariate row.
 #[test]
 fn adaptive_cmt_toggle_under_a_time_varying_covariate() {
-    let model = r#"
-[parameters]
-  theta TVKA(0.3, 0.01, 10.0)
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  KA = TVKA
-  CL = TVCL * CRCL / 100.0
-  V  = TVV
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL / V) * central / (1 + central / 200)
-[scaling]
-  y[CMT=1] = depot
-  y[CMT=2] = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+    let model = crate::test_models::ODE_2;
     let m = parse_model_string(model).expect("parse");
     let rows: [(f64, u8, i32, f64); 7] = [
         (1.0, 0, 2, 100.0),
@@ -415,18 +338,12 @@ fn adaptive_cmt_toggle_under_a_time_varying_covariate() {
         (10.0, 0, 2, 120.0),
     ];
     let to_csv = |doses: &[(f64, f64)]| {
-        let mut all: Vec<(f64, u8, f64, i32, f64)> = rows
-            .iter()
-            .map(|&(t, e, c, cr)| (t, e, 0.0, c, cr))
-            .collect();
+        let mut all: Vec<(f64, u8, f64, i32, f64)> =
+            rows.iter().map(|&(t, e, c, cr)| (t, e, 0.0, c, cr)).collect();
         // A dose row is a record, and the segment ending at it runs under its row (#1073).
         // In the adaptive run the decision is that record (#2895) and carries the LOCF row:
         // give each dose row that `CRCL` (the baseline 100 at 0, the row at 4's 60 at 6).
-        all.extend(
-            doses
-                .iter()
-                .map(|&(t, a)| (t, 1, a, 1, if t < 1.0 { 100.0 } else { 60.0 })),
-        );
+        all.extend(doses.iter().map(|&(t, a)| (t, 1, a, 1, if t < 1.0 { 100.0 } else { 60.0 })));
         all.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,CRCL\n");
         for (t, e, a, c, cr) in all {
@@ -443,15 +360,11 @@ fn adaptive_cmt_toggle_under_a_time_varying_covariate() {
     let res = simulate_adaptive(&m, &pop, &m.default_params, 1, || depot_bolus, &opts)
         .expect("runs and passes adaptive_frozen_replay_tv");
     let realized: Vec<(f64, f64)> = res.ledger.iter().map(|e| (e.time, e.amt)).collect();
-    let want: Vec<f64> = predict(
-        &m,
-        &read_pop(&to_csv(&realized), &["CRCL"]),
-        &m.default_params,
-    )
-    .unwrap()
-    .iter()
-    .map(|p| p.pred)
-    .collect();
+    let want: Vec<f64> = predict(&m, &read_pop(&to_csv(&realized), &["CRCL"]), &m.default_params)
+        .unwrap()
+        .iter()
+        .map(|p| p.pred)
+        .collect();
     let worst = worst_rel(&ipreds(&res), &want);
     eprintln!("tv covariate × toggle: worst rel {worst:e}");
     assert!(worst < ORACLE_TOL, "worst rel {worst:e}");
@@ -484,33 +397,17 @@ fn adaptive_auc_window_spanning_an_off_interval() {
   DV ~ proportional(PROP)
 "#;
     let m = parse_model_string(model).expect("parse");
-    let pop = read_pop(
-        &csv(&[obs(2.0, 1), off(10.0, 1), on(14.0, 1), obs(30.0, 1)]),
-        &[],
-    );
+    let pop = read_pop(&csv(&[obs(2.0, 1), off(10.0, 1), on(14.0, 1), obs(30.0, 1)]), &[]);
     let decisions = [0.0, 12.0, 24.0];
     let spec = fixed_dose_spec(Some("central"), &decisions, 100.0);
     let k = 0.1;
-    let seg = |t0: f64, t1: f64| Seg {
-        t0,
-        t1,
-        k,
-        factor: 1.0,
-    };
+    let seg = |t0: f64, t1: f64| Seg { t0, t1, k, factor: 1.0 };
     let segs = [seg(0.0, 10.0), seg(10.0, 12.0), seg(12.0, 24.0)];
     let boluses = [(0.0, 100.0), (12.0, 100.0)];
     let want = exact_window_aucs(&segs, &boluses, &[10.0], &decisions);
     let blind = exact_window_aucs(&segs, &boluses, &[], &decisions);
     assert_distinct(&want, &blind, AUC_TOL, "off interval vs toggle ignored");
-    assert_window_aucs(
-        &m,
-        &pop,
-        &spec,
-        7,
-        &want,
-        AUC_TOL,
-        "window over an off interval",
-    );
+    assert_window_aucs(&m, &pop, &spec, 7, &want, AUC_TOL, "window over an off interval");
 }
 
 /// Oral 1-cpt `[odes]` model with a per-occasion κ on CL, so a run takes the per-event path
@@ -594,10 +491,8 @@ fn adaptive_cmt_toggle_reset_under_a_time_varying_covariate() {
         (10.0, 0, 3, 120.0),
     ];
     let to_csv = |doses: &[(f64, f64, f64)]| {
-        let mut all: Vec<(f64, u8, f64, i32, f64)> = rows
-            .iter()
-            .map(|&(t, e, c, cr)| (t, e, 0.0, c, cr))
-            .collect();
+        let mut all: Vec<(f64, u8, f64, i32, f64)> =
+            rows.iter().map(|&(t, e, c, cr)| (t, e, 0.0, c, cr)).collect();
         // Each dose row carries the next record's CRCL (see the covariate test above).
         all.extend(doses.iter().map(|&(t, a, cr)| (t, 1, a, 1, cr)));
         all.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -616,26 +511,15 @@ fn adaptive_cmt_toggle_reset_under_a_time_varying_covariate() {
     let res = simulate_adaptive(&m, &pop, &m.default_params, 1, || depot_bolus, &opts)
         .expect("runs and passes adaptive_frozen_replay_tv");
     let next_crcl = |t: f64| if t < 1.0 { 100.0 } else { 40.0 };
-    let realized: Vec<(f64, f64, f64)> = res
-        .ledger
+    let realized: Vec<(f64, f64, f64)> =
+        res.ledger.iter().map(|e| (e.time, e.amt, next_crcl(e.time))).collect();
+    let want: Vec<f64> = predict(&m, &read_pop(&to_csv(&realized), &["CRCL"]), &m.default_params)
+        .unwrap()
         .iter()
-        .map(|e| (e.time, e.amt, next_crcl(e.time)))
+        .map(|p| p.pred)
         .collect();
-    let want: Vec<f64> = predict(
-        &m,
-        &read_pop(&to_csv(&realized), &["CRCL"]),
-        &m.default_params,
-    )
-    .unwrap()
-    .iter()
-    .map(|p| p.pred)
-    .collect();
     let got = ipreds(&res);
-    assert!(
-        got[3] > 1.0,
-        "urine at 10 is on again after the reset: {}",
-        got[3]
-    );
+    assert!(got[3] > 1.0, "urine at 10 is on again after the reset: {}", got[3]);
     let worst = worst_rel(&got, &want);
     eprintln!("tv covariate × reset × toggle: worst rel {worst:e}");
     assert!(worst < ORACLE_TOL, "worst rel {worst:e}");
@@ -685,35 +569,13 @@ fn adaptive_dead_lagged_dose_does_not_turn_its_compartment_on() {
 
 /// Oral 1-cpt `[odes]` model with CL on a time-varying `CRCL`, so a run takes the per-event
 /// path and its verifier is `adaptive_frozen_replay_tv`.
-const GUT_CRCL: &str = r#"
-[parameters]
-  theta TVKA(0.3, 0.01, 10.0)
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  KA = TVKA
-  CL = TVCL * CRCL / 100.0
-  V  = TVV
-[structural_model]
-  ode(states=[depot, central])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - (CL / V) * central / (1 + central / 200)
-[scaling]
-  y[CMT=1] = depot
-  y[CMT=2] = central
-[error_model]
-  DV ~ proportional(PROP)
-"#;
+const GUT_CRCL: &str = crate::test_models::ODE_2;
 
 /// A held run on `pop` (one decision at 7, no dose), with the verifier on, and `predict()` on
 /// the same subject. The decision sits on an observation's time, so the driver breaks where
 /// `predict()` does and the two walk the same segments.
 fn held_run_and_predict(
-    m: &CompiledModel,
-    pop: &Population,
+    m: &CompiledModel, pop: &Population,
 ) -> (Result<AdaptiveSimulationResult, EngineError>, Vec<f64>) {
     let opts = AdaptiveSimulateOptions {
         seed: Some(7),
@@ -761,10 +623,7 @@ fn adaptive_off_row_inside_an_addl_train_passes_the_replay() {
     let got = ipreds(&res.expect("runs and passes adaptive_frozen_replay_tv"));
     let worst = worst_rel(&got, &want);
     eprintln!("tv covariate × ADDL train cut by an off row: worst rel {worst:e}");
-    assert!(
-        worst < ORACLE_TOL,
-        "worst rel {worst:e}: {got:?} vs {want:?}"
-    );
+    assert!(worst < ORACLE_TOL, "worst rel {worst:e}: {got:?} vs {want:?}");
 
     let (uncut, _) = held_run_and_predict(&m, &data(false));
     let uncut = ipreds(&uncut.expect("the uncut train runs"));
@@ -821,10 +680,7 @@ fn adaptive_off_row_inside_an_addl_train_passes_the_replay_under_iov() {
     let got =
         ipreds(&run(train, 4, true).expect("runs and passes adaptive_frozen_replay_tv under IOV"));
     let uncut = ipreds(&run(train, 4, false).expect("the uncut train runs"));
-    assert!(
-        got.iter().chain(&uncut).all(|x| x.is_finite() && *x > 0.0),
-        "{got:?} / {uncut:?}"
-    );
+    assert!(got.iter().chain(&uncut).all(|x| x.is_finite() && *x > 0.0), "{got:?} / {uncut:?}");
     // The cut train is the regimen with only its first two doses written out: same seed,
     // same decisions, so the same κ per window. This is what pins the driver's side under
     // IOV: the replay's `Ok` cannot, since both apply an arrival through one function.
@@ -885,10 +741,7 @@ fn adaptive_off_row_tied_with_a_base_dose_passes_the_replay() {
     let tied = ipreds(&res.expect("tied: runs and passes adaptive_frozen_replay_tv"));
     let worst = worst_rel(&tied, &want);
     eprintln!("tv covariate × off row tied with a base dose: worst rel {worst:e}");
-    assert!(
-        worst < ORACLE_TOL,
-        "tied: worst rel {worst:e}: {tied:?} vs {want:?}"
-    );
+    assert!(worst < ORACLE_TOL, "tied: worst rel {worst:e}: {tied:?} vs {want:?}");
 
     let (kept, _) = held_run_and_predict(&m, &data(false));
     let kept = ipreds(&kept.expect("the twin without the off row runs"));

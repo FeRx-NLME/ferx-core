@@ -138,11 +138,7 @@ fn assert_straddle(bad: &CompiledModel, ctl: &CompiledModel) {
     for t in [1.0, 13.0] {
         for m in [bad, ctl] {
             assert_eq!(pk_at(m, "MTT", t), 1.0, "MTT at the dose record t = {t}");
-            assert_eq!(
-                pk_at(m, "ALAG1", t),
-                0.5,
-                "ALAG1 at the dose record t = {t}"
-            );
+            assert_eq!(pk_at(m, "ALAG1", t), 0.5, "ALAG1 at the dose record t = {t}");
         }
     }
 }
@@ -213,9 +209,7 @@ fn predict_survival_reads_dose_quantities_at_the_dose_record() {
 /// the value both arms would agree on if the dose were lost in both.
 fn live_margin() -> f64 {
     let m = parse_model_string(
-        &MODEL
-            .replace("DROP_VALUE", "0.0")
-            .replace("TVBETA(0.1, FIX)", "TVBETA(0.0, FIX)"),
+        &MODEL.replace("DROP_VALUE", "0.0").replace("TVBETA(0.1, FIX)", "TVBETA(0.0, FIX)"),
     )
     .expect("drug-free twin parses");
     ferx_core::predict_survival(&m, &population(&m), &m.default_params, &[30.0])

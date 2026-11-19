@@ -181,10 +181,9 @@ impl ModelsearchOptions {
             "ABSORPTION / PERIPHERALS / TRANSITS / LAGTIME statements",
         )?;
         let section = match config.tools.get("modelsearch") {
-            Some(table) => table
-                .clone()
-                .try_into::<Section>()
-                .map_err(|e| format!("[modelsearch]: {e}"))?,
+            Some(table) => {
+                table.clone().try_into::<Section>().map_err(|e| format!("[modelsearch]: {e}"))?
+            }
             None => Section::default(),
         };
         let options = ModelsearchOptions {
@@ -371,9 +370,7 @@ pub struct ModelsearchRun<'a> {
 /// Run a structural search from a loaded `.ferxsearch` file and its base
 /// model. Writes `models.csv` and `final.ferx` into `run.dir` when given.
 pub fn run_modelsearch(
-    config: &SearchConfig,
-    base: &BaseModel,
-    run: ModelsearchRun<'_>,
+    config: &SearchConfig, base: &BaseModel, run: ModelsearchRun<'_>,
 ) -> Result<ModelsearchResult, String> {
     let options = ModelsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
@@ -434,22 +431,13 @@ impl Space {
             base.prepared.parsed.model.eta_names.clone(),
             &base.prepared.population,
         );
-        Self::build(
-            base.text.clone(),
-            input_structure,
-            &features,
-            defaults,
-            resolved.notes.clone(),
-        )
+        Self::build(base.text.clone(), input_structure, &features, defaults, resolved.notes.clone())
     }
 
     /// The space from its parts — the seam the unit tests use.
     pub(crate) fn build(
-        input_model: ModelText,
-        input_structure: Structure,
-        features: &[FeatureKey],
-        defaults: Defaults,
-        mut notes: Vec<String>,
+        input_model: ModelText, input_structure: Structure, features: &[FeatureKey],
+        defaults: Defaults, mut notes: Vec<String>,
     ) -> Result<Space, String> {
         let onto = structure::onto_space(&input_structure, features);
         let mut base_structure = input_structure;
@@ -474,37 +462,21 @@ impl Space {
                      no template: {why}. List the input's own value in each category the \
                      space names (e.g. `LAGTIME([OFF,ON])`, `TRANSITS(0, NODEPOT)`) so the \
                      input can be the base",
-                    onto.iter()
-                        .map(|k| k.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    onto.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ")
                 )
             });
         }
         if !onto.is_empty() {
             notes.push(format!(
                 "the input model lies outside the space; the base is the input with {} applied",
-                onto.iter()
-                    .map(|k| k.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                onto.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ")
             ));
         }
         // Pharmpy's `filter_mfl_statements`: a feature the base has is no move.
         let has = base_structure.features();
-        let funcs: Vec<FeatureKey> = features
-            .iter()
-            .filter(|k| !has.contains(k))
-            .copied()
-            .collect();
-        Ok(Space {
-            input_model,
-            input_structure,
-            onto,
-            funcs,
-            defaults,
-            notes,
-        })
+        let funcs: Vec<FeatureKey> =
+            features.iter().filter(|k| !has.contains(k)).copied().collect();
+        Ok(Space { input_model, input_structure, onto, funcs, defaults, notes })
     }
 }
 
@@ -530,10 +502,7 @@ struct Node {
 
 impl Node {
     fn from_model(
-        id: &str,
-        model: ModelText,
-        structure: Structure,
-        path: Vec<FeatureKey>,
+        id: &str, model: ModelText, structure: Structure, path: Vec<FeatureKey>,
         result: Option<(&CandidateResult, &RunReport)>,
     ) -> Result<Node, String> {
         let template = model
@@ -611,11 +580,7 @@ fn resolve_fit(result: &CandidateResult, report: &RunReport) -> Result<Option<Fi
 /// The candidate that moves `parent` by `keys`, seeded from the parent's
 /// estimates.
 fn derive(
-    id: &str,
-    parent: &Node,
-    keys: &[FeatureKey],
-    space: &Space,
-    options: &ModelsearchOptions,
+    id: &str, parent: &Node, keys: &[FeatureKey], space: &Space, options: &ModelsearchOptions,
 ) -> Result<(Candidate, Structure, Vec<FeatureKey>), String> {
     let mut target = parent.structure;
     for k in keys {
@@ -639,9 +604,7 @@ fn derive(
         &defaults,
         options.iiv_strategy,
     )?;
-    model
-        .apply(ModelEdit::SetStructural(spec))
-        .map_err(|e| format!("{id}: {e}"))?;
+    model.apply(ModelEdit::SetStructural(spec)).map_err(|e| format!("{id}: {e}"))?;
     let mut path = parent.path.clone();
     path.extend_from_slice(keys);
     // An `[odes]` candidate costs one to two orders of magnitude more per fit
@@ -665,9 +628,7 @@ const INPUT_ID: &str = "input";
 
 /// The search proper, over an injected fitter.
 pub(crate) fn search(
-    fitter: &dyn StepFitter,
-    space: Space,
-    options: &ModelsearchOptions,
+    fitter: &dyn StepFitter, space: Space, options: &ModelsearchOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<ModelsearchResult, String> {
     let emit = |event: ModelsearchEvent| {
@@ -686,30 +647,16 @@ pub(crate) fn search(
     // ── the input, and the base when it has to be derived ───────────────
     let derive_base = !space.onto.is_empty();
     let root_id = if derive_base { INPUT_ID } else { "base" };
-    emit(if derive_base {
-        ModelsearchEvent::InputStarted
-    } else {
-        ModelsearchEvent::BaseStarted
-    });
+    emit(if derive_base { ModelsearchEvent::InputStarted } else { ModelsearchEvent::BaseStarted });
     let candidate = Candidate::new(root_id, space.input_model.clone())
         .features(space.input_structure.feature_vector());
     let report = fitter.fit_step(root_id, std::slice::from_ref(&candidate))?;
     notes.extend(report.warnings.iter().cloned());
-    let result = report
-        .results
-        .first()
-        .ok_or("the base model was not fitted")?;
+    let result = report.results.first().ok_or("the base model was not fitted")?;
     if let Some(e) = &result.error {
         return Err(format!("the {root_id} model could not be fitted: {e}"));
     }
-    rows.push(row_of(
-        result,
-        0,
-        None,
-        space.input_structure,
-        vec![],
-        criterion,
-    ));
+    rows.push(row_of(result, 0, None, space.input_structure, vec![], criterion));
     let mut root = Node::from_model(
         root_id,
         space.input_model.clone(),
@@ -725,21 +672,11 @@ pub(crate) fn search(
         let (candidate, structure, path) = derive("base", &root, &space.onto, &space, options)?;
         let report = fitter.fit_step("base", std::slice::from_ref(&candidate))?;
         notes.extend(report.warnings.iter().cloned());
-        let result = report
-            .results
-            .first()
-            .ok_or("the base model was not fitted")?;
+        let result = report.results.first().ok_or("the base model was not fitted")?;
         if let Some(e) = &result.error {
             return Err(format!("the base model could not be fitted: {e}"));
         }
-        rows.push(row_of(
-            result,
-            0,
-            Some(INPUT_ID),
-            structure,
-            path,
-            criterion,
-        ));
+        rows.push(row_of(result, 0, Some(INPUT_ID), structure, path, criterion));
         // The base is the root: its path is empty, since the candidate
         // moves are counted from it (Pharmpy filters the space by the base).
         root = Node::from_model(
@@ -801,10 +738,7 @@ pub(crate) fn search(
                     if let Some(why) = leaf.structure.apply(key).unbuildable() {
                         push_note(
                             &mut notes,
-                            format!(
-                                "not generated: {key} after {}: {why}",
-                                path_label(&leaf.path)
-                            ),
+                            format!("not generated: {key} after {}: {why}", path_label(&leaf.path)),
                         );
                         continue;
                     }
@@ -814,10 +748,7 @@ pub(crate) fn search(
             if planned.is_empty() {
                 break;
             }
-            emit(ModelsearchEvent::LayerStarted {
-                layer,
-                candidates: planned.len(),
-            });
+            emit(ModelsearchEvent::LayerStarted { layer, candidates: planned.len() });
             let mut candidates = Vec::with_capacity(planned.len());
             let mut meta = Vec::with_capacity(planned.len());
             for (i, key) in &planned {
@@ -883,10 +814,7 @@ pub(crate) fn search(
                 target = target.apply(k);
             }
             if let Some(why) = target.unbuildable() {
-                push_note(
-                    &mut notes,
-                    format!("not generated: {}: {why}", path_label(&combo)),
-                );
+                push_note(&mut notes, format!("not generated: {}: {why}", path_label(&combo)));
                 continue;
             }
             let id = new_id();
@@ -895,24 +823,14 @@ pub(crate) fn search(
             meta.push((structure, path));
         }
         if !candidates.is_empty() {
-            emit(ModelsearchEvent::LayerStarted {
-                layer: 1,
-                candidates: candidates.len(),
-            });
+            emit(ModelsearchEvent::LayerStarted { layer: 1, candidates: candidates.len() });
             let report = fitter.fit_step("candidates", &candidates)?;
             notes.extend(report.warnings.iter().cloned());
             for (candidate, (structure, path)) in candidates.iter().zip(meta) {
                 let Some(result) = report.results.iter().find(|r| r.id == candidate.id) else {
                     continue;
                 };
-                rows.push(row_of(
-                    result,
-                    1,
-                    Some(&root.id),
-                    structure,
-                    path,
-                    criterion,
-                ));
+                rows.push(row_of(result, 1, Some(&root.id), structure, path, criterion));
                 store.insert(
                     candidate.id.clone(),
                     (candidate.model.clone(), resolve_fit(result, &report)?),
@@ -929,11 +847,8 @@ pub(crate) fn search(
     }
 
     // ── ranking and selection ────────────────────────────────────────────
-    let base_criterion = rows
-        .iter()
-        .find(|r| r.id == base_id)
-        .filter(|r| r.eligible())
-        .map(|r| r.criterion);
+    let base_criterion =
+        rows.iter().find(|r| r.id == base_id).filter(|r| r.eligible()).map(|r| r.criterion);
     for row in &mut rows {
         row.d_criterion = match (base_criterion, row.criterion.is_finite()) {
             (Some(b), true) => Some(row.criterion - b),
@@ -968,13 +883,9 @@ pub(crate) fn search(
     if !rows[winner].eligible() {
         notes.push("no model passed the strictness gate; the final model is the base".into());
     }
-    let models: BTreeMap<String, ModelText> = store
-        .iter()
-        .map(|(id, (text, _))| (id.clone(), text.clone()))
-        .collect();
-    let (final_model, final_fit) = store
-        .remove(&final_id)
-        .expect("every fitted model is stored");
+    let models: BTreeMap<String, ModelText> =
+        store.iter().map(|(id, (text, _))| (id.clone(), text.clone())).collect();
+    let (final_model, final_fit) = store.remove(&final_id).expect("every fitted model is stored");
     Ok(ModelsearchResult {
         options: options.clone(),
         criterion,
@@ -1003,20 +914,13 @@ fn path_label(path: &[FeatureKey]) -> String {
     if path.is_empty() {
         "the base".to_string()
     } else {
-        path.iter()
-            .map(|k| k.to_string())
-            .collect::<Vec<_>>()
-            .join(" → ")
+        path.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(" → ")
     }
 }
 
 fn row_of(
-    result: &CandidateResult,
-    layer: usize,
-    parent: Option<&str>,
-    structure: Structure,
-    path: Vec<FeatureKey>,
-    criterion: Criterion,
+    result: &CandidateResult, layer: usize, parent: Option<&str>, structure: Structure,
+    path: Vec<FeatureKey>, criterion: Criterion,
 ) -> ModelRow {
     ModelRow {
         id: result.id.clone(),
@@ -1050,11 +954,8 @@ fn row_of(
 /// only for groups every member of which still has a move, as Pharmpy adds
 /// a collector node only there. Returns the ids that continue.
 fn collapse(children: &[Node], funcs: &[FeatureKey]) -> Vec<String> {
-    let has_action = |n: &Node| {
-        funcs
-            .iter()
-            .any(|k| structure::allowed(k, &n.path, funcs, &n.structure))
-    };
+    let has_action =
+        |n: &Node| funcs.iter().any(|k| structure::allowed(k, &n.path, funcs, &n.structure));
     let mut kept: Vec<String> = Vec::new();
     let mut grouped: Vec<bool> = vec![false; children.len()];
     for i in 0..children.len() {
@@ -1080,12 +981,7 @@ fn collapse(children: &[Node], funcs: &[FeatureKey]) -> Vec<String> {
                 .copied()
                 .filter(|j| !eligible_only || children[*j].passed)
                 .filter(|j| children[*j].ofv.is_some_and(f64::is_finite))
-                .min_by(|a, b| {
-                    children[*a]
-                        .ofv
-                        .unwrap()
-                        .total_cmp(&children[*b].ofv.unwrap())
-                })
+                .min_by(|a, b| children[*a].ofv.unwrap().total_cmp(&children[*b].ofv.unwrap()))
         };
         let chosen = best(true).or_else(|| best(false)).unwrap_or(group[0]);
         kept.push(children[chosen].id.clone());
@@ -1106,10 +1002,7 @@ fn feature_set(path: &[FeatureKey]) -> Vec<(&'static str, String)> {
 fn combinations(funcs: &[FeatureKey], base: &Structure) -> Vec<Vec<FeatureKey>> {
     let mut groups: Vec<Vec<FeatureKey>> = Vec::new();
     for key in funcs {
-        match groups
-            .iter_mut()
-            .find(|g| g[0].category() == key.category())
-        {
+        match groups.iter_mut().find(|g| g[0].category() == key.category()) {
             Some(g) => g.push(*key),
             None => groups.push(vec![*key]),
         }

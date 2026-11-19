@@ -77,12 +77,7 @@ pub struct ElboConfig {
 
 impl Default for ElboConfig {
     fn default() -> Self {
-        Self {
-            n_mc_samples: 3,
-            eta_grad: EtaGradMode::default(),
-            kl: KlMode::default(),
-            seed: 0,
-        }
+        Self { n_mc_samples: 3, eta_grad: EtaGradMode::default(), kl: KlMode::default(), seed: 0 }
     }
 }
 
@@ -204,9 +199,7 @@ impl<'a> From<&'a dyn VariationalFamily> for Families<'a> {
 /// structural zeros — `η` and `κ` are independent by construction, as are two distinct
 /// occasions — and must never pick up a covariance the model does not declare.
 pub fn stacked_prior(
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    k_occasions: usize,
+    omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>, k_occasions: usize,
 ) -> OmegaMatrix {
     let Some(iov) = omega_iov else {
         return omega.clone();
@@ -242,11 +235,7 @@ pub fn stacked_prior(
     let mut names = omega.eta_names.clone();
     for g in 0..k_occasions {
         for k in 0..n_kappa {
-            let base = iov
-                .eta_names
-                .get(k)
-                .cloned()
-                .unwrap_or_else(|| format!("KAPPA{k}"));
+            let base = iov.eta_names.get(k).cloned().unwrap_or_else(|| format!("KAPPA{k}"));
             names.push(format!("{base}@{}", g + 1));
         }
     }
@@ -297,11 +286,7 @@ pub fn unsupported_data_term_reason(model: &CompiledModel) -> Option<String> {
 /// them would drift silently the moment the provider's scope changed. A probe
 /// cannot drift.
 pub fn analytic_eta_grad_available(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    omega: &OmegaMatrix,
-    sigma: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], omega: &OmegaMatrix, sigma: &[f64],
 ) -> bool {
     let eta = vec![0.0; model.n_eta];
     analytic_eta_nll_gradient(model, subject, theta, &eta, omega, sigma).is_some()
@@ -375,14 +360,8 @@ fn crn_eps(seed: u64, iter: u64, subject: usize, sample: usize, d: usize) -> Vec
 /// value uses.
 #[allow(clippy::too_many_arguments)]
 fn fd_eta_data_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    z: &[f64],
-    _kappas: &[Vec<f64>],
-    k_occasions: usize,
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], z: &[f64],
+    _kappas: &[Vec<f64>], k_occasions: usize, scratch: &mut EventPkParams,
 ) -> Vec<f64> {
     let n_eta = model.n_eta;
     let n_kappa = model.n_kappa;
@@ -428,17 +407,9 @@ fn fd_eta_data_grad(
 /// would pull every `μᵢ` toward zero.
 #[allow(clippy::too_many_arguments)]
 fn eta_data_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    params: &ModelParameters,
-    stacked_prior: &OmegaMatrix,
-    sigma: &[f64],
-    z: &[f64],
-    kappas: &[Vec<f64>],
-    k_occasions: usize,
-    mode: EtaGradMode,
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], params: &ModelParameters,
+    stacked_prior: &OmegaMatrix, sigma: &[f64], z: &[f64], kappas: &[Vec<f64>], k_occasions: usize,
+    mode: EtaGradMode, scratch: &mut EventPkParams,
 ) -> (Vec<f64>, bool) {
     let iov = k_occasions > 0 && model.n_kappa > 0;
     if mode != EtaGradMode::Fd {
@@ -453,10 +424,7 @@ fn eta_data_grad(
                 theta,
                 z,
                 &params.omega,
-                params
-                    .omega_iov
-                    .as_ref()
-                    .expect("an IOV subject implies an Omega_iov"),
+                params.omega_iov.as_ref().expect("an IOV subject implies an Omega_iov"),
                 sigma,
                 model.ruv_obs_mult(subject, theta).as_deref(),
             )
@@ -486,19 +454,7 @@ fn eta_data_grad(
     // for or fallen back to — `n_fd_subjects` reports what actually happened.
     // In `Analytic` mode FD is never *requested*, so a `true` there can only mean
     // the provider declined, which is what the caller turns into an error.
-    (
-        fd_eta_data_grad(
-            model,
-            subject,
-            theta,
-            sigma,
-            z,
-            kappas,
-            k_occasions,
-            scratch,
-        ),
-        true,
-    )
+    (fd_eta_data_grad(model, subject, theta, sigma, z, kappas, k_occasions, scratch), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -547,10 +503,7 @@ struct McKlDraw {
 /// design. The `θ`, `σ` and `Ω` blocks are unaffected and remain exactly FD-checkable
 /// — see `mc_kl_grad_x_matches_fd_but_phi_is_path_derivative`.
 fn mc_kl_draw(
-    family: &dyn VariationalFamily,
-    phi: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
+    family: &dyn VariationalFamily, phi: &[f64], eta: &[f64], omega: &OmegaMatrix,
 ) -> McKlDraw {
     let d = eta.len();
     let eta_v = DVector::from_column_slice(eta);
@@ -564,11 +517,7 @@ fn mc_kl_draw(
     let d_eta = (0..d).map(|k| d_log_q[k] + oinv_eta[k]).collect();
     let d_omega = (&omega.inv - &oinv_eta * oinv_eta.transpose()) * 0.5;
 
-    McKlDraw {
-        integrand: log_q + neg_log_p,
-        d_eta,
-        d_omega,
-    }
+    McKlDraw { integrand: log_q + neg_log_p, d_eta, d_omega }
 }
 
 /// Packed-space bounds marking FIXed coordinates, in the `[log θ | log σ]` layout
@@ -577,9 +526,8 @@ fn mc_kl_draw(
 fn theta_sigma_masks(template: &ModelParameters) -> (Vec<bool>, Vec<f64>, Vec<f64>) {
     let n_theta = template.theta.len();
     let n_sigma = template.sigma.values.len();
-    let log_mask: Vec<bool> = (0..n_theta)
-        .map(|i| theta_packs_log(template.theta_lower[i]))
-        .collect();
+    let log_mask: Vec<bool> =
+        (0..n_theta).map(|i| theta_packs_log(template.theta_lower[i])).collect();
 
     let mut lower = Vec::with_capacity(n_theta + n_sigma);
     let mut upper = Vec::with_capacity(n_theta + n_sigma);
@@ -631,10 +579,7 @@ fn theta_sigma_masks(template: &ModelParameters) -> (Vec<bool>, Vec<f64>, Vec<f6
 /// `vi_omega_update = closed_form` route does not inherit it — [`closed_form_omega`]
 /// restores FIXed entries in `Ω` space directly, where the restoration is exact.
 fn chain_omega_grad(
-    d_omega: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    tmpl_block: &OmegaMatrix,
-    fixed: &[bool],
+    d_omega: &DMatrix<f64>, omega: &OmegaMatrix, tmpl_block: &OmegaMatrix, fixed: &[bool],
     out: &mut [f64],
 ) {
     let n = omega.dim();
@@ -665,10 +610,7 @@ pub(crate) fn subject_k_occasions(model: &CompiledModel, subject: &Subject) -> u
 ///
 /// Returns an empty `kappas` for a non-IOV model, so callers can branch on that alone.
 fn split_stacked(
-    z: &[f64],
-    n_eta: usize,
-    n_kappa: usize,
-    k_occasions: usize,
+    z: &[f64], n_eta: usize, n_kappa: usize, k_occasions: usize,
 ) -> (&[f64], Vec<Vec<f64>>) {
     if n_kappa == 0 || k_occasions == 0 {
         return (z, Vec::new());
@@ -685,18 +627,9 @@ fn split_stacked(
 /// One subject's contribution to `−ELBO` and its gradients.
 #[allow(clippy::too_many_arguments)]
 fn subject_terms(
-    model: &CompiledModel,
-    subject: &Subject,
-    subject_idx: usize,
-    params: &ModelParameters,
-    family: &dyn VariationalFamily,
-    phi: &[f64],
-    cfg: &ElboConfig,
-    iter: u64,
-    log_mask: &[bool],
-    lower: &[f64],
-    upper: &[f64],
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, subject_idx: usize, params: &ModelParameters,
+    family: &dyn VariationalFamily, phi: &[f64], cfg: &ElboConfig, iter: u64, log_mask: &[bool],
+    lower: &[f64], upper: &[f64], scratch: &mut EventPkParams,
 ) -> Result<SubjectTerms, String> {
     let n_theta = params.theta.len();
     let n_sigma = params.sigma.values.len();
@@ -854,23 +787,15 @@ fn subject_terms(
 /// objective depend on the rayon worker count (#703).
 #[allow(clippy::too_many_arguments)]
 pub fn population_neg_elbo(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    families: Families<'_>,
-    phis: &[Vec<f64>],
-    cfg: &ElboConfig,
-    iter: u64,
+    model: &CompiledModel, population: &Population, template: &ModelParameters, x: &[f64],
+    families: Families<'_>, phis: &[Vec<f64>], cfg: &ElboConfig, iter: u64,
 ) -> Result<ElboEval, String> {
     let params = unpack_params(x, template);
     let layout = PackedLayout::new(template);
     let (log_mask, lower, upper) = theta_sigma_masks(template);
 
-    let per_subj: Vec<Result<SubjectTerms, String>> = crate::par::map_init(
-        population.subjects.len(),
-        EventPkParams::default,
-        |scratch, i| {
+    let per_subj: Vec<Result<SubjectTerms, String>> =
+        crate::par::map_init(population.subjects.len(), EventPkParams::default, |scratch, i| {
             let subject = &population.subjects[i];
             subject_terms(
                 model,
@@ -886,8 +811,7 @@ pub fn population_neg_elbo(
                 &upper,
                 scratch,
             )
-        },
-    );
+        });
 
     let mut eval = ElboEval {
         neg_elbo: 0.0,
@@ -1032,10 +956,7 @@ fn finalize_omega_block(mut acc: DMatrix<f64>, tmpl: &OmegaMatrix, fixed: &[bool
 /// `k_occasions[i]` is subject `i`'s occasion count (0 without IOV). Returns `None` for
 /// the IOV block when the model declares no `kappa`.
 pub fn closed_form_omega(
-    families: Families<'_>,
-    phis: &[Vec<f64>],
-    k_occasions: &[usize],
-    template: &ModelParameters,
+    families: Families<'_>, phis: &[Vec<f64>], k_occasions: &[usize], template: &ModelParameters,
 ) -> (OmegaMatrix, Option<OmegaMatrix>) {
     let n_eta = template.omega.dim();
     let mut acc = DMatrix::<f64>::zeros(n_eta, n_eta);
@@ -1091,8 +1012,7 @@ pub fn closed_form_omega(
 /// principle as the KL fallback — a scope gap must fail loudly, not silently
 /// produce a `σ` from a formula that does not apply to the model in hand.
 pub fn closed_form_sigma_support(
-    model: &CompiledModel,
-    template: &ModelParameters,
+    model: &CompiledModel, template: &ModelParameters,
 ) -> Result<usize, String> {
     // The error structure is checked *before* the σ count, so the reason a user is given
     // is the one that explains their model: a combined model necessarily declares two σ,
@@ -1101,11 +1021,9 @@ pub fn closed_form_sigma_support(
     match model.error_spec {
         ErrorSpec::Single(ErrorModel::Additive) | ErrorSpec::Single(ErrorModel::Proportional) => {}
         ErrorSpec::Single(ErrorModel::Combined | ErrorModel::LogCombined) => {
-            return Err(
-                "the combined error model couples two σ in one variance, which has no \
+            return Err("the combined error model couples two σ in one variance, which has no \
                  scalar stationary point"
-                    .to_string(),
-            );
+                .to_string());
         }
         // Per-endpoint and covariate-selected error models each carry their own
         // σ set, so the single-scalar derivation does not describe them.
@@ -1135,7 +1053,7 @@ pub fn closed_form_sigma_support(
     }
     if matches!(model.bloq_in_force(), BloqMethod::M3) {
         return Err(
-            "M3 BLOQ adds a censored log-CDF term in which σ has no closed form".to_string(),
+            "M3 BLOQ adds a censored log-CDF term in which σ has no closed form".to_string()
         );
     }
     if model.residual_error_eta.is_some() {
@@ -1288,12 +1206,8 @@ impl ElboTightness {
 /// makes `n_mc_samples` times per subject per iteration — so running it once at
 /// the end is free relative to the fit.
 pub(crate) fn elbo_tightness(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    sampled_data_term: f64,
-    eta_means: &[Vec<f64>],
-    kappa_means: &[Vec<Vec<f64>>],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    sampled_data_term: f64, eta_means: &[Vec<f64>], kappa_means: &[Vec<Vec<f64>>],
 ) -> ElboTightness {
     let n_eta = params.omega.dim();
     let mut at_means = 0.0;
@@ -1331,8 +1245,5 @@ pub(crate) fn elbo_tightness(
         expected += 0.5 * (n_eta + kappas.len() * model.n_kappa) as f64;
     }
 
-    ElboTightness {
-        excess: sampled_data_term - at_means,
-        expected,
-    }
+    ElboTightness { excess: sampled_data_term - at_means, expected }
 }

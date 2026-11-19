@@ -88,7 +88,7 @@
 2 lib:iovsearch_cmd
 2 lib:pk::analytical_absorption
 2 lib:pk::three_compartment
-1 lib:api::pool
+1 lib:pool
 1 lib:estimation::run_sir::from_fit_bindings
 1 lib:parser::model_parser
 1 lib:tests
