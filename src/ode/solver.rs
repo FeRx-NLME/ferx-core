@@ -3620,19 +3620,6 @@ impl SolverStatsScope {
     pub(crate) fn collected(&self) -> OdeSolverStats {
         STATS_SINK.with(|c| c.get()).unwrap_or_default()
     }
-
-    /// End this scope and add what it collected to the enclosing scope, if one is active.
-    ///
-    /// A plain drop restores the enclosing total unchanged, which is right for a pass whose
-    /// result is thrown away, and wrong for one whose result is kept: the enclosing scope
-    /// would then vouch for integrations it never saw (#2994 review r4).
-    pub(crate) fn fold_into_outer(mut self) {
-        let inner = self.collected();
-        if let Some(mut outer) = self.prev.take() {
-            outer.merge(&inner);
-            self.prev = Some(outer);
-        }
-    }
 }
 
 impl Drop for SolverStatsScope {
@@ -5574,35 +5561,6 @@ mod tests {
             after_one.attempted_steps * 2
         );
         drop(outer);
-        assert!(!stats_sink_active());
-    }
-
-    /// `fold_into_outer` hands the inner scope's counters to the enclosing one, where a plain
-    /// drop (above) restores it unchanged; with no enclosing scope it leaves nothing set
-    /// (#2994 review r4).
-    #[test]
-    fn a_folded_scope_adds_its_counters_to_the_enclosing_one() {
-        let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -0.1 * u[0];
-        let opts = OdeSolverOptions::default();
-        let solve = || {
-            solve_ode(&rhs, &[1.0], (0.0, 10.0), &[], &[10.0], &opts);
-        };
-        let outer = SolverStatsScope::enter();
-        solve();
-        let before = outer.collected();
-        let inner = SolverStatsScope::enter();
-        solve();
-        let seen = inner.collected();
-        assert!(seen.attempted_steps > 0);
-        inner.fold_into_outer();
-        let mut want = before;
-        want.merge(&seen);
-        assert_eq!(outer.collected(), want);
-        drop(outer);
-
-        let alone = SolverStatsScope::enter();
-        solve();
-        alone.fold_into_outer();
         assert!(!stats_sink_active());
     }
 

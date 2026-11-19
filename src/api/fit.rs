@@ -3501,17 +3501,10 @@ fn fit_inner(
     // both are out of scope.
     {
         use crate::estimation::ode_tolerance_check as otc;
-        let stage = match objective_stage_opts {
-            Some(ref owner) if owner.method == objective_stage => owner.clone(),
-            // No recorded owner: the post-fit options with the owner's method, its
-            // interaction resolved for that method rather than for `final_method`.
-            _ => FitOptions {
-                method: objective_stage,
-                interaction: crate::types::interaction_for(objective_stage, options.interaction),
-                ..options.clone()
-            },
-        };
-        if result.mixture_posteriors.is_none() && otc::method_in_scope(stage.method) {
+        // The owner's options are recorded by every stage this check can re-score; an
+        // `imp_eval_only` owner records none and is out of scope anyway.
+        let stage = objective_stage_opts.filter(|o| otc::method_in_scope(o.method));
+        if let (Some(stage), None) = (stage, &result.mixture_posteriors) {
             match otc::ofv_tolerance_shift(
                 model,
                 population,

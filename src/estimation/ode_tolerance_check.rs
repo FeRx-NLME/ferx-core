@@ -140,12 +140,15 @@ pub(crate) fn tightened_override(
     })
 }
 
-/// Whether the tight pass's kept trajectories were integrated, not padded (#2994 review r2):
-/// no segment left unfinished, stiff-aborted or diverged, no step force-accepted at `min_dt`,
-/// no timeline abandoned. Each of those returns a finite trajectory (or a sentinel-clamped
-/// objective) that never met the tighter tolerance, so a small shift from it would read as a
-/// settled objective. An `auto` attempt the guard discarded and re-solved cleanly does not
-/// count. `None` when clean, else the counters that were not, for the warning.
+/// Whether the trajectories a re-scored pass **kept** were integrated, not padded (#2994
+/// review r2): no segment left unfinished and no step force-accepted at `min_dt`. Either
+/// returns a finite trajectory (or a sentinel-clamped objective) that never met the tolerance,
+/// so a small shift from it would read as a settled objective. A stiff-aborted or diverged
+/// segment is an unfinished one, so it is caught here too; an `auto` attempt the guard
+/// discarded and re-solved cleanly does not count. The same two counters
+/// `with_fd_jacobian_integration` accepts its tight pass on, so a finite-difference `H` the
+/// pass kept is clean by this test by construction and needs no separate accounting. `None`
+/// when clean, else the counters that were not, for the warning.
 pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Option<String> {
     let parts: Vec<String> = [
         (
@@ -153,12 +156,6 @@ pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Op
             "steps clamped at the minimum step size",
         ),
         (st.kept_unfinished_segments(), "unfinished segments"),
-        (st.stiff_aborted_segments, "stiff-aborted segments"),
-        (st.diverged_segments, "diverged segments"),
-        (
-            st.abandoned_non_finite_timeline,
-            "abandoned non-finite timelines",
-        ),
     ]
     .into_iter()
     .filter(|(n, _)| *n > 0)
@@ -172,11 +169,12 @@ pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Op
 /// when the result cannot be trusted (#2994 review r2, r3):
 ///
 /// * **an integration behind it was not clean** ([`unclean_integration`]). Every integration
-///   that forms a subject's term — the EBE search, its `H` (finite-difference Jacobian or
-///   exact jets), every AGQ node — is counted, because each subject is solved *and* scored in
-///   one task under one [`crate::ode::solver::SolverStatsScope`]. The scope is per thread, and
-///   a subject's solve and score fan out over nothing but that subject, so the task's thread
-///   runs all of it;
+///   that forms a subject's term — the EBE search, its `H`, every AGQ node — is counted,
+///   because each subject is solved *and* scored in one task under one
+///   [`crate::ode::solver::SolverStatsScope`]. The scope is per thread, and a subject's solve
+///   and score fan out over nothing but that subject, so the task's thread runs all of it. A
+///   finite-difference `H` whose tighter pass was kept is the one integration the scope does
+///   not see, and it is clean by the same test ([`unclean_integration`]);
 /// * **the EBE pass fails the production guard** ([`ebe_guard_rejects`]): a start the inner
 ///   loop hard-rejected (its η̂ / `H` are placeholders), or more unconverged subjects than
 ///   `max_unconverged_frac` allows. Such a pass is rejected by every objective evaluation

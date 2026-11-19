@@ -438,8 +438,8 @@ Scope and limits:
 - A re-scored objective is used only if it can be trusted. The fit carries
   `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, naming every reason, when the tighter solve
   cannot be set up (its worker pool cannot be built), or when either side has
-  - an integration that is not clean: a step forced at the minimum step size, a segment
-    left unfinished, stiff-aborted or diverged, or an abandoned timeline. Every integration
+  - an integration that is not clean: a step forced at the minimum step size, or a segment
+    left unfinished (which includes stiff-aborted and diverged ones). Every integration
     behind the objective is counted, including the EBE search, `H` and each AGQ node, not
     only the prediction at the mode;
   - or EBEs that fail the fit's own convergence guard: a subject hard-rejected at its

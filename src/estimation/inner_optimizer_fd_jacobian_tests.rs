@@ -444,57 +444,6 @@ fn a_truncated_but_finite_tight_jacobian_is_redone() {
     assert_ne!(h, truncated, "the truncated pass must not be returned");
 }
 
-/// #2994 review r4: an enclosing solver-stats scope sees the integrations behind the `H` that
-/// is kept — the tight pass when it is clean, only the redo when it is not. The tight pass
-/// runs under its own nested scope to judge itself, and a plain drop of that would hide it.
-#[test]
-fn an_enclosing_scope_counts_the_kept_jacobians_integrations_only() {
-    let model = chain_model();
-    let spec = model.ode_spec.as_ref().unwrap();
-    let fit_reltol = spec.effective_solver_opts().reltol;
-    let pop = chain_population(1);
-    let s = &pop.subjects[0];
-    let theta = &model.default_params.theta;
-    let eta = eta_of(0);
-    let mut scratch = pk::EventPkParams::default();
-    let predict = |scratch: &mut pk::EventPkParams| {
-        pk::compute_predictions_with_tv_into_with_schedule(&model, s, theta, &eta, scratch, None)
-    };
-
-    // Kept tight pass: the enclosing scope counts it.
-    let outer = crate::ode::solver::SolverStatsScope::enter();
-    let mut tight_steps = 0;
-    with_fd_jacobian_integration(&model, |_| {
-        let inner = crate::ode::solver::SolverStatsScope::enter();
-        let preds = predict(&mut scratch);
-        tight_steps = inner.collected().accepted_steps;
-        inner.fold_into_outer();
-        DMatrix::from_vec(preds.len(), 1, preds)
-    });
-    assert!(tight_steps > 0);
-    assert_eq!(outer.collected().accepted_steps, tight_steps);
-    drop(outer);
-
-    // Discarded tight pass: only the redo at the fit's tolerance is counted.
-    let fit_steps = {
-        let alone = crate::ode::solver::SolverStatsScope::enter();
-        predict(&mut scratch);
-        alone.collected().accepted_steps
-    };
-    let outer = crate::ode::solver::SolverStatsScope::enter();
-    with_fd_jacobian_integration(&model, |_| {
-        let preds = predict(&mut scratch);
-        let tight = spec.effective_solver_opts().reltol < fit_reltol;
-        let v = if tight { f64::NAN } else { 1.0 };
-        DMatrix::from_element(preds.len(), 1, v)
-    });
-    assert_eq!(outer.collected().accepted_steps, fit_steps);
-    assert!(
-        tight_steps > fit_steps,
-        "fixture: the tight pass takes more steps"
-    );
-}
-
 /// A chain model pinned where its fit-tolerance solves fit the step budget and the Jacobian's
 /// tighter ones do not, on a stepper whose steps grow fastest with tolerance.
 fn budget_starved_chain() -> CompiledModel {

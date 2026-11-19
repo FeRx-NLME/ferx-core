@@ -41,11 +41,10 @@ use std::path::{Path, PathBuf};
 const ALLOWED: &[(&str, usize, &str)] = &[
     (
         "src/api/fit.rs",
-        9,
+        8,
         "the stage loop resolves `stage_opts.interaction` through `interaction_for`; the \
          `post_opts` shadow resolves it for the post-fit block, so every later \
-         `options.interaction` there is the resolved flag; the ODE-tolerance check's \
-         fallback stage re-resolves it for the owning stage's method (#2994)",
+         `options.interaction` there is the resolved flag",
     ),
     (
         "src/api/postfit.rs",
@@ -99,8 +98,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "src/estimation/ode_tolerance_check.rs",
         1,
         "the settlement check (#2994) scores under the options of the stage that owns the \
-         published OFV: the stage loop's `stage_opts` (resolved through `interaction_for`), \
-         or `fit`'s fallback, which resolves it for that stage's method",
+         published OFV: the stage loop's `stage_opts`, resolved through `interaction_for`",
     ),
     (
         "src/estimation/outer_optimizer.rs",

@@ -8383,9 +8383,6 @@ fn with_fd_jacobian_integration(
         let met_tolerance =
             solved.kept_unfinished_segments() == 0 && solved.kept_clamped_steps() == 0;
         if met_tolerance && h.iter().all(|v| v.is_finite()) {
-            // The kept `H` is built from these integrations: an enclosing scope (the #2994
-            // settlement check's per-subject health) must see them.
-            stats.fold_into_outer();
             return h;
         }
         FD_H_REDONE.with(|c| c.set(c.get() + 1));

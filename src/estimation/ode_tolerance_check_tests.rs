@@ -199,6 +199,50 @@ fn fit_warns_when_the_ofv_moves_at_a_tighter_tolerance_and_not_when_settled() {
     );
 }
 
+/// A Monte-Carlo estimator owning the published OFV is out of scope: it reports an objective
+/// `pop_nll_opts` does not compute, so comparing against it would blame the estimator's own
+/// noise on the ODE tolerance. A differential pair: the same model and tolerance warn under
+/// FOCEI (the gate's other side), and stay silent under an estimating IMP stage.
+#[test]
+fn an_objective_owned_by_a_monte_carlo_estimator_is_not_checked() {
+    let prep = mm_iv();
+    let at = |method: EstimationMethod| {
+        let opts = FitOptions {
+            verbose: false,
+            method,
+            methods: vec![method],
+            outer_maxiter: 0,
+            imp_iterations: 1,
+            run_covariance_step: false,
+            ode_reltol: 1e-3,
+            ode_abstol: 1e-3,
+            ode_method: crate::ode::OdeMethod::Rk45,
+            ..prep.parsed.fit_options.clone()
+        };
+        crate::fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+        )
+        .expect("the fit runs")
+    };
+    let focei = at(EstimationMethod::FoceI);
+    assert!(
+        not_settled(&focei).is_some(),
+        "fixture: FOCEI at 1e-3 warns: {:?}",
+        focei.warnings
+    );
+    let imp = at(EstimationMethod::Imp);
+    assert!(
+        !imp.warnings
+            .iter()
+            .any(|w| w.starts_with("W_ODE_OFV_NOT_SETTLED:") || w.starts_with(NOT_CHECKED_TOKEN)),
+        "an IMP-owned OFV was checked: {:?}",
+        imp.warnings
+    );
+}
+
 fn details_of(r: &crate::types::FitResult) -> Option<&serde_json::Value> {
     r.warnings_structured
         .iter()
@@ -311,8 +355,8 @@ fn a_check_that_could_not_run_is_reported_not_silent() {
     assert_eq!(classified.severity, WarningSeverity::Warning);
 }
 
-/// Each counter that marks a padded or abandoned trajectory makes the tight pass unclean, by
-/// name; a clamp or stop in an `auto` attempt the guard discarded does not.
+/// A kept clamp or a kept unfinished segment makes a pass unclean, by name; a clamp or stop in
+/// an `auto` attempt the guard discarded does not.
 #[test]
 fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
     use crate::ode::solver::OdeSolverStats;
@@ -346,25 +390,15 @@ fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
             "1 unfinished segments",
         ),
         (
+            // A stiff-aborted or diverged segment is an unfinished one too (the driver counts
+            // it in both), so it is reported by the roll-up.
             OdeSolverStats {
-                stiff_aborted_segments: 5,
-                ..Default::default()
-            },
-            "5 stiff-aborted segments",
-        ),
-        (
-            OdeSolverStats {
+                unfinished_segments: 3,
+                stiff_aborted_segments: 2,
                 diverged_segments: 1,
                 ..Default::default()
             },
-            "1 diverged segments",
-        ),
-        (
-            OdeSolverStats {
-                abandoned_non_finite_timeline: 2,
-                ..Default::default()
-            },
-            "2 abandoned non-finite timelines",
+            "3 unfinished segments",
         ),
     ] {
         assert_eq!(unclean_integration(&st).as_deref(), Some(want));
