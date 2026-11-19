@@ -54,16 +54,10 @@ fn the_finite_shift_message_states_the_tolerances_the_shift_and_the_remedy() {
 #[test]
 fn the_non_finite_message_says_the_check_could_not_measure() {
     let msg = not_settled_warning(&shift(-100.0, f64::NAN)).expect("a NaN side warns");
-    assert!(
-        msg.contains("gives a non-finite objective (-100.0000 -> NaN)"),
-        "{msg}"
-    );
+    assert!(msg.contains("gives a non-finite objective (-100.0000 -> NaN)"), "{msg}");
     assert!(msg.contains("could not be measured"), "{msg}");
     assert!(!msg.contains("moves the OFV"), "{msg}");
-    assert!(
-        msg.contains("Refit with ode_reltol / ode_abstol at most"),
-        "{msg}"
-    );
+    assert!(msg.contains("Refit with ode_reltol / ode_abstol at most"), "{msg}");
     let classified = crate::types::classify_warning(&msg);
     assert_eq!(classified.category, WarningCode::OdeSolver);
 }
@@ -90,10 +84,7 @@ fn the_override_tightens_one_decade_and_keeps_the_callers_method() {
     let prep = mm_iv();
     let model = &prep.parsed.model;
     let base = model.integrator_spec().unwrap().effective_solver_opts();
-    let opts = FitOptions {
-        ode_method: crate::ode::OdeMethod::Rodas5P,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { ode_method: crate::ode::OdeMethod::Rodas5P, ..FitOptions::default() };
     let o = tightened_override(model, &opts).expect("an ODE model at the default is checked");
     assert_eq!(o.reltol, Some(base.reltol * 0.1));
     assert_eq!(o.abstol, Some(base.abstol * 0.1));
@@ -141,19 +132,12 @@ fn evaluate(prep: &crate::api::PreparedRun, tol: f64) -> crate::types::FitResult
         ode_method: crate::ode::OdeMethod::Rk45,
         ..prep.parsed.fit_options.clone()
     };
-    crate::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("the evaluation runs")
+    crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("the evaluation runs")
 }
 
 fn not_settled(r: &crate::types::FitResult) -> Option<&String> {
-    r.warnings
-        .iter()
-        .find(|w| w.starts_with("W_ODE_OFV_NOT_SETTLED:"))
+    r.warnings.iter().find(|w| w.starts_with("W_ODE_OFV_NOT_SETTLED:"))
 }
 
 /// End to end, a differential pair straddling the gate: the same evaluation at a tolerance
@@ -192,11 +176,7 @@ fn fit_warns_when_the_ofv_moves_at_a_tighter_tolerance_and_not_when_settled() {
     );
 
     let tight = evaluate(&prep, 1e-10);
-    assert!(
-        not_settled(&tight).is_none(),
-        "a settled objective warned: {:?}",
-        tight.warnings
-    );
+    assert!(not_settled(&tight).is_none(), "a settled objective warned: {:?}", tight.warnings);
 }
 
 /// A Monte-Carlo estimator owning the published OFV is out of scope: it reports an objective
@@ -219,20 +199,11 @@ fn an_objective_owned_by_a_monte_carlo_estimator_is_not_checked() {
             ode_method: crate::ode::OdeMethod::Rk45,
             ..prep.parsed.fit_options.clone()
         };
-        crate::fit(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &opts,
-        )
-        .expect("the fit runs")
+        crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+            .expect("the fit runs")
     };
     let focei = at(EstimationMethod::FoceI);
-    assert!(
-        not_settled(&focei).is_some(),
-        "fixture: FOCEI at 1e-3 warns: {:?}",
-        focei.warnings
-    );
+    assert!(not_settled(&focei).is_some(), "fixture: FOCEI at 1e-3 warns: {:?}", focei.warnings);
     let imp = at(EstimationMethod::Imp);
     assert!(
         !imp.warnings
@@ -251,9 +222,7 @@ fn details_of(r: &crate::types::FitResult) -> Option<&serde_json::Value> {
 }
 
 fn chain(
-    prep: &crate::api::PreparedRun,
-    methods: Vec<EstimationMethod>,
-    tol: f64,
+    prep: &crate::api::PreparedRun, methods: Vec<EstimationMethod>, tol: f64,
 ) -> crate::types::FitResult {
     let opts = FitOptions {
         verbose: false,
@@ -267,13 +236,8 @@ fn chain(
         ode_method: crate::ode::OdeMethod::Rk45,
         ..prep.parsed.fit_options.clone()
     };
-    crate::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("the chain runs")
+    crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("the chain runs")
 }
 
 /// #2994 review r1: a trailing `agq_eval_only` readout publishes its own quadrature marginal
@@ -284,11 +248,7 @@ fn chain(
 #[test]
 fn an_agq_readout_is_checked_on_the_objective_it_publishes() {
     let prep = mm_iv();
-    let readout = chain(
-        &prep,
-        vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
-        1e-3,
-    );
+    let readout = chain(&prep, vec![EstimationMethod::FoceI, EstimationMethod::Laplace], 1e-3);
     let focei = chain(&prep, vec![EstimationMethod::FoceI], 1e-3);
     let gap = (readout.ofv - focei.ofv).abs();
     assert!(
@@ -314,11 +274,7 @@ fn an_agq_readout_is_checked_on_the_objective_it_publishes() {
 #[test]
 fn a_vi_fit_finished_by_an_agq_readout_is_checked() {
     let prep = mm_iv();
-    let r = chain(
-        &prep,
-        vec![EstimationMethod::Vi, EstimationMethod::Laplace],
-        1e-3,
-    );
+    let r = chain(&prep, vec![EstimationMethod::Vi, EstimationMethod::Laplace], 1e-3);
     let d =
         details_of(&r).unwrap_or_else(|| panic!("no W_ODE_OFV_NOT_SETTLED in {:?}", r.warnings));
     let fit_ofv = d["fit_ofv"].as_f64().expect("finite");
@@ -346,10 +302,7 @@ fn a_check_that_could_not_run_is_reported_not_silent() {
     let (_, entry) = crate::api::postfit::ode_ofv_not_checked_warning("pool build failed");
     assert_eq!(entry.category, WarningCode::OdeSolver);
     assert_eq!(entry.severity, WarningSeverity::Warning);
-    assert_eq!(
-        entry.details.as_ref().unwrap()["reason"],
-        "pool build failed"
-    );
+    assert_eq!(entry.details.as_ref().unwrap()["reason"], "pool build failed");
     let classified = crate::types::classify_warning(&msg);
     assert_eq!(classified.category, WarningCode::OdeSolver);
     assert_eq!(classified.severity, WarningSeverity::Warning);
@@ -368,11 +321,7 @@ fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
         discarded_unfinished_segments: 2,
         ..Default::default()
     };
-    assert_eq!(
-        unclean_integration(&discarded),
-        None,
-        "discarded attempts were re-solved"
-    );
+    assert_eq!(unclean_integration(&discarded), None, "discarded attempts were re-solved");
     for (st, want) in [
         (
             OdeSolverStats {
@@ -382,13 +331,7 @@ fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
             },
             "2 steps clamped at the minimum step size",
         ),
-        (
-            OdeSolverStats {
-                unfinished_segments: 1,
-                ..Default::default()
-            },
-            "1 unfinished segments",
-        ),
+        (OdeSolverStats { unfinished_segments: 1, ..Default::default() }, "1 unfinished segments"),
         (
             // A stiff-aborted or diverged segment is an unfinished one too (the driver counts
             // it in both), so it is reported by the roll-up.
@@ -403,10 +346,7 @@ fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
         (
             // An abandoned walk starts no segment, so it is not among the unfinished ones
             // (#1234): it must be reported on its own.
-            OdeSolverStats {
-                abandoned_non_finite_timeline: 2,
-                ..Default::default()
-            },
+            OdeSolverStats { abandoned_non_finite_timeline: 2, ..Default::default() },
             "2 abandoned non-finite timelines",
         ),
     ] {
@@ -425,18 +365,10 @@ fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
 #[test]
 fn a_tight_pass_that_clamped_is_reported_unchecked_not_compared() {
     let mut prep = mm_iv();
-    prep.parsed
-        .model
-        .ode_spec
-        .as_mut()
-        .unwrap()
-        .solver_opts
-        .min_dt = 0.5;
+    prep.parsed.model.ode_spec.as_mut().unwrap().solver_opts.min_dt = 0.5;
     let r = evaluate(&prep, 1e-6);
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.starts_with("W_ODE_SOLVER_DIAGNOSTICS")),
+        !r.warnings.iter().any(|w| w.starts_with("W_ODE_SOLVER_DIAGNOSTICS")),
         "fixture: the fit's own tolerance must integrate cleanly: {:?}",
         r.warnings
     );
@@ -447,14 +379,8 @@ fn a_tight_pass_that_clamped_is_reported_unchecked_not_compared() {
         .find(|w| w.starts_with("W_ODE_OFV_SETTLEMENT_UNCHECKED:"))
         .unwrap_or_else(|| panic!("no unchecked warning in {:?}", r.warnings));
     assert!(msg.contains("because at the tighter tolerance, "), "{msg}");
-    assert!(
-        msg.contains("the solve did not integrate cleanly:"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("steps clamped at the minimum step size"),
-        "{msg}"
-    );
+    assert!(msg.contains("the solve did not integrate cleanly:"), "{msg}");
+    assert!(msg.contains("steps clamped at the minimum step size"), "{msg}");
     let entry = r
         .warnings_structured
         .iter()
@@ -480,20 +406,12 @@ fn an_estimating_laplace_stage_is_checked_under_its_own_stage_options() {
         ode_method: crate::ode::OdeMethod::Rk45,
         ..prep.parsed.fit_options.clone()
     };
-    let r = crate::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("the evaluation runs");
+    let r = crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("the evaluation runs");
     let d =
         details_of(&r).unwrap_or_else(|| panic!("no W_ODE_OFV_NOT_SETTLED in {:?}", r.warnings));
     let tol = d["inner_tol"].as_f64().expect("inner_tol recorded");
-    assert!(
-        tol <= 1e-8,
-        "checked at inner_tol = {tol}, not the Laplace stage's"
-    );
+    assert!(tol <= 1e-8, "checked at inner_tol = {tol}, not the Laplace stage's");
 }
 
 /// #2994 review r3: the counters cover every integration that forms the re-scored objective,
@@ -509,11 +427,7 @@ fn the_rescore_counts_the_integrations_behind_every_term() {
     let etas: Vec<DVector<f64>> = (0..n).map(|_| DVector::zeros(model.n_eta)).collect();
     let kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n];
     let at = |n_agq: usize| {
-        let opts = FitOptions {
-            method: EstimationMethod::Laplace,
-            n_agq,
-            ..FitOptions::default()
-        };
+        let opts = FitOptions { method: EstimationMethod::Laplace, n_agq, ..FitOptions::default() };
         rescore_counted(model, &prep.population, params, &etas, &kappas, &opts)
     };
     let (ofv1, ebe1, one) = at(1);
@@ -527,10 +441,7 @@ fn the_rescore_counts_the_integrations_behind_every_term() {
         one.accepted_steps
     );
 
-    let opts = FitOptions {
-        method: EstimationMethod::Laplace,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { method: EstimationMethod::Laplace, ..FitOptions::default() };
     let (e, h, k) = {
         let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
         let (e, h, _, k) = crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
@@ -575,27 +486,16 @@ fn an_ebe_pass_failing_the_convergence_guard_is_reported_unchecked() {
         ode_method: crate::ode::OdeMethod::Rk45,
         ..prep.parsed.fit_options.clone()
     };
-    let r = crate::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("the chain runs");
+    let r = crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("the chain runs");
     assert!(not_settled(&r).is_none(), "{:?}", r.warnings);
     let msg = r
         .warnings
         .iter()
         .find(|w| w.starts_with("W_ODE_OFV_SETTLEMENT_UNCHECKED:"))
         .unwrap_or_else(|| panic!("no unchecked warning in {:?}", r.warnings));
-    assert!(
-        msg.contains("the re-found EBEs fail the fit's own convergence guard"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("unconverged, max_unconverged_frac = 0"),
-        "{msg}"
-    );
+    assert!(msg.contains("the re-found EBEs fail the fit's own convergence guard"), "{msg}");
+    assert!(msg.contains("unconverged, max_unconverged_frac = 0"), "{msg}");
 }
 
 /// #2994 review r7: both sides re-find the EBEs the same way, so the extra optimization a
@@ -611,11 +511,7 @@ fn both_sides_resolve_the_ebes_alike_so_ebe_movement_is_not_a_shift() {
         .expect("prepare one_cpt_iv_ode");
     let model = &prep.parsed.model;
     assert_eq!(
-        model
-            .integrator_spec()
-            .expect("an ODE model")
-            .effective_solver_opts()
-            .method,
+        model.integrator_spec().expect("an ODE model").effective_solver_opts().method,
         crate::ode::OdeMethod::Linear,
         "fixture: the model must be propagated exactly"
     );
@@ -628,16 +524,9 @@ fn both_sides_resolve_the_ebes_alike_so_ebe_movement_is_not_a_shift() {
         max_unconverged_frac: 1.0,
         ..FitOptions::default()
     };
-    let s = ofv_tolerance_shift(
-        model,
-        &prep.population,
-        &prep.init_params,
-        &etas,
-        &kappas,
-        &opts,
-    )
-    .expect("the check applies")
-    .expect("the check completes");
+    let s = ofv_tolerance_shift(model, &prep.population, &prep.init_params, &etas, &kappas, &opts)
+        .expect("the check applies")
+        .expect("the check completes");
     assert!(
         s.shift().is_finite() && s.shift().abs() < 1e-9,
         "an exact objective moved by {} between tolerances",
@@ -645,19 +534,10 @@ fn both_sides_resolve_the_ebes_alike_so_ebe_movement_is_not_a_shift() {
     );
     assert!(not_settled_warning(&s).is_none());
 
-    let h: Vec<DMatrix<f64>> = (0..n)
-        .map(|_| DMatrix::identity(model.n_eta, model.n_eta))
-        .collect();
-    let at_stored = 2.0
-        * pop_nll_opts(
-            model,
-            &prep.population,
-            &prep.init_params,
-            &etas,
-            &h,
-            &kappas,
-            &opts,
-        );
+    let h: Vec<DMatrix<f64>> =
+        (0..n).map(|_| DMatrix::identity(model.n_eta, model.n_eta)).collect();
+    let at_stored =
+        2.0 * pop_nll_opts(model, &prep.population, &prep.init_params, &etas, &h, &kappas, &opts);
     assert!(
         (at_stored - s.fit_ofv).abs() > OFV_SHIFT_WARN,
         "fixture: the re-solve must move the modes ({at_stored} at the stored modes vs {} \
@@ -676,11 +556,9 @@ fn both_sides_resolve_the_ebes_alike_so_ebe_movement_is_not_a_shift() {
 #[cfg(feature = "markov")]
 #[test]
 fn a_linear_routed_model_with_an_integrated_likelihood_is_checked() {
-    let prep = crate::api::prepare_run(
-        "examples/ctmm_pd_2state.ferx",
-        Some("data/ctmm_pd_2state.csv"),
-    )
-    .expect("prepare ctmm_pd_2state");
+    let prep =
+        crate::api::prepare_run("examples/ctmm_pd_2state.ferx", Some("data/ctmm_pd_2state.csv"))
+            .expect("prepare ctmm_pd_2state");
     assert_eq!(
         prep.parsed
             .model
@@ -700,13 +578,8 @@ fn a_linear_routed_model_with_an_integrated_likelihood_is_checked() {
             ode_abstol: tol,
             ..prep.parsed.fit_options.clone()
         };
-        crate::fit(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &opts,
-        )
-        .expect("the evaluation runs")
+        crate::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+            .expect("the evaluation runs")
     };
     let loose = at(5e-2);
     let msg = not_settled(&loose)
@@ -716,11 +589,7 @@ fn a_linear_routed_model_with_an_integrated_likelihood_is_checked() {
         "{msg}"
     );
     let settled = at(1e-6);
-    assert!(
-        not_settled(&settled).is_none(),
-        "a settled objective warned: {:?}",
-        settled.warnings
-    );
+    assert!(not_settled(&settled).is_none(), "a settled objective warned: {:?}", settled.warnings);
 }
 
 /// #2994 review r7: a cancelled fit does not wait for the check. Each subject's task reads
@@ -739,35 +608,13 @@ fn a_cancelled_fit_skips_the_check_without_solving() {
         cancel: Some(flag.clone()),
         ..FitOptions::default()
     };
-    let (_, _, live) = rescore_counted(
-        model,
-        &prep.population,
-        &prep.init_params,
-        &etas,
-        &kappas,
-        &opts,
-    );
-    assert!(
-        live.accepted_steps > 0,
-        "fixture: an uncancelled pass integrates"
-    );
+    let (_, _, live) =
+        rescore_counted(model, &prep.population, &prep.init_params, &etas, &kappas, &opts);
+    assert!(live.accepted_steps > 0, "fixture: an uncancelled pass integrates");
     flag.cancel();
-    let (_, _, st) = rescore_counted(
-        model,
-        &prep.population,
-        &prep.init_params,
-        &etas,
-        &kappas,
-        &opts,
-    );
+    let (_, _, st) =
+        rescore_counted(model, &prep.population, &prep.init_params, &etas, &kappas, &opts);
     assert_eq!(st.accepted_steps, 0, "a cancelled pass integrated");
-    assert!(ofv_tolerance_shift(
-        model,
-        &prep.population,
-        &prep.init_params,
-        &etas,
-        &kappas,
-        &opts
-    )
-    .is_none());
+    assert!(ofv_tolerance_shift(model, &prep.population, &prep.init_params, &etas, &kappas, &opts)
+        .is_none());
 }

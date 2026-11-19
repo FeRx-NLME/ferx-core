@@ -119,16 +119,11 @@ pub(crate) fn method_in_scope(method: EstimationMethod) -> bool {
 /// the thread the fit runs on, where its own override is armed, so the tolerance tightened is
 /// the one the fit integrated at.
 pub(crate) fn tightened_override(
-    model: &CompiledModel,
-    options: &FitOptions,
+    model: &CompiledModel, options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
     let eff = model.integrator_spec()?.effective_solver_opts();
-    let reltol = (eff.reltol * TIGHTEN_FACTOR)
-        .max(RELTOL_FLOOR)
-        .min(eff.reltol);
-    let abstol = (eff.abstol * TIGHTEN_FACTOR)
-        .max(ABSTOL_FLOOR)
-        .min(eff.abstol);
+    let reltol = (eff.reltol * TIGHTEN_FACTOR).max(RELTOL_FLOOR).min(eff.reltol);
+    let abstol = (eff.abstol * TIGHTEN_FACTOR).max(ABSTOL_FLOOR).min(eff.abstol);
     if reltol >= eff.reltol && abstol >= eff.abstol {
         return None;
     }
@@ -155,15 +150,9 @@ pub(crate) fn tightened_override(
 /// accounting. `None` when clean, else the counters that were not, for the warning.
 pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Option<String> {
     let parts: Vec<String> = [
-        (
-            st.kept_clamped_steps(),
-            "steps clamped at the minimum step size",
-        ),
+        (st.kept_clamped_steps(), "steps clamped at the minimum step size"),
         (st.kept_unfinished_segments(), "unfinished segments"),
-        (
-            st.abandoned_non_finite_timeline,
-            "abandoned non-finite timelines",
-        ),
+        (st.abandoned_non_finite_timeline, "abandoned non-finite timelines"),
     ]
     .into_iter()
     .filter(|(n, _)| *n > 0)
@@ -197,12 +186,8 @@ pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Op
 ///
 /// [`ebe_guard_rejects`]: crate::estimation::outer_optimizer::ebe_guard_rejects
 fn rescore_checked(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], options: &FitOptions,
 ) -> Option<Result<f64, String>> {
     let (ofv, ebe_stats, solver) =
         rescore_counted(model, population, params, eta_hats, kappas, options);
@@ -230,27 +215,15 @@ fn rescore_checked(
     if let Some(counters) = unclean_integration(&solver) {
         why.push(format!("the solve did not integrate cleanly: {counters}"));
     }
-    Some(if why.is_empty() {
-        Ok(ofv)
-    } else {
-        Err(why.join("; "))
-    })
+    Some(if why.is_empty() { Ok(ofv) } else { Err(why.join("; ")) })
 }
 
 /// [`rescore_checked`]'s objective, with the EBE pass's statistics and the solver counters of
 /// every integration behind it, before either is judged.
 fn rescore_counted(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
-) -> (
-    f64,
-    crate::estimation::inner_optimizer::InnerLoopStats,
-    crate::ode::solver::OdeSolverStats,
-) {
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], options: &FitOptions,
+) -> (f64, crate::estimation::inner_optimizer::InnerLoopStats, crate::ode::solver::OdeSolverStats) {
     use crate::estimation::inner_optimizer::{
         cacheable_schedule, find_ebe_cached, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
         PrevEtas,
@@ -267,12 +240,7 @@ fn rescore_counted(
         // A cancelled fit stops solving: the remaining subjects return at once, and the
         // caller discards the pass (`ofv_tolerance_shift` reads the token after it).
         if crate::cancel::is_cancelled(&options.cancel) {
-            return (
-                f64::NAN,
-                false,
-                false,
-                crate::ode::solver::OdeSolverStats::default(),
-            );
+            return (f64::NAN, false, false, crate::ode::solver::OdeSolverStats::default());
         }
         let subject = &population.subjects[i];
         let scope = crate::ode::solver::SolverStatsScope::enter();
@@ -289,15 +257,8 @@ fn rescore_counted(
             schedule.as_ref(),
             policy,
         );
-        let nll = score_subject(
-            model,
-            subject,
-            params,
-            &ebe.eta,
-            &ebe.h_matrix,
-            &ebe.kappas,
-            options,
-        );
+        let nll =
+            score_subject(model, subject, params, &ebe.eta, &ebe.h_matrix, &ebe.kappas, options);
         let unconverged = !ebe.converged && subject.n_scored_rows() >= min_obs;
         (nll, unconverged, ebe.hard_reject, scope.collected())
     });
@@ -317,13 +278,8 @@ fn rescore_counted(
 /// has nodes (which lays its own grid and anchor around `eta`, and ignores `h`), the
 /// FOCE/FOCEI one at `h` otherwise. The one scoring rule both sides of the check share.
 fn score_subject(
-    model: &CompiledModel,
-    subject: &crate::types::Subject,
-    params: &ModelParameters,
-    eta: &DVector<f64>,
-    h: &DMatrix<f64>,
-    kappas: &[DVector<f64>],
-    options: &FitOptions,
+    model: &CompiledModel, subject: &crate::types::Subject, params: &ModelParameters,
+    eta: &DVector<f64>, h: &DMatrix<f64>, kappas: &[DVector<f64>], options: &FitOptions,
 ) -> f64 {
     match options.agq_nodes() {
         Some(n_nodes) => crate::estimation::agq::agq_subject_term(
@@ -363,12 +319,8 @@ fn score_subject(
 ///
 /// `None` as well when the fit is cancelled during the check: it is skipped, not reported.
 pub(crate) fn ofv_tolerance_shift(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], options: &FitOptions,
 ) -> Option<Result<OdeToleranceShift, String>> {
     let eff = model.integrator_spec()?.effective_solver_opts();
     let tight = tightened_override(model, options)?;
@@ -376,7 +328,7 @@ pub(crate) fn ofv_tolerance_shift(
         Ok(v) => v,
         Err(why) => return Some(Err(format!("at the fit's own tolerance, {why}"))),
     };
-    let tight_ofv = match crate::api::with_fit_scope_ode(options, tight, || {
+    let tight_ofv = match crate::pool::with_fit_scope_ode(options, tight, || {
         rescore_checked(model, population, params, eta_hats, kappas, options)
     }) {
         Ok(None) => return None,
