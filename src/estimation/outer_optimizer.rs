@@ -7356,15 +7356,26 @@ fn optimize_nlopt_attempt_probed(
                     .then_some(state.cached_etas_by_class.as_slice());
                 let mut m =
                     if grad.is_some() && crate::estimation::mixture::needs_class_modes(&params) {
-                        let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-                            model, population, &params, options, warm,
+                        let (m, modes) = crate::estimation::mixture::mixture_ofv_cached(
+                            model,
+                            population,
+                            &params,
+                            options,
+                            warm,
+                            &schedule_cache,
                         );
                         mixmodes = Some(modes);
                         m
                     } else {
-                        crate::estimation::mixture::mixture_ofv(
-                            model, population, &params, options, warm,
+                        crate::estimation::mixture::mixture_ofv_cached(
+                            model,
+                            population,
+                            &params,
+                            options,
+                            warm,
+                            &schedule_cache,
                         )
+                        .0
                     };
                 let stats = InnerLoopStats {
                     n_unconverged: m.ebe_stats.n_unconverged,
