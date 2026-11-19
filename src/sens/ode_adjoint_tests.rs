@@ -3092,7 +3092,7 @@ fn a_foce_fit_with_a_refused_frem_subject_reports_no_fd_inner_subjects() {
 /// Kernel `F` and `l` at `(params, η)` against production's `foce_subject_nll` / inner
 /// objective, on the production predictions and η-Jacobian. Returns `(|ΔF|, |Δl|)`, each
 /// relative to `1 + |F|`.
-fn objective_gaps(
+pub(super) fn objective_gaps(
     model: &CompiledModel,
     s: &Subject,
     params: &ModelParameters,

@@ -1607,6 +1607,17 @@ fn record_ode<T: VmNum>(
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
+    // A modified-release subject the value path serves in closed form is recorded as that
+    // closed form, not as the integration of its ODE twin (no solver loop in the plan).
+    #[cfg(test)]
+    let mr_off = MR_PLAN_OFF.with(|c| c.get());
+    #[cfg(not(test))]
+    let mr_off = false;
+    if let Some(s) =
+        crate::pk::modified_release::mr_scope(model, subject, theta, eta).filter(|_| !mr_off)
+    {
+        return record_modified_release(model, subject, &s, th, et, prog);
+    }
     if static_walk_subject_supported(model, subject) {
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
@@ -1668,6 +1679,63 @@ fn record_ode<T: VmNum>(
         .values
         .len();
     let by_slot = taped_params(model, prog, n_slots, th, et, &subject.covariates);
+    apply_expression_scale(model, subject, th, et, &by_slot, preds)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: record a modified-release subject as its ODE twin, as before the closed
+    /// form was recorded, for the tests whose subject is the ODE walk (its onset anchoring, its
+    /// cross-check against the closed form). Read at recording time only, so it is set around a
+    /// fresh model, whose plans are its own.
+    pub(crate) static MR_PLAN_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Modified-release closed form on the tape: the one generic kernel the value path runs
+/// (`pk::modified_release::mr_observable_g`) over the recording type, its disposition
+/// recovered from the compiled RHS and readout programs on the taped parameters
+/// (`recover_disp_params_g`), then the output transforms and scale as the ODE walks apply them.
+/// Admission (`mr_scope`) is the value path's own gate, so value and plan serve one set of
+/// subjects; a point where a recorded branch (a flip-flop domain, a non-positive slope) flips
+/// fails the plan's guard and is re-recorded, where the gate declines to the ODE walk.
+fn record_modified_release<T: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    s: &crate::pk::modified_release::MrScope<'_>,
+    th: &ThetaLeaves<'_, T>,
+    et: &[T],
+    prog: &crate::parser::model_parser::IndivParamProgram,
+) -> Option<Vec<T>> {
+    use crate::types::{PK_IDX_F, PK_IDX_LAGTIME};
+    let by_slot = taped_params(model, prog, s.pk.values.len(), th, et, &subject.covariates);
+    let params: Vec<T> = by_slot
+        .iter()
+        .zip(&s.pk.values)
+        .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
+        .collect();
+    let dp = crate::pk::modified_release::recover_disp_params_g::<T>(
+        s.spec,
+        &s.disp,
+        &params,
+        &subject.covariates,
+    )?;
+    let (lag_cmt, f_bio) = (params[PK_IDX_LAGTIME], params[PK_IDX_F]);
+    let preds: Vec<T> = subject
+        .obs_times
+        .iter()
+        .map(|&t| {
+            let y = crate::pk::modified_release::mr_observable_g(
+                &dp,
+                &s.spec.input_rate,
+                &subject.doses,
+                T::from_f64(t),
+                &params,
+                lag_cmt,
+                f_bio,
+            );
+            crate::sens::ode_provider::apply_output_transform(model, y)
+        })
+        .collect();
     apply_expression_scale(model, subject, th, et, &by_slot, preds)
 }
 
