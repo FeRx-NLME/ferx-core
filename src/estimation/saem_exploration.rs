@@ -139,12 +139,7 @@ impl ExplorationMonitor {
     /// No tracked coordinate drifts over the trailing window. `false` until a
     /// full window exists.
     pub(crate) fn converged(&self) -> bool {
-        if self.len() < TREND_WINDOW {
-            return false;
-        }
-        self.series
-            .iter()
-            .all(|s| !trend_detected(&s[s.len() - TREND_WINDOW..]))
+        self.len() >= TREND_WINDOW && self.drifting().is_empty()
     }
 
     /// Whether exploration may end after iteration `k` (1-based): the minimum
@@ -158,11 +153,9 @@ impl ExplorationMonitor {
         if self.len() < TREND_WINDOW {
             return Vec::new();
         }
+        // `trend_detected` reads the trailing window itself.
         (0..self.series.len())
-            .filter(|&c| {
-                let s = &self.series[c];
-                trend_detected(&s[s.len() - TREND_WINDOW..])
-            })
+            .filter(|&c| trend_detected(&self.series[c]))
             .collect()
     }
 }

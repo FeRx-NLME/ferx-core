@@ -4299,6 +4299,14 @@ pub fn run_saem(
     let k2 = options.saem_n_convergence;
     let mut n_iter = k1 + k2;
     let smoothing_exponent = options.saem_smoothing_exponent;
+    // The model-file parser rejects these; a `FitOptions` built in code reaches here
+    // unchecked, and 0 would skip the averaging, a negative value or NaN poisons γ.
+    if !(smoothing_exponent.is_finite() && smoothing_exponent > 0.5 && smoothing_exponent <= 1.0) {
+        return Err(format!(
+            "SAEM `saem_smoothing_exponent` must lie in (0.5, 1] (the Robbins-Monro \
+             conditions on the step 1/(k-K1)^a), got {smoothing_exponent}"
+        ));
+    }
     let mut exploration_monitor =
         crate::estimation::saem_exploration::ExplorationMonitor::default();
     let mut exploration_hit_max = false;
@@ -4372,6 +4380,15 @@ pub fn run_saem(
     }
 
     let mut warnings = Vec::new();
+    if auto_exploration && k_max < crate::estimation::saem_exploration::TREND_WINDOW {
+        warnings.push(format!(
+            "SAEM: `n_exploration_max` = {k_max} is shorter than the automatic stop's \
+             {}-iteration trend window, so the stop can never be tested and exploration \
+             always runs {k_max} iterations; set `n_exploration = {k_max}` for a fixed \
+             length, or raise `n_exploration_max`.",
+            crate::estimation::saem_exploration::TREND_WINDOW
+        ));
+    }
     // Acceptance window in which the Robbins-Monro step is skipped entirely
     // (#1449). Read once here so the two call sites below cannot drift, and
     // sanitised here because `FitOptions` is public and a band built in Rust
@@ -6805,13 +6822,25 @@ pub fn run_saem(
             let omega_iov = (n_kappa > 0).then_some(&state.omega_iov_mat);
             // `nll_cache` was refreshed at this iteration's Ω/σ just above and holds
             // each subject's −log p(yᵢ, ηᵢ) (η prior included): the complete-data −log L.
-            exploration_monitor.push(&crate::estimation::saem_exploration::exploration_coords(
+            let mut coords = crate::estimation::saem_exploration::exploration_coords(
                 state.nll_cache.iter().sum(),
                 &state.theta,
                 &state.omega_mat,
                 omega_iov,
                 &state.sigma_vals,
-            ));
+            );
+            // Mixture: the per-class Ω-override variances move on their own SA
+            // statistic, outside the base Ω (σ overrides are held at their inits,
+            // the mixing θ are already in `theta`).
+            if let Some(mix) = saem_mix.as_ref() {
+                coords.extend(
+                    mix.mp
+                        .omega_override_addr
+                        .iter()
+                        .map(|&(c, j)| mix.class_omega(c).matrix[(j, j)].max(1e-300).ln()),
+                );
+            }
+            exploration_monitor.push(&coords);
             if k < k1 && exploration_monitor.may_stop_at(k, k_min) {
                 k1 = k;
                 n_iter = k1 + k2;
@@ -6996,7 +7025,7 @@ pub fn run_saem(
     }
 
     if exploration_hit_max {
-        let names = crate::estimation::saem_exploration::exploration_coord_names(
+        let mut names = crate::estimation::saem_exploration::exploration_coord_names(
             &init_params.theta_names,
             &init_params.omega.eta_names,
             init_params
@@ -7005,6 +7034,16 @@ pub fn run_saem(
                 .map(|m| m.eta_names.as_slice()),
             &init_params.sigma.names,
         );
+        if let Some(mix) = saem_mix.as_ref() {
+            names.extend(mix.mp.omega_override_addr.iter().map(|&(c, j)| {
+                let eta = init_params
+                    .omega
+                    .eta_names
+                    .get(j)
+                    .map_or("?", String::as_str);
+                format!("OMEGA({eta}) class {}", c + 1)
+            }));
+        }
         warnings.push(format!(
             "SAEM: the exploration phase reached its maximum of {k_max} iterations while a \
              parameter trajectory still trended (still drifting: {}). The convergence \

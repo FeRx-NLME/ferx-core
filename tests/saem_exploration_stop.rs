@@ -114,9 +114,17 @@ fn maximum_is_respected_and_reported() {
     });
     assert_eq!(r.saem_n_exploration_used, Some(15));
     assert!(max_warning(&r), "{:?}", r.warnings);
-    // The window never filled, and the warning says so rather than naming nothing.
+    // The window never filled: the max-reached warning says so rather than naming
+    // nothing, and a separate warning says the settings make the test impossible.
     assert!(
-        r.warnings.iter().any(|w| w.contains("trend window")),
+        r.warnings
+            .iter()
+            .any(|w| w.contains("reached its maximum") && w.contains("trend window")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(
+        r.warnings.iter().any(|w| w.contains("can never be tested")),
         "{:?}",
         r.warnings
     );
@@ -176,4 +184,28 @@ fn smoothing_exponent_one_is_the_default_and_seven_tenths_differs() {
     assert_eq!(base.theta, one.theta);
     assert_eq!(base.omega.diagonal(), one.omega.diagonal());
     assert_ne!(base.theta, sev.theta);
+}
+
+/// A `FitOptions` built in code bypasses the model-file parser's range check;
+/// `run_saem` rejects the exponent itself rather than averaging with a
+/// non-decaying (0), growing (negative) or NaN step.
+#[test]
+fn smoothing_exponent_out_of_range_is_rejected_from_the_api() {
+    let model = parse_model_string(MODEL).expect("model must parse");
+    let pop = population(&model);
+    for bad in [0.0, 0.5, -1.0, 1.5, f64::NAN] {
+        let mut o = FitOptions::default();
+        o.method = EstimationMethod::Saem;
+        o.saem_n_exploration = Some(5);
+        o.saem_n_convergence = 5;
+        o.saem_seed = Some(11);
+        o.run_covariance_step = false;
+        o.verbose = false;
+        o.saem_smoothing_exponent = bad;
+        let err = fit(&model, &pop, &model.default_params, &o)
+            .err()
+            .unwrap_or_else(|| panic!("exponent {bad} must be rejected"));
+        let msg = err.to_string();
+        assert!(msg.contains("smoothing_exponent"), "{bad}: {msg}");
+    }
 }
