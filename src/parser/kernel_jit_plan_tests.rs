@@ -2415,3 +2415,45 @@ fn an_unkept_forward_writes_what_the_kept_one_does() {
         }
     }
 }
+
+/// #3060: a residual covariance `R` of pairs (`correlation cs(RHO) by PAIR`, `n/2` blocks of
+/// 2) factored and solved on a recording. The dense factorisation records superlinearly many
+/// instructions (here 618 at 16 rows, 2018 at 32: every structural zero below a pivot is a
+/// division, and every product with it a node or a zero-fold guard) — which made the outer
+/// gradient's kernel of a subject with 84 observations take gigabytes and seconds to
+/// compile; the blocked one records `O(n)`. The probe is checked to see the dense growth, so
+/// a blocked factorisation that went back to the dense loops would fail the linear bound.
+#[test]
+fn blocked_cholesky_records_linear_in_the_rows() {
+    use crate::sens::focei_kernel::{chol, chol_blocks, chol_solve, chol_solve_blocks};
+    use crate::stats::residual_error::RBlocks;
+    let count = |n: usize, blocked: bool| -> usize {
+        begin();
+        let x = Tr::eta(0, 0.3);
+        let group: Vec<usize> = (0..n).map(|j| j / 2).collect();
+        let a: Vec<Vec<Tr>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| match (i == j, group[i] == group[j]) {
+                        (true, _) => x + Tr::from_f64(2.0),
+                        (false, true) => x * Tr::from_f64(0.5),
+                        (false, false) => Tr::from_f64(0.0),
+                    })
+                    .collect()
+            })
+            .collect();
+        let rhs: Vec<Tr> = (0..n).map(|j| x * Tr::from_f64(1.0 + j as f64)).collect();
+        let z = if blocked {
+            let blk = RBlocks::from_groups(&group);
+            chol_solve_blocks(&chol_blocks(&a, &blk).expect("factors"), &rhs, &blk)
+        } else {
+            chol_solve(&chol(&a).expect("factors"), &rhs)
+        };
+        let s = z.into_iter().fold(Tr::from_f64(0.0), |acc, v| acc + v);
+        end(Some(vec![s.reg()])).expect("records").code.len()
+    };
+    let (d16, d32) = (count(16, false), count(32, false));
+    assert!(d32 > 3 * d16, "the probe sees the dense growth: {d16} → {d32}");
+    let (b16, b32, b64) = (count(16, true), count(32, true), count(64, true));
+    assert!(b32 <= 2 * b16 + 8 && b64 <= 2 * b32 + 8, "blocked: {b16} → {b32} → {b64}");
+}
