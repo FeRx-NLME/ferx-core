@@ -12141,6 +12141,17 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.saem_smoothing_exponent = v;
         }
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
+        "isample_m1" => opts.saem_isample_m1 = parse_usize(key)?,
+        "isample_m1b" => opts.saem_isample_m1b = parse_usize(key)?,
+        "isample_m2" => opts.saem_isample_m2 = parse_usize(key)?,
+        "isample_m3" => opts.saem_isample_m3 = parse_usize(key)?,
+        "iaccept" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v > 0.0 && v < 1.0) {
+                return Err(format!("fit option `{key}` must lie in (0, 1), got {v}"));
+            }
+            opts.saem_iaccept = v;
+        }
         "n_chains" => {
             let n = parse_usize("n_chains")?;
             if n == 0 {
@@ -12232,9 +12243,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.saem_kernel = match value.to_lowercase().as_str() {
                 "rw" | "random_walk" | "random-walk" | "mh" => crate::types::SaemKernel::RandomWalk,
                 "imh" | "fsaem" | "f-saem" => crate::types::SaemKernel::Imh,
+                "nonmem" | "nm" => crate::types::SaemKernel::Nonmem,
                 other => {
                     return Err(format!(
-                        "fit option `{key}`: unknown value `{other}` — expected rw/imh"
+                        "fit option `{key}`: unknown value `{other}` — expected rw/imh/nonmem"
                     ));
                 }
             };

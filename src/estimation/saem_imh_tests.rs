@@ -1212,7 +1212,8 @@ fn a_seeded_imh_fit_is_reproducible() {
 /// IMH evaluation.
 #[test]
 fn default_fit_options_leave_the_imh_kernel_untouched() {
-    assert_eq!(FitOptions::default().saem_kernel, SaemKernel::RandomWalk);
+    // NONMEM's kernels are the default since #2986; the IMH kernel is opt-in either way.
+    assert_eq!(FitOptions::default().saem_kernel, SaemKernel::Nonmem);
     let model = parse_model_string(IV_MODEL).expect("parse");
     let pop = population_of(&well_conditioned_subject(), 3);
     let opts = FitOptions { saem_kernel: SaemKernel::RandomWalk, ..imh_opts(1) };
@@ -1625,6 +1626,8 @@ fn the_default_random_walk_fit_matches_main() {
         saem_n_exploration: Some(8),
         saem_n_convergence: 8,
         saem_seed: Some(11),
+        // Pinned to main's random-walk trajectory (#2986 made NONMEM's kernels the default).
+        saem_kernel: SaemKernel::RandomWalk,
         run_covariance_step: false,
         // Pinned against main's single-chain trajectory (#2986 made two the default).
         saem_n_chains: 1,

@@ -2183,6 +2183,134 @@ pub(crate) fn mh_steps_with_proposal(
     (n_accepted, nll)
 }
 
+/// Independence Metropolis–Hastings from a Gaussian proposal `N(mean, L·Lᵀ)` — NONMEM's
+/// SAEM kernels 1 (`mean = 0`, `L = chol(Ω)`: the population density) and 1B (the subject's
+/// running conditional mean and covariance), #2986. The proposal does not depend on the
+/// current η, so the acceptance carries its density: `log α = (nll − nll′) + (log q(η) −
+/// log q(η′))`, with `nll` the individual NLL including the η prior. Under kernel 1 the
+/// proposal is the prior, which cancels and leaves the data likelihood ratio. A factor with a
+/// non-positive diagonal (a degenerate covariance) runs no proposals. Returns
+/// `(n_accepted, updated_nll)`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn independence_steps(
+    eta: &mut [f64], nll_current: f64, mean: &[f64], l: &DMatrix<f64>, subject: &Subject,
+    model: &CompiledModel, theta: &[f64], omega: &OmegaMatrix, sigma_values: &[f64],
+    rng: &mut impl Rng, n_steps: usize, scratch: &mut MhScratch,
+    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> (usize, f64) {
+    let n_eta = eta.len();
+    if n_steps == 0 || (0..n_eta).any(|j| !(l[(j, j)] > 0.0)) {
+        return (0, nll_current);
+    }
+    // −½‖L⁻¹(x − mean)‖², by forward substitution (the shared −½log|LLᵀ| cancels).
+    let log_q = |x: &[f64]| -> f64 {
+        let mut w = [0.0_f64; 16];
+        let mut heap;
+        let w: &mut [f64] = if n_eta <= w.len() {
+            &mut w[..n_eta]
+        } else {
+            heap = vec![0.0_f64; n_eta];
+            &mut heap
+        };
+        let mut ss = 0.0;
+        for i in 0..n_eta {
+            let mut v = x[i] - mean[i];
+            for j in 0..i {
+                v -= l[(i, j)] * w[j];
+            }
+            w[i] = v / l[(i, i)];
+            ss += w[i] * w[i];
+        }
+        -0.5 * ss
+    };
+    let MhScratch { nll: nll_scratch, prep, z, perturbation, eta_prop } = scratch;
+    let mut nll = nll_current;
+    let mut log_q_cur = log_q(eta);
+    let mut n_accepted = 0;
+    for _ in 0..n_steps {
+        for slot in z.iter_mut() {
+            *slot = rng.sample(StandardNormal);
+        }
+        cholesky_perturbation_into(l, z, perturbation);
+        for j in 0..n_eta {
+            eta_prop[j] = mean[j] + perturbation[j];
+        }
+        // The same two evaluation arms as the random walk (IOV needs the per-occasion
+        // `[η, κ_k]` predictions; see `mh_steps_with_proposal`).
+        let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
+            individual_nll_iov_with_scratch_and_schedule(
+                model,
+                subject,
+                theta,
+                eta_prop,
+                kappas,
+                omega,
+                Some(omega_iov),
+                sigma_values,
+                &mut nll_scratch.pk,
+                schedule,
+            )
+        } else {
+            individual_nll_prepared(
+                model,
+                subject,
+                theta,
+                eta_prop,
+                omega,
+                sigma_values,
+                prep,
+                schedule,
+                nll_scratch,
+            )
+        };
+        let log_q_prop = log_q(eta_prop);
+        let log_alpha = (nll - nll_prop) + (log_q_cur - log_q_prop);
+        let log_u: f64 = rng.random::<f64>().ln();
+        if log_alpha.is_finite() && log_u < log_alpha {
+            eta.copy_from_slice(eta_prop);
+            nll = nll_prop;
+            log_q_cur = log_q_prop;
+            n_accepted += 1;
+        }
+    }
+    (n_accepted, nll)
+}
+
+/// Kernel 1B's proposal from a subject's running draw moments `(Σ η, Σ ηηᵀ, n)`: the mean
+/// and the lower Cholesky factor of the covariance, or `None` before
+/// [`NONMEM_M1B_MIN_DRAWS`] draws. A covariance that is not positive definite falls back to
+/// its diagonal (each variance floored at `1e-12`).
+fn m1b_proposal(sum: &[f64], sumsq: &DMatrix<f64>, n: usize) -> Option<(Vec<f64>, DMatrix<f64>)> {
+    if n < NONMEM_M1B_MIN_DRAWS {
+        return None;
+    }
+    let k = sum.len();
+    let nf = n as f64;
+    let mean: Vec<f64> = sum.iter().map(|v| v / nf).collect();
+    let mut cov = sumsq / nf;
+    for i in 0..k {
+        for j in 0..k {
+            cov[(i, j)] -= mean[i] * mean[j];
+        }
+    }
+    let l = match cov.clone().cholesky() {
+        Some(c) => c.l(),
+        None => {
+            DMatrix::from_fn(k, k, |i, j| if i == j { cov[(i, i)].max(1e-12).sqrt() } else { 0.0 })
+        }
+    };
+    Some((mean, l))
+}
+
+/// Draws a subject's chain must have made (after the Ω burn-in) before kernel 1B proposes
+/// from their moments (#2986).
+const NONMEM_M1B_MIN_DRAWS: usize = 10;
+/// NONMEM's `ISCALE_MIN` / `ISCALE_MAX` for MCMC sampling: the bounds on the random-walk
+/// scales under [`crate::types::SaemKernel::Nonmem`].
+const NONMEM_ISCALE_MIN: f64 = 1e-6;
+const NONMEM_ISCALE_MAX: f64 = 1e6;
+
 /// Componentwise (single-coordinate) Metropolis-within-Gibbs sweep for one
 /// subject — the second kernel of the Kuhn & Lavielle (2004) mixture.
 ///
@@ -4580,9 +4708,39 @@ pub fn run_saem(
     // estimated. Clamped to the exploration length — burning in past K1 would
     // freeze Ω into the convergence phase. See `FitOptions::saem_omega_burnin`.
     let omega_burnin = options.saem_omega_burnin.min(k_min);
-    let n_mh_steps =
-        resolve_n_mh_steps(options.saem_n_mh_steps, population.n_obs(), n_subjects, n_eta);
-    let n_cw_sweeps = componentwise_sweeps(n_mh_steps, n_eta);
+    // NONMEM's kernels (#2986): kernel 2's proposals and kernel 3's sweeps are NONMEM's
+    // counts; kernels 1 and 1B run before them in the E-step.
+    let nonmem_kernel = options.saem_kernel == crate::types::SaemKernel::Nonmem;
+    let n_mh_steps = if nonmem_kernel {
+        options.saem_isample_m2
+    } else {
+        resolve_n_mh_steps(options.saem_n_mh_steps, population.n_obs(), n_subjects, n_eta)
+    };
+    let n_cw_sweeps = if nonmem_kernel {
+        options.saem_isample_m3
+    } else {
+        componentwise_sweeps(n_mh_steps, n_eta)
+    };
+    // Acceptance targets and scale bounds: NONMEM's `IACCEPT` and `ISCALE_MIN/MAX` under
+    // its kernels, ferx's otherwise.
+    let cw_target_accept = if nonmem_kernel { options.saem_iaccept } else { CW_TARGET_ACCEPT };
+    let (blk_scale_lo, blk_scale_hi) = if nonmem_kernel {
+        (NONMEM_ISCALE_MIN, NONMEM_ISCALE_MAX)
+    } else {
+        (MH_BLOCK_SCALE_MIN, MH_BLOCK_SCALE_MAX)
+    };
+    let (cw_scale_lo, cw_scale_hi) = if nonmem_kernel {
+        (NONMEM_ISCALE_MIN, NONMEM_ISCALE_MAX)
+    } else {
+        (MH_CW_SCALE_MIN, MH_CW_SCALE_MAX)
+    };
+    // Kernel 1B: each chain's running draw moments `(Σ η, Σ ηηᵀ, n)`, from the Ω burn-in on.
+    #[allow(clippy::type_complexity)]
+    let mut m1b_moments: Vec<(Vec<f64>, DMatrix<f64>, usize)> = if nonmem_kernel {
+        vec![(vec![0.0; n_eta], DMatrix::zeros(n_eta, n_eta), 0); n_subjects]
+    } else {
+        Vec::new()
+    };
     let adapt_interval = options.saem_adapt_interval;
     // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
     // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
@@ -4633,7 +4791,20 @@ pub fn run_saem(
         // The block count is data-derived unless the caller pinned it, so say
         // which of the two a run is using — otherwise a reader cannot tell the
         // resolved count from a coincidence.
-        eprintln!("{}", mh_steps_report(options.saem_n_mh_steps, n_mh_steps, n_cw_sweeps));
+        if nonmem_kernel {
+            eprintln!(
+                "SAEM: NONMEM kernels per chain and iteration: {} from N(0, Ω) (M1), {} from \
+                 the running conditional moments (M1B), {} block random-walk (M2), {} \
+                 componentwise sweeps (M3); IACCEPT {}",
+                options.saem_isample_m1,
+                options.saem_isample_m1b,
+                n_mh_steps,
+                n_cw_sweeps,
+                options.saem_iaccept
+            );
+        } else {
+            eprintln!("{}", mh_steps_report(options.saem_n_mh_steps, n_mh_steps, n_cw_sweeps));
+        }
     }
 
     let mut warnings = Vec::new();
@@ -4684,7 +4855,13 @@ pub fn run_saem(
         warnings
             .push(format!("saem_n_leapfrog > 0 but {reason}; falling back to Metropolis-Hastings"));
     }
-    let target_accept_rate = if using_hmc { 0.65_f64 } else { 0.40_f64 };
+    let target_accept_rate = if using_hmc {
+        0.65_f64
+    } else if nonmem_kernel {
+        options.saem_iaccept
+    } else {
+        0.40_f64
+    };
 
     // ---- f-SAEM independent-MH kernel (`saem_kernel = imh`, #1449) ----------
     // Under the default `SaemKernel::RandomWalk` every IMH line below is inert:
@@ -5677,6 +5854,7 @@ pub fn run_saem(
                 ))
             };
             let imh_counters_ref = &imh_counters;
+            let m1b_ref = &m1b_moments;
             let e_step_fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
             #[cfg(test)]
             let rw_block_calls_ref = &rw_block_calls;
@@ -5812,6 +5990,51 @@ pub fn run_saem(
                         let mut nll_cur = nll;
                         let mut n_acc_primary = 0_usize;
                         let mut n_prop_primary = 0_usize;
+                        // ---- NONMEM kernels 1 and 1B (#2986) ----
+                        // Independence proposals from the population density `N(0, Ω)`,
+                        // then from the chain's running conditional mean and covariance;
+                        // kernel 2 (the block random walk, `n_mh_steps = isample_m2`) and
+                        // kernel 3 (the componentwise sweep, `isample_m3`) follow below.
+                        if nonmem_kernel {
+                            let zero = vec![0.0_f64; eta_work.len()];
+                            let (_, nll_m1) = independence_steps(
+                                &mut eta_work,
+                                nll_cur,
+                                &zero,
+                                &omega_ref.chol,
+                                subject,
+                                model,
+                                theta_ref,
+                                omega_ref,
+                                sigma_ref,
+                                &mut rng,
+                                options.saem_isample_m1,
+                                mh_scratch,
+                                schedules[i].as_ref(),
+                                kappas_mh_opt,
+                            );
+                            nll_cur = nll_m1;
+                            let (sum, sumsq, n_draws) = &m1b_ref[i];
+                            if let Some((mean, l)) = m1b_proposal(sum, sumsq, *n_draws) {
+                                let (_, nll_m1b) = independence_steps(
+                                    &mut eta_work,
+                                    nll_cur,
+                                    &mean,
+                                    &l,
+                                    subject,
+                                    model,
+                                    theta_ref,
+                                    omega_ref,
+                                    sigma_ref,
+                                    &mut rng,
+                                    options.saem_isample_m1b,
+                                    mh_scratch,
+                                    schedules[i].as_ref(),
+                                    kappas_mh_opt,
+                                );
+                                nll_cur = nll_m1b;
+                            }
+                        }
                         // HMC path: one gradient-guided proposal per SAEM iteration.
                         // hmc_step returns None if HMC is unavailable for this subject
                         // (e.g. TV-cov subject with unsupported PK model); fall through
@@ -5974,6 +6197,18 @@ pub fn run_saem(
                 }
                 drawn_classes[i] = mix_class;
                 state.etas[i] = eta_new;
+                // Kernel 1B's moments: this chain's draws from the Ω burn-in on (#2986).
+                if nonmem_kernel && k > omega_burnin {
+                    let (sum, sumsq, n_draws) = &mut m1b_moments[i];
+                    let e = &state.etas[i];
+                    for a in 0..e.len() {
+                        sum[a] += e[a];
+                        for b in 0..e.len() {
+                            sumsq[(a, b)] += e[a] * e[b];
+                        }
+                    }
+                    *n_draws += 1;
+                }
                 state.nll_cache[i] = nll_new;
                 // Deliberately NOT fed from the IMH kernel: these counters drive
                 // the *random walk's* step scale toward its 0.40 target, and an
@@ -6018,8 +6253,8 @@ pub fn run_saem(
                                 rate,
                                 target_accept_rate,
                                 k,
-                                MH_BLOCK_SCALE_MIN,
-                                MH_BLOCK_SCALE_MAX,
+                                blk_scale_lo,
+                                blk_scale_hi,
                             );
                         }
                     }
@@ -6035,10 +6270,10 @@ pub fn run_saem(
                             state.cw_step_scales[i][j] = rm_scale_update(
                                 state.cw_step_scales[i][j],
                                 rate,
-                                CW_TARGET_ACCEPT,
+                                cw_target_accept,
                                 k,
-                                MH_CW_SCALE_MIN,
-                                MH_CW_SCALE_MAX,
+                                cw_scale_lo,
+                                cw_scale_hi,
                             );
                         }
                     }
@@ -6062,7 +6297,7 @@ pub fn run_saem(
                     mh_tally.1 += n_prop_cw as u64;
                 }
                 iter_target_weight +=
-                    blk_prop as f64 * target_accept_rate + n_prop_cw as f64 * CW_TARGET_ACCEPT;
+                    blk_prop as f64 * target_accept_rate + n_prop_cw as f64 * cw_target_accept;
             }
 
             // ---- Mixture bookkeeping (#985) ----
@@ -7025,8 +7260,8 @@ pub fn run_saem(
                         state.step_scales[i],
                         rate,
                         target_accept_rate,
-                        MH_BLOCK_SCALE_MIN,
-                        MH_BLOCK_SCALE_MAX,
+                        blk_scale_lo,
+                        blk_scale_hi,
                     );
                 }
                 state.accept_counts[i] = 0;
@@ -7048,9 +7283,9 @@ pub fn run_saem(
                             state.cw_step_scales[i][j] = interval_scale_update(
                                 state.cw_step_scales[i][j],
                                 cw_rate,
-                                CW_TARGET_ACCEPT,
-                                MH_CW_SCALE_MIN,
-                                MH_CW_SCALE_MAX,
+                                cw_target_accept,
+                                cw_scale_lo,
+                                cw_scale_hi,
                             );
                         }
                         state.cw_accept_counts[i][j] = 0;
@@ -12072,6 +12307,9 @@ DV ~ additive(EPS)
             saem_scale_deadband: band,
             saem_seed: Some(SCALE1444_SEED),
             run_covariance_step: false,
+            // The random walk's acceptance mechanics are the subject (#2986 made NONMEM's
+            // kernels the default).
+            saem_kernel: crate::types::SaemKernel::RandomWalk,
             ..FitOptions::default()
         };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");
@@ -12372,6 +12610,7 @@ DV ~ additive(EPS)
             saem_scale_adaptation: ScaleAdaptation::Interval,
             saem_seed: Some(SCALE1444_SEED),
             run_covariance_step: false,
+            saem_kernel: crate::types::SaemKernel::RandomWalk,
             ..FitOptions::default()
         };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok");

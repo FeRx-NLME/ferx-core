@@ -226,3 +226,25 @@ fn two_chains_are_the_default_and_the_result_keeps_the_data_subjects() {
     }
     assert_ne!(two.theta, one.theta, "the chain count changes the fit");
 }
+
+/// #2986: `saem_kernel = nonmem` (the default) runs NONMEM's η kernels (independence proposals from the
+/// population density and from the running conditional moments, then the block and
+/// componentwise random walks). It must reach the E-step — a different fit from the default
+/// random walk on the same seed — and recover the simulated CL and V as well.
+#[test]
+fn nonmem_kernels_fit_and_differ_from_the_random_walk() {
+    let fixed = |o: &mut FitOptions| {
+        o.saem_n_exploration = Some(60);
+        o.saem_n_convergence = 60;
+    };
+    assert_eq!(FitOptions::default().saem_kernel, ferx_core::types::SaemKernel::Nonmem);
+    let rw = run(|o| {
+        fixed(o);
+        o.saem_kernel = ferx_core::types::SaemKernel::RandomWalk;
+    });
+    let nm = run(fixed);
+    assert_ne!(rw.theta, nm.theta, "the kernel option reaches the E-step");
+    for (name, got, truth) in [("CL", nm.theta[0], 5.0), ("V", nm.theta[1], 50.0)] {
+        assert!((got / truth - 1.0).abs() < 0.15, "{name}: {got} vs simulated {truth}");
+    }
+}

@@ -3662,7 +3662,7 @@ fn test_mstep_optimizer_round_trips_validates_and_is_scoped() {
 fn test_saem_imh_options_round_trip_validate_and_warn() {
     use crate::types::SaemKernel;
     let mut opts = FitOptions::default();
-    assert_eq!(opts.saem_kernel, SaemKernel::RandomWalk);
+    assert_eq!(opts.saem_kernel, SaemKernel::Nonmem, "NONMEM's kernels are the default (#2986)");
     assert_eq!((opts.saem_imh_proposals, opts.saem_imh_refresh), (2, 5), "defaults moved");
     assert_eq!(opts.saem_imh_defensive, 0.05);
     assert_eq!(opts.saem_imh_min_obs_per_eta, 2.0);
@@ -3831,6 +3831,21 @@ fn test_apply_fit_option_saem_exploration_stop_and_smoothing() {
     assert_eq!(apply_fit_option(&mut opts, "n_chains", "3"), Ok(true));
     assert_eq!(opts.saem_n_chains, 3);
     assert!(apply_fit_option(&mut opts, "n_chains", "0").is_err());
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "nonmem"), Ok(true));
+    assert_eq!(opts.saem_kernel, crate::types::SaemKernel::Nonmem);
+    for (k, v) in
+        [("isample_m1", "3"), ("isample_m1b", "0"), ("isample_m2", "4"), ("isample_m3", "1")]
+    {
+        assert_eq!(apply_fit_option(&mut opts, k, v), Ok(true), "{k}");
+    }
+    assert_eq!(
+        (opts.saem_isample_m1, opts.saem_isample_m1b, opts.saem_isample_m2, opts.saem_isample_m3),
+        (3, 0, 4, 1)
+    );
+    assert_eq!(apply_fit_option(&mut opts, "iaccept", "0.3"), Ok(true));
+    assert_eq!(opts.saem_iaccept, 0.3);
+    assert!(apply_fit_option(&mut opts, "iaccept", "1.0").is_err());
+    assert_eq!(opts.saem_iaccept, 0.3, "a rejected value leaves the previous one");
     assert_eq!(opts.saem_n_chains, 3, "a rejected value leaves the previous one");
     assert_eq!(opts.saem_smoothing_exponent, 1.0);
 

@@ -141,6 +141,9 @@ fn short_saem_opts(n_mh_steps: usize) -> FitOptions {
         saem_n_mh_steps: n_mh_steps,
         run_covariance_step: false,
         threads: Some(1),
+        // The `n_mh_steps = auto` rule is the random walk's; NONMEM's kernels (the default
+        // since #2986) run `isample_m2` block proposals instead.
+        saem_kernel: ferx_core::types::SaemKernel::RandomWalk,
         ..FitOptions::default()
     }
 }

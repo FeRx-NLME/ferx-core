@@ -1381,3 +1381,45 @@ fn chain_copies_are_fingerprinted_once_not_per_evaluation() {
          registered, so every likelihood evaluation re-hashes its subject"
     );
 }
+
+/// #2986: kernel 1B proposes from a chain's running draw moments — nothing before
+/// `NONMEM_M1B_MIN_DRAWS` draws, then their mean and the Cholesky factor of their
+/// covariance, and the diagonal when that covariance is not positive definite.
+#[test]
+fn m1b_proposal_reads_the_running_moments() {
+    use super::{m1b_proposal, NONMEM_M1B_MIN_DRAWS};
+    use nalgebra::DMatrix;
+    let draws = [[0.1, -0.2], [0.3, 0.0], [-0.1, 0.4], [0.2, 0.1]];
+    let n = NONMEM_M1B_MIN_DRAWS.max(draws.len());
+    let mut sum = vec![0.0; 2];
+    let mut sumsq = DMatrix::<f64>::zeros(2, 2);
+    for k in 0..n {
+        let e = draws[k % draws.len()];
+        for a in 0..2 {
+            sum[a] += e[a];
+            for b in 0..2 {
+                sumsq[(a, b)] += e[a] * e[b];
+            }
+        }
+    }
+    assert!(m1b_proposal(&sum, &sumsq, NONMEM_M1B_MIN_DRAWS - 1).is_none());
+    let (mean, l) = m1b_proposal(&sum, &sumsq, n).expect("enough draws");
+    let nf = n as f64;
+    for a in 0..2 {
+        assert!((mean[a] - sum[a] / nf).abs() < 1e-15);
+    }
+    let cov = &l * l.transpose();
+    for a in 0..2 {
+        for b in 0..2 {
+            let want = sumsq[(a, b)] / nf - mean[a] * mean[b];
+            assert!((cov[(a, b)] - want).abs() < 1e-12, "cov[{a},{b}] {} vs {want}", cov[(a, b)]);
+        }
+    }
+    // Identical draws: zero covariance, not positive definite — the floored diagonal.
+    let (_, l0) =
+        m1b_proposal(&[1.0, 2.0], &DMatrix::from_row_slice(2, 2, &[0.1, 0.2, 0.2, 0.4]), 10)
+            .expect("enough draws");
+    assert_eq!(l0[(0, 1)], 0.0);
+    assert_eq!(l0[(1, 0)], 0.0);
+    assert!(l0[(0, 0)] > 0.0 && l0[(1, 1)] > 0.0);
+}

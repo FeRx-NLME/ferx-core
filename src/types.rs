@@ -9735,6 +9735,19 @@ pub struct FitOptions {
     /// replicated `n` times for the SAEM iterations, and the final EBEs, OFV and
     /// covariance step use the original subjects. `1` is the single-chain SAEM.
     pub saem_n_chains: usize,
+    /// [`SaemKernel::Nonmem`]: independence proposals from `N(0, Ω)` per chain per
+    /// iteration (NONMEM `ISAMPLE_M1`, default 2).
+    pub saem_isample_m1: usize,
+    /// [`SaemKernel::Nonmem`]: independence proposals from the subject's running
+    /// conditional mean and covariance (NONMEM `ISAMPLE_M1B`, default 2).
+    pub saem_isample_m1b: usize,
+    /// [`SaemKernel::Nonmem`]: block random-walk proposals (NONMEM `ISAMPLE_M2`, default 2).
+    pub saem_isample_m2: usize,
+    /// [`SaemKernel::Nonmem`]: componentwise sweeps (NONMEM `ISAMPLE_M3`, default 2).
+    pub saem_isample_m3: usize,
+    /// [`SaemKernel::Nonmem`]: target acceptance of the random-walk kernels (NONMEM
+    /// `IACCEPT`, default 0.4).
+    pub saem_iaccept: f64,
     /// Number of block-kernel MH proposals per subject per SAEM outer
     /// iteration, or `0` — the default, written `n_mh_steps = auto` in a model
     /// file — to size it from the dataset.
@@ -9902,9 +9915,10 @@ pub struct FitOptions {
     /// back to MH otherwise.
     pub saem_n_leapfrog: usize,
     /// The SAEM E-step's primary kernel, set via `[fit_options] saem_kernel`
-    /// (#1449). Defaults to [`SaemKernel::RandomWalk`], the historical block
-    /// random walk; [`SaemKernel::Imh`] is the opt-in f-SAEM independent
-    /// Metropolis-Hastings kernel. See [`SaemKernel`] for when it pays.
+    /// (#1449). Defaults to [`SaemKernel::Nonmem`], NONMEM's four η kernels (#2986);
+    /// [`SaemKernel::RandomWalk`] is the historical block random walk and
+    /// [`SaemKernel::Imh`] the opt-in f-SAEM independent Metropolis-Hastings kernel. See
+    /// [`SaemKernel`] for when each pays.
     pub saem_kernel: SaemKernel,
     /// Independent-MH proposals per subject per SAEM iteration under
     /// [`SaemKernel::Imh`] (`[fit_options] saem_imh_proposals`). Each costs one
@@ -10463,6 +10477,11 @@ impl Default for FitOptions {
             saem_smoothing_exponent: 1.0,
             saem_n_convergence: 1000,
             saem_n_chains: 2,
+            saem_isample_m1: 2,
+            saem_isample_m1b: 2,
+            saem_isample_m2: 2,
+            saem_isample_m3: 2,
+            saem_iaccept: 0.4,
             // 0 = `auto`: resolved from the dataset by
             // `estimation::saem::auto_n_mh_steps` (#1459).
             saem_n_mh_steps: 0,
@@ -10759,8 +10778,8 @@ pub enum ScaleAdaptation {
 /// (#1449).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SaemKernel {
-    /// The block random walk `η + δ_i·chol(Ω)·z`, `n_mh_steps` proposals (default).
-    #[default]
+    /// The block random walk `η + δ_i·chol(Ω)·z`, `n_mh_steps` proposals, plus the
+    /// componentwise sweep (the default before #2986).
     RandomWalk,
     /// The f-SAEM independent MH kernel (Karimi, Lavielle & Moulines, CSDA 2020):
     /// `saem_imh_proposals` draws per subject from `N(η̂_i, c·Γ_i)` with
@@ -10773,6 +10792,15 @@ pub enum SaemKernel {
     /// with a warning. A subject without a curvature uses the random walk until its next
     /// refresh. Neither gate reads a clock, so seeded fits are reproducible.
     Imh,
+    /// NONMEM's SAEM/BAYES η kernels (Users Guide 7.5.1, `ISAMPLE_M1/M1B/M2/M3`), per
+    /// chain per iteration, in NONMEM's order: `isample_m1` independence proposals from
+    /// the population density `N(0, Ω)`; `isample_m1b` from the subject's running
+    /// conditional mean and covariance (its draws since the Ω burn-in); `isample_m2`
+    /// block random-walk proposals `η + s·chol(Ω)·z`; `isample_m3` componentwise sweeps.
+    /// The random-walk scales are adapted towards `iaccept` (0.4) within NONMEM's
+    /// `ISCALE` bounds `[1e-6, 1e6]`. The default (#2986).
+    #[default]
+    Nonmem,
 }
 
 /// Which solver moves the SAEM numerical θ/σ M-step (`[fit_options] mstep_solver`,
@@ -11736,6 +11764,11 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "smoothing_exponent",
             "n_convergence",
             "n_chains",
+            "isample_m1",
+            "isample_m1b",
+            "isample_m2",
+            "isample_m3",
+            "iaccept",
             "n_mh_steps",
             "n_leapfrog",
             "saem_n_leapfrog",
