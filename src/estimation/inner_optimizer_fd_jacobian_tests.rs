@@ -100,8 +100,8 @@ fn kappas_of(i: usize) -> Vec<Vec<f64>> {
 fn worst_gap(h: &DMatrix<f64>, truth: &DMatrix<f64>) -> f64 {
     assert_eq!(h.shape(), truth.shape());
     assert!(h.iter().chain(truth.iter()).all(|v| v.is_finite()));
-    h.iter().zip(truth.iter()).map(|(a, b)| (a - b).abs() / (1.0 + b.abs())).fold(0.0, f64::max)
-    // nan-ok: both operands asserted finite above
+    let gaps = h.iter().zip(truth.iter()).map(|(a, b)| (a - b).abs() / (1.0 + b.abs()));
+    gaps.fold(0.0, f64::max) // nan-ok: both operands asserted finite above
 }
 
 /// `log|Ω⁻¹ + HᵀH/σ²|`, the term of the FOCE/FOCEI objective `H` reaches, at this fixture's
