@@ -2052,14 +2052,23 @@ fn a_fit_estimate_on_a_log_packed_bound_is_not_a_start_outside_it_2896() {
     let fitted = crate::api::fit(&model, &pop, &model.default_params, &eval_only()).unwrap();
     let mut p = model.default_params.clone();
     p.theta = fitted.theta.clone();
-    // Premise: the fit reports the round trip, one ULP outside each declared bound.
-    assert!(p.theta[0] > 10.0 && p.theta[1] < 500.0, "{:?}", p.theta);
+    // Premise: the fit reports each bound's round trip, whatever this platform's libm makes
+    // of it (one ULP outside 10 and 500 on macOS arm64).
+    let rt = |b: f64| b.ln().exp();
+    assert_eq!(p.theta, [rt(10.0), rt(500.0)]);
     for opts in [eval_only(), FitOptions::default()] {
         let d = check_packed_start_in_box(&p, &opts);
         assert!(d.is_empty(), "a fit's own estimates are a valid start: {d:#?}");
     }
-    p.theta[0] = p.theta[0].next_up();
+    // End to end: neither the eval-only warning nor the search's refusal.
+    let again = crate::api::fit(&model, &pop, &p, &eval_only()).unwrap();
+    assert!(!again.warnings.iter().any(|w| w.contains("OUTSIDE_BOUNDS")), "{:?}", again.warnings);
+    let search = FitOptions { outer_maxiter: 1, ..FitOptions::default() };
+    crate::api::fit(&model, &pop, &p, &search).expect("a search from a fit's own estimates");
+    // One ULP past the bound or its round trip, whichever is further, is still outside.
+    let mut q = p.clone();
+    q.theta = vec![10f64.max(rt(10.0)).next_up(), 500f64.min(rt(500.0)).next_down()];
     let out: Vec<_> =
-        crate::estimation::parameterization::theta_outside_declared_range(&p).collect();
-    assert_eq!(out.len(), 1, "one ULP past the round trip is still outside: {out:?}");
+        crate::estimation::parameterization::theta_outside_declared_range(&q).collect();
+    assert_eq!(out.len(), 2, "both sides are still judged: {out:?}");
 }

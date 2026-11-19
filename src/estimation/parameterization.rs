@@ -1635,13 +1635,16 @@ pub(crate) struct OutOfDeclaredRange {
 /// the shape most likely to carry the defect was the one shape invisible to
 /// the packed predicate. NM-TRAN rejects `$THETA (0, -5, 10)` with error 24.
 ///
-/// On the declared sides this predicate is **strictly stronger** than the
-/// packed one and never weaker: for a log-packed θ with `theta_lower >
+/// On the declared sides this predicate is **stronger** than the packed one, and
+/// weaker only where a bound's round trip moves its own `ln` (see below): for a
+/// log-packed θ with `theta_lower >
 /// LOG_PACK_FLOOR`, `packed < lower` holds exactly when `theta < theta_lower`
 /// up to `ln`'s rounding. That rounding used to invent hits: an estimate on a bound
 /// unpacks as `exp(ln(bound))`, one ULP either side of it, so a fit's own estimates read
 /// as outside their range when passed back as a start (#2896). A bound's round trip
-/// counts as inside, so the rounding can only lose hits. Measured
+/// now counts as inside. Where `ln(exp(ln b)) != ln b` (3 of 2,000,000 random bounds,
+/// none of 200,000 round ones), the packed walk alone still reports that estimate.
+/// Measured
 /// over every `.ferx` in the tree at the time of writing — 154 that parse — it
 /// finds **zero** violations, the same answer the packed walk gives.
 ///
