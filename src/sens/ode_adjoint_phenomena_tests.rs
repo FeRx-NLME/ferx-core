@@ -6573,6 +6573,9 @@ fn modified_release_plan_values_are_bit_equal_to_the_value_path() {
             probe_eta(m.n_eta).iter().map(|e| -1.7 * e).collect(),
         ] {
             let mut got = Vec::new();
+            // `plan_values` serves recorded plans only (a miss is the native predictor's), so
+            // record this point's plan first, as the gradient that precedes it in a fit does.
+            exact_eta_jacobian(&m, &s, &theta, &eta).expect("record the plan");
             assert!(
                 plan_values(&m, &s, None, &theta, &eta, &mut got),
                 "{label}: the plan must be served without a solver loop"
@@ -6639,6 +6642,9 @@ fn modified_release_flip_flop_point_is_recorded_on_the_ode_twin() {
     let eta = probe_eta(m.n_eta);
     let serve = |theta: &[f64]| {
         let mut got = Vec::new();
+        // Record at this point first (`plan_values` never records): the closed form where the
+        // gate admits it, the ODE twin where it declines.
+        exact_eta_jacobian(&m, &s, theta, &eta).expect("record the plan");
         let served = plan_values(&m, &s, None, theta, &eta, &mut got);
         (served, got)
     };

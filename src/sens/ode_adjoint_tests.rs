@@ -8596,7 +8596,7 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
             1e-9
         } else if *name == "additive_four_eta" {
             1e-13
-        } else if name == "warfarin_sde" {
+        } else if *name == "warfarin_sde" {
             1e-12
         } else {
             1e-14
