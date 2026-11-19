@@ -1208,12 +1208,12 @@ fn a_seeded_imh_fit_is_reproducible() {
     assert_ne!(a, c, "the seed does not reach the estimates — the comparison above is vacuous");
 }
 
-/// The default `saem_kernel` must not build a single proposal or spend a single
-/// IMH evaluation.
+/// The legacy f-SAEM kernel's own move is opt-in: `saem_kernel = rw` builds no proposal and
+/// spends no IMH evaluation (the default `hmc` preset's single `imh` jump is a counted kernel
+/// of its own, #2986).
 #[test]
 fn default_fit_options_leave_the_imh_kernel_untouched() {
-    // NONMEM's kernels are the default since #2986; the IMH kernel is opt-in either way.
-    assert_eq!(FitOptions::default().saem_kernel, SaemKernel::Nonmem);
+    assert_eq!(FitOptions::default().saem_kernel, SaemKernel::Hmc);
     let model = parse_model_string(IV_MODEL).expect("parse");
     let pop = population_of(&well_conditioned_subject(), 3);
     let opts = FitOptions { saem_kernel: SaemKernel::RandomWalk, ..imh_opts(1) };

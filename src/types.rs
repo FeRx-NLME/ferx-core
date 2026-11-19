@@ -10862,8 +10862,7 @@ pub enum SaemKernel {
     /// conditional mean and covariance (its draws since the Ω burn-in); `isample_m2`
     /// block random-walk proposals `η + s·chol(Ω)·z`; `isample_m3` componentwise sweeps.
     /// The random-walk scales are adapted towards `iaccept` (0.4) within NONMEM's
-    /// `ISCALE` bounds `[1e-6, 1e6]`. The default (#2986).
-    #[default]
+    /// `ISCALE` bounds `[1e-6, 1e6]`. The preset `m1 2, m1b 2, m2 2, m3 2` (#2986).
     Nonmem,
     /// NONMEM's independence kernels 1 and 1B, then one **preconditioned HMC** transition in
     /// place of kernels 2 and 3 (#2986). The mass matrix is the inverse of the chain's running
@@ -10873,7 +10872,9 @@ pub enum SaemKernel {
     /// draw in a few leapfrog steps; the step size is adapted per chain towards a Metropolis
     /// acceptance probability of 0.8 during exploration and frozen after. The η-gradient is
     /// the AD engine's exact one (with IOV, the stacked `[η, κ]` gradient's η block at the
-    /// chain's κ); a subject it gives none for takes kernels 2 and 3 instead.
+    /// chain's κ); a subject it gives none for takes kernels 2 and 3 instead. The default
+    /// (#2986): the preset `imh 1, hmc 1`.
+    #[default]
     Hmc,
     /// As [`SaemKernel::Hmc`], with a **NUTS** transition (Stan's multinomial No-U-Turn
     /// sampler: trajectories doubled until they U-turn, diverge or reach depth 5) in place of

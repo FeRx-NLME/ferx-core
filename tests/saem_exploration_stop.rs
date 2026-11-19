@@ -227,7 +227,7 @@ fn two_chains_are_the_default_and_the_result_keeps_the_data_subjects() {
     assert_ne!(two.theta, one.theta, "the chain count changes the fit");
 }
 
-/// #2986: `saem_kernel = nonmem` (the default) runs NONMEM's η kernels (independence proposals from the
+/// #2986: `saem_kernel = nonmem` runs NONMEM's η kernels (independence proposals from the
 /// population density and from the running conditional moments, then the block and
 /// componentwise random walks). It must reach the E-step — a different fit from the default
 /// random walk on the same seed — and recover the simulated CL and V as well.
@@ -237,12 +237,15 @@ fn nonmem_kernels_fit_and_differ_from_the_random_walk() {
         o.saem_n_exploration = Some(60);
         o.saem_n_convergence = 60;
     };
-    assert_eq!(FitOptions::default().saem_kernel, ferx_core::types::SaemKernel::Nonmem);
+    assert_eq!(FitOptions::default().saem_kernel, ferx_core::types::SaemKernel::Hmc);
     let rw = run(|o| {
         fixed(o);
         o.saem_kernel = ferx_core::types::SaemKernel::RandomWalk;
     });
-    let nm = run(fixed);
+    let nm = run(|o| {
+        fixed(o);
+        o.saem_kernel = ferx_core::types::SaemKernel::Nonmem;
+    });
     assert_ne!(rw.theta, nm.theta, "the kernel option reaches the E-step");
     for (name, got, truth) in [("CL", nm.theta[0], 5.0), ("V", nm.theta[1], 50.0)] {
         assert!((got / truth - 1.0).abs() < 0.15, "{name}: {got} vs simulated {truth}");
@@ -260,7 +263,10 @@ fn gradient_kernels_are_served_differ_and_recover_the_truth() {
         o.saem_n_exploration = Some(60);
         o.saem_n_convergence = 60;
     };
-    let nm = run(fixed);
+    let nm = run(|o| {
+        fixed(o);
+        o.saem_kernel = SaemKernel::Nonmem;
+    });
     for kernel in [SaemKernel::Hmc, SaemKernel::Nuts] {
         let r = run(|o| {
             fixed(o);
@@ -320,7 +326,7 @@ fn the_gradient_kernel_serves_an_iov_model() {
 
 /// #2986: a user picks the kernels. A combination no preset names — f-SAEM jumps, HMC and a
 /// componentwise sweep — runs, is reported in its order, and differs from HMC alone; the
-/// default reports NONMEM's schedule; every count at 0 is refused with a message naming the
+/// default reports HMC's preset and `nonmem` NONMEM's; every count at 0 is refused with a message naming the
 /// counts.
 #[test]
 fn a_user_chosen_kernel_combination_runs_and_all_zero_is_refused() {
@@ -329,8 +335,12 @@ fn a_user_chosen_kernel_combination_runs_and_all_zero_is_refused() {
         o.saem_n_exploration = Some(40);
         o.saem_n_convergence = 40;
     };
-    let nm = run(fixed);
+    let nm = run(|o| {
+        fixed(o);
+        o.saem_kernel = SaemKernel::Nonmem;
+    });
     assert_eq!(nm.saem_kernels.as_deref(), Some("m1 2, m1b 2, m2 2, m3 2"));
+    assert_eq!(run(fixed).saem_kernels.as_deref(), Some("imh 1, hmc 1"), "the default preset");
     let hmc = run(|o| {
         fixed(o);
         o.saem_kernel = SaemKernel::Hmc;

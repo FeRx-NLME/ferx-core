@@ -3662,7 +3662,7 @@ fn test_mstep_optimizer_round_trips_validates_and_is_scoped() {
 fn test_saem_imh_options_round_trip_validate_and_warn() {
     use crate::types::SaemKernel;
     let mut opts = FitOptions::default();
-    assert_eq!(opts.saem_kernel, SaemKernel::Nonmem, "NONMEM's kernels are the default (#2986)");
+    assert_eq!(opts.saem_kernel, SaemKernel::Hmc, "the HMC preset is the default (#2986)");
     assert_eq!((opts.saem_imh_proposals, opts.saem_imh_refresh), (2, 5), "defaults moved");
     assert_eq!(opts.saem_imh_defensive, 0.05);
     assert_eq!(opts.saem_imh_min_obs_per_eta, 2.0);

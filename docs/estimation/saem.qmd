@@ -36,7 +36,7 @@ Default: 1000 iterations (NONMEM's `NITER` default).
 
 ### NONMEM's kernels {#nonmem-kernels}
 
-The E-step samples each subject's η from its conditional distribution by Metropolis–Hastings. By default (`saem_kernel = nonmem`) it runs NONMEM's SAEM kernels (Users Guide 7.5.1, `ISAMPLE_M1/M1B/M2/M3`), per chain per iteration and in NONMEM's order:
+The E-step samples each subject's η from its conditional distribution by Metropolis–Hastings. With `saem_kernel = nonmem` it runs NONMEM's SAEM kernels (Users Guide 7.5.1, `ISAMPLE_M1/M1B/M2/M3`), per chain per iteration and in NONMEM's order:
 
 | kernel | proposals (default) | proposal |
 |---|---|---|
@@ -67,10 +67,12 @@ Each SAEM iteration moves every chain's random effects with a sequence of kernel
 
 | `saem_kernel` | counts |
 |---|---|
-| `nonmem` (default) | `m1 2, m1b 2, m2 2, m3 2` — NONMEM's SAEM ([NONMEM's kernels](#nonmem-kernels)) |
-| `hmc` | `imh 1, hmc 1` (`m1 1, hmc 1` outside f-SAEM's scope) |
+| `hmc` (default) | `imh 1, hmc 1` (`m1 1, hmc 1` outside f-SAEM's scope) |
+| `nonmem` | `m1 2, m1b 2, m2 2, m3 2` — NONMEM's own kernels ([NONMEM's kernels](#nonmem-kernels)) |
 | `nuts` | `imh 1, nuts 1` (likewise) |
 | `rw`, `imh` | the earlier random-walk and f-SAEM kernels, unchanged; the `isample_*` counts do not apply |
+
+Neither NONMEM nor Monolix runs a gradient kernel inside SAEM: NONMEM's NUTS is a separate full-Bayesian method (`$EST METHOD=NUTS`), and both tools' SAEM E-steps are Metropolis–Hastings kernels set by counts (NONMEM's `ISAMPLE_M1/M1B/M2/M3`, Monolix's m₁…m₄), the convention these counts follow. The default `hmc` targets the same conditional posterior, so SAEM aims at the same estimate. No two implementations reproduce each other's Monte Carlo runs (their random streams differ), so a comparison with NONMEM is of estimates, not iterations; `saem_kernel = nonmem` runs NONMEM's own kernels, the closest algorithmic match.
 
 So `saem_kernel = hmc` with `isample_m3 = 1` adds a componentwise sweep after HMC, `isample_imh = 0` drops its jump, and `isample_hmc = 1` alone adds HMC to NONMEM's four kernels. The fit reports what ran — `saem_kernels: "imh 1, hmc 1"` in `-fit.yaml`, `FitResult::saem_kernels` — and refuses a schedule with every count at 0.
 
