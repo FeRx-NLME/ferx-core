@@ -736,7 +736,9 @@ pub(crate) fn read_nonmem_csv_routed_from(
 /// entries neither named in the caller's list nor referenced by a filter. A
 /// column the model references binds only the header it spells exactly, so a
 /// case-differing reference stays unread (`check_covariates` reports it). Inert
-/// on the auto-detect path.
+/// on the auto-detect path. On the `[covariates]` path the extras are the
+/// referenced-but-*undeclared* columns, so no declared name is among them, and the
+/// caller passes `None` for `covariate_columns` (declarations take precedence).
 fn exact_case_extras(
     covariate_columns: Option<&[&str]>, extra_columns: &[String], filter: Option<&SelectionFilter>,
 ) -> Vec<String> {

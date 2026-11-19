@@ -291,8 +291,7 @@ impl RecordIndex {
 
     /// Indices of the records [`reads_at_break`] assigns to `t_break`, written into `out` (cleared
     /// first). Replaces the exact-bit `obs_map` boundary lookups (the band is a superset). Indices
-    /// come
-    /// back in **time order**, which `ode/ekf.rs` relies on for sequential assimilation.
+    /// come back in **time order**, which `ode/ekf.rs` relies on for sequential assimilation.
     pub(crate) fn records_at_break(&self, t_break: f64, out: &mut Vec<usize>) {
         out.clear();
         // `t < t_break` is false for `NaN`, so the NaN tail sits in the upper partition and
@@ -926,10 +925,9 @@ where
     let distinguishable_growth = 1.0 / reltol.sqrt().clamp(1e-8, 1.0);
     let diverged_ceiling = distinguishable_growth * seed_mag;
     // Seed-scale residual bound (#867): once a divergent map inflates the iterate, the real
-    // per-cycle
-    // surplus hides under the relative test. A genuine fixed point's residual is solver noise, so
-    // it
-    // also clears `√reltol·seed`; combined with non-negativity below, this rejects the inflation.
+    // per-cycle surplus hides under the relative test. A genuine fixed point's residual is solver
+    // noise, so it also clears `√reltol·seed`; combined with non-negativity below, this rejects
+    // the inflation.
     let seed_residual_bound = reltol.sqrt().max(1e-7) * seed_mag + abstol;
     let mut u_hist: Vec<Vec<T>> = Vec::with_capacity(SS_ANDERSON_WINDOW + 1);
     let mut g_hist: Vec<Vec<T>> = Vec::with_capacity(SS_ANDERSON_WINDOW + 1);
@@ -966,9 +964,8 @@ where
             if max_res > seed_residual_bound || !nonneg {
                 return None;
             }
-            // Value converged: one dual Newton step fixes the derivative jets; on a singular `I −
-            // J_P`
-            // (`ρ ≈ 1`) fall back to `g` with its artifact derivative.
+            // Value converged: one dual Newton step fixes the derivative jets; on a singular
+            // `I − J_P` (`ρ ≈ 1`) fall back to `g` with its artifact derivative.
             record_ss_equilibration_cycles(iter + 1);
             crate::dosing::record_ss_equilibration_branch(crate::dosing::SsBranch::Anderson);
             return newton_ss_derivative_correction_g(&g, n, advance_forced).or(Some(g));
@@ -1183,10 +1180,9 @@ fn equilibrate_ss_pk_state(
     // *infusion* into an absorption compartment is out of scope (#719 gap 2).
     if !is_inf && input_rate_consumes_cmt(ode, dose.cmt_raw()) {
         // Periodic-SS solve of `u = P(u)`: closed form for a linear disposition, Anderson for a
-        // nonlinear
-        // one (`equilibrate_ss_input_rate`, records its own cycle count). Only `ρ ≥ 1` returns
-        // `None` and
-        // falls to the capped pulse train + #867 warning below. `prepared` serves both.
+        // nonlinear one (`equilibrate_ss_input_rate`, records its own cycle count). Only `ρ ≥ 1`
+        // returns `None` and falls to the capped pulse train + #867 warning below. `prepared`
+        // serves both.
         let prepared = prepare_input_rates(ode, pk_params_flat);
         if let Some(u_ss) =
             equilibrate_ss_input_rate_lagged(ode, pk_params_flat, dose, lag, f_bio, opts, &prepared)
@@ -1204,8 +1200,7 @@ fn equilibrate_ss_pk_state(
         //
         // A lagged dose (#2786) staggers each synthetic pulse's arrival by the same lag, clamped so
         // lag + route lag stays within one interval: the state after the last cycle is the state at
-        // the
-        // record, `lag` before the arrival.
+        // the record, `lag` before the arrival.
         let route0 = ode
             .input_rate
             .iter()
@@ -1288,11 +1283,10 @@ fn equilibrate_ss_pk_state(
 
     // #914: exact periodic steady state for a LINEAR disposition, `u_ss = (I − M)⁻¹·b` (as the
     // analytical walk #908 and the input-rate branch #835). `advance_forced` integrates one cycle
-    // with
-    // the dose; `advance_unforced` one `II` of disposition alone, the propagator `M` (an infusion's
-    // constant `+RATE` has zero state-Jacobian, so the window length enters only through `b`). A
-    // nonlinear RHS fails the linearity self-check → the capped pulse train below with the #867
-    // warning. Integrates at the tightened `ss_equilibration_opts`.
+    // with the dose; `advance_unforced` one `II` of disposition alone, the propagator `M` (an
+    // infusion's constant `+RATE` has zero state-Jacobian, so the window length enters only through
+    // `b`). A nonlinear RHS fails the linearity self-check → the capped pulse train below with the
+    // #867 warning. Integrates at the tightened `ss_equilibration_opts`.
     let eq_opts = ss_equilibration_opts(opts);
     // Both closures integrate `[0, II]` on a clock whose origin is the pulse, so the RHS reads
     // `TAD = t` (#1139). The propagator probe carries the same anchor as the forced cycle because
@@ -1364,9 +1358,8 @@ fn equilibrate_ss_pk_state(
             }
         } else {
             // Bolus pulse + decay for one cycle. Applied as an instantaneous bolus, which is
-            // correct only
-            // because SS dosing into a built-in absorption compartment is rejected upstream by
-            // `E_ABSORPTION_SS` (`api::check_absorption_dosing`).
+            // correct only because SS dosing into a built-in absorption compartment is rejected
+            // upstream by `E_ABSORPTION_SS` (`api::check_absorption_dosing`).
             u[cmt_idx] += f_bio * dose.amt;
             register_run_in_jac!(&base_rhs, run_in);
             let sol =
@@ -1642,12 +1635,9 @@ pub(crate) fn active_infusion_doses_g<T: crate::sens::num::PkNum>(
             let own = t_start.br_shift_cmp(INFUSION_EPS, Ge, start)
                 && end.br_cmp(Ge, t_end - c(INFUSION_EPS));
             // Earlier SS pulses of an `SS=1` infusion still running at the record (#1121; every
-            // overlapping
-            // pulse when `T_inf > II`) deliver on `[d.time, end_j]` (`ss_residual_infusion_ends`).
-            // They belong
-            // to no `DoseEvent`, so they are admitted here; reset-aware on the record (#1586). One
-            // entry per
-            // running pulse.
+            // overlapping pulse when `T_inf > II`) deliver on `[d.time, end_j]`
+            // (`ss_residual_infusion_ends`). They belong to no `DoseEvent`, so they are admitted
+            // here; reset-aware on the record (#1586). One entry per running pulse.
             let residual = if t_start.br_shift_cmp(INFUSION_EPS, Ge, d.time) {
                 crate::dosing::ss_residual_count_ending_at_or_after_g(
                     d,
@@ -1935,8 +1925,7 @@ type ActiveWindow = (usize, f64, f64, usize);
 
 /// Register the earlier SS pulses still running at the record (`[dose.time, end_j]`) as active
 /// infusions. Pulses ending after `horizon` are interchangeable: up to `PULSES_INDIVIDUAL` go in
-/// one
-/// by one (exact summation order), more as one entry carrying their count, since a rate driven
+/// one by one (exact summation order), more as one entry carrying their count, since a rate driven
 /// toward 0 makes the count astronomically large.
 fn push_residual_windows(
     active: &mut Vec<ActiveWindow>, di: usize, dose: &DoseEvent, lag: f64, f_bio: f64, horizon: f64,
@@ -2209,11 +2198,9 @@ impl<G: crate::sens::num::PkNum> ResetGate<G> {
     }
 
     /// Whether dose `k` is live: not reset by a reached `SS=1` record, not recorded before the
-    /// EVID=3/4
-    /// reset in force, and its compartment not turned off (#2732, `DoseEvent::off_at`; that test is
-    /// exact, without `EVENT_MATCH_TOL`). Also the arrival gate of every state engine (#1588,
-    /// #1587)
-    /// and the membership test of every infusion and zero-order window (#1586).
+    /// EVID=3/4 reset in force, and its compartment not turned off (#2732, `DoseEvent::off_at`;
+    /// that test is exact, without `EVENT_MATCH_TOL`). Also the arrival gate of every state engine
+    /// (#1588, #1587) and the membership test of every infusion and zero-order window (#1586).
     #[inline]
     pub(crate) fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
         use crate::sens::num::BranchCmp::{Ge, Lt};
@@ -2338,13 +2325,11 @@ fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::
             }
             let dose_rate = prepared.get(fi, k);
             // `dose_lagtimes[k]` (`T`) carries `∂t_eff/∂lag = 1` for an estimated lag (#486), a
-            // zero jet
-            // otherwise. The gating comparisons use `.val()`.
+            // zero jet otherwise. The gating comparisons use `.val()`.
             let lag = dose_lagtimes.get(k).copied().unwrap_or(T::from_f64(0.0));
             // Per-route absorption delay (`fn(..., lag=L)`) on top of the compartment lag; `0` when
-            // unlagged.
-            // Analytic on the `Dual2` walk since #859 (the onset jump is the `K_ROUTE_ONSET`
-            // saltation).
+            // unlagged. Analytic on the `Dual2` walk since #859 (the onset jump is the
+            // `K_ROUTE_ONSET` saltation).
             let t_eff = T::from_f64(d.time) + lag + dose_rate.route_lag;
             let tad = t - t_eff;
             let dose_mass =
@@ -2370,10 +2355,8 @@ fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::
                 ss_periodic_forcing_shifted(prep, tad, ii, dose_mass, shift)
             } else if d.is_infusion() {
                 // Infusion into a built-in absorption compartment (#719 gap 2): `R_in` is the
-                // kernel convolved
-                // with the rectangle, `(dose/T)·[G(tad) − G(tad − T)]` (mass-exact); the plain
-                // `+rate` is
-                // suppressed for this compartment.
+                // kernel convolved with the rectangle, `(dose/T)·[G(tad) − G(tad − T)]`
+                // (mass-exact); the plain `+rate` is suppressed for this compartment.
                 let f_bio_k = dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0));
                 // The window carries the jets of `F` (`F·duration`, rate-defined) or of the
                 // modeled `D`/`R` (`infusion_windows`, a dose record that cannot say).
@@ -2402,8 +2385,8 @@ fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::
                 }
                 let end = t_eff + window;
                 // The segment decides its side of the window end; a stage past the end of a segment
-                // that starts
-                // before it is read on the tail side by its own time (integrator time slack).
+                // that starts before it is read on the tail side by its own time (integrator time
+                // slack).
                 let ended = end.br_cmp(crate::sens::num::BranchCmp::Le, reached);
                 if T::RECORDS_BRANCHES && !ended {
                     // A recording type decides that by the stage's own time as a *selection*

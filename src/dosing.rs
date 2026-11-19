@@ -143,6 +143,9 @@ pub(crate) fn resolve_subject_doses<'a>(
 ///
 /// 1. A record resolves to **itself**, a non-record to the **next record ahead**.
 /// 2. Past the final record, slots keep the **last record that ran** (forward fill).
+///    Not observable through predictions today (no observation follows such a boundary), but the
+///    four walks once split between the last record and the dose row, which would become live
+///    once a trailing record, a reset or a second pass reads the state.
 ///
 /// `None` in every slot only when the timeline has no record at all.
 pub(crate) fn governing_record_indices(
@@ -216,7 +219,8 @@ pub(crate) const SS_EQUILIBRATION_CYCLES: usize = 50;
 
 /// Relative-`L∞` tolerance for the SS equilibration **early stop** (#519). The cycle is a
 /// geometric contraction (`≈ exp(−λ·II)`), so once a step is below this the truncation is at
-/// f64 precision. `λ·II ≈ 2` stops in ~14 cycles; `λ·II ≈ 0.1` runs the full
+/// f64 precision. Conservative: the dropped tail is far below the provider-vs-production parity
+/// tolerance, so values are unchanged for any realistic PK. `λ·II ≈ 2` stops in ~14 cycles; `λ·II ≈ 0.1` runs the full
 /// [`SS_EQUILIBRATION_CYCLES`].
 pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
 
@@ -229,7 +233,9 @@ pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
 /// `T`-typed algebra. Over a dual `T` the solve carries `∂u_ss/∂(θ,η)` automatically.
 ///
 /// Callers: the ODE path (#835, RK45, so `vtol` scales with its `reltol`/`abstol`; may be
-/// nonlinear) and the analytical walks (#908, exact propagators, `reltol = abstol = 0`).
+/// nonlinear) and the analytical walks (#908, exact closed-form propagators, so `reltol = abstol = 0`
+/// leaves `vtol = 1e-9·scale`, the pure rounding floor; their disposition is always linear, so the
+/// self-check is a can't-happen assertion there).
 ///
 /// Returns `None` on a nonlinear map, a singular `I − M` (a zero eigenvalue: no periodic SS,
 /// so the capped fallback plus [`note_ss_nonconvergence_if_capped`] applies), or a non-finite
@@ -274,9 +280,11 @@ where
     // itself does not depend on the verdict. The scale is a magnitude only (`abs_hint`).
     let scale = u_ss.iter().fold(1e-12_f64, |a, x| a.max(x.abs_hint()));
     // A linear map's ODE residual is a solver-noise floor ≈ 45·reltol (different adaptive
-    // steps for `b` and the check); `256·reltol` clears it ~5× while a nonlinear map's O(scale)
-    // residual (~1e8·reltol) is rejected. Analytical callers get `1e-9·scale`, seven orders
-    // above their measured ~1e-16 residual.
+    // steps for `b` and the check); `256·reltol` clears it ~5× (the original `32·reltol` falsely
+    // declined linear models at a tight `ode_reltol`, e.g. 1e-10) while a nonlinear map's
+    // O(scale) residual (~1e8·reltol) is rejected (see
+    // `ss_input_rate_nonlinear_disposition_falls_back_to_iteration`). Analytical callers get
+    // `1e-9·scale`, seven orders above their measured ~1e-16 residual.
     let vtol = (256.0 * reltol + 1e-9) * scale + 256.0 * abstol;
     // `|c − u| ≤ vtol` is `< next_up(vtol)`, exactly, for a finite `vtol`.
     let vtol_open = vtol.next_up();
@@ -536,7 +544,10 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 /// the adaptive driver; #1652). Writes outside any scope land in bucket `0`.
 /// [`clear_ss_nonconvergence_warnings`] on entry and the take on exit bracket the run's set, so
 /// code running inside an entry point must not call a draining one (hence
-/// `api::predict_diag_undrained` in `suggest_start::sweep`).
+/// `api::predict_diag_undrained` in `suggest_start::sweep`). Bare `predict()` / `simulate()`
+/// wrap their `_diag` forms, so they drain too and discard the note. Writers that do not drain
+/// (e.g. `pk::compute_predictions_with_states`) leave their note for the next draining entry
+/// point of the same run, whose clear discards it.
 type SsSink = std::sync::Mutex<std::collections::HashMap<u64, std::collections::BTreeSet<String>>>;
 
 fn ss_nonconvergence_sink() -> &'static SsSink {

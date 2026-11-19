@@ -10845,12 +10845,14 @@ pub enum InnerOptimizer {
 /// Parameter-scaling strategy for the outer optimizer; supersedes the legacy
 /// [`FitOptions::scale_params`] bool when not `None`. `Rescale2` + `bfgs` reaches OFV
 /// −1198.97 on `two_cpt_oral_cov` (nlmixr2 −1199.24) where unscaled optimizers stall near
-/// −1152/−1192, but it harms `Bobyqa` (`emax_pkpd` −36.76 → −13.51, `three_cpt_iv`
-/// −730.6 → −715.9), hence the default [`Auto`](Self::Auto).
+/// −1152/−1192, but bound width is unrelated to curvature: it harms `Bobyqa` (`emax_pkpd`
+/// −36.76 → −13.51, `three_cpt_iv` −730.6 → −715.9) and drove L-BFGS into a bound on
+/// ill-conditioned fits, hence the default [`Auto`](Self::Auto) resolves to `Abs`
+/// (`outer_optimizer::resolve_scaling`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ParameterScaling {
-    /// Default: `Rescale2` for the gradient-based optimizers (`Bfgs`, `Lbfgs`, `NloptLbfgs`,
-    /// `Slsqp` — the latter fixes cold starts on IOV models, #335), else unscaled with the
+    /// Default: `Abs` for the gradient-based optimizers (`Bfgs`, `Lbfgs`, `NloptLbfgs`,
+    /// `Slsqp` — which also keeps its IOV cold-start win, #335), else unscaled with the
     /// legacy `scale_params` / IOV auto-enable.
     #[default]
     Auto,

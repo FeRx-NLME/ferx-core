@@ -992,6 +992,15 @@ fn residual_magnitude_at_class(
 /// This is the *error* half; the within-occasion-variation warning is
 /// [`check_kappa_weight_variation`]. They are separate walks so neither caller pays
 /// for the other's work.
+///
+/// A `theta NAME[...]` block that was never bound to data has no levels, so every
+/// gather out of it is `NaN` (#1064). `fit()` refuses such a model up front with its
+/// own message; this is the same guard for the simulate and predict paths, which do
+/// not go through `fit()`. Binding happens in `api::levels::bind_theta_levels`, which
+/// every file entry point calls, so the case caught here is an in-memory caller that
+/// assembled the `CompiledModel` itself. `entry` picks the suggestion: the message is
+/// shared, but only a simulation has a design population and a binding file entry
+/// point to name.
 pub(crate) fn check_unbound_theta_levels(
     model: &CompiledModel, entry: UnboundLevelsEntry,
 ) -> Vec<Diagnostic> {
@@ -4749,8 +4758,7 @@ pub(crate) fn check_survival_tv_covariates(
 /// *bit-identical* across `KT = 0` and `KT = 0.05`.
 ///
 /// Until a per-record disposition reaches the hazard pass (#1920), refuse. **The granularity is per
-/// parameter and per endpoint**, so the refusal fires only where freezing *that* parameter can
-/// reach
+/// parameter and per endpoint**, so the refusal fires only where freezing *that* parameter can reach
 /// *that* accumulator, sparing a quantity read at each dose record (`MTT`, `ALAG1`, `F`,
 /// `D{n}`/`R{n}`, #1575) and a parameter the accumulator does not depend on (`CL` when
 /// `hazard = H0`, an `init()` of a state the hazard never sees).
@@ -4762,16 +4770,14 @@ pub(crate) fn check_survival_tv_covariates(
 /// remedy (delete the term) is right anyway. Both analyses are also flow-insensitive with respect
 /// to *kills* (#1931): a `TIME`-dependent definition a later unconditional assignment discards is
 /// still followed. That errs loud; a kill-aware pass could false-*accept* by mistaking a
-/// conditional
-/// write for a kill. Pinned by `the_time_mask_and_the_slice_ignore_a_killed_definition`.
+/// conditional write for a kill. Pinned by `the_time_mask_and_the_slice_ignore_a_killed_definition`.
 ///
 /// Returns `None` for a model with no `OdeAccumulated` hazard or none of whose `TIME`-dependent
 /// individual parameters can reach one. `fit()` and every predict / simulate entry point surface it
 /// as an `Err`.
 ///
 /// **Not wired into `predict_categorical`**: #741's check is there because the logit predictor
-/// itself
-/// is evaluated at a frozen snapshot, while this freeze is read only by `ode_cumhaz_hazard` and
+/// itself is evaluated at a frozen snapshot, while this freeze is read only by `ode_cumhaz_hazard` and
 /// `draw_ode_tte_latent`, which that entry point never calls; a call there would refuse a
 /// categorical prediction whose own answer is unaffected.
 ///
@@ -4782,8 +4788,7 @@ pub(crate) fn check_survival_tv_covariates(
 ///
 /// **One gate, not two.** A `compiled_model_uses_time_builtin` fast exit in front of the loop would
 /// read as the load-bearing narrow-vs-wide choice but is not: swapping the narrow flag for the wide
-/// one left all seven unit tests green because `params_reading_time` already answers all-`false`
-/// for
+/// one left all seven unit tests green because `params_reading_time` already answers all-`false` for
 /// a model whose `TIME`-reading is only in the `[odes]` RHS (honoured by the integrator clock,
 /// #610).
 /// The mask is the gate; `.min()?` on the endpoint list is the cheap discriminator in front of it.

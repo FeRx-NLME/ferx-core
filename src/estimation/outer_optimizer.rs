@@ -670,7 +670,8 @@ fn freeze_flat_thetas(
 
 /// The flat-θ candidates of the #826 pre-flight: each free θ whose outer gradient is
 /// negligible, absolutely and against the largest free θ gradient; `None` when there is
-/// none or the whole θ gradient is ~0. Only the machine-precision-zero case is frozen,
+/// none or the whole θ gradient is ~0. θ are the first `n_theta` packed coordinates, so `grad[i]`
+/// is d(OFV)/d(coord_i) for θ `i`. Only the machine-precision-zero case is frozen,
 /// never a weakly identified θ. Shared by [`freeze_flat_thetas`] and the profiled loop
 /// (#2136) so the two agree.
 pub(crate) fn flat_theta_candidates(
@@ -1901,6 +1902,12 @@ fn guard_penalty_value(xs: &[f64], lower_s: &[f64], upper_s: &[f64]) -> f64 {
     BASE + 50.0 * pen
 }
 
+/// Latches `stagnation_stopped` once recent evals show no OFV progress (SLSQP on
+/// poorly-identified, e.g. γ-bearing, FOCEI problems can otherwise spend 30+ min at a
+/// numerically-flat OFV before its xtol/ftol criteria fire).
+///
+/// `enabled = false` disables the guard entirely: never latches and never reports
+/// stagnation, so the optimizer runs to its own termination criterion (or `outer_maxiter`).
 fn detect_stagnation(
     state: &mut NloptState, n: usize, enabled: bool, short_window: bool,
     still_descending: impl FnOnce() -> bool,
@@ -2383,7 +2390,19 @@ fn compute_rescale2_scale(bounds: &PackedBounds) -> Vec<f64> {
 }
 
 /// Resolve [`ParameterScaling::Auto`]: `Abs` (normalise by |packed value|) for the gradient
-/// optimizers (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`), `None` otherwise. (#335)
+/// optimizers (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`), `None` otherwise (#335).
+///
+/// `Abs` presents O(1) coordinates, the right preconditioner for a quasi-Newton / SQP step.
+/// The earlier `Rescale2` (bound half-width) was wrong for them: bound width is unrelated
+/// to curvature, so it drove L-BFGS into a bound (warfarin FOCEI −286→−243; tvcov to a +166
+/// local min) and froze SLSQP's first step (two_cpt_oral_cov −1026, no move). `Abs` recovers
+/// warfarin −286, tvcov −188.6 and two_cpt_oral_cov −1165, and keeps SLSQP's warfarin_iov
+/// cold-start win (OFV 307.8).
+///
+/// Derivative-free `Bobyqa` stays unscaled: per-coordinate scaling distorts its trust-region
+/// quadratic model and regresses multi-cpt / PD fits (emax_pkpd −36.8→−13.5, three_cpt_iv
+/// −730.6→−715.9). `Mma` / `TrustRegion` take the unscaled legacy branch. Non-`Auto` values
+/// pass through.
 fn resolve_scaling(ps: ParameterScaling, opt: Optimizer) -> ParameterScaling {
     match ps {
         ParameterScaling::Auto => match opt {
@@ -3553,8 +3572,10 @@ pub(crate) fn final_ebe_check(
 /// are over *feasible* (unguarded) evals only, so guard thrashing cannot pad them. `true`
 /// only when all hold:
 ///   - **progress**: the last significant improvement is after feasible eval 1
-///     (`last_sig_feasible_eval >= 2`; eval 1 only sets the baseline, so a stall at the
-///     start — e.g. L-BFGS's overshoot on warfarin FOCEI — fails);
+///     (`last_sig_feasible_eval >= 2`; 1-based over feasible evals, `0` = none seen). Eval 1
+///     only sets the baseline, so a stall at the start (L-BFGS's overshoot on warfarin
+///     FOCEI) fails, and so does a guard-rejected eval 1 followed by a feasible one, which
+///     is a failed start and not descent;
 ///   - **left init**: the best point is at least [`INIT_ESCAPE_STEP_S`] from `x₀` (the
 ///     user-ODE warfarin twin improved 0.028 once and went flat, #751);
 ///   - **plateau**: the flat tail (`feasible_evals − last_sig_feasible_eval`) is at least
@@ -3588,6 +3609,9 @@ const START_PROBE_TOL: f64 = 1e-2;
 /// - `Some(true)` — the probe **converged** to within the tolerance: a warm start at an
 ///   optimum;
 /// - `None` — anything else: no evidence, the fit stays a stall.
+///
+/// The question is asked of the optimizer, not of a finite-difference certificate: bounds,
+/// flat directions and saddles are the optimizer's to handle, and it handles them on every fit.
 fn start_probe_verdict(start_ofv: f64, probe_ofv: f64, probe_converged: bool) -> Option<bool> {
     if !ofv_is_valid(start_ofv) || !ofv_is_valid(probe_ofv) {
         None
@@ -3689,7 +3713,8 @@ fn verified_start_result(
     probe.n_iterations += unmoved.n_iterations;
     // The covariance quartet goes with `packed_estimate` (#816). The covariance step's warnings
     // cannot be told apart from the probe's others, so off NLopt they stay the probe's (a point
-    // within `START_PROBE_TOL`); on NLopt the step is deferred to the reported point. The probe's restart cause stays (adopted only when lower).
+    // within `START_PROBE_TOL`); on NLopt the step is deferred to the reported point. The
+    // probe's restart cause stays (adopted only when lower).
     if start_wins {
         probe.params = unmoved.params;
         probe.ofv = unmoved.ofv;
@@ -5412,6 +5437,9 @@ pub(crate) struct PassState<'a> {
 /// leaves nothing behind. Its latch and its #2093 probe describe the point it explored, not
 /// the incumbent, so they go back: a cold round's probe would otherwise stop the Newton round
 /// and send a verified stop to a restart on another point's evidence.
+///
+/// `stop_is_free` is asked once, before the first pass, whether the verified stop may take
+/// passes at all ([`verified_stop_owes_a_restart`]).
 pub(crate) fn drive_leg_passes<V>(
     warm: V, end_of: impl Fn(&V) -> PolishEnd, cancelled: impl Fn() -> bool, state: PassState<'_>,
     stop_is_free: impl FnOnce() -> bool, mut pass: impl FnMut(LegStart, &V) -> V,
@@ -5585,6 +5613,10 @@ fn optimize_nlopt_once(
 ///   ([`outer_eval_budget`]), so the two legs together never exceed the
 ///   `outer_maxiter` the user set. The caller does not restart on an empty
 ///   budget: `set_maxeval(0)` means *unlimited* to NLopt, not "no evaluations".
+///
+/// With `defer_covariance` the covariance step is left to the caller: [`optimize_nlopt`] runs
+/// it once, on the attempt it reports, rather than on every attempt of its retry and restart
+/// chain (a restarted fit used to pay a full step for a result it then replaced).
 #[allow(clippy::too_many_arguments)]
 fn optimize_nlopt_attempt(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters,
@@ -5658,7 +5690,16 @@ fn optimize_nlopt_attempt_probed(
         crate::estimation::inner_optimizer::build_schedule_cache(model, population);
 
     // Per-element scale factors: present O(1) coordinates to NLopt — see
-    // `nlopt_scale_vector` for which coordinates stay unscaled and why. (#101, #2) (#155, #490)
+    // `nlopt_scale_vector` for which coordinates stay unscaled and why.
+    //
+    // IOV + SLSQP auto-enables per-coordinate scaling (#101): IOV models pack disparate
+    // magnitudes (block-diagonal omega plus the kappa block), and SLSQP's uniform gradient cap
+    // (`cap_scaled_gradient`, every SLSQP eval) would otherwise rescale the whole gradient by
+    // the worst (theta) component and starve the omega / omega_iov step. The #99 regression that
+    // made scaling default-off was on non-IOV models and other algorithms (notably MMA), so the
+    // auto-enable is scoped to the combination that needs it. Since #155/#490 the default
+    // optimizer is `Auto` (`NloptLbfgs` / BOBYQA, gradient-free, no starvation), so this fires
+    // only for an explicit `optimizer = slsqp` on IOV models.
     let auto_scale_iov = model.n_kappa > 0 && matches!(options.optimizer, Optimizer::Slsqp);
     let scale =
         nlopt_scale_vector(&x0, init_params, &bounds, options, auto_scale_iov, identity_scales);
@@ -6154,7 +6195,9 @@ fn optimize_nlopt_attempt_probed(
         // Parameter priors (#254). Unlike the NN penalty this is already a
         // function of the packed vector, so there is nothing to map: `x` *is*
         // the space the penalty is defined in, and `prior_grad` is spliced into
-        // `grad_raw` below without a change of variables.
+        // `grad_raw` below without a change of variables. Value and gradient come from one
+        // call on purpose (`PriorSet::penalty_and_gradient`): taken separately, deleting only
+        // the gradient half left the whole integration suite green.
         let mut prior_grad: Vec<f64> =
             if grad.is_some() && priors.is_active() { vec![0.0; n] } else { Vec::new() };
         let prior_penalty = if prior_grad.is_empty() {
@@ -7371,7 +7414,17 @@ fn optimize_nlopt_attempt_probed(
     // actually binds — `inner_maxiter`, or `max_unconverged_frac` — so offering the outer
     // knob beside it sends the reader at the wrong one. Only the *advice* is withheld:
     // `max_eval_reached` itself still reads true, so `latched_stop_needs_plateau_check`
-    // above and the second arm's own conditions are unchanged. (#2, #486)
+    // above and the second arm's own conditions are unchanged.
+    //
+    // One binding read by **both** budget warnings rather than the same condition written
+    // twice. The `MaxEvalReached` arm just below is reachable (pinned by
+    // `a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter`); the bare
+    // `Failure`-with-spent-budget arm further down is not: it needs NLopt to return a bare
+    // `Failure`, and the guard penalty is an exact quadratic whose value and gradient agree
+    // (#486), so no line search fails on it. Measured with this gate removed (`slsqp` /
+    // `nlopt_lbfgs` / `mma`, three outer budgets, all-rejected trace): every run ended in a
+    // *success* state with its budget exactly spent. Written twice, the unreachable copy would
+    // be an independently breakable gate no test can reach.
     let budget_advice_applies = !feasibility.no_feasible();
 
     // A spent evaluation budget gets a targeted "increase maxiter" warning; every
@@ -8017,6 +8070,15 @@ fn nlopt_stop_label<T>(result: &Result<(nlopt::SuccessState, T), (nlopt::FailSta
 /// one. Such a run is reported as it stands, with an "increase maxiter" warning
 /// of its own: the ordinary budget warning is keyed on `MaxEvalReached`, which a
 /// line search that fails after crossing `maxeval` never returns. (#1617)
+///
+/// `no_feasible_eval` is [`RunFeasibility::no_feasible`]: not one evaluation scored the real
+/// objective (#1617). Such a leg has nothing to descend from: after the restore it reports the
+/// point it was handed, so the restart would begin exactly where this leg began (same cap
+/// state, fresh `(s, y)` memory as this leg had). That is a deterministic replay of a prefix
+/// of the leg that just failed, which cannot find a feasible evaluation the first leg missed,
+/// and the strictly-lower adoption rule would discard it. A fourth argument, like the
+/// objective, rather than a term folded into `stalled_mid_descent` at the call site (which
+/// reads that verdict *before* it is demoted).
 ///
 /// This is **not** the same trade as the #751 `left_init` retry, which *is* run on an
 /// infeasible leg: that retry passes `hold_cap_at_init = true`, so its opening step is
@@ -9512,6 +9574,9 @@ impl Drop for WarmPredictorOff {
 /// beyond `x` itself (#1520): the objective there, the per-subject contributions that
 /// objective is the sum of, and the same pair at the **incumbent** — the best evaluation
 /// the optimizer has accepted so far. [`skip_fd_salvage`] is its only reader.
+/// [`OuterTrial::unknown`] disarms the guard: the first evaluation of a fit, the
+/// `freeze_flat_thetas` pre-flight, the mixture branch (no per-subject decomposition) and
+/// every test that wants the plain assembly pass it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct OuterTrial<'a> {
     /// The objective the optimizer ranks this point on — penalties included, the EBE-guard
@@ -10534,9 +10599,13 @@ fn sens_check_enabled() -> bool {
 /// Population gradient dispatcher. IOV models (`n_kappa > 0`) and TTE / discrete
 /// models with η (#1778) use the EBE-reconverging FD gradient — their weakly-identified
 /// variance components / η-dependent data-term curvature need it — and everything else
-/// uses the
-/// cheap analytical fixed-EBE gradient unless the `reconverge_gradient_interval`
+/// uses the cheap analytical fixed-EBE gradient unless the `reconverge_gradient_interval`
 /// schedule opts this evaluation into the reconverged path.
+///
+/// `grad_eval_idx` is the caller's count of gradient evaluations so far; this function reads
+/// it to apply the schedule and then advances it. Owning the counter here keeps every
+/// optimizer path (NLopt objective, NLopt fallback, BFGS) on one definition of "gradient
+/// evaluation", so they cannot drift apart in how they count or pick the gradient.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn population_gradient(
     x: &[f64], n_subj: usize, init_params: &ModelParameters, model: &CompiledModel,
