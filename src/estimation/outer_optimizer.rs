@@ -261,16 +261,11 @@ pub(crate) fn resolve_outer_optimizer(
 }
 
 /// Whether the exact Hessian serves `model` under `options`: the covariance step's own
-/// prediction of its R-matrix route ([`crate::estimation::covariance::predicted_r_route`]),
+/// prediction of its R-matrix route (`covariance::analytic_r_expected`),
 /// which is the Hessian the trust region models with. `false` under
 /// `analytic_cov_hessian = false` and wherever a subject is outside the exact scope.
-pub(crate) fn exact_hessian_serves(
-    model: &CompiledModel,
-    options: &FitOptions,
-    has_mixture: bool,
-) -> bool {
-    crate::estimation::covariance::predicted_r_route(model, options, has_mixture)
-        == crate::estimation::covariance::PredictedRRoute::Analytic
+pub(crate) fn exact_hessian_serves(model: &CompiledModel, options: &FitOptions) -> bool {
+    crate::estimation::covariance::analytic_r_expected(model, options)
 }
 
 /// Run the outer optimizer for one stage from `init_params`.
@@ -317,7 +312,7 @@ pub fn optimize_population(
         model,
         init_params.mixture.is_some(),
         crate::sens::provider::analytic_outer_gradient_available(model),
-        exact_hessian_serves(model, options, init_params.mixture.is_some()),
+        exact_hessian_serves(model, options),
     );
     let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;

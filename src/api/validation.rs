@@ -7092,11 +7092,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 // The exact Hessian as the unforced fit would have it: `gradient = fd` also
                 // moves the covariance step to the stencil, and the counterfactual asks what
                 // `auto` picks with the gradient left at `auto`.
-                crate::estimation::outer_optimizer::exact_hessian_serves(
-                    model,
-                    &unforced_options,
-                    has_mixture,
-                ),
+                crate::estimation::outer_optimizer::exact_hessian_serves(model, &unforced_options),
             )
             .0
         };
