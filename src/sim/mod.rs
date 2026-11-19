@@ -6,5 +6,5 @@
 //! driver lives in [`crate::ode::predictions`] and the public
 //! [`crate::api::simulate_adaptive`] entry point wraps it.
 
-pub mod adaptive;
+pub use ferx_model::sim::adaptive;
 pub mod adaptive_control;

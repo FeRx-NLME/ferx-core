@@ -56,24 +56,6 @@ pub enum BicType {
     Fixed,
 }
 
-impl BicInputs {
-    /// Total free parameters in the tally; equals `FitResult::n_parameters`
-    /// for a result produced by `fit()`.
-    pub fn n_free(&self) -> usize {
-        self.theta_random + self.theta_fixed + self.omega + self.kappa + self.sigma
-    }
-
-    /// Free parameters penalised on `ln(n_subjects)` by the mixed BIC.
-    pub fn n_random_class(&self) -> usize {
-        self.theta_random + self.omega + self.kappa + if self.sigma_random { self.sigma } else { 0 }
-    }
-
-    /// Free parameters penalised on `ln(n_obs)` by the mixed BIC.
-    pub fn n_fixed_class(&self) -> usize {
-        self.theta_fixed + if self.sigma_random { 0 } else { self.sigma }
-    }
-}
-
 /// The BIC of a fit under one of the four penalty conventions.
 ///
 /// `OFV + penalty`, where the penalty is:

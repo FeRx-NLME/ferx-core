@@ -544,7 +544,7 @@ impl ViWire {
         };
         let eta_covs = rows(|p| p.cov.as_ref());
         let kappa_means = rows(|p| p.kappa_means.as_ref());
-        Ok(ViResult {
+        Ok(ferx_model::construct::vi_result(ferx_model::construct::ViResultParts {
             neg_two_elbo: self.neg_two_elbo,
             data_term: self.data_term,
             kl_term: self.kl_term,
@@ -562,7 +562,7 @@ impl ViWire {
             n_fd_subjects: self.n_fd_subjects,
             elbo_tightness_ratio: self.elbo_tightness_ratio,
             superseded_by: self.superseded_by,
-        })
+        }))
     }
 }
 

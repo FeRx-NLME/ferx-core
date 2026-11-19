@@ -1,42 +1,42 @@
 pub mod api;
 pub mod build_info;
-pub mod cancel;
+pub use ferx_model::cancel;
 #[cfg(feature = "survival")]
-pub mod categorical;
-pub(crate) mod cold_sort;
-pub(crate) mod covariate_stats;
-pub mod diagnostics;
-pub(crate) mod dosing;
-pub mod edit;
-pub(crate) mod entry_refusals;
-pub mod environment;
+pub use ferx_model::categorical;
+pub(crate) use ferx_model::cold_sort;
+pub(crate) use ferx_model::covariate_stats;
+pub use ferx_model::diagnostics;
+pub(crate) use ferx_model::dosing;
+pub use ferx_model::edit;
+pub(crate) use ferx_model::entry_refusals;
+pub use ferx_model::environment;
 pub mod estimation;
 pub mod frem;
 pub mod io;
-pub(crate) mod levels;
+pub(crate) use ferx_model::levels;
 #[cfg(feature = "markov")]
-pub mod markov;
-pub(crate) mod model_checks;
+pub use ferx_model::markov;
+pub(crate) use ferx_model::model_checks;
 pub mod model_selection;
-pub mod nn;
-pub(crate) mod occasions;
-pub mod ode;
-pub(crate) mod par;
-pub mod parser;
-pub mod pk;
+pub use ferx_model::nn;
+pub(crate) use ferx_model::occasions;
+pub use ferx_model::ode;
+pub(crate) use ferx_model::par;
+pub use ferx_model::parser;
+pub use ferx_model::pk;
 pub(crate) mod pool;
 pub mod propensity_match;
-pub(crate) mod rng;
-pub(crate) mod scratch;
-pub mod sens;
-pub(crate) mod serde_nalgebra;
+pub(crate) use ferx_model::rng;
+pub(crate) use ferx_model::scratch;
+pub use ferx_model::sens;
+pub(crate) use ferx_model::serde_nalgebra;
 pub mod sim;
-pub(crate) mod sim_result;
+pub(crate) use ferx_model::sim_result;
 pub mod stats;
 pub mod suggest_start;
 #[cfg(feature = "survival")]
-pub mod survival;
-pub mod types;
+pub use ferx_model::survival;
+pub use ferx_model::types;
 
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
@@ -136,4 +136,4 @@ mod debug_assertion_canary;
 
 /// Model texts shared by test modules (written once instead of per test).
 #[cfg(test)]
-pub(crate) mod test_models;
+pub(crate) use ferx_model::test_models;

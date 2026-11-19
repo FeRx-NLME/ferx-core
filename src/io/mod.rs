@@ -1,10 +1,10 @@
 pub mod checkpoint;
 pub(crate) mod data_source;
-pub mod datareader;
-pub mod filter_expr;
-pub(crate) mod fit_estimates;
+pub use ferx_model::io::datareader;
+pub use ferx_model::io::filter_expr;
+pub(crate) use ferx_model::io::fit_estimates;
 pub mod fitrx;
-pub mod hash;
+pub use ferx_model::io::hash;
 pub(crate) mod model_source;
-pub mod output;
-pub(crate) mod serde_nan;
+pub use ferx_model::io::output;
+pub(crate) use ferx_model::io::serde_nan;

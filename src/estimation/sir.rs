@@ -57,12 +57,6 @@ pub struct SirResult {
     pub settings: SirSettings,
 }
 
-impl Default for SirSettings {
-    fn default() -> Self {
-        Self::from_options(&FitOptions::default())
-    }
-}
-
 impl SirResult {
     /// `ci_kappa` as `FitResult.sir_ci_kappa` carries it: `None` for a model
     /// with no kappa, so a non-IOV fit's writers and `.fitrx` are unchanged

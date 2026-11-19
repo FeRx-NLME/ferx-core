@@ -1,0 +1,4202 @@
+use super::*;
+use approx::assert_relative_eq;
+
+/// `CompiledModel.endpoints` iterates in ascending CMT order — not declaration order, not
+/// a hash order — on every compile (#2531): the contract every sum, row and message over
+/// endpoints rests on. The blocks are declared in descending CMT order so declaration
+/// order and CMT order disagree. Mutation: revert the field to a `HashMap` (which also
+/// reddens the per-site order tests).
+#[cfg(feature = "survival")]
+#[test]
+fn endpoints_iterate_in_ascending_cmt_order_on_every_compile() {
+    use crate::survival::endpoint_order_test_helpers::COMPILES;
+    let src = "[parameters]\n  theta TVA(0.10, 0.001, 10.0)\n\
+               [event_model c]\n  cmt = 4\n  family = exponential\n  scale = TVA\n\
+               [event_model b]\n  cmt = 3\n  family = exponential\n  scale = TVA\n\
+               [event_model a]\n  cmt = 2\n  family = exponential\n  scale = TVA\n";
+    for k in 0..COMPILES {
+        let m = crate::parser::model_parser::parse_model_string(src).expect("parse");
+        let keys: Vec<usize> = m.endpoints.keys().copied().collect();
+        assert_eq!(keys, vec![2, 3, 4], "compile {k}");
+    }
+}
+
+/// Phase 4.0: the `Category` / `Count` `SimOutcome` variants compile
+/// unconditionally (shared categorical/count/Markov draw shapes) and derive
+/// Debug/Clone. The Gaussian path is unchanged.
+#[test]
+fn sim_outcome_category_and_count_variants_construct() {
+    let c = SimOutcome::Category { state: 2 };
+    let n = SimOutcome::Count { count: 5 };
+    assert!(format!("{c:?}").contains("Category"));
+    assert!(format!("{n:?}").contains("Count"));
+    let _ = c.clone();
+    let _ = n.clone();
+    assert_eq!(SimOutcome::Continuous { value: 4.25 }.continuous_value(), 4.25);
+}
+
+/// Calls `f` and reports whether the misuse `debug_assert!` inside it fired.
+///
+/// `continuous_value()` on a non-Gaussian outcome has two correct behaviours and
+/// which one you get is a property of the profile: with the guards live it panics,
+/// with them compiled out it returns NaN. Both matter — the guard is the developer
+/// signal, the NaN is what a release user actually gets — so the tests below assert
+/// whichever the current build promises rather than switching themselves off.
+///
+/// They used to be `#[cfg(not(debug_assertions))]`, which was correct while every
+/// CI profile inherited `release`. #1248 moved the coverage jobs onto `ci-cov`,
+/// where the guards ARE live, and a `cfg`-gated test does not fail there — it
+/// silently stops existing, in the only jobs that ran it. Measured at the time:
+/// three tests, and `src/types.rs:3490` and `:3494` went from 2 hits to 0.
+///
+/// The panic hook is left ALONE, so under a guarded profile each expected panic
+/// prints its message to the test log. That noise is deliberate. The obvious
+/// tidier version — `take_hook`, install a silent one, restore — is not merely
+/// racy in the "a concurrent failure loses its message" sense: `set_hook` is
+/// process-global and these expected-panic paths can run concurrently in the same
+/// lib-test process, so the interleaving where A takes the normal hook, B takes
+/// the *silent* hook A installed, A restores normal and B restores silent leaves
+/// the whole process permanently silenced. Restoring immediately does not help;
+/// only a shared lock would, and three expected panic messages are cheaper than
+/// that machinery. Raised by review on PR #1293.
+fn guard_fired(f: impl FnOnce() -> f64) -> Result<f64, ()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| ())
+}
+
+/// `continuous_value()` on the non-Gaussian outcomes: the misuse guard fires where
+/// `debug_assert!` is live, and the NAN branch is taken where it is not.
+#[test]
+fn sim_outcome_category_and_count_continuous_value_is_nan() {
+    for out in [SimOutcome::Category { state: 3 }, SimOutcome::Count { count: 9 }] {
+        let got = guard_fired(|| out.continuous_value());
+        if cfg!(debug_assertions) {
+            assert!(
+                got.is_err(),
+                "{out:?}: the misuse `debug_assert!` in continuous_value() did not \
+                 fire, even though this build has debug-assertions on"
+            );
+        } else {
+            assert!(
+                got.expect("no guard in a release-derived build").is_nan(),
+                "{out:?}: continuous_value() must return NAN once the guard is \
+                 compiled out"
+            );
+        }
+    }
+}
+
+/// The TTE `Event` outcome likewise has no continuous value. Same two behaviours
+/// as above.
+#[test]
+#[cfg(feature = "survival")]
+fn sim_outcome_event_continuous_value_is_nan() {
+    let out = SimOutcome::Event { time: 1.0, observed: true };
+    let got = guard_fired(|| out.continuous_value());
+    if cfg!(debug_assertions) {
+        assert!(got.is_err(), "the misuse `debug_assert!` for the Event outcome did not fire");
+    } else {
+        assert!(
+            got.expect("no guard in a release-derived build").is_nan(),
+            "continuous_value() on an Event outcome must return NAN once the guard \
+             is compiled out"
+        );
+    }
+}
+
+/// `effective_cov_inner_tol` resolves the covariance-step reconvergence tolerance:
+/// an explicit `cov_inner_tol` wins; otherwise the fit's `inner_tol`, tightened to
+/// at most `LTBS_COV_INNER_TOL` (1e-8) for LTBS models only (non-LTBS unchanged).
+#[test]
+fn effective_cov_inner_tol_resolution() {
+    let mut o = FitOptions::default();
+    o.cov_inner_tol = None;
+    o.inner_tol = 1e-5;
+    // Non-LTBS: unchanged (byte-identical to before this option).
+    assert_relative_eq!(o.effective_cov_inner_tol(false), 1e-5);
+    // LTBS: tightened to the 1e-8 default.
+    assert_relative_eq!(o.effective_cov_inner_tol(true), 1e-8);
+    // A fit already tighter than 1e-8 keeps its own tolerance (LTBS).
+    o.inner_tol = 1e-10;
+    assert_relative_eq!(o.effective_cov_inner_tol(true), 1e-10);
+    // Explicit override always wins for either model kind.
+    o.inner_tol = 1e-5;
+    o.cov_inner_tol = Some(1e-5);
+    assert_relative_eq!(o.effective_cov_inner_tol(false), 1e-5);
+    assert_relative_eq!(o.effective_cov_inner_tol(true), 1e-5);
+}
+
+/// `effective_inner_tol` tightens the fit's inner tolerance to at most 1e-6 for the
+/// closed-form LTBS path (reproducible flat-direction SEs), leaves other
+/// models untouched, never loosens an already-tighter setting, and — crucially —
+/// honours an explicit user `inner_tol` (`user_set_keys`).
+#[test]
+fn effective_inner_tol_ltbs() {
+    let mut o = FitOptions::default();
+    o.inner_tol = 1e-5;
+    // Non-(closed-form LTBS): unchanged.
+    assert_relative_eq!(o.effective_inner_tol(false), 1e-5);
+    // Closed-form LTBS with the default inner_tol: tightened to the 1e-6 ceiling.
+    assert_relative_eq!(o.effective_inner_tol(true), 1e-6);
+    // A fit already tighter than 1e-6 is kept.
+    o.inner_tol = 1e-8;
+    assert_relative_eq!(o.effective_inner_tol(true), 1e-8);
+    // An EXPLICIT user inner_tol (even looser) is honoured, not overridden (#665 review).
+    o.inner_tol = 1e-4;
+    o.user_set_keys.push("inner_tol".to_string());
+    assert_relative_eq!(o.effective_inner_tol(true), 1e-4);
+}
+
+/// Transit (`OneCptTransit`) descriptors: canonical name, the analytic 2-state
+/// `[depot, central]` layout, and no modeled-duration infusions (#386).
+#[test]
+fn one_cpt_transit_descriptors() {
+    assert_eq!(PkModel::OneCptTransit.canonical_name(), "one_cpt_transit");
+    assert!(PkModel::OneCptTransit.infusable_compartments().is_empty());
+}
+
+/// Transit (`TwoCptTransit`) descriptors: canonical name + alias round-trip, the
+/// analytic 3-state `[depot, central, peripheral]` layout, required params
+/// (cl/v1/q/v2/n/mtt), oral routing, and no modeled-duration infusions (#386 PR D).
+#[test]
+fn two_cpt_transit_descriptors() {
+    assert_eq!(PkModel::TwoCptTransit.canonical_name(), "two_cpt_transit");
+    assert_eq!(PkModel::from_name("two_cpt_transit"), Some(PkModel::TwoCptTransit));
+    assert_eq!(PkModel::from_name("two_compartment_transit"), Some(PkModel::TwoCptTransit));
+    assert!(PkModel::TwoCptTransit.is_oral());
+    assert!(PkModel::TwoCptTransit.infusable_compartments().is_empty());
+    let req: Vec<&str> =
+        PkModel::TwoCptTransit.required_pk_params().iter().map(|(_, n)| *n).collect();
+    assert_eq!(req, vec!["cl", "v1", "q", "v2", "n", "mtt"]);
+}
+
+/// `sim_residual_variance` must split FREM covariate pseudo-observations
+/// (FREMTYPE>0) off the PK error model: they use the additive covariate
+/// sigma (EPSCOV) and ignore the IIV-on-RUV scaling, while ordinary PK rows
+/// use the PK error model scaled by `ruv_scale`. Regression for the FREM
+/// simulation corruption introduced when sim/NPDE moved onto the TV-cov
+/// dispatcher (which writes the θ+η override into FREM rows).
+#[test]
+fn sim_residual_variance_splits_frem_rows_from_pk_error() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    // Proportional PK error: V_pk = (f·σ)².
+    model.error_model = ErrorModel::Proportional;
+    model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+    // FREMTYPE 100 maps to (θ[0], η[0]); the covariate sigma sits at index 1.
+    model.frem_config = Some(FremConfig {
+        fremtype_to_indices: std::collections::HashMap::from([(100u16, (0usize, 0usize))]),
+        covariate_sigma_index: 1,
+    });
+
+    let subject = Subject {
+        id: "S".into(),
+        obs_times: vec![1.0, 2.0],
+        observations: vec![0.0, 0.0],
+        obs_cmts: vec![1, 1],
+        cens: vec![0, 0],
+        // Row 0 = PK observation, row 1 = covariate pseudo-observation.
+        fremtype: vec![0, 100],
+        ..Default::default()
+    };
+
+    let sigma = vec![0.3, 0.5]; // [pk_prop_sigma, frem_cov_sigma]
+    let ruv = 4.0; // exercise the IIV-on-RUV scaling on the PK row
+    let f = 2.0;
+
+    // PK row: (f·σ_pk)² · ruv_scale.
+    let pk_var = model.sim_residual_variance(&subject, 0, f, &sigma, &[], ruv, None);
+    assert!((pk_var - (f * 0.3) * (f * 0.3) * ruv).abs() < 1e-12);
+
+    // FREM row: covariate σ², independent of `f_pred` and `ruv_scale`.
+    let frem_var = model.sim_residual_variance(&subject, 1, 999.0, &sigma, &[], ruv, None);
+    assert!((frem_var - 0.5 * 0.5).abs() < 1e-12);
+
+    // Without a FREM config every row uses the PK error model.
+    model.frem_config = None;
+    let pk_only = model.sim_residual_variance(&subject, 1, f, &sigma, &[], 1.0, None);
+    assert!((pk_only - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+}
+
+#[test]
+fn sim_residual_variance_applies_custom_magnitude() {
+    // #484 review #3: simulate() must draw residual error with the custom
+    // magnitude, not a constant SD. A multiplier m on the proportional slot
+    // scales the variance by m²; an all-ones / None multiplier is the legacy
+    // variance exactly.
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    model.error_model = ErrorModel::Proportional;
+    model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+    model.frem_config = None;
+
+    let subject = Subject {
+        id: "S".into(),
+        obs_times: vec![1.0],
+        observations: vec![0.0],
+        obs_cmts: vec![1],
+        cens: vec![0],
+        fremtype: vec![0],
+        ..Default::default()
+    };
+    let sigma = vec![0.3];
+    let f = 2.0;
+
+    // Bare row: (f·σ)².
+    let bare = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, None);
+    assert!((bare - (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+
+    // Magnitude 2 on the proportional slot: (f·2·σ)² = 4·bare.
+    let scaled = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, Some(&[2.0]));
+    assert!((scaled - 4.0 * (f * 0.3) * (f * 0.3)).abs() < 1e-12);
+
+    // An all-ones multiplier reproduces the bare variance.
+    let unit = model.sim_residual_variance(&subject, 0, f, &sigma, &[], 1.0, Some(&[1.0]));
+    assert!((unit - bare).abs() < 1e-12);
+}
+
+#[test]
+fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
+    // Analytical PK model with `gradient = auto` → exact FOCE gradient is
+    // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
+    let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
+    assert_eq!(
+        Optimizer::Auto.resolve_auto(&m),
+        Optimizer::NloptLbfgs,
+        "analytic-gradient model should resolve auto → nlopt_lbfgs"
+    );
+}
+
+#[test]
+fn resolve_auto_picks_bobyqa_when_fd_only() {
+    // ODE model (no analytic scope) and an analytical model with
+    // `gradient = fd` both fall back to finite differences → bobyqa.
+    let ode = test_helpers::ode_model(GradientMethod::Auto);
+    let forced_fd = test_helpers::analytical_model(GradientMethod::Fd);
+    for m in [&ode, &forced_fd] {
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(m),
+            Optimizer::Bobyqa,
+            "FD-only model should resolve auto → bobyqa"
+        );
+    }
+}
+
+/// #486 σ-magnitude FOCE port: a custom residual-magnitude model is analytic on
+/// **both** loops now (the Sheiner–Beal FOCE marginal threads `mult(θ)` through
+/// its `R⁰`), so `auto` resolves to `NloptLbfgs` under plain `method = foce`
+/// (`interaction = false`) as well as under FOCEI (`interaction = true`).
+#[test]
+fn resolve_auto_analytic_for_custom_magnitude_both_loops() {
+    let content = "[parameters]\n  theta TVCL(0.2)\n  theta TVV(10.0)\n  theta RUV_LATE(1.5, 0.0, 10.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR * (1.0 + RUV_LATE * TIME / 48.0))\n";
+    let m = crate::parser::model_parser::parse_model_string(content).expect("parse");
+    assert!(m.has_custom_ruv_magnitude());
+    assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
+    assert_eq!(
+        Optimizer::Auto.resolve_auto(&m),
+        Optimizer::NloptLbfgs,
+        "FOCE + custom magnitude now has the analytic gradient"
+    );
+    assert_eq!(
+        Optimizer::Auto.resolve_auto(&m),
+        Optimizer::NloptLbfgs,
+        "FOCEI + custom magnitude has the analytic gradient"
+    );
+}
+
+#[test]
+fn resolve_auto_is_identity_for_concrete_optimizers() {
+    // Every non-`Auto` optimizer is returned unchanged, regardless of model.
+    let m = test_helpers::analytical_model(GradientMethod::Auto);
+    for opt in [
+        Optimizer::Bfgs,
+        Optimizer::Lbfgs,
+        Optimizer::Slsqp,
+        Optimizer::NloptLbfgs,
+        Optimizer::Mma,
+        Optimizer::Bobyqa,
+        Optimizer::TrustRegion,
+    ] {
+        assert_eq!(opt.resolve_auto(&m), opt);
+    }
+}
+
+#[test]
+fn required_pk_params_match_docs_table() {
+    // Locks the per-model required slots to the "Required Parameters" table
+    // in docs/model-file/structural-model.qmd (issue #309).
+    use PkModel::*;
+    let cases: &[(PkModel, &[&str])] = &[
+        (OneCptIv, &["cl", "v"]),
+        (OneCptOral, &["cl", "v", "ka"]),
+        (OneCptTransit, &["cl", "v", "n", "mtt"]),
+        (OneCptIg, &["cl", "v", "mat", "cv2"]),
+        (TwoCptIv, &["cl", "v1", "q", "v2"]),
+        (TwoCptOral, &["cl", "v1", "q", "v2", "ka"]),
+        (TwoCptTransit, &["cl", "v1", "q", "v2", "n", "mtt"]),
+        (TwoCptIg, &["cl", "v1", "q", "v2", "mat", "cv2"]),
+        (ThreeCptIv, &["cl", "v1", "q2", "v2", "q3", "v3"]),
+        (ThreeCptOral, &["cl", "v1", "q2", "v2", "q3", "v3", "ka"]),
+    ];
+    for (model, expected_names) in cases {
+        let req = model.required_pk_params();
+        let names: Vec<&str> = req.iter().map(|(_, n)| *n).collect();
+        assert_eq!(&names, expected_names, "wrong required names for {model:?}");
+        // Every (slot, name) pair must be self-consistent with name_to_index,
+        // so the parser's key→slot canonicalisation lines up with this table.
+        for (slot, name) in req {
+            assert_eq!(
+                PkParams::name_to_index(name),
+                Some(*slot),
+                "slot/name mismatch for `{name}` in {model:?}"
+            );
+        }
+        // f / lagtime are optional and must never appear as required.
+        assert!(
+            !req.iter().any(|(s, _)| *s == PK_IDX_F || *s == PK_IDX_LAGTIME),
+            "{model:?} must not require f/lagtime"
+        );
+    }
+}
+
+#[test]
+fn canonical_name_covers_all_variants() {
+    use PkModel::*;
+    assert_eq!(OneCptIv.canonical_name(), "one_cpt_iv");
+    assert_eq!(OneCptOral.canonical_name(), "one_cpt_oral");
+    assert_eq!(OneCptTransit.canonical_name(), "one_cpt_transit");
+    assert_eq!(OneCptIg.canonical_name(), "one_cpt_ig");
+    assert_eq!(TwoCptIv.canonical_name(), "two_cpt_iv");
+    assert_eq!(TwoCptOral.canonical_name(), "two_cpt_oral");
+    assert_eq!(TwoCptTransit.canonical_name(), "two_cpt_transit");
+    assert_eq!(TwoCptIg.canonical_name(), "two_cpt_ig");
+    assert_eq!(ThreeCptIv.canonical_name(), "three_cpt_iv");
+    assert_eq!(ThreeCptOral.canonical_name(), "three_cpt_oral");
+}
+
+#[test]
+fn from_name_round_trips_and_accepts_aliases() {
+    use PkModel::*;
+    // `from_name` is the single source of name → model for both the `pk` parser
+    // and the `ode_template` desugarer (Ron #363). It must be the inverse of
+    // `canonical_name` on the canonical spelling and accept every long-form
+    // alias the parser historically accepted.
+    let cases: &[(PkModel, &str)] = &[
+        (OneCptIv, "one_compartment_iv"),
+        (OneCptOral, "one_compartment_oral"),
+        (TwoCptIv, "two_compartment_iv"),
+        (TwoCptOral, "two_compartment_oral"),
+        (ThreeCptIv, "three_compartment_iv"),
+        (ThreeCptOral, "three_compartment_oral"),
+    ];
+    for (model, alias) in cases {
+        assert_eq!(
+            PkModel::from_name(model.canonical_name()),
+            Some(*model),
+            "canonical name of {model:?} must round-trip"
+        );
+        assert_eq!(
+            PkModel::from_name(alias),
+            Some(*model),
+            "alias `{alias}` must resolve to {model:?}"
+        );
+    }
+    // Unknown names and the retired `*_bolus` / `*_infusion` spellings do NOT
+    // resolve — the parser maps the retired ones to a migration error itself,
+    // so `from_name` must return `None` for them (not a wrong variant).
+    for none in ["four_cpt_oral", "one_cpt_iv_bolus", "two_cpt_infusion", "", "pk"] {
+        assert_eq!(PkModel::from_name(none), None, "`{none}` must not resolve");
+    }
+}
+
+#[test]
+fn error_spec_has_f_dependent_variance() {
+    use std::collections::HashMap;
+    // Single endpoint: only additive is f-independent.
+    assert!(!ErrorSpec::Single(ErrorModel::Additive).has_f_dependent_variance());
+    assert!(ErrorSpec::Single(ErrorModel::Proportional).has_f_dependent_variance());
+    assert!(ErrorSpec::Single(ErrorModel::Combined).has_f_dependent_variance());
+
+    // PerCmt: f-dependent if ANY endpoint is non-additive.
+    let ep = |em: ErrorModel| EndpointError { error_model: em, sigma_idx: vec![0] };
+    let mut all_additive = HashMap::new();
+    all_additive.insert(1usize, ep(ErrorModel::Additive));
+    all_additive.insert(2usize, ep(ErrorModel::Additive));
+    assert!(!ErrorSpec::PerCmt(all_additive).has_f_dependent_variance());
+
+    let mut mixed = HashMap::new();
+    mixed.insert(1usize, ep(ErrorModel::Additive));
+    mixed.insert(2usize, ep(ErrorModel::Proportional));
+    assert!(ErrorSpec::PerCmt(mixed).has_f_dependent_variance());
+}
+
+#[test]
+fn combined_additive_sigma_indices_picks_second_slot() {
+    use std::collections::HashMap;
+    // Single combined: additive component is sigma index 1.
+    assert_eq!(ErrorSpec::Single(ErrorModel::Combined).combined_additive_sigma_indices(), vec![1]);
+    // Non-combined single specs have no additive-combined slot.
+    assert!(ErrorSpec::Single(ErrorModel::Additive).combined_additive_sigma_indices().is_empty());
+    assert!(ErrorSpec::Single(ErrorModel::Proportional)
+        .combined_additive_sigma_indices()
+        .is_empty());
+
+    let ep = |em: ErrorModel, idx: Vec<usize>| EndpointError { error_model: em, sigma_idx: idx };
+
+    // PerCmt: returns the global index of each combined endpoint's
+    // second sigma slot, de-duplicated; non-combined endpoints contribute
+    // nothing.
+    let mut map = HashMap::new();
+    map.insert(1usize, ep(ErrorModel::Proportional, vec![0]));
+    map.insert(2usize, ep(ErrorModel::Combined, vec![1, 3]));
+    let mut got = ErrorSpec::PerCmt(map).combined_additive_sigma_indices();
+    got.sort_unstable();
+    assert_eq!(got, vec![3]);
+
+    // Two combined endpoints that share the same additive sigma index
+    // collapse to a single entry.
+    let mut shared = HashMap::new();
+    shared.insert(1usize, ep(ErrorModel::Combined, vec![0, 2]));
+    shared.insert(2usize, ep(ErrorModel::Combined, vec![1, 2]));
+    assert_eq!(ErrorSpec::PerCmt(shared).combined_additive_sigma_indices(), vec![2]);
+}
+
+#[test]
+fn classify_warning_convergence_is_critical() {
+    let w = classify_warning("Outer optimization did not converge");
+    assert_eq!(w.severity, WarningSeverity::Critical);
+    assert_eq!(w.category.as_str(), "convergence");
+    assert!(w.source_method.is_none());
+}
+
+#[test]
+fn classify_warning_covariance_is_critical() {
+    let w = classify_warning("Covariance step failed");
+    assert_eq!(w.severity, WarningSeverity::Critical);
+    assert_eq!(w.category.as_str(), "covariance_failed");
+}
+
+/// #2158: every covariance-step failure reason emitted in `src/` classifies as
+/// `covariance_failed`, whatever words the reason goes on to use. One row per emit site;
+/// `steals` names the phrase another arm of `classify_warning` matches in that row (empty
+/// when none does), and is asserted present, so a reworded reason that loses it shows up
+/// here rather than leaving the row testing nothing. The four profile rows are the text
+/// `covariance_at_estimate` emits (inline and on replay), built by its own
+/// `profile_solve_failed_msg`; the rest are
+/// copies of the `src/` literal named in the comment, with a sample interpolation.
+///
+/// The profile rows are the ones the old arm order misfiled: with the
+/// `starts_with("covariance step failed")` arm moved below the `did not converge` arm they
+/// classify `convergence`, and this test fails naming the row.
+#[test]
+fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
+    use crate::estimation::profile::{profile_solve_failed_msg, ProfileFailure};
+    let profile = |e: ProfileFailure| profile_solve_failed_msg(&e);
+    let rows: Vec<(String, &str)> = vec![
+        // profile.rs `covariance_at_estimate`: `ctx.solve` failed, one row per `ProfileFailure`.
+        (profile(ProfileFailure::NotConverged { criterion: 3.2e-3 }), "did not converge"),
+        (profile(ProfileFailure::Singular), "did not converge"),
+        (profile(ProfileFailure::LineSearch), "did not converge"),
+        (profile(ProfileFailure::NonFinite), "did not converge"),
+        (profile(ProfileFailure::BoxQp), "did not converge"),
+        // profile.rs `covariance_at_estimate`: the EBE guard rejected the solve (#2214).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_nm_polished: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+                false,
+            ),
+            "",
+        ),
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 0,
+                    n_fallback: 0,
+                    n_nm_polished: 0,
+                    n_start_rejected: 1,
+                },
+                12,
+                1.0,
+                false,
+            ),
+            "",
+        ),
+        // profile.rs `covariance_at_estimate`: the guard rejected the held-layout re-solve
+        // (#2420).
+        (
+            crate::estimation::profile::profile_resolve_guarded_msg(
+                &crate::estimation::inner_optimizer::InnerLoopStats {
+                    n_unconverged: 3,
+                    n_fallback: 0,
+                    n_nm_polished: 0,
+                    n_start_rejected: 0,
+                },
+                12,
+                0.0,
+                true,
+            ),
+            "",
+        ),
+        // profile.rs `ProfiledCov` objective / Hessian / level-block failures.
+        (
+            "Covariance step failed: the profile objective is not finite at the estimate. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: the profile objective is not finite at some \
+             finite-difference point. SE estimates not available."
+                .into(),
+            "",
+        ),
+        (crate::estimation::profile::profile_non_pd_msg(&[1.5, -2.0e-3]), "not positive definite"),
+        (
+            "Covariance step failed: the Hessian of the objective in the profiled \
+             levels is not positive definite. SE estimates not available."
+                .into(),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: a profiled level has no curvature at the estimate. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: the objective is not finite at some \
+             finite-difference point of the profiled levels. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs `S_SINGULAR_MSG`.
+        (crate::estimation::covariance::S_SINGULAR_MSG.into(), ""),
+        // covariance.rs quadrature score.
+        (
+            "Covariance step failed: could not obtain a converged, finite quadrature score \
+             for subject 7. SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs non-finite S.
+        (
+            "Covariance step failed: non-finite score cross-product. SE estimates not \
+             available."
+                .into(),
+            "",
+        ),
+        // covariance.rs `fd_hessian_step` guard.
+        (
+            "Covariance step failed: fd_hessian_step must be positive and finite, got -1. \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs Omega at convergence, both descriptors, and the non-finite base OFV.
+        (
+            "Covariance step failed: Omega matrix is not positive definite at convergence \
+             (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
+             SE estimates not available."
+                .into(),
+            "not positive definite",
+        ),
+        (
+            "Covariance step failed: Omega matrix is near-singular at convergence \
+             (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        (
+            "Covariance step failed: base OFV is non-finite at convergence \
+             (likely numerical overflow or underflow in model evaluation). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // covariance.rs ill-conditioned diagonal.
+        (
+            "Covariance step failed: Hessian has ill-conditioned entries for the following \
+             parameter(s) — theta[CL] (non-finite diagonal). SE estimates not available."
+                .into(),
+            "ill-conditioned",
+        ),
+        // covariance.rs eigen-decomposition failure.
+        (
+            "Covariance step failed: could not compute eigenvalues of the \
+             FD Hessian (Hessian may contain NaN or Inf). \
+             SE estimates not available."
+                .into(),
+            "",
+        ),
+        // The chain tag is stripped before the prefix test.
+        (format!("[FOCEI] {}", profile(ProfileFailure::Singular)), "did not converge"),
+    ];
+    for (msg, steals) in &rows {
+        assert!(msg.to_lowercase().contains(steals), "row no longer contains {steals:?}: {msg}");
+        let w = classify_warning(msg);
+        assert_eq!(
+            (w.severity, w.category.as_str()),
+            (WarningSeverity::Critical, "covariance_failed"),
+            "{msg}"
+        );
+    }
+}
+
+/// #2158, both sides of the gate in one test: the profiled covariance step's
+/// "…the profile solve did not converge…" is `covariance_failed`, and every
+/// non-convergence warning emitted in `src/` stays `convergence`. The straddle is asserted
+/// too — the covariance row contains "did not converge", so it sits on the convergence
+/// arm's side of the old predicate — so this pair cannot quietly become two rows nothing
+/// separates. Forcing the prefix arm either way reddens it: moved below the convergence arm
+/// the first assert fails; widened from the prefix to `contains("converge")` the second
+/// does.
+#[test]
+fn classify_warning_covariance_prefix_does_not_claim_convergence() {
+    use crate::estimation::profile::{profile_solve_failed_msg, ProfileFailure};
+    let cov = profile_solve_failed_msg(&ProfileFailure::Singular);
+    assert!(cov.to_lowercase().contains("did not converge"), "{cov}");
+    assert_eq!(classify_warning(&cov).category.as_str(), "covariance_failed");
+
+    let convergence = [
+        // outer_optimizer.rs, the generic line.
+        "Outer optimization did not converge".to_string(),
+        "[FOCEI] Outer optimization did not converge".to_string(),
+        crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string(),
+        crate::estimation::gauss_newton::GN_BUDGET_WARNING.to_string(),
+        // #1049: the collapse stops are non-convergence too, so they file with it.
+        crate::estimation::gauss_newton::GN_COLLAPSE_WARNING.to_string(),
+        crate::estimation::gauss_newton::GN_DEGENERATE_COLLAPSE_WARNING.to_string(),
+        // trust_region.rs, the four forms.
+        "Trust-region did not converge: reached the iteration budget (maxiter = 50). The \
+         estimates and any standard errors are reported at a non-stationary point; raise \
+         maxiter or improve the starting values."
+            .to_string(),
+        "Trust-region did not converge: no initial progress — every step was rejected from \
+         the first iteration, so the fit never left them. Check the starting values \
+         (`inits_from_nca` helps) and that the model is identifiable on this data."
+            .to_string(),
+        "Trust-region did not converge: line search stalled".to_string(),
+        "Trust-region did not converge: solver stopped without a termination reason".to_string(),
+        // api/fit.rs multi-start.
+        "No multi-start run converged (4 starts); returning best OFV from start 2".to_string(),
+        // dosing.rs SS equilibration.
+        "Steady-state (SS=1) equilibration did not converge within 200 cycles: the per-cycle \
+         carryover is not contracting (ratio ≈ 1.000), indicating no periodic steady state \
+         exists. The returned SS trough is unreliable."
+            .to_string(),
+    ];
+    for msg in &convergence {
+        let w = classify_warning(msg);
+        assert_eq!(
+            (w.severity, w.category.as_str()),
+            (WarningSeverity::Critical, "convergence"),
+            "{msg}"
+        );
+    }
+}
+
+/// #2341: every outer-optimizer verdict that demotes `converged` without the words "did
+/// not converge" still classifies `(Critical, Convergence)`. Each row is the emitting
+/// function's own text — `profiled_verdict_warning` for the profiled path's four ends,
+/// `polish_leg_cap_warning` for BOBYQA's leg cap — not a copy, so a reworded message that
+/// drops the phrase the arm keys on fails here naming the row. Before #2341 all five
+/// classified `(Warning, General)`.
+///
+/// The other side of the gate: the SS-equilibration cycle-cap warning says "without
+/// converging" too, and is not an optimizer verdict, so widening the arm's
+/// "optimizer stopped without converging" to the bare phrase reddens the last assert. The
+/// straddle is asserted, so that row cannot silently stop containing the phrase.
+#[test]
+fn classify_warning_outer_optimizer_verdicts_are_convergence() {
+    use crate::estimation::outer_optimizer::{polish_leg_cap_warning, PolishEnd};
+    use crate::estimation::profile::profiled_verdict_warning;
+    use nlopt::{FailState as F, SuccessState as S};
+    let profiled = |end, last, converged| {
+        profiled_verdict_warning(end, &last, converged).expect("an unconverged verdict warns")
+    };
+    let rows = [
+        // profile.rs `profiled_verdict_warning`: leg cap, budget spent before a leg, budget
+        // spent during one, and an unverified stop.
+        profiled(PolishEnd::LegCapReached { last_gain: 2.1e-5 }, Ok((S::XtolReached, 1.0)), false),
+        profiled(PolishEnd::BudgetSpent, Ok((S::FtolReached, 1.0)), false),
+        profiled(PolishEnd::Settled, Ok((S::MaxEvalReached, 1.0)), false),
+        profiled(PolishEnd::NotNeeded, Err((F::Failure, 1.0)), false),
+        // outer_optimizer.rs, BOBYQA's polish-leg cap.
+        polish_leg_cap_warning(0.25),
+    ];
+    for msg in &rows {
+        for raw in [msg.clone(), format!("[FOCEI] {msg}")] {
+            let w = classify_warning(&raw);
+            assert_eq!(
+                (w.severity, w.category.as_str()),
+                (WarningSeverity::Critical, "convergence"),
+                "{raw}"
+            );
+        }
+    }
+
+    let ss = "Steady-state (SS=1) equilibration reached the 200-cycle cap without converging \
+              (per-cycle carryover ratio ≈ 0.990); the returned SS trough is approximately \
+              38% below the true periodic steady state.";
+    assert!(ss.contains("without converging"), "{ss}");
+    assert_ne!(classify_warning(ss).category.as_str(), "convergence", "{ss}");
+}
+
+#[test]
+fn classify_warning_flat_parameter_is_warning() {
+    let w = classify_warning(
+        "[parameters] `TVFLAT` has no effect on the objective (gradient ≈ 0 at the \
+             initial estimate) — it is likely computed but never used. Freezing it at its \
+             initial value (1) so the remaining parameters can be estimated.",
+    );
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "flat_parameter");
+    assert_eq!(w.source_method.as_deref(), Some("parameters"));
+}
+
+/// #1008: a declined absorption ODE twin gets its own code rather than the `general`
+/// fallback, so a consumer (the R wrapper, an agent) can branch on "this model kept no
+/// ODE fallback" instead of matching prose. Built through the real emitter rather than a
+/// pasted copy, so a reworded message cannot drift away from the token it is keyed on.
+#[test]
+fn classify_warning_absorption_twin_declined_is_warning() {
+    let w = classify_warning(&super::absorption_twin_declined_warning(
+        "[odes]: name `CENTRAL` collides with a previously-declared state (case-insensitive); \
+         state, individual-parameter, and ODE-block intermediate names must all be distinct.",
+    ));
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "absorption_twin_declined");
+}
+
+/// The decline arm sits ahead of *every* prose arm because the message carries the twin
+/// parser's own error text verbatim (#1027 review). A twin error that happens to contain a
+/// substring a later arm matches — here `"ill-conditioned"`, which would otherwise classify
+/// `Critical` / `condition_number` — must still read as a twin decline.
+#[test]
+fn classify_warning_twin_decline_beats_prose_arms_in_the_reason() {
+    for reason in [
+        "[odes]: the Jacobian is ill-conditioned at the initial state",
+        "the fit did not converge in the re-emitted [fit_options]",
+        "covariance failed to parse",
+        "condition number check rejected the block",
+    ] {
+        let w = classify_warning(&super::absorption_twin_declined_warning(reason));
+        assert_eq!(
+            w.category.as_str(),
+            "absorption_twin_declined",
+            "a twin decline whose reason says {reason:?} must not be claimed by a prose arm"
+        );
+        assert_eq!(w.severity, WarningSeverity::Warning);
+    }
+}
+
+/// The reason round-trips out of the warning verbatim, so the up-front rejection messages
+/// in `api::validation` can quote it (#1027 review). Also pins the terminator normalisation:
+/// a reason with no sentence-ending punctuation gets one, so it cannot run into the fixed
+/// text around it.
+#[test]
+fn absorption_twin_decline_reason_round_trips() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    assert_eq!(
+        super::absorption_twin_decline_reason(&model),
+        None,
+        "a model with no decline warning has no reason"
+    );
+    model
+        .parse_warnings
+        .push(super::absorption_twin_declined_warning("two parameters map to the V slot"));
+    assert_eq!(
+        super::absorption_twin_decline_reason(&model),
+        Some("two parameters map to the V slot."),
+        "the reason comes back verbatim, with a terminator added"
+    );
+    // An already-terminated reason is not double-punctuated.
+    let terminated = super::absorption_twin_declined_warning("names must all be distinct.");
+    assert!(terminated.ends_with("names must all be distinct."), "got: {terminated}");
+}
+
+#[test]
+fn classify_warning_dw_is_warning() {
+    let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "dw_autocorrelation");
+}
+
+/// #2798: every positive-DW message, whatever the model class, lands in
+/// `dw_autocorrelation`. The compartment-free text reaches that arm only after
+/// ~60 earlier ones, so a wording that hits one of their keys (`degenerate`,
+/// `did not converge`, `covariance step`, …) would silently re-file it; ferx-r
+/// classifies through this same function. The full messages, not a prefix.
+#[test]
+fn classify_warning_dw_advice_messages_are_dw() {
+    use crate::api::{dw_autocorrelation_warning, DwAdvice};
+    for advice in [
+        DwAdvice::Compartmental,
+        DwAdvice::Algebraic { group: None },
+        DwAdvice::Algebraic { group: Some("ARM".into()) },
+        DwAdvice::AlgebraicInTime { by: crate::api::SubjectLine::ById("ID".into()) },
+        DwAdvice::AlgebraicInTime { by: crate::api::SubjectLine::ByNumericColumn },
+    ] {
+        for dw in [1.2, 2.8] {
+            let msg = dw_autocorrelation_warning(dw, &advice).expect("outside the band");
+            let w = classify_warning(&msg);
+            assert_eq!(w.severity, WarningSeverity::Warning, "{msg}");
+            assert_eq!(w.category.as_str(), "dw_autocorrelation", "{msg}");
+        }
+    }
+}
+
+/// #2041: the reader's missing-covariate warning is `data_quality` on its token,
+/// whatever the covariate is called. `DURBIN` is the name a prose arm would claim
+/// (the Durbin-Watson arm) without the token arm ahead of it.
+#[test]
+fn classify_warning_covariate_missing_is_data_quality() {
+    use crate::io::datareader::covariate_missing_warning;
+    for name in ["WT", "DURBIN"] {
+        let msg = covariate_missing_warning(name, &["3"], 10);
+        let w = classify_warning(&msg);
+        assert_eq!(w.severity, WarningSeverity::Warning, "{name}");
+        assert_eq!(w.category.as_str(), "data_quality", "{name}: {msg}");
+    }
+}
+
+#[test]
+fn classify_warning_sir_proposal_diagnostics_route_to_sir() {
+    // #1021: the proposal-conditioning notes are prefixed `SIR:` / `SIR fallback:`
+    // and match none of the older "sir failed" / "sir requested" phrasings. The
+    // shrinkage one also name-drops "the covariance step", so it must not be
+    // claimed by a covariance arm.
+    let w = classify_warning(
+        "SIR: proposal was shrunk in 3 direction(s) so draws stay inside the parameter \
+         bounds [TVKA -0.74 (sd 6.15e3 → 2.89e0)]. Those directions come from \
+         eigenvalue-floored (non-identified) curvature in the covariance step; the SIR \
+         CIs along them understate the true uncertainty.",
+    );
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+    assert_eq!(w.severity, WarningSeverity::Warning);
+
+    let w = classify_warning(
+        "SIR: proposal covariance is rank-deficient beyond the FIX-ed parameters: 1 \
+         direction(s) carry no uncertainty [TVCL +0.71, TVV -0.70].",
+    );
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+
+    let w = classify_warning("SIR fallback: proposal was shrunk in 1 direction(s).");
+    assert_eq!(w.category.as_str(), "sir", "message: {}", w.message);
+}
+
+/// #1723: every row of the low-ESS warning's input space, rendered by the
+/// builder itself and prefixed as `fit()` (`SIR:`), `run_sir` (`SIR:`) and the
+/// non-PD fallback (`SIR fallback:`) push it, routes to `sir` at `Warning`. The
+/// chain has generic `degenerate` → `optimizer_health` and `condition number` →
+/// `condition_number` arms *above* the `sir:` one, so a rewording that lets one
+/// of those tokens in misroutes the message — and this test renders the real
+/// text, so it sees the rewording.
+#[test]
+fn classify_warning_sir_low_ess_rows_route_to_sir() {
+    use crate::estimation::sir::{low_ess_warning, FloorProbe, HeaviestDraw};
+    let h = HeaviestDraw { share: 0.529, name: "ETA_CL".into(), sd_units: -6.36, value: 4.6e-4 };
+    let flagged = || {
+        vec![FloorProbe {
+            name: "ETA_KA".into(),
+            dofv: 1.56,
+            variance: 6.1e-6,
+            covariances_zeroed: false,
+        }]
+    };
+    let rows = [
+        low_ess_warning(3.5, 1000, SirScale::Packed, &h, flagged),
+        low_ess_warning(3.5, 1000, SirScale::Packed, &h, Vec::new),
+        low_ess_warning(35.2, 1000, SirScale::Natural, &h, flagged),
+    ];
+    for msg in rows.into_iter().map(|m| m.expect("below the threshold")) {
+        for prefix in ["SIR: ", "SIR fallback: "] {
+            let w = classify_warning(&format!("{prefix}{msg}"));
+            assert_eq!(w.category, WarningCode::Sir, "{prefix}{msg}");
+            assert_eq!(w.severity, WarningSeverity::Warning, "{prefix}{msg}");
+        }
+    }
+}
+
+#[test]
+fn classify_warning_mu_ref_is_info() {
+    let w = classify_warning("mu-ref: CL, V");
+    assert_eq!(w.severity, WarningSeverity::Info);
+    assert_eq!(w.category.as_str(), "mu_referencing");
+}
+
+#[test]
+fn classify_warning_saem_non_mu_ref_is_warning() {
+    let w = classify_warning(
+        "SAEM: individual parameter(s) not mu-referenced: V. This can strongly \
+             affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+    );
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "mu_referencing");
+}
+
+#[test]
+fn classify_warning_strips_chain_prefix() {
+    let w = classify_warning("[FOCEI] Covariance step failed");
+    assert_eq!(w.source_method.as_deref(), Some("FOCEI"));
+    assert_eq!(w.message, "Covariance step failed");
+    assert_eq!(w.severity, WarningSeverity::Critical);
+    assert_eq!(w.category.as_str(), "covariance_failed");
+}
+
+#[test]
+fn classify_warning_unknown_falls_back_to_general() {
+    let w = classify_warning("some entirely novel message");
+    assert_eq!(w.severity, WarningSeverity::Warning);
+    assert_eq!(w.category.as_str(), "general");
+}
+
+#[test]
+fn classify_warning_simulation_beats_optimizer_health_degenerate() {
+    // #762/#763 simulation diagnostics contain the word "degenerate", which the
+    // generic optimizer-health branch also keys on. The `w_tte/​w_rtte` prefix
+    // branch must precede it so a simulated-subject diagnostic is not mislabelled
+    // as an estimation/optimizer problem.
+    for msg in [
+        "W_TTE_DEGENERATE_HAZARD: subject '1' (CMT=1) drew a non-positive / \
+             non-finite effective hazard rate (#763).",
+        "W_RTTE_DEGENERATE: subject '1' (CMT=2) has a degenerate recurrent hazard (#762).",
+    ] {
+        let w = classify_warning(msg);
+        assert_eq!(w.category.as_str(), "simulation", "misclassified: {msg:?}");
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_ne!(w.category, WarningCode::OptimizerHealth);
+    }
+}
+
+#[test]
+fn classify_warning_mid_descent_restart_is_optimizer_health() {
+    // The #1277 restart notice (`outer_optimizer::mid_descent_restart_warning`,
+    // #1428) is an optimizer-health event, not a convergence verdict: the fit
+    // went on and its own `converged` says how it ended. It contains neither
+    // "did not converge" nor "degenerate", so it needs its own key. Proxy of the
+    // emitter's string; the key phrase is the one the emitter and the fast nn
+    // regression test share.
+    let w = classify_warning(
+        "Outer optimizer (nlopt_lbfgs) stopped mid-descent (bare Failure at OFV = 7901.994 \
+         after 12 evaluations) and was resumed from the best point seen on the remaining \
+         maxiter budget; the reported estimates are from the resumed run.",
+    );
+    assert_eq!(w.category, WarningCode::OptimizerHealth);
+    assert_eq!(w.severity, WarningSeverity::Warning);
+}
+
+#[test]
+fn classify_warning_flip_flop_beats_optimizer_health() {
+    // Both absorption flip-flop warnings — the twin-carrying heads-up (#776) and
+    // the twin-less EBE warning (#785) — say "flip-flop regime". The EBE message
+    // also contains "degenerating", which the generic optimizer-health branch keys
+    // on ("degenerate"), so the flip-flop branch must precede it to type these
+    // `flip_flop`. These are representative proxies of the real emitters
+    // (src/api.rs ~2596 and ~6613); the drift-proof end-to-end check on the actual
+    // emitted string lives in `flip_flop_ebe_warning_fires_for_twinless_transit_crosser`.
+    for msg in [
+        "one_cpt_transit disposition rate (0.5000) ≥ transit rate KTR = (n+1)/mtt \
+             (0.2000) at typical values (subject 3): the flip-flop regime, outside the \
+             analytic absorption closed form's convergence domain. ferx automatically \
+             evaluates the equivalent ODE transit model for such parameters.",
+        "one_cpt_transit subject(s) [3] enter the analytic absorption closed form's \
+             clamp region — the flip-flop regime (disposition rate ≥ transit rate KTR = \
+             (n+1)/mtt), or (for a 2-cpt model) coincident disposition eigenvalues — at \
+             their fitted empirical-Bayes estimates, silently degenerating those \
+             subjects' likelihood contributions.",
+    ] {
+        let w = classify_warning(msg);
+        assert_eq!(w.category, WarningCode::FlipFlop, "misclassified: {msg:?}");
+        assert_eq!(w.category.as_str(), "flip_flop");
+        assert_eq!(w.severity, WarningSeverity::Warning);
+        assert_ne!(w.category, WarningCode::OptimizerHealth);
+    }
+}
+
+#[test]
+fn classify_warning_eta_shrinkage_is_word_bounded() {
+    // The real message classifies to eta_shrinkage.
+    assert_eq!(
+        classify_warning("High ETA shrinkage (>= 30%): eta_V (42%)").category.as_str(),
+        "eta_shrinkage"
+    );
+    // A substring like "beta shrinkage" must NOT collide.
+    assert_ne!(classify_warning("beta shrinkage looks odd").category.as_str(), "eta_shrinkage");
+}
+
+#[test]
+fn classify_warning_recognizes_internal_runaway_guard() {
+    let warning =
+        classify_warning("Internal optimizer parameter guard reached by estimate(s): PROP_ERR");
+    assert_eq!(warning.category, WarningCode::ParameterAtRunawayGuard);
+    assert_eq!(warning.severity, WarningSeverity::Warning);
+
+    // #1118: each listed hit carries its verdict, and a runaway — the one that
+    // demotes `converged` — classifies Critical even when the entry reaches this
+    // path as a flat string (a spliced multi-start warning, say) instead of the
+    // native typed entry.
+    let upper = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
+         (estimate 148.4132; packed coordinate 5.0000 at upper guard, runaway).",
+    );
+    assert_eq!(upper.category, WarningCode::ParameterAtRunawayGuard);
+    assert_eq!(upper.severity, WarningSeverity::Critical);
+
+    let lower = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): PROP_ERR \
+         (estimate 0.0003; packed coordinate -8.0000 at lower guard, collapse).",
+    );
+    assert_eq!(lower.severity, WarningSeverity::Warning);
+
+    // #1205 review: the verdict, not the side, is what carries the severity —
+    // an Ω off-diagonal at its *lower* rail is a runaway and must reach Critical.
+    let off_diag = classify_warning(
+        "Internal optimizer parameter guard reached by estimate(s): ETA_CL~ETA_V \
+         (estimate -10.0000; packed coordinate -10.0000 at lower guard, runaway).",
+    );
+    assert_eq!(off_diag.severity, WarningSeverity::Critical);
+}
+
+/// #1251: a **start** outside its own box is `InitOutsideBounds`, and must not
+/// reach `BoundaryEstimate`, which is about where a fit *ended*.
+///
+/// This is not a taxonomy preference. `model_selection::estimate_near_boundary`
+/// reads `BoundaryEstimate` off `warnings_structured`, and it drives two
+/// **default-on** filters: `bootstrap`'s `skip_estimate_near_boundary`
+/// (`BootstrapOptions::default`) and `Strictness::reject_on_boundary`. Measured
+/// before the split: a start-side message carrying the phrase "optimizer bound"
+/// classified as `BoundaryEstimate`, `estimate_near_boundary` returned `true`,
+/// and `check_strictness` failed the fit with *"estimate pinned to a declared
+/// bound: TVCL **starts at** 1.00e11 …"*. A bootstrap would have dropped every
+/// replicate of a model whose start was clamped.
+///
+/// So the discriminator is asserted, not just the category (#1255): the two
+/// messages are classified side by side, and the start-side one is required to
+/// keep out of the estimate-side arm.
+#[test]
+fn a_start_outside_its_box_is_not_classified_as_a_boundary_estimate() {
+    let start_side = classify_warning(
+        "W_INIT_OUTSIDE_BOUNDS: TVCL starts at a value of 1.0e11, above ferx's internal \
+         upper cap of 1.0e9. The start is clamped onto that rail before the first \
+         objective evaluation.",
+    );
+    let estimate_side = classify_warning(
+        "Parameter estimate(s) pinned to an optimizer bound: TVKA (50.0000 at upper bound).",
+    );
+
+    assert_eq!(start_side.category, WarningCode::InitOutsideBounds);
+    assert_eq!(start_side.severity, WarningSeverity::Warning);
+    assert_eq!(estimate_side.category, WarningCode::BoundaryEstimate);
+    assert_ne!(
+        start_side.category, estimate_side.category,
+        "the two must not share an arm — `estimate_near_boundary` reads the \
+         estimate-side one and drops bootstrap replicates on it"
+    );
+
+    // And the separation is by an explicit `W_` token, not by prose: a message
+    // that merely avoids the phrase "optimizer bound" would fall through to
+    // `General` instead, losing the typing altogether.
+    assert_eq!(
+        classify_warning("TVCL starts outside its packed box.").category,
+        WarningCode::General,
+        "without the token there is no arm to land in — which is why the token exists"
+    );
+}
+
+/// #2112: the profiled at-bound warning re-classifies as `BoundaryEstimate` from its text
+/// alone, as its native entry does, so a path that rebuilds the structured list from the
+/// strings keeps the level in `estimate_near_boundary` — with and without the sentence on
+/// standard errors the covariance step adds, which must not pull it into a covariance
+/// category. Built by its own emit function.
+#[test]
+fn a_profiled_level_on_its_bound_classifies_as_a_boundary_estimate() {
+    let names = vec!["PLACEBO[STUDY=7,TIME=4]".to_string()];
+    let hits = [(0, 2.5, true)];
+    for with_se in [false, true] {
+        let (msg, entry) = crate::api::profiled_bound_warning(&names, &hits, with_se).unwrap();
+        assert_eq!(msg.contains("standard errors"), with_se, "{msg}");
+        let c = classify_warning(&msg);
+        assert_eq!(
+            (c.severity, c.category),
+            (WarningSeverity::Warning, WarningCode::BoundaryEstimate),
+            "{msg}"
+        );
+        assert_eq!(c.category, entry.category);
+    }
+}
+
+/// #778: the `WarningCode` serde token is a public API an agent / the R
+/// wrapper pins against. This snapshot fails loudly if a variant's token
+/// drifts, and asserts `as_str()` and the serde representation agree.
+#[test]
+fn warning_code_tokens_are_stable() {
+    use WarningCode::*;
+    let expected: &[(WarningCode, &str)] = &[
+        (Convergence, "convergence"),
+        (CovarianceStep, "covariance_step"),
+        (CovarianceFailed, "covariance_failed"),
+        (CovarianceRegularized, "covariance_regularized"),
+        (ConditionNumber, "condition_number"),
+        (OptimizerHealth, "optimizer_health"),
+        (ViBadBasin, "vi_bad_basin"),
+        (DwAutocorrelation, "dw_autocorrelation"),
+        (EtaNormality, "eta_normality"),
+        (Experimental, "experimental"),
+        (BloqMethod, "bloq_method"),
+        (Sir, "sir"),
+        (ImportanceSampling, "importance_sampling"),
+        (EpsShrinkage, "eps_shrinkage"),
+        (EtaShrinkage, "eta_shrinkage"),
+        (BoundaryEstimate, "boundary_estimate"),
+        (ParameterAtRunawayGuard, "parameter_at_runaway_guard"),
+        (InitOutsideBounds, "init_outside_bounds"),
+        (InflatedRse, "inflated_rse"),
+        (HighCorrelation, "high_correlation"),
+        (DataQuality, "data_quality"),
+        (OmegaStructure, "omega_structure"),
+        (GradientFallback, "gradient_fallback"),
+        (MuReferencing, "mu_referencing"),
+        (OptimizerConfig, "optimizer_config"),
+        (MultiStart, "multi_start"),
+        (Cancelled, "cancelled"),
+        (Threads, "threads"),
+        (Simulation, "simulation"),
+        (FlipFlop, "flip_flop"),
+        (AbsorptionTwinDeclined, "absorption_twin_declined"),
+        (FlatParameter, "flat_parameter"),
+        (OdeSolver, "ode_solver"),
+        (StalledAtInit, "stalled_at_init"),
+        (EbeStartDependent, "ebe_start_dependent"),
+        (General, "general"),
+        // #1307. Appended rather than filed next to `InitOutsideBounds`, which
+        // is where it belongs by subject: the match below returns each variant's
+        // *index in this list*, so inserting mid-list renumbers every arm after
+        // it and the diff stops being reviewable.
+        (InitNotRepresentable, "init_not_representable"),
+        (UncertaintyDrawsSkipped, "uncertainty_draws_skipped"),
+        (DegenerateClearanceOrVolume, "degenerate_clearance_or_volume"),
+        (OdeRhsRoute, "ode_rhs_route"),
+    ];
+    // The list is hand-maintained, and had silently fallen four variants behind
+    // when `StalledAtInit` was added (#997) — `FlipFlop`, `AbsorptionTwinDeclined`,
+    // `FlatParameter` and `OdeSolver` were each shipped without a row here, so
+    // their tokens were never pinned by the test whose job that is. The match
+    // below is the guard against that recurring: it has no wildcard arm, so a new
+    // `WarningCode` variant fails to compile here until someone touches this test.
+    // It deliberately does not call `as_str` — a body that delegated would pin
+    // nothing, since `as_str` is the thing under test.
+    fn _every_variant_is_listed_above(c: WarningCode) -> usize {
+        match c {
+            Convergence => 0,
+            CovarianceStep => 1,
+            CovarianceFailed => 2,
+            CovarianceRegularized => 3,
+            ConditionNumber => 4,
+            OptimizerHealth => 5,
+            ViBadBasin => 6,
+            DwAutocorrelation => 7,
+            EtaNormality => 8,
+            Experimental => 9,
+            BloqMethod => 10,
+            Sir => 11,
+            ImportanceSampling => 12,
+            EpsShrinkage => 13,
+            EtaShrinkage => 14,
+            BoundaryEstimate => 15,
+            ParameterAtRunawayGuard => 16,
+            InitOutsideBounds => 17,
+            InflatedRse => 18,
+            HighCorrelation => 19,
+            DataQuality => 20,
+            OmegaStructure => 21,
+            GradientFallback => 22,
+            MuReferencing => 23,
+            OptimizerConfig => 24,
+            MultiStart => 25,
+            Cancelled => 26,
+            Threads => 27,
+            Simulation => 28,
+            FlipFlop => 29,
+            AbsorptionTwinDeclined => 30,
+            FlatParameter => 31,
+            OdeSolver => 32,
+            StalledAtInit => 33,
+            EbeStartDependent => 34,
+            General => 35,
+            InitNotRepresentable => 36,
+            UncertaintyDrawsSkipped => 37,
+            DegenerateClearanceOrVolume => 38,
+            OdeRhsRoute => 39,
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        40,
+        "every arm of `_every_variant_is_listed_above` needs a row in `expected`"
+    );
+    for (i, (code, _)) in expected.iter().enumerate() {
+        assert_eq!(
+            _every_variant_is_listed_above(*code),
+            i,
+            "`expected` and the exhaustiveness match disagree on {code:?}"
+        );
+    }
+    for (code, token) in expected {
+        assert_eq!(code.as_str(), *token, "as_str drift for {code:?}");
+        // serde token == as_str token (rename_all = "snake_case").
+        assert_eq!(
+            serde_json::to_value(code).unwrap(),
+            serde_json::json!(token),
+            "serde token drift for {code:?}"
+        );
+        // and it round-trips back to the same variant.
+        let back: WarningCode = serde_json::from_value(serde_json::json!(token)).unwrap();
+        assert_eq!(back, *code);
+    }
+}
+
+/// #778: the optional `details` payload serializes when present (the
+/// at-source numeric channel) and is omitted when `None`.
+#[test]
+fn warning_entry_details_serialize_when_present() {
+    let with = WarningEntry {
+        severity: WarningSeverity::Warning,
+        category: WarningCode::DwAutocorrelation,
+        message: "Positive IWRES autocorrelation".to_string(),
+        source_method: None,
+        details: Some(serde_json::json!({ "durbin_watson": 1.2 })),
+    };
+    let v = serde_json::to_value(&with).unwrap();
+    assert_eq!(v["category"], "dw_autocorrelation");
+    assert_eq!(v["details"]["durbin_watson"], 1.2);
+    // round-trips
+    let back: WarningEntry = serde_json::from_value(v).unwrap();
+    assert_eq!(back.details, with.details);
+    assert_eq!(back.category, WarningCode::DwAutocorrelation);
+
+    // None -> key omitted entirely.
+    let without = classify_warning("some novel message");
+    let vo = serde_json::to_value(&without).unwrap();
+    assert!(vo.get("details").is_none());
+}
+
+/// Round-trip table covering every literal warning message emitted by the
+/// engine, with the (severity, category) it should classify to.
+///
+/// This protects the classifier contract from quiet regressions when a
+/// message gets a typo fix or a wording change. If you edit a message
+/// string in `outer_optimizer.rs`, `saem.rs`, `gauss_newton.rs`,
+/// `trust_region.rs`, or `api.rs`, mirror the edit here so the test
+/// keeps reflecting the engine's actual output.
+///
+/// Messages built by `format!(..)` are exercised with a representative
+/// instantiation: the substrings the classifier matches on must remain
+/// present after interpolation.
+#[test]
+fn classify_warning_roundtrips_every_engine_message() {
+    use WarningSeverity::*;
+    let table: &[(&str, WarningSeverity, &str)] = &[
+        // -- outer_optimizer.rs ----------------------------------------
+        ("Outer optimization did not converge", Critical, "convergence"),
+        ("Covariance step failed", Critical, "covariance_failed"),
+        // global_search has two arms: explicit "disabled" is a runtime
+        // failure (Warning); a bare mention without "disabled" is
+        // informational.
+        ("global_search disabled: bad seed", Warning, "optimizer_config"),
+        ("global_search reached eval cap", Info, "optimizer_config"),
+        ("cancelled by user", Info, "cancelled"),
+        // -- gauss_newton.rs -------------------------------------------
+        ("Gauss-Newton: trust radius collapsed without convergence", Critical, "convergence"),
+        (
+            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed without convergence",
+            Critical,
+            "convergence",
+        ),
+        ("Gauss-Newton: max iterations reached without convergence", Critical, "convergence"),
+        // -- saem.rs ---------------------------------------------------
+        ("Covariance step failed \u{2014} SEs not available", Critical, "covariance_failed"),
+        (
+            "saem_n_leapfrog > 0 but HMC is unavailable (requires an analytical PK model \
+                 the Dual2 gradient supports); falling back to Metropolis-Hastings",
+            Info,
+            "gradient_fallback",
+        ),
+        // -- trust_region.rs ------------------------------------------
+        ("Trust-region did not converge: line search stalled", Critical, "convergence"),
+        // -- api.rs ----------------------------------------------------
+        (
+            "Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).",
+            Warning,
+            "dw_autocorrelation",
+        ),
+        (
+            "Negative IWRES autocorrelation detected (Durbin-Watson = 2.80).",
+            Warning,
+            "dw_autocorrelation",
+        ),
+        (
+            "M3 censoring under FOCE uses non-interaction (Sheiner–Beal) semantics",
+            Warning,
+            "bloq_method",
+        ),
+        ("SIR failed: covariance not positive definite", Warning, "sir"),
+        ("SIR requested but covariance matrix is not available", Warning, "sir"),
+        // #972: the stranded-SIR-after-a-failed-covariance-step message names
+        // the covariance step and the Hessian, both of which earlier arms in the
+        // chain sniff for. It must still route to "sir", not to
+        // "covariance_failed" / "optimizer_health".
+        (
+            "SIR requested but the covariance step did not succeed and no usable SIR \
+             proposal could be built from it, so SIR could not run — see the \
+             covariance warning above for the cause.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR requested but not run: Bayesian estimation reports posterior \
+             credible intervals instead of a Hessian-based covariance, which SIR \
+             would have to draw from.",
+            Warning,
+            "sir",
+        ),
+        // #1021: proposal-conditioning diagnostics. The shrinkage message names
+        // "the covariance step", which earlier arms sniff for — it must still
+        // route to "sir".
+        (
+            "SIR: proposal was shrunk in 3 direction(s) so draws stay inside the \
+             parameter bounds [TVKA -0.74 (sd 6.15e3 → 2.89e0)]. Those directions \
+             come from eigenvalue-floored (non-identified) curvature in the \
+             covariance step; the SIR CIs along them understate the true uncertainty.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR: proposal covariance is rank-deficient beyond the FIX-ed \
+             parameters: 1 direction(s) carry no uncertainty [TVCL +0.71, TVV -0.70]. \
+             SIR holds those parameter combinations at their ML values, so their CIs \
+             are not explored — they are not identified by the data.",
+            Warning,
+            "sir",
+        ),
+        (
+            "SIR fallback: proposal was shrunk in 1 direction(s) so draws stay inside \
+             the parameter bounds [ADD_ERR +0.99 (sd 4.36e3 → 2.17e0)].",
+            Warning,
+            "sir",
+        ),
+        ("IMP: 2 subject(s) had ESS = 0 (proposal collapse)", Warning, "importance_sampling"),
+        (
+            "High ETA shrinkage (\u{2265} 30%): eta_CL (42%). EBE-based diagnostics \
+                 for these random effects are unreliable.",
+            Warning,
+            "eta_shrinkage",
+        ),
+        (
+            "Parameter estimate(s) pinned to an optimizer bound: CL (0.0010 at lower bound).",
+            Warning,
+            "boundary_estimate",
+        ),
+        (
+            "W_INIT_OUTSIDE_BOUNDS: ETA_CL starts at a variance of 1.0e8, above the \
+             optimizer's upper variance rail of 1.6e5. The start is clamped onto that \
+             rail before the first objective evaluation.",
+            Warning,
+            "init_outside_bounds",
+        ),
+        ("High relative standard error (RSE > 50%): TVCL (72%).", Warning, "inflated_rse"),
+        (
+            "Highly correlated parameter pair(s) (|r| >= 0.95): TVCL ~ TVV (0.98).",
+            Warning,
+            "high_correlation",
+        ),
+        ("LTBS (log(DV) ~ ...): 3 observation(s) with non-positive DV", Warning, "data_quality"),
+        ("W_MISSING_DV: 2 observation row(s) (EVID=0) had a missing DV", Warning, "data_quality"),
+        (
+            "W_CMT_DEFAULTED: the dataset has no CMT column, so 10 dose row(s) and 110 \
+             observation row(s) were assigned compartment 1.",
+            Warning,
+            "data_quality",
+        ),
+        (
+            "Stochastic differential equations ([diffusion] / Extended Kalman \
+                 Filter) are an EXPERIMENTAL feature: validated only on a small set",
+            Warning,
+            "experimental",
+        ),
+        (
+            "Neural-network model components ([covariate_nn] / deep compartment \
+                 models) are an EXPERIMENTAL feature: validated only on a small set",
+            Warning,
+            "experimental",
+        ),
+        (
+            "block omega: ETA_CL x ETA_V have mixed lognormal / additive parameterisations",
+            Warning,
+            "omega_structure",
+        ),
+        ("mu-ref: CL, V, KA", Info, "mu_referencing"),
+        (
+            "SAEM: individual parameter(s) not mu-referenced: V. This can strongly \
+                 affect convergence; prefer forms such as `CL = TVCL * exp(ETA_CL)` when possible.",
+            Warning,
+            "mu_referencing",
+        ),
+        (
+            "Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 3); \
+             all 8 converged starts within 1.0 of best (range 0.0000)",
+            Info,
+            "multi_start",
+        ),
+        ("12 threads configured (engine default) but only 10 subject(s)", Info, "threads"),
+        ("SAEM with more threads than subjects/2", Info, "threads"),
+        (
+            "Covariance step: 35 parameters \u{2192} n\u{00b2} OFV evaluations",
+            Info,
+            "covariance_step",
+        ),
+        ("Covariance step: 35 parameters -> n^2 OFV evaluations", Info, "covariance_step"),
+        // format_non_pd_warning path (NonPdHessian variant).
+        (
+            "Covariance step: Hessian is not positive definite. \
+                 Eigenvalues: [8.4000, 2.1000, -0.0100]. SE estimates not available.",
+            Critical,
+            "covariance_failed",
+        ),
+        // Covariance step regularised — present in all three severity tiers.
+        (
+            "Covariance step regularized: eigenvalue floor applied to the FD Hessian \
+                 (1 of 3 free-block eigenvalues clipped; min eig = 1.200e-6, max eig = 8.4e3, \
+                 floor = 8.4e-14; worst variance inflation from \
+                 the floor = 1.050e0\u{d7}; severity: minor). Standard errors are likely reliable.",
+            Warning,
+            "covariance_regularized",
+        ),
+        // #520: the analytic-R-matrix spelling of the same warning must classify identically —
+        // the route is named in the text, so a taxonomy keyed on the wrong half of the sentence
+        // would split one code into two.
+        (
+            "Covariance step regularized: eigenvalue floor applied to the analytic R-matrix \
+                 (3 of 5 free-block eigenvalues clipped; min eig = -1.2e-6, max eig = 8.4e3, \
+                 |min eig|/max eig = 1.43e-10, floor = 8.4e-14; worst variance inflation from \
+                 the floor = unbounded; severity: severe). Standard errors for the affected \
+                 parameters come mostly from the floor rather than from the data and are not \
+                 reliable; SIR-based confidence intervals are recommended.",
+            Warning,
+            "covariance_regularized",
+        ),
+        // Off-diagonal NaN soft warning — Success result, but correlation missing.
+        (
+            "Covariance step: off-diagonal FD stencil(s) non-finite for theta[CL], sigma[1]. \
+                 Cross-partial correlation set to 0; SE for these parameter(s) \
+                 may be over-optimistic. Try tuning fd_hessian_step.",
+            Warning,
+            "covariance_regularized",
+        ),
+        // Chain-prefixed off-diagonal warning.
+        (
+            "[FOCEI] Covariance step: off-diagonal FD stencil(s) non-finite for theta[CL]. \
+                 Cross-partial correlation set to 0; SE for these parameter(s) \
+                 may be over-optimistic. Try tuning fd_hessian_step.",
+            Warning,
+            "covariance_regularized",
+        ),
+        // Unusable messages introduced in commit 2.
+        (
+            "Covariance step failed: base OFV is non-finite at convergence \
+                 (likely numerical overflow or underflow in model evaluation). \
+                 SE estimates not available.",
+            Critical,
+            "covariance_failed",
+        ),
+        (
+            "Covariance step failed: Hessian has ill-conditioned entries for the \
+                 following parameter(s) — theta[CL] (non-finite diagonal); \
+                 sigma[1] (non-finite off-diagonal). SE estimates not available.",
+            Critical,
+            "covariance_failed",
+        ),
+        // Omega near-singular (tiny positive eigenvalue) — "near-singular" descriptor.
+        (
+            "Covariance step failed: Omega matrix is near-singular at \
+                 convergence (min eigenvalue = 1.2e-10; eigenvalues: [0.5000, 1.2e-10]). \
+                 SE estimates not available.",
+            Critical,
+            "covariance_failed",
+        ),
+        // Omega truly non-PD (negative eigenvalue) — "not positive definite" descriptor.
+        (
+            "Covariance step failed: Omega matrix is not positive definite at \
+                 convergence (min eigenvalue = -1.0e-3; eigenvalues: [0.5000, -1.0e-3]). \
+                 SE estimates not available.",
+            Critical,
+            "covariance_failed",
+        ),
+        // SIR message that also contains "not positive definite" — must
+        // still route to "sir", NOT to covariance_step.
+        ("SIR failed: covariance not positive definite", Warning, "sir"),
+        // -- chain-prefixed (multi-stage) -----------------------------
+        ("[FOCEI] Covariance step failed", Critical, "covariance_failed"),
+        (
+            "[FOCEI] Covariance step: Hessian is not positive definite. \
+                 Eigenvalues: [2.1000, -0.0100]. SE estimates not available.",
+            Critical,
+            "covariance_failed",
+        ),
+        ("[SAEM] individual parameter(s) not mu-referenced: V", Warning, "mu_referencing"),
+        ("[FOCEI] Outer optimization did not converge", Critical, "convergence"),
+        // -- survival/mod.rs simulation diagnostics (#762/#763) --------
+        // The `w_tte_degenerate` / `w_rtte_degenerate` prefixes must route to
+        // `simulation`, winning over the generic "degenerate" -> optimizer_health
+        // branch that their message body would otherwise match.
+        (
+            "W_TTE_DEGENERATE_HAZARD: subject '7' (CMT=1) drew a non-positive / \
+                 non-finite effective hazard rate; no event was generated and the \
+                 subject is censored at the observation window (#763). Check the \
+                 hazard parameters / covariate values.",
+            Warning,
+            "simulation",
+        ),
+        (
+            "W_RTTE_DEGENERATE: subject '7' (CMT=2) has a degenerate recurrent \
+                 hazard (~1.234e7 events expected before horizon 30); its event stream \
+                 was skipped and the subject censored at the horizon (#762). Check the \
+                 hazard parameters / covariate values.",
+            Warning,
+            "simulation",
+        ),
+        (
+            "W_RTTE_DEGENERATE: subject '7' (CMT=2) produced over 1000000 events \
+                 before horizon 30 (vanishing inter-event gaps); its stream was \
+                 truncated and the subject censored at the horizon (#762).",
+            Warning,
+            "simulation",
+        ),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for (msg, want_sev, want_cat) in table {
+        let got = classify_warning(msg);
+        if got.severity != *want_sev || got.category.as_str() != *want_cat {
+            failures.push(format!(
+                "  {msg:?} -> expected ({:?}, {:?}), got ({:?}, {:?})",
+                want_sev, want_cat, got.severity, got.category
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "classify_warning round-trip failures:\n{}", failures.join("\n"));
+}
+
+#[test]
+fn is_ode_based_false_for_analytical() {
+    let m = test_helpers::analytical_model(GradientMethod::Auto);
+    assert!(!m.is_ode_based());
+}
+
+#[test]
+fn is_ode_based_true_for_ode() {
+    let m = test_helpers::ode_model(GradientMethod::Auto);
+    assert!(m.is_ode_based());
+}
+
+#[test]
+fn has_bioavailability_detects_f_on_either_engine() {
+    // Baseline test models declare no F → false on both engines.
+    assert!(!test_helpers::analytical_model(GradientMethod::Auto).has_bioavailability());
+    assert!(!test_helpers::ode_model(GradientMethod::Auto).has_bioavailability());
+
+    // Analytical route: `f=` on `[structural_model]` puts PK_IDX_F in pk_indices.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.pk_indices = vec![PK_IDX_F];
+    assert!(m.has_bioavailability());
+
+    // Analytical engine: a bare `F` in `[individual_parameters]` with no `f=`
+    // binding never reaches PK_IDX_F, so it is not a bioavailability (#1359).
+    // On the ODE layout the same name is routed by `ode_param_slots`, which is
+    // what puts PK_IDX_F into `pk_indices` — covered by the parser tests.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "f".into()];
+    assert!(!m.has_bioavailability());
+
+    // ODE engine only: a compartment-indexed `Fn` routes via the DoseAttrMap.
+    let mut m = test_helpers::ode_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "F1".into()];
+    assert!(m.has_bioavailability());
+
+    // The same `F1` on the analytical engine is not bioavailability (no ode_spec).
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "F1".into()];
+    assert!(!m.has_bioavailability());
+}
+
+#[test]
+fn has_lagtime_answers_from_routed_slots_and_indexed_names_only() {
+    // #1359: both lag predicates share `has_indexed_dose_attr`, so pin its three
+    // arms — the slot, the ODE-only indexed name, and the compartment scoping
+    // that separates `has_lagtime_on_cmt` from `has_lagtime`.
+    let base = test_helpers::analytical_model(GradientMethod::Auto);
+    assert!(!base.has_lagtime() && !base.has_lagtime_on_cmt(1));
+
+    // Route 1, either engine: the slot in `pk_indices` is the whole answer.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.pk_indices = vec![PK_IDX_CL, PK_IDX_LAGTIME];
+    assert!(m.has_lagtime() && m.has_lagtime_on_cmt(1) && m.has_lagtime_on_cmt(2));
+
+    // A bare name alone — the analytical false positive — is no longer a lag.
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "LAGTIME".into(), "ALAG".into()];
+    assert!(!m.has_lagtime() && !m.has_lagtime_on_cmt(1));
+
+    // Route 2, ODE only: `ALAG2` is a lag on compartment 2 and on the model, not
+    // on compartment 1.
+    let mut m = test_helpers::ode_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "ALAG2".into()];
+    assert!(m.has_lagtime());
+    assert!(m.has_lagtime_on_cmt(2));
+    assert!(!m.has_lagtime_on_cmt(1), "ALAG2 must not count for compartment 1");
+
+    // The same `ALAG2` on the analytical engine routes nothing (no ode_spec).
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "ALAG2".into()];
+    assert!(!m.has_lagtime() && !m.has_lagtime_on_cmt(2));
+}
+
+#[test]
+fn error_spec_single_ignores_cmt() {
+    let spec = ErrorSpec::Single(ErrorModel::Proportional);
+    // Proportional: V = (f * sigma)^2 = (10 * 0.1)^2 = 1.0, regardless of CMT.
+    assert!((spec.variance_at(1, 10.0, &[0.1]) - 1.0).abs() < 1e-12);
+    assert!((spec.variance_at(7, 10.0, &[0.1]) - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn error_spec_per_cmt_dispatches_model_and_sigma_slice() {
+    // Flat sigma vector [prop_pk, add_pd]; CMT=2 uses idx 0 (proportional),
+    // CMT=3 uses idx 1 (additive).
+    let mut map = HashMap::new();
+    map.insert(2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] });
+    map.insert(3, EndpointError { error_model: ErrorModel::Additive, sigma_idx: vec![1] });
+    let spec = ErrorSpec::PerCmt(map);
+    let sigma = [0.1, 2.0];
+
+    // CMT=2 proportional: (10 * 0.1)^2 = 1.0 (independent of additive sigma).
+    assert!((spec.variance_at(2, 10.0, &sigma) - 1.0).abs() < 1e-12);
+    // CMT=3 additive: 2.0^2 = 4.0 (independent of prediction).
+    assert!((spec.variance_at(3, 10.0, &sigma) - 4.0).abs() < 1e-12);
+    assert!((spec.variance_at(3, 999.0, &sigma) - 4.0).abs() < 1e-12);
+
+    // Unregistered CMT → NaN guard.
+    assert!(spec.variance_at(1, 10.0, &sigma).is_nan());
+}
+
+#[test]
+fn error_spec_single_sigma_types_padded_to_n_sigma() {
+    // Single proportional with extra declared sigmas: leading slot is
+    // proportional, the rest default to additive, length == n_sigma.
+    let spec = ErrorSpec::Single(ErrorModel::Proportional);
+    assert_eq!(
+        spec.sigma_types(3),
+        vec![SigmaType::Proportional, SigmaType::Additive, SigmaType::Additive]
+    );
+    // Combined stamps both leading slots.
+    let combined = ErrorSpec::Single(ErrorModel::Combined);
+    assert_eq!(combined.sigma_types(2), vec![SigmaType::Proportional, SigmaType::Additive]);
+}
+
+#[test]
+fn variance_at_scaled_unit_mult_matches_legacy() {
+    // A unit multiplier must reproduce the plain variance bit-for-bit.
+    let combined = ErrorSpec::Single(ErrorModel::Combined);
+    let sigma = [0.3, 2.0];
+    let f = 5.0;
+    let base = combined.variance_at_with_correlations(1, f, &sigma, &[]);
+    let scaled = combined.variance_at_scaled(1, f, &sigma, &[], &[1.0, 1.0]);
+    assert_eq!(base, scaled);
+}
+
+#[test]
+fn variance_at_scaled_scales_proportional_loading() {
+    // mult = [2, 1] on combined → (2·f·σ_p)² + σ_a².
+    let combined = ErrorSpec::Single(ErrorModel::Combined);
+    let sigma = [0.3, 2.0];
+    let f = 5.0;
+    let v = combined.variance_at_scaled(1, f, &sigma, &[], &[2.0, 1.0]);
+    let expected = (2.0 * f * 0.3).powi(2) + 2.0_f64.powi(2);
+    assert!((v - expected).abs() < 1e-12, "got {v}, want {expected}");
+}
+
+#[test]
+fn dvar_df_scaled_scales_by_mprop_squared() {
+    // dvar_df scales by the proportional multiplier squared.
+    let combined = ErrorSpec::Single(ErrorModel::Combined);
+    let sigma = [0.3, 2.0];
+    let f = 7.0;
+    let base = combined.dvar_df(1, f, &sigma);
+    let scaled = combined.dvar_df_scaled(1, f, &sigma, &[3.0, 1.0]);
+    assert!((scaled - base * 9.0).abs() < 1e-12);
+}
+
+#[test]
+fn d2var_df2_scaled_scales_by_mprop_squared() {
+    // d2var_df2 takes the same m² proportional-loading factor as dvar_df_scaled,
+    // so the M3 censored curvature is built from a consistent v(f). A unit mult
+    // reproduces the unscaled value; additive stays 0 at any mult.
+    let combined = ErrorSpec::Single(ErrorModel::Combined);
+    let sigma = [0.3, 2.0];
+    // A prediction well away from 0: the combined variance `(f·σ₁)² + σ₂²`
+    // stays far above the `MIN_VARIANCE` floor, so `d2var_df2` returns the raw
+    // `2·σ₁²` and the m² scaling below is unaffected by the floor gate (#958).
+    let f = 5.0;
+    let base = combined.d2var_df2(1, f, &sigma);
+    assert!((combined.d2var_df2_scaled(1, f, &sigma, &[3.0, 1.0]) - base * 9.0).abs() < 1e-12);
+    assert!((combined.d2var_df2_scaled(1, f, &sigma, &[1.0, 1.0]) - base).abs() < 1e-12);
+    assert_eq!(ErrorSpec::Single(ErrorModel::Additive).d2var_df2_scaled(1, f, &[0.5], &[4.0]), 0.0);
+}
+
+#[test]
+fn error_spec_per_cmt_variance_at_out_of_range_idx_is_nan() {
+    // Hand-constructed endpoint whose sigma_idx points past the sigma slice
+    // must yield NaN, not panic.
+    let mut map = HashMap::new();
+    map.insert(
+        2,
+        EndpointError {
+            error_model: ErrorModel::Proportional,
+            sigma_idx: vec![5], // out of range for a length-1 sigma vector
+        },
+    );
+    let spec = ErrorSpec::PerCmt(map);
+    assert!(spec.variance_at(2, 10.0, &[0.1]).is_nan());
+}
+
+#[test]
+fn error_spec_dvar_df_matches_legacy_single_formulas() {
+    let f = 7.0;
+    // Additive: 0. Proportional/Combined: 2*f*sigma_prop^2.
+    assert_eq!(ErrorSpec::Single(ErrorModel::Additive).dvar_df(1, f, &[0.5]), 0.0);
+    assert!(
+        (ErrorSpec::Single(ErrorModel::Proportional).dvar_df(1, f, &[0.3]) - 2.0 * f * 0.09).abs()
+            < 1e-12
+    );
+    // Combined uses the first (proportional) sigma.
+    assert!(
+        (ErrorSpec::Single(ErrorModel::Combined).dvar_df(1, f, &[0.3, 2.0]) - 2.0 * f * 0.09).abs()
+            < 1e-12
+    );
+}
+
+#[test]
+fn error_spec_per_cmt_dvar_df_and_dlogsigma_dispatch_by_endpoint() {
+    // CMT=2 proportional on sigma idx 0; CMT=3 additive on sigma idx 1.
+    let mut map = HashMap::new();
+    map.insert(2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] });
+    map.insert(3, EndpointError { error_model: ErrorModel::Additive, sigma_idx: vec![1] });
+    let spec = ErrorSpec::PerCmt(map);
+    let sigma = [0.3, 2.0];
+    let f = 7.0;
+
+    // dvar_df: proportional endpoint -> 2*f*0.3^2; additive -> 0.
+    assert!((spec.dvar_df(2, f, &sigma) - 2.0 * f * 0.09).abs() < 1e-12);
+    assert_eq!(spec.dvar_df(3, f, &sigma), 0.0);
+
+    // dvar_dlogsigma: each sigma only contributes through its own endpoint.
+    // sigma 0 (proportional, CMT=2): 2*0.3^2*f^2 at CMT=2, 0 at CMT=3.
+    assert!((spec.dvar_dlogsigma(2, 0, f, &sigma) - 2.0 * 0.09 * f * f).abs() < 1e-12);
+    assert_eq!(spec.dvar_dlogsigma(3, 0, f, &sigma), 0.0);
+    // sigma 1 (additive, CMT=3): 2*2.0^2 at CMT=3, 0 at CMT=2.
+    assert!((spec.dvar_dlogsigma(3, 1, f, &sigma) - 2.0 * 4.0).abs() < 1e-12);
+    assert_eq!(spec.dvar_dlogsigma(2, 1, f, &sigma), 0.0);
+}
+
+#[test]
+fn error_spec_per_cmt_sigma_types_maps_each_slot() {
+    let mut map = HashMap::new();
+    map.insert(2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] });
+    map.insert(3, EndpointError { error_model: ErrorModel::Additive, sigma_idx: vec![1] });
+    let spec = ErrorSpec::PerCmt(map);
+    assert_eq!(spec.sigma_types(2), vec![SigmaType::Proportional, SigmaType::Additive]);
+}
+
+#[test]
+fn test_lagtime_name_to_index_and_default() {
+    assert_eq!(PkParams::name_to_index("lagtime"), Some(PK_IDX_LAGTIME));
+    // NONMEM-style alias maps to the same slot.
+    assert_eq!(PkParams::name_to_index("alag"), Some(PK_IDX_LAGTIME));
+    assert_eq!(PK_IDX_LAGTIME, 8);
+    // Slots 0–8 are named PK params; the rest are ODE structural-param
+    // headroom (see MAX_PK_PARAMS docs / issue #122).
+    assert!(MAX_PK_PARAMS > PK_IDX_LAGTIME);
+
+    let default = PkParams::default();
+    assert_eq!(default.lagtime(), 0.0);
+    // F still defaults to 1.0 (unchanged).
+    assert_eq!(default.f_bio(), 1.0);
+}
+
+#[test]
+fn dose_attr_map_resolves_indexed_then_bare_then_default() {
+    // params: slot 5 = bare F, slot 8 = bare lag, slots 9/10 = F2/ALAG2.
+    let mut params = [0.0f64; MAX_PK_PARAMS];
+    params[PK_IDX_F] = 0.8; // bare F
+    params[PK_IDX_LAGTIME] = 0.5; // bare lag
+    params[9] = 0.3; // F for compartment 2
+    params[10] = 1.25; // ALAG for compartment 2
+
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::F, 2, 9);
+    map.insert(DoseAttr::Lag, 2, 10);
+
+    // Compartment 1 has no indexed entry -> falls through to the bare slot.
+    assert_eq!(map.f_bio(1, &params), 0.8);
+    assert_eq!(map.lagtime(1, &params), 0.5);
+    // Compartment 2 is overridden by its indexed slot.
+    assert_eq!(map.f_bio(2, &params), 0.3);
+    assert_eq!(map.lagtime(2, &params), 1.25);
+    // indexed_slot exposes the raw mapping (used by upstream validation).
+    assert_eq!(map.indexed_slot(DoseAttr::F, 2), Some(9));
+    assert_eq!(map.indexed_slot(DoseAttr::F, 1), None);
+}
+
+/// `CMT=0` is NONMEM's *default dose compartment* — compartment 1 — so it must
+/// resolve to the `F1` / `ALAG1` entry, not miss the indexed map (#899).
+///
+/// The silent failure this pins: a model declaring `F1 = 0.6` and no bare `F`
+/// leaves `PK_IDX_F` at `PkParams::default()`'s **1.0**, so a dose written
+/// `CMT=0` would be delivered at full amount — a 40% dose error with no error
+/// and no warning. It was the last site where `CMT=0` still meant something
+/// other than compartment 1 after the rest of #899 unified the dose routing.
+#[test]
+fn cmt_zero_resolves_dose_attributes_as_the_default_compartment() {
+    let mut params = [0.0f64; MAX_PK_PARAMS];
+    // No bare F declared: the slot keeps the 1.0 default, which is exactly what
+    // a missed lookup would silently return.
+    params[PK_IDX_F] = 1.0;
+    params[PK_IDX_LAGTIME] = 0.0;
+    params[9] = 0.6; // F1
+    params[10] = 0.75; // ALAG1
+
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::F, 1, 9);
+    map.insert(DoseAttr::Lag, 1, 10);
+
+    // The bug: without the normalisation these returned the bare 1.0 / 0.0.
+    assert_eq!(map.f_bio(0, &params), 0.6, "CMT=0 must read F1, not bare F");
+    assert_eq!(map.lagtime(0, &params), 0.75, "CMT=0 must read ALAG1, not bare ALAG");
+    // …and identically to the same dose written CMT=1.
+    assert_eq!(map.f_bio(0, &params), map.f_bio(1, &params));
+    assert_eq!(map.lagtime(0, &params), map.lagtime(1, &params));
+
+    // The slot accessors agree, so `lag_slot` (which the sens walk differentiates
+    // through) picks the same parameter — otherwise the gradient would be taken
+    // with respect to the wrong slot.
+    assert_eq!(map.indexed_slot(DoseAttr::F, 0), map.indexed_slot(DoseAttr::F, 1));
+    assert_eq!(map.lag_slot(0), map.lag_slot(1));
+
+    // Not over-broad: a model with no compartment-1 entry still falls through to
+    // the bare slot for CMT=0, exactly as CMT=1 does.
+    let mut only_cmt2 = DoseAttrMap::default();
+    only_cmt2.insert(DoseAttr::F, 2, 9);
+    assert_eq!(only_cmt2.f_bio(0, &params), 1.0);
+    assert_eq!(only_cmt2.indexed_slot(DoseAttr::F, 0), None);
+}
+
+/// The canonical CMT-conversion accessors (#899, #912): `CMT=0` is the default dose
+/// compartment == compartment 1, so `cmt_idx()` (0-based state index) maps both 0 and 1 to
+/// 0, and `cmt_1based()` maps both to 1. Every dose-compartment comparison in the engines
+/// routes through these instead of open-coding `cmt - 1` (underflows on 0) or `cmt >= 1`
+/// (drops 0) — the scattering that produced the #913-review gaps.
+#[test]
+fn dose_cmt_accessors_resolve_cmt_zero_to_the_default_compartment() {
+    let d0 = DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0);
+    let d1 = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
+    let d2 = DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0);
+
+    // CMT=0 and CMT=1 are the same compartment on both bases.
+    assert_eq!(d0.cmt_idx(), 0);
+    assert_eq!(d1.cmt_idx(), 0);
+    assert_eq!(d0.cmt_1based(), 1);
+    assert_eq!(d1.cmt_1based(), 1);
+
+    // A genuine second compartment is unaffected (no clamping past 1).
+    assert_eq!(d2.cmt_idx(), 1);
+    assert_eq!(d2.cmt_1based(), 2);
+
+    // `cmt_raw()` is the literal authored value, `0` included — the escape hatch
+    // that lets a site distinguish an authored `CMT=0` from `CMT=1` (the resolved
+    // accessors cannot).
+    assert_eq!(d0.cmt_raw(), 0);
+    assert_eq!(d1.cmt_raw(), 1);
+    assert_eq!(d2.cmt_raw(), 2);
+
+    // The two resolved accessors are exact complements, and both are pure
+    // functions of the raw value (#912: the field is private, these are the only
+    // ways to read it).
+    for d in [&d0, &d1, &d2] {
+        assert_eq!(d.cmt_idx() + 1, d.cmt_1based());
+        assert_eq!(d.cmt_idx(), d.cmt_raw().saturating_sub(1));
+        assert_eq!(d.cmt_1based(), d.cmt_raw().max(1));
+    }
+}
+
+/// `ss_cycle_doses()` (#912/#419) repositions a dose to a single SS cycle's
+/// origin — `time = 0`, `ss`/`ii` cleared — while preserving the compartment and
+/// the bioavailability-reshaped `(rate, duration)` that a bare `DoseEvent::new`
+/// would recompute and drop. It is the replacement for the `..dose.clone()`
+/// struct-update the now-private `cmt` field forbids outside this module.
+#[test]
+fn ss_cycle_doses_preserve_shape_and_clear_steady_state() {
+    // An SS infusion into compartment 2, then F-reshaped so (rate, duration) no
+    // longer equal the raw amt/rate pair `::new` would derive.
+    let dose = DoseEvent::new(5.0, 100.0, 2, 25.0, true, 12.0).with_bioavailable_infusion(0.5);
+    let cycle = dose.ss_cycle_doses();
+    assert_eq!(cycle.len(), 1, "no overlap: one window");
+    let cyc = &cycle[0];
+
+    // Repositioned to the cycle origin.
+    assert_eq!(cyc.time, 0.0);
+    assert!(!cyc.ss);
+    assert_eq!(cyc.ii, 0.0);
+
+    // Compartment and the reshaped infusion shape survive verbatim.
+    assert_eq!(cyc.cmt_raw(), dose.cmt_raw());
+    assert_eq!(cyc.amt, dose.amt);
+    assert_eq!(cyc.rate, dose.rate);
+    assert_eq!(cyc.duration, dose.duration);
+    assert_eq!(cyc.is_infusion(), dose.is_infusion());
+    assert_eq!(cyc.rate_mode, dose.rate_mode);
+    assert_eq!(cyc.infusion_def, dose.infusion_def);
+
+    // `rate_mode` / `infusion_def` are carried through directly, not inferred from
+    // `is_infusion()` — assert on a *modeled* dose so the check is non-vacuous (the
+    // reshaped `Fixed` case above would pass even if they were hard-coded to
+    // `Fixed`/`RateDefined`, which is exactly what `DoseEvent::new` would do).
+    let modeled = DoseEvent::modeled(5.0, 100.0, 2, true, 12.0, RateMode::ModeledDuration);
+    let mcyc = &modeled.ss_cycle_doses()[0];
+    assert_eq!(mcyc.rate_mode, RateMode::ModeledDuration);
+    assert_eq!(mcyc.infusion_def, modeled.infusion_def);
+
+    // Overlapping pulses (`T_inf = 20 = 2.5·II`): the newest over `r = 4`, and the two that
+    // run the whole cycle as one window at twice the rate.
+    let overlap = DoseEvent::new(5.0, 1000.0, 1, 50.0, true, 8.0).ss_cycle_doses();
+    let shape: Vec<(f64, f64, f64)> =
+        overlap.iter().map(|d| (d.time, d.rate, d.duration)).collect();
+    assert_eq!(shape, vec![(0.0, 50.0, 4.0), (0.0, 100.0, 8.0)]);
+    // Exactly `2·II`: `r = II`, one earlier pulse.
+    let edge = DoseEvent::new(5.0, 800.0, 1, 50.0, true, 8.0).ss_cycle_doses();
+    let shape: Vec<(f64, f64)> = edge.iter().map(|d| (d.rate, d.duration)).collect();
+    assert_eq!(shape, vec![(50.0, 8.0), (50.0, 8.0)]);
+}
+
+#[test]
+fn dose_attr_from_indexed_name_recognizes_f_lag_duration_and_rate() {
+    use DoseAttr::*;
+    // Bioavailability and both lag spellings, case-insensitive.
+    assert_eq!(DoseAttr::from_indexed_name("F1"), Some((F, 1)));
+    assert_eq!(DoseAttr::from_indexed_name("f2"), Some((F, 2)));
+    assert_eq!(DoseAttr::from_indexed_name("ALAG1"), Some((Lag, 1)));
+    assert_eq!(DoseAttr::from_indexed_name("alag3"), Some((Lag, 3)));
+    assert_eq!(DoseAttr::from_indexed_name("LAGTIME2"), Some((Lag, 2)));
+    // Modeled infusion duration D{n} (RATE=-2; #324), case-insensitive.
+    assert_eq!(DoseAttr::from_indexed_name("D1"), Some((Duration, 1)));
+    assert_eq!(DoseAttr::from_indexed_name("d2"), Some((Duration, 2)));
+    // Modeled infusion rate R{n} (RATE=-1; #324), case-insensitive.
+    assert_eq!(DoseAttr::from_indexed_name("R1"), Some((Rate, 1)));
+    assert_eq!(DoseAttr::from_indexed_name("r2"), Some((Rate, 2)));
+
+    // Bare forms and zero index are not compartment-indexed attributes.
+    assert_eq!(DoseAttr::from_indexed_name("F"), None);
+    assert_eq!(DoseAttr::from_indexed_name("lagtime"), None);
+    assert_eq!(DoseAttr::from_indexed_name("alag"), None);
+    assert_eq!(DoseAttr::from_indexed_name("F0"), None);
+    assert_eq!(DoseAttr::from_indexed_name("D0"), None);
+    assert_eq!(DoseAttr::from_indexed_name("D"), None);
+    assert_eq!(DoseAttr::from_indexed_name("R0"), None);
+    assert_eq!(DoseAttr::from_indexed_name("R"), None);
+
+    // Must not capture canonical PK names, the [scaling] `S{n}` names, or
+    // non-numeric suffixes — including `D`/`R`-prefixed words (`delta`,
+    // `rate`, `RUV`, `R2D2`).
+    for n in [
+        "CL", "V1", "V2", "Q2", "Q3", "KA", "S1", "S2", "f_bio", "rate", "delta", "decay", "RUV",
+        "R2D2",
+    ] {
+        assert_eq!(DoseAttr::from_indexed_name(n), None, "{n} must not match");
+    }
+
+    // An all-digit suffix that overflows usize fails to parse -> not an
+    // attribute (exercises the parse-error guard, not just the success path).
+    assert_eq!(DoseAttr::from_indexed_name(&format!("R{}", "9".repeat(40))), None);
+}
+
+#[test]
+fn dose_attr_map_empty_yields_engine_defaults() {
+    // An empty map (the common bare-/single-route model) must reproduce the
+    // pre-existing defaults: F = 1.0, lag = 0.0, even for a params slice too
+    // short to hold the reserved slots (cannot panic).
+    let map = DoseAttrMap::default();
+    let full = PkParams::default().values; // F slot already 1.0
+    assert_eq!(map.f_bio(1, &full), 1.0);
+    assert_eq!(map.lagtime(1, &full), 0.0);
+
+    let short: [f64; 3] = [2.0, 3.0, 4.0];
+    assert_eq!(map.f_bio(1, &short), 1.0);
+    assert_eq!(map.lagtime(1, &short), 0.0);
+    // Duration/Rate have no bare fallback -> no indexed slot means None.
+    assert_eq!(map.indexed_slot(DoseAttr::Duration, 1), None);
+    assert_eq!(map.indexed_slot(DoseAttr::Rate, 1), None);
+}
+
+#[test]
+fn dose_event_resolve_rate_modeled_duration_matches_explicit_infusion() {
+    // RATE=-2 with D{1} in slot 9: a 100-unit dose over D = 5 must resolve to
+    // the same (rate, duration) as an explicit RATE = 100/5 = 20 infusion.
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::Duration, 1, 9);
+    let mut params = [0.0; MAX_PK_PARAMS];
+    params[9] = 5.0; // D1
+
+    let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
+    assert!(modeled.is_infusion(), "modeled dose is an infusion pre-resolve");
+    let resolved = modeled.resolve_rate(&map, &params);
+
+    assert_eq!(resolved.rate_mode, RateMode::Fixed);
+    assert_eq!(resolved.duration, 5.0);
+    assert_eq!(resolved.rate, 20.0);
+    // Bit-equal to the hand-written explicit infusion (the #324 invariant).
+    let explicit = DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0);
+    assert_eq!(resolved.rate, explicit.rate);
+    assert_eq!(resolved.duration, explicit.duration);
+    // cmt/time/amt/ss/ii are preserved through resolution.
+    assert_eq!(resolved.cmt, 1);
+    assert_eq!(resolved.amt, 100.0);
+
+    // A Fixed dose is returned unchanged (the common, allocation-cheap path).
+    let same = explicit.resolve_rate(&map, &params);
+    assert_eq!((same.rate, same.duration, same.rate_mode), (20.0, 5.0, RateMode::Fixed));
+}
+
+#[test]
+fn dose_event_resolve_rate_clamps_nonpositive_duration() {
+    // A transient *finite* D <= 0 mid-search clamps to DURATION_FLOOR so
+    // rate = amt / D stays finite (mirrors PreparedInputRate::MIN_PARAM).
+    // A NON-finite D is not a small positive one and takes the other branch —
+    // `dose_event_resolve_rate_repels_a_non_finite_duration` (#1284).
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::Duration, 1, 9);
+    let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration);
+
+    for bad in [0.0, -3.0, -1e-9] {
+        let mut params = [0.0; MAX_PK_PARAMS];
+        params[9] = bad;
+        let r = modeled.resolve_rate(&map, &params);
+        assert_eq!(r.duration, DoseEvent::DURATION_FLOOR, "clamp at floor");
+        assert!(r.rate.is_finite() && r.rate > 0.0, "rate finite");
+    }
+}
+
+#[test]
+fn dose_event_resolve_rate_modeled_rate_matches_explicit_infusion() {
+    // RATE=-1 with R{1} in slot 9: a 100-unit dose at R = 20 must resolve to
+    // the same (rate, duration) as an explicit RATE = 20 infusion (the
+    // #324 invariant, mirror of the modeled-duration case).
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::Rate, 1, 9);
+    let mut params = [0.0; MAX_PK_PARAMS];
+    params[9] = 20.0; // R1
+
+    let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate);
+    assert!(modeled.is_infusion(), "modeled-rate dose is an infusion pre-resolve");
+    let resolved = modeled.resolve_rate(&map, &params);
+
+    assert_eq!(resolved.rate_mode, RateMode::Fixed);
+    assert_eq!(resolved.rate, 20.0);
+    // amt / rate = 100 / 20; bit-equal to the hand-written explicit infusion.
+    assert_eq!(resolved.duration, 5.0);
+    let explicit = DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0);
+    assert_eq!(resolved.rate, explicit.rate);
+    assert_eq!(resolved.duration, explicit.duration);
+    assert_eq!(resolved.cmt, 1);
+    assert_eq!(resolved.amt, 100.0);
+}
+
+#[test]
+fn dose_event_resolve_rate_clamps_nonpositive_rate() {
+    // A transient *finite* R <= 0 mid-search clamps to RATE_FLOOR so the
+    // implied duration = amt / R stays finite (mirror of the duration clamp).
+    // A NON-finite R takes the other branch — see
+    // `dose_event_resolve_rate_repels_a_non_finite_duration` (#1284).
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::Rate, 1, 9);
+    let modeled = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledRate);
+
+    for bad in [0.0, -3.0, -1e-9] {
+        let mut params = [0.0; MAX_PK_PARAMS];
+        params[9] = bad;
+        let r = modeled.resolve_rate(&map, &params);
+        assert_eq!(r.rate, DoseEvent::RATE_FLOOR, "clamp at floor");
+        assert!(r.duration.is_finite() && r.duration > 0.0, "duration finite");
+    }
+}
+
+#[test]
+fn dose_event_resolve_rate_repels_a_non_finite_duration_or_rate() {
+    // #1284. A non-finite modeled `D{n}`/`R{n}` must NOT take the domain-floor
+    // clamp: `x > floor` is false for `NaN`, so the floor arm served the dose as
+    // an instantaneous bolus (`duration = 1e-8`) and `+inf` served one too
+    // (`rate = amt/inf = 0`, which `is_infusion()` reads as "not an infusion").
+    // Both returned finite, silently wrong numbers — measured 2.03x high at one
+    // elimination half-time on a 1-cpt model.
+    //
+    // The property that makes the engines repel instead is that the resolved
+    // dose's **time** is non-finite: that is what every walk's timeline guard
+    // reads (`times_have_non_finite` / `EventSchedule::non_finite_event_time`,
+    // and `predict_concentration`'s `t_eff` guard). The `(rate, duration)` pair
+    // cannot carry it — `is_real_infusion` demands both finite and positive, so
+    // a non-finite pair falls to the bolus branch, which reads only `amt`.
+    //
+    // Mutation (run): drop either `if !d_raw.is_finite()` / `if !r_raw.is_finite()`
+    // early return in `resolve_rate` → that attribute's arm resolves to a finite
+    // time at the floor and the `is_finite()` assert below fires, naming D or R.
+    let mut map = DoseAttrMap::default();
+    map.insert(DoseAttr::Duration, 1, 9);
+    map.insert(DoseAttr::Rate, 1, 10);
+
+    for (attr, slot, mode) in
+        [("D1", 9usize, RateMode::ModeledDuration), ("R1", 10usize, RateMode::ModeledRate)]
+    {
+        let modeled = DoseEvent::modeled(3.0, 100.0, 1, false, 0.0, mode);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut params = [0.0; MAX_PK_PARAMS];
+            params[slot] = bad;
+            let r = modeled.resolve_rate(&map, &params);
+            assert!(
+                !r.time.is_finite(),
+                "{attr} = {bad}: resolved time {} is finite, so no timeline guard sees it \
+                 and the dose is served as a bolus",
+                r.time
+            );
+            assert!(!r.rate.is_finite(), "{attr} = {bad}: rate {}", r.rate);
+            assert!(!r.duration.is_finite(), "{attr} = {bad}: duration {}", r.duration);
+            // Resolution still happened — a dose left `Modeled` would trip
+            // `is_real_infusion`'s unresolved tripwire in every engine.
+            assert_eq!(r.rate_mode, RateMode::Fixed, "{attr} = {bad}: resolved");
+            // The event is still recognisable: amt/cmt/ss/ii are untouched.
+            assert_eq!((r.amt, r.cmt, r.ss, r.ii), (100.0, 1, false, 0.0));
+        }
+
+        // The straddle, and it must straddle under the OLD behaviour too: a
+        // finite value just *below* the floor is the clamp's own job and keeps a
+        // finite time, while `NaN` — which the old `>` comparison sent down the
+        // same arm — does not. Assert the straddle itself so it cannot silently
+        // become a tautology.
+        let mut low = [0.0; MAX_PK_PARAMS];
+        low[slot] = 1e-12;
+        let clamped = modeled.resolve_rate(&map, &low);
+        assert!(
+            clamped.time.is_finite() && clamped.rate.is_finite() && clamped.duration.is_finite(),
+            "{attr}: a finite sub-floor value is clamped, not repelled"
+        );
+        assert_eq!(clamped.time, 3.0, "{attr}: the clamp leaves the time alone");
+    }
+}
+
+#[test]
+fn clamp_above_floor_passes_through_or_clamps() {
+    // The shared clamp behind DURATION_FLOOR / MIN_PARAM: > floor passes through,
+    // <= floor (and NaN — every `>` is false for NaN) returns the floor.
+    let floor = 1e-8;
+    assert_eq!(clamp_above_floor(5.0, floor), 5.0, "above floor passes");
+    assert_eq!(clamp_above_floor(2e-8, floor), 2e-8, "just above floor passes");
+    assert_eq!(clamp_above_floor(floor, floor), floor, "at floor → floor (not >)");
+    assert_eq!(clamp_above_floor(0.0, floor), floor, "zero clamps to floor");
+    assert_eq!(clamp_above_floor(-3.0, floor), floor, "negative clamps to floor");
+    assert_eq!(clamp_above_floor(f64::NAN, floor), floor, "NaN clamps to floor");
+}
+
+#[test]
+fn test_lagtime_from_hashmap_primary_and_alias() {
+    let mut m = HashMap::new();
+    m.insert("lagtime".to_string(), 1.5);
+    let p = PkParams::from_hashmap(&m);
+    assert_eq!(p.lagtime(), 1.5);
+
+    let mut m_alias = HashMap::new();
+    m_alias.insert("alag".to_string(), 2.0);
+    let p_alias = PkParams::from_hashmap(&m_alias);
+    assert_eq!(p_alias.lagtime(), 2.0);
+}
+
+/// Guard the SAEM MH-step default, which is the `auto` sentinel (#1459).
+///
+/// History, because the value is not free to move: an early fixed 3 was too low
+/// for hard cold-start surfaces — the chain didn't decorrelate between SAEM
+/// outer iterations, so the single-draw stochastic M-step received sticky
+/// correlated ETAs and locked the population-θ M-step into a degenerate basin
+/// (observed on Emax PKPD: PD-curve thetas pinned to boundary, ~150 OFV units
+/// worse than the correct basin). It was raised to 10, then to 20 alongside the
+/// componentwise eta kernel and the damped Ω stochastic-approximation step —
+/// both added to stop a block (correlated) Ω collapsing to a near rank-1
+/// correlation matrix (UVM 2-cpt: every off-diagonal correlation → ~0.99, one
+/// variance → 0). The count also sizes the componentwise sweep
+/// (`max(2, n_mh_steps / n_eta)`).
+///
+/// #1459 replaced the fixed 20 with
+/// [`auto_n_mh_steps`](crate::estimation::saem::auto_n_mh_steps), which returns
+/// **20 on the Emax PKPD shape that calibrated it** (8 observations per η, the
+/// cap) and 6–7 on sparse PK data, where six real-dataset benchmarks could not
+/// distinguish 6 from 20 at 27–45 % of the CPU.
+///
+/// A future change that makes this a small fixed number again drops the Emax
+/// case to that number too: re-run the Emax PKPD basin regression and the UVM
+/// block-Ω collapse regression (`tests/saem_block_omega_collapse.rs`) first —
+/// both fail silently (OFV looks fine; parameters wrong).
+#[test]
+fn saem_n_mh_steps_default_is_auto() {
+    let opts = FitOptions::default();
+    assert_eq!(
+        opts.saem_n_mh_steps,
+        crate::estimation::saem_settings::SAEM_N_MH_STEPS_AUTO,
+        "saem_n_mh_steps default changed — see comment above this test for the \
+             basin-trap and block-Ω-collapse regression rationale before adjusting."
+    );
+    assert_eq!(
+        crate::estimation::saem_settings::SAEM_N_MH_STEPS_AUTO,
+        0,
+        "the sentinel is 0 — a model file writes it as `n_mh_steps = auto`"
+    );
+}
+
+#[test]
+fn impmap_proposal_df_default_is_finite_t() {
+    // IMPMAP defaults to a Student-t proposal (df = 4), not a Gaussian: the
+    // MVN tails are too light for weakly-identified posteriors and bias the
+    // M-step moments (absorption-param drift, #411). Do not revert to ∞
+    // without re-checking that regression.
+    let opts = FitOptions::default();
+    assert_eq!(opts.impmap_proposal_df, 4.0);
+    assert!(opts.impmap_proposal_df.is_finite());
+}
+
+// ── small pure helpers ───────────────────────────────────────────────────
+
+/// Bare subject with no doses/observations; tests mutate the fields they
+/// exercise.
+fn bare_subject(id: &str) -> Subject {
+    Subject { id: id.to_string(), ..Default::default() }
+}
+
+fn dose(ss: bool) -> DoseEvent {
+    DoseEvent::new(0.0, 100.0, 1, 0.0, ss, 0.0)
+}
+
+#[test]
+fn subject_has_censored_observation_reflects_cens_flags() {
+    let mut s = bare_subject("1");
+    s.cens = vec![0, 0];
+    assert!(!s.has_censored_observation());
+    s.cens = vec![0, 1];
+    assert!(s.has_censored_observation());
+    s.cens = vec![-1, 0];
+    assert!(s.has_censored_observation());
+}
+
+/// #1499: the one predicate the likelihood and the residual diagnostics share.
+/// `Drop` keeps a flagged row as an ordinary observation — the documented
+/// meaning of the default — so only `M3` reads the flag at all. Both sides of
+/// the gate in one body: a predicate stuck on either branch reddens it.
+#[test]
+fn bloq_method_reads_the_cens_flag_only_under_m3() {
+    for &flag in &[1_i8, -1, 7] {
+        assert!(
+            BloqMethod::M3.is_censored_row(flag),
+            "m3 must treat CENS={flag} as censored (m3_logcdf reads the sign)"
+        );
+        assert!(
+            !BloqMethod::Drop.is_censored_row(flag),
+            "drop must treat CENS={flag} as an ordinary observation"
+        );
+    }
+    assert!(!BloqMethod::M3.is_censored_row(0));
+    assert!(!BloqMethod::Drop.is_censored_row(0));
+
+    // The subject-level form follows the row-level one, and an empty `cens`
+    // (a dataset with no CENS column) is never censored.
+    assert!(BloqMethod::M3.has_censored_row(&[0, 1]));
+    assert!(!BloqMethod::M3.has_censored_row(&[0, 0]));
+    assert!(!BloqMethod::Drop.has_censored_row(&[0, 1]));
+    assert!(!BloqMethod::M3.has_censored_row(&[]));
+    assert!(!BloqMethod::Drop.has_censored_row(&[]));
+}
+
+#[test]
+fn time_varying_covariate_names_detects_only_varying_covariates() {
+    let mut s = bare_subject("1");
+    // WT varies across obs snapshots; SEX is constant → only WT is reported.
+    s.obs_covariates = vec![
+        HashMap::from([("WT".to_string(), 70.0), ("SEX".to_string(), 1.0)]),
+        HashMap::from([("WT".to_string(), 80.0), ("SEX".to_string(), 1.0)]),
+    ];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+}
+
+#[test]
+fn time_varying_covariate_names_empty_when_constant_or_absent() {
+    // No snapshots at all → empty.
+    let s = bare_subject("1");
+    assert!(s.time_varying_covariate_names().is_empty());
+    // Present but constant across snapshots → empty.
+    let mut s2 = bare_subject("2");
+    s2.obs_covariates =
+        vec![HashMap::from([("WT".to_string(), 70.0)]), HashMap::from([("WT".to_string(), 70.0)])];
+    assert!(s2.time_varying_covariate_names().is_empty());
+}
+
+#[test]
+fn time_varying_covariate_names_inspects_pk_only_rows() {
+    // A covariate that changes only across EVID=2 (pk-only) rows is time-varying —
+    // this is the case `has_tv_covariates()` misses (it inspects only obs/dose
+    // snapshots), so with obs/dose empty it reports no TV covariates at all.
+    let mut s = bare_subject("1");
+    s.pk_only_covariates = vec![
+        HashMap::from([("CRCL".to_string(), 100.0)]),
+        HashMap::from([("CRCL".to_string(), 60.0)]),
+    ];
+    assert!(
+        !s.has_tv_covariates(),
+        "has_tv_covariates inspects only obs/dose rows, so it is blind to pk_only variation"
+    );
+    assert_eq!(s.time_varying_covariate_names(), vec!["CRCL".to_string()]);
+}
+
+#[test]
+fn subject_has_ss_doses_detects_steady_state_flag() {
+    let mut s = bare_subject("1");
+    s.doses = vec![dose(false), dose(false)];
+    assert!(!s.has_ss_doses());
+    s.doses.push(dose(true));
+    assert!(s.has_ss_doses());
+}
+
+#[test]
+fn subject_has_periodic_ss_dose_requires_ss_flag_and_positive_ii() {
+    let mut s = bare_subject("1");
+    // No doses → false.
+    assert!(!s.has_periodic_ss_dose());
+    // SS flag but `II = 0` (not a periodic SS dose) → false, unlike
+    // `has_ss_doses`, which keys on the flag alone.
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 0.0)];
+    assert!(s.has_ss_doses());
+    assert!(!s.has_periodic_ss_dose());
+    // Periodic SS dose (`SS=1`, `II > 0`) → true.
+    s.doses.push(DoseEvent::new(0.0, 100.0, 1, 0.0, true, 24.0));
+    assert!(s.has_periodic_ss_dose());
+    // `II > 0` without the SS flag → false.
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 24.0)];
+    assert!(!s.has_periodic_ss_dose());
+}
+
+/// #1969: the parameter time of each record kind is its TIME as written, read from the
+/// subject's own vectors, and the engine clock for an in-memory subject that carries none.
+#[test]
+fn param_time_reads_the_written_time_of_each_record_kind() {
+    use crate::types::test_helpers::{param_time_straddle_subject, ParamTimeStraddle};
+    let moved = 24.0f64.next_down();
+
+    // A moved observation and a moved pk-only row: the written 24, not the engine 24⁻.
+    let s = param_time_straddle_subject(ParamTimeStraddle::Obs);
+    assert_eq!(s.obs_times[2], moved);
+    assert_eq!(s.param_time_obs(2), 24.0);
+    let s = param_time_straddle_subject(ParamTimeStraddle::PkOnly);
+    assert_eq!(s.pk_only_times[0], moved);
+    assert_eq!(s.param_time_pk_only(0), 24.0);
+
+    // A reset period: a row in the table reads its stored written time, exactly.
+    let s = param_time_straddle_subject(ParamTimeStraddle::Reset);
+    assert_eq!(s.param_time_at(50.0), 0.0, "the EVID=4 row");
+    assert_eq!(s.param_time_at(74.0), 24.0, "a period-2 dose");
+    // A time with no row (a dose the adaptive engine appended) takes the offset of the
+    // latest row at or before it; before the first shifted row the clocks agree.
+    assert_eq!(s.param_time_at(60.0), 10.0);
+    assert_eq!(s.param_time_at(80.0), 30.0);
+    assert_eq!(s.param_time_at(12.0), 12.0);
+
+    // In memory, with no written times: the engine clock, for every kind.
+    let mut bare = bare_subject("1");
+    bare.obs_times = vec![moved];
+    bare.pk_only_times = vec![moved];
+    assert_eq!(bare.param_time_obs(0), moved);
+    assert_eq!(bare.param_time_pk_only(0), moved);
+    assert_eq!(bare.param_time_at(50.0), 50.0);
+}
+
+/// #1969: `param_time_at` returns the stored written time, not `engine − offset`. The
+/// subtraction is inexact for most decimal times, and a step such as `TIME >= 24.3` at a dose
+/// written 24.3 would take the earlier branch on a value one ULP short.
+#[test]
+fn param_time_at_returns_the_stored_written_time_not_a_difference() {
+    let mut s = bare_subject("1");
+    let offset = 72.1 + 1.0 - 0.1;
+    let written = 24.3;
+    let engine = written + offset;
+    assert_ne!(
+        engine - offset,
+        written,
+        "the fixture must be one where the subtraction rounds, or it tests nothing"
+    );
+    s.reset_period_times = vec![(0.1 + offset, 0.1), (engine, written)];
+    assert_eq!(s.param_time_at(engine), written);
+}
+
+#[test]
+fn subject_has_rate_defined_infusion_distinguishes_infusion_modes() {
+    let mut s = bare_subject("1");
+    // No doses → false.
+    assert!(!s.has_rate_defined_infusion());
+
+    // Bolus (RATE=0) is not an infusion → false.
+    s.doses = vec![dose(false)];
+    assert!(!s.has_rate_defined_infusion());
+
+    // Duration-defined infusion (RATE=-2 → D{cmt}): it *is* an infusion, but F
+    // scales its rate, not its window, so it must not count (#419).
+    s.doses = vec![DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration)];
+    assert!(s.doses[0].is_infusion());
+    assert!(!s.has_rate_defined_infusion());
+
+    // Rate-defined infusion (RATE>0 data) → true.
+    s.doses = vec![DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)];
+    assert!(s.has_rate_defined_infusion());
+
+    // A rate-defined infusion alongside a bolus still trips it.
+    s.doses = vec![dose(false), DoseEvent::new(0.0, 100.0, 1, 10.0, false, 0.0)];
+    assert!(s.has_rate_defined_infusion());
+}
+
+#[test]
+fn subject_pk_only_cov_falls_back_to_static_map() {
+    let mut s = bare_subject("1");
+    s.covariates.insert("WT".to_string(), 70.0);
+    // No per-EVID-2 snapshots → static map.
+    assert_eq!(s.pk_only_cov(0).get("WT"), Some(&70.0));
+    // With a snapshot at index 0 → that snapshot.
+    let mut snap = HashMap::new();
+    snap.insert("WT".to_string(), 80.0);
+    s.pk_only_covariates = vec![snap];
+    assert_eq!(s.pk_only_cov(0).get("WT"), Some(&80.0));
+    // Out-of-range index → fall back to static map.
+    assert_eq!(s.pk_only_cov(5).get("WT"), Some(&70.0));
+}
+
+#[test]
+fn prune_irrelevant_tv_covariates_clears_only_constant_referenced_covs() {
+    // Subject A: the referenced covariate (WT) is constant across snapshots
+    // but an unreferenced one (DAY) varies → snapshots should be pruned.
+    let mut a = bare_subject("A");
+    a.covariates = HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 1.0)]);
+    a.obs_covariates = vec![
+        HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 1.0)]),
+        HashMap::from([("WT".to_string(), 70.0), ("DAY".to_string(), 2.0)]),
+    ];
+    // Subject B: the referenced covariate (WT) genuinely varies → keep.
+    let mut b = bare_subject("B");
+    b.covariates = HashMap::from([("WT".to_string(), 70.0)]);
+    b.obs_covariates =
+        vec![HashMap::from([("WT".to_string(), 70.0)]), HashMap::from([("WT".to_string(), 90.0)])];
+
+    let mut pop = Population {
+        subjects: vec![a, b],
+        covariate_names: vec!["WT".to_string(), "DAY".to_string()],
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    let pruned = pop.prune_irrelevant_tv_covariates(&["WT".to_string()]);
+    assert_eq!(pruned, 1, "only subject A should be pruned");
+    assert!(pop.subjects[0].obs_covariates.is_empty(), "A pruned to fast path");
+    assert!(!pop.subjects[1].obs_covariates.is_empty(), "B keeps TV snapshots");
+}
+
+#[test]
+fn covariate_kind_label_strings() {
+    assert_eq!(CovariateKind::Continuous.label(), "continuous");
+    assert_eq!(CovariateKind::Categorical.label(), "categorical");
+}
+
+#[test]
+fn scaling_spec_requires_fd_is_always_false() {
+    assert!(!ScalingSpec::None.requires_fd());
+    assert!(!ScalingSpec::ScalarScale(1000.0).requires_fd());
+    assert!(!ScalingSpec::PerCmt(HashMap::new()).requires_fd());
+}
+
+#[test]
+fn estimation_method_label_covers_all_variants() {
+    assert_eq!(EstimationMethod::Foce.label(), "FOCE");
+    assert_eq!(EstimationMethod::FoceI.label(), "FOCEI");
+    assert_eq!(EstimationMethod::FoceGn.label(), "FOCE-GN");
+    assert_eq!(EstimationMethod::FoceGnHybrid.label(), "FOCE-GN-Hybrid");
+    assert_eq!(EstimationMethod::Saem.label(), "SAEM");
+    assert_eq!(EstimationMethod::Imp.label(), "IMP");
+}
+
+#[test]
+fn model_parameters_has_any_fixed_tracks_every_flag_vec() {
+    let mut mp = test_helpers::analytical_model(GradientMethod::Fd).default_params;
+    mp.theta_fixed = vec![false];
+    mp.omega_fixed = vec![false];
+    mp.sigma_fixed = vec![false];
+    mp.kappa_fixed = Vec::new();
+    assert!(!mp.has_any_fixed());
+    mp.sigma_fixed = vec![true];
+    assert!(mp.has_any_fixed());
+}
+
+#[test]
+fn pk_params_from_hashmap_maps_named_fields_and_aliases() {
+    let map = HashMap::from([
+        ("cl".to_string(), 5.0),
+        ("v1".to_string(), 30.0), // v1 alias → V index
+        ("q".to_string(), 2.0),
+        ("v2".to_string(), 50.0),
+        ("ka".to_string(), 1.2),
+        ("f".to_string(), 0.8),
+        ("q3".to_string(), 0.5),
+        ("v3".to_string(), 100.0),
+    ]);
+    let p = PkParams::from_hashmap(&map);
+    assert_eq!(p.values[PK_IDX_CL], 5.0);
+    assert_eq!(p.values[PK_IDX_V], 30.0);
+    assert_eq!(p.values[PK_IDX_Q], 2.0);
+    assert_eq!(p.values[PK_IDX_V2], 50.0);
+    assert_eq!(p.values[PK_IDX_KA], 1.2);
+    assert_eq!(p.values[PK_IDX_F], 0.8);
+    assert_eq!(p.values[PK_IDX_Q3], 0.5);
+    assert_eq!(p.values[PK_IDX_V3], 100.0);
+}
+
+// ── block_sigma / correlated residual error (PR #545) ──────────────────
+
+#[test]
+fn sigma_loadings_single_matches_error_model_shape() {
+    // Additive loads only the additive sigma (coeff 1); proportional loads
+    // the proportional sigma (coeff f); combined loads both, in the
+    // (prop, add) order that `residual_variance` assumes positionally.
+    let add = ErrorSpec::Single(ErrorModel::Additive);
+    assert_eq!(add.sigma_loadings(0, 5.0, 1), vec![(0, 1.0)]);
+
+    let prop = ErrorSpec::Single(ErrorModel::Proportional);
+    assert_eq!(prop.sigma_loadings(0, 5.0, 1), vec![(0, 5.0)]);
+
+    let comb = ErrorSpec::Single(ErrorModel::Combined);
+    assert_eq!(comb.sigma_loadings(0, 5.0, 2), vec![(0, 5.0), (1, 1.0)]);
+}
+
+#[test]
+fn sigma_loadings_single_respects_n_sigma_guards() {
+    // With no sigmas available the loadings are empty; a 1-sigma combined
+    // model exposes only the proportional loading.
+    let add = ErrorSpec::Single(ErrorModel::Additive);
+    assert!(add.sigma_loadings(0, 5.0, 0).is_empty());
+    let prop = ErrorSpec::Single(ErrorModel::Proportional);
+    assert!(prop.sigma_loadings(0, 5.0, 0).is_empty());
+    let comb = ErrorSpec::Single(ErrorModel::Combined);
+    assert_eq!(comb.sigma_loadings(0, 5.0, 1), vec![(0, 5.0)]);
+}
+
+#[test]
+fn sigma_loadings_per_cmt_dispatches_by_endpoint() {
+    // Endpoint in cmt 1 is combined over global sigma indices (2, 3);
+    // cmt 2 is additive over index 0. Loadings must use those global
+    // indices, and an unmapped compartment yields no loadings.
+    let mut map = std::collections::HashMap::new();
+    map.insert(1usize, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![2, 3] });
+    map.insert(2usize, EndpointError { error_model: ErrorModel::Additive, sigma_idx: vec![0] });
+    let spec = ErrorSpec::PerCmt(map);
+    assert_eq!(spec.sigma_loadings(1, 7.0, 4), vec![(2, 7.0), (3, 1.0)]);
+    assert_eq!(spec.sigma_loadings(2, 7.0, 4), vec![(0, 1.0)]);
+    assert!(spec.sigma_loadings(9, 7.0, 4).is_empty());
+}
+
+#[test]
+fn sigma_loading_slopes_match_loading_shape_with_f_derivatives() {
+    // Slopes have the SAME slot presence as `sigma_loadings` but carry
+    // ∂coeff/∂f: 0 for the additive (constant) slot, 1 for the proportional
+    // slot. This keeps the dense-R ∂R/∂f cross-covariance assembly consistent.
+    let add = ErrorSpec::Single(ErrorModel::Additive);
+    assert_eq!(add.sigma_loading_slopes(0, 1), vec![(0, 0.0)]);
+    assert!(add.sigma_loading_slopes(0, 0).is_empty());
+
+    let prop = ErrorSpec::Single(ErrorModel::Proportional);
+    assert_eq!(prop.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
+    assert!(prop.sigma_loading_slopes(0, 0).is_empty());
+
+    let comb = ErrorSpec::Single(ErrorModel::Combined);
+    assert_eq!(comb.sigma_loading_slopes(0, 2), vec![(0, 1.0), (1, 0.0)]);
+    assert_eq!(comb.sigma_loading_slopes(0, 1), vec![(0, 1.0)]);
+
+    // PerCmt dispatch over global sigma indices, mirroring sigma_loadings.
+    let mut map = std::collections::HashMap::new();
+    map.insert(1usize, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![2, 3] });
+    map.insert(2usize, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] });
+    map.insert(3usize, EndpointError { error_model: ErrorModel::Additive, sigma_idx: vec![1] });
+    let spec = ErrorSpec::PerCmt(map);
+    assert_eq!(spec.sigma_loading_slopes(1, 4), vec![(2, 1.0), (3, 0.0)]);
+    assert_eq!(spec.sigma_loading_slopes(2, 4), vec![(0, 1.0)]);
+    assert_eq!(spec.sigma_loading_slopes(3, 4), vec![(1, 0.0)]);
+    assert!(spec.sigma_loading_slopes(9, 4).is_empty());
+}
+
+#[test]
+fn variance_at_with_correlations_empty_delegates_to_variance_at() {
+    // No correlations ⇒ identical to the plain diagonal variance.
+    let spec = ErrorSpec::Single(ErrorModel::Combined);
+    let sigma = [0.2, 1.0];
+    let plain = spec.variance_at(0, 10.0, &sigma);
+    let corr = spec.variance_at_with_correlations(0, 10.0, &sigma, &[]);
+    assert_relative_eq!(plain, corr, epsilon = 1e-12);
+}
+
+#[test]
+fn variance_at_with_correlations_combined_adds_cross_term() {
+    // V = (10·0.2)² + 1² + 2·10·0.5·0.2·1 = 4 + 1 + 2 = 7.
+    let spec = ErrorSpec::Single(ErrorModel::Combined);
+    let corr = ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
+    let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+    assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+}
+
+#[test]
+fn variance_at_with_correlations_per_cmt_combined() {
+    // Same combined cross term, but reached through a PerCmt endpoint whose
+    // sigmas live at global indices (0, 1).
+    let mut map = std::collections::HashMap::new();
+    map.insert(1usize, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![0, 1] });
+    let spec = ErrorSpec::PerCmt(map);
+    let corr = ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
+    let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+    assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+}
+
+#[test]
+fn variance_at_with_correlations_nan_when_no_loadings() {
+    // An observation in an unmapped compartment has no loadings ⇒ NaN.
+    let map = std::collections::HashMap::new();
+    let spec = ErrorSpec::PerCmt(map);
+    let corr = ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
+    let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
+    assert!(v.is_nan());
+}
+
+#[test]
+fn variance_at_with_correlations_nan_when_sigma_index_missing() {
+    // A PerCmt combined endpoint whose sigma_idx (0, 1) points past a
+    // length-1 sigma slice: the diagonal accumulation hits a missing sigma
+    // and returns NaN rather than silently dropping a term.
+    let mut map = std::collections::HashMap::new();
+    map.insert(1usize, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![0, 1] });
+    let spec = ErrorSpec::PerCmt(map);
+    let corr = ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
+    let v = spec.variance_at_with_correlations(1, 10.0, &[0.2], &[corr]);
+    assert!(v.is_nan());
+}
+
+#[test]
+fn variance_at_with_correlations_skips_unloaded_correlation() {
+    // The correlation names sigma index 2, which the combined endpoint
+    // never loads, so the cross term is skipped and V is the plain
+    // diagonal (10·0.2)² + 1² = 5.
+    let spec = ErrorSpec::Single(ErrorModel::Combined);
+    let corr = ResidualCorrelation { sigma_i: 0, sigma_j: 2, rho: 0.5 };
+    let v = spec.variance_at_with_correlations(0, 10.0, &[0.2, 1.0, 0.3], &[corr]);
+    assert_relative_eq!(v, 5.0, epsilon = 1e-12);
+}
+
+#[test]
+fn residual_variance_at_threads_correlations_from_model() {
+    // The `CompiledModel` convenience wrapper must apply its own
+    // `residual_correlations`, not just the diagonal.
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+    model.error_model = ErrorModel::Combined;
+    model.residual_correlations = vec![ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
+    let v = model.residual_variance_at(0, 10.0, &[0.2, 1.0]);
+    assert_relative_eq!(v, 7.0, epsilon = 1e-12);
+}
+
+/// #1733: `sim_residual_variance` draws at the correlations it is *handed*, not
+/// the model's declared `block_sigma` ρ. Closed form for `combined(PROP, ADD)`
+/// at f = 10, σ = (0.2, 1.0): `0.04·f² + 1 + 2ρ·0.2·1·f` = 7 at the declared
+/// ρ = 0.5 and 1.4 at ρ = −0.9. Both multiplier arms are checked, since each
+/// dispatches to its own `ErrorSpec` method.
+#[test]
+fn sim_residual_variance_uses_the_correlations_it_is_passed() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+    model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+    model.error_model = ErrorModel::Combined;
+    model.frem_config = None;
+    let corr = |rho| vec![ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho }];
+    model.residual_correlations = corr(0.5);
+    let subject = Subject {
+        obs_times: vec![1.0],
+        observations: vec![0.0],
+        obs_cmts: vec![1],
+        cens: vec![0],
+        fremtype: vec![0],
+        ..Default::default()
+    };
+    let sigma = [0.2, 1.0];
+    let fitted = corr(-0.9);
+    for mult in [None, Some(&[1.0, 1.0][..])] {
+        let at_fitted = model.sim_residual_variance(&subject, 0, 10.0, &sigma, &fitted, 1.0, mult);
+        let at_declared = model.sim_residual_variance(
+            &subject,
+            0,
+            10.0,
+            &sigma,
+            &model.residual_correlations,
+            1.0,
+            mult,
+        );
+        assert_relative_eq!(at_fitted, 1.4, epsilon = 1e-12);
+        assert_relative_eq!(at_declared, 7.0, epsilon = 1e-12);
+    }
+}
+
+#[test]
+fn has_residual_error_for_cmt_covers_single_and_per_cmt() {
+    let mut model = test_helpers::analytical_model(GradientMethod::Fd);
+
+    // Single error model: defined for every cmt iff sigma covers its n_sigma.
+    model.error_spec = ErrorSpec::Single(ErrorModel::Proportional);
+    assert!(model.has_residual_error_for_cmt(1, &[0.1]));
+    assert!(model.has_residual_error_for_cmt(99, &[0.1]));
+    assert!(!model.has_residual_error_for_cmt(1, &[]), "no sigma ⇒ no error model");
+    // A Combined model needs two sigmas; one is too short — `residual_variance`
+    // would otherwise index `sigma[1]` and PANIC (symmetric to the PerCmt
+    // out-of-range guard below, never a fabricated σ).
+    model.error_spec = ErrorSpec::Single(ErrorModel::Combined);
+    assert!(model.has_residual_error_for_cmt(1, &[0.1, 0.2]));
+    assert!(
+        !model.has_residual_error_for_cmt(1, &[0.1]),
+        "Combined needs 2 sigmas; 1 is too short to draw a DV"
+    );
+
+    // PerCmt: defined only for compartments present in the map.
+    let mut map = std::collections::HashMap::new();
+    map.insert(2usize, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] });
+    model.error_spec = ErrorSpec::PerCmt(map);
+    assert!(model.has_residual_error_for_cmt(2, &[0.1]), "cmt 2 has an endpoint");
+    assert!(!model.has_residual_error_for_cmt(1, &[0.1]), "cmt 1 is not in the map");
+    // An endpoint whose sigma_idx falls outside `sigma` is not drawable —
+    // `residual_variance_at` would otherwise return NaN (symmetric to the
+    // Single empty-sigma guard, never a fabricated σ).
+    assert!(
+        !model.has_residual_error_for_cmt(2, &[]),
+        "cmt 2's sigma_idx is out of range for an empty sigma"
+    );
+    // A Combined endpoint needs two sigma indices; one is too few — `variance_at`
+    // would read `sigma_idx[1]` (absent) and return NaN even though sigma is long.
+    let mut combined_map = std::collections::HashMap::new();
+    combined_map.insert(
+        2usize,
+        EndpointError {
+            error_model: ErrorModel::Combined,
+            sigma_idx: vec![0], // only one index for a two-sigma model
+        },
+    );
+    model.error_spec = ErrorSpec::PerCmt(combined_map);
+    assert!(
+        !model.has_residual_error_for_cmt(2, &[0.1, 0.2]),
+        "a Combined endpoint with too few sigma indices is not drawable"
+    );
+}
+
+/// The transit/IG source used by the #814 twin-tolerance tests. A closed-form
+/// `one_cpt_transit` + IOV model: analytic primary (`ode_spec == None`), carries an ODE
+/// twin, and every subject reroutes to it (`n_kappa > 0`). Its `[fit_options]` sets a
+/// distinctive `ode_reltol = 1e-8` (≠ `OdeSolverOptions::default` 1e-4) so a source-default
+/// read is distinguishable from a call-time override.
+const TRANSIT_IOV_TOL_SRC: &str = "\
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVMTT(1.0, 0.01, 50.0)
+  theta TVN(3.0, 0.5, 20.0)
+  omega ETA_V ~ 0.09
+  kappa KAPPA_CL ~ 0.02
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(KAPPA_CL)
+  V   = TVV  * exp(ETA_V)
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method        = focei
+  iov_column    = OCC
+  ode_reltol    = 1e-8
+  ode_abstol    = 1e-8
+  ode_max_steps = 5000
+";
+
+#[test]
+fn call_time_ode_tolerances_reach_the_absorption_twin() {
+    // #814: a closed-form transit/IG model is analytic (`ode_spec == None`), but its IOV /
+    // TV-cov subjects integrate on the ODE twin. A call-time `ode_reltol`/`ode_abstol`/
+    // `ode_max_steps` — merged into the runtime FitOptions and applied via
+    // `sync_ode_solver_opts`, exactly as ferx-r's `ferx_fit` does — must reach that twin
+    // rather than be silently dropped at the twin source's parse default.
+    use crate::parser::model_parser::parse_model_string;
+
+    // The override must reach the twin (built at parse time since #1008).
+    let mut model = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+    assert!(model.absorption_ode_equivalent.is_some(), "one_cpt_transit carries an ODE twin");
+    assert!(model.n_kappa > 0, "model has IOV");
+    assert!(model.ode_spec.is_none(), "the closed-form transit primary is analytic");
+
+    let mut opts = FitOptions::default();
+    opts.ode_reltol = 1e-10;
+    opts.ode_abstol = 1e-11;
+    opts.ode_max_steps = 77_777;
+    model.sync_ode_solver_opts(&opts);
+
+    // IOV ⇒ every subject reroutes to the twin; its OdeSpec must carry the *call-time*
+    // tolerances, not the source's 1e-8 / 5000.
+    let twin = model.effective_for(&bare_subject("1"));
+    let so =
+        twin.ode_spec.as_ref().expect("IOV transit subject is served by the ODE twin").solver_opts;
+    assert_eq!(so.reltol, 1e-10, "call-time reltol reaches the twin");
+    assert_eq!(so.abstol, 1e-11, "call-time abstol reaches the twin");
+    assert_eq!(so.max_steps, 77_777, "call-time max_steps reaches the twin");
+
+    // Default-path regression: with no call-time sync, the twin keeps its source
+    // `[fit_options]` (1e-8 / 5000), NOT `OdeSolverOptions::default()` and NOT a leaked
+    // override from another model.
+    let untouched = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+    let dso = untouched.effective_for(&bare_subject("2")).ode_spec.as_ref().unwrap().solver_opts;
+    assert_eq!(dso.reltol, 1e-8, "un-synced twin keeps its source reltol");
+    assert_eq!(dso.abstol, 1e-8, "un-synced twin keeps its source abstol");
+    assert_eq!(dso.max_steps, 5000, "un-synced twin keeps its source max_steps");
+
+    // Re-sync: a second fit reusing the same owned model with *different* tolerances must
+    // overwrite the first sync's stamp, not keep it. (Before #1008 this block tested a
+    // sync-before-build vs sync-after-build ordering; the twin is now always built by the
+    // time anyone can sync, so the only distinction left worth pinning is second-sync-wins.)
+    let mut tight = FitOptions::default();
+    tight.ode_reltol = 1e-12;
+    tight.ode_abstol = 1e-13;
+    tight.ode_max_steps = 4242;
+    model.sync_ode_solver_opts(&tight);
+    let rso = model.effective_for(&bare_subject("3")).ode_spec.as_ref().unwrap().solver_opts;
+    assert_eq!(rso.reltol, 1e-12, "a second sync overwrites the first");
+    assert_eq!(rso.abstol, 1e-13);
+    assert_eq!(rso.max_steps, 4242);
+}
+
+// ── #1111: the `[covariate_model]` data types ──────────────────────────────
+
+/// Every `label()` spelling is what the fit YAML and the block text both use,
+/// so a renamed arm silently changes a written file and the text a user has to
+/// type back. Pinned as data, one assert per variant.
+#[test]
+fn covariate_form_labels_are_the_block_spellings() {
+    let cases = [
+        (CovariateForm::None, "none"),
+        (CovariateForm::Linear, "linear"),
+        (CovariateForm::LinearRelative, "linear_relative"),
+        (CovariateForm::Exponential, "exponential"),
+        (CovariateForm::Power, "power"),
+        (CovariateForm::Hockey, "hockey"),
+        (CovariateForm::Categorical, "categorical"),
+        (CovariateForm::Categorical2, "categorical2"),
+        (CovariateForm::Expr("(WT/70)^0.75".into()), "expr"),
+    ];
+    for (form, label) in &cases {
+        assert_eq!(&form.label(), label);
+    }
+    // The two categorical forms read a categorical column; the check against
+    // the `[covariates]` declaration is keyed on this, so a new categorical
+    // variant left out of `is_categorical` would be checked against the wrong
+    // column kind (#1312).
+    assert!(CovariateForm::Categorical.is_categorical());
+    assert!(CovariateForm::Categorical2.is_categorical());
+    assert!(!CovariateForm::Power.is_categorical());
+    assert!(!CovariateForm::Expr("1".into()).is_categorical());
+}
+
+#[test]
+fn covariate_stat_labels_and_literals_round_trip() {
+    let cases = [
+        (CovariateStat::Median, "median"),
+        (CovariateStat::Mean, "mean"),
+        (CovariateStat::Min, "min"),
+        (CovariateStat::Max, "max"),
+        (CovariateStat::Mode, "mode"),
+    ];
+    for (stat, label) in &cases {
+        assert_eq!(&stat.label(), label);
+        // A symbolic statistic is not a literal — that is what defers the
+        // relation until a population has been summarised.
+        assert_eq!(stat.literal(), None);
+    }
+    assert_eq!(CovariateStat::Literal(70.0).label(), "70");
+    assert_eq!(CovariateStat::Literal(70.0).literal(), Some(70.0));
+}
+
+#[test]
+fn a_covariate_summary_resolves_every_statistic_it_names() {
+    let summary = CovariateSummary {
+        median: 70.0,
+        mean: 72.5,
+        min: 50.0,
+        max: 95.0,
+        mode: 70.0,
+        levels: vec![50.0, 70.0, 95.0],
+    };
+    assert_eq!(summary.value_of(CovariateStat::Median), 70.0);
+    assert_eq!(summary.value_of(CovariateStat::Mean), 72.5);
+    assert_eq!(summary.value_of(CovariateStat::Min), 50.0);
+    assert_eq!(summary.value_of(CovariateStat::Max), 95.0);
+    assert_eq!(summary.value_of(CovariateStat::Mode), 70.0);
+    // A literal ignores the summary entirely, so a bound model and a
+    // file-literal one build the same expression.
+    assert_eq!(summary.value_of(CovariateStat::Literal(1.5)), 1.5);
+}
+
+#[test]
+fn declared_levels_are_readable_and_auto_is_not() {
+    assert_eq!(CovariateLevels::Declared(vec![0.0, 1.0]).declared(), Some(&[0.0, 1.0][..]));
+    // `auto` has no levels until a population has been seen — that `None` is
+    // what leaves the relation unresolved rather than generating zero θ.
+    assert_eq!(CovariateLevels::Auto.declared(), None);
+    // The pre-`levels` shape of every `[covariates]` line.
+    let decl = CovariateDecl::new("WT", CovariateKind::Continuous);
+    assert_eq!(decl.name, "WT");
+    assert_eq!(decl.kind, CovariateKind::Continuous);
+    assert_eq!(decl.levels, None);
+}
+
+// ── #1064: scale guardrails for models with hundreds of θ ──────────────────
+mod theta_block_scale_guards {
+    use crate::io::output::compact_theta_blocks;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM};
+
+    /// A gather model with `len` levels. (Written when a wide one was an
+    /// FD-gradient model by construction — the pre-#2093 forward provider capped
+    /// at `MAX_SCALE_AXES` axes; the adjoint has no θ-count cap.)
+    fn wide_model(len: usize) -> crate::types::CompiledModel {
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta PLACEBO[{len}](0.5, -10.0, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL + PLACEBO[PLA_IDX]
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+        );
+        crate::parser::model_parser::parse_full_model(&content).unwrap().model
+    }
+
+    #[test]
+    fn free_packed_dim_counts_theta_omega_and_sigma() {
+        let model = wide_model(10);
+        // 12 θ + 1 Ω element + 1 σ.
+        assert_eq!(model.free_packed_dim(), 14);
+    }
+
+    #[test]
+    fn free_packed_dim_matches_separate_packed_masks() {
+        let content = r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0) FIX
+  omega ETA_CL ~ 0.09
+  block_omega (ETA_V, ETA_KA) = [0.04, 0.01, 0.16]
+  kappa KAPPA_CL ~ 0.02
+  kappa KAPPA_V ~ 0.03 FIX
+  sigma ADD_ERR ~ 0.1 FIX
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL + KAPPA_CL)
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(ADD_ERR, PROP_ERR)
+"#;
+        let model = crate::parser::model_parser::parse_full_model(content).unwrap().model;
+        let p = &model.default_params;
+        let exact = crate::estimation::parameterization::packed_fixed_mask(p)
+            .iter()
+            .filter(|held| !**held)
+            .count();
+        assert_eq!(model.free_packed_dim(), exact);
+        assert_eq!(exact, 7);
+    }
+
+    #[test]
+    fn free_packed_dim_ignores_fixed_omega_coordinates() {
+        // The review case for this guard (#1095): 14 fixed diagonal etas plus
+        // two free thetas and one free sigma is *three* free coordinates. The
+        // original formula counted a dense triangular Omega regardless of FIX
+        // flags and returned 108 — enough on its own to flip `optimizer = auto`
+        // and the default covariance estimator on a model that has nothing to do
+        // with level blocks. This is the assertion that would have caught it.
+        let etas: String = (1..=14).map(|i| format!("  omega ETA_{i} ~ 0.09 FIX\n")).collect();
+        let sum: Vec<String> = (1..=14).map(|i| format!("ETA_{i}")).collect();
+        let content = format!(
+            r#"
+[parameters]
+  theta TVCL(2.0, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+{etas}  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL = TVCL * exp({})
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#,
+            sum.join(" + ")
+        );
+        let model = crate::parser::model_parser::parse_full_model(&content).unwrap().model;
+        assert_eq!(model.n_eta, 14);
+        assert_eq!(
+            model.free_packed_dim(),
+            3,
+            "two free thetas and one free sigma; every omega coordinate is fixed"
+        );
+        // And therefore neither scale guard fires on it.
+        assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
+        assert!(model.free_packed_dim() <= COV_HESSIAN_MAX_DIM);
+    }
+
+    #[test]
+    fn auto_keeps_bobyqa_at_ordinary_dimension() {
+        // The guard must not disturb the historical `auto` behaviour on the
+        // models everything else in this codebase is: `gradient = fd` removes
+        // the analytic gradient, so BOBYQA is what `auto` has always picked.
+        let mut model = wide_model(4);
+        model.gradient_method = crate::types::GradientMethod::Fd;
+        assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
+        assert_eq!(
+            Optimizer::Auto.resolve_auto(&model),
+            Optimizer::Bobyqa,
+            "small models must be unaffected by the scale guard"
+        );
+    }
+
+    #[test]
+    fn auto_still_prefers_the_analytic_gradient_at_ordinary_dimension() {
+        // A small gather model keeps its exact analytic gradient, so `auto`
+        // resolves to the gradient-based optimizer exactly as it would without
+        // the block.
+        let model = wide_model(4);
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
+    }
+
+    #[test]
+    fn auto_refuses_bobyqa_above_the_dimension_threshold() {
+        // BOBYQA interpolates a quadratic over the whole space; at several
+        // hundred θ the interpolation set alone is the whole budget.
+        let model = wide_model(BOBYQA_MAX_DIM + 10);
+        assert!(model.free_packed_dim() > BOBYQA_MAX_DIM);
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
+    }
+
+    #[test]
+    fn an_explicit_optimizer_is_never_overridden_by_the_guard() {
+        let model = wide_model(BOBYQA_MAX_DIM + 10);
+        for opt in [Optimizer::Bobyqa, Optimizer::Slsqp, Optimizer::Mma, Optimizer::TrustRegion] {
+            assert_eq!(opt.resolve_auto(&model), opt);
+        }
+    }
+
+    #[test]
+    fn cov_hessian_threshold_is_above_the_bobyqa_one() {
+        // The covariance step is quadratic in n where the optimizer is only
+        // linear, but it runs once — so it tolerates more, not less.
+        assert!(COV_HESSIAN_MAX_DIM > BOBYQA_MAX_DIM);
+    }
+
+    #[test]
+    fn compact_theta_blocks_finds_only_large_contiguous_blocks() {
+        let mut names = vec!["TVCL".to_string()];
+        names.extend((1..=30).map(|i| format!("PLACEBO[{i}]")));
+        names.push("TVV".to_string());
+        // A small block stays inline.
+        names.extend((1..=3).map(|i| format!("SMALL[{i}]")));
+        let blocks = compact_theta_blocks(&names);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, "PLACEBO");
+        assert_eq!(blocks[0].1, 1..31);
+    }
+
+    #[test]
+    fn compact_theta_blocks_ignores_a_model_with_no_blocks() {
+        let names = vec!["TVCL".to_string(), "TVV".to_string()];
+        assert!(compact_theta_blocks(&names).is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #518: the unsupported-keys warning is model-aware for the `ode_*` knobs.
+//
+// #517 fixed a false positive by adding the ODE-solver keys to `framework_keys()`,
+// which suppresses the "not used by method" warning *unconditionally* — including on
+// an analytical model, where `sync_ode_solver_opts` is a no-op and the keys really do
+// nothing. `unsupported_keys_warnings_with_model` restores that diagnostic without
+// bringing the false positive back.
+// ---------------------------------------------------------------------------
+
+/// Build a `FitOptions` whose `user_set_keys` names exactly `keys` (the field the
+/// warning layer reads); the values themselves are irrelevant to the warning.
+fn opts_with_user_set_keys(keys: &[&str]) -> FitOptions {
+    FitOptions {
+        user_set_keys: keys.iter().map(|k| k.to_string()).collect(),
+        ..FitOptions::default()
+    }
+}
+
+#[test]
+fn ode_solver_keys_are_a_subset_of_framework_keys() {
+    // The two lists are separate on purpose — `framework_keys` suppresses the
+    // *method*-level warning, `ode_solver_keys` selects the *model*-conditional
+    // notice — but an `ode_*` key missing from the former would draw the old
+    // spurious "not used by method FOCEI" warning again (#516/#517). Pin the
+    // subset relation so the lists cannot drift apart.
+    let fw = framework_keys();
+    for k in ode_solver_keys() {
+        assert!(
+            fw.contains(k),
+            "`{k}` is in ode_solver_keys() but not framework_keys() — it would \
+             spuriously warn as method-unsupported"
+        );
+    }
+}
+
+#[test]
+fn analytical_model_warns_that_ode_solver_keys_have_no_effect() {
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    assert!(!model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(&["ode_reltol"]);
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+
+    assert_eq!(w.len(), 1, "expected exactly one warning, got: {w:?}");
+    // Pinned in full, not by `contains`. This string is user-facing — it reaches the
+    // CLI and the fit YAML verbatim — and a `\`-continuation in the source silently
+    // keeps the next line's indentation unless the escape is exactly right, which is
+    // how a run of 18 spaces shipped in review. A substring check cannot see that.
+    assert_eq!(
+        w[0],
+        "fit option `ode_reltol` configures the ODE integrator, but this model has \
+         no `[odes]` block (and no closed-form absorption ODE twin), so it has no \
+         effect."
+    );
+    // The method-level phrasing would be the wrong diagnosis here: the key is
+    // fine for FOCEI, it is the *model* that never integrates.
+    assert!(!w[0].contains("is not used by method"), "got: {}", w[0]);
+}
+
+#[test]
+fn analytical_model_warns_once_per_distinct_ode_solver_key() {
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    // Every key in the list must be covered, and a duplicate must not double up.
+    let mut keys: Vec<&str> = ode_solver_keys().to_vec();
+    keys.push("ode_reltol");
+    let opts = opts_with_user_set_keys(&keys);
+
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+    assert_eq!(w.len(), ode_solver_keys().len(), "one notice per distinct key, got: {w:?}");
+    for k in ode_solver_keys() {
+        assert!(w.iter().any(|m| m.contains(k)), "no notice named `{k}`: {w:?}");
+    }
+    // No notice may carry a run of whitespace. The exact-message assertion above
+    // pins one key's text; this covers the other five, and any key added later.
+    for m in &w {
+        assert!(
+            !m.contains("  "),
+            "notice contains a run of spaces — check the `\\` line continuations: {m:?}"
+        );
+    }
+}
+
+#[test]
+fn ode_model_does_not_warn_on_ode_solver_keys() {
+    // The #517 regression guard, at the model tier: `sync_ode_solver_opts` does
+    // apply these here, so neither the method-level nor the model-level layer
+    // may say a word.
+    let model = test_helpers::ode_model(GradientMethod::Auto);
+    assert!(model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(ode_solver_keys());
+    assert!(
+        opts.unsupported_keys_warnings_with_model(&model).is_empty(),
+        "ODE model warned on solver keys: {:?}",
+        opts.unsupported_keys_warnings_with_model(&model)
+    );
+}
+
+#[test]
+fn closed_form_absorption_twin_suppresses_the_ode_solver_key_notice() {
+    // The predicate is *not* `is_ode_based()`. A closed-form transit primary is
+    // analytic (`ode_spec == None`) but carries an absorption ODE twin (#814) that
+    // `sync_ode_solver_opts` also stamps, so the keys are live and "this model has
+    // no `[odes]` block" would be a false positive of the kind #517 removed.
+    use crate::parser::model_parser::parse_model_string;
+    let model = parse_model_string(TRANSIT_IOV_TOL_SRC).expect("parse transit+IOV");
+    assert!(!model.is_ode_based(), "the transit primary is analytic");
+    assert!(model.absorption_ode_equivalent.is_some(), "it carries a twin");
+    assert!(model.honors_ode_solver_opts());
+
+    let opts = opts_with_user_set_keys(ode_solver_keys());
+    assert!(
+        opts.unsupported_keys_warnings_with_model(&model).is_empty(),
+        "twin-carrying analytic model warned: {:?}",
+        opts.unsupported_keys_warnings_with_model(&model)
+    );
+}
+
+#[test]
+fn model_aware_warnings_keep_the_method_level_ones() {
+    // The model layer only *appends*: a genuinely method-unsupported key must still
+    // produce its own warning alongside the ODE notice.
+    let model = test_helpers::analytical_model(GradientMethod::Auto);
+    let opts = opts_with_user_set_keys(&["n_convergence", "ode_abstol"]);
+
+    let w = opts.unsupported_keys_warnings_with_model(&model);
+    assert_eq!(w.len(), 2, "got: {w:?}");
+    assert!(
+        w.iter().any(|m| m.contains("n_convergence") && m.contains("is not used by method")),
+        "lost the method-level warning: {w:?}"
+    );
+    assert!(w.iter().any(|m| m.contains("ode_abstol")), "lost the model-level notice: {w:?}");
+    // The model-agnostic entry point is unchanged — it still sees only the
+    // method-level miss, which is what keeps the public API's contract stable.
+    let base = opts.unsupported_keys_warnings();
+    assert_eq!(base.len(), 1, "got: {base:?}");
+    assert!(base[0].contains("n_convergence"), "got: {}", base[0]);
+}
+
+/// `FitOptions::non_interaction_stage` is the one `iiv_on_ruv` predicate
+/// `fit()` and `ruvsearch` share (#1182). It walks the whole chain — `method`
+/// is the *last* stage of a chained fit, so reading it alone lets a
+/// `[foce, focei]` chain propose a candidate `fit()` then refuses at its
+/// first stage (review of #1273).
+#[test]
+fn non_interaction_stage_walks_the_whole_method_chain() {
+    let single = |method: EstimationMethod, interaction: bool| FitOptions {
+        method,
+        interaction,
+        ..Default::default()
+    };
+    assert_eq!(
+        single(EstimationMethod::Foce, false).non_interaction_stage(),
+        Some(EstimationMethod::Foce)
+    );
+    assert_eq!(single(EstimationMethod::FoceI, true).non_interaction_stage(), None);
+    assert_eq!(
+        single(EstimationMethod::FoceGn, false).non_interaction_stage(),
+        Some(EstimationMethod::FoceGn)
+    );
+    assert_eq!(single(EstimationMethod::FoceGn, true).non_interaction_stage(), None);
+    assert_eq!(
+        single(EstimationMethod::FoceGnHybrid, false).non_interaction_stage(),
+        Some(EstimationMethod::FoceGnHybrid)
+    );
+    for m in [
+        EstimationMethod::Laplace,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+    ] {
+        assert_eq!(single(m, false).non_interaction_stage(), None, "{m:?}");
+    }
+    // A chain: the parser leaves `method` at the last stage, so the predicate
+    // must not read it alone.
+    let chain = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::FoceI],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), Some(EstimationMethod::Foce));
+    let chain = FitOptions {
+        method: EstimationMethod::Saem,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::Saem],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), Some(EstimationMethod::Foce));
+    let chain = FitOptions {
+        method: EstimationMethod::Imp,
+        interaction: true,
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Imp],
+        ..Default::default()
+    };
+    assert_eq!(chain.non_interaction_stage(), None);
+}
+
+// ---------------------------------------------------------------------------
+// #956: the covariance keys are one group, and the group is framework-level.
+//
+// `cov_inner_tol` shipped in *no* advertised key list while having a working
+// `apply_fit_option` arm, so `unsupported_keys_warnings` announced that a value the
+// parser had just applied would be ignored. The fix lists it with its five siblings in
+// `framework_keys()` rather than in nine `method_specific_keys` arms — a per-method list
+// re-arms the same trap for the next covariance-capable method — and the one case where
+// the group really is inert (a chain ending in Bayes) becomes a rule over the group,
+// mirroring the `ode_*` model-conditional notice above.
+// ---------------------------------------------------------------------------
+
+/// The [`covariance_keys`] analogue of [`ode_solver_keys_are_a_subset_of_framework_keys`].
+#[test]
+fn covariance_keys_are_a_subset_of_framework_keys() {
+    let fw = framework_keys();
+    for k in covariance_keys() {
+        assert!(
+            fw.contains(k),
+            "`{k}` is in covariance_keys() but not framework_keys() — it would \
+             spuriously warn as method-unsupported (#956)"
+        );
+    }
+}
+
+/// Every method advertises the *whole* covariance group, not most of it.
+///
+/// This is the guard the #956 bug needed and did not have. The reverse scraper in
+/// `model_parser_tests` unions the ten `method_specific_keys` arms, so a key present in
+/// any one arm satisfies it — deleting `cov_inner_tol` from eight of nine arms leaves it
+/// green. This asserts per method, so a covariance key that drifts back into per-method
+/// lists and is forgotten in one of them names that method.
+#[test]
+fn every_method_advertises_the_whole_covariance_key_group() {
+    for m in [
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+        EstimationMethod::FoceGn,
+        EstimationMethod::FoceGnHybrid,
+        EstimationMethod::Saem,
+        EstimationMethod::Imp,
+        EstimationMethod::Impmap,
+        EstimationMethod::Bayes,
+        EstimationMethod::Laplace,
+        EstimationMethod::Vi,
+    ] {
+        for k in covariance_keys() {
+            let advertised = framework_keys().contains(k) || method_specific_keys(m).contains(k);
+            assert!(
+                advertised,
+                "method `{}` advertises neither `{k}` in framework_keys() nor in its \
+                 method_specific_keys() arm — a fit setting it would be told the value \
+                 it just applied will be ignored (#956)",
+                m.label()
+            );
+        }
+    }
+}
+
+#[test]
+fn bayes_chain_warns_that_covariance_keys_have_no_effect() {
+    let opts = FitOptions {
+        method: EstimationMethod::Bayes,
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    let w = opts.unsupported_keys_warnings();
+
+    assert_eq!(w.len(), 1, "expected exactly one warning, got: {w:?}");
+    // Pinned in full for the same reason as the `ode_reltol` notice above: the string
+    // reaches the CLI and the fit YAML verbatim, and a `\`-continuation that is not
+    // exactly right ships a run of spaces that `contains` cannot see.
+    assert_eq!(
+        w[0],
+        "fit option `cov_inner_tol` configures the post-fit covariance step, but this \
+         fit ends in Bayesian estimation, which reports posterior credible intervals \
+         instead of Hessian standard errors and runs no covariance step, so it has no \
+         effect."
+    );
+    // The method-level phrasing would be the wrong diagnosis, and is what the key's
+    // omission from `method_specific_keys` used to produce: "not used by method `Bayes`"
+    // is the text a *misspelled* key gets, and it lists every method-specific key as the
+    // suggested alternative.
+    assert!(!w[0].contains("is not used by method"), "got: {}", w[0]);
+}
+
+#[test]
+fn bayes_chain_warns_once_per_distinct_covariance_key() {
+    let mut keys: Vec<&str> = covariance_keys().to_vec();
+    keys.push("cov_inner_tol");
+    let opts = FitOptions { method: EstimationMethod::Bayes, ..opts_with_user_set_keys(&keys) };
+
+    let w = opts.unsupported_keys_warnings();
+    assert_eq!(w.len(), covariance_keys().len(), "one notice per distinct key, got: {w:?}");
+    for k in covariance_keys() {
+        assert!(w.iter().any(|m| m.contains(k)), "no notice named `{k}`: {w:?}");
+    }
+    for m in &w {
+        assert!(
+            !m.contains("  "),
+            "notice contains a run of spaces — check the `\\` line continuations: {m:?}"
+        );
+    }
+}
+
+/// The notice follows the covariance step, not the presence of a Bayes stage.
+///
+/// `[bayes, focei]` ends on FOCEI, which runs the step and consumes every covariance
+/// key; `[focei, bayes]` does not, because the step only ever runs on the chain's last
+/// estimating stage (#615) and Bayes disables its own. The pair straddles the predicate:
+/// a rule keyed on "the chain contains Bayes" passes the second and fails the first.
+#[test]
+fn covariance_key_notice_follows_the_last_estimating_stage() {
+    let ends_estimating = FitOptions {
+        methods: vec![EstimationMethod::Bayes, EstimationMethod::FoceI],
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    assert_eq!(ends_estimating.covariance_stage(), Some(EstimationMethod::FoceI));
+    assert!(
+        ends_estimating.unsupported_keys_warnings().is_empty(),
+        "a chain that ends in FOCEI runs the covariance step: {:?}",
+        ends_estimating.unsupported_keys_warnings()
+    );
+
+    let ends_bayes = FitOptions {
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Bayes],
+        ..opts_with_user_set_keys(&["cov_inner_tol"])
+    };
+    assert_eq!(ends_bayes.covariance_stage(), Some(EstimationMethod::Bayes));
+    assert_eq!(ends_bayes.unsupported_keys_warnings().len(), 1);
+}
+
+/// A trailing evaluation-only stage does not take ownership of the covariance step.
+///
+/// `[bayes, imp]` under `imp_eval_only` estimates in Bayes and only *evaluates* in IMP,
+/// so `is_last_estimating_stage` puts the step on the Bayes stage and the keys are inert
+/// — the same rule `fit_inner` runs, reached through the same helper rather than a
+/// second copy of it.
+#[test]
+fn eval_only_trailing_stage_leaves_the_covariance_step_on_bayes() {
+    let opts = FitOptions {
+        methods: vec![EstimationMethod::Bayes, EstimationMethod::Imp],
+        imp_eval_only: true,
+        ..opts_with_user_set_keys(&["fd_hessian_step"])
+    };
+    assert_eq!(opts.eval_only_methods(), vec![EstimationMethod::Imp]);
+    assert_eq!(opts.covariance_stage(), Some(EstimationMethod::Bayes));
+    assert_eq!(opts.unsupported_keys_warnings().len(), 1);
+
+    // Without the eval-only flag the IMP stage estimates, so it owns the step.
+    let estimating = FitOptions { imp_eval_only: false, ..opts.clone() };
+    assert_eq!(estimating.covariance_stage(), Some(EstimationMethod::Imp));
+    assert!(estimating.unsupported_keys_warnings().is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  #2717 — MCEM-only `imp` keys under `imp_eval_only`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `imp_eval_only` on `chain`, with `(key, value)` applied the way a model file or
+/// ferx-r applies them, so `user_set_keys` is the parser's rather than hand-written.
+fn eval_only_opts(chain: &[EstimationMethod], keys: &[(&str, &str)]) -> FitOptions {
+    let mut opts =
+        FitOptions { methods: chain.to_vec(), imp_eval_only: true, ..FitOptions::default() };
+    for (key, value) in keys {
+        crate::parser::model_parser::apply_fit_option(&mut opts, key, value)
+            .expect("the option parses");
+    }
+    opts
+}
+
+const EVAL_CHAIN: [EstimationMethod; 2] = [EstimationMethod::FoceI, EstimationMethod::Imp];
+
+/// Every sentence of each message, and the set and unset cases of each option. `imp_auto`
+/// defaults to `true`, so `unset` is what catches a rule keyed on the value.
+#[test]
+fn eval_only_iscale_keys_warn_when_set_and_only_then() {
+    assert!(eval_only_opts(&EVAL_CHAIN, &[]).unsupported_keys_warnings().is_empty());
+    for (key, other) in [("iscale_min", "iscale_max"), ("iscale_max", "iscale_min")] {
+        let w = eval_only_opts(&EVAL_CHAIN, &[(key, "5")]).unsupported_keys_warnings();
+        assert_eq!(
+            w,
+            vec![format!(
+                "fit option `{key}` bounds the proposal-scale search of the estimating IMP \
+                 iterations, but `imp_eval_only` runs an evaluation, which does not search \
+                 a scale, so it has no effect. An evaluation's proposal is adapted only by \
+                 `imp_adapt_passes`."
+            )]
+        );
+        assert!(!w[0].contains(other), "{}", w[0]);
+    }
+}
+
+#[test]
+fn eval_only_imp_auto_warns_when_set_to_either_value_and_only_then() {
+    let unset = eval_only_opts(&EVAL_CHAIN, &[]);
+    assert!(unset.imp_auto, "the unset case must hold the default `true`");
+    assert!(unset.unsupported_keys_warnings().is_empty());
+    for value in ["true", "false"] {
+        let w = eval_only_opts(&EVAL_CHAIN, &[("imp_auto", value)]).unsupported_keys_warnings();
+        assert_eq!(
+            w,
+            vec!["fit option `imp_auto` adapts the sample count of the estimating IMP \
+                 iterations, but `imp_eval_only` runs an evaluation, which draws a fixed \
+                 `imp_samples` per subject in each pass, so it has no effect. Raise \
+                 `imp_samples` to lower the evaluation's Monte-Carlo error."
+                .to_string()],
+            "imp_auto = {value}"
+        );
+    }
+}
+
+/// The estimating path reads all three, so the pair straddles `imp_eval_only`.
+#[test]
+fn estimating_imp_keeps_the_mcem_keys_quiet() {
+    let keys = [("iscale_min", "5"), ("iscale_max", "5"), ("imp_auto", "false")];
+    let evaluating = eval_only_opts(&[EstimationMethod::Imp], &keys);
+    assert_eq!(evaluating.unsupported_keys_warnings().len(), 3);
+    let estimating = FitOptions { imp_eval_only: false, ..evaluating };
+    assert!(estimating.unsupported_keys_warnings().is_empty());
+}
+
+/// `[impmap, imp]`: IMPMAP reads `iscale_*`, so calling them inert would be false, while
+/// it reads `impmap_auto` rather than `imp_auto`, so that one stays inert.
+#[test]
+fn eval_only_notice_skips_a_key_an_impmap_stage_reads() {
+    let w = eval_only_opts(
+        &[EstimationMethod::Impmap, EstimationMethod::Imp],
+        &[("iscale_min", "5"), ("imp_auto", "false")],
+    )
+    .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].starts_with("fit option `imp_auto`"), "{}", w[0]);
+}
+
+/// With no `imp` stage the key is unknown to the chain: one warning, the general one.
+#[test]
+fn eval_only_notice_leaves_a_chain_without_imp_to_the_general_warning() {
+    let w = eval_only_opts(&[EstimationMethod::FoceI], &[("iscale_min", "5")])
+        .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("is not used by method"), "{}", w[0]);
+}
+
+#[test]
+fn eval_only_notice_is_issued_once_per_key() {
+    let w = eval_only_opts(&EVAL_CHAIN, &[("imp_auto", "true"), ("imp_auto", "false")])
+        .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  #1382 — one spelling for the covariance estimator
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **L3 — the serde token *is* `label()`.**
+///
+/// The point of the field is that a reported estimator can be pasted straight
+/// back into a `[fit_options]` block, so the JSON value, the `.fitrx` value, the
+/// YAML value and the model-file value have to be one string. Derived serde would
+/// have emitted `"CrossProduct"`; the explicit renames make it `"s"`. Asserting
+/// the *equality* rather than the literals separately is what stops a later
+/// rename of one from drifting past the other.
+#[test]
+fn the_serialized_covariance_method_is_the_fit_option_token() {
+    for m in [CovarianceMethod::Hessian, CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich]
+    {
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert_eq!(
+            json,
+            format!("\"{}\"", m.label()),
+            "the wire token and the fit-option token must be the same string for {m:?}"
+        );
+        let back: CovarianceMethod = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, m);
+        assert_eq!(CovarianceMethod::from_label(m.label()), Some(m));
+    }
+    // The three tokens are what the parser accepts, and they are distinct — a
+    // label collision would make two estimators indistinguishable in every
+    // output this issue is about.
+    assert_eq!(CovarianceMethod::Hessian.label(), "r");
+    assert_eq!(CovarianceMethod::CrossProduct.label(), "s");
+    assert_eq!(CovarianceMethod::Sandwich.label(), "rsr");
+    assert_eq!(CovarianceMethod::from_label("hessian"), None);
+    assert_eq!(CovarianceMethod::from_label(""), None);
+}
+
+/// **L4 — `formula()` says what was inverted, and says something different for
+/// each estimator.** The token alone does not tell a reader why 1.42e8 and
+/// 3.68e5 are both correct for the same fit; `R⁻¹` vs `R⁻¹SR⁻¹` does.
+#[test]
+fn each_covariance_estimator_prints_a_distinct_matrix_expression() {
+    let all =
+        [CovarianceMethod::Hessian, CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich];
+    let formulas: Vec<&str> = all.iter().map(|m| m.formula()).collect();
+    let unique: std::collections::HashSet<&&str> = formulas.iter().collect();
+    assert_eq!(unique.len(), all.len(), "two estimators share a printed expression: {formulas:?}");
+    assert_eq!(CovarianceMethod::Hessian.formula(), "R⁻¹");
+    assert_eq!(CovarianceMethod::Sandwich.formula(), "R⁻¹SR⁻¹");
+}
+
+/// #1710: `interaction_for` is the one copy of the per-method interaction rule — FOCEI
+/// on, FOCE off, every other method the caller's flag — under both inherited values, so
+/// a helper that returned `inherited`, or that hard-wired a pass-through method, fails.
+#[test]
+fn interaction_for_truth_table() {
+    use EstimationMethod::*;
+    for inherited in [true, false] {
+        assert!(interaction_for(FoceI, inherited), "FoceI, inherited {inherited}");
+        assert!(!interaction_for(Foce, inherited), "Foce, inherited {inherited}");
+        // Every other variant of the enum, so no pass-through method can be hard-wired.
+        for m in [FoceGn, FoceGnHybrid, Saem, Imp, Impmap, Bayes, Laplace, Vi] {
+            assert_eq!(
+                interaction_for(m, inherited),
+                inherited,
+                "{m:?} must pass the inherited flag through"
+            );
+        }
+    }
+}
+
+/// #1899: the slot lookup must not answer an unbound individual parameter for
+/// `PK_IDX_CL`, in either declaration order.
+///
+/// On an analytical model only a name the `pk(...)` line binds (or a readout /
+/// `obs_scale` / `init` reads) owns a PK slot; every other name carries the
+/// placeholder `0`, which *is* `CL`'s slot. So `pk_indices` answers both ways
+/// round: forwards it hands the intermediate `CL`'s value, backwards a
+/// `position(|&s| s == PK_IDX_CL)` scan hands `CL`'s slot the intermediate's name
+/// — the two defects #1899 covers. `pk_slot_rows` drops the placeholder rows and
+/// `indiv_param_for_pk_slot` is `find` over what is left.
+///
+/// Both orders are asserted because each consumer broke on a different one: a
+/// `position` scan loses when the intermediate is declared **before** `CL`, while
+/// a slot-keyed `seed_dim` (the sensitivity fallback) loses when it is declared
+/// **after** — so a single-order fixture leaves one half untested.
+#[test]
+fn pk_slot_rows_omit_an_unbound_individual_parameter() {
+    let before = "[parameters]\n  theta THCL(0.2, 0.001, 10.0)\n  theta THV(10.0, 0.1, 500.0)\n  \
+         theta THS(3.0, 0.01, 100.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+         omega ETA_S ~ 0.25\n  sigma PROP_ERR ~ 0.02 (sd)\n\
+         [individual_parameters]\n  S = THS * exp(ETA_S)\n  CL = THCL * exp(ETA_CL)\n  \
+         V = THV * exp(ETA_V)\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=1.0)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    let after = before.replace("  S = THS * exp(ETA_S)\n  CL", "  CL").replace(
+        "  V = THV * exp(ETA_V)\n[structural_model]",
+        "  V = THV * exp(ETA_V)\n  S = THS * exp(ETA_S)\n[structural_model]",
+    );
+    for (label, src) in [("S first", before), ("S last", after.as_str())] {
+        let m = crate::parser::model_parser::parse_model_string(src)
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let s_pos = m
+            .indiv_param_names
+            .iter()
+            .position(|n| n == "S")
+            .unwrap_or_else(|| panic!("{label}: S must be declared"));
+        let cl_pos = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+        // The defect's precondition: `S` carries CL's slot in `pk_indices`, so the
+        // old lookups could not tell the two apart. If a later change gives every
+        // name a real slot this assert fires and the test below stops testing
+        // anything — which is the point of asserting it.
+        assert_eq!(
+            m.pk_indices[s_pos], PK_IDX_CL,
+            "{label}: S must still carry the placeholder slot"
+        );
+        let rows = m.pk_slot_rows();
+        assert!(
+            !rows.iter().any(|&(_, i)| i == s_pos),
+            "{label}: S owns no slot, so it must contribute no row: {rows:?}"
+        );
+        // One row per slot — what `indiv_param_for_pk_slot`'s `find` by slot needs to
+        // be unambiguous (and what the pre-#2093 `seed_dim_from_slots`, last row per
+        // slot wins, needed).
+        let mut slots: Vec<usize> = rows.iter().map(|&(s, _)| s).collect();
+        let n = slots.len();
+        slots.sort_unstable();
+        slots.dedup();
+        assert_eq!(slots.len(), n, "{label}: a slot appears twice: {rows:?}");
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_CL),
+            Some(cl_pos),
+            "{label}: PK_IDX_CL must resolve to CL, not to S"
+        );
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_V),
+            m.indiv_param_names.iter().position(|n| n == "V"),
+            "{label}: PK_IDX_V must resolve to V"
+        );
+        // A slot no parameter owns stays unowned — the literal `ka=1.0` binds no
+        // variable, so nothing may claim `PK_IDX_KA`.
+        assert_eq!(
+            m.indiv_param_for_pk_slot(PK_IDX_KA),
+            None,
+            "{label}: a literal-bound role owns no individual parameter"
+        );
+    }
+}
+
+/// #1899: a hand-built `CompiledModel` carries no individual-parameter program, so
+/// `pk_slot_rows` has nothing to read the resolved pairs off and falls back to
+/// `pk_indices` — where, for such a fixture, every entry is a real slot by
+/// construction. Pins that fallback, which the parsed-model test above cannot
+/// reach.
+#[test]
+fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
+    let mut m = test_helpers::analytical_model(GradientMethod::Auto);
+    m.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
+    m.pk_indices = vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA];
+    assert!(
+        m.indiv_param_partials.indiv_param_program.is_none(),
+        "the hand-built fixture must carry no program, or this tests the other arm"
+    );
+    assert_eq!(m.pk_slot_rows(), vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (PK_IDX_KA, 2)]);
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_Q), None);
+}
+
+/// #1899: an analytical **modeled-duration** `D1` owns a real PK slot above
+/// `PK_IDX_LAGTIME` that `pk_indices` records as the placeholder `0` — CL's slot —
+/// so it is the same defect as an unbound intermediate's, on a parameter that
+/// drives the infusion window. Pins that the rows give it its own slot and leave
+/// `CL`'s to `CL`. The gradient consequence was asserted against FD in the pre-#2093
+/// `a_modeled_duration_parameter_does_not_steal_cls_gradient_row` (retired in #2093).
+#[test]
+fn pk_slot_rows_give_a_modeled_duration_parameter_its_own_slot() {
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(10.0, 1.0, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         theta TVD1(2.0, 0.1, 24.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_D1 ~ 0.04\n  \
+         sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  \
+         D1 = TVD1 * exp(ETA_D1)\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("model parses");
+    let d1 = m.indiv_param_names.iter().position(|n| n == "D1").unwrap();
+    let cl = m.indiv_param_names.iter().position(|n| n == "CL").unwrap();
+    assert_eq!(
+        m.pk_indices[d1], PK_IDX_CL,
+        "D1's pk_indices entry must still be the placeholder, or this tests nothing"
+    );
+    let rows = m.pk_slot_rows();
+    let d1_slot = rows.iter().find(|&&(_, i)| i == d1).map(|&(s, _)| s).expect("D1 owns a row");
+    assert!(
+        d1_slot > PK_IDX_LAGTIME,
+        "D1's slot must be the spare-region modeled-dose slot, got {d1_slot}"
+    );
+    assert_eq!(
+        m.indiv_param_for_pk_slot(PK_IDX_CL),
+        Some(cl),
+        "PK_IDX_CL must resolve to CL, not to D1"
+    );
+}
+
+/// Review r3 #1: the exact rows for a name that owns **two** PK slots. The generic
+/// invariants (one row per slot, indices in range, bounded by the program's pairs)
+/// are all satisfied by a `pk_slot_rows` deduplicated by name, which would silently
+/// drop one of the two — so the shape needs its row list pinned, not just its
+/// invariants.
+///
+/// `pk two_cpt_iv(cl=D1, …)` alongside `D1 = …` parses because the modeled-dose
+/// mapping is not a `pk(...)` role and the #1359 one-variable-two-roles reject does
+/// not see it.
+///
+/// This is the **only** check on the slot-9 row (review r4 #2): the companion
+/// `sens::provider::tests::a_parameter_owning_two_pk_slots_gets_both_gradient_rows`
+/// (retired in #2093) asserted FD parity for the `cl` row, but on the plain bolus it ran
+/// that row is the only one `η_D1` reaches the prediction through, so zeroing the slot-9
+/// derivative alone would have left its parity unchanged.
+#[test]
+fn pk_slot_rows_give_one_name_both_of_its_slots() {
+    let m = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVD1(2.0, 0.1, 24.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_D1 ~ 0.04\n  sigma PROP_ERR ~ 0.04\n\
+         [individual_parameters]\n  D1 = TVD1 * exp(ETA_D1)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=D1, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("model parses");
+    assert_eq!(m.indiv_param_names, vec!["D1".to_string(), "V".to_string()]);
+    // `pk_indices` keeps one entry per name and drops the modeled slot entirely,
+    // which is why it cannot answer this question either way.
+    assert_eq!(m.pk_indices, vec![PK_IDX_CL, PK_IDX_V]);
+    let mut rows = m.pk_slot_rows();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (9, 0)],
+        "D1 (name index 0) must own both CL's slot and its modeled-duration slot"
+    );
+    // Three rows for two names: the inequality review r2 #4 disproved.
+    assert!(rows.len() > m.pk_indices.len());
+    // The reverse lookup still answers each slot with the one name that owns it.
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_CL), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(9), Some(0));
+    assert_eq!(m.indiv_param_for_pk_slot(PK_IDX_V), Some(1));
+}
+
+/// Review r6: deleting the `debug_assert!` in
+/// [`CompiledModel::pk_slot_rows`](super::CompiledModel::pk_slot_rows) was a minimal
+/// production edit no test caught, and by its nature none can: the condition it
+/// guards is unreachable on every accepted model (measured — deleting the range
+/// filter beside it leaves the whole suite green), so observing it would need a
+/// hand-built `IndivParamProgram` with an out-of-range `var_slot`, which its private
+/// fields do not allow without a test-only constructor.
+///
+/// So the guard's **presence** is what is asserted, in the same spirit as
+/// `tests/public_api_boundary.rs`'s structural bans. What it buys is not style: a
+/// future mapping that pointed a pair past `indiv_param_names` would otherwise have
+/// its row silently filtered away, which is a lost gradient row — #1899's own
+/// failure mode — rather than a loud test failure.
+#[test]
+fn pk_slot_rows_keeps_its_range_guard() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types.rs"))
+        .expect("src/types.rs is valid UTF-8");
+    let body = {
+        let start = src.find("pub fn pk_slot_rows(&self)").expect("pk_slot_rows must exist");
+        let rest = &src[start..];
+        let end = rest
+            .find("pub fn indiv_param_for_pk_slot")
+            .expect("indiv_param_for_pk_slot follows pk_slot_rows");
+        &rest[..end]
+    };
+    assert!(
+        body.contains("debug_assert!"),
+        "pk_slot_rows must keep its debug_assert over pk_var_slots: a pair pointing \
+         past indiv_param_names would otherwise lose a gradient row silently"
+    );
+    assert!(
+        body.contains("i < self.indiv_param_names.len()"),
+        "pk_slot_rows must keep the range condition the assert and the filter share"
+    );
+}
+
+// ── #2122 / #2101: kappa with a residual `correlation` line is analytic ──────────────────
+mod kappa_correlation_auto_route {
+    use crate::estimation::outer_policy::resolve_outer_optimizer;
+    use crate::sens::provider::analytic_outer_gradient_in_scope;
+    use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+
+    /// A one-level compartment-free model, optionally with a kappa, a
+    /// `correlation car1(RHO) by ARMID` line, and `extra` unreferenced θ.
+    fn src(kappa: bool, corr: bool, extra: usize) -> String {
+        let extras: String =
+            (0..extra).map(|i| format!("  theta X{i}(1.0, 0.0, 10.0)\n")).collect();
+        format!(
+            "[parameters]\n  theta TVE0(10.0)\n  theta TVEMAX(20.0)\n  theta RHO(0.3, 0.0, 0.9)\n\
+             {extras}  omega ETA_SP ~ 0.09\n{}  sigma ADD ~ 0.25\n\
+             [individual_parameters]\n  EMAX = TVEMAX * exp(ETA_SP{})\n\
+             [structural_model]\n  y = TVE0 + EMAX * TIME / (TIME + 3)\n\
+             [error_model]\n  DV ~ additive(ADD)\n{}\
+             [fit_options]\n  iov_column = ARMID\n",
+            if kappa { "  kappa K_OC ~ 0.04\n" } else { "" },
+            if kappa { " + K_OC" } else { "" },
+            if corr { "  correlation car1(RHO) by ARMID\n" } else { "" },
+        )
+    }
+
+    fn model(kappa: bool, corr: bool, extra: usize) -> crate::types::CompiledModel {
+        crate::parser::model_parser::parse_full_model(&src(kappa, corr, extra)).unwrap().model
+    }
+
+    /// `main`'s #2122 made `auto` take L-BFGS on this route because its gradient was
+    /// finite differences there (#2101). The adjoint serves kappa with a residual
+    /// `correlation` line exactly, so the route is analytic like its neighbours and `auto`
+    /// takes L-BFGS on the general rule, under FOCE and FOCEI alike; on a counterfactual FD
+    /// gradient all three get BOBYQA again.
+    #[test]
+    fn kappa_with_a_residual_correlation_is_analytic_and_auto_takes_lbfgs() {
+        let on = model(true, true, 0);
+        let kappa_only = model(true, false, 0);
+        let corr_only = model(false, true, 0);
+        for m in [&on, &kappa_only, &corr_only] {
+            assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
+            assert!(analytic_outer_gradient_in_scope(m));
+            assert_eq!(Optimizer::Auto.resolve_auto(m), Optimizer::NloptLbfgs);
+            assert_eq!(Optimizer::Auto.resolve_auto_given_analytic(m, false), Optimizer::Bobyqa);
+        }
+        // The outer loop's own resolver agrees, handed the live predicate (no mixture).
+        assert_eq!(
+            resolve_outer_optimizer(
+                Optimizer::Auto,
+                &on,
+                false,
+                analytic_outer_gradient_in_scope(&on)
+            )
+            .0,
+            Optimizer::NloptLbfgs
+        );
+    }
+
+    /// No finite-difference warning on the route, and none past `main`'s 24-axis
+    /// compartment-free cap either: the adjoint has no axis cap (#2093).
+    #[test]
+    fn no_fd_route_or_axis_cap_warning() {
+        for (k, c, e) in [(true, true, 22), (true, true, 0), (true, false, 22), (false, true, 22)] {
+            let m = model(k, c, e);
+            assert!(
+                !m.parse_warnings
+                    .iter()
+                    .any(|w| w.contains("finite differences") || w.contains("axis cap")),
+                "kappa={k} corr={c} extra={e}: {:#?}",
+                m.parse_warnings
+            );
+        }
+    }
+}
+
+#[test]
+fn time_varying_covariate_names_inspects_endpoint_rows() {
+    // #1854: the reader keeps no other trace of a covariate on a CTMM / TTE row, so a
+    // change seen only there — here the baseline row is an endpoint row — must be read
+    // from `endpoint_covariates`. Without that field the doses alone look constant.
+    let mut s = bare_subject("1");
+    s.dose_covariates =
+        vec![HashMap::from([("WT".to_string(), 0.0)]), HashMap::from([("WT".to_string(), 0.0)])];
+    assert!(s.time_varying_covariate_names().is_empty());
+    s.endpoint_covariates = vec![HashMap::from([("WT".to_string(), 1.0)])];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+}
+
+#[test]
+fn time_varying_covariate_names_compares_the_snapshots_with_the_baseline() {
+    // #1854 round 3: the baseline the CTMM solve reads is `covariates`, the first finite
+    // value on any row — including a row dropped before any snapshot was kept. When every
+    // retained snapshot agrees with each other but not with that baseline, the covariate
+    // is time-varying for the baseline-only paths.
+    let mut s = bare_subject("1");
+    s.covariates = HashMap::from([("WT".to_string(), 1.0), ("AGE".to_string(), 40.0)]);
+    let at = |wt: f64| HashMap::from([("WT".to_string(), wt), ("AGE".to_string(), 40.0)]);
+    s.dose_covariates = vec![at(0.0), at(0.0)];
+    s.endpoint_covariates = vec![at(0.0)];
+    assert_eq!(s.time_varying_covariate_names(), vec!["WT".to_string()]);
+    // Control: snapshots equal to the baseline are not time-varying.
+    s.covariates.insert("WT".to_string(), 0.0);
+    assert!(s.time_varying_covariate_names().is_empty());
+}
+
+/// The membership of the "requires at least one random effect" family (#1007,
+/// #1050), pinned explicitly so a change to it is a deliberate edit here too.
+/// A new variant needs no entry: `requires_random_effects` is an exhaustive
+/// `match`, so it cannot compile without a membership decision, and both the
+/// up-front check and the run-time guards consult that predicate directly.
+#[test]
+fn requires_random_effects_is_exactly_saem_imp_impmap_bayes() {
+    use EstimationMethod::*;
+    for m in [Saem, Imp, Impmap, Bayes] {
+        assert!(m.requires_random_effects(), "{m:?} must be a member");
+    }
+    for m in [Foce, FoceI, FoceGn, FoceGnHybrid, Laplace, Vi] {
+        assert!(!m.requires_random_effects(), "{m:?} must not be a member");
+    }
+}
+
+/// `retain_records` drops a record's aligned covariate snapshot with it (#2562), so the
+/// snapshots still line up after the drop; a subject with no snapshot is left without.
+///
+/// Mutation: retain the records alone and the second record reads the third's `X`.
+#[cfg(feature = "survival")]
+#[test]
+fn retain_records_keeps_the_record_snapshots_aligned() {
+    let x = |v: f64| HashMap::from([("X".to_string(), v)]);
+    let rec = |t: f64| ObsRecord::DiscreteState { time: t, raw_time: t, state: 0, cmt: 1 };
+    let mut s = Subject {
+        obs_records: vec![rec(0.0), rec(1.0), rec(2.0)],
+        endpoint_covariates: vec![x(0.0), x(1.0), x(2.0)],
+        ..Default::default()
+    };
+    s.retain_records(|r| !matches!(r, ObsRecord::DiscreteState { time, .. } if *time == 1.0));
+    let snaps = s.record_covariate_snapshots().expect("still aligned");
+    assert_eq!(snaps.iter().map(|m| m["X"]).collect::<Vec<_>>(), [0.0, 2.0]);
+
+    let mut bare = Subject { obs_records: vec![rec(0.0), rec(1.0)], ..Default::default() };
+    bare.retain_records(|_| false);
+    assert!(bare.obs_records.is_empty() && bare.endpoint_covariates.is_empty());
+}
+
+/// #2741 T12: `time_after_dose(j)` is a thin wrapper over the time-keyed
+/// `time_after_dose_at`, bit for bit, on every fixture of
+/// `subject_time_after_dose_is_the_data_tad` (Pharmpy same-time grouping, group 0,
+/// SS with and without a preceding dose). Regression: a `j` wrapper that diverges
+/// from `*_at` (the assay reads `*_at`, every estimator reads the wrapper).
+#[test]
+fn time_after_dose_is_its_time_keyed_twin_bit_for_bit() {
+    let d = |t: f64, ss: bool, ii: f64| DoseEvent::new(t, 100.0, 1, 0.0, ss, ii);
+    let fixtures = [
+        Subject {
+            id: "1".into(),
+            doses: vec![d(0.0, false, 0.0), d(24.0, false, 0.0)],
+            obs_times: vec![-1.0, 0.0, 2.0, 23.9, 24.0, 30.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "4".into(),
+            doses: vec![d(10.0, false, 0.0)],
+            pk_only_times: vec![-3.0],
+            obs_times: vec![-2.0, 0.0, 10.0, 12.0],
+            ..Default::default()
+        },
+        Subject { id: "5".into(), obs_times: vec![0.0, 4.0, 9.0], ..Default::default() },
+        Subject {
+            id: "2".into(),
+            doses: vec![d(0.0, true, 12.0)],
+            obs_times: vec![0.0, 26.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "3".into(),
+            doses: vec![d(0.0, false, 0.0), d(48.0, true, 12.0)],
+            obs_times: vec![48.0],
+            ..Default::default()
+        },
+    ];
+    let mut n = 0;
+    for s in &fixtures {
+        for (j, &t) in s.obs_times.iter().enumerate() {
+            let (by_row, by_time) = (s.time_after_dose(j), s.time_after_dose_at(t));
+            assert!(by_row.is_finite(), "subject {} obs {j}: {by_row}", s.id);
+            assert_eq!(by_row.to_bits(), by_time.to_bits(), "subject {} obs {j}", s.id);
+            n += 1;
+        }
+        assert!(s.time_after_dose(s.obs_times.len()).is_nan(), "out of range stays NaN");
+    }
+    assert_eq!(n, 16, "every fixture row was compared");
+}
+
+/// #2741 T6: at a decision time with no record there, `time_after_dose_at` folds the
+/// time itself into group 0's earliest record, so a decision at `0` on records from
+/// `1` reads `0` (by hand: no dose, no earlier record, the decision is its own group-0
+/// start), and one at `5` reads `5 − 1 = 4`. Regression: `obs_t` left out of the minimum,
+/// which reads `0 − 1 = −1` at the first decision.
+#[test]
+fn time_after_dose_at_a_decision_before_every_record_is_zero() {
+    let s = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(8.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 6.0],
+        ..Default::default()
+    };
+    assert_eq!(s.time_after_dose_at(0.0), 0.0, "decision before every record");
+    assert_eq!(s.time_after_dose_at(5.0), 4.0, "decision after the first record");
+    assert_eq!(s.time_after_dose_at(8.0), 0.0, "at the first dose: that dose's");
+}
+
+/// #2799: the multi-start notes `fit()` appends to the returned run classify `(Info,
+/// MultiStart)` whatever sibling-start error text they interpolate. Each phrase below is one a
+/// Critical prose arm claims on its own (convergence, covariance failure, condition number), and
+/// the control row shows that phrase *without* the prefix still lands Critical, so the pair
+/// straddles the arm. Mutation: delete the `multi-start:` prefix arm → every prefixed row
+/// classifies Critical and this test names it.
+#[test]
+fn multi_start_notes_classify_info_whatever_error_text_they_carry() {
+    let embedded = [
+        "Outer optimizer did not converge after 3 iterations",
+        "Covariance step failed: Hessian is not positive definite",
+        "Covariance step: Hessian is not positive definite",
+        "condition number 3.2e9 exceeds 1e6",
+        "optimizer stopped without converging (Failure)",
+    ];
+    for phrase in embedded {
+        let bare = classify_warning(phrase);
+        assert_eq!(
+            bare.severity,
+            WarningSeverity::Critical,
+            "control: `{phrase}` must be Critical on its own, or this row tests nothing"
+        );
+        for msg in [
+            format!("Multi-start: 1 of 4 starts failed: start 2: {phrase}"),
+            format!("[FOCEI] Multi-start: 2 of 3 starts failed: x; {phrase}"),
+        ] {
+            let w = classify_warning(&msg);
+            assert_eq!(
+                (w.severity, w.category),
+                (WarningSeverity::Info, WarningCode::MultiStart),
+                "{msg}"
+            );
+        }
+    }
+    // #2867: the summary line says "not converged" of the starts that were not returned, and
+    // stays informational for the same reason.
+    for msg in [
+        "Multi-start: 4 starts, 4 converged; best OFV 123.4560 (start 2); \
+         all 4 converged starts within 1.0 of best (range 0.0000)",
+        "Multi-start: 4 starts, 2 converged, 2 not converged; best OFV 123.4560 (start 2); \
+         all 2 converged starts within 1.0 of best (range 0.0000); \
+         1 not converged at a lower OFV: start 3 (-3.21)",
+    ] {
+        let best = classify_warning(msg);
+        assert_eq!(
+            (best.severity, best.category),
+            (WarningSeverity::Info, WarningCode::MultiStart),
+            "{msg}"
+        );
+    }
+    // The no-run-converged note is a real verdict on the returned run and keeps its class.
+    let none = classify_warning(
+        "No multi-start run converged (4 starts); returning best OFV from start 2",
+    );
+    assert_eq!(
+        (none.severity, none.category),
+        (WarningSeverity::Critical, WarningCode::Convergence)
+    );
+}
+
+/// #2799: `FitOptions::evaluation_only_run`, the source of `FitResult::evaluation_only`. Every
+/// stage must be an evaluator: `maxiter = 0` on a method that reads it as `MAXEVAL=0` (FOCE,
+/// FOCEI, Laplace, pure GN), or a standalone `imp_eval_only` / `agq_eval_only`. SAEM, IMP,
+/// IMPMAP, Bayes, VI and the GN hybrid (fixed 100-eval polish) search regardless, so
+/// `maxiter = 0` on them is not evaluation-only; one estimating stage in a chain makes the run
+/// estimate. Mutation: widen the method list to any method → the SAEM/VI/hybrid rows; drop the
+/// `eval_only_methods` arm → the IMP/AGQ rows.
+#[test]
+fn evaluation_only_run_reads_each_estimators_own_meaning_of_maxiter_zero() {
+    use EstimationMethod::*;
+    let opts = |methods: &[EstimationMethod], maxiter: usize, imp: bool, agq: bool| FitOptions {
+        method: methods[methods.len() - 1],
+        methods: if methods.len() > 1 { methods.to_vec() } else { Vec::new() },
+        outer_maxiter: maxiter,
+        imp_eval_only: imp,
+        agq_eval_only: agq,
+        ..FitOptions::default()
+    };
+    #[rustfmt::skip]
+    let rows: Vec<(&str, FitOptions, bool)> = vec![
+        ("foce maxiter 0", opts(&[Foce], 0, false, false), true),
+        ("focei maxiter 0", opts(&[FoceI], 0, false, false), true),
+        ("laplace maxiter 0", opts(&[Laplace], 0, false, false), true),
+        ("pure gn maxiter 0", opts(&[FoceGn], 0, false, false), true),
+        ("focei maxiter 500", opts(&[FoceI], 500, false, false), false),
+        ("gn hybrid maxiter 0", opts(&[FoceGnHybrid], 0, false, false), false),
+        ("saem maxiter 0", opts(&[Saem], 0, false, false), false),
+        ("imp maxiter 0", opts(&[Imp], 0, false, false), false),
+        ("impmap maxiter 0", opts(&[Impmap], 0, false, false), false),
+        ("bayes maxiter 0", opts(&[Bayes], 0, false, false), false),
+        ("vi maxiter 0", opts(&[Vi], 0, false, false), false),
+        ("standalone imp_eval_only", opts(&[Imp], 500, true, false), true),
+        ("standalone agq_eval_only", opts(&[Laplace], 500, false, true), true),
+        ("focei then imp_eval_only", opts(&[FoceI, Imp], 500, true, false), false),
+        ("focei maxiter 0 then imp_eval_only", opts(&[FoceI, Imp], 0, true, false), true),
+        ("saem then focei, maxiter 0", opts(&[Saem, FoceI], 0, false, false), false),
+    ];
+    for (name, o, want) in rows {
+        assert_eq!(o.evaluation_only_run(), want, "{name}");
+    }
+}

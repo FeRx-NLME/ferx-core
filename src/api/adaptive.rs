@@ -2093,6 +2093,9 @@ pub(crate) fn verify_decision_records(
             Some(decision_nocb_covs_by_scan(subject, decision_times))
         }
         crate::sim::adaptive::DecisionCovariates::Locf => None,
+        // `DecisionCovariates` is `#[non_exhaustive]` and lives in ferx-model (#3041), so this
+        // match can no longer be exhaustive: an unknown rule refuses rather than defaults.
+        _ => return Err("a decision-covariate rule this check does not know".to_string()),
     };
     for (g, &t) in decision_times.iter().enumerate() {
         let row = nocb.as_ref().and_then(|v| v[g]).unwrap_or(locf[g]);
