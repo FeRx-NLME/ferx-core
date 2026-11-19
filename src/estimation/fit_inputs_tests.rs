@@ -6,6 +6,8 @@
 //! Dual2 inner gradient, 30 subjects × 10 observations, 3 outer iterations. Every
 //! oracle is a bit-identity at the fitted point or a refusal text, so no fit number
 //! enters and the platform does not either.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::test_fixtures::{case, case_with_call_ignore, unbound, Case, Kind};
 use super::*;

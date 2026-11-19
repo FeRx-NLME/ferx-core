@@ -7,6 +7,8 @@ use crate::propensity_match::MatchMethod;
 use crate::stats::residual_error::{
     compute_r_matrix_with_correlations_cov, compute_r_matrix_with_correlations_scaled_cov,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 use rand::{RngExt, SeedableRng};
 

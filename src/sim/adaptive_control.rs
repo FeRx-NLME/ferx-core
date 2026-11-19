@@ -17,6 +17,8 @@
 //!
 //! Wired to the public file-driven entry point [`crate::simulate_adaptive_from_spec`]
 //! in S2.3 (#391).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;

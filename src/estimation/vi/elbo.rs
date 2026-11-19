@@ -31,6 +31,8 @@
 //! scheduling, and at a *fixed* iteration index `−ELBO` is a deterministic
 //! function of `(x, φ)`, which is what makes the finite-difference parity tests
 //! exact rather than noisy.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::stats::stacked_layout::{kappa_offset, stacked_width};
 use nalgebra::{DMatrix, DVector};

@@ -6,6 +6,8 @@
 //!
 //! SIR provides a non-parametric estimate of parameter uncertainty that is
 //! more robust than the asymptotic covariance matrix.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::cold_sort::ColdSort;
 use crate::diagnostics::EngineError;

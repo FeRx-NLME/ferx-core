@@ -479,7 +479,7 @@ impl ErrorSpecText {
 
     /// The σ argument of slot `i` as the block spells it — the bare name, or
     /// the time-varying magnitude around it.
-    pub fn render_sigma_arg(&self, i: usize) -> String {
+    pub(crate) fn render_sigma_arg(&self, i: usize) -> String {
         let name = &self.sigmas[i].name;
         match &self.time_varying {
             Some(tv) => {

@@ -1,4 +1,6 @@
 //! Tier-1 tests for the count endpoint (#2877).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::parser::model_parser::with_model_time;
 use ferx_model::sens::num::BranchCmp;
@@ -744,9 +746,9 @@ fn count_records_define_and_carry_theta_levels() {
     // Two levels under the default sum-to-zero contrast: one free θ, the TRT = 1 level its
     // negative. Without the count records as level rows only TRT = 0 (the baseline) is a
     // level, and every record is scored at it.
-    let blocks = &model.indiv_param_partials.theta_blocks.level_blocks;
+    let blocks = &model.indiv_param_partials.theta_blocks().level_blocks();
     assert_eq!(blocks.len(), 1);
-    assert_eq!(blocks[0].record_cmts, vec![1], "the count endpoint reads the block");
+    assert_eq!(*blocks[0].record_cmts(), vec![1], "the count endpoint reads the block");
     assert_eq!(model.theta_names, vec!["BASE", "EFF[TRT=0]"]);
     let theta = [4.0, 0.35];
     let s = &prep.population.subjects[0];

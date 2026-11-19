@@ -20,6 +20,8 @@
 //! Both entry points return `(nll, grad)` so the caller gets the objective for
 //! free alongside its gradient. `lower[i] == upper[i]` marks a pinned coordinate:
 //! it contributes 0 and skips its evaluation.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::estimation::nn_theta_gradient::NnGradPlan;
 use crate::estimation::pred_memo::{memoized, MemoSlot};

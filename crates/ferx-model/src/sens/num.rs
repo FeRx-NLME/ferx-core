@@ -64,7 +64,7 @@ pub enum HostFn {
 
 impl HostFn {
     /// Every analysis, by index (a native call passes the index).
-    pub const ALL: [HostFn; 5] = [
+    pub(crate) const ALL: [HostFn; 5] = [
         HostFn::Spectral,
         HostFn::PadeSquarings,
         HostFn::LuFactor,
@@ -73,7 +73,7 @@ impl HostFn {
     ];
     /// Exhaustive on purpose: a new analysis does not compile until it has an index (and
     /// [`Self::compute`] an arm), so it cannot be added half-wired.
-    pub fn index(self) -> u16 {
+    pub(crate) fn index(self) -> u16 {
         match self {
             HostFn::Spectral => 0,
             HostFn::PadeSquarings => 1,
@@ -82,13 +82,13 @@ impl HostFn {
             HostFn::RemEuclid => 4,
         }
     }
-    pub fn from_index(i: u16) -> HostFn {
+    pub(crate) fn from_index(i: u16) -> HostFn {
         Self::ALL[i as usize]
     }
     /// Run the analysis on `args`' values into `out` — or reuse the result of the same
     /// analysis on the same bits: one point's generator is analysed by its `f64` prediction and
     /// by every derivative layout of its gradient, and the analyses are pure.
-    pub fn run(self, args: &[f64], out: &mut Vec<f64>) {
+    pub(crate) fn run(self, args: &[f64], out: &mut Vec<f64>) {
         use std::cell::RefCell;
         thread_local! {
             /// The last few analyses: `(f, argument bits, result)`, most recent last.
@@ -177,7 +177,7 @@ pub enum JetFn {
 
 impl JetFn {
     /// `[f, f′, f″, f‴, f⁗]` at `x`.
-    pub fn jet(self, x: f64) -> [f64; 5] {
+    pub(crate) fn jet(self, x: f64) -> [f64; 5] {
         match self {
             #[cfg(feature = "survival")]
             JetFn::NegLogNormCdf => crate::categorical::neg_log_normal_cdf_jet(x),
@@ -209,7 +209,7 @@ impl JetFn {
     }
     /// Exhaustive on purpose: a new function does not compile until it has an index and a
     /// [`Self::jet`] arm, which is its derivative rule — there is no jet-free `JetFn`.
-    pub const fn index(self) -> u8 {
+    pub(crate) const fn index(self) -> u8 {
         match self {
             JetFn::NegLogNormCdf => 0,
             JetFn::Softplus => 1,
@@ -224,7 +224,7 @@ impl JetFn {
         }
     }
     /// Every function, in index order (see the test pinning it to [`Self::index`]).
-    pub const ALL: [JetFn; 10] = [
+    pub(crate) const ALL: [JetFn; 10] = [
         JetFn::NegLogNormCdf,
         JetFn::Softplus,
         JetFn::Pnorm,
@@ -237,7 +237,7 @@ impl JetFn {
         JetFn::LnGamma,
     ];
     /// The function of [`Self::index`] `i`.
-    pub const fn from_index(i: u8) -> JetFn {
+    pub(crate) const fn from_index(i: u8) -> JetFn {
         Self::ALL[i as usize]
     }
 }

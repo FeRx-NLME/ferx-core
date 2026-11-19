@@ -196,14 +196,14 @@ impl PopulationFingerprint {
     }
 
     /// Whether the fit derived its occasion labels from a model-side rule.
-    pub fn occasions_derived(&self) -> bool {
+    pub(crate) fn occasions_derived(&self) -> bool {
         self.occasions_derived
     }
 
     /// The fingerprint of `population`. With `occasions_derived` (the fit derives its
     /// occasion labels from a model-side rule, `run::occasions_are_derived`), the
     /// labels the population carries are left out: the fit overwrites them.
-    pub fn of_with(population: &Population, occasions_derived: bool) -> Self {
+    pub(crate) fn of_with(population: &Population, occasions_derived: bool) -> Self {
         let Population {
             subjects,
             covariate_names,
@@ -227,7 +227,7 @@ impl PopulationFingerprint {
 
     /// Whether this fingerprint was made with the current encoding. One that was
     /// not cannot be compared, and is treated as absent.
-    pub fn is_current(&self) -> bool {
+    pub(crate) fn is_current(&self) -> bool {
         self.scheme == SCHEME
     }
 
@@ -235,7 +235,7 @@ impl PopulationFingerprint {
     /// position) between `population` and this fingerprint. The post-hoc checks
     /// run it before binding; [`Self::first_difference`] runs it first, so the two
     /// can never disagree on a subject list (#1813).
-    pub fn first_subject_difference(&self, population: &Population) -> Option<Difference> {
+    pub(crate) fn first_subject_difference(&self, population: &Population) -> Option<Difference> {
         subject_list_difference(
             population.subjects.iter().map(|s| s.id.as_str()),
             self.subjects.iter().map(|s| s.id.as_str()),
@@ -244,7 +244,7 @@ impl PopulationFingerprint {
 
     /// The first difference between `population` and the population this
     /// fingerprint was made of, or `None` when they are the same.
-    pub fn first_difference(&self, population: &Population) -> Option<Difference> {
+    pub(crate) fn first_difference(&self, population: &Population) -> Option<Difference> {
         self.first_subject_difference(population)
             .or_else(|| self.first_content_difference(population))
     }
@@ -254,7 +254,7 @@ impl PopulationFingerprint {
     /// [`Self::first_subject_difference`] found none, since subjects are paired by
     /// position. The post-hoc checks run the two halves apart, the subject list
     /// before binding and this after (#1813); [`Self::first_difference`] is both.
-    pub fn first_content_difference(&self, population: &Population) -> Option<Difference> {
+    pub(crate) fn first_content_difference(&self, population: &Population) -> Option<Difference> {
         let got = Self::of_with(population, self.occasions_derived);
         let pairs = || got.subjects.iter().zip(&self.subjects);
         if got.covariate_names != self.covariate_names {

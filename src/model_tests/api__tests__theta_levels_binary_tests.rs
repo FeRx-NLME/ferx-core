@@ -1,6 +1,8 @@
 //! A θ level block read by a discrete-state endpoint (#2562): the records of every
 //! endpoint whose expression reads the block define its levels, as the Gaussian
 //! observations do, and each carries its own level index in its covariate snapshot.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::levels::{level_index_finding, LevelIndexFinding};
@@ -455,7 +457,7 @@ fn a_ctmm_generator_reading_a_changing_level_is_refused_naming_the_block() {
     .unwrap()
     .model;
     assert!(
-        model.theta_blocks().level_blocks()[0].record_cmts.is_empty(),
+        model.theta_blocks().level_blocks()[0].record_cmts().is_empty(),
         "a CTMM's records define no levels"
     );
     let col = level_index_column("PLACEBO");
@@ -1095,7 +1097,7 @@ fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
     let mut parsed = parse_full_model(&text).unwrap();
     let decl = &parsed.model.theta_blocks().level_blocks()[0];
     assert!(
-        decl.read_bare && decl.record_cmts.is_empty(),
+        decl.read_bare() && decl.record_cmts().is_empty(),
         "fixture precondition: read bare by `y` alone"
     );
     let mut pop = read_population(Rows::Binary, true);
@@ -1128,7 +1130,7 @@ fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
     let mut parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
     let decl = &parsed.model.theta_blocks().level_blocks()[0];
     assert!(
-        decl.read_bare && decl.record_cmts.is_empty(),
+        decl.read_bare() && decl.record_cmts().is_empty(),
         "fixture precondition: read bare by the hazard alone"
     );
     let mut pop = read_population(Rows::Binary, true);
@@ -1190,7 +1192,7 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
 ";
     let mut parsed = parse_full_model(dtmm).unwrap();
     assert_eq!(
-        parsed.model.theta_blocks().level_blocks()[0].record_cmts,
+        *parsed.model.theta_blocks().level_blocks()[0].record_cmts(),
         [1],
         "fixture precondition: the CMT-1 DTMM reads the block"
     );
@@ -1515,7 +1517,7 @@ fn ctmm_records_define_no_level_cells() {
         let text = ctmm(read);
         let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{read}: {e}"));
         assert_eq!(
-            parsed.model.theta_blocks().level_blocks()[0].level_capable_cmts,
+            *parsed.model.theta_blocks().level_blocks()[0].level_capable_cmts(),
             [1, 2],
             "fixture precondition: the binary and DTMM CMTs, not the CTMM's"
         );

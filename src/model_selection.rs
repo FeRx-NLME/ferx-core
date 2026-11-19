@@ -28,6 +28,8 @@
 //! initial estimates is ranked on an OFV that says nothing about the model.
 //! [`check_strictness`] evaluates the pyDarwin-style gates and returns the
 //! *reasons*, so a search report can say why a candidate was excluded.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use nalgebra::DMatrix;
 use serde::{Deserialize, Serialize};
@@ -134,7 +136,7 @@ pub(crate) fn counted_held_mask(
     model: &CompiledModel, template: &ModelParameters, held_mask: &[bool],
 ) -> Vec<bool> {
     let mut out = held_mask.to_vec();
-    for i in model.indiv_param_partials.theta_blocks.profiled_theta_indices() {
+    for i in model.indiv_param_partials.theta_blocks().profiled_theta_indices() {
         if !template.theta_fixed.get(i).copied().unwrap_or(false) {
             if let Some(h) = out.get_mut(i) {
                 *h = false;

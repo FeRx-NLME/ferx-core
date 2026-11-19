@@ -1,5 +1,7 @@
 use super::*;
 use crate::types::{MuTransform, Population};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::DMatrix;
 use std::io::Write;
 
@@ -610,7 +612,7 @@ fn an_anchor_that_cannot_join_declines_the_group() {
 
     let additive = anchor_collision_model("1.0", "TVV1 + ETA_V1");
     assert!(
-        additive.covariate_mu_refs[0].colliding_anchors.is_empty(),
+        additive.covariate_mu_refs[0].colliding_anchors().is_empty(),
         "premise: no anchor is recorded for the additive form"
     );
     let (groups, notes) = resolve_covariate_mu_groups(
@@ -828,10 +830,10 @@ fn an_anchor_left_out_of_the_group_keeps_the_data_term() {
     let m = anchor_collision_model("-1.0", "TVV1 * exp(ETA_V1)");
     let spec = &m.covariate_mu_refs[0];
     assert!(
-        spec.read_outside_groups_and_anchors.is_empty(),
+        spec.read_outside_groups_and_anchors().is_empty(),
         "premise: the anchor-stopped walk sees no other route"
     );
-    assert_eq!(spec.colliding_anchors.len(), 1, "premise: the anchor is recorded");
+    assert_eq!(spec.colliding_anchors().len(), 1, "premise: the anchor is recorded");
     let pairs = estimator_pairs(&m);
     assert!(
         !pairs.iter().any(|&(_, e)| e == 0),
@@ -942,7 +944,7 @@ const SHARED_ETA_MODEL: &str = r"
 fn an_eta_a_second_typical_value_reads_keeps_the_data_term() {
     let shared = model(SHARED_ETA_MODEL);
     assert_eq!(shared.covariate_mu_refs.len(), 1, "the group survives");
-    assert!(shared.covariate_mu_refs[0].eta_shared, "ETA_CL is read by V as well");
+    assert!(shared.covariate_mu_refs[0].eta_shared(), "ETA_CL is read by V as well");
 
     let pop = pop_with_crcl(&CRCL_GRID);
     let free = vec![false; shared.theta_names.len()];
@@ -959,7 +961,7 @@ fn an_eta_a_second_typical_value_reads_keeps_the_data_term() {
     );
 
     let control = model(ADDITIVE_MODEL);
-    assert!(!control.covariate_mu_refs[0].eta_shared, "V has its own ETA_V there");
+    assert!(!control.covariate_mu_refs[0].eta_shared(), "V has its own ETA_V there");
     let g = only_group(&control, &pop, &diag_omega(&[0.2, 0.1]));
     assert!(!g.needs_data_term, "control still takes the exact engine");
 }

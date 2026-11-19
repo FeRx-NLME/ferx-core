@@ -12,6 +12,8 @@ use crate::stats::likelihood::{
     foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
 use crate::stats::residual_error::compute_iwres_with_correlations;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 
 pub(crate) use crate::types::is_last_estimating_stage;

@@ -3,6 +3,8 @@
 //!
 //! Every test fits one fixture twice — plans working, then every plan failing
 //! ([`FORCE_PLAN_FAIL`] on a one-worker pool) — and compares the two to a measured bound.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::parser::model_parser::rhs_regcode::ir;
 use ferx_model::parser::model_parser::rhs_regcode::ir::Func;

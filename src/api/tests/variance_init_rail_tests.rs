@@ -14,6 +14,8 @@
 //! * The `FIX` case is not a "no diagnostic" formality: `compute_bounds` pins a
 //!   fixed coordinate at `lower == upper == packed`, so `packed <= lower` is
 //!   *true* for it and only the `packed_fixed_mask` consult keeps it green.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 
@@ -709,7 +711,7 @@ fn a_one_eta_block_omega_keeps_its_own_spelling_without_the_correlation_story() 
     // not diagonal (a block exists), ETA_CL is declared in it, and yet it has no
     // free off-diagonal.
     assert!(!p.omega.diagonal, "a block declaration makes Ω non-diagonal");
-    assert!(p.omega.block_declared[0], "ETA_CL must be recorded as block-declared");
+    assert!(p.omega.block_declared()[0], "ETA_CL must be recorded as block-declared");
     let n = p.omega.dim();
     assert!(
         !(0..n).any(|k| k != 0 && p.omega.free_mask[(0, k)]),
@@ -771,7 +773,7 @@ fn a_one_eta_block_kappa_keeps_its_own_spelling() {
         .unwrap_or_else(|e| panic!("one-eta block_kappa must parse: {e}"));
     let p = &model.default_params;
     let iov = p.omega_iov.as_ref().expect("model declares IOV");
-    assert!(iov.block_declared[0], "KAPPA_CL must be recorded as block-declared");
+    assert!(iov.block_declared()[0], "KAPPA_CL must be recorded as block-declared");
 
     let diags = rails_with_default_options(p);
     assert_eq!(diags.len(), 1, "{diags:#?}");

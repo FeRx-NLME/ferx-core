@@ -3,6 +3,8 @@
 //! row listed after it (#1810), and a stacked-reset subject's later periods run on a
 //! shifted clock. Neither may change which level a record is, or what a message calls
 //! its time.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::api::validation::{check_level_index_columns, LevelDataEntry};

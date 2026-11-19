@@ -18,6 +18,8 @@
 //! test's tight override, and the bit-comparisons here would stop meaning anything. They hold
 //! because an override travels on the thread that armed it and on a pool keyed to it, never
 //! on a slot other fits can see.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;

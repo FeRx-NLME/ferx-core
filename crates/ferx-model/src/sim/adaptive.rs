@@ -799,7 +799,7 @@ impl DoseValue {
     }
 
     /// As written: the number for a literal, the source for an expression.
-    pub fn source(&self) -> String {
+    pub(crate) fn source(&self) -> String {
         match self {
             DoseValue::Literal(x) => x.to_string(),
             DoseValue::Expr(s) => s.clone(),
@@ -815,7 +815,7 @@ impl AdaptiveRule {
     /// `signal == <value>` semantics; titrating on an exact equality is unusual
     /// but it is what the rule says, not a tolerance we get to invent.
     #[allow(clippy::float_cmp)]
-    pub fn matches(&self, signal: f64) -> bool {
+    pub(crate) fn matches(&self, signal: f64) -> bool {
         match self.op {
             Comparison::Lt => signal < self.threshold,
             Comparison::Le => signal <= self.threshold,
@@ -1252,7 +1252,7 @@ pub fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), String> 
 impl AdaptiveDosingSpec {
     /// The dose plan every subject shares when every dose value is a number; `None`
     /// when one is an expression (#944).
-    pub fn literal_dose_plan(&self) -> Option<SubjectDosePlan> {
+    pub(crate) fn literal_dose_plan(&self) -> Option<SubjectDosePlan> {
         Some(SubjectDosePlan {
             start_dose: self.start_dose.as_literal()?,
             dose_bounds: (self.dose_bounds.0.as_literal()?, self.dose_bounds.1.as_literal()?),
@@ -1265,7 +1265,7 @@ impl AdaptiveDosingSpec {
 
     /// What the dose-grid checks need (#944): `None` without `round_to`, or with an
     /// invalid one, which `validate` refuses first (P3).
-    pub fn grid_rule(&self) -> Option<GridRule> {
+    pub(crate) fn grid_rule(&self) -> Option<GridRule> {
         let step = self.round_to.filter(|s| s.is_finite() && *s > 0.0)?;
         Some(GridRule { step, percent_steps: self.has_percent_steps() })
     }
@@ -1283,13 +1283,13 @@ impl AdaptiveDosingSpec {
 
     /// The dose grid of a subject whose bounds evaluate to `bounds` (#944): `None`
     /// without `round_to`. A plan that passed [`dose_plan_violation`] has one.
-    pub fn dose_grid(&self, bounds: (f64, f64)) -> Option<DoseGrid> {
+    pub(crate) fn dose_grid(&self, bounds: (f64, f64)) -> Option<DoseGrid> {
         DoseGrid::new(self.grid_rule()?.step, bounds)
     }
 
     /// The smallest `increase N%` among the rules, if any. `increase 0%` is not one:
     /// it is written to keep the dose, so a dose it leaves unchanged is no surprise.
-    pub fn smallest_increase_percent(&self) -> Option<f64> {
+    pub(crate) fn smallest_increase_percent(&self) -> Option<f64> {
         self.rules
             .iter()
             .filter_map(|r| match r.action {
@@ -1317,7 +1317,7 @@ impl AdaptiveDosingSpec {
     /// lowest reachable dose decides (`d * p / 100` grows with `d`): the placed start, or
     /// where the largest decrease stops. A dose at the aligned high bound is not reported.
     #[allow(clippy::float_cmp)] // grid doses: "unchanged" is the same multiple, bit for bit
-    pub fn absorbed_increase(&self, plan: &SubjectDosePlan) -> Option<AbsorbedIncrease> {
+    pub(crate) fn absorbed_increase(&self, plan: &SubjectDosePlan) -> Option<AbsorbedIncrease> {
         let grid = self.dose_grid(plan.dose_bounds)?;
         let p = self.smallest_increase_percent()?;
         let absorbed = |d: f64| d < grid.high && grid.step_percent(d, p, true) == d;
@@ -1339,7 +1339,7 @@ impl AdaptiveDosingSpec {
     }
 
     /// Every dose expression, with the key it is written under (#944).
-    pub fn dose_expressions(&self) -> Vec<(&'static str, &str)> {
+    pub(crate) fn dose_expressions(&self) -> Vec<(&'static str, &str)> {
         let levels = self.levels.iter().flatten().map(|v| ("levels", v));
         [
             ("start_dose", &self.start_dose),

@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::parser::model_parser::IndivParamPartials;
 use ferx_model::parser::model_parser::ThetaBlocks;
@@ -3911,6 +3913,8 @@ mod kappa_correlation_auto_route {
     use crate::estimation::outer_policy::resolve_outer_optimizer;
     use crate::sens::provider::analytic_outer_gradient_in_scope;
     use crate::types::{Optimizer, BOBYQA_MAX_DIM};
+    #[allow(unused_imports)]
+    use ferx_model::internal::*;
 
     /// A one-level compartment-free model, optionally with a kappa, a
     /// `correlation car1(RHO) by ARMID` line, and `extra` unreferenced θ.

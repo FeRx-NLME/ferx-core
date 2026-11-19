@@ -1,5 +1,7 @@
 //! A fit lowers an `SS=1` dose into a `zero_order()` window once, where it binds the data,
 //! not by a clone of the subject in every walk (#2786 review).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::types::DoseEvent;
 use ferx_model::types::Subject;

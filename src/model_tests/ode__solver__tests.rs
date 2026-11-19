@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::sens::num::NonRecRead;
 use ferx_model::sens::num::PkNum;

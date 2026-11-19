@@ -10,6 +10,8 @@
 //! propensity-matched pool's η, κ), `simulate_adaptive` (η, κ, and the verifier's κ
 //! re-draw) and the NPDE reference (η, κ). Each was killed by pointing that one site
 //! back at `.chol`; the PR body lists which test died for which site.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -141,7 +143,7 @@ fn assert_rows_bit_equal(
 #[test]
 fn positive_definite_omega_draws_from_chol_unchanged() {
     let om = OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["A".into(), "B".into()]);
-    assert!(om.sim_chol.is_none());
+    assert!(om.sim_chol().is_none());
     let f = om.sim_draw_factor(Some(&om), &[true, true]);
     assert!(std::ptr::eq(&*f, &om.chol), "a PD Ω must borrow `chol`, not rebuild it");
 }
@@ -182,7 +184,7 @@ fn indefinite_omega_without_a_zero_row_keeps_drawing_from_chol() {
     // so the draw falls back to the regularised `chol` as before.
     let m = DMatrix::from_row_slice(2, 2, &[0.0, 0.01, 0.01, 0.09]);
     let om = OmegaMatrix::from_matrix(m, vec!["A".into(), "B".into()], false);
-    assert!(om.sim_chol.is_none());
+    assert!(om.sim_chol().is_none());
     assert!(std::ptr::eq(&*om.sim_draw_factor(None, &[]), &om.chol));
 }
 
@@ -209,7 +211,7 @@ fn a_fit_carried_fix_zero_is_recovered_from_the_declaration() {
 
     // (a) through the fit's own pack/unpack: `from_chol_factor`, no `sim_chol`.
     let fitted = unpack_params(&pack_params(declared), declared);
-    assert!(fitted.omega.sim_chol.is_none());
+    assert!(fitted.omega.sim_chol().is_none());
     assert!(fitted.omega.matrix[(0, 0)] > 0.0, "the fit carries the floor, not 0");
     // How far the unpack path lands from the floor: `exp(ln 1e-4)²` is 10 ULP above 1e-8
     // (measured, macOS arm64 and Linux aarch64). `SIM_ZERO_RECOVERY_CEILING` (2e-8) clears

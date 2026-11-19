@@ -4,6 +4,8 @@
 //! trailing doses as `fit()` now runs it, the same dataset with the view switched off
 //! (`SCORE_ALL_RECORDS`, what `fit()` did before), and the dataset with those rows deleted.
 //! The structural tests pin the horizon itself, one record kind at a time.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::api::fit;

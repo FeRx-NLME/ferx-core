@@ -117,7 +117,7 @@ impl<const N: usize> Dual2<N> {
     }
 
     /// Bit-for-bit equality of the value and every jet entry.
-    pub fn same_bits(&self, o: &Self) -> bool {
+    pub(crate) fn same_bits(&self, o: &Self) -> bool {
         self.value.to_bits() == o.value.to_bits()
             && self.grad.iter().zip(&o.grad).all(|(a, b)| a.to_bits() == b.to_bits())
             && self

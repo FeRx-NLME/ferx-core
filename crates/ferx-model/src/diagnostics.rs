@@ -497,7 +497,7 @@ pub struct EngineError {
 
 impl EngineError {
     /// An error carrying `d`, whose message is `d.message`.
-    pub fn from_diagnostic(d: Diagnostic) -> Self {
+    pub(crate) fn from_diagnostic(d: Diagnostic) -> Self {
         EngineError {
             message: d.message.clone(),
             diagnostic: Some(d),
@@ -510,14 +510,14 @@ impl EngineError {
     /// rather than `d.message`: for a refusal whose historical text the diagnostic
     /// rewords (`ferx check` renders `block:line` beside a parse error's message, so its
     /// diagnostic drops the ` (line N)` the raw text carries; #2062 review B1).
-    pub fn from_diagnostic_keeping_text(d: Diagnostic, message: String) -> Self {
+    pub(crate) fn from_diagnostic_keeping_text(d: Diagnostic, message: String) -> Self {
         EngineError { message, ..EngineError::from_diagnostic(d) }
     }
 
     /// An error carrying `d` whose `Display` folds the suggestion in after the
     /// message, capitalised and closed with a full stop — for a refusal whose
     /// historical text read that way. [`message`](Self::message) stays `d.message`.
-    pub fn with_suggestion_in_display(d: Diagnostic) -> Self {
+    pub(crate) fn with_suggestion_in_display(d: Diagnostic) -> Self {
         EngineError { suggestion_in_display: true, ..EngineError::from_diagnostic(d) }
     }
 
@@ -529,7 +529,7 @@ impl EngineError {
     /// There is deliberately no `From<String>` (#1775): a `?` on a `String`
     /// helper would otherwise drop a code silently. Every call site is listed in
     /// `UNCODED_SITES` (the test module below) with its reason.
-    pub fn uncoded(message: impl Into<String>) -> Self {
+    pub(crate) fn uncoded(message: impl Into<String>) -> Self {
         EngineError {
             diagnostic: None,
             message: message.into(),
@@ -539,7 +539,7 @@ impl EngineError {
     }
 
     /// This error, attributed to the entry point `context` (e.g. `"run_sir"`).
-    pub fn in_context(mut self, context: impl Into<String>) -> Self {
+    pub(crate) fn in_context(mut self, context: impl Into<String>) -> Self {
         self.context = Some(context.into());
         self
     }

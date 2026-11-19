@@ -16,6 +16,7 @@ pub mod edit;
 pub mod entry_refusals;
 pub mod environment;
 pub mod estimation;
+pub mod internal;
 pub mod io;
 pub mod levels;
 #[cfg(feature = "markov")]

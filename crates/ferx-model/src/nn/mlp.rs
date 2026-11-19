@@ -403,7 +403,7 @@ impl MlpMapper {
     /// accumulates whatever derivative pieces `sink` asks for. The gradient is
     /// `2·lambda·wᵢ` on weight entries; the Hessian is exact, `2·lambda` on the
     /// weight diagonal and nothing on biases. `lambda == 0.0` touches nothing.
-    pub fn l2_weight_penalty_accum(
+    pub(crate) fn l2_weight_penalty_accum(
         &self, weights: &[f64], lambda: f64, sink: &mut PenaltySink<'_>,
     ) -> f64 {
         if lambda == 0.0 {
@@ -464,7 +464,7 @@ impl MlpMapper {
     /// `2·lambda·Σ (∂C/∂w)(∂C/∂w)ᵀ`, dropping `C·∂²C/∂w²`: positive semi-definite by construction and
     /// exact at `C = 0`, the flat map the penalty pulls toward (the regime a trust-region / BHHH consumer
     /// needs). `lambda == 0.0` or an empty grid touches nothing.
-    pub fn curvature_penalty_accum(
+    pub(crate) fn curvature_penalty_accum(
         &self, weights: &[f64], grid: &CurvatureGrid, lambda: f64, sink: &mut PenaltySink<'_>,
     ) -> f64 {
         if lambda == 0.0 || grid.is_empty() {

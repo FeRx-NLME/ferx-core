@@ -7,6 +7,8 @@
 //! sentence of its text, and the models it stays silent on.
 use super::*;
 use crate::types::WarningCode;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::DVector;
 use std::collections::HashMap;
 
@@ -364,7 +366,7 @@ fn an_evid4_row_is_one_record_and_a_cotimed_evid3_row_is_another() {
     let model = parse(LINEAR_AGE_SRC);
     // EVID=4 at TIME 0: the dose and its reset twin, same row, AGE 200 everywhere.
     let mut s1 = subject("S1", [200.0; 4]);
-    s1.doses[0].evid4 = true;
+    *s1.doses[0].evid4_mut() = true;
     s1.reset_times = vec![0.0];
     s1.reset_covariates = vec![age(200.0)];
     let (msg, entry) = degenerate_cl_v_warning(

@@ -20,6 +20,8 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_region_subproblem};
 use crate::stats::likelihood::{chol_log_det, compute_r_tilde, is_usable_subject_nll};
 use crate::types::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 
 /// The #1006 post-fit warning carried by a **pure** Gauss-Newton run that ends

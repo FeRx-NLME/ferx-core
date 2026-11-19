@@ -248,11 +248,11 @@ pub struct DoseEvent {
     /// is what tells it apart from a separate `EVID=3` row co-timed with a dose, which the
     /// engines treat identically but which is a second data record (#2104's warning counts
     /// records). Crate-private, like `cmt`, so it widens no public API.
-    pub evid4: bool,
+    pub(crate) evid4: bool,
     /// `Some` for a dose an `ADDL` cell implies rather than a dose record (#1909), which
     /// NONMEM gives no `$PK` call of its own; see [`ImpliedDose`]. Set only by the reader,
     /// so a dose built in memory is a record, as before. Crate-private, like `evid4`.
-    pub implied: Option<ImpliedDose>,
+    pub(crate) implied: Option<ImpliedDose>,
     /// The time this dose's input stops because its compartment was turned off (#2732),
     /// `+∞` when it never does: the first `EVID=2`, `CMT=-N` row on its compartment after
     /// its record, or after its parent's for an `ADDL`-implied dose. NONMEM cancels the
@@ -263,7 +263,7 @@ pub struct DoseEvent {
     /// state walk takes from `Subject::with_cmt_cutoffs` carries a finite one, derived from
     /// `Subject::cmt_toggles`, so no edit to those rows can leave it stale. Crate-private,
     /// like `evid4`.
-    pub off_at: f64,
+    pub(crate) off_at: f64,
 }
 
 /// One compartment on/off record (#2732): an `EVID=2` row with `CMT=N` (on) or `CMT=-N`
@@ -435,7 +435,7 @@ impl DoseEvent {
     /// a transient `D ≤ 0` from turning `amt / D` into a non-finite rate. A
     /// **non-finite** `D` is not clamped here — it repels the subject
     /// ([`Self::non_finite`], #1284).
-    pub const DURATION_FLOOR: f64 = 1e-8;
+    pub(crate) const DURATION_FLOOR: f64 = 1e-8;
 
     /// Domain floor for a modeled infusion `rate` (`RATE = -1` → `R{cmt}`), the
     /// mirror of [`Self::DURATION_FLOOR`]. A transient `R ≤ 0` mid-search would
@@ -444,7 +444,7 @@ impl DoseEvent {
     /// duration) without perturbing a converged fit, whose optimum is interior.
     /// A **non-finite** `R` is not clamped here — it repels the subject
     /// ([`Self::non_finite`], #1284).
-    pub const RATE_FLOOR: f64 = 1e-8;
+    pub(crate) const RATE_FLOOR: f64 = 1e-8;
 
     /// The resolved dose for a modeled `D{n}` / `R{n}` that came back
     /// **non-finite** — the out-of-domain outcome, not a clamped one (#1284).
@@ -511,7 +511,7 @@ impl DoseEvent {
     /// `R ≤ 0` to [`Self::RATE_FLOOR`]. A **non-finite** `D`/`R` is a different
     /// case and gets a different answer — [`Self::non_finite`] (#1284), not the
     /// floor.
-    pub fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
+    pub(crate) fn resolve_rate(&self, attr_map: &DoseAttrMap, params: &[f64]) -> DoseEvent {
         match self.rate_mode {
             RateMode::Fixed => self.clone(),
             RateMode::ModeledDuration => {
@@ -591,7 +591,7 @@ impl DoseEvent {
     /// Write `CMT=0` as the compartment 1 it means. For a dose rewritten into an infusion
     /// ([`crate::dosing::lower_zero_order_ss`]): a `CMT=0` infusion has no rate channel, so the
     /// lowered dose names its compartment.
-    pub fn resolve_default_cmt(&mut self) {
+    pub(crate) fn resolve_default_cmt(&mut self) {
         self.cmt = self.cmt.max(1);
     }
 
@@ -608,7 +608,7 @@ impl DoseEvent {
     /// closes), so it is kept off the public surface where adversarial review does
     /// not reach. The public read API is the two *resolved* accessors above.
     #[inline]
-    pub fn cmt_raw(&self) -> usize {
+    pub(crate) fn cmt_raw(&self) -> usize {
         self.cmt
     }
 
@@ -644,7 +644,7 @@ impl DoseEvent {
     /// post-multiply, so it declines a rate-defined infusion under `F ≠ 1` (which
     /// reshapes rather than scales) to the FD gradient. At `F = 1` both arms are
     /// the no-op identity, so every infusion is unchanged.
-    pub fn bioavailable_infusion(&self, f_bio: f64) -> (f64, f64) {
+    pub(crate) fn bioavailable_infusion(&self, f_bio: f64) -> (f64, f64) {
         match self.infusion_def {
             InfusionDef::RateDefined => (self.rate, f_bio * self.duration),
             InfusionDef::DurationDefined => (f_bio * self.rate, self.duration),
@@ -655,7 +655,7 @@ impl DoseEvent {
     /// bioavailable pair from [`Self::bioavailable_infusion`]. Lets the analytical
     /// superposition closed forms (which read `dose.rate`/`dose.duration`) consume
     /// the `F`-reshaped infusion without an extra post-multiply (#419).
-    pub fn with_bioavailable_infusion(&self, f_bio: f64) -> DoseEvent {
+    pub(crate) fn with_bioavailable_infusion(&self, f_bio: f64) -> DoseEvent {
         let (rate, duration) = self.bioavailable_infusion(f_bio);
         DoseEvent { rate, duration, ..self.clone() }
     }
@@ -668,7 +668,7 @@ impl DoseEvent {
     /// [`Self::new`], which would recompute `duration = amt/rate` and drop `F` (#419). Lives
     /// here because it constructs a `DoseEvent` by functional update, which the private `cmt`
     /// field forbids outside this module (#912).
-    pub fn ss_cycle_doses(&self) -> Vec<DoseEvent> {
+    pub(crate) fn ss_cycle_doses(&self) -> Vec<DoseEvent> {
         let (m, r) = crate::dosing::ss_overlap_split_g(self.duration, self.ii);
         let at = |rate: f64, duration: f64| DoseEvent {
             time: 0.0,
@@ -921,7 +921,7 @@ impl DoseAttr {
     /// Single source of truth for the "computed but never used" census and the
     /// `edit` layer's declaration pruner, which must agree: a name the census
     /// calls load-bearing and the pruner deletes is how #2789 lost `D1`.
-    pub fn is_read_by_name(name: &str, is_ode: bool) -> bool {
+    pub(crate) fn is_read_by_name(name: &str, is_ode: bool) -> bool {
         match Self::from_indexed_name(name) {
             Some((DoseAttr::Duration | DoseAttr::Rate, _)) => true,
             Some((DoseAttr::F | DoseAttr::Lag, _)) => is_ode,
@@ -1052,24 +1052,26 @@ impl DoseAttrMap {
     /// `lag=` slot when it is the **only** lag the compartment's doses carry (no `ALAG{c}`, no
     /// bare `lagtime`): a dose lowered to an infusion reads it as the dose's lag
     /// ([`Self::lagtime_for_dose`]); the forcing keeps it for every other dose.
-    pub fn set_zero_order(&mut self, cmt: usize, slot: usize, route_lag_slot: Option<usize>) {
+    pub(crate) fn set_zero_order(
+        &mut self, cmt: usize, slot: usize, route_lag_slot: Option<usize>,
+    ) {
         self.zero_order.insert(cmt, (slot, route_lag_slot));
     }
 
     /// The `dur` slot of the sole zero-order forcing feeding 1-based `cmt`, if it has exactly
     /// that ([`Self::set_zero_order`]).
-    pub fn zero_order_slot(&self, cmt: usize) -> Option<usize> {
+    pub(crate) fn zero_order_slot(&self, cmt: usize) -> Option<usize> {
         self.zero_order.get(&cmt.max(1)).map(|z| z.0)
     }
 
     /// The per-route lag slot a dose lowered from 1-based pure zero-order `cmt` carries as its
     /// own lag ([`Self::set_zero_order`]), if there is one.
-    pub fn lowered_route_lag_slot(&self, cmt: usize) -> Option<usize> {
+    pub(crate) fn lowered_route_lag_slot(&self, cmt: usize) -> Option<usize> {
         self.zero_order.get(&cmt.max(1)).and_then(|z| z.1)
     }
 
     /// Whether some pure zero-order compartment hands its route lag to its lowered doses.
-    pub fn has_lowered_route_lag(&self) -> bool {
+    pub(crate) fn has_lowered_route_lag(&self) -> bool {
         self.zero_order.values().any(|z| z.1.is_some())
     }
 
@@ -1088,12 +1090,12 @@ impl DoseAttrMap {
     /// [`Self::lag_slot`] for the dose `d`: a dose lowered from a route-lagged zero-order
     /// compartment lags by the route's `lag=` slot (its lag now lives on the dose); every other
     /// dose by its compartment's lag. The one reader every dose-lag consumer goes through.
-    pub fn lag_slot_for_dose(&self, d: &DoseEvent) -> usize {
+    pub(crate) fn lag_slot_for_dose(&self, d: &DoseEvent) -> usize {
         self.lowered_dose_lag_slot(d).unwrap_or_else(|| self.lag_slot(d.cmt_raw()))
     }
 
     /// [`Self::lagtime`] for the dose `d` ([`Self::lag_slot_for_dose`]).
-    pub fn lagtime_for_dose(&self, d: &DoseEvent, params: &[f64]) -> f64 {
+    pub(crate) fn lagtime_for_dose(&self, d: &DoseEvent, params: &[f64]) -> f64 {
         match self.lowered_dose_lag_slot(d) {
             Some(slot) => params.get(slot).copied().unwrap_or(0.0),
             None => self.lagtime(d.cmt_raw(), params),
@@ -1101,7 +1103,7 @@ impl DoseAttrMap {
     }
 
     /// Whether any compartment is a pure zero-order one.
-    pub fn has_zero_order(&self) -> bool {
+    pub(crate) fn has_zero_order(&self) -> bool {
         !self.zero_order.is_empty()
     }
 
@@ -1214,7 +1216,7 @@ impl PkParams {
     ///   infusion, `F ≠ 1`) to the FD gradient.
     ///
     /// A change to either rule must be mirrored in those sites.
-    pub fn bioavailable_amount(&self, amount: f64) -> f64 {
+    pub(crate) fn bioavailable_amount(&self, amount: f64) -> f64 {
         self.f_bio() * amount
     }
     pub fn q3(&self) -> f64 {
@@ -1539,7 +1541,7 @@ impl Subject {
     /// read. Borrowed for a subject with no on/off row. The copy is the cost of keeping the
     /// cutoffs off the stored subject, paid only by subjects with such a row, and small
     /// against the solve it precedes.
-    pub fn with_cmt_cutoffs(&self) -> std::borrow::Cow<'_, Subject> {
+    pub(crate) fn with_cmt_cutoffs(&self) -> std::borrow::Cow<'_, Subject> {
         use std::borrow::Cow;
         if self.cmt_toggles.is_empty() {
             return Cow::Borrowed(self);
@@ -1555,7 +1557,7 @@ impl Subject {
     /// `DoseEvent::off_at` for a dose an adaptive controller decided at `t` into state
     /// `cmt_idx` (#2753): see [`CoTimedOff::After`]. The driver sets it at injection and the
     /// frozen replay on each ledger dose, so the two cut the same input at the same row.
-    pub fn controller_dose_off_at(&self, t: f64, cmt_idx: usize) -> f64 {
+    pub(crate) fn controller_dose_off_at(&self, t: f64, cmt_idx: usize) -> f64 {
         cmt_off_time(t, cmt_idx, &self.cmt_toggles, &self.pk_only_times, CoTimedOff::After)
     }
 
@@ -1635,7 +1637,7 @@ impl Subject {
     /// record. Not the subject-static `covariates` map. The one list of record kinds for
     /// the covariate presence check (`population_carries`, #2671), so a kind cannot be
     /// left out of one caller and kept in another.
-    pub fn record_maps(&self) -> impl Iterator<Item = &HashMap<String, f64>> {
+    pub(crate) fn record_maps(&self) -> impl Iterator<Item = &HashMap<String, f64>> {
         self.obs_covariates
             .iter()
             .chain(&self.dose_covariates)
@@ -1657,7 +1659,7 @@ impl Subject {
     /// two for one scored transition. Measured on the
     /// Gaussian observations alone, a binary-only or time-to-event-only subject counted as
     /// having none, so its unconverged EBE was never counted and never warned about.
-    pub fn n_scored_rows(&self) -> usize {
+    pub(crate) fn n_scored_rows(&self) -> usize {
         self.observations.len() + self.obs_records.len()
     }
 
@@ -1675,7 +1677,7 @@ impl Subject {
     /// refuses such a subject when a predictor covariate varies, so `None` only ever stands
     /// for "the baseline is exact". Shared by the binary predictor (#2562) and the DTMM
     /// probabilities (#2473).
-    pub fn record_covariate_snapshots(&self) -> Option<&[HashMap<String, f64>]> {
+    pub(crate) fn record_covariate_snapshots(&self) -> Option<&[HashMap<String, f64>]> {
         let snaps = &self.endpoint_covariates;
         let aligned =
             !snaps.is_empty() && snaps.len() == self.obs_records.len() && !self.has_event_records();
@@ -1684,7 +1686,7 @@ impl Subject {
 
     /// Whether any of [`Self::obs_records`] is a time-to-event record, the one kind a data
     /// row can yield zero or two of.
-    pub fn has_event_records(&self) -> bool {
+    pub(crate) fn has_event_records(&self) -> bool {
         #[cfg(feature = "survival")]
         {
             self.obs_records.iter().any(|r| matches!(r, ObsRecord::Event { .. }))
@@ -1699,7 +1701,7 @@ impl Subject {
     /// snapshots aligned (#2562): when [`Self::record_covariate_snapshots`] lines up with
     /// the records, a dropped record drops its snapshot too.
     #[cfg(feature = "survival")]
-    pub fn retain_records(&mut self, mut keep: impl FnMut(&mut ObsRecord) -> bool) {
+    pub(crate) fn retain_records(&mut self, mut keep: impl FnMut(&mut ObsRecord) -> bool) {
         let aligned = self.record_covariate_snapshots().is_some();
         let mut kept: Vec<bool> = Vec::with_capacity(self.obs_records.len());
         self.obs_records.retain_mut(|rec| {
@@ -1753,14 +1755,14 @@ impl Subject {
     /// `j`: the TIME as written, as NONMEM's `$PK` sees it (#1969). The same value as
     /// [`Subject::readout_time`]; the engines keep ordering and integrating on
     /// `obs_times`.
-    pub fn param_time_obs(&self, j: usize) -> f64 {
+    pub(crate) fn param_time_obs(&self, j: usize) -> f64 {
         self.readout_time(j)
     }
 
     /// The `TIME` `[individual_parameters]` reads at pk-only record `m` (EVID=2 or
     /// EVID=0/MDV=1): [`Subject::pk_only_raw_times`], falling back to the engine
     /// clock `pk_only_times` for an in-memory subject (#1969).
-    pub fn param_time_pk_only(&self, m: usize) -> f64 {
+    pub(crate) fn param_time_pk_only(&self, m: usize) -> f64 {
         written_time(&self.pk_only_times, &self.pk_only_raw_times, m)
     }
 
@@ -1770,7 +1772,7 @@ impl Subject {
     /// (a dose the adaptive engine appended, a decision time) takes the offset of the
     /// latest row at or before it. Before the first shifted row, and for a subject
     /// with none, the engine clock is the written clock.
-    pub fn param_time_at(&self, engine_t: f64) -> f64 {
+    pub(crate) fn param_time_at(&self, engine_t: f64) -> f64 {
         period_written_time(&self.reset_period_times, engine_t)
     }
 
@@ -1778,7 +1780,7 @@ impl Subject {
     /// ([`Self::param_time_at`]), or for an `ADDL`-implied dose the governing record's
     /// (#1909, [`ImpliedDose`]). The parent's, for an implied dose's lag, is this at
     /// [`Self::implied_dose_parent`].
-    pub fn dose_param_time(&self, k: usize) -> f64 {
+    pub(crate) fn dose_param_time(&self, k: usize) -> f64 {
         let d = &self.doses[k];
         match d.implied {
             Some(i) => i.param_time,
@@ -1789,7 +1791,7 @@ impl Subject {
     /// The engine time whose occasion (decision window) dose `k` runs under on the adaptive
     /// path: its own, or for an `ADDL`-implied dose the governing record's (#2371,
     /// [`ImpliedDose::gov_time`]), as [`Self::dose_param_time`] reads that record's `TIME`.
-    pub fn dose_occasion_time(&self, k: usize) -> f64 {
+    pub(crate) fn dose_occasion_time(&self, k: usize) -> f64 {
         let d = &self.doses[k];
         d.implied.map_or(d.time, |i| i.gov_time)
     }
@@ -1797,13 +1799,13 @@ impl Subject {
     /// The explicit dose whose `ADDL` implies dose `k` (#1909), whose `$PK` gives `k`
     /// its lag. `None` for a dose record, and for an index that does not name an
     /// earlier explicit dose, which only a dose list edited after the read can hold.
-    pub fn implied_dose_parent(&self, k: usize) -> Option<usize> {
+    pub(crate) fn implied_dose_parent(&self, k: usize) -> Option<usize> {
         let p = self.doses.get(k)?.implied?.parent;
         (p < k && self.doses[p].implied.is_none()).then_some(p)
     }
 
     /// Whether observations `j` and `k` are one instant: see [`same_instant`].
-    pub fn same_instant(&self, j: usize, k: usize) -> bool {
+    pub(crate) fn same_instant(&self, j: usize, k: usize) -> bool {
         same_instant(&self.obs_times, j, k)
     }
 
@@ -1849,7 +1851,7 @@ impl Subject {
     /// observation's time it is that observation's value, bit for bit. Never `NaN`
     /// for a finite `obs_t`: with no dose at or before it, the time since the
     /// earliest record ahead of the first dose, `obs_t` itself counted.
-    pub fn time_after_dose_at(&self, obs_t: f64) -> f64 {
+    pub(crate) fn time_after_dose_at(&self, obs_t: f64) -> f64 {
         let strict = self.data_tad_at(obs_t, false);
         if strict.is_finite() {
             return strict;
@@ -1892,7 +1894,7 @@ impl Subject {
     /// `api/output_columns.rs`. Steady-state aware, no lag time, `NaN` before
     /// the first dose. See [`Self::time_after_dose`] for why the `TAD`
     /// built-in reads the same-time trough differently.
-    pub fn time_after_dose_at_or_before(&self, j: usize) -> f64 {
+    pub(crate) fn time_after_dose_at_or_before(&self, j: usize) -> f64 {
         match self.obs_times.get(j) {
             Some(&obs_t) => self.data_tad_at(obs_t, true),
             None => f64::NAN,
@@ -2632,7 +2634,7 @@ pub struct OmegaMatrix {
     /// numbers, not a declaration, so there is no spelling to preserve.
     /// `pub(crate)` on purpose: it is a diagnostic-wording aid, not public API,
     /// and nothing outside the crate builds an `OmegaMatrix` by struct literal.
-    pub block_declared: Vec<bool>,
+    pub(crate) block_declared: Vec<bool>,
     /// The factor a **simulation** draws η from, when it differs from `chol`
     /// (#1605). `None` means "draw from `chol`", which is every positive-definite
     /// input.
@@ -2651,7 +2653,7 @@ pub struct OmegaMatrix {
     /// where a zero carried by a fit's `1e-8` (which has no `sim_chol`) is
     /// recovered from the declaration. `pub(crate)` for the same reason as
     /// `block_declared`.
-    pub sim_chol: Option<DMatrix<f64>>,
+    pub(crate) sim_chol: Option<DMatrix<f64>>,
     /// Pre-computed Ω⁻¹. Cached at construction so per-call code paths
     /// (`individual_nll_into`, SAEM MH proposals) don't have to clone the
     /// matrix, run Cholesky, and invert on every evaluation.
@@ -2716,7 +2718,7 @@ impl OmegaMatrix {
     /// has seen the declaration. A length that disagrees with the matrix
     /// dimension is ignored rather than panicking, since the field only steers
     /// how a diagnostic is worded.
-    pub fn with_block_declared(mut self, block_declared: Vec<bool>) -> Self {
+    pub(crate) fn with_block_declared(mut self, block_declared: Vec<bool>) -> Self {
         if block_declared.len() == self.dim() {
             self.block_declared = block_declared;
         }
@@ -2804,7 +2806,7 @@ impl OmegaMatrix {
     /// Per η: is it a structural zero of the matrix this was built from — a
     /// declared `~ 0.0`, diagonal and whole row/column exactly `0` (#1605)?
     /// All-`false` for a positive-definite input and for one built from a factor.
-    pub fn structural_zeros(&self) -> Vec<bool> {
+    pub(crate) fn structural_zeros(&self) -> Vec<bool> {
         let n = self.dim();
         match &self.sim_chol {
             Some(l) => (0..n).map(|i| l.row(i).iter().all(|&x| x == 0.0)).collect(),
@@ -3203,10 +3205,10 @@ pub struct MixingExpr {
     /// `p(k) = …` (probability, must lie in (0,1) and is renormalized).
     pub is_logit: bool,
     /// Mixing expression over theta + covariates. Parser-private AST.
-    pub expr: crate::parser::model_parser::Expression,
+    pub(crate) expr: crate::parser::model_parser::Expression,
     /// The same expression compiled once, at parse, to the θ-only program the exact mixing
     /// gradient evaluates on its tape (`mixing_logp_grad_exact`).
-    pub program: crate::parser::model_parser::RuvMagDerivProgram,
+    pub(crate) program: crate::parser::model_parser::RuvMagDerivProgram,
 }
 
 /// A per-class Omega/Sigma override declared in a `[mixture]` block via
@@ -3355,7 +3357,7 @@ impl PkModel {
     /// aliases satisfy the same requirement. The display names mirror the
     /// "Required Parameters" table in `docs/model-file/structural-model.qmd`;
     /// the parser enforces what that table documents (issue #309).
-    pub fn required_pk_params(&self) -> &'static [(usize, &'static str)] {
+    pub(crate) fn required_pk_params(&self) -> &'static [(usize, &'static str)] {
         match self {
             PkModel::OneCptIv => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v")],
             PkModel::OneCptOral => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_KA, "ka")],
@@ -3418,7 +3420,7 @@ impl PkModel {
     /// `parse_structural_model` (which additionally accepts the long-form
     /// aliases, so the two can't be a single bidirectional table);
     /// `canonical_name_round_trips_through_parser` guards them against drift.
-    pub fn canonical_name(&self) -> &'static str {
+    pub(crate) fn canonical_name(&self) -> &'static str {
         match self {
             PkModel::OneCptIv => "one_cpt_iv",
             PkModel::OneCptOral => "one_cpt_oral",
@@ -3448,7 +3450,7 @@ impl PkModel {
     /// (they have no walk, and reroute an infusion to their ODE twin). A
     /// `D{cmt}` outside this set is rejected at parse time rather than silently
     /// mis-routed (no-TV path) or panicking (event-driven path).
-    pub fn infusable_compartments(&self) -> &'static [usize] {
+    pub(crate) fn infusable_compartments(&self) -> &'static [usize] {
         self.topology().infusable_compartments()
     }
 
@@ -3462,7 +3464,7 @@ impl PkModel {
     /// accepted aliases can't drift between the two paths. The inverse of
     /// `canonical_name` (which omits the aliases); `from_name_round_trips_and_accepts_aliases`
     /// and `canonical_name_round_trips_through_parser` pin them together.
-    pub fn from_name(name: &str) -> Option<PkModel> {
+    pub(crate) fn from_name(name: &str) -> Option<PkModel> {
         match name {
             "one_cpt_iv" | "one_compartment_iv" => Some(PkModel::OneCptIv),
             "one_cpt_oral" | "one_compartment_oral" => Some(PkModel::OneCptOral),
@@ -3486,7 +3488,7 @@ impl PkModel {
     /// transit reads `n`/`mtt`; which slots a model actually consumes is
     /// [`PkModel::consumes_pk_slot`] via [`PkModel::required_pk_params`], not this
     /// predicate). (`f` is read by every model since #327 — it scales IV doses too.)
-    pub fn is_oral(&self) -> bool {
+    pub(crate) fn is_oral(&self) -> bool {
         matches!(
             self,
             PkModel::OneCptOral
@@ -3511,7 +3513,7 @@ impl PkModel {
     ///     infusion, and oral depot — scaling the bioavailable amount/rate
     ///     (#327). Both the superposition and event-driven analytical paths read
     ///     it for every model, IV included, so it is never inert.
-    pub fn consumes_pk_slot(&self, slot: usize) -> bool {
+    pub(crate) fn consumes_pk_slot(&self, slot: usize) -> bool {
         slot == PK_IDX_LAGTIME
             || slot == PK_IDX_F
             || self.required_pk_params().iter().any(|(s, _)| *s == slot)
@@ -3787,13 +3789,13 @@ pub struct RuvMagnitude {
     /// [`Subject::time_after_dose`] is an `O(n_doses)` scan per observation,
     /// so the scan runs only when an expression can see the result. Set by
     /// the parser; `false` for every model built before this field existed.
-    pub uses_tad: bool,
+    pub(crate) uses_tad: bool,
     /// Per-endpoint magnitudes of a `CMT=N:` or `if/else` block (#2731), keyed as
     /// [`ErrorSpec::obs_key`] keys the row: the data `CMT` for `PerCmt`, the branch
     /// index for `Selected`. An endpoint with only bare sigmas has no entry, and its
     /// rows read `per_sigma`, which such a block leaves all `None`. Empty for a
     /// single-endpoint block.
-    pub per_endpoint: HashMap<usize, EndpointMagnitude>,
+    pub(crate) per_endpoint: HashMap<usize, EndpointMagnitude>,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
@@ -3830,7 +3832,7 @@ impl RuvMagnitude {
     /// Whether the magnitude is keyed by endpoint, a `CMT=N:` or `if/else` block
     /// (#2731). [`eval_obs`](Self::eval_obs) cannot see such a magnitude: it has no
     /// endpoint to look up.
-    pub fn has_endpoint_magnitude(&self) -> bool {
+    pub(crate) fn has_endpoint_magnitude(&self) -> bool {
         !self.per_endpoint.is_empty()
     }
 
@@ -3858,7 +3860,7 @@ impl RuvMagnitude {
     /// `TAD`. A magnitude reads `(θ, covariates, TIME, TAD)` and nothing else, so it
     /// needs no observation row: the adaptive controller's assay evaluates it at a
     /// decision (#2741), and [`eval_subject_obs`](Self::eval_subject_obs) at a data row.
-    pub fn eval_key(
+    pub(crate) fn eval_key(
         &self, key: usize, theta: &[f64], covariates: &HashMap<String, f64>, time: f64, tad: f64,
     ) -> Vec<f64> {
         self.eval_row(self.fns_for_key(key), theta, covariates, time, tad)
@@ -3873,7 +3875,7 @@ impl RuvMagnitude {
     /// The `TAD` value to feed [`eval_obs`](Self::eval_obs) for observation
     /// `j` of `subject`: the data TAD when an expression reads it, else a
     /// placeholder that skips the per-dose scan (`uses_tad`).
-    pub fn tad_for(&self, subject: &Subject, j: usize) -> f64 {
+    pub(crate) fn tad_for(&self, subject: &Subject, j: usize) -> f64 {
         if self.uses_tad {
             subject.time_after_dose(j)
         } else {
@@ -3898,7 +3900,7 @@ impl RuvMagnitude {
 
     /// [`eval_obs`](Self::eval_obs) of observation `j` of `subject`, on the magnitude
     /// programs of the endpoint it resolves to under `spec`.
-    pub fn eval_subject_obs(
+    pub(crate) fn eval_subject_obs(
         &self, spec: &ErrorSpec, subject: &Subject, j: usize, theta: &[f64],
     ) -> Vec<f64> {
         // The key is resolved only for a block with endpoint magnitudes: a `Selected`
@@ -4129,7 +4131,7 @@ impl AnalyticReadout {
     /// silently feeding a zero depot into the readout (issue #650 review). A
     /// readout that only reads `central` is unaffected (the central concentration
     /// is already reset-correct).
-    pub fn references_depot(&self) -> bool {
+    pub(crate) fn references_depot(&self) -> bool {
         if self.state_names.first().map(String::as_str) != Some("depot") {
             return false;
         }
@@ -4444,7 +4446,7 @@ pub struct CovariateMuRef {
     /// frozen, a theta read only by the members no longer reaches the data
     /// (#1620). A theta listed here keeps the observation term whatever the
     /// grouping.
-    pub read_outside_groups: Vec<String>,
+    pub(crate) read_outside_groups: Vec<String>,
     /// Whether a right-hand side other than this group's own typical value also
     /// reads [`Self::eta_name`].
     ///
@@ -4454,7 +4456,7 @@ pub struct CovariateMuRef {
     /// value is the eta's *only* consumer. Like such a theta it does not drop
     /// the group — it forces the prior-plus-data engine, which evaluates the
     /// observation term with the shift applied.
-    pub eta_shared: bool,
+    pub(crate) eta_shared: bool,
     /// [`Self::read_outside_groups`] with the taint also stopped at every
     /// recorded **single-anchor** statement (`V2 = TVV2 * exp(ETA_V2)`, see
     /// [`Self::colliding_anchors`]).
@@ -4463,18 +4465,18 @@ pub struct CovariateMuRef {
     /// group (#1630); when it does not, the anchor's theta is live in the data
     /// after all, and the estimator adds it back. So this field is exact only
     /// together with that add-back, which is why `read_outside_groups` stays.
-    pub read_outside_groups_and_anchors: Vec<String>,
+    pub(crate) read_outside_groups_and_anchors: Vec<String>,
     /// The single-anchor mu-references whose one theta this typical value also
     /// reads — `V2 = TVV2 * exp(ETA_V2)` next to a group on `V1 = TVV2 * TH_R *
     /// (WT/70)^TH_WT * exp(ETA_V1)` (#1630). Each is a one-theta entry of this
     /// same type, its reachability fields filled the same way, so SAEM and
     /// IMP/IMPMAP can take it into the group's joint M-step as a member instead
     /// of declining the group. Empty on the entries themselves.
-    pub colliding_anchors: Vec<CovariateMuRef>,
+    pub(crate) colliding_anchors: Vec<CovariateMuRef>,
     /// The eta-free typical value `A(θ, covariates)`, with every local
     /// `[individual_parameters]` definition it referenced resolved: each one
     /// emitted once as a line of the program and read by reference (#1699).
-    pub typical: crate::parser::model_parser::TypicalProgram,
+    pub(crate) typical: crate::parser::model_parser::TypicalProgram,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4532,7 +4534,7 @@ pub enum ObsRecord {
 impl ObsRecord {
     /// The CMT the row was routed to — the same value for every variant.
     #[cfg(feature = "survival")]
-    pub fn cmt(&self) -> usize {
+    pub(crate) fn cmt(&self) -> usize {
         match self {
             ObsRecord::Event { cmt, .. }
             | ObsRecord::DiscreteState { cmt, .. }
@@ -5056,7 +5058,7 @@ impl PlanId {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         PlanId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
-    pub fn get(&self) -> u64 {
+    pub(crate) fn get(&self) -> u64 {
         self.0
     }
 }
@@ -5533,13 +5535,13 @@ impl AbsorptionOdeEquivalent {
     /// as a parse warning rather than failing the primary parse (#1008). The source contains
     /// no `pk one_cpt_transit`/…/`pk two_cpt_ig` line, so this parse cannot recurse into the
     /// desugar that produced it.
-    pub fn build(source: &str) -> Result<Self, String> {
+    pub(crate) fn build(source: &str) -> Result<Self, String> {
         let built = crate::parser::model_parser::parse_model_string(source)?;
         Ok(Self { built: Box::new(built) })
     }
 
     /// The ODE equivalent sub-model.
-    pub fn built(&self) -> &CompiledModel {
+    pub(crate) fn built(&self) -> &CompiledModel {
         &self.built
     }
 
@@ -5550,7 +5552,7 @@ impl AbsorptionOdeEquivalent {
     /// tolerance baked into the twin's re-emitted `[fit_options]` (#814). The twin is itself
     /// an ODE model, so this stamps its `ode_spec.solver_opts`; it carries no nested twin, so
     /// the twin-branch in `sync_ode_solver_opts` is a no-op.
-    pub fn sync_solver_opts(&mut self, opts: &FitOptions) {
+    pub(crate) fn sync_solver_opts(&mut self, opts: &FitOptions) {
         self.built.sync_ode_solver_opts(opts);
     }
 }
@@ -5699,7 +5701,7 @@ impl GradientMethod {
     /// `auto` optimizer pick, the inner η-gradient route, the covariance R-matrix scope and
     /// the IOV FD reason. A union, like [`GradientMethod::effective`]: `Fd` from either side
     /// wins and `Auto` is neutral.
-    pub fn forced_fd(model: &CompiledModel) -> bool {
+    pub(crate) fn forced_fd(model: &CompiledModel) -> bool {
         model.gradient_method == GradientMethod::Fd || LOCAL_FORCED_FD.get().unwrap_or(false)
     }
 
@@ -5726,7 +5728,7 @@ impl GradientMethod {
     ///
     /// Taking either source's `Fd` is right in all three cases and idempotent on an
     /// already-stamped model.
-    pub fn effective(model: &CompiledModel, options: &FitOptions) -> GradientMethod {
+    pub(crate) fn effective(model: &CompiledModel, options: &FitOptions) -> GradientMethod {
         if model.gradient_method == GradientMethod::Fd
             || options.gradient_method == GradientMethod::Fd
         {
@@ -5740,7 +5742,7 @@ impl GradientMethod {
 impl CompiledModel {
     /// Whether the model carries a `[covariate_nn]` block (always `false` without the
     /// `nn` feature).
-    pub fn has_covariate_nn(&self) -> bool {
+    pub(crate) fn has_covariate_nn(&self) -> bool {
         #[cfg(feature = "nn")]
         return !self.covariate_nns.is_empty();
         #[cfg(not(feature = "nn"))]
@@ -5749,7 +5751,7 @@ impl CompiledModel {
 
     /// The θ index range of each `[covariate_nn]` block's weights,
     /// `weights_offset..weights_offset + n_weights` (empty without the `nn` feature).
-    pub fn nn_weight_theta_ranges(&self) -> Vec<std::ops::Range<usize>> {
+    pub(crate) fn nn_weight_theta_ranges(&self) -> Vec<std::ops::Range<usize>> {
         #[cfg(feature = "nn")]
         return self
             .covariate_nns
@@ -5783,7 +5785,7 @@ impl CompiledModel {
     /// Whether this model was laid out on a fit's data-derived bindings (#1730),
     /// by `bind_from_fit`, `layout_from_fit` or the deprecated
     /// `bind_theta_levels_from_fit`, rather than bound to data or never bound.
-    pub fn bound_from_fit(&self) -> bool {
+    pub(crate) fn bound_from_fit(&self) -> bool {
         self.indiv_param_partials.bound_from_fit
     }
 
@@ -5802,7 +5804,7 @@ impl CompiledModel {
     /// subjects integrate on — and `sync_ode_solver_opts` stamps the tolerances onto
     /// that twin too. So the keys are live there even though `ode_spec` is `None`,
     /// and warning "this model has no `[odes]` block" would be wrong.
-    pub fn honors_ode_solver_opts(&self) -> bool {
+    pub(crate) fn honors_ode_solver_opts(&self) -> bool {
         self.ode_spec.is_some() || self.absorption_ode_equivalent.is_some()
     }
 
@@ -5810,7 +5812,7 @@ impl CompiledModel {
     /// (a model has one or the other). `None` for a model that never integrates. The twin
     /// counts even when no current subject reaches it, since the flip-flop reroute is decided
     /// per `(θ, η)` and can reach it at a perturbed point only (#520 review).
-    pub fn integrator_spec(&self) -> Option<&crate::ode::predictions::OdeSpec> {
+    pub(crate) fn integrator_spec(&self) -> Option<&crate::ode::predictions::OdeSpec> {
         self.ode_spec.as_ref().or_else(|| {
             self.absorption_ode_equivalent.as_ref().and_then(|eq| eq.built().ode_spec.as_ref())
         })
@@ -5878,7 +5880,7 @@ impl CompiledModel {
     /// `dose_attr_map` field otherwise. Single source of truth for "which map
     /// applies", so a caller cannot accidentally read the empty analytical default
     /// on an ODE model (or vice versa) and silently resolve nothing (#383/#394).
-    pub fn active_dose_attr_map(&self) -> &DoseAttrMap {
+    pub(crate) fn active_dose_attr_map(&self) -> &DoseAttrMap {
         match &self.ode_spec {
             Some(ode) => &ode.dose_attr_map,
             None => &self.dose_attr_map,
@@ -5889,7 +5891,7 @@ impl CompiledModel {
     /// after both engines' maps have been built — currently only
     /// [`DoseAttrMap::mark_prediction_path_read`] (#993), which is discovered when
     /// `[scaling]` is parsed, after the ODE spec already exists.
-    pub fn active_dose_attr_map_mut(&mut self) -> &mut DoseAttrMap {
+    pub(crate) fn active_dose_attr_map_mut(&mut self) -> &mut DoseAttrMap {
         match &mut self.ode_spec {
             Some(ode) => &mut ode.dose_attr_map,
             None => &mut self.dose_attr_map,
@@ -6330,7 +6332,7 @@ impl CompiledModel {
     /// Falls back to `pk_indices` — placeholder and all — for a hand-built
     /// `CompiledModel` carrying no program (test fixtures, `generate_data`), where
     /// every entry is a real slot by construction. Every parsed model has a program.
-    pub fn pk_slot_rows(&self) -> Vec<(usize, usize)> {
+    pub(crate) fn pk_slot_rows(&self) -> Vec<(usize, usize)> {
         match self.indiv_param_partials.indiv_param_program.as_ref() {
             Some(prog) => {
                 // A top-level name's var slot is its `indiv_param_names` index, and
@@ -6371,7 +6373,7 @@ impl CompiledModel {
     /// placeholder-free replacement for `pk_indices.iter().position(|&s| s == slot)`:
     /// that scan returns the first *declared* name whose entry equals the slot, so an
     /// unbound intermediate declared above `CL` answers for `PK_IDX_CL` (#1899).
-    pub fn indiv_param_for_pk_slot(&self, pk_slot: usize) -> Option<usize> {
+    pub(crate) fn indiv_param_for_pk_slot(&self, pk_slot: usize) -> Option<usize> {
         self.pk_slot_rows().into_iter().find(|&(slot, _)| slot == pk_slot).map(|(_, i)| i)
     }
 
@@ -6426,7 +6428,7 @@ impl CompiledModel {
     /// compartment carry as their own lag once lowered to infusions (#2786). Only the sites
     /// that read a *lowered* dose's lag ask this; everywhere else a route lag stays on the
     /// route and the model stays on the lag-free paths.
-    pub fn has_dose_lag(&self) -> bool {
+    pub(crate) fn has_dose_lag(&self) -> bool {
         self.has_lagtime()
             || self.ode_spec.as_ref().is_some_and(|o| o.dose_attr_map.has_lowered_route_lag())
     }
@@ -6467,7 +6469,7 @@ impl CompiledModel {
     /// discontinuity is injected as its own rate-on saltation (#859) — mirroring
     /// how `has_lagtime` routes an estimated compartment lag there. A model with
     /// no `ode_spec` (analytical PK) has no input-rate forcings, so this is false.
-    pub fn has_route_absorption_lag(&self) -> bool {
+    pub(crate) fn has_route_absorption_lag(&self) -> bool {
         self.ode_spec.as_ref().is_some_and(|o| o.has_route_lag())
     }
 
@@ -6543,7 +6545,7 @@ impl CompiledModel {
     /// one "take the dense-`R` path" question (#1081); see `ResidualCov::is_dense`.
     /// Structural: true for a `block_sigma` off-diagonal or a `correlation` line,
     /// whatever value either holds.
-    pub fn residual_is_dense(&self) -> bool {
+    pub(crate) fn residual_is_dense(&self) -> bool {
         self.residual_cov_theta(&[]).is_dense()
     }
 
@@ -6672,14 +6674,14 @@ impl CompiledModel {
 
     /// Whether the model declares more than one variability level below `ID` (#1082).
     #[inline]
-    pub fn has_nested_levels(&self) -> bool {
+    pub(crate) fn has_nested_levels(&self) -> bool {
         self.indiv_param_partials.nested_levels.is_some()
     }
 
     /// The nested variability levels of a model that declares more than one `level`
     /// (#1082); `None` for every other model, including one with a single level.
     #[inline]
-    pub fn nested_levels(&self) -> Option<&NestedLevels> {
+    pub(crate) fn nested_levels(&self) -> Option<&NestedLevels> {
         self.indiv_param_partials.nested_levels.as_ref()
     }
 
@@ -6687,7 +6689,7 @@ impl CompiledModel {
     /// through any intermediate or `if` condition (#944). `true` for every name on a
     /// hand-built model that never went through the parser (no record of its
     /// dependencies), so a caller never treats a drawn value as known.
-    pub fn indiv_param_is_random(&self, name: &str) -> bool {
+    pub(crate) fn indiv_param_is_random(&self, name: &str) -> bool {
         self.indiv_param_partials
             .random_indiv_params
             .as_ref()
@@ -6700,7 +6702,7 @@ impl CompiledModel {
     /// name there, so each is a read of the dataset column it names whenever one
     /// exists. Not in [`CompiledModel::referenced_covariates`], since a
     /// `[derived]`-only name is not a required column.
-    pub fn derived_reads(&self) -> &[String] {
+    pub(crate) fn derived_reads(&self) -> &[String] {
         &self.indiv_param_partials.derived_reads
     }
 
@@ -6803,7 +6805,7 @@ impl CompiledModel {
     /// row. `mult = None` is the legacy unscaled form, bit for bit: the `_scaled`
     /// form at a row of ones is *not* (it associates the product differently), so a
     /// model without a magnitude must pass `None`.
-    pub fn residual_variance_for_key(
+    pub(crate) fn residual_variance_for_key(
         &self, key: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
         ruv_scale: f64, mult: Option<&[f64]>,
     ) -> f64 {
@@ -10717,7 +10719,7 @@ impl BloqMethod {
     }
 
     /// The method a [`label`](Self::label) names; `None` otherwise.
-    pub fn from_label(label: &str) -> Option<Self> {
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
         match label {
             "drop" => Some(BloqMethod::Drop),
             "m3" => Some(BloqMethod::M3),
@@ -10762,7 +10764,7 @@ impl CompiledModel {
     /// The LOQ method the running call scores this model under: the call's override, else
     /// [`bloq_method`](Self::bloq_method) (#1824). The one reader of the field
     /// (`tests/bloq_in_force_is_the_one_reader.rs`).
-    pub fn bloq_in_force(&self) -> BloqMethod {
+    pub(crate) fn bloq_in_force(&self) -> BloqMethod {
         LOCAL_BLOQ_OVERRIDE.get().unwrap_or(self.bloq_method)
     }
 }
@@ -11007,7 +11009,7 @@ impl Optimizer {
 
     /// [`Optimizer::resolve_auto`] with the analytic predicate supplied by the caller, so the
     /// `gradient = fd` coupling warning (#1381) can ask the counterfactual off this one rule.
-    pub fn resolve_auto_given_analytic(
+    pub(crate) fn resolve_auto_given_analytic(
         self, model: &CompiledModel, analytic_outer_gradient: bool,
     ) -> Optimizer {
         if self != Optimizer::Auto {
@@ -11095,7 +11097,7 @@ impl EstimationMethod {
     /// Laplace, pure Gauss–Newton). The one list behind [`FitOptions::evaluation_only_run`]
     /// and `api::validation::outer_search_runs` (#2865). An allow-list: a new estimator
     /// counts as searching until added.
-    pub fn evaluates_at_maxiter_zero(self) -> bool {
+    pub(crate) fn evaluates_at_maxiter_zero(self) -> bool {
         matches!(
             self,
             EstimationMethod::Foce
@@ -11107,7 +11109,7 @@ impl EstimationMethod {
 
     /// Whether this method's objective integrates over random effects, so `n_eta = 0`
     /// leaves nothing to integrate (#1050). Exhaustive `match` so a new variant must decide.
-    pub fn requires_random_effects(self) -> bool {
+    pub(crate) fn requires_random_effects(self) -> bool {
         match self {
             EstimationMethod::Saem
             | EstimationMethod::Imp
@@ -11265,7 +11267,7 @@ pub fn interaction_for(method: EstimationMethod, inherited: bool) -> bool {
 
 impl FitOptions {
     /// The inner-loop settings for this call's EBE solves (#426).
-    pub fn inner_settings(&self) -> crate::estimation::inner_settings::InnerSettings {
+    pub(crate) fn inner_settings(&self) -> crate::estimation::inner_settings::InnerSettings {
         crate::estimation::inner_settings::InnerSettings {
             mode: self.inner_optimizer,
             warm: self.ebe_warm_start,
@@ -11273,7 +11275,7 @@ impl FitOptions {
     }
 
     /// Whether this call asked for FD gradients (#1613); see [`GradientMethod::forced_fd`].
-    pub fn forces_fd(&self) -> bool {
+    pub(crate) fn forces_fd(&self) -> bool {
         self.gradient_method == GradientMethod::Fd
     }
 
@@ -11282,7 +11284,7 @@ impl FitOptions {
     /// `OdeSpec::solver_opts`. A field is carried only when it differs from
     /// [`FitOptions::default`] (equal to [`OdeSolverOptions::default`](crate::ode::OdeSolverOptions),
     /// pinned by a test), so a model file's pinned tolerance wins over an untouched field.
-    pub fn ode_solver_override(&self) -> crate::ode::solver::OdeSolverOverride {
+    pub(crate) fn ode_solver_override(&self) -> crate::ode::solver::OdeSolverOverride {
         let d = Self::default();
         crate::ode::solver::OdeSolverOverride {
             reltol: (self.ode_reltol != d.ode_reltol).then_some(self.ode_reltol),
@@ -11318,7 +11320,7 @@ impl FitOptions {
 
     /// The methods running as pure evaluators (`imp` under `imp_eval_only`, `laplace` under
     /// `agq_eval_only`), chain-wide. Feeds [`crate::types::is_last_estimating_stage`].
-    pub fn eval_only_methods(&self) -> Vec<EstimationMethod> {
+    pub(crate) fn eval_only_methods(&self) -> Vec<EstimationMethod> {
         let mut v = Vec::new();
         if self.imp_eval_only {
             v.push(EstimationMethod::Imp);
@@ -11331,7 +11333,7 @@ impl FitOptions {
 
     /// Whether every stage is a pure evaluator (standalone `imp_eval_only` /
     /// `agq_eval_only`), so the fit reports the initial estimates by request (#2716).
-    pub fn evaluation_only_chain(&self) -> bool {
+    pub(crate) fn evaluation_only_chain(&self) -> bool {
         let eval_only = self.eval_only_methods();
         self.method_chain().iter().all(|m| eval_only.contains(m))
     }
@@ -11339,7 +11341,7 @@ impl FitOptions {
     /// Whether no stage estimates (#2799), the source of [`FitResult::evaluation_only`]:
     /// each stage is an evaluator ([`Self::evaluation_only_chain`]) or reads
     /// `outer_maxiter = 0` as `MAXEVAL=0` (`EstimationMethod::evaluates_at_maxiter_zero`).
-    pub fn evaluation_only_run(&self) -> bool {
+    pub(crate) fn evaluation_only_run(&self) -> bool {
         let eval_only = self.eval_only_methods();
         self.method_chain().iter().all(|m| {
             eval_only.contains(m) || (self.outer_maxiter == 0 && m.evaluates_at_maxiter_zero())
@@ -11348,7 +11350,7 @@ impl FitOptions {
 
     /// The stage that owns the post-fit covariance step: the last estimating stage (#615).
     /// Answers which stage owns it, not whether it runs.
-    pub fn covariance_stage(&self) -> Option<EstimationMethod> {
+    pub(crate) fn covariance_stage(&self) -> Option<EstimationMethod> {
         let chain = self.method_chain();
         let eval_only = self.eval_only_methods();
         (0..chain.len())
@@ -11375,7 +11377,7 @@ impl FitOptions {
     }
 
     /// Stage-level quadrature dispatch without cloning the surrounding fit options.
-    pub fn agq_nodes_for(method: EstimationMethod, n_agq: usize) -> Option<usize> {
+    pub(crate) fn agq_nodes_for(method: EstimationMethod, n_agq: usize) -> Option<usize> {
         match method {
             // `n_agq = 1` is Laplace, `> 1` adaptive GH; same objective, gradient and stencil.
             EstimationMethod::Laplace => Some(n_agq.max(1)),
@@ -11565,7 +11567,9 @@ impl FitOptions {
     /// [`Self::unsupported_keys_warnings`] plus the **model-conditional** notices.
     /// The `ode_*` keys are method-agnostic but model-conditional: a silent no-op on a model
     /// that does not integrate (#517, #518).
-    pub fn unsupported_keys_warnings_with_model(&self, model: &CompiledModel) -> Vec<String> {
+    pub(crate) fn unsupported_keys_warnings_with_model(
+        &self, model: &CompiledModel,
+    ) -> Vec<String> {
         let mut warnings = self.unsupported_keys_warnings();
         if model.honors_ode_solver_opts() {
             return warnings;

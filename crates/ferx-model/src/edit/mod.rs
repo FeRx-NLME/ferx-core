@@ -193,7 +193,7 @@ impl ModelText {
     // ── Internals shared by the appliers ────────────────────────────────────
 
     /// Every block header in source order.
-    pub fn block_spans(&self) -> Vec<BlockSpan> {
+    pub(crate) fn block_spans(&self) -> Vec<BlockSpan> {
         let mut headers: Vec<(usize, String)> = Vec::new();
         for (i, line) in self.lines.iter().enumerate() {
             if let Some(caps) = BLOCK_HEADER_RE.captures(code_of(line)) {
@@ -213,12 +213,12 @@ impl ModelText {
     /// A block may legally appear more than once — the parser concatenates the
     /// bodies — and appending to the last occurrence is the only choice that
     /// preserves declaration order for every duplicate arrangement.
-    pub fn last_block(&self, name: &str) -> Option<BlockSpan> {
+    pub(crate) fn last_block(&self, name: &str) -> Option<BlockSpan> {
         self.block_spans().into_iter().filter(|b| b.name == name).next_back()
     }
 
     /// Line indices of every body line of every `[name]` block, in source order.
-    pub fn body_indices(&self, name: &str) -> Vec<usize> {
+    pub(crate) fn body_indices(&self, name: &str) -> Vec<usize> {
         self.block_spans().iter().filter(|b| b.name == name).flat_map(|b| b.body.clone()).collect()
     }
 
@@ -233,7 +233,7 @@ impl ModelText {
     /// editor addressing the *physical* line instead rewrites the first line of
     /// a six-line `block_omega` and leaves the other five behind, so every
     /// lookup in this module goes through here.
-    pub fn logical_lines(&self, name: &str) -> Vec<(Range<usize>, String)> {
+    pub(crate) fn logical_lines(&self, name: &str) -> Vec<(Range<usize>, String)> {
         /// Leading characters that can only continue the previous line, and
         /// trailing ones that leave it unfinished — the parser's two lists.
         const LEADERS: &[char] = &['+', '-', '*', '/', '^'];
@@ -307,25 +307,25 @@ impl ModelText {
     /// holding several spans at once. Pass them to
     /// [`delete_lines`](Self::delete_lines) with the rest of the deletions.
     #[must_use]
-    pub fn set_span(&mut self, span: &Range<usize>, code: &str) -> Vec<usize> {
+    pub(crate) fn set_span(&mut self, span: &Range<usize>, code: &str) -> Vec<usize> {
         self.set_code(span.start, code);
         (span.start + 1..span.end).collect()
     }
 
     /// The comment-stripped, trimmed content of line `i`.
-    pub fn code(&self, i: usize) -> &str {
+    pub(crate) fn code(&self, i: usize) -> &str {
         code_of(&self.lines[i])
     }
 
     /// Replace line `i`, keeping its original indentation and terminator.
-    pub fn set_code(&mut self, i: usize, code: &str) {
+    pub(crate) fn set_code(&mut self, i: usize, code: &str) {
         let indent = leading_ws(&self.lines[i]).to_string();
         let term = terminator_of(&self.lines[i]).to_string();
         self.lines[i] = format!("{indent}{code}{term}");
     }
 
     /// Delete the given line indices.
-    pub fn delete_lines(&mut self, mut idx: Vec<usize>) {
+    pub(crate) fn delete_lines(&mut self, mut idx: Vec<usize>) {
         idx.sort_unstable();
         idx.dedup();
         for i in idx.into_iter().rev() {
@@ -338,7 +338,7 @@ impl ModelText {
     ///
     /// "End of the block" means after its last non-blank line, so a blank
     /// separator before the next header stays where the author put it.
-    pub fn append_to_block(&mut self, block: &str, code: &str) {
+    pub(crate) fn append_to_block(&mut self, block: &str, code: &str) {
         let (at, indent) = match self.last_block(block) {
             Some(span) => {
                 let mut at = span.body.end;
@@ -394,7 +394,7 @@ impl ModelText {
     }
 
     /// The file's line terminator: CRLF if any line uses it, else LF.
-    pub fn newline(&self) -> String {
+    pub(crate) fn newline(&self) -> String {
         if self.lines.iter().any(|l| l.ends_with("\r\n")) {
             "\r\n".to_string()
         } else {
@@ -406,7 +406,7 @@ impl ModelText {
     ///
     /// This is the reachability test the declaration pruner runs: a `theta` or
     /// `omega` whose name survives nowhere but its own declaration is dead.
-    pub fn identifiers_excluding(&self, skip: &[usize]) -> HashSet<String> {
+    pub(crate) fn identifiers_excluding(&self, skip: &[usize]) -> HashSet<String> {
         let mut out = HashSet::new();
         for (i, line) in self.lines.iter().enumerate() {
             if skip.contains(&i) {

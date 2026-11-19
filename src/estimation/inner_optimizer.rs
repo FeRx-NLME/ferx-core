@@ -1,6 +1,8 @@
 pub(crate) use crate::estimation::inner_settings::{
     analytic_inner_common_bail, inner_reports_analytic_model, no_analytic_inner_forced,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 #[cfg(test)]
 pub(crate) use crate::estimation::inner_settings::analytic_inner_grad_supported_model;

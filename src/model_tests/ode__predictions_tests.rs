@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::cold_sort::ColdSort;
 use ferx_model::dosing::first_record;
@@ -1827,7 +1829,8 @@ fn the_adaptive_record_index_skips_an_implied_dose_for_in_force_only() {
 
     let implied = |t: f64, gov: f64| {
         let mut d = DoseEvent::new(t, 10.0, 1, 0.0, false, 0.0);
-        d.implied = Some(crate::types::ImpliedDose { parent: 0, param_time: gov, gov_time: gov });
+        *d.implied_mut() =
+            Some(crate::types::ImpliedDose { parent: 0, param_time: gov, gov_time: gov });
         d
     };
     let s = make_subject(
@@ -16252,7 +16255,7 @@ fn replay_subject(base: &Subject, run: &AdaptiveRun) -> Subject {
     let mut s = base.with_cmt_cutoffs().into_owned();
     s.doses.extend(run.ledger.iter().map(|e| {
         let mut d = DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0);
-        d.off_at = base.controller_dose_off_at(e.time, d.cmt_idx());
+        *d.off_at_mut() = base.controller_dose_off_at(e.time, d.cmt_idx());
         d
     }));
     s
@@ -16332,7 +16335,7 @@ fn frozen_replay_tv_applies_cmt_toggles_like_the_closed_form() {
     // The realized ledger, as `verify_adaptive_frozen_replay` appends it.
     for &t in &TOG_DECISIONS {
         let mut d = DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
-        d.off_at = subject.controller_dose_off_at(t, d.cmt_idx());
+        *d.off_at_mut() = subject.controller_dose_off_at(t, d.cmt_idx());
         subject.doses.push(d);
     }
     let event_pk = crate::pk::EventPkParams {

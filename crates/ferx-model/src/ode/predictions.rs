@@ -3209,7 +3209,7 @@ impl OdeReadout {
     /// `sens::ode_provider::resolve_obs_readout`) enter the matching guard, so FD and analytic
     /// sensitivities linearise the same expression.
     #[inline]
-    pub fn eval(
+    pub(crate) fn eval(
         &self, state: &[f64], pk_params_flat: &[f64], theta: &[f64], eta: &[f64],
         covariates: &HashMap<String, f64>, obs_cmt: usize, time: f64,
     ) -> f64 {
@@ -4055,7 +4055,7 @@ impl OdeSpec {
     /// that is not becomes `auto` — so no path can reach the exact propagator with an equation
     /// the parser did not prove valid for it, whether the request came from the model file or
     /// a fit-scoped override. A named integrator is left alone, which is how a user opts out.
-    pub fn effective_solver_opts(&self) -> crate::ode::OdeSolverOptions {
+    pub(crate) fn effective_solver_opts(&self) -> crate::ode::OdeSolverOptions {
         use crate::ode::OdeMethod;
         let mut opts = crate::ode::solver::effective_solver_options(self.solver_opts);
         match opts.method {
@@ -4081,13 +4081,13 @@ impl OdeSpec {
     /// the mean, and v1 of the exact path has no anchor for that pairing.
     ///
     /// A hand-built spec without an `rhs_program` is never eligible.
-    pub fn linear_eligible(&self) -> bool {
+    pub(crate) fn linear_eligible(&self) -> bool {
         self.linear_ineligibility().is_none()
     }
 
     /// Why [`linear_eligible`](Self::linear_eligible) is false, phrased for the
     /// `ode_method = linear` parse error; `None` when the spec is eligible.
-    pub fn linear_ineligibility(&self) -> Option<&'static str> {
+    pub(crate) fn linear_ineligibility(&self) -> Option<&'static str> {
         let Some(program) = self.rhs_program.as_ref() else {
             return Some("its right-hand side was not built from an [odes] block");
         };

@@ -3,6 +3,8 @@ use crate::parser::model_parser::parse_model_string;
 use crate::sim::adaptive::{
     kappa_standard_normal, subject_kappa_base_seed, ControllerCtx, DoseAction,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use std::collections::HashMap;
 
 // IOV (per-occasion κ on CL) × a time-varying covariate (CRCL) on CL — the exact
@@ -342,7 +344,7 @@ fn an_implied_doses_parent_lag_is_part_of_the_canonical_dose_snapshot() {
     let params = model.default_params.clone();
     let mut subject = tv_subject_with_dose();
     let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
-    implied.implied =
+    *implied.implied_mut() =
         Some(crate::types::ImpliedDose { parent: 0, param_time: 24.0, gov_time: 24.0 });
     subject.doses.push(implied);
     subject.dose_covariates.push(HashMap::from([("CRCL".to_string(), 50.0)]));
@@ -681,7 +683,8 @@ fn decision_covs_by_scan_skips_an_implied_dose() {
     let row = |v: f64| HashMap::from([("ROW".to_string(), v)]);
     let implied = |t: f64, gov: f64| {
         let mut d = DoseEvent::new(t, 10.0, 1, 0.0, false, 0.0);
-        d.implied = Some(crate::types::ImpliedDose { parent: 0, param_time: gov, gov_time: gov });
+        *d.implied_mut() =
+            Some(crate::types::ImpliedDose { parent: 0, param_time: gov, gov_time: gov });
         d
     };
     let mut s = tv_subject_with_dose();

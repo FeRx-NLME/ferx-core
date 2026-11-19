@@ -10,6 +10,8 @@ use crate::stats::likelihood::{
     foce_subject_nll_cov_at, foce_subject_nll_iov_cov, SUBJECT_SENTINEL_NLL,
 };
 use crate::types::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 
 // `SymmetricEigen` is used only by this module's `#[cfg(test)]` code (the non-PD

@@ -6,6 +6,8 @@ use crate::io::data_source::DataSource;
 use crate::io::datareader::{
     read_nonmem_csv_routed, read_nonmem_csv_routed_from, CsvInput, MissingDvPolicy, SelectionFilter,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use std::collections::HashMap;
 use std::path::Path;
 

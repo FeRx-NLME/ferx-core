@@ -7,6 +7,8 @@
 //! `pub` / `pub(crate)` re-exports in the parent module.
 use super::*;
 use crate::cold_sort::ColdSort;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 #[cfg(all(test, feature = "markov"))]
 pub(crate) use crate::model_checks::check_ctmm_time_dependent_pk;
@@ -3893,8 +3895,8 @@ pub(crate) fn check_profiled_levels(
 ) -> Vec<Diagnostic> {
     let blocks: Vec<&str> = model
         .indiv_param_partials
-        .theta_blocks
-        .decls
+        .theta_blocks()
+        .decls()
         .iter()
         .filter(|d| d.profiled)
         .map(|d| d.name.as_str())

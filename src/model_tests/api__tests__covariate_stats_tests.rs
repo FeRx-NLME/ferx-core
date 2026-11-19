@@ -1,4 +1,6 @@
 //! Binding `[covariate_model]` statistics to data (#1111).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::diagnostics::Diagnostic;
 use ferx_model::diagnostics::EngineError;

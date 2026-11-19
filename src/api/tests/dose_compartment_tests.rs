@@ -11,6 +11,8 @@
 use super::check_dose_compartments;
 use crate::types::test_helpers::{analytical_model, ode_model};
 use crate::types::{CompiledModel, DoseEvent, GradientMethod, PkModel, Population, Subject};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 /// A one-subject population carrying exactly the doses under test.
 fn population_with_doses(doses: Vec<DoseEvent>) -> Population {

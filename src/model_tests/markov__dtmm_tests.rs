@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::parser::model_parser::with_model_time;
 use ferx_model::stats::likelihood::SUBJECT_SENTINEL_NLL;

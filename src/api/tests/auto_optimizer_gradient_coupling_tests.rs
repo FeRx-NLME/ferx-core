@@ -10,6 +10,8 @@
 //! gates in the check reject overlapping inputs and a green suite is not evidence
 //! any of them is load-bearing. Every one was mutated in turn; the test named in
 //! each doc comment is the one that went red.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::diagnostics::Severity;

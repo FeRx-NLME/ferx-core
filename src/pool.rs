@@ -1,6 +1,8 @@
 //! The fit-scoped Rayon pools and thread-count policy. A crate-level module (not under `api`)
 //! so the estimators below `api` can open a fit scope without depending on it (#3041).
 use crate::types::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 /// Worker-stack size for ferx-managed Rayon pools.
 ///

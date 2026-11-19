@@ -19,6 +19,8 @@
 //!   reading the hash-verified model file; pass both to avoid it.
 //! - A fit that carries a population fingerprint (every fit since #1685) refuses
 //!   any population, supplied or re-read, that is not the one it was given.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::estimation::uncertainty_samples::fitted_params_from_result;
 use crate::types::*;

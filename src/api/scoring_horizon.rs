@@ -24,6 +24,8 @@
 //!
 //! That route change is the one way the view moves a result by more than rounding: two routes
 //! break an integrated walk at different records, so they agree only to solver tolerance.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use std::borrow::Cow;
 

@@ -58,7 +58,9 @@ impl SirSettings {
 
     /// The first field outside the `[fit_options]` domain, if any (#1770): `df`, then the
     /// scoring half. Fields are named as the record names them (`df`, not `sir_df`).
-    pub fn check_domain(&self) -> Result<(), crate::estimation::population_check::OutOfDomain> {
+    pub(crate) fn check_domain(
+        &self,
+    ) -> Result<(), crate::estimation::population_check::OutOfDomain> {
         crate::estimation::population_check::sir_df_in_domain("df", self.df)?;
         self.scoring.check_domain()
     }

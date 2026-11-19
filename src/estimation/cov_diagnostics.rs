@@ -20,6 +20,8 @@
 //! its ODE twin) × declined clauses (one, or several). Every sentence must be true on every
 //! reachable cell, which is why each conditional sentence is gated on the fact that makes it
 //! true rather than emitted unconditionally.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::ode::OdeSolverOptions;
 use crate::types::{CompiledModel, CovarianceMethod, EstimationMethod, FitOptions, Population};

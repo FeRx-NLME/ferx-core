@@ -2,6 +2,8 @@
 //! oracles: Richardson differences of the production objective with the EBE re-solved at
 //! every point (which shares no derivative code with the adjoint), and of the production
 //! predictor.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::estimation::parameterization::lower_tri_entries;
 use ferx_model::estimation::parameterization::unpack_params;
@@ -1336,7 +1338,7 @@ fn addl_lag_src(ode: bool, iov: bool) -> String {
 /// record's.
 fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
     let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
-    implied.implied =
+    *implied.implied_mut() =
         Some(crate::types::ImpliedDose { parent: 0, param_time: 13.0, gov_time: 13.0 });
     let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0), implied];
     let times = [1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0];
@@ -1387,7 +1389,7 @@ fn assert_implied_lag_is_the_parents(
     let parent = dose[0].values[lag];
     assert_eq!(dose[1].values[lag], parent, "{label}: the implied dose takes the parent's lag");
     let mut own = s.clone();
-    own.doses[1].implied = None;
+    *own.doses[1].implied_mut() = None;
     let mut own_dose = Vec::new();
     crate::pk::compute_dose_pk_params_into(model, &own, theta, &[0.0, 0.0], &mut own_dose);
     let governing = own_dose[1].values[lag];
@@ -1506,7 +1508,7 @@ fn shared_inputs_src(iov: bool) -> String {
 /// occasion 2, so the X = 2 records straddle a κ.
 fn shared_inputs_subject(model: &CompiledModel, distinct: impl Fn(usize) -> bool) -> Subject {
     let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
-    implied.implied =
+    *implied.implied_mut() =
         Some(crate::types::ImpliedDose { parent: 0, param_time: 13.0, gov_time: 13.0 });
     let doses = vec![
         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
@@ -8650,7 +8652,7 @@ fn adjoint_matches_fd_for_an_infusion_stopped_by_a_toggle() {
         &[0.1, -0.05],
     );
     let s = with_toggles(plain.clone(), &[(4.0, 1, false), (6.0, 1, true)]);
-    assert_eq!(s.doses[1].off_at, f64::INFINITY, "derived by the walk, not here");
+    assert_eq!(s.doses[1].off_at(), f64::INFINITY, "derived by the walk, not here");
     assert_toggle_is_live(&model, &s, &plain);
     let worst = fd_oracle(&model, &s, true);
     assert!(worst < TOGGLE_BOUND, "worst relative difference {worst:.2e}");
@@ -10116,7 +10118,7 @@ fn an_addl_implied_dose_and_its_explicit_twin_do_not_share_a_plan() {
     let model = parse_model_string(&addl_lag_src(false, false)).unwrap();
     let implied = addl_implied_lag_subject(&model, true);
     let mut explicit = implied.clone();
-    explicit.doses[1].implied = None;
+    *explicit.doses[1].implied_mut() = None;
     let theta = moved_params(&model).theta;
     let etas = vec![vec![0.1, -0.05]];
     let mut worst = Vec::new();

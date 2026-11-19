@@ -472,7 +472,7 @@ pub enum PreparedInputRate<T = f64> {
 
 impl<T: Copy> PreparedInputRate<T> {
     /// The same constants through `f` (a lift to a jet type).
-    pub fn map<U>(self, f: impl Fn(T) -> U) -> PreparedInputRate<U> {
+    pub(crate) fn map<U>(self, f: impl Fn(T) -> U) -> PreparedInputRate<U> {
         use PreparedInputRate::*;
         match self {
             Transit { ktr, ln_ktr, n, ln_gamma_np1 } => {
@@ -721,7 +721,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// `n > 0` (its slope infinite for `n < 1`, which the anchored onset segment resolves), and a
     /// Weibull with `β ≥ 1` is finite.
     #[inline]
-    pub fn frame_kernel(&self) -> bool {
+    pub(crate) fn frame_kernel(&self) -> bool {
         match *self {
             PreparedInputRate::Weibull { beta, .. } => {
                 beta.br_cmp_c(crate::sens::num::BranchCmp::Lt, 1.0)
@@ -736,7 +736,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// frame (`CumulativeInputs`) reads this in place of the density,
     /// which is infinite at the onset for `β < 1`. Any kind but those two is `1 − cdf`.
     #[inline]
-    pub fn survival(&self, s: T) -> T {
+    pub(crate) fn survival(&self, s: T) -> T {
         match *self {
             PreparedInputRate::Transit { ktr, n, .. } => {
                 crate::stats::special::regularized_gamma_q(n + T::from_f64(1.0), ktr * s)
@@ -794,7 +794,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// continued density is a polynomial of degree ≤ 3 in the jet and a value-zero `s` carries
     /// no derivative above the fourth. Exactly as exact as that continuation (a `NaN` where it
     /// declines).
-    pub fn cdf_onset_continued(&self, s: T) -> T {
+    pub(crate) fn cdf_onset_continued(&self, s: T) -> T {
         let tau = s - s.value_only();
         let one = T::from_f64(1.0);
         let g = |x: T| self.rate_onset_continued(x, one);
@@ -829,7 +829,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// reads is jet-free, so a recording's stage at age zero is the flat `G = 0` rather than
     /// the onset continuation ([`Self::cdf_onset_continued`]).
     #[inline]
-    pub fn rate_infused_from(
+    pub(crate) fn rate_infused_from(
         &self, tad: T, dose: T, t_inf: T, tail_age: Option<T>, anchored: bool,
     ) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
@@ -855,7 +855,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// exact through second order, and a type carrying higher derivatives
     /// (`!PkNum::TAYLOR2_EXACT`) gets `NaN` there, so its recording declines rather than
     /// truncating.
-    pub fn rate_onset_continued(&self, tau: T, dose: T) -> T {
+    pub(crate) fn rate_onset_continued(&self, tau: T, dose: T) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
@@ -908,7 +908,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// asks; only a steady-state or infused dose could, and an estimated lag on those is rejected
     /// upstream. `ZeroOrder`'s onset/cutoff is handled by its moving-window mechanism (#530).
     #[inline]
-    pub fn rate_at_zero(&self, dose: T) -> T {
+    pub(crate) fn rate_at_zero(&self, dose: T) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
@@ -964,7 +964,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// The `Transit` `n = 0`/`n = 1` and `Weibull` `β = 1` arms branch on **exact** `f64`
     /// equality (as `rate_at_zero` does), since the slope is discontinuous across each.
     #[inline]
-    pub fn rate_dtad_at_zero(&self, dose: T) -> T {
+    pub(crate) fn rate_dtad_at_zero(&self, dose: T) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }

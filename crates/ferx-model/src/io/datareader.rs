@@ -55,7 +55,7 @@ impl SelectionFilter {
     /// True when any ignore/accept clause reads `col` (case-insensitive; standard
     /// columns included). Asked for `cmt` by `api::validation`: a clause naming a
     /// defaulted `CMT` must raise `W_CMT_DEFAULTED` (#1409).
-    pub fn references_column(&self, col: &str) -> bool {
+    pub(crate) fn references_column(&self, col: &str) -> bool {
         self.ignore
             .iter()
             .chain(self.accept.iter())
@@ -66,7 +66,7 @@ impl SelectionFilter {
     /// True when any ignore/accept clause compares `col` as a number
     /// (case-insensitive). Gates `W_COVARIATE_MISSING`: a string comparison reads
     /// the raw text, so a non-numeric label is not a missing value (#2599).
-    pub fn reads_column_numerically(&self, col: &str) -> bool {
+    pub(crate) fn reads_column_numerically(&self, col: &str) -> bool {
         self.ignore
             .iter()
             .chain(self.accept.iter())
@@ -94,7 +94,7 @@ impl SelectionFilter {
 
     /// The first rule that excludes this record, in the documented order, or `None`
     /// when the record survives.
-    pub fn first_excluding_rule(&self, ctx: &RowContext<'_>) -> Option<Excluder<'_>> {
+    pub(crate) fn first_excluding_rule(&self, ctx: &RowContext<'_>) -> Option<Excluder<'_>> {
         // 1. ignore_subjects shorthand.
         if self.ignore_subject_ids.iter().any(|id| id == ctx.id) {
             return Some(Excluder::Subject);
@@ -118,7 +118,7 @@ impl SelectionFilter {
     /// `ctx` rests on any of `cols` (`FilterClause::depends_on`). A record the
     /// filter keeps was kept by every clause, so this is the clause that first
     /// decided it on those columns (#1501).
-    pub fn first_clause_depending_on(
+    pub(crate) fn first_clause_depending_on(
         &self, ctx: &RowContext<'_>, cols: &[&str],
     ) -> Option<Excluder<'_>> {
         let depends = |c: &&FilterClause| c.depends_on(ctx, cols);

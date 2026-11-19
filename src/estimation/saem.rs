@@ -1,4 +1,6 @@
 pub(crate) use crate::estimation::saem_settings::{sanitize_scale_deadband, SAEM_N_MH_STEPS_AUTO};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 /// SAEM (Stochastic Approximation EM) for NLME population parameter estimation.
 ///

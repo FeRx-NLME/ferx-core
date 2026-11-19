@@ -55,7 +55,7 @@ pub struct PkTopology {
 
 impl PkModel {
     /// The compartment topology for this model. `'static` table lookup.
-    pub fn topology(self) -> &'static PkTopology {
+    pub(crate) fn topology(self) -> &'static PkTopology {
         match self {
             PkModel::OneCptIv => &ONE_CPT_IV,
             PkModel::OneCptOral => &ONE_CPT_ORAL,

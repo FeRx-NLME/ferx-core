@@ -351,7 +351,7 @@ impl ScoringSettings {
     /// The retired `Ad` records as `Auto`: only `fit()` refuses it (`E_AD_RETIRED`), and a
     /// post-hoc `run_sir` handed it runs the analytic route, which is what `Auto` names. So a
     /// record holds `Auto` or `Fd`, the two values the `.fitrx` decode accepts (#1860 review).
-    pub fn of_run(model: &CompiledModel, options: &FitOptions) -> Self {
+    pub(crate) fn of_run(model: &CompiledModel, options: &FitOptions) -> Self {
         let gradient_method = match GradientMethod::effective(model, options) {
             GradientMethod::Ad => GradientMethod::Auto,
             g => g,
@@ -369,7 +369,7 @@ impl ScoringSettings {
     ///
     /// Destructured without `..`, like [`with_scoring_record`], so a field added to the
     /// record and left out here does not compile.
-    pub fn overwrite(&self, options: &FitOptions) -> FitOptions {
+    pub(crate) fn overwrite(&self, options: &FitOptions) -> FitOptions {
         let ScoringSettings {
             inner_maxiter,
             inner_tol,
@@ -424,7 +424,7 @@ impl ScoringSettings {
     /// The first field outside the `[fit_options]` domain, if any (#1770). A record holds
     /// `gradient_method` `auto` or `fd`: `ad` is retired (`E_AD_RETIRED`), and
     /// [`of_run`](Self::of_run) records a run handed it as the `auto` it ran.
-    pub fn check_domain(&self) -> Result<(), OutOfDomain> {
+    pub(crate) fn check_domain(&self) -> Result<(), OutOfDomain> {
         ode_tol_in_domain("ode_reltol", self.ode_reltol)?;
         ode_tol_in_domain("ode_abstol", self.ode_abstol)?;
         ode_max_steps_in_domain(self.ode_max_steps)?;

@@ -289,7 +289,7 @@ impl FilterClause {
     /// and fails makes the clause false whatever `cols` hold: `EVID == 2 && RATE ==
     /// 0` on an observation record is decided by `EVID` alone. The clause depends on
     /// `cols` when it reads one of them and every other sub-expression holds.
-    pub fn depends_on(&self, ctx: &RowContext<'_>, cols: &[&str]) -> bool {
+    pub(crate) fn depends_on(&self, ctx: &RowContext<'_>, cols: &[&str]) -> bool {
         let reads = |e: &FilterExpr| cols.iter().any(|c| e.col.eq_ignore_ascii_case(c));
         self.exprs.iter().any(reads) && self.exprs.iter().filter(|e| !reads(e)).all(|e| e.eval(ctx))
     }
@@ -312,7 +312,7 @@ impl FilterClause {
     /// Reading it off the parsed sub-expressions means the `&&` split, the
     /// case-folding and the bare-identifier `IGNORE=C` shorthand are all answered by
     /// the parser rather than re-spelled by the caller.
-    pub fn columns(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn columns(&self) -> impl Iterator<Item = &str> {
         self.exprs.iter().map(|e| e.col.as_str())
     }
 
@@ -320,7 +320,7 @@ impl FilterClause {
     /// sub-expression with a numeric right-hand side. A string comparison reads the
     /// raw cell instead (`RowContext::str_covariates`), so a label column the numeric
     /// map holds as `NaN` is not a missing value to it (#2599).
-    pub fn numeric_columns(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn numeric_columns(&self) -> impl Iterator<Item = &str> {
         self.exprs.iter().filter(|e| matches!(e.rhs, FilterValue::Num(_))).map(|e| e.col.as_str())
     }
 

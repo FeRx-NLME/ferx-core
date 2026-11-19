@@ -1,5 +1,7 @@
 //! `profile`d θ level blocks (#1065): the per-subject active sets, the route and
 //! scope refusals, the parameter count and the output fields.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::diagnostics::Diagnostic;
 use ferx_model::diagnostics::EngineError;
@@ -620,7 +622,7 @@ fn count_of(model: &CompiledModel, held: &[bool]) -> (usize, crate::types::BicIn
 /// PR2's shape: the optimizer holds every profiled level, the way it holds a FIX θ.
 fn held_like_the_profile_solve(model: &CompiledModel) -> Vec<bool> {
     let mut held = crate::estimation::parameterization::packed_fixed_mask(&model.default_params);
-    let idx = model.indiv_param_partials.theta_blocks.profiled_theta_indices();
+    let idx = model.indiv_param_partials.theta_blocks().profiled_theta_indices();
     assert!(!idx.is_empty(), "the fixture must have profiled levels");
     for i in idx {
         held[i] = true;
@@ -653,7 +655,7 @@ fn a_profiled_fit_counts_the_parameters_the_unprofiled_fit_counts() {
         assert!(searched < want.0, "{p_decl}: {searched} vs {}", want.0);
 
         // One level frozen (as #1891's `theta_fixed` freezes one) on both sides.
-        let first = p.indiv_param_partials.theta_blocks.profiled_theta_indices()[0];
+        let first = p.indiv_param_partials.theta_blocks().profiled_theta_indices()[0];
         let (mut p, mut u) = (p, u);
         p.default_params.theta_fixed[first] = true;
         u.default_params.theta_fixed[first] = true;
@@ -1068,7 +1070,7 @@ fn binary_reading(read: &str) -> String {
 fn a_profiled_block_in_the_binary_predictor_is_walked_as_a_linked_readout() {
     let parsed = parse_full_model(&binary_reading("PLACEBO[STUDY]"))
         .unwrap_or_else(|e| panic!("an affine binary read passes the walk: {e}"));
-    let decl = parsed.model.theta_blocks().decls.iter().find(|d| d.name == "PLACEBO").unwrap();
+    let decl = parsed.model.theta_blocks().decls().iter().find(|d| d.name == "PLACEBO").unwrap();
     assert!(decl.linked, "the binary predictor's link is implicit");
     let msgs = scope(&parsed.model, &FitOptions::default());
     assert!(msgs.is_empty(), "in scope since #2111: {msgs:#?}");

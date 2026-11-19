@@ -4,6 +4,8 @@
 //! and the progress reporter all live here. `outer_optimizer` retains only the
 //! population optimizers, the outer-gradient family, `OuterResult`, and
 //! `pop_nll`/`pop_nll_opts` (imported below).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::cold_sort::ColdSort;
 use crate::estimation::cov_diagnostics::{
@@ -3942,6 +3944,8 @@ mod nn_reg_tests;
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
+    use ferx_model::internal::*;
     // The moved cov-specific unit tests remain in `outer_optimizer`'s test module
     // (they reach the moved symbols via the cross-module import added there). The
     // `run_covariance_step` gate + match is exercised end-to-end by every

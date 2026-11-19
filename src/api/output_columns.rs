@@ -1,6 +1,8 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::DVector;
 use std::collections::HashMap;
 

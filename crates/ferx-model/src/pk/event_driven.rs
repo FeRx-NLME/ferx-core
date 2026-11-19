@@ -144,7 +144,7 @@ pub struct EventSchedule {
     /// effect is that an external struct literal can no longer build an `EventSchedule`
     /// — which is right, since `bounds_per_interval` must stay consistent with `events`
     /// and only [`EventSchedule::for_subject`] can establish that.
-    pub non_finite_event_time: bool,
+    pub(crate) non_finite_event_time: bool,
     /// For each interval `i` between `events[i]` and `events[i+1]`, the
     /// sub-interval boundary points (sorted, deduped, including the two
     /// interval endpoints) at which the active infusion rate matrix
@@ -162,7 +162,7 @@ pub struct EventSchedule {
     /// [`active_rates_at`] computes it at that sub-interval's midpoint under the
     /// reset floor the walk has at that point (#1477). Built from the `doses` this
     /// schedule was built from — see `rates_dose_key`.
-    pub rates_per_interval: Vec<Vec<[f64; 4]>>,
+    pub(crate) rates_per_interval: Vec<Vec<[f64; 4]>>,
     /// `(rate, duration)` of every dose `rates_per_interval` was computed from,
     /// parallel to `subject.doses`. A walk may use the precomputed rates only for
     /// doses that still carry these two values bit-for-bit
@@ -171,10 +171,10 @@ pub struct EventSchedule {
     /// per η, and the cached schedule built from the unreshaped doses is still
     /// reused in the first case (its *bounds* do not move), so the rates are
     /// validated per walk rather than assumed.
-    pub rates_dose_key: Vec<(f64, f64)>,
+    pub(crate) rates_dose_key: Vec<(f64, f64)>,
     /// The `doses` this schedule was built from, indexed once (#2754). Valid for exactly
     /// the doses [`Self::rates_valid_for`] accepts — see [`Self::dose_index_for`].
-    pub dose_index: crate::dosing::DoseIndex,
+    pub(crate) dose_index: crate::dosing::DoseIndex,
 }
 
 impl EventSchedule {
@@ -182,7 +182,7 @@ impl EventSchedule {
     /// dose's `(rate, duration)` bit-identical to the ones the rates were built from.
     /// `O(n_doses)` once per walk, against the `O(n_doses)` scan per sub-interval it
     /// replaces.
-    pub fn rates_valid_for(&self, doses: &[DoseEvent]) -> bool {
+    pub(crate) fn rates_valid_for(&self, doses: &[DoseEvent]) -> bool {
         self.rates_dose_key.len() == doses.len()
             && self.rates_dose_key.iter().zip(doses.iter()).all(|(&(r, d), dose)| {
                 r.to_bits() == dose.rate.to_bits() && d.to_bits() == dose.duration.to_bits()
@@ -194,7 +194,7 @@ impl EventSchedule {
     /// result of [`Self::rates_valid_for`]`(doses)`, which the caller already holds), a
     /// fresh `O(n log n)` build otherwise. The index reads only times, `ss`/`ii`, lagtimes
     /// (all schedule-static) and `rate`/`duration` (what `rates_valid_for` checks).
-    pub fn dose_index_for(
+    pub(crate) fn dose_index_for(
         &self, doses: &[DoseEvent], rates_valid: bool,
     ) -> std::borrow::Cow<'_, crate::dosing::DoseIndex> {
         if rates_valid {

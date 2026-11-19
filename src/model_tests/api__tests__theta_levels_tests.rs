@@ -1,4 +1,6 @@
 //! `theta NAME[COL, ...]` binding (#1064).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::diagnostics::Diagnostic;
 use ferx_model::diagnostics::EngineError;
@@ -4593,8 +4595,8 @@ mod absorption {
         fn coupling(text: &str) -> EtaCoupling {
             let parsed = parse_full_model(text).unwrap();
             let decl = &parsed.model.theta_blocks().level_blocks()[0];
-            assert_eq!(decl.eta_couplings.len(), 1, "one random effect");
-            decl.eta_couplings[0].clone()
+            assert_eq!(decl.eta_couplings().len(), 1, "one random effect");
+            decl.eta_couplings()[0].clone()
         }
         let site = |param: Option<&str>, via: Option<&str>| ScaleShare {
             param: param.map(str::to_string),

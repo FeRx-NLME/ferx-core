@@ -4,6 +4,8 @@ use crate::estimation::inner_optimizer::test_helpers::{
     kappa_correlation_fixture, load_iov_fixture, nested_levels_fixture, on_one_thread,
     warfarin_iov_fixture, warfarin_iov_ode_fixture,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // Cov helpers moved to `estimation::covariance` (refactor T4); the unit tests
 // below still live here and reach them across the module boundary.
 use crate::estimation::covariance::covariance_steps_run_on;

@@ -3,6 +3,8 @@
 //! that evaluates to zero, a negative number, or a non-finite value at the
 //! initial estimates is a hard error, not a fit that silently lets one row own
 //! the objective.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::check_model_data;
 use crate::parser::model_parser::parse_model_string;
@@ -108,7 +110,7 @@ fn a_tad_magnitude_passes_with_a_pre_dose_sample() {
          1.0))\n",
     )
     .expect("parse");
-    assert!(model.ruv_magnitude.as_ref().unwrap().uses_tad);
+    assert!(model.ruv_magnitude.as_ref().unwrap().uses_tad());
     let subject = Subject {
         id: "1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],

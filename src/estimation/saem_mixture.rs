@@ -29,6 +29,8 @@
 //! under SAEM — they are held at their initial values and a warning is emitted;
 //! everything else (class-switched θ, Ω overrides, constant/covariate mixing) is
 //! estimated.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::estimation::mixture::combine_subject;
 use crate::estimation::saem::MixtureMuRefPair;
@@ -202,7 +204,7 @@ impl SaemMixture {
                 base_omega.diagonal,
                 base_omega.free_mask.clone(),
             )
-            .with_block_declared(base_omega.block_declared.clone());
+            .with_block_declared(base_omega.block_declared().clone());
         }
         // Restore σ overrides to their held init values.
         for (&(c, s), &v) in &self.sigma_override_init {

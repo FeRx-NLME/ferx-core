@@ -23420,32 +23420,32 @@ pub struct LevelBlockDecl {
     /// directly or through a variable (#1642). States carry no taint here.
     /// Backs [`Self::shares_scale_with_eta`]; the binder decides from
     /// `eta_couplings`, which refines it per random effect.
-    pub scale_share: Option<ScaleShare>,
+    pub(crate) scale_share: Option<ScaleShare>,
     /// Set by the parse: how each random effect the model declares relates to
     /// this block (#1649, #1650) — the model-side half of "can the block absorb
     /// that random effect". The binder adds the data-side half and resolves
     /// [`LevelContrast::Auto`] and its refusals from it.
-    pub eta_couplings: Vec<EtaCoupling>,
+    pub(crate) eta_couplings: Vec<EtaCoupling>,
     /// Per random effect, parallel to `eta_couplings`: the individual parameters
     /// whose own expression reads it, sorted. Two random effects with the same
     /// readers enter the model at the same site, which is what lets the binder
     /// call a kappa the η by another name (#1696).
-    pub eta_readers: Vec<Vec<String>>,
+    pub(crate) eta_readers: Vec<Vec<String>>,
     /// Synthesized per-record index column the implicit gather reads.
-    pub index_covariate: String,
+    pub(crate) index_covariate: String,
     /// Set by the parse: the CMTs of the discrete-state endpoints whose expression reads
     /// this block and is evaluated per record — `[binary_model]` and a DTMM
     /// `[markov_model]` — sorted (#2562). Their records define levels as the Gaussian
     /// observations do, and carry the index in their per-record covariate snapshot. A
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
-    pub record_cmts: Vec<usize>,
+    pub(crate) record_cmts: Vec<usize>,
     /// Set by the parse: the CMTs of the model's `[binary_model]` and DTMM `[markov_model]`
     /// endpoints, sorted (#2808) — the endpoints whose discrete-state records a reader of
     /// this block would make define levels. The binder's no-levels refusal advises reading
     /// the block in one of them only when the data has a record on one: a CTMM state row
     /// defines no level whatever reads it, and its CMT has no other endpoint.
-    pub level_capable_cmts: Vec<usize>,
+    pub(crate) level_capable_cmts: Vec<usize>,
     /// Set by the parse: some expression reads this block bare, through
     /// `index_covariate` — the model's referenced covariates include it (#2623 review).
     /// Bare is the only way to read a data-driven block: the parse refuses a
@@ -23453,7 +23453,7 @@ pub struct LevelBlockDecl {
     /// With [`Self::record_cmts`] it tells the binder's no-levels refusal whether the
     /// expression is the cause or the block's only readers define no level on the data
     /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator, a TTE hazard).
-    pub read_bare: bool,
+    pub(crate) read_bare: bool,
 }
 
 impl LevelBlockDecl {
@@ -23575,22 +23575,22 @@ pub type LevelBindings = std::collections::HashMap<String, LevelBinding>;
 /// `pub(crate)`; callers inspect the metadata through its accessors.
 #[derive(Debug, Clone, Default)]
 pub struct ThetaBlocks {
-    pub decls: Vec<VectorThetaDecl>,
+    pub(crate) decls: Vec<VectorThetaDecl>,
     /// `NAME[COLUMN]` sites whose index column the data check should walk.
-    pub uses: Vec<GatherUse>,
+    pub(crate) uses: Vec<GatherUse>,
     /// a level block declarations, in declaration order. Present whether or not
     /// they are bound; `unbound_level_blocks` says which still need data.
-    pub level_blocks: Vec<LevelBlockDecl>,
+    pub(crate) level_blocks: Vec<LevelBlockDecl>,
     /// Names of level blocks that were declared but never bound to
     /// data. A model carrying any of these cannot be fit — see
     /// `api::validation::check_unbound_theta_levels`.
-    pub unbound_level_blocks: Vec<String>,
+    pub(crate) unbound_level_blocks: Vec<String>,
     /// Per θ block (#1065, #2108 follow-up B): the plain data column every read of it is
     /// indexed by, or `None` when some read indexes it by anything else
     /// (`PLACEBO[4 - STUDY]`, a second column, an individual parameter). Read by
     /// `levels::levels_read`: the profile solve's per-subject levels and the
     /// `W_COV_RSR_ONE_SUBJECT_LEVELS` count.
-    pub read_index: Vec<(String, Option<String>)>,
+    pub(crate) read_index: Vec<(String, Option<String>)>,
 }
 
 impl ThetaBlocks {
@@ -23606,13 +23606,13 @@ impl ThetaBlocks {
     }
 
     /// Names of the blocks declared `profile` (#1065), in declaration order.
-    pub fn profiled_names(&self) -> Vec<String> {
+    pub(crate) fn profiled_names(&self) -> Vec<String> {
         self.decls.iter().filter(|d| d.profiled).map(|d| d.name.clone()).collect()
     }
 
     /// θ indices of the profiled blocks' estimated levels (#1065): each `Free` level,
     /// a `NegSum` dependent being no θ of its own. Sorted.
-    pub fn profiled_theta_indices(&self) -> Vec<usize> {
+    pub(crate) fn profiled_theta_indices(&self) -> Vec<usize> {
         let mut out: Vec<usize> = self
             .decls
             .iter()
@@ -30238,16 +30238,16 @@ pub struct SwitchRhs {
 }
 
 pub struct OdeRhsProgram {
-    pub stmts: Vec<Statement>,
-    pub n_vars_total: usize,
+    pub(crate) stmts: Vec<Statement>,
+    pub(crate) n_vars_total: usize,
     state_count: usize,
     /// Per individual parameter `i`, the slot in the flat `params` vector it is
     /// read from (its PK slot). Same plan the f64 `rhs` closure uses.
-    pub indiv_to_params_slot: Vec<usize>,
+    pub(crate) indiv_to_params_slot: Vec<usize>,
     time_slot: usize,
     tafd_slot: usize,
     tad_slot: usize,
-    pub macheps_slot: usize,
+    pub(crate) macheps_slot: usize,
     /// True when the RHS reads any of the `TIME`/`TAFD`/`TAD` time-anchor slots — i.e. the
     /// system is **non-autonomous**. A steady-state (`SS=1`) dose assumes a time-invariant
     /// pulse train, so the SS dual equilibration's cycle recurrence breaks for such an RHS;
@@ -30288,12 +30288,12 @@ pub struct OdeRhsProgram {
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
-    pub hoist: Option<RhsHoist>,
+    pub(crate) hoist: Option<RhsHoist>,
     /// [`Self::stmts`] as register code reading `u`, `params` and the seeds directly, run
     /// instead of the binding and the interpreter when the program translates (see
     /// `rhs_regcode`); `None` otherwise. It recomputes the hoist's parameter-only values,
     /// which are bit-identical to the cached ones by construction.
-    pub reg: Option<rhs_regcode::RhsRegProgram>,
+    pub(crate) reg: Option<rhs_regcode::RhsRegProgram>,
     /// Why [`Self::reg`] is `None`: the construct that kept the interpreter, and where
     /// (#2681). `Some` exactly when `reg` is `None`.
     reg_refusal: Option<rhs_regcode::RhsInterpreted>,
@@ -30327,7 +30327,7 @@ pub struct OdeRhsProgram {
     /// cannot express). Recorded here for the same reason as `init_indiv_reads`.
     init_program: Option<Vec<(usize, OdeOutputProgram)>>,
     /// Which per-call binding work this program needs (#1523).
-    pub binding: RhsBindingPlan,
+    pub(crate) binding: RhsBindingPlan,
     /// Address of the `f64` closure built alongside this program (`OdeSpec::rhs`), `0` when
     /// none: [`Self::direct_f64`] serves exactly that closure and no other.
     f64_rhs: usize,
@@ -30501,7 +30501,7 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 impl OdeRhsProgram {
     /// Which engine runs this RHS (#2681): the interpreter, with the construct that kept
     /// it; the register code, with why no native code; or native code.
-    pub fn rhs_route(&self) -> rhs_regcode::RhsRoute<'_> {
+    pub(crate) fn rhs_route(&self) -> rhs_regcode::RhsRoute<'_> {
         match (&self.reg, &self.reg_refusal) {
             (_, Some(r)) => rhs_regcode::RhsRoute::Interpreter(r),
             (Some(reg), None) => reg.route(),
@@ -30512,7 +30512,7 @@ impl OdeRhsProgram {
 
     /// The note `fit()` and `ferx check` report for an RHS that does not run as native code
     /// (#2681): `(code, message, details)`, or `None` when it does.
-    pub fn route_note(&self) -> Option<(&'static str, String, serde_json::Value)> {
+    pub(crate) fn route_note(&self) -> Option<(&'static str, String, serde_json::Value)> {
         rhs_regcode::rhs_route_note(self.rhs_route())
     }
 
@@ -30529,7 +30529,7 @@ impl OdeRhsProgram {
     }
 
     /// [`Self::program_jacobian`] of `rhs`, when it is this program's closure.
-    pub fn native_jacobian(
+    pub(crate) fn native_jacobian(
         &self, rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync), clock: bool,
     ) -> Option<NativeJacobian<'_>> {
         self.serves(rhs).then(|| self.program_jacobian(clock)).flatten()
@@ -30537,7 +30537,7 @@ impl OdeRhsProgram {
 
     /// The program's exact Jacobian as one native call, when it has native code for the
     /// tangents.
-    pub fn program_jacobian(&self, clock: bool) -> Option<NativeJacobian<'_>> {
+    pub(crate) fn program_jacobian(&self, clock: bool) -> Option<NativeJacobian<'_>> {
         let n = self.state_count;
         Some(NativeJacobian {
             tan: self.reg.as_ref()?.native_tangent(n + usize::from(clock))?,
@@ -30549,14 +30549,16 @@ impl OdeRhsProgram {
     }
 
     /// Whether `rhs` is the very closure this program was built with (same address).
-    pub fn serves(&self, rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync)) -> bool {
+    pub(crate) fn serves(
+        &self, rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+    ) -> bool {
         self.f64_rhs != 0 && self.f64_rhs == rhs as *const _ as *const () as usize
     }
 
     /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
     /// closure this program was built with (same address) and the program has an `f64`
     /// native function.
-    pub fn direct_f64(
+    pub(crate) fn direct_f64(
         &self, rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
     ) -> Option<DirectRhsF64<'_>> {
         // A model with moving switches runs its closure, which tells the integrator so.
@@ -30612,7 +30614,7 @@ impl OdeRhsProgram {
     }
 
     /// Whether every `init(...)` directive compiled ([`Self::init_state_g`] serves it).
-    pub fn has_init_program(&self) -> bool {
+    pub(crate) fn has_init_program(&self) -> bool {
         self.init_program.is_some()
     }
 
@@ -30624,7 +30626,7 @@ impl OdeRhsProgram {
     }
 
     /// See [`OdeRhsProgram::uses_time_vars`]. `true` ⇒ a steady-state dose must route to FD.
-    pub fn uses_time_vars(&self) -> bool {
+    pub(crate) fn uses_time_vars(&self) -> bool {
         self.uses_time_vars
     }
 
@@ -30633,7 +30635,7 @@ impl OdeRhsProgram {
     /// covers all four spellings, and pairing them by hand at each call site is how #1124's gap
     /// survived (the pre-#2093 `ode_tvcov_supported` paired them; the SS gate did not, and its own
     /// test worked *around* the gap by spelling the term `T`).
-    pub fn reads_time_builtin(&self) -> bool {
+    pub(crate) fn reads_time_builtin(&self) -> bool {
         self.reads_time_builtin
     }
 
@@ -30654,7 +30656,7 @@ impl OdeRhsProgram {
     /// reads as dead code once this becomes their only production caller — a
     /// `#[allow(dead_code)]` there would hide the real thing it is meant to
     /// signal, that a gate stopped asking one of them.
-    pub fn reads_model_time(&self) -> bool {
+    pub(crate) fn reads_model_time(&self) -> bool {
         self.uses_time_vars() || self.reads_time_builtin()
     }
 
@@ -30696,7 +30698,7 @@ impl OdeRhsProgram {
     /// slice of what *is*. `extract_input_rate_terms` has already lifted them out of
     /// `stmts`, so this falls out rather than needing a rule.
     #[cfg(feature = "survival")]
-    pub fn chz_dependency_slice(&self, chz_slot: usize) -> Vec<bool> {
+    pub(crate) fn chz_dependency_slice(&self, chz_slot: usize) -> Vec<bool> {
         /// Every slot any statement in `stmts` writes, recursively.
         fn writes_into(stmts: &[Statement], out: &mut Vec<usize>) {
             for s in stmts {
@@ -30830,7 +30832,7 @@ impl OdeRhsProgram {
     ///
     /// Requires [`Self::has_indiv_param`] first.
     #[cfg(feature = "survival")]
-    pub fn indiv_param_reaches_chz(&self, i: usize, slice: &[bool]) -> bool {
+    pub(crate) fn indiv_param_reaches_chz(&self, i: usize, slice: &[bool]) -> bool {
         debug_assert!(
             self.has_indiv_param(i),
             "ask has_indiv_param first: slot state_count + {i} is an intermediate's"
@@ -30852,7 +30854,7 @@ impl OdeRhsProgram {
     /// Requires [`Self::has_indiv_param`] first. A seed whose state slot is outside the
     /// mask counts as reaching, for the same reason the sibling does.
     #[cfg(feature = "survival")]
-    pub fn init_reads_indiv_param_reaching_chz(&self, i: usize, slice: &[bool]) -> bool {
+    pub(crate) fn init_reads_indiv_param_reaching_chz(&self, i: usize, slice: &[bool]) -> bool {
         debug_assert!(self.has_indiv_param(i), "ask has_indiv_param first");
         self.has_indiv_param(i)
             && self.init_indiv_reads.iter().any(|(state_slot, params)| {
@@ -30876,21 +30878,21 @@ impl OdeRhsProgram {
     /// returns `false` for. "The `[odes]` block does not read it" is the truth for them,
     /// not a default.
     #[cfg(feature = "survival")]
-    pub fn has_indiv_param(&self, i: usize) -> bool {
+    pub(crate) fn has_indiv_param(&self, i: usize) -> bool {
         i < self.indiv_to_params_slot.len()
     }
 
     /// Every `d/dt(...)` is affine in the states and no state reaches an `if` condition — the
     /// structural half of the linear fast path's eligibility (#852). The other half is
     /// [`Self::reads_any_model_time`]; `OdeSpec::linear_ineligibility` asks both.
-    pub fn is_affine_in_states(&self) -> bool {
+    pub(crate) fn is_affine_in_states(&self) -> bool {
         self.affine_in_states
     }
 
     /// Any equation reads `TIME`/`T`/`TAFD`/`TAD` — the injected hazard lines included,
     /// unlike [`Self::pk_reads_model_time`], because the exact linear path (#852) propagates
     /// the augmented system and a time-dependent hazard line is part of it.
-    pub fn reads_any_model_time(&self) -> bool {
+    pub(crate) fn reads_any_model_time(&self) -> bool {
         self.reads_model_time()
     }
 
@@ -30912,26 +30914,26 @@ impl OdeRhsProgram {
     /// f(TT)`), or a chain of them, is excluded with it, so the flag does not depend
     /// on whether the hazard's time term was factored out. An intermediate any PK
     /// derivative line reads, transitively, still counts.
-    pub fn pk_reads_model_time(&self) -> bool {
+    pub(crate) fn pk_reads_model_time(&self) -> bool {
         self.pk_reads_model_time
     }
 
     /// See [`OdeRhsProgram::pk_reads_tafd`]. Ask [`Self::pk_reads_absolute_time`] to decide
     /// anything; ask this only to phrase a message about `TAFD` specifically.
-    pub fn pk_reads_tafd(&self) -> bool {
+    pub(crate) fn pk_reads_tafd(&self) -> bool {
         self.pk_reads_tafd
     }
 
     /// See [`OdeRhsProgram::pk_reads_tad`]. Ask [`Self::pk_reads_model_time`] to decide
     /// whether the system is autonomous; ask this only to decide something about `TAD`
     /// specifically, or to phrase a message about it.
-    pub fn pk_reads_tad(&self) -> bool {
+    pub(crate) fn pk_reads_tad(&self) -> bool {
         self.pk_reads_tad
     }
 
     /// See [`OdeRhsProgram::pk_reads_solver_time`]. Ask [`Self::pk_reads_absolute_time`] to
     /// decide anything; ask this only to phrase a message about `T`/`TIME` specifically.
-    pub fn pk_reads_solver_time(&self) -> bool {
+    pub(crate) fn pk_reads_solver_time(&self) -> bool {
         self.pk_reads_solver_time
     }
 
@@ -30961,7 +30963,7 @@ impl OdeRhsProgram {
     /// Before the dataflow cut it did — #1166's kind filter kept every intermediate, an
     /// over-decline free for its routing consumer and a false positive for this diagnostic.
     /// Pinned by `a_time_reading_intermediate_used_only_by_the_hazard_does_not_warn`.
-    pub fn pk_reads_absolute_time(&self) -> bool {
+    pub(crate) fn pk_reads_absolute_time(&self) -> bool {
         self.pk_reads_tafd() || self.pk_reads_solver_time()
     }
 
@@ -31506,7 +31508,7 @@ impl CtmmGeneratorProgram {
     }
 
     /// Whether an intensity reads an ODE state (the time-inhomogeneous endpoint).
-    pub fn reads_states(&self) -> bool {
+    pub(crate) fn reads_states(&self) -> bool {
         !self.state_slots.is_empty()
     }
 
@@ -31805,17 +31807,17 @@ pub fn build_endpoint_expr_program(
 /// f64 binding in the `pk_param_fn` closure.
 #[derive(Debug, Clone)]
 pub struct IndivParamProgram {
-    pub stmts: Vec<Statement>,
-    pub n_vars: usize,
+    pub(crate) stmts: Vec<Statement>,
+    pub(crate) n_vars: usize,
     /// Per var-slot mask: `true` = the slot is cov-static (constant across every
     /// θ / η dual axis), so [`eval_params_g`](Self::eval_params_g) computes it once in `f64`
     /// and seed it as a dual constant instead of re-running the (often pow/exp/log
     /// heavy) covariate kernel under dual arithmetic every call (#485). Empty when
     /// no slot is foldable, in which case both paths run exactly as before.
-    pub cov_static_mask: Vec<bool>,
+    pub(crate) cov_static_mask: Vec<bool>,
     /// `(pk_slot, var_slot)` per individual parameter, in declaration order
     /// (parallel to `CompiledModel.pk_indices`).
-    pub pk_var_slots: Vec<(usize, usize)>,
+    pub(crate) pk_var_slots: Vec<(usize, usize)>,
     /// `pk_var_slots` projected to just the PK slots, cached at construction so the hot
     /// analytic paths borrow it via [`pk_slots_ref`](Self::pk_slots_ref) instead of
     /// re-collecting a `Vec` on every per-gradient evaluation (#534 review #2).
@@ -31845,17 +31847,17 @@ pub struct IndivParamProgram {
 impl IndivParamProgram {
     /// User-declared θ count the individual parameters reference (the dual seed
     /// dimension of η axis `k` is `n_theta_axis() + k`).
-    pub fn n_theta_axis(&self) -> usize {
+    pub(crate) fn n_theta_axis(&self) -> usize {
         self.n_theta
     }
     /// η count the individual parameters reference (BSV + IOV kappa).
-    pub fn n_eta_axis(&self) -> usize {
+    pub(crate) fn n_eta_axis(&self) -> usize {
         self.n_eta
     }
 
     /// The PK-slot list cached at construction (`pk_var_slots` projected to its PK slots),
     /// for hot paths that only read it (no per-call `Vec`, #534 review #2).
-    pub fn pk_slots_ref(&self) -> &[usize] {
+    pub(crate) fn pk_slots_ref(&self) -> &[usize] {
         &self.pk_slot_indices
     }
 
@@ -31875,7 +31877,7 @@ impl IndivParamProgram {
     /// `indiv_param_values_are_var_slot_ordered`). A slot the mask does not cover reads
     /// `true` — a missing answer must not look like "time-free" to a gate.
     #[cfg(feature = "survival")]
-    pub fn params_reading_time(&self) -> Vec<bool> {
+    pub(crate) fn params_reading_time(&self) -> Vec<bool> {
         let mask = compute_time_dependent_mask(&self.stmts, self.n_vars);
         (0..self.n_top_level_vars).map(|i| mask.get(i).copied().unwrap_or(true)).collect()
     }
@@ -31888,7 +31890,7 @@ impl IndivParamProgram {
     /// `[covariate_nn]` output read counts as reading every name (see
     /// [`compute_covariate_dependent_mask`]).
     #[cfg(feature = "markov")]
-    pub fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool> {
+    pub(crate) fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool> {
         let cov_idx: Vec<usize> = self
             .cov_names
             .iter()
@@ -31913,7 +31915,7 @@ impl IndivParamProgram {
     ///
     /// `var_slot` is the evaluator's var slot, which for a top-level name equals its
     /// index in `CompiledModel::indiv_param_names` (see `n_top_level_vars`).
-    pub fn pk_var_slots(&self) -> &[(usize, usize)] {
+    pub(crate) fn pk_var_slots(&self) -> &[(usize, usize)] {
         &self.pk_var_slots
     }
 
@@ -32063,7 +32065,7 @@ impl IndivParamProgram {
     /// `nn_outputs` is the per-`[covariate_nn]` forward output, in block order;
     /// pass an empty slice for a model with no networks. `time` feeds the `TIME`
     /// built-in (#610) and is ignored by a program that does not read it.
-    pub fn eval_param_values(
+    pub(crate) fn eval_param_values(
         &self, theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64,
         nn_outputs: &[Vec<f64>],
     ) -> Vec<f64> {
@@ -32093,7 +32095,7 @@ impl IndivParamProgram {
 /// the dual PK parameters into the scaled observable with exact derivatives
 /// (issue #367, Option A). Mirrors the f64 readout closure in `build_y_output_fn`.
 pub struct OdeOutputProgram {
-    pub bc: Bytecode,
+    pub(crate) bc: Bytecode,
     n_states: usize,
     n_indiv: usize,
     /// Per individual parameter `i`, its slot in the flat PK-parameter vector.
@@ -32133,7 +32135,7 @@ impl OdeOutputProgram {
     }
 
     /// See [`OdeOutputProgram::reads_leaves`].
-    pub fn reads_leaves(&self) -> bool {
+    pub(crate) fn reads_leaves(&self) -> bool {
         self.reads_leaves
     }
 
@@ -32150,14 +32152,14 @@ impl OdeOutputProgram {
     /// value there (`0.0` at the gate), so the probe would certify a linear readout
     /// and the fast path would then silently drop the whole time term. Callers that
     /// probe must decline on `true` (#1028).
-    pub fn reads_time_builtin(&self) -> bool {
+    pub(crate) fn reads_time_builtin(&self) -> bool {
         self.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
     }
 
     /// Number of compartment-state inputs in the readout's `vars[0..n_states]`
     /// layout. For an analytic readout this is `1` (IV: `["central"]`) or `2`
     /// (oral: `["depot", "central"]`).
-    pub fn n_states(&self) -> usize {
+    pub(crate) fn n_states(&self) -> usize {
         self.n_states
     }
 
@@ -32165,7 +32167,7 @@ impl OdeOutputProgram {
     /// `PushVar(idx)` with `idx < n_states`). The analytic Dual2 provider (#650)
     /// uses this to gate a readout that reads the oral `depot` amount — which the
     /// static superposition jet doesn't reconstruct — onto the FD path.
-    pub fn references_state(&self, idx: usize) -> bool {
+    pub(crate) fn references_state(&self, idx: usize) -> bool {
         idx < self.n_states
             && self.bc.ops.iter().any(|op| matches!(op, Op::PushVar(i) if *i as usize == idx))
     }
@@ -32219,14 +32221,14 @@ pub struct ScaleDerivProgram {
 }
 
 impl ScaleDerivProgram {
-    pub fn n_theta_axis(&self) -> usize {
+    pub(crate) fn n_theta_axis(&self) -> usize {
         self.n_theta
     }
-    pub fn n_eta_axis(&self) -> usize {
+    pub(crate) fn n_eta_axis(&self) -> usize {
         self.n_eta
     }
     /// `vars` slot → flat PK slot (so the provider knows which PK params to seed).
-    pub fn var_to_pk_slot(&self) -> &[usize] {
+    pub(crate) fn var_to_pk_slot(&self) -> &[usize] {
         &self.var_to_pk_slot
     }
 
@@ -32937,12 +32939,12 @@ pub struct IndivParamPartials {
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
     /// indiv params don't reference). Each Expression is in resolved form.
-    pub d_d_theta: Vec<Vec<Expression>>,
+    pub(crate) d_d_theta: Vec<Vec<Expression>>,
     /// `d_d_eta[i][k]` = ∂P_i/∂η_k. Inner Vec length = `n_eta_extended` —
     /// BSV η first (slots 0..n_eta_bsv), kappas appended (slots
     /// n_eta_bsv..n_eta_bsv+n_kappa). Matches the `eta` slice the
     /// `pk_param_fn` closure consumes.
-    pub d_d_eta: Vec<Vec<Expression>>,
+    pub(crate) d_d_eta: Vec<Vec<Expression>>,
     /// The partials are a **derivative program**, not closed-form trees (#1699):
     /// a partial reaches an upstream row's partial along the *same* axis
     /// through the tangent slot `VariableIdx(tangent_base + j)`, `j` that
@@ -32956,7 +32958,7 @@ pub struct IndivParamPartials {
     /// to a leaf (`0`, `ETA_CL`) is substituted in place instead, so zero
     /// partials still fold away. Equal to `vars.len()` of the primal program,
     /// its selector slots included.
-    pub tangent_base: usize,
+    pub(crate) tangent_base: usize,
     /// The first selector slot (#2471). Each statement-level `if` in the
     /// block, nested ones included, owns one slot in
     /// `selector_base..tangent_base`, written by its `if#<n>` row with the
@@ -32968,12 +32970,12 @@ pub struct IndivParamPartials {
     /// condition per row would switch branches mid-body when the body
     /// reassigns a variable the condition reads. Equal to `tangent_base` when
     /// the block has no `if`.
-    pub selector_base: usize,
+    pub(crate) selector_base: usize,
     /// The primal variable slot each row assigns, parallel to `names`.
-    pub slots: Vec<usize>,
+    pub(crate) slots: Vec<usize>,
     /// Each row's right-hand side in resolved form, parallel to
     /// `names`: the primal program the tangent program reads.
-    pub values: Vec<Expression>,
+    pub(crate) values: Vec<Expression>,
     /// The compiled individual-parameter program, so the analytic (adjoint)
     /// gradient can obtain exact `∂p/∂(θ,η)` by evaluating it over
     /// a dual or tape type seeded on (θ, η) — replacing the finite-difference `tv_theta_jacobian`
@@ -32984,7 +32986,7 @@ pub struct IndivParamPartials {
     /// the ODE provider reads its own copy from `ode_spec`.
     pub indiv_param_program: Option<IndivParamProgram>,
     /// Additive parser metadata kept behind this existing opaque public field.
-    pub theta_blocks: ThetaBlocks,
+    pub(crate) theta_blocks: ThetaBlocks,
     /// PK slots an analytical `pk(...)` line binds to a numeric **literal**
     /// (`lagtime=0.5`, `f=0.8`), in ascending slot order. Such a binding writes
     /// the slot through `pk_const_mapping` but has no `[individual_parameters]`
@@ -32995,7 +32997,7 @@ pub struct IndivParamPartials {
     /// predictor that applied the lag — measured 120 % apart at the first
     /// post-dose sample). Empty for ODE / compartment-free models and for
     /// hand-built fixtures.
-    pub const_pk_slots: Vec<usize>,
+    pub(crate) const_pk_slots: Vec<usize>,
     /// The data-derived bindings the parse compiled this model from (#1621).
     /// Written only by `parse_full_model_with`; read through
     /// [`crate::types::CompiledModel::data_bindings`]. Empty for hand-built fixtures.
@@ -33006,38 +33008,38 @@ pub struct IndivParamPartials {
     /// [`crate::types::CompiledModel::bound_from_fit`]: such a model keeps the fit's
     /// bindings, so `bind_covariate_stats` leaves it as it is and `bind_theta_levels`
     /// refuses it, where a model bound to data is re-bound from its declaration.
-    pub bound_from_fit: bool,
+    pub(crate) bound_from_fit: bool,
     /// Whether the closed-form log-normal η chain (`pk · sel_flat`) is exact
     /// for this model, computed by `lognormal_eta_chain_exact`. `None` for
     /// hand-built fixtures, which have no statements to measure: the pre-#2093
     /// forward providers then kept the older rule, "every `eta_param_info` entry is
     /// `LogNormal`". No reader remains since the adjoint replaced them.
-    pub lognormal_eta_chain: Option<bool>,
+    pub(crate) lognormal_eta_chain: Option<bool>,
     /// The nested variability levels (#1082), read through
     /// [`crate::types::CompiledModel::has_nested_levels`]. `None` for every model with at most
     /// one level, and for hand-built fixtures.
-    pub nested_levels: Option<crate::types::NestedLevels>,
+    pub(crate) nested_levels: Option<crate::types::NestedLevels>,
     /// The `[individual_parameters]` name each BSV mu-reference in
     /// [`crate::types::CompiledModel::mu_refs`] was detected on, keyed by η name
     /// (`ETA_CL -> CL`). A `BTreeMap` so any scan of it is order-deterministic.
     /// Read by `suggest_start`'s θ routing, which needs the parameter an η's
     /// mu-reference *belongs to* rather than a guess from the η's name (#1930).
     /// Empty for hand-built fixtures.
-    pub mu_ref_owners: std::collections::BTreeMap<String, String>,
+    pub(crate) mu_ref_owners: std::collections::BTreeMap<String, String>,
     /// The mu lines and θ the covariance Hessian folds into η-space ([`MuFoldSpec`], #2982).
     /// Empty for hand-built fixtures, which then take no fold.
-    pub mu_fold: MuFoldSpec,
+    pub(crate) mu_fold: MuFoldSpec,
     /// The names a `[derived]` expression looks up at evaluation time (#2599),
     /// read through [`crate::types::CompiledModel::derived_reads`]. Parser bookkeeping
     /// kept here rather than on the public `DerivedExprSpec`, whose fields are
     /// all public, so recording it does not break a downstream struct literal.
     /// Empty without a `[derived]` block, and for hand-built fixtures.
-    pub derived_reads: Vec<String>,
+    pub(crate) derived_reads: Vec<String>,
     /// The individual parameters whose value depends on a draw — an η or κ, or `MIXNUM`,
     /// through any intermediate or `if` condition (#944) — sorted. `None` for a hand-built
     /// fixture that never went through the parser, which every consumer treats as "every
     /// individual parameter is random" (the conservative answer).
-    pub random_indiv_params: Option<Vec<String>>,
+    pub(crate) random_indiv_params: Option<Vec<String>>,
 }
 
 impl IndivParamPartials {
@@ -33070,7 +33072,7 @@ impl IndivParamPartials {
 
     /// PK slots bound to a numeric literal on the `pk(...)` line — see the
     /// field doc on `const_pk_slots`.
-    pub fn const_pk_slots(&self) -> &[usize] {
+    pub(crate) fn const_pk_slots(&self) -> &[usize] {
         &self.const_pk_slots
     }
 }

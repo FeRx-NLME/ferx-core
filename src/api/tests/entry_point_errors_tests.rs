@@ -21,6 +21,8 @@
 //! # Tiering
 //!
 //! Tier 1. `fit()` is called, but only on inputs it refuses before its first iteration.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::parser::model_parser::{parse_full_model, parse_model_string};

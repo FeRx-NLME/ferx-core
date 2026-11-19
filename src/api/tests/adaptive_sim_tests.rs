@@ -4,6 +4,8 @@ use crate::sim::adaptive::{
     AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule, Comparison, ControllerCtx,
     DoseAction, DoseStep, MonitorSpec, ObserveMode,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use std::collections::HashMap;
 
 // 1-cpt IV ODE, state = central amount, readout y = central (amount units).
@@ -8521,7 +8523,7 @@ fn iov_implied_dose_oracle(
 ) -> (Vec<f64>, Vec<f64>) {
     let model = parse_model_string(ODE_IOV_X_2371).expect("parse");
     let subject = read_subject_2371(&addl_csv_2371(decisions, x_after, false), "X", None);
-    let implied = subject.doses[1].implied.expect("the dose at 12 is ADDL-implied");
+    let implied = subject.doses[1].implied().expect("the dose at 12 is ADDL-implied");
     assert_eq!((subject.doses[1].time, implied.gov_time), (12.0, 18.0));
     assert_eq!(
         crate::pk::occasion_of(decisions, 12.0) != crate::pk::occasion_of(decisions, 18.0),
@@ -8621,10 +8623,10 @@ fn assert_decision_skips_the_implied_dose(model_src: &str, label: &str) {
     let addl = read_subject_2371(crcl_csv_2528(true), "CRCL", None);
     // The straddle under the old rule: the implied dose at 12 is the latest base-regimen entry
     // before 15, and it carries the CRCL of the observation at 18.
-    assert!(addl.doses[1].implied.is_some(), "{label}: the dose at 12 is implied");
+    assert!(addl.doses[1].implied().is_some(), "{label}: the dose at 12 is implied");
     assert_eq!(addl.dose_cov(1)["CRCL"], 50.0, "{label}: it carries obs@18's CRCL");
     let rows = read_subject_2371(crcl_csv_2528(false), "CRCL", None);
-    assert!(rows.doses.iter().all(|d| d.implied.is_none()), "{label}: no implied dose");
+    assert!(rows.doses.iter().all(|d| d.implied().is_none()), "{label}: no implied dose");
 
     // F = 0.8·CRCL/100, k = 0.1/h. In both runs: the base dose at 0 and the bolus at 0 (F 0.8)
     // and the bolus at 15 under the in-force CRCL 100 (F 0.8). The base dose at 12 enters

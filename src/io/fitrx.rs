@@ -19,6 +19,8 @@
 //! - `interface_extras.json` — an interface's own data, opaque to core (only when set)
 //!
 //! See `docs/file-formats/fitrx.qmd` for the field-by-field schema.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::parser::model_parser::{DataBindings, LevelBinding};
 use crate::types::*;

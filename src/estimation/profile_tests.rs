@@ -13,6 +13,8 @@
 //! once on the population objective, with every EBE re-solved cold at each point and
 //! finite differences for both derivatives — the M3 probe of #1065, in Rust. It shares
 //! nothing with the solve but the objective.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, PrevEtas};
@@ -1917,8 +1919,13 @@ fn a_global_sum_to_zero_differences_each_subject_over_its_own_levels() {
     let p = global_prep(3);
     let layout = layout_of(&p);
     let model = &p.parsed.model;
-    let decl =
-        model.indiv_param_partials.theta_blocks.decls.iter().find(|d| d.name == "PLACEBO").unwrap();
+    let decl = model
+        .indiv_param_partials
+        .theta_blocks()
+        .decls()
+        .iter()
+        .find(|d| d.name == "PLACEBO")
+        .unwrap();
     let al = crate::levels::active_levels(model, &p.population);
     let per_subject = &al.iter().find(|a| a.block == "PLACEBO").unwrap().per_subject;
     assert_eq!(layout.groups.len(), 1, "the global contrast ties every level");

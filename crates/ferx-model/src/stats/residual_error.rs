@@ -271,7 +271,7 @@ impl ErrorSpec {
     /// [`Self::sigma_loading_slopes`], [`Self::scaled_loadings`] and the generic
     /// likelihood kernel read, without a heap allocation — the kernel reads it for every
     /// row of every subject at every gradient.
-    pub fn loading_shape(&self, cmt: usize, n_sigma: usize) -> Loads<(usize, LoadingForm)> {
+    pub(crate) fn loading_shape(&self, cmt: usize, n_sigma: usize) -> Loads<(usize, LoadingForm)> {
         let mut out = Loads::empty((0, LoadingForm::Const));
         let (model, slots) = match self {
             ErrorSpec::Single(em) => (em, [(n_sigma > 0).then_some(0), (n_sigma > 1).then_some(1)]),
@@ -302,7 +302,9 @@ impl ErrorSpec {
     }
 
     /// [`Self::sigma_loadings`], inline.
-    pub fn sigma_loadings_inline(&self, cmt: usize, f: f64, n_sigma: usize) -> Loads<(usize, f64)> {
+    pub(crate) fn sigma_loadings_inline(
+        &self, cmt: usize, f: f64, n_sigma: usize,
+    ) -> Loads<(usize, f64)> {
         let mut out = Loads::empty((0, 0.0));
         for (i, form) in self.loading_shape(cmt, n_sigma) {
             out.push((i, form.eval(f).0));
@@ -311,7 +313,7 @@ impl ErrorSpec {
     }
 
     /// [`Self::sigma_loading_slopes`], inline.
-    pub fn sigma_loading_slopes_inline(
+    pub(crate) fn sigma_loading_slopes_inline(
         &self, cmt: usize, f: f64, n_sigma: usize,
     ) -> Loads<(usize, f64)> {
         let mut out = Loads::empty((0, 0.0));
@@ -324,7 +326,7 @@ impl ErrorSpec {
     /// Whether flat sigma slot `k`'s loading for the observation with key `cmt` depends on
     /// the prediction `f` — the slot that carries `∂v/∂f` (the proportional one, or
     /// `LogCombined`'s additive one, #2729).
-    pub fn slot_reads_f(&self, cmt: usize, k: usize, n_sigma: usize) -> bool {
+    pub(crate) fn slot_reads_f(&self, cmt: usize, k: usize, n_sigma: usize) -> bool {
         self.loading_shape(cmt, n_sigma)
             .iter()
             .any(|&(i, form)| i == k && form != LoadingForm::Const)
@@ -355,7 +357,7 @@ impl ErrorSpec {
 
     /// [`variance_at_with_correlations`](Self::variance_at_with_correlations) before
     /// the invalid-variance guard ([`variance_is_guarded`]).
-    pub fn variance_at_with_correlations_raw(
+    pub(crate) fn variance_at_with_correlations_raw(
         &self, cmt: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
     ) -> f64 {
         if correlations.is_empty() {
@@ -387,7 +389,7 @@ impl ErrorSpec {
 
     /// [`variance_at_scaled`](Self::variance_at_scaled) before the invalid-variance
     /// guard ([`variance_is_guarded`]).
-    pub fn variance_at_scaled_raw(
+    pub(crate) fn variance_at_scaled_raw(
         &self, cmt: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
@@ -406,7 +408,7 @@ impl ErrorSpec {
     /// [`power_loading`] for a proportional-type slot whose row carries an
     /// exponent ([`slot_exponent`]). Slot presence is
     /// [`sigma_loadings`](Self::sigma_loadings)'s.
-    pub fn scaled_loadings(
+    pub(crate) fn scaled_loadings(
         &self, cmt: usize, f: f64, n_sigma: usize, mult: &[f64],
     ) -> Loads<ScaledLoading> {
         let mut out = Loads::empty(ScaledLoading { idx: 0, c: 0.0, c1: 0.0, c2: 0.0 });
@@ -865,7 +867,7 @@ impl ErrorSpec {
     /// [`variance_at`](Self::variance_at) before the invalid-variance guard
     /// ([`variance_is_guarded`]). `NaN` for an unregistered `PerCmt` cmt, as there.
     #[inline]
-    pub fn variance_at_raw(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
+    pub(crate) fn variance_at_raw(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
         match self {
             ErrorSpec::Single(em) => residual_variance_raw(*em, f_pred, sigma),
             _ => self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw),

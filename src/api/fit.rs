@@ -6,6 +6,8 @@ use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
 use crate::pk;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -1928,7 +1930,7 @@ fn fit_inner(
     // What the covariance step differentiates: a `profile`d block's levels (#1065) are
     // re-profiled inside its stencil, not stenciled, so its cost and its scale routing
     // read the structural count.
-    let profiled = model.indiv_param_partials.theta_blocks.profiled_theta_indices();
+    let profiled = model.indiv_param_partials.theta_blocks().profiled_theta_indices();
     let n_params_pre = held_mask
         .iter()
         .enumerate()
@@ -2701,7 +2703,7 @@ fn fit_inner(
             // parameters; `check_profiled_levels` has refused every method but foce, focei
             // and laplace at one node. A run that did not leave its start is probed
             // (#2591), as on every other outer optimizer.
-            _ if !model.indiv_param_partials.theta_blocks.profiled_names().is_empty() => {
+            _ if !model.indiv_param_partials.theta_blocks().profiled_names().is_empty() => {
                 floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
                     crate::estimation::profile::optimize_profiled_probed(model, population, p, o)
                 })
@@ -3824,7 +3826,7 @@ fn fit_inner(
         cov_eigenvalues,
         cov_condition_number,
         bic_inputs,
-        profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
+        profiled_blocks: model.indiv_param_partials.theta_blocks().profiled_names(),
         profiled_levels_at_bound,
         held_at_bound: Vec::new(),
         eta_log_transformed,

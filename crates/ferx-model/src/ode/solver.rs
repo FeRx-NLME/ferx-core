@@ -351,7 +351,7 @@ impl OdeSolverOptions {
     /// integrated after all — the exact path declined it, or a driver (the threshold search)
     /// has no exact counterpart — it is integrated exactly as the default would integrate it,
     /// stiffness probe and escalation guard included.
-    pub fn for_integration(&self) -> Self {
+    pub(crate) fn for_integration(&self) -> Self {
         match self.method {
             OdeMethod::Linear => Self { method: OdeMethod::Auto, ..*self },
             _ => *self,
@@ -794,7 +794,7 @@ impl OdeSolverStats {
     /// `!(err_norm <= 1.0)` so a non-finite `err_norm` (a diverging RHS pinned
     /// at `min_dt`) still counts as a min-step clamp rather than a clean accept.
     #[inline]
-    pub fn record(&mut self, accepted: bool, err_norm: f64, dt_eff: f64, min_dt: f64) {
+    pub(crate) fn record(&mut self, accepted: bool, err_norm: f64, dt_eff: f64, min_dt: f64) {
         self.attempted_steps += 1;
         if accepted {
             self.accepted_steps += 1;
@@ -808,12 +808,12 @@ impl OdeSolverStats {
 
     /// Steps force-accepted at `min_dt` over the error test on trajectories the caller
     /// received: a clamp in an `auto` attempt the guard discarded is not one.
-    pub fn kept_clamped_steps(&self) -> usize {
+    pub(crate) fn kept_clamped_steps(&self) -> usize {
         self.min_step_clamped_steps.saturating_sub(self.discarded_clamped_steps)
     }
 
     /// Unfinished segments among the trajectories the caller received.
-    pub fn kept_unfinished_segments(&self) -> usize {
+    pub(crate) fn kept_unfinished_segments(&self) -> usize {
         self.unfinished_segments.saturating_sub(self.discarded_unfinished_segments)
     }
 
@@ -821,7 +821,7 @@ impl OdeSolverStats {
     /// logical solve across more than one driver call (the `auto` finite-guard's escalated
     /// attempt and its explicit re-solve).
     #[inline]
-    pub fn merge(&mut self, other: &OdeSolverStats) {
+    pub(crate) fn merge(&mut self, other: &OdeSolverStats) {
         let OdeSolverStats {
             attempted_steps,
             accepted_steps,
@@ -867,7 +867,7 @@ impl OdeSolverStats {
     /// counting it only as the former is what would let a stalled-and-frozen integration
     /// present the same clean stats block as a healthy one.
     #[inline]
-    pub fn record_min_step_failure(&mut self) {
+    pub(crate) fn record_min_step_failure(&mut self) {
         self.attempted_steps += 1;
         self.rejected_steps += 1;
         self.min_step_clamped_steps += 1;

@@ -6,6 +6,8 @@ use crate::sim::adaptive::{
     AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
     DoseLedgerEntry, MonitorSpec,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 use nalgebra::DVector;
 use rand::RngExt;
 use rand_distr::Normal;
@@ -871,7 +873,7 @@ fn decisions_before_moved_reset_warnings(
                 .chain(
                     s.doses
                         .iter()
-                        .filter(|d| d.implied.is_none() && d.time < engine)
+                        .filter(|d| d.implied().is_none() && d.time < engine)
                         .map(|d| s.param_time_at(d.time)),
                 )
                 .chain(s.reset_times.iter().filter(|&&t| t < engine).map(|&t| s.param_time_at(t)));
@@ -1354,7 +1356,7 @@ where
                     needs_tad: model
                         .ruv_magnitude
                         .as_ref()
-                        .is_some_and(|rm| rm.is_active() && rm.uses_tad),
+                        .is_some_and(|rm| rm.is_active() && rm.uses_tad()),
                     base_seed: crate::sim::adaptive::subject_assay_base_seed(
                         assay_root,
                         &subject.id,
@@ -1997,7 +1999,7 @@ pub(super) fn decision_covs_by_scan<'a>(
     );
     rows.extend(
         (0..subject.doses.len())
-            .filter(|&k| subject.doses[k].implied.is_none())
+            .filter(|&k| subject.doses[k].implied().is_none())
             .map(|k| (subject.doses[k].time, subject.dose_cov(k))),
     );
     rows.extend(
@@ -2189,7 +2191,7 @@ fn check_event_pk_records(
             let d = &subject.doses[k];
             (model.pk_param_fn)(
                 theta,
-                eta_at(d.implied.map_or(d.time, |i| i.gov_time)),
+                eta_at(d.implied().map_or(d.time, |i| i.gov_time)),
                 subject.dose_cov(k),
                 subject.dose_param_time(k),
             )

@@ -7,6 +7,8 @@
 //! 12 sponsors × 2 studies × 2 arms × 5 visits, `ARM` numbered 1, 2 inside each study and
 //! `ARMID` numbering the same arms across the file. The NONMEM anchor of the composed
 //! model is `tests/nested_levels_correlation_nonmem_anchor.rs`.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::api::validation::check_model_data;
 use crate::build_info::GradientMethodKind;

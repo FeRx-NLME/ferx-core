@@ -22,6 +22,8 @@ use crate::sim::adaptive::{
     assay_standard_normal, subject_assay_base_seed, ControllerCtx, DoseAction, MonitorSpec,
     ObserveMode,
 };
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 const SEED: u64 = 7;
 

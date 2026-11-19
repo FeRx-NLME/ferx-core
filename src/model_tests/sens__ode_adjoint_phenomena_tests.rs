@@ -11,6 +11,8 @@
 //! check is against an oracle that shares no derivative code with the adjoint: the
 //! reconverged-FD objective gradient ([`fd_oracle`]) and a Richardson difference of the
 //! production predictor for `∂f/∂η`. Each bound is the measured worst with ~10× headroom.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::estimation::parameterization::lower_tri_entries;
 use ferx_model::estimation::parameterization::unpack_params;

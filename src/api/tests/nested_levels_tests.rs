@@ -4,6 +4,8 @@
 //! The numerical oracles live in `tests/`: the NONMEM anchor and nesting-by-key (O1,
 //! O3, `nested_levels_nonmem_anchor.rs`) and the one-level degenerate oracle (O2,
 //! `nested_levels_degenerate_oracle.rs`).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::api::validation::{check_model_data, check_model_options, validate_model_file};
 use crate::parser::model_parser::{parse_full_model, parse_model_string};

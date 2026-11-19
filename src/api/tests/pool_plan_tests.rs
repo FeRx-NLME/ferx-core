@@ -9,6 +9,8 @@
 //! exactly the models that need the bigger stack, and only under a tool, where
 //! no existing test looks. Both halves are pinned below: the declared size, and
 //! a runtime probe that actually touches more stack than the default provides.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::api::fit;
 

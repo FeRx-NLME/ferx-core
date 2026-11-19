@@ -15,6 +15,8 @@
 //!
 //! Each draw is unpacked via [`unpack_params`] so theta, Omega, and Sigma are
 //! perturbed coherently (they share one packed vector).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::api::ParamBlock;
 use crate::diagnostics::EngineError;

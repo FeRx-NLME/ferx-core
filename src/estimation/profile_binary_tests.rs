@@ -16,6 +16,8 @@
 //!
 //! Every number below was measured on macOS arm64 and again on Linux aarch64
 //! (`tools/linux-test.sh`), which agreed in every printed digit.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 

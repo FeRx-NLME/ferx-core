@@ -1,5 +1,7 @@
 //! #1909: an `ADDL`-implied dose takes its lag from its parent row and everything else
 //! from the record that governs it.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::pk::one_compartment::*;
 use ferx_model::pk::three_compartment::*;
@@ -265,13 +267,13 @@ fn a_parent_that_is_not_an_earlier_dose_record_is_ignored() {
     // Only a dose list edited after the read can hold one; the copy must not reach it.
     let (model, mut subject) = fixture();
     let set = |s: &mut Subject, parent: usize| {
-        s.doses[2].implied.as_mut().unwrap().parent = parent;
+        s.doses[2].implied_mut().as_mut().unwrap().parent = parent;
     };
     set(&mut subject, 3); // a later dose
     assert_eq!(subject.implied_dose_parent(2), None);
     set(&mut subject, 2); // itself
     assert_eq!(subject.implied_dose_parent(2), None);
-    subject.doses[3].implied.as_mut().unwrap().parent = 2; // an implied dose
+    subject.doses[3].implied_mut().as_mut().unwrap().parent = 2; // an implied dose
     set(&mut subject, 0);
     assert_eq!(subject.implied_dose_parent(3), None);
     assert_eq!(subject.implied_dose_parent(2), Some(0));

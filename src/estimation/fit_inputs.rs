@@ -20,6 +20,8 @@
 //! #1783 then prepares that population the way `fit()` prepared the one it was
 //! given — derived occasions under the fit's recorded rule, LTBS's log-DV — with
 //! `fit()`'s own helper, so the step scores the population the fit scored.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 pub use ferx_model::estimation::population_check::ScoringSettings;
 use std::borrow::Cow;

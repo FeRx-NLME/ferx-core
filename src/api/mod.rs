@@ -2,6 +2,8 @@ use crate::diagnostics::{CheckReport, Diagnostic};
 use crate::io::datareader::{ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC};
 use crate::pk;
 use crate::types::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 #[cfg(test)]
 use nalgebra::{DMatrix, DVector};
 #[cfg(test)]

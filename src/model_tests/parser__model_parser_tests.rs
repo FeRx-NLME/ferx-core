@@ -1,3 +1,5 @@
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use ferx_model::cold_sort::ColdSort;
 use ferx_model::parser::covariate_model::CovariateStatBindings;
@@ -5947,7 +5949,7 @@ fn block_value(stmts: &[Statement], theta: &[f64], covs: &[(&str, f64)], name: &
 /// A group's typical value at `covs`.
 fn group_typical(g: &CovariateMuRef, theta: &[f64], covs: &[(&str, f64)]) -> f64 {
     let map: HashMap<String, f64> = covs.iter().map(|(k, v)| (k.to_string(), *v)).collect();
-    eval_typical_value(&g.typical, theta, &map)
+    eval_typical_value(&g.typical(), theta, &map)
 }
 
 /// The issue's melphalan model: `CRCLR` is assigned in both arms of an
@@ -6404,10 +6406,10 @@ fn covariate_mu_ref_read_outside_groups_stops_at_every_group_owner() {
     for grp in &g {
         assert_eq!(grp.shared_thetas, vec!["TH_WT"], "{}", grp.eta_name);
         assert!(
-            grp.read_outside_groups.is_empty(),
+            grp.read_outside_groups().is_empty(),
             "{}: {:?}",
             grp.eta_name,
-            grp.read_outside_groups
+            grp.read_outside_groups()
         );
     }
 
@@ -6415,12 +6417,12 @@ fn covariate_mu_ref_read_outside_groups_stops_at_every_group_owner() {
     let g = detect_groups_outside(&with_f1, &tn, &en, &["CL", "V1", "F1"]);
     assert_eq!(g.len(), 2);
     for grp in &g {
-        assert_eq!(grp.read_outside_groups, vec!["TH_WT"], "{}", grp.eta_name);
+        assert_eq!(*grp.read_outside_groups(), vec!["TH_WT"], "{}", grp.eta_name);
     }
 
     // The theta named in another block directly is outside every group too.
     let g = detect_groups_outside(pair, &tn, &en, &["CL", "V1", "TH_WT"]);
-    assert_eq!(g[0].read_outside_groups, vec!["TH_WT"]);
+    assert_eq!(*g[0].read_outside_groups(), vec!["TH_WT"]);
 }
 
 /// The taint stops at the statement that **defines** a group, not at every
@@ -6450,19 +6452,19 @@ fn covariate_mu_ref_taint_stops_at_the_defining_statement_not_the_name() {
     assert_eq!(g.len(), 2);
     assert_eq!(g[0].eta_name, "ETA_CL");
     assert_eq!(g[0].shared_thetas, vec!["TH_X"], "(a) shared_thetas");
-    assert_eq!(g[0].read_outside_groups, vec!["TH_X"], "(a) read_outside_groups");
+    assert_eq!(*g[0].read_outside_groups(), vec!["TH_X"], "(a) read_outside_groups");
 
     let own_owner = format!("CL = TH_X * 2.0\nQ = CL * 0.5\n{group}");
     let g = detect_groups_outside(&own_owner, &tn, &en, &["CL", "Q"]);
     assert_eq!(g.len(), 1);
     assert_eq!(g[0].shared_thetas, vec!["TH_X"], "(b) shared_thetas");
-    assert_eq!(g[0].read_outside_groups, vec!["TH_X"], "(b) read_outside_groups");
+    assert_eq!(*g[0].read_outside_groups(), vec!["TH_X"], "(b) read_outside_groups");
 
     let dead = format!("CL = TH_X * 2.0\n{group}");
     let g = detect_groups_outside(&dead, &tn, &en, &["CL"]);
     assert_eq!(g.len(), 1);
     assert!(g[0].shared_thetas.is_empty(), "(c) {:?}", g[0].shared_thetas);
-    assert!(g[0].read_outside_groups.is_empty(), "(c) {:?}", g[0].read_outside_groups);
+    assert!(g[0].read_outside_groups().is_empty(), "(c) {:?}", g[0].read_outside_groups());
 }
 
 /// A group records the single anchors whose theta it reads (#1630), with the
@@ -6486,19 +6488,19 @@ fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
 
     let g = detect_groups_outside(&base, &tn, &en, &["V1", "V2", "KA"]);
     assert_eq!(g.len(), 1);
-    assert_eq!(g[0].read_outside_groups, vec!["TVV2"], "(a)");
+    assert_eq!(*g[0].read_outside_groups(), vec!["TVV2"], "(a)");
     assert!(
-        g[0].read_outside_groups_and_anchors.is_empty(),
+        g[0].read_outside_groups_and_anchors().is_empty(),
         "(a) {:?}",
-        g[0].read_outside_groups_and_anchors
+        g[0].read_outside_groups_and_anchors()
     );
-    assert_eq!(g[0].colliding_anchors.len(), 1, "(a)");
-    let a = &g[0].colliding_anchors[0];
+    assert_eq!(g[0].colliding_anchors().len(), 1, "(a)");
+    let a = &g[0].colliding_anchors()[0];
     assert_eq!(a.eta_name, "ETA_V2");
     assert_eq!(a.theta_names, vec!["TVV2"]);
     assert_eq!(a.transform, MuTransform::Log);
-    assert!(a.read_outside_groups_and_anchors.is_empty(), "(a)");
-    assert!(!a.eta_shared, "(a)");
+    assert!(a.read_outside_groups_and_anchors().is_empty(), "(a)");
+    assert!(!a.eta_shared(), "(a)");
 
     // (a') A second group that reads `TVKA` but not `TVV2`: each group lists
     // the anchors on *its* thetas only.
@@ -6508,7 +6510,7 @@ fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
     assert_eq!(g.len(), 2, "(a')");
     assert_eq!(g[0].eta_name, "ETA_V1");
     let etas = |g: &CovariateMuRef| -> Vec<String> {
-        g.colliding_anchors.iter().map(|a| a.eta_name.clone()).collect()
+        g.colliding_anchors().iter().map(|a| a.eta_name.clone()).collect()
     };
     assert_eq!(etas(&g[0]), vec!["ETA_V2"], "(a')");
     // `ETA_KA`'s plain line is overwritten by its group, so it is no anchor.
@@ -6516,16 +6518,16 @@ fn covariate_mu_ref_records_the_single_anchors_it_collides_with() {
 
     let third = format!("{base}\nQ = TVV2 * 0.1");
     let g = detect_groups_outside(&third, &tn, &en, &["V1", "V2", "KA", "Q"]);
-    assert_eq!(g[0].read_outside_groups_and_anchors, vec!["TVV2"], "(b)");
-    assert_eq!(g[0].colliding_anchors[0].read_outside_groups_and_anchors, vec!["TVV2"], "(b)");
+    assert_eq!(*g[0].read_outside_groups_and_anchors(), vec!["TVV2"], "(b)");
+    assert_eq!(*g[0].colliding_anchors()[0].read_outside_groups_and_anchors(), vec!["TVV2"], "(b)");
 
     let retired = format!("{base}\nV2 = TVV2 + ETA_V2");
     let g = detect_groups_outside(&retired, &tn, &en, &["V1", "V2", "KA"]);
-    assert!(g[0].colliding_anchors.is_empty(), "(c)");
+    assert!(g[0].colliding_anchors().is_empty(), "(c)");
 
     let shared_eta = format!("{base}\nQ = 3.0 * exp(0.5 * ETA_V2)");
     let g = detect_groups_outside(&shared_eta, &tn, &en, &["V1", "V2", "KA", "Q"]);
-    assert!(g[0].colliding_anchors[0].eta_shared, "(d)");
+    assert!(g[0].colliding_anchors()[0].eta_shared(), "(d)");
 }
 
 #[test]
@@ -16406,7 +16408,7 @@ fn readout_reads_time(model: &CompiledModel) -> bool {
         .and_then(|o| o.readout_program.as_ref())
         .or_else(|| model.analytic_readout.as_ref().and_then(|a| a.program.as_ref()))
         .expect("uniform Form C readout carries a program");
-    program.bc.ops.iter().any(|op| matches!(op, Op::PushTime))
+    program.bc().ops.iter().any(|op| matches!(op, Op::PushTime))
 }
 
 /// `T` / `t` is the `[odes]` spelling of the same built-in (reserved there against
@@ -18163,11 +18165,11 @@ fn eval_partials_along(
     let cov_vec: Vec<f64> = keys.iter().map(|k| cov[k.as_str()]).collect();
     let nn_outputs: Vec<Vec<f64>> = Vec::new();
     let n = partials.names.len();
-    let mut vars = vec![0.0_f64; partials.tangent_base + n];
+    let mut vars = vec![0.0_f64; partials.tangent_base() + n];
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let v = eval_expression_indexed(
-            &partials.values[i],
+            &partials.values()[i],
             theta,
             eta,
             &cov_vec,
@@ -18175,13 +18177,13 @@ fn eval_partials_along(
             &nn_outputs,
         );
         let d = match axis {
-            DiffAxis::Theta(k) => &partials.d_d_theta[i][k],
-            DiffAxis::Eta(k) => &partials.d_d_eta[i][k],
+            DiffAxis::Theta(k) => &partials.d_d_theta()[i][k],
+            DiffAxis::Eta(k) => &partials.d_d_eta()[i][k],
             DiffAxis::Variable(_) => unreachable!("partials have no variable axis"),
         };
         let dv = eval_expression_indexed(d, theta, eta, &cov_vec, &mut vars, &nn_outputs);
-        vars[partials.slots[i]] = v;
-        vars[partials.tangent_base + i] = dv;
+        vars[partials.slots()[i]] = v;
+        vars[partials.tangent_base() + i] = dv;
         out.push(dv);
     }
     out
@@ -18248,13 +18250,13 @@ fn indiv_partials_populated_for_1cpt_oral() {
     let m = &parsed.model;
     let partials = &m.indiv_param_partials;
     assert_eq!(partials.names, vec!["CL", "V", "KA"]);
-    assert_eq!(partials.d_d_theta.len(), 3);
-    assert_eq!(partials.d_d_eta.len(), 3);
+    assert_eq!(partials.d_d_theta().len(), 3);
+    assert_eq!(partials.d_d_eta().len(), 3);
     // Each row has length n_theta_base (3) and n_eta_extended (3).
-    for row in &partials.d_d_theta {
+    for row in partials.d_d_theta() {
         assert_eq!(row.len(), 3);
     }
-    for row in &partials.d_d_eta {
+    for row in partials.d_d_eta() {
         assert_eq!(row.len(), 3);
     }
 
@@ -19994,10 +19996,10 @@ fn cov_static_mask_classifies_kernel_and_dynamic_tail() {
         .as_ref()
         .expect("indiv param program present");
     // Some slots fold (the covariate/FIXED-θ kernel) …
-    assert!(prog.cov_static_mask.iter().any(|&b| b), "expected some cov-static slots");
+    assert!(prog.cov_static_mask().iter().any(|&b| b), "expected some cov-static slots");
     // … and at least one does not (the free-θ × exp(η) CL slot).
     assert!(
-        prog.cov_static_mask.iter().any(|&b| !b),
+        prog.cov_static_mask().iter().any(|&b| !b),
         "expected the dynamic CL slot to stay unfolded"
     );
 }
@@ -20233,10 +20235,10 @@ fn cov_static_else_if_governed_by_earlier_dynamic_condition() {
     let cl = names.iter().position(|n| n == "CL").expect("CL slot");
     // `FAC` must not fold: which value it takes depends on `ETA_SW`.
     assert!(
-        !prog.cov_static_mask.get(fac).copied().unwrap_or(false),
+        !prog.cov_static_mask().get(fac).copied().unwrap_or(false),
         "FAC is governed by the η condition of the earlier arm; it must not be cov-static \
          (mask = {:?}, names = {names:?})",
-        prog.cov_static_mask
+        prog.cov_static_mask()
     );
     // `CL` is read through the pk slot list.
     let cl_row = prog.pk_var_slots().iter().position(|&(_, vs)| vs == cl).expect("CL is a pk slot");
@@ -24680,21 +24682,21 @@ fn error_model_tad_builtin_refuses_a_declared_tad_covariate() {
 #[test]
 fn ruv_magnitude_records_whether_it_reads_tad() {
     let without = parse_model_string(POWER_MODEL).unwrap();
-    assert!(!without.ruv_magnitude.as_ref().unwrap().uses_tad);
+    assert!(!without.ruv_magnitude.as_ref().unwrap().uses_tad());
     for spelling in ["TAD", "tad"] {
         let with = parse_model_string(&POWER_MODEL.replace(
             "power(PROP_ERR, RUV_POW)",
             &format!("power(PROP_ERR * (if ({spelling} < 12.0) 1.5 else 1.0), RUV_POW)"),
         ))
         .unwrap();
-        assert!(with.ruv_magnitude.as_ref().unwrap().uses_tad, "{spelling}");
+        assert!(with.ruv_magnitude.as_ref().unwrap().uses_tad(), "{spelling}");
     }
     // The exponent is an expression too.
     let in_exponent = parse_model_string(
         &POWER_MODEL.replace("power(PROP_ERR, RUV_POW)", "power(PROP_ERR, RUV_POW + 0.01 * TAD)"),
     )
     .unwrap();
-    assert!(in_exponent.ruv_magnitude.as_ref().unwrap().uses_tad);
+    assert!(in_exponent.ruv_magnitude.as_ref().unwrap().uses_tad());
 }
 
 #[test]
@@ -25745,7 +25747,7 @@ fn covariate_mu_ref_flags_an_eta_a_second_typical_value_reads() {
         &en,
     );
     assert_eq!(g.len(), 1);
-    assert!(!g[0].eta_shared, "ETA_CL is written by CL alone");
+    assert!(!g[0].eta_shared(), "ETA_CL is written by CL alone");
 
     // Shared: V reads ETA_CL through a shape `split_typical_and_eta` does not
     // recognise, so `retire_superseded_group` leaves the group standing.
@@ -25755,7 +25757,7 @@ fn covariate_mu_ref_flags_an_eta_a_second_typical_value_reads() {
         &en,
     );
     assert_eq!(g.len(), 1, "premise: the group is not retired");
-    assert!(g[0].eta_shared, "V reads ETA_CL too");
+    assert!(g[0].eta_shared(), "V reads ETA_CL too");
 
     // Shared from inside a branch, which is still a second consumer.
     let g = detect_groups(
@@ -25764,7 +25766,7 @@ fn covariate_mu_ref_flags_an_eta_a_second_typical_value_reads() {
         &en,
     );
     assert_eq!(g.len(), 1);
-    assert!(g[0].eta_shared, "a conditional second consumer counts");
+    assert!(g[0].eta_shared(), "a conditional second consumer counts");
 }
 
 // ── `model NAME` preamble line (#1395) ─────────────────────────────────────
@@ -26057,8 +26059,8 @@ fn eta_independent_split_is_value_preserving_on_every_shape() {
             .indiv_param_program
             .as_ref()
             .unwrap_or_else(|| panic!("{name}: no indiv_param_program"));
-        let stmts = &program.stmts;
-        let n_vars = program.n_vars;
+        let stmts = &program.stmts();
+        let n_vars = program.n_vars();
         let Some(split) = split_ip_eta_independent_prefix(
             stmts,
             n_vars,
@@ -26185,10 +26187,10 @@ fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
                 let _guard = ModelTimeGuard::enter(*time);
                 let cov_vec: Vec<f64> =
                     cov_names.iter().map(|n| cov.get(n).copied().unwrap_or(0.0)).collect();
-                let mut vars = vec![0.0f64; program.n_vars];
+                let mut vars = vec![0.0f64; program.n_vars()];
                 let mut stack: Vec<f64> = Vec::new();
                 eval_statements_indexed_with_stack(
-                    &program.stmts,
+                    &program.stmts(),
                     theta,
                     eta,
                     &cov_vec,
@@ -26198,7 +26200,7 @@ fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
                     &mut stack,
                 );
                 let mut p = [0.0f64; MAX_PK_PARAMS];
-                for &(pk_slot, var_slot) in &program.pk_var_slots {
+                for &(pk_slot, var_slot) in program.pk_var_slots() {
                     p[pk_slot] = vars[var_slot];
                 }
                 p
@@ -26218,7 +26220,7 @@ fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
         for &i in &order {
             let (theta, eta, cov, time) = &inputs[i];
             let got = (model.pk_param_fn)(theta, eta, cov, *time);
-            for &(pk_slot, _) in &program.pk_var_slots {
+            for &(pk_slot, _) in program.pk_var_slots() {
                 assert_eq!(
                     got.values[pk_slot].to_bits(),
                     want[i][pk_slot].to_bits(),
@@ -26268,8 +26270,8 @@ fn eta_dependent_statements_shed_their_eta_independent_powers() {
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
     let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
-        &program.stmts,
-        program.n_vars,
+        &program.stmts(),
+        program.n_vars(),
         model.n_theta,
         model.referenced_covariates.len(),
     )
@@ -26277,16 +26279,16 @@ fn eta_dependent_statements_shed_their_eta_independent_powers() {
     // Whole statements: HILL and KA are η-independent and hoist whole; V's `(WT/70)`
     // is too cheap to lift (cost < 20) so V stays whole in the suffix.
     assert_eq!(split.n_subexpr, 1, "lifted sub-expressions");
-    assert_eq!(split.n_vars, program.n_vars + 1, "one synthetic slot per lift");
+    assert_eq!(split.n_vars, program.n_vars() + 1, "one synthetic slot per lift");
     assert!(!split.key_time, "no TIME reader may be lifted, so TIME stays out of the key");
     // Powers: original program has 1 (KA) + 4 (CL) = 5; the suffix keeps the two
     // `TIME^HILL` and `TI50^HILL`.
-    assert_eq!(count_pow_ops(&program.stmts), 5);
+    assert_eq!(count_pow_ops(&program.stmts()), 5);
     assert_eq!(count_pow_ops(&split.suffix), 3, "TIME readers and the η reader stay");
     assert_eq!(count_pow_ops(&split.prefix), 2, "KA's and CL's lifted allometric power");
     // The synthetic slot is the tail of `writes`, so the cache entry's `vals` stays
     // parallel to it.
-    assert_eq!(split.writes.last().copied(), Some(program.n_vars));
+    assert_eq!(split.writes.last().copied(), Some(program.n_vars()));
 }
 
 /// `1 − (WT/70)^0.75` compiles to `…, PushConst(1), RSub` (#1996), so the lift must
@@ -26304,8 +26306,8 @@ fn a_literal_left_subtraction_is_lifted_out_of_an_eta_statement() {
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
     let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
-        &program.stmts,
-        program.n_vars,
+        &program.stmts(),
+        program.n_vars(),
         model.n_theta,
         model.referenced_covariates.len(),
     )
@@ -26313,7 +26315,7 @@ fn a_literal_left_subtraction_is_lifted_out_of_an_eta_statement() {
     assert_eq!(split.n_subexpr, 1, "lifted sub-expressions");
     let lifted_rsub = split.prefix.iter().any(|st| match st {
         Statement::AssignBc(slot, bc) => {
-            *slot >= program.n_vars && bc.ops.iter().any(|o| matches!(o, Op::RSub))
+            *slot >= program.n_vars() && bc.ops.iter().any(|o| matches!(o, Op::RSub))
         }
         _ => false,
     });
@@ -26337,14 +26339,14 @@ fn a_tainted_slot_blocks_the_sub_expression_lift() {
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
     let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
-        &program.stmts,
-        program.n_vars,
+        &program.stmts(),
+        program.n_vars(),
         model.n_theta,
         model.referenced_covariates.len(),
     )
     .expect("SCALE's first assignment hoists");
     assert_eq!(split.n_subexpr, 0, "`SCALE^0.5` reads a tainted slot");
-    assert_eq!(split.n_vars, program.n_vars);
+    assert_eq!(split.n_vars, program.n_vars());
     // `SCALE = SCALE^2` conflicts with CL's read, so it and `V` stay whole.
     assert_eq!(count_pow_ops(&split.suffix), 2);
 }
@@ -26404,8 +26406,8 @@ fn ip_unhoisted_model(src: &str) -> CompiledModel {
     let model = parse_model_string(src).expect("unhoisted parse");
     assert!(
         split_ip_eta_independent_prefix(
-            &model.indiv_param_partials.indiv_param_program.as_ref().expect("program").stmts,
-            model.indiv_param_partials.indiv_param_program.as_ref().expect("program").n_vars,
+            &model.indiv_param_partials.indiv_param_program.as_ref().expect("program").stmts(),
+            model.indiv_param_partials.indiv_param_program.as_ref().expect("program").n_vars(),
             model.n_theta,
             model.referenced_covariates.len(),
         )
@@ -26766,12 +26768,12 @@ fn hoist_leaves_the_indiv_param_program_unsplit() {
     let hp = hoisted.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     let cp = cold.indiv_param_partials.indiv_param_program.as_ref().expect("program");
     assert_eq!(
-        hp.stmts.len(),
-        cp.stmts.len(),
+        hp.stmts().len(),
+        cp.stmts().len(),
         "the snapshot the dual evaluators read must be the unsplit list"
     );
-    assert_eq!(hp.n_vars, cp.n_vars);
-    assert_eq!(hp.pk_var_slots, cp.pk_var_slots);
+    assert_eq!(hp.n_vars(), cp.n_vars());
+    assert_eq!(hp.pk_var_slots(), cp.pk_var_slots());
 }
 
 // ── #1644: the synthesized level-index column never reaches the user ─────────
@@ -27043,7 +27045,7 @@ fn gather_readout_program(m: &CompiledModel) -> &OdeOutputProgram {
 }
 
 fn readout_has_gather_op(m: &CompiledModel) -> bool {
-    gather_readout_program(m).bc.ops.iter().any(|op| matches!(op, Op::PushThetaGather(_)))
+    gather_readout_program(m).bc().ops.iter().any(|op| matches!(op, Op::PushThetaGather(_)))
 }
 
 fn readout_synth_names(m: &CompiledModel) -> Vec<&str> {
@@ -27149,7 +27151,7 @@ fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
     assert!(readout_has_gather_op(&m), "premise: the gather is still in the readout");
     assert!(
         !gather_readout_program(&m)
-            .bc
+            .bc()
             .ops
             .iter()
             .any(|op| matches!(op, Op::PushTheta(_) | Op::PushEta(_))),
@@ -28826,7 +28828,7 @@ fn a_recorded_covariate_group_is_linear_on_a_diamond() {
             let g = &groups[0];
             assert_eq!(g.theta_names, ["TVCL", "TVV"], "{op} diamond, depth {d}");
             assert_eq!(g.covariate_names, ["WT"], "{op} diamond, depth {d}");
-            (nodes, g.typical.node_count(), groups)
+            (nodes, g.typical().node_count(), groups)
         };
         // The value, at depth 3: TVCL = 1.3, TVV = 1.1, WT = 0.9.
         let (_, _, groups) = measure(3);
@@ -28905,7 +28907,7 @@ fn the_symbolic_partials_are_linear_on_a_diamond() {
             let src = op_diamond(d, "TVV * exp(ETA_V)", op) + &tail.replace("{d}", &d.to_string());
             let p = diamond_partials(&src);
             assert_eq!(p.names.len(), 3 * d + 2, "{op} diamond, depth {d}: one row per line");
-            p.d_d_theta.iter().chain(&p.d_d_eta).flatten().map(expr_nodes).sum::<usize>()
+            p.d_d_theta().iter().chain(p.d_d_eta()).flatten().map(expr_nodes).sum::<usize>()
         };
         // From depth 1: level 0 reads `X0`, whose partials are leaves.
         let c1 = count(1);
@@ -28938,10 +28940,10 @@ fn the_symbolic_partials_on_a_diamond_match_fd() {
         let eta = [0.2, -0.15];
         let cov: HashMap<String, f64> = HashMap::new();
         let primal = |theta: &[f64], eta: &[f64]| -> Vec<f64> {
-            let mut vars = vec![0.0_f64; p.tangent_base];
-            p.values
+            let mut vars = vec![0.0_f64; p.tangent_base()];
+            p.values()
                 .iter()
-                .zip(&p.slots)
+                .zip(p.slots())
                 .map(|(e, &slot)| {
                     let v = eval_expression_indexed(e, theta, eta, &[], &mut vars, &[]);
                     vars[slot] = v;
@@ -29010,24 +29012,24 @@ fn program_final(
             wt
         })
         .collect();
-    let mut vars = vec![0.0_f64; p.tangent_base + p.names.len()];
+    let mut vars = vec![0.0_f64; p.tangent_base() + p.names.len()];
     for i in 0..p.names.len() {
-        let v = eval_expression_indexed(&p.values[i], theta, eta, &cov, &mut vars, &[]);
+        let v = eval_expression_indexed(&p.values()[i], theta, eta, &cov, &mut vars, &[]);
         let d = match axis {
-            DiffAxis::Theta(k) => &p.d_d_theta[i][k],
-            DiffAxis::Eta(k) => &p.d_d_eta[i][k],
+            DiffAxis::Theta(k) => &p.d_d_theta()[i][k],
+            DiffAxis::Eta(k) => &p.d_d_eta()[i][k],
             DiffAxis::Variable(_) => unreachable!("partials have no variable axis"),
         };
         let dv = eval_expression_indexed(d, theta, eta, &cov, &mut vars, &[]);
-        vars[p.slots[i]] = v;
-        vars[p.tangent_base + i] = dv;
+        vars[p.slots()[i]] = v;
+        vars[p.tangent_base() + i] = dv;
     }
     let row = p
         .names
         .iter()
         .rposition(|n| n == name)
         .unwrap_or_else(|| panic!("`{name}` has a partials row"));
-    (vars[p.slots[row]], vars[p.tangent_base + row])
+    (vars[p.slots()[row]], vars[p.tangent_base() + row])
 }
 
 /// `name`'s value from the production `pk_param_fn` at `WT = wt`.
@@ -29277,13 +29279,13 @@ fn a_guarded_row_off_its_axis_folds_to_zero() {
     let p = &m.indiv_param_partials;
     let row = p.names.iter().rposition(|n| n == "CL").unwrap();
     assert!(
-        matches!(p.d_d_eta[row][0], Expression::Literal(v) if v == 0.0),
+        matches!(p.d_d_eta()[row][0], Expression::Literal(v) if v == 0.0),
         "{:?}",
-        p.d_d_eta[row][0]
+        p.d_d_eta()[row][0]
     );
     // ∂CL/∂TVCL is live on both branches, so it is no constant.
     assert!(matches!(
-        p.d_d_theta[row][0],
+        p.d_d_theta()[row][0],
         Expression::VariableIdx(_) | Expression::Conditional(..)
     ));
 }
@@ -29391,8 +29393,8 @@ fn funnels_1712(e0: &str, y: &str) -> Vec<Funnel> {
     );
     let parsed = parse_full_model(&src).expect("parses");
     let decl = &parsed.model.theta_blocks().level_blocks()[0];
-    assert_eq!(decl.eta_couplings.len(), 1, "one random effect");
-    decl.eta_couplings[0].funnels.clone()
+    assert_eq!(decl.eta_couplings().len(), 1, "one random effect");
+    decl.eta_couplings()[0].funnels.clone()
 }
 
 /// #1712: only the operands of the smallest sum or product collecting both the
@@ -29637,8 +29639,10 @@ fn assert_inliner_matches_eager(
         // middle of a product associates differently from the eager tree's.
         let group = |g: Option<(usize, CovariateMuRef)>| {
             g.map(|(e, mut g)| {
-                let typical =
-                    std::mem::replace(&mut g.typical, TypicalProgram::of(Expression::Literal(0.0)));
+                let typical = std::mem::replace(
+                    g.typical_mut(),
+                    TypicalProgram::of(Expression::Literal(0.0)),
+                );
                 let covs = g.covariate_names.clone();
                 (format!("{:?}", (e, g)), typical, covs)
             })
@@ -31268,11 +31272,11 @@ fn hoist_model(src: &str) -> CompiledModel {
 /// The same program with the lift switched off — the oracle.
 fn hoist_model_unlifted(src: &str) -> CompiledModel {
     let mut m = hoist_model(src);
-    m.ode_spec
+    *m.ode_spec
         .as_mut()
         .and_then(|s| s.rhs_program.as_mut())
         .expect("ODE model has an RHS program")
-        .hoist = None;
+        .hoist_mut() = None;
     m
 }
 
@@ -31311,7 +31315,7 @@ fn hoist_stmt_reads(stmts: &[Statement], out: &mut Vec<usize>) {
 /// `vals[i]` at individual parameter `i`'s slot.
 fn hoist_params<T: crate::sens::num::PkNum>(prog: &OdeRhsProgram, vals: &[T]) -> Vec<T> {
     let mut p = vec![T::from_f64(0.0); crate::types::MAX_PK_PARAMS + 2];
-    for (i, &slot) in prog.indiv_to_params_slot.iter().enumerate() {
+    for (i, &slot) in prog.indiv_to_params_slot().iter().enumerate() {
         p[slot] = vals[i];
     }
     p[crate::types::MAX_PK_PARAMS] = T::from_f64(0.0);
@@ -31331,7 +31335,7 @@ fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_prog
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
-    let h = prog.hoist.as_ref().expect("the two-cpt RHS has liftable subtrees");
+    let h = prog.hoist().as_ref().expect("the two-cpt RHS has liftable subtrees");
     // `0 − SH` (unary minus), `Q/V1` and `Q/V2` — each of the last two read twice in
     // the source and lifted once.
     let lifted: Vec<String> = h.lifted.iter().map(|(_, bc)| format!("{:?}", bc.ops)).collect();
@@ -31350,8 +31354,8 @@ fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_prog
     }
     assert_eq!(h.key_slots.len(), 4, "key slots: {:?}", h.key_slots);
     let mut analysis_reads = Vec::new();
-    hoist_stmt_reads(&prog.stmts, &mut analysis_reads);
-    assert!(analysis_reads.iter().all(|&s| s < prog.n_vars_total));
+    hoist_stmt_reads(&prog.stmts(), &mut analysis_reads);
+    assert!(analysis_reads.iter().all(|&s| s < prog.n_vars_total()));
     for &k in &h.key_slots {
         assert!(analysis_reads.contains(&k), "analysis program lost read of slot {k}");
     }
@@ -31359,9 +31363,9 @@ fn rhs_hoist_lifts_each_parameter_only_subtree_once_and_leaves_the_analysis_prog
     // The straddle: `CL/V` is lifted, `(0 − central)·CL` has nothing to lift — and a
     // program with nothing to lift carries no cache at all.
     let ratio = hoist_model(HOIST_ONE_CPT_RATIO);
-    assert_eq!(hoist_program(&ratio).hoist.as_ref().map(|h| h.lifted.len()), Some(1));
+    assert_eq!(hoist_program(&ratio).hoist().as_ref().map(|h| h.lifted.len()), Some(1));
     let none = hoist_model(HOIST_ONE_CPT_NONE);
-    assert!(hoist_program(&none).hoist.is_none());
+    assert!(hoist_program(&none).hoist().is_none());
 }
 
 /// Run `prog` and its unlifted twin over the same call sequence and require
@@ -31376,10 +31380,10 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
-    assert!(prog.hoist.is_some());
+    assert!(prog.hoist().is_some());
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
-    assert!(plain.hoist.is_none());
+    assert!(plain.hoist().is_none());
     let spec = model.ode_spec.as_ref().unwrap();
 
     // Indiv params in declaration order: CL, V1, Q, V2, DR, SH.
@@ -31490,7 +31494,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         // The lift is live for a first-order dual: its scratch carries the cache tail.
         assert_eq!(
             vars_h.len(),
-            prog.hoist.as_ref().unwrap().n_ext,
+            prog.hoist().as_ref().unwrap().n_ext,
             "a first-order dual uses the lift"
         );
         for j in 0..2 {
@@ -31534,7 +31538,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         &mut vars_m,
         &mut stack_m,
     );
-    assert_eq!(vars_m.len(), prog.n_vars_total, "Dual2 must not use the lift");
+    assert_eq!(vars_m.len(), prog.n_vars_total(), "Dual2 must not use the lift");
     let mut want = [M::constant(0.0); 2];
     plain.eval_rhs_g::<M>(
         &ud,
@@ -31564,7 +31568,7 @@ fn rhs_hoist_cache_is_keyed_to_the_program_not_just_the_inputs() {
     let ratio = hoist_model(HOIST_ONE_CPT_RATIO);
     let product = hoist_model(HOIST_ONE_CPT_PRODUCT);
     let (pr, pp) = (hoist_program(&ratio), hoist_program(&product));
-    let (hr, hp) = (pr.hoist.as_ref().unwrap(), pp.hoist.as_ref().unwrap());
+    let (hr, hp) = (pr.hoist().as_ref().unwrap(), pp.hoist().as_ref().unwrap());
     // Same shape, or the length check alone would separate them.
     assert_eq!(hr.n_ext, hp.n_ext);
     assert_eq!(hr.key_slots, hp.key_slots);
@@ -31612,7 +31616,7 @@ fn rhs_hoist_hit_reuses_the_cached_value_and_a_miss_recomputes_it() {
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_ONE_CPT_RATIO);
     let prog = hoist_program(&model);
-    let h = prog.hoist.as_ref().unwrap();
+    let h = prog.hoist().as_ref().unwrap();
     let (slot, _) = h.lifted[0];
     let u = [50.0];
     let p1 = hoist_params::<f64>(prog, &[3.0, 30.0]);
@@ -31717,7 +31721,7 @@ fn rhs_hoist_does_not_merge_subtrees_that_differ_only_in_a_literal() {
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_LITERALS);
     let prog = hoist_program(&model);
-    assert_eq!(prog.hoist.as_ref().map(|h| h.lifted.len()), Some(2));
+    assert_eq!(prog.hoist().as_ref().map(|h| h.lifted.len()), Some(2));
     let plain_model = hoist_model_unlifted(HOIST_LITERALS);
     let plain = hoist_program(&plain_model);
     let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
@@ -31825,7 +31829,7 @@ fn rhs_hoist_never_lifts_a_mixnum_reader() {
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_MIXNUM);
     let prog = hoist_program(&model);
-    let h = prog.hoist.as_ref().expect("KIN/KOUT is liftable, so the cache is live");
+    let h = prog.hoist().as_ref().expect("KIN/KOUT is liftable, so the cache is live");
     for (_, bc) in &h.lifted {
         assert!(
             !bc.ops.iter().any(|o| matches!(o, Op::PushMixNum)),
@@ -31941,7 +31945,7 @@ const HOIST_BRANCH_ONLY_WRITE: &str = "
 fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &[(Vec<f64>, f64)]) {
     let model = hoist_model(src);
     let prog = hoist_program(&model);
-    assert!(prog.hoist.is_some(), "fixture must have a live cache");
+    assert!(prog.hoist().is_some(), "fixture must have a live cache");
     let plain_model = hoist_model_unlifted(src);
     let plain = hoist_program(&plain_model);
     let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
@@ -32033,7 +32037,7 @@ fn rhs_hoist_never_lifts_a_bare_time_reader() {
     // both), which every program the compiler declines still takes.
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_BARE_TIME);
-    for (_, bc) in &hoist_program(&model).hoist.as_ref().expect("CL/V lifts").lifted {
+    for (_, bc) in &hoist_program(&model).hoist().as_ref().expect("CL/V lifts").lifted {
         assert!(
             !bc.ops.iter().any(|o| matches!(o, Op::PushTime)),
             "a lifted subtree reads TIME: {:?}",
@@ -32085,7 +32089,7 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_ONE_CPT_RATIO);
     let prog = hoist_program(&model);
-    let (slot, _) = prog.hoist.as_ref().unwrap().lifted[0];
+    let (slot, _) = prog.hoist().as_ref().unwrap().lifted[0];
     let rhs = &model.ode_spec.as_ref().unwrap().rhs;
     let u = [50.0];
     let p1 = hoist_params::<f64>(prog, &[3.0, 30.0]);
@@ -32122,7 +32126,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_TWO_CPT);
     let prog = hoist_program(&model);
-    assert_eq!(prog.hoist.as_ref().unwrap().key_slots.len(), 4);
+    assert_eq!(prog.hoist().as_ref().unwrap().key_slots.len(), 4);
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
     let rhs = &model.ode_spec.as_ref().unwrap().rhs;
@@ -32247,7 +32251,7 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
     let model = hoist_model(HOIST_SIGNED_ZERO);
     let prog = hoist_program(&model);
-    assert!(prog.hoist.is_some());
+    assert!(prog.hoist().is_some());
     let plain_model = hoist_model_unlifted(HOIST_SIGNED_ZERO);
     let plain = hoist_program(&plain_model);
     let rhs = &model.ode_spec.as_ref().unwrap().rhs;
@@ -32375,7 +32379,12 @@ fn lean_spec(lines: &[&str]) -> crate::ode::OdeSpec {
 }
 
 fn lean_plan(lines: &[&str]) -> RhsBindingPlan {
-    lean_spec(lines).rhs_program.as_ref().expect("ODE spec carries its RHS program").binding
+    lean_spec(lines)
+        .rhs_program
+        .as_ref()
+        .expect("ODE spec carries its RHS program")
+        .binding()
+        .clone()
 }
 
 /// Each fixture with the plan it must get. `zero = false` only where every read
@@ -32738,7 +32747,7 @@ fn lean_rhs_dual2_vs_fd(compiled: bool) {
     for (name, lines, _) in LEAN_FIXTURES {
         let spec = lean_spec(lines);
         let prog = spec.rhs_program.as_ref().unwrap();
-        n_compiled += usize::from(prog.reg.is_some());
+        n_compiled += usize::from(prog.reg().is_some());
         let mut lag_live = false;
         for (u, t) in &points {
             let f = |x: &[f64; 3]| -> [f64; 2] {
@@ -32861,16 +32870,16 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
     };
     let (sp, lp) = (small.rhs_program.as_ref().unwrap(), large.rhs_program.as_ref().unwrap());
     for (name, p) in [("small", sp), ("large", lp)] {
-        assert!(p.hoist.is_none(), "{name}: must take the no-hoist reset");
-        assert!(!p.binding.zero, "{name}: must be a lean (no re-zero) binding");
+        assert!(p.hoist().is_none(), "{name}: must take the no-hoist reset");
+        assert!(!p.binding().zero, "{name}: must be a lean (no re-zero) binding");
     }
     // The straddle: an intermediate the large model writes lies past the end of
     // the small model's buffer.
     assert!(
-        lp.n_vars_total > sp.n_vars_total + 1,
+        lp.n_vars_total() > sp.n_vars_total() + 1,
         "large {} vs small {}",
-        lp.n_vars_total,
-        sp.n_vars_total
+        lp.n_vars_total(),
+        sp.n_vars_total()
     );
 
     let mut params = vec![0.0; crate::types::MAX_PK_PARAMS + 2];
@@ -32883,7 +32892,7 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
     assert!(want.iter().all(|w| w.is_finite() && *w != 0.0));
     let mut sink = [0.0; 2];
     (small.rhs)(&u, &params, 0.5, &mut sink);
-    FERX_SCRATCH.with(|c| assert_eq!(c.borrow().rhs_vars.len(), sp.n_vars_total));
+    FERX_SCRATCH.with(|c| assert_eq!(c.borrow().rhs_vars.len(), sp.n_vars_total()));
     let mut got = [0.0; 2];
     (large.rhs)(&u, &params, 0.5, &mut got);
     for j in 0..2 {
@@ -32909,7 +32918,7 @@ fn lean_rhs_binding_resizes_a_buffer_another_model_left_short() {
         &mut vars,
         &mut stack,
     );
-    assert_eq!(vars.len(), sp.n_vars_total);
+    assert_eq!(vars.len(), sp.n_vars_total());
     let mut got = vec![0.0; 2];
     lp.eval_rhs_g::<f64>(
         &u,
@@ -33021,7 +33030,7 @@ fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
             .find(|(n, ..)| *n == name)
             .unwrap_or_else(|| panic!("no fixture {name}"));
         let spec = lean_spec(lines);
-        spec.rhs_program.as_ref().unwrap().hoist.is_some()
+        spec.rhs_program.as_ref().unwrap().hoist().is_some()
     };
     for name in
         ["no hoist, R defined only inside an if without else", "no hoist, R defined on both arms"]
@@ -33030,14 +33039,14 @@ fn lean_rhs_binding_fixtures_reach_the_intended_reset() {
     }
     let spec = lean_spec(&["K = CL / V + MACHEPS", "d/dt(a) = -K * a", "d/dt(b) = K * a - Q * b"]);
     let p = spec.rhs_program.as_ref().unwrap();
-    let h = p.hoist.as_ref().expect("MACHEPS fixture is hoisted");
-    let slot = [p.macheps_slot];
+    let h = p.hoist().as_ref().expect("MACHEPS fixture is hoisted");
+    let slot = [p.macheps_slot()];
     assert!(
         !stmts_read_slots(&h.stmts, &slot)
             && h.lifted.iter().any(|(_, bc)| bc
                 .ops
                 .iter()
-                .any(|op| matches!(op, Op::PushVar(i) if *i as usize == p.macheps_slot))),
+                .any(|op| matches!(op, Op::PushVar(i) if *i as usize == p.macheps_slot()))),
         "MACHEPS must be read only by the lifted code, not the residual statements"
     );
     assert!(has_hoist("K defined only inside an if without else"));
@@ -33130,7 +33139,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
                 &mut sf,
             );
             let mut got = vec![T::from_f64(0.0); 2];
-            pollute(&mut vl, lean.n_vars_total, &mut got);
+            pollute(&mut vl, lean.n_vars_total(), &mut got);
             lean.eval_rhs_g::<T>(
                 &u,
                 params,
@@ -33162,7 +33171,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
         };
         let lean = lean_s.rhs_program.as_ref().unwrap();
         let full = full_s.rhs_program.as_ref().unwrap();
-        assert!(full.binding.zero, "{name}: oracle must be the full binding");
+        assert!(full.binding().zero, "{name}: oracle must be the full binding");
 
         // The f64 closure, on the shared thread-local scratch. All oracle calls
         // first: interleaving them would hand the lean program a buffer stamped
@@ -33181,7 +33190,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             let mut got = [-LEAN_GARBAGE; 2];
             FERX_SCRATCH.with(|c| {
                 let mut s = c.borrow_mut();
-                let n = lean.n_vars_total.min(s.rhs_vars.len());
+                let n = lean.n_vars_total().min(s.rhs_vars.len());
                 s.rhs_vars[..n].fill(LEAN_GARBAGE);
             });
             (lean_s.rhs)(u, &params, *t, &mut got);
@@ -33259,8 +33268,8 @@ fn profiled_decls(parsed: &ParsedModel) -> Vec<(String, bool)> {
     parsed
         .model
         .indiv_param_partials
-        .theta_blocks
-        .decls
+        .theta_blocks()
+        .decls()
         .iter()
         .map(|d| (d.name.clone(), d.profiled))
         .collect()
@@ -33352,8 +33361,8 @@ fn profile_box(parsed: &ParsedModel) -> Option<(f64, f64)> {
     parsed
         .model
         .indiv_param_partials
-        .theta_blocks
-        .decls
+        .theta_blocks()
+        .decls()
         .iter()
         .find(|d| d.name == "PLACEBO")
         .unwrap()
@@ -33776,8 +33785,8 @@ fn linked_of(text: &str, name: &str) -> bool {
     parsed
         .model
         .indiv_param_partials
-        .theta_blocks
-        .decls
+        .theta_blocks()
+        .decls()
         .iter()
         .find(|d| d.name == name)
         .expect("the block")
@@ -34345,7 +34354,7 @@ fn lognormal_eta_chain_skips_only_an_unconditionally_replaced_eta_free_definitio
     ];
     for (label, indiv, want) in cases {
         let m = eta_scale_model(&format!("{indiv}{V}"), "");
-        assert_eq!(m.indiv_param_partials.lognormal_eta_chain, Some(*want), "{label}");
+        assert_eq!(m.indiv_param_partials.lognormal_eta_chain(), Some(*want), "{label}");
     }
 }
 
@@ -36061,14 +36070,14 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
         parse_model_string(&src).unwrap_or_else(|e| panic!("{e}\n{src}"))
     }
     let names = |m: &CompiledModel| -> Vec<String> {
-        let f = &m.indiv_param_partials.mu_fold;
+        let f = &m.indiv_param_partials.mu_fold();
         f.thetas.iter().map(|&i| m.theta_names[i].clone()).collect()
     };
     let plain = "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V)";
     let rhs = "-(CL/V) * central";
     let m = model("", plain, rhs);
     assert_eq!(names(&m), ["TVCL", "TVV"], "the plain log-normal model");
-    assert_eq!(m.indiv_param_partials.mu_fold.lines.len(), 2);
+    assert_eq!(m.indiv_param_partials.mu_fold().lines.len(), 2);
 
     // TVCL also read by the right-hand side (through K2, which the ODE reads): it reaches the
     // data around CL.
@@ -36119,7 +36128,7 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
     // Per line, the θ that reach it: the pairs whose cross derivative the Hessian forms. TH_WT
     // reaches both lines, each typical value only its own — a pair left out here would drop a
     // nonzero `∂²μ/∂θ_i∂θ_j`, one put in costs a program run.
-    let f = &m.indiv_param_partials.mu_fold;
+    let f = &m.indiv_param_partials.mu_fold();
     let reach: Vec<Vec<&str>> =
         f.reach.iter().map(|r| r.iter().map(|&i| m.theta_names[i].as_str()).collect()).collect();
     assert_eq!(reach, [vec!["TVCL", "TH_WT"], vec!["TVV", "TH_WT"]]);
@@ -36178,11 +36187,11 @@ fn a_covariate_model_block_is_read_through_its_statements_by_every_exclusivity_c
                     g.eta_name.clone(),
                     g.theta_names.clone(),
                     g.shared_thetas.clone(),
-                    g.read_outside_groups.clone(),
+                    g.read_outside_groups().clone(),
                 )
             })
             .collect();
-        let f = &m.indiv_param_partials.mu_fold;
+        let f = &m.indiv_param_partials.mu_fold();
         Seen {
             thetas: m.theta_names.clone(),
             mu_refs,
@@ -36233,15 +36242,15 @@ fn a_named_endpoint_block_is_an_outside_reader_like_its_unnamed_spelling() {
             .find(|g| g.eta_name == "ETA_CL")
             .unwrap_or_else(|| panic!("{header}: the CL group is recorded"));
         assert_eq!(
-            cl.read_outside_groups,
+            *cl.read_outside_groups(),
             vec!["THETA_WT"],
             "{header}: the hazard reads THETA_WT outside the CL group"
         );
         let wt = m.theta_names.iter().position(|n| n == "THETA_WT").unwrap();
         assert!(
-            !m.indiv_param_partials.mu_fold.thetas.contains(&wt),
+            !m.indiv_param_partials.mu_fold().thetas.contains(&wt),
             "{header}: a θ the hazard reads is not folded: {:?}",
-            m.indiv_param_partials.mu_fold
+            m.indiv_param_partials.mu_fold()
         );
     }
 }
@@ -36416,7 +36425,7 @@ fn an_eta_read_by_another_block_is_a_second_use() {
             .iter()
             .find(|g| g.eta_name == "ETA_CL")
             .expect("the CL group is recorded")
-            .eta_shared;
+            .eta_shared();
         (cl, m.mu_refs.contains_key("ETA_V"))
     };
     assert_eq!(seen(""), (false, true), "control: both η are exclusive to their line");
@@ -36473,9 +36482,9 @@ fn an_eta_read_by_a_named_hazard_is_a_second_use_like_its_unnamed_spelling() {
             .iter()
             .find(|g| g.eta_name == "ETA_CL")
             .unwrap_or_else(|| panic!("{header}: the CL group is recorded"));
-        assert!(cl.eta_shared, "{header}: the hazard reads ETA_CL: {cl:?}");
+        assert!(cl.eta_shared(), "{header}: the hazard reads ETA_CL: {cl:?}");
         assert!(
-            cl.read_outside_groups.is_empty(),
+            cl.read_outside_groups().is_empty(),
             "{header}: no θ of the group is read outside it: {cl:?}"
         );
     }
