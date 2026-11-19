@@ -740,7 +740,7 @@ fn replicate_events_carry_the_sample_its_ofv_and_its_outcome() {
         assert!(ofv.is_finite());
         assert_eq!(ofv.to_bits(), r.ofv.to_bits(), "sample {sample}");
         // The outcome agrees with the row `raw_results.csv` writes: a
-        // two-iteration fit has not converged, and has moved off its start.
+        // three-iteration fit has not converged, and has moved off its start.
         assert!(!r.converged, "premise: sample {sample} did not converge");
         assert_eq!(outcome, ReplicateOutcome::NotConverged, "sample {sample}");
         // …and the default `skip_minimization_terminated` leaves it out of the
