@@ -774,7 +774,7 @@ fn a_malformed_theta_clause_is_an_error() {
     assert!(e.contains("`low` is not a number"), "{e}");
 
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => T(0.75, -10)");
-    assert!(e.contains("needs exactly (init, lower, upper)"), "{e}");
+    assert!(e.contains("needs (init) or (init, lower, upper)"), "{e}");
 
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => ");
     assert!(e.contains("empty `=>` clause"), "{e}");
@@ -1162,4 +1162,21 @@ fn the_two_operators_are_still_one_line_per_pair() {
     let e =
         err("  WT continuous", "  CL ~ WT linear(center = 70)\n  CL ~ WT linear(center = 70) +");
     assert!(e.contains("declared more than once"), "{e}");
+}
+
+/// #2864: `=> NAME(init)` names the θ and sets its init, and keeps the bounds the form
+/// gives it with no clause, per θ and by position: what `SeedInits` writes for a fitted
+/// coefficient. A part that states its bounds keeps them.
+#[test]
+fn an_init_only_theta_clause_keeps_the_form_default_bounds() {
+    let bounds = |s: &CovariateModelSpec| -> Vec<(String, f64, f64, f64)> {
+        s.relations[0].thetas.iter().map(|t| (t.name.clone(), t.init, t.lower, t.upper)).collect()
+    };
+    let bare = spec("  WT continuous", "  CL ~ WT power(center = 70)");
+    let seeded = spec("  WT continuous", "  CL ~ WT power(center = 70) => THETA_CL_WT(0.82)");
+    assert_eq!(bounds(&seeded), [("THETA_CL_WT".into(), 0.82, -100.0, 1e6)]);
+    assert_eq!(bounds(&bare)[0].2..bounds(&bare)[0].3, -100.0..1e6);
+    let levels = "  SEX categorical(levels = [0, 1, 2])";
+    let cat = spec(levels, "  CL ~ SEX categorical(ref = 0) => A(0.1), B(0.2, -0.5, 0.5)");
+    assert_eq!(bounds(&cat), [("A".into(), 0.1, -1.0, 5.0), ("B".into(), 0.2, -0.5, 0.5)]);
 }

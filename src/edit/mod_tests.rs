@@ -1524,6 +1524,64 @@ fn seed_inits_carries_estimates_over_by_name_not_position() {
     assert!(params.contains(&"sigma PROP_ERR ~ 0.05 (sd)".to_string()), "{params:?}");
 }
 
+/// #2864: a `[covariate_model]` coefficient has no `[parameters]` line, so `SeedInits` left
+/// it at the form's default (`0.001` for `power`) and the seeded model was not the fit's
+/// optimum (14.1 OFV off on #2863's model). Now each fitted coefficient is written into its
+/// relation as `NAME(estimate)`, keeping the default bounds, or with the bounds its clause
+/// states; a `FIX` relation is left alone. Re-parsed, every coefficient starts at its
+/// estimate with the bounds it had.
+#[test]
+fn seed_inits_writes_covariate_model_coefficients_2864() {
+    let rel =
+        |p: &str, names: &[(&str, f64)], fixed: bool| crate::types::CovariateRelationEstimate {
+            parameter: p.into(),
+            covariate: "WT".into(),
+            form: "power".into(),
+            center_source: Some("70".into()),
+            center: Some(70.0),
+            expression: None,
+            thetas: names
+                .iter()
+                .map(|(n, v)| crate::types::CovariateThetaEstimate {
+                    name: n.to_string(),
+                    estimate: *v,
+                    se: None,
+                    fixed,
+                    level: None,
+                })
+                .collect(),
+        };
+    let mut fit = fit_with(&[], &[], &[], &[], &[], &[]);
+    fit.covariate_relations = vec![
+        rel("CL", &[("THETA_CL_WT", 0.8216)], false),
+        rel("V", &[("THETA_V_WT", 0.91)], false),
+        rel("KA", &[("THETA_KA_WT", 0.3)], true),
+    ];
+    let src = format!(
+        "{BASE}\n[covariate_model]\n  CL ~ WT power(center = 70)\n  \
+         V ~ WT power(center = 70) => THETA_V_WT(0.5, 0.01, 5.0)\n  \
+         KA ~ WT power(center = 70, fix = 0.3)\n"
+    );
+    let mut text = ModelText::parse(&src).unwrap();
+    apply(&mut text, ModelEdit::SeedInits(&fit));
+    assert_eq!(
+        text.block_lines("covariate_model"),
+        [
+            "CL ~ WT power(center = 70) => THETA_CL_WT(0.8216)",
+            "V ~ WT power(center = 70) => THETA_V_WT(0.91, 0.01, 5.0)",
+            "KA ~ WT power(center = 70, fix = 0.3)",
+        ]
+    );
+    let m = crate::parser::model_parser::parse_full_model(&text.render()).unwrap().model;
+    let at = |n: &str| {
+        let i = m.theta_names.iter().position(|x| x == n).unwrap();
+        let p = &m.default_params;
+        (p.theta[i], p.theta_lower[i], p.theta_upper[i])
+    };
+    assert_eq!(at("THETA_CL_WT"), (0.8216, -100.0, 1e6));
+    assert_eq!(at("THETA_V_WT"), (0.91, 0.01, 5.0));
+}
+
 #[test]
 fn seed_inits_writes_a_collapsed_variance_verbatim() {
     // `SeedInits` reproduces the fit it is given, including an η that
