@@ -19019,9 +19019,54 @@ fn quadrature_remaining_gain_of_a_laplace_mixture_is_zero_at_its_optimum() {
         .expect("the mixture's exact per-subject gradients form")
     };
     let gain = gain_at([0.94985, 2.81959, 10.01103, -0.11795]);
-    eprintln!("w19 gain {gain}");
     assert!(gain < 0.05, "predicted gain {gain} at the optimum");
     // Moved off the optimum the same call predicts a real gain, so the number is live.
     let gain_off = gain_at([1.2, 2.81959, 10.01103, -0.11795]);
     assert!(gain_off > 1.0, "off-optimum gain {gain_off}");
+}
+
+/// A built-in optimizer that does not carry the mixture objective (`bfgs`, `lbfgs`,
+/// `trust_region`) is replaced by what `auto` resolves to (#3034 review r2): NLopt L-BFGS on
+/// the exact mixture gradient, BOBYQA where the loop has no analytic outer gradient
+/// (`gradient = fd`, out of scope) — never a gradient-based optimizer on a gradient the loop
+/// does not form. Both sides in one test, and the warning names what ran. Mutation: replace the
+/// built-ins with `NloptLbfgs` unconditionally -> the no-gradient row reads L-BFGS.
+#[test]
+fn a_replaced_mixture_optimizer_follows_the_gradient_the_loop_forms() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
+         omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .expect("model parses");
+    for requested in [Optimizer::Bfgs, Optimizer::Lbfgs, Optimizer::TrustRegion] {
+        let (with, w_with) = resolve_outer_optimizer(requested, &model, true, true);
+        assert_eq!(
+            with,
+            Optimizer::NloptLbfgs,
+            "{requested:?} with the exact gradient"
+        );
+        let w_with = w_with.expect("an explicit replaced choice warns");
+        assert!(
+            w_with.contains("replaced by NLopt L-BFGS") && !w_with.contains("BOBYQA ("),
+            "{w_with}"
+        );
+        let (without, w_without) = resolve_outer_optimizer(requested, &model, true, false);
+        assert_eq!(
+            without,
+            Optimizer::Bobyqa,
+            "{requested:?} without an analytic gradient"
+        );
+        let w_without = w_without.expect("an explicit replaced choice warns");
+        assert!(
+            w_without.contains("replaced by BOBYQA") && !w_without.contains("replaced by NLopt"),
+            "{w_without}"
+        );
+    }
+    assert_eq!(
+        resolve_outer_optimizer(Optimizer::Auto, &model, true, false),
+        (Optimizer::Bobyqa, None),
+        "auto without a gradient: BOBYQA, silently"
+    );
 }

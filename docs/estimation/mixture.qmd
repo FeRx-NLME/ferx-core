@@ -98,7 +98,7 @@ covariance R-matrix and the score cross-product $S$ are exact for the same objec
 no finite-difference fallback: a (subject $\times$ class) term the adjoint declines at run
 time is salvaged on its own by that term's reconverged difference, as for FOCE/FOCEI.
 A mixture of identical classes reproduces the single-population Laplace/AGQ fit.
-FOCE and FOCEI fits are unchanged.
+The FOCE and FOCEI mixture objectives are unchanged; their default optimizer is not (below).
 
 `optimizer = auto` resolves for a mixture exactly as for a single population: NLopt L-BFGS on
 the exact mixture gradient for every method (FOCE, FOCEI, Laplace, AGQ). An explicit

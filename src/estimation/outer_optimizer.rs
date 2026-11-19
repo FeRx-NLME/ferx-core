@@ -217,8 +217,9 @@ pub(crate) fn resolve_outer_optimizer(
     // not), and an explicit NLopt optimizer -- gradient-based or BOBYQA -- is honoured
     // without a warning (#2852): those route through `optimize_nlopt`, whose objective
     // closure branches to `mixture_gradient`. The built-in BFGS / L-BFGS and
-    // trust-region paths do not carry the mixture objective and fall back to NLopt
-    // L-BFGS, with a warning.
+    // trust-region paths do not carry the mixture objective and fall back to what
+    // `auto` resolves to (L-BFGS on the exact gradient, BOBYQA without one: never a
+    // gradient-based optimizer on a gradient the loop does not form), with a warning.
     if has_mixture {
         // Exhaustive, no wildcard: a new variant must say here whether it carries
         // the mixture objective.
@@ -226,10 +227,9 @@ pub(crate) fn resolve_outer_optimizer(
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
                 requested
             }
-            Optimizer::Auto => {
-                requested.resolve_auto_given_analytic(model, analytic_outer_gradient)
+            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
+                Optimizer::Auto.resolve_auto_given_analytic(model, analytic_outer_gradient)
             }
-            Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => Optimizer::NloptLbfgs,
         };
         // The warning is owed exactly when an *explicit* choice did not run — keyed
         // on the outcome, not on a second list of variants, so "replaced" can never
@@ -240,8 +240,13 @@ pub(crate) fn resolve_outer_optimizer(
             format!(
                 "Mixture models are optimized with an NLopt method (L-BFGS / SLSQP / MMA / \
                  BOBYQA); the requested `{}` optimizer does not carry the mixture \
-                 objective and was replaced by NLopt L-BFGS.",
-                requested.label()
+                 objective and was replaced by {}.",
+                requested.label(),
+                if resolved == Optimizer::NloptLbfgs {
+                    "NLopt L-BFGS"
+                } else {
+                    "BOBYQA (no analytic outer gradient)"
+                }
             )
         });
         return (resolved, warning);

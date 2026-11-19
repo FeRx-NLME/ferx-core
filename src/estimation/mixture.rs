@@ -3758,8 +3758,8 @@ mod tests {
         ];
         let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
         for requested in ALL_OPTIMIZERS {
-            // The analytic flag is read only by `auto`; neither value may change what an
-            // explicit choice runs or whether a warning is owed.
+            // The analytic flag decides what `auto` and a replaced choice run (L-BFGS on the
+            // exact gradient, BOBYQA without one); it never changes whether a warning is owed.
             for analytic in [true, false] {
                 let (resolved, warning) =
                     resolve_outer_optimizer(requested, &model, true, analytic);
@@ -3778,12 +3778,16 @@ mod tests {
                         assert_eq!(warning, None, "auto resolves silently");
                     }
                     OnMixture::Replaced(name) => {
-                        assert_eq!(resolved, Optimizer::NloptLbfgs, "{requested:?} runs L-BFGS");
+                        let (want, ran) = if analytic {
+                            (Optimizer::NloptLbfgs, "was replaced by NLopt L-BFGS")
+                        } else {
+                            (Optimizer::Bobyqa, "was replaced by BOBYQA")
+                        };
+                        assert_eq!(resolved, want, "{requested:?} runs what auto would");
                         let w = warning
                             .unwrap_or_else(|| panic!("{requested:?} on a mixture must warn"));
                         assert!(
-                            w.contains("does not carry the mixture objective")
-                                && w.contains("was replaced by NLopt L-BFGS"),
+                            w.contains("does not carry the mixture objective") && w.contains(ran),
                             "{requested:?}: {w}"
                         );
                         // The advice half: what the user can pick instead.
