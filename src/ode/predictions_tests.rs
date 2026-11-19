@@ -11045,21 +11045,9 @@ mod break_collision_1186 {
             clean.abandoned_non_finite_timeline, 0,
             "a finite timeline is not an abandoned walk: {clean:?}"
         );
-        // No `attempted_steps > 0` here, and the reason is a property of *this* engine worth
-        // recording: the threshold search runs on `solver::solve_ode_until_threshold`, its own
-        // driver, which does not go through `integrate_resolved_g`'s `STATS_SINK` tee — so its
-        // step counters never reach the scope and read `0` on a solve that worked (measured).
-        // The proof that the control actually ran is therefore the outcome asserted above, not
-        // the counters. It also means that on this one engine the step counters cannot serve as
-        // the "abandoned vs nothing to integrate" discriminator the way they do everywhere
-        // else; the new counter is the only thing that separates them here.
-        assert_eq!(
-            clean.attempted_steps, 0,
-            "this engine's own driver does not tee into the stats sink, so its step counters \
-             stay zero even on a solve that worked. If this is now non-zero the tee has been \
-             widened and the comment above (and the control's proof of life) needs revisiting: \
-             {clean:?}"
-        );
+        // No step to count here: dose C puts 100 in the monitored state at t = 0, so the control
+        // crosses at its first break without integrating. The threshold search's step counters
+        // are pinned on a search that integrates, in `solver`'s tests (#1412).
     }
 
     /// The control for the test above: the *same* engine on the *same* fixture with a
