@@ -2164,8 +2164,8 @@ fn fit_inner(
     // is only knowable once the gradient has run — `outer_optimizer::optimize_population`
     // owns the runtime log and pushes the warning onto its own `OuterResult::warnings`.
     // A probe at this point would have to guess a parameter point, and the provider's
-    // declines are parameter-dependent (`moving_bounds_separable` reads the resolved
-    // infusion windows and lag times), so a guess reports fallbacks that never happen.
+    // declines are parameter-dependent (an EBE off a strict mode, a non-finite plan result),
+    // so a guess reports fallbacks that never happen.
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());

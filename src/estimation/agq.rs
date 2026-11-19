@@ -250,11 +250,13 @@ pub(crate) struct PopulationEvaluation {
 pub(crate) enum ScoreRoute {
     /// The adjoint's exact `dFᵢ/dx`.
     Exact,
-    /// The adjoint's held-EBE score (no EBE response):
-    /// `adjoint::subject_adjoint_held_ebe_score`.
-    HeldEbe,
-    /// The reconverged finite-difference score.
-    Reconverged,
+    /// The adjoint's exact `dFᵢ/dx` at the subject's EBE re-solved at the trial point (the
+    /// runtime-declined subject's salvage; the re-solved mode is handed back as polished).
+    ResolvedExact,
+    /// The reconverged finite-difference score. `structural`: no recorder serves the
+    /// subject at any point ([`crate::estimation::outer_optimizer::is_structural_decline`]),
+    /// as against a runtime decline whose re-solved exact route failed too.
+    Reconverged { structural: bool },
 }
 
 impl ScoreRoute {
@@ -262,10 +264,17 @@ impl ScoreRoute {
     fn record(self, log: &crate::estimation::outer_optimizer::OuterFdDeclineLog, i: usize) {
         match self {
             ScoreRoute::Exact => {}
-            ScoreRoute::HeldEbe => log.record(i),
-            ScoreRoute::Reconverged => {
+            ScoreRoute::ResolvedExact => {
                 log.record(i);
-                log.record_structural(i);
+                log.record_exact(i);
+            }
+            ScoreRoute::Reconverged { structural } => {
+                log.record(i);
+                if structural {
+                    log.record_structural(i);
+                } else {
+                    log.record_reconverged(i);
+                }
             }
         }
     }
@@ -993,6 +1002,7 @@ pub(crate) fn agq_population_evaluate(
     n_nodes: usize,
     anchor: HessianAnchor,
     want_eta_dx: bool,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -1009,6 +1019,7 @@ pub(crate) fn agq_population_evaluate(
         None,
         None,
         want_eta_dx,
+        declines,
     )
 }
 
@@ -1031,6 +1042,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
     schedules: &[Option<pk::event_driven::EventSchedule>],
     terminal_work: &[TerminalLaplaceWork],
     want_eta_dx: bool,
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     agq_population_evaluate_impl(
         model,
@@ -1047,6 +1059,7 @@ pub(crate) fn agq_population_evaluate_with_schedules(
         Some(schedules),
         Some(terminal_work),
         want_eta_dx,
+        declines,
     )
 }
 
@@ -1067,10 +1080,13 @@ fn agq_population_evaluate_impl(
     terminal_work: Option<&[TerminalLaplaceWork]>,
     // Whether each subject's mode response `dη̂ᵢ/dx` is formed with its score (#2549).
     want_eta_dx: bool,
+    // The fit's decline log: a declined subject's structural probe is asked once per fit.
+    declines: Option<&crate::estimation::outer_optimizer::OuterFdDeclineLog>,
 ) -> PopulationEvaluation {
     let (nodes, weights) = gauss_hermite(n_nodes);
     let log_weights: Vec<f64> = weights.iter().map(|w| w.ln()).collect();
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, false)
+        .with_declines(declines);
 
     let exact_anchor = matches!(anchor, HessianAnchor::Exact);
     let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> =
@@ -1095,6 +1111,7 @@ fn agq_population_evaluate_impl(
                 ..ModeOut::default()
             };
             let score = context.score_routed_with_mode(
+                Some(i),
                 subject,
                 eta_hats[i].as_slice(),
                 subj_kappas,
@@ -1136,7 +1153,10 @@ fn agq_population_evaluate_impl(
     );
     let routes = per_subject
         .iter()
-        .map(|(_, s, _)| s.as_ref().map_or(ScoreRoute::Reconverged, |s| s.1))
+        .map(|(_, s, _)| {
+            s.as_ref()
+                .map_or(ScoreRoute::Reconverged { structural: true }, |s| s.1)
+        })
         .collect();
     let scores: Option<Vec<Vec<f64>>> = per_subject
         .iter()
@@ -1261,6 +1281,13 @@ pub(crate) struct SubjectScoreContext<'a> {
     /// `x` unpacked once for every subject this context scores (`None` when `x` is not
     /// `template`'s packed length, which the adjoint declines).
     point: Option<crate::sens::ode_provider::adjoint::PackedPoint<'a>>,
+    /// The fit's decline log, which remembers a subject whose structural probe answered "no"
+    /// ([`crate::estimation::outer_optimizer::OuterFdDeclineLog::is_structural`]) so a declined
+    /// subject pays the recording once per fit, not once per evaluation.
+    declines: Option<&'a crate::estimation::outer_optimizer::OuterFdDeclineLog>,
+    /// Test hook: how many structural probes (recordings) this context ran.
+    #[cfg(test)]
+    pub(crate) probes: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> SubjectScoreContext<'a> {
@@ -1286,6 +1313,20 @@ impl<'a> SubjectScoreContext<'a> {
             force_fd: force_fd || !analytic_gradient_available(model),
             fd_inner_tol: crate::estimation::inner_optimizer::stencil_inner_tol(options.inner_tol),
             point: crate::sens::ode_provider::adjoint::PackedPoint::new(template, x),
+            declines: None,
+            #[cfg(test)]
+            probes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// This context asking `log` before it probes whether a decline is structural.
+    pub(crate) fn with_declines(
+        self,
+        log: Option<&'a crate::estimation::outer_optimizer::OuterFdDeclineLog>,
+    ) -> Self {
+        Self {
+            declines: log,
+            ..self
         }
     }
 
@@ -1298,8 +1339,8 @@ impl<'a> SubjectScoreContext<'a> {
     }
 
     /// Negative-log-likelihood score: the exact `dFᵢ/dx`, else the reconverged
-    /// finite-difference score. The covariance step's form, which never takes a held-EBE
-    /// score into `S`.
+    /// finite-difference score. The covariance step's form, which re-solves per probe rather
+    /// than take the re-solved-EBE score into `S`.
     pub(crate) fn score(
         &self,
         subject: &Subject,
@@ -1310,29 +1351,43 @@ impl<'a> SubjectScoreContext<'a> {
             .map(|(g, _)| g)
     }
 
-    /// [`Self::score`], and with `held_ok` the optimizer's salvage between the two: a
-    /// subject whose mode identity the adjoint declines takes the held-EBE score
-    /// ([`ScoreRoute::HeldEbe`]) rather than `2·n_x` EBE re-solves — what FOCE/FOCEI do with
-    /// the same subject. Not under IOV, whose FOCEI salvage is the reconverged one.
+    /// [`Self::score`], and with `resolve_ok` the optimizer's salvage between the two: a
+    /// subject the adjoint declines at the held mode is scored exactly at its EBE re-solved
+    /// at the trial point ([`ScoreRoute::ResolvedExact`]), one inner solve and one adjoint
+    /// pass rather than `2·n_x` re-solves; the covariance step's form re-solves per probe.
     pub(crate) fn score_routed(
         &self,
         subject: &Subject,
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
-        held_ok: bool,
+        resolve_ok: bool,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
-        self.score_routed_with_mode(subject, eta, kappas, held_ok, &mut ModeOut::default())
+        self.score_routed_with_mode(
+            None,
+            subject,
+            eta,
+            kappas,
+            resolve_ok,
+            &mut ModeOut::default(),
+        )
     }
 
     /// [`Self::score_routed`], with what `mode` asks for about the subject's mode
     /// ([`ModeOut`]: its response, its exact inner Hessian) formed by the same adjoint pass.
-    /// Exact route only; on any other `mode` comes back empty (#2549).
+    /// Exact route only; on any other `mode` comes back empty (#2549). `index` is the subject's
+    /// place in the fit, which keys the decline log's kept answer.
+    ///
+    /// Whether a decline is structural is asked (a recording) only where the answer is used: the
+    /// optimizer's salvage (`resolve_ok`) routes on it, and the label it puts on a reconverged
+    /// score is what the fit's warning reports. Without `resolve_ok` (the covariance step, the
+    /// predicted-gain scores) the label is discarded and reads `structural: false`.
     pub(crate) fn score_routed_with_mode(
         &self,
+        index: Option<usize>,
         subject: &Subject,
         eta: &[f64],
         kappas: &[nalgebra::DVector<f64>],
-        held_ok: bool,
+        resolve_ok: bool,
         mode: &mut ModeOut,
     ) -> Option<(Vec<f64>, ScoreRoute)> {
         mode.clear();
@@ -1340,10 +1395,11 @@ impl<'a> SubjectScoreContext<'a> {
             return None;
         }
         let joint_warm = stack_mode(eta, kappas);
+        let mut structural = true;
         if !self.force_fd {
             // The adjoint (any node count, either anchor): the exact `dFᵢ/dx`.
             use crate::sens::ode_provider::adjoint::{
-                subject_adjoint_gradient_and_mode_at, subject_adjoint_held_ebe_score_at, Objective,
+                subject_adjoint_gradient_and_mode_at, Objective,
             };
             let objective = Objective::Agq {
                 n_agq: self.nodes.len(),
@@ -1362,25 +1418,91 @@ impl<'a> SubjectScoreContext<'a> {
                 Some(g)
             };
             if let Some(pt) = &self.point {
-                let b = &joint_warm[..];
                 let exact = subject_adjoint_gradient_and_mode_at(
-                    self.model, subject, pt, b, objective, mode,
+                    self.model,
+                    subject,
+                    pt,
+                    &joint_warm,
+                    objective,
+                    mode,
                 );
                 if let Some(g) = accept(exact) {
                     return Some((g, ScoreRoute::Exact));
                 }
                 mode.clear();
-                if held_ok && self.model.n_kappa == 0 {
-                    let held =
-                        subject_adjoint_held_ebe_score_at(self.model, subject, pt, b, objective);
-                    if let Some(g) = accept(held) {
-                        return Some((g, ScoreRoute::HeldEbe));
+                structural = resolve_ok && {
+                    let probe = || {
+                        #[cfg(test)]
+                        self.probes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::estimation::outer_optimizer::is_structural_decline(
+                            self.model,
+                            subject,
+                            self.template,
+                            &joint_warm,
+                        )
+                    };
+                    match (self.declines, index) {
+                        (Some(log), Some(i)) => log.is_structural(i, probe),
+                        _ => probe(),
                     }
+                };
+                if resolve_ok && !structural {
+                    // The EBE re-solved at the trial point is stationary, so the mode
+                    // identity the held `η̂` lacked holds there: the exact score, with the
+                    // EBE response. The mode is handed back as polished, so the objective
+                    // is evaluated at the `η̂` the gradient differentiated at.
+                    if let Some((g, b)) = self.exact_at_resolved_ebe(subject, pt, &joint_warm, mode)
+                    {
+                        if let Some(g) = accept(Some(g)) {
+                            mode.eta_polished.get_or_insert(b);
+                            return Some((g, ScoreRoute::ResolvedExact));
+                        }
+                    }
+                    mode.clear();
                 }
             }
         }
         self.finite_difference_score(subject, &joint_warm)
-            .map(|g| (g, ScoreRoute::Reconverged))
+            .map(|g| (g, ScoreRoute::Reconverged { structural }))
+    }
+
+    /// The exact score at the subject's EBE re-solved at `self.x` (warm from `warm`, the
+    /// stacked `[η̂, κ̂…]`) at the FD stencil's tight tolerance, with the stacked mode it was
+    /// taken at. `None` when the re-solve is unresolved or the adjoint declines there too.
+    fn exact_at_resolved_ebe(
+        &self,
+        subject: &Subject,
+        pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+        warm: &[f64],
+        mode: &mut ModeOut,
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        use crate::estimation::parameterization::{compute_mu_k, unpack_params};
+        let p = unpack_params(self.x, self.template);
+        let mu = compute_mu_k(self.model, &p.theta, self.options.mu_referencing);
+        let ebe = crate::estimation::inner_optimizer::find_ebe_for_stage(
+            self.model,
+            subject,
+            &p,
+            self.options.inner_maxiter,
+            crate::estimation::fd_resolution::tight_tol(self.options.inner_tol),
+            Some(warm),
+            Some(&mu),
+            0,
+            self.options,
+        );
+        if !crate::estimation::fd_resolution::ebe_resolved(&ebe) {
+            return None;
+        }
+        let b = stack_mode(ebe.eta.as_slice(), &ebe.kappas);
+        let objective = crate::sens::ode_provider::adjoint::Objective::Agq {
+            n_agq: self.nodes.len(),
+            exact: matches!(self.options.hessian_anchor(), HessianAnchor::Exact),
+        };
+        let g = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_and_mode_at(
+            self.model, subject, pt, &b, objective, mode,
+        )?;
+        Some((g, b))
     }
 
     fn reconverged_nll(&self, subject: &Subject, xv: &[f64], joint_warm: &[f64]) -> Option<f64> {
@@ -1498,7 +1620,8 @@ pub(crate) fn population_gradient_mixed(
     }
     let want_eta_dx = eta_dx.as_ref().is_some_and(|s| s.want_dx);
     let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
-    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
+    let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd)
+        .with_declines(declines);
     let scores: Vec<_> = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
         let mut mode = ModeOut {
@@ -1507,6 +1630,7 @@ pub(crate) fn population_gradient_mixed(
             ..ModeOut::default()
         };
         let score = context.score_routed_with_mode(
+            Some(i),
             subject,
             eta_hats[i].as_slice(),
             kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
@@ -1609,6 +1733,50 @@ pub fn agq_population_gradient(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3009 review 2: a runtime-declined subject served at its re-solved EBE records as
+    /// exact; a reconverged route records "structural" only when no recorder serves the
+    /// subject, and a runtime decline whose exact route failed as plain reconverged. Each
+    /// kind and its negatives in one test, so forcing a route onto another's record reddens it.
+    #[test]
+    fn score_routes_are_recorded_as_their_own_kind() {
+        use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
+        let mut pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin.csv"),
+            None,
+            None,
+        )
+        .expect("data");
+        pop.subjects.truncate(1);
+        let record = |route: ScoreRoute| {
+            let log = OuterFdDeclineLog::new(1);
+            route.record(&log, 0);
+            log
+        };
+        let warn = |route: ScoreRoute| outer_fd_fallback_warning(&pop, &record(route));
+        assert!(
+            warn(ScoreRoute::Exact).is_none(),
+            "an exact route is no decline"
+        );
+        // Served exactly at the re-solved EBE: no fallback ran, so no warning, and the log
+        // counts it exact; the reconverged routes are not.
+        let resolved = record(ScoreRoute::ResolvedExact);
+        assert!(outer_fd_fallback_warning(&pop, &resolved).is_none());
+        assert!(resolved.all_declines_exact());
+        assert!(!record(ScoreRoute::Reconverged { structural: false }).all_declines_exact());
+        let structural = warn(ScoreRoute::Reconverged { structural: true }).expect("warns");
+        assert!(
+            structural.contains("no analytic recorder serves them"),
+            "{structural}"
+        );
+        let runtime = warn(ScoreRoute::Reconverged { structural: false }).expect("warns");
+        assert!(
+            runtime.contains("reconverged finite-difference outer gradients")
+                && !runtime.contains("no analytic recorder serves them")
+                && !runtime.contains("every parameter point"),
+            "{runtime}"
+        );
+    }
 
     #[test]
     fn inline_iov_slice_table_is_bitwise_identical_to_legacy_allocation() {
@@ -1813,6 +1981,7 @@ mod tests {
                 3,
                 anchor,
                 false,
+                None,
             );
             let terms_only =
                 agq_population_nll(&model, &population, &params, &eta_hats, &kappas, 3, anchor);
@@ -2417,6 +2586,7 @@ mod tests {
                 3,
                 anchor,
                 false,
+                None,
             );
             let cached_eval = agq_population_evaluate_with_schedules(
                 &model,
@@ -2433,6 +2603,7 @@ mod tests {
                 &schedules,
                 &terminal_work,
                 false,
+                None,
             );
             assert_eq!(uncached_eval.nll.to_bits(), cached_eval.nll.to_bits());
             let (uncached_grad, cached_grad) = (
@@ -2464,6 +2635,7 @@ mod tests {
                     Some(&schedules),
                     None,
                     false,
+                    None,
                 );
                 let reused_one = agq_population_evaluate_impl(
                     &model,
@@ -2480,6 +2652,7 @@ mod tests {
                     Some(&schedules),
                     Some(&terminal_work),
                     false,
+                    None,
                 );
                 assert_eq!(fresh_one.nll.to_bits(), reused_one.nll.to_bits());
                 for (fresh, reused) in fresh_one

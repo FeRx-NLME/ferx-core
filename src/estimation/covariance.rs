@@ -841,10 +841,10 @@ pub(crate) fn assemble_score_cross_product(
 /// (`Ψ = F − wᵀ∇_η l`, which carries the mode response) wherever the outer gradient would ask
 /// the adjoint (`analytic_outer_gradient_available`, which honours `gradient = fd`), and
 /// otherwise — or where the adjoint declines the subject — the reconverged central difference
-/// of the subject's objective (`subject_reconverged_fd_gradient[_iov]`). That is the total
-/// derivative; the NLopt outer gradient salvages a non-structural decline with the held-EBE
-/// score instead unless reconvergence is scheduled, so on such a subject the two differ. One rule for every estimator and model class
-/// this path serves: FOCE and FOCEI, IOV, non-Gaussian endpoints, covariate networks, and a
+/// of the subject's objective (`subject_reconverged_fd_gradient`). That is the total
+/// derivative, and the NLopt outer gradient's salvage of a declined subject is the same
+/// derivative (exact at the re-solved EBE, else this difference; #3004). One rule for every
+/// estimator and model class this path serves: FOCE and FOCEI, IOV, non-Gaussian endpoints, covariate networks, and a
 /// mixture's classes. (AGQ / Laplace take `SubjectScoreContext::score`, the same convention.)
 ///
 /// Before #2974 the row was the **fixed-mode** score (η̂, `H`, κ̂ held at x̂, the θ axis a
@@ -903,15 +903,9 @@ pub(crate) fn subject_total_score(
     let warm = (model.n_kappa > 0)
         .then(|| crate::estimation::outer_optimizer::joint_warm_start(eta_hat, kappas));
     let warm = warm.as_ref().unwrap_or(eta_hat);
-    if model.n_kappa > 0 {
-        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
-            x, template, model, subject, warm, bounds, options,
-        )
-    } else {
-        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
-            x, template, model, subject, eta_hat, bounds, options,
-        )
-    }
+    crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+        x, template, model, subject, warm, bounds, options,
+    )
 }
 
 /// Test hook: subject ids whose analytic covariance term declines, so a test can reach the
@@ -947,6 +941,9 @@ pub(crate) enum ExactDecline {
 
 /// The objective the analytic R-matrix differentiates: the one the fit minimised (see
 /// `analytic_cov_hessian`), and whose per-subject gradients the BHHH decrement reads.
+///
+/// A mixture's class objective is the same one (`mixture_ofv` scores each class with FOCE,
+/// FOCEI or the Laplace/AGQ quadrature, #3025), so a mixture takes no separate rule.
 pub(crate) fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
     use crate::sens::ode_provider::adjoint::Objective;
     match options.agq_nodes() {
@@ -1119,8 +1116,9 @@ pub(crate) fn analytic_cov_model_declines(
     }
     // The adjoint's profile Hessian serves every estimator and anchor, and a mixture through
     // its own exact assembly (`mixture::mixture_cov_hessian`, over the class objective
-    // `mixture_ofv` scores: FOCE, FOCEI, Laplace or AGQ); what it declines is the model (a shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's
-    // exact term) or the user's `gradient = fd` opt-out from analytic derivatives.
+    // `mixture_ofv` scores: FOCE, FOCEI, Laplace or AGQ); what it declines is the model (a
+    // shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's exact term) or
+    // the user's `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
     }
@@ -4401,7 +4399,6 @@ mod tests {
         fd.gradient_method = GradientMethod::Fd;
         let off = FitOptions {
             analytic_cov_hessian: false,
-            method: crate::types::EstimationMethod::Laplace,
             ..FitOptions::default()
         };
         assert_eq!(

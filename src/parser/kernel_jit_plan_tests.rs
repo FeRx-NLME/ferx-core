@@ -2724,3 +2724,122 @@ fn the_hot_table_compares_the_layout_structure() {
     assert!(t.get(&key, stamp, None).is_some(), "none vs none");
     assert!(t.get(&key, stamp, Some(&l_a)).is_none(), "none vs layout");
 }
+
+/// A matrix call or a repeat call whose record-time run overflows is at a point the value path
+/// cannot score (its own `exp` returns `None` on the non-finite power), so the recording fails
+/// as repelled, not counted as a plan failure: a diverged trial point (an extreme η) made the
+/// squaring of a Padé approximant overflow and the subject reported `W_PLAN_FD_FALLBACK` for a
+/// point nothing needed a derivative at (#3004). The controls on the other side of each gate
+/// stay the point's: a count out of range (the repeat) and a finite product that is simply
+/// recorded. Mutation: stop `MatSpec::run` noting a non-finite result to an open recording
+/// -> the product row and the repeat row both read `Point`.
+#[test]
+fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_scope() {
+    use crate::sens::num::RecHooks;
+    let square = |v: &[Tr]| {
+        <Tr as RecHooks>::mat_mul(v, v, 1)
+            .flatten()
+            .expect("records")
+    };
+    let repeat = |x: f64, count: f64| {
+        begin();
+        let (x0, n) = (Tr::eta(0, x), Tr::eta(1, count));
+        let out = <Tr as RecHooks>::repeat(&[x0], n, &square);
+        assert_eq!(
+            matches!(out, Some(Some(_))),
+            x.abs() < 1e50 && count <= 64.0
+        );
+        end(Some(vec![]))
+    };
+    // The product: finite records, an overflow is repelled.
+    begin();
+    let x = Tr::eta(0, 2.0);
+    assert!(<Tr as RecHooks>::mat_mul(&[x], &[x], 1).flatten().is_some());
+    assert!(end(Some(vec![])).is_ok(), "a finite product records");
+    begin();
+    let x = Tr::eta(0, 1e200);
+    assert!(<Tr as RecHooks>::mat_mul(&[x], &[x], 1).flatten().is_none());
+    assert_eq!(
+        end(Some(vec![])).err().expect("fails").1,
+        FailScope::Repelled
+    );
+    // The repeat: finite records, an overflowing iterate is repelled, a count out of range is
+    // the point's.
+    assert!(repeat(2.0, 3.0).is_ok(), "a finite repeat records");
+    assert_eq!(
+        repeat(1e100, 3.0).err().expect("fails").1,
+        FailScope::Repelled
+    );
+    assert_eq!(repeat(2.0, 100.0).err().expect("fails").1, FailScope::Point);
+    // A body whose inner solve is singular at a later iterate (`x -> (x-1)²/(x-1)`, singular at
+    // `x = 1`): a real failure of the point, not an overflow, so it stays the point's. Mutation:
+    // note a non-finite result unconditionally in `RepeatSpec::run` (the old reading of every
+    // body `None`) -> this row reads `Repelled`.
+    let solve_body = |v: &[Tr]| {
+        let q = v[0] - Tr::k(1.0);
+        <Tr as RecHooks>::mat_solve(&[q], &[q * q], 1)
+            .flatten()
+            .expect("records")
+    };
+    begin();
+    let out = <Tr as RecHooks>::repeat(&[Tr::eta(0, 3.0)], Tr::eta(1, 3.0), &solve_body);
+    assert!(matches!(out, Some(None)), "the third iterate is singular");
+    assert_eq!(end(Some(vec![])).err().expect("fails").1, FailScope::Point);
+    begin();
+    let out = <Tr as RecHooks>::repeat(&[Tr::eta(0, 3.0)], Tr::eta(1, 2.0), &solve_body);
+    assert!(matches!(out, Some(Some(_))), "two iterates are regular");
+    assert!(end(Some(vec![])).is_ok());
+}
+
+/// A plan's kernels keep only what runs and lowers them (#3010): each compiled kernel's
+/// instructions at their length and no `live`, which only the transforms that built it read,
+/// and each chunk program's code at its length. A fit keeps thousands of kernels; on #3010's
+/// 156-subject model this was 1.7 GB of IR at the peak, 0.8 GB after.
+/// Mutation: drop `into_kernel` from `Tiered::new` (or the chunk code's `shrink_to_fit`) → the
+/// kernel (or program) named in the message keeps its slack.
+#[test]
+fn a_plans_kernels_keep_only_what_runs_them() {
+    begin();
+    let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
+    let y = (et[0] * et[1]).exp() + et[0] * et[0];
+    let rec = end(Some(vec![y.reg()])).expect("records");
+    let l1 = Layout {
+        n: 2,
+        m: 0,
+        th: false,
+        wide: false,
+        tan: 0,
+    };
+    let plan = rec.plan(l1, 2, 0).expect("plans");
+    let l = l1.lanes();
+    let u = [0.3, 1.0, 0.0, 0.3, 0.0, 1.0];
+    assert_eq!(u.len(), 2 * l);
+    let fwd = plan.forward_kept(l1, &u, &[]).expect("runs");
+    let mut du_bar = vec![0.0; l];
+    du_bar[0] = 1.0;
+    let mut ub = vec![0.0; 2 * l];
+    assert!(plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar));
+    // Kernels seen: [forward, reverse].
+    let mut seen = [0usize; 2];
+    for c in &plan.calls {
+        let Call::Chunk { prog, .. } = c else {
+            continue;
+        };
+        assert_eq!(
+            prog.code.capacity(),
+            prog.code.len(),
+            "a chunk program's code"
+        );
+        for t in prog.compiled.lock().unwrap().values().flatten() {
+            let what = if t.rev { "reverse" } else { "forward" };
+            assert!(t.f.live.is_empty(), "the {what} kernel keeps `live`");
+            assert_eq!(
+                t.f.insts.capacity(),
+                t.f.insts.len(),
+                "the {what} kernel's instructions"
+            );
+            seen[t.rev as usize] += 1;
+        }
+    }
+    assert!(seen[0] > 0 && seen[1] > 0, "kernels seen {seen:?}");
+}

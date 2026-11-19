@@ -42,8 +42,9 @@
 //! The same recordings are replayed by value for the inner loop's η-Jacobians,
 //! inner gradients and Hessians ([`exact_obs_grads`], [`exact_inner_hessian`], …).
 //!
-//! Out of scope (`None`, and the caller salvages the subject by finite differences): SDE,
-//! subjects with non-Gaussian records, engine shapes no recorder serves.
+//! Out of scope (`None`, and the caller salvages the subject by finite differences): a model
+//! no recorder serves (see `recorder_in_scope`) and the per-point plan failures. SDE models
+//! and non-Gaussian records are served.
 #![allow(clippy::needless_range_loop)]
 
 use super::*;
@@ -96,6 +97,12 @@ fn endpoint_only(model: &CompiledModel) -> bool {
 /// [`likelihood_supported`], plus the dual ODE walk or a closed form (or compartment-free
 /// readout) with a parameter program over `[η, κ]`. The inner loop's scope: a subject
 /// without non-Gaussian records is served even on a joint model.
+///
+/// Every parsed model carries the programs this reads (`parse_model_string` attaches them to
+/// `indiv_param_partials` and the `OdeSpec`); only a `CompiledModel` assembled by hand through
+/// the public struct literal lacks them. Its `rhs` / `pk_param_fn` are opaque Rust closures
+/// that no recording can differentiate, so it is declined here and takes finite differences
+/// (#3004: the one scope gap that is not a parser model).
 pub(crate) fn recorder_in_scope(model: &CompiledModel) -> bool {
     match model.ode_spec.as_ref() {
         _ if model.is_algebraic() => model
@@ -403,16 +410,11 @@ pub(crate) fn subject_adjoint_gradient_and_mode_at(
     g
 }
 
-/// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
-/// identity [`subject_adjoint_gradient_at`] declines — an indefinite exact `H` at an `η̂` the
-/// inner search's fallback left short of stationary ([`mode_solve`]). Without the identity
-/// the EBE response is not available exactly, and the alternative is the reconverged
-/// finite-difference score, `2·n_x` EBE re-solves per subject: on a 147-weight covariate
-/// network under Laplace that turned a 7.5 s fit into a 90 s one. This is the AGQ twin of
-/// FOCE/FOCEI's held-EBE salvage, omits the same EBE-response term, and is reported by the
-/// same outer FD-fallback warning. `None` wherever [`subject_adjoint_gradient_at`] declines for
-/// any other reason (scope, a non-finite recording) and for the FOCE/FOCEI objectives,
-/// whose salvage lives in the outer optimizer.
+/// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, without the EBE-response term.
+/// No production route takes it (a runtime-declined subject is re-solved to its EBE and scored
+/// exactly, `agq::ScoreRoute::ResolvedExact`); it is the biased score the tests hold that route
+/// against. `None` for the FOCE/FOCEI objectives and wherever
+/// [`subject_adjoint_gradient_at`] declines for a reason other than the mode identity.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_held_ebe_score(
     model: &CompiledModel,
@@ -423,26 +425,15 @@ pub(crate) fn subject_adjoint_held_ebe_score(
     objective: Objective,
 ) -> Option<Vec<f64>> {
     let pt = PackedPoint::new(template, x)?;
-    subject_adjoint_held_ebe_score_at(model, subject, &pt, eta_hat, objective)
-}
-
-/// `subject_adjoint_held_ebe_score` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
-pub(crate) fn subject_adjoint_held_ebe_score_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-) -> Option<Vec<f64>> {
     matches!(objective, Objective::Agq { .. })
-        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true, None))?
+        .then(|| adjoint_gradient(model, subject, &pt, eta_hat, objective, true, None))?
 }
 
 /// The fixed-EBE objective and its exact packed gradient at `η̂` with the linearisation
 /// `H` held as given: `F(θ, Ω, σ; η̂, H)` — the analytic kernel's FOCE (`interaction =
 /// false`, `R⁰` at `f(η = 0)` where the variance is f-dependent) or FOCEI objective, with
 /// `H` and `η̂` constants. This is the score the outer optimizer's fixed-EBE paths
-/// difference (GN, trust region, the S-matrix, the held-EBE salvage), taken exactly: one
+/// difference (GN, trust region, the S-matrix), taken exactly: one
 /// reverse of the objective's kernel plan gives its adjoints in the predictions, `Ω` and `σ`,
 /// and the predictions' θ-derivatives are contracted with them by one recording and one
 /// reverse sweep each ([`fixed_eta_theta_contractions`]). Every feature the kernel scores —
@@ -1031,9 +1022,7 @@ fn adjoint_gradient(
         if first.is_some() || held {
             return first;
         }
-        polish_mode(&sc.eta, o, polish_steps(subject), |eta, o| {
-            attempt(eta, Some(o))
-        })
+        polish_mode(&sc.eta, o, polish_steps(), |eta, o| attempt(eta, Some(o)))
     }
     go(&sc, subject, template, x, objective, held, eta_dx)
 }
@@ -1087,11 +1076,6 @@ thread_local! {
         const { std::cell::Cell::new(POLISH_STEPS) };
 }
 
-#[cfg(test)]
-/// Test hook: the ids of the subjects whose polish is off, on every thread (a population pass
-/// runs its subjects on the pool, where [`POLISH_BUDGET`] is not set).
-static POLISH_OFF_FOR: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
 /// Test guard: the polish off for its lifetime, to read the decline and its salvage.
 #[cfg(test)]
 pub(crate) struct PolishOff(usize);
@@ -1110,41 +1094,11 @@ impl Drop for PolishOff {
     }
 }
 
-/// Test guard: the polish off, on every thread, for the subject with this id only (keep the
-/// ids unique to the test).
-#[cfg(test)]
-pub(crate) struct PolishOffFor(String);
-
-#[cfg(test)]
-impl PolishOffFor {
-    pub(crate) fn new(id: &str) -> Self {
-        POLISH_OFF_FOR.lock().unwrap().push(id.to_string());
-        PolishOffFor(id.to_string())
-    }
-}
-
-#[cfg(test)]
-impl Drop for PolishOffFor {
-    fn drop(&mut self) {
-        let mut v = POLISH_OFF_FOR.lock().unwrap();
-        if let Some(i) = v.iter().position(|x| *x == self.0) {
-            v.remove(i);
-        }
-    }
-}
-
-fn polish_steps(subject: &Subject) -> usize {
+fn polish_steps() -> usize {
     #[cfg(test)]
-    return if POLISH_OFF_FOR.lock().unwrap().contains(&subject.id) {
-        0
-    } else {
-        POLISH_BUDGET.with(|c| c.get())
-    };
+    return POLISH_BUDGET.with(|c| c.get());
     #[cfg(not(test))]
-    {
-        let _ = subject;
-        POLISH_STEPS
-    }
+    POLISH_STEPS
 }
 
 /// A pass that declined at its mode system (an `η̂` the inner search left off the mode, on
@@ -1242,8 +1196,8 @@ fn finish(
 /// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
 /// from a certified or iteration-limited inner search, which need not be stationary in
 /// `‖g‖∞` (see [`MODE_STATIONARY_TOL`]), and the gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
-/// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
-/// score ([`subject_adjoint_held_ebe_score_at`]), not the reconverged one.
+/// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review), and the caller re-solves its EBE
+/// and scores it there (`agq::ScoreRoute::ResolvedExact`) rather than take a held-EBE score.
 ///
 /// The SPD branch takes no such gate, deliberately. Near a strict mode `η̂ = η* + ε` and
 /// `∂Ψ/∂x` misses the converged objective's total derivative by `O(|∇_η l|)` only, while
@@ -3478,7 +3432,7 @@ fn fixed_eta_theta_sweeps(
     // An SDE subject's score has variance rows beside the predictions: the callers that hand σ
     // ([`fixed_eta_theta_sigma_contractions`]) weight them; the rest contract the predictions
     // alone (FOCE's population prediction at η = 0, whose variance rows are not in the score).
-    if !recorder_in_scope(model) || (model.is_sde() && want_jac && sigma.is_none()) {
+    if !recorder_in_scope(model) {
         return None;
     }
     let sigma = sigma.filter(|_| model.is_sde());
@@ -5551,7 +5505,8 @@ fn ng_value_grad(
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
 pub(crate) use hessian::{
-    cov_non_gaussian_served, subject_adjoint_cov_block_at, subject_adjoint_cov_diag_at,
+    cov_non_gaussian_served, subject_adjoint_cov_block_at,
+    subject_adjoint_cov_block_with_gradient_at, subject_adjoint_cov_diag_at,
     subject_adjoint_cov_hessian_at,
 };
 #[cfg(test)]

@@ -2893,6 +2893,59 @@ fn frem_with_kappa_on_an_ode_is_served_exactly() {
     }
 }
 
+/// The route the inner-solve report gives an IOV + FREM subject is what the search runs. The
+/// IOV marginal refuses a FREM subject's rows, so its search takes finite differences
+/// (`analytic_iov_inner_supported`); the report (`iov_inner_subject_route`) must say so rather
+/// than call it analytic. The control, the same subject without FREM rows, is analytic on
+/// both. Mutation: drop `!iov_refuses_frem` from `iov_inner_rule` -> the refused subject's
+/// route and search both read analytic and the `is_none` assertion dies; read the route
+/// without the shared rule -> the two disagree on the refused subject.
+#[test]
+fn an_iov_frem_subject_is_reported_the_route_its_search_runs() {
+    use crate::estimation::inner_optimizer::{
+        analytic_iov_inner_supported, iov_inner_subject_route,
+    };
+    let model = frem_iov_ode();
+    let params = &model.default_params;
+    let mut plain = iov_subject(&model);
+    plain.fremtype = vec![0; plain.observations.len()];
+    let mut refused = plain.clone();
+    let last = refused.observations.len() - 1;
+    refused.fremtype[last] = 100;
+    assert!(crate::stats::likelihood::iov_refuses_frem(&model, &refused));
+    assert!(!crate::stats::likelihood::iov_refuses_frem(&model, &plain));
+    for (name, s, analytic) in [("plain", &plain, true), ("refused", &refused, false)] {
+        assert_eq!(
+            analytic_iov_inner_supported(&model, s, params),
+            analytic,
+            "{name}: the search"
+        );
+        assert_eq!(
+            iov_inner_subject_route(&model, s, &params.theta).is_some(),
+            analytic,
+            "{name}: the route report"
+        );
+    }
+}
+
+/// The FD reason an IOV + FREM subject is reported under is the FREM refusal, and the
+/// non-Gaussian cause is named for what it covers. Discriminator and negatives: the refused
+/// subject reads the FREM reason and neither the generic scope reason nor the non-Gaussian
+/// one. Mutation: drop the FREM clause from `iov_fd_reason` -> the refused subject reads
+/// "subject outside IOV analytic scope" and the equality dies.
+#[test]
+fn an_iov_frem_subject_is_reported_its_true_fd_reason() {
+    use crate::estimation::inner_optimizer::iov_fd_reason;
+    let model = frem_iov_ode();
+    let (_, refused) = frem_iov_pair(&model);
+    let reason = iov_fd_reason(&model, &refused);
+    assert_eq!(reason, "FREM rows (the IOV marginal refuses them)");
+    assert!(
+        !reason.contains("outside IOV analytic scope") && !reason.contains("non-Gaussian"),
+        "{reason}"
+    );
+}
+
 /// The `frem_iov_ode` subject pair: an ordinary IOV subject and the same one with its last
 /// observation a FREM weight row (the one the IOV marginal refuses).
 fn frem_iov_pair(model: &CompiledModel) -> (Subject, Subject) {
@@ -4201,6 +4254,12 @@ fn laplace_kernel(
 /// `mode_solve_declines_an_indefinite_hessian_off_the_mode`).
 #[test]
 fn laplace_serves_the_prior_precision_anchor_fallback() {
+    for n_agq in [1usize, 3] {
+        runtime_declined_subject_is_served_exactly(n_agq);
+    }
+}
+
+fn runtime_declined_subject_is_served_exactly(n_agq: usize) {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
     let s = subject(
         &one,
@@ -4239,21 +4298,18 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         .into_iter()
         .find(|e| indefinite(e))
         .expect("a point where the exact anchor is indefinite");
-    let prod = laplace_prod(&one, &s, params, &eta);
+    let prod = agq_prod(&one, &s, params, &eta, n_agq, true);
     assert!(
         prod.is_finite() && prod < 1e19,
         "production falls back: {prod}"
     );
-    let laplace = Objective::Agq {
-        n_agq: 1,
-        exact: true,
-    };
+    let laplace = Objective::Agq { n_agq, exact: true };
     assert!(
         subject_adjoint_gradient(&one, &s, params, &x, &eta, laplace).is_none(),
         "off the mode, an indefinite H must decline rather than drop wᵀ∇_η l"
     );
-    // The optimizer's salvage for that subject: the held-EBE score, `∂A/∂x` at this fixed
-    // `η` — FD of production's objective with `η` held, not reconverged.
+    // The old salvage for that subject, the held-EBE score `∂A/∂x` at this fixed `η` (FD of
+    // production's objective with `η` held, not reconverged): the straddle's far side.
     let held = subject_adjoint_held_ebe_score(&one, &s, params, &x, &eta, laplace)
         .expect("the held-EBE score serves the declined subject");
     let mut worst = 0.0f64;
@@ -4263,7 +4319,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
             let mut xv = x.clone();
             xv[k] += d;
             let p = crate::estimation::parameterization::unpack_params(&xv, params);
-            laplace_prod(&one, &s, &p, &eta)
+            agq_prod(&one, &s, &p, &eta, n_agq, true)
         };
         let fd = (at(h) - at(-h)) / (2.0 * h);
         assert!(
@@ -4274,16 +4330,17 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         worst = worst.max((held[k] - fd).abs() / (1.0 + fd.abs()));
     }
     eprintln!("held-EBE score vs fixed-η FD: worst rel {worst:.3e}");
-    // Measured 4.794e-10 (central FD, h = 1e-5); ~10× headroom.
+    // Measured 4.794e-10 (n_agq = 1), 7.780e-9 (n_agq = 3) (central FD, h = 1e-5); ~10× headroom.
     assert!(
-        worst < 5e-9,
+        worst < 1e-7,
         "held-EBE score off the fixed-η FD by {worst:.3e}"
     );
     // FOCE/FOCEI have their own salvage in the outer optimizer: no held route here.
     assert!(subject_adjoint_held_ebe_score(&one, &s, params, &x, &eta, Objective::Focei).is_none());
 
-    // The population gradient takes that route for the optimizer — the held score, not
-    // `2·n_x` reconverged ones — and says so in the outer FD-fallback warning.
+    // The population gradient (the optimizer's) re-solves the subject's EBE at the trial point
+    // and takes the exact score there: it matches the reconverged-FD oracle, which the held
+    // score above does not (the straddle), and the warning says so.
     use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
     use crate::types::{EstimationMethod, FitOptions, Population};
     let population = Population {
@@ -4296,6 +4353,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
     };
     let options = FitOptions {
         method: EstimationMethod::Laplace,
+        n_agq,
         ..FitOptions::default()
     };
     let log = OuterFdDeclineLog::new(1);
@@ -4314,16 +4372,141 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         None,
     )
     .expect("population gradient");
-    for (k, (&gk, &hk)) in g.iter().zip(&held).enumerate() {
+    let f_at = |xv: &[f64]| {
+        let p = crate::estimation::parameterization::unpack_params(xv, params);
+        let e = ebe_for(&one, &s, &p, 1e-12, true);
+        agq_prod(&one, &s, &p, e.as_slice(), n_agq, true)
+    };
+    let (mut served, mut old) = (0.0f64, 0.0f64);
+    for k in 0..x.len() {
+        let fd = |h: f64| {
+            let (mut xp, mut xm) = (x.clone(), x.clone());
+            xp[k] += h;
+            xm[k] -= h;
+            (f_at(&xp) - f_at(&xm)) / (2.0 * h)
+        };
+        let rich = (4.0 * fd(1e-3) - fd(2e-3)) / 3.0;
+        assert!(
+            rich.is_finite() && g[k].is_finite(),
+            "x[{k}]: {} {rich}",
+            g[k]
+        );
+        // g is the OFV gradient, 2·F.
+        let e_served = (g[k] - 2.0 * rich).abs() / (1.0 + (2.0 * rich).abs());
+        let e_old = (2.0 * held[k] - 2.0 * rich).abs() / (1.0 + (2.0 * rich).abs());
+        assert!(e_served.is_finite() && e_old.is_finite(), "x[{k}]");
+        served = served.max(e_served);
+        old = old.max(e_old);
+    }
+    eprintln!("n_agq = {n_agq}: served vs reconverged FD {served:.3e}, held vs FD {old:.3e}");
+    assert!(
+        served < SERVED_TOL,
+        "n_agq = {n_agq}: served score off the oracle by {served:.3e}"
+    );
+    assert!(
+        old > 100.0 * served && old > 1e-2,
+        "n_agq = {n_agq}: the held score must be far off the oracle ({old:.3e} vs {served:.3e})"
+    );
+    assert!(
+        log.all_declines_exact() && outer_fd_fallback_warning(&population, &log).is_none(),
+        "the decline was served exactly at the re-solved EBE: no fallback to warn about"
+    );
+    assert!(g.iter().any(|v| *v != 0.0));
+    // The route and the mode: the served subject reports `ResolvedExact` and hands the
+    // re-solved EBE back as polished, so the objective is evaluated where the gradient was
+    // taken; without the optimizer's salvage the same decline is a runtime one (a recorder
+    // serves the subject), reconverged and not structural.
+    {
+        use crate::estimation::agq::{ScoreRoute, SubjectScoreContext};
+        let bounds = crate::estimation::parameterization::compute_bounds(params);
+        let ctx = SubjectScoreContext::new(&one, params, &x, &options, &bounds, false);
+        let mut mode = ModeOut::default();
+        let (_, route) = ctx
+            .score_routed_with_mode(None, &s, &eta, &[], true, &mut mode)
+            .expect("score");
+        assert_eq!(route, ScoreRoute::ResolvedExact, "n_agq = {n_agq}");
+        let ebe = ebe_for(&one, &s, params, 1e-12, true);
+        let polished = mode
+            .eta_polished
+            .expect("the re-solved mode is handed back");
+        let gap = polished
+            .iter()
+            .zip(ebe.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, |m, d| {
+                assert!(d.is_finite());
+                m.max(d)
+            });
+        assert!(gap < 1e-6, "polished mode off the EBE by {gap:.2e}");
+        let (_, route) = ctx.score_routed(&s, &eta, &[], false).expect("score");
         assert_eq!(
-            gk.to_bits(),
-            (2.0 * hk).to_bits(),
-            "x[{k}]: OFV = 2·F of the held score"
+            route,
+            ScoreRoute::Reconverged { structural: false },
+            "n_agq = {n_agq}"
+        );
+        // The structural probe (an adjoint recording) is asked only where its answer is used,
+        // and once per fit: the covariance step's form (`resolve_ok = false`) never asks, the
+        // optimizer's asks once for a subject whose decline the log has seen answered "no", and a
+        // context without the log asks at every call. Mutations: probe unconditionally (the first
+        // count), drop the log's kept answer (the second), or the log (the third).
+        use std::sync::atomic::Ordering::Relaxed;
+        let fit_log = OuterFdDeclineLog::new(1);
+        let logged = SubjectScoreContext::new(&one, params, &x, &options, &bounds, false)
+            .with_declines(Some(&fit_log));
+        logged.score_routed(&s, &eta, &[], false).expect("score");
+        logged.score(&s, &eta, &[]).expect("score");
+        assert_eq!(logged.probes.load(Relaxed), 0, "n_agq = {n_agq}: no probe");
+        for _ in 0..3 {
+            let (_, route) = logged
+                .score_routed_with_mode(Some(0), &s, &eta, &[], true, &mut ModeOut::default())
+                .expect("score");
+            assert_eq!(route, ScoreRoute::ResolvedExact, "n_agq = {n_agq}");
+        }
+        assert_eq!(
+            logged.probes.load(Relaxed),
+            1,
+            "n_agq = {n_agq}: probed once"
+        );
+        for _ in 0..2 {
+            ctx.score_routed_with_mode(Some(0), &s, &eta, &[], true, &mut ModeOut::default())
+                .expect("score");
+        }
+        assert_eq!(
+            ctx.probes.load(Relaxed),
+            3,
+            "n_agq = {n_agq}: without the log every call probes"
+        );
+        // The fused outer-loop evaluation (`agq_population_evaluate`, what the NLopt objective
+        // runs) takes the same log: three evaluations of the declined subject ask the probe once.
+        // Mutation: pass `None` for the log there -> the log is never asked, 0 probes.
+        let loop_log = OuterFdDeclineLog::new(1);
+        let anchor = options.hessian_anchor();
+        for _ in 0..3 {
+            crate::estimation::agq::agq_population_evaluate(
+                &one,
+                &population,
+                params,
+                params,
+                &x,
+                &[DVector::from_column_slice(&eta)],
+                &[Vec::new()],
+                &bounds,
+                &options,
+                n_agq,
+                anchor,
+                false,
+                Some(&loop_log),
+            );
+        }
+        assert_eq!(
+            loop_log.structural_probes.load(Relaxed),
+            1,
+            "n_agq = {n_agq}: the fused loop probes once per fit"
         );
     }
-    let w = outer_fd_fallback_warning(&one, &population, &log).expect("the salvage is reported");
-    assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
 }
+
+const SERVED_TOL: f64 = 1e-2;
 
 /// #2713: a FOCEI gradient declined at its mode system says so. Off the mode, on a grid
 /// point where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s
@@ -4487,6 +4670,50 @@ fn agq_adjoint_matches_reconverged_fd_both_anchors() {
             "n_agq = {n_agq}, exact = {exact}: {worst:.2e}"
         );
     }
+}
+
+/// One subject's 3-node AGQ gradient against the reconverged-FD oracle, for a model some of
+/// whose quadrature nodes the value path scores as the sentinel (zero weight in the
+/// `logsumexp`, `agq::agq_terms`). The subject must be served, over the nodes that remain,
+/// and the oracle scores the same nodes the same way.
+fn dropped_node_parity(model: &CompiledModel, etas: &[f64]) -> f64 {
+    let s = subject(
+        model,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        etas,
+    );
+    let mut worst = 0.0f64;
+    for exact in [true, false] {
+        let w = fd_oracle_agq(model, &s, 3, exact);
+        eprintln!("dropped nodes, exact = {exact}: worst {w:.2e}");
+        assert!(w.is_finite());
+        worst = worst.max(w);
+    }
+    worst
+}
+
+/// A quadrature node whose predictions are `NaN` is dropped, as the objective drops it: the
+/// subject is served exactly, not declined to finite differences. `CL = 16*TVCL*e^eta*(c -
+/// eta^3)^(1/2)` (the parser's `sqrt` clamps at 0; `^` does not) is `NaN` for `eta_CL^3 > c`,
+/// `c = 0.008`: the mode `eta_CL ~ 0.01` and the lower nodes are finite, and 9 of the 27 nodes
+/// (the upper `eta_CL` third) are not. Those nodes' forwards record, with `NaN` predictions,
+/// so the first gradient does not form and the retry over the 18 live nodes serves it.
+/// Mutations: never retrying (`return None` after the first run), or keeping every node in
+/// the retry, each kill it.
+#[test]
+fn a_quadrature_node_with_nan_predictions_is_dropped_not_declined() {
+    let src = ONE_CPT_ORAL.replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = TVCL * exp(ETA_CL) * 16.0 * (0.008 - (ETA_CL ^ 3)) ^ 0.5",
+    );
+    let model = parse_model_string(&src).unwrap();
+    let worst = dropped_node_parity(&model, &[0.1, -0.05, 0.2]);
+    // Measured 2.6e-8 (Linux); ~20x headroom.
+    assert!(worst < 6e-7, "{worst:.2e}");
 }
 
 /// A packed vector of the wrong length is declined (`None`), not read past its end:
@@ -8290,8 +8517,23 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         (
             "ode_iov",
             parse_model_string(ODE_IOV).unwrap(),
-            bolus,
+            bolus.clone(),
             vec![0.1, -0.05, 0.08, -0.03],
+        ),
+        // An SDE model (#3004): `want_jac` without σ is the predictions' own `∂f_j/∂θ`, served
+        // rather than declined to a forward difference per θ.
+        (
+            "warfarin_sde",
+            parse_model_string(
+                &std::fs::read_to_string(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/examples/warfarin_sde.ferx"
+                ))
+                .unwrap(),
+            )
+            .unwrap(),
+            bolus,
+            vec![0.1, -0.05, 0.08],
         ),
     ];
     let mut worst_all = 0.0f64;
@@ -8338,6 +8580,8 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
             1e-9
         } else if name == "additive_four_eta" {
             1e-13
+        } else if name == "warfarin_sde" {
+            1e-12
         } else {
             1e-14
         };
@@ -8569,6 +8813,92 @@ fn the_agq_gradient_is_exact_with_a_non_gaussian_term() {
     }
     eprintln!("non-Gaussian AGQ gradient: worst {worst:.2e}");
     assert!(worst < 5e-7, "worst relative difference {worst:.2e}");
+}
+
+/// A quadrature node whose non-Gaussian endpoint term is not usable (`NaN`, or beyond the
+/// sentinel) while its Gaussian term `l` is finite is left out of the sum by the objective
+/// (`agq::agq_terms` scores `l + q`), and the adjoint serves the subject over the same nodes:
+/// mixed with PK rows and with the endpoint alone, against the reconverged-FD oracle. Two
+/// predictors on `ETA_CL`: `exp(200*ETA_CL)` is `~1e30` at the upper nodes (finite, over
+/// `1e20`, small below), and `16*(0.008 - ETA_CL^3)^0.5` is `NaN` there (the parser's `^` does
+/// not clamp). Measured: the subject is served *without* the live-node filter reaching these
+/// nodes (the first kernel run forms, since `q` enters the reverse as numbers and `0 * NaN` never
+/// arises through it), and swapping the filter's `l + q` for `l` alone leaves this test green, so
+/// it pins the parity of the served gradient, not the filter's `q` term (the review's reading of
+/// that term as a defect has no observable effect; see the filter's comment).
+#[cfg(all(feature = "survival", feature = "markov"))]
+#[test]
+fn an_agq_node_with_an_unusable_endpoint_term_is_served_exactly() {
+    use crate::types::ObsRecord;
+    let mut worst = 0.0f64;
+    for (case, logit, nan) in [
+        ("sentinel", "exp(200.0 * ETA_CL)", false),
+        ("nan", "16.0 * (0.008 - ETA_CL ^ 3) ^ 0.5", true),
+    ] {
+        let model = parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+             theta TVKA(1.2, 0.05, 20.0)\n  theta TH0(-0.3, -10.0, 10.0)\n  \
+             omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+             KA = TVKA\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n\
+             [binary_model]\n  cmt   = 3\n  logit = TH0 + 2.0 * ETA_CL + {logit}\n"
+        ))
+        .unwrap();
+        let records: Vec<ObsRecord> = [(0.0, 0), (1.0, 0), (2.0, 1), (4.0, 0)]
+            .iter()
+            .map(|&(time, state)| ObsRecord::DiscreteState {
+                time,
+                raw_time: time,
+                state,
+                cmt: 3,
+            })
+            .collect();
+        let mut only = subject(
+            &model,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[],
+            &[0.0, 0.0],
+        );
+        only.obs_records = records.clone();
+        assert!(only.observations.is_empty());
+        let mut mixed = subject(
+            &model,
+            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+            &[1.0, 4.0, 12.0],
+            &[0.1, -0.05],
+        );
+        mixed.obs_records = records;
+        assert!(crate::pk::subject_feeds_analytical_pk(&model, &mixed));
+        for (tag, s) in [("endpoint only", &only), ("mixed", &mixed)] {
+            // The premise: the term is usable at the mode and below, and not at the upper node
+            // (the nodes sit at the mode, ±~0.5 in `ETA_CL`).
+            let params = moved_params(&model);
+            let eta = ebe_for(&model, s, &params, 1e-12, true);
+            let q: Vec<f64> = [-0.5, 0.0, 0.5]
+                .iter()
+                .map(|d| {
+                    let e = [eta[0] + d, eta[1]];
+                    super::ng_value_grad(&model, s, &params.theta, &e).map_or(f64::NAN, |r| r.0)
+                })
+                .collect();
+            let unusable = |v: f64| !crate::stats::likelihood::is_usable_subject_nll(v);
+            assert!(
+                !unusable(q[0]) && !unusable(q[1]) && unusable(q[2]) && q[2].is_nan() == nan,
+                "{case}/{tag}: the premise, a usable term below and an unusable one at the upper \
+                 node: {q:?}"
+            );
+            for (n_agq, exact) in [(3, true), (3, false)] {
+                let w = fd_oracle_agq(&model, s, n_agq, exact);
+                eprintln!("{case}/{tag} n_agq={n_agq} exact={exact}: worst {w:.2e}");
+                assert!(w.is_finite());
+                worst = worst.max(w);
+            }
+        }
+    }
+    // Measured on Linux: 2.5e-6 on the `sentinel` mixed subject (the `exp(200*ETA_CL)` slope
+    // makes the Richardson oracle's own error that large on the small TVCL component).
+    assert!(worst < 1e-5, "{worst:.2e}");
 }
 
 /// The covariance step's exact Hessian on subjects carrying non-Gaussian records — a
@@ -11944,13 +12274,15 @@ const ONE_CPT_D1_ODE: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// A point no plan of the subject serves — the infusion end moved by η across an observation —
-/// is the native predictor's in the objective's value pass: `plan_values` declines it without
-/// recording (#3010). Recording it there cost a whole recording (a few hundred thousand
-/// instructions) per objective value of an EBE search, and three quarters of a fit's time on a
-/// modeled-infusion model. The gradient's lookup (`with_plan`) still records the point, after
-/// which the value pass serves it. Mutation: `record_miss = true` in `plan_values` -> the moved
-/// point is served, by a recording.
+/// A point no plan of the subject serves is the native predictor's in the objective's value
+/// pass: `plan_values` declines it without recording (#3010). Recording it there cost a whole
+/// recording (a few hundred thousand instructions) per objective value of an EBE search. The
+/// gradient's lookup (`with_plan`) still records the point, after which the value pass serves
+/// it. Since an infusion end that moves across an observation no longer changes a plan's
+/// structure (`a_plan_serves_both_sides_of_a_moving_infusion_end`), the moved point here moves
+/// the first dose's end past the second dose's arrival, the one check a walked end keeps.
+/// Mutation: `record_miss = true` in `plan_values` -> the moved point is served, by a recording;
+/// drop the walked end's check (`end < until`) -> the first plan serves it, wrongly.
 #[test]
 fn plan_values_declines_a_point_no_plan_serves_without_recording() {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
@@ -11962,12 +12294,12 @@ fn plan_values_declines_a_point_no_plan_serves_without_recording() {
     let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
     let s = subject(&model, vec![d(0.0), d(12.0)], &times, &[0.0; 2]);
     let theta = moved_params(&model).theta;
-    let (e0, e1) = (vec![0.0, 0.0], vec![0.0, 0.2]);
-    // The straddle: the window ends before the observation at 2.5 at `e0`, after it at `e1`
-    // (and so for the second dose's at 14.5), so the two points have different structures.
     let end = |e: &[f64]| theta[2] * e[1].exp();
+    let (e0, e1) = (vec![0.0, 0.0], vec![0.0, (13.0 / theta[2]).ln()]);
+    // The straddle: the first window ends before the second dose arrives at `e0`, after it at
+    // `e1`.
     assert!(
-        end(&e0) < 2.5 && end(&e1) > 2.5,
+        end(&e0) < 12.0 && end(&e1) > 12.0,
         "{} {}",
         end(&e0),
         end(&e1)
@@ -12000,6 +12332,96 @@ fn plan_values_declines_a_point_no_plan_serves_without_recording() {
     let got = values(&e1).expect("the recorded variant serves the moved point");
     assert_eq!(planned(), 0);
     assert_eq!(got, native(&e1));
+}
+
+/// One plan serves an infusion end on both sides of an observation (#3010): the end of a
+/// modeled `D1` (`RATE=-2`) is walked without a timeline event (`integrate_tvcov_g`'s `soft`),
+/// each segment of its window cut where it falls (`AffinePieces`), so moving it past the
+/// observation at 2.5 h changes no structure. Before, the end was an event sorted against the
+/// observations, the recording kept that order as a check, and every crossing recorded the
+/// subject again — on #3010's 156-subject model, 2084 recordings and 7011 compiled kernels.
+///
+/// Three pairs, the recording made at the first point and run at the second: the end moves
+/// later across the observation, earlier, and with the other η moving too. At the second
+/// point: no recording, values bit-equal to the native predictor and to a fresh recording
+/// there, and each `∂f/∂η` against central differences of the native predictor (worst
+/// measured 1.3e-9 relative, the differences' own error at `h = 1e-6`; bound 2e-8).
+///
+/// Mutations, each run: the walked ends off (`soft` empty) → "no new recording at the moved
+/// point"; the cut without its lower clamp → a piece of negative length fails its check and the
+/// moved point records again; without its upper clamp → "a fresh recording at the moved point"
+/// disagrees; the rate left off the first piece → "value 0 against native"; the cut at the end's
+/// value only (`w.end.value_only()`) → `∂f/∂η_D1` off by 5.1 relative (the boundary term).
+#[test]
+fn a_plan_serves_both_sides_of_a_moving_infusion_end() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::types::RateMode::ModeledDuration;
+    let model = parse_model_string(ONE_CPT_D1_ODE).unwrap();
+    let d = |t| DoseEvent::modeled(t, 100.0, 1, false, 0.0, ModeledDuration);
+    let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
+    let s = subject(&model, vec![d(0.0), d(12.0)], &times, &[0.0; 2]);
+    let mut fresh_s = s.clone();
+    fresh_s.id = format!("{}-fresh", s.id);
+    let theta = moved_params(&model).theta;
+    let n = s.observations.len();
+    let end = |e: &[f64]| theta[2] * e[1].exp();
+    let planned = || kj::TEMPLATE_PROBE.with(|p| p.replace((false, 0, 0)).1);
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&model, &s, &theta, e);
+    let run = |s: &Subject, e: &[f64]| {
+        with_plan(&model, s, None, &theta, e, &mut |p| {
+            kjit_run(p, &theta, e, n)
+        })
+        .expect("served")
+        .du
+    };
+    let pairs = [
+        (vec![0.0, 0.0], vec![0.0, 0.2]),
+        (vec![0.0, 0.2], vec![0.0, 0.0]),
+        (vec![0.1, -0.3], vec![-0.1, 0.25]),
+    ];
+    for (i, (e0, e1)) in pairs.iter().enumerate() {
+        // The straddle: the first window's end on opposite sides of the observation at 2.5,
+        // and before the second dose at both points.
+        assert!(
+            (end(e0) < 2.5) != (end(e1) < 2.5) && end(e0).max(end(e1)) < 12.0,
+            "pair {i}: {} {}",
+            end(e0),
+            end(e1)
+        );
+        planned();
+        run(&s, e0);
+        // The first pair records the subject's plan; the later ones find it.
+        assert_eq!(planned(), usize::from(i == 0), "pair {i}: the first point");
+        let got = run(&s, e1);
+        assert_eq!(
+            planned(),
+            0,
+            "pair {i}: no new recording at the moved point"
+        );
+        let fresh = run(&fresh_s, e1);
+        assert_eq!(got, fresh, "pair {i}: a fresh recording at the moved point");
+        let nat = native(e1);
+        let l = 1 + e1.len();
+        let mut worst = 0.0f64;
+        for j in 0..n {
+            assert_eq!(got[j * l], nat[j], "pair {i}: value {j} against native");
+            for k in 0..e1.len() {
+                let h = 1e-6;
+                let (mut ep, mut em) = (e1.clone(), e1.clone());
+                ep[k] += h;
+                em[k] -= h;
+                let fd = (native(&ep)[j] - native(&em)[j]) / (2.0 * h);
+                let gap = (got[j * l + 1 + k] - fd).abs() / (1e-6 + fd.abs());
+                assert!(gap.is_finite(), "pair {i}: obs {j}, eta {k}: {gap}");
+                worst = worst.max(gap);
+            }
+        }
+        eprintln!("pair {i}: worst d/deta gap {worst:e}");
+        assert!(
+            worst < 2e-8,
+            "pair {i}: d/deta against central differences: {worst:e}"
+        );
+    }
 }
 
 /// The structured kernel's reduce is one plan shared by every subject (`kernel_run_shared`,
@@ -12206,5 +12628,358 @@ fn the_covariance_bases_take_the_shared_primal_kernels() {
             "ode {ode}: rows forward {fwd}, reverse {rev}"
         );
         assert_eq!(loops > 0, ode, "ode {ode}: rows loop runs {loops}");
+    }
+}
+
+/// A walked infusion end's segment that the exact pieces decline (a type that does not record
+/// probes `A`, and its self-check can refuse a finite segment) is integrated on the values, as
+/// the end's event would have been — not filled with `NaN` (#3010 review). Forced
+/// (`FORCE_LINEAR_DECLINE`) on the `Dual2` walk, with the end inside a segment (2.47 h, between
+/// the 2.1 and 2.5 h samples) and outside every segment's interior (2.24 h): values and
+/// `∂f/∂η` against the exact pieces, the fallback's adaptive solver at 1e-12: measured worst
+/// 9.8e-13 relative (4.0e-5 at the default tolerance, the solver's own error); bound 1e-10.
+/// Mutations: the decline filled with `NaN` again → "finite"; the fallback's rate-off saltation
+/// dropped → `∂f/∂η_D1` past the end.
+#[test]
+fn a_declined_walked_segment_is_integrated_on_its_values() {
+    use crate::types::RateMode::ModeledDuration;
+    let mut model = parse_model_string(ONE_CPT_D1_ODE).unwrap();
+    // The fallback integrates adaptively: tight enough that its error is far below a wrong
+    // crossing's.
+    let ode = model.ode_spec.as_mut().unwrap();
+    ode.solver_opts.reltol = 1e-12;
+    ode.solver_opts.abstol = 1e-12;
+    let d = |t| DoseEvent::modeled(t, 100.0, 1, false, 0.0, ModeledDuration);
+    let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
+    let s = subject(&model, vec![d(0.0), d(12.0)], &times, &[0.0; 2]);
+    let theta = moved_params(&model).theta;
+    let th: Vec<Dual2<2>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
+    let walk = |eta: &[f64]| -> Vec<Dual2<2>> {
+        let et: Vec<Dual2<2>> = eta
+            .iter()
+            .enumerate()
+            .map(|(k, &v)| Dual2::var(v, k))
+            .collect();
+        record(&model, &s, None, &theta, eta, &ThetaLeaves::theta(&th), &et).expect("in scope")
+    };
+    for eta in [[0.05, 0.1], [-0.05, 0.0]] {
+        let exact = walk(&eta);
+        let declined = {
+            let prev = crate::ode::solver::FORCE_LINEAR_DECLINE.replace(true);
+            let r = walk(&eta);
+            crate::ode::solver::FORCE_LINEAR_DECLINE.set(prev);
+            r
+        };
+        let mut worst = 0.0f64;
+        for (j, (a, b)) in exact.iter().zip(&declined).enumerate() {
+            let pairs = std::iter::once((a.value, b.value))
+                .chain(a.grad.iter().copied().zip(b.grad.iter().copied()));
+            for (x, y) in pairs {
+                assert!(
+                    x.is_finite() && y.is_finite(),
+                    "eta {eta:?}, obs {j}: finite ({x}, {y})"
+                );
+                worst = worst.max((x - y).abs() / (1e-6 + x.abs()));
+            }
+        }
+        eprintln!("eta {eta:?}: declined vs exact {worst:e}");
+        assert!(worst < 1e-10, "eta {eta:?}: {worst:e}");
+    }
+}
+
+/// [`ONE_CPT_D1_ODE`] on the closed form (`pk one_cpt_iv`): the same modeled `D1`, walked by
+/// the analytic event walk.
+fn one_cpt_d1_closed_form() -> CompiledModel {
+    let ode = "  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n";
+    assert!(ONE_CPT_D1_ODE.contains(ode));
+    let model =
+        parse_model_string(&ONE_CPT_D1_ODE.replace(ode, "  pk one_cpt_iv(cl=CL, v=V)\n")).unwrap();
+    assert!(model.ode_spec.is_none(), "the closed form");
+    model
+}
+
+/// A subject of [`one_cpt_d1_closed_form`]: 100 mg doses at `doses` with a modeled `D1`
+/// (`RATE=-2`), sampled at `times`.
+fn d1_subject(model: &CompiledModel, doses: &[f64], times: &[f64]) -> Subject {
+    use crate::types::RateMode::ModeledDuration;
+    let d = |t| DoseEvent::modeled(t, 100.0, 1, false, 0.0, ModeledDuration);
+    subject(
+        model,
+        doses.iter().map(|&t| d(t)).collect(),
+        times,
+        &[0.0; 2],
+    )
+}
+
+/// The served plan's `[f, ∂f/∂η…]` per observation at `eta`, and how many plans the call
+/// recorded.
+fn served_and_recorded(
+    model: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> (Vec<f64>, usize) {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    kj::TEMPLATE_PROBE.with(|p| p.replace((false, 0, 0)));
+    let n = s.observations.len();
+    let du = with_plan(model, s, None, theta, eta, &mut |p| {
+        kjit_run(p, theta, eta, n)
+    })
+    .expect("served")
+    .du;
+    (du, kj::TEMPLATE_PROBE.with(|p| p.replace((false, 0, 0)).1))
+}
+
+/// The worst relative gap of a plan's values (`got`, laid out as [`served_and_recorded`]'s)
+/// against the native predictor at `eta`, and of its `∂f/∂η` against the native predictor's
+/// differences, central (`h = 1e-6`) except at the observations in `one_sided`, which take the
+/// forward difference (`h = 1e-7`).
+fn gaps_against_native(
+    model: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    got: &[f64],
+    one_sided: &[usize],
+) -> (f64, f64) {
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(model, s, theta, e);
+    let nat = native(eta);
+    let l = 1 + eta.len();
+    let (mut value, mut grad) = (0.0f64, 0.0f64);
+    for j in 0..s.observations.len() {
+        let gap = (got[j * l] - nat[j]).abs() / nat[j].abs();
+        assert!(gap.is_finite(), "value {j}: {} vs {}", got[j * l], nat[j]);
+        value = value.max(gap);
+        for k in 0..eta.len() {
+            let (mut ep, mut em) = (eta.to_vec(), eta.to_vec());
+            let fd = if one_sided.contains(&j) {
+                let h = 1e-7;
+                ep[k] += h;
+                (native(&ep)[j] - nat[j]) / h
+            } else {
+                let h = 1e-6;
+                ep[k] += h;
+                em[k] -= h;
+                (native(&ep)[j] - native(&em)[j]) / (2.0 * h)
+            };
+            let gap = (got[j * l + 1 + k] - fd).abs() / (1e-6 + fd.abs());
+            assert!(
+                gap.is_finite(),
+                "obs {j}, eta {k}: {} vs {fd}",
+                got[j * l + 1 + k]
+            );
+            grad = grad.max(gap);
+        }
+    }
+    (value, grad)
+}
+
+/// The closed-form twin of `a_plan_serves_both_sides_of_a_moving_infusion_end` (#3033): one
+/// plan serves the end of a modeled `D1` (`RATE=-2`) on both sides of the observation at 2.5 h.
+/// The analytic event walk (`sens::propagate`'s `walked_ends`) walks such an end without a break:
+/// every sub-interval of its window is cut where the end falls (`walk_cut`), chosen on every
+/// evaluation. Before, the end was a break sorted against the observations, the recording kept
+/// that order as a guard, and every crossing recorded the subject again.
+///
+/// Three pairs, the recording made at the first point and run at the second: the end moves
+/// later across the observation, earlier, and with the other η moving too. At the second point:
+/// no recording, values bit-equal to a fresh recording there and equal to the native predictor
+/// (measured worst 3.3e-16 relative — the plan and the native walk round differently, by an ULP
+/// or two, at every point, recorded before #3033 too; bound 1e-14), and each `∂f/∂η` against
+/// central differences of the native predictor (measured worst 7.9e-10, the differences' own
+/// error at `h = 1e-6`; bound 2e-8).
+///
+/// Mutations, each run: no window walked (`walked_ends` empty) → "no new recording at the moved
+/// point"; the window's rate left off the cut's first piece → the values; the cut at the end's
+/// value only (`we.end.value_only()`) → `∂f/∂η_D1`.
+#[test]
+fn a_closed_form_plan_serves_both_sides_of_a_moving_infusion_end() {
+    let model = one_cpt_d1_closed_form();
+    let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
+    let s = d1_subject(&model, &[0.0, 12.0], &times);
+    let mut fresh_s = s.clone();
+    fresh_s.id = format!("{}-fresh", s.id);
+    let theta = moved_params(&model).theta;
+    let end = |e: &[f64]| theta[2] * e[1].exp();
+    let pairs = [
+        (vec![0.0, 0.0], vec![0.0, 0.2]),
+        (vec![0.0, 0.2], vec![0.0, 0.0]),
+        (vec![0.1, -0.3], vec![-0.1, 0.25]),
+    ];
+    for (i, (e0, e1)) in pairs.iter().enumerate() {
+        // The straddle: the first window's end on opposite sides of the observation at 2.5,
+        // and before the second dose at both points.
+        assert!(
+            (end(e0) < 2.5) != (end(e1) < 2.5) && end(e0).max(end(e1)) < 12.0,
+            "pair {i}: {} {}",
+            end(e0),
+            end(e1)
+        );
+        let (_, first) = served_and_recorded(&model, &s, &theta, e0);
+        // The first pair records the subject's plan; the later ones find it.
+        assert_eq!(first, usize::from(i == 0), "pair {i}: the first point");
+        let (got, moved) = served_and_recorded(&model, &s, &theta, e1);
+        assert_eq!(moved, 0, "pair {i}: no new recording at the moved point");
+        let (fresh, _) = served_and_recorded(&model, &fresh_s, &theta, e1);
+        assert_eq!(got, fresh, "pair {i}: a fresh recording at the moved point");
+        let (value, grad) = gaps_against_native(&model, &s, &theta, e1, &got, &[]);
+        eprintln!("pair {i}: worst value gap {value:e}, d/deta gap {grad:e}");
+        assert!(value < 1e-14, "pair {i}: values against native: {value:e}");
+        assert!(
+            grad < 2e-8,
+            "pair {i}: d/deta against central differences: {grad:e}"
+        );
+    }
+}
+
+/// The one check a walked window keeps (#3033, `walked_ends`): its end comes before the next
+/// infusion's arrival, recorded as a guard. Moving the first dose's end past the second dose's
+/// arrival at 12 h fails it, so the moved point is recorded again — the end is a break there, as
+/// before — and its values and `∂f/∂η` are the native predictor's (measured worst 4.4e-16 and
+/// 8.0e-10; bounds 1e-14 and 2e-8). Mutation: the check dropped (`end < until`) → the first
+/// plan serves the moved point, with the first window's rate cut off at 12 h ("a new recording").
+#[test]
+fn a_walked_end_past_the_next_infusion_records_again() {
+    let model = one_cpt_d1_closed_form();
+    let times = [1.0, 2.1, 2.5, 6.0, 12.5, 14.1, 14.5, 20.0];
+    let s = d1_subject(&model, &[0.0, 12.0], &times);
+    let theta = moved_params(&model).theta;
+    let end = |e: &[f64]| theta[2] * e[1].exp();
+    let (e0, e1) = (vec![0.0, 0.0], vec![0.0, (13.0 / theta[2]).ln()]);
+    assert!(
+        end(&e0) < 12.0 && end(&e1) > 12.0,
+        "{} {}",
+        end(&e0),
+        end(&e1)
+    );
+    let (_, first) = served_and_recorded(&model, &s, &theta, &e0);
+    assert_eq!(first, 1, "the first point");
+    let (got, moved) = served_and_recorded(&model, &s, &theta, &e1);
+    assert_eq!(moved, 1, "a new recording at the moved point");
+    let (value, grad) = gaps_against_native(&model, &s, &theta, &e1, &got, &[]);
+    eprintln!("worst value gap {value:e}, d/deta gap {grad:e}");
+    assert!(value < 1e-14, "values against native: {value:e}");
+    assert!(grad < 2e-8, "d/deta against central differences: {grad:e}");
+}
+
+/// A walked end exactly on a sample belongs to the later sub-interval (#3033, `walk_cut`): the
+/// window still contributes to the sample, production's convention for a window end on a sample
+/// (the end sorts after the observation), and the sample's `∂f/∂η_D1` is the one-sided
+/// derivative of that branch — the end moving later. `TVD1 = 2.5` and `η_D1 = 0` put the end on
+/// the 2.5 h sample exactly. The two one-sided differences there differ by the rate-off term
+/// (asserted, so the test can tell the sides apart); the plan matches the forward one (measured
+/// worst 7.3e-8 relative, the forward difference's own error at `h = 1e-7`; bound 1e-6), and
+/// every other sample's central difference (smooth there). Mutations: the whole-on arm taken only
+/// past `b` (`Gt` for `Ge`) → the 2.5 h sample takes the backward side; the whole-off arm from
+/// `a` on (`Le` for `Lt`) → the end's derivative is lost from the sub-interval after it.
+#[test]
+fn a_walked_end_on_a_sample_leaves_the_window_on_for_it() {
+    let model = one_cpt_d1_closed_form();
+    let times = [1.0, 2.1, 2.5, 6.0];
+    let s = d1_subject(&model, &[0.0], &times);
+    let mut theta = moved_params(&model).theta;
+    theta[2] = 2.5;
+    let eta = [0.05f64, 0.0];
+    assert_eq!(theta[2] * eta[1].exp(), 2.5, "the end on the sample");
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&model, &s, &theta, e)[2];
+    let h = 1e-7;
+    let (fwd, bwd) = (
+        (native(&[eta[0], h]) - native(&eta)) / h,
+        (native(&eta) - native(&[eta[0], -h])) / h,
+    );
+    assert!(
+        (fwd - bwd).abs() > 1e-2 * fwd.abs(),
+        "the two sides apart: {fwd} {bwd}"
+    );
+    let (got, _) = served_and_recorded(&model, &s, &theta, &eta);
+    let (value, grad) = gaps_against_native(&model, &s, &theta, &eta, &got, &[2]);
+    eprintln!("worst value gap {value:e}, d/deta gap {grad:e} (forward {fwd}, backward {bwd})");
+    assert!(value < 1e-14, "values against native: {value:e}");
+    assert!(
+        grad < 1e-6,
+        "d/deta against the forward difference: {grad:e}"
+    );
+}
+
+/// A sub-interval far from a walked end stays finite (#3033, `walk_cut`): the cut's point is
+/// clamped into the sub-interval, so the arm not chosen never steps backwards — a backward
+/// closed-form step grows as `e^{ke·|dt|}`, and `ke·|dt| ≈ 800` overflows it. The forward
+/// tangents select past such an arm; the reverse passes take it with a zero adjoint, and
+/// `0 · ∞` is `NaN`. Two subjects: the end long before a sub-interval (a bolus 6000 h after the
+/// window, sampled after it), and long after one (a 7000 h window, sampled in its first hours).
+/// The plan's values and `∂f/∂η`, and the FOCEI adjoint gradient, finite. Mutations, each run:
+/// either clamp dropped → this test fails (the plan's forward values stay finite without them;
+/// only the reverse passes see it).
+#[test]
+fn a_walked_cut_far_from_the_end_stays_finite() {
+    use crate::types::RateMode::ModeledDuration;
+    let model = one_cpt_d1_closed_form();
+    let eta = [0.05, 0.1];
+    let template = moved_params(&model);
+    let d1 = template.theta[2];
+    let infusion = DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, ModeledDuration);
+    for (label, tvd1, doses, times) in [
+        (
+            "end long before",
+            d1,
+            vec![
+                infusion.clone(),
+                DoseEvent::new(6000.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            vec![1.0, 2.5, 6001.0, 6002.0],
+        ),
+        (
+            "end long after",
+            7000.0,
+            vec![infusion.clone()],
+            vec![1.0, 2.0],
+        ),
+    ] {
+        let mut params = template.clone();
+        params.theta[2] = tvd1;
+        let mut s = subject(&model, doses, &times, &[0.0; 2]);
+        s.id = label.to_string();
+        s.observations = vec![1.0; times.len()];
+        let (got, _) = served_and_recorded(&model, &s, &params.theta, &eta);
+        assert!(got.iter().all(|x| x.is_finite()), "{label}: plan {got:?}");
+        let x = pack_params(&params);
+        let grad = subject_adjoint_packed_gradient(&model, &s, &params, &x, &eta, true)
+            .expect("in adjoint scope");
+        assert!(
+            grad.iter().all(|x| x.is_finite()),
+            "{label}: gradient {grad:?}"
+        );
+    }
+}
+
+/// A plan recorded where a modeled window overflows does not serve a finite one (#3033). At
+/// `η_D1 = 829.3` (a runaway step of an EBE search on the `ADVAN1` anchor's subject 19) `D` is
+/// `∞`, the dose resolves to `rate = amt/∞ = 0` and so to no infusion — a plain value the
+/// recording kept as its structure with no guard, so the plan then served every finite `D` as no
+/// infusion either: predictions zero, an objective of 8.6e13 at every point, and the inner search
+/// stuck at `η = 0` for 41 of the anchor's 60 subjects. Now the same decision on the dual window is
+/// a guard: the finite point records again, with the native predictor's values (measured worst
+/// 4.3e-16; bound 1e-14). `η_D1 = 300` (`D` huge but finite) records again too — the control that
+/// it is the overflow, not the size. Mutation: the guard dropped → "a new recording" (1.0 off).
+#[test]
+fn a_plan_recorded_at_an_overflowed_window_does_not_serve_a_finite_one() {
+    let model = one_cpt_d1_closed_form();
+    let theta = moved_params(&model).theta;
+    let good = [0.04, 0.25];
+    for (k, bad) in [[0.0, 829.3], [0.0, 300.0]].iter().enumerate() {
+        let mut s = d1_subject(
+            &model,
+            &[0.0, 12.0],
+            // Its own design, so the two cases share no template.
+            &[1.0 + 0.1 * k as f64, 2.0, 2.5, 6.0, 13.0, 14.5, 20.0],
+        );
+        s.id = format!("overflow-{k}");
+        let (_, first) = served_and_recorded(&model, &s, &theta, bad);
+        assert_eq!(first, 1, "{bad:?}: the first point");
+        let (got, again) = served_and_recorded(&model, &s, &theta, &good);
+        assert_eq!(again, 1, "{bad:?}: a new recording at the finite window");
+        let (value, _) = gaps_against_native(&model, &s, &theta, &good, &got, &[]);
+        eprintln!("{bad:?}: worst value gap {value:e}");
+        assert!(value < 1e-14, "{bad:?}: values against native: {value:e}");
     }
 }

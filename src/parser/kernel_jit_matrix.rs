@@ -186,7 +186,16 @@ impl MatSpec {
                 }
             }
         }
-        out[..nn * l].iter().all(|v| v.is_finite())
+        if out[..nn * l].iter().all(|v| v.is_finite()) {
+            return true;
+        }
+        // An overflowed result is a point the value path cannot score either; a recording this
+        // call runs inside (a repeat body's record-time run) is told, so a failure it causes is
+        // repelled, while a singular solve (above) stays the point's.
+        if super::recording_open() {
+            super::note_nonfinite();
+        }
+        false
     }
 
     /// The reverse: `out_adj` the result's adjoints per seed, into `in_adj` per seed the two

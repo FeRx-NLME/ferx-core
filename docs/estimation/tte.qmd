@@ -280,7 +280,6 @@ The duals do not reach every endpoint. These keep a 4-point central-difference
 stencil:
 
 - an expression ferx cannot compile to a dual program;
-- a drug-driven hazard on a subject the dual walk declines (a steady-state dose).
 
 The step on each η axis is `2.4e-3` conditional posterior standard deviations,
 `1/√((Ω⁻¹)_jj + Ĥ_jj)`. The stencil moves one η with the others held, so the prior

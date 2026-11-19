@@ -1634,7 +1634,7 @@ fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
         m.contains("declined because the model is outside the analytic recorders' scope."),
         "{m}"
     );
-    // No invented advice: the FD stencil is the correct route for such a model.
+    // No invented advice: a model outside the recorders' scope has no one-line remedy.
     assert!(!m.contains("moves the fit onto the analytic route"), "{m}");
     assert!(!m.contains("stays on the finite-difference route"), "{m}");
 }
@@ -1643,15 +1643,13 @@ fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
 fn several_unremediable_clauses_invent_no_advice() {
     let mut facts = measured_severe_facts();
     facts.declines = &[
-        CovScopeDecline::PerSubjectBail,
         CovScopeDecline::ModelOutOfScope,
         CovScopeDecline::NonGaussianEndpoint,
     ];
     let m = format_regularized_warning(&facts);
     assert!(
         m.contains(
-            "at least one subject fell outside the analytic assembly, the model is outside the \
-             analytic recorders' scope \
+            "the model is outside the analytic recorders' scope \
              and the model has a non-Gaussian endpoint ([event_model] / [binary_model]) \
              outside the exact term (an endpoint without an exact channel, or an SDE)."
         ),

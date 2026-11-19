@@ -329,8 +329,9 @@ adjoint (#486). The weights are θ inputs of its plan, so one reverse pass retur
 weight's derivative, at a cost that does not grow with the number of weights. Static and
 time-varying network inputs, IOV (`kappa`), an `[initial_conditions]` baseline, an `obs_scale`
 expression and a Form C readout are all served, on both loops. A model that reads a generated
-weight parameter directly (`… + B_TYPICAL_PK_2_1`) routes to finite differences, as it does
-for the fixed-η estimators.
+weight parameter directly (`… + B_TYPICAL_PK_2_1`) is served too: the adjoint records the
+weights as θ leaves. Only the weight-gradient speed-ups (`NnGradPlan`, `NnReduction`) stand
+down for such a model.
 
 Two things keep the network off the hot paths:
 
