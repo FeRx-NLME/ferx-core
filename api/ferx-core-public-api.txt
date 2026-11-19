@@ -660,6 +660,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::kappas: alloc::vec::Vec
 pub ferx_core::estimation::outer_optimizer::OuterResult::left_init: core::option::Option<bool>
 pub ferx_core::estimation::outer_optimizer::OuterResult::max_unconverged_subjects: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::mixture_posteriors: core::option::Option<ferx_core::estimation::outer_optimizer::MixturePosteriors>
+pub ferx_core::estimation::outer_optimizer::OuterResult::mstep_optimizer_used: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::n_iterations: usize
 pub ferx_core::estimation::outer_optimizer::OuterResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::ofv: f64
@@ -2829,6 +2830,13 @@ pub ferx_core::types::KappaTreatment::NotApplicable
 pub enum ferx_core::types::LinkFn
 pub ferx_core::types::LinkFn::Logit
 pub ferx_core::types::LinkFn::Probit
+pub enum ferx_core::types::MstepOptimizer
+pub ferx_core::types::MstepOptimizer::Auto
+pub ferx_core::types::MstepOptimizer::Bobyqa
+pub ferx_core::types::MstepOptimizer::Lbfgs
+pub ferx_core::types::MstepOptimizer::Newton
+impl ferx_core::MstepOptimizer
+pub fn ferx_core::MstepOptimizer::as_str(self) -> &'static str
 pub enum ferx_core::types::MuTransform
 pub ferx_core::types::MuTransform::Identity
 pub ferx_core::types::MuTransform::Log
@@ -3413,6 +3421,7 @@ pub ferx_core::types::FitOptions::max_unconverged_frac: f64
 pub ferx_core::types::FitOptions::method: ferx_core::EstimationMethod
 pub ferx_core::types::FitOptions::methods: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::types::FitOptions::min_obs_for_convergence_check: u32
+pub ferx_core::types::FitOptions::mstep_optimizer: ferx_core::MstepOptimizer
 pub ferx_core::types::FitOptions::mu_referencing: bool
 pub ferx_core::types::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::n_agq: usize
@@ -3570,6 +3579,7 @@ pub ferx_core::types::FitResult::model_hash: core::option::Option<alloc::string:
 pub ferx_core::types::FitResult::model_name: alloc::string::String
 pub ferx_core::types::FitResult::model_path: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::model_text: core::option::Option<alloc::string::String>
+pub ferx_core::types::FitResult::mstep_optimizer_used: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::multi_start_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::n_iterations: usize
 pub ferx_core::types::FitResult::n_obs: usize
@@ -4379,6 +4389,13 @@ pub enum ferx_core::MatchMethod
 pub ferx_core::MatchMethod::Nearest
 pub ferx_core::MatchMethod::Optimal
 pub ferx_core::MatchMethod::Rank
+pub enum ferx_core::MstepOptimizer
+pub ferx_core::MstepOptimizer::Auto
+pub ferx_core::MstepOptimizer::Bobyqa
+pub ferx_core::MstepOptimizer::Lbfgs
+pub ferx_core::MstepOptimizer::Newton
+impl ferx_core::MstepOptimizer
+pub fn ferx_core::MstepOptimizer::as_str(self) -> &'static str
 pub enum ferx_core::MuTransform
 pub ferx_core::MuTransform::Identity
 pub ferx_core::MuTransform::Log
@@ -5156,6 +5173,7 @@ pub ferx_core::FitOptions::max_unconverged_frac: f64
 pub ferx_core::FitOptions::method: ferx_core::EstimationMethod
 pub ferx_core::FitOptions::methods: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::FitOptions::min_obs_for_convergence_check: u32
+pub ferx_core::FitOptions::mstep_optimizer: ferx_core::MstepOptimizer
 pub ferx_core::FitOptions::mu_referencing: bool
 pub ferx_core::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::n_agq: usize
@@ -5313,6 +5331,7 @@ pub ferx_core::FitResult::model_hash: core::option::Option<alloc::string::String
 pub ferx_core::FitResult::model_name: alloc::string::String
 pub ferx_core::FitResult::model_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::model_text: core::option::Option<alloc::string::String>
+pub ferx_core::FitResult::mstep_optimizer_used: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::multi_start_seed: core::option::Option<u64>
 pub ferx_core::FitResult::n_iterations: usize
 pub ferx_core::FitResult::n_obs: usize

@@ -3980,6 +3980,72 @@ fn test_mstep_solver_and_draws_round_trip_and_validate() {
     assert_eq!(opts.saem_mstep_draws, 1);
 }
 
+/// `mstep_optimizer` round-trips, defaults to `auto` (#3001), rejects
+/// what it cannot act on without clobbering the last good value, is accepted by the
+/// three estimators whose numerical M-step it drives and warns under any other.
+#[test]
+fn test_mstep_optimizer_round_trips_validates_and_is_scoped() {
+    use crate::types::MstepOptimizer;
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Auto);
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_optimizer", "newton"),
+        Ok(true)
+    );
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_optimizer", "AUTO"),
+        Ok(true)
+    );
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Auto);
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_optimizer", "LBFGS"),
+        Ok(true)
+    );
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Lbfgs);
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_optimizer", "bobyqa"),
+        Ok(true)
+    );
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Bobyqa);
+    assert_eq!(
+        apply_fit_option(&mut opts, "mstep_optimizer", "lbfgs"),
+        Ok(true)
+    );
+    let err = apply_fit_option(&mut opts, "mstep_optimizer", "adam")
+        .expect_err("an unknown optimizer must be rejected");
+    assert!(
+        err.contains("auto/bobyqa/lbfgs/newton") && err.contains("adam"),
+        "got: {err}"
+    );
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Lbfgs);
+
+    for method in ["saem", "imp", "impmap"] {
+        let opts = parse_fit_options(&[
+            format!("method = {method}"),
+            "mstep_optimizer = lbfgs".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            !opts
+                .unsupported_keys_warnings()
+                .iter()
+                .any(|w| w.contains("mstep_optimizer")),
+            "{method} drives the key and must not warn"
+        );
+    }
+    let opts = parse_fit_options(&[
+        "method = focei".to_string(),
+        "mstep_optimizer = lbfgs".to_string(),
+    ])
+    .unwrap();
+    assert!(
+        opts.unsupported_keys_warnings()
+            .iter()
+            .any(|w| w.contains("mstep_optimizer")),
+        "mstep_optimizer under FOCEI must warn"
+    );
+}
+
 /// The f-SAEM keys (#1449) round-trip, default to the random walk, reject what
 /// they cannot act on without clobbering the last good value, and warn under a
 /// non-SAEM method.
@@ -40508,4 +40574,13 @@ fn an_eta_read_by_a_named_hazard_is_a_second_use_like_its_unnamed_spelling() {
             "{header}: no θ of the group is read outside it: {cl:?}"
         );
     }
+}
+
+#[test]
+fn mstep_optimizer_accepts_newton_and_names_it_in_the_error() {
+    let mut opts = FitOptions::default();
+    apply_fit_option(&mut opts, "mstep_optimizer", "newton").unwrap();
+    assert_eq!(opts.mstep_optimizer, MstepOptimizer::Newton);
+    let err = apply_fit_option(&mut opts, "mstep_optimizer", "adam").unwrap_err();
+    assert!(err.contains("bobyqa/lbfgs/newton"), "{err}");
 }

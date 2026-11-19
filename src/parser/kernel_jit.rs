@@ -6546,6 +6546,36 @@ impl Plan {
         Some(())
     }
 
+    /// [`Self::forward_layout`] without keeping the forward: the outputs' lanes then the guard
+    /// into `du` as there, but with no run logs and no buffer handed back, so no reverse can
+    /// follow — the cost of an exact tangent Jacobian read straight off the output lanes
+    /// (`layout.tan` directions seeded in `params`). `None` when a call cannot run (the plan
+    /// itself may still serve another layout); `Some(held)` otherwise, `held` the guard.
+    pub(crate) fn forward_unkept(
+        &self,
+        layout: Layout,
+        u: &[f64],
+        params: &[f64],
+        du: &mut [f64],
+    ) -> Option<bool> {
+        let fwd = self.fns(layout, Sweep::Forward)?;
+        let l = layout.lanes();
+        let ins = (self.n_eta + self.n_theta) * l;
+        let mut buf = Buf::new(self.n_slots * l);
+        buf[..self.n_eta * l].copy_from_slice(&u[..self.n_eta * l]);
+        buf[self.n_eta * l..ins].copy_from_slice(&params[..self.n_theta * l]);
+        self.forward_logged(&fwd, &mut buf, layout, None)?;
+        for (i, &o) in self.outs.iter().enumerate() {
+            let o = o as usize * l;
+            du[i * l..(i + 1) * l].copy_from_slice(&buf[o..o + l]);
+        }
+        let held = self.guard.is_none_or(|g| buf[g as usize * l] == 1.0);
+        let g = &mut du[self.outs.len() * l..(self.outs.len() + 1) * l];
+        g.fill(0.0);
+        g[0] = if held { 1.0 } else { 0.0 };
+        Some(held)
+    }
+
     /// The forward over `layout` from `u` and `params` (laid out at its lanes, η seeded
     /// one-hot), kept for reverse passes: `None` when a loop call fails. The guard is not
     /// judged here ([`Self::kept_guard`]).

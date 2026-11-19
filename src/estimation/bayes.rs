@@ -2242,6 +2242,7 @@ pub fn run_bayes(
         saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: None,
         // Post-loop EBE health at the posterior mean. Non-convergence is likelier
         // on the mixture path (K multimodal inner solves per subject), so report it
         // instead of hardcoding a clean run (#985).

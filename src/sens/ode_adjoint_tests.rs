@@ -3092,7 +3092,7 @@ fn a_foce_fit_with_a_refused_frem_subject_reports_no_fd_inner_subjects() {
 /// Kernel `F` and `l` at `(params, η)` against production's `foce_subject_nll` / inner
 /// objective, on the production predictions and η-Jacobian. Returns `(|ΔF|, |Δl|)`, each
 /// relative to `1 + |F|`.
-fn objective_gaps(
+pub(super) fn objective_gaps(
     model: &CompiledModel,
     s: &Subject,
     params: &ModelParameters,
@@ -8537,20 +8537,36 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         ),
     ];
     let mut worst_all = 0.0f64;
-    for (name, model, doses, eta) in cases {
-        let mut worst = 0.0f64;
+    // Both routes of the Jacobian: the forward tangents (one pass, a direction per θ, taken
+    // where there are no more θ than observations) and one reverse seed per observation, each
+    // against the independent `Dual2` forward oracle.
+    for (force_reverse, (name, model, doses, eta)) in [false, true]
+        .into_iter()
+        .flat_map(|r| cases.iter().map(move |c| (r, c)))
+    {
+        JAC_REVERSE_FORCE.with(|f| f.set(force_reverse));
+        let (doses, mut worst) = (doses.clone(), 0.0f64);
         let width = model.n_eta + model.n_kappa;
         let mut eta = eta[..width.min(eta.len())].to_vec();
         eta.resize(width, 0.05);
-        let s = subject(&model, doses, &TIMES, &eta[..model.n_eta]);
+        let s = subject(model, doses, &TIMES, &eta[..model.n_eta]);
         let theta = model.default_params.theta.clone();
         let weights: Vec<f64> = (0..s.observations.len())
             .map(|j| (0.7 * j as f64 + 0.3).sin())
             .collect();
-        let x = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, &weights)
+        let tan0 = TANGENT_JACS.with(|c| c.get());
+        let x = fixed_eta_theta_adjoint(model, &s, &theta, &eta, true, &weights)
             .unwrap_or_else(|| panic!("{name}: out of the recorders' scope"));
+        let took_tangents = TANGENT_JACS.with(|c| c.get()) - tan0;
+        assert_eq!(
+            took_tangents,
+            usize::from(!force_reverse && theta.len() <= s.observations.len()),
+            "{name} (force_reverse {force_reverse}): the route taken ({} θ, {} observations)",
+            theta.len(),
+            s.observations.len()
+        );
         let n_axis = theta.len();
-        let fwd = forward_theta_jacobian(&model, &s, &theta, &eta, n_axis);
+        let fwd = forward_theta_jacobian(model, &s, &theta, &eta, n_axis);
         let jac = x.jac.as_ref().expect("asked for");
         let n_theta = theta.len();
         let mut live = 0;
@@ -8578,9 +8594,9 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         // whose propagation is a sum of modes: measured 1.9e-14 there; 1e-13 keeps ~5×.
         let bound = if name.contains("rodas") {
             1e-9
-        } else if name == "additive_four_eta" {
+        } else if *name == "additive_four_eta" {
             1e-13
-        } else if name == "warfarin_sde" {
+        } else if *name == "warfarin_sde" {
             1e-12
         } else {
             1e-14
@@ -8588,7 +8604,65 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         assert!(worst < bound, "{name}: worst relative difference {worst:e}");
         worst_all = worst_all.max(worst);
     }
+    JAC_REVERSE_FORCE.with(|f| f.set(false));
     eprintln!("fixed-η θ adjoint vs forward tangents: worst relative difference {worst_all:e}");
+}
+
+/// The Jacobian over a subset of the θ coordinates (the free ones of an M-step that holds the
+/// rest pinned) is the full Jacobian's columns, by forward tangents, and the gradient the
+/// subset's contraction; routing is by direction count against observation count.
+#[test]
+fn the_tangent_jacobian_over_a_column_subset_is_the_full_jacobians_columns() {
+    let model = parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 1, 50.0, false, 0.0),
+    ];
+    let eta = vec![0.1, -0.05, 0.08];
+    let s = subject(&model, doses, &TIMES, &eta);
+    let theta = model.default_params.theta.clone();
+    let n_theta = theta.len();
+    let weights: Vec<f64> = (0..s.observations.len())
+        .map(|j| (0.7 * j as f64 + 0.3).sin())
+        .collect();
+    let full = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, &weights).unwrap();
+    let cols = vec![n_theta - 1, 1];
+    let tan0 = TANGENT_JACS.with(|c| c.get());
+    let sub =
+        fixed_eta_theta_adjoint_cols(&model, &s, &theta, &eta, Some(&cols), &weights).unwrap();
+    assert_eq!(
+        TANGENT_JACS.with(|c| c.get()) - tan0,
+        1,
+        "the subset took tangents"
+    );
+    let (fj, sj) = (full.jac.as_ref().unwrap(), sub.jac.as_ref().unwrap());
+    let mut live = 0;
+    for j in 0..s.observations.len() {
+        for m in 0..n_theta {
+            let (a, b) = (fj[j * n_theta + m], sj[j * n_theta + m]);
+            if cols.contains(&m) {
+                assert!(a.is_finite() && b.is_finite());
+                assert!(
+                    (a - b).abs() <= 1e-12 * (1.0 + a.abs()),
+                    "∂f{j}/∂θ{m}: {a} vs {b}"
+                );
+                live += (a != 0.0) as usize;
+            } else {
+                assert_eq!(b, 0.0, "an unwanted column is not computed");
+            }
+        }
+    }
+    assert!(live > s.observations.len(), "the columns are live: {live}");
+    for &m in &cols {
+        let g = (full.grad[m] - sub.grad[m]).abs();
+        assert!(g <= 1e-12 * (1.0 + full.grad[m].abs()), "grad θ{m}: {g:e}");
+    }
+    // Routing: a direction per column against a seed per observation.
+    assert!(tangent_jac_wins(1, 9) && tangent_jac_wins(9, 9));
+    assert!(!tangent_jac_wins(0, 9) && !tangent_jac_wins(10, 9) && !tangent_jac_wins(49, 99));
+    JAC_REVERSE_FORCE.with(|f| f.set(true));
+    assert!(!tangent_jac_wins(1, 9));
+    JAC_REVERSE_FORCE.with(|f| f.set(false));
 }
 
 /// The exact outer gradient of a subject carrying non-Gaussian records: the term `q`
@@ -12982,4 +13056,66 @@ fn a_plan_recorded_at_an_overflowed_window_does_not_serve_a_finite_one() {
         eprintln!("{bad:?}: worst value gap {value:e}");
         assert!(value < 1e-14, "{bad:?}: values against native: {value:e}");
     }
+}
+
+/// A FREM covariate pseudo-observation (first row, at `TIME = 0.5` so that the plan's PK prediction
+/// there, which production discards, is live and θ-dependent) predicts `θ_i + η_e`, so its row of the Jacobian is the
+/// unit vector on `θ_i` and its weight is that θ's whole share of the score from the row —
+/// by forward tangents as by reverse seeds (the plan returns the PK prediction on that row,
+/// whose own tangents are discarded). The PK predictions do not read `TV_WT`, so its
+/// gradient entry is the row's weight exactly, whichever route computed it.
+#[test]
+fn the_tangent_jacobian_patches_a_frem_row_like_the_reverse_one() {
+    let model = parse_model_string(FREM_MODEL).unwrap();
+    let fc = model.frem_config.as_ref().expect("fixture must be FREM");
+    let (ti, _) = fc.fremtype_to_indices[&100u16];
+    let mut s = subject_shell(
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[0.5, 1.0, 6.0, 24.0],
+    );
+    s.fremtype = vec![100, 0, 0, 0];
+    let theta = model.default_params.theta.clone();
+    let eta = vec![0.1, -0.05, 0.15, 0.7];
+    let n_theta = theta.len();
+    assert!(
+        n_theta <= s.observations.len(),
+        "fixture: the tangents serve it"
+    );
+    let weights = vec![1.7, 0.9, -0.4, 0.6];
+    let tan0 = TANGENT_JACS.with(|c| c.get());
+    let by_tangents = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, &weights).unwrap();
+    assert_eq!(TANGENT_JACS.with(|c| c.get()) - tan0, 1);
+    JAC_REVERSE_FORCE.with(|f| f.set(true));
+    let by_reverse = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, &weights).unwrap();
+    JAC_REVERSE_FORCE.with(|f| f.set(false));
+    assert_eq!(
+        TANGENT_JACS.with(|c| c.get()) - tan0,
+        1,
+        "the control took reverse seeds"
+    );
+    let (jt, jr) = (by_tangents.jac.unwrap(), by_reverse.jac.unwrap());
+    for (k, (a, b)) in jt.iter().zip(&jr).enumerate() {
+        assert!(
+            (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
+            "jac[{k}]: {a} vs {b}"
+        );
+    }
+    for m in 0..n_theta {
+        let (a, b) = (by_tangents.grad[m], by_reverse.grad[m]);
+        assert!(
+            (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
+            "grad[{m}]: {a} vs {b}"
+        );
+    }
+    for m in 0..n_theta {
+        assert_eq!(jt[m], f64::from(u8::from(m == ti)), "FREM row, θ{m}");
+    }
+    assert_eq!(
+        by_tangents.grad[ti], weights[0],
+        "TV_WT's score is the FREM row's weight"
+    );
+    assert!(
+        (1..4).any(|j| jt[j * n_theta] != 0.0),
+        "fixture: the PK rows depend on θ"
+    );
 }

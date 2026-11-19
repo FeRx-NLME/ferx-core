@@ -14,7 +14,7 @@
 
 use super::tests::{
     censor, ebe_for, fd_oracle, hessian_gaps, hessian_gaps_for, laplace_prod, moved_params,
-    oracle_jacobian, parity, subject, subject_shell, tight, with_tol,
+    objective_gaps, oracle_jacobian, parity, subject, subject_shell, tight, with_tol,
 };
 use super::*;
 use crate::estimation::parameterization::pack_params;
@@ -5633,14 +5633,32 @@ fn an_unanchored_onset_loses_the_second_derivative() {
     // scope decline), instead of being served with the wrong second derivative.
     let m = tight(parse_model_string(&lagged_kernel_model("transit", 0.5, "route")).unwrap());
     let s = lagged_kernel_subject(&m);
+    // (As its ODE twin: a route-lagged `transit` is a modified-release model, whose plan is
+    // the closed form -- which has no onset to anchor -- unless the twin is asked for.)
     assert!(
-        !with_onset_shift_off(|| served(&m, &s)),
+        !with_mr_plan_off(|| with_onset_shift_off(|| served(&m, &s))),
         "transit n = 0.5, unanchored, must not be served"
     );
     // A fresh model: the unanchored run's failure marks `m`'s plan bad for good.
     let m = tight(parse_model_string(&lagged_kernel_model("transit", 0.5, "route")).unwrap());
     let s = lagged_kernel_subject(&m);
-    assert!(served(&m, &s), "transit n = 0.5, anchored, is served");
+    assert!(
+        with_mr_plan_off(|| served(&m, &s)),
+        "transit n = 0.5, anchored, is served"
+    );
+}
+
+/// Runs `f` with a modified-release subject recorded as its ODE twin ([`MR_PLAN_OFF`]), restoring it.
+fn with_mr_plan_off<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MR_PLAN_OFF.with(|c| c.set(false));
+        }
+    }
+    MR_PLAN_OFF.with(|c| c.set(true));
+    let _restore = Restore;
+    f()
 }
 
 /// Runs `f` with the refused-anchor clause (an event preceding the onset at its instant) on,
@@ -6257,4 +6275,487 @@ fn per_route_lag_example_start_values_are_exact_and_finite() {
     let (gap, _) = hessian_gaps_for(&m, &s, Objective::Focei);
     // Measured 1.6e-9 on Linux; ~10x headroom.
     assert!(gap < 2e-8, "Hessian vs reconverged FD: {gap:.2e}");
+}
+
+// ---- modified-release closed form on the tape (#3001) -----------------------------------
+//
+// A static modified-release model (`first_order` / `transit` / `igd` / `zero_order` forcings
+// on a canonical linear 1-/2-cpt disposition) is predicted in closed form by the value path
+// (`pk::modified_release::mr_predictions`). The adjoint used to record the integration of its
+// ODE twin; it now records that one generic kernel (`mr_observable_g`), so its plan holds no
+// solver loop and its values are the value path's bits.
+
+/// One-compartment `first_order` with an estimated bioavailability and a compartment lag.
+const MR_FO_F_LAG: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVF(0.7, 0.1, 0.95)
+  theta TVLAG(0.8, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_F ~ 0.04
+  omega ETA_LAG ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+  F  = inv_logit(logit(TVF) + ETA_F)
+  LAGTIME = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// Two-compartment disposition, two routes split by `FR`, the second one lagged.
+const MR_2CPT_TWO_ROUTE: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 50.0)
+  theta TVV1(20.0, 1.0, 200.0)
+  theta TVQ(2.0, 0.1, 50.0)
+  theta TVV2(30.0, 1.0, 500.0)
+  theta TVFR1(0.6, 0.05, 0.95)
+  theta TVKA1(1.5, 0.05, 20.0)
+  theta TVKA2(0.3, 0.05, 20.0)
+  theta TVLAG2(2.0, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.04
+  omega ETA_LAG2 ~ 0.04
+  sigma PROP_ERR ~ 0.15 (sd)
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V1   = TVV1 * exp(ETA_V1)
+  Q    = TVQ
+  V2   = TVV2
+  FR1  = TVFR1
+  FR2  = 1 - TVFR1
+  KA1  = TVKA1
+  KA2  = TVKA2
+  LAG2 = TVLAG2 * exp(ETA_LAG2)
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = FR1*first_order(ka=KA1) + FR2*first_order(ka=KA2, lag=LAG2) - (CL/V1)*central - (Q/V1)*central + (Q/V2)*peripheral
+  d/dt(peripheral) = (Q/V1)*central - (Q/V2)*peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `transit(n, mtt)` into one or two compartments (`{2}`: the peripheral terms).
+fn mr_transit_src(two: bool) -> String {
+    let (extra_theta, extra_ind, states, peri, disp) = if two {
+        (
+            "  theta TVQ(2.0, 0.1, 50.0)\n  theta TVV2(30.0, 1.0, 500.0)\n",
+            "  Q = TVQ\n  V2 = TVV2\n",
+            "[central, peripheral]",
+            "  d/dt(peripheral) = (Q/V)*central - (Q/V2)*peripheral\n",
+            " - (Q/V)*central + (Q/V2)*peripheral",
+        )
+    } else {
+        ("", "", "[central]", "", "")
+    };
+    format!(
+        r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVN(5.0, 1.0, 30.0)
+  theta TVMTT(2.0, 0.1, 20.0)
+{extra_theta}  omega ETA_CL ~ 0.09
+  omega ETA_MTT ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  N   = TVN
+  MTT = TVMTT * exp(ETA_MTT)
+{extra_ind}[structural_model]
+  ode(obs_cmt=central, states={states})
+[odes]
+  d/dt(central) = transit(n=N, mtt=MTT) - CL/V*central{disp}
+{peri}[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    )
+}
+
+const MR_IGD: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVMAT(2.0, 0.1, 20.0)
+  theta TVCV2(0.5, 0.01, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_MAT ~ 0.04
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  MAT = TVMAT * exp(ETA_MAT)
+  CV2 = TVCV2
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = igd(mat=MAT, cv2=CV2) - CL/V*central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `zero_order(dur, lag)` with an estimated window and route lag, on a 2-cpt disposition.
+const MR_2CPT_ZERO_ORDER: &str = r#"
+[parameters]
+  theta TVCL(3.0, 0.1, 50.0)
+  theta TVV1(20.0, 1.0, 200.0)
+  theta TVQ(2.0, 0.1, 50.0)
+  theta TVV2(30.0, 1.0, 500.0)
+  theta TVDUR(2.0, 0.1, 8.0)
+  theta TVLAG(0.7, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  omega ETA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V1  = TVV1
+  Q   = TVQ
+  V2  = TVV2
+  DUR = TVDUR * exp(ETA_DUR)
+  LAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = zero_order(dur=DUR, lag=LAG) - (CL/V1)*central - (Q/V1)*central + (Q/V2)*peripheral
+  d/dt(peripheral) = (Q/V1)*central - (Q/V2)*peripheral
+[scaling]
+  y = central / V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// `first_order` with a Form C readout under the LTBS log, alone and with a constant or an
+/// η-dependent `obs_scale` beside it (ODE keeps that combination): the output stage the
+/// recording applies after the closed form. A Form B `obs_scale` alone has no readout program
+/// and is outside the closed form's scope.
+fn mr_scaled_src(scale: &str) -> String {
+    let scale = if scale.is_empty() {
+        String::new()
+    } else {
+        format!("  obs_scale = {scale}\n")
+    };
+    format!(
+        r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  sigma ADD_LOG ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  KA = TVKA
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = first_order(ka=KA) - CL/V*central
+[scaling]
+  y = central / V
+{scale}[error_model]
+  log(DV) ~ additive(ADD_LOG)
+"#
+    )
+}
+
+/// Every closed-form variant, each on a two-dose subject whose second dose lands on residual
+/// drug (observations bracket the second dose, the lag onsets and the window ends), with the
+/// θ that move predictions.
+fn mr_cases() -> Vec<(&'static str, CompiledModel, Subject, Vec<usize>)> {
+    let doses = || {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ]
+    };
+    let times = [
+        0.5, 1.0, 2.0, 3.5, 6.0, 11.5, 12.5, 13.0, 14.5, 16.0, 20.0, 30.0,
+    ];
+    let src: Vec<(&'static str, String, Vec<usize>)> = vec![
+        (
+            "1cpt first_order F+lag",
+            MR_FO_F_LAG.into(),
+            vec![0, 1, 2, 3, 4],
+        ),
+        (
+            "2cpt two routes, lagged",
+            MR_2CPT_TWO_ROUTE.into(),
+            vec![0, 1, 2, 3, 4, 5, 6, 7],
+        ),
+        ("1cpt transit", mr_transit_src(false), vec![0, 1, 2, 3]),
+        ("2cpt transit", mr_transit_src(true), vec![0, 1, 2, 3, 4, 5]),
+        ("1cpt igd", MR_IGD.into(), vec![0, 1, 2, 3]),
+        (
+            "2cpt zero_order lagged",
+            MR_2CPT_ZERO_ORDER.into(),
+            vec![0, 1, 2, 3, 4, 5],
+        ),
+        ("LTBS", mr_scaled_src(""), vec![0, 1, 2]),
+        (
+            "constant obs_scale + LTBS",
+            mr_scaled_src("2.5"),
+            vec![0, 1, 2],
+        ),
+        (
+            "expression obs_scale + LTBS",
+            mr_scaled_src("V / 10.0"),
+            vec![0, 1, 2],
+        ),
+    ];
+    src.into_iter()
+        .map(|(label, text, live)| {
+            let m = parse_model_string(&text).unwrap();
+            let n_eta = m.n_eta;
+            let eta_ref: Vec<f64> = (0..n_eta).map(|k| 0.05 - 0.03 * k as f64).collect();
+            let s = subject(&m, doses(), &times, &eta_ref);
+            (label, m, s, live)
+        })
+        .collect()
+}
+
+/// The plan of every modified-release variant against the external oracles: `∂f/∂η` against a
+/// Richardson difference of the production predictor and the FOCEI gradient against the
+/// reconverged-FD objective (whose value path is the same closed form). Every θ under test
+/// moves a prediction (`measure` asserts it), `F` and the route / compartment lags among them.
+/// Mutation: record `F` or the lag as the constants `s.pk` holds rather than the taped
+/// parameters -> their θ and η derivatives vanish and the gap is O(1).
+#[test]
+fn modified_release_plan_matches_reconverged_fd() {
+    for (label, m, s, live) in mr_cases() {
+        let (jac, grad) = measure(&m, &s, &live, label);
+        assert!(jac < MR_JAC_BOUND, "{label}: ∂f/∂η {jac:.2e}");
+        assert!(grad < MR_GRAD_BOUND, "{label}: FOCEI gradient {grad:.2e}");
+    }
+}
+
+// Measured worst on Linux: ∂f/∂η 1.3e-11, gradient 1.4e-8, R-matrix 7.4e-8 (FOCE) / 9.7e-9
+// (FOCEI), kernel vs production 9.4e-16; ~10x headroom.
+const MR_JAC_BOUND: f64 = 1.5e-10;
+const MR_GRAD_BOUND: f64 = 1.5e-7;
+
+/// The plan's value pass is the value path's bits, and serving it at all says the plan holds
+/// no solver loop (`plan_values` declines a plan that is not `chunks_only`, and the default
+/// RK45 twin of these models is one). Mutation: the hook in `record_ode` removed -> the ODE
+/// twin is recorded, `plan_values` declines and the model is "not served".
+#[test]
+fn modified_release_plan_values_are_bit_equal_to_the_value_path() {
+    for (label, m, s, _) in mr_cases() {
+        assert_ne!(
+            m.ode_spec.as_ref().unwrap().effective_solver_opts().method,
+            crate::ode::OdeMethod::Linear,
+            "{label}: the default twin must be a solver loop for the routing check to bind"
+        );
+        let theta = moved_params(&m).theta;
+        for eta in [
+            vec![0.0; m.n_eta],
+            probe_eta(m.n_eta),
+            probe_eta(m.n_eta).iter().map(|e| -1.7 * e).collect(),
+        ] {
+            let mut got = Vec::new();
+            // `plan_values` serves recorded plans only (a miss is the native predictor's), so
+            // record this point's plan first, as the gradient that precedes it in a fit does.
+            exact_eta_jacobian(&m, &s, &theta, &eta).expect("record the plan");
+            assert!(
+                plan_values(&m, &s, None, &theta, &eta, &mut got),
+                "{label}: the plan must be served without a solver loop"
+            );
+            let want = crate::pk::compute_predictions_with_tv(&m, &s, &theta, &eta);
+            assert_eq!(got.len(), want.len());
+            for (j, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    a.is_finite() && b.is_finite(),
+                    "{label} row {j}: {a} vs {b}"
+                );
+                assert_eq!(a.to_bits(), b.to_bits(), "{label} row {j}: {a} vs {b}");
+            }
+        }
+    }
+}
+
+/// The kernel objective and the covariance R-matrix (inner Hessian) on a modified-release plan,
+/// against the production objective and the reconverged FD of the exact inner gradient.
+#[test]
+fn modified_release_plan_objective_and_hessian_match_production() {
+    for (label, m, s, _) in mr_cases() {
+        let params = moved_params(&m);
+        let (gf, gl) = objective_gaps(&m, &s, &params, &probe_eta(m.n_eta));
+        eprintln!("{label}: kernel vs production F {gf:.2e}, l {gl:.2e}");
+        assert!(gf < 1e-13 && gl < 1e-13, "{label}: {gf:.2e}, {gl:.2e}");
+        for objective in [Objective::Focei, Objective::Foce] {
+            let (fd, _) = hessian_gaps_for(&m, &s, objective);
+            eprintln!("{label}: R-matrix vs FD ({objective:?}) {fd:.2e}");
+            assert!(
+                fd < MR_HESS_BOUND,
+                "{label}: {objective:?} R-matrix {fd:.2e}"
+            );
+        }
+    }
+}
+
+const MR_HESS_BOUND: f64 = 8e-7;
+
+/// A flip-flop `transit` route (`ke ≥ (n+1)/mtt`) is out of the closed form's domain: the gate
+/// declines it to the ODE twin, so a plan recorded there holds a solver loop and is not served
+/// as values; and a closed-form plan cached from an in-domain point does not serve the flip
+/// point (its recorded domain guard fails) -- it is re-recorded, never replayed as the kernel's
+/// `0`. Back in domain, the closed form serves again. Mutation: drop `mr_scope`'s
+/// `route_flips` decline -> the flip point records the closed form and its values are the
+/// kernel's `0`, off the native (ODE) prediction.
+#[test]
+fn modified_release_flip_flop_point_is_recorded_on_the_ode_twin() {
+    let m = parse_model_string(&mr_transit_src(false)).unwrap();
+    let s = subject(
+        &m,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.5, 2.0, 6.0, 12.5, 15.0, 24.0],
+        &[0.05, -0.03],
+    );
+    let ok = moved_params(&m).theta;
+    // CL/V = 6 against (n+1)/mtt = 3.
+    let mut flip = ok.clone();
+    flip[0] = 60.0;
+    flip[1] = 10.0;
+    let eta = probe_eta(m.n_eta);
+    let serve = |theta: &[f64]| {
+        let mut got = Vec::new();
+        // Record at this point first (`plan_values` never records): the closed form where the
+        // gate admits it, the ODE twin where it declines.
+        exact_eta_jacobian(&m, &s, theta, &eta).expect("record the plan");
+        let served = plan_values(&m, &s, None, theta, &eta, &mut got);
+        (served, got)
+    };
+    assert!(serve(&ok).0, "in domain: closed-form plan");
+    let (served, _) = serve(&flip);
+    assert!(
+        !served,
+        "flip-flop point: the ODE twin, not the closed form"
+    );
+    let native = crate::pk::compute_predictions_with_tv(&m, &s, &flip, &eta);
+    assert!(
+        native.iter().any(|&y| y > 1e-3),
+        "the twin predicts drug at the flip point: {native:?}"
+    );
+    // (Back in domain the ODE variant stays valid and may serve first: slower, never wrong.)
+}
+
+/// The closed-form plan against its own ODE twin, on every modified-release variant: the same
+/// `(theta, eta)`, once recorded as the closed form and once (a fresh model, [`MR_PLAN_OFF`], at a
+/// tight tolerance) as the integrated ODE. `df/deta` and the FOCEI packed gradient agree to the
+/// twin's tolerance -- an engine-level cross-check of the closed form's derivatives that shares
+/// no code with it past the parameter program. Mutation: a route's `FR` split or lag dropped from
+/// the recorded closed form -> O(1) gap.
+#[test]
+fn modified_release_plan_agrees_with_its_ode_twin() {
+    let mut bad = Vec::new();
+    for ((label, m, s, _), (_, t, _, _)) in mr_cases().into_iter().zip(mr_cases()) {
+        let t = with_tol(t, 1e-12, 1e-14);
+        let params = moved_params(&m);
+        let x = pack_params(&params);
+        let eta = probe_eta(m.n_eta);
+        let jac_mr = exact_eta_jacobian(&m, &s, &params.theta, &eta).expect("closed-form jacobian");
+        let g_mr =
+            subject_adjoint_packed_gradient(&m, &s, &params, &x, &eta, true).expect("gradient");
+        let (jac_ode, g_ode) = with_mr_plan_off(|| {
+            (
+                exact_eta_jacobian(&t, &s, &params.theta, &eta).expect("twin jacobian"),
+                subject_adjoint_packed_gradient(&t, &s, &params, &x, &eta, true)
+                    .expect("twin gradient"),
+            )
+        });
+        let mut jac_gap = 0.0f64;
+        for (a, b) in jac_mr.iter().zip(jac_ode.iter()) {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{label}: jacobian {a} vs {b}"
+            );
+            jac_gap = jac_gap.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        let mut g_gap = 0.0f64;
+        for (a, b) in g_mr.iter().zip(&g_ode) {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{label}: gradient {a} vs {b}"
+            );
+            g_gap = g_gap.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        eprintln!("{label}: closed-form plan vs ODE-twin plan, jacobian {jac_gap:.2e}, gradient {g_gap:.2e}");
+        // The plain-LTBS fixture's gradient carries the ODE twin's own error (measured 4.1e-6; the
+        // closed form's matches reconverged FD to 4.5e-9 above, and the two scaled LTBS fixtures
+        // agree to 1e-9), so it gets its own bound. Measured worst elsewhere: jacobian 1.0e-10,
+        // gradient 1.4e-9.
+        let g_bound = if label == "LTBS" { 4e-5 } else { 1.5e-8 };
+        if jac_gap >= 1e-9 || g_gap >= g_bound {
+            bad.push(format!("{label}: {jac_gap:.2e} {g_gap:.2e}"));
+        }
+    }
+    assert!(bad.is_empty(), "closed form vs ODE twin: {bad:?}");
+}
+
+/// A Form-B `obs_scale` (`= V`, an η-dependent individual parameter, or a constant) under
+/// LTBS (additive and combined error) on a built-in `first_order` input kernel, which
+/// production's modified-release closed form predicts while the plan walks the ODE (S19's
+/// report of a 1.9 / 2.7 gradient gap on this shape under #3001). Every cell — η on `V` or
+/// not, scale `V` or `10` — is gradient-vs-reconverged-FD parity for FOCEI and FOCE. Measured
+/// worst 3.5e-7 over the gradients (the kernel's ODE tolerance); bound 1e-5. Mutation: take the
+/// LTBS log before the `obs_scale` quotient in `apply_expression_scale` and the `V` cells move
+/// by O(1).
+#[test]
+fn first_order_kernel_with_obs_scale_under_ltbs_matches_reconverged_fd() {
+    for scale in ["V", "10.0"] {
+        for eta_v in [true, false] {
+            for (sigmas, err) in [
+                ("  sigma ADD ~ 0.1 (sd)\n", "log(DV) ~ additive(ADD)"),
+                (
+                    "  sigma PROP ~ 0.1 (sd)\n  sigma ADD ~ 0.3 (sd)\n",
+                    "log(DV) ~ combined(PROP, ADD)",
+                ),
+            ] {
+                let src = format!(
+                    "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+                     theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n{sigmas}\
+                     [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp({})\n  \
+                     KA = TVKA\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+                     [odes]\n  d/dt(central) = first_order(ka=KA) - CL/V*central\n\
+                     [scaling]\n  obs_scale = {scale}\n[error_model]\n  {err}\n",
+                    if eta_v { "ETA_V" } else { "0.0 * ETA_V" },
+                );
+                let m = tight(parse_model_string(&src).unwrap());
+                assert!(m.log_transform, "LTBS");
+                let s = two_dose_subject(&m);
+                assert!(served(&m, &s), "{scale} etav={eta_v} {err}: served");
+                for interaction in [true, false] {
+                    let g = fd_oracle(&m, &s, interaction);
+                    eprintln!("obs_scale={scale} etav={eta_v} {err} FOCEI={interaction}: {g:.2e}");
+                    assert!(
+                        g.is_finite() && g < 1e-5,
+                        "{scale} etav={eta_v} {err}: {g:.2e}"
+                    );
+                }
+            }
+        }
+    }
 }
