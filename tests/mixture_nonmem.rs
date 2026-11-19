@@ -339,6 +339,9 @@ fn saem_mixture_fit_matches_nonmem_saem() {
         opts.saem_n_exploration = 1000;
         opts.saem_n_convergence = 1000;
         opts.saem_seed = Some(seed);
+        // The OFV check below is against NONMEM FOCEI (#2973: the default is now the IS value,
+        // which is anchored by `imp_mixture_marginal_matches_nonmem`).
+        opts.saem_ofv = ferx_core::types::SaemOfv::Focei;
 
         let res = fit(&model, &pop, &model.default_params, &opts).expect("SAEM mixture fit Ok");
         let th = &res.theta;

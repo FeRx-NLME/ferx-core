@@ -130,6 +130,9 @@ fn saem_on_the_one_line_spelling_lands_with_the_split_one() {
                 let f = fit(&model, &data, |o| {
                     o.method = ferx_core::types::EstimationMethod::Saem;
                     o.saem_seed = Some(s);
+                    // The bounds below are on the FOCE objective at SAEM's estimates (the
+                    // pre-#2973 SAEM `ofv`); the default readout is now NONMEM's SAEMOBJ.
+                    o.saem_ofv = ferx_core::types::SaemOfv::Focei;
                 });
                 assert!(f.ofv.is_finite(), "{indiv} seed {s}: {}", f.ofv);
                 f.ofv
@@ -153,12 +156,19 @@ fn saem_on_the_one_line_spelling_lands_with_the_split_one() {
          split {split:?}",
         median(&one)
     );
-    for (s, o) in seeds.iter().zip(&one) {
-        assert!(*o < WORST_BOUND, "one-line seed {s}: {o}");
-    }
+    assert!(
+        median(&one) < MEDIAN_BOUND,
+        "one-line median {} not below {MEDIAN_BOUND}: one-line {one:?}",
+        median(&one)
+    );
 }
 
-// Linux aarch64: one-line 97.28–97.85, split 97.34–98.05; macOS arm64: one-line
-// 97.21–98.88, split 97.33–98.39. 99.5 is 1.65 above the Linux worst and 0.6 above the
-// macOS one; before #2544 all five seeds were above it (100.97–107.92, macOS).
-const WORST_BOUND: f64 = 99.5;
+// Before #3021 the per-subject SAEM streams were `seed + i`: Linux aarch64 gave one-line
+// 97.28–97.85, split 97.34–98.05; macOS arm64 one-line 97.21–98.88, split 97.33–98.39, and
+// the bound was 99.5 on every seed. Hashing the streams (#3021) moved the five runs on
+// Linux x86_64 to one-line 97.41–101.22 (median 98.74), split 97.30–100.53 (median
+// 98.76): a run at 100–101 appears under *both* spellings, so the old all-seeds bound was
+// a property of that stream set, not of the spelling. The median of the five is the
+// robust form: 99.5 is 0.76 above the one-line median, and before #2544 all five seeds
+// were above 100.97 (macOS, so the median was too).
+const MEDIAN_BOUND: f64 = 99.5;

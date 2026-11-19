@@ -42,8 +42,9 @@
 //! The same recordings are replayed by value for the inner loop's η-Jacobians,
 //! inner gradients and Hessians ([`exact_obs_grads`], [`exact_inner_hessian`], …).
 //!
-//! Out of scope (`None`, and the caller salvages the subject by finite differences): SDE,
-//! subjects with non-Gaussian records, engine shapes no recorder serves.
+//! Out of scope (`None`, and the caller salvages the subject by finite differences): a model
+//! no recorder serves (see `recorder_in_scope`) and the per-point plan failures. SDE models
+//! and non-Gaussian records are served.
 #![allow(clippy::needless_range_loop)]
 
 use super::*;
@@ -96,6 +97,12 @@ fn endpoint_only(model: &CompiledModel) -> bool {
 /// [`likelihood_supported`], plus the dual ODE walk or a closed form (or compartment-free
 /// readout) with a parameter program over `[η, κ]`. The inner loop's scope: a subject
 /// without non-Gaussian records is served even on a joint model.
+///
+/// Every parsed model carries the programs this reads (`parse_model_string` attaches them to
+/// `indiv_param_partials` and the `OdeSpec`); only a `CompiledModel` assembled by hand through
+/// the public struct literal lacks them. Its `rhs` / `pk_param_fn` are opaque Rust closures
+/// that no recording can differentiate, so it is declined here and takes finite differences
+/// (#3004: the one scope gap that is not a parser model).
 pub(crate) fn recorder_in_scope(model: &CompiledModel) -> bool {
     match model.ode_spec.as_ref() {
         _ if model.is_algebraic() => model
@@ -403,16 +410,11 @@ pub(crate) fn subject_adjoint_gradient_and_mode_at(
     g
 }
 
-/// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, for an AGQ subject whose mode
-/// identity [`subject_adjoint_gradient_at`] declines — an indefinite exact `H` at an `η̂` the
-/// inner search's fallback left short of stationary ([`mode_solve`]). Without the identity
-/// the EBE response is not available exactly, and the alternative is the reconverged
-/// finite-difference score, `2·n_x` EBE re-solves per subject: on a 147-weight covariate
-/// network under Laplace that turned a 7.5 s fit into a 90 s one. This is the AGQ twin of
-/// FOCE/FOCEI's held-EBE salvage, omits the same EBE-response term, and is reported by the
-/// same outer FD-fallback warning. `None` wherever [`subject_adjoint_gradient_at`] declines for
-/// any other reason (scope, a non-finite recording) and for the FOCE/FOCEI objectives,
-/// whose salvage lives in the outer optimizer.
+/// The **held-EBE** quadrature score: `∂Aᵢ/∂x` at a fixed `η̂`, without the EBE-response term.
+/// No production route takes it (a runtime-declined subject is re-solved to its EBE and scored
+/// exactly, `agq::ScoreRoute::ResolvedExact`); it is the biased score the tests hold that route
+/// against. `None` for the FOCE/FOCEI objectives and wherever
+/// [`subject_adjoint_gradient_at`] declines for a reason other than the mode identity.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_held_ebe_score(
     model: &CompiledModel,
@@ -423,26 +425,15 @@ pub(crate) fn subject_adjoint_held_ebe_score(
     objective: Objective,
 ) -> Option<Vec<f64>> {
     let pt = PackedPoint::new(template, x)?;
-    subject_adjoint_held_ebe_score_at(model, subject, &pt, eta_hat, objective)
-}
-
-/// `subject_adjoint_held_ebe_score` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
-pub(crate) fn subject_adjoint_held_ebe_score_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
-    objective: Objective,
-) -> Option<Vec<f64>> {
     matches!(objective, Objective::Agq { .. })
-        .then(|| adjoint_gradient(model, subject, pt, eta_hat, objective, true, None))?
+        .then(|| adjoint_gradient(model, subject, &pt, eta_hat, objective, true, None))?
 }
 
 /// The fixed-EBE objective and its exact packed gradient at `η̂` with the linearisation
 /// `H` held as given: `F(θ, Ω, σ; η̂, H)` — the analytic kernel's FOCE (`interaction =
 /// false`, `R⁰` at `f(η = 0)` where the variance is f-dependent) or FOCEI objective, with
 /// `H` and `η̂` constants. This is the score the outer optimizer's fixed-EBE paths
-/// difference (GN, trust region, the S-matrix, the held-EBE salvage), taken exactly: one
+/// difference (GN, trust region, the S-matrix), taken exactly: one
 /// reverse of the objective's kernel plan gives its adjoints in the predictions, `Ω` and `σ`,
 /// and the predictions' θ-derivatives are contracted with them by one recording and one
 /// reverse sweep each ([`fixed_eta_theta_contractions`]). Every feature the kernel scores —
@@ -1031,9 +1022,7 @@ fn adjoint_gradient(
         if first.is_some() || held {
             return first;
         }
-        polish_mode(&sc.eta, o, polish_steps(subject), |eta, o| {
-            attempt(eta, Some(o))
-        })
+        polish_mode(&sc.eta, o, polish_steps(), |eta, o| attempt(eta, Some(o)))
     }
     go(&sc, subject, template, x, objective, held, eta_dx)
 }
@@ -1087,11 +1076,6 @@ thread_local! {
         const { std::cell::Cell::new(POLISH_STEPS) };
 }
 
-#[cfg(test)]
-/// Test hook: the ids of the subjects whose polish is off, on every thread (a population pass
-/// runs its subjects on the pool, where [`POLISH_BUDGET`] is not set).
-static POLISH_OFF_FOR: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
 /// Test guard: the polish off for its lifetime, to read the decline and its salvage.
 #[cfg(test)]
 pub(crate) struct PolishOff(usize);
@@ -1110,41 +1094,11 @@ impl Drop for PolishOff {
     }
 }
 
-/// Test guard: the polish off, on every thread, for the subject with this id only (keep the
-/// ids unique to the test).
-#[cfg(test)]
-pub(crate) struct PolishOffFor(String);
-
-#[cfg(test)]
-impl PolishOffFor {
-    pub(crate) fn new(id: &str) -> Self {
-        POLISH_OFF_FOR.lock().unwrap().push(id.to_string());
-        PolishOffFor(id.to_string())
-    }
-}
-
-#[cfg(test)]
-impl Drop for PolishOffFor {
-    fn drop(&mut self) {
-        let mut v = POLISH_OFF_FOR.lock().unwrap();
-        if let Some(i) = v.iter().position(|x| *x == self.0) {
-            v.remove(i);
-        }
-    }
-}
-
-fn polish_steps(subject: &Subject) -> usize {
+fn polish_steps() -> usize {
     #[cfg(test)]
-    return if POLISH_OFF_FOR.lock().unwrap().contains(&subject.id) {
-        0
-    } else {
-        POLISH_BUDGET.with(|c| c.get())
-    };
+    return POLISH_BUDGET.with(|c| c.get());
     #[cfg(not(test))]
-    {
-        let _ = subject;
-        POLISH_STEPS
-    }
+    POLISH_STEPS
 }
 
 /// A pass that declined at its mode system (an `η̂` the inner search left off the mode, on
@@ -1242,8 +1196,8 @@ fn finish(
 /// The indefinite branch also needs the stationarity the identity rests on: there `η̂` came
 /// from a certified or iteration-limited inner search, which need not be stationary in
 /// `‖g‖∞` (see [`MODE_STATIONARY_TOL`]), and the gradient `wᵀ∇_η l` drops is then not zero. `grad_l` is `∇_η l(η̂)`; above
-/// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review) — under AGQ to the held-EBE
-/// score ([`subject_adjoint_held_ebe_score_at`]), not the reconverged one.
+/// [`MODE_STATIONARY_TOL`] the subject declines (#2093 review), and the caller re-solves its EBE
+/// and scores it there (`agq::ScoreRoute::ResolvedExact`) rather than take a held-EBE score.
 ///
 /// The SPD branch takes no such gate, deliberately. Near a strict mode `η̂ = η* + ε` and
 /// `∂Ψ/∂x` misses the converged objective's total derivative by `O(|∇_η l|)` only, while
@@ -1653,6 +1607,17 @@ fn record_ode<T: VmNum>(
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
     let prog = ode.indiv_param_program.as_ref()?;
+    // A modified-release subject the value path serves in closed form is recorded as that
+    // closed form, not as the integration of its ODE twin (no solver loop in the plan).
+    #[cfg(test)]
+    let mr_off = MR_PLAN_OFF.with(|c| c.get());
+    #[cfg(not(test))]
+    let mr_off = false;
+    if let Some(s) =
+        crate::pk::modified_release::mr_scope(model, subject, theta, eta).filter(|_| !mr_off)
+    {
+        return record_modified_release(model, subject, &s, th, et, prog);
+    }
     if static_walk_subject_supported(model, subject) {
         let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         let by_slot = taped_params(model, prog, pk.values.len(), th, et, &subject.covariates);
@@ -1714,6 +1679,63 @@ fn record_ode<T: VmNum>(
         .values
         .len();
     let by_slot = taped_params(model, prog, n_slots, th, et, &subject.covariates);
+    apply_expression_scale(model, subject, th, et, &by_slot, preds)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: record a modified-release subject as its ODE twin, as before the closed
+    /// form was recorded, for the tests whose subject is the ODE walk (its onset anchoring, its
+    /// cross-check against the closed form). Read at recording time only, so it is set around a
+    /// fresh model, whose plans are its own.
+    pub(crate) static MR_PLAN_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Modified-release closed form on the tape: the one generic kernel the value path runs
+/// (`pk::modified_release::mr_observable_g`) over the recording type, its disposition
+/// recovered from the compiled RHS and readout programs on the taped parameters
+/// (`recover_disp_params_g`), then the output transforms and scale as the ODE walks apply them.
+/// Admission (`mr_scope`) is the value path's own gate, so value and plan serve one set of
+/// subjects; a point where a recorded branch (a flip-flop domain, a non-positive slope) flips
+/// fails the plan's guard and is re-recorded, where the gate declines to the ODE walk.
+fn record_modified_release<T: VmNum>(
+    model: &CompiledModel,
+    subject: &Subject,
+    s: &crate::pk::modified_release::MrScope<'_>,
+    th: &ThetaLeaves<'_, T>,
+    et: &[T],
+    prog: &crate::parser::model_parser::IndivParamProgram,
+) -> Option<Vec<T>> {
+    use crate::types::{PK_IDX_F, PK_IDX_LAGTIME};
+    let by_slot = taped_params(model, prog, s.pk.values.len(), th, et, &subject.covariates);
+    let params: Vec<T> = by_slot
+        .iter()
+        .zip(&s.pk.values)
+        .map(|(d, &v)| d.unwrap_or(T::from_f64(v)))
+        .collect();
+    let dp = crate::pk::modified_release::recover_disp_params_g::<T>(
+        s.spec,
+        &s.disp,
+        &params,
+        &subject.covariates,
+    )?;
+    let (lag_cmt, f_bio) = (params[PK_IDX_LAGTIME], params[PK_IDX_F]);
+    let preds: Vec<T> = subject
+        .obs_times
+        .iter()
+        .map(|&t| {
+            let y = crate::pk::modified_release::mr_observable_g(
+                &dp,
+                &s.spec.input_rate,
+                &subject.doses,
+                T::from_f64(t),
+                &params,
+                lag_cmt,
+                f_bio,
+            );
+            crate::sens::ode_provider::apply_output_transform(model, y)
+        })
+        .collect();
     apply_expression_scale(model, subject, th, et, &by_slot, preds)
 }
 
@@ -2682,13 +2704,16 @@ pub(crate) fn plan_values(
     let n_obs = subject.observations.len();
     out.clear();
     out.resize(n_obs, 0.0);
-    let served = with_plan_in(
+    // A point no plan serves is the native predictor's (the same values): recording it would
+    // cost a full recording for one objective value.
+    let served = with_plan_in_or(
         eff,
         subject,
         lay.as_deref(),
         theta,
         None,
         &eta_p,
+        false,
         &mut |plan| {
             if plan.n_out() != n_obs {
                 return None;
@@ -2739,6 +2764,22 @@ fn with_plan_in<R>(
     eta: &[f64],
     serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
 ) -> Option<R> {
+    with_plan_in_or(model, subject, lay, theta, sigma, eta, true, serves)
+}
+
+/// [`with_plan_in`]; `record_miss = false` records only a subject that has no plan yet, and
+/// answers `None` where its plans do not serve the point ([`plan_or_record`]).
+#[allow(clippy::too_many_arguments)]
+fn with_plan_in_or<R>(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    sigma: Option<&[f64]>,
+    eta: &[f64],
+    record_miss: bool,
+    serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
+) -> Option<R> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
     // An endpoint-only subject has no prediction rows to record (its terms have their own
     // plans, `terms::term_plans`).
@@ -2765,6 +2806,7 @@ fn with_plan_in<R>(
         &build,
         &fits,
         &|key| kjit_record(model, subject, lay, theta, eta, None, sigma, key),
+        record_miss,
         serves,
     )
 }
@@ -2775,7 +2817,11 @@ fn with_plan_in<R>(
 /// it cannot (a recording whose predictions overflow) never evicts a good one. With a `hot` key
 /// the variants this thread last found for the subject are tried before the key's fingerprints
 /// and registry reads are paid for (`build` runs only on a hot miss, or to record); when they do
-/// not serve, the plans are not tried a second time through the lookup.
+/// not serve, the plans are not tried a second time through the lookup. With `record_miss`
+/// false a subject whose plans do not serve the point is answered `None`, not recorded again:
+/// a caller with another way to the answer (the value pass's native predictor,
+/// [`plan_values`]) does not pay a recording for a point whose structure — an infusion end
+/// that moved with η across an observation — no plan has.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_or_record<R>(
     model: &CompiledModel,
@@ -2787,6 +2833,7 @@ pub(super) fn plan_or_record<R>(
     record: &dyn Fn(
         &crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
     ) -> Option<(PlanArc, bool)>,
+    record_miss: bool,
     serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
 ) -> Option<R> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
@@ -2824,6 +2871,9 @@ pub(super) fn plan_or_record<R>(
             }
         }
         kj::STATS.guard_fail.fetch_add(1, Relaxed);
+        if !record_miss {
+            return None;
+        }
     }
     let key = key_cell.unwrap_or_else(build);
     let (plan, sane) = record(&key)?;
@@ -2877,6 +2927,7 @@ pub(super) fn with_plan_nn<R>(
         &build,
         &fits,
         &|key| kjit_record(model, subject, None, theta, eta, Some(nn_z), sigma, key),
+        true,
         serves,
     )
 }
@@ -3379,6 +3430,7 @@ pub(crate) struct FixedEtaTheta {
     pub(crate) jac: Option<Vec<f64>>,
 }
 
+#[cfg(test)]
 pub(crate) fn fixed_eta_theta_adjoint(
     model: &CompiledModel,
     subject: &Subject,
@@ -3387,10 +3439,40 @@ pub(crate) fn fixed_eta_theta_adjoint(
     want_jac: bool,
     weights: &[f64],
 ) -> Option<FixedEtaTheta> {
-    let (mut rows, jac) =
-        fixed_eta_theta_sweeps(model, subject, theta, None, eta, want_jac, |f| {
-            (weights.len() == f.len()).then(|| vec![weights.to_vec()])
-        })?;
+    let all: Vec<usize> = (0..theta.len()).collect();
+    fixed_eta_theta_adjoint_cols(
+        model,
+        subject,
+        theta,
+        eta,
+        want_jac.then_some(&all),
+        weights,
+    )
+}
+
+/// `fixed_eta_theta_adjoint` with the Jacobian over the θ coordinates `jac_cols` alone
+/// (`None`: no Jacobian, the gradient over every θ). With `Some`, the gradient and the
+/// Jacobian are exact for those coordinates and unspecified for every other θ — a caller
+/// that holds them pinned reads neither. That is what lets the Jacobian be read off one
+/// forward pass carrying one tangent per coordinate instead of one reverse per observation
+/// ([`tangent_jac_wins`]).
+pub(crate) fn fixed_eta_theta_adjoint_cols(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    jac_cols: Option<&Vec<usize>>,
+    weights: &[f64],
+) -> Option<FixedEtaTheta> {
+    let (mut rows, jac) = fixed_eta_theta_sweeps(
+        model,
+        subject,
+        theta,
+        None,
+        eta,
+        jac_cols.map(Vec::as_slice),
+        |f| (weights.len() == f.len()).then(|| vec![weights.to_vec()]),
+    )?;
     let grad = rows.pop()?;
     Some(FixedEtaTheta {
         jac: jac.map(|j| j.into_iter().flatten().collect()),
@@ -3412,7 +3494,7 @@ pub(crate) fn fixed_eta_theta_contractions(
     eta: &[f64],
     weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
 ) -> Option<Vec<Vec<f64>>> {
-    fixed_eta_theta_sweeps(model, subject, theta, None, eta, false, weights).map(|(rows, _)| rows)
+    fixed_eta_theta_sweeps(model, subject, theta, None, eta, None, weights).map(|(rows, _)| rows)
 }
 
 /// [`fixed_eta_theta_contractions`] of an SDE subject's kernel rows: `weights` gets the `2n`
@@ -3428,11 +3510,84 @@ pub(crate) fn fixed_eta_theta_sigma_contractions(
     eta: &[f64],
     weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
 ) -> Option<Vec<Vec<f64>>> {
-    fixed_eta_theta_sweeps(model, subject, theta, Some(sigma), eta, false, weights)
+    fixed_eta_theta_sweeps(model, subject, theta, Some(sigma), eta, None, weights)
         .map(|(rows, _)| rows)
 }
 
-/// The plan reverses behind [`fixed_eta_theta_contractions`] and [`fixed_eta_theta_adjoint`]:
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the Jacobian by one reverse per observation even where forward
+    /// tangents serve it, for the test pinning the two against each other.
+    pub(crate) static JAC_REVERSE_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test counter: the Jacobians [`fixed_eta_theta_sweeps`] took from forward tangents, so a
+    /// parity test can assert the tangent path ran rather than the reverse one it compares with.
+    pub(crate) static TANGENT_JACS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the Jacobian over `d` θ coordinates of `n_obs` predictions is cheaper by forward
+/// tangents than by reverse seeds: a tangent pass carries one direction per coordinate and a
+/// reverse sweep one seed per observation, each added to the same recorded trajectory, but the
+/// tangents need no kept forward, no run log and no second pass. The forward kernels exist for
+/// up to 48 directions (`rhs_ir::MAX_N`).
+fn tangent_jac_wins(d: usize, n_obs: usize) -> bool {
+    #[cfg(test)]
+    if JAC_REVERSE_FORCE.with(|c| c.get()) {
+        return false;
+    }
+    (1..=n_obs.min(48)).contains(&d)
+}
+
+/// The predictions and `∂f_j/∂θ_{cols[c]}` (row-major `n_obs × cols.len()`) from one forward
+/// of the subject's plan with a tangent per column, θ's unit tangents seeded in `params` and
+/// η's zero. `None` where the plan cannot run that layout — it still serves the F64 forward,
+/// so the caller's reverse path runs — or where the guard fails at this point.
+fn tangent_forward(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    axes: &[f64],
+    cols: &[usize],
+) -> Option<(Vec<f64>, Vec<f64>)> {
+    use crate::sens::num::vm::Layout;
+    let n_obs = subject.observations.len();
+    let d = cols.len();
+    let layout = Layout {
+        tan: u8::try_from(d).ok()?,
+        ..Layout::F64
+    };
+    let l = layout.lanes();
+    // `Some(None)`: the plan serves, but not at this layout — it must stay in the cache
+    // (a `None` from `serves` is a guard failure, and a plan failing at its own recording
+    // point is marked bad for every caller).
+    let du = with_plan_width(model, subject, lay, theta, axes, &mut |pn, plan| {
+        let mut u = vec![0.0; pn * l];
+        for (k, &a) in axes.iter().enumerate() {
+            u[k * l] = a;
+        }
+        let mut p = vec![0.0; theta.len() * l];
+        for (i, &t) in theta.iter().enumerate() {
+            p[i * l] = t;
+        }
+        for (c, &m) in cols.iter().enumerate() {
+            p[m * l + 1 + c] = 1.0;
+        }
+        let mut du = vec![0.0; (n_obs + 1) * l];
+        match plan.forward_unkept(layout, &u, &p, &mut du) {
+            None => Some(None),
+            Some(true) => Some(Some(du)),
+            Some(false) => None,
+        }
+    })??;
+    let vals = (0..n_obs).map(|j| du[j * l]).collect();
+    let mut jac = vec![0.0; n_obs * d];
+    for j in 0..n_obs {
+        jac[j * d..(j + 1) * d].copy_from_slice(&du[j * l + 1..j * l + 1 + d]);
+    }
+    Some((vals, jac))
+}
+
+/// The plan reverses behind [`fixed_eta_theta_contractions`] and [`fixed_eta_theta_adjoint_cols`]:
 /// the subject's plan, its value forward at `(θ, eta)` kept, and one value
 /// reverse seeded with every weight row (and, with `want_jac`, one with every observation's
 /// unit seed): the rows' contractions over raw θ.
@@ -3442,14 +3597,15 @@ fn fixed_eta_theta_sweeps(
     theta: &[f64],
     sigma: Option<&[f64]>,
     eta: &[f64],
-    want_jac: bool,
+    jac_cols: Option<&[usize]>,
     weights: impl FnOnce(&[f64]) -> Option<Vec<Vec<f64>>>,
 ) -> Option<(Vec<Vec<f64>>, Option<Vec<Vec<f64>>>)> {
     use crate::sens::num::vm::Layout;
+    let want_jac = jac_cols.is_some();
     // An SDE subject's score has variance rows beside the predictions: the callers that hand σ
     // ([`fixed_eta_theta_sigma_contractions`]) weight them; the rest contract the predictions
     // alone (FOCE's population prediction at η = 0, whose variance rows are not in the score).
-    if !recorder_in_scope(model) || (model.is_sde() && want_jac && sigma.is_none()) {
+    if !recorder_in_scope(model) {
         return None;
     }
     let sigma = sigma.filter(|_| model.is_sde());
@@ -3468,6 +3624,83 @@ fn fixed_eta_theta_sweeps(
         let zero = |n: usize| vec![vec![0.0; theta.len() + n_sig]; n];
         return Some((zero(rows.len()), want_jac.then(|| zero(0))));
     }
+    // A FREM covariate pseudo-observation predicts `θ_i + η_e` (the recorders return the
+    // PK prediction there, as every caller of theirs patches): its derivative is the unit
+    // vector on `θ_i`, added after the reverse rather than seeded.
+    let frem: Vec<Option<usize>> = (0..n_obs)
+        .map(|j| {
+            let fc = model.frem_config.as_ref()?;
+            let ft = subject.fremtype.get(j).filter(|&&ft| ft != 0)?;
+            fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
+        })
+        .collect();
+    let patch = |vals: &[f64]| -> Vec<f64> {
+        (0..n_obs)
+            .map(|j| match (frem[j], model.frem_config.as_ref()) {
+                (Some(ti), Some(fc)) => {
+                    let ei = fc.fremtype_to_indices[&subject.fremtype[j]].1;
+                    theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0)
+                }
+                _ => vals[j],
+            })
+            .collect()
+    };
+    // The Jacobian by forward tangents where that is the cheaper exact route: one pass gives
+    // the predictions and every `∂f_j/∂θ_m` of the wanted coordinates, the gradient is the
+    // weights' contraction of its rows, and no reverse sweep is made at all.
+    let tangents = match jac_cols {
+        Some(cols) if sigma.is_none() && tangent_jac_wins(cols.len(), n_obs) => {
+            tangent_forward(rec_model, subject, lay.as_deref(), theta, &axes, cols)
+        }
+        _ => None,
+    };
+    if let (Some((vals, jac_c)), Some(cols)) = (tangents, jac_cols) {
+        let rows = weights(&patch(&vals))?;
+        if rows.iter().any(|w| w.len() != n_obs) {
+            return None;
+        }
+        let (n_th, d) = (theta.len(), cols.len());
+        let dense: Vec<Vec<f64>> = rows
+            .iter()
+            .map(|w| {
+                let mut g = vec![0.0; n_th];
+                for (c, &m) in cols.iter().enumerate() {
+                    g[m] = (0..n_obs)
+                        .filter(|&j| frem[j].is_none())
+                        .map(|j| w[j] * jac_c[j * d + c])
+                        .sum();
+                }
+                for (j, ti) in frem.iter().enumerate() {
+                    if let Some(gm) = ti.and_then(|ti| g.get_mut(ti)) {
+                        *gm += w[j];
+                    }
+                }
+                g
+            })
+            .collect();
+        let jac: Vec<Vec<f64>> = (0..n_obs)
+            .map(|j| {
+                let mut row = vec![0.0; n_th];
+                match frem[j] {
+                    Some(ti) => {
+                        if let Some(r) = row.get_mut(ti) {
+                            *r = 1.0;
+                        }
+                    }
+                    None => {
+                        for (c, &m) in cols.iter().enumerate() {
+                            row[m] = jac_c[j * d + c];
+                        }
+                    }
+                }
+                row
+            })
+            .collect();
+        let finite = |x: &Vec<Vec<f64>>| x.iter().flatten().all(|v| v.is_finite());
+        #[cfg(test)]
+        TANGENT_JACS.with(|c| c.set(c.get() + 1));
+        return (finite(&dense) && finite(&jac)).then_some((dense, Some(jac)));
+    }
     let (n_eta, plan, vals, fwd) = with_plan_width(
         rec_model,
         subject,
@@ -3482,25 +3715,7 @@ fn fixed_eta_theta_sweeps(
             (du[n_obs] == 1.0).then(|| (pn, plan.clone(), du[..n_obs].to_vec(), fwd))
         },
     )?;
-    // A FREM covariate pseudo-observation predicts `θ_i + η_e` (the recorders return the
-    // PK prediction there, as every caller of theirs patches): its derivative is the unit
-    // vector on `θ_i`, added after the reverse rather than seeded.
-    let frem: Vec<Option<usize>> = (0..n_obs)
-        .map(|j| {
-            let fc = model.frem_config.as_ref()?;
-            let ft = subject.fremtype.get(j).filter(|&&ft| ft != 0)?;
-            fc.fremtype_to_indices.get(ft).map(|&(ti, _)| ti)
-        })
-        .collect();
-    let f: Vec<f64> = (0..n_obs)
-        .map(|j| match (frem[j], model.frem_config.as_ref()) {
-            (Some(ti), Some(fc)) => {
-                let ei = fc.fremtype_to_indices[&subject.fremtype[j]].1;
-                theta.get(ti).copied().unwrap_or(0.0) + eta.get(ei).copied().unwrap_or(0.0)
-            }
-            _ => vals[j],
-        })
-        .collect();
+    let f = patch(&vals);
     // An SDE subject's variance rows: the EKF's `p_obs` at the same point, a plan of their
     // own over θ then σ, scored after the predictions.
     let planned_p = match sigma {
@@ -5522,7 +5737,8 @@ fn ng_value_grad(
 #[path = "ode_adjoint_hessian.rs"]
 mod hessian;
 pub(crate) use hessian::{
-    cov_non_gaussian_served, subject_adjoint_cov_block_at, subject_adjoint_cov_diag_at,
+    cov_non_gaussian_served, subject_adjoint_cov_block_at,
+    subject_adjoint_cov_block_with_gradient_at, subject_adjoint_cov_diag_at,
     subject_adjoint_cov_hessian_at,
 };
 #[cfg(test)]

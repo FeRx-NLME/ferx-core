@@ -1201,8 +1201,8 @@ impl ProfileCtx<'_> {
     /// `inv_logit` fixture (10 studies): 3 iterations, quadratic, against the held matrix's
     /// 7–9 (by its first step), linear at ~0.1 per step, to the same OFV.
     ///
-    /// `None` where the subject declines, as [`Self::total_gradient_adjoint`] does: a level
-    /// that log-packs, a mode the identity cannot be formed at, or a recorder decline. The
+    /// `None` where the subject declines, as [`Self::total_gradient_adjoint`] does: a mode the
+    /// identity cannot be formed at, or a recorder decline. The
     /// solve then takes [`Self::resolved_hessian`], not the held matrix: on a fixture with
     /// probabilities 0.1–0.9 the held matrix contracted at 0.96 per step on one study and
     /// did not converge in [`MAX_PROFILE_ITER`] steps, where the exact one took 4.
@@ -1212,10 +1212,7 @@ impl ProfileCtx<'_> {
         pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
         s: &SubjectState,
     ) -> Option<DMatrix<f64>> {
-        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_at;
-        if self.reads_a_log_packed_level(i, pt.template) {
-            return None;
-        }
+        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_with_gradient_at;
         let subject = &self.population.subjects[i];
         let mode = crate::estimation::covariance::stacked_mode(
             self.model,
@@ -1230,7 +1227,8 @@ impl ProfileCtx<'_> {
             .collect();
         touched.sort_unstable();
         touched.dedup();
-        let h = subject_adjoint_cov_block_at(
+        // The diagonal's `−∂/∂x` of a log-packed θ is the block's own pass's gradient.
+        let (g, mut h) = subject_adjoint_cov_block_with_gradient_at(
             self.model,
             subject,
             pt,
@@ -1238,7 +1236,9 @@ impl ProfileCtx<'_> {
             self.objective(),
             &touched,
         )?;
-        // Every θ the moves touch packs as itself (checked above), so `∂²/∂x²` is `∂²/∂θ²`.
+        if self.reads_a_log_packed_level(i, pt.template) {
+            Self::theta_scale(pt, &touched, 0, &g, &mut h);
+        }
         let m = DMatrix::from_fn(touched.len(), reads.len(), |t, a| {
             reads[a]
                 .moves
@@ -1305,15 +1305,57 @@ impl ProfileCtx<'_> {
     }
 
     /// Whether subject `i` reads a level whose θ log-packs in `template`. The adjoint's
-    /// packed derivatives are read as `∂/∂θ_k`, which holds only where θ `k` packs as
-    /// itself. A level does today (its template box is open, even under #2402's bounds);
-    /// one that log-packed would be off by a factor of θ, so the subject declines to the
-    /// re-solved differences, which step in θ, instead (#2401 review row 1).
+    /// packed derivatives are in `x = ln θ` there, so [`Self::theta_scale`] converts
+    /// them to θ. A parsed profiled block never log-packs (its template box is open, even
+    /// under #2402's bounds); a hand-built template can.
     fn reads_a_log_packed_level(&self, i: usize, template: &ModelParameters) -> bool {
         self.layout.reads[i]
             .iter()
             .flat_map(|r| &r.moves)
             .any(|&(k, _)| theta_packs_log(template.theta_lower[k]))
+    }
+
+    /// The level coordinates' θ-derivatives from the packed ones. `axes[lo..]` are the level
+    /// θ (`g` their packed gradient, `h` the packed Hessian over all of `axes`; the first
+    /// `lo` axes are structural packed coordinates and stay as they are). A log-packed θ has
+    /// `x = ln θ`, so `∂/∂θ = (∂/∂x)/θ` and `∂²/∂θ² = (∂²/∂x² − ∂/∂x)/θ²` on its diagonal,
+    /// `(∂²/∂xₐ∂x_b)/(θₐθ_b)` off it; an identity-packed θ is itself.
+    fn theta_scale(
+        pt: &crate::sens::ode_provider::adjoint::PackedPoint<'_>,
+        axes: &[usize],
+        lo: usize,
+        g: &[f64],
+        h: &mut DMatrix<f64>,
+    ) {
+        let template = pt.template;
+        if !axes[lo..]
+            .iter()
+            .any(|&k| theta_packs_log(template.theta_lower[k]))
+        {
+            return;
+        }
+        let theta = unpack_params(pt.x, template).theta;
+        let mut jac = vec![1.0; axes.len()];
+        for (t, &k) in axes.iter().enumerate().skip(lo) {
+            if theta_packs_log(template.theta_lower[k]) {
+                jac[t] = theta[k];
+                h[(t, t)] -= g[t - lo];
+            }
+        }
+        for a in 0..axes.len() {
+            for b in 0..axes.len() {
+                h[(a, b)] /= jac[a] * jac[b];
+            }
+        }
+    }
+
+    /// `∂/∂θ_k` from the packed `∂/∂x_k`: `θ_k` (`theta`, unpacked once by the caller) is
+    /// divided out where it log-packs.
+    fn theta_derivative(template: &ModelParameters, theta: &[f64], k: usize, packed: f64) -> f64 {
+        if !theta_packs_log(template.theta_lower[k]) {
+            return packed;
+        }
+        packed / theta[k]
     }
 
     /// The exact total gradient of subject `i`'s term over its levels (#2109): one adjoint
@@ -1333,9 +1375,6 @@ impl ProfileCtx<'_> {
         s: &SubjectState,
     ) -> Option<Vec<f64>> {
         use crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at;
-        if self.reads_a_log_packed_level(i, pt.template) {
-            return None;
-        }
         let subject = &self.population.subjects[i];
         let mode = crate::estimation::covariance::stacked_mode(
             self.model,
@@ -1344,10 +1383,16 @@ impl ProfileCtx<'_> {
             Some(&s.kappas),
         )?;
         let g = subject_adjoint_gradient_at(self.model, subject, pt, &mode, self.objective())?;
-        // Every θ the moves touch packs as itself (checked above), so `∂/∂x_k` is `∂/∂θ_k`.
+        // One unpack per call, not per (read, move) pair.
+        let theta = unpack_params(pt.x, pt.template).theta;
         let out: Vec<f64> = self.layout.reads[i]
             .iter()
-            .map(|r| r.moves.iter().map(|&(k, c)| c * g[k]).sum())
+            .map(|r| {
+                r.moves
+                    .iter()
+                    .map(|&(k, c)| c * Self::theta_derivative(pt.template, &theta, k, g[k]))
+                    .sum()
+            })
             .collect();
         out.iter().all(|v| v.is_finite()).then_some(out)
     }
@@ -2111,12 +2156,12 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// The outer-gradient decline log of a profiled fit: reconverging, so a subject that
-/// declines the analytic gradient at runtime takes the reconverged salvage rather than the
-/// held-EBE one (#2136, see [`envelope_gradient`]). The one constructor both of
+/// The outer-gradient decline log of a profiled fit: a subject that declines the analytic
+/// gradient at runtime is served at its re-solved EBE or reconverged, never by the
+/// held-EBE gradient (#2136, #3004; see [`envelope_gradient`]). The one constructor both of
 /// [`optimize_profiled`]'s gradient sites use.
 pub(crate) fn profiled_decline_log(n_subjects: usize) -> OuterFdDeclineLog {
-    let log = OuterFdDeclineLog::reconverging(n_subjects);
+    let log = OuterFdDeclineLog::new(n_subjects);
     #[cfg(test)]
     if FORCE_PROFILED_DECLINES.with(std::cell::Cell::get) {
         for i in 0..n_subjects {
@@ -3158,7 +3203,7 @@ pub(crate) fn optimize_profiled(
     // Per-subject outer FD fallbacks that happened in the outer loop, from its runtime log,
     // as `optimize_population` reports them (#1154).
     if let Some(w) =
-        crate::estimation::outer_optimizer::outer_fd_fallback_warning(model, population, &declines)
+        crate::estimation::outer_optimizer::outer_fd_fallback_warning(population, &declines)
     {
         warnings.push(w);
     }
@@ -3185,8 +3230,10 @@ pub(crate) fn optimize_profiled(
         covariance_wall_time_secs: cov.as_ref().map_or(0.0, |c| c.wall_time_secs),
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: None,
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
@@ -3372,8 +3419,10 @@ fn failed_result(
         covariance_wall_time_secs: 0.0,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: None,
         ebe_convergence_warnings: ebe.n_guarded as u32,
         max_unconverged_subjects: ebe.max_unconverged as u32,
         total_ebe_fallbacks: ebe.total_fallback as u32,
@@ -4387,7 +4436,7 @@ impl ProfileCtx<'_> {
     /// [`Self::subject_blocks_fd`] take, a slack's `−1` included; `Aᵢ = H_SS`.
     ///
     /// `None` where the recorder declines the subject (its scope or width, a mode at which
-    /// `H` is singular, a non-finite block) or a level it reads log-packs.
+    /// `H` is singular, a non-finite block).
     fn subject_blocks_adjoint(
         &self,
         i: usize,
@@ -4395,10 +4444,7 @@ impl ProfileCtx<'_> {
         free: &[usize],
         solve: &ProfileSolve,
     ) -> Option<(DMatrix<f64>, DMatrix<f64>, DMatrix<f64>)> {
-        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_at;
-        if self.reads_a_log_packed_level(i, pt.template) {
-            return None;
-        }
+        use crate::sens::ode_provider::adjoint::subject_adjoint_cov_block_with_gradient_at;
         let subject = &self.population.subjects[i];
         let mode = crate::estimation::covariance::stacked_mode(
             self.model,
@@ -4415,8 +4461,17 @@ impl ProfileCtx<'_> {
         touched.dedup();
         let nf = free.len();
         let axes: Vec<usize> = free.iter().chain(&touched).copied().collect();
-        let h =
-            subject_adjoint_cov_block_at(self.model, subject, pt, &mode, self.objective(), &axes)?;
+        let (g, mut h) = subject_adjoint_cov_block_with_gradient_at(
+            self.model,
+            subject,
+            pt,
+            &mode,
+            self.objective(),
+            &axes,
+        )?;
+        if self.reads_a_log_packed_level(i, pt.template) {
+            Self::theta_scale(pt, &axes, nf, &g[nf..], &mut h);
+        }
         let m = DMatrix::from_fn(touched.len(), reads.len(), |t, a| {
             reads[a]
                 .moves

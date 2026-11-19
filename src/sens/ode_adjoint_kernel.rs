@@ -219,6 +219,7 @@ pub(super) fn kernel_run(
         &|| key.clone(),
         &|_| true,
         &record,
+        true,
         &mut |plan| run(plan),
     )
 }

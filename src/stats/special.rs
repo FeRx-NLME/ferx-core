@@ -225,6 +225,47 @@ pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
     }
 }
 
+/// [`normal_cdf_g`] for a recording type (#2786) that reads it **inside an ODE step**, where `z`
+/// moves with the stage time: the same value, with every branch of [`erf_g`] and [`erfc_g`] a
+/// selection. Those branches are guards of a recorded body, which fail at any other stage of the
+/// segment than the one recorded (#3004: an infusion into an `igd()` kernel evaluates `Φ` at the
+/// stage time). Each arm is read at a safe argument where it is not taken, the incomplete gamma
+/// off its `x ≤ 0` clamp. Both arms are evaluated, so a caller whose `z` is fixed per recording
+/// keeps the branching form.
+pub(crate) fn normal_cdf_stage<T: PkNum>(z: T) -> T {
+    use crate::sens::num::BranchCmp::{Gt, Lt};
+    let (zero, one, half) = (T::from_f64(0.0), T::from_f64(1.0), T::from_f64(0.5));
+    // Φ(z) = ½·erfc(x), x = −z/√2; erfc = 1 − erf, or Q(½, x²) above x = 1 (`erfc_g`).
+    let x = -z * T::from_f64(INV_SQRT_2);
+    let germ_sq = T::from_f64(ERF_GERM_HALF_WIDTH * ERF_GERM_HALF_WIDTH);
+    let near = x * x;
+    let germ = T::from_f64(TWO_OVER_SQRT_PI) * (x - x * x * x / T::from_f64(3.0));
+    let away = T::select_if(Lt, near, germ_sq, one, x);
+    let sign = T::select_if(Lt, x, zero, T::from_f64(-1.0), one);
+    let erf = T::select_if(
+        Gt,
+        near,
+        germ_sq,
+        sign * regularized_gamma_p(half, away * away),
+        germ,
+    );
+    let upper_x = T::select_if(Gt, x, one, x, T::from_f64(2.0));
+    let upper = regularized_gamma_q(half, upper_x * upper_x);
+    half * T::select_if(Gt, x, one, upper, one - erf)
+}
+
+/// [`log_normal_cdf_g`] for a recording type inside an ODE step: [`normal_cdf_stage`]'s
+/// selections, and the Mills switch one too, each arm read at a safe `z` where it is not taken
+/// (the Mills fraction needs `t ≥ 2`, `ln Φ` a `z` above its underflow).
+pub(crate) fn log_normal_cdf_stage<T: PkNum>(z: T) -> T {
+    use crate::sens::num::BranchCmp::Lt;
+    let switch = T::from_f64(LOG_NORMAL_CDF_MILLS_SWITCH);
+    let t = T::select_if(Lt, z, switch, -z, -switch);
+    let mills = T::from_f64(-0.5) * t * t - T::from_f64(HALF_LN_2PI) - (t + mills_excess(t)).ln();
+    let direct = normal_cdf_stage(T::select_if(Lt, z, switch, switch, z)).ln();
+    T::select_if(Lt, z, switch, mills, direct)
+}
+
 /// Below this `z`, [`log_normal_cdf_g`] takes the Mills form instead of `ln Φ(z)` (#2769).
 /// Measured against a 60-digit `mpmath` `ln Φ` and its derivatives on `z ∈ [−42, −2]`
 /// in steps of ½: the Mills form is exact to the last bit in value, gradient and Hessian
@@ -855,11 +896,163 @@ pub(crate) fn gamma_pq_g<T: PkNum>(a: T, x: T, upper: bool) -> T {
 /// `∂^(i+j) P / ∂aⁱ ∂xʲ` at `(a, x)` — of `Q` when `upper`, which is `1 − P`, so every
 /// partial but the value is the negated one of `P` — for `i + j ≤ 3`; `NaN` above, where no
 /// layout differentiates (a misuse shows as a non-finite derivative, which the checks
-/// reject). The primitive's local derivatives (#2786): [`gamma_pq_g`] over a two-variable
-/// Taylor polynomial of the order asked, so they are the derivatives the dual types carry
-/// through the same iteration, rounded once more. The last point's polynomial is kept per
-/// thread, as a recorded program asks for several partials at one point in a row.
+/// reject). The primitive's local derivatives (#2786).
+///
+/// Every partial with an `x` derivative is closed form: `∂P/∂x = h = x^(a−1) e^(−x) / Γ(a)`,
+/// so with `g = ln h` (`g_a = ln x − ψ(a)`, `g_x = (a−1)/x − 1`) the others are polynomials in
+/// `g`'s partials times `h`. Only the pure-`a` partials need the series, which are taken from
+/// [`gamma_pq_g`] over a *one*-variable Taylor polynomial of the order asked (the two-variable
+/// one of the order-3 partials carried ten coefficients for four numbers that were needed).
+/// A point outside `a, x > 0` takes the two-variable polynomial
+/// ([`gamma_pq_partial_taylor`]). The last point's results are kept per thread, as a recorded
+/// program asks for several partials at one point in a row, and the pure-`a` polynomial is
+/// taken to the highest order the previous point needed, so a program asking order 1, 2 then 3
+/// at each point builds it once.
 pub(crate) fn gamma_pq_partial(a: f64, x: f64, upper: bool, i: u8, j: u8) -> f64 {
+    use crate::sens::taylor::Taylor;
+    use std::cell::Cell;
+    let ord = (i + j) as usize;
+    if ord == 0 {
+        return gamma_pq_g(a, x, upper);
+    }
+    if ord > 3 {
+        return f64::NAN;
+    }
+    if !(a > 0.0 && x > 0.0 && a.is_finite() && x.is_finite()) {
+        return gamma_pq_partial_taylor(a, x, upper, i, j);
+    }
+    thread_local! {
+        /// `(a, x)` bits, `h`, `ψ(a)`, `ψ′(a)` (`NaN` until asked).
+        static ANA: Cell<(u64, u64, f64, f64, f64)> = const { Cell::new((0, 0, 0.0, f64::NAN, f64::NAN)) };
+        /// `(a, x)` bits, the order built, `[∂a, ∂aa, ∂aaa]` of `P`, and the order the previous
+        /// point ended at.
+        static PURE: Cell<(u64, u64, usize, [f64; 3], usize)> = const { Cell::new((0, 0, 0, [0.0; 3], 1)) };
+    }
+    let (ka, kx) = (a.to_bits(), x.to_bits());
+    let p = if j == 0 {
+        let (la, lx, lord, mut d, hint) = PURE.get();
+        let (same, mut hint) = (la == ka && lx == kx, hint);
+        if !same || lord < i as usize {
+            // `c_k = ∂ᵏ P / k!`.
+            fn fill<const O: usize, const L: usize>(a: f64, x: f64, d: &mut [f64; 3]) {
+                let p = gamma_pq_g(Taylor::<1, O, L>::seed(a, 0), Taylor::constant(x), false);
+                const FACT: [f64; 3] = [1.0, 2.0, 6.0];
+                for (k, f) in FACT.iter().enumerate().take(L - 1) {
+                    d[k] = p.c[k + 1] * f;
+                }
+            }
+            let want = if same { 3 } else { (i as usize).max(hint) };
+            if x < a + 1.0 {
+                // The power series' own `a`-derivatives, all three at once.
+                d = p_series_a_partials(a, x);
+            } else {
+                match want {
+                    1 => fill::<1, 2>(a, x, &mut d),
+                    2 => fill::<2, 3>(a, x, &mut d),
+                    _ => fill::<3, 4>(a, x, &mut d),
+                }
+            }
+            if !same {
+                hint = lord.max(1);
+            }
+            PURE.set((ka, kx, want.min(3), d, hint));
+        }
+        d[i as usize - 1]
+    } else {
+        let (la, lx, mut h, mut psi, mut psi1) = ANA.get();
+        if la != ka || lx != kx {
+            h = (x.ln() * (a - 1.0) - x - ln_gamma(a)).exp();
+            (psi, psi1) = (f64::NAN, f64::NAN);
+        }
+        let lnx = x.ln();
+        let gx = (a - 1.0) / x - 1.0;
+        let ga = |psi: &mut f64| {
+            if psi.is_nan() {
+                *psi = digamma(a);
+            }
+            lnx - *psi
+        };
+        let v = match (i, j) {
+            (0, 1) => h,
+            (0, 2) => h * gx,
+            (0, 3) => h * (gx * gx - (a - 1.0) / (x * x)),
+            (1, 1) => h * ga(&mut psi),
+            (1, 2) => {
+                let g = ga(&mut psi);
+                h * (g * gx + 1.0 / x)
+            }
+            _ => {
+                // (2, 1): `h (g_a² + g_aa)`, `g_aa = −ψ′(a)`.
+                let g = ga(&mut psi);
+                if psi1.is_nan() {
+                    psi1 = trigamma(a);
+                }
+                h * (g * g - psi1)
+            }
+        };
+        ANA.set((ka, kx, h, psi, psi1));
+        v
+    };
+    if upper {
+        -p
+    } else {
+        p
+    }
+}
+
+/// `[∂P/∂a, ∂²P/∂a², ∂³P/∂a³]` of the power series [`gamma_p_series`] (`x < a + 1`), by the
+/// series' own recurrences instead of a Taylor polynomial through its loop: with
+/// `tₙ = xⁿ / ∏ₖ₌₀ⁿ (a+k)` the derivatives of `tₙ` are `tₙ` times polynomials in the running
+/// sums `Hₘ = Σₖ (a+k)⁻ᵐ` (`t′ = −t H₁`, `t″ = t (H₁² + H₂)`, `t‴ = −t (H₁³ + 3 H₁H₂ + 2 H₃)`),
+/// and the prefactor `u = e^(a ln x − x − ln Γ(a))` has `ln u` derivatives `ln x − ψ(a)`,
+/// `−ψ′(a)`, `−ψ″(a)`. The loop stops on the same value-part test as [`gamma_p_series`].
+fn p_series_a_partials(a: f64, x: f64) -> [f64; 3] {
+    const EPS: f64 = 1e-15;
+    const MAX_ITER: usize = 300;
+    let terms = |t: f64, h1: f64, h2: f64, h3: f64| {
+        [
+            t,
+            -t * h1,
+            t * (h1 * h1 + h2),
+            -t * (h1 * h1 * h1 + 3.0 * h1 * h2 + 2.0 * h3),
+        ]
+    };
+    let r = 1.0 / a;
+    let (mut h1, mut h2, mut h3) = (r, r * r, r * r * r);
+    let mut del = r;
+    let mut s = terms(del, h1, h2, h3);
+    let mut ap = a;
+    for _ in 0..MAX_ITER {
+        ap += 1.0;
+        del = del * x / ap;
+        let r = 1.0 / ap;
+        h1 += r;
+        h2 += r * r;
+        h3 += r * r * r;
+        let t = terms(del, h1, h2, h3);
+        for k in 0..4 {
+            s[k] += t[k];
+        }
+        if del.abs() < s[0].abs() * EPS {
+            break;
+        }
+    }
+    let u = gamma_pref(a, x);
+    let (l1, l2, l3) = (x.ln() - digamma(a), -trigamma(a), -tetragamma(a));
+    let u1 = u * l1;
+    let u2 = u * (l1 * l1 + l2);
+    let u3 = u * (l1 * l1 * l1 + 3.0 * l1 * l2 + l3);
+    [
+        u1 * s[0] + u * s[1],
+        u2 * s[0] + 2.0 * u1 * s[1] + u * s[2],
+        u3 * s[0] + 3.0 * u2 * s[1] + 3.0 * u1 * s[2] + u * s[3],
+    ]
+}
+
+/// [`gamma_pq_partial`] over [`gamma_pq_g`]'s two-variable Taylor polynomial of the order asked:
+/// the partials the dual types carry through the same iteration, rounded once more. The
+/// fallback outside `a, x > 0`, and the reference the closed forms are tested against.
+pub(crate) fn gamma_pq_partial_taylor(a: f64, x: f64, upper: bool, i: u8, j: u8) -> f64 {
     use crate::sens::taylor::Taylor;
     use std::cell::Cell;
     let ord = (i + j) as usize;
@@ -1953,6 +2146,73 @@ mod tests {
         }
     }
 
+    /// The `z` grid of the stage-form parity: every arm of `normal_cdf_stage` (the erf germ
+    /// `|z| < √2·1e-3`, the `P` region both signs, the `Q` tail `x > 1` i.e. `z < −√2`, and
+    /// `x < −1`, i.e. `z > √2`, where `Φ = ½(1 + erf)`), the points a relative 1e-9 each side of
+    /// the three seams (not the seams themselves: the two forms compare `x` and `x²` against
+    /// the same threshold, which can round to opposite arms at the exact value), and the Mills switch of `log_normal_cdf_stage` (`z = −10`) with the
+    /// Mills arm well below it.
+    fn stage_parity_grid() -> Vec<f64> {
+        let germ_edge = std::f64::consts::SQRT_2 * ERF_GERM_HALF_WIDTH;
+        let mut zs = vec![
+            0.0, 1e-4, -1e-4, 0.5, -0.5, 1.0, -1.0, 2.5, -2.5, 6.0, -6.0, -9.9, -10.0, -10.1,
+            -15.0, -30.0, -100.0,
+        ];
+        for edge in [
+            germ_edge,
+            std::f64::consts::SQRT_2,
+            LOG_NORMAL_CDF_MILLS_SWITCH,
+        ] {
+            for e in [edge, -edge] {
+                zs.extend([e * (1.0 + 1e-9), e * (1.0 - 1e-9)]);
+            }
+        }
+        zs
+    }
+
+    /// [`normal_cdf_stage`] / [`log_normal_cdf_stage`] are the branching [`normal_cdf_g`] /
+    /// [`log_normal_cdf_g`] with the branches turned into selections: the same value, gradient
+    /// and Hessian on every arm and across every seam (#3004). Regression caught: an arm of
+    /// the selection form that drifts from its branching twin (a sign, a threshold, the safe
+    /// argument of the arm not taken). Measured over the grid, at `f64` and in `Dual2<1>`
+    /// jets: the two forms are bit-identical (worst relative difference 0, Linux), so the 1e-13
+    /// bound is headroom for another libm, not the observed error.
+    #[test]
+    fn the_stage_cdfs_match_the_branching_forms_on_every_arm() {
+        use crate::sens::dual2::Dual2;
+        let note = |what: &str, z: f64, a: f64, b: f64| {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{what} at z = {z}: {a} vs {b}"
+            );
+            assert!(
+                (a - b).abs() <= 1e-13 * (1e-300 + a.abs().max(b.abs())),
+                "{what} at z = {z}: stage {a:e} vs branching {b:e}"
+            );
+        };
+        for z in stage_parity_grid() {
+            note("Phi value", z, normal_cdf_stage(z), normal_cdf_g(z));
+            note(
+                "ln Phi value",
+                z,
+                log_normal_cdf_stage(z),
+                log_normal_cdf_g(z),
+            );
+            let (s, g) = (
+                normal_cdf_stage(Dual2::<1>::var(z, 0)),
+                normal_cdf_g(Dual2::<1>::var(z, 0)),
+            );
+            note("Phi grad", z, s.grad[0], g.grad[0]);
+            note("Phi hess", z, s.hess[0][0], g.hess[0][0]);
+            let (s, g) = (
+                log_normal_cdf_stage(Dual2::<1>::var(z, 0)),
+                log_normal_cdf_g(Dual2::<1>::var(z, 0)),
+            );
+            note("ln Phi grad", z, s.grad[0], g.grad[0]);
+            note("ln Phi hess", z, s.hess[0][0], g.hess[0][0]);
+        }
+    }
+
     /// `erfc_g`'s two branches — `1 − erf` (`x ≤ 1`) and `Q(½,x²)` (`x > 1`) — must
     /// agree **at the same point** (value and dual derivative) across the `x = 1`
     /// seam, so the branch switch is a no-op on the gradient path. Evaluated
@@ -2355,5 +2615,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The closed-form partials of `P` / `Q` against the two-variable Taylor polynomial they
+    /// replaced, on both sides of the series / continued-fraction switch `x = a + 1`, in every
+    /// call order a program uses (ascending per point, a new point mid-order, order 3 first).
+    /// Mutation: a wrong `g_a` / `g_x` combination in any one arm (e.g. `(1, 2)` without the
+    /// `1/x`) moves that partial by O(1).
+    #[test]
+    fn gamma_pq_partials_match_the_taylor_polynomial() {
+        const ALL: [(u8, u8); 9] = [
+            (1, 0),
+            (0, 1),
+            (2, 0),
+            (1, 1),
+            (0, 2),
+            (3, 0),
+            (2, 1),
+            (1, 2),
+            (0, 3),
+        ];
+        let mut worst = 0.0f64;
+        for &a in &[0.3, 1.0, 2.5, 7.0, 25.0] {
+            for &x in &[0.05, 0.9, 2.4, 3.5, 8.0, 30.0] {
+                for upper in [false, true] {
+                    for order in [false, true] {
+                        let mut ks = ALL.to_vec();
+                        if order {
+                            ks.reverse();
+                        }
+                        for (i, j) in ks {
+                            let got = gamma_pq_partial(a, x, upper, i, j);
+                            let want = gamma_pq_partial_taylor(a, x, upper, i, j);
+                            assert!(got.is_finite() && want.is_finite(), "a={a} x={x} ({i},{j})");
+                            let e = (got - want).abs() / (1e-12 + want.abs());
+                            worst = worst.max(e); // nan-ok: both asserted finite above
+                            assert!(
+                                e < 1e-7 || (got - want).abs() < 1e-13,
+                                "a={a} x={x} upper={upper} ({i},{j}): {got:e} vs {want:e}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("gamma_pq_partial closed form vs Taylor: worst relative gap {worst:.2e}");
+        // Outside a, x > 0 the Taylor polynomial answers (zero derivatives where x <= 0).
+        assert_eq!(gamma_pq_partial(2.0, -1.0, false, 1, 1), 0.0);
+        assert_eq!(gamma_pq_partial(2.0, 1.0, false, 4, 0).is_nan(), true);
     }
 }

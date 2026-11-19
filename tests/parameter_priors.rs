@@ -265,8 +265,8 @@ fn a_priored_fit_splits_the_objective_and_keeps_the_ics_on_the_data_half() {
     assert!((r.ofv - (r.ofv_data + r.ofv_prior)).abs() < 1e-9);
     // AIC/BIC are computed from the data half: a penalized objective is not a
     // log-likelihood, and an IC built from one would reward a tighter prior.
-    assert!((r.aic - (r.ofv_data + 2.0 * r.n_parameters as f64)).abs() < 1e-9);
-    assert!(r.aic < r.ofv + 2.0 * r.n_parameters as f64);
+    assert!((r.aic.unwrap() - (r.ofv_data + 2.0 * r.n_parameters as f64)).abs() < 1e-9);
+    assert!(r.aic.unwrap() < r.ofv + 2.0 * r.n_parameters as f64);
 
     // The per-parameter report reconciles with the total, or the split shown to
     // the user does not add up to the number next to it.
@@ -910,7 +910,9 @@ fn a_priored_fit_round_trips_through_fitrx() {
         "ofv_data must not be the penalized total"
     );
     // The invariant `aic` was computed under survives the trip.
-    assert!((loaded.aic - (loaded.ofv_data + 2.0 * loaded.n_parameters as f64)).abs() < 1e-9);
+    assert!(
+        (loaded.aic.unwrap() - (loaded.ofv_data + 2.0 * loaded.n_parameters as f64)).abs() < 1e-9
+    );
     // And the per-parameter rows survive.
     assert_eq!(loaded.prior_summary.len(), saved.prior_summary.len());
     assert_eq!(loaded.prior_summary[0].name, "TVCL");
