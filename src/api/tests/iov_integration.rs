@@ -147,11 +147,18 @@ fn test_iov_foce_lbfgs() {
     assert_iov_fit_ok(&result);
 }
 
+/// `nlopt_lbfgs`, `mma` and `bfgs` ran all 60 outer iterations on this fixture (39–55 s each,
+/// measured locally), while `assert_iov_fit_ok` needs only a finite objective and the IOV
+/// outputs, which the first outer steps already produce. The cap keeps each optimizer's IOV
+/// path covered per PR; IOV convergence stays pinned by the slow-tests fits below.
+const OPTIMIZER_SMOKE_ITERS: usize = 5;
+
 #[test]
 fn test_iov_foce_nlopt_lbfgs() {
     let model = make_iov_model();
     let pop = make_iov_population();
-    let opts = fast_opts(EstimationMethod::Foce, Optimizer::NloptLbfgs, false);
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::NloptLbfgs, false);
+    opts.outer_maxiter = OPTIMIZER_SMOKE_ITERS;
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
     assert_iov_fit_ok(&result);
 }
@@ -160,7 +167,8 @@ fn test_iov_foce_nlopt_lbfgs() {
 fn test_iov_foce_mma() {
     let model = make_iov_model();
     let pop = make_iov_population();
-    let opts = fast_opts(EstimationMethod::Foce, Optimizer::Mma, false);
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Mma, false);
+    opts.outer_maxiter = OPTIMIZER_SMOKE_ITERS;
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
     assert_iov_fit_ok(&result);
 }
@@ -169,7 +177,8 @@ fn test_iov_foce_mma() {
 fn test_iov_foce_bfgs() {
     let model = make_iov_model();
     let pop = make_iov_population();
-    let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bfgs, false);
+    let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bfgs, false);
+    opts.outer_maxiter = OPTIMIZER_SMOKE_ITERS;
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
     assert_iov_fit_ok(&result);
 }
