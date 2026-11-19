@@ -46,9 +46,7 @@ thread_local! {
 fn last_scored_time(subject: &Subject) -> Option<f64> {
     let record_times = subject.obs_records.iter().flat_map(|r| match r {
         #[cfg(feature = "survival")]
-        ObsRecord::Event {
-            time, event_type, ..
-        } => {
+        ObsRecord::Event { time, event_type, .. } => {
             let right = match event_type {
                 crate::types::EventType::IntervalCensored { right, .. } => *right,
                 _ => *time,
@@ -89,23 +87,16 @@ fn cutoff(subject: &Subject) -> Option<f64> {
         .chain(subject.reset_times.iter().copied())
         .filter(|&t| t > horizon)
         .fold(f64::INFINITY, f64::min);
-    Some(if next_record.is_finite() {
-        next_record
-    } else {
-        horizon
-    })
+    Some(if next_record.is_finite() { next_record } else { horizon })
 }
 
 /// How many leading entries of `times` to keep: through the last one at or before `cutoff`,
 /// so the kept records are a prefix however the list is ordered, and an `ADDL`-implied
 /// dose's `parent` index stays valid. A `NaN` time is kept for the engines to refuse.
 fn kept_prefix(
-    mut times: impl DoubleEndedIterator<Item = f64> + ExactSizeIterator,
-    cutoff: f64,
+    mut times: impl DoubleEndedIterator<Item = f64> + ExactSizeIterator, cutoff: f64,
 ) -> usize {
-    times
-        .rposition(|t| t <= cutoff || t.is_nan())
-        .map_or(0, |i| i + 1)
+    times.rposition(|t| t <= cutoff || t.is_nan()).map_or(0, |i| i + 1)
 }
 
 /// Cut a per-record occasion list to its first `keep` entries, then add back each label
@@ -207,8 +198,7 @@ fn dose_can_arrive_before_its_record(model: &CompiledModel) -> bool {
 /// (`cells_ready`), which [`cut_occasions`] does not promise.
 /// So is a model where [`dose_can_arrive_before_its_record`] holds.
 pub(crate) fn scored_population<'a>(
-    model: &CompiledModel,
-    population: Cow<'a, Population>,
+    model: &CompiledModel, population: Cow<'a, Population>,
 ) -> Cow<'a, Population> {
     #[cfg(test)]
     if SCORE_ALL_RECORDS.with(std::cell::Cell::get) {

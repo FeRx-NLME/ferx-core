@@ -84,9 +84,7 @@ fn run(edit: impl FnOnce(&mut FitOptions)) -> FitResult {
 }
 
 fn max_warning(r: &FitResult) -> bool {
-    r.warnings
-        .iter()
-        .any(|w| w.contains("exploration phase reached its maximum"))
+    r.warnings.iter().any(|w| w.contains("exploration phase reached its maximum"))
 }
 
 /// An explicit `n_exploration` is a fixed length: it is used as given, the
@@ -123,11 +121,7 @@ fn maximum_is_respected_and_reported() {
         "{:?}",
         r.warnings
     );
-    assert!(
-        r.warnings.iter().any(|w| w.contains("can never be tested")),
-        "{:?}",
-        r.warnings
-    );
+    assert!(r.warnings.iter().any(|w| w.contains("can never be tested")), "{:?}", r.warnings);
 }
 
 /// Well-identified model: the rule needs ten points per coordinate at a spacing of
@@ -139,9 +133,7 @@ fn automatic_stop_lies_between_the_bounds() {
         o.saem_exploration_min = 20;
         o.saem_exploration_max = 700;
     });
-    let used = r
-        .saem_n_exploration_used
-        .expect("SAEM reports its exploration length");
+    let used = r.saem_n_exploration_used.expect("SAEM reports its exploration length");
     // Requiring a stop strictly before the maximum is what makes the test fail if the
     // automatic stop is never taken (which would also yield a length inside the bounds).
     eprintln!("automatic stop used {used}");

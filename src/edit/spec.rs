@@ -42,11 +42,7 @@ pub enum ModelEdit<'a> {
     /// Give `param` a κ — inter-occasion variability — in the canonical
     /// `TVP * exp(ETA_P + KAPPA_P)` form (`TVP * exp(KAPPA_P)` on a parameter
     /// with no η), declaring `kappa KAPPA_P ~ variance` (#1183).
-    AddIov {
-        param: String,
-        kappa: String,
-        variance: f64,
-    },
+    AddIov { param: String, kappa: String, variance: f64 },
     /// Take `param`'s κ away: drop it from the `exp(…)` factor and drop the
     /// `kappa` declaration that goes with it.
     DropIov { param: String },
@@ -98,10 +94,7 @@ pub enum StructuralEngine {
     /// the generated disposition unchanged — a numerically-integrated twin of
     /// the analytic template, which is a legitimate thing to ask for and
     /// writes no override line at all.
-    Ode {
-        input: InputForm,
-        elimination: EliminationForm,
-    },
+    Ode { input: InputForm, elimination: EliminationForm },
 }
 
 /// The `[structural_model]` template line, plus the defaults for any
@@ -153,8 +146,7 @@ pub struct StructuralSpec {
 impl StructuralSpec {
     /// An analytic `pk NAME(role=VAR, …)` swap.
     pub fn new(
-        template: impl Into<String>,
-        bindings: Vec<(String, String)>,
+        template: impl Into<String>, bindings: Vec<(String, String)>,
         new_parameters: Vec<NewParameter>,
     ) -> Self {
         StructuralSpec {
@@ -202,11 +194,7 @@ pub struct NewParameter {
 impl NewParameter {
     /// A free θ with no η: `NAME = THETA`, `theta THETA(init, lower, upper)`.
     pub fn new(
-        name: impl Into<String>,
-        theta: impl Into<String>,
-        init: f64,
-        lower: f64,
-        upper: f64,
+        name: impl Into<String>, theta: impl Into<String>, init: f64, lower: f64, upper: f64,
     ) -> Self {
         NewParameter {
             name: name.into(),
@@ -332,16 +320,12 @@ impl VariabilityText {
 
     /// The `block_omega` an η belongs to, if any.
     pub fn omega_block_of(&self, eta: &str) -> Option<&RandomEffectBlock> {
-        self.omega_blocks
-            .iter()
-            .find(|b| b.names.iter().any(|n| n == eta))
+        self.omega_blocks.iter().find(|b| b.names.iter().any(|n| n == eta))
     }
 
     /// The `block_kappa` a κ belongs to, if any.
     pub fn kappa_block_of(&self, kappa: &str) -> Option<&RandomEffectBlock> {
-        self.kappa_blocks
-            .iter()
-            .find(|b| b.names.iter().any(|n| n == kappa))
+        self.kappa_blocks.iter().find(|b| b.names.iter().any(|n| n == kappa))
     }
 
     /// Whether the η / κ is declared `FIX` — on its own line or through its
@@ -360,11 +344,7 @@ impl VariabilityText {
     /// The initial variance of a diagonal η / κ; `None` for a blocked one
     /// or a name the model does not declare.
     pub fn variance(&self, name: &str) -> Option<f64> {
-        self.omegas
-            .iter()
-            .chain(self.kappas.iter())
-            .find(|d| d.name == name)
-            .map(|d| d.variance)
+        self.omegas.iter().chain(self.kappas.iter()).find(|d| d.name == name).map(|d| d.variance)
     }
 }
 
@@ -502,29 +482,21 @@ impl ErrorSpecText {
     pub(crate) fn render_sigma_arg(&self, i: usize) -> String {
         let name = &self.sigmas[i].name;
         match &self.time_varying {
-            Some(tv) => format!(
-                "{name} * (if (TAD < {}) {} else 1.0)",
-                num(tv.cutoff),
-                tv.theta.name
-            ),
+            Some(tv) => {
+                format!("{name} * (if (TAD < {}) {} else 1.0)", num(tv.cutoff), tv.theta.name)
+            }
             None => name.clone(),
         }
     }
 
     /// The `DV ~ form(...)` statement.
     pub fn render_statement(&self) -> String {
-        let mut args: Vec<String> = (0..self.sigmas.len())
-            .map(|i| self.render_sigma_arg(i))
-            .collect();
+        let mut args: Vec<String> =
+            (0..self.sigmas.len()).map(|i| self.render_sigma_arg(i)).collect();
         if let Some(p) = &self.exponent {
             args.push(p.name.clone());
         }
-        format!(
-            "{} ~ {}({})",
-            self.endpoint,
-            self.form.label(),
-            args.join(", ")
-        )
+        format!("{} ~ {}({})", self.endpoint, self.form.label(), args.join(", "))
     }
 }
 
@@ -581,12 +553,7 @@ pub struct ThetaDecl {
 
 impl ThetaDecl {
     pub fn new(name: impl Into<String>, init: f64, lower: f64, upper: f64) -> Self {
-        ThetaDecl {
-            name: name.into(),
-            init,
-            lower,
-            upper,
-        }
+        ThetaDecl { name: name.into(), init, lower, upper }
     }
 
     /// `theta NAME(init, lower, upper)` — or `theta NAME(init)` when both
@@ -596,13 +563,7 @@ impl ThetaDecl {
         if !self.lower.is_finite() && !self.upper.is_finite() {
             return format!("theta {}({})", self.name, num(self.init));
         }
-        format!(
-            "theta {}({}, {}, {})",
-            self.name,
-            num(self.init),
-            num(self.lower),
-            num(self.upper)
-        )
+        format!("theta {}({}, {}, {})", self.name, num(self.init), num(self.lower), num(self.upper))
     }
 }
 
@@ -616,10 +577,7 @@ pub struct EtaDecl {
 
 impl EtaDecl {
     pub fn new(name: impl Into<String>, variance: f64) -> Self {
-        EtaDecl {
-            name: name.into(),
-            variance,
-        }
+        EtaDecl { name: name.into(), variance }
     }
 
     /// `omega NAME ~ variance`.
@@ -731,12 +689,7 @@ impl Relation {
     /// emitting it on every line would rewrite every existing
     /// `[covariate_model]` an edit passes through.
     pub(crate) fn render(&self) -> String {
-        let mut line = format!(
-            "{} ~ {} {}",
-            self.parameter,
-            self.covariate,
-            self.form_src()
-        );
+        let mut line = format!("{} ~ {} {}", self.parameter, self.covariate, self.form_src());
         if self.op == CovariateOp::Add {
             line.push_str(" +");
         }
@@ -744,15 +697,7 @@ impl Relation {
             let clause: Vec<String> = self
                 .thetas
                 .iter()
-                .map(|t| {
-                    format!(
-                        "{}({}, {}, {})",
-                        t.name,
-                        num(t.init),
-                        num(t.lower),
-                        num(t.upper)
-                    )
-                })
+                .map(|t| format!("{}({}, {}, {})", t.name, num(t.init), num(t.lower), num(t.upper)))
                 .collect();
             line.push_str(" => ");
             line.push_str(&clause.join(", "));
@@ -810,11 +755,7 @@ pub(crate) fn num(v: f64) -> String {
         // Rust's float parser returns `Ok(f64::INFINITY)` on overflow rather
         // than `Err`, so `unwrap_or` alone would let `inf` through and write
         // it into the file as a bound.
-        format!("{v:.14e}")
-            .parse::<f64>()
-            .ok()
-            .filter(|r| r.is_finite())
-            .unwrap_or(v)
+        format!("{v:.14e}").parse::<f64>().ok().filter(|r| r.is_finite()).unwrap_or(v)
     } else {
         v
     };
@@ -835,8 +776,6 @@ pub(crate) fn finite(v: f64, what: &str) -> Result<(), String> {
     if v.is_finite() {
         Ok(())
     } else {
-        Err(format!(
-            "ferx-core::edit: {what} is {v}, which cannot be written as a `.ferx` number"
-        ))
+        Err(format!("ferx-core::edit: {what} is {v}, which cannot be written as a `.ferx` number"))
     }
 }

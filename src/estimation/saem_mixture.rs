@@ -86,22 +86,14 @@ impl SaemMixture {
     /// population's covariates both to detect which thetas the mixing expressions
     /// depend on and to seed each subject's responsibility average.
     pub(crate) fn build(
-        model: &CompiledModel,
-        init_params: &ModelParameters,
-        population: &Population,
+        model: &CompiledModel, init_params: &ModelParameters, population: &Population,
     ) -> Self {
-        let mp = init_params
-            .mixture
-            .as_ref()
-            .expect("SaemMixture::build on non-mixture params")
-            .clone();
+        let mp =
+            init_params.mixture.as_ref().expect("SaemMixture::build on non-mixture params").clone();
         let n_classes = mp.omega.len();
         let n_eta = model.n_eta;
         let n_subjects = population.subjects.len();
-        let spec = model
-            .mixture
-            .as_ref()
-            .expect("SaemMixture::build on non-mixture model");
+        let spec = model.mixture.as_ref().expect("SaemMixture::build on non-mixture model");
 
         // Per-subject initial mixing probabilities (each under that subject's own
         // covariates — so covariate-dependent logit mixing starts from the right,
@@ -148,17 +140,12 @@ impl SaemMixture {
             .collect();
 
         // σ-override init snapshot (held constant under SAEM).
-        let sigma_override_init: HashMap<(usize, usize), f64> = mp
-            .sigma_override_addr
-            .iter()
-            .map(|&(c, s)| ((c, s), mp.sigma[c].values[s]))
-            .collect();
+        let sigma_override_init: HashMap<(usize, usize), f64> =
+            mp.sigma_override_addr.iter().map(|&(c, s)| ((c, s), mp.sigma[c].values[s])).collect();
 
         // r̄ initialised per subject from that subject's initial mixing probs.
-        let rbar: Vec<Vec<f64>> = base_lp
-            .iter()
-            .map(|blp| blp.iter().map(|l| l.exp()).collect())
-            .collect();
+        let rbar: Vec<Vec<f64>> =
+            base_lp.iter().map(|blp| blp.iter().map(|l| l.exp()).collect()).collect();
 
         SaemMixture {
             n_classes,
@@ -195,10 +182,7 @@ impl SaemMixture {
             let v = if self.omega_stat_active {
                 self.s2_diag[c][j]
             } else {
-                self.omega_override_init
-                    .get(&(c, j))
-                    .copied()
-                    .unwrap_or(self.s2_diag[c][j])
+                self.omega_override_init.get(&(c, j)).copied().unwrap_or(self.s2_diag[c][j])
             };
             self.mp.omega[c].matrix[(j, j)] = v.max(OVERRIDE_OMEGA_DIAG_FLOOR);
         }
@@ -289,9 +273,7 @@ impl SaemMixture {
     /// non-zero count (a coordinate overridden by *every* class has no base
     /// members and keeps its previous value).
     pub(crate) fn base_eta_outer(
-        &self,
-        etas: &[Vec<f64>],
-        n_eta: usize,
+        &self, etas: &[Vec<f64>], n_eta: usize,
     ) -> (DMatrix<f64>, DMatrix<usize>) {
         let mut sum = DMatrix::zeros(n_eta, n_eta);
         let mut counts = DMatrix::zeros(n_eta, n_eta);
@@ -344,14 +326,8 @@ impl SaemMixture {
 /// reaches the structural `MIXNUM` branch correctly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_class(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    mix: &SaemMixture,
-    omega_iov: Option<&OmegaMatrix>,
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[Vec<f64>],
+    mix: &SaemMixture, omega_iov: Option<&OmegaMatrix>, scratch: &mut EventPkParams,
     rng: &mut StdRng,
 ) -> usize {
     let pmix = class_posterior(model, subject, theta, eta, kappas, mix, omega_iov, scratch);
@@ -363,14 +339,8 @@ pub(crate) fn draw_class(
 /// exact probabilities instead of sampling them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn class_posterior(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    mix: &SaemMixture,
-    omega_iov: Option<&OmegaMatrix>,
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[Vec<f64>],
+    mix: &SaemMixture, omega_iov: Option<&OmegaMatrix>, scratch: &mut EventPkParams,
 ) -> Vec<f64> {
     use crate::parser::model_parser::MixtureClassGuard;
     let spec = model.mixture.as_ref().expect("draw_class non-mixture");
@@ -434,11 +404,7 @@ pub(crate) fn is_class_shared(p: &MixtureMuRefPair) -> bool {
 /// translation (Jacobian 1) and the orbit `{(k, η_k)}` is the same set from any
 /// of its members. Etas without a switched pair are left unchanged.
 pub(crate) fn orbit_eta(
-    eta: &[f64],
-    theta: &[f64],
-    prev: usize,
-    k: usize,
-    pairs: &[MixtureMuRefPair],
+    eta: &[f64], theta: &[f64], prev: usize, k: usize, pairs: &[MixtureMuRefPair],
 ) -> Vec<f64> {
     let mut out = eta.to_vec();
     for p in pairs {
@@ -453,24 +419,14 @@ pub(crate) fn orbit_eta(
 /// run under IOV.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn orbit_class_probs(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    prev: usize,
-    mix: &SaemMixture,
-    pairs: &[MixtureMuRefPair],
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], prev: usize,
+    mix: &SaemMixture, pairs: &[MixtureMuRefPair], scratch: &mut EventPkParams,
 ) -> (Vec<f64>, Vec<Vec<f64>>, Vec<f64>) {
     use crate::parser::model_parser::MixtureClassGuard;
-    let spec = model
-        .mixture
-        .as_ref()
-        .expect("orbit_class_probs non-mixture");
+    let spec = model.mixture.as_ref().expect("orbit_class_probs non-mixture");
     let logp = eval_mixing_log_probs(spec, theta, &subject.covariates);
-    let etas: Vec<Vec<f64>> = (0..mix.n_classes)
-        .map(|k| orbit_eta(eta, theta, prev, k, pairs))
-        .collect();
+    let etas: Vec<Vec<f64>> =
+        (0..mix.n_classes).map(|k| orbit_eta(eta, theta, prev, k, pairs)).collect();
     let nll: Vec<f64> = etas
         .iter()
         .enumerate()
@@ -504,15 +460,8 @@ pub(crate) fn orbit_class_probs(
 /// (the MH baseline for the moves that follow).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_class_orbit(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    prev: usize,
-    mix: &SaemMixture,
-    pairs: &[MixtureMuRefPair],
-    scratch: &mut EventPkParams,
-    rng: &mut StdRng,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], prev: usize,
+    mix: &SaemMixture, pairs: &[MixtureMuRefPair], scratch: &mut EventPkParams, rng: &mut StdRng,
 ) -> Option<(usize, Vec<f64>, f64)> {
     if pairs.iter().all(is_class_shared) {
         return None;
@@ -534,20 +483,11 @@ pub(crate) fn draw_class_orbit(
 /// before #2458.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_class_mobile(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    mix: &SaemMixture,
-    omega_iov: Option<&OmegaMatrix>,
-    pairs: &[MixtureMuRefPair],
-    scratch: &mut EventPkParams,
-    rng: &mut StdRng,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[Vec<f64>],
+    mix: &SaemMixture, omega_iov: Option<&OmegaMatrix>, pairs: &[MixtureMuRefPair],
+    scratch: &mut EventPkParams, rng: &mut StdRng,
 ) -> (usize, Option<(Vec<f64>, f64)>) {
-    let c0 = draw_class(
-        model, subject, theta, eta, kappas, mix, omega_iov, scratch, rng,
-    );
+    let c0 = draw_class(model, subject, theta, eta, kappas, mix, omega_iov, scratch, rng);
     match draw_class_orbit(model, subject, theta, eta, c0, mix, pairs, scratch, rng) {
         Some((k, eta_k, nll_k)) => (k, Some((eta_k, nll_k))),
         None => (c0, None),
@@ -563,21 +503,12 @@ pub(crate) fn draw_class_mobile(
 /// `run_saem` takes all three from here, so the E-step has no wiring of its own.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mixture_estep_start(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    cached_nll: f64,
-    kappas: &[Vec<f64>],
-    mix: &SaemMixture,
-    omega_iov: Option<&OmegaMatrix>,
-    pairs: &[MixtureMuRefPair],
-    scratch: &mut EventPkParams,
-    rng: &mut StdRng,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], cached_nll: f64,
+    kappas: &[Vec<f64>], mix: &SaemMixture, omega_iov: Option<&OmegaMatrix>,
+    pairs: &[MixtureMuRefPair], scratch: &mut EventPkParams, rng: &mut StdRng,
 ) -> (usize, Vec<f64>, f64) {
-    let (class, moved) = draw_class_mobile(
-        model, subject, theta, eta, kappas, mix, omega_iov, pairs, scratch, rng,
-    );
+    let (class, moved) =
+        draw_class_mobile(model, subject, theta, eta, kappas, mix, omega_iov, pairs, scratch, rng);
     match moved {
         Some((eta_k, nll_k)) => (class, eta_k, nll_k),
         None => (class, eta.to_vec(), cached_nll),
@@ -602,13 +533,8 @@ pub(crate) fn mixture_estep_start(
 /// into two thetas (one for structure, one for mixing). [`mixing_structural_overlap`]
 /// detects the pattern up front so `run_saem` can reject it with a clear error.
 pub(crate) fn mstep_mixing(
-    model: &CompiledModel,
-    population: &Population,
-    mix: &SaemMixture,
-    theta: &mut [f64],
-    theta_lower: &[f64],
-    theta_upper: &[f64],
-    maxiter: u32,
+    model: &CompiledModel, population: &Population, mix: &SaemMixture, theta: &mut [f64],
+    theta_lower: &[f64], theta_upper: &[f64], maxiter: u32,
 ) {
     let idx = &mix.mixing_theta_idx;
     if idx.is_empty() {
@@ -649,13 +575,7 @@ pub(crate) fn mstep_mixing(
         x[p] = x[p].clamp(lower[p], upper[p]);
     }
 
-    let mut opt = nlopt::Nlopt::new(
-        nlopt::Algorithm::Bobyqa,
-        m,
-        obj,
-        nlopt::Target::Minimize,
-        (),
-    );
+    let mut opt = nlopt::Nlopt::new(nlopt::Algorithm::Bobyqa, m, obj, nlopt::Target::Minimize, ());
     opt.set_lower_bounds(&lower).ok();
     opt.set_upper_bounds(&upper).ok();
     opt.set_maxeval(maxiter * (m as u32 + 1)).ok();
@@ -677,9 +597,7 @@ pub(crate) fn mstep_mixing(
 /// review). One-time build-cost: `|mixing_theta_idx| · n_classes · n_subjects` NLL
 /// evaluations, and `mixing_theta_idx` is a handful of thetas.
 pub(crate) fn mixing_structural_overlap(
-    model: &CompiledModel,
-    init_params: &ModelParameters,
-    population: &Population,
+    model: &CompiledModel, init_params: &ModelParameters, population: &Population,
     mixing_theta_idx: &[usize],
 ) -> Vec<usize> {
     use crate::parser::model_parser::MixtureClassGuard;
@@ -970,10 +888,7 @@ mod tests {
         let mix = SaemMixture::build(&model, &model.default_params, &pop);
         let overlap =
             mixing_structural_overlap(&model, &model.default_params, &pop, &mix.mixing_theta_idx);
-        assert!(
-            overlap.is_empty(),
-            "dedicated MIXL must not flag: {overlap:?}"
-        );
+        assert!(overlap.is_empty(), "dedicated MIXL must not flag: {overlap:?}");
     }
 
     #[test]
@@ -1009,11 +924,7 @@ mod tests {
         assert!(mix.mixing_theta_idx.contains(&2));
         let overlap =
             mixing_structural_overlap(&model, &model.default_params, &pop, &mix.mixing_theta_idx);
-        assert_eq!(
-            overlap,
-            vec![2],
-            "TVV shared with structure must be flagged"
-        );
+        assert_eq!(overlap, vec![2], "TVV shared with structure must be flagged");
     }
 
     // Per-class Ω / σ overrides on top of the constant-mixing model.
@@ -1049,15 +960,10 @@ mod tests {
     /// (working on natural-scale user bounds) cannot see (#987 review).
     #[test]
     fn build_excludes_fixed_mixing_theta() {
-        let fixed_model = CONST_MODEL.replace(
-            "theta MIXL(0.0, -10.0, 10.0)",
-            "theta MIXL(0.4, -10.0, 10.0, FIX)",
-        );
+        let fixed_model = CONST_MODEL
+            .replace("theta MIXL(0.0, -10.0, 10.0)", "theta MIXL(0.4, -10.0, 10.0, FIX)");
         let model = parse_model_string(&fixed_model).unwrap();
-        assert!(
-            model.default_params.theta_fixed[3],
-            "MIXL must parse as FIX"
-        );
+        assert!(model.default_params.theta_fixed[3], "MIXL must parse as FIX");
         let pop = read_pop(&iv_csv(2));
         let mix = SaemMixture::build(&model, &model.default_params, &pop);
         assert!(
@@ -1071,10 +977,8 @@ mod tests {
     /// no-op even when the responsibilities point somewhere else entirely.
     #[test]
     fn mstep_mixing_holds_fixed_theta() {
-        let fixed_model = CONST_MODEL.replace(
-            "theta MIXL(0.0, -10.0, 10.0)",
-            "theta MIXL(0.4, -10.0, 10.0, FIX)",
-        );
+        let fixed_model = CONST_MODEL
+            .replace("theta MIXL(0.0, -10.0, 10.0)", "theta MIXL(0.4, -10.0, 10.0, FIX)");
         let model = parse_model_string(&fixed_model).unwrap();
         let pop = read_pop(&iv_csv(5));
         let mut mix = SaemMixture::build(&model, &model.default_params, &pop);
@@ -1108,12 +1012,7 @@ mod tests {
         mix.classes = vec![0, 0, 1, 1];
         // ETA_CL (coord 0) large only for the class-2 members, so pooling would
         // be visibly different from the class-1-only mean.
-        let etas = vec![
-            vec![0.1, 1.0],
-            vec![0.3, 2.0],
-            vec![5.0, 3.0],
-            vec![7.0, 4.0],
-        ];
+        let etas = vec![vec![0.1, 1.0], vec![0.3, 2.0], vec![5.0, 3.0], vec![7.0, 4.0]];
         let (mean, counts) = mix.base_eta_outer(&etas, 2);
         // (0,0): only classes without an override on ETA_CL → subjects 0 and 1.
         assert_eq!(counts[(0, 0)], 2);
@@ -1154,12 +1053,7 @@ mod tests {
         // Drive the SA statistic well away from the init.
         mix.classes = vec![1, 1, 1, 1];
         mix.mstep_omega_overrides(
-            &[
-                vec![2.0, 0.0],
-                vec![2.0, 0.0],
-                vec![2.0, 0.0],
-                vec![2.0, 0.0],
-            ],
+            &[vec![2.0, 0.0], vec![2.0, 0.0], vec![2.0, 0.0], vec![2.0, 0.0]],
             1.0,
         );
         assert!((mix.s2_diag[1][0] - 4.0).abs() < 1e-12);
@@ -1193,12 +1087,7 @@ mod tests {
         let base_sigma = model.default_params.sigma.values.clone();
         mix.classes = vec![1, 1, 1, 1];
         mix.mstep_omega_overrides(
-            &[
-                vec![2.0, 0.0],
-                vec![2.0, 0.0],
-                vec![2.0, 0.0],
-                vec![2.0, 0.0],
-            ],
+            &[vec![2.0, 0.0], vec![2.0, 0.0], vec![2.0, 0.0], vec![2.0, 0.0]],
             1.0,
         );
         let theta = model.default_params.theta.clone();
@@ -1210,10 +1099,7 @@ mod tests {
             mix.omega_stat_active = active;
             mix.sync_base(&base_omega, &base_sigma);
             let class = mix.class_omega(1).clone();
-            assert!(
-                (class.matrix[(0, 0)] - want_var).abs() < 1e-12,
-                "{phase}: class-2 variance"
-            );
+            assert!((class.matrix[(0, 0)] - want_var).abs() < 1e-12, "{phase}: class-2 variance");
             let fresh = OmegaMatrix::from_matrix_with_mask(
                 class.matrix.clone(),
                 base_omega.eta_names.clone(),
@@ -1223,20 +1109,13 @@ mod tests {
             let bits = |m: &DMatrix<f64>| m.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
             assert_eq!(bits(&class.chol), bits(&fresh.chol), "{phase}: chol");
             assert_eq!(bits(&class.inv), bits(&fresh.inv), "{phase}: inv");
-            assert_eq!(
-                class.log_det.to_bits(),
-                fresh.log_det.to_bits(),
-                "{phase}: log_det"
-            );
+            assert_eq!(class.log_det.to_bits(), fresh.log_det.to_bits(), "{phase}: log_det");
             let sig = mix.class_sigma(1).to_vec();
             let mut nll = |o: &OmegaMatrix| {
                 individual_nll_into(&model, subject, &theta, &eta, o, &sig, &mut scratch)
             };
             let (got, want, base) = (nll(&class), nll(&fresh), nll(&base_omega));
-            assert!(
-                got.is_finite() && base.is_finite(),
-                "{phase}: {got} / {base}"
-            );
+            assert!(got.is_finite() && base.is_finite(), "{phase}: {got} / {base}");
             assert_eq!(got.to_bits(), want.to_bits(), "{phase}: class-2 objective");
             assert_ne!(
                 got.to_bits(),
@@ -1341,10 +1220,7 @@ mod tests {
 
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("mixture + IOV SAEM fit");
-        let omega_iov = res
-            .omega_iov
-            .as_ref()
-            .expect("IOV model must report Omega_IOV");
+        let omega_iov = res.omega_iov.as_ref().expect("IOV model must report Omega_IOV");
         let w = omega_iov[(0, 0)];
         // Measured: 0.0065 with the class-aware sweep, 0.165 without it.
         assert!(
@@ -1473,10 +1349,8 @@ mod tests {
     /// visible.
     #[test]
     fn orbit_probabilities_are_mixing_times_class_prior() {
-        let src = ORBIT_MODEL.replace(
-            "  logit(1) = MIXL\n",
-            "  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.25\n",
-        );
+        let src = ORBIT_MODEL
+            .replace("  logit(1) = MIXL\n", "  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.25\n");
         let model = parse_model_string(&src).unwrap();
         let pop = read_pop(&iv_csv(1));
         let pairs = orbit_pairs(&model);
@@ -1716,24 +1590,11 @@ mod tests {
                     &mut scratch,
                     &mut a,
                 );
-                let old = draw_class(
-                    &model,
-                    s,
-                    theta,
-                    &[0.3],
-                    &[],
-                    &mix,
-                    None,
-                    &mut scratch,
-                    &mut b,
-                );
+                let old =
+                    draw_class(&model, s, theta, &[0.3], &[], &mix, None, &mut scratch, &mut b);
                 assert!(moved.is_none());
                 assert_eq!(c, old, "seed {seed}");
-                assert_eq!(
-                    a.random::<u64>(),
-                    b.random::<u64>(),
-                    "seed {seed}: RNG desync"
-                );
+                assert_eq!(a.random::<u64>(), b.random::<u64>(), "seed {seed}: RNG desync");
             }
         }
     }

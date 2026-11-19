@@ -86,12 +86,9 @@ const MODEL: &str = r"
     ignore = "slow: opt in with --features slow-tests (NONMEM IOV+mixture cross-check)"
 )]
 fn iov_mixture_fit_matches_nonmem() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv_iov.csv"),
-        Some(&["WT"]),
-        Some("OCC"),
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv_iov.csv"), Some(&["WT"]), Some("OCC"))
+            .unwrap();
     let model = parse_model_string(MODEL).unwrap();
     assert_eq!(model.n_kappa, 1, "one IOV kappa on CL");
 
@@ -111,26 +108,11 @@ fn iov_mixture_fit_matches_nonmem() {
     // ── Estimated typical values ────────────────────────────────────────────
     let th = &res.theta;
     let rel = |a: f64, b: f64| (a - b).abs() / b.abs();
-    assert!(
-        rel(th[0], NM_TVCL1) < 0.05,
-        "TVCL1 {} vs {}",
-        th[0],
-        NM_TVCL1
-    );
-    assert!(
-        rel(th[1], NM_TVCL2) < 0.05,
-        "TVCL2 {} vs {}",
-        th[1],
-        NM_TVCL2
-    );
+    assert!(rel(th[0], NM_TVCL1) < 0.05, "TVCL1 {} vs {}", th[0], NM_TVCL1);
+    assert!(rel(th[1], NM_TVCL2) < 0.05, "TVCL2 {} vs {}", th[1], NM_TVCL2);
     assert!(rel(th[2], NM_TVV) < 0.05, "TVV {} vs {}", th[2], NM_TVV);
     // ferx `p(1) = P1` is the probability directly, same as NONMEM P(1)=THETA(4).
-    assert!(
-        (th[3] - NM_P1).abs() < 0.05,
-        "p(1) {} vs NONMEM {}",
-        th[3],
-        NM_P1
-    );
+    assert!((th[3] - NM_P1).abs() < 0.05, "p(1) {} vs NONMEM {}", th[3], NM_P1);
 
     // ── Per-subject MIXEST classification agreement ─────────────────────────
     assert_eq!(res.subjects.len(), NM_MIXEST.len());
@@ -142,22 +124,14 @@ fn iov_mixture_fit_matches_nonmem() {
         .count();
     // The two engines compute the same posterior at the same optimum, so every
     // subject's most-probable class must match.
-    assert_eq!(
-        agree,
-        NM_MIXEST.len(),
-        "MIXEST agreement {}/{}",
-        agree,
-        NM_MIXEST.len()
-    );
+    assert_eq!(agree, NM_MIXEST.len(), "MIXEST agreement {}/{}", agree, NM_MIXEST.len());
 
     // Two distinct classes at the NONMEM optimum: the merged-class check stays silent
     // (#2907; the largest per-subject class log Bayes factor here is 19.29, against the
     // threshold of 1, and 0 at the identical-class saddle this fixture's L-BFGS reaches from
     // a symmetric start, OFV 549.20).
     assert!(
-        !res.warnings
-            .iter()
-            .any(|w| w.contains("W_MIXTURE_MERGED_CLASSES")),
+        !res.warnings.iter().any(|w| w.contains("W_MIXTURE_MERGED_CLASSES")),
         "{:?}",
         res.warnings
     );
@@ -228,12 +202,9 @@ fn read_nm_eval_tab() -> Vec<NmRow> {
 /// engines' η̂ and κ̂ carried through `f0`.
 #[test]
 fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
-    let pop: ferx_core::Population = read_nonmem_csv(
-        Path::new("tests/nonmem/mixture_iv_iov.csv"),
-        Some(&["WT"]),
-        Some("OCC"),
-    )
-    .unwrap();
+    let pop: ferx_core::Population =
+        read_nonmem_csv(Path::new("tests/nonmem/mixture_iv_iov.csv"), Some(&["WT"]), Some("OCC"))
+            .unwrap();
     let src = MODEL
         .replace("TVCL1(1.0,", "TVCL1(1.05700,")
         .replace("TVCL2(3.0,", "TVCL2(3.32950,")
@@ -289,11 +260,7 @@ fn iov_mixture_eval_only_postfit_matches_nonmem_posthoc() {
          |dCWRES| {cwres_gap:.3e}"
     );
     assert_eq!(no_kappa, 0, "every subject carries its two occasion κ̂s");
-    assert!(
-        ofv_gap < EVAL_OFV_TOL,
-        "OFV {} vs NONMEM {NM_EVAL_OFV}",
-        res.ofv
-    );
+    assert!(ofv_gap < EVAL_OFV_TOL, "OFV {} vs NONMEM {NM_EVAL_OFV}", res.ofv);
     assert!(ipred_gap < EVAL_IPRED_TOL, "IPRED gap {ipred_gap:.3e}");
     assert!(iwres_gap < EVAL_IWRES_TOL, "IWRES gap {iwres_gap:.3e}");
     assert!(eta_gap < EVAL_ETA_TOL, "ETA / κ̂ gap {eta_gap:.3e}");

@@ -118,10 +118,7 @@ fn resume_seeds_params_and_emits_banner() {
         result.theta[0]
     );
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("Resuming from checkpoint")),
+        result.warnings.iter().any(|w| w.contains("Resuming from checkpoint")),
         "a resume banner should be recorded in warnings: {:?}",
         result.warnings
     );
@@ -149,18 +146,12 @@ fn hash_mismatch_starts_fresh() {
         result.theta[0]
     );
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("Ignoring checkpoint")),
+        result.warnings.iter().any(|w| w.contains("Ignoring checkpoint")),
         "an 'ignoring checkpoint' warning should be recorded: {:?}",
         result.warnings
     );
     // The stale checkpoint was removed by the reject path.
-    assert!(
-        checkpoint::load(&path).is_none(),
-        "stale checkpoint should be deleted"
-    );
+    assert!(checkpoint::load(&path).is_none(), "stale checkpoint should be deleted");
     checkpoint::remove(&path);
 }
 
@@ -189,10 +180,7 @@ fn disabled_ignores_existing_checkpoint() {
         result.warnings
     );
     // The file is left untouched (neither read nor deleted).
-    assert!(
-        checkpoint::load(&path).is_some(),
-        "disabled run must not touch the file"
-    );
+    assert!(checkpoint::load(&path).is_some(), "disabled run must not touch the file");
     checkpoint::remove(&path);
 }
 
@@ -243,10 +231,7 @@ fn focei_fit_writes_then_removes_checkpoint() {
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("short fit runs");
     assert!(result.theta[0].is_finite());
-    assert!(
-        checkpoint::load(&path).is_none(),
-        "checkpoint must be removed after a successful fit"
-    );
+    assert!(checkpoint::load(&path).is_none(), "checkpoint must be removed after a successful fit");
     checkpoint::remove(&path);
 }
 
@@ -339,16 +324,8 @@ fn optimizer_loops_checkpoint_through_the_best_point_tracker() {
             1usize,
             "only BestPoint::write_checkpoint may call maybe_write",
         ),
-        (
-            "src/estimation/gauss_newton.rs",
-            0,
-            "GN must checkpoint via BestPoint::write_checkpoint",
-        ),
-        (
-            "src/estimation/saem.rs",
-            1,
-            "SAEM's current iterate is its state, so it writes directly",
-        ),
+        ("src/estimation/gauss_newton.rs", 0, "GN must checkpoint via BestPoint::write_checkpoint"),
+        ("src/estimation/saem.rs", 1, "SAEM's current iterate is its state, so it writes directly"),
     ] {
         let src = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file}: {e}"));
         let n = src.matches("maybe_write(").count();

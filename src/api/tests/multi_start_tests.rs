@@ -5,23 +5,16 @@ use crate::types::{FitOptions, ModelParameters, OmegaMatrix, SigmaVector};
 fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) -> ModelParameters {
     let n = theta.len();
     ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
         theta,
         theta_names: (0..n).map(|i| format!("T{i}")).collect(),
         theta_lower,
         theta_upper,
         theta_fixed: vec![false; n],
-        omega: OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]),
-        omega_fixed: vec![false],
-        sigma: SigmaVector {
-            values: vec![0.1],
-            names: vec!["ERR".into()],
-        },
-        sigma_fixed: vec![false],
-        omega_iov: None,
-        kappa_fixed: Vec::new(),
-        mixture: None,
+        sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
+        ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+            &[0.04],
+            vec!["ETA_CL".into()],
+        ))
     }
 }
 
@@ -37,11 +30,7 @@ fn test_perturb_changes_theta() {
     let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
     let perturbed = perturb_init(&p, 1, 0.3, 42);
     // With sigma=0.3 and seed=43 (42+1), at least one theta should differ
-    let changed = perturbed
-        .theta
-        .iter()
-        .zip(p.theta.iter())
-        .any(|(a, b)| (a - b).abs() > 1e-10);
+    let changed = perturbed.theta.iter().zip(p.theta.iter()).any(|(a, b)| (a - b).abs() > 1e-10);
     assert!(changed, "start 1 should perturb theta");
 }
 
@@ -96,17 +85,80 @@ fn test_n_starts_and_seed_via_parser() {
 
 #[test]
 fn test_per_start_saem_seed_derivation() {
+    use super::per_start_seed;
     let base: u64 = 12345;
-    // Each start k > 0 gets base + k; start 0 keeps the base unchanged.
-    assert_eq!(base.wrapping_add(0), 12345);
-    assert_eq!(base.wrapping_add(1), 12346);
-    assert_eq!(base.wrapping_add(7), 12352);
-    // All derived seeds are distinct.
-    let seeds: Vec<u64> = (0..8).map(|k| base.wrapping_add(k)).collect();
-    let unique: std::collections::HashSet<u64> = seeds.iter().copied().collect();
-    assert_eq!(unique.len(), 8);
-    // wrapping_add is defined at u64::MAX.
-    assert_eq!(u64::MAX.wrapping_add(1), 0);
+    // Start 0 keeps the user's seed; later starts hash (base, k).
+    assert_eq!(per_start_seed(base, 0), base);
+    assert_eq!(per_start_seed(base, 3), crate::rng::stream_seed(base, &[3]));
+    // All starts under one base get distinct seeds, including at u64::MAX.
+    for b in [base, u64::MAX] {
+        let seeds: std::collections::HashSet<u64> = (0..8).map(|k| per_start_seed(b, k)).collect();
+        assert_eq!(seeds.len(), 8);
+    }
+    // #3021: start k under seed s must not replay start k - 1 under seed s + 1.
+    for k in 2..8 {
+        assert_ne!(per_start_seed(base, k), per_start_seed(base + 1, k - 1));
+    }
+}
+
+/// Starts k > 0 get their own SAEM and Bayes streams when the chain runs that sampler
+/// (#3021), keep the user's seed otherwise (so a result never reports a seed nothing
+/// used), and always keep the IS seeds, so every start's IS-evaluated OFV is scored on
+/// common draws.
+#[test]
+fn per_start_options_reseed_the_samplers_the_chain_runs_and_share_the_is_seeds() {
+    use super::{per_start_options, per_start_seed};
+    use crate::estimation::bayes::BAYES_DEFAULT_SEED;
+    use crate::estimation::saem::SAEM_DEFAULT_SEED;
+    use crate::types::EstimationMethod;
+    let sampled = FitOptions {
+        methods: vec![EstimationMethod::Saem, EstimationMethod::Bayes],
+        saem_seed: Some(7),
+        bayes_seed: None,
+        imp_seed: Some(5),
+        impmap_seed: None,
+        global_search: true,
+        ..FitOptions::default()
+    };
+    for k in 1..6 {
+        let o = per_start_options(&sampled, k);
+        // Set seed: hashed from it. Unset: hashed from the sampler's own default.
+        assert_eq!(o.saem_seed, Some(per_start_seed(7, k)));
+        assert_eq!(o.bayes_seed, Some(per_start_seed(BAYES_DEFAULT_SEED, k)));
+        // Start k never replays start 0's stream.
+        assert_ne!(o.saem_seed, Some(7));
+        assert_ne!(o.bayes_seed, Some(BAYES_DEFAULT_SEED));
+        // The IS seeds are the user's, unchanged.
+        assert_eq!(o.imp_seed, Some(5));
+        assert_eq!(o.impmap_seed, None);
+        assert!(!o.global_search);
+    }
+    let seeds: std::collections::HashSet<_> =
+        (1..6).map(|k| per_start_options(&sampled, k).saem_seed).collect();
+    assert_eq!(seeds.len(), 5, "every start gets its own SAEM seed");
+
+    // `methods` empty: `method` is the chain. SAEM alone re-seeds SAEM from its default.
+    let saem_only = FitOptions {
+        method: EstimationMethod::Saem,
+        methods: Vec::new(),
+        saem_seed: None,
+        bayes_seed: Some(3),
+        ..FitOptions::default()
+    };
+    let o = per_start_options(&saem_only, 2);
+    assert_eq!(o.saem_seed, Some(per_start_seed(SAEM_DEFAULT_SEED, 2)));
+    assert_eq!(o.bayes_seed, Some(3), "no Bayes stage: the user's seed is kept");
+
+    // A FOCEI chain runs neither sampler, so nothing is derived.
+    let focei = FitOptions {
+        method: EstimationMethod::FoceI,
+        methods: Vec::new(),
+        saem_seed: None,
+        bayes_seed: None,
+        ..FitOptions::default()
+    };
+    let o = per_start_options(&focei, 3);
+    assert_eq!((o.saem_seed, o.bayes_seed), (None, None));
 }
 
 // ── #2867: the per-start records ───────────────────────────────────────────────────────
@@ -181,24 +233,14 @@ fn select_start_records_every_start_and_picks_what_the_ranking_picks() {
     assert_eq!(winner.theta, vec![3.0]);
     assert_eq!(failed, vec!["start 1: start refused".to_string()]);
 
-    assert_eq!(
-        starts.iter().map(|s| s.start).collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4, 5]
-    );
-    let selected: Vec<usize> = starts
-        .iter()
-        .filter(|s| s.selected)
-        .map(|s| s.start)
-        .collect();
+    assert_eq!(starts.iter().map(|s| s.start).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+    let selected: Vec<usize> = starts.iter().filter(|s| s.selected).map(|s| s.start).collect();
     assert_eq!(selected, vec![3]);
     assert_eq!(starts[3].ofv, Some(winner.ofv));
     assert_eq!(starts[3].theta, winner.theta);
     assert_eq!(starts[3].status.as_deref(), Some("converged"));
     assert!(starts[3].status_reasons.is_empty());
-    assert_eq!(
-        (starts[3].n_iterations, starts[3].wall_time_secs),
-        (7, 0.25)
-    );
+    assert_eq!((starts[3].n_iterations, starts[3].wall_time_secs), (7, 0.25));
     assert_eq!(starts[2].status.as_deref(), Some("not_converged"));
     assert!(!starts[2].converged);
     // Start 0's critical warning is a plain string on its result, with nothing in
@@ -226,11 +268,8 @@ fn a_failed_start_keeps_its_message_and_code() {
     let coded = EngineError::from_diagnostic(Diagnostic::error("E_AGQ_NODES_ZERO", "no nodes"));
     assert_eq!(coded.code(), Some("E_AGQ_NODES_ZERO"), "premise");
     let text = coded.to_string();
-    let (best, _, starts) = select_start(
-        vec![(0, Err(coded)), (1, Ok(start_fit(5.0, true, 1.0)))],
-        |r| r.ofv,
-        false,
-    );
+    let (best, _, starts) =
+        select_start(vec![(0, Err(coded)), (1, Ok(start_fit(5.0, true, 1.0)))], |r| r.ofv, false);
     assert_eq!(best.map(|b| b.0), Some(1));
     assert_eq!(
         starts[0],
@@ -253,11 +292,8 @@ fn a_failed_start_keeps_its_message_and_code() {
     assert!(starts[1].selected);
     // An uncoded failure has the message and no code; with no start that ran, none is
     // selected.
-    let (best, _, starts) = select_start(
-        vec![(0, Err(EngineError::uncoded("boom")))],
-        |r| r.ofv,
-        false,
-    );
+    let (best, _, starts) =
+        select_start(vec![(0, Err(EngineError::uncoded("boom")))], |r| r.ofv, false);
     assert!(best.is_none());
     assert_eq!(starts[0].error.as_deref(), Some("boom"));
     assert_eq!(starts[0].error_code, None);
@@ -268,12 +304,8 @@ fn a_failed_start_keeps_its_message_and_code() {
 /// lowest *ranked* start: start 0 has the higher OFV and the lower penalized objective.
 #[test]
 fn select_start_records_the_ranked_objective_under_a_penalty() {
-    let results = || {
-        vec![
-            (0, Ok(start_fit(-100.0, true, 0.5))),
-            (1, Ok(start_fit(-105.0, true, 4.0))),
-        ]
-    };
+    let results =
+        || vec![(0, Ok(start_fit(-100.0, true, 0.5))), (1, Ok(start_fit(-105.0, true, 4.0)))];
     // penalty = theta², so start 1 pays 16 for its 5 OFV.
     let rank = |r: &FitResult| r.ofv + r.theta[0] * r.theta[0];
     let (best, _, starts) = select_start(results(), rank, true);
@@ -373,22 +405,13 @@ fn multi_start_yaml_block_lists_the_summary_and_every_start() {
     fit.starts[0].penalized = true;
     fit.starts[1].error_code = Some("E_X".into());
     let yaml = multi_start_yaml(&fit).unwrap();
-    assert!(
-        yaml.contains("{start: 0, ofv: 12.000000, objective: null, converged: true"),
-        "{yaml}"
-    );
-    assert!(
-        yaml.contains("{start: 2, ofv: 10.000000, converged: false"),
-        "{yaml}"
-    );
+    assert!(yaml.contains("{start: 0, ofv: 12.000000, objective: null, converged: true"), "{yaml}");
+    assert!(yaml.contains("{start: 2, ofv: 10.000000, converged: false"), "{yaml}");
     assert!(yaml.contains("  compared: penalized_objective\n"), "{yaml}");
     assert!(yaml.contains("  best: 13.500000\n"), "{yaml}");
     assert!(
         yaml.contains("{start: 3, ofv: 11.000000, objective: 13.500000, converged: true"),
         "{yaml}"
     );
-    assert!(
-        yaml.contains("error: \"start refused\", error_code: \"E_X\"}"),
-        "{yaml}"
-    );
+    assert!(yaml.contains("error: \"start refused\", error_code: \"E_X\"}"), "{yaml}");
 }

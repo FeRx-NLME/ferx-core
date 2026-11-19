@@ -56,9 +56,7 @@ fn warfarin_population() -> Population {
 /// `fit()` at the model's own declared initial estimates — which is what a
 /// `.ferx` file means and what every test here wants.
 fn fit_model(
-    model: &ferx_core::types::CompiledModel,
-    pop: &Population,
-    opts: &FitOptions,
+    model: &ferx_core::types::CompiledModel, pop: &Population, opts: &FitOptions,
 ) -> Result<ferx_core::types::FitResult, String> {
     fit(model, pop, &model.default_params, opts).map_err(|e| e.to_string())
 }
@@ -71,10 +69,7 @@ fn fit_model(
 /// #1212). Setting it in both places would let a test pass on the default while
 /// reading as though it had pinned a method.
 fn short_fit_options(method: EstimationMethod) -> FitOptions {
-    let mut opts = FitOptions {
-        method,
-        ..FitOptions::default()
-    };
+    let mut opts = FitOptions { method, ..FitOptions::default() };
     opts.outer_maxiter = 2;
     opts.run_covariance_step = false;
     opts
@@ -173,19 +168,13 @@ fn every_prior_applying_optimizer_carries_the_penalty() {
             o
         }),
         ("gn", short_fit_options(EstimationMethod::FoceGn)),
-        (
-            "gn_hybrid",
-            short_fit_options(EstimationMethod::FoceGnHybrid),
-        ),
+        ("gn_hybrid", short_fit_options(EstimationMethod::FoceGnHybrid)),
     ];
 
     for (label, opts) in cases {
         let r = fit_model(&model, &pop, &opts)
             .unwrap_or_else(|e| panic!("{label} must accept a prior: {e}"));
-        assert!(
-            r.ofv_prior > 0.0,
-            "{label}: the prior half must be reported"
-        );
+        assert!(r.ofv_prior > 0.0, "{label}: the prior half must be reported");
         assert!(
             (r.ofv - (r.ofv_data + r.ofv_prior)).abs() < 1e-9,
             "{label}: ofv {} != ofv_data {} + ofv_prior {}",
@@ -204,10 +193,9 @@ fn every_prior_applying_optimizer_carries_the_penalty() {
     let unpriored = warfarin_with(BASE_PARAMS);
     let mut bfgs = short_focei();
     bfgs.optimizer = ferx_core::types::Optimizer::Bfgs;
-    for (label, opts) in [
-        ("builtin bfgs", bfgs),
-        ("gn", short_fit_options(EstimationMethod::FoceGn)),
-    ] {
+    for (label, opts) in
+        [("builtin bfgs", bfgs), ("gn", short_fit_options(EstimationMethod::FoceGn))]
+    {
         let r = fit_model(&unpriored, &pop, &opts)
             .unwrap_or_else(|e| panic!("{label} unpriored must fit: {e}"));
         assert_eq!(r.ofv_prior, 0.0, "{label}");
@@ -227,11 +215,7 @@ fn a_chain_ending_in_focei_accepts_a_prior() {
     opts.saem_n_convergence = 1;
 
     let r = fit_model(&model, &warfarin_population(), &opts);
-    assert!(
-        r.is_ok(),
-        "a chain ending in focei must be accepted: {:?}",
-        r.err()
-    );
+    assert!(r.is_ok(), "a chain ending in focei must be accepted: {:?}", r.err());
 
     // The straddle: reverse the chain so the *last* stage is the one that
     // cannot apply priors, and it must be refused. Without this the test would
@@ -257,16 +241,12 @@ fn a_priored_fit_splits_the_objective_and_keeps_the_ics_on_the_data_half() {
     let r = fit_model(&model, &warfarin_population(), &short_focei())
         .expect("short priored fit should run");
 
-    assert!(
-        r.ofv_prior > 0.0,
-        "the prior must contribute to the objective; got {}",
-        r.ofv_prior
-    );
+    assert!(r.ofv_prior > 0.0, "the prior must contribute to the objective; got {}", r.ofv_prior);
     assert!((r.ofv - (r.ofv_data + r.ofv_prior)).abs() < 1e-9);
     // AIC/BIC are computed from the data half: a penalized objective is not a
     // log-likelihood, and an IC built from one would reward a tighter prior.
-    assert!((r.aic - (r.ofv_data + 2.0 * r.n_parameters as f64)).abs() < 1e-9);
-    assert!(r.aic < r.ofv + 2.0 * r.n_parameters as f64);
+    assert!((r.aic.unwrap() - (r.ofv_data + 2.0 * r.n_parameters as f64)).abs() < 1e-9);
+    assert!(r.aic.unwrap() < r.ofv + 2.0 * r.n_parameters as f64);
 
     // The per-parameter report reconciles with the total, or the split shown to
     // the user does not add up to the number next to it.
@@ -301,18 +281,10 @@ fn an_unpriored_fit_reports_a_zero_prior_half() {
 #[test]
 fn moving_the_prior_moves_the_objective() {
     let pop = warfarin_population();
-    let near = fit_model(
-        &warfarin_with(&params_with_cl_prior(0.13, 25.0)),
-        &pop,
-        &short_focei(),
-    )
-    .expect("near-prior fit should run");
-    let far = fit_model(
-        &warfarin_with(&params_with_cl_prior(0.50, 25.0)),
-        &pop,
-        &short_focei(),
-    )
-    .expect("far-prior fit should run");
+    let near = fit_model(&warfarin_with(&params_with_cl_prior(0.13, 25.0)), &pop, &short_focei())
+        .expect("near-prior fit should run");
+    let far = fit_model(&warfarin_with(&params_with_cl_prior(0.50, 25.0)), &pop, &short_focei())
+        .expect("far-prior fit should run");
 
     // The start is TVCL = 0.13, so the near prior sits on it and the far one is
     // ~4× away: the penalties must differ by a lot, and in the right direction.
@@ -340,18 +312,10 @@ fn moving_the_prior_moves_the_objective() {
 fn a_prior_moves_the_estimates_and_not_only_the_report() {
     let pop = warfarin_population();
     // Start is TVCL = 0.13. RSE 1% makes each prior far stronger than the data.
-    let low = fit_model(
-        &warfarin_with(&params_with_cl_prior(0.065, 1.0)),
-        &pop,
-        &short_focei(),
-    )
-    .expect("low-prior fit should run");
-    let high = fit_model(
-        &warfarin_with(&params_with_cl_prior(0.26, 1.0)),
-        &pop,
-        &short_focei(),
-    )
-    .expect("high-prior fit should run");
+    let low = fit_model(&warfarin_with(&params_with_cl_prior(0.065, 1.0)), &pop, &short_focei())
+        .expect("low-prior fit should run");
+    let high = fit_model(&warfarin_with(&params_with_cl_prior(0.26, 1.0)), &pop, &short_focei())
+        .expect("high-prior fit should run");
 
     let i = low.theta_names.iter().position(|n| n == "TVCL").unwrap();
     let (cl_low, cl_high) = (low.theta[i], high.theta[i]);
@@ -477,12 +441,8 @@ fn an_imported_prior_moves_the_estimates() {
 fn an_imported_prior_reports_the_source_estimate_on_the_declared_scale() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_source_fit(dir.path(), 0.13);
-    let fit = fit_model(
-        &warfarin_from_fit(&path),
-        &warfarin_population(),
-        &short_focei(),
-    )
-    .expect("fit should run");
+    let fit = fit_model(&warfarin_from_fit(&path), &warfarin_population(), &short_focei())
+        .expect("fit should run");
 
     let centre = |name: &str| {
         fit.prior_summary
@@ -493,17 +453,9 @@ fn an_imported_prior_reports_the_source_estimate_on_the_declared_scale() {
     };
     assert!((centre("TVCL") - 0.13).abs() < 1e-9);
     assert!((centre("TVV") - 8.0).abs() < 1e-9);
-    assert!(
-        (centre("ETA_CL") - 0.09).abs() < 1e-9,
-        "{}",
-        centre("ETA_CL")
-    );
+    assert!((centre("ETA_CL") - 0.09).abs() < 1e-9, "{}", centre("ETA_CL"));
     // σ: the source's SD of 0.1, squared onto the declared variance scale.
-    assert!(
-        (centre("PROP_ERR") - 0.01).abs() < 1e-9,
-        "{}",
-        centre("PROP_ERR")
-    );
+    assert!((centre("PROP_ERR") - 0.01).abs() < 1e-9, "{}", centre("PROP_ERR"));
 }
 
 /// A relative `from_fit` resolves against the model file, end to end through
@@ -556,11 +508,8 @@ fn a_relative_from_fit_works_end_to_end_from_a_model_file() {
 fn a_from_fit_that_lands_nothing_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unrelated-fit.yaml");
-    std::fs::write(
-        &path,
-        "theta:\n  SOMETHING_ELSE:\n    estimate: 1.000000\n    se: 0.100000\n",
-    )
-    .unwrap();
+    std::fs::write(&path, "theta:\n  SOMETHING_ELSE:\n    estimate: 1.000000\n    se: 0.100000\n")
+        .unwrap();
     let err = parse_model_string(&warfarin_from_fit_src(&path))
         .map(|_| ())
         .expect_err("an import that lands nothing must be refused");
@@ -669,10 +618,7 @@ fn the_update_example_names_a_file_the_documented_commands_produce() {
     let model =
         ferx_core::parser::model_parser::parse_model_file(&dir.path().join("warfarin_update.ferx"))
             .expect("the example must parse with its parent fit beside it");
-    assert!(
-        !model.priors.is_empty(),
-        "the example's from_fit resolved but imported nothing"
-    );
+    assert!(!model.priors.is_empty(), "the example's from_fit resolved but imported nothing");
 }
 
 /// Parameters the import skipped are reported in `warnings`.
@@ -693,18 +639,12 @@ fn skipped_imports_are_reported_in_the_warnings() {
         ),
     )
     .unwrap();
-    let fit = fit_model(
-        &warfarin_from_fit(&path),
-        &warfarin_population(),
-        &short_focei(),
-    )
-    .expect("the remaining five imports must still land");
+    let fit = fit_model(&warfarin_from_fit(&path), &warfarin_population(), &short_focei())
+        .expect("the remaining five imports must still land");
 
     assert_eq!(fit.prior_summary.len(), 5, "{:?}", fit.prior_summary);
     assert!(
-        fit.warnings
-            .iter()
-            .any(|w| w.contains("from_fit") && w.contains("TVKA")),
+        fit.warnings.iter().any(|w| w.contains("from_fit") && w.contains("TVKA")),
         "{:?}",
         fit.warnings
     );
@@ -720,10 +660,7 @@ fn skipped_imports_are_reported_in_the_warnings() {
 /// shrunk estimate could be chance. They only test anything as a pair, with a
 /// stated minimum shift on the strong side.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_weak_prior_reproduces_the_mle_and_a_strong_one_shrinks_toward_it() {
     let pop = warfarin_population();
     let mut opts = FitOptions::default();
@@ -739,21 +676,13 @@ fn a_weak_prior_reproduces_the_mle_and_a_strong_one_shrinks_toward_it() {
 
     // RSE 10000% → a log-scale SD of ~4.8, i.e. a 95% interval spanning eight
     // orders of magnitude. Flat enough to be no prior at all.
-    let weak = fit_model(
-        &warfarin_with(&params_with_cl_prior(prior_at, 10000.0)),
-        &pop,
-        &opts,
-    )
-    .expect("weak-prior fit");
+    let weak = fit_model(&warfarin_with(&params_with_cl_prior(prior_at, 10000.0)), &pop, &opts)
+        .expect("weak-prior fit");
     let cl_weak = weak.theta[i];
 
     // RSE 1% → a log-scale SD of 0.01, which pins TVCL to the prior.
-    let strong = fit_model(
-        &warfarin_with(&params_with_cl_prior(prior_at, 1.0)),
-        &pop,
-        &opts,
-    )
-    .expect("strong-prior fit");
+    let strong = fit_model(&warfarin_with(&params_with_cl_prior(prior_at, 1.0)), &pop, &opts)
+        .expect("strong-prior fit");
     let cl_strong = strong.theta[i];
 
     assert!(
@@ -787,27 +716,16 @@ fn a_weak_prior_reproduces_the_mle_and_a_strong_one_shrinks_toward_it() {
 /// the specific failure that makes MAP SEs meaningless, and the one the
 /// covariance step's own `add_hessian` call is the only thing preventing.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_tight_prior_tightens_the_reported_standard_error() {
     let pop = warfarin_population();
     let mut opts = FitOptions::default();
     opts.run_covariance_step = true;
 
-    let loose = fit_model(
-        &warfarin_with(&params_with_cl_prior(0.13, 200.0)),
-        &pop,
-        &opts,
-    )
-    .expect("loose-prior fit");
-    let tight = fit_model(
-        &warfarin_with(&params_with_cl_prior(0.13, 2.0)),
-        &pop,
-        &opts,
-    )
-    .expect("tight-prior fit");
+    let loose = fit_model(&warfarin_with(&params_with_cl_prior(0.13, 200.0)), &pop, &opts)
+        .expect("loose-prior fit");
+    let tight = fit_model(&warfarin_with(&params_with_cl_prior(0.13, 2.0)), &pop, &opts)
+        .expect("tight-prior fit");
 
     let i = loose.theta_names.iter().position(|n| n == "TVCL").unwrap();
     let se_loose = loose.se_theta.as_ref().expect("loose SEs")[i];
@@ -817,10 +735,7 @@ fn a_tight_prior_tightens_the_reported_standard_error() {
     // natural scale the prior alone would give SE ≈ 0.02·TVCL. The penalized SE
     // must be at or below that — the data can only add information.
     let cl = tight.theta[i];
-    assert!(
-        se_tight < 0.021 * cl,
-        "a 2% prior must pin the SE: got {se_tight} at TVCL = {cl}"
-    );
+    assert!(se_tight < 0.021 * cl, "a 2% prior must pin the SE: got {se_tight} at TVCL = {cl}");
     // And it must be a *change*, not just a small number. Measured on this
     // fixture: SE 7.959e-3 at RSE 200% falls to 2.486e-3 at RSE 2%, a ratio of
     // 0.312. The bound is set at 0.5 — loose enough to survive optimizer noise
@@ -871,10 +786,7 @@ fn the_prior_method_gate_looks_past_evaluation_only_stages() {
         r.err()
     );
     let r = r.unwrap();
-    assert!(
-        r.ofv_prior > 0.0,
-        "the prior must still be in the objective"
-    );
+    assert!(r.ofv_prior > 0.0, "the prior must still be in the objective");
 }
 
 /// **Finding 2.** A priored fit must survive a `.fitrx` round trip.
@@ -905,12 +817,11 @@ fn a_priored_fit_round_trips_through_fitrx() {
     assert_eq!(loaded.ofv, saved.ofv);
     assert_eq!(loaded.ofv_data, saved.ofv_data);
     assert_eq!(loaded.ofv_prior, saved.ofv_prior);
-    assert_ne!(
-        loaded.ofv_data, loaded.ofv,
-        "ofv_data must not be the penalized total"
-    );
+    assert_ne!(loaded.ofv_data, loaded.ofv, "ofv_data must not be the penalized total");
     // The invariant `aic` was computed under survives the trip.
-    assert!((loaded.aic - (loaded.ofv_data + 2.0 * loaded.n_parameters as f64)).abs() < 1e-9);
+    assert!(
+        (loaded.aic.unwrap() - (loaded.ofv_data + 2.0 * loaded.n_parameters as f64)).abs() < 1e-9
+    );
     // And the per-parameter rows survive.
     assert_eq!(loaded.prior_summary.len(), saved.prior_summary.len());
     assert_eq!(loaded.prior_summary[0].name, "TVCL");
@@ -979,10 +890,7 @@ fn a_prior_with_an_s_based_covariance_is_refused() {
             "the message must name the rejected method: {err}"
         );
         // The suggestion must not send the user to the other broken estimator.
-        assert!(
-            !err.contains("`rsr`"),
-            "`rsr` is rejected too and must not be recommended: {err}"
-        );
+        assert!(!err.contains("`rsr`"), "`rsr` is rejected too and must not be recommended: {err}");
 
         // And an unpriored fit may still use it, so the rejection is about the
         // prior and not about the method.
@@ -995,12 +903,7 @@ fn a_prior_with_an_s_based_covariance_is_refused() {
 
     // The straddle: the same model with the default `r` is accepted, so the gate
     // rejects the estimator rather than every priored covariance step.
-    assert!(fit_model(
-        &model,
-        &pop,
-        &with_cov(ferx_core::types::CovarianceMethod::Hessian)
-    )
-    .is_ok());
+    assert!(fit_model(&model, &pop, &with_cov(ferx_core::types::CovarianceMethod::Hessian)).is_ok());
 }
 
 /// **Finding 3.** SIR must resample against the *penalized* objective.
@@ -1031,10 +934,7 @@ fn a_prior_with_an_s_based_covariance_is_refused() {
 /// At 10% the point estimate is identical either way (0.156190 — the *fit* is
 /// unaffected, only the resampling is), so anything that moves is the weights.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn sir_intervals_respect_the_prior() {
     let pop = warfarin_population();
     let mut opts = FitOptions::default();
@@ -1053,12 +953,8 @@ fn sir_intervals_respect_the_prior() {
     let cl_mle = mle.theta[i];
     let prior_at = cl_mle * 1.5;
 
-    let r = fit_model(
-        &warfarin_with(&params_with_cl_prior(prior_at, 10.0)),
-        &pop,
-        &opts,
-    )
-    .expect("priored SIR fit");
+    let r = fit_model(&warfarin_with(&params_with_cl_prior(prior_at, 10.0)), &pop, &opts)
+        .expect("priored SIR fit");
     assert!(r.ofv_prior > 0.0, "the fixture must actually carry a prior");
 
     let ci = r.sir_ci_theta.as_ref().expect("SIR theta CIs")[i];
@@ -1134,10 +1030,7 @@ fn sir_intervals_respect_the_prior() {
 #[test]
 fn the_prior_penalty_matches_nonmem_nwpri() {
     let pop = warfarin_population();
-    let mut opts = FitOptions {
-        method: EstimationMethod::FoceI,
-        ..FitOptions::default()
-    };
+    let mut opts = FitOptions { method: EstimationMethod::FoceI, ..FitOptions::default() };
     opts.outer_maxiter = 0;
     opts.run_covariance_step = false;
 
@@ -1219,10 +1112,7 @@ fn the_prior_penalty_matches_nonmem_nwpri() {
 /// test: the likelihood and the prior are then maximised in the same place and
 /// an engine that ignores priors entirely passes.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_sparse_fit_can_be_updated_from_a_parent_runs_written_estimates() {
     let full = warfarin_population();
     let mut parent_opts = FitOptions::default();
@@ -1302,10 +1192,8 @@ fn a_sparse_fit_can_be_updated_from_a_parent_runs_written_estimates() {
     // update back toward the parent.
     for name in drifted {
         let i = idx(name);
-        let (d_child, d_control) = (
-            rel(child.theta[i], parent.theta[i]),
-            rel(control.theta[i], parent.theta[i]),
-        );
+        let (d_child, d_control) =
+            (rel(child.theta[i], parent.theta[i]), rel(control.theta[i], parent.theta[i]));
         assert!(
             // Measured: TVCL child 5.2% vs control 36.5% off the parent, TVV
             // 5.0% vs 38.0% — a factor of ~7 either way. The bound asks only for

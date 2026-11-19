@@ -51,10 +51,7 @@ fn quiet(method: EstimationMethod) -> FitOptions {
 
 /// The caller of every claim: `FitOptions::default()`, quietened (`verbose` is not recorded).
 fn defaults() -> FitOptions {
-    FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    }
+    FitOptions { verbose: false, ..FitOptions::default() }
 }
 
 fn bits(fit: &FitResult, what: &str) -> Vec<u64> {
@@ -62,10 +59,7 @@ fn bits(fit: &FitResult, what: &str) -> Vec<u64> {
         .covariance_matrix
         .as_ref()
         .unwrap_or_else(|| panic!("{what}: covariance step produced no matrix"));
-    assert!(
-        cov.iter().all(|x| x.is_finite()),
-        "{what}: non-finite covariance"
-    );
+    assert!(cov.iter().all(|x| x.is_finite()), "{what}: non-finite covariance");
     cov.iter().map(|x| x.to_bits()).collect()
 }
 
@@ -75,10 +69,8 @@ struct Fixture(&'static str, &'static str);
 const WARFARIN: Fixture = Fixture("examples/warfarin.ferx", "data/warfarin.csv");
 /// Integrated, not solved exactly: the rows below observe the integrator's settings, which a
 /// linear `[odes]` model no longer reads (#852). See the fixture's header.
-const WARFARIN_ODE: Fixture = Fixture(
-    "tests/fixtures/warfarin_ode_integrated.ferx",
-    "data/warfarin.csv",
-);
+const WARFARIN_ODE: Fixture =
+    Fixture("tests/fixtures/warfarin_ode_integrated.ferx", "data/warfarin.csv");
 const WARFARIN_IOV: Fixture = Fixture("examples/warfarin_iov.ferx", "data/warfarin_iov.csv");
 
 struct Fitted {
@@ -98,15 +90,8 @@ impl Fitted {
             "{what}: the engine this file names moved: {}",
             fit.gradient_method_inner
         );
-        assert!(
-            fit.scoring_settings.is_some(),
-            "{what}: fit() recorded nothing"
-        );
-        Fitted {
-            model,
-            population,
-            fit,
-        }
+        assert!(fit.scoring_settings.is_some(), "{what}: fit() recorded nothing");
+        Fitted { model, population, fit }
     }
 
     fn cov(&self, fit: &FitResult, options: &FitOptions, what: &str) -> Vec<u64> {
@@ -144,10 +129,7 @@ macro_rules! field_row {
         #[test]
         fn $name() {
             let base: FitOptions = $base;
-            let with = FitOptions {
-                $field: $value,
-                ..base.clone()
-            };
+            let with = FitOptions { $field: $value, ..base.clone() };
             row(stringify!($field), $fixture, with, base);
         }
     };
@@ -187,56 +169,21 @@ field_row!(
     quiet(EstimationMethod::FoceI),
     inner_optimizer = InnerOptimizer::NelderMead
 );
-field_row!(
-    inner_maxiter,
-    WARFARIN,
-    quiet(EstimationMethod::FoceI),
-    inner_maxiter = 3
-);
-field_row!(
-    ebe_warm_start,
-    WARFARIN,
-    failing_inner(),
-    ebe_warm_start = true
-);
+field_row!(inner_maxiter, WARFARIN, quiet(EstimationMethod::FoceI), inner_maxiter = 3);
+field_row!(ebe_warm_start, WARFARIN, failing_inner(), ebe_warm_start = true);
 // The non-IOV EBE solve ignores the μ shift; the IOV solve optimises in ψ = η + μ.
-field_row!(
-    mu_referencing,
-    WARFARIN_IOV,
-    quiet(EstimationMethod::FoceI),
-    mu_referencing = false
-);
+field_row!(mu_referencing, WARFARIN_IOV, quiet(EstimationMethod::FoceI), mu_referencing = false);
 field_row!(n_agq, WARFARIN, quiet(EstimationMethod::Laplace), n_agq = 3);
-field_row!(
-    ode_reltol,
-    WARFARIN_ODE,
-    quiet(EstimationMethod::FoceI),
-    ode_reltol = 1e-7
-);
-field_row!(
-    ode_abstol,
-    WARFARIN_ODE,
-    quiet(EstimationMethod::FoceI),
-    ode_abstol = 1e-10
-);
-field_row!(
-    ode_max_steps,
-    WARFARIN_ODE,
-    quiet(EstimationMethod::FoceI),
-    ode_max_steps = 60
-);
+field_row!(ode_reltol, WARFARIN_ODE, quiet(EstimationMethod::FoceI), ode_reltol = 1e-7);
+field_row!(ode_abstol, WARFARIN_ODE, quiet(EstimationMethod::FoceI), ode_abstol = 1e-10);
+field_row!(ode_max_steps, WARFARIN_ODE, quiet(EstimationMethod::FoceI), ode_max_steps = 60);
 field_row!(
     ode_method,
     WARFARIN_ODE,
     quiet(EstimationMethod::FoceI),
     ode_method = ferx_core::ode::OdeMethod::Rodas5P
 );
-field_row!(
-    ode_auto_switch,
-    WARFARIN_ODE,
-    quiet(EstimationMethod::FoceI),
-    ode_auto_switch = false
-);
+field_row!(ode_auto_switch, WARFARIN_ODE, quiet(EstimationMethod::FoceI), ode_auto_switch = false);
 
 /// `inner_tol`, on a two-stage chain, unset by the caller: the Laplace stage tightens its own
 /// `inner_tol` to 1e-8, so the record must come from that stage's options, not the
@@ -258,10 +205,7 @@ field_row!(
 /// still moves the bits.
 #[test]
 fn inner_tol() {
-    let fd = |o: FitOptions| FitOptions {
-        analytic_cov_hessian: false,
-        ..o
-    };
+    let fd = |o: FitOptions| FitOptions { analytic_cov_hessian: false, ..o };
     let with = fd(FitOptions {
         methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
         ..quiet(EstimationMethod::FoceI)
@@ -311,10 +255,7 @@ fn inner_tol_ignores_a_trailing_evaluator() {
         "{what}: the record is the estimating FOCEI stage's, not the Laplace readout's"
     );
     let inline = bits(&f.fit, what);
-    let readout = FitOptions {
-        inner_tol: 1e-8,
-        ..defaults()
-    };
+    let readout = FitOptions { inner_tol: 1e-8, ..defaults() };
     assert!(
         f.cov(&f.unrecorded(), &readout, what) != inline,
         "{what}: premise — the readout's inner_tol must move the covariance"
@@ -340,10 +281,7 @@ fn a_callers_non_default_setting_wins_over_the_record() {
     };
     let f = Fitted::new(&WARFARIN, &with, "T10");
     let inline = bits(&f.fit, "T10");
-    let bfgs = FitOptions {
-        inner_optimizer: InnerOptimizer::Bfgs,
-        ..defaults()
-    };
+    let bfgs = FitOptions { inner_optimizer: InnerOptimizer::Bfgs, ..defaults() };
     let caller_wins = f.cov(&f.fit, &bfgs, "T10 bfgs");
     assert!(
         caller_wins == f.cov(&f.unrecorded(), &bfgs, "T10 bfgs, unrecorded"),
@@ -353,10 +291,7 @@ fn a_callers_non_default_setting_wins_over_the_record() {
         caller_wins != inline,
         "T10: premise — bfgs must move the covariance away from the nelder_mead fit's"
     );
-    let auto = FitOptions {
-        inner_optimizer: InnerOptimizer::Auto,
-        ..defaults()
-    };
+    let auto = FitOptions { inner_optimizer: InnerOptimizer::Auto, ..defaults() };
     assert!(
         f.cov(&f.fit, &auto, "T10 auto") == inline,
         "T10: a default caller value must yield to the record"
@@ -366,15 +301,11 @@ fn a_callers_non_default_setting_wins_over_the_record() {
 /// Every SIR output a `run_sir` must repeat: the ESS and each θ/Ω/σ interval, as bits.
 /// `is_finite` first, so a `NaN` ESS cannot match a `NaN` ESS.
 fn sir_bits(fit: &FitResult, what: &str) -> Vec<u64> {
-    let ess = fit
-        .sir_ess
-        .unwrap_or_else(|| panic!("{what}: SIR produced no ESS"));
+    let ess = fit.sir_ess.unwrap_or_else(|| panic!("{what}: SIR produced no ESS"));
     assert!(ess.is_finite(), "{what}: ESS {ess}");
     let mut out = vec![ess.to_bits()];
     for ci in [&fit.sir_ci_theta, &fit.sir_ci_omega, &fit.sir_ci_sigma] {
-        let ci = ci
-            .as_ref()
-            .unwrap_or_else(|| panic!("{what}: SIR produced no interval"));
+        let ci = ci.as_ref().unwrap_or_else(|| panic!("{what}: SIR produced no interval"));
         for (lo, hi) in ci {
             assert!(lo.is_finite() && hi.is_finite(), "{what}: CI ({lo}, {hi})");
             out.extend([lo.to_bits(), hi.to_bits()]);
@@ -402,13 +333,7 @@ impl Fitted {
 }
 
 fn with_sir(base: FitOptions) -> FitOptions {
-    FitOptions {
-        sir: true,
-        sir_samples: 200,
-        sir_resamples: 100,
-        sir_seed: Some(7),
-        ..base
-    }
+    FitOptions { sir: true, sir_samples: 200, sir_resamples: 100, sir_seed: Some(7), ..base }
 }
 
 /// #1806 T1 / T2: the in-fit SIR scores under the record of the stage that produced the
@@ -432,10 +357,7 @@ fn sir_row(row: &str, options: FitOptions, quadrature: bool) {
             "{row}: premise — the quadrature stage must run at a tighter inner_tol than the \
              top-level options"
         );
-        assert_eq!(
-            stage.inner_tol, 1e-8,
-            "{row}: premise — the stage tolerance"
-        );
+        assert_eq!(stage.inner_tol, 1e-8, "{row}: premise — the stage tolerance");
     } else {
         assert_eq!(
             stage.inner_tol, options.inner_tol,
@@ -464,10 +386,7 @@ fn in_fit_sir_scores_under_the_stage_record_laplace() {
 fn in_fit_sir_scores_under_the_stage_record_focei_nagq3() {
     sir_row(
         "focei_nagq3",
-        with_sir(FitOptions {
-            n_agq: 3,
-            ..quiet(EstimationMethod::FoceI)
-        }),
+        with_sir(FitOptions { n_agq: 3, ..quiet(EstimationMethod::FoceI) }),
         true,
     );
 }
@@ -488,10 +407,7 @@ fn in_fit_sir_scores_under_the_stage_record_chain_focei_laplace() {
 fn in_fit_sir_scores_under_the_stage_record_laplace_explicit_tol() {
     sir_row(
         "laplace_explicit_tol",
-        with_sir(FitOptions {
-            inner_tol: 1e-6,
-            ..quiet(EstimationMethod::Laplace)
-        }),
+        with_sir(FitOptions { inner_tol: 1e-6, ..quiet(EstimationMethod::Laplace) }),
         true,
     );
 }
@@ -519,11 +435,7 @@ fn in_fit_sir_scores_under_the_stage_record_saem_focei_control() {
 fn in_fit_sir_on_an_iov_fit_is_repeated_by_run_sir() {
     use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
     let row = "warfarin_iov focei";
-    let f = Fitted::new(
-        &WARFARIN_IOV,
-        &with_sir(quiet(EstimationMethod::FoceI)),
-        row,
-    );
+    let f = Fitted::new(&WARFARIN_IOV, &with_sir(quiet(EstimationMethod::FoceI)), row);
     assert!(
         f.fit.ebe_kappas.iter().flatten().count() > 0,
         "{row}: premise — the fit has κ̂ to start the draws from"
@@ -536,17 +448,9 @@ fn in_fit_sir_on_an_iov_fit_is_repeated_by_run_sir() {
     );
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fit.fitrx");
-    save_fit(
-        &f.fit,
-        &f.population,
-        "model\n",
-        &path,
-        SaveFitOptions::default(),
-    )
-    .unwrap_or_else(|e| panic!("{row}: save_fit: {e}"));
-    let reloaded = load_fit(&path)
-        .unwrap_or_else(|e| panic!("{row}: load_fit: {e}"))
-        .fit;
+    save_fit(&f.fit, &f.population, "model\n", &path, SaveFitOptions::default())
+        .unwrap_or_else(|e| panic!("{row}: save_fit: {e}"));
+    let reloaded = load_fit(&path).unwrap_or_else(|e| panic!("{row}: load_fit: {e}")).fit;
     assert_eq!(
         f.sir(&sir_cleared(&reloaded), &defaults(), row),
         inline,
@@ -561,12 +465,8 @@ fn in_fit_sir_on_an_iov_fit_is_repeated_by_run_sir() {
 /// lands on different bits. Mutation: drop the stage-record fallback in `resolve_sir_options`
 /// → every row's claim dies.
 fn no_sir_record_row(row: &str, fixture: Fixture, base: FitOptions) {
-    let sir_args = FitOptions {
-        sir_samples: 300,
-        sir_resamples: 100,
-        sir_seed: Some(1),
-        ..defaults()
-    };
+    let sir_args =
+        FitOptions { sir_samples: 300, sir_resamples: 100, sir_seed: Some(1), ..defaults() };
     let twin_opts = FitOptions {
         sir: true,
         sir_samples: sir_args.sir_samples,
@@ -595,10 +495,7 @@ fn run_sir_without_a_sir_record_takes_the_stage_record_inner_maxiter() {
     no_sir_record_row(
         "focei_inner_maxiter_5",
         WARFARIN,
-        FitOptions {
-            inner_maxiter: 5,
-            ..quiet(EstimationMethod::FoceI)
-        },
+        FitOptions { inner_maxiter: 5, ..quiet(EstimationMethod::FoceI) },
     );
 }
 

@@ -86,12 +86,8 @@ fn transit_multidose_lag_f_objective_matches_nonmem() {
     );
 
     let model = parse_model_string(&fixed).expect("fixed-param transit lag+F model parses");
-    let pop = read_nonmem_csv(
-        Path::new("data/transit_multidose_lag_f.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .expect("transit_multidose_lag_f data loads");
+    let pop = read_nonmem_csv(Path::new("data/transit_multidose_lag_f.csv"), Some(&["WT"]), None)
+        .expect("transit_multidose_lag_f data loads");
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;

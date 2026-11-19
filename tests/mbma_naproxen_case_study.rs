@@ -143,13 +143,8 @@ fn fit_options() -> FitOptions {
     ignore = "slow convergence fit against a published MBMA case study (#811/#1032): opt in with --features slow-tests"
 )]
 fn mbma_naproxen_reproduces_the_published_analysis() {
-    let model = parse_full_model_file(Path::new(MODEL))
-        .expect("the MBMA example must parse")
-        .model;
-    assert!(
-        model.is_algebraic(),
-        "the point of this test is that the model has no compartments"
-    );
+    let model = parse_full_model_file(Path::new(MODEL)).expect("the MBMA example must parse").model;
+    assert!(model.is_algebraic(), "the point of this test is that the model has no compartments");
     // The whole analysis rests on the residual being fixed: unfix it and the SE
     // weighting silently becomes an ordinary homoscedastic fit.
     assert!(
@@ -159,10 +154,7 @@ fn mbma_naproxen_reproduces_the_published_analysis() {
 
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("MBMA data must load");
     assert_eq!(pop.subjects.len(), 18, "18 trials");
-    assert!(
-        pop.subjects.iter().all(|s| s.doses.is_empty()),
-        "an MBMA dataset has no dose records"
-    );
+    assert!(pop.subjects.iter().all(|s| s.doses.is_empty()), "an MBMA dataset has no dose records");
 
     let result = fit(&model, &pop, &model.default_params, &fit_options())
         .expect("the MBMA fit must converge");
@@ -174,10 +166,7 @@ fn mbma_naproxen_reproduces_the_published_analysis() {
         (emax_trt - PUB_EMAX_TRT).abs() / PUB_EMAX_TRT < 0.01,
         "naproxen effect on Emax: ferx {emax_trt:.4} vs published {PUB_EMAX_TRT:.3}"
     );
-    let se = result
-        .se_theta
-        .as_ref()
-        .expect("covariance step must succeed")[I_B_EMAX_TRT];
+    let se = result.se_theta.as_ref().expect("covariance step must succeed")[I_B_EMAX_TRT];
     assert!(
         (se - PUB_EMAX_TRT_SE).abs() / PUB_EMAX_TRT_SE < 0.10,
         "SE of the naproxen effect: ferx {se:.4} vs published {PUB_EMAX_TRT_SE:.3}"
@@ -214,23 +203,11 @@ fn mbma_naproxen_reproduces_the_published_analysis() {
     let table2 = [
         ("E0 (nonflare)", result.theta[I_TVE0], NM_E0),
         ("ΔE0 (flare)", result.theta[I_B_E0_FLARE], NM_D_E0_FLARE),
-        (
-            "Emax_p (nonflare)",
-            result.theta[I_TVEMAX],
-            NM_EMAX_NONFLARE,
-        ),
-        (
-            "ΔEmax_p (flare)",
-            result.theta[I_B_EMAX_FLARE],
-            NM_D_EMAX_FLARE,
-        ),
+        ("Emax_p (nonflare)", result.theta[I_TVEMAX], NM_EMAX_NONFLARE),
+        ("ΔEmax_p (flare)", result.theta[I_B_EMAX_FLARE], NM_D_EMAX_FLARE),
         ("ΔEmax_n", result.theta[I_B_EMAX_TRT], NM_D_EMAX_NAPROXEN),
         ("ln(ET50_p)", et50_placebo.ln(), NM_LN_ET50_PLACEBO),
-        (
-            "ln(ΔET50_n)",
-            result.theta[I_B_LET50_TRT],
-            NM_LN_D_ET50_NAPROXEN,
-        ),
+        ("ln(ΔET50_n)", result.theta[I_B_LET50_TRT], NM_LN_D_ET50_NAPROXEN),
         ("ET50_p (weeks)", et50_placebo, NM_ET50_PLACEBO),
         ("ET50_n (weeks)", et50_naproxen, NM_ET50_NAPROXEN),
         ("τ1 (ω E0, SD)", omega_e0_sd, NM_TAU1),
@@ -312,20 +289,14 @@ const DUMMY_ODE_MODEL: &str = r"
     ignore = "two slow convergence fits (#811): opt in with --features slow-tests"
 )]
 fn mbma_naproxen_compartment_free_matches_the_dummy_clock_workaround() {
-    let algebraic = parse_full_model_file(Path::new(MODEL))
-        .expect("the MBMA example must parse")
-        .model;
-    let dummy = parse_full_model(DUMMY_ODE_MODEL)
-        .expect("the dummy-clock twin must parse")
-        .model;
+    let algebraic =
+        parse_full_model_file(Path::new(MODEL)).expect("the MBMA example must parse").model;
+    let dummy = parse_full_model(DUMMY_ODE_MODEL).expect("the dummy-clock twin must parse").model;
     assert!(algebraic.is_algebraic() && algebraic.ode_spec.is_none());
     assert!(!dummy.is_algebraic() && dummy.ode_spec.is_some());
 
     let pop = read_nonmem_csv(Path::new(DATA), None, None).expect("MBMA data must load");
-    let opts = FitOptions {
-        run_covariance_step: false,
-        ..fit_options()
-    };
+    let opts = FitOptions { run_covariance_step: false, ..fit_options() };
 
     let a = fit(&algebraic, &pop, &algebraic.default_params, &opts)
         .expect("compartment-free fit must converge");

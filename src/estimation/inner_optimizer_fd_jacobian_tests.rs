@@ -88,11 +88,7 @@ fn chain_population(n: usize) -> Population {
 
 fn eta_of(i: usize) -> [f64; 3] {
     let u = i as f64 + 1.0;
-    [
-        0.5 * (1.7 * u).sin(),
-        0.2 * (2.3 * u).cos(),
-        0.3 * (0.9 * u).sin(),
-    ]
+    [0.5 * (1.7 * u).sin(), 0.2 * (2.3 * u).cos(), 0.3 * (0.9 * u).sin()]
 }
 
 fn kappas_of(i: usize) -> Vec<Vec<f64>> {
@@ -104,10 +100,8 @@ fn kappas_of(i: usize) -> Vec<Vec<f64>> {
 fn worst_gap(h: &DMatrix<f64>, truth: &DMatrix<f64>) -> f64 {
     assert_eq!(h.shape(), truth.shape());
     assert!(h.iter().chain(truth.iter()).all(|v| v.is_finite()));
-    h.iter()
-        .zip(truth.iter())
-        .map(|(a, b)| (a - b).abs() / (1.0 + b.abs()))
-        .fold(0.0, f64::max) // nan-ok: both operands asserted finite above
+    let gaps = h.iter().zip(truth.iter()).map(|(a, b)| (a - b).abs() / (1.0 + b.abs()));
+    gaps.fold(0.0, f64::max) // nan-ok: both operands asserted finite above
 }
 
 /// `log|Ω⁻¹ + HᵀH/σ²|`, the term of the FOCE/FOCEI objective `H` reaches, at this fixture's
@@ -132,9 +126,7 @@ fn oracle_scope() -> crate::ode::solver::OdeSolverOverrideGuard {
 
 /// The rule #2701 replaced: a roundoff-sized step at the fit's tolerance.
 fn roundoff_step_jacobian(
-    n_obs: usize,
-    eta: &[f64],
-    predict: &mut dyn FnMut(&[f64]) -> Vec<f64>,
+    n_obs: usize, eta: &[f64], predict: &mut dyn FnMut(&[f64]) -> Vec<f64>,
 ) -> DMatrix<f64> {
     let mut h = DMatrix::zeros(n_obs, eta.len());
     let mut pert = eta.to_vec();
@@ -279,10 +271,7 @@ fn fd_h_runs_at_the_jacobian_tolerance_and_leaves_the_fits_in_force() {
         let ov = fd_jacobian_ode_override(m).expect("an integrated model");
         (ov.reltol.unwrap(), ov.abstol.unwrap())
     };
-    assert_eq!(
-        tolerances(&default),
-        (ODE_FD_JACOBIAN_RELTOL, ODE_FD_JACOBIAN_ABSTOL)
-    );
+    assert_eq!(tolerances(&default), (ODE_FD_JACOBIAN_RELTOL, ODE_FD_JACOBIAN_ABSTOL));
     assert_eq!(tolerances(&tighter), (1e-10, 1e-12));
 
     let pop = chain_population(1);
@@ -292,14 +281,8 @@ fn fd_h_runs_at_the_jacobian_tolerance_and_leaves_the_fits_in_force() {
     let mut scratch = pk::EventPkParams::default();
     let mut h_of = |m: &CompiledModel| compute_jacobian_fd(m, s, &theta, &eta, &mut scratch, None);
     let (d, p, t) = (h_of(&default), h_of(&pinned), h_of(&tighter));
-    assert_eq!(
-        d, p,
-        "the default model's H must integrate at the pinned values"
-    );
-    assert_ne!(
-        d, t,
-        "a tighter model's H must integrate at its own tolerance"
-    );
+    assert_eq!(d, p, "the default model's H must integrate at the pinned values");
+    assert_ne!(d, t, "a tighter model's H must integrate at its own tolerance");
 
     let after = default.ode_spec.as_ref().unwrap().effective_solver_opts();
     assert_eq!(
@@ -332,10 +315,7 @@ fn fd_jacobian_override_tightens_each_tolerance_and_keeps_the_fits_solver() {
     );
     let looser_abstol_only = pinned_chain(1e-4, 1e-12, 5000);
     let tight = fd_jacobian_ode_override(&looser_abstol_only).unwrap();
-    assert_eq!(
-        (tight.reltol, tight.abstol),
-        (Some(ODE_FD_JACOBIAN_RELTOL), Some(1e-12))
-    );
+    assert_eq!((tight.reltol, tight.abstol), (Some(ODE_FD_JACOBIAN_RELTOL), Some(1e-12)));
 }
 
 /// A model with no integrator keeps its roundoff-sized step, bit for bit, and a closed form
@@ -383,10 +363,7 @@ fn a_non_finite_tight_jacobian_is_redone_at_the_fits_tolerance() {
     assert_eq!(h[(0, 0)], 1.0);
     assert_eq!(
         calls,
-        vec![
-            (ODE_FD_JACOBIAN_STEP, ODE_FD_JACOBIAN_RELTOL),
-            (ODE_FD_JACOBIAN_STEP, fit_reltol),
-        ]
+        vec![(ODE_FD_JACOBIAN_STEP, ODE_FD_JACOBIAN_RELTOL), (ODE_FD_JACOBIAN_STEP, fit_reltol),]
     );
     assert_eq!(FD_H_REDONE.with(|c| c.get()), redone_before + 1);
 
@@ -417,10 +394,7 @@ fn a_truncated_but_finite_tight_jacobian_is_redone() {
     let h = with_fd_jacobian_integration(&model, |step| {
         let tight = spec.effective_solver_opts().reltol < fit_reltol;
         let _cut = tight.then(|| {
-            arm_ode_solver_override(OdeSolverOverride {
-                max_steps: Some(3),
-                ..Default::default()
-            })
+            arm_ode_solver_override(OdeSolverOverride { max_steps: Some(3), ..Default::default() })
         });
         let preds = pk::compute_predictions_with_tv_into_with_schedule(
             &model,
@@ -437,10 +411,7 @@ fn a_truncated_but_finite_tight_jacobian_is_redone() {
         m
     });
     let truncated = tight_pass.expect("the tight pass ran");
-    assert!(
-        truncated.iter().all(|v| v.is_finite()),
-        "this fixture needs a finite truncated pass"
-    );
+    assert!(truncated.iter().all(|v| v.is_finite()), "this fixture needs a finite truncated pass");
     assert_ne!(h, truncated, "the truncated pass must not be returned");
 }
 
@@ -463,9 +434,7 @@ const STARVED_MAX_STEPS: usize = 30;
 #[test]
 fn a_redone_final_h_is_reported_by_the_fit() {
     let pop = chain_population(4);
-    let etas: Vec<DVector<f64>> = (0..4)
-        .map(|i| DVector::from_column_slice(&eta_of(i)))
-        .collect();
+    let etas: Vec<DVector<f64>> = (0..4).map(|i| DVector::from_column_slice(&eta_of(i))).collect();
 
     let mut model = budget_starved_chain();
     model.gradient_method = GradientMethod::Fd;
@@ -489,10 +458,7 @@ fn a_redone_final_h_is_reported_by_the_fit() {
 
     assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &[]), 4);
     // A subject with no reported EBE is skipped rather than read out of bounds.
-    assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas[..1], &[]),
-        1
-    );
+    assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas[..1], &[]), 1);
 
     let mut roomy = pinned_chain(1e-1, 1e-1, 100_000);
     roomy.ode_spec.as_mut().unwrap().solver_opts.method = OdeMethod::Rosenbrock23;
@@ -505,10 +471,7 @@ fn a_redone_final_h_is_reported_by_the_fit() {
     assert_eq!(fd_h_subjects_redone(&tight, &pop, &params, &etas, &[]), 4);
     let mut tight_roomy = pinned_chain(1e-9, 1e-11, 100_000);
     tight_roomy.gradient_method = GradientMethod::Fd;
-    assert_eq!(
-        fd_h_subjects_redone(&tight_roomy, &pop, &params, &etas, &[]),
-        0
-    );
+    assert_eq!(fd_h_subjects_redone(&tight_roomy, &pop, &params, &etas, &[]), 0);
 }
 
 /// #2701 review 3: the budget a tight fit's Jacobian gets is the same multiple, so a perturbed
@@ -520,9 +483,7 @@ fn an_already_tight_fit_gets_the_jacobians_budget() {
     model.gradient_method = GradientMethod::Fd;
     let pop = chain_population(2);
     let params = model.default_params.clone();
-    let etas: Vec<DVector<f64>> = (0..2)
-        .map(|i| DVector::from_column_slice(&eta_of(i)))
-        .collect();
+    let etas: Vec<DVector<f64>> = (0..2).map(|i| DVector::from_column_slice(&eta_of(i))).collect();
     let scope = crate::ode::solver::SolverStatsScope::enter();
     let mut scratch = pk::EventPkParams::default();
     for (s, eta) in pop.subjects.iter().zip(&etas) {
@@ -592,25 +553,12 @@ fn a_redone_final_h_is_counted_under_iov() {
     model.gradient_method = GradientMethod::Fd;
     let pop = chain_population(2);
     let params = model.default_params.clone();
-    let etas: Vec<DVector<f64>> = (0..2)
-        .map(|i| DVector::from_column_slice(&eta_of(i)))
-        .collect();
+    let etas: Vec<DVector<f64>> = (0..2).map(|i| DVector::from_column_slice(&eta_of(i))).collect();
     let kappas: Vec<Vec<DVector<f64>>> = (0..2)
-        .map(|i| {
-            kappas_of(i)
-                .iter()
-                .map(|k| DVector::from_column_slice(k))
-                .collect()
-        })
+        .map(|i| kappas_of(i).iter().map(|k| DVector::from_column_slice(k)).collect())
         .collect();
-    assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas),
-        2
-    );
-    assert_eq!(
-        fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas[..1]),
-        1
-    );
+    assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas), 2);
+    assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &kappas[..1]), 1);
 }
 
 /// A subject on the exact Jacobian takes no FD pass, so it cannot be counted, whatever the
@@ -621,9 +569,7 @@ fn an_exact_h_is_never_counted_as_redone() {
     assert!(!inner_analytic_opted_out(&model));
     let pop = chain_population(2);
     let params = model.default_params.clone();
-    let etas: Vec<DVector<f64>> = (0..2)
-        .map(|i| DVector::from_column_slice(&eta_of(i)))
-        .collect();
+    let etas: Vec<DVector<f64>> = (0..2).map(|i| DVector::from_column_slice(&eta_of(i))).collect();
     assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &[]), 0);
 }
 
@@ -681,9 +627,7 @@ fn a_finished_tight_jacobian_that_clamped_at_min_dt_is_redone() {
     model.gradient_method = GradientMethod::Fd;
     let pop = chain_population(2);
     let params = model.default_params.clone();
-    let etas: Vec<DVector<f64>> = (0..2)
-        .map(|i| DVector::from_column_slice(&eta_of(i)))
-        .collect();
+    let etas: Vec<DVector<f64>> = (0..2).map(|i| DVector::from_column_slice(&eta_of(i))).collect();
     let mut scratch = pk::EventPkParams::default();
     let mut solve = |tight: bool| {
         let override_ = fd_jacobian_ode_override(&model).unwrap();
@@ -702,11 +646,7 @@ fn a_finished_tight_jacobian_that_clamped_at_min_dt_is_redone() {
         scope.collected()
     };
     let (fit, tight) = (solve(false), solve(true));
-    assert_eq!(
-        fit.kept_clamped_steps(),
-        0,
-        "the fixture's fit must be clean"
-    );
+    assert_eq!(fit.kept_clamped_steps(), 0, "the fixture's fit must be clean");
     assert!(tight.kept_clamped_steps() > 0, "the tight solve must clamp");
     assert_eq!(tight.kept_unfinished_segments(), 0, "and still finish");
     assert_eq!(fd_h_subjects_redone(&model, &pop, &params, &etas, &[]), 2);
@@ -764,11 +704,9 @@ fn a_mixture_counts_a_redone_h_in_a_contributing_non_winning_class() {
         "MTT   = if (MIXNUM == 1) TMTT * exp(ETA_MTT) else TMTT * exp(ETA_MTT) / CLASS_RATIO",
     );
     let build = |ratio: &str, min_dt: f64| {
-        let mut model = parse_model_string(&format!(
-            "{CLASS_CHAIN}{}",
-            chain.replace("CLASS_RATIO", ratio)
-        ))
-        .expect("the class chain parses");
+        let mut model =
+            parse_model_string(&format!("{CLASS_CHAIN}{}", chain.replace("CLASS_RATIO", ratio)))
+                .expect("the class chain parses");
         let opts = &mut model.ode_spec.as_mut().unwrap().solver_opts;
         opts.reltol = 1e-1;
         opts.abstol = 1e-1;

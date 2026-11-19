@@ -144,10 +144,7 @@ const SUBCOMMANDS: &[(&str, fn(&[String]) -> i32)] = &[
 
 /// The runner for `word`, when it names a subcommand.
 fn subcommand(word: &str) -> Option<fn(&[String]) -> i32> {
-    SUBCOMMANDS
-        .iter()
-        .find(|(name, _)| *name == word)
-        .map(|(_, run)| *run)
+    SUBCOMMANDS.iter().find(|(name, _)| *name == word).map(|(_, run)| *run)
 }
 
 /// What the first argument means once it is known not to name a [`SUBCOMMANDS`]
@@ -293,10 +290,7 @@ fn main() {
     }
 
     let model_path = &args[1];
-    let data_path = args
-        .iter()
-        .position(|a| a == "--data")
-        .and_then(|i| args.get(i + 1));
+    let data_path = args.iter().position(|a| a == "--data").and_then(|i| args.get(i + 1));
     let simulate = args.iter().any(|a| a == "--simulate");
     let threads = parse_threads_flag(&args);
     let inits_from_nca = match parse_inits_from_nca_flag(&args) {
@@ -317,10 +311,7 @@ fn main() {
     // by an interrupted run of this model before fitting. Without it, a run
     // resumes automatically from `{model}.tmp` when present and compatible.
     if args.iter().any(|a| a == "--clean") {
-        if let Some(stem) = std::path::Path::new(model_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-        {
+        if let Some(stem) = std::path::Path::new(model_path).file_stem().and_then(|s| s.to_str()) {
             let tmp = format!("{stem}.tmp");
             if std::path::Path::new(&tmp).exists() {
                 match std::fs::remove_file(&tmp) {
@@ -346,10 +337,7 @@ fn main() {
     }
     // Everything the command line named explicitly, which beats the model file's
     // `[fit_options]` (#1416).
-    let overrides = ferx_core::RunOverrides {
-        inits_from_nca,
-        threads,
-    };
+    let overrides = ferx_core::RunOverrides { inits_from_nca, threads };
 
     let t_start = Instant::now();
     // Precedence: an explicit `--data` always wins (unchanged); `--simulate`
@@ -436,9 +424,7 @@ fn main() {
                 } else {
                     None
                 };
-                let opts = ferx_core::io::fitrx::SaveFitOptions {
-                    include_data: include,
-                };
+                let opts = ferx_core::io::fitrx::SaveFitOptions { include_data: include };
                 match ferx_core::io::fitrx::save_fit(
                     &fit_result,
                     &population,
@@ -464,6 +450,18 @@ fn main() {
 
             println!("\nFit completed!");
             println!("OFV: {:.4}", fit_result.ofv);
+            // A SAEM fit's OFV is the SAEM objective or the IS / quadrature -2 log L (#2973);
+            // say which, and give the FOCE/Laplace value the old number was.
+            if let Some(o) = &fit_result.saem_objective {
+                let kind = match o.kind {
+                    ferx_core::types::SaemOfv::Saem => {
+                        "SAEM objective (NONMEM SAEMOBJ convention; not a likelihood)"
+                    }
+                    ferx_core::types::SaemOfv::Agq => "adaptive Gauss-Hermite -2LL",
+                    _ => "importance-sampled -2LL (NONMEM IMP EONLY=1)",
+                };
+                println!("  {kind}; FOCE/Laplace OFV (diagnostic): {:.4}", o.foce_ofv);
+            }
             println!("Elapsed: {:.3}s", elapsed_secs);
             for (name, val) in fit_result.theta_names.iter().zip(fit_result.theta.iter()) {
                 println!("  {} = {:.6}", name, val);
@@ -531,10 +529,7 @@ fn run_summary(args: &[String]) -> i32 {
     }
 
     if loaded.len() == 1 {
-        print!(
-            "{}",
-            ferx_core::io::output::format_summary(&loaded[0].1.fit)
-        );
+        print!("{}", ferx_core::io::output::format_summary(&loaded[0].1.fit));
     } else {
         // Column label = file stem (e.g. `run1.fitrx` → `run1`).
         let runs: Vec<(String, &ferx_core::FitResult)> = loaded
@@ -684,11 +679,7 @@ fn check_summary_line(report: &ferx_core::CheckReport) -> String {
         n => format!(", {n} info"),
     };
     if report.valid {
-        format!(
-            "ok: {} — no errors ({} warning(s){info})",
-            report.model,
-            report.warning_count()
-        )
+        format!("ok: {} — no errors ({} warning(s){info})", report.model, report.warning_count())
     } else {
         format!(
             "invalid: {} — {} error(s), {} warning(s){info}",
@@ -769,10 +760,7 @@ fn parse_threads_flag(args: &[String]) -> Option<usize> {
     match value.parse::<usize>() {
         Ok(n) if n > 0 => Some(n),
         _ => {
-            eprintln!(
-                "Error: --threads expects a positive integer, 0, or 'auto'; got '{}'",
-                value
-            );
+            eprintln!("Error: --threads expects a positive integer, 0, or 'auto'; got '{}'", value);
             std::process::exit(1);
         }
     }
@@ -784,9 +772,8 @@ fn parse_threads_flag(args: &[String]) -> Option<usize> {
 /// `nca_sweep`; an explicit method is given as `--inits-from-nca=nca_ebe`.
 /// Returns `Err` for an unrecognised method.
 fn parse_inits_from_nca_flag(args: &[String]) -> Result<Option<NcaInit>, String> {
-    let Some(arg) = args
-        .iter()
-        .find(|a| *a == "--inits-from-nca" || a.starts_with("--inits-from-nca="))
+    let Some(arg) =
+        args.iter().find(|a| *a == "--inits-from-nca" || a.starts_with("--inits-from-nca="))
     else {
         return Ok(None);
     };
@@ -817,10 +804,7 @@ mod tests {
     use ferx_core::NcaInit;
 
     fn args(extra: &[&str]) -> Vec<String> {
-        std::iter::once("ferx")
-            .chain(extra.iter().copied())
-            .map(String::from)
-            .collect()
+        std::iter::once("ferx").chain(extra.iter().copied()).map(String::from).collect()
     }
 
     #[test]
@@ -848,14 +832,8 @@ mod tests {
     fn a_bare_word_is_read_as_a_tool_name_not_a_model_path() {
         // The reported case: a tool this build does not have. Before #1396 this
         // fell through to the fit path and reported a missing model file.
-        assert_eq!(
-            classify_first_arg("covsearch", Ok(false)),
-            FirstArg::UnknownTool("covsearch")
-        );
-        assert_eq!(
-            classify_first_arg("bootstrap", Ok(false)),
-            FirstArg::UnknownTool("bootstrap")
-        );
+        assert_eq!(classify_first_arg("covsearch", Ok(false)), FirstArg::UnknownTool("covsearch"));
+        assert_eq!(classify_first_arg("bootstrap", Ok(false)), FirstArg::UnknownTool("bootstrap"));
     }
 
     #[test]
@@ -883,14 +861,8 @@ mod tests {
         // win over the two decisions `main` takes before this one — a
         // SUBCOMMANDS name and a leading `-` are settled there, which is why a
         // file called `check` needs a path.
-        assert_eq!(
-            classify_first_arg("mymodel", Ok(true)),
-            FirstArg::ModelFile("mymodel")
-        );
-        assert_eq!(
-            classify_first_arg("run1.ferx", Ok(true)),
-            FirstArg::ModelFile("run1.ferx")
-        );
+        assert_eq!(classify_first_arg("mymodel", Ok(true)), FirstArg::ModelFile("mymodel"));
+        assert_eq!(classify_first_arg("run1.ferx", Ok(true)), FirstArg::ModelFile("run1.ferx"));
     }
 
     #[test]
@@ -914,14 +886,8 @@ mod tests {
 
     #[test]
     fn a_flag_in_the_model_position_is_neither_a_tool_nor_a_file() {
-        assert_eq!(
-            classify_first_arg("--data", Ok(false)),
-            FirstArg::Flag("--data")
-        );
-        assert_eq!(
-            classify_first_arg("--simulate", Ok(false)),
-            FirstArg::Flag("--simulate")
-        );
+        assert_eq!(classify_first_arg("--data", Ok(false)), FirstArg::Flag("--data"));
+        assert_eq!(classify_first_arg("--simulate", Ok(false)), FirstArg::Flag("--simulate"));
     }
 
     #[test]
@@ -930,19 +896,13 @@ mod tests {
         // unknown-tool error enumerates it. A name in the list that does not
         // resolve would be advertised and then rejected.
         for (name, _) in SUBCOMMANDS {
-            assert!(
-                subcommand(name).is_some(),
-                "`{name}` is listed but does not dispatch"
-            );
+            assert!(subcommand(name).is_some(), "`{name}` is listed but does not dispatch");
         }
         // A listed name is a bare word, so `main` must consult `subcommand`
         // *before* classifying — classification alone would call every tool
         // unrecognized. `every_listed_tool_still_dispatches` (cli_ferx.rs) runs
         // the binary to pin that ordering.
-        assert_eq!(
-            classify_first_arg("check", Ok(false)),
-            FirstArg::UnknownTool("check")
-        );
+        assert_eq!(classify_first_arg("check", Ok(false)), FirstArg::UnknownTool("check"));
         assert!(subcommand("covsearchx").is_none());
     }
 
@@ -955,10 +915,7 @@ mod tests {
         );
         // Far from every name: no suggestion, but still the full list.
         let far = unknown_tool_hint("zzzzzzzzzz");
-        assert!(
-            !far.contains("Did you mean"),
-            "unrelated word should not suggest anything: {far}"
-        );
+        assert!(!far.contains("Did you mean"), "unrelated word should not suggest anything: {far}");
         for (name, _) in SUBCOMMANDS {
             assert!(far.contains(name), "hint should list `{name}`: {far}");
         }
@@ -1011,10 +968,7 @@ mod tests {
 
     #[test]
     fn threads_flag_accepts_eq_form_after_normalize() {
-        assert_eq!(
-            parse_threads_flag(&normalize_args(&args(&["--threads=4"]))),
-            Some(4)
-        );
+        assert_eq!(parse_threads_flag(&normalize_args(&args(&["--threads=4"]))), Some(4));
     }
 
     #[test]
@@ -1125,14 +1079,8 @@ mod tests {
 
     #[test]
     fn check_args_missing_model_is_usage_error() {
-        assert_eq!(
-            parse_check_args(&args(&["check"])),
-            Err(CheckArgsError::Usage)
-        );
-        assert_eq!(
-            parse_check_args(&args(&["check", "--json"])),
-            Err(CheckArgsError::Usage)
-        );
+        assert_eq!(parse_check_args(&args(&["check"])), Err(CheckArgsError::Usage));
+        assert_eq!(parse_check_args(&args(&["check", "--json"])), Err(CheckArgsError::Usage));
     }
 
     #[test]
@@ -1161,10 +1109,8 @@ mod tests {
 
     // `CARGO_MANIFEST_DIR` is `crates/ferx-cli`, so the repo-root fixtures
     // (`examples/`, `data/`) are two levels up (#1114).
-    const VALID_MODEL: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/one_cpt_iv.ferx"
-    );
+    const VALID_MODEL: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/one_cpt_iv.ferx");
     const VALID_DATA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../data/one_cpt_iv.csv");
 
     #[test]
@@ -1211,10 +1157,7 @@ mod tests {
     fn run_check_with_data_runs_data_path_without_usage_error() {
         // 0 (valid) or 1 (data-dependent findings) — never 2. Exercises the
         // data-dependent branch of `validate_model_file`.
-        assert_ne!(
-            run_check(&args(&["check", VALID_MODEL, "--data", VALID_DATA])),
-            2
-        );
+        assert_ne!(run_check(&args(&["check", VALID_MODEL, "--data", VALID_DATA])), 2);
     }
 
     #[test]
@@ -1241,10 +1184,7 @@ mod tests {
         assert_eq!(run_summary(&args(&["summary"])), 2);
         assert_eq!(run_summary(&args(&["summary", "--json"])), 2);
         // An unknown flag *after* a path is rejected, not silently ignored.
-        assert_eq!(
-            run_summary(&args(&["summary", "/no/such/file.fitrx", "--bogus"])),
-            2
-        );
+        assert_eq!(run_summary(&args(&["summary", "/no/such/file.fitrx", "--bogus"])), 2);
         // A short unknown flag (single dash) is rejected too.
         assert_eq!(run_summary(&args(&["summary", "-x"])), 2);
     }
@@ -1252,14 +1192,8 @@ mod tests {
     #[test]
     fn run_summary_help_anywhere_returns_0() {
         // Help is recognized even when it follows a path (before any load).
-        assert_eq!(
-            run_summary(&args(&["summary", "/no/such/file.fitrx", "-h"])),
-            0
-        );
-        assert_eq!(
-            run_summary(&args(&["summary", "/no/such/file.fitrx", "--help"])),
-            0
-        );
+        assert_eq!(run_summary(&args(&["summary", "/no/such/file.fitrx", "-h"])), 0);
+        assert_eq!(run_summary(&args(&["summary", "/no/such/file.fitrx", "--help"])), 0);
     }
 
     #[test]
@@ -1298,14 +1232,7 @@ mod tests {
         let p2 = dir.path().join("run2.fitrx");
         write_warfarin_fitrx(&p1);
         write_warfarin_fitrx(&p2);
-        assert_eq!(
-            run_summary(&args(&[
-                "summary",
-                p1.to_str().unwrap(),
-                p2.to_str().unwrap()
-            ])),
-            0
-        );
+        assert_eq!(run_summary(&args(&["summary", p1.to_str().unwrap(), p2.to_str().unwrap()])), 0);
     }
 
     #[test]
@@ -1347,27 +1274,14 @@ mod tests {
         let info = || Diagnostic::info("W_LEVEL_SUMMARY", "level `ARM`: 7 groups");
         let ok = CheckReport::new("m", None, vec![info(), info()]);
         print_check_human(&ok);
-        assert_eq!(
-            check_summary_line(&ok),
-            "ok: m — no errors (0 warning(s), 2 info)"
-        );
+        assert_eq!(check_summary_line(&ok), "ok: m — no errors (0 warning(s), 2 info)");
         let bad = CheckReport::new(
             "m",
             None,
-            vec![
-                info(),
-                Diagnostic::warning("W_X", "w"),
-                Diagnostic::error("E_Y", "e"),
-            ],
+            vec![info(), Diagnostic::warning("W_X", "w"), Diagnostic::error("E_Y", "e")],
         );
-        assert_eq!(
-            check_summary_line(&bad),
-            "invalid: m — 1 error(s), 1 warning(s), 1 info"
-        );
+        assert_eq!(check_summary_line(&bad), "invalid: m — 1 error(s), 1 warning(s), 1 info");
         let plain = CheckReport::new("m", None, vec![Diagnostic::warning("W_X", "w")]);
-        assert_eq!(
-            check_summary_line(&plain),
-            "ok: m — no errors (1 warning(s))"
-        );
+        assert_eq!(check_summary_line(&plain), "ok: m — no errors (1 warning(s))");
     }
 }

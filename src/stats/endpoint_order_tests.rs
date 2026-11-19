@@ -47,10 +47,7 @@ fn accumulate_non_gaussian_nll_adds_endpoints_in_ascending_cmt_order() {
                     .collect()
             })
             .collect();
-        assert!(
-            terms.iter().flatten().all(|t| t.is_finite()),
-            "{label}: {terms:?}"
-        );
+        assert!(terms.iter().flatten().all(|t| t.is_finite()), "{label}: {terms:?}");
         assert!(
             terms.iter().any(|t| order_sensitive(acc0, t)),
             "{label}: no subject's sum depends on the order: the pin cannot fail"
@@ -102,13 +99,7 @@ fn non_gaussian_mode_terms_sum_endpoints_in_ascending_cmt_order() {
                 .unzip()
         })
         .collect();
-    assert!(
-        terms
-            .iter()
-            .flat_map(|(q, h)| q.iter().chain(h))
-            .all(|x| x.is_finite()),
-        "{terms:?}"
-    );
+    assert!(terms.iter().flat_map(|(q, h)| q.iter().chain(h)).all(|x| x.is_finite()), "{terms:?}");
     assert!(
         terms.iter().any(|(q, _)| order_sensitive(0.0, q)),
         "no subject's NLL depends on the order: the pin cannot fail"

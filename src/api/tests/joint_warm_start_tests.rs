@@ -25,20 +25,9 @@ use crate::types::{
 type Fixture = (CompiledModel, Population, FitOptions);
 
 fn fit_recorded(
-    (model, pop, base): Fixture,
-    edit: impl FnOnce(FitOptions) -> FitOptions,
-) -> (
-    CompiledModel,
-    Population,
-    FitOptions,
-    FitResult,
-    InnerRecording,
-) {
-    let opts = edit(FitOptions {
-        verbose: false,
-        threads: Some(1),
-        ..base
-    });
+    (model, pop, base): Fixture, edit: impl FnOnce(FitOptions) -> FitOptions,
+) -> (CompiledModel, Population, FitOptions, FitResult, InnerRecording) {
+    let opts = edit(FitOptions { verbose: false, threads: Some(1), ..base });
     let (fit, rec) = on_fit_thread(&opts, || {
         record_inner_solves(|| {
             crate::api::fit(&model, &pop, &model.default_params, &opts).expect("the fit runs")
@@ -115,21 +104,14 @@ fn bayes_final_ebe_solve_starts_at_the_posterior_mean_kappa() {
         .filter(|p| !p.kappas.is_empty())
         .filter_map(|p| p.init.as_ref())
         .any(|init| init[model.n_eta..].iter().any(|&k| k != 0.0));
-    assert!(
-        handed_kappa,
-        "every handed κ̂ is 0: the sampled κ were not summed"
-    );
+    assert!(handed_kappa, "every handed κ̂ is 0: the sampled κ were not summed");
     // And it is a start, not just a non-zero vector: summed over the IOV subjects, the
     // handed κ̂ is nearer the pass's own modes than the cold κ = 0 is. Measured on this
     // fixture (macOS arm64, seed 7, review r1 #1): 0.131 against 0.183, 28% nearer, where
     // handing the sum undivided gives 1.97. One subject alone can be farther (3.46e-2 vs
     // 2.01e-2 at these 2×(10+10) draws), so the check is the aggregate.
     let dist = |a: &[f64], b: &[f64]| -> f64 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).powi(2))
-            .sum::<f64>()
-            .sqrt()
+        a.iter().zip(b).map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt()
     };
     let (mut warm, mut cold) = (0.0_f64, 0.0_f64);
     for p in rec.passes.iter().filter(|p| !p.kappas.is_empty()) {
@@ -182,11 +164,7 @@ fn focei_sir(o: FitOptions) -> FitOptions {
 
 fn assert_in_fit_sir_draws_are_joint(label: &str, fixture: Fixture) {
     let (model, pop, opts, fit, rec) = fit_recorded(fixture, focei_sir);
-    assert!(
-        fit.sir_ess.is_some(),
-        "{label}: fixture: SIR ran ({:?})",
-        fit.warnings
-    );
+    assert!(fit.sir_ess.is_some(), "{label}: fixture: SIR ran ({:?})", fit.warnings);
     assert_every_warm_pass_is_joint(label, &rec, &model);
     // `run_sir` on the stored fit draws from `fit.ebe_kappas` the same way.
     if fit.covariance_matrix.is_some() {
@@ -241,11 +219,7 @@ fn run_sir_hands_eta_alone_when_the_kappas_do_not_line_up() {
         fit.warnings
     );
     let cells = crate::stats::stacked_layout::group_count(&pop.subjects[0]);
-    assert_eq!(
-        fit.ebe_kappas[0].len(),
-        cells,
-        "fixture: the fit's κ̂ line up"
-    );
+    assert_eq!(fit.ebe_kappas[0].len(), cells, "fixture: the fit's κ̂ line up");
     assert!(cells > 1, "fixture: subject 0 has {cells} cells");
 
     let mut short_cell = fit.clone();
@@ -286,10 +260,7 @@ fn run_sir_hands_eta_alone_when_the_kappas_do_not_line_up() {
         sir.unwrap_or_else(|e| panic!("{label}: run_sir: {e}"));
         let id = &pop.subjects[0].id;
         let starts: Vec<_> = rec.starts.iter().filter(|s| &s.subject == id).collect();
-        assert!(
-            !starts.is_empty(),
-            "{label}: fixture: subject {id} was solved"
-        );
+        assert!(!starts.is_empty(), "{label}: fixture: subject {id} was solved");
         for s in &starts {
             assert!(
                 s.kappas.iter().flatten().all(|&k| k == 0.0),
@@ -299,9 +270,7 @@ fn run_sir_hands_eta_alone_when_the_kappas_do_not_line_up() {
         }
         // η̂ is still handed: the starts are not cold.
         assert!(
-            starts
-                .iter()
-                .any(|s| s.psi.iter().zip(&s.mu).any(|(p, m)| p != m)),
+            starts.iter().any(|s| s.psi.iter().zip(&s.mu).any(|(p, m)| p != m)),
             "{label}: subject {id}: every start was cold, so η̂ was dropped too"
         );
     }

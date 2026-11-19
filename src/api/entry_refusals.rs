@@ -50,11 +50,7 @@ pub(crate) fn param_shape(message: impl Into<String>) -> EngineError {
 /// expression reads a covariate the data lack, the cause `ferx check` gives that code for
 /// a model expression. `simulate_adaptive_from_spec` adds its context.
 pub(crate) fn observe_covariate_missing(message: impl Into<String>) -> EngineError {
-    coded(
-        "E_MISSING_COVARIATE",
-        Some("adaptive_dosing"),
-        message.into(),
-    )
+    coded("E_MISSING_COVARIATE", Some("adaptive_dosing"), message.into())
 }
 
 /// `E_NESTED_LEVEL_SIMULATE_UNSUPPORTED`: a model with nested levels (more than one
@@ -190,8 +186,7 @@ pub(crate) fn adaptive_unsupported(block: Option<&str>, message: impl Into<Strin
 
 /// [`adaptive_unsupported`] as a [`Diagnostic`], for `compile_adaptive`'s ODE gate.
 pub(crate) fn adaptive_unsupported_diag(
-    block: Option<&str>,
-    message: impl Into<String>,
+    block: Option<&str>, message: impl Into<String>,
 ) -> Diagnostic {
     diag("E_ADAPTIVE_UNSUPPORTED", block, message.into())
 }
@@ -229,8 +224,7 @@ pub(crate) fn adaptive_controller_action(message: impl Into<String>) -> EngineEr
 /// A refusal of the reactive driver (`ode_predictions_adaptive_impl`) as the code its
 /// kind names (#1983). Its runtime failures carry no code and do not come here.
 pub(crate) fn adaptive_driver_refusal(
-    kind: crate::ode::AdaptiveRefusalKind,
-    message: String,
+    kind: crate::ode::AdaptiveRefusalKind, message: String,
 ) -> EngineError {
     use crate::ode::AdaptiveRefusalKind as K;
     match kind {
@@ -262,11 +256,7 @@ pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
 /// replicate after its draw; the message names the subject (and that replicate) and the
 /// values read.
 pub(crate) fn adaptive_dose_value(message: impl Into<String>) -> EngineError {
-    coded(
-        "E_ADAPTIVE_DOSE_VALUE",
-        Some("adaptive_dosing"),
-        message.into(),
-    )
+    coded("E_ADAPTIVE_DOSE_VALUE", Some("adaptive_dosing"), message.into())
 }
 
 /// `E_ADAPTIVE_DOSE_KNOWLEDGE`: an `[adaptive_dosing]` dose expression reads a
@@ -274,11 +264,7 @@ pub(crate) fn adaptive_dose_value(message: impl Into<String>) -> EngineError {
 /// the simulation, under `dose_knowledge = known` (#944). Refused before any subject
 /// runs; the message lists the drawn subjects and the three routes.
 pub(crate) fn adaptive_dose_knowledge(message: impl Into<String>) -> EngineError {
-    coded(
-        "E_ADAPTIVE_DOSE_KNOWLEDGE",
-        Some("adaptive_dosing"),
-        message.into(),
-    )
+    coded("E_ADAPTIVE_DOSE_KNOWLEDGE", Some("adaptive_dosing"), message.into())
 }
 
 /// `E_THETA_LENGTH`: a θ whose length is not the model's (#1614, #1615) — a
@@ -363,9 +349,5 @@ pub(crate) fn logit_theta_out_of_range(name: &str, estimate: f64) -> Diagnostic 
 /// no free direction to propose in. The model's own `[parameters]`, not the SIR
 /// settings, which is why it is not `E_SIR_OPTIONS`.
 pub(crate) fn sir_nothing_to_sample(message: impl Into<String>) -> EngineError {
-    coded(
-        "E_SIR_NOTHING_TO_SAMPLE",
-        Some("parameters"),
-        message.into(),
-    )
+    coded("E_SIR_NOTHING_TO_SAMPLE", Some("parameters"), message.into())
 }

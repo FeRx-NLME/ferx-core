@@ -13,11 +13,7 @@
 use ferx_core::{fit_from_files, FitOptions};
 
 fn smoke_opts() -> FitOptions {
-    FitOptions {
-        outer_maxiter: 3,
-        run_covariance_step: false,
-        ..Default::default()
-    }
+    FitOptions { outer_maxiter: 3, run_covariance_step: false, ..Default::default() }
 }
 
 /// A continuous (residual-error) model with no `omega` declarations fits.
@@ -98,10 +94,8 @@ fn no_random_effects_makes_ipred_equal_pred_and_cwres_equal_iwres() {
 /// runs, rather than after a stage of the chain has already executed.
 #[test]
 fn saem_is_rejected_without_random_effects() {
-    let opts = FitOptions {
-        methods: vec![ferx_core::types::EstimationMethod::Saem],
-        ..smoke_opts()
-    };
+    let opts =
+        FitOptions { methods: vec![ferx_core::types::EstimationMethod::Saem], ..smoke_opts() };
     let err = fit_from_files(
         "examples/one_cpt_iv_pooled.ferx",
         Some("data/one_cpt_iv.csv"),
@@ -110,10 +104,7 @@ fn saem_is_rejected_without_random_effects() {
     )
     .expect_err("saem at n_eta = 0 must be rejected")
     .to_string();
-    assert!(
-        err.contains("at least one random effect"),
-        "unexpected message: {err}"
-    );
+    assert!(err.contains("at least one random effect"), "unexpected message: {err}");
 }
 
 /// The survival half of the pair: a TTE endpoint with neither Omega nor sigma.
@@ -144,22 +135,15 @@ fn tte_model_with_no_random_effects_and_no_sigma_fits() {
     let model =
         parse_model_string(POOLED_TTE).expect("a TTE model with no omega and no sigma must parse");
     assert_eq!(model.n_eta, 0);
-    assert!(
-        model.default_params.sigma.values.is_empty(),
-        "a pure-TTE model carries no sigma"
-    );
+    assert!(model.default_params.sigma.values.is_empty(), "a pure-TTE model carries no sigma");
 
     // Go through `fit_from_files` rather than `read_nonmem_csv` + `fit`: the TTE
     // rows on CMT 2 only route to the event likelihood when the population is read
     // through the endpoint-aware chokepoint, which is what the CLI and the R
     // wrapper both use. Reading the CSV blind makes CMT 2 look like an
     // observation compartment with no `[error_model]` entry.
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model");
-    f.write_all(POOLED_TTE.as_bytes())
-        .expect("write temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
+    f.write_all(POOLED_TTE.as_bytes()).expect("write temp model");
     f.flush().expect("flush temp model");
 
     let res = fit_from_files(
@@ -216,10 +200,7 @@ fn single_occasion_warfarin() -> tempfile::NamedTempFile {
         out.push('\n');
     }
 
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .expect("create temp data");
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().expect("create temp data");
     f.write_all(out.as_bytes()).expect("write temp data");
     f.flush().expect("flush temp data");
     f
@@ -258,10 +239,7 @@ fn one_effect_model(decl: &str, term: &str, extra_opts: &str) -> tempfile::Named
   checkpoint = false
 {extra_opts}"
     );
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
     f.write_all(src.as_bytes()).expect("write temp model");
     f.flush().expect("flush temp model");
     f
@@ -288,22 +266,10 @@ fn iov_without_bsv_reduces_to_bsv_on_a_single_occasion() {
     )
     .expect("a kappa-only fit must return Ok (#989)");
 
+    assert_eq!(bsv_res.omega.nrows(), 1, "the reference must carry exactly one BSV eta");
+    assert_eq!(iov_res.omega.nrows(), 0, "the IOV model must carry no BSV Omega");
     assert_eq!(
-        bsv_res.omega.nrows(),
-        1,
-        "the reference must carry exactly one BSV eta"
-    );
-    assert_eq!(
-        iov_res.omega.nrows(),
-        0,
-        "the IOV model must carry no BSV Omega"
-    );
-    assert_eq!(
-        iov_res
-            .omega_iov
-            .as_ref()
-            .expect("a declared kappa must yield an IOV Omega")
-            .nrows(),
+        iov_res.omega_iov.as_ref().expect("a declared kappa must yield an IOV Omega").nrows(),
         1
     );
 

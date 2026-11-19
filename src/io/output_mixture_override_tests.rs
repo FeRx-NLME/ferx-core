@@ -15,16 +15,9 @@ fn template() -> ModelParameters {
     let eta = vec!["eta_CL".to_string(), "eta_V".to_string()];
     let names = vec!["prop".to_string(), "add".to_string()];
     let omega = OmegaMatrix::from_diagonal(&[0.1, 0.2], eta.clone());
-    let sigma = SigmaVector {
-        values: vec![0.05, 0.4],
-        names: names.clone(),
-    };
+    let sigma = SigmaVector { values: vec![0.05, 0.4], names: names.clone() };
     ModelParameters {
-        residual_correlations: vec![ResidualCorrelation {
-            sigma_i: 1,
-            sigma_j: 0,
-            rho: 0.5,
-        }],
+        residual_correlations: vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.5 }],
         residual_correlation_fixed: vec![false],
         theta: vec![1.0, 2.0, 0.5],
         theta_names: vec!["CL".into(), "V".into(), "KA".into()],
@@ -39,13 +32,7 @@ fn template() -> ModelParameters {
         kappa_fixed: vec![false],
         mixture: Some(MixtureParams {
             omega: vec![omega, OmegaMatrix::from_diagonal(&[0.3, 0.2], eta)],
-            sigma: vec![
-                sigma,
-                SigmaVector {
-                    values: vec![0.05, 0.7],
-                    names,
-                },
-            ],
+            sigma: vec![sigma, SigmaVector { values: vec![0.05, 0.7], names }],
             omega_override_addr: vec![(1, 0)],
             omega_override_fixed: vec![false],
             sigma_override_addr: vec![(1, 1)],
@@ -229,18 +216,13 @@ fn rendered_override_rows_cover_the_input_space() {
     // Free, covariance ran: value, CV% (Ω), SE, %RSE; the section follows SIGMA.
     let free = result();
     let summary = format_summary(&free);
-    let at = summary
-        .find("--- Mixture per-class overrides ---")
-        .expect("section");
+    let at = summary.find("--- Mixture per-class overrides ---").expect("section");
     assert!(summary.find("--- SIGMA").unwrap() < at, "{summary}");
     assert_eq!(
         row(&summary, "eta_CL_MIX2"),
         "  eta_CL_MIX2          = 0.300000  (CV% = 59.1)  SE = 0.060000"
     );
-    assert_eq!(
-        row(&summary, "add_MIX2"),
-        "  add_MIX2             = 0.700000  SE = 0.035000"
-    );
+    assert_eq!(row(&summary, "add_MIX2"), "  add_MIX2             = 0.700000  SE = 0.035000");
     // A σ override on a proportional base reads like a proportional SIGMA row: its CV%
     // is σ·100 (review r1 row 1 — the additive fixture above never reaches that arm).
     let mut prop = result();
@@ -261,20 +243,13 @@ fn rendered_override_rows_cover_the_input_space() {
     );
     let table = parameter_table(&free);
     let cells = |name: &str| -> Vec<String> {
-        row(&table, name)
-            .split_whitespace()
-            .skip(1)
-            .map(String::from)
-            .collect()
+        row(&table, name).split_whitespace().skip(1).map(String::from).collect()
     };
     assert_eq!(
         cells("eta_CL_MIX2"),
         ["0.300000", "0.060000", "20.0", "OMEGA", "var", "(class", "2)"]
     );
-    assert_eq!(
-        cells("add_MIX2"),
-        ["0.700000", "0.035000", "5.0", "SIGMA", "SD", "(class", "2)"]
-    );
+    assert_eq!(cells("add_MIX2"), ["0.700000", "0.035000", "5.0", "SIGMA", "SD", "(class", "2)"]);
 
     // Free, no covariance: `N/A` (console), `se: ~` (YAML), `---` (table, as base rows);
     // never `0.000000`.
@@ -300,11 +275,7 @@ fn rendered_override_rows_cover_the_input_space() {
     assert!(text.contains("eta_CL_MIX2 [FIX]"), "{text}");
     assert!(text.contains("add_MIX2 [FIX]"), "{text}");
     let yaml = yaml_of(&fixed);
-    assert_eq!(
-        yaml.matches("    fixed: true\n    se: ~\n").count(),
-        2,
-        "{yaml}"
-    );
+    assert_eq!(yaml.matches("    fixed: true\n    se: ~\n").count(), 2, "{yaml}");
     assert!(!yaml.contains("held:"), "{yaml}");
     let table = parameter_table(&fixed);
     for name in ["eta_CL_MIX2", "add_MIX2"] {
@@ -324,24 +295,14 @@ fn rendered_override_rows_cover_the_input_space() {
         class: Some(2),
     }];
     let summary = format_summary(&held_r);
-    assert!(
-        row(&summary, "eta_CL_MIX2").ends_with("SE = N/A"),
-        "{summary}"
-    );
-    assert!(
-        row(&summary, "eta_CL").ends_with("SE = 0.010000"),
-        "{summary}"
-    );
+    assert!(row(&summary, "eta_CL_MIX2").ends_with("SE = N/A"), "{summary}");
+    assert!(row(&summary, "eta_CL").ends_with("SE = 0.010000"), "{summary}");
     let yaml = top_level_yaml(&yaml_of(&held_r));
     assert!(
         yaml.contains("    cv_pct: 59.15\n    se: ~\n    held: collapsed_at_guard\n"),
         "{yaml}"
     );
-    assert_eq!(
-        yaml.matches("held: collapsed_at_guard").count(),
-        1,
-        "{yaml}"
-    );
+    assert_eq!(yaml.matches("held: collapsed_at_guard").count(), 1, "{yaml}");
     let table = parameter_table(&held_r);
     assert!(row(&table, "eta_CL_MIX2").contains(" N/A "), "{table}");
     assert!(row(&table, "eta_CL").contains("0.010000"), "{table}");
@@ -366,8 +327,5 @@ fn from_fit_reader_ignores_the_override_section() {
     let names = |v: &[crate::io::fit_estimates::SourceEstimate]| {
         v.iter().map(|e| e.name.clone()).collect::<Vec<_>>()
     };
-    assert_eq!(
-        names(&read),
-        names(&crate::io::fit_estimates::from_fit_result(&r))
-    );
+    assert_eq!(names(&read), names(&crate::io::fit_estimates::from_fit_result(&r)));
 }

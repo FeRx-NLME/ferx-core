@@ -40,6 +40,7 @@
 //! | `W_PER_CMT_UNMATCHED`     | the other direction of the two above: a **declared** per-CMT entry — `[scaling] obs_scale[CMT=N]`, `[error_model] CMT=N:`, or a `y[CMT=N]` readout on either engine — that no observation is recorded on, so the entry is inert. A warning rather than an error because nothing goes `NaN`, and one code for all three channels, with the channel named in the message. Names `[data_selection]` as a candidate cause only for the dead compartments a clause actually emptied. Silent on an observation-free population, so `ferx check` without `--data` does not report every declared entry as dead (#1405) |
 //! | `E_ENDPOINT_UNROUTED`     | a CMT declared as a non-Gaussian endpoint carries Gaussian observations — the population was read without the model's endpoint routing (#1199) |
 //! | `E_ENDPOINT_NO_RECORDS`   | a declared non-Gaussian endpoint has no row routed to it (typically a missing `CMT` column) |
+//! | `E_ENDPOINT_RECORD_KIND`  | a record on an endpoint's CMT is of a variant that endpoint's likelihood does not score (a hand-built population) |
 //! | `E_NO_SCORED_OBSERVATIONS` | the population has no record the likelihood scores — no Gaussian observation and no endpoint record on any subject — so the data contribute nothing to the objective. One population-level finding, last in `check_model_data_rule` so the specific data codes win `fit()`'s first error; the message names `[data_selection]` when it removed observation rows, and otherwise says what makes a row scored (#1491) |
 //! | `E_DATA`                  | the `--data` file could not be read or parsed. Also raised by `run_sir` / `run_covariance` when the re-read of `fit.data_path` fails for any other reason than a covariate column (#1774), through the same classifier; there the message is the reader's own, without `ferx check`'s `Failed to read data file` lead |
 //! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN |
@@ -191,6 +192,7 @@
 //! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
 //! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
+//! | `E_COUNT_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[count_model]` (Poisson / negative-binomial) endpoint (#2877) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM or DTMM) endpoint (#759, #2473) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM or DTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator / transition probabilities use BSV η only, so κ would be ignored (#759, #2473) |
 //! | `E_IMP_MIXTURE_IOV_UNSUPPORTED` | `method = imp` / `impmap` anywhere in the chain on a `[mixture]` model with IOV (`n_kappa > 0`); their mixture E-step has no κ (#2301) |
@@ -406,9 +408,7 @@ impl CheckReport {
     /// Build a report from collected diagnostics; `valid` is derived as
     /// "no error-severity diagnostics present".
     pub fn new(
-        model: impl Into<String>,
-        data: Option<String>,
-        diagnostics: Vec<Diagnostic>,
+        model: impl Into<String>, data: Option<String>, diagnostics: Vec<Diagnostic>,
     ) -> Self {
         let valid = !diagnostics.iter().any(Diagnostic::is_error);
         CheckReport {
@@ -432,10 +432,7 @@ impl CheckReport {
 
     /// Count of `Info`-severity diagnostics (#2387).
     pub fn info_count(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Info)
-            .count()
+        self.diagnostics.iter().filter(|d| d.severity == Severity::Info).count()
     }
 }
 
@@ -514,20 +511,14 @@ impl EngineError {
     /// rewords (`ferx check` renders `block:line` beside a parse error's message, so its
     /// diagnostic drops the ` (line N)` the raw text carries; #2062 review B1).
     pub(crate) fn from_diagnostic_keeping_text(d: Diagnostic, message: String) -> Self {
-        EngineError {
-            message,
-            ..EngineError::from_diagnostic(d)
-        }
+        EngineError { message, ..EngineError::from_diagnostic(d) }
     }
 
     /// An error carrying `d` whose `Display` folds the suggestion in after the
     /// message, capitalised and closed with a full stop — for a refusal whose
     /// historical text read that way. [`message`](Self::message) stays `d.message`.
     pub(crate) fn with_suggestion_in_display(d: Diagnostic) -> Self {
-        EngineError {
-            suggestion_in_display: true,
-            ..EngineError::from_diagnostic(d)
-        }
+        EngineError { suggestion_in_display: true, ..EngineError::from_diagnostic(d) }
     }
 
     /// An error with no diagnostic: [`code`](Self::code) is `None`.
@@ -570,9 +561,7 @@ impl EngineError {
 
     /// The diagnostic's actionable hint, if any.
     pub fn suggestion(&self) -> Option<&str> {
-        self.diagnostic
-            .as_ref()
-            .and_then(|d| d.suggestion.as_deref())
+        self.diagnostic.as_ref().and_then(|d| d.suggestion.as_deref())
     }
 
     /// The message, without the entry-point context and without the suggestion.
@@ -716,10 +705,7 @@ mod tests {
         assert_eq!(folded.code(), Some("E_X"));
         assert_eq!(folded.message(), "Short.");
         assert_eq!(folded.suggestion(), Some("with the advice folded in"));
-        assert_eq!(
-            folded.to_string(),
-            "predict: Short. With the advice folded in."
-        );
+        assert_eq!(folded.to_string(), "predict: Short. With the advice folded in.");
         // The fold is the exception: an ordinary diagnostic with a suggestion prints
         // its message alone.
         let plain_coded = EngineError::from_diagnostic(
@@ -739,10 +725,7 @@ mod tests {
         let d = Diagnostic::error("E_PARSE", "bad");
         let json = serde_json::to_string(&d).unwrap();
         // block / line / suggestion are None → skipped.
-        assert_eq!(
-            json,
-            r#"{"severity":"error","code":"E_PARSE","message":"bad"}"#
-        );
+        assert_eq!(json, r#"{"severity":"error","code":"E_PARSE","message":"bad"}"#);
     }
 }
 

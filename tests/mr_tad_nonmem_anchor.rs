@@ -113,9 +113,8 @@ const MODEL: &str = r"
 ";
 
 fn ofv_for(elim: &str) -> f64 {
-    let model = parse_full_model(&MODEL.replace("{ELIM}", elim))
-        .expect("TAD model must parse")
-        .model;
+    let model =
+        parse_full_model(&MODEL.replace("{ELIM}", elim)).expect("TAD model must parse").model;
     let pop =
         read_nonmem_csv(Path::new("data/mr_tad.csv"), None, None).expect("anchor data must load");
     let opts = FitOptions {
@@ -136,9 +135,7 @@ fn ofv_for(elim: &str) -> f64 {
         inner_tol: 1e-6,
         ..Default::default()
     };
-    fit(&model, &pop, &model.default_params, &opts)
-        .expect("fit must evaluate")
-        .ofv
+    fit(&model, &pop, &model.default_params, &opts).expect("fit must evaluate").ofv
 }
 
 #[test]

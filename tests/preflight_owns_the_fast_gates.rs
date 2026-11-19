@@ -84,14 +84,12 @@ fn preflight() -> PathBuf {
 fn script_array(name: &str) -> Vec<String> {
     let src = std::fs::read_to_string(preflight()).expect("read tools/preflight.sh");
     let needle = format!("\n{name}=(");
-    let start = src
-        .find(&needle)
-        .unwrap_or_else(|| panic!("`{name}=(` not found in tools/preflight.sh"))
-        + needle.len();
+    let start =
+        src.find(&needle).unwrap_or_else(|| panic!("`{name}=(` not found in tools/preflight.sh"))
+            + needle.len();
     let rest = &src[start..];
-    let end = rest
-        .find(')')
-        .unwrap_or_else(|| panic!("unterminated `{name}=(` in tools/preflight.sh"));
+    let end =
+        rest.find(')').unwrap_or_else(|| panic!("unterminated `{name}=(` in tools/preflight.sh"));
     rest[..end].split_whitespace().map(str::to_string).collect()
 }
 
@@ -188,11 +186,8 @@ fn expand_features(listed: &[String]) -> Vec<String> {
     let mut out: Vec<String> = listed.to_vec();
     // Bounded: a cycle is a Cargo error, but this test must not hang on a bad manifest.
     for _ in 0..16 {
-        let grown: Vec<String> = out
-            .iter()
-            .flat_map(|f| deps(f))
-            .filter(|d| !out.contains(d))
-            .collect();
+        let grown: Vec<String> =
+            out.iter().flat_map(|f| deps(f)).filter(|d| !out.contains(d)).collect();
         if grown.is_empty() {
             return out;
         }
@@ -240,9 +235,7 @@ fn ci_yml() -> String {
 /// deeper, so the next two-space `key:` is reliably the next job.
 fn job_body(yml: &str, name: &str) -> String {
     let header = format!("\n  {name}:\n");
-    let start = yml
-        .find(&header)
-        .unwrap_or_else(|| panic!("job `{name}` not found in ci.yml"))
+    let start = yml.find(&header).unwrap_or_else(|| panic!("job `{name}` not found in ci.yml"))
         + header.len();
     let rest = &yml[start..];
     let end = rest
@@ -257,9 +250,7 @@ fn job_body(yml: &str, name: &str) -> String {
             !line.starts_with('-')
                 && !line.starts_with('#')
                 && !line.starts_with(' ')
-                && line[..colon]
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                && line[..colon].chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 && line[..colon].chars().next().is_some_and(|c| c != ' ')
         })
         .map(|(i, _)| i)
@@ -292,9 +283,7 @@ fn run_commands(body: &str) -> Vec<String> {
         let rest = rest.trim();
         // `|`, `>`, and their chomping variants (`|-`, `>+`, …) all open a block scalar.
         let is_block = matches!(rest.chars().next(), Some('|' | '>'))
-            && rest[1..]
-                .chars()
-                .all(|c| matches!(c, '-' | '+' | '0'..='9'));
+            && rest[1..].chars().all(|c| matches!(c, '-' | '+' | '0'..='9'));
         if is_block {
             while let Some(next) = lines.peek() {
                 if next.trim().is_empty() {
@@ -372,11 +361,7 @@ fn the_fast_gate_jobs_delegate_to_preflight_and_never_inline_cargo() {
             "job `{job}` runs cargo inline instead of through tools/preflight.sh (#1157):\n  {}\n\
              Add the command to the `{group}` group in tools/preflight.sh instead, so the \
              local gate and the CI gate stay the same list.",
-            inline
-                .iter()
-                .map(|c| c.as_str())
-                .collect::<Vec<_>>()
-                .join("\n  ")
+            inline.iter().map(|c| c.as_str()).collect::<Vec<_>>().join("\n  ")
         );
 
         // (1b) the job must not be able to skip itself or pass while red. Both turn the
@@ -447,10 +432,7 @@ fn a_failing_gate_fails_the_script_from_every_position() {
         "release-semantics",
     ] {
         let listed = listed_commands(group);
-        assert!(
-            !listed.is_empty(),
-            "group `{group}` lists no commands — nothing to fail"
-        );
+        assert!(!listed.is_empty(), "group `{group}` lists no commands — nothing to fail");
 
         for (idx, cmd) in listed.iter().enumerate() {
             let nth = idx + 1;
@@ -506,11 +488,7 @@ fn fake_cargo_on_path(slot: &str) -> (PathBuf, String) {
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("preflight-{slot}"));
     std::fs::create_dir_all(&tmp).expect("create temp dir");
     write_fake_cargo(&tmp);
-    let path = format!(
-        "{}:{}",
-        tmp.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let path = format!("{}:{}", tmp.display(), std::env::var("PATH").unwrap_or_default());
     (tmp.join("count"), path)
 }
 
@@ -541,18 +519,12 @@ fn the_failure_diagnostic_names_the_group_that_actually_failed() {
         .expect("run tools/preflight.sh fmt check");
 
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        !out.status.success(),
-        "exited 0 with a failing command\n{stderr}"
-    );
+    assert!(!out.status.success(), "exited 0 with a failing command\n{stderr}");
     assert!(
         stderr.contains("group 'check'"),
         "the failure happened in `check` but the diagnostic does not say so:\n{stderr}"
     );
-    assert!(
-        stderr.contains("Check"),
-        "the diagnostic does not name the `Check` CI job:\n{stderr}"
-    );
+    assert!(stderr.contains("Check"), "the diagnostic does not name the `Check` CI job:\n{stderr}");
     assert!(
         !stderr.contains("Format"),
         "the diagnostic blames `Format`, the group that PASSED — a stale CI_JOB sends \
@@ -589,10 +561,7 @@ fn the_gates_run_on_ci_s_toolchain_unless_the_caller_says_otherwise() {
         .output()
         .expect("run tools/preflight.sh check");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "all commands passed but the script failed:\n{stdout}"
-    );
+    assert!(out.status.success(), "all commands passed but the script failed:\n{stdout}");
     assert!(
         stdout.contains("RUSTUP_TOOLCHAIN=nightly"),
         "the gates did not run on nightly, so a local `rustup override` would silently \
@@ -777,10 +746,8 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     // `cargo test -p docs-lint` lines counts 2, leaves the crate unlinted, and makes the
     // blanket vacuous for `docs`. Measured — that mutation leaves all eight group counts at
     // their expected values, and this assertion is the only one in the file that fires.
-    let docs_lint: Vec<String> = listed_commands("docs")
-        .into_iter()
-        .filter(|c| c.contains("cargo clippy"))
-        .collect();
+    let docs_lint: Vec<String> =
+        listed_commands("docs").into_iter().filter(|c| c.contains("cargo clippy")).collect();
     assert!(
         !docs_lint.is_empty(),
         "the `docs` group runs no `cargo clippy`, so `crates/docs-lint` is linted by \
@@ -896,10 +863,7 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     // way, so assert it directly against Cargo.toml instead of by proxy: whatever
     // profile the command selects must be one whose guards are on.
     let dbg = listed_commands("debug-assertions");
-    assert!(
-        !dbg.is_empty(),
-        "the `debug-assertions` group lists no commands"
-    );
+    assert!(!dbg.is_empty(), "the `debug-assertions` group lists no commands");
     for cmd in &dbg {
         assert!(
             cmd.contains("cargo test "),
@@ -917,11 +881,8 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
              guard this group exists to execute compiles to nothing while the run \
              stays green (#344)."
         );
-        let profile = cmd
-            .split_whitespace()
-            .skip_while(|w| *w != "--profile")
-            .nth(1)
-            .unwrap_or_else(|| {
+        let profile =
+            cmd.split_whitespace().skip_while(|w| *w != "--profile").nth(1).unwrap_or_else(|| {
                 panic!(
                     "`{cmd}` selects no `--profile`, so it builds `dev`. That was the \
                      #344 gate, but since #1248 the guards are measured under \
@@ -978,20 +939,14 @@ fn load_bearing_flags_and_feature_coverage_survive_in_the_command_list() {
     // `continuous_value()` / `max_scaled_deviation()` would go unchecked on PRs
     // again — green throughout, which is why this is asserted rather than assumed.
     let rel = listed_commands("release-semantics");
-    assert!(
-        !rel.is_empty(),
-        "the `release-semantics` group lists no commands"
-    );
+    assert!(!rel.is_empty(), "the `release-semantics` group lists no commands");
     for cmd in &rel {
         assert!(
             cmd.contains("cargo test "),
             "`{cmd}` is in the `release-semantics` group but does not RUN anything."
         );
-        let profile = cmd
-            .split_whitespace()
-            .skip_while(|w| *w != "--profile")
-            .nth(1)
-            .unwrap_or_else(|| {
+        let profile =
+            cmd.split_whitespace().skip_while(|w| *w != "--profile").nth(1).unwrap_or_else(|| {
                 panic!(
                     "`{cmd}` selects no `--profile`, so it builds `dev` — which has \
                      the guards ON and no optimisation, i.e. neither of the two things \
@@ -1207,10 +1162,7 @@ fn preflight_is_executable_and_lists_every_group() {
         // Up to the next banner, or to the end.
         let rest = &stdout[start + banner.len()..];
         let end = rest.find("══ ").unwrap_or(rest.len());
-        let got = rest[..end]
-            .lines()
-            .filter(|l| l.trim_start().starts_with("$ "))
-            .count();
+        let got = rest[..end].lines().filter(|l| l.trim_start().starts_with("$ ")).count();
         assert_eq!(
             got, want,
             "group `{group}` lists {got} command(s), expected {want}. If you added or \
@@ -1218,10 +1170,7 @@ fn preflight_is_executable_and_lists_every_group() {
              group's dispatch or one of its `run` lines is silently doing nothing.\n{stdout}"
         );
     }
-    assert!(
-        stdout.contains("nothing was executed"),
-        "`--list` should execute nothing:\n{stdout}"
-    );
+    assert!(stdout.contains("nothing was executed"), "`--list` should execute nothing:\n{stdout}");
 }
 
 /// A no-argument run is **every group except the declared opt-in ones** — and an
@@ -1251,11 +1200,7 @@ fn the_default_run_is_every_group_that_is_not_opt_in_and_ci_runs_the_rest() {
         .current_dir(repo_root())
         .output()
         .expect("run tools/preflight.sh --list");
-    assert!(
-        out.status.success(),
-        "`--list` exited {:?}",
-        out.status.code()
-    );
+    assert!(out.status.success(), "`--list` exited {:?}", out.status.code());
     let walked: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| l.trim().strip_prefix("══ "))
@@ -1263,11 +1208,7 @@ fn the_default_run_is_every_group_that_is_not_opt_in_and_ci_runs_the_rest() {
         .map(str::to_string)
         .collect();
 
-    let want: Vec<String> = all
-        .iter()
-        .filter(|g| !opt_in.contains(g))
-        .cloned()
-        .collect();
+    let want: Vec<String> = all.iter().filter(|g| !opt_in.contains(g)).cloned().collect();
     assert_eq!(
         walked, want,
         "a no-argument run walks {walked:?} but ALL_GROUPS minus OPT_IN_GROUPS is \
@@ -1298,9 +1239,7 @@ fn the_default_run_is_every_group_that_is_not_opt_in_and_ci_runs_the_rest() {
     for g in &opt_in {
         if PINNED_BY_PROFILE.contains(&g.as_str()) {
             let src = std::fs::read_to_string(
-                repo_root()
-                    .join("tests")
-                    .join("preflight_owns_the_fast_gates.rs"),
+                repo_root().join("tests").join("preflight_owns_the_fast_gates.rs"),
             )
             .expect("read this test file");
             assert!(
@@ -1418,15 +1357,10 @@ fn preflight_help_lists_every_group_and_works_from_any_cwd() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    for want in [
-        "Run the fast CI gates locally",
-        "tools/preflight.sh check",
-        "tools/preflight.sh --list",
-    ] {
-        assert!(
-            stdout.contains(want),
-            "`--help` is missing {want:?}:\n{stdout}"
-        );
+    for want in
+        ["Run the fast CI gates locally", "tools/preflight.sh check", "tools/preflight.sh --list"]
+    {
+        assert!(stdout.contains(want), "`--help` is missing {want:?}:\n{stdout}");
     }
 
     // Every group the script will actually dispatch has to be documented. Read from

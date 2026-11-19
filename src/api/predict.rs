@@ -1,39 +1,8 @@
-#![allow(unused_imports)]
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
-use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
-};
-use crate::estimation::saem;
-use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
-    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
-};
+use crate::diagnostics::{first_error, EngineError};
 use crate::pk;
-use crate::propensity_match::MatchMethod;
-use crate::sim::adaptive::{
-    AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
-    DoseLedgerEntry, MonitorSpec,
-};
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
-use crate::types::*;
-use nalgebra::{DMatrix, DVector};
-use rand::{RngExt, SeedableRng};
-use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::Instant;
 
 /// Predict concentrations for a population using given parameters (no random effects).
 ///
@@ -63,9 +32,7 @@ use std::time::Instant;
 /// Exactly the `Err` of [`predict_diag`] for the same input: the bare check message `fit()`
 /// gives for that precondition (#898).
 pub fn predict(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
 ) -> Result<Vec<PredictionResult>, EngineError> {
     predict_diag(model, population, params).map(|out| out.results)
 }
@@ -139,9 +106,7 @@ pub struct PredictionOutput {
 /// diagnostic `ferx check` reports for the same refusal — its `code()`, `block()` and
 /// `suggestion()` — or none where `ferx check` has no code for it (#1746).
 pub fn predict_diag(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
 ) -> Result<PredictionOutput, EngineError> {
     // Start the process-global SS-equilibration non-convergence sink clean, then drain it into
     // this pass's `warnings` (#867, #1652) — the order `simulate_with_options_diag` uses. Without
@@ -151,10 +116,7 @@ pub fn predict_diag(
     let out = predict_diag_undrained(model, population, params)?;
     let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
     warnings.extend(out.warnings);
-    Ok(PredictionOutput {
-        results: out.results,
-        warnings,
-    })
+    Ok(PredictionOutput { results: out.results, warnings })
 }
 
 /// [`predict_diag`] without touching the process-global SS non-convergence sink: the same rows,
@@ -166,9 +128,7 @@ pub fn predict_diag(
 /// start of a multi-start `fit()`, whose starts run concurrently, so one start's sweep would
 /// delete a note another start's objective passes had written (#1652 review r1 #1).
 pub(crate) fn predict_diag_undrained(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
 ) -> Result<PredictionOutput, EngineError> {
     // `predict()` runs no data-check (unlike `fit()`); guard the one
     // model-aware dose precondition so a modeled-`RATE` dose can't reach the
@@ -188,11 +148,7 @@ pub(crate) fn predict_diag_undrained(
     // A bound block on a population never bound for it has no index column to gather
     // on: name the binder before the covariate check, which leaves that column out
     // (#1647).
-    first_error(&check_level_index_columns(
-        model,
-        population,
-        LevelDataEntry::Run,
-    ))?;
+    first_error(&check_level_index_columns(model, population, LevelDataEntry::Run))?;
     // Every identifier the parser could not bind resolves as a covariate, and a
     // covariate absent from the data reads as 0.0 — so an undefined name anywhere in
     // the model (notably `[scaling]`, #1028) silently collapsed the prediction. `fit()`
@@ -216,14 +172,8 @@ pub(crate) fn predict_diag_undrained(
     // it into, so an unroutable infusion errors here with subject/time context
     // instead of panicking deep inside the event-driven walk (#375).
     first_error(&check_dose_compartments(model, population))?;
-    first_error(&check_absorption_closed_form_support_diags(
-        model, population,
-    ))?;
-    first_error(&check_absorption_flip_flop_no_twin_diags(
-        model,
-        population,
-        &params.theta,
-    ))?;
+    first_error(&check_absorption_closed_form_support_diags(model, population))?;
+    first_error(&check_absorption_flip_flop_no_twin_diags(model, population, &params.theta))?;
     // A time-varying covariate on a survival hazard would be silently frozen — refuse
     // rather than return a subtly wrong prediction / simulation (#741; as fit() does).
     #[cfg(feature = "survival")]
@@ -306,9 +256,7 @@ pub(crate) fn predict_diag_undrained(
     let run = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
     let predict_subjects = || {
         let subjects = &population.subjects;
-        assemble(crate::par::map(subjects.len(), |i| {
-            predict_one(&subjects[i])
-        }))
+        assemble(crate::par::map(subjects.len(), |i| predict_one(&subjects[i])))
     };
     let predict_subjects_serial =
         || assemble(population.subjects.iter().map(predict_one).collect());
@@ -385,9 +333,7 @@ pub struct PredictionResult {
 /// (`E_MISSING_COVARIATE`). These are the only checks it makes.
 #[cfg(feature = "survival")]
 pub fn predict_categorical(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
 ) -> Result<Vec<EndpointPredictionResult>, EngineError> {
     // Same guard `predict()` and `fit()` apply: a time-varying covariate on the linear
     // predictor would be silently frozen at its baseline value, since `LinearPredictorFn`
@@ -401,11 +347,7 @@ pub fn predict_categorical(
     unbound_level_refusal(model, "predict_categorical")?;
     // θ against the model's layout, as `predict()` checks it (#1615).
     super::check_theta_length(model, &params.theta)?;
-    first_error(&check_level_index_columns(
-        model,
-        population,
-        LevelDataEntry::Run,
-    ))?;
+    first_error(&check_level_index_columns(model, population, LevelDataEntry::Run))?;
     first_error(&check_covariates(model, population))?;
     // And the routing precondition `predict()` applies (#1199): `predict_binary` walks
     // `obs_records`, so a population read model-blind — its binary rows in the
@@ -419,6 +361,7 @@ pub fn predict_categorical(
     let mut results = Vec::new();
     for subject in &population.subjects {
         crate::categorical::predict_binary(model, subject, &params.theta, &zero_eta, &mut results);
+        crate::categorical::predict_count(model, subject, &params.theta, &zero_eta, &mut results);
     }
     Ok(results)
 }
@@ -530,10 +473,7 @@ pub(crate) fn grid_median_from_cumhaz(time_grid: &[f64], cum_haz: &[f64]) -> f64
 /// Exactly the `Err` of [`predict_survival_diag`] for the same input.
 #[cfg(feature = "survival")]
 pub fn predict_survival(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    time_grid: &[f64],
+    model: &CompiledModel, population: &Population, params: &ModelParameters, time_grid: &[f64],
 ) -> Result<Vec<SurvivalPredictionResult>, EngineError> {
     predict_survival_diag(model, population, params, time_grid).map(|out| out.results)
 }
@@ -577,10 +517,7 @@ pub struct SurvivalPredictionOutput {
 /// returns exactly this function's `Err`.
 #[cfg(feature = "survival")]
 pub fn predict_survival_diag(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    time_grid: &[f64],
+    model: &CompiledModel, population: &Population, params: &ModelParameters, time_grid: &[f64],
 ) -> Result<SurvivalPredictionOutput, EngineError> {
     predict_survival_output(model, population, params, None, time_grid)
 }
@@ -611,11 +548,8 @@ pub fn predict_survival_diag(
 /// model's (in the model's order), or when a population subject has no supplied row.
 #[cfg(feature = "survival")]
 pub fn predict_survival_at_etas_diag(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    etas: &super::SuppliedEtas,
-    time_grid: &[f64],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    etas: &super::SuppliedEtas, time_grid: &[f64],
 ) -> Result<SurvivalPredictionOutput, EngineError> {
     predict_survival_output(model, population, params, Some(etas), time_grid)
 }
@@ -624,11 +558,8 @@ pub fn predict_survival_at_etas_diag(
 /// `None` is the population (η = 0) curve.
 #[cfg(feature = "survival")]
 fn predict_survival_output(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    etas: Option<&super::SuppliedEtas>,
-    time_grid: &[f64],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    etas: Option<&super::SuppliedEtas>, time_grid: &[f64],
 ) -> Result<SurvivalPredictionOutput, EngineError> {
     // The order `predict_diag` uses (#867, #1652): start the sink clean, then drain it ahead
     // of the rest of the bundle.
@@ -651,11 +582,8 @@ fn predict_survival_output(
 /// (resolved after every other check); without, at η = 0.
 #[cfg(feature = "survival")]
 fn predict_survival_rows(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    etas: Option<&super::SuppliedEtas>,
-    time_grid: &[f64],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    etas: Option<&super::SuppliedEtas>, time_grid: &[f64],
 ) -> Result<(Vec<SurvivalPredictionResult>, crate::ode::OdeSolverStats), EngineError> {
     // Deliberately no `check_absorption_flip_flop_no_twin` guard here (unlike
     // `predict`/`simulate`): a survival prediction cannot be corrupted by a degenerate
@@ -681,11 +609,7 @@ fn predict_survival_rows(
     unbound_level_refusal(model, "predict_survival")?;
     // θ against the model's layout, as `predict()` checks it (#1615).
     super::check_theta_length(model, &params.theta)?;
-    first_error(&check_level_index_columns(
-        model,
-        population,
-        LevelDataEntry::Run,
-    ))?;
+    first_error(&check_level_index_columns(model, population, LevelDataEntry::Run))?;
     first_error(&check_covariates(model, population))?;
 
     // A joint PK-TTE hazard reads a PK prediction, so an unroutable dose silently

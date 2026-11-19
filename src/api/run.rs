@@ -1,41 +1,14 @@
-#![allow(unused_imports)]
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
-use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
-};
-use crate::estimation::saem;
+use crate::diagnostics::EngineError;
 use crate::io::data_source::DataSource;
 use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped, read_nonmem_csv_routed,
-    read_nonmem_csv_routed_from, read_nonmem_csv_with_covariates_filtered_mapped,
-    read_nonmem_csv_with_covariates_mapped, CovariateReads, CsvInput, MissingDvPolicy, ObsRouting,
-    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
+    read_nonmem_csv_routed, read_nonmem_csv_routed_from, CovariateReads, CsvInput, MissingDvPolicy,
+    ObsRouting, SelectionFilter,
 };
-use crate::pk;
-use crate::propensity_match::MatchMethod;
-use crate::sim::adaptive::{
-    AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
-    DoseLedgerEntry, MonitorSpec,
-};
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
-use crate::types::*;
-use nalgebra::{DMatrix, DVector};
-use rand::{RngExt, SeedableRng};
-use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
 
 /// Log-transform every observation (including M3 LLOQ values carried on CENS
 /// rows — they live in the same `observations` vector) in place, for LTBS case 2
@@ -93,8 +66,7 @@ fn paths_equivalent(a: &str, b: &str) -> bool {
 ///   (not printed — see "Warning and Error Conventions" in AGENTS.md) for the
 ///   caller to attach to `FitResult.warnings` or a `ferx check` diagnostic.
 pub fn resolve_data_path(
-    model_data_path: Option<&str>,
-    external_data_path: Option<&str>,
+    model_data_path: Option<&str>, external_data_path: Option<&str>,
 ) -> Result<(String, Option<String>), String> {
     match (external_data_path, model_data_path) {
         (Some(ext), Some(model_p)) if !paths_equivalent(ext, model_p) => Ok((
@@ -106,11 +78,9 @@ pub fn resolve_data_path(
         )),
         (Some(ext), _) => Ok((ext.to_string(), None)),
         (None, Some(model_p)) => Ok((model_p.to_string(), None)),
-        (None, None) => Err(
-            "no dataset specified — pass a data path, or set `path = ...` in the \
+        (None, None) => Err("no dataset specified — pass a data path, or set `path = ...` in the \
              model file's `[data]` block"
-                .to_string(),
-        ),
+            .to_string()),
     }
 }
 
@@ -119,8 +89,7 @@ pub fn resolve_data_path(
 /// `data_path` overrides the model's, with a warning recorded on the result.
 /// Returns (FitResult, Population) so caller can write sdtab.
 pub fn run_model_with_data(
-    model_path: &str,
-    data_path: Option<&str>,
+    model_path: &str, data_path: Option<&str>,
 ) -> Result<(FitResult, Population), EngineError> {
     run_model_with_data_inits(model_path, data_path, None)
 }
@@ -184,17 +153,13 @@ pub fn prepare_run(model_path: &str, data_path: Option<&str>) -> Result<Prepared
 /// [`prepare_run`] with the CLI's `--inits-from-nca` override, which has to be
 /// applied before `build_init_params` reads the parsed model.
 pub fn prepare_run_with_inits(
-    model_path: &str,
-    data_path: Option<&str>,
+    model_path: &str, data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
 ) -> Result<PreparedRun, EngineError> {
     // One read of the model file (#1752): the parse, the binders, `model_hash` and
     // the stored `model_text` are all this read, never a later version of the file.
     let crate::io::model_source::ModelSource {
-        text: model_text,
-        hash: model_hash,
-        mut parsed,
-        ..
+        text: model_text, hash: model_hash, mut parsed, ..
     } = read_model_source(model_path)?;
     set_model_name(&mut parsed.model, model_path);
     if let Some(method) = inits_override {
@@ -280,8 +245,7 @@ pub struct RunOverrides {
 /// nothing — so only a positive, differing model-file count is reported. The
 /// override itself is unconditional whenever the caller named the key.
 pub(crate) fn apply_threads_override(
-    options: &mut FitOptions,
-    requested: Option<usize>,
+    options: &mut FitOptions, requested: Option<usize>,
 ) -> Option<String> {
     let requested = requested?;
     let from_file = options.threads;
@@ -307,17 +271,13 @@ pub(crate) fn apply_threads_override(
 /// option. When `inits_override` is `None` the model-file value is used as-is;
 /// when `Some(method)` it forces that NCA strategy regardless of the file.
 pub fn run_model_with_data_inits(
-    model_path: &str,
-    data_path: Option<&str>,
+    model_path: &str, data_path: Option<&str>,
     inits_override: Option<crate::suggest_start::NcaInit>,
 ) -> Result<(FitResult, Population), EngineError> {
     run_model_with_overrides(
         model_path,
         data_path,
-        &RunOverrides {
-            inits_from_nca: inits_override,
-            threads: None,
-        },
+        &RunOverrides { inits_from_nca: inits_override, threads: None },
     )
 }
 
@@ -326,9 +286,7 @@ pub fn run_model_with_data_inits(
 /// surfaces (`--threads`, `--inits-from-nca`) beats the model file rather than
 /// being silently vetoed by it (#1416).
 pub fn run_model_with_overrides(
-    model_path: &str,
-    data_path: Option<&str>,
-    overrides: &RunOverrides,
+    model_path: &str, data_path: Option<&str>, overrides: &RunOverrides,
 ) -> Result<(FitResult, Population), EngineError> {
     let inits_override = overrides.inits_from_nca;
     let PreparedRun {
@@ -365,21 +323,13 @@ pub fn run_model_with_overrides(
     // by `[fit_options] checkpoint = false`. The CLI's `--clean` flag removes an
     // existing checkpoint before this runs, forcing a fresh start.
     if parsed.fit_options.checkpoint {
-        let stem = Path::new(model_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("model");
+        let stem = Path::new(model_path).file_stem().and_then(|s| s.to_str()).unwrap_or("model");
         parsed.fit_options.checkpoint_path = Some(format!("{stem}.tmp"));
         parsed.fit_options.checkpoint_model_hash = model_hash.clone();
         parsed.fit_options.checkpoint_data_hash = data_hash.clone();
     }
 
-    let mut result = fit(
-        &parsed.model,
-        &population,
-        &init_params,
-        &parsed.fit_options,
-    )?;
+    let mut result = fit(&parsed.model, &population, &init_params, &parsed.fit_options)?;
     result.covariate_table = covariate_table;
     let mut appended = false;
     for w in [data_path_warning, threads_warning].into_iter().flatten() {
@@ -417,9 +367,7 @@ pub(crate) fn occasions_are_derived(model: &CompiledModel, options: &FitOptions)
 /// a derived rule is active; `had_column = false` + a throwaway sink because the
 /// override warning already fired inside `fit()`.
 pub(crate) fn derive_output_occasions(
-    model: &CompiledModel,
-    options: &FitOptions,
-    population: &mut Population,
+    model: &CompiledModel, options: &FitOptions, population: &mut Population,
 ) {
     if !occasions_are_derived(model, options) {
         return;
@@ -460,8 +408,7 @@ pub(crate) type SimulationDesignCovariates = (Vec<String>, Vec<HashMap<String, f
 /// — its size, its reported standard error — are constant over the arm by
 /// construction.
 pub(crate) fn simulation_design_covariates(
-    sim_spec: &SimulationSpec,
-    model: &CompiledModel,
+    sim_spec: &SimulationSpec, model: &CompiledModel,
 ) -> Result<SimulationDesignCovariates, String> {
     let names: Vec<String> = sim_spec.covariates.iter().map(|(n, _)| n.clone()).collect();
 
@@ -517,23 +464,13 @@ pub(crate) fn simulation_design_covariates(
              covariates — an arm size behind `weight = N`, a reported standard error behind \
              `weight = SE`, a body weight — are part of the design and must be stated: add \
              `covariate {} = <value>` (or `= [v1, ...]`, one per subject) to [simulation].",
-            missing
-                .iter()
-                .map(|n| format!("`{n}`"))
-                .collect::<Vec<_>>()
-                .join(", "),
+            missing.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", "),
             missing[0],
         ));
     }
 
     let per_subject: Vec<HashMap<String, f64>> = (0..sim_spec.n_subjects)
-        .map(|i| {
-            sim_spec
-                .covariates
-                .iter()
-                .map(|(n, vals)| (n.clone(), vals[i]))
-                .collect()
-        })
+        .map(|i| sim_spec.covariates.iter().map(|(n, vals)| (n.clone(), vals[i])).collect())
         .collect();
     Ok((names, per_subject))
 }
@@ -547,22 +484,16 @@ pub fn run_model_simulate(model_path: &str) -> Result<(FitResult, Population), E
 /// `[fit_options] threads` either (#1416). `inits_from_nca` is inert here — a
 /// simulated design has no observed data to run NCA on.
 pub fn run_model_simulate_with_overrides(
-    model_path: &str,
-    overrides: &RunOverrides,
+    model_path: &str, overrides: &RunOverrides,
 ) -> Result<(FitResult, Population), EngineError> {
     use std::collections::HashMap;
 
     // One read of the model file (#1752), as in `prepare_run_with_inits`.
     let crate::io::model_source::ModelSource {
-        text: model_text,
-        hash: model_hash,
-        mut parsed,
-        ..
+        text: model_text, hash: model_hash, mut parsed, ..
     } = read_model_source(model_path)?;
-    let sim_spec = parsed
-        .simulation
-        .clone()
-        .ok_or_else(super::entry_refusals::simulation_block_missing)?;
+    let sim_spec =
+        parsed.simulation.clone().ok_or_else(super::entry_refusals::simulation_block_missing)?;
     set_model_name(&mut parsed.model, model_path);
 
     eprintln!("Model: {}", parsed.model.name);
@@ -627,6 +558,11 @@ pub fn run_model_simulate_with_overrides(
     let binary_cmts: Vec<usize> = parsed.model.binary_cmts();
     #[cfg(not(feature = "survival"))]
     let binary_cmts: Vec<usize> = Vec::new();
+    // Count endpoints (#2877) observe on the same fixed grid.
+    #[cfg(feature = "survival")]
+    let count_cmts: Vec<usize> = parsed.model.count_cmts();
+    #[cfg(not(feature = "survival"))]
+    let count_cmts: Vec<usize> = Vec::new();
     if sim_spec.obs_times.is_empty() {
         if model_has_continuous {
             return Err(super::entry_refusals::simulation_design(
@@ -634,6 +570,13 @@ pub fn run_model_simulate_with_overrides(
                  (residual-error) endpoint that needs observation times — add \
                  `times = [...]` (a joint PK + TTE design needs both `times` and a \
                  `horizon`)",
+            ));
+        }
+        if !count_cmts.is_empty() {
+            return Err(super::entry_refusals::simulation_design(
+                "[simulation] has no `times`, but the model has a [count_model] endpoint. \
+                 A count is observed on a fixed schedule, so it needs `times = [...]` (a \
+                 `horizon` alone gives it nothing to observe)",
             ));
         }
         if !binary_cmts.is_empty() {
@@ -659,20 +602,13 @@ pub fn run_model_simulate_with_overrides(
     // which `check_per_cmt_error_model` then rejects ("[error_model] has no entry for
     // observed compartment(s) 1"). The binary rows live in `obs_records` instead, so a
     // model with no residual error contributes an empty Gaussian grid.
-    let n_gauss = if model_has_continuous {
-        sim_spec.obs_times.len()
-    } else {
-        0
-    };
+    let n_gauss = if model_has_continuous { sim_spec.obs_times.len() } else { 0 };
     // Per-subject covariate values from `[simulation] covariate NAME = ...` (#1083).
     let (sim_covariate_names, sim_subject_covariates) =
         simulation_design_covariates(&sim_spec, &parsed.model)
             .map_err(super::entry_refusals::simulation_covariate_missing)?;
     let subject_covariates = |i: usize| -> HashMap<String, f64> {
-        sim_subject_covariates
-            .get(i - 1)
-            .cloned()
-            .unwrap_or_default()
+        sim_subject_covariates.get(i - 1).cloned().unwrap_or_default()
     };
 
     // Build template population
@@ -680,19 +616,8 @@ pub fn run_model_simulate_with_overrides(
         .map(|i| Subject {
             obs_rgroup: Vec::new(),
             id: format!("{}", i),
-            doses: vec![DoseEvent::new(
-                0.0,
-                sim_spec.dose_amt,
-                sim_spec.dose_cmt,
-                0.0,
-                false,
-                0.0,
-            )],
-            obs_times: if model_has_continuous {
-                sim_spec.obs_times.clone()
-            } else {
-                Vec::new()
-            },
+            doses: vec![DoseEvent::new(0.0, sim_spec.dose_amt, sim_spec.dose_cmt, 0.0, false, 0.0)],
+            obs_times: if model_has_continuous { sim_spec.obs_times.clone() } else { Vec::new() },
             obs_raw_times: Vec::new(),
             observations: vec![0.0; n_gauss],
             obs_cmts: vec![1; n_gauss],
@@ -745,6 +670,16 @@ pub fn run_model_simulate_with_overrides(
                             state: 0,
                             cmt,
                         }
+                    })
+                }))
+                // Count template rows (#2877), the same shape: `count = 0` is overwritten
+                // by the draw in the write-back below.
+                .chain(count_cmts.iter().flat_map(|&cmt| {
+                    sim_spec.obs_times.iter().map(move |&time| crate::types::ObsRecord::Count {
+                        time,
+                        raw_time: time,
+                        count: 0,
+                        cmt,
                     })
                 }))
                 .collect(),
@@ -805,45 +740,39 @@ pub fn run_model_simulate_with_overrides(
     }
 
     // Simulate
-    eprintln!(
-        "Simulating {} subjects (seed={})...",
-        sim_spec.n_subjects, sim_spec.seed
-    );
+    eprintln!("Simulating {} subjects (seed={})...", sim_spec.n_subjects, sim_spec.seed);
     // Pass the administrative `horizon` through so TTE causes censor at the
     // planned study end (#522). `match_method = None` makes this identical to
     // `simulate_with_seed` for the Gaussian path (same seeded RNG, no matching),
     // and the `None`-matching branch cannot error.
-    let SimulationOutput {
-        results: sim_results,
-        warnings: sim_warnings,
-        ..
-    } = simulate_with_options_diag(
-        &parsed.model,
-        &template,
-        &parsed.model.default_params,
-        1,
-        &SimulateOptions {
-            seed: Some(sim_spec.seed),
-            match_method: None,
-            horizon: sim_spec.horizon,
-            // The template subjects carry no occasion labels, so a derived rule is the
-            // only way an IOV model's κ is drawn here (#1955). Without one,
-            // `check_simulation_iov_occasions` above has already refused the template
-            // with `E_IOV_MISSING_OCC` (#2005), so `W_IOV_NO_OCCASIONS` never reaches here.
-            iov_occasion: Some(parsed.fit_options.iov_occasion.clone()),
-        },
-    )
-    // The step's prefix goes into the message, `"simulation failed: {e}"` byte for byte,
-    // with the simulation's diagnostic kept for `code()` / `block()`. Not `in_context`:
-    // `context()` names an entry point, and it would overwrite an inner one (#2062 review
-    // 2, F4).
-    .map_err(|e| {
-        let text = format!("simulation failed: {e}");
-        match e.diagnostic() {
-            Some(d) => EngineError::from_diagnostic_keeping_text(d.clone(), text),
-            None => EngineError::uncoded(text),
-        }
-    })?;
+    let SimulationOutput { results: sim_results, warnings: sim_warnings, .. } =
+        simulate_with_options_diag(
+            &parsed.model,
+            &template,
+            &parsed.model.default_params,
+            1,
+            &SimulateOptions {
+                seed: Some(sim_spec.seed),
+                match_method: None,
+                horizon: sim_spec.horizon,
+                // The template subjects carry no occasion labels, so a derived rule is the
+                // only way an IOV model's κ is drawn here (#1955). Without one,
+                // `check_simulation_iov_occasions` above has already refused the template
+                // with `E_IOV_MISSING_OCC` (#2005), so `W_IOV_NO_OCCASIONS` never reaches here.
+                iov_occasion: Some(parsed.fit_options.iov_occasion.clone()),
+            },
+        )
+        // The step's prefix goes into the message, `"simulation failed: {e}"` byte for byte,
+        // with the simulation's diagnostic kept for `code()` / `block()`. Not `in_context`:
+        // `context()` names an entry point, and it would overwrite an inner one (#2062 review
+        // 2, F4).
+        .map_err(|e| {
+            let text = format!("simulation failed: {e}");
+            match e.diagnostic() {
+                Some(d) => EngineError::from_diagnostic_keeping_text(d.clone(), text),
+                None => EngineError::uncoded(text),
+            }
+        })?;
 
     // Group the simulation results by subject id once (they are emitted in
     // subject order, but a map keeps the write-back independent of that), then
@@ -883,11 +812,7 @@ pub fn run_model_simulate_with_overrides(
                 // negative, so the positivity floor only applies to natural-scale
                 // simulation.
                 let v = s.outcome.continuous_value();
-                subject.observations[j] = if parsed.model.log_transform {
-                    v
-                } else {
-                    v.max(0.001)
-                };
+                subject.observations[j] = if parsed.model.log_transform { v } else { v.max(0.001) };
             }
         }
 
@@ -926,9 +851,7 @@ pub fn run_model_simulate_with_overrides(
                 // templates created above — so a joint TTE + binary `--simulate`
                 // emitted zero binary rows, reintroducing the very bug the binary
                 // producer exists to fix.
-                subject
-                    .obs_records
-                    .retain(|r| !matches!(r, crate::types::ObsRecord::Event { .. }));
+                subject.obs_records.retain(|r| !matches!(r, crate::types::ObsRecord::Event { .. }));
                 subject.obs_records.splice(0..0, events);
             }
         }
@@ -963,10 +886,7 @@ pub fn run_model_simulate_with_overrides(
                 HashMap::new();
             for s in sims {
                 if let crate::types::SimOutcome::Category { state } = s.outcome {
-                    drawn
-                        .entry((s.cmt, s.time.to_bits()))
-                        .or_default()
-                        .push_back(state);
+                    drawn.entry((s.cmt, s.time.to_bits())).or_default().push_back(state);
                 }
             }
             // Runs unconditionally — and now genuinely so. Two gates once suppressed it:
@@ -979,12 +899,7 @@ pub fn run_model_simulate_with_overrides(
             {
                 // `retain_records` drops a record's covariate snapshot with it (#2562).
                 subject.retain_records(|rec| {
-                    let crate::types::ObsRecord::DiscreteState {
-                        state,
-                        cmt,
-                        raw_time,
-                        ..
-                    } = rec
+                    let crate::types::ObsRecord::DiscreteState { state, cmt, raw_time, .. } = rec
                     else {
                         return true; // not a discrete row — untouched
                     };
@@ -997,10 +912,7 @@ pub fn run_model_simulate_with_overrides(
                     if !binary_cmts.contains(cmt) {
                         return true;
                     }
-                    match drawn
-                        .get_mut(&(*cmt, raw_time.to_bits()))
-                        .and_then(|q| q.pop_front())
-                    {
+                    match drawn.get_mut(&(*cmt, raw_time.to_bits())).and_then(|q| q.pop_front()) {
                         Some(next) => {
                             *state = next;
                             true
@@ -1012,35 +924,48 @@ pub fn run_model_simulate_with_overrides(
                 });
             }
         }
+
+        // Count write-back (#2877): the binary write-back's shape on `Count` rows —
+        // paired by `(cmt, raw_time)` with a queue per key, and a template that received
+        // no draw (a record with no count law, warned at draw time) dropped rather than
+        // fitted as an observed 0.
+        #[cfg(feature = "survival")]
+        if !count_cmts.is_empty() {
+            let mut drawn: HashMap<(usize, u64), std::collections::VecDeque<u32>> = HashMap::new();
+            for s in sims {
+                if let crate::types::SimOutcome::Count { count } = s.outcome {
+                    drawn.entry((s.cmt, s.time.to_bits())).or_default().push_back(count);
+                }
+            }
+            subject.retain_records(|rec| {
+                let crate::types::ObsRecord::Count { count, cmt, raw_time, .. } = rec else {
+                    return true;
+                };
+                match drawn.get_mut(&(*cmt, raw_time.to_bits())).and_then(|q| q.pop_front()) {
+                    Some(next) => {
+                        *count = next;
+                        true
+                    }
+                    None => false,
+                }
+            });
+        }
     }
 
     // `n_obs()` counts only Gaussian observations; add the simulated TTE event
     // rows so a TTE-only `--simulate` run doesn't misleadingly report "0
     // observations" (#522 review).
     #[cfg(feature = "survival")]
-    let n_records = population.n_obs()
-        + population
-            .subjects
-            .iter()
-            .map(|s| s.obs_records.len())
-            .sum::<usize>();
+    let n_records =
+        population.n_obs() + population.subjects.iter().map(|s| s.obs_records.len()).sum::<usize>();
     #[cfg(not(feature = "survival"))]
     let n_records = population.n_obs();
-    eprintln!(
-        "Loaded {} subjects, {} observations",
-        population.subjects.len(),
-        n_records
-    );
+    eprintln!("Loaded {} subjects, {} observations", population.subjects.len(), n_records);
 
     let init_params = build_init_params(&parsed);
     // Same `--threads` precedence as the data path (#1416).
     let threads_warning = apply_threads_override(&mut parsed.fit_options, overrides.threads);
-    let mut result = fit(
-        &parsed.model,
-        &population,
-        &init_params,
-        &parsed.fit_options,
-    )?;
+    let mut result = fit(&parsed.model, &population, &init_params, &parsed.fit_options)?;
     if let Some(w) = threads_warning {
         result.warnings.push(w);
     }
@@ -1130,10 +1055,7 @@ pub(crate) fn referenced_columns(model: &CompiledModel) -> Vec<String> {
 /// declaration. These are still read (leniently) so the model works; the parser
 /// has already warned that they ought to be declared.
 fn undeclared_referenced(model: &CompiledModel, decls: &[CovariateDecl]) -> Vec<String> {
-    referenced_columns(model)
-        .into_iter()
-        .filter(|c| !decls.iter().any(|d| &d.name == c))
-        .collect()
+    referenced_columns(model).into_iter().filter(|c| !decls.iter().any(|d| &d.name == c)).collect()
 }
 
 /// Build a `SelectionFilter` from a model file's `FitOptions` alone.
@@ -1152,12 +1074,8 @@ pub(crate) fn build_selection_filter(opts: &FitOptions) -> Result<Option<Selecti
     {
         return Ok(None);
     }
-    SelectionFilter::from_opts(
-        &opts.ignore_exprs,
-        &opts.accept_exprs,
-        &opts.ignore_subjects,
-    )
-    .map(Some)
+    SelectionFilter::from_opts(&opts.ignore_exprs, &opts.accept_exprs, &opts.ignore_subjects)
+        .map(Some)
 }
 
 /// The merged `[data_selection]` expression strings — the model file's plus the
@@ -1172,8 +1090,7 @@ pub(crate) fn build_selection_filter(opts: &FitOptions) -> Result<Option<Selecti
 /// One implementation of the merge answers both questions, so the filter that runs
 /// and the filter the warning reasons about cannot come apart.
 pub(crate) fn merge_selection_exprs(
-    model_opts: &FitOptions,
-    call_opts: &FitOptions,
+    model_opts: &FitOptions, call_opts: &FitOptions,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     // Merge by accumulating unique strings from both sources.
     let mut ignore = model_opts.ignore_exprs.clone();
@@ -1196,12 +1113,7 @@ pub(crate) fn merge_selection_exprs(
         // subject as a `.ferx` `ignore_subjects = 3` (the model-file parser
         // already quote-strips). Without this the two sources disagree and a
         // duplicate across them fails to dedup.
-        let t = s
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .trim()
-            .to_string();
+        let t = s.trim().trim_matches('"').trim_matches('\'').trim().to_string();
         if !t.is_empty() && !subjects.iter().any(|e| e == &t) {
             subjects.push(t);
         }
@@ -1231,13 +1143,15 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     let tte_cmts: std::collections::HashSet<usize> = model
         .endpoints
         .iter()
-        .filter_map(|(&cmt, ep)| {
-            if matches!(ep, EndpointLikelihood::Tte { .. }) {
-                Some(cmt)
-            } else {
-                None
-            }
-        })
+        .filter_map(
+            |(&cmt, ep)| {
+                if matches!(ep, EndpointLikelihood::Tte { .. }) {
+                    Some(cmt)
+                } else {
+                    None
+                }
+            },
+        )
         .collect();
     #[cfg(not(feature = "survival"))]
     let tte_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -1254,11 +1168,8 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
     let discrete_cmts: std::collections::HashSet<usize> = {
         let discrete: std::collections::HashSet<usize> = model.binary_cmts().into_iter().collect();
         #[cfg(feature = "markov")]
-        let discrete = discrete
-            .into_iter()
-            .chain(model.ctmm_cmts())
-            .chain(model.dtmm_cmts())
-            .collect();
+        let discrete =
+            discrete.into_iter().chain(model.ctmm_cmts()).chain(model.dtmm_cmts()).collect();
         discrete
     };
     #[cfg(not(feature = "survival"))]
@@ -1293,7 +1204,14 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
         .map(|l| l.levels.iter().map(|l| l.column.clone()).collect())
         .unwrap_or_default();
 
+    // Count CMTs (#2877) route to `ObsRecord::Count`.
+    #[cfg(feature = "survival")]
+    let count_cmts: std::collections::HashSet<usize> = model.count_cmts().into_iter().collect();
+    #[cfg(not(feature = "survival"))]
+    let count_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
     ObsRouting::tte_and_discrete(&tte_cmts, &discrete_cmts)
+        .with_count(count_cmts)
         .with_missing_dv(missing_dv)
         .with_design_states(design_states)
         .with_no_carry_forward(no_carry_forward)
@@ -1314,9 +1232,7 @@ fn obs_routing_for(model: &CompiledModel, missing_dv: MissingDvPolicy) -> ObsRou
 fn columns_read_by_relations(model: &CompiledModel) -> CovariateReads {
     CovariateReads {
         exact: referenced_columns(model).into_iter().collect(),
-        any_case: super::output_columns::output_echo_columns(model)
-            .cloned()
-            .collect(),
+        any_case: super::output_columns::output_echo_columns(model).cloned().collect(),
         derived: model.derived_reads().iter().cloned().collect(),
     }
 }
@@ -1364,14 +1280,9 @@ pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
 /// A failure is the [`Diagnostic`](crate::Diagnostic) `ferx check` gives it
 /// ([`read_population_with_diag`]).
 pub(crate) fn read_population_as_fitted(
-    parsed: &ParsedModel,
-    data_path: &str,
+    parsed: &ParsedModel, data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
-    read_population_with_diag(
-        &parsed.model,
-        &ReaderSettings::from_parsed(parsed),
-        data_path,
-    )
+    read_population_with_diag(&parsed.model, &ReaderSettings::from_parsed(parsed), data_path)
 }
 
 /// Everything the dataset reader reads a file with besides the model's endpoint
@@ -1457,12 +1368,8 @@ impl ReaderSettings {
         {
             return Ok(None);
         }
-        SelectionFilter::from_opts(
-            &self.ignore_exprs,
-            &self.accept_exprs,
-            &self.ignore_subjects,
-        )
-        .map(Some)
+        SelectionFilter::from_opts(&self.ignore_exprs, &self.accept_exprs, &self.ignore_subjects)
+            .map(Some)
     }
 }
 
@@ -1475,9 +1382,7 @@ impl ReaderSettings {
 /// `E_COVARIATE_NOT_NUMERIC` for a covariate the reader finds missing or non-numeric,
 /// `E_DATA` for any other read failure.
 pub fn read_population_with(
-    model: &CompiledModel,
-    settings: &ReaderSettings,
-    data_path: &str,
+    model: &CompiledModel, settings: &ReaderSettings, data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>), EngineError> {
     read_population_with_diag(model, settings, data_path).map_err(EngineError::from_diagnostic)
 }
@@ -1487,17 +1392,10 @@ pub fn read_population_with(
 /// compile through `selection_filter_diagnostic`, a read failure through
 /// `data_read_diagnostic`. The message is [`read_population_with`]'s, byte for byte.
 pub(crate) fn read_population_with_diag(
-    model: &CompiledModel,
-    settings: &ReaderSettings,
-    data_path: &str,
+    model: &CompiledModel, settings: &ReaderSettings, data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
     let filter = reader_filter(settings)?;
-    read_population_filtered(
-        model,
-        settings,
-        filter.as_ref(),
-        CsvInput::Path(Path::new(data_path)),
-    )
+    read_population_filtered(model, settings, filter.as_ref(), CsvInput::Path(Path::new(data_path)))
 }
 
 /// [`read_population_with`] over a dataset already read into a [`DataSource`]
@@ -1510,9 +1408,7 @@ pub(crate) fn read_population_with_diag(
 /// The same reader as [`read_population_with`], so a source read from a file gives
 /// the population, the codes and the messages a read of that file's path gives.
 pub fn read_population_with_source(
-    model: &CompiledModel,
-    settings: &ReaderSettings,
-    source: &DataSource,
+    model: &CompiledModel, settings: &ReaderSettings, source: &DataSource,
 ) -> Result<(Population, Option<CovariateTable>), EngineError> {
     reader_filter(settings)
         .and_then(|filter| {
@@ -1532,42 +1428,30 @@ pub fn read_population_with_source(
 /// order: a selection clause that does not compile is reported before the file is
 /// opened.
 pub(crate) fn read_population_hashed_diag(
-    model: &CompiledModel,
-    settings: &ReaderSettings,
-    data_path: &str,
+    model: &CompiledModel, settings: &ReaderSettings, data_path: &str,
 ) -> Result<(Population, Option<CovariateTable>, String), crate::Diagnostic> {
     let filter = reader_filter(settings)?;
     let source =
         DataSource::read(data_path).map_err(|e| super::validation::data_read_diagnostic(&e))?;
-    let (population, table) = read_population_filtered(
-        model,
-        settings,
-        filter.as_ref(),
-        CsvInput::Bytes(&source.bytes),
-    )?;
+    let (population, table) =
+        read_population_filtered(model, settings, filter.as_ref(), CsvInput::Bytes(&source.bytes))?;
     Ok((population, table, source.hash))
 }
 
 /// The `[data_selection]` filter `settings` read with, coded as `ferx check` codes
 /// a clause that does not compile.
 fn reader_filter(settings: &ReaderSettings) -> Result<Option<SelectionFilter>, crate::Diagnostic> {
-    settings
-        .selection_filter()
-        .map_err(super::validation::selection_filter_diagnostic)
+    settings.selection_filter().map_err(super::validation::selection_filter_diagnostic)
 }
 
 /// The one body behind every [`ReaderSettings`] read: [`read_population_for`] with
 /// its arguments taken from `settings`, over a path or bytes.
 fn read_population_filtered(
-    model: &CompiledModel,
-    settings: &ReaderSettings,
-    filter: Option<&SelectionFilter>,
+    model: &CompiledModel, settings: &ReaderSettings, filter: Option<&SelectionFilter>,
     input: CsvInput<'_>,
 ) -> Result<(Population, Option<CovariateTable>), crate::Diagnostic> {
-    let fallback: Option<Vec<&str>> = settings
-        .fallback_columns
-        .as_ref()
-        .map(|cols| cols.iter().map(String::as_str).collect());
+    let fallback: Option<Vec<&str>> =
+        settings.fallback_columns.as_ref().map(|cols| cols.iter().map(String::as_str).collect());
     read_population_for_policy(
         model,
         &settings.covariate_decls,
@@ -1590,9 +1474,7 @@ fn read_population_filtered(
 /// the endpoint's rows come back as event records, not as Gaussian observations
 /// (#1199). With a model file, [`read_population_as_fitted`] is the reader.
 pub(crate) fn read_population_routed_by(
-    model: &CompiledModel,
-    data_path: &Path,
-    iov_column: Option<&str>,
+    model: &CompiledModel, data_path: &Path, iov_column: Option<&str>,
     column_map: &[(String, String)],
 ) -> Result<Population, String> {
     read_nonmem_csv_routed(
@@ -1625,12 +1507,8 @@ pub(crate) fn read_population_routed_by(
 /// vectors. Library consumers (e.g. the R glue) should call this instead of the
 /// individual `read_nonmem_csv*` functions so that TTE routing is applied.
 pub fn read_population_for(
-    model: &CompiledModel,
-    covariate_decls: &Option<Vec<CovariateDecl>>,
-    data_path: &str,
-    fallback_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
+    model: &CompiledModel, covariate_decls: &Option<Vec<CovariateDecl>>, data_path: &str,
+    fallback_columns: Option<&[&str]>, iov_column: Option<&str>, filter: Option<&SelectionFilter>,
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     read_population_for_policy(
@@ -1664,12 +1542,8 @@ pub fn read_population_for(
 /// `MDV=1` still excludes the record — that is the user explicitly saying it is
 /// not an observation.
 pub fn read_population_for_simulation(
-    model: &CompiledModel,
-    covariate_decls: &Option<Vec<CovariateDecl>>,
-    data_path: &str,
-    fallback_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
+    model: &CompiledModel, covariate_decls: &Option<Vec<CovariateDecl>>, data_path: &str,
+    fallback_columns: Option<&[&str]>, iov_column: Option<&str>, filter: Option<&SelectionFilter>,
     column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     read_population_for_policy(
@@ -1689,14 +1563,9 @@ pub fn read_population_for_simulation(
 /// difference between them.
 #[allow(clippy::too_many_arguments)]
 fn read_population_for_policy(
-    model: &CompiledModel,
-    covariate_decls: &Option<Vec<CovariateDecl>>,
-    input: CsvInput<'_>,
-    fallback_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    column_map: &[(String, String)],
-    missing_dv: MissingDvPolicy,
+    model: &CompiledModel, covariate_decls: &Option<Vec<CovariateDecl>>, input: CsvInput<'_>,
+    fallback_columns: Option<&[&str]>, iov_column: Option<&str>, filter: Option<&SelectionFilter>,
+    column_map: &[(String, String)], missing_dv: MissingDvPolicy,
 ) -> Result<(Population, Option<CovariateTable>), String> {
     let routing = obs_routing_for(model, missing_dv);
     let (decls, extra) = match covariate_decls {

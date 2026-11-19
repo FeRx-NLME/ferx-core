@@ -131,10 +131,7 @@ fn arm_population() -> Population {
 }
 
 fn smoke_opts(method: EstimationMethod) -> FitOptions {
-    let mut o = FitOptions {
-        outer_maxiter: 2,
-        ..Default::default()
-    };
+    let mut o = FitOptions { outer_maxiter: 2, ..Default::default() };
     o.method = method;
     o.iov_column = Some("OCC".to_string());
     o.saem_n_exploration = Some(2);
@@ -171,11 +168,7 @@ fn the_declared_weight_matches_the_hand_written_scaling_under_every_estimator() 
             .unwrap_or_else(|e| panic!("{method:?} declared-weight fit: {e}"));
         let b = fit(&by_hand, &pop, &by_hand.default_params, &opts)
             .unwrap_or_else(|e| panic!("{method:?} hand-written fit: {e}"));
-        assert!(
-            a.ofv.is_finite(),
-            "{method:?} returned a non-finite OFV: {}",
-            a.ofv
-        );
+        assert!(a.ofv.is_finite(), "{method:?} returned a non-finite OFV: {}", a.ofv);
         assert!(
             (a.ofv - b.ofv).abs() <= 1e-8 * a.ofv.abs().max(1.0),
             "{method:?}: `weight = NARM` scored {} but the hand-written \
@@ -212,25 +205,14 @@ fn the_weight_changes_the_objective() {
 fn the_fit_reports_the_weight_and_the_typical_arm_size() {
     let declared = parse_model_string(WEIGHTED_KAPPA).expect("weighted model must parse");
     let pop = arm_population();
-    let res = fit(
-        &declared,
-        &pop,
-        &declared.default_params,
-        &smoke_opts(EstimationMethod::Foce),
-    )
-    .expect("weighted fit");
+    let res = fit(&declared, &pop, &declared.default_params, &smoke_opts(EstimationMethod::Foce))
+        .expect("weighted fit");
     assert_eq!(res.kappa_weights, vec![Some("NARM".to_string())]);
     // Eight subject-occasions: four at 200, four at 25 — the median lands on
     // one of the two, and either is a legitimate "typical arm".
     let typical = res.kappa_weight_typical[0].expect("a typical arm size");
-    assert!(
-        typical == 200.0 || typical == 25.0,
-        "unexpected typical arm size {typical}"
-    );
+    assert!(typical == 200.0 || typical == 25.0, "unexpected typical arm size {typical}");
     // #1643: the kappa's scale reaches the `FitResult`, parallel to `kappa_names`,
     // so the printers and ferx-r can tell its CV% from an SD.
-    assert_eq!(
-        res.kappa_param_types,
-        vec![ferx_core::types::EtaParamType::LogNormal]
-    );
+    assert_eq!(res.kappa_param_types, vec![ferx_core::types::EtaParamType::LogNormal]);
 }

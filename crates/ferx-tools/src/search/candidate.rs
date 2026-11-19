@@ -75,21 +75,13 @@ impl FeatureVector {
     /// Display only — the journal round-trips the vector through serde, which
     /// has no separator to collide with, so nothing has to parse this back.
     pub fn render(&self) -> String {
-        self.iter()
-            .map(|(k, v)| format!("{k}={v}"))
-            .collect::<Vec<_>>()
-            .join(";")
+        self.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(";")
     }
 }
 
 impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for FeatureVector {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
-        Self {
-            entries: iter
-                .into_iter()
-                .map(|(k, v)| (k.into(), v.into()))
-                .collect(),
-        }
+        Self { entries: iter.into_iter().map(|(k, v)| (k.into(), v.into())).collect() }
     }
 }
 
@@ -262,7 +254,7 @@ impl Criterion {
     pub fn of(&self, result: &FitResult) -> f64 {
         match self {
             Criterion::Ofv => result.ofv,
-            Criterion::Aic => result.aic,
+            Criterion::Aic => result.aic.unwrap_or(f64::NAN),
             Criterion::Bic(kind) => bic(result, *kind),
             Criterion::Penalized(p) => p.score(result),
         }
@@ -401,10 +393,7 @@ impl CandidateError {
     /// not compile, or does not bind against this run's data. Deterministic, so
     /// a resume reuses it.
     pub fn model(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: false,
-        }
+        Self { message: message.into(), retryable: false }
     }
 
     /// A failure raised by the run rather than by the candidate. A resume
@@ -417,10 +406,7 @@ impl CandidateError {
     /// journalled and reused like any other result. An `Err` out of `fit()` is
     /// the pathological case, and refitting it is cheap because it is rare.
     pub fn environment(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: true,
-        }
+        Self { message: message.into(), retryable: true }
     }
 }
 

@@ -75,17 +75,10 @@ pub(crate) fn spacing(y: &[f64]) -> usize {
     let xbar = (n - 1) as f64 / 2.0;
     let ybar = y.iter().sum::<f64>() / n as f64;
     let sxx: f64 = (0..n).map(|i| (i as f64 - xbar).powi(2)).sum();
-    let slope = y
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as f64 - xbar) * (v - ybar))
-        .sum::<f64>()
-        / sxx;
-    let resid: Vec<f64> = y
-        .iter()
-        .enumerate()
-        .map(|(i, v)| v - ybar - slope * (i as f64 - xbar))
-        .collect();
+    let slope =
+        y.iter().enumerate().map(|(i, v)| (i as f64 - xbar) * (v - ybar)).sum::<f64>() / sxx;
+    let resid: Vec<f64> =
+        y.iter().enumerate().map(|(i, v)| v - ybar - slope * (i as f64 - xbar)).collect();
     let tau = crate::stats::convergence::integrated_autocorr_time(&resid, SPACING_MAX as f64);
     (tau.ceil() as usize).clamp(SPACING_MIN, SPACING_MAX)
 }
@@ -109,17 +102,10 @@ pub(crate) fn trend_test(y: &[f64]) -> Option<bool> {
     let xbar = (b - 1.0) / 2.0;
     let mbar = pts.iter().sum::<f64>() / b;
     let sxx: f64 = (0..CITER).map(|i| (i as f64 - xbar).powi(2)).sum();
-    let slope = pts
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (i as f64 - xbar) * (v - mbar))
-        .sum::<f64>()
-        / sxx;
-    let ss: f64 = pts
-        .iter()
-        .enumerate()
-        .map(|(i, v)| (v - mbar - slope * (i as f64 - xbar)).powi(2))
-        .sum();
+    let slope =
+        pts.iter().enumerate().map(|(i, v)| (i as f64 - xbar) * (v - mbar)).sum::<f64>() / sxx;
+    let ss: f64 =
+        pts.iter().enumerate().map(|(i, v)| (v - mbar - slope * (i as f64 - xbar)).powi(2)).sum();
     // Numerically constant: the fitted change across the points is at rounding level of the
     // series scale. (Not "zero residual": a noiseless exact ramp has zero residual and is a trend.)
     let scale = pts.iter().fold(0.0_f64, |a, v| a.max(v.abs())).max(1e-300);
@@ -142,9 +128,7 @@ pub(crate) fn exploration_bounds(options: &crate::types::FitOptions) -> (bool, u
         None => (
             true,
             options.saem_exploration_min,
-            options
-                .saem_exploration_max
-                .max(options.saem_exploration_min),
+            options.saem_exploration_max.max(options.saem_exploration_min),
         ),
     }
 }
@@ -186,9 +170,7 @@ impl ExplorationMonitor {
     /// Indices of the coordinates not yet shown stationary: drifting, or still
     /// too short to test at their spacing (diagnostics / warning).
     pub(crate) fn drifting(&self) -> Vec<usize> {
-        (0..self.series.len())
-            .filter(|&c| trend_test(&self.series[c]) != Some(false))
-            .collect()
+        (0..self.series.len()).filter(|&c| trend_test(&self.series[c]) != Some(false)).collect()
     }
 }
 
@@ -196,10 +178,7 @@ impl ExplorationMonitor {
 /// log Ω_jj, correlations (and the same for Ω_IOV when present), log σ.
 /// [`exploration_coord_names`] names them in the same order.
 pub(crate) fn exploration_coords(
-    complete_nll: f64,
-    theta: &[f64],
-    omega: &DMatrix<f64>,
-    omega_iov: Option<&DMatrix<f64>>,
+    complete_nll: f64, theta: &[f64], omega: &DMatrix<f64>, omega_iov: Option<&DMatrix<f64>>,
     sigma: &[f64],
 ) -> Vec<f64> {
     let mut out: Vec<f64> = Vec::with_capacity(1 + theta.len() + sigma.len());
@@ -224,10 +203,7 @@ pub(crate) fn exploration_coords(
 /// Names of the coordinates [`exploration_coords`] returns, in its order, for
 /// the maximum-reached warning.
 pub(crate) fn exploration_coord_names(
-    theta: &[String],
-    eta: &[String],
-    kappa: Option<&[String]>,
-    sigma: &[String],
+    theta: &[String], eta: &[String], kappa: Option<&[String]>, sigma: &[String],
 ) -> Vec<String> {
     let mut out = vec!["complete-data -logL".to_string()];
     out.extend(theta.iter().cloned());

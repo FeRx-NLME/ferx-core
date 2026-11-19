@@ -138,9 +138,7 @@ fn data_ofv(fit: &FitResult) -> f64 {
 /// (#1765), else from a usable `packed_estimate`; for a mixture model with at least
 /// one override, a fit with neither (built in R) returns an error (see [`fitted_params_from_result`]).
 pub fn run_sir(
-    fit: &FitResult,
-    model: Option<&CompiledModel>,
-    population: Option<&Population>,
+    fit: &FitResult, model: Option<&CompiledModel>, population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
     // #1758: the fit's recorded SIR settings, wherever the caller left the default. Resolved
@@ -198,9 +196,7 @@ fn resolve_sir_options(fit: &FitResult, options: &FitOptions) -> FitOptions {
 }
 
 fn run_sir_scoped(
-    fit: &FitResult,
-    model: Option<&CompiledModel>,
-    population: Option<&Population>,
+    fit: &FitResult, model: Option<&CompiledModel>, population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
     // Hash verification runs before the covariance check so a stale-input
@@ -229,9 +225,7 @@ fn run_sir_scoped(
     // …and the endpoint-routing precondition (#1199), as `fit()` enforces it: SIR on
     // a population read model-blind would resample the Gaussian half of a joint
     // likelihood. The re-read above is routed; this covers a supplied population.
-    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
-        model_ref, pop_ref, true,
-    ))?;
+    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(model_ref, pop_ref, true))?;
     // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
     crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
         .map_err(|e| e.in_context("run_sir"))?;
@@ -244,9 +238,7 @@ fn run_sir_scoped(
     // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
     // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
     #[cfg(feature = "survival")]
-    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
-        model_ref, pop_ref,
-    ))?;
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(model_ref, pop_ref))?;
 
     // --- Reconstruct ModelParameters (the shape gate) ----------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -337,10 +329,7 @@ mod tests {
         ];
         replace_sir_warnings(&mut warnings, &sir);
         assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(
-            warnings[2].starts_with("SIR: proposal was shrunk"),
-            "{warnings:?}"
-        );
+        assert!(warnings[2].starts_with("SIR: proposal was shrunk"), "{warnings:?}");
 
         // Idempotent: a second pass over the same kernel output adds nothing.
         replace_sir_warnings(&mut warnings, &sir);
@@ -417,21 +406,12 @@ mod tests {
         )
         .expect("fit must converge");
 
-        assert_eq!(
-            fit.model_path.as_deref(),
-            Some(model_path.to_str().unwrap())
-        );
+        assert_eq!(fit.model_path.as_deref(), Some(model_path.to_str().unwrap()));
         assert_eq!(fit.data_path.as_deref(), Some(data_path.to_str().unwrap()));
         assert_eq!(fit.model_hash.as_deref().map(|s| s.len()), Some(64));
         assert_eq!(fit.data_hash.as_deref().map(|s| s.len()), Some(64));
-        assert_eq!(
-            fit.model_hash.as_deref(),
-            Some(sha256_file(&model_path).unwrap().as_str())
-        );
-        assert_eq!(
-            fit.data_hash.as_deref(),
-            Some(sha256_file(&data_path).unwrap().as_str())
-        );
+        assert_eq!(fit.model_hash.as_deref(), Some(sha256_file(&model_path).unwrap().as_str()));
+        assert_eq!(fit.data_hash.as_deref(), Some(sha256_file(&data_path).unwrap().as_str()));
     }
 
     #[test]
@@ -439,11 +419,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (model_path, data_path) = copy_example_to_tempdir(dir.path());
 
-        let opts = FitOptions {
-            verbose: false,
-            run_covariance_step: false,
-            ..FitOptions::default()
-        };
+        let opts =
+            FitOptions { verbose: false, run_covariance_step: false, ..FitOptions::default() };
         let fit = fit_from_files(
             model_path.to_str().unwrap(),
             Some(data_path.to_str().unwrap()),
@@ -478,10 +455,7 @@ mod tests {
 
         // Tamper with the model file (append whitespace — enough to flip the
         // SHA-256). The next run_sir call must refuse.
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&model_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&model_path).unwrap();
         writeln!(f, "  ").unwrap();
         drop(f);
 
@@ -499,9 +473,7 @@ mod tests {
     /// centralises the skip pattern so the SIR happy-path tests don't fail
     /// spuriously.
     fn fit_with_cov_or_skip(
-        model_path: &str,
-        data_path: &str,
-        opts: FitOptions,
+        model_path: &str, data_path: &str, opts: FitOptions,
     ) -> Option<FitResult> {
         let fit = fit_from_files(model_path, Some(data_path), None, Some(opts))
             .expect("fit must converge");
@@ -600,10 +572,7 @@ mod tests {
         ))
         .expect("parse warfarin_iov.ferx")
         .model;
-        assert!(
-            iov_model.n_kappa > 0,
-            "warfarin_iov.ferx must declare kappa"
-        );
+        assert!(iov_model.n_kappa > 0, "warfarin_iov.ferx must declare kappa");
 
         let err = run_sir(&fit, Some(&iov_model), None, &opts).unwrap_err();
         assert!(
@@ -616,8 +585,7 @@ mod tests {
     /// The bits of a SIR CI vector, so `assert_eq!` compares exactly and a `NaN`
     /// endpoint cannot compare equal to anything but the same `NaN`.
     fn ci_bits(ci: &Option<Vec<(f64, f64)>>) -> Option<Vec<(u64, u64)>> {
-        ci.as_ref()
-            .map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
+        ci.as_ref().map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect())
     }
 
     /// #1705: `sir_ci_kappa` is filled on **both** SIR paths and they agree to the
@@ -666,47 +634,23 @@ mod tests {
         bare.sir_ess = None;
         let standalone = run_sir(&bare, Some(model), Some(pop), &opts).expect("run_sir");
 
-        let k_fit = fit
-            .sir_ci_kappa
-            .as_ref()
-            .expect("in-fit SIR filled no sir_ci_kappa");
-        let k_sa = standalone
-            .sir_ci_kappa
-            .as_ref()
-            .expect("standalone run_sir filled no sir_ci_kappa");
+        let k_fit = fit.sir_ci_kappa.as_ref().expect("in-fit SIR filled no sir_ci_kappa");
+        let k_sa =
+            standalone.sir_ci_kappa.as_ref().expect("standalone run_sir filled no sir_ci_kappa");
         assert_eq!(k_fit.len(), fit.kappa_names.len(), "one CI per kappa");
         for &(lo, hi) in k_fit {
             assert!(lo.is_finite() && hi.is_finite(), "κ CI [{lo}, {hi}]");
-            assert!(
-                0.0 < lo && lo <= hi,
-                "κ CI [{lo}, {hi}] is not a variance interval"
-            );
+            assert!(0.0 < lo && lo <= hi, "κ CI [{lo}, {hi}] is not a variance interval");
         }
         assert_eq!(
             ci_bits(&standalone.sir_ci_kappa),
             ci_bits(&fit.sir_ci_kappa),
             "κ: {k_sa:?} vs {k_fit:?}"
         );
-        assert_eq!(
-            ci_bits(&standalone.sir_ci_theta),
-            ci_bits(&fit.sir_ci_theta),
-            "θ"
-        );
-        assert_eq!(
-            ci_bits(&standalone.sir_ci_omega),
-            ci_bits(&fit.sir_ci_omega),
-            "Ω"
-        );
-        assert_eq!(
-            ci_bits(&standalone.sir_ci_sigma),
-            ci_bits(&fit.sir_ci_sigma),
-            "σ"
-        );
-        assert_eq!(
-            standalone.sir_ess.map(f64::to_bits),
-            fit.sir_ess.map(f64::to_bits),
-            "ESS"
-        );
+        assert_eq!(ci_bits(&standalone.sir_ci_theta), ci_bits(&fit.sir_ci_theta), "θ");
+        assert_eq!(ci_bits(&standalone.sir_ci_omega), ci_bits(&fit.sir_ci_omega), "Ω");
+        assert_eq!(ci_bits(&standalone.sir_ci_sigma), ci_bits(&fit.sir_ci_sigma), "σ");
+        assert_eq!(standalone.sir_ess.map(f64::to_bits), fit.sir_ess.map(f64::to_bits), "ESS");
     }
 
     #[test]
@@ -728,10 +672,7 @@ mod tests {
         };
 
         // Append a comment line so the CSV still parses but the hash flips.
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&data_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&data_path).unwrap();
         writeln!(f, "# tampered").unwrap();
         drop(f);
 
@@ -769,10 +710,7 @@ mod tests {
         // run_sir_detects_modified_data_file.
         {
             use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&model_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().append(true).open(&model_path).unwrap();
             writeln!(f, "# tampered").unwrap();
         }
 
@@ -995,10 +933,7 @@ mod tests {
         );
 
         let resolved = resolve_sir_options(&fit, &d);
-        assert_eq!(
-            crate::estimation::sir::SirSettings::from_options(&resolved),
-            rec
-        );
+        assert_eq!(crate::estimation::sir::SirSettings::from_options(&resolved), rec);
 
         // The caller's explicit, non-default value wins over the record.
         let caller = FitOptions {
@@ -1041,10 +976,7 @@ mod tests {
         let unset = FitOptions::default();
         assert_eq!(unset.sir_seed, None, "premise: the caller sets no seed");
         assert_eq!(resolve_sir_options(&fit, &unset).sir_seed, Some(7));
-        let explicit = FitOptions {
-            sir_seed: Some(1),
-            ..FitOptions::default()
-        };
+        let explicit = FitOptions { sir_seed: Some(1), ..FitOptions::default() };
         assert_eq!(resolve_sir_options(&fit, &explicit).sir_seed, Some(1));
     }
 
@@ -1099,9 +1031,7 @@ mod tests {
     /// once with the record and **default** options. The second must repeat the
     /// in-fit SIR to the bit; the first must not, or the row tests nothing.
     fn assert_run_sir_repeats_in_fit_sir(
-        prep: &crate::api::PreparedRun,
-        opts: &FitOptions,
-        row: &str,
+        prep: &crate::api::PreparedRun, opts: &FitOptions, row: &str,
     ) -> FitResult {
         let model = &prep.parsed.model;
         let pop = &prep.population;
@@ -1134,10 +1064,7 @@ mod tests {
             "{row}: premise — default options must score differently, or this row tests nothing"
         );
 
-        let quiet = FitOptions {
-            verbose: false,
-            ..FitOptions::default()
-        };
+        let quiet = FitOptions { verbose: false, ..FitOptions::default() };
         let out =
             run_sir(&sir_outputs_cleared(&fit), Some(model), Some(pop), &quiet).expect("run_sir");
         assert_eq!(
@@ -1146,21 +1073,9 @@ mod tests {
             "{row}: ESS {:?} vs in-fit {ess_fit}",
             out.sir_ess
         );
-        assert_eq!(
-            ci_bits(&out.sir_ci_theta),
-            ci_bits(&fit.sir_ci_theta),
-            "{row}: θ"
-        );
-        assert_eq!(
-            ci_bits(&out.sir_ci_omega),
-            ci_bits(&fit.sir_ci_omega),
-            "{row}: Ω"
-        );
-        assert_eq!(
-            ci_bits(&out.sir_ci_sigma),
-            ci_bits(&fit.sir_ci_sigma),
-            "{row}: σ"
-        );
+        assert_eq!(ci_bits(&out.sir_ci_theta), ci_bits(&fit.sir_ci_theta), "{row}: θ");
+        assert_eq!(ci_bits(&out.sir_ci_omega), ci_bits(&fit.sir_ci_omega), "{row}: Ω");
+        assert_eq!(ci_bits(&out.sir_ci_sigma), ci_bits(&fit.sir_ci_sigma), "{row}: σ");
         assert_eq!(out.sir_settings, fit.sir_settings, "{row}: settings");
         assert_eq!(out.sir_seed, fit.sir_seed, "{row}: seed");
         fit
@@ -1193,20 +1108,11 @@ mod tests {
         let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
             .expect("prepare warfarin");
         let base = warfarin_sir_opts(&prep);
-        let natural = FitOptions {
-            sir_scale: SirScale::Natural,
-            ..base.clone()
-        };
+        let natural = FitOptions { sir_scale: SirScale::Natural, ..base.clone() };
         assert_run_sir_repeats_in_fit_sir(&prep, &natural, "sir_scale = natural");
-        let df3 = FitOptions {
-            sir_df: 3.0,
-            ..base.clone()
-        };
+        let df3 = FitOptions { sir_df: 3.0, ..base.clone() };
         assert_run_sir_repeats_in_fit_sir(&prep, &df3, "sir_df = 3");
-        let maxiter5 = FitOptions {
-            inner_maxiter: 5,
-            ..base
-        };
+        let maxiter5 = FitOptions { inner_maxiter: 5, ..base };
         assert_run_sir_repeats_in_fit_sir(&prep, &maxiter5, "inner_maxiter = 5");
     }
 
@@ -1246,10 +1152,7 @@ mod tests {
     fn run_sir_records_the_settings_it_ran_not_the_inputs() {
         let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
             .expect("prepare warfarin");
-        let opts = FitOptions {
-            sir_df: 3.0,
-            ..warfarin_sir_opts(&prep)
-        };
+        let opts = FitOptions { sir_df: 3.0, ..warfarin_sir_opts(&prep) };
         let model = &prep.parsed.model;
         let pop = &prep.population;
         let fit = crate::api::fit(model, pop, &prep.init_params, &opts).expect("fit");
@@ -1283,10 +1186,7 @@ mod tests {
         let (prep, fit) = fitrx_round_trip_repeats_the_in_fit_sir(3.0);
         let (model, pop) = (&prep.parsed.model, &prep.population);
         let ess_fit = fit.sir_ess.expect("in-fit SIR ran");
-        let quiet = FitOptions {
-            verbose: false,
-            ..FitOptions::default()
-        };
+        let quiet = FitOptions { verbose: false, ..FitOptions::default() };
         // Premise: the same fit with its EBEs at six decimals, as a pre-#1847 bundle
         // stores them, does not repeat it — so the bit identity above is the exact write's.
         let mut rounded = sir_outputs_cleared(&fit);
@@ -1322,10 +1222,7 @@ mod tests {
     ) -> (crate::api::PreparedRun, FitResult) {
         let prep = crate::api::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv"))
             .expect("prepare warfarin");
-        let opts = FitOptions {
-            sir_df,
-            ..warfarin_sir_opts(&prep)
-        };
+        let opts = FitOptions { sir_df, ..warfarin_sir_opts(&prep) };
         let model = &prep.parsed.model;
         let pop = &prep.population;
         let fit = crate::api::fit(model, pop, &prep.init_params, &opts).expect("fit");
@@ -1342,22 +1239,11 @@ mod tests {
         )
         .expect("save");
         let loaded = crate::io::fitrx::load_fit(&path).expect("load").fit;
-        assert_eq!(
-            loaded.sir_settings, fit.sir_settings,
-            "df {sir_df}: record round-trips"
-        );
+        assert_eq!(loaded.sir_settings, fit.sir_settings, "df {sir_df}: record round-trips");
 
-        let quiet = FitOptions {
-            verbose: false,
-            ..FitOptions::default()
-        };
-        let out = run_sir(
-            &sir_outputs_cleared(&loaded),
-            Some(model),
-            Some(pop),
-            &quiet,
-        )
-        .expect("run_sir");
+        let quiet = FitOptions { verbose: false, ..FitOptions::default() };
+        let out = run_sir(&sir_outputs_cleared(&loaded), Some(model), Some(pop), &quiet)
+            .expect("run_sir");
 
         let ess = out.sir_ess.expect("standalone SIR ran");
         assert!(ess.is_finite(), "ESS {ess}");
@@ -1366,11 +1252,7 @@ mod tests {
             ess_fit.to_bits(),
             "df {sir_df}: the reloaded fit must repeat the in-fit SIR: ESS {ess} vs {ess_fit}"
         );
-        assert_eq!(
-            ci_bits(&out.sir_ci_theta),
-            ci_bits(&fit.sir_ci_theta),
-            "df {sir_df}: θ"
-        );
+        assert_eq!(ci_bits(&out.sir_ci_theta), ci_bits(&fit.sir_ci_theta), "df {sir_df}: θ");
 
         (prep, fit)
     }
@@ -1400,26 +1282,13 @@ mod from_fit_bindings {
     /// selection from the re-read: `Select` is refused on the subject count (a panic in
     /// the inner loop before #1622).
     #[test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: opt in with --features slow-tests"
-    )]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn the_re_read_equals_the_model_bound_on_the_fit_data() {
-        for kind in [
-            Kind::Plain,
-            Kind::Median,
-            Kind::Level,
-            Kind::LevelMedian,
-            Kind::Select,
-        ] {
+        for kind in [Kind::Plain, Kind::Median, Kind::Level, Kind::LevelMedian, Kind::Select] {
             let c = sir_case(kind);
-            let want = run_sir(
-                &c.fit,
-                Some(&c.prep.parsed.model),
-                Some(&c.prep.population),
-                &c.opts,
-            )
-            .unwrap_or_else(|e| panic!("{kind:?} oracle: {e}"));
+            let want =
+                run_sir(&c.fit, Some(&c.prep.parsed.model), Some(&c.prep.population), &c.opts)
+                    .unwrap_or_else(|e| panic!("{kind:?} oracle: {e}"));
             let got =
                 run_sir(&c.fit, None, None, &c.opts).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
             let ess = want.sir_ess.expect("the oracle reports an ESS");
@@ -1432,11 +1301,9 @@ mod from_fit_bindings {
                 want.sir_ess
             );
             let ci = |f: &FitResult| {
-                f.sir_ci_theta.as_ref().map(|v| {
-                    v.iter()
-                        .map(|(a, b)| (a.to_bits(), b.to_bits()))
-                        .collect::<Vec<_>>()
-                })
+                f.sir_ci_theta
+                    .as_ref()
+                    .map(|v| v.iter().map(|(a, b)| (a.to_bits(), b.to_bits())).collect::<Vec<_>>())
             };
             assert!(ci(&want).is_some(), "{kind:?}");
             assert_eq!(ci(&got), ci(&want), "{kind:?}: sir_ci_theta bits");
@@ -1454,14 +1321,9 @@ mod from_fit_bindings {
         let mut fit = c.fit.clone();
         fit.data_bindings = Default::default();
         let design = design(&c);
-        let err = run_sir(
-            &fit,
-            Some(&design.parsed.model),
-            Some(&c.prep.population),
-            &c.opts,
-        )
-        .map(|_| ())
-        .expect_err("refused");
+        let err = run_sir(&fit, Some(&design.parsed.model), Some(&c.prep.population), &c.opts)
+            .map(|_| ())
+            .expect_err("refused");
         assert!(
             err.to_string().starts_with(
                 "run_sir: this fit records no data-derived bindings (an older `.fitrx`), so \

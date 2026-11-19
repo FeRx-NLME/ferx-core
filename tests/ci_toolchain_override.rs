@@ -58,9 +58,8 @@ fn every_toolchain_job_overrides_rust_toolchain_toml() {
         let yml: Value = serde_saphyr::from_str(&text)
             .unwrap_or_else(|e| panic!("{name} does not parse as YAML: {e}"));
         let workflow_level = sets_toolchain(&yml["env"]);
-        let jobs = yml["jobs"]
-            .as_object()
-            .unwrap_or_else(|| panic!("{name} has no `jobs:` mapping"));
+        let jobs =
+            yml["jobs"].as_object().unwrap_or_else(|| panic!("{name} has no `jobs:` mapping"));
         for (job, body) in jobs {
             let steps = body["steps"].as_array().map(Vec::as_slice).unwrap_or(&[]);
             if !steps.iter().any(step_uses_toolchain) {
@@ -98,17 +97,9 @@ fn the_detector_sees_a_job_without_the_override() {
     assert!(sets_toolchain(&pinned["env"]));
     let audit: Value =
         serde_saphyr::from_str("steps:\n  - uses: rustsec/audit-check@v2.0.0\n").unwrap();
-    assert!(audit["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(step_uses_toolchain));
+    assert!(audit["steps"].as_array().unwrap().iter().any(step_uses_toolchain));
     let quiet: Value = serde_saphyr::from_str("steps:\n  - run: quarto render docs\n").unwrap();
-    assert!(!quiet["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(step_uses_toolchain));
+    assert!(!quiet["steps"].as_array().unwrap().iter().any(step_uses_toolchain));
 }
 
 #[test]
@@ -120,9 +111,6 @@ fn rust_toolchain_toml_installs_rust_analyzer() {
         .find(|l| l.trim_start().starts_with("components"))
         .expect("rust-toolchain.toml has a `components` list");
     for c in ["rust-analyzer", "clippy", "rustfmt"] {
-        assert!(
-            line.contains(&format!("\"{c}\"")),
-            "`components` lacks {c}: {line}"
-        );
+        assert!(line.contains(&format!("\"{c}\"")), "`components` lacks {c}: {line}");
     }
 }

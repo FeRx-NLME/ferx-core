@@ -97,10 +97,8 @@ fn run_globalsearch_command(args: &[String]) -> Result<i32, String> {
     };
     let threads = parse_threads(args)?;
     let quiet = flag(args, "--quiet");
-    let reuse_from: Vec<PathBuf> = value(args, "--reuse-from")?
-        .map(PathBuf::from)
-        .into_iter()
-        .collect();
+    let reuse_from: Vec<PathBuf> =
+        value(args, "--reuse-from")?.map(PathBuf::from).into_iter().collect();
 
     let mut config = SearchConfig::load(&config_path)?;
     // Refuse a file the grid cannot lay out before the dataset is read.
@@ -146,11 +144,7 @@ fn run_globalsearch_command(args: &[String]) -> Result<i32, String> {
             GlobalsearchEvent::InputFinished { ofv, criterion } => {
                 eprintln!("Input model: OFV {ofv:.3}, criterion {criterion:.3}")
             }
-            GlobalsearchEvent::BatchStarted {
-                step,
-                proposed,
-                candidates,
-            } => eprintln!(
+            GlobalsearchEvent::BatchStarted { step, proposed, candidates } => eprintln!(
                 "{step}: fitting {candidates} new model{} of {proposed} proposed...",
                 if candidates == 1 { "" } else { "s" }
             ),
@@ -202,27 +196,10 @@ mod tests {
 
     #[test]
     fn run_rejects_two_files_and_a_missing_file_and_prints_help() {
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "globalsearch",
-                "a.ferxsearch",
-                "b.ferxsearch"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "globalsearch", "a.ferxsearch", "b.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "globalsearch", "nope.ferxsearch"])), 1);
         assert_eq!(run(&args(&["ferx", "globalsearch", "-h"])), 0);
         assert_eq!(run(&args(&["ferx", "globalsearch"])), 1);
-        assert_eq!(
-            run(&args(&[
-                "ferx",
-                "globalsearch",
-                "x.ferxsearch",
-                "--samples",
-                "3"
-            ])),
-            1
-        );
+        assert_eq!(run(&args(&["ferx", "globalsearch", "x.ferxsearch", "--samples", "3"])), 1);
     }
 }

@@ -84,8 +84,7 @@ pub enum UncertaintyMethod {
 /// model) or no longer unpacks to the fit's reported estimates (they were edited after
 /// the fit, or the model's layout differs).
 pub fn fitted_params_from_result(
-    fit_result: &FitResult,
-    model: &crate::types::CompiledModel,
+    fit_result: &FitResult, model: &crate::types::CompiledModel,
 ) -> Result<ModelParameters, EngineError> {
     // The one `E_PARAM_SHAPE` gate on a fit (#1833): `run_covariance`, `run_sir` and
     // `simulate_with_uncertainty` reach their blocks only through this function.
@@ -104,11 +103,8 @@ pub fn fitted_params_from_result(
         template.omega.free_mask.clone(),
     );
     // Both present, same dimension: the shape check above refused every other cell.
-    let omega_iov = template
-        .omega_iov
-        .as_ref()
-        .zip(fit_result.omega_iov.as_ref())
-        .map(|(iov_template, m)| {
+    let omega_iov =
+        template.omega_iov.as_ref().zip(fit_result.omega_iov.as_ref()).map(|(iov_template, m)| {
             OmegaMatrix::from_matrix_with_mask(
                 m.clone(),
                 iov_template.eta_names.clone(),
@@ -116,10 +112,8 @@ pub fn fitted_params_from_result(
                 iov_template.free_mask.clone(),
             )
         });
-    let sigma = SigmaVector {
-        values: fit_result.sigma.clone(),
-        names: fit_result.sigma_names.clone(),
-    };
+    let sigma =
+        SigmaVector { values: fit_result.sigma.clone(), names: fit_result.sigma_names.clone() };
     let mixture = match template.mixture.as_ref() {
         None => None,
         Some(tmpl) => Some(fitted_mixture(fit_result, template, tmpl, &omega, &sigma)?),
@@ -186,8 +180,7 @@ pub(crate) enum PackedEstimate<'a> {
 /// them (#1765); a fit without that field has no stored counterpart for the segment,
 /// so only its length is checked.
 pub(crate) fn fit_packed_estimate<'a>(
-    fit: &'a FitResult,
-    template: &ModelParameters,
+    fit: &'a FitResult, template: &ModelParameters,
 ) -> PackedEstimate<'a> {
     let Some(v) = fit.packed_estimate.as_deref() else {
         return PackedEstimate::Absent;
@@ -228,10 +221,7 @@ pub(crate) fn fit_packed_estimate<'a>(
     };
     let rho =
         |cs: &[crate::types::ResidualCorrelation]| cs.iter().map(|c| c.rho).collect::<Vec<_>>();
-    let rho_ok = same(
-        &rho(&p.residual_correlations),
-        &rho(&fit.residual_correlations),
-    );
+    let rho_ok = same(&rho(&p.residual_correlations), &rho(&fit.residual_correlations));
     // A fit that records its `[mixture]` override values (#1765) has the segment's
     // counterpart too; one without them (R-built, pre-#1765) is checked by length only.
     let mixture_ok = fit.mixture_overrides.as_deref().is_none_or(|recorded| {
@@ -260,17 +250,12 @@ pub(crate) fn fit_packed_estimate<'a>(
 /// flags), so they come back `FIX` here too: the standalone covariance and SIR steps then
 /// treat as fixed exactly the coordinates the in-fit ones did.
 fn fitted_mixture(
-    fit_result: &FitResult,
-    template: &ModelParameters,
-    tmpl: &crate::types::MixtureParams,
-    omega: &OmegaMatrix,
-    sigma: &SigmaVector,
+    fit_result: &FitResult, template: &ModelParameters, tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix, sigma: &SigmaVector,
 ) -> Result<crate::types::MixtureParams, EngineError> {
     let mut mix = fitted_mixture_values(fit_result, template, tmpl, omega, sigma)?;
     let ran_saem = fit_result.method == crate::types::EstimationMethod::Saem
-        || fit_result
-            .method_chain
-            .contains(&crate::types::EstimationMethod::Saem);
+        || fit_result.method_chain.contains(&crate::types::EstimationMethod::Saem);
     if ran_saem {
         mix.sigma_override_fixed.fill(true);
     }
@@ -279,11 +264,8 @@ fn fitted_mixture(
 
 /// [`fitted_mixture`]'s class matrices, with the template's FIX flags.
 fn fitted_mixture_values(
-    fit_result: &FitResult,
-    template: &ModelParameters,
-    tmpl: &crate::types::MixtureParams,
-    omega: &OmegaMatrix,
-    sigma: &SigmaVector,
+    fit_result: &FitResult, template: &ModelParameters, tmpl: &crate::types::MixtureParams,
+    omega: &OmegaMatrix, sigma: &SigmaVector,
 ) -> Result<crate::types::MixtureParams, EngineError> {
     use crate::estimation::parameterization::{mixture_from_base, mixture_from_overrides};
     let n_overrides = tmpl.omega_override_addr.len() + tmpl.sigma_override_addr.len();
@@ -371,11 +353,7 @@ pub(crate) fn regularised_cholesky(cov: &DMatrix<f64>) -> Result<DMatrix<f64>, S
     }
     let eig = sym.clone().symmetric_eigen();
     let min_eig = eig.eigenvalues.min();
-    let reg = if min_eig < 1e-8 {
-        -min_eig + 1e-8
-    } else {
-        1e-8
-    };
+    let reg = if min_eig < 1e-8 { -min_eig + 1e-8 } else { 1e-8 };
     let reg_cov = &sym + DMatrix::identity(n, n) * reg;
     reg_cov
         .cholesky()
@@ -470,9 +448,7 @@ impl LogitThetaCoord {
 /// declared upper bound above 1, where the clamped likelihood is flat past 1.
 /// It is `E_LOGIT_THETA_OUT_OF_RANGE` (#2044), whose suggestion is that fix.
 pub(crate) fn logit_theta_coords(
-    template: &ModelParameters,
-    theta_transform: &[ThetaTransform],
-    fixed_mask: &[bool],
+    template: &ModelParameters, theta_transform: &[ThetaTransform], fixed_mask: &[bool],
 ) -> Result<Vec<LogitThetaCoord>, crate::diagnostics::Diagnostic> {
     let mut coords = Vec::new();
     for i in 0..template.theta.len() {
@@ -481,11 +457,7 @@ pub(crate) fn logit_theta_coords(
         }
         let t = template.theta[i];
         if !(t > 0.0 && t < 1.0) {
-            let name = template
-                .theta_names
-                .get(i)
-                .map(String::as_str)
-                .unwrap_or("?");
+            let name = template.theta_names.get(i).map(String::as_str).unwrap_or("?");
             return Err(crate::api::logit_theta_out_of_range(name, t));
         }
         coords.push(LogitThetaCoord {
@@ -500,9 +472,7 @@ pub(crate) fn logit_theta_coords(
 /// coordinate becomes `logit(θ̂)` and its row and column of `cov` are scaled by
 /// `dy/dx` at the estimate (the delta method). Other coordinates are untouched.
 pub(crate) fn to_draw_scale(
-    x_hat: &[f64],
-    cov: &DMatrix<f64>,
-    coords: &[LogitThetaCoord],
+    x_hat: &[f64], cov: &DMatrix<f64>, coords: &[LogitThetaCoord],
 ) -> (Vec<f64>, DMatrix<f64>) {
     let mut y_hat = x_hat.to_vec();
     let mut cov_y = cov.clone();
@@ -519,8 +489,7 @@ pub(crate) fn to_draw_scale(
 /// Move packed bounds onto the draw scale. A θ bound at or beyond 0 / 1 maps
 /// to `∓LOGIT_DRAW_LIMIT` instead of `∓inf`.
 pub(crate) fn bounds_to_draw_scale(
-    bounds: &PackedBounds,
-    coords: &[LogitThetaCoord],
+    bounds: &PackedBounds, coords: &[LogitThetaCoord],
 ) -> PackedBounds {
     let mut lower = bounds.lower.clone();
     let mut upper = bounds.upper.clone();
@@ -529,17 +498,9 @@ pub(crate) fn bounds_to_draw_scale(
         // A bound outside (0, 1) has no logit (`x_to_y` is NaN there, or ±inf
         // exactly at 0 / 1), so it becomes the limit on its own side.
         let lo = c.x_to_y(lower[i]);
-        lower[i] = if lo.is_nan() {
-            -LOGIT_DRAW_LIMIT
-        } else {
-            lo.max(-LOGIT_DRAW_LIMIT)
-        };
+        lower[i] = if lo.is_nan() { -LOGIT_DRAW_LIMIT } else { lo.max(-LOGIT_DRAW_LIMIT) };
         let hi = c.x_to_y(upper[i]);
-        upper[i] = if hi.is_nan() {
-            LOGIT_DRAW_LIMIT
-        } else {
-            hi.min(LOGIT_DRAW_LIMIT)
-        };
+        upper[i] = if hi.is_nan() { LOGIT_DRAW_LIMIT } else { hi.min(LOGIT_DRAW_LIMIT) };
     }
     PackedBounds { lower, upper }
 }
@@ -579,9 +540,7 @@ pub(crate) fn log_abs_jacobian(x: &[f64], coords: &[LogitThetaCoord]) -> f64 {
 /// Constant terms are kept so the value is the exact log-determinant; SIR uses
 /// it relative to the estimate, where they cancel.
 pub(crate) fn log_abs_jacobian_natural(
-    x: &[f64],
-    template: &ModelParameters,
-    fixed: &[bool],
+    x: &[f64], template: &ModelParameters, fixed: &[bool],
 ) -> f64 {
     log_abs_jacobian_natural_g::<f64>(x, template, fixed)
 }
@@ -590,9 +549,7 @@ pub(crate) fn log_abs_jacobian_natural(
 /// gradient ([`log_abs_jacobian_natural_grad`]) is the exact derivative of the value SIR
 /// weighs with. Over `f64` the operations are the value's own, bit for bit.
 pub(crate) fn log_abs_jacobian_natural_g<T: crate::sens::num::PkNum>(
-    x: &[T],
-    template: &ModelParameters,
-    fixed: &[bool],
+    x: &[T], template: &ModelParameters, fixed: &[bool],
 ) -> T {
     let seg = packed_segments(template);
     let free = |i: usize| !fixed[i];
@@ -635,11 +592,7 @@ pub(crate) fn log_abs_jacobian_natural_g<T: crate::sens::num::PkNum>(
         if free(i) {
             // ln(1 − tanh² z) = ln 4 − 2|z| − 2·ln(1 + e^{−2|z|}): finite at any z.
             let z = x[i];
-            let a = if z.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
-                z
-            } else {
-                -z
-            };
+            let a = if z.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) { z } else { -z };
             let ln4 = T::from_f64(4.0f64.ln());
             out = out + (ln4 - two * a - two * (T::from_f64(1.0) + (-two * a).exp()).ln());
         }
@@ -652,10 +605,7 @@ pub(crate) fn log_abs_jacobian_natural_g<T: crate::sens::num::PkNum>(
 /// central difference of [`log_abs_jacobian_natural`] itself (step `1e-6·max(|xᵢ|, 1)`), which
 /// `model`'s fit reports (`W_PLAN_FD_FALLBACK`).
 pub(crate) fn log_abs_jacobian_natural_grad(
-    model: &crate::types::CompiledModel,
-    x: &[f64],
-    template: &ModelParameters,
-    fixed: &[bool],
+    model: &crate::types::CompiledModel, x: &[f64], template: &ModelParameters, fixed: &[bool],
 ) -> Vec<f64> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
     if let Some((_, mut g, _)) = kj::derivs(model, x, 1, false, &|xr| {
@@ -738,17 +688,14 @@ pub(crate) fn admissible_values(p: &ModelParameters) -> bool {
 /// Out-of-bounds or invalid draws are rejected and resampled, up to
 /// `10 * n_draws` total attempts.
 pub fn draw_parameter_samples(
-    fit_result: &FitResult,
-    template: &ModelParameters,
-    n_draws: usize,
-    method: UncertaintyMethod,
+    fit_result: &FitResult, template: &ModelParameters, n_draws: usize, method: UncertaintyMethod,
     rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, String> {
     draw_parameter_samples_coded(fit_result, template, n_draws, method, rng)
         .map_err(|e| e.to_string())
 }
 
-/// [`draw_parameter_samples`], refusing with an [`EngineError`] that carries the code of
+/// `draw_parameter_samples`, refusing with an [`EngineError`] that carries the code of
 /// a refusal of its input (#2044): `E_FIT_INPUT_MISSING` for a covariance matrix or SIR
 /// pool the fit does not carry (or an empty pool), `E_FIT_INPUT_MODEL` for one that is
 /// not the size of the template's packed parameters, and `E_LOGIT_THETA_OUT_OF_RANGE` on
@@ -757,10 +704,7 @@ pub fn draw_parameter_samples(
 /// draws) carry none. `simulate_with_uncertainty` returns it as is; the public `String`
 /// function is its `to_string()`, unchanged.
 pub(crate) fn draw_parameter_samples_coded(
-    fit_result: &FitResult,
-    template: &ModelParameters,
-    n_draws: usize,
-    method: UncertaintyMethod,
+    fit_result: &FitResult, template: &ModelParameters, n_draws: usize, method: UncertaintyMethod,
     rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, EngineError> {
     if n_draws == 0 {
@@ -773,10 +717,7 @@ pub(crate) fn draw_parameter_samples_coded(
 }
 
 fn draw_asymptotic(
-    fit_result: &FitResult,
-    template: &ModelParameters,
-    n_draws: usize,
-    rng: &mut impl Rng,
+    fit_result: &FitResult, template: &ModelParameters, n_draws: usize, rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, EngineError> {
     let cov = fit_result.covariance_matrix.as_ref().ok_or_else(|| {
         crate::api::fit_input_missing(
@@ -864,10 +805,7 @@ fn draw_asymptotic(
 }
 
 fn draw_sir(
-    fit_result: &FitResult,
-    template: &ModelParameters,
-    n_draws: usize,
-    rng: &mut impl Rng,
+    fit_result: &FitResult, template: &ModelParameters, n_draws: usize, rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, EngineError> {
     let pool = fit_result.sir_resamples_packed.as_ref().ok_or_else(|| {
         crate::api::fit_input_missing(
@@ -953,23 +891,13 @@ mod tests {
         let omega_matrix = DMatrix::from_diagonal(&DVector::from_vec(vec![0.04]));
         let omega = OmegaMatrix::from_matrix(omega_matrix, vec!["eta_CL".to_string()], true);
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 5.0],
             theta_names: vec!["CL".to_string(), "V".to_string()],
             theta_lower: vec![1e-3, 1e-3],
             theta_upper: vec![1e6, 1e6],
             theta_fixed: vec![false, false],
-            omega,
-            omega_fixed: vec![false],
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["prop_err".to_string()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            sigma: SigmaVector { values: vec![0.1], names: vec!["prop_err".to_string()] },
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
@@ -991,8 +919,8 @@ mod tests {
             covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
-            aic: 0.0,
-            bic: 0.0,
+            aic: Some(0.0),
+            bic: Some(0.0),
             theta: template.theta.clone(),
             theta_names: template.theta_names.clone(),
             eta_names: template.omega.eta_names.clone(),
@@ -1025,6 +953,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            saem_objective: None,
             impmap_trace: None,
             bayes: None,
             vi: None,
@@ -1044,6 +973,7 @@ mod tests {
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
             saem_n_exploration_used: None,
+            mstep_optimizer_used: None,
             gradient_method_inner: String::new(),
             gradient_method_outer: String::new(),
             uses_ode_solver: false,
@@ -1279,17 +1209,11 @@ mod tests {
         let (fit, template) = fit_at_own_pack("examples/warfarin_iov.ferx");
         assert!(template.omega_iov.is_some(), "fixture must carry Ω_IOV");
         let v = fit.packed_estimate.clone().unwrap();
-        assert_eq!(
-            fit_packed_estimate(&fit, &template),
-            PackedEstimate::Usable(&v)
-        );
+        assert_eq!(fit_packed_estimate(&fit, &template), PackedEstimate::Usable(&v));
 
         let mut absent = fit.clone();
         absent.packed_estimate = None;
-        assert_eq!(
-            fit_packed_estimate(&absent, &template),
-            PackedEstimate::Absent
-        );
+        assert_eq!(fit_packed_estimate(&absent, &template), PackedEstimate::Absent);
 
         for n in [v.len() - 1, v.len() + 1] {
             let mut wrong = fit.clone();
@@ -1306,9 +1230,7 @@ mod tests {
             ("theta[0]", |f| one_ulp(&mut f.theta[0])),
             ("omega(0,0)", |f| one_ulp(&mut f.omega[(0, 0)])),
             ("sigma[0]", |f| one_ulp(&mut f.sigma[0])),
-            ("omega_iov(0,0)", |f| {
-                one_ulp(&mut f.omega_iov.as_mut().unwrap()[(0, 0)])
-            }),
+            ("omega_iov(0,0)", |f| one_ulp(&mut f.omega_iov.as_mut().unwrap()[(0, 0)])),
         ];
         for (field, edit) in edits {
             let mut stale = fit.clone();
@@ -1321,14 +1243,8 @@ mod tests {
         }
 
         let (fit, template) = fit_at_own_pack("examples/correlated_residual_combined.ferx");
-        assert!(
-            !fit.residual_correlations.is_empty(),
-            "fixture must carry a block_sigma ρ"
-        );
-        assert!(matches!(
-            fit_packed_estimate(&fit, &template),
-            PackedEstimate::Usable(_)
-        ));
+        assert!(!fit.residual_correlations.is_empty(), "fixture must carry a block_sigma ρ");
+        assert!(matches!(fit_packed_estimate(&fit, &template), PackedEstimate::Usable(_)));
         let mut stale = fit.clone();
         one_ulp(&mut stale.residual_correlations[0].rho);
         assert_eq!(
@@ -1348,14 +1264,9 @@ mod tests {
         let fit = fit_with_cov(&template, cov);
 
         let mut rng = StdRng::seed_from_u64(42);
-        let draws = draw_parameter_samples(
-            &fit,
-            &template,
-            2000,
-            UncertaintyMethod::Asymptotic,
-            &mut rng,
-        )
-        .unwrap();
+        let draws =
+            draw_parameter_samples(&fit, &template, 2000, UncertaintyMethod::Asymptotic, &mut rng)
+                .unwrap();
         assert_eq!(draws.len(), 2000);
 
         // Empirical theta means should be close to template theta.
@@ -1440,11 +1351,7 @@ mod tests {
             draw_parameter_samples(&fit, &template, 50, UncertaintyMethod::Asymptotic, &mut rng)
                 .unwrap();
         for d in &draws {
-            assert!(
-                d.theta[0] <= 1.05 + 1e-12,
-                "theta_1 = {} exceeded upper",
-                d.theta[0]
-            );
+            assert!(d.theta[0] <= 1.05 + 1e-12, "theta_1 = {} exceeded upper", d.theta[0]);
         }
     }
 
@@ -1488,11 +1395,7 @@ mod tests {
         // natural-scale round-trip through `unpack_params` is ULP-accurate
         // rather than bit-exact.
         for d in &draws {
-            assert!(
-                (d.theta[0] - 1.0).abs() < 1e-12,
-                "fixed TVCL drifted: {}",
-                d.theta[0]
-            );
+            assert!((d.theta[0] - 1.0).abs() < 1e-12, "fixed TVCL drifted: {}", d.theta[0]);
             assert!(
                 (d.sigma.values[0] - 0.1).abs() < 1e-12,
                 "fixed sigma drifted: {}",
@@ -1500,10 +1403,7 @@ mod tests {
             );
         }
         let any_v_varies = draws.iter().any(|d| (d.theta[1] - 5.0).abs() > 1e-6);
-        assert!(
-            any_v_varies,
-            "free parameter V was inadvertently pinned by the clamp"
-        );
+        assert!(any_v_varies, "free parameter V was inadvertently pinned by the clamp");
     }
 
     /// #2797: a collapse the covariance step held (its row of the matrix zero) is held in
@@ -1554,10 +1454,7 @@ mod tests {
         let s_hat = template.sigma.values[0];
         let pinned = sigma_draws(&held);
         for s in &pinned {
-            assert!(
-                s.is_finite() && (s - s_hat).abs() < 1e-12,
-                "held σ ({reason:?}) drifted: {s}"
-            );
+            assert!(s.is_finite() && (s - s_hat).abs() < 1e-12, "held σ ({reason:?}) drifted: {s}");
         }
         let scattered = sigma_draws(&free);
         assert!(
@@ -1570,11 +1467,7 @@ mod tests {
     /// and a `FitResult` whose covariance gives every coordinate variance
     /// `1e-4` except `F`'s packed coordinate (index 2), which gets `var_f`.
     fn logit_fixture(
-        f_hat: f64,
-        lower: f64,
-        upper: f64,
-        var_f: f64,
-        transform: ThetaTransform,
+        f_hat: f64, lower: f64, upper: f64, var_f: f64, transform: ThetaTransform,
     ) -> (ModelParameters, FitResult) {
         let mut template = tiny_template();
         template.theta.push(f_hat);
@@ -1619,10 +1512,7 @@ mod tests {
         let (template, fit) =
             logit_fixture(0.7, 0.001, 0.999, 0.09, ThetaTransform::LogitProbability);
         let f = draw_f(&template, &fit, 4000, 11);
-        assert!(
-            f.iter().all(|&t| t > 0.0 && t < 0.999),
-            "draw left (0, 0.999)"
-        );
+        assert!(f.iter().all(|&t| t > 0.0 && t < 0.999), "draw left (0, 0.999)");
         // The log-normal draw this replaces puts 12% of its mass above 0.999
         // (all rejected) and piles the survivors against the bound: ~0.6% of
         // draws land in (0.99, 0.999), vs `P(Z > (logit 0.99 − logit 0.7)) =
@@ -1631,15 +1521,8 @@ mod tests {
         assert!(near_ceiling <= 4, "{near_ceiling}/4000 draws above 0.99");
         let y: Vec<f64> = f.iter().map(|&t| logit(t)).collect();
         let (m, sd) = mean_sd(&y);
-        assert!(
-            (m - logit(0.7)).abs() < MEAN_TOL,
-            "logit mean {m} vs {}",
-            logit(0.7)
-        );
-        assert!(
-            (sd - 1.0).abs() < SD_TOL,
-            "logit sd {sd} vs delta-method 1.0"
-        );
+        assert!((m - logit(0.7)).abs() < MEAN_TOL, "logit mean {m} vs {}", logit(0.7));
+        assert!((sd - 1.0).abs() < SD_TOL, "logit sd {sd} vs delta-method 1.0");
     }
 
     /// #1548: with the declared upper bound above 1 (here 5), a log-normal draw
@@ -1669,22 +1552,14 @@ mod tests {
     /// a logit SD of exactly 1.
     #[test]
     fn asymptotic_identity_packed_logit_probability_uses_its_own_jacobian() {
-        let (template, fit) = logit_fixture(
-            0.7,
-            -1.0,
-            5.0,
-            0.21 * 0.21,
-            ThetaTransform::LogitProbability,
-        );
+        let (template, fit) =
+            logit_fixture(0.7, -1.0, 5.0, 0.21 * 0.21, ThetaTransform::LogitProbability);
         let f = draw_f(&template, &fit, 4000, 17);
         assert!(f.iter().all(|&t| t > 0.0 && t < 1.0), "draw left (0, 1)");
         let y: Vec<f64> = f.iter().map(|&t| logit(t)).collect();
         let (m, sd) = mean_sd(&y);
         assert!((m - logit(0.7)).abs() < MEAN_TOL, "logit mean {m}");
-        assert!(
-            (sd - 1.0).abs() < SD_TOL,
-            "logit sd {sd} vs delta-method 1.0"
-        );
+        assert!((sd - 1.0).abs() < SD_TOL, "logit sd {sd} vs delta-method 1.0");
     }
 
     /// `x_to_y` / `y_to_x` invert each other on both packings, `dx_dy` is the
@@ -1692,10 +1567,7 @@ mod tests {
     #[test]
     fn logit_theta_coord_round_trips_and_differentiates() {
         for log_packed in [true, false] {
-            let c = LogitThetaCoord {
-                index: 0,
-                log_packed,
-            };
+            let c = LogitThetaCoord { index: 0, log_packed };
             for t in [1e-6, 0.05, 0.5, 0.7, 0.999] {
                 let x = if log_packed { f64::ln(t) } else { t };
                 let y = c.x_to_y(x);
@@ -1723,30 +1595,15 @@ mod tests {
             upper: vec![f64::ln(0.999), 5.0, 1.0],
         };
         let coords = [
-            LogitThetaCoord {
-                index: 0,
-                log_packed: true,
-            },
-            LogitThetaCoord {
-                index: 1,
-                log_packed: false,
-            },
-            LogitThetaCoord {
-                index: 2,
-                log_packed: false,
-            },
+            LogitThetaCoord { index: 0, log_packed: true },
+            LogitThetaCoord { index: 1, log_packed: false },
+            LogitThetaCoord { index: 2, log_packed: false },
         ];
         let y = bounds_to_draw_scale(&b, &coords);
         assert!((y.lower[0] - logit(0.001)).abs() < 1e-9);
         assert!((y.upper[0] - logit(0.999)).abs() < 1e-9);
-        assert_eq!(
-            (y.lower[1], y.upper[1]),
-            (-LOGIT_DRAW_LIMIT, LOGIT_DRAW_LIMIT)
-        );
-        assert_eq!(
-            (y.lower[2], y.upper[2]),
-            (-LOGIT_DRAW_LIMIT, LOGIT_DRAW_LIMIT)
-        );
+        assert_eq!((y.lower[1], y.upper[1]), (-LOGIT_DRAW_LIMIT, LOGIT_DRAW_LIMIT));
+        assert_eq!((y.lower[2], y.upper[2]), (-LOGIT_DRAW_LIMIT, LOGIT_DRAW_LIMIT));
         assert!((LOGIT_DRAW_LIMIT - logit(1.0 - 1e-15)).abs() < 1e-3);
     }
 
@@ -1757,10 +1614,7 @@ mod tests {
     fn to_draw_scale_applies_the_delta_method() {
         let x_hat = [f64::ln(0.7), 2.0];
         let cov = DMatrix::from_row_slice(2, 2, &[0.09, 0.02, 0.02, 0.5]);
-        let c = LogitThetaCoord {
-            index: 0,
-            log_packed: true,
-        };
+        let c = LogitThetaCoord { index: 0, log_packed: true };
         let (y_hat, cov_y) = to_draw_scale(&x_hat, &cov, &[c]);
         let d = 1.0 / 0.3;
         assert!((y_hat[0] - logit(0.7)).abs() < 1e-12);
@@ -1778,34 +1632,20 @@ mod tests {
     fn logit_theta_coords_selects_free_logit_probability_thetas() {
         let (mut template, _) =
             logit_fixture(0.7, 0.001, 0.999, 0.09, ThetaTransform::LogitProbability);
-        let tt = [
-            ThetaTransform::Log,
-            ThetaTransform::Logit,
-            ThetaTransform::LogitProbability,
-        ];
+        let tt = [ThetaTransform::Log, ThetaTransform::Logit, ThetaTransform::LogitProbability];
         let free = [false; 5];
         assert_eq!(
             logit_theta_coords(&template, &tt, &free).unwrap(),
-            vec![LogitThetaCoord {
-                index: 2,
-                log_packed: true
-            }]
+            vec![LogitThetaCoord { index: 2, log_packed: true }]
         );
-        assert!(logit_theta_coords(&template, &[], &free)
-            .unwrap()
-            .is_empty());
+        assert!(logit_theta_coords(&template, &[], &free).unwrap().is_empty());
         let mut fixed = free;
         fixed[2] = true;
-        assert!(logit_theta_coords(&template, &tt, &fixed)
-            .unwrap()
-            .is_empty());
+        assert!(logit_theta_coords(&template, &tt, &fixed).unwrap().is_empty());
         template.theta_lower[2] = -1.0;
         assert_eq!(
             logit_theta_coords(&template, &tt, &free).unwrap(),
-            vec![LogitThetaCoord {
-                index: 2,
-                log_packed: false
-            }]
+            vec![LogitThetaCoord { index: 2, log_packed: false }]
         );
     }
 
@@ -1815,11 +1655,7 @@ mod tests {
     /// estimate is fine: it is pinned, never drawn.
     #[test]
     fn logit_theta_coords_rejects_a_free_estimate_outside_the_unit_interval() {
-        let tt = [
-            ThetaTransform::Log,
-            ThetaTransform::Log,
-            ThetaTransform::LogitProbability,
-        ];
+        let tt = [ThetaTransform::Log, ThetaTransform::Log, ThetaTransform::LogitProbability];
         for (f_hat, lower) in [(1.0, 0.001), (1.2, 0.001), (0.0, -1.0), (-0.3, -1.0)] {
             let (template, _) =
                 logit_fixture(f_hat, lower, 5.0, 0.09, ThetaTransform::LogitProbability);
@@ -1841,9 +1677,7 @@ mod tests {
             );
             let mut fixed = [false; 5];
             fixed[2] = true;
-            assert!(logit_theta_coords(&template, &tt, &fixed)
-                .unwrap()
-                .is_empty());
+            assert!(logit_theta_coords(&template, &tt, &fixed).unwrap().is_empty());
         }
     }
 
@@ -1889,16 +1723,13 @@ mod tests {
             f
         };
         let no_cov = with(&fit, &|f| f.covariance_matrix = None);
-        let small_cov = with(&fit, &|f| {
-            f.covariance_matrix = Some(DMatrix::identity(2, 2))
-        });
+        let small_cov = with(&fit, &|f| f.covariance_matrix = Some(DMatrix::identity(2, 2)));
         let no_pool = with(&fit, &|f| f.sir_resamples_packed = None);
         let empty_pool = with(&fit, &|f| f.sir_resamples_packed = Some(Vec::new()));
         let short_pool = with(&fit, &|f| f.sir_resamples_packed = Some(vec![vec![0.0; 2]]));
         let logit_no_cov = with(&logit_fit, &|f| f.covariance_matrix = None);
-        let logit_small_cov = with(&logit_fit, &|f| {
-            f.covariance_matrix = Some(DMatrix::identity(2, 2))
-        });
+        let logit_small_cov =
+            with(&logit_fit, &|f| f.covariance_matrix = Some(DMatrix::identity(2, 2)));
         let missing_cov = "Asymptotic uncertainty requires FitResult.covariance_matrix; run the \
              fit with `covariance = true` and ensure the covariance step succeeds.";
         let small = format!("Covariance matrix (2x2) doesn't match packed parameters ({n})");
@@ -2025,15 +1856,11 @@ mod tests {
         let mut pinned = logit_t.clone();
         pinned.theta_fixed[2] = true;
         let mut rng = StdRng::seed_from_u64(0);
-        assert!(
-            draw_parameter_samples_coded(&logit_fit, &pinned, 10, Asymptotic, &mut rng).is_ok()
-        );
+        assert!(draw_parameter_samples_coded(&logit_fit, &pinned, 10, Asymptotic, &mut rng).is_ok());
         let mut rng = StdRng::seed_from_u64(0);
-        assert!(
-            draw_parameter_samples_coded(&no_cov, &template, 0, Asymptotic, &mut rng)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(draw_parameter_samples_coded(&no_cov, &template, 0, Asymptotic, &mut rng)
+            .unwrap()
+            .is_empty());
     }
 
     /// From `y ≈ 36.7` on, `inv_logit(y)` rounds to exactly 1.0 — through
@@ -2043,28 +1870,17 @@ mod tests {
     /// the limit and ~12% above 36.7: without the cut-off those return F = 1.
     #[test]
     fn asymptotic_logit_draws_never_saturate_to_one() {
-        let c = LogitThetaCoord {
-            index: 0,
-            log_packed: false,
-        };
+        let c = LogitThetaCoord { index: 0, log_packed: false };
         assert_eq!(c.y_to_x(40.0), f64::INFINITY);
         assert!(c.y_to_x(LOGIT_DRAW_LIMIT) < 1.0);
-        let c_log = LogitThetaCoord {
-            index: 0,
-            log_packed: true,
-        };
+        let c_log = LogitThetaCoord { index: 0, log_packed: true };
         assert_eq!(c_log.y_to_x(40.0), f64::INFINITY);
         assert!(c_log.y_to_x(LOGIT_DRAW_LIMIT).exp() < 1.0);
 
         // sd(x) = 30 · dx/dy at 0.7: θ(1 − θ) = 0.21 identity-packed, 1 − θ = 0.3 log-packed.
         for (lower, sd_x) in [(-1.0, 30.0 * 0.21), (0.001, 30.0 * 0.3)] {
-            let (template, fit) = logit_fixture(
-                0.7,
-                lower,
-                5.0,
-                sd_x * sd_x,
-                ThetaTransform::LogitProbability,
-            );
+            let (template, fit) =
+                logit_fixture(0.7, lower, 5.0, sd_x * sd_x, ThetaTransform::LogitProbability);
             let f = draw_f(&template, &fit, 2000, 3);
             let at_one = f.iter().filter(|&&t| t >= 1.0).count();
             assert_eq!(at_one, 0, "lower {lower}: {at_one}/2000 draws at F = 1");
@@ -2094,10 +1910,7 @@ mod tests {
     fn admissible_values_requires_positive_variances_and_only_finite_theta() {
         let mut base = tiny_template();
         base.theta[0] = -3.0;
-        base.omega_iov = Some(OmegaMatrix::from_diagonal(
-            &[0.01],
-            vec!["kappa_CL".to_string()],
-        ));
+        base.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.01], vec!["kappa_CL".to_string()]));
         assert!(admissible_values(&base), "a negative θ is admissible");
 
         let rejects = |what: &str, edit: &dyn Fn(&mut ModelParameters)| {
@@ -2111,12 +1924,8 @@ mod tests {
         rejects("σ = 0", &|p| p.sigma.values[0] = 0.0);
         rejects("Ω variance < 0", &|p| p.omega.matrix[(0, 0)] = -0.04);
         rejects("Ω Cholesky diagonal < 0", &|p| p.omega.chol[(0, 0)] = -0.2);
-        rejects("κ variance < 0", &|p| {
-            p.omega_iov.as_mut().unwrap().matrix[(0, 0)] = -0.01
-        });
-        rejects("κ Cholesky diagonal < 0", &|p| {
-            p.omega_iov.as_mut().unwrap().chol[(0, 0)] = -0.1
-        });
+        rejects("κ variance < 0", &|p| p.omega_iov.as_mut().unwrap().matrix[(0, 0)] = -0.01);
+        rejects("κ Cholesky diagonal < 0", &|p| p.omega_iov.as_mut().unwrap().chol[(0, 0)] = -0.1);
     }
 
     /// #1701 on the MVN sampler: a θ declared `(-0.05, -5, 5)` packs on its
@@ -2136,14 +1945,9 @@ mod tests {
         let cov = DMatrix::identity(n_packed, n_packed) * 0.01; // sd 0.1
         let fit = fit_with_cov(&template, cov);
         let mut rng = StdRng::seed_from_u64(1701);
-        let draws = draw_parameter_samples(
-            &fit,
-            &template,
-            4000,
-            UncertaintyMethod::Asymptotic,
-            &mut rng,
-        )
-        .unwrap();
+        let draws =
+            draw_parameter_samples(&fit, &template, 4000, UncertaintyMethod::Asymptotic, &mut rng)
+                .unwrap();
         let th: Vec<f64> = draws.iter().map(|p| p.theta[0]).collect();
         assert!(th.iter().all(|t| t.is_finite()));
         assert!(
@@ -2211,16 +2015,9 @@ mod tests {
             theta_fixed: vec![false, false, false, true],
             omega: OmegaMatrix::from_matrix(om, names("ETA", 6), false),
             omega_fixed: vec![true, false, false, false, false, false],
-            sigma: SigmaVector {
-                values: vec![0.2, 0.5],
-                names: names("EPS", 2),
-            },
+            sigma: SigmaVector { values: vec![0.2, 0.5], names: names("EPS", 2) },
             sigma_fixed: vec![false, false],
-            residual_correlations: vec![ResidualCorrelation {
-                sigma_i: 0,
-                sigma_j: 1,
-                rho: 0.3,
-            }],
+            residual_correlations: vec![ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.3 }],
             residual_correlation_fixed: vec![false],
             omega_iov: Some(OmegaMatrix::from_matrix(iov, names("KAPPA", 2), false)),
             kappa_fixed: vec![false, false],
@@ -2267,13 +2064,7 @@ mod tests {
         let x0: Vec<f64> = packed
             .iter()
             .enumerate()
-            .map(|(i, &v)| {
-                if fixed[i] {
-                    v
-                } else {
-                    v + 0.2 * ((i % 3) as f64 - 1.0)
-                }
-            })
+            .map(|(i, &v)| if fixed[i] { v } else { v + 0.2 * ((i % 3) as f64 - 1.0) })
             .collect();
         // The fit whose W_PLAN_FD_FALLBACK a failed recording is reported in (#2786).
         let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
@@ -2288,11 +2079,7 @@ mod tests {
         .expect("data");
         use crate::parser::model_parser::rhs_regcode::kernel_jit::{plan_failures, FORCED_FAILURE};
         let g = log_abs_jacobian_natural_grad(&model, &x0, &t, &fixed);
-        assert_eq!(
-            plan_failures(&model, &pop.subjects),
-            None,
-            "an exact gradient reports nothing"
-        );
+        assert_eq!(plan_failures(&model, &pop.subjects), None, "an exact gradient reports nothing");
         let seg = packed_segments(&t);
         let mut want = vec![0.0; x0.len()];
         for (i, w) in want.iter_mut().enumerate().take(seg.theta) {
@@ -2344,10 +2131,7 @@ mod tests {
         // ... and is reported, for every subject: the log-Jacobian enters each one's draw.
         let (k, why) = plan_failures(&model, &pop.subjects).expect("the fallback is reported");
         assert_eq!(k, pop.subjects.len(), "{why}");
-        assert!(
-            why.contains("θ-only recording") && why.contains(FORCED_FAILURE),
-            "{why}"
-        );
+        assert!(why.contains("θ-only recording") && why.contains(FORCED_FAILURE), "{why}");
         let mut worst = 0.0f64;
         for (a, b) in fd.iter().zip(&want) {
             assert!(a.is_finite() && b.is_finite(), "{fd:?} vs {want:?}");
@@ -2374,13 +2158,7 @@ mod tests {
             let x0: Vec<f64> = packed
                 .iter()
                 .enumerate()
-                .map(|(i, &v)| {
-                    if fixed[i] {
-                        v
-                    } else {
-                        v + shift * ((i % 3) as f64 - 1.0)
-                    }
-                })
+                .map(|(i, &v)| if fixed[i] { v } else { v + shift * ((i % 3) as f64 - 1.0) })
                 .collect();
             let h = 1e-6;
             let mut jac = DMatrix::zeros(free.len(), free.len());

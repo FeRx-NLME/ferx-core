@@ -80,9 +80,8 @@ fn warfarin_tail_rate_banded(rule: &str, seed: u64, band: Option<&str>) -> f64 {
             .expect("scale_deadband parses");
     }
     let res = fit(&model, &pop, &model.default_params, &opts).expect("warfarin SAEM Ok");
-    let rate = res
-        .saem_mh_accept_tail
-        .expect("a 400-iteration SAEM fit must report a tail acceptance");
+    let rate =
+        res.saem_mh_accept_tail.expect("a 400-iteration SAEM fit must report a tail acceptance");
     // A `NaN` from a diverged solve would sail through every comparison below
     // (any comparison against NaN is false, so a `<` bound would simply fail,
     // but a range `contains` would too) — assert finiteness explicitly so the
@@ -118,10 +117,7 @@ fn warfarin_tail_rate_banded(rule: &str, seed: u64, band: Option<&str>) -> f64 {
 /// 12345 — both inside the bounds above, and both moved by less than the
 /// cross-seed spread, so the bounds were not recalibrated.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn warfarin_saem_reaches_target_only_under_robbins_monro() {
     let interval = warfarin_tail_rate("interval");
     let rm = warfarin_tail_rate("robbins_monro");
@@ -172,10 +168,7 @@ fn warfarin_saem_reaches_target_only_under_robbins_monro() {
 /// not a weaker test of the same thing: it is the bound for a different,
 /// measured quantity, and the straddle assertion is what pins the rescue.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_default_deadband_still_rescues_warfarin() {
     let interval = warfarin_tail_rate("interval");
     let banded = warfarin_tail_rate_banded("robbins_monro", 12345, Some("0.15,0.60"));

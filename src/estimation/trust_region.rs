@@ -55,18 +55,11 @@ impl FoceiProblem<'_> {
     fn run_inner(&self, x: &[f64]) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>) {
         let params = unpack_params(x, self.init_params);
         let warm = self.cached_etas.lock().unwrap().clone();
-        let warm_ref = if warm.is_empty() {
-            None
-        } else {
-            Some(warm.as_slice())
-        };
+        let warm_ref = if warm.is_empty() { None } else { Some(warm.as_slice()) };
         let mu_k = compute_mu_k(self.model, &params.theta, self.options.mu_referencing);
         // `run_inner_loop_warm_seeded`'s solve, with the #2076 certificate carried through.
         // Every pass's modes become the cache below.
-        let prev = std::mem::replace(
-            &mut *self.cached_etas_kind.lock().unwrap(),
-            PrevEtas::Solved,
-        );
+        let prev = std::mem::replace(&mut *self.cached_etas_kind.lock().unwrap(), PrevEtas::Solved);
         let (etas, h_mats, _, _kappas, _) = run_inner_loop_warm_map(
             self.model,
             self.population,
@@ -180,12 +173,8 @@ impl CostFunction for FoceiProblem<'_> {
         // Pre-warm the gradient cache with EBEs so that a subsequent
         // gradient() call on the same x skips the redundant run_inner().
         // per_subj_grads: vec![] is the sentinel for "EBEs ready, AD pending".
-        *self.grad_cache.lock().unwrap() = Some(GradCache {
-            x: p.clone(),
-            etas,
-            h_mats,
-            per_subj_grads: vec![],
-        });
+        *self.grad_cache.lock().unwrap() =
+            Some(GradCache { x: p.clone(), etas, h_mats, per_subj_grads: vec![] });
         Ok(ofv)
     }
 }
@@ -243,8 +232,7 @@ impl Hessian for FoceiProblem<'_> {
         // would read poor on each step and the radius would shrink for no
         // reason. Both pieces are PSD, so the BHHH model stays PSD.
         let params = unpack_params(p, self.init_params);
-        self.nn_reg
-            .add_packed_hessian(&params.theta, &mut |i, j, v| h[i][j] += v);
+        self.nn_reg.add_packed_hessian(&params.theta, &mut |i, j, v| h[i][j] += v);
         // Parameter-prior curvature (#254): the exact `2/s²` diagonal, not an
         // approximation. Same reason it has to be here as the NN term — the
         // gradient carries the prior's pull, so a quadratic model without its
@@ -265,10 +253,7 @@ impl Hessian for FoceiProblem<'_> {
 ///
 /// Returns the step `δ` satisfying the trust constraint.
 pub(crate) fn solve_trust_region_subproblem(
-    g: &DVector<f64>,
-    h: &DMatrix<f64>,
-    trust_radius: f64,
-    max_iters: usize,
+    g: &DVector<f64>, h: &DMatrix<f64>, trust_radius: f64, max_iters: usize,
 ) -> DVector<f64> {
     let n = g.len();
 
@@ -331,11 +316,7 @@ fn boundary_step(p: &DVector<f64>, d: &DVector<f64>, delta: f64) -> DVector<f64>
     if d_sq < 1e-30 {
         // d is negligible — return p clamped to the boundary (or as-is if inside).
         let p_norm = p_sq.sqrt();
-        return if p_norm > 1e-30 {
-            p * (delta / p_norm)
-        } else {
-            p.clone()
-        };
+        return if p_norm > 1e-30 { p * (delta / p_norm) } else { p.clone() };
     }
 
     // disc = (p·d)² − ‖d‖²(‖p‖² − Δ²) ≥ 0 since p is inside the ball.
@@ -409,12 +390,7 @@ fn l2_norm(v: &[f64]) -> f64 {
 /// `xtol · (1 + ‖x‖)`. Both are relative, so neither depends on the scale of the
 /// dataset or the parameterization.
 fn made_progress(
-    prev_cost: f64,
-    cost: f64,
-    prev_x: &[f64],
-    x: &[f64],
-    ftol: f64,
-    xtol: f64,
+    prev_cost: f64, cost: f64, prev_x: &[f64], x: &[f64], ftol: f64, xtol: f64,
 ) -> bool {
     let improved = prev_cost - cost;
     if improved.is_nan() || improved > ftol * (1.0 + cost.abs()) {
@@ -424,13 +400,7 @@ fn made_progress(
     if prev_x.len() != x.len() {
         return true;
     }
-    let step = l2_norm(
-        &prev_x
-            .iter()
-            .zip(x)
-            .map(|(p, c)| c - p)
-            .collect::<Vec<f64>>(),
-    );
+    let step = l2_norm(&prev_x.iter().zip(x).map(|(p, c)| c - p).collect::<Vec<f64>>());
     let x_norm = l2_norm(x);
     step > xtol * (1.0 + x_norm)
 }
@@ -512,8 +482,7 @@ impl TrustRegionWithStop {
     /// looser than every other optimizer on exactly the near-flat frailty-ω²
     /// ridge #469 tightened it for.
     fn new(
-        inner: TrustRegion<Steihaug<Vec<f64>, f64>, f64>,
-        model: &CompiledModel,
+        inner: TrustRegion<Steihaug<Vec<f64>, f64>, f64>, model: &CompiledModel,
         options: &FitOptions,
     ) -> Self {
         Self {
@@ -584,9 +553,7 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
     }
 
     fn init(
-        &mut self,
-        problem: &mut Problem<FoceiProblem<'a>>,
-        state: TrState,
+        &mut self, problem: &mut Problem<FoceiProblem<'a>>, state: TrState,
     ) -> Result<(TrState, Option<KV>), Error> {
         let (state, kv) = self.inner.init(problem, state)?;
         self.observe_state(problem, &state);
@@ -594,9 +561,7 @@ impl<'a> Solver<FoceiProblem<'a>, TrState> for TrustRegionWithStop {
     }
 
     fn next_iter(
-        &mut self,
-        problem: &mut Problem<FoceiProblem<'a>>,
-        state: TrState,
+        &mut self, problem: &mut Problem<FoceiProblem<'a>>, state: TrState,
     ) -> Result<(TrState, Option<KV>), Error> {
         let (state, kv) = self.inner.next_iter(problem, state)?;
         self.observe_state(problem, &state);
@@ -689,10 +654,9 @@ fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Op
                 )),
             )
         }
-        TerminationStatus::Terminated(reason) => (
-            false,
-            Some(format!("Trust-region did not converge: {reason}")),
-        ),
+        TerminationStatus::Terminated(reason) => {
+            (false, Some(format!("Trust-region did not converge: {reason}")))
+        }
         // Unreachable: the executor only returns once the state is terminated.
         TerminationStatus::NotTerminated => (
             false,
@@ -713,10 +677,7 @@ fn classify_termination(status: &TerminationStatus, max_iters: u64) -> (bool, Op
 /// that belongs to a different parameter vector than the estimates it is printed
 /// next to. `gradient` is not called when `skip_gradient` is set (a cancelled run).
 fn clamped_point_and_gradient<G>(
-    mut best: Vec<f64>,
-    bounds: &PackedBounds,
-    skip_gradient: bool,
-    gradient: G,
+    mut best: Vec<f64>, bounds: &PackedBounds, skip_gradient: bool, gradient: G,
 ) -> (Vec<f64>, Option<Vec<f64>>)
 where
     G: FnOnce(&Vec<f64>) -> Option<Vec<f64>>,
@@ -726,31 +687,23 @@ where
     (best, grad)
 }
 
-pub fn optimize_trust_region(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+#[cfg(test)]
+pub(crate) fn optimize_trust_region(
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
     optimize_trust_region_seeded(model, population, init_params, options, None)
 }
 
-/// [`optimize_trust_region`] with the first evaluation's EBEs supplied: `first_eval_etas`
+/// `optimize_trust_region` with the first evaluation's EBEs supplied: `first_eval_etas`
 /// are the EBEs already solved at the packed, clamped `init_params` (the flat-theta
 /// pre-flight's, #2076), so the first inner solve starts at that mode instead of solving
 /// it cold a second time. `None` is the cold start.
 pub(crate) fn optimize_trust_region_seeded(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
-    options: &FitOptions,
-    first_eval_etas: Option<&[DVector<f64>]>,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
+    options: &FitOptions, first_eval_etas: Option<&[DVector<f64>]>,
 ) -> OuterResult {
-    let PackedStart {
-        packed: mut x0,
-        bounds,
-        ..
-    } = pack_with_bounds(init_params);
+    let PackedStart { packed: mut x0, bounds, .. } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x0, &bounds);
 
     let mut warnings = Vec::new();
@@ -763,10 +716,7 @@ pub(crate) fn optimize_trust_region_seeded(
     // The post-run clamp below needs the box after `problem` has taken it and
     // argmin has swallowed `problem`. Two `Vec<f64>` copies, against a second
     // `compute_bounds` walk of the same unchanged template (#1252).
-    let post_run_bounds = PackedBounds {
-        lower: bounds.lower.clone(),
-        upper: bounds.upper.clone(),
-    };
+    let post_run_bounds = PackedBounds { lower: bounds.lower.clone(), upper: bounds.upper.clone() };
     let problem = FoceiProblem {
         model,
         population,
@@ -790,15 +740,11 @@ pub(crate) fn optimize_trust_region_seeded(
     };
 
     if options.verbose {
-        eprintln!(
-            "Starting trust-region optimization ({} parameters)...",
-            x0.len()
-        );
+        eprintln!("Starting trust-region optimization ({} parameters)...", x0.len());
     }
 
-    let cg_budget = options
-        .steihaug_max_iters
-        .unwrap_or_else(|| adaptive_steihaug_budget(x0.len()));
+    let cg_budget =
+        options.steihaug_max_iters.unwrap_or_else(|| adaptive_steihaug_budget(x0.len()));
 
     let subproblem = Steihaug::new().with_max_iters(cg_budget as u64);
     let solver = TrustRegionWithStop::new(
@@ -834,16 +780,8 @@ pub(crate) fn optimize_trust_region_seeded(
                     res.state().get_termination_status()
                 );
             }
-            let best = res
-                .state()
-                .get_best_param()
-                .cloned()
-                .unwrap_or_else(|| x0.clone());
-            let OptimizationResult {
-                problem: mut prob,
-                solver,
-                ..
-            } = res;
+            let best = res.state().get_best_param().cloned().unwrap_or_else(|| x0.clone());
+            let OptimizationResult { problem: mut prob, solver, .. } = res;
             // The box the run started from, not a second `compute_bounds` of the
             // same template (#1252): the box is a property of `init_params`,
             // which has not moved. `problem` owns the original and argmin does
@@ -875,11 +813,8 @@ pub(crate) fn optimize_trust_region_seeded(
                     // Under covariate-NN regularization this gradient is of the
                     // penalized objective the optimizer minimised, not of the
                     // reported OFV — label it as such.
-                    let label = if nn_reg_active {
-                        "∂(OFV + NN penalty)/∂x"
-                    } else {
-                        "∂OFV/∂x"
-                    };
+                    let label =
+                        if nn_reg_active { "∂(OFV + NN penalty)/∂x" } else { "∂OFV/∂x" };
                     w.push_str(&format!(" Final ‖{label}‖ = {:.3e}.", l2_norm(g)));
                 }
                 warnings.push(w);
@@ -948,20 +883,10 @@ pub(crate) fn optimize_trust_region_seeded(
         }
         None => {
             let final_mu_k = compute_mu_k(model, &final_params.theta, options.mu_referencing);
-            let FinalInnerSolve {
-                etas,
-                h_mats,
-                kappas,
-                screen_moved_ids,
-            } = final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
+            let FinalInnerSolve { etas, h_mats, kappas, screen_moved_ids } =
+                final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
             warnings.extend(ebe_screen_moved_warning(&screen_moved_ids));
-            score_final_ebes(
-                model,
-                population,
-                &final_params,
-                (etas, h_mats, kappas),
-                options,
-            )
+            score_final_ebes(model, population, &final_params, (etas, h_mats, kappas), options)
         }
     };
 
@@ -1015,7 +940,6 @@ pub(crate) fn optimize_trust_region_seeded(
     );
 
     OuterResult {
-        params: final_params,
         ofv: final_ofv,
         converged,
         // Outer trust-region iterations actually run. This is the number the
@@ -1030,36 +954,18 @@ pub(crate) fn optimize_trust_region_seeded(
         covariance_method,
         covariance_wall_time_secs,
         warnings,
-        saem_mu_ref_m_step_evals_saved: None,
-        saem_n_subjects_hmc: None,
-        saem_mh_accept_tail: None,
-        saem_n_exploration_used: None,
-        ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
-        total_ebe_fallbacks: 0,
-        total_ebe_nm_polished: 0,
         final_gradient_source: final_gradient.as_ref().map(|_| "optimizer".to_string()),
         final_gradient,
         sir_fallback_proposal,
-        impmap_trace: None,
-        bayes: None,
-        cond_dist: None,
         // The exact packed vector this stage's inline covariance step used
         // (`compute_covariance(&best_x, …)` above). The trust-region optimizer
         // works in packed Cholesky space, so `best_x`'s omega block is the exact
         // factor `L`; carrying it lets `run_covariance` reproduce this covariance
         // step bit-for-bit instead of re-decomposing `omega` (#816 follow-up).
         packed_estimate: Some(best_x.clone()),
-        left_init: None,
-        stationary_start: false,
-        mixture_posteriors: None,
-        vi: None,
-        start_eval: None,
-        mcem_lowest_objective: None,
-        mcem_objective_trail: None,
         newton_decrement,
-        optimizer_stop: None,
         eval_budget_spent: tr_budget_spent,
+        ..OuterResult::from_params(final_params)
     }
 }
 
@@ -1079,10 +985,7 @@ mod tests {
     /// vacuously under either ordering.
     #[test]
     fn final_gradient_is_taken_at_the_clamped_point() {
-        let bounds = PackedBounds {
-            lower: vec![-1.0, -1.0, -1.0],
-            upper: vec![1.0, 1.0, 1.0],
-        };
+        let bounds = PackedBounds { lower: vec![-1.0, -1.0, -1.0], upper: vec![1.0, 1.0, 1.0] };
         let raw = vec![3.5, -2.0, 0.25];
         let clamped = vec![1.0, -1.0, 0.25];
         assert_ne!(raw, clamped, "fixture must leave the box");
@@ -1152,9 +1055,7 @@ mod tests {
             ..FitOptions::default()
         };
         let res = optimize_trust_region(&model, &population, &model.default_params, &opts);
-        let packed = res
-            .packed_estimate
-            .expect("trust_region must carry packed_estimate");
+        let packed = res.packed_estimate.expect("trust_region must carry packed_estimate");
         assert_eq!(packed.len(), packed_len(&model.default_params));
     }
 
@@ -1189,18 +1090,10 @@ mod tests {
         assert_eq!(eta_of(&held), Some((0.0, 10.0, 1.0)));
         // A rejected trial at x = 1 scored with η = 7: the state stays at x = 0.
         HeldEbes::observe(&mut held, &[0.0], 10.0, Some(&cache(1.0, 7.0)));
-        assert_eq!(
-            eta_of(&held),
-            Some((0.0, 10.0, 1.0)),
-            "the trial's EBEs taken"
-        );
+        assert_eq!(eta_of(&held), Some((0.0, 10.0, 1.0)), "the trial's EBEs taken");
         // An accepted step to x = 2 with η = 2.
         HeldEbes::observe(&mut held, &[2.0], 8.0, Some(&cache(2.0, 2.0)));
-        assert_eq!(
-            eta_of(&held),
-            Some((2.0, 8.0, 2.0)),
-            "the accepted step not taken"
-        );
+        assert_eq!(eta_of(&held), Some((2.0, 8.0, 2.0)), "the accepted step not taken");
         // A lower cost the cache is not keyed by, a tie, a higher cost and a `NaN` all
         // leave it.
         HeldEbes::observe(&mut held, &[3.0], 5.0, Some(&cache(4.0, 9.0)));
@@ -1229,10 +1122,7 @@ mod tests {
             .expect("warfarin model must parse");
         let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
             .expect("warfarin data must load");
-        let options = FitOptions {
-            verbose: false,
-            ..FitOptions::default()
-        };
+        let options = FitOptions { verbose: false, ..FitOptions::default() };
         let bounds = compute_bounds(&model.default_params);
         let mut x0 = pack_params(&model.default_params);
         clamp_to_bounds(&mut x0, &bounds);
@@ -1335,13 +1225,8 @@ mod tests {
         let _ = problem.compute_ad_grads(&x0);
         {
             let cache = problem.grad_cache.lock().unwrap();
-            let c = cache
-                .as_ref()
-                .expect("compute_ad_grads() must populate grad_cache");
-            assert_eq!(
-                c.x, x0,
-                "grad_cache x must still match x0 after full AD pass"
-            );
+            let c = cache.as_ref().expect("compute_ad_grads() must populate grad_cache");
+            assert_eq!(c.x, x0, "grad_cache x must still match x0 after full AD pass");
             assert!(
                 !c.per_subj_grads.is_empty(),
                 "compute_ad_grads() must upgrade sentinel to a full entry"
@@ -1463,20 +1348,11 @@ mod tests {
             g.iter().chain(&want).chain(&fd).chain(&raw).all(|v| v.is_finite()),
             "every side must be finite: gradient {g:?}, exact {want:?}, reconverged {fd:?}, raw {raw:?}"
         );
-        let vs_fd = want
-            .iter()
-            .zip(&fd)
-            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let vs_fd = want.iter().zip(&fd).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
         // The reconverged difference's own error at its step and the inner tolerance.
         assert!(vs_fd < 1e-4, "exact vs reconverged {vs_fd:.3e}");
-        let off = g
-            .iter()
-            .zip(&want)
-            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
-        let raw_gap = raw
-            .iter()
-            .zip(&want)
-            .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let off = g.iter().zip(&want).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
+        let raw_gap = raw.iter().zip(&want).fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
         eprintln!("[#1778] trust-region: ‖g − 2Σd‖∞ = {off:.3e}, ‖2Σg − 2Σd‖∞ = {raw_gap:.3e}");
         // The gradient sums the rows `dᵢ` themselves: 1e-10 allows for summation-order
         // rounding. The raw gap was measured at 2.435e-1; 5e-2 is 4.9× under it.
@@ -1560,9 +1436,7 @@ mod tests {
         let options = FitOptions::default();
         assert!(options.steihaug_max_iters.is_none());
         // Simulate what optimize_trust_region does for n_params = 8.
-        let budget = options
-            .steihaug_max_iters
-            .unwrap_or_else(|| adaptive_steihaug_budget(8));
+        let budget = options.steihaug_max_iters.unwrap_or_else(|| adaptive_steihaug_budget(8));
         assert_eq!(budget, 5); // ceil(sqrt(8))=3, clamped to 5
     }
 
@@ -1570,9 +1444,7 @@ mod tests {
     fn test_steihaug_budget_option_some_pins_value() {
         let mut options = FitOptions::default();
         options.steihaug_max_iters = Some(20);
-        let budget = options
-            .steihaug_max_iters
-            .unwrap_or_else(|| adaptive_steihaug_budget(8));
+        let budget = options.steihaug_max_iters.unwrap_or_else(|| adaptive_steihaug_budget(8));
         assert_eq!(budget, 20);
     }
 
@@ -1641,9 +1513,7 @@ mod tests {
         );
         let warn = warn.expect("MaxItersReached must warn");
         assert!(
-            warn.contains(&format!(
-                "cannot even be demonstrated below maxiter = {floor}"
-            )),
+            warn.contains(&format!("cannot even be demonstrated below maxiter = {floor}")),
             "{warn}"
         );
         assert!(!warn.contains("improve the starting values"), "{warn}");
@@ -1677,10 +1547,7 @@ mod tests {
         // solver-bail-out branch.
         assert!(warn.contains("`inits_from_nca` helps"), "{warn}");
         assert!(warn.contains("every step was rejected"), "{warn}");
-        assert!(
-            !warn.contains("maxiter = 500"),
-            "the budget is not the cause here: {warn}"
-        );
+        assert!(!warn.contains("maxiter = 500"), "the budget is not the cause here: {warn}");
     }
 
     /// Analytic-gradient ↔ central-FD parity for the vector the trust region
@@ -1786,12 +1653,9 @@ mod tests {
         let parsed =
             parse_full_model(&crate::nn::dcm_fixture_without_init()).expect("DCM fixture parses");
         let model = parsed.model;
-        let population = read_nonmem_csv(
-            Path::new("data/two_cpt_oral_cov.csv"),
-            Some(&["WT", "CRCL"]),
-            None,
-        )
-        .expect("dataset loads");
+        let population =
+            read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), Some(&["WT", "CRCL"]), None)
+                .expect("dataset loads");
 
         let mk_options = |l2: f64, smooth: f64| FitOptions {
             inner_tol: 1e-10,
@@ -1808,9 +1672,7 @@ mod tests {
         clamp_to_bounds(&mut x, &bounds);
 
         fn fresh<'a>(
-            model: &'a CompiledModel,
-            population: &'a Population,
-            init: &'a ModelParameters,
+            model: &'a CompiledModel, population: &'a Population, init: &'a ModelParameters,
             options: &'a FitOptions,
         ) -> FoceiProblem<'a> {
             FoceiProblem {
@@ -1829,9 +1691,7 @@ mod tests {
                 priors: crate::estimation::outer_optimizer::build_prior_set(model, init),
             }
         }
-        assert!(fresh(&model, &population, init, &options)
-            .nn_reg
-            .is_active());
+        assert!(fresh(&model, &population, init, &options).nn_reg.is_active());
 
         let nn = &model.covariate_nns[0];
         let (w_lo, w_hi) = (nn.weights_offset, nn.weights_offset + nn.mapper.n_weights());
@@ -1845,9 +1705,7 @@ mod tests {
         // EBE-fixpoint FD noise the DCM likelihood carries. The likelihood part
         // of the assembled gradient is pinned by the warfarin test above.
         let grad_at = |o: &FitOptions, p: &Vec<f64>| -> Vec<f64> {
-            fresh(&model, &population, init, o)
-                .gradient(p)
-                .expect("gradient must evaluate")
+            fresh(&model, &population, init, o).gradient(p).expect("gradient must evaluate")
         };
         let pen_cost_at = |p: &Vec<f64>| -> f64 {
             fresh(&model, &population, init, &options).cost(p).unwrap()
@@ -1892,14 +1750,9 @@ mod tests {
         // here the point is that `hessian()` carries it at all, at the right
         // indices, and adds nothing anywhere else.
         let h_pen: Vec<Vec<f64>> = {
-            let hl = fresh(&model, &population, init, &options)
-                .hessian(&x)
-                .unwrap();
+            let hl = fresh(&model, &population, init, &options).hessian(&x).unwrap();
             let h0 = fresh(&model, &population, init, &zero).hessian(&x).unwrap();
-            hl.iter()
-                .zip(&h0)
-                .map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect())
-                .collect()
+            hl.iter().zip(&h0).map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect()).collect()
         };
         let mut expected = vec![vec![0.0; x.len()]; x.len()];
         let theta = unpack_params(&x, init).theta;
@@ -1926,29 +1779,15 @@ mod tests {
         // entries, `0` on biases, nothing off-diagonal.
         let l2_only = mk_options(3e-2, 0.0);
         let hl2: Vec<Vec<f64>> = {
-            let hl = fresh(&model, &population, init, &l2_only)
-                .hessian(&x)
-                .unwrap();
+            let hl = fresh(&model, &population, init, &l2_only).hessian(&x).unwrap();
             let h0 = fresh(&model, &population, init, &zero).hessian(&x).unwrap();
-            hl.iter()
-                .zip(&h0)
-                .map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect())
-                .collect()
+            hl.iter().zip(&h0).map(|(a, b)| a.iter().zip(b).map(|(p, q)| p - q).collect()).collect()
         };
-        let weight_idx: std::collections::HashSet<usize> = nn
-            .mapper
-            .mlp()
-            .weight_param_indices()
-            .into_iter()
-            .map(|i| w_lo + i)
-            .collect();
+        let weight_idx: std::collections::HashSet<usize> =
+            nn.mapper.mlp().weight_param_indices().into_iter().map(|i| w_lo + i).collect();
         for k in 0..x.len() {
             for j in 0..x.len() {
-                let expect = if k == j && weight_idx.contains(&k) {
-                    2.0 * 3e-2
-                } else {
-                    0.0
-                };
+                let expect = if k == j && weight_idx.contains(&k) { 2.0 * 3e-2 } else { 0.0 };
                 // 1e-8 absolute: the BHHH likelihood part cancels between the two
                 // `hessian()` calls only up to rayon reduction-order noise (~1e-12
                 // on entries of O(1e3)); the L2 term itself is exact.
@@ -2011,10 +1850,7 @@ mod tests {
             ..FitOptions::default()
         };
         let res = optimize_trust_region(&model, &population, &model.default_params, &opts);
-        assert!(
-            !res.converged,
-            "a run that exhausted outer_maxiter must not report converged"
-        );
+        assert!(!res.converged, "a run that exhausted outer_maxiter must not report converged");
         // #2799: the typed form of the same fact.
         assert!(res.eval_budget_spent, "MaxItersReached is a spent budget");
         assert!(
@@ -2024,10 +1860,7 @@ mod tests {
         );
         // The same run must now carry the gradient it stopped at, which the
         // trust-region path previously left unset.
-        assert!(
-            res.final_gradient.is_some(),
-            "trust_region must report final_gradient"
-        );
+        assert!(res.final_gradient.is_some(), "trust_region must report final_gradient");
         // ...and the iteration count it stopped at, which was hardcoded to 0
         // right next to the warning that names the budget.
         assert_eq!(
@@ -2065,10 +1898,7 @@ mod tests {
             res.warnings
         );
         assert!(res.n_iterations <= 1, "ran {} iterations", res.n_iterations);
-        assert!(
-            res.final_gradient.is_none(),
-            "a cancelled run paid a gradient pass"
-        );
+        assert!(res.final_gradient.is_none(), "a cancelled run paid a gradient pass");
     }
 
     /// #574 review r2: the cancel check runs at every iteration boundary, not only before
@@ -2081,10 +1911,7 @@ mod tests {
         let mut state = TrState::new().param(vec![0.0, 1.0]).cost(1.0);
         state.increment_iter();
         assert!(state.get_iter() > 0, "fixture: past iteration 0");
-        assert!(matches!(
-            tracker.terminate(&state),
-            TerminationStatus::NotTerminated
-        ));
+        assert!(matches!(tracker.terminate(&state), TerminationStatus::NotTerminated));
         state.increment_iter();
         match tracker.terminate(&state) {
             TerminationStatus::Terminated(TerminationReason::SolverExit(reason)) => {
@@ -2105,10 +1932,7 @@ mod tests {
         TrustRegionWithStop::new(
             TrustRegion::new(Steihaug::new()).with_radius(1.0).unwrap(),
             &warfarin_model(),
-            &FitOptions {
-                verbose: false,
-                ..FitOptions::default()
-            },
+            &FitOptions { verbose: false, ..FitOptions::default() },
         )
     }
 
@@ -2124,10 +1948,7 @@ mod tests {
             TrustRegionWithStop::new(
                 TrustRegion::new(Steihaug::new()).with_radius(1.0).unwrap(),
                 model,
-                &FitOptions {
-                    outer_ftol: override_ftol,
-                    ..FitOptions::default()
-                },
+                &FitOptions { outer_ftol: override_ftol, ..FitOptions::default() },
             )
         };
 
@@ -2139,10 +1960,7 @@ mod tests {
         assert_eq!(tracker(&gaussian, Some(1e-10)).ftol, 1e-10);
 
         // The step limb is the user's `outer_xtol` verbatim.
-        assert_eq!(
-            tracker(&gaussian, None).xtol,
-            FitOptions::default().outer_xtol
-        );
+        assert_eq!(tracker(&gaussian, None).xtol, FitOptions::default().outer_xtol);
 
         // The branch that matters — a pure-TTE objective gets the #469 `1e-8` —
         // needs a model only the `survival` build can parse.
@@ -2209,10 +2027,7 @@ mod tests {
         }
         let status = settled.terminate(&state_at(99, 50.0, x.clone()));
         assert!(
-            matches!(
-                status,
-                TerminationStatus::Terminated(TerminationReason::SolverConverged)
-            ),
+            matches!(status, TerminationStatus::Terminated(TerminationReason::SolverConverged)),
             "a settled run must report SolverConverged, got {status}"
         );
 
@@ -2248,10 +2063,7 @@ mod tests {
         // A state with no parameter vector cannot be judged; the executor keeps going.
         let mut empty = stall_tracker();
         let bare: TrState = IterState::new();
-        assert!(matches!(
-            empty.terminate(&bare),
-            TerminationStatus::NotTerminated
-        ));
+        assert!(matches!(empty.terminate(&bare), TerminationStatus::NotTerminated));
     }
 
     /// A run that rejects every step from iteration 0 must bail out on its own

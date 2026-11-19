@@ -75,12 +75,8 @@ const DEFAULT_DATA: &str = "data/external/mbma_canakinumab.csv";
 const N_STUDIES: usize = 9;
 const N_OBS: usize = 140;
 /// `Σ NARM` and `Σ` of each drug indicator over the 140 observation rows.
-const SUM_COVARIATES: [(&str, f64); 4] = [
-    ("NARM", 27608.0),
-    ("ABATA", 40.0),
-    ("ADALI", 43.0),
-    ("CANAKI", 4.0),
-];
+const SUM_COVARIATES: [(&str, f64); 4] =
+    [("NARM", 27608.0), ("ABATA", 40.0), ("ADALI", 43.0), ("CANAKI", 4.0)];
 /// `Σ DV` over the derived file, `DV = transY/√Narm` — the published transform, not
 /// `logit(Y/100)`, which differs by up to 5.5e-3 per row.
 const SUM_DV: f64 = -28.777668972433098;
@@ -220,23 +216,14 @@ fn locate_data(override_path: Option<PathBuf>, require: bool) -> Option<PathBuf>
 #[test]
 #[should_panic(expected = "FERX_REQUIRE_EXTERNAL_DATA=1 and canakinumab anchor: no data at")]
 fn a_missing_file_panics_when_external_data_is_required() {
-    locate_data(
-        Some(PathBuf::from("/nonexistent/mbma_canakinumab.csv")),
-        true,
-    );
+    locate_data(Some(PathBuf::from("/nonexistent/mbma_canakinumab.csv")), true);
 }
 
 /// …and without the flag the same missing file is a skip (`None`), not a panic —
 /// the other side of the same gate, so forcing it either way reddens one of the two.
 #[test]
 fn a_missing_file_skips_when_external_data_is_not_required() {
-    assert_eq!(
-        locate_data(
-            Some(PathBuf::from("/nonexistent/mbma_canakinumab.csv")),
-            false
-        ),
-        None
-    );
+    assert_eq!(locate_data(Some(PathBuf::from("/nonexistent/mbma_canakinumab.csv")), false), None);
 }
 
 fn model_path() -> PathBuf {
@@ -260,14 +247,8 @@ fn published_model_file() -> PathBuf {
         ("B_EMAX_CAN(1.0,", format!("B_EMAX_CAN({PUB_B_EMAX_CAN},")),
         ("T50_POP(4.0,", format!("T50_POP({PUB_T50_POP},")),
         ("B_T50_ADA(-0.5,", format!("B_T50_ADA({PUB_B_T50_ADA},")),
-        (
-            "ETA_BSV_EMAX ~ 0.3 (sd)",
-            format!("ETA_BSV_EMAX ~ {PUB_OMEGA_SD} (sd)"),
-        ),
-        (
-            "KAPPA_EMAX ~ 2.0 (sd)",
-            format!("KAPPA_EMAX ~ {PUB_GAMMA_SD} (sd)"),
-        ),
+        ("ETA_BSV_EMAX ~ 0.3 (sd)", format!("ETA_BSV_EMAX ~ {PUB_OMEGA_SD} (sd)")),
+        ("KAPPA_EMAX ~ 2.0 (sd)", format!("KAPPA_EMAX ~ {PUB_GAMMA_SD} (sd)")),
         ("ADD_ERR ~ 2.5 (sd)", format!("ADD_ERR ~ {PUB_A} (sd)")),
     ];
     let mut out = src.clone();
@@ -279,10 +260,8 @@ fn published_model_file() -> PathBuf {
         );
         out = out.replace(from, to);
     }
-    let path = std::env::temp_dir().join(format!(
-        "ferx_mbma_canakinumab_published_{}_{call}.ferx",
-        std::process::id()
-    ));
+    let path = std::env::temp_dir()
+        .join(format!("ferx_mbma_canakinumab_published_{}_{call}.ferx", std::process::id()));
     std::fs::write(&path, out).expect("write the published-value model");
     path
 }
@@ -290,11 +269,7 @@ fn published_model_file() -> PathBuf {
 /// Shape and checksum of the provisioned file, through ferx's own reader.
 fn check_population(pop: &ferx_core::types::Population) {
     assert_eq!(pop.subjects.len(), N_STUDIES, "9 studies");
-    let dv: Vec<f64> = pop
-        .subjects
-        .iter()
-        .flat_map(|s| s.observations.iter().copied())
-        .collect();
+    let dv: Vec<f64> = pop.subjects.iter().flat_map(|s| s.observations.iter().copied()).collect();
     assert_eq!(dv.len(), N_OBS, "140 observations");
     assert!(dv.iter().all(|v| v.is_finite()), "non-finite DV");
     let sum: f64 = dv.iter().sum();
@@ -350,11 +325,7 @@ fn no_external_data_is_tracked() {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .expect("git must be runnable for this check");
-    assert!(
-        out.status.success(),
-        "git ls-files failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert!(out.status.success(), "git ls-files failed: {}", String::from_utf8_lossy(&out.stderr));
     let tracked = String::from_utf8_lossy(&out.stdout);
     assert!(
         tracked.trim().is_empty(),
@@ -378,18 +349,9 @@ fn objective_at_the_published_estimates_matches_monolix_linearised_m2ll() {
         verbose: false,
         ..prep.parsed.fit_options.clone()
     };
-    let r = fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("evaluate at the published estimates");
-    assert!(
-        r.ofv.is_finite(),
-        "OFV at the published estimates: {}",
-        r.ofv
-    );
+    let r = fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("evaluate at the published estimates");
+    assert!(r.ofv.is_finite(), "OFV at the published estimates: {}", r.ofv);
     let m2ll = r.ofv + SUM_LN_N + N_LN_2PI;
     let err = (m2ll - PUB_M2LL_LIN).abs();
     eprintln!(
@@ -415,13 +377,8 @@ fn fit_shipped(data: &Path) -> (FitResult, f64) {
         sir_seed: Some(1913),
         ..prep.parsed.fit_options.clone()
     };
-    let r = fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("fit the canakinumab model");
+    let r = fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("fit the canakinumab model");
 
     // The same objective at the published point, for claim 2's "not a better point".
     let model = published_model_file();
@@ -434,14 +391,9 @@ fn fit_shipped(data: &Path) -> (FitResult, f64) {
         verbose: false,
         ..pprep.parsed.fit_options.clone()
     };
-    let at_pub = fit(
-        &pprep.parsed.model,
-        &pprep.population,
-        &pprep.init_params,
-        &popts,
-    )
-    .expect("evaluate at the published estimates")
-    .ofv;
+    let at_pub = fit(&pprep.parsed.model, &pprep.population, &pprep.init_params, &popts)
+        .expect("evaluate at the published estimates")
+        .ofv;
     (r, at_pub)
 }
 
@@ -466,18 +418,9 @@ fn fit_reproduces_nonmem_foce_optimum_profile_ses_and_runs_sir() {
     let se_kappa = r.se_kappa.as_ref().expect("covariance step: se_kappa");
 
     // ---- Monolix, for the reader ----
-    let pubs = [
-        PUB_EMAX_POP,
-        PUB_B_EMAX_ABA,
-        PUB_B_EMAX_ADA,
-        PUB_B_EMAX_CAN,
-        PUB_T50_POP,
-        PUB_B_T50_ADA,
-    ];
-    eprintln!(
-        "{:<14} {:>12} {:>12} {:>12}",
-        "", "ferx", "NONMEM", "Monolix"
-    );
+    let pubs =
+        [PUB_EMAX_POP, PUB_B_EMAX_ABA, PUB_B_EMAX_ADA, PUB_B_EMAX_CAN, PUB_T50_POP, PUB_B_T50_ADA];
+    eprintln!("{:<14} {:>12} {:>12} {:>12}", "", "ferx", "NONMEM", "Monolix");
     for i in 0..6 {
         eprintln!(
             "{:<14} {:>12.6} {:>12.6} {:>12.6}",
@@ -505,11 +448,7 @@ fn fit_reproduces_nonmem_foce_optimum_profile_ses_and_runs_sir() {
     // ---- NONMEM FOCE-I optimum ----
     let d_ofv = (r.ofv - NM_OFV).abs();
     eprintln!("OFV vs NONMEM: |Δ| {d_ofv:.3e}");
-    assert!(
-        d_ofv < TOL_NM_OFV,
-        "OFV: ferx {:.8} vs NONMEM {NM_OFV:.8} (|Δ| {d_ofv:.3e})",
-        r.ofv
-    );
+    assert!(d_ofv < TOL_NM_OFV, "OFV: ferx {:.8} vs NONMEM {NM_OFV:.8} (|Δ| {d_ofv:.3e})", r.ofv);
     let est = [
         r.theta[0],
         r.theta[1],
@@ -599,20 +538,14 @@ fn fit_reproduces_nonmem_foce_optimum_profile_ses_and_runs_sir() {
         ("σ", &r.sir_ci_sigma),
         ("κ", &r.sir_ci_kappa),
     ] {
-        let ci = ci
-            .as_ref()
-            .unwrap_or_else(|| panic!("SIR filled no {what} interval"));
+        let ci = ci.as_ref().unwrap_or_else(|| panic!("SIR filled no {what} interval"));
         assert!(
-            ci.iter()
-                .all(|(lo, hi)| lo.is_finite() && hi.is_finite() && lo < hi),
+            ci.iter().all(|(lo, hi)| lo.is_finite() && hi.is_finite() && lo < hi),
             "{what}: SIR interval not finite and ordered: {ci:?}"
         );
     }
     let (lo, hi) = r.sir_ci_kappa.as_ref().unwrap()[0];
     let kappa = iov[(0, 0)];
     eprintln!("SIR: ESS {ess:.1}, γ² {kappa:.6} in [{lo:.6}, {hi:.6}]");
-    assert!(
-        lo < kappa && kappa < hi,
-        "SIR κ interval [{lo}, {hi}] does not bracket γ² = {kappa}"
-    );
+    assert!(lo < kappa && kappa < hi, "SIR κ interval [{lo}, {hi}] does not bracket γ² = {kappa}");
 }

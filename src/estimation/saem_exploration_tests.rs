@@ -80,18 +80,16 @@ fn decaying_variance_trajectory_is_a_trend_and_its_plateau_is_not() {
     let still = (1..=40u64)
         .filter(|&s| {
             let noise = series(s, 300, 0.9, 0.05, 0.0);
-            let y: Vec<f64> = (0..300)
-                .map(|k| -2.0 - 3.0 * (-(k as f64) / 150.0).exp() + noise[k])
-                .collect();
+            let y: Vec<f64> =
+                (0..300).map(|k| -2.0 - 3.0 * (-(k as f64) / 150.0).exp() + noise[k]).collect();
             trend_test(&y) != Some(false)
         })
         .count();
     let settled = (1..=40u64)
         .filter(|&s| {
             let noise = series(s, 2000, 0.9, 0.05, 0.0);
-            let y: Vec<f64> = (0..2000)
-                .map(|k| -2.0 - 3.0 * (-(k as f64) / 150.0).exp() + noise[k])
-                .collect();
+            let y: Vec<f64> =
+                (0..2000).map(|k| -2.0 - 3.0 * (-(k as f64) / 150.0).exp() + noise[k]).collect();
             trend_test(&y) == Some(false)
         })
         .count();
@@ -113,11 +111,7 @@ fn constant_short_and_nonfinite_series() {
     let mut y = series(1, 600, 0.0, 0.1, 0.0);
     let last = y.len() - 1;
     y[last] = f64::NAN;
-    assert_eq!(
-        trend_test(&y),
-        Some(true),
-        "a diverged coordinate is not converged"
-    );
+    assert_eq!(trend_test(&y), Some(true), "a diverged coordinate is not converged");
     y[last] = f64::INFINITY;
     assert_eq!(trend_test(&y), Some(true));
 }
@@ -166,9 +160,7 @@ fn push_all(m: &mut ExplorationMonitor, cols: &[Vec<f64>], upto: usize) {
 
 #[test]
 fn monitor_stationary_stops_on_a_check_after_the_minimum_and_names_nothing() {
-    let cols: Vec<Vec<f64>> = (0..6)
-        .map(|c| series(100 + c, 800, 0.0, 0.05, 0.0))
-        .collect();
+    let cols: Vec<Vec<f64>> = (0..6).map(|c| series(100 + c, 800, 0.0, 0.05, 0.0)).collect();
     let mut m = ExplorationMonitor::default();
     let mut stop = None;
     for k in 1..=800 {
@@ -180,29 +172,19 @@ fn monitor_stationary_stops_on_a_check_after_the_minimum_and_names_nothing() {
     }
     let stop = stop.expect("stationary coordinates must pass the test");
     assert!(stop >= 150, "never before the minimum, got {stop}");
-    assert_eq!(
-        stop % CHECK_EVERY,
-        0,
-        "only on a check iteration, got {stop}"
-    );
+    assert_eq!(stop % CHECK_EVERY, 0, "only on a check iteration, got {stop}");
     assert!(m.drifting().is_empty());
     // Before the shortest window nothing can be declared converged.
     let mut early = ExplorationMonitor::default();
     push_all(&mut early, &cols, MIN_TEST_WINDOW - 1);
     assert!(!early.converged());
     assert!(!early.may_stop_at(MIN_TEST_WINDOW - 1, 0));
-    assert_eq!(
-        early.drifting().len(),
-        cols.len(),
-        "untestable coordinates are listed"
-    );
+    assert_eq!(early.drifting().len(), cols.len(), "untestable coordinates are listed");
 }
 
 #[test]
 fn monitor_one_drifting_coordinate_blocks_the_stop_and_is_named() {
-    let mut cols: Vec<Vec<f64>> = (0..4)
-        .map(|c| series(200 + c, 600, 0.0, 0.05, 0.0))
-        .collect();
+    let mut cols: Vec<Vec<f64>> = (0..4).map(|c| series(200 + c, 600, 0.0, 0.05, 0.0)).collect();
     // Coordinate 2 decays steadily: -0.01 per iteration against sd 0.05 noise (20 sd
     // across its 100-iteration test window).
     cols[2] = series(9, 600, 0.0, 0.05, -0.01);
@@ -216,11 +198,7 @@ fn monitor_one_drifting_coordinate_blocks_the_stop_and_is_named() {
 #[test]
 fn bounds_precedence_explicit_length_overrides_the_automatic_stop() {
     let mut o = FitOptions::default();
-    assert_eq!(
-        exploration_bounds(&o),
-        (true, 150, 4000),
-        "default is automatic"
-    );
+    assert_eq!(exploration_bounds(&o), (true, 150, 4000), "default is automatic");
     o.saem_exploration_min = 100;
     o.saem_exploration_max = 300;
     assert_eq!(exploration_bounds(&o), (true, 100, 300));
@@ -287,10 +265,7 @@ fn coordinate_names_follow_the_coordinate_order() {
 fn drifting_summary_names_and_caps() {
     let names: Vec<String> = (0..12).map(|i| format!("p{i}")).collect();
     assert_eq!(drifting_summary(&[3, 7], &names, 8), "p3, p7");
-    assert_eq!(
-        drifting_summary(&[0, 1, 2], &names, 2),
-        "p0, p1, and 1 more"
-    );
+    assert_eq!(drifting_summary(&[0, 1, 2], &names, 2), "p0, p1, and 1 more");
     assert_eq!(drifting_summary(&[20], &names, 8), "#20");
     assert_eq!(drifting_summary(&[], &names, 8), "none");
 }

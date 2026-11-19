@@ -39,11 +39,8 @@ const RHO: f64 = 0.6;
 /// The fixture model; `line` is the correlation line, and the `RHO` θ is declared only
 /// with one (an unread θ is a model error).
 fn src(line: &str, rho: f64) -> String {
-    let rho = if line.is_empty() {
-        String::new()
-    } else {
-        format!("  theta RHO({rho}, -0.4, 0.95)\n")
-    };
+    let rho =
+        if line.is_empty() { String::new() } else { format!("  theta RHO({rho}, -0.4, 0.95)\n") };
     format!(
         "[parameters]\n  theta TVY(10.0, 1.0, 100.0)\n{rho}  \
          omega ETA ~ 0.04\n  level STUDY by STUDY in ID\n  level ARM by ARM in STUDY\n  \
@@ -84,11 +81,7 @@ fn population() -> Population {
 /// Position of each row inside its arm, in TIME order, by hand.
 fn positions(rows: &[(f64, f64, f64)]) -> Vec<i32> {
     rows.iter()
-        .map(|r| {
-            rows.iter()
-                .filter(|o| o.0 == r.0 && o.1 == r.1 && o.2 < r.2)
-                .count() as i32
-        })
+        .map(|r| rows.iter().filter(|o| o.0 == r.0 && o.1 == r.1 && o.2 < r.2).count() as i32)
         .collect()
 }
 
@@ -138,11 +131,7 @@ fn simulate_draws_the_within_arm_correlation_nested_by_key() {
     for j in 0..12 {
         for k in (j + 1)..12 {
             let same_arm = rows[j].0 == rows[k].0 && rows[j].1 == rows[k].1;
-            let want = if same_arm {
-                RHO.powi((pos[j] - pos[k]).abs())
-            } else {
-                0.0
-            };
+            let want = if same_arm { RHO.powi((pos[j] - pos[k]).abs()) } else { 0.0 };
             let got = corr(&eps, j, k);
             let se = (1.0 - want * want) / (N_SIM as f64).sqrt();
             assert!(
@@ -157,10 +146,7 @@ fn simulate_draws_the_within_arm_correlation_nested_by_key() {
         }
     }
     assert_eq!(live, 12, "four arms of three rows: twelve within-arm pairs");
-    assert_eq!(
-        same_label, 18,
-        "pairs sharing an ARM label across studies, at ρ = 0 each"
-    );
+    assert_eq!(same_label, 18, "pairs sharing an ARM label across studies, at ρ = 0 each");
 }
 
 /// V8, ρ = 0: the line with a free ρ at 0 draws what the model without it draws, with one
@@ -195,11 +181,7 @@ fn npde_on_a_nested_correlated_model() {
     };
     let line = "  correlation ar1(RHO) by ARM\n";
     let corr = at(line, RHO);
-    assert!(corr[0]
-        .npde
-        .iter()
-        .chain(&corr[0].npd)
-        .all(|v| v.is_finite()));
+    assert!(corr[0].npde.iter().chain(&corr[0].npd).all(|v| v.is_finite()));
     let zero = at(line, 0.0);
     let none = at("", 0.0);
     for (a, b) in zero[0].npde.iter().zip(&none[0].npde) {

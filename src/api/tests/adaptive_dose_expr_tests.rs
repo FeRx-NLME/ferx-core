@@ -58,10 +58,7 @@ fn csv_const(subjects: &[(&str, f64)], times: &[f64]) -> String {
 
 fn run(p: &ParsedModel, pop: &Population) -> Result<AdaptiveSimulationResult, EngineError> {
     let spec = p.adaptive_dosing.as_ref().expect("block present");
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(7), ..Default::default() };
     simulate_adaptive_from_spec(&p.model, pop, &p.model.default_params, 2, spec, &opts)
 }
 
@@ -70,10 +67,7 @@ fn run(p: &ParsedModel, pop: &Population) -> Result<AdaptiveSimulationResult, En
 /// moves the trough by ~1.5e-5 relative, far outside the 1e-9 band.
 fn run_typical(p: &ParsedModel, pop: &Population) -> AdaptiveSimulationResult {
     let spec = p.adaptive_dosing.as_ref().expect("block present");
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(7), ..Default::default() };
     let ids: Vec<String> = pop.subjects.iter().map(|s| s.id.clone()).collect();
     let n = ids.len();
     let etas = crate::SuppliedEtas::from_table(
@@ -122,12 +116,7 @@ fn each_subject_is_dosed_from_its_own_weight_and_matches_the_static_engine() {
     let res = run_typical(&p, &population);
     for (id, wt) in [("1", 50.0f64), ("2", 110.0)] {
         let want = 15.0 * wt;
-        let amts: Vec<f64> = res
-            .ledger
-            .iter()
-            .filter(|e| e.subject == id)
-            .map(|e| e.amt)
-            .collect();
+        let amts: Vec<f64> = res.ledger.iter().filter(|e| e.subject == id).map(|e| e.amt).collect();
         assert_eq!(amts.len(), GRID.len(), "subject {id}: a dose per decision");
         assert!(
             amts.iter().all(|a| a.to_bits() == want.to_bits()),
@@ -192,10 +181,7 @@ fn fingerprint(r: &AdaptiveSimulationResult) -> Fp {
                     d.subject.clone(),
                     d.time.to_bits(),
                     format!("{:?}", d.outcome),
-                    d.observed_signals
-                        .iter()
-                        .map(|s| s.value.to_bits())
-                        .collect(),
+                    d.observed_signals.iter().map(|s| s.value.to_bits()).collect(),
                 )
             })
             .collect(),
@@ -266,18 +252,10 @@ fn a_time_varying_covariate_is_read_at_the_first_decision() {
 2,48,0,0,0,1,0,80
 ";
     let res = run(&p, &pop(csv)).expect("runs");
-    assert_eq!(
-        first_dose(&res, "1"),
-        15.0 * 80.0,
-        "WT changed before at[0]"
-    );
+    assert_eq!(first_dose(&res, "1"), 15.0 * 80.0, "WT changed before at[0]");
     assert_eq!(first_dose(&res, "2"), 15.0 * 50.0, "WT changed after at[0]");
     // Evaluated once: no later dose follows the t = 30 change.
-    assert!(res
-        .ledger
-        .iter()
-        .filter(|e| e.subject == "2")
-        .all(|e| e.amt == 750.0));
+    assert!(res.ledger.iter().filter(|e| e.subject == "2").all(|e| e.amt == 750.0));
 }
 
 /// A first decision before the subject's first record (#2125): the expression reads
@@ -477,12 +455,8 @@ fn every_dose_slot_can_be_an_expression_and_keeps_its_slot() {
     for (label, p) in [("percent", &percent), ("ladder", &ladder)] {
         let res = run_typical(p, &population);
         for (id, wt) in [("1", 50.0f64), ("2", 80.0)] {
-            let amts: Vec<f64> = res
-                .ledger
-                .iter()
-                .filter(|e| e.subject == id)
-                .map(|e| e.amt)
-                .collect();
+            let amts: Vec<f64> =
+                res.ledger.iter().filter(|e| e.subject == id).map(|e| e.amt).collect();
             // 15·WT stepped down at the first decision: to the 10·WT lower bound (7.5·WT
             // clamped), or to the 10·WT bottom rung; then held there.
             assert_eq!(amts, vec![10.0 * wt; GRID.len()], "{label}, subject {id}");
@@ -532,10 +506,7 @@ fn a_hand_built_spec_reading_a_state_is_refused_at_compile() {
     let mut spec: AdaptiveDosingSpec = p.adaptive_dosing.clone().expect("block");
     spec.start_dose = crate::sim::adaptive::DoseValue::Expr("2 * CENT".to_string());
     let population = pop(&csv_const(&[("1", 50.0)], &GRID));
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = AdaptiveSimulateOptions { seed: Some(7), ..Default::default() };
     let e = simulate_adaptive_from_spec(
         &p.model,
         &population,
@@ -547,8 +518,7 @@ fn a_hand_built_spec_reading_a_state_is_refused_at_compile() {
     .expect_err("refused");
     assert_eq!(e.code(), Some("E_ADAPTIVE_SPEC"));
     assert!(
-        e.message()
-            .starts_with("[adaptive_dosing] start_dose reads CENT, a state of the model."),
+        e.message().starts_with("[adaptive_dosing] start_dose reads CENT, a state of the model."),
         "{e}"
     );
 }
@@ -572,21 +542,14 @@ const CSV_DW: &str = "ID,TIME,DV,AMT,EVID,CMT,MDV,WT,DW
 fn dw_populations() -> (Population, Population) {
     let full = pop(CSV_DW);
     let s = &full.subjects[0];
-    assert_eq!(
-        s.obs_covariates.len(),
-        4,
-        "the reader built per-record snapshots"
-    );
+    assert_eq!(s.obs_covariates.len(), 4, "the reader built per-record snapshots");
     assert!(
         s.covariates.contains_key("DW") && s.obs_covariates.iter().all(|m| m.contains_key("DW")),
         "the reader fills every map"
     );
     let mut gap = full.clone();
     assert_eq!(gap.subjects[0].obs_covariates[1].remove("DW"), Some(80.0));
-    assert!(
-        gap.subjects[0].covariates.contains_key("DW"),
-        "static map untouched"
-    );
+    assert!(gap.subjects[0].covariates.contains_key("DW"), "static map untouched");
     (full, gap)
 }
 
@@ -691,11 +654,5 @@ fn the_reported_dose_expression_read_is_the_value_used() {
             r.plan.start_dose
         );
     }
-    assert_eq!(
-        exprs
-            .resolve(spec, &p.model, theta, &present, None)
-            .plan
-            .start_dose,
-        1200.0
-    );
+    assert_eq!(exprs.resolve(spec, &p.model, theta, &present, None).plan.start_dose, 1200.0);
 }

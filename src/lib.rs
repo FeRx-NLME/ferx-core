@@ -20,6 +20,7 @@ pub(crate) mod par;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;
+pub(crate) mod rng;
 pub(crate) mod scratch;
 pub mod sens;
 pub(crate) mod serde_nalgebra;
@@ -125,3 +126,7 @@ pub use api::{
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod debug_assertion_canary;
+
+/// Model texts shared by test modules (written once instead of per test).
+#[cfg(test)]
+pub(crate) mod test_models;

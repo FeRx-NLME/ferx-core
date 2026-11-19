@@ -58,14 +58,9 @@ const MIXTURE: &str = "[parameters]\n  theta TVCL1(1.0, 0.01, 100.0)\n  \
     [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n";
 
 fn fit_refusal(
-    model: &CompiledModel,
-    pop: &Population,
-    params: &ModelParameters,
-    opts: &FitOptions,
+    model: &CompiledModel, pop: &Population, params: &ModelParameters, opts: &FitOptions,
 ) -> EngineError {
-    fit(model, pop, params, opts)
-        .err()
-        .expect("the fixture is refused before the fit")
+    fit(model, pop, params, opts).err().expect("the fixture is refused before the fit")
 }
 
 /// The code, the block and the text of one refusal, named by `label` on failure.
@@ -100,10 +95,7 @@ fn check_codes(text: &str) -> Vec<String> {
 fn mixture_refusals_are_coded() {
     let model = parse_model_string(MIXTURE).expect("parse");
     let pop = gaussian_population();
-    let foce = FitOptions {
-        method: EstimationMethod::Foce,
-        ..FitOptions::default()
-    };
+    let foce = FitOptions { method: EstimationMethod::Foce, ..FitOptions::default() };
 
     let mut no_classes = model.default_params.clone();
     no_classes.mixture = None;
@@ -132,10 +124,7 @@ fn mixture_refusals_are_coded() {
          for mixture FOCEI. The mixture objective does not evaluate the quadrature grid.",
     );
 
-    let laplace = FitOptions {
-        method: EstimationMethod::Laplace,
-        ..FitOptions::default()
-    };
+    let laplace = FitOptions { method: EstimationMethod::Laplace, ..FitOptions::default() };
     assert_coded(
         &fit_refusal(&model, &pop, &model.default_params, &laplace),
         "laplace",
@@ -149,10 +138,7 @@ fn mixture_refusals_are_coded() {
         &MIXTURE.replace("  p(1) = P1\n", "  p(1) = P1\n  omega(2) ETA_CL ~ 0.4\n"),
     )
     .expect("parse with an omega(2) override");
-    let bayes = FitOptions {
-        method: EstimationMethod::Bayes,
-        ..FitOptions::default()
-    };
+    let bayes = FitOptions { method: EstimationMethod::Bayes, ..FitOptions::default() };
     assert_coded(
         &fit_refusal(&overrides, &pop, &overrides.default_params, &bayes),
         "bayes + omega(2)",
@@ -196,10 +182,8 @@ fn ltbs_refusals_are_coded() {
     proportional.error_model = ErrorModel::Proportional;
     // A per-CMT spec is accepted under LTBS when every endpoint is a log-scale one
     // (#2729); one proportional endpoint is refused.
-    let endpoint = |error_model, sigma_idx: Vec<usize>| crate::types::EndpointError {
-        error_model,
-        sigma_idx,
-    };
+    let endpoint =
+        |error_model, sigma_idx: Vec<usize>| crate::types::EndpointError { error_model, sigma_idx };
     let mut per_cmt = ltbs();
     per_cmt.error_spec = ErrorSpec::PerCmt(std::collections::HashMap::from([
         (2, endpoint(ErrorModel::LogCombined, vec![0, 1])),
@@ -302,37 +286,21 @@ fn iiv_on_ruv_with_a_dense_r_refuses_only_what_each_half_refuses() {
     };
     let with_method = |src: &str, m: &str| src.replace("method = focei", &format!("method = {m}"));
     let errors = |src: &str| -> Vec<String> {
-        check_codes(src)
-            .into_iter()
-            .filter(|c| c.starts_with("E_"))
-            .collect()
+        check_codes(src).into_iter().filter(|c| c.starts_with("E_")).collect()
     };
     let block = twin("pair");
     for m in ["focei", "saem", "imp", "laplace", "vi"] {
         assert_eq!(errors(&with_method(&block, m)), Vec::<String>::new(), "{m}");
     }
-    assert_eq!(
-        errors(&with_method(&block, "gn")),
-        ["E_BLOCK_SIGMA_METHOD_UNSUPPORTED"],
-    );
-    assert_eq!(
-        errors(&with_method(&block, "foce")),
-        ["E_IIV_ON_RUV_METHOD"]
-    );
+    assert_eq!(errors(&with_method(&block, "gn")), ["E_BLOCK_SIGMA_METHOD_UNSUPPORTED"],);
+    assert_eq!(errors(&with_method(&block, "foce")), ["E_IIV_ON_RUV_METHOD"]);
 
     let serial = twin("triple");
     assert_eq!(errors(&serial), Vec::<String>::new());
     for m in ["saem", "imp", "laplace", "vi"] {
-        assert_eq!(
-            errors(&with_method(&serial, m)),
-            ["E_RESIDUAL_CORRELATION_SCOPE"],
-            "{m}"
-        );
+        assert_eq!(errors(&with_method(&serial, m)), ["E_RESIDUAL_CORRELATION_SCOPE"], "{m}");
     }
-    assert_eq!(
-        errors(&with_method(&serial, "foce")),
-        ["E_IIV_ON_RUV_METHOD"]
-    );
+    assert_eq!(errors(&with_method(&serial, "foce")), ["E_IIV_ON_RUV_METHOD"]);
 }
 
 /// A shared η is `E_IIV_ON_RUV_SHARED_ETA` on `error_model`; a non-interaction method
@@ -342,11 +310,8 @@ fn iiv_on_ruv_with_a_dense_r_refuses_only_what_each_half_refuses() {
 fn iiv_on_ruv_refusals_are_coded() {
     let pop = gaussian_population();
     let src = iiv_on_ruv_model();
-    let focei = FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
-        ..FitOptions::default()
-    };
+    let focei =
+        FitOptions { method: EstimationMethod::FoceI, interaction: true, ..FitOptions::default() };
 
     let shared_src = src.replace("iiv_on_ruv = ETA_RUV", "iiv_on_ruv = ETA_V");
     let shared = parse_model_string(&shared_src).expect("parse a shared iiv_on_ruv eta");
@@ -362,11 +327,8 @@ fn iiv_on_ruv_refusals_are_coded() {
     assert!(check_codes(&shared_src).contains(&"E_IIV_ON_RUV_SHARED_ETA".to_string()));
 
     let model = parse_model_string(&src).expect("parse");
-    let foce = FitOptions {
-        method: EstimationMethod::Foce,
-        interaction: false,
-        ..FitOptions::default()
-    };
+    let foce =
+        FitOptions { method: EstimationMethod::Foce, interaction: false, ..FitOptions::default() };
     assert_coded(
         &fit_refusal(&model, &pop, &model.default_params, &foce),
         "foce",
@@ -381,10 +343,7 @@ fn iiv_on_ruv_refusals_are_coded() {
     assert!(check_codes(&foce_src).contains(&"E_IIV_ON_RUV_METHOD".to_string()));
     // The example as written (focei, a dedicated η) is neither.
     let clean = check_codes(&src);
-    assert!(
-        !clean.iter().any(|c| c.starts_with("E_IIV_ON_RUV")),
-        "{clean:?}"
-    );
+    assert!(!clean.iter().any(|c| c.starts_with("E_IIV_ON_RUV")), "{clean:?}");
 }
 
 // ── AGQ grid under IOV, single occasion ─────────────────────────────────────
@@ -415,11 +374,8 @@ fn agq_grid_under_iov_is_coded() {
         s.occasions = (1..=6).collect();
         s.dose_occasions = vec![1];
     }
-    let laplace = FitOptions {
-        method: EstimationMethod::Laplace,
-        n_agq: 6,
-        ..FitOptions::default()
-    };
+    let laplace =
+        FitOptions { method: EstimationMethod::Laplace, n_agq: 6, ..FitOptions::default() };
     let err = fit_refusal(&model, &pop, &model.default_params, &laplace);
     assert_eq!(err.code(), Some("E_AGQ_GRID_TOO_LARGE"), "{err}");
     assert_eq!(err.block(), Some("fit_options"), "{err}");
@@ -509,10 +465,8 @@ fn agq_grid_under_iov_counts_derived_occasions() {
         );
     }
     // The control: a rule giving two windows (`d = 3`, `6^3 = 216`) is under the cap.
-    let two = FitOptions {
-        iov_occasion: IovOccasionRule::TimeWindows(vec![3.5]),
-        ..laplace.clone()
-    };
+    let two =
+        FitOptions { iov_occasion: IovOccasionRule::TimeWindows(vec![3.5]), ..laplace.clone() };
     assert!(crate::api::validation::check_agq_grid_iov(
         &model,
         &six_obs(Vec::new(), Vec::new()),
@@ -564,18 +518,11 @@ fn ferx_check_reports_a_single_derived_occasion() {
         ..FitOptions::default()
     };
     let err = fit_refusal(&model, &gaussian_population(), &model.default_params, &opts);
-    assert_eq!(
-        err.to_string(),
-        d.message,
-        "fit() and ferx check say the same"
-    );
+    assert_eq!(err.to_string(), d.message, "fit() and ferx check say the same");
 
     let inside = check("6");
     assert!(
-        !inside
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "E_IOV_SINGLE_OCCASION"),
+        !inside.diagnostics.iter().any(|d| d.code == "E_IOV_SINGLE_OCCASION"),
         "{:?}",
         inside.diagnostics
     );
@@ -617,10 +564,7 @@ fn rtte_records_out_of_order_are_coded() {
         want,
     );
     let check = crate::api::check_model_data(&model, &pop);
-    assert!(
-        check.iter().any(|d| d.code == "E_RTTE_RECORDS"),
-        "{check:?}"
-    );
+    assert!(check.iter().any(|d| d.code == "E_RTTE_RECORDS"), "{check:?}");
 }
 
 /// With two repeated-event endpoints both out of time order, `E_RTTE_RECORDS` names the
@@ -654,11 +598,7 @@ fn rtte_records_refusal_names_the_lowest_bad_cmt_on_every_compile() {
                 ]
             })
             .collect();
-        population_of(vec![Subject {
-            id: "1".to_string(),
-            obs_records,
-            ..Default::default()
-        }])
+        population_of(vec![Subject { id: "1".to_string(), obs_records, ..Default::default() }])
     };
     let message = |model: &crate::types::CompiledModel, pop: &Population| {
         let check = crate::api::check_model_data(model, pop);
@@ -694,12 +634,8 @@ fn binary_state_outside_zero_one_is_coded() {
     use crate::types::ObsRecord;
     let src = std::fs::read_to_string("examples/binary_logistic.ferx").expect("example");
     let model = parse_model_string(&src).expect("parse");
-    let state = |time: f64, state: usize| ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state,
-        cmt: 3,
-    };
+    let state =
+        |time: f64, state: usize| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 3 };
     let mut pop = population_of(vec![Subject {
         id: "1".to_string(),
         obs_records: vec![state(1.0, 0), state(2.0, 2)],
@@ -717,10 +653,7 @@ fn binary_state_outside_zero_one_is_coded() {
          ordinal endpoint (not yet supported).",
     );
     let check = crate::api::check_model_data(&model, &pop);
-    assert!(
-        check.iter().any(|d| d.code == "E_BINARY_STATE"),
-        "{check:?}"
-    );
+    assert!(check.iter().any(|d| d.code == "E_BINARY_STATE"), "{check:?}");
 }
 
 /// An undeclared state and decreasing times are `E_CTMM_RECORDS` on `markov_model`. An
@@ -733,12 +666,8 @@ fn ctmm_refusals_are_coded() {
     use crate::types::{EndpointLikelihood, ObsRecord};
     let src = std::fs::read_to_string("examples/ctmm_2state.ferx").expect("example");
     let model = parse_model_string(&src).expect("parse");
-    let state = |time: f64, state: usize| ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state,
-        cmt: 5,
-    };
+    let state =
+        |time: f64, state: usize| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 5 };
     let pop_with = |records: Vec<ObsRecord>| {
         population_of(vec![Subject {
             id: "1".to_string(),
@@ -748,12 +677,7 @@ fn ctmm_refusals_are_coded() {
     };
     let undeclared = pop_with(vec![state(1.0, 0), state(2.0, 7)]);
     assert_coded(
-        &fit_refusal(
-            &model,
-            &undeclared,
-            &model.default_params,
-            &FitOptions::default(),
-        ),
+        &fit_refusal(&model, &undeclared, &model.default_params, &FitOptions::default()),
         "undeclared state",
         "E_CTMM_RECORDS",
         Some("markov_model"),
@@ -762,12 +686,7 @@ fn ctmm_refusals_are_coded() {
     );
     let unsorted = pop_with(vec![state(2.0, 0), state(1.0, 1)]);
     assert_coded(
-        &fit_refusal(
-            &model,
-            &unsorted,
-            &model.default_params,
-            &FitOptions::default(),
-        ),
+        &fit_refusal(&model, &unsorted, &model.default_params, &FitOptions::default()),
         "unsorted times",
         "E_CTMM_RECORDS",
         Some("markov_model"),
@@ -781,10 +700,7 @@ fn ctmm_refusals_are_coded() {
 
     let mut no_ode = parse_model_string(&src).expect("parse");
     for ep in no_ode.endpoints.values_mut() {
-        if let EndpointLikelihood::Ctmm {
-            generator_states, ..
-        } = ep
-        {
+        if let EndpointLikelihood::Ctmm { generator_states, .. } = ep {
             generator_states.push(("central".to_string(), 0));
         }
     }
@@ -809,10 +725,7 @@ fn a_missing_data_path_is_coded() {
             "fit_from_files",
             crate::api::fit_from_files(path, None, None, None).expect_err("no data"),
         ),
-        (
-            "prepare_run",
-            crate::api::prepare_run(path, None).err().expect("no data"),
-        ),
+        ("prepare_run", crate::api::prepare_run(path, None).err().expect("no data")),
     ];
     for (entry, err) in &errs {
         assert_coded(err, entry, "E_DATA_PATH_MISSING", None, want);

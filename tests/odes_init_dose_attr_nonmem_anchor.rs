@@ -125,14 +125,11 @@ fn model(attr: &str, attr_init: f64, init_reads: &str) -> String {
 
 /// NONMEM `IPRED` at the six **observation** times (t = 0, 0.5, 1.5, 2, 4, 8); the
 /// t = 1 dose record carries no ferx prediction. `F1 = 0.5`, seed `F1·100 = 50`.
-const NONMEM_F: [f64; 6] = [
-    1.0000E+00, 9.5123E-01, 1.8119E+00, 1.7236E+00, 1.4111E+00, 9.4591E-01,
-];
+const NONMEM_F: [f64; 6] = [1.0000E+00, 9.5123E-01, 1.8119E+00, 1.7236E+00, 1.4111E+00, 9.4591E-01];
 
 /// The lag pair: `ALAG1 = 0.7`, seed `ALAG1·100 = 70`, dose lands at t = 1.7.
-const NONMEM_LAG: [f64; 6] = [
-    1.4000E+00, 1.3317E+00, 1.2050E+00, 3.0871E+00, 2.5275E+00, 1.6942E+00,
-];
+const NONMEM_LAG: [f64; 6] =
+    [1.4000E+00, 1.3317E+00, 1.2050E+00, 3.0871E+00, 2.5275E+00, 1.6942E+00];
 
 /// `predict` at fixed parameters over `csv`. Single implementation so the reset arm
 /// below cannot drift from the anchor arms.
@@ -142,11 +139,7 @@ fn preds_on(csv: &str, src: &str) -> Vec<f64> {
     f.flush().expect("flush csv");
     let pop = read_nonmem_csv(f.path(), None, None).expect("dataset loads");
     let model = parse_full_model(src).expect("the model parses").model;
-    predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect()
+    predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect()
 }
 
 fn preds(src: &str) -> Vec<f64> {
@@ -154,19 +147,12 @@ fn preds(src: &str) -> Vec<f64> {
 }
 
 fn assert_matches(got: &[f64], want: &[f64], label: &str) {
-    assert_eq!(
-        got.len(),
-        want.len(),
-        "{label}: one prediction per observation"
-    );
+    assert_eq!(got.len(), want.len(), "{label}: one prediction per observation");
     // 1e-4 relative, matching the #993 anchor: NONMEM's table carries 5 significant
     // figures, so this sits just above the reference's own precision.
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         let rel = (g - w).abs() / w;
-        assert!(
-            rel < 1e-4,
-            "{label} obs {i}: ferx {g:.6} vs NONMEM {w:.6} (rel {rel:.2e})"
-        );
+        assert!(rel < 1e-4, "{label} obs {i}: ferx {g:.6} vs NONMEM {w:.6} (rel {rel:.2e})");
     }
 }
 
@@ -181,11 +167,7 @@ fn ferx_matches_nonmem_when_an_init_seed_reads_bioavailability() {
 fn ferx_matches_nonmem_when_an_init_seed_reads_the_absorption_lag() {
     // Same for lag: seed deposited at t=0 unshifted, dose lagged to t=1.7. The t=1.5
     // point is the discriminator — still pure decay, because the dose has not landed.
-    assert_matches(
-        &preds(&model("LAGTIME", 0.7, "LAGTIME")),
-        &NONMEM_LAG,
-        "LAG-A",
-    );
+    assert_matches(&preds(&model("LAGTIME", 0.7, "LAGTIME")), &NONMEM_LAG, "LAG-A");
 }
 
 /// Same events as [`CSV`] but with an `EVID=3` reset at t = 1 in place of the dose:
@@ -254,11 +236,7 @@ fn an_init_seed_reading_a_dose_attribute_survives_a_system_reset() {
         //     model on a dataset with the reset row removed. On its own this would
         //     admit a zeroing reset, which is why (a) carries the value.
         let plain = run(CSV_NO_RESET, attr);
-        assert_eq!(
-            plain.len(),
-            4,
-            "{attr}: four observations without the reset"
-        );
+        assert_eq!(plain.len(), 4, "{attr}: four observations without the reset");
         assert_ne!(
             a[2].to_bits(),
             plain[2].to_bits(),

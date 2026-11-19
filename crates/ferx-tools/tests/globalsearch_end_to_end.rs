@@ -79,10 +79,7 @@ fn run(dir: &Path, path: &Path, resume: bool) -> GlobalsearchResult {
     run_globalsearch(
         &config,
         &base,
-        GlobalsearchRun {
-            dir: Some(dir.join("run")),
-            ..GlobalsearchRun::default()
-        },
+        GlobalsearchRun { dir: Some(dir.join("run")), ..GlobalsearchRun::default() },
     )
     .expect("search")
 }
@@ -93,11 +90,7 @@ const GRID: &str = "ABSORPTION([INST,FO]); PERIPHERALS(0..1); LAGTIME([OFF,ON]);
 #[test]
 fn every_grid_point_compiles_and_evaluates_and_a_dead_gene_is_fitted_once() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        GRID,
-        "[globalsearch]\nalgorithm = \"exhaustive\"\n",
-    );
+    let path = write_config(dir.path(), GRID, "[globalsearch]\nalgorithm = \"exhaustive\"\n");
     let result = run(dir.path(), &path, false);
     // 2 · 2 · 2 · 2 · 2 = 32 points; the input on top.
     assert_eq!(result.space_size, 32);
@@ -132,10 +125,7 @@ fn every_grid_point_compiles_and_evaluates_and_a_dead_gene_is_fitted_once() {
             assert_eq!(r.seconds, 0.0);
             let twin = result.row(r.duplicate_of.as_ref().unwrap()).unwrap();
             assert_eq!(r.ofv, twin.ofv);
-            assert_eq!(
-                r.fitness,
-                twin.fitness + result.options.penalties.non_influential
-            );
+            assert_eq!(r.fitness, twin.fitness + result.options.penalties.non_influential);
             assert!(!result.models[&r.id].render().contains("KA ~ WT"));
         } else {
             assert_eq!(r.non_influential, 0, "{}", r.id);
@@ -144,10 +134,7 @@ fn every_grid_point_compiles_and_evaluates_and_a_dead_gene_is_fitted_once() {
             fitted += 1;
             // A live gene is a real relation the candidate carries.
             let text = result.models[&r.id].render();
-            assert_eq!(
-                text.contains("CL ~ WT power"),
-                r.description.contains("CL-WT=power")
-            );
+            assert_eq!(text.contains("CL ~ WT power"), r.description.contains("CL-WT=power"));
             assert_eq!(text.contains("KA ~ WT exponential"), ka_gene);
             assert_eq!(r.effects.len(), text.matches(" ~ WT ").count());
         }
@@ -199,11 +186,7 @@ fn every_grid_point_compiles_and_evaluates_and_a_dead_gene_is_fitted_once() {
 #[test]
 fn the_ga_agrees_with_exhaustive_enumeration_and_resumes_without_refitting() {
     let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        GRID,
-        "[globalsearch]\nalgorithm = \"exhaustive\"\n",
-    );
+    let path = write_config(dir.path(), GRID, "[globalsearch]\nalgorithm = \"exhaustive\"\n");
     let exhaustive = run(dir.path(), &path, false);
     let best = exhaustive.row(&exhaustive.final_id).unwrap();
 
@@ -218,11 +201,7 @@ fn the_ga_agrees_with_exhaustive_enumeration_and_resumes_without_refitting() {
     let winner = ga.row(&ga.final_id).unwrap();
     assert_eq!(winner.description, best.description, "{:?}", ga.notes);
     assert_eq!(winner.fitness.to_bits(), best.fitness.to_bits());
-    assert!(
-        ga.n_fitted() < exhaustive.n_fitted(),
-        "{} fits",
-        ga.n_fitted()
-    );
+    assert!(ga.n_fitted() < exhaustive.n_fitted(), "{} fits", ga.n_fitted());
     assert_eq!(ga.generations.len(), 5);
     let n_fitted = ga.n_fitted();
     let fitted_seconds: f64 = ga.rows.iter().map(|r| r.seconds).sum();
@@ -234,22 +213,11 @@ fn the_ga_agrees_with_exhaustive_enumeration_and_resumes_without_refitting() {
     assert_eq!(resumed.final_id, ga.final_id);
     assert_eq!(resumed.n_fitted(), n_fitted);
     assert!(
-        resumed
-            .rows
-            .iter()
-            .all(|r| r.reused || r.error.is_some() || r.duplicate_of.is_some()),
+        resumed.rows.iter().all(|r| r.reused || r.error.is_some() || r.duplicate_of.is_some()),
         "a resumed run fitted something: {:?}",
-        resumed
-            .rows
-            .iter()
-            .filter(|r| !r.reused)
-            .map(|r| &r.id)
-            .collect::<Vec<_>>()
+        resumed.rows.iter().filter(|r| !r.reused).map(|r| &r.id).collect::<Vec<_>>()
     );
-    assert_eq!(
-        resumed.rows.iter().map(|r| r.seconds).sum::<f64>(),
-        fitted_seconds
-    );
+    assert_eq!(resumed.rows.iter().map(|r| r.seconds).sum::<f64>(), fitted_seconds);
     for (a, b) in ga.rows.iter().zip(&resumed.rows) {
         assert_eq!(a.description, b.description);
         assert_eq!(a.fitness.to_bits(), b.fitness.to_bits(), "{}", a.id);
@@ -269,26 +237,15 @@ fn a_covariate_only_grid_needs_no_structural_axis() {
     assert_eq!(result.space_size, 8);
     assert_eq!(result.axes.len(), 3);
     assert!(result.rows[1..].iter().all(|r| r.structure.is_none()));
-    assert!(
-        result.rows[1..].iter().all(|r| r.error.is_none()),
-        "{:?}",
-        result.notes
-    );
+    assert!(result.rows[1..].iter().all(|r| r.error.is_none()), "{:?}", result.notes);
     assert_eq!(result.criterion.label(), "bic_mixed");
     // The axes follow the η order of the base (`@IIV`): CL, V, KA.
     assert_eq!(
-        result
-            .axes
-            .iter()
-            .map(|(n, _)| n.as_str())
-            .collect::<Vec<_>>(),
+        result.axes.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
         vec!["CL-WT", "V-WT", "KA-WT"]
     );
-    let all = result
-        .rows
-        .iter()
-        .find(|r| r.description == "CL-WT=power;V-WT=power;KA-WT=power")
-        .unwrap();
+    let all =
+        result.rows.iter().find(|r| r.description == "CL-WT=power;V-WT=power;KA-WT=power").unwrap();
     assert_eq!(all.effects.len(), 3);
     assert_eq!(all.n_parameters, Some(10));
 }

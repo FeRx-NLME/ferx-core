@@ -66,31 +66,22 @@ fn fit(model: &str) -> ferx_core::types::FitResult {
 }
 
 fn fit_with(
-    model: &str,
-    edit: impl FnOnce(&mut ferx_core::types::FitOptions),
+    model: &str, edit: impl FnOnce(&mut ferx_core::types::FitOptions),
 ) -> ferx_core::types::FitResult {
     let prep = ferx_core::prepare_run(
         root().join("nonmem_anchor").join(model).to_str().unwrap(),
-        Some(
-            root()
-                .join("nonmem_anchor/saem_additive_mu.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        Some(root().join("nonmem_anchor/saem_additive_mu.csv").to_str().unwrap()),
     )
     .expect("prepare");
     let mut opts = ferx_core::types::FitOptions {
         verbose: false,
+        // NONMEM scored these estimates with FOCEI (`METHOD=1 MAXEVAL=0`), so the oracle is the
+        // FOCE/Laplace readout, not the importance-sampled default of #2973.
+        saem_ofv: ferx_core::types::SaemOfv::Focei,
         ..prep.parsed.fit_options.clone()
     };
     edit(&mut opts);
-    ferx_core::fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("fit")
+    ferx_core::fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts).expect("fit")
 }
 
 #[test]
@@ -99,16 +90,8 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     let nm_mu = ext_last("saem_additive_mu.ext");
     let nm_nomu = ext_last("saem_additive_mu_nomu.ext");
     // The oracle itself: NONMEM with MU reaches the MLE, NONMEM without it does not.
-    assert!(
-        (nm_mu["OBJ"] - mle).abs() < 1e-3,
-        "NONMEM MU {} vs MLE {mle}",
-        nm_mu["OBJ"]
-    );
-    assert!(
-        nm_nomu["OBJ"] > mle + 1.0,
-        "NONMEM no-MU {} vs MLE {mle}",
-        nm_nomu["OBJ"]
-    );
+    assert!((nm_mu["OBJ"] - mle).abs() < 1e-3, "NONMEM MU {} vs MLE {mle}", nm_mu["OBJ"]);
+    assert!(nm_nomu["OBJ"] > mle + 1.0, "NONMEM no-MU {} vs MLE {mle}", nm_nomu["OBJ"]);
 
     // NONMEM is spelling-invariant: the inline `MU_1` stream ends bit-identical to the
     // split one, in the SAEM table and the scored one alike.
@@ -181,11 +164,7 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
         ("TVE0", inline.theta[0], split.theta[0]),
         ("omega2", inline.omega[(0, 0)], split.omega[(0, 0)]),
     ] {
-        assert_eq!(
-            a.to_bits(),
-            b.to_bits(),
-            "inline vs split {what}: {a} vs {b}"
-        );
+        assert_eq!(a.to_bits(), b.to_bits(), "inline vs split {what}: {a} vs {b}");
     }
     let ofv_rel = (inline.ofv - split.ofv).abs() / split.ofv.abs();
     assert!(
@@ -201,11 +180,18 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
         nm_inline["THETA1"]
     );
 
-    // The control: TVE0 also read in [structural_model], so it is not mu-referenced and,
-    // at the 150 + 250 single-chain schedule, stays on the ridge (measured 172.663 at the
-    // default seed, 168.54–172.76 over five, what the inline spelling gave before #2544).
+    // The control: TVE0 also read in [structural_model], so it is not mu-referenced and
+    // stays off the MLE. Before #3021 it measured 172.663 at the default seed and
+    // 168.54–172.76 over five (what the inline spelling gave before #2544). On the hashed
+    // streams (#3021) its distance above the MLE scatters widely: 0.845 at the default
+    // seed and 0.233–13.65 over seeds 1..=20, while the split mu-reference sits at most
+    // 0.00034 above (macOS aarch64; the default seed matches Linux x86_64 CI to the
+    // printed digit). 0.05 is 4.7x below the lowest control and ~150x above the highest
+    // mu-referenced fit, so it still separates the shapes on every seed measured.
+    // The control runs main's former 150 + 250 single-chain schedule (pinned above), where
+    // these numbers were measured; at the #2986 defaults it reaches MLE + 0.30.
     assert!(
-        shared.ofv > mle + 1.0,
+        shared.ofv > mle + 0.05,
         "shared BASE = TVE0 + PLAFIX + ETA_E0 with TVE0 read elsewhere must stay off the \
          MLE: {}",
         shared.ofv
@@ -214,10 +200,7 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     // What each spelling is told. Neither mu-referenced one is warned. The control names
     // BASE and says why splitting would not help, since its theta is read elsewhere.
     let not_mu = |f: &ferx_core::types::FitResult| {
-        f.warnings
-            .iter()
-            .find(|w| w.contains("not mu-referenced:"))
-            .cloned()
+        f.warnings.iter().find(|w| w.contains("not mu-referenced:")).cloned()
     };
     assert_eq!(not_mu(&split), None, "split: {:?}", split.warnings);
     assert_eq!(not_mu(&inline), None, "inline: {:?}", inline.warnings);

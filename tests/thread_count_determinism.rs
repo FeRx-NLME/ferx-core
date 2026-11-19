@@ -24,10 +24,7 @@ use std::path::Path;
 use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions};
 
-fn warfarin() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn warfarin() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -72,10 +69,7 @@ fn focei_ofv_is_independent_of_thread_count() {
 }
 
 fn assert_bit_identical_across_threads(label: &str, ofv_1: f64, ofv_4: f64, ofv_15: f64) {
-    assert!(
-        ofv_1.is_finite(),
-        "{label}: OFV must be finite, got {ofv_1}"
-    );
+    assert!(ofv_1.is_finite(), "{label}: OFV must be finite, got {ofv_1}");
     assert_eq!(
         ofv_1.to_bits(),
         ofv_4.to_bits(),
@@ -145,10 +139,7 @@ fn saem_imh_ofv_is_independent_of_thread_count() {
     assert_bit_identical_across_threads("SAEM (imh)", ofv_1, ofv_4, ofv_15);
 }
 
-fn warfarin_iov() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn warfarin_iov() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model = parse_model_file(Path::new("examples/warfarin_iov_saem.ferx"))
         .expect("warfarin_iov_saem model must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))

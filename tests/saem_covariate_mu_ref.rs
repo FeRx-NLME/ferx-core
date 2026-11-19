@@ -118,10 +118,7 @@ fn covariate_mu_refs_are_detected_in_both_anchor_models() {
     assert_eq!(pow.covariate_mu_refs.len(), 1);
     assert_eq!(pow.covariate_mu_refs[0].theta_names, vec!["TVCL", "TH_WT"]);
     // The power form keeps its historical single anchor on TVCL as well.
-    assert_eq!(
-        pow.mu_refs.get("ETA_CL").map(|m| m.theta_name.as_str()),
-        Some("TVCL")
-    );
+    assert_eq!(pow.mu_refs.get("ETA_CL").map(|m| m.theta_name.as_str()), Some("TVCL"));
 }
 
 /// Tier-2: the group is a closed-form channel. `V` keeps its own single-anchor
@@ -130,11 +127,7 @@ fn covariate_mu_refs_are_detected_in_both_anchor_models() {
 #[test]
 fn saem_covariate_group_removes_the_not_mu_referenced_warning() {
     let (model, pop) = load("covmuref_additive_saem_fit.ferx", "covmuref_additive.csv");
-    let opts = FitOptions {
-        saem_n_exploration: Some(2),
-        saem_n_convergence: 1,
-        ..saem_opts()
-    };
+    let opts = FitOptions { saem_n_exploration: Some(2), saem_n_convergence: 1, ..saem_opts() };
     let result = fit(&model, &pop, &model.default_params, &opts).expect("short SAEM must run");
     assert!(
         result.saem_mu_ref_m_step_evals_saved.unwrap_or(0) > 0,
@@ -142,18 +135,12 @@ fn saem_covariate_group_removes_the_not_mu_referenced_warning() {
         result.saem_mu_ref_m_step_evals_saved
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("individual parameter(s) not mu-referenced")),
+        !result.warnings.iter().any(|w| w.contains("individual parameter(s) not mu-referenced")),
         "CL is mu-referenced through its covariate group, got {:?}",
         result.warnings
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("covariate mu-reference on")),
+        !result.warnings.iter().any(|w| w.contains("covariate mu-reference on")),
         "no group may be declined on this model, got {:?}",
         result.warnings
     );
@@ -173,41 +160,22 @@ fn an_if_else_assigned_covariate_local_joins_the_group() {
     let (direct, _) = load("covmuref_power_saem_fit.ferx", "covmuref_power.csv");
     let (ifelse, pop) = load("covmuref_power_ifelse_saem_fit.ferx", "covmuref_power.csv");
     let (numeric, _) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
-    assert_eq!(
-        ifelse.covariate_mu_refs.len(),
-        1,
-        "{:?}",
-        ifelse.covariate_mu_refs
-    );
+    assert_eq!(ifelse.covariate_mu_refs.len(), 1, "{:?}", ifelse.covariate_mu_refs);
     let (g, d) = (&ifelse.covariate_mu_refs[0], &direct.covariate_mu_refs[0]);
     assert_eq!(g.eta_name, d.eta_name);
     assert_eq!(g.theta_names, d.theta_names);
     assert_eq!(g.covariate_names, d.covariate_names);
     assert_eq!(g.transform, d.transform);
-    assert!(
-        numeric.covariate_mu_refs.is_empty(),
-        "{:?}",
-        numeric.covariate_mu_refs
-    );
+    assert!(numeric.covariate_mu_refs.is_empty(), "{:?}", numeric.covariate_mu_refs);
 
-    let opts = FitOptions {
-        saem_n_exploration: Some(2),
-        saem_n_convergence: 1,
-        ..saem_opts()
-    };
+    let opts = FitOptions { saem_n_exploration: Some(2), saem_n_convergence: 1, ..saem_opts() };
     // (named in the ETA-less advisory, named in the carries-an-ETA advisory)
     let advisories_naming_th_wt = |model: &ferx_core::CompiledModel| {
         let result = fit(model, &pop, &model.default_params, &opts).expect("short SAEM must run");
         let names = |phrase: &str| {
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains(phrase) && w.contains("TH_WT"))
+            result.warnings.iter().any(|w| w.contains(phrase) && w.contains("TH_WT"))
         };
-        (
-            names("NO associated ETA"),
-            names("but not as a mu-referenced typical value"),
-        )
+        (names("NO associated ETA"), names("but not as a mu-referenced typical value"))
     };
     assert_eq!(
         advisories_naming_th_wt(&numeric),
@@ -242,18 +210,8 @@ fn saem_recovers_the_additive_renal_gradient() {
     );
     assert_finite_close("TVCL", theta(&result, "TVCL"), NM_ADD_TVCL, 0.15);
     assert_finite_close("TVV", theta(&result, "TVV"), NM_ADD_TVV, 1.0);
-    assert_finite_close(
-        "omega^2(ETA_CL)",
-        omega(&result, "ETA_CL"),
-        NM_ADD_OMEGA_CL,
-        0.01,
-    );
-    assert_finite_close(
-        "omega^2(ETA_V)",
-        omega(&result, "ETA_V"),
-        NM_ADD_OMEGA_V,
-        0.01,
-    );
+    assert_finite_close("omega^2(ETA_CL)", omega(&result, "ETA_CL"), NM_ADD_OMEGA_CL, 0.01);
+    assert_finite_close("omega^2(ETA_V)", omega(&result, "ETA_V"), NM_ADD_OMEGA_V, 0.01);
 }
 
 /// Tier-3: the allometric exponent — NONMEM's linear-in-theta MU, its
@@ -276,18 +234,8 @@ fn saem_recovers_the_allometric_exponent() {
     );
     assert_finite_close("TVCL", theta(&result, "TVCL"), NM_POW_TVCL, 0.15);
     assert_finite_close("TVV", theta(&result, "TVV"), NM_POW_TVV, 1.0);
-    assert_finite_close(
-        "omega^2(ETA_CL)",
-        omega(&result, "ETA_CL"),
-        NM_POW_OMEGA_CL,
-        0.01,
-    );
-    assert_finite_close(
-        "omega^2(ETA_V)",
-        omega(&result, "ETA_V"),
-        NM_POW_OMEGA_V,
-        0.01,
-    );
+    assert_finite_close("omega^2(ETA_CL)", omega(&result, "ETA_CL"), NM_POW_OMEGA_CL, 0.01);
+    assert_finite_close("omega^2(ETA_V)", omega(&result, "ETA_V"), NM_POW_OMEGA_V, 0.01);
 }
 
 /// Tier-3, #1422: the allometric exponent with the weight ratio assigned in
@@ -306,12 +254,7 @@ fn saem_recovers_the_allometric_exponent() {
 )]
 fn saem_recovers_the_allometric_exponent_through_an_if_else_local() {
     let (model, pop) = load("covmuref_power_ifelse_saem_fit.ferx", "covmuref_power.csv");
-    assert_eq!(
-        model.covariate_mu_refs.len(),
-        1,
-        "{:?}",
-        model.covariate_mu_refs
-    );
+    assert_eq!(model.covariate_mu_refs.len(), 1, "{:?}", model.covariate_mu_refs);
     let result = fit(&model, &pop, &model.default_params, &saem_opts()).expect("SAEM must run");
     let th_wt = theta(&result, "TH_WT");
     assert_finite_close("TH_WT", th_wt, NM_POW_TH_WT, 0.01);
@@ -321,18 +264,8 @@ fn saem_recovers_the_allometric_exponent_through_an_if_else_local() {
     );
     assert_finite_close("TVCL", theta(&result, "TVCL"), NM_POW_TVCL, 0.05);
     assert_finite_close("TVV", theta(&result, "TVV"), NM_POW_TVV, 0.1);
-    assert_finite_close(
-        "omega^2(ETA_CL)",
-        omega(&result, "ETA_CL"),
-        NM_POW_OMEGA_CL,
-        0.002,
-    );
-    assert_finite_close(
-        "omega^2(ETA_V)",
-        omega(&result, "ETA_V"),
-        NM_POW_OMEGA_V,
-        0.002,
-    );
+    assert_finite_close("omega^2(ETA_CL)", omega(&result, "ETA_CL"), NM_POW_OMEGA_CL, 0.002);
+    assert_finite_close("omega^2(ETA_V)", omega(&result, "ETA_V"), NM_POW_OMEGA_V, 0.002);
 }
 
 /// Tier-3, #1415: the same allometric exponent with **no** mu-reference group —
@@ -388,18 +321,8 @@ fn saem_recovers_the_allometric_exponent_on_the_numerical_mstep() {
     );
     assert_finite_close("TVCL", theta(&result, "TVCL"), NM_POW_TVCL, 0.15);
     assert_finite_close("TVV", theta(&result, "TVV"), NM_POW_TVV, 1.0);
-    assert_finite_close(
-        "omega^2(ETA_CL)",
-        omega(&result, "ETA_CL"),
-        NM_POW_OMEGA_CL,
-        0.02,
-    );
-    assert_finite_close(
-        "omega^2(ETA_V)",
-        omega(&result, "ETA_V"),
-        NM_POW_OMEGA_V,
-        0.01,
-    );
+    assert_finite_close("omega^2(ETA_CL)", omega(&result, "ETA_CL"), NM_POW_OMEGA_CL, 0.02);
+    assert_finite_close("omega^2(ETA_V)", omega(&result, "ETA_V"), NM_POW_OMEGA_V, 0.01);
 }
 
 /// Tier-3: IMP shares the group step (exact engine on the importance-weighted
@@ -484,10 +407,7 @@ fn imp_recovers_the_additive_renal_gradient() {
 fn the_k_draw_mstep_estimator_also_recovers_the_allometric_exponent() {
     assert_mstep_arm_recovers_th_wt(
         "mstep_draws=3",
-        FitOptions {
-            saem_mstep_draws: 3,
-            ..saem_opts()
-        },
+        FitOptions { saem_mstep_draws: 3, ..saem_opts() },
     );
 }
 
@@ -515,10 +435,7 @@ fn the_k_draw_mstep_estimator_also_recovers_the_allometric_exponent() {
 fn score_sa_also_recovers_the_allometric_exponent() {
     assert_mstep_arm_recovers_th_wt(
         "score_sa",
-        FitOptions {
-            saem_mstep_solver: SaemMstepSolver::ScoreSa,
-            ..saem_opts()
-        },
+        FitOptions { saem_mstep_solver: SaemMstepSolver::ScoreSa, ..saem_opts() },
     );
 }
 
@@ -575,10 +492,7 @@ fn assert_mstep_arm_recovers_th_wt(name: &str, opts: FitOptions) {
     // would fall back to the default solver and this test would then be a
     // second copy of the one above.
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("#1458") && w.contains("not available")),
+        !result.warnings.iter().any(|w| w.contains("#1458") && w.contains("not available")),
         "{name}: the scope gate refused this fixture, so the arm never ran: {:?}",
         result.warnings
     );
@@ -596,18 +510,8 @@ fn assert_mstep_arm_recovers_th_wt(name: &str, opts: FitOptions) {
          {BEFORE_TH_WT} — an arm that never moves the theta passes the anchor \
          bound above only because the start is not far from it"
     );
-    assert_finite_close(
-        &format!("{name}: TVCL"),
-        theta(&result, "TVCL"),
-        NM_POW_TVCL,
-        0.25,
-    );
-    assert_finite_close(
-        &format!("{name}: TVV"),
-        theta(&result, "TVV"),
-        NM_POW_TVV,
-        1.5,
-    );
+    assert_finite_close(&format!("{name}: TVCL"), theta(&result, "TVCL"), NM_POW_TVCL, 0.25);
+    assert_finite_close(&format!("{name}: TVV"), theta(&result, "TVV"), NM_POW_TVV, 1.5);
     assert_finite_close(
         &format!("{name}: omega^2(ETA_CL)"),
         omega(&result, "ETA_CL"),
@@ -644,14 +548,8 @@ fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
         o.saem_n_mh_steps = 2;
         o
     };
-    let score_sa = || FitOptions {
-        saem_mstep_solver: SaemMstepSolver::ScoreSa,
-        ..saem_opts()
-    };
-    let k_draws = || FitOptions {
-        saem_mstep_draws: 3,
-        ..saem_opts()
-    };
+    let score_sa = || FitOptions { saem_mstep_solver: SaemMstepSolver::ScoreSa, ..saem_opts() };
+    let k_draws = || FitOptions { saem_mstep_draws: 3, ..saem_opts() };
 
     // In scope: no fallback warning, so the assertions below are about the gate
     // and not about every fit emitting the message.
@@ -669,10 +567,7 @@ fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
     )
     .expect("anchor model file");
     let magnitude_src = src
-        .replace(
-            "  sigma PROP_ERR ~ 0.02",
-            "  sigma PROP_ERR ~ 0.02\n  sigma ADD_ERR  ~ 0.50 (sd)",
-        )
+        .replace("  sigma PROP_ERR ~ 0.02", "  sigma PROP_ERR ~ 0.02\n  sigma ADD_ERR  ~ 0.50 (sd)")
         .replace(
             "DV ~ proportional(PROP_ERR)",
             "DV ~ combined(PROP_ERR, ADD_ERR) weight = WT
@@ -685,9 +580,7 @@ fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
         magnitude_src.contains("ADD_ERR") && magnitude_src.contains("weight = WT"),
         "both halves of the magnitude edit must land: {magnitude_src}"
     );
-    let mag = parse_full_model(&magnitude_src)
-        .expect("magnitude variant parses")
-        .model;
+    let mag = parse_full_model(&magnitude_src).expect("magnitude variant parses").model;
     assert!(
         mag.has_custom_ruv_magnitude(),
         "the variant must really carry a magnitude, or this tests nothing"
@@ -696,10 +589,7 @@ fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
     let refused = fit(&mag, &pop, &mag.default_params, &short(score_sa()))
         .expect("out-of-scope SAEM must still run");
     assert!(
-        refused
-            .warnings
-            .iter()
-            .any(|w| w.contains("score_sa") && w.contains("magnitude")),
+        refused.warnings.iter().any(|w| w.contains("score_sa") && w.contains("magnitude")),
         "a residual magnitude must be refused by name: {:?}",
         refused.warnings
     );
@@ -707,10 +597,7 @@ fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
     let refused_k = fit(&mag, &pop, &mag.default_params, &short(k_draws()))
         .expect("out-of-scope SAEM must still run");
     assert!(
-        refused_k
-            .warnings
-            .iter()
-            .any(|w| w.contains("mstep_draws") && w.contains("magnitude")),
+        refused_k.warnings.iter().any(|w| w.contains("mstep_draws") && w.contains("magnitude")),
         "`mstep_draws` must be refused by name too: {:?}",
         refused_k.warnings
     );
@@ -756,9 +643,7 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
     let run = |o: FitOptions| -> Vec<f64> {
         let r = fit(&model, &pop, &model.default_params, &short(o)).expect("SAEM must run");
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains("#1458") && w.contains("not available")),
+            !r.warnings.iter().any(|w| w.contains("#1458") && w.contains("not available")),
             "the scope gate refused this fixture, so no arm ran: {:?}",
             r.warnings
         );
@@ -778,10 +663,7 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
 
     let worst = |a: &[f64], b: &[f64]| -> f64 {
         a.iter().zip(b.iter()).fold(0.0f64, |m, (x, y)| {
-            assert!(
-                x.is_finite() && y.is_finite(),
-                "non-finite theta: {x} vs {y}"
-            );
+            assert!(x.is_finite() && y.is_finite(), "non-finite theta: {x} vs {y}");
             m.max((x.ln() - y.ln()).abs())
         })
     };
@@ -789,18 +671,9 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
     for (name, opts) in [
         (
             "mstep_solver = score_sa",
-            FitOptions {
-                saem_mstep_solver: SaemMstepSolver::ScoreSa,
-                ..saem_opts()
-            },
+            FitOptions { saem_mstep_solver: SaemMstepSolver::ScoreSa, ..saem_opts() },
         ),
-        (
-            "mstep_draws = 3",
-            FitOptions {
-                saem_mstep_draws: 3,
-                ..saem_opts()
-            },
-        ),
+        ("mstep_draws = 3", FitOptions { saem_mstep_draws: 3, ..saem_opts() }),
     ] {
         let arm = run(opts);
         let d = worst(&arm, &base);
@@ -863,19 +736,16 @@ fn mstep_damping_reaches_sigma_under_score_sa() {
         };
         let r = fit(&model, &pop, &model.default_params, &opts).expect("SAEM must run");
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains("#1458") && w.contains("not available")),
+            !r.warnings.iter().any(|w| w.contains("#1458") && w.contains("not available")),
             "the scope gate refused this fixture, so score_sa never ran: {:?}",
             r.warnings
         );
         r.sigma.clone()
     };
 
-    for (branch, mu_referencing) in [
-        ("mu-referenced branch", true),
-        ("mu_referencing = false branch", false),
-    ] {
+    for (branch, mu_referencing) in
+        [("mu-referenced branch", true), ("mu_referencing = false branch", false)]
+    {
         let off = run(mu_referencing, None);
         // The control: the same arm twice is bit-identical, so the difference
         // below is the option and not fit-to-fit noise.
@@ -887,11 +757,7 @@ fn mstep_damping_reaches_sigma_under_score_sa() {
         );
 
         let damped = run(mu_referencing, Some(0.005));
-        assert_eq!(
-            off.len(),
-            damped.len(),
-            "{branch}: the two arms returned different σ shapes"
-        );
+        assert_eq!(off.len(), damped.len(), "{branch}: the two arms returned different σ shapes");
         let worst = off.iter().zip(damped.iter()).fold(0.0f64, |m, (a, b)| {
             assert!(
                 a.is_finite() && b.is_finite() && *a > 0.0 && *b > 0.0,
@@ -930,7 +796,9 @@ const BEFORE_SHARED_SAEM_TH_WT: f64 = 0.010_075;
 const BEFORE_SHARED_IMPMAP_TH_CRCL: f64 = 0.358_114;
 const BEFORE_SHARED_IMPMAP_TVCL: f64 = 4.744_483;
 
-/// Bounds against the NONMEM anchors, from the realised errors on aarch64
+/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3021; the
+/// tables below are the pre-#3021 single-seed errors, whose seeds 1-3 shared 29 of 30
+/// subject streams), from the realised errors on aarch64
 /// (`ci-test`) at the time of writing:
 ///
 /// | arm | `THETA_WT` | `THETA_CRCL` | `TVCL` |
@@ -963,9 +831,7 @@ const SHARED_NOTE: &str = "covariate mu-references on ETA_CL (reads TVCL, THETA_
 fn fit_shared(edit: impl FnOnce(&mut FitOptions)) -> FitResult {
     let model = Path::new("nonmem_anchor").join("covmuref_shared_saem_fit.ferx");
     let src = std::fs::read_to_string(&model).expect("anchor model file");
-    let mut opts = parse_full_model(&src)
-        .expect("anchor model parses")
-        .fit_options;
+    let mut opts = parse_full_model(&src).expect("anchor model parses").fit_options;
     edit(&mut opts);
     let result = ferx_core::fit_from_files(
         model.to_str().unwrap(),
@@ -974,20 +840,64 @@ fn fit_shared(edit: impl FnOnce(&mut FitOptions)) -> FitResult {
         Some(opts),
     )
     .expect("the fit must run");
-    let notes: Vec<&String> = result
-        .warnings
-        .iter()
-        .filter(|w| w.contains("covariate mu-reference"))
-        .collect();
+    let notes: Vec<&String> =
+        result.warnings.iter().filter(|w| w.contains("covariate mu-reference")).collect();
     assert_eq!(notes.len(), 1, "{:?}", result.warnings);
     assert!(notes[0].ends_with(SHARED_NOTE), "{}", notes[0]);
     result
 }
 
+/// The seeds every #1620 / #1630 SAEM arm is run over, asserting on the **median** of the
+/// fits (#3021). The bounds below were tuned to the one Monte Carlo path of seed 1 (and a
+/// "spread over seeds 1/2/3", whose streams overlapped before #3021). Hashing the streams
+/// (#3021) moved seed 1 onto another path of the same noisy distribution: over 15 seeds
+/// `THETA_WT` has sd 0.058 (150/250), 0.051 (300/700) and 0.153 (`score_sa`, one seed at
+/// 1.20) — the pre-#3021 streams measured sd 0.074 / 0.070 / 0.048 on the same seeds, so the
+/// noise is the fixture's, not the change's — so no single seed can honour the 0.04
+/// bound. The median of 9 seeds can: its worst realised error over the 7 windows of
+/// consecutive seeds 1..15 is `THETA_WT` 0.016 / 0.020 / 0.028, `THETA_CRCL` ≤ 0.0042,
+/// `TVCL` ≤ 0.0050 (shared arms), A: `THETA_CRCL` 0.0002, `TVCL` 0.0014, typical V1 0.12
+/// (Linux x86_64, `ci-fast`) — each inside the bound with 1.4× or more headroom, and the
+/// pre-fix values stay far outside (below). Case B needs more seeds: [`ANCHOR_B_SEEDS`].
+const SAEM_SEEDS: std::ops::RangeInclusive<u64> = 1..=9;
+
+/// Case B's seeds: 25, not [`SAEM_SEEDS`]' 9. `THETA_WT_V1` is trimodal on this fixture
+/// (#3021 review; seeds 1..=40, macOS arm64 `ci-test`, the profile the slow-tests job
+/// runs): 20 of 40 seeds land within 0.05 of NONMEM's 0.591, 9 in a low mode 0.21–0.54
+/// around the pre-#1630 value, 11 high at 0.64–1.43. A 9-seed median failed the 0.05
+/// bound on 5 of the 32 windows of consecutive seeds (worst error 0.215), so seeds 1..=9
+/// passed by luck of the draw. Over every 25-seed window of 1..=40 the median's worst error
+/// is `THETA_WT_V1` 0.0226 (bound 0.05) and typical V1 0.529 (bound 1.2), and it stays at
+/// least 0.167 / 1.93 clear of the pre-#1630 values (margins 0.15 / 1.5). 0.55 s a fit.
+const ANCHOR_B_SEEDS: std::ops::RangeInclusive<u64> = 1..=25;
+
+fn median(mut v: Vec<f64>) -> f64 {
+    assert!(v.iter().all(|x| x.is_finite()), "non-finite fit values {v:?}");
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+fn median_theta(results: &[FitResult], name: &str) -> f64 {
+    median(results.iter().map(|r| theta(r, name)).collect())
+}
+
+/// [`fit_shared`] over [`SAEM_SEEDS`].
+fn fit_shared_seeds(edit: impl Fn(&mut FitOptions)) -> Vec<FitResult> {
+    SAEM_SEEDS
+        .map(|seed| {
+            fit_shared(|o| {
+                edit(o);
+                o.saem_seed = Some(seed);
+            })
+        })
+        .collect()
+}
+
 /// The SAEM arms share one body, so an arm cannot drift onto weaker
-/// assertions than its siblings.
-fn assert_saem_shared_arm(name: &str, result: &FitResult) {
-    let th_wt = theta(result, "THETA_WT");
+/// assertions than its siblings. `results` is one fit per seed of
+/// [`SAEM_SEEDS`]; the bounds apply to the median.
+fn assert_saem_shared_arm(name: &str, results: &[FitResult]) {
+    let th_wt = median_theta(results, "THETA_WT");
     assert_finite_close(
         &format!("{name}: THETA_WT"),
         th_wt,
@@ -1001,13 +911,13 @@ fn assert_saem_shared_arm(name: &str, result: &FitResult) {
     );
     assert_finite_close(
         &format!("{name}: THETA_CRCL"),
-        theta(result, "THETA_CRCL"),
+        median_theta(results, "THETA_CRCL"),
         NM_SHARED_SAEM_TH_CRCL,
         SHARED_TH_CRCL_TOL,
     );
     assert_finite_close(
         &format!("{name}: TVCL"),
-        theta(result, "TVCL"),
+        median_theta(results, "TVCL"),
         NM_SHARED_SAEM_TVCL,
         SHARED_TVCL_TOL,
     );
@@ -1024,8 +934,8 @@ fn assert_saem_shared_arm(name: &str, result: &FitResult) {
     ignore = "slow + NONMEM-anchored shared covariate theta (#1620): opt in with --features slow-tests"
 )]
 fn saem_recovers_a_shared_allometric_exponent() {
-    let result = fit_shared(|_| {});
-    assert_saem_shared_arm("SAEM 150/250", &result);
+    let results = fit_shared_seeds(|_| {});
+    assert_saem_shared_arm("SAEM 150/250", &results);
 }
 
 /// Tier-3, #1620 (T11). The same anchor through `score_sa` and through the
@@ -1037,9 +947,9 @@ fn saem_recovers_a_shared_allometric_exponent() {
     ignore = "slow + NONMEM-anchored shared covariate theta (#1620): opt in with --features slow-tests"
 )]
 fn saem_recovers_a_shared_allometric_exponent_on_every_mstep_arm() {
-    let sa = fit_shared(|o| o.saem_mstep_solver = SaemMstepSolver::ScoreSa);
+    let sa = fit_shared_seeds(|o| o.saem_mstep_solver = SaemMstepSolver::ScoreSa);
     assert_saem_shared_arm("SAEM score_sa 150/250", &sa);
-    let long = fit_shared(|o| {
+    let long = fit_shared_seeds(|o| {
         o.saem_n_exploration = Some(300);
         o.saem_n_convergence = 700;
     });
@@ -1103,7 +1013,9 @@ const BEFORE_ANCHOR_A_TH_CRCL: f64 = 0.213_731;
 const BEFORE_ANCHOR_B_TH_WT_V1: f64 = 0.401_657;
 const BEFORE_ANCHOR_B_TVV1: f64 = 94.696_502 * 0.483_249;
 
-/// Bounds against the NONMEM anchors, from the realised errors (Linux x86_64,
+/// Bounds against the NONMEM anchors (asserted on the median over `SAEM_SEEDS` since #3021; the
+/// table below is the pre-#3021 single-seed errors, whose seeds 1-3 shared 29 of 30 subject
+/// streams), from the realised errors (Linux x86_64,
 /// release) at the time of writing, seed 1 being the tested arm:
 ///
 /// | arm | `THETA_CRCL` | `TVCL` | typical V1 | `THETA_WT_V1` |
@@ -1130,9 +1042,7 @@ const ANCHOR_B_TH_WT_V1_TOL: f64 = 0.05;
 fn fit_anchor_twin(file: &str, edit: impl FnOnce(&mut FitOptions)) -> (FitResult, Vec<String>) {
     let model = Path::new("nonmem_anchor").join(file);
     let src = std::fs::read_to_string(&model).expect("anchor model file");
-    let mut opts = parse_full_model(&src)
-        .expect("anchor model parses")
-        .fit_options;
+    let mut opts = parse_full_model(&src).expect("anchor model parses").fit_options;
     edit(&mut opts);
     let result = ferx_core::fit_from_files(
         model.to_str().unwrap(),
@@ -1141,12 +1051,7 @@ fn fit_anchor_twin(file: &str, edit: impl FnOnce(&mut FitOptions)) -> (FitResult
         Some(opts),
     )
     .expect("the fit must run");
-    let notes = result
-        .warnings
-        .iter()
-        .filter(|w| w.contains("mu-reference"))
-        .cloned()
-        .collect();
+    let notes = result.warnings.iter().filter(|w| w.contains("mu-reference")).cloned().collect();
     (result, notes)
 }
 
@@ -1161,35 +1066,35 @@ fn fit_anchor_twin(file: &str, edit: impl FnOnce(&mut FitOptions)) -> (FitResult
     ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
 )]
 fn saem_merges_a_group_reading_a_superseded_anchor() {
-    let (result, notes) = fit_anchor_twin("covmuref_anchor_a_saem_fit.ferx", |_| {});
-    assert_eq!(
-        notes,
-        vec![
-            "SAEM: covariate mu-references on ETA_CL (reads TVCL, THETA_WT, THETA_CRCL) and \
-             ETA_V1 (reads TVCL, THETA_WT_V1, TH_R) share TVCL and take one joint M-step that \
-             re-centres both (#1620)."
-                .to_string()
-        ]
-    );
-    let th_crcl = theta(&result, "THETA_CRCL");
-    assert_finite_close(
-        "A: THETA_CRCL",
-        th_crcl,
-        NM_ANCHOR_A_TH_CRCL,
-        ANCHOR_TH_CRCL_TOL,
-    );
+    let fits: Vec<(FitResult, Vec<String>)> = SAEM_SEEDS
+        .map(|seed| {
+            fit_anchor_twin("covmuref_anchor_a_saem_fit.ferx", |o| o.saem_seed = Some(seed))
+        })
+        .collect();
+    for (_, notes) in &fits {
+        assert_eq!(
+            notes,
+            &vec![
+                "SAEM: covariate mu-references on ETA_CL (reads TVCL, THETA_WT, THETA_CRCL) and \
+                 ETA_V1 (reads TVCL, THETA_WT_V1, TH_R) share TVCL and take one joint M-step that \
+                 re-centres both (#1620)."
+                    .to_string()
+            ]
+        );
+    }
+    let results: Vec<FitResult> = fits.into_iter().map(|(r, _)| r).collect();
+    let th_crcl = median_theta(&results, "THETA_CRCL");
+    assert_finite_close("A: THETA_CRCL", th_crcl, NM_ANCHOR_A_TH_CRCL, ANCHOR_TH_CRCL_TOL);
     assert!(
-        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.3,
+        // 0.335, not the 0.328 the ±ANCHOR_TH_CRCL_TOL band already implies, so this
+        // check can fail on its own: the 9-seed median sat 0.0002 off NONMEM (0.3425 clear).
+        (th_crcl - BEFORE_ANCHOR_A_TH_CRCL).abs() > 0.335,
         "A: THETA_CRCL = {th_crcl:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_A_TH_CRCL}"
     );
-    let tvcl = theta(&result, "TVCL");
+    let tvcl = median_theta(&results, "TVCL");
     assert_finite_close("A: TVCL", tvcl, NM_ANCHOR_A_TVCL, ANCHOR_TVCL_TOL);
-    assert_finite_close(
-        "A: TVCL·TH_R",
-        tvcl * theta(&result, "TH_R"),
-        NM_ANCHOR_A_TVV1,
-        ANCHOR_A_TVV1_TOL,
-    );
+    let v1 = median(results.iter().map(|r| theta(r, "TVCL") * theta(r, "TH_R")).collect());
+    assert_finite_close("A: TVCL·TH_R", v1, NM_ANCHOR_A_TVV1, ANCHOR_A_TVV1_TOL);
 }
 
 /// Tier-3, #1630 case B. `V1` reads `TVV2`, the plain anchor of `ETA_V2`,
@@ -1205,33 +1110,39 @@ fn saem_merges_a_group_reading_a_superseded_anchor() {
     ignore = "slow + NONMEM-anchored covariate group on another eta's anchor (#1630): opt in with --features slow-tests"
 )]
 fn saem_takes_a_colliding_plain_anchor_into_the_group() {
-    let (result, notes) = fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
-        o.saem_n_exploration = Some(300);
-        o.saem_n_convergence = 700;
-    });
-    assert_eq!(
-        notes,
-        vec![
-            "SAEM: mu-references on ETA_V1 (reads TVV2, THETA_WT_V1, TH_R) and ETA_V2 (anchored \
-             on TVV2) share TVV2 and take one joint M-step that re-centres both (#1620, #1630)."
-                .to_string()
-        ]
-    );
-    let th_wt_v1 = theta(&result, "THETA_WT_V1");
-    assert_finite_close(
-        "B: THETA_WT_V1",
-        th_wt_v1,
-        NM_ANCHOR_B_TH_WT_V1,
-        ANCHOR_B_TH_WT_V1_TOL,
-    );
+    let fits: Vec<(FitResult, Vec<String>)> = ANCHOR_B_SEEDS
+        .map(|seed| {
+            fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
+                o.saem_seed = Some(seed);
+                o.saem_n_exploration = Some(300);
+                o.saem_n_convergence = 700;
+            })
+        })
+        .collect();
+    for (_, notes) in &fits {
+        assert_eq!(
+            notes,
+            &vec!["SAEM: mu-references on ETA_V1 (reads TVV2, THETA_WT_V1, TH_R) and ETA_V2 \
+                 (anchored on TVV2) share TVV2 and take one joint M-step that re-centres both \
+                 (#1620, #1630)."
+                .to_string()]
+        );
+    }
+    let results: Vec<FitResult> = fits.into_iter().map(|(r, _)| r).collect();
+    let th_wt_v1 = median_theta(&results, "THETA_WT_V1");
+    assert_finite_close("B: THETA_WT_V1", th_wt_v1, NM_ANCHOR_B_TH_WT_V1, ANCHOR_B_TH_WT_V1_TOL);
     assert!(
+        // 0.15, above the 0.139 the ±ANCHOR_B_TH_WT_V1_TOL band implies: every measured
+        // 25-seed median sat ≥ 0.167 clear of the pre-#1630 value (see ANCHOR_B_SEEDS).
         (th_wt_v1 - BEFORE_ANCHOR_B_TH_WT_V1).abs() > 0.15,
         "B: THETA_WT_V1 = {th_wt_v1:.4} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TH_WT_V1}"
     );
-    let tvv1 = theta(&result, "TVV2") * theta(&result, "TH_R");
+    let tvv1 = median(results.iter().map(|r| theta(r, "TVV2") * theta(r, "TH_R")).collect());
     assert_finite_close("B: TVV2·TH_R", tvv1, NM_ANCHOR_B_TVV1, ANCHOR_B_TVV1_TOL);
     assert!(
-        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 2.0,
+        // 1.5, above the 1.26 the ±ANCHOR_B_TVV1_TOL band implies: every measured 25-seed
+        // median sat ≥ 1.93 clear of the pre-#1630 value (see ANCHOR_B_SEEDS).
+        (tvv1 - BEFORE_ANCHOR_B_TVV1).abs() > 1.5,
         "B: TVV2·TH_R = {tvv1:.3} must be clear of the pre-#1630 {BEFORE_ANCHOR_B_TVV1:.3}"
     );
 }
@@ -1311,10 +1222,7 @@ fn a_plain_mu_ref_shift_translates_the_draws_a_numerical_group_step_scores() {
             r.ofv
         );
         let th_crcl = theta(&r, "TH_CRCL");
-        assert!(
-            th_crcl > 0.02,
-            "{method:?}: TH_CRCL {th_crcl} collapsed toward its bound (#1365)"
-        );
+        assert!(th_crcl > 0.02, "{method:?}: TH_CRCL {th_crcl} collapsed toward its bound (#1365)");
     }
 }
 
@@ -1350,9 +1258,7 @@ fn fit_two_groups(method: EstimationMethod, block_omega: bool, time_varying_wt: 
   DV ~ proportional(PROP_ERR)
 "
     );
-    let model = parse_full_model(&src)
-        .expect("two-group model parses")
-        .model;
+    let model = parse_full_model(&src).expect("two-group model parses").model;
     let csv = std::fs::read_to_string("data/covmuref_additive.csv").expect("anchor data");
     let mut out = String::new();
     for (i, line) in csv.lines().enumerate() {
@@ -1420,10 +1326,7 @@ fn a_later_numerical_group_scores_draws_recentred_by_an_earlier_group() {
             r.ofv
         );
         let th_wt = theta(&r, "TH_WT");
-        assert!(
-            th_wt < 2.0,
-            "{method:?}: TH_WT {th_wt} ran to its bound on stale draws (#1365)"
-        );
+        assert!(th_wt < 2.0, "{method:?}: TH_WT {th_wt} ran to its bound on stale draws (#1365)");
     }
 }
 
@@ -1442,10 +1345,7 @@ fn a_later_numerical_group_scores_draws_recentred_by_an_earlier_group() {
 /// re-centring on IMP, as it was before, fails the IMPMAP arm here too (40.810).
 #[test]
 fn a_later_exact_group_reads_means_recentred_by_an_earlier_group() {
-    for (method, want) in [
-        (EstimationMethod::Imp, 45.334),
-        (EstimationMethod::Impmap, 45.362),
-    ] {
+    for (method, want) in [(EstimationMethod::Imp, 45.334), (EstimationMethod::Impmap, 45.362)] {
         let r = fit_two_groups(method, true, false);
         let tvv = theta(&r, "TVV");
         assert!(

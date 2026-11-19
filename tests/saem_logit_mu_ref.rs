@@ -141,14 +141,9 @@ fn theta_by_name(result_names: &[String], theta: &[f64], name: &str) -> f64 {
 /// non-mu-referenced.
 #[test]
 fn logit_fraction_is_detected_as_a_mu_reference() {
-    let model = parse_full_model(LOGIT_FRACTION_MODEL)
-        .expect("fixture must parse")
-        .model;
+    let model = parse_full_model(LOGIT_FRACTION_MODEL).expect("fixture must parse").model;
 
-    let fr1 = model
-        .mu_refs
-        .get("ETA_FR1")
-        .expect("ETA_FR1 must be mu-referenced (#918)");
+    let fr1 = model.mu_refs.get("ETA_FR1").expect("ETA_FR1 must be mu-referenced (#918)");
     assert_eq!(fr1.theta_name, "LOGIT_FR1");
     assert_eq!(fr1.transform, MuTransform::Logit);
     assert!(
@@ -167,9 +162,7 @@ fn logit_fraction_is_detected_as_a_mu_reference() {
 /// mu-ref is both detected *and* judged eligible for the closed form.
 #[test]
 fn logit_mu_ref_drives_the_saem_closed_form_m_step() {
-    let model = parse_full_model(LOGIT_ONLY_MODEL)
-        .expect("fixture must parse")
-        .model;
+    let model = parse_full_model(LOGIT_ONLY_MODEL).expect("fixture must parse").model;
     let pop = read_nonmem_csv(Path::new("data/logit_fraction_oral.csv"), None, None)
         .expect("fixture data must load");
 
@@ -195,19 +188,13 @@ fn logit_mu_ref_drives_the_saem_closed_form_m_step() {
          signature of the closed-form M-step running for LOGIT_FR1 (#918); got {saved}"
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("packed on the log scale")),
+        !result.warnings.iter().any(|w| w.contains("packed on the log scale")),
         "a negative lower bound keeps the theta identity-packed; no packing advisory expected, \
          got {:?}",
         result.warnings
     );
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("individual parameter(s) not mu-referenced")),
+        !result.warnings.iter().any(|w| w.contains("individual parameter(s) not mu-referenced")),
         "no parameter should be flagged as non-mu-referenced, got {:?}",
         result.warnings
     );
@@ -264,9 +251,7 @@ const SHARED_LOGIT_ANCHOR_MODEL: &str = r"
 /// same fixture with a single eta on the anchor reports `saved > 0`.
 #[test]
 fn saem_two_logit_etas_on_one_theta_route_to_the_numerical_mstep() {
-    let model = parse_full_model(SHARED_LOGIT_ANCHOR_MODEL)
-        .expect("fixture must parse")
-        .model;
+    let model = parse_full_model(SHARED_LOGIT_ANCHOR_MODEL).expect("fixture must parse").model;
     let pop = read_nonmem_csv(Path::new("data/logit_fraction_oral.csv"), None, None)
         .expect("fixture data must load");
     let opts = FitOptions {
@@ -289,15 +274,9 @@ fn saem_two_logit_etas_on_one_theta_route_to_the_numerical_mstep() {
         .iter()
         .find(|w| w.contains("mu-reference anchor of more than one ETA"))
         .unwrap_or_else(|| {
-            panic!(
-                "expected the shared-anchor advisory, got {:?}",
-                result.warnings
-            )
+            panic!("expected the shared-anchor advisory, got {:?}", result.warnings)
         });
-    assert!(
-        hit.contains("LOGIT_FR"),
-        "advisory must name the shared anchor: {hit}"
-    );
+    assert!(hit.contains("LOGIT_FR"), "advisory must name the shared anchor: {hit}");
 }
 
 /// `LOGIT_ONLY_MODEL` with the logit-scale theta declared with a **non-negative**
@@ -322,9 +301,7 @@ fn log_packed_logit_model() -> &'static str {
 /// the same model with a negative lower bound takes the closed form.
 #[test]
 fn saem_log_packed_logit_theta_routes_to_numerical_mstep_with_advisory() {
-    let model = parse_full_model(log_packed_logit_model())
-        .expect("fixture must parse")
-        .model;
+    let model = parse_full_model(log_packed_logit_model()).expect("fixture must parse").model;
     let pop = read_nonmem_csv(Path::new("data/logit_fraction_oral.csv"), None, None)
         .expect("fixture data must load");
     let opts = FitOptions {
@@ -342,25 +319,13 @@ fn saem_log_packed_logit_theta_routes_to_numerical_mstep_with_advisory() {
         0,
         "a log-packed logit theta has no closed-form pair, so nothing is saved"
     );
-    let hit = result
-        .warnings
-        .iter()
-        .find(|w| w.contains("packed on the log scale"))
-        .unwrap_or_else(|| {
-            panic!(
-                "expected the #918 packing advisory, got {:?}",
-                result.warnings
-            )
-        });
+    let hit =
+        result.warnings.iter().find(|w| w.contains("packed on the log scale")).unwrap_or_else(
+            || panic!("expected the #918 packing advisory, got {:?}", result.warnings),
+        );
+    assert!(hit.contains("LOGIT_FR1"), "advisory must name the theta: {hit}");
     assert!(
-        hit.contains("LOGIT_FR1"),
-        "advisory must name the theta: {hit}"
-    );
-    assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("individual parameter(s) not mu-referenced")),
+        !result.warnings.iter().any(|w| w.contains("individual parameter(s) not mu-referenced")),
         "the parameter is still mu-referenced (detection is independent of packing), got {:?}",
         result.warnings
     );
@@ -384,9 +349,7 @@ fn saem_recovers_the_logit_normal_fraction() {
     const NONMEM_LOGIT_FR1: f64 = NONMEM_SAEM_LOGIT_FR1;
     const FR1_TOLERANCE: f64 = 0.05;
 
-    let model = parse_full_model(LOGIT_FRACTION_MODEL)
-        .expect("fixture must parse")
-        .model;
+    let model = parse_full_model(LOGIT_FRACTION_MODEL).expect("fixture must parse").model;
     let pop = read_nonmem_csv(Path::new("data/logit_fraction_oral.csv"), None, None)
         .expect("fixture data must load");
 
@@ -417,11 +380,8 @@ fn saem_recovers_the_logit_normal_fraction() {
 
     // The IIV is on the logit scale; recovering its order of magnitude is what
     // separates "the fraction is estimated" from "the fraction collapsed".
-    let eta_idx = result
-        .eta_names
-        .iter()
-        .position(|n| n == "ETA_FR1")
-        .expect("ETA_FR1 must be in omega");
+    let eta_idx =
+        result.eta_names.iter().position(|n| n == "ETA_FR1").expect("ETA_FR1 must be in omega");
     let omega_fr1 = result.omega[(eta_idx, eta_idx)];
     assert!(
         (0.08..0.45).contains(&omega_fr1),

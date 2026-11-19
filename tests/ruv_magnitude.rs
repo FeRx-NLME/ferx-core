@@ -102,10 +102,7 @@ fn eval_only_ofv(src: &str) -> f64 {
 #[test]
 fn magnitude_parses_into_compiled_model() {
     let model = parse_model_string(&time_varying_ruv_src("2.0")).expect("parses");
-    let rm = model
-        .ruv_magnitude
-        .as_ref()
-        .expect("custom magnitude present");
+    let rm = model.ruv_magnitude.as_ref().expect("custom magnitude present");
     assert!(rm.is_active());
     assert!(model.has_custom_ruv_magnitude());
     // proportional model → one sigma slot, carrying the multiplier.
@@ -219,12 +216,9 @@ fn endpoint_magnitude_src(tpf: &str) -> String {
 
 fn endpoint_magnitude_ofv(tpf: &str, method: EstimationMethod) -> f64 {
     let model = parse_model_string(&endpoint_magnitude_src(tpf)).expect("model must parse");
-    let population = read_nonmem_csv(
-        Path::new("nonmem_anchor/ruv_endpoint_magnitude.csv"),
-        None,
-        None,
-    )
-    .expect("data must load");
+    let population =
+        read_nonmem_csv(Path::new("nonmem_anchor/ruv_endpoint_magnitude.csv"), None, None)
+            .expect("data must load");
     let opts = FitOptions {
         method,
         methods: vec![],

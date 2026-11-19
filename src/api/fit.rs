@@ -1,38 +1,14 @@
-#![allow(unused_imports)]
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic, EngineError};
+use crate::diagnostics::{first_error, EngineError};
 use crate::estimation::outer_optimizer::optimize_population;
-use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_packed_len, theta_packs_log,
-};
+use crate::estimation::parameterization::theta_packs_log;
 use crate::estimation::saem;
-use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
-    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
-};
 use crate::pk;
-use crate::propensity_match::MatchMethod;
-use crate::sim::adaptive::{
-    AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
-    DoseLedgerEntry, MonitorSpec,
-};
-use crate::stats::likelihood::{
-    build_frem_r_override, compute_cwres, foce_subject_nll, foce_subject_nll_iov,
-};
-use crate::stats::residual_error::{
-    compute_iwres_with_correlations, compute_r_matrix_with_correlations,
-    compute_r_matrix_with_correlations_scaled, iwres_autocorrelation,
-};
-use crate::types::*;
 use nalgebra::{DMatrix, DVector};
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
-use std::collections::HashMap;
-use std::path::Path;
 use std::time::Instant;
 
 /// Where a run's optimizer trace is written when `FitOptions::optimizer_trace`
@@ -104,10 +80,7 @@ fn build_neural_network_infos(model: &CompiledModel) -> Vec<NeuralNetworkInfo> {
 /// its own subjects, so a fit with only a `TIME`-reading model is not told about
 /// covariates it does not have.
 pub(crate) fn derived_cmt_time_varying_warnings(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    eta_hats: &[DVector<f64>],
+    model: &CompiledModel, population: &Population, theta: &[f64], eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
 ) -> Vec<String> {
     // (any subject with a TV covariate, any subject on a TIME-reading model), per engine.
@@ -201,9 +174,7 @@ mod nn_regularization_warning_tests;
 /// (#690); when both are given, `data_path` overrides the model's, with a
 /// warning recorded on the result (see [`resolve_data_path`]).
 pub fn fit_from_files(
-    model_path: &str,
-    data_path: Option<&str>,
-    covariate_columns: Option<&[&str]>,
+    model_path: &str, data_path: Option<&str>, covariate_columns: Option<&[&str]>,
     options: Option<FitOptions>,
 ) -> Result<FitResult, EngineError> {
     // Parse the full model so an authoritative `[covariates]` block is visible
@@ -214,10 +185,7 @@ pub fn fit_from_files(
     // and `model_text` all come from this one read, so an edit to the file while
     // the fit runs cannot bind against a different version than was parsed.
     let crate::io::model_source::ModelSource {
-        text: model_text,
-        hash: model_hash,
-        mut parsed,
-        ..
+        text: model_text, hash: model_hash, mut parsed, ..
     } = crate::api::run::read_model_source(model_path)?;
     // A `[covariates]` declaration takes precedence over the explicit
     // `covariate_columns` argument; otherwise fall back to the argument (or
@@ -298,10 +266,7 @@ pub fn fit_from_files(
 /// and the outer loop's downgrade warning says why. `has_mixture` is the same
 /// `init_params.mixture.is_some()` the outer loop keys on.
 pub(crate) fn reported_optimizer_label(
-    method: EstimationMethod,
-    options: &FitOptions,
-    model: &CompiledModel,
-    has_mixture: bool,
+    method: EstimationMethod, options: &FitOptions, model: &CompiledModel, has_mixture: bool,
 ) -> String {
     match method {
         EstimationMethod::Saem => "saem".to_string(),
@@ -366,10 +331,7 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
 /// consecutive blocks (#2858). The positive text then says so and names the line that
 /// would correlate them, since no structure of the line as written can.
 pub(crate) fn dw_autocorrelation_warning_decorrelated(
-    dw: f64,
-    line: &str,
-    kind: crate::types::ResidualSerialKind,
-    across_blocks: Option<SubjectLine>,
+    dw: f64, line: &str, kind: crate::types::ResidualSerialKind, across_blocks: Option<SubjectLine>,
 ) -> Option<String> {
     if !dw.is_finite() {
         return None;
@@ -435,11 +397,7 @@ pub(crate) enum SubjectLine {
 
 impl SubjectLine {
     pub(crate) fn of(prepared: &Population) -> Self {
-        if prepared
-            .subjects
-            .iter()
-            .all(|s| s.id.parse::<f64>().is_ok())
-        {
+        if prepared.subjects.iter().all(|s| s.id.parse::<f64>().is_ok()) {
             // The header as written; a population built without a file has none.
             let header = prepared
                 .input_columns
@@ -518,10 +476,7 @@ pub(crate) const DW_CROSS_BLOCK_MIN_PAIRS: usize = 62;
 /// blocks is also a pooled pair, so the pooled statistic is finite whenever this
 /// one is.
 pub(crate) fn dw_cross_block_warning(
-    cross: (usize, f64),
-    pooled: f64,
-    line: &str,
-    kind: crate::types::ResidualSerialKind,
+    cross: (usize, f64), pooled: f64, line: &str, kind: crate::types::ResidualSerialKind,
     by: &SubjectLine,
 ) -> Option<String> {
     let (pairs, dw) = cross;
@@ -609,28 +564,20 @@ pub(crate) enum DwAdvice {
 /// `options`, not `model.fit_options`, because the column a fit groups by is the
 /// caller's (#1783).
 pub(crate) fn dw_advice(
-    model: &CompiledModel,
-    options: &FitOptions,
-    prepared: &Population,
+    model: &CompiledModel, options: &FitOptions, prepared: &Population,
 ) -> DwAdvice {
     if !model.is_algebraic() {
         return DwAdvice::Compartmental;
     }
-    let split_at_occasions = prepared
-        .subjects
-        .iter()
-        .any(|s| !crate::stats::residual_error::occasions_run_in_time(s));
+    let split_at_occasions =
+        prepared.subjects.iter().any(|s| !crate::stats::residual_error::occasions_run_in_time(s));
     if !split_at_occasions {
         // More than one label in some subject: only then is there a pair that
         // crosses occasions for the advice to speak about.
-        let across_occasions = prepared
-            .subjects
-            .iter()
-            .any(|s| s.occasions.windows(2).any(|w| w[0] != w[1]));
+        let across_occasions =
+            prepared.subjects.iter().any(|s| s.occasions.windows(2).any(|w| w[0] != w[1]));
         if across_occasions {
-            return DwAdvice::AlgebraicInTime {
-                by: SubjectLine::of(prepared),
-            };
+            return DwAdvice::AlgebraicInTime { by: SubjectLine::of(prepared) };
         }
     }
     let group = if !split_at_occasions {
@@ -728,15 +675,15 @@ pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<S
 /// (negative lower bound) by `sigma * N(0,1)`. Omega and sigma are left
 /// unchanged — their starting values are typically less important than theta.
 pub(crate) fn perturb_init(
-    params: &ModelParameters,
-    start_idx: usize,
-    sigma: f64,
-    base_seed: u64,
+    params: &ModelParameters, start_idx: usize, sigma: f64, base_seed: u64,
 ) -> ModelParameters {
     if start_idx == 0 {
         return params.clone();
     }
-    let mut rng = rand::rngs::SmallRng::seed_from_u64(base_seed.wrapping_add(start_idx as u64));
+    let mut rng = rand::rngs::SmallRng::seed_from_u64(crate::rng::stream_seed(
+        base_seed,
+        &[start_idx as u64],
+    ));
     let normal = Normal::new(0.0_f64, 1.0_f64).expect("normal dist");
     let mut p = params.clone();
     for (i, t) in p.theta.iter_mut().enumerate() {
@@ -752,6 +699,62 @@ pub(crate) fn perturb_init(
         *t = t.clamp(lo, hi);
     }
     p
+}
+
+/// The seed of one sampler (SAEM, Bayes, IMP, IMPMAP) on multi-start start `k`: start 0
+/// keeps the user's seed, every later start hashes `(base, k)` (#3021: `base + k` made
+/// start `k` under seed `s` replay start `k - 1` under seed `s + 1`).
+pub(crate) fn per_start_seed(base: u64, k: usize) -> u64 {
+    if k == 0 {
+        base
+    } else {
+        crate::rng::stream_seed(base, &[k as u64])
+    }
+}
+
+/// The options multi-start start `k > 0` runs with:
+/// - `saem_seed` / `bayes_seed`: when the method chain runs that sampler, derived by
+///   [`per_start_seed`] from the user's seed, or from the sampler's own default when it
+///   is unset, so each start gets a different MH/MCMC trajectory. A chain without the
+///   sampler keeps the user's value, so the result does not report a seed nothing used.
+///   The Bayes sampler keys off `bayes_seed`, so without it every start runs an
+///   identical RNG trajectory (differing only by the perturbed init): wasted compute and
+///   false multi-start robustness. Start 0 keeps the user's seeds for reproducibility.
+/// - `imp_seed` / `impmap_seed` stay shared on purpose: they also seed the IS evaluation
+///   that every start's ranked OFV comes from, and common draws are what make two starts
+///   on the same optimum score the same. Per-start IS draws would make `select_start`
+///   pick the luckiest Monte Carlo noise and break `StartSpread`'s 1.0 OFV agreement.
+/// - `global_search`: CRS2-LM ignores the starting point and samples freely in
+///   `[lower, upper]`, so running it on starts 1..n overrides the perturbation and makes
+///   multi-start a no-op for those starts. It runs on start 0 only.
+pub(crate) fn per_start_options(options: &FitOptions, k: usize) -> FitOptions {
+    let chain = if options.methods.is_empty() {
+        std::slice::from_ref(&options.method)
+    } else {
+        options.methods.as_slice()
+    };
+    let derive = |runs: bool, s: Option<u64>, default: u64| {
+        if runs {
+            Some(per_start_seed(s.unwrap_or(default), k))
+        } else {
+            s
+        }
+    };
+    let runs = |m: EstimationMethod| chain.contains(&m);
+    FitOptions {
+        saem_seed: derive(
+            runs(EstimationMethod::Saem),
+            options.saem_seed,
+            crate::estimation::saem::SAEM_DEFAULT_SEED,
+        ),
+        bayes_seed: derive(
+            runs(EstimationMethod::Bayes),
+            options.bayes_seed,
+            crate::estimation::bayes::BAYES_DEFAULT_SEED,
+        ),
+        global_search: false,
+        ..options.clone()
+    }
 }
 
 /// Multi-start ranking: should the candidate `(c_ofv, c_conv)` replace the
@@ -790,8 +793,7 @@ pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: b
 /// `rank_ofv` is not the reported OFV (`nn_l2` / `nn_smooth`), so each row carries it as
 /// `objective`.
 pub(crate) fn select_start(
-    results: Vec<(usize, Result<FitResult, EngineError>)>,
-    rank_ofv: impl Fn(&FitResult) -> f64,
+    results: Vec<(usize, Result<FitResult, EngineError>)>, rank_ofv: impl Fn(&FitResult) -> f64,
     penalized: bool,
 ) -> (Option<(usize, FitResult)>, Vec<String>, Vec<StartRecord>) {
     let mut best: Option<(usize, FitResult)> = None;
@@ -872,18 +874,13 @@ pub(crate) use crate::estimation::nn_reg::applies_nn_regularization;
 /// them — an earlier non-FOCE stage in a chain like `[saem, focei]` is fine,
 /// since the regularized stage is the one whose estimates are reported.
 pub(crate) fn nn_regularization_unapplied_warning(
-    model: &CompiledModel,
-    options: &FitOptions,
-    chain: &[EstimationMethod],
+    model: &CompiledModel, options: &FitOptions, chain: &[EstimationMethod],
 ) -> Option<String> {
-    let set: Vec<&str> = [
-        ("nn_l2", options.nn_l2_lambda),
-        ("nn_smooth", options.nn_smooth_lambda),
-    ]
-    .into_iter()
-    .filter(|(_, l)| *l > 0.0)
-    .map(|(k, _)| k)
-    .collect();
+    let set: Vec<&str> = [("nn_l2", options.nn_l2_lambda), ("nn_smooth", options.nn_smooth_lambda)]
+        .into_iter()
+        .filter(|(_, l)| *l > 0.0)
+        .map(|(k, _)| k)
+        .collect();
     if set.is_empty() || !model.has_covariate_nn() {
         return None;
     }
@@ -926,9 +923,7 @@ pub(crate) fn nn_regularization_unapplied_warning(
 /// pruned, log-transformed or given derived occasions — which `run_sir`,
 /// `run_covariance` and `load_fit` check the population they run on against.
 pub fn fit(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
     let mut result = fit_unstamped(model, population, init_params, options)?;
@@ -957,11 +952,8 @@ pub fn fit(
 /// under LTBS. The single-occasion refusal and the occasion-count warning stay
 /// in `fit()`.
 pub(crate) fn fitted_population<'a>(
-    model: &CompiledModel,
-    rule: &IovOccasionRule,
-    had_column: bool,
-    population: std::borrow::Cow<'a, Population>,
-    warnings: &mut Vec<String>,
+    model: &CompiledModel, rule: &IovOccasionRule, had_column: bool,
+    population: std::borrow::Cow<'a, Population>, warnings: &mut Vec<String>,
 ) -> std::borrow::Cow<'a, Population> {
     // If any subject has per-event covariate snapshots that don't carry
     // a variation in covariates the model actually references (e.g.
@@ -1041,9 +1033,7 @@ pub(crate) fn fitted_population<'a>(
 }
 
 fn fit_unstamped(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
     // #426: this call's `inner_optimizer` / `ebe_warm_start` are armed by `install_on_fit_pool`
@@ -1102,11 +1092,7 @@ fn fit_unstamped(
     // variability under a mixture fits (#985): the per-class inner solve carries the shared
     // base `omega_iov`, and the outer gradient is the exact one at every class's modes
     // (`mixture_gradient_salvaged`).
-    first_error(&crate::api::validation::check_mixture_options(
-        model,
-        options,
-        init_params,
-    ))?;
+    first_error(&crate::api::validation::check_mixture_options(model, options, init_params))?;
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
     let _ss_run = crate::dosing::run_scope();
@@ -1114,19 +1100,13 @@ fn fit_unstamped(
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
     // `E_TRANSIT_UNSUPPORTED` / `E_IG_UNSUPPORTED`, as `ferx check` and `predict` (#1772).
-    first_error(&check_absorption_closed_form_support_diags(
-        model, population,
-    ))?;
+    first_error(&check_absorption_closed_form_support_diags(model, population))?;
     // Reject a twin-less transit closed form that starts in the flip-flop regime (#776):
     // it returns an identically-zero profile that silently degenerates the objective and,
     // unlike a twin-carrying model, has no ODE twin to reroute to. Parameter-dependent, so
     // evaluated at η = 0 typical values here rather than in `check_absorption_closed_form_support`.
     // `E_TRANSIT_FLIP_FLOP` / `E_IG_FLIP_FLOP` (#1772).
-    first_error(&check_absorption_flip_flop_no_twin_diags(
-        model,
-        population,
-        &init_params.theta,
-    ))?;
+    first_error(&check_absorption_flip_flop_no_twin_diags(model, population, &init_params.theta))?;
     // Reject a depot-referencing analytic Form C readout on reset subjects (#650):
     // the depot amount can't be superposed across an EVID=3/4 reset, so predicting
     // would silently read a zero depot. Fail loudly instead.
@@ -1157,17 +1137,13 @@ fn fit_unstamped(
     // binary from ordinal), so the Bernoulli endpoint must reject `state ≥ 2` itself —
     // fail-loud rather than silently score a non-binary code. `E_BINARY_STATE` (#1788).
     #[cfg(feature = "survival")]
-    first_error(&crate::api::validation::check_binary_states(
-        model, population,
-    ))?;
+    first_error(&crate::api::validation::check_binary_states(model, population))?;
     // CTMM (#759): an observed DV code that is not one of the endpoint's declared `states`,
     // or out-of-order observation times, either of which would otherwise fold into a
     // silent sentinel. `E_CTMM_RECORDS` (#1788). A time-inhomogeneous Q(t) on a hand-built
     // model with no ODE system is refused above, fail-closed, by the #1918 check.
     #[cfg(feature = "markov")]
-    first_error(&crate::api::validation::check_ctmm_records(
-        model, population,
-    ))?;
+    first_error(&crate::api::validation::check_ctmm_records(model, population))?;
     // LTBS sanity checks for hand-built `CompiledModel`s. The parser already enforces
     // these for `.ferx` models, but a Rust caller could otherwise set `log_transform =
     // true` together with a proportional/combined error, a per-CMT spec or an SDE, which
@@ -1193,9 +1169,7 @@ fn fit_unstamped(
     // this cap. `E_AGQ_GRID_TOO_LARGE`, the code it gives the η-only grid (#1788). The
     // helper counts `K` after a derived `iov_occasion` rule has labelled the population,
     // as `fitted_population` below labels it.
-    first_error(&crate::api::validation::check_agq_grid_iov(
-        model, population, options,
-    ))?;
+    first_error(&crate::api::validation::check_agq_grid_iov(model, population, options))?;
     let mut ltbs_warnings: Vec<String> = Vec::new();
     let derive_occ = crate::api::run::occasions_are_derived(model, options);
     let pop_pruned = fitted_population(
@@ -1279,8 +1253,6 @@ fn fit_unstamped(
     // replicate-level pool *and* the full-width shared pool underneath every replicate
     // (#1115). Unpinned, the shared big-stack pool handles both levels as before.
     let base_seed: u64 = options.multi_start_seed.unwrap_or(42);
-    let base_saem_seed: u64 = options.saem_seed.unwrap_or(12345);
-    let base_bayes_seed: u64 = options.bayes_seed.unwrap_or(12345);
     let n = options.n_starts;
     let sigma = options.start_sigma;
 
@@ -1300,25 +1272,11 @@ fn fit_unstamped(
     let par_starts = || -> Vec<(usize, Result<FitResult, EngineError>)> {
         crate::par::map(n, |k| {
             let init_k = perturb_init(init_params, k, sigma, base_seed);
-            // Per-start option overrides for k > 0:
-            // - saem_seed / bayes_seed: derive from base so each start gets a different
-            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
-            //   perturbing it every start runs an identical RNG trajectory (differing
-            //   only by the perturbed init) — wasted compute and false multi-start
-            //   robustness. Start 0 keeps the user's seeds for reproducibility.
-            // - global_search: CRS2-LM ignores the starting point and samples freely in
-            //   [lower, upper], so running it on starts 1..n overrides the perturbation
-            //   and makes multi-start a no-op for those starts. Only run it on start 0.
             let opts_k_storage;
             let opts_ref: &FitOptions = if k == 0 {
                 options
             } else {
-                opts_k_storage = FitOptions {
-                    saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
-                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
-                    global_search: false,
-                    ..options.clone()
-                };
+                opts_k_storage = per_start_options(options, k);
                 &opts_k_storage
             };
             (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))
@@ -1390,9 +1348,7 @@ fn fit_unstamped(
 /// mirroring only the two outer gates suppressed the #621 warning for every
 /// group the resolver drops, which is exactly where it is true (#918 review).
 pub(crate) fn saem_active_covariate_group_etas<'m>(
-    model: &'m CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &'m CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<&'m str> {
     if !options.mu_referencing || model.mixture.is_some() {
@@ -1420,9 +1376,7 @@ pub(crate) fn saem_active_covariate_group_etas<'m>(
 /// split (`saem_mixture_closed_form_pairs`), so under IOV or `mu_referencing =
 /// false`, where the switched θ really is numerical, nothing is returned.
 pub(crate) fn saem_active_mixture_switched_etas<'m>(
-    model: &'m CompiledModel,
-    init_params: &ModelParameters,
-    options: &FitOptions,
+    model: &'m CompiledModel, init_params: &ModelParameters, options: &FitOptions,
 ) -> Vec<&'m str> {
     if !options.mu_referencing || model.mixture.is_none() {
         return Vec::new();
@@ -1453,8 +1407,7 @@ pub(crate) fn saem_active_mixture_switched_etas<'m>(
 /// `mu_referencing = false` is the case the warning exists for (#621, #918
 /// review). Pass `&[]` where no group runs.
 pub(crate) fn saem_non_mu_referenced_individual_params_warning(
-    model: &CompiledModel,
-    active_group_etas: &[&str],
+    model: &CompiledModel, active_group_etas: &[&str],
 ) -> Option<String> {
     let mut names = Vec::new();
     for (param_name, &eta_idx) in model.indiv_param_names.iter().zip(model.eta_map.iter()) {
@@ -1505,10 +1458,7 @@ pub(crate) fn saem_non_mu_referenced_individual_params_warning(
 /// the penalized objective, as `optimize_nlopt` ranks its attempts. The #2461 check that
 /// the reported objective is not above the fit's start runs inside, on the reported run.
 fn floor_escaped(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
     run: impl Fn(&ModelParameters, &FitOptions) -> crate::estimation::outer_optimizer::OuterResult,
 ) -> crate::estimation::outer_optimizer::OuterResult {
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
@@ -1520,15 +1470,193 @@ fn floor_escaped(
     })
 }
 
+/// The adaptive-Gauss–Hermite `−2 log L` at `params`, with the EBEs reconverged there: the
+/// grid is centred on the conditional mode and scaled by its Hessian, so a mode carried over
+/// from another method would misplace it. `opts` is a quadrature stage's options
+/// (`agq_nodes()` is `Some`); its inner tolerance, Hessian seed and anchor are used as given.
+/// Shared by the `agq_eval_only` stage and the `saem_ofv = agq` readout (#2973), so the two
+/// agree at the same parameters.
+#[allow(clippy::type_complexity)]
+fn agq_marginal_at(
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    warm: Option<&[DVector<f64>]>, opts: &FitOptions,
+) -> (f64, Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
+    let n_nodes = opts.agq_nodes().unwrap_or(1);
+    let mu_k = crate::estimation::parameterization::compute_mu_k(
+        model,
+        &params.theta,
+        opts.mu_referencing,
+    );
+    // Seeded like the estimator stages and `run_covariance` (#1389): at a loose
+    // `inner_tol` the seeded and unseeded solves stop at η̂ that differ at the
+    // ~1e-11 level, and this OFV should agree with the one a preceding
+    // Laplace/AGQ stage reported at the same parameters.
+    let (eta_hats, h_matrices, _stats, kappas) =
+        crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+            model,
+            population,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            warm,
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            crate::estimation::inner_optimizer::InnerHessianSeed::for_options(opts),
+            opts,
+            crate::estimation::inner_optimizer::PrevEtas::Solved,
+        );
+    let nll = crate::estimation::agq::agq_population_nll(
+        model,
+        population,
+        params,
+        &eta_hats,
+        &kappas,
+        n_nodes,
+        opts.hessian_anchor(),
+    );
+    (2.0 * nll, eta_hats, h_matrices, kappas)
+}
+
+/// The objective a SAEM fit reports at its final estimates (#2973), by `saem_ofv`: NONMEM's
+/// SAEM objective (accumulated during the run), the importance-sampled `−2 log L` (NONMEM
+/// `IMP EONLY=1`) or the adaptive-quadrature one. `prev` is the SAEM stage's result, whose
+/// EBEs and Hessians seed the evaluator and whose `ofv` (the FOCE/Laplace objective) is kept
+/// as `SaemObjective::foce_ofv`. An `Err` (or a non-finite value) is the caller's cue to fall
+/// back, with a warning.
+fn saem_reported_objective(
+    model: &CompiledModel, population: &Population,
+    prev: &crate::estimation::outer_optimizer::OuterResult, opts: &FitOptions, kind: SaemOfv,
+) -> Result<(f64, SaemObjective, Option<ImportanceSamplingResult>), String> {
+    match kind {
+        SaemOfv::Focei => Err("saem_ofv = focei reports the FOCE/Laplace objective".into()),
+        SaemOfv::Saem => {
+            let ofv = prev.saem_objective_value.filter(|v| v.is_finite()).ok_or_else(|| {
+                crate::estimation::saem_objective::unsupported(model)
+                    .unwrap_or(
+                        "the run had no convergence-phase draw, or a subject's joint \
+                             density was not finite",
+                    )
+                    .to_string()
+            })?;
+            let obj = SaemObjective {
+                kind,
+                mc_standard_error: None,
+                n_samples: None,
+                n_nodes: None,
+                foce_ofv: prev.ofv,
+            };
+            Ok((ofv, obj, None))
+        }
+        SaemOfv::Imp => {
+            let mut o = opts.clone();
+            o.imp_samples = opts.saem_ofv_samples;
+            o.imp_adapt_samples = opts.saem_ofv_pilot_samples;
+            let is = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model,
+                    population,
+                    &prev.params,
+                    &o,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &prev.params,
+                    &prev.eta_hats,
+                    &prev.h_matrices,
+                    &prev.kappas,
+                    &o,
+                )
+            }?;
+            let obj = SaemObjective {
+                kind,
+                mc_standard_error: Some(is.mc_standard_error),
+                n_samples: Some(is.n_samples),
+                n_nodes: None,
+                foce_ofv: prev.ofv,
+            };
+            Ok((is.minus2_log_likelihood, obj, Some(is)))
+        }
+        SaemOfv::Agq => {
+            let n_nodes = opts.saem_ofv_nodes;
+            if model.mixture.is_some() {
+                return Err("saem_ofv = agq does not support mixture models".into());
+            }
+            if model.n_eta == 0 {
+                return Err("saem_ofv = agq needs at least one random effect".into());
+            }
+            if model.n_eta > 3 {
+                return Err(format!(
+                    "saem_ofv = agq grids {n_nodes}^n_eta nodes per subject and is limited to \
+                     three random effects (this model has {})",
+                    model.n_eta
+                ));
+            }
+            // The model-file parser checks this range; a `FitOptions` built in code does not
+            // pass through it, and `gauss_hermite` asserts it.
+            if !(2..=crate::estimation::agq::MAX_AGQ_NODES).contains(&n_nodes) {
+                return Err(format!(
+                    "saem_ofv_nodes must be in 2..={}, got {n_nodes}",
+                    crate::estimation::agq::MAX_AGQ_NODES
+                ));
+            }
+            // IOV stacks every occasion's κ into the grid (d = n_η + n_occ·n_κ), which the
+            // n_η bound above does not see: cap the grid itself, as `check_agq_grid_iov` does
+            // for an AGQ stage.
+            if model.n_kappa > 0 {
+                let max_occ = population
+                    .subjects
+                    .iter()
+                    .map(crate::stats::stacked_layout::group_count)
+                    .max()
+                    .unwrap_or(0);
+                let d = crate::stats::stacked_layout::stacked_width(
+                    model.n_eta,
+                    model.n_kappa,
+                    max_occ,
+                );
+                let grid = crate::estimation::agq::grid_size(n_nodes, d);
+                if grid > crate::estimation::agq::MAX_AGQ_GRID {
+                    return Err(format!(
+                        "with IOV the quadrature grid stacks {d} random effects \
+                         ({n_nodes}^{d} nodes per subject, above the {} limit)",
+                        crate::estimation::agq::MAX_AGQ_GRID
+                    ));
+                }
+            }
+            // Evaluated exactly as an `agq_eval_only` stage would be at these estimates: a
+            // `laplace` stage with `n_agq = saem_ofv_nodes`, at the tolerance quadrature
+            // needs (`fit_inner` tightens a quadrature stage's `inner_tol` the same way).
+            let mut o = opts.clone();
+            o.method = EstimationMethod::Laplace;
+            o.methods = Vec::new();
+            o.interaction =
+                crate::types::interaction_for(EstimationMethod::Laplace, opts.interaction);
+            o.n_agq = n_nodes;
+            o.inner_tol = o.inner_tol.min(1e-8);
+            let warm =
+                crate::estimation::outer_optimizer::joint_warm_starts(&prev.eta_hats, &prev.kappas);
+            let (ofv, ..) = agq_marginal_at(model, population, &prev.params, Some(&warm), &o);
+            let obj = SaemObjective {
+                kind,
+                mc_standard_error: None,
+                n_samples: None,
+                n_nodes: Some(n_nodes),
+                foce_ofv: prev.ofv,
+            };
+            Ok((ofv, obj, None))
+        }
+    }
+}
+
 /// One fit of `population`, the records the estimators score (`scored_population`, #2778).
 /// `all_records` is the same population with every record, for the data warnings and the
 /// `[derived]` outputs, whose grids run past the last observation.
 fn fit_inner(
-    model: &CompiledModel,
-    population: &Population,
-    all_records: &Population,
-    init_params: &ModelParameters,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, all_records: &Population,
+    init_params: &ModelParameters, options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
     // `SS=1` doses into a `zero_order()` compartment are lowered to the infusions they are
     // once, here, not by a clone of the subject in every walk (#2786). Validation has seen
@@ -1558,10 +1686,7 @@ fn fit_inner(
     let options = {
         let eff = options.effective_inner_tol(model.uses_closed_form_ltbs_inner());
         if eff < options.inner_tol {
-            ltbs_opts = FitOptions {
-                inner_tol: eff,
-                ..options.clone()
-            };
+            ltbs_opts = FitOptions { inner_tol: eff, ..options.clone() };
             &ltbs_opts
         } else {
             options
@@ -1720,15 +1845,8 @@ fn fit_inner(
             n_threads,
             thread_word
         );
-        eprintln!(
-            "  {} subjects, {} observations",
-            population.subjects.len(),
-            population.n_obs()
-        );
-        eprintln!(
-            "  {} thetas, {} etas, {} sigmas",
-            model.n_theta, model.n_eta, model.n_epsilon
-        );
+        eprintln!("  {} subjects, {} observations", population.subjects.len(), population.n_obs());
+        eprintln!("  {} thetas, {} etas, {} sigmas", model.n_theta, model.n_eta, model.n_epsilon);
         // Report the route each method actually uses. Gradient-based estimators
         // (FOCE/FOCEI/GN) are driven by the inner-loop gradient; IMP consumes
         // the EBE Hessian built via that same route. SAEM is sampling-based, so
@@ -1787,11 +1905,7 @@ fn fit_inner(
     // #254: refuse a prior that cannot be applied, before any optimizer runs.
     // See `check_parameter_priors` for why an unapplied prior is an error and
     // not a warning.
-    first_error(&crate::api::validation::check_parameter_priors(
-        model,
-        init_params,
-        options,
-    ))?;
+    first_error(&crate::api::validation::check_parameter_priors(model, init_params, options))?;
 
     // An initial estimate that packs strictly outside its own box and is
     // silently clamped there (#1251). Computed **once**, into a local: it
@@ -1813,10 +1927,7 @@ fn fit_inner(
     // What the covariance step differentiates: a `profile`d block's levels (#1065) are
     // re-profiled inside its stencil, not stenciled, so its cost and its scale routing
     // read the structural count.
-    let profiled = model
-        .indiv_param_partials
-        .theta_blocks
-        .profiled_theta_indices();
+    let profiled = model.indiv_param_partials.theta_blocks.profiled_theta_indices();
     let n_params_pre = held_mask
         .iter()
         .enumerate()
@@ -1826,11 +1937,7 @@ fn fit_inner(
     // Probe NLopt algorithm availability only when global_search will actually
     // run — otherwise the CRS2-LM warning is misleading for users who never
     // requested it.
-    let nlopt_missing = if options.global_search {
-        probe_nlopt_algorithms()
-    } else {
-        Vec::new()
-    };
+    let nlopt_missing = if options.global_search { probe_nlopt_algorithms() } else { Vec::new() };
 
     // Covariance step cost warning: fire before chain so user sees it
     // immediately. The count is checked arithmetic, so an absurd parameter
@@ -1839,11 +1946,7 @@ fn fit_inner(
     // an estimator that builds no `R` (#1803).
     // The route is predicted from the covariance step's own scope walk (#2054): no note on
     // the analytic R-matrix.
-    let covariance_route = crate::estimation::covariance::predicted_r_route(
-        model,
-        options,
-        init_params.mixture.is_some(),
-    );
+    let covariance_route = crate::estimation::covariance::predicted_r_route(model, options);
     let covariance_cost = crate::estimation::covariance::pre_fit_covariance_cost(
         n_params_pre,
         options,
@@ -1930,8 +2033,8 @@ fn fit_inner(
     // is only knowable once the gradient has run — `outer_optimizer::optimize_population`
     // owns the runtime log and pushes the warning onto its own `OuterResult::warnings`.
     // A probe at this point would have to guess a parameter point, and the provider's
-    // declines are parameter-dependent (`moving_bounds_separable` reads the resolved
-    // infusion windows and lag times), so a guess reports fallbacks that never happen.
+    // declines are parameter-dependent (an EBE off a strict mode, a non-finite plan result),
+    // so a guess reports fallbacks that never happen.
 
     // Emit NLopt / covariance warnings before any work starts.
     accumulated_warnings.extend(nlopt_missing.iter().cloned());
@@ -2033,6 +2136,8 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // `Some` once a SAEM stage's `ofv` was replaced by its IS / quadrature −2 log L (#2973).
+    let mut saem_objective: Option<SaemObjective> = None;
     // Which stage last **wrote** `result.ofv` — i.e. who owns the number this fit
     // will publish as `FitResult::ofv` (#1303).
     //
@@ -2197,10 +2302,8 @@ fn fit_inner(
                     } else {
                         "its model/data integrity hashes are unavailable"
                     };
-                    let msg = format!(
-                        "Ignoring checkpoint {} ({}); starting fresh.",
-                        ckpt_path, reason
-                    );
+                    let msg =
+                        format!("Ignoring checkpoint {} ({}); starting fresh.", ckpt_path, reason);
                     if options.verbose {
                         eprintln!("{msg}");
                     }
@@ -2297,12 +2400,7 @@ fn fit_inner(
         last_scoring = Some(stage_scoring);
 
         if options.verbose && n_stages > 1 {
-            eprintln!(
-                "\n── Stage {}/{}: {} ──",
-                stage_idx + 1,
-                n_stages,
-                method.label()
-            );
+            eprintln!("\n── Stage {}/{}: {} ──", stage_idx + 1, n_stages, method.label());
         }
 
         // AGQ evaluation-only stage (`agq_eval_only`): not an estimator. Reconverges the
@@ -2316,46 +2414,13 @@ fn fit_inner(
         // modes) would put the grid in the wrong place. Deterministic throughout, which is
         // the whole point relative to `method = [..., imp]` with `imp_eval_only`.
         if method == EstimationMethod::Laplace && stage_opts.agq_eval_only {
-            let n_nodes = stage_opts.agq_nodes().unwrap_or(1);
-            let mu_k = crate::estimation::parameterization::compute_mu_k(
-                model,
-                &stage_params.theta,
-                stage_opts.mu_referencing,
-            );
-            // Seeded like the estimator stages and `run_covariance` (#1389): at a loose
-            // `inner_tol` the seeded and unseeded solves stop at η̂ that differ at the
-            // ~1e-11 level, and this stage's OFV should agree with the one a preceding
-            // Laplace/AGQ stage reported at the same parameters. Warm from the preceding
-            // stage's joint mode, κ̂ included, so an IOV subject does not restart κ at 0
-            // (#2261).
+            // Warm from the preceding stage's joint mode, κ̂ included, so an IOV subject does
+            // not restart κ at 0 (#2261).
             let warm = result.as_ref().map(|r| {
                 crate::estimation::outer_optimizer::joint_warm_starts(&r.eta_hats, &r.kappas)
             });
-            let (eta_hats, h_matrices, _stats, kappas) =
-                crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
-                    model,
-                    population,
-                    &stage_params,
-                    stage_opts.inner_maxiter,
-                    stage_opts.inner_tol,
-                    warm.as_deref(),
-                    Some(&mu_k),
-                    stage_opts.min_obs_for_convergence_check as usize,
-                    stage_opts.inner_restarts,
-                    crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
-                    &stage_opts,
-                    crate::estimation::inner_optimizer::PrevEtas::Solved,
-                );
-            let nll = crate::estimation::agq::agq_population_nll(
-                model,
-                population,
-                &stage_params,
-                &eta_hats,
-                &kappas,
-                n_nodes,
-                stage_opts.hessian_anchor(),
-            );
-            let ofv = 2.0 * nll;
+            let (ofv, eta_hats, h_matrices, kappas) =
+                agq_marginal_at(model, population, &stage_params, warm.as_deref(), &stage_opts);
             // This stage writes `result.ofv` on both branches, so it owns the
             // published objective even though it estimates nothing (#1303).
             objective_stage = Some(method);
@@ -2378,44 +2443,16 @@ fn fit_inner(
                             ofv,
                         );
                     result = Some(crate::estimation::outer_optimizer::OuterResult {
-                        params: stage_params.clone(),
                         ofv,
                         converged,
-                        n_iterations: 0,
                         eta_hats,
                         h_matrices,
                         kappas,
-                        covariance_matrix: None,
-                        // No covariance step on an evaluation-only stage, so no
-                        // estimator to name (#1382).
-                        covariance_method: None,
-                        covariance_wall_time_secs: 0.0,
                         warnings: gate_warning.into_iter().collect(),
-                        saem_mu_ref_m_step_evals_saved: None,
-                        saem_n_subjects_hmc: None,
-                        saem_mh_accept_tail: None,
-                        saem_n_exploration_used: None,
-                        ebe_convergence_warnings: 0,
-                        max_unconverged_subjects: 0,
-                        total_ebe_fallbacks: 0,
-                        total_ebe_nm_polished: 0,
-                        final_gradient: None,
-                        final_gradient_source: None,
-                        sir_fallback_proposal: None,
-                        impmap_trace: None,
-                        bayes: None,
-                        cond_dist: None,
-                        packed_estimate: None,
-                        left_init: None,
-                        stationary_start: false,
-                        vi: None,
-                        start_eval: None,
-                        mcem_lowest_objective: None,
-                        mcem_objective_trail: None,
-                        mixture_posteriors: None,
-                        newton_decrement: None,
-                        optimizer_stop: None,
-                        eval_budget_spent: false,
+                        // No covariance step on an evaluation-only stage, so no estimator to name (#1382).
+                        ..crate::estimation::outer_optimizer::OuterResult::from_params(
+                            stage_params.clone(),
+                        )
                     });
                 }
             }
@@ -2482,44 +2519,16 @@ fn fit_inner(
                     ofv,
                 );
                 result = Some(crate::estimation::outer_optimizer::OuterResult {
-                    params: stage_params.clone(),
                     ofv,
                     converged,
-                    n_iterations: 0,
                     eta_hats,
                     h_matrices,
                     kappas,
-                    covariance_matrix: None,
-                    // No covariance step on an evaluation-only stage, so no
-                    // estimator to name (#1382).
-                    covariance_method: None,
-                    covariance_wall_time_secs: 0.0,
                     warnings: gate_warning.into_iter().collect(),
-                    saem_mu_ref_m_step_evals_saved: None,
-                    saem_n_subjects_hmc: None,
-                    saem_mh_accept_tail: None,
-                    saem_n_exploration_used: None,
-                    ebe_convergence_warnings: 0,
-                    max_unconverged_subjects: 0,
-                    total_ebe_fallbacks: 0,
-                    total_ebe_nm_polished: 0,
-                    final_gradient: None,
-                    final_gradient_source: None,
-                    sir_fallback_proposal: None,
-                    impmap_trace: None,
-                    bayes: None,
-                    cond_dist: None,
-                    packed_estimate: None,
-                    left_init: None,
-                    stationary_start: false,
-                    mixture_posteriors: None,
-                    vi: None,
-                    start_eval: None,
-                    mcem_lowest_objective: None,
-                    mcem_objective_trail: None,
-                    newton_decrement: None,
-                    optimizer_stop: None,
-                    eval_budget_spent: false,
+                    // No covariance step on an evaluation-only stage, so no estimator to name (#1382).
+                    ..crate::estimation::outer_optimizer::OuterResult::from_params(
+                        stage_params.clone(),
+                    )
                 });
             }
             let prev = result.as_ref().expect(
@@ -2590,6 +2599,29 @@ fn fit_inner(
                         } else {
                             msg
                         });
+                    }
+                    // `[saem, imp]` + `imp_eval_only` is NONMEM's `SAEM` → `IMP EONLY=1`
+                    // workflow spelled out: as NONMEM's final `$EST` step's value does, its IS
+                    // value becomes the reported objective under `saem_ofv = saem` (the
+                    // default) or `imp` (#2973). This is the terminal stage (validation), so
+                    // nothing later overwrites it.
+                    let after_saem =
+                        chain[..stage_idx].iter().rev().find(|m| !eval_only_methods.contains(m))
+                            == Some(&EstimationMethod::Saem);
+                    if after_saem
+                        && matches!(stage_opts.saem_ofv, SaemOfv::Saem | SaemOfv::Imp)
+                        && r.minus2_log_likelihood.is_finite()
+                    {
+                        if let Some(prev) = result.as_mut() {
+                            saem_objective = Some(SaemObjective {
+                                kind: SaemOfv::Imp,
+                                mc_standard_error: Some(r.mc_standard_error),
+                                n_samples: Some(r.n_samples),
+                                n_nodes: None,
+                                foce_ofv: prev.ofv,
+                            });
+                            prev.ofv = r.minus2_log_likelihood;
+                        }
                     }
                     is_result = Some(r);
                 }
@@ -2668,12 +2700,7 @@ fn fit_inner(
             // parameters; `check_profiled_levels` has refused every method but foce, focei
             // and laplace at one node. A run that did not leave its start is probed
             // (#2591), as on every other outer optimizer.
-            _ if !model
-                .indiv_param_partials
-                .theta_blocks
-                .profiled_names()
-                .is_empty() =>
-            {
+            _ if !model.indiv_param_partials.theta_blocks.profiled_names().is_empty() => {
                 floor_escaped(model, population, &stage_params, &stage_opts, |p, o| {
                     crate::estimation::profile::optimize_profiled_probed(model, population, p, o)
                 })
@@ -2694,10 +2721,8 @@ fn fit_inner(
         }
         stage_params = stage_result.params.clone();
         total_iterations += stage_result.n_iterations;
-        for w in stage_result
-            .warnings
-            .iter()
-            .filter(|w| keep_gn_zero_eta_warning(w, is_last_estimating))
+        for w in
+            stage_result.warnings.iter().filter(|w| keep_gn_zero_eta_warning(w, is_last_estimating))
         {
             accumulated_warnings.push(if n_stages > 1 {
                 format!("[{}] {}", method.label(), w)
@@ -2709,6 +2734,67 @@ fn fit_inner(
         // so it becomes the owner of the published `ofv` (#1303).
         objective_stage = Some(method);
         result = Some(stage_result);
+
+        // SAEM's reported objective (#2973): by default NONMEM's SAEM objective (SAEMOBJ),
+        // or by `saem_ofv` the importance-sampled / quadrature −2 log L; the FOCE/Laplace
+        // value moves to `SaemObjective::foce_ofv`. A chain that carries its own evaluator
+        // stage after SAEM (`imp_eval_only` / `agq_eval_only`) is explicit and handled by
+        // that stage; an eval-only flag naming a method the chain does not run is inert and
+        // does not count. Best-effort like the IMP marginal below: a model the evaluator
+        // cannot score keeps the FOCE/Laplace `ofv`, with a warning.
+        if method == EstimationMethod::Saem
+            && is_last_estimating
+            && stage_idx + 1 == chain.len()
+            && stage_opts.saem_ofv != SaemOfv::Focei
+        {
+            let prev = result.as_mut().expect("stage result was just set");
+            let mut tried = stage_opts.saem_ofv;
+            let outcome = loop {
+                let attempt = saem_reported_objective(model, population, prev, &stage_opts, tried)
+                    .and_then(|x| {
+                        if x.0.is_finite() {
+                            Ok(x)
+                        } else {
+                            Err(format!("the value is not finite ({})", x.0))
+                        }
+                    });
+                match attempt {
+                    Ok(x) => break Some(x),
+                    Err(e) if tried == SaemOfv::Saem => {
+                        accumulated_warnings.push(format!(
+                            "saem_ofv = saem unavailable ({e}); reporting the importance-sampled \
+                             −2 log L instead."
+                        ));
+                        tried = SaemOfv::Imp;
+                    }
+                    Err(e) if tried == SaemOfv::Agq => {
+                        accumulated_warnings.push(format!(
+                            "saem_ofv = agq unavailable ({e}); reporting the importance-sampled \
+                             −2 log L instead."
+                        ));
+                        tried = SaemOfv::Imp;
+                    }
+                    Err(e) => {
+                        accumulated_warnings.push(format!(
+                            "SAEM objective: importance-sampled −2 log L skipped ({e}); \
+                             reporting the FOCE/Laplace OFV."
+                        ));
+                        break None;
+                    }
+                }
+            };
+            if let Some((ofv, obj, is)) = outcome {
+                if let Some(msg) = is
+                    .as_ref()
+                    .and_then(crate::estimation::importance_sampling::marginal_reliability_warning)
+                {
+                    accumulated_warnings.push(msg);
+                }
+                prev.ofv = ofv;
+                saem_objective = Some(obj);
+                is_result = is;
+            }
+        }
 
         // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
         // is a final FOCE *Laplace* pass (kept for cross-method AIC/BIC
@@ -2804,10 +2890,8 @@ fn fit_inner(
     // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are
     // the winning class's EBEs, so predictions built with `MIXNUM` at the class-1
     // default would mix a class-2 η̂ with class-1 typical values.
-    let mixest_classes: Option<Vec<usize>> = result
-        .mixture_posteriors
-        .as_ref()
-        .map(|mp| mp.mixest.clone());
+    let mixest_classes: Option<Vec<usize>> =
+        result.mixture_posteriors.as_ref().map(|mp| mp.mixest.clone());
     // Report the last estimating stage using the same evaluator classification as
     // covariance and diagnostics. Neither evaluation-only IMP nor an AGQ readout
     // changes the estimator that produced the parameters. Preserve the full chain.
@@ -2880,21 +2964,14 @@ fn fit_inner(
     // each SubjectResult so output.rs can emit the PMIX_1..PMIX_K and MIXEST
     // columns. MIXEST is stored 1-based to match the NONMEM `MIXEST` convention.
     if let Some(mp) = &result.mixture_posteriors {
-        for (sr, (pmix, mixest)) in subjects
-            .iter_mut()
-            .zip(mp.pmix.iter().zip(mp.mixest.iter()))
-        {
+        for (sr, (pmix, mixest)) in subjects.iter_mut().zip(mp.pmix.iter().zip(mp.mixest.iter())) {
             sr.pmix = Some(pmix.clone());
             sr.mixest = Some(mixest + 1);
         }
         // #2907: a fit that ends with two classes merged, or one class empty, has fewer
         // distinct classes than `nsub` — often a local optimum the user should know about.
         let collapse = crate::estimation::mixture::merged_classes_from(&mp.class_nll, &mp.pmix);
-        result
-            .warnings
-            .extend(crate::estimation::mixture::merged_classes_warning(
-                &collapse,
-            ));
+        result.warnings.extend(crate::estimation::mixture::merged_classes_warning(&collapse));
     }
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
@@ -2927,11 +3004,9 @@ fn fit_inner(
         // The reference distribution's flip-flop count (#1928) has no other channel: the
         // η = 0 refusal and the #785 EBE warning never see the reference draws. Only that
         // one — the no-occasion warning is the fit's own, already reported for the fit.
-        result.warnings.extend(
-            npde_warnings
-                .into_iter()
-                .filter(|w| w.starts_with("W_SIMULATED_FLIP_FLOP")),
-        );
+        result
+            .warnings
+            .extend(npde_warnings.into_iter().filter(|w| w.starts_with("W_SIMULATED_FLIP_FLOP")));
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;
@@ -2966,9 +3041,7 @@ fn fit_inner(
                 }
                 // A failed event-time solve among the reference draws is worth a line;
                 // a replicate that simply never has an event is not.
-                result
-                    .warnings
-                    .extend(crate::stats::npde::fit_time_warnings(npde_warnings));
+                result.warnings.extend(crate::stats::npde::fit_time_warnings(npde_warnings));
             }
             Err(why) => result.warnings.push(tte_npde_skipped_warning(&why)),
         }
@@ -3002,23 +3075,27 @@ fn fit_inner(
     let prior_summary = prior_set.summarize(&packed_final);
     let ofv_data = result.ofv;
     let ofv = ofv_data + ofv_prior;
-    let aic = ofv_data + 2.0 * n_params as f64;
+    // The SAEM objective (`saem_ofv = saem`) is NONMEM's SAEMOBJ, not a likelihood: no
+    // information criterion exists for it, so AIC/BIC are `None` (#2973). Every other
+    // reported objective (FOCE/Laplace, IS, AGQ) is a likelihood and they are built from it.
+    let ic_ofv: Option<f64> = match &saem_objective {
+        Some(o) if o.kind == SaemOfv::Saem => None,
+        _ => Some(ofv_data),
+    };
+    // A non-finite value (a VI fit with no objective, a record-free BIC) is `None` too: one
+    // way to say "no information criterion", and a `.fitrx` round trip that is lossless.
+    let aic = ic_ofv.map(|o| o + 2.0 * n_params as f64).filter(|v| v.is_finite());
     // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
     // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
     #[cfg(feature = "survival")]
-    let n_for_bic: usize = n_obs
-        + population
-            .subjects
-            .iter()
-            .map(|s| s.obs_records.len())
-            .sum::<usize>();
+    let n_for_bic: usize =
+        n_obs + population.subjects.iter().map(|s| s.obs_records.len()).sum::<usize>();
     #[cfg(not(feature = "survival"))]
     let n_for_bic: usize = n_obs;
-    let bic = if n_for_bic > 0 {
-        ofv_data + n_params as f64 * (n_for_bic as f64).ln()
-    } else {
-        f64::NAN
-    };
+    let bic = ic_ofv
+        .filter(|_| n_for_bic > 0)
+        .map(|o| o + n_params as f64 * (n_for_bic as f64).ln())
+        .filter(|v| v.is_finite());
     // Delattre class tally behind the BIC variants (#1177): the same packed
     // held mask `n_params` was counted from, split by segment.
     let bic_inputs =
@@ -3140,15 +3217,9 @@ fn fit_inner(
     // `final_method`, not `options.method` (the chain's last stage): under `[foce, imp]` +
     // `imp_eval_only` the estimates are FOCE-M3 though the last stage is IMP (#1726).
     if matches!(model.bloq_in_force(), BloqMethod::M3)
-        && matches!(
-            final_method,
-            EstimationMethod::Foce | EstimationMethod::FoceGn
-        )
+        && matches!(final_method, EstimationMethod::Foce | EstimationMethod::FoceGn)
         && !options.interaction
-        && population
-            .subjects
-            .iter()
-            .any(|s| s.has_censored_observation())
+        && population.subjects.iter().any(|s| s.has_censored_observation())
     {
         warnings.push(
             "M3 censoring under FOCE uses non-interaction (Sheiner–Beal) semantics; \
@@ -3262,11 +3333,7 @@ fn fit_inner(
 
     // Flush and close the trace file; capture path for FitResult. Guarded on
     // having installed one — see the `trace_installed` comment above.
-    let trace_path = if trace_installed {
-        crate::estimation::trace::finish()
-    } else {
-        None
-    };
+    let trace_path = if trace_installed { crate::estimation::trace::finish() } else { None };
     // The file is a temporary one, so the fit keeps its text. `None` here leaves
     // `trace_path` as the only record, which a bundle cannot carry.
     let trace_csv = trace_path.as_deref().and_then(|path| {
@@ -3376,12 +3443,8 @@ fn fit_inner(
         // The contributions are the post-hoc FOCE/FOCEI score whatever produced the
         // objective, so the source says which, and the scorer splits out the terms the
         // predictions cannot describe (#2267).
-        let source = ContributionSource::of(
-            objective_stage,
-            options,
-            mixest_classes.is_some(),
-            ofv_prior,
-        );
+        let source =
+            ContributionSource::of(objective_stage, options, mixest_classes.is_some(), ofv_prior);
         let scorer = |i: usize, data: &Subject, s: &SubjectResult| {
             contribution_terms(
                 model,
@@ -3408,11 +3471,9 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
-    if let Some((msg, entry)) = runaway_guard_warning_for(
-        &mut converged,
-        &result.params,
-        result.covariance_matrix.as_ref(),
-    ) {
+    if let Some((msg, entry)) =
+        runaway_guard_warning_for(&mut converged, &result.params, result.covariance_matrix.as_ref())
+    {
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -3437,12 +3498,10 @@ fn fit_inner(
     if let Some((msg, entry)) = mcem_settling_warning(
         &mut converged,
         result.mcem_objective_trail.as_ref(),
-        is_result
-            .as_ref()
-            .map(|r| crate::estimation::impmap::FinalMarginal {
-                value: r.minus2_log_likelihood,
-                mc_se: r.mc_standard_error,
-            }),
+        is_result.as_ref().map(|r| crate::estimation::impmap::FinalMarginal {
+            value: r.minus2_log_likelihood,
+            mc_se: r.mc_standard_error,
+        }),
     ) {
         warnings.push(msg);
         native_warnings.push(entry);
@@ -3550,13 +3609,7 @@ fn fit_inner(
         .omega
         .eta_names
         .iter()
-        .map(|name| {
-            model
-                .mu_refs
-                .get(name)
-                .map(|r| r.log_transformed())
-                .unwrap_or(false)
-        })
+        .map(|name| model.mu_refs.get(name).map(|r| r.log_transformed()).unwrap_or(false))
         .collect();
 
     let omega_param_corr = compute_param_corr(
@@ -3571,13 +3624,7 @@ fn fit_inner(
         let kappa_log: Vec<bool> = model
             .kappa_names
             .iter()
-            .map(|name| {
-                model
-                    .kappa_mu_refs
-                    .get(name)
-                    .map(|r| r.log_transformed())
-                    .unwrap_or(false)
-            })
+            .map(|name| model.kappa_mu_refs.get(name).map(|r| r.log_transformed()).unwrap_or(false))
             .collect();
         compute_param_corr(
             &iov.matrix,
@@ -3593,9 +3640,7 @@ fn fit_inner(
         .residual_serial
         .as_ref()
         .zip(crate::api::validation::residual_correlation_line(model));
-    let across_blocks = serial_line
-        .as_ref()
-        .and_then(|_| dw_across_blocks(population));
+    let across_blocks = serial_line.as_ref().and_then(|_| dw_across_blocks(population));
     let dw_warning = match &serial_line {
         Some((serial, line)) => dw_autocorrelation_warning_decorrelated(
             dw_statistic,
@@ -3615,13 +3660,7 @@ fn fit_inner(
             &result.params,
             &subjects,
         );
-        warnings.extend(dw_cross_block_warning(
-            cross,
-            dw_statistic,
-            line,
-            serial.kind,
-            by,
-        ));
+        warnings.extend(dw_cross_block_warning(cross, dw_statistic, line, serial.kind, by));
     }
     // The published method is `None` whenever the step produced no matrix, so the method
     // gate inside is the only gate (#2415 review row 3).
@@ -3712,6 +3751,7 @@ fn fit_inner(
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: is_result,
+        saem_objective,
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
         vi: vi_result.clone(),
@@ -3722,11 +3762,7 @@ fn fit_inner(
         // Left empty unless a kappa actually carries a weight, so an ordinary
         // IOV fit's YAML/fitrx output is byte-identical to before #1031.
         kappa_weights: if model.has_weighted_kappa() {
-            model
-                .kappa_weights
-                .iter()
-                .map(|w| w.as_ref().map(|w| w.expr.clone()))
-                .collect()
+            model.kappa_weights.iter().map(|w| w.as_ref().map(|w| w.expr.clone())).collect()
         } else {
             Vec::new()
         },
@@ -3735,14 +3771,13 @@ fn fit_inner(
         shrinkage_kappa,
         shrinkage_kappa_by_occ,
         ebe_kappas: result.kappas.clone(),
-        kappa_levels: nested_kappa
-            .as_ref()
-            .map_or_else(Vec::new, |f| f.kappa_levels.clone()),
+        kappa_levels: nested_kappa.as_ref().map_or_else(Vec::new, |f| f.kappa_levels.clone()),
         ebe_kappas_by_level: nested_kappa.map_or_else(Vec::new, |f| f.by_level),
         saem_mu_ref_m_step_evals_saved: result.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: result.saem_n_subjects_hmc,
         saem_mh_accept_tail: result.saem_mh_accept_tail,
         saem_n_exploration_used: result.saem_n_exploration_used,
+        mstep_optimizer_used: result.mstep_optimizer_used,
         gradient_method_inner: grad_inner.as_str().to_string(),
         gradient_method_outer: grad_outer.as_str().to_string(),
         uses_ode_solver: model.is_ode_based(),
@@ -3785,9 +3820,7 @@ fn fit_inner(
         kappa_param_types: model.kappa_param_types.clone(),
         data_bindings: model.data_bindings().clone(),
         theta_transform: model.theta_transform.clone(),
-        sigma_types: model
-            .error_spec
-            .sigma_types(result.params.sigma.values.len()),
+        sigma_types: model.error_spec.sigma_types(result.params.sigma.values.len()),
         cov_eigenvalues,
         cov_condition_number,
         bic_inputs,
@@ -3857,11 +3890,7 @@ fn fit_inner(
         exclusions: population.exclusions.clone(),
     };
     // The normal SIR when it ran, else the non-PD fallback's (#1713).
-    apply_sir_result(
-        &mut fit_result,
-        sir_result.as_ref(),
-        sir_fallback_result.as_ref(),
-    );
+    apply_sir_result(&mut fit_result, sir_result.as_ref(), sir_fallback_result.as_ref());
 
     if time_gradients {
         let (an_c, an_n, fd_c, fd_n, jac_an_c, jac_an_n, jac_fd_c, jac_fd_n) =
@@ -3979,10 +4008,7 @@ mod bobyqa_scale_warning_tests {
         let w = bobyqa_scale_warning(Optimizer::Bobyqa, BOBYQA_MAX_DIM + 1)
             .expect("an explicit bobyqa at this size must not be a silent hour");
         assert!(w.contains("optimizer = bobyqa"), "{w}");
-        assert!(
-            w.contains("nlopt_lbfgs"),
-            "the message must name the way out: {w}"
-        );
+        assert!(w.contains("nlopt_lbfgs"), "the message must name the way out: {w}");
     }
 
     #[test]

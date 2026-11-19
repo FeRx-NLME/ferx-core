@@ -55,7 +55,6 @@ fn subject(first_rate: f64) -> Subject {
     let obs_times = vec![0.0, 1.0, 10.0, 12.0, 13.0, 24.0];
     let n = obs_times.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         // First (IV models) a 5 h infusion observed at its start, `t = 0`, with nothing
         // else arrived — the 2-cpt closed form's own arithmetic returns 0 there under a
@@ -67,30 +66,12 @@ fn subject(first_rate: f64) -> Subject {
             DoseEvent::new(12.0, 500.0, 1, 0.0, false, 0.0),
         ],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations: vec![1.0; n],
         obs_cmts: vec![1; n],
-        covariates: std::collections::HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1, 1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -126,10 +107,8 @@ fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume()
         PkModel::ThreeCptOral,
     ] {
         let model = model_for(pk_model);
-        let oral = matches!(
-            pk_model,
-            PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-        );
+        let oral =
+            matches!(pk_model, PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral);
         let subj = subject(if oral { 0.0 } else { 100.0 });
         for (label, idx, val) in cases {
             let mut pk = crate::types::PkParams::default();
@@ -296,10 +275,7 @@ fn the_exported_kernels_drop_a_degenerate_dose_themselves() {
     let bolus = mk(0.0, false, 0.0);
     let inf = f64::INFINITY;
     assert_eq!(crate::pk::one_cpt_iv_bolus(&bolus, 0.0, inf, 80.0), 0.0);
-    assert_eq!(
-        crate::pk::one_cpt_predict(&bolus, 0.0, inf, 80.0, None, None),
-        0.0
-    );
+    assert_eq!(crate::pk::one_cpt_predict(&bolus, 0.0, inf, 80.0, None, None), 0.0);
     assert_eq!(
         crate::pk::two_compartment::two_cpt_iv_peripheral(&bolus, 1.0, inf, 80.0, q, v2),
         0.0
@@ -350,10 +326,7 @@ fn the_exported_kernels_serve_a_nan_clearance_or_volume_as_nan() {
     for (dose, oral) in &doses {
         for (label, cl, v) in [("CL=NaN", nan, 80.0), ("V=NaN", 5.0, nan)] {
             for t in [0.0, 1.0, 10.0] {
-                let at = format!(
-                    "{label} rate={} ss={} oral={oral} t={t}",
-                    dose.rate, dose.ss
-                );
+                let at = format!("{label} rate={} ss={} oral={oral} t={t}", dose.rate, dose.ss);
                 let c1 = one_cpt_conc_g::<f64>(dose, t, cl, v, ka, f, *oral);
                 let c2 = two_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, ka, f, *oral);
                 let c3 = three_cpt_conc_g::<f64>(dose, t, cl, v, q, v2, q3, v3, ka, f, *oral);
@@ -366,17 +339,7 @@ fn the_exported_kernels_serve_a_nan_clearance_or_volume_as_nan() {
                 let k = Dual2::<2>::constant;
                 let jets = [
                     one_cpt_conc_g(dose, k(t), d(cl, 0), d(v, 1), k(ka), k(f), *oral),
-                    two_cpt_conc_g(
-                        dose,
-                        k(t),
-                        d(cl, 0),
-                        d(v, 1),
-                        k(q),
-                        k(v2),
-                        k(ka),
-                        k(f),
-                        *oral,
-                    ),
+                    two_cpt_conc_g(dose, k(t), d(cl, 0), d(v, 1), k(q), k(v2), k(ka), k(f), *oral),
                     three_cpt_conc_g(
                         dose,
                         k(t),
@@ -438,12 +401,9 @@ fn the_exported_kernels_serve_a_nan_clearance_or_volume_as_nan() {
 #[test]
 fn transit_and_ig_agree_with_the_rule_through_their_own_kernels() {
     let doses = [DoseEvent::new(0.0, 500.0, 1, 0.0, false, 0.0)];
-    for model in [
-        PkModel::OneCptTransit,
-        PkModel::TwoCptTransit,
-        PkModel::OneCptIg,
-        PkModel::TwoCptIg,
-    ] {
+    for model in
+        [PkModel::OneCptTransit, PkModel::TwoCptTransit, PkModel::OneCptIg, PkModel::TwoCptIg]
+    {
         for (label, idx) in [("CL", PK_IDX_CL), ("V", PK_IDX_V)] {
             let mut pk = crate::types::PkParams::default();
             pk.values[PK_IDX_CL] = 5.0;

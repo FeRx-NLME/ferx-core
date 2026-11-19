@@ -41,10 +41,11 @@ use std::path::{Path, PathBuf};
 const ALLOWED: &[(&str, usize, &str)] = &[
     (
         "src/api/fit.rs",
-        8,
+        9,
         "the stage loop resolves `stage_opts.interaction` through `interaction_for`; the \
          `post_opts` shadow resolves it for the post-fit block, so every later \
-         `options.interaction` there is the resolved flag",
+         `options.interaction` there is the resolved flag; the `saem_ofv = agq` readout \
+         passes its flag to `interaction_for(Laplace, ..)` (#2973)",
     ),
     (
         "src/api/postfit.rs",
@@ -79,25 +80,19 @@ const ALLOWED: &[(&str, usize, &str)] = &[
          score picks its objective from them, #2482; the per-subject rows are each subject's \
          total derivative on the same GN / trust-region stage options, #2974)",
     ),
-    (
-        "src/estimation/impmap.rs",
-        1,
-        "the IMP-MAP inner pass, run on a stage's options",
-    ),
+    ("src/estimation/impmap.rs", 1, "the IMP-MAP inner pass, run on a stage's options"),
     (
         "src/estimation/inner_optimizer.rs",
         1,
         "`InnerMode::for_options` is documented as taking a stage's resolved options",
     ),
-    (
-        "src/estimation/mixture.rs",
-        2,
-        "the mixture outer loop, run on a stage's options",
-    ),
+    ("src/estimation/mixture.rs", 2, "the mixture outer loop, run on a stage's options"),
     (
         "src/estimation/outer_optimizer.rs",
-        14,
+        15,
         "the outer optimizer and objective, run on a stage's options; \
+         #3004's `exact_at_resolved_ebe` (the adjoint at a declined subject's re-solved EBE) \
+         reads the same stage options as the salvage around it; \
          `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options \
          (#2549: the built-in BFGS loop's two standalone `population_eta_dx` reads went \
          with its separate mode-response pass); the #2093 basin probe's switched-subject \
@@ -110,22 +105,14 @@ const ALLOWED: &[(&str, usize, &str)] = &[
         "the profiled outer loop is a stage of the stage loop, on its stage options; the \
          profile solve's adjoint level gradient (#2109) differentiates the same stage objective",
     ),
-    (
-        "src/estimation/saem.rs",
-        1,
-        "the SAEM stage's final objective, on its stage options",
-    ),
+    ("src/estimation/saem.rs", 1, "the SAEM stage's final objective, on its stage options"),
     (
         "src/estimation/trace.rs",
         1,
         "`method_label` (#2552) resolves the flag itself, `interaction_for(options.method, \
          options.interaction)`: the raw field is only the inherited value it passes in",
     ),
-    (
-        "src/estimation/vi/run.rs",
-        1,
-        "the VI stage's objective, on its stage options",
-    ),
+    ("src/estimation/vi/run.rs", 1, "the VI stage's objective, on its stage options"),
     (
         "src/io/fitrx.rs",
         2,
@@ -196,13 +183,7 @@ fn field_reads(src: &str) -> Vec<(usize, String)> {
     const NEEDLE: &str = ".interaction";
     let code: String = src
         .split_inclusive('\n')
-        .map(|line| {
-            if line.trim_start().starts_with("//") {
-                "\n"
-            } else {
-                line
-            }
-        })
+        .map(|line| if line.trim_start().starts_with("//") { "\n" } else { line })
         .collect();
     let lines: Vec<&str> = code.lines().collect();
     let mut out = Vec::new();
@@ -244,10 +225,8 @@ fn the_classifier_sees_reads_and_skips_assignments_and_test_modules() {
                fn m(o: &O) -> bool {\n    o\n        // a comment between\n        .interaction\n}\n\
                fn n(o: &mut O) {\n    o\n        .interaction = true;\n}\n\
                fn p(o: &[O]) -> bool { o[0].interaction && get()?.interaction }\n";
-    let lines: Vec<usize> = field_reads(&production_part(src))
-        .into_iter()
-        .map(|(n, _)| n)
-        .collect();
+    let lines: Vec<usize> =
+        field_reads(&production_part(src)).into_iter().map(|(n, _)| n).collect();
     // 1; 2 (the right-hand side only, not the assignment); 3; 9 (a call receiver);
     // 17: production code *after* an inline test module (with a nested module inside
     // it), which must still be scanned; 18: a match guard, whose `=>` is not an `=`;
@@ -266,10 +245,7 @@ fn the_allow_list_names_each_file_once() {
     let mut seen = std::collections::BTreeSet::new();
     for (path, count, why) in ALLOWED {
         assert!(seen.insert(*path), "{path} is listed twice");
-        assert!(
-            *count > 0,
-            "{path} is listed with no reads; delete the entry"
-        );
+        assert!(*count > 0, "{path} is listed with no reads; delete the entry");
         assert!(!why.trim().is_empty(), "{path} is listed without a reason");
     }
 }
@@ -280,11 +256,7 @@ fn raw_interaction_reads_stay_on_the_allow_list() {
     let src_dir = root.join("src");
     let mut sources = Vec::new();
     rust_sources(&src_dir, &mut sources);
-    assert!(
-        sources.len() > 50,
-        "found only {} sources under src/",
-        sources.len()
-    );
+    assert!(sources.len() > 50, "found only {} sources under src/", sources.len());
 
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for path in &sources {
@@ -295,10 +267,7 @@ fn raw_interaction_reads_stay_on_the_allow_list() {
             .to_string_lossy()
             .replace('\\', "/");
         for (n, line) in field_reads(&production_part(&src)) {
-            found
-                .entry(rel.clone())
-                .or_default()
-                .push(format!("{rel}:{n}: {line}"));
+            found.entry(rel.clone()).or_default().push(format!("{rel}:{n}: {line}"));
         }
     }
 

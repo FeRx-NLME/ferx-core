@@ -187,10 +187,7 @@ impl ModelText {
     /// with blank lines dropped and continuation lines folded in — the view
     /// the parser gets.
     pub fn block_lines(&self, name: &str) -> Vec<String> {
-        self.logical_lines(name)
-            .into_iter()
-            .map(|(_, c)| c)
-            .collect()
+        self.logical_lines(name).into_iter().map(|(_, c)| c).collect()
     }
 
     // ── Internals shared by the appliers ────────────────────────────────────
@@ -206,11 +203,7 @@ impl ModelText {
         let mut out = Vec::with_capacity(headers.len());
         for (k, (header, name)) in headers.iter().enumerate() {
             let end = headers.get(k + 1).map(|h| h.0).unwrap_or(self.lines.len());
-            out.push(BlockSpan {
-                name: name.clone(),
-                header: *header,
-                body: header + 1..end,
-            });
+            out.push(BlockSpan { name: name.clone(), header: *header, body: header + 1..end });
         }
         out
     }
@@ -221,19 +214,12 @@ impl ModelText {
     /// bodies — and appending to the last occurrence is the only choice that
     /// preserves declaration order for every duplicate arrangement.
     pub(crate) fn last_block(&self, name: &str) -> Option<BlockSpan> {
-        self.block_spans()
-            .into_iter()
-            .filter(|b| b.name == name)
-            .next_back()
+        self.block_spans().into_iter().filter(|b| b.name == name).next_back()
     }
 
     /// Line indices of every body line of every `[name]` block, in source order.
     pub(crate) fn body_indices(&self, name: &str) -> Vec<usize> {
-        self.block_spans()
-            .iter()
-            .filter(|b| b.name == name)
-            .flat_map(|b| b.body.clone())
-            .collect()
+        self.block_spans().iter().filter(|b| b.name == name).flat_map(|b| b.body.clone()).collect()
     }
 
     /// The **logical** declarations of every `[name]` block: the line range
@@ -492,9 +478,8 @@ fn bracket_depth(code: &str) -> i32 {
 }
 
 fn leading_ws(line: &str) -> &str {
-    let end = line
-        .find(|c: char| !c.is_whitespace() || c == '\n' || c == '\r')
-        .unwrap_or(line.len());
+    let end =
+        line.find(|c: char| !c.is_whitespace() || c == '\n' || c == '\r').unwrap_or(line.len());
     &line[..end]
 }
 

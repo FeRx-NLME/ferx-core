@@ -39,13 +39,8 @@ pub(crate) fn fixture_fit() -> FitResult {
             options.verbose = false;
             options.threads = Some(1);
             options.checkpoint = false;
-            fit(
-                &prepared.parsed.model,
-                &prepared.population,
-                &prepared.init_params,
-                &options,
-            )
-            .expect("warfarin evaluation")
+            fit(&prepared.parsed.model, &prepared.population, &prepared.init_params, &options)
+                .expect("warfarin evaluation")
         })
         .join()
         .expect("the fixture thread panicked")
@@ -58,8 +53,8 @@ pub(crate) fn converged_fit(ofv: f64) -> FitResult {
     let mut result = fixture_fit();
     result.converged = true;
     result.ofv = ofv;
-    result.aic = ofv + 2.0;
-    result.bic = ofv + 5.0;
+    result.aic = Some(ofv + 2.0);
+    result.bic = Some(ofv + 5.0);
     result
 }
 
@@ -69,10 +64,7 @@ pub(crate) fn population(ids: &[&str]) -> Population {
     Population {
         subjects: ids
             .iter()
-            .map(|id| Subject {
-                id: (*id).to_string(),
-                ..Default::default()
-            })
+            .map(|id| Subject { id: (*id).to_string(), ..Default::default() })
             .collect(),
         covariate_names: vec![],
         dv_column: "DV".into(),
@@ -150,12 +142,7 @@ impl ScriptedFitter {
 
     /// The step directories fitted, in order.
     pub(crate) fn dirs(&self) -> Vec<String> {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(d, _)| d.clone())
-            .collect()
+        self.calls.lock().unwrap().iter().map(|(d, _)| d.clone()).collect()
     }
 
     /// The candidates of one step directory.
@@ -181,9 +168,7 @@ impl ScriptedFitter {
 
 impl crate::search::fitter::StepFitter for ScriptedFitter {
     fn fit_step(
-        &self,
-        step_dir: &str,
-        candidates: &[Candidate],
+        &self, step_dir: &str, candidates: &[Candidate],
     ) -> Result<crate::search::RunReport, String> {
         use crate::search::{CandidateError, CandidateResult};
         use ferx_core::StrictnessVerdict;

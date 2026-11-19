@@ -197,9 +197,9 @@ pub(crate) use adaptive::{
 pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
-    dw_autocorrelation_warning, multistart_prefers, perturb_init, saem_active_covariate_group_etas,
-    saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
-    select_start, DwAdvice, SubjectLine,
+    dw_autocorrelation_warning, multistart_prefers, per_start_options, per_start_seed,
+    perturb_init, saem_active_covariate_group_etas, saem_active_mixture_switched_etas,
+    saem_non_mu_referenced_individual_params_warning, select_start, DwAdvice, SubjectLine,
 };
 #[cfg(test)]
 pub(crate) use pool::{
@@ -234,11 +234,7 @@ pub(crate) use simulate::{correlated_residual_draw, draw_correlations, SimClasse
 /// backs the TV-vs-no-TV gap assertions in the regression tests.
 #[cfg(test)]
 pub(crate) fn model_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    pk_params: &PkParams,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, pk_params: &PkParams, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {
     let mut preds = if let Some(ref ode_spec) = model.ode_spec {
         pk::compute_predictions_ode(ode_spec, subject, &pk_params.values, theta, eta)

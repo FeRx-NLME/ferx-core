@@ -51,10 +51,7 @@ fn latent_binding_rhs<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], T, &
 }
 
 fn loose() -> OdeSolverOptions {
-    OdeSolverOptions {
-        method: OdeMethod::Auto,
-        ..Default::default()
-    }
+    OdeSolverOptions { method: OdeMethod::Auto, ..Default::default() }
 }
 
 #[test]
@@ -62,10 +59,7 @@ fn eigenvalue_probe_matches_the_exact_spectrum_of_a_diagonal_system() {
     let rhs = diagonal_rhs::<f64>(&[-1.0, -1000.0, -0.5]);
     let lambda = max_abs_re_eigenvalue(&rhs, &[1.0, 1.0, 1.0], &[], 0.0).unwrap();
     // FD Jacobian of a linear system is exact up to round-off.
-    assert!(
-        (lambda - 1000.0).abs() < 1e-3,
-        "expected |Re λ|max ≈ 1000, got {lambda}"
-    );
+    assert!((lambda - 1000.0).abs() < 1e-3, "expected |Re λ|max ≈ 1000, got {lambda}");
 }
 
 #[test]
@@ -153,33 +147,21 @@ fn a_named_method_is_never_second_guessed_by_the_probe() {
         OdeMethod::Rodas4,
         OdeMethod::Rodas5P,
     ] {
-        let opts = OdeSolverOptions {
-            method: named,
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_method(&rhs, &[50.0, 10.0, 0.0], &[], 0.0, &opts),
-            named
-        );
+        let opts = OdeSolverOptions { method: named, ..Default::default() };
+        assert_eq!(resolve_method(&rhs, &[50.0, 10.0, 0.0], &[], 0.0, &opts), named);
     }
 }
 
 #[test]
 fn auto_keeps_the_explicit_default_on_a_non_stiff_or_unclassifiable_system() {
     let pk = diagonal_rhs::<f64>(&[-1.2, -0.15]);
-    assert_eq!(
-        resolve_method(&pk, &[100.0, 0.0], &[], 0.0, &loose()),
-        OdeMethod::Rk45
-    );
+    assert_eq!(resolve_method(&pk, &[100.0, 0.0], &[], 0.0, &loose()), OdeMethod::Rk45);
 
     // Unclassifiable must fall back to explicit, not guess a stiff method: escalating on a
     // system whose Jacobian could not even be formed is how `auto` would trade a slow answer
     // for a wrong one.
     let nan_rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = f64::NAN;
-    assert_eq!(
-        resolve_method(&nan_rhs, &[1.0], &[], 0.0, &loose()),
-        OdeMethod::Rk45
-    );
+    assert_eq!(resolve_method(&nan_rhs, &[1.0], &[], 0.0, &loose()), OdeMethod::Rk45);
 }
 
 #[test]
@@ -188,11 +170,7 @@ fn auto_picks_the_stiff_method_the_tolerance_calls_for() {
     let u = [50.0, 10.0, 0.0];
 
     let at = |reltol: f64| {
-        let opts = OdeSolverOptions {
-            method: OdeMethod::Auto,
-            reltol,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method: OdeMethod::Auto, reltol, ..Default::default() };
         resolve_method(&rhs, &u, &[], 0.0, &opts)
     };
     // The band boundary is pinned because it is a *consistency* requirement, not a free
@@ -217,17 +195,11 @@ fn the_probe_decides_identically_at_f64_and_at_a_dual() {
 
     for u_central in [0.0, 0.05, 5.0, 50.0] {
         let u_f64 = [u_central, 10.0, 0.0];
-        let u_dual = [
-            Dual2::<N>::var(u_central, 0),
-            Dual2::<N>::var(10.0, 1),
-            Dual2::<N>::constant(0.0),
-        ];
+        let u_dual =
+            [Dual2::<N>::var(u_central, 0), Dual2::<N>::var(10.0, 1), Dual2::<N>::constant(0.0)];
         let l_f64 = max_abs_re_eigenvalue(&scalar_rhs, &u_f64, &[], 0.0).unwrap();
         let l_dual = max_abs_re_eigenvalue(&dual_rhs, &u_dual, &[], 0.0).unwrap();
-        assert_eq!(
-            l_f64, l_dual,
-            "λ must not depend on T (central={u_central})"
-        );
+        assert_eq!(l_f64, l_dual, "λ must not depend on T (central={u_central})");
         assert_eq!(
             resolve_method(&scalar_rhs, &u_f64, &[], 0.0, &loose()),
             resolve_method(&dual_rhs, &u_dual, &[], 0.0, &loose()),
@@ -253,20 +225,10 @@ fn auto_integrates_a_stiff_system_that_the_explicit_default_cannot_step_through(
         &loose(),
         Some(&mut stats),
     );
-    assert_eq!(
-        stats.auto_stiff_segments, 1,
-        "the probe must have escalated"
-    );
-    assert_eq!(
-        stats.auto_stiff_rejected, 0,
-        "and the result must be usable"
-    );
+    assert_eq!(stats.auto_stiff_segments, 1, "the probe must have escalated");
+    assert_eq!(stats.auto_stiff_rejected, 0, "and the result must be usable");
     for (p, &t) in sol.iter().zip(saveat.iter()) {
-        assert!(
-            (p.u[1] - (-0.5 * t).exp()).abs() < 1e-5,
-            "slow mode wrong at t={t}: {}",
-            p.u[1]
-        );
+        assert!((p.u[1] - (-0.5 * t).exp()).abs() < 1e-5, "slow mode wrong at t={t}: {}", p.u[1]);
         assert!(p.u[0].abs() < 1e-6, "fast mode should be dead: {}", p.u[0]);
     }
 }
@@ -276,21 +238,10 @@ fn auto_leaves_the_stats_counters_alone_under_a_named_method() {
     // The counters exist to say "`auto` did something"; a fixed method must never move them,
     // including a fixed *stiff* method on a system the probe would have escalated.
     for named in [OdeMethod::Rk45, OdeMethod::Rodas4] {
-        let opts = OdeSolverOptions {
-            method: named,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method: named, ..Default::default() };
         let mut stats = OdeSolverStats::default();
         let rhs = diagonal_rhs::<f64>(&[-1.0e4, -0.5]);
-        solve_ode_with_stats(
-            &rhs,
-            &[1.0, 1.0],
-            (0.0, 5.0),
-            &[],
-            &[5.0],
-            &opts,
-            Some(&mut stats),
-        );
+        solve_ode_with_stats(&rhs, &[1.0, 1.0], (0.0, 5.0), &[], &[5.0], &opts, Some(&mut stats));
         assert_eq!(stats.auto_stiff_segments, 0, "{named:?}");
         assert_eq!(stats.auto_stiff_rejected, 0, "{named:?}");
     }
@@ -306,38 +257,17 @@ fn the_guard_re_solves_an_escalation_that_stalled_at_min_dt() {
     // re-solve is what the caller receives.
     let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
     let mut stats = OdeSolverStats::default();
-    let sol = solve_ode_with_stats(
-        &rhs,
-        &[1.0e6],
-        (0.0, 1.0),
-        &[],
-        &[1.0],
-        &loose(),
-        Some(&mut stats),
-    );
+    let sol =
+        solve_ode_with_stats(&rhs, &[1.0e6], (0.0, 1.0), &[], &[1.0], &loose(), Some(&mut stats));
     assert_eq!(stats.auto_stiff_segments, 1);
-    assert_eq!(
-        stats.auto_stiff_rejected, 1,
-        "the stalled escalation must have been rejected"
-    );
+    assert_eq!(stats.auto_stiff_rejected, 1, "the stalled escalation must have been rejected");
     assert_eq!(sol.len(), 1);
 
     // The guard is scoped to escalations: the same system under a named stiff method keeps
     // that method's own (non-finite) answer rather than being silently re-solved.
-    let named = OdeSolverOptions {
-        method: OdeMethod::Rodas4,
-        ..Default::default()
-    };
+    let named = OdeSolverOptions { method: OdeMethod::Rodas4, ..Default::default() };
     let mut named_stats = OdeSolverStats::default();
-    solve_ode_with_stats(
-        &rhs,
-        &[1.0e6],
-        (0.0, 1.0),
-        &[],
-        &[1.0],
-        &named,
-        Some(&mut named_stats),
-    );
+    solve_ode_with_stats(&rhs, &[1.0e6], (0.0, 1.0), &[], &[1.0], &named, Some(&mut named_stats));
     assert_eq!(named_stats.auto_stiff_rejected, 0);
 }
 
@@ -350,20 +280,9 @@ fn a_budgeted_abort_inside_an_escalation_is_still_rejected_by_the_guard() {
     // Same blow-up fixture as `the_guard_re_solves_an_escalation_that_stalled_at_min_dt`.
     let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
     let mut unbudgeted = OdeSolverStats::default();
-    solve_ode_with_stats(
-        &rhs,
-        &[1.0e6],
-        (0.0, 1.0),
-        &[],
-        &[1.0],
-        &loose(),
-        Some(&mut unbudgeted),
-    );
+    solve_ode_with_stats(&rhs, &[1.0e6], (0.0, 1.0), &[], &[1.0], &loose(), Some(&mut unbudgeted));
 
-    let budgeted_opts = OdeSolverOptions {
-        stiff_abort_after: Some(1),
-        ..loose()
-    };
+    let budgeted_opts = OdeSolverOptions { stiff_abort_after: Some(1), ..loose() };
     let mut budgeted = OdeSolverStats::default();
     solve_ode_with_stats(
         &rhs,
@@ -376,10 +295,7 @@ fn a_budgeted_abort_inside_an_escalation_is_still_rejected_by_the_guard() {
     );
 
     assert_eq!(budgeted.auto_stiff_segments, 1);
-    assert_eq!(
-        budgeted.auto_stiff_rejected, 1,
-        "an aborted escalation is a stalled escalation"
-    );
+    assert_eq!(budgeted.auto_stiff_rejected, 1, "an aborted escalation is a stalled escalation");
     // The abort that is *counted* is the explicit re-solve's: this system blows up under any
     // method, so the fallback trips the same budget. The discarded escalation's own abort is
     // deliberately not counted — nobody received that trajectory.
@@ -410,10 +326,7 @@ fn a_budgeted_abort_inside_an_escalation_is_still_rejected_by_the_guard() {
 #[test]
 fn the_guard_re_solves_an_escalation_that_ran_out_of_steps_without_clamping() {
     let rhs = diagonal_rhs::<f64>(&[-1.0e4, -0.5]);
-    let starved = OdeSolverOptions {
-        max_steps: 2,
-        ..loose()
-    };
+    let starved = OdeSolverOptions { max_steps: 2, ..loose() };
     let mut stats = OdeSolverStats::default();
     let sol = solve_ode_with_stats(
         &rhs,
@@ -439,10 +352,7 @@ fn the_guard_re_solves_an_escalation_that_ran_out_of_steps_without_clamping() {
         "the explicit re-solve is starved of steps too, so both attempts failed: {stats:?}"
     );
     assert_eq!(stats.unfinished_segments, 2, "one attempt per method");
-    assert_eq!(
-        stats.discarded_unfinished_segments, 1,
-        "only the stiff attempt was discarded"
-    );
+    assert_eq!(stats.discarded_unfinished_segments, 1, "only the stiff attempt was discarded");
     assert_eq!(sol.len(), 1, "the saveat contract remains freeze-padded");
 }
 
@@ -452,15 +362,7 @@ fn the_guard_re_solves_an_escalation_that_ran_out_of_steps_without_clamping() {
 fn a_finished_escalation_is_not_rejected_by_the_unfinished_test() {
     let rhs = diagonal_rhs::<f64>(&[-1.0e4, -0.5]);
     let mut stats = OdeSolverStats::default();
-    solve_ode_with_stats(
-        &rhs,
-        &[1.0, 1.0],
-        (0.0, 5.0),
-        &[],
-        &[5.0],
-        &loose(),
-        Some(&mut stats),
-    );
+    solve_ode_with_stats(&rhs, &[1.0, 1.0], (0.0, 5.0), &[], &[5.0], &loose(), Some(&mut stats));
     assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
     assert_eq!(stats.unfinished_segments, 0, "{stats:?}");
     assert_eq!(stats.auto_stiff_rejected, 0, "{stats:?}");
@@ -498,20 +400,13 @@ fn the_gershgorin_bound_never_undercuts_the_exact_spectrum() {
             }),
             vec![1.0, 1.0],
         ),
-        (
-            "binding",
-            Box::new(binding_rhs::<f64>(100.0, 1.0)),
-            vec![100.0, 10.0, 0.0],
-        ),
+        ("binding", Box::new(binding_rhs::<f64>(100.0, 1.0)), vec![100.0, 10.0, 0.0]),
     ];
     for (name, rhs, u) in cases {
         let exact = max_abs_re_eigenvalue(&rhs, &u, &[], 0.0).unwrap();
         let jac = fd_jacobian(&rhs, &u, &[], 0.0).unwrap();
         let bound = gershgorin_abs_bound(&jac, u.len());
-        assert!(
-            bound >= exact * (1.0 - 1e-9),
-            "{name}: bound {bound} below exact {exact}"
-        );
+        assert!(bound >= exact * (1.0 - 1e-9), "{name}: bound {bound} below exact {exact}");
     }
 }
 
@@ -541,9 +436,7 @@ fn the_gershgorin_fast_path_agrees_with_the_exact_eigensolve() {
 
 /// The probe's pre-change algorithm, written out: fresh vectors, one-sided FD, column-major.
 fn reference_fd_jacobian(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u: &[f64],
-    t: f64,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u: &[f64], t: f64,
 ) -> Vec<f64> {
     let n = u.len();
     let mut f0 = vec![0.0; n];
@@ -579,31 +472,14 @@ fn coupled_rhs(u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
 /// writing `jac[j + i * n]`, skipping the `u_pert[j] = u[j]` restore.
 #[test]
 fn the_probe_jacobian_equals_the_reference_loop_bit_for_bit() {
-    for n in [
-        2,
-        PROBE_STACK_N - 1,
-        PROBE_STACK_N,
-        PROBE_STACK_N + 1,
-        2 * PROBE_STACK_N,
-    ] {
+    for n in [2, PROBE_STACK_N - 1, PROBE_STACK_N, PROBE_STACK_N + 1, 2 * PROBE_STACK_N] {
         let u: Vec<f64> = (0..n).map(|i| 0.3 + 0.9 * i as f64).collect();
         let want = reference_fd_jacobian(&coupled_rhs, &u, 0.0);
         let mut got = vec![f64::NAN; n * n];
-        assert!(
-            fd_jacobian_into(&coupled_rhs, &u, &[], 0.0, &mut got),
-            "n={n}"
-        );
+        assert!(fd_jacobian_into(&coupled_rhs, &u, &[], 0.0, &mut got), "n={n}");
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
-        assert_eq!(
-            bits(&got),
-            bits(&want),
-            "n={n}: scratch placement changed the Jacobian"
-        );
-        assert_eq!(
-            bits(&fd_jacobian(&coupled_rhs, &u, &[], 0.0).unwrap()),
-            bits(&want),
-            "n={n}"
-        );
+        assert_eq!(bits(&got), bits(&want), "n={n}: scratch placement changed the Jacobian");
+        assert_eq!(bits(&fd_jacobian(&coupled_rhs, &u, &[], 0.0).unwrap()), bits(&want), "n={n}");
     }
 }
 
@@ -614,13 +490,7 @@ fn the_probe_jacobian_equals_the_reference_loop_bit_for_bit() {
 /// declines the probe on both sides alike.
 #[test]
 fn the_probe_agrees_across_the_stack_and_heap_scratch_boundary() {
-    for n in [
-        1,
-        PROBE_STACK_N - 1,
-        PROBE_STACK_N,
-        PROBE_STACK_N + 1,
-        2 * PROBE_STACK_N,
-    ] {
+    for n in [1, PROBE_STACK_N - 1, PROBE_STACK_N, PROBE_STACK_N + 1, 2 * PROBE_STACK_N] {
         for (rate, stiff) in [(-1.0, false), (-500.0, true)] {
             let rates: &'static [f64] = Box::leak(vec![rate; n].into_boxed_slice());
             let rhs = diagonal_rhs::<f64>(rates);
@@ -629,16 +499,8 @@ fn the_probe_agrees_across_the_stack_and_heap_scratch_boundary() {
             let mut into = vec![f64::NAN; n * n];
             assert!(fd_jacobian_into(&rhs, &u, &[], 0.0, &mut into), "n={n}");
             assert_eq!(jac, into, "n={n}: scratch placement changed the Jacobian");
-            let expected = if stiff {
-                OdeMethod::Rodas4
-            } else {
-                OdeMethod::EXPLICIT_FALLBACK
-            };
-            assert_eq!(
-                resolve_method(&rhs, &u, &[], 0.0, &loose()),
-                expected,
-                "n={n} rate={rate}"
-            );
+            let expected = if stiff { OdeMethod::Rodas4 } else { OdeMethod::EXPLICIT_FALLBACK };
+            assert_eq!(resolve_method(&rhs, &u, &[], 0.0, &loose()), expected, "n={n} rate={rate}");
         }
         let mut u = vec![1.0; n];
         u[n - 1] = f64::NAN;
@@ -657,20 +519,9 @@ fn the_probe_agrees_across_the_stack_and_heap_scratch_boundary() {
 #[test]
 fn a_discarded_escalations_clamps_are_recorded_as_discarded() {
     let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = u[0] * u[0];
-    let opts = OdeSolverOptions {
-        stiff_abort_after: Some(1),
-        ..loose()
-    };
+    let opts = OdeSolverOptions { stiff_abort_after: Some(1), ..loose() };
     let mut stats = OdeSolverStats::default();
-    solve_ode_with_stats(
-        &rhs,
-        &[1.0e6],
-        (0.0, 1.0),
-        &[],
-        &[1.0],
-        &opts,
-        Some(&mut stats),
-    );
+    solve_ode_with_stats(&rhs, &[1.0e6], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
     assert_eq!(stats.auto_stiff_rejected, 1);
     assert!(
@@ -679,10 +530,7 @@ fn a_discarded_escalations_clamps_are_recorded_as_discarded() {
     );
     // Whatever clamps survive the subtraction belong to the explicit re-solve, which is the
     // trajectory the caller actually received.
-    assert!(
-        stats.min_step_clamped_steps >= stats.discarded_clamped_steps,
-        "{stats:?}"
-    );
+    assert!(stats.min_step_clamped_steps >= stats.discarded_clamped_steps, "{stats:?}");
 }
 
 #[test]
@@ -690,10 +538,7 @@ fn auto_round_trips_through_the_fit_option_token() {
     assert_eq!(OdeMethod::parse("auto"), Some(OdeMethod::Auto));
     assert_eq!(OdeMethod::parse("AUTO"), Some(OdeMethod::Auto));
     assert_eq!(OdeMethod::Auto.as_str(), "auto");
-    assert_eq!(
-        OdeMethod::parse(OdeMethod::Auto.as_str()),
-        Some(OdeMethod::Auto)
-    );
+    assert_eq!(OdeMethod::parse(OdeMethod::Auto.as_str()), Some(OdeMethod::Auto));
 }
 
 #[test]
@@ -724,10 +569,7 @@ fn measure_probe_cost_against_segment_cost() {
     }
     let segment = t1.elapsed().as_secs_f64() / m as f64;
 
-    let explicit = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..Default::default()
-    };
+    let explicit = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
     let t2 = Instant::now();
     for _ in 0..m {
         std::hint::black_box(solve_ode(&rhs, &u, (0.0, 12.0), &[], &[12.0], &explicit));
@@ -835,24 +677,15 @@ fn measure_runtime_stiffness_signals_on_the_binding_sweep() {
             ..Default::default()
         };
         let reference = solve_ode(&rhs, &u0, (0.0, 24.0), &[], &saveat, &tight);
-        let tight_explicit = OdeSolverOptions {
-            method: OdeMethod::Rk45,
-            ..tight
-        };
+        let tight_explicit = OdeSolverOptions { method: OdeMethod::Rk45, ..tight };
         let cross = solve_ode(&rhs, &u0, (0.0, 24.0), &[], &saveat, &tight_explicit);
         let rel = |a: &crate::ode::SolPoint, b: &crate::ode::SolPoint| {
             (a.u[0] - b.u[0]).abs() / a.u[0].abs().max(1e-30)
         };
-        let cross_err = reference
-            .iter()
-            .zip(&cross)
-            .map(|(a, b)| rel(a, b))
-            .fold(0.0_f64, f64::max);
+        let cross_err =
+            reference.iter().zip(&cross).map(|(a, b)| rel(a, b)).fold(0.0_f64, f64::max);
 
-        let production = OdeSolverOptions {
-            method: OdeMethod::Rk45,
-            ..Default::default()
-        };
+        let production = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
         let mut stats = OdeSolverStats::default();
         let t0 = Instant::now();
         let got = solve_ode_with_stats(
@@ -914,47 +747,27 @@ fn measure_the_mid_segment_stiffness_a_start_probe_cannot_see() {
         let lambda0 = max_abs_re_eigenvalue(&rhs, &u0, &[], 0.0).unwrap();
         let (t_cross, lambda_max) = reference.iter().fold((f64::NAN, 0.0_f64), |(tc, lm), p| {
             let l = max_abs_re_eigenvalue(&rhs, &p.u, &[], p.t).unwrap_or(0.0);
-            let tc = if tc.is_nan() && l >= STIFF_RE_LAMBDA_THRESHOLD {
-                p.t
-            } else {
-                tc
-            };
+            let tc = if tc.is_nan() && l >= STIFF_RE_LAMBDA_THRESHOLD { p.t } else { tc };
             (tc, lm.max(l))
         });
         println!(
             "\nKON={kon}: probe at t0 reads {lambda0:.1} ({}), |Re l|max along the trajectory \
              {lambda_max:.1}, first stiff saveat t={t_cross}",
-            if lambda0 >= STIFF_RE_LAMBDA_THRESHOLD {
-                "stiff"
-            } else {
-                "NOT stiff"
-            }
+            if lambda0 >= STIFF_RE_LAMBDA_THRESHOLD { "stiff" } else { "NOT stiff" }
         );
         println!(
             "{:>12} {:>12} {:>12} {:>9} {:>8} {:>8} {:>8} {:>6}",
             "method", "med relerr", "max relerr", "wall s", "att", "rej", "clamp", "esc"
         );
 
-        for (name, method) in [
-            ("rk45", OdeMethod::Rk45),
-            ("auto", OdeMethod::Auto),
-            ("rodas4", OdeMethod::Rodas4),
-        ] {
-            let opts = OdeSolverOptions {
-                method,
-                ..Default::default()
-            };
+        for (name, method) in
+            [("rk45", OdeMethod::Rk45), ("auto", OdeMethod::Auto), ("rodas4", OdeMethod::Rodas4)]
+        {
+            let opts = OdeSolverOptions { method, ..Default::default() };
             let mut stats = OdeSolverStats::default();
             let t0 = Instant::now();
-            let got = solve_ode_with_stats(
-                &rhs,
-                &u0,
-                (0.0, 24.0),
-                &[],
-                &saveat,
-                &opts,
-                Some(&mut stats),
-            );
+            let got =
+                solve_ode_with_stats(&rhs, &u0, (0.0, 24.0), &[], &saveat, &opts, Some(&mut stats));
             let wall = t0.elapsed().as_secs_f64();
             let mut errs: Vec<f64> = reference
                 .iter()
@@ -985,9 +798,7 @@ fn latent_grid() -> (Vec<f64>, [f64; 4]) {
 /// The reference the switching tests score against: the stiff workhorse at tolerances six
 /// decades tighter than production, with a step budget it cannot exhaust.
 fn tight_reference(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    saveat: &[f64],
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64], saveat: &[f64],
 ) -> Vec<crate::ode::SolPoint> {
     let opts = OdeSolverOptions {
         abstol: 1e-12,
@@ -1028,10 +839,7 @@ fn auto_switches_in_place_when_a_segment_turns_stiff_mid_way() {
         "the entry state must read non-stiff or the test is not testing the switch"
     );
 
-    let pinned = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..Default::default()
-    };
+    let pinned = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
     let mut explicit_stats = OdeSolverStats::default();
     let explicit = solve_ode_with_stats(
         &rhs,
@@ -1052,20 +860,10 @@ fn auto_switches_in_place_when_a_segment_turns_stiff_mid_way() {
     );
 
     let mut stats = OdeSolverStats::default();
-    let switched = solve_ode_with_stats(
-        &rhs,
-        &u0,
-        (0.0, 24.0),
-        &[],
-        &saveat,
-        &loose(),
-        Some(&mut stats),
-    );
+    let switched =
+        solve_ode_with_stats(&rhs, &u0, (0.0, 24.0), &[], &saveat, &loose(), Some(&mut stats));
     let err = max_rel_err(&reference, &switched);
-    assert!(
-        err < 1e-4,
-        "the switched solve must track the reference: {err:.3e}"
-    );
+    assert!(err < 1e-4, "the switched solve must track the reference: {err:.3e}");
     assert_eq!(stats.auto_switched_segments, 1, "{stats:?}");
     assert_eq!(
         stats.auto_stiff_segments, 1,
@@ -1087,26 +885,13 @@ fn disabling_the_switch_reproduces_the_segment_start_decision_bit_for_bit() {
     let (saveat, u0) = latent_grid();
     let rhs = latent_binding_rhs::<f64>(100.0, 10.0);
 
-    let pinned = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..Default::default()
-    };
+    let pinned = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
     let explicit = crate::ode::solve_ode(&rhs, &u0, (0.0, 24.0), &[], &saveat, &pinned);
 
-    let no_switch = OdeSolverOptions {
-        auto_switch: false,
-        ..loose()
-    };
+    let no_switch = OdeSolverOptions { auto_switch: false, ..loose() };
     let mut stats = OdeSolverStats::default();
-    let got = solve_ode_with_stats(
-        &rhs,
-        &u0,
-        (0.0, 24.0),
-        &[],
-        &saveat,
-        &no_switch,
-        Some(&mut stats),
-    );
+    let got =
+        solve_ode_with_stats(&rhs, &u0, (0.0, 24.0), &[], &saveat, &no_switch, Some(&mut stats));
     assert_eq!(stats.auto_switched_segments, 0, "{stats:?}");
     for (a, b) in explicit.iter().zip(&got) {
         assert_eq!(a.u, b.u, "t={}", a.t);
@@ -1121,22 +906,12 @@ fn a_benign_segment_is_never_switched() {
     let u0 = [100.0, 10.0, 0.0];
     let saveat: Vec<f64> = (1..=24).map(|h| h as f64).collect();
 
-    let pinned = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..Default::default()
-    };
+    let pinned = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
     let explicit = crate::ode::solve_ode(&rhs, &u0, (0.0, 24.0), &[], &saveat, &pinned);
 
     let mut stats = OdeSolverStats::default();
-    let auto = solve_ode_with_stats(
-        &rhs,
-        &u0,
-        (0.0, 24.0),
-        &[],
-        &saveat,
-        &loose(),
-        Some(&mut stats),
-    );
+    let auto =
+        solve_ode_with_stats(&rhs, &u0, (0.0, 24.0), &[], &saveat, &loose(), Some(&mut stats));
     assert_eq!(stats.auto_switched_segments, 0, "{stats:?}");
     assert_eq!(stats.auto_stiff_segments, 0, "{stats:?}");
     for (a, b) in explicit.iter().zip(&auto) {
@@ -1190,25 +965,15 @@ fn a_segment_that_started_stiff_is_never_demoted_mid_way() {
     );
 
     let mut stats = OdeSolverStats::default();
-    let auto = solve_ode_with_stats(
-        &rhs,
-        &u0,
-        (0.0, 24.0),
-        &[],
-        &saveat,
-        &loose(),
-        Some(&mut stats),
-    );
+    let auto =
+        solve_ode_with_stats(&rhs, &u0, (0.0, 24.0), &[], &saveat, &loose(), Some(&mut stats));
     assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
     assert_eq!(
         stats.auto_switched_segments, 0,
         "a stiff segment must not be demoted to the explicit stepper: {stats:?}"
     );
 
-    let pinned = OdeSolverOptions {
-        method: stiff_method_for(&loose()),
-        ..Default::default()
-    };
+    let pinned = OdeSolverOptions { method: stiff_method_for(&loose()), ..Default::default() };
     let stiff = crate::ode::solve_ode(&rhs, &u0, (0.0, 24.0), &[], &saveat, &pinned);
     for (a, b) in stiff.iter().zip(&auto) {
         assert_eq!(a.u, b.u, "t={}", a.t);
@@ -1231,12 +996,8 @@ fn the_event_time_driver_never_demotes_a_stiff_span() {
             other => panic!("the span must cross: {other:?}"),
         }
     };
-    let tight = |method| OdeSolverOptions {
-        method,
-        reltol: 1e-8,
-        abstol: 1e-10,
-        ..Default::default()
-    };
+    let tight =
+        |method| OdeSolverOptions { method, reltol: 1e-8, abstol: 1e-10, ..Default::default() };
     let auto = crossing(&tight(OdeMethod::Auto));
     let stiff = crossing(&tight(stiff_method_for(&tight(OdeMethod::Auto))));
     let explicit = crossing(&tight(OdeMethod::EXPLICIT_FALLBACK));
@@ -1290,10 +1051,7 @@ fn the_event_time_driver_switches_mid_span() {
     })
     .expect("the tight reference must find the crossing");
 
-    let explicit = crossing(&OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..Default::default()
-    });
+    let explicit = crossing(&OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() });
     let switched = crossing(&loose()).expect("the switched solve must find the crossing");
 
     assert!(
@@ -1325,15 +1083,7 @@ fn a_stalled_mid_segment_switch_is_discarded_and_re_solved_explicitly() {
     );
 
     let mut stats = OdeSolverStats::default();
-    solve_ode_with_stats(
-        &rhs,
-        &u0,
-        (0.0, 0.25),
-        &[],
-        &[0.25],
-        &loose(),
-        Some(&mut stats),
-    );
+    solve_ode_with_stats(&rhs, &u0, (0.0, 0.25), &[], &[0.25], &loose(), Some(&mut stats));
 
     assert_eq!(stats.auto_switched_segments, 1, "{stats:?}");
     assert_eq!(
@@ -1346,10 +1096,7 @@ fn a_stalled_mid_segment_switch_is_discarded_and_re_solved_explicitly() {
         stats.discarded_clamped_steps > 0,
         "the discarded attempt's clamps belong to it, not to the returned trajectory: {stats:?}"
     );
-    assert!(
-        stats.min_step_clamped_steps >= stats.discarded_clamped_steps,
-        "{stats:?}"
-    );
+    assert!(stats.min_step_clamped_steps >= stats.discarded_clamped_steps, "{stats:?}");
 }
 
 /// A segment that never leaves the explicit stepper is **not** guarded, even when it clamps:
@@ -1366,20 +1113,9 @@ fn an_unswitched_explicit_segment_is_not_re_solved() {
     let rhs = rotating_rhs::<f64>(200.0);
     let opts = coarse_min_dt();
     assert!(opts.auto_switch, "the arm under test needs switching on");
-    let pinned = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..coarse_min_dt()
-    };
+    let pinned = OdeSolverOptions { method: OdeMethod::Rk45, ..coarse_min_dt() };
     let mut auto_stats = OdeSolverStats::default();
-    solve_ode_with_stats(
-        &rhs,
-        &[1.0, 0.0],
-        (0.0, 1.0),
-        &[],
-        &[1.0],
-        &opts,
-        Some(&mut auto_stats),
-    );
+    solve_ode_with_stats(&rhs, &[1.0, 0.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut auto_stats));
     let mut pinned_stats = OdeSolverStats::default();
     solve_ode_with_stats(
         &rhs,
@@ -1466,11 +1202,7 @@ fn the_switch_happens_at_the_same_step_at_f64_and_at_a_dual() {
 /// into the 1e-12 floor the production default sets. That is what lets the fixtures below
 /// produce min-`dt` clamps on demand, on a chosen stepper, within a handful of steps.
 fn coarse_min_dt() -> OdeSolverOptions {
-    OdeSolverOptions {
-        min_dt: 1e-2,
-        initial_dt: 1e-2,
-        ..loose()
-    }
+    OdeSolverOptions { min_dt: 1e-2, initial_dt: 1e-2, ..loose() }
 }
 
 /// A fast **rotation**: `Re λ = 0` at every state, so the probe reads it as non-stiff however
@@ -1544,10 +1276,7 @@ fn explicit_clamps_before_a_switch_do_not_discard_the_stiff_half() {
         stats.stiff_min_step_clamped_steps, 0,
         "the stiff half integrated cleanly, so nothing here may read as a stall: {stats:?}"
     );
-    assert_eq!(
-        stats.auto_stiff_rejected, 0,
-        "a rescued segment must not be discarded: {stats:?}"
-    );
+    assert_eq!(stats.auto_stiff_rejected, 0, "a rescued segment must not be discarded: {stats:?}");
     assert_eq!(
         stats.discarded_clamped_steps, 0,
         "nothing was discarded, so no clamp belongs to a discarded trajectory: {stats:?}"
@@ -1561,10 +1290,7 @@ fn explicit_clamps_before_a_switch_do_not_discard_the_stiff_half() {
         "the kept trajectory must be the switched one (z -> 1): {:?}",
         got[0].u
     );
-    let pinned = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..coarse_min_dt()
-    };
+    let pinned = OdeSolverOptions { method: OdeMethod::Rk45, ..coarse_min_dt() };
     let explicit = crate::ode::solve_ode(&rhs, &u0, (0.0, 2.0), &[], &[2.0], &pinned);
     assert!(
         !((explicit[0].u[2] - 1.0).abs() < 1e-3),
@@ -1617,10 +1343,7 @@ fn explicit_clamps_before_a_switch_do_not_discard_a_crossing() {
         crate::ode::solver::ThresholdCrossing::Crossed(t) => t,
         other => panic!("the reference must cross: {other:?}"),
     };
-    assert!(
-        reference > 1.0,
-        "premise: the crossing must land after the switch ({reference})"
-    );
+    assert!(reference > 1.0, "premise: the crossing must land after the switch ({reference})");
 
     let mut u = u_entry;
     let crossed = match crate::ode::solve_ode_until_threshold(
@@ -1644,10 +1367,7 @@ fn explicit_clamps_before_a_switch_do_not_discard_a_crossing() {
 
     // The premise, in this driver's currency: pinned explicit, the same span does not report
     // this crossing correctly — which is what the discarding guard used to hand back.
-    let pinned = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..coarse_min_dt()
-    };
+    let pinned = OdeSolverOptions { method: OdeMethod::Rk45, ..coarse_min_dt() };
     let mut u = u_entry;
     if let crate::ode::solver::ThresholdCrossing::Crossed(t) =
         crate::ode::solve_ode_until_threshold(&rhs, &mut u, (0.0, 3.0), &[], &pinned, 3, threshold)
@@ -1672,29 +1392,15 @@ fn explicit_clamps_before_a_switch_do_not_discard_a_crossing() {
 fn the_abort_budget_starts_again_when_the_stepper_is_swapped() {
     let rhs = clamps_then_turns_stiff::<f64>();
     let u0 = [1.0, 0.0, 1.0];
-    let pinned = OdeSolverOptions {
-        method: OdeMethod::Rk45,
-        ..coarse_min_dt()
-    };
+    let pinned = OdeSolverOptions { method: OdeMethod::Rk45, ..coarse_min_dt() };
     // The explicit phase is exactly `[0, 1)`, and the switched run steps it identically, so its
     // clamp count is the budget the stiff half would inherit.
     let mut first_phase = OdeSolverStats::default();
-    solve_ode_with_stats(
-        &rhs,
-        &u0,
-        (0.0, 1.0),
-        &[],
-        &[1.0],
-        &pinned,
-        Some(&mut first_phase),
-    );
+    solve_ode_with_stats(&rhs, &u0, (0.0, 1.0), &[], &[1.0], &pinned, Some(&mut first_phase));
     let budget = u32::try_from(first_phase.min_step_clamped_steps).unwrap();
     assert!(budget > 0, "premise: the explicit phase must clamp");
 
-    let opts = OdeSolverOptions {
-        stiff_abort_after: Some(budget),
-        ..coarse_min_dt()
-    };
+    let opts = OdeSolverOptions { stiff_abort_after: Some(budget), ..coarse_min_dt() };
     let mut stats = OdeSolverStats::default();
     let got = solve_ode_with_stats(&rhs, &u0, (0.0, 2.0), &[], &[2.0], &opts, Some(&mut stats));
     assert_eq!(
@@ -1705,10 +1411,7 @@ fn the_abort_budget_starts_again_when_the_stepper_is_swapped() {
         stats.stiff_aborted_segments, 0,
         "the stiff half clamped nothing of its own, so nothing may abort it: {stats:?}"
     );
-    assert_eq!(
-        stats.auto_stiff_rejected, 0,
-        "nor may it be discarded: {stats:?}"
-    );
+    assert_eq!(stats.auto_stiff_rejected, 0, "nor may it be discarded: {stats:?}");
     assert!(
         (got[0].u[2] - 1.0).abs() < 1e-3,
         "the segment must still be integrated to the end: {:?}",
@@ -1739,12 +1442,7 @@ fn jet_overflow_rhs<T: PkNum>(k: f64) -> impl Fn(&[T], &[T], T, &mut [T]) {
 /// Tolerances loose enough to keep the fixture at a few thousand steps. The margins above
 /// are decades wide, so the verdict does not depend on the solver's accuracy here.
 fn jet_overflow_opts(method: OdeMethod) -> OdeSolverOptions {
-    OdeSolverOptions {
-        method,
-        reltol: 1e-2,
-        abstol: 1e-2,
-        ..Default::default()
-    }
+    OdeSolverOptions { method, reltol: 1e-2, abstol: 1e-2, ..Default::default() }
 }
 
 const JET_OVERFLOW_K: f64 = 1.0e6;
@@ -1853,11 +1551,7 @@ fn a_healthy_escalation_records_no_jet_rejection() {
     use crate::sens::dual2::Dual2;
     const N: usize = 2;
     let rhs = binding_rhs::<Dual2<N>>(1000.0, 20.0);
-    let u0 = [
-        Dual2::<N>::var(100.0, 0),
-        Dual2::<N>::var(10.0, 1),
-        Dual2::<N>::constant(0.0),
-    ];
+    let u0 = [Dual2::<N>::var(100.0, 0), Dual2::<N>::var(10.0, 1), Dual2::<N>::constant(0.0)];
     let mut stats = OdeSolverStats::default();
     let out = crate::ode::solver::solve_ode_g_with_stats(
         &f64_time(&rhs),

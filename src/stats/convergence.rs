@@ -124,12 +124,8 @@ pub fn effective_sample_size(chains: &[Vec<f64>]) -> f64 {
     let max_lag = n - 1;
     let mut rho = vec![0.0_f64; max_lag + 1];
     for (t, rho_t) in rho.iter_mut().enumerate() {
-        let mean_acov: f64 = chains
-            .iter()
-            .zip(&means)
-            .map(|(c, &mu)| autocov(c, t, mu))
-            .sum::<f64>()
-            / m as f64;
+        let mean_acov: f64 =
+            chains.iter().zip(&means).map(|(c, &mu)| autocov(c, t, mu)).sum::<f64>() / m as f64;
         *rho_t = 1.0 - (w - mean_acov) / var_plus;
     }
 
@@ -219,10 +215,7 @@ fn rank_normalized(chains: &[Vec<f64>]) -> Vec<Vec<f64>> {
     // Average ranks (1-based) with tie handling.
     let mut order: Vec<usize> = (0..s).collect();
     order.cold_sort_by(&|&a, &b| {
-        flat[a]
-            .2
-            .partial_cmp(&flat[b].2)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        flat[a].2.partial_cmp(&flat[b].2).unwrap_or(std::cmp::Ordering::Equal)
     });
     let mut ranks = vec![0.0_f64; s];
     let mut i = 0;
@@ -267,11 +260,7 @@ pub fn ess_tail(chains: &[Vec<f64>]) -> f64 {
     let indicator = |thresh: f64| -> Vec<Vec<f64>> {
         chains
             .iter()
-            .map(|c| {
-                c.iter()
-                    .map(|&x| if x <= thresh { 1.0 } else { 0.0 })
-                    .collect()
-            })
+            .map(|c| c.iter().map(|&x| if x <= thresh { 1.0 } else { 0.0 }).collect())
             .collect()
     };
     effective_sample_size(&indicator(q05)).min(effective_sample_size(&indicator(q95)))
@@ -286,9 +275,7 @@ mod tests {
 
     fn iid_normal_chains(m: usize, n: usize, seed: u64) -> Vec<Vec<f64>> {
         let mut rng = StdRng::seed_from_u64(seed);
-        (0..m)
-            .map(|_| (0..n).map(|_| StandardNormal.sample(&mut rng)).collect())
-            .collect()
+        (0..m).map(|_| (0..n).map(|_| StandardNormal.sample(&mut rng)).collect()).collect()
     }
 
     #[test]
@@ -340,10 +327,7 @@ mod tests {
             *x += 10.0; // shift one chain far away
         }
         let rhat = split_rhat(&chains);
-        assert!(
-            rhat > 1.5,
-            "R-hat for separated chains should be large, got {rhat}"
-        );
+        assert!(rhat > 1.5, "R-hat for separated chains should be large, got {rhat}");
     }
 
     #[test]
@@ -374,10 +358,7 @@ mod tests {
             })
             .collect();
         let ess = effective_sample_size(&[chain]);
-        assert!(
-            ess < 0.4 * n as f64,
-            "AR(1) phi=0.8 ESS should be well below {n}, got {ess}"
-        );
+        assert!(ess < 0.4 * n as f64, "AR(1) phi=0.8 ESS should be well below {n}, got {ess}");
         assert!(ess > 1.0, "ESS should stay positive, got {ess}");
     }
 
@@ -398,10 +379,7 @@ mod tests {
         let chains = iid_normal_chains(m, n, 2024);
         let bulk = ess_bulk(&chains);
         let total = (m * n) as f64;
-        assert!(
-            bulk > 0.6 * total && bulk <= total,
-            "iid bulk-ESS near total {total}, got {bulk}"
-        );
+        assert!(bulk > 0.6 * total && bulk <= total, "iid bulk-ESS near total {total}, got {bulk}");
     }
 
     #[test]
@@ -411,10 +389,7 @@ mod tests {
         let tail = ess_tail(&chains);
         let total = (m * n) as f64;
         // Tail-ESS is a valid ESS: positive and not above the draw count.
-        assert!(
-            tail > 1.0 && tail <= total + 1.0,
-            "tail-ESS out of range: {tail}"
-        );
+        assert!(tail > 1.0 && tail <= total + 1.0, "tail-ESS out of range: {tail}");
     }
 
     #[test]
@@ -432,10 +407,7 @@ mod tests {
             })
             .collect();
         let tail = ess_tail(&[chain]);
-        assert!(
-            tail < 0.5 * n as f64,
-            "AR(1) tail-ESS should be reduced, got {tail}"
-        );
+        assert!(tail < 0.5 * n as f64, "AR(1) tail-ESS should be reduced, got {tail}");
         assert!(tail > 1.0);
     }
 }

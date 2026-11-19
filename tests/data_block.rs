@@ -41,11 +41,7 @@ fn write_model_and_data(dir: &Path, with_data_block: bool) -> std::path::PathBuf
     let csv_src = Path::new("data/one_cpt_iv.csv");
     std::fs::copy(csv_src, dir.join("data.csv")).expect("copy one_cpt_iv.csv");
 
-    let data_block = if with_data_block {
-        "[data]\n  path = data.csv\n"
-    } else {
-        ""
-    };
+    let data_block = if with_data_block { "[data]\n  path = data.csv\n" } else { "" };
     let model_src = MODEL_TEMPLATE.replace("{data}", data_block);
     let model_path = dir.join("m.ferx");
     std::fs::write(&model_path, model_src).expect("write model file");
@@ -64,10 +60,7 @@ fn fit_falls_back_to_model_declared_data_path_when_none_given() {
         "no override happened, so no override warning expected: {:?}",
         result.warnings
     );
-    assert_eq!(
-        result.data_path.as_deref(),
-        Some(dir.path().join("data.csv").to_str().unwrap())
-    );
+    assert_eq!(result.data_path.as_deref(), Some(dir.path().join("data.csv").to_str().unwrap()));
 }
 
 #[test]
@@ -78,10 +71,7 @@ fn fit_without_data_anywhere_errors_clearly() {
     let err = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
         .expect_err("no [data] block and no external path must error")
         .to_string();
-    assert!(
-        err.contains("no dataset specified"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("no dataset specified"), "unexpected error: {err}");
 }
 
 #[test]
@@ -101,15 +91,9 @@ fn fit_explicit_data_path_overrides_model_declared_path_with_warning() {
     )
     .expect("fit should succeed using the overriding --data path");
 
-    assert_eq!(
-        result.data_path.as_deref(),
-        Some(override_path.to_str().unwrap())
-    );
+    assert_eq!(result.data_path.as_deref(), Some(override_path.to_str().unwrap()));
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("overridden") && w.contains("override.csv")),
+        result.warnings.iter().any(|w| w.contains("overridden") && w.contains("override.csv")),
         "expected an override warning, got: {:?}",
         result.warnings
     );
@@ -151,11 +135,7 @@ fn fit_reads_dataset_through_data_block_column_mapping() {
 
     // The mapping fed the response into DV: a non-trivial objective was formed
     // over real observations (would be empty/NaN if CONC never became DV).
-    let n_obs: usize = population
-        .subjects
-        .iter()
-        .map(|s| s.observations.len())
-        .sum();
+    let n_obs: usize = population.subjects.iter().map(|s| s.observations.len()).sum();
     assert!(n_obs > 0, "mapped dataset should yield observations");
     assert!(result.ofv.is_finite());
     // The renamed headers must not have leaked in as covariates.
@@ -174,10 +154,7 @@ fn fit_renames_arbitrary_covariate_column_through_data_block() {
     let mut lines = src.lines();
     let header = format!("{},wgt", lines.next().expect("header"));
     let body: Vec<String> = lines.map(|l| format!("{l},70")).collect();
-    let out = std::iter::once(header)
-        .chain(body)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let out = std::iter::once(header).chain(body).collect::<Vec<_>>().join("\n");
     std::fs::write(dir.path().join("cov.csv"), out).expect("write cov csv");
 
     let data_block = "[data]\n  path = cov.csv\n  WT = wgt\n";
@@ -206,10 +183,7 @@ fn fit_errors_when_mapped_column_absent_from_dataset() {
     let err = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
         .expect_err("mapping to an absent column must error")
         .to_string();
-    assert!(
-        err.contains("mapped column `NOPE`"),
-        "unexpected error: {err}"
-    );
+    assert!(err.contains("mapped column `NOPE`"), "unexpected error: {err}");
 }
 
 #[test]
@@ -218,10 +192,7 @@ fn check_uses_model_declared_data_path_when_no_data_flag_given() {
     let model_path = write_model_and_data(dir.path(), true);
 
     let report = validate_model_file(model_path.to_str().unwrap(), None);
-    assert_eq!(
-        report.data.as_deref(),
-        Some(dir.path().join("data.csv").to_str().unwrap())
-    );
+    assert_eq!(report.data.as_deref(), Some(dir.path().join("data.csv").to_str().unwrap()));
     assert!(
         report.diagnostics.iter().all(|d| d.code != "E_PARSE"),
         "model + declared data must parse and read cleanly: {:?}",
@@ -236,19 +207,11 @@ fn check_explicit_data_flag_overrides_model_declared_path_with_warning() {
     let override_path = dir.path().join("override.csv");
     std::fs::copy("data/one_cpt_iv.csv", &override_path).expect("copy override csv");
 
-    let report = validate_model_file(
-        model_path.to_str().unwrap(),
-        Some(override_path.to_str().unwrap()),
-    );
-    assert_eq!(
-        report.data.as_deref(),
-        Some(override_path.to_str().unwrap())
-    );
+    let report =
+        validate_model_file(model_path.to_str().unwrap(), Some(override_path.to_str().unwrap()));
+    assert_eq!(report.data.as_deref(), Some(override_path.to_str().unwrap()));
     assert!(
-        report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "W_DATA_PATH_OVERRIDE"),
+        report.diagnostics.iter().any(|d| d.code == "W_DATA_PATH_OVERRIDE"),
         "expected a W_DATA_PATH_OVERRIDE diagnostic: {:?}",
         report.diagnostics
     );
@@ -275,31 +238,17 @@ fn data_block_without_path_uses_caller_data_through_its_column_map() {
     assert_eq!(parsed.data_path, None);
     assert_eq!(
         parsed.column_map,
-        vec![
-            ("TIME".to_string(), "TAFD".to_string()),
-            ("DV".to_string(), "CONC".to_string()),
-        ]
+        vec![("TIME".to_string(), "TAFD".to_string()), ("DV".to_string(), "CONC".to_string()),]
     );
 
-    let (result, population) = run_model_with_data_inits(
-        model_path.to_str().unwrap(),
-        Some(csv.to_str().unwrap()),
-        None,
-    )
-    .expect("fit should read the caller's data through the [data] column map");
-    let n_obs: usize = population
-        .subjects
-        .iter()
-        .map(|s| s.observations.len())
-        .sum();
+    let (result, population) =
+        run_model_with_data_inits(model_path.to_str().unwrap(), Some(csv.to_str().unwrap()), None)
+            .expect("fit should read the caller's data through the [data] column map");
+    let n_obs: usize = population.subjects.iter().map(|s| s.observations.len()).sum();
     assert!(n_obs > 0, "mapped dataset should yield observations");
     assert!(result.ofv.is_finite());
     // Only one path was given, so there is nothing to override.
-    assert!(
-        result.warnings.iter().all(|w| !w.contains("overridden")),
-        "{:?}",
-        result.warnings
-    );
+    assert!(result.warnings.iter().all(|w| !w.contains("overridden")), "{:?}", result.warnings);
     assert_eq!(result.data_path.as_deref(), Some(csv.to_str().unwrap()));
 }
 

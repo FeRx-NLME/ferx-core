@@ -49,11 +49,7 @@ fn load() -> (CompiledModel, FitOptions, Population) {
 /// `method_specific_keys` list) and the "not applied" one (reserved for non-FOCE
 /// final stages).
 fn regularization_warnings(result: &ferx_core::types::FitResult) -> Vec<&String> {
-    result
-        .warnings
-        .iter()
-        .filter(|w| w.contains("nn_l2") || w.contains("nn_smooth"))
-        .collect()
+    result.warnings.iter().filter(|w| w.contains("nn_l2") || w.contains("nn_smooth")).collect()
 }
 
 /// A couple of outer iterations with both penalties on — proves the optimizer
@@ -68,11 +64,7 @@ fn fit_with_regularization_runs() {
     options.nn_smooth_lambda = 5e-2;
     let result = fit(&model, &population, &model.default_params, &options)
         .expect("regularized fit returns Ok");
-    assert!(
-        result.ofv.is_finite(),
-        "regularized fit OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "regularized fit OFV must be finite, got {}", result.ofv);
     assert!(
         regularization_warnings(&result).is_empty(),
         "a regularized FOCEI fit must not warn about nn_l2/nn_smooth: {:?}",
@@ -92,11 +84,7 @@ fn fit_with_regularization_runs_under_gn() {
     options.nn_smooth_lambda = 5e-2;
     let result = fit(&model, &population, &model.default_params, &options)
         .expect("regularized GN fit returns Ok");
-    assert!(
-        result.ofv.is_finite(),
-        "GN OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "GN OFV must be finite, got {}", result.ofv);
     assert!(
         regularization_warnings(&result).is_empty(),
         "a regularized GN fit must not warn about nn_l2/nn_smooth: {:?}",

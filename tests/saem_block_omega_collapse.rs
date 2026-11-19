@@ -84,11 +84,7 @@ fn true_omega() -> OmegaMatrix {
     set(&mut m, 0, 1, TRUE_CORR_CL_V1);
     set(&mut m, 0, 2, TRUE_CORR_CL_V2);
     set(&mut m, 1, 2, TRUE_CORR_V1_V2);
-    OmegaMatrix::from_matrix(
-        m,
-        vec!["ETA_CL".into(), "ETA_V1".into(), "ETA_V2".into()],
-        false,
-    )
+    OmegaMatrix::from_matrix(m, vec!["ETA_CL".into(), "ETA_V1".into(), "ETA_V2".into()], false)
 }
 
 /// Build a synthetic population: `n` subjects, one 2 h IV infusion each, with a
@@ -167,10 +163,7 @@ fn assert_no_rank1_collapse(kernel: ferx_core::types::SaemKernel, label: &str) {
 
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("saem_kernel = imh requested")),
+        !result.warnings.iter().any(|w| w.contains("saem_kernel = imh requested")),
         "[{label}] the IMH kernel was declined, so this arm re-ran the random walk: {:?}",
         result.warnings
     );
@@ -220,10 +213,7 @@ fn assert_no_rank1_collapse(kernel: ferx_core::types::SaemKernel, label: &str) {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_block_omega_does_not_collapse_to_rank1() {
     assert_no_rank1_collapse(ferx_core::types::SaemKernel::RandomWalk, "rw");
 }
@@ -233,10 +223,7 @@ fn saem_block_omega_does_not_collapse_to_rank1() {
 /// componentwise sweep is the anti-collapse device — so this is the test that
 /// would catch a future change that let the IMH proposal stand in for it.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_block_omega_does_not_collapse_to_rank1_under_imh() {
     assert_no_rank1_collapse(ferx_core::types::SaemKernel::Imh, "imh");
 }
