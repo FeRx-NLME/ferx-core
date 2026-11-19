@@ -6216,6 +6216,80 @@ fn the_terminal_jacobian_from_the_last_gradient_is_the_fresh_one() {
     }
 }
 
+/// The light seed's rows serve the terminal Jacobian too. A seeded warm solve takes its first
+/// gradient fused from the seed, whose recording at the start is the one `ebe_h_matrix`
+/// would repeat. When the solve returns that start (the warm start is already a mode),
+/// `find_ebe` must build `H` from those rows, not record the subject again, and the matrix is
+/// the fresh one bit for bit. On warfarin, every subject re-solved from its own mode at a
+/// looser tolerance returns its start. Before the fix the seed cleared the held key, and
+/// each of these solves recorded a second Jacobian. Mutation: clear the key after a fused
+/// seed → `fresh_jacobians` lists every subject.
+#[test]
+fn a_seeded_warm_solve_that_returns_its_start_reuses_the_seeds_rows() {
+    let prep =
+        crate::prepare_run("examples/warfarin.ferx", Some("data/warfarin.csv")).expect("prepare");
+    let (model, pop, params) = (prep.parsed.model, prep.population, prep.init_params);
+    let modes: Vec<DVector<f64>> = pop
+        .subjects
+        .iter()
+        .map(|s| find_ebe(&model, s, &params, 200, 1e-10, None, None, 0).eta)
+        .collect();
+    let policy = InnerSolvePolicy {
+        seed: InnerHessianSeed::GaussNewton,
+        init_is_warm: true,
+        ..InnerSolvePolicy::default()
+    };
+    let (results, rec) = record_inner_solves(|| {
+        pop.subjects
+            .iter()
+            .zip(&modes)
+            .map(|(s, m)| {
+                find_ebe_impl(
+                    &model,
+                    s,
+                    &params,
+                    200,
+                    1e-5,
+                    Some(m.as_slice()),
+                    None,
+                    0,
+                    None,
+                    policy,
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for ((s, m), r) in pop.subjects.iter().zip(&modes).zip(&results) {
+        assert_eq!(
+            bits(r.eta.as_slice()),
+            bits(m.as_slice()),
+            "premise: subject {} returns its start",
+            s.id
+        );
+        let fresh = ebe_h_matrix(
+            &model,
+            s,
+            &params,
+            r.eta.as_slice(),
+            None,
+            &mut pk::EventPkParams::default(),
+            None,
+        );
+        assert_eq!(
+            bits(r.h_matrix.as_slice()),
+            bits(fresh.as_slice()),
+            "subject {}: the held rows are the fresh Jacobian",
+            s.id
+        );
+    }
+    assert!(
+        rec.fresh_jacobians.is_empty(),
+        "recorded the Jacobian again for {:?}",
+        rec.fresh_jacobians
+    );
+}
+
 /// A predicted start whose objective is undefined starts at the mode it was predicted from,
 /// and a solve that fails outright is retried there (#2549 review r2 #3): the two decisions,
 /// on every kind of value the objective can report. A usable start is kept and a usable end
