@@ -687,8 +687,7 @@ pub(crate) fn admissible_values(p: &ModelParameters) -> bool {
 ///
 /// Out-of-bounds or invalid draws are rejected and resampled, up to
 /// `10 * n_draws` total attempts.
-#[cfg(test)]
-pub(crate) fn draw_parameter_samples(
+pub fn draw_parameter_samples(
     fit_result: &FitResult, template: &ModelParameters, n_draws: usize, method: UncertaintyMethod,
     rng: &mut impl Rng,
 ) -> Result<Vec<ModelParameters>, String> {

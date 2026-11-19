@@ -2143,6 +2143,8 @@ pub fn run_bayes(
         total_ebe_nm_polished: ebe_stats.n_nm_polished as u32,
         bayes: Some(bayes),
         mixture_posteriors,
+        // No covariance matrix or method: a Bayesian fit reports posterior credible intervals,
+        // never a Hessian covariance, so there is no estimator to name (#1382).
         ..OuterResult::from_params(mean_params)
     })
 }

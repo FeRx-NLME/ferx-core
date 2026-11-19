@@ -4770,8 +4770,7 @@ pub(crate) fn check_survival_tv_covariates(
 /// `draw_ode_tte_latent`, which that entry point never calls.
 ///
 /// **Not a complete guard on the low-level public surface**, as for #741:
-/// `stats::likelihood::individual_nll*` and `survival::simulate_tte` are `pub` and reach the frozen
-/// snapshot directly; a model-level walk inside `individual_nll` would run millions of times. Widening
+/// `stats::likelihood::individual_nll*` is `pub` and reaches the frozen snapshot directly; a model-level walk inside `individual_nll` would run millions of times. Widening
 /// the guard there is one decision for both checks (#1926).
 ///
 /// **One gate, not two.** A `compiled_model_uses_time_builtin` fast exit in front of the loop would

@@ -17,7 +17,7 @@
 //! That split is what keeps the methods at parity: a consumer written against a driver gets
 //! every method, and a method implementing `Stepper` gets every consumer. The two live
 //! drivers are `integrate_dense_g` (saves + in-step reads; behind [`solve_ode`],
-//! `solve_ode_dense` and [`solve_ode_g`]) and `solve_ode_until_threshold` (event-time
+//! `solve_ode_dense` and [`solve_ode_g`]) and [`solve_ode_until_threshold`] (event-time
 //! root-finding). `make_stepper` is the single place a method name selects an implementation.
 
 use crate::sens::num::NonRecRead;
@@ -620,7 +620,7 @@ pub struct OdeSolverStats {
     /// half for anyone who needs it.
     ///
     /// Zero under every explicitly-named `ode_method`, so a non-zero value means `auto` was
-    /// asked and escalated. It is a floor, not a total: `solve_ode_until_threshold` takes no
+    /// asked and escalated. It is a floor, not a total: [`solve_ode_until_threshold`] takes no
     /// stats, so escalations on the event-time path (TTE / adaptive dosing) are not counted
     /// here.
     pub auto_stiff_segments: usize,
@@ -669,7 +669,7 @@ pub struct OdeSolverStats {
     /// counter is the honest "both attempts failed" signal that makes that otherwise-silent
     /// outcome visible in the fit's `ode_solver` warning (#1080).
     ///
-    /// Like every other `auto` counter it is a floor, not a total: `solve_ode_until_threshold`
+    /// Like every other `auto` counter it is a floor, not a total: [`solve_ode_until_threshold`]
     /// takes no stats, so a failure on the event-time path (TTE / adaptive dosing) is not
     /// counted here and a zero is not by itself proof that every solve in the fit was clean.
     pub auto_fallback_failed: usize,
@@ -686,7 +686,7 @@ pub struct OdeSolverStats {
     /// only fires while `t < tf`), as is every segment that stopped because its stepper could not form
     /// a step at `min_dt`. Do not add this to those counters; the fit's `ode_solver` warning subtracts
     /// the abandoned ones first so its clauses stay disjoint. What is left is dominated by segments
-    /// that exhausted [`OdeSolverOptions::max_steps`]. A floor, not a total: `solve_ode_until_threshold`
+    /// that exhausted [`OdeSolverOptions::max_steps`]. A floor, not a total: [`solve_ode_until_threshold`]
     /// takes no stats, so event-time segments (TTE / adaptive dosing) are not counted.
     pub unfinished_segments: usize,
     /// Integrations abandoned early because their min-`dt` clamps crossed
@@ -774,7 +774,7 @@ pub struct OdeSolverStats {
     /// solver advice when every damaged segment is one of these. Non-zero means some
     /// predictions are `NaN` by construction; check the `[odes]` right-hand side and the
     /// parameter values. Like the other step counters it is a floor:
-    /// `solve_ode_until_threshold` takes no stats.
+    /// [`solve_ode_until_threshold`] takes no stats.
     pub diverged_segments: usize,
     /// Segments of a model on the exact linear path ([`OdeMethod::Linear`], #852) that the
     /// matrix-exponential propagator **declined** and that were integrated instead — its
@@ -2760,7 +2760,7 @@ pub(crate) fn solve_ode_dense_with_auto_state(
     (to_points(hard), to_points(soft))
 }
 
-/// Outcome of `solve_ode_until_threshold` over a single integration span.
+/// Outcome of [`solve_ode_until_threshold`] over a single integration span.
 ///
 /// This is the **segment-level** primitive behind the TTE event-time sampler
 /// (plan §8.8.3): the simulation entry point drives it once per dose segment
@@ -2804,7 +2804,7 @@ pub fn solve_ode_until_threshold(
     solve_ode_until_threshold_labelled(rhs, u, t_span, params, opts, monitor, threshold, None)
 }
 
-/// `solve_ode_until_threshold` with display labels for the states, used in a `Failed`
+/// [`solve_ode_until_threshold`] with display labels for the states, used in a `Failed`
 /// message in place of the bare 0-based index (#2087). `labels[k]` is printed as given, so the
 /// caller decides the rendering (a backticked `[odes]` name, or a phrase for an injected
 /// accumulator). `None` is the public driver, byte for byte.

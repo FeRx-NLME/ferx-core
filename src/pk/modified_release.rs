@@ -947,8 +947,9 @@ fn verify_against_twin(
     // while still catching #1124 (5.8e-1) by ~12×; a false positive panics a debug build, so
     // headroom is deliberately on that side. The floor keeps the bound meaningful for a model
     // that pins tolerances very tight. At the default `reltol = 1e-4` the bound is `0.05`, so
-    // only gross disagreement is caught (#1124 was 1.4e-1 at `t = 4.4` and 2.2e-4 at `t = 0.5`):
-    // a backstop against a structurally wrong closed form, not an accuracy guarantee.
+    // only gross disagreement is caught: #1124 was 1.4e-1 at `t = 4.4` and 2.2e-4 at `t = 0.5`,
+    // i.e. under the default bound at the early times. A backstop against a structurally wrong
+    // closed form, not an accuracy guarantee.
     //
     // Once per key (see `MrVerifyKey`), claimed *before* the integration; the claim releases
     // itself (including on unwind) unless the comparison below settles it.

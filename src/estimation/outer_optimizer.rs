@@ -7960,6 +7960,8 @@ fn optimize_nlopt_attempt_probed(
         // verified stop and a stagnation latch on the last permitted eval have each had their
         // say above, so it is the same fact the "increase maxiter" warning is gated on.
         eval_budget_spent: max_eval_reached,
+        // `stationary_start` stays false: set by `settle_start_probe` on the probe's result, never
+        // on an attempt's own.
         ..OuterResult::from_params(final_params)
     };
     (

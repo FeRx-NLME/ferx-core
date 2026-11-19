@@ -955,6 +955,9 @@ pub fn run_foce_gn(
         // reused by `run_covariance` for a bit-for-bit covariance (#816 follow-up).
         packed_estimate: Some(final_packed),
         newton_decrement,
+        // `eval_budget_spent` stays false: the hybrid's estimate is the FOCEI polish's or the GN
+        // phase's; the polish runs its own fixed 100-evaluation budget, not the user's `maxiter`,
+        // so neither half's budget is the fit's to report (#2799).
         ..OuterResult::from_params(final_params)
     }
 }
@@ -4387,8 +4390,6 @@ mod tests {
         );
     }
 
-    // ── IOV analytical gradient tests ─────────────────────────────────────
-
     /// Central-difference check of a packed gradient `grad` at `x` against
     /// `subject_nll_at` for subject 0 at fixed `eta_hat` / `h_matrix`: coordinate `j` is
     /// stepped by `eps·(1 + |x_j|)` each way and must agree within `rtol·(1 + |FD_j|)`.
@@ -4419,6 +4420,8 @@ mod tests {
             );
         }
     }
+
+    // ── IOV analytical gradient tests ─────────────────────────────────────
 
     fn make_iov_model_gn() -> CompiledModel {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);

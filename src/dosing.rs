@@ -797,7 +797,8 @@ mod ss_warn_tests {
 }
 
 /// Whether `d` is a usable infusion. `is_infusion()` only checks `rate > 0`; a degenerate row
-/// with `duration <= 0` or NaN would break the break-time sort, so it falls back to a bolus.
+/// with `duration <= 0` or NaN would break the break-time sort, so it falls back to a bolus (a
+/// zero/negative bolus update — visible, not silently dropped).
 pub(crate) fn is_real_infusion(d: &DoseEvent) -> bool {
     // Tripwire (#324): modeled-RATE doses must be resolved before any infusion logic.
     debug_assert!(d.is_fixed(), "is_real_infusion: unresolved modeled dose");

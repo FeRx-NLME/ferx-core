@@ -1248,7 +1248,6 @@ pub(crate) fn evaluate_final_marginal(
 /// Give a direct [`run_imp`] / [`run_impmap`] caller the settling verdict `fit()` gives
 /// its stages (#2686), which needs the final marginal a stage does not compute. If the
 /// marginal fails, the falling-floor test still runs and a warning says so.
-#[cfg(test)]
 fn apply_settling_verdict(
     mut result: OuterResult, model: &CompiledModel, population: &Population, options: &FitOptions,
     method: EstimationMethod,
@@ -1275,8 +1274,7 @@ fn apply_settling_verdict(
 /// supplied, seed the first MAP inner loop; otherwise it cold-starts from η = 0.
 ///
 /// `converged` includes the settling verdict, so this also scores the final marginal.
-#[cfg(test)]
-pub(crate) fn run_impmap(
+pub fn run_impmap(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     warm_etas: Option<&[DVector<f64>]>, options: &FitOptions,
 ) -> Result<OuterResult, String> {
@@ -1321,8 +1319,7 @@ pub(crate) fn run_impmap_stage(
 /// evaluation-only `imp_eval_only` path lives in `importance_sampling.rs`.
 ///
 /// `converged` includes the settling verdict, so this also scores the final marginal.
-#[cfg(test)]
-pub(crate) fn run_imp(
+pub fn run_imp(
     model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     warm_etas: Option<&[DVector<f64>]>, options: &FitOptions,
 ) -> Result<OuterResult, String> {

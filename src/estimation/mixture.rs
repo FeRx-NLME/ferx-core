@@ -496,8 +496,7 @@ pub(crate) fn mixture_ofv_with_modes(
 /// mixture is served exactly like any other. The fit itself holds the modes already and
 /// calls `mixture_gradient_with_modes` directly. `None` only when
 /// `mixture_gradient_with_modes` declines.
-#[cfg(test)]
-pub(crate) fn mixture_gradient(
+pub fn mixture_gradient(
     model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
     eval: &MixtureEval,
 ) -> Option<Vec<f64>> {

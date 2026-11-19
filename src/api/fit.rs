@@ -2449,6 +2449,8 @@ fn fit_inner(
                         h_matrices,
                         kappas,
                         warnings: gate_warning.into_iter().collect(),
+                        // No covariance step on an evaluation-only stage, so no estimator to name (#1382).
+                        // No covariance step on an evaluation-only stage, so no estimator to name (#1382).
                         ..crate::estimation::outer_optimizer::OuterResult::from_params(
                             stage_params.clone(),
                         )
