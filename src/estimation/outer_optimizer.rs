@@ -444,7 +444,18 @@ pub fn optimize_population(
                 options,
                 first_eval_etas,
             );
-            let budget = options.outer_maxiter.saturating_sub(result.n_iterations);
+            // A start with no feasible objective (#1617) already carries its verdict; the
+            // #2506 probe asks whether an unmoved *feasible* start is an optimum, and a rerun
+            // from its perturbation would only repeat the infeasible solve.
+            let budget = if result
+                .warnings
+                .iter()
+                .any(|w| w.starts_with(NO_FEASIBLE_EVAL_TOKEN))
+            {
+                0
+            } else {
+                options.outer_maxiter.saturating_sub(result.n_iterations)
+            };
             verify_unmoved_start(
                 model,
                 population,

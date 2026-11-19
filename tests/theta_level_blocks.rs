@@ -1788,7 +1788,9 @@ fn shifted_study_data() -> String {
 ///
 /// Oracle: on this well-identified block the SIR 95% interval agrees with the
 /// covariance step's Wald interval `θ̂ ± 1.96·SE`. The bound is measured, see
-/// `SIR_WALD_TOL`.
+/// `SIR_WALD_TOL`. Both intervals are an optimum's, so the fit runs to convergence:
+/// `maxiter = 4` was converged on L-BFGS's evaluation budget, but is four steps of the
+/// `trust_region` `auto` has taken since #2976.
 #[test]
 fn in_fit_sir_resamples_a_negative_bounded_level_block() {
     let model = r#"
@@ -1811,7 +1813,7 @@ fn in_fit_sir_resamples_a_negative_bounded_level_block() {
 
 [fit_options]
   method        = focei
-  maxiter       = 4
+  maxiter       = 100
   covariance    = true
   sir           = true
   sir_samples   = 4000

@@ -4,7 +4,8 @@ use crate::estimation::inner_optimizer::{
     run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy, PrevEtas,
 };
 use crate::estimation::outer_optimizer::{
-    final_ebe_check, gate_converged_on_objective, pop_nll_opts, score_final_ebes, OuterResult,
+    ebe_guard_rejects, final_ebe_check, gate_converged_on_objective, pop_nll_opts,
+    score_final_ebes, OuterResult,
 };
 use crate::estimation::parameterization::{
     clamp_to_bounds, compute_mu_k, pack_with_bounds, unpack_params, PackedBounds, PackedStart,
@@ -43,6 +44,25 @@ struct FoceiProblem<'a> {
     /// Parameter priors (#254). Same contract as `nn_reg`: in the optimizer
     /// objective, gradient and Hessian; out of the reported OFV.
     priors: crate::estimation::priors::PriorSet,
+    /// The evaluation trace the EBE convergence guard reads (#1617): every objective the
+    /// trust region scores goes through [`ebe_guard_rejects`], as the NLopt objective does.
+    feasibility: std::sync::Mutex<TrFeasibility>,
+    /// Per packed coordinate, the largest `√|B_aa|` any leg's model gave it (`0` where none
+    /// did): the curvature units Moré's scaling measures steps in, and the units the
+    /// `left_init` escape test (#751) reads a move in, as NLopt reads it in its curvature-scaled
+    /// space (#2975).
+    curvature_scale: std::sync::Mutex<Vec<f64>>,
+}
+
+/// Per-evaluation tallies of the trust region's objective, for the #1617 verdict
+/// ([`crate::estimation::outer_optimizer::no_feasible_eval_warning`]) and the published
+/// `max_unconverged_subjects`.
+#[derive(Debug, Default, Clone, Copy)]
+struct TrFeasibility {
+    feasible: usize,
+    guard_rejected: usize,
+    nonfinite: usize,
+    max_unconverged: usize,
 }
 
 /// The trust region (#2975): PORT's model/trust-region method (the `DMNGB` family behind R's
@@ -86,11 +106,15 @@ fn exact_trust_region(
         .collect();
     let n_subj = population.subjects.len();
     // The inner solve at `x` from `warm` (η̂, then each κ̂ cell): the penalized objective and the
-    // modes.
-    let eval = |x: &[f64], warm: &[DVector<f64>]| {
+    // modes. `prev` says what `warm` is (#2076): the start's cache kind for the first
+    // evaluation (the pre-flight's converged modes are taken as modes, not re-scanned), the
+    // modes of an earlier pass for every trial after it. A point the EBE convergence guard
+    // rejects, or whose objective is not finite, scores `1e20`, so its step is refused, as
+    // the NLopt objective refuses it (#1617).
+    let eval = |x: &[f64], warm: &[DVector<f64>], prev: PrevEtas| {
         let params = unpack_params(x, problem.init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let (etas, hms, _, kappas, _) = run_inner_loop_warm_map(
+        let (etas, hms, stats, kappas, _) = run_inner_loop_warm_map(
             model,
             population,
             &params,
@@ -104,15 +128,26 @@ fn exact_trust_region(
                 seed: InnerHessianSeed::for_options(options),
                 ..InnerSolvePolicy::for_stage(options, model)
             }
-            .with_prev_etas(PrevEtas::Solved),
+            .with_prev_etas(prev),
             None,
             |_, _| (),
         );
         let nll = pop_nll_opts(model, population, &params, &etas, &hms, &kappas, options);
         let raw =
             2.0 * nll + problem.nn_reg.penalty_value(&params.theta) + problem.priors.penalty(x);
-        let f = if raw.is_finite() { raw } else { 1e20 };
-        (f, etas, hms, kappas)
+        let mut tally = problem.feasibility.lock().unwrap();
+        tally.max_unconverged = tally.max_unconverged.max(stats.n_unconverged);
+        let f = if !raw.is_finite() {
+            tally.nonfinite += 1;
+            1e20
+        } else if ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac) {
+            tally.guard_rejected += 1;
+            1e20
+        } else {
+            tally.feasible += 1;
+            raw
+        };
+        (f, etas, hms, kappas, stats, raw)
     };
     let mut x = x0.to_vec();
     let start_warm = problem.cached_etas.lock().unwrap().clone();
@@ -121,7 +156,39 @@ fn exact_trust_region(
     } else {
         vec![DVector::zeros(model.n_eta); n_subj]
     };
-    let (mut f, mut etas, mut hms, mut kappas) = eval(&x, &start_warm);
+    let start_kind = std::mem::replace(
+        &mut *problem.cached_etas_kind.lock().unwrap(),
+        PrevEtas::Solved,
+    );
+    let (mut f, mut etas, mut hms, mut kappas, start_stats, start_raw) =
+        eval(&x, &start_warm, start_kind);
+    // #2682, on the NLopt leg's rule: a start the guard rejects on its *fraction* of
+    // unconverged subjects is solved once more, warm from the EBEs it just found, before it is
+    // judged; at the start there is no incumbent's modes to warm-start from, and a second pass
+    // gives the unconverged subjects that budget. Kept only if the guard then accepts it.
+    if crate::estimation::outer_optimizer::wants_start_warm_rescore(
+        &start_stats,
+        n_subj,
+        start_raw,
+        options.max_unconverged_frac,
+    ) {
+        let rewarm = joint_warm_starts(&etas, &kappas);
+        let (f2, e2, h2, k2, _, _) = eval(&x, &rewarm, PrevEtas::Solved);
+        if f2 < 1e20 {
+            (f, etas, hms, kappas) = (f2, e2, h2, k2);
+        }
+    }
+    if f >= 1e20 {
+        // The start is infeasible (#1617): there is no objective to model or to improve on,
+        // and a step from it would rank a guard value against a guard value. Stop here, not
+        // converged; the caller reports the start with the no-feasible-evaluation verdict.
+        let held = HeldEbes {
+            etas,
+            h_mats: hms,
+            kappas,
+        };
+        return (false, x, 0, None, held, f, f);
+    }
     let f_start = f;
     let mut radius = 1.0_f64;
     let mut d_scale = vec![0.0_f64; axes.len()];
@@ -135,7 +202,9 @@ fn exact_trust_region(
     // is so short that the model's own error (third order in it) is negligible, and this is the
     // objective's evaluation noise at the incumbent, measured.
     let mut last_mismatch = f64::NAN;
-    let mut last_decrement = f64::INFINITY;
+    let mut last_decrement: f64;
+    // The first radius is set from the seed model's own Newton step (below).
+    let mut radius_set = false;
     let mut prev_free: Option<Vec<usize>> = None;
     let mut n_exact = 0usize;
     let mut converged = false;
@@ -144,10 +213,27 @@ fn exact_trust_region(
     let at = |b: f64, v: f64| b.is_finite() && (v - b).abs() <= 1e-10 * (1.0 + b.abs());
     // The #2974 rows' gradient along `axes` at `x`, from `x`'s own modes: where the exact
     // adjoint gradient is out of scope (non-IOV only; the rows carry no κ̂).
-    let rows_gradient = |x: &[f64], etas: &[DVector<f64>]| -> Vec<f64> {
-        *problem.cached_etas.lock().unwrap() = etas.to_vec();
-        let g = problem.data_gradient(x);
-        axes.iter().map(|&k| g[k]).collect()
+    // The gradient that goes with the FD twin of the exact Hessian, of the objective the fit
+    // scores: the #2974 rows' total derivative of the FOCE/FOCEI marginal, and otherwise (IOV,
+    // or a quadrature objective, which the rows do not differentiate) the reconverged central
+    // difference of `pop_nll_opts`, which re-solves the EBEs and κ̂ at every probe.
+    let rows_gradient = |x: &[f64], etas: &[DVector<f64>], kappas: &[Vec<DVector<f64>>]| {
+        let g = if model.n_kappa == 0 && options.agq_nodes().is_none() {
+            *problem.cached_etas.lock().unwrap() = etas.to_vec();
+            problem.data_gradient(x)
+        } else {
+            crate::estimation::outer_optimizer::reconverged_fd_gradient(
+                x,
+                problem.init_params,
+                model,
+                population,
+                etas,
+                kappas,
+                bounds,
+                options,
+            )
+        };
+        axes.iter().map(|&k| g[k]).collect::<Vec<f64>>()
     };
     for it in 0..options.outer_maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
@@ -183,7 +269,7 @@ fn exact_trust_region(
                         options,
                         &axes,
                     )
-                    .or_else(|| (model.n_kappa == 0).then(|| rows_gradient(&x, &etas)))?,
+                    .unwrap_or_else(|| rows_gradient(&x, &etas, &kappas)),
                 };
                 let mut b = b.clone();
                 if let Some((xl, gl)) = last.as_ref().filter(|(xl, _)| *xl != x) {
@@ -213,7 +299,7 @@ fn exact_trust_region(
                     Ok(gh) => gh,
                     // Out of the exact scope: the same model from the finite-difference
                     // Hessian of the same objective, and the #2974 rows' gradient.
-                    Err(ExactDecline::OutOfScope) if model.n_kappa == 0 => {
+                    Err(ExactDecline::OutOfScope) => {
                         let Some(h) = fd_candidate_hessian(
                             model,
                             population,
@@ -228,7 +314,7 @@ fn exact_trust_region(
                         if options.verbose {
                             eprintln!("  TR iter {it:>3}: exact Hessian out of scope, FD Hessian");
                         }
-                        (rows_gradient(&x, &etas), h)
+                        (rows_gradient(&x, &etas, &kappas), h)
                     }
                     // In scope but not resolved at this point (an EBE that does not re-converge
                     // at the covariance tolerance, a non-finite term): a property of the point,
@@ -246,7 +332,7 @@ fn exact_trust_region(
                         }
                         // No model yet to keep (the first iterate): the same quantity at FD
                         // precision, so the fit can start at all.
-                        None if model_b.is_none() && model.n_kappa == 0 => {
+                        None if model_b.is_none() => {
                             let Some(h) = fd_candidate_hessian(
                                 model,
                                 population,
@@ -263,11 +349,10 @@ fn exact_trust_region(
                                     "  TR iter {it:>3}: exact Hessian not resolved at the start; FD Hessian"
                                 );
                             }
-                            (rows_gradient(&x, &etas), h)
+                            (rows_gradient(&x, &etas, &kappas), h)
                         }
                         _ => break,
                     },
-                    Err(ExactDecline::OutOfScope) => break,
                 }
             }
         };
@@ -313,10 +398,17 @@ fn exact_trust_region(
             break;
         }
         // Moré's scaling: `D` at its running maximum of `√|B_aa|`.
-        for (i, &fi) in fr.iter().enumerate() {
-            let hd = h[(i, i)].abs().sqrt();
-            if hd.is_finite() && hd > d_scale[fi] {
-                d_scale[fi] = hd;
+        {
+            let mut cs = problem.curvature_scale.lock().unwrap();
+            if cs.len() != n {
+                cs.resize(n, 0.0);
+            }
+            for (i, &fi) in fr.iter().enumerate() {
+                let hd = h[(i, i)].abs().sqrt();
+                if hd.is_finite() && hd > d_scale[fi] {
+                    d_scale[fi] = hd;
+                }
+                cs[axes[fi]] = cs[axes[fi]].max(d_scale[fi]);
             }
         }
         let dmax = fr.iter().map(|&fi| d_scale[fi]).fold(0.0_f64, f64::max);
@@ -326,6 +418,22 @@ fn exact_trust_region(
         let d: Vec<f64> = fr.iter().map(|&fi| d_scale[fi].max(1e-8 * dmax)).collect();
         let gy = DVector::from_iterator(m, (0..m).map(|i| g_full[axes[fr[i]]] / d[i]));
         let hy = DMatrix::from_fn(m, m, |i, j| h[(i, j)] / (d[i] * d[j]));
+        if !radius_set {
+            // The first radius is the length of the seed model's own Newton step, in the
+            // scaled norm, clamped to `[1, 1e3]`. The seed is the exact `|H|`, so its Newton
+            // step is the best length estimate available, and the ρ test still rejects it
+            // where the model is wrong. PORT's fixed initial radius of 1 is 1/√B_aa in a
+            // coordinate's own units: on a tightly curved coordinate far from its optimum
+            // (a 1% prior, #254's `a_prior_moves_the_estimates_and_not_only_the_report`) it
+            // moved 0.7% a step and needed ~log₂ of the distance in doublings to get there.
+            radius_set = true;
+            if let Some(newton) = saddle_free_subproblem(&gy, hy.clone(), f64::INFINITY) {
+                let len = newton.step.norm();
+                if len.is_finite() {
+                    radius = len.clamp(1.0, 1e3);
+                }
+            }
+        }
         let Some(sub) = saddle_free_subproblem(&gy, hy, radius) else {
             break;
         };
@@ -356,7 +464,7 @@ fn exact_trust_region(
         let sy =
             DVector::from_iterator(m, (0..m).map(|i| (xn[axes[fr[i]]] - x[axes[fr[i]]]) * d[i]));
         let pred = -(gy.dot(&sy) + 0.5 * sy.dot(&(&sub.habs * &sy)));
-        let (fnew, en, hn, kn) = eval(&xn, &trial_warm);
+        let (fnew, en, hn, kn, _, _) = eval(&xn, &trial_warm, PrevEtas::Solved);
         let rho = if pred > 0.0 { (f - fnew) / pred } else { -1.0 };
         // Measured (#2975): without this refresh (PORT's pure secant mode) the trust region took
         // 32% more iterations on the 26-model set, up to 13× on single models, with one more miss.
@@ -372,6 +480,14 @@ fn exact_trust_region(
             etas = en;
             hms = hn;
             kappas = kn;
+            // A resume point (#755), as every outer optimizer writes one: the accepted iterate
+            // is the best point seen (the trust region's iterates descend monotonically), and
+            // the checkpoint carries the unpenalized −2LL there.
+            if crate::io::checkpoint::is_due() {
+                let theta = unpack_params(&x, problem.init_params).theta;
+                let clean = f - problem.nn_reg.penalty_value(&theta) - problem.priors.penalty(&x);
+                crate::io::checkpoint::maybe_write(it, clean, &x);
+            }
             // The rows' gradient at the next iterate starts from this point's own modes.
             *problem.grad_cache.lock().unwrap() = Some(GradCache {
                 x: x.clone(),
@@ -386,7 +502,13 @@ fn exact_trust_region(
             }
         } else {
             radius = 0.25 * snorm.max(1e-12);
-            last_mismatch = ((f - fnew) - pred).abs();
+            // A guard-rejected or non-finite trial measures no noise: its `1e20` is a wall,
+            // not an objective, and must not settle a stop at the noise floor.
+            last_mismatch = if fnew < 1e20 {
+                ((f - fnew) - pred).abs()
+            } else {
+                f64::NAN
+            };
         }
         if radius < 1e-10 {
             // The noise floor: no step can realise a predicted gain smaller than the
@@ -799,6 +921,7 @@ pub(crate) fn optimize_trust_region_seeded(
     let PackedStart {
         packed: mut x0,
         bounds,
+        fixed,
         ..
     } = pack_with_bounds(init_params);
     clamp_to_bounds(&mut x0, &bounds);
@@ -836,6 +959,8 @@ pub(crate) fn optimize_trust_region_seeded(
         grad_cache: std::sync::Mutex::new(None),
         priors: crate::estimation::outer_optimizer::build_prior_set(model, init_params),
         nn_reg,
+        feasibility: std::sync::Mutex::new(TrFeasibility::default()),
+        curvature_scale: std::sync::Mutex::new(Vec::new()),
     };
 
     if options.verbose {
@@ -931,6 +1056,8 @@ pub(crate) fn optimize_trust_region_seeded(
         && !tr_budget_spent
         && n_iterations < options.outer_maxiter
         && !crate::cancel::is_cancelled(&options.cancel)
+        // An infeasible start (#1617) has no objective for a tighter leg to verify.
+        && problem.feasibility.lock().unwrap().feasible > 0
     {
         use crate::estimation::outer_optimizer::{
             UNPROFILED_FIRST_LEG_GAIN, UNPROFILED_VERIFY_INNER_TOL,
@@ -974,7 +1101,9 @@ pub(crate) fn optimize_trust_region_seeded(
         } else {
             "∂OFV/∂x"
         };
-        let reason = if tr_budget_spent {
+        let reason = if problem.feasibility.lock().unwrap().feasible == 0 {
+            "found no feasible objective at its start (W_NO_FEASIBLE_EVAL)".to_string()
+        } else if tr_budget_spent {
             format!(
                 "reached the iteration budget (maxiter = {}) before the exact Newton decrement \
                  fell to {TR_EXACT_DECREMENT_TOL:e}",
@@ -990,6 +1119,26 @@ pub(crate) fn optimize_trust_region_seeded(
     }
     if options.verbose {
         eprintln!("Trust-region finished: {n_iterations} iters, converged = {converged}");
+    }
+
+    // #1617, on the NLopt path's rule and message: a run that never scored a feasible
+    // objective has minimised nothing. The trust region stops at an infeasible start, so
+    // `best_x` is the start and the estimates reported are the ones the fit started from.
+    let tally = *problem.feasibility.lock().unwrap();
+    let run = crate::estimation::outer_optimizer::RunFeasibility {
+        feasible_evals: tally.feasible,
+        n_guard_rejected: tally.guard_rejected,
+        n_nonfinite: tally.nonfinite,
+        max_unconverged: tally.max_unconverged,
+        n_subj,
+        max_unconverged_frac: options.max_unconverged_frac,
+        inner_maxiter: options.inner_maxiter,
+        cancelled: crate::cancel::is_cancelled(&options.cancel),
+    };
+    if let Some(w) =
+        crate::estimation::outer_optimizer::no_feasible_eval_warning(&mut converged, &run)
+    {
+        warnings.push(w);
     }
 
     let final_params = unpack_params(&best_x, init_params);
@@ -1089,7 +1238,7 @@ pub(crate) fn optimize_trust_region_seeded(
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         ebe_convergence_warnings: 0,
-        max_unconverged_subjects: 0,
+        max_unconverged_subjects: u32::try_from(tally.max_unconverged).unwrap_or(u32::MAX),
         total_ebe_fallbacks: 0,
         total_ebe_nm_polished: 0,
         final_gradient_source: final_gradient.as_ref().map(|_| "optimizer".to_string()),
@@ -1104,7 +1253,29 @@ pub(crate) fn optimize_trust_region_seeded(
         // factor `L`; carrying it lets `run_covariance` reproduce this covariance
         // step bit-for-bit instead of re-decomposing `omega` (#816 follow-up).
         packed_estimate: Some(best_x.clone()),
-        left_init: None,
+        // The NLopt loop's own escape test (#751), on the free coordinates and in the same
+        // units: NLopt reads a move in its curvature-scaled space (`x·√|H_aa|`), and the trust
+        // region's model measures its steps in `√|B_aa|` (Moré's scaling), so a move counts in
+        // those, and in packed units on a coordinate no model reached. `!(… < …)` so a
+        // non-finite deviation counts as moved.
+        left_init: Some({
+            let cs = problem.curvature_scale.lock().unwrap();
+            let scaled_free = |x: &[f64]| -> Vec<f64> {
+                x.iter()
+                    .zip(&fixed)
+                    .enumerate()
+                    .filter(|&(_, (_, &f))| !f)
+                    .map(|(k, (&v, _))| {
+                        let c = cs.get(k).copied().unwrap_or(0.0);
+                        v * if c > 0.0 { c } else { 1.0 }
+                    })
+                    .collect()
+            };
+            !(crate::estimation::outer_optimizer::max_scaled_deviation(
+                &scaled_free(&best_x),
+                &scaled_free(&x0),
+            ) < crate::estimation::outer_optimizer::INIT_ESCAPE_STEP_S)
+        }),
         stationary_start: false,
         mixture_posteriors: None,
         vi: None,
@@ -1365,6 +1536,8 @@ mod tests {
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(model.n_eta); n_subj]),
             cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
+            feasibility: std::sync::Mutex::new(TrFeasibility::default()),
+            curvature_scale: std::sync::Mutex::new(Vec::new()),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1565,6 +1738,8 @@ mod tests {
                     population.subjects.len()
                 ]),
                 cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
+                feasibility: std::sync::Mutex::new(TrFeasibility::default()),
+                curvature_scale: std::sync::Mutex::new(Vec::new()),
                 grad_cache: std::sync::Mutex::new(None),
                 priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
@@ -1660,6 +1835,8 @@ mod tests {
                     population.subjects.len()
                 ]),
                 cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
+                feasibility: std::sync::Mutex::new(TrFeasibility::default()),
+                curvature_scale: std::sync::Mutex::new(Vec::new()),
                 grad_cache: std::sync::Mutex::new(None),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
                 priors: crate::estimation::outer_optimizer::build_prior_set(model, init),

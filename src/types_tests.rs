@@ -3585,7 +3585,7 @@ mod theta_block_scale_guards {
         // resolves to the gradient-based optimizer exactly as it would without
         // the block.
         let model = wide_model(4);
-        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::TrustRegion);
     }
 
     #[test]
@@ -4497,7 +4497,7 @@ mod kappa_correlation_auto_route {
         for m in [&on, &kappa_only, &corr_only] {
             assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
             assert!(analytic_outer_gradient_in_scope(m));
-            assert_eq!(Optimizer::Auto.resolve_auto(m), Optimizer::NloptLbfgs);
+            assert_eq!(Optimizer::Auto.resolve_auto(m), Optimizer::TrustRegion);
             assert_eq!(
                 Optimizer::Auto.resolve_auto_given_analytic(m, false),
                 Optimizer::Bobyqa
@@ -4512,7 +4512,7 @@ mod kappa_correlation_auto_route {
                 analytic_outer_gradient_in_scope(&on)
             )
             .0,
-            Optimizer::NloptLbfgs
+            Optimizer::TrustRegion
         );
     }
 

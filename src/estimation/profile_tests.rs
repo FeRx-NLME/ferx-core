@@ -7306,6 +7306,12 @@ fn f2_fit(studies: Option<usize>, edit: fn(String) -> String, im: usize) -> crat
         run_covariance_step: false,
         inner_maxiter: im,
         max_unconverged_frac: 0.0,
+        // The twins share one optimizer: a profiled fit runs L-BFGS, and the unprofiled
+        // twin's floor escape and restarts are the NLopt leg's (`auto` is `trust_region`
+        // since #2976).
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..options(&p)
     };
     crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o).unwrap()

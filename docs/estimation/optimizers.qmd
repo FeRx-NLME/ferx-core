@@ -100,11 +100,24 @@ Welsch 1981; Gay 1983) with exact second-order information where PORT has none (
    the objective it minimised, some subjects sat in a higher individual mode, and the trust
    region resumes from the same point with the cold EBEs: the rules `nlopt_lbfgs` uses (#1565).
 
-Where the exact Hessian cannot be formed at an iterate, BHHH from each subject's exact total
-derivative ([#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)) stands in for that
-iteration (non-IOV models). IOV models are supported. The quadrature objectives (`laplace`,
-`focei` with `n_agq > 1`) are still refused (`E_OPTIMIZER_AGQ`). `steihaug_max_iters` has no
-effect.
+Where the exact Hessian is out of scope, or not resolved at the start, the same rule runs on the
+finite-difference Hessian of the same objective, with the exact gradient of each subject's total
+derivative ([#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)) or, under IOV or a
+quadrature objective, the reconverged central difference. IOV models and the quadrature
+objectives (`laplace`, `focei` with `n_agq > 1`) are supported: the exact derivatives are those
+of the objective the fit scores.
+
+The rest follows the other outer optimizers:
+
+- A trial point the EBE convergence guard rejects (`max_unconverged_frac`) is refused like a
+  failed step. A start with no feasible objective stops there, not converged, with
+  `W_NO_FEASIBLE_EVAL` ([#1617](https://github.com/FeRx-NLME/ferx-core/issues/1617)).
+- Checkpoints are written as for every outer optimizer.
+- The first radius is the length of the exact model's Newton step, so a tightly curved
+  coordinate far from its optimum (a strong prior, say) is not walked there in doublings.
+- `maxiter` counts trust-region iterations. NLopt's budget is `maxiter × (n + 1)` evaluations,
+  so a short fit set by `maxiter` stops at a different place under each.
+- `steihaug_max_iters` has no effect.
 
 Measured (#2975; FOCEI, 26 bundled and synthetic models) against `nlopt_lbfgs` with
 [curvature scaling](parameterization.qmd#outer-curvature-scaling):

@@ -45,6 +45,12 @@ fn example(model: &str, data: &str) -> (CompiledModel, Population) {
 fn opts(method: EstimationMethod) -> FitOptions {
     FitOptions {
         method,
+        // The routes are compared after a short fit, measured on NLopt's evaluation budget
+        // (`auto` is `trust_region` since #2976, whose own FD fallback is pinned in
+        // `gauss_newton_and_trust_region_fall_back_to_fd`).
+        optimizer: crate::types::Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         outer_maxiter: 3,
         threads: Some(1),
         verbose: false,
@@ -191,16 +197,25 @@ fn gauss_newton_and_trust_region_fall_back_to_fd() {
     let (e, f) = pair(&m, &p, &opts(EstimationMethod::FoceGn));
     // Measured 2.2e-6 / 1.1e-8 / 2.7e-4.
     check("gn", &e, &f, [2e-5, 1e-6, 2e-3]);
+    // To convergence, not three iterations: mid-descent the two routes' steps differ by the
+    // precision of their models, and the comparison would measure the path, not the answer.
     let o = FitOptions {
         optimizer: Optimizer::TrustRegion,
+        outer_maxiter: 200,
         ..opts(EstimationMethod::FoceI)
     };
     let (e, f) = pair(&m, &p, &o);
-    // Measured 4.2e-3 / 4.5e-5 / 6.0e-4 (#2975). The trust region models with the exact Hessian;
-    // with every plan failing it models with the finite-difference Hessian of the same objective
-    // (`fd_candidate_hessian`), one rule at two precisions. Three iterations from the start
-    // (gradient norm ~155), the steps differ by that precision. A different model on the
-    // fallback (it used BHHH before) puts the forced fit 50 OFV away.
+    assert!(
+        e.converged && f.converged,
+        "both routes converge: {:?} / {:?}",
+        e.warnings,
+        f.warnings
+    );
+    // MEASURE (#2976). The trust region models with the exact Hessian; with every plan failing
+    // it models with the finite-difference Hessian of the same objective
+    // (`fd_candidate_hessian`), one rule at two precisions, and both must reach the same
+    // optimum. A different model on the fallback (it used BHHH before) put the forced fit 50
+    // OFV away.
     check("trust-region", &e, &f, [1e-2, 1e-4, 3e-3]);
 }
 

@@ -10689,11 +10689,10 @@ pub struct FitOptions {
     /// supersedes [`FitOptions::scale_params`]: `Rescale2` (nlmixr2-style bound-half-width
     /// normalisation) is the recommended setting for gradient-based optimizers
     /// and substantially improves cold-start convergence (see
-    /// [`ParameterScaling`]). **Default: `Auto`** — applies `Rescale2` to the
-    /// gradient-based optimizers that benefit (`Bfgs`/`Lbfgs`/`NloptLbfgs`/`Slsqp`)
-    /// and leaves the derivative-free `Bobyqa` unscaled (where `Rescale2`
-    /// distorts its trust-region model). Set via `[fit_options]` key
-    /// `parameter_scaling = none|abs|rescale2` to override.
+    /// [`ParameterScaling`]). **Default: `Auto`** — scales each free coordinate of
+    /// `NloptLbfgs` and `Slsqp` by its exact curvature at the start (#2975), applies `Abs` to
+    /// the built-in `Bfgs`/`Lbfgs`, and leaves `Bobyqa`, `Mma` and `TrustRegion` unscaled.
+    /// Set via `[fit_options]` key `parameter_scaling = none|abs|rescale2` to override.
     pub parameter_scaling: ParameterScaling,
     /// Fraction of subjects allowed to have unconverged EBEs before the outer
     /// optimizer rejects the current parameter step (returns OFV = ∞).  Set to
@@ -11352,17 +11351,15 @@ pub enum InnerOptimizer {
 /// Crucially, `Rescale2` is **harmful to the derivative-free `Bobyqa`**
 /// (e.g. it drops `emax_pkpd` from OFV −36.76 to −13.51 and `three_cpt_iv` from
 /// −730.6 to −715.9): rescaling the trust region of a gradient-free optimizer
-/// distorts its quadratic model. Hence the default is [`Auto`](Self::Auto),
-/// which applies `Rescale2` only to the gradient-based optimizers that benefit.
+/// distorts its quadratic model. Hence the default is [`Auto`](Self::Auto), which
+/// scales only the gradient-based optimizers (see its variant docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ParameterScaling {
-    /// **Default.** Apply `Rescale2` for the gradient-based optimizers that
-    /// benefit from it (`Bfgs`, `Lbfgs`, `NloptLbfgs`, `Slsqp`) and no scaling
-    /// otherwise — so the derivative-free `Bobyqa` (where `Rescale2` is
-    /// harmful) and `Mma`/`TrustRegion` are left unscaled, with the legacy
+    /// **Default.** `NloptLbfgs` and `Slsqp` scale each free coordinate by its exact
+    /// curvature at the start, `1/√|∂²OFV/∂x²|` (#2975); the built-in `Bfgs`/`Lbfgs` take
+    /// `Abs`; the derivative-free `Bobyqa` (where scaling is harmful) and `Mma` /
+    /// `TrustRegion` (which scales its own model) are left unscaled, with the legacy
     /// `scale_params` / IOV-auto-enable still applying in that unscaled branch.
-    /// `Slsqp` is scaled because the bound-half-width rescaling fixes its
-    /// cold-start convergence on IOV models (#335).
     #[default]
     Auto,
     /// No scaling: fall back to the legacy `scale_params` bool (and the IOV+SLSQP

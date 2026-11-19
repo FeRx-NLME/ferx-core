@@ -4715,6 +4715,9 @@ fn non_convergence_reports_directly_without_second_optimization() {
         method: EstimationMethod::FoceI,
         interaction: true,
         optimizer: Optimizer::NloptLbfgs,
+        // The mid-descent shape is tied to the pre-#2975 L-BFGS search path (magnitude
+        // scaling): under the curvature scaling stage 1 already ends within 0.1 of the optimum.
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         outer_maxiter,
         run_covariance_step: false,
         mu_referencing: true,
@@ -10868,6 +10871,10 @@ fn the_basin_probe_absorbs_one_switched_subject_of_ten() {
     .unwrap();
     let opts = FitOptions {
         verbose: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..parsed.fit_options.clone()
     };
     let _off = WarmPredictorOff::new();
@@ -10974,6 +10981,10 @@ fn a_handful_of_switched_subjects_is_absorbed_into_the_running_leg() {
     .unwrap();
     let opts = FitOptions {
         verbose: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..parsed.fit_options.clone()
     };
     let _off = WarmPredictorOff::new();
@@ -15181,6 +15192,10 @@ fn a_stuck_unprofiled_stop_is_verified_into_the_band() {
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..prep.parsed.fit_options.clone()
     };
     // Through #2460's floor restart, as `fit` runs it: the start's first attempt ends with
@@ -15258,6 +15273,10 @@ fn an_unprofiled_leg_ranks_its_own_incumbent() {
     let opts = FitOptions {
         verbose: false,
         run_covariance_step: false,
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..prep.parsed.fit_options.clone()
     };
     let fit = |on| {
@@ -17361,6 +17380,10 @@ fn a_restarted_fit_runs_one_covariance_step() {
         run_covariance_step: true,
         verbose: false,
         threads: Some(1),
+        // The NLopt leg's mechanism is under test; `auto` is `trust_region` since #2976.
+        optimizer: Optimizer::NloptLbfgs,
+        // The fixture is tied to the pre-#2975 L-BFGS search path (magnitude scaling).
+        parameter_scaling: crate::types::ParameterScaling::Abs,
         ..parsed.fit_options.clone()
     };
     // Diffed, not read absolute: an earlier test's population may have had this address.

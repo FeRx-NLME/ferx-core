@@ -79,7 +79,7 @@ fn fd_on_an_analytic_model_warns_and_names_both_optimizers() {
         d.message
     );
     assert!(
-        d.message.contains("nlopt_lbfgs"),
+        d.message.contains("trust_region"),
         "must name what auto would have resolved to under gradient = auto: {}",
         d.message
     );

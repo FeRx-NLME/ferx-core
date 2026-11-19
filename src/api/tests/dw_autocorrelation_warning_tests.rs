@@ -317,9 +317,22 @@ fn assert_fit_pushes_only_the_helpers_message_on(
 ) -> String {
     // One outer iteration: the statistic comes from the post-fit residual pass,
     // and the misfit is structural, so there is nothing to gain by converging.
+    // The fixture's DW values and its warning allow-list were measured with `auto` resolving
+    // to L-BFGS on its `maxiter × (n + 1)` evaluation budget; since #2976 `auto` takes
+    // `trust_region` on an exact gradient, whose one iteration is one step. Keep the arm the
+    // fixture was measured on, with the pre-#2975 magnitude scaling it was measured under (the
+    // SDE arm stays on BOBYQA either way).
+    let (optimizer, parameter_scaling) = match base.optimizer {
+        Optimizer::Auto if Optimizer::Auto.resolve_auto(model) == Optimizer::TrustRegion => {
+            (Optimizer::NloptLbfgs, crate::types::ParameterScaling::Abs)
+        }
+        o => (o, base.parameter_scaling),
+    };
     let opts = FitOptions {
         outer_maxiter: 1,
         run_covariance_step: false,
+        optimizer,
+        parameter_scaling,
         ..base
     };
 

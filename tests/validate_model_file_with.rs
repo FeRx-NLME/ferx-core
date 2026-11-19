@@ -177,26 +177,38 @@ fn selection_override_reaches_the_data_read() {
     }
 }
 
-/// `check_model_options` reads the merged options: trust-region does not route the
-/// quadrature objective's gradient (`E_OPTIMIZER_AGQ`), so the refusal appears only when the
-/// overrides combine `method = laplace` with `optimizer = trust_region`.
+/// `check_model_options` reads the merged options, `optimizer` included. With `optimizer =
+/// auto`, a `gradient = fd` override moves the optimizer `auto` resolves to and the check warns
+/// about the coupling (`W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT`); a further `optimizer` override pins
+/// the optimizer, and the warning goes. (This probed `E_OPTIMIZER_AGQ` until #2976 retired it:
+/// the trust region differentiates the quadrature objective now.)
 #[test]
 fn optimizer_override_reaches_check_model_options() {
+    let codes = |report: &CheckReport| -> Vec<String> {
+        report.diagnostics.iter().map(|d| d.code.clone()).collect()
+    };
+    const CODE: &str = "W_AUTO_OPTIMIZER_FOLLOWS_GRADIENT";
     let file_only = validate_model_file_with(IOV_MODEL, None, &[]);
     assert!(
-        !error_codes(&file_only).contains(&"E_OPTIMIZER_AGQ"),
+        !codes(&file_only).iter().any(|c| c == CODE),
         "{:#?}",
         file_only.diagnostics
     );
-    let overridden = validate_model_file_with(
+    let fd = validate_model_file_with(IOV_MODEL, None, &pairs(&[("gradient", "fd")]));
+    assert!(
+        codes(&fd).iter().any(|c| c == CODE),
+        "{:#?}",
+        fd.diagnostics
+    );
+    let pinned = validate_model_file_with(
         IOV_MODEL,
         None,
-        &pairs(&[("method", "laplace"), ("optimizer", "trust_region")]),
+        &pairs(&[("gradient", "fd"), ("optimizer", "nlopt_lbfgs")]),
     );
     assert!(
-        error_codes(&overridden).contains(&"E_OPTIMIZER_AGQ"),
+        !codes(&pinned).iter().any(|c| c == CODE),
         "{:#?}",
-        overridden.diagnostics
+        pinned.diagnostics
     );
 }
 
