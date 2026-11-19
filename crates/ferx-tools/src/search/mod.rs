@@ -58,10 +58,7 @@ pub(crate) mod test_support;
 /// config file — `runs/warfarin.ferxsearch` → `runs/warfarin-covsearch` for
 /// `covsearch`. Each tool's `default_dir` is this with its own name.
 pub fn default_dir(config_path: &std::path::Path, tool: &str) -> std::path::PathBuf {
-    let stem = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("search");
+    let stem = config_path.file_stem().and_then(|s| s.to_str()).unwrap_or("search");
     config_path.with_file_name(format!("{stem}-{tool}"))
 }
 

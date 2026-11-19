@@ -159,10 +159,7 @@ pub(crate) fn reads_in_segment(t: f64, t_start: f64, t_end: f64) -> bool {
 /// (#2139, #2124). `pre` is `None` when the caller took no snapshot (band empty).
 #[inline]
 pub(crate) fn band_read_state<'a, T>(
-    t: f64,
-    first_event: f64,
-    pre: Option<&'a [T]>,
-    post: &'a [T],
+    t: f64, first_event: f64, pre: Option<&'a [T]>, post: &'a [T],
 ) -> &'a [T] {
     match pre {
         Some(pre) if t < first_event => pre,
@@ -176,8 +173,7 @@ pub(crate) fn band_read_state<'a, T>(
 /// co-timed row (#614/#1810). The sub-`1e-15` segment between them is skipped without stepping.
 /// Both engines must call this with the same `records`.
 fn dedup_breaks_keeping_records(
-    break_times: &mut Vec<f64>,
-    records: &std::collections::HashSet<u64>,
+    break_times: &mut Vec<f64>, records: &std::collections::HashSet<u64>,
 ) {
     break_times.dedup_by(|a, b| {
         a.to_bits() == b.to_bits()
@@ -244,11 +240,8 @@ fn doses_next_break(break_times: &[f64], k: usize, bounded: bool) -> f64 {
 /// near-equal entries: after each accepted step it saves every entry within `1e-12`, each
 /// under its own time and with the same state.
 pub(crate) fn segment_saveat(times: &[f64], t_start: f64, t_end: f64) -> Vec<f64> {
-    let mut saveat: Vec<f64> = times
-        .iter()
-        .copied()
-        .filter(|&t| reads_in_segment(t, t_start, t_end))
-        .collect();
+    let mut saveat: Vec<f64> =
+        times.iter().copied().filter(|&t| reads_in_segment(t, t_start, t_end)).collect();
     if saveat.is_empty() || (saveat.last().unwrap() - t_end).abs() > 1e-12 {
         saveat.push(t_end);
     }
@@ -317,9 +310,7 @@ impl RecordIndex {
     /// answers, without materialising the indices.
     pub(crate) fn any_at_break(&self, t_break: f64) -> bool {
         let lo = self.sorted.partition_point(|&(t, _)| t < t_break);
-        self.sorted
-            .get(lo)
-            .is_some_and(|&(t, _)| reads_at_break(t, t_break))
+        self.sorted.get(lo).is_some_and(|&(t, _)| reads_at_break(t, t_break))
     }
 }
 
@@ -348,8 +339,7 @@ pub(crate) fn times_have_non_finite<T: crate::sens::num::PkNum>(
 /// walks deliberately do not record (the guard test's only allowance).
 #[inline]
 pub(crate) fn abandon_non_finite_timeline(
-    times: impl Iterator<Item = f64>,
-    stats: Option<&mut crate::ode::solver::OdeSolverStats>,
+    times: impl Iterator<Item = f64>, stats: Option<&mut crate::ode::solver::OdeSolverStats>,
 ) -> bool {
     if times_have_non_finite(times) {
         crate::ode::solver::record_abandoned_non_finite_timeline(stats);
@@ -407,12 +397,7 @@ pub(crate) fn subject_integration_start(subject: &Subject) -> f64 {
 /// it. A decision within 1e-12 *below* the origin leaves the replay ~1e-13 from `predict()`
 /// rather than bit-identical (measured on #2630).
 fn push_breaks_after_origin(break_times: &mut Vec<f64>, extra_breaks: &[f64], origin: f64) {
-    break_times.extend(
-        extra_breaks
-            .iter()
-            .copied()
-            .filter(|b| b.is_finite() && *b > origin),
-    );
+    break_times.extend(extra_breaks.iter().copied().filter(|b| b.is_finite() && *b > origin));
 }
 
 /// Fill every requested sample time **before the first break** with the seeded initial state `u`
@@ -428,10 +413,7 @@ fn push_breaks_after_origin(break_times: &mut Vec<f64>, extra_breaks: &[f64], or
 /// `first_break` finite (callers run `times_have_non_finite` first). Generic in the number type
 /// (#2786): the static dual walk marks its rows in `filled`.
 pub(crate) fn fill_prestart_states<T: crate::sens::num::PkNum>(
-    times: &[f64],
-    states: &mut [Vec<T>],
-    first_break: Option<T>,
-    u: &[T],
+    times: &[f64], states: &mut [Vec<T>], first_break: Option<T>, u: &[T],
     mut filled: Option<&mut [bool]>,
 ) {
     debug_assert_eq!(
@@ -485,10 +467,7 @@ struct ChzProjection {
 
 impl ChzProjection {
     fn new(chz: &[usize], n: usize) -> Self {
-        Self {
-            n,
-            pk_rows: (0..n).filter(|i| !chz.contains(i)).collect(),
-        }
+        Self { n, pk_rows: (0..n).filter(|i| !chz.contains(i)).collect() }
     }
 
     /// Size of the reduced system. Zero means the spec is all accumulator and no PK.
@@ -527,11 +506,7 @@ pub(crate) fn mask_chz<T: crate::sens::num::PkNum>(chz: &[usize], dy: &mut [T]) 
         // A slot outside the state vector means `chz_state_slots` disagrees with `n_states`.
         // Skipping silently would leave the row unmasked; assert in debug so an inconsistent
         // spec is loud rather than quietly reinstating the #1210 behaviour.
-        debug_assert!(
-            slot < dy.len(),
-            "chz slot {slot} is outside a {}-state system",
-            dy.len()
-        );
+        debug_assert!(slot < dy.len(), "chz slot {slot} is outside a {}-state system", dy.len());
         if slot < dy.len() {
             dy[slot] = T::from_f64(0.0);
         }
@@ -543,10 +518,7 @@ pub(crate) fn mask_chz<T: crate::sens::num::PkNum>(chz: &[usize], dy: &mut [T]) 
 /// Allocation-free when the model has no accumulators.
 #[inline]
 fn chz_snapshot(ode: &crate::ode::OdeSpec, u: &[f64]) -> Vec<f64> {
-    ode.chz_state_slots
-        .iter()
-        .map(|&slot| u.get(slot).copied().unwrap_or(0.0))
-        .collect()
+    ode.chz_state_slots.iter().map(|&slot| u.get(slot).copied().unwrap_or(0.0)).collect()
 }
 
 /// Write a [`chz_snapshot`] back into an equilibrated state. The single chokepoint for
@@ -565,11 +537,7 @@ fn restore_chz(ode: &crate::ode::OdeSpec, u: &mut [f64], chz_before: &[f64]) {
         "chz snapshot length does not match the spec's accumulator slots"
     );
     for (k, &slot) in ode.chz_state_slots.iter().enumerate() {
-        debug_assert!(
-            slot < u.len(),
-            "chz slot {slot} is outside a {}-state system",
-            u.len()
-        );
+        debug_assert!(slot < u.len(), "chz slot {slot} is outside a {}-state system", u.len());
         if slot < u.len() {
             u[slot] = chz_before.get(k).copied().unwrap_or(0.0);
         }
@@ -581,12 +549,7 @@ fn restore_chz(ode: &crate::ode::OdeSpec, u: &mut [f64], chz_before: &[f64]) {
 /// joint PK-TTE model; projecting those rows out restores the PK propagator. The returned vector
 /// is full-length with accumulator rows at zero; the caller's [`restore_chz`] fills them.
 pub(crate) fn periodic_ss_fixed_point_pk<T, FUnf, FFor>(
-    chz: &[usize],
-    n: usize,
-    ii: f64,
-    reltol: f64,
-    abstol: f64,
-    advance_unforced: FUnf,
+    chz: &[usize], n: usize, ii: f64, reltol: f64, abstol: f64, advance_unforced: FUnf,
     advance_forced: FFor,
 ) -> Option<Vec<T>>
 where
@@ -617,12 +580,7 @@ where
 /// result full-length with those rows at zero for the caller to restore. Shared by the f64
 /// equilibration and its dual twin, so the two solve the same reduced problem.
 pub(crate) fn equilibrate_ss_input_rate_pk<T, FUnf, FFor>(
-    chz: &[usize],
-    n: usize,
-    ii: f64,
-    reltol: f64,
-    abstol: f64,
-    advance_unforced: FUnf,
+    chz: &[usize], n: usize, ii: f64, reltol: f64, abstol: f64, advance_unforced: FUnf,
     advance_forced: FFor,
 ) -> Option<Vec<T>>
 where
@@ -689,8 +647,7 @@ where
 /// walk's anchor and not this one.
 #[inline]
 pub(crate) fn ss_run_in_params(
-    pk_params_flat: &[f64],
-    pulse_at: f64,
+    pk_params_flat: &[f64], pulse_at: f64,
 ) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
     // `seed_ext_params` copies `min(len, MAX_PK_PARAMS)` and leaves the rest `NaN`, so a
     // short slice would turn what used to be an index panic inside the RHS into a silent
@@ -719,12 +676,8 @@ pub(crate) fn ss_run_in_params(
 /// non-finite intermediate, or `ρ ≥ 1`.
 #[cfg(test)]
 fn equilibrate_ss_input_rate(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    f_bio: f64,
-    opts: &OdeSolverOptions,
-    prepared: &PreparedForcings,
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, f_bio: f64,
+    opts: &OdeSolverOptions, prepared: &PreparedForcings,
 ) -> Option<Vec<f64>> {
     equilibrate_ss_input_rate_lagged(ode, pk_params_flat, dose, 0.0, f_bio, opts, prepared)
 }
@@ -735,13 +688,8 @@ fn equilibrate_ss_input_rate(
 /// the clamped periodic sum ([`ss_periodic_forcing_shifted`]), so a lag of a full interval or
 /// more leaves the train on the record, like every other lagged SS seed.
 fn equilibrate_ss_input_rate_lagged(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    lag: f64,
-    f_bio: f64,
-    opts: &OdeSolverOptions,
-    prepared: &PreparedForcings,
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, lag: f64, f_bio: f64,
+    opts: &OdeSolverOptions, prepared: &PreparedForcings,
 ) -> Option<Vec<f64>> {
     let n = ode.n_states;
     let ii = dose.ii;
@@ -848,18 +796,14 @@ fn equilibrate_ss_input_rate_lagged(
         |u0| {
             advance(
                 &masked_unforced,
-                unforced_jac
-                    .as_ref()
-                    .map(|j| j as &crate::ode::rosenbrock::JacFn<'_>),
+                unforced_jac.as_ref().map(|j| j as &crate::ode::rosenbrock::JacFn<'_>),
                 u0,
             )
         },
         |u0| {
             advance(
                 &masked_forced,
-                forced_jac_c
-                    .as_ref()
-                    .map(|j| j as &crate::ode::rosenbrock::JacFn<'_>),
+                forced_jac_c.as_ref().map(|j| j as &crate::ode::rosenbrock::JacFn<'_>),
                 u0,
             )
         },
@@ -888,9 +832,7 @@ const SS_ANDERSON_WINDOW: usize = 5;
 /// `None` on a singular `I − J_P` or failed solve.
 /// Non-recording: a recording type takes `T::ss_fixed_point` in the caller first.
 fn newton_ss_derivative_correction_g<T, FFor>(
-    u_star: &[T],
-    n: usize,
-    advance_forced: &FFor,
+    u_star: &[T], n: usize, advance_forced: &FFor,
 ) -> Option<Vec<T>>
 where
     T: crate::sens::num::PkNum,
@@ -956,11 +898,7 @@ const SS_NEWTON_REFINEMENTS: usize = 2;
 /// [Anderson acceleration]: https://doi.org/10.1137/10078356X
 /// Non-recording: a recording type takes `T::ss_fixed_point` in the caller before this runs.
 fn anderson_ss_fixed_point_g<T, FFor>(
-    n: usize,
-    ii: f64,
-    reltol: f64,
-    abstol: f64,
-    advance_forced: &FFor,
+    n: usize, ii: f64, reltol: f64, abstol: f64, advance_forced: &FFor,
 ) -> Option<Vec<T>>
 where
     T: crate::sens::num::PkNum,
@@ -999,9 +937,7 @@ where
     let mut u_prev: Option<Vec<T>> = None;
     for iter in 0..SS_ANDERSON_MAX_ITERS {
         let g = advance_forced(&u)?;
-        if g.iter()
-            .any(|x| !x.plain().is_finite() || x.plain().abs() > diverged_ceiling)
-        {
+        if g.iter().any(|x| !x.plain().is_finite() || x.plain().abs() > diverged_ceiling) {
             return None;
         }
         // Relative-L∞ residual of the one-cycle map on the value parts.
@@ -1018,9 +954,7 @@ where
         // inflated magnitude, but it was reached by an enormous jump, so the step is not small.
         let settled_step = match &u_prev {
             Some(p) => {
-                u.iter()
-                    .zip(p)
-                    .fold(0.0_f64, |m, (a, b)| m.max((a.plain() - b.plain()).abs()))
+                u.iter().zip(p).fold(0.0_f64, |m, (a, b)| m.max((a.plain() - b.plain()).abs()))
                     <= tol
             }
             None => false, // the seed is not, on its own, evidence of convergence
@@ -1058,9 +992,7 @@ where
 /// Picard step with one history point or a singular least-squares.
 /// Non-recording: called only by `anderson_ss_fixed_point_g`.
 fn anderson_combine<T: crate::sens::num::PkNum>(
-    u_hist: &[Vec<T>],
-    g_hist: &[Vec<T>],
-    n: usize,
+    u_hist: &[Vec<T>], g_hist: &[Vec<T>], n: usize,
 ) -> Vec<T> {
     let k = u_hist.len();
     let g_last = &g_hist[k - 1];
@@ -1070,11 +1002,7 @@ fn anderson_combine<T: crate::sens::num::PkNum>(
     let m = k - 1; // difference-column count
                    // Residual value parts f_i = g_i − u_i, then columns ΔF_j = f_{j+1} − f_j (n × m).
     let f: Vec<Vec<f64>> = (0..k)
-        .map(|i| {
-            (0..n)
-                .map(|r| g_hist[i][r].plain() - u_hist[i][r].plain())
-                .collect()
-        })
+        .map(|i| (0..n).map(|r| g_hist[i][r].plain() - u_hist[i][r].plain()).collect())
         .collect();
     let df = |r: usize, j: usize| f[j + 1][r] - f[j][r];
     // Normal equations A = ΔFᵀΔF (m × m), rhs = ΔFᵀ f_last.
@@ -1120,12 +1048,7 @@ fn anderson_combine<T: crate::sens::num::PkNum>(
 /// [Anderson-accelerated][`anderson_ss_fixed_point_g`] solve of the same fixed point. `None` only
 /// when neither converges (`ρ ≥ 1`), leaving the capped pulse train and the #867 warning.
 pub(crate) fn equilibrate_ss_input_rate_g<T, FUnf, FFor>(
-    n: usize,
-    ii: f64,
-    reltol: f64,
-    abstol: f64,
-    advance_unforced: FUnf,
-    advance_forced: FFor,
+    n: usize, ii: f64, reltol: f64, abstol: f64, advance_unforced: FUnf, advance_forced: FFor,
 ) -> Option<Vec<T>>
 where
     T: crate::sens::num::PkNum,
@@ -1139,10 +1062,7 @@ where
             Box::new(move |maps| {
                 equilibrate_ss_input_rate_g::<f64, _, _>(n, ii, reltol, abstol, maps[0], maps[1])
                     .map(|u| {
-                        (
-                            u,
-                            crate::parser::model_parser::rhs_regcode::kernel_jit::Found::Fixed(1),
-                        )
+                        (u, crate::parser::model_parser::rhs_regcode::kernel_jit::Found::Fixed(1))
                     })
             });
         let maps: [&dyn Fn(&[T]) -> Option<Vec<T>>; 2] = [&advance_unforced, &advance_forced];
@@ -1185,10 +1105,7 @@ where
 /// warns). `chz_before` (from [`chz_snapshot`]) holds the hazard accumulators at the record; they
 /// are held still through the run-in and handed back unchanged (#1210).
 fn equilibrate_ss_state(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    opts: &OdeSolverOptions,
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, opts: &OdeSolverOptions,
     chz_before: &[f64],
 ) -> Vec<f64> {
     equilibrate_ss_state_lagged(ode, pk_params_flat, dose, 0.0, opts, chz_before)
@@ -1198,12 +1115,8 @@ fn equilibrate_ss_state(
 /// a built-in absorption compartment reads it: its steady state is a statement about the record
 /// (`lag` before the dose's own pulse arrives), not about the arrival.
 fn equilibrate_ss_state_lagged(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    lag: f64,
-    opts: &OdeSolverOptions,
-    chz_before: &[f64],
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, lag: f64,
+    opts: &OdeSolverOptions, chz_before: &[f64],
 ) -> Vec<f64> {
     let mut u = equilibrate_ss_pk_state(ode, pk_params_flat, dose, lag, opts);
     restore_chz(ode, &mut u, chz_before);
@@ -1215,10 +1128,7 @@ fn equilibrate_ss_state_lagged(
 /// caller-facing wrapper writes the record values over them. Kept separate so that single
 /// restore is the one exit — including from the three early bail-outs below.
 fn equilibrate_ss_pk_state(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    lag: f64,
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, lag: f64,
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
     // Clear the branch tag up front so the early returns below leave `None` rather than
@@ -1285,16 +1195,7 @@ fn equilibrate_ss_pk_state(
         }
         let n_pulses = SS_EQUILIBRATION_CYCLES;
         let local_doses: Vec<DoseEvent> = (0..n_pulses)
-            .map(|m| {
-                DoseEvent::new(
-                    m as f64 * dose.ii,
-                    dose.amt,
-                    dose.cmt_raw(),
-                    0.0,
-                    false,
-                    0.0,
-                )
-            })
+            .map(|m| DoseEvent::new(m as f64 * dose.ii, dose.amt, dose.cmt_raw(), 0.0, false, 0.0))
             .collect();
         let local_f_bio = vec![f_bio; n_pulses];
         // One empty slice serves both callees: `wrap_rhs_with_forcings` and `tad_anchor_for` read
@@ -1360,10 +1261,8 @@ fn equilibrate_ss_pk_state(
             // segment `m` is `local_doses[m]` at `m·II`. Taken from the shared rule over
             // this train's own dose list rather than re-spelled — a flat `0.0` would read
             // `TAD = m·II + τ`, wrong by up to 49 whole dosing intervals (#1139).
-            let ext = ss_run_in_params(
-                pk_params_flat,
-                tad_anchor_for(&local_doses, &no_lag, seg_start),
-            );
+            let ext =
+                ss_run_in_params(pk_params_flat, tad_anchor_for(&local_doses, &no_lag, seg_start));
             register_run_in_jac!(&wrapped, wrapped_jac);
             let sol =
                 solve_ode_certified(&wrapped, &u, (seg_start, seg_end), &ext, &[seg_end], opts);
@@ -1403,16 +1302,9 @@ fn equilibrate_ss_pk_state(
     // The quiet window's params are built inside each infusion arm below (a bolus has none).
     let advance_unforced = |u0: &[f64]| -> Option<Vec<f64>> {
         register_run_in_jac!(&base_rhs, run_in);
-        solve_ode_certified(
-            &base_rhs,
-            u0,
-            (0.0, dose.ii),
-            &ext_cycle,
-            &[dose.ii],
-            &eq_opts,
-        )
-        .last()
-        .map(|p| p.u.clone())
+        solve_ode_certified(&base_rhs, u0, (0.0, dose.ii), &ext_cycle, &[dose.ii], &eq_opts)
+            .last()
+            .map(|p| p.u.clone())
     };
     let advance_forced = |u0: &[f64]| -> Option<Vec<f64>> {
         if is_inf {
@@ -1430,16 +1322,9 @@ fn equilibrate_ss_pk_state(
             let mut y = u0.to_vec();
             y[cmt_idx] += f_bio * dose.amt;
             register_run_in_jac!(&base_rhs, run_in);
-            solve_ode_certified(
-                &base_rhs,
-                &y,
-                (0.0, dose.ii),
-                &ext_cycle,
-                &[dose.ii],
-                &eq_opts,
-            )
-            .last()
-            .map(|p| p.u.clone())
+            solve_ode_certified(&base_rhs, &y, (0.0, dose.ii), &ext_cycle, &[dose.ii], &eq_opts)
+                .last()
+                .map(|p| p.u.clone())
         }
     };
     if let Some(u_ss) = periodic_ss_fixed_point_pk(
@@ -1515,13 +1400,8 @@ fn equilibrate_ss_pk_state(
 /// the phase in both windows. `None` when a solve returns nothing.
 #[allow(clippy::too_many_arguments)]
 fn ss_infusion_cycle<J: Fn(&[f64], &[f64], f64, &mut [f64], &mut [f64]) -> bool>(
-    base_rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    run_in: &Option<J>,
-    pk_params_flat: &[f64],
-    u0: &[f64],
-    cmt_idx: usize,
-    (rate, t_inf, ii): (f64, f64, f64),
-    phase: f64,
+    base_rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), run_in: &Option<J>, pk_params_flat: &[f64],
+    u0: &[f64], cmt_idx: usize, (rate, t_inf, ii): (f64, f64, f64), phase: f64,
     opts: &OdeSolverOptions,
 ) -> Option<Vec<f64>> {
     let (m, r) = crate::dosing::ss_overlap_split_g(t_inf, ii);
@@ -1540,10 +1420,7 @@ fn ss_infusion_cycle<J: Fn(&[f64], &[f64], f64, &mut [f64], &mut [f64]) -> bool>
         register_run_in_jac!(&rhs, run_in);
         let span = to - from;
         let ext = ss_run_in_params(pk_params_flat, 0.0 - from);
-        y = solve_ode_certified(&rhs, &y, (0.0, span), &ext, &[span], opts)
-            .last()?
-            .u
-            .clone();
+        y = solve_ode_certified(&rhs, &y, (0.0, span), &ext, &[span], opts).last()?.u.clone();
     }
     Some(y)
 }
@@ -1559,12 +1436,8 @@ fn ss_infusion_cycle<J: Fn(&[f64], &[f64], f64, &mut [f64], &mut [f64]) -> bool>
 /// `crate::dosing::ss_residual_infusions_g`). The advance is part of the run-in, so it integrates
 /// under [`mask_chz`] (#1210's `ALAG1 = 2` arm).
 fn ss_state_at_phase(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    phase: f64,
-    opts: &OdeSolverOptions,
-    chz_before: &[f64],
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, phase: f64,
+    opts: &OdeSolverOptions, chz_before: &[f64],
 ) -> Vec<f64> {
     let mut u = ss_state_at_phase_pk(ode, pk_params_flat, dose, phase, opts);
     restore_chz(ode, &mut u, chz_before);
@@ -1576,34 +1449,20 @@ fn ss_state_at_phase(
 /// absorption compartment (#2786), the fixed point of the cycle starting at the record with the
 /// dose's pulse `lag` into it ([`equilibrate_ss_input_rate_lagged`]).
 fn ss_seed_at_record(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    lag: f64,
-    opts: &OdeSolverOptions,
-    chz_before: &[f64],
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, lag: f64,
+    opts: &OdeSolverOptions, chz_before: &[f64],
 ) -> Vec<f64> {
     if !is_real_infusion(dose) && input_rate_consumes_cmt(ode, dose.cmt_raw()) {
         equilibrate_ss_state_lagged(ode, pk_params_flat, dose, lag, opts, chz_before)
     } else {
-        ss_state_at_phase(
-            ode,
-            pk_params_flat,
-            dose,
-            ss_seed_phase(dose, lag),
-            opts,
-            chz_before,
-        )
+        ss_state_at_phase(ode, pk_params_flat, dose, ss_seed_phase(dose, lag), opts, chz_before)
     }
 }
 
 /// The PK-only body of [`ss_state_at_phase`] — see that function. Every integration runs under
 /// [`mask_chz`]; the accumulator rows come back at zero for the wrapper to fill.
 fn ss_state_at_phase_pk(
-    ode: &crate::ode::OdeSpec,
-    pk_params_flat: &[f64],
-    dose: &DoseEvent,
-    phase: f64,
+    ode: &crate::ode::OdeSpec, pk_params_flat: &[f64], dose: &DoseEvent, phase: f64,
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
     // ### The phase advance is a run-in window too, and it is the pre-arrival one
@@ -1696,14 +1555,8 @@ fn ss_state_at_phase_pk(
 /// to `F·AMT/rate`; a duration-defined one (`RATE=-2`) keeps its window and F scales the rate.
 /// Missing entries default to 1.0. The caller's breaks must split at the same F-scaled ends.
 pub(crate) fn active_infusions(
-    input_rate: &[crate::pk::absorption::InputRateForcing],
-    doses: &[DoseEvent],
-    t_start: f64,
-    t_end: f64,
-    dose_lagtimes: &[f64],
-    dose_f_bio: &[f64],
-    reset_floor: f64,
-    n_states: usize,
+    input_rate: &[crate::pk::absorption::InputRateForcing], doses: &[DoseEvent], t_start: f64,
+    t_end: f64, dose_lagtimes: &[f64], dose_f_bio: &[f64], reset_floor: f64, n_states: usize,
 ) -> Vec<(usize, f64)> {
     active_infusion_doses(
         input_rate,
@@ -1716,16 +1569,7 @@ pub(crate) fn active_infusions(
         n_states,
     )
     .into_iter()
-    .map(|(_, cmt, rate, pulses)| {
-        (
-            cmt,
-            if pulses == 1 {
-                rate
-            } else {
-                rate * pulses as f64
-            },
-        )
-    })
+    .map(|(_, cmt, rate, pulses)| (cmt, if pulses == 1 { rate } else { rate * pulses as f64 }))
     .collect()
 }
 
@@ -1739,14 +1583,8 @@ const PULSES_INDIVIDUAL: usize = 16;
 /// dose from `k` and multiplies by `pulses`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn active_infusion_doses(
-    input_rate: &[crate::pk::absorption::InputRateForcing],
-    doses: &[DoseEvent],
-    t_start: f64,
-    t_end: f64,
-    dose_lagtimes: &[f64],
-    dose_f_bio: &[f64],
-    reset_floor: f64,
-    n_states: usize,
+    input_rate: &[crate::pk::absorption::InputRateForcing], doses: &[DoseEvent], t_start: f64,
+    t_end: f64, dose_lagtimes: &[f64], dose_f_bio: &[f64], reset_floor: f64, n_states: usize,
 ) -> Vec<(usize, usize, f64, usize)> {
     let f_of = |k: usize| dose_f_bio.get(k).copied().unwrap_or(1.0);
     active_infusion_doses_g(
@@ -1771,13 +1609,8 @@ pub(crate) fn active_infusion_doses(
 /// guarded comparison, not an exact value — and `f64` reproduces the plain walk bit for bit.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn active_infusion_doses_g<T: crate::sens::num::PkNum>(
-    input_rate: &[crate::pk::absorption::InputRateForcing],
-    doses: &[DoseEvent],
-    t_start: T,
-    t_end: T,
-    dose_lagtimes: &[f64],
-    window_of: &dyn Fn(usize, &DoseEvent) -> T,
-    reset_floor: f64,
+    input_rate: &[crate::pk::absorption::InputRateForcing], doses: &[DoseEvent], t_start: T,
+    t_end: T, dose_lagtimes: &[f64], window_of: &dyn Fn(usize, &DoseEvent) -> T, reset_floor: f64,
     n_states: usize,
 ) -> Vec<(usize, usize, usize)> {
     use crate::sens::num::BranchCmp::Ge;
@@ -1854,9 +1687,7 @@ type ZeroOrderWindow = (usize, f64, f64, f64, usize);
 /// `FR*zero_order(...)` in a `mixed` model (#505). Doses not feeding a `zero_order` forcing
 /// contribute no window.
 fn zero_order_windows(
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
-    dose_f_bio: &[f64],
+    doses: &[DoseEvent], dose_lagtimes: &[f64], dose_f_bio: &[f64],
     dur_frac_for_dose: impl Fn(usize, &DoseEvent) -> Option<(f64, f64, f64)>,
 ) -> Vec<ZeroOrderWindow> {
     let mut out = Vec::new();
@@ -1872,13 +1703,7 @@ fn zero_order_windows(
         // with it (via `zero_order_dur_and_lag_for_dose`), keeping every segment
         // fully inside or outside the window (#504 mass-exactness) under a route lag.
         let w_start = d.time + lag + route_lag;
-        out.push((
-            d.cmt_idx(),
-            f_bio * d.amt * frac / dur,
-            w_start,
-            w_start + dur,
-            k,
-        ));
+        out.push((d.cmt_idx(), f_bio * d.amt * frac / dur, w_start, w_start + dur, k));
     }
     out
 }
@@ -1891,11 +1716,7 @@ fn zero_order_windows(
 /// The segment's [`ResetGate`] turns off windows recorded before a reached EVID=3/4 reset (#1587)
 /// or `SS=1` record (#1586).
 fn active_zero_order_inputs(
-    windows: &[ZeroOrderWindow],
-    doses: &[DoseEvent],
-    t_start: f64,
-    t_end: f64,
-    reset_floor: f64,
+    windows: &[ZeroOrderWindow], doses: &[DoseEvent], t_start: f64, t_end: f64, reset_floor: f64,
 ) -> Vec<(usize, f64)> {
     // Most subjects have no zero-order window: skip the gate's O(n) cutoff scan for them.
     if windows.is_empty() {
@@ -1918,9 +1739,7 @@ fn active_zero_order_inputs(
 /// `R_in`) and [`InputRateForcing::frac`]. One zero-order forcing per compartment: the parser
 /// rejects more (#505).
 fn zero_order_dur_and_frac_for_dose(
-    ode: &OdeSpec,
-    dose: &DoseEvent,
-    pk_params: &[f64],
+    ode: &OdeSpec, dose: &DoseEvent, pk_params: &[f64],
 ) -> Option<(f64, f64, f64)> {
     if dose.amt <= 0.0 {
         return None;
@@ -1954,9 +1773,7 @@ fn zero_order_dur_and_frac_for_dose(
 /// projection of [`zero_order_dur_and_frac_for_dose`] so the two never disagree on
 /// which forcing / `dur` / `lag_route` a dose resolves to.
 fn zero_order_dur_and_lag_for_dose(
-    ode: &OdeSpec,
-    dose: &DoseEvent,
-    pk_params: &[f64],
+    ode: &OdeSpec, dose: &DoseEvent, pk_params: &[f64],
 ) -> Option<(f64, f64)> {
     zero_order_dur_and_frac_for_dose(ode, dose, pk_params)
         .map(|(dur, _, route_lag)| (dur, route_lag))
@@ -1968,8 +1785,7 @@ fn zero_order_dur_and_lag_for_dose(
 /// applies no forcing can pass `&[]` (the EKF).
 #[inline]
 pub(crate) fn forcing_consumes_cmt(
-    input_rate: &[crate::pk::absorption::InputRateForcing],
-    cmt: usize,
+    input_rate: &[crate::pk::absorption::InputRateForcing], cmt: usize,
 ) -> bool {
     input_rate.iter().any(|f| f.cmt == cmt)
 }
@@ -1985,9 +1801,7 @@ pub(crate) fn forcing_consumes_cmt(
 /// `residual_ss_infusion_window_obeys_the_membership_predicate` (#1236).
 #[inline]
 pub(crate) fn infusion_contributes(
-    input_rate: &[crate::pk::absorption::InputRateForcing],
-    d: &DoseEvent,
-    n_states: usize,
+    input_rate: &[crate::pk::absorption::InputRateForcing], d: &DoseEvent, n_states: usize,
 ) -> bool {
     // The `CMT=0` half is [`crate::dosing::infusion_has_rate_channel`] rather than a
     // local `cmt_raw() == 0`, so this resolver and the analytic sensitivity walk cannot
@@ -2025,11 +1839,7 @@ pub(crate) fn input_rate_consumes_cmt(ode: &OdeSpec, cmt_1based: usize) -> bool 
 /// step, so a new builder needs only this call (not [`push_route_lag_break_times`] too). Extra
 /// breaks for unlagged or reset doses are harmless.
 fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderWindow]) {
-    break_times.extend(
-        windows
-            .iter()
-            .flat_map(|&(_, _, w_start, w_end, _)| [w_start, w_end]),
-    );
+    break_times.extend(windows.iter().flat_map(|&(_, _, w_start, w_end, _)| [w_start, w_end]));
 }
 
 /// Push a break at every per-route absorption onset `d.time + lag_cmt + lag_route` for each
@@ -2038,10 +1848,7 @@ fn push_zero_order_break_times(break_times: &mut Vec<f64>, windows: &[ZeroOrderW
 /// onset kink is unresolved and a lagged `zero_order` window is never fully contained. No-op
 /// without a route lag.
 fn push_route_lag_break_times(
-    break_times: &mut Vec<f64>,
-    ode: &OdeSpec,
-    subject: &Subject,
-    dose_lagtimes: &[f64],
+    break_times: &mut Vec<f64>, ode: &OdeSpec, subject: &Subject, dose_lagtimes: &[f64],
     dose_f_bio: &[f64],
     route_lag_of: impl Fn(&crate::pk::absorption::InputRateForcing, usize) -> f64,
 ) {
@@ -2093,12 +1900,8 @@ enum InfusionInput {
 /// slice the caller actually applies (both call sites pass `&ode.input_rate`). `gate` is the
 /// segment's [`ResetGate`], the list's **one** reset test (#1586).
 fn gated_infusions(
-    input_rate: &[crate::pk::absorption::InputRateForcing],
-    active: &[ActiveWindow],
-    doses: &[DoseEvent],
-    dose_f_bio: &[f64],
-    n_states: usize,
-    gate: &ResetGate,
+    input_rate: &[crate::pk::absorption::InputRateForcing], active: &[ActiveWindow],
+    doses: &[DoseEvent], dose_f_bio: &[f64], n_states: usize, gate: &ResetGate,
 ) -> Vec<(usize, f64, f64, f64)> {
     active
         .iter()
@@ -2121,11 +1924,7 @@ fn gated_infusions(
             // break-time list.
             let (rate_eff, _) = dose.bioavailable_infusion(dose_f_bio[di]);
             // `pulses` equal windows sharing one entry (see `push_residual_windows`).
-            let rate_eff = if pulses == 1 {
-                rate_eff
-            } else {
-                rate_eff * pulses as f64
-            };
+            let rate_eff = if pulses == 1 { rate_eff } else { rate_eff * pulses as f64 };
             Some((cmt, rate_eff, t_start_inf, t_end_inf))
         })
         .collect()
@@ -2141,12 +1940,7 @@ type ActiveWindow = (usize, f64, f64, usize);
 /// by one (exact summation order), more as one entry carrying their count, since a rate driven
 /// toward 0 makes the count astronomically large.
 fn push_residual_windows(
-    active: &mut Vec<ActiveWindow>,
-    di: usize,
-    dose: &DoseEvent,
-    lag: f64,
-    f_bio: f64,
-    horizon: f64,
+    active: &mut Vec<ActiveWindow>, di: usize, dose: &DoseEvent, lag: f64, f_bio: f64, horizon: f64,
 ) {
     let ends = crate::dosing::ss_residual_ends(dose, lag, f_bio);
     let far = ends.count_ending_after(horizon);
@@ -2155,10 +1949,7 @@ fn push_residual_windows(
     } else {
         active.push((di, dose.time, ends.end(far - 1), far));
     }
-    active.extend(
-        ends.within(f64::NEG_INFINITY, horizon)
-            .map(|(_, e)| (di, dose.time, e, 1)),
-    );
+    active.extend(ends.within(f64::NEG_INFINITY, horizon).map(|(_, e)| (di, dose.time, e, 1)));
 }
 
 /// One dose's built-in absorption forcing, read at that dose's own record (#1569): the
@@ -2174,8 +1965,7 @@ pub(crate) struct DoseInputRate<T = f64> {
 
 impl<T: crate::sens::num::PkNum> DoseInputRate<T> {
     fn read(
-        forcing: &InputRateForcing,
-        params: &[T],
+        forcing: &InputRateForcing, params: &[T],
         prep: &impl Fn(&InputRateForcing, &[T]) -> PreparedInputRate<T>,
     ) -> Self {
         Self {
@@ -2203,25 +1993,17 @@ pub(crate) struct PreparedForcings<T = f64> {
 impl<T: crate::sens::num::PkNum> PreparedForcings<T> {
     /// Every dose reads the one snapshot `params`.
     pub(crate) fn shared(
-        ode: &OdeSpec,
-        params: &[T],
-        prep: impl Fn(&InputRateForcing, &[T]) -> PreparedInputRate<T>,
+        ode: &OdeSpec, params: &[T], prep: impl Fn(&InputRateForcing, &[T]) -> PreparedInputRate<T>,
     ) -> Self {
         Self {
             per_dose: None,
-            rows: ode
-                .input_rate
-                .iter()
-                .map(|f| DoseInputRate::read(f, params, &prep))
-                .collect(),
+            rows: ode.input_rate.iter().map(|f| DoseInputRate::read(f, params, &prep)).collect(),
         }
     }
 
     /// Dose `k` reads its own record's snapshot, `dose_params(k)`.
     pub(crate) fn per_dose<'p>(
-        ode: &OdeSpec,
-        n_doses: usize,
-        dose_params: impl Fn(usize) -> &'p [T],
+        ode: &OdeSpec, n_doses: usize, dose_params: impl Fn(usize) -> &'p [T],
         prep: impl Fn(&InputRateForcing, &[T]) -> PreparedInputRate<T>,
     ) -> Self
     where
@@ -2231,16 +2013,12 @@ impl<T: crate::sens::num::PkNum> PreparedForcings<T> {
         for f in &ode.input_rate {
             rows.extend((0..n_doses).map(|k| DoseInputRate::read(f, dose_params(k), &prep)));
         }
-        Self {
-            per_dose: Some(n_doses),
-            rows,
-        }
+        Self { per_dose: Some(n_doses), rows }
     }
 
     /// The same forcings through `f` (a lift to a jet type).
     pub(crate) fn map<U: crate::sens::num::PkNum>(
-        &self,
-        f: impl Fn(T) -> U,
+        &self, f: impl Fn(T) -> U,
     ) -> PreparedForcings<U> {
         PreparedForcings {
             per_dose: self.per_dose,
@@ -2296,10 +2074,7 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> PreparedForcings {
 #[cfg(test)]
 #[inline]
 fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
-    prep: &PreparedInputRate<T>,
-    tad: T,
-    ii: T,
-    dose_mass: T,
+    prep: &PreparedInputRate<T>, tad: T, ii: T, dose_mass: T,
 ) -> T {
     ss_periodic_forcing_shifted(prep, tad, ii, dose_mass, T::from_f64(0.0))
 }
@@ -2321,11 +2096,7 @@ fn tad_cycle<T: crate::sens::num::PkNum>(tad: T, ii: T, shift: T, j: usize) -> T
 /// `shift = max(L − II, 0)`.
 #[inline]
 fn ss_periodic_forcing_shifted<T: crate::sens::num::PkNum>(
-    prep: &PreparedInputRate<T>,
-    tad: T,
-    ii: T,
-    dose_mass: T,
-    shift: T,
+    prep: &PreparedInputRate<T>, tad: T, ii: T, dose_mass: T, shift: T,
 ) -> T {
     let mut local = T::from_f64(0.0);
     if T::RECORDS_BRANCHES {
@@ -2412,14 +2183,9 @@ impl ResetGate<f64> {
     /// segment time goes through [`Self::at_segment`]'s branch API.
     #[inline]
     pub(crate) fn at_segment_indexed(
-        index: &crate::dosing::DoseIndex,
-        doses: &[DoseEvent],
-        reset_floor: f64,
-        t_seg: f64,
+        index: &crate::dosing::DoseIndex, doses: &[DoseEvent], reset_floor: f64, t_seg: f64,
     ) -> Self {
-        Self::with_cutoff(reset_floor, t_seg, |reached| {
-            index.ss_cutoff(doses, reached)
-        })
+        Self::with_cutoff(reset_floor, t_seg, |reached| index.ss_cutoff(doses, reached))
     }
 }
 
@@ -2440,12 +2206,7 @@ impl<G: crate::sens::num::PkNum> ResetGate<G> {
     #[inline]
     fn with_cutoff(reset_floor: G, t_seg: G, cutoff: impl FnOnce(G) -> Option<usize>) -> Self {
         let reached = t_seg + G::from_f64(EVENT_MATCH_TOL);
-        Self {
-            cutoff: cutoff(reached),
-            reached,
-            reset_floor,
-            t_seg,
-        }
+        Self { cutoff: cutoff(reached), reached, reset_floor, t_seg }
     }
 
     /// Whether dose `k` is live: not reset by a reached `SS=1` record, not recorded before the
@@ -2488,15 +2249,8 @@ pub(crate) fn add_prepared_input_rate_forcing<
     T: crate::sens::num::PkNum,
     G: crate::sens::num::PkNum,
 >(
-    ode: &OdeSpec,
-    prepared: &PreparedForcings<T>,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[T],
-    dose_f_bio: &[T],
-    infusion_windows: &[Option<T>],
-    gate: ResetGate<G>,
-    t: T,
-    since: T,
+    ode: &OdeSpec, prepared: &PreparedForcings<T>, doses: &[DoseEvent], dose_lagtimes: &[T],
+    dose_f_bio: &[T], infusion_windows: &[Option<T>], gate: ResetGate<G>, t: T, since: T,
     dy: &mut [T],
 ) {
     add_input_rate_forcing_core(
@@ -2525,18 +2279,9 @@ pub(crate) fn add_input_rate_forcing_except_cumulative<
     T: crate::sens::num::PkNum,
     G: crate::sens::num::PkNum,
 >(
-    ode: &OdeSpec,
-    prepared: &PreparedForcings<T>,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[T],
-    dose_f_bio: &[T],
-    infusion_windows: &[Option<T>],
-    gate: ResetGate<G>,
-    t: T,
-    since: T,
-    framed: &[(usize, usize)],
-    anchored: bool,
-    dy: &mut [T],
+    ode: &OdeSpec, prepared: &PreparedForcings<T>, doses: &[DoseEvent], dose_lagtimes: &[T],
+    dose_f_bio: &[T], infusion_windows: &[Option<T>], gate: ResetGate<G>, t: T, since: T,
+    framed: &[(usize, usize)], anchored: bool, dy: &mut [T],
 ) {
     add_input_rate_forcing_core(
         ode,
@@ -2557,18 +2302,9 @@ pub(crate) fn add_input_rate_forcing_except_cumulative<
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::PkNum>(
-    ode: &OdeSpec,
-    prepared: &PreparedForcings<T>,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[T],
-    dose_f_bio: &[T],
-    infusion_windows: &[Option<T>],
-    gate: ResetGate<G>,
-    t: T,
-    since: T,
-    framed: &[(usize, usize)],
-    anchored: bool,
-    dy: &mut [T],
+    ode: &OdeSpec, prepared: &PreparedForcings<T>, doses: &[DoseEvent], dose_lagtimes: &[T],
+    dose_f_bio: &[T], infusion_windows: &[Option<T>], gate: ResetGate<G>, t: T, since: T,
+    framed: &[(usize, usize)], anchored: bool, dy: &mut [T],
 ) {
     debug_assert!(
         prepared.per_dose.is_none_or(|n| n == doses.len()),
@@ -2642,14 +2378,12 @@ fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::
                 let f_bio_k = dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0));
                 // The window carries the jets of `F` (`F·duration`, rate-defined) or of the
                 // modeled `D`/`R` (`infusion_windows`, a dose record that cannot say).
-                let window = infusion_windows
-                    .get(k)
-                    .copied()
-                    .flatten()
-                    .unwrap_or_else(|| match d.infusion_def {
-                        crate::types::InfusionDef::RateDefined => f_bio_k * T::from_f64(d.duration),
-                        crate::types::InfusionDef::DurationDefined => T::from_f64(d.duration),
-                    });
+                let window = infusion_windows.get(k).copied().flatten().unwrap_or_else(|| match d
+                    .infusion_def
+                {
+                    crate::types::InfusionDef::RateDefined => f_bio_k * T::from_f64(d.duration),
+                    crate::types::InfusionDef::DurationDefined => T::from_f64(d.duration),
+                });
                 // Which side of its two kinks (the onset and the window end) the segment lies
                 // on is the segment's, by the membership every window uses: `since` is where
                 // it starts, and each time is a break of its timeline.
@@ -2796,22 +2530,14 @@ struct CumulativeItem<T> {
 impl<T: crate::sens::num::PkNum> CumulativeInputs<T> {
     /// No dose in the cumulative frame.
     pub(crate) fn empty() -> Self {
-        Self {
-            items: Vec::new(),
-            framed: Vec::new(),
-        }
+        Self { items: Vec::new(), framed: Vec::new() }
     }
 
     /// The cumulative-frame doses live in a segment starting at `since`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_segment<G: crate::sens::num::PkNum>(
-        ode: &OdeSpec,
-        prepared: &PreparedForcings<T>,
-        doses: &[DoseEvent],
-        dose_lagtimes: &[T],
-        dose_f_bio: &[T],
-        gate: ResetGate<G>,
-        since: T,
+        ode: &OdeSpec, prepared: &PreparedForcings<T>, doses: &[DoseEvent], dose_lagtimes: &[T],
+        dose_f_bio: &[T], gate: ResetGate<G>, since: T,
     ) -> Self {
         let mut items = Vec::new();
         let mut framed = Vec::new();
@@ -2928,14 +2654,8 @@ impl<T: crate::sens::num::PkNum> CumulativeInputs<T> {
 /// holds each dose's absorption forcing, read at its dose record ([`PreparedForcings`]).
 #[allow(clippy::too_many_arguments)] // each is a distinct slice of dose/forcing context
 fn wrap_rhs_with_forcings<'a>(
-    ode: &'a OdeSpec,
-    doses: &'a [DoseEvent],
-    dose_lagtimes: &'a [f64],
-    dose_f_bio: &'a [f64],
-    reset_floor: f64,
-    t_seg: f64,
-    prepared: &'a PreparedForcings,
-    infusions: InfusionInput,
+    ode: &'a OdeSpec, doses: &'a [DoseEvent], dose_lagtimes: &'a [f64], dose_f_bio: &'a [f64],
+    reset_floor: f64, t_seg: f64, prepared: &'a PreparedForcings, infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
     let force = forcing_adder(
@@ -2958,8 +2678,7 @@ fn wrap_rhs_with_forcings<'a>(
 /// `ode.rhs` plus `force` — [`wrap_rhs_with_forcings`] over a caller-held forcing, so the
 /// same forcing can serve [`forced_jac`].
 fn forced<'a>(
-    ode: &'a OdeSpec,
-    force: &'a SegmentForcing<'a>,
+    ode: &'a OdeSpec, force: &'a SegmentForcing<'a>,
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
     // The state the model reads, in the cumulative frame: `v + shift(t)`.
     let scratch = std::cell::RefCell::new(Vec::<f64>::new());
@@ -2981,13 +2700,8 @@ fn forced<'a>(
 /// `DualT<1, f64>` pass of the `[odes]` program per state and one along the clock (the EKF's
 /// pattern, `ode::ekf`).
 pub(crate) fn jet_jacobian(
-    prog: &crate::parser::model_parser::OdeRhsProgram,
-    u: &[f64],
-    p: &[f64],
-    t: f64,
-    clock: bool,
-    jac: &mut [f64],
-    ft: &mut [f64],
+    prog: &crate::parser::model_parser::OdeRhsProgram, u: &[f64], p: &[f64], t: f64, clock: bool,
+    jac: &mut [f64], ft: &mut [f64],
 ) {
     // A missing anchor reads `NaN`, as the closure's does.
     let anchor = |i: usize| p.get(i).copied().unwrap_or(f64::NAN);
@@ -3012,9 +2726,7 @@ pub(crate) fn jet_jacobian(
 /// `autonomous` segment (no pass for the program either), and a compartment held off is a zero
 /// row. `None` when the spec's RHS is not its program's own closure.
 fn forced_jac<'a>(
-    ode: &'a OdeSpec,
-    force: &'a SegmentForcing<'a>,
-    autonomous: bool,
+    ode: &'a OdeSpec, force: &'a SegmentForcing<'a>, autonomous: bool,
 ) -> Option<impl Fn(&[f64], &[f64], f64, &mut [f64], &mut [f64]) -> bool + 'a> {
     use crate::sens::jet::DualT;
     type D1 = DualT<1, f64>;
@@ -3027,63 +2739,61 @@ fn forced_jac<'a>(
         let f_bio: Vec<D1> = force.dose_f_bio.iter().map(|&x| lift1(x)).collect();
         (force.prepared.map(lift1), lagged, f_bio)
     });
-    Some(
-        move |u: &[f64], p: &[f64], t: f64, jac: &mut [f64], ft: &mut [f64]| {
-            if u.len() < n {
-                return false;
-            }
-            // A cumulative-frame segment steps on `v = u − shift(t)`: the model's tangents are
-            // those at the physical `u = v + shift(t)`, and `f_t` gains `J·shift'(t)` (below).
-            let shifted: Vec<f64>;
-            let u: &[f64] = if force.is_cumulative() {
-                let mut v = u.to_vec();
-                force.cum.add_shift(t, &mut v);
-                shifted = v;
-                &shifted
-            } else {
-                u
-            };
-            if !native.as_ref().is_some_and(|nj| nj.eval(u, p, t, jac, ft)) {
-                jet_jacobian(prog, u, p, t, !autonomous, jac, ft);
-            }
-            if force.is_cumulative() {
-                let mut r = vec![0.0; n];
-                force.cum.add_rate(t, &mut r);
-                for (c, &rc) in r.iter().enumerate() {
-                    if rc != 0.0 {
-                        for i in 0..n {
-                            ft[i] += jac[i * n + c] * rc;
-                        }
+    Some(move |u: &[f64], p: &[f64], t: f64, jac: &mut [f64], ft: &mut [f64]| {
+        if u.len() < n {
+            return false;
+        }
+        // A cumulative-frame segment steps on `v = u − shift(t)`: the model's tangents are
+        // those at the physical `u = v + shift(t)`, and `f_t` gains `J·shift'(t)` (below).
+        let shifted: Vec<f64>;
+        let u: &[f64] = if force.is_cumulative() {
+            let mut v = u.to_vec();
+            force.cum.add_shift(t, &mut v);
+            shifted = v;
+            &shifted
+        } else {
+            u
+        };
+        if !native.as_ref().is_some_and(|nj| nj.eval(u, p, t, jac, ft)) {
+            jet_jacobian(prog, u, p, t, !autonomous, jac, ft);
+        }
+        if force.is_cumulative() {
+            let mut r = vec![0.0; n];
+            force.cum.add_rate(t, &mut r);
+            for (c, &rc) in r.iter().enumerate() {
+                if rc != 0.0 {
+                    for i in 0..n {
+                        ft[i] += jac[i * n + c] * rc;
                     }
                 }
             }
-            if let Some((prepared, lagged, f_bio)) = &rates {
-                let mut dy = vec![lift1(0.0); n];
-                add_input_rate_forcing_except_cumulative::<D1, f64>(
-                    ode,
-                    prepared,
-                    force.doses,
-                    lagged,
-                    f_bio,
-                    &[],
-                    force.gate,
-                    D1 { v: t, g: [1.0] },
-                    lift1(force.gate.t_seg),
-                    force.cum.framed(),
-                    false,
-                    &mut dy,
-                );
-                for i in 0..n {
-                    ft[i] += dy[i].g[0];
-                }
+        }
+        if let Some((prepared, lagged, f_bio)) = &rates {
+            let mut dy = vec![lift1(0.0); n];
+            add_input_rate_forcing_except_cumulative::<D1, f64>(
+                ode,
+                prepared,
+                force.doses,
+                lagged,
+                f_bio,
+                &[],
+                force.gate,
+                D1 { v: t, g: [1.0] },
+                lift1(force.gate.t_seg),
+                force.cum.framed(),
+                false,
+                &mut dy,
+            );
+            for i in 0..n {
+                ft[i] += dy[i].g[0];
             }
-            for &c in force.off {
-                jac[c * n..(c + 1) * n].fill(0.0);
-                ft[c] = 0.0;
-            }
-            true
-        },
-    )
+        }
+        for &c in force.off {
+            jac[c * n..(c + 1) * n].fill(0.0);
+            ft[c] = 0.0;
+        }
+        true
+    })
 }
 
 /// The exact `J` and `f_t` of a steady-state run-in's right-hand side when that is the
@@ -3093,30 +2803,27 @@ fn forced_jac<'a>(
 /// every accumulator. `None` when the spec's RHS is not its program's own closure. Register it
 /// with `register_run_in_jac!`.
 fn run_in_jac<'a>(
-    ode: &'a OdeSpec,
-    chz: &'a [usize],
+    ode: &'a OdeSpec, chz: &'a [usize],
 ) -> Option<impl Fn(&[f64], &[f64], f64, &mut [f64], &mut [f64]) -> bool + 'a> {
     let prog = ode.rhs_program.as_ref().filter(|p| p.serves(&*ode.rhs))?;
     let clock = prog.reads_model_time();
     let native = prog.native_jacobian(&*ode.rhs, clock);
-    Some(
-        move |u: &[f64], p: &[f64], t: f64, jac: &mut [f64], ft: &mut [f64]| {
-            let n = u.len();
-            if jac.len() != n * n {
-                return false;
+    Some(move |u: &[f64], p: &[f64], t: f64, jac: &mut [f64], ft: &mut [f64]| {
+        let n = u.len();
+        if jac.len() != n * n {
+            return false;
+        }
+        if !native.as_ref().is_some_and(|nj| nj.eval(u, p, t, jac, ft)) {
+            jet_jacobian(prog, u, p, t, clock, jac, ft);
+        }
+        for &c in chz {
+            if c < n {
+                jac[c * n..(c + 1) * n].fill(0.0);
+                ft[c] = 0.0;
             }
-            if !native.as_ref().is_some_and(|nj| nj.eval(u, p, t, jac, ft)) {
-                jet_jacobian(prog, u, p, t, clock, jac, ft);
-            }
-            for &c in chz {
-                if c < n {
-                    jac[c * n..(c + 1) * n].fill(0.0);
-                    ft[c] = 0.0;
-                }
-            }
-            true
-        },
-    )
+        }
+        true
+    })
 }
 
 /// [`forced`] as direct native calls: the program's `f64` native path, then the segment's
@@ -3192,8 +2899,7 @@ fn register_jac<'a>(
 ) -> crate::ode::rosenbrock::RhsGuard {
     crate::ode::rosenbrock::RhsGuard::register(
         rhs,
-        jac.as_ref()
-            .map(|c| c as &crate::ode::rosenbrock::JacFn<'_>),
+        jac.as_ref().map(|c| c as &crate::ode::rosenbrock::JacFn<'_>),
         direct.as_ref(),
     )
 }
@@ -3205,16 +2911,11 @@ fn register_jac<'a>(
 /// (`no_gated_infusions`). Spanning infusions and zero-order windows are constant over a
 /// segment by construction.
 fn segment_autonomous(
-    ode: &OdeSpec,
-    prepared: &PreparedForcings,
-    no_gated_infusions: bool,
+    ode: &OdeSpec, prepared: &PreparedForcings, no_gated_infusions: bool,
 ) -> bool {
     no_gated_infusions
         && prepared.is_empty()
-        && ode
-            .rhs_program
-            .as_ref()
-            .is_some_and(|p| !p.reads_model_time())
+        && ode.rhs_program.as_ref().is_some_and(|p| !p.reads_model_time())
 }
 
 /// The state-independent inputs [`wrap_rhs_with_forcings`] adds to the model's `du` at
@@ -3222,14 +2923,8 @@ fn segment_autonomous(
 /// that order ([`SegmentForcing::apply`]).
 #[allow(clippy::too_many_arguments)]
 fn forcing_adder<'a>(
-    ode: &'a OdeSpec,
-    doses: &'a [DoseEvent],
-    dose_lagtimes: &'a [f64],
-    dose_f_bio: &'a [f64],
-    reset_floor: f64,
-    t_seg: f64,
-    prepared: &'a PreparedForcings,
-    infusions: InfusionInput,
+    ode: &'a OdeSpec, doses: &'a [DoseEvent], dose_lagtimes: &'a [f64], dose_f_bio: &'a [f64],
+    reset_floor: f64, t_seg: f64, prepared: &'a PreparedForcings, infusions: InfusionInput,
     zero_order: &'a [(usize, f64)],
 ) -> SegmentForcing<'a> {
     SegmentForcing {
@@ -3254,10 +2949,7 @@ fn forcing_adder<'a>(
 /// only reachable through an on row, which is a no-op there as on any compartment that is
 /// already on: `check_cmt_toggles` refuses the off row.
 pub(crate) fn apply_cmt_toggle<T: Copy>(
-    toggle: &crate::types::CmtToggle,
-    u: &mut [T],
-    off: &mut Vec<usize>,
-    zero: T,
+    toggle: &crate::types::CmtToggle, u: &mut [T], off: &mut Vec<usize>, zero: T,
 ) {
     if toggle.state >= u.len() {
         return;
@@ -3282,11 +2974,7 @@ pub(crate) fn apply_cmt_toggle<T: Copy>(
 /// reader puts an on/off row (`order_cmt_toggle_ties`), and merged into the dose's break it
 /// would lose its side of the dose.
 pub(crate) fn apply_cmt_toggles_at_break(
-    subject: &Subject,
-    t_start: f64,
-    t_next: f64,
-    u: &mut [f64],
-    off: &mut Vec<usize>,
+    subject: &Subject, t_start: f64, t_next: f64, u: &mut [f64], off: &mut Vec<usize>,
 ) -> f64 {
     let mut first = f64::INFINITY;
     for toggle in &subject.cmt_toggles {
@@ -3306,10 +2994,7 @@ pub(crate) fn apply_cmt_toggles_at_break(
 /// so each stays a break of its own and [`apply_cmt_toggles_at_break`] finds it there.
 /// Empty for a subject with no such record.
 fn cmt_toggle_times(subject: &Subject) -> impl Iterator<Item = f64> + '_ {
-    subject
-        .cmt_toggles
-        .iter()
-        .filter_map(|c| subject.pk_only_times.get(c.pk_only).copied())
+    subject.cmt_toggles.iter().filter_map(|c| subject.pk_only_times.get(c.pk_only).copied())
 }
 
 /// The record set a constant-path walk on a toggled subject hands
@@ -3321,9 +3006,7 @@ fn cmt_toggle_times(subject: &Subject) -> impl Iterator<Item = f64> + '_ {
 /// its own. The driver (base arrivals; its controller doses sit at decisions) and the static
 /// engine replaying it (base ∪ ledger arrivals) build the same set.
 fn adaptive_toggle_record_bits(
-    subject: &Subject,
-    decisions: &[f64],
-    dose_arrivals: impl Iterator<Item = f64>,
+    subject: &Subject, decisions: &[f64], dose_arrivals: impl Iterator<Item = f64>,
 ) -> std::collections::HashSet<u64> {
     decisions
         .iter()
@@ -3527,14 +3210,8 @@ impl OdeReadout {
     /// sensitivities linearise the same expression.
     #[inline]
     pub(crate) fn eval(
-        &self,
-        state: &[f64],
-        pk_params_flat: &[f64],
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-        obs_cmt: usize,
-        time: f64,
+        &self, state: &[f64], pk_params_flat: &[f64], theta: &[f64], eta: &[f64],
+        covariates: &HashMap<String, f64>, obs_cmt: usize, time: f64,
     ) -> f64 {
         match self {
             OdeReadout::ObsCmt(idx) => state[*idx],
@@ -3561,17 +3238,10 @@ impl OdeReadout {
 /// — see [`OdeReadout::eval`].
 #[inline]
 fn read_observable(
-    ode: &OdeSpec,
-    u: &[f64],
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &HashMap<String, f64>,
-    obs_cmt: usize,
-    time: f64,
+    ode: &OdeSpec, u: &[f64], pk_params_flat: &[f64], theta: &[f64], eta: &[f64],
+    covariates: &HashMap<String, f64>, obs_cmt: usize, time: f64,
 ) -> f64 {
-    ode.readout
-        .eval(u, pk_params_flat, theta, eta, covariates, obs_cmt, time)
+    ode.readout.eval(u, pk_params_flat, theta, eta, covariates, obs_cmt, time)
 }
 
 /// Record `read_observable` into `predictions[obs_idx]` for every observation
@@ -3582,15 +3252,8 @@ fn read_observable(
 /// cloned into `states[obs_idx]` too (the `_with_states` driver).
 #[inline]
 fn record_observations(
-    ode: &OdeSpec,
-    obs_idxs: &[usize],
-    u: &[f64],
-    pk: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    subject: &Subject,
-    predictions: &mut [f64],
-    mut states: Option<&mut [Vec<f64>]>,
+    ode: &OdeSpec, obs_idxs: &[usize], u: &[f64], pk: &[f64], theta: &[f64], eta: &[f64],
+    subject: &Subject, predictions: &mut [f64], mut states: Option<&mut [Vec<f64>]>,
 ) {
     for &obs_idx in obs_idxs {
         let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
@@ -3693,11 +3356,8 @@ pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start
     // No dose has arrived yet. `fold` over an empty dose list leaves `+∞`, which is
     // the dose-free case and must read NaN rather than propagate as an infinite
     // anchor.
-    let first_arrival = doses
-        .iter()
-        .enumerate()
-        .map(|(i, d)| d.time + lag_at(i))
-        .fold(f64::INFINITY, f64::min);
+    let first_arrival =
+        doses.iter().enumerate().map(|(i, d)| d.time + lag_at(i)).fold(f64::INFINITY, f64::min);
     if first_arrival.is_finite() {
         first_arrival
     } else {
@@ -3710,9 +3370,7 @@ pub(crate) fn tad_anchor_for(doses: &[DoseEvent], dose_lagtimes: &[f64], t_start
 /// dense path, where every dose reads the same `pk_params_flat`.
 #[inline]
 fn subject_dose_attrs(
-    subject: &Subject,
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
+    subject: &Subject, ode: &OdeSpec, pk_params_flat: &[f64],
 ) -> (Vec<f64>, Vec<f64>) {
     subject_dose_attrs_with(subject, ode, |_| pk_params_flat)
 }
@@ -3722,9 +3380,7 @@ fn subject_dose_attrs(
 /// `|_| pk_params_flat` instance of this.
 #[inline]
 fn subject_dose_attrs_with<'a>(
-    subject: &Subject,
-    ode: &OdeSpec,
-    pk_for_dose: impl Fn(usize) -> &'a [f64],
+    subject: &Subject, ode: &OdeSpec, pk_for_dose: impl Fn(usize) -> &'a [f64],
 ) -> (Vec<f64>, Vec<f64>) {
     let dose_lagtimes: Vec<f64> = subject
         .doses
@@ -3749,9 +3405,7 @@ fn subject_dose_attrs_with<'a>(
 #[cfg(feature = "survival")]
 #[inline]
 pub(crate) fn dose_lagtimes_for(
-    subject: &Subject,
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
+    subject: &Subject, ode: &OdeSpec, pk_params_flat: &[f64],
 ) -> Vec<f64> {
     dose_lagtimes_reading(subject, ode, DoseReads::Shared(pk_params_flat))
 }
@@ -3762,9 +3416,7 @@ pub(crate) fn dose_lagtimes_for(
 #[cfg(feature = "survival")]
 #[inline]
 pub(crate) fn dose_lagtimes_reading(
-    subject: &Subject,
-    ode: &OdeSpec,
-    dose_reads: DoseReads<'_>,
+    subject: &Subject, ode: &OdeSpec, dose_reads: DoseReads<'_>,
 ) -> Vec<f64> {
     subject
         .doses
@@ -3786,10 +3438,7 @@ pub(crate) fn dose_lagtimes_reading(
 #[cfg(feature = "survival")]
 #[inline]
 pub(crate) fn rhs_ext_params_at(
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
-    first_dose_time: f64,
-    pk_params_flat: &[f64],
+    doses: &[DoseEvent], dose_lagtimes: &[f64], first_dose_time: f64, pk_params_flat: &[f64],
     t: f64,
 ) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
     let mut ext_params = seed_ext_params(pk_params_flat, first_dose_time);
@@ -3886,12 +3535,7 @@ pub(crate) fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// driver on them. That is an engine defect, filed as #1539, and it is the reason a silent
 /// row of the message table is not the same as a correct one.
 fn unanchored_dose_clock_error(
-    ode: &OdeSpec,
-    subject: &Subject,
-    u_start: &[f64],
-    u: &[f64],
-    ext_params: &[f64],
-    t_start: f64,
+    ode: &OdeSpec, subject: &Subject, u_start: &[f64], u: &[f64], ext_params: &[f64], t_start: f64,
     t_end: f64,
 ) -> Option<String> {
     debug_assert!(
@@ -3908,10 +3552,8 @@ fn unanchored_dose_clock_error(
     // Phase A pairs the window's start state with every grid time (see
     // [`unanchored_clock_dependence`] for why a diverged window keeps this pairing). Its end
     // state is non-finite, so it is never a pair the probe could read.
-    let pairs: Vec<(f64, &[f64])> = clock_probe_grid(t_start, t_end)
-        .into_iter()
-        .map(|t| (t, u_start))
-        .collect();
+    let pairs: Vec<(f64, &[f64])> =
+        clock_probe_grid(t_start, t_end).into_iter().map(|t| (t, u_start)).collect();
     let dependence = unanchored_clock_dependence(
         ode,
         ext_params,
@@ -3964,9 +3606,7 @@ const CLOCK_COMPARISON_NOTE: &str = "A comparison against an unanchored clock do
 /// before the solve, when `ext_params` still holds the previous segment's, so it can request
 /// the soft samples phase B reads.
 fn unanchored_clock_candidates(
-    ode: &OdeSpec,
-    tad_anchor: impl FnOnce() -> f64,
-    ext_params: &[f64],
+    ode: &OdeSpec, tad_anchor: impl FnOnce() -> f64, ext_params: &[f64],
 ) -> Option<(bool, bool)> {
     let prog = ode.rhs_program.as_ref()?;
     let tad = prog.pk_reads_tad() && tad_anchor().is_nan();
@@ -4010,16 +3650,10 @@ struct PendingClockWindow {
 /// derivative is compared at the (time, state) pairs the trajectory visited, never at a pairing
 /// it did not. `Some(message)` when the window must be refused.
 fn unanchored_dose_clock_error_at_dose(
-    ode: &OdeSpec,
-    subject: &Subject,
-    window: &PendingClockWindow,
-    dose_time: f64,
+    ode: &OdeSpec, subject: &Subject, window: &PendingClockWindow, dose_time: f64,
 ) -> Option<String> {
-    let pairs: Vec<(f64, &[f64])> = window
-        .samples
-        .iter()
-        .map(|(t, state)| (*t, state.as_slice()))
-        .collect();
+    let pairs: Vec<(f64, &[f64])> =
+        window.samples.iter().map(|(t, state)| (*t, state.as_slice())).collect();
     let dependence = unanchored_clock_dependence(
         ode,
         &window.ext_params,
@@ -4188,12 +3822,7 @@ impl ClockDependence {
 /// `3 × pairs` to name the slots when both are candidates and the segment is refused. Nothing on
 /// segments with an anchored clock, and nothing on the RHS hot path.
 fn unanchored_clock_dependence(
-    ode: &OdeSpec,
-    ext_params: &[f64],
-    tad: bool,
-    tafd: bool,
-    pairs: &[(f64, &[f64])],
-    anchor: f64,
+    ode: &OdeSpec, ext_params: &[f64], tad: bool, tafd: bool, pairs: &[(f64, &[f64])], anchor: f64,
 ) -> Option<ClockDependence> {
     // A fixed order: `alone[j]` below is indexed like this list.
     let candidates: Vec<usize> = [(tad, TAD_ANCHOR_SLOT), (tafd, TAFD_ANCHOR_SLOT)]
@@ -4209,11 +3838,8 @@ fn unanchored_clock_dependence(
         anchored[slot] = anchor;
     }
     // Per pair, only a state whose every component is finite (see the doc comment).
-    let pairs: Vec<(f64, &[f64])> = pairs
-        .iter()
-        .copied()
-        .filter(|(_, state)| state.iter().all(|x| x.is_finite()))
-        .collect();
+    let pairs: Vec<(f64, &[f64])> =
+        pairs.iter().copied().filter(|(_, state)| state.iter().all(|x| x.is_finite())).collect();
     let n = pairs.first().map_or(0, |(_, state)| state.len());
     let (mut du_ran, mut du_anchored) = (vec![0.0; n], vec![0.0; n]);
     let mut depends = false;
@@ -4243,10 +3869,7 @@ fn unanchored_clock_dependence(
                 alone_unanchored.copy_from_slice(&anchored);
                 alone_unanchored[slot] = f64::NAN;
                 (ode.rhs)(state, &alone_unanchored, t, &mut du_ran);
-                alone[j] |= du_ran
-                    .iter()
-                    .zip(&du_anchored)
-                    .any(|(&ran, &anch)| moves(ran, anch));
+                alone[j] |= du_ran.iter().zip(&du_anchored).any(|(&ran, &anch)| moves(ran, anch));
             }
         }
     }
@@ -4285,17 +3908,13 @@ fn update_tafd_anchor(ext_params: &mut [f64], t: f64) {
 /// slot `MAX_PK_PARAMS + 1` (TAD) is left NaN for the per-segment update.
 #[inline]
 pub(crate) fn seed_ext_params(
-    pk_params_flat: &[f64],
-    first_dose_time: f64,
+    pk_params_flat: &[f64], first_dose_time: f64,
 ) -> [f64; crate::types::MAX_PK_PARAMS + 2] {
     let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
     let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
     ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
-    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
-        first_dose_time
-    } else {
-        f64::NAN
-    };
+    ext_params[crate::types::MAX_PK_PARAMS] =
+        if first_dose_time.is_finite() { first_dose_time } else { f64::NAN };
     ext_params
 }
 
@@ -4319,11 +3938,8 @@ pub(crate) struct ObsIndex {
 
 impl ObsIndex {
     pub(crate) fn new(times: &[f64]) -> Self {
-        let mut pairs: Vec<(u64, usize)> = times
-            .iter()
-            .enumerate()
-            .map(|(i, t)| (t.to_bits(), i))
-            .collect();
+        let mut pairs: Vec<(u64, usize)> =
+            times.iter().enumerate().map(|(i, t)| (t.to_bits(), i)).collect();
         // Already in order for the usual non-decreasing times.
         if !pairs.windows(2).all(|w| w[0] <= w[1]) {
             pairs.sort_unstable();
@@ -4750,11 +4366,7 @@ fn integrate_segment(
 
 /// Dose events are handled as state discontinuities between integration segments.
 pub fn ode_predictions(
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    subject: &Subject,
+    ode: &OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &Subject,
 ) -> Vec<f64> {
     // A compartment on/off record (#2732) stops a dose's input at the row: the engine
     // honours the rows and reads that from `DoseEvent::off_at`, which the stored subject
@@ -4793,11 +4405,7 @@ pub fn ode_predictions(
 /// default build neither compiles nor flags it.
 #[cfg(feature = "survival")]
 pub(crate) fn ode_predictions_and_chz(
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    subject: &Subject,
+    ode: &OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &Subject,
     chz_times: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     // Cutoffs as in [`ode_predictions`].
@@ -4822,11 +4430,7 @@ pub(crate) fn ode_predictions_and_chz(
 /// so the returned counters classify the same RK45 work the production
 /// predictor performs.
 pub fn ode_predictions_with_solver_stats(
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    subject: &Subject,
+    ode: &OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &Subject,
 ) -> (Vec<f64>, OdeSolverStats) {
     let mut stats = OdeSolverStats::default();
     // Cutoffs as in [`ode_predictions`].
@@ -4859,11 +4463,7 @@ pub fn ode_predictions_with_solver_stats(
 /// over identical segments — turning the comparison bit-aligned rather than
 /// merely tolerance-close.
 pub(crate) fn ode_predictions_with_extra_breaks(
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    subject: &Subject,
+    ode: &OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &Subject,
     extra_breaks: &[f64],
 ) -> Vec<f64> {
     ode_predictions_with_extra_breaks_and_stats(
@@ -4932,14 +4532,9 @@ fn collect_dose_break_times<'a>(
     }
     // Per-route absorption lag (`fn(..., lag=L)`): a route with its own lag switches
     // on past the dose's compartment-lag break, so add a break at each route onset.
-    push_route_lag_break_times(
-        break_times,
-        ode,
-        subject,
-        dose_lagtimes,
-        dose_f_bio,
-        |f, k| f.route_lag(pk_for_dose(k)),
-    );
+    push_route_lag_break_times(break_times, ode, subject, dose_lagtimes, dose_f_bio, |f, k| {
+        f.route_lag(pk_for_dose(k))
+    });
     // Zero-order windows (#504): break at each window end so segments align with the
     // cutoff (the same windows `integrate_segment` recomputes for the injection).
     let zo_windows = zero_order_windows(&subject.doses, dose_lagtimes, dose_f_bio, |k, d| {
@@ -5034,13 +4629,7 @@ fn reseed_prescheduled_states_at(
         // same `t_start` and reports it (both callers run it right after this pass).
         if ss_equilibrates_at_arrival(dose, dose_lagtimes[i]) {
             let chz_before = chz_snapshot(ode, u);
-            u.copy_from_slice(&equilibrate_ss_state(
-                ode,
-                pk_params_flat,
-                dose,
-                opts,
-                &chz_before,
-            ));
+            u.copy_from_slice(&equilibrate_ss_state(ode, pk_params_flat, dose, opts, &chz_before));
         }
     }
     first_event
@@ -5128,11 +4717,7 @@ pub(crate) fn turn_on_at_live_arrival(off: &mut Vec<usize>, dose: &DoseEvent) {
 /// shares the turn-on through [`turn_on_at_live_arrival`] and keeps its own jump, which is
 /// over dual numbers and carries the lag saltation.
 fn land_live_arrival(
-    u: &mut [f64],
-    ode: &OdeSpec,
-    dose: &DoseEvent,
-    f_bio: f64,
-    off: &mut Vec<usize>,
+    u: &mut [f64], ode: &OdeSpec, dose: &DoseEvent, f_bio: f64, off: &mut Vec<usize>,
 ) {
     turn_on_at_live_arrival(off, dose);
     // dose.cmt is 1-based; state indices are 0-based. `cmt_idx` maps CMT=0 → compartment 1
@@ -5269,12 +4854,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // #570: also reach any soft (TTE) time past the last observation. This only
     // *appends* a final segment after the last obs — earlier breaks and every
     // observation prediction are untouched, so ipred stays bit-identical.
-    let t_last = subject
-        .obs_times
-        .iter()
-        .chain(chz_times.iter())
-        .cloned()
-        .fold(0.0f64, f64::max);
+    let t_last = subject.obs_times.iter().chain(chz_times.iter()).cloned().fold(0.0f64, f64::max);
     let origin = subject_integration_start(subject);
     let mut break_times: Vec<f64> = vec![origin];
     // Every pre-scheduled dose's breaks — the lag-shifted dose time, a real infusion's
@@ -5309,11 +4889,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     if toggled {
         // Each on/off row, decision and dose arrival keeps its own break, on the same record
         // set as the driver (`adaptive_toggle_record_bits`).
-        let arrivals = subject
-            .doses
-            .iter()
-            .zip(&dose_lagtimes)
-            .map(|(d, lag)| d.time + lag);
+        let arrivals = subject.doses.iter().zip(&dose_lagtimes).map(|(d, lag)| d.time + lag);
         dedup_breaks_keeping_records(
             &mut break_times,
             &adaptive_toggle_record_bits(subject, extra_breaks, arrivals),
@@ -5338,13 +4914,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // it, so without this it keeps its NaN prefill and the TTE likelihood repels the subject with
     // its `1e20` sentinel. One function with `ode_dense_solve_states`, which is the point: see
     // [`fill_prestart_states`] for why there is no second copy to keep in step.
-    fill_prestart_states(
-        chz_times,
-        &mut chz_states,
-        break_times.first().copied(),
-        &u,
-        None,
-    );
+    fill_prestart_states(chz_times, &mut chz_states, break_times.first().copied(), &u, None);
 
     // Compartments currently off (#2753), empty and never touched for a subject with no
     // on/off record. The caller sets the doses' `off_at`: the public wrappers from
@@ -5461,12 +5031,8 @@ fn ode_predictions_with_extra_breaks_and_stats(
         // applied here reads `u_before` instead: the integration start at an observation
         // the reader moved one ULP below a co-timed dose (#2124).
         for &obs_idx in &boundary_obs {
-            let state = band_read_state(
-                subject.obs_times[obs_idx],
-                first_event,
-                u_before.as_deref(),
-                &u,
-            );
+            let state =
+                band_read_state(subject.obs_times[obs_idx], first_event, u_before.as_deref(), &u);
             record_observations(
                 ode,
                 &[obs_idx],
@@ -5622,10 +5188,7 @@ pub(crate) enum AdaptiveRefusalKind {
 /// boundary, or a runtime / internal failure, which carries none.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AdaptiveDriverError {
-    Refusal {
-        kind: AdaptiveRefusalKind,
-        message: String,
-    },
+    Refusal { kind: AdaptiveRefusalKind, message: String },
     Runtime(String),
 }
 
@@ -5686,11 +5249,7 @@ impl std::fmt::Display for AdaptiveDriverError {
 /// Single source of truth so the two branches cannot drift the eligibility
 /// contract apart.
 fn reject_unsupported_dose_compartment(
-    ode: &OdeSpec,
-    cmt: usize,
-    n_states: usize,
-    pk_params_flat: &[f64],
-    decision_index: usize,
+    ode: &OdeSpec, cmt: usize, n_states: usize, pk_params_flat: &[f64], decision_index: usize,
 ) -> Result<f64, AdaptiveDriverError> {
     if cmt > n_states {
         return Err(AdaptiveDriverError::controller_action(format!(
@@ -5795,9 +5354,7 @@ pub(crate) struct AdaptiveRecordIndex {
 /// later one at the same instant moves only `last`. Each record vector is in file order
 /// within its kind, so `last` is the row processed last.
 fn push_first_last(map: &mut HashMap<u64, (usize, usize)>, t: f64, i: usize) {
-    map.entry(t.to_bits())
-        .and_modify(|e| e.1 = i)
-        .or_insert((i, i));
+    map.entry(t.to_bits()).and_modify(|e| e.1 = i).or_insert((i, i));
 }
 
 impl AdaptiveRecordIndex {
@@ -5899,11 +5456,8 @@ impl AdaptiveRecordIndex {
     /// integration, which runs under the governing record either way, not what a
     /// controller can know.
     pub(crate) fn in_force(&self, t: f64) -> Option<AdaptiveRecord> {
-        let i = self
-            .record_times
-            .partition_point(|&r| r <= t + EVENT_MATCH_TOL);
-        i.checked_sub(1)
-            .and_then(|i| self.last_at_among(self.record_times[i], &self.dose_record))
+        let i = self.record_times.partition_point(|&r| r <= t + EVENT_MATCH_TOL);
+        i.checked_sub(1).and_then(|i| self.last_at_among(self.record_times[i], &self.dose_record))
     }
 
     /// The PK the LOCF carry (`last_pk`) takes after the walk integrates into `t_end`: the
@@ -5952,9 +5506,7 @@ impl AdaptiveRecordIndex {
     /// order and the interval between them integrates nothing. A guard would reject
     /// ordinary datasets to protect a sub-ULP case that is already correct.
     fn governing(&self, t_end: f64) -> Option<f64> {
-        self.times
-            .get(self.times.partition_point(|&r| r < t_end))
-            .copied()
+        self.times.get(self.times.partition_point(|&r| r < t_end)).copied()
     }
 }
 
@@ -6012,9 +5564,7 @@ enum Governing {
 /// `decisions = None` — the constant-PK path, and driver unit tests that build no
 /// decision records — is the pre-#2895 rule.
 fn governing_at(
-    t_end: f64,
-    records: &AdaptiveRecordIndex,
-    decisions: Option<&DecisionRecords>,
+    t_end: f64, records: &AdaptiveRecordIndex, decisions: Option<&DecisionRecords>,
 ) -> Governing {
     let record_t = records.governing(t_end);
     if let Some(d) = decisions {
@@ -6026,9 +5576,7 @@ fn governing_at(
         }
     }
     // `governing` only ever returns a time drawn from the record grid, so `at` cannot miss.
-    record_t
-        .and_then(|t| records.at(t))
-        .map_or(Governing::Past, Governing::Record)
+    record_t.and_then(|t| records.at(t)).map_or(Governing::Past, Governing::Record)
 }
 
 /// `subject` with each `ADDL`-implied dose governed as if a record sat at every decision
@@ -6043,9 +5591,7 @@ fn governing_at(
 /// every layout with a data record on each decision. The static `Subject` stays as the
 /// reader built it: `predict()` has no decisions.
 pub(crate) fn with_implied_doses_governed_by_decisions<'a>(
-    subject: &'a Subject,
-    decision_times: &[f64],
-    covs: &[&HashMap<String, f64>],
+    subject: &'a Subject, decision_times: &[f64], covs: &[&HashMap<String, f64>],
 ) -> std::borrow::Cow<'a, Subject> {
     let regovern = |k: usize| -> Option<usize> {
         let d = &subject.doses[k];
@@ -6055,9 +5601,8 @@ pub(crate) fn with_implied_doses_governed_by_decisions<'a>(
         let no_record_ahead = imp.gov_time < d.time;
         (no_record_ahead || t_g < imp.gov_time).then_some(g)
     };
-    let moved: Vec<(usize, usize)> = (0..subject.doses.len())
-        .filter_map(|k| regovern(k).map(|g| (k, g)))
-        .collect();
+    let moved: Vec<(usize, usize)> =
+        (0..subject.doses.len()).filter_map(|k| regovern(k).map(|g| (k, g))).collect();
     if moved.is_empty() {
         return std::borrow::Cow::Borrowed(subject);
     }
@@ -6067,9 +5612,7 @@ pub(crate) fn with_implied_doses_governed_by_decisions<'a>(
     // `event_pk_iov`, and the copy exists only where per-event PK already holds (#2948 review
     // row 7). A new reader of that predicate on this copy must account for it.
     if s.dose_covariates.len() != s.doses.len() {
-        s.dose_covariates = (0..subject.doses.len())
-            .map(|k| subject.dose_cov(k).clone())
-            .collect();
+        s.dose_covariates = (0..subject.doses.len()).map(|k| subject.dose_cov(k).clone()).collect();
     }
     for (k, g) in moved {
         let t_g = decision_times[g];
@@ -6090,10 +5633,8 @@ pub(crate) fn with_implied_doses_governed_by_decisions<'a>(
 /// [`DecisionCovariates::Locf`]: crate::sim::adaptive::DecisionCovariates::Locf
 /// [`DecisionCovariates::Nocb`]: crate::sim::adaptive::DecisionCovariates::Nocb
 pub(crate) fn decision_record_covs<'a>(
-    rule: crate::sim::adaptive::DecisionCovariates,
-    records: &AdaptiveRecordIndex,
-    decision_times: &[f64],
-    subject: &'a Subject,
+    rule: crate::sim::adaptive::DecisionCovariates, records: &AdaptiveRecordIndex,
+    decision_times: &[f64], subject: &'a Subject,
 ) -> Vec<&'a HashMap<String, f64>> {
     use crate::sim::adaptive::DecisionCovariates;
     decision_times
@@ -6120,18 +5661,13 @@ pub(crate) fn decision_record_covs<'a>(
 /// dose (#2528), which the PK carry steps through, so a train running past the last data
 /// record would pair the implied dose's PK with an earlier record's row.
 fn governing_segment_cov_at<'a>(
-    t_end: f64,
-    records: &AdaptiveRecordIndex,
-    decisions: Option<&DecisionRecords<'a>>,
-    subject: &'a Subject,
-    last_cov: &'a HashMap<String, f64>,
+    t_end: f64, records: &AdaptiveRecordIndex, decisions: Option<&DecisionRecords<'a>>,
+    subject: &'a Subject, last_cov: &'a HashMap<String, f64>,
 ) -> &'a HashMap<String, f64> {
     match governing_at(t_end, records, decisions) {
         Governing::Record(rec) => rec.cov(subject),
         Governing::Decision(g) => {
-            decisions
-                .expect("a decision governs only with decision records")
-                .cov[g]
+            decisions.expect("a decision governs only with decision records").cov[g]
         }
         Governing::Past => last_cov,
     }
@@ -6165,18 +5701,13 @@ fn governing_segment_cov_at<'a>(
 /// causally correct answer — a controller cannot read a covariate that has not been
 /// recorded yet.
 fn governing_segment_pk_at(
-    t_end: f64,
-    records: &AdaptiveRecordIndex,
-    decisions: Option<&DecisionRecords>,
-    event_pk: &crate::pk::EventPkParams,
-    last_pk: PkParams,
+    t_end: f64, records: &AdaptiveRecordIndex, decisions: Option<&DecisionRecords>,
+    event_pk: &crate::pk::EventPkParams, last_pk: PkParams,
 ) -> PkParams {
     match governing_at(t_end, records, decisions) {
         Governing::Record(rec) => rec.pk(event_pk),
         Governing::Decision(g) => {
-            decisions
-                .expect("a decision governs only with decision records")
-                .pk[g]
+            decisions.expect("a decision governs only with decision records").pk[g]
         }
         // Past the final record and decision.
         Governing::Past => last_pk,
@@ -6229,11 +5760,8 @@ impl AdaptiveRecordOcc {
 /// Occasion twin of [`governing_segment_pk_at`] (#701): the same record, so the eta
 /// threaded into the segment carries the same occasion's κ as its PK snapshot.
 fn governing_segment_occ_at(
-    t_end: f64,
-    records: &AdaptiveRecordIndex,
-    decisions: Option<&DecisionRecords>,
-    occ: &AdaptiveRecordOcc,
-    last_occ: Option<usize>,
+    t_end: f64, records: &AdaptiveRecordIndex, decisions: Option<&DecisionRecords>,
+    occ: &AdaptiveRecordOcc, last_occ: Option<usize>,
 ) -> Option<usize> {
     match governing_at(t_end, records, decisions) {
         Governing::Record(rec) => occ.of(rec),
@@ -6261,9 +5789,7 @@ fn governing_segment_occ_at(
 /// with resets ranked first, while the seed is the minimum over every record time with
 /// resets excluded (a reset re-seeds from its own row).
 fn earliest_record_pk(
-    subject: &Subject,
-    event_pk: &crate::pk::EventPkParams,
-    fallback: PkParams,
+    subject: &Subject, event_pk: &crate::pk::EventPkParams, fallback: PkParams,
 ) -> PkParams {
     match first_record(subject, event_pk.dose.len().min(subject.doses.len())) {
         Some(FirstRecord::Dose(k)) => event_pk.dose[k],
@@ -6288,10 +5814,7 @@ fn earliest_record_pk(
 /// bit-checks that against a derivation sharing no code with [`AdaptiveRecordIndex`]
 /// (#1599), so a wrong rule here fails that check rather than passing on every side.
 pub(crate) fn locf_decision_cov<'a>(
-    records: &AdaptiveRecordIndex,
-    t: f64,
-    subject: &'a Subject,
-    baseline: &'a HashMap<String, f64>,
+    records: &AdaptiveRecordIndex, t: f64, subject: &'a Subject, baseline: &'a HashMap<String, f64>,
 ) -> &'a HashMap<String, f64> {
     records.in_force(t).map_or(baseline, |rec| rec.cov(subject))
 }
@@ -6398,16 +5921,10 @@ pub(crate) fn ode_predictions_adaptive(
 ) -> Result<AdaptiveRun, AdaptiveDriverError> {
     let mons: Vec<AdaptiveMonitor> = monitors
         .iter()
-        .map(|spec| AdaptiveMonitor {
-            spec,
-            observe: None,
-            obs_scale: None,
-        })
+        .map(|spec| AdaptiveMonitor { spec, observe: None, obs_scale: None })
         .collect();
-    let mut decide = |ctx: &ControllerCtx| ControllerDecision {
-        actions: controller(ctx),
-        rule: None,
-    };
+    let mut decide =
+        |ctx: &ControllerCtx| ControllerDecision { actions: controller(ctx), rule: None };
     ode_predictions_adaptive_impl(
         ode,
         pk_params_flat,
@@ -6594,11 +6111,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // `tv` with an `auc_target`; before any record it is the baseline, as `init_pk` is.
     let mut last_cov: &HashMap<String, f64> = &subject.covariates;
 
-    let mut u = if tv {
-        ode.initial_state(&init_pk.values)
-    } else {
-        ode.initial_state(pk_params_flat)
-    };
+    let mut u =
+        if tv { ode.initial_state(&init_pk.values) } else { ode.initial_state(pk_params_flat) };
     let mut predictions = vec![f64::NAN; n_obs];
     let mut ledger: Vec<DoseLedgerEntry> = Vec::new();
     let mut decisions: Vec<DecisionLogEntry> = Vec::new();
@@ -6630,22 +6144,16 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
     let copy_n = pk_params_flat.len().min(crate::types::MAX_PK_PARAMS);
     ext_params[..copy_n].copy_from_slice(&pk_params_flat[..copy_n]);
-    ext_params[crate::types::MAX_PK_PARAMS] = if n_base > 0 {
-        earliest_dose_time(&shadow.doses)
-    } else {
-        f64::NAN
-    };
+    ext_params[crate::types::MAX_PK_PARAMS] =
+        if n_base > 0 { earliest_dose_time(&shadow.doses) } else { f64::NAN };
 
     let obs_map = build_obs_index_map(&shadow.obs_times);
 
     // #1073 / #1148: the data records on this walk — base dose rows, EVID=2 pk-only rows,
     // observations and EVID=3/4 resets. `records.at` governs segments; `records.in_force`
     // resolves what a decision reads. Empty on the constant path, where both are no-ops.
-    let records = if tv {
-        AdaptiveRecordIndex::new(subject, n_base)
-    } else {
-        AdaptiveRecordIndex::default()
-    };
+    let records =
+        if tv { AdaptiveRecordIndex::new(subject, n_base) } else { AdaptiveRecordIndex::default() };
     // Per-record occasion (decision window) for the IOV path (#701), resolved from the
     // decision schedule exactly as the occasion-aware `event_pk` was built in
     // `run_adaptive_population`, so a governed segment threads its record's κ. Empty on
@@ -6687,12 +6195,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // per-event PK to stay piecewise-constant; the frozen-replay static engine adds
     // the identical breaks, so the two still share `integrate_segment` over
     // identical segments and stay bit-aligned.
-    let mut t_last = shadow
-        .obs_times
-        .iter()
-        .chain(decision_times.iter())
-        .cloned()
-        .fold(0.0_f64, f64::max);
+    let mut t_last =
+        shadow.obs_times.iter().chain(decision_times.iter()).cloned().fold(0.0_f64, f64::max);
     // On the TV path a trailing pk-only (EVID=2) record can be the latest event and
     // becomes a break below, so the horizon must reach it too. Gated by `tv` so the
     // constant path — where pk-only rows are neither breaks nor PK-changing — keeps
@@ -6788,11 +6292,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // set the replaying static engine builds (`adaptive_toggle_record_bits`). On the
         // time-varying path above they already do: an on/off row is a pk-only row, and a base
         // dose there arrives at its record.
-        let arrivals = shadow
-            .doses
-            .iter()
-            .zip(&base_lagtimes)
-            .map(|(d, lag)| d.time + lag);
+        let arrivals = shadow.doses.iter().zip(&base_lagtimes).map(|(d, lag)| d.time + lag);
         dedup_breaks_keeping_records(
             &mut break_times,
             &adaptive_toggle_record_bits(subject, decision_times, arrivals),
@@ -6854,10 +6354,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     if !tv && (!subject.reset_times.is_empty() || n_base > 0) {
         let surviving: std::collections::HashSet<u64> =
             break_times.iter().map(|t| t.to_bits()).collect();
-        if let Some(t) = decision_times
-            .iter()
-            .copied()
-            .find(|t| !surviving.contains(&t.to_bits()))
+        if let Some(t) = decision_times.iter().copied().find(|t| !surviving.contains(&t.to_bits()))
         {
             return Err(AdaptiveDriverError::options(format!(
                 "adaptive-dosing decision time {t} lies within 1e-15 of a system-reset or \
@@ -6965,11 +6462,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             Some(ev) => in_force.map_or(baseline_pk, |rec| rec.pk(ev)),
             None => PkParams::default(),
         };
-        let pk_readout: &[f64] = if tv {
-            &readout_pk.values
-        } else {
-            pk_params_flat
-        };
+        let pk_readout: &[f64] = if tv { &readout_pk.values } else { pk_params_flat };
         // Eta to evaluate the pre-dose readouts with — paired to `readout_pk`'s
         // occasion (#701): at a decision, `last_occ` is that decision's window, so this is
         // `[η_bsv | κ_g]`. Byte-identical to `eta` on the non-IOV path.
@@ -7118,10 +6611,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 let decision_cov = if tv {
                     locf_decision_cov(&records, t_start, subject, &shadow.covariates)
                 } else {
-                    match obs_map
-                        .get(&t_start.to_bits())
-                        .and_then(|idxs| idxs.first())
-                    {
+                    match obs_map.get(&t_start.to_bits()).and_then(|idxs| idxs.first()) {
                         Some(&i) => shadow.obs_cov(i),
                         None => &shadow.covariates,
                     }
@@ -7261,11 +6751,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         }
                     };
                     signals.insert(m.name.clone(), value);
-                    observed.push(ObservedSignal {
-                        name: m.name.clone(),
-                        value,
-                        mode: m.mode,
-                    });
+                    observed.push(ObservedSignal { name: m.name.clone(), value, mode: m.mode });
                 }
 
                 // #945: at a grid point that is not yet due under the dosing interval the
@@ -7273,10 +6759,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 // `NotDue`, with what the monitors read.
                 let due = adaptive_point_is_due(next_due, t_start);
                 let decision = if !due {
-                    ControllerDecision {
-                        actions: Vec::new(),
-                        rule: None,
-                    }
+                    ControllerDecision { actions: Vec::new(), rule: None }
                 } else {
                     let ctx = ControllerCtx {
                         t: t_start,
@@ -7563,11 +7046,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 };
                 // Eta paired to this observation's occasion (#701), consistent with
                 // its per-occasion `event_pk.obs` snapshot; baseline `eta` otherwise.
-                let obs_eta = eta_for(
-                    eta_occ,
-                    eta,
-                    if iov { record_occ.obs[obs_idx] } else { None },
-                );
+                let obs_eta =
+                    eta_for(eta_occ, eta, if iov { record_occ.obs[obs_idx] } else { None });
                 let state = band_read_state(
                     shadow.obs_times[obs_idx],
                     first_event,
@@ -7772,10 +7252,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                         let mut samples = Vec::with_capacity(probe_times.len() + 1);
                         samples.push((t_start, u_start));
                         samples.extend(
-                            probe_times
-                                .iter()
-                                .zip(&probe_at)
-                                .map(|(&t, &i)| (t, soft[i].clone())),
+                            probe_times.iter().zip(&probe_at).map(|(&t, &i)| (t, soft[i].clone())),
                         );
                         pending_clock_windows.push(PendingClockWindow {
                             t_start,
@@ -7834,11 +7311,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
         *out = auc.map_or_else(Vec::new, |a| a.into_realized(decisions.len()));
     }
 
-    Ok(AdaptiveRun {
-        predictions,
-        ledger,
-        decisions,
-    })
+    Ok(AdaptiveRun { predictions, ledger, decisions })
 }
 
 /// Frozen-schedule replay verifier — the Part-E backbone of #391, default-on in
@@ -8100,11 +7573,8 @@ fn adaptive_frozen_replay_tv(
     // overwrites them per-segment from each event's own snapshot before integrating.
     let mut ext_params = [f64::NAN; crate::types::MAX_PK_PARAMS + 2];
     let first_dose_time = earliest_dose_time(&subject.doses);
-    ext_params[crate::types::MAX_PK_PARAMS] = if first_dose_time.is_finite() {
-        first_dose_time
-    } else {
-        f64::NAN
-    };
+    ext_params[crate::types::MAX_PK_PARAMS] =
+        if first_dose_time.is_finite() { first_dose_time } else { f64::NAN };
 
     // The same break set the reactive driver visited: 0, the last time, every dose
     // time, F-scaled infusion ends, obs / pk-only records, and the decision breaks.
@@ -8332,11 +7802,8 @@ fn adaptive_frozen_replay_tv(
         {
             for &obs_idx in &boundary_obs {
                 let cmt = subject.obs_cmts.get(obs_idx).copied().unwrap_or(0);
-                let obs_eta = eta_for(
-                    eta_occ,
-                    eta,
-                    if iov { record_occ.obs[obs_idx] } else { None },
-                );
+                let obs_eta =
+                    eta_for(eta_occ, eta, if iov { record_occ.obs[obs_idx] } else { None });
                 let state = band_read_state(
                     subject.obs_times[obs_idx],
                     first_event,
@@ -8446,14 +7913,8 @@ const ADAPTIVE_AUC_PANELS: usize = 128;
 /// point under that point's own PK snapshot and `[η | κ]`.
 #[allow(clippy::too_many_arguments)]
 fn adaptive_monitor_signal(
-    ode: &OdeSpec,
-    am: &AdaptiveMonitor,
-    u: &[f64],
-    pk: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    cov: &HashMap<String, f64>,
-    t: f64,
+    ode: &OdeSpec, am: &AdaptiveMonitor, u: &[f64], pk: &[f64], theta: &[f64], eta: &[f64],
+    cov: &HashMap<String, f64>, t: f64,
 ) -> f64 {
     let latent = match am.observe {
         // `[adaptive_dosing] observe` compiles through the same `build_y_output_fn` as a
@@ -8493,9 +7954,7 @@ pub(crate) fn adaptive_point_is_due(next_due: Option<f64>, t: f64) -> bool {
 /// the matching tolerance. `grid` is strictly increasing (`validate_increasing_finite`) and
 /// `interval` positive and finite (`DoseAction::validate`, `check_start_interval`).
 pub(crate) fn adaptive_walk_due_times(
-    grid: &[f64],
-    from: f64,
-    interval: f64,
+    grid: &[f64], from: f64, interval: f64,
 ) -> Result<(), String> {
     let mut t = from;
     loop {
@@ -8642,14 +8101,8 @@ fn merge_soft_times(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<usize>, Vec<usize>) 
 /// infusion-end break carries no NONMEM record, so it doesn't update the
 /// "current PK" used to integrate subsequent segments.
 pub fn ode_predictions_event_driven(
-    ode: &OdeSpec,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
-    pk_at_reset: &[PkParams],
+    ode: &OdeSpec, subject: &Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams], pk_at_pk_only: &[PkParams], pk_at_reset: &[PkParams],
 ) -> Vec<f64> {
     event_driven_walk(
         ode,
@@ -8668,14 +8121,8 @@ pub fn ode_predictions_event_driven(
 /// `obs_states` when it is given (one row per observation, left as found if none is read).
 #[allow(clippy::too_many_arguments)]
 fn event_driven_walk(
-    ode: &OdeSpec,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
-    pk_at_reset: &[PkParams],
+    ode: &OdeSpec, subject: &Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams], pk_at_pk_only: &[PkParams], pk_at_reset: &[PkParams],
     mut obs_states: Option<&mut [Vec<f64>]>,
 ) -> Vec<f64> {
     assert_eq!(pk_at_dose.len(), subject.doses.len());
@@ -8701,11 +8148,7 @@ fn event_driven_walk(
     // fold yields INFINITY when there are no doses; convert to NaN so the ODE
     // RHS injects NaN for TAFD (consistent with sdtab) rather than -∞.
     let first_dose_time_ed = {
-        let t = subject
-            .doses
-            .iter()
-            .map(|d| d.time)
-            .fold(f64::INFINITY, f64::min);
+        let t = subject.doses.iter().map(|d| d.time).fold(f64::INFINITY, f64::min);
         if t.is_finite() {
             t
         } else {
@@ -8898,10 +8341,8 @@ fn event_driven_walk(
     for (m, &t) in subject.pk_only_times.iter().enumerate() {
         timeline.push((t, Kind::PkOnly, m));
     }
-    timeline.sort_by(|a, b| {
-        a.0.total_cmp(&b.0)
-            .then_with(|| kind_order(a.1).cmp(&kind_order(b.1)))
-    });
+    timeline
+        .sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| kind_order(a.1).cmp(&kind_order(b.1))));
     // A non-finite event time makes the subject non-finite (#1189). This engine
     // dispatches typed events by index and so never re-applies a dose, but a `NaN` time
     // still sorts to the end and its event is silently never reached — the same silent
@@ -9198,11 +8639,7 @@ fn event_driven_walk(
                 // rather than a silent zero. See the corresponding note
                 // in `ode_predictions`. Bare-state readouts only — a Form C
                 // `[scaling]` expression may legitimately be negative (#1020).
-                predictions[idx] = if v < 0.0 && ode.readout.clamps_negative() {
-                    0.0
-                } else {
-                    v
-                };
+                predictions[idx] = if v < 0.0 && ode.readout.clamps_negative() { 0.0 } else { v };
                 if let Some(states) = obs_states.as_deref_mut() {
                     states[idx].clone_from(&u);
                 }
@@ -9264,10 +8701,7 @@ fn event_driven_walk(
 /// for each observation given its predicted value: it feeds the Kalman update only, and does
 /// not enter the returned `p_obs` of that observation (those are pre-update).
 pub fn ode_predictions_ekf_with_diffusion(
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
-    subject: &Subject,
-    diffusion_var: &[f64],
+    ode: &OdeSpec, pk_params_flat: &[f64], subject: &Subject, diffusion_var: &[f64],
     r_obs_fn: impl Fn(f64) -> f64,
 ) -> (Vec<f64>, Vec<f64>) {
     use crate::ode::ekf::{solve_ekf_g, ProgramRhs};
@@ -9293,10 +8727,8 @@ pub fn ode_predictions_ekf_with_diffusion(
         .iter()
         .map(|d| ode.dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
         .collect();
-    let program = ode
-        .rhs_program
-        .as_ref()
-        .expect("an SDE model's `[odes]` block is compiled into a program");
+    let program =
+        ode.rhs_program.as_ref().expect("an SDE model's `[odes]` block is compiled into a program");
 
     let pts = solve_ekf_g::<f64, _>(
         &ProgramRhs(program),
@@ -9354,11 +8786,7 @@ pub fn ode_predictions_ekf_with_diffusion(
 /// Calling this function directly on a reset subject would produce incorrect
 /// states because the re-seed events are absent from the break-time list.
 pub fn ode_predictions_with_states(
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    subject: &Subject,
+    ode: &OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &Subject,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = ode.n_states;
     let n_obs = subject.obs_times.len();
@@ -9547,12 +8975,8 @@ pub fn ode_predictions_with_states(
         // through the same helper as the objective path (#1226), and with its pre-event
         // read for a record strictly earlier than the first event here (#2124).
         for &obs_idx in &boundary_obs {
-            let state = band_read_state(
-                subject.obs_times[obs_idx],
-                first_event,
-                u_before.as_deref(),
-                &u,
-            );
+            let state =
+                band_read_state(subject.obs_times[obs_idx], first_event, u_before.as_deref(), &u);
             record_observations(
                 ode,
                 &[obs_idx],
@@ -9627,14 +9051,8 @@ pub fn ode_predictions_with_states(
         let direct = direct_step(ode, &force);
         let _fd_columns = register_jac(&wrapped_rhs, &jac, &direct);
 
-        let sol = solve_ode_certified(
-            &wrapped_rhs,
-            &u,
-            (t_start, t_end),
-            &ext_params,
-            &saveat,
-            &opts,
-        );
+        let sol =
+            solve_ode_certified(&wrapped_rhs, &u, (t_start, t_end), &ext_params, &saveat, &opts);
 
         for pt in &sol {
             if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
@@ -9686,14 +9104,8 @@ pub fn ode_predictions_with_states(
 /// reset-only subjects (no TV covariates, no `TIME` in `$PK`) `pk_at_obs` is uniformly filled, so using the
 /// first entry is exact.
 pub fn ode_predictions_event_driven_with_states(
-    ode: &OdeSpec,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    pk_at_dose: &[PkParams],
-    pk_at_obs: &[PkParams],
-    pk_at_pk_only: &[PkParams],
-    pk_at_reset: &[PkParams],
+    ode: &OdeSpec, subject: &Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[PkParams],
+    pk_at_obs: &[PkParams], pk_at_pk_only: &[PkParams], pk_at_reset: &[PkParams],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     // The dense walk below has no compartment on/off record (#2732), so such a subject
     // reads its states off the walk that produced `ipreds`. They are exact: each row is the
@@ -9754,10 +9166,8 @@ pub fn ode_predictions_event_driven_with_states(
     //
     // A future improvement: duplicate the event-driven loop to capture `u` at each
     // obs time directly — exact states, but ~2× the integration work post-fit.
-    let pk_flat = &pk_at_obs
-        .first()
-        .map(|p| p.values)
-        .unwrap_or([0.0; crate::types::MAX_PK_PARAMS]);
+    let pk_flat =
+        &pk_at_obs.first().map(|p| p.values).unwrap_or([0.0; crate::types::MAX_PK_PARAMS]);
     let first: &[f64] = match first_record(subject, subject.doses.len()) {
         Some(FirstRecord::Dose(k)) => &pk_at_dose[k].values,
         Some(FirstRecord::PkOnly(m)) => &pk_at_pk_only[m].values,
@@ -9767,10 +9177,7 @@ pub fn ode_predictions_event_driven_with_states(
     let states = ode_dense_solve_states_seeded(
         ode,
         pk_flat,
-        InitReads::PerRecord {
-            first,
-            reset: pk_at_reset,
-        },
+        InitReads::PerRecord { first, reset: pk_at_reset },
         DoseReads::PerDose(pk_at_dose),
         subject,
         &subject.obs_times,
@@ -9797,13 +9204,8 @@ pub fn ode_predictions_event_driven_with_states(
 /// `terminal`. Those three are this builder's own, and the reset push in particular
 /// is load-bearing (#1133) — do not delete it to "restore agreement".
 fn build_segment_break_times(
-    ode: &OdeSpec,
-    dose_reads: DoseReads<'_>,
-    subject: &Subject,
-    dose_lagtimes: &[f64],
-    dose_f_bio: &[f64],
-    zo_windows: &[ZeroOrderWindow],
-    terminal: f64,
+    ode: &OdeSpec, dose_reads: DoseReads<'_>, subject: &Subject, dose_lagtimes: &[f64],
+    dose_f_bio: &[f64], zo_windows: &[ZeroOrderWindow], terminal: f64,
 ) -> Vec<f64> {
     // Integration starts at the subject's first event, not a phantom t=0 (#573) —
     // shared by the dense fit path and the TTE event-time search so both segment
@@ -9923,10 +9325,7 @@ pub(crate) enum InitReads<'a> {
     Disposition,
     /// `init()` from `first` at the integration start and from `reset[r]` at
     /// `subject.reset_times[r]` (`reset` parallel to it, as `EventPkParams::reset` is).
-    PerRecord {
-        first: &'a [f64],
-        reset: &'a [PkParams],
-    },
+    PerRecord { first: &'a [f64], reset: &'a [PkParams] },
 }
 
 impl<'a> InitReads<'a> {
@@ -10015,18 +9414,10 @@ fn apply_segment_boundary(
     // own later in the band (at or after `t_end`) is not on this one: a `saveat` read here
     // precedes it, as an observation between the two rows does in the event-driven walk.
     // On the final break (`t_end == t_start`) nothing later exists.
-    let t_next = if t_end <= t_start {
-        f64::INFINITY
-    } else {
-        t_end
-    };
+    let t_next = if t_end <= t_start { f64::INFINITY } else { t_end };
     let on_this_break = |rt: f64| event_on_break(rt, t_start, t_next);
     let mut first_event = earliest_reset_at_break(&subject.reset_times, t_start, t_next);
-    if let Some(r) = subject
-        .reset_times
-        .iter()
-        .rposition(|&rt| on_this_break(rt))
-    {
+    if let Some(r) = subject.reset_times.iter().rposition(|&rt| on_this_break(rt)) {
         *u = ode.initial_state(init_reads.reset(disposition, r));
     }
 
@@ -10122,14 +9513,8 @@ fn apply_segment_boundary(
     active_infusions.retain(|(_, _, e, _)| *e > t_start + 1e-12);
     // Resolve to (cmt_idx, F·rate, t_start, t_end) for the seam's time-gated
     // injection (CMT=0 / out-of-range dropped).
-    let gated = gated_infusions(
-        &ode.input_rate,
-        active_infusions,
-        &subject.doses,
-        dose_f_bio,
-        n,
-        &gate,
-    );
+    let gated =
+        gated_infusions(&ode.input_rate, active_infusions, &subject.doses, dose_f_bio, n, &gate);
 
     // `reset_floor` (above) also turns off, for the input-rate forcing, every dose recorded
     // before the reset — mirroring how the reset clears `active_infusions` and re-seeds `u`.
@@ -10140,12 +9525,7 @@ fn apply_segment_boundary(
     let zero_order =
         active_zero_order_inputs(zo_windows, &subject.doses, t_start, t_end, reset_floor);
 
-    SegmentForcings {
-        reset_floor,
-        gated,
-        zero_order,
-        first_event,
-    }
+    SegmentForcings { reset_floor, gated, zero_order, first_event }
 }
 
 /// Run the ODE solver with an arbitrary set of `saveat` time points and
@@ -10165,11 +9545,7 @@ fn apply_segment_boundary(
 /// dose records differ from that snapshot read each dose-record quantity at its own record
 /// instead (#1575).
 pub fn ode_dense_solve_states(
-    ode: &OdeSpec,
-    pk_params_flat: &[f64],
-    theta: &[f64],
-    eta: &[f64],
-    subject: &Subject,
+    ode: &OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &Subject,
     saveat: &[f64],
 ) -> Vec<Vec<f64>> {
     // `theta` and `eta` are accepted for API symmetry with sibling ODE functions
@@ -10191,10 +9567,7 @@ pub fn ode_dense_solve_states(
 /// (#1575) and the disposition and `init()` from `disposition`. `DoseReads::Shared` of the
 /// disposition is [`ode_dense_solve_states`] itself, bit for bit.
 pub(crate) fn ode_dense_solve_states_reading(
-    ode: &OdeSpec,
-    disposition: &[f64],
-    dose_reads: DoseReads<'_>,
-    subject: &Subject,
+    ode: &OdeSpec, disposition: &[f64], dose_reads: DoseReads<'_>, subject: &Subject,
     saveat: &[f64],
 ) -> Vec<Vec<f64>> {
     ode_dense_solve_states_seeded(
@@ -10210,12 +9583,8 @@ pub(crate) fn ode_dense_solve_states_reading(
 /// [`ode_dense_solve_states_reading`] with `init()` read through `init_reads` (#2133) — at
 /// the subject's first record and at each reset's own row — instead of at `disposition`.
 fn ode_dense_solve_states_seeded(
-    ode: &OdeSpec,
-    disposition: &[f64],
-    init_reads: InitReads<'_>,
-    dose_reads: DoseReads<'_>,
-    subject: &Subject,
-    saveat: &[f64],
+    ode: &OdeSpec, disposition: &[f64], init_reads: InitReads<'_>, dose_reads: DoseReads<'_>,
+    subject: &Subject, saveat: &[f64],
 ) -> Vec<Vec<f64>> {
     if saveat.is_empty() {
         return vec![];
@@ -10498,13 +9867,8 @@ pub(crate) fn chz_threshold_state_labels(ode: &OdeSpec, chz_state: usize) -> Vec
 /// quantity through `dose_reads`.
 #[cfg(feature = "survival")]
 pub(crate) fn ode_solve_until_chz_threshold(
-    ode: &OdeSpec,
-    disposition: &[f64],
-    dose_reads: DoseReads<'_>,
-    subject: &Subject,
-    chz_state: usize,
-    threshold: f64,
-    horizon: f64,
+    ode: &OdeSpec, disposition: &[f64], dose_reads: DoseReads<'_>, subject: &Subject,
+    chz_state: usize, threshold: f64, horizon: f64,
 ) -> ThresholdOutcome {
     use crate::ode::solver::{solve_ode_until_threshold_labelled, ThresholdCrossing};
 

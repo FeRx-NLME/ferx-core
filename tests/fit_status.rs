@@ -69,15 +69,11 @@ fn evaluate_src(name: &str, src: &str) -> FitResult {
     let dir = tempfile::tempdir().unwrap();
     let path: PathBuf = dir.path().join(format!("{name}.ferx"));
     std::fs::write(&path, src).unwrap();
-    run_model_with_data(path.to_str().unwrap(), Some(DATA))
-        .expect("evaluate")
-        .0
+    run_model_with_data(path.to_str().unwrap(), Some(DATA)).expect("evaluate").0
 }
 
 fn floored(r: &FitResult) -> bool {
-    r.warnings
-        .iter()
-        .any(|w| w.starts_with("Covariance step regularized"))
+    r.warnings.iter().any(|w| w.starts_with("Covariance step regularized"))
 }
 
 /// F and G in one test, so the pair cannot both land on one side of the hold:
@@ -99,26 +95,17 @@ fn status_names_an_unheld_collapse_and_an_evaluation_only_run() {
     assert!(!floored(&f), "F has a clean R: {:?}", f.warnings);
     assert!(floored(&g), "G floors R: {:?}", g.warnings);
     assert!(f.cov_fixed[ETA_KA_ROW], "F holds ETA_KA: {:?}", f.cov_fixed);
-    assert!(
-        !g.cov_fixed[ETA_KA_ROW],
-        "G does not hold ETA_KA: {:?}",
-        g.cov_fixed
-    );
+    assert!(!g.cov_fixed[ETA_KA_ROW], "G does not hold ETA_KA: {:?}", g.cov_fixed);
     for (name, r) in [("F", &f), ("G", &g)] {
         assert!(r.evaluation_only, "{name}: maxiter = 0 on FOCEI evaluates");
-        assert!(
-            !r.eval_budget_spent,
-            "{name}: an evaluation spends no budget"
-        );
+        assert!(!r.eval_budget_spent, "{name}: an evaluation spends no budget");
         assert_eq!(r.held_at_bound.len(), 1, "{name}");
         assert_eq!(r.held_at_bound[0].name, "ETA_KA", "{name}");
     }
 
     assert_eq!(
         f.status(),
-        FitStatus::NotConverged {
-            reasons: vec![StatusReason::EvaluationOnly]
-        },
+        FitStatus::NotConverged { reasons: vec![StatusReason::EvaluationOnly] },
         "F: {:?}",
         f.warnings
     );
@@ -127,9 +114,7 @@ fn status_names_an_unheld_collapse_and_an_evaluation_only_run() {
         FitStatus::NotConverged {
             reasons: vec![
                 StatusReason::EvaluationOnly,
-                StatusReason::CollapsedAtGuard {
-                    parameters: vec!["ETA_KA".into()]
-                },
+                StatusReason::CollapsedAtGuard { parameters: vec!["ETA_KA".into()] },
             ]
         },
         "G: {:?}",
@@ -139,10 +124,7 @@ fn status_names_an_unheld_collapse_and_an_evaluation_only_run() {
     let printed =
         |r: &FitResult| -> Vec<String> { r.status().reasons().iter().map(|x| x.label()).collect() };
     assert_eq!(printed(&f), ["evaluation_only"]);
-    assert_eq!(
-        printed(&g),
-        ["evaluation_only", "collapsed_at_guard: ETA_KA"]
-    );
+    assert_eq!(printed(&g), ["evaluation_only", "collapsed_at_guard: ETA_KA"]);
 }
 
 /// #2799 r1 #1: a standalone `agq_eval_only` run is an evaluation too, but its arm publishes
@@ -167,26 +149,15 @@ fn a_standalone_agq_evaluation_reads_converged_with_issues() {
         )
         .replace(RAIL, "0.01"),
     );
-    assert!(
-        r.evaluation_only,
-        "a standalone agq_eval_only run evaluates"
-    );
-    assert!(
-        r.converged,
-        "its arm reports a finite objective as converged"
-    );
+    assert!(r.evaluation_only, "a standalone agq_eval_only run evaluates");
+    assert!(r.converged, "its arm reports a finite objective as converged");
     // With the fixture's `covariance = true`: a chain with no estimating stage owns no step,
     // so it is not requested, not failed. Before r1 this read `Failed` and the status gained
     // a `covariance_failed` for a step that never ran.
-    assert_eq!(
-        r.covariance_status,
-        ferx_core::types::CovarianceStatus::NotRequested
-    );
+    assert_eq!(r.covariance_status, ferx_core::types::CovarianceStatus::NotRequested);
     assert_eq!(
         r.status(),
-        FitStatus::ConvergedWithIssues {
-            reasons: vec![StatusReason::EvaluationOnly]
-        },
+        FitStatus::ConvergedWithIssues { reasons: vec![StatusReason::EvaluationOnly] },
         "{:?}",
         r.warnings
     );

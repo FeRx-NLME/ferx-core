@@ -65,10 +65,7 @@ fn population() -> Population {
 }
 
 fn route_entries(r: &FitResult) -> Vec<&crate::types::WarningEntry> {
-    r.warnings_structured
-        .iter()
-        .filter(|e| e.category == WarningCode::OdeRhsRoute)
-        .collect()
+    r.warnings_structured.iter().filter(|e| e.category == WarningCode::OdeRhsRoute).collect()
 }
 
 /// Both sides of the gate in one test: an evaluation-only fit of the interpreted RHS
@@ -76,12 +73,8 @@ fn route_entries(r: &FitResult) -> Vec<&crate::types::WarningEntry> {
 /// the same fit of the compiled twin reports nothing.
 #[test]
 fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..Default::default()
-    }
-    .quiet();
+    let opts =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..Default::default() }.quiet();
     let pop = population();
 
     let m = model(INTERPRETED);
@@ -90,19 +83,10 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
     assert_eq!(entries.len(), 1, "{:?}", r.warnings);
     let e = entries[0];
     assert_eq!(e.severity, WarningSeverity::Info);
-    assert!(
-        e.message.starts_with("W_ODE_RHS_INTERPRETED: "),
-        "{}",
-        e.message
-    );
+    assert!(e.message.starts_with("W_ODE_RHS_INTERPRETED: "), "{}", e.message);
     assert!(e.message.contains("`tanh`"), "{}", e.message);
     assert!(e.message.contains("`d/dt(central)`"), "{}", e.message);
-    assert_eq!(
-        r.warnings.iter().filter(|w| **w == e.message).count(),
-        1,
-        "{:?}",
-        r.warnings
-    );
+    assert_eq!(r.warnings.iter().filter(|w| **w == e.message).count(), 1, "{:?}", r.warnings);
     let d = e.details.as_ref().expect("details");
     assert_eq!(d["route"], "interpreter");
     assert_eq!(d["site"], "`d/dt(central)`");
@@ -111,11 +95,7 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
         let m = model(rhs);
         let r = fit(&m, &pop, &m.default_params, &opts).expect("fit");
         assert!(route_entries(&r).is_empty(), "{rhs}: {:?}", r.warnings);
-        assert!(
-            !r.warnings.iter().any(|w| w.starts_with("W_ODE_RHS_")),
-            "{rhs}: {:?}",
-            r.warnings
-        );
+        assert!(!r.warnings.iter().any(|w| w.starts_with("W_ODE_RHS_")), "{rhs}: {:?}", r.warnings);
     }
 }
 

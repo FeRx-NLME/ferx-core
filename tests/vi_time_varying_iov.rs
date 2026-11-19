@@ -74,21 +74,9 @@ const SEED: u64 = 20_260_812;
 /// Everything else is held identical so a difference between fits is attributable to the
 /// toggled term alone.
 fn model_src(with_decline: bool, with_iov: bool) -> String {
-    let kdec_par = if with_decline {
-        "  theta KDEC(0.005, 0.00001, 1.0)\n"
-    } else {
-        ""
-    };
-    let kappa_par = if with_iov {
-        "  kappa KAPPA_CL ~ 0.02\n"
-    } else {
-        ""
-    };
-    let decline = if with_decline {
-        " * exp(-KDEC * TIME)"
-    } else {
-        ""
-    };
+    let kdec_par = if with_decline { "  theta KDEC(0.005, 0.00001, 1.0)\n" } else { "" };
+    let kappa_par = if with_iov { "  kappa KAPPA_CL ~ 0.02\n" } else { "" };
+    let decline = if with_decline { " * exp(-KDEC * TIME)" } else { "" };
     let kappa = if with_iov { " + KAPPA_CL" } else { "" };
     format!(
         r"
@@ -140,10 +128,8 @@ fn truth(model: &CompiledModel) -> ModelParameters {
         &[TRUE_OMEGA_CL, TRUE_OMEGA_V],
         vec!["ETA_CL".into(), "ETA_V".into()],
     );
-    p.omega_iov = Some(ferx_core::OmegaMatrix::from_diagonal(
-        &[TRUE_OMEGA_IOV],
-        vec!["KAPPA_CL".into()],
-    ));
+    p.omega_iov =
+        Some(ferx_core::OmegaMatrix::from_diagonal(&[TRUE_OMEGA_IOV], vec!["KAPPA_CL".into()]));
     p.sigma.values = vec![TRUE_SIGMA];
     p
 }
@@ -262,10 +248,7 @@ fn rel_err(got: f64, want: f64) -> f64 {
 
 /// Claim 1: with both effects present in the data and in the model, VI recovers both.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn vi_recovers_time_varying_clearance_and_iov() {
     let full = parse(true, true);
     let pop = simulated_population(&full, &truth(&full));
@@ -276,10 +259,7 @@ fn vi_recovers_time_varying_clearance_and_iov() {
     let kdec = theta_of(&f, &full, "KDEC");
     let omega_cl = f.omega[(0, 0)];
     let omega_v = f.omega[(1, 1)];
-    let omega_iov = f
-        .omega_iov
-        .as_ref()
-        .expect("an IOV fit must report Omega_iov")[(0, 0)];
+    let omega_iov = f.omega_iov.as_ref().expect("an IOV fit must report Omega_iov")[(0, 0)];
 
     // Measured at this design and seed:
     //
@@ -292,21 +272,12 @@ fn vi_recovers_time_varying_clearance_and_iov() {
     // Bounds are set around those with headroom, not tightened onto them — this is a
     // stochastic estimator on 60 simulated subjects and pinning it to 3 s.f. would make
     // the test a tripwire for irrelevant changes.
-    assert!(
-        rel_err(tvcl, TRUE_TVCL) < 0.15,
-        "TVCL: got {tvcl:.4}, true {TRUE_TVCL}"
-    );
-    assert!(
-        rel_err(tvv, TRUE_TVV) < 0.15,
-        "TVV: got {tvv:.4}, true {TRUE_TVV}"
-    );
+    assert!(rel_err(tvcl, TRUE_TVCL) < 0.15, "TVCL: got {tvcl:.4}, true {TRUE_TVCL}");
+    assert!(rel_err(tvv, TRUE_TVV) < 0.15, "TVV: got {tvv:.4}, true {TRUE_TVV}");
     // KDEC comes back ~13% low. Recorded rather than tightened away: the decline is the
     // parameter this whole file is about, and a bound that hid a real downward bias would
     // defeat the purpose.
-    assert!(
-        rel_err(kdec, TRUE_KDEC) < 0.30,
-        "KDEC: got {kdec:.5}, true {TRUE_KDEC}"
-    );
+    assert!(rel_err(kdec, TRUE_KDEC) < 0.30, "KDEC: got {kdec:.5}, true {TRUE_KDEC}");
     // Ω_iov comes back ~24% low, and the sign is the one VI_PLAN §10.6 predicted:
     // variational posteriors understate posterior variance, Ω_iov* is a mean of
     // `S + μμᵀ`, and unlike Ω_bsv it has only `Σᵢ Kᵢ` occasions rather than N subjects to
@@ -361,10 +332,7 @@ fn vi_recovers_time_varying_clearance_and_iov() {
 /// available. The direction is asserted, not just the magnitude: with no per-occasion
 /// term to absorb it, between-occasion variation has nowhere to go but the residual.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn omitting_iov_biases_the_decline_and_inflates_residual_error() {
     let full = parse(true, true);
     let pop = simulated_population(&full, &truth(&full));
@@ -414,10 +382,7 @@ fn omitting_iov_biases_the_decline_and_inflates_residual_error() {
 /// Claim 3: the decline is genuinely identified on top of IOV — dropping it costs
 /// objective function on 1 df, rather than being absorbed by the per-occasion effect.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_decline_is_worth_its_degree_of_freedom_on_top_of_iov() {
     let full = parse(true, true);
     let pop = simulated_population(&full, &truth(&full));

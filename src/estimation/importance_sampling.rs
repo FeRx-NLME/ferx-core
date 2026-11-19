@@ -100,9 +100,7 @@ fn u32_to_open_unit(x: u32) -> f64 {
 /// and appending coordinates leaves the earlier ones alone.
 fn owen_coordinate_seeds(dim: usize, seed: u64) -> Vec<u32> {
     let base = splitmix64(seed.wrapping_add(0x4F57_454E_0000_0000u64));
-    (0..dim)
-        .map(|j| (splitmix64(base ^ (j as u64)) >> 32) as u32)
-        .collect()
+    (0..dim).map(|j| (splitmix64(base ^ (j as u64)) >> 32) as u32).collect()
 }
 
 /// `k_samples` Sobol points of dimension `dim`, Owen-scrambled (#1965 Phase 2):
@@ -130,10 +128,7 @@ pub(crate) fn sobol_uniforms(dim: usize, k_samples: usize, seed: u64) -> Vec<Vec
 /// every coordinate, the direction number at the rightmost zero bit of `i − 1`)
 /// over the crate's own direction numbers, held in [`sobol_directions`].
 pub(crate) fn for_each_sobol_uniform(
-    dim: usize,
-    k_samples: usize,
-    seed: u64,
-    mut f: impl FnMut(&[f64]),
+    dim: usize, k_samples: usize, seed: u64, mut f: impl FnMut(&[f64]),
 ) {
     assert!(
         dim <= SOBOL_MAX_DIMS,
@@ -240,13 +235,8 @@ enum DrawInputs {
 /// pre-#1965 per-site loops exactly, and with it every seeded result.
 #[allow(clippy::too_many_arguments)]
 fn draw_inputs(
-    idx: usize,
-    qmc: Option<&QmcDraws>,
-    mixture: Option<&DefensiveMixture>,
-    chi_sq: Option<&ChiSquared<f64>>,
-    nu: f64,
-    rng: &mut StdRng,
-    z: &mut [f64],
+    idx: usize, qmc: Option<&QmcDraws>, mixture: Option<&DefensiveMixture>,
+    chi_sq: Option<&ChiSquared<f64>>, nu: f64, rng: &mut StdRng, z: &mut [f64],
 ) -> DrawInputs {
     let from_broad = match (mixture, qmc) {
         (Some(m), Some(q)) => m.selects_broad(q.u_mix.as_ref().expect("u_mix with a mixture")[idx]),
@@ -279,10 +269,7 @@ fn sobol_qmc_draws(d: usize, k_samples: usize, seed: u64, nu: f64, mixture: bool
     let t = nu.is_finite();
     let dim = d + usize::from(t) + usize::from(mixture);
     let points = sobol_uniforms(dim, k_samples, seed);
-    let z = points
-        .iter()
-        .map(|p| p[..d].iter().map(|&u| inv_normal_cdf(u)).collect())
-        .collect();
+    let z = points.iter().map(|p| p[..d].iter().map(|&u| inv_normal_cdf(u)).collect()).collect();
     // Same open-interval clamp as the normals, so a shifted coordinate of
     // exactly 0 cannot produce a zero χ² (an infinite t scale).
     let chi_sq = t.then(|| {
@@ -344,17 +331,9 @@ struct PilotMoments {
 /// same moments bit for bit. A pass with no usable proposal reports ESS 0.
 #[allow(clippy::too_many_arguments)]
 fn subject_pilot_moments(
-    obs_nll: &SampleObsNll<'_>,
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    mixture: Option<&DefensiveMixture>,
+    obs_nll: &SampleObsNll<'_>, eta_hat: &DVector<f64>, h: &DMatrix<f64>, omega_inv: &DMatrix<f64>,
+    log_det_omega: f64, d: usize, k_samples: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, mixture: Option<&DefensiveMixture>,
 ) -> PilotMoments {
     let mut flat: Vec<f64> = Vec::with_capacity(k_samples * d);
     let Some(log_w) = is_log_weights(
@@ -382,11 +361,7 @@ fn subject_pilot_moments(
     let (_, weights) = logsumexp_with_normalised(&log_w);
     let ess_fraction = ess_from_weights(&weights) / (k_samples as f64);
     let (mean, second_moment) = weighted_moments(&weights, &flat, d);
-    PilotMoments {
-        ess_fraction,
-        mean,
-        second_moment,
-    }
+    PilotMoments { ess_fraction, mean, second_moment }
 }
 
 /// The proposal centre and precision a pilot's weighted moments give, or `None`
@@ -418,18 +393,9 @@ fn proposal_from_moments(draws: &PilotMoments, k: usize) -> Option<(DVector<f64>
 /// E-step: there a wide proposal feeds the Ω update, here it only costs ESS.
 #[allow(clippy::too_many_arguments)]
 fn adapt_proposal(
-    obs_nll: &SampleObsNll<'_>,
-    center: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    passes: usize,
-    mixture: Option<&DefensiveMixture>,
+    obs_nll: &SampleObsNll<'_>, center: &DVector<f64>, h: &DMatrix<f64>, omega_inv: &DMatrix<f64>,
+    log_det_omega: f64, d: usize, k_samples: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, passes: usize, mixture: Option<&DefensiveMixture>,
     cancel: &Option<crate::cancel::CancelFlag>,
 ) -> (DVector<f64>, DMatrix<f64>) {
     let mut center = center.clone();
@@ -463,22 +429,10 @@ fn adapt_proposal(
 /// `passes = 0`.
 #[allow(clippy::too_many_arguments)]
 fn adapted_eta_proposal(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    passes: usize,
-    mixture: Option<&DefensiveMixture>,
-    cancel: &Option<crate::cancel::CancelFlag>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, log_det_omega: f64, d: usize, k_samples: usize,
+    nu: f64, seed: u64, scratch: &mut EventPkParams, passes: usize,
+    mixture: Option<&DefensiveMixture>, cancel: &Option<crate::cancel::CancelFlag>,
 ) -> (DVector<f64>, DMatrix<f64>) {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
         obs_nll_subject_into(
@@ -562,12 +516,8 @@ pub(crate) fn assert_adaptive_evaluation_is_wired(
 /// Estimate `−2 log L` by importance sampling. See module docstring for the
 /// algorithm and IOV caveats.
 pub fn run_importance_sampling(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    kappas: &[Vec<DVector<f64>>],
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[DVector<f64>], h_matrices: &[DMatrix<f64>], kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Result<ImportanceSamplingResult, String> {
     let n_subjects = population.subjects.len();
@@ -596,12 +546,10 @@ pub fn run_importance_sampling(
     // SDE model would silently report a wrong −2 log L. Refuse upfront — the
     // user can still get the Laplace OFV via FOCE / FOCEI.
     if model.is_sde() {
-        return Err(
-            "Importance sampling is not yet supported for SDE / [diffusion] models. \
+        return Err("Importance sampling is not yet supported for SDE / [diffusion] models. \
              The EKF process-noise variance is not included in the IS observation likelihood, \
              so the marginal would be biased. Use FOCE / FOCEI for the Laplace OFV instead."
-                .to_string(),
-        );
+            .to_string());
     }
 
     // Defensive: every Jacobian must have shape (n_obs_i × n_eta). The only
@@ -673,10 +621,7 @@ pub fn run_importance_sampling(
         options.imp_adapt_samples.clamp(2, k_samples)
     };
     if nu.is_nan() || nu < 1.0 {
-        return Err(format!(
-            "IS: imp_proposal_df must be >= 1.0 or `normal`, got {}",
-            nu
-        ));
+        return Err(format!("IS: imp_proposal_df must be >= 1.0 or `normal`, got {}", nu));
     }
 
     let kappa_treatment = if model.n_kappa > 0 {
@@ -730,11 +675,9 @@ pub fn run_importance_sampling(
             defensive_alpha,
         ))
     } else if model.n_kappa > 0 {
-        return Err(
-            "IS: model declares κ (IOV) but params.omega_iov is missing — \
+        return Err("IS: model declares κ (IOV) but params.omega_iov is missing — \
                     cannot build the joint (η, κ) proposal"
-                .into(),
-        );
+            .into());
     } else {
         None
     };
@@ -744,11 +687,7 @@ pub fn run_importance_sampling(
             "Importance sampling: {} subjects, K={} per subject, {} proposal, seed={}",
             n_subjects,
             k_samples,
-            if nu.is_finite() {
-                format!("t_{nu}")
-            } else {
-                "normal".to_string()
-            },
+            if nu.is_finite() { format!("t_{nu}") } else { "normal".to_string() },
             seed
         );
     }
@@ -766,10 +705,8 @@ pub fn run_importance_sampling(
             .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
     };
 
-    let per_subject: Vec<SubjectIsOutput> = crate::par::map_init(
-        population.subjects.len(),
-        EventPkParams::default,
-        |scratch, i| {
+    let per_subject: Vec<SubjectIsOutput> =
+        crate::par::map_init(population.subjects.len(), EventPkParams::default, |scratch, i| {
             let subject = &population.subjects[i];
             if crate::cancel::is_cancelled(cancel) {
                 return SubjectIsOutput::cancelled(subject.id.clone());
@@ -955,8 +892,7 @@ pub fn run_importance_sampling(
                     defensive_mixture.as_ref(),
                 )
             }
-        },
-    );
+        });
 
     if crate::cancel::is_cancelled(&options.cancel) {
         return Err("cancelled by user".to_string());
@@ -1000,28 +936,21 @@ pub(crate) const MIX_ESS_PMIX_FLOOR: f64 = 1e-3;
 /// worker thread), so subject-level parallelism is preserved while the
 /// thread-local class index stays correct. IOV is not yet supported here.
 pub fn run_importance_sampling_mixture(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
 ) -> Result<ImportanceSamplingResult, String> {
     use crate::estimation::inner_optimizer::find_ebe;
     use crate::estimation::mixture::{class_params, combine_subject};
     use crate::parser::model_parser::{eval_mixing_log_probs, MixtureClassGuard};
 
-    let spec = model
-        .mixture
-        .as_ref()
-        .ok_or("run_importance_sampling_mixture on a non-mixture model")?;
+    let spec =
+        model.mixture.as_ref().ok_or("run_importance_sampling_mixture on a non-mixture model")?;
     if params.mixture.is_none() {
         return Err("IMP mixture objective requires params.mixture (per-class Ω/Σ)".to_string());
     }
     if model.n_kappa > 0 {
-        return Err(
-            "IMP objective evaluation for a mixture does not yet support inter-occasion \
+        return Err("IMP objective evaluation for a mixture does not yet support inter-occasion \
              variability (IOV); use FOCE/FOCEI for an IOV mixture (#985)"
-                .to_string(),
-        );
+            .to_string());
     }
     // Same two scope guards the single-population entry point applies (#992
     // review). With n_eta = 0 there is nothing to integrate — the class-
@@ -1035,12 +964,10 @@ pub fn run_importance_sampling_mixture(
             .to_string());
     }
     if model.is_sde() {
-        return Err(
-            "Importance sampling is not yet supported for SDE / [diffusion] models. \
+        return Err("Importance sampling is not yet supported for SDE / [diffusion] models. \
              The EKF process-noise variance is not included in the IS observation likelihood, \
              so the marginal would be biased. Use FOCE / FOCEI for the Laplace OFV instead."
-                .to_string(),
-        );
+            .to_string());
     }
     let n_eta = model.n_eta;
     let k_samples = options.imp_samples;
@@ -1054,10 +981,7 @@ pub fn run_importance_sampling_mixture(
         return Err(format!("IS: imp_samples must be >= 2, got {}", k_samples));
     }
     if nu.is_nan() || nu < 1.0 {
-        return Err(format!(
-            "IS: imp_proposal_df must be >= 1.0 or `normal`, got {}",
-            nu
-        ));
+        return Err(format!("IS: imp_proposal_df must be >= 1.0 or `normal`, got {}", nu));
     }
     // Every class's Ω must admit a finite log-determinant before any sampling:
     // the single-population entry point rejects a degenerate Ω up front, and
@@ -1088,10 +1012,8 @@ pub fn run_importance_sampling_mixture(
         );
     }
 
-    let per_subject: Vec<SubjectIsOutput> = crate::par::map_init(
-        population.subjects.len(),
-        EventPkParams::default,
-        |scratch, i| {
+    let per_subject: Vec<SubjectIsOutput> =
+        crate::par::map_init(population.subjects.len(), EventPkParams::default, |scratch, i| {
             let subject = &population.subjects[i];
             if crate::cancel::is_cancelled(cancel) {
                 return SubjectIsOutput::cancelled(subject.id.clone());
@@ -1192,13 +1114,8 @@ pub fn run_importance_sampling_mixture(
                 // back to the worst class overall rather than claiming health.
                 ess_k.iter().copied().fold(f64::INFINITY, f64::min)
             };
-            SubjectIsOutput {
-                log_marginal,
-                var_log_marginal,
-                ess_fraction,
-            }
-        },
-    );
+            SubjectIsOutput { log_marginal, var_log_marginal, ess_fraction }
+        });
 
     if crate::cancel::is_cancelled(&options.cancel) {
         return Err("cancelled by user".to_string());
@@ -1223,15 +1140,8 @@ pub fn run_importance_sampling_mixture(
 /// when verbose.
 #[allow(clippy::too_many_arguments)]
 fn reduce_subjects(
-    label: &str,
-    per_subject: &[SubjectIsOutput],
-    population: &Population,
-    threshold: f64,
-    verbose: bool,
-    k_samples: usize,
-    nu: f64,
-    kappa_treatment: KappaTreatment,
-    adapt_passes: usize,
+    label: &str, per_subject: &[SubjectIsOutput], population: &Population, threshold: f64,
+    verbose: bool, k_samples: usize, nu: f64, kappa_treatment: KappaTreatment, adapt_passes: usize,
 ) -> ImportanceSamplingResult {
     let mut ll = 0.0_f64;
     let mut var_ll = 0.0_f64;
@@ -1295,11 +1205,7 @@ struct SubjectIsOutput {
 
 impl SubjectIsOutput {
     fn cancelled(_id: String) -> Self {
-        Self {
-            log_marginal: 0.0,
-            var_log_marginal: 0.0,
-            ess_fraction: 0.0,
-        }
+        Self { log_marginal: 0.0, var_log_marginal: 0.0, ess_fraction: 0.0 }
     }
 
     /// A subject's marginal and ESS fraction, plus the Geweke MC variance of
@@ -1324,20 +1230,9 @@ impl SubjectIsOutput {
 /// stream (`imp_sobol` does not apply to it).
 #[allow(clippy::too_many_arguments)]
 fn subject_is_estimate(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale: f64,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, log_det_omega: f64, d: usize, k_samples: usize,
+    nu: f64, seed: u64, scratch: &mut EventPkParams, iscale: f64,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
@@ -1472,11 +1367,7 @@ pub(crate) fn frem_pk_cov_partition(fc: &FremConfig, n_eta: usize) -> (Vec<usize
 /// subject, or when any covariate has more than one pseudo-obs row (→ caller
 /// falls back to full-dimensional IS).
 pub(crate) fn subject_frem_partition(
-    subject: &Subject,
-    theta: &[f64],
-    fc: &FremConfig,
-    pk_idx: &[usize],
-    cov_idx: &[usize],
+    subject: &Subject, theta: &[f64], fc: &FremConfig, pk_idx: &[usize], cov_idx: &[usize],
 ) -> Option<(Vec<usize>, Vec<usize>, Vec<f64>)> {
     // eta_idx → (fremtype, theta_idx)
     let mut eta_to_ft: std::collections::HashMap<usize, (u16, usize)> =
@@ -1544,25 +1435,10 @@ fn submatrix(m: &DMatrix<f64>, rows: &[usize], cols: &[usize]) -> DMatrix<f64> {
 /// degenerate (caller then falls back to the full-dimensional [`subject_is_draws`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws_frem_rb(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    eta_hat: &DVector<f64>,
-    h_post: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    omega_matrix: &DMatrix<f64>,
-    pk_idx: &[usize],
-    cov_idx: &[usize],
-    d: &[f64],
-    n_eta: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale: f64,
-    use_sobol: bool,
-    defensive_alpha: f64,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], eta_hat: &DVector<f64>,
+    h_post: &DMatrix<f64>, omega_inv: &DMatrix<f64>, omega_matrix: &DMatrix<f64>, pk_idx: &[usize],
+    cov_idx: &[usize], d: &[f64], n_eta: usize, k_samples: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, iscale: f64, use_sobol: bool, defensive_alpha: f64,
 ) -> Option<SubjectDraws> {
     let np = pk_idx.len();
     let nc = cov_idx.len();
@@ -1764,14 +1640,7 @@ pub(crate) fn subject_is_draws_frem_rb(
         }
     }
 
-    Some(SubjectDraws {
-        log_marginal,
-        ess_fraction,
-        etas,
-        weights,
-        mean,
-        second_moment,
-    })
+    Some(SubjectDraws { log_marginal, ess_fraction, etas, weights, mean, second_moment })
 }
 
 /// Draw `K` importance samples for one subject from a proposal centered at the
@@ -1792,23 +1661,10 @@ pub(crate) fn subject_is_draws_frem_rb(
 /// MVN or Student-t proposal, with or without the defensive mixture (#1965).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale: f64,
-    use_sobol: bool,
-    mixture: Option<&DefensiveMixture>,
-    schedule: Option<&EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, log_det_omega: f64, d: usize, k_samples: usize,
+    nu: f64, seed: u64, scratch: &mut EventPkParams, iscale: f64, use_sobol: bool,
+    mixture: Option<&DefensiveMixture>, schedule: Option<&EventSchedule>,
 ) -> SubjectDraws {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
         obs_nll_subject_into_with_schedule(
@@ -1855,19 +1711,9 @@ pub(crate) type SampleObsNll<'a> = dyn Fn(&[f64], &mut EventPkParams) -> f64 + '
 /// to has a Cholesky factor.
 #[allow(clippy::too_many_arguments)]
 fn is_log_weights(
-    obs_nll: &SampleObsNll<'_>,
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale: f64,
-    use_sobol: bool,
-    mixture: Option<&DefensiveMixture>,
+    obs_nll: &SampleObsNll<'_>, eta_hat: &DVector<f64>, h: &DMatrix<f64>, omega_inv: &DMatrix<f64>,
+    log_det_omega: f64, d: usize, k_samples: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, iscale: f64, use_sobol: bool, mixture: Option<&DefensiveMixture>,
     mut keep: Option<&mut Vec<f64>>,
 ) -> Option<Vec<f64>> {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -1918,19 +1764,12 @@ fn is_log_weights(
     let qmc = use_sobol.then(|| sobol_qmc_draws(d, k_samples, seed, nu, mixture.is_some()));
 
     for sample_idx in 0..k_samples {
-        match draw_inputs(
-            sample_idx,
-            qmc.as_ref(),
-            mixture,
-            chi_sq.as_ref(),
-            nu,
-            &mut rng,
-            &mut z,
-        ) {
+        match draw_inputs(sample_idx, qmc.as_ref(), mixture, chi_sq.as_ref(), nu, &mut rng, &mut z)
+        {
             // Defensive draw η ~ N(0, Ω): centred at the prior mean (0), not η̂.
-            DrawInputs::Broad => mixture
-                .expect("mixture set when from_broad")
-                .broad_from_z(&z, &mut eta_sample),
+            DrawInputs::Broad => {
+                mixture.expect("mixture set when from_broad").broad_from_z(&z, &mut eta_sample)
+            }
             DrawInputs::Narrow { t_scale } => {
                 proposal.apply_l_sigma(&z, &mut eta_sample, t_scale * iscale);
                 for (j, e) in eta_sample.iter_mut().enumerate() {
@@ -1981,19 +1820,9 @@ fn is_log_weights(
 /// is the defensive `mixture`'s broad component.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_is_draws_with(
-    obs_nll: &SampleObsNll<'_>,
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale: f64,
-    use_sobol: bool,
-    mixture: Option<&DefensiveMixture>,
+    obs_nll: &SampleObsNll<'_>, eta_hat: &DVector<f64>, h: &DMatrix<f64>, omega_inv: &DMatrix<f64>,
+    log_det_omega: f64, d: usize, k_samples: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, iscale: f64, use_sobol: bool, mixture: Option<&DefensiveMixture>,
 ) -> SubjectDraws {
     let mut flat: Vec<f64> = Vec::with_capacity(k_samples * d);
     let Some(log_w) = is_log_weights(
@@ -2029,14 +1858,7 @@ pub(crate) fn subject_is_draws_with(
     let (mean, second_moment) = weighted_moments(&weights, &flat, d);
     let etas: Vec<Vec<f64>> = flat.chunks_exact(d).map(<[f64]>::to_vec).collect();
 
-    SubjectDraws {
-        log_marginal,
-        ess_fraction,
-        etas,
-        weights,
-        mean,
-        second_moment,
-    }
+    SubjectDraws { log_marginal, ess_fraction, etas, weights, mean, second_moment }
 }
 
 /// Weighted first and second moments `Σₖ w̃ₖ ηₖ` and `Σₖ w̃ₖ ηₖ ηₖᵀ` of draws stored flat,
@@ -2060,19 +1882,9 @@ fn weighted_moments(weights: &[f64], flat: &[f64], d: usize) -> (Vec<f64>, DMatr
 /// retaining the draws or forming the moments the M-step needs.
 #[allow(clippy::too_many_arguments)]
 fn subject_is_marginal_with(
-    obs_nll: &SampleObsNll<'_>,
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale: f64,
-    use_sobol: bool,
-    mixture: Option<&DefensiveMixture>,
+    obs_nll: &SampleObsNll<'_>, eta_hat: &DVector<f64>, h: &DMatrix<f64>, omega_inv: &DMatrix<f64>,
+    log_det_omega: f64, d: usize, k_samples: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, iscale: f64, use_sobol: bool, mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
     let Some(log_w) = is_log_weights(
         obs_nll,
@@ -2109,10 +1921,7 @@ fn subject_is_marginal_with(
 /// draw (e.g. a non-PD proposal) — that scale is skipped, not treated as best.
 /// Returns 1.0 if ISCALE is disabled (`iscale_min >= iscale_max`, or both == 1.0).
 fn iscale_pilot_grid_search(
-    iscale_min: f64,
-    iscale_max: f64,
-    seed: u64,
-    mut pilot_ess: impl FnMut(f64, u64) -> Option<f64>,
+    iscale_min: f64, iscale_max: f64, seed: u64, mut pilot_ess: impl FnMut(f64, u64) -> Option<f64>,
 ) -> f64 {
     if iscale_min >= iscale_max || (iscale_min == 1.0 && iscale_max == 1.0) {
         return 1.0;
@@ -2145,20 +1954,9 @@ fn iscale_pilot_grid_search(
 /// Returns 1.0 if ISCALE is disabled (min >= max or both == 1.0).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_optimal_iscale(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale_min: f64,
-    iscale_max: f64,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], eta_hat: &DVector<f64>,
+    h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, log_det_omega: f64, d: usize, nu: f64, seed: u64,
+    scratch: &mut EventPkParams, iscale_min: f64, iscale_max: f64,
     schedule: Option<&EventSchedule>,
 ) -> f64 {
     let obs_nll = |eta: &[f64], scratch: &mut EventPkParams| {
@@ -2193,16 +1991,8 @@ pub(crate) fn find_optimal_iscale(
 /// proposal is tuned on the joint ESS (#2301).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_optimal_iscale_with(
-    obs_nll: &SampleObsNll<'_>,
-    eta_hat: &DVector<f64>,
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    log_det_omega: f64,
-    d: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale_min: f64,
+    obs_nll: &SampleObsNll<'_>, eta_hat: &DVector<f64>, h: &DMatrix<f64>, omega_inv: &DMatrix<f64>,
+    log_det_omega: f64, d: usize, nu: f64, seed: u64, scratch: &mut EventPkParams, iscale_min: f64,
     iscale_max: f64,
 ) -> f64 {
     const N_PILOT: usize = 50;
@@ -2237,23 +2027,10 @@ pub(crate) fn find_optimal_iscale_with(
 /// reduced-dimension (PK-only) ESS instead of the full-dimensional one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn find_optimal_iscale_frem_rb(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    eta_hat: &DVector<f64>,
-    h_post: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    omega_matrix: &DMatrix<f64>,
-    pk_idx: &[usize],
-    cov_idx: &[usize],
-    d: &[f64],
-    n_eta: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
-    iscale_min: f64,
-    iscale_max: f64,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], eta_hat: &DVector<f64>,
+    h_post: &DMatrix<f64>, omega_inv: &DMatrix<f64>, omega_matrix: &DMatrix<f64>, pk_idx: &[usize],
+    cov_idx: &[usize], d: &[f64], n_eta: usize, nu: f64, seed: u64, scratch: &mut EventPkParams,
+    iscale_min: f64, iscale_max: f64,
 ) -> f64 {
     const N_PILOT: usize = 50;
     iscale_pilot_grid_search(iscale_min, iscale_max, seed, |scale, pilot_seed| {
@@ -2308,17 +2085,9 @@ fn kappa_fd_forced() -> bool {
 /// Jacobian of predictions w.r.t. b.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_joint_posterior_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    kappas: &[DVector<f64>],
-    sigma: &[f64],
-    jacobian_eta: &DMatrix<f64>,
-    omega_joint_inv: &DMatrix<f64>,
-    n_eta: usize,
-    n_iov: usize,
-    n_occ: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    kappas: &[DVector<f64>], sigma: &[f64], jacobian_eta: &DMatrix<f64>,
+    omega_joint_inv: &DMatrix<f64>, n_eta: usize, n_iov: usize, n_occ: usize,
     _scratch: &mut EventPkParams,
 ) -> DMatrix<f64> {
     let n_obs = subject.observations.len();
@@ -2374,11 +2143,8 @@ pub(crate) fn compute_joint_posterior_hessian(
     // search differentiates (`exact_kappa_jacobian`: its κ lanes only, the same layout
     // `kappa_offset` indexes).
     // The central difference over `predict_iov` remains where the recorders decline.
-    let stacked: Vec<f64> = eta_hat
-        .iter()
-        .chain(kappas.iter().flat_map(|k| k.iter()))
-        .copied()
-        .collect();
+    let stacked: Vec<f64> =
+        eta_hat.iter().chain(kappas.iter().flat_map(|k| k.iter())).copied().collect();
     let exact = if kappa_fd_forced() {
         None
     } else {
@@ -2449,10 +2215,7 @@ pub(crate) fn compute_joint_posterior_hessian(
 
 /// Build the joint prior precision matrix (block-diagonal: Omega_bsv^{-1} + K copies of Omega_iov^{-1}).
 pub(crate) fn build_joint_omega_inv(
-    omega_inv: &DMatrix<f64>,
-    omega_iov_inv: &DMatrix<f64>,
-    n_eta: usize,
-    n_iov: usize,
+    omega_inv: &DMatrix<f64>, omega_iov_inv: &DMatrix<f64>, n_eta: usize, n_iov: usize,
     n_occ: usize,
 ) -> DMatrix<f64> {
     debug_assert_eq!((omega_inv.nrows(), omega_iov_inv.nrows()), (n_eta, n_iov));
@@ -2470,19 +2233,9 @@ pub(crate) fn build_joint_omega_inv(
 /// readout then scored a different likelihood than the one IMP/IMPMAP estimate.
 #[allow(clippy::too_many_arguments)]
 fn subject_is_estimate_joint(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma: &[f64],
-    mode_joint: &[f64],
-    h_joint: &DMatrix<f64>,
-    omega_joint_inv: &DMatrix<f64>,
-    log_det_omega_joint: f64,
-    n_b: usize,
-    k_samples: usize,
-    nu: f64,
-    seed: u64,
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma: &[f64], mode_joint: &[f64],
+    h_joint: &DMatrix<f64>, omega_joint_inv: &DMatrix<f64>, log_det_omega_joint: f64, n_b: usize,
+    k_samples: usize, nu: f64, seed: u64, scratch: &mut EventPkParams,
     mixture: Option<&DefensiveMixture>,
 ) -> SubjectIsOutput {
     let obs_nll =
@@ -2534,11 +2287,7 @@ impl Proposal {
         }
         let l = h.clone().cholesky()?.l();
         let log_det = 2.0 * (0..d).map(|i| l[(i, i)].ln()).sum::<f64>();
-        Some(Proposal {
-            chol_h: l,
-            log_det_inv_scale: log_det,
-            d,
-        })
+        Some(Proposal { chol_h: l, log_det_inv_scale: log_det, d })
     }
 
     /// Apply `scale · L_Σ z` into `out`, where `L_Σ` is the Cholesky factor of
@@ -2593,9 +2342,7 @@ impl Proposal {
 ///
 /// Returns `None` only when `d == 0`.
 pub(crate) fn build_proposal(
-    h: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    d: usize,
+    h: &DMatrix<f64>, omega_inv: &DMatrix<f64>, d: usize,
 ) -> Option<Proposal> {
     if d == 0 {
         return None;
@@ -2655,24 +2402,14 @@ impl DefensiveMixture {
             return None;
         }
         let broad = build_broad_proposal(omega_inv, d)?;
-        Some(Self {
-            broad,
-            alpha,
-            ln_alpha: alpha.ln(),
-            ln_one_minus_alpha: (1.0 - alpha).ln(),
-        })
+        Some(Self { broad, alpha, ln_alpha: alpha.ln(), ln_one_minus_alpha: (1.0 - alpha).ln() })
     }
 
     /// Build a defensive component from a pre-factored broad proposal (used by the
     /// FREM Rao-Blackwell path, whose covering distribution is the conditional PK
     /// prior `N(μ, P_pp⁻¹)` rather than `N(0, Ω)`).
     fn from_proposal(broad: Proposal, alpha: f64) -> Self {
-        Self {
-            broad,
-            alpha,
-            ln_alpha: alpha.ln(),
-            ln_one_minus_alpha: (1.0 - alpha).ln(),
-        }
+        Self { broad, alpha, ln_alpha: alpha.ln(), ln_one_minus_alpha: (1.0 - alpha).ln() }
     }
 
     /// Decide whether this draw comes from the broad component. Consumes exactly
@@ -2701,10 +2438,7 @@ impl DefensiveMixture {
     /// Gaussian prior for the `N(0,Ω)` component, or the conditional prior for the
     /// FREM RB component).
     fn log_q(&self, log_q_narrow: f64, log_q_broad: f64) -> f64 {
-        logsumexp2(
-            self.ln_one_minus_alpha + log_q_narrow,
-            self.ln_alpha + log_q_broad,
-        )
+        logsumexp2(self.ln_one_minus_alpha + log_q_narrow, self.ln_alpha + log_q_broad)
     }
 }
 
@@ -2774,15 +2508,8 @@ fn var_log_marginal_from_ess_fraction(ess_fraction: f64, k: f64) -> f64 {
 /// — it's the Laplace covariance's inverse.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_posterior_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    sigma: &[f64],
-    jacobian: &DMatrix<f64>,
-    omega_inv: &DMatrix<f64>,
-    n_eta: usize,
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>, sigma: &[f64],
+    jacobian: &DMatrix<f64>, omega_inv: &DMatrix<f64>, n_eta: usize, scratch: &mut EventPkParams,
 ) -> DMatrix<f64> {
     let n_obs = subject.observations.len();
     if n_obs == 0 {
@@ -2825,11 +2552,7 @@ pub(crate) fn compute_posterior_hessian(
             if let Some(k) = model.residual_error_eta.filter(|&k| k < n_eta) {
                 let res = DVector::from_iterator(
                     n_obs,
-                    subject
-                        .observations
-                        .iter()
-                        .zip(ipreds.iter())
-                        .map(|(&y, &f)| y - f),
+                    subject.observations.iter().zip(ipreds.iter()).map(|(&y, &f)| y - f),
                 );
                 h_post[(k, k)] += 2.0 * res.dot(&chol.solve(&res));
             }
@@ -2890,12 +2613,8 @@ pub(crate) fn compute_posterior_hessian(
 /// diagonal η_ruv couplings are left at the Gauss-Newton level (zero), matching
 /// how the structural-eta block already drops `∂R/∂η` cross terms.
 fn add_ruv_posterior_curvature(
-    h_post: &mut DMatrix<f64>,
-    model: &CompiledModel,
-    subject: &Subject,
-    ipreds: &[f64],
-    r_diag: &[f64],
-    n_eta: usize,
+    h_post: &mut DMatrix<f64>, model: &CompiledModel, subject: &Subject, ipreds: &[f64],
+    r_diag: &[f64], n_eta: usize,
 ) {
     let Some(k) = model.residual_error_eta else {
         return;
@@ -2948,28 +2667,29 @@ mod tests {
             s.obs_rgroup = crate::stats::residual_error::residual_groups(&parsed.model, &s);
             (parsed.model, s)
         };
-        let precision = |model: &CompiledModel, s: &Subject| {
-            let p = &model.default_params;
-            let n_obs = s.observations.len();
-            let jac = DMatrix::from_fn(n_obs, 3, |j, k| {
-                if k == 2 {
-                    0.0
-                } else {
-                    0.4 + 0.1 * (j + k) as f64
-                }
-            });
-            compute_posterior_hessian(
-                model,
-                s,
-                &p.theta,
-                &DVector::from_vec(vec![0.1, -0.05, 0.6]),
-                &p.sigma.values,
-                &jac,
-                &p.omega.inv,
-                3,
-                &mut EventPkParams::default(),
-            )
-        };
+        let precision =
+            |model: &CompiledModel, s: &Subject| {
+                let p = &model.default_params;
+                let n_obs = s.observations.len();
+                let jac = DMatrix::from_fn(n_obs, 3, |j, k| {
+                    if k == 2 {
+                        0.0
+                    } else {
+                        0.4 + 0.1 * (j + k) as f64
+                    }
+                });
+                compute_posterior_hessian(
+                    model,
+                    s,
+                    &p.theta,
+                    &DVector::from_vec(vec![0.1, -0.05, 0.6]),
+                    &p.sigma.values,
+                    &jac,
+                    &p.omega.inv,
+                    3,
+                    &mut EventPkParams::default(),
+                )
+            };
         let (dense, s_dense) = load(&free("theta RHO(0.0, -0.9, 0.99)"));
         assert!(dense.residual_is_dense());
         let diagonal_src = free("theta RHO(0.0, -0.9, 0.99) FIX");
@@ -2978,10 +2698,7 @@ mod tests {
         let (h_dense, h_diag) = (precision(&dense, &s_dense), precision(&diagonal, &s_diag));
         let gap = (&h_dense - &h_diag).abs().max();
         eprintln!("ρ = 0 dense vs diagonal proposal: {gap:.3e}");
-        assert!(
-            gap.is_finite() && gap < 1e-9 * h_diag.abs().max(),
-            "{gap:e}"
-        );
+        assert!(gap.is_finite() && gap < 1e-9 * h_diag.abs().max(), "{gap:e}");
         // Both halves are live: the scale on the structural block, the curvature on `η_ruv`.
         assert!(h_diag[(0, 0)] > 2.0 * dense.default_params.omega.inv[(0, 0)]);
         assert!(h_diag[(2, 2)] > 1.5 * dense.default_params.omega.inv[(2, 2)]);
@@ -3013,9 +2730,8 @@ mod tests {
             let n_occ = crate::stats::likelihood::iov_occasion_groups(s).len();
             let n_b = crate::stats::stacked_layout::stacked_width(n_eta, n_iov, n_occ);
             let eta = DVector::from_element(n_eta, 0.05);
-            let kappas: Vec<DVector<f64>> = (0..n_occ)
-                .map(|k| DVector::from_element(n_iov, 0.02 * (k as f64 + 1.0)))
-                .collect();
+            let kappas: Vec<DVector<f64>> =
+                (0..n_occ).map(|k| DVector::from_element(n_iov, 0.02 * (k as f64 + 1.0))).collect();
             let jac_eta = DMatrix::from_element(s.observations.len(), n_eta, 0.3);
             let prior = DMatrix::identity(n_b, n_b);
             let mut scratch = EventPkParams::default();
@@ -3090,10 +2806,7 @@ mod tests {
         model.residual_error_eta = None;
         let mut h = DMatrix::<f64>::zeros(n_eta, n_eta);
         add_ruv_posterior_curvature(&mut h, &model, &subject, &ipreds, &r_diag, n_eta);
-        assert!(
-            h.iter().all(|&v| v == 0.0),
-            "no residual eta must be a no-op"
-        );
+        assert!(h.iter().all(|&v| v == 0.0), "no residual eta must be a no-op");
 
         // η_ruv at index 1: diagonal gains Σ 2·res²/R over PK rows only.
         // 2·(10−9)²/4 + 2·(8−7)²/2 = 0.5 + 1.0 = 1.5 (FREM row 3 excluded).
@@ -3107,10 +2820,7 @@ mod tests {
         let mut h2 = DMatrix::<f64>::zeros(n_eta, n_eta);
         model.residual_error_eta = Some(5);
         add_ruv_posterior_curvature(&mut h2, &model, &subject, &ipreds, &r_diag, n_eta);
-        assert!(
-            h2.iter().all(|&v| v == 0.0),
-            "out-of-range k must be a no-op"
-        );
+        assert!(h2.iter().all(|&v| v == 0.0), "out-of-range k must be a no-op");
 
         // Including a FREM row only (no PK rows) yields zero curvature.
         subject.fremtype = vec![1, 1, 1];
@@ -3162,10 +2872,7 @@ mod tests {
         assert!((logsumexp2(f64::NEG_INFINITY, 5.0) - 5.0).abs() < 1e-12);
         assert!((logsumexp2(5.0, f64::NEG_INFINITY) - 5.0).abs() < 1e-12);
         // Both degenerate → −∞ (no NaN).
-        assert_eq!(
-            logsumexp2(f64::NEG_INFINITY, f64::NEG_INFINITY),
-            f64::NEG_INFINITY
-        );
+        assert_eq!(logsumexp2(f64::NEG_INFINITY, f64::NEG_INFINITY), f64::NEG_INFINITY);
         // Stable for large magnitudes (no overflow).
         let big = logsumexp2(1000.0, 1001.0);
         assert!((big - (1001.0 + (1.0 + (-1.0_f64).exp()).ln())).abs() < 1e-9);
@@ -3384,10 +3091,7 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         map.insert(100u16, (5usize, 1usize)); // cov eta at index 1
         map.insert(200u16, (6usize, 3usize)); // cov eta at index 3
-        let fc = FremConfig {
-            fremtype_to_indices: map,
-            covariate_sigma_index: 0,
-        };
+        let fc = FremConfig { fremtype_to_indices: map, covariate_sigma_index: 0 };
         let (pk, cov) = frem_pk_cov_partition(&fc, 4);
         assert_eq!(pk, vec![0, 2]);
         assert_eq!(cov, vec![1, 3]);
@@ -3395,12 +3099,7 @@ mod tests {
 
     /// Build a Subject carrying only the fields `subject_frem_partition` reads.
     fn frem_subject(fremtype: Vec<u16>, observations: Vec<f64>) -> Subject {
-        Subject {
-            id: "t".into(),
-            observations,
-            fremtype,
-            ..Default::default()
-        }
+        Subject { id: "t".into(), observations, fremtype, ..Default::default() }
     }
 
     #[test]
@@ -3408,10 +3107,7 @@ mod tests {
         // One eta (idx 1) mapped to FREMTYPE 100; pk = {0}, cov = {1}.
         let mut map = std::collections::HashMap::new();
         map.insert(100u16, (0usize, 1usize)); // (theta_idx, eta_idx)
-        let fc = FremConfig {
-            fremtype_to_indices: map,
-            covariate_sigma_index: 0,
-        };
+        let fc = FremConfig { fremtype_to_indices: map, covariate_sigma_index: 0 };
         let theta = [0.0_f64];
         // Single covariate row → RB split is exact → Some.
         let single = frem_subject(vec![0, 100], vec![5.0, 1.2]);
@@ -3455,10 +3151,7 @@ mod tests {
         for i in 0..2 {
             assert!((mu_prec[i] - mu_cov[i]).abs() < 1e-10, "mu[{i}]");
             for j in 0..2 {
-                assert!(
-                    (sigma_prec[(i, j)] - sigma_cov[(i, j)]).abs() < 1e-10,
-                    "sigma[{i},{j}]"
-                );
+                assert!((sigma_prec[(i, j)] - sigma_cov[(i, j)]).abs() < 1e-10, "sigma[{i},{j}]");
             }
         }
     }
@@ -3585,11 +3278,7 @@ mod tests {
                     let x = (prefix << shift) | (rng.random::<u32>() >> t);
                     let y = (prefix << shift) | (rng.random::<u32>() >> t);
                     let (sx, sy) = (owen_scramble_u32(x, seed), owen_scramble_u32(y, seed));
-                    assert_eq!(
-                        sx >> shift,
-                        sy >> shift,
-                        "seed {seed:#x}, t {t}: not nested"
-                    );
+                    assert_eq!(sx >> shift, sy >> shift, "seed {seed:#x}, t {t}: not nested");
                     let p = (sx >> shift) as usize;
                     assert!(!seen[p], "seed {seed:#x}, t {t}: prefixes collide");
                     seen[p] = true;
@@ -3619,9 +3308,8 @@ mod tests {
             }
         }
         // Full width: 2¹⁶ distinct inputs give 2¹⁶ distinct outputs.
-        let mut out: Vec<u32> = (0..1u32 << 16)
-            .map(|i| owen_scramble_u32(i.wrapping_mul(0x9E37_79B9), 7))
-            .collect();
+        let mut out: Vec<u32> =
+            (0..1u32 << 16).map(|i| owen_scramble_u32(i.wrapping_mul(0x9E37_79B9), 7)).collect();
         out.sort_unstable();
         out.dedup();
         assert_eq!(out.len(), 1 << 16, "scramble collides at full width");
@@ -3631,11 +3319,7 @@ mod tests {
         let mut distinct = keys.clone();
         distinct.sort_unstable();
         distinct.dedup();
-        assert_eq!(
-            distinct.len(),
-            SOBOL_MAX_DIMS,
-            "coordinates share a scramble key"
-        );
+        assert_eq!(distinct.len(), SOBOL_MAX_DIMS, "coordinates share a scramble key");
         let other = owen_coordinate_seeds(SOBOL_MAX_DIMS, 2);
         assert!(keys.iter().zip(&other).all(|(a, b)| a != b));
         assert_eq!(owen_coordinate_seeds(3, 1)[..], keys[..3]);
@@ -3658,12 +3342,7 @@ mod tests {
             let shift: Vec<f64> = (0..d).map(|_| rng.random::<f64>()).collect();
             Sobol::<f64>::new(d, sobol_params())
                 .take(k)
-                .map(|p| {
-                    p.iter()
-                        .zip(shift.iter())
-                        .map(|(&u, &s)| (u + s) % 1.0)
-                        .collect()
-                })
+                .map(|p| p.iter().zip(shift.iter()).map(|(&u, &s)| (u + s) % 1.0).collect())
                 .collect()
         };
         let rmse = |k: usize, pts: &dyn Fn(usize, u64) -> Vec<Vec<f64>>| -> f64 {
@@ -3686,10 +3365,7 @@ mod tests {
         assert!([o256, o1024, s256, s1024].iter().all(|v| v.is_finite()));
         // 10.8× and 16.7× measured; 4× bounds.
         assert!(o256 * 4.0 < s256, "K=256: Owen {o256:e} vs shift {s256:e}");
-        assert!(
-            o1024 * 4.0 < s1024,
-            "K=1024: Owen {o1024:e} vs shift {s1024:e}"
-        );
+        assert!(o1024 * 4.0 < s1024, "K=1024: Owen {o1024:e} vs shift {s1024:e}");
         // Rate over the 4× step in K: Owen measured 6.9× (K^−1.39), the shift
         // 4.5× (K^−1.08); 5.5× sits between them.
         assert!(o256 / o1024 > 5.5, "Owen rate: {o256:e} → {o1024:e}");
@@ -3706,12 +3382,9 @@ mod tests {
         let omega_inv = DMatrix::from_diagonal(&DVector::from_vec(vec![4.0, 9.0, 1.0]));
         let mix = DefensiveMixture::new(&omega_inv, 3, 0.3).expect("PD Ω⁻¹ → mixture");
         let d = 3;
-        for (nu, with_mix) in [
-            (f64::INFINITY, false),
-            (5.0, false),
-            (f64::INFINITY, true),
-            (5.0, true),
-        ] {
+        for (nu, with_mix) in
+            [(f64::INFINITY, false), (5.0, false), (f64::INFINITY, true), (5.0, true)]
+        {
             let chi = nu.is_finite().then(|| ChiSquared::new(nu).unwrap());
             let mixture = with_mix.then_some(&mix);
             let mut rng = StdRng::seed_from_u64(99);
@@ -3747,11 +3420,7 @@ mod tests {
                 }
             }
             // Both components were exercised whenever the mixture is on.
-            assert_eq!(
-                n_broad > 0,
-                with_mix,
-                "nu={nu} mix={with_mix}: {n_broad} broad draws"
-            );
+            assert_eq!(n_broad > 0, with_mix, "nu={nu} mix={with_mix}: {n_broad} broad draws");
         }
     }
 
@@ -3786,10 +3455,7 @@ mod tests {
         assert_eq!(mvn.z, want);
 
         let full = sobol_qmc_draws(d, k, seed, 4.0, true);
-        assert_eq!(
-            full.z, mvn.z,
-            "t/mixture coordinates must follow the normals"
-        );
+        assert_eq!(full.z, mvn.z, "t/mixture coordinates must follow the normals");
         assert_eq!(full.chi_sq.as_ref().map(Vec::len), Some(k));
         assert_eq!(full.u_mix.as_ref().map(Vec::len), Some(k));
     }
@@ -3802,16 +3468,12 @@ mod tests {
     #[test]
     fn sobol_chi_sq_coordinate_has_the_chi_sq_marginal() {
         let (k, nu) = (1024, 4.0);
-        let mut chi = sobol_qmc_draws(2, k, 3, nu, false)
-            .chi_sq
-            .expect("t proposal");
+        let mut chi = sobol_qmc_draws(2, k, 3, nu, false).chi_sq.expect("t proposal");
         chi.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
         let mut ks = 0.0_f64;
         for (i, &x) in chi.iter().enumerate() {
             let f = crate::stats::special::regularized_gamma_p(0.5 * nu, 0.5 * x);
-            ks = ks
-                .max((f - i as f64 / k as f64).abs())
-                .max((f - (i + 1) as f64 / k as f64).abs());
+            ks = ks.max((f - i as f64 / k as f64).abs()).max((f - (i + 1) as f64 / k as f64).abs());
         }
         assert!(ks.is_finite() && ks < 2.0 / k as f64, "KS distance {ks}");
     }
@@ -3898,10 +3560,7 @@ mod tests {
             let mut want = [0.0; 3];
             mix.broad_from_z(&q.z[idx], &mut want);
             assert_eq!(
-                draws.etas[idx]
-                    .iter()
-                    .map(|x| x.to_bits())
-                    .collect::<Vec<_>>(),
+                draws.etas[idx].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                 want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                 "broad draw {idx} is not L_broad · z(Sobol)"
             );
@@ -3954,15 +3613,9 @@ mod tests {
         // Conditional PK prior N(μ_pc, P_pp⁻¹), rebuilt independently.
         let p_pp = submatrix(&omega_inv, &pk, &pk);
         let p_pc = submatrix(&omega_inv, &pk, &cov);
-        let mu_pc = p_pp
-            .clone()
-            .cholesky()
-            .unwrap()
-            .solve(&(-(&p_pc * DVector::from_column_slice(&d))));
-        assert!(
-            mu_pc.iter().any(|m| m.abs() > 1e-6),
-            "fixture must make μ_pc nonzero"
-        );
+        let mu_pc =
+            p_pp.clone().cholesky().unwrap().solve(&(-(&p_pc * DVector::from_column_slice(&d))));
+        assert!(mu_pc.iter().any(|m| m.abs() > 1e-6), "fixture must make μ_pc nonzero");
         let mix = DefensiveMixture::from_proposal(build_broad_proposal(&p_pp, 2).unwrap(), alpha);
         let q = sobol_qmc_draws(2, k, seed, nu, true);
         let mut n_broad = 0;
@@ -4029,10 +3682,7 @@ mod tests {
         }
         let (rms_qmc, rms_prng) = ((se_qmc / 16.0).sqrt(), (se_prng / 16.0).sqrt());
         assert!(rms_qmc.is_finite() && rms_prng.is_finite());
-        assert!(
-            rms_qmc * 5.0 < rms_prng,
-            "Sobol RMS {rms_qmc:e} vs pseudo-random {rms_prng:e}"
-        );
+        assert!(rms_qmc * 5.0 < rms_prng, "Sobol RMS {rms_qmc:e} vs pseudo-random {rms_prng:e}");
         // The scale itself: E[t²] = ν/(ν−2) = 2 for ν = 4; measured 1.979. The
         // bound is loose because t₄ is heavy-tailed; it still catches a missing
         // (E = 1) or inverted √(ν/χ²) scale.
@@ -4059,12 +3709,7 @@ mod tests {
         let (k, seed) = (64, 21);
         let mix = DefensiveMixture::new(&omega_inv, 3, 0.2).expect("PD Ω⁻¹ → mixture");
 
-        for (nu, alpha) in [
-            (f64::INFINITY, 0.0),
-            (4.0, 0.0),
-            (f64::INFINITY, 0.2),
-            (4.0, 0.2),
-        ] {
+        for (nu, alpha) in [(f64::INFINITY, 0.0), (4.0, 0.0), (f64::INFINITY, 0.2), (4.0, 0.2)] {
             let label = format!("nu={nu} alpha={alpha}");
             let full = |sobol: bool| {
                 let mixture = (alpha > 0.0).then_some(&mix);
@@ -4125,11 +3770,7 @@ mod tests {
                 .expect("well-formed RB partition")
                 .etas
             };
-            assert_ne!(
-                rb(true),
-                rb(false),
-                "FREM RB sampler, {label}: Sobol had no effect"
-            );
+            assert_ne!(rb(true), rb(false), "FREM RB sampler, {label}: Sobol had no effect");
         }
     }
 
@@ -4223,13 +3864,7 @@ mod tests {
 
         let theta = [10.0, 100.0, 90.0];
         let eta_hat = DVector::from_column_slice(&[0.05, -0.02, 0.0]);
-        let omega_inv = model
-            .default_params
-            .omega
-            .matrix
-            .clone()
-            .try_inverse()
-            .unwrap();
+        let omega_inv = model.default_params.omega.matrix.clone().try_inverse().unwrap();
         let omega_matrix = model.default_params.omega.matrix.clone();
         let pk_idx = vec![0usize, 1];
         let cov_idx = vec![2usize];
@@ -4396,11 +4031,7 @@ mod tests {
 
     /// Prior variances of [`linear_design`]'s columns, and the residual variance.
     fn linear_variances(iov: bool) -> (DVector<f64>, f64) {
-        let prior = if iov {
-            vec![0.5, 0.2, 0.3, 0.3]
-        } else {
-            vec![0.5, 0.2]
-        };
+        let prior = if iov { vec![0.5, 0.2, 0.3, 0.3] } else { vec![0.5, 0.2] };
         (DVector::from_vec(prior), 0.4 * 0.4)
     }
 
@@ -4431,18 +4062,14 @@ mod tests {
         let (prior, s2) = linear_variances(iov);
         let h = z.transpose() * &z / s2 + DMatrix::from_diagonal(&prior.map(|p| 1.0 / p));
         let chol = h.cholesky().unwrap();
-        let modes: Vec<DVector<f64>> = (0..2)
-            .map(|s| chol.solve(&(z.transpose() * linear_residual(s) / s2)))
-            .collect();
+        let modes: Vec<DVector<f64>> =
+            (0..2).map(|s| chol.solve(&(z.transpose() * linear_residual(s) / s2))).collect();
         let etas = modes.iter().map(|m| m.rows(0, 2).into_owned()).collect();
         let kappas = modes
             .iter()
             .map(|m| {
                 if iov {
-                    vec![
-                        DVector::from_element(1, m[2]),
-                        DVector::from_element(1, m[3]),
-                    ]
+                    vec![DVector::from_element(1, m[2]), DVector::from_element(1, m[3])]
                 } else {
                     Vec::new()
                 }
@@ -4455,20 +4082,13 @@ mod tests {
     /// the given proposal alone: these tests pin the sampler's kernel, and an
     /// exact proposal is what makes its weights constant, so they do not adapt.
     fn linear_is(
-        model: &CompiledModel,
-        iov: bool,
-        nu: f64,
-        alpha: f64,
+        model: &CompiledModel, iov: bool, nu: f64, alpha: f64,
     ) -> ImportanceSamplingResult {
         linear_is_adapted(model, iov, nu, alpha, 0)
     }
 
     fn linear_is_adapted(
-        model: &CompiledModel,
-        iov: bool,
-        nu: f64,
-        alpha: f64,
-        passes: usize,
+        model: &CompiledModel, iov: bool, nu: f64, alpha: f64, passes: usize,
     ) -> ImportanceSamplingResult {
         let (etas, kappas) = linear_modes(iov);
         let j = linear_design(false);
@@ -4762,10 +4382,7 @@ mod tests {
                 let err =
                     run_importance_sampling_mixture(&model, &pop, &model.default_params, &opts)
                         .expect_err("IOV mixture IS must be rejected");
-                assert!(
-                    err.contains("IOV") || err.contains("inter-occasion"),
-                    "got: {err}"
-                );
+                assert!(err.contains("IOV") || err.contains("inter-occasion"), "got: {err}");
             }
         }
     }
@@ -4830,10 +4447,7 @@ mod tests {
         // `from_matrix` regularises a singular Ω, so set the cached determinant
         // directly — the state a caller-supplied Ω can genuinely arrive in.
         mp.omega[1].log_det = f64::NAN;
-        assert!(
-            !mp.omega[1].log_det.is_finite(),
-            "test setup: class-2 log_det must be non-finite"
-        );
+        assert!(!mp.omega[1].log_det.is_finite(), "test setup: class-2 log_det must be non-finite");
         let opts = FitOptions::default();
         let err = run_importance_sampling_mixture(&model, &pop, &params, &opts)
             .expect_err("a non-finite class log-determinant must be rejected");
@@ -4904,16 +4518,12 @@ mod tests {
             eta_hat.as_slice(),
             &mut scratch,
         );
-        let mult = model
-            .ruv_obs_mult(&subject, &theta)
-            .expect("magnitude active");
+        let mult = model.ruv_obs_mult(&subject, &theta).expect("magnitude active");
         let reference = |scaled: bool| -> f64 {
             let mut acc = 1.0 / 0.04;
             for j in 0..3 {
                 let r = if scaled {
-                    model
-                        .error_spec
-                        .variance_at_scaled(1, ipreds[j], &sigma, &[], &mult[j])
+                    model.error_spec.variance_at_scaled(1, ipreds[j], &sigma, &[], &mult[j])
                 } else {
                     model.error_spec.variance_at(1, ipreds[j], &sigma)
                 };
@@ -4964,11 +4574,7 @@ mod tests {
 
     /// Run [`adapt_proposal`] on a 1-D subject with a N(0, 1) prior.
     fn adapt_1d(
-        obs_nll: &SampleObsNll<'_>,
-        center: f64,
-        precision: f64,
-        k: usize,
-        passes: usize,
+        obs_nll: &SampleObsNll<'_>, center: f64, precision: f64, k: usize, passes: usize,
         mixture: Option<&DefensiveMixture>,
     ) -> (DVector<f64>, DMatrix<f64>) {
         adapt_proposal(
@@ -4999,11 +4605,7 @@ mod tests {
         let nll = normal_nll(2.0, 0.5);
         let (center, h) = adapt_1d(&nll, 0.26, 20.0, 4000, 3, None);
         assert!((center[0] - 1.6).abs() < 0.02, "centre {}", center[0]);
-        assert!(
-            (1.0 / h[(0, 0)] - 0.2).abs() < 0.02,
-            "precision {}",
-            h[(0, 0)]
-        );
+        assert!((1.0 / h[(0, 0)] - 0.2).abs() < 0.02, "precision {}", h[(0, 0)]);
     }
 
     #[test]
@@ -5049,11 +4651,7 @@ mod tests {
     }
 
     fn pilot(ess_fraction: f64, mean: f64, second_moment: f64) -> PilotMoments {
-        PilotMoments {
-            ess_fraction,
-            mean: vec![mean],
-            second_moment: scalar(second_moment),
-        }
+        PilotMoments { ess_fraction, mean: vec![mean], second_moment: scalar(second_moment) }
     }
 
     #[test]
@@ -5128,11 +4726,7 @@ mod tests {
             )
         };
 
-        let laplace = run(
-            &DVector::from_element(1, a),
-            &scalar(1.0 / (s * s) + 1.0),
-            None,
-        );
+        let laplace = run(&DVector::from_element(1, a), &scalar(1.0 / (s * s) + 1.0), None);
         let gap = 2.0 * (exact - laplace.log_marginal);
         assert!(gap > 1.0, "the mode-centred proposal must read high: {gap}");
 
@@ -5140,10 +4734,7 @@ mod tests {
         let (center, h) = adapt_1d(&nll, a, 1.0 / (s * s) + 1.0, k, 5, Some(&mix));
         let adapted = run(&center, &h, Some(&mix));
         let gap = 2.0 * (exact - adapted.log_marginal);
-        assert!(
-            gap.abs() < 0.15,
-            "the adapted marginal must be exact: {gap}"
-        );
+        assert!(gap.abs() < 0.15, "the adapted marginal must be exact: {gap}");
     }
 
     fn is_result(ess_min: f64, n_samples: usize, adapt_passes: usize) -> ImportanceSamplingResult {
@@ -5317,14 +4908,10 @@ mod joint_eval_scorer_tests {
     #[test]
     fn joint_eval_scores_frem_rows_with_the_covariate_sigma() {
         let src = include_str!("../../examples/warfarin_frem.ferx")
-            .replace(
-                "  sigma PROP_ERR ~ 0.02",
-                "  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.02",
-            )
+            .replace("  sigma PROP_ERR ~ 0.02", "  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.02")
             .replace("exp(ETA_CL)", "exp(ETA_CL + KAPPA_CL)");
-        let model = crate::parser::model_parser::parse_full_model(&src)
-            .expect("FREM + IOV parses")
-            .model;
+        let model =
+            crate::parser::model_parser::parse_full_model(&src).expect("FREM + IOV parses").model;
         assert_eq!(model.n_kappa, 1, "the κ edit must take");
         let fc = model.frem_config.as_ref().expect("FREM config");
         let cov_sigma = fc.covariate_sigma_index;
@@ -5355,12 +4942,8 @@ mod joint_eval_scorer_tests {
         // because of the FREM row, not because σ moved some other term.
         subject.fremtype[j] = 0;
         assert_eq!(
-            joint_readout(&model, &subject, &sigma)
-                .log_marginal
-                .to_bits(),
-            joint_readout(&model, &subject, &wider)
-                .log_marginal
-                .to_bits(),
+            joint_readout(&model, &subject, &sigma).log_marginal.to_bits(),
+            joint_readout(&model, &subject, &wider).log_marginal.to_bits(),
             "EPSCOV moved a readout with no FREM row"
         );
     }
@@ -5375,28 +4958,19 @@ mod joint_eval_scorer_tests {
             "{}\n[binary_model]\n  cmt   = 9\n  logit = -0.5 + 2.0 * ETA_V\n",
             include_str!("../../examples/warfarin_iov.ferx")
         );
-        let model = crate::parser::model_parser::parse_full_model(&src)
-            .expect("IOV + binary parses")
-            .model;
+        let model =
+            crate::parser::model_parser::parse_full_model(&src).expect("IOV + binary parses").model;
         assert_eq!(model.n_kappa, 1);
         let plain = iov_subject();
         let mut with_binary = plain.clone();
         with_binary.obs_records = [(1.0, 1), (24.0, 0), (72.0, 1)]
             .iter()
-            .map(|&(time, state)| ObsRecord::DiscreteState {
-                time,
-                raw_time: time,
-                state,
-                cmt: 9,
-            })
+            .map(|&(time, state)| ObsRecord::DiscreteState { time, raw_time: time, state, cmt: 9 })
             .collect();
         let sigma = model.default_params.sigma.values.clone();
         let without = joint_readout(&model, &plain, &sigma);
         let with = joint_readout(&model, &with_binary, &sigma);
-        eprintln!(
-            "log p̂ without binary {}, with {}",
-            without.log_marginal, with.log_marginal
-        );
+        eprintln!("log p̂ without binary {}, with {}", without.log_marginal, with.log_marginal);
         assert!(without.log_marginal.is_finite() && with.log_marginal.is_finite());
         assert!(
             with.log_marginal < without.log_marginal,

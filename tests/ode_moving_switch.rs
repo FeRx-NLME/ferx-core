@@ -56,15 +56,9 @@ fn a_theta_only_in_an_odes_condition_is_estimated() {
 
     let tlag = result.theta[0];
     assert!(tlag.is_finite(), "TLAG = {tlag}");
+    assert!((tlag - 1.13).abs() > 1e-3, "TLAG never left its start: {tlag}");
     assert!(
-        (tlag - 1.13).abs() > 1e-3,
-        "TLAG never left its start: {tlag}"
-    );
-    assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains("finite-difference")),
+        !result.warnings.iter().any(|w| w.contains("finite-difference")),
         "the exact gradient serves it: {:?}",
         result.warnings
     );

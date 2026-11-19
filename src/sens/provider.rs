@@ -72,8 +72,7 @@ const N_PK: usize = crate::types::MAX_PK_PARAMS;
 /// `const_pk_slots`, and seeded as a constant by the recorders, so it is covered too.
 /// The parser leaves no third case: an argument that is neither is a parse error.
 fn prog_covers_required_pk_slots(
-    model: &CompiledModel,
-    prog: &crate::parser::model_parser::IndivParamProgram,
+    model: &CompiledModel, prog: &crate::parser::model_parser::IndivParamProgram,
 ) -> bool {
     let prog_slots = prog.pk_slots_ref();
     let literal = model.indiv_param_partials.const_pk_slots();
@@ -213,9 +212,7 @@ impl<T: PkNum> SeededPkDuals<T> {
                 self.cl_d, self.v1_d, self.q_d, self.v2_d, self.q3_d, self.v3_d,
             ));
         } else if flags.two_cpt {
-            self.two = Some(super::two_cpt::TwoCpt::new(
-                self.cl_d, self.v1_d, self.q_d, self.v2_d,
-            ));
+            self.two = Some(super::two_cpt::TwoCpt::new(self.cl_d, self.v1_d, self.q_d, self.v2_d));
         }
         self
     }
@@ -245,12 +242,7 @@ impl<T: PkNum> SeededPkDuals<T> {
 /// walker's `event_reset_floor`.
 #[inline]
 fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
-    subject
-        .reset_times
-        .iter()
-        .copied()
-        .filter(|&r| r <= t_obs)
-        .fold(f64::NEG_INFINITY, f64::max)
+    subject.reset_times.iter().copied().filter(|&r| r <= t_obs).fold(f64::NEG_INFINITY, f64::max)
 }
 
 /// Superpose one observation's dose contributions through the closed-form PK kernel the
@@ -263,11 +255,7 @@ fn reset_floor_at(subject: &Subject, t_obs: f64) -> f64 {
 /// `analytic_static_predictions` shares the one dispatch ladder.
 #[inline]
 fn superpose_doses<T: PkNum>(
-    d: &SeededPkDuals<T>,
-    flags: PkClassFlags,
-    subject: &Subject,
-    t_obs: f64,
-    reset_floor: f64,
+    d: &SeededPkDuals<T>, flags: PkClassFlags, subject: &Subject, t_obs: f64, reset_floor: f64,
 ) -> T {
     let mut fd = T::from_f64(0.0);
     // The value path's `SS=1` reset (#1576): `crate::pk::predict_concentration`.
@@ -301,9 +289,7 @@ fn superpose_doses<T: PkNum>(
         } else if flags.ig {
             one_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.mat_d, d.cv2_d, d.f_d)
         } else if flags.two_cpt_ig {
-            two_cpt_ig_conc_g(
-                dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.mat_d, d.cv2_d, d.f_d,
-            )
+            two_cpt_ig_conc_g(dose, elapsed, d.cl_d, d.v1_d, d.q_d, d.v2_d, d.mat_d, d.cv2_d, d.f_d)
         } else if let Some(disp) = d.three.as_ref().filter(|_| flags.three_cpt) {
             three_cpt_conc_d(dose, elapsed, disp, d.ka_d, d.f_d, flags.oral)
         } else if let Some(disp) = d.two.as_ref().filter(|_| flags.two_cpt) {
@@ -390,9 +376,7 @@ fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
 /// readout an observation whose CMT has no entry is a `NaN` prediction, as
 /// `OdeReadout::eval` serves it.
 pub(crate) fn readout_program_at<'a>(
-    ar: &'a crate::types::AnalyticReadout,
-    subject: &Subject,
-    j: usize,
+    ar: &'a crate::types::AnalyticReadout, subject: &Subject, j: usize,
 ) -> Option<Option<&'a crate::parser::model_parser::OdeOutputProgram>> {
     match &ar.readout {
         crate::ode::OdeReadout::Single(_) => ar.program.as_ref().map(Some),
@@ -419,10 +403,7 @@ pub(crate) fn readout_program_at<'a>(
 /// `obs_params(j)` is the flat PK-slot vector at observation `j`. `None` for a readout with no
 /// compiled program (see [`readout_program_at`]).
 pub(crate) fn apply_closed_form_readout_g<'p, T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    conc: Vec<T>,
-    depot: Option<&[T]>,
+    model: &CompiledModel, subject: &Subject, conc: Vec<T>, depot: Option<&[T]>,
     obs_params: &dyn Fn(usize) -> std::borrow::Cow<'p, [T; N_PK]>,
     leaves: crate::sens::ode_provider::ReadoutLeaves<'_, T>,
 ) -> Option<Vec<T>> {
@@ -475,9 +456,7 @@ pub(crate) fn apply_closed_form_readout_g<'p, T: crate::sens::num::vm::VmNum>(
 /// resets, a dose off the default compartment), so none reaches here.
 /// `dual_of(slot, value)` seeds each PK slot.
 pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
-    subject: &Subject,
-    pk: &crate::types::PkParams,
-    dual_of: &dyn Fn(usize, f64) -> T,
+    subject: &Subject, pk: &crate::types::PkParams, dual_of: &dyn Fn(usize, f64) -> T,
 ) -> Vec<T> {
     let d = SeededPkDuals::<T>::seed_with(pk, dual_of);
     subject
@@ -526,10 +505,7 @@ pub(crate) fn closed_form_depot_amounts_g<T: PkNum>(
 /// model is trivially supported; a hand-built init with no program is not served by the walk.
 fn init_supported(model: &CompiledModel) -> bool {
     model.analytical_init.is_empty()
-        || (model
-            .analytical_init
-            .iter()
-            .all(|i| i.amount_deriv.is_some()))
+        || (model.analytical_init.iter().all(|i| i.amount_deriv.is_some()))
 }
 
 /// Whether the model's output scaling is one the closed-form walks differentiate exactly:
@@ -716,11 +692,7 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     // would otherwise silently drop it), so require every init to carry its amount program; the
     // stacked axis count `n_theta + n_stacked` is bounded by the walk's `1..=24` dispatch (out
     // of range → the walk returns `None` → FD).
-    if model
-        .analytical_init
-        .iter()
-        .any(|i| i.amount_deriv.is_none())
-    {
+    if model.analytical_init.iter().any(|i| i.amount_deriv.is_none()) {
         return false;
     }
     let n_eff = model.n_eta + model.n_kappa;
@@ -881,11 +853,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
 /// network (and always `0` without the `nn` feature, where the field does not exist).
 #[cfg(feature = "nn")]
 pub(crate) fn nn_weight_theta_count(model: &CompiledModel) -> usize {
-    model
-        .covariate_nns
-        .iter()
-        .map(|nn| nn.mapper.mlp().n_weights())
-        .sum()
+    model.covariate_nns.iter().map(|nn| nn.mapper.mlp().n_weights()).sum()
 }
 
 #[cfg(not(feature = "nn"))]
@@ -898,11 +866,7 @@ pub(crate) fn nn_weight_theta_count(_model: &CompiledModel) -> usize {
 /// declaration order). `0` without a network.
 #[cfg(feature = "nn")]
 fn nn_output_count(model: &CompiledModel) -> usize {
-    model
-        .covariate_nns
-        .iter()
-        .map(|nn| nn.mapper.mlp().n_outputs())
-        .sum()
+    model.covariate_nns.iter().map(|nn| nn.mapper.mlp().n_outputs()).sum()
 }
 
 #[cfg(not(feature = "nn"))]
@@ -976,9 +940,7 @@ fn modeled_doses_resolvable(model: &CompiledModel, subject: &Subject) -> bool {
 /// re-run here, #486 review). The matching derivative twin is
 /// `modeled_dose_inf_duals`.
 fn resolve_eff_doses<'a>(
-    model: &CompiledModel,
-    subject: &'a Subject,
-    dose_pk: impl Fn(usize) -> crate::types::PkParams,
+    model: &CompiledModel, subject: &'a Subject, dose_pk: impl Fn(usize) -> crate::types::PkParams,
 ) -> std::borrow::Cow<'a, [crate::types::DoseEvent]> {
     let bio = model.has_bioavailability() && subject.doses.iter().any(|d| d.is_infusion());
     if subject.all_doses_fixed() && !bio {
@@ -1039,16 +1001,12 @@ fn dose_lagtime_values(model: &CompiledModel, dose_pk: &[crate::types::PkParams]
 /// `slot_dual(dose_k, pk_slot)` is the same seeder `modeled_dose_inf_duals` takes, so both
 /// read the identical per-dose snapshot.
 fn dose_lag_duals<T: crate::sens::num::PkNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    slot_dual: impl Fn(usize, usize) -> T,
+    model: &CompiledModel, subject: &Subject, slot_dual: impl Fn(usize, usize) -> T,
 ) -> Vec<T> {
     if !model.has_lagtime() {
         return Vec::new();
     }
-    (0..subject.doses.len())
-        .map(|k| slot_dual(k, PK_IDX_LAGTIME))
-        .collect()
+    (0..subject.doses.len()).map(|k| slot_dual(k, PK_IDX_LAGTIME)).collect()
 }
 
 /// Per-dose infusion duals `(rate, window)` for the event walk
@@ -1063,9 +1021,7 @@ fn dose_lag_duals<T: crate::sens::num::PkNum>(
 /// non-positive `D`/`R` is clamped to its floor, mirroring the f64
 /// `DoseEvent::resolve_rate`.
 fn modeled_dose_inf_duals<T: crate::sens::num::PkNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    slot_dual: impl Fn(usize, usize) -> T,
+    model: &CompiledModel, subject: &Subject, slot_dual: impl Fn(usize, usize) -> T,
 ) -> Vec<Option<(T, T)>> {
     let bio = model.has_bioavailability() && subject.doses.iter().any(|d| d.is_infusion());
     if subject.all_doses_fixed() && !bio {
@@ -1130,10 +1086,7 @@ thread_local! {
 /// timing and infusion fields, the lag times, and the observation, pk-only and reset
 /// times), so a hit is exactly a rebuild's result; a mutated subject or a moved lag misses.
 fn cached_event_schedule(
-    subject: &Subject,
-    pk_model: PkModel,
-    doses: &[DoseEvent],
-    lagtimes: &[f64],
+    subject: &Subject, pk_model: PkModel, doses: &[DoseEvent], lagtimes: &[f64],
 ) -> std::rc::Rc<crate::pk::event_driven::EventSchedule> {
     SCHEDULE_CACHE.with(|cell| {
         let (scratch, entry) = &mut *cell.borrow_mut();
@@ -1172,10 +1125,7 @@ fn cached_event_schedule(
         let schedule = std::rc::Rc::new(crate::pk::event_driven::EventSchedule::for_subject(
             subject, pk_model, doses, lagtimes,
         ));
-        *entry = Some(ScheduleCacheEntry {
-            key: scratch.clone(),
-            schedule: schedule.clone(),
-        });
+        *entry = Some(ScheduleCacheEntry { key: scratch.clone(), schedule: schedule.clone() });
         schedule
     })
 }
@@ -1192,13 +1142,10 @@ fn cached_event_schedule(
 /// moving breaks, or an absorption walk the closed form declines).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    dose_pk: &[crate::types::PkParams],
+    model: &CompiledModel, subject: &Subject, dose_pk: &[crate::types::PkParams],
     pk_at_dose: &[crate::sens::propagate::PkDual<T>],
     pk_at_obs: &[crate::sens::propagate::PkDual<T>],
-    pk_at_pk_only: &[crate::sens::propagate::PkDual<T>],
-    slot_dual: &dyn Fn(usize, usize) -> T,
+    pk_at_pk_only: &[crate::sens::propagate::PkDual<T>], slot_dual: &dyn Fn(usize, usize) -> T,
 ) -> Option<Vec<T>> {
     // Modeled-`RATE=-1/-2` doses (#486): resolve to concrete rate/duration for the
     // schedule's break times, and build the per-dose duals so the injected rate and
@@ -1250,26 +1197,17 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
 /// models alike — or `None` for a subject no recorder serves. FREM pseudo-observation rows
 /// carry their exact `θ_i + η_e`.
 pub fn subject_eta_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<Vec<ObsGrad>> {
     crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta)
 }
 
 /// `subject_eta_grad`'s `∂f/∂η` as a row-major `n_obs × n_eta` matrix.
 pub fn subject_eta_jacobian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<Vec<f64>> {
     Some(
-        subject_eta_grad(model, subject, theta, eta)?
-            .into_iter()
-            .flat_map(|o| o.df_deta)
-            .collect(),
+        subject_eta_grad(model, subject, theta, eta)?.into_iter().flat_map(|o| o.df_deta).collect(),
     )
 }
 
@@ -1288,27 +1226,14 @@ pub struct ObsGrad {
 /// one observation `j` decays with (`None`: `amount`'s, the non-IOV convention). `None`
 /// when an init has no compiled amount program.
 pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[T],
-    eta: &[T],
-    amount: &[T],
-    decay: Option<&[Vec<T>]>,
-    preds: &mut [T],
+    model: &CompiledModel, subject: &Subject, theta: &[T], eta: &[T], amount: &[T],
+    decay: Option<&[Vec<T>]>, preds: &mut [T],
 ) -> Option<()> {
-    let first_reset = subject
-        .reset_times
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let first_reset = subject.reset_times.iter().copied().fold(f64::INFINITY, f64::min);
     let slot = |p: &[T], s: usize| p.get(s).copied().unwrap_or(T::from_f64(0.0));
     for init in &model.analytical_init {
         let prog = init.amount_deriv.as_ref()?;
-        let vars: Vec<T> = prog
-            .var_to_pk_slot()
-            .iter()
-            .map(|&s| slot(amount, s))
-            .collect();
+        let vars: Vec<T> = prog.var_to_pk_slot().iter().map(|&s| slot(amount, s)).collect();
         let a0 = prog.eval_scale_g(theta, eta, &subject.covariates, &vars);
         // Only a non-finite amount is skipped. A zero one still carries `∂A₀/∂(θ, η)`, which
         // reaches `∂C` as `kernel · ∂A₀` (#527): skipping it zeroes that gradient.
@@ -1319,9 +1244,7 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
             if t < 0.0 || t >= first_reset {
                 continue;
             }
-            let p: &[T] = decay
-                .and_then(|d| d.get(j))
-                .map_or(amount, |v| v.as_slice());
+            let p: &[T] = decay.and_then(|d| d.get(j)).map_or(amount, |v| v.as_slice());
             let c = crate::pk::analytical_init_concentration_g(
                 model.pk_model,
                 init.cmt,
@@ -1376,12 +1299,8 @@ pub(crate) fn closed_form_model_scope(model: &CompiledModel) -> bool {
 /// adjoint divides by it as its own leaf). FREM pseudo-observation rows are
 /// predicted here like any row; the adjoint's likelihood kernel replaces them.
 pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    pk: &crate::types::PkParams,
-    slot_dual: impl Fn(usize) -> Option<T>,
-    theta: &[T],
-    eta: &[T],
+    model: &CompiledModel, subject: &Subject, pk: &crate::types::PkParams,
+    slot_dual: impl Fn(usize) -> Option<T>, theta: &[T], eta: &[T],
 ) -> Option<Vec<T>> {
     if model.is_algebraic()
         || model.ode_spec.is_some()
@@ -1418,13 +1337,7 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
     let mut conc: Vec<T> = crate::scratch::take_for(subject.obs_times.len());
     conc.extend(subject.obs_times.iter().map(|&t_obs| {
         T::chunk_mark();
-        let fd = superpose_doses(
-            &seeded,
-            flags,
-            subject,
-            t_obs,
-            reset_floor_at(subject, t_obs),
-        );
+        let fd = superpose_doses(&seeded, flags, subject, t_obs, reset_floor_at(subject, t_obs));
         // Mirror production's `conc.max(0.0)`.
         if fd.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
             T::from_f64(0.0)
@@ -1442,9 +1355,7 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
     let Some(ar) = model.analytic_readout.as_ref() else {
         return Some(conc);
     };
-    let depot = ar
-        .references_depot()
-        .then(|| closed_form_depot_amounts_g(subject, pk, &dual_of));
+    let depot = ar.references_depot().then(|| closed_form_depot_amounts_g(subject, pk, &dual_of));
     let ro_pk: [T; N_PK] =
         std::array::from_fn(|s| dual_of(s, pk.values.get(s).copied().unwrap_or(0.0)));
     apply_closed_form_readout_g(
@@ -1478,10 +1389,8 @@ pub(crate) fn analytic_param_program(
 /// production's `compute_predictions` routes oral-depot infusion to the
 /// event-driven path (`subject_routes_to_event_walk`).
 pub(crate) fn subject_has_oral_infusion(model: &CompiledModel, subject: &Subject) -> bool {
-    matches!(
-        model.pk_model,
-        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-    ) && subject.doses.iter().any(|d| d.is_infusion())
+    matches!(model.pk_model, PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral)
+        && subject.doses.iter().any(|d| d.is_infusion())
 }
 
 /// True when a subject must be served by the event-driven per-event walk rather than

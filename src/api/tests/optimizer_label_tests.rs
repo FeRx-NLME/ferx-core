@@ -88,17 +88,11 @@ fn assert_analytic_scope(model: &CompiledModel) {
 fn auto_label_follows_the_mixture_downgrade() {
     let model = parse(MIXTURE);
     assert!(model.mixture.is_some());
-    for (method, interaction) in [
-        (EstimationMethod::Foce, false),
-        (EstimationMethod::FoceI, true),
-    ] {
+    for (method, interaction) in [(EstimationMethod::Foce, false), (EstimationMethod::FoceI, true)]
+    {
         assert_analytic_scope(&model);
-        let opts = FitOptions {
-            method,
-            interaction,
-            optimizer: Optimizer::Auto,
-            ..Default::default()
-        };
+        let opts =
+            FitOptions { method, interaction, optimizer: Optimizer::Auto, ..Default::default() };
         assert_eq!(
             reported_optimizer_label(method, &opts, &model, true),
             "auto (bobyqa)",
@@ -124,10 +118,7 @@ fn auto_label_follows_the_mixture_downgrade() {
 fn explicit_optimizer_label_reports_the_mixture_replacement() {
     let model = parse(MIXTURE);
     let label = |optimizer, has_mixture| {
-        let opts = FitOptions {
-            optimizer,
-            ..Default::default()
-        };
+        let opts = FitOptions { optimizer, ..Default::default() };
         reported_optimizer_label(EstimationMethod::FoceI, &opts, &model, has_mixture)
     };
     for (optimizer, own) in [
@@ -135,16 +126,8 @@ fn explicit_optimizer_label_reports_the_mixture_replacement() {
         (Optimizer::Lbfgs, "lbfgs"),
         (Optimizer::TrustRegion, "trust_region"),
     ] {
-        assert_eq!(
-            label(optimizer, true),
-            "bobyqa",
-            "{optimizer:?} under a mixture"
-        );
-        assert_eq!(
-            label(optimizer, false),
-            own,
-            "{optimizer:?} without a mixture"
-        );
+        assert_eq!(label(optimizer, true), "bobyqa", "{optimizer:?} under a mixture");
+        assert_eq!(label(optimizer, false), own, "{optimizer:?} without a mixture");
     }
     for (optimizer, own) in [
         (Optimizer::NloptLbfgs, "nlopt_lbfgs"),
@@ -152,20 +135,14 @@ fn explicit_optimizer_label_reports_the_mixture_replacement() {
         (Optimizer::Mma, "mma"),
         (Optimizer::Bobyqa, "bobyqa"),
     ] {
-        assert_eq!(
-            label(optimizer, true),
-            own,
-            "{optimizer:?} is honoured under a mixture"
-        );
+        assert_eq!(label(optimizer, true), own, "{optimizer:?} is honoured under a mixture");
     }
 }
 
 fn subject(id: &str, cl: f64) -> Subject {
     let obs_times: Vec<f64> = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
-    let observations: Vec<f64> = obs_times
-        .iter()
-        .map(|t| 100.0 / 10.0 * (-cl / 10.0 * t).exp())
-        .collect();
+    let observations: Vec<f64> =
+        obs_times.iter().map(|t| 100.0 / 10.0 * (-cl / 10.0 * t).exp()).collect();
     let n = obs_times.len();
     Subject {
         id: id.into(),
@@ -186,12 +163,7 @@ fn subject(id: &str, cl: f64) -> Subject {
 #[test]
 fn fit_reports_auto_bobyqa_for_a_mixture_model() {
     let pop = Population {
-        subjects: vec![
-            subject("1", 1.0),
-            subject("2", 1.2),
-            subject("3", 3.0),
-            subject("4", 2.8),
-        ],
+        subjects: vec![subject("1", 1.0), subject("2", 1.2), subject("3", 3.0), subject("4", 2.8)],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: Vec::new(),
@@ -206,18 +178,10 @@ fn fit_reports_auto_bobyqa_for_a_mixture_model() {
         run_covariance_step: false,
         ..Default::default()
     };
-    for (src, want) in [
-        (MIXTURE, "auto (bobyqa)"),
-        (NO_MIXTURE, "auto (nlopt_lbfgs)"),
-    ] {
+    for (src, want) in [(MIXTURE, "auto (bobyqa)"), (NO_MIXTURE, "auto (nlopt_lbfgs)")] {
         let model = parse(src);
         assert_analytic_scope(&model);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
-        assert_eq!(
-            result.optimizer,
-            want,
-            "mixture = {}",
-            model.mixture.is_some()
-        );
+        assert_eq!(result.optimizer, want, "mixture = {}", model.mixture.is_some());
     }
 }

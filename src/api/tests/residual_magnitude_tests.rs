@@ -52,10 +52,7 @@ fn magnitude_error(pop: &Population) -> Option<String> {
 
 #[test]
 fn positive_weights_pass() {
-    assert_eq!(
-        magnitude_error(&population_with_weights(&[0.5, 1.5, 2.0])),
-        None
-    );
+    assert_eq!(magnitude_error(&population_with_weights(&[0.5, 1.5, 2.0])), None);
 }
 
 #[test]
@@ -92,9 +89,7 @@ fn a_model_with_no_magnitude_is_not_checked() {
     )
     .expect("parse");
     let pop = population_with_weights(&[0.0, 0.0]);
-    assert!(check_model_data(&plain, &pop)
-        .iter()
-        .all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"));
+    assert!(check_model_data(&plain, &pop).iter().all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"));
 }
 
 /// A `TAD`-reading magnitude on a dataset with a **pre-dose** sample (review
@@ -132,12 +127,7 @@ fn a_tad_magnitude_passes_with_a_pre_dose_sample() {
         warnings: Vec::new(),
     };
     let diags = check_model_data(&model, &pop);
-    assert!(
-        diags
-            .iter()
-            .all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"),
-        "{diags:?}"
-    );
+    assert!(diags.iter().all(|d| d.code != "E_RUV_MAGNITUDE_NONPOSITIVE"), "{diags:?}");
     // The pre-dose row is in the early group (TAD = 0 < 2), like Pharmpy's
     // group 0 — not, as a NaN would have it, in the late one.
     let mult = model
@@ -169,12 +159,7 @@ fn continuous(r: &crate::api::SimulationResult) -> f64 {
 }
 
 fn sim_opts() -> SimulateOptions {
-    SimulateOptions {
-        seed: Some(42),
-        match_method: None,
-        horizon: None,
-        iov_occasion: None,
-    }
+    SimulateOptions { seed: Some(42), match_method: None, horizon: None, iov_occasion: None }
 }
 
 #[test]
@@ -209,10 +194,7 @@ fn the_seeded_entry_point_errs_on_a_zero_weight() {
     let pop = population_with_weights(&[0.5, 0.0, 2.0]);
     let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(
-        err.to_string().contains("sigma slot 0"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("sigma slot 0"), "unexpected Err: {err}");
 }
 
 #[test]
@@ -262,10 +244,7 @@ fn a_larger_weight_widens_the_simulated_residual() {
         (continuous(r) - r.ipred).abs()
     };
     let (small, large) = (dev(0.5), dev(2.0));
-    assert!(
-        large > small * 3.0,
-        "a 4x weight must widen the residual ~4x: {small} then {large}"
-    );
+    assert!(large > small * 3.0, "a 4x weight must widen the residual ~4x: {small} then {large}");
 }
 
 /// #1182: a `power(...)` exponent at or below zero at the initial estimates is
@@ -286,10 +265,7 @@ fn a_non_positive_power_exponent_is_rejected_as_an_exponent() {
         .find(|d| d.code == "E_RUV_MAGNITUDE_NONPOSITIVE")
         .map(|d| d.message)
         .expect("a zero exponent must be an error");
-    assert!(
-        msg.contains("power exponent for sigma slot 0"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("power exponent for sigma slot 0"), "got: {msg}");
     assert!(!msg.contains("magnitude for sigma slot"), "got: {msg}");
     // A positive exponent passes.
     let ok = parse_model_string(

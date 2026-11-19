@@ -79,10 +79,7 @@ fn severity_is_graded_on_magnitude_not_on_the_clipped_count() {
 
     // And the sentence the user reads, not only the enum: the exact string #520 reported.
     let msg = format_regularized_warning(&measured);
-    assert!(
-        !msg.contains("Standard errors are likely reliable"),
-        "{msg}"
-    );
+    assert!(!msg.contains("Standard errors are likely reliable"), "{msg}");
     assert!(msg.contains("severity: severe"), "{msg}");
     assert!(format_regularized_warning(&benign).contains("severity: minor"));
 }
@@ -281,9 +278,7 @@ fn severe_inflation_threshold_supports_the_word_mostly() {
     assert_eq!(just_over.severity, CovSeverity::Severe);
     assert_eq!(just_over.cause, CovSeverityCause::Inflation);
     assert!(
-        just_over
-            .interpretation()
-            .contains("come mostly from the floor"),
+        just_over.interpretation().contains("come mostly from the floor"),
         "{}",
         just_over.interpretation()
     );
@@ -340,24 +335,15 @@ fn a_remedy_only_promises_a_route_change_when_it_clears_every_clause() {
     let mut sole = measured_severe_facts();
     sole.declines = &[CovScopeDecline::GradientFd];
     let m = format_regularized_warning(&sole);
-    assert!(
-        m.contains("Dropping gradient = fd moves the fit onto the analytic route."),
-        "{m}"
-    );
+    assert!(m.contains("Dropping gradient = fd moves the fit onto the analytic route."), "{m}");
 
     // Same remedy, but a second clause that no flag clears (a non-Gaussian endpoint is a
     // property of the model the user asked for). The promise must NOT be made, and the
     // remaining blocker must be named as such.
     let mut multi = measured_severe_facts();
-    multi.declines = &[
-        CovScopeDecline::GradientFd,
-        CovScopeDecline::NonGaussianEndpoint,
-    ];
+    multi.declines = &[CovScopeDecline::GradientFd, CovScopeDecline::NonGaussianEndpoint];
     let m = format_regularized_warning(&multi);
-    assert!(
-        m.contains("gradient = fd and the model has a non-Gaussian"),
-        "{m}"
-    );
+    assert!(m.contains("gradient = fd and the model has a non-Gaussian"), "{m}");
     assert!(
         !m.contains("moves the fit onto the analytic route"),
         "the second clause is still blocking: {m}"
@@ -366,10 +352,7 @@ fn a_remedy_only_promises_a_route_change_when_it_clears_every_clause() {
         m.contains("stays on the finite-difference route until all of them are cleared"),
         "{m}"
     );
-    assert!(
-        m.contains("the remaining clause has no one-line remedy"),
-        "{m}"
-    );
+    assert!(m.contains("the remaining clause has no one-line remedy"), "{m}");
 }
 
 #[test]
@@ -388,10 +371,7 @@ fn two_remediable_clauses_promise_the_route_only_together() {
         "{m}"
     );
     // Both clauses are named, joined, and the sentence is one sentence.
-    assert!(
-        m.contains("declined because analytic_cov_hessian = false and gradient = fd."),
-        "{m}"
-    );
+    assert!(m.contains("declined because analytic_cov_hessian = false and gradient = fd."), "{m}");
 }
 
 #[test]
@@ -410,11 +390,7 @@ fn every_decline_clause_has_non_empty_prose() {
         // Every message, whatever the clause, still classifies as the same warning code.
         let entry = classify_warning(&msg);
         assert_eq!(entry.severity, WarningSeverity::Warning, "{decline:?}");
-        assert_eq!(
-            entry.category,
-            WarningCode::CovarianceRegularized,
-            "{decline:?}"
-        );
+        assert_eq!(entry.category, WarningCode::CovarianceRegularized, "{decline:?}");
     }
 }
 
@@ -436,11 +412,7 @@ fn a_remedy_is_an_action_not_a_promise() {
 // ── C2: the ODE tolerance sentence ──────────────────────────────────────────────────────
 
 fn ode_facts(reltol: f64, abstol: f64) -> OdeToleranceFacts {
-    OdeToleranceFacts {
-        reltol,
-        abstol,
-        via_twin: false,
-    }
+    OdeToleranceFacts { reltol, abstol, via_twin: false }
 }
 
 #[test]
@@ -495,17 +467,9 @@ fn the_tolerance_sentence_names_the_twin_when_the_twin_is_what_integrates() {
     // — `sync_ode_solver_opts` stamps it onto the absorption twin. Both sides of `via_twin` in
     // one test, so collapsing the two labels reddens.
     let mut own = measured_severe_facts();
-    own.ode = Some(OdeToleranceFacts {
-        reltol: 1e-4,
-        abstol: 1e-6,
-        via_twin: false,
-    });
+    own.ode = Some(OdeToleranceFacts { reltol: 1e-4, abstol: 1e-6, via_twin: false });
     let mut twin = measured_severe_facts();
-    twin.ode = Some(OdeToleranceFacts {
-        reltol: 1e-4,
-        abstol: 1e-6,
-        via_twin: true,
-    });
+    twin.ode = Some(OdeToleranceFacts { reltol: 1e-4, abstol: 1e-6, via_twin: true });
     let m_own = format_regularized_warning(&own);
     let m_twin = format_regularized_warning(&twin);
     assert!(m_own.contains("this model integrates ODEs at"), "{m_own}");
@@ -533,17 +497,11 @@ fn the_head_sentence_carries_the_classification_token_and_the_numbers() {
     assert_eq!(entry.severity, WarningSeverity::Warning);
     assert_eq!(entry.category, WarningCode::CovarianceRegularized);
     // The magnitudes the grade was made from are in the message, so a reader can check it.
-    assert!(
-        msg.contains("1 of 13 free-block eigenvalues clipped"),
-        "{msg}"
-    );
+    assert!(msg.contains("1 of 13 free-block eigenvalues clipped"), "{msg}");
     assert!(msg.contains("min eig = -3.197e1"), "{msg}");
     assert!(msg.contains("max eig = 8.416e3"), "{msg}");
     assert!(msg.contains("|min eig|/max eig = 3.80e-3"), "{msg}");
-    assert!(
-        msg.contains("worst inflation of a reported variance ="),
-        "{msg}"
-    );
+    assert!(msg.contains("worst inflation of a reported variance ="), "{msg}");
 }
 
 #[test]
@@ -556,10 +514,7 @@ fn the_eigenvalue_ratio_clause_prints_only_on_an_indefinite_spectrum() {
     positive.max_eigenvalue = 2.078e3;
     positive.floor = 2.078e-7;
     let pos = format_regularized_warning(&positive);
-    assert!(
-        pos.contains("min eig = 1.161e-8, max eig = 2.078e3, floor = 2.078e-7;"),
-        "{pos}"
-    );
+    assert!(pos.contains("min eig = 1.161e-8, max eig = 2.078e3, floor = 2.078e-7;"), "{pos}");
     assert!(!pos.contains("|min eig|/max eig"), "{pos}");
 
     let neg = format_regularized_warning(&measured_severe_facts());
@@ -569,10 +524,7 @@ fn the_eigenvalue_ratio_clause_prints_only_on_an_indefinite_spectrum() {
         "{neg}"
     );
     // Same classification either way: the clause is not part of the taxonomy key.
-    assert_eq!(
-        classify_warning(&pos).category,
-        WarningCode::CovarianceRegularized
-    );
+    assert_eq!(classify_warning(&pos).category, WarningCode::CovarianceRegularized);
 }
 
 #[test]
@@ -599,10 +551,8 @@ fn each_severity_tier_carries_its_own_interpretation() {
     moderate.variance_inflation = 2.0;
     let severe = measured_severe_facts();
 
-    let texts: Vec<String> = [minor, moderate, severe]
-        .iter()
-        .map(format_regularized_warning)
-        .collect();
+    let texts: Vec<String> =
+        [minor, moderate, severe].iter().map(format_regularized_warning).collect();
     assert!(texts[0].ends_with("Standard errors are likely reliable."));
     assert!(texts[1].contains("interpret them with caution"));
     assert!(texts[2].contains("come mostly from the floor rather than from the data"));
@@ -667,17 +617,11 @@ fn the_interpretation_follows_the_magnitude_that_triggered_the_tier() {
         m.contains("the reported standard errors do not load on the altered directions"),
         "{m}"
     );
-    assert!(
-        !m.contains("comes from the floor rather than from the data"),
-        "{m}"
-    );
+    assert!(!m.contains("comes from the floor rather than from the data"), "{m}");
 
     let mut moderate_inflation = benign_facts();
     moderate_inflation.variance_inflation = 2.0;
-    assert_eq!(
-        moderate_inflation.grade().cause,
-        CovSeverityCause::Inflation
-    );
+    assert_eq!(moderate_inflation.grade().cause, CovSeverityCause::Inflation);
     assert!(
         format_regularized_warning(&moderate_inflation)
             .contains("comes from the floor rather than from the data"),
@@ -791,14 +735,8 @@ fn the_tolerance_facts_are_read_from_the_route_the_subjects_take() {
     // All three cells in one test, on the SAME model, so the difference is the route and
     // nothing else: mutating the twin walk away leaves the middle assertion red.
     let transit = crate::parser::model_parser::parse_model_string(TRANSIT_MODEL).unwrap();
-    assert!(
-        transit.ode_spec.is_none(),
-        "a one_cpt_transit model is closed form"
-    );
-    assert!(
-        transit.absorption_ode_equivalent.is_some(),
-        "and carries an absorption ODE twin"
-    );
+    assert!(transit.ode_spec.is_none(), "a one_cpt_transit model is closed form");
+    assert!(transit.absorption_ode_equivalent.is_some(), "and carries an absorption ODE twin");
 
     // Bolus-only population: nothing reroutes, nothing integrates, no facts.
     let bolus_pop = population_of(vec![subject_with_dose(true)]);
@@ -826,10 +764,7 @@ fn the_tolerance_facts_are_read_from_the_route_the_subjects_take() {
         assert!(s.has_tv_covariates());
         s
     };
-    assert!(crate::pk::absorption_walk::walk_eligible(
-        &transit,
-        &tv(false)
-    ));
+    assert!(crate::pk::absorption_walk::walk_eligible(&transit, &tv(false)));
     assert!(
         OdeToleranceFacts::from_route(&transit, &population_of(vec![tv(false)])).is_none(),
         "a TV-covariate transit subject on the walk never integrates"
@@ -865,10 +800,7 @@ fn the_fd_inner_gradient_note_straddles_the_plateau_and_the_model_class() {
 
     let default_tol = crate::parser::model_parser::parse_model_string(&ode_model_src("")).unwrap();
     let note = fd_inner_gradient_tolerance_note(&default_tol, &pop).expect("ODE model gets a note");
-    assert!(
-        note.contains("ode_reltol = 1e-4 / ode_abstol = 1e-6"),
-        "{note}"
-    );
+    assert!(note.contains("ode_reltol = 1e-4 / ode_abstol = 1e-6"), "{note}");
     assert!(note.contains("next step 1e-9"), "{note}");
     assert!(note.contains("analytic sensitivity scope"), "{note}");
 
@@ -897,14 +829,8 @@ fn the_fd_inner_gradient_note_reaches_a_rerouted_closed_form_model() {
     );
     let note = fd_inner_gradient_tolerance_note(&transit, &infusion)
         .expect("a rerouted transit subject integrates");
-    assert!(
-        note.contains("this model's closed-form absorption ODE twin integrates at"),
-        "{note}"
-    );
-    assert!(
-        note.contains("ode_reltol = 1e-4 / ode_abstol = 1e-6"),
-        "{note}"
-    );
+    assert!(note.contains("this model's closed-form absorption ODE twin integrates at"), "{note}");
+    assert!(note.contains("ode_reltol = 1e-4 / ode_abstol = 1e-6"), "{note}");
 }
 
 // ── The gate that names the clauses is the gate that fires ──────────────────────────────
@@ -963,11 +889,7 @@ fn the_offdiag_nan_warning_says_what_each_route_actually_lost() {
         // The token `classify_warning` keys on — a reworded message that dropped it would
         // silently demote the warning out of `covariance_regularized`.
         let entry = classify_warning(msg);
-        assert_eq!(
-            entry.category,
-            WarningCode::CovarianceRegularized,
-            "{label}: {msg}"
-        );
+        assert_eq!(entry.category, WarningCode::CovarianceRegularized, "{label}: {msg}");
     }
 }
 
@@ -990,30 +912,18 @@ fn the_salvage_note_agrees_with_its_own_counts() {
     assert!(one.contains("1 of 55 subjects (ID 42) is outside"), "{one}");
     assert!(one.contains("its information term was"), "{one}");
     assert!(one.contains("its own marginal"), "{one}");
-    assert!(
-        one.contains("the remaining 54 subjects were assembled analytically"),
-        "{one}"
-    );
+    assert!(one.contains("the remaining 54 subjects were assembled analytically"), "{one}");
 
     // The note's second sentence, which no count reaches: it is the answer to the question
     // the first sentence provokes ("so are my standard errors a blend of two things?"), and
     // without an assertion here deleting it would kill no test at all.
-    assert!(
-        one.contains("only the named subjects' terms use a different estimator"),
-        "{one}"
-    );
+    assert!(one.contains("only the named subjects' terms use a different estimator"), "{one}");
 
     let many = format_salvage_note(&["7", "13", "42"], 10).expect("three salvaged subjects");
-    assert!(
-        many.contains("3 of 10 subjects (IDs 7, 13 and 42) are outside"),
-        "{many}"
-    );
+    assert!(many.contains("3 of 10 subjects (IDs 7, 13 and 42) are outside"), "{many}");
     assert!(many.contains("their information terms were"), "{many}");
     assert!(many.contains("their own marginals"), "{many}");
-    assert!(
-        many.contains("the remaining 7 subjects were assembled analytically"),
-        "{many}"
-    );
+    assert!(many.contains("the remaining 7 subjects were assembled analytically"), "{many}");
 
     // The one cell where "remaining" is singular while the salvaged count is plural — the pair
     // that a single shared count gets wrong in one direction or the other.
@@ -1037,24 +947,15 @@ fn the_salvage_note_dedupes_ids_and_caps_the_list() {
     // the same one subject — so both counts are asserted next to the list they disagree with.
     let dup = format_salvage_note(&["4", "4", "9"], 20).expect("three salvaged subjects");
     assert!(dup.contains("3 of 20 subjects (IDs 4 and 9)"), "{dup}");
-    assert!(
-        dup.contains("the remaining 17 subjects were assembled analytically"),
-        "{dup}"
-    );
+    assert!(dup.contains("the remaining 17 subjects were assembled analytically"), "{dup}");
 
     // Cap: twelve ids print ten and summarise the rest, while the count stays the true one.
     let ids: Vec<String> = (0..12).map(|i| i.to_string()).collect();
     let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
     let capped = format_salvage_note(&refs, 40).expect("twelve salvaged subjects");
     assert!(capped.contains("12 of 40 subjects"), "{capped}");
-    assert!(
-        capped.contains("0, 1, 2, 3, 4, 5, 6, 7, 8, 9 and 2 more"),
-        "{capped}"
-    );
-    assert!(
-        !capped.contains(", 10,"),
-        "the 11th id must not be printed: {capped}"
-    );
+    assert!(capped.contains("0, 1, 2, 3, 4, 5, 6, 7, 8, 9 and 2 more"), "{capped}");
+    assert!(!capped.contains(", 10,"), "the 11th id must not be printed: {capped}");
 
     // Exactly at the cap nothing is summarised — the boundary the `>` above sits on.
     let ten: Vec<&str> = refs[..10].to_vec();
@@ -1089,65 +990,30 @@ fn the_salvage_note_classifies_as_an_informational_covariance_note() {
 fn the_quadrature_route_takes_exactly_a_sampler_on_a_non_gaussian_model_with_eta() {
     use EstimationMethod as M;
     let route = |m, ng, n_eta, mix, iov| cov_objective_route(m, ng, n_eta, mix, iov);
-    let quad = CovObjectiveRoute::Quadrature {
-        n_agq: COV_AGQ_NODES,
-    };
+    let quad = CovObjectiveRoute::Quadrature { n_agq: COV_AGQ_NODES };
     // The method straddle, on an otherwise eligible model.
     for m in [M::Saem, M::Imp, M::Impmap] {
         assert_eq!(route(m, true, 1, false, false), quad, "{m:?}");
     }
-    for m in [
-        M::Foce,
-        M::FoceI,
-        M::FoceGn,
-        M::FoceGnHybrid,
-        M::Laplace,
-        M::Vi,
-        M::Bayes,
-    ] {
-        assert_eq!(
-            route(m, true, 1, false, false),
-            CovObjectiveRoute::AsFitted,
-            "{m:?}"
-        );
+    for m in [M::Foce, M::FoceI, M::FoceGn, M::FoceGnHybrid, M::Laplace, M::Vi, M::Bayes] {
+        assert_eq!(route(m, true, 1, false, false), CovObjectiveRoute::AsFitted, "{m:?}");
     }
     // The endpoint and η straddles.
-    assert_eq!(
-        route(M::Saem, false, 1, false, false),
-        CovObjectiveRoute::AsFitted
-    );
-    assert_eq!(
-        route(M::Saem, true, 0, false, false),
-        CovObjectiveRoute::AsFitted
-    );
+    assert_eq!(route(M::Saem, false, 1, false, false), CovObjectiveRoute::AsFitted);
+    assert_eq!(route(M::Saem, true, 0, false, false), CovObjectiveRoute::AsFitted);
     // Mixture and IOV decline; a mixture is named first when both hold.
     let declined = |d| CovObjectiveRoute::Declined(d);
-    assert_eq!(
-        route(M::Imp, true, 1, true, false),
-        declined(QuadratureDecline::Mixture)
-    );
-    assert_eq!(
-        route(M::Imp, true, 1, false, true),
-        declined(QuadratureDecline::Iov)
-    );
-    assert_eq!(
-        route(M::Imp, true, 1, true, true),
-        declined(QuadratureDecline::Mixture)
-    );
+    assert_eq!(route(M::Imp, true, 1, true, false), declined(QuadratureDecline::Mixture));
+    assert_eq!(route(M::Imp, true, 1, false, true), declined(QuadratureDecline::Iov));
+    assert_eq!(route(M::Imp, true, 1, true, true), declined(QuadratureDecline::Mixture));
     // The grid straddle: 7³ = 343 is in, 7⁴ = 2401 is out.
     assert_eq!(route(M::Saem, true, 3, false, false), quad);
     assert_eq!(
         route(M::Saem, true, 4, false, false),
-        declined(QuadratureDecline::Grid {
-            n_eta: 4,
-            grid: 2401
-        })
+        declined(QuadratureDecline::Grid { n_eta: 4, grid: 2401 })
     );
     // Nothing declines a fit that would not have taken the route anyway.
-    assert_eq!(
-        route(M::FoceI, true, 4, true, true),
-        CovObjectiveRoute::AsFitted
-    );
+    assert_eq!(route(M::FoceI, true, 4, true, true), CovObjectiveRoute::AsFitted);
 }
 
 #[test]
@@ -1219,10 +1085,7 @@ fn the_declined_warning_names_the_objective_the_reason_and_the_remedy_sentence_b
          integrate over as well"
     );
     assert_eq!(
-        reason(&saem(QuadratureDecline::Grid {
-            n_eta: 4,
-            grid: 2401
-        })),
+        reason(&saem(QuadratureDecline::Grid { n_eta: 4, grid: 2401 })),
         "4 random effects need a 7^4 = 2401-node grid per subject, over the covariance step's \
          343-node limit"
     );
@@ -1346,9 +1209,7 @@ fn the_non_stationary_warning_has_two_forms_and_every_sentence_is_pinned() {
         "{failed}"
     );
     assert!(
-        failed.contains(&format!(
-            " SE estimates not available.{design}{why}{remedy}{moves}{sir}"
-        )),
+        failed.contains(&format!(" SE estimates not available.{design}{why}{remedy}{moves}{sir}")),
         "{failed}"
     );
     assert!(failed.ends_with(sir), "{failed}");
@@ -1370,14 +1231,8 @@ fn the_non_stationary_warning_names_the_quadrature_objective_and_the_imp_remedy(
         quadrature_nodes: Some(7),
         ..non_stationary_facts(None)
     });
-    assert!(
-        quad.contains("the 7-node quadrature R matrix needed an eigenvalue floor"),
-        "{quad}"
-    );
-    assert!(
-        quad.contains("SAEM does not minimise the 7-node quadrature objective"),
-        "{quad}"
-    );
+    assert!(quad.contains("the 7-node quadrature R matrix needed an eigenvalue floor"), "{quad}");
+    assert!(quad.contains("SAEM does not minimise the 7-node quadrature objective"), "{quad}");
     assert!(
         quad.ends_with(
             "polish the estimate with `method = [saem, laplace]` and `n_agq = 7`, which takes \
@@ -1388,10 +1243,7 @@ fn the_non_stationary_warning_names_the_quadrature_objective_and_the_imp_remedy(
         "{quad}"
     );
     let plain = format_non_stationary_warning(&non_stationary_facts(None));
-    assert!(
-        !plain.contains("n_agq") && !plain.contains("quadrature"),
-        "{plain}"
-    );
+    assert!(!plain.contains("n_agq") && !plain.contains("quadrature"), "{plain}");
 
     let imp = format_non_stationary_warning(&NonStationaryFacts {
         method: EstimationMethod::Imp,
@@ -1419,18 +1271,12 @@ fn every_non_stationary_remedy_parses_as_the_fit_options_it_names() {
         quadrature_nodes: Some(7),
         ..non_stationary_facts(None)
     }));
-    assert_eq!(
-        (quad.methods.clone(), quad.agq_nodes()),
-        (vec![M::Saem, M::Laplace], Some(7))
-    );
+    assert_eq!((quad.methods.clone(), quad.agq_nodes()), (vec![M::Saem, M::Laplace], Some(7)));
     let imp = apply_remedy(&format_non_stationary_warning(&NonStationaryFacts {
         method: M::Imp,
         ..non_stationary_facts(None)
     }));
-    assert_eq!(
-        (imp.methods.clone(), imp.imp_eval_only),
-        (vec![M::FoceI, M::Imp], true)
-    );
+    assert_eq!((imp.methods.clone(), imp.imp_eval_only), (vec![M::FoceI, M::Imp], true));
     // The quadrature-declined warning shares the remedy (#1781).
     let declined = apply_remedy(&format_quadrature_declined_warning(
         M::Saem,
@@ -1438,11 +1284,8 @@ fn every_non_stationary_remedy_parses_as_the_fit_options_it_names() {
         QuadratureDecline::Iov,
     ));
     assert_eq!(declined.methods, vec![M::Saem, M::FoceI]);
-    let declined_imp = apply_remedy(&format_quadrature_declined_warning(
-        M::Imp,
-        M::FoceI,
-        QuadratureDecline::Iov,
-    ));
+    let declined_imp =
+        apply_remedy(&format_quadrature_declined_warning(M::Imp, M::FoceI, QuadratureDecline::Iov));
     assert_eq!(
         (declined_imp.methods.clone(), declined_imp.imp_eval_only),
         (vec![M::FoceI, M::Imp], true)
@@ -1469,10 +1312,7 @@ fn the_s_design_sentence_needs_fewer_subjects_than_free_parameters() {
     let equal = at(24, 24);
     assert!(!equal.contains("rank at most"), "{equal}");
     let one = at(1, 3);
-    assert!(
-        one.contains(" With 1 subject and 3 free parameters S has rank at most 1,"),
-        "{one}"
-    );
+    assert!(one.contains(" With 1 subject and 3 free parameters S has rank at most 1,"), "{one}");
 }
 
 #[test]
@@ -1481,22 +1321,10 @@ fn the_s_fallback_needs_a_clip_a_non_minimising_estimator_and_an_r_based_request
     use EstimationMethod as M;
     assert!(r_falls_back_to_s(M::Saem, 1, C::Hessian));
     assert!(r_falls_back_to_s(M::Vi, 1, C::Sandwich));
-    assert!(
-        !r_falls_back_to_s(M::Saem, 0, C::Hessian),
-        "nothing clipped"
-    );
-    assert!(
-        !r_falls_back_to_s(M::FoceI, 1, C::Hessian),
-        "FOCEI minimised it"
-    );
-    assert!(
-        !r_falls_back_to_s(M::Laplace, 1, C::Sandwich),
-        "Laplace minimised it"
-    );
-    assert!(
-        !r_falls_back_to_s(M::Saem, 1, C::CrossProduct),
-        "S was asked for"
-    );
+    assert!(!r_falls_back_to_s(M::Saem, 0, C::Hessian), "nothing clipped");
+    assert!(!r_falls_back_to_s(M::FoceI, 1, C::Hessian), "FOCEI minimised it");
+    assert!(!r_falls_back_to_s(M::Laplace, 1, C::Sandwich), "Laplace minimised it");
+    assert!(!r_falls_back_to_s(M::Saem, 1, C::CrossProduct), "S was asked for");
     for m in [M::Saem, M::Imp, M::Impmap, M::Vi, M::Bayes] {
         assert!(!estimate_minimises_cov_objective(m), "{m:?}");
     }
@@ -1539,19 +1367,13 @@ fn the_non_stationary_warning_says_which_of_the_two_floored_cells_r_is_in() {
         ),
         "{pd}"
     );
-    assert!(
-        !pd.contains("not positive definite") && !pd.contains("near-singular"),
-        "{pd}"
-    );
+    assert!(!pd.contains("not positive definite") && !pd.contains("near-singular"), "{pd}");
     let indefinite = format_non_stationary_warning(&non_stationary_facts(None));
     assert!(
         indefinite.contains("(it is not positive definite: min eigenvalue -9.510e-2"),
         "{indefinite}"
     );
-    assert!(
-        !indefinite.contains("below the numerical floor"),
-        "{indefinite}"
-    );
+    assert!(!indefinite.contains("below the numerical floor"), "{indefinite}");
     // The absolute-floor cell (Codex review r2): every eigenvalue under 1e-12, condition
     // number 2 — positive definite and well-conditioned, so not "near-singular" either.
     let absolute = format_non_stationary_warning(&NonStationaryFacts {
@@ -1591,16 +1413,8 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
         inv.min_eigenvalue,
         inv.n_clipped
     );
-    assert!(r_falls_back_to_s(
-        EstimationMethod::Saem,
-        inv.n_clipped,
-        CovarianceMethod::Hessian
-    ));
-    assert!(!r_falls_back_to_s(
-        EstimationMethod::FoceI,
-        inv.n_clipped,
-        CovarianceMethod::Hessian
-    ));
+    assert!(r_falls_back_to_s(EstimationMethod::Saem, inv.n_clipped, CovarianceMethod::Hessian));
+    assert!(!r_falls_back_to_s(EstimationMethod::FoceI, inv.n_clipped, CovarianceMethod::Hessian));
     // And the absolute-floor cell: diag(1e-13, 2e-13) is clipped by `1e-12` at condition 2.
     let tiny = nalgebra::DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![1e-13, 2e-13]));
     let inv = crate::estimation::covariance::invert_psd_with_floor(&tiny).expect("inverse");
@@ -1622,10 +1436,7 @@ fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
     with.declines = &[CovScopeDecline::GradientFd];
     let m = format_regularized_warning(&with);
     assert!(m.contains("declined because gradient = fd."), "{m}");
-    assert!(
-        m.contains("Dropping gradient = fd moves the fit onto the analytic route."),
-        "{m}"
-    );
+    assert!(m.contains("Dropping gradient = fd moves the fit onto the analytic route."), "{m}");
 
     let mut without = measured_severe_facts();
     without.declines = &[CovScopeDecline::ModelOutOfScope];
@@ -1642,10 +1453,7 @@ fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
 #[test]
 fn several_unremediable_clauses_invent_no_advice() {
     let mut facts = measured_severe_facts();
-    facts.declines = &[
-        CovScopeDecline::ModelOutOfScope,
-        CovScopeDecline::NonGaussianEndpoint,
-    ];
+    facts.declines = &[CovScopeDecline::ModelOutOfScope, CovScopeDecline::NonGaussianEndpoint];
     let m = format_regularized_warning(&facts);
     assert!(
         m.contains(
@@ -1678,10 +1486,7 @@ fn the_decline_sentence_names_the_subjects_that_declined_not_the_whole_fit() {
     fd.source = CovHessianSource::FdStencil;
     let mut hybrid = fd;
     hybrid.source = CovHessianSource::HybridRMatrix;
-    let (m_fd, m_hybrid) = (
-        format_regularized_warning(&fd),
-        format_regularized_warning(&hybrid),
-    );
+    let (m_fd, m_hybrid) = (format_regularized_warning(&fd), format_regularized_warning(&hybrid));
     let clause = CovScopeDecline::ModelOutOfScope.clause();
     assert!(
         m_fd.contains(&format!(
@@ -1697,10 +1502,7 @@ fn the_decline_sentence_names_the_subjects_that_declined_not_the_whole_fit() {
         "{m_hybrid}"
     );
     assert!(!m_hybrid.contains("R-matrix was declined"), "{m_hybrid}");
-    assert!(
-        !m_fd.contains("The finite-differenced subjects declined"),
-        "{m_fd}"
-    );
+    assert!(!m_fd.contains("The finite-differenced subjects declined"), "{m_fd}");
 }
 
 #[test]
@@ -1717,10 +1519,7 @@ fn the_message_names_the_hybrid_route_and_keeps_its_stencil_guidance() {
         format_regularized_warning(&fd),
         format_regularized_warning(&hybrid),
     );
-    assert!(
-        m_hybrid.contains("the hybrid analytic/FD R-matrix"),
-        "{m_hybrid}"
-    );
+    assert!(m_hybrid.contains("the hybrid analytic/FD R-matrix"), "{m_hybrid}");
     assert!(!m_analytic.contains("hybrid"), "{m_analytic}");
     assert!(!m_fd.contains("hybrid"), "{m_fd}");
     let clause = "because gradient = fd";
@@ -1738,10 +1537,7 @@ fn the_remedy_sentences_move_the_subjects_not_the_fit_on_the_hybrid_route() {
     hybrid.source = CovHessianSource::HybridRMatrix;
     let mut fd = hybrid;
     fd.source = CovHessianSource::FdStencil;
-    let (m_hybrid, m_fd) = (
-        format_regularized_warning(&hybrid),
-        format_regularized_warning(&fd),
-    );
+    let (m_hybrid, m_fd) = (format_regularized_warning(&hybrid), format_regularized_warning(&fd));
     assert!(
         m_hybrid.contains("Dropping gradient = fd moves those subjects onto the analytic route."),
         "{m_hybrid}"
@@ -1752,10 +1548,7 @@ fn the_remedy_sentences_move_the_subjects_not_the_fit_on_the_hybrid_route() {
     );
     // One action, one blocker without one.
     let mut hybrid_mixed = hybrid;
-    hybrid_mixed.declines = &[
-        CovScopeDecline::GradientFd,
-        CovScopeDecline::ModelOutOfScope,
-    ];
+    hybrid_mixed.declines = &[CovScopeDecline::GradientFd, CovScopeDecline::ModelOutOfScope];
     let mut fd_mixed = hybrid_mixed;
     fd_mixed.source = CovHessianSource::FdStencil;
     assert!(
@@ -1777,11 +1570,8 @@ fn the_remedy_sentences_move_the_subjects_not_the_fit_on_the_hybrid_route() {
 #[test]
 fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
     let mut facts = measured_severe_facts();
-    facts.declines = &[
-        CovScopeDecline::Disabled,
-        CovScopeDecline::GradientFd,
-        CovScopeDecline::ModelOutOfScope,
-    ];
+    facts.declines =
+        &[CovScopeDecline::Disabled, CovScopeDecline::GradientFd, CovScopeDecline::ModelOutOfScope];
     let m = format_regularized_warning(&facts);
     assert!(
         m.contains(
@@ -1789,10 +1579,7 @@ fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
         ),
         "{m}"
     );
-    assert!(
-        m.contains("the remaining clause has no one-line remedy"),
-        "{m}"
-    );
+    assert!(m.contains("the remaining clause has no one-line remedy"), "{m}");
     let mut two_left = measured_severe_facts();
     two_left.declines = &[
         CovScopeDecline::GradientFd,
@@ -1800,14 +1587,8 @@ fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
         CovScopeDecline::NonGaussianEndpoint,
     ];
     let m = format_regularized_warning(&two_left);
-    assert!(
-        m.contains("Dropping gradient = fd clears that clause"),
-        "{m}"
-    );
-    assert!(
-        m.contains("the remaining clauses have no one-line remedy"),
-        "{m}"
-    );
+    assert!(m.contains("Dropping gradient = fd clears that clause"), "{m}");
+    assert!(m.contains("the remaining clauses have no one-line remedy"), "{m}");
 }
 
 #[test]
@@ -1824,10 +1605,7 @@ fn the_sir_sentence_reads_whether_sir_is_armed_and_which_marginal_weights_it() {
         off.contains("`sir = true` samples a proposal") && !off.contains("The SIR intervals"),
         "{off}"
     );
-    let armed = failed(NonStationaryFacts {
-        sir_armed: true,
-        ..base()
-    });
+    let armed = failed(NonStationaryFacts { sir_armed: true, ..base() });
     assert!(
         armed.ends_with(
             " The SIR intervals reported with this fit sample a proposal built from R with its \
@@ -1874,10 +1652,7 @@ fn the_rank_sentence_replaces_the_rank_deficient_hedge_only_below_full_rank() {
         "{below}"
     );
     let equal = at(24, S_RANK_DEFICIENT_REASON);
-    assert!(
-        equal.contains(&format!("unavailable ({S_RANK_DEFICIENT_REASON}).")),
-        "{equal}"
-    );
+    assert!(equal.contains(&format!("unavailable ({S_RANK_DEFICIENT_REASON}).")), "{equal}");
     let other = at(6, "non-finite score");
     assert!(other.contains("unavailable (non-finite score)."), "{other}");
 }
@@ -1934,10 +1709,7 @@ fn the_gradient_non_stationary_warning_reads_its_facts() {
         method: EstimationMethod::Vi,
         ..gradient_facts()
     });
-    assert!(
-        rsr.contains("so covariance_method = rsr returned standard errors"),
-        "{rsr}"
-    );
+    assert!(rsr.contains("so covariance_method = rsr returned standard errors"), "{rsr}");
     assert!(!rsr.contains("covariance_method = r "), "{rsr}");
     // The sandwich is described as the sandwich (#2541 review r1 §1): its R is the curvature on
     // the slope and its S is summed from scores with a non-zero mean. Neither sentence of the
@@ -1951,10 +1723,7 @@ fn the_gradient_non_stationary_warning_reads_its_facts() {
     );
     assert!(!rsr.contains("but they come from the curvature"), "{rsr}");
     let r = format_non_stationary_gradient_warning(&gradient_facts());
-    assert!(
-        !r.contains("R⁻¹SR⁻¹") && !r.contains("per-subject scores"),
-        "{r}"
-    );
+    assert!(!r.contains("R⁻¹SR⁻¹") && !r.contains("per-subject scores"), "{r}");
     assert!(
         rsr.contains(
             "by an estimated 1.430 OFV units, which puts the estimate about 1.2 standard errors \
@@ -1962,14 +1731,8 @@ fn the_gradient_non_stationary_warning_reads_its_facts() {
         ),
         "{rsr}"
     );
-    assert!(
-        rsr.contains("the VI estimate is not a stationary point"),
-        "{rsr}"
-    );
-    assert!(
-        rsr.ends_with("`method = [vi, focei]`, which takes R at the FOCEI minimum."),
-        "{rsr}"
-    );
+    assert!(rsr.contains("the VI estimate is not a stationary point"), "{rsr}");
+    assert!(rsr.ends_with("`method = [vi, focei]`, which takes R at the FOCEI minimum."), "{rsr}");
 
     let quad = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
         objective: EstimationMethod::Laplace,
@@ -1994,10 +1757,7 @@ fn the_gradient_non_stationary_warning_reads_its_facts() {
         "{quad}"
     );
     let plain = format_non_stationary_gradient_warning(&gradient_facts());
-    assert!(
-        !plain.contains("quadrature") && !plain.contains("n_agq"),
-        "{plain}"
-    );
+    assert!(!plain.contains("quadrature") && !plain.contains("n_agq"), "{plain}");
 
     let imp = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
         method: EstimationMethod::Imp,
@@ -2024,18 +1784,9 @@ fn the_three_non_stationary_forms_classify_apart() {
         let e = classify_warning(w);
         (e.category, e.severity)
     };
-    assert_eq!(
-        class(&replaced),
-        (WarningCode::CovarianceRegularized, WarningSeverity::Warning)
-    );
-    assert_eq!(
-        class(&failed),
-        (WarningCode::CovarianceFailed, WarningSeverity::Critical)
-    );
-    assert_eq!(
-        class(&gradient),
-        (WarningCode::CovarianceStep, WarningSeverity::Warning)
-    );
+    assert_eq!(class(&replaced), (WarningCode::CovarianceRegularized, WarningSeverity::Warning));
+    assert_eq!(class(&failed), (WarningCode::CovarianceFailed, WarningSeverity::Critical));
+    assert_eq!(class(&gradient), (WarningCode::CovarianceStep, WarningSeverity::Warning));
 }
 
 #[test]
@@ -2043,16 +1794,10 @@ fn the_stationarity_test_runs_for_a_sampler_whose_r_was_kept() {
     use EstimationMethod as M;
     for m in [M::Saem, M::Imp, M::Impmap, M::Vi] {
         assert!(tests_stationarity_by_gradient(m, false), "{m:?}");
-        assert!(
-            !tests_stationarity_by_gradient(m, true),
-            "{m:?}: the S⁻¹ fallback already warned"
-        );
+        assert!(!tests_stationarity_by_gradient(m, true), "{m:?}: the S⁻¹ fallback already warned");
     }
     for m in [M::Foce, M::FoceI, M::FoceGn, M::FoceGnHybrid, M::Laplace] {
-        assert!(
-            !tests_stationarity_by_gradient(m, false),
-            "{m:?} minimised R's objective"
-        );
+        assert!(!tests_stationarity_by_gradient(m, false), "{m:?} minimised R's objective");
     }
 }
 
@@ -2091,10 +1836,7 @@ fn the_minimum_test_runs_for_minimisers_on_an_unclipped_r_only() {
         assert!(!tests_minimum_stationarity(m, 1), "{m:?}, R clipped");
     }
     for m in [M::Saem, M::Imp, M::Impmap, M::Vi, M::Bayes] {
-        assert!(
-            !tests_minimum_stationarity(m, 0),
-            "{m:?} never minimised R's objective"
-        );
+        assert!(!tests_minimum_stationarity(m, 0), "{m:?} never minimised R's objective");
     }
 }
 
@@ -2133,18 +1875,10 @@ fn the_reading_makes_no_claim_on_non_finite_input() {
     let h_inv = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, 1.0, 1.0, 3.0]);
     for bad in [f64::NAN, f64::INFINITY] {
         let g = nalgebra::DVector::from_vec(vec![bad, 1.0]);
-        assert_eq!(
-            stationarity_reading(&g, &h_inv, &[false, false]),
-            None,
-            "g {bad}"
-        );
+        assert_eq!(stationarity_reading(&g, &h_inv, &[false, false]), None, "g {bad}");
         let g = nalgebra::DVector::from_vec(vec![1.0, 1.0]);
         let h = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, bad, bad, 3.0]);
-        assert_eq!(
-            stationarity_reading(&g, &h, &[false, false]),
-            None,
-            "H⁻¹ {bad}"
-        );
+        assert_eq!(stationarity_reading(&g, &h, &[false, false]), None, "H⁻¹ {bad}");
     }
 }
 
@@ -2159,16 +1893,10 @@ fn a_coordinate_is_held_only_on_a_bound_its_descent_leaves_the_box_through() {
     // 5: 1e-6 inside the upper bound — a real interior point — descent outward → free.
     let x = [1.0, 1.0, -1.0, 0.0, 1.0 - 1e-10, 1.0 - 1e-6];
     let g = [-5.0, 5.0, 5.0, 5.0, -5.0, -5.0];
-    assert_eq!(
-        held_at_bound(&x, &g, &lo, &hi),
-        vec![true, false, true, false, true, false]
-    );
+    assert_eq!(held_at_bound(&x, &g, &lo, &hi), vec![true, false, true, false, true, false]);
     // An unbounded coordinate is never held.
     let inf = [f64::INFINITY];
-    assert_eq!(
-        held_at_bound(&[1e300], &[-1.0], &[-1e300], &inf),
-        vec![false]
-    );
+    assert_eq!(held_at_bound(&[1e300], &[-1.0], &[-1e300], &inf), vec![false]);
 }
 
 #[test]
@@ -2189,35 +1917,17 @@ fn the_non_stationary_optimum_warning_says_each_thing_once() {
     let w = format_non_stationary_optimum_warning(
         EstimationMethod::FoceI,
         12.5,
-        &[
-            ("theta[CL]".to_string(), 3.25),
-            ("theta[WT_V]".to_string(), -1.04),
-        ],
+        &[("theta[CL]".to_string(), 3.25), ("theta[WT_V]".to_string(), -1.04)],
     );
     // The token and the demotion, which `classify_warning` and the strictness gate key on.
-    assert!(
-        w.starts_with("W_NON_STATIONARY_OPTIMUM: the FOCEI estimate"),
-        "{w}"
-    );
+    assert!(w.starts_with("W_NON_STATIONARY_OPTIMUM: the FOCEI estimate"), "{w}");
     assert!(w.contains("not reported as converged"), "{w}");
     // The decrement and its distance in SEs (√12.5 = 3.54), and the threshold.
-    assert!(
-        w.contains("by an estimated 12.500 units, about 3.5 standard errors"),
-        "{w}"
-    );
-    assert!(
-        w.contains("fails above 1.0 OFV unit, one standard error"),
-        "{w}"
-    );
+    assert!(w.contains("by an estimated 12.500 units, about 3.5 standard errors"), "{w}");
+    assert!(w.contains("fails above 1.0 OFV unit, one standard error"), "{w}");
     // The coordinates, as the move a minimiser makes: −δ/SE.
-    assert!(
-        w.contains("in standard errors: theta[CL] -3.2, theta[WT_V] +1.0."),
-        "{w}"
-    );
-    assert!(
-        w.contains("standard errors taken on the objective's slope"),
-        "{w}"
-    );
+    assert!(w.contains("in standard errors: theta[CL] -3.2, theta[WT_V] +1.0."), "{w}");
+    assert!(w.contains("standard errors taken on the objective's slope"), "{w}");
     assert!(w.contains("Restart the fit from these estimates"), "{w}");
     let entry = classify_warning(&w);
     assert_eq!(entry.severity, WarningSeverity::Critical, "{w}");

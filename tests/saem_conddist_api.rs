@@ -97,10 +97,8 @@ fn saem_conddist_populates_per_subject_mean_and_sd() {
     let opts = short_saem_opts();
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
 
-    let cd = result
-        .cond_dist
-        .as_ref()
-        .expect("cond_dist must be populated when saem_conddist = true");
+    let cd =
+        result.cond_dist.as_ref().expect("cond_dist must be populated when saem_conddist = true");
 
     let n_subjects = population.subjects.len();
     let n_eta = result.eta_names.len();
@@ -113,10 +111,7 @@ fn saem_conddist_populates_per_subject_mean_and_sd() {
         assert_eq!(cd.cond_mean[i].len(), n_eta);
         assert_eq!(cd.cond_sd[i].len(), n_eta);
         for j in 0..n_eta {
-            assert!(
-                cd.cond_mean[i][j].is_finite(),
-                "subject {i} eta {j}: cond_mean not finite"
-            );
+            assert!(cd.cond_mean[i][j].is_finite(), "subject {i} eta {j}: cond_mean not finite");
             assert!(
                 cd.cond_sd[i][j].is_finite() && cd.cond_sd[i][j] >= 0.0,
                 "subject {i} eta {j}: cond_sd invalid ({})",
@@ -139,10 +134,7 @@ fn saem_conddist_disabled_by_default_is_none() {
     opts.saem_conddist = false; // explicit: the pass must not run
 
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
-    assert!(
-        result.cond_dist.is_none(),
-        "cond_dist must be None when saem_conddist = false"
-    );
+    assert!(result.cond_dist.is_none(), "cond_dist must be None when saem_conddist = false");
 }
 
 #[test]
@@ -174,27 +166,14 @@ fn saem_conddist_roundtrips_through_fitrx_bundle() {
 
     let opts = short_saem_opts();
     let result = fit(&model, &population, &model.default_params, &opts).expect("SAEM fit succeeds");
-    assert!(
-        result.cond_dist.is_some(),
-        "fixture fit must have run conddist"
-    );
+    assert!(result.cond_dist.is_some(), "fixture fit must have run conddist");
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("conddist_fit.fitrx");
-    save_fit(
-        &result,
-        &population,
-        MODEL,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .unwrap();
+    save_fit(&result, &population, MODEL, &path, SaveFitOptions::default()).unwrap();
 
     let loaded = load_fit(&path).unwrap();
-    let cd = loaded
-        .fit
-        .cond_dist
-        .expect("cond_dist must round-trip through .fitrx");
+    let cd = loaded.fit.cond_dist.expect("cond_dist must round-trip through .fitrx");
     let orig = result.cond_dist.as_ref().unwrap();
 
     assert_eq!(cd.cond_mean.len(), orig.cond_mean.len());
@@ -231,14 +210,7 @@ fn saem_no_conddist_omits_fitrx_entry() {
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("no_conddist_fit.fitrx");
-    save_fit(
-        &result,
-        &population,
-        MODEL,
-        &path,
-        SaveFitOptions::default(),
-    )
-    .unwrap();
+    save_fit(&result, &population, MODEL, &path, SaveFitOptions::default()).unwrap();
 
     let loaded = load_fit(&path).unwrap();
     assert!(loaded.fit.cond_dist.is_none());

@@ -27,8 +27,7 @@ use std::borrow::Cow;
 /// `Subject` (not just `doses`) because downstream helpers read `obs_times` /
 /// `pk_only_times` / `reset_times` alongside the resolved doses.
 pub(crate) fn resolve_subject_doses_with<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
+    subject: &'a Subject, attr_map: &crate::types::DoseAttrMap,
     pk_for_dose: impl Fn(usize) -> &'a [f64],
 ) -> Cow<'a, Subject> {
     // Fast path: an empty map means no modeled dose (the data gate rejects one).
@@ -58,8 +57,7 @@ fn is_zero_order_ss_record(attr_map: &crate::types::DoseAttrMap, d: &DoseEvent) 
 /// refused by validation, so this names the lowered doses and only them. Every walk asks it to
 /// keep such a dose on the plain-infusion paths (no forcing onset, no `R_in_inf`).
 pub(crate) fn is_lowered_zero_order_ss(
-    attr_map: &crate::types::DoseAttrMap,
-    d: &DoseEvent,
+    attr_map: &crate::types::DoseAttrMap, d: &DoseEvent,
 ) -> bool {
     d.ss && d.ii > 0.0 && d.is_infusion() && attr_map.zero_order_slot(d.cmt_1based()).is_some()
 }
@@ -71,14 +69,10 @@ pub(crate) fn is_lowered_zero_order_ss(
 /// the engines already carry an SS infusion exactly in every derivative order, so lowering reuses
 /// that instead of a second SS train for `zero_order()`. Borrowed unless a dose is rewritten.
 pub(crate) fn lower_zero_order_ss<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
+    subject: &'a Subject, attr_map: &crate::types::DoseAttrMap,
 ) -> Cow<'a, Subject> {
     if !attr_map.has_zero_order()
-        || !subject
-            .doses
-            .iter()
-            .any(|d| is_zero_order_ss_record(attr_map, d))
+        || !subject.doses.iter().any(|d| is_zero_order_ss_record(attr_map, d))
     {
         return Cow::Borrowed(subject);
     }
@@ -97,11 +91,7 @@ fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::
     if subject.doses.first().is_some_and(|d| d.amt == 4321.5) {
         MARKER_LOWERINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    for d in subject
-        .doses
-        .iter_mut()
-        .filter(|d| is_zero_order_ss_record(attr_map, d))
-    {
+    for d in subject.doses.iter_mut().filter(|d| is_zero_order_ss_record(attr_map, d)) {
         d.rate_mode = crate::types::RateMode::ModeledDuration;
         d.infusion_def = crate::types::InfusionDef::DurationDefined;
         d.rate = 0.0;
@@ -115,8 +105,7 @@ fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::
 /// [`lower_zero_order_ss`] on a bound subject is a scan that borrows instead of cloning the
 /// subject on every walk of every inner solve. Borrowed unless a dose is rewritten.
 pub(crate) fn lower_population_zero_order_ss<'a>(
-    population: &'a crate::types::Population,
-    attr_map: &crate::types::DoseAttrMap,
+    population: &'a crate::types::Population, attr_map: &crate::types::DoseAttrMap,
 ) -> Cow<'a, crate::types::Population> {
     let has = |s: &Subject| s.doses.iter().any(|d| is_zero_order_ss_record(attr_map, d));
     if !attr_map.has_zero_order() || !population.subjects.iter().any(has) {
@@ -135,9 +124,7 @@ pub(crate) fn lower_population_zero_order_ss<'a>(
 /// [`resolve_subject_doses_with`] directly with a per-dose closure. See
 /// [`resolve_subject_doses_with`].
 pub(crate) fn resolve_subject_doses<'a>(
-    subject: &'a Subject,
-    attr_map: &crate::types::DoseAttrMap,
-    params: &'a [f64],
+    subject: &'a Subject, attr_map: &crate::types::DoseAttrMap, params: &'a [f64],
 ) -> Cow<'a, Subject> {
     resolve_subject_doses_with(subject, attr_map, |_| params)
 }
@@ -159,8 +146,7 @@ pub(crate) fn resolve_subject_doses<'a>(
 ///
 /// `None` in every slot only when the timeline has no record at all.
 pub(crate) fn governing_record_indices(
-    n_events: usize,
-    is_record: impl Fn(usize) -> bool,
+    n_events: usize, is_record: impl Fn(usize) -> bool,
 ) -> Vec<Option<usize>> {
     let mut acc: Vec<Option<usize>> = vec![None; n_events];
     // Rule 1: backward scan; `seen` is set before `acc[i]`, so a record maps to itself.
@@ -249,12 +235,7 @@ pub(crate) const SS_EQUILIBRATION_TOL: f64 = 1e-12;
 /// so the capped fallback plus [`note_ss_nonconvergence_if_capped`] applies), or a non-finite
 /// intermediate.
 pub(crate) fn periodic_ss_fixed_point_g<T, FUnf, FFor>(
-    n: usize,
-    ii: f64,
-    reltol: f64,
-    abstol: f64,
-    advance_unforced: FUnf,
-    advance_forced: FFor,
+    n: usize, ii: f64, reltol: f64, abstol: f64, advance_unforced: FUnf, advance_forced: FFor,
 ) -> Option<Vec<T>>
 where
     T: crate::sens::num::PkNum,
@@ -299,11 +280,7 @@ where
     let vtol = (256.0 * reltol + 1e-9) * scale + 256.0 * abstol;
     // `|c − u| ≤ vtol` is `< next_up(vtol)`, exactly, for a finite `vtol`.
     let vtol_open = vtol.next_up();
-    let within = |a: &[T], b: &[T]| {
-        a.iter()
-            .zip(b)
-            .all(|(&c, &u)| c.br_absdiff_lt(u, vtol_open))
-    };
+    let within = |a: &[T], b: &[T]| a.iter().zip(b).all(|(&c, &u)| c.br_absdiff_lt(u, vtol_open));
     let u_check = advance_forced(&u_ss)?;
     if !within(&u_check, &u_ss) {
         return None;
@@ -339,9 +316,7 @@ pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
     }
     let max_mag = cur.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
     let atol = tol * max_mag;
-    cur.iter()
-        .zip(prev)
-        .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
+    cur.iter().zip(prev).all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
 }
 
 /// The test-only full-budget switch, for the recording type's convergence test.
@@ -384,20 +359,14 @@ impl SsStopTracker {
     /// `(prev_abs, last_abs, last_mag)` for [`note_ss_nonconvergence_if_capped`] (#867); all
     /// `0.0` ("nothing to warn about") after an early stop or fewer than two such cycles.
     pub(crate) fn recent_increments(&self) -> (f64, f64, f64) {
-        (
-            self.abs_increments[0],
-            self.abs_increments[1],
-            self.last_mag,
-        )
+        (self.abs_increments[0], self.abs_increments[1], self.last_mag)
     }
 }
 
 /// Absolute L∞ change `max|cur − prev|` between SS cycles (#867); see
 /// [`SsStopTracker::abs_increments`].
 fn ss_abs_increment(cur: &[f64], prev: &[f64]) -> f64 {
-    cur.iter()
-        .zip(prev)
-        .fold(0.0_f64, |m, (&a, &b)| m.max((a - b).abs()))
+    cur.iter().zip(prev).fold(0.0_f64, |m, (&a, &b)| m.max((a - b).abs()))
 }
 
 /// L∞ magnitude `max|cur|` of a cycle state — the scale the absolute tail is normalised against
@@ -583,10 +552,7 @@ fn ss_run_key() -> u64 {
 /// run id for the operation's duration (carried by its pool tasks), a thread inside one joins it.
 /// Dropping it discards what the run left in the sink.
 pub(crate) struct SsRunScope(
-    Option<(
-        u64,
-        crate::parser::model_parser::rhs_regcode::kernel_jit::FitGuard,
-    )>,
+    Option<(u64, crate::parser::model_parser::rhs_regcode::kernel_jit::FitGuard)>,
 );
 
 pub(crate) fn run_scope() -> SsRunScope {
@@ -612,10 +578,7 @@ pub(crate) fn drop_ss_run(run: u64) {
 /// warning in the [`ss_nonconvergence_sink`] (#867). Inputs from
 /// [`SsStopTracker::recent_increments`].
 pub(crate) fn note_ss_nonconvergence_if_capped(
-    early_stopped: bool,
-    abs_prev: f64,
-    abs_last: f64,
-    mag: f64,
+    early_stopped: bool, abs_prev: f64, abs_last: f64, mag: f64,
 ) {
     let warning = ss_equilibration_tail_warning(early_stopped, abs_prev, abs_last, mag);
     // Recorded on every call so a converged run clears an earlier warning (#1289).
@@ -635,10 +598,7 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
 /// `rel_last ≤ SS_WARN_REL_TOL` noise floor, where solver jitter makes `ρ` meaningless. The
 /// floor is not applied to the `ρ < 1` branch: a near-1 ratio has a small step but a large tail.
 fn ss_equilibration_tail_warning(
-    early_stopped: bool,
-    abs_prev: f64,
-    abs_last: f64,
-    mag: f64,
+    early_stopped: bool, abs_prev: f64, abs_last: f64, mag: f64,
 ) -> Option<String> {
     if early_stopped || abs_last <= 0.0 {
         return None;
@@ -723,10 +683,7 @@ mod ss_warn_tests {
         // Not contracting (`ρ = 2`) and past the noise floor (last step 20% of the trough).
         let want = ss_equilibration_tail_warning(false, 1.0, 2.0, 10.0).expect("fixture warns");
         note_ss_nonconvergence_if_capped(false, 1.0, 2.0, 10.0);
-        assert_eq!(
-            last_ss_equilibration_warning().as_deref(),
-            Some(want.as_str())
-        );
+        assert_eq!(last_ss_equilibration_warning().as_deref(), Some(want.as_str()));
         assert!(last_ss_equilibration_warned());
         note_ss_nonconvergence_if_capped(true, 1.0, 2.0, 10.0);
         assert_eq!(last_ss_equilibration_warning(), None);
@@ -747,13 +704,9 @@ mod ss_warn_tests {
             assert_ne!(fit, 0, "a top-level run opens a scope");
             // The write comes from another thread running the run's id, as a pool task does.
             std::thread::scope(|s| {
-                s.spawn(|| {
-                    in_fit(fit, || {
-                        note_ss_nonconvergence_if_capped(false, 1.0, 2.0, mag)
-                    })
-                })
-                .join()
-                .unwrap();
+                s.spawn(|| in_fit(fit, || note_ss_nonconvergence_if_capped(false, 1.0, 2.0, mag)))
+                    .join()
+                    .unwrap();
             });
             gate.wait(); // both runs have written before either reads
             (fit, take_ss_nonconvergence_warnings())
@@ -906,8 +859,7 @@ pub(crate) fn ss_equilibrates_at_arrival(dose: &DoseEvent, lag: f64) -> bool {
 
 /// [`ss_equilibrates_at_arrival`] for a lag of any type (#2786).
 pub(crate) fn ss_equilibrates_at_arrival_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: G,
+    dose: &DoseEvent, lag: G,
 ) -> bool {
     dose.ss && dose.ii > 0.0 && !ss_seeded_at_record_g(dose, lag)
 }
@@ -973,9 +925,7 @@ pub(crate) fn ss_overlap_split_g<G: crate::sens::num::PkNum>(t_inf: G, ii: f64) 
 /// not a physical reading of a 600 mg dose. ferx does not reproduce it; see
 /// `docs/model-file/lagtime.qmd`.
 pub(crate) fn ss_residual_infusions_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: G,
-    t_inf: G,
+    dose: &DoseEvent, lag: G, t_inf: G,
 ) -> (G, usize) {
     let psi = if ss_seeded_at_record_g(dose, lag) {
         ss_seed_phase_g(dose, lag)
@@ -983,11 +933,7 @@ pub(crate) fn ss_residual_infusions_g<G: crate::sens::num::PkNum>(
         G::from_f64(dose.ii)
     };
     let first = t_inf - psi;
-    let n = if dose.ss && dose.ii > 0.0 {
-        count_gt_multiples(first, dose.ii)
-    } else {
-        0
-    };
+    let n = if dose.ss && dose.ii > 0.0 { count_gt_multiples(first, dose.ii) } else { 0 };
     (first, n)
 }
 
@@ -1004,11 +950,7 @@ pub(crate) fn count_gt_multiples<G: crate::sens::num::PkNum>(x: G, ii: f64) -> u
     }
     // value-read-ok: an estimate; the two comparisons recorded below pin `n`, the value is not a decision
     let v = x.probe_value();
-    let mut n = if v.is_finite() {
-        (v / ii).ceil() as usize
-    } else {
-        usize::MAX
-    };
+    let mut n = if v.is_finite() { (v / ii).ceil() as usize } else { usize::MAX };
     n = n.max(1);
     // The loop's own arithmetic `n as f64 * ii`; correct the estimate by rounding.
     if n < (1usize << 52) {
@@ -1081,11 +1023,7 @@ impl ResidualEnds {
 /// split is read from the value; a recording type guards both sides of it (`end(j0−1) >
 /// horizon`, `end(j0) ≤ horizon`) so the kept set is what a replay at other parameters keeps.
 pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
-    t: f64,
-    first: G,
-    ii: f64,
-    n: usize,
-    horizon: f64,
+    t: f64, first: G, ii: f64, n: usize, horizon: f64,
 ) -> std::ops::Range<usize> {
     use crate::sens::num::BranchCmp::{Gt, Le};
     // value-read-ok: an estimate of the split; the two comparisons recorded below pin it
@@ -1104,10 +1042,7 @@ pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
 /// estimated from values and pinned by two recorded comparisons (as
 /// [`residual_end_indices_g`]).
 pub(crate) fn ss_residual_count_ending_at_or_after_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: f64,
-    dur_eff: G,
-    lo: G,
+    dose: &DoseEvent, lag: f64, dur_eff: G, lo: G,
 ) -> usize {
     use crate::sens::num::BranchCmp::{Ge, Lt};
     if !is_real_infusion(dose) {
@@ -1138,26 +1073,15 @@ pub(crate) fn ss_residual_ends(dose: &DoseEvent, lag: f64, f_bio: f64) -> Residu
     } else {
         (0.0, 0)
     };
-    ResidualEnds {
-        t: dose.time,
-        first,
-        ii: dose.ii,
-        n,
-    }
+    ResidualEnds { t: dose.time, first, ii: dose.ii, n }
 }
 
 /// [`ss_residual_ends`]'s stop times lying in `[lo, hi]` — the span a caller integrates over;
 /// an end outside it is never reached (the pulse still counts in the rate, through `n`).
 pub(crate) fn ss_residual_infusion_ends(
-    dose: &DoseEvent,
-    lag: f64,
-    f_bio: f64,
-    lo: f64,
-    hi: f64,
+    dose: &DoseEvent, lag: f64, f_bio: f64, lo: f64, hi: f64,
 ) -> impl Iterator<Item = f64> {
-    ss_residual_ends(dose, lag, f_bio)
-        .within(lo, hi)
-        .map(|(_, e)| e)
+    ss_residual_ends(dose, lag, f_bio).within(lo, hi).map(|(_, e)| e)
 }
 
 /// Whether flowing a seeded steady-state dose from its record to its lagged
@@ -1247,9 +1171,7 @@ pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
 /// comparison through its branch API and the wrap through [`wrap_into_period_g`].
 #[inline]
 pub(crate) fn tad_referent_g<G: crate::sens::num::PkNum>(
-    dose: &DoseEvent,
-    lag: G,
-    t: G,
+    dose: &DoseEvent, lag: G, t: G,
 ) -> Option<G> {
     use crate::sens::num::BranchCmp::Le;
     let arrival = G::from_f64(dose.time) + lag;
@@ -1353,8 +1275,7 @@ pub(crate) fn ss_reset_cutoff(doses: &[DoseEvent], t: f64) -> Option<usize> {
 /// [`ss_reset_cutoff`] at a time of any type: a recording type (#2786) decides `record ≤ t`
 /// through its branch API.
 pub(crate) fn ss_reset_cutoff_g<G: crate::sens::num::PkNum>(
-    doses: &[DoseEvent],
-    t: G,
+    doses: &[DoseEvent], t: G,
 ) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (i, d) in doses.iter().enumerate() {
@@ -1497,11 +1418,7 @@ impl DoseIndex {
     /// index was built from (it is only read on the scan fallback).
     #[inline]
     pub(crate) fn ss_cutoff(&self, doses: &[DoseEvent], t: f64) -> Option<usize> {
-        debug_assert_eq!(
-            doses.len(),
-            self.n_doses,
-            "DoseIndex queried with another list"
-        );
+        debug_assert_eq!(doses.len(), self.n_doses, "DoseIndex queried with another list");
         if self.ss_scan_fallback || t.is_nan() {
             return ss_reset_cutoff(doses, t);
         }
@@ -1529,11 +1446,7 @@ impl DoseIndex {
         }
         let mut out = own.to_vec();
         for (_, ends) in &self.residuals {
-            out.extend(
-                ends.within(lo, hi)
-                    .map(|(_, e)| e)
-                    .filter(|&e| e > lo && e < hi),
-            );
+            out.extend(ends.within(lo, hi).map(|(_, e)| e).filter(|&e| e > lo && e < hi));
         }
         out.sort_by(|a, b| a.total_cmp(b));
         std::borrow::Cow::Owned(out)
@@ -1605,11 +1518,7 @@ mod dose_index_tests {
                 _ => 200.0,
             };
             let ss = rng.below(4) == 0;
-            let ii = if ss {
-                [0.0, 6.0, 12.0][rng.below(3) as usize]
-            } else {
-                0.0
-            };
+            let ii = if ss { [0.0, 6.0, 12.0][rng.below(3) as usize] } else { 0.0 };
             doses.push(DoseEvent::new(time, 100.0, 1, rate, ss, ii));
             lags.push([0.0, 0.0, 0.25, 1.5, 7.0][rng.below(5) as usize]);
         }
@@ -1619,21 +1528,10 @@ mod dose_index_tests {
     /// The probe times: every dose time and arrival, each nudged by the match tolerances
     /// either way, plus points between and beyond the grid.
     fn probes(doses: &[DoseEvent], lags: &[f64]) -> Vec<f64> {
-        let mut ts = vec![
-            -1.0,
-            -0.0,
-            0.0,
-            0.1,
-            2.75,
-            100.0,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-        ];
+        let mut ts = vec![-1.0, -0.0, 0.0, 0.1, 2.75, 100.0, f64::INFINITY, f64::NEG_INFINITY];
         for (d, &lag) in doses.iter().zip(lags) {
             for base in [d.time, d.time + lag, d.time + lag + d.duration] {
-                for eps in [
-                    0.0, 1e-15, -1e-15, 1e-12, -1e-12, 5e-10, -5e-10, 2e-9, -2e-9,
-                ] {
+                for eps in [0.0, 1e-15, -1e-15, 1e-12, -1e-12, 5e-10, -5e-10, 2e-9, -2e-9] {
                     ts.push(base + eps);
                 }
             }
@@ -1689,11 +1587,7 @@ mod dose_index_tests {
         ];
         let index = DoseIndex::new(&doses, &[]);
         for t in [0.0, 1.0, 1.5, 3.0, f64::NAN] {
-            assert_eq!(
-                index.ss_cutoff(&doses, t),
-                ss_reset_cutoff(&doses, t),
-                "t = {t}"
-            );
+            assert_eq!(index.ss_cutoff(&doses, t), ss_reset_cutoff(&doses, t), "t = {t}");
         }
     }
 
@@ -1749,19 +1643,11 @@ mod dose_index_tests {
                     let a = ts[rng.below(ts.len() as u64) as usize];
                     let b = ts[rng.below(ts.len() as u64) as usize];
                     let (lo, hi) = (a.min(b) + 1e-15, a.max(b) - 1e-15);
-                    let got: Vec<u64> = index
-                        .breaks_within(lo, hi)
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect();
-                    let want: Vec<u64> = breaks_by_scan(&doses, &lags, lo, hi)
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect();
-                    assert_eq!(
-                        got, want,
-                        "({lo}, {hi}), doses = {doses:?}, lags = {lags:?}"
-                    );
+                    let got: Vec<u64> =
+                        index.breaks_within(lo, hi).iter().map(|x| x.to_bits()).collect();
+                    let want: Vec<u64> =
+                        breaks_by_scan(&doses, &lags, lo, hi).iter().map(|x| x.to_bits()).collect();
+                    assert_eq!(got, want, "({lo}, {hi}), doses = {doses:?}, lags = {lags:?}");
                 }
             }
         }
@@ -1780,17 +1666,11 @@ mod dose_index_tests {
                 let ts = probes(&doses, &lags);
                 for _ in 0..40 {
                     let a = ts[rng.below(ts.len() as u64) as usize];
-                    let b = if rng.below(2) == 0 {
-                        a
-                    } else {
-                        ts[rng.below(ts.len() as u64) as usize]
-                    };
+                    let b =
+                        if rng.below(2) == 0 { a } else { ts[rng.below(ts.len() as u64) as usize] };
                     let (lo, hi) = (a.min(b), a.max(b));
                     let near = index.near_moving_points(lo, hi);
-                    assert!(
-                        near.windows(2).all(|w| w[0] < w[1]),
-                        "not ascending: {near:?}"
-                    );
+                    assert!(near.windows(2).all(|w| w[0] < w[1]), "not ascending: {near:?}");
                     for (k, d) in doses.iter().enumerate() {
                         let t_start = d.time + lags[k];
                         let mut points = vec![t_start];
@@ -1819,9 +1699,8 @@ mod dose_index_tests {
     /// inter-dose interval are a handful, not every dose (#2754's `O(n²)`).
     #[test]
     fn one_interval_of_a_long_history_sees_a_handful_of_doses() {
-        let doses: Vec<DoseEvent> = (0..400)
-            .map(|i| DoseEvent::new(12.0 * i as f64, 100.0, 1, 0.0, false, 0.0))
-            .collect();
+        let doses: Vec<DoseEvent> =
+            (0..400).map(|i| DoseEvent::new(12.0 * i as f64, 100.0, 1, 0.0, false, 0.0)).collect();
         let lags = vec![0.75; doses.len()];
         let index = DoseIndex::new(&doses, &lags);
         let near = index.near_moving_points(12.0 * 200.0 + 0.75, 12.0 * 201.0 + 0.75);
@@ -1935,13 +1814,8 @@ ID,TIME,DV,MDV,EVID,AMT,CMT,WT
     /// are not records), and a subject with no record has no seed.
     #[test]
     fn first_record_skips_doses_past_n_doses_and_is_none_without_records() {
-        let mut s = Subject {
-            id: "1".into(),
-            obs_times: vec![1.0],
-            ..Default::default()
-        };
-        s.doses
-            .push(crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
+        let mut s = Subject { id: "1".into(), obs_times: vec![1.0], ..Default::default() };
+        s.doses.push(crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0));
         assert_eq!(first_record(&s, 1), Some(FirstRecord::Dose(0)));
         assert_eq!(first_record(&s, 0), Some(FirstRecord::Obs(0)));
         let empty = Subject::default();
@@ -2038,11 +1912,7 @@ mod tad_referent_tests {
     #[test]
     fn a_seeded_ss_dose_measures_the_pre_arrival_window_from_the_previous_cycles_pulse() {
         let d = ss_dose();
-        assert_eq!(
-            tad(&d, 3.0, 480.0),
-            Some(9.0),
-            "the record sits at phase II - lag"
-        );
+        assert_eq!(tad(&d, 3.0, 480.0), Some(9.0), "the record sits at phase II - lag");
         assert_eq!(tad(&d, 3.0, 481.0), Some(10.0));
         assert_eq!(tad(&d, 3.0, 482.0), Some(11.0));
         // The instant *before* the arrival is a full interval after the previous pulse …
@@ -2053,11 +1923,7 @@ mod tad_referent_tests {
         );
         // … and the arrival itself restarts the cycle.
         assert_eq!(tad(&d, 3.0, 483.0), Some(0.0));
-        assert_eq!(
-            tad(&d, 3.0, 485.0),
-            Some(2.0),
-            "back on the post-arrival fold"
-        );
+        assert_eq!(tad(&d, 3.0, 485.0), Some(2.0), "back on the post-arrival fold");
     }
 
     /// Before the dose **record** an `SS=1` row contributes nothing: `SS=1` establishes steady
@@ -2085,11 +1951,7 @@ mod tad_referent_tests {
         assert_eq!(ss_seed_phase(&d, lag), 0.0, "the clamp itself");
         assert_eq!(tad(&d, lag, 480.0), Some(0.0));
         assert_eq!(tad(&d, lag, 485.0), Some(5.0));
-        assert_eq!(
-            tad(&d, lag, 494.0),
-            Some(14.0),
-            "TAD exceeds II under the clamp"
-        );
+        assert_eq!(tad(&d, lag, 494.0), Some(14.0), "TAD exceeds II under the clamp");
         assert_eq!(tad(&d, lag, 495.0), Some(0.0), "the real arrival");
 
         // What the rejected spelling would have returned, computed here rather than
@@ -2120,11 +1982,7 @@ mod tad_referent_tests {
             "a non-SS dose contributes nothing before it arrives — the referent added by \
              #1126 is gated on `ss_seeded_at_record`"
         );
-        assert_eq!(
-            tad(&d1, 3.0, 27.0),
-            Some(0.0),
-            "…and everything once it does"
-        );
+        assert_eq!(tad(&d1, 3.0, 27.0), Some(0.0), "…and everything once it does");
     }
 
     /// `lag = 0` leaves no window to have a referent for, so the answer is the fold that stood
@@ -2153,11 +2011,7 @@ mod tad_referent_tests {
         // Past the SS arrival it is back on the periodic fold.
         assert_eq!(tad_at(&doses, &[3.0, 3.0], 485.0), 2.0);
         // A short slice means zero lag on the remaining doses, and `&[]` means all of them.
-        assert_eq!(
-            tad_at(&doses, &[3.0], 485.0),
-            5.0,
-            "dose 1 unlagged: pulse at 480"
-        );
+        assert_eq!(tad_at(&doses, &[3.0], 485.0), 5.0, "dose 1 unlagged: pulse at 480");
         assert_eq!(tad_at(&doses, &[], 485.0), 5.0);
         // Nothing has a referent yet.
         assert!(tad_at(&doses, &[3.0, 3.0], -1.0).is_nan());
@@ -2180,10 +2034,7 @@ mod tad_referent_tests {
 
         let d = ss_dose();
         assert_eq!(tad_referent(&d, f64::NAN, 481.0), None, "NaN lag");
-        assert!(
-            tad_referent(&d, 3.0, f64::NAN).is_none(),
-            "NaN observation time"
-        );
+        assert!(tad_referent(&d, 3.0, f64::NAN).is_none(), "NaN observation time");
 
         let mut nan_ii = ss_dose();
         nan_ii.ii = f64::NAN;
@@ -2225,14 +2076,10 @@ mod tad_referent_tests {
             obs_times: vec![0.0, 2.0, 23.9, 24.0, 30.0],
             ..Default::default()
         };
-        let mine: Vec<f64> = subject
-            .obs_times
-            .iter()
-            .map(|&t| super::tad_at(&subject.doses, &[], t))
-            .collect();
-        let theirs: Vec<f64> = (0..subject.obs_times.len())
-            .map(|j| subject.time_after_dose_at_or_before(j))
-            .collect();
+        let mine: Vec<f64> =
+            subject.obs_times.iter().map(|&t| super::tad_at(&subject.doses, &[], t)).collect();
+        let theirs: Vec<f64> =
+            (0..subject.obs_times.len()).map(|j| subject.time_after_dose_at_or_before(j)).collect();
         assert_eq!(
             mine, theirs,
             "the zero-lag fold and the sdtab fallback must agree on every row, including the \
@@ -2240,10 +2087,7 @@ mod tad_referent_tests {
         );
         // The straddle: assert the fixture actually reaches the tie, so this cannot quietly
         // become a comparison of two functions on rows where every spelling agrees.
-        assert_eq!(
-            mine[3], 0.0,
-            "obs@24 takes the dose at 24 — NONMEM record order"
-        );
+        assert_eq!(mine[3], 0.0, "obs@24 takes the dose at 24 — NONMEM record order");
         assert_eq!(
             subject.time_after_dose(3),
             24.0,
@@ -2300,11 +2144,7 @@ mod tad_referent_tests {
         let d = DoseEvent::new(480.0, 100.0, 1, 0.0, true, 0.0);
         assert_eq!(tad_referent(&d, 3.0, 481.0), None, "not yet arrived");
         assert_eq!(tad(&d, 3.0, 483.0), Some(0.0));
-        assert_eq!(
-            tad(&d, 3.0, 500.0),
-            Some(17.0),
-            "no wrap without an interval"
-        );
+        assert_eq!(tad(&d, 3.0, 500.0), Some(17.0), "no wrap without an interval");
     }
 }
 
@@ -2361,9 +2201,7 @@ mod ss_reset_tests {
     /// Indices live at `t`, the observable of the rule.
     fn live(doses: &[DoseEvent], t: f64) -> Vec<usize> {
         let c = ss_reset_cutoff(doses, t);
-        (0..doses.len())
-            .filter(|&k| ss_reset_live(doses, c, k))
-            .collect()
+        (0..doses.len()).filter(|&k| ss_reset_live(doses, c, k)).collect()
     }
 
     #[test]
@@ -2402,17 +2240,9 @@ mod ss_reset_tests {
     #[test]
     fn a_co_timed_dose_is_wiped_before_the_ss_row_and_live_after_it() {
         let row51 = [bolus(10.0), ss(10.0)];
-        assert_eq!(
-            live(&row51, 10.0),
-            vec![1],
-            "row 51: bolus row BEFORE the SS row is wiped"
-        );
+        assert_eq!(live(&row51, 10.0), vec![1], "row 51: bolus row BEFORE the SS row is wiped");
         let row52 = [ss(10.0), bolus(10.0)];
-        assert_eq!(
-            live(&row52, 10.0),
-            vec![0, 1],
-            "row 52: bolus row AFTER the SS row superposes"
-        );
+        assert_eq!(live(&row52, 10.0), vec![0, 1], "row 52: bolus row AFTER the SS row superposes");
     }
 
     #[test]
@@ -2447,10 +2277,7 @@ mod evid_reset_tests {
     fn a_dose_is_live_iff_recorded_at_or_after_the_reset() {
         assert!(evid_reset_live(9.0, f64::NEG_INFINITY), "no reset reached");
         assert!(!evid_reset_live(9.0, 10.0), "recorded before the reset");
-        assert!(
-            evid_reset_live(10.0, 10.0),
-            "recorded at the reset (EVID=4)"
-        );
+        assert!(evid_reset_live(10.0, 10.0), "recorded at the reset (EVID=4)");
         assert!(evid_reset_live(10.001, 10.0), "recorded after the reset");
     }
 }
@@ -2540,11 +2367,7 @@ mod residual_pulse_count_tests {
                 (1e9, 2e9),
                 (-5.0, -1.0),
             ] {
-                let want: Vec<f64> = all
-                    .iter()
-                    .copied()
-                    .filter(|&e| e >= lo && e <= hi)
-                    .collect();
+                let want: Vec<f64> = all.iter().copied().filter(|&e| e >= lo && e <= hi).collect();
                 let got: Vec<f64> = ss_residual_infusion_ends(&d, lag, 1.0, lo, hi).collect();
                 assert_eq!(got, want, "dose {d:?} lag {lag} range [{lo}, {hi}]");
             }
@@ -2625,10 +2448,7 @@ mod zero_order_binding_tests {
             assert!(matches!(lower_zero_order_ss(s, map), Cow::Borrowed(_)));
             assert!(is_lowered_zero_order_ss(map, &s.doses[0]));
         }
-        assert!(matches!(
-            lower_population_zero_order_ss(&bound, map),
-            Cow::Borrowed(_)
-        ));
+        assert!(matches!(lower_population_zero_order_ss(&bound, map), Cow::Borrowed(_)));
         // The data as read is untouched: the lowering is the fit's own.
         assert!(!pop.subjects[0].doses[0].is_infusion());
     }

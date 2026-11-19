@@ -45,17 +45,11 @@ fn tad_at_time(subject: &Subject, t: f64, dose_lagtimes: &[f64]) -> f64 {
 /// pass `&[]`. TAFD is unaffected — measured from the raw first-dose time, not the
 /// lagged arrival.
 pub fn tafd_tad_for_subject(
-    subject: &Subject,
-    obs_idx: usize,
-    dose_lagtimes: &[f64],
+    subject: &Subject, obs_idx: usize, dose_lagtimes: &[f64],
 ) -> (f64, f64) {
     let obs_time = subject.obs_times[obs_idx];
     let first_dose_time = subject.occasion_first_dose_time(obs_time);
-    let tafd = if first_dose_time.is_finite() {
-        obs_time - first_dose_time
-    } else {
-        f64::NAN
-    };
+    let tafd = if first_dose_time.is_finite() { obs_time - first_dose_time } else { f64::NAN };
     let tad = tad_at_time(subject, obs_time, dose_lagtimes);
     (tafd, tad)
 }
@@ -122,11 +116,8 @@ pub(crate) fn is_mixture_class_column(model: &CompiledModel, col: &str) -> bool 
 /// branch on `MIXNUM`, so each subject's columns are evaluated under its own class
 /// guard rather than the class-1 default.
 pub(crate) fn compute_extra_output_columns(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    kappas_per_subject: &[Vec<DVector<f64>>],
-    subjects: &mut [SubjectResult],
+    model: &CompiledModel, population: &Population, theta: &[f64],
+    kappas_per_subject: &[Vec<DVector<f64>>], subjects: &mut [SubjectResult],
     mixest: Option<&[usize]>,
 ) {
     use crate::types::{AggFunction, DerivedContext, DerivedKind, IntegralStep, IntegralWindow};
@@ -148,10 +139,8 @@ pub(crate) fn compute_extra_output_columns(
         // selection exactly so the post-fit derived/diagnostic columns use the
         // same per-occasion kappa as the predictions that drove the fit. Without
         // this the kappa slots silently read 0 for every observation (issue #238).
-        let subj_kappas: &[DVector<f64>] = kappas_per_subject
-            .get(si)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[]);
+        let subj_kappas: &[DVector<f64>] =
+            kappas_per_subject.get(si).map(|v| v.as_slice()).unwrap_or(&[]);
         let layout = crate::stats::stacked_layout::StackedLayout::of(model, subject);
         let combined_for = |occ_id: u32| -> Vec<f64> {
             let mut c = Vec::with_capacity(eta_hat.len() + model.n_kappa);
@@ -210,9 +199,9 @@ pub(crate) fn compute_extra_output_columns(
                     // `ALAG2` leaves at 0 (TAD would then ignore that route's lag).
                     // The analytical engine has one fixed route → the bare lag.
                     match &model.ode_spec {
-                        Some(ode) => ode
-                            .dose_attr_map
-                            .lagtime_for_dose(&subject.doses[d], &pk_d.values),
+                        Some(ode) => {
+                            ode.dose_attr_map.lagtime_for_dose(&subject.doses[d], &pk_d.values)
+                        }
                         None => pk_d.lagtime(),
                     }
                 })
@@ -263,12 +252,7 @@ pub(crate) fn compute_extra_output_columns(
             .map(|s| s.state_names.as_slice())
             .unwrap_or_else(|| model.analytical_compartment_names());
         let per_obs_cmts: Vec<&[f64]> = (0..n_obs)
-            .map(|j| {
-                sr.compartment_states
-                    .get(j)
-                    .map(|v| v.as_slice())
-                    .unwrap_or(&[])
-            })
+            .map(|j| sr.compartment_states.get(j).map(|v| v.as_slice()).unwrap_or(&[]))
             .collect();
 
         // Session infrastructure for EVID=3/4 stacked subjects.
@@ -293,11 +277,7 @@ pub(crate) fn compute_extra_output_columns(
             }
             let shifts: Vec<f64> = groups
                 .iter()
-                .map(|g| {
-                    g.first()
-                        .map(|&j| subject.obs_times[j] - raw_time_of(j))
-                        .unwrap_or(0.0)
-                })
+                .map(|g| g.first().map(|&j| subject.obs_times[j] - raw_time_of(j)).unwrap_or(0.0))
                 .collect();
             (groups, shifts)
         };
@@ -341,17 +321,9 @@ pub(crate) fn compute_extra_output_columns(
         // fitted MIXEST of a fit, the drawn class of a simulation). Written under the
         // canonical name so the sdtab writer recognises it and does not emit its own
         // simulated-class `MIXNUM` column beside it.
-        if model
-            .output_columns
-            .iter()
-            .any(|c| is_mixture_class_column(model, c))
-        {
-            let class = subject
-                .simulated_mixnum
-                .or(mix_class)
-                .map_or(f64::NAN, |k| k as f64);
-            sr.extra_columns
-                .push((MIXNUM_COLUMN.to_string(), vec![class; n_obs]));
+        if model.output_columns.iter().any(|c| is_mixture_class_column(model, c)) {
+            let class = subject.simulated_mixnum.or(mix_class).map_or(f64::NAN, |k| k as f64);
+            sr.extra_columns.push((MIXNUM_COLUMN.to_string(), vec![class; n_obs]));
         }
 
         // [derived] columns, evaluated in declaration order.
@@ -365,10 +337,8 @@ pub(crate) fn compute_extra_output_columns(
             let col_vals: Vec<f64> = match &spec.kind {
                 DerivedKind::PerRow { eval } => (0..n_obs)
                     .map(|j| {
-                        let row_prev: HashMap<String, f64> = prev_derived_vecs
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v[j]))
-                            .collect();
+                        let row_prev: HashMap<String, f64> =
+                            prev_derived_vecs.iter().map(|(k, v)| (k.clone(), v[j])).collect();
                         let ctx = DerivedContext {
                             theta,
                             eta: &per_obs_eta_full[j],
@@ -388,17 +358,11 @@ pub(crate) fn compute_extra_output_columns(
                     })
                     .collect(),
 
-                DerivedKind::Aggregate {
-                    func,
-                    value,
-                    filter,
-                } => {
+                DerivedKind::Aggregate { func, value, filter } => {
                     let mut qualifying: Vec<(usize, f64)> = Vec::new();
                     for j in 0..n_obs {
-                        let row_prev: HashMap<String, f64> = prev_derived_vecs
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v[j]))
-                            .collect();
+                        let row_prev: HashMap<String, f64> =
+                            prev_derived_vecs.iter().map(|(k, v)| (k.clone(), v[j])).collect();
                         let ctx = DerivedContext {
                             theta,
                             eta: &per_obs_eta_full[j],
@@ -423,14 +387,12 @@ pub(crate) fn compute_extra_output_columns(
                         f64::NAN
                     } else {
                         match func {
-                            AggFunction::Max => qualifying
-                                .iter()
-                                .map(|(_, v)| *v)
-                                .fold(f64::NEG_INFINITY, f64::max),
-                            AggFunction::Min => qualifying
-                                .iter()
-                                .map(|(_, v)| *v)
-                                .fold(f64::INFINITY, f64::min),
+                            AggFunction::Max => {
+                                qualifying.iter().map(|(_, v)| *v).fold(f64::NEG_INFINITY, f64::max)
+                            }
+                            AggFunction::Min => {
+                                qualifying.iter().map(|(_, v)| *v).fold(f64::INFINITY, f64::min)
+                            }
                             AggFunction::Tmax => {
                                 // Time of maximum value; raw_time_of returns dataset
                                 // TIME so the sdtab column reflects the user's clock.
@@ -516,9 +478,7 @@ pub(crate) fn compute_extra_output_columns(
                         session_obs
                             .iter()
                             .map(|g| {
-                                g.first()
-                                    .map(|&j| per_obs_cov[j])
-                                    .unwrap_or(&subject.covariates)
+                                g.first().map(|&j| per_obs_cov[j]).unwrap_or(&subject.covariates)
                             })
                             .collect()
                     };
@@ -545,9 +505,7 @@ pub(crate) fn compute_extra_output_columns(
                         session_obs
                             .iter()
                             .map(|g| {
-                                g.first()
-                                    .map(|&j| per_obs_indiv[j].clone())
-                                    .unwrap_or_default()
+                                g.first().map(|&j| per_obs_indiv[j].clone()).unwrap_or_default()
                             })
                             .collect()
                     };
@@ -812,11 +770,8 @@ pub(crate) fn compute_extra_output_columns(
                     // crossing into the next session.
                     let session_grid_window =
                         |s: usize, from_raw: f64, to_raw: f64| -> Option<(f64, f64)> {
-                            let reset_start = if s == 0 {
-                                f64::NEG_INFINITY
-                            } else {
-                                subject.reset_times[s - 1]
-                            };
+                            let reset_start =
+                                if s == 0 { f64::NEG_INFINITY } else { subject.reset_times[s - 1] };
                             let reset_end =
                                 subject.reset_times.get(s).copied().unwrap_or(f64::INFINITY);
                             let from_sh = (from_raw + session_shift[s]).max(reset_start);

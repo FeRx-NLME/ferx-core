@@ -261,11 +261,7 @@ fn full_rank_vi_is_exact_on_a_linear_gaussian_model() {
         })
         .collect();
 
-    let exact: f64 = pop
-        .subjects
-        .iter()
-        .map(|s| exact_neg_two_log_marginal(&s.observations))
-        .sum();
+    let exact: f64 = pop.subjects.iter().map(|s| exact_neg_two_log_marginal(&s.observations)).sum();
 
     let cfg = ElboConfig {
         // Large enough that the MC error on the quadratic data term is well under the
@@ -388,13 +384,9 @@ fn closed_form_omega_matches_the_exact_posterior_moments() {
         .collect();
     expected /= pop.subjects.len() as f64;
 
-    let omega = closed_form_omega(
-        Families::Uniform(&family),
-        &phis,
-        &vec![0usize; phis.len()],
-        &template,
-    )
-    .0;
+    let omega =
+        closed_form_omega(Families::Uniform(&family), &phis, &vec![0usize; phis.len()], &template)
+            .0;
     let got = omega.matrix[(0, 0)];
     assert!(
         (got - expected).abs() < 1e-12,
@@ -562,10 +554,7 @@ fn iov_predict(model: &CompiledModel, subject: &Subject, theta: &[f64], z: &[f64
 /// true design matrix, not an approximation — which is what lets the closed forms below
 /// be exact rather than FD-accurate.
 fn measure_iov_design(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    d: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], d: usize,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let n = subject.obs_times.len();
     let zero = vec![0.0; d];
@@ -606,10 +595,7 @@ fn stacked_prior(d: usize) -> DMatrix<f64> {
 /// Exact Gaussian posterior over the stacked vector: `S = (AᵀA/σ² + Σ_b⁻¹)⁻¹`,
 /// `μ = S·Aᵀr/σ²`.
 fn exact_iov_posterior(
-    c: &[f64],
-    a: &[Vec<f64>],
-    obs: &[f64],
-    d: usize,
+    c: &[f64], a: &[Vec<f64>], obs: &[f64], d: usize,
 ) -> (DVector<f64>, DMatrix<f64>) {
     let s2 = SIGMA * SIGMA;
     let n = obs.len();
@@ -617,12 +603,8 @@ fn exact_iov_posterior(
     let r = DVector::from_fn(n, |i, _| obs[i] - c[i]);
 
     let prec = amat.transpose() * &amat / s2
-        + stacked_prior(d)
-            .try_inverse()
-            .expect("block-diagonal prior is invertible");
-    let cov = prec
-        .try_inverse()
-        .expect("posterior precision is invertible");
+        + stacked_prior(d).try_inverse().expect("block-diagonal prior is invertible");
+    let cov = prec.try_inverse().expect("posterior precision is invertible");
     let mean = &cov * (amat.transpose() * r) / s2;
     (mean, cov)
 }
@@ -644,11 +626,7 @@ fn exact_iov_neg_two_log_marginal(c: &[f64], a: &[Vec<f64>], obs: &[f64], d: usi
 /// `φ` for a `d`-dimensional [`FullRank`]: `[μ | vech(L)]`, diagonal stored as `log`.
 fn full_rank_phi_nd(mean: &DVector<f64>, cov: &DMatrix<f64>) -> Vec<f64> {
     let d = mean.len();
-    let l = cov
-        .clone()
-        .cholesky()
-        .expect("posterior covariance is PD")
-        .l();
+    let l = cov.clone().cholesky().expect("posterior covariance is PD").l();
     let mut phi = vec![0.0; d + n_tril(d)];
     phi[..d].copy_from_slice(mean.as_slice());
     for i in 0..d {
@@ -694,11 +672,7 @@ fn iov_oracle_model_is_affine_in_the_stacked_random_effects() {
     // η acts on every observation; each κ acts only from its own occasion onward, so a
     // first-occasion observation must be completely insensitive to κ₂.
     for (k, &occ) in IOV_OCCASIONS.iter().enumerate() {
-        assert!(
-            a[k][0].abs() > 1e-9,
-            "obs {k} must respond to the BSV eta, got {:.3e}",
-            a[k][0]
-        );
+        assert!(a[k][0].abs() > 1e-9, "obs {k} must respond to the BSV eta, got {:.3e}", a[k][0]);
         if occ == 1 {
             assert!(
                 a[k][2].abs() < 1e-12,
@@ -925,11 +899,7 @@ fn agq_marginal_matches_the_exact_linear_gaussian_marginal() {
         .collect();
     let kappas: Vec<Vec<nalgebra::DVector<f64>>> = vec![Vec::new(); pop.subjects.len()];
 
-    let exact: f64 = pop
-        .subjects
-        .iter()
-        .map(|s| exact_neg_two_log_marginal(&s.observations))
-        .sum();
+    let exact: f64 = pop.subjects.iter().map(|s| exact_neg_two_log_marginal(&s.observations)).sum();
 
     let agq_at = |n_nodes: usize| {
         2.0 * crate::estimation::agq::agq_population_nll(

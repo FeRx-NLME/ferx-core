@@ -48,11 +48,7 @@ pub(crate) fn undeclared_random_effect_message(names: &[&str]) -> String {
          random effects at all is valid (#989): to make it fixed-effects-only, drop the \
          `exp({})` term as well as the omega line.",
         names.join(", "),
-        if names.len() == 1 {
-            "a random effect"
-        } else {
-            "random effects"
-        },
+        if names.len() == 1 { "a random effect" } else { "random effects" },
         if names.len() == 1 { "it" } else { "them" },
         names[0],
         names[0],
@@ -96,12 +92,9 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
     let mut diags = Vec::new();
     if !eta_shaped.is_empty() {
         diags.push(
-            Diagnostic::error(
-                "E_ETA_NOT_DECLARED",
-                undeclared_random_effect_message(&eta_shaped),
-            )
-            .with_block("parameters")
-            .with_suggestion(format!("declare `omega {} ~ <variance>`", eta_shaped[0])),
+            Diagnostic::error("E_ETA_NOT_DECLARED", undeclared_random_effect_message(&eta_shaped))
+                .with_block("parameters")
+                .with_suggestion(format!("declare `omega {} ~ <variance>`", eta_shaped[0])),
         );
     }
 
@@ -168,11 +161,8 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
     // is among the missing (#1028). Appended only in that case, so the historical
     // message text is byte-for-byte unchanged for every ordinary covariate.
     const ODE_ONLY_BUILTINS: &[&str] = &["TAFD", "TAD", "MACHEPS"];
-    let builtin_shaped: Vec<&str> = plain
-        .iter()
-        .copied()
-        .filter(|n| ODE_ONLY_BUILTINS.contains(n))
-        .collect();
+    let builtin_shaped: Vec<&str> =
+        plain.iter().copied().filter(|n| ODE_ONLY_BUILTINS.contains(n)).collect();
     let builtin_hint = if builtin_shaped.is_empty() {
         String::new()
     } else {
@@ -183,11 +173,7 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
              the name is an ordinary covariate and must be a data column. Compute it as \
              an `[odes]` intermediate and read that state instead.",
             builtin_shaped.join(", "),
-            if builtin_shaped.len() == 1 {
-                "is"
-            } else {
-                "are"
-            },
+            if builtin_shaped.len() == 1 { "is" } else { "are" },
         )
     };
     Diagnostic::error(
@@ -301,9 +287,7 @@ pub(crate) enum LevelDataEntry {
 ///
 /// A population is refused, never re-indexed (the check reads `&Population`).
 pub(crate) fn check_level_index_columns(
-    model: &CompiledModel,
-    population: &Population,
-    entry: LevelDataEntry,
+    model: &CompiledModel, population: &Population, entry: LevelDataEntry,
 ) -> Vec<Diagnostic> {
     let binder = match entry {
         LevelDataEntry::Run | LevelDataEntry::PostHoc => {
@@ -335,11 +319,7 @@ pub(crate) fn check_level_index_columns(
                          it, so its records carry no index into the block's levels. {binder}"
                     ),
                 ),
-                LevelIndexFinding::SomeSubjectsUnbound {
-                    unbound,
-                    of,
-                    first_id,
-                } => (
+                LevelIndexFinding::SomeSubjectsUnbound { unbound, of, first_id } => (
                     "E_THETA_LEVELS_DATA_UNBOUND",
                     format!(
                         "`theta {name}[...]` is bound, but {unbound} of {of} subjects in this \
@@ -373,21 +353,11 @@ pub(crate) fn check_level_index_columns(
                              other levels: it has {} level(s) the model's block does not: {}. \
                              The θ being run has no value for them. {remedy}",
                             labels.len(),
-                            labels
-                                .iter()
-                                .map(|l| format!("`{l}`"))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            labels.iter().map(|l| format!("`{l}`")).collect::<Vec<_>>().join(", ")
                         ),
                     )
                 }
-                LevelIndexFinding::Misindexed {
-                    id,
-                    time,
-                    label,
-                    want,
-                    got,
-                } => {
+                LevelIndexFinding::Misindexed { id, time, label, want, got } => {
                     let got = match got {
                         Some(g) => format!("its index says {g}"),
                         None => "it carries no index".to_string(),
@@ -560,9 +530,8 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
     // has nothing to report whatever the data holds, so the population walk below never
     // runs for it. Not a fast path that hides the logic behind it: every fixture in
     // `per_cmt_unmatched_tests` declares a map and passes straight through this.
-    let declared: Vec<(&'static str, &'static str, BTreeSet<usize>)> = CmtConsumer::iter()
-        .filter_map(|c| c.declared_cmts(model))
-        .collect();
+    let declared: Vec<(&'static str, &'static str, BTreeSet<usize>)> =
+        CmtConsumer::iter().filter_map(|c| c.declared_cmts(model)).collect();
     if declared.is_empty() {
         return Vec::new();
     }
@@ -616,10 +585,7 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
     // residual: the reader also raises `W_CMT_DEFAULTED` when only *dose* rows were
     // defaulted (`cmt_defaults.record_dose`), so this is slightly broader than
     // "observations were defaulted"; splitting that is a reader-side change.
-    let cmt_defaulted = population
-        .warnings
-        .iter()
-        .any(|w| w.starts_with("W_CMT_DEFAULTED"));
+    let cmt_defaulted = population.warnings.iter().any(|w| w.starts_with("W_CMT_DEFAULTED"));
     let advice = if cmt_defaulted {
         "The usual cause is on the data side: a missing or mis-mapped CMT column keys \
          every observation to compartment 1. Check the CMT column, or delete the unused \
@@ -646,11 +612,8 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         // than merely plausible: a compartment is unmatched only when *no* scored
         // observation on it survived, so one the filter also touched is one the filter
         // emptied.
-        let blamed: Vec<usize> = unmatched
-            .iter()
-            .copied()
-            .filter(|c| filtered_cmts.contains(c))
-            .collect();
+        let blamed: Vec<usize> =
+            unmatched.iter().copied().filter(|c| filtered_cmts.contains(c)).collect();
         // What the note may claim is bounded by what `obs_cmts_excluded` records: the
         // compartments of rows the reader *classified* as observations when the filter
         // removed them (the bucket `n_obs_excluded` counts). That is **not**
@@ -665,11 +628,7 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
         // implementation). So the field records what it can see and the sentence claims
         // only the intersection, without which `ignore = CMT == 3` was named as the cause of
         // a dead `[CMT=2]` entry.
-        let entries = if blamed.len() == 1 {
-            "that entry"
-        } else {
-            "those entries"
-        };
+        let entries = if blamed.len() == 1 { "that entry" } else { "those entries" };
         let filter_note = if blamed.is_empty() {
             String::new()
         } else {
@@ -696,11 +655,7 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
                      nothing dispatches to them.{filter_note}{}",
                     join_cmts(&unmatched),
                     join_cmts(&observed.iter().copied().collect::<Vec<_>>()),
-                    if advice_applies {
-                        format!(" {advice}")
-                    } else {
-                        String::new()
-                    },
+                    if advice_applies { format!(" {advice}") } else { String::new() },
                 ),
             )
             .with_block(block),
@@ -712,10 +667,7 @@ fn check_per_cmt_unmatched(model: &CompiledModel, population: &Population) -> Ve
 /// `[2, 3]` as `2, 3` — the compartment lists in [`check_per_cmt_unmatched`]'s message,
 /// without `Vec`'s `Debug` brackets.
 fn join_cmts(cmts: &[usize]) -> String {
-    cmts.iter()
-        .map(|c| c.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+    cmts.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
 }
 
 /// Per-CMT (multi-endpoint) error models: every observed CMT must have a
@@ -768,9 +720,7 @@ fn check_per_cmt_error_model(model: &CompiledModel, population: &Population) -> 
 /// DV-code validation. A no-op without the `survival` feature.
 #[cfg(feature = "survival")]
 pub(crate) fn check_endpoint_routing(
-    model: &CompiledModel,
-    population: &Population,
-    require_records: bool,
+    model: &CompiledModel, population: &Population, require_records: bool,
 ) -> Vec<Diagnostic> {
     use crate::types::{EndpointLikelihood, ObsRecord};
     use std::collections::BTreeMap;
@@ -794,11 +744,8 @@ pub(crate) fn check_endpoint_routing(
             EndpointLikelihood::Gaussian(_) => None,
         }
     };
-    let endpoints: BTreeMap<usize, (&'static str, &'static str)> = model
-        .endpoints
-        .iter()
-        .filter_map(|(&cmt, ep)| kind_of(ep).map(|k| (cmt, k)))
-        .collect();
+    let endpoints: BTreeMap<usize, (&'static str, &'static str)> =
+        model.endpoints.iter().filter_map(|(&cmt, ep)| kind_of(ep).map(|k| (cmt, k))).collect();
     if endpoints.is_empty() {
         return Vec::new();
     }
@@ -836,10 +783,7 @@ pub(crate) fn check_endpoint_routing(
     for subj in &population.subjects {
         for &cmt in &subj.obs_cmts {
             if endpoints.contains_key(&cmt) {
-                unrouted
-                    .entry(cmt)
-                    .or_insert_with(|| (subj.id.clone(), 0))
-                    .1 += 1;
+                unrouted.entry(cmt).or_insert_with(|| (subj.id.clone(), 0)).1 += 1;
             }
         }
     }
@@ -898,11 +842,7 @@ pub(crate) fn check_endpoint_routing(
         // one pass over the records: cmt -> routed rows, of any kind — a CMT whose records
         // are all of the wrong kind has its own, more precise, error above
         let mut routed: BTreeMap<usize, usize> = BTreeMap::new();
-        for r in population
-            .subjects
-            .iter()
-            .flat_map(|s| s.obs_records.iter())
-        {
+        for r in population.subjects.iter().flat_map(|s| s.obs_records.iter()) {
             *routed.entry(r.cmt()).or_insert(0) += 1;
         }
         for (&cmt, &(kind, block)) in &endpoints {
@@ -932,9 +872,7 @@ pub(crate) fn check_endpoint_routing(
 /// See the `survival` twin; no non-Gaussian endpoint exists on this build.
 #[cfg(not(feature = "survival"))]
 pub(crate) fn check_endpoint_routing(
-    _model: &CompiledModel,
-    _population: &Population,
-    _require_records: bool,
+    _model: &CompiledModel, _population: &Population, _require_records: bool,
 ) -> Vec<Diagnostic> {
     Vec::new()
 }
@@ -948,8 +886,7 @@ pub(crate) fn check_endpoint_routing(
 /// non-finite value poisons the OFV, a negative one squares to its absolute value.
 /// Typical cause: a missing cell in the weight column (MBMA arm with no reported SE).
 pub(crate) fn check_residual_magnitude(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     if !model.has_custom_ruv_magnitude() {
         return Vec::new();
@@ -968,8 +905,7 @@ pub(crate) fn check_residual_magnitude(
 /// `MIXNUM`: the fit scores every class, and a simulation runs each subject under the class
 /// it draws, so a check at the class-1 default alone passes a class that then degenerates.
 pub(crate) fn under_each_mixture_class<T>(
-    model: &CompiledModel,
-    mut check: impl FnMut(Option<usize>) -> Option<T>,
+    model: &CompiledModel, mut check: impl FnMut(Option<usize>) -> Option<T>,
 ) -> Option<T> {
     match model.mixture.as_ref() {
         Some(spec) => (1..=spec.n_classes).find_map(|class| {
@@ -983,17 +919,13 @@ pub(crate) fn under_each_mixture_class<T>(
 /// `" under mixture class {c}"` for a class [`under_each_mixture_class`] ran under, `""`
 /// otherwise: the suffix a message names the class with.
 fn mixture_class_suffix(class: Option<usize>) -> String {
-    class
-        .map(|c| format!(" under mixture class {c}"))
-        .unwrap_or_default()
+    class.map(|c| format!(" under mixture class {c}")).unwrap_or_default()
 }
 
 /// [`check_residual_magnitude`] under the `MIXNUM` the caller holds; `class` (1-based) is
 /// named in the message when it is `Some`.
 fn residual_magnitude_at_class(
-    model: &CompiledModel,
-    population: &Population,
-    class: Option<usize>,
+    model: &CompiledModel, population: &Population, class: Option<usize>,
 ) -> Vec<Diagnostic> {
     let at_class = mixture_class_suffix(class);
     let theta = &model.default_params.theta;
@@ -1060,8 +992,7 @@ fn residual_magnitude_at_class(
 /// [`check_kappa_weight_variation`]. They are separate walks so neither caller pays
 /// for the other's work.
 pub(crate) fn check_unbound_theta_levels(
-    model: &CompiledModel,
-    entry: UnboundLevelsEntry,
+    model: &CompiledModel, entry: UnboundLevelsEntry,
 ) -> Vec<Diagnostic> {
     let unbound = model.theta_blocks().unbound_level_blocks();
     // `fit()`'s refusal names every unbound block in one message, with the way out
@@ -1140,13 +1071,10 @@ pub(crate) fn check_unbound_theta_levels(
 /// advice is `suggestion()` only (#1746 review r1 #6). `entry` is the name the
 /// suggestion gives the refusing entry (#1763).
 pub(crate) fn unbound_level_refusal(
-    model: &CompiledModel,
-    entry: &'static str,
+    model: &CompiledModel, entry: &'static str,
 ) -> Result<(), crate::diagnostics::EngineError> {
     match check_unbound_theta_levels(model, UnboundLevelsEntry::Predict(entry)).first() {
-        Some(d) => Err(crate::diagnostics::EngineError::with_suggestion_in_display(
-            d.clone(),
-        )),
+        Some(d) => Err(crate::diagnostics::EngineError::with_suggestion_in_display(d.clone())),
         None => Ok(()),
     }
 }
@@ -1176,8 +1104,7 @@ pub(crate) enum UnboundLevelsEntry {
 /// index (`PLACEBO[2 * K]`) falls back to the NaN guard. At most one diagnostic per
 /// (block, subject).
 pub(crate) fn check_theta_gather_indices(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     if model.theta_blocks().is_empty() {
         return Vec::new();
@@ -1193,18 +1120,14 @@ pub(crate) fn check_theta_gather_indices(
             // `[count_model]` mean reads the index from each record's own snapshot (#2562,
             // #2877).
             let snaps = subj.record_covariate_snapshots();
-            let records = subj
-                .obs_records
-                .iter()
-                .enumerate()
-                .filter_map(|(r, rec)| match rec {
-                    crate::types::ObsRecord::DiscreteState { raw_time, .. }
-                    | crate::types::ObsRecord::Count { raw_time, .. } => {
-                        Some((*raw_time, subj.record_cov(snaps, r)))
-                    }
-                    #[cfg(feature = "survival")]
-                    crate::types::ObsRecord::Event { .. } => None,
-                });
+            let records = subj.obs_records.iter().enumerate().filter_map(|(r, rec)| match rec {
+                crate::types::ObsRecord::DiscreteState { raw_time, .. }
+                | crate::types::ObsRecord::Count { raw_time, .. } => {
+                    Some((*raw_time, subj.record_cov(snaps, r)))
+                }
+                #[cfg(feature = "survival")]
+                crate::types::ObsRecord::Event { .. } => None,
+            });
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
                 .chain((0..subj.doses.len()).map(|d| (subj.dose_param_time(d), subj.dose_cov(d))))
@@ -1256,8 +1179,7 @@ pub(crate) fn check_theta_gather_indices(
 }
 
 pub(crate) fn check_kappa_weights(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     if !model.has_weighted_kappa() {
         return Vec::new();
@@ -1265,11 +1187,7 @@ pub(crate) fn check_kappa_weights(
     let theta = &model.default_params.theta;
     for (k, weight) in model.kappa_weights.iter().enumerate() {
         let Some(weight) = weight else { continue };
-        let name = model
-            .kappa_names
-            .get(k)
-            .map(String::as_str)
-            .unwrap_or("<kappa>");
+        let name = model.kappa_names.get(k).map(String::as_str).unwrap_or("<kappa>");
         for subj in &population.subjects {
             for j in 0..subj.obs_times.len() {
                 // Evaluated and reported at the TIME as written, as the individual
@@ -1336,11 +1254,7 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
     let mut diags = Vec::new();
     for (k, weight) in model.kappa_weights.iter().enumerate() {
         let Some(weight) = weight else { continue };
-        let name = model
-            .kappa_names
-            .get(k)
-            .map(String::as_str)
-            .unwrap_or("<kappa>");
+        let name = model.kappa_names.get(k).map(String::as_str).unwrap_or("<kappa>");
         // One variation warning per kappa — the condition is a property of the
         // dataset's shape, so repeating it per subject-occasion is noise.
         'kappa: for subj in &population.subjects {
@@ -1358,11 +1272,8 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
                     .map(|(occ, idx)| (format!("occasion {occ}"), idx))
                     .collect(),
             };
-            let drawn_per = if model.has_nested_levels() {
-                "group of its level"
-            } else {
-                "occasion"
-            };
+            let drawn_per =
+                if model.has_nested_levels() { "group of its level" } else { "occasion" };
             for (occ, obs_idx) in groups {
                 let mut seen: Option<f64> = None;
                 for &j in &obs_idx {
@@ -1416,9 +1327,7 @@ fn check_kappa_weight_variation(model: &CompiledModel, population: &Population) 
 /// consumes the resolved compartment that lives on [`FitOptions`] (#1409). Callers
 /// pass the options the read will use.
 pub(crate) fn reader_warning_suppressed(
-    model: &CompiledModel,
-    options: &FitOptions,
-    warning: &str,
+    model: &CompiledModel, options: &FitOptions, warning: &str,
 ) -> bool {
     if warning.starts_with("W_CMT_DEFAULTED") {
         // A summary that reports rows a `CMT`-reading `[data_selection]` rule DELETED
@@ -1549,10 +1458,7 @@ impl CmtConsumer {
             // one. #1404 round 2 inspected only the second.
             CmtConsumer::PerCmtReadout => {
                 model.ode_spec.as_ref().is_some_and(|s| per_cmt(&s.readout))
-                    || model
-                        .analytic_readout
-                        .as_ref()
-                        .is_some_and(|ar| per_cmt(&ar.readout))
+                    || model.analytic_readout.as_ref().is_some_and(|ar| per_cmt(&ar.readout))
             }
             CmtConsumer::EndpointRouting => crate::api::run::model_routes_rows_by_cmt(model),
             CmtConsumer::DataSelectionFilter => data_selection_reads_cmt(options),
@@ -1575,13 +1481,8 @@ impl CmtConsumer {
     /// gives an empty difference), pinned by
     /// `declared_cmts_is_some_exactly_when_the_channel_is_live`.
     pub(crate) fn declared_cmts(
-        self,
-        model: &CompiledModel,
-    ) -> Option<(
-        &'static str,
-        &'static str,
-        std::collections::BTreeSet<usize>,
-    )> {
+        self, model: &CompiledModel,
+    ) -> Option<(&'static str, &'static str, std::collections::BTreeSet<usize>)> {
         use std::collections::BTreeSet;
         // The `[block]` the entry is written in travels with the syntax rather than
         // being re-derived by the caller. `check_per_cmt_unmatched` first picked it
@@ -1598,19 +1499,15 @@ impl CmtConsumer {
             // dose to a compartment the model does not have — is `check_dose_compartments`.
             CmtConsumer::DoseCompartment => None,
             CmtConsumer::PerCmtScaling => match &model.scaling {
-                ScalingSpec::PerCmt(map) => keys(
-                    map.keys().copied().collect(),
-                    "[scaling] obs_scale[CMT=N]",
-                    "scaling",
-                ),
+                ScalingSpec::PerCmt(map) => {
+                    keys(map.keys().copied().collect(), "[scaling] obs_scale[CMT=N]", "scaling")
+                }
                 _ => None,
             },
             CmtConsumer::PerCmtErrorModel => match &model.error_spec {
-                ErrorSpec::PerCmt(map) => keys(
-                    map.keys().copied().collect(),
-                    "[error_model] CMT=N:",
-                    "error_model",
-                ),
+                ErrorSpec::PerCmt(map) => {
+                    keys(map.keys().copied().collect(), "[error_model] CMT=N:", "error_model")
+                }
                 _ => None,
             },
             // Both readout structs, unioned — `OdeReadout::PerCmt` is dispatched from
@@ -1754,17 +1651,12 @@ pub(crate) fn model_scores_gaussian_observations(model: &CompiledModel) -> bool 
 /// produce plots. Ordered covariates-first so the first error reported by existing
 /// callers is unchanged.
 pub(crate) fn check_simulation_data(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     let mut diags = check_unbound_theta_levels(model, UnboundLevelsEntry::Simulate);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
-    diags.extend(check_level_index_columns(
-        model,
-        population,
-        LevelDataEntry::Run,
-    ));
+    diags.extend(check_level_index_columns(model, population, LevelDataEntry::Run));
     diags.extend(check_covariates(model, population));
     // Unrouted half only: a design template has no event rows by construction. An
     // unrouted template would otherwise simulate *no* events (the TTE draw is keyed
@@ -1793,9 +1685,7 @@ pub fn check_model_data(model: &CompiledModel, population: &Population) -> Vec<D
 /// `E_IOV_MISSING_OCC` check can be skipped when `iov_occasion` will derive the
 /// labels at fit time. Used by `fit()` and the `ferx check` path.
 pub fn check_model_data_rule(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
     check_model_data_rule_at(model, population, iov_rule, &model.default_params)
 }
@@ -1806,19 +1696,13 @@ pub fn check_model_data_rule(
 /// caller (ferx-r, `--inits-from-nca`) may have replaced — the reason
 /// `check_variance_init_rails` reads them too (#1229).
 pub(crate) fn check_model_data_rule_at(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
     params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     let mut diags = check_finite_observations(population);
     diags.extend(check_covariate_model_bound(model));
     diags.extend(check_covariate_levels(model, population));
-    diags.extend(check_level_index_columns(
-        model,
-        population,
-        LevelDataEntry::Fit,
-    ));
+    diags.extend(check_level_index_columns(model, population, LevelDataEntry::Fit));
     diags.extend(check_covariates(model, population));
     // Before the per-CMT checks: an unrouted endpoint CMT would otherwise surface as
     // `E_PER_CMT_ERROR_MODEL` ("CMT 3 has no error model") and name the wrong cause.
@@ -1871,12 +1755,7 @@ pub(crate) fn check_model_data_rule_at(
 /// `code`: the registry test finds an informational code by the literal there, and checks
 /// the docs' `info` severity column against it (#2387).
 pub(crate) fn check_ode_rhs_route(model: &CompiledModel) -> Option<Diagnostic> {
-    let (code, msg, _) = model
-        .ode_spec
-        .as_ref()?
-        .rhs_program
-        .as_ref()?
-        .route_note()?;
+    let (code, msg, _) = model.ode_spec.as_ref()?.rhs_program.as_ref()?.route_note()?;
     let d = if code == "W_ODE_RHS_NOT_NATIVE" {
         Diagnostic::info("W_ODE_RHS_NOT_NATIVE", msg)
     } else {
@@ -1897,9 +1776,7 @@ pub(crate) fn check_ode_rhs_route(model: &CompiledModel) -> Option<Diagnostic> {
 /// as the fit would count it. A model with nested levels is left alone: its groups are
 /// its level cells, and `check_nested_levels` refuses a derived rule on one.
 fn check_single_derived_occasion(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
     if model.n_kappa == 0 || *iov_rule == IovOccasionRule::Column || model.has_nested_levels() {
         return Vec::new();
@@ -1933,11 +1810,8 @@ fn check_single_derived_occasion(
 /// #1405), so it says what the filter removed, not that it removed every *scored*
 /// observation.
 fn check_scored_observations(population: &Population) -> Vec<Diagnostic> {
-    let n_scored: usize = population
-        .subjects
-        .iter()
-        .map(|s| s.observations.len() + s.obs_records.len())
-        .sum();
+    let n_scored: usize =
+        population.subjects.iter().map(|s| s.observations.len() + s.obs_records.len()).sum();
     if n_scored > 0 {
         return Vec::new();
     }
@@ -1948,11 +1822,7 @@ fn check_scored_observations(population: &Population) -> Vec<Diagnostic> {
          value except under a prior or a regularization penalty.",
         population.subjects.len()
     );
-    let cause = match population
-        .exclusions
-        .as_ref()
-        .filter(|x| x.n_obs_excluded > 0)
-    {
+    let cause = match population.exclusions.as_ref().filter(|x| x.n_obs_excluded > 0) {
         Some(x) => format!(
             "`[data_selection]` removed {} row(s) classed as observations and {} subject(s) \
              entirely; check its `ignore` / `accept` clauses.",
@@ -1963,10 +1833,7 @@ fn check_scored_observations(population: &Population) -> Vec<Diagnostic> {
                  row is skipped), or when it is routed to a declared endpoint."
             .to_string(),
     };
-    vec![Diagnostic::error(
-        "E_NO_SCORED_OBSERVATIONS",
-        format!("{count} {cause}"),
-    )]
+    vec![Diagnostic::error("E_NO_SCORED_OBSERVATIONS", format!("{count} {cause}"))]
 }
 
 /// Every scored observation must be a finite number.
@@ -1981,18 +1848,12 @@ fn check_scored_observations(population: &Population) -> Vec<Diagnostic> {
 /// (#957), which keeps a missing `DV` as a `NaN` design point. A hand-built
 /// `Population` with a `NaN` DV is caught the same way.
 fn check_finite_observations(population: &Population) -> Vec<Diagnostic> {
-    let Some(subject) = population
-        .subjects
-        .iter()
-        .find(|s| s.observations.iter().any(|v| !v.is_finite()))
+    let Some(subject) =
+        population.subjects.iter().find(|s| s.observations.iter().any(|v| !v.is_finite()))
     else {
         return Vec::new();
     };
-    let n_bad = subject
-        .observations
-        .iter()
-        .filter(|v| !v.is_finite())
-        .count();
+    let n_bad = subject.observations.iter().filter(|v| !v.is_finite()).count();
     vec![Diagnostic::error(
         "E_NONFINITE_DV",
         format!(
@@ -2015,9 +1876,7 @@ fn check_finite_observations(population: &Population) -> Vec<Diagnostic> {
 /// When `n_kappa > 0` but every subject has an empty `occasions` vector the kappa
 /// random effects are silently ignored.
 fn iov_occasions_missing(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
 ) -> bool {
     // A model-side occasion rule (`iov_occasion = dose | time(...)`) populates the
     // occasion labels at fit time from each subject's timeline, so the dataset need
@@ -2037,9 +1896,7 @@ fn iov_occasions_missing(
 /// IOV models require occasion labels in the dataset — catch their absence early
 /// instead of silently ignoring the kappas.
 fn check_iov_occasions(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
     if !iov_occasions_missing(model, population, iov_rule) {
         return Vec::new();
@@ -2059,8 +1916,7 @@ fn check_iov_occasions(
 /// chokepoint (#1082 PR4), which groups the κ draw by those labels and needs nothing
 /// else `check_nested_levels` asks of a fit.
 pub(crate) fn check_level_labels(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     use crate::stats::nested_levels::{record_paths, RecordKind};
     let Some(levels) = model.nested_levels() else {
@@ -2079,11 +1935,9 @@ pub(crate) fn check_level_labels(
                     subj.pk_only_cov(i),
                     subj.param_time_pk_only(i),
                 ),
-                RecordKind::Reset => (
-                    "reset (EVID=3/4)",
-                    subj.reset_cov(i),
-                    subj.param_time_at(subj.reset_times[i]),
-                ),
+                RecordKind::Reset => {
+                    ("reset (EVID=3/4)", subj.reset_cov(i), subj.param_time_at(subj.reset_times[i]))
+                }
             };
             let level = levels
                 .levels
@@ -2231,8 +2085,7 @@ fn check_nested_levels(model: &CompiledModel, population: &Population) -> Vec<Di
 /// is reported while a label is missing (`E_LEVEL_MISSING_LABEL`). `ferx check --data`
 /// only: `fit()` does not record it.
 pub(crate) fn check_level_summary(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     use crate::stats::nested_levels::label_path;
     use std::collections::{HashMap, HashSet};
@@ -2290,10 +2143,7 @@ pub(crate) fn check_level_summary(
             format!("every {parent_one} holds a single `{}` group", level.name)
         } else {
             let verb = if singles == 1 { "holds" } else { "hold" };
-            format!(
-                "{singles} of {n_parents} {parent_many} {verb} a single `{}` group",
-                level.name
-            )
+            format!("{singles} of {n_parents} {parent_many} {verb} a single `{}` group", level.name)
         };
         let kappas: Vec<&str> = (0..model.n_kappa)
             .filter(|&k| levels.kappa_level[k] == l)
@@ -2340,9 +2190,7 @@ pub(crate) fn check_level_summary(
 /// named. An `iov_column` the model already sets is called out as having no effect
 /// rather than asked for.
 pub(crate) fn check_simulation_iov_occasions(
-    model: &CompiledModel,
-    template: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, template: &Population, iov_rule: &IovOccasionRule,
     iov_column: Option<&str>,
 ) -> Option<Diagnostic> {
     if !iov_occasions_missing(model, template, iov_rule) {
@@ -2383,12 +2231,7 @@ pub(crate) fn max_obs_dose_occasions(population: &Population) -> usize {
         occs.dedup();
         occs.len()
     };
-    population
-        .subjects
-        .iter()
-        .map(distinct_occ)
-        .max()
-        .unwrap_or(0)
+    population.subjects.iter().map(distinct_occ).max().unwrap_or(0)
 }
 
 /// `fit()`'s single-occasion refusal (`E_IOV_SINGLE_OCCASION`), checked on the template
@@ -2402,9 +2245,7 @@ pub(crate) fn max_obs_dose_occasions(population: &Population) -> usize {
 /// The gate is `fit()`'s: kappa declared and a derived rule active. A model with nested
 /// levels is left to `fit()` (records labelled from the level columns).
 pub(crate) fn check_simulation_iov_single_occasion(
-    model: &CompiledModel,
-    template: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, template: &Population, iov_rule: &IovOccasionRule,
 ) -> Option<Diagnostic> {
     if model.n_kappa == 0 || *iov_rule == IovOccasionRule::Column || model.has_nested_levels() {
         return None;
@@ -2445,9 +2286,7 @@ pub(crate) fn check_simulation_iov_single_occasion(
 /// and a one-time override warning is pushed. A `Column` rule must never reach
 /// here (the caller only clones the population when a derived rule is active).
 pub(crate) fn apply_iov_occasion_rule(
-    population: &mut Population,
-    rule: &IovOccasionRule,
-    had_column: bool,
+    population: &mut Population, rule: &IovOccasionRule, had_column: bool,
     warnings: &mut Vec<String>,
 ) {
     if had_column {
@@ -2484,19 +2323,12 @@ pub(crate) fn apply_iov_occasion_rule(
                 // A pk-only row on the same clock (#1876). One the reader moved a ULP below
                 // an edge (#1810) lands in the earlier window, as a #614-moved observation
                 // does: that window holds the whole interval the row governs.
-                s.pk_only_occasions = s
-                    .pk_only_times
-                    .iter()
-                    .map(|&t| window_occ(edges, t))
-                    .collect();
+                s.pk_only_occasions =
+                    s.pk_only_times.iter().map(|&t| window_occ(edges, t)).collect();
                 // A reset row is a record too, and `reset_times` is on the same clock.
                 // Left alone, it kept the dataset's labels under `iov_column`, or stayed
                 // empty and ran under κ = 0.
-                s.reset_occasions = s
-                    .reset_times
-                    .iter()
-                    .map(|&t| window_occ(edges, t))
-                    .collect();
+                s.reset_occasions = s.reset_times.iter().map(|&t| window_occ(edges, t)).collect();
             }
             IovOccasionRule::PerDose => {
                 // Each distinct administration *time* opens a new occasion. Doses
@@ -2570,9 +2402,7 @@ pub(crate) fn apply_iov_occasion_rule(
 /// `had_column = false` and a throwaway sink: the override warning is about a fit's
 /// `[fit_options]`, which these entry points either do not have or have already fitted under.
 pub(crate) fn with_derived_occasions<'a>(
-    model: &CompiledModel,
-    population: &'a Population,
-    rule: Option<&IovOccasionRule>,
+    model: &CompiledModel, population: &'a Population, rule: Option<&IovOccasionRule>,
 ) -> std::borrow::Cow<'a, Population> {
     // A nested model's groups are its level cells (#1082 PR4), which no rule regroups:
     // `fit()` refuses a derived rule on one, and `simulate_with_options_diag` too.
@@ -2603,10 +2433,7 @@ pub(crate) fn with_derived_occasions<'a>(
 /// sentence: only the caller knows where its rule comes from and whether its population
 /// has a data column to label.
 pub(crate) fn no_occasion_warning(
-    has_omega_iov: bool,
-    population: &Population,
-    effect: &str,
-    remedy: &str,
+    has_omega_iov: bool, population: &Population, effect: &str, remedy: &str,
 ) -> Option<String> {
     if !has_omega_iov {
         return None;
@@ -2638,9 +2465,7 @@ pub(crate) fn no_occasion_warning(
 /// (`SimulateOptions::match_method` only on `simulate_with_options`, supplied η only on
 /// the adaptive path).
 pub(crate) fn frem_drawn_eta_warning<'a>(
-    model: &CompiledModel,
-    n_subjects: usize,
-    drawn: impl IntoIterator<Item = &'a Subject>,
+    model: &CompiledModel, n_subjects: usize, drawn: impl IntoIterator<Item = &'a Subject>,
     remedy: &str,
 ) -> Option<String> {
     model.frem_config.as_ref()?;
@@ -2675,8 +2500,7 @@ pub(crate) fn frem_drawn_eta_warning<'a>(
 ///   - an input-rate model combined with a `[diffusion]` block (the SDE/EKF
 ///     path), whose Kalman propagation does not carry the `R_in` forcing.
 pub(crate) fn check_absorption_dosing(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     let Some(ode) = &model.ode_spec else {
         return Vec::new();
@@ -2746,10 +2570,7 @@ pub(crate) fn check_absorption_dosing(
             d.ss && d.ii > 0.0
                 && lowerable(d.cmt_1based())
                 && route_lagged_zero_order(d.cmt_1based())
-                && ode
-                    .dose_attr_map
-                    .lowered_route_lag_slot(d.cmt_1based())
-                    .is_none()
+                && ode.dose_attr_map.lowered_route_lag_slot(d.cmt_1based()).is_none()
         })
     });
     if ss_zero_order_mixed {
@@ -2799,16 +2620,14 @@ pub(crate) fn check_absorption_dosing(
     // checks are `is_infusion()`-gated and an `AMT>0` `CMT=0` infusion is already a hard
     // error from `check_dose_compartments` (`E_DOSE_CMT_NOT_INFUSABLE`); an `AMT=0` one is
     // inert. (Behaviour-preserving: the pre-#912 raw `d.cmt`.)
-    let has_ss_infusion = population.subjects.iter().any(|s| {
-        s.doses
-            .iter()
-            .any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt_raw()))
-    });
-    let has_infusion_zero_order = population.subjects.iter().any(|s| {
-        s.doses
-            .iter()
-            .any(|d| d.is_infusion() && zero_order_cmts.contains(&d.cmt_raw()))
-    });
+    let has_ss_infusion = population
+        .subjects
+        .iter()
+        .any(|s| s.doses.iter().any(|d| d.ss && d.is_infusion() && cmts.contains(&d.cmt_raw())));
+    let has_infusion_zero_order = population
+        .subjects
+        .iter()
+        .any(|s| s.doses.iter().any(|d| d.is_infusion() && zero_order_cmts.contains(&d.cmt_raw())));
     if has_ss_infusion {
         diags.push(
             Diagnostic::error(
@@ -2955,8 +2774,7 @@ pub(crate) fn check_absorption_dosing(
 /// Reported once per offending compartment (naming the first dose that hits it). The two
 /// checks are mutually exclusive per `(attr, cmt)`.
 pub(crate) fn check_modeled_dose_rates(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     use crate::types::{DoseAttr, RateMode};
     let mut diags = Vec::new();
@@ -2980,13 +2798,9 @@ pub(crate) fn check_modeled_dose_rates(
             // engine-agnostic error code). `Fixed` doses need no slot.
             let (attr, code, kind, err_code, param) = match dose.rate_mode {
                 RateMode::Fixed => continue,
-                RateMode::ModeledDuration => (
-                    DoseAttr::Duration,
-                    "-2",
-                    "duration",
-                    "E_MODELED_DURATION_NO_PARAM",
-                    "D",
-                ),
+                RateMode::ModeledDuration => {
+                    (DoseAttr::Duration, "-2", "duration", "E_MODELED_DURATION_NO_PARAM", "D")
+                }
                 RateMode::ModeledRate => {
                     (DoseAttr::Rate, "-1", "rate", "E_MODELED_RATE_NO_PARAM", "R")
                 }
@@ -3000,10 +2814,7 @@ pub(crate) fn check_modeled_dose_rates(
             // BOTH engines. `active_dose_attr_map()` returns the engine-correct map
             // (the `OdeSpec`'s for ODE models, the analytical field otherwise,
             // #324), so an absent slot is the same actionable error on either engine.
-            let has_slot = model
-                .active_dose_attr_map()
-                .indexed_slot(attr, cmt)
-                .is_some();
+            let has_slot = model.active_dose_attr_map().indexed_slot(attr, cmt).is_some();
             if !has_slot {
                 diags.push(
                     Diagnostic::error(
@@ -3082,10 +2893,7 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
     // predictor would feed nothing (#905). See `subject_feeds_analytical_pk` for why
     // "no Gaussian observation" implies "predictor output unused" on an analytical
     // model.
-    population
-        .subjects
-        .iter()
-        .any(|s| crate::pk::subject_feeds_analytical_pk(model, s))
+    population.subjects.iter().any(|s| crate::pk::subject_feeds_analytical_pk(model, s))
 }
 
 /// Refuse what compartment on/off rows (`EVID=2`, `CMT=-N`, #2732) cannot do here.
@@ -3125,10 +2933,7 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
         return refused("an SDE model cannot honour", "diffusion");
     }
     if crate::api::run::model_routes_rows_by_cmt(model) {
-        return refused(
-            "a model with a declared endpoint cannot honour",
-            "structural_model",
-        );
+        return refused("a model with a declared endpoint cannot honour", "structural_model");
     }
 
     #[derive(Clone, Copy)]
@@ -3147,19 +2952,12 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
     // The `TIME` as written. A subject built in memory carries no written times.
     let written_at = |s: &crate::types::Subject, c: &crate::types::CmtToggle| {
         let engine = s.pk_only_times[c.pk_only];
-        s.pk_only_raw_times
-            .get(c.pk_only)
-            .copied()
-            .unwrap_or(engine)
+        s.pk_only_raw_times.get(c.pk_only).copied().unwrap_or(engine)
     };
     let mut diags = Vec::new();
     for s in population.subjects.iter().filter(|s| s.has_cmt_toggles()) {
         // Reachable only from a subject built in memory: the reader's indices are its own.
-        if let Some(c) = s
-            .cmt_toggles
-            .iter()
-            .find(|c| c.pk_only >= s.pk_only_times.len())
-        {
+        if let Some(c) = s.cmt_toggles.iter().find(|c| c.pk_only >= s.pk_only_times.len()) {
             return vec![Diagnostic::error(
                 "E_CMT_TOGGLE_OUT_OF_RANGE",
                 format!(
@@ -3212,23 +3010,10 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
 
         let mut events: Vec<(f64, Event)> =
             s.reset_times.iter().map(|&t| (t, Event::Reset)).collect();
-        events.extend(
-            s.doses
-                .iter()
-                .enumerate()
-                .map(|(k, d)| (d.time, Event::Dose(k))),
-        );
-        events.extend(
-            s.cmt_toggles
-                .iter()
-                .map(|&c| (s.pk_only_times[c.pk_only], Event::Toggle(c))),
-        );
-        events.extend(
-            s.obs_times
-                .iter()
-                .enumerate()
-                .map(|(j, &t)| (t, Event::Obs(j))),
-        );
+        events.extend(s.doses.iter().enumerate().map(|(k, d)| (d.time, Event::Dose(k))));
+        events
+            .extend(s.cmt_toggles.iter().map(|&c| (s.pk_only_times[c.pk_only], Event::Toggle(c))));
+        events.extend(s.obs_times.iter().enumerate().map(|(j, &t)| (t, Event::Obs(j))));
         events.sort_by(|a, b| a.0.total_cmp(&b.0).then(rank(&a.1).cmp(&rank(&b.1))));
         // Two statuses, because a lagged dose separates them. `off` is what an observation is
         // checked against, which a dose clears at its record. `held` is what the walk holds at
@@ -3282,11 +3067,8 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
                     }
                 }
                 Event::Obs(j) => {
-                    let cmt = s
-                        .obs_cmts
-                        .get(j)
-                        .copied()
-                        .unwrap_or(crate::io::datareader::DEFAULT_CMT);
+                    let cmt =
+                        s.obs_cmts.get(j).copied().unwrap_or(crate::io::datareader::DEFAULT_CMT);
                     if cmt >= 1 && off.contains(&(cmt - 1)) {
                         diags.push(
                             Diagnostic::error(
@@ -3352,8 +3134,7 @@ pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) 
 /// Reported once per `(kind, compartment)`, matching [`check_modeled_dose_rates`].
 /// Compartment on/off rows are checked first ([`check_cmt_toggles`]).
 pub(crate) fn check_dose_compartments(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     // Ahead of everything else here, the compartment-free return below included: a model
     // that cannot honour an off row must not run with the row ignored (#2732).
@@ -3592,9 +3373,7 @@ pub(crate) struct TypicalSnapshotScratch {
 /// observation snapshots no check reads: for 1000 subjects × (2 doses + 100 observations)
 /// 102,000 `$PK` evaluations against 2,000 (111.7 ms of `check_model_data` against 9.9 ms).
 pub(crate) fn typical_dose_snapshots<'a>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64],
     scratch: &'a mut TypicalSnapshotScratch,
 ) -> Vec<DoseSnapshot<'a>> {
     let n_zero = model.n_eta + model.n_kappa;
@@ -3671,8 +3450,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
 /// passes through arithmetic, `^` and `exp`, and `^` is a bare `powf`, so `(WT/70)^0.75`
 /// with `WT < 0` is `NaN`. The message names all three.
 pub(crate) fn check_dose_attr_finiteness(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     use crate::types::{DoseAttr, RateMode};
     // NOT gated on `DoseAttrMap::is_empty()`: that reports only whether a
@@ -3725,10 +3503,7 @@ pub(crate) fn check_dose_attr_finiteness(
                 Some((what, snap.values.get(slot).copied().unwrap_or(0.0)))
             });
             for (what, value) in [
-                Some((
-                    "lag time (`lagtime` / `ALAG`)",
-                    map.lagtime(cmt, snap.values),
-                )),
+                Some(("lag time (`lagtime` / `ALAG`)", map.lagtime(cmt, snap.values))),
                 Some(("bioavailability (`F`)", map.f_bio(cmt, snap.values))),
                 modeled,
             ]
@@ -3781,20 +3556,13 @@ struct NegativeLag {
 }
 
 fn first_negative_lag(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
+    model: &CompiledModel, population: &Population, theta: &[f64],
 ) -> Option<NegativeLag> {
     let map = model.active_dose_attr_map();
     let route_lagged: Vec<&crate::pk::absorption::InputRateForcing> = model
         .ode_spec
         .as_ref()
-        .map(|ode| {
-            ode.input_rate
-                .iter()
-                .filter(|f| f.lag_slot.is_some())
-                .collect()
-        })
+        .map(|ode| ode.input_rate.iter().filter(|f| f.lag_slot.is_some()).collect())
         .unwrap_or_default();
     // Cost gate: a model with neither lag kind reads the `PkParams` default `0.0`, so no
     // snapshot is built for it.
@@ -3815,10 +3583,7 @@ fn first_negative_lag(
                     .map(|f| (f, f.route_lag(snap.values)))
                     .find(|(_, lag)| *lag < 0.0)
                     .map(|(f, lag)| {
-                        (
-                            format!("per-route absorption lag (a `{:?}` route)", f.kind),
-                            lag,
-                        )
+                        (format!("per-route absorption lag (a `{:?}` route)", f.kind), lag)
                     })
             };
             if let Some((what, value)) = found {
@@ -3846,9 +3611,7 @@ fn first_negative_lag(
 /// mid-fit by an η or θ excursion is still integrated from the earlier onset, identically
 /// on every engine (pinned by `negative_route_lag_engines_agree_from_earlier_onset`).
 pub(crate) fn check_negative_lagtime(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
+    model: &CompiledModel, population: &Population, theta: &[f64],
 ) -> Vec<Diagnostic> {
     let Some(neg) = first_negative_lag(model, population, theta) else {
         return Vec::new();
@@ -3871,9 +3634,7 @@ pub(crate) fn check_negative_lagtime(
 /// points run no data errors, so a negative lag is served — the dose's input starts at the
 /// earlier onset — and reported as `W_NEGATIVE_LAGTIME` instead.
 pub(crate) fn negative_lagtime_warning(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
+    model: &CompiledModel, population: &Population, theta: &[f64],
 ) -> Option<Diagnostic> {
     let neg = first_negative_lag(model, population, theta)?;
     Some(Diagnostic::warning(
@@ -3921,8 +3682,7 @@ pub(crate) fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnost
 /// refit; `bound_from_fit()` is model-wide, so that advice also covers a relation whose levels
 /// are written out, which needs the value added to `levels = [...]` before the refit (#1742).
 pub(crate) fn check_covariate_levels(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     let Some(spec) = model.covariate_model.as_ref() else {
         return Vec::new();
@@ -3954,11 +3714,7 @@ pub(crate) fn check_covariate_levels(
         unknown.sort_by(f64::total_cmp);
         declared.sort_by(f64::total_cmp);
         let (cov, from_fit) = (&rel.covariate, model.bound_from_fit());
-        let whose = if from_fit {
-            "the fit's levels"
-        } else {
-            "levels"
-        };
+        let whose = if from_fit { "the fit's levels" } else { "levels" };
         let facts = format!(
             "[covariate_model]: `{} ~ {cov} {}(...)` has {whose} {declared:?} (reference \
              {reference}), but `{cov}` takes {unknown:?} in this data.",
@@ -3981,11 +3737,8 @@ pub(crate) fn check_covariate_levels(
             )
         };
         diags.push(
-            Diagnostic::error(
-                "E_COV_LEVEL_UNKNOWN",
-                format!("{facts} {consequence} {advice}"),
-            )
-            .with_block("covariate_model"),
+            Diagnostic::error("E_COV_LEVEL_UNKNOWN", format!("{facts} {consequence} {advice}"))
+                .with_block("covariate_model"),
         );
     }
     diags
@@ -4033,9 +3786,7 @@ fn twin_decline_clause(model: &CompiledModel) -> String {
 /// The code an absorption closed-form refusal carries: `E_IG_*` for an inverse-Gaussian
 /// model, `E_TRANSIT_*` otherwise.
 fn absorption_family_code(
-    model: &CompiledModel,
-    ig: &'static str,
-    transit: &'static str,
+    model: &CompiledModel, ig: &'static str, transit: &'static str,
 ) -> &'static str {
     if matches!(model.pk_model, PkModel::OneCptIg | PkModel::TwoCptIg) {
         ig
@@ -4049,8 +3800,7 @@ fn absorption_family_code(
 /// `ferx check` and every predict / simulate entry point read it from here, so the
 /// entry point's `Err` carries the same code (#1746).
 pub(crate) fn check_absorption_closed_form_support_diags(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     check_absorption_closed_form_support(model, population)
         .map(|e| {
@@ -4064,9 +3814,7 @@ pub(crate) fn check_absorption_closed_form_support_diags(
 /// (`E_TRANSIT_FLIP_FLOP` / `E_IG_FLIP_FLOP`); see
 /// [`check_absorption_closed_form_support_diags`].
 pub(crate) fn check_absorption_flip_flop_no_twin_diags(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
+    model: &CompiledModel, population: &Population, theta: &[f64],
 ) -> Vec<Diagnostic> {
     check_absorption_flip_flop_no_twin(model, population, theta)
         .map(|e| {
@@ -4087,8 +3835,7 @@ pub(crate) fn check_absorption_flip_flop_no_twin_diags(
 /// rejects them. `fit()` and every predict / simulate entry point surface this as an `Err`
 /// (#898). Returns the first offending feature's message, or `None`.
 pub(crate) fn check_absorption_closed_form_support(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Option<String> {
     if !matches!(
         model.pk_model,
@@ -4283,11 +4030,7 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
     // scoped to reset and don't reject clock-forward data that telescopes fine.
     let mut reset_cmts: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (cmt, ep) in &model.endpoints {
-        if let EndpointLikelihood::Tte {
-            recurrence: TteRecurrence::Repeated { clock },
-            ..
-        } = ep
-        {
+        if let EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { clock }, .. } = ep {
             rtte_cmts.push(*cmt);
             if matches!(clock, RtteClock::Reset) {
                 reset_cmts.insert(*cmt);
@@ -4304,14 +4047,7 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
             // subject+cmt — any record after it is a mid-stream censor (rejected below).
             let mut seen_censor = false;
             for r in &subject.obs_records {
-                let ObsRecord::Event {
-                    time,
-                    cmt: c,
-                    event_type,
-                    entry_time,
-                    ..
-                } = r
-                else {
+                let ObsRecord::Event { time, cmt: c, event_type, entry_time, .. } = r else {
                     // Non-TTE records are handled by their own endpoint; skip them.
                     continue;
                 };
@@ -4408,8 +4144,7 @@ fn check_rtte_records(model: &CompiledModel, population: &Population) -> Option<
 /// [`Diagnostic`], so `fit()` and `ferx check` give it one code (#1788).
 #[cfg(feature = "survival")]
 pub(crate) fn check_rtte_records_diags(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     check_rtte_records(model, population)
         .map(|m| Diagnostic::error("E_RTTE_RECORDS", m).with_block("event_model"))
@@ -4422,8 +4157,7 @@ pub(crate) fn check_rtte_records_diags(
 /// non-negative integer DV on a discrete CMT, so the endpoint refuses `state ≥ 2` itself.
 #[cfg(feature = "survival")]
 pub(crate) fn check_binary_states(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     for cmt in model.binary_cmts() {
         for subject in &population.subjects {
@@ -4445,19 +4179,13 @@ pub(crate) fn check_binary_states(
 /// `ferx check` alike.
 #[cfg(feature = "markov")]
 pub(crate) fn check_ctmm_records(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for (cmt, endpoint) in &model.endpoints {
         // DTMM (#2473): the same two checks, plus an observed change of state that no
         // `transition` declares — probability 0 for every parameter value.
-        if let crate::types::EndpointLikelihood::Dtmm {
-            state_codes,
-            transitions,
-            ..
-        } = endpoint
-        {
+        if let crate::types::EndpointLikelihood::Dtmm { state_codes, transitions, .. } = endpoint {
             let first_bad = population.subjects.iter().find_map(|subject| {
                 crate::markov::dtmm::validate_dtmm_records(
                     *cmt,
@@ -4612,9 +4340,7 @@ pub(crate) fn check_iiv_on_ruv(model: &CompiledModel, options: &FitOptions) -> V
 ///
 /// `fit()` passes its `init_params`; `ferx check`, the model's parsed defaults.
 pub(crate) fn check_mixture_options(
-    model: &CompiledModel,
-    options: &FitOptions,
-    params: &ModelParameters,
+    model: &CompiledModel, options: &FitOptions, params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     if model.mixture.is_none() {
         return Vec::new();
@@ -4687,9 +4413,7 @@ pub(crate) fn check_mixture_options(
 /// trip this. A later stage can request quadrature while `options.method` names another
 /// estimator, so the effective chain is inspected, as in `check_model_options` (#251).
 pub(crate) fn check_agq_grid_iov(
-    model: &CompiledModel,
-    population: &Population,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, options: &FitOptions,
 ) -> Vec<Diagnostic> {
     if model.n_kappa == 0 {
         return Vec::new();
@@ -4713,11 +4437,7 @@ pub(crate) fn check_agq_grid_iov(
     if grid <= crate::estimation::agq::MAX_AGQ_GRID {
         return Vec::new();
     }
-    let label = if matches!(method, EstimationMethod::Laplace) {
-        "laplace"
-    } else {
-        "focei"
-    };
+    let label = if matches!(method, EstimationMethod::Laplace) { "laplace" } else { "focei" };
     vec![Diagnostic::error(
         "E_AGQ_GRID_TOO_LARGE",
         format!(
@@ -4788,8 +4508,7 @@ fn tv_remedy(name: &str, otherwise: &str) -> String {
 
 #[cfg(feature = "survival")]
 pub(crate) fn check_survival_tv_covariates(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     use crate::types::{EndpointLikelihood, HazardSpec};
     // One code for the four texts: the cause is the same (a time-varying covariate read
@@ -4841,14 +4560,8 @@ pub(crate) fn check_survival_tv_covariates(
             }
             // Count (#2877): the mean and size read each record's own snapshot, as the binary
             // predictor does, with the same refusal when the snapshot cannot line up.
-            if let EndpointLikelihood::Count {
-                count_covariates, ..
-            } = endpoint
-            {
-                if let Some(name) = count_covariates
-                    .iter()
-                    .find(|c| tv_set.contains(c.as_str()))
-                {
+            if let EndpointLikelihood::Count { count_covariates, .. } = endpoint {
+                if let Some(name) = count_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
                     if subject.record_covariate_snapshots().is_none() {
                         return refuse(
                             "count_model",
@@ -4877,10 +4590,7 @@ pub(crate) fn check_survival_tv_covariates(
             // does not (a subject that also carries time-to-event rows, or an in-memory
             // subject without per-row snapshots) would silently fall back to the baseline.
             #[cfg(feature = "markov")]
-            if let EndpointLikelihood::Dtmm {
-                prob_covariates, ..
-            } = endpoint
-            {
+            if let EndpointLikelihood::Dtmm { prob_covariates, .. } = endpoint {
                 if let Some(name) = prob_covariates.iter().find(|c| tv_set.contains(c.as_str())) {
                     if subject.record_covariate_snapshots().is_none() {
                         return refuse(
@@ -4906,15 +4616,11 @@ pub(crate) fn check_survival_tv_covariates(
             // covariate snapshot (time-homogeneous — a drug-driven Q(t) is Phase 6), so a
             // time-varying covariate on a transition intensity would be silently frozen.
             #[cfg(feature = "markov")]
-            if let EndpointLikelihood::Ctmm {
-                generator_covariates,
-                generator_states,
-                ..
-            } = endpoint
+            if let EndpointLikelihood::Ctmm { generator_covariates, generator_states, .. } =
+                endpoint
             {
-                if let Some(name) = generator_covariates
-                    .iter()
-                    .find(|c| tv_set.contains(c.as_str()))
+                if let Some(name) =
+                    generator_covariates.iter().find(|c| tv_set.contains(c.as_str()))
                 {
                     return refuse(
                         "markov_model",
@@ -4977,19 +4683,13 @@ pub(crate) fn check_survival_tv_covariates(
                 }
                 continue;
             }
-            let EndpointLikelihood::Tte {
-                hazard,
-                hazard_covariates,
-                ..
-            } = endpoint
-            else {
+            let EndpointLikelihood::Tte { hazard, hazard_covariates, .. } = endpoint else {
                 continue;
             };
             match hazard {
                 HazardSpec::Analytic { .. } => {
-                    if let Some(name) = hazard_covariates
-                        .iter()
-                        .find(|c| tv_set.contains(c.as_str()))
+                    if let Some(name) =
+                        hazard_covariates.iter().find(|c| tv_set.contains(c.as_str()))
                     {
                         return refuse(
                             "event_model",
@@ -5092,8 +4792,7 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
         .iter()
         .filter_map(|(cmt, e)| match e {
             EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { chz_state },
-                ..
+                hazard: HazardSpec::OdeAccumulated { chz_state }, ..
             } => Some((*cmt, *chz_state)),
             _ => None,
         })
@@ -5204,9 +4903,7 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
         .endpoints
         .iter()
         .filter_map(|(cmt, e)| match e {
-            EndpointLikelihood::Ctmm {
-                generator_states, ..
-            } if !generator_states.is_empty() => {
+            EndpointLikelihood::Ctmm { generator_states, .. } if !generator_states.is_empty() => {
                 Some((*cmt, generator_states.iter().map(|&(_, idx)| idx).collect()))
             }
             _ => None,
@@ -5262,8 +4959,7 @@ pub(crate) fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<Stri
 /// it reads. Shared by the `TIME` (#1918) and covariate (#1854) freezes.
 #[cfg(feature = "markov")]
 fn ctmm_generator_slice(
-    rhs: &crate::parser::model_parser::OdeRhsProgram,
-    states: &[usize],
+    rhs: &crate::parser::model_parser::OdeRhsProgram, states: &[usize],
 ) -> Vec<bool> {
     let mut slice: Vec<bool> = Vec::new();
     for &s in states {
@@ -5284,9 +4980,7 @@ fn ctmm_generator_slice(
 /// (#1575), is skipped — neither is frozen by the snapshot.
 #[cfg(feature = "markov")]
 fn first_param_reaching_slice<'m>(
-    model: &'m CompiledModel,
-    rhs: &crate::parser::model_parser::OdeRhsProgram,
-    mask: &[bool],
+    model: &'m CompiledModel, rhs: &crate::parser::model_parser::OdeRhsProgram, mask: &[bool],
     slice: &[bool],
 ) -> Option<(&'m str, &'static str)> {
     for (i, name) in model.indiv_param_names.iter().enumerate() {
@@ -5317,20 +5011,10 @@ fn first_param_reaching_slice<'m>(
 /// states never see are not refused. `Err(())` when the compiled programs are missing (fails closed).
 #[cfg(feature = "markov")]
 fn ctmm_tv_covariate_on_disposition<'m>(
-    model: &'m CompiledModel,
-    generator_states: &[(String, usize)],
-    tv: &[String],
+    model: &'m CompiledModel, generator_states: &[(String, usize)], tv: &[String],
 ) -> Result<Option<(String, &'m str, &'static str)>, ()> {
-    let rhs = model
-        .ode_spec
-        .as_ref()
-        .and_then(|o| o.rhs_program.as_ref())
-        .ok_or(())?;
-    let program = model
-        .indiv_param_partials
-        .indiv_param_program
-        .as_ref()
-        .ok_or(())?;
+    let rhs = model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).ok_or(())?;
+    let program = model.indiv_param_partials.indiv_param_program.as_ref().ok_or(())?;
     let states: Vec<usize> = generator_states.iter().map(|&(_, idx)| idx).collect();
     let slice = ctmm_generator_slice(rhs, &states);
     for cov in tv {
@@ -5395,8 +5079,7 @@ pub(crate) fn check_ctmm_time_dependent_pk_diags(model: &CompiledModel) -> Vec<D
 /// `predict` / `predict_diag`, every `simulate*` but `simulate_adaptive*` (#1488) and `ferx check`
 /// (through [`check_model_data_rule`], #1774).
 pub(crate) fn check_analytic_readout_support(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     // One code for both texts: either way the depot amount the readout reads cannot be
     // reconstructed by dose superposition for this subject.
@@ -5488,9 +5171,7 @@ fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
 /// `W_TRANSIT_FLIP_FLOP` for the twin-carrying case. Returns the first offending subject's message,
 /// or `None`. `fit()` / `ferx check` and every predict / simulate entry point surface it (#898).
 pub(crate) fn check_absorption_flip_flop_no_twin(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
+    model: &CompiledModel, population: &Population, theta: &[f64],
 ) -> Option<String> {
     // A twin-carrying model is auto-rerouted (correct) — only warned, not rejected.
     if !twinless_absorption_closed_form(model) {
@@ -5544,17 +5225,11 @@ pub(crate) fn check_absorption_flip_flop_no_twin(
 /// The survivors are a sample of a *truncated* distribution, so the message says the
 /// intervals built from them are biased — the reason a skip may not pass silently.
 pub(crate) fn uncertainty_draws_skipped_warning(
-    model: &CompiledModel,
-    skipped: &[usize],
-    n: usize,
+    model: &CompiledModel, skipped: &[usize], n: usize,
 ) -> String {
     let (domain, ode_fn) = absorption_flip_flop_wording(model);
     let confluent = absorption_confluent_clause(model);
-    let list = skipped
-        .iter()
-        .map(|k| k.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let list = skipped.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(", ");
     format!(
         "W_UNCERTAINTY_DRAWS_SKIPPED: {k} of {n} uncertainty draws were skipped (draws {list}). \
          Each drew typical values in the flip-flop regime (disposition rate ≥ {domain}){confluent}, \
@@ -5624,11 +5299,7 @@ impl SimulatedFlipFlopTally {
     /// Returns without counting for a subject carrying no positive dose amount: there is no
     /// dose-driven term for the clamp to remove, so the individual is not affected.
     pub(crate) fn observe(
-        &mut self,
-        model: &CompiledModel,
-        subject: &Subject,
-        theta: &[f64],
-        eta: &[f64],
+        &mut self, model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
     ) {
         if !twinless_absorption_closed_form(model) {
             return;
@@ -5660,16 +5331,8 @@ impl SimulatedFlipFlopTally {
         // (reachable from the `pk` snapshot below) would match the scope to the claim, but a per-compartment
         // `ALAGn` and the `dose_attr_map` layout make it more than a one-liner, and `f = 0` would need the
         // same. Deferred deliberately.
-        let last_obs = subject
-            .obs_times
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
-        if !subject
-            .doses
-            .iter()
-            .any(|d| d.amt > 0.0 && d.time < last_obs)
-        {
+        let last_obs = subject.obs_times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if !subject.doses.iter().any(|d| d.amt > 0.0 && d.time < last_obs) {
             return;
         }
         // A twin-less transit / IG closed form takes no IOV (rejected by
@@ -5772,9 +5435,7 @@ impl SimulatedFlipFlopTally {
 /// draws was skipped (#1485): an empty `Ok` would read as a run that produced nothing to
 /// report. Carries the family's flip-flop code and the first draw's own reason.
 pub(crate) fn all_uncertainty_draws_skipped_diags(
-    model: &CompiledModel,
-    n: usize,
-    first_reason: &str,
+    model: &CompiledModel, n: usize, first_reason: &str,
 ) -> Vec<Diagnostic> {
     let code = absorption_family_code(model, "E_IG_FLIP_FLOP", "E_TRANSIT_FLIP_FLOP");
     vec![Diagnostic::error(
@@ -5797,8 +5458,7 @@ pub(crate) fn all_uncertainty_draws_skipped_diags(
 /// settings calls it: `fit()` (through [`check_model_options`]), `run_covariance` and
 /// `run_sir`.
 pub(crate) fn check_ode_method_linear(
-    model: &CompiledModel,
-    options: &FitOptions,
+    model: &CompiledModel, options: &FitOptions,
 ) -> Vec<Diagnostic> {
     if options.ode_method != crate::ode::OdeMethod::Linear {
         return Vec::new();
@@ -5834,12 +5494,7 @@ fn profile_refused_endpoint(model: &CompiledModel) -> Option<&'static str> {
             E::Ctmm { .. } => Some((2, "Markov (CTMM)")),
         }
     };
-    model
-        .endpoints
-        .values()
-        .filter_map(rank)
-        .min_by_key(|&(r, _)| r)
-        .map(|(_, kind)| kind)
+    model.endpoints.values().filter_map(rank).min_by_key(|&(r, _)| r).map(|(_, kind)| kind)
 }
 
 /// The estimation half of `E_PROFILE_SCOPE` (#1065): what a `profile`d θ level block
@@ -5853,8 +5508,7 @@ fn profile_refused_endpoint(model: &CompiledModel) -> Option<&'static str> {
 /// The declaration half (bounds, `FIX`, a single θ) and the route
 /// (`E_PROFILE_NOT_LINEAR`) are the parser's.
 pub(crate) fn check_profiled_levels(
-    model: &CompiledModel,
-    options: &FitOptions,
+    model: &CompiledModel, options: &FitOptions,
 ) -> Vec<Diagnostic> {
     let blocks: Vec<&str> = model
         .indiv_param_partials
@@ -5869,19 +5523,13 @@ pub(crate) fn check_profiled_levels(
         [one] => format!("theta {one}[...] is"),
         [init @ .., last] => format!(
             "theta {} and {last}[...] are",
-            init.iter()
-                .map(|b| format!("{b}[...]"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            init.iter().map(|b| format!("{b}[...]")).collect::<Vec<_>>().join(", ")
         ),
     };
     const REMOVE: &str = "Remove `profile` to estimate the levels as ordinary θ.";
     let refuse = |what: String, fix: &str| {
-        Diagnostic::error(
-            "E_PROFILE_SCOPE",
-            format!("{subject} `profile`d, {what} {fix}"),
-        )
-        .with_block("parameters")
+        Diagnostic::error("E_PROFILE_SCOPE", format!("{subject} `profile`d, {what} {fix}"))
+            .with_block("parameters")
     };
     let mut out = Vec::new();
     for m in options.method_chain() {
@@ -5958,10 +5606,7 @@ pub(crate) fn check_profiled_levels(
         (model.frem_config.is_some(), "a FREM covariate model"),
     ] {
         if present {
-            out.push(refuse(
-                format!("which does not yet combine with {what}."),
-                REMOVE,
-            ));
+            out.push(refuse(format!("which does not yet combine with {what}."), REMOVE));
         }
     }
     // Every `covariance_method` is computed on a profiled fit (#2108): `r` as the profile
@@ -6135,9 +5780,8 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         // the user has set `n_agq` on a VI-only chain and would otherwise believe it did
         // something. `focei` consumes `n_agq > 1` as the Gauss-Newton-anchored quadrature;
         // `laplace` consumes it at any `n_agq`.
-        let consumes_n_agq = chain
-            .iter()
-            .any(|&m| matches!(m, EstimationMethod::Laplace | EstimationMethod::FoceI));
+        let consumes_n_agq =
+            chain.iter().any(|&m| matches!(m, EstimationMethod::Laplace | EstimationMethod::FoceI));
         if options.n_agq > 1 && !consumes_n_agq {
             diags.push(
                 Diagnostic::error(
@@ -6329,9 +5973,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // Surface that here so `ferx check` rejects the model up front.
     if model.mixture.is_some()
         && model.n_kappa > 0
-        && chain
-            .iter()
-            .any(|&m| matches!(m, EstimationMethod::Imp | EstimationMethod::Impmap))
+        && chain.iter().any(|&m| matches!(m, EstimationMethod::Imp | EstimationMethod::Impmap))
     {
         diags.push(
             Diagnostic::error(
@@ -6357,12 +5999,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 (options.n_agq > 1 && chain.contains(&EstimationMethod::FoceI))
                     .then(|| format!("method = focei with n_agq = {}", options.n_agq))
             })
-            .or_else(|| {
-                model
-                    .mixture
-                    .is_some()
-                    .then(|| "a [mixture] block".to_string())
-            })
+            .or_else(|| model.mixture.is_some().then(|| "a [mixture] block".to_string()))
             .or_else(|| model.frem_config.is_some().then(|| "FREM".to_string()));
         if let Some(what) = refused {
             diags.push(
@@ -6380,10 +6017,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         // time, but `FitOptions::iov_occasion` reaches `fit()` without the file, and a
         // derived rule would overwrite the level cells.
         if options.iov_occasion != IovOccasionRule::Column {
-            let first = model
-                .nested_levels()
-                .map(|l| l.levels[0].name.clone())
-                .unwrap_or_default();
+            let first = model.nested_levels().map(|l| l.levels[0].name.clone()).unwrap_or_default();
             diags.push(
                 Diagnostic::error(
                     "E_LEVEL_MIXED_WITH_IOV_COLUMN",
@@ -6451,9 +6085,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // block must fire for either, or a non-IOV FOCEI quadrature would skip the check-time
     // caps entirely (the runtime cap in `fit_inner` only fires under IOV) and build a
     // 100k+-node grid unchecked (#251 review #1).
-    let laplace_stage = chain
-        .iter()
-        .any(|&m| matches!(m, EstimationMethod::Laplace));
+    let laplace_stage = chain.iter().any(|&m| matches!(m, EstimationMethod::Laplace));
     let focei_quadrature =
         chain.iter().any(|&m| matches!(m, EstimationMethod::FoceI)) && options.n_agq > 1;
     // The per-dimension node cap below, for a chain no quadrature reads `n_agq` in: the
@@ -6819,10 +6451,7 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // placing an evaluator mid-chain would leave `FitResult.importance_sampling`
     // computed at parameters the following stage then overwrites.
     if chain.iter().any(|&m| m == EstimationMethod::Imp) {
-        let n_imp = chain
-            .iter()
-            .filter(|&&m| m == EstimationMethod::Imp)
-            .count();
+        let n_imp = chain.iter().filter(|&&m| m == EstimationMethod::Imp).count();
         if n_imp > 1 {
             diags.push(
                 Diagnostic::error(
@@ -6940,16 +6569,8 @@ pub(crate) const RESIDUAL_CORRELATION_RAIL: f64 = 0.995;
 /// The `correlation <kind>(RHO) by COL` line as the user wrote it (#1081).
 pub(crate) fn residual_correlation_line(model: &CompiledModel) -> Option<String> {
     let serial = model.residual_serial.as_ref()?;
-    let rho = model
-        .theta_names
-        .get(serial.rho_theta)
-        .map(String::as_str)
-        .unwrap_or("?");
-    Some(format!(
-        "correlation {}({rho}) by {}",
-        serial.kind.keyword(),
-        serial.by.join(", ")
-    ))
+    let rho = model.theta_names.get(serial.rho_theta).map(String::as_str).unwrap_or("?");
+    Some(format!("correlation {}({rho}) by {}", serial.kind.keyword(), serial.by.join(", ")))
 }
 
 /// Phase-1 scope of a `correlation` line (#1081): FOCE and FOCEI only, and none
@@ -6957,9 +6578,7 @@ pub(crate) fn residual_correlation_line(model: &CompiledModel) -> Option<String>
 /// θ path has no `∂R/∂ρ`. One code, `E_RESIDUAL_CORRELATION_SCOPE`, naming the
 /// offending method or feature.
 fn residual_correlation_scope(
-    model: &CompiledModel,
-    options: &FitOptions,
-    chain: &[EstimationMethod],
+    model: &CompiledModel, options: &FitOptions, chain: &[EstimationMethod],
 ) -> Vec<Diagnostic> {
     let Some(line) = residual_correlation_line(model) else {
         return Vec::new();
@@ -6975,9 +6594,8 @@ fn residual_correlation_scope(
         .with_block("fit_options")
     };
     let mut diags = Vec::new();
-    if let Some(m) = chain
-        .iter()
-        .find(|m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
+    if let Some(m) =
+        chain.iter().find(|m| !matches!(m, EstimationMethod::Foce | EstimationMethod::FoceI))
     {
         diags.push(scope(format!("method = {}", m.label().to_lowercase())));
     } else if options.n_agq > 1 {
@@ -6990,9 +6608,7 @@ fn residual_correlation_scope(
         diags.push(scope("FREM covariate pseudo-observations".to_string()));
     }
     if model.has_non_gaussian() {
-        diags.push(scope(
-            "a time-to-event, binary, categorical or Markov endpoint".to_string(),
-        ));
+        diags.push(scope("a time-to-event, binary, categorical or Markov endpoint".to_string()));
     }
     if model.mixture.is_some() {
         diags.push(scope("a mixture model".to_string()));
@@ -7029,11 +6645,7 @@ fn residual_block_key(model: &CompiledModel, subject: &Subject, row: usize) -> S
         return levels.levels[..=l]
             .iter()
             .map(|level| {
-                format!(
-                    "{}={}",
-                    level.name,
-                    cov.get(&level.column).copied().unwrap_or(f64::NAN)
-                )
+                format!("{}={}", level.name, cov.get(&level.column).copied().unwrap_or(f64::NAN))
             })
             .collect::<Vec<_>>()
             .join(", ");
@@ -7071,24 +6683,14 @@ fn car1_negative_rho_message(line: &str, what: &str) -> String {
 /// different matrix. Checked on the θ's value, since that is what is drawn at,
 /// whatever its bounds; the free-ρ rail does not apply, as nothing is searched.
 pub(crate) fn check_residual_correlation_value(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
     else {
         return Vec::new();
     };
-    let v = params
-        .theta
-        .get(serial.rho_theta)
-        .copied()
-        .unwrap_or(f64::NAN);
-    let rho = model
-        .theta_names
-        .get(serial.rho_theta)
-        .cloned()
-        .unwrap_or_default();
+    let v = params.theta.get(serial.rho_theta).copied().unwrap_or(f64::NAN);
+    let rho = model.theta_names.get(serial.rho_theta).cloned().unwrap_or_default();
     residual_correlation_range(model, population, &line, RhoRange::Value(v), &|_| {
         format!("theta {rho} is {v}")
     })
@@ -7105,8 +6707,7 @@ pub(crate) fn check_residual_correlation_value(
 ///   one block at the same time have no order; `car1` correlates them by
 ///   `ρ^0 = 1`, which makes `R` singular.
 pub(crate) fn check_residual_correlation_data(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
     else {
@@ -7200,9 +6801,7 @@ pub(crate) fn check_residual_correlation_data(
 ///
 /// Shared by fit (`check_model_data`) and `simulate()` through [`check_residual_correlation_data`].
 fn residual_correlation_grouping(
-    model: &CompiledModel,
-    population: &Population,
-    line: &str,
+    model: &CompiledModel, population: &Population, line: &str,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(levels)) = (&model.residual_serial, model.nested_levels()) else {
         return Vec::new();
@@ -7286,9 +6885,7 @@ fn residual_correlation_grouping(
 /// the derived `iov_occasion` rule applied as the fit applies it). `ar1` and `car1` decay with the lag
 /// and are never refused, nor is `cs` over a grouping no kappa is at.
 fn residual_correlation_confounded(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
     let Some(line) = residual_correlation_line(model) else {
         return Vec::new();
@@ -7325,9 +6922,7 @@ fn residual_correlation_confounded(
 /// column that splits one group would otherwise switch the refusal off in silence. Not
 /// raised when the refusal fires (every subject matches some grouping).
 fn residual_correlation_partly_confounded(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
     let Some(line) = residual_correlation_line(model) else {
         return Vec::new();
@@ -7382,11 +6977,7 @@ impl PartitionMatch {
 
     /// "kappa K is drawn" / "kappas K, K2 are drawn".
     fn kappas_drawn(&self) -> String {
-        let (word, verb) = if self.kappas.len() > 1 {
-            ("kappas", "are")
-        } else {
-            ("kappa", "is")
-        };
+        let (word, verb) = if self.kappas.len() > 1 { ("kappas", "are") } else { ("kappa", "is") };
         format!("{word} {} {verb} drawn", self.kappas.join(", "))
     }
 }
@@ -7401,9 +6992,7 @@ impl PartitionMatch {
 /// On partitions, not names, so `cs by ARMID`, a column numbering the arms across the
 /// whole file, matches a kappa at `ARM`.
 fn kappa_partition_matches(
-    model: &CompiledModel,
-    population: &Population,
-    iov_rule: &IovOccasionRule,
+    model: &CompiledModel, population: &Population, iov_rule: &IovOccasionRule,
 ) -> Vec<PartitionMatch> {
     let Some(serial) = &model.residual_serial else {
         return Vec::new();
@@ -7483,9 +7072,8 @@ fn kappa_partition_matches(
             }
             let groups = |s: &Subject| {
                 let mut class = vec![None; s.obs_times.len()];
-                for (g, (_, rows)) in crate::stats::nested_levels::obs_groups_at(levels, s, l)
-                    .into_iter()
-                    .enumerate()
+                for (g, (_, rows)) in
+                    crate::stats::nested_levels::obs_groups_at(levels, s, l).into_iter().enumerate()
                 {
                     for j in rows {
                         class[j] = Some(g as u64);
@@ -7493,12 +7081,7 @@ fn kappa_partition_matches(
                 }
                 canonical(class)
             };
-            out.push(count(
-                population,
-                format!("the level `{}`", level.name),
-                kappas,
-                &groups,
-            ));
+            out.push(count(population, format!("the level `{}`", level.name), kappas, &groups));
         }
     } else {
         // The occasions the fit will integrate over: a derived rule labels them only when
@@ -7514,9 +7097,7 @@ fn kappa_partition_matches(
         };
         let groups = |s: &Subject| {
             canonical(
-                (0..s.obs_times.len())
-                    .map(|j| s.occasions.get(j).map(|&o| u64::from(o)))
-                    .collect(),
+                (0..s.obs_times.len()).map(|j| s.occasions.get(j).map(|&o| u64::from(o))).collect(),
             )
         };
         out.push(count(
@@ -7547,20 +7128,13 @@ enum RhoRange {
 /// a `FIX`ed θ) and simulate (the value drawn at), so the two refuse the same values
 /// with the same text (#1976).
 fn residual_correlation_range(
-    model: &CompiledModel,
-    population: &Population,
-    line: &str,
-    range: RhoRange,
+    model: &CompiledModel, population: &Population, line: &str, range: RhoRange,
     what: &dyn Fn(&str) -> String,
 ) -> Vec<Diagnostic> {
     let Some(serial) = &model.residual_serial else {
         return Vec::new();
     };
-    let rho = model
-        .theta_names
-        .get(serial.rho_theta)
-        .cloned()
-        .unwrap_or_default();
+    let rho = model.theta_names.get(serial.rho_theta).cloned().unwrap_or_default();
     let (lo, hi) = match range {
         RhoRange::Bounds(lo, hi) => (lo, hi),
         RhoRange::Value(v) => (v, v),
@@ -7626,9 +7200,7 @@ fn residual_correlation_range(
 /// then `E_RESIDUAL_CORRELATION_RANGE` on the θ's bounds when it is free and on its
 /// value when it is `FIX`ed.
 fn check_residual_correlation(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     let (Some(serial), Some(line)) = (&model.residual_serial, residual_correlation_line(model))
     else {
@@ -7648,15 +7220,12 @@ fn check_residual_correlation(
     };
     let what = |side: &str| match range {
         RhoRange::Value(v) => format!("theta {rho} is fixed at {v}"),
-        RhoRange::Bounds(lo, hi) => format!(
-            "the {side} bound of theta {rho} is {}",
-            if side == "lower" { lo } else { hi }
-        ),
+        RhoRange::Bounds(lo, hi) => {
+            format!("the {side} bound of theta {rho} is {}", if side == "lower" { lo } else { hi })
+        }
     };
     let mut diags = check_residual_correlation_data(model, population);
-    diags.extend(residual_correlation_range(
-        model, population, &line, range, &what,
-    ));
+    diags.extend(residual_correlation_range(model, population, &line, range, &what));
     diags
 }
 
@@ -7667,10 +7236,8 @@ fn residual_correlation_inert(model: &CompiledModel, population: &Population) ->
     let Some(line) = residual_correlation_line(model) else {
         return Vec::new();
     };
-    let coupled = population
-        .subjects
-        .iter()
-        .any(|s| residual_blocks(model, s).iter().any(|b| b.len() >= 2));
+    let coupled =
+        population.subjects.iter().any(|s| residual_blocks(model, s).iter().any(|b| b.len() >= 2));
     if coupled {
         return Vec::new();
     }
@@ -7697,10 +7264,7 @@ fn outer_search_runs(options: &FitOptions) -> bool {
     if options.outer_maxiter > 0 {
         return true;
     }
-    options
-        .method_chain()
-        .iter()
-        .any(|m| !m.evaluates_at_maxiter_zero())
+    options.method_chain().iter().any(|m| !m.evaluates_at_maxiter_zero())
 }
 
 /// Which declaration a flagged variance coordinate came from — the keyword the
@@ -7712,17 +7276,11 @@ enum VarianceDecl {
     /// The two differ only for a one-eta `block_omega (NAME) = [v]` — a block
     /// declaration with no correlations — which is why they are separate fields
     /// rather than one bool (#1394).
-    Omega {
-        correlated: bool,
-        block_declared: bool,
-    },
+    Omega { correlated: bool, block_declared: bool },
     /// An `Ω_IOV` diagonal. `correlated: true` is a `block_kappa` (IOV Option B)
     /// diagonal — correlated exactly like a `block_omega`, and reported the same
     /// way. Same split as [`VarianceDecl::Omega`].
-    Kappa {
-        correlated: bool,
-        block_declared: bool,
-    },
+    Kappa { correlated: bool, block_declared: bool },
     /// A `[mixture]` per-class Ω override (#977): its 1-based class, and the
     /// **declared** base eta name. Not the packed coordinate's display name —
     /// `coordinate_names` reports `ETA_CL_MIX2` for this slot, which appears
@@ -7766,14 +7324,8 @@ impl VarianceDecl {
     /// assert the keyword each way round.
     fn block_keyword(&self) -> Option<&'static str> {
         match self {
-            VarianceDecl::Omega {
-                block_declared: true,
-                ..
-            } => Some("block_omega"),
-            VarianceDecl::Kappa {
-                block_declared: true,
-                ..
-            } => Some("block_kappa"),
+            VarianceDecl::Omega { block_declared: true, .. } => Some("block_omega"),
+            VarianceDecl::Kappa { block_declared: true, .. } => Some("block_kappa"),
             _ => None,
         }
     }
@@ -7789,12 +7341,8 @@ impl VarianceDecl {
     /// matrix and always knowable; the spelling is not.
     fn correlated_block_keyword(&self) -> Option<&'static str> {
         match self {
-            VarianceDecl::Omega {
-                correlated: true, ..
-            } => Some("block_omega"),
-            VarianceDecl::Kappa {
-                correlated: true, ..
-            } => Some("block_kappa"),
+            VarianceDecl::Omega { correlated: true, .. } => Some("block_omega"),
+            VarianceDecl::Kappa { correlated: true, .. } => Some("block_kappa"),
             _ => None,
         }
     }
@@ -7900,15 +7448,9 @@ fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<Varianc
             let correlated = correlated.get(i).copied().unwrap_or(false);
             let block_declared = block_declared.get(i).copied().unwrap_or(false);
             if i < segs.sigma_start() {
-                Some(VarianceDecl::Omega {
-                    correlated,
-                    block_declared,
-                })
+                Some(VarianceDecl::Omega { correlated, block_declared })
             } else if i < iov_end {
-                Some(VarianceDecl::Kappa {
-                    correlated,
-                    block_declared,
-                })
+                Some(VarianceDecl::Kappa { correlated, block_declared })
             } else {
                 // A `[mixture]` Ω override (#977): one packed scalar each, in
                 // `omega_override_addr` order, immediately after the Ω_IOV
@@ -7969,8 +7511,7 @@ fn variance_decl_by_coordinate(template: &ModelParameters) -> Vec<Option<Varianc
 /// half-collapses (ω² 1e-5, σ 15% high) while reporting `converged: true`, so a warning nobody reads
 /// is no better than the post-hoc `parameter_at_runaway_guard`, which blames the data.
 pub(crate) fn check_variance_init_rails(
-    init_params: &ModelParameters,
-    options: &FitOptions,
+    init_params: &ModelParameters, options: &FitOptions,
 ) -> Vec<Diagnostic> {
     use crate::estimation::parameterization::{coordinate_names, pack_with_bounds, PackedStart};
 
@@ -8004,12 +7545,9 @@ pub(crate) fn check_variance_init_rails(
         // cannot be judged. `ModelParameters` is public and every producer in
         // the crate keeps these in lockstep, so that arm only guards a
         // hand-built one against a panic here.
-        let (Some(&p), Some(&lo), Some(&is_fixed), Some(Some(decl))) = (
-            packed.get(i),
-            bounds.lower.get(i),
-            fixed.get(i),
-            decls.get(i),
-        ) else {
+        let (Some(&p), Some(&lo), Some(&is_fixed), Some(Some(decl))) =
+            (packed.get(i), bounds.lower.get(i), fixed.get(i), decls.get(i))
+        else {
             continue;
         };
         if is_fixed || p > lo {
@@ -8136,9 +7674,7 @@ mod nn_input_scale_tests;
 /// Three failure classes, all errors: an unapplied or half-applied prior is invisible (the fit still
 /// converges and reports estimates).
 pub(crate) fn check_parameter_priors(
-    model: &CompiledModel,
-    init_params: &ModelParameters,
-    options: &FitOptions,
+    model: &CompiledModel, init_params: &ModelParameters, options: &FitOptions,
 ) -> Vec<Diagnostic> {
     if model.priors.is_empty() && model.prior_from_fit.is_none() {
         return Vec::new();
@@ -8246,10 +7782,7 @@ pub(crate) fn check_parameter_priors(
 /// M-step would need penalizing; planned), Bayes (already carries its own Ω prior) and VI do not.
 pub(crate) fn applies_parameter_priors(method: crate::types::EstimationMethod) -> bool {
     use crate::types::EstimationMethod as M;
-    matches!(
-        method,
-        M::Foce | M::FoceI | M::Laplace | M::FoceGn | M::FoceGnHybrid
-    )
+    matches!(method, M::Foce | M::FoceI | M::Laplace | M::FoceGn | M::FoceGnHybrid)
 }
 
 /// The `W_` token carried inside the message text of every start-outside-the-box
@@ -8340,8 +7873,7 @@ const THETA_START_EVAL_ONLY_TOKEN: &str = "W_THETA_INIT_OUTSIDE_BOUNDS";
 /// "strictly below"), so this check claims every strictly-outside coordinate **except** those:
 /// disjoint, and together exhaustive.
 pub(crate) fn check_packed_start_in_box(
-    init_params: &ModelParameters,
-    options: &FitOptions,
+    init_params: &ModelParameters, options: &FitOptions,
 ) -> Vec<Diagnostic> {
     use crate::estimation::parameterization::{
         coordinate_kinds, coordinate_names, coordinates_outside_bounds,
@@ -8375,19 +7907,13 @@ pub(crate) fn check_packed_start_in_box(
     for hit in coordinates_with_inverted_bounds(&start, &kinds) {
         inverted.insert(hit.index);
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
-        let name = names
-            .get(hit.index)
-            .cloned()
-            .unwrap_or_else(|| format!("#{}", hit.index));
+        let name = names.get(hit.index).cloned().unwrap_or_else(|| format!("#{}", hit.index));
         // Only THETA can reach this through the parser — every other segment's
         // bounds are constants and a FIX pin is `lower == upper` — so the
         // `cause` clause is THETA-shaped and a non-THETA coordinate simply
         // reports its packed bounds. See `coordinates_with_inverted_bounds`.
         let cause = if hit.kind == PackedCoordKind::Theta {
-            let (lo, hi) = (
-                init_params.theta_lower[hit.index],
-                init_params.theta_upper[hit.index],
-            );
+            let (lo, hi) = (init_params.theta_lower[hit.index], init_params.theta_upper[hit.index]);
             if !(lo <= hi) {
                 format!(
                     "its declared range is empty — the lower bound {lo:e} is above the upper \
@@ -8493,10 +8019,7 @@ pub(crate) fn check_packed_start_in_box(
         // — the same hand-built-`ModelParameters` guard the walks above carry.
         let seen = effective.get(mv.index).copied().unwrap_or(mv.represented);
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
-        let name = names
-            .get(mv.index)
-            .cloned()
-            .unwrap_or_else(|| format!("#{}", mv.index));
+        let name = names.get(mv.index).cloned().unwrap_or_else(|| format!("#{}", mv.index));
         let held = start.fixed.get(mv.index).copied().unwrap_or(false);
         // What the user has to change, which depends on the guard and not on
         // the coordinate: the floor is a property of `ln`, the ρ rail is a
@@ -8567,18 +8090,11 @@ pub(crate) fn check_packed_start_in_box(
         // `tanh(3)`, and the box rails are `exp(-8)`-shaped too. Same split
         // #1309's review applied to the box messages, for the same reason.
         let computed = seen != mv.represented || mv.guard != PackGuard::ValueFloor;
-        let represented = if computed {
-            format!("{seen:.6e}")
-        } else {
-            format!("{seen:e}")
-        };
+        let represented = if computed { format!("{seen:.6e}") } else { format!("{seen:e}") };
         // The box moved it a *second* time, so the cause has to name both steps
         // or the guard it blames will not explain the number it quotes.
         let chain = if seen != mv.represented {
-            format!(
-                ", which the optimizer's own box then clamps to {:.6e}",
-                seen
-            )
+            format!(", which the optimizer's own box then clamps to {:.6e}", seen)
         } else {
             String::new()
         };
@@ -8641,10 +8157,7 @@ pub(crate) fn check_packed_start_in_box(
         }
         declared_hits.insert((hit.index, hit.side));
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
-        let name = names
-            .get(hit.index)
-            .cloned()
-            .unwrap_or_else(|| format!("#{}", hit.index));
+        let name = names.get(hit.index).cloned().unwrap_or_else(|| format!("#{}", hit.index));
         // The interval a start actually has to land inside: the declaration
         // intersected with ferx's packing caps. Two things read it.
         //
@@ -8695,10 +8208,7 @@ pub(crate) fn check_packed_start_in_box(
                 || hit.value < 0.0
                 || (LOG_PACK_FLOOR..=THETA_PACK_CEIL).contains(&hit.value);
             let score_declared = if widening_scores_it {
-                format!(
-                    "To score {:e}, widen the declared range to include it;",
-                    hit.value
-                )
+                format!("To score {:e}, widen the declared range to include it;", hit.value)
             } else {
                 format!(
                     "{:e} cannot be scored while the lower bound is 0 or more: such a theta is \
@@ -8784,10 +8294,7 @@ pub(crate) fn check_packed_start_in_box(
             continue;
         }
         let names = names.get_or_insert_with(|| coordinate_names(init_params));
-        let name = names
-            .get(hit.index)
-            .cloned()
-            .unwrap_or_else(|| format!("#{}", hit.index));
+        let name = names.get(hit.index).cloned().unwrap_or_else(|| format!("#{}", hit.index));
         let side = hit.side.direction();
 
         // Everything reaching here is one of ferx's internal rails. The reporting scale
@@ -8823,10 +8330,7 @@ pub(crate) fn check_packed_start_in_box(
                      {:e}, which the packer cannot represent)",
                     init_params.theta_upper[hit.index],
                 ),
-                format!(
-                    "start {name} inside ({:e}, {:e})",
-                    LOG_PACK_FLOOR, THETA_PACK_CEIL
-                ),
+                format!("start {name} inside ({:e}, {:e})", LOG_PACK_FLOOR, THETA_PACK_CEIL),
             ),
             PackedCoordKind::OmegaDiagonal => {
                 // `exp(2·ln(L_ii)) = L_ii²`, which **is** the variance on a
@@ -8874,11 +8378,7 @@ pub(crate) fn check_packed_start_in_box(
             }
             PackedCoordKind::OmegaOffDiagonal => (
                 format!("a Cholesky element of {:.3e}", hit.packed),
-                format!(
-                    "the optimizer's {} rail of {:e}",
-                    hit.side.bound_name(),
-                    hit.bound
-                ),
+                format!("the optimizer's {} rail of {:e}", hit.side.bound_name(), hit.bound),
                 format!("reduce the covariances involving {name}"),
             ),
             // Σ is stored, packed and railed on the **SD** scale
@@ -8939,9 +8439,7 @@ mod packed_start_box_tests;
 /// warnings live in [`check_experimental_features`] instead, so `ferx check`
 /// surfaces them even without a `--data` file.
 pub fn check_model_data_warnings(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     check_model_data_warnings_rule(model, population, init_params, &IovOccasionRule::Column)
 }
@@ -8953,9 +8451,7 @@ pub fn check_model_data_warnings(
 /// population it has already prepared, whose occasions the rule has labelled, so
 /// [`check_model_data_warnings`] serves it.
 pub(crate) fn check_model_data_warnings_rule(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     iov_rule: &IovOccasionRule,
 ) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
@@ -8965,9 +8461,7 @@ pub(crate) fn check_model_data_warnings_rule(
     diags.extend(check_kappa_weight_variation(model, population));
     diags.extend(output_mixnum_is_class(model, population));
     diags.extend(residual_correlation_inert(model, population));
-    diags.extend(residual_correlation_partly_confounded(
-        model, population, iov_rule,
-    ));
+    diags.extend(residual_correlation_partly_confounded(model, population, iov_rule));
 
     // A compartment-free model (#811) has nothing for a dose to land in, so every
     // dose record the reader parsed is silently dropped from the prediction —
@@ -9009,11 +8503,8 @@ pub(crate) fn check_model_data_warnings_rule(
 
     // SS=1 with II ≤ 0 — the SS branch is gated on `dose.ii > 0`, so the dose
     // is silently treated as a single (non-SS) dose.
-    let n_ss_bad_ii = population
-        .subjects
-        .iter()
-        .filter(|s| s.doses.iter().any(|d| d.ss && d.ii <= 0.0))
-        .count();
+    let n_ss_bad_ii =
+        population.subjects.iter().filter(|s| s.doses.iter().any(|d| d.ss && d.ii <= 0.0)).count();
     if n_ss_bad_ii > 0 {
         diags.push(Diagnostic::warning(
             "W_STEADY_STATE_II",
@@ -9079,11 +8570,7 @@ pub(crate) fn check_model_data_warnings_rule(
             // returns the unequilibrated zero state without touching the RHS.
             d.cmt_idx() < n_states
         };
-        let n_ss = population
-            .subjects
-            .iter()
-            .filter(|s| s.doses.iter().any(equilibrates))
-            .count();
+        let n_ss = population.subjects.iter().filter(|s| s.doses.iter().any(equilibrates)).count();
         if n_ss > 0 {
             let (reads_tafd, reads_solver_time) =
                 (prog.pk_reads_tafd(), prog.pk_reads_solver_time());
@@ -9157,11 +8644,7 @@ pub(crate) fn check_model_data_warnings_rule(
     // explicit starting amount usually express the same idea twice, double-counting
     // the baseline. Surface it rather than silently combine them.
     if !model.analytical_init.is_empty() {
-        let n_ss_init = population
-            .subjects
-            .iter()
-            .filter(|s| s.has_ss_doses())
-            .count();
+        let n_ss_init = population.subjects.iter().filter(|s| s.has_ss_doses()).count();
         if n_ss_init > 0 {
             diags.push(Diagnostic::warning(
                 "W_STEADY_STATE_INIT",
@@ -9274,11 +8757,7 @@ pub(crate) fn check_model_data_warnings_rule(
 
     // EVID=3/4 resets are not honoured on the EKF/SDE path.
     if model.is_sde() {
-        let n_reset_sde = population
-            .subjects
-            .iter()
-            .filter(|s| s.has_resets())
-            .count();
+        let n_reset_sde = population.subjects.iter().filter(|s| s.has_resets()).count();
         if n_reset_sde > 0 {
             diags.push(Diagnostic::warning(
                 "W_SDE_RESET",
@@ -9329,10 +8808,7 @@ pub(crate) fn check_model_data_warnings_rule(
         PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg
     ) && model.absorption_ode_equivalent.is_some()
     {
-        let is_transit = matches!(
-            model.pk_model,
-            PkModel::OneCptTransit | PkModel::TwoCptTransit
-        );
+        let is_transit = matches!(model.pk_model, PkModel::OneCptTransit | PkModel::TwoCptTransit);
         for subject in &population.subjects {
             // Reuse the exact runtime reroute decision (validity + domain + confluent), so
             // this heads-up fires precisely when a flip-flop reroute happens.
@@ -9504,9 +8980,7 @@ pub(crate) fn check_model_data_warnings_rule(
 /// scale): a genuinely small-but-intended additive floor of a few % of the data
 /// does not trip it; only an essentially-zero start does.
 fn additive_init_scale_warnings(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
 ) -> Vec<Diagnostic> {
     use crate::types::{EndpointError, ErrorModel, ErrorSpec, SigmaType};
     use std::collections::HashMap;
@@ -9524,11 +8998,8 @@ fn additive_init_scale_warnings(
     let mut push_endpoints = |map: &HashMap<usize, EndpointError>, label: &str| {
         for (&key, ee) in map {
             if ee.error_model == ErrorModel::Combined {
-                if let Some(pos) = ee
-                    .error_model
-                    .sigma_types()
-                    .iter()
-                    .position(|t| *t == SigmaType::Additive)
+                if let Some(pos) =
+                    ee.error_model.sigma_types().iter().position(|t| *t == SigmaType::Additive)
                 {
                     if let Some(&idx) = ee.sigma_idx.get(pos) {
                         combined_endpoints.push((idx, Some(key), format!("{label}={key}")));
@@ -9591,21 +9062,15 @@ fn additive_init_scale_warnings(
 /// the caller does not reuse it afterwards. Returns `None` for an empty/all-zero
 /// data scale (nothing to compare against) or a non-negligible additive start.
 fn additive_init_scale_check(
-    scope: &str,
-    sigma_name: &str,
-    add_sd_init: f64,
-    mags: &mut [f64],
+    scope: &str, sigma_name: &str, add_sd_init: f64, mags: &mut [f64],
 ) -> Option<Diagnostic> {
     if mags.is_empty() {
         return None;
     }
     mags.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = mags.len() / 2;
-    let data_scale = if mags.len() % 2 == 1 {
-        mags[mid]
-    } else {
-        0.5 * (mags[mid - 1] + mags[mid])
-    };
+    let data_scale =
+        if mags.len() % 2 == 1 { mags[mid] } else { 0.5 * (mags[mid - 1] + mags[mid]) };
     if data_scale <= 0.0 || add_sd_init >= NEGLIGIBLE_ADD_FRACTION * data_scale {
         return None;
     }
@@ -9663,18 +9128,14 @@ const NEGLIGIBLE_ADD_FRACTION: f64 = 0.01;
 /// (#1824): `fit()` has armed its `FitOptions::bloq_method` override by the time this runs,
 /// and on `ferx check` parsing has stamped the model file's onto the model.
 pub(crate) fn check_zero_dv_magnitude_only(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
 ) -> Option<Diagnostic> {
     zero_dv_magnitude_only_under(model, population, init_params, model.bloq_in_force())
 }
 
 /// [`check_zero_dv_magnitude_only`] under an explicit censoring method, for its unit tests.
 fn zero_dv_magnitude_only_under(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     bloq: crate::types::BloqMethod,
 ) -> Option<Diagnostic> {
     let sigma = &init_params.sigma.values;
@@ -9689,10 +9150,7 @@ fn zero_dv_magnitude_only_under(
             }
             #[cfg(feature = "survival")]
             if !model.endpoints.is_empty()
-                && subject
-                    .obs_cmts
-                    .get(j)
-                    .is_some_and(|c| model.endpoints.contains_key(c))
+                && subject.obs_cmts.get(j).is_some_and(|c| model.endpoints.contains_key(c))
             {
                 continue;
             }
@@ -9867,8 +9325,7 @@ pub(crate) fn check_nn_bare_output_start(model: &CompiledModel, theta: &[f64]) -
 /// hidden activations only; one warning per block, naming every such input.
 #[cfg(feature = "nn")]
 pub(crate) fn check_nn_input_scale(
-    model: &CompiledModel,
-    population: &crate::types::Population,
+    model: &CompiledModel, population: &crate::types::Population,
 ) -> Vec<Diagnostic> {
     use crate::nn::Activation;
     let mut diags = Vec::new();
@@ -10085,9 +9542,8 @@ pub(crate) fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
         // model. The tag is read back out of the one phrase the emitting arm
         // always carries it in, at its first occurrence: the emitter writes it
         // before the quoted line.
-        let tag_is_sd = head
-            .split_once("the scale tag `(")
-            .is_some_and(|(_, rest)| rest.starts_with("sd)`"));
+        let tag_is_sd =
+            head.split_once("the scale tag `(").is_some_and(|(_, rest)| rest.starts_with("sd)`"));
         let suggestion = if tag_is_sd {
             "square each SD into a variance and write the off-diagonals as covariances"
         } else {
@@ -10238,9 +9694,7 @@ pub fn validate_model_file(model_path: &str, data_path: Option<&str>) -> CheckRe
 /// since the options every other check would read are not ones any fit runs
 /// with. An empty `overrides` is exactly [`validate_model_file`].
 pub fn validate_model_file_with(
-    model_path: &str,
-    data_path: Option<&str>,
-    overrides: &[(String, String)],
+    model_path: &str, data_path: Option<&str>, overrides: &[(String, String)],
 ) -> CheckReport {
     use crate::io::model_source::ModelSource;
 
@@ -10274,11 +9728,7 @@ pub fn validate_model_file_with(
     // below would describe options no fit runs with.
     let override_errors = apply_fit_option_overrides(&mut parsed, overrides);
     if !override_errors.is_empty() {
-        return CheckReport::new(
-            model_name,
-            data_path.map(|s| s.to_string()),
-            override_errors,
-        );
+        return CheckReport::new(model_name, data_path.map(|s| s.to_string()), override_errors);
     }
 
     // Resolve which dataset (if any) to check against: an explicit
@@ -10324,19 +9774,13 @@ pub fn validate_model_file_with(
     //    without `--data`. The fit path evaluates the same predicate on its
     //    *actual* `init_params`; here the parsed inits are all there is, which
     //    is exactly what the model file declares.
-    diags.extend(check_variance_init_rails(
-        &parsed.model.default_params,
-        &parsed.fit_options,
-    ));
+    diags.extend(check_variance_init_rails(&parsed.model.default_params, &parsed.fit_options));
 
     // 2b-ter. Initial estimates strictly outside their own packed box (#1251).
     //    Same inputs, same data-independence: `ferx check model.ferx` reports a
     //    θ outside its declared range without a dataset, exactly as `fit()`
     //    refuses it.
-    diags.extend(check_packed_start_in_box(
-        &parsed.model.default_params,
-        &parsed.fit_options,
-    ));
+    diags.extend(check_packed_start_in_box(&parsed.model.default_params, &parsed.fit_options));
 
     // 2b-quater. A `prior(...)` that cannot be applied (#254). Same inputs and
     //    the same data-independence as the two above: a prior resolves against
@@ -10361,10 +9805,7 @@ pub fn validate_model_file_with(
     // A `[covariate_nn]` with no `init` (#1561): a property of the model's own starting
     // values, so it needs no `--data` either.
     #[cfg(feature = "nn")]
-    diags.extend(check_nn_bare_output_start(
-        &parsed.model,
-        &parsed.model.default_params.theta,
-    ));
+    diags.extend(check_nn_bare_output_start(&parsed.model, &parsed.model.default_params.theta));
 
     // 2c'. A TIME-dependent disposition under an ODE-accumulated hazard (#1853): a
     //    function of the model alone, so it needs no `--data`. `fit()` and every
@@ -10579,8 +10020,7 @@ pub fn validate_model_file_with(
 /// a check reaches sits behind `check_model_options`, which arms
 /// `options.bloq_method` itself — and `fit()` resolves both from its options too.
 fn apply_fit_option_overrides(
-    parsed: &mut crate::types::ParsedModel,
-    overrides: &[(String, String)],
+    parsed: &mut crate::types::ParsedModel, overrides: &[(String, String)],
 ) -> Vec<Diagnostic> {
     let mut errors = Vec::new();
     for (key, value) in overrides {
@@ -10624,9 +10064,7 @@ fn apply_fit_option_overrides(
 /// cannot bind is a `[covariate_model]` one. The binders assign the code (#1773),
 /// so `check` reports the diagnostic a caller of the binder gets.
 pub(crate) fn bind_for_check(
-    parsed: &mut crate::types::ParsedModel,
-    model_text: &str,
-    population: &mut Population,
+    parsed: &mut crate::types::ParsedModel, model_text: &str, population: &mut Population,
 ) -> Result<(), Diagnostic> {
     crate::api::levels::bind_theta_levels_diag(parsed, model_text, population)?;
     crate::api::covariate_stats::bind_covariate_stats_diag(parsed, model_text, population)
@@ -10638,17 +10076,13 @@ pub(crate) fn bind_for_check(
 /// the model already (an expression reads the built-in). In the warning bundle
 /// ([`check_model_data_warnings`]) so `fit()` reports it as `ferx check` does.
 pub(crate) fn output_mixnum_is_class(
-    model: &CompiledModel,
-    population: &Population,
+    model: &CompiledModel, population: &Population,
 ) -> Option<Diagnostic> {
     let col = model
         .output_columns
         .iter()
         .find(|c| super::output_columns::is_mixture_class_column(model, c))?;
-    let data_col = population
-        .covariate_names
-        .iter()
-        .find(|c| c.eq_ignore_ascii_case(col))?;
+    let data_col = population.covariate_names.iter().find(|c| c.eq_ignore_ascii_case(col))?;
     Some(Diagnostic::warning(
         "W_OUTPUT_MIXNUM_IS_CLASS",
         format!(
@@ -10664,11 +10098,7 @@ pub(crate) fn output_mixnum_is_class(
 /// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
 pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
-    let derived_names: Vec<&str> = model
-        .derived_exprs
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect();
+    let derived_names: Vec<&str> = model.derived_exprs.iter().map(|s| s.name.as_str()).collect();
     let cov_names = &population.covariate_names;
 
     for col in &model.output_columns {

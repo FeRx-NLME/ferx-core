@@ -166,11 +166,7 @@ fn a_fit_whose_objective_is_nan_is_not_reported_converged() {
         .unwrap_or_else(|| {
             panic!(
                 "the demotion must carry a typed warning naming the objective; got {:?}",
-                result
-                    .warnings_structured
-                    .iter()
-                    .map(|w| &w.message)
-                    .collect::<Vec<_>>()
+                result.warnings_structured.iter().map(|w| &w.message).collect::<Vec<_>>()
             )
         });
     assert_eq!(
@@ -191,11 +187,7 @@ fn a_fit_whose_objective_is_nan_is_not_reported_converged() {
     // and keeps the typed one. Without that explicit de-duplication a user reads
     // the same paragraph twice.
     assert_eq!(
-        result
-            .warnings
-            .iter()
-            .filter(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN))
-            .count(),
+        result.warnings.iter().filter(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)).count(),
         1,
         "the plain-text warnings must carry it exactly once — that is what the CLI and the \
          fit YAML print: {:?}",
@@ -330,12 +322,7 @@ fn the_gate_rejects_the_finite_sentinel_not_only_nan() {
             msg.contains(what),
             "the message must name which way it failed; ofv = {ofv:?} is `{what}`: {msg}"
         );
-        for other in [
-            "NaN",
-            "infinite",
-            "at the divergence sentinel",
-            "too large to be a fit",
-        ] {
+        for other in ["NaN", "infinite", "at the divergence sentinel", "too large to be a fit"] {
             assert!(
                 other == what || !msg.contains(other),
                 "ofv = {ofv:?} is `{what}`, and the message also says `{other}`: {msg}"
@@ -433,18 +420,12 @@ fn vi_publishing_no_objective_is_exempt_but_vi_publishing_one_is_not() {
         vi_final_ofv: ViFinalOfv::None,
         ..Default::default()
     };
-    let laplace_vi = FitOptions {
-        vi_final_ofv: ViFinalOfv::Laplace,
-        ..default_vi.clone()
-    };
+    let laplace_vi = FitOptions { vi_final_ofv: ViFinalOfv::Laplace, ..default_vi.clone() };
 
     assert!(publishes_no_objective(EstimationMethod::Vi, &default_vi));
     assert!(!publishes_no_objective(EstimationMethod::Vi, &laplace_vi));
     // Not a property of the method on its own, and not one any other method has.
-    assert!(!publishes_no_objective(
-        EstimationMethod::FoceI,
-        &default_vi
-    ));
+    assert!(!publishes_no_objective(EstimationMethod::FoceI, &default_vi));
 
     let mut converged = true;
     assert!(
@@ -457,10 +438,7 @@ fn vi_publishing_no_objective_is_exempt_but_vi_publishing_one_is_not() {
         .is_none(),
         "the default VI NaN is a declaration that no objective was published, not a failed one"
     );
-    assert!(
-        converged,
-        "every default VI fit would otherwise report converged: false"
-    );
+    assert!(converged, "every default VI fit would otherwise report converged: false");
 
     let mut converged = true;
     let (msg, entry) = crate::api::nonfinite_objective_warning(
@@ -551,10 +529,7 @@ fn a_trailing_eval_only_imp_stage_does_not_claim_vis_deliberate_nan() {
     // The regression: VI's declaration that it published no objective must not be
     // read as IMP's failure to produce one.
     assert!(
-        !result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+        !result.warnings.iter().any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
         "the deliberate VI NaN was reported as a non-finite-objective failure: {:?}",
         result.warnings
     );
@@ -639,10 +614,7 @@ fn an_agq_readout_owns_the_objective_it_writes() {
         result.ofv
     );
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+        result.warnings.iter().any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
         "{:?}",
         result.warnings
     );
@@ -839,9 +811,7 @@ fn the_optimizer_publishes_its_own_gated_verdict_not_only_fit() {
         out.ofv
     );
     assert!(
-        out.warnings
-            .iter()
-            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+        out.warnings.iter().any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
         "the reason travels on the OuterResult too, not only on the FitResult: {:?}",
         out.warnings
     );
@@ -1044,9 +1014,7 @@ fn foce_source() -> ContributionSource {
 
 /// A term scorer for a model with no separately scored term.
 fn no_terms(
-    _: usize,
-    _: &Subject,
-    _: &SubjectResult,
+    _: usize, _: &Subject, _: &SubjectResult,
 ) -> Vec<crate::api::postfit::ContributionTerm> {
     Vec::new()
 }
@@ -1150,19 +1118,14 @@ fn the_warning_names_each_unusable_subject_with_its_first_bad_record() {
          NaN, every observation's likelihood term usable on its own; every IPRED and PRED \
          finite)."
     );
-    assert_eq!(
-        entry.message, full,
-        "the structured message and the string one say the same thing"
-    );
+    assert_eq!(entry.message, full, "the structured message and the string one say the same thing");
 
     let details = entry.details.as_ref().expect("the gate's payload");
     assert_eq!(
         details["reason"], "at the divergence sentinel",
         "the gate's own keys are kept: {details}"
     );
-    let subjects = details["unusable_subjects"]
-        .as_array()
-        .expect("an unusable_subjects array");
+    let subjects = details["unusable_subjects"].as_array().expect("an unusable_subjects array");
     assert_eq!(
         subjects,
         &vec![
@@ -1217,11 +1180,7 @@ fn a_warning_with_no_unusable_subject_says_why_it_names_nobody() {
     );
     assert_eq!(entry.message, out);
     let details = entry.details.as_ref().expect("payload");
-    assert_eq!(
-        details["unusable_subjects"],
-        serde_json::json!([]),
-        "{details}"
-    );
+    assert_eq!(details["unusable_subjects"], serde_json::json!([]), "{details}");
     assert_eq!(details["ofv_prior"], 0.0, "{details}");
 
     let large: Vec<SubjectResult> = ["A", "B"]
@@ -1260,10 +1219,7 @@ fn a_warning_with_no_unusable_subject_says_why_it_names_nobody() {
     );
     assert_eq!(
         (&details["reason"], &details["reason_read_from"]),
-        (
-            &serde_json::json!("at the divergence sentinel"),
-            &serde_json::json!("total")
-        ),
+        (&serde_json::json!("at the divergence sentinel"), &serde_json::json!("total")),
         "a 2e20 objective over subjects summing to 1.2e14 is not their sum: {details}"
     );
 }
@@ -1304,17 +1260,9 @@ fn a_subject_not_matched_to_its_data_is_named_without_a_time() {
         "{full}"
     );
     let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
-    assert_eq!(
-        subjects[0]["first_time"],
-        serde_json::Value::Null,
-        "{subjects}"
-    );
+    assert_eq!(subjects[0]["first_time"], serde_json::Value::Null, "{subjects}");
     assert_eq!(subjects[0]["nonfinite_predictions"], 1, "{subjects}");
-    assert_eq!(
-        subjects[0]["first_unusable_term_time"],
-        serde_json::Value::Null,
-        "{subjects}"
-    );
+    assert_eq!(subjects[0]["first_unusable_term_time"], serde_json::Value::Null, "{subjects}");
     assert_eq!(
         subjects[0]["unusable_terms"],
         serde_json::Value::Null,
@@ -1349,16 +1297,9 @@ fn a_non_finite_written_time_is_carried_as_null() {
         &no_terms,
     );
     assert!(full.ends_with("the first at TIME NaN)."), "{full}");
-    assert!(
-        full.contains("the first at TIME NaN (DV 5.555555555555555, IPRED NaN);"),
-        "{full}"
-    );
+    assert!(full.contains("the first at TIME NaN (DV 5.555555555555555, IPRED NaN);"), "{full}");
     let subjects = entry.details.as_ref().expect("payload")["unusable_subjects"].clone();
-    assert_eq!(
-        subjects[0]["first_time"],
-        serde_json::Value::Null,
-        "{subjects}"
-    );
+    assert_eq!(subjects[0]["first_time"], serde_json::Value::Null, "{subjects}");
     assert_eq!(subjects[0]["nonfinite_predictions"], 1, "{subjects}");
 }
 
@@ -1532,10 +1473,7 @@ fn a_negative_covariate_on_every_record_names_its_subject() {
         control.ofv
     );
     assert!(
-        !control
-            .warnings
-            .iter()
-            .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+        !control.warnings.iter().any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
         "{:?}",
         control.warnings
     );
@@ -1590,11 +1528,7 @@ fn a_negative_covariate_on_one_record_names_the_record() {
             ),
             "{engine}: {message}"
         );
-        assert_eq!(
-            subjects.len(),
-            1,
-            "{engine}: only subject 3 is named: {subjects:?}"
-        );
+        assert_eq!(subjects.len(), 1, "{engine}: only subject 3 is named: {subjects:?}");
     }
 }
 
@@ -1636,10 +1570,7 @@ fn a_runaway_residual_error_eta_names_every_record() {
             "an unusable likelihood term on 4 of 4 observations, the first at TIME 0.5 \
              (DV 33.333333333333336, IPRED 1);",
         ),
-        (
-            0.0,
-            "every observation's likelihood term usable on its own;",
-        ),
+        (0.0, "every observation's likelihood term usable on its own;"),
     ] {
         let mut a = crate::types::test_helpers::dummy_subject("A", 2, 4);
         a.ofv_contribution = 2e20;
@@ -1677,10 +1608,7 @@ fn a_censored_record_is_scored_by_its_m3_term() {
     a.ofv_contribution = 2e20;
     a.ipred[0] = 0.0;
     for (bloq, want) in [
-        (
-            BloqMethod::M3,
-            "every observation's likelihood term usable on its own;",
-        ),
+        (BloqMethod::M3, "every observation's likelihood term usable on its own;"),
         (
             BloqMethod::Drop,
             "an unusable likelihood term on 1 of 4 observations, the first at TIME 0.5 \
@@ -1780,9 +1708,7 @@ fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
                 "{engine} at DV {dv}: {subjects:?}"
             );
             assert!(
-                message.contains(&format!(
-                    "observations, the first at TIME 0 (DV {dv}, IPRED "
-                )),
+                message.contains(&format!("observations, the first at TIME 0 (DV {dv}, IPRED ")),
                 "{engine} at DV {dv}: the term clause names TIME 0: {message}"
             );
             assert!(
@@ -1796,11 +1722,8 @@ fn a_runaway_ebe_names_the_record_with_the_unusable_term_on_both_engines() {
 /// One subject `A` (`shifted_subject`) whose first record reads `dv`, named by a
 /// sentinel warning with `ipred0` as that record's `IPRED`; returns the sentence.
 fn name_first_record(
-    model: &CompiledModel,
-    params: &crate::types::ModelParameters,
-    mixest: Option<&[usize]>,
-    dv: f64,
-    ipred0: f64,
+    model: &CompiledModel, params: &crate::types::ModelParameters, mixest: Option<&[usize]>,
+    dv: f64, ipred0: f64,
 ) -> String {
     let mut data = shifted_subject("A");
     data.observations[0] = dv;
@@ -1858,10 +1781,7 @@ fn a_negative_prediction_is_scored_as_the_scorer_scores_it() {
     let got = name_first_record(&m, p, None, 20.0, -1.0);
     assert!(got.contains(NAMES_NONE), "IPRED −1: {got}");
     let got = name_first_record(&m, p, None, 20.0, 0.0);
-    assert!(
-        got.contains(&format!("{NAMES_FIRST} (DV 20, IPRED 0);")),
-        "IPRED 0: {got}"
-    );
+    assert!(got.contains(&format!("{NAMES_FIRST} (DV 20, IPRED 0);")), "IPRED 0: {got}");
 }
 
 /// Two classes of one proportional error: class 1's σ is `1e-7` (sd), class 2's `0.5`.
@@ -1962,16 +1882,10 @@ fn a_mixture_subject_is_selected_under_its_fitted_class() {
         (c, unnamed, got)
     };
     let (c2, unnamed2, got2) = run(1);
-    assert!(
-        c2.is_finite() && c2 < 1e14,
-        "class 2: contribution {c2} is usable"
-    );
+    assert!(c2.is_finite() && c2 < 1e14, "class 2: contribution {c2} is usable");
     assert!(unnamed2, "class 2 is not named: {got2}");
     let (c1, unnamed1, got1) = run(0);
-    assert!(
-        !(c1 < 1e14),
-        "premise, class 1: contribution {c1} past the cutoff"
-    );
+    assert!(!(c1 < 1e14), "premise, class 1: contribution {c1} past the cutoff");
     assert!(
         !unnamed1
             && got1.contains(
@@ -2020,10 +1934,7 @@ fn the_fitted_residual_correlation_is_the_one_scored() {
     let mut fitted = declared.clone();
     fitted.residual_correlations[0].rho = -1.0;
     let got = name_first_record(&m, &fitted, None, 30.0, 10.0);
-    assert!(
-        got.contains(&format!("{NAMES_FIRST} (DV 30, IPRED 10);")),
-        "fitted ρ = −1: {got}"
-    );
+    assert!(got.contains(&format!("{NAMES_FIRST} (DV 30, IPRED 10);")), "fitted ρ = −1: {got}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2031,10 +1942,7 @@ fn the_fitted_residual_correlation_is_the_one_scored() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn term(name: &str, nll: f64) -> crate::api::postfit::ContributionTerm {
-    crate::api::postfit::ContributionTerm {
-        name: name.into(),
-        nll,
-    }
+    crate::api::postfit::ContributionTerm { name: name.into(), nll }
 }
 
 /// **T1 — the sentence names the term that failed.**
@@ -2080,10 +1988,7 @@ fn the_sentence_names_the_term_that_failed() {
             "T" | "X" => vec![term("time-to-event on CMT 2", 1e20)],
             "U" => vec![term("time-to-event on CMT 2", 3.25)],
             "V" => vec![term("IOV + FREM refusal", 1e18)],
-            "W" => vec![
-                term("time-to-event on CMT 2", f64::NAN),
-                term("categorical", 1e20),
-            ],
+            "W" => vec![term("time-to-event on CMT 2", f64::NAN), term("categorical", 1e20)],
             other => panic!("{other}"),
         }
     };
@@ -2114,10 +2019,7 @@ fn the_sentence_names_the_term_that_failed() {
     );
     let details = entry.details.as_ref().expect("payload");
     assert_eq!(details["contribution_score"], "FOCEI", "{details}");
-    assert_eq!(
-        details["contributions_are_objective_terms"], true,
-        "{details}"
-    );
+    assert_eq!(details["contributions_are_objective_terms"], true, "{details}");
     let failed: Vec<&serde_json::Value> = details["unusable_subjects"]
         .as_array()
         .expect("subjects")
@@ -2162,14 +2064,7 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
         (FoceGnHybrid, false, 1, false, "FOCE", None),
         (FoceI, true, 3, false, "FOCEI", Some("FOCEI (n_agq = 3)")),
         (Laplace, true, 1, false, "FOCEI", Some("LAPLACE")),
-        (
-            Laplace,
-            true,
-            5,
-            false,
-            "FOCEI",
-            Some("LAPLACE (n_agq = 5)"),
-        ),
+        (Laplace, true, 5, false, "FOCEI", Some("LAPLACE (n_agq = 5)")),
         // SAEM, IMP, IMPMAP and VI's `vi_final_ofv = laplace` publish `2·pop_nll`,
         // the sum of these scores (review r1).
         (Saem, true, 1, false, "FOCEI", None),
@@ -2211,12 +2106,8 @@ fn the_contribution_source_names_every_objective_it_is_not_a_term_of() {
 #[test]
 fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody() {
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
-    let laplace = ContributionSource::of(
-        EstimationMethod::Laplace,
-        &FitOptions::default(),
-        false,
-        0.0,
-    );
+    let laplace =
+        ContributionSource::of(EstimationMethod::Laplace, &FitOptions::default(), false, 0.0);
     let healthy = [
         crate::types::test_helpers::dummy_subject("A", 1, 4),
         crate::types::test_helpers::dummy_subject("B", 1, 4),
@@ -2291,15 +2182,8 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         "{past}"
     );
     let details = entry.details.as_ref().expect("payload");
-    assert_eq!(
-        details["unusable_subjects"],
-        serde_json::json!([]),
-        "{details}"
-    );
-    assert_eq!(
-        details["contributions_are_objective_terms"], false,
-        "{details}"
-    );
+    assert_eq!(details["unusable_subjects"], serde_json::json!([]), "{details}");
+    assert_eq!(details["contributions_are_objective_terms"], false, "{details}");
     assert_eq!(entry.message, nobody);
 
     let (msg, mut entry) = sentinel_warning();
@@ -2314,10 +2198,7 @@ fn a_non_foce_objective_says_whose_contributions_it_lists_or_why_it_names_nobody
         &foce_source(),
         &no_terms,
     );
-    assert!(
-        control.ends_with("every IPRED and PRED finite)."),
-        "{control}"
-    );
+    assert!(control.ends_with("every IPRED and PRED finite)."), "{control}");
 
     let (msg, mut entry) = sentinel_warning();
     let listed = name_nonfinite_subjects(
@@ -2367,11 +2248,7 @@ fn overflowing_tte(overflow: bool) -> (CompiledModel, Population) {
     let mut lines = text.lines();
     let mut csv = format!("{},Z\n", lines.next().expect("header"));
     for line in lines {
-        let z = if overflow && line.starts_with("3,") {
-            "1000"
-        } else {
-            "0"
-        };
+        let z = if overflow && line.starts_with("3,") { "1000" } else { "0" };
         csv.push_str(&format!("{line},{z}\n"));
     }
     let mut f = tempfile::NamedTempFile::new().unwrap();
@@ -2431,10 +2308,7 @@ fn an_overflowing_hazard_names_its_time_to_event_term() {
             control.ofv
         );
         assert!(
-            !control
-                .warnings
-                .iter()
-                .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+            !control.warnings.iter().any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
             "{method:?}: {:?}",
             control.warnings
         );
@@ -2558,10 +2432,7 @@ fn a_term_is_judged_on_the_ofv_scale_and_shown_raw() {
     let mut a = crate::types::test_helpers::dummy_subject("A", 1, 0);
     a.ofv_contribution = 2e14;
     let scorer = |_: usize, _: &Subject, _: &SubjectResult| {
-        vec![
-            term("time-to-event on CMT 2", 6e13),
-            term("categorical", 4e13),
-        ]
+        vec![term("time-to-event on CMT 2", 6e13), term("categorical", 4e13)]
     };
     let (msg, mut entry) = sentinel_warning();
     let full = name_nonfinite_subjects(
@@ -2591,11 +2462,7 @@ fn a_term_is_judged_on_the_ofv_scale_and_shown_raw() {
 /// A one-compartment IV bolus with proportional error, one η on `CL`, optionally under
 /// `bloq_method = m3`.
 fn proportional_iv(m3: bool) -> CompiledModel {
-    let fit_options = if m3 {
-        "[fit_options]\n  bloq_method = m3\n"
-    } else {
-        ""
-    };
+    let fit_options = if m3 { "[fit_options]\n  bloq_method = m3\n" } else { "" };
     parse_model_string(&format!(
         r#"
 [parameters]
@@ -2651,10 +2518,7 @@ fn a_finite_zero_prediction_names_the_gaussian_residual_term() {
         };
         let control = fit(&model, &pop(false), &model.default_params, &opts).expect("fit");
         assert!(
-            !control
-                .warnings
-                .iter()
-                .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+            !control.warnings.iter().any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
             "{method:?}: {:?}",
             control.warnings
         );
@@ -2663,14 +2527,9 @@ fn a_finite_zero_prediction_names_the_gaussian_residual_term() {
         let (message, subjects) = named_subjects(&result);
         assert_eq!(subjects.len(), 1, "{method:?}: {subjects:?}");
         assert_eq!(subjects[0]["id"], "3");
-        let failed = subjects[0]["failed_terms"]
-            .as_array()
-            .expect("failed_terms");
+        let failed = subjects[0]["failed_terms"].as_array().expect("failed_terms");
         assert_eq!(
-            failed
-                .iter()
-                .map(|t| t["term"].as_str().unwrap())
-                .collect::<Vec<_>>(),
+            failed.iter().map(|t| t["term"].as_str().unwrap()).collect::<Vec<_>>(),
             vec![residual],
             "{method:?}: only the residual term fails: {message}"
         );
@@ -2738,16 +2597,10 @@ fn each_branch_records_the_parts_of_its_own_contribution() {
     let independent = model.residual_cov_at(&params);
     let serial = |rho: f64| ResidualCov {
         pairs: &[],
-        serial: Some(SerialCov {
-            kind: ResidualSerialKind::Cs,
-            rho,
-        }),
+        serial: Some(SerialCov { kind: ResidualSerialKind::Cs, rho }),
     };
     let ebe = |subject: &Subject| {
-        let opts = FitOptions {
-            method: EstimationMethod::FoceI,
-            ..Default::default()
-        };
+        let opts = FitOptions { method: EstimationMethod::FoceI, ..Default::default() };
         crate::estimation::inner_optimizer::find_ebe_for_stage(
             &model, subject, &params, 200, 1e-8, None, None, 0, &opts,
         )
@@ -2828,11 +2681,7 @@ fn each_branch_records_the_parts_of_its_own_contribution() {
             &q_ebe,
             serial(0.5),
             true,
-            vec![
-                "Gaussian residual term",
-                "random-effect prior",
-                "curvature log-determinant",
-            ],
+            vec!["Gaussian residual term", "random-effect prior", "curvature log-determinant"],
         ),
     ];
     for (label, subject, e, cov, interaction, want) in branches {
@@ -2856,13 +2705,7 @@ fn each_branch_records_the_parts_of_its_own_contribution() {
     // The straddles: the r3 splitter's row-wise FOCEI parts are not the FOCE contribution,
     // and the independent-row FOCEI marginal is not the dense one.
     let foce = contribution(&censored, &c_ebe.eta, &c_ebe.h_matrix, independent, false);
-    let rowwise = twice_sum(&parts(
-        &censored,
-        &c_ebe.eta,
-        &c_ebe.h_matrix,
-        independent,
-        true,
-    ));
+    let rowwise = twice_sum(&parts(&censored, &c_ebe.eta, &c_ebe.h_matrix, independent, true));
     let dense = contribution(&quantified, &q_ebe.eta, &q_ebe.h_matrix, serial(0.5), true);
     let undense = contribution(&quantified, &q_ebe.eta, &q_ebe.h_matrix, independent, true);
     eprintln!(
@@ -2875,10 +2718,8 @@ fn each_branch_records_the_parts_of_its_own_contribution() {
     // `inf`), so the residual fails too. The prior is asserted to be named, and its value.
     let runaway = DVector::from_vec(vec![1e8]);
     let prior = parts(&censored, &runaway, &c_ebe.h_matrix, independent, true);
-    let (_, prior_nll) = prior
-        .iter()
-        .find(|(n, _)| n == "random-effect prior")
-        .expect("prior part");
+    let (_, prior_nll) =
+        prior.iter().find(|(n, _)| n == "random-effect prior").expect("prior part");
     assert!(
         *prior_nll > 1e17 && failing(&prior).contains(&"random-effect prior".to_string()),
         "{prior:?}"
@@ -2899,13 +2740,7 @@ fn each_branch_records_the_parts_of_its_own_contribution() {
     // Compound symmetry at ρ = 1.5 over four rows has eigenvalue 1 − ρ < 0: the dense `R`
     // does not factor, while every row's own variance is usable.
     assert_eq!(
-        failing(&parts(
-            &quantified,
-            &q_ebe.eta,
-            &q_ebe.h_matrix,
-            serial(1.5),
-            true
-        )),
+        failing(&parts(&quantified, &q_ebe.eta, &q_ebe.h_matrix, serial(1.5), true)),
         vec!["Gaussian residual covariance R (not positive definite)".to_string()],
     );
 }
@@ -2936,15 +2771,9 @@ fn proportional_iov() -> CompiledModel {
 /// Subject `id` of [`proportional_iov`], dosed at `dose_times` (one per occasion).
 fn iov_subject(id: &str, dose_times: [f64; 2], scale: f64) -> Subject {
     let mut s = subject_with_dose_time(id, dose_times[0], scale);
-    s.doses = dose_times
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
+    s.doses = dose_times.iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect();
     s.obs_times = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    s.observations = [36.0, 28.0, 21.0, 34.0, 26.0, 19.0]
-        .iter()
-        .map(|y| scale * y)
-        .collect();
+    s.observations = [36.0, 28.0, 21.0, 34.0, 26.0, 19.0].iter().map(|y| scale * y).collect();
     s.obs_cmts = vec![1; 6];
     s.cens = vec![0; 6];
     s.occasions = vec![1, 1, 1, 2, 2, 2];
@@ -2985,10 +2814,7 @@ fn an_iov_subject_names_the_part_of_its_stacked_marginal_that_failed() {
         };
         let control = fit(&model, &pop(false), &model.default_params, &opts).expect("fit");
         assert!(
-            !control
-                .warnings
-                .iter()
-                .any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
+            !control.warnings.iter().any(|w| w.contains(NONFINITE_OBJECTIVE_TOKEN)),
             "{method:?}: {:?}",
             control.warnings
         );
@@ -3007,9 +2833,7 @@ fn an_iov_subject_names_the_part_of_its_stacked_marginal_that_failed() {
             .collect();
         assert_eq!(failed, vec![residual], "{method:?}: {message}");
         assert!(
-            message.contains(&format!(
-                "every IPRED and PRED finite, failed term: {residual} = "
-            )),
+            message.contains(&format!("every IPRED and PRED finite, failed term: {residual} = ")),
             "{method:?}: {message}"
         );
     }
@@ -3052,19 +2876,12 @@ fn an_iov_subjects_parts_sum_to_its_stacked_contribution() {
     for (interaction, names, broken) in [
         (
             true,
-            vec![
-                "Gaussian residual term",
-                "random-effect prior",
-                "curvature log-determinant",
-            ],
+            vec!["Gaussian residual term", "random-effect prior", "curvature log-determinant"],
             "curvature (H̃ not positive definite)",
         ),
         (
             false,
-            vec![
-                "linearized residual term",
-                "linearized covariance log-determinant",
-            ],
+            vec!["linearized residual term", "linearized covariance log-determinant"],
             "linearized covariance R̃ (not positive definite)",
         ),
     ] {
@@ -3097,10 +2914,7 @@ fn an_iov_subjects_parts_sum_to_its_stacked_contribution() {
             c.is_finite() && failing(&parts).is_empty(),
             "interaction {interaction}: {parts:?} vs {c}"
         );
-        eprintln!(
-            "interaction {interaction}: contribution {c}, gap {:e}",
-            (summed - c).abs()
-        );
+        eprintln!("interaction {interaction}: contribution {c}, gap {:e}", (summed - c).abs());
         assert!(
             (summed - c).abs() <= 1e-12 * c.abs().max(1.0),
             "interaction {interaction}: 2·Σ parts = {summed}, contribution = {c}"
@@ -3205,10 +3019,7 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
     let pop = population_of(vec![shifted_subject("A"), shifted_subject("B")]);
     let hazard = |_: usize, s: &Subject, _: &SubjectResult| {
         if s.id == "A" {
-            vec![
-                term("time-to-event on CMT 2", 1e20),
-                term("Gaussian residual", 2.5e19),
-            ]
+            vec![term("time-to-event on CMT 2", 1e20), term("Gaussian residual", 2.5e19)]
         } else {
             Vec::new()
         }
@@ -3226,72 +3037,14 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
         &'a str,
     );
     let rows: [Row<'_>; 10] = [
-        (
-            "unclamped",
-            1.44e20,
-            1.44e20 + 12.34,
-            foce,
-            &no_terms,
-            large,
-            "subjects",
-        ),
-        (
-            "refusal",
-            2e18,
-            2e18 + 12.34,
-            foce,
-            &no_terms,
-            sentinel,
-            "subjects",
-        ),
-        (
-            "hazard term",
-            2.5e20,
-            2.5e20 + 12.34,
-            foce,
-            &hazard,
-            sentinel,
-            "subjects",
-        ),
-        (
-            "NaN contribution",
-            f64::NAN,
-            2e20 + 12.34,
-            foce,
-            &no_terms,
-            sentinel,
-            "subjects",
-        ),
-        (
-            "another point",
-            1.44e20,
-            2e20,
-            foce,
-            &no_terms,
-            sentinel,
-            "total",
-        ),
-        (
-            "rounding",
-            1.44e20,
-            1.44e20 * (1.0 + 1e-10),
-            foce,
-            &no_terms,
-            large,
-            "subjects",
-        ),
-        (
-            "0.5% out", 1.99e20, 2e20, foce, &no_terms, sentinel, "total",
-        ),
-        (
-            "NaN objective",
-            f64::NAN,
-            f64::NAN,
-            foce,
-            &no_terms,
-            "NaN",
-            "total",
-        ),
+        ("unclamped", 1.44e20, 1.44e20 + 12.34, foce, &no_terms, large, "subjects"),
+        ("refusal", 2e18, 2e18 + 12.34, foce, &no_terms, sentinel, "subjects"),
+        ("hazard term", 2.5e20, 2.5e20 + 12.34, foce, &hazard, sentinel, "subjects"),
+        ("NaN contribution", f64::NAN, 2e20 + 12.34, foce, &no_terms, sentinel, "subjects"),
+        ("another point", 1.44e20, 2e20, foce, &no_terms, sentinel, "total"),
+        ("rounding", 1.44e20, 1.44e20 * (1.0 + 1e-10), foce, &no_terms, large, "subjects"),
+        ("0.5% out", 1.99e20, 2e20, foce, &no_terms, sentinel, "total"),
+        ("NaN objective", f64::NAN, f64::NAN, foce, &no_terms, "NaN", "total"),
         (
             "not its terms",
             1.44e20,
@@ -3301,15 +3054,7 @@ fn the_label_is_read_from_the_subjects_when_they_are_the_objective() {
             sentinel,
             "total",
         ),
-        (
-            "sum usable",
-            4.995e13,
-            1e14,
-            foce,
-            &no_terms,
-            large,
-            "total",
-        ),
+        ("sum usable", 4.995e13, 1e14, foce, &no_terms, large, "total"),
     ];
     for (row, a_contribution, ofv, method, scorer, reason, read_from) in rows {
         let mut a = crate::types::test_helpers::dummy_subject("A", 1, 4);
@@ -3399,20 +3144,8 @@ fn a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large() {
     let plain: &dyn Fn() -> CompiledModel = &one_cpt_model;
     let priored: &dyn Fn() -> CompiledModel = &priored;
     for (case, model, method, dv, total_reads) in [
-        (
-            "#2265, FOCEI",
-            plain,
-            EstimationMethod::FoceI,
-            12000.0,
-            REASON_AT_SENTINEL,
-        ),
-        (
-            "#2265, FOCE",
-            plain,
-            EstimationMethod::Foce,
-            12000.0,
-            REASON_AT_SENTINEL,
-        ),
+        ("#2265, FOCEI", plain, EstimationMethod::FoceI, 12000.0, REASON_AT_SENTINEL),
+        ("#2265, FOCE", plain, EstimationMethod::Foce, 12000.0, REASON_AT_SENTINEL),
         (
             "past the cutoff, priored, FOCEI",
             priored,
@@ -3432,29 +3165,17 @@ fn a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large() {
         let mut a = subject_with_dose_time("A", 1.0, 1.0);
         a.observations[0] = dv;
         let pop = population_of(vec![a, subject_with_dose_time("B", 0.0, 1.0)]);
-        let opts = FitOptions {
-            method,
-            outer_maxiter: 3,
-            ..one_iteration_opts()
-        };
+        let opts = FitOptions { method, outer_maxiter: 3, ..one_iteration_opts() };
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
 
         let a = &result.subjects[0];
-        assert_eq!(
-            a.ipred[0], 0.0,
-            "{case}: the pre-dose prediction is exactly 0"
-        );
+        assert_eq!(a.ipred[0], 0.0, "{case}: the pre-dose prediction is exactly 0");
         assert!(
             a.ofv_contribution.is_finite() && a.ofv_contribution != 2.0 * SUBJECT_SENTINEL_NLL,
             "{case}: A is large on its own terms, not clamped: {}",
             a.ofv_contribution
         );
-        assert_eq!(
-            nonfinite_objective_reason(result.ofv),
-            total_reads,
-            "{case}: {}",
-            result.ofv
-        );
+        assert_eq!(nonfinite_objective_reason(result.ofv), total_reads, "{case}: {}", result.ofv);
 
         let entry = result
             .warnings_structured
@@ -3463,22 +3184,12 @@ fn a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large() {
             // sentence quotes `ofv_data`, so the de-duplication keeps it too.
             .find(|w| w.message.contains(NONFINITE_OBJECTIVE_TOKEN) && w.details.is_some())
             .unwrap_or_else(|| {
-                panic!(
-                    "{case}: no {NONFINITE_OBJECTIVE_TOKEN}: {:?}",
-                    result.warnings
-                )
+                panic!("{case}: no {NONFINITE_OBJECTIVE_TOKEN}: {:?}", result.warnings)
             });
         let details = entry.details.as_ref().expect("payload");
-        let ofv = details["ofv"]
-            .as_f64()
-            .expect("a finite objective is a number");
+        let ofv = details["ofv"].as_f64().expect("a finite objective is a number");
         let prior = details["ofv_prior"].as_f64().expect("the prior");
-        let clamped_total = result
-            .subjects
-            .iter()
-            .map(|s| s.ofv_contribution)
-            .sum::<f64>()
-            + prior;
+        let clamped_total = result.subjects.iter().map(|s| s.ofv_contribution).sum::<f64>() + prior;
         assert!(clamped_total.is_finite(), "{case}: {clamped_total}");
         let gap = (clamped_total - ofv).abs() / ofv.abs();
         let ulp = f64::from_bits(ofv.to_bits() + 1) - ofv;
@@ -3501,9 +3212,7 @@ fn a_fit_rereads_an_unclamped_subject_past_1e20_as_too_large() {
         assert_eq!(details["reason"], REASON_TOO_LARGE, "{case}: {details}");
         assert_eq!(details["reason_read_from"], "subjects", "{case}: {details}");
         assert!(
-            entry
-                .message
-                .starts_with(&nonfinite_objective_message(ofv, REASON_TOO_LARGE)),
+            entry.message.starts_with(&nonfinite_objective_message(ofv, REASON_TOO_LARGE)),
             "{case}: the gate's sentence carries the reread label: {}",
             entry.message
         );
@@ -3543,8 +3252,7 @@ fn a_sum_past_the_cutoff_names_its_largest_contributions() {
         &no_terms,
     );
     assert_eq!(
-        out.strip_prefix(&msg)
-            .expect("the label agrees, so the sentence is kept"),
+        out.strip_prefix(&msg).expect("the label agrees, so the sentence is kept"),
         " No subject can be named: every subject's post-hoc FOCEI contribution at these \
          estimates is usable, but their sum (156000000000000.0) is past the cutoff. The \
          objective fails only as a sum; the 10 largest of 12, together 96% of the sum of \
@@ -3555,15 +3263,8 @@ fn a_sum_past_the_cutoff_names_its_largest_contributions() {
     );
     let details = entry.details.as_ref().expect("payload");
     let largest = details["largest_subjects"].as_array().expect("an array");
-    assert_eq!(
-        largest.len(),
-        crate::api::postfit::NONFINITE_SUBJECTS_NAMED,
-        "{details}"
-    );
-    assert_eq!(
-        largest[0],
-        serde_json::json!({"id": "S12", "ofv_contribution": 2.4e13})
-    );
+    assert_eq!(largest.len(), crate::api::postfit::NONFINITE_SUBJECTS_NAMED, "{details}");
+    assert_eq!(largest[0], serde_json::json!({"id": "S12", "ofv_contribution": 2.4e13}));
     assert_eq!(details["reason_read_from"], "subjects", "{details}");
 }
 
@@ -3644,10 +3345,7 @@ fn poisoned(
     mut model: CompiledModel,
     poison: impl Fn(&[f64], &[f64], &mut crate::types::PkParams) + Send + Sync + 'static,
 ) -> CompiledModel {
-    let base = std::mem::replace(
-        &mut model.pk_param_fn,
-        Box::new(|_, _, _, _| unreachable!()),
-    );
+    let base = std::mem::replace(&mut model.pk_param_fn, Box::new(|_, _, _, _| unreachable!()));
     model.pk_param_fn = Box::new(move |theta, eta, cov, time| {
         let mut pk = base(theta, eta, cov, time);
         poison(theta, eta, &mut pk);
@@ -3700,16 +3398,11 @@ fn a_diverged_marginal_reaches_the_published_verdict() {
         agq_eval_only: true,
         ..estimating.clone()
     };
-    for (name, opts) in [
-        ("estimating", estimating),
-        ("readout", readout),
-        ("agq readout", agq_readout),
-    ] {
+    for (name, opts) in
+        [("estimating", estimating), ("readout", readout), ("agq readout", agq_readout)]
+    {
         let bad = fit(&spiked, &pop, &spiked.default_params, &opts).expect("fit");
-        let is = bad
-            .importance_sampling
-            .as_ref()
-            .expect("marginal published");
+        let is = bad.importance_sampling.as_ref().expect("marginal published");
         assert!(
             is.minus2_log_likelihood >= 1e14,
             "premise ({name}): a diverged marginal, got {}",
@@ -3718,29 +3411,16 @@ fn a_diverged_marginal_reaches_the_published_verdict() {
         assert!(bad.ofv.is_finite(), "premise ({name}): ofv {}", bad.ofv);
         assert!(!bad.converged, "{name}: {:?}", bad.warnings);
         let has_token = |w: &String| w.starts_with(NONFINITE_MARGINAL_TOKEN);
+        assert!(bad.warnings.iter().any(has_token), "{name}: {:?}", bad.warnings);
         assert!(
-            bad.warnings.iter().any(has_token),
-            "{name}: {:?}",
-            bad.warnings
-        );
-        assert!(
-            bad.warnings_structured
-                .iter()
-                .any(|e| e.message.starts_with(NONFINITE_MARGINAL_TOKEN)),
+            bad.warnings_structured.iter().any(|e| e.message.starts_with(NONFINITE_MARGINAL_TOKEN)),
             "{name}: the typed entry was dropped"
         );
 
         let good = fit(&plain, &pop, &plain.default_params, &opts).expect("fit");
-        let is = good
-            .importance_sampling
-            .as_ref()
-            .expect("marginal published");
+        let is = good.importance_sampling.as_ref().expect("marginal published");
         assert!(is.minus2_log_likelihood < 1e14, "{name}: plain model");
-        assert!(
-            !good.warnings.iter().any(has_token),
-            "{name}: {:?}",
-            good.warnings
-        );
+        assert!(!good.warnings.iter().any(has_token), "{name}: {:?}", good.warnings);
         assert!(good.converged, "{name}: {:?}", good.warnings);
     }
 }
@@ -3753,11 +3433,7 @@ fn final_marginal(value: f64, mc_se: f64) -> Option<crate::estimation::impmap::F
 /// A trail of `n` iterations: a first third that is never read, then two windows whose
 /// floors are `previous` and `last`.
 fn settling_trail(
-    n: usize,
-    previous: f64,
-    last: f64,
-    mc_se: f64,
-    label: &str,
+    n: usize, previous: f64, last: f64, mc_se: f64, label: &str,
 ) -> crate::estimation::impmap::McemObjectiveTrail {
     let third = n / 3;
     let mut objectives = vec![1e9; n - 2 * third];
@@ -3768,17 +3444,9 @@ fn settling_trail(
         objectives,
         mc_se: vec![mc_se; n],
         label: label.to_string(),
-        iterations_option: if map {
-            "impmap_iterations"
-        } else {
-            "imp_iterations"
-        },
+        iterations_option: if map { "impmap_iterations" } else { "imp_iterations" },
         samples_option: if map { "impmap_samples" } else { "imp_samples" },
-        proposal_option: if map {
-            "impmap_proposal_df"
-        } else {
-            "imp_proposal_df"
-        },
+        proposal_option: if map { "impmap_proposal_df" } else { "imp_proposal_df" },
     }
 }
 
@@ -3794,10 +3462,7 @@ fn a_falling_objective_demotes_the_fit_and_asks_for_iterations() {
         mcem_settling_warning(&mut converged, Some(&trail), final_marginal(1004.72, 0.23))
             .expect("the vancomycin run passed");
     assert!(!converged);
-    assert!(
-        msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
-        "{msg}"
-    );
+    assert!(msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")), "{msg}");
     assert!(msg.contains("still falling"), "{msg}");
     assert!(msg.contains("limit of 150 iterations"), "{msg}");
     assert!(msg.contains("converged: false"), "{msg}");
@@ -3836,10 +3501,7 @@ fn a_floor_above_the_marginal_demotes_the_fit_and_asks_for_better_sampling() {
         mcem_settling_warning(&mut converged, Some(&trail), final_marginal(4288.06, 1.09))
             .expect("the cefepime run passed");
     assert!(!converged);
-    assert!(
-        msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
-        "{msg}"
-    );
+    assert!(msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")), "{msg}");
     assert!(msg.contains("stayed well above"), "{msg}");
     assert!(msg.contains("converged: false"), "{msg}");
     assert!(msg.contains("last 50 iterations"), "{msg}");
@@ -3850,10 +3512,7 @@ fn a_floor_above_the_marginal_demotes_the_fit_and_asks_for_better_sampling() {
     assert!(msg.contains("not sampling the posterior well"), "{msg}");
     assert!(msg.contains("short of the optimum"), "{msg}");
     assert!(msg.contains("Raise `imp_samples`"), "{msg}");
-    assert!(
-        msg.contains("heavy-tailed proposal (`imp_proposal_df`)"),
-        "{msg}"
-    );
+    assert!(msg.contains("heavy-tailed proposal (`imp_proposal_df`)"), "{msg}");
     assert!(msg.contains("chain a FOCE/FOCEI stage first"), "{msg}");
     assert!(!msg.contains("imp_iterations"), "{msg}");
     assert!(!msg.contains("impmap"), "{msg}");
@@ -3884,9 +3543,7 @@ fn a_run_too_short_to_test_keeps_its_verdict_and_hears_why() {
     let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), None).expect("no note");
     assert!(converged);
     assert!(
-        msg.starts_with(&format!(
-            "{MCEM_SETTLING_UNTESTED_TOKEN}: IMP: 29 iteration(s)"
-        )),
+        msg.starts_with(&format!("{MCEM_SETTLING_UNTESTED_TOKEN}: IMP: 29 iteration(s)")),
         "{msg}"
     );
     assert!(msg.contains("only says the run did not diverge"), "{msg}");
@@ -3912,10 +3569,7 @@ fn an_unreadable_trace_is_demoted_and_not_blamed_on_its_length() {
     let mut converged = true;
     let (msg, entry) = mcem_settling_warning(&mut converged, Some(&trail), None).expect("no note");
     assert!(!converged);
-    assert!(
-        msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")),
-        "{msg}"
-    );
+    assert!(msg.starts_with(&format!("{MCEM_NOT_SETTLED_TOKEN}: IMP: ")), "{msg}");
     assert!(!msg.contains(MCEM_SETTLING_UNTESTED_TOKEN), "{msg}");
     assert!(msg.contains("trace cannot be read"), "{msg}");
     assert!(msg.contains("converged: false"), "{msg}");
@@ -3941,10 +3595,8 @@ fn a_settled_run_and_a_non_mcem_fit_are_left_alone() {
     let settled = settling_trail(150, 100.0, 100.0, 0.1, "IMP");
     for verdict in [true, false] {
         let mut converged = verdict;
-        assert!(
-            mcem_settling_warning(&mut converged, Some(&settled), final_marginal(100.0, 0.1))
-                .is_none()
-        );
+        assert!(mcem_settling_warning(&mut converged, Some(&settled), final_marginal(100.0, 0.1))
+            .is_none());
         assert!(mcem_settling_warning(&mut converged, None, final_marginal(1.0, 0.1)).is_none());
         assert_eq!(converged, verdict);
     }
@@ -3982,23 +3634,14 @@ fn a_short_mcem_fit_is_told_its_verdict_was_not_tested() {
         .iter()
         .find(|w| w.message.starts_with(MCEM_SETTLING_UNTESTED_TOKEN))
         .unwrap_or_else(|| panic!("{:?}", res.warnings));
-    assert!(
-        note.message.contains("IMP: 3 iteration(s)"),
-        "{}",
-        note.message
-    );
+    assert!(note.message.contains("IMP: 3 iteration(s)"), "{}", note.message);
     assert_eq!(note.severity, WarningSeverity::Warning);
     assert!(res.converged, "{:?}", res.warnings);
 
-    let focei = FitOptions {
-        methods: vec![EstimationMethod::FoceI],
-        ..opts
-    };
+    let focei = FitOptions { methods: vec![EstimationMethod::FoceI], ..opts };
     let res = fit(&model, &pop, &model.default_params, &focei).expect("fit");
     assert!(
-        !res.warnings
-            .iter()
-            .any(|w| w.contains(MCEM_SETTLING_UNTESTED_TOKEN)),
+        !res.warnings.iter().any(|w| w.contains(MCEM_SETTLING_UNTESTED_TOKEN)),
         "{:?}",
         res.warnings
     );
@@ -4030,11 +3673,7 @@ fn slow_em_pop() -> Population {
     let subject = |i: usize| {
         let mut s = subject_with_dose_time(&i.to_string(), 0.0, 1.0);
         let cl = (2.4 * (((i * 37 % 101) as f64) / 101.0 - 0.5)).exp();
-        s.observations = s
-            .obs_times
-            .iter()
-            .map(|t| 10.0 * (-cl / 10.0 * t).exp())
-            .collect();
+        s.observations = s.obs_times.iter().map(|t| 10.0 * (-cl / 10.0 * t).exp()).collect();
         s
     };
     population_of((0..20).map(subject).collect())
@@ -4080,12 +3719,8 @@ fn a_run_stopped_while_falling_reaches_the_published_verdict() {
     // The marginal arm, on the settled model. Five normal draws per subject miss the
     // posterior every iteration, and the final marginal, with its fresh proposal, does
     // not. The entry has to quote the marginal `fit()` publishes.
-    let starved = FitOptions {
-        imp_samples: 5,
-        imp_proposal_df: f64::INFINITY,
-        imp_averaging: 1,
-        ..opts
-    };
+    let starved =
+        FitOptions { imp_samples: 5, imp_proposal_df: f64::INFINITY, imp_averaging: 1, ..opts };
     let bad = fit(&near, &pop, &near.default_params, &starved).expect("fit");
     assert!(!bad.converged, "{:?}", bad.warnings);
     let entry = bad
@@ -4095,10 +3730,7 @@ fn a_run_stopped_while_falling_reaches_the_published_verdict() {
         .unwrap_or_else(|| panic!("{:?}", bad.warnings));
     let details = entry.details.as_ref().unwrap();
     assert_eq!(details["reason"], "above_marginal");
-    let published = bad
-        .importance_sampling
-        .as_ref()
-        .expect("marginal published");
+    let published = bad.importance_sampling.as_ref().expect("marginal published");
     assert_eq!(details["marginal"], published.minus2_log_likelihood);
     assert_eq!(details["marginal_mc_se"], published.mc_standard_error);
 }
@@ -4121,10 +3753,7 @@ fn a_direct_estimator_call_gets_the_settling_verdict() {
         ..Default::default()
     };
     let notice = |r: &crate::estimation::outer_optimizer::OuterResult| {
-        r.warnings
-            .iter()
-            .find(|w| w.starts_with(MCEM_NOT_SETTLED_TOKEN))
-            .cloned()
+        r.warnings.iter().find(|w| w.starts_with(MCEM_NOT_SETTLED_TOKEN)).cloned()
     };
 
     let tiny = slow_em_model(0.001);
@@ -4196,17 +3825,12 @@ fn a_risen_marginal_reaches_the_published_verdict() {
     let has_token = |w: &String| w.starts_with(MCEM_OBJECTIVE_ROSE_TOKEN);
 
     let bad = fit(&worsening, &pop, &worsening.default_params, &opts).expect("fit");
-    let marginal = bad
-        .importance_sampling
-        .as_ref()
-        .expect("marginal published")
-        .minus2_log_likelihood;
+    let marginal =
+        bad.importance_sampling.as_ref().expect("marginal published").minus2_log_likelihood;
     assert!(marginal < 1e14, "premise: below the cutoff, got {marginal}");
     assert!(bad.warnings.iter().any(has_token), "{:?}", bad.warnings);
     assert!(
-        !bad.warnings
-            .iter()
-            .any(|w| w.starts_with(NONFINITE_MARGINAL_TOKEN)),
+        !bad.warnings.iter().any(|w| w.starts_with(NONFINITE_MARGINAL_TOKEN)),
         "{:?}",
         bad.warnings
     );

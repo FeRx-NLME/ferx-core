@@ -132,11 +132,7 @@ fn hoist_plan(code: &[Flat]) -> HoistPlan {
     for (i, f) in code.iter().enumerate() {
         let mut g = *f;
         let (d, uses) = super::regs_of(&mut g);
-        let from: Vec<usize> = uses
-            .into_iter()
-            .flatten()
-            .map(|r| producer[*r as usize])
-            .collect();
+        let from: Vec<usize> = uses.into_iter().flatten().map(|r| producer[*r as usize]).collect();
         invariant[i] = match *f {
             _ if in_if[i] => false,
             Flat::LoadParam { slot, .. } => {
@@ -172,12 +168,7 @@ fn hoist_plan(code: &[Flat]) -> HoistPlan {
         .collect();
     param_slots.sort_unstable();
     param_slots.dedup();
-    HoistPlan {
-        invariant,
-        slot,
-        n_slots,
-        param_slots,
-    }
+    HoistPlan { invariant, slot, n_slots, param_slots }
 }
 
 /// Which function [`emit`] writes from the program.
@@ -308,14 +299,8 @@ fn new_module(fast_alloc: bool) -> Option<JITModule> {
     if fast_alloc {
         flags.set("regalloc_algorithm", "single_pass").ok()?;
     }
-    let isa = cranelift_native::builder()
-        .ok()?
-        .finish(settings::Flags::new(flags))
-        .ok()?;
-    Some(JITModule::new(JITBuilder::with_isa(
-        isa,
-        default_libcall_names(),
-    )))
+    let isa = cranelift_native::builder().ok()?.finish(settings::Flags::new(flags)).ok()?;
+    Some(JITModule::new(JITBuilder::with_isa(isa, default_libcall_names())))
 }
 
 /// Native functions and the module that owns their memory.
@@ -341,9 +326,7 @@ fn compile(funcs: &[(&str, &Func)]) -> Option<(JITModule, Vec<*const u8>)> {
 
 /// [`compile`] with its own size limits (a whole subject's plan, #2786).
 pub(super) fn compile_with(
-    funcs: &[(&str, &Func)],
-    max_insts: usize,
-    fast_alloc_insts: usize,
+    funcs: &[(&str, &Func)], max_insts: usize, fast_alloc_insts: usize,
 ) -> Option<(JITModule, Vec<*const u8>)> {
     let insts: usize = funcs.iter().map(|(_, f)| f.insts.len()).sum();
     if insts > max_insts {
@@ -351,19 +334,13 @@ pub(super) fn compile_with(
     }
     let mut module = new_module(insts > fast_alloc_insts)?;
     // A failure past this point must free what `module` mapped: it has no `Drop` that does.
-    let ids: Option<Vec<_>> = funcs
-        .iter()
-        .map(|(name, f)| lower(&mut module, name, f))
-        .collect();
+    let ids: Option<Vec<_>> = funcs.iter().map(|(name, f)| lower(&mut module, name, f)).collect();
     let Some(ids) = ids.filter(|_| module.finalize_definitions().is_ok()) else {
         // SAFETY: nothing was handed out from this module.
         unsafe { module.free_memory() };
         return None;
     };
-    let addrs = ids
-        .into_iter()
-        .map(|id| module.get_finalized_function(id))
-        .collect();
+    let addrs = ids.into_iter().map(|id| module.get_finalized_function(id)).collect();
     Some((module, addrs))
 }
 
@@ -399,12 +376,10 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
             let r = |x: ir::V| v[x as usize];
             let out = match *inst {
                 Inst::Load { arg, off } => {
-                    b.ins()
-                        .load(types::F64, flags, args[arg as usize], (off * 8) as i32)
+                    b.ins().load(types::F64, flags, args[arg as usize], (off * 8) as i32)
                 }
                 Inst::Store { arg, off, v: x } => {
-                    b.ins()
-                        .store(flags, r(x), args[arg as usize], (off * 8) as i32);
+                    b.ins().store(flags, r(x), args[arg as usize], (off * 8) as i32);
                     // A store has no value; nothing reads this slot.
                     r(x)
                 }
@@ -426,11 +401,8 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
 /// `Load` / `Store`, whose addressing each JIT owns. Shared by this RHS JIT and the
 /// kernel JIT, so the two lower the instruction set identically.
 pub(super) fn lower_value_inst(
-    b: &mut FunctionBuilder,
-    inst: &Inst,
-    r: impl Fn(ir::V) -> Value,
-    ptr: cranelift_codegen::ir::Type,
-    unary: cranelift_codegen::ir::SigRef,
+    b: &mut FunctionBuilder, inst: &Inst, r: impl Fn(ir::V) -> Value,
+    ptr: cranelift_codegen::ir::Type, unary: cranelift_codegen::ir::SigRef,
     binary: cranelift_codegen::ir::SigRef,
 ) -> Option<Value> {
     type F1 = extern "C" fn(f64) -> f64;
@@ -454,18 +426,9 @@ pub(super) fn lower_value_inst(
         Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
         Inst::Call1(s, x) => call(b, unary, s.f() as usize, &[r(x)]),
         Inst::Powf(x, y) => call(b, binary, shim_powf as F2 as usize, &[r(x), r(y)]),
-        Inst::Gamma {
-            upper,
-            i,
-            j,
-            a: x,
-            x: y,
-        } => call(
-            b,
-            binary,
-            ir::gamma_shim(upper, i, j) as usize,
-            &[r(x), r(y)],
-        ),
+        Inst::Gamma { upper, i, j, a: x, x: y } => {
+            call(b, binary, ir::gamma_shim(upper, i, j) as usize, &[r(x), r(y)])
+        }
         Inst::Cmp(cc, x, y) => {
             let cc = match cc {
                 Cc::Lt => FloatCC::LessThan,
@@ -518,9 +481,7 @@ unsafe impl Sync for JitInner {}
 
 impl std::fmt::Debug for JitCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JitCode")
-            .field("instructions", &self.inner.code.len())
-            .finish()
+        f.debug_struct("JitCode").field("instructions", &self.inner.code.len()).finish()
     }
 }
 
@@ -568,10 +529,7 @@ impl JitInner {
                 let (module, a) = compile(&[("rhs", &f)])?;
                 // SAFETY: defined with exactly `RhsFn`'s signature.
                 let f = unsafe { std::mem::transmute::<*const u8, RhsFn>(a[0]) };
-                Some(Compiled {
-                    f,
-                    module: Some(module),
-                })
+                Some(Compiled { f, module: Some(module) })
             })
             .as_ref()?;
         Some(self.resolved(c.f, layout))
@@ -592,22 +550,14 @@ impl JitInner {
                         std::mem::transmute::<*const u8, MainFn>(a[1]),
                     )
                 };
-                Some(Compiled {
-                    f,
-                    module: Some(module),
-                })
+                Some(Compiled { f, module: Some(module) })
             })
             .as_ref()?;
         Some(self.resolved(c.f, layout))
     }
 
     fn resolved<F: Copy>(&self, f: F, layout: Layout) -> Resolved<'_, F> {
-        Resolved {
-            f,
-            extent: self.extent,
-            lanes: layout.lanes(),
-            plan: &self.plan,
-        }
+        Resolved { f, extent: self.extent, lanes: layout.lanes(), plan: &self.plan }
     }
 }
 
@@ -644,11 +594,7 @@ impl Resolved<'_, RhsFn> {
     /// overlap the inputs.
     #[inline(always)]
     pub(super) unsafe fn call(
-        &self,
-        u: *const f64,
-        params: *const f64,
-        seeds: *const f64,
-        du: *mut f64,
+        &self, u: *const f64, params: *const f64, seeds: *const f64, du: *mut f64,
     ) {
         (self.f)(u, params, seeds, du)
     }
@@ -683,11 +629,7 @@ impl Resolved<'_, (PrepFn, MainFn)> {
     /// and `seeds[3]`.
     #[inline(always)]
     pub(super) unsafe fn main(
-        &self,
-        u: *const f64,
-        params: *const f64,
-        seeds: *const f64,
-        du: *mut f64,
+        &self, u: *const f64, params: *const f64, seeds: *const f64, du: *mut f64,
         cache: *const f64,
     ) {
         (self.f.1)(u, params, seeds, du, cache)

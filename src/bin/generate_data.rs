@@ -16,14 +16,7 @@ fn main() {
 
 fn write_nonmem_csv(
     path: &str,
-    subjects: &[(
-        String,
-        f64,
-        Vec<f64>,
-        Vec<f64>,
-        Vec<f64>,
-        HashMap<String, f64>,
-    )],
+    subjects: &[(String, f64, Vec<f64>, Vec<f64>, Vec<f64>, HashMap<String, f64>)],
     // (id, dose_amt, obs_times, observations, dose_times, covariates)
     cov_names: &[&str],
     dose_cmt: usize,
@@ -53,11 +46,7 @@ fn write_nonmem_csv(
         for (j, &t) in obs_times.iter().enumerate() {
             let dv = observations[j];
             let mdv = if dv <= 0.001 { 1 } else { 0 };
-            let dv_str = if mdv == 1 {
-                ".".to_string()
-            } else {
-                format!("{:.4}", dv)
-            };
+            let dv_str = if mdv == 1 { ".".to_string() } else { format!("{:.4}", dv) };
             let mut line = format!("{},{},{},0,.,{},0,{}", id, t, dv_str, dose_cmt, mdv);
             for cov in cov_names {
                 let v = covariates.get(*cov).copied().unwrap_or(0.0);
@@ -71,22 +60,10 @@ fn write_nonmem_csv(
 }
 
 fn simulate_subjects(
-    model: &CompiledModel,
-    params: &ModelParameters,
-    n_subjects: usize,
-    dose_amt: f64,
-    dose_cmt: usize,
-    obs_times: &[f64],
-    seed: u64,
+    model: &CompiledModel, params: &ModelParameters, n_subjects: usize, dose_amt: f64,
+    dose_cmt: usize, obs_times: &[f64], seed: u64,
     covariates_fn: Option<&dyn Fn(usize) -> HashMap<String, f64>>,
-) -> Vec<(
-    String,
-    f64,
-    Vec<f64>,
-    Vec<f64>,
-    Vec<f64>,
-    HashMap<String, f64>,
-)> {
+) -> Vec<(String, f64, Vec<f64>, Vec<f64>, Vec<f64>, HashMap<String, f64>)> {
     let subjects: Vec<Subject> = (1..=n_subjects)
         .map(|i| {
             let cov = covariates_fn.map(|f| f(i)).unwrap_or_default();
@@ -138,18 +115,9 @@ fn simulate_subjects(
         .into_iter()
         .map(|subj| {
             let sims: Vec<&SimulationResult> = sim.iter().filter(|s| s.id == subj.id).collect();
-            let obs: Vec<f64> = sims
-                .iter()
-                .map(|s| s.outcome.continuous_value().max(0.0))
-                .collect();
-            (
-                subj.id,
-                dose_amt,
-                subj.obs_times,
-                obs,
-                vec![0.0],
-                subj.covariates,
-            )
+            let obs: Vec<f64> =
+                sims.iter().map(|s| s.outcome.continuous_value().max(0.0)).collect();
+            (subj.id, dose_amt, subj.obs_times, obs, vec![0.0], subj.covariates)
         })
         .collect()
 }
@@ -239,10 +207,7 @@ fn build_warfarin_model() -> CompiledModel {
     let theta_names = vec!["TVCL".into(), "TVV".into(), "TVKA".into()];
     let eta_names = vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()];
     let omega = OmegaMatrix::from_diagonal(&[0.07, 0.02, 0.40], eta_names.clone());
-    let sigma = SigmaVector {
-        values: vec![0.01],
-        names: vec!["PROP_ERR".into()],
-    };
+    let sigma = SigmaVector { values: vec![0.01], names: vec!["PROP_ERR".into()] };
     let default_params = ModelParameters {
         residual_correlations: Vec::new(),
         residual_correlation_fixed: Vec::new(),
@@ -259,15 +224,14 @@ fn build_warfarin_model() -> CompiledModel {
         kappa_fixed: Vec::new(),
         mixture: None,
     };
-    let pk_param_fn: PkParamFn = Box::new(
-        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+    let pk_param_fn: PkParamFn =
+        Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_CL] = theta[0] * eta[0].exp();
             p.values[PK_IDX_V] = theta[1] * eta[1].exp();
             p.values[PK_IDX_KA] = theta[2] * eta[2].exp();
             p
-        },
-    );
+        });
     CompiledModel {
         name: "warfarin".into(),
         error_spec: ferx_core::types::ErrorSpec::Single(ErrorModel::Proportional),
@@ -279,10 +243,7 @@ fn build_warfarin_model() -> CompiledModel {
         omega_init_as_sd: vec![false; 3],
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA],
         eta_map: (0..3).map(|i| i as i32).collect(),
-        pk_idx_f64: [PK_IDX_CL, PK_IDX_V, PK_IDX_KA]
-            .iter()
-            .map(|&i| i as f64)
-            .collect(),
+        pk_idx_f64: [PK_IDX_CL, PK_IDX_V, PK_IDX_KA].iter().map(|&i| i as f64).collect(),
         sel_flat: {
             // n_tv = 3, n_eta = 3, each tv uses its positional eta.
             let mut v = vec![0.0f64; 3 * 3];
@@ -310,10 +271,7 @@ fn build_warfarin_true_params() -> ModelParameters {
             vec!["ETA_CL".into(), "ETA_V".into(), "ETA_KA".into()],
         ),
         omega_fixed: vec![false; 3],
-        sigma: SigmaVector {
-            values: vec![0.01],
-            names: vec!["PROP_ERR".into()],
-        },
+        sigma: SigmaVector { values: vec![0.01], names: vec!["PROP_ERR".into()] },
         sigma_fixed: vec![false; 1],
         omega_iov: None,
         kappa_fixed: Vec::new(),
@@ -326,17 +284,9 @@ fn build_warfarin_true_params() -> ModelParameters {
 fn generate_two_cpt_iv() {
     eprintln!("Generating two_cpt_iv dataset...");
     let theta_names = vec!["TVCL".into(), "TVV1".into(), "TVQ".into(), "TVV2".into()];
-    let eta_names = vec![
-        "ETA_CL".into(),
-        "ETA_V1".into(),
-        "ETA_Q".into(),
-        "ETA_V2".into(),
-    ];
+    let eta_names = vec!["ETA_CL".into(), "ETA_V1".into(), "ETA_Q".into(), "ETA_V2".into()];
     let omega = OmegaMatrix::from_diagonal(&[0.10, 0.10, 0.10, 0.10], eta_names.clone());
-    let sigma = SigmaVector {
-        values: vec![0.01],
-        names: vec!["PROP_ERR".into()],
-    };
+    let sigma = SigmaVector { values: vec![0.01], names: vec!["PROP_ERR".into()] };
     let params = ModelParameters {
         residual_correlations: Vec::new(),
         residual_correlation_fixed: Vec::new(),
@@ -353,16 +303,15 @@ fn generate_two_cpt_iv() {
         kappa_fixed: Vec::new(),
         mixture: None,
     };
-    let pk_param_fn: PkParamFn = Box::new(
-        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+    let pk_param_fn: PkParamFn =
+        Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_CL] = theta[0] * eta[0].exp();
             p.values[PK_IDX_V] = theta[1] * eta[1].exp();
             p.values[PK_IDX_Q] = theta[2] * eta[2].exp();
             p.values[PK_IDX_V2] = theta[3] * eta[3].exp();
             p
-        },
-    );
+        });
     let model = CompiledModel {
         name: "two_cpt_iv".into(),
         pk_model: PkModel::TwoCptIv,
@@ -375,10 +324,7 @@ fn generate_two_cpt_iv() {
         omega_init_as_sd: vec![false; 4],
         pk_indices: vec![PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2],
         eta_map: (0..4).map(|i| i as i32).collect(),
-        pk_idx_f64: [PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2]
-            .iter()
-            .map(|&i| i as f64)
-            .collect(),
+        pk_idx_f64: [PK_IDX_CL, PK_IDX_V, PK_IDX_Q, PK_IDX_V2].iter().map(|&i| i as f64).collect(),
         sel_flat: {
             let mut v = vec![0.0f64; 4 * 4];
             for i in 0..4 {
@@ -401,27 +347,17 @@ fn generate_two_cpt_oral_cov() {
     use rand::SeedableRng;
     use rand_distr::{Distribution, Normal};
 
-    let theta_names: Vec<String> = vec![
-        "TVCL",
-        "TVV1",
-        "TVQ",
-        "TVV2",
-        "TVKA",
-        "THETA_WT",
-        "THETA_CRCL",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
+    let theta_names: Vec<String> =
+        vec!["TVCL", "TVV1", "TVQ", "TVV2", "TVKA", "THETA_WT", "THETA_CRCL"]
+            .into_iter()
+            .map(String::from)
+            .collect();
     let eta_names: Vec<String> = vec!["ETA_CL", "ETA_V1", "ETA_Q", "ETA_V2", "ETA_KA"]
         .into_iter()
         .map(String::from)
         .collect();
     let omega = OmegaMatrix::from_diagonal(&[0.10, 0.10, 0.05, 0.05, 0.15], eta_names.clone());
-    let sigma = SigmaVector {
-        values: vec![0.02],
-        names: vec!["PROP_ERR".into()],
-    };
+    let sigma = SigmaVector { values: vec![0.02], names: vec!["PROP_ERR".into()] };
     let params = ModelParameters {
         residual_correlations: Vec::new(),
         residual_correlation_fixed: Vec::new(),
@@ -438,8 +374,8 @@ fn generate_two_cpt_oral_cov() {
         kappa_fixed: Vec::new(),
         mixture: None,
     };
-    let pk_param_fn: PkParamFn = Box::new(
-        |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+    let pk_param_fn: PkParamFn =
+        Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
             let wt = cov.get("wt").copied().unwrap_or(70.0);
             let crcl = cov.get("crcl").copied().unwrap_or(100.0);
             let mut p = PkParams::default();
@@ -452,8 +388,7 @@ fn generate_two_cpt_oral_cov() {
             p.values[PK_IDX_V2] = theta[3] * eta[3].exp();
             p.values[PK_IDX_KA] = theta[4] * eta[4].exp();
             p
-        },
-    );
+        });
     let model = CompiledModel {
         name: "two_cpt_oral_cov".into(),
         pk_model: PkModel::TwoCptOral,
@@ -477,13 +412,7 @@ fn generate_two_cpt_oral_cov() {
             }
             v
         },
-        indiv_param_names: vec![
-            "CL".into(),
-            "V".into(),
-            "Q".into(),
-            "V2".into(),
-            "KA".into(),
-        ],
+        indiv_param_names: vec!["CL".into(), "V".into(), "Q".into(), "V2".into(), "KA".into()],
         ..bare_model(params.clone())
     };
 
@@ -552,10 +481,8 @@ fn generate_two_cpt_oral_cov() {
         .iter()
         .map(|subj| {
             let sims: Vec<_> = sim.iter().filter(|s| s.id == subj.id).collect();
-            let obs: Vec<f64> = sims
-                .iter()
-                .map(|s| s.outcome.continuous_value().max(0.0))
-                .collect();
+            let obs: Vec<f64> =
+                sims.iter().map(|s| s.outcome.continuous_value().max(0.0)).collect();
             (
                 subj.id.clone(),
                 250.0,
@@ -577,10 +504,7 @@ fn generate_mm_oral() {
     let theta_names = vec!["TVVMAX".into(), "TVKM".into(), "TVV".into(), "TVKA".into()];
     let eta_names = vec!["ETA_VMAX".into(), "ETA_V".into()];
     let omega = OmegaMatrix::from_diagonal(&[0.15, 0.10], eta_names.clone());
-    let sigma = SigmaVector {
-        values: vec![0.02],
-        names: vec!["PROP_ERR".into()],
-    };
+    let sigma = SigmaVector { values: vec![0.02], names: vec!["PROP_ERR".into()] };
     let params = ModelParameters {
         residual_correlations: Vec::new(),
         residual_correlation_fixed: Vec::new(),
@@ -597,16 +521,15 @@ fn generate_mm_oral() {
         kappa_fixed: Vec::new(),
         mixture: None,
     };
-    let pk_param_fn: PkParamFn = Box::new(
-        |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+    let pk_param_fn: PkParamFn =
+        Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[0] = theta[0] * eta[0].exp(); // VMAX
             p.values[1] = theta[1]; // KM
             p.values[2] = theta[2] * eta[1].exp(); // V
             p.values[4] = theta[3]; // KA
             p
-        },
-    );
+        });
     let ode_rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
         Box::new(|u: &[f64], params: &[f64], _t: f64, du: &mut [f64]| {
             let (depot, central) = (u[0], u[1]);
@@ -652,9 +575,7 @@ fn generate_mm_oral() {
         indiv_param_names: vec!["VMAX".into(), "KM".into(), "V".into(), "KA".into()],
         ..bare_model(params.clone())
     };
-    let obs_times = vec![
-        0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0,
-    ];
+    let obs_times = vec![0.25, 0.5, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0];
     let subjects = simulate_subjects(&model, &params, 20, 200.0, 1, &obs_times, 1234, None);
     write_nonmem_csv("data/mm_oral.csv", &subjects, &[], 1);
 }

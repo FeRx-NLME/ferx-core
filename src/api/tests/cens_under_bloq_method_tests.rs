@@ -86,11 +86,7 @@ fn the_fixture_is_non_degenerate_for_the_decorrelation() {
     // decorrelated vector must not be the marginal standardisation. Compare the
     // all-live CWRES against the same subject's IWRES, which *is* per-row.
     let r = diagnostics(BloqMethod::Drop, vec![0, 0, 0]);
-    let differs = r
-        .cwres
-        .iter()
-        .zip(r.iwres.iter())
-        .any(|(c, w)| (c - w).abs() > 1e-6);
+    let differs = r.cwres.iter().zip(r.iwres.iter()).any(|(c, w)| (c - w).abs() > 1e-6);
     assert!(
         differs,
         "fixture is degenerate: CWRES equals the per-row IWRES, so the \
@@ -135,10 +131,7 @@ fn cwres_excludes_a_flagged_row_from_the_decorrelation_only_under_m3() {
         "under `drop` no row is censored for the fit: {:?}",
         drop.cwres
     );
-    assert_eq!(
-        drop.cwres, unflagged.cwres,
-        "under `drop` the flag must not touch any row's CWRES"
-    );
+    assert_eq!(drop.cwres, unflagged.cwres, "under `drop` the flag must not touch any row's CWRES");
 
     let m3 = diagnostics(BloqMethod::M3, flagged);
     assert!(m3.cwres[1].is_nan(), "m3 must blank the censored row");

@@ -101,10 +101,7 @@ pub(crate) struct Loads<T: Copy> {
 
 impl<T: Copy> Loads<T> {
     fn empty(fill: T) -> Self {
-        Loads {
-            len: 0,
-            items: [fill; 2],
-        }
+        Loads { len: 0, items: [fill; 2] }
     }
 
     fn push(&mut self, x: T) {
@@ -142,9 +139,7 @@ pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f
 /// #958 derivative gates test with [`variance_is_guarded`].
 #[inline]
 pub(crate) fn residual_variance_raw(
-    error_model: ErrorModel,
-    f_pred: f64,
-    sigma_values: &[f64],
+    error_model: ErrorModel, f_pred: f64, sigma_values: &[f64],
 ) -> f64 {
     match error_model {
         ErrorModel::Additive => {
@@ -310,10 +305,7 @@ impl ErrorSpec {
 
     /// [`Self::sigma_loadings`], inline.
     pub(crate) fn sigma_loadings_inline(
-        &self,
-        cmt: usize,
-        f: f64,
-        n_sigma: usize,
+        &self, cmt: usize, f: f64, n_sigma: usize,
     ) -> Loads<(usize, f64)> {
         let mut out = Loads::empty((0, 0.0));
         for (i, form) in self.loading_shape(cmt, n_sigma) {
@@ -324,10 +316,7 @@ impl ErrorSpec {
 
     /// [`Self::sigma_loading_slopes`], inline.
     pub(crate) fn sigma_loading_slopes_inline(
-        &self,
-        cmt: usize,
-        f: f64,
-        n_sigma: usize,
+        &self, cmt: usize, f: f64, n_sigma: usize,
     ) -> Loads<(usize, f64)> {
         let mut out = Loads::empty((0, 0.0));
         for (i, form) in self.loading_shape(cmt, n_sigma) {
@@ -349,19 +338,13 @@ impl ErrorSpec {
     /// ([`LoadingForm::InvExp`], #2729): the closed-form `∂v/∂f` shortcuts, which assume
     /// the only `f`-dependent slot is the proportional one, do not apply.
     fn has_inv_exp_slot(&self, cmt: usize, n_sigma: usize) -> bool {
-        self.loading_shape(cmt, n_sigma)
-            .iter()
-            .any(|&(_, form)| form == LoadingForm::InvExp)
+        self.loading_shape(cmt, n_sigma).iter().any(|&(_, form)| form == LoadingForm::InvExp)
     }
 
     /// Residual variance including fixed residual correlations from
     /// `block_sigma`.
     pub fn variance_at_with_correlations(
-        &self,
-        cmt: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        correlations: &[ResidualCorrelation],
+        &self, cmt: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
     ) -> f64 {
         if correlations.is_empty() {
             return self.variance_at(cmt, f_pred, sigma);
@@ -377,11 +360,7 @@ impl ErrorSpec {
     /// [`variance_at_with_correlations`](Self::variance_at_with_correlations) before
     /// the invalid-variance guard ([`variance_is_guarded`]).
     pub(crate) fn variance_at_with_correlations_raw(
-        &self,
-        cmt: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        correlations: &[ResidualCorrelation],
+        &self, cmt: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
     ) -> f64 {
         if correlations.is_empty() {
             return self.variance_at_raw(cmt, f_pred, sigma);
@@ -400,11 +379,7 @@ impl ErrorSpec {
     ///
     /// [`variance_at_with_correlations`]: ErrorSpec::variance_at_with_correlations
     pub fn variance_at_scaled(
-        &self,
-        cmt: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        correlations: &[ResidualCorrelation],
+        &self, cmt: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
         let mut loadings = Loads::empty((0, 0.0));
@@ -417,11 +392,7 @@ impl ErrorSpec {
     /// [`variance_at_scaled`](Self::variance_at_scaled) before the invalid-variance
     /// guard ([`variance_is_guarded`]).
     pub(crate) fn variance_at_scaled_raw(
-        &self,
-        cmt: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        correlations: &[ResidualCorrelation],
+        &self, cmt: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
         mult: &[f64],
     ) -> f64 {
         let mut loadings = Loads::empty((0, 0.0));
@@ -440,51 +411,30 @@ impl ErrorSpec {
     /// exponent ([`slot_exponent`]). Slot presence is
     /// [`sigma_loadings`](Self::sigma_loadings)'s.
     pub(crate) fn scaled_loadings(
-        &self,
-        cmt: usize,
-        f: f64,
-        n_sigma: usize,
-        mult: &[f64],
+        &self, cmt: usize, f: f64, n_sigma: usize, mult: &[f64],
     ) -> Loads<ScaledLoading> {
-        let mut out = Loads::empty(ScaledLoading {
-            idx: 0,
-            c: 0.0,
-            c1: 0.0,
-            c2: 0.0,
-        });
-        for l in self
-            .loading_shape(cmt, n_sigma)
-            .into_iter()
-            .map(|(idx, form)| {
-                let m = mult.get(idx).copied().unwrap_or(1.0);
-                // Only a proportional loading is raised to a power; a constant
-                // slot's loading ignores its exponent entry.
-                match (form == LoadingForm::Prop)
-                    .then(|| slot_exponent(mult, n_sigma, idx))
-                    .flatten()
-                {
-                    Some(p) if p != 1.0 => {
-                        let (g, g1, g2) = power_loading(f, p);
-                        ScaledLoading {
-                            idx,
-                            c: m * g,
-                            c1: m * g1,
-                            c2: m * g2,
-                        }
-                    }
-                    _ => {
-                        let (coeff, slope, curv) = form.eval(f);
-                        ScaledLoading {
-                            idx,
-                            c: coeff * m,
-                            c1: slope * m,
-                            // An affine loading's curvature is an exact `0`, not `0·m`.
-                            c2: if curv == 0.0 { 0.0 } else { curv * m },
-                        }
+        let mut out = Loads::empty(ScaledLoading { idx: 0, c: 0.0, c1: 0.0, c2: 0.0 });
+        for l in self.loading_shape(cmt, n_sigma).into_iter().map(|(idx, form)| {
+            let m = mult.get(idx).copied().unwrap_or(1.0);
+            // Only a proportional loading is raised to a power; a constant
+            // slot's loading ignores its exponent entry.
+            match (form == LoadingForm::Prop).then(|| slot_exponent(mult, n_sigma, idx)).flatten() {
+                Some(p) if p != 1.0 => {
+                    let (g, g1, g2) = power_loading(f, p);
+                    ScaledLoading { idx, c: m * g, c1: m * g1, c2: m * g2 }
+                }
+                _ => {
+                    let (coeff, slope, curv) = form.eval(f);
+                    ScaledLoading {
+                        idx,
+                        c: coeff * m,
+                        c1: slope * m,
+                        // An affine loading's curvature is an exact `0`, not `0·m`.
+                        c2: if curv == 0.0 { 0.0 } else { curv * m },
                     }
                 }
-            })
-        {
+            }
+        }) {
             out.push(l);
         }
         out
@@ -625,11 +575,7 @@ impl ErrorSpec {
                 match map.get(&cmt) {
                     Some(ep) => (
                         ep.error_model,
-                        ep.sigma_idx
-                            .first()
-                            .and_then(|&i| sigma.get(i))
-                            .copied()
-                            .unwrap_or(0.0),
+                        ep.sigma_idx.first().and_then(|&i| sigma.get(i)).copied().unwrap_or(0.0),
                     ),
                     None => return 0.0,
                 }
@@ -695,9 +641,7 @@ impl ErrorSpec {
         // slot (#2729) takes the same sum: its multiplier is the additive slot's,
         // not the `m_prop` the closed form below scales by.
         if self.has_inv_exp_slot(cmt, sigma.len())
-            || self
-                .prop_slot_exponent(cmt, sigma.len(), mult)
-                .is_some_and(|p| p != 1.0)
+            || self.prop_slot_exponent(cmt, sigma.len(), mult).is_some_and(|p| p != 1.0)
         {
             return self.dvar_df_loadings(cmt, f, sigma, mult);
         }
@@ -736,11 +680,7 @@ impl ErrorSpec {
                 match map.get(&cmt) {
                     Some(ep) => (
                         ep.error_model,
-                        ep.sigma_idx
-                            .first()
-                            .and_then(|&i| sigma.get(i))
-                            .copied()
-                            .unwrap_or(0.0),
+                        ep.sigma_idx.first().and_then(|&i| sigma.get(i)).copied().unwrap_or(0.0),
                     ),
                     None => return 0.0,
                 }
@@ -784,9 +724,7 @@ impl ErrorSpec {
         // curvature `c''` is what the affine loadings never had. So is
         // `LogCombined`'s `exp(−f)` slot (#2729).
         if self.has_inv_exp_slot(cmt, sigma.len())
-            || self
-                .prop_slot_exponent(cmt, sigma.len(), mult)
-                .is_some_and(|p| p != 1.0)
+            || self.prop_slot_exponent(cmt, sigma.len(), mult).is_some_and(|p| p != 1.0)
         {
             return self.d2var_df2_loadings(cmt, f, sigma, mult);
         }
@@ -850,21 +788,14 @@ impl ErrorSpec {
     /// [`variance_at_scaled`](Self::variance_at_scaled). A `mult` of all ones
     /// reproduces `dvar_dlogsigma`.
     pub fn dvar_dlogsigma_scaled(
-        &self,
-        cmt: usize,
-        k: usize,
-        f: f64,
-        sigma: &[f64],
-        mult: &[f64],
+        &self, cmt: usize, k: usize, f: f64, sigma: &[f64], mult: &[f64],
     ) -> f64 {
         let m = mult.get(k).copied().unwrap_or(1.0);
         // A `power(...)` slot (#1182): its contribution is `(c·σ_k)²` with
         // `c = m·|f|^p`, so `∂/∂log σ_k = 2·c²·σ_k²` — the unscaled `2·σ_k²·f²`
         // has the wrong power of `f`.
         if self.prop_sigma_slot(cmt) == Some(k)
-            && self
-                .prop_slot_exponent(cmt, sigma.len(), mult)
-                .is_some_and(|p| p != 1.0)
+            && self.prop_slot_exponent(cmt, sigma.len(), mult).is_some_and(|p| p != 1.0)
         {
             let sk = sigma.get(k).copied().unwrap_or(0.0);
             return self
@@ -892,9 +823,9 @@ impl ErrorSpec {
     pub fn has_f_dependent_variance(&self) -> bool {
         match self {
             ErrorSpec::Single(em) => !matches!(em, ErrorModel::Additive),
-            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => map
-                .values()
-                .any(|ep| !matches!(ep.error_model, ErrorModel::Additive)),
+            ErrorSpec::PerCmt(map) | ErrorSpec::Selected { endpoints: map, .. } => {
+                map.values().any(|ep| !matches!(ep.error_model, ErrorModel::Additive))
+            }
         }
     }
 
@@ -946,11 +877,7 @@ impl ErrorSpec {
     }
 
     fn variance_at_by(
-        &self,
-        cmt: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        score: fn(ErrorModel, f64, &[f64]) -> f64,
+        &self, cmt: usize, f_pred: f64, sigma: &[f64], score: fn(ErrorModel, f64, &[f64]) -> f64,
     ) -> f64 {
         match self {
             ErrorSpec::Single(em) => score(*em, f_pred, sigma),
@@ -982,10 +909,7 @@ impl ErrorSpec {
 /// parallel to `ipreds` (`subject.obs_cmts`); for single-endpoint models the
 /// CMT is ignored.
 pub fn compute_r_diag(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    sigma_values: &[f64],
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], sigma_values: &[f64],
 ) -> Vec<f64> {
     ipreds
         .iter()
@@ -1000,10 +924,7 @@ pub fn compute_r_diag(
 /// [`ErrorSpec::variance_at`] association exactly (the two differ by ~1 ULP
 /// under IEEE-754 reassociation, so the split is preserved, not merged).
 pub fn compute_r_diag_maybe_scaled(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    sigma_values: &[f64],
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], sigma_values: &[f64],
     ruv_mult: Option<&[Vec<f64>]>,
 ) -> Vec<f64> {
     let Some(mult) = ruv_mult else {
@@ -1034,15 +955,9 @@ pub fn compute_r_diag_maybe_scaled(
 /// take their own path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gaussian_obs_nll_scaled(
-    error_spec: &ErrorSpec,
-    err_keys: &[usize],
-    observations: &[f64],
-    preds: &[f64],
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
-    ruv_scale: f64,
-    frem_var: Option<&[Option<f64>]>,
-    ruv_mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, err_keys: &[usize], observations: &[f64], preds: &[f64],
+    sigma_values: &[f64], correlations: &[ResidualCorrelation], ruv_scale: f64,
+    frem_var: Option<&[Option<f64>]>, ruv_mult: Option<&[Vec<f64>]>,
 ) -> f64 {
     let mut nll = 0.0_f64;
     for (j, (&y, &f_raw)) in observations.iter().zip(preds.iter()).enumerate() {
@@ -1121,10 +1036,7 @@ impl<'a> ResidualCov<'a> {
     /// The structure carried by a bare `block_sigma` correlation list — the shape every
     /// `pub` builder taking `&[ResidualCorrelation]` describes.
     pub(crate) fn block_sigma(pairs: &'a [ResidualCorrelation]) -> Self {
-        Self {
-            pairs,
-            serial: None,
-        }
+        Self { pairs, serial: None }
     }
 
     /// Can `R` hold an off-diagonal term? The one predicate for "take the dense-`R`
@@ -1138,10 +1050,7 @@ impl<'a> ResidualCov<'a> {
 /// Compute residual variances including fixed residual correlations from
 /// `block_sigma`.
 pub fn compute_r_diag_with_correlations(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    sigma_values: &[f64],
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> Vec<f64> {
     if correlations.is_empty() {
@@ -1172,11 +1081,7 @@ fn observation_occasion_key(occasions: &[u32], j: usize) -> u32 {
 /// reader moved a ULP below a co-timed `MDV=1` / `EVID=2` row still pairs with
 /// its co-timed twin (#1959).
 fn same_residual_block(
-    obs_times: &[f64],
-    _obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    j: usize,
+    obs_times: &[f64], _obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], j: usize,
     k: usize,
 ) -> bool {
     let l2j = obs_l2.get(j).copied().unwrap_or(0);
@@ -1197,9 +1102,7 @@ fn same_residual_block(
 /// [`ErrorSpec::variance_at_scaled`] (instantiated at `f64`) and the adjoint's generic
 /// `R` ([`r_matrix_g`]).
 pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
-    loadings: &[(usize, T)],
-    sigma: &[T],
-    correlations: &[ResidualCorrelation],
+    loadings: &[(usize, T)], sigma: &[T], correlations: &[ResidualCorrelation],
     rho: impl Fn(usize) -> T,
 ) -> T {
     match loadings_variance_sum(loadings, sigma, correlations, rho) {
@@ -1214,9 +1117,7 @@ pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
 
 /// [`loadings_variance_g`] before the invalid-variance guard.
 pub(crate) fn loadings_variance_raw_g<T: crate::sens::num::PkNum>(
-    loadings: &[(usize, T)],
-    sigma: &[T],
-    correlations: &[ResidualCorrelation],
+    loadings: &[(usize, T)], sigma: &[T], correlations: &[ResidualCorrelation],
     rho: impl Fn(usize) -> T,
 ) -> T {
     loadings_variance_sum(loadings, sigma, correlations, rho).unwrap_or(T::from_f64(f64::NAN))
@@ -1226,9 +1127,7 @@ pub(crate) fn loadings_variance_raw_g<T: crate::sens::num::PkNum>(
 /// slice) — which both variants report as an unguarded `NaN`, so a spec error is never
 /// scored as a finite row.
 fn loadings_variance_sum<T: crate::sens::num::PkNum>(
-    loadings: &[(usize, T)],
-    sigma: &[T],
-    correlations: &[ResidualCorrelation],
+    loadings: &[(usize, T)], sigma: &[T], correlations: &[ResidualCorrelation],
     rho: impl Fn(usize) -> T,
 ) -> Option<T> {
     if loadings.is_empty() {
@@ -1256,12 +1155,8 @@ fn loadings_variance_sum<T: crate::sens::num::PkNum>(
 /// row-wise FOCEI objective uses it for a correlated model whose subject has censored or
 /// FREM rows, so it scores the same correlated variance the inner objective does.
 pub(crate) fn residual_rd2_corr(
-    error_spec: &ErrorSpec,
-    cmt: usize,
-    f: f64,
-    sigma: &[f64],
-    correlations: &[ResidualCorrelation],
-    mult: Option<&[f64]>,
+    error_spec: &ErrorSpec, cmt: usize, f: f64, sigma: &[f64],
+    correlations: &[ResidualCorrelation], mult: Option<&[f64]>,
 ) -> (f64, f64, f64) {
     use crate::sens::dual2::Dual2;
     use crate::sens::num::PkNum;
@@ -1291,13 +1186,8 @@ pub(crate) fn residual_rd2_corr(
 /// carries exact derivatives in `f` and in every residual parameter.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
-    loadings: impl Fn(usize) -> Vec<(usize, T)>,
-    n: usize,
-    subject: &Subject,
-    sigma: &[T],
-    cov: ResidualCov<'_>,
-    rho: impl Fn(usize) -> T,
-    serial_rho: Option<T>,
+    loadings: impl Fn(usize) -> Vec<(usize, T)>, n: usize, subject: &Subject, sigma: &[T],
+    cov: ResidualCov<'_>, rho: impl Fn(usize) -> T, serial_rho: Option<T>,
 ) -> Vec<Vec<T>> {
     let lt: Vec<Vec<(usize, T)>> = (0..n).map(&loadings).collect();
     let mut r = vec![vec![T::from_f64(0.0); n]; n];
@@ -1309,10 +1199,8 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
     }
     // The pairing reads the loadings' slots only (the value covariance it also returns is
     // recomputed below on `T`): no value of a generic number is read.
-    let lf: Vec<Vec<(usize, f64)>> = lt
-        .iter()
-        .map(|l| l.iter().map(|&(i, _)| (i, 0.0)).collect())
-        .collect();
+    let lf: Vec<Vec<(usize, f64)>> =
+        lt.iter().map(|l| l.iter().map(|&(i, _)| (i, 0.0)).collect()).collect();
     let sigma_v = vec![0.0; sigma.len()];
     for (j, k, _) in match_partners(
         &lf,
@@ -1357,11 +1245,8 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
 }
 
 fn cross_observation_covariance<T: crate::sens::num::PkNum>(
-    load_j: &[(usize, T)],
-    load_k: &[(usize, T)],
-    sigma_values: &[T],
-    correlations: &[ResidualCorrelation],
-    rho: impl Fn(usize) -> T,
+    load_j: &[(usize, T)], load_k: &[(usize, T)], sigma_values: &[T],
+    correlations: &[ResidualCorrelation], rho: impl Fn(usize) -> T,
 ) -> T {
     let mut cov = T::from_f64(0.0);
     for (ck, corr) in correlations.iter().enumerate() {
@@ -1379,26 +1264,14 @@ fn cross_observation_covariance<T: crate::sens::num::PkNum>(
             return T::from_f64(f64::NAN);
         };
         let cov_ij = rho(ck) * si * sj;
-        let ci_j = load_j
-            .iter()
-            .find(|(idx, _)| *idx == corr.sigma_i)
-            .map(|(_, coeff)| *coeff);
-        let cj_k = load_k
-            .iter()
-            .find(|(idx, _)| *idx == corr.sigma_j)
-            .map(|(_, coeff)| *coeff);
+        let ci_j = load_j.iter().find(|(idx, _)| *idx == corr.sigma_i).map(|(_, coeff)| *coeff);
+        let cj_k = load_k.iter().find(|(idx, _)| *idx == corr.sigma_j).map(|(_, coeff)| *coeff);
         if let (Some(ci), Some(cj)) = (ci_j, cj_k) {
             cov = cov + ci * cj * cov_ij;
         }
 
-        let cj_j = load_j
-            .iter()
-            .find(|(idx, _)| *idx == corr.sigma_j)
-            .map(|(_, coeff)| *coeff);
-        let ci_k = load_k
-            .iter()
-            .find(|(idx, _)| *idx == corr.sigma_i)
-            .map(|(_, coeff)| *coeff);
+        let cj_j = load_j.iter().find(|(idx, _)| *idx == corr.sigma_j).map(|(_, coeff)| *coeff);
+        let ci_k = load_k.iter().find(|(idx, _)| *idx == corr.sigma_i).map(|(_, coeff)| *coeff);
         if let (Some(cj), Some(ci)) = (cj_j, ci_k) {
             cov = cov + cj * ci * cov_ij;
         }
@@ -1416,9 +1289,7 @@ fn cross_observation_covariance<T: crate::sens::num::PkNum>(
 /// partner and the derivative builders keep emitting the nonzero slope-loading
 /// cross term.
 pub(crate) fn loadings_share_correlation(
-    load_j: &[(usize, f64)],
-    load_k: &[(usize, f64)],
-    correlations: &[ResidualCorrelation],
+    load_j: &[(usize, f64)], load_k: &[(usize, f64)], correlations: &[ResidualCorrelation],
 ) -> bool {
     correlations.iter().any(|corr| {
         let j_has_i = load_j.iter().any(|(idx, _)| *idx == corr.sigma_i);
@@ -1453,13 +1324,8 @@ pub(crate) fn loadings_share_correlation(
 /// recompute with slope loadings (`loadings[j]` are observation `j`'s sigma value loadings;
 /// slot presence is identical for slope loadings).
 fn match_partners(
-    loadings: &[Vec<(usize, f64)>],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
+    loadings: &[Vec<(usize, f64)>], obs_times: &[f64], obs_raw_times: &[f64], occasions: &[u32],
+    obs_l2: &[i64], sigma_values: &[f64], correlations: &[ResidualCorrelation],
 ) -> Vec<(usize, usize, f64)> {
     let n = loadings.len();
     let mut pairs = Vec::new();
@@ -1592,14 +1458,10 @@ pub(crate) fn residual_level(
 /// one `fitted_population` prepared (`simulate()`, `compute_npde_npd`): such a caller has
 /// no way to assign blocks itself, and an unassigned population gets a NaN `R`.
 pub(crate) fn with_residual_blocks<'a>(
-    model: &crate::types::CompiledModel,
-    population: &'a crate::types::Population,
+    model: &crate::types::CompiledModel, population: &'a crate::types::Population,
 ) -> std::borrow::Cow<'a, crate::types::Population> {
     let unassigned = model.residual_serial.is_some()
-        && population
-            .subjects
-            .iter()
-            .any(|s| s.obs_rgroup.len() != s.obs_times.len());
+        && population.subjects.iter().any(|s| s.obs_rgroup.len() != s.obs_times.len());
     if !unassigned {
         return std::borrow::Cow::Borrowed(population);
     }
@@ -1612,8 +1474,7 @@ pub(crate) fn with_residual_blocks<'a>(
 /// the step a population takes before a model with a `correlation` line scores
 /// it (#1081). A no-op for any other model.
 pub(crate) fn assign_residual_groups(
-    model: &crate::types::CompiledModel,
-    population: &mut crate::types::Population,
+    model: &crate::types::CompiledModel, population: &mut crate::types::Population,
 ) {
     if model.residual_serial.is_none() {
         return;
@@ -1637,11 +1498,7 @@ pub(crate) fn assign_residual_groups(
 /// builders turn that into a NaN `R`, which fails its factorisation, instead of
 /// scoring the rows as independent.
 fn serial_pairs(
-    serial: SerialCov,
-    obs_rgroup: &[u32],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    n: usize,
+    serial: SerialCov, obs_rgroup: &[u32], obs_times: &[f64], obs_raw_times: &[f64], n: usize,
 ) -> Option<Vec<(usize, usize, f64)>> {
     Some(
         serial_pairs_jet(serial, obs_rgroup, obs_times, obs_raw_times, n)?
@@ -1660,11 +1517,7 @@ fn serial_pairs(
 /// pair's value, and a pair is kept when any of the three is non-zero — at `ρ = 0` the
 /// value vanishes but its derivative does not.
 fn serial_pairs_jet(
-    serial: SerialCov,
-    obs_rgroup: &[u32],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    n: usize,
+    serial: SerialCov, obs_rgroup: &[u32], obs_times: &[f64], obs_raw_times: &[f64], n: usize,
 ) -> Option<Vec<(usize, usize, [f64; 5])>> {
     let rho = serial.rho;
     Some(
@@ -1715,10 +1568,9 @@ impl SerialShape {
     pub(crate) fn coefficient<T: crate::sens::num::PkNum>(self, rho: T) -> T {
         match self {
             SerialShape::Linear => rho,
-            SerialShape::IntPower(lag) => (1..lag)
-                .fold(if lag == 0 { T::from_f64(1.0) } else { rho }, |a, _| {
-                    a * rho
-                }),
+            SerialShape::IntPower(lag) => {
+                (1..lag).fold(if lag == 0 { T::from_f64(1.0) } else { rho }, |a, _| a * rho)
+            }
             SerialShape::Power(e) if e == 0.0 => T::from_f64(1.0),
             SerialShape::Power(e) => rho.pow(T::from_f64(e)),
         }
@@ -1729,11 +1581,8 @@ impl SerialShape {
 /// residual group (`obs_rgroup`, `0` none), `ar1`'s lag from each row's position in its
 /// group's time order. `None` when the population lacks its residual blocks.
 fn serial_pairs_shape(
-    kind: crate::types::ResidualSerialKind,
-    obs_rgroup: &[u32],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    n: usize,
+    kind: crate::types::ResidualSerialKind, obs_rgroup: &[u32], obs_times: &[f64],
+    obs_raw_times: &[f64], n: usize,
 ) -> Option<Vec<(usize, usize, SerialShape)>> {
     if n == 0 {
         return Some(Vec::new());
@@ -1746,10 +1595,7 @@ fn serial_pairs_shape(
     if kind == crate::types::ResidualSerialKind::Ar1 {
         let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
         order.cold_sort_by(&|&a, &b| {
-            obs_rgroup[a]
-                .cmp(&obs_rgroup[b])
-                .then(time(a).total_cmp(&time(b)))
-                .then(a.cmp(&b))
+            obs_rgroup[a].cmp(&obs_rgroup[b]).then(time(a).total_cmp(&time(b))).then(a.cmp(&b))
         });
         let mut prev = None;
         let mut p = 0usize;
@@ -1792,17 +1638,12 @@ fn serial_pairs_shape(
 /// loadings, so the derivative builders pass slope (or curvature) loadings for
 /// one side, exactly as they do for [`cross_observation_covariance`].
 fn same_slot_covariance<T: crate::sens::num::PkNum>(
-    load_a: &[(usize, T)],
-    load_b: &[(usize, T)],
-    sigma_values: &[T],
+    load_a: &[(usize, T)], load_b: &[(usize, T)], sigma_values: &[T],
 ) -> T {
     let mut cov = T::from_f64(0.0);
     for &(idx, a) in load_a {
         if let Some(&(_, b)) = load_b.iter().find(|(i, _)| *i == idx) {
-            let sg = sigma_values
-                .get(idx)
-                .copied()
-                .unwrap_or(T::from_f64(f64::NAN));
+            let sg = sigma_values.get(idx).copied().unwrap_or(T::from_f64(f64::NAN));
             cov = cov + a * b * sg * sg;
         }
     }
@@ -1814,13 +1655,8 @@ fn same_slot_covariance<T: crate::sens::num::PkNum>(
 /// A population without its residual blocks gets a NaN `R` (see [`serial_pairs`]).
 #[allow(clippy::too_many_arguments)]
 fn fill_serial_covariances(
-    r: &mut DMatrix<f64>,
-    cov: ResidualCov<'_>,
-    loadings: &[Vec<(usize, f64)>],
-    obs_rgroup: &[u32],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    sigma_values: &[f64],
+    r: &mut DMatrix<f64>, cov: ResidualCov<'_>, loadings: &[Vec<(usize, f64)>], obs_rgroup: &[u32],
+    obs_times: &[f64], obs_raw_times: &[f64], sigma_values: &[f64],
 ) {
     let Some(serial) = cov.serial else {
         return;
@@ -1847,14 +1683,8 @@ fn fill_serial_covariances(
 /// records such as total/unbound assays written as separate rows.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_r_matrix_with_correlations(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    sigma_values: &[f64],
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> DMatrix<f64> {
     compute_r_matrix_with_correlations_cov(
@@ -1875,16 +1705,9 @@ pub fn compute_r_matrix_with_correlations(
 /// form every in-crate caller uses (#1081).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_r_matrix_with_correlations_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], obs_rgroup: &[u32],
+    sigma_values: &[f64], cov: ResidualCov<'_>,
 ) -> DMatrix<f64> {
     let correlations = cov.pairs;
     // NOTE: deliberately NOT delegated to `_scaled` with an empty multiplier.
@@ -1953,16 +1776,9 @@ pub(crate) fn compute_r_matrix_with_correlations_cov(
 /// `_scaled(..., &[])` (that is the exact regression this revert prevents).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_r_matrix_with_correlations_scaled(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
-    mult: &[Vec<f64>],
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64],
+    correlations: &[ResidualCorrelation], mult: &[Vec<f64>],
 ) -> DMatrix<f64> {
     compute_r_matrix_with_correlations_scaled_cov(
         error_spec,
@@ -1983,17 +1799,9 @@ pub fn compute_r_matrix_with_correlations_scaled(
 /// the form every in-crate caller uses (#1081).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_r_matrix_with_correlations_scaled_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: &[Vec<f64>],
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], obs_rgroup: &[u32],
+    sigma_values: &[f64], cov: ResidualCov<'_>, mult: &[Vec<f64>],
 ) -> DMatrix<f64> {
     let correlations = cov.pairs;
     let n = ipreds.len();
@@ -2051,13 +1859,8 @@ pub(crate) fn compute_r_matrix_with_correlations_scaled_cov(
 /// `occasions`/`obs_l2` are pulled off `subject`. Folds the identical `match`
 /// that the FOCE/FOCEI/data-term/CWRES paths each carried.
 pub(crate) fn r_matrix_maybe_scaled(
-    error_spec: &ErrorSpec,
-    preds: &[f64],
-    err_keys: &[usize],
-    subject: &Subject,
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    ruv_mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, preds: &[f64], err_keys: &[usize], subject: &Subject,
+    sigma_values: &[f64], cov: ResidualCov<'_>, ruv_mult: Option<&[Vec<f64>]>,
 ) -> DMatrix<f64> {
     match ruv_mult {
         Some(mult) => compute_r_matrix_with_correlations_scaled_cov(
@@ -2106,16 +1909,9 @@ pub(crate) fn r_matrix_maybe_scaled(
 /// ⇒ all ones), applied identically to value and slope loadings.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_dr_df_matrices(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
-    mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64],
+    correlations: &[ResidualCorrelation], mult: Option<&[Vec<f64>]>,
 ) -> Vec<DMatrix<f64>> {
     compute_dr_df_matrices_cov(
         error_spec,
@@ -2136,17 +1932,9 @@ pub fn compute_dr_df_matrices(
 /// in-crate caller uses (#1081).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_dr_df_matrices_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], obs_rgroup: &[u32],
+    sigma_values: &[f64], cov: ResidualCov<'_>, mult: Option<&[Vec<f64>]>,
 ) -> Vec<DMatrix<f64>> {
     let n = ipreds.len();
     let mut out = vec![DMatrix::<f64>::zeros(n, n); n];
@@ -2182,30 +1970,15 @@ pub(crate) fn compute_dr_df_matrices_cov(
 /// [`compute_dr_df_matrices_cov`] stores.
 #[allow(clippy::too_many_arguments)]
 fn visit_dr_df_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], obs_rgroup: &[u32],
+    sigma_values: &[f64], cov: ResidualCov<'_>, mult: Option<&[Vec<f64>]>,
     sink: &mut impl FnMut(usize, usize, usize, f64),
 ) -> bool {
     let correlations = cov.pairs;
     let n = ipreds.len();
     let (vload, sload, _) = value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
-    let floored = floored_rows(
-        error_spec,
-        ipreds,
-        obs_cmts,
-        sigma_values,
-        correlations,
-        mult,
-    );
+    let floored = floored_rows(error_spec, ipreds, obs_cmts, sigma_values, correlations, mult);
 
     let pairs = match_partners(
         &vload,
@@ -2221,12 +1994,7 @@ fn visit_dr_df_cov(
         if vload[m].is_empty() || floored[m] {
             continue;
         }
-        sink(
-            m,
-            m,
-            m,
-            diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations),
-        );
+        sink(m, m, m, diag_self_deriv(&vload[m], &sload[m], sigma_values, correlations));
     }
     // ∂R_jk/∂f_j for each matched pair (mirrors the pairing that builds `R`):
     // slope loadings of the differentiated row, value loadings of its partner.
@@ -2270,39 +2038,24 @@ fn visit_dr_df_cov(
 /// place of `f` and `1` (`ErrorSpec::scaled_loadings`).
 #[allow(clippy::type_complexity)]
 fn value_slope_loadings(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    sigma_values: &[f64],
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], sigma_values: &[f64],
     mult: Option<&[Vec<f64>]>,
-) -> (
-    Vec<Vec<(usize, f64)>>,
-    Vec<Vec<(usize, f64)>>,
-    Vec<Vec<ScaledLoading>>,
-) {
+) -> (Vec<Vec<(usize, f64)>>, Vec<Vec<(usize, f64)>>, Vec<Vec<ScaledLoading>>) {
     let n = ipreds.len();
     let empty: Vec<f64> = Vec::new();
     let mrow = |j: usize| -> &[f64] {
-        mult.and_then(|m| m.get(j))
-            .map(|v| v.as_slice())
-            .unwrap_or(&empty)
+        mult.and_then(|m| m.get(j)).map(|v| v.as_slice()).unwrap_or(&empty)
     };
     let cmt_at = |j: usize| -> usize { obs_cmts.get(j).copied().unwrap_or(0) };
     let scaled: Vec<Vec<ScaledLoading>> = (0..n)
         .map(|j| {
-            error_spec
-                .scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j))
-                .to_vec()
+            error_spec.scaled_loadings(cmt_at(j), ipreds[j], sigma_values.len(), mrow(j)).to_vec()
         })
         .collect();
-    let vload: Vec<Vec<(usize, f64)>> = scaled
-        .iter()
-        .map(|row| row.iter().map(|l| (l.idx, l.c)).collect())
-        .collect();
-    let sload: Vec<Vec<(usize, f64)>> = scaled
-        .iter()
-        .map(|row| row.iter().map(|l| (l.idx, l.c1)).collect())
-        .collect();
+    let vload: Vec<Vec<(usize, f64)>> =
+        scaled.iter().map(|row| row.iter().map(|l| (l.idx, l.c)).collect()).collect();
+    let sload: Vec<Vec<(usize, f64)>> =
+        scaled.iter().map(|row| row.iter().map(|l| (l.idx, l.c1)).collect()).collect();
     (vload, sload, scaled)
 }
 
@@ -2316,12 +2069,8 @@ fn value_slope_loadings(
 /// applies on the diagonal path (#958). Off-diagonal entries are never guarded and keep
 /// their terms.
 fn floored_rows(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
-    mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], sigma_values: &[f64],
+    correlations: &[ResidualCorrelation], mult: Option<&[Vec<f64>]>,
 ) -> Vec<bool> {
     (0..ipreds.len())
         .map(|j| {
@@ -2360,9 +2109,7 @@ fn floored_rows(
 /// guarded row's diagonal before calling this (`floored_rows`), the gate
 /// [`ErrorSpec::dvar_df`] applies on the diagonal path.
 fn diag_self_deriv(
-    vload: &[(usize, f64)],
-    sload: &[(usize, f64)],
-    sigma_values: &[f64],
+    vload: &[(usize, f64)], sload: &[(usize, f64)], sigma_values: &[f64],
     correlations: &[ResidualCorrelation],
 ) -> f64 {
     let coeff = |loads: &[(usize, f64)], slot: usize| -> Option<f64> {
@@ -2409,16 +2156,9 @@ fn diag_self_deriv(
 /// #484 magnitude matrix, applied to the slope loadings as in the first-order path.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_d2r_df2_matrices(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
-    mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64],
+    correlations: &[ResidualCorrelation], mult: Option<&[Vec<f64>]>,
 ) -> Vec<Vec<DMatrix<f64>>> {
     compute_d2r_df2_matrices_cov(
         error_spec,
@@ -2439,17 +2179,9 @@ pub fn compute_d2r_df2_matrices(
 /// in-crate caller uses (#1081).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_d2r_df2_matrices_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], obs_rgroup: &[u32],
+    sigma_values: &[f64], cov: ResidualCov<'_>, mult: Option<&[Vec<f64>]>,
 ) -> Vec<Vec<DMatrix<f64>>> {
     let n = ipreds.len();
     let mut out = vec![vec![DMatrix::<f64>::zeros(n, n); n]; n];
@@ -2473,9 +2205,7 @@ pub(crate) fn compute_d2r_df2_matrices_cov(
         },
     );
     if !ok {
-        out.iter_mut()
-            .flat_map(|row| row.iter_mut())
-            .for_each(|m| m.fill(f64::NAN));
+        out.iter_mut().flat_map(|row| row.iter_mut()).for_each(|m| m.fill(f64::NAN));
     }
     out
 }
@@ -2487,17 +2217,9 @@ pub(crate) fn compute_d2r_df2_matrices_cov(
 /// [`compute_d2r_df2_matrices_cov`] stores.
 #[allow(clippy::too_many_arguments)]
 fn visit_d2r_df2_cov(
-    error_spec: &ErrorSpec,
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    obs_times: &[f64],
-    obs_raw_times: &[f64],
-    occasions: &[u32],
-    obs_l2: &[i64],
-    obs_rgroup: &[u32],
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
-    mult: Option<&[Vec<f64>]>,
+    error_spec: &ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64],
+    obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], obs_rgroup: &[u32],
+    sigma_values: &[f64], cov: ResidualCov<'_>, mult: Option<&[Vec<f64>]>,
     sink: &mut impl FnMut(usize, usize, usize, usize, f64),
 ) -> bool {
     let correlations = cov.pairs;
@@ -2508,14 +2230,7 @@ fn visit_d2r_df2_cov(
     // loading's own curvature `c''`, which an affine loading never has.
     let (vload, sload, scaled) =
         value_slope_loadings(error_spec, ipreds, obs_cmts, sigma_values, mult);
-    let floored = floored_rows(
-        error_spec,
-        ipreds,
-        obs_cmts,
-        sigma_values,
-        correlations,
-        mult,
-    );
+    let floored = floored_rows(error_spec, ipreds, obs_cmts, sigma_values, correlations, mult);
 
     let pairs = match_partners(
         &vload,
@@ -2532,20 +2247,12 @@ fn visit_d2r_df2_cov(
             continue;
         }
         // Diagonal curvature ∂²R_mm/∂f_m².
-        sink(
-            m,
-            m,
-            m,
-            m,
-            diag_self_second_deriv(&scaled[m], sigma_values, correlations),
-        );
+        sink(m, m, m, m, diag_self_second_deriv(&scaled[m], sigma_values, correlations));
     }
     // Curvature loadings `c''`: zero for an affine loading, live for a `power(...)`
     // slot (#1182) and `LogCombined`'s `exp(−f)` slot (#2729).
-    let cload: Vec<Vec<(usize, f64)>> = scaled
-        .iter()
-        .map(|row| row.iter().map(|l| (l.idx, l.c2)).collect())
-        .collect();
+    let cload: Vec<Vec<(usize, f64)>> =
+        scaled.iter().map(|row| row.iter().map(|l| (l.idx, l.c2)).collect()).collect();
     // For each matched pair, `R_jk = cross(c_j, c_k)` is bilinear in the two rows'
     // loadings: the mixed partial `∂²R_jk/∂f_j∂f_k = cross(c_j', c_k')`, and — where a
     // loading is not affine — the own-row curvatures `∂²R_jk/∂f_j² = cross(c_j'', c_k)`
@@ -2598,9 +2305,7 @@ fn visit_d2r_df2_cov(
 /// loadings (additive slots appear with slope and curvature 0), so iterating
 /// them is sufficient.
 fn diag_self_second_deriv(
-    loads: &[ScaledLoading],
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
+    loads: &[ScaledLoading], sigma_values: &[f64], correlations: &[ResidualCorrelation],
 ) -> f64 {
     let at = |slot: usize| -> Option<&ScaledLoading> { loads.iter().find(|l| l.idx == slot) };
     let sig = |idx: usize| -> f64 { sigma_values.get(idx).copied().unwrap_or(0.0) };
@@ -2631,10 +2336,7 @@ pub fn iwres(obs: f64, ipred: f64, error_model: ErrorModel, sigma_values: &[f64]
 /// Compute IWRES for all observations, dispatching the error model per
 /// observation by compartment (`obs_cmts` parallel to `observations`/`ipreds`).
 pub fn compute_iwres(
-    observations: &[f64],
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    error_spec: &ErrorSpec,
+    observations: &[f64], ipreds: &[f64], obs_cmts: &[usize], error_spec: &ErrorSpec,
     sigma_values: &[f64],
 ) -> Vec<f64> {
     observations
@@ -2659,13 +2361,8 @@ pub fn compute_iwres(
 /// OFV variance (otherwise late/covariate-varying rows are systematically
 /// mis-scaled).
 pub fn compute_iwres_with_correlations(
-    observations: &[f64],
-    ipreds: &[f64],
-    obs_cmts: &[usize],
-    error_spec: &ErrorSpec,
-    sigma_values: &[f64],
-    correlations: &[ResidualCorrelation],
-    ruv_mult: Option<&[Vec<f64>]>,
+    observations: &[f64], ipreds: &[f64], obs_cmts: &[usize], error_spec: &ErrorSpec,
+    sigma_values: &[f64], correlations: &[ResidualCorrelation], ruv_mult: Option<&[Vec<f64>]>,
 ) -> Vec<f64> {
     if let Some(mult) = ruv_mult {
         // variance_at_scaled handles empty `correlations` (no cross terms) and a
@@ -2786,22 +2483,14 @@ fn labels_run_in_time(labels: &[u32], obs_times: &[f64]) -> bool {
 /// (dependence the line does not explain). Split there, a line `by` the visits hid the
 /// cross-visit pairs and, with one row per block, gave `NaN` (#2858).
 pub(crate) fn split_by_residual_group(
-    values: &[f64],
-    subject: &crate::types::Subject,
+    values: &[f64], subject: &crate::types::Subject,
 ) -> Vec<Vec<f64>> {
     // A subject's vector is either empty (the key part is absent: every row `None`)
     // or one entry per row, so `get` alone reads both cases.
     let part = |v: &[u32], j: usize| v.get(j).copied();
-    let occasions: &[u32] = if occasions_run_in_time(subject) {
-        &[]
-    } else {
-        &subject.occasions
-    };
-    let blocks: &[u32] = if residual_blocks_run_in_time(subject) {
-        &[]
-    } else {
-        &subject.obs_rgroup
-    };
+    let occasions: &[u32] = if occasions_run_in_time(subject) { &[] } else { &subject.occasions };
+    let blocks: &[u32] =
+        if residual_blocks_run_in_time(subject) { &[] } else { &subject.obs_rgroup };
     let mut keys: Vec<(Option<u32>, Option<u32>)> = Vec::new();
     let mut groups: Vec<Vec<f64>> = Vec::new();
     for (j, &e) in values.iter().enumerate() {
@@ -2823,8 +2512,7 @@ pub(crate) fn split_by_residual_group(
 /// set), so lag pairs never join one arm's or level cell's last row to the next
 /// one's first. Occasions that run in time stay one series (#2829).
 pub(crate) fn grouped_iwres_autocorrelation(
-    population: &crate::types::Population,
-    subjects: &[SubjectResult],
+    population: &crate::types::Population, subjects: &[SubjectResult],
 ) -> (f64, f64) {
     debug_assert_eq!(population.subjects.len(), subjects.len());
     let series: Vec<Vec<f64>> = population
@@ -2854,10 +2542,8 @@ pub(crate) fn grouped_iwres_autocorrelation(
 /// residual block when the blocks are parallel (#2858), and within one occasion when the
 /// occasions are (#2829).
 pub(crate) fn whitened_residual_autocorrelation(
-    model: &crate::types::CompiledModel,
-    population: &crate::types::Population,
-    params: &crate::types::ModelParameters,
-    subjects: &[SubjectResult],
+    model: &crate::types::CompiledModel, population: &crate::types::Population,
+    params: &crate::types::ModelParameters, subjects: &[SubjectResult],
 ) -> (f64, f64) {
     let series: Vec<Vec<f64>> = population
         .subjects
@@ -2876,10 +2562,8 @@ pub(crate) fn whitened_residual_autocorrelation(
 /// (see [`whitened_residual_autocorrelation`]). `None` when the subject has a
 /// non-finite IWRES, its rows do not line up, or its `R` does not factor.
 fn whitened_rows(
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    params: &crate::types::ModelParameters,
-    res: &SubjectResult,
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject,
+    params: &crate::types::ModelParameters, res: &SubjectResult,
 ) -> Option<Vec<f64>> {
     let n = res.iwres.len();
     if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
@@ -2898,9 +2582,7 @@ fn whitened_rows(
     );
     let chol = r.clone().cholesky()?;
     let e = nalgebra::DVector::from_iterator(n, (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()));
-    chol.l()
-        .solve_lower_triangular(&e)
-        .map(|w| w.as_slice().to_vec())
+    chol.l().solve_lower_triangular(&e).map(|w| w.as_slice().to_vec())
 }
 
 /// The Durbin–Watson statistic over the lag pairs that **join two residual blocks** (#2858),
@@ -2915,10 +2597,8 @@ fn whitened_rows(
 /// the pooled one, so independent rows give 2. A pair that also crosses a parallel occasion is
 /// left out, as in the pooled statistic.
 pub(crate) fn whitened_cross_block_dw(
-    model: &crate::types::CompiledModel,
-    population: &crate::types::Population,
-    params: &crate::types::ModelParameters,
-    subjects: &[SubjectResult],
+    model: &crate::types::CompiledModel, population: &crate::types::Population,
+    params: &crate::types::ModelParameters, subjects: &[SubjectResult],
 ) -> (usize, f64) {
     let (mut pairs, mut num, mut den) = (0usize, 0.0_f64, 0.0_f64);
     for (subject, res) in population.subjects.iter().zip(subjects) {
@@ -2972,11 +2652,7 @@ fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64
     let mut n_pairs: usize = 0;
 
     for residuals in series {
-        let valid: Vec<f64> = residuals
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
+        let valid: Vec<f64> = residuals.iter().copied().filter(|v| v.is_finite()).collect();
         if valid.len() < 2 {
             continue;
         }
@@ -3012,11 +2688,7 @@ fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64
         }
     };
 
-    let dw = if dw_den == 0.0 {
-        f64::NAN
-    } else {
-        dw_num / dw_den
-    };
+    let dw = if dw_den == 0.0 { f64::NAN } else { dw_num / dw_den };
 
     (lag1_r, dw)
 }
@@ -3036,14 +2708,8 @@ mod tests {
     /// `compute_r_matrix_with_correlations`, for every observation `m` and entry of `R`.
     #[allow(clippy::too_many_arguments)]
     fn assert_dr_df_matches_fd(
-        spec: &ErrorSpec,
-        ipreds: &[f64],
-        cmts: &[usize],
-        times: &[f64],
-        raw_times: &[f64],
-        occasions: &[u32],
-        obs_l2: &[i64],
-        sigma: &[f64],
+        spec: &ErrorSpec, ipreds: &[f64], cmts: &[usize], times: &[f64], raw_times: &[f64],
+        occasions: &[u32], obs_l2: &[i64], sigma: &[f64],
         corrs: &[crate::types::ResidualCorrelation],
     ) {
         let dr = compute_dr_df_matrices(
@@ -3113,54 +2779,19 @@ mod tests {
         ] {
             let spec = ErrorSpec::Single(em);
             for n in 0..=3 {
-                assert_eq!(
-                    shape_of(&spec, 1, n),
-                    lists_of(&spec, 1, n),
-                    "{em:?}, {n} σ"
-                );
+                assert_eq!(shape_of(&spec, 1, n), lists_of(&spec, 1, n), "{em:?}, {n} σ");
             }
         }
         let mut map = HashMap::new();
-        map.insert(
-            1,
-            EndpointError {
-                error_model: ErrorModel::Additive,
-                sigma_idx: vec![3],
-            },
-        );
-        map.insert(
-            2,
-            EndpointError {
-                error_model: ErrorModel::Proportional,
-                sigma_idx: vec![0],
-            },
-        );
-        map.insert(
-            3,
-            EndpointError {
-                error_model: ErrorModel::Combined,
-                sigma_idx: vec![1, 2],
-            },
-        );
-        map.insert(
-            4,
-            EndpointError {
-                error_model: ErrorModel::Combined,
-                sigma_idx: vec![5],
-            },
-        );
+        map.insert(1, EndpointError { error_model: ErrorModel::Additive, sigma_idx: vec![3] });
+        map.insert(2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] });
+        map.insert(3, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![1, 2] });
+        map.insert(4, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![5] });
         let spec = ErrorSpec::PerCmt(map);
         for k in [1, 2, 3, 4, 9] {
-            assert_eq!(
-                shape_of(&spec, k, 6),
-                lists_of(&spec, k, 6),
-                "endpoint key {k}"
-            );
+            assert_eq!(shape_of(&spec, k, 6), lists_of(&spec, k, 6), "endpoint key {k}");
         }
-        assert!(
-            shape_of(&spec, 9, 6).is_empty(),
-            "an unmapped key loads nothing"
-        );
+        assert!(shape_of(&spec, 9, 6).is_empty(), "an unmapped key loads nothing");
         assert_eq!(shape_of(&spec, 3, 6).len(), 2, "combined: two slots");
     }
 
@@ -3205,10 +2836,7 @@ mod tests {
         let lc = ErrorSpec::Single(ErrorModel::LogCombined);
         let add = ErrorSpec::Single(ErrorModel::Additive);
         for g in [-2.0, 0.3, 4.0] {
-            assert_eq!(
-                lc.variance_at(0, g, &[0.2, 0.0]),
-                add.variance_at(0, g, &[0.2])
-            );
+            assert_eq!(lc.variance_at(0, g, &[0.2, 0.0]), add.variance_at(0, g, &[0.2]));
             assert_eq!(lc.dvar_df(0, g, &[0.2, 0.0]), 0.0);
             assert_eq!(lc.d2var_df2(0, g, &[0.2, 0.0]), 0.0);
             assert_eq!(
@@ -3227,13 +2855,7 @@ mod tests {
     fn log_combined_f_derivatives_match_fd() {
         let spec = ErrorSpec::Single(ErrorModel::LogCombined);
         let sigma = [0.15, 0.4];
-        for row in [
-            vec![],
-            vec![1.0, 1.0],
-            vec![2.0, 1.0],
-            vec![1.0, 0.5],
-            vec![1.7, 2.5],
-        ] {
+        for row in [vec![], vec![1.0, 1.0], vec![2.0, 1.0], vec![1.0, 0.5], vec![1.7, 2.5]] {
             for g in [-1.5, 0.0, 1.2, 4.0] {
                 let h = 1e-5;
                 let v = |x: f64| spec.variance_at_scaled(0, x, &sigma, &[], &row);
@@ -3297,10 +2919,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             2,
-            EndpointError {
-                error_model: ErrorModel::LogCombined,
-                sigma_idx: vec![3, 1],
-            },
+            EndpointError { error_model: ErrorModel::LogCombined, sigma_idx: vec![3, 1] },
         );
         let spec = ErrorSpec::PerCmt(map);
         let g = 0.8;
@@ -3334,11 +2953,7 @@ mod tests {
     /// rather than a slope at some arbitrary `f`; `sigma_loading_slopes_at` is exact.
     #[test]
     fn sigma_loading_slopes_compat_and_at() {
-        for em in [
-            ErrorModel::Additive,
-            ErrorModel::Proportional,
-            ErrorModel::Combined,
-        ] {
+        for em in [ErrorModel::Additive, ErrorModel::Proportional, ErrorModel::Combined] {
             let spec = ErrorSpec::Single(em);
             for f in [-2.0, 0.0, 3.5] {
                 assert_eq!(
@@ -3368,20 +2983,8 @@ mod tests {
     #[test]
     fn d2r_df2_includes_own_row_curvature_of_paired_log_combined_rows() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::LogCombined,
-                    sigma_idx: vec![0, 1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::LogCombined,
-                    sigma_idx: vec![2, 3],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::LogCombined, sigma_idx: vec![0, 1] }),
+            (2, EndpointError { error_model: ErrorModel::LogCombined, sigma_idx: vec![2, 3] }),
         ]));
         // Log-scale predictions; the ADD slots (1 and 3) are correlated across rows
         // sampled at the same time.
@@ -3389,11 +2992,7 @@ mod tests {
         let cmts = [1usize, 2, 1, 2];
         let times = [1.0, 1.0, 2.0, 2.0];
         let sigma = [0.1, 0.4, 0.2, 0.6];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 1,
-            sigma_j: 3,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 1, sigma_j: 3, rho: 0.5 };
         let r_at = |f: &[f64]| {
             compute_r_matrix_with_correlations(
                 &spec,
@@ -3508,47 +3107,22 @@ mod tests {
         ] {
             let single = ErrorSpec::Single(em);
             let mut map = HashMap::new();
-            map.insert(
-                1usize,
-                EndpointError {
-                    error_model: em,
-                    sigma_idx: idx,
-                },
-            );
+            map.insert(1usize, EndpointError { error_model: em, sigma_idx: idx });
             let per = ErrorSpec::PerCmt(map);
-            for f in [
-                0.0,
-                -0.0,
-                1e-200,
-                5e-324,
-                f64::NAN,
-                -2.5,
-                0.7,
-                13.0,
-                1e150,
-                f64::INFINITY,
-            ] {
+            for f in [0.0, -0.0, 1e-200, 5e-324, f64::NAN, -2.5, 0.7, 13.0, 1e150, f64::INFINITY] {
                 let same = |a: f64, b: f64, what: &str| {
                     assert!(
                         a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
                         "{em:?} {what} at f = {f}: {a} vs {b}"
                     );
                 };
-                same(
-                    single.variance_at(1, f, &sigma),
-                    per.variance_at(1, f, &sigma),
-                    "value",
-                );
+                same(single.variance_at(1, f, &sigma), per.variance_at(1, f, &sigma), "value");
                 same(
                     single.variance_at_raw(1, f, &sigma),
                     per.variance_at_raw(1, f, &sigma),
                     "raw value",
                 );
-                same(
-                    single.dvar_df(1, f, &sigma),
-                    per.dvar_df(1, f, &sigma),
-                    "slope",
-                );
+                same(single.dvar_df(1, f, &sigma), per.dvar_df(1, f, &sigma), "slope");
             }
         }
     }
@@ -3584,21 +3158,9 @@ mod tests {
     #[test]
     fn dvar_df_scaled_and_d2var_df2_scaled_match_fd_under_an_exponent() {
         for (spec, sigma, row) in [
-            (
-                ErrorSpec::Single(ErrorModel::Proportional),
-                vec![0.2],
-                vec![1.0, 1.4],
-            ),
-            (
-                ErrorSpec::Single(ErrorModel::Proportional),
-                vec![0.2],
-                vec![1.7, 0.6],
-            ),
-            (
-                ErrorSpec::Single(ErrorModel::Combined),
-                vec![0.2, 0.5],
-                vec![1.0, 1.0, 1.4, 1.0],
-            ),
+            (ErrorSpec::Single(ErrorModel::Proportional), vec![0.2], vec![1.0, 1.4]),
+            (ErrorSpec::Single(ErrorModel::Proportional), vec![0.2], vec![1.7, 0.6]),
+            (ErrorSpec::Single(ErrorModel::Combined), vec![0.2, 0.5], vec![1.0, 1.0, 1.4, 1.0]),
         ] {
             for f in [0.5, 3.0, 12.0] {
                 let h = 1e-5 * f;
@@ -3729,11 +3291,7 @@ mod tests {
     #[test]
     fn test_combined_variance_with_residual_correlation() {
         let spec = ErrorSpec::Single(ErrorModel::Combined);
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
         // V = (10 * 0.2)^2 + 1^2 + 2 * 10 * 0.5 * 0.2 * 1 = 7.
         let v = spec.variance_at_with_correlations(1, 10.0, &[0.2, 1.0], &[corr]);
         assert_relative_eq!(v, 7.0, epsilon = 1e-12);
@@ -3758,11 +3316,7 @@ mod tests {
         let ipreds = [10.0];
         let cmts = [0usize];
         let sigma = [0.2, 1.0];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
         let with = compute_r_diag_with_correlations(&spec, &ipreds, &cmts, &sigma, &[corr]);
         assert_relative_eq!(with[0], 7.0, epsilon = 1e-12);
     }
@@ -3770,30 +3324,14 @@ mod tests {
     #[test]
     fn test_compute_r_matrix_with_correlations_links_paired_endpoints() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0];
         let cmts = [1usize, 2, 2];
         let times = [1.0, 1.0, 2.0];
         let sigma = [0.2, 0.3];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
         let r = compute_r_matrix_with_correlations(
             &spec,
             &ipreds,
@@ -3824,26 +3362,10 @@ mod tests {
     #[test]
     fn a_moved_observation_pairs_with_its_co_timed_twin_but_not_across_a_reset() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
-        let corr = [crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        }];
+        let corr = [crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
         let r = |engine: [f64; 2]| {
             compute_r_matrix_with_correlations(
                 &spec,
@@ -3874,20 +3396,8 @@ mod tests {
     #[test]
     fn test_replicate_time_samples_pair_disjointly_and_stay_pd() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
         // Rows in the NONMEM-contiguous layout: (total#1, unbound#1, total#2,
         // unbound#2), all at t = 1.0 — the replicate-time collision from ID 21.
@@ -3895,11 +3405,7 @@ mod tests {
         let cmts = [1usize, 2, 1, 2];
         let times = [1.0, 1.0, 1.0, 1.0];
         let sigma = [0.671, 0.644];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.93,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.93 };
         let r = compute_r_matrix_with_correlations(
             &spec,
             &ipreds,
@@ -3920,10 +3426,7 @@ mod tests {
         assert_eq!(r[(1, 2)], 0.0);
         assert_eq!(r[(2, 1)], 0.0);
         // The whole matrix is PD (before the fix this cholesky failed → 2e20).
-        assert!(
-            r.cholesky().is_some(),
-            "replicate-time residual R must be positive-definite"
-        );
+        assert!(r.cholesky().is_some(), "replicate-time residual R must be positive-definite");
     }
 
     // #827: an explicit `L2` grouping id is authoritative — it pairs rows the
@@ -3934,20 +3437,8 @@ mod tests {
     #[test]
     fn test_l2_grouping_controls_pairing_over_time_and_order() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0, 4.0];
         let cmts = [1usize, 2, 2, 1];
@@ -3956,11 +3447,7 @@ mod tests {
         let times = [1.0, 1.0, 9.0, 9.0];
         let obs_l2 = [10i64, 20, 10, 20];
         let sigma = [0.671, 0.644];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.93,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.93 };
         let r = compute_r_matrix_with_correlations(
             &spec,
             &ipreds,
@@ -3993,27 +3480,9 @@ mod tests {
     #[test]
     fn test_l2_group_correlates_three_endpoints_all_to_all() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                3,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![2],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (3, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![2] }),
         ]));
         let ipreds = [10.0, 20.0, 30.0];
         let cmts = [1usize, 2, 3];
@@ -4022,21 +3491,9 @@ mod tests {
         let sigma = [0.3, 0.3, 0.3];
         // Three pairwise correlations at a mild rho so the 3×3 block stays PD.
         let corrs = [
-            crate::types::ResidualCorrelation {
-                sigma_i: 0,
-                sigma_j: 1,
-                rho: 0.3,
-            },
-            crate::types::ResidualCorrelation {
-                sigma_i: 0,
-                sigma_j: 2,
-                rho: 0.3,
-            },
-            crate::types::ResidualCorrelation {
-                sigma_i: 1,
-                sigma_j: 2,
-                rho: 0.3,
-            },
+            crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.3 },
+            crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 2, rho: 0.3 },
+            crate::types::ResidualCorrelation { sigma_i: 1, sigma_j: 2, rho: 0.3 },
         ];
         let r = compute_r_matrix_with_correlations(
             &spec,
@@ -4054,24 +3511,11 @@ mod tests {
         assert!(r[(0, 1)] != 0.0 && r[(1, 0)] != 0.0);
         assert!(r[(0, 2)] != 0.0 && r[(2, 0)] != 0.0);
         assert!(r[(1, 2)] != 0.0 && r[(2, 1)] != 0.0);
-        assert!(
-            r.cholesky().is_some(),
-            "PD 3-endpoint L2 block must stay positive-definite"
-        );
+        assert!(r.cholesky().is_some(), "PD 3-endpoint L2 block must stay positive-definite");
 
         // The derivative builder must track the same all-to-all pairing: ∂R/∂f
         // matches a central difference of R for every observation.
-        assert_dr_df_matches_fd(
-            &spec,
-            &ipreds,
-            &cmts,
-            &times,
-            &[],
-            &[],
-            &obs_l2,
-            &sigma,
-            &corrs,
-        );
+        assert_dr_df_matches_fd(&spec, &ipreds, &cmts, &times, &[], &[], &obs_l2, &sigma, &corrs);
     }
 
     // #830: the pairing is structural (slot overlap), not value-based, so a
@@ -4081,20 +3525,8 @@ mod tests {
     #[test]
     fn test_cross_derivative_survives_zero_prediction() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
         ]));
         // Row 0's prediction is exactly zero — its value loading (and hence the
         // value cross covariance) vanishes, but its slope loading does not.
@@ -4102,11 +3534,7 @@ mod tests {
         let cmts = [1usize, 2];
         let times = [1.0, 1.0];
         let sigma = [0.3, 0.4];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
         // R's off-diagonal is genuinely 0 at f = 0 (value covariance), and the
         // block stays PD.
         let r = compute_r_matrix_with_correlations(
@@ -4136,10 +3564,7 @@ mod tests {
         );
         assert_relative_eq!(dr[0][(0, 1)], 0.3, epsilon = 1e-12);
         assert_relative_eq!(dr[0][(1, 0)], 0.3, epsilon = 1e-12);
-        assert!(
-            dr[0][(0, 1)] != 0.0,
-            "cross derivative must survive a zero prediction"
-        );
+        assert!(dr[0][(0, 1)] != 0.0, "cross derivative must survive a zero prediction");
     }
 
     // The derivative builders must use the SAME disjoint pairing as
@@ -4148,41 +3573,15 @@ mod tests {
     #[test]
     fn test_compute_dr_df_matrices_matches_fd_replicate_time() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0, 4.0];
         let cmts = [1usize, 2, 1, 2];
         let times = [1.0, 1.0, 1.0, 1.0];
         let sigma = [0.671, 0.644];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.93,
-        };
-        assert_dr_df_matches_fd(
-            &spec,
-            &ipreds,
-            &cmts,
-            &times,
-            &[],
-            &[],
-            &[],
-            &sigma,
-            &[corr],
-        );
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.93 };
+        assert_dr_df_matches_fd(&spec, &ipreds, &cmts, &times, &[], &[], &[], &sigma, &[corr]);
     }
 
     // Central-difference check: ∂R/∂f_m from `compute_dr_df_matrices` must match
@@ -4191,41 +3590,15 @@ mod tests {
     #[test]
     fn test_compute_dr_df_matrices_matches_finite_difference_paired() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Combined,
-                    sigma_idx: vec![0, 2],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![0, 2] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0, 4.0];
         let cmts = [1usize, 2, 1, 2];
         let times = [1.0, 1.0, 2.0, 2.0];
         let sigma = [0.2, 0.3, 1.5];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.4,
-        };
-        assert_dr_df_matches_fd(
-            &spec,
-            &ipreds,
-            &cmts,
-            &times,
-            &[],
-            &[],
-            &[],
-            &sigma,
-            &[corr],
-        );
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.4 };
+        assert_dr_df_matches_fd(&spec, &ipreds, &cmts, &times, &[], &[], &[], &sigma, &[corr]);
     }
 
     // With a #484 per-observation magnitude matrix, ∂R/∂f must track the
@@ -4233,37 +3606,16 @@ mod tests {
     #[test]
     fn test_compute_dr_df_matrices_matches_finite_difference_scaled() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0, 4.0];
         let cmts = [1usize, 2, 1, 2];
         let times = [1.0, 1.0, 2.0, 2.0];
         let sigma = [0.2, 0.3];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.4,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.4 };
         // Non-trivial per-observation, per-slot multipliers.
-        let mult = vec![
-            vec![1.0, 1.2],
-            vec![0.8, 1.0],
-            vec![1.1, 0.9],
-            vec![1.3, 1.0],
-        ];
+        let mult = vec![vec![1.0, 1.2], vec![0.8, 1.0], vec![1.1, 0.9], vec![1.3, 1.0]];
         let dr = compute_dr_df_matrices(
             &spec,
             &ipreds,
@@ -4319,30 +3671,14 @@ mod tests {
     #[test]
     fn test_compute_d2r_df2_matrices_matches_finite_difference_paired() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Combined,
-                    sigma_idx: vec![0, 2],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Combined, sigma_idx: vec![0, 2] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0, 4.0];
         let cmts = [1usize, 2, 1, 2];
         let times = [1.0, 1.0, 2.0, 2.0];
         let sigma = [0.2, 0.3, 1.5];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.4,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.4 };
         let d2r = compute_d2r_df2_matrices(
             &spec,
             &ipreds,
@@ -4357,18 +3693,7 @@ mod tests {
         );
         let n = ipreds.len();
         let dr_at = |f: &[f64]| {
-            compute_dr_df_matrices(
-                &spec,
-                f,
-                &cmts,
-                &times,
-                &[],
-                &[],
-                &[],
-                &sigma,
-                &[corr],
-                None,
-            )
+            compute_dr_df_matrices(&spec, f, &cmts, &times, &[], &[], &[], &sigma, &[corr], None)
         };
         let h = 1e-4;
         for b in 0..n {
@@ -4399,36 +3724,15 @@ mod tests {
     #[test]
     fn test_compute_d2r_df2_matrices_matches_finite_difference_scaled() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0, 4.0];
         let cmts = [1usize, 2, 1, 2];
         let times = [1.0, 1.0, 2.0, 2.0];
         let sigma = [0.2, 0.3];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.4,
-        };
-        let mult = vec![
-            vec![1.0, 1.2],
-            vec![0.8, 1.0],
-            vec![1.1, 0.9],
-            vec![1.3, 1.0],
-        ];
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.4 };
+        let mult = vec![vec![1.0, 1.2], vec![0.8, 1.0], vec![1.1, 0.9], vec![1.3, 1.0]];
         let d2r = compute_d2r_df2_matrices(
             &spec,
             &ipreds,
@@ -4487,11 +3791,7 @@ mod tests {
     fn test_compute_dr_df_matrices_within_obs_cross_term() {
         let spec = ErrorSpec::Single(ErrorModel::Combined);
         let sigma = [0.3, 1.2];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
         let ipreds = [40.0];
         let cmts = [1usize];
         let times = [1.0];
@@ -4515,31 +3815,15 @@ mod tests {
     #[test]
     fn test_compute_r_matrix_with_correlations_uses_shifted_time_after_reset() {
         let spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
         let ipreds = [50.0, 5.0, 40.0, 4.0];
         let cmts = [1usize, 2, 1, 2];
         let shifted_times = [1.0, 1.0, 101.0, 101.0];
         let raw_times = [1.0, 1.0, 1.0, 1.0];
         let sigma = [0.2, 0.3];
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
 
         let r = compute_r_matrix_with_correlations(
             &spec,
@@ -4565,10 +3849,7 @@ mod tests {
         let v = residual_variance(ErrorModel::Proportional, 0.0, &[0.1]);
         assert_eq!(v, MIN_VARIANCE);
         // A NaN variance is guarded too, rather than propagating.
-        assert_eq!(
-            residual_variance(ErrorModel::Additive, 0.0, &[f64::NAN]),
-            MIN_VARIANCE
-        );
+        assert_eq!(residual_variance(ErrorModel::Additive, 0.0, &[f64::NAN]), MIN_VARIANCE);
         // A subnormal one (here 2.25e-322) cannot be divided by safely either.
         let v = residual_variance(ErrorModel::Proportional, 1e-160, &[0.15]);
         assert_eq!(v, MIN_VARIANCE);
@@ -4612,9 +3893,8 @@ mod tests {
             let n_sig = em.n_sigma();
             let neg2ll = |k: f64| -> (f64, f64) {
                 let f: Vec<f64> = f1.iter().map(|x| x * k).collect();
-                let sig: Vec<f64> = (0..n_sig)
-                    .map(|i| if in_units[i] { sig1[i] * k } else { sig1[i] })
-                    .collect();
+                let sig: Vec<f64> =
+                    (0..n_sig).map(|i| if in_units[i] { sig1[i] * k } else { sig1[i] }).collect();
                 // A residual of 1.3 SD on every row, so no row's (y−f)²/V swamps the
                 // ln V terms the test is about (it is unit-free, so it scales with k).
                 let y: Vec<f64> = f
@@ -4716,10 +3996,7 @@ mod tests {
 
         // Guarded under the magnitude too: f = 0 and a subnormal scaled V.
         for f in [0.0, 1e-162] {
-            assert_eq!(
-                spec.variance_at_scaled(1, f, &sigma, &corr, &mult),
-                MIN_VARIANCE
-            );
+            assert_eq!(spec.variance_at_scaled(1, f, &sigma, &corr, &mult), MIN_VARIANCE);
             assert_eq!(spec.dvar_df_scaled(1, f, &sigma, &mult), 0.0, "f={f}");
             assert_eq!(spec.d2var_df2_scaled(1, f, &sigma, &mult), 0.0, "f={f}");
         }
@@ -4787,11 +4064,7 @@ mod tests {
     #[test]
     fn test_compute_iwres_with_correlations_applies_cross_term() {
         let spec = ErrorSpec::Single(ErrorModel::Combined);
-        let corr = crate::types::ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        };
+        let corr = crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 };
         // V = (10 * 0.2)^2 + 1^2 + 2 * 10 * 0.5 * 0.2 * 1 = 7.
         let result = compute_iwres_with_correlations(
             &[12.0],
@@ -4919,10 +4192,7 @@ mod tests {
         // Monotonically increasing → strong positive autocorrelation → DW near 0
         let subj = make_subject(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
         let (r, dw) = iwres_autocorrelation(&[subj]);
-        assert!(
-            dw < 1.5,
-            "expected DW < 1.5 for monotone sequence, got {dw}"
-        );
+        assert!(dw < 1.5, "expected DW < 1.5 for monotone sequence, got {dw}");
         assert!(r > 0.5, "expected positive lag-1 r, got {r}");
     }
 
@@ -4931,10 +4201,7 @@ mod tests {
         // Alternating signs → strong negative autocorrelation → DW near 4
         let subj = make_subject(vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
-        assert!(
-            dw > 2.5,
-            "expected DW > 2.5 for alternating sequence, got {dw}"
-        );
+        assert!(dw > 2.5, "expected DW > 2.5 for alternating sequence, got {dw}");
     }
 
     #[test]
@@ -4945,10 +4212,7 @@ mod tests {
         // — its lag-1 r is negative, which the classic form's downward bias hid.
         let subj = make_subject(vec![1.0, 0.3, -0.8, 0.5, 0.9, -0.4, -0.2, 0.6]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
-        assert!(
-            dw > 1.5 && dw < 2.5,
-            "expected DW near 2 for white-noise sequence, got {dw}"
-        );
+        assert!(dw > 1.5 && dw < 2.5, "expected DW near 2 for white-noise sequence, got {dw}");
     }
 
     #[test]
@@ -4956,10 +4220,7 @@ mod tests {
         let subj = make_subject(vec![f64::NAN, 1.0, 2.0, f64::NAN, 3.0]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
         // Should not panic and should produce a finite result based on valid values
-        assert!(
-            dw.is_finite(),
-            "DW should be finite after skipping NaN entries"
-        );
+        assert!(dw.is_finite(), "DW should be finite after skipping NaN entries");
     }
 
     #[test]
@@ -5009,12 +4270,7 @@ mod tests {
     /// its own occasion.
     fn restarting_times(occasions: &[u32]) -> Vec<f64> {
         (0..occasions.len())
-            .map(|j| {
-                occasions[..j]
-                    .iter()
-                    .filter(|o| **o == occasions[j])
-                    .count() as f64
-            })
+            .map(|j| occasions[..j].iter().filter(|o| **o == occasions[j]).count() as f64)
             .collect()
     }
 
@@ -5060,16 +4316,10 @@ mod tests {
         assert!(dw.is_finite() && r.is_finite(), "({r}, {dw})");
         assert!(dw.abs() < 1e-15, "split at the occasion: DW 0, got {dw}");
         // The lag-1 r over the same two pairs: x = [1, −1], y = [1, −1], r = 1.
-        assert!(
-            (r - 1.0).abs() < 1e-12,
-            "lag-1 r over the split pairs, got {r}"
-        );
+        assert!((r - 1.0).abs() < 1e-12, "lag-1 r over the split pairs, got {r}");
         let (_, whole) = iwres_autocorrelation(std::slice::from_ref(&res));
         assert!(whole.is_finite());
-        assert!(
-            (whole - 4.0 / 3.0).abs() < 1e-15,
-            "whole subject: 4/3, got {whole}"
-        );
+        assert!((whole - 4.0 / 3.0).abs() < 1e-15, "whole subject: 4/3, got {whole}");
     }
 
     /// B2: the split is a function of the occasions, neither a no-op nor always on.
@@ -5160,11 +4410,7 @@ mod tests {
                 .subjects
                 .iter()
                 .map(|s| {
-                    make_subject(
-                        (0..s.occasions.len())
-                            .map(|_| normal.sample(&mut rng))
-                            .collect(),
-                    )
+                    make_subject((0..s.occasions.len()).map(|_| normal.sample(&mut rng)).collect())
                 })
                 .collect();
             let (_, dw) = grouped_iwres_autocorrelation(&pop, &results);
@@ -5210,20 +4456,11 @@ mod tests {
         let parallel = grouped_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0], e);
         assert!(in_time.1.is_finite() && parallel.1.is_finite() && ungrouped.1.is_finite());
         assert_eq!(in_time.1.to_bits(), ungrouped.1.to_bits(), "DW in time");
-        assert_eq!(
-            in_time.0.to_bits(),
-            ungrouped.0.to_bits(),
-            "lag-1 r in time"
-        );
+        assert_eq!(in_time.0.to_bits(), ungrouped.0.to_bits(), "lag-1 r in time");
         assert!((in_time.1 - 4.0 / 3.0).abs() < 1e-15, "{}", in_time.1);
         assert!(parallel.1.abs() < 1e-15, "parallel: 0, got {}", parallel.1);
         // The straddle itself: only the clock differs, and the statistic moves.
-        assert!(
-            (in_time.1 - parallel.1).abs() > 1.0,
-            "{} vs {}",
-            in_time.1,
-            parallel.1
-        );
+        assert!((in_time.1 - parallel.1).abs() > 1.0, "{} vs {}", in_time.1, parallel.1);
     }
 
     /// T3: the boundary is **strict**. Occasions `[1, 2, 2]` at times `0, 0, 1`: the
@@ -5252,10 +4489,7 @@ mod tests {
         assert!(!occasions_run_in_time(&s));
         let (_, dw) = grouped_at(vec![1, 2, 1], vec![0.0, 1.0, 2.0], vec![1.0, -1.0, 1.0]);
         assert!(dw.is_finite(), "{dw}");
-        assert!(
-            dw.abs() < 1e-15,
-            "interleaved labels split by key: 0, got {dw}"
-        );
+        assert!(dw.abs() < 1e-15, "interleaved labels split by key: 0, got {dw}");
     }
 
     /// T5: the predicate reads the **internal** clock. An `EVID = 4` crossover with
@@ -5293,10 +4527,7 @@ mod tests {
             assert!(occasions_run_in_time(&s), "{label}");
             let (_, dw) = grouped_at(vec![1, 1, 2, 2], times, vec![1.0, 1.0, -1.0, -1.0]);
             assert!(dw.is_finite(), "{label}: {dw}");
-            assert!(
-                (dw - 4.0 / 3.0).abs() < 1e-15,
-                "{label}: joined 4/3, got {dw}"
-            );
+            assert!((dw - 4.0 / 3.0).abs() < 1e-15, "{label}: joined 4/3, got {dw}");
         }
     }
 
@@ -5312,10 +4543,7 @@ mod tests {
     #[test]
     fn a_later_occasion_that_restarts_the_clock_is_parallel() {
         let (occ, times) = (vec![1, 1, 2, 2, 3, 3], vec![0.0, 1.0, 2.0, 3.0, 0.0, 1.0]);
-        assert!(!occasions_run_in_time(&subject_at(
-            occ.clone(),
-            times.clone()
-        )));
+        assert!(!occasions_run_in_time(&subject_at(occ.clone(), times.clone())));
         let (_, dw) = grouped_at(occ, times, vec![1.0, 1.0, -1.0, -1.0, 1.0, 1.0]);
         assert!(dw.is_finite(), "{dw}");
         assert!(dw.abs() < 1e-15, "split at every occasion: 0, got {dw}");
@@ -5335,16 +4563,11 @@ mod tests {
             subject_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 2.0, 3.0]),
             subject_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0]),
         ]);
-        let res = [
-            make_subject(vec![1.0, 1.0, -1.0, -1.0]),
-            make_subject(vec![1.0, 2.0, 3.0, 1.0]),
-        ];
+        let res =
+            [make_subject(vec![1.0, 1.0, -1.0, -1.0]), make_subject(vec![1.0, 2.0, 3.0, 1.0])];
         let (_, dw) = grouped_iwres_autocorrelation(&pop, &res);
         assert!(dw.is_finite(), "{dw}");
-        assert!(
-            (dw - 9.0 / 10.5).abs() < 1e-15,
-            "per subject: 9/10.5, got {dw}"
-        );
+        assert!((dw - 9.0 / 10.5).abs() < 1e-15, "per subject: 9/10.5, got {dw}");
     }
 }
 
@@ -5357,17 +4580,12 @@ mod tests {
 /// unchanged. Diagonal-`R` only (`block_sigma` correlations force FD upstream).
 #[inline]
 pub(crate) fn residual_rd(
-    es: &ErrorSpec,
-    cmt: usize,
-    f: f64,
-    sigma: &[f64],
-    mult_row: Option<&[f64]>,
+    es: &ErrorSpec, cmt: usize, f: f64, sigma: &[f64], mult_row: Option<&[f64]>,
 ) -> (f64, f64) {
     match mult_row {
-        Some(m) => (
-            es.variance_at_scaled(cmt, f, sigma, &[], m),
-            es.dvar_df_scaled(cmt, f, sigma, m),
-        ),
+        Some(m) => {
+            (es.variance_at_scaled(cmt, f, sigma, &[], m), es.dvar_df_scaled(cmt, f, sigma, m))
+        }
         None => (es.variance_at(cmt, f, sigma), es.dvar_df(cmt, f, sigma)),
     }
 }
@@ -5375,11 +4593,7 @@ pub(crate) fn residual_rd(
 /// [`residual_rd`] plus the second `f`-derivative `d2 = ∂²R/∂f²`.
 #[inline]
 pub(crate) fn residual_rd2(
-    es: &ErrorSpec,
-    cmt: usize,
-    f: f64,
-    sigma: &[f64],
-    mult_row: Option<&[f64]>,
+    es: &ErrorSpec, cmt: usize, f: f64, sigma: &[f64], mult_row: Option<&[f64]>,
 ) -> (f64, f64, f64) {
     match mult_row {
         Some(m) => (
@@ -5387,11 +4601,9 @@ pub(crate) fn residual_rd2(
             es.dvar_df_scaled(cmt, f, sigma, m),
             es.d2var_df2_scaled(cmt, f, sigma, m),
         ),
-        None => (
-            es.variance_at(cmt, f, sigma),
-            es.dvar_df(cmt, f, sigma),
-            es.d2var_df2(cmt, f, sigma),
-        ),
+        None => {
+            (es.variance_at(cmt, f, sigma), es.dvar_df(cmt, f, sigma), es.d2var_df2(cmt, f, sigma))
+        }
     }
 }
 
@@ -5409,10 +4621,7 @@ pub(crate) fn residual_rd2(
 /// which is why `f = 1` stands in for it. A subject this is true for therefore keeps an
 /// off-diagonal `R` at every parameter point of a fit (#1536).
 pub(crate) fn has_cross_observation_residual(
-    error_spec: &ErrorSpec,
-    subject: &Subject,
-    sigma_values: &[f64],
-    cov: ResidualCov<'_>,
+    error_spec: &ErrorSpec, subject: &Subject, sigma_values: &[f64], cov: ResidualCov<'_>,
 ) -> bool {
     if !cov.is_dense() {
         return false;

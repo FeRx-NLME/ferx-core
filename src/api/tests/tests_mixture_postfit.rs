@@ -22,10 +22,7 @@ fn one_subject_pop() -> crate::types::Population {
 
 /// Closed-form 1-cpt IV bolus concentration at `eta = 0`.
 fn analytic_ipred(cl: f64) -> Vec<f64> {
-    TIMES
-        .iter()
-        .map(|t| (100.0 / 10.0) * (-(cl / 10.0) * t).exp())
-        .collect()
+    TIMES.iter().map(|t| (100.0 / 10.0) * (-(cl / 10.0) * t).exp()).collect()
 }
 
 /// Post-fit diagnostics must be computed under each subject's **fitted** class
@@ -63,36 +60,23 @@ fn subject_results_use_the_fitted_mixture_class() {
     let class1 = analytic_ipred(1.0);
     let default_run = run(None);
     for (got, want) in default_run[0].ipred.iter().zip(&class1) {
-        assert!(
-            (got - want).abs() < 1e-9,
-            "default IPRED {got} vs class-1 {want}"
-        );
+        assert!((got - want).abs() < 1e-9, "default IPRED {got} vs class-1 {want}");
     }
 
     // MIXEST = 2 (0-based 1): every prediction must follow TVCL2, not TVCL1.
     let class2 = analytic_ipred(3.0);
     let mixest_run = run(Some(&[1]));
     for (got, want) in mixest_run[0].ipred.iter().zip(&class2) {
-        assert!(
-            (got - want).abs() < 1e-9,
-            "MIXEST=2 IPRED {got} vs class-2 {want}"
-        );
+        assert!((got - want).abs() < 1e-9, "MIXEST=2 IPRED {got} vs class-2 {want}");
     }
     // PRED (population prediction at eta = 0) follows the same class.
     for (got, want) in mixest_run[0].pred.iter().zip(&class2) {
-        assert!(
-            (got - want).abs() < 1e-9,
-            "MIXEST=2 PRED {got} vs class-2 {want}"
-        );
+        assert!((got - want).abs() < 1e-9, "MIXEST=2 PRED {got} vs class-2 {want}");
     }
     // Sanity: the two classes are genuinely distinguishable here, so the test
     // cannot pass by both runs collapsing onto the same curve.
     assert!(
-        default_run[0]
-            .ipred
-            .iter()
-            .zip(&mixest_run[0].ipred)
-            .any(|(a, b)| (a - b).abs() > 1e-3),
+        default_run[0].ipred.iter().zip(&mixest_run[0].ipred).any(|(a, b)| (a - b).abs() > 1e-3),
         "class-1 and class-2 IPRED must differ"
     );
 }
@@ -154,9 +138,7 @@ fn one_subject_pop_with_mixnum_column() -> crate::types::Population {
 /// `[output] MIXNUM`'s column on `population`, computed under fitted class `mixest`
 /// (0-based, as `compute_extra_output_columns` takes it).
 fn output_mixnum_column(
-    model: &CompiledModel,
-    population: &crate::types::Population,
-    mixest: Option<&[usize]>,
+    model: &CompiledModel, population: &crate::types::Population, mixest: Option<&[usize]>,
 ) -> Option<Vec<f64>> {
     let params = &model.default_params;
     let eta_hats = vec![DVector::zeros(1)];
@@ -173,14 +155,7 @@ fn output_mixnum_column(
         mixest,
         false,
     );
-    compute_extra_output_columns(
-        model,
-        population,
-        &params.theta,
-        &kappas,
-        &mut subjects,
-        mixest,
-    );
+    compute_extra_output_columns(model, population, &params.theta, &kappas, &mut subjects, mixest);
     let hits: Vec<_> = subjects[0]
         .extra_columns
         .iter()
@@ -270,10 +245,7 @@ fn output_mixnum_validation_on_a_mixture_model() {
 
     let no_column = one_subject_pop();
     assert!(validate_output_columns(&model, &no_column).is_empty());
-    assert!(
-        warning_codes(&no_column).is_empty(),
-        "no data column, no warning"
-    );
+    assert!(warning_codes(&no_column).is_empty(), "no data column, no warning");
 
     let with_column = one_subject_pop_with_mixnum_column();
     assert!(
@@ -283,14 +255,8 @@ fn output_mixnum_validation_on_a_mixture_model() {
     let msgs = warning_codes(&with_column);
     assert_eq!(msgs.len(), 1, "{msgs:?}");
     let msg = &msgs[0];
-    assert!(
-        msg.contains("mixture class") && msg.contains("not the data column `MIXNUM`"),
-        "{msg}"
-    );
-    assert!(
-        msg.contains("fitted MIXEST") && msg.contains("Rename"),
-        "{msg}"
-    );
+    assert!(msg.contains("mixture class") && msg.contains("not the data column `MIXNUM`"), "{msg}");
+    assert!(msg.contains("fitted MIXEST") && msg.contains("Rename"), "{msg}");
 }
 
 /// #2784 end to end: a `fit()` of a mixture model with `[output] MIXNUM` on data that
@@ -315,27 +281,18 @@ fn fit_reports_output_mixnum_warning_and_tables_the_class() {
     };
     let result = fit(&model, &population, &model.default_params, &opts).expect("fit");
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_OUTPUT_MIXNUM_IS_CLASS")),
+        result.warnings.iter().any(|w| w.contains("W_OUTPUT_MIXNUM_IS_CLASS")),
         "{:?}",
         result.warnings
     );
     let cols = crate::io::output::sdtab(&result, &population);
     let col = |name: &str| -> Vec<Vec<f64>> {
-        cols.iter()
-            .filter(|(n, _)| n == name)
-            .map(|(_, v)| v.clone())
-            .collect()
+        cols.iter().filter(|(n, _)| n == name).map(|(_, v)| v.clone()).collect()
     };
     let mixnum = col("MIXNUM");
     assert_eq!(mixnum.len(), 1, "one MIXNUM column");
     assert_eq!(mixnum, col("MIXEST"), "MIXNUM is the fitted class");
-    assert!(
-        mixnum[0].iter().all(|&k| k == 1.0 || k == 2.0),
-        "{mixnum:?}"
-    );
+    assert!(mixnum[0].iter().all(|&k| k == 1.0 || k == 2.0), "{mixnum:?}");
 }
 
 /// #2784: a `[derived]` column may not take a mixture sdtab name, or `[derived] MIXNUM`

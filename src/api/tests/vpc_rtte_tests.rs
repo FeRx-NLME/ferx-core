@@ -41,20 +41,11 @@ fn model(src: &str) -> CompiledModel {
 }
 
 fn rec(time: f64, event_type: EventType) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time: 0.0,
-        cmt: 2,
-    }
+    ObsRecord::Event { time, event_type, entry_time: 0.0, cmt: 2 }
 }
 
 fn subj(id: &str, records: Vec<ObsRecord>) -> Subject {
-    Subject {
-        id: id.into(),
-        obs_records: records,
-        ..Default::default()
-    }
+    Subject { id: id.into(), obs_records: records, ..Default::default() }
 }
 
 /// A subject followed to `end` with events at `events`: one exact record per event and,
@@ -93,18 +84,13 @@ fn r1() -> Vec<Subject> {
 
 /// `n` subjects, ids from `first`, each followed to `end` with events at `events`.
 fn cohort(first: usize, n: usize, end: f64, events: &[f64]) -> Vec<Subject> {
-    (first..first + n)
-        .map(|i| stream(&i.to_string(), end, events))
-        .collect()
+    (first..first + n).map(|i| stream(&i.to_string(), end, events)).collect()
 }
 
 fn opts(n_sim: usize) -> VpcRtteOptions {
     VpcRtteOptions {
         n_sim,
-        sim: SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        sim: SimulateOptions { seed: Some(7), ..Default::default() },
         ..Default::default()
     }
 }
@@ -117,10 +103,7 @@ fn run(src: &str, p: &Population, o: &VpcRtteOptions) -> Result<RtteVpc, EngineE
 fn assert_near(got: &[f64], want: &[f64]) {
     assert_eq!(got.len(), want.len(), "{got:?} vs {want:?}");
     for (g, w) in got.iter().zip(want) {
-        assert!(
-            g.is_finite() && (g - w).abs() < 1e-15,
-            "{got:?} vs {want:?}"
-        );
+        assert!(g.is_finite() && (g - w).abs() < 1e-15, "{got:?} vs {want:?}");
     }
 }
 
@@ -146,10 +129,7 @@ fn order_curves_match_survfit_on_r1() {
     assert_eq!(s.mcf.observed.n_event, [1, 2, 1, 1, 1, 0, 1, 1, 1, 0]);
     assert!((s.mcf.observed.mcf[9] - 11.0 / 5.0).abs() < 1e-15);
 
-    assert_eq!(
-        s.absolute.iter().map(|b| b.order).collect::<Vec<_>>(),
-        [1, 2, 3]
-    );
+    assert_eq!(s.absolute.iter().map(|b| b.order).collect::<Vec<_>>(), [1, 2, 3]);
     let a2 = &s.absolute[1];
     assert_eq!(a2.n_subjects, 6);
     assert_eq!(a2.observed.time, [4.0, 5.0, 6.0, 7.0, 8.0]);
@@ -189,31 +169,14 @@ fn order_curves_match_survfit_on_r1() {
     for b in s.absolute.iter().chain(&s.gap) {
         assert!(lens(
             &b.grid,
-            [
-                b.obs_on_grid.len(),
-                b.lo.len(),
-                b.med.len(),
-                b.hi.len(),
-                b.n_used.len()
-            ]
+            [b.obs_on_grid.len(), b.lo.len(), b.med.len(), b.hi.len(), b.n_used.len()]
         ));
-        assert!(b
-            .lo
-            .iter()
-            .chain(&b.med)
-            .chain(&b.hi)
-            .flatten()
-            .all(|x| x.is_finite()));
+        assert!(b.lo.iter().chain(&b.med).chain(&b.hi).flatten().all(|x| x.is_finite()));
     }
     // The overlay reads the observed curve at the grid's observed times.
     let k = a2.grid.iter().position(|&t| t == 7.0).expect("7 on grid");
     assert_eq!(a2.obs_on_grid[k], a2.observed.at(7.0));
-    let k = s
-        .mcf
-        .grid
-        .iter()
-        .position(|&t| t == 9.0)
-        .expect("9 on grid");
+    let k = s.mcf.grid.iter().position(|&t| t == 9.0).expect("9 on grid");
     assert_eq!(s.mcf.obs_on_grid[k], s.mcf.observed.at(9.0));
 }
 
@@ -224,10 +187,7 @@ fn order_mark_reads_one_subject() {
     let a = [2.0, 5.0, 9.0];
     assert_eq!(order_mark(&a, 10.0, 1, Clock::Absolute), Some((2.0, true)));
     assert_eq!(order_mark(&a, 10.0, 3, Clock::Absolute), Some((9.0, true)));
-    assert_eq!(
-        order_mark(&a, 10.0, 4, Clock::Absolute),
-        Some((10.0, false))
-    );
+    assert_eq!(order_mark(&a, 10.0, 4, Clock::Absolute), Some((10.0, false)));
     assert_eq!(order_mark(&a, 10.0, 2, Clock::Gap), Some((3.0, true)));
     assert_eq!(order_mark(&a, 10.0, 4, Clock::Gap), Some((1.0, false)));
     assert_eq!(order_mark(&a, 10.0, 5, Clock::Gap), None);
@@ -312,10 +272,7 @@ fn replicate_follow_up_cuts_at_the_observed_end() {
     assert_eq!(replicate_follow_up(&ev, 4.0, 20.0, obs), (&ev[..2], 4.0));
     assert_eq!(replicate_follow_up(&ev, 5.0, 20.0, obs), (&ev[..2], 5.0));
     assert_eq!(replicate_follow_up(&ev, 30.0, 20.0, obs), (&ev[..], 20.0));
-    assert_eq!(
-        replicate_follow_up(&ev, 4.0, 20.0, VpcCensoring::Horizon),
-        (&ev[..], 20.0)
-    );
+    assert_eq!(replicate_follow_up(&ev, 4.0, 20.0, VpcCensoring::Horizon), (&ev[..], 20.0));
 }
 
 /// 30 subjects followed to 4 (ARM 0) beside 30 followed to 20 (ARM 1).
@@ -323,8 +280,7 @@ fn short_and_long() -> Population {
     let mut subjects = cohort(1, 30, 4.0, &[1.0]);
     subjects.extend(cohort(31, 30, 20.0, &[1.0, 12.0]));
     for (i, s) in subjects.iter_mut().enumerate() {
-        s.covariates
-            .insert("ARM".into(), if i < 30 { 0.0 } else { 1.0 });
+        s.covariates.insert("ARM".into(), if i < 30 { 0.0 } else { 1.0 });
     }
     pop(subjects)
 }
@@ -359,10 +315,7 @@ fn observed_follow_up_ends_each_replicate_subject_at_its_own_time() {
     assert_eq!(last(&v.strata[0].mcf.grid), 4.0);
     assert_eq!(last(&v.strata[0].absolute[0].grid), 4.0);
     assert_eq!(last(&v.strata[1].mcf.grid), 20.0);
-    assert!(
-        v.strata[0].mcf.grid.len() > 20,
-        "replicate steps on the grid"
-    );
+    assert!(v.strata[0].mcf.grid.len() > 20, "replicate steps on the grid");
 
     o.grid = VpcGrid::Times(vec![3.0, 5.0]);
     o.censoring = VpcCensoring::Horizon;
@@ -400,10 +353,7 @@ fn replicate_events_after_the_follow_up_end_are_dropped() {
     for (k, want) in [(0, 0.6), (1, 3.0)] {
         let med = m.med[k].expect("60 replicates resolve the band");
         eprintln!("replicate MCF median at grid point {k}: {med} (expected {want})");
-        assert!(
-            med.is_finite() && (med - want).abs() < 0.15,
-            "median {med} at grid point {k}"
-        );
+        assert!(med.is_finite() && (med - want).abs() < 0.15, "median {med} at grid point {k}");
         let (lo, hi) = (m.lo[k].unwrap(), m.hi[k].unwrap());
         assert!(lo <= med && med <= hi && lo < hi, "{lo} {med} {hi}");
     }
@@ -422,11 +372,7 @@ fn simulator_gives_one_stream_per_subject_per_replicate() {
     let p = pop(cohort(1, 30, 20.0, &[3.0, 8.0, 15.0]));
     assert_eq!(p.subjects[0].obs_records.len(), 4);
     let m = model(RTTE);
-    let sim_opts = SimulateOptions {
-        seed: Some(7),
-        horizon: Some(20.0),
-        ..Default::default()
-    };
+    let sim_opts = SimulateOptions { seed: Some(7), horizon: Some(20.0), ..Default::default() };
     let out = simulate_with_options_impl(&m, &p, &m.default_params, 3, &sim_opts, false).unwrap();
     for sim in 1..=3 {
         let rows: Vec<(f64, bool)> = out
@@ -475,14 +421,8 @@ fn gap_band_is_built_from_the_replicates_gap_time_curves() {
     let gap = s.gap[0].med[0].expect("60 replicates resolve the band");
     let abs = s.absolute[1].med[0].expect("60 replicates resolve the band");
     eprintln!("replicate medians at 5: gap order 2 {gap} (expected 0.472), absolute order 2 {abs} (expected 0.827)");
-    assert!(
-        gap.is_finite() && (gap - (-0.75f64).exp()).abs() < 0.06,
-        "gap {gap}"
-    );
-    assert!(
-        abs.is_finite() && (abs - 1.75 * (-0.75f64).exp()).abs() < 0.06,
-        "absolute {abs}"
-    );
+    assert!(gap.is_finite() && (gap - (-0.75f64).exp()).abs() < 0.06, "gap {gap}");
+    assert!(abs.is_finite() && (abs - 1.75 * (-0.75f64).exp()).abs() < 0.06, "absolute {abs}");
 }
 
 /// The simulator's warnings reach the result (review r1 row 4). At a rate of 1e6 the
@@ -501,10 +441,7 @@ fn simulator_warnings_reach_the_result() {
     o.grid = VpcGrid::Times(vec![10.0]);
     let v = vpc_rtte(&m, &p, &params, &o).unwrap();
     assert_eq!(v.warnings.len(), 3 * 20, "{:?}", v.warnings.first());
-    assert!(v
-        .warnings
-        .iter()
-        .all(|w| w.starts_with("W_RTTE_DEGENERATE: subject '")));
+    assert!(v.warnings.iter().all(|w| w.starts_with("W_RTTE_DEGENERATE: subject '")));
     assert_eq!(v.strata[0].mcf.med, [Some(0.0)]);
 }
 
@@ -525,20 +462,8 @@ fn replicate_events_reads_only_the_endpoints_event_rows() {
         mixnum: None,
     };
     let streams = [
-        Stream {
-            id: "a".into(),
-            events: vec![],
-            end: 9.0,
-            ends_on_event: false,
-            stratum: 0,
-        },
-        Stream {
-            id: "b".into(),
-            events: vec![],
-            end: 9.0,
-            ends_on_event: false,
-            stratum: 0,
-        },
+        Stream { id: "a".into(), events: vec![], end: 9.0, ends_on_event: false, stratum: 0 },
+        Stream { id: "b".into(), events: vec![], end: 9.0, ends_on_event: false, stratum: 0 },
     ];
     let results = [
         row(1, "a", 2, 1.0, true),
@@ -568,22 +493,15 @@ fn warns_when_subjects_end_on_an_event_record() {
     let v = run(RTTE, &pop(r1()), &opts(20)).unwrap();
     assert_eq!(
         v.warnings,
-        [
-            "W_VPC_RTTE_ENDS_ON_EVENT: 2 of 6 subjects on cmt 2 have an event as their last \
+        ["W_VPC_RTTE_ENDS_ON_EVENT: 2 of 6 subjects on cmt 2 have an event as their last \
           record, so their follow-up ends at that event. Such a subject has an event exactly \
           at its follow-up end, which a simulated subject almost never has. If follow-up went \
-          on after the last event, add a censoring record at its end."
-        ]
+          on after the last event, add a censoring record at its end."]
     );
     let closed = pop(cohort(1, 12, 20.0, &[3.0, 8.0]));
     assert_eq!(run(RTTE, &closed, &opts(20)).unwrap().warnings, [""; 0]);
-    let tied = pop(vec![subj(
-        "1",
-        vec![
-            rec(4.0, EventType::Exact),
-            rec(4.0, EventType::RightCensored),
-        ],
-    )]);
+    let tied =
+        pop(vec![subj("1", vec![rec(4.0, EventType::Exact), rec(4.0, EventType::RightCensored)])]);
     assert_eq!(run(RTTE, &tied, &opts(20)).unwrap().warnings, [""; 0]);
 }
 
@@ -627,10 +545,7 @@ fn ends_on_event_counts_the_data_cut_at_the_horizon() {
     // An event exactly at `H` that is the subject's last record (`cᵢ = H`) still ends
     // follow-up on an event, both with `H` set to it and with `H` unset, where `H` is the
     // latest follow-up end and is that subject's (review r1 row 1).
-    let at_h = pop(vec![
-        stream("A", 10.0, &[3.0, 10.0]),
-        stream("B", 6.0, &[2.0]),
-    ]);
+    let at_h = pop(vec![stream("A", 10.0, &[3.0, 10.0]), stream("B", 6.0, &[2.0])]);
     for horizon in [Some(10.0), None] {
         o.sim.horizon = horizon;
         assert_eq!(
@@ -647,10 +562,7 @@ fn ends_on_event_counts_the_data_cut_at_the_horizon() {
             o.max_order = Some(max_order);
             o.sim.horizon = horizon;
             let w = own(&o, &p);
-            assert!(
-                w.is_empty(),
-                "max_order {max_order}, horizon {horizon:?}: {w:?}"
-            );
+            assert!(w.is_empty(), "max_order {max_order}, horizon {horizon:?}: {w:?}");
         }
     }
 }
@@ -697,12 +609,8 @@ fn cut_by_hand(subjects: &[Subject], h: f64) -> Vec<Subject> {
             if last <= h {
                 return s.clone();
             }
-            let mut records: Vec<ObsRecord> = s
-                .obs_records
-                .iter()
-                .filter(|r| record_time(r) <= h)
-                .cloned()
-                .collect();
+            let mut records: Vec<ObsRecord> =
+                s.obs_records.iter().filter(|r| record_time(r) <= h).cloned().collect();
             records.push(rec(h, EventType::RightCensored));
             subj(&s.id, records)
         })
@@ -730,19 +638,10 @@ fn horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
     let f = fixture_f();
     let cut = cut_by_hand(&f, F_HORIZON);
     let times = |s: &[Subject]| -> Vec<f64> {
-        s.iter()
-            .flat_map(|s| s.obs_records.iter())
-            .map(record_time)
-            .collect()
+        s.iter().flat_map(|s| s.obs_records.iter()).map(record_time).collect()
     };
-    assert!(
-        times(&f).iter().any(|&t| t > F_HORIZON),
-        "F has records past H"
-    );
-    assert!(
-        times(&cut).iter().all(|&t| t <= F_HORIZON),
-        "the cut has none"
-    );
+    assert!(times(&f).iter().any(|&t| t > F_HORIZON), "F has records past H");
+    assert!(times(&cut).iter().all(|&t| t <= F_HORIZON), "the cut has none");
 
     for censoring in [VpcCensoring::Observed, VpcCensoring::Horizon] {
         let mut o = opts(20);
@@ -750,10 +649,7 @@ fn horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
         o.sim.horizon = Some(F_HORIZON);
         let got = run(RTTE, &pop(f.clone()), &o).unwrap();
         let want = run(RTTE, &pop(cut.clone()), &o).unwrap();
-        assert_eq!(
-            got.max_order, 2,
-            "{censoring:?}: default max_order on the cut data"
-        );
+        assert_eq!(got.max_order, 2, "{censoring:?}: default max_order on the cut data");
         assert_eq!(got, want, "{censoring:?}");
     }
 }
@@ -781,11 +677,7 @@ fn gap_curve_reads_the_data_cut_at_the_horizon() {
         (27, 0, 1),
         "X10 is censored at gap 0: its event at H, its follow-up ending at H"
     );
-    assert_eq!(
-        (c.n_risk[1], c.n_event[1]),
-        (26, 12),
-        "subjects 13–24, gap 5 − 2 = 3"
-    );
+    assert_eq!((c.n_risk[1], c.n_event[1]), (26, 12), "subjects 13–24, gap 5 − 2 = 3");
     assert_eq!(
         (c.n_risk[2], c.n_event[2], c.n_censor[2]),
         (14, 13, 0),
@@ -840,12 +732,7 @@ fn default_max_order_needs_ten_subjects_and_a_given_one_is_honoured() {
     assert_eq!(g6.observed, KmCurve::default());
     assert!(!g6.grid.is_empty());
     assert!(g6.obs_on_grid.iter().all(Option::is_none));
-    assert!(g6
-        .lo
-        .iter()
-        .chain(&g6.med)
-        .chain(&g6.hi)
-        .all(Option::is_none));
+    assert!(g6.lo.iter().chain(&g6.med).chain(&g6.hi).all(Option::is_none));
     assert!(g6.n_used.iter().all(|&n| n == 0));
 
     // Fewer than ten subjects with any event: order 1 still.
@@ -865,8 +752,7 @@ fn each_stratum_uses_its_own_subjects() {
     subjects.push(stream("H", 20.0, &[1.0, 2.0]));
     subjects.push(stream("I", 20.0, &[]));
     for (i, s) in subjects.iter_mut().enumerate() {
-        s.covariates
-            .insert("ARM".into(), if i < 6 { 0.0 } else { 1.0 });
+        s.covariates.insert("ARM".into(), if i < 6 { 0.0 } else { 1.0 });
     }
     let mut o = opts(20);
     o.max_order = Some(2);
@@ -875,14 +761,8 @@ fn each_stratum_uses_its_own_subjects() {
     let v = run(RTTE, &pop(subjects), &o).unwrap();
     assert_eq!(v.horizon, 20.0);
     let (a, b) = (&v.strata[0], &v.strata[1]);
-    assert_eq!(
-        (a.label.as_str(), a.value, a.n_subjects),
-        ("ARM=0", Some(0.0), 6)
-    );
-    assert_eq!(
-        (b.label.as_str(), b.value, b.n_subjects),
-        ("ARM=1", Some(1.0), 3)
-    );
+    assert_eq!((a.label.as_str(), a.value, a.n_subjects), ("ARM=0", Some(0.0), 6));
+    assert_eq!((b.label.as_str(), b.value, b.n_subjects), ("ARM=1", Some(1.0), 3));
     assert_eq!(a.mcf.observed.n_risk, [6, 6, 6, 6, 5, 4, 3, 3, 2, 2]);
     assert_eq!(a.absolute[1].observed.n_risk, [6, 5, 3, 2, 1]);
     assert_eq!(a.gap[0].n_subjects, 5);
@@ -901,10 +781,7 @@ fn each_stratum_uses_its_own_subjects() {
 fn strata_labels() {
     let v = run(RTTE, &pop(r1()), &opts(20)).unwrap();
     assert_eq!(v.strata.len(), 1);
-    assert_eq!(
-        (v.strata[0].label.as_str(), v.strata[0].value),
-        ("all", None)
-    );
+    assert_eq!((v.strata[0].label.as_str(), v.strata[0].value), ("all", None));
     let mut subjects = r1();
     for s in subjects.iter_mut().take(3) {
         s.doses = vec![crate::types::DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
@@ -930,10 +807,7 @@ fn assert_refusal<T: std::fmt::Debug>(got: Result<T, EngineError>, text: &str) {
 /// point: both sides of each such gate are asserted in one test.
 fn run_tte(src: &str, p: &Population) -> Result<crate::api::TteVpc, EngineError> {
     let m = model(src);
-    let o = crate::api::VpcTteOptions {
-        n_sim: 20,
-        ..Default::default()
-    };
+    let o = crate::api::VpcTteOptions { n_sim: 20, ..Default::default() };
     crate::api::vpc_tte(&m, p, &m.default_params, &o)
 }
 
@@ -989,12 +863,7 @@ fn refuses_several_tte_endpoints_without_cmt() {
 fn refuses_left_truncation() {
     let p = pop(vec![subj(
         "7",
-        vec![ObsRecord::Event {
-            time: 5.0,
-            event_type: EventType::Exact,
-            entry_time: 1.5,
-            cmt: 2,
-        }],
+        vec![ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 1.5, cmt: 2 }],
     )]);
     assert_refusal(
         run(RTTE, &p, &opts(20)),
@@ -1005,16 +874,8 @@ fn refuses_left_truncation() {
 
 #[test]
 fn refuses_interval_censoring() {
-    let p = pop(vec![subj(
-        "8",
-        vec![rec(
-            5.0,
-            EventType::IntervalCensored {
-                left: 2.0,
-                right: 5.0,
-            },
-        )],
-    )]);
+    let p =
+        pop(vec![subj("8", vec![rec(5.0, EventType::IntervalCensored { left: 2.0, right: 5.0 })])]);
     assert_refusal(
         run(RTTE, &p, &opts(20)),
         "vpc_rtte: subject 8 has an interval-censored record on cmt 2. The repeated-events \
@@ -1030,10 +891,7 @@ fn refuses_interval_censoring() {
 #[test]
 fn refuses_a_bad_observed_time() {
     for (t, shown) in [(f64::NAN, "NaN"), (-1.0, "-1")] {
-        let p = pop(vec![
-            stream("1", 5.0, &[2.0]),
-            subj("9", vec![rec(t, EventType::Exact)]),
-        ]);
+        let p = pop(vec![stream("1", 5.0, &[2.0]), subj("9", vec![rec(t, EventType::Exact)])]);
         assert_refusal(
             run(RTTE, &p, &opts(20)),
             &format!(
@@ -1060,10 +918,7 @@ fn refuses_records_out_of_time_order() {
         "vpc_rtte: subject 3 has records on cmt 2 out of time order (time 2.5 follows 4). \
          Sort each subject's records by time.",
     );
-    let tied = pop(vec![subj(
-        "3",
-        vec![rec(4.0, EventType::Exact), rec(4.0, EventType::Exact)],
-    )]);
+    let tied = pop(vec![subj("3", vec![rec(4.0, EventType::Exact), rec(4.0, EventType::Exact)])]);
     assert!(run(RTTE, &tied, &opts(20)).is_ok());
 }
 

@@ -10,10 +10,7 @@ fn make_params(theta: Vec<f64>, theta_lower: Vec<f64>, theta_upper: Vec<f64>) ->
         theta_lower,
         theta_upper,
         theta_fixed: vec![false; n],
-        sigma: SigmaVector {
-            values: vec![0.1],
-            names: vec!["ERR".into()],
-        },
+        sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
         ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
             &[0.04],
             vec!["ETA_CL".into()],
@@ -33,11 +30,7 @@ fn test_perturb_changes_theta() {
     let p = make_params(vec![5.0, 50.0], vec![0.1, 1.0], vec![100.0, 500.0]);
     let perturbed = perturb_init(&p, 1, 0.3, 42);
     // With sigma=0.3 and seed=43 (42+1), at least one theta should differ
-    let changed = perturbed
-        .theta
-        .iter()
-        .zip(p.theta.iter())
-        .any(|(a, b)| (a - b).abs() > 1e-10);
+    let changed = perturbed.theta.iter().zip(p.theta.iter()).any(|(a, b)| (a - b).abs() > 1e-10);
     assert!(changed, "start 1 should perturb theta");
 }
 
@@ -140,9 +133,8 @@ fn per_start_options_reseed_the_samplers_the_chain_runs_and_share_the_is_seeds()
         assert_eq!(o.impmap_seed, None);
         assert!(!o.global_search);
     }
-    let seeds: std::collections::HashSet<_> = (1..6)
-        .map(|k| per_start_options(&sampled, k).saem_seed)
-        .collect();
+    let seeds: std::collections::HashSet<_> =
+        (1..6).map(|k| per_start_options(&sampled, k).saem_seed).collect();
     assert_eq!(seeds.len(), 5, "every start gets its own SAEM seed");
 
     // `methods` empty: `method` is the chain. SAEM alone re-seeds SAEM from its default.
@@ -155,11 +147,7 @@ fn per_start_options_reseed_the_samplers_the_chain_runs_and_share_the_is_seeds()
     };
     let o = per_start_options(&saem_only, 2);
     assert_eq!(o.saem_seed, Some(per_start_seed(SAEM_DEFAULT_SEED, 2)));
-    assert_eq!(
-        o.bayes_seed,
-        Some(3),
-        "no Bayes stage: the user's seed is kept"
-    );
+    assert_eq!(o.bayes_seed, Some(3), "no Bayes stage: the user's seed is kept");
 
     // A FOCEI chain runs neither sampler, so nothing is derived.
     let focei = FitOptions {
@@ -245,24 +233,14 @@ fn select_start_records_every_start_and_picks_what_the_ranking_picks() {
     assert_eq!(winner.theta, vec![3.0]);
     assert_eq!(failed, vec!["start 1: start refused".to_string()]);
 
-    assert_eq!(
-        starts.iter().map(|s| s.start).collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4, 5]
-    );
-    let selected: Vec<usize> = starts
-        .iter()
-        .filter(|s| s.selected)
-        .map(|s| s.start)
-        .collect();
+    assert_eq!(starts.iter().map(|s| s.start).collect::<Vec<_>>(), vec![0, 1, 2, 3, 4, 5]);
+    let selected: Vec<usize> = starts.iter().filter(|s| s.selected).map(|s| s.start).collect();
     assert_eq!(selected, vec![3]);
     assert_eq!(starts[3].ofv, Some(winner.ofv));
     assert_eq!(starts[3].theta, winner.theta);
     assert_eq!(starts[3].status.as_deref(), Some("converged"));
     assert!(starts[3].status_reasons.is_empty());
-    assert_eq!(
-        (starts[3].n_iterations, starts[3].wall_time_secs),
-        (7, 0.25)
-    );
+    assert_eq!((starts[3].n_iterations, starts[3].wall_time_secs), (7, 0.25));
     assert_eq!(starts[2].status.as_deref(), Some("not_converged"));
     assert!(!starts[2].converged);
     // Start 0's critical warning is a plain string on its result, with nothing in
@@ -290,11 +268,8 @@ fn a_failed_start_keeps_its_message_and_code() {
     let coded = EngineError::from_diagnostic(Diagnostic::error("E_AGQ_NODES_ZERO", "no nodes"));
     assert_eq!(coded.code(), Some("E_AGQ_NODES_ZERO"), "premise");
     let text = coded.to_string();
-    let (best, _, starts) = select_start(
-        vec![(0, Err(coded)), (1, Ok(start_fit(5.0, true, 1.0)))],
-        |r| r.ofv,
-        false,
-    );
+    let (best, _, starts) =
+        select_start(vec![(0, Err(coded)), (1, Ok(start_fit(5.0, true, 1.0)))], |r| r.ofv, false);
     assert_eq!(best.map(|b| b.0), Some(1));
     assert_eq!(
         starts[0],
@@ -317,11 +292,8 @@ fn a_failed_start_keeps_its_message_and_code() {
     assert!(starts[1].selected);
     // An uncoded failure has the message and no code; with no start that ran, none is
     // selected.
-    let (best, _, starts) = select_start(
-        vec![(0, Err(EngineError::uncoded("boom")))],
-        |r| r.ofv,
-        false,
-    );
+    let (best, _, starts) =
+        select_start(vec![(0, Err(EngineError::uncoded("boom")))], |r| r.ofv, false);
     assert!(best.is_none());
     assert_eq!(starts[0].error.as_deref(), Some("boom"));
     assert_eq!(starts[0].error_code, None);
@@ -332,12 +304,8 @@ fn a_failed_start_keeps_its_message_and_code() {
 /// lowest *ranked* start: start 0 has the higher OFV and the lower penalized objective.
 #[test]
 fn select_start_records_the_ranked_objective_under_a_penalty() {
-    let results = || {
-        vec![
-            (0, Ok(start_fit(-100.0, true, 0.5))),
-            (1, Ok(start_fit(-105.0, true, 4.0))),
-        ]
-    };
+    let results =
+        || vec![(0, Ok(start_fit(-100.0, true, 0.5))), (1, Ok(start_fit(-105.0, true, 4.0)))];
     // penalty = theta², so start 1 pays 16 for its 5 OFV.
     let rank = |r: &FitResult| r.ofv + r.theta[0] * r.theta[0];
     let (best, _, starts) = select_start(results(), rank, true);
@@ -437,22 +405,13 @@ fn multi_start_yaml_block_lists_the_summary_and_every_start() {
     fit.starts[0].penalized = true;
     fit.starts[1].error_code = Some("E_X".into());
     let yaml = multi_start_yaml(&fit).unwrap();
-    assert!(
-        yaml.contains("{start: 0, ofv: 12.000000, objective: null, converged: true"),
-        "{yaml}"
-    );
-    assert!(
-        yaml.contains("{start: 2, ofv: 10.000000, converged: false"),
-        "{yaml}"
-    );
+    assert!(yaml.contains("{start: 0, ofv: 12.000000, objective: null, converged: true"), "{yaml}");
+    assert!(yaml.contains("{start: 2, ofv: 10.000000, converged: false"), "{yaml}");
     assert!(yaml.contains("  compared: penalized_objective\n"), "{yaml}");
     assert!(yaml.contains("  best: 13.500000\n"), "{yaml}");
     assert!(
         yaml.contains("{start: 3, ofv: 11.000000, objective: 13.500000, converged: true"),
         "{yaml}"
     );
-    assert!(
-        yaml.contains("error: \"start refused\", error_code: \"E_X\"}"),
-        "{yaml}"
-    );
+    assert!(yaml.contains("error: \"start refused\", error_code: \"E_X\"}"), "{yaml}");
 }

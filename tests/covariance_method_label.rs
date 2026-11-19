@@ -49,10 +49,7 @@ fn one_cpt_model() -> CompiledModel {
 
 fn subject(id: &str, scale: f64) -> Subject {
     let obs_times: Vec<f64> = vec![0.5, 2.0, 8.0, 24.0];
-    let observations = obs_times
-        .iter()
-        .map(|t| scale * 10.0 * (-0.1 * t).exp())
-        .collect();
+    let observations = obs_times.iter().map(|t| scale * 10.0 * (-0.1 * t).exp()).collect();
     Subject {
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -71,9 +68,7 @@ fn subject(id: &str, scale: f64) -> Subject {
 /// nothing to do with the label.
 fn population() -> Population {
     Population {
-        subjects: (0..12)
-            .map(|i| subject(&format!("{i}"), 1.0 + 0.05 * i as f64))
-            .collect(),
+        subjects: (0..12).map(|i| subject(&format!("{i}"), 1.0 + 0.05 * i as f64)).collect(),
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: Vec::new(),
@@ -112,18 +107,11 @@ fn a_fit_reports_the_estimator_its_standard_errors_came_from() {
     let model = one_cpt_model();
     let pop = population();
 
-    for requested in [
-        CovarianceMethod::Hessian,
-        CovarianceMethod::CrossProduct,
-        CovarianceMethod::Sandwich,
-    ] {
-        let fit = fit(
-            &model,
-            &pop,
-            &model.default_params,
-            &opts(requested, /* explicit */ true),
-        )
-        .expect("fit");
+    for requested in
+        [CovarianceMethod::Hessian, CovarianceMethod::CrossProduct, CovarianceMethod::Sandwich]
+    {
+        let fit = fit(&model, &pop, &model.default_params, &opts(requested, /* explicit */ true))
+            .expect("fit");
 
         assert!(
             fit.covariance_matrix.is_some(),
@@ -160,11 +148,7 @@ fn a_fit_with_no_covariance_matrix_names_no_estimator() {
     let fit = fit(&model, &pop, &model.default_params, &o).expect("fit");
 
     assert!(fit.covariance_matrix.is_none(), "premise");
-    assert_eq!(
-        fit.covariance_status,
-        CovarianceStatus::NotRequested,
-        "premise"
-    );
+    assert_eq!(fit.covariance_status, CovarianceStatus::NotRequested, "premise");
     assert_eq!(
         fit.covariance_method, None,
         "an estimator name must never outlive the matrix it describes — here there \
@@ -206,11 +190,7 @@ fn cov_fixed_is_the_mask_of_the_published_matrix() {
 
     let mut fitted = fit(&model, &pop, &model.default_params, &o).expect("fit");
     let dim = fitted.covariance_matrix.as_ref().expect("premise").nrows();
-    assert_eq!(
-        dim,
-        held.len(),
-        "premise: the matrix spans the packed layout"
-    );
+    assert_eq!(dim, held.len(), "premise: the matrix spans the packed layout");
     assert_eq!(fitted.cov_fixed, held);
 
     fitted.cov_fixed.clear();
@@ -256,34 +236,22 @@ fn rerunning_the_covariance_step_relabels_the_result_and_its_payloads() {
     let model = one_cpt_model();
     let pop = population();
 
-    let fitted = fit(
-        &model,
-        &pop,
-        &model.default_params,
-        &opts(CovarianceMethod::Hessian, true),
-    )
-    .expect("fit");
+    let fitted = fit(&model, &pop, &model.default_params, &opts(CovarianceMethod::Hessian, true))
+        .expect("fit");
     assert_eq!(
         fitted.covariance_method,
         Some(CovarianceMethod::Hessian),
         "premise: the incoming fit must already carry a *different* label, or the \
          overwrite below is indistinguishable from doing nothing"
     );
-    let stale_payloads: Vec<_> = fitted
-        .warnings_structured
-        .iter()
-        .filter(|w| is_covariance_code(&w.category))
-        .collect();
+    let stale_payloads: Vec<_> =
+        fitted.warnings_structured.iter().filter(|w| is_covariance_code(&w.category)).collect();
     assert!(
         !stale_payloads.is_empty(),
         "premise: the incoming fit must carry a covariance-step warning whose \
          payload names `r`, or there is no stale provenance for the re-run to \
          correct and this test cannot fail. structured: {:?}",
-        fitted
-            .warnings_structured
-            .iter()
-            .map(|w| &w.category)
-            .collect::<Vec<_>>()
+        fitted.warnings_structured.iter().map(|w| &w.category).collect::<Vec<_>>()
     );
     assert!(
         stale_payloads.iter().any(|w| {
@@ -304,11 +272,7 @@ fn rerunning_the_covariance_step_relabels_the_result_and_its_payloads() {
     )
     .expect("run_covariance");
 
-    assert!(
-        rerun.covariance_matrix.is_some(),
-        "premise: {:?}",
-        rerun.warnings
-    );
+    assert!(rerun.covariance_matrix.is_some(), "premise: {:?}", rerun.warnings);
     // (1) the typed field
     assert_eq!(
         rerun.covariance_method,
@@ -335,10 +299,7 @@ fn rerunning_the_covariance_step_relabels_the_result_and_its_payloads() {
     // ...and the superseded covariance-step warnings are gone from the flat list
     // too, since the step they describe has been replaced.
     assert!(
-        !rerun
-            .warnings
-            .iter()
-            .any(|w| w.contains("eigenvalue floor applied to FD Hessian")),
+        !rerun.warnings.iter().any(|w| w.contains("eigenvalue floor applied to FD Hessian")),
         "the `r` step's eigenvalue-floor warning describes a step that no longer \
          exists — it cannot even arise under the cross-product: {:?}",
         rerun.warnings
@@ -349,11 +310,7 @@ fn rerunning_the_covariance_step_relabels_the_result_and_its_payloads() {
         rerun.warnings_structured.len(),
         "flat and structured warning lists disagree after a re-run:\nflat: {:?}\nstructured: {:?}",
         rerun.warnings,
-        rerun
-            .warnings_structured
-            .iter()
-            .map(|w| &w.message)
-            .collect::<Vec<_>>()
+        rerun.warnings_structured.iter().map(|w| &w.message).collect::<Vec<_>>()
     );
 }
 

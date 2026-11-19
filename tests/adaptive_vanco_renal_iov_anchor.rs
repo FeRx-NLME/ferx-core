@@ -49,9 +49,8 @@ const ANCHOR_SEED: u64 = 20260708;
 /// Declining renal function over the horizon (one CRCL per daily decision/obs),
 /// CRCL(0)=120 down to CRCL(312)=40 mL/min. MUST match the `crcl` vector in
 /// `tests/reference/vanco_renal_iov_mrgsolve/vanco_renal_iov_mrgsolve.R` exactly.
-const CRCL: [f64; 14] = [
-    120.0, 115.0, 108.0, 98.0, 88.0, 78.0, 68.0, 60.0, 54.0, 49.0, 45.0, 42.0, 41.0, 40.0,
-];
+const CRCL: [f64; 14] =
+    [120.0, 115.0, 108.0, 98.0, 88.0, 78.0, 68.0, 60.0, 54.0, 49.0, 45.0, 42.0, 41.0, 40.0];
 
 /// mrgsolve 1.7.2 reference, frozen in
 /// `tests/reference/vanco_renal_iov_mrgsolve/expected.md`. Per daily decision:
@@ -91,10 +90,8 @@ const DOSE_TOL: f64 = 1e-3;
 /// per-occasion κ — drives the pre-dose trough at each decision.
 fn anchor_subject(decision_times: &[f64]) -> Subject {
     let n = decision_times.len();
-    let obs_covariates: Vec<HashMap<String, f64>> = CRCL
-        .iter()
-        .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
-        .collect();
+    let obs_covariates: Vec<HashMap<String, f64>> =
+        CRCL.iter().map(|&c| HashMap::from([("CRCL".to_string(), c)])).collect();
     Subject {
         id: "1".to_string(),
         doses: Vec::<DoseEvent>::new(),
@@ -143,16 +140,9 @@ fn print_coordination() {
     .expect("sim runs");
     println!("=== ferx renal x IOV ladder (seed {ANCHOR_SEED}) ===");
     for (i, d) in res.decisions.iter().enumerate() {
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         let dose = res.ledger[i].amt;
-        println!(
-            "g={i} t={} crcl={} trough={sig:.9} dose={dose:.9}",
-            d.time, CRCL[i]
-        );
+        println!("g={i} t={} crcl={} trough={sig:.9} dose={dose:.9}", d.time, CRCL[i]);
     }
 }
 
@@ -166,10 +156,7 @@ fn vanco_renal_iov_example_parses_and_runs_the_verifier() {
         .expect("vanco renal×IOV model must parse");
     assert_eq!(parsed.model.n_kappa, 1, "one IOV effect (κ on CL)");
     assert_eq!(parsed.model.n_eta, 1, "one (negligible) BSV η on CL");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(
         spec.auc_target, None,
         "the example declares no auc_target; the window-AUC test adds one (#943)"
@@ -201,10 +188,7 @@ fn vanco_renal_iov_example_parses_and_runs_the_verifier() {
 fn vanco_renal_iov_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_iov.ferx"))
         .expect("vanco renal×IOV model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
     let pop = anchor_population(&spec.at);
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(ANCHOR_SEED);
@@ -224,11 +208,7 @@ fn vanco_renal_iov_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(
             (sig - trough_ref).abs() < SIGNAL_TOL,
             "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
@@ -289,10 +269,7 @@ fn vanco_renal_iov_window_aucs_match_mrgsolve() {
 fn windows_in(band: (f64, f64)) -> usize {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_renal_iov.ferx"))
         .expect("model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     spec.auc_target = Some(band);
     let pop = anchor_population(&spec.at);
     let mut opts = AdaptiveSimulateOptions::default();

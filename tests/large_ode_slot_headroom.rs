@@ -100,12 +100,7 @@ const RESERVED_PK_SLOTS_LEN: usize = 2;
 
 fn fillers() -> String {
     (1..=N_FILLER)
-        .map(|i| {
-            format!(
-                "  FILLER_{i} = TVCL * {factor:.3}\n",
-                factor = 1.0 + (i as f64) * 0.01
-            )
-        })
+        .map(|i| format!("  FILLER_{i} = TVCL * {factor:.3}\n", factor = 1.0 + (i as f64) * 0.01))
         .collect()
 }
 
@@ -229,9 +224,7 @@ fn simulate_into(model: &ferx_core::types::CompiledModel, template: &Population)
 }
 
 fn fit_short_with(
-    model: &mut ferx_core::types::CompiledModel,
-    pop: &Population,
-    gradient: GradientMethod,
+    model: &mut ferx_core::types::CompiledModel, pop: &Population, gradient: GradientMethod,
 ) -> ferx_core::FitResult {
     // Both the inner and outer loops key off the gradient method: `opts`
     // controls the inner loop, but `model.gradient_method` is what
@@ -253,8 +246,7 @@ fn fit_short_with(
 }
 
 fn fit_short(
-    model: &mut ferx_core::types::CompiledModel,
-    pop: &Population,
+    model: &mut ferx_core::types::CompiledModel, pop: &Population,
 ) -> ferx_core::FitResult {
     fit_short_with(model, pop, GradientMethod::Auto)
 }

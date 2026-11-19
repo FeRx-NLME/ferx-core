@@ -363,11 +363,7 @@ fn vi_opts() -> FitOptions {
 }
 
 fn focei_opts() -> FitOptions {
-    FitOptions {
-        method: EstimationMethod::FoceI,
-        run_covariance_step: false,
-        ..Default::default()
-    }
+    FitOptions { method: EstimationMethod::FoceI, run_covariance_step: false, ..Default::default() }
 }
 
 fn fit_with(model: &CompiledModel, pop: &Population, opts: &FitOptions) -> FitResult {
@@ -461,10 +457,7 @@ fn the_two_covariate_designs_are_what_they_claim_to_be() {
     // the two are close to uncorrelated rather than merely distinct.
     let (wt, crcl): (Vec<f64>, Vec<f64>) = (0..N_SUBJECTS)
         .map(|i| {
-            (
-                CovariateDesign::SubjectUnique.weight_of(i),
-                CovariateDesign::SubjectUnique.crcl_of(i),
-            )
+            (CovariateDesign::SubjectUnique.weight_of(i), CovariateDesign::SubjectUnique.crcl_of(i))
         })
         .unzip();
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
@@ -487,10 +480,7 @@ fn the_two_covariate_designs_are_what_they_claim_to_be() {
 /// covariates permit; [`iiv_collapses_when_the_network_can_index_subjects`] is the
 /// statement about the design.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn vi_recovers_iiv_on_a_dcm() {
     let pop = simulated_population(CovariateDesign::Tied);
     let dcm = parse(&dcm_src("4"));
@@ -553,10 +543,7 @@ fn vi_recovers_iiv_on_a_dcm() {
 /// that anyone reading a DCM fit cares about: on a design that identifies `Ω`, neither
 /// estimator loses it.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn vi_and_focei_both_recover_iiv_on_an_identified_dcm() {
     let pop = simulated_population(CovariateDesign::Tied);
     let dcm = parse(&dcm_src("4"));
@@ -615,10 +602,7 @@ fn vi_and_focei_both_recover_iiv_on_an_identified_dcm() {
 /// point this test fails and is the natural home for the before/after number. That is the
 /// intended lifecycle, not an accident: a silent pass after the fix would prove nothing.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iiv_collapses_when_the_network_can_index_subjects() {
     let pop = simulated_population(CovariateDesign::SubjectUnique);
 
@@ -685,10 +669,7 @@ fn iiv_collapses_when_the_network_can_index_subjects() {
 /// 0.1207 → 0.0921 against a truth of 0.09, i.e. the wide network was *more* accurate and
 /// the "absorption" it detected was the narrow network's bias being corrected.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn capacity_alone_does_not_collapse_iiv_when_the_design_identifies_omega() {
     let pop = simulated_population(CovariateDesign::Tied);
     let f = fit_with(&parse(&dcm_src("8, 8")), &pop, &vi_opts());

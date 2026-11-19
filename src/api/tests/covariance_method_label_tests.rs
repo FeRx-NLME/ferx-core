@@ -138,10 +138,8 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
             .iter()
             .position(|l| l.starts_with("mod ") && l.contains("test") && l.ends_with('{'))
             .unwrap_or(lines.len());
-        let code: Vec<&str> = lines[..end]
-            .iter()
-            .map(|l| l.split("//").next().unwrap_or(""))
-            .collect();
+        let code: Vec<&str> =
+            lines[..end].iter().map(|l| l.split("//").next().unwrap_or("")).collect();
 
         /// A site is correctly paired when the two values agree about whether a
         /// matrix exists: `None` beside `None` (an exit that runs no covariance
@@ -167,9 +165,7 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
                     // two different results.
                     let lo = i.saturating_sub(30);
                     let hi = (i + 30).min(code.len());
-                    let method = code[lo..hi]
-                        .iter()
-                        .find_map(|l| writes(l, "covariance_method"));
+                    let method = code[lo..hi].iter().find_map(|l| writes(l, "covariance_method"));
                     if paired(v, method) {
                         labelled += 1;
                     }
@@ -177,9 +173,8 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
                 }
             }
             // (b) struct-literal form
-            let is_literal = ["OuterResult {", "FitResult {", "FitWire {"]
-                .iter()
-                .any(|s| line.contains(s));
+            let is_literal =
+                ["OuterResult {", "FitResult {", "FitWire {"].iter().any(|s| line.contains(s));
             if !is_literal || line.contains("struct ") {
                 continue;
             }
@@ -203,16 +198,12 @@ fn every_published_covariance_matrix_is_written_with_its_estimator() {
                     break;
                 }
             }
-            let Some(matrix) = own_fields
-                .iter()
-                .find_map(|l| writes(l, "covariance_matrix"))
+            let Some(matrix) = own_fields.iter().find_map(|l| writes(l, "covariance_matrix"))
             else {
                 continue;
             };
             sites += 1;
-            let method = own_fields
-                .iter()
-                .find_map(|l| writes(l, "covariance_method"));
+            let method = own_fields.iter().find_map(|l| writes(l, "covariance_method"));
             if paired(matrix, method) {
                 labelled += 1;
             }

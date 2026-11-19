@@ -39,12 +39,7 @@ fn model(src: &str) -> CompiledModel {
 }
 
 fn rec(time: f64, event_type: EventType, entry_time: f64, cmt: usize) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time,
-        cmt,
-    }
+    ObsRecord::Event { time, event_type, entry_time, cmt }
 }
 
 fn event(time: f64) -> Vec<ObsRecord> {
@@ -80,25 +75,16 @@ fn pop(records: Vec<Vec<ObsRecord>>) -> Population {
 /// An assertion on the whole list fails beside the rest of the lib tests (review r2
 /// #12); assert on this instead.
 fn tte_warnings(warnings: Vec<String>) -> Vec<String> {
-    warnings
-        .into_iter()
-        .filter(|w| w.starts_with("W_TTE_"))
-        .collect()
+    warnings.into_iter().filter(|w| w.starts_with("W_TTE_")).collect()
 }
 
 fn scores(m: &CompiledModel, p: &Population, nsim: usize, seed: u64) -> Vec<Vec<TteNpde>> {
-    compute_tte_npde(m, p, &m.default_params, nsim, Some(seed), None)
-        .expect("scored")
-        .0
+    compute_tte_npde(m, p, &m.default_params, nsim, Some(seed), None).expect("scored").0
 }
 
 fn refusal(m: &CompiledModel, p: &Population, nsim: usize) -> String {
     let err = compute_tte_npde(m, p, &m.default_params, nsim, Some(1), None).expect_err("refused");
-    assert_eq!(
-        err.diagnostic().map(|d| d.code.as_str()),
-        Some("E_NPDE_TTE_INPUT"),
-        "{err}"
-    );
+    assert_eq!(err.diagnostic().map(|d| d.code.as_str()), Some("E_NPDE_TTE_INPUT"), "{err}");
     err.to_string()
 }
 
@@ -162,9 +148,7 @@ fn censored_scores_lie_above_the_censoring_quantile() {
     let mut lowest = f64::INFINITY;
     let mut sum = 0.0;
     for s in &out {
-        let [row] = s.as_slice() else {
-            panic!("one score per subject, got {}", s.len())
-        };
+        let [row] = s.as_slice() else { panic!("one score per subject, got {}", s.len()) };
         assert!(row.imputed);
         assert!(row.pd.is_finite() && row.npde.is_finite());
         assert!(row.pd >= floor, "pd {} below {floor}", row.pd);
@@ -267,15 +251,7 @@ fn refusals_say_exactly_this() {
     assert_eq!(
         refusal(
             &m,
-            &with(vec![rec(
-                4.0,
-                EventType::IntervalCensored {
-                    left: 2.0,
-                    right: 4.0,
-                },
-                0.0,
-                2
-            )]),
+            &with(vec![rec(4.0, EventType::IntervalCensored { left: 2.0, right: 4.0 }, 0.0, 2)]),
             100
         ),
         "compute_tte_npde: subject 2 has an interval-censored record on cmt 2; npde needs an \
@@ -295,11 +271,7 @@ fn refusals_say_exactly_this() {
          one per subject."
     );
     assert_eq!(
-        refusal(
-            &m,
-            &with(vec![rec(f64::NAN, EventType::Exact, 0.0, 2)]),
-            100
-        ),
+        refusal(&m, &with(vec![rec(f64::NAN, EventType::Exact, 0.0, 2)]), 100),
         "compute_tte_npde: subject 2 has time NaN on cmt 2, which is not a finite, \
          non-negative number."
     );
@@ -328,13 +300,7 @@ fn refusals_say_exactly_this() {
 fn seeded_batches_are_reproducible_and_exact() {
     let m = model(EXP_IIV);
     let mut records: Vec<Vec<ObsRecord>> = (0..20)
-        .map(|i| {
-            if i % 2 == 0 {
-                event(2.0 + i as f64)
-            } else {
-                censor(2.0 + i as f64)
-            }
-        })
+        .map(|i| if i % 2 == 0 { event(2.0 + i as f64) } else { censor(2.0 + i as f64) })
         .collect();
     records.insert(3, vec![]);
     let p = pop(records);
@@ -430,10 +396,7 @@ fn dropout_design(n: usize, seed: u64) -> (Population, usize) {
 /// 7 s in a debug build, 98 % of this module's run time. A calibration study, not a
 /// unit test. The two kernel mutations above are killed per PR by T2 as well.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn scores_are_uniform_under_the_true_model_and_not_under_a_wrong_one() {
     const BOUND: f64 = 0.0616;
     let n = 1000;
@@ -498,10 +461,7 @@ const PD_BOUND: f64 = 1e-15;
 const NPDE_BOUND: f64 = 1e-8;
 
 fn reference_file(name: &str) -> Vec<Vec<String>> {
-    let path = format!(
-        "{}/tests/fixtures/npde_tte_reference/{name}",
-        env!("CARGO_MANIFEST_DIR")
-    );
+    let path = format!("{}/tests/fixtures/npde_tte_reference/{name}", env!("CARGO_MANIFEST_DIR"));
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{path}: {e}"))
         .lines()
@@ -544,29 +504,17 @@ fn kernel_matches_the_r_npde_package() {
     for (o, r) in obs.iter().zip(&reference) {
         assert_eq!(o[0], r[0], "row order");
         let (y, is_event) = (num(&o[1]), o[2] == "1");
-        let draws: Vec<(f64, bool)> = sims
-            .iter()
-            .filter(|s| s[0] == o[0])
-            .map(|s| (num(&s[2]), s[3] == "1"))
-            .collect();
+        let draws: Vec<(f64, bool)> =
+            sims.iter().filter(|s| s[0] == o[0]).map(|s| (num(&s[2]), s[3] == "1")).collect();
         let k = draws.len();
         assert_eq!(k, 200, "subject {}", o[0]);
-        let n = draws
-            .iter()
-            .filter(|(t, observed)| event_before(*t, *observed, y))
-            .count();
+        let n = draws.iter().filter(|(t, observed)| event_before(*t, *observed, y)).count();
         let (pd_r, ploq_r, npde_r, npd_r) = (num(&r[1]), num(&r[2]), num(&r[3]), num(&r[4]));
-        assert_eq!(
-            npde_r, npd_r,
-            "one observation per subject: R's npde is its npd"
-        );
+        assert_eq!(npde_r, npd_r, "one observation per subject: R's npde is its npd");
         if is_event {
             n_event += 1;
             let pd = tte_pd(n, k, false, 0.0);
-            let (e_pd, e_npde) = (
-                (pd - (1.0 - pd_r)).abs(),
-                (normal_inv_cdf(pd) + npde_r).abs(),
-            );
+            let (e_pd, e_npde) = ((pd - (1.0 - pd_r)).abs(), (normal_inv_cdf(pd) + npde_r).abs());
             assert!(e_pd.is_finite() && e_npde.is_finite());
             if e_pd > worst_pd {
                 worst_pd = e_pd;
@@ -591,11 +539,7 @@ fn kernel_matches_the_r_npde_package() {
             assert!(pd_r <= ploq_r.max(1.0 / 400.0), "subject {}", o[0]);
             for u in [0.0, 0.5, 0.999] {
                 let pd = tte_pd(n, k, true, u);
-                assert!(
-                    1.0 - pd <= ploq_r.max(1.0 / 400.0) + 1e-15,
-                    "subject {}",
-                    o[0]
-                );
+                assert!(1.0 - pd <= ploq_r.max(1.0 / 400.0) + 1e-15, "subject {}", o[0]);
             }
         }
     }
@@ -623,32 +567,19 @@ fn joint_population(model: &CompiledModel, tte: &[Option<(f64, bool)>]) -> Popul
     }
     let mut f = tempfile::NamedTempFile::new().unwrap();
     f.write_all(csv.as_bytes()).unwrap();
-    crate::api::read_population_for(
-        model,
-        &None,
-        f.path().to_str().unwrap(),
-        None,
-        None,
-        None,
-        &[],
-    )
-    .expect("population reads")
-    .0
+    crate::api::read_population_for(model, &None, f.path().to_str().unwrap(), None, None, None, &[])
+        .expect("population reads")
+        .0
 }
 
 fn ode_hazard_model(file: &str) -> CompiledModel {
-    let src = std::fs::read_to_string(format!(
-        "{}/nonmem_anchor/{file}",
-        env!("CARGO_MANIFEST_DIR")
-    ))
-    .unwrap();
+    let src =
+        std::fs::read_to_string(format!("{}/nonmem_anchor/{file}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap();
     // IIV on CL, so the drug-driven hazard differs between replicates; the anchor's
     // own `[fit_options]` (tight tolerances for a NONMEM comparison) is dropped.
     let src = src
-        .replace(
-            "  sigma PROP_ERR",
-            "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR",
-        )
+        .replace("  sigma PROP_ERR", "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR")
         .replace("  CL   = TVCL", "  CL   = TVCL * exp(ETA_CL)");
     assert!(src.contains("ETA_CL ~ 0.09") && src.contains("TVCL * exp(ETA_CL)"));
     model(src.split("\n[fit_options]").next().unwrap())
@@ -675,23 +606,17 @@ fn ode_hazard_and_joint_subjects() {
     assert!(warnings.is_empty(), "{warnings:?}");
     for (s, &t) in out.iter().zip(&times) {
         let want = 1.0 - (-0.02 * t).exp();
-        let [row] = s.as_slice() else {
-            panic!("one score per subject")
-        };
+        let [row] = s.as_slice() else { panic!("one score per subject") };
         assert_eq!((row.cmt, row.time, row.imputed), (3, t, false));
         assert!(row.pd.is_finite());
-        let (err, bound) = (
-            (row.pd - want).abs(),
-            4.0 * (want * (1.0 - want) / k as f64).sqrt(),
-        );
+        let (err, bound) = ((row.pd - want).abs(), 4.0 * (want * (1.0 - want) / k as f64).sqrt());
         eprintln!("T6 const: t = {t}: pd {:.4}, closed form {want:.4}, error {err:.2e}, bound {bound:.2e}", row.pd);
         assert!(err < bound);
     }
 
     let m = ode_hazard_model("ss_chz_drug_fit.ferx");
-    let mut rows: Vec<Option<(f64, bool)>> = (0..12)
-        .map(|i| Some((4.0 + 3.0 * i as f64, i % 3 != 0)))
-        .collect();
+    let mut rows: Vec<Option<(f64, bool)>> =
+        (0..12).map(|i| Some((4.0 + 3.0 * i as f64, i % 3 != 0))).collect();
     rows[5] = None;
     let p = joint_population(&m, &rows);
     let gaussian = |p: &Population| {
@@ -716,9 +641,7 @@ fn ode_hazard_and_joint_subjects() {
         }
     }
     // The concentration rows: one Gaussian score each, the TTE record none.
-    assert!(gaussian_scores
-        .iter()
-        .all(|(npd, npde)| npd.len() == 1 && npde.len() == 1));
+    assert!(gaussian_scores.iter().all(|(npd, npde)| npd.len() == 1 && npde.len() == 1));
     assert!(gaussian_scores.iter().all(|(npd, _)| npd[0].is_finite()));
 }
 
@@ -749,10 +672,7 @@ fn no_event_replicates_count_and_their_warnings_fold() {
     let raw = tte_warnings(raw);
     assert_eq!(raw.len(), 3, "one line per subject: {raw:#?}");
     for (i, w) in raw.iter().enumerate() {
-        let head = format!(
-            "W_TTE_DEGENERATE_HAZARD: subject '{}' (CMT=2) ",
-            p.subjects[i].id
-        );
+        let head = format!("W_TTE_DEGENERATE_HAZARD: subject '{}' (CMT=2) ", p.subjects[i].id);
         assert!(w.starts_with(&head), "{w}");
         // "censored at the observation window in k of 250 replicates (sim …)".
         let k: usize = w
@@ -764,19 +684,14 @@ fn no_event_replicates_count_and_their_warnings_fold() {
         // A no-event replicate has no event before anything, so k and before[i] are
         // disjoint replicates; subject index 1 is scored at the horizon, where every
         // replicate with an event inside it counts.
-        assert!(
-            k > 0 && k + before[i] <= 250,
-            "k = {k}, before = {before:?}"
-        );
+        assert!(k > 0 && k + before[i] <= 250, "k = {k}, before = {before:?}");
     }
     // The cure fraction is exp(−α/|γ|) = exp(−0.4) ≈ 0.67: about a third have an event.
     assert!(before[1] > 50 && before[1] < 120, "{before:?}");
 
     let (out, warnings) = compute_tte_npde(&m, &p, &m.default_params, 250, Some(5), None).unwrap();
     let warnings = tte_warnings(warnings);
-    let [w] = warnings.as_slice() else {
-        panic!("one folded warning, got {}", warnings.len())
-    };
+    let [w] = warnings.as_slice() else { panic!("one folded warning, got {}", warnings.len()) };
     assert!(w.starts_with(&raw[0]), "{w}");
     assert!(
         w.ends_with(
@@ -844,12 +759,7 @@ fn reported_time_is_the_written_time() {
 fn records_off_the_endpoint_are_skipped() {
     let p = pop(vec![
         vec![
-            ObsRecord::DiscreteState {
-                time: 1.0,
-                raw_time: 1.0,
-                state: 1,
-                cmt: 5,
-            },
+            ObsRecord::DiscreteState { time: 1.0, raw_time: 1.0, state: 1, cmt: 5 },
             rec(9.0, EventType::Exact, 0.0, 3),
             rec(4.0, EventType::RightCensored, 0.0, 2),
         ],
@@ -874,12 +784,10 @@ fn a_fit_keeps_only_failed_solves_of_the_reference_draws() {
     ]);
     assert_eq!(
         kept,
-        vec![
-            "W_TTE_SOLVE_FAILED: in the npde reference replicates of the time-to-event \
+        vec!["W_TTE_SOLVE_FAILED: in the npde reference replicates of the time-to-event \
              records, where a failed solve counts as \"no event\": subject '7' (CMT=3): the \
              solve failed [12 such]"
-                .to_string()
-        ]
+            .to_string()]
     );
     assert!(fit_time_warnings(vec![]).is_empty());
 }
@@ -904,11 +812,7 @@ fn all_scored_times_at_zero_are_scored_without_simulating() {
     for i in [1, 3] {
         let row = &out[i][0];
         assert!(row.imputed);
-        assert_eq!(
-            row.pd,
-            clamp_prob(impute_uniform(9, i), 200),
-            "subject index {i}"
-        );
+        assert_eq!(row.pd, clamp_prob(impute_uniform(9, i), 200), "subject index {i}");
         assert!(row.npde.is_finite());
     }
     assert_ne!(out[1][0].pd, out[3][0].pd);

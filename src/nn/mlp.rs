@@ -42,11 +42,7 @@ pub enum NnError {
     #[error("duplicate output name '{0}'")]
     DuplicateOutput(String),
     #[error("`{field}` must have one entry per input: expected {expected}, got {actual}")]
-    NormalizationLengthMismatch {
-        field: &'static str,
-        expected: usize,
-        actual: usize,
-    },
+    NormalizationLengthMismatch { field: &'static str, expected: usize, actual: usize },
     #[error("`scale` for input '{input}' must be finite and non-zero; got {value}")]
     InvalidScale { input: String, value: f64 },
     #[error("`center` for input '{input}' must be finite; got {value}")]
@@ -106,9 +102,7 @@ impl MlpMapper {
     /// Construct an MLP. `layers` must be `[n_input, n_hidden_1, ..., n_output]`
     /// (length ≥ 2).
     pub fn new(
-        layers: Vec<usize>,
-        hidden_activation: Activation,
-        output_activation: Activation,
+        layers: Vec<usize>, hidden_activation: Activation, output_activation: Activation,
     ) -> Result<Self, NnError> {
         if layers.len() < 2 {
             return Err(NnError::InvalidLayers(layers));
@@ -166,10 +160,7 @@ impl MlpMapper {
 
     /// Number of output features.
     pub fn n_outputs(&self) -> usize {
-        *self
-            .layers
-            .last()
-            .expect("layers non-empty by construction")
+        *self.layers.last().expect("layers non-empty by construction")
     }
 
     /// Indices, within the flat weight vector, of every weight output `k`
@@ -199,10 +190,7 @@ impl MlpMapper {
     /// Panics if `k >= n_outputs()`.
     pub fn output_bias_index(&self, k: usize) -> usize {
         let n_out = self.n_outputs();
-        assert!(
-            k < n_out,
-            "output index {k} out of range (n_outputs {n_out})"
-        );
+        assert!(k < n_out, "output index {k} out of range (n_outputs {n_out})");
         let l = self.layers.len() - 1;
         let n_lm1 = self.layers[l - 1];
         self.offsets[l - 1] + n_out * n_lm1 + k
@@ -228,10 +216,7 @@ impl MlpMapper {
     pub fn forward(&self, x: &[f64], weights: &[f64]) -> Result<Vec<f64>, NnError> {
         self.check_shapes(x, weights)?;
         let (_pre, post) = self.forward_cache(x, weights);
-        Ok(post
-            .into_iter()
-            .last()
-            .expect("at least one layer activation"))
+        Ok(post.into_iter().last().expect("at least one layer activation"))
     }
 
     /// Full Jacobian dy/dθ, shape `(n_outputs × n_weights)`, as a dense
@@ -264,9 +249,7 @@ impl MlpMapper {
     /// post-activation form would divide by `f'(z_k)`, which is `0/0` where it matters (a saturated
     /// `Softplus`/`Sigmoid` head drives `f'(z_k) → 0`). Here the factor cancels analytically.
     pub fn jacobian_preactivation(
-        &self,
-        x: &[f64],
-        weights: &[f64],
+        &self, x: &[f64], weights: &[f64],
     ) -> Result<DMatrix<f64>, NnError> {
         self.jacobian_impl(x, weights, true)
     }
@@ -275,13 +258,9 @@ impl MlpMapper {
     /// [`jacobian_preactivation`](Self::jacobian_preactivation). `preactivation`
     /// skips the output layer's activation derivative in the seed.
     fn jacobian_impl(
-        &self,
-        x: &[f64],
-        weights: &[f64],
-        preactivation: bool,
+        &self, x: &[f64], weights: &[f64], preactivation: bool,
     ) -> Result<DMatrix<f64>, NnError> {
-        self.jacobian_with_output(x, weights, preactivation)
-            .map(|(_, jac)| jac)
+        self.jacobian_with_output(x, weights, preactivation).map(|(_, jac)| jac)
     }
 
     /// [`jacobian_impl`](Self::jacobian_impl) plus the network output `a_L` at
@@ -290,10 +269,7 @@ impl MlpMapper {
     /// at every grid node) gets the output for free instead of paying a second
     /// forward pass.
     fn jacobian_with_output(
-        &self,
-        x: &[f64],
-        weights: &[f64],
-        preactivation: bool,
+        &self, x: &[f64], weights: &[f64], preactivation: bool,
     ) -> Result<(Vec<f64>, DMatrix<f64>), NnError> {
         self.check_shapes(x, weights)?;
         let (pre, post) = self.forward_cache(x, weights);
@@ -309,15 +285,9 @@ impl MlpMapper {
             scratch.adjoint.clear();
             scratch.adjoint.resize(n_out, 0.0);
             scratch.adjoint[k] = 1.0;
-            self.backprop(
-                x,
-                weights,
-                &pre,
-                &post,
-                preactivation,
-                &mut scratch,
-                |c, v| jac[(k, c)] = v,
-            );
+            self.backprop(x, weights, &pre, &post, preactivation, &mut scratch, |c, v| {
+                jac[(k, c)] = v
+            });
         }
 
         Ok((output, jac))
@@ -336,24 +306,15 @@ impl MlpMapper {
     /// adjoint is bit-identical (pinned by `jacobian_matches_nalgebra_reference`).
     #[allow(clippy::too_many_arguments)]
     fn backprop(
-        &self,
-        x: &[f64],
-        weights: &[f64],
-        pre: &[Vec<f64>],
-        post: &[Vec<f64>],
-        preactivation: bool,
-        scratch: &mut Backprop,
-        mut put: impl FnMut(usize, f64),
+        &self, x: &[f64], weights: &[f64], pre: &[Vec<f64>], post: &[Vec<f64>],
+        preactivation: bool, scratch: &mut Backprop, mut put: impl FnMut(usize, f64),
     ) {
         let Backprop { adjoint, dz: dz_l } = scratch;
         // Walk layers L, L-1, ..., 1.
         for l in (1..self.layers.len()).rev() {
             let is_output_layer = l == self.layers.len() - 1;
-            let activation = if is_output_layer {
-                self.output_activation
-            } else {
-                self.hidden_activation
-            };
+            let activation =
+                if is_output_layer { self.output_activation } else { self.hidden_activation };
 
             // dz_l = da_l ⊙ activation'(z_l). Under `preactivation` the
             // output layer is seeded directly at z_L, so its activation
@@ -364,10 +325,7 @@ impl MlpMapper {
                 dz_l.extend_from_slice(adjoint);
             } else {
                 dz_l.extend(
-                    adjoint
-                        .iter()
-                        .zip(z_l.iter())
-                        .map(|(&a, &z)| a * activation.derivative(z)),
+                    adjoint.iter().zip(z_l.iter()).map(|(&a, &z)| a * activation.derivative(z)),
                 );
             }
 
@@ -446,10 +404,7 @@ impl MlpMapper {
     /// `2·lambda·wᵢ` on weight entries; the Hessian is exact, `2·lambda` on the
     /// weight diagonal and nothing on biases. `lambda == 0.0` touches nothing.
     pub(crate) fn l2_weight_penalty_accum(
-        &self,
-        weights: &[f64],
-        lambda: f64,
-        sink: &mut PenaltySink<'_>,
+        &self, weights: &[f64], lambda: f64, sink: &mut PenaltySink<'_>,
     ) -> f64 {
         if lambda == 0.0 {
             return 0.0;
@@ -478,10 +433,7 @@ impl MlpMapper {
     /// returns `0.0` (no-op).
     #[cfg(test)]
     pub(crate) fn curvature_penalty_value(
-        &self,
-        weights: &[f64],
-        grid: &CurvatureGrid,
-        lambda: f64,
+        &self, weights: &[f64], grid: &CurvatureGrid, lambda: f64,
     ) -> f64 {
         self.curvature_penalty_accum(weights, grid, lambda, &mut PenaltySink::none())
     }
@@ -491,10 +443,7 @@ impl MlpMapper {
     /// (strict no-op). See [`curvature_penalty_accum`](Self::curvature_penalty_accum).
     #[cfg(test)]
     pub(crate) fn curvature_penalty(
-        &self,
-        weights: &[f64],
-        grid: &CurvatureGrid,
-        lambda: f64,
+        &self, weights: &[f64], grid: &CurvatureGrid, lambda: f64,
     ) -> (f64, Vec<f64>) {
         let mut grad = vec![0.0f64; self.n_params];
         let v =
@@ -516,11 +465,7 @@ impl MlpMapper {
     /// exact at `C = 0`, the flat map the penalty pulls toward (the regime a trust-region / BHHH consumer
     /// needs). `lambda == 0.0` or an empty grid touches nothing.
     pub(crate) fn curvature_penalty_accum(
-        &self,
-        weights: &[f64],
-        grid: &CurvatureGrid,
-        lambda: f64,
-        sink: &mut PenaltySink<'_>,
+        &self, weights: &[f64], grid: &CurvatureGrid, lambda: f64, sink: &mut PenaltySink<'_>,
     ) -> f64 {
         if lambda == 0.0 || grid.is_empty() {
             return 0.0;
@@ -535,9 +480,8 @@ impl MlpMapper {
             let mut js: Vec<DMatrix<f64>> = Vec::new();
             for x in nodes {
                 if want_deriv {
-                    let (y, j) = self
-                        .jacobian_with_output(x, weights, false)
-                        .expect("grid input shape ok");
+                    let (y, j) =
+                        self.jacobian_with_output(x, weights, false).expect("grid input shape ok");
                     ys.push(y);
                     js.push(j);
                 } else {
@@ -611,11 +555,8 @@ impl MlpMapper {
             let w_start = self.offsets[l - 1];
             let w = &weights[w_start..w_start + n_l * n_lm1];
             let b = &weights[w_start + n_l * n_lm1..w_start + n_l * n_lm1 + n_l];
-            let activation = if l == l_max {
-                self.output_activation
-            } else {
-                self.hidden_activation
-            };
+            let activation =
+                if l == l_max { self.output_activation } else { self.hidden_activation };
             a_prev = (0..n_l)
                 .map(|i| {
                     let row = &w[i * n_lm1..(i + 1) * n_lm1];
@@ -655,11 +596,8 @@ impl MlpMapper {
             let w_start = self.offsets[l - 1];
             let w = &weights[w_start..w_start + n_l * n_lm1];
             let b = self.bias_slice(weights, l);
-            let activation = if l == l_max {
-                self.output_activation
-            } else {
-                self.hidden_activation
-            };
+            let activation =
+                if l == l_max { self.output_activation } else { self.hidden_activation };
             let mut z = Vec::with_capacity(n_l);
             let mut a = Vec::with_capacity(n_l);
             for i in 0..n_l {
@@ -683,9 +621,7 @@ impl MlpMapper {
     /// reference the slice-loop version is pinned bit-identical to. Test-only.
     #[cfg(test)]
     fn forward_cache_nalgebra(
-        &self,
-        x: &[f64],
-        weights: &[f64],
+        &self, x: &[f64], weights: &[f64],
     ) -> (Vec<DVector<f64>>, Vec<DVector<f64>>) {
         let l_max = self.layers.len() - 1;
         let mut pre = Vec::with_capacity(l_max);
@@ -696,11 +632,8 @@ impl MlpMapper {
             let w = self.weight_matrix(weights, l);
             let b = DVector::<f64>::from_column_slice(self.bias_slice(weights, l));
             let z = &w * &a_prev + b;
-            let activation = if l == l_max {
-                self.output_activation
-            } else {
-                self.hidden_activation
-            };
+            let activation =
+                if l == l_max { self.output_activation } else { self.hidden_activation };
             let a: DVector<f64> =
                 DVector::from_iterator(z.len(), z.iter().map(|&v| activation.apply(v)));
             pre.push(z);
@@ -724,11 +657,8 @@ impl MlpMapper {
             adjoint[k] = 1.0;
             for l in (1..self.layers.len()).rev() {
                 let is_output_layer = l == self.layers.len() - 1;
-                let activation = if is_output_layer {
-                    self.output_activation
-                } else {
-                    self.hidden_activation
-                };
+                let activation =
+                    if is_output_layer { self.output_activation } else { self.hidden_activation };
                 let z_l = &pre[l - 1];
                 let dz_l = if preactivation && is_output_layer {
                     adjoint.clone()
@@ -739,11 +669,8 @@ impl MlpMapper {
                     );
                     adjoint.component_mul(&d)
                 };
-                let a_prev = if l == 1 {
-                    DVector::<f64>::from_column_slice(x)
-                } else {
-                    post[l - 2].clone()
-                };
+                let a_prev =
+                    if l == 1 { DVector::<f64>::from_column_slice(x) } else { post[l - 2].clone() };
                 let w_start = self.offsets[l - 1];
                 let n_l = self.layers[l];
                 let n_lm1 = self.layers[l - 1];
@@ -766,10 +693,7 @@ impl MlpMapper {
 
     fn check_shapes(&self, x: &[f64], weights: &[f64]) -> Result<(), NnError> {
         if x.len() != self.n_inputs() {
-            return Err(NnError::InputCountMismatch {
-                expected: self.n_inputs(),
-                actual: x.len(),
-            });
+            return Err(NnError::InputCountMismatch { expected: self.n_inputs(), actual: x.len() });
         }
         if weights.len() != self.n_params {
             return Err(NnError::WeightCountMismatch {
@@ -805,18 +729,13 @@ pub trait CovariateMapper: Send + Sync {
     /// `PkParams::default()`, which sets `F=1` and leaves the rest at 0 —
     /// matching analytical-model conventions).
     fn forward(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
-        out: &mut PkParams,
+        &self, weights: &[f64], covariates: &HashMap<String, f64>, out: &mut PkParams,
     ) -> Result<(), NnError>;
 
     /// Jacobian of the (named) PK outputs vs the flat weight vector.
     /// Row order matches the order returned by `output_names()`.
     fn jacobian(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
+        &self, weights: &[f64], covariates: &HashMap<String, f64>,
     ) -> Result<DMatrix<f64>, NnError>;
 
     /// PK parameter names written into `out` by `forward`, in row order
@@ -862,9 +781,7 @@ impl NamedMlpMapper {
     /// (case-insensitive — names are lower-cased internally to match the
     /// analytical path).
     pub fn new(
-        mlp: MlpMapper,
-        input_names: Vec<String>,
-        output_names: Vec<String>,
+        mlp: MlpMapper, input_names: Vec<String>, output_names: Vec<String>,
     ) -> Result<Self, NnError> {
         if mlp.n_inputs() != input_names.len() {
             return Err(NnError::InputCountMismatch {
@@ -907,9 +824,7 @@ impl NamedMlpMapper {
     /// Lengths must match `inputs`, and every `scale` entry must be finite and non-zero.
     /// Callers that want centering only (or scaling only) pass the identity for the other.
     pub fn with_normalization(
-        mut self,
-        center: Vec<f64>,
-        scale: Vec<f64>,
+        mut self, center: Vec<f64>, scale: Vec<f64>,
     ) -> Result<Self, NnError> {
         let n_in = self.input_names.len();
         for (label, v) in [("center", &center), ("scale", &scale)] {
@@ -997,9 +912,7 @@ impl NamedMlpMapper {
     /// `read_nonmem_csv*` one, is refused. Whether NN `TIME` should be refused on every path is open
     /// (#1942).
     pub fn forward_raw(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
+        &self, weights: &[f64], covariates: &HashMap<String, f64>,
     ) -> Result<Vec<f64>, NnError> {
         let x = self.build_input_vec_zero_fill(covariates);
         // `pk_param_fn` calls this once per event on every objective evaluation, and an inner
@@ -1009,9 +922,7 @@ impl NamedMlpMapper {
         // Exact bits, branch-free so it vectorises (an early-exit `all` does not).
         let same = |v: &[f64], u: &[f64]| {
             v.len() == u.len()
-                && v.iter()
-                    .zip(u)
-                    .fold(true, |eq, (a, b)| eq & (a.to_bits() == b.to_bits()))
+                && v.iter().zip(u).fold(true, |eq, (a, b)| eq & (a.to_bits() == b.to_bits()))
         };
         if let Some(y) = FORWARD_MEMO.with(|m| {
             m.borrow()
@@ -1040,12 +951,9 @@ impl NamedMlpMapper {
     /// [`Self::forward_raw`] on any number type: the weights on it, the (zero-filled,
     /// normalised) inputs constant.
     pub(crate) fn forward_raw_g<T: crate::sens::num::PkNum>(
-        &self,
-        weights: &[T],
-        covariates: &HashMap<String, f64>,
+        &self, weights: &[T], covariates: &HashMap<String, f64>,
     ) -> Vec<T> {
-        self.mlp
-            .forward_g(&self.build_input_vec_zero_fill(covariates), weights)
+        self.mlp.forward_g(&self.build_input_vec_zero_fill(covariates), weights)
     }
 
     /// Pre-activation Jacobian `∂z_L/∂weights` at this subject's covariates,
@@ -1059,9 +967,7 @@ impl NamedMlpMapper {
     /// absent. Use this variant anywhere the Jacobian has to agree with the
     /// production forward pass.
     pub fn jacobian_preactivation_raw(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
+        &self, weights: &[f64], covariates: &HashMap<String, f64>,
     ) -> Result<DMatrix<f64>, NnError> {
         let x = self.build_input_vec_zero_fill(covariates);
         self.mlp.jacobian_preactivation(&x, weights)
@@ -1115,10 +1021,7 @@ impl CovariateMapper for NamedMlpMapper {
     }
 
     fn forward(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
-        out: &mut PkParams,
+        &self, weights: &[f64], covariates: &HashMap<String, f64>, out: &mut PkParams,
     ) -> Result<(), NnError> {
         let x = self.build_input_vec(covariates)?;
         let y = self.mlp.forward(&x, weights)?;
@@ -1129,9 +1032,7 @@ impl CovariateMapper for NamedMlpMapper {
     }
 
     fn jacobian(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
+        &self, weights: &[f64], covariates: &HashMap<String, f64>,
     ) -> Result<DMatrix<f64>, NnError> {
         let x = self.build_input_vec(covariates)?;
         self.mlp.jacobian(&x, weights)
@@ -1186,18 +1087,12 @@ pub(crate) struct PenaltySink<'a> {
 impl<'a> PenaltySink<'a> {
     /// Value only.
     pub(crate) fn none() -> Self {
-        Self {
-            grad: None,
-            hess: None,
-        }
+        Self { grad: None, hess: None }
     }
 
     /// Value + gradient.
     pub(crate) fn grad(grad: &'a mut [f64]) -> Self {
-        Self {
-            grad: Some(grad),
-            hess: None,
-        }
+        Self { grad: Some(grad), hess: None }
     }
 }
 
@@ -1283,10 +1178,7 @@ impl CurvatureGrid {
             // three nodes. Past the cap, widen the step to keep the whole span.
             let n_at_step = (span / step_z).floor() as usize + 1;
             let (n_nodes, step) = if n_at_step > NN_SMOOTH_GRID_MAX_NODES {
-                (
-                    NN_SMOOTH_GRID_MAX_NODES,
-                    span / (NN_SMOOTH_GRID_MAX_NODES - 1) as f64,
-                )
+                (NN_SMOOTH_GRID_MAX_NODES, span / (NN_SMOOTH_GRID_MAX_NODES - 1) as f64)
             } else {
                 (n_at_step, step_z)
             };
@@ -1412,9 +1304,7 @@ impl NnRegularizer {
     /// fit options' `nn_l2` / `nn_smooth` strengths. When both λ are `0.0` the
     /// spec list is empty and every method is a no-op.
     pub(crate) fn build(
-        model: &CompiledModel,
-        population: &Population,
-        options: &FitOptions,
+        model: &CompiledModel, population: &Population, options: &FitOptions,
     ) -> Self {
         let l2_lambda = options.nn_l2_lambda;
         let smooth_lambda = options.nn_smooth_lambda;
@@ -1436,11 +1326,7 @@ impl NnRegularizer {
                 });
             }
         }
-        Self {
-            l2_lambda,
-            smooth_lambda,
-            specs,
-        }
+        Self { l2_lambda, smooth_lambda, specs }
     }
 
     /// Whether any penalty term is active (a positive λ and at least one NN).
@@ -1493,9 +1379,7 @@ impl NnRegularizer {
     /// `2·n_weights` penalty-gradient evaluations per network — forward/backward passes over
     /// the curvature grid, no model evaluation. The result is symmetrised. No-op when inactive.
     pub(crate) fn add_exact_packed_hessian(
-        &self,
-        theta: &[f64],
-        add: &mut dyn FnMut(usize, usize, f64),
+        &self, theta: &[f64], add: &mut dyn FnMut(usize, usize, f64),
     ) {
         if self.hessian_is_exact() {
             self.add_packed_hessian(theta, add);
@@ -1509,10 +1393,7 @@ impl NnRegularizer {
             spec.mapper.l2_weight_penalty_accum(
                 &w,
                 self.l2_lambda,
-                &mut PenaltySink {
-                    grad: None,
-                    hess: Some(&mut l2_add),
-                },
+                &mut PenaltySink { grad: None, hess: Some(&mut l2_add) },
             );
             let smooth_grad = |w: &[f64]| -> Vec<f64> {
                 let mut g = vec![0.0; n_w];
@@ -1520,10 +1401,7 @@ impl NnRegularizer {
                     w,
                     &spec.grid,
                     self.smooth_lambda,
-                    &mut PenaltySink {
-                        grad: Some(&mut g),
-                        hess: None,
-                    },
+                    &mut PenaltySink { grad: Some(&mut g), hess: None },
                 );
                 g
             };
@@ -1554,9 +1432,7 @@ impl NnRegularizer {
     }
 
     fn accumulate(
-        &self,
-        theta: &[f64],
-        mut grad: Option<&mut [f64]>,
+        &self, theta: &[f64], mut grad: Option<&mut [f64]>,
         mut hess: Option<&mut dyn FnMut(usize, usize, f64)>,
     ) -> f64 {
         let mut p = 0.0;
@@ -1569,16 +1445,10 @@ impl NnRegularizer {
                 .map(|h| move |i: usize, j: usize, v: f64| h(off + i, off + j, v));
             let mut sink = PenaltySink {
                 grad: grad.as_deref_mut().map(|g| &mut g[off..off + n_w]),
-                hess: hess_local
-                    .as_mut()
-                    .map(|h| h as &mut dyn FnMut(usize, usize, f64)),
+                hess: hess_local.as_mut().map(|h| h as &mut dyn FnMut(usize, usize, f64)),
             };
-            p += spec
-                .mapper
-                .l2_weight_penalty_accum(w, self.l2_lambda, &mut sink);
-            p += spec
-                .mapper
-                .curvature_penalty_accum(w, &spec.grid, self.smooth_lambda, &mut sink);
+            p += spec.mapper.l2_weight_penalty_accum(w, self.l2_lambda, &mut sink);
+            p += spec.mapper.curvature_penalty_accum(w, &spec.grid, self.smooth_lambda, &mut sink);
         }
         p
     }
@@ -1593,9 +1463,7 @@ mod tests {
     /// Deterministic pseudo-random weights/inputs (LCG) — no rand dependency, and
     /// the same stream on every platform so a bit-identity failure reproduces.
     fn lcg(seed: &mut u64) -> f64 {
-        *seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((*seed >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
     }
 
@@ -1719,10 +1587,7 @@ mod tests {
         // A single-output network: every weight.
         let one =
             MlpMapper::new(vec![2, 3, 1], Activation::Identity, Activation::Identity).unwrap();
-        assert_eq!(
-            one.weight_indices_for_output(0),
-            (0..13).collect::<Vec<_>>()
-        );
+        assert_eq!(one.weight_indices_for_output(0), (0..13).collect::<Vec<_>>());
     }
 
     /// ReLU activation in the hidden layer with a known mix of active /
@@ -1742,9 +1607,7 @@ mod tests {
     /// magnitudes keep bounded activations in their responsive range so the
     /// finite differences have clean signal.
     fn probe_weights(n: usize) -> Vec<f64> {
-        (0..n)
-            .map(|i| 0.1 * (i as f64).sin() + 0.05 * ((i * 7) as f64).cos())
-            .collect()
+        (0..n).map(|i| 0.1 * (i as f64).sin() + 0.05 * ((i * 7) as f64).cos()).collect()
     }
 
     /// Forward pass stopped at the output layer's pre-activation `z_L`, i.e.
@@ -1752,11 +1615,7 @@ mod tests {
     /// for what `jacobian_preactivation` claims to differentiate.
     fn forward_preactivation(mlp: &MlpMapper, x: &[f64], weights: &[f64]) -> Vec<f64> {
         let (pre, _post) = mlp.forward_cache(x, weights);
-        pre.last()
-            .expect("at least one layer")
-            .iter()
-            .copied()
-            .collect()
+        pre.last().expect("at least one layer").iter().copied().collect()
     }
 
     /// `jacobian_preactivation` must be the central FD of `z_L`, not of the
@@ -1867,9 +1726,8 @@ mod tests {
         let n_w = mlp.n_weights();
         // Deterministic non-trivial weights — small magnitudes keep tanh in
         // its linear regime so FD has clean signal.
-        let weights: Vec<f64> = (0..n_w)
-            .map(|i| 0.1 * (i as f64).sin() + 0.05 * ((i * 7) as f64).cos())
-            .collect();
+        let weights: Vec<f64> =
+            (0..n_w).map(|i| 0.1 * (i as f64).sin() + 0.05 * ((i * 7) as f64).cos()).collect();
         let x = vec![0.3, -0.7];
 
         let jac = mlp.jacobian(&x, &weights).unwrap();
@@ -1930,10 +1788,7 @@ mod tests {
     fn forward_rejects_mismatched_shapes() {
         let mlp =
             MlpMapper::new(vec![2, 3, 1], Activation::Identity, Activation::Identity).unwrap();
-        assert!(matches!(
-            mlp.forward(&[1.0], &[0.0; 13]),
-            Err(NnError::InputCountMismatch { .. })
-        ));
+        assert!(matches!(mlp.forward(&[1.0], &[0.0; 13]), Err(NnError::InputCountMismatch { .. })));
         assert!(matches!(
             mlp.forward(&[1.0, 2.0], &[0.0; 5]),
             Err(NnError::WeightCountMismatch { .. })
@@ -1980,13 +1835,7 @@ mod tests {
         NamedMlpMapper::new(
             mlp,
             vec!["WT".into(), "CRCL".into()],
-            vec![
-                "CL".into(),
-                "V1".into(),
-                "Q".into(),
-                "V2".into(),
-                "KA".into(),
-            ],
+            vec!["CL".into(), "V1".into(), "Q".into(), "V2".into(), "KA".into()],
         )
         .unwrap()
     }
@@ -2064,12 +1913,9 @@ mod tests {
     /// differ: centred origin feeds `0`, raw zero feeds `-center / scale`.
     #[test]
     fn forward_raw_reads_an_absent_input_as_raw_zero_under_normalization() {
-        let mapper = five_param_mapper()
-            .with_normalization(vec![70.0, 86.0], vec![12.0, 23.0])
-            .unwrap();
-        let weights: Vec<f64> = (0..mapper.n_weights())
-            .map(|k| (k as f64 * 0.7).sin())
-            .collect();
+        let mapper =
+            five_param_mapper().with_normalization(vec![70.0, 86.0], vec![12.0, 23.0]).unwrap();
+        let weights: Vec<f64> = (0..mapper.n_weights()).map(|k| (k as f64 * 0.7).sin()).collect();
         let explicit = HashMap::from([("WT".to_string(), 64.0), ("CRCL".to_string(), 0.0)]);
         let absent = HashMap::from([("WT".to_string(), 64.0)]);
         let centred = HashMap::from([("WT".to_string(), 64.0), ("CRCL".to_string(), 86.0)]);
@@ -2079,10 +1925,7 @@ mod tests {
         for k in 0..y_absent.len() {
             assert_eq!(y_absent[k].to_bits(), y_explicit[k].to_bits(), "output {k}");
         }
-        assert_ne!(
-            y_absent, y_centred,
-            "the fixture must tell the two readings apart"
-        );
+        assert_ne!(y_absent, y_centred, "the fixture must tell the two readings apart");
     }
 
     #[test]
@@ -2227,19 +2070,14 @@ mod invert_tests {
             // truncated `0.693_147` so it lands on that zero exactly (and so clippy's
             // `approx_constant` does not have to be silenced for a value that really
             // is ln 2).
-            (
-                Activation::Softplus,
-                &[1e-8, 1e-3, std::f64::consts::LN_2, 1.0, 10.0, 25.0, 400.0],
-            ),
+            (Activation::Softplus, &[1e-8, 1e-3, std::f64::consts::LN_2, 1.0, 10.0, 25.0, 400.0]),
             (Activation::Tanh, &[-0.95, 0.0, 0.5]),
             (Activation::Sigmoid, &[0.01, 0.5, 0.99]),
             (Activation::Exp, &[1e-6, 1.0, 500.0]),
         ];
         for (act, ys) in cases {
             for &y in *ys {
-                let z = act
-                    .invert(y)
-                    .unwrap_or_else(|| panic!("{:?} should invert {y}", act));
+                let z = act.invert(y).unwrap_or_else(|| panic!("{:?} should invert {y}", act));
                 assert_relative_eq!(act.apply(z), y, max_relative = 1e-9);
             }
         }
@@ -2309,9 +2147,7 @@ mod invert_tests {
     #[test]
     fn zeroed_output_weights_make_the_bias_the_whole_output() {
         let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
-        let mut w: Vec<f64> = (0..mlp.n_weights())
-            .map(|i| 0.3 * (i as f64).sin())
-            .collect();
+        let mut w: Vec<f64> = (0..mlp.n_weights()).map(|i| 0.3 * (i as f64).sin()).collect();
         for i in mlp.output_weight_range() {
             w[i] = 0.0;
         }
@@ -2339,9 +2175,7 @@ mod regularization_tests {
     /// Deterministic non-trivial weights, small magnitudes so tanh stays in a
     /// smooth regime (clean finite-difference signal).
     fn det_weights(n: usize) -> Vec<f64> {
-        (0..n)
-            .map(|i| 0.2 * (i as f64 * 0.7).sin() + 0.1 * (i as f64 * 1.3).cos())
-            .collect()
+        (0..n).map(|i| 0.2 * (i as f64 * 0.7).sin() + 0.1 * (i as f64 * 1.3).cos()).collect()
     }
 
     #[test]
@@ -2349,10 +2183,7 @@ mod regularization_tests {
         // 2→3→1: layer1 W=6 (0..6) b=3 (6..9); layer2 W=3 (9..12) b=1 (12).
         let mlp = MlpMapper::new(vec![2, 3, 1], Activation::Tanh, Activation::Identity).unwrap();
         assert_eq!(mlp.n_weights(), 13);
-        assert_eq!(
-            mlp.weight_param_indices(),
-            vec![0, 1, 2, 3, 4, 5, 9, 10, 11]
-        );
+        assert_eq!(mlp.weight_param_indices(), vec![0, 1, 2, 3, 4, 5, 9, 10, 11]);
     }
 
     #[test]
@@ -2371,17 +2202,9 @@ mod regularization_tests {
         let w = det_weights(mlp.n_weights());
         let lambda = 0.37;
         // Hand-sum over the weight indices only.
-        let expected: f64 = lambda
-            * mlp
-                .weight_param_indices()
-                .iter()
-                .map(|&i| w[i] * w[i])
-                .sum::<f64>();
-        assert_relative_eq!(
-            mlp.l2_weight_penalty_value(&w, lambda),
-            expected,
-            epsilon = 1e-12
-        );
+        let expected: f64 =
+            lambda * mlp.weight_param_indices().iter().map(|&i| w[i] * w[i]).sum::<f64>();
+        assert_relative_eq!(mlp.l2_weight_penalty_value(&w, lambda), expected, epsilon = 1e-12);
         // A large bias must not change the penalty (biases excluded).
         let mut w_big_bias = w.clone();
         w_big_bias[6] += 100.0; // a layer-1 bias index
@@ -2415,10 +2238,8 @@ mod regularization_tests {
     #[test]
     fn curvature_grid_skips_constant_and_narrow_inputs() {
         // Input 0 varies widely; input 1 is constant (sd=0 → no axis).
-        let vals = vec![
-            vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0],
-            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-        ];
+        let vals =
+            vec![vec![50.0, 60.0, 70.0, 80.0, 90.0, 100.0], vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0]];
         let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
         assert!(!grid.is_empty(), "wide input 0 must yield curvature nodes");
         // Every triple must hold input 1 fixed at its median (1.0) and vary only
@@ -2466,11 +2287,7 @@ mod regularization_tests {
         ];
         let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
         assert!(!grid.is_empty());
-        assert_relative_eq!(
-            mlp.curvature_penalty_value(&w, &grid, 1.0),
-            0.0,
-            epsilon = 1e-9
-        );
+        assert_relative_eq!(mlp.curvature_penalty_value(&w, &grid, 1.0), 0.0, epsilon = 1e-9);
     }
 
     #[test]
@@ -2538,11 +2355,7 @@ mod regularization_tests {
     fn median_of_sorted_handles_empty_odd_and_even() {
         assert_eq!(median_of_sorted(&[]), 0.0);
         assert_relative_eq!(median_of_sorted(&[1.0, 2.0, 9.0]), 2.0, epsilon = 1e-12);
-        assert_relative_eq!(
-            median_of_sorted(&[1.0, 2.0, 4.0, 9.0]),
-            3.0,
-            epsilon = 1e-12
-        );
+        assert_relative_eq!(median_of_sorted(&[1.0, 2.0, 4.0, 9.0]), 3.0, epsilon = 1e-12);
         // Single element is its own median.
         assert_relative_eq!(median_of_sorted(&[7.5]), 7.5, epsilon = 1e-12);
     }
@@ -2571,11 +2384,7 @@ mod regularization_tests {
         );
         let grid = CurvatureGrid::build(&vals, step);
         let nodes = &grid.axes()[0];
-        assert_eq!(
-            nodes.len(),
-            NN_SMOOTH_GRID_MAX_NODES,
-            "capped at the max node count"
-        );
+        assert_eq!(nodes.len(), NN_SMOOTH_GRID_MAX_NODES, "capped at the max node count");
         assert_relative_eq!(nodes[0][0], 0.0, epsilon = 1e-9);
         assert_relative_eq!(nodes[nodes.len() - 1][0], 2000.0, epsilon = 1e-6);
         // Uniform in between.
@@ -2589,11 +2398,7 @@ mod regularization_tests {
         let nodes = &g.axes()[0];
         let sd = (narrow[0].iter().map(|v| (v - 75.0).powi(2)).sum::<f64>() / 6.0).sqrt();
         assert!(nodes.len() < NN_SMOOTH_GRID_MAX_NODES);
-        assert_relative_eq!(
-            nodes[1][0] - nodes[0][0],
-            NN_SMOOTH_GRID_STEP_Z * sd,
-            epsilon = 1e-9
-        );
+        assert_relative_eq!(nodes[1][0] - nodes[0][0], NN_SMOOTH_GRID_STEP_Z * sd, epsilon = 1e-9);
     }
 
     /// A subject with no finite value for an input arrives as `NaN` (the reader's
@@ -2609,11 +2414,7 @@ mod regularization_tests {
         let g_clean = CurvatureGrid::build(&clean, NN_SMOOTH_GRID_STEP_Z);
         let g_dirty = CurvatureGrid::build(&dirty, NN_SMOOTH_GRID_STEP_Z);
         assert!(!g_clean.is_empty());
-        assert_eq!(
-            g_dirty.axes().len(),
-            g_clean.axes().len(),
-            "axis must survive"
-        );
+        assert_eq!(g_dirty.axes().len(), g_clean.axes().len(), "axis must survive");
         for (a, b) in g_dirty.axes()[0].iter().zip(&g_clean.axes()[0]) {
             assert_relative_eq!(a[0], b[0], epsilon = 1e-12);
         }
@@ -2713,10 +2514,8 @@ mod regularization_tests {
         );
         // The penalty is live on this axis (weights of order 1 keep tanh in
         // its curved band).
-        let w: Vec<f64> = det_weights(mapper.mlp().n_weights())
-            .into_iter()
-            .map(|v| 5.0 * v)
-            .collect();
+        let w: Vec<f64> =
+            det_weights(mapper.mlp().n_weights()).into_iter().map(|v| 5.0 * v).collect();
         assert!(mapper.mlp().curvature_penalty_value(&w, &grid, 1.0) > 1e-6);
     }
 
@@ -2776,10 +2575,7 @@ mod regularization_tests {
             }
             // The nodes are in z-space: nothing should look like a raw kilogram.
             for x in a {
-                assert!(
-                    x[0].abs() < 5.0 && x[1].abs() < 5.0,
-                    "raw-looking node {x:?}"
-                );
+                assert!(x[0].abs() < 5.0 && x[1].abs() < 5.0, "raw-looking node {x:?}");
             }
         }
         // Same weights, same inputs, same function → same penalty, and a
@@ -2787,26 +2583,17 @@ mod regularization_tests {
         // of order 1 so that z ∈ [−2, 2] lands in tanh's curved band (the tiny
         // `det_weights` keep the net nearly affine, which is the *other* way to
         // read zero curvature).
-        let w: Vec<f64> = det_weights(normed.mlp().n_weights())
-            .into_iter()
-            .map(|v| 5.0 * v)
-            .collect();
+        let w: Vec<f64> =
+            det_weights(normed.mlp().n_weights()).into_iter().map(|v| 5.0 * v).collect();
         let p_normed = normed.mlp().curvature_penalty_value(&w, &g_normed, 1.0);
         let p_plain = plain.mlp().curvature_penalty_value(&w, &g_plain, 1.0);
         assert_relative_eq!(p_normed, p_plain, max_relative = 1e-12);
-        assert!(
-            p_normed > 1e-6,
-            "penalty must be live in the responsive band: {p_normed}"
-        );
+        assert!(p_normed > 1e-6, "penalty must be live in the responsive band: {p_normed}");
         // …whereas the old raw-space grid, fed to the same network, sits in the
         // saturated tail: orders of magnitude smaller. This is the failure the
         // fix removes.
         let raw_vals: Vec<Vec<f64>> = (0..2)
-            .map(|i| {
-                raw.iter()
-                    .map(|&(w, c)| if i == 0 { w } else { c })
-                    .collect()
-            })
+            .map(|i| raw.iter().map(|&(w, c)| if i == 0 { w } else { c }).collect())
             .collect();
         let g_raw = CurvatureGrid::build(&raw_vals, NN_SMOOTH_GRID_STEP_Z);
         let p_raw = normed.mlp().curvature_penalty_value(&w, &g_raw, 1.0);
@@ -2824,10 +2611,8 @@ mod regularization_tests {
     fn curvature_penalty_hessian_matches_fd_of_gradient() {
         let mlp = MlpMapper::new(vec![2, 3, 2], Activation::Tanh, Activation::Identity).unwrap();
         let w = det_weights(mlp.n_weights());
-        let vals = vec![
-            vec![-1.5, -0.8, -0.2, 0.3, 0.9, 1.6],
-            vec![-1.2, -0.5, 0.0, 0.4, 1.1, 1.7],
-        ];
+        let vals =
+            vec![vec![-1.5, -0.8, -0.2, 0.3, 0.9, 1.6], vec![-1.2, -0.5, 0.0, 0.4, 1.1, 1.7]];
         let grid = CurvatureGrid::build(&vals, NN_SMOOTH_GRID_STEP_Z);
         assert!(!grid.is_empty());
         let lambda = 0.7;
@@ -2837,10 +2622,7 @@ mod regularization_tests {
         let mut hess = vec![vec![0.0; n]; n];
         let v = {
             let mut add = |i: usize, j: usize, x: f64| hess[i][j] += x;
-            let mut sink = PenaltySink {
-                grad: Some(&mut grad),
-                hess: Some(&mut add),
-            };
+            let mut sink = PenaltySink { grad: Some(&mut grad), hess: Some(&mut add) };
             mlp.curvature_penalty_accum(&w, &grid, lambda, &mut sink)
         };
         assert_relative_eq!(
@@ -2993,12 +2775,7 @@ mod regularizer_fit_tests {
     fn weight_block_sq_norm(model: &CompiledModel, theta: &[f64]) -> f64 {
         let nn = &model.covariate_nns[0];
         let w = &theta[nn.weights_offset..nn.weights_offset + nn.mapper.n_weights()];
-        nn.mapper
-            .mlp()
-            .weight_param_indices()
-            .iter()
-            .map(|&i| w[i] * w[i])
-            .sum()
+        nn.mapper.mlp().weight_param_indices().iter().map(|&i| w[i] * w[i]).sum()
     }
 
     /// λ = 0 must leave the regularizer inactive, its penalty exactly 0 and its
@@ -3017,10 +2794,7 @@ mod regularizer_fit_tests {
 
         let mut grad = vec![0.0; theta.len()];
         reg.add_packed_gradient(&theta, &mut grad);
-        assert!(
-            grad.iter().all(|&g| g == 0.0),
-            "λ = 0 gradient contribution must be exactly 0"
-        );
+        assert!(grad.iter().all(|&g| g == 0.0), "λ = 0 gradient contribution must be exactly 0");
     }
 
     /// The analytic penalty gradient must match central finite differences of
@@ -3110,20 +2884,11 @@ mod regularizer_fit_tests {
         let reg_l2 = NnRegularizer::build(&model, &population, &l2);
         let mut h = vec![vec![0.0; n]; n];
         reg_l2.add_packed_hessian(&theta, &mut |i, j, v| h[i][j] += v);
-        let weight_idx: std::collections::HashSet<usize> = nn
-            .mapper
-            .mlp()
-            .weight_param_indices()
-            .into_iter()
-            .map(|i| w_lo + i)
-            .collect();
+        let weight_idx: std::collections::HashSet<usize> =
+            nn.mapper.mlp().weight_param_indices().into_iter().map(|i| w_lo + i).collect();
         for i in 0..n {
             for j in 0..n {
-                let expect = if i == j && weight_idx.contains(&i) {
-                    2.0 * 2e-2
-                } else {
-                    0.0
-                };
+                let expect = if i == j && weight_idx.contains(&i) { 2.0 * 2e-2 } else { 0.0 };
                 assert_relative_eq!(h[i][j], expect, epsilon = 1e-15);
             }
         }
@@ -3279,14 +3044,9 @@ mod regularizer_fit_tests {
         const LAMBDA_BIG: f64 = 1000.0;
         let lambdas = [0.0, LAMBDA_MID, LAMBDA_BIG];
         let fits: Vec<(Vec<f64>, f64)> = lambdas.iter().map(|&l| fit_at(l)).collect();
-        let norms: Vec<f64> = fits
-            .iter()
-            .map(|(t, _)| weight_block_sq_norm(&model, t))
-            .collect();
-        let vars: Vec<f64> = fits
-            .iter()
-            .map(|(t, _)| cl_modulator_variance(&model, &population, t))
-            .collect();
+        let norms: Vec<f64> = fits.iter().map(|(t, _)| weight_block_sq_norm(&model, t)).collect();
+        let vars: Vec<f64> =
+            fits.iter().map(|(t, _)| cl_modulator_variance(&model, &population, t)).collect();
         let ofvs: Vec<f64> = fits.iter().map(|(_, o)| *o).collect();
         let (n0, n_mid, n_big) = (norms[0], norms[1], norms[2]);
         let (v0, v_mid, v_big) = (vars[0], vars[1], vars[2]);
@@ -3300,10 +3060,7 @@ mod regularizer_fit_tests {
 
         // (2) The baseline must have weights and spread worth removing, or every
         // check below is vacuous. Measured: ‖W‖² 9.7e4, var 1.91.
-        assert!(
-            n0 > 1.0,
-            "the λ=0 fit must leave a weight block for L2 to shrink (‖W‖² {n0:e})"
-        );
+        assert!(n0 > 1.0, "the λ=0 fit must leave a weight block for L2 to shrink (‖W‖² {n0:e})");
         const FLAT_VAR_MAX: f64 = 1e-3;
         assert!(
             v0 > 100.0 * FLAT_VAR_MAX,
@@ -3387,11 +3144,7 @@ mod regularizer_fit_tests {
         let l2_only = build(1e-2, 0.0);
         assert!(l2_only.is_active());
         let expected_l2 = mlp.l2_weight_penalty_value(w, 1e-2);
-        assert_relative_eq!(
-            l2_only.penalty_value(&theta),
-            expected_l2,
-            max_relative = 1e-12
-        );
+        assert_relative_eq!(l2_only.penalty_value(&theta), expected_l2, max_relative = 1e-12);
         let (_v, expected_l2_g) = mlp.l2_weight_penalty(w, 1e-2);
         let g_l2 = grad_of(&l2_only);
         for (i, e) in expected_l2_g.iter().enumerate() {
@@ -3402,10 +3155,7 @@ mod regularizer_fit_tests {
         let smooth_only = build(0.0, 1e-1);
         assert!(smooth_only.is_active());
         let p_smooth = smooth_only.penalty_value(&theta);
-        assert!(
-            p_smooth > 0.0,
-            "the fixture's network must have some curvature to penalize"
-        );
+        assert!(p_smooth > 0.0, "the fixture's network must have some curvature to penalize");
         let g_smooth = grad_of(&smooth_only);
 
         // --- Both together must equal the sum of the two acting alone: the

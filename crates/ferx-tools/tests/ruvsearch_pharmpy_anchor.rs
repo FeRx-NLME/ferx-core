@@ -46,9 +46,7 @@ struct Variant {
 }
 
 fn pharmpy(variant: &str) -> Variant {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(ANCHOR)
-        .join("pharmpy_ruvsearch.json");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(ANCHOR).join("pharmpy_ruvsearch.json");
     let text = std::fs::read_to_string(&path).expect("anchor json");
     let mut all: HashMap<String, Variant> = serde_json::from_str(&text).expect("anchor json");
     all.remove(variant).expect("variant")
@@ -71,10 +69,7 @@ fn run(dir: &Path, prescreen: bool) -> RuvsearchResult {
     run_ruvsearch(
         &config,
         &base,
-        RuvsearchRun {
-            dir: Some(dir.join("run")),
-            ..RuvsearchRun::default()
-        },
+        RuvsearchRun { dir: Some(dir.join("run")), ..RuvsearchRun::default() },
     )
     .expect("search")
 }
@@ -84,10 +79,7 @@ fn label(f: RuvFeature) -> String {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_cwres_prescreen_follows_pharmpys_trajectory() {
     let reference = pharmpy("all");
     assert!(reference.final_model_code.contains("EPS(1)*IPRED + EPS(2)"));
@@ -109,23 +101,11 @@ fn the_cwres_prescreen_follows_pharmpys_trajectory() {
             })
             .unwrap_or_else(|| panic!("no screened row for {}", row.model));
         let d = ours.cwres_dofv.expect("screened dOFV");
-        eprintln!(
-            "screen {:14} pharmpy {:8.3} ferx {:8.3}",
-            row.model, row.dofv, d
-        );
-        assert!(
-            (d - row.dofv).abs() < 1.0,
-            "{}: ferx dOFV {d} vs Pharmpy {}",
-            row.model,
-            row.dofv
-        );
+        eprintln!("screen {:14} pharmpy {:8.3} ferx {:8.3}", row.model, row.dofv, d);
+        assert!((d - row.dofv).abs() < 1.0, "{}: ferx dOFV {d} vs Pharmpy {}", row.model, row.dofv);
     }
     // The same pick, refitted to the same objective, accepted.
-    let refit = result
-        .rows
-        .iter()
-        .find(|r| !r.screened && r.iteration == 1)
-        .expect("a refit");
+    let refit = result.rows.iter().find(|r| !r.screened && r.iteration == 1).expect("a refit");
     assert_eq!(refit.feature, Some(RuvFeature::Combined));
     assert!(refit.selected);
     assert!(
@@ -144,27 +124,16 @@ fn the_cwres_prescreen_follows_pharmpys_trajectory() {
             })
             .unwrap_or_else(|| panic!("no screened row for {} in iteration 2", row.model));
         let d = ours.cwres_dofv.expect("screened dOFV");
-        assert!(
-            (d - row.dofv).abs() < 1.0,
-            "{}: {d} vs {}",
-            row.model,
-            row.dofv
-        );
+        assert!((d - row.dofv).abs() < 1.0, "{}: {d} vs {}", row.model, row.dofv);
         assert!(d < result.options.cutoff());
     }
-    assert!(result
-        .rows
-        .iter()
-        .all(|r| !(r.iteration == 2 && !r.screened)));
+    assert!(result.rows.iter().all(|r| !(r.iteration == 2 && !r.screened)));
     assert_eq!(result.features, vec![RuvFeature::Combined]);
     assert!((result.final_ofv - reference.final_ofv).abs() < 0.01);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn the_full_refit_lands_on_pharmpys_refit_and_selects_within_the_pair() {
     let reference = pharmpy("all");
     let dir = tempfile::tempdir().unwrap();
@@ -187,17 +156,10 @@ fn the_full_refit_lands_on_pharmpys_refit_and_selects_within_the_pair() {
         .map(|r| r.feature.unwrap())
         .collect();
     assert!(
-        matches!(
-            selected.as_slice(),
-            [RuvFeature::Power] | [RuvFeature::Combined]
-        ),
+        matches!(selected.as_slice(), [RuvFeature::Power] | [RuvFeature::Combined]),
         "{selected:?}"
     );
     assert_eq!(result.features.len(), 1);
     // Whichever of the pair wins, the search ends on it.
-    assert!(result
-        .rows
-        .iter()
-        .filter(|r| r.iteration == 2)
-        .all(|r| !r.selected));
+    assert!(result.rows.iter().filter(|r| r.iteration == 2).all(|r| !r.selected));
 }

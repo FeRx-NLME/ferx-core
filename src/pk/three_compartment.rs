@@ -18,12 +18,7 @@ use crate::types::DoseEvent;
 /// below are the only remaining f64 callers).
 #[inline]
 fn macro_rates_three_cpt(
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
+    cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
 ) -> (f64, f64, f64, f64, f64) {
     crate::sens::three_cpt::macro_rates_three_cpt_g::<f64>(cl, v1, q2, v2, q3, v3)
 }
@@ -32,14 +27,7 @@ fn macro_rates_three_cpt(
 /// C(t) = A*exp(-alpha*t) + B*exp(-beta*t) + G*exp(-gamma*t)
 #[inline]
 pub fn three_cpt_iv_bolus(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
 ) -> f64 {
     three_cpt_iv_bolus_g::<f64>(dose.amt, t, cl, v1, q2, v2, q3, v3)
 }
@@ -47,41 +35,15 @@ pub fn three_cpt_iv_bolus(
 /// Three-compartment constant-rate IV infusion
 #[inline]
 pub fn three_cpt_infusion(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
 ) -> f64 {
-    three_cpt_infusion_g::<f64>(
-        dose.rate,
-        dose.duration,
-        dose.amt,
-        t,
-        cl,
-        v1,
-        q2,
-        v2,
-        q3,
-        v3,
-    )
+    three_cpt_infusion_g::<f64>(dose.rate, dose.duration, dose.amt, t, cl, v1, q2, v2, q3, v3)
 }
 
 /// Three-compartment oral absorption with bioavailability
 #[inline]
 pub fn three_cpt_oral_f(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
-    ka: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64,
     f_bio: f64,
 ) -> f64 {
     three_cpt_oral_g::<f64>(dose.amt, t, cl, v1, q2, v2, q3, v3, ka, f_bio)
@@ -89,15 +51,7 @@ pub fn three_cpt_oral_f(
 
 /// Three-compartment oral absorption (F=1.0 default)
 pub fn three_cpt_oral(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
-    ka: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64,
 ) -> f64 {
     three_cpt_oral_f(dose, t, cl, v1, q2, v2, q3, v3, ka, 1.0)
 }
@@ -111,14 +65,7 @@ pub fn three_cpt_oral(
 /// Three-compartment IV bolus at steady state.
 #[inline]
 pub fn three_cpt_iv_bolus_ss(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
 ) -> f64 {
     three_cpt_iv_bolus_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q2, v2, q3, v3)
 }
@@ -127,14 +74,7 @@ pub fn three_cpt_iv_bolus_ss(
 /// overlapping pulses (`T_inf > II`). Evaluated at phase `t ∈ [0, II)`.
 #[inline]
 pub fn three_cpt_infusion_ss(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
 ) -> f64 {
     three_cpt_infusion_ss_g::<f64>(
         dose.rate,
@@ -154,15 +94,7 @@ pub fn three_cpt_infusion_ss(
 /// Three-compartment oral absorption at steady state (with bioavailability).
 #[inline]
 pub fn three_cpt_oral_f_ss(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
-    ka: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64,
     f_bio: f64,
 ) -> f64 {
     three_cpt_oral_ss_g::<f64>(dose.amt, t, dose.ii, cl, v1, q2, v2, q3, v3, ka, f_bio)
@@ -170,15 +102,7 @@ pub fn three_cpt_oral_f_ss(
 
 /// Three-compartment oral absorption at steady state (F = 1).
 pub fn three_cpt_oral_ss(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
-    ka: f64,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64,
 ) -> f64 {
     three_cpt_oral_f_ss(dose, t, cl, v1, q2, v2, q3, v3, ka, 1.0)
 }
@@ -191,14 +115,7 @@ pub fn three_cpt_oral_ss(
 ///   [ −(α−k31)/(ab·ag)·e^{-αt} + (β−k31)/(ab·bg)·e^{-βt} − (γ−k31)/(ag·bg)·e^{-γt} ]
 /// Peripheral 2 (V3): swap k31↔k21 and q2/v2 → q3/v3.
 pub(crate) fn three_cpt_iv_peripherals(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
 ) -> [f64; 2] {
     if tau < 0.0 {
         return [0.0; 2];
@@ -216,10 +133,7 @@ pub(crate) fn three_cpt_iv_peripherals(
     };
     let mode = |lam| crate::sens::one_cpt::mode_dose(dose, lam, tau);
     use crate::sens::one_cpt::modal_sum;
-    [
-        q2 / (v1 * v2) * modal_sum(&m2, mode),
-        q3 / (v1 * v3) * modal_sum(&m3, mode),
-    ]
+    [q2 / (v1 * v2) * modal_sum(&m2, mode), q3 / (v1 * v3) * modal_sum(&m3, mode)]
 }
 
 /// The modes `(c, λ)` of each peripheral's response to a unit central impulse (the factor
@@ -228,12 +142,7 @@ pub(crate) fn three_cpt_iv_peripherals(
 /// inter-compartmental clearance.
 #[allow(clippy::type_complexity)]
 fn peripheral_modes(
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
+    cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
 ) -> Option<[[(f64, f64); 3]; 2]> {
     let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
     let (ab, ag, bg) = (alpha - beta, alpha - gamma, beta - gamma);
@@ -260,15 +169,7 @@ fn peripheral_modes(
 /// Each exp term gains a 1/(1−e^(−λ·II)) factor at steady state. Written through the
 /// Bateman function, which is smooth where `ka` meets an eigenvalue.
 pub(crate) fn three_cpt_oral_peripherals(
-    dose: &DoseEvent,
-    tau: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
-    ka: f64,
+    dose: &DoseEvent, tau: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64, ka: f64,
     f_bio: f64,
 ) -> [f64; 2] {
     // This function implements the bolus-only oral formula (depot → central → peripherals).
@@ -308,41 +209,19 @@ pub(crate) fn three_cpt_oral_peripherals(
         }
     };
     use crate::sens::one_cpt::modal_sum;
-    [
-        q2 / v2 * d * modal_sum(&m2, bateman),
-        q3 / v3 * d * modal_sum(&m3, bateman),
-    ]
+    [q2 / v2 * d * modal_sum(&m2, bateman), q3 / v3 * d * modal_sum(&m3, bateman)]
 }
 
 /// Predict concentration from a single dose at elapsed time t using 3-cmt model.
 #[cfg(test)]
 pub(crate) fn three_cpt_predict(
-    dose: &DoseEvent,
-    t: f64,
-    cl: f64,
-    v1: f64,
-    q2: f64,
-    v2: f64,
-    q3: f64,
-    v3: f64,
-    ka: Option<f64>,
-    f_bio: Option<f64>,
+    dose: &DoseEvent, t: f64, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
+    ka: Option<f64>, f_bio: Option<f64>,
 ) -> f64 {
     if dose.is_infusion() {
         three_cpt_infusion(dose, t, cl, v1, q2, v2, q3, v3)
     } else if let Some(ka_val) = ka {
-        three_cpt_oral_f(
-            dose,
-            t,
-            cl,
-            v1,
-            q2,
-            v2,
-            q3,
-            v3,
-            ka_val,
-            f_bio.unwrap_or(1.0),
-        )
+        three_cpt_oral_f(dose, t, cl, v1, q2, v2, q3, v3, ka_val, f_bio.unwrap_or(1.0))
     } else {
         three_cpt_iv_bolus(dose, t, cl, v1, q2, v2, q3, v3)
     }
@@ -741,9 +620,8 @@ mod tests {
             assert!(dose.duration > ii, "fixture must overlap");
             for &t in &[0.0, 0.3 * ii, 0.5 * ii, 0.9 * ii, 0.999 * ii] {
                 let cf = three_cpt_infusion_ss(&dose, t, CL, V1, Q2, V2, Q3, V3);
-                let num = big_sum(t, ii, &|tt| {
-                    three_cpt_infusion(&single, tt, CL, V1, Q2, V2, Q3, V3)
-                });
+                let num =
+                    big_sum(t, ii, &|tt| three_cpt_infusion(&single, tt, CL, V1, Q2, V2, Q3, V3));
                 assert_relative_eq!(cf, num, epsilon = 1e-6, max_relative = 1e-5);
             }
         }

@@ -234,11 +234,7 @@ pub(crate) use simulate::{correlated_residual_draw, draw_correlations, SimClasse
 /// backs the TV-vs-no-TV gap assertions in the regression tests.
 #[cfg(test)]
 pub(crate) fn model_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    pk_params: &PkParams,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, pk_params: &PkParams, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {
     let mut preds = if let Some(ref ode_spec) = model.ode_spec {
         pk::compute_predictions_ode(ode_spec, subject, &pk_params.values, theta, eta)

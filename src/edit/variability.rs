@@ -98,10 +98,8 @@ pub(crate) fn read(text: &ModelText) -> Result<VariabilityText, String> {
             }
             None => {
                 let eta: Vec<&String> = mentioned.iter().filter(|m| etas.contains(m)).collect();
-                let kappa: Vec<&String> = mentioned
-                    .iter()
-                    .filter(|m| kappa_names.contains(m))
-                    .collect();
+                let kappa: Vec<&String> =
+                    mentioned.iter().filter(|m| kappa_names.contains(m)).collect();
                 (
                     (eta.len() == 1).then(|| eta[0].clone()),
                     (kappa.len() == 1).then(|| kappa[0].clone()),
@@ -109,19 +107,7 @@ pub(crate) fn read(text: &ModelText) -> Result<VariabilityText, String> {
                 )
             }
         };
-        parameters.push(ParameterVariability {
-            name,
-            eta,
-            kappa,
-            canonical,
-            mentions: mentioned,
-        });
+        parameters.push(ParameterVariability { name, eta, kappa, canonical, mentions: mentioned });
     }
-    Ok(VariabilityText {
-        parameters,
-        omegas,
-        omega_blocks,
-        kappas,
-        kappa_blocks,
-    })
+    Ok(VariabilityText { parameters, omegas, omega_blocks, kappas, kappa_blocks })
 }

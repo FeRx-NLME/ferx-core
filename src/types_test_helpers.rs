@@ -15,10 +15,7 @@ pub(crate) fn bare_params(omega: OmegaMatrix) -> ModelParameters {
         theta_fixed: vec![false; 2],
         omega,
         omega_fixed: vec![false],
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
+        sigma: SigmaVector { values: vec![0.05], names: vec!["PROP_ERR".into()] },
         sigma_fixed: vec![false],
         omega_iov: None,
         kappa_fixed: Vec::new(),
@@ -160,11 +157,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
         indiv_param_names: vec!["CL".into()],
         indiv_param_partials: IndivParamPartials::empty(),
         // Analytical models populate tv_fn; ODE models leave it None.
-        tv_fn: if with_ode {
-            None
-        } else {
-            Some(Box::new(|_t, _c| vec![1.0]))
-        },
+        tv_fn: if with_ode { None } else { Some(Box::new(|_t, _c| vec![1.0])) },
         pk_indices: vec![],
         eta_map: vec![],
         pk_idx_f64: vec![],
@@ -188,10 +181,7 @@ fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> Compi
             theta_lower: vec![0.0],
             theta_upper: vec![f64::INFINITY],
             theta_fixed: vec![false],
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["EPS".into()],
-            },
+            sigma: SigmaVector { values: vec![0.1], names: vec!["EPS".into()] },
             ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
                 &[0.1],
                 vec!["ETA_CL".into()],
@@ -498,11 +488,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
                 individual_param_name: "V".into(),
             },
         ],
-        theta_transform: vec![
-            ThetaTransform::Log,
-            ThetaTransform::Log,
-            ThetaTransform::Log,
-        ],
+        theta_transform: vec![ThetaTransform::Log, ThetaTransform::Log, ThetaTransform::Log],
         sigma_types: vec![SigmaType::Proportional],
         cov_eigenvalues: Some(vec![1.0, 0.5, 0.2]),
         cov_condition_number: Some(5.0),
@@ -589,11 +575,7 @@ pub(crate) fn param_time_straddle_subject(kind: ParamTimeStraddle) -> Subject {
             s.pk_only_times = vec![moved];
             s.pk_only_raw_times = vec![24.0];
             s.pk_only_occasions = vec![1];
-            (
-                vec![6.0, 12.0, 30.0, 36.0],
-                vec![6.0, 12.0, 30.0, 36.0],
-                vec![1, 1, 2, 2],
-            )
+            (vec![6.0, 12.0, 30.0, 36.0], vec![6.0, 12.0, 30.0, 36.0], vec![1, 1, 2, 2])
         }
         ParamTimeStraddle::Reset => {
             s.doses = vec![bolus(0.0), bolus(50.0), bolus(74.0)];

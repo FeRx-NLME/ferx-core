@@ -22,10 +22,7 @@ use ferx_core::types::{DoseEvent, Subject};
 /// Centralizing the full-field literal means a new `Subject` field is added in
 /// one place here rather than in every integration-test file.
 pub fn subject(
-    id: &str,
-    doses: Vec<DoseEvent>,
-    obs_times: Vec<f64>,
-    observations: Vec<f64>,
+    id: &str, doses: Vec<DoseEvent>, obs_times: Vec<f64>, observations: Vec<f64>,
     obs_cmts: Vec<usize>,
 ) -> Subject {
     let n = obs_times.len();
@@ -52,18 +49,9 @@ pub fn tte_pop_from_pairs(data: &[(f64, u8)]) -> ferx_core::types::Population {
         .iter()
         .enumerate()
         .map(|(i, &(t, dv))| {
-            let event_type = if dv == 1 {
-                EventType::Exact
-            } else {
-                EventType::RightCensored
-            };
+            let event_type = if dv == 1 { EventType::Exact } else { EventType::RightCensored };
             let mut s = subject(&format!("{}", i + 1), vec![], vec![], vec![], vec![]);
-            s.obs_records = vec![ObsRecord::Event {
-                time: t,
-                event_type,
-                entry_time: 0.0,
-                cmt: 2,
-            }];
+            s.obs_records = vec![ObsRecord::Event { time: t, event_type, entry_time: 0.0, cmt: 2 }];
             s
         })
         .collect();
@@ -161,10 +149,7 @@ pub fn binary_pop(subjects: &[(f64, Vec<(f64, u8)>)], cmt: usize) -> ferx_core::
 /// and no other; tightening the reference spacing or widening the band past that point
 /// fails here, by name, instead of quietly letting two windows swap.
 pub fn assert_window_aucs_match(
-    windows_in: &dyn Fn((f64, f64)) -> usize,
-    refs: &[f64],
-    tol: f64,
-    label: &str,
+    windows_in: &dyn Fn((f64, f64)) -> usize, refs: &[f64], tol: f64, label: &str,
 ) {
     let band_of = |r: f64| (r * (1.0 - tol), r * (1.0 + tol));
     for (i, &a) in refs.iter().enumerate() {
@@ -177,11 +162,7 @@ pub fn assert_window_aucs_match(
             );
         }
     }
-    assert_eq!(
-        windows_in((0.0, f64::MAX)),
-        refs.len(),
-        "{label}: number of realized windows"
-    );
+    assert_eq!(windows_in((0.0, f64::MAX)), refs.len(), "{label}: number of realized windows");
     for (i, &r) in refs.iter().enumerate() {
         assert_eq!(
             windows_in(band_of(r)),
@@ -194,14 +175,9 @@ pub fn assert_window_aucs_match(
 /// The number of realized windows `res` scores in its `auc_target` band.
 pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
     let n_windows = res.decisions.len() - 1;
-    let attain = res.metrics[0]
-        .auc_target_attainment
-        .expect("auc_target declared");
+    let attain = res.metrics[0].auc_target_attainment.expect("auc_target declared");
     let n = attain * n_windows as f64;
-    assert!(
-        (n - n.round()).abs() < 1e-9,
-        "attainment {attain} is k/{n_windows}"
-    );
+    assert!((n - n.round()).abs() < 1e-9, "attainment {attain} is k/{n_windows}");
     n.round() as usize
 }
 
@@ -216,8 +192,7 @@ pub fn windows_in_band(res: &ferx_core::AdaptiveSimulationResult) -> usize {
 /// η only: on an IOV model κ is still drawn, so the run is not the typical-value patient
 /// there. None of its callers (the vanco, vanco-loading and vanco-interval anchors) has κ.
 pub fn typical_value_etas(
-    model: &ferx_core::CompiledModel,
-    pop: &ferx_core::types::Population,
+    model: &ferx_core::CompiledModel, pop: &ferx_core::types::Population,
 ) -> ferx_core::SuppliedEtas {
     let ids: Vec<String> = pop.subjects.iter().map(|s| s.id.clone()).collect();
     let n = ids.len();
@@ -231,8 +206,7 @@ pub fn typical_value_etas(
 
 /// Run `spec` at [`typical_value_etas`]. Seed 1, as every kit run uses.
 pub fn simulate_from_spec_at_typical_value(
-    model: &ferx_core::CompiledModel,
-    pop: &ferx_core::types::Population,
+    model: &ferx_core::CompiledModel, pop: &ferx_core::types::Population,
     spec: &ferx_core::sim::adaptive::AdaptiveDosingSpec,
 ) -> ferx_core::AdaptiveSimulationResult {
     let etas = typical_value_etas(model, pop);

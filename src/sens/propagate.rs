@@ -102,13 +102,7 @@ pub(crate) fn dose_override_g<T: PkNum>(cl: T, v: T) -> Option<T> {
     } else {
         None
     };
-    c.map(|c| {
-        if c.is_nan() {
-            crate::sens::one_cpt::nan_jet(cl * v)
-        } else {
-            T::from_f64(c)
-        }
-    })
+    c.map(|c| if c.is_nan() { crate::sens::one_cpt::nan_jet(cl * v) } else { T::from_f64(c) })
 }
 
 /// [`cl_or_v_degenerate`] on the values, through the branch API (#2786): a recording type
@@ -167,13 +161,7 @@ pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: 
 /// Mirror of `crate::pk::event_driven::propagate_one_cpt_oral`; the depot-driven terms are
 /// the Bateman function, one smooth function through `ka = ke` (`bateman`).
 pub fn propagate_one_cpt_oral_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    cl: T,
-    v: T,
-    ka: T,
-    rate_central: T,
-    rate_depot: T,
+    state: &mut [T], dt: T, cl: T, v: T, ka: T, rate_central: T, rate_depot: T,
 ) {
     if skip_step_on_cl_v(state, cl, v, &[rate_central, rate_depot])
         || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
@@ -239,24 +227,14 @@ pub fn two_cpt_eigen_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEige
         return None;
     }
     let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
-    Some(TwoCptEigen {
-        alpha,
-        beta,
-        k10: cl / v1,
-        k12: q / v1,
-        k21,
-    })
+    Some(TwoCptEigen { alpha, beta, k10: cl / v1, k12: q / v1, k21 })
 }
 
 /// 2-cpt IV/central propagation over `dt` from **precomputed** eigendata — the
 /// single source of the 2-cpt eigenmode formula, shared by the inline wrapper and
 /// the cached walk path.
 pub fn propagate_two_cpt_core_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    e: &TwoCptEigen<T>,
-    rate_central: T,
-    rate_periph: T,
+    state: &mut [T], dt: T, e: &TwoCptEigen<T>, rate_central: T, rate_periph: T,
 ) {
     let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
     let dtt = dt;
@@ -301,14 +279,7 @@ pub fn propagate_two_cpt_core_g<T: PkNum>(
 /// eigendata once via [`two_cpt_eigen_g`] and calls [`propagate_two_cpt_core_g`].
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_two_cpt_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    rate_central: T,
-    rate_periph: T,
+    state: &mut [T], dt: T, cl: T, v1: T, q: T, v2: T, rate_central: T, rate_periph: T,
 ) {
     if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph]) {
         return;
@@ -328,12 +299,7 @@ pub fn propagate_two_cpt_g<T: PkNum>(
 /// 2-cpt oral eigenmode + forced-response formula. `ka` is absorption; `rate_central`
 /// / `rate_depot` are the #350/#400 infusion inputs.
 pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    e: &TwoCptEigen<T>,
-    ka: T,
-    rate_central: T,
-    rate_periph1: T,
+    state: &mut [T], dt: T, e: &TwoCptEigen<T>, ka: T, rate_central: T, rate_periph1: T,
     rate_depot: T,
 ) {
     let (alpha, beta, k10, k12, k21) = (e.alpha, e.beta, e.k10, e.k12, e.k21);
@@ -359,11 +325,7 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
 
     let denom = beta - alpha;
     let (c1, c2) = if k12.br_abs_lt(1e-30) || denom.br_abs_lt(1e-30) {
-        let kk = if k12.br_abs_lt(1e-30) {
-            T::from_f64(1e-30)
-        } else {
-            k12
-        };
+        let kk = if k12.br_abs_lt(1e-30) { T::from_f64(1e-30) } else { k12 };
         let s_homog = a_p_0 / kk;
         (s_homog * T::from_f64(0.5), s_homog * T::from_f64(0.5))
     } else {
@@ -434,15 +396,7 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
 /// 2-cpt oral propagator computing its eigendata inline (the dual-walk wrapper).
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_two_cpt_oral_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    cl: T,
-    v1: T,
-    q: T,
-    v2: T,
-    ka: T,
-    rate_central: T,
-    rate_periph1: T,
+    state: &mut [T], dt: T, cl: T, v1: T, q: T, v2: T, ka: T, rate_central: T, rate_periph1: T,
     rate_depot: T,
 ) {
     if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph1, rate_depot])
@@ -492,12 +446,7 @@ pub struct ThreeCptEigen<T: PkNum> {
 
 /// Compute the 3-cpt eigendata, or `None` for degenerate params.
 pub fn three_cpt_eigen_g<T: PkNum>(
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    cl: T, v1: T, q2: T, v2: T, q3: T, v3: T,
 ) -> Option<ThreeCptEigen<T>> {
     if cl_or_v_degenerate_g(cl, v1)
         || v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
@@ -549,34 +498,21 @@ fn build_three_cpt_mode_g<T: PkNum>(mu: T, k12: T, k13: T, k21: T, k31: T) -> Th
 /// state's free evolution, the Bateman function `B(μ, ka, dt)` for a depot's drain.
 #[inline]
 fn apply_three_cpt_mode_g<T: PkNum>(
-    m: &ThreeCptModeG<T>,
-    c: T,
-    p1: T,
-    p2: T,
-    decay: T,
+    m: &ThreeCptModeG<T>, c: T, p1: T, p2: T, decay: T,
 ) -> (T, T, T) {
     if m.norm.br_abs_lt(1e-30) {
         return (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0));
     }
     let proj = m.w[0] * c + m.w[1] * p1 + m.w[2] * p2;
     let coef = proj / m.norm;
-    (
-        coef * m.v[0] * decay,
-        coef * m.v[1] * decay,
-        coef * m.v[2] * decay,
-    )
+    (coef * m.v[0] * decay, coef * m.v[1] * decay, coef * m.v[2] * decay)
 }
 
 /// 3-cpt IV/central propagation from **precomputed** eigendata — the single source
 /// of the 3-cpt eigenmode formula. Spectral decomposition along (α, β, γ) with the
 /// steady-state + homogeneous pattern for constant infusion.
 pub fn propagate_three_cpt_core_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    e: &ThreeCptEigen<T>,
-    rate_central: T,
-    rate_periph1: T,
-    rate_periph2: T,
+    state: &mut [T], dt: T, e: &ThreeCptEigen<T>, rate_central: T, rate_periph1: T, rate_periph2: T,
 ) {
     let (cl, v1, v2, q2, v3, q3) = (e.cl, e.v1, e.v2, e.q2, e.v3, e.q3);
 
@@ -605,17 +541,8 @@ pub fn propagate_three_cpt_core_g<T: PkNum>(
 /// Generic mirror of `crate::pk::event_driven::propagate_three_cpt`.
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_three_cpt_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
-    rate_central: T,
-    rate_periph1: T,
-    rate_periph2: T,
+    state: &mut [T], dt: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, rate_central: T,
+    rate_periph1: T, rate_periph2: T,
 ) {
     if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph1, rate_periph2]) {
         return;
@@ -634,14 +561,8 @@ pub fn propagate_three_cpt_g<T: PkNum>(
 /// 3-cpt oral propagation from **precomputed** eigendata — the single source of the
 /// 3-cpt oral eigenmode + depot forced-response formula.
 pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    e: &ThreeCptEigen<T>,
-    ka: T,
-    rate_central: T,
-    rate_periph1: T,
-    rate_periph2: T,
-    rate_depot: T,
+    state: &mut [T], dt: T, e: &ThreeCptEigen<T>, ka: T, rate_central: T, rate_periph1: T,
+    rate_periph2: T, rate_depot: T,
 ) {
     let (k10, k12, k13, k21, k31) = (e.k10, e.k12, e.k13, e.k21, e.k31);
 
@@ -695,11 +616,7 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
             && k21.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30)
             && k31.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30)
         {
-            (
-                rate_depot / k10,
-                k12 * rate_depot / (k21 * k10),
-                k13 * rate_depot / (k31 * k10),
-            )
+            (rate_depot / k10, k12 * rate_depot / (k21 * k10), k13 * rate_depot / (k31 * k10))
         } else {
             (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0))
         };
@@ -725,26 +642,11 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
 /// 3-cpt oral propagator computing its eigendata inline (the dual-walk wrapper).
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_three_cpt_oral_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
-    ka: T,
-    rate_central: T,
-    rate_periph1: T,
-    rate_periph2: T,
-    rate_depot: T,
+    state: &mut [T], dt: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, rate_central: T,
+    rate_periph1: T, rate_periph2: T, rate_depot: T,
 ) {
-    if skip_step_on_cl_v(
-        state,
-        cl,
-        v1,
-        &[rate_central, rate_periph1, rate_periph2, rate_depot],
-    ) || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph1, rate_periph2, rate_depot])
+        || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
     {
         return;
     }
@@ -799,13 +701,7 @@ impl EigenCacheG {
     /// 3-cpt eigendata for these params, computed once and reused while the param
     /// values are unchanged. `None` for degenerate params.
     pub fn three_cpt(
-        &mut self,
-        cl: f64,
-        v1: f64,
-        q2: f64,
-        v2: f64,
-        q3: f64,
-        v3: f64,
+        &mut self, cl: f64, v1: f64, q2: f64, v2: f64, q3: f64, v3: f64,
     ) -> Option<ThreeCptEigen<f64>> {
         let key = [cl, v1, q2, v2, q3, v3];
         if let Some((k, e)) = self.three {
@@ -878,10 +774,7 @@ fn walk_supports(pk_model: PkModel) -> bool {
 
 #[inline]
 fn pk_for_g<T: PkNum>(
-    ev: Event,
-    pk_at_dose: &[PkDual<T>],
-    pk_at_obs: &[PkDual<T>],
-    pk_at_pk_only: &[PkDual<T>],
+    ev: Event, pk_at_dose: &[PkDual<T>], pk_at_obs: &[PkDual<T>], pk_at_pk_only: &[PkDual<T>],
 ) -> PkDual<T> {
     match ev.kind {
         EventKind::DoseRecord | EventKind::Dose => pk_at_dose[ev.orig_idx],
@@ -904,10 +797,7 @@ fn pk_for_g<T: PkNum>(
 /// models #1073 is about.
 #[inline]
 fn record_pk_at_g<T: PkNum>(
-    ev: Event,
-    pk_at_dose: &[PkDual<T>],
-    pk_at_obs: &[PkDual<T>],
-    pk_at_pk_only: &[PkDual<T>],
+    ev: Event, pk_at_dose: &[PkDual<T>], pk_at_obs: &[PkDual<T>], pk_at_pk_only: &[PkDual<T>],
 ) -> PkDual<T> {
     match ev.kind {
         EventKind::DoseRecord => pk_at_dose[ev.orig_idx],
@@ -942,15 +832,9 @@ fn record_pk_at_g<T: PkNum>(
 /// ([`propagate_bounds_g`]) and an observation's reading ([`obs_group_reading`]).
 #[allow(clippy::too_many_arguments)]
 fn collect_breaks<T: PkNum>(
-    lo: Option<f64>,
-    hi: Option<f64>,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
-    dose_lag_dual: &[T],
-    dose_inf_dual: &[Option<(T, T)>],
-    reset_floor: f64,
-    index: &crate::dosing::DoseIndex,
-    extra_moving: &[(f64, T)],
+    lo: Option<f64>, hi: Option<f64>, doses: &[DoseEvent], dose_lagtimes: &[f64],
+    dose_lag_dual: &[T], dose_inf_dual: &[Option<(T, T)>], reset_floor: f64,
+    index: &crate::dosing::DoseIndex, extra_moving: &[(f64, T)],
 ) -> Vec<(f64, T, BrkKind)> {
     // Dual clock position of dose `k`'s arrival, `τ_k = t_k + ALAG`. With an estimated
     // lagtime this boundary **moves**: `dose_lag_dual[k]` carries `∂ALAG/∂(θ,η)`, so the
@@ -1204,18 +1088,13 @@ fn propagate_bounds_g<T: PkNum>(
             }
         }
         let group: Vec<usize> = if coincident {
-            (0..moving_bounds.len())
-                .filter(|&i| (moving_bounds[i].0 - w[1]).abs() < 1e-9)
-                .collect()
+            (0..moving_bounds.len()).filter(|&i| (moving_bounds[i].0 - w[1]).abs() < 1e-9).collect()
         } else {
             Vec::new()
         };
         if group.len() < 2 {
             let (a, b) = (dual_pos(w[0]), dual_pos(w[1]));
-            match walked
-                .iter()
-                .find(|we| we.start <= w[0] && w[1] <= we.until)
-            {
+            match walked.iter().find(|we| we.start <= w[0] && w[1] <= we.until) {
                 Some(we) => walk_cut(state, a, b, we, pk, pk_model, rates),
                 None => apply_step_g(state, b - a, pk, pk_model, rates),
             }
@@ -1293,12 +1172,8 @@ pub(crate) struct WalkedEnd<T> {
 /// window this does not walk) lies past this one's arrival, inside its span. Anything else keeps
 /// its end as a break, as before.
 fn walked_ends<T: PkNum>(
-    subject: &Subject,
-    schedule: &EventSchedule,
-    eff_doses: &[DoseEvent],
-    dose_lag_dual: &[T],
-    dose_inf_dual: &[Option<(T, T)>],
-    pk_model: PkModel,
+    subject: &Subject, schedule: &EventSchedule, eff_doses: &[DoseEvent], dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>], pk_model: PkModel,
 ) -> Vec<WalkedEnd<T>> {
     use crate::sens::num::BranchCmp as B;
     if !dose_lag_dual.is_empty()
@@ -1334,26 +1209,15 @@ fn walked_ends<T: PkNum>(
                 .filter(move |&(j, o)| j != k && infusing(o))
                 .map(|(j, _)| arrival(j))
         };
-        let until = others()
-            .filter(|&t| t > start)
-            .fold(f64::INFINITY, f64::min); // nan-ok: arrivals are finite event times
+        let until = others().filter(|&t| t > start).fold(f64::INFINITY, f64::min); // nan-ok: arrivals are finite event times
         let alone = others().all(|t| t != start);
         let ch = pk_model.topology().dose_channel(d.cmt_raw());
         let ok = alone
             && ch.is_some()
-            && hard_ends
-                .iter()
-                .all(|e| e.br_cmp(B::Le, T::from_f64(start)))
+            && hard_ends.iter().all(|e| e.br_cmp(B::Le, T::from_f64(start)))
             && (until == f64::INFINITY || end.br_cmp(B::Lt, T::from_f64(until)));
         match ch.filter(|_| ok) {
-            Some(ch) => walked.push(WalkedEnd {
-                dose: k,
-                start,
-                until,
-                end,
-                ch,
-                rate,
-            }),
+            Some(ch) => walked.push(WalkedEnd { dose: k, start, until, end, ch, rate }),
             None => {
                 if !end.is_constant() {
                     hard_ends.push(end);
@@ -1381,12 +1245,7 @@ fn walked_ends<T: PkNum>(
 /// window still contributes) and on a covariate change (crossed after the new parameters hold).
 #[allow(clippy::too_many_arguments)]
 fn walk_cut<T: PkNum>(
-    state: &mut [T],
-    a: T,
-    b: T,
-    we: &WalkedEnd<T>,
-    pk: &PkDual<T>,
-    pk_model: PkModel,
+    state: &mut [T], a: T, b: T, we: &WalkedEnd<T>, pk: &PkDual<T>, pk_model: PkModel,
     rates: (T, T, T, T),
 ) {
     use crate::sens::num::BranchCmp as B;
@@ -1410,10 +1269,7 @@ fn walk_cut<T: PkNum>(
 /// rate, its end (or an earlier pulse's) removes it; a bolus arrival or a marker switches
 /// nothing.
 fn break_rate_jump<T: PkNum>(
-    kind: BrkKind,
-    doses: &[DoseEvent],
-    dose_inf_dual: &[Option<(T, T)>],
-    pk: &PkDual<T>,
+    kind: BrkKind, doses: &[DoseEvent], dose_inf_dual: &[Option<(T, T)>], pk: &PkDual<T>,
     pk_model: PkModel,
 ) -> Option<(Channel, T)> {
     let (k, opens) = match kind {
@@ -1445,32 +1301,20 @@ fn add_rate<T: PkNum>(r: (T, T, T, T), ch: Channel, x: T) -> (T, T, T, T) {
 /// no value), the dual the same end moving with an estimated lag (through a seeded record's
 /// phase) and with a modeled or `F`-reshaped window.
 fn residual_ends_g<T: PkNum>(
-    k: usize,
-    d: &DoseEvent,
-    dose_lagtimes: &[f64],
-    dose_lag_dual: &[T],
-    dose_inf_dual: &[Option<(T, T)>],
-    lo: f64,
-    hi: f64,
+    k: usize, d: &DoseEvent, dose_lagtimes: &[f64], dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>], lo: f64, hi: f64,
 ) -> Vec<(f64, T)> {
     let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
     // Only the ends in `[lo, hi]`, the span the caller looks at (`j` keeps each one's index).
-    let ends: Vec<(usize, f64)> = crate::dosing::ss_residual_ends(d, lag, 1.0)
-        .within(lo, hi)
-        .collect();
+    let ends: Vec<(usize, f64)> =
+        crate::dosing::ss_residual_ends(d, lag, 1.0).within(lo, hi).collect();
     if ends.is_empty() {
         return Vec::new();
     }
     let lag_d = dose_lag_dual.get(k).copied().unwrap_or(T::from_f64(lag));
-    let t_inf = dose_inf_dual
-        .get(k)
-        .copied()
-        .flatten()
-        .map_or(T::from_f64(d.duration), |(_, w)| w);
+    let t_inf = dose_inf_dual.get(k).copied().flatten().map_or(T::from_f64(d.duration), |(_, w)| w);
     let e0 = T::from_f64(d.time) + crate::dosing::ss_residual_infusions_g(d, lag_d, t_inf).0;
-    ends.into_iter()
-        .map(|(j, e)| (e, e0 - T::from_f64(j as f64 * d.ii)))
-        .collect()
+    ends.into_iter().map(|(j, e)| (e, e0 - T::from_f64(j as f64 * d.ii))).collect()
 }
 
 /// The infusion rates (`F·rate`, already summed per compartment) active at clock time `mid`,
@@ -1538,11 +1382,7 @@ fn active_rates_g<T: PkNum>(
         let pulses = residual + usize::from(own);
         if pulses > 0 {
             let (one, _) = infusion_window_g(d, dose_inf_dual.get(k).copied().flatten(), pk);
-            let r = if pulses == 1 {
-                one
-            } else {
-                one * T::from_f64(pulses as f64)
-            };
+            let r = if pulses == 1 { one } else { one * T::from_f64(pulses as f64) };
             match pk_model.topology().dose_channel(d.cmt_raw()) {
                 Some(Channel::Central) => rate_central = rate_central + r,
                 Some(Channel::Periph1) => rate_periph1 = rate_periph1 + r,
@@ -1579,11 +1419,7 @@ fn infusion_window_g<T: PkNum>(d: &DoseEvent, inf: Option<(T, T)>, pk: &PkDual<T
 /// `dt` may carry a jet — that is how a moving boundary's sensitivity enters — and its **value**
 /// may be zero, which is exactly the zero-length sliver the observation correction uses.
 fn apply_step_g<T: PkNum>(
-    state: &mut [T],
-    dt: T,
-    pk: &PkDual<T>,
-    pk_model: PkModel,
-    rates: (T, T, T, T),
+    state: &mut [T], dt: T, pk: &PkDual<T>, pk_model: PkModel, rates: (T, T, T, T),
 ) {
     let (rate_central, rate_periph1, rate_periph2, rate_depot) = rates;
     {
@@ -1603,16 +1439,9 @@ fn apply_step_g<T: PkNum>(
             PkModel::OneCptOral => {
                 propagate_one_cpt_oral_g(state, dt, pk.cl, pk.v, pk.ka, rate_central, rate_depot)
             }
-            PkModel::TwoCptIv => propagate_two_cpt_g(
-                state,
-                dt,
-                pk.cl,
-                pk.v,
-                pk.q,
-                pk.v2,
-                rate_central,
-                rate_periph1,
-            ),
+            PkModel::TwoCptIv => {
+                propagate_two_cpt_g(state, dt, pk.cl, pk.v, pk.q, pk.v2, rate_central, rate_periph1)
+            }
             PkModel::TwoCptOral => propagate_two_cpt_oral_g(
                 state,
                 dt,
@@ -1682,13 +1511,8 @@ fn apply_step_g<T: PkNum>(
 /// nothing about the coincident boundary actually moves (a fixed window with no lagtime). The
 /// a sample on several coincident boundaries applies each in turn.
 fn obs_boundary_correction<T: PkNum>(
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
-    dose_lag_dual: &[T],
-    dose_inf_dual: &[Option<(T, T)>],
-    reset_floor: f64,
-    t: f64,
-    index: &crate::dosing::DoseIndex,
+    doses: &[DoseEvent], dose_lagtimes: &[f64], dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>], reset_floor: f64, t: f64, index: &crate::dosing::DoseIndex,
 ) -> Option<(T, bool)> {
     let has_lag = !dose_lag_dual.is_empty();
     // A window stopped by a reset — EVID=3/4 or an `SS=1` record reached at `t` (#1586) — has
@@ -1751,15 +1575,8 @@ fn obs_boundary_correction<T: PkNum>(
 /// for each end, the input it still delivers from its own position to the sample's instant.
 #[allow(clippy::too_many_arguments)]
 fn obs_group_reading<T: PkNum>(
-    state: &[T],
-    group: &[(f64, T, BrkKind)],
-    t: f64,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
-    dose_inf_dual: &[Option<(T, T)>],
-    pk: &PkDual<T>,
-    pk_model: PkModel,
-    reset_floor: f64,
+    state: &[T], group: &[(f64, T, BrkKind)], t: f64, doses: &[DoseEvent], dose_lagtimes: &[f64],
+    dose_inf_dual: &[Option<(T, T)>], pk: &PkDual<T>, pk_model: PkModel, reset_floor: f64,
     index: &crate::dosing::DoseIndex,
 ) -> Vec<T> {
     let zero = T::from_f64(0.0);
@@ -1825,11 +1642,7 @@ fn obs_group_reading<T: PkNum>(
 /// ULP-level disagreement between the separate f64 and dual value arithmetics can at most shift
 /// the stop by ±1 cycle, i.e. by the converged increment (≤ `1e-12` relative).
 pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
-    cycle: usize,
-    u: &[T],
-    cur: &mut Vec<f64>,
-    prev: &mut Vec<f64>,
-    prev_t: &mut Vec<T>,
+    cycle: usize, u: &[T], cur: &mut Vec<f64>, prev: &mut Vec<f64>, prev_t: &mut Vec<T>,
 ) -> bool {
     if T::RECORDS_BRANCHES {
         return ss_cycle_converged_recorded(cycle, u, prev_t);
@@ -1885,9 +1698,7 @@ fn ss_cycle_converged_recorded<T: PkNum>(cycle: usize, u: &[T], prev: &mut Vec<T
 /// on the dual `D` so a recording guards it), and the `m` earlier ones over the whole cycle at
 /// `m·rate`, a fixed window. All `None` (`len` of them) for a fixed window.
 fn cycle_window_duals<T: PkNum>(
-    dose: &DoseEvent,
-    inf: Option<(T, T)>,
-    len: usize,
+    dose: &DoseEvent, inf: Option<(T, T)>, len: usize,
 ) -> Vec<Option<(T, T)>> {
     let Some((rate, dur)) = inf else {
         return vec![None; len];
@@ -1920,10 +1731,7 @@ fn cycle_window_duals<T: PkNum>(
 /// dual disposition params, but the infusion window is inhomogeneous forcing and enters `b`
 /// alone. Threading it into the unforced call would corrupt the propagator.
 fn equilibrate_ss_g<T: PkNum>(
-    pk_model: PkModel,
-    pk: &PkDual<T>,
-    dose: &DoseEvent,
-    inf: Option<(T, T)>,
+    pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEvent, inf: Option<(T, T)>,
 ) -> Vec<T> {
     let (n_states, _) = state_layout_g(pk_model);
     let mut state = vec![T::from_f64(0.0); n_states];
@@ -1942,11 +1750,7 @@ fn equilibrate_ss_g<T: PkNum>(
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
     // The value walk's cycle doses, which keep the `F`-reshaped window (#419) and replay the
     // always-running pulses of an overlapping infusion as one more window.
-    let synthetic_dose = if is_inf {
-        dose.ss_cycle_doses()
-    } else {
-        Vec::new()
-    };
+    let synthetic_dose = if is_inf { dose.ss_cycle_doses() } else { Vec::new() };
     let synthetic_lag = vec![0.0; synthetic_dose.len()];
     // #486: for a **modeled** SS infusion (`RATE=-1/-2`), thread the window dual
     // `(rate_bare, dur_bare)` so each equilibration cycle's active/quiet split carries the
@@ -1956,11 +1760,8 @@ fn equilibrate_ss_g<T: PkNum>(
     let synthetic_inf = cycle_window_duals(dose, inf, synthetic_dose.len());
     let synthetic_index = crate::dosing::DoseIndex::new(&synthetic_dose, &synthetic_lag);
     let empty_index = crate::dosing::DoseIndex::default();
-    let bounds: Vec<f64> = if is_inf {
-        vec![0.0, synthetic_dose[0].duration, dose.ii]
-    } else {
-        vec![0.0, dose.ii]
-    };
+    let bounds: Vec<f64> =
+        if is_inf { vec![0.0, synthetic_dose[0].duration, dose.ii] } else { vec![0.0, dose.ii] };
     // One cycle from `u0`. `forced` applies this cycle's own dose — the bolus jump, or the
     // synthetic infusion window together with its modeled-window duals; unforced is the bare
     // homogeneous disposition over the *same* bounds, whose columns are the monodromy `M`.
@@ -1977,12 +1778,7 @@ fn equilibrate_ss_g<T: PkNum>(
         }
         let (doses, lag, inf_dual, index): (&[DoseEvent], &[f64], &[Option<(T, T)>], _) = if forced
         {
-            (
-                &synthetic_dose,
-                &synthetic_lag,
-                &synthetic_inf,
-                &synthetic_index,
-            )
+            (&synthetic_dose, &synthetic_lag, &synthetic_inf, &synthetic_index)
         } else {
             (&[], &[], &[], &empty_index)
         };
@@ -2072,11 +1868,7 @@ fn equilibrate_ss_g<T: PkNum>(
 /// the trough plus a bolus, or the bare trough for an infusion (its residual window delivers
 /// the cycle).
 fn ss_state_at_phase_g<T: PkNum>(
-    pk_model: PkModel,
-    pk: &PkDual<T>,
-    dose: &DoseEvent,
-    lag: T,
-    inf: Option<(T, T)>,
+    pk_model: PkModel, pk: &PkDual<T>, dose: &DoseEvent, lag: T, inf: Option<(T, T)>,
 ) -> Vec<T> {
     use crate::sens::num::BranchCmp as B;
     let mut state = equilibrate_ss_g(pk_model, pk, dose, inf);
@@ -2173,11 +1965,7 @@ fn ss_state_at_phase_g<T: PkNum>(
 ///   dual path is consistent with the objective.
 #[inline]
 pub(crate) fn observe_central_g<T: PkNum>(
-    read: &[T],
-    central_slot: usize,
-    cl: T,
-    v: T,
-    dosed: bool,
+    read: &[T], central_slot: usize, cl: T, v: T, dosed: bool,
 ) -> T {
     use crate::sens::num::BranchCmp as B;
     if cl_or_v_degenerate_g(cl, v) {
@@ -2217,12 +2005,8 @@ pub(crate) fn observe_central_g<T: PkNum>(
 /// of truth); the `Dual2` instantiation yields exact `∂(conc)/∂(seeded axes)` and
 /// second order.
 pub fn event_driven_sens_g<T: PkNum>(
-    pk_model: PkModel,
-    subject: &Subject,
-    schedule: &EventSchedule,
-    pk_at_dose: &[PkDual<T>],
-    pk_at_obs: &[PkDual<T>],
-    pk_at_pk_only: &[PkDual<T>],
+    pk_model: PkModel, subject: &Subject, schedule: &EventSchedule, pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>], pk_at_pk_only: &[PkDual<T>],
 ) -> Vec<T> {
     // Fixed-dose entrypoint: the walk reads `subject.doses` directly and carries no
     // modeled-window duals. Modeled-`RATE` subjects use
@@ -2255,15 +2039,9 @@ pub fn event_driven_sens_g<T: PkNum>(
 /// Empty ⇒ the model carries no lagtime and every arrival is a fixed break.
 #[allow(clippy::too_many_arguments)]
 pub fn event_driven_sens_with_doses_g<T: PkNum>(
-    pk_model: PkModel,
-    subject: &Subject,
-    schedule: &EventSchedule,
-    eff_doses: &[DoseEvent],
-    dose_lag_dual: &[T],
-    dose_inf_dual: &[Option<(T, T)>],
-    pk_at_dose: &[PkDual<T>],
-    pk_at_obs: &[PkDual<T>],
-    pk_at_pk_only: &[PkDual<T>],
+    pk_model: PkModel, subject: &Subject, schedule: &EventSchedule, eff_doses: &[DoseEvent],
+    dose_lag_dual: &[T], dose_inf_dual: &[Option<(T, T)>], pk_at_dose: &[PkDual<T>],
+    pk_at_obs: &[PkDual<T>], pk_at_pk_only: &[PkDual<T>],
 ) -> Vec<T> {
     let n_obs = subject.obs_times.len();
     let mut preds = vec![T::from_f64(0.0); n_obs];
@@ -2292,14 +2070,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     // no window, no end, no rate of its own in `active_rates_g` — and each sub-interval of its
     // window adds the rate where the end leaves it on (`walk_cut`). The arrival is still the
     // dose event it was.
-    let walked = walked_ends(
-        subject,
-        schedule,
-        eff_doses,
-        dose_lag_dual,
-        dose_inf_dual,
-        pk_model,
-    );
+    let walked = walked_ends(subject, schedule, eff_doses, dose_lag_dual, dose_inf_dual, pk_model);
     let (walk_doses, walk_inf);
     let (eff_doses, dose_inf_dual): (&[DoseEvent], &[Option<(T, T)>]) = if walked.is_empty() {
         (eff_doses, dose_inf_dual)
@@ -2367,11 +2138,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 dose_lag_dual,
                 dose_inf_dual,
                 f64::NEG_INFINITY,
-                schedule
-                    .events
-                    .iter()
-                    .map(|ev| ev.time)
-                    .fold(f64::NEG_INFINITY, f64::max), // nan-ok: event times are finite
+                schedule.events.iter().map(|ev| ev.time).fold(f64::NEG_INFINITY, f64::max), // nan-ok: event times are finite
             ) {
                 breaks.push((e, e_val));
             }
@@ -2465,10 +2232,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 let d = &eff_doses[ev.orig_idx];
                 let lag = schedule.dose_lagtimes[ev.orig_idx];
                 if crate::dosing::ss_seeded_at_record(d, lag) {
-                    let lag_dual = dose_lag_dual
-                        .get(ev.orig_idx)
-                        .copied()
-                        .unwrap_or_else(|| T::from_f64(lag));
+                    let lag_dual =
+                        dose_lag_dual.get(ev.orig_idx).copied().unwrap_or_else(|| T::from_f64(lag));
                     let inf = dose_inf_dual.get(ev.orig_idx).copied().flatten();
                     state =
                         ss_state_at_phase_g(pk_model, &pk_at_dose[ev.orig_idx], d, lag_dual, inf);
@@ -2516,10 +2281,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     let cmt_idx = d.cmt_idx();
                     if cmt_idx < n_states {
                         let bolus = dose_pk.f * T::from_f64(d.amt);
-                        match edge
-                            .as_ref()
-                            .filter(|e| e.last != BrkKind::Onset(ev.orig_idx))
-                        {
+                        match edge.as_ref().filter(|e| e.last != BrkKind::Onset(ev.orig_idx)) {
                             None => state[cmt_idx] = state[cmt_idx] + bolus,
                             // The walk stands at the group's last break, this dose arrived at
                             // its own: it has been in the body for the gap between them.
@@ -2678,18 +2440,10 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
 /// tests and terse 1-cpt callers.
 #[cfg(test)]
 pub(crate) fn event_driven_sens_one_cpt_g<T: PkNum>(
-    oral: bool,
-    subject: &Subject,
-    schedule: &EventSchedule,
-    pk_at_dose: &[OneCptPk<T>],
-    pk_at_obs: &[OneCptPk<T>],
-    pk_at_pk_only: &[OneCptPk<T>],
+    oral: bool, subject: &Subject, schedule: &EventSchedule, pk_at_dose: &[OneCptPk<T>],
+    pk_at_obs: &[OneCptPk<T>], pk_at_pk_only: &[OneCptPk<T>],
 ) -> Vec<T> {
-    let pk_model = if oral {
-        PkModel::OneCptOral
-    } else {
-        PkModel::OneCptIv
-    };
+    let pk_model = if oral { PkModel::OneCptOral } else { PkModel::OneCptIv };
     let dose: Vec<PkDual<T>> = pk_at_dose.iter().map(|p| p.to_pk_dual()).collect();
     let obs: Vec<PkDual<T>> = pk_at_obs.iter().map(|p| p.to_pk_dual()).collect();
     let only: Vec<PkDual<T>> = pk_at_pk_only.iter().map(|p| p.to_pk_dual()).collect();
@@ -2716,11 +2470,9 @@ mod tests {
     /// truth in disguise).
     #[test]
     fn one_cpt_g_matches_production_f64() {
-        for &(cl, v, rate, dt, s0) in &[
-            (3.0, 30.0, 0.0, 2.5, 10.0),
-            (5.0, 40.0, 8.0, 1.0, 0.0),
-            (1.2, 12.0, 2.0, 6.0, 3.5),
-        ] {
+        for &(cl, v, rate, dt, s0) in
+            &[(3.0, 30.0, 0.0, 2.5, 10.0), (5.0, 40.0, 8.0, 1.0, 0.0), (1.2, 12.0, 2.0, 6.0, 3.5)]
+        {
             let mut s_g = [s0];
             propagate_one_cpt_g::<f64>(&mut s_g, dt, cl, v, rate);
             let mut s_p = [s0];
@@ -2757,11 +2509,7 @@ mod tests {
     /// A `PkDual` whose `cl` carries the seed jet, everything else constant.
     fn pk_dual_cl_var(cl: f64, v: f64, seed: bool) -> PkDual<Dual2<1>> {
         PkDual {
-            cl: if seed {
-                Dual2::var(cl, 0)
-            } else {
-                Dual2::constant(cl)
-            },
+            cl: if seed { Dual2::var(cl, 0) } else { Dual2::constant(cl) },
             v: Dual2::constant(v),
             q: Dual2::constant(0.0),
             v2: Dual2::constant(0.0),
@@ -2820,15 +2568,9 @@ mod tests {
 
         let lagtimes = vec![0.0, lag];
         let schedule = EventSchedule::for_subject(&subject, PkModel::OneCptIv, &doses, &lagtimes);
-        let pk_at_dose = vec![
-            pk_dual_cl_var(cl_a, v, false),
-            pk_dual_cl_var(cl_a, v, false),
-        ];
+        let pk_at_dose = vec![pk_dual_cl_var(cl_a, v, false), pk_dual_cl_var(cl_a, v, false)];
         // Only the LAST record's CL carries the seed jet.
-        let pk_at_obs = vec![
-            pk_dual_cl_var(cl_a, v, false),
-            pk_dual_cl_var(cl_c, v, true),
-        ];
+        let pk_at_obs = vec![pk_dual_cl_var(cl_a, v, false), pk_dual_cl_var(cl_c, v, true)];
         let dual: Vec<Dual2<1>> = event_driven_sens_with_doses_g(
             PkModel::OneCptIv,
             &subject,
@@ -2854,10 +2596,7 @@ mod tests {
 
         // Non-degeneracy: the sensitivity must be materially nonzero, or "matches FD"
         // would be the trivial 0 == 0 and a twin reading the wrong record would pass.
-        assert!(
-            fd.abs() > 1e-3,
-            "fixture is inert: d f / d CL_C = {fd} at the last observation"
-        );
+        assert!(fd.abs() > 1e-3, "fixture is inert: d f / d CL_C = {fd} at the last observation");
     }
 
     /// #2039 / #2104: the observation readout keeps a `NaN`, in the volume or in the
@@ -2880,21 +2619,10 @@ mod tests {
         let g = |read: &[f64], cl: f64| observe_central_g::<f64>(read, 1, cl, 10.0, false);
         assert_eq!(g(&[0.0, 50.0], 0.0), 0.0, "a zero clearance reads 0");
         assert_eq!(g(&[0.0, 50.0], -1.0), 0.0, "a negative clearance reads 0");
-        assert_eq!(
-            g(&[0.0, 50.0], f64::INFINITY),
-            0.0,
-            "an infinite clearance reads 0"
-        );
+        assert_eq!(g(&[0.0, 50.0], f64::INFINITY), 0.0, "an infinite clearance reads 0");
         assert!(g(&[0.0, 50.0], f64::NAN).is_nan(), "NaN CL on central drug");
-        assert!(
-            g(&[50.0, 0.0], f64::NAN).is_nan(),
-            "NaN CL on depot drug only"
-        );
-        assert_eq!(
-            g(&[0.0, 0.0], f64::NAN),
-            0.0,
-            "NaN CL before any dose reads 0"
-        );
+        assert!(g(&[50.0, 0.0], f64::NAN).is_nan(), "NaN CL on depot drug only");
+        assert_eq!(g(&[0.0, 0.0], f64::NAN), 0.0, "NaN CL before any dose reads 0");
         assert!(
             observe_central_g::<f64>(&[0.0, 0.0], 1, f64::NAN, 10.0, true).is_nan(),
             "NaN CL at an infusion's start: arrived, but nothing in the state yet"
@@ -2914,9 +2642,7 @@ mod tests {
             nan_v.value.is_nan() && nan_v.grad[0].is_nan(),
             "a NaN volume reads NaN with a NaN jet"
         );
-        assert!(d(Dual2::var(f64::NAN, 0), Dual2::constant(10.0))
-            .value
-            .is_nan());
+        assert!(d(Dual2::var(f64::NAN, 0), Dual2::constant(10.0)).value.is_nan());
         let clamped = d(Dual2::var(-1.0, 0), Dual2::constant(10.0));
         assert_eq!((clamped.value, clamped.grad[0]), (0.0, 0.0));
         let live = d(Dual2::var(50.0, 0), Dual2::constant(10.0));
@@ -2959,12 +2685,7 @@ mod tests {
         for (route, model, ka, lag) in [
             ("IV bolus", PkModel::OneCptIv, 0.0, 0.0),
             ("oral", PkModel::OneCptOral, 1.2, 0.0),
-            (
-                "IV, record on a lagged arrival",
-                PkModel::OneCptIv,
-                0.0,
-                1.0,
-            ),
+            ("IV, record on a lagged arrival", PkModel::OneCptIv, 0.0, 1.0),
         ] {
             let lagtimes = [0.0, lag];
             let lag_dual: Vec<Dual2<1>> = if lag > 0.0 {
@@ -2996,30 +2717,15 @@ mod tests {
                 })
                 .collect();
             let schedule = EventSchedule::for_subject(&subject, model, &doses, &lagtimes);
-            let with_ka = |p: PkDual<Dual2<1>>| PkDual {
-                ka: Dual2::constant(ka),
-                ..p
-            };
+            let with_ka = |p: PkDual<Dual2<1>>| PkDual { ka: Dual2::constant(ka), ..p };
             for (label, cl, v) in [("V", 5.0, f64::NAN), ("CL", f64::NAN, 80.0)] {
                 let pk_obs: Vec<PkParams> = (0..6)
-                    .map(|j| {
-                        if j < bad_from {
-                            pk_of(5.0, 80.0, ka)
-                        } else {
-                            pk_of(cl, v, ka)
-                        }
-                    })
+                    .map(|j| if j < bad_from { pk_of(5.0, 80.0, ka) } else { pk_of(cl, v, ka) })
                     .collect();
                 let production = event_driven_predictions(model, &subject, &pk_dose, &pk_obs, &[]);
                 let pk_at_obs: Vec<PkDual<Dual2<1>>> = pk_obs
                     .iter()
-                    .map(|p| {
-                        with_ka(pk_dual_cl_var(
-                            p.values[PK_IDX_CL],
-                            p.values[PK_IDX_V],
-                            true,
-                        ))
-                    })
+                    .map(|p| with_ka(pk_dual_cl_var(p.values[PK_IDX_CL], p.values[PK_IDX_V], true)))
                     .collect();
                 let dual: Vec<Dual2<1>> = event_driven_sens_with_doses_g(
                     model,
@@ -3137,12 +2843,7 @@ mod tests {
     }
 
     fn one_cpt_pk_f64(p: &PkParams) -> OneCptPk<f64> {
-        OneCptPk {
-            cl: p.cl(),
-            v: p.v(),
-            ka: p.ka(),
-            f: p.f_bio(),
-        }
+        OneCptPk { cl: p.cl(), v: p.v(), ka: p.ka(), f: p.f_bio() }
     }
 
     /// #375: `active_rates_g` used to answer an unroutable infusion with a silent
@@ -3297,10 +2998,7 @@ mod tests {
         let obs = vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
         let (cl, v1, q, v2, ka) = (3.0, 30.0, 1.5, 40.0, 1.2);
         let cases = [
-            Case {
-                model: PkModel::TwoCptIv,
-                dose: DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            },
+            Case { model: PkModel::TwoCptIv, dose: DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0) },
             Case {
                 model: PkModel::TwoCptIv,
                 dose: DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0), // 5 h infusion
@@ -3389,16 +3087,7 @@ mod tests {
         );
         let out = walk[0];
         let (g, he) = fd2([cl, v1], |p| {
-            let pkd = PkDual {
-                cl: p[0],
-                v: p[1],
-                q,
-                v2,
-                ka: 0.0,
-                q3: 0.0,
-                v3: 0.0,
-                f: 1.0,
-            };
+            let pkd = PkDual { cl: p[0], v: p[1], q, v2, ka: 0.0, q3: 0.0, v3: 0.0, f: 1.0 };
             event_driven_sens_g::<f64>(PkModel::TwoCptIv, &subj, &schedule, &[pkd], &[pkd], &[])[0]
         });
         for i in 0..2 {
@@ -3526,16 +3215,7 @@ mod tests {
         );
         let out = walk[0];
         let (g, he) = fd2([cl, v1], |p| {
-            let pkd = PkDual {
-                cl: p[0],
-                v: p[1],
-                q: q2,
-                v2,
-                ka: 0.0,
-                q3,
-                v3,
-                f: 1.0,
-            };
+            let pkd = PkDual { cl: p[0], v: p[1], q: q2, v2, ka: 0.0, q3, v3, f: 1.0 };
             event_driven_sens_g::<f64>(PkModel::ThreeCptIv, &subj, &schedule, &[pkd], &[pkd], &[])
                 [0]
         });
@@ -3570,10 +3250,8 @@ mod tests {
         let pk_occ2 = pk_full(8.0, 50.0, 1.0); // faster clearance in occasion 2
                                                // Per-event params: dose is occasion 1; obs before t=12 are occasion 1,
                                                // after are occasion 2.
-        let pk_at_obs: Vec<PkParams> = obs
-            .iter()
-            .map(|&t| if t < 12.0 { pk_occ1 } else { pk_occ2 })
-            .collect();
+        let pk_at_obs: Vec<PkParams> =
+            obs.iter().map(|&t| if t < 12.0 { pk_occ1 } else { pk_occ2 }).collect();
 
         let prod = event_driven_predictions(PkModel::OneCptIv, &subj, &[pk_occ1], &pk_at_obs, &[]);
         let schedule = EventSchedule::for_subject(&subj, PkModel::OneCptIv, &subj.doses, &[0.0]);
@@ -3615,12 +3293,7 @@ mod tests {
         let out = walk[0];
 
         let (g, he) = fd2([cl, v], |p| {
-            let pk_g = OneCptPk {
-                cl: p[0],
-                v: p[1],
-                ka,
-                f: 1.0,
-            };
+            let pk_g = OneCptPk { cl: p[0], v: p[1], ka, f: 1.0 };
             let w =
                 event_driven_sens_one_cpt_g::<f64>(false, &subj, &schedule, &[pk_g], &[pk_g], &[]);
             w[0]

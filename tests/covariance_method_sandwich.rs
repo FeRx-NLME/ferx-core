@@ -90,11 +90,7 @@ fn covariance_rsr_assembles_finite_ses_fast() {
     let mut opts = warfarin_focei_opts(CovarianceMethod::Sandwich);
     opts.outer_maxiter = 60;
     let r = fit(&model, &pop, &model.default_params, &opts).expect("FOCEI rsr fit must succeed");
-    assert_eq!(
-        r.covariance_status,
-        CovarianceStatus::Computed,
-        "rsr covariance must be Computed"
-    );
+    assert_eq!(r.covariance_status, CovarianceStatus::Computed, "rsr covariance must be Computed");
     let ses = all_ses(&r);
     assert!(
         ses.iter().all(|s| s.is_finite() && *s > 0.0),
@@ -202,15 +198,10 @@ fn covariance_se_matches_nonmem_s_rsr() {
 
     // NONMEM 7.5.1 FOCEI SEs (.ext, ITER=-1000000001), order
     // [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA].
-    let nm_s = [
-        9.29659e-3, 4.60240e-1, 2.26835e-1, 1.54472e-3, 1.76426e-2, 8.28678e-3, 2.59564e-1,
-    ];
-    let nm_rsr = [
-        7.09785e-3, 2.40313e-1, 1.48728e-1, 7.96181e-4, 1.09264e-2, 3.97787e-3, 1.39645e-1,
-    ];
-    let names = [
-        "TVCL", "TVV", "TVKA", "PROP_ERR", "omega_CL", "omega_V", "omega_KA",
-    ];
+    let nm_s = [9.29659e-3, 4.60240e-1, 2.26835e-1, 1.54472e-3, 1.76426e-2, 8.28678e-3, 2.59564e-1];
+    let nm_rsr =
+        [7.09785e-3, 2.40313e-1, 1.48728e-1, 7.96181e-4, 1.09264e-2, 3.97787e-3, 1.39645e-1];
+    let names = ["TVCL", "TVV", "TVKA", "PROP_ERR", "omega_CL", "omega_V", "omega_KA"];
 
     let ferx_ses = |m: CovarianceMethod| {
         let r = fit(&model, &pop, &model.default_params, &warfarin_focei_opts(m))
@@ -226,10 +217,9 @@ fn covariance_se_matches_nonmem_s_rsr() {
         [t[0], t[1], t[2], s[0], om[0], om[1], om[2]]
     };
 
-    for (method, nm, tol) in [
-        (CovarianceMethod::CrossProduct, &nm_s, 5e-4),
-        (CovarianceMethod::Sandwich, &nm_rsr, 1e-3),
-    ] {
+    for (method, nm, tol) in
+        [(CovarianceMethod::CrossProduct, &nm_s, 5e-4), (CovarianceMethod::Sandwich, &nm_rsr, 1e-3)]
+    {
         let ferx = ferx_ses(method);
         for ((name, &f), &n) in names.iter().zip(ferx.iter()).zip(nm.iter()) {
             let rel = (f - n).abs() / n;
@@ -267,15 +257,10 @@ fn covariance_se_matches_nonmem_foce_s_rsr() {
 
     // NONMEM 7.5.1 FOCE ($EST METHOD=1) SEs (.ext, ITER=-1000000001), order
     // [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA].
-    let nm_s = [
-        8.38101e-3, 3.99649e-1, 1.49477e-1, 1.57334e-3, 1.77100e-2, 8.38719e-3, 2.33647e-1,
-    ];
-    let nm_rsr = [
-        7.56977e-3, 2.45704e-1, 1.32798e-1, 9.47247e-4, 1.09205e-2, 3.95710e-3, 1.54860e-1,
-    ];
-    let names = [
-        "TVCL", "TVV", "TVKA", "PROP_ERR", "omega_CL", "omega_V", "omega_KA",
-    ];
+    let nm_s = [8.38101e-3, 3.99649e-1, 1.49477e-1, 1.57334e-3, 1.77100e-2, 8.38719e-3, 2.33647e-1];
+    let nm_rsr =
+        [7.56977e-3, 2.45704e-1, 1.32798e-1, 9.47247e-4, 1.09205e-2, 3.95710e-3, 1.54860e-1];
+    let names = ["TVCL", "TVV", "TVKA", "PROP_ERR", "omega_CL", "omega_V", "omega_KA"];
 
     let ferx_ses = |m: CovarianceMethod| {
         let mut opts = FitOptions::default();
@@ -298,10 +283,9 @@ fn covariance_se_matches_nonmem_foce_s_rsr() {
         [t[0], t[1], t[2], s[0], om[0], om[1], om[2]]
     };
 
-    for (method, nm, tol) in [
-        (CovarianceMethod::CrossProduct, &nm_s, 5e-3),
-        (CovarianceMethod::Sandwich, &nm_rsr, 5e-3),
-    ] {
+    for (method, nm, tol) in
+        [(CovarianceMethod::CrossProduct, &nm_s, 5e-3), (CovarianceMethod::Sandwich, &nm_rsr, 5e-3)]
+    {
         let ferx = ferx_ses(method);
         for ((name, &f), &n) in names.iter().zip(ferx.iter()).zip(nm.iter()) {
             let rel = (f - n).abs() / n;

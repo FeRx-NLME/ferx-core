@@ -146,20 +146,16 @@ pub(crate) fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 #[inline]
 pub(crate) fn model_uses_time_anywhere(model: &CompiledModel) -> bool {
     model_uses_time_builtin(model)
-        || model.ode_spec.as_ref().is_some_and(|s| {
-            s.rhs_program
-                .as_ref()
-                .is_some_and(|p| p.pk_reads_model_time())
-        })
+        || model
+            .ode_spec
+            .as_ref()
+            .is_some_and(|s| s.rhs_program.as_ref().is_some_and(|p| p.pk_reads_model_time()))
 }
 
 #[inline]
 fn pk_params_at_time(
-    model: &CompiledModel,
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &std::collections::HashMap<String, f64>,
-    time: f64,
+    model: &CompiledModel, theta: &[f64], eta: &[f64],
+    covariates: &std::collections::HashMap<String, f64>, time: f64,
 ) -> PkParams {
     // `pk_param_fn` sets the model-time thread-local from `time` itself, so the
     // `TIME` built-in resolves to this event time without a separate wrap.
@@ -176,10 +172,7 @@ fn pk_params_at_time(
 /// for other models, for invalid parameters (the `0` is a deliberate optimiser
 /// penalty) and for `NaN` ones (served as `NaN`, #2134).
 pub(crate) fn absorption_flip_flop_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> bool {
     let pk = pk_params_at_time(model, theta, eta, &subject.covariates, 0.0);
     let (cl, v1) = (pk.cl(), pk.v());
@@ -240,11 +233,7 @@ pub(crate) fn absorption_flip_flop_at(
 /// Each record is evaluated as the prediction evaluates it (own covariates, `TIME`, and
 /// IOV occasion κ). `kappas` is ignored when `model.n_kappa == 0`.
 pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_bsv: &[f64],
-    kappas: &[K],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_bsv: &[f64], kappas: &[K],
 ) -> Vec<(f64, bool)> {
     if !crate::sens::propagate::cl_v_rule_governs(model.pk_model)
         || model.ode_spec.is_some()
@@ -299,12 +288,7 @@ pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
         .chain(subject.obs_times.iter().copied().zip(&params.obs))
         .chain(subject.pk_only_times.iter().copied().zip(&params.pk_only))
         .chain(
-            subject
-                .reset_times
-                .iter()
-                .copied()
-                .zip(&params.reset)
-                .filter(|&(t, _)| !evid4_twin(t)),
+            subject.reset_times.iter().copied().zip(&params.reset).filter(|&(t, _)| !evid4_twin(t)),
         )
         .filter(|(_, p)| !(valid(p.cl()) && valid(p.v())))
         .map(|(t, p)| {
@@ -326,10 +310,7 @@ pub(crate) fn invalid_cl_v_records<K: AsRef<[f64]>>(
 /// [`crate::types::CompiledModel::absorption_ode_equivalent`] for what "no twin" covers
 /// (an open-ended set, #1008).
 pub(crate) fn effective_model_for_eval<'a>(
-    model: &'a CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &'a CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> &'a CompiledModel {
     // A TV-covariate subject of a closed-form transit/IG model (#1560): the absorption
     // walk serves it unless a pair leaves the tilting domain (`walk_domain`).
@@ -357,10 +338,7 @@ pub(crate) fn effective_model_for_eval<'a>(
 /// subject stays on the closed form when the walk serves it, as [`predict_iov`] decides;
 /// everything else is [`CompiledModel::effective_for`] (#1560).
 pub(crate) fn effective_model_for_eval_iov<'a>(
-    model: &'a CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    stacked_eta: &[f64],
+    model: &'a CompiledModel, subject: &Subject, theta: &[f64], stacked_eta: &[f64],
 ) -> &'a CompiledModel {
     if !absorption_walk::walk_eligible(model, subject) {
         return model.effective_for(subject);
@@ -386,26 +364,19 @@ pub(crate) fn effective_model_for_eval_iov<'a>(
 /// the twin. The caller has established [`absorption_walk::walk_eligible`], which includes
 /// a twin being present.
 fn absorption_walk_or_twin<'a>(
-    model: &'a CompiledModel,
-    subject: &Subject,
-    ev: &EventPkParams,
+    model: &'a CompiledModel, subject: &Subject, ev: &EventPkParams,
 ) -> &'a CompiledModel {
     if absorption_walk::walk_serves(model.pk_model, subject, &ev.dose, &ev.obs, &ev.pk_only) {
         return model;
     }
-    model
-        .absorption_ode_equivalent
-        .as_ref()
-        .map_or(model, |twin| twin.built())
+    model.absorption_ode_equivalent.as_ref().map_or(model, |twin| twin.built())
 }
 
 /// `η` per record for an IOV subject: `[η_bsv, κ_g]` for occasion `occ` in group `g`
 /// ([`crate::stats::likelihood::iov_occasion_groups`] order), `κ = 0` for an occasion
 /// with no group — an occasion-less caller asks for `u32::MAX` and gets that.
 fn iov_occasion_eta<'a, K: AsRef<[f64]>>(
-    layout: &'a crate::stats::stacked_layout::StackedLayout,
-    eta_bsv: &'a [f64],
-    kappas: &'a [K],
+    layout: &'a crate::stats::stacked_layout::StackedLayout, eta_bsv: &'a [f64], kappas: &'a [K],
 ) -> impl Fn(u32) -> Vec<f64> + 'a {
     let n_kappa = layout.n_kappa();
     move |occ_id: u32| -> Vec<f64> {
@@ -423,12 +394,8 @@ fn iov_occasion_eta<'a, K: AsRef<[f64]>>(
 /// [`pk_only_row_occasion`], #1876) as [`predict_iov`] evaluates them; shared with
 /// [`effective_model_for_eval_iov`] so the route uses the same parameters.
 fn fill_iov_record_params(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    combined_for: &dyn Fn(u32) -> Vec<f64>,
-    dose: &mut Vec<PkParams>,
-    obs: &mut Vec<PkParams>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64],
+    combined_for: &dyn Fn(u32) -> Vec<f64>, dose: &mut Vec<PkParams>, obs: &mut Vec<PkParams>,
     pk_only: &mut Vec<PkParams>,
 ) {
     // Consecutive records of one occasion usually share every input of the (pure)
@@ -462,12 +429,7 @@ fn fill_iov_record_params(
     for m in 0..subject.pk_only_times.len() {
         // `u32::MAX` names no group, so an unresolvable row gets κ = 0 (#1876).
         let occ = pk_only_row_occasion(subject, m).unwrap_or(u32::MAX);
-        push(
-            pk_only,
-            occ,
-            subject.pk_only_cov(m),
-            subject.param_time_pk_only(m),
-        );
+        push(pk_only, occ, subject.pk_only_cov(m), subject.param_time_pk_only(m));
     }
 }
 
@@ -494,14 +456,9 @@ fn iov_table_off() -> bool {
 /// (#2549). An `ADDL`-implied dose that inherits its parent's attributes gets its own
 /// entry first (copy-on-write).
 fn fill_iov_record_table(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    combined_for: &dyn Fn(u32) -> Vec<f64>,
-    table: &mut Vec<PkParams>,
-    dose_ix: &mut Vec<u32>,
-    obs_ix: &mut Vec<u32>,
-    pk_only_ix: &mut Vec<u32>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64],
+    combined_for: &dyn Fn(u32) -> Vec<f64>, table: &mut Vec<PkParams>, dose_ix: &mut Vec<u32>,
+    obs_ix: &mut Vec<u32>, pk_only_ix: &mut Vec<u32>,
 ) {
     let mut memo = RecordParamMemo::new(model);
     // The table entry holding the memo's evaluation: never one the parent-dose edits below
@@ -517,13 +474,7 @@ fn fill_iov_record_table(
         let i = match *held {
             Some(i) if hit => i,
             _ => {
-                table.push(pk_params_at_time(
-                    model,
-                    theta,
-                    &combined_for(occ),
-                    cov,
-                    time,
-                ));
+                table.push(pk_params_at_time(model, theta, &combined_for(occ), cov, time));
                 (table.len() - 1) as u32
             }
         };
@@ -532,14 +483,7 @@ fn fill_iov_record_table(
     };
     for d in 0..subject.doses.len() {
         let occ = dose_row_occasion(subject, d).unwrap_or(u32::MAX);
-        push(
-            table,
-            &mut held,
-            dose_ix,
-            occ,
-            subject.dose_cov(d),
-            subject.dose_param_time(d),
-        );
+        push(table, &mut held, dose_ix, occ, subject.dose_cov(d), subject.dose_param_time(d));
     }
     let mut own = vec![false; subject.doses.len()];
     for (k, p, slot) in parent_dose_attr_copies(model, subject) {
@@ -554,14 +498,7 @@ fn fill_iov_record_table(
     }
     for j in 0..subject.obs_times.len() {
         let occ = subject.occasions.get(j).copied().unwrap_or(0);
-        push(
-            table,
-            &mut held,
-            obs_ix,
-            occ,
-            subject.obs_cov(j),
-            subject.param_time_obs(j),
-        );
+        push(table, &mut held, obs_ix, occ, subject.obs_cov(j), subject.param_time_obs(j));
     }
     for m in 0..subject.pk_only_times.len() {
         let occ = pk_only_row_occasion(subject, m).unwrap_or(u32::MAX);
@@ -600,10 +537,7 @@ impl RecordParamMemo {
     /// The parameters for these inputs: the last evaluation's when every input matches,
     /// else a fresh `eval()`, kept for the next record.
     fn get_ref(
-        &mut self,
-        occ: u32,
-        cov: &std::collections::HashMap<String, f64>,
-        time: f64,
+        &mut self, occ: u32, cov: &std::collections::HashMap<String, f64>, time: f64,
         eval: impl FnOnce() -> PkParams,
     ) -> &PkParams {
         if !self.same(occ, cov, time) {
@@ -614,11 +548,7 @@ impl RecordParamMemo {
 
     /// Whether these inputs are the last call's, which they become.
     fn same(&mut self, occ: u32, cov: &std::collections::HashMap<String, f64>, time: f64) -> bool {
-        let key = (
-            occ,
-            cov as *const _,
-            if self.time_free { 0 } else { time.to_bits() },
-        );
+        let key = (occ, cov as *const _, if self.time_free { 0 } else { time.to_bits() });
         self.last.replace(key) == Some(key)
     }
 }
@@ -629,11 +559,7 @@ impl RecordParamMemo {
 /// (`y = <expr>`) does not come through here.
 #[inline]
 pub fn apply_scaling(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    preds: &mut [f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], preds: &mut [f64],
 ) {
     // Fast path: no scaling skips both the pk evaluation and the per-obs
     // array allocation. Keeps the hot loop allocation-free for the
@@ -652,11 +578,7 @@ pub fn apply_scaling(
 /// Shared with the adaptive driver (#2129). Invalid scales come back `NaN` (see
 /// [`ScalingSpec::build_obs_scale_array`]).
 pub(crate) fn obs_scale_divisors(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    cmts: &[usize],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], cmts: &[usize],
 ) -> Vec<f64> {
     // Shared `ScalingSpec::build_obs_scale_array` keeps FD and AD (`inner_optimizer.rs`)
     // identical. Only evaluate pk when an ExpressionScale actually needs it.
@@ -667,14 +589,10 @@ pub(crate) fn obs_scale_divisors(
         pk_owned = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
         &pk_owned
     } else {
-        static DEFAULT_PK: PkParams = PkParams {
-            values: [0.0; crate::types::MAX_PK_PARAMS],
-        };
+        static DEFAULT_PK: PkParams = PkParams { values: [0.0; crate::types::MAX_PK_PARAMS] };
         &DEFAULT_PK
     };
-    model
-        .scaling
-        .build_obs_scale_array(theta, eta, &subject.covariates, pk_ref, cmts)
+    model.scaling.build_obs_scale_array(theta, eta, &subject.covariates, pk_ref, cmts)
 }
 
 /// Divide one prediction by its `[scaling]` divisor, or `NaN` when the divisor is
@@ -698,11 +616,7 @@ pub(crate) fn divide_by_obs_scale(pred: f64, scale: f64) -> f64 {
 /// individual parameters are re-evaluated per observation (NONMEM's per-record `$ERROR`,
 /// matching `record_analytic_events`). No-op unless `model.analytic_readout` is set.
 pub fn apply_analytic_readout(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    preds: &mut [f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], preds: &mut [f64],
 ) {
     let Some(ar) = &model.analytic_readout else {
         return;
@@ -725,12 +639,7 @@ pub fn apply_analytic_readout(
     let depot_amts: Option<Vec<f64>> = if need_depot {
         let states =
             analytical_state_at_times(model.pk_model, subject, &static_pk, &subject.obs_times);
-        Some(
-            states
-                .iter()
-                .map(|s| s.first().copied().unwrap_or(0.0))
-                .collect(),
-        )
+        Some(states.iter().map(|s| s.first().copied().unwrap_or(0.0)).collect())
     } else {
         None
     };
@@ -757,9 +666,7 @@ pub fn apply_analytic_readout(
         // `OdeReadout::eval` enters this observation's time as the `TIME` guard (#1028).
         // `readout_time` is the raw data-file clock (the `$ERROR` convention).
         let t = subject.readout_time(i);
-        *pred = ar
-            .readout
-            .eval(&state, &pk_i.values, theta, eta, cov, obs_cmt, t);
+        *pred = ar.readout.eval(&state, &pk_i.values, theta, eta, cov, obs_cmt, t);
     }
 }
 
@@ -769,11 +676,7 @@ pub fn apply_analytic_readout(
 /// log-transform, matching the ODE path. No-op for ODE models and without
 /// `[initial_conditions]`. `preds` is parallel to `subject.obs_times`.
 pub fn add_analytical_init(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    preds: &mut [f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], preds: &mut [f64],
 ) {
     if model.analytical_init.is_empty() || model.ode_spec.is_some() {
         return;
@@ -790,19 +693,10 @@ pub fn add_analytical_init(
 /// #521 review), else `amount_pk` drives it. An EVID=3/4 reset zeros the baseline, so it
 /// contributes only to observations strictly before the first reset (internal clock).
 fn add_analytical_init_with(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    amount_pk: &PkParams,
-    obs_decay_pk: Option<&[PkParams]>,
-    preds: &mut [f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], amount_pk: &PkParams,
+    obs_decay_pk: Option<&[PkParams]>, preds: &mut [f64],
 ) {
-    let first_reset = subject
-        .reset_times
-        .iter()
-        .copied()
-        .fold(f64::INFINITY, f64::min);
+    let first_reset = subject.reset_times.iter().copied().fold(f64::INFINITY, f64::min);
     for init in &model.analytical_init {
         let a0 = (init.amount_fn)(theta, eta, &subject.covariates, amount_pk);
         if a0 == 0.0 || !a0.is_finite() {
@@ -830,11 +724,7 @@ fn add_analytical_init_with(
 /// `cmt` (1-based) at t=0, with `F = 1`. Supports central and (oral) depot; peripheral
 /// inits are rejected at parse time, so any other `cmt` returns 0.
 fn analytical_init_concentration(
-    pk_model: PkModel,
-    cmt: usize,
-    a0: f64,
-    t: f64,
-    p: &PkParams,
+    pk_model: PkModel, cmt: usize, a0: f64, t: f64, p: &PkParams,
 ) -> f64 {
     // Delegate to the generic form at `T = f64`; the single formula dispatch
     // lives there so the Dual2/Dual2 sensitivity path (#524) cannot drift from
@@ -859,17 +749,7 @@ fn analytical_init_concentration(
 /// for unsupported compartments.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytical_init_concentration_g<T: crate::sens::num::PkNum>(
-    pk_model: PkModel,
-    cmt: usize,
-    a0: T,
-    t: T,
-    cl: T,
-    v: T,
-    q: T,
-    v2: T,
-    ka: T,
-    q3: T,
-    v3: T,
+    pk_model: PkModel, cmt: usize, a0: T, t: T, cl: T, v: T, q: T, v2: T, ka: T, q3: T, v3: T,
 ) -> T {
     use crate::sens::one_cpt::{one_cpt_iv_bolus_amt_g, one_cpt_oral_amt_g};
     use crate::sens::three_cpt::{three_cpt_iv_bolus_amt_g, three_cpt_oral_amt_g};
@@ -923,11 +803,8 @@ pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> 
 
     // Check ScalingSpec::PerCmt coverage (Forms A/B).
     if let ScalingSpec::PerCmt(map) = &model.scaling {
-        let missing: Vec<usize> = observed_cmts
-            .iter()
-            .copied()
-            .filter(|c| !map.contains_key(c))
-            .collect();
+        let missing: Vec<usize> =
+            observed_cmts.iter().copied().filter(|c| !map.contains_key(c)).collect();
         if !missing.is_empty() {
             return Err(format!(
                 "[scaling]: per-CMT scaling is missing entries for observed CMTs {:?}. \
@@ -940,11 +817,8 @@ pub fn validate_per_cmt_scaling(model: &CompiledModel, subjects: &[Subject]) -> 
     // Check OdeReadout::PerCmt coverage (Form C per-CMT).
     if let Some(ref ode) = model.ode_spec {
         if let crate::ode::OdeReadout::PerCmt(map) = &ode.readout {
-            let missing: Vec<usize> = observed_cmts
-                .iter()
-                .copied()
-                .filter(|c| !map.contains_key(c))
-                .collect();
+            let missing: Vec<usize> =
+                observed_cmts.iter().copied().filter(|c| !map.contains_key(c)).collect();
             if !missing.is_empty() {
                 return Err(format!(
                     "[scaling]: per-CMT `y[CMT=N]` Form C is missing entries for observed CMTs {:?}. \
@@ -998,10 +872,7 @@ impl EventPkParams {
 /// LOCF covariate snapshot (once, cloned, for a parameter-static subject). Allocates; hot
 /// loops use [`compute_event_pk_params_into`] with a reused [`EventPkParams`].
 pub fn compute_event_pk_params(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> EventPkParams {
     let mut out = EventPkParams::with_capacity_for(subject);
     compute_event_pk_params_into(model, subject, theta, eta, &mut out);
@@ -1059,9 +930,7 @@ pub(crate) fn dose_row_occasion(subject: &Subject, d: usize) -> Option<u32> {
 /// walks seed it. `None` is the κ = 0 dose, where production's `combined_for` lands on
 /// a miss — the treatment [`pk_only_row_group`] gives an ungrouped pk-only row.
 pub(crate) fn dose_row_group(
-    subject: &Subject,
-    d: usize,
-    occ_to_k: &std::collections::HashMap<u32, usize>,
+    subject: &Subject, d: usize, occ_to_k: &std::collections::HashMap<u32, usize>,
 ) -> Option<usize> {
     dose_row_occasion(subject, d).and_then(|occ| occ_to_k.get(&occ).copied())
 }
@@ -1069,9 +938,7 @@ pub(crate) fn dose_row_group(
 /// The κ group of pk-only row `m` ([`pk_only_row_occasion`] through `occ_to_k`); `None`
 /// is the κ = 0 row.
 pub(crate) fn pk_only_row_group(
-    subject: &Subject,
-    m: usize,
-    occ_to_k: &std::collections::HashMap<u32, usize>,
+    subject: &Subject, m: usize, occ_to_k: &std::collections::HashMap<u32, usize>,
 ) -> Option<usize> {
     pk_only_row_occasion(subject, m).and_then(|occ| occ_to_k.get(&occ).copied())
 }
@@ -1079,9 +946,7 @@ pub(crate) fn pk_only_row_group(
 /// The κ group of reset row `r` ([`reset_row_occasion`] through `occ_to_k`), as the
 /// `sens/` providers seed it — [`pk_only_row_group`]'s rule for a reset row.
 pub(crate) fn reset_row_group(
-    subject: &Subject,
-    r: usize,
-    occ_to_k: &std::collections::HashMap<u32, usize>,
+    subject: &Subject, r: usize, occ_to_k: &std::collections::HashMap<u32, usize>,
 ) -> Option<usize> {
     reset_row_occasion(subject, r).and_then(|occ| occ_to_k.get(&occ).copied())
 }
@@ -1092,12 +957,8 @@ pub(crate) fn reset_row_group(
 /// subject so the caller's snapshot is reused (one `$PK` call less per evaluation).
 #[inline]
 fn fill_dose_pk_params(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    constant: Option<PkParams>,
-    out: &mut Vec<PkParams>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    constant: Option<PkParams>, out: &mut Vec<PkParams>,
 ) {
     out.clear();
     match constant {
@@ -1141,12 +1002,8 @@ fn pk_only_pk_inputs(subject: &Subject) -> impl Iterator<Item = PkInputs<'_>> {
 
 /// The `$PK` inputs of each reset (`EVID=3/4`) record, in order.
 fn reset_pk_inputs(subject: &Subject) -> impl Iterator<Item = PkInputs<'_>> {
-    (0..subject.reset_times.len()).map(|r| {
-        (
-            subject.reset_cov(r),
-            subject.param_time_at(subject.reset_times[r]),
-        )
-    })
+    (0..subject.reset_times.len())
+        .map(|r| (subject.reset_cov(r), subject.param_time_at(subject.reset_times[r])))
 }
 
 /// Every dose, observation and PK-only record of `subject`, in that order, as
@@ -1240,12 +1097,8 @@ pub(crate) fn first_record_with_same_pk_inputs<'a>(
 /// are `subject`'s records for `site`, indexed by an open [`sharing_scope::SharingScope`].
 #[allow(clippy::too_many_arguments)]
 fn fill_per_record_pk_params(
-    model: &CompiledModel,
-    subject: &Subject,
-    site: sharing_scope::ShareSite,
-    theta: &[f64],
-    eta: &[f64],
-    records: &[&[(&std::collections::HashMap<String, f64>, f64)]],
+    model: &CompiledModel, subject: &Subject, site: sharing_scope::ShareSite, theta: &[f64],
+    eta: &[f64], records: &[&[(&std::collections::HashMap<String, f64>, f64)]],
     outs: &mut [&mut Vec<PkParams>],
 ) {
     debug_assert_eq!(records.len(), outs.len());
@@ -1255,9 +1108,7 @@ fn fill_per_record_pk_params(
         model,
         subject,
         site,
-        records
-            .iter()
-            .flat_map(|r| r.iter().map(|&(cov, _)| (None, cov))),
+        records.iter().flat_map(|r| r.iter().map(|&(cov, _)| (None, cov))),
     );
     // Record `i` of the concatenation sits at `(list, i - offset[list])`.
     let locate = |i: usize| {
@@ -1299,32 +1150,21 @@ const PARENT_DOSE_ATTRS: [crate::types::DoseAttr; 1] = [crate::types::DoseAttr::
 /// (`ALAG{cmt}`, else the bare lag; the forcing's `lag_slot`). A route lag is a depot
 /// `ALAG`, which NONMEM fixes at the parent row (`nonmem_anchor/addl_lag`).
 pub(crate) fn parent_dose_attr_copies<'a>(
-    model: &'a CompiledModel,
-    subject: &'a Subject,
+    model: &'a CompiledModel, subject: &'a Subject,
 ) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
     let map = model.active_dose_attr_map();
-    let forcings = model
-        .ode_spec
-        .as_ref()
-        .map_or(&[][..], |o| &o.input_rate[..]);
+    let forcings = model.ode_spec.as_ref().map_or(&[][..], |o| &o.input_rate[..]);
     (0..subject.doses.len()).flat_map(move |k| {
         let parent = subject.implied_dose_parent(k);
         let dose = &subject.doses[k];
         let cmt = dose.cmt_1based();
-        let attrs = PARENT_DOSE_ATTRS
-            .iter()
-            .filter_map(move |&attr| match attr {
-                crate::types::DoseAttr::Lag => Some(map.lag_slot(cmt)),
-                other => map.indexed_slot(other, cmt),
-            });
-        let route_lags = forcings
-            .iter()
-            .filter(move |f| f.cmt == dose.cmt_idx())
-            .filter_map(|f| f.lag_slot);
-        parent
-            .map(move |p| attrs.chain(route_lags).map(move |s| (k, p, s)))
-            .into_iter()
-            .flatten()
+        let attrs = PARENT_DOSE_ATTRS.iter().filter_map(move |&attr| match attr {
+            crate::types::DoseAttr::Lag => Some(map.lag_slot(cmt)),
+            other => map.indexed_slot(other, cmt),
+        });
+        let route_lags =
+            forcings.iter().filter(move |f| f.cmt == dose.cmt_idx()).filter_map(|f| f.lag_slot);
+        parent.map(move |p| attrs.chain(route_lags).map(move |s| (k, p, s))).into_iter().flatten()
     })
 }
 
@@ -1332,9 +1172,7 @@ pub(crate) fn parent_dose_attr_copies<'a>(
 /// (#2367), as listed by [`parent_dose_attr_copies`]: the post-pass every per-dose builder
 /// runs, so no second `$PK` call is needed.
 pub(crate) fn inherit_parent_dose_attrs(
-    model: &CompiledModel,
-    subject: &Subject,
-    dose: &mut [PkParams],
+    model: &CompiledModel, subject: &Subject, dose: &mut [PkParams],
 ) {
     for (k, p, slot) in parent_dose_attr_copies(model, subject) {
         dose[k].values[slot] = dose[p].values[slot];
@@ -1344,9 +1182,7 @@ pub(crate) fn inherit_parent_dose_attrs(
 /// [`inherit_parent_dose_attrs`] over per-dose seed vectors of any scalar, for the
 /// `sens/` walks whose dose snapshots are `Vec<T>` of duals.
 pub(crate) fn inherit_parent_dose_attrs_g<T: Clone>(
-    model: &CompiledModel,
-    subject: &Subject,
-    dose: &mut [Vec<T>],
+    model: &CompiledModel, subject: &Subject, dose: &mut [Vec<T>],
 ) {
     for (k, p, slot) in parent_dose_attr_copies(model, subject) {
         // Every seed vector spans the `ode_param_slots` layout, which reserves the lag
@@ -1386,11 +1222,7 @@ fn push_pk_in_place(out: &mut Vec<PkParams>, f: impl FnOnce() -> PkParams) {
 /// `tests::dose_only_snapshots_match_the_full_event_builder`. Exists for cost: 1000
 /// subjects × (2 doses + 100 obs), TV covariate: 9.9 ms vs 111.7 ms (#1235).
 pub(crate) fn compute_dose_pk_params_into(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    out: &mut Vec<PkParams>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], out: &mut Vec<PkParams>,
 ) {
     let constant = (!subject_needs_per_event_pk(model, subject))
         .then(|| (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0));
@@ -1402,11 +1234,7 @@ pub(crate) fn compute_dose_pk_params_into(
 /// The TV-cov path still builds the per-record input lists and sharing index each call
 /// (an in-crate EBE search keeps the index, #2558).
 pub fn compute_event_pk_params_into(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    out: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], out: &mut EventPkParams,
 ) {
     out.dose.clear();
     out.obs.clear();
@@ -1547,12 +1375,8 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// the dose's own time, as before #1909) fails that oracle on the κ alone. A dose record
 /// is its own governing record, so nothing else moves.
 pub(crate) fn compute_event_pk_params_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_baseline: &[f64],
-    eta_occ: &[Vec<f64>],
-    decision_times: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_baseline: &[f64],
+    eta_occ: &[Vec<f64>], decision_times: &[f64],
 ) -> EventPkParams {
     let mut out = EventPkParams::with_capacity_for(subject);
     let eta_at = |t: f64| -> &[f64] {
@@ -1618,11 +1442,7 @@ pub(crate) const LTBS_FLOOR: f64 = 1e-12;
 /// [`finish_on_observation_scale`]. Every non-IOV prediction sink ends here, so a new
 /// tail step reaches all of them (#2129, #2156, #2259 were incomplete copies).
 pub(crate) fn to_observation_scale(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    preds: &mut [f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], preds: &mut [f64],
 ) {
     apply_scaling(model, subject, theta, eta, preds);
     finish_on_observation_scale(model, subject, theta, eta, preds);
@@ -1634,11 +1454,7 @@ pub(crate) fn to_observation_scale(
 /// comes last (pseudo-observations are `θ_k + η_m` on the raw scale); it reads only BSV
 /// slots of `eta_bsv`.
 pub(crate) fn finish_on_observation_scale(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_bsv: &[f64],
-    preds: &mut [f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_bsv: &[f64], preds: &mut [f64],
 ) {
     apply_log_transform(model, preds);
     apply_frem_prediction_override(model, subject, theta, eta_bsv, preds);
@@ -1666,31 +1482,16 @@ pub(crate) fn ltbs_log_g<T: crate::sens::num::PkNum>(p: T) -> T {
 }
 
 pub fn predict_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_bsv: &[f64],
-    kappas: &[Vec<f64>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_bsv: &[f64], kappas: &[Vec<f64>],
 ) -> Vec<f64> {
-    predict_iov_with_scratch(
-        model,
-        subject,
-        theta,
-        eta_bsv,
-        kappas,
-        &mut EventPkParams::default(),
-    )
+    predict_iov_with_scratch(model, subject, theta, eta_bsv, kappas, &mut EventPkParams::default())
 }
 
 /// IOV predictions with caller-owned per-event parameter storage. Every event
 /// is still evaluated at its current theta, eta, kappa, covariates and time;
 /// only allocation capacity is reused, never numerical values.
 pub(crate) fn predict_iov_with_scratch<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_bsv: &[f64],
-    kappas: &[K],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_bsv: &[f64], kappas: &[K],
     scratch: &mut EventPkParams,
 ) -> Vec<f64> {
     predict_iov_with_scratch_and_schedule(model, subject, theta, eta_bsv, kappas, scratch, None)
@@ -1702,35 +1503,23 @@ pub(crate) fn predict_iov_with_scratch<K: AsRef<[f64]>>(
 /// `None` rebuilds it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_bsv: &[f64],
-    kappas: &[K],
-    scratch: &mut EventPkParams,
-    schedule: Option<&event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_bsv: &[f64], kappas: &[K],
+    scratch: &mut EventPkParams, schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
     let layout = crate::stats::stacked_layout::StackedLayout::new_cached(
         eta_bsv.len(),
         model.n_kappa,
         subject,
     );
-    predict_iov_in(
-        model, subject, &layout, theta, eta_bsv, kappas, scratch, schedule,
-    )
+    predict_iov_in(model, subject, &layout, theta, eta_bsv, kappas, scratch, schedule)
 }
 
 /// [`predict_iov_with_scratch_and_schedule`] over a caller-built occasion → group
 /// `layout`, built once per subject by callers predicting it many times (#2037).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    layout: &crate::stats::stacked_layout::StackedLayout,
-    theta: &[f64],
-    eta_bsv: &[f64],
-    kappas: &[K],
-    scratch: &mut EventPkParams,
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64], eta_bsv: &[f64], kappas: &[K], scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
     debug_assert_eq!(layout.n_eta(), eta_bsv.len());
@@ -1755,11 +1544,7 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
     // (interval, open dose) pair is in the tilting domain, else by the ODE twin (#719).
     let primary = model;
     let walk = absorption_walk::walk_eligible(model, subject);
-    let model = if walk {
-        model
-    } else {
-        model.effective_for(subject)
-    };
+    let model = if walk { model } else { model.effective_for(subject) };
     let n_kappa = model.n_kappa;
 
     // occasion id -> kappa-group index (iov_occasion_groups order).
@@ -1871,10 +1656,7 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
             };
             match (&resolved, schedule) {
                 (std::borrow::Cow::Borrowed(_), Some(sched)) => {
-                    let view = |idx| event_driven::Indexed {
-                        table: dose_params.as_slice(),
-                        idx,
-                    };
+                    let view = |idx| event_driven::Indexed { table: dose_params.as_slice(), idx };
                     event_driven::event_driven_predictions_with_schedule_at(
                         model.pk_model,
                         &resolved,
@@ -2024,10 +1806,7 @@ pub(crate) fn superposition_arrival_non_finite(doses: &[DoseEvent], lagtime: f64
 /// Matches NONMEM `ALAG1` + `SS=1` (7.5 to 5 significant figures; 7.6.0 for the
 /// `lagtime ≥ II` clamp, `nonmem_anchor/results/ss_lag_ge_ii`).
 pub fn predict_concentration(
-    pk_model: PkModel,
-    doses: &[DoseEvent],
-    t: f64,
-    pk_params: &PkParams,
+    pk_model: PkModel, doses: &[DoseEvent], t: f64, pk_params: &PkParams,
 ) -> f64 {
     let lagtime = pk_params.lagtime();
     // A non-finite arrival makes the whole subject non-finite — see
@@ -2224,10 +2003,9 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
         PkModel::OneCptOral if infusion => vec![0.0, central],
         PkModel::OneCptOral => vec![one_cpt_oral_depot(dose, tau, p.ka(), p.f_bio()), central],
         // [depot = lumped in-transit mass, central(, peripheral)].
-        PkModel::OneCptTransit => vec![
-            one_cpt_transit_depot(dose, tau, p.n_transit(), p.mtt(), p.f_bio()),
-            central,
-        ],
+        PkModel::OneCptTransit => {
+            vec![one_cpt_transit_depot(dose, tau, p.n_transit(), p.mtt(), p.f_bio()), central]
+        }
         PkModel::TwoCptTransit => {
             let (q, v2, n, mtt, f) = (p.q(), p.v2(), p.n_transit(), p.mtt(), p.f_bio());
             vec![
@@ -2237,10 +2015,9 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
             ]
         }
         // [depot = unabsorbed IG mass, central(, peripheral)].
-        PkModel::OneCptIg => vec![
-            one_cpt_ig_depot(dose, tau, p.mat(), p.cv2(), p.f_bio()),
-            central,
-        ],
+        PkModel::OneCptIg => {
+            vec![one_cpt_ig_depot(dose, tau, p.mat(), p.cv2(), p.f_bio()), central]
+        }
         PkModel::TwoCptIg => {
             let (q, v2, mat, cv2, f) = (p.q(), p.v2(), p.mat(), p.cv2(), p.f_bio());
             vec![
@@ -2249,16 +2026,9 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
                 two_cpt_ig_peripheral(dose, tau, cl, v, q, v2, mat, cv2, f),
             ]
         }
-        PkModel::TwoCptIv => vec![
-            central,
-            two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2()),
-        ],
+        PkModel::TwoCptIv => vec![central, two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2())],
         PkModel::TwoCptOral if infusion => {
-            vec![
-                0.0,
-                central,
-                two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2()),
-            ]
+            vec![0.0, central, two_cpt_iv_peripheral(dose, tau, cl, v, p.q(), p.v2())]
         }
         PkModel::TwoCptOral => {
             let (q, v2, ka, f) = (p.q(), p.v2(), p.ka(), p.f_bio());
@@ -2298,10 +2068,7 @@ fn single_dose_states(pk_model: PkModel, dose: &DoseEvent, tau: f64, p: &PkParam
 /// (`[k]` is the state at `times[k]`), with `predict_concentration`'s lagtime/SS logic.
 /// Used by `compute_extra_output_columns` and [`predict_all_states`].
 pub fn analytical_state_at_times(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_params: &PkParams,
-    times: &[f64],
+    pk_model: PkModel, subject: &Subject, pk_params: &PkParams, times: &[f64],
 ) -> Vec<Vec<f64>> {
     debug_assert!(
         subject.reset_times.is_empty(),
@@ -2368,9 +2135,7 @@ pub fn analytical_state_at_times(
 /// Superposition of compartment states at each `subject.obs_times`
 /// ([`analytical_state_at_times`]).
 pub fn predict_all_states(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_params: &PkParams,
+    pk_model: PkModel, subject: &Subject, pk_params: &PkParams,
 ) -> Vec<Vec<f64>> {
     analytical_state_at_times(pk_model, subject, pk_params, &subject.obs_times)
 }
@@ -2380,10 +2145,7 @@ pub fn predict_all_states(
 /// analytical states from superposition. Analytical subjects with resets, and IOV models,
 /// get empty states (→ NaN in `[derived]`, `W_DERIVED_CMT_RESET_ANALYTICAL`).
 pub fn compute_predictions_with_states(
-    model: &crate::types::CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     // A transit subject the closed form can't serve routes to its ODE twin, so states
     // come from the ODE integration (matches `compute_predictions_with_tv`, #486).
@@ -2469,10 +2231,7 @@ pub fn compute_predictions(pk_model: PkModel, subject: &Subject, pk_params: &PkP
 /// Allocation-reusing counterpart of [`compute_predictions`]: the static superposition
 /// path overwrites `out` in place.
 fn compute_predictions_recycle(
-    pk_model: PkModel,
-    subject: &Subject,
-    pk_params: &PkParams,
-    mut out: Vec<f64>,
+    pk_model: PkModel, subject: &Subject, pk_params: &PkParams, mut out: Vec<f64>,
 ) -> Vec<f64> {
     // Modeled-RATE doses (RATE=-2) must be resolved to `Fixed` before this closed form
     // (#324/#394, #898); unresolved they would silently be 0-rate "infusions". A real
@@ -2555,10 +2314,7 @@ pub(crate) fn subject_feeds_analytical_pk(model: &CompiledModel, subject: &Subje
         if model.endpoints.is_empty() {
             return true;
         }
-        subject
-            .obs_cmts
-            .iter()
-            .any(|cmt| !model.endpoints.contains_key(cmt))
+        subject.obs_cmts.iter().any(|cmt| !model.endpoints.contains_key(cmt))
     }
     #[cfg(not(feature = "survival"))]
     {
@@ -2572,10 +2328,7 @@ pub(crate) fn subject_feeds_analytical_pk(model: &CompiledModel, subject: &Subje
 /// Compute predictions using ODE integration. `pk_params_flat` is the flat RHS parameter
 /// vector; `theta`/`eta` feed `OdeSpec::output_fn` for Form C (empty slices otherwise).
 pub fn compute_predictions_ode(
-    ode_spec: &crate::ode::OdeSpec,
-    subject: &Subject,
-    pk_params_flat: &[f64],
-    theta: &[f64],
+    ode_spec: &crate::ode::OdeSpec, subject: &Subject, pk_params_flat: &[f64], theta: &[f64],
     eta: &[f64],
 ) -> Vec<f64> {
     // System resets (EVID=3/4) need the event-driven ODE walker; replicate the constant
@@ -2607,10 +2360,7 @@ pub fn compute_predictions_ode(
 /// the BSV vector (IOV callers pass the BSV slice). Shared by the analytical and IOV/SAEM
 /// prediction paths.
 pub(crate) fn apply_frem_prediction_override(
-    model: &crate::types::CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
     preds: &mut [f64],
 ) {
     if let Some(ref fc) = model.frem_config {
@@ -2639,10 +2389,7 @@ pub(crate) fn apply_frem_prediction_override(
 /// `TAD`/`TAFD`/`MACHEPS` read in a readout or `[scaling]` (#1028). Run
 /// [`crate::check_model_data`] first, or call [`crate::predict`] (`E_MISSING_COVARIATE`).
 pub fn compute_predictions_with_tv(
-    model: &crate::types::CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {
     // Event snapshots allocate lazily, only on paths that materialize them.
     // Hot loops should reuse the buffer via `compute_predictions_with_tv_into`.
@@ -2655,10 +2402,7 @@ pub fn compute_predictions_with_tv(
 /// touch it; an empty buffer is fine). Runs no model/data checks (see
 /// [`compute_predictions_with_tv`]).
 pub fn compute_predictions_with_tv_into(
-    model: &crate::types::CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
     scratch: &mut EventPkParams,
 ) -> Vec<f64> {
     compute_predictions_with_tv_into_with_schedule(model, subject, theta, eta, scratch, None)
@@ -2669,12 +2413,8 @@ pub fn compute_predictions_with_tv_into(
 /// bounds per call). Ignored on the static fast path; `None` builds one on demand. Runs
 /// no model/data checks (see [`compute_predictions_with_tv`]).
 pub fn compute_predictions_with_tv_into_with_schedule(
-    model: &crate::types::CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    scratch: &mut EventPkParams,
-    schedule: Option<&event_driven::EventSchedule>,
+    model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    scratch: &mut EventPkParams, schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
     compute_predictions_with_tv_recycle_with_schedule(
         model,
@@ -2691,12 +2431,8 @@ pub fn compute_predictions_with_tv_into_with_schedule(
 /// that reuses the returned observation vector on allocation-sensitive repeated
 /// evaluations of one subject.
 pub(crate) fn compute_predictions_with_tv_recycle_with_schedule(
-    model: &crate::types::CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    scratch: &mut EventPkParams,
-    schedule: Option<&event_driven::EventSchedule>,
+    model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    scratch: &mut EventPkParams, schedule: Option<&event_driven::EventSchedule>,
     mut recycled: Vec<f64>,
 ) -> Vec<f64> {
     // #905: an analytical subject with no Gaussian observation feeds the predictor nothing
@@ -2855,11 +2591,7 @@ mod tests {
             p
         };
         let (a, b): (HashMap<String, f64>, HashMap<String, f64>) = (HashMap::new(), HashMap::new());
-        let mut memo = RecordParamMemo {
-            time_free: true,
-            last: None,
-            value: PkParams::default(),
-        };
+        let mut memo = RecordParamMemo { time_free: true, last: None, value: PkParams::default() };
         assert_eq!(memo.get_ref(0, &a, 1.0, || eval(1.0)).values[0], 1.0);
         // Same occasion and map, another time, on a time-free program: reused.
         assert_eq!(memo.get_ref(0, &a, 2.0, || eval(9.0)).values[0], 1.0);
@@ -2869,11 +2601,8 @@ mod tests {
         assert_eq!(memo.get_ref(1, &b, 2.0, || eval(3.0)).values[0], 3.0);
         assert_eq!(calls.get(), 3);
         // A program that reads `TIME` keys on the time too.
-        let mut timed = RecordParamMemo {
-            time_free: false,
-            last: None,
-            value: PkParams::default(),
-        };
+        let mut timed =
+            RecordParamMemo { time_free: false, last: None, value: PkParams::default() };
         timed.get_ref(0, &a, 1.0, || eval(4.0));
         assert_eq!(timed.get_ref(0, &a, 2.0, || eval(5.0)).values[0], 5.0);
         assert_eq!(timed.get_ref(0, &a, 2.0, || eval(6.0)).values[0], 5.0);
@@ -2974,10 +2703,7 @@ mod tests {
             first_record_with_same_pk_inputs(&without, records.iter().copied()),
             Some(vec![0, 0, 2, 2])
         );
-        assert_eq!(
-            first_record_with_same_pk_inputs(&with_time, records.iter().copied()),
-            None
-        );
+        assert_eq!(first_record_with_same_pk_inputs(&with_time, records.iter().copied()), None);
     }
 
     /// A hand-built `pk_param_fn` has no program whose inputs the key could list, so it
@@ -2988,10 +2714,7 @@ mod tests {
         assert!(model.indiv_param_partials.indiv_param_program.is_none());
         let m = covs(&[("CR", 1.0)]);
         let records = [(None, &m), (None, &m), (Some(0), &m)];
-        assert_eq!(
-            first_record_with_same_pk_inputs(&model, records.iter().copied()),
-            None
-        );
+        assert_eq!(first_record_with_same_pk_inputs(&model, records.iter().copied()), None);
     }
 
     /// The per-event materializer copies a snapshot from the record it shares with, in
@@ -3018,32 +2741,14 @@ mod tests {
         let ev = compute_event_pk_params(&model, &s, &theta, &eta);
         let own = |cov: &HashMap<String, f64>, t: f64| (model.pk_param_fn)(&theta, &eta, cov, t);
         let lists: [(&str, &[PkParams], Vec<PkParams>); 4] = [
-            (
-                "dose",
-                &ev.dose,
-                (0..2)
-                    .map(|k| own(s.dose_cov(k), s.dose_param_time(k)))
-                    .collect(),
-            ),
-            (
-                "obs",
-                &ev.obs,
-                (0..5)
-                    .map(|j| own(s.obs_cov(j), s.param_time_obs(j)))
-                    .collect(),
-            ),
+            ("dose", &ev.dose, (0..2).map(|k| own(s.dose_cov(k), s.dose_param_time(k))).collect()),
+            ("obs", &ev.obs, (0..5).map(|j| own(s.obs_cov(j), s.param_time_obs(j))).collect()),
             (
                 "pk_only",
                 &ev.pk_only,
-                (0..2)
-                    .map(|m| own(s.pk_only_cov(m), s.param_time_pk_only(m)))
-                    .collect(),
+                (0..2).map(|m| own(s.pk_only_cov(m), s.param_time_pk_only(m))).collect(),
             ),
-            (
-                "reset",
-                &ev.reset,
-                vec![own(s.reset_cov(0), s.param_time_at(s.reset_times[0]))],
-            ),
+            ("reset", &ev.reset, vec![own(s.reset_cov(0), s.param_time_at(s.reset_times[0]))]),
         ];
         for (name, got, want) in &lists {
             assert_eq!(got.len(), want.len(), "{name}");
@@ -3077,11 +2782,7 @@ mod tests {
 
     /// `CL` reads `WT` and `V` reads `AGE` when `wt`; otherwise `WT` is no input at all.
     fn wt_age_model(wt: bool) -> CompiledModel {
-        let cl = if wt {
-            "TVCL * exp(ETA_CL) * (WT/70)"
-        } else {
-            "TVCL * exp(ETA_CL)"
-        };
+        let cl = if wt { "TVCL * exp(ETA_CL) * (WT/70)" } else { "TVCL * exp(ETA_CL)" };
         crate::parser::model_parser::parse_model_string(&format!(
             r#"
 [parameters]
@@ -3140,11 +2841,7 @@ mod tests {
 
         let b0 = builds();
         let unscoped = [eval(0.2), eval(-0.3)];
-        assert_eq!(
-            builds() - b0,
-            4,
-            "outside a scope: dose + rest index per evaluation"
-        );
+        assert_eq!(builds() - b0, 4, "outside a scope: dose + rest index per evaluation");
         let scoped = {
             let _share = sharing_scope::SharingScope::enter(&model, &s);
             let b1 = builds();
@@ -3152,23 +2849,13 @@ mod tests {
             assert_eq!(builds() - b1, 2, "inside a scope: dose + rest index, once");
             scoped
         };
-        assert_eq!(
-            scoped[0], unscoped[0],
-            "η = 0.2: a reused index moved a snapshot"
-        );
-        assert_eq!(
-            scoped[1], unscoped[1],
-            "η = -0.3: a reused index moved a snapshot"
-        );
+        assert_eq!(scoped[0], unscoped[0], "η = 0.2: a reused index moved a snapshot");
+        assert_eq!(scoped[1], unscoped[1], "η = -0.3: a reused index moved a snapshot");
         assert_eq!(scoped[2], unscoped[0]);
         // Closed, the scope keeps nothing.
         let b2 = builds();
         eval(0.2);
-        assert_eq!(
-            builds() - b2,
-            2,
-            "a closed scope must not keep serving its index"
-        );
+        assert_eq!(builds() - b2, 2, "a closed scope must not keep serving its index");
     }
 
     /// The scope is for one model, one subject, one site and one set of κ groups, and an
@@ -3183,42 +2870,22 @@ mod tests {
         let other = wt_varying_subject([70.0, 70.0, 95.0, 95.0, 95.0]);
         let builds = sharing_scope::builds;
         fn none(s: &Subject) -> Vec<(Option<usize>, &HashMap<String, f64>)> {
-            (0..s.obs_times.len())
-                .map(|j| (None, s.obs_cov(j)))
-                .collect()
+            (0..s.obs_times.len()).map(|j| (None, s.obs_cov(j))).collect()
         }
         let direct = |m: &CompiledModel, r: &[(Option<usize>, &HashMap<String, f64>)]| {
             first_record_with_same_pk_inputs(m, r.iter().copied()).expect("parsed, no TIME")
         };
         let get = |m: &CompiledModel, sub: &Subject, site, r: &[_]| {
-            scoped(m, sub, site, r.iter().copied())
-                .expect("parsed, no TIME")
-                .to_vec()
+            scoped(m, sub, site, r.iter().copied()).expect("parsed, no TIME").to_vec()
         };
         let (rs, ro) = (none(&s), none(&other));
         // The same records in other κ groups: obs 1 and 2 now share only within a group.
-        let grouped: Vec<_> = rs
-            .iter()
-            .enumerate()
-            .map(|(j, &(_, c))| (Some(j % 2), c))
-            .collect();
+        let grouped: Vec<_> = rs.iter().enumerate().map(|(j, &(_, c))| (Some(j % 2), c)).collect();
         let want = direct(&with_wt, &rs);
         assert_eq!(want, [0, 1, 1, 3, 0]);
-        assert_ne!(
-            direct(&age_only, &rs),
-            want,
-            "the models must index s differently"
-        );
-        assert_ne!(
-            direct(&with_wt, &ro),
-            want,
-            "the subjects must index differently"
-        );
-        assert_ne!(
-            direct(&with_wt, &grouped),
-            want,
-            "the groupings must index differently"
-        );
+        assert_ne!(direct(&age_only, &rs), want, "the models must index s differently");
+        assert_ne!(direct(&with_wt, &ro), want, "the subjects must index differently");
+        assert_ne!(direct(&with_wt, &grouped), want, "the groupings must index differently");
 
         let _share = sharing_scope::SharingScope::enter(&with_wt, &s);
         assert_eq!(get(&with_wt, &s, ShareSite::Recorder, &rs), want);
@@ -3287,11 +2954,7 @@ mod tests {
         }
         let b = builds();
         ask(&s);
-        assert_eq!(
-            builds(),
-            b,
-            "the outer scope's index survives the inner one"
-        );
+        assert_eq!(builds(), b, "the outer scope's index survives the inner one");
         {
             let _again = SharingScope::enter(&model, &s);
             ask(&s);
@@ -3334,11 +2997,7 @@ mod tests {
             let b = sharing_scope::builds();
             ask(sub);
             ask(sub);
-            assert_eq!(
-                sharing_scope::builds(),
-                b + 2,
-                "no scope may outlive its guard"
-            );
+            assert_eq!(sharing_scope::builds(), b + 2, "no scope may outlive its guard");
         }
     }
 
@@ -3625,10 +3284,7 @@ mod tests {
             PkModel::ThreeCptOral,
         ] {
             let c0 = predict_concentration(model, &doses, t, &baseline());
-            assert!(
-                c0 > 0.0,
-                "{model:?}: baseline concentration should be positive"
-            );
+            assert!(c0 > 0.0, "{model:?}: baseline concentration should be positive");
             for &slot in &named_slots {
                 let mut perturbed = baseline();
                 perturbed.values[slot] *= 5.0;
@@ -3762,19 +3418,12 @@ mod tests {
         // `y(9) = 10·5·e^{−0.1}/50` exactly, against `10·e^{−0.1}/50` under κ = 0.
         subj.reset_occasions = vec![7];
         let groups = crate::stats::likelihood::iov_occasion_groups(&subj);
-        assert_eq!(
-            groups.iter().map(|g| g.0).collect::<Vec<_>>(),
-            vec![1, 2, 7]
-        );
+        assert_eq!(groups.iter().map(|g| g.0).collect::<Vec<_>>(), vec![1, 2, 7]);
         let mut kappas = vec![vec![0.0]; 3];
         kappas[0] = vec![2.0f64.ln()];
         kappas[2] = vec![5.0f64.ln()];
         let reset_only = predict_iov(&model, &subj, &theta, &eta_bsv, &kappas)[1];
-        assert_relative_eq!(
-            reset_only,
-            10.0 * 5.0 * (-0.1f64).exp() / 50.0,
-            epsilon = 1e-9
-        );
+        assert_relative_eq!(reset_only, 10.0 * 5.0 * (-0.1f64).exp() / 50.0, epsilon = 1e-9);
     }
 
     /// Records at 0 (dose, occasion 1), 2 (pk-only), 5 (obs, occasion 1) and 8 (obs,
@@ -3803,10 +3452,7 @@ mod tests {
     /// sits right before it.
     #[test]
     fn pk_only_row_occasion_is_its_own_label_or_none() {
-        assert_eq!(
-            pk_only_row_occasion(&pk_only_occasion_subject(vec![7]), 0),
-            Some(7)
-        );
+        assert_eq!(pk_only_row_occasion(&pk_only_occasion_subject(vec![7]), 0), Some(7));
         let mut s = pk_only_occasion_subject(Vec::new());
         s.dose_occasions = vec![4];
         assert_eq!(pk_only_row_occasion(&s, 0), None);
@@ -3906,10 +3552,7 @@ mod tests {
             };
             let got = pred(vec![2]);
             assert!(got.is_finite(), "{name}: {got}");
-            eprintln!(
-                "{name}: pred(5) relative error {:e}",
-                (got - own).abs() / own
-            );
+            eprintln!("{name}: pred(5) relative error {:e}", (got - own).abs() / own);
             assert!(
                 (got - own).abs() / own < tol,
                 "{name}: pred(5) = {got}, own-occasion value {own}"
@@ -4038,24 +3681,14 @@ mod tests {
         // gates) proves the predictor itself fails fast on an unvalidated subject.
         use crate::types::RateMode;
         let mut subj = make_subject_with_tv(HashMap::new(), Vec::new(), Vec::new(), 0, 1);
-        subj.doses = vec![DoseEvent::modeled(
-            0.0,
-            100.0,
-            1,
-            false,
-            0.0,
-            RateMode::ModeledDuration,
-        )];
+        subj.doses = vec![DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration)];
         let pk = make_pk_params(10.0, 100.0);
         let _ = compute_predictions(PkModel::OneCptIv, &subj, &pk);
     }
 
     fn make_subject_with_tv(
-        cov_const: HashMap<String, f64>,
-        dose_cov: Vec<HashMap<String, f64>>,
-        obs_cov: Vec<HashMap<String, f64>>,
-        n_doses: usize,
-        n_obs: usize,
+        cov_const: HashMap<String, f64>, dose_cov: Vec<HashMap<String, f64>>,
+        obs_cov: Vec<HashMap<String, f64>>, n_doses: usize, n_obs: usize,
     ) -> Subject {
         Subject {
             id: "1".to_string(),
@@ -4105,10 +3738,7 @@ mod tests {
                 theta_upper: vec![f64::INFINITY],
                 theta_fixed: vec![false],
                 omega_fixed: Vec::new(),
-                sigma: SigmaVector {
-                    values: vec![0.1],
-                    names: vec!["EPS".into()],
-                },
+                sigma: SigmaVector { values: vec![0.1], names: vec!["EPS".into()] },
                 ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
                     &[],
                     Vec::new(),
@@ -4216,10 +3846,7 @@ mod tests {
         let model = crate::parser::model_parser::parse_model_string(model_str)
             .expect("TIME/time built-ins parse");
         assert!(
-            !model
-                .referenced_covariates
-                .iter()
-                .any(|c| c == "TIME" || c == "time"),
+            !model.referenced_covariates.iter().any(|c| c == "TIME" || c == "time"),
             "TIME/time must not be tracked as data covariates: {:?}",
             model.referenced_covariates
         );
@@ -4342,10 +3969,7 @@ mod tests {
 
         let via_dose_time =
             predict_concentration(PkModel::OneCptIv, &[bolus_dose(f64::NAN, 100.0)], 4.0, &pk);
-        assert!(
-            via_dose_time.is_nan(),
-            "NaN dose time: got {via_dose_time}, want NaN"
-        );
+        assert!(via_dose_time.is_nan(), "NaN dose time: got {via_dose_time}, want NaN");
 
         // The *other* finite dose in the same subject must not rescue it: the
         // subject is non-finite, not "finite where it happens to have data".
@@ -4635,10 +4259,7 @@ mod tests {
             let got = predict_concentration(PkModel::OneCptOral, doses, t, &pk);
             assert!(got.is_finite(), "{label}: non-finite at t={t}");
             let rel = ((got - want) / want).abs();
-            assert!(
-                rel < 1e-11,
-                "{label}: t={t} got {got} want {want} (rel {rel:e})"
-            );
+            assert!(rel < 1e-11, "{label}: t={t} got {got} want {want} (rel {rel:e})");
         }
     }
 
@@ -4726,17 +4347,11 @@ mod tests {
         for (t, want) in cases {
             let got = predict_concentration(PkModel::OneCptOral, &doses, t, &pk);
             let rel = ((got - want) / want).abs();
-            assert!(
-                got.is_finite() && rel < 1e-11,
-                "t={t}: got {got} want {want} (rel {rel:e})"
-            );
+            assert!(got.is_finite() && rel < 1e-11, "t={t}: got {got} want {want} (rel {rel:e})");
         }
         // Differential: without the `SS=1` row the pending dose is live at 13.
         let alone = predict_concentration(PkModel::OneCptOral, &doses[..1], 13.0, &pk);
-        assert!(
-            alone > 0.1 * ss_reset_c_ss(1.0),
-            "fixture degenerate: {alone}"
-        );
+        assert!(alone > 0.1 * ss_reset_c_ss(1.0), "fixture degenerate: {alone}");
     }
 
     /// A central infusion running across an `SS=1` record into the depot contributes nothing
@@ -4777,16 +4392,12 @@ mod tests {
             // Elapsed time since the latest reached record (records at 0, 12, 24, 36).
             let tau = t - (12.0 * (t / 12.0).floor()).min(36.0);
             let depot = d * (-ka * tau).exp() / (1.0 - (-ka * ii).exp());
-            for (name, got, want) in [
-                ("depot", st[0], depot),
-                ("central", st[1], ss_reset_c_ss(tau)),
-            ] {
+            for (name, got, want) in
+                [("depot", st[0], depot), ("central", st[1], ss_reset_c_ss(tau))]
+            {
                 assert!(got.is_finite(), "{name} non-finite at t={t}");
                 let rel = ((got - want) / want).abs();
-                assert!(
-                    rel < 1e-11,
-                    "{name} at t={t}: got {got} want {want} (rel {rel:e})"
-                );
+                assert!(rel < 1e-11, "{name} at t={t}: got {got} want {want} (rel {rel:e})");
             }
         }
     }
@@ -5201,10 +4812,8 @@ mod tests {
         // FREM config: FREMTYPE 100 -> (theta_idx=0 [TVCL], eta_idx=1 [ETA_COV])
         let mut map = std::collections::HashMap::new();
         map.insert(100u16, (0usize, 1usize));
-        model.frem_config = Some(crate::types::FremConfig {
-            fremtype_to_indices: map,
-            covariate_sigma_index: 0,
-        });
+        model.frem_config =
+            Some(crate::types::FremConfig { fremtype_to_indices: map, covariate_sigma_index: 0 });
 
         let theta = [1.0]; // TVCL = 1.0
         let eta = [0.0, 5.0]; // ETA_COV = 5.0
@@ -5315,20 +4924,12 @@ mod tests {
         let bad_returns = [0.0_f64, -1.0_f64, f64::NAN, f64::INFINITY];
         for &val in &bad_returns {
             let scale_fn: crate::types::ScaleFn = Box::new(move |_, _, _, _| val);
-            let model = model_with_scaling(ScalingSpec::ExpressionScale {
-                scale_fn,
-                deriv: None,
-            });
+            let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn, deriv: None });
             let subj = one_subject_for_scaling();
             let mut preds = vec![1.0, 2.0, 3.0];
             apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
             for p in &preds {
-                assert!(
-                    p.is_nan(),
-                    "bad scale ({}) must produce NaN preds, got {}",
-                    val,
-                    p
-                );
+                assert!(p.is_nan(), "bad scale ({}) must produce NaN preds, got {}", val, p);
             }
         }
     }
@@ -5343,12 +4944,7 @@ mod tests {
             let mut preds = vec![1.0, 2.0, 3.0];
             apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
             for p in &preds {
-                assert!(
-                    p.is_nan(),
-                    "bad scalar scale ({}) must produce NaN preds, got {}",
-                    k,
-                    p
-                );
+                assert!(p.is_nan(), "bad scalar scale ({}) must produce NaN preds, got {}", k, p);
             }
         }
     }
@@ -5360,10 +4956,7 @@ mod tests {
             Box::new(|_theta, _eta, cov: &HashMap<String, f64>, _pk: &PkParams| {
                 cov.get("WT").copied().unwrap_or(70.0) / 70.0
             });
-        let model = model_with_scaling(ScalingSpec::ExpressionScale {
-            scale_fn,
-            deriv: None,
-        });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn, deriv: None });
         let mut subj = one_subject_for_scaling();
         subj.covariates.insert("WT".to_string(), 84.0); // scale = 84/70 = 1.2
         let mut preds = vec![12.0, 24.0];
@@ -5382,10 +4975,7 @@ mod tests {
             Box::new(|_theta, _eta, _cov: &HashMap<String, f64>, pk: &PkParams| {
                 pk.values[crate::types::PK_IDX_V] / 10.0
             });
-        let model = model_with_scaling(ScalingSpec::ExpressionScale {
-            scale_fn,
-            deriv: None,
-        });
+        let model = model_with_scaling(ScalingSpec::ExpressionScale { scale_fn, deriv: None });
         let subj = one_subject_for_scaling();
         let mut preds = vec![100.0, 50.0];
         apply_scaling(&model, &subj, &[10.0], &[], &mut preds);
@@ -5453,11 +5043,7 @@ mod tests {
 
         let err = validate_per_cmt_scaling(&model, std::slice::from_ref(&subj))
             .expect_err("missing CMTs must error");
-        assert!(
-            err.contains("[2, 3]"),
-            "error should list missing CMTs explicitly, got: {}",
-            err
-        );
+        assert!(err.contains("[2, 3]"), "error should list missing CMTs explicitly, got: {}", err);
     }
 
     #[test]
@@ -5522,10 +5108,7 @@ mod tests {
     fn test_build_obs_scale_array_expression() {
         // Closure returns 5.0; array should be 5.0 for every obs.
         let scale_fn: crate::types::ScaleFn = Box::new(|_, _, _, _| 5.0);
-        let spec = ScalingSpec::ExpressionScale {
-            scale_fn,
-            deriv: None,
-        };
+        let spec = ScalingSpec::ExpressionScale { scale_fn, deriv: None };
         let pk = PkParams::default();
         let arr = spec.build_obs_scale_array(&[], &[], &HashMap::new(), &pk, &[1; 3]);
         assert_eq!(arr, vec![5.0; 3]);
@@ -5812,11 +5395,7 @@ mod tests {
         p.values[crate::types::PK_IDX_MTT] = 1.5;
         let d = DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0);
         let states = single_dose_states(PkModel::TwoCptTransit, &d, 2.0, &p);
-        assert_eq!(
-            states.len(),
-            3,
-            "2-cpt transit exposes [depot, central, periph]"
-        );
+        assert_eq!(states.len(), 3, "2-cpt transit exposes [depot, central, periph]");
         assert!(
             states.iter().all(|&x| x > 0.0),
             "all three amounts positive mid-absorption: {states:?}"

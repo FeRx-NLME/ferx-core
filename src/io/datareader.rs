@@ -24,23 +24,13 @@ impl SelectionFilter {
     /// Build from the raw expression strings stored in `FitOptions`.
     /// Returns `Err` if any expression fails to parse.
     pub fn from_opts(
-        ignore_exprs: &[String],
-        accept_exprs: &[String],
-        ignore_subjects: &[String],
+        ignore_exprs: &[String], accept_exprs: &[String], ignore_subjects: &[String],
     ) -> Result<Self, String> {
-        let ignore = ignore_exprs
-            .iter()
-            .map(|s| FilterClause::parse(s))
-            .collect::<Result<Vec<_>, _>>()?;
-        let accept = accept_exprs
-            .iter()
-            .map(|s| FilterClause::parse(s))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(SelectionFilter {
-            ignore,
-            accept,
-            ignore_subject_ids: ignore_subjects.to_vec(),
-        })
+        let ignore =
+            ignore_exprs.iter().map(|s| FilterClause::parse(s)).collect::<Result<Vec<_>, _>>()?;
+        let accept =
+            accept_exprs.iter().map(|s| FilterClause::parse(s)).collect::<Result<Vec<_>, _>>()?;
+        Ok(SelectionFilter { ignore, accept, ignore_subject_ids: ignore_subjects.to_vec() })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -88,10 +78,7 @@ impl SelectionFilter {
     /// string, so the reader must build the per-row `str_covariates` map. Lets a
     /// purely numeric filter (the common case) skip that per-row allocation.
     pub fn needs_str_covariates(&self) -> bool {
-        self.ignore
-            .iter()
-            .chain(self.accept.iter())
-            .any(|c| c.needs_str_covariates())
+        self.ignore.iter().chain(self.accept.iter()).any(|c| c.needs_str_covariates())
     }
 
     /// Returns `(excluded, which)`: whether the row is dropped, and the source of
@@ -132,9 +119,7 @@ impl SelectionFilter {
     /// filter keeps was kept by every clause, so this is the clause that first
     /// decided it on those columns (#1501).
     pub(crate) fn first_clause_depending_on(
-        &self,
-        ctx: &RowContext<'_>,
-        cols: &[&str],
+        &self, ctx: &RowContext<'_>, cols: &[&str],
     ) -> Option<Excluder<'_>> {
         let depends = |c: &&FilterClause| c.depends_on(ctx, cols);
         self.ignore
@@ -246,9 +231,7 @@ fn is_missing_cell(s: &str) -> bool {
 /// `simulate()` / `predict()` reject such a population with `E_ENDPOINT_UNROUTED`
 /// (#1199).
 pub fn read_nonmem_csv(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
 ) -> Result<Population, String> {
     read_nonmem_csv_mapped(path, covariate_columns, iov_column, &[])
 }
@@ -257,9 +240,7 @@ pub fn read_nonmem_csv(
 /// a `[data]` canonical-role → header remapping (#730). `column_map` entries are `(canonical_role, actual_header)`;
 /// an empty slice is the no-remap identity used by the public wrapper.
 pub(crate) fn read_nonmem_csv_mapped(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
     column_map: &[(String, String)],
 ) -> Result<Population, String> {
     read_nonmem_csv_routed(
@@ -282,10 +263,7 @@ pub(crate) fn read_nonmem_csv_mapped(
 /// for missing). `extra_columns` (used but undeclared) are read leniently into
 /// the [`Population`] only.
 pub fn read_nonmem_csv_with_covariates(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
 ) -> Result<(Population, CovariateTable), String> {
     read_nonmem_csv_with_covariates_mapped(path, decls, extra_columns, iov_column, &[])
 }
@@ -322,10 +300,7 @@ fn augment_with_filter(cols: &mut Vec<String>, filter: Option<&SelectionFilter>)
 /// Like [`read_nonmem_csv_with_covariates`] but with a `[data]` column
 /// remapping (#730). See [`read_nonmem_csv_mapped`].
 pub(crate) fn read_nonmem_csv_with_covariates_mapped(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
     column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     // Population reads the union of declared + referenced-but-undeclared columns,
@@ -340,19 +315,14 @@ pub(crate) fn read_nonmem_csv_with_covariates_mapped(
         &ObsRouting::default(),
         column_map,
     )?;
-    Ok((
-        pop,
-        table.expect("covariate table is built whenever table_decls is Some"),
-    ))
+    Ok((pop, table.expect("covariate table is built whenever table_decls is Some")))
 }
 
 /// Like [`read_nonmem_csv`] (model-blind: no endpoint routing, see there) but
 /// applies `[data_selection]` filtering at read time. Called from
 /// `api::read_population_for` when `FitOptions` carries selection rules.
 pub fn read_nonmem_csv_filtered(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
     filter: &SelectionFilter,
 ) -> Result<Population, String> {
     read_nonmem_csv_filtered_mapped(path, covariate_columns, iov_column, filter, &[])
@@ -361,11 +331,8 @@ pub fn read_nonmem_csv_filtered(
 /// Like [`read_nonmem_csv_filtered`] but with a `[data]` column remapping
 /// (#730). See [`read_nonmem_csv_mapped`].
 pub(crate) fn read_nonmem_csv_filtered_mapped(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    iov_column: Option<&str>,
-    filter: &SelectionFilter,
-    column_map: &[(String, String)],
+    path: &Path, covariate_columns: Option<&[&str]>, iov_column: Option<&str>,
+    filter: &SelectionFilter, column_map: &[(String, String)],
 ) -> Result<Population, String> {
     // `read_nonmem_csv_routed` adds filter-referenced columns to an explicit list
     // (auto-detect already reads every non-standard column).
@@ -386,10 +353,7 @@ pub(crate) fn read_nonmem_csv_filtered_mapped(
 /// [`read_nonmem_csv`]) but applies `[data_selection]` filtering.
 #[cfg(test)]
 pub(crate) fn read_nonmem_csv_with_covariates_filtered(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
     filter: &SelectionFilter,
 ) -> Result<(Population, CovariateTable), String> {
     read_nonmem_csv_with_covariates_filtered_mapped(
@@ -406,12 +370,8 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered(
 /// remapping (#730). See [`read_nonmem_csv_mapped`].
 #[cfg(test)]
 pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
-    path: &Path,
-    decls: &[CovariateDecl],
-    extra_columns: &[String],
-    iov_column: Option<&str>,
-    filter: &SelectionFilter,
-    column_map: &[(String, String)],
+    path: &Path, decls: &[CovariateDecl], extra_columns: &[String], iov_column: Option<&str>,
+    filter: &SelectionFilter, column_map: &[(String, String)],
 ) -> Result<(Population, CovariateTable), String> {
     // `read_nonmem_csv_routed` also reads filter-referenced undeclared columns.
     let (pop, table) = read_nonmem_csv_routed(
@@ -424,10 +384,7 @@ pub(crate) fn read_nonmem_csv_with_covariates_filtered_mapped(
         &ObsRouting::default(),
         column_map,
     )?;
-    Ok((
-        pop,
-        table.expect("covariate table is built whenever table_decls is Some"),
-    ))
+    Ok((pop, table.expect("covariate table is built whenever table_decls is Some")))
 }
 
 /// How an `EVID=0`, `MDV=0` record with a missing `DV` (`.` / `NA` / blank) is
@@ -509,11 +466,7 @@ impl ObsRouting {
     /// Routing for TTE (`ObsRecord::Event`) and binary/categorical
     /// (`ObsRecord::DiscreteState`, #760) CMTs. Count CMTs: [`Self::with_count`].
     pub(crate) fn tte_and_discrete(tte: &HashSet<usize>, discrete: &HashSet<usize>) -> Self {
-        Self {
-            tte: tte.clone(),
-            discrete: discrete.clone(),
-            ..Default::default()
-        }
+        Self { tte: tte.clone(), discrete: discrete.clone(), ..Default::default() }
     }
 
     /// Route `count` CMTs' rows to `ObsRecord::Count` (builder form) — the `[count_model]`
@@ -664,11 +617,7 @@ impl IntDvKind {
 /// that a raw `as usize`/`as u32` cast would silently mis-record. Missing DVs are
 /// skipped by the caller as MDV=1 (#258).
 fn checked_integer_dv(
-    dv: f64,
-    kind: IntDvKind,
-    id: &str,
-    cmt: usize,
-    time: f64,
+    dv: f64, kind: IntDvKind, id: &str, cmt: usize, time: f64,
 ) -> Result<f64, String> {
     let (label, unit) = (kind.label(), kind.unit());
     if !dv.is_finite() {
@@ -698,21 +647,10 @@ fn checked_integer_dv(
 /// discrete-state / count routing.
 #[cfg(test)]
 pub(crate) fn read_nonmem_csv_filtered_routed(
-    path: &Path,
-    routing: &ObsRouting,
+    path: &Path, routing: &ObsRouting,
 ) -> Result<Population, String> {
-    read_nonmem_csv_impl(
-        CsvInput::Path(path),
-        None,
-        &[],
-        &[],
-        None,
-        None,
-        None,
-        routing,
-        &[],
-    )
-    .map(|(pop, _)| pop)
+    read_nonmem_csv_impl(CsvInput::Path(path), None, &[], &[], None, None, None, routing, &[])
+        .map(|(pop, _)| pop)
 }
 
 /// The one reader every wrapper delegates to: builds the covariate read set
@@ -724,14 +662,9 @@ pub(crate) fn read_nonmem_csv_filtered_routed(
 /// auto-detect). `routing` carries endpoint routing and the missing-DV policy.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_nonmem_csv_routed(
-    path: &Path,
-    covariate_columns: Option<&[&str]>,
-    decls: Option<&[CovariateDecl]>,
-    extra_columns: &[String],
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    routing: &ObsRouting,
-    column_map: &[(String, String)],
+    path: &Path, covariate_columns: Option<&[&str]>, decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String], iov_column: Option<&str>, filter: Option<&SelectionFilter>,
+    routing: &ObsRouting, column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     read_nonmem_csv_routed_from(
         CsvInput::Path(path),
@@ -758,14 +691,9 @@ pub(crate) enum CsvInput<'a> {
 /// share, so a read of bytes and a read of the file holding them agree.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_nonmem_csv_routed_from(
-    input: CsvInput<'_>,
-    covariate_columns: Option<&[&str]>,
-    decls: Option<&[CovariateDecl]>,
-    extra_columns: &[String],
-    iov_column: Option<&str>,
-    filter: Option<&SelectionFilter>,
-    routing: &ObsRouting,
-    column_map: &[(String, String)],
+    input: CsvInput<'_>, covariate_columns: Option<&[&str]>, decls: Option<&[CovariateDecl]>,
+    extra_columns: &[String], iov_column: Option<&str>, filter: Option<&SelectionFilter>,
+    routing: &ObsRouting, column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     // Declared covariates first (table column order); else the explicit list or
     // `None` for auto-detect. Filter-referenced columns are always added.
@@ -784,9 +712,7 @@ pub(crate) fn read_nonmem_csv_routed_from(
             v
         }),
     };
-    let cols_ref: Option<Vec<&str>> = cols
-        .as_ref()
-        .map(|v| v.iter().map(|s| s.as_str()).collect());
+    let cols_ref: Option<Vec<&str>> = cols.as_ref().map(|v| v.iter().map(|s| s.as_str()).collect());
     let exact = exact_case_extras(
         // The declared branch ignores the caller's list, so it exempts nothing there.
         covariate_columns.filter(|_| decls.is_none()),
@@ -812,13 +738,9 @@ pub(crate) fn read_nonmem_csv_routed_from(
 /// case-differing reference stays unread (`check_covariates` reports it). Inert
 /// on the auto-detect path.
 fn exact_case_extras(
-    covariate_columns: Option<&[&str]>,
-    extra_columns: &[String],
-    filter: Option<&SelectionFilter>,
+    covariate_columns: Option<&[&str]>, extra_columns: &[String], filter: Option<&SelectionFilter>,
 ) -> Vec<String> {
-    let filter_cols = filter
-        .map(|f| f.referenced_covariate_columns())
-        .unwrap_or_default();
+    let filter_cols = filter.map(|f| f.referenced_covariate_columns()).unwrap_or_default();
     extra_columns
         .iter()
         .filter(|e| {
@@ -839,15 +761,9 @@ fn exact_case_extras(
 /// names that must match a header by exact case (see [`exact_case_extras`]).
 /// `routing`: per-CMT endpoint routing, validated for disjointness up front.
 fn read_nonmem_csv_impl(
-    input: CsvInput<'_>,
-    covariate_columns: Option<&[&str]>,
-    auto_extras: &[String],
-    exact_extras: &[String],
-    iov_column: Option<&str>,
-    table_decls: Option<&[CovariateDecl]>,
-    filter: Option<&SelectionFilter>,
-    routing: &ObsRouting,
-    column_map: &[(String, String)],
+    input: CsvInput<'_>, covariate_columns: Option<&[&str]>, auto_extras: &[String],
+    exact_extras: &[String], iov_column: Option<&str>, table_decls: Option<&[CovariateDecl]>,
+    filter: Option<&SelectionFilter>, routing: &ObsRouting, column_map: &[(String, String)],
 ) -> Result<(Population, Option<CovariateTable>), String> {
     routing.validate()?;
     // `ReaderBuilder::from_path` is `File::open` + `from_reader`, and a csv I/O
@@ -859,10 +775,7 @@ fn read_nonmem_csv_impl(
         }
         CsvInput::Bytes(bytes) => Box::new(bytes),
     };
-    let mut rdr = csv::ReaderBuilder::new()
-        .flexible(true)
-        .has_headers(true)
-        .from_reader(source);
+    let mut rdr = csv::ReaderBuilder::new().flexible(true).has_headers(true).from_reader(source);
 
     // Preserve original header casing for covariate names. Standard NONMEM
     // columns are matched case-insensitively so that legacy CSVs (e.g. `Id`,
@@ -883,10 +796,8 @@ fn read_nonmem_csv_impl(
         for (target, actual) in column_map {
             // A mapped header that is absent is a hard error — the mapping would
             // silently do nothing (e.g. TIME would still be reported missing).
-            let idx = headers
-                .iter()
-                .position(|h| h.eq_ignore_ascii_case(actual))
-                .ok_or_else(|| {
+            let idx =
+                headers.iter().position(|h| h.eq_ignore_ascii_case(actual)).ok_or_else(|| {
                     format!(
                         "[data]: mapped column `{actual}` (renamed to `{target}`) not found in \
                          dataset headers: {}",
@@ -954,10 +865,7 @@ fn read_nonmem_csv_impl(
     // IOV occasion column (case-insensitive lookup of user-specified name)
     let occ_col: Option<usize> = iov_column.and_then(|name| col_idx_ci(name));
     if iov_column.is_some() && occ_col.is_none() {
-        return Err(format!(
-            "iov_column '{}' not found in dataset headers",
-            iov_column.unwrap()
-        ));
+        return Err(format!("iov_column '{}' not found in dataset headers", iov_column.unwrap()));
     }
 
     const STANDARD_COLS: &[&str] = &[
@@ -1021,10 +929,7 @@ fn read_nonmem_csv_impl(
                 headers.join(", ")
             ));
         }
-        decls
-            .iter()
-            .map(|d| (d.name.clone(), col_idx_cs(&d.name).unwrap()))
-            .collect()
+        decls.iter().map(|d| (d.name.clone(), col_idx_cs(&d.name).unwrap())).collect()
     } else {
         Vec::new()
     };
@@ -1079,12 +984,7 @@ fn read_nonmem_csv_impl(
                     }
                 }
             }
-            table_rows.push(CovariateRow {
-                id: id.clone(),
-                time,
-                evid,
-                values,
-            });
+            table_rows.push(CovariateRow { id: id.clone(), time, evid, values });
         }
 
         if id != current_id {
@@ -1114,10 +1014,7 @@ fn read_nonmem_csv_impl(
         ));
     }
     let n_records_total: usize = rows_by_id.iter().map(|(_, rows)| rows.len()).sum();
-    let mut excl_summary = ExclusionSummary {
-        n_records_total,
-        ..Default::default()
-    };
+    let mut excl_summary = ExclusionSummary { n_records_total, ..Default::default() };
     // Union across subjects, sorted and deduplicated by the set; assigned once after
     // the loop rather than pushed into the summary's `Vec` per subject.
     let mut excl_obs_cmts_all: std::collections::BTreeSet<usize> =
@@ -1370,9 +1267,7 @@ fn read_nonmem_csv_impl(
     // column is present. Fires only when a dose event exists.
     if amt_col.is_some() {
         let any_dose = subjects.iter().any(|s| !s.doses.is_empty());
-        let all_zero = subjects
-            .iter()
-            .all(|s| s.doses.iter().all(|d| d.amt == 0.0));
+        let all_zero = subjects.iter().all(|s| s.doses.iter().all(|d| d.amt == 0.0));
         if any_dose && all_zero {
             population_warnings.push(
                 "W_ALL_DOSES_ZERO: every dose record has AMT = 0, so no drug enters the system \
@@ -1384,11 +1279,7 @@ fn read_nonmem_csv_impl(
     }
 
     excl_summary.obs_cmts_excluded = excl_obs_cmts_all.into_iter().collect();
-    let exclusions = if filter.is_some() {
-        Some(excl_summary)
-    } else {
-        None
-    };
+    let exclusions = if filter.is_some() { Some(excl_summary) } else { None };
 
     let table = if let Some(decls) = table_decls {
         // `table_indices` (and hence each row's `values`) is in declaration
@@ -1412,10 +1303,7 @@ fn read_nonmem_csv_impl(
     let mut population_warnings = population_warnings;
     // Only for a column the model reads (#2599): on a model-aware read an unread
     // column with gaps is not a problem, and the warning's claim would be false.
-    for name in existing_cov_names
-        .iter()
-        .filter(|n| routing.warns_missing_covariate(n, filter))
-    {
+    for name in existing_cov_names.iter().filter(|n| routing.warns_missing_covariate(n, filter)) {
         let missing: Vec<&str> = subjects
             .iter()
             .filter(|s| s.covariates.get(name).is_some_and(|v| v.is_nan()))
@@ -1635,9 +1523,7 @@ fn negative_cmt(row: &[String], cmt_col: Option<usize>) -> Option<usize> {
 /// `Err` holds the time of a tie no such move can order: an on/off row between two
 /// doses, or between a reset and a dose.
 fn order_cmt_toggle_ties(
-    toggles: &[crate::types::CmtToggle],
-    doses: &[(f64, usize)],
-    resets: &[f64],
+    toggles: &[crate::types::CmtToggle], doses: &[(f64, usize)], resets: &[f64],
     (obs_times, obs_rec): (&mut [f64], &[usize]),
     (pk_only_times, pk_only_rec): (&mut [f64], &[usize]),
 ) -> Result<(), f64> {
@@ -1658,20 +1544,15 @@ fn order_cmt_toggle_ties(
     tie_times.sort_by(f64::total_cmp);
     tie_times.dedup();
     for t in tie_times {
-        let mut tie: Vec<(usize, Item)> = doses
-            .iter()
-            .filter(|d| d.0 == t)
-            .map(|d| (d.1, Item::Dose))
-            .collect();
+        let mut tie: Vec<(usize, Item)> =
+            doses.iter().filter(|d| d.0 == t).map(|d| (d.1, Item::Dose)).collect();
         tie.extend(
             (0..pk_only_times.len())
                 .filter(|&m| pk_only_times[m] == t)
                 .map(|m| (pk_only_rec[m], Item::PkOnly(m))),
         );
         tie.extend(
-            (0..obs_times.len())
-                .filter(|&j| obs_times[j] == t)
-                .map(|j| (obs_rec[j], Item::Obs(j))),
+            (0..obs_times.len()).filter(|&j| obs_times[j] == t).map(|j| (obs_rec[j], Item::Obs(j))),
         );
         tie.sort_by_key(|e| e.0);
         let items: Vec<Item> = tie.into_iter().map(|e| e.1).collect();
@@ -1746,10 +1627,9 @@ fn resolve_row_cmt(row: &[String], cmt_col: Option<usize>) -> (usize, Option<Cmt
     match parse_cmt_cell(cell) {
         CmtCell::Value(n) => (n, None),
         CmtCell::Missing => (DEFAULT_CMT, Some(CmtDefaultCause::MissingCell)),
-        CmtCell::Unparseable => (
-            DEFAULT_CMT,
-            Some(CmtDefaultCause::UnparseableCell(truncate_example(cell))),
-        ),
+        CmtCell::Unparseable => {
+            (DEFAULT_CMT, Some(CmtDefaultCause::UnparseableCell(truncate_example(cell))))
+        }
     }
 }
 
@@ -1777,11 +1657,7 @@ fn truncate_example(cell: &str) -> String {
     if cleaned.chars().count() <= MAX_CMT_EXAMPLE_LEN {
         return cleaned;
     }
-    cleaned
-        .chars()
-        .take(MAX_CMT_EXAMPLE_LEN)
-        .chain(std::iter::once('…'))
-        .collect()
+    cleaned.chars().take(MAX_CMT_EXAMPLE_LEN).chain(std::iter::once('…')).collect()
 }
 
 /// Rows whose compartment the reader chose because the dataset did not say
@@ -1880,12 +1756,7 @@ impl CmtDefaults {
     /// The offending spellings, quoted, with an ellipsis only when a spelling was
     /// withheld.
     fn example_list(&self) -> String {
-        let mut s = self
-            .examples
-            .iter()
-            .map(|e| format!("\"{e}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let mut s = self.examples.iter().map(|e| format!("\"{e}\"")).collect::<Vec<_>>().join(", ");
         if self.examples_capped {
             s.push_str(", …");
         }
@@ -1935,9 +1806,7 @@ fn parse_cens(s: &str) -> CensCell<'_> {
 /// Resolve a row's `CENS` cell (absent column or short row = 0). Shared by the
 /// observation row and the filter [`RowContext`] (#1496), as [`resolve_row_cmt`].
 fn resolve_row_cens(row: &[String], cens_col: Option<usize>) -> CensCell<'_> {
-    cens_col
-        .and_then(|c| row.get(c))
-        .map_or(CensCell::Flag(0, ""), |s| parse_cens(s))
+    cens_col.and_then(|c| row.get(c)).map_or(CensCell::Flag(0, ""), |s| parse_cens(s))
 }
 
 /// The error for a non-whole `CENS` cell on an observation row that reads the
@@ -2012,11 +1881,7 @@ fn validate_dose_rate(rate: f64, id: &str, time: f64) -> Result<RateMode, String
     // A coded value is an exact negative integer: `fract() != 0.0` rejects -1.5
     // rather than rounding it into a code, and `as i64` saturates so an
     // out-of-range integer cannot alias -1/-2.
-    let code = if rate.fract() == 0.0 {
-        Some(rate as i64)
-    } else {
-        None
-    };
+    let code = if rate.fract() == 0.0 { Some(rate as i64) } else { None };
     let detail = match code {
         Some(-2) => return Ok(RateMode::ModeledDuration),
         Some(-1) => return Ok(RateMode::ModeledRate),
@@ -2040,11 +1905,7 @@ fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
         ));
     }
     // Integer code match as in `validate_dose_rate`; `as i64` saturates.
-    let code = if ss.fract() == 0.0 {
-        Some(ss as i64)
-    } else {
-        None
-    };
+    let code = if ss.fract() == 0.0 { Some(ss as i64) } else { None };
     match code {
         Some(0) => Ok(false),
         Some(1) => Ok(true),
@@ -2056,9 +1917,7 @@ fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
             } else {
                 ""
             };
-            Err(format!(
-                "subject {id}, time {time}: SS={ss} is not {NOT_AN_SS_CODE}.{hint}"
-            ))
+            Err(format!("subject {id}, time {time}: SS={ss} is not {NOT_AN_SS_CODE}.{hint}"))
         }
     }
 }
@@ -2069,13 +1928,7 @@ fn validate_ss(ss: f64, id: &str, time: f64) -> Result<bool, String> {
 /// silently make a bolus.) Single construction site for the primary dose and its
 /// `ADDL` copies (`ss = false`), so they cannot diverge (#722).
 fn dose_for_rate_mode(
-    time: f64,
-    amt: f64,
-    cmt: usize,
-    rate: f64,
-    ss: bool,
-    ii: f64,
-    rate_mode: RateMode,
+    time: f64, amt: f64, cmt: usize, rate: f64, ss: bool, ii: f64, rate_mode: RateMode,
 ) -> DoseEvent {
     match rate_mode {
         RateMode::Fixed => DoseEvent::new(time, amt, cmt, rate, ss, ii),
@@ -2096,10 +1949,7 @@ fn effective_evid(row: &[String], evid_col: Option<usize>, amt_col: Option<usize
     match evid_col {
         Some(c) => row.get(c).map(|s| parse_evid(s)).unwrap_or(0),
         None => {
-            let amt = amt_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+            let amt = amt_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
             if is_dosing_amt(amt) {
                 1
             } else {
@@ -2170,38 +2020,14 @@ const NOT_A_U16: &str = "a whole number from 0 to 65535";
 /// the maximum — the same measured edge [`parse_cmt_cell`] documents.
 const NOT_A_USIZE: &str = "a whole number from 0 to 18446744073709551615";
 
-const TIME_CELL: CellSpec = CellSpec {
-    name: "TIME",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const DV_CELL: CellSpec = CellSpec {
-    name: "DV",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const AMT_CELL: CellSpec = CellSpec {
-    name: "AMT",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const RATE_CELL: CellSpec = CellSpec {
-    name: "RATE",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
-const II_CELL: CellSpec = CellSpec {
-    name: "II",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
+const TIME_CELL: CellSpec = CellSpec { name: "TIME", what: NOT_A_NUMBER, holds: holds_number };
+const DV_CELL: CellSpec = CellSpec { name: "DV", what: NOT_A_NUMBER, holds: holds_number };
+const AMT_CELL: CellSpec = CellSpec { name: "AMT", what: NOT_A_NUMBER, holds: holds_number };
+const RATE_CELL: CellSpec = CellSpec { name: "RATE", what: NOT_A_NUMBER, holds: holds_number };
+const II_CELL: CellSpec = CellSpec { name: "II", what: NOT_A_NUMBER, holds: holds_number };
 /// `SS` on a dose row: [`validate_ss`] already rejects `1.5`, `-1` and `2`, so
 /// only the text that is no number at all is new here.
-const SS_DOSE_CELL: CellSpec = CellSpec {
-    name: "SS",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
+const SS_DOSE_CELL: CellSpec = CellSpec { name: "SS", what: NOT_A_NUMBER, holds: holds_number };
 /// What `SS` accepts, as every message about the cell spells it: [`validate_ss`]
 /// on a dose record and [`SS_FILTER_CELL`] in the `[data_selection]` context, so
 /// the two cannot drift.
@@ -2212,43 +2038,17 @@ const NOT_AN_SS_CODE: &str = "a supported steady-state code; expected 0 (not ste
 /// `SS` as the filter context reads it (`parse_unsigned_cell`). The message names
 /// what `SS` *accepts*, as [`validate_ss`] does (#1541); a refused cell is never a
 /// code.
-const SS_FILTER_CELL: CellSpec = CellSpec {
-    name: "SS",
-    what: NOT_AN_SS_CODE,
-    holds: holds_count,
-};
-const EVID_CELL: CellSpec = CellSpec {
-    name: "EVID",
-    what: NOT_A_U32,
-    holds: holds_evid,
-};
-const MDV_CELL: CellSpec = CellSpec {
-    name: "MDV",
-    what: NOT_A_USIZE,
-    holds: holds_count,
-};
-const ADDL_CELL: CellSpec = CellSpec {
-    name: "ADDL",
-    what: NOT_A_USIZE,
-    holds: holds_count,
-};
-const FREMTYPE_CELL: CellSpec = CellSpec {
-    name: "FREMTYPE",
-    what: NOT_A_U16,
-    holds: holds_fremtype,
-};
+const SS_FILTER_CELL: CellSpec = CellSpec { name: "SS", what: NOT_AN_SS_CODE, holds: holds_count };
+const EVID_CELL: CellSpec = CellSpec { name: "EVID", what: NOT_A_U32, holds: holds_evid };
+const MDV_CELL: CellSpec = CellSpec { name: "MDV", what: NOT_A_USIZE, holds: holds_count };
+const ADDL_CELL: CellSpec = CellSpec { name: "ADDL", what: NOT_A_USIZE, holds: holds_count };
+const FREMTYPE_CELL: CellSpec =
+    CellSpec { name: "FREMTYPE", what: NOT_A_U16, holds: holds_fremtype };
 /// `CENS` in the `[data_selection]` context. The observation row keeps its own
 /// message ([`cens_not_whole_error`], #1496).
-const CENS_FILTER_CELL: CellSpec = CellSpec {
-    name: "CENS",
-    what: "a whole number",
-    holds: holds_whole,
-};
-const TENTRY_CELL: CellSpec = CellSpec {
-    name: "TENTRY",
-    what: NOT_A_NUMBER,
-    holds: holds_number,
-};
+const CENS_FILTER_CELL: CellSpec =
+    CellSpec { name: "CENS", what: "a whole number", holds: holds_whole };
+const TENTRY_CELL: CellSpec = CellSpec { name: "TENTRY", what: NOT_A_NUMBER, holds: holds_number };
 
 /// The row's cell in `col`, trimmed, when it is present, not missing, and not
 /// readable as `spec` says; `None` otherwise — including for an absent column and
@@ -2286,11 +2086,7 @@ fn unreadable_cell_error(id: &str, at: &str, spec: &CellSpec, cell: &str, reads:
 /// `ignore = CENS == 0` would otherwise remove a `CENS = abc` record as an
 /// ordinary exclusion. `rule` is the fired-condition string.
 fn filter_reads_unreadable_cell_error(
-    id: &str,
-    at: &str,
-    rule: &str,
-    spec: &CellSpec,
-    cell: &str,
+    id: &str, at: &str, rule: &str, spec: &CellSpec, cell: &str,
 ) -> String {
     format!(
         "subject {id}, {at}: the [data_selection] rule \"{rule}\" decides this record \
@@ -2305,19 +2101,14 @@ fn filter_reads_unreadable_cell_error(
 /// The finite number in cell `idx` of `row`, or `None` for a missing, unparseable or
 /// non-finite cell: the cells the LOCF update reads no value from.
 fn finite_cell(row: &[String], idx: usize) -> Option<f64> {
-    row.get(idx)
-        .and_then(|s| s.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
+    row.get(idx).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite())
 }
 
 /// Record, for each column of `watch` this record has no value in, the record's
 /// `TIME` as written, unless the column already has an entry: see
 /// [`Subject::filled_cells`] (#2036).
 fn note_filled_cells(
-    filled: &mut Vec<(String, f64)>,
-    watch: &[(&str, usize)],
-    row: &[String],
-    raw_time: f64,
+    filled: &mut Vec<(String, f64)>, watch: &[(&str, usize)], row: &[String], raw_time: f64,
 ) {
     for &(name, idx) in watch {
         if finite_cell(row, idx).is_none() && !filled.iter().any(|(c, _)| c == name) {
@@ -2360,18 +2151,7 @@ fn parse_subject(
     routing: &ObsRouting,
     // Column index of the TENTRY (left-truncation time) column, if present.
     _tentry_col: Option<usize>,
-) -> Result<
-    (
-        Subject,
-        usize,
-        usize,
-        SubjectExclusion,
-        Vec<String>,
-        usize,
-        CmtDefaults,
-    ),
-    String,
-> {
+) -> Result<(Subject, usize, usize, SubjectExclusion, Vec<String>, usize, CmtDefaults), String> {
     let mut doses = Vec::new();
     // File-order record index (position in `rows`) of each dose / observation,
     // parallel to `doses` (pre-sort) and `obs_times`. Used after the loop to
@@ -2471,10 +2251,7 @@ fn parse_subject(
         let mut first_val: Option<f64> = None;
         let mut is_tv = false;
         for row in rows {
-            let v_opt = row
-                .get(*idx)
-                .and_then(|s| s.parse::<f64>().ok())
-                .filter(|v| v.is_finite());
+            let v_opt = row.get(*idx).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
             if let Some(v) = v_opt {
                 match first_val {
                     None => first_val = Some(v),
@@ -2491,9 +2268,7 @@ fn parse_subject(
         // missing record would read the subject-static value.
         let gapped = || {
             first_val.is_some()
-                && rows
-                    .iter()
-                    .any(|row| row.get(*idx).is_none_or(|s| is_missing_cell(s)))
+                && rows.iter().any(|row| row.get(*idx).is_none_or(|s| is_missing_cell(s)))
         };
         if is_tv || (routing.no_carry_forward.contains(name) && gapped()) {
             tv_names.push(name.as_str());
@@ -2556,10 +2331,8 @@ fn parse_subject(
         // with this record's covariate values" semantics.
         if any_tv {
             for (name, idx) in tv_names.iter().zip(tv_indices.iter()) {
-                let value = row
-                    .get(*idx)
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .filter(|v| v.is_finite());
+                let value =
+                    row.get(*idx).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
                 match value {
                     Some(v) => {
                         locf_state.insert((*name).to_string(), v);
@@ -2585,11 +2358,7 @@ fn parse_subject(
         // With no EVID column the record type is inferred from AMT, so every record
         // reads AMT; with one, only a dose record does (checked in the dose arm).
         let amt_unreadable = unreadable_cell(row, amt_col, &AMT_CELL);
-        let amt_cols: &[&str] = if evid_col.is_none() {
-            &["amt", "evid"]
-        } else {
-            &["amt"]
-        };
+        let amt_cols: &[&str] = if evid_col.is_none() { &["amt", "evid"] } else { &["amt"] };
         let row_at = |t: f64| row_label(t, time_unreadable.is_some(), row_seq);
         let mdv = mdv_col
             .and_then(|c| row.get(c))
@@ -2624,21 +2393,15 @@ fn parse_subject(
             // Missing-sensitive numeric columns map `.`/blank to NaN so the
             // filter never matches them (see `parse_f64_or_nan`).
             let dv_for_ctx = parse_f64_or_nan(row.get(dv_col).map(|s| s.as_str()).unwrap_or(""));
-            let amt_for_ctx = amt_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64_or_nan(s))
-                .unwrap_or(f64::NAN);
+            let amt_for_ctx =
+                amt_col.and_then(|c| row.get(c)).map(|s| parse_f64_or_nan(s)).unwrap_or(f64::NAN);
             // Resolved as the dose / observation arms do (#1009). The cause is kept:
             // if a CMT-reading rule deletes the row, only here can it be counted.
             let (cmt_for_ctx, cmt_cause_for_filter) = resolve_row_cmt(row, cmt_col);
-            let rate_for_ctx = rate_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64_or_nan(s))
-                .unwrap_or(f64::NAN);
-            let ii_for_ctx = ii_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64_or_nan(s))
-                .unwrap_or(f64::NAN);
+            let rate_for_ctx =
+                rate_col.and_then(|c| row.get(c)).map(|s| parse_f64_or_nan(s)).unwrap_or(f64::NAN);
+            let ii_for_ctx =
+                ii_col.and_then(|c| row.get(c)).map(|s| parse_f64_or_nan(s)).unwrap_or(f64::NAN);
             let ss_for_ctx = ss_col
                 .and_then(|c| row.get(c))
                 .and_then(|s| parse_unsigned_cell::<usize>(s))
@@ -2651,8 +2414,7 @@ fn parse_subject(
                 cov_indices
                     .iter()
                     .filter_map(|(name, idx)| {
-                        row.get(*idx)
-                            .map(|cell| (name.to_lowercase(), cell.trim().to_string()))
+                        row.get(*idx).map(|cell| (name.to_lowercase(), cell.trim().to_string()))
                     })
                     .collect()
             } else {
@@ -2682,48 +2444,22 @@ fn parse_subject(
             // map, where an unparseable cell carries the previous value forward.
             let filter_cells: [(&CellSpec, Option<&str>, &[&str]); 11] = [
                 (&TIME_CELL, time_unreadable, &["time"]),
-                (
-                    &DV_CELL,
-                    unreadable_cell(row, Some(dv_col), &DV_CELL),
-                    &["dv"],
-                ),
+                (&DV_CELL, unreadable_cell(row, Some(dv_col), &DV_CELL), &["dv"]),
                 (&EVID_CELL, evid_unreadable, &["evid"]),
                 (&AMT_CELL, amt_unreadable, amt_cols),
-                (
-                    &RATE_CELL,
-                    unreadable_cell(row, rate_col, &RATE_CELL),
-                    &["rate"],
-                ),
+                (&RATE_CELL, unreadable_cell(row, rate_col, &RATE_CELL), &["rate"]),
                 (&II_CELL, unreadable_cell(row, ii_col, &II_CELL), &["ii"]),
                 (&MDV_CELL, mdv_unreadable, &["mdv"]),
-                (
-                    &SS_FILTER_CELL,
-                    unreadable_cell(row, ss_col, &SS_FILTER_CELL),
-                    &["ss"],
-                ),
-                (
-                    &CENS_FILTER_CELL,
-                    unreadable_cell(row, cens_col, &CENS_FILTER_CELL),
-                    &["cens"],
-                ),
-                (
-                    &FREMTYPE_CELL,
-                    unreadable_cell(row, fremtype_col, &FREMTYPE_CELL),
-                    &["fremtype"],
-                ),
-                (
-                    &TENTRY_CELL,
-                    unreadable_cell(row, _tentry_col, &TENTRY_CELL),
-                    &["tentry"],
-                ),
+                (&SS_FILTER_CELL, unreadable_cell(row, ss_col, &SS_FILTER_CELL), &["ss"]),
+                (&CENS_FILTER_CELL, unreadable_cell(row, cens_col, &CENS_FILTER_CELL), &["cens"]),
+                (&FREMTYPE_CELL, unreadable_cell(row, fremtype_col, &FREMTYPE_CELL), &["fremtype"]),
+                (&TENTRY_CELL, unreadable_cell(row, _tentry_col, &TENTRY_CELL), &["tentry"]),
             ];
             for (spec, cell, cols) in filter_cells {
                 let Some(cell) = cell else { continue };
                 let decider = match &fired {
                     Some(rule) => rule.depends_on(&ctx, cols).then(|| rule.source(id)),
-                    None => sel
-                        .first_clause_depending_on(&ctx, cols)
-                        .map(|r| r.source(id)),
+                    None => sel.first_clause_depending_on(&ctx, cols).map(|r| r.source(id)),
                 };
                 if let Some(src) = decider {
                     return Err(filter_reads_unreadable_cell_error(
@@ -2769,22 +2505,10 @@ fn parse_subject(
         // TIME and its record type; MDV decides whether an EVID=0 record is an
         // observation. The dose and observation arms check the cells only they read.
         if let Some(cell) = time_unreadable {
-            return Err(unreadable_cell_error(
-                id,
-                &row_at(time),
-                &TIME_CELL,
-                cell,
-                "TIME",
-            ));
+            return Err(unreadable_cell_error(id, &row_at(time), &TIME_CELL, cell, "TIME"));
         }
         if let Some(cell) = evid_unreadable {
-            return Err(unreadable_cell_error(
-                id,
-                &row_at(time),
-                &EVID_CELL,
-                cell,
-                "EVID",
-            ));
+            return Err(unreadable_cell_error(id, &row_at(time), &EVID_CELL, cell, "EVID"));
         }
         if evid_col.is_none() {
             if let Some(cell) = amt_unreadable {
@@ -2799,22 +2523,13 @@ fn parse_subject(
         }
         if evid == 0 {
             if let Some(cell) = mdv_unreadable {
-                return Err(unreadable_cell_error(
-                    id,
-                    &row_at(time),
-                    &MDV_CELL,
-                    cell,
-                    "MDV",
-                ));
+                return Err(unreadable_cell_error(id, &row_at(time), &MDV_CELL, cell, "MDV"));
             }
         }
 
         // AMT for this row (parsed once, post-filter; reused by the dose arm).
         // A missing column or `.` cell parses to 0.0 (see `parse_f64`).
-        let row_amt = amt_col
-            .and_then(|c| row.get(c))
-            .map(|s| parse_f64(s))
-            .unwrap_or(0.0);
+        let row_amt = amt_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
         // AMT that won't be administered: a dosing AMT on a record that is neither a
         // dose nor a *scored* observation. The `mdv != 0` gate avoids false fires on
         // a scored row with a forward-filled AMT; mostly catches mistyped dose rows
@@ -2905,22 +2620,13 @@ fn parse_subject(
             // expansion below, so remember where this row's doses start and record
             // the finding once the row is fully expanded.
             let doses_before_this_row = doses.len();
-            let rate = rate_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+            let rate = rate_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
             // Classify RATE (#324); `raw_time` names the value the user wrote.
             let rate_mode = validate_dose_rate(rate, id, raw_time)?;
-            let ii = ii_col
-                .and_then(|c| row.get(c))
-                .map(|s| parse_f64(s))
-                .unwrap_or(0.0);
+            let ii = ii_col.and_then(|c| row.get(c)).map(|s| parse_f64(s)).unwrap_or(0.0);
             // Only `SS=0`/`SS=1` are supported (`validate_ss`); `raw_time` as above.
             let ss = validate_ss(
-                ss_col
-                    .and_then(|c| row.get(c))
-                    .map(|s| parse_f64(s.trim()))
-                    .unwrap_or(0.0),
+                ss_col.and_then(|c| row.get(c)).map(|s| parse_f64(s.trim())).unwrap_or(0.0),
                 id,
                 raw_time,
             )?;
@@ -3024,13 +2730,7 @@ fn parse_subject(
             // A present non-number DV (#1501): every endpoint reads DV, so check it
             // before routing.
             if let Some(cell) = unreadable_cell(row, Some(dv_col), &DV_CELL) {
-                return Err(unreadable_cell_error(
-                    id,
-                    &row_at(raw_time),
-                    &DV_CELL,
-                    cell,
-                    "DV",
-                ));
+                return Err(unreadable_cell_error(id, &row_at(raw_time), &DV_CELL, cell, "DV"));
             }
 
             // Route a TTE / discrete-state / count CMT to `obs_records` (disjoint
@@ -3242,10 +2942,8 @@ fn parse_subject(
                 if l2_col.is_some() {
                     // NONMEM writes L2 as an integer id; a blank / unparsable
                     // cell means "ungrouped" (0), matching the empty-vector case.
-                    let l2 = l2_col
-                        .and_then(|c| row.get(c))
-                        .and_then(|s| parse_l2_id(s))
-                        .unwrap_or(0);
+                    let l2 =
+                        l2_col.and_then(|c| row.get(c)).and_then(|s| parse_l2_id(s)).unwrap_or(0);
                     obs_l2.push(l2);
                 }
                 if any_tv {
@@ -3272,12 +2970,10 @@ fn parse_subject(
             // (#2732); it stays a pk-only row.
             if evid == 2 {
                 let on_cmt =
-                    cmt_col
-                        .and_then(|c| row.get(c))
-                        .and_then(|s| match parse_cmt_cell(s) {
-                            CmtCell::Value(n) if n > 0 => Some(n),
-                            _ => None,
-                        });
+                    cmt_col.and_then(|c| row.get(c)).and_then(|s| match parse_cmt_cell(s) {
+                        CmtCell::Value(n) if n > 0 => Some(n),
+                        _ => None,
+                    });
                 if let Some((n, on)) = off_cmt.map(|n| (n, false)).or(on_cmt.map(|n| (n, true))) {
                     cmt_toggles.push(crate::types::CmtToggle {
                         pk_only: pk_only_times.len(),
@@ -3386,11 +3082,8 @@ fn parse_subject(
                 Rec::PkOnly(m) => (pk_only_raw_times[m], pk_only_times[m]),
                 Rec::Reset(r) => (written_at(reset_times[r]), reset_times[r]),
             };
-            sorted_doses[k].implied = Some(crate::types::ImpliedDose {
-                parent,
-                param_time,
-                gov_time,
-            });
+            sorted_doses[k].implied =
+                Some(crate::types::ImpliedDose { parent, param_time, gov_time });
             match rec {
                 Rec::Obs(j) => gov_by_obs.push((k, j)),
                 Rec::PkOnly(m) => gov_by_pk_only.push((k, m)),
@@ -3426,9 +3119,7 @@ fn parse_subject(
     if !reset_times.windows(2).all(|w| w[0] <= w[1]) {
         let mut rperm: Vec<usize> = (0..reset_times.len()).collect();
         rperm.cold_sort_by(&|&a, &b| {
-            reset_times[a]
-                .partial_cmp(&reset_times[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
+            reset_times[a].partial_cmp(&reset_times[b]).unwrap_or(std::cmp::Ordering::Equal)
         });
         reset_times = rperm.iter().map(|&i| reset_times[i]).collect();
         if any_tv {
@@ -3445,11 +3136,8 @@ fn parse_subject(
     if cmt_toggles.iter().all(|c| c.on) {
         cmt_toggles.clear();
     }
-    let dose_ties: Vec<(f64, usize)> = sorted_doses
-        .iter()
-        .zip(&sorted_dose_rec)
-        .map(|(d, &r)| (d.time, r))
-        .collect();
+    let dose_ties: Vec<(f64, usize)> =
+        sorted_doses.iter().zip(&sorted_dose_rec).map(|(d, &r)| (d.time, r)).collect();
     order_cmt_toggle_ties(
         &cmt_toggles,
         &dose_ties,

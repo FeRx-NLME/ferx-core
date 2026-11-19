@@ -78,15 +78,11 @@ impl DoseAction {
             return Err("dose target compartment is 0, but CMT is 1-based".to_string());
         }
         if !amt.is_finite() || amt < 0.0 {
-            return Err(format!(
-                "dose amount must be finite and non-negative; got {amt}"
-            ));
+            return Err(format!("dose amount must be finite and non-negative; got {amt}"));
         }
         if let Some(rate) = rate {
             if !(rate.is_finite() && rate > 0.0) {
-                return Err(format!(
-                    "Infuse requires a positive, finite rate; got {rate}"
-                ));
+                return Err(format!("Infuse requires a positive, finite rate; got {rate}"));
             }
         }
         Ok(())
@@ -122,11 +118,7 @@ pub struct MonitorSpec {
 impl MonitorSpec {
     /// Declare a monitored signal `name` reading endpoint `cmt` under `mode`.
     pub fn new(name: impl Into<String>, cmt: usize, mode: ObserveMode) -> Self {
-        Self {
-            name: name.into(),
-            cmt,
-            mode,
-        }
+        Self { name: name.into(), cmt, mode }
     }
 }
 
@@ -403,9 +395,7 @@ pub struct AdaptiveSubjectMetrics {
 /// AUC relies on this being false (a dose at a stop has no window to score); it is
 /// currently unreachable there, so the call site `debug_assert!`s it.
 pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
-    decisions
-        .iter()
-        .any(|d| matches!(d.outcome, DecisionOutcome::Stop { dosed } if dosed > 0))
+    decisions.iter().any(|d| matches!(d.outcome, DecisionOutcome::Stop { dosed } if dosed > 0))
 }
 
 /// Compute the [`AdaptiveSubjectMetrics`] of one `(subject, draw, sim)` run from its dose
@@ -413,14 +403,9 @@ pub(crate) fn run_has_dose_on_stop(decisions: &[DecisionLogEntry]) -> bool {
 /// `window_aucs` is the per-window signal AUC series (`decisions − 1` long, `&[]` with no
 /// `auc_target`). The programmatic path passes `None` / `&[]`.
 pub(crate) fn compute_subject_metrics(
-    subject: &str,
-    draw: usize,
-    sim: usize,
-    ledger: &[DoseLedgerEntry],
-    decisions: &[DecisionLogEntry],
-    target_window: Option<(f64, f64)>,
-    auc_target: Option<(f64, f64)>,
-    window_aucs: &[f64],
+    subject: &str, draw: usize, sim: usize, ledger: &[DoseLedgerEntry],
+    decisions: &[DecisionLogEntry], target_window: Option<(f64, f64)>,
+    auc_target: Option<(f64, f64)>, window_aucs: &[f64],
 ) -> AdaptiveSubjectMetrics {
     let cumulative_dose: f64 = ledger.iter().map(|e| e.amt).sum();
     let n_doses = ledger.len();
@@ -439,33 +424,21 @@ pub(crate) fn compute_subject_metrics(
         }
     }
 
-    let n_holds = decisions
-        .iter()
-        .filter(|d| matches!(d.outcome, DecisionOutcome::Hold))
-        .count();
-    let n_not_due = decisions
-        .iter()
-        .filter(|d| matches!(d.outcome, DecisionOutcome::NotDue))
-        .count();
-    let stop = decisions
-        .iter()
-        .find(|d| matches!(d.outcome, DecisionOutcome::Stop { .. }));
+    let n_holds = decisions.iter().filter(|d| matches!(d.outcome, DecisionOutcome::Hold)).count();
+    let n_not_due =
+        decisions.iter().filter(|d| matches!(d.outcome, DecisionOutcome::NotDue)).count();
+    let stop = decisions.iter().find(|d| matches!(d.outcome, DecisionOutcome::Stop { .. }));
     let discontinued = stop.is_some();
     let time_to_discontinuation = stop.map(|d| d.time);
 
     // Over the first monitor's observed values; decisions without one are skipped.
-    let signal_vals: Vec<f64> = decisions
-        .iter()
-        .filter_map(|d| d.observed_signals.first().map(|s| s.value))
-        .collect();
+    let signal_vals: Vec<f64> =
+        decisions.iter().filter_map(|d| d.observed_signals.first().map(|s| s.value)).collect();
     let (signal_min, signal_max, signal_mean) = if signal_vals.is_empty() {
         (None, None, None)
     } else {
         let min = signal_vals.iter().copied().fold(f64::INFINITY, f64::min);
-        let max = signal_vals
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max);
+        let max = signal_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let mean = signal_vals.iter().sum::<f64>() / signal_vals.len() as f64;
         (Some(min), Some(max), Some(mean))
     };
@@ -607,10 +580,8 @@ pub(crate) fn subject_assay_base_seed(root: u64, subject_id: &str, replicate: us
 pub(crate) fn assay_standard_normal(base_seed: u64, decision_index: usize, analyte: &str) -> f64 {
     use rand::SeedableRng;
     use rand_distr::{Distribution, Normal};
-    let key = combine_seed(
-        combine_seed(base_seed, decision_index as u64),
-        stable_hash_str(analyte),
-    );
+    let key =
+        combine_seed(combine_seed(base_seed, decision_index as u64), stable_hash_str(analyte));
     let mut rng = rand::rngs::StdRng::seed_from_u64(key);
     Normal::new(0.0, 1.0).unwrap().sample(&mut rng)
 }
@@ -890,10 +861,7 @@ fn snapped_integer(q: f64) -> Option<f64> {
 fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
     let (ql, qh) = (lo / s, hi / s);
     let kl = snapped_integer(ql).unwrap_or_else(|| ql.ceil());
-    (
-        if lo > 0.0 { kl.max(1.0) } else { kl },
-        snapped_integer(qh).unwrap_or_else(|| qh.floor()),
-    )
+    (if lo > 0.0 { kl.max(1.0) } else { kl }, snapped_integer(qh).unwrap_or_else(|| qh.floor()))
 }
 
 /// `x` rounded to the nearest multiple of `s`, ties up: the half is nudged up by
@@ -956,11 +924,7 @@ impl DoseGrid {
     /// [`Self::step_percent`], since the relative tie nudge makes `50 / p` inexact (#2890).
     pub(crate) fn lowest_raised_by(step: f64, p: f64) -> Option<f64> {
         const MAX_INDEX: f64 = 4_503_599_627_370_496.0; // 2^52
-        let open = Self {
-            step,
-            low: 0.0,
-            high: f64::INFINITY,
-        };
+        let open = Self { step, low: 0.0, high: f64::INFINITY };
         let raised = |k: f64| {
             let d = grid_point(k, step);
             d.is_finite() && open.step_percent(d, p, true) > d
@@ -1023,13 +987,10 @@ pub(crate) fn round_to_message(val: &str) -> String {
 
 /// The first dose invariant `plan` breaks, if any, under `spec`'s `round_to` and rules.
 pub(crate) fn dose_plan_violation(
-    spec: &AdaptiveDosingSpec,
-    plan: &SubjectDosePlan,
+    spec: &AdaptiveDosingSpec, plan: &SubjectDosePlan,
 ) -> Option<DosePlanViolation> {
-    let levels: Option<Vec<Option<f64>>> = plan
-        .levels
-        .as_ref()
-        .map(|l| l.iter().copied().map(Some).collect());
+    let levels: Option<Vec<Option<f64>>> =
+        plan.levels.as_ref().map(|l| l.iter().copied().map(Some).collect());
     known_dose_violation(
         Some(plan.start_dose),
         Some(plan.dose_bounds.0),
@@ -1044,10 +1005,7 @@ pub(crate) fn dose_plan_violation(
 /// its values are known (#2667). The one implementation of each dose invariant.
 #[allow(clippy::float_cmp)] // `start_dose ∈ levels` is exact membership
 fn known_dose_violation(
-    d: Option<f64>,
-    lo: Option<f64>,
-    hi: Option<f64>,
-    levels: Option<&[Option<f64>]>,
+    d: Option<f64>, lo: Option<f64>, hi: Option<f64>, levels: Option<&[Option<f64>]>,
     grid: Option<GridRule>,
 ) -> Option<DosePlanViolation> {
     // `low >= 0` and `low <= high` make a negative `high` invalid on its own.
@@ -1165,11 +1123,7 @@ impl DosePlanViolation {
                             "[adaptive_dosing]: start_dose {d} must be one of the declared \
                              levels [{}]. It is none of the numbers, and the ladder increases, \
                              so no expression rung can equal it: none lies {gap}.",
-                            rungs
-                                .iter()
-                                .map(DoseValue::source)
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            rungs.iter().map(DoseValue::source).collect::<Vec<_>>().join(", ")
                         )
                     }
                 }
@@ -1196,37 +1150,20 @@ impl DosePlanViolation {
     /// The per-subject text (#944): the subject (and oracle replicate), each value as
     /// written and evaluated, and the covariate / subject values the expressions read.
     pub(crate) fn subject_message(
-        &self,
-        spec: &AdaptiveDosingSpec,
-        plan: &SubjectDosePlan,
-        subject_id: &str,
-        replicate: Option<ReplicateTag>,
-        reads: &[(String, f64)],
+        &self, spec: &AdaptiveDosingSpec, plan: &SubjectDosePlan, subject_id: &str,
+        replicate: Option<ReplicateTag>, reads: &[(String, f64)],
     ) -> String {
         let (lo, hi) = plan.dose_bounds;
         let d = plan.start_dose;
         let head = match replicate {
             None => format!("[adaptive_dosing] subject {subject_id}:"),
-            Some(k) => format!(
-                "[adaptive_dosing] subject {subject_id}, {}:",
-                k.replicate_label()
-            ),
+            Some(k) => format!("[adaptive_dosing] subject {subject_id}, {}:", k.replicate_label()),
         };
         let start = spec.start_dose.source();
-        let bounds = format!(
-            "[{}, {}]",
-            spec.dose_bounds.0.source(),
-            spec.dose_bounds.1.source()
-        );
+        let bounds = format!("[{}, {}]", spec.dose_bounds.0.source(), spec.dose_bounds.1.source());
         let rungs = spec.levels.as_deref().unwrap_or(&[]);
-        let ladder = format!(
-            "[{}]",
-            rungs
-                .iter()
-                .map(DoseValue::source)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let ladder =
+            format!("[{}]", rungs.iter().map(DoseValue::source).collect::<Vec<_>>().join(", "));
         let values = plan.levels.as_deref().unwrap_or(&[]);
         let body = match self {
             DosePlanViolation::Bounds => format!(
@@ -1251,9 +1188,7 @@ impl DosePlanViolation {
             DosePlanViolation::LevelOutsideBounds(i, bad) => format!(
                 "level {} evaluates to {bad}, outside dose_bounds = {bounds}, which evaluate \
                  to [{lo}, {hi}].",
-                rungs
-                    .get(*i)
-                    .map_or_else(|| bad.to_string(), DoseValue::source)
+                rungs.get(*i).map_or_else(|| bad.to_string(), DoseValue::source)
             ),
             DosePlanViolation::NoGridPoint => format!(
                 "no multiple of round_to = {} lies within dose_bounds = {bounds}, which \
@@ -1273,11 +1208,7 @@ impl DosePlanViolation {
         if reads.is_empty() {
             return format!("{head} {body}");
         }
-        let read = reads
-            .iter()
-            .map(|(n, v)| format!("{n} = {v}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let read = reads.iter().map(|(n, v)| format!("{n} = {v}")).collect::<Vec<_>>().join(", ");
         format!(
             "{head} {body} The dose expressions read {read}, at the first decision (t = {}).",
             spec.at[0]
@@ -1289,17 +1220,13 @@ impl DosePlanViolation {
 /// shared by the block parser and [`AdaptiveDosingSpec::validate`]. `what` names it.
 pub(crate) fn validate_increasing_finite(xs: &[f64], what: &str) -> Result<(), String> {
     if xs.is_empty() {
-        return Err(format!(
-            "[adaptive_dosing]: {what} must be a non-empty list"
-        ));
+        return Err(format!("[adaptive_dosing]: {what} must be a non-empty list"));
     }
     if !xs.iter().all(|x| x.is_finite()) {
         return Err(format!("[adaptive_dosing]: {what} must all be finite"));
     }
     if xs.windows(2).any(|w| w[1] <= w[0]) {
-        return Err(format!(
-            "[adaptive_dosing]: {what} must be strictly increasing"
-        ));
+        return Err(format!("[adaptive_dosing]: {what} must be strictly increasing"));
     }
     Ok(())
 }
@@ -1310,10 +1237,7 @@ impl AdaptiveDosingSpec {
     pub(crate) fn literal_dose_plan(&self) -> Option<SubjectDosePlan> {
         Some(SubjectDosePlan {
             start_dose: self.start_dose.as_literal()?,
-            dose_bounds: (
-                self.dose_bounds.0.as_literal()?,
-                self.dose_bounds.1.as_literal()?,
-            ),
+            dose_bounds: (self.dose_bounds.0.as_literal()?, self.dose_bounds.1.as_literal()?),
             levels: match &self.levels {
                 Some(l) => Some(l.iter().map(DoseValue::as_literal).collect::<Option<_>>()?),
                 None => None,
@@ -1325,10 +1249,7 @@ impl AdaptiveDosingSpec {
     /// invalid one, which `validate` refuses first (P3).
     pub(crate) fn grid_rule(&self) -> Option<GridRule> {
         let step = self.round_to.filter(|s| s.is_finite() && *s > 0.0)?;
-        Some(GridRule {
-            step,
-            percent_steps: self.has_percent_steps(),
-        })
+        Some(GridRule { step, percent_steps: self.has_percent_steps() })
     }
 
     /// Whether a rule takes a percentage dose step (`increase N%` / `decrease N%`).
@@ -1417,17 +1338,13 @@ impl AdaptiveDosingSpec {
     /// by `compile_adaptive` as the safety net for a hand-built `pub` spec.
     pub fn validate(&self) -> Result<(), String> {
         if self.rules.is_empty() {
-            return Err(
-                "[adaptive_dosing]: at least one `when … : …` rule is required".to_string(),
-            );
+            return Err("[adaptive_dosing]: at least one `when … : …` rule is required".to_string());
         }
         // Dose invariants among the numeric values (#944, #2667); those involving an
         // expression run per subject in `resolve_dose_plans`. Reported at each check's
         // historical position so the same invariant is named as before #944.
-        let levels: Option<Vec<Option<f64>>> = self
-            .levels
-            .as_ref()
-            .map(|l| l.iter().map(DoseValue::as_literal).collect());
+        let levels: Option<Vec<Option<f64>>> =
+            self.levels.as_ref().map(|l| l.iter().map(DoseValue::as_literal).collect());
         let violation = known_dose_violation(
             self.start_dose.as_literal(),
             self.dose_bounds.0.as_literal(),
@@ -1466,22 +1383,15 @@ impl AdaptiveDosingSpec {
         validate_increasing_finite(&self.at, "`at` times")?;
         if self.at[0] < 0.0 {
             // Strictly increasing ⇒ `at[0]` is the minimum.
-            return Err(format!(
-                "[adaptive_dosing]: `at` times must be >= 0: {}",
-                self.at[0]
-            ));
+            return Err(format!("[adaptive_dosing]: `at` times must be >= 0: {}", self.at[0]));
         }
         if self.confirm < 1 {
             return Err(
-                "[adaptive_dosing]: confirm must be >= 1 (1 acts on the first breach)".to_string(),
+                "[adaptive_dosing]: confirm must be >= 1 (1 acts on the first breach)".to_string()
             );
         }
         // Exactly one signal source: `observe` (latent) or `with_assay_error`.
-        match (
-            self.with_assay_error,
-            self.observe.is_some(),
-            self.assay_cmt.is_some(),
-        ) {
+        match (self.with_assay_error, self.observe.is_some(), self.assay_cmt.is_some()) {
             (false, true, false) => {} // Ipred: titrate on the `observe` expression.
             (true, false, true) => {}  // Dv: titrate on the noised output at `assay_cmt`.
             (false, false, _) => {
@@ -1494,7 +1404,7 @@ impl AdaptiveDosingSpec {
             }
             (false, true, true) => {
                 return Err(
-                    "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string(),
+                    "[adaptive_dosing]: assay_cmt is set but with_assay_error = false".to_string()
                 )
             }
             (true, true, _) => {
@@ -1597,10 +1507,7 @@ impl AdaptiveDosingSpec {
                 validate_increasing_finite(l, "intervals")?;
                 // Strictly increasing ⇒ `l[0]` is the minimum.
                 if l[0] <= 0.0 {
-                    return Err(format!(
-                        "[adaptive_dosing]: intervals must be > 0: {}",
-                        l[0]
-                    ));
+                    return Err(format!("[adaptive_dosing]: intervals must be > 0: {}", l[0]));
                 }
                 if !l.contains(&start) {
                     return Err(format!(
@@ -1610,10 +1517,8 @@ impl AdaptiveDosingSpec {
                 }
             }
         }
-        if let Some(r) = self
-            .rules
-            .iter()
-            .find(|r| r.interval.is_some() && r.action == AdaptiveAction::Stop)
+        if let Some(r) =
+            self.rules.iter().find(|r| r.interval.is_some() && r.action == AdaptiveAction::Stop)
         {
             return Err(format!(
                 "[adaptive_dosing]: `stop` cannot be combined with `lengthen` / `shorten` (a \
@@ -1623,10 +1528,8 @@ impl AdaptiveDosingSpec {
         }
         // `Maintain` is the dose effect of an interval-only rule; without the interval
         // effect the rule does nothing, and its label would name no effect at all.
-        if let Some(r) = self
-            .rules
-            .iter()
-            .find(|r| r.interval.is_none() && r.action == AdaptiveAction::Maintain)
+        if let Some(r) =
+            self.rules.iter().find(|r| r.interval.is_none() && r.action == AdaptiveAction::Maintain)
         {
             return Err(format!(
                 "[adaptive_dosing]: a rule must have an effect; `Maintain` is only the dose \
@@ -1769,12 +1672,7 @@ impl AdaptiveRule {
             .chain(self.interval.map(|i| i.label().to_string()))
             .filter(|e| !e.is_empty())
             .collect();
-        format!(
-            "signal {} {} : {}",
-            self.op.symbol(),
-            self.threshold,
-            effects.join(", ")
-        )
+        format!("signal {} {} : {}", self.op.symbol(), self.threshold, effects.join(", "))
     }
 }
 
@@ -1798,13 +1696,9 @@ mod tests {
 
     #[test]
     fn infuse_action_sets_rate_and_derived_duration() {
-        let de = DoseAction::Infuse {
-            amt: 100.0,
-            cmt: 2,
-            rate: 25.0,
-        }
-        .to_dose_event(0.0)
-        .expect("infusion yields a dose event");
+        let de = DoseAction::Infuse { amt: 100.0, cmt: 2, rate: 25.0 }
+            .to_dose_event(0.0)
+            .expect("infusion yields a dose event");
         assert_eq!(de.cmt_raw(), 2);
         assert_eq!(de.rate, 25.0);
         // DoseEvent::new derives duration = amt / rate.
@@ -1871,16 +1765,8 @@ mod tests {
     /// 500; just below a tie goes down.
     #[test]
     fn round_to_grid_sends_ties_up_on_a_decimal_grid() {
-        assert_eq!(
-            (0.35f64 / 0.1).round(),
-            3.0,
-            "premise: plain round sends it down"
-        );
-        assert!(
-            (round_to_grid(0.35, 0.1) - 0.4).abs() < 1e-12,
-            "{}",
-            round_to_grid(0.35, 0.1)
-        );
+        assert_eq!((0.35f64 / 0.1).round(), 3.0, "premise: plain round sends it down");
+        assert!((round_to_grid(0.35, 0.1) - 0.4).abs() < 1e-12, "{}", round_to_grid(0.35, 0.1));
         assert_eq!(round_to_grid(375.0, 250.0).to_bits(), 500.0f64.to_bits());
         assert_eq!(round_to_grid(374.999, 250.0).to_bits(), 250.0f64.to_bits());
         assert_eq!(round_to_grid(0.0, 250.0).to_bits(), 0.0f64.to_bits());
@@ -1901,16 +1787,9 @@ mod tests {
         assert_eq!(round_to_grid(0.35, 0.1).to_bits(), 0.4f64.to_bits());
         assert_eq!(round_to_grid(1.3, 0.25).to_bits(), 1.25f64.to_bits());
         let g = DoseGrid::new(0.1, (0.05, 0.75)).expect("grid");
-        assert_eq!(
-            (g.low.to_bits(), g.high.to_bits()),
-            (0.1f64.to_bits(), 0.7f64.to_bits())
-        );
+        assert_eq!((g.low.to_bits(), g.high.to_bits()), (0.1f64.to_bits(), 0.7f64.to_bits()));
         for (x, k) in [(1300.0, 5.0), (375.0, 2.0), (4000.0, 16.0)] {
-            assert_eq!(
-                round_to_grid(x, 250.0).to_bits(),
-                (k * 250.0f64).to_bits(),
-                "{x}"
-            );
+            assert_eq!(round_to_grid(x, 250.0).to_bits(), (k * 250.0f64).to_bits(), "{x}");
         }
     }
 
@@ -1928,17 +1807,11 @@ mod tests {
         let g = DoseGrid::new(0.1, (0.0, 0.3)).expect("0, 0.1, 0.2 and 0.3 lie inside");
         assert_eq!(g.high.to_bits(), 0.3f64.to_bits(), "{g:?}");
         assert_eq!(g.place(0.3).to_bits(), 0.3f64.to_bits(), "{g:?}");
-        assert!(
-            (2.1f64 / 0.3).ceil() == 8.0,
-            "premise: a bare ceil overshoots"
-        );
+        assert!((2.1f64 / 0.3).ceil() == 8.0, "premise: a bare ceil overshoots");
         let g = DoseGrid::new(0.3, (2.1, 3.0)).expect("grid");
         assert!((g.low - 2.1).abs() < 1e-12, "{g:?}");
         let g = DoseGrid::new(0.1, (0.3, 0.3)).expect("0.3 is a multiple of 0.1");
-        assert_eq!(
-            (g.low.to_bits(), g.high.to_bits()),
-            (0.3f64.to_bits(), 0.3f64.to_bits())
-        );
+        assert_eq!((g.low.to_bits(), g.high.to_bits()), (0.3f64.to_bits(), 0.3f64.to_bits()));
     }
 
     /// `hi = 1150, s = 250`: round then clamp gives 1000 (row 13); `lo = 1e-6` aligns to
@@ -1951,10 +1824,7 @@ mod tests {
         let g = DoseGrid::new(250.0, (1e-6, 4000.0)).expect("grid");
         assert_eq!(g.low.to_bits(), 250.0f64.to_bits(), "{g:?}");
         assert_eq!(g.place(100.0).to_bits(), 250.0f64.to_bits());
-        assert!(
-            DoseGrid::new(250.0, (300.0, 400.0)).is_none(),
-            "no multiple in [300, 400]"
-        );
+        assert!(DoseGrid::new(250.0, (300.0, 400.0)).is_none(), "no multiple in [300, 400]");
         // A single grid point, with a low a hair above it (within the snap): the aligned
         // bounds collapse onto the written low rather than crossing.
         let lo = 250.0 * (1.0 + 1e-12);
@@ -1977,27 +1847,16 @@ mod tests {
     /// `round_to = 250` with the rules `increase up%` (each of `ups`) and `decrease
     /// down%` (each of `downs`).
     fn stepped(bounds: (f64, f64), start: f64, ups: &[f64], downs: &[f64]) -> AdaptiveDosingSpec {
-        let rule = |op, action| AdaptiveRule {
-            op,
-            threshold: 10.0,
-            action,
-            interval: None,
-        };
+        let rule = |op, action| AdaptiveRule { op, threshold: 10.0, action, interval: None };
         let mut s = gridded(250.0, bounds, start);
         s.rules = ups
             .iter()
-            .map(|&p| {
-                rule(
-                    Comparison::Lt,
-                    AdaptiveAction::Increase(DoseStep::Percent(p)),
-                )
-            })
-            .chain(downs.iter().map(|&q| {
-                rule(
-                    Comparison::Gt,
-                    AdaptiveAction::Decrease(DoseStep::Percent(q)),
-                )
-            }))
+            .map(|&p| rule(Comparison::Lt, AdaptiveAction::Increase(DoseStep::Percent(p))))
+            .chain(
+                downs
+                    .iter()
+                    .map(|&q| rule(Comparison::Gt, AdaptiveAction::Decrease(DoseStep::Percent(q)))),
+            )
             .collect();
         s
     }
@@ -2012,10 +1871,7 @@ mod tests {
     fn an_increase_just_below_half_a_step_is_absorbed_and_one_at_half_is_not() {
         let half: f64 = 250.0 / 2.0;
         let (at, below) = (25.0, 24.99);
-        assert_eq!(
-            (percent_step(500.0, at, true) - 500.0).to_bits(),
-            half.to_bits()
-        );
+        assert_eq!((percent_step(500.0, at, true) - 500.0).to_bits(), half.to_bits());
         let short = percent_step(500.0, below, true) - 500.0;
         assert!(short < half && short > half - 0.1, "{short}");
 
@@ -2049,10 +1905,7 @@ mod tests {
         let bounds = (250.0, 4000.0);
         let grid = DoseGrid::new(250.0, bounds).expect("grid");
         assert_eq!(grid.low.to_bits(), 250.0f64.to_bits());
-        assert_eq!(
-            grid.step_percent(250.0, 25.0, true).to_bits(),
-            250.0f64.to_bits()
-        );
+        assert_eq!(grid.step_percent(250.0, 25.0, true).to_bits(), 250.0f64.to_bits());
         assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[])), None);
         assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[25.0])), None);
     }
@@ -2061,10 +1914,7 @@ mod tests {
     /// (`[250, 600]`, start 300 → 250, `examples/adaptive_vanco_mgkg_rounded.ferx`).
     #[test]
     fn a_dose_at_the_high_bound_is_not_reported() {
-        assert_eq!(
-            absorbed(&stepped((250.0, 500.0), 500.0, &[10.0], &[])),
-            None
-        );
+        assert_eq!(absorbed(&stepped((250.0, 500.0), 500.0, &[10.0], &[])), None);
         assert_eq!(
             absorbed(&stepped((250.0, 600.0), 300.0, &[25.0], &[])),
             Some(AbsorbedIncrease::FromStart(250.0))
@@ -2111,11 +1961,7 @@ mod tests {
     /// does not return for 1e-310%.
     #[test]
     fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
-        let open = |s: f64| DoseGrid {
-            step: s,
-            low: 0.0,
-            high: f64::INFINITY,
-        };
+        let open = |s: f64| DoseGrid { step: s, low: 0.0, high: f64::INFINITY };
         for (s, p, want) in [
             (250.0, 25.0, Some(500.0)),
             (250.0, 10.0, Some(1250.0)),
@@ -2132,10 +1978,7 @@ mod tests {
                 assert_eq!(got.to_bits(), f64::to_bits(want), "s = {s}, p = {p}");
             }
             let below = got - s;
-            assert!(
-                open(s).step_percent(got, p, true) > got,
-                "s = {s}, p = {p}: {got}"
-            );
+            assert!(open(s).step_percent(got, p, true) > got, "s = {s}, p = {p}: {got}");
             assert_eq!(
                 open(s).step_percent(below, p, true).to_bits(),
                 below.to_bits(),
@@ -2150,12 +1993,8 @@ mod tests {
     /// P3: a `round_to` that is not finite `> 0` on a spec built in code.
     #[test]
     fn validate_refuses_a_round_to_that_is_not_positive_and_finite() {
-        for (s, shown) in [
-            (0.0, "0"),
-            (-250.0, "-250"),
-            (f64::NAN, "NaN"),
-            (f64::INFINITY, "inf"),
-        ] {
+        for (s, shown) in [(0.0, "0"), (-250.0, "-250"), (f64::NAN, "NaN"), (f64::INFINITY, "inf")]
+        {
             assert_eq!(
                 gridded(s, (250.0, 400.0), 250.0).validate().unwrap_err(),
                 format!("[adaptive_dosing]: round_to must be a finite number > 0: {shown}")
@@ -2180,9 +2019,7 @@ mod tests {
     #[test]
     fn validate_refuses_bounds_holding_no_multiple_of_round_to() {
         assert_eq!(
-            gridded(250.0, (300.0, 400.0), 350.0)
-                .validate()
-                .unwrap_err(),
+            gridded(250.0, (300.0, 400.0), 350.0).validate().unwrap_err(),
             "[adaptive_dosing]: no multiple of round_to = 250 lies within dose_bounds [300, 400]"
         );
     }
@@ -2192,9 +2029,7 @@ mod tests {
     #[test]
     fn validate_refuses_a_lower_bound_that_aligns_to_zero_under_percentage_steps() {
         assert_eq!(
-            gridded(250.0, (0.0, 4000.0), 1000.0)
-                .validate()
-                .unwrap_err(),
+            gridded(250.0, (0.0, 4000.0), 1000.0).validate().unwrap_err(),
             "[adaptive_dosing]: with round_to = 250, dose_bounds low = 0 lets a dose round \
              to 0, and a running dose of 0 cannot rise again under percentage steps; set the \
              lower bound above 0 (any value up to 250 raises it to 250)"
@@ -2210,22 +2045,13 @@ mod tests {
     #[test]
     fn a_tiny_positive_low_bound_is_lifted_to_one_step_not_refused() {
         for (s, lo) in [(1000.0, 1e-6), (2000.0, 1e-6), (250.0, 1e-7)] {
-            assert_eq!(
-                gridded(s, (lo, 4000.0), 2000.0).validate(),
-                Ok(()),
-                "s = {s}, lo = {lo}"
-            );
+            assert_eq!(gridded(s, (lo, 4000.0), 2000.0).validate(), Ok(()), "s = {s}, lo = {lo}");
             let g = DoseGrid::new(s, (lo, 4000.0)).expect("grid");
             assert_eq!(g.low.to_bits(), s.to_bits(), "s = {s}, lo = {lo}: {g:?}");
             assert_eq!(g.place(1.0).to_bits(), s.to_bits(), "s = {s}, lo = {lo}");
         }
-        let e = gridded(1000.0, (0.0, 4000.0), 2000.0)
-            .validate()
-            .unwrap_err();
-        assert!(
-            e.contains("dose_bounds low = 0 lets a dose round to 0"),
-            "{e}"
-        );
+        let e = gridded(1000.0, (0.0, 4000.0), 2000.0).validate().unwrap_err();
+        assert!(e.contains("dose_bounds low = 0 lets a dose round to 0"), "{e}");
         // A positive low with no positive multiple at or below the high is V7, not a
         // grid that clamps every dose to the low.
         let e = gridded(250.0, (1e-7, 100.0), 50.0).validate().unwrap_err();
@@ -2240,10 +2066,7 @@ mod tests {
         s.start_dose = DoseValue::Expr("15 * WT".into());
         s.dose_bounds.1 = DoseValue::Expr("min(30 * WT, 4000)".into());
         let e = s.validate().unwrap_err();
-        assert!(
-            e.contains("dose_bounds low = 0 lets a dose round to 0"),
-            "{e}"
-        );
+        assert!(e.contains("dose_bounds low = 0 lets a dose round to 0"), "{e}");
         s.dose_bounds.0 = DoseValue::Literal(250.0);
         assert_eq!(s.validate(), Ok(()));
     }
@@ -2307,10 +2130,7 @@ mod tests {
             action: AdaptiveAction::Increase(DoseStep::Level),
             interval: None,
         }];
-        assert_eq!(
-            s.validate().unwrap_err(),
-            "[adaptive_dosing]: levels must be a non-empty list"
-        );
+        assert_eq!(s.validate().unwrap_err(), "[adaptive_dosing]: levels must be a non-empty list");
     }
 
     /// A numeric block breaking two invariants names the one it named before #944
@@ -2476,11 +2296,7 @@ mod tests {
 
     #[test]
     fn ledger_entry_and_observed_signal_round_trip() {
-        let obs = ObservedSignal {
-            name: "CONC".to_string(),
-            value: 12.5,
-            mode: ObserveMode::Dv,
-        };
+        let obs = ObservedSignal { name: "CONC".to_string(), value: 12.5, mode: ObserveMode::Dv };
         let entry = DoseLedgerEntry {
             subject: "1".to_string(),
             draw: 0,
@@ -2506,11 +2322,7 @@ mod tests {
 
     #[test]
     fn decision_log_entry_round_trips_and_outcomes_are_distinct() {
-        let obs = ObservedSignal {
-            name: "A".to_string(),
-            value: 0.0,
-            mode: ObserveMode::Ipred,
-        };
+        let obs = ObservedSignal { name: "A".to_string(), value: 0.0, mode: ObserveMode::Ipred };
         let entry = DecisionLogEntry {
             subject: "1".to_string(),
             draw: 0,
@@ -2526,10 +2338,7 @@ mod tests {
         // The three outcome categories are distinct, and `Stop` carries the count
         // of any dose(s) issued before discontinuation.
         assert_ne!(DecisionOutcome::Hold, DecisionOutcome::Dosed { n: 0 });
-        assert_ne!(
-            DecisionOutcome::Stop { dosed: 0 },
-            DecisionOutcome::Stop { dosed: 1 }
-        );
+        assert_ne!(DecisionOutcome::Stop { dosed: 0 }, DecisionOutcome::Stop { dosed: 1 });
         assert_ne!(DecisionOutcome::Hold, DecisionOutcome::Stop { dosed: 0 });
     }
 
@@ -2574,26 +2383,14 @@ mod tests {
     #[test]
     fn validate_rejects_zero_compartment() {
         assert!(DoseAction::Bolus { amt: 100.0, cmt: 0 }.validate().is_err());
-        assert!(DoseAction::Infuse {
-            amt: 100.0,
-            cmt: 0,
-            rate: 10.0,
-        }
-        .validate()
-        .is_err());
+        assert!(DoseAction::Infuse { amt: 100.0, cmt: 0, rate: 10.0 }.validate().is_err());
     }
 
     #[test]
     fn validate_rejects_nonpositive_or_nonfinite_infusion_rate() {
         for rate in [0.0, -5.0, f64::NAN, f64::INFINITY] {
             assert!(
-                DoseAction::Infuse {
-                    amt: 100.0,
-                    cmt: 1,
-                    rate,
-                }
-                .validate()
-                .is_err(),
+                DoseAction::Infuse { amt: 100.0, cmt: 1, rate }.validate().is_err(),
                 "rate {rate} should be rejected"
             );
         }
@@ -2602,24 +2399,13 @@ mod tests {
     #[test]
     fn validate_rejects_negative_or_nonfinite_amount() {
         assert!(DoseAction::Bolus { amt: -1.0, cmt: 1 }.validate().is_err());
-        assert!(DoseAction::Bolus {
-            amt: f64::NAN,
-            cmt: 1,
-        }
-        .validate()
-        .is_err());
+        assert!(DoseAction::Bolus { amt: f64::NAN, cmt: 1 }.validate().is_err());
     }
 
     #[test]
     fn validate_accepts_well_formed_actions_and_holds() {
         assert!(DoseAction::Bolus { amt: 100.0, cmt: 1 }.validate().is_ok());
-        assert!(DoseAction::Infuse {
-            amt: 100.0,
-            cmt: 2,
-            rate: 25.0,
-        }
-        .validate()
-        .is_ok());
+        assert!(DoseAction::Infuse { amt: 100.0, cmt: 2, rate: 25.0 }.validate().is_ok());
         assert!(DoseAction::Hold.validate().is_ok());
         assert!(DoseAction::Stop.validate().is_ok());
     }
@@ -2638,52 +2424,25 @@ mod tests {
     fn combine_seed_is_order_sensitive() {
         // Folding components in a different order yields a different seed, so key
         // tuples map injectively enough for substream separation.
-        assert_ne!(
-            combine_seed(combine_seed(0, 1), 2),
-            combine_seed(combine_seed(0, 2), 1)
-        );
+        assert_ne!(combine_seed(combine_seed(0, 1), 2), combine_seed(combine_seed(0, 2), 1));
     }
 
     #[test]
     fn subject_assay_base_seed_separates_subjects_and_replicates() {
         let a = subject_assay_base_seed(42, "subj-1", 1);
         assert_eq!(a, subject_assay_base_seed(42, "subj-1", 1), "deterministic");
-        assert_ne!(
-            a,
-            subject_assay_base_seed(42, "subj-2", 1),
-            "subject id keys the stream"
-        );
-        assert_ne!(
-            a,
-            subject_assay_base_seed(42, "subj-1", 2),
-            "replicate keys the stream"
-        );
-        assert_ne!(
-            a,
-            subject_assay_base_seed(7, "subj-1", 1),
-            "root seed keys the stream"
-        );
+        assert_ne!(a, subject_assay_base_seed(42, "subj-2", 1), "subject id keys the stream");
+        assert_ne!(a, subject_assay_base_seed(42, "subj-1", 2), "replicate keys the stream");
+        assert_ne!(a, subject_assay_base_seed(7, "subj-1", 1), "root seed keys the stream");
     }
 
     #[test]
     fn assay_standard_normal_is_deterministic_and_key_separated() {
         let x = assay_standard_normal(100, 0, "A");
         assert_eq!(x, assay_standard_normal(100, 0, "A"), "deterministic");
-        assert_ne!(
-            x,
-            assay_standard_normal(100, 1, "A"),
-            "decision index keys the draw"
-        );
-        assert_ne!(
-            x,
-            assay_standard_normal(100, 0, "B"),
-            "analyte keys the draw"
-        );
-        assert_ne!(
-            x,
-            assay_standard_normal(101, 0, "A"),
-            "base seed keys the draw"
-        );
+        assert_ne!(x, assay_standard_normal(100, 1, "A"), "decision index keys the draw");
+        assert_ne!(x, assay_standard_normal(100, 0, "B"), "analyte keys the draw");
+        assert_ne!(x, assay_standard_normal(101, 0, "A"), "base seed keys the draw");
     }
 
     // ----- #701: IOV-kappa substream seed helpers -----------------------
@@ -2692,16 +2451,8 @@ mod tests {
     fn subject_kappa_base_seed_separates_and_is_disjoint_from_assay() {
         let a = subject_kappa_base_seed(42, "subj-1", 1);
         assert_eq!(a, subject_kappa_base_seed(42, "subj-1", 1), "deterministic");
-        assert_ne!(
-            a,
-            subject_kappa_base_seed(42, "subj-2", 1),
-            "subject id keys"
-        );
-        assert_ne!(
-            a,
-            subject_kappa_base_seed(42, "subj-1", 2),
-            "replicate keys"
-        );
+        assert_ne!(a, subject_kappa_base_seed(42, "subj-2", 1), "subject id keys");
+        assert_ne!(a, subject_kappa_base_seed(42, "subj-1", 2), "replicate keys");
         assert_ne!(a, subject_kappa_base_seed(7, "subj-1", 1), "root seed keys");
         // Disjoint from the assay stream that shares the same run root: the
         // purpose salt is what keeps enabling a `Dv` monitor from perturbing κ.
@@ -2737,21 +2488,9 @@ mod tests {
     fn kappa_standard_normal_is_deterministic_and_key_separated() {
         let x = kappa_standard_normal(100, 0, 0);
         assert_eq!(x, kappa_standard_normal(100, 0, 0), "deterministic");
-        assert_ne!(
-            x,
-            kappa_standard_normal(100, 1, 0),
-            "occasion keys the draw"
-        );
-        assert_ne!(
-            x,
-            kappa_standard_normal(100, 0, 1),
-            "component keys the draw"
-        );
-        assert_ne!(
-            x,
-            kappa_standard_normal(101, 0, 0),
-            "base seed keys the draw"
-        );
+        assert_ne!(x, kappa_standard_normal(100, 1, 0), "occasion keys the draw");
+        assert_ne!(x, kappa_standard_normal(100, 0, 1), "component keys the draw");
+        assert_ne!(x, kappa_standard_normal(101, 0, 0), "base seed keys the draw");
     }
 
     #[test]
@@ -2760,19 +2499,10 @@ mod tests {
         // generator produces both signs across keys, with a mean near 0.
         let n = 2000;
         let draws: Vec<f64> = (0..n).map(|i| assay_standard_normal(1, i, "A")).collect();
-        assert!(
-            draws.iter().any(|&d| d < 0.0),
-            "some draws must be negative"
-        );
-        assert!(
-            draws.iter().any(|&d| d > 0.0),
-            "some draws must be positive"
-        );
+        assert!(draws.iter().any(|&d| d < 0.0), "some draws must be negative");
+        assert!(draws.iter().any(|&d| d > 0.0), "some draws must be positive");
         let mean = draws.iter().sum::<f64>() / n as f64;
-        assert!(
-            mean.abs() < 0.1,
-            "standard-normal draws should center near 0, got {mean}"
-        );
+        assert!(mean.abs() < 0.1, "standard-normal draws should center near 0, got {mean}");
         // Unit variance too, so the noise scale is right (a mis-scaled generator
         // would still pass the sign/mean checks).
         let var = draws.iter().map(|&d| (d - mean).powi(2)).sum::<f64>() / n as f64;
@@ -2849,10 +2579,7 @@ mod tests {
         assert_eq!(m.cumulative_dose, 425.0);
         assert_eq!(m.n_doses, 4);
         assert_eq!(m.n_increases, 1, "100→125 is the only step up");
-        assert_eq!(
-            m.n_decreases, 1,
-            "125→100 is the only step down; 100→100 is no change"
-        );
+        assert_eq!(m.n_decreases, 1, "125→100 is the only step down; 100→100 is no change");
         assert_eq!(m.n_holds, 1);
         assert!(m.discontinued);
         assert_eq!(m.time_to_discontinuation, Some(120.0));
@@ -2874,16 +2601,8 @@ mod tests {
             decision(96.0, Some(45.0), DecisionOutcome::Dosed { n: 1 }),
         ];
         // Two-sided band [10, 20]: only 15 is in band ⇒ 1/5.
-        let band = compute_subject_metrics(
-            "S",
-            1,
-            1,
-            &ledger,
-            &decisions,
-            Some((10.0, 20.0)),
-            None,
-            &[],
-        );
+        let band =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
         assert_eq!(band.pct_time_in_window, Some(0.2));
         // One-sided "at or above 10" ([10, +∞]): 22, 15, 45 ⇒ 3/5.
         let one_sided = compute_subject_metrics(
@@ -2922,16 +2641,8 @@ mod tests {
     fn metrics_empty_run_has_no_signal_summary() {
         // No doses, no decisions: counts are zero and the signal summary is `None`
         // (not a NaN), even when a target_window is set (no signal to score).
-        let m = compute_subject_metrics(
-            "S",
-            1,
-            1,
-            &[],
-            &[],
-            Some((10.0, 20.0)),
-            Some((1.0, 2.0)),
-            &[],
-        );
+        let m =
+            compute_subject_metrics("S", 1, 1, &[], &[], Some((10.0, 20.0)), Some((1.0, 2.0)), &[]);
         assert_eq!(m.cumulative_dose, 0.0);
         assert_eq!(m.n_doses, 0);
         assert_eq!(m.n_increases, 0);
@@ -2959,16 +2670,8 @@ mod tests {
             decision(48.0, Some(8.0), DecisionOutcome::Dosed { n: 1 }), // below band
             decision(72.0, None, DecisionOutcome::Hold),                // no signal
         ];
-        let m = compute_subject_metrics(
-            "S",
-            1,
-            1,
-            &ledger,
-            &decisions,
-            Some((10.0, 20.0)),
-            None,
-            &[],
-        );
+        let m =
+            compute_subject_metrics("S", 1, 1, &ledger, &decisions, Some((10.0, 20.0)), None, &[]);
 
         // Summary spans only the two decisions that recorded a signal (12 and 8),
         // not the two signal-less ones.
@@ -3090,17 +2793,11 @@ mod tests {
     /// `SetInterval` injects nothing and must carry a positive, finite interval (#945).
     #[test]
     fn set_interval_maps_to_no_dose_and_validates_its_interval() {
-        assert!(DoseAction::SetInterval { interval: 24.0 }
-            .to_dose_event(0.0)
-            .is_none());
+        assert!(DoseAction::SetInterval { interval: 24.0 }.to_dose_event(0.0).is_none());
         assert!(!DoseAction::SetInterval { interval: 24.0 }.is_stop());
-        assert!(DoseAction::SetInterval { interval: 24.0 }
-            .validate()
-            .is_ok());
+        assert!(DoseAction::SetInterval { interval: 24.0 }.validate().is_ok());
         for bad in [0.0, -12.0, f64::NAN, f64::INFINITY] {
-            let err = DoseAction::SetInterval { interval: bad }
-                .validate()
-                .unwrap_err();
+            let err = DoseAction::SetInterval { interval: bad }.validate().unwrap_err();
             assert!(err.contains("positive, finite interval"), "{bad}: {err}");
         }
     }
@@ -3199,10 +2896,7 @@ mod tests {
     fn validate_rejects_a_malformed_interval_ladder() {
         let mut s = interval_base();
         s.intervals = Some(vec![24.0, 12.0]);
-        assert!(s
-            .validate()
-            .unwrap_err()
-            .contains("intervals must be strictly increasing"));
+        assert!(s.validate().unwrap_err().contains("intervals must be strictly increasing"));
 
         let mut s = interval_base();
         s.intervals = Some(vec![0.0, 24.0]);

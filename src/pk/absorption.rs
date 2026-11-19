@@ -45,14 +45,10 @@ pub(crate) fn transit_input_rate(tad: f64, n: f64, mtt: f64, dose: f64) -> f64 {
 /// The negated comparisons also reject `NaN`.
 pub fn validate_transit(n: f64, mtt: f64) -> Result<(), String> {
     if !(mtt > 0.0) {
-        return Err(format!(
-            "transit: mtt (mean transit time) must be > 0, got {mtt}"
-        ));
+        return Err(format!("transit: mtt (mean transit time) must be > 0, got {mtt}"));
     }
     if !(n >= 0.0) {
-        return Err(format!(
-            "transit: n (number of transit compartments) must be ≥ 0, got {n}"
-        ));
+        return Err(format!("transit: n (number of transit compartments) must be ≥ 0, got {n}"));
     }
     Ok(())
 }
@@ -80,14 +76,10 @@ pub(crate) fn inverse_gaussian_input_rate(tad: f64, mat: f64, cv2: f64, dose: f6
 /// The negated comparisons also reject `NaN`.
 pub fn validate_igd(mat: f64, cv2: f64) -> Result<(), String> {
     if !(mat > 0.0) {
-        return Err(format!(
-            "igd: mat (mean absorption time) must be > 0, got {mat}"
-        ));
+        return Err(format!("igd: mat (mean absorption time) must be > 0, got {mat}"));
     }
     if !(cv2 > 0.0) {
-        return Err(format!(
-            "igd: cv2 (relative dispersion) must be > 0, got {cv2}"
-        ));
+        return Err(format!("igd: cv2 (relative dispersion) must be > 0, got {cv2}"));
     }
     Ok(())
 }
@@ -184,9 +176,7 @@ pub(crate) fn first_order_input_rate(tad: f64, ka: f64, dose: f64) -> f64 {
 /// positive. The negated comparison also rejects `NaN`.
 pub fn validate_first_order(ka: f64) -> Result<(), String> {
     if !(ka > 0.0) {
-        return Err(format!(
-            "first_order: ka (absorption rate constant) must be > 0, got {ka}"
-        ));
+        return Err(format!("first_order: ka (absorption rate constant) must be > 0, got {ka}"));
     }
     Ok(())
 }
@@ -328,11 +318,7 @@ impl InputRateForcing {
     /// individual-parameter vector).
     #[inline]
     fn arg<T: PkNum>(&self, params: &[T], i: usize, dflt: f64) -> T {
-        self.arg_slots
-            .get(i)
-            .and_then(|&s| params.get(s))
-            .copied()
-            .unwrap_or(T::from_f64(dflt))
+        self.arg_slots.get(i).and_then(|&s| params.get(s)).copied().unwrap_or(T::from_f64(dflt))
     }
 
     /// The pathway-fraction multiplier for this forcing, read from the flat
@@ -343,10 +329,7 @@ impl InputRateForcing {
     /// sensitivity (the multiplier flows linearly into the forcing — #388).
     #[inline]
     pub fn frac<T: PkNum>(&self, params: &[T]) -> T {
-        self.frac_slot
-            .and_then(|s| params.get(s))
-            .copied()
-            .unwrap_or(T::from_f64(1.0))
+        self.frac_slot.and_then(|s| params.get(s)).copied().unwrap_or(T::from_f64(1.0))
     }
 
     /// This route's own absorption lag (`fn(..., lag=L)`), read from the flat
@@ -361,10 +344,7 @@ impl InputRateForcing {
     /// (#877) paths. See [`InputRateKind::route_lag_analytic`].
     #[inline]
     pub fn route_lag<T: PkNum>(&self, params: &[T]) -> T {
-        self.lag_slot
-            .and_then(|s| params.get(s))
-            .copied()
-            .unwrap_or(T::from_f64(0.0))
+        self.lag_slot.and_then(|s| params.get(s)).copied().unwrap_or(T::from_f64(0.0))
     }
 
     /// Precompute the dose-invariant constants for this forcing's parameters
@@ -437,18 +417,16 @@ impl InputRateForcing {
     /// `supported_over_dual_agrees_with_prepare_dual`.
     pub fn prepare_dual<T: PkNum>(&self, params: &[T]) -> Option<PreparedInputRate<T>> {
         match self.kind {
-            InputRateKind::Transit => Some(PreparedInputRate::transit(
-                self.arg(params, 0, 0.0),
-                self.arg(params, 1, 1.0),
-            )),
+            InputRateKind::Transit => {
+                Some(PreparedInputRate::transit(self.arg(params, 0, 0.0), self.arg(params, 1, 1.0)))
+            }
             InputRateKind::InverseGaussian => Some(PreparedInputRate::inverse_gaussian(
                 self.arg(params, 0, 1.0),
                 self.arg(params, 1, 1.0),
             )),
-            InputRateKind::Weibull => Some(PreparedInputRate::weibull(
-                self.arg(params, 0, 1.0),
-                self.arg(params, 1, 1.0),
-            )),
+            InputRateKind::Weibull => {
+                Some(PreparedInputRate::weibull(self.arg(params, 0, 1.0), self.arg(params, 1, 1.0)))
+            }
             // Lifted (#530): the pointwise `dur` jet carries the smooth magnitude
             // term; the analytic ODE walk's `integrate_g` delivers the window as a
             // per-segment constant and injects the rate-off saltation at the cutoff
@@ -473,12 +451,7 @@ impl InputRateForcing {
 #[derive(Debug, Clone, Copy)]
 pub enum PreparedInputRate<T = f64> {
     /// Savic transit constants: `KTR`, `ln KTR`, `n`, and `ln Γ(n + 1)`.
-    Transit {
-        ktr: T,
-        ln_ktr: T,
-        n: T,
-        ln_gamma_np1: T,
-    },
+    Transit { ktr: T, ln_ktr: T, n: T, ln_gamma_np1: T },
     /// Inverse-Gaussian constants: the mean `mat`, the dose-invariant log
     /// prefactor `c0 = ½·(ln mat − ln 2π − ln cv2)`, and `inv_2cv2mat
     /// = 1/(2·cv2·mat)`. (`cv2` is folded into `c0`/`inv_2cv2mat`, so it is not
@@ -502,35 +475,14 @@ impl<T: Copy> PreparedInputRate<T> {
     pub(crate) fn map<U>(self, f: impl Fn(T) -> U) -> PreparedInputRate<U> {
         use PreparedInputRate::*;
         match self {
-            Transit {
-                ktr,
-                ln_ktr,
-                n,
-                ln_gamma_np1,
-            } => Transit {
-                ktr: f(ktr),
-                ln_ktr: f(ln_ktr),
-                n: f(n),
-                ln_gamma_np1: f(ln_gamma_np1),
-            },
-            InverseGaussian {
-                mat,
-                c0,
-                inv_2cv2mat,
-            } => InverseGaussian {
-                mat: f(mat),
-                c0: f(c0),
-                inv_2cv2mat: f(inv_2cv2mat),
-            },
-            Weibull { beta, ln_td, c0 } => Weibull {
-                beta: f(beta),
-                ln_td: f(ln_td),
-                c0: f(c0),
-            },
-            ZeroOrder { dur, inv_dur } => ZeroOrder {
-                dur: f(dur),
-                inv_dur: f(inv_dur),
-            },
+            Transit { ktr, ln_ktr, n, ln_gamma_np1 } => {
+                Transit { ktr: f(ktr), ln_ktr: f(ln_ktr), n: f(n), ln_gamma_np1: f(ln_gamma_np1) }
+            }
+            InverseGaussian { mat, c0, inv_2cv2mat } => {
+                InverseGaussian { mat: f(mat), c0: f(c0), inv_2cv2mat: f(inv_2cv2mat) }
+            }
+            Weibull { beta, ln_td, c0 } => Weibull { beta: f(beta), ln_td: f(ln_td), c0: f(c0) },
+            ZeroOrder { dur, inv_dur } => ZeroOrder { dur: f(dur), inv_dur: f(inv_dur) },
             FirstOrder { ka } => FirstOrder { ka: f(ka) },
         }
     }
@@ -587,11 +539,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     #[inline]
     fn transit(n: T, mtt: T) -> Self {
         let mtt = mtt.guard_floor(Self::MIN_PARAM);
-        let n = if n.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
-            n
-        } else {
-            T::from_f64(0.0)
-        };
+        let n = if n.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) { n } else { T::from_f64(0.0) };
         let ktr = (n + T::from_f64(1.0)) / mtt;
         PreparedInputRate::Transit {
             ktr,
@@ -614,11 +562,7 @@ impl<T: PkNum> PreparedInputRate<T> {
         let td = td.guard_floor(Self::MIN_PARAM);
         let beta = beta.guard_floor(Self::MIN_PARAM);
         let ln_td = td.ln();
-        PreparedInputRate::Weibull {
-            beta,
-            ln_td,
-            c0: beta.ln() - ln_td,
-        }
+        PreparedInputRate::Weibull { beta, ln_td, c0: beta.ln() - ln_td }
     }
 
     /// Precompute the zero-order constants for `dur`. `dur` is **clamped to the valid domain**
@@ -633,10 +577,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     #[inline]
     fn zero_order(dur: T) -> Self {
         let dur = dur.guard_floor(Self::MIN_PARAM);
-        PreparedInputRate::ZeroOrder {
-            dur,
-            inv_dur: T::from_f64(1.0) / dur,
-        }
+        PreparedInputRate::ZeroOrder { dur, inv_dur: T::from_f64(1.0) / dur }
     }
 
     /// Precompute the first-order constant for `ka`. `ka` is **clamped to the valid domain**
@@ -649,9 +590,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// `T = f64` this reduces to the scalar first-order (Bateman) input rate.
     #[inline]
     fn first_order(ka: T) -> Self {
-        PreparedInputRate::FirstOrder {
-            ka: ka.guard_floor(Self::MIN_PARAM),
-        }
+        PreparedInputRate::FirstOrder { ka: ka.guard_floor(Self::MIN_PARAM) }
     }
 
     /// Appearance rate `R_in(tad)` for one dose (`dose = F · amt`). Per-dose
@@ -670,12 +609,7 @@ impl<T: PkNum> PreparedInputRate<T> {
             // ln R_in = ln dose + ln KTR + n·ln(KTR·tad) − KTR·tad − ln Γ(n + 1).
             // For n = 0 the middle term is 0·ln x = 0, reducing to the first-order
             // (Bateman) input dose·KTR·exp(−KTR·tad).
-            PreparedInputRate::Transit {
-                ktr,
-                ln_ktr,
-                n,
-                ln_gamma_np1,
-            } => {
+            PreparedInputRate::Transit { ktr, ln_ktr, n, ln_gamma_np1 } => {
                 let x = ktr * tad; // > 0 (tad > 0, ktr > 0 for valid params)
                 (dose.ln() + ln_ktr + n * x.ln() - x - ln_gamma_np1).exp()
             }
@@ -684,11 +618,7 @@ impl<T: PkNum> PreparedInputRate<T> {
             // tad > 0 here. As tad → 0⁺ the last term → −mat/(2·cv2·tad) = −∞,
             // dominating the +∞ from −1.5·ln tad, so R_in → 0 (the essential
             // singularity); large tad underflows the same way.
-            PreparedInputRate::InverseGaussian {
-                mat,
-                c0,
-                inv_2cv2mat,
-            } => {
+            PreparedInputRate::InverseGaussian { mat, c0, inv_2cv2mat } => {
                 let d = tad - mat;
                 (dose.ln() + c0 - T::from_f64(1.5) * tad.ln() - d * d * inv_2cv2mat / tad).exp()
             }
@@ -742,9 +672,7 @@ impl<T: PkNum> PreparedInputRate<T> {
             PreparedInputRate::Transit { ktr, n, .. } => {
                 crate::stats::special::regularized_gamma_p(n + T::from_f64(1.0), ktr * s)
             }
-            PreparedInputRate::InverseGaussian {
-                mat, inv_2cv2mat, ..
-            } => {
+            PreparedInputRate::InverseGaussian { mat, inv_2cv2mat, .. } => {
                 // Standard IG(μ = MAT, λ) CDF, λ = MAT/CV² = 2·MAT²·inv_2cv2mat:
                 //   F(s) = Φ(z₁) + exp(2λ/μ)·Φ(z₂),
                 //   z₁ = √(λ/s)·(s/μ − 1),  z₂ = −√(λ/s)·(s/μ + 1).
@@ -902,12 +830,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// the onset continuation ([`Self::cdf_onset_continued`]).
     #[inline]
     pub(crate) fn rate_infused_from(
-        &self,
-        tad: T,
-        dose: T,
-        t_inf: T,
-        tail_age: Option<T>,
-        anchored: bool,
+        &self, tad: T, dose: T, t_inf: T, tail_age: Option<T>, anchored: bool,
     ) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
             || t_inf.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
@@ -1138,40 +1061,16 @@ mod tests {
         let ka = 0.7;
         let cases: Vec<(PreparedInputRate<D>, f64, f64)> = vec![
             // G = 1 − exp(−ka·s): G' = ka, G'' = −ka².
-            (
-                PreparedInputRate::first_order(D::constant(ka)),
-                ka,
-                -ka * ka,
-            ),
-            (
-                PreparedInputRate::transit(D::constant(0.0), D::constant(1.0 / ka)),
-                ka,
-                -ka * ka,
-            ),
-            (
-                PreparedInputRate::weibull(D::constant(1.0 / ka), D::constant(1.0)),
-                ka,
-                -ka * ka,
-            ),
-            (
-                PreparedInputRate::inverse_gaussian(D::constant(2.0), D::constant(0.3)),
-                0.0,
-                0.0,
-            ),
+            (PreparedInputRate::first_order(D::constant(ka)), ka, -ka * ka),
+            (PreparedInputRate::transit(D::constant(0.0), D::constant(1.0 / ka)), ka, -ka * ka),
+            (PreparedInputRate::weibull(D::constant(1.0 / ka), D::constant(1.0)), ka, -ka * ka),
+            (PreparedInputRate::inverse_gaussian(D::constant(2.0), D::constant(0.3)), 0.0, 0.0),
         ];
         for (prep, g1, g2) in cases {
             let g = prep.cdf_onset_continued(s);
             assert_eq!(g.val(), 0.0, "{prep:?}");
-            assert!(
-                (g.grad[0] - g1).abs() < 1e-12,
-                "{prep:?}: G' {} vs {g1}",
-                g.grad[0]
-            );
-            assert!(
-                (g.hess[0][0] - g2).abs() < 1e-12,
-                "{prep:?}: G'' {} vs {g2}",
-                g.hess[0][0]
-            );
+            assert!((g.grad[0] - g1).abs() < 1e-12, "{prep:?}: G' {} vs {g1}", g.grad[0]);
+            assert!((g.hess[0][0] - g2).abs() < 1e-12, "{prep:?}: G'' {} vs {g2}", g.hess[0][0]);
             // `rate_infused` at the tie `tad = T`, whose tail age is the value-zero `s`: the
             // jet in the window's end is `−(dose/T)·G'(0)` — what `cdf`'s `s ≤ 0` guard drops.
             let (dose, t_inf) = (D::constant(100.0), D::constant(3.0));
@@ -1334,16 +1233,11 @@ mod tests {
             let mut params = vec![D::constant(0.0); crate::types::MAX_PK_PARAMS];
             params[6] = D::var(n, 0); // seed n   → dim 0
             params[7] = D::var(mtt, 1); // seed mtt → dim 1
-            let prep = forcing
-                .prepare_dual::<D>(&params)
-                .expect("transit lifts over PkNum (slice 2)");
+            let prep =
+                forcing.prepare_dual::<D>(&params).expect("transit lifts over PkNum (slice 2)");
             for &tad in &[0.5, 2.0, 10.0] {
                 let r = prep.rate(D::constant(tad), D::constant(100.0));
-                assert!(
-                    r.value.is_finite(),
-                    "{label}: value not finite at tad={tad}: {}",
-                    r.value
-                );
+                assert!(r.value.is_finite(), "{label}: value not finite at tad={tad}: {}", r.value);
                 assert!(
                     r.grad.iter().all(|g| g.is_finite()),
                     "{label}: gradient not finite at tad={tad}: {:?}",
@@ -1382,10 +1276,7 @@ mod tests {
         params[7] = 2.0; // mtt
         let prepared = forcing.prepare(&params);
         for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
-            assert_eq!(
-                prepared.rate(tad, 100.0),
-                transit_input_rate(tad, 3.0, 2.0, 100.0)
-            );
+            assert_eq!(prepared.rate(tad, 100.0), transit_input_rate(tad, 3.0, 2.0, 100.0));
         }
     }
 
@@ -1467,13 +1358,7 @@ mod tests {
         // ∫₀^∞ R_in dt = dose: the inverse-Gaussian is a proper density (mean MAT),
         // so the dose is fully delivered. `upper`/`dt` are sized per case from the
         // mean and SD (= MAT·√CV²) to capture the right-skewed tail.
-        for &(mat, cv2) in &[
-            (2.0_f64, 0.3_f64),
-            (6.0, 1.87),
-            (1.0, 0.5),
-            (4.0, 0.2),
-            (3.0, 1.0),
-        ] {
+        for &(mat, cv2) in &[(2.0_f64, 0.3_f64), (6.0, 1.87), (1.0, 0.5), (4.0, 0.2), (3.0, 1.0)] {
             let dose = 100.0;
             let sd = mat * cv2.sqrt();
             let upper = mat + 40.0 * sd;
@@ -1509,14 +1394,8 @@ mod tests {
         let peak = inverse_gaussian_input_rate(ig_mode(mat, cv2), mat, cv2, 100.0);
         for &tad in &[1e-2, 1e-4, 1e-6, 1e-10, 1e-300] {
             let r = inverse_gaussian_input_rate(tad, mat, cv2, 100.0);
-            assert!(
-                r.is_finite() && r >= 0.0,
-                "R_in must be finite ≥ 0, got {r}"
-            );
-            assert!(
-                r < peak,
-                "R_in at tiny tad={tad} ({r}) must stay below the peak"
-            );
+            assert!(r.is_finite() && r >= 0.0, "R_in must be finite ≥ 0, got {r}");
+            assert!(r < peak, "R_in at tiny tad={tad} ({r}) must stay below the peak");
         }
         assert_eq!(inverse_gaussian_input_rate(1e-300, mat, cv2, 100.0), 0.0);
     }
@@ -1537,14 +1416,9 @@ mod tests {
     /// never a `NaN`/`∞` poisoning the ODE RHS — the IG analogue of the transit guard.
     #[test]
     fn igd_rate_is_finite_for_domain_excursions() {
-        for &(mat, cv2) in &[
-            (0.0, 0.3),
-            (-1.0, 0.3),
-            (2.0, 0.0),
-            (2.0, -0.3),
-            (f64::NAN, 0.3),
-            (2.0, f64::NAN),
-        ] {
+        for &(mat, cv2) in
+            &[(0.0, 0.3), (-1.0, 0.3), (2.0, 0.0), (2.0, -0.3), (f64::NAN, 0.3), (2.0, f64::NAN)]
+        {
             for &tad in &[0.5, 2.0, 10.0] {
                 let r = inverse_gaussian_input_rate(tad, mat, cv2, 100.0);
                 assert!(
@@ -1719,16 +1593,8 @@ mod tests {
         let (td, dose) = (2.0_f64, 50.0_f64);
         let ka = 1.0 / td;
         for &tad in &[0.0, 0.1, 0.5, 1.0, 3.0, 8.0] {
-            let want = if tad <= 0.0 {
-                0.0
-            } else {
-                dose * ka * (-ka * tad).exp()
-            };
-            assert_relative_eq!(
-                weibull_input_rate(tad, td, 1.0, dose),
-                want,
-                max_relative = 1e-12
-            );
+            let want = if tad <= 0.0 { 0.0 } else { dose * ka * (-ka * tad).exp() };
+            assert_relative_eq!(weibull_input_rate(tad, td, 1.0, dose), want, max_relative = 1e-12);
         }
     }
 
@@ -1757,10 +1623,7 @@ mod tests {
         let mut prev_absorbed = f64::INFINITY; // falls as tad shrinks
         for &tad in &[1e-1, 1e-3, 1e-6, 1e-9] {
             let r = weibull_input_rate(tad, td, beta, dose);
-            assert!(
-                r.is_finite() && r > 0.0,
-                "R_in must be finite > 0 at tad={tad}, got {r}"
-            );
+            assert!(r.is_finite() && r > 0.0, "R_in must be finite > 0 at tad={tad}, got {r}");
             assert!(
                 r > prev_r,
                 "R_in must rise toward the tad→0 singularity (tad={tad}: {r} vs prev {prev_r})"
@@ -1806,14 +1669,9 @@ mod tests {
     /// `NaN`/`∞` poisoning the ODE RHS.
     #[test]
     fn weibull_rate_is_finite_for_domain_excursions() {
-        for &(td, beta) in &[
-            (0.0, 1.5),
-            (-1.0, 1.5),
-            (2.0, 0.0),
-            (2.0, -0.5),
-            (f64::NAN, 1.5),
-            (2.0, f64::NAN),
-        ] {
+        for &(td, beta) in
+            &[(0.0, 1.5), (-1.0, 1.5), (2.0, 0.0), (2.0, -0.5), (f64::NAN, 1.5), (2.0, f64::NAN)]
+        {
             for &tad in &[0.5, 2.0, 10.0] {
                 let r = weibull_input_rate(tad, td, beta, 100.0);
                 assert!(
@@ -1853,16 +1711,11 @@ mod tests {
             let mut params = vec![D::constant(0.0); crate::types::MAX_PK_PARAMS];
             params[4] = D::var(td, 0);
             params[5] = D::var(beta, 1);
-            let prep = forcing
-                .prepare_dual::<D>(&params)
-                .expect("weibull lifts over PkNum (Phase 2)");
+            let prep =
+                forcing.prepare_dual::<D>(&params).expect("weibull lifts over PkNum (Phase 2)");
             for &tad in &[0.5, 2.0, 10.0] {
                 let r = prep.rate(D::constant(tad), D::constant(100.0));
-                assert!(
-                    r.value.is_finite(),
-                    "{label}: value not finite at tad={tad}: {}",
-                    r.value
-                );
+                assert!(r.value.is_finite(), "{label}: value not finite at tad={tad}: {}", r.value);
                 assert!(
                     r.grad.iter().all(|g| g.is_finite()),
                     "{label}: gradient not finite at tad={tad}: {:?}",
@@ -1937,10 +1790,7 @@ mod tests {
         params[5] = 1.5; // beta
         let prepared = forcing.prepare(&params);
         for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
-            assert_eq!(
-                prepared.rate(tad, 100.0),
-                weibull_input_rate(tad, 2.0, 1.5, 100.0)
-            );
+            assert_eq!(prepared.rate(tad, 100.0), weibull_input_rate(tad, 2.0, 1.5, 100.0));
         }
     }
 
@@ -1977,11 +1827,7 @@ mod tests {
         let (dur, dose) = (4.0_f64, 100.0_f64);
         let rate = dose / dur;
         for &tad in &[0.001, 1.0, 2.0, dur - 1e-9, dur] {
-            assert_relative_eq!(
-                zero_order_input_rate(tad, dur, dose),
-                rate,
-                max_relative = 1e-12
-            );
+            assert_relative_eq!(zero_order_input_rate(tad, dur, dose), rate, max_relative = 1e-12);
         }
         // Strictly past the cutoff the input has stopped.
         for &tad in &[dur + 1e-9, dur + 1.0, 100.0] {
@@ -2046,10 +1892,7 @@ mod tests {
         params[4] = 4.0; // dur
         let prepared = forcing.prepare(&params);
         for &tad in &[0.0, 0.1, 1.0, 4.0, 4.5, 12.0] {
-            assert_eq!(
-                prepared.rate(tad, 100.0),
-                zero_order_input_rate(tad, 4.0, 100.0)
-            );
+            assert_eq!(prepared.rate(tad, 100.0), zero_order_input_rate(tad, 4.0, 100.0));
         }
     }
 
@@ -2137,9 +1980,7 @@ mod tests {
             lag_slot: None,
         };
         for forcing in [&ig, &transit, &weibull, &first_order] {
-            let lifted = forcing
-                .prepare_dual::<f64>(&params)
-                .expect("all kinds lift over PkNum");
+            let lifted = forcing.prepare_dual::<f64>(&params).expect("all kinds lift over PkNum");
             let scalar = forcing.prepare(&params);
             for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
                 assert_eq!(lifted.rate(tad, 100.0), scalar.rate(tad, 100.0));
@@ -2187,11 +2028,7 @@ mod tests {
         let (ka, dose) = (1.3_f64, 80.0_f64);
         for &tad in &[0.1, 0.5, 1.0, 3.0, 8.0] {
             let want = dose * ka * (-ka * tad).exp();
-            assert_relative_eq!(
-                first_order_input_rate(tad, ka, dose),
-                want,
-                max_relative = 1e-12
-            );
+            assert_relative_eq!(first_order_input_rate(tad, ka, dose), want, max_relative = 1e-12);
         }
         // The input starts at the dose (no negative-tad leak) and a non-positive
         // dose contributes nothing.
@@ -2199,11 +2036,7 @@ mod tests {
         assert_eq!(first_order_input_rate(-1.0, ka, dose), 0.0);
         assert_eq!(first_order_input_rate(1.0, ka, 0.0), 0.0);
         // The peak rate is at the dose instant (finite, no singularity): dose·ka.
-        assert_relative_eq!(
-            first_order_input_rate(1e-9, ka, dose),
-            dose * ka,
-            max_relative = 1e-6
-        );
+        assert_relative_eq!(first_order_input_rate(1e-9, ka, dose), dose * ka, max_relative = 1e-6);
     }
 
     #[test]
@@ -2286,10 +2119,7 @@ mod tests {
         params[3] = 1.1; // ka
         let prepared = forcing.prepare(&params);
         for &tad in &[0.0, 0.1, 1.0, 4.0, 12.0] {
-            assert_eq!(
-                prepared.rate(tad, 100.0),
-                first_order_input_rate(tad, 1.1, 100.0)
-            );
+            assert_eq!(prepared.rate(tad, 100.0), first_order_input_rate(tad, 1.1, 100.0));
         }
     }
 
@@ -2417,12 +2247,7 @@ mod tests {
                     / (2.0 * h);
                 let d_frac = first_order_input_rate(tad, ka, dose);
                 assert_relative_eq!(delivered.grad[0], d_ka, max_relative = 1e-5, epsilon = 1e-7);
-                assert_relative_eq!(
-                    delivered.grad[1],
-                    d_frac,
-                    max_relative = 1e-5,
-                    epsilon = 1e-7
-                );
+                assert_relative_eq!(delivered.grad[1], d_frac, max_relative = 1e-5, epsilon = 1e-7);
             }
         }
     }
@@ -2549,30 +2374,18 @@ mod tests {
         let ktr = 2.0;
         // n = 0 (Bateman-degenerate, rate ktr): slope −dose·ktr², matching first-order.
         let prep = PreparedInputRate::transit(0.0, 1.0 / ktr);
-        assert_relative_eq!(
-            prep.rate_dtad_at_zero(dose),
-            -dose * ktr * ktr,
-            max_relative = 1e-12
-        );
+        assert_relative_eq!(prep.rate_dtad_at_zero(dose), -dose * ktr * ktr, max_relative = 1e-12);
         let fd = (prep.rate(1e-6, dose) - prep.rate_at_zero(dose)) / 1e-6;
         assert_relative_eq!(prep.rate_dtad_at_zero(dose), fd, max_relative = 1e-4);
         // n < 0 clamps to 0 → same degenerate first-order slope.
         let prep = PreparedInputRate::transit(-1.0, 1.0 / ktr);
-        assert_relative_eq!(
-            prep.rate_dtad_at_zero(dose),
-            -dose * ktr * ktr,
-            max_relative = 1e-12
-        );
+        assert_relative_eq!(prep.rate_dtad_at_zero(dose), -dose * ktr * ktr, max_relative = 1e-12);
         // n = 1 (Erlang-2): onset VALUE is 0 (continuous) but the SLOPE jumps to
         // +dose·ktr² — a curvature saltation the term MUST carry (#880). ktr = (n+1)/mtt,
         // so mtt = 2/ktr gives this ktr. FD-checked (the value 0 makes rate_at_zero=0, so
         // the FD numerator is just rate(h)).
         let prep = PreparedInputRate::transit(1.0, 2.0 / ktr);
-        assert_relative_eq!(
-            prep.rate_dtad_at_zero(dose),
-            dose * ktr * ktr,
-            max_relative = 1e-12
-        );
+        assert_relative_eq!(prep.rate_dtad_at_zero(dose), dose * ktr * ktr, max_relative = 1e-12);
         let fd = (prep.rate(1e-6, dose) - prep.rate_at_zero(dose)) / 1e-6;
         assert_relative_eq!(prep.rate_dtad_at_zero(dose), fd, max_relative = 1e-4);
         // n > 1: true onset slope vanishes (Γ-density and its slope both →0).
@@ -2589,19 +2402,10 @@ mod tests {
             assert_eq!(prep.rate_dtad_at_zero(dose), 0.0);
         }
         // Zero-order: constant rate ⇒ flat, zero onset slope.
-        assert_eq!(
-            PreparedInputRate::zero_order(3.0).rate_dtad_at_zero(dose),
-            0.0
-        );
+        assert_eq!(PreparedInputRate::zero_order(3.0).rate_dtad_at_zero(dose), 0.0);
         // Zero/negative dose short-circuits to 0 for every arm.
-        assert_eq!(
-            PreparedInputRate::first_order(1.0).rate_dtad_at_zero(0.0),
-            0.0
-        );
-        assert_eq!(
-            PreparedInputRate::first_order(1.0).rate_dtad_at_zero(-5.0),
-            0.0
-        );
+        assert_eq!(PreparedInputRate::first_order(1.0).rate_dtad_at_zero(0.0), 0.0);
+        assert_eq!(PreparedInputRate::first_order(1.0).rate_dtad_at_zero(-5.0), 0.0);
     }
 
     /// Weibull mirrors `rate_at_zero`'s three sub-cases; unreachable on the analytic
@@ -2611,20 +2415,11 @@ mod tests {
     fn rate_dtad_at_zero_weibull_arms() {
         let dose = 100.0;
         let td = 2.0;
-        assert_eq!(
-            PreparedInputRate::weibull(td, 1.5).rate_dtad_at_zero(dose),
-            0.0
-        );
+        assert_eq!(PreparedInputRate::weibull(td, 1.5).rate_dtad_at_zero(dose), 0.0);
         let prep = PreparedInputRate::weibull(td, 1.0);
-        assert_relative_eq!(
-            prep.rate_dtad_at_zero(dose),
-            -dose / (td * td),
-            max_relative = 1e-12
-        );
+        assert_relative_eq!(prep.rate_dtad_at_zero(dose), -dose / (td * td), max_relative = 1e-12);
         let fd = (prep.rate(1e-6, dose) - prep.rate_at_zero(dose)) / 1e-6;
         assert_relative_eq!(prep.rate_dtad_at_zero(dose), fd, max_relative = 1e-4);
-        assert!(PreparedInputRate::weibull(td, 0.5)
-            .rate_dtad_at_zero(dose)
-            .is_nan());
+        assert!(PreparedInputRate::weibull(td, 0.5).rate_dtad_at_zero(dose).is_nan());
     }
 }

@@ -179,10 +179,7 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
     // the fast path never serves NaN where the sign/linearity checks below (also
     // `.abs() > …` comparisons) would silently admit it.
     let du0 = probe_rhs_f64(spec, &vec![0.0; n], p, t)?;
-    if du0
-        .iter()
-        .any(|d| !d.is_finite() || d.abs() > LINEARITY_TOL)
-    {
+    if du0.iter().any(|d| !d.is_finite() || d.abs() > LINEARITY_TOL) {
         return None;
     }
 
@@ -261,11 +258,7 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
             if jac[central][central] >= -COUPLING_EPS {
                 return None;
             }
-            Some(MrDisposition {
-                kind: MrDispositionKind::OneCpt,
-                central,
-                periph: None,
-            })
+            Some(MrDisposition { kind: MrDispositionKind::OneCpt, central, periph: None })
         }
         2 => {
             let periph = (0..n).find(|&s| s != central)?;
@@ -292,11 +285,7 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
             if -c_self - k12 < -COUPLING_EPS {
                 return None;
             }
-            Some(MrDisposition {
-                kind: MrDispositionKind::TwoCpt,
-                central,
-                periph: Some(periph),
-            })
+            Some(MrDisposition { kind: MrDispositionKind::TwoCpt, central, periph: Some(periph) })
         }
         _ => None,
     }
@@ -309,10 +298,7 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
 /// two-compartment). Returns `None` if the readout slope is non-positive
 /// (degenerate) — the caller ([`mr_scope`]) then declines to the ODE path.
 pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
-    spec: &OdeSpec,
-    disp: &MrDisposition,
-    p: &[T],
-    cov: &std::collections::HashMap<String, f64>,
+    spec: &OdeSpec, disp: &MrDisposition, p: &[T], cov: &std::collections::HashMap<String, f64>,
 ) -> Option<DispParams<T>> {
     let prog = spec.rhs_program.as_ref()?;
     let ro = spec.readout_program.as_ref()?;
@@ -369,10 +355,7 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
     if y0.abs().br_cmp(BranchCmp::Gt, tol * (one + y1.abs())) {
         return None;
     }
-    if (y2 - T::from_f64(2.0) * y1)
-        .abs()
-        .br_cmp(BranchCmp::Gt, tol * (one + y2.abs()))
-    {
+    if (y2 - T::from_f64(2.0) * y1).abs().br_cmp(BranchCmp::Gt, tol * (one + y2.abs())) {
         return None;
     }
     let m = y1 - y0;
@@ -388,11 +371,7 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
             if ke.br_cmp_c(BranchCmp::Le, 0.0) {
                 return None;
             }
-            Some(DispParams {
-                cl: ke * v,
-                v,
-                periph: None,
-            })
+            Some(DispParams { cl: ke * v, v, periph: None })
         }
         MrDispositionKind::TwoCpt => {
             let periph = disp.periph?;
@@ -412,11 +391,7 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
             let cl = k10 * v1;
             let q = k12 * v1;
             let v2 = q / k21;
-            Some(DispParams {
-                cl,
-                v: v1,
-                periph: Some((q, v2)),
-            })
+            Some(DispParams { cl, v: v1, periph: Some((q, v2)) })
         }
     }
 }
@@ -426,11 +401,7 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
 /// not widen that visibility).
 #[inline]
 fn forcing_arg<T: PkNum>(f: &InputRateForcing, p: &[T], i: usize, dflt: f64) -> T {
-    f.arg_slots
-        .get(i)
-        .and_then(|&s| p.get(s))
-        .copied()
-        .unwrap_or_else(|| T::from_f64(dflt))
+    f.arg_slots.get(i).and_then(|&s| p.get(s)).copied().unwrap_or_else(|| T::from_f64(dflt))
 }
 
 /// One route's contribution to the observable: `mass · kernel_conc(τ)`.
@@ -446,12 +417,7 @@ fn forcing_arg<T: PkNum>(f: &InputRateForcing, p: &[T], i: usize, dflt: f64) -> 
 /// here as a defensive no-op.
 #[inline(always)]
 fn route_conc_g<T: PkNum>(
-    kind: InputRateKind,
-    f: &InputRateForcing,
-    p: &[T],
-    dp: &DispParams<T>,
-    tau: T,
-    mass: T,
+    kind: InputRateKind, f: &InputRateForcing, p: &[T], dp: &DispParams<T>, tau: T, mass: T,
 ) -> T {
     let one = T::from_f64(1.0);
     let unit = match dp.periph {
@@ -518,13 +484,8 @@ fn route_conc_g<T: PkNum>(
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn mr_observable_g<T: PkNum>(
-    dp: &DispParams<T>,
-    forcings: &[InputRateForcing],
-    doses: &[DoseEvent],
-    t: T,
-    params: &[T],
-    lag_cmt: T,
-    f_bio: T,
+    dp: &DispParams<T>, forcings: &[InputRateForcing], doses: &[DoseEvent], t: T, params: &[T],
+    lag_cmt: T, f_bio: T,
 ) -> T {
     let mut c = T::from_f64(0.0);
     for dose in doses {
@@ -633,9 +594,7 @@ pub(crate) struct MrScope<'a> {
 /// `dose_attr_map`); and no route in its flip-flop domain ([`route_flips`]). Returns `None`
 /// when out of scope, and the caller falls back to the ODE path (always correct).
 pub(crate) fn mr_scope<'a>(
-    model: &'a crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    theta: &[f64],
+    model: &'a crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
     eta: &[f64],
 ) -> Option<MrScope<'a>> {
     let spec = model.ode_spec.as_ref()?;
@@ -667,11 +626,7 @@ pub(crate) fn mr_scope<'a>(
     // ambient model time — so a time term would be silently dropped rather than
     // rejected. Mirrors the same decline inside `recover_disp_params_g`, kept here
     // too so scope membership never depends on the ambient thread-local (#1028).
-    if spec
-        .readout_program
-        .as_ref()
-        .is_some_and(|ro| ro.reads_time_builtin())
-    {
+    if spec.readout_program.as_ref().is_some_and(|ro| ro.reads_time_builtin()) {
         return None;
     }
     if spec.init_fn.is_some() || !spec.dose_attr_map.is_empty() {
@@ -704,11 +659,7 @@ pub(crate) fn mr_scope<'a>(
         return None;
     }
     let dp = recover_disp_params_g::<f64>(spec, &disp, &pk.values, &subject.covariates)?;
-    if spec
-        .input_rate
-        .iter()
-        .any(|f| route_flips(f, &dp, &pk.values))
-    {
+    if spec.input_rate.iter().any(|f| route_flips(f, &dp, &pk.values)) {
         return None;
     }
     Some(MrScope { spec, disp, dp, pk })
@@ -962,11 +913,7 @@ impl Drop for MrVerifyClaim {
 /// after obs 3 of 30 would retire the key with 27 observations never compared.
 #[cfg(debug_assertions)]
 fn verify_against_ode_twin(
-    s: &MrScope<'_>,
-    subject: &crate::types::Subject,
-    theta: &[f64],
-    eta: &[f64],
-    mr: &[f64],
+    s: &MrScope<'_>, subject: &crate::types::Subject, theta: &[f64], eta: &[f64], mr: &[f64],
 ) {
     verify_against_twin(s, subject, mr, || {
         crate::ode::ode_predictions(s.spec, &s.pk.values, theta, eta, subject)
@@ -979,10 +926,7 @@ fn verify_against_ode_twin(
 /// `twin` runs only once the key is claimed and the budget and tolerance gates pass.
 #[cfg(debug_assertions)]
 fn verify_against_twin(
-    s: &MrScope<'_>,
-    subject: &crate::types::Subject,
-    mr: &[f64],
-    twin: impl FnOnce() -> Vec<f64>,
+    s: &MrScope<'_>, subject: &crate::types::Subject, mr: &[f64], twin: impl FnOnce() -> Vec<f64>,
 ) {
     // The bound scales with the model's *own* solver accuracy: the twin is integrated at
     // `spec.solver_opts`, so it cannot be tighter than the user asked for. A fixed `1e-4` was
@@ -1017,10 +961,7 @@ fn verify_against_twin(
         return;
     }
     let budget_key = (key.spec, key.subject);
-    let mut claim = MrVerifyClaim {
-        key: Some(key),
-        budget_charged: false,
-    };
+    let mut claim = MrVerifyClaim { key: Some(key), budget_charged: false };
     // Budget check before anything expensive: a new point is only worth a solve
     // while this subject still has budget left. A vacuous call still spends budget,
     // so a twin that never integrates costs at most the budget in solves.
@@ -1096,9 +1037,7 @@ fn verify_against_twin(
 /// are the exact derivatives of this value; only a point `mr_scope` declines is recorded on
 /// the ODE twin.
 pub(crate) fn mr_predictions(
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    theta: &[f64],
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
     eta: &[f64],
 ) -> Option<Vec<f64>> {
     let s = mr_scope(model, subject, theta, eta)?;
@@ -1129,18 +1068,9 @@ mod tests {
     use super::*;
 
     fn forcing(
-        kind: InputRateKind,
-        arg_slots: Vec<usize>,
-        frac: Option<usize>,
-        lag: Option<usize>,
+        kind: InputRateKind, arg_slots: Vec<usize>, frac: Option<usize>, lag: Option<usize>,
     ) -> InputRateForcing {
-        InputRateForcing {
-            cmt: 0,
-            kind,
-            arg_slots,
-            frac_slot: frac,
-            lag_slot: lag,
-        }
+        InputRateForcing { cmt: 0, kind, arg_slots, frac_slot: frac, lag_slot: lag }
     }
 
     fn dose(time: f64, amt: f64) -> DoseEvent {
@@ -1153,11 +1083,7 @@ mod tests {
     fn single_first_order_route_reduces_to_bateman() {
         // params: [ka] at slot 0.
         let p = vec![1.3_f64];
-        let dp = DispParams {
-            cl: 5.0,
-            v: 50.0,
-            periph: None,
-        };
+        let dp = DispParams { cl: 5.0, v: 50.0, periph: None };
         let f = vec![forcing(InputRateKind::FirstOrder, vec![0], None, None)];
         let doses = vec![dose(0.0, 100.0)];
         for &t in &[0.5, 1.0, 2.0, 4.0, 8.0, 12.0] {
@@ -1179,11 +1105,7 @@ mod tests {
         let fr2 = 0.4;
         let lag2 = 2.0;
         let p = vec![ka1, ka2, fr1, fr2, lag2];
-        let dp = DispParams {
-            cl: 4.0,
-            v: 40.0,
-            periph: None,
-        };
+        let dp = DispParams { cl: 4.0, v: 40.0, periph: None };
         let f = vec![
             forcing(InputRateKind::FirstOrder, vec![0], Some(2), None),
             forcing(InputRateKind::FirstOrder, vec![1], Some(3), Some(4)),
@@ -1205,11 +1127,7 @@ mod tests {
     fn mixed_transit_igd_routes_superpose() {
         // params: [n, mtt, mat, cv2, fr1, fr2] slots 0..6.
         let p = vec![3.0, 1.5, 1.2, 0.3, 0.5, 0.5];
-        let dp = DispParams {
-            cl: 3.0,
-            v: 30.0,
-            periph: None,
-        };
+        let dp = DispParams { cl: 3.0, v: 30.0, periph: None };
         let f = vec![
             forcing(InputRateKind::Transit, vec![0, 1], Some(4), None),
             forcing(InputRateKind::InverseGaussian, vec![2, 3], Some(5), None),
@@ -1229,11 +1147,7 @@ mod tests {
     #[test]
     fn multi_dose_superposes() {
         let p = vec![1.0];
-        let dp = DispParams {
-            cl: 5.0,
-            v: 50.0,
-            periph: None,
-        };
+        let dp = DispParams { cl: 5.0, v: 50.0, periph: None };
         let f = vec![forcing(InputRateKind::FirstOrder, vec![0], None, None)];
         let doses = vec![dose(0.0, 100.0), dose(12.0, 100.0)];
         for &t in &[1.0, 6.0, 13.0, 18.0, 24.0] {
@@ -1249,11 +1163,7 @@ mod tests {
     #[test]
     fn f_bio_scales_whole_dose() {
         let p = vec![1.2, 0.6, 0.4];
-        let dp = DispParams {
-            cl: 4.0,
-            v: 40.0,
-            periph: None,
-        };
+        let dp = DispParams { cl: 4.0, v: 40.0, periph: None };
         let f = vec![
             forcing(InputRateKind::FirstOrder, vec![0], Some(1), None),
             forcing(InputRateKind::FirstOrder, vec![0], Some(2), None),
@@ -1666,10 +1576,7 @@ mod tests {
         for u in [vec![0.0], vec![1.0], vec![2.0]] {
             let f_bad = probe_rhs_f64(bspec, &u, &bp, 1.0).expect("probe");
             let f_ctl = probe_rhs_f64(cspec, &u, &cp, 1.0).expect("probe");
-            assert!(
-                f_bad[0].is_finite(),
-                "on-axis probe at {u:?} must be finite, got {f_bad:?}"
-            );
+            assert!(f_bad[0].is_finite(), "on-axis probe at {u:?} must be finite, got {f_bad:?}");
             assert!(
                 (f_bad[0] - f_ctl[0]).abs() < LINEARITY_TOL,
                 "on-axis probe at {u:?} must be bit-comparable to the control: \
@@ -1744,10 +1651,8 @@ mod tests {
     /// times survive, the snapshots are cleared. Asserts the fixture really is
     /// parameter-static, else it takes the per-event arm and proves nothing.
     fn evid2_static_subject(model: &crate::types::CompiledModel) -> crate::types::Subject {
-        let mut s = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![1.0, 2.0, 6.0],
-        );
+        let mut s =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 6.0]);
         s.pk_only_times = vec![3.0];
         s.pk_only_covariates = Vec::new();
         assert!(
@@ -1779,10 +1684,7 @@ mod tests {
         let s = evid2_static_subject(&tad);
         let out = crate::pk::compute_predictions_with_tv(&tad, &s, &EVID2_THETA, &EVID2_ETA);
         assert_eq!(out.len(), s.obs_times.len());
-        assert!(
-            out.iter().all(|p| p.is_finite() && *p > 0.0),
-            "TAD route returned {out:?}"
-        );
+        assert!(out.iter().all(|p| p.is_finite() && *p > 0.0), "TAD route returned {out:?}");
     }
 
     /// Route 2 — an EVID 3/4 reset on an AUTONOMOUS RHS. `model_uses_time_anywhere`
@@ -1801,10 +1703,7 @@ mod tests {
         assert!(s.has_resets());
         let out = crate::pk::compute_predictions_with_tv(&plain, &s, &EVID2_THETA, &EVID2_ETA);
         assert_eq!(out.len(), s.obs_times.len());
-        assert!(
-            out.iter().all(|p| p.is_finite()),
-            "reset route returned {out:?}"
-        );
+        assert!(out.iter().all(|p| p.is_finite()), "reset route returned {out:?}");
     }
 
     /// Route 3 — the **analytical** event-driven walker, which carries its own copy
@@ -1845,10 +1744,7 @@ mod tests {
         s.doses.push(DoseEvent::new(5.0, 100.0, 1, 0.0, false, 0.0));
         let out = crate::pk::compute_predictions_with_tv(&analytical, &s, &EVID2_THETA, &EVID2_ETA);
         assert_eq!(out.len(), s.obs_times.len());
-        assert!(
-            out.iter().all(|p| p.is_finite()),
-            "analytical route returned {out:?}"
-        );
+        assert!(out.iter().all(|p| p.is_finite()), "analytical route returned {out:?}");
         assert!(
             out.last().is_some_and(|p| *p > 0.0),
             "the post-reset observation must see the second dose, else the arm is \
@@ -2030,20 +1926,12 @@ mod tests {
         // θ rather than η because `REDUCE_1CPT_LAG` carries no `ETA_V`, so an η-only route
         // leaves `V` at 49.2 and the state never reaches `abstol` — a first draft did that
         // and passed with the gate disabled, i.e. proved nothing.
-        let theta = [
-            1.1197394031099207e-7,
-            5.219077731731729e-8,
-            0.500693,
-            1.22062,
-            0.811426,
-            3.07375,
-        ];
+        let theta =
+            [1.1197394031099207e-7, 5.219077731731729e-8, 0.500693, 1.22062, 0.811426, 3.07375];
         let eta = [0.0];
         let subject = mk_subject(
             vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![
-                0.25, 0.5, 1.0, 1.5, 2.0, 2.9, 3.1, 3.5, 4.0, 5.0, 6.0, 8.0, 12.0, 16.0, 24.0,
-            ],
+            vec![0.25, 0.5, 1.0, 1.5, 2.0, 2.9, 3.1, 3.5, 4.0, 5.0, 6.0, 8.0, 12.0, 16.0, 24.0],
         );
         let out = mr_predictions(&model, &subject, &theta, &eta).expect("MR-supported");
         assert_eq!(out.len(), subject.obs_times.len());
@@ -2206,10 +2094,8 @@ mod tests {
         let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
         let eta = [0.1];
         let obs: Vec<f64> = (1..=60).map(|i| i as f64 * 0.4).collect();
-        let mut subject = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs.clone(),
-        );
+        let mut subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], obs.clone());
         subject.covariates = std::collections::HashMap::from([("WT".to_string(), 140.0)]);
         let mr = mr_predictions(&model, &subject, &theta, &eta).expect("MR-supported");
         // Flat params WITH the covariate baked in, for the ODE reference.
@@ -2329,10 +2215,8 @@ mod tests {
     #[test]
     fn declines_time_dependent_disposition() {
         let model = parse(TIME_DEPENDENT);
-        let subject = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![1.0, 2.0, 4.0],
-        );
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
         assert!(
             mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
             "a TIME-dependent disposition must decline"
@@ -2343,10 +2227,8 @@ mod tests {
     fn declines_flip_flop_transit_route() {
         let model = parse(TRANSIT_FLIPFLOP);
         // ke = CL/V = 60/10 = 6 ≥ KTR = (2+1)/1 = 3 → flip-flop, no closed form.
-        let subject = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![0.5, 1.0, 2.0],
-        );
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![0.5, 1.0, 2.0]);
         assert!(
             mr_predictions(&model, &subject, &[60.0, 10.0, 2.0, 1.0], &[0.0]).is_none(),
             "a transit route past its flip-flop bound must decline"
@@ -2359,14 +2241,8 @@ mod tests {
         let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
         let obs = vec![1.0, 4.0, 8.0];
         // Steady-state dose.
-        let ss = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
-            obs.clone(),
-        );
-        assert!(
-            mr_predictions(&model, &ss, &theta, &[0.0, 0.0]).is_none(),
-            "SS dose declines"
-        );
+        let ss = mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)], obs.clone());
+        assert!(mr_predictions(&model, &ss, &theta, &[0.0, 0.0]).is_none(), "SS dose declines");
         // Infusion dose (RATE > 0).
         let inf = mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)], obs);
         assert!(
@@ -2380,16 +2256,8 @@ mod tests {
         // The defensive arm in `route_conc_g` (the gate excludes this kind, so it
         // is never reached in production) returns 0 for both dispositions.
         let p = vec![2.0_f64];
-        let one = DispParams {
-            cl: 5.0,
-            v: 50.0,
-            periph: None,
-        };
-        let two = DispParams {
-            cl: 5.0,
-            v: 50.0,
-            periph: Some((10.0, 100.0)),
-        };
+        let one = DispParams { cl: 5.0, v: 50.0, periph: None };
+        let two = DispParams { cl: 5.0, v: 50.0, periph: Some((10.0, 100.0)) };
         for dp in [one, two] {
             let f = forcing(InputRateKind::Weibull, vec![0], None, None);
             let got = route_conc_g::<f64>(InputRateKind::Weibull, &f, &p, &dp, 2.0, 100.0);
@@ -2407,11 +2275,7 @@ mod tests {
         // new kernel, mirroring `single_first_order_route_reduces_to_bateman`.
         let dur = 2.5_f64;
         let p = vec![dur];
-        let dp = DispParams {
-            cl: 5.0,
-            v: 50.0,
-            periph: None,
-        };
+        let dp = DispParams { cl: 5.0, v: 50.0, periph: None };
         let f = vec![forcing(InputRateKind::ZeroOrder, vec![0], None, None)];
         let doses = vec![dose(0.0, 100.0)];
         let rate = 100.0 / dur;
@@ -2509,10 +2373,8 @@ mod tests {
     #[test]
     fn declines_baseline_readout() {
         let model = parse(BASELINE_READOUT);
-        let subject = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![1.0, 2.0, 4.0],
-        );
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
         assert!(
             mr_predictions(&model, &subject, &[5.0, 50.0, 1.5], &[0.0]).is_none(),
             "a readout with a baseline (non-zero intercept) must decline"
@@ -2525,18 +2387,14 @@ mod tests {
     fn declines_dose_into_noncentral_compartment() {
         let model = parse(REDUCE_2CPT);
         let theta = [5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3];
-        let central_ok = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![1.0, 4.0],
-        );
+        let central_ok =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 4.0]);
         assert!(
             mr_predictions(&model, &central_ok, &theta, &[0.0]).is_some(),
             "sanity: a central dose is served"
         );
-        let periph_dose = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)],
-            vec![1.0, 4.0],
-        );
+        let periph_dose =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 2, 0.0, false, 0.0)], vec![1.0, 4.0]);
         assert!(
             mr_predictions(&model, &periph_dose, &theta, &[0.0]).is_none(),
             "a dose into the peripheral compartment must decline"
@@ -2593,10 +2451,8 @@ mod tests {
         // KTR=(1+1)/0.5=4. So ke=k10=0.1 < 4 (the OLD 1-cpt check WRONGLY passes),
         // but α≈12 ≥ 4 (the kernel returns 0) → the 2-cpt check must decline.
         let theta = [5.0, 50.0, 100.0, 10.0, 1.0, 0.5];
-        let subject = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![0.5, 1.0, 2.0],
-        );
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![0.5, 1.0, 2.0]);
         assert!(
             mr_predictions(&model, &subject, &theta, &[0.0]).is_none(),
             "a 2-cpt transit route past its macro-rate domain (α≥KTR while k10<KTR) must decline"
@@ -2667,9 +2523,7 @@ mod tests {
     /// arrival; it is the engine the NONMEM `TAD`-in-`$DES` anchors validate
     /// (`nonmem_anchor/tad_lag_{A,B}`), and the one production routes to.
     fn event_twin(
-        model: &crate::types::CompiledModel,
-        subject: &crate::types::Subject,
-        theta: &[f64],
+        model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
         eta: &[f64],
     ) -> Vec<f64> {
         let spec = model.ode_spec.as_ref().expect("ode model");
@@ -2694,9 +2548,7 @@ mod tests {
     /// return `NaN` for every observation there (#1110), which is why the callers
     /// below that predate it use [`event_twin`] instead and say so.
     fn dense_twin(
-        model: &crate::types::CompiledModel,
-        subject: &crate::types::Subject,
-        theta: &[f64],
+        model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
         eta: &[f64],
     ) -> Vec<f64> {
         let spec = model.ode_spec.as_ref().expect("ode model");
@@ -2765,11 +2617,8 @@ mod tests {
         let eta = [0.0];
         let a = crate::pk::compute_predictions_with_tv(&with_tad, &subject, &TAD_THETA, &eta);
         let b = crate::pk::compute_predictions_with_tv(&without, &subject, &TAD_THETA, &eta);
-        let worst = a
-            .iter()
-            .zip(&b)
-            .map(|(x, y)| (x - y).abs() / (1.0 + y.abs()))
-            .fold(0.0f64, f64::max);
+        let worst =
+            a.iter().zip(&b).map(|(x, y)| (x - y).abs() / (1.0 + y.abs())).fold(0.0f64, f64::max);
         assert!(
             worst > 1e-2,
             "predictions are within {worst:.3e} of the same model with the `TAD` \
@@ -2943,10 +2792,7 @@ mod tests {
         // `model_uses_time_anywhere`'s table (5.8e-12 under a lagtime).
         let twin = event_twin(&model, &subject, &theta, &eta);
         for (i, (&a, &b)) in prod.iter().zip(&twin).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-6 * (1.0 + b.abs()),
-                "obs {i}: {a} vs {b}"
-            );
+            assert!((a - b).abs() < 1e-6 * (1.0 + b.abs()), "obs {i}: {a} vs {b}");
         }
     }
 
@@ -3007,10 +2853,7 @@ mod tests {
         // Add one observation before the dose at t = 1.0.
         let before = mk_subject(doses(), vec![0.4, 2.0, 4.0, 8.0, 24.0]);
         let with_pre = crate::pk::compute_predictions_with_tv(&model, &before, &theta, &eta);
-        assert_eq!(
-            with_pre[0], 0.0,
-            "a pre-arrival observation carries no drug, got {with_pre:?}"
-        );
+        assert_eq!(with_pre[0], 0.0, "a pre-arrival observation carries no drug, got {with_pre:?}");
         for (i, (&a, &b)) in with_pre[1..].iter().zip(&base).enumerate() {
             assert_eq!(
                 a.to_bits(),
@@ -3191,11 +3034,7 @@ mod tests {
             (REDUCE_1CPT, &[5.0, 50.0, 0.6, 1.5, 0.3], &[0.0, 0.0]),
             (REDUCE_1CPT, &[5.0, 50.0, 0.6, 1.5, 0.3], &[0.3, -0.2]),
             (REDUCE_1CPT_LAG, &[5.0, 50.0, 0.5, 1.2, 0.8, 3.0], &[0.0]),
-            (
-                REDUCE_2CPT,
-                &[5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3],
-                &[0.0],
-            ),
+            (REDUCE_2CPT, &[5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3], &[0.0]),
         ];
         for (i, (src, theta, eta)) in zoo.iter().enumerate() {
             let model = crate::parser::model_parser::parse_model_string(src).unwrap();
@@ -3344,12 +3183,8 @@ mod tests {
     /// i.e. iff the memo did **not** treat the two calls as one key (#1150).
     #[cfg(debug_assertions)]
     fn verify_clean_then_perturbed(
-        model_a: &crate::types::CompiledModel,
-        subject_a: &crate::types::Subject,
-        theta_a: &[f64],
-        model_b: &crate::types::CompiledModel,
-        subject_b: &crate::types::Subject,
-        theta_b: &[f64],
+        model_a: &crate::types::CompiledModel, subject_a: &crate::types::Subject, theta_a: &[f64],
+        model_b: &crate::types::CompiledModel, subject_b: &crate::types::Subject, theta_b: &[f64],
     ) {
         let eta = [0.0, 0.0];
         let s_a = mr_scope(model_a, subject_a, theta_a, &eta).expect("point a in scope");
@@ -3404,10 +3239,7 @@ mod tests {
             verify_against_ode_twin(&s, &subject, &theta, &eta, &twin);
         }
         let spec = model.ode_spec.as_mut().expect("ode model");
-        assert_eq!(
-            spec.solver_opts.reltol, 1e-10,
-            "precondition: the fixture's pin"
-        );
+        assert_eq!(spec.solver_opts.reltol, 1e-10, "precondition: the fixture's pin");
         spec.solver_opts.reltol = 1e-11;
         let s = mr_scope(&model, &subject, &theta, &eta).expect("in scope");
         let mut preds = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
@@ -3428,10 +3260,7 @@ mod tests {
             (1..=30).map(|i| i as f64 * 0.4).collect(),
         );
         let multi = tad_subject();
-        assert_eq!(
-            single.id, multi.id,
-            "precondition: same id, different doses"
-        );
+        assert_eq!(single.id, multi.id, "precondition: same id, different doses");
         assert_eq!(single.obs_times, multi.obs_times);
         let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
         verify_clean_then_perturbed(&model, &single, &theta, &model, &multi, &theta);
@@ -3448,18 +3277,11 @@ mod tests {
         let parse = crate::parser::model_parser::parse_model_string;
         let src_b = REDUCE_1CPT.replace("- CL/V*central", "- 1.3*CL/V*central");
         assert_ne!(src_b, REDUCE_1CPT, "precondition: the replacement applied");
-        let (a1, a2, b) = (
-            parse(REDUCE_1CPT).unwrap(),
-            parse(REDUCE_1CPT).unwrap(),
-            parse(&src_b).unwrap(),
-        );
+        let (a1, a2, b) =
+            (parse(REDUCE_1CPT).unwrap(), parse(REDUCE_1CPT).unwrap(), parse(&src_b).unwrap());
         let subject = tad_subject();
         let fp = |m: &crate::types::CompiledModel| spec_fingerprint(m.ode_spec.as_ref().unwrap());
-        assert_eq!(
-            fp(&a1),
-            fp(&a2),
-            "two parses of one source must share a key"
-        );
+        assert_eq!(fp(&a1), fp(&a2), "two parses of one source must share a key");
         assert_ne!(fp(&a1), fp(&b), "an RHS change must change the key");
         let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
         let eta = [0.0, 0.0];
@@ -3473,10 +3295,7 @@ mod tests {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             verify_clean_then_perturbed(&a1, &subject, &theta, &b, &subject, &theta)
         }));
-        assert!(
-            caught.is_err(),
-            "the second model's closed form was never checked"
-        );
+        assert!(caught.is_err(), "the second model's closed form was never checked");
     }
 
     /// A **partial** comparison must not retire the key either (#1150 §5): a twin that
@@ -3497,10 +3316,7 @@ mod tests {
         let real = crate::ode::ode_predictions(s.spec, &s.pk.values, &theta, &eta, &subject);
         let mut partial = real.clone();
         partial[3..].iter_mut().for_each(|v| *v = f64::NAN);
-        assert!(
-            partial[..3].iter().all(|v| v.is_finite()),
-            "precondition: finite prefix"
-        );
+        assert!(partial[..3].iter().all(|v| v.is_finite()), "precondition: finite prefix");
         verify_against_twin(&s, &subject, &real, || partial);
         let mut preds = real.clone();
         preds[10] *= 1.01;
@@ -3537,10 +3353,7 @@ mod tests {
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             verify_clean_then_perturbed(&a, &subject, &theta, &b, &subject, &theta)
         }));
-        assert!(
-            caught.is_err(),
-            "the second model's closed form was never checked"
-        );
+        assert!(caught.is_err(), "the second model's closed form was never checked");
     }
 
     /// A panicking check must release its key **and** refund its budget (#1150 §5).
@@ -3606,25 +3419,12 @@ mod tests {
     #[test]
     fn the_verify_gate_stays_quiet_at_default_solver_tolerances() {
         let strip = |s: &str| -> String {
-            s.replace("  ode_reltol = 1e-10\n", "")
-                .replace("  ode_abstol = 1e-12\n", "")
+            s.replace("  ode_reltol = 1e-10\n", "").replace("  ode_abstol = 1e-12\n", "")
         };
         let zoo: Vec<(String, Vec<f64>, Vec<f64>)> = vec![
-            (
-                strip(REDUCE_1CPT),
-                vec![5.0, 50.0, 0.6, 1.5, 0.3],
-                vec![0.3, -0.2],
-            ),
-            (
-                strip(REDUCE_1CPT_LAG),
-                vec![5.0, 50.0, 0.5, 1.2, 0.8, 3.0],
-                vec![0.0],
-            ),
-            (
-                strip(REDUCE_2CPT),
-                vec![5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3],
-                vec![0.0],
-            ),
+            (strip(REDUCE_1CPT), vec![5.0, 50.0, 0.6, 1.5, 0.3], vec![0.3, -0.2]),
+            (strip(REDUCE_1CPT_LAG), vec![5.0, 50.0, 0.5, 1.2, 0.8, 3.0], vec![0.0]),
+            (strip(REDUCE_2CPT), vec![5.0, 50.0, 10.0, 100.0, 0.6, 1.5, 0.3], vec![0.0]),
         ];
         for (src, theta, eta) in &zoo {
             let model = crate::parser::model_parser::parse_model_string(src).unwrap();
@@ -3662,10 +3462,8 @@ mod tests {
         // form. Exercise it directly by injecting a diffusion term into a model
         // `mr_scope` otherwise admits, proving the guard is load-bearing.
         let mut model = parse(REDUCE_1CPT);
-        let subject = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![1.0, 2.0, 4.0],
-        );
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
         let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
         let eta = [0.0, 0.0];
         // Baseline: this model IS admitted (sanity — else the test proves nothing).
@@ -3700,10 +3498,8 @@ mod tests {
         // then silently serve predictions with the whole term missing. Decline instead.
         let src = REDUCE_1CPT.replace("y = central / V", "y = central / V + 0.5 * TIME");
         let model = parse(&src);
-        let subject = mk_subject(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            vec![1.0, 2.0, 4.0],
-        );
+        let subject =
+            mk_subject(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], vec![1.0, 2.0, 4.0]);
         let theta = [5.0, 50.0, 0.6, 1.5, 0.3];
         let eta = [0.0, 0.0];
 

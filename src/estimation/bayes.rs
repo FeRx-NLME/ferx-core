@@ -50,10 +50,7 @@ use rand_distr::{ChiSquared, Distribution, Gamma, StandardNormal};
 // Used by the Ω block for the independent per-variance full conditional of a
 // diagonal Ω; also the basis for any future conjugate-σ draw (ferx-core#380).
 pub fn inverse_gamma_draw(shape: f64, scale: f64, rng: &mut impl Rng) -> f64 {
-    debug_assert!(
-        shape > 0.0 && scale > 0.0,
-        "InvGamma params must be positive"
-    );
+    debug_assert!(shape > 0.0 && scale > 0.0, "InvGamma params must be positive");
     // Gamma(shape, scale = 1/rate); we want rate = `scale`, so Gamma scale = 1/scale.
     let gamma = Gamma::new(shape, 1.0 / scale).expect("valid Gamma parameters");
     let g = gamma.sample(rng);
@@ -99,9 +96,7 @@ pub fn wishart_draw(df: f64, scale_chol: &DMatrix<f64>, rng: &mut impl Rng) -> D
 /// conjugate prior `InvWishart(ν₀, Λ₀)`, the full conditional of Ω is
 /// `InvWishart(ν₀ + N, Λ₀ + S)`.
 pub fn inverse_wishart_draw(
-    df: f64,
-    psi: &DMatrix<f64>,
-    rng: &mut impl Rng,
+    df: f64, psi: &DMatrix<f64>, rng: &mut impl Rng,
 ) -> Option<DMatrix<f64>> {
     let psi_inv = psi.clone().try_inverse()?;
     // Symmetrize to kill the asymmetry that try_inverse can introduce, so the
@@ -146,11 +141,7 @@ pub fn summarize_param(name: &str, chains: &[Vec<f64>]) -> PosteriorSummary {
         ess_bulk: bulk,
         ess_tail: tail,
         // MCSE of the posterior mean uses the bulk ESS.
-        mcse: if bulk > 0.0 {
-            sd_v / bulk.sqrt()
-        } else {
-            f64::NAN
-        },
+        mcse: if bulk > 0.0 { sd_v / bulk.sqrt() } else { f64::NAN },
     }
 }
 
@@ -269,12 +260,7 @@ impl EtaProposal {
     fn adapt(&mut self, build_shape: bool) {
         self.scale = adapt_scale(self.scale, self.acc, self.prop, ETA_BLOCK_TARGET_ACCEPT);
         for (s, &a) in self.cw_scales.iter_mut().zip(&self.cw_acc) {
-            *s = adapt_scale(
-                *s,
-                a,
-                self.cw_prop,
-                crate::estimation::saem::CW_TARGET_ACCEPT,
-            );
+            *s = adapt_scale(*s, a, self.cw_prop, crate::estimation::saem::CW_TARGET_ACCEPT);
         }
         self.acc = 0;
         self.prop = 0;
@@ -316,14 +302,8 @@ fn ebe_start_etas(ebes: &[DVector<f64>], n_subjects: usize, n_eta: usize) -> Vec
 /// Named rather than written inline so the `chain_outputs` binding stays one
 /// line: spelled out, rustfmt wraps the annotation and re-indents the whole
 /// per-chain closure, which turns a 340-line change into a 1,600-line diff.
-type ChainOutput = (
-    Vec<Vec<f64>>,
-    Vec<DVector<f64>>,
-    Vec<Vec<DVector<f64>>>,
-    u64,
-    u64,
-    ConjugateTally,
-);
+type ChainOutput =
+    (Vec<Vec<f64>>, Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>, u64, u64, ConjugateTally);
 
 /// A chain accepting below this share of its conjugate draws is reported rather
 /// than left silent. Not a correctness threshold: the move is
@@ -396,14 +376,10 @@ impl ConjugateTally {
     /// sentence is true; what matters is that the pick is fixed rather than
     /// incidental.
     fn largest_rejection(&self) -> Option<(u64, char)> {
-        [
-            (self.skipped, 's'),
-            (self.rejected_metropolis, 'm'),
-            (self.rejected_out_of_bounds, 'b'),
-        ]
-        .into_iter()
-        .filter(|&(n, _)| n > 0)
-        .max_by_key(|&(n, _)| n)
+        [(self.skipped, 's'), (self.rejected_metropolis, 'm'), (self.rejected_out_of_bounds, 'b')]
+            .into_iter()
+            .filter(|&(n, _)| n > 0)
+            .max_by_key(|&(n, _)| n)
     }
 }
 
@@ -500,21 +476,12 @@ enum WorstRhatDriver {
 /// Classify the recorded parameter `p` (θ, then Ω's free entries from
 /// `n_theta`, then σ and Ω_iov from `sig_start`).
 fn worst_rhat_driver(
-    p: usize,
-    n_theta: usize,
-    sig_start: usize,
-    pop_coords: &[PopCoord],
-    conjugate_theta: &std::collections::HashSet<usize>,
-    mu_pairs: &[Option<usize>],
+    p: usize, n_theta: usize, sig_start: usize, pop_coords: &[PopCoord],
+    conjugate_theta: &std::collections::HashSet<usize>, mu_pairs: &[Option<usize>],
 ) -> WorstRhatDriver {
     if p < n_theta {
-        if pop_coords
-            .iter()
-            .any(|c| matches!(*c, PopCoord::Theta { idx, .. } if idx == p))
-        {
-            WorstRhatDriver::RandomWalkTheta {
-                mu_referenced: mu_pairs.contains(&Some(p)),
-            }
+        if pop_coords.iter().any(|c| matches!(*c, PopCoord::Theta { idx, .. } if idx == p)) {
+            WorstRhatDriver::RandomWalkTheta { mu_referenced: mu_pairs.contains(&Some(p)) }
         } else if conjugate_theta.contains(&p) {
             WorstRhatDriver::EtaDriven
         } else {
@@ -531,10 +498,7 @@ fn worst_rhat_driver(
 /// ran the Metropolis kernel on a model the HMC kernel could serve (analytical
 /// PK, no IOV, no mixture).
 fn rhat_warning(
-    max_rhat: f64,
-    worst: &str,
-    driver: WorstRhatDriver,
-    mh_on_hmc_capable: bool,
+    max_rhat: f64, worst: &str, driver: WorstRhatDriver, mh_on_hmc_capable: bool,
 ) -> String {
     let mut w = format!(
         "Bayes: max split-R-hat = {max_rhat:.3} (> {RHAT_CONVERGENCE_THRESHOLD}) on {worst} — \
@@ -596,16 +560,9 @@ enum PopCoord {
 /// differ only through the `MIXNUM`-switched structural typical values.
 #[allow(clippy::too_many_arguments)]
 fn subject_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    sigma: &[f64],
-    scratch: &mut EventPkParams,
-    schedule: Option<&crate::pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[Vec<f64>],
+    omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>, sigma: &[f64],
+    scratch: &mut EventPkParams, schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> f64 {
     if let Some(spec) = model.mixture.as_ref() {
         let k = spec.n_classes;
@@ -659,19 +616,9 @@ fn subject_nll(
 /// for mixtures (its Dual2 gradient is single-class), so this is the η kernel.
 #[allow(clippy::too_many_arguments)]
 fn mh_steps_mixture(
-    eta: &mut [f64],
-    nll_current: f64,
-    subject: &Subject,
-    model: &CompiledModel,
-    theta: &[f64],
-    kappas: &[Vec<f64>],
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    sigma: &[f64],
-    step_scale: f64,
-    rng: &mut impl Rng,
-    n_steps: usize,
-    scratch: &mut EventPkParams,
+    eta: &mut [f64], nll_current: f64, subject: &Subject, model: &CompiledModel, theta: &[f64],
+    kappas: &[Vec<f64>], omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>, sigma: &[f64],
+    step_scale: f64, rng: &mut impl Rng, n_steps: usize, scratch: &mut EventPkParams,
     schedule: Option<&crate::pk::event_driven::EventSchedule>,
 ) -> (usize, f64) {
     let n_eta = eta.len();
@@ -681,9 +628,8 @@ fn mh_steps_mixture(
     for _ in 0..n_steps {
         let z: Vec<f64> = (0..n_eta).map(|_| rng.sample(StandardNormal)).collect();
         let perturbation = l * DVector::from_column_slice(&z);
-        let eta_prop: Vec<f64> = (0..n_eta)
-            .map(|j| eta[j] + step_scale * perturbation[j])
-            .collect();
+        let eta_prop: Vec<f64> =
+            (0..n_eta).map(|j| eta[j] + step_scale * perturbation[j]).collect();
         let nll_prop = subject_nll(
             model, subject, theta, &eta_prop, kappas, omega, omega_iov, sigma, scratch, schedule,
         );
@@ -711,18 +657,9 @@ fn mh_steps_mixture(
 /// same Rao-Blackwellised target that every other Gibbs block uses.
 #[allow(clippy::too_many_arguments)]
 fn mh_kappa_steps_mixture(
-    kappas: &mut [Vec<f64>],
-    nll_current: f64,
-    subject: &Subject,
-    model: &CompiledModel,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
-    omega_iov: &OmegaMatrix,
-    sigma: &[f64],
-    step_scale: f64,
-    rng: &mut impl Rng,
-    scratch: &mut EventPkParams,
+    kappas: &mut [Vec<f64>], nll_current: f64, subject: &Subject, model: &CompiledModel,
+    theta: &[f64], eta: &[f64], omega: &OmegaMatrix, omega_iov: &OmegaMatrix, sigma: &[f64],
+    step_scale: f64, rng: &mut impl Rng, scratch: &mut EventPkParams,
 ) -> (usize, usize, f64) {
     let n_kappa = omega_iov.matrix.nrows();
     let l = &omega_iov.chol;
@@ -733,9 +670,8 @@ fn mh_kappa_steps_mixture(
     for k in 0..n_occ {
         let z: Vec<f64> = (0..n_kappa).map(|_| rng.sample(StandardNormal)).collect();
         let perturbation = l * DVector::from_column_slice(&z);
-        let kap_prop: Vec<f64> = (0..n_kappa)
-            .map(|j| kappas[k][j] + step_scale * perturbation[j])
-            .collect();
+        let kap_prop: Vec<f64> =
+            (0..n_kappa).map(|j| kappas[k][j] + step_scale * perturbation[j]).collect();
 
         // Temporarily substitute κ_k with the proposal; restore on reject.
         let old_kap = std::mem::replace(&mut kappas[k], kap_prop);
@@ -769,11 +705,8 @@ fn mh_kappa_steps_mixture(
 /// rows/columns from `original`, and floor the diagonal for positive-
 /// definiteness. Shared by the Ω and Ω_iov inverse-Wishart blocks.
 fn impose_omega_structure(
-    m: &mut DMatrix<f64>,
-    free_mask: &nalgebra::DMatrix<bool>,
-    fixed: &[bool],
-    original: &DMatrix<f64>,
-    diag_floor: f64,
+    m: &mut DMatrix<f64>, free_mask: &nalgebra::DMatrix<bool>, fixed: &[bool],
+    original: &DMatrix<f64>, diag_floor: f64,
 ) {
     let n = m.nrows();
     for i in 0..n {
@@ -822,9 +755,7 @@ pub(crate) const BAYES_DEFAULT_SEED: u64 = 0x6E_61_6D_63_62_61_79_65;
 /// Returns an [`OuterResult`] whose point estimate is the posterior mean and
 /// whose [`OuterResult::bayes`] carries the posterior summaries + diagnostics.
 pub fn run_bayes(
-    model: &CompiledModel,
-    population: &Population,
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
     let n_kappa = model.n_kappa;
@@ -835,15 +766,13 @@ pub fn run_bayes(
     if n_kappa > 0 {
         if init_params.omega_iov.is_none() {
             return Err(
-                "Bayesian estimation: model declares kappa but init has no omega_iov".to_string(),
+                "Bayesian estimation: model declares kappa but init has no omega_iov".to_string()
             );
         }
         if !model.kappa_mu_refs.is_empty() {
-            return Err(
-                "Bayesian estimation (method = bayes) supports zero-mean IOV kappas only \
+            return Err("Bayesian estimation (method = bayes) supports zero-mean IOV kappas only \
                  (κ ~ N(0, Ω_iov)); kappa mu-references are not yet supported"
-                    .to_string(),
-            );
+                .to_string());
         }
     }
 
@@ -919,10 +848,8 @@ pub fn run_bayes(
     // data pin at fixed η. Groups are left out under a mixture: the
     // class-switched typical value has not been derived for them.
     let mu_design = MuDesign::build(model, population, init_params, model.mixture.is_none());
-    let conjugate_theta: std::collections::HashSet<usize> = mu_design
-        .as_ref()
-        .map(|d| d.theta_indices().into_iter().collect())
-        .unwrap_or_default();
+    let conjugate_theta: std::collections::HashSet<usize> =
+        mu_design.as_ref().map(|d| d.theta_indices().into_iter().collect()).unwrap_or_default();
     // The conjugate Gaussian θ move requires EVERY η to be covered (a non-fixed
     // log anchor or an affine covariate mu-reference). When only some are
     // (partial mu-referencing), the conjugate
@@ -1109,10 +1036,8 @@ pub fn run_bayes(
             .collect();
         // The sampled κ, summed per subject and cell like η: the final EBE pass
         // starts each occasion at its posterior mean, not at 0 (#2377).
-        let mut kappa_sum: Vec<Vec<DVector<f64>>> = kappas
-            .iter()
-            .map(|ks| ks.iter().map(|_| DVector::zeros(n_kappa)).collect())
-            .collect();
+        let mut kappa_sum: Vec<Vec<DVector<f64>>> =
+            kappas.iter().map(|ks| ks.iter().map(|_| DVector::zeros(n_kappa)).collect()).collect();
         let mut omega_iov_cur: Option<OmegaMatrix> = init_params.omega_iov.clone();
         // Per-subject kappa-MH step scale (adapted in warmup).
         let mut kappa_scale = 0.6_f64;
@@ -1214,9 +1139,8 @@ pub fn run_bayes(
                 .collect();
 
             // Componentwise proposal SD, √Ω_jj (shared by every subject).
-            let cw_sd: Vec<f64> = (0..n_eta)
-                .map(|j| omega_cur.matrix[(j, j)].max(OMEGA_DIAG_FLOOR).sqrt())
-                .collect();
+            let cw_sd: Vec<f64> =
+                (0..n_eta).map(|j| omega_cur.matrix[(j, j)].max(OMEGA_DIAG_FLOOR).sqrt()).collect();
 
             // ---- 1. η block ----
             // HMC (gradient-guided, on the analytic Dual2 η-gradient) when opted in
@@ -1337,9 +1261,8 @@ pub fn run_bayes(
 
             // ---- 1b. κ block: sample κ_ik | η, θ, Ω, Ω_iov, data (η fixed) ----
             if should_sample_kappa_block(n_kappa, omega_iov_cur.as_ref()) {
-                let oi = omega_iov_cur
-                    .as_ref()
-                    .expect("should_sample_kappa_block requires OMEGA_IOV");
+                let oi =
+                    omega_iov_cur.as_ref().expect("should_sample_kappa_block requires OMEGA_IOV");
                 for i in 0..n_subjects {
                     // Mixture (#985): the marginal κ kernel, so the acceptance
                     // ratio compares like with like (`nll[i]` is the K-class
@@ -1884,14 +1807,7 @@ pub fn run_bayes(
             }
         }
 
-        Some((
-            chain_draws,
-            eta_sum,
-            kappa_sum,
-            eta_record_count,
-            n_divergent_total,
-            conj_tally,
-        ))
+        Some((chain_draws, eta_sum, kappa_sum, eta_record_count, n_divergent_total, conj_tally))
     });
 
     // Bail before the summary stage can observe partial/empty chain draws.
@@ -1955,11 +1871,8 @@ pub fn run_bayes(
             summarize_param(&param_names[p], &chains)
         })
         .collect();
-    let max_rhat = summaries
-        .iter()
-        .map(|s| s.rhat)
-        .filter(|r| r.is_finite())
-        .fold(0.0_f64, f64::max);
+    let max_rhat =
+        summaries.iter().map(|s| s.rhat).filter(|r| r.is_finite()).fold(0.0_f64, f64::max);
     let n_draws_per_chain = draws_by_chain.first().map(|c| c[0].len()).unwrap_or(0);
 
     // ----- posterior-mean point estimate -----
@@ -1967,10 +1880,8 @@ pub fn run_bayes(
         (0..n_params)
             .filter(|&p| name_pred(p))
             .map(|p| {
-                let all: Vec<f64> = draws_by_chain
-                    .iter()
-                    .flat_map(|c| c[p].iter().copied())
-                    .collect();
+                let all: Vec<f64> =
+                    draws_by_chain.iter().flat_map(|c| c[p].iter().copied()).collect();
                 all.iter().sum::<f64>() / all.len().max(1) as f64
             })
             .collect()
@@ -2016,10 +1927,7 @@ pub fn run_bayes(
         theta_fixed: init_params.theta_fixed.clone(),
         omega: omega_mean.clone(),
         omega_fixed: init_params.omega_fixed.clone(),
-        sigma: SigmaVector {
-            values: sigma_mean.clone(),
-            names: init_params.sigma.names.clone(),
-        },
+        sigma: SigmaVector { values: sigma_mean.clone(), names: init_params.sigma.names.clone() },
         sigma_fixed: init_params.sigma_fixed.clone(),
         // Bayes does not sample the `block_sigma` off-diagonals (#847), so the
         // posterior-mean snapshot carries them through at their declared value
@@ -2159,14 +2067,8 @@ pub fn run_bayes(
             .max_by(|a, b| a.1.rhat.total_cmp(&b.1.rhat))
             .map(|(p, _)| p)
             .unwrap_or(0);
-        let driver = worst_rhat_driver(
-            worst,
-            n_theta,
-            sig_start,
-            &pop_coords,
-            &conjugate_theta,
-            &mu_pairs,
-        );
+        let driver =
+            worst_rhat_driver(worst, n_theta, sig_start, &pop_coords, &conjugate_theta, &mu_pairs);
         warnings.push(rhat_warning(
             max_rhat,
             &param_names[worst],
@@ -2329,14 +2231,8 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1);
         let (a, b) = (5.0_f64, 4.0_f64); // mean = 4/4 = 1.0
         let n = 50_000;
-        let mean: f64 = (0..n)
-            .map(|_| inverse_gamma_draw(a, b, &mut rng))
-            .sum::<f64>()
-            / n as f64;
-        assert!(
-            (mean - 1.0).abs() < 0.03,
-            "InvGamma mean = {mean}, expected ~1.0"
-        );
+        let mean: f64 = (0..n).map(|_| inverse_gamma_draw(a, b, &mut rng)).sum::<f64>() / n as f64;
+        assert!((mean - 1.0).abs() < 0.03, "InvGamma mean = {mean}, expected ~1.0");
     }
 
     /// InvGamma(a, b) has variance b²/((a−1)²(a−2)) for a > 2.
@@ -2395,10 +2291,7 @@ mod tests {
             "IW mean[0,0] = {}, expected ~{expected_diag}",
             acc[(0, 0)]
         );
-        assert!(
-            acc[(0, 1)].abs() < 0.01,
-            "IW mean off-diagonal should be ~0"
-        );
+        assert!(acc[(0, 1)].abs() < 0.01, "IW mean off-diagonal should be ~0");
     }
 
     /// 1-D consistency: InvWishart(df, [s]) ≡ InvGamma(df/2, s/2). Both must
@@ -2412,14 +2305,11 @@ mod tests {
         let expected = s / (df - 2.0); // 3/6 = 0.5
 
         let n = 60_000;
-        let iw_mean: f64 = (0..n)
-            .map(|_| inverse_wishart_draw(df, &psi, &mut rng).unwrap()[(0, 0)])
-            .sum::<f64>()
-            / n as f64;
-        let ig_mean: f64 = (0..n)
-            .map(|_| inverse_gamma_draw(df / 2.0, s / 2.0, &mut rng))
-            .sum::<f64>()
-            / n as f64;
+        let iw_mean: f64 =
+            (0..n).map(|_| inverse_wishart_draw(df, &psi, &mut rng).unwrap()[(0, 0)]).sum::<f64>()
+                / n as f64;
+        let ig_mean: f64 =
+            (0..n).map(|_| inverse_gamma_draw(df / 2.0, s / 2.0, &mut rng)).sum::<f64>() / n as f64;
 
         assert!((iw_mean - expected).abs() < 0.02, "IW 1-D mean = {iw_mean}");
         assert!((ig_mean - expected).abs() < 0.02, "IG mean = {ig_mean}");
@@ -2450,13 +2340,7 @@ mod tests {
 
     fn iid_normal_chains(m: usize, n: usize, seed: u64) -> Vec<Vec<f64>> {
         let mut rng = StdRng::seed_from_u64(seed);
-        (0..m)
-            .map(|_| {
-                (0..n)
-                    .map(|_| rng.sample::<f64, _>(StandardNormal))
-                    .collect()
-            })
-            .collect()
+        (0..m).map(|_| (0..n).map(|_| rng.sample::<f64, _>(StandardNormal)).collect()).collect()
     }
 
     #[test]
@@ -2540,42 +2424,18 @@ mod tests {
         let b = res.bayes.as_ref().expect("BayesResult present");
         let get = |n: &str| b.summaries.iter().find(|s| s.name == n).expect(n);
         for s in &b.summaries {
-            assert!(
-                s.mean.is_finite() && s.sd.is_finite() && s.sd >= 0.0,
-                "{}",
-                s.name
-            );
-            assert!(
-                s.q025 <= s.median && s.median <= s.q975,
-                "{} quantiles",
-                s.name
-            );
+            assert!(s.mean.is_finite() && s.sd.is_finite() && s.sd >= 0.0, "{}", s.name);
+            assert!(s.q025 <= s.median && s.median <= s.q975, "{} quantiles", s.name);
         }
         // Sanity-floor bounds only. This model is strongly correlated
         // (CL/V/F/KA trade off) and mixes slowly, so the mean estimate at these
         // settings is noisy — the test guards that the multi-coordinate block
         // runs and returns physically plausible values, not tight convergence
         // (truth is TVCL≈5, TVV≈50, TVKA≈1.5, THETA_F≈0.7).
-        assert!(
-            (2.0..9.0).contains(&get("TVCL").mean),
-            "TVCL {}",
-            get("TVCL").mean
-        );
-        assert!(
-            (25.0..75.0).contains(&get("TVV").mean),
-            "TVV {}",
-            get("TVV").mean
-        );
-        assert!(
-            (0.8..2.5).contains(&get("TVKA").mean),
-            "TVKA {}",
-            get("TVKA").mean
-        );
-        assert!(
-            (0.4..0.95).contains(&get("THETA_F").mean),
-            "THETA_F {}",
-            get("THETA_F").mean
-        );
+        assert!((2.0..9.0).contains(&get("TVCL").mean), "TVCL {}", get("TVCL").mean);
+        assert!((25.0..75.0).contains(&get("TVV").mean), "TVV {}", get("TVV").mean);
+        assert!((0.8..2.5).contains(&get("TVKA").mean), "TVKA {}", get("TVKA").mean);
+        assert!((0.4..0.95).contains(&get("THETA_F").mean), "THETA_F {}", get("THETA_F").mean);
     }
 
     /// End-to-end smoke test: short Bayes run on the bundled warfarin model.
@@ -2609,11 +2469,7 @@ mod tests {
         for s in &bayes.summaries {
             assert!(s.mean.is_finite(), "{}: mean not finite", s.name);
             assert!(s.sd.is_finite() && s.sd >= 0.0, "{}: bad sd", s.name);
-            assert!(
-                s.q025 <= s.median && s.median <= s.q975,
-                "{}: quantiles out of order",
-                s.name
-            );
+            assert!(s.q025 <= s.median && s.median <= s.q975, "{}: quantiles out of order", s.name);
             assert!(s.rhat.is_finite(), "{}: R-hat not finite", s.name);
         }
         assert!(res.ofv.is_finite(), "OFV not finite");
@@ -2768,18 +2624,10 @@ mod tests {
 
         // The IOV variance is surfaced as a posterior parameter.
         let kiov = get("OMEGA_IOV(1,1)");
-        assert!(
-            kiov.mean.is_finite() && kiov.mean > 0.0,
-            "IOV var {}",
-            kiov.mean
-        );
+        assert!(kiov.mean.is_finite() && kiov.mean > 0.0, "IOV var {}", kiov.mean);
         assert!(kiov.q025 <= kiov.median && kiov.median <= kiov.q975);
         // Population fit is sane.
-        assert!(
-            (0.10..0.18).contains(&get("TVCL").mean),
-            "TVCL {}",
-            get("TVCL").mean
-        );
+        assert!((0.10..0.18).contains(&get("TVCL").mean), "TVCL {}", get("TVCL").mean);
         assert!(b.max_rhat.is_finite());
         // Per-occasion kappa EBEs are returned (one occasion list per subject).
         assert_eq!(res.kappas.len(), pop.subjects.len());
@@ -2795,10 +2643,7 @@ mod tests {
     /// slow-tests job. The fast `run_bayes_warfarin_hmc_smoke` below keeps the
     /// HMC-on-Dual2 wiring covered on every PR.
     #[test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: opt in with --features slow-tests"
-    )]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn run_bayes_warfarin_hmc_eta_block() {
         use std::path::Path;
         let model =
@@ -2828,19 +2673,11 @@ mod tests {
         for s in &bayes.summaries {
             assert!(s.mean.is_finite(), "{}: mean not finite", s.name);
             assert!(s.sd.is_finite() && s.sd >= 0.0, "{}: bad sd", s.name);
-            assert!(
-                s.q025 <= s.median && s.median <= s.q975,
-                "{}: quantiles out of order",
-                s.name
-            );
+            assert!(s.q025 <= s.median && s.median <= s.q975, "{}: quantiles out of order", s.name);
             assert!(s.rhat.is_finite(), "{}: R-hat not finite", s.name);
         }
         // Sane population recovery from the HMC-sampled etas.
-        let tvcl = bayes
-            .summaries
-            .iter()
-            .find(|s| s.name == "TVCL")
-            .expect("TVCL summary");
+        let tvcl = bayes.summaries.iter().find(|s| s.name == "TVCL").expect("TVCL summary");
         // Short HMC run (200+200 sweeps, 2 chains): a sanity range around the
         // warfarin TVCL, not a convergence assertion.
         assert!((0.10..0.20).contains(&tvcl.mean), "TVCL {}", tvcl.mean);
@@ -2848,16 +2685,8 @@ mod tests {
         // the random-walk target (0.234 instead of ~0.7) over-disperses η and
         // inflates the residual error — PROP_ERR ballooned to ~0.05 (vs the FOCEI
         // value ~0.011) with R̂ > 2. Pin it near the truth.
-        let prop = bayes
-            .summaries
-            .iter()
-            .find(|s| s.name == "PROP_ERR")
-            .expect("PROP_ERR summary");
-        assert!(
-            prop.mean < 0.02,
-            "PROP_ERR {} — HMC η over-dispersing?",
-            prop.mean
-        );
+        let prop = bayes.summaries.iter().find(|s| s.name == "PROP_ERR").expect("PROP_ERR summary");
+        assert!(prop.mean < 0.02, "PROP_ERR {} — HMC η over-dispersing?", prop.mean);
         assert!(res.ofv.is_finite(), "OFV not finite");
         assert!(bayes.max_rhat.is_finite());
         assert_eq!(res.eta_hats.len(), pop.subjects.len());
@@ -2886,20 +2715,13 @@ mod tests {
 
         // The startup banner must report HMC (proves the Dual2 route is selected).
         let summary = crate::estimation::saem::saem_sampler_summary(&model, &opts);
-        assert!(
-            summary.starts_with("HMC"),
-            "expected HMC sampler, got: {summary}"
-        );
+        assert!(summary.starts_with("HMC"), "expected HMC sampler, got: {summary}");
 
         let res = run_bayes(&model, &pop, &params, &opts).expect("HMC bayes runs");
         let bayes = res.bayes.as_ref().expect("BayesResult present");
         assert!(!bayes.summaries.is_empty());
         for s in &bayes.summaries {
-            assert!(
-                s.mean.is_finite() && s.sd.is_finite(),
-                "{}: non-finite",
-                s.name
-            );
+            assert!(s.mean.is_finite() && s.sd.is_finite(), "{}: non-finite", s.name);
         }
         assert!(res.ofv.is_finite(), "OFV not finite");
     }
@@ -2908,9 +2730,8 @@ mod tests {
     #[ignore = "exploratory: prints FOCEI vs Bayes posterior means"]
     fn bayes_vs_focei_print() {
         use std::path::Path;
-        let benchmark_threads = std::env::var("FERX_BAYES_BENCH_THREADS")
-            .ok()
-            .and_then(|value| value.parse().ok());
+        let benchmark_threads =
+            std::env::var("FERX_BAYES_BENCH_THREADS").ok().and_then(|value| value.parse().ok());
         let model =
             crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin.ferx"))
                 .expect("parse");
@@ -2978,31 +2799,15 @@ mod tests {
         let tvka = get("TVKA");
         let prop = get("PROP_ERR");
 
-        assert!(
-            b.max_rhat < 1.05,
-            "chains did not mix: max R-hat = {}",
-            b.max_rhat
-        );
+        assert!(b.max_rhat < 1.05, "chains did not mix: max R-hat = {}", b.max_rhat);
         assert!(
             (0.11..0.16).contains(&tvcl.mean),
             "TVCL posterior mean {} off (FOCEI ~0.133)",
             tvcl.mean
         );
-        assert!(
-            (6.5..9.0).contains(&tvv.mean),
-            "TVV mean {} off (~7.74)",
-            tvv.mean
-        );
-        assert!(
-            (0.6..1.1).contains(&tvka.mean),
-            "TVKA mean {} off (~0.82)",
-            tvka.mean
-        );
-        assert!(
-            (0.006..0.016).contains(&prop.mean),
-            "PROP_ERR mean {} off (~0.0106)",
-            prop.mean
-        );
+        assert!((6.5..9.0).contains(&tvv.mean), "TVV mean {} off (~7.74)", tvv.mean);
+        assert!((0.6..1.1).contains(&tvka.mean), "TVKA mean {} off (~0.82)", tvka.mean);
+        assert!((0.006..0.016).contains(&prop.mean), "PROP_ERR mean {} off (~0.0106)", prop.mean);
         // Thetas should be well-mixed (conjugate block ⇒ high ESS).
         for s in [tvcl, tvv, tvka] {
             assert!(s.ess_bulk > 200.0, "{} ESS too low: {}", s.name, s.ess_bulk);
@@ -3031,10 +2836,7 @@ mod tests {
 
         let fitres = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
         assert_eq!(fitres.method, crate::types::EstimationMethod::Bayes);
-        let b = fitres
-            .bayes
-            .as_ref()
-            .expect("FitResult.bayes set by dispatch");
+        let b = fitres.bayes.as_ref().expect("FitResult.bayes set by dispatch");
         assert!(!b.summaries.is_empty());
         assert!(b.max_rhat.is_finite());
     }
@@ -3166,10 +2968,7 @@ mod tests {
         let pop = mix_iov_pop();
         let params = &model.default_params;
         let subject = &pop.subjects[0];
-        let omega_iov = params
-            .omega_iov
-            .as_ref()
-            .expect("kappa declared ⇒ OMEGA_IOV");
+        let omega_iov = params.omega_iov.as_ref().expect("kappa declared ⇒ OMEGA_IOV");
         let n_occ = crate::stats::likelihood::iov_occasion_groups(subject).len();
         assert_eq!(n_occ, 2, "two dosing occasions per subject");
 
@@ -3302,9 +3101,7 @@ mod tests {
         opts.saem_n_leapfrog = 4;
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("bayes fit");
         assert!(
-            res.warnings
-                .iter()
-                .any(|w| w.contains("saem_n_leapfrog") && w.contains("mixture")),
+            res.warnings.iter().any(|w| w.contains("saem_n_leapfrog") && w.contains("mixture")),
             "expected an HMC-downgrade warning, got: {:?}",
             res.warnings
         );
@@ -3331,17 +3128,12 @@ mod tests {
         // *before* any stage runs — so `method = [focei, bayes]` does not burn a
         // full FOCEI fit only to fail at the hand-off (#985).
         let mut chain_opts = FitOptions::default();
-        chain_opts.methods = vec![
-            crate::types::EstimationMethod::FoceI,
-            crate::types::EstimationMethod::Bayes,
-        ];
+        chain_opts.methods =
+            vec![crate::types::EstimationMethod::FoceI, crate::types::EstimationMethod::Bayes];
         let err = crate::api::fit(&model, &pop, &model.default_params, &chain_opts)
             .expect_err("per-class overrides in a bayes chain must be rejected")
             .to_string();
-        assert!(
-            err.contains("per-class Omega/Sigma overrides"),
-            "got: {err}"
-        );
+        assert!(err.contains("per-class Omega/Sigma overrides"), "got: {err}");
     }
 
     // ---------------------------------------------------------------------
@@ -3365,20 +3157,11 @@ mod tests {
     /// Deterministic draws whose sample covariance is exactly known: the four
     /// sign patterns of (±a, ±b) plus a correlated pair, repeated.
     fn eta_samples() -> (Vec<[f64; 2]>, DMatrix<f64>) {
-        let base = [
-            [0.3, 0.1],
-            [-0.3, -0.1],
-            [0.3, -0.05],
-            [-0.3, 0.05],
-            [0.1, 0.2],
-            [-0.1, -0.2],
-        ];
+        let base = [[0.3, 0.1], [-0.3, -0.1], [0.3, -0.05], [-0.3, 0.05], [0.1, 0.2], [-0.1, -0.2]];
         let xs: Vec<[f64; 2]> = (0..60).map(|k| base[k % base.len()]).collect();
         let n = xs.len() as f64;
-        let mean = [
-            xs.iter().map(|x| x[0]).sum::<f64>() / n,
-            xs.iter().map(|x| x[1]).sum::<f64>() / n,
-        ];
+        let mean =
+            [xs.iter().map(|x| x[0]).sum::<f64>() / n, xs.iter().map(|x| x[1]).sum::<f64>() / n];
         let mut cov = DMatrix::<f64>::zeros(2, 2);
         for x in &xs {
             for a in 0..2 {
@@ -3414,11 +3197,7 @@ mod tests {
             }
         }
         // The first switch resets the step to the optimal 2.38/√d …
-        assert!(
-            (ep.scale - 2.38 / 2f64.sqrt()).abs() < 1e-15,
-            "{}",
-            ep.scale
-        );
+        assert!((ep.scale - 2.38 / 2f64.sqrt()).abs() < 1e-15, "{}", ep.scale);
         // … and later rebuilds keep adapting it instead of resetting again.
         ep.acc = 0;
         ep.prop = 100;
@@ -3462,10 +3241,7 @@ mod tests {
 
     #[test]
     fn ebe_start_falls_back_to_zero_for_a_non_finite_ebe() {
-        let ebes = vec![
-            DVector::from_vec(vec![0.1, -0.2]),
-            DVector::from_vec(vec![f64::NAN, 0.3]),
-        ];
+        let ebes = vec![DVector::from_vec(vec![0.1, -0.2]), DVector::from_vec(vec![f64::NAN, 0.3])];
         let got = ebe_start_etas(&ebes, 3, 2);
         assert_eq!(got[0], vec![0.1, -0.2]);
         assert_eq!(got[1], vec![0.0, 0.0], "non-finite EBE → 0");
@@ -3474,26 +3250,16 @@ mod tests {
 
     #[test]
     fn worst_rhat_driver_classifies_every_recorded_block() {
-        let pop_coords = vec![
-            PopCoord::Theta { idx: 1, log: true },
-            PopCoord::Sigma { idx: 0 },
-        ];
+        let pop_coords = vec![PopCoord::Theta { idx: 1, log: true }, PopCoord::Sigma { idx: 0 }];
         let conj: std::collections::HashSet<usize> = [0usize].into_iter().collect();
         // θ0 conjugate, θ1 random walk, θ2 FIX; Ω entries 3..5; σ / Ω_iov from 5.
         let d = |p| worst_rhat_driver(p, 3, 5, &pop_coords, &conj, &[None, None]);
         assert_eq!(d(0), WorstRhatDriver::EtaDriven);
-        assert_eq!(
-            d(1),
-            WorstRhatDriver::RandomWalkTheta {
-                mu_referenced: false
-            }
-        );
+        assert_eq!(d(1), WorstRhatDriver::RandomWalkTheta { mu_referenced: false });
         // θ1 anchoring an η (the conjugate move being off model-wide).
         assert_eq!(
             worst_rhat_driver(1, 3, 5, &pop_coords, &conj, &[None, Some(1)]),
-            WorstRhatDriver::RandomWalkTheta {
-                mu_referenced: true
-            }
+            WorstRhatDriver::RandomWalkTheta { mu_referenced: true }
         );
         assert_eq!(d(2), WorstRhatDriver::Other);
         assert_eq!(d(3), WorstRhatDriver::EtaDriven);
@@ -3546,15 +3312,10 @@ mod tests {
         let w = rhat_warning(
             2.4,
             "THETA_CRCL",
-            WorstRhatDriver::RandomWalkTheta {
-                mu_referenced: false,
-            },
+            WorstRhatDriver::RandomWalkTheta { mu_referenced: false },
             true,
         );
-        assert!(
-            w.contains("on THETA_CRCL — chains may not have converged."),
-            "{w}"
-        );
+        assert!(w.contains("on THETA_CRCL — chains may not have converged."), "{w}");
         assert!(
             w.contains(
                 " THETA_CRCL is sampled by the random-walk (theta, sigma) block, not by the \
@@ -3584,15 +3345,10 @@ mod tests {
         let w = rhat_warning(
             1.9,
             "TVCL",
-            WorstRhatDriver::RandomWalkTheta {
-                mu_referenced: true,
-            },
+            WorstRhatDriver::RandomWalkTheta { mu_referenced: true },
             true,
         );
-        assert!(
-            w.contains(" TVCL is sampled by the random-walk (theta, sigma) block"),
-            "{w}"
-        );
+        assert!(w.contains(" TVCL is sampled by the random-walk (theta, sigma) block"), "{w}");
         assert!(
             w.ends_with(
                 " It is already log mu-referenced, but the conjugate move runs only when every \
@@ -3677,10 +3433,7 @@ mod tests {
             None,
             "no design, no draws, no warning"
         );
-        let perfect = ConjugateTally {
-            moved: 100,
-            ..Default::default()
-        };
+        let perfect = ConjugateTally { moved: 100, ..Default::default() };
         assert_eq!(
             conjugate_accept_warning(&[perfect; 4]),
             None,
@@ -3688,19 +3441,11 @@ mod tests {
         );
         // Exactly at the threshold is "often enough": the constant is the point
         // below which the move has stopped doing its job.
-        let at = ConjugateTally {
-            moved: 50,
-            rejected_metropolis: 50,
-            ..Default::default()
-        };
+        let at = ConjugateTally { moved: 50, rejected_metropolis: 50, ..Default::default() };
         assert_eq!(at.accept_rate(), Some(CONJUGATE_ACCEPT_REPORT_THRESHOLD));
         assert_eq!(conjugate_accept_warning(&[at]), None, "{at:?}");
         // One draw either way straddles it.
-        let below = ConjugateTally {
-            moved: 49,
-            rejected_metropolis: 51,
-            ..Default::default()
-        };
+        let below = ConjugateTally { moved: 49, rejected_metropolis: 51, ..Default::default() };
         assert!(conjugate_accept_warning(&[below]).is_some(), "{below:?}");
     }
 
@@ -3710,15 +3455,8 @@ mod tests {
     /// the thetas that move owns sit frozen for its share of the sample.
     #[test]
     fn conjugate_accept_warning_is_decided_by_the_worst_chain() {
-        let dead = ConjugateTally {
-            moved: 0,
-            rejected_metropolis: 100,
-            ..Default::default()
-        };
-        let healthy = ConjugateTally {
-            moved: 100,
-            ..Default::default()
-        };
+        let dead = ConjugateTally { moved: 0, rejected_metropolis: 100, ..Default::default() };
+        let healthy = ConjugateTally { moved: 100, ..Default::default() };
 
         // One dead chain in four pools to 75%, two to exactly 50% — both of
         // which the gate calls healthy when applied to the pool.
@@ -3739,9 +3477,7 @@ mod tests {
                 "{w}"
             );
             assert!(
-                w.contains(&format!(
-                    "and {pooled} of 400 across the 4 chain(s) that ran it."
-                )),
+                w.contains(&format!("and {pooled} of 400 across the 4 chain(s) that ran it.")),
                 "{w}"
             );
         }
@@ -3751,10 +3487,7 @@ mod tests {
         let w = conjugate_accept_warning(&[ConjugateTally::default(), dead, healthy])
             .expect("the dead chain is still reported");
         assert!(w.contains("in chain 2 — its worst —"), "{w}");
-        assert!(
-            w.contains("and 100 of 200 across the 2 chain(s) that ran it."),
-            "{w}"
-        );
+        assert!(w.contains("and 100 of 200 across the 2 chain(s) that ran it."), "{w}");
     }
 
     /// Every sentence of the report, and the branch that selects it. Each of
@@ -3797,10 +3530,7 @@ mod tests {
         );
         assert!(w.contains(FROZEN), "{w}");
         assert!(w.contains(BOUNDS), "{w}");
-        assert!(
-            !w.contains("came from the Metropolis") && !w.contains("could not form"),
-            "{w}"
-        );
+        assert!(!w.contains("came from the Metropolis") && !w.contains("could not form"), "{w}");
         assert!(w.ends_with(CORRECT), "{w}");
 
         let w = conjugate_accept_warning(&[ConjugateTally {
@@ -3812,10 +3542,7 @@ mod tests {
         .expect("below the threshold");
         assert!(w.contains(FROZEN) && w.ends_with(CORRECT), "{w}");
         assert!(w.contains(METROPOLIS), "{w}");
-        assert!(
-            !w.contains("left a declared") && !w.contains("could not form"),
-            "{w}"
-        );
+        assert!(!w.contains("left a declared") && !w.contains("could not form"), "{w}");
 
         let w = conjugate_accept_warning(&[ConjugateTally {
             moved: 1,
@@ -3826,10 +3553,7 @@ mod tests {
         .expect("below the threshold");
         assert!(w.contains(FROZEN) && w.ends_with(CORRECT), "{w}");
         assert!(w.contains(SKIPPED), "{w}");
-        assert!(
-            !w.contains("left a declared") && !w.contains("came from the Metropolis"),
-            "{w}"
-        );
+        assert!(!w.contains("left a declared") && !w.contains("came from the Metropolis"), "{w}");
     }
 
     /// The largest rejection group is reported as the largest, never as "most":
@@ -3845,14 +3569,8 @@ mod tests {
             skipped: 16,
         }])
         .expect("49% is below the threshold");
-        assert!(
-            w.contains("Its largest group of rejections (18) left a declared"),
-            "{w}"
-        );
-        assert!(
-            !w.to_lowercase().contains("most "),
-            "no majority claim: {w}"
-        );
+        assert!(w.contains("Its largest group of rejections (18) left a declared"), "{w}");
+        assert!(!w.to_lowercase().contains("most "), "no majority claim: {w}");
     }
 
     #[test]
@@ -3897,30 +3615,14 @@ mod tests {
         let b = res.bayes.as_ref().expect("BayesResult present");
         let s = b.summaries.iter().find(|s| s.name == "TVV").expect("TVV");
         assert!(s.q025.is_finite() && s.q975.is_finite());
-        assert!(
-            s.q025 >= lo,
-            "TVV q025 {} below the lower bound {lo}",
-            s.q025
-        );
-        assert!(
-            s.q975 <= hi,
-            "TVV q975 {} above the upper bound {hi}",
-            s.q975
-        );
+        assert!(s.q025 >= lo, "TVV q025 {} below the lower bound {lo}", s.q025);
+        assert!(s.q975 <= hi, "TVV q975 {} above the upper bound {hi}", s.q975);
 
         // The same short run has not converged, so it is also the wiring check
         // of the warning: it names the parameter that carries the max R-hat,
         // and says how that parameter is sampled.
-        assert!(
-            b.max_rhat > RHAT_CONVERGENCE_THRESHOLD,
-            "precondition: {}",
-            b.max_rhat
-        );
-        let worst = b
-            .summaries
-            .iter()
-            .max_by(|a, b| a.rhat.total_cmp(&b.rhat))
-            .expect("summaries");
+        assert!(b.max_rhat > RHAT_CONVERGENCE_THRESHOLD, "precondition: {}", b.max_rhat);
+        let worst = b.summaries.iter().max_by(|a, b| a.rhat.total_cmp(&b.rhat)).expect("summaries");
         let w = res
             .warnings
             .iter()

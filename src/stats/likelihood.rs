@@ -11,21 +11,14 @@ use nalgebra::{DMatrix, DVector};
 /// loops should use [`model_predictions_into`].
 #[inline]
 fn model_predictions(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {
     pk::compute_predictions_with_tv(model, subject, theta, eta)
 }
 
 #[inline]
 pub(crate) fn m3_logcdf(limit: f64, f: f64, sd: f64, cens: i8) -> f64 {
-    let z = if cens < 0 {
-        (f - limit) / sd
-    } else {
-        (limit - f) / sd
-    };
+    let z = if cens < 0 { (f - limit) / sd } else { (limit - f) / sd };
     log_normal_cdf(z)
 }
 
@@ -38,37 +31,20 @@ pub(crate) fn m3_logcdf(limit: f64, f: f64, sd: f64, cens: i8) -> f64 {
 ///   - `-2·log Φ((LLOQ_j - f_j)/√V_j)` for M3 left-censored rows (CENS=1), or
 ///   - `-2·log Φ((f_j - ULOQ_j)/√V_j)` for M3 right-censored rows (CENS=-1).
 pub fn individual_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], omega: &OmegaMatrix,
     sigma_values: &[f64],
 ) -> f64 {
     // Allocate-on-each-call wrapper — see `individual_nll_into` for
     // the scratch-aware version used by SAEM's MH loop.
     let mut scratch = pk::EventPkParams::with_capacity_for(subject);
-    individual_nll_into(
-        model,
-        subject,
-        theta,
-        eta,
-        omega,
-        sigma_values,
-        &mut scratch,
-    )
+    individual_nll_into(model, subject, theta, eta, omega, sigma_values, &mut scratch)
 }
 
 /// [`individual_nll`] with a caller-owned scratch buffer (SAEM MH hot path: one
 /// buffer reused across all proposed `eta`s).
 pub fn individual_nll_into(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    scratch: &mut pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], omega: &OmegaMatrix,
+    sigma_values: &[f64], scratch: &mut pk::EventPkParams,
 ) -> f64 {
     individual_nll_into_with_schedule_cov(
         model,
@@ -95,12 +71,8 @@ pub fn individual_nll_into(
 /// [`tte_endpoint_nll_visit`] must equal bit for bit.
 #[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    chz_state: usize,
-    records: &[ObsRecord],
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord],
+    theta: &[f64], eta: &[f64],
 ) -> f64 {
     let curves = tte_ode_curves(model, subject, chz_state, records, theta, eta);
     tte_ode_nll_from_curves(records, &curves.times, &curves.cum, &curves.haz, curves.tol)
@@ -121,23 +93,13 @@ struct TteCurves {
 /// at `(theta, eta)`, read at the endpoint's sorted-unique record times.
 #[cfg(feature = "survival")]
 fn tte_ode_curves(
-    model: &CompiledModel,
-    subject: &Subject,
-    chz_state: usize,
-    records: &[ObsRecord],
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord],
+    theta: &[f64], eta: &[f64],
 ) -> TteCurves {
     // Distinct times where H(t) — and h(t) for exact events — is needed.
     let mut times: Vec<f64> = Vec::new();
     for r in records {
-        let ObsRecord::Event {
-            time,
-            event_type,
-            entry_time,
-            ..
-        } = r
-        else {
+        let ObsRecord::Event { time, event_type, entry_time, .. } = r else {
             // Non-TTE records don't contribute hazard times; skip them.
             continue;
         };
@@ -168,12 +130,7 @@ fn tte_ode_curves(
         .as_ref()
         .map(|o| crate::survival::MonoTol::from_solver(&o.effective_solver_opts()))
         .unwrap_or_default();
-    TteCurves {
-        times,
-        cum,
-        haz,
-        tol,
-    }
+    TteCurves { times, cum, haz, tol }
 }
 
 /// Per-record TTE NLL from `H`/`h` curves sampled at sorted-unique `times` (lookups
@@ -181,11 +138,7 @@ fn tte_ode_curves(
 /// joint-PK-TTE share so the per-record likelihood lives in one place.
 #[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll_from_curves(
-    records: &[ObsRecord],
-    times: &[f64],
-    cum: &[f64],
-    haz: &[f64],
-    tol: crate::survival::MonoTol,
+    records: &[ObsRecord], times: &[f64], cum: &[f64], haz: &[f64], tol: crate::survival::MonoTol,
 ) -> f64 {
     tte_ode_nll_from_curves_visit(records, times, cum, haz, tol, &mut |_| {})
 }
@@ -193,22 +146,14 @@ fn tte_ode_nll_from_curves(
 /// `tte_ode_nll_from_curves` handing each scored record's term to `visit` (#901).
 #[cfg(feature = "survival")]
 fn tte_ode_nll_from_curves_visit(
-    records: &[ObsRecord],
-    times: &[f64],
-    cum: &[f64],
-    haz: &[f64],
-    tol: crate::survival::MonoTol,
+    records: &[ObsRecord], times: &[f64], cum: &[f64], haz: &[f64], tol: crate::survival::MonoTol,
     visit: &mut impl FnMut(crate::survival::RecordTerm<f64>),
 ) -> f64 {
     let cumhaz_at = |t: f64| -> f64 {
-        times
-            .binary_search_by(|x| x.partial_cmp(&t).unwrap())
-            .map_or(f64::NAN, |i| cum[i])
+        times.binary_search_by(|x| x.partial_cmp(&t).unwrap()).map_or(f64::NAN, |i| cum[i])
     };
     let hazard_at = |t: f64| -> f64 {
-        times
-            .binary_search_by(|x| x.partial_cmp(&t).unwrap())
-            .map_or(f64::NAN, |i| haz[i])
+        times.binary_search_by(|x| x.partial_cmp(&t).unwrap()).map_or(f64::NAN, |i| haz[i])
     };
     crate::survival::tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, visit)
 }
@@ -244,10 +189,7 @@ pub(crate) struct JointPkTteSolve {
 /// otherwise (caller keeps the two-solve path).
 #[cfg(feature = "survival")]
 fn try_joint_pktte_shared_solve(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<JointPkTteSolve> {
     let ode = model.ode_spec.as_ref()?;
     // Equivalent only when the standalone prediction path takes the same no-TV
@@ -266,13 +208,7 @@ fn try_joint_pktte_shared_solve(
         return None;
     }
     let is_ode_tte = |e: &EndpointLikelihood| {
-        matches!(
-            e,
-            EndpointLikelihood::Tte {
-                hazard: HazardSpec::OdeAccumulated { .. },
-                ..
-            }
-        )
+        matches!(e, EndpointLikelihood::Tte { hazard: HazardSpec::OdeAccumulated { .. }, .. })
     };
     if !model.endpoints.values().any(is_ode_tte) {
         return None; // nothing to share
@@ -286,13 +222,7 @@ fn try_joint_pktte_shared_solve(
             continue;
         }
         for r in &subject.obs_records {
-            let ObsRecord::Event {
-                time,
-                event_type,
-                entry_time,
-                cmt: rc,
-            } = r
-            else {
+            let ObsRecord::Event { time, event_type, entry_time, cmt: rc } = r else {
                 // Non-TTE records don't contribute hazard times; skip them.
                 continue;
             };
@@ -359,10 +289,7 @@ fn try_joint_pktte_shared_solve(
 /// **Test-only** since #901: [`tte_endpoint_nll_visit`]'s shared arm must equal it.
 #[cfg(all(test, feature = "survival"))]
 fn tte_ode_nll_from_shared(
-    ode: &crate::ode::OdeSpec,
-    share: &JointPkTteSolve,
-    chz_state: usize,
-    records: &[ObsRecord],
+    ode: &crate::ode::OdeSpec, share: &JointPkTteSolve, chz_state: usize, records: &[ObsRecord],
 ) -> f64 {
     let (cum, haz, tol) = shared_tte_curves(ode, share, chz_state);
     tte_ode_nll_from_curves(records, &share.times, &cum, &haz, tol)
@@ -372,9 +299,7 @@ fn tte_ode_nll_from_shared(
 /// `share.times`, with the monotone floor of the configured solver tolerances.
 #[cfg(feature = "survival")]
 fn shared_tte_curves(
-    ode: &crate::ode::OdeSpec,
-    share: &JointPkTteSolve,
-    chz_state: usize,
+    ode: &crate::ode::OdeSpec, share: &JointPkTteSolve, chz_state: usize,
 ) -> (Vec<f64>, Vec<f64>, crate::survival::MonoTol) {
     let n = share.times.len();
     let mut cum = vec![f64::NAN; n];
@@ -399,13 +324,8 @@ fn shared_tte_curves(
 /// no-share, no-visitor case of [`tte_endpoint_nll_visit`].
 #[cfg(feature = "survival")]
 fn tte_endpoint_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    hazard: &HazardSpec,
-    recurrence: crate::types::TteRecurrence,
-    records: &[ObsRecord],
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence, records: &[ObsRecord], theta: &[f64], eta: &[f64],
 ) -> f64 {
     tte_endpoint_nll_visit(
         model,
@@ -435,13 +355,8 @@ fn tte_endpoint_nll(
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn tte_endpoint_nll_visit(
-    model: &CompiledModel,
-    subject: &Subject,
-    hazard: &HazardSpec,
-    recurrence: crate::types::TteRecurrence,
-    records: &[ObsRecord],
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence, records: &[ObsRecord], theta: &[f64], eta: &[f64],
     joint_share: Option<&JointPkTteSolve>,
     visit: &mut impl FnMut(crate::survival::RecordTerm<f64>),
 ) -> f64 {
@@ -482,13 +397,8 @@ fn tte_endpoint_nll_visit(
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn tte_endpoint_record_terms(
-    model: &CompiledModel,
-    subject: &Subject,
-    hazard: &HazardSpec,
-    recurrence: crate::types::TteRecurrence,
-    records: &[ObsRecord],
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, hazard: &HazardSpec,
+    recurrence: crate::types::TteRecurrence, records: &[ObsRecord], theta: &[f64], eta: &[f64],
     joint_share: Option<&JointPkTteSolve>,
 ) -> Option<Vec<crate::survival::RecordTerm<f64>>> {
     let mut terms = Vec::new();
@@ -512,27 +422,17 @@ pub(crate) fn tte_endpoint_record_terms(
 /// come from [`tte_endpoint_record_terms`]. Empty for a subject with no TTE record.
 #[cfg(feature = "survival")]
 pub(crate) fn tte_diagnostics(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<crate::types::TteObsDiagnostic> {
     let mut rows = Vec::new();
-    if !subject
-        .obs_records
-        .iter()
-        .any(|r| matches!(r, ObsRecord::Event { .. }))
-    {
+    if !subject.obs_records.iter().any(|r| matches!(r, ObsRecord::Event { .. })) {
         return rows;
     }
     let joint_share = try_joint_pktte_shared_solve(model, subject, theta, eta);
     let mut cmts: Vec<&usize> = model.endpoints.keys().collect();
     cmts.sort();
     for cmt in cmts {
-        let EndpointLikelihood::Tte {
-            hazard, recurrence, ..
-        } = &model.endpoints[cmt]
-        else {
+        let EndpointLikelihood::Tte { hazard, recurrence, .. } = &model.endpoints[cmt] else {
             continue;
         };
         let records: Vec<ObsRecord> = subject
@@ -554,11 +454,9 @@ pub(crate) fn tte_diagnostics(
             eta,
             joint_share.as_ref(),
         );
-        rows.extend(crate::survival::tte_record_diagnostics(
-            &records,
-            terms.as_deref(),
-            |t| subject.param_time_at(t),
-        ));
+        rows.extend(crate::survival::tte_record_diagnostics(&records, terms.as_deref(), |t| {
+            subject.param_time_at(t)
+        }));
     }
     rows
 }
@@ -566,16 +464,11 @@ pub(crate) fn tte_diagnostics(
 /// [`tte_endpoint_nll`] for the endpoint on `cmt`, for tests outside this module.
 #[cfg(all(test, feature = "survival"))]
 pub(crate) fn tte_endpoint_nll_for_tests(
-    model: &CompiledModel,
-    subject: &Subject,
-    cmt: usize,
-    records: &[ObsRecord],
-    theta: &[f64],
+    model: &CompiledModel, subject: &Subject, cmt: usize, records: &[ObsRecord], theta: &[f64],
     eta: &[f64],
 ) -> f64 {
-    let Some(crate::types::EndpointLikelihood::Tte {
-        hazard, recurrence, ..
-    }) = model.endpoints.get(&cmt)
+    let Some(crate::types::EndpointLikelihood::Tte { hazard, recurrence, .. }) =
+        model.endpoints.get(&cmt)
     else {
         panic!("no TTE endpoint on CMT {cmt}");
     };
@@ -596,22 +489,14 @@ pub(crate) fn tte_endpoint_nll_for_tests(
 /// an `OdeAccumulated` endpoint, re-solved via `tte_ode_nll`.
 #[cfg(feature = "survival")]
 pub(crate) fn accumulate_non_gaussian_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    joint_share: Option<&JointPkTteSolve>,
-    factor: f64,
-    acc: &mut f64,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
+    joint_share: Option<&JointPkTteSolve>, factor: f64, acc: &mut f64,
 ) {
     // Callers gate on `!subject.obs_records.is_empty()`, so an empty subject never reaches
     // here; both loops below are also natural no-ops on one.
     // TTE endpoints — one `factor * raw` add each, in ascending CMT order.
     for (cmt, endpoint) in &model.endpoints {
-        if let EndpointLikelihood::Tte {
-            hazard, recurrence, ..
-        } = endpoint
-        {
+        if let EndpointLikelihood::Tte { hazard, recurrence, .. } = endpoint {
             // A pooled buffer (#2549): this runs on every inner objective evaluation.
             let mut records_for_cmt: Vec<crate::types::ObsRecord> = crate::scratch::take();
             records_for_cmt.extend(
@@ -658,10 +543,7 @@ pub(crate) fn accumulate_non_gaussian_nll(
 /// (agree with the #570 share to solver tolerance). Empty with no non-Gaussian record.
 #[cfg(feature = "survival")]
 pub(crate) fn non_gaussian_terms(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<(String, f64)> {
     let mut terms = Vec::new();
     if subject.obs_records.is_empty() {
@@ -670,9 +552,8 @@ pub(crate) fn non_gaussian_terms(
     let mut cmts: Vec<&usize> = model.endpoints.keys().collect();
     cmts.sort();
     for cmt in cmts {
-        if let crate::types::EndpointLikelihood::Tte {
-            hazard, recurrence, ..
-        } = &model.endpoints[cmt]
+        if let crate::types::EndpointLikelihood::Tte { hazard, recurrence, .. } =
+            &model.endpoints[cmt]
         {
             let records: Vec<ObsRecord> = subject
                 .obs_records
@@ -729,15 +610,9 @@ pub(crate) fn iov_refuses_frem(model: &CompiledModel, subject: &Subject) -> bool
 /// off-diagonals as `sigma_values` carries live σ (#847): FOCE/FOCEI pass the current
 /// ρ; estimators holding ρ fixed pass `&model.residual_correlations`.
 pub fn individual_nll_into_with_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], omega: &OmegaMatrix,
+    sigma_values: &[f64], residual_correlations: &[ResidualCorrelation],
+    scratch: &mut pk::EventPkParams, schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
     individual_nll_into_with_schedule_cov(
         model,
@@ -755,14 +630,8 @@ pub fn individual_nll_into_with_schedule(
 /// [`individual_nll_into_with_schedule`] over a resolved [`ResidualCov`] — the form every in-crate
 /// caller uses (#1081).
 pub(crate) fn individual_nll_into_with_schedule_cov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    scratch: &mut pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], omega: &OmegaMatrix,
+    sigma_values: &[f64], residual_cov: ResidualCov<'_>, scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
     let err_keys = model.error_spec.obs_keys(subject);
@@ -835,8 +704,7 @@ impl IndividualNllPrep {
     /// long-lived scratch and refreshes it per subject.
     pub(crate) fn refresh(&mut self, model: &CompiledModel, subject: &Subject, theta: &[f64]) {
         self.err_keys.clear();
-        self.err_keys
-            .extend_from_slice(model.error_spec.obs_keys(subject).as_ref());
+        self.err_keys.extend_from_slice(model.error_spec.obs_keys(subject).as_ref());
         self.ruv_mult = model.ruv_obs_mult(subject, theta);
         #[cfg(test)]
         {
@@ -873,12 +741,7 @@ pub(crate) fn individual_nll_prepared(
         crate::parser::model_parser::current_mixture_class(),
     );
     scratch.ensure_eta(eta.len());
-    let IndividualNllScratch {
-        pk,
-        preds,
-        eta_work,
-        prior_work,
-    } = scratch;
+    let IndividualNllScratch { pk, preds, eta_work, prior_work } = scratch;
     individual_nll_into_prepared_with_schedule(
         model,
         subject,
@@ -902,19 +765,10 @@ pub(crate) fn individual_nll_prepared(
 /// caller-owned prediction vector reused across objective evaluations.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_into_prepared_with_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    err_keys: &[usize],
-    ruv_mult: Option<&[Vec<f64>]>,
-    pred_recycle: &mut Vec<f64>,
-    eta_work: &mut DVector<f64>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], omega: &OmegaMatrix,
+    sigma_values: &[f64], residual_cov: ResidualCov<'_>, scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>, err_keys: &[usize],
+    ruv_mult: Option<&[Vec<f64>]>, pred_recycle: &mut Vec<f64>, eta_work: &mut DVector<f64>,
     prior_work: &mut DVector<f64>,
 ) -> f64 {
     individual_nll_into_prepared_with_schedule_frozen(
@@ -942,10 +796,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule(
 /// EBE search, so both linearise around the same mode — NONMEM `METHOD=1` without
 /// `INTER` (#319, #1722).
 pub(crate) fn population_variance_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    n_eta: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize,
 ) -> Option<Vec<f64>> {
     if !model.error_spec.has_f_dependent_variance() {
         return None;
@@ -959,11 +810,7 @@ pub(crate) fn population_variance_preds(
 /// point the augmented Sheiner–Beal marginal ([`foce_subject_nll_iov`]) scores
 /// `R⁰` at.
 pub(crate) fn population_variance_preds_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    n_eta: usize,
-    n_kappa: usize,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], n_eta: usize, n_kappa: usize,
     k_occasions: usize,
 ) -> Option<Vec<f64>> {
     if !model.error_spec.has_f_dependent_variance() {
@@ -1025,11 +872,8 @@ thread_local! {
 /// `preds` from the plan when [`plan_value_route`] admits the model and the plan serves the
 /// point; `false` when the native predictor must answer.
 fn plan_value_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>, theta: &[f64], eta: &[f64],
     out: &mut Vec<f64>,
 ) -> bool {
     plan_value_route(model)
@@ -1043,21 +887,11 @@ fn plan_value_preds(
 /// (`R⁰` has every random effect zero). `None` is bit-identical to the function above.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
-    err_keys: &[usize],
-    ruv_mult: Option<&[Vec<f64>]>,
-    pred_recycle: &mut Vec<f64>,
-    eta_work: &mut DVector<f64>,
-    prior_work: &mut DVector<f64>,
-    frozen_var_preds: Option<&[f64]>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], omega: &OmegaMatrix,
+    sigma_values: &[f64], residual_cov: ResidualCov<'_>, scratch: &mut pk::EventPkParams,
+    schedule: Option<&pk::event_driven::EventSchedule>, err_keys: &[usize],
+    ruv_mult: Option<&[Vec<f64>]>, pred_recycle: &mut Vec<f64>, eta_work: &mut DVector<f64>,
+    prior_work: &mut DVector<f64>, frozen_var_preds: Option<&[f64]>,
 ) -> f64 {
     // Ω⁻¹ and log|Ω| are pre-computed in `OmegaMatrix::from_matrix_*`.
     // Hot-path users (FOCE inner BFGS, SAEM MH) call this 100s–1000s of
@@ -1121,11 +955,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
     // (`EPS·EXP(ETA)` → V·exp(2·η_ruv)). 1.0 when no `iiv_on_ruv` is set.
     // Does not touch FREM covariate pseudo-observations (handled below before
     // this factor is applied) or the EKF process noise `p_obs`.
-    let ruv_scale = if frozen_var_preds.is_some() {
-        1.0
-    } else {
-        model.residual_var_scale(eta)
-    };
+    let ruv_scale = if frozen_var_preds.is_some() { 1.0 } else { model.residual_var_scale(eta) };
     let mut data_ll = 0.0;
     let has_censored_m3 = model.bloq_in_force().has_censored_row(&subject.cens);
     let has_frem_rows = subject.fremtype.iter().any(|&ft| ft > 0);
@@ -1151,10 +981,7 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
             // would poison the NLL.
             #[cfg(feature = "survival")]
             if !model.endpoints.is_empty()
-                && subject
-                    .obs_cmts
-                    .get(j)
-                    .is_some_and(|c| model.endpoints.contains_key(c))
+                && subject.obs_cmts.get(j).is_some_and(|c| model.endpoints.contains_key(c))
             {
                 continue;
             }
@@ -1270,11 +1097,7 @@ fn dense_residual_data_term(
     let chol = r.cholesky()?;
     let residuals = DVector::from_iterator(
         subject.observations.len(),
-        subject
-            .observations
-            .iter()
-            .zip(preds.iter())
-            .map(|(&y, &f)| y - f),
+        subject.observations.iter().zip(preds.iter()).map(|(&y, &f)| y - f),
     );
     let solved = chol.solve(&residuals);
     Some(residuals.dot(&solved) + chol_log_det(&chol.l()))
@@ -1286,13 +1109,8 @@ fn dense_residual_data_term(
 /// `[focei, imp]` hands IMP the fitted ρ, which the declaration would not reflect.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    eta: &[f64],
-    pk_scratch: &mut pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, eta: &[f64], pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
     obs_nll_subject_into_with_schedule(
         model,
@@ -1311,27 +1129,14 @@ pub(crate) fn obs_nll_subject_into(
 /// uncached behaviour (see `inner_optimizer::cacheable_schedule`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_into_with_schedule(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    eta: &[f64],
-    pk_scratch: &mut pk::EventPkParams,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, eta: &[f64], pk_scratch: &mut pk::EventPkParams,
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
     let preds = pk::compute_predictions_with_tv_into_with_schedule(
         model, subject, theta, eta, pk_scratch, schedule,
     );
-    obs_nll_subject_from_preds(
-        model,
-        subject,
-        &preds,
-        theta,
-        sigma_values,
-        residual_cov,
-        eta,
-    )
+    obs_nll_subject_from_preds(model, subject, &preds, theta, sigma_values, residual_cov, eta)
 }
 
 /// [`obs_nll_subject_into`] from *precomputed* `preds` (σ-independent), so the SAEM
@@ -1339,13 +1144,8 @@ pub(crate) fn obs_nll_subject_into_with_schedule(
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn obs_nll_subject_from_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    preds: &[f64],
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, preds: &[f64], theta: &[f64], sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, eta: &[f64],
 ) -> f64 {
     obs_nll_subject_from_preds_with_semantics(
         model,
@@ -1373,14 +1173,8 @@ enum PredNllSemantics {
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
 #[allow(clippy::too_many_arguments)]
 fn obs_nll_subject_from_preds_with_semantics(
-    model: &CompiledModel,
-    subject: &Subject,
-    preds: &[f64],
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    eta: &[f64],
-    semantics: PredNllSemantics,
+    model: &CompiledModel, subject: &Subject, preds: &[f64], theta: &[f64], sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, eta: &[f64], semantics: PredNllSemantics,
 ) -> f64 {
     let m3 = matches!(model.bloq_in_force(), BloqMethod::M3);
     // FREM covariate rows use EPSCOV, not the PK residual error (see
@@ -1418,10 +1212,7 @@ fn obs_nll_subject_from_preds_with_semantics(
             // `individual_nll_into_with_schedule`).
             #[cfg(feature = "survival")]
             if !model.endpoints.is_empty()
-                && subject
-                    .obs_cmts
-                    .get(j)
-                    .is_some_and(|c| model.endpoints.contains_key(c))
+                && subject.obs_cmts.get(j).is_some_and(|c| model.endpoints.contains_key(c))
             {
                 continue;
             }
@@ -1495,11 +1286,7 @@ fn obs_nll_subject_from_preds_with_semantics(
 /// Per-observation EKF process-noise variance (`p_obs`) for an SDE model; empty when
 /// `!model.is_sde()`. Also read by the level binder's rank check (#2421).
 pub(crate) fn ekf_p_obs(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    sigma_values: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], sigma_values: &[f64],
 ) -> Vec<f64> {
     let (start, state_indices) = match model.diffusion_theta_start {
         Some(s) => (s, &model.diffusion_state_indices),
@@ -1563,15 +1350,9 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
 /// in-crate form that carries it.
 #[allow(clippy::too_many_arguments)]
 pub fn foce_subject_nll(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega: &OmegaMatrix, sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation], interaction: bool,
 ) -> f64 {
     foce_subject_nll_cov(
         model,
@@ -1590,15 +1371,9 @@ pub fn foce_subject_nll(
 /// caller uses (#1081).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_nll_cov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega: &OmegaMatrix, sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, interaction: bool,
 ) -> f64 {
     foce_subject_nll_cov_at(
         model,
@@ -1618,16 +1393,9 @@ pub(crate) fn foce_subject_nll_cov(
 /// (the inner objective's last evaluation at the mode), so the point is not predicted again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_nll_cov_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    interaction: bool,
-    ipreds: Option<&[f64]>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega: &OmegaMatrix, sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, interaction: bool, ipreds: Option<&[f64]>,
 ) -> f64 {
     foce_subject_nll_cov_split(
         model,
@@ -1672,15 +1440,9 @@ fn note(parts: &mut PartSink<'_>, name: &str, nll: f64) {
 ///   joint-form Gaussian, prior and curvature parts (also under FOCE).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_contribution_parts(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega: &OmegaMatrix, sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, interaction: bool,
 ) -> Vec<(String, f64)> {
     let mut parts = Vec::new();
     foce_subject_nll_cov_split(
@@ -1704,12 +1466,8 @@ pub(crate) fn foce_subject_contribution_parts(
 /// data term (`2·q`) and curvature (`H̃ + ∇²q`) by the non-IOV and IOV marginals.
 #[cfg(feature = "survival")]
 fn non_gaussian_mode_terms(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    joint_share: Option<&JointPkTteSolve>,
-    parts: &mut PartSink<'_>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    joint_share: Option<&JointPkTteSolve>, parts: &mut PartSink<'_>,
 ) -> (f64, DMatrix<f64>) {
     use crate::types::EndpointLikelihood;
     // TTE data NLL over `model.endpoints` (a `BTreeMap`: ascending CMT, bit-identical
@@ -1721,10 +1479,7 @@ fn non_gaussian_mode_terms(
     let mut tte_parts: Vec<(usize, f64)> = Vec::new();
 
     for (cmt, endpoint) in &model.endpoints {
-        if let EndpointLikelihood::Tte {
-            hazard, recurrence, ..
-        } = endpoint
-        {
+        if let EndpointLikelihood::Tte { hazard, recurrence, .. } = endpoint {
             // A pooled buffer (#2549): this runs on every inner objective evaluation.
             let mut records_for_cmt: Vec<crate::types::ObsRecord> = crate::scratch::take();
             records_for_cmt.extend(
@@ -1832,16 +1587,9 @@ fn non_gaussian_mode_terms(
 /// [`foce_subject_nll_cov`], recording its parts into `parts` when one is attached.
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_cov_split(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    interaction: bool,
-    held_preds: Option<&[f64]>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega: &OmegaMatrix, sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, interaction: bool, held_preds: Option<&[f64]>,
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))] mut parts: PartSink<'_>,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
@@ -1999,9 +1747,7 @@ pub(crate) const FREM_VARIANCE_FLOOR: f64 = 1e-12;
 /// Per-observation R-diagonal overrides for FREM covariate pseudo-observations;
 /// `None` when FREM is inactive (no config or empty fremtype).
 pub fn build_frem_r_override(
-    frem_config: Option<&FremConfig>,
-    fremtype: &[u16],
-    sigma_values: &[f64],
+    frem_config: Option<&FremConfig>, fremtype: &[u16], sigma_values: &[f64],
 ) -> Option<Vec<Option<f64>>> {
     let fc = frem_config?;
     if fremtype.is_empty() {
@@ -2013,11 +1759,7 @@ pub fn build_frem_r_override(
             .map(|&ft| {
                 if ft > 0 && fc.fremtype_to_indices.contains_key(&ft) {
                     let s = sigma_values[fc.covariate_sigma_index];
-                    Some(if s * s > FREM_VARIANCE_FLOOR {
-                        s * s
-                    } else {
-                        FREM_VARIANCE_FLOOR
-                    })
+                    Some(if s * s > FREM_VARIANCE_FLOOR { s * s } else { FREM_VARIANCE_FLOOR })
                 } else {
                     None
                 }
@@ -2123,20 +1865,11 @@ pub(crate) fn foce_subject_nll_standard_cov(
 /// attached (see [`foce_subject_contribution_parts`]).
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_standard_split(
-    subject: &Subject,
-    ipreds: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    error_spec: &ErrorSpec,
-    residual_cov: ResidualCov<'_>,
-    bloq_method: BloqMethod,
-    p_obs: &[f64],
-    frem_r_override: Option<&[Option<f64>]>,
-    r_pred_override: Option<&[f64]>,
-    ruv_mult: Option<&[Vec<f64>]>,
-    mut parts: PartSink<'_>,
+    subject: &Subject, ipreds: &[f64], eta_hat: &DVector<f64>, h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix, sigma_values: &[f64], error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>, bloq_method: BloqMethod, p_obs: &[f64],
+    frem_r_override: Option<&[Option<f64>]>, r_pred_override: Option<&[f64]>,
+    ruv_mult: Option<&[Vec<f64>]>, mut parts: PartSink<'_>,
 ) -> f64 {
     let n_obs = subject.observations.len();
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
@@ -2144,11 +1877,7 @@ fn foce_subject_nll_standard_split(
 
     // f0 = ipred - H * eta_hat (linearized population prediction)
     let h_eta = h_matrix * eta_hat;
-    let f0: Vec<f64> = ipreds
-        .iter()
-        .enumerate()
-        .map(|(j, &ip)| ip - h_eta[j])
-        .collect();
+    let f0: Vec<f64> = ipreds.iter().enumerate().map(|(j, &ip)| ip - h_eta[j]).collect();
 
     // R; inflate the diagonal with EKF process-noise variance for SDE models,
     // then overwrite FREM covariate rows with their EPSCOV² overrides. The
@@ -2212,11 +1941,7 @@ fn foce_subject_nll_standard_split(
     } else {
         h_matrix.clone()
     };
-    let r_q = if m3 {
-        select_symmetric_submatrix(&r_matrix, &quant)
-    } else {
-        r_matrix
-    };
+    let r_q = if m3 { select_symmetric_submatrix(&r_matrix, &quant) } else { r_matrix };
     let r_tilde = compute_r_tilde_with_r(&h_q, &omega.matrix, &r_q);
 
     let chol = match r_tilde.clone().cholesky() {
@@ -2225,11 +1950,7 @@ fn foce_subject_nll_standard_split(
             if m3 {
                 note(&mut parts, "censored (M3) term", 0.5 * bloq_term);
             }
-            note(
-                &mut parts,
-                "linearized covariance R̃ (not positive definite)",
-                f64::NAN,
-            );
+            note(&mut parts, "linearized covariance R̃ (not positive definite)", f64::NAN);
             return SUBJECT_SENTINEL_NLL;
         }
     };
@@ -2249,11 +1970,7 @@ fn foce_subject_nll_standard_split(
         note(&mut parts, "censored (M3) term", 0.5 * bloq_term);
     }
     if nq > 0 {
-        note(
-            &mut parts,
-            "linearized covariance log-determinant",
-            0.5 * log_det_r,
-        );
+        note(&mut parts, "linearized covariance log-determinant", 0.5 * log_det_r);
     }
 
     0.5 * (quad_form + log_det_r + bloq_term)
@@ -2323,19 +2040,10 @@ pub fn foce_subject_nll_interaction(
 /// the same correlated variance (`individual_nll_into_prepared_with_schedule_frozen`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_nll_interaction_corr(
-    subject: &Subject,
-    ipreds: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    error_spec: &ErrorSpec,
-    bloq_method: BloqMethod,
-    p_obs: &[f64],
-    frem_r_override: Option<&[Option<f64>]>,
-    residual_error_eta: Option<usize>,
-    ruv_mult: Option<&[Vec<f64>]>,
-    correlations: &[ResidualCorrelation],
+    subject: &Subject, ipreds: &[f64], eta_hat: &DVector<f64>, h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix, sigma_values: &[f64], error_spec: &ErrorSpec, bloq_method: BloqMethod,
+    p_obs: &[f64], frem_r_override: Option<&[Option<f64>]>, residual_error_eta: Option<usize>,
+    ruv_mult: Option<&[Vec<f64>]>, correlations: &[ResidualCorrelation],
 ) -> f64 {
     foce_subject_nll_interaction_split(
         subject,
@@ -2359,20 +2067,10 @@ pub(crate) fn foce_subject_nll_interaction_corr(
 /// attached (see [`foce_subject_contribution_parts`]).
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_interaction_split(
-    subject: &Subject,
-    ipreds: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    error_spec: &ErrorSpec,
-    bloq_method: BloqMethod,
-    p_obs: &[f64],
-    frem_r_override: Option<&[Option<f64>]>,
-    residual_error_eta: Option<usize>,
-    ruv_mult: Option<&[Vec<f64>]>,
-    correlations: &[ResidualCorrelation],
-    mut parts: PartSink<'_>,
+    subject: &Subject, ipreds: &[f64], eta_hat: &DVector<f64>, h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix, sigma_values: &[f64], error_spec: &ErrorSpec, bloq_method: BloqMethod,
+    p_obs: &[f64], frem_r_override: Option<&[Option<f64>]>, residual_error_eta: Option<usize>,
+    ruv_mult: Option<&[Vec<f64>]>, correlations: &[ResidualCorrelation], mut parts: PartSink<'_>,
 ) -> f64 {
     let n_eta = eta_hat.len();
     let ruv_scale = ruv_scale_from(eta_hat.as_slice(), residual_error_eta);
@@ -2399,11 +2097,7 @@ fn foce_subject_nll_interaction_split(
     // η̂'Ω⁻¹η̂  +  log|Ω|  (both cached on OmegaMatrix).
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
     note_gaussian_data(&mut parts, subject, bloq_method, g.data_ll, g.bloq_term);
-    note(
-        &mut parts,
-        "random-effect prior",
-        0.5 * (eta_prior + omega.log_det),
-    );
+    note(&mut parts, "random-effect prior", 0.5 * (eta_prior + omega.log_det));
     // H̃ = a'·diag(1/R)·a + ½·c̃'·c̃ + cens_hess + Ω⁻¹.  log|H̃| via Cholesky.
     // (`cens_hess` = 0 unless the subject has M3-censored rows.)
     let htilde = g.hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv;
@@ -2414,11 +2108,7 @@ fn foce_subject_nll_interaction_split(
             return SUBJECT_SENTINEL_NLL;
         }
     };
-    note(
-        &mut parts,
-        "curvature log-determinant",
-        0.5 * log_det_htilde,
-    );
+    note(&mut parts, "curvature log-determinant", 0.5 * log_det_htilde);
 
     0.5 * (g.data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
 }
@@ -2431,10 +2121,7 @@ const CURVATURE_FAILED: &str = "curvature (H̃ not positive definite)";
 /// Record the conditional Gaussian data parts: the residual term when the subject has a
 /// Gaussian observation, and the censored term when the fit censors one of its rows.
 fn note_gaussian_data(
-    parts: &mut PartSink<'_>,
-    subject: &Subject,
-    bloq_method: BloqMethod,
-    data_ll: f64,
+    parts: &mut PartSink<'_>, subject: &Subject, bloq_method: BloqMethod, data_ll: f64,
     bloq_term: f64,
 ) {
     if !subject.observations.is_empty() {
@@ -2527,18 +2214,10 @@ pub(crate) fn foce_subject_nll_interaction_dense_cov(
 /// is attached (see [`foce_subject_contribution_parts`]).
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_interaction_dense_split(
-    subject: &Subject,
-    ipreds: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    error_spec: &ErrorSpec,
-    residual_cov: ResidualCov<'_>,
-    p_obs: &[f64],
-    ruv_mult: Option<&[Vec<f64>]>,
-    residual_error_eta: Option<usize>,
-    mut parts: PartSink<'_>,
+    subject: &Subject, ipreds: &[f64], eta_hat: &DVector<f64>, h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix, sigma_values: &[f64], error_spec: &ErrorSpec,
+    residual_cov: ResidualCov<'_>, p_obs: &[f64], ruv_mult: Option<&[Vec<f64>]>,
+    residual_error_eta: Option<usize>, mut parts: PartSink<'_>,
 ) -> f64 {
     let n_obs = subject.observations.len();
     let n_eta = eta_hat.len();
@@ -2569,11 +2248,7 @@ fn foce_subject_nll_interaction_dense_split(
     let chol = match r.clone().cholesky() {
         Some(c) => c,
         None => {
-            note(
-                &mut parts,
-                "Gaussian residual covariance R (not positive definite)",
-                f64::NAN,
-            );
+            note(&mut parts, "Gaussian residual covariance R (not positive definite)", f64::NAN);
             return SUBJECT_SENTINEL_NLL;
         }
     };
@@ -2582,11 +2257,7 @@ fn foce_subject_nll_interaction_dense_split(
     // data_ll = rᵀ R⁻¹ r + log|R|.
     let residuals = DVector::from_iterator(
         n_obs,
-        subject
-            .observations
-            .iter()
-            .zip(ipreds.iter())
-            .map(|(&y, &f)| y - f),
+        subject.observations.iter().zip(ipreds.iter()).map(|(&y, &f)| y - f),
     );
     let solved = chol.solve(&residuals);
     let data_ll = residuals.dot(&solved) + chol_log_det(&chol.l());
@@ -2651,11 +2322,7 @@ fn foce_subject_nll_interaction_dense_split(
     let htilde = term1 + 0.5 * b + &omega.inv;
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
     note(&mut parts, "Gaussian residual term", 0.5 * data_ll);
-    note(
-        &mut parts,
-        "random-effect prior",
-        0.5 * (eta_prior + omega.log_det),
-    );
+    note(&mut parts, "random-effect prior", 0.5 * (eta_prior + omega.log_det));
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => {
@@ -2663,11 +2330,7 @@ fn foce_subject_nll_interaction_dense_split(
             return SUBJECT_SENTINEL_NLL;
         }
     };
-    note(
-        &mut parts,
-        "curvature log-determinant",
-        0.5 * log_det_htilde,
-    );
+    note(&mut parts, "curvature log-determinant", 0.5 * log_det_htilde);
 
     0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde)
 }
@@ -2741,19 +2404,12 @@ fn foce_subject_nll_interaction_with_tte(
     let hrh = g.hrh + tte_hessian;
 
     let eta_prior = eta_hat.dot(&(&omega.inv * eta_hat));
-    note(
-        &mut parts,
-        "random-effect prior",
-        0.5 * (eta_prior + omega.log_det),
-    );
+    note(&mut parts, "random-effect prior", 0.5 * (eta_prior + omega.log_det));
     // FOCEI adds ½·CᵀC; FOCE omits it. `cens_hess` is FOCEI-order curvature (its `g2`
     // folds in ∂v/∂f, and C·z/C·m are `iiv_on_ruv` interaction), so it is gated the
     // same way; plain FOCE leaves censored rows out of `H̃`.
-    let htilde = if interaction {
-        hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv
-    } else {
-        hrh + &omega.inv
-    };
+    let htilde =
+        if interaction { hrh + 0.5 * g.ctc + &g.cens_hess + &omega.inv } else { hrh + &omega.inv };
     let log_det_htilde = match htilde.cholesky() {
         Some(c) => chol_log_det(&c.l()),
         None => {
@@ -2771,11 +2427,7 @@ fn foce_subject_nll_interaction_with_tte(
             return SUBJECT_SENTINEL_NLL;
         }
     };
-    note(
-        &mut parts,
-        "curvature log-determinant",
-        0.5 * log_det_htilde,
-    );
+    note(&mut parts, "curvature log-determinant", 0.5 * log_det_htilde);
 
     0.5 * (data_ll + eta_prior + omega.log_det + log_det_htilde + g.bloq_term)
 }
@@ -2803,13 +2455,8 @@ struct GaussianFoceTerms {
 /// `data_ll + bloq_term` when all rows are usable; under FOCE or dense `R` they are
 /// still each record's own contribution at η̂.
 pub(crate) fn conditional_obs_neg2ll_terms(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    ipreds: &[f64],
-    eta_hat: &[f64],
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], ipreds: &[f64], eta_hat: &[f64],
+    sigma_values: &[f64], residual_cov: ResidualCov<'_>,
 ) -> Vec<f64> {
     let n_obs = subject.observations.len();
     if ipreds.len() != n_obs {
@@ -3039,13 +2686,7 @@ fn gaussian_foce_accum(
         }
     }
 
-    Some(GaussianFoceTerms {
-        data_ll,
-        hrh,
-        ctc,
-        bloq_term,
-        cens_hess,
-    })
+    Some(GaussianFoceTerms { data_ll, hrh, ctc, bloq_term, cens_hess })
 }
 
 /// Conditional η-precision at `eta_hat` — the FOCEI/Laplace approximation to
@@ -3062,15 +2703,8 @@ fn gaussian_foce_accum(
 /// IIV-on-RUV are gated out by the caller. `None` on a non-finite/non-positive variance.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conditional_eta_precision(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &[f64],
-    ipreds: &[f64],
-    p_obs: &[f64],
-    h_matrix: &DMatrix<f64>,
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &[f64], ipreds: &[f64],
+    p_obs: &[f64], h_matrix: &DMatrix<f64>, omega: &OmegaMatrix, sigma_values: &[f64],
     interaction: bool,
 ) -> Option<DMatrix<f64>> {
     let n_eta = eta_hat.len();
@@ -3100,9 +2734,7 @@ pub(crate) fn conditional_eta_precision(
 
 /// R_tilde = H * Omega * H' + diag(r_diag)
 pub(crate) fn compute_r_tilde(
-    h: &DMatrix<f64>,
-    omega: &DMatrix<f64>,
-    r_diag: &[f64],
+    h: &DMatrix<f64>, omega: &DMatrix<f64>, r_diag: &[f64],
 ) -> DMatrix<f64> {
     let n_obs = h.nrows();
     let h_omega = h * omega;
@@ -3116,18 +2748,14 @@ pub(crate) fn compute_r_tilde(
 /// R_tilde = H * Omega * H' + R for models with a non-diagonal residual
 /// covariance matrix.
 pub(crate) fn compute_r_tilde_with_r(
-    h: &DMatrix<f64>,
-    omega: &DMatrix<f64>,
-    r: &DMatrix<f64>,
+    h: &DMatrix<f64>, omega: &DMatrix<f64>, r: &DMatrix<f64>,
 ) -> DMatrix<f64> {
     let h_omega = h * omega;
     &h_omega * h.transpose() + r
 }
 
 fn select_symmetric_submatrix(matrix: &DMatrix<f64>, indices: &[usize]) -> DMatrix<f64> {
-    DMatrix::from_fn(indices.len(), indices.len(), |row, col| {
-        matrix[(indices[row], indices[col])]
-    })
+    DMatrix::from_fn(indices.len(), indices.len(), |row, col| matrix[(indices[row], indices[col])])
 }
 
 /// log-determinant from Cholesky factor L: 2 * sum(log(L_ii))
@@ -3158,16 +2786,9 @@ pub(crate) fn chol_log_det(l: &DMatrix<f64>) -> f64 {
 /// Scores `block_sigma` at its **declared** ρ; the fit uses
 /// `foce_subject_nll_iov_cov` with the live one (#979).
 pub fn foce_subject_nll_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega_bsv: &OmegaMatrix,
-    sigma_values: &[f64],
-    interaction: bool,
-    kappas: &[DVector<f64>],
-    omega_iov: &OmegaMatrix,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega_bsv: &OmegaMatrix, sigma_values: &[f64], interaction: bool,
+    kappas: &[DVector<f64>], omega_iov: &OmegaMatrix,
 ) -> f64 {
     foce_subject_nll_iov_cov(
         model,
@@ -3190,17 +2811,10 @@ pub fn foce_subject_nll_iov(
 /// structure (`CompiledModel::residual_cov_at` / `residual_cov_theta`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_subject_nll_iov_cov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega_bsv: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    interaction: bool,
-    kappas: &[DVector<f64>],
-    omega_iov: &OmegaMatrix,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega_bsv: &OmegaMatrix, sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, interaction: bool,
+    kappas: &[DVector<f64>], omega_iov: &OmegaMatrix,
 ) -> f64 {
     // A nested-level subject with no κ̂ was never given its cells (#1082): refused, not
     // scored as a BSV-only subject. With cells, `iov_linearization` refuses it below.
@@ -3221,9 +2835,8 @@ pub(crate) fn foce_subject_nll_iov_cov(
         );
     }
 
-    match iov_linearization(
-        model, subject, theta, eta_hat, h_matrix, omega_bsv, kappas, omega_iov,
-    ) {
+    match iov_linearization(model, subject, theta, eta_hat, h_matrix, omega_bsv, kappas, omega_iov)
+    {
         Some(lin) => foce_subject_nll_iov_linearized(
             model,
             subject,
@@ -3281,13 +2894,8 @@ fn nested_kappa_fd_forced() -> bool {
 /// it to the sentinel or to `NaN` CWRES).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn iov_linearization(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
-    omega_bsv: &OmegaMatrix,
-    kappas: &[DVector<f64>],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>, omega_bsv: &OmegaMatrix, kappas: &[DVector<f64>],
     omega_iov: &OmegaMatrix,
 ) -> Option<IovLinearization> {
     // #1082: the compact layout, built once. A nested-level subject never given its cells
@@ -3354,11 +2962,8 @@ pub(crate) fn iov_linearization(
         // The compact κ columns: exact, from the recording of the per-cell vector over the
         // axes it expands from (`exact_kappa_jacobian`, κ lanes only); central differences of the
         // prediction (2 solves per compact κ) where the recorders decline.
-        let cells: Vec<f64> = eta_hat
-            .iter()
-            .copied()
-            .chain(kappa_slices.iter().flatten().copied())
-            .collect();
+        let cells: Vec<f64> =
+            eta_hat.iter().copied().chain(kappa_slices.iter().flatten().copied()).collect();
         let recorded = if nested_kappa_fd_forced() {
             None
         } else {
@@ -3465,25 +3070,13 @@ pub(crate) fn iov_linearization(
     let sigma_b_mat = layout.prior(&omega_bsv.matrix, &omega_iov.matrix);
     let sigma_b = OmegaMatrix::from_matrix(sigma_b_mat, Vec::new(), false);
 
-    Some(IovLinearization {
-        ipreds,
-        b_hat,
-        h_full,
-        sigma_b,
-        n_occasions: k_occ,
-        n_eta,
-        n_iov,
-    })
+    Some(IovLinearization { ipreds, b_hat, h_full, sigma_b, n_occasions: k_occ, n_eta, n_iov })
 }
 
 /// [`foce_subject_nll_iov_cov`] on an already-built [`IovLinearization`].
 pub(crate) fn foce_subject_nll_iov_linearized(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, interaction: bool,
     lin: &IovLinearization,
 ) -> f64 {
     foce_subject_nll_iov_linearized_split(
@@ -3503,12 +3096,8 @@ pub(crate) fn foce_subject_nll_iov_linearized(
 /// prior` is over the stacked `[η, κ]`; curvature and `R̃` carry κ columns. A FREM
 /// refusal has the one part `IOV + FREM refusal`.
 pub(crate) fn foce_subject_iov_contribution_parts(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, interaction: bool,
     lin: &IovLinearization,
 ) -> Vec<(String, f64)> {
     let mut parts = Vec::new();
@@ -3529,24 +3118,11 @@ pub(crate) fn foce_subject_iov_contribution_parts(
 /// attached.
 #[allow(clippy::too_many_arguments)]
 fn foce_subject_nll_iov_linearized_split(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    interaction: bool,
-    lin: &IovLinearization,
-    mut parts: PartSink<'_>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], sigma_values: &[f64],
+    residual_cov: crate::stats::residual_error::ResidualCov<'_>, interaction: bool,
+    lin: &IovLinearization, mut parts: PartSink<'_>,
 ) -> f64 {
-    let IovLinearization {
-        ipreds,
-        b_hat,
-        h_full,
-        sigma_b,
-        n_occasions: k_occ,
-        n_eta,
-        n_iov,
-    } = lin;
+    let IovLinearization { ipreds, b_hat, h_full, sigma_b, n_occasions: k_occ, n_eta, n_iov } = lin;
     let (k_occ, n_eta, n_iov) = (*k_occ, *n_eta, *n_iov);
     let eta_hat = &b_hat.as_slice()[..n_eta];
 
@@ -3664,26 +3240,16 @@ fn foce_subject_nll_iov_linearized_split(
 /// `foce_subject_nll_iov`.  `kappas_per_subject[i]` holds the per-occasion
 /// kappa EBEs for subject i (empty slice = no IOV for that subject).
 pub fn foce_population_nll_iov(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    kappas_per_subject: &[Vec<DVector<f64>>],
-    omega_bsv: &OmegaMatrix,
-    omega_iov: &OmegaMatrix,
-    sigma_values: &[f64],
-    interaction: bool,
+    model: &CompiledModel, population: &Population, theta: &[f64], eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>], kappas_per_subject: &[Vec<DVector<f64>>], omega_bsv: &OmegaMatrix,
+    omega_iov: &OmegaMatrix, sigma_values: &[f64], interaction: bool,
 ) -> f64 {
     // Per-subject NLLs in parallel, summed serially in subject order: rayon's `sum`
     // depends on thread count and f64 addition is not associative (#703).
     let per_subj: Vec<f64> = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
-        let kappas = if i < kappas_per_subject.len() {
-            kappas_per_subject[i].as_slice()
-        } else {
-            &[]
-        };
+        let kappas =
+            if i < kappas_per_subject.len() { kappas_per_subject[i].as_slice() } else { &[] };
         foce_subject_nll_iov(
             model,
             subject,
@@ -3705,15 +3271,9 @@ pub fn foce_population_nll_iov(
 /// form that carries it).
 #[allow(clippy::too_many_arguments)]
 pub fn foce_population_nll(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_correlations: &[ResidualCorrelation],
-    interaction: bool,
+    model: &CompiledModel, population: &Population, theta: &[f64], eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>], omega: &OmegaMatrix, sigma_values: &[f64],
+    residual_correlations: &[ResidualCorrelation], interaction: bool,
 ) -> f64 {
     foce_population_nll_cov(
         model,
@@ -3732,15 +3292,9 @@ pub fn foce_population_nll(
 /// caller uses (#1081).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn foce_population_nll_cov(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    omega: &OmegaMatrix,
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    interaction: bool,
+    model: &CompiledModel, population: &Population, theta: &[f64], eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>], omega: &OmegaMatrix, sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, interaction: bool,
 ) -> f64 {
     // Deterministic reduction: collect per-subject NLLs in subject order, then
     // sum serially. A parallel `.sum()` would make the OFV depend on the
@@ -3859,11 +3413,7 @@ pub(crate) fn compute_cwres_cov(
 
     // f0 = ipred - H * eta_hat
     let h_eta = h_matrix * eta_hat;
-    let f0: Vec<f64> = ipreds
-        .iter()
-        .enumerate()
-        .map(|(j, &ip)| ip - h_eta[j])
-        .collect();
+    let f0: Vec<f64> = ipreds.iter().enumerate().map(|(j, &ip)| ip - h_eta[j]).collect();
 
     // R_tilde, with R at the requested predictions when given (see above).
     let r_eval: &[f64] = r_preds.unwrap_or(&f0);
@@ -3907,19 +3457,15 @@ pub(crate) fn compute_cwres_cov(
     if live.is_empty() {
         return out;
     }
-    let resid = DVector::from_iterator(
-        live.len(),
-        live.iter().map(|&j| subject.observations[j] - f0[j]),
-    );
+    let resid =
+        DVector::from_iterator(live.len(), live.iter().map(|&j| subject.observations[j] - f0[j]));
     let sub = r_tilde.select_rows(&live).select_columns(&live);
     let eig = nalgebra::SymmetricEigen::new(sub);
     if eig.eigenvalues.iter().all(|&l| l > 0.0 && l.is_finite()) {
         let vt_r = eig.eigenvectors.transpose() * &resid;
         let scaled = DVector::from_iterator(
             live.len(),
-            vt_r.iter()
-                .zip(eig.eigenvalues.iter())
-                .map(|(v, l)| v / l.sqrt()),
+            vt_r.iter().zip(eig.eigenvalues.iter()).map(|(v, l)| v / l.sqrt()),
         );
         let z = &eig.eigenvectors * scaled;
         for (k, &j) in live.iter().enumerate() {
@@ -3946,10 +3492,7 @@ pub fn split_obs_by_occasion(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
         }
         occ_map.get_mut(&occ).unwrap().push(j);
     }
-    occ_order
-        .into_iter()
-        .map(|occ| (occ, occ_map.remove(&occ).unwrap()))
-        .collect()
+    occ_order.into_iter().map(|occ| (occ, occ_map.remove(&occ).unwrap())).collect()
 }
 
 /// IOV kappa groups for a subject: observation occasions in [`split_obs_by_occasion`]
@@ -3981,22 +3524,14 @@ pub fn iov_occasion_groups(subject: &Subject) -> Vec<(u32, Vec<usize>)> {
 /// `init(...)`, #1153). An uninformed κ̂ is the prior mode 0 and leaves the objective
 /// unchanged.
 pub(crate) fn iov_group_informed(
-    subject: &Subject,
-    carries_state: bool,
-    reset_reseeds: bool,
+    subject: &Subject, carries_state: bool, reset_reseeds: bool,
 ) -> Vec<bool> {
     let records = subject
         .doses
         .iter()
         .map(|d| d.time)
         .zip(&subject.dose_occasions)
-        .chain(
-            subject
-                .pk_only_times
-                .iter()
-                .copied()
-                .zip(&subject.pk_only_occasions),
-        )
+        .chain(subject.pk_only_times.iter().copied().zip(&subject.pk_only_occasions))
         .chain(
             subject
                 .reset_times
@@ -4032,10 +3567,7 @@ pub(crate) fn iov_group_informed(
 /// `init(...)` (`OdeSpec::initial_state`; the closed-form and algebraic arms of
 /// `predict_iov` build no reset snapshot at all). The one place postfit asks.
 pub(crate) fn iov_group_informed_for(model: &CompiledModel, subject: &Subject) -> Vec<bool> {
-    let reset_reseeds = model
-        .ode_spec
-        .as_ref()
-        .is_some_and(|ode| ode.init_fn.is_some());
+    let reset_reseeds = model.ode_spec.as_ref().is_some_and(|ode| ode.init_fn.is_some());
     iov_group_informed(subject, !model.is_algebraic(), reset_reseeds)
 }
 
@@ -4044,21 +3576,14 @@ pub(crate) fn iov_group_informed_for(model: &CompiledModel, subject: &Subject) -
 /// which the closed-form and ODE recorders both read, so the occasion→group mapping is defined once
 /// (#466 review round 2).
 pub fn iov_occ_to_k(occ_groups: &[(u32, Vec<usize>)]) -> std::collections::HashMap<u32, usize> {
-    occ_groups
-        .iter()
-        .enumerate()
-        .map(|(k, (occ, _))| (*occ, k))
-        .collect()
+    occ_groups.iter().enumerate().map(|(k, (occ, _))| (*occ, k)).collect()
 }
 
 /// `[η_bsv, κ_g]` for occasion group `g`, sliced from the stacked
 /// `[η_bsv, κ₁..κ_K]`. The offset is owned by `stats::stacked_layout` (`kappa_offset`,
 /// #1082) so closed-form and ODE IOV providers agree.
 pub fn iov_combined_effect(
-    stacked_eta: &[f64],
-    n_eta: usize,
-    n_kappa: usize,
-    g: usize,
+    stacked_eta: &[f64], n_eta: usize, n_kappa: usize, g: usize,
 ) -> Vec<f64> {
     let mut c = Vec::with_capacity(n_eta + n_kappa);
     c.extend_from_slice(&stacked_eta[..n_eta]);
@@ -4080,9 +3605,7 @@ pub fn iov_combined_pk_only(stacked_eta: &[f64], n_eta: usize, n_kappa: usize) -
 /// Used for the extended H-matrix in the FOCE outer loop with IOV.
 #[cfg(test)]
 pub(crate) fn build_block_diag_omega(
-    omega_bsv: &DMatrix<f64>,
-    omega_iov: &DMatrix<f64>,
-    n_occasions: usize,
+    omega_bsv: &DMatrix<f64>, omega_iov: &DMatrix<f64>, n_occasions: usize,
 ) -> DMatrix<f64> {
     crate::stats::stacked_layout::block_diag_stack(omega_bsv, omega_iov, n_occasions)
 }
@@ -4094,14 +3617,8 @@ pub(crate) fn build_block_diag_omega(
 /// across occasions, so an earlier dose decays with the later occasion's clearance as
 /// in NONMEM (#104). The FD Jacobian and `foce_subject_nll_iov` use the same prediction.
 pub fn individual_nll_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    sigma_values: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[Vec<f64>],
+    omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>, sigma_values: &[f64],
 ) -> f64 {
     individual_nll_iov_with_scratch(
         model,
@@ -4120,14 +3637,8 @@ pub fn individual_nll_iov(
 /// eta/kappa values. The public convenience function keeps its original API.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[K],
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    sigma_values: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[K],
+    omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>, sigma_values: &[f64],
     pk_scratch: &mut pk::EventPkParams,
 ) -> f64 {
     individual_nll_iov_with_scratch_and_schedule(
@@ -4149,16 +3660,9 @@ pub(crate) fn individual_nll_iov_with_scratch<K: AsRef<[f64]>>(
 /// uncached behaviour.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[K],
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    sigma_values: &[f64],
-    pk_scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[K],
+    omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>, sigma_values: &[f64],
+    pk_scratch: &mut pk::EventPkParams, schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> f64 {
     individual_nll_iov_frozen(
         model,
@@ -4180,16 +3684,9 @@ pub(crate) fn individual_nll_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
 /// `None` is bit-identical to the conditional objective.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[K],
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    sigma_values: &[f64],
-    pk_scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64], kappas: &[K],
+    omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>, sigma_values: &[f64],
+    pk_scratch: &mut pk::EventPkParams, schedule: Option<&pk::event_driven::EventSchedule>,
     frozen_var_preds: Option<&[f64]>,
 ) -> f64 {
     // #1082: a nested-level subject never given its cells has no layout, and is refused
@@ -4240,18 +3737,10 @@ pub(crate) fn quad_form(m: &DMatrix<f64>, v: &[f64]) -> f64 {
 /// FOCE/FOCEI EBE search (#979), the declaration for every other caller.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
-    model: &CompiledModel,
-    subject: &Subject,
-    layout: &crate::stats::stacked_layout::StackedLayout,
-    theta: &[f64],
-    eta: &[f64],
-    kappas: &[K],
-    omega: &OmegaMatrix,
-    omega_iov: Option<&OmegaMatrix>,
-    sigma_values: &[f64],
-    residual_cov: crate::stats::residual_error::ResidualCov<'_>,
-    pk_scratch: &mut pk::EventPkParams,
-    schedule: Option<&pk::event_driven::EventSchedule>,
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64], eta: &[f64], kappas: &[K], omega: &OmegaMatrix, omega_iov: Option<&OmegaMatrix>,
+    sigma_values: &[f64], residual_cov: crate::stats::residual_error::ResidualCov<'_>,
+    pk_scratch: &mut pk::EventPkParams, schedule: Option<&pk::event_driven::EventSchedule>,
     frozen_var_preds: Option<&[f64]>,
 ) -> f64 {
     let nested = layout.nested();
@@ -4310,9 +3799,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     {
         planned
     } else {
-        pk::predict_iov_in(
-            model, subject, layout, theta, eta, kappas, pk_scratch, schedule,
-        )
+        pk::predict_iov_in(model, subject, layout, theta, eta, kappas, pk_scratch, schedule)
     };
     crate::scratch::give(stacked);
     // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
@@ -4322,11 +3809,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
         build_frem_r_override(model.frem_config.as_ref(), &subject.fremtype, sigma_values);
     // IIV on residual error (#409): η_ruv is a BSV eta, indexed into `eta`. A frozen
     // variance is `R⁰`, taken at every random effect zero (see the doc above).
-    let ruv_scale = if frozen_var_preds.is_some() {
-        1.0
-    } else {
-        model.residual_var_scale(eta)
-    };
+    let ruv_scale = if frozen_var_preds.is_some() { 1.0 } else { model.residual_var_scale(eta) };
     // #484/#1029: per-observation residual-magnitude multiplier, so the IOV
     // individual NLL (SAEM's E-step, the Bayes MH target, the IOV IS weights)
     // scores the same variance the non-IOV path and FOCE/FOCEI do.
@@ -4430,10 +3913,7 @@ mod tests {
                 "  omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n",
             )
             .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)")
-            .replace(
-                "  method  = focei\n",
-                "  method  = focei\n  iov_column = OCC\n",
-            );
+            .replace("  method  = focei\n", "  method  = focei\n  iov_column = OCC\n");
         let binary =
             "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
                       theta TH0(0.3, -10.0, 10.0)\n  omega ETA_I ~ 0.3\n  sigma PROP ~ 0.05\n\
@@ -4444,15 +3924,9 @@ mod tests {
                       [fit_options]\n  method = focei\n"
                 .to_string();
         let binary_iov = binary
-            .replace(
-                "  omega ETA_I ~ 0.3\n",
-                "  omega ETA_I ~ 0.3\n  kappa KAPPA_CL ~ 0.04\n",
-            )
+            .replace("  omega ETA_I ~ 0.3\n", "  omega ETA_I ~ 0.3\n  kappa KAPPA_CL ~ 0.04\n")
             .replace("CL = TVCL\n", "CL = TVCL * exp(KAPPA_CL)\n")
-            .replace(
-                "  method = focei\n",
-                "  method = focei\n  iov_column = OCC\n",
-            );
+            .replace("  method = focei\n", "  method = focei\n  iov_column = OCC\n");
         let event = |time: f64, event_type: EventType, entry_time: f64| ObsRecord::Event {
             time,
             event_type,
@@ -4470,10 +3944,7 @@ mod tests {
                 "tte",
                 tte,
                 tte_iov,
-                vec![
-                    event(7.5, EventType::Exact, 0.0),
-                    event(30.0, EventType::RightCensored, 7.5),
-                ],
+                vec![event(7.5, EventType::Exact, 0.0), event(30.0, EventType::RightCensored, 7.5)],
             ),
             (
                 "binary",
@@ -4502,10 +3973,7 @@ mod tests {
             let eta = DVector::from_vec(vec![0.12]);
             let h = DMatrix::<f64>::zeros(0, 1);
             let kappas = vec![DVector::zeros(1), DVector::zeros(1)];
-            let no_records = Subject {
-                obs_records: Vec::new(),
-                ..s.clone()
-            };
+            let no_records = Subject { obs_records: Vec::new(), ..s.clone() };
             let iov_nll = |subject: &Subject, interaction: bool| {
                 foce_subject_nll_iov(
                     &iov,
@@ -4584,9 +4052,7 @@ mod tests {
             let (he, hf) = (run(false), run(true));
             assert_eq!(he.ncols(), hf.ncols());
             assert!(
-                he.iter()
-                    .zip(hf.iter())
-                    .any(|(a, b)| a.to_bits() != b.to_bits()),
+                he.iter().zip(hf.iter()).any(|(a, b)| a.to_bits() != b.to_bits()),
                 "the exact κ branch did not run"
             );
             let scale = hf.iter().fold(1.0f64, |m, &v| m.max(v.abs()));
@@ -4651,26 +4117,11 @@ mod tests {
     fn obs_nll_subject_into_uses_cross_endpoint_residual_covariance() {
         let mut model = make_model();
         model.error_spec = ErrorSpec::PerCmt(HashMap::from([
-            (
-                1,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![1],
-                },
-            ),
-            (
-                2,
-                EndpointError {
-                    error_model: ErrorModel::Proportional,
-                    sigma_idx: vec![0],
-                },
-            ),
+            (1, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![1] }),
+            (2, EndpointError { error_model: ErrorModel::Proportional, sigma_idx: vec![0] }),
         ]));
-        model.residual_correlations = vec![ResidualCorrelation {
-            sigma_i: 0,
-            sigma_j: 1,
-            rho: 0.5,
-        }];
+        model.residual_correlations =
+            vec![ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
 
         let mut subj = make_simple_subject();
         subj.obs_times = vec![1.0, 1.0];
@@ -4742,11 +4193,7 @@ mod tests {
     fn m3_logcdf_scores_an_out_of_domain_flag_by_its_sign() {
         let at = |cens: i8| m3_logcdf(10.0, 12.0, 2.0, cens);
         assert!(at(1).is_finite() && at(-1).is_finite());
-        assert_ne!(
-            at(1).to_bits(),
-            at(-1).to_bits(),
-            "the two tails differ here"
-        );
+        assert_ne!(at(1).to_bits(), at(-1).to_bits(), "the two tails differ here");
         for (flag, code) in [(7, 1), (i8::MAX, 1), (-2, -1), (i8::MIN, -1)] {
             assert_eq!(
                 at(flag).to_bits(),
@@ -4876,21 +4323,9 @@ mod tests {
                 assert!(m3(flag).is_finite(), "{name}: m3, CENS={flag}");
                 assert!(drop(flag).is_finite(), "{name}: drop, CENS={flag}");
             }
-            assert_ne!(
-                m3(1).to_bits(),
-                m3(-1).to_bits(),
-                "{name}: the tails differ"
-            );
-            assert_ne!(
-                m3(1).to_bits(),
-                m3(0).to_bits(),
-                "{name}: the lower tail is live"
-            );
-            assert_ne!(
-                m3(-1).to_bits(),
-                m3(0).to_bits(),
-                "{name}: the upper tail is live"
-            );
+            assert_ne!(m3(1).to_bits(), m3(-1).to_bits(), "{name}: the tails differ");
+            assert_ne!(m3(1).to_bits(), m3(0).to_bits(), "{name}: the lower tail is live");
+            assert_ne!(m3(-1).to_bits(), m3(0).to_bits(), "{name}: the upper tail is live");
             // "under bloq_method = m3 a positive flag is scored on the lower tail, like
             // CENS=1" — and the negative one on the upper tail, like CENS=-1.
             assert_eq!(m3(7).to_bits(), m3(1).to_bits(), "{name}: m3, 7 as 1");
@@ -5024,10 +4459,8 @@ mod tests {
         natural.obs_cmts = vec![1; 3];
         natural.cens = vec![0; 3];
         natural.occasions = vec![1; 3];
-        natural.obs_covariates = w
-            .iter()
-            .map(|&wi| [("WPSE".to_string(), wi)].into_iter().collect())
-            .collect();
+        natural.obs_covariates =
+            w.iter().map(|&wi| [("WPSE".to_string(), wi)].into_iter().collect()).collect();
 
         // The hand-built twin: DV and the prediction both pre-divided by the
         // weight, scored by an unweighted additive model on the same sigma.
@@ -5141,19 +4574,10 @@ mod tests {
         subj.reset_occasions = vec![2, 8, 9];
         let ids: Vec<u32> = iov_occasion_groups(&subj).iter().map(|g| g.0).collect();
         assert_eq!(ids, vec![1, 2, 8, 9]);
-        assert_eq!(
-            iov_group_informed(&subj, true, true),
-            vec![true, true, true, false]
-        );
-        assert_eq!(
-            iov_group_informed(&subj, false, true),
-            vec![true, true, false, false]
-        );
+        assert_eq!(iov_group_informed(&subj, true, true), vec![true, true, true, false]);
+        assert_eq!(iov_group_informed(&subj, false, true), vec![true, true, false, false]);
         // A reset that re-seeds nothing informs nothing, at any time (review r1 #1).
-        assert_eq!(
-            iov_group_informed(&subj, true, false),
-            vec![true, true, false, false]
-        );
+        assert_eq!(iov_group_informed(&subj, true, false), vec![true, true, false, false]);
     }
 
     /// #1153 review r1 #1: `iov_group_informed_for` lets a reset inform its group only on an
@@ -5182,11 +4606,9 @@ mod tests {
         let mut subj = make_simple_subject();
         subj.reset_times = vec![4.0];
         subj.reset_occasions = vec![8];
-        for (src, want) in [
-            (closed.to_string(), false),
-            (ode(""), false),
-            (ode("  init(central) = CL\n"), true),
-        ] {
+        for (src, want) in
+            [(closed.to_string(), false), (ode(""), false), (ode("  init(central) = CL\n"), true)]
+        {
             let m = crate::parser::model_parser::parse_model_string(&src).unwrap();
             assert_eq!(
                 iov_group_informed_for(&m, &subj),
@@ -5233,10 +4655,7 @@ mod tests {
     fn test_iov_group_informed_all_true_for_observation_groups() {
         let subj = make_simple_subject();
         for carries_state in [true, false] {
-            assert_eq!(
-                iov_group_informed(&subj, carries_state, true),
-                vec![true, true]
-            );
+            assert_eq!(iov_group_informed(&subj, carries_state, true), vec![true, true]);
         }
     }
 
@@ -5274,9 +4693,8 @@ mod tests {
         let snap =
             |w: f64| -> HashMap<String, f64> { [("WPSE".to_string(), w)].into_iter().collect() };
         subj.covariates = snap(0.5);
-        subj.obs_covariates = (0..subj.observations.len())
-            .map(|j| snap(0.5 + 0.3 * j as f64))
-            .collect();
+        subj.obs_covariates =
+            (0..subj.observations.len()).map(|j| snap(0.5 + 0.3 * j as f64)).collect();
 
         let theta = vec![5.0, 50.0];
         let eta = vec![0.0];
@@ -5304,19 +4722,9 @@ mod tests {
         let model = make_model();
         let subj = make_simple_subject();
         let omega = make_omega(0.09);
-        let nll = individual_nll(
-            &model,
-            &subj,
-            &[5.0, 50.0],
-            &[f64::INFINITY],
-            &omega,
-            &[0.05],
-        );
+        let nll = individual_nll(&model, &subj, &[5.0, 50.0], &[f64::INFINITY], &omega, &[0.05]);
         assert!(nll.is_finite(), "NLL must stay finite, got {nll}");
-        assert_eq!(
-            nll, SUBJECT_SENTINEL_NLL,
-            "a non-finite NLL should map to the 1e20 sentinel"
-        );
+        assert_eq!(nll, SUBJECT_SENTINEL_NLL, "a non-finite NLL should map to the 1e20 sentinel");
     }
 
     /// #2269: each guard returns exactly `SUBJECT_SENTINEL_NLL`, and its readers
@@ -5363,10 +4771,7 @@ mod tests {
             ("individual_nll singular Ω", singular_omega),
             ("chol_log_det", chol),
         ] {
-            assert_eq!(
-                got, SUBJECT_SENTINEL_NLL,
-                "{guard} must return the shared sentinel"
-            );
+            assert_eq!(got, SUBJECT_SENTINEL_NLL, "{guard} must return the shared sentinel");
         }
 
         assert!(
@@ -5479,11 +4884,7 @@ mod tests {
         let mut hits = Vec::new();
         let mut saw_definition = false;
         for path in &files {
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
             let is_test_file = rel.ends_with("_tests.rs") || rel.contains("/tests/");
             if is_test_file || POPULATION_OBJECTIVE_FILES.contains(&rel.as_str()) {
                 continue;
@@ -5545,12 +4946,7 @@ mod tests {
         );
         assert_eq!(iov.to_bits(), reused.to_bits());
         // Kappa prior is positive → IOV NLL should differ from base
-        assert!(
-            (iov - base).abs() > 1e-6,
-            "IOV NLL={}, base NLL={}",
-            iov,
-            base
-        );
+        assert!((iov - base).abs() > 1e-6, "IOV NLL={}, base NLL={}", iov, base);
     }
 
     /// A model whose CL depends on both the BSV eta and the per-occasion
@@ -5559,15 +4955,14 @@ mod tests {
     /// `foce_subject_nll` path (which passes a length-1 eta) doesn't panic.
     fn make_iov_kappa_model() -> CompiledModel {
         let mut model = make_model();
-        model.pk_param_fn = Box::new(
-            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+        model.pk_param_fn =
+            Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
                 let mut p = PkParams::default();
                 let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
                 p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL
                 p.values[1] = theta[1]; // V
                 p
-            },
-        );
+            });
         model
     }
 
@@ -5627,10 +5022,7 @@ mod tests {
         // (2) The marginal responds to Ω_iov through R̃ (the determinant term
         //     the old penalty was missing): with non-zero kappas, two different
         //     Ω_iov give materially different, finite OFVs.
-        let kappas = vec![
-            DVector::from_vec(vec![0.08]),
-            DVector::from_vec(vec![-0.05]),
-        ];
+        let kappas = vec![DVector::from_vec(vec![0.08]), DVector::from_vec(vec![-0.05])];
         let nll = |iov_var: f64| {
             foce_subject_nll_iov(
                 &model,
@@ -6168,11 +5560,7 @@ mod tests {
             Some(&[4.0]),
             BloqMethod::Drop,
         );
-        assert_relative_eq!(
-            cw[0],
-            2.0 / (0.25_f64 + 0.25 * 16.0).sqrt(),
-            epsilon = 1e-12
-        );
+        assert_relative_eq!(cw[0], 2.0 / (0.25_f64 + 0.25 * 16.0).sqrt(), epsilon = 1e-12);
         let cw_f0 = compute_cwres(
             &one,
             &ipreds[..1],
@@ -6188,11 +5576,7 @@ mod tests {
             None,
             BloqMethod::Drop,
         );
-        assert_relative_eq!(
-            cw_f0[0],
-            2.0 / (0.25_f64 + 0.25 * 1.0).sqrt(),
-            epsilon = 1e-12
-        );
+        assert_relative_eq!(cw_f0[0], 2.0 / (0.25_f64 + 0.25 * 1.0).sqrt(), epsilon = 1e-12);
     }
 
     #[test]
@@ -6430,10 +5814,7 @@ mod tests {
 
         // (1) Inner EBE NLL: individual_nll → tte_endpoint_nll → tte_ode_nll.
         let inner = individual_nll(&model, &subject, &p.theta, &eta, &p.omega, &p.sigma.values);
-        assert!(
-            inner.is_finite(),
-            "inner joint NLL must be finite; got {inner}"
-        );
+        assert!(inner.is_finite(), "inner joint NLL must be finite; got {inner}");
 
         // (2) SAEM M-step: obs_nll_subject_from_preds (Gaussian preds supplied).
         let preds = vec![30.0_f64; n_obs];
@@ -6446,10 +5827,7 @@ mod tests {
             model.residual_cov_at(p),
             &eta,
         );
-        assert!(
-            saem.is_finite(),
-            "SAEM M-step joint NLL must be finite; got {saem}"
-        );
+        assert!(saem.is_finite(), "SAEM M-step joint NLL must be finite; got {saem}");
 
         // (3) FOCEI Laplace objective, incl. the ODE-TTE FD-Hessian term. A zero Gaussian
         // sensitivity matrix is fine here — the prior + TTE Hessian keep H̃ positive-definite.
@@ -6466,20 +5844,10 @@ mod tests {
             &p.residual_correlations,
             true,
         );
-        assert!(
-            foce.is_finite(),
-            "FOCEI joint NLL must be finite; got {foce}"
-        );
+        assert!(foce.is_finite(), "FOCEI joint NLL must be finite; got {foce}");
 
         // The ODE hazard must actually contribute: moving η changes the inner NLL.
-        let moved = individual_nll(
-            &model,
-            &subject,
-            &p.theta,
-            &[0.4],
-            &p.omega,
-            &p.sigma.values,
-        );
+        let moved = individual_nll(&model, &subject, &p.theta, &[0.4], &p.omega, &p.sigma.values);
         assert!(
             moved.is_finite() && (moved - inner).abs() > 1e-9,
             "η must move the joint NLL (inner={inner}, moved={moved})"
@@ -6561,10 +5929,7 @@ mod tests {
     #[cfg(feature = "survival")]
     fn walk_scope_straddle(s: &Subject) -> (bool, bool) {
         let in_scope = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope;
-        (
-            in_scope(&joint_pktte_ode_model(), s),
-            in_scope(&walk_declined_joint_pktte_model(), s),
-        )
+        (in_scope(&joint_pktte_ode_model(), s), in_scope(&walk_declined_joint_pktte_model(), s))
     }
 
     /// #1885's ODE fixture (the plan's M4): [`joint_pktte_ode_model`]'s subject on oral
@@ -6629,12 +5994,8 @@ mod tests {
         };
         let t = 25.3;
         let cases = [("A", 0.4), ("B", -0.7)];
-        let pop = ebe_population(
-            cases
-                .iter()
-                .map(|(id, _)| ebe_pktte_subject(id, t, true))
-                .collect(),
-        );
+        let pop =
+            ebe_population(cases.iter().map(|(id, _)| ebe_pktte_subject(id, t, true)).collect());
         let etas = crate::api::SuppliedEtas::from_table(
             vec!["B".into(), "A".into()],
             vec!["ETA_CL".into()],
@@ -6994,10 +6355,7 @@ DV ~ proportional(PROP_ERR)
         // η = 0 also matches what `predict_survival` evaluates at.
         let eta = [0.0_f64];
         let tv_h0 = theta[3];
-        assert_eq!(
-            tv_h0, 0.01,
-            "theta[3] must be TVH0 — the arms read h against it"
-        );
+        assert_eq!(tv_h0, 0.01, "theta[3] must be TVH0 — the arms read h against it");
 
         for (arm, t_pre, records) in [
             (
@@ -7015,10 +6373,7 @@ DV ~ proportional(PROP_ERR)
                 5.0_f64,
                 vec![ObsRecord::Event {
                     time: 20.0,
-                    event_type: EventType::IntervalCensored {
-                        left: 5.0,
-                        right: 20.0,
-                    },
+                    event_type: EventType::IntervalCensored { left: 5.0, right: 20.0 },
                     entry_time: 0.0,
                     cmt: 2,
                 }],
@@ -7041,10 +6396,7 @@ DV ~ proportional(PROP_ERR)
                 0.0_f64,
                 vec![ObsRecord::Event {
                     time: 20.0,
-                    event_type: EventType::IntervalCensored {
-                        left: 0.0,
-                        right: 20.0,
-                    },
+                    event_type: EventType::IntervalCensored { left: 0.0, right: 20.0 },
                     entry_time: 0.0,
                     cmt: 2,
                 }],
@@ -7419,9 +6771,7 @@ DV ~ proportional(PROP_ERR)
             "fixture must carry a real infusion or it tests nothing"
         );
         subject.obs_times = vec![0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 12.0, 18.0];
-        subject.observations = vec![
-            4.6271, 6.2626, 7.1063, 8.0446, 6.3602, 4.8718, 3.6207, 2.0972,
-        ];
+        subject.observations = vec![4.6271, 6.2626, 7.1063, 8.0446, 6.3602, 4.8718, 3.6207, 2.0972];
         subject.obs_cmts = vec![1; 8];
         subject.cens = vec![0; 8];
         subject.occasions = vec![1; 8];
@@ -7532,22 +6882,8 @@ DV ~ proportional(PROP_ERR)
             "a TIME-using joint PK-TTE model must not take the #570 shared-solve path"
         );
         // The fallback still yields a finite NLL (and η still moves it).
-        let nll = individual_nll(
-            &model,
-            &subject,
-            &p.theta,
-            &[0.0],
-            &p.omega,
-            &p.sigma.values,
-        );
-        let moved = individual_nll(
-            &model,
-            &subject,
-            &p.theta,
-            &[0.3],
-            &p.omega,
-            &p.sigma.values,
-        );
+        let nll = individual_nll(&model, &subject, &p.theta, &[0.0], &p.omega, &p.sigma.values);
+        let moved = individual_nll(&model, &subject, &p.theta, &[0.3], &p.omega, &p.sigma.values);
         assert!(
             nll.is_finite() && moved.is_finite() && (nll - moved).abs() > 1e-9,
             "fallback joint NLL must be finite and η-sensitive (nll={nll}, moved={moved})"
@@ -7625,22 +6961,8 @@ DV ~ proportional(PROP_ERR)
              the #570 shared-solve path"
         );
         // …and the two-solve fallback still produces a finite, η-sensitive NLL.
-        let nll = individual_nll(
-            &model,
-            &subject,
-            &p.theta,
-            &[0.0],
-            &p.omega,
-            &p.sigma.values,
-        );
-        let moved = individual_nll(
-            &model,
-            &subject,
-            &p.theta,
-            &[0.3],
-            &p.omega,
-            &p.sigma.values,
-        );
+        let nll = individual_nll(&model, &subject, &p.theta, &[0.0], &p.omega, &p.sigma.values);
+        let moved = individual_nll(&model, &subject, &p.theta, &[0.3], &p.omega, &p.sigma.values);
         assert!(
             nll.is_finite() && moved.is_finite() && (nll - moved).abs() > 1e-9,
             "fallback joint NLL must be finite and η-sensitive (nll={nll}, moved={moved})"
@@ -7699,11 +7021,8 @@ DV ~ proportional(PROP_ERR)
         // The discriminating precondition: the *wide* flag still fires — the
         // augmented program does read model time, and the SS gates must keep
         // seeing that — while the predicate the share asks does not.
-        let prog = model
-            .ode_spec
-            .as_ref()
-            .and_then(|o| o.rhs_program.as_ref())
-            .expect("rhs program");
+        let prog =
+            model.ode_spec.as_ref().and_then(|o| o.rhs_program.as_ref()).expect("rhs program");
         assert!(
             prog.reads_model_time(),
             "the augmented RHS does read model time (the SS gates' predicate)"
@@ -7748,10 +7067,7 @@ DV ~ proportional(PROP_ERR)
         // Without the reset the subject qualifies — the straddle that makes the next
         // assertion about the reset rather than about something else in the admission list.
         let subject = late_start_joint_subject(records.clone());
-        assert!(
-            !subject.has_resets(),
-            "control subject must carry no resets"
-        );
+        assert!(!subject.has_resets(), "control subject must carry no resets");
         assert!(
             try_joint_pktte_shared_solve(&model, &subject, &p.theta, &[0.0]).is_some(),
             "the reset-free subject must qualify for the share, or this test proves nothing \
@@ -7761,10 +7077,7 @@ DV ~ proportional(PROP_ERR)
         // With one, it must not.
         let mut reset_subject = late_start_joint_subject(records);
         reset_subject.reset_times = vec![15.0];
-        assert!(
-            reset_subject.has_resets(),
-            "fixture must actually carry a reset"
-        );
+        assert!(reset_subject.has_resets(), "fixture must actually carry a reset");
         assert!(
             try_joint_pktte_shared_solve(&model, &reset_subject, &p.theta, &[0.0]).is_none(),
             "an EVID=3/4 reset must decline the #570 share — the share takes a single t=0 PK \
@@ -7817,14 +7130,7 @@ DV ~ proportional(PROP_ERR)
         let q = &twin.default_params;
 
         for eta in [0.0, 0.3, -0.25] {
-            let a = individual_nll(
-                &plain,
-                &subject,
-                &p.theta,
-                &[eta],
-                &p.omega,
-                &p.sigma.values,
-            );
+            let a = individual_nll(&plain, &subject, &p.theta, &[eta], &p.omega, &p.sigma.values);
             let b = individual_nll(&twin, &subject, &q.theta, &[eta], &q.omega, &q.sigma.values);
             assert!(
                 a.is_finite(),
@@ -7907,14 +7213,7 @@ DV ~ proportional(PROP_ERR)
             _ => panic!("expected an OdeAccumulated TTE endpoint on CMT 2"),
         };
 
-        let nll = tte_ode_nll(
-            &model,
-            &subject,
-            chz_state,
-            &subject.obs_records,
-            theta,
-            &eta,
-        );
+        let nll = tte_ode_nll(&model, &subject, chz_state, &subject.obs_records, theta, &eta);
         assert!(
             nll.is_finite() && nll < SUBJECT_SENTINEL_NLL,
             "an event on the first dose is scored with the sentinel, not a likelihood: {nll}"
@@ -7989,18 +7288,11 @@ DV ~ proportional(PROP_ERR)
             let (nll, parts) = run(&h, 3.0, interaction);
             assert_eq!(
                 names(&parts),
-                [
-                    "Gaussian residual term",
-                    "random-effect prior",
-                    "curvature log-determinant"
-                ],
+                ["Gaussian residual term", "random-effect prior", "curvature log-determinant"],
                 "interaction = {interaction}"
             );
             let summed = parts.iter().map(|(_, v)| v).sum::<f64>() + tte_nll;
-            eprintln!(
-                "interaction = {interaction}: gap {:e}",
-                (summed - nll).abs()
-            );
+            eprintln!("interaction = {interaction}: gap {:e}", (summed - nll).abs());
             assert!(
                 nll.is_finite() && nll < 1e3 && (summed - nll).abs() <= 1e-12 * nll.abs(),
                 "interaction = {interaction}: Σ parts + tte = {summed}, marginal = {nll}"
@@ -8064,10 +7356,7 @@ DV ~ proportional(PROP_ERR)
     fn ode_tte_endpoint(
         model: &CompiledModel,
     ) -> (usize, &HazardSpec, crate::types::TteRecurrence) {
-        let EndpointLikelihood::Tte {
-            hazard, recurrence, ..
-        } = &model.endpoints[&2]
-        else {
+        let EndpointLikelihood::Tte { hazard, recurrence, .. } = &model.endpoints[&2] else {
             panic!("CMT 2 is the TTE endpoint");
         };
         let HazardSpec::OdeAccumulated { chz_state } = hazard else {
@@ -8096,10 +7385,7 @@ DV ~ proportional(PROP_ERR)
     /// (`tte_diagnostics`, which builds its own share) checked to report the same `ΔH`.
     #[cfg(feature = "survival")]
     fn router_terms(
-        model: &CompiledModel,
-        s: &Subject,
-        share: Option<&JointPkTteSolve>,
-        eta: &[f64],
+        model: &CompiledModel, s: &Subject, share: Option<&JointPkTteSolve>, eta: &[f64],
     ) -> Vec<crate::survival::RecordTerm<f64>> {
         let (_, hazard, recurrence) = ode_tte_endpoint(model);
         let p = &model.default_params;
@@ -8120,11 +7406,7 @@ DV ~ proportional(PROP_ERR)
             panic!("the censor is a point record");
         };
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[1].coxsnell.to_bits(),
-            dh.to_bits(),
-            "tte_diagnostics arm"
-        );
+        assert_eq!(rows[1].coxsnell.to_bits(), dh.to_bits(), "tte_diagnostics arm");
         terms
     }
 
@@ -8217,21 +7499,12 @@ DV ~ proportional(PROP_ERR)
             family: HazardFamily::Exponential,
             param_fn: Box::new(|_: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![0.1]),
         };
-        let forward = TteRecurrence::Repeated {
-            clock: RtteClock::Forward,
-        };
-        let event = ObsRecord::Event {
-            time: 4.0,
-            event_type: EventType::Exact,
-            entry_time: 0.0,
-            cmt: 2,
-        };
+        let forward = TteRecurrence::Repeated { clock: RtteClock::Forward };
+        let event =
+            ObsRecord::Event { time: 4.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 };
         let interval = ObsRecord::Event {
             time: 8.0,
-            event_type: EventType::IntervalCensored {
-                left: 6.0,
-                right: 8.0,
-            },
+            event_type: EventType::IntervalCensored { left: 6.0, right: 8.0 },
             entry_time: 0.0,
             cmt: 2,
         };
@@ -8247,10 +7520,7 @@ DV ~ proportional(PROP_ERR)
                 None,
             )
         };
-        assert_eq!(
-            terms(std::slice::from_ref(&event)).map(|t| t.len()),
-            Some(1)
-        );
+        assert_eq!(terms(std::slice::from_ref(&event)).map(|t| t.len()), Some(1));
         assert!(terms(&[event, interval]).is_none());
     }
 
@@ -8331,18 +7601,11 @@ DV ~ proportional(PROP_ERR)
             entry_time: 0.0,
             cmt: 2,
         }];
-        assert_eq!(
-            subject.param_time_at(104.0),
-            4.0,
-            "fixture: written time is 4"
-        );
+        assert_eq!(subject.param_time_at(104.0), 4.0, "fixture: written time is 4");
         let eta = [0.0_f64];
         let rows = tte_diagnostics(&model, &subject, &model.default_params.theta, &eta);
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].time, 4.0,
-            "TIME must be as written, not the engine 104"
-        );
+        assert_eq!(rows[0].time, 4.0, "TIME must be as written, not the engine 104");
         // …while ΔH stays on the engine clock the likelihood scored.
         assert!((rows[0].coxsnell - 0.10 * 104.0).abs() < 1e-12);
     }
@@ -8380,20 +7643,11 @@ DV ~ proportional(PROP_ERR)
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn conditional_obs_nll_from_preds(
-    model: &CompiledModel,
-    subject: &Subject,
-    preds: &[f64],
-    theta: &[f64],
-    sigma_values: &[f64],
-    residual_cov: ResidualCov<'_>,
-    eta: &[f64],
-    iov: bool,
+    model: &CompiledModel, subject: &Subject, preds: &[f64], theta: &[f64], sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>, eta: &[f64], iov: bool,
 ) -> f64 {
-    let semantics = if iov {
-        PredNllSemantics::ConditionalIov
-    } else {
-        PredNllSemantics::Conditional
-    };
+    let semantics =
+        if iov { PredNllSemantics::ConditionalIov } else { PredNllSemantics::Conditional };
     obs_nll_subject_from_preds_with_semantics(
         model,
         subject,
@@ -8459,10 +7713,7 @@ mod conditional_obs_terms_tests {
         );
         assert!(terms.iter().all(|t| t.is_finite()), "{terms:?}");
         let p_obs = ekf_p_obs(&model, &subject, &p.theta, eta.as_slice(), &p.sigma.values);
-        assert!(
-            p_obs.iter().any(|&v| v > 1e-3),
-            "premise: the process noise is live: {p_obs:?}"
-        );
+        assert!(p_obs.iter().any(|&v| v > 1e-3), "premise: the process noise is live: {p_obs:?}");
         let scorer = foce_subject_nll_cov(
             &model,
             &subject,
@@ -8553,10 +7804,7 @@ mod negative_prediction_tests {
             "fixture must keep every prediction negative, or the floor is not exercised: {preds:?}"
         );
         for (got, want) in preds.iter().zip(&f_hand) {
-            assert!(
-                (got - want).abs() < 1e-12,
-                "prediction {got} vs hand {want}"
-            );
+            assert!((got - want).abs() < 1e-12, "prediction {got} vs hand {want}");
         }
 
         let s2 = sigma[0] * sigma[0];
@@ -8621,10 +7869,7 @@ mod negative_prediction_tests {
 
         let clean =
             obs_nll_subject_from_preds(&model, &subject, &f_hand, &theta, &sigma, cov, &eta);
-        assert!(
-            clean.abs() < 100.0,
-            "clean control must score normally: {clean}"
-        );
+        assert!(clean.abs() < 100.0, "clean control must score normally: {clean}");
 
         let mut preds = f_hand.clone();
         preds[2] = f64::NAN;
@@ -8658,10 +7903,7 @@ mod negative_prediction_tests {
             )
         };
         let clean = score(&f_hand);
-        assert!(
-            clean.abs() < 100.0,
-            "clean control must score normally: {clean}"
-        );
+        assert!(clean.abs() < 100.0, "clean control must score normally: {clean}");
         let mut preds = f_hand.clone();
         preds[4] = f64::NAN;
         let nll = score(&preds);

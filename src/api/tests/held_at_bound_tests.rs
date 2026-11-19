@@ -40,10 +40,7 @@ fn params_with_every_kind_of_hit() -> ModelParameters {
         theta_lower: vec![0.0, 5.0],
         theta_upper: vec![f64::INFINITY, 500.0],
         omega_fixed: vec![false, false, true],
-        sigma: SigmaVector {
-            values: vec![SIGMA_RAIL.exp()],
-            names: vec!["PROP_ERR".into()],
-        },
+        sigma: SigmaVector { values: vec![SIGMA_RAIL.exp()], names: vec!["PROP_ERR".into()] },
         omega_iov: Some(diag_chol(&[OMEGA_RAIL_L.exp()], &["K_A"])),
         kappa_fixed: vec![false],
         ..crate::types::test_helpers::bare_params(diag_chol(
@@ -64,10 +61,8 @@ fn the_step_holds_collapses_and_nothing_else() {
     assert_eq!(super::held_guard_coordinates(&p), [0, 2, 5, 6]);
 
     let list = super::held_at_bound_list(&p, &[]);
-    let got: Vec<(&str, ParameterKind, usize, usize, HeldReason)> = list
-        .iter()
-        .map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index, h.reason))
-        .collect();
+    let got: Vec<(&str, ParameterKind, usize, usize, HeldReason)> =
+        list.iter().map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index, h.reason)).collect();
     use HeldReason::CollapsedAtGuard as C;
     assert_eq!(
         got,
@@ -116,12 +111,7 @@ fn a_block_diagonal_on_the_rail_is_held_and_its_off_diagonal_runaway_is_not() {
     let list = super::held_at_bound_list(&p, &[]);
     assert_eq!(list.len(), 1);
     assert_eq!(
-        (
-            list[0].name.as_str(),
-            list[0].kind,
-            list[0].index,
-            list[0].packed_index
-        ),
+        (list[0].name.as_str(), list[0].kind, list[0].index, list[0].packed_index),
         ("ETA_V", ParameterKind::Omega, 1, 4)
     );
 }
@@ -168,10 +158,7 @@ fn the_step_reads_the_guard_set_off_the_estimate_not_the_template() {
         &["ETA_A", "ETA_B", "ETA_C"],
     );
     let free: Vec<usize> = (0..6).filter(|&i| i != 4).collect(); // ETA_C is FIX
-    assert_eq!(
-        held_free_positions(&pack_params(&estimate), &start, &free),
-        [2]
-    );
+    assert_eq!(held_free_positions(&pack_params(&estimate), &start, &free), [2]);
     assert!(held_free_positions(&pack_params(&start), &estimate, &free).is_empty());
 }
 
@@ -183,9 +170,7 @@ fn condition_on_held_is_the_sub_block_inverse_embedded_with_zero_rows() {
     let m = DMatrix::from_row_slice(3, 3, &[4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0]);
     let inv = |s: &DMatrix<f64>, _: &[usize]| s.clone().try_inverse();
     let got = condition_on_held(&m, &[1], inv).expect("held");
-    let sub = DMatrix::from_row_slice(2, 2, &[4.0, 0.5, 0.5, 2.0])
-        .try_inverse()
-        .unwrap();
+    let sub = DMatrix::from_row_slice(2, 2, &[4.0, 0.5, 0.5, 2.0]).try_inverse().unwrap();
     for (a, &i) in [0usize, 2].iter().enumerate() {
         for (b, &j) in [0usize, 2].iter().enumerate() {
             assert_eq!(got[(i, j)], sub[(a, b)], "({i},{j})");
@@ -247,11 +232,7 @@ fn cell(collapse: bool, runaway: bool, held: Option<bool>) -> (String, serde_jso
     let mut converged = true;
     let (msg, entry) =
         super::runaway_guard_warning_for(&mut converged, &p, cov.as_ref()).expect("a guard hit");
-    let severity = if runaway {
-        WarningSeverity::Critical
-    } else {
-        WarningSeverity::Warning
-    };
+    let severity = if runaway { WarningSeverity::Critical } else { WarningSeverity::Warning };
     assert_eq!(entry.severity, severity, "{msg}");
     let flat = classify_warning(&msg);
     assert_eq!(flat.category, WarningCode::ParameterAtRunawayGuard, "{msg}");
@@ -262,10 +243,7 @@ fn cell(collapse: bool, runaway: bool, held: Option<bool>) -> (String, serde_jso
 #[test]
 fn collapse_only_clean_r_says_the_other_ses_are_conditional() {
     let (msg, details) = cell(true, false, Some(true));
-    assert!(
-        msg.contains("Their standard errors are not reported; "),
-        "{msg}"
-    );
+    assert!(msg.contains("Their standard errors are not reported; "), "{msg}");
     assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
     assert_eq!(details["parameters"][0]["held"], true);
 }
@@ -273,10 +251,7 @@ fn collapse_only_clean_r_says_the_other_ses_are_conditional() {
 #[test]
 fn collapse_only_floored_r_reports_no_se_and_claims_nothing_about_the_others() {
     let (msg, details) = cell(true, false, Some(false));
-    assert!(
-        msg.ends_with(" Their standard errors are not reported."),
-        "{msg}"
-    );
+    assert!(msg.ends_with(" Their standard errors are not reported."), "{msg}");
     assert!(!msg.contains(HELD_SENTENCE), "{msg}");
     assert_eq!(details["parameters"][0]["held"], false);
 }
@@ -358,10 +333,8 @@ fn mixture_params(ov_omega: bool, ov_sigma: bool, base_v: Option<bool>) -> Model
     let names = ["ETA_CL", "ETA_V"];
     p.omega = diag_chol(&[0.25, l_v], &names);
     p.omega_fixed = vec![false; 2];
-    p.sigma = SigmaVector {
-        values: vec![0.1, 0.2],
-        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
-    };
+    p.sigma =
+        SigmaVector { values: vec![0.1, 0.2], names: vec!["PROP_ERR".into(), "ADD_ERR".into()] };
     p.sigma_fixed = vec![false; 2];
     p.omega_iov = None;
     p.kappa_fixed = Vec::new();
@@ -376,10 +349,7 @@ fn mixture_params(ov_omega: bool, ov_sigma: bool, base_v: Option<bool>) -> Model
         sigma: vec![
             p.sigma.clone(),
             p.sigma.clone(),
-            SigmaVector {
-                values: vec![0.1, ov_s],
-                names: p.sigma.names.clone(),
-            },
+            SigmaVector { values: vec![0.1, ov_s], names: p.sigma.names.clone() },
         ],
         omega_override_addr: vec![(1, 0), (1, 1)],
         omega_override_fixed: vec![false, true],
@@ -402,10 +372,7 @@ fn a_collapsed_mixture_override_is_held_and_a_fix_one_is_not() {
     );
     assert_eq!(super::held_guard_coordinates(&p), [8, 10]);
     // Beside a base collapse, both are held.
-    assert_eq!(
-        super::held_guard_coordinates(&mixture_params(true, true, Some(false))),
-        [5, 8, 10]
-    );
+    assert_eq!(super::held_guard_coordinates(&mixture_params(true, true, Some(false))), [5, 8, 10]);
     // Off the rail (the FIX override still on it): nothing.
     assert!(super::held_guard_coordinates(&mixture_params(false, false, None)).is_empty());
 }
@@ -419,16 +386,7 @@ fn a_held_override_is_listed_with_its_class_and_never_as_the_base() {
     let list = super::held_at_bound_list(&mixture_params(true, true, None), &[]);
     let got: Vec<_> = list
         .iter()
-        .map(|h| {
-            (
-                h.name.as_str(),
-                h.kind,
-                h.index,
-                h.packed_index,
-                h.reason,
-                h.class,
-            )
-        })
+        .map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index, h.reason, h.class))
         .collect();
     use HeldReason::CollapsedAtGuard as C;
     assert_eq!(
@@ -485,8 +443,7 @@ fn applying_a_held_override_leaves_the_base_se_untouched() {
 
 /// One guard-warning cell on `mixture_params` (T6, #2809).
 fn mixture_cell(
-    p: &ModelParameters,
-    cov: Option<DMatrix<f64>>,
+    p: &ModelParameters, cov: Option<DMatrix<f64>>,
 ) -> Option<(String, serde_json::Value)> {
     let mut converged = true;
     super::runaway_guard_warning_for(&mut converged, p, cov.as_ref())
@@ -515,10 +472,7 @@ fn override_collapse_clean_r_is_held_and_named_with_its_class() {
     let p = mixture_params(true, false, None);
     let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[8]))).unwrap();
     names_only_the_override(&msg, "ETA_CL_MIX2", "ETA_CL");
-    assert!(
-        msg.contains("Their standard errors are not reported; "),
-        "{msg}"
-    );
+    assert!(msg.contains("Their standard errors are not reported; "), "{msg}");
     assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
     assert_eq!(held_of(&details, "ETA_CL_MIX2"), true);
 }
@@ -528,10 +482,7 @@ fn override_collapse_floored_r_reports_no_se_and_claims_no_hold() {
     let p = mixture_params(true, false, None);
     let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[]))).unwrap();
     names_only_the_override(&msg, "ETA_CL_MIX2", "ETA_CL");
-    assert!(
-        msg.ends_with(" Their standard errors are not reported."),
-        "{msg}"
-    );
+    assert!(msg.ends_with(" Their standard errors are not reported."), "{msg}");
     assert!(!msg.contains(HELD_SENTENCE), "{msg}");
     assert_eq!(held_of(&details, "ETA_CL_MIX2"), false);
 }
@@ -567,10 +518,7 @@ fn base_and_override_collapse_clean_r_holds_both() {
     let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[5, 8]))).unwrap();
     assert!(msg.contains("ETA_V"), "{msg}");
     assert!(msg.contains("ETA_CL_MIX2"), "{msg}");
-    assert!(
-        msg.contains("Their standard errors are not reported; "),
-        "{msg}"
-    );
+    assert!(msg.contains("Their standard errors are not reported; "), "{msg}");
     assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
     assert_eq!(held_of(&details, "ETA_V"), true);
     assert_eq!(held_of(&details, "ETA_CL_MIX2"), true);
@@ -595,15 +543,10 @@ fn sigma_override_collapse_clean_r_is_held_and_named_with_its_class() {
     // the warning would claim a hold nothing records.
     let list = super::held_at_bound_list(&p, &[]);
     assert_eq!(
-        list.iter()
-            .map(|h| (h.name.as_str(), h.kind, h.index, h.class))
-            .collect::<Vec<_>>(),
+        list.iter().map(|h| (h.name.as_str(), h.kind, h.index, h.class)).collect::<Vec<_>>(),
         [("ADD_ERR_MIX3", ParameterKind::Sigma, 1, Some(3))]
     );
-    assert!(
-        msg.contains("Their standard errors are not reported; "),
-        "{msg}"
-    );
+    assert!(msg.contains("Their standard errors are not reported; "), "{msg}");
     assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
     assert_eq!(held_of(&details, "ADD_ERR_MIX3"), true);
 }

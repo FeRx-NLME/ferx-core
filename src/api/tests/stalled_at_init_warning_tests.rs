@@ -32,10 +32,7 @@ fn a_fit_that_moved_produces_no_warning() {
     let mut r = stalled_result();
     // One free theta 2% away from its start is enough to have left init.
     r.theta[0] = r.theta_init[0] * 1.02;
-    assert!(
-        estimating_fit_warning(&r).is_none(),
-        "a fit that moved must not be flagged"
-    );
+    assert!(estimating_fit_warning(&r).is_none(), "a fit that moved must not be flagged");
 }
 
 #[test]
@@ -51,10 +48,7 @@ fn a_fit_that_never_moved_is_flagged_with_its_own_category() {
     );
     // The message has to name what did not move, or the user has nothing to act
     // on — a bare "the fit stalled" is the `converged: true` problem restated.
-    assert!(
-        msg.contains("CL"),
-        "the unmoved free THETA must be named: {msg}"
-    );
+    assert!(msg.contains("CL"), "the unmoved free THETA must be named: {msg}");
 }
 
 /// `rebuild_warnings_structured` re-classifies any message it has no native
@@ -118,15 +112,8 @@ fn the_details_list_free_thetas_with_their_initial_values_and_skip_fixed_ones() 
     let d = entry.details.as_ref().expect("details payload");
     let thetas = d["theta"].as_array().expect("theta array");
 
-    let names: Vec<&str> = thetas
-        .iter()
-        .map(|t| t["parameter"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        names,
-        vec!["CL", "KA"],
-        "the FIXed theta must not be listed as unmoved"
-    );
+    let names: Vec<&str> = thetas.iter().map(|t| t["parameter"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["CL", "KA"], "the FIXed theta must not be listed as unmoved");
     assert_eq!(thetas[0]["estimate"], r.theta[0]);
     assert_eq!(thetas[0]["init"], r.theta_init[0]);
 }
@@ -158,31 +145,19 @@ fn only_a_chain_with_no_estimating_stage_is_exempt() {
     use EstimationMethod::{FoceI, Imp, Impmap, Laplace};
     let mut r = stalled_result();
     r.outer_maxiter = 500;
-    let single = |method| FitOptions {
-        method,
-        ..Default::default()
-    };
+    let single = |method| FitOptions { method, ..Default::default() };
     let chain = |methods: &[EstimationMethod]| FitOptions {
         methods: methods.to_vec(),
         ..Default::default()
     };
-    let imp_eval = |o: FitOptions| FitOptions {
-        imp_eval_only: true,
-        ..o
-    };
-    let agq_eval = |o: FitOptions| FitOptions {
-        agq_eval_only: true,
-        ..o
-    };
+    let imp_eval = |o: FitOptions| FitOptions { imp_eval_only: true, ..o };
+    let agq_eval = |o: FitOptions| FitOptions { agq_eval_only: true, ..o };
 
     for (name, opts) in [
         ("standalone imp_eval_only", imp_eval(single(Imp))),
         ("standalone imp_eval_only, chain", imp_eval(chain(&[Imp]))),
         ("standalone agq_eval_only", agq_eval(single(Laplace))),
-        (
-            "standalone agq_eval_only, chain",
-            agq_eval(chain(&[Laplace])),
-        ),
+        ("standalone agq_eval_only, chain", agq_eval(chain(&[Laplace]))),
     ] {
         assert!(
             stalled_at_init_warning(&r, &opts).is_none(),
@@ -197,10 +172,7 @@ fn only_a_chain_with_no_estimating_stage_is_exempt() {
         ("focei then agq readout", agq_eval(chain(&[FoceI, Laplace]))),
         ("inert imp_eval_only on focei", imp_eval(single(FoceI))),
         ("inert imp_eval_only on laplace", imp_eval(single(Laplace))),
-        (
-            "imp_eval_only leaves impmap estimating",
-            imp_eval(single(Impmap)),
-        ),
+        ("imp_eval_only leaves impmap estimating", imp_eval(single(Impmap))),
     ] {
         assert!(
             stalled_at_init_warning(&r, &opts).is_some(),
@@ -229,11 +201,7 @@ fn standalone_evaluators_report_no_stall_through_fit() {
         exclusions: None,
         warnings: Vec::new(),
     };
-    let base = FitOptions {
-        run_covariance_step: false,
-        threads: Some(1),
-        ..Default::default()
-    };
+    let base = FitOptions { run_covariance_step: false, threads: Some(1), ..Default::default() };
     for (name, opts) in [
         (
             "imp_eval_only",
@@ -247,11 +215,7 @@ fn standalone_evaluators_report_no_stall_through_fit() {
         ),
         (
             "agq_eval_only",
-            FitOptions {
-                method: EstimationMethod::Laplace,
-                agq_eval_only: true,
-                ..base.clone()
-            },
+            FitOptions { method: EstimationMethod::Laplace, agq_eval_only: true, ..base.clone() },
         ),
     ] {
         let r = fit(&model, &pop, &model.default_params, &opts).expect("fit");
@@ -267,9 +231,7 @@ fn standalone_evaluators_report_no_stall_through_fit() {
             r.warnings
         );
         assert!(
-            !r.warnings_structured
-                .iter()
-                .any(|e| e.category == WarningCode::StalledAtInit),
+            !r.warnings_structured.iter().any(|e| e.category == WarningCode::StalledAtInit),
             "{name}: {:?}",
             r.warnings_structured
         );
@@ -296,10 +258,7 @@ fn the_message_hedges_on_a_start_that_was_not_verified() {
     r.left_init = Some(false);
 
     r.stationary_start = true;
-    assert!(
-        estimating_fit_warning(&r).is_none(),
-        "a start the optimizer verified is not a stall"
-    );
+    assert!(estimating_fit_warning(&r).is_none(), "a start the optimizer verified is not a stall");
 
     for (left, label) in [(Some(false), "unverified"), (None, "natural scale")] {
         r.left_init = left;

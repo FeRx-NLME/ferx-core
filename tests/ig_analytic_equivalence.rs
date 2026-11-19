@@ -149,13 +149,7 @@ fn population(doses: Vec<DoseEvent>, obs_times: Vec<f64>) -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            doses,
-            obs_times,
-            vec![0.0; n],
-            vec![2; n],
-        )],
+        subjects: vec![common::subject("1", doses, obs_times, vec![0.0; n], vec![2; n])],
     }
 }
 
@@ -171,10 +165,7 @@ fn assert_equiv(an_src: &str, ode_src: &str, label: &str, pop: &Population, rtol
         .unwrap_or_else(|e| panic!("[{label}] ODE IG did not parse: {e}"))
         .model;
     // The analytic model must actually be the closed form (not silently an ODE).
-    assert!(
-        an.ode_spec.is_none(),
-        "[{label}] analytic model must be a closed form, not an ODE"
-    );
+    assert!(an.ode_spec.is_none(), "[{label}] analytic model must be a closed form, not an ODE");
 
     let pa = predict(&an, pop, &an.default_params).unwrap();
     let po = predict(&ode, pop, &ode.default_params).unwrap();
@@ -203,10 +194,7 @@ fn assert_equiv(an_src: &str, ode_src: &str, label: &str, pop: &Population, rtol
 
 #[test]
 fn ig_1cpt_single_dose_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let (a, o) = build_pair_1cpt(false, false);
     assert_equiv(&a, &o, "1cpt-single", &pop, RTOL);
 }
@@ -216,13 +204,7 @@ fn ig_1cpt_multidose_matches_ode() {
     let doses = vec![bolus(0.0, 100.0), bolus(12.0, 100.0), bolus(24.0, 100.0)];
     let obs = vec![0.5, 2.0, 6.0, 11.5, 13.0, 18.0, 23.5, 26.0, 36.0, 48.0];
     let (a, o) = build_pair_1cpt(false, false);
-    assert_equiv(
-        &a,
-        &o,
-        "1cpt-multidose",
-        &population(doses, obs),
-        ACCUM_RTOL,
-    );
+    assert_equiv(&a, &o, "1cpt-multidose", &population(doses, obs), ACCUM_RTOL);
 }
 
 #[test]
@@ -276,10 +258,7 @@ fn ig_flipflop_lag_f_autoroutes_and_matches_twin() {
         an.absorption_ode_equivalent.is_some(),
         "a flip-flop lag/f IG closed form must now auto-route to an ODE twin (#735)"
     );
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let pa = predict(&an, &pop, &an.default_params).unwrap();
     assert!(
         pa.iter().map(|p| p.pred).fold(0.0_f64, f64::max) > 0.01,
@@ -310,17 +289,10 @@ fn ig_flipflop_noncanonical_lag_f_alias_matches_canonical() {
              [error_model]\n  DV ~ proportional(PROP)\n"
         )
     };
-    let canonical = parse_full_model(&mk("LAGTIME", "F"))
-        .expect("canonical parses")
-        .model;
-    let aliased = parse_full_model(&mk("LAG", "FBIO"))
-        .expect("aliased parses")
-        .model;
+    let canonical = parse_full_model(&mk("LAGTIME", "F")).expect("canonical parses").model;
+    let aliased = parse_full_model(&mk("LAG", "FBIO")).expect("aliased parses").model;
     assert!(aliased.absorption_ode_equivalent.is_some());
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let pc = predict(&canonical, &pop, &canonical.default_params).unwrap();
     let pl = predict(&aliased, &pop, &aliased.default_params).unwrap();
     assert_eq!(pc.len(), pl.len());
@@ -340,10 +312,7 @@ fn ig_flipflop_noncanonical_lag_f_alias_matches_canonical() {
 
 #[test]
 fn ig_2cpt_single_dose_matches_ode() {
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let (a, o) = build_pair_2cpt(false, false);
     assert_equiv(&a, &o, "2cpt-single", &pop, RTOL);
 }
@@ -353,13 +322,7 @@ fn ig_2cpt_multidose_lag_fbio_match_ode() {
     let doses = vec![bolus(0.0, 100.0), bolus(12.0, 100.0), bolus(24.0, 100.0)];
     let obs = vec![0.5, 2.0, 6.0, 11.5, 13.0, 18.0, 24.5, 30.0, 36.0, 48.0];
     let (a, o) = build_pair_2cpt(true, true);
-    assert_equiv(
-        &a,
-        &o,
-        "2cpt-multi-lag+f",
-        &population(doses, obs),
-        ACCUM_RTOL,
-    );
+    assert_equiv(&a, &o, "2cpt-multi-lag+f", &population(doses, obs), ACCUM_RTOL);
 }
 
 // ── Low CV (#2769) ───────────────────────────────────────────────────────────
@@ -401,10 +364,7 @@ fn ig_low_cv_matches_ode_twin() {
             let pop = population(doses(), obs(mat));
             let an = parse_full_model(&a).unwrap().model;
             let od = parse_full_model(&o).unwrap().model;
-            assert!(
-                an.ode_spec.is_none(),
-                "[{label} cv={cv}] must be the closed form"
-            );
+            assert!(an.ode_spec.is_none(), "[{label} cv={cv}] must be the closed form");
             let pa = predict(&an, &pop, &an.default_params).unwrap();
             let po = predict(&od, &pop, &od.default_params).unwrap();
             assert_eq!(pa.len(), po.len());
@@ -465,9 +425,7 @@ fn ig_flip_flop_reroutes_to_ode_twin() {
          [scaling]\n  obs_scale = V\n\n\
          [error_model]\n  DV ~ proportional(PROP)\n"
     );
-    let an = parse_full_model(&analytic)
-        .expect("analytic IG parses")
-        .model;
+    let an = parse_full_model(&analytic).expect("analytic IG parses").model;
     let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
     // The plain form stays closed-form but carries the ODE twin the flip-flop
     // reroute uses per subject.
@@ -475,19 +433,13 @@ fn ig_flip_flop_reroutes_to_ode_twin() {
         an.ode_spec.is_none() && an.absorption_ode_equivalent.is_some(),
         "plain IG carries an ODE twin (primary stays closed-form)"
     );
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0]);
     let pa = predict(&an, &pop, &an.default_params).unwrap();
     let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(pa.len(), ph.len());
     assert!(!pa.is_empty());
     // Non-degenerate (the reroute avoids the closed form's spurious zero).
-    assert!(
-        pa.iter().any(|x| x.pred.abs() > 1e-6),
-        "reroute produced all-zero"
-    );
+    assert!(pa.iter().any(|x| x.pred.abs() > 1e-6), "reroute produced all-zero");
     for (x, y) in pa.iter().zip(ph.iter()) {
         let tol = ATOL + ACCUM_RTOL * x.pred.abs();
         assert!(
@@ -535,18 +487,13 @@ fn ig_time_desugar_matches_hand_written_ode() {
          [scaling]\n  obs_scale = V\n\n\
          [error_model]\n  DV ~ proportional(PROP)\n"
     );
-    let sh = parse_full_model(&shorthand)
-        .expect("shorthand IG+TIME parses")
-        .model;
+    let sh = parse_full_model(&shorthand).expect("shorthand IG+TIME parses").model;
     let hd = parse_full_model(&hand_ode).expect("hand ODE parses").model;
     assert!(
         sh.ode_spec.is_none() && sh.absorption_ode_equivalent.is_some(),
         "IG + TIME shorthand carries an ODE equivalent (primary stays closed-form)"
     );
-    let pop = population(
-        vec![bolus(0.0, 100.0)],
-        vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0],
-    );
+    let pop = population(vec![bolus(0.0, 100.0)], vec![0.5, 2.0, 4.0, 5.9, 6.1, 8.0, 12.0, 24.0]);
     let ps = predict(&sh, &pop, &sh.default_params).unwrap();
     let ph = predict(&hd, &pop, &hd.default_params).unwrap();
     assert_eq!(ps.len(), ph.len());
@@ -577,10 +524,9 @@ fn ig_ofv_matches_ode() {
     const OFV_RTOL: f64 = 3e-3;
 
     let obs_t = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 24.0];
-    for (label, (an_src, ode_src)) in [
-        ("1cpt", build_pair_1cpt(false, false)),
-        ("2cpt", build_pair_2cpt(false, false)),
-    ] {
+    for (label, (an_src, ode_src)) in
+        [("1cpt", build_pair_1cpt(false, false)), ("2cpt", build_pair_2cpt(false, false))]
+    {
         let an = parse_full_model(&an_src).unwrap().model;
         let ode = parse_full_model(&ode_src).unwrap().model;
 
@@ -647,11 +593,7 @@ fn ig_fit_runs_and_converges() {
     opts.method = EstimationMethod::FoceI;
     opts.run_covariance_step = false;
     let r = fit(&model, &pop, &model.default_params, &opts).expect("analytic IG fit ok");
-    assert!(
-        r.ofv.is_finite(),
-        "IG fit OFV must be finite, got {}",
-        r.ofv
-    );
+    assert!(r.ofv.is_finite(), "IG fit OFV must be finite, got {}", r.ofv);
 }
 
 // ── Restrictions: features the closed form does not support are rejected up front ─
@@ -710,32 +652,20 @@ fn ig_cmt_zero_is_the_default_depot_not_rejected() {
     let obs = vec![1.0, 4.0, 8.0];
     let depot = predict(
         &model,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            obs.clone(),
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], obs.clone()),
         &model.default_params,
     )
     .unwrap();
     let default_cmt = predict(
         &model,
-        &population(
-            vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)],
-            obs.clone(),
-        ),
+        &population(vec![DoseEvent::new(0.0, 100.0, 0, 0.0, false, 0.0)], obs.clone()),
         &model.default_params,
     )
     .unwrap();
-    assert!(
-        depot.iter().any(|p| p.pred > 0.0),
-        "control must be non-trivial"
-    );
+    assert!(depot.iter().any(|p| p.pred > 0.0), "control must be non-trivial");
     assert_eq!(default_cmt.len(), depot.len());
     for (a, b) in default_cmt.iter().zip(depot.iter()) {
-        assert_eq!(
-            a.pred, b.pred,
-            "CMT=0 must predict like the CMT=1 depot dose"
-        );
+        assert_eq!(a.pred, b.pred, "CMT=0 must predict like the CMT=1 depot dose");
     }
 }
 
@@ -804,10 +734,8 @@ fn build_iov_pair_2cpt() -> (String, String) {
 /// drug on board at occ 1's observations, t=13/18) — the case a per-dose superposition gets
 /// wrong (#104), so occ 1's `KAPPA_CL` must govern that tail via the twin's integration.
 fn iov_subject() -> Population {
-    let mut pop = population(
-        vec![bolus(0.0, 100.0), bolus(12.0, 100.0)],
-        vec![1.0, 6.0, 13.0, 18.0],
-    );
+    let mut pop =
+        population(vec![bolus(0.0, 100.0), bolus(12.0, 100.0)], vec![1.0, 6.0, 13.0, 18.0]);
     pop.subjects[0].occasions = vec![0, 0, 1, 1];
     pop.subjects[0].dose_occasions = vec![0, 1];
     pop
@@ -824,10 +752,7 @@ fn assert_iov_matches_ode(an_src: &str, ode_src: &str, label: &str) {
         .unwrap_or_else(|e| panic!("[{label}] ODE IG IOV parses: {e}"))
         .model;
     assert_eq!(an.n_kappa, 1, "[{label}] one IOV kappa");
-    assert!(
-        an.absorption_ode_equivalent.is_some(),
-        "[{label}] IG IOV carries an ODE twin"
-    );
+    assert!(an.absorption_ode_equivalent.is_some(), "[{label}] IG IOV carries an ODE twin");
     let pop = iov_subject();
     let subject = &pop.subjects[0];
     assert!(
@@ -877,10 +802,7 @@ fn ig_iov_now_served_and_drives_analytic_sens() {
     let (an_src, _) = build_iov_pair_1cpt();
     let model = parse_full_model(&an_src).expect("IG IOV parses").model;
     assert_eq!(model.n_kappa, 1);
-    assert!(
-        model.absorption_ode_equivalent.is_some(),
-        "IG IOV carries an ODE twin"
-    );
+    assert!(model.absorption_ode_equivalent.is_some(), "IG IOV carries an ODE twin");
     let template = iov_subject();
     let base = predict(&model, &template, &model.default_params).unwrap();
     // Two IOV subjects (each with two occasions) so the fit is identifiable; observations are
@@ -895,10 +817,7 @@ fn ig_iov_now_served_and_drives_analytic_sens() {
             s
         })
         .collect();
-    let pop = Population {
-        subjects,
-        ..template
-    };
+    let pop = Population { subjects, ..template };
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::FoceI;
     opts.outer_maxiter = 2;

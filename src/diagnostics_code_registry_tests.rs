@@ -19,16 +19,14 @@ fn is_code(word: &str) -> bool {
         && (b[0] == b'E' || b[0] == b'W')
         && b[1] == b'_'
         && b[2].is_ascii_uppercase()
-        && b.iter()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_')
+        && b.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == b'_')
         && b[b.len() - 1] != b'_'
 }
 
 /// The codes in `line`: its maximal `[A-Za-z0-9_]` runs that are codes, so
 /// `W_TYPICAL_PK_{}` (an NN weight's name template) and `xE_FOO` are not.
 fn code_tokens(line: &str) -> impl Iterator<Item = &str> {
-    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|w| is_code(w))
+    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|w| is_code(w))
 }
 
 /// Code → first `file:line` emitting it in the non-test code under `root/src`.
@@ -47,9 +45,7 @@ fn emitted(root: &Path) -> BTreeMap<String, String> {
                 continue;
             }
             for code in code_tokens(line) {
-                found
-                    .entry(code.to_string())
-                    .or_insert_with(|| format!("{rel}:{}", i + 1));
+                found.entry(code.to_string()).or_insert_with(|| format!("{rel}:{}", i + 1));
             }
         }
     }
@@ -68,11 +64,8 @@ fn info_emitted(root: &Path) -> BTreeSet<String> {
             let Some((_, rest)) = line.split_once("Diagnostic::info(") else {
                 continue;
             };
-            let arg = if rest.trim().is_empty() {
-                lines.get(i + 1).copied().unwrap_or("")
-            } else {
-                rest
-            };
+            let arg =
+                if rest.trim().is_empty() { lines.get(i + 1).copied().unwrap_or("") } else { rest };
             found.extend(code_tokens(arg).take(1).map(str::to_string));
         }
     }
@@ -106,10 +99,8 @@ fn table_rows(text: &str, prefix: &str) -> BTreeMap<String, Vec<String>> {
 
 /// Every way the two registries can disagree with the emitted codes, one line each.
 fn registry_problems(
-    emitted: &BTreeMap<String, String>,
-    info: &BTreeSet<String>,
-    registry: &BTreeMap<String, Vec<String>>,
-    docs: &BTreeMap<String, Vec<String>>,
+    emitted: &BTreeMap<String, String>, info: &BTreeSet<String>,
+    registry: &BTreeMap<String, Vec<String>>, docs: &BTreeMap<String, Vec<String>>,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     for (code, site) in emitted {
@@ -119,9 +110,7 @@ fn registry_problems(
             ));
         }
         if !docs.contains_key(code) {
-            problems.push(format!(
-                "{code} (emitted at {site}) has no row in {DOCS}'s code tables"
-            ));
+            problems.push(format!("{code} (emitted at {site}) has no row in {DOCS}'s code tables"));
         }
     }
     for (table, rows) in [(REGISTRY, registry), (DOCS, docs)] {
@@ -147,9 +136,8 @@ fn registry_problems(
             ("warning", "a W_ code")
         };
         for got in cells.iter().filter(|c| c.as_str() != want) {
-            problems.push(format!(
-                "{code}'s row in {DOCS} says severity `{got}`; {kind} is `{want}`"
-            ));
+            problems
+                .push(format!("{code}'s row in {DOCS} says severity `{got}`; {kind} is `{want}`"));
         }
     }
     problems
@@ -163,10 +151,7 @@ fn every_emitted_code_has_a_row_in_both_registries() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let emitted = emitted(root);
     let info = info_emitted(root);
-    assert!(
-        info.contains("W_LEVEL_SUMMARY"),
-        "the info scan missed W_LEVEL_SUMMARY: {info:?}"
-    );
+    assert!(info.contains("W_LEVEL_SUMMARY"), "the info scan missed W_LEVEL_SUMMARY: {info:?}");
     let registry = table_rows(
         &std::fs::read_to_string(root.join(REGISTRY)).expect("read the registry"),
         "//! ",
@@ -179,10 +164,7 @@ fn every_emitted_code_has_a_row_in_both_registries() {
     // green result is not three empty sets agreeing.
     for code in ["E_PARSE", "W_MISSING_DV", "E_DERIVED_NAME_CONFLICT"] {
         assert!(emitted.contains_key(code), "the scan missed {code}");
-        assert!(
-            registry.contains_key(code),
-            "the registry parse missed {code}"
-        );
+        assert!(registry.contains_key(code), "the registry parse missed {code}");
         assert!(docs.contains_key(code), "the docs parse missed {code}");
     }
     let problems = registry_problems(&emitted, &info, &registry, &docs);
@@ -217,20 +199,13 @@ fn the_scan_sees_planted_codes_and_skips_the_rest() {
     )
     .unwrap();
     std::fs::write(src.join("a_tests.rs"), "fn t() { e(\"E_IN_SIBLING\"); }\n").unwrap();
-    std::fs::write(
-        src.join("tests").join("b.rs"),
-        "fn t() { e(\"E_IN_TESTS_DIR\"); }\n",
-    )
-    .unwrap();
+    std::fs::write(src.join("tests").join("b.rs"), "fn t() { e(\"E_IN_TESTS_DIR\"); }\n").unwrap();
     let found = emitted(&dir);
     let info = info_emitted(&dir);
     std::fs::remove_dir_all(&dir).ok();
     assert_eq!(
         info,
-        BTreeSet::from([
-            "W_INFO_NEXT_LINE".to_string(),
-            "W_INFO_SAME_LINE".to_string()
-        ])
+        BTreeSet::from(["W_INFO_NEXT_LINE".to_string(), "W_INFO_SAME_LINE".to_string()])
     );
     let codes: BTreeSet<&str> = found.keys().map(String::as_str).collect();
     assert_eq!(

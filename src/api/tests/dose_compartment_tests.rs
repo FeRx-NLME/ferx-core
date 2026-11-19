@@ -49,10 +49,7 @@ fn bolus(cmt: usize) -> DoseEvent {
 }
 
 fn codes(model: &CompiledModel, population: &Population) -> Vec<String> {
-    check_dose_compartments(model, population)
-        .into_iter()
-        .map(|d| d.code)
-        .collect()
+    check_dose_compartments(model, population).into_iter().map(|d| d.code).collect()
 }
 
 // ── the reported case: infusion into a compartment the walk cannot route ──
@@ -64,11 +61,9 @@ fn codes(model: &CompiledModel, population: &Population) -> Vec<String> {
 /// and, exactly, against an ODE twin (`tests/oral_peripheral_infusion.rs`).
 #[test]
 fn infusion_into_oral_peripheral_is_supported() {
-    for (pk_model, cmt) in [
-        (PkModel::TwoCptOral, 3),
-        (PkModel::ThreeCptOral, 3),
-        (PkModel::ThreeCptOral, 4),
-    ] {
+    for (pk_model, cmt) in
+        [(PkModel::TwoCptOral, 3), (PkModel::ThreeCptOral, 3), (PkModel::ThreeCptOral, 4)]
+    {
         let model = model_with(pk_model);
         let population = population_with_doses(vec![infusion(cmt)]);
         assert!(
@@ -164,11 +159,7 @@ fn rejection_message_names_the_subject_time_and_infusable_set() {
 /// must not regress it.
 #[test]
 fn infusion_into_oral_depot_is_accepted() {
-    for pk_model in [
-        PkModel::OneCptOral,
-        PkModel::TwoCptOral,
-        PkModel::ThreeCptOral,
-    ] {
+    for pk_model in [PkModel::OneCptOral, PkModel::TwoCptOral, PkModel::ThreeCptOral] {
         let model = model_with(pk_model);
         let population = population_with_doses(vec![infusion(1)]);
         assert!(
@@ -281,18 +272,9 @@ fn the_ode_out_of_range_message_names_the_declared_states() {
     let population = population_with_doses(vec![bolus(3)]);
     let diags = check_dose_compartments(&model, &population);
     let msg = &diags[0].message;
-    assert!(
-        msg.contains("depot"),
-        "should name the declared states: {msg}"
-    );
-    assert!(
-        msg.contains("central"),
-        "should name the declared states: {msg}"
-    );
-    assert!(
-        msg.contains("only 2 state(s)"),
-        "should give the declared state count: {msg}"
-    );
+    assert!(msg.contains("depot"), "should name the declared states: {msg}");
+    assert!(msg.contains("central"), "should name the declared states: {msg}");
+    assert!(msg.contains("only 2 state(s)"), "should give the declared state count: {msg}");
     assert_eq!(diags[0].block.as_deref(), Some("odes"));
 }
 
@@ -308,10 +290,7 @@ fn every_declared_ode_state_accepts_a_bolus_and_an_infusion() {
     for cmt in 1..=n {
         for dose in [bolus(cmt), infusion(cmt)] {
             let population = population_with_doses(vec![dose]);
-            assert!(
-                codes(&model, &population).is_empty(),
-                "ODE cmt {cmt} should be accepted"
-            );
+            assert!(codes(&model, &population).is_empty(), "ODE cmt {cmt} should be accepted");
         }
     }
 }
@@ -357,12 +336,9 @@ fn ode_zero_amount_doses_follow_the_same_split_as_analytical() {
 /// that.
 #[test]
 fn transit_and_ig_infusions_are_not_rejected_by_the_routing_check() {
-    for pk_model in [
-        PkModel::OneCptTransit,
-        PkModel::TwoCptTransit,
-        PkModel::OneCptIg,
-        PkModel::TwoCptIg,
-    ] {
+    for pk_model in
+        [PkModel::OneCptTransit, PkModel::TwoCptTransit, PkModel::OneCptIg, PkModel::TwoCptIg]
+    {
         let model = model_with(pk_model);
         let population = population_with_doses(vec![infusion(1)]);
         assert!(
@@ -387,13 +363,8 @@ fn transit_bolus_range_is_still_checked() {
 #[test]
 fn errors_are_deduped_per_kind_and_compartment() {
     let model = model_with(PkModel::TwoCptOral);
-    let population = population_with_doses(vec![
-        infusion(0),
-        infusion(0),
-        infusion(0),
-        bolus(9),
-        bolus(9),
-    ]);
+    let population =
+        population_with_doses(vec![infusion(0), infusion(0), infusion(0), bolus(9), bolus(9)]);
     assert_eq!(
         codes(&model, &population),
         vec!["E_DOSE_CMT_NOT_INFUSABLE", "E_DOSE_CMT_OUT_OF_RANGE"]
@@ -455,10 +426,7 @@ fn a_zero_amount_dose_is_exempt_from_the_routing_rule_but_not_the_range_rule() {
     // Exempting it here made `ferx check` bless the dataset and `fit()` abort.
     let mut bol = bolus(9); // cmt 9 is past the end of the 3-state model
     bol.amt = 0.0;
-    assert_eq!(
-        codes(&model, &population_with_doses(vec![bol])),
-        vec!["E_DOSE_CMT_OUT_OF_RANGE"],
-    );
+    assert_eq!(codes(&model, &population_with_doses(vec![bol])), vec!["E_DOSE_CMT_OUT_OF_RANGE"],);
 }
 
 // ── wiring ──
@@ -545,15 +513,12 @@ fn a_non_finite_lagtime_at_typical_values_is_rejected_at_fit_init() {
         "the fixture must overflow, or there is nothing to reject"
     );
     let diags = crate::api::check_model_data(&model, &pop);
-    let hit = diags
-        .iter()
-        .find(|d| d.code == "E_DOSE_ATTR_NONFINITE")
-        .unwrap_or_else(|| {
-            panic!(
-                "expected E_DOSE_ATTR_NONFINITE, got {:?}",
-                diags.iter().map(|d| &d.code).collect::<Vec<_>>()
-            )
-        });
+    let hit = diags.iter().find(|d| d.code == "E_DOSE_ATTR_NONFINITE").unwrap_or_else(|| {
+        panic!(
+            "expected E_DOSE_ATTR_NONFINITE, got {:?}",
+            diags.iter().map(|d| &d.code).collect::<Vec<_>>()
+        )
+    });
     assert!(
         hit.message.contains("subject 1"),
         "the diagnostic must name the offending subject: {}",
@@ -688,29 +653,17 @@ fn assert_consequence_and_causes(what: &str, msg: &str) {
             "makes the subject's whole integration timeline non-finite and every prediction NaN",
             "the consequence: the subject's predictions are NaN",
         ),
-        (
-            "the subject is repelled as a diverged solve",
-            "the consequence: the subject is repelled",
-        ),
+        ("the subject is repelled as a diverged solve", "the consequence: the subject is repelled"),
         (
             "a covariate missing at that record (a missing value is NaN, and NaN passes \
              through arithmetic, `^` and `exp`)",
             "the missing-covariate cause",
         ),
-        (
-            "a fractional power of a negative value",
-            "the negative-power cause",
-        ),
+        ("a fractional power of a negative value", "the negative-power cause"),
         ("overflowing `exp(...)`", "the exp-overflow cause"),
-        (
-            "Check this subject's covariate values at that record",
-            "the remedy",
-        ),
+        ("Check this subject's covariate values at that record", "the remedy"),
     ] {
-        assert!(
-            msg.contains(needle),
-            "{what}: message must state {why}: {msg}"
-        );
+        assert!(msg.contains(needle), "{what}: message must state {why}: {msg}");
     }
     for stale in [
         "never reaches you",
@@ -769,10 +722,7 @@ fn a_missing_or_negative_covariate_under_a_power_is_rejected_on_the_same_message
         );
         let msg = dose_attr_nonfinite_message(&model, &population_with_wt(wt))
             .unwrap_or_else(|| panic!("{case}: ALAG1 = NaN must be rejected"));
-        assert!(
-            msg.contains("lag time"),
-            "{case}: must name the attribute: {msg}"
-        );
+        assert!(msg.contains("lag time"), "{case}: must name the attribute: {msg}");
         assert!(msg.contains("is NaN"), "{case}: must name the value: {msg}");
         assert_consequence_and_causes(case, &msg);
     }

@@ -106,10 +106,7 @@ fn ig_analytic_marginal_ofv_matches_nonmem_at_their_optimum() {
         .expect("analytic inverse-Gaussian model must parse")
         .model;
     // The model must be the closed form (not silently rerouted to an ODE at parse).
-    assert!(
-        model.ode_spec.is_none(),
-        "pk one_cpt_ig must be the analytic closed form, not an ODE"
-    );
+    assert!(model.ode_spec.is_none(), "pk one_cpt_ig must be the analytic closed form, not an ODE");
     let pop = read_nonmem_csv(Path::new("data/ig_indomain_oral.csv"), None, None)
         .expect("ig_indomain data must load");
 
@@ -123,11 +120,7 @@ fn ig_analytic_marginal_ofv_matches_nonmem_at_their_optimum() {
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("analytic IG fit must run");
 
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(
         (result.ofv - NONMEM_OFV).abs() < TOLERANCE,
         "ferx FOCEI objective {:.3} for the analytic `pk one_cpt_ig` closed form at NONMEM's \
@@ -153,9 +146,8 @@ fn ig_ode_marginal_ofv_matches_nonmem_at_their_optimum() {
     const NONMEM_OFV: f64 = -1303.639;
     const TOLERANCE: f64 = 1.0;
 
-    let model = parse_full_model(&ode_model())
-        .expect("ODE inverse-Gaussian model must parse")
-        .model;
+    let model =
+        parse_full_model(&ode_model()).expect("ODE inverse-Gaussian model must parse").model;
     assert!(model.ode_spec.is_some(), "must be the ODE `igd()` form");
     let pop = read_nonmem_csv(Path::new("data/ig_indomain_oral.csv"), None, None)
         .expect("ig_indomain data must load");
@@ -171,11 +163,7 @@ fn ig_ode_marginal_ofv_matches_nonmem_at_their_optimum() {
     opts.ode_abstol = 1e-9;
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("ODE IG fit must run");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(
         (result.ofv - NONMEM_OFV).abs() < TOLERANCE,
         "ferx FOCEI objective {:.3} for the ODE `igd()` form at NONMEM's in-domain optimum is \

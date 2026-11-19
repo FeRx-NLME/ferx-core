@@ -72,10 +72,8 @@ fn iiv_on_ruv_parses_and_wires_eta() {
 /// above, must not be refused for this reason.
 #[test]
 fn iiv_on_ruv_rejects_an_eta_shared_inside_one_exp() {
-    let src = iiv_on_ruv_src().replace(
-        "CL = TVCL * exp(ETA_CL)",
-        "CL = TVCL * exp(ETA_CL + ETA_RUV)",
-    );
+    let src =
+        iiv_on_ruv_src().replace("CL = TVCL * exp(ETA_CL)", "CL = TVCL * exp(ETA_CL + ETA_RUV)");
     assert_ne!(src, iiv_on_ruv_src(), "fixture must actually share the eta");
     let shared = parse_model_string(&src).expect("parses");
     assert!(
@@ -135,11 +133,7 @@ fn iiv_on_ruv_focei_runs_and_reports_extra_omega() {
     assert_eq!(result.omega.nrows(), 4);
     assert_eq!(result.omega.ncols(), 4);
     // Its variance stays finite and positive across the (short) run.
-    let idx = result
-        .eta_names
-        .iter()
-        .position(|n| n == "ETA_RUV")
-        .unwrap();
+    let idx = result.eta_names.iter().position(|n| n == "ETA_RUV").unwrap();
     assert!(
         result.omega[(idx, idx)].is_finite() && result.omega[(idx, idx)] > 0.0,
         "ETA_RUV variance must be finite/positive, got {}",
@@ -171,11 +165,7 @@ fn iiv_on_ruv_impmap_runs_and_reports_is_marginal() {
     assert_eq!(result.method, EstimationMethod::Impmap);
     assert!(result.eta_names.contains(&"ETA_RUV".to_string()));
     assert!(result.ofv.is_finite(), "IMPMAP OFV must be finite");
-    let idx = result
-        .eta_names
-        .iter()
-        .position(|n| n == "ETA_RUV")
-        .unwrap();
+    let idx = result.eta_names.iter().position(|n| n == "ETA_RUV").unwrap();
     assert!(
         result.omega[(idx, idx)].is_finite() && result.omega[(idx, idx)] > 0.0,
         "ETA_RUV variance must stay finite/positive under IMPMAP, got {}",
@@ -192,11 +182,8 @@ fn iiv_on_ruv_impmap_runs_and_reports_is_marginal() {
 fn population_from_sim(template: &Population, sims: &[SimulationResult]) -> Population {
     let mut pop = template.clone();
     for subj in pop.subjects.iter_mut() {
-        let vals: Vec<f64> = sims
-            .iter()
-            .filter(|r| r.id == subj.id)
-            .map(|r| r.outcome.continuous_value())
-            .collect();
+        let vals: Vec<f64> =
+            sims.iter().filter(|r| r.id == subj.id).map(|r| r.outcome.continuous_value()).collect();
         assert_eq!(
             vals.len(),
             subj.observations.len(),
@@ -269,10 +256,7 @@ fn replicate_population(base: &Population, copies: usize) -> Population {
 /// this exact setup lives in `nonmem_anchor/` (ferx vs NONMEM FOCEI agree to
 /// ΔOFV = 0.017; ETA_RUV variance within 2.4%).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn iiv_on_ruv_focei_recovers_simulated_variance() {
     const TRUE_RUV_VAR: f64 = 0.30;
 
@@ -294,11 +278,7 @@ fn iiv_on_ruv_focei_recovers_simulated_variance() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("FOCEI fit on simulated iiv_on_ruv data must converge");
 
-    let idx = result
-        .eta_names
-        .iter()
-        .position(|n| n == "ETA_RUV")
-        .expect("ETA_RUV reported");
+    let idx = result.eta_names.iter().position(|n| n == "ETA_RUV").expect("ETA_RUV reported");
     let est = result.omega[(idx, idx)];
     // Recover within a factor of ~2 (residual-error IIV shrinks somewhat under
     // FOCEI); must be clearly non-zero (not collapsed).

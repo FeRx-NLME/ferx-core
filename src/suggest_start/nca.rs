@@ -104,11 +104,7 @@ pub fn aumc_trapezoid(times: &[f64], concs: &[f64]) -> Option<(f64, f64, f64)> {
 /// Returns `(lambda_z, intercept_ln)` where `ln(C) = intercept_ln - lambda_z * t`,
 /// or `None` if fewer than `min_pts` points survive or R² < `r2_threshold`.
 pub fn terminal_slope(
-    times: &[f64],
-    concs: &[f64],
-    cmax: f64,
-    min_pts: usize,
-    r2_threshold: f64,
+    times: &[f64], concs: &[f64], cmax: f64, min_pts: usize, r2_threshold: f64,
 ) -> Option<(f64, f64)> {
     terminal_slope_frac(times, concs, cmax, min_pts, r2_threshold, 0.1)
 }
@@ -117,12 +113,7 @@ pub fn terminal_slope(
 /// Use a lower fraction (e.g. 0.01) when estimating the true terminal phase
 /// of multi-compartment data, where the terminal phase sits well below 10% of Cmax.
 pub fn terminal_slope_frac(
-    times: &[f64],
-    concs: &[f64],
-    cmax: f64,
-    min_pts: usize,
-    r2_threshold: f64,
-    cmax_fraction: f64,
+    times: &[f64], concs: &[f64], cmax: f64, min_pts: usize, r2_threshold: f64, cmax_fraction: f64,
 ) -> Option<(f64, f64)> {
     let threshold = cmax * cmax_fraction;
     let pts: Vec<(f64, f64)> = times
@@ -172,15 +163,8 @@ fn ols_slope(pts: &[(f64, f64)]) -> Option<(f64, f64, f64)> {
     // R²
     let y_mean = sum_y / n;
     let ss_tot: f64 = pts.iter().map(|(_, y)| (y - y_mean).powi(2)).sum();
-    let ss_res: f64 = pts
-        .iter()
-        .map(|(t, y)| (y - (slope * t + intercept)).powi(2))
-        .sum();
-    let r2 = if ss_tot < 1e-30 {
-        1.0
-    } else {
-        1.0 - ss_res / ss_tot
-    };
+    let ss_res: f64 = pts.iter().map(|(t, y)| (y - (slope * t + intercept)).powi(2)).sum();
+    let r2 = if ss_tot < 1e-30 { 1.0 } else { 1.0 - ss_res / ss_tot };
 
     Some((slope, intercept, r2))
 }
@@ -273,17 +257,16 @@ pub fn wagner_nelson_ka(times: &[f64], concs: &[f64], cl_f: f64, v_f: f64) -> Op
 
 /// Extract Cmax and Tmax from dose-normalised concentrations.
 pub fn cmax_tmax(times: &[f64], concs: &[f64]) -> (f64, f64) {
-    times
-        .iter()
-        .zip(concs.iter())
-        .filter(|(_, &c)| c.is_finite())
-        .fold((0.0_f64, 0.0_f64), |(cmax, tmax), (&t, &c)| {
+    times.iter().zip(concs.iter()).filter(|(_, &c)| c.is_finite()).fold(
+        (0.0_f64, 0.0_f64),
+        |(cmax, tmax), (&t, &c)| {
             if c > cmax {
                 (c, t)
             } else {
                 (cmax, tmax)
             }
-        })
+        },
+    )
 }
 
 /// Biexponential peeling for 2-cpt IV/infusion data.
@@ -316,10 +299,8 @@ pub fn biexponential_peel(
 
     // Use the last (min_pts + 1) points for terminal regression (max 5).
     let n_terminal = (min_pts + 1).min(5).min(valid_pts.len() / 2);
-    let terminal_pts: Vec<(f64, f64)> = valid_pts[valid_pts.len() - n_terminal..]
-        .iter()
-        .map(|&(t, c)| (t, c.ln()))
-        .collect();
+    let terminal_pts: Vec<(f64, f64)> =
+        valid_pts[valid_pts.len() - n_terminal..].iter().map(|&(t, c)| (t, c.ln())).collect();
 
     let (slope_term, intercept_term, r2_term) = ols_slope(&terminal_pts)?;
     if slope_term >= 0.0 || r2_term < 0.8 {
@@ -397,21 +378,11 @@ pub fn nca_one_cpt_oral(subject: &Subject) -> SubjectNca {
         .unzip();
 
     if times_shifted.len() < 2 {
-        return SubjectNca {
-            cmax,
-            tmax,
-            tlag,
-            ..empty_nca()
-        };
+        return SubjectNca { cmax, tmax, tlag, ..empty_nca() };
     }
 
     let Some((auc_obs, c_last, t_last)) = auc_trapezoid(&times_shifted, &concs_shifted) else {
-        return SubjectNca {
-            cmax,
-            tmax,
-            tlag,
-            ..empty_nca()
-        };
+        return SubjectNca { cmax, tmax, tlag, ..empty_nca() };
     };
 
     let lz = terminal_slope(&times_shifted, &concs_shifted, cmax, 3, 0.8);
@@ -429,11 +400,7 @@ pub fn nca_one_cpt_oral(subject: &Subject) -> SubjectNca {
     let vss = mrt.and_then(|m| cl_f.map(|cl| cl * m));
 
     // Ka via Wagner-Nelson on lag-shifted times; fallback = heuristic from Tmax
-    let tmax_shifted = if tmax >= lag_shift {
-        tmax - lag_shift
-    } else {
-        tmax
-    };
+    let tmax_shifted = if tmax >= lag_shift { tmax - lag_shift } else { tmax };
     let ka = if let (Some(cl), Some(v)) = (cl_f, v_f) {
         wagner_nelson_ka(&times_shifted, &concs_shifted, cl, v).or_else(|| {
             if tmax_shifted > 0.0 {
@@ -483,20 +450,12 @@ pub fn nca_one_cpt_iv(subject: &Subject) -> SubjectNca {
     let (cmax, tmax) = cmax_tmax(&times, &concs_norm);
 
     // Infusion end time: for rate > 0, terminal phase starts after the infusion ends.
-    let t_infusion_end = subject
-        .doses
-        .first()
-        .filter(|d| d.rate > 0.0)
-        .map(|d| d.time + d.duration)
-        .unwrap_or(0.0);
+    let t_infusion_end =
+        subject.doses.first().filter(|d| d.rate > 0.0).map(|d| d.time + d.duration).unwrap_or(0.0);
     let is_infusion = t_infusion_end > 0.0;
 
     let Some((auc_obs, c_last, t_last)) = auc_trapezoid(&times, &concs_norm) else {
-        return SubjectNca {
-            cmax,
-            tmax,
-            ..empty_nca()
-        };
+        return SubjectNca { cmax, tmax, ..empty_nca() };
     };
 
     // Terminal slope: use only post-infusion points for infusion to avoid
@@ -528,11 +487,7 @@ pub fn nca_one_cpt_iv(subject: &Subject) -> SubjectNca {
         aumc_inf.and_then(|aumc| auc_inf.map(|auc| if auc > 0.0 { aumc / auc } else { f64::NAN }));
     let vss = mrt.and_then(|m| cl_f.map(|cl| cl * m));
     // C0 back-extrapolation is only meaningful for bolus dosing.
-    let c0 = if is_infusion {
-        None
-    } else {
-        backextrapolate_c0(&times, &concs_norm)
-    };
+    let c0 = if is_infusion { None } else { backextrapolate_c0(&times, &concs_norm) };
 
     SubjectNca {
         cl_f,
@@ -558,20 +513,14 @@ pub fn first_dose_amt(subject: &Subject) -> f64 {
 /// Returns (times, concs) excluding censored (cens==1) observations.
 pub fn first_dose_obs(subject: &Subject) -> (Vec<f64>, Vec<f64>) {
     let t_dose = subject.doses.first().map(|d| d.time).unwrap_or(0.0);
-    let t_next_dose = subject
-        .doses
-        .get(1)
-        .map(|d| d.time)
-        .unwrap_or(f64::INFINITY);
+    let t_next_dose = subject.doses.get(1).map(|d| d.time).unwrap_or(f64::INFINITY);
 
-    let iter = subject
-        .obs_times
-        .iter()
-        .zip(subject.observations.iter())
-        .zip(subject.cens.iter())
-        .filter(|&((&t, &c), &cens)| {
-            t >= t_dose && t < t_next_dose && cens == 0 && c.is_finite() && c >= 0.0
-        });
+    let iter =
+        subject.obs_times.iter().zip(subject.observations.iter()).zip(subject.cens.iter()).filter(
+            |&((&t, &c), &cens)| {
+                t >= t_dose && t < t_next_dose && cens == 0 && c.is_finite() && c >= 0.0
+            },
+        );
 
     let mut times = Vec::new();
     let mut concs = Vec::new();
@@ -711,10 +660,7 @@ mod tests {
         let times = vec![1.0, 2.0];
         let concs = vec![0.5, 0.3];
         let result = terminal_slope(&times, &concs, 0.5, 3, 0.8);
-        assert!(
-            result.is_none(),
-            "should return None with < 3 terminal points"
-        );
+        assert!(result.is_none(), "should return None with < 3 terminal points");
     }
 
     #[test]
@@ -759,10 +705,7 @@ mod tests {
             (al - alpha).abs() / alpha < 0.15,
             "α error > 15%: got {al:.5}, expected {alpha:.5}"
         );
-        assert!(
-            (be - beta).abs() / beta < 0.15,
-            "β error > 15%: got {be:.5}, expected {beta:.5}"
-        );
+        assert!((be - beta).abs() / beta < 0.15, "β error > 15%: got {be:.5}, expected {beta:.5}");
     }
 
     #[test]

@@ -50,10 +50,7 @@ fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
             theta_lower: Vec::new(),
             theta_upper: Vec::new(),
             theta_fixed: Vec::new(),
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["ERR".into()],
-            },
+            sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
             omega_iov: Some(OmegaMatrix::from_diagonal(&[1.0], vec!["KAPPA_CL".into()])),
             kappa_fixed: vec![false],
             ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
@@ -146,20 +143,11 @@ fn derived_and_indiv_use_per_occasion_kappa() {
     };
     // ebe_kappas[subject][occasion]; occasion order matches split_obs_by_occasion
     // (first-seen): occasion 1 → index 0 (κ=ln2), occasion 2 → index 1 (κ=ln3).
-    let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
-        DVector::from_vec(vec![ln2]),
-        DVector::from_vec(vec![ln3]),
-    ]];
+    let kappas: Vec<Vec<DVector<f64>>> =
+        vec![vec![DVector::from_vec(vec![ln2]), DVector::from_vec(vec![ln3])]];
     let mut subjects_results = vec![sr_iov(4)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let cols = &subjects_results[0].extra_columns;
     let cl = &cols.iter().find(|(n, _)| n == "CL_OUT").unwrap().1;
@@ -209,14 +197,7 @@ fn missing_kappa_falls_back_to_zero() {
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
     let mut subjects_results = vec![sr_iov(4)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let cl = &subjects_results[0].extra_columns[0].1;
     for (j, &v) in cl.iter().enumerate() {
@@ -246,14 +227,13 @@ fn tad_uses_per_dose_occasion_lag() {
     model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
     model.pk_indices = vec![0, PK_IDX_LAGTIME];
     // Drive the absorption lag (slot PK_IDX_LAGTIME) from the occasion kappa.
-    model.pk_param_fn = Box::new(
-        |_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>, _t: f64| {
+    model.pk_param_fn =
+        Box::new(|_theta: &[f64], eta: &[f64], _cov: &HashMap<String, f64>, _t: f64| {
             let kappa = eta.get(1).copied().unwrap_or(0.0);
             let mut p = PkParams::default();
             p.values[PK_IDX_LAGTIME] = 1.0 + kappa;
             p
-        },
-    );
+        });
 
     let subject = Subject {
         id: "S1".into(),
@@ -280,20 +260,11 @@ fn tad_uses_per_dose_occasion_lag() {
     };
     // ebe_kappas in split_obs_by_occasion order: occ 1 → idx 0 (κ=0.0),
     // occ 2 → idx 1 (κ=0.5).
-    let kappas: Vec<Vec<DVector<f64>>> = vec![vec![
-        DVector::from_vec(vec![0.0]),
-        DVector::from_vec(vec![0.5]),
-    ]];
+    let kappas: Vec<Vec<DVector<f64>>> =
+        vec![vec![DVector::from_vec(vec![0.0]), DVector::from_vec(vec![0.5])]];
     let mut subjects_results = vec![sr_iov(2)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let tad = &subjects_results[0].per_obs_tad;
     assert!(
@@ -343,9 +314,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("parse ok")
-        .model;
+    let model = crate::parser::model_parser::parse_full_model(src).expect("parse ok").model;
     assert!(model.has_lagtime(), "ALAG2 must enable has_lagtime()");
 
     // Dose into compartment 2 (central) at t=0; observe cmt 2 at t=3.
@@ -373,14 +342,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
     let kappas: Vec<Vec<DVector<f64>>> = Vec::new(); // no IOV
     let mut subjects_results = vec![sr_iov(1)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &theta,
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &theta, &kappas, &mut subjects_results, None);
 
     let tad = &subjects_results[0].per_obs_tad;
     // 3 − (dose@0 + ALAG2=2) = 1.0; the pre-fix bare-lag path gives 3.0.
@@ -394,10 +356,7 @@ fn tad_uses_per_compartment_alag_on_ode_models() {
 fn neg_lag_population(cmt: usize, dose_times: &[f64]) -> Population {
     let subject = Subject {
         id: "S1".into(),
-        doses: dose_times
-            .iter()
-            .map(|&t| DoseEvent::new(t, 100.0, cmt, 0.0, false, 0.0))
-            .collect(),
+        doses: dose_times.iter().map(|&t| DoseEvent::new(t, 100.0, cmt, 0.0, false, 0.0)).collect(),
         obs_times: vec![30.0],
         obs_raw_times: vec![30.0],
         observations: vec![1.0],
@@ -445,9 +404,7 @@ fn alag2_model(tvlag2: f64, slope: f64) -> CompiledModel {
   DV ~ proportional(PROP)
 "#
     );
-    crate::parser::model_parser::parse_full_model(&src)
-        .expect("parse ok")
-        .model
+    crate::parser::model_parser::parse_full_model(&src).expect("parse ok").model
 }
 
 /// One-state ODE model whose compartment 1 is fed by `first_order(ka, lag=TVLAG)`.
@@ -477,9 +434,7 @@ fn route_lag_model(tvlag: f64) -> CompiledModel {
   DV ~ proportional(PROP)
 "#
     );
-    crate::parser::model_parser::parse_full_model(&src)
-        .expect("parse ok")
-        .model
+    crate::parser::model_parser::parse_full_model(&src).expect("parse ok").model
 }
 
 fn find_code<'a>(diags: &'a [Diagnostic], code: &str) -> Option<&'a Diagnostic> {
@@ -511,11 +466,7 @@ fn negative_alag_is_a_fit_init_error() {
         "NONMEM rejects it",
         "positive-link",
     ] {
-        assert!(
-            err.message.contains(want),
-            "missing {want:?} in: {}",
-            err.message
-        );
+        assert!(err.message.contains(want), "missing {want:?} in: {}", err.message);
     }
     // One finding, one severity: the fit's warning bundle no longer carries it.
     assert!(
@@ -559,11 +510,8 @@ fn negative_lag_is_read_per_dose_record() {
 
     let zero = alag2_model(0.0, 0.0);
     assert!(
-        find_code(
-            &check_model_data(&zero, &neg_lag_population(2, &[0.0])),
-            "E_NEGATIVE_LAGTIME"
-        )
-        .is_none(),
+        find_code(&check_model_data(&zero, &neg_lag_population(2, &[0.0])), "E_NEGATIVE_LAGTIME")
+            .is_none(),
         "a lag of exactly 0 is not negative"
     );
 }
@@ -578,10 +526,7 @@ fn negative_lag_is_read_per_dose_record() {
 #[test]
 fn negative_per_route_lag_is_a_fit_init_error() {
     let model = route_lag_model(-1.0);
-    assert!(
-        !model.has_lagtime(),
-        "route lag must not ride the dose-attribute map"
-    );
+    assert!(!model.has_lagtime(), "route lag must not ride the dose-attribute map");
 
     let diags = check_model_data(&model, &neg_lag_population(1, &[0.0]));
     let err = find_code(&diags, "E_NEGATIVE_LAGTIME").expect("a negative route lag is refused");
@@ -594,11 +539,8 @@ fn negative_per_route_lag_is_a_fit_init_error() {
     );
 
     assert!(
-        find_code(
-            &check_model_data(&model, &neg_lag_population(2, &[0.0])),
-            "E_NEGATIVE_LAGTIME"
-        )
-        .is_none(),
+        find_code(&check_model_data(&model, &neg_lag_population(2, &[0.0])), "E_NEGATIVE_LAGTIME")
+            .is_none(),
         "a dose into an unforced compartment never sees the route lag"
     );
     assert!(
@@ -617,20 +559,17 @@ fn negative_lag_on_an_analytical_model_is_a_fit_init_error() {
     let mut model = minimal_iov_model(vec![]);
     model.indiv_param_names = vec!["CL".into(), "LAGTIME".into()];
     model.pk_indices = vec![0, PK_IDX_LAGTIME];
-    model.pk_param_fn = Box::new(
-        |_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _time: f64| {
+    model.pk_param_fn =
+        Box::new(|_t: &[f64], _e: &[f64], _c: &HashMap<String, f64>, _time: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_LAGTIME] = -1.0;
             p
-        },
-    );
+        });
     assert!(model.has_lagtime() && model.ode_spec.is_none());
-    let err = find_code(
-        &check_model_data(&model, &neg_lag_population(1, &[0.0])),
-        "E_NEGATIVE_LAGTIME",
-    )
-    .cloned()
-    .expect("bare negative lag must be refused on an analytical model");
+    let err =
+        find_code(&check_model_data(&model, &neg_lag_population(1, &[0.0])), "E_NEGATIVE_LAGTIME")
+            .cloned()
+            .expect("bare negative lag must be refused on an analytical model");
     assert!(err.message.contains("compartment 1"), "{}", err.message);
 }
 
@@ -705,9 +644,7 @@ fn predict_reports_a_negative_lag_as_a_warning() {
     let good = alag2_model(1.0, 0.0);
     let out = crate::api::predict_diag(&good, &pop, &good.default_params).expect("predict");
     assert!(
-        !out.warnings
-            .iter()
-            .any(|w| w.contains("E_NEGATIVE_LAGTIME")),
+        !out.warnings.iter().any(|w| w.contains("E_NEGATIVE_LAGTIME")),
         "a positive lag must not warn: {:?}",
         out.warnings
     );
@@ -737,16 +674,11 @@ fn block_sigma_two_endpoint_model() -> CompiledModel {
     ]));
     m.error_model = ErrorModel::Proportional;
     m.n_epsilon = 2;
-    m.default_params.sigma = SigmaVector {
-        values: vec![0.3, 0.4],
-        names: vec!["S1".into(), "S2".into()],
-    };
+    m.default_params.sigma =
+        SigmaVector { values: vec![0.3, 0.4], names: vec!["S1".into(), "S2".into()] };
     m.default_params.sigma_fixed = vec![false, false];
-    m.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 0.5,
-    }];
+    m.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
     m
 }
 
@@ -784,11 +716,8 @@ fn population_of(subject: Subject) -> Population {
 #[test]
 fn block_sigma_ambiguous_pairing_without_l2_warns() {
     let model = block_sigma_two_endpoint_model();
-    let pop = population_of(obs_only_subject(
-        vec![1, 2, 1, 2],
-        vec![1.0, 1.0, 1.0, 1.0],
-        Vec::new(),
-    ));
+    let pop =
+        population_of(obs_only_subject(vec![1, 2, 1, 2], vec![1.0, 1.0, 1.0, 1.0], Vec::new()));
     let diags = check_model_data_warnings(&model, &pop, &model.default_params);
     assert!(
         diags.iter().any(|d| d.code == "W_BLOCK_SIGMA_L2_ORDER"),
@@ -888,9 +817,7 @@ fn block_sigma_with_l2_is_not_flagged_unused() {
 #[test]
 fn ss_dose_with_analytical_init_warns() {
     let src = crate::test_models::ONE_CPT_IV_4;
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("parse ok")
-        .model;
+    let model = crate::parser::model_parser::parse_full_model(src).expect("parse ok").model;
     assert_eq!(model.analytical_init.len(), 1);
 
     // Subject with a steady-state dose (ss=true, ii=24).
@@ -925,9 +852,7 @@ fn ss_dose_with_analytical_init_warns() {
 #[test]
 fn non_ss_dose_with_analytical_init_does_not_warn() {
     let src = crate::test_models::ONE_CPT_IV_4;
-    let model = crate::parser::model_parser::parse_full_model(src)
-        .expect("parse ok")
-        .model;
+    let model = crate::parser::model_parser::parse_full_model(src).expect("parse ok").model;
     let subject = Subject {
         id: "S1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -967,13 +892,12 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     model.indiv_param_names = vec!["CL".into(), "ALAG".into()];
     model.pk_indices = vec![0, PK_IDX_LAGTIME];
     // Lag = LAGCOV covariate (time-varying); independent of eta/kappa.
-    model.pk_param_fn = Box::new(
-        |_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+    model.pk_param_fn =
+        Box::new(|_theta: &[f64], _eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
             let mut p = PkParams::default();
             p.values[PK_IDX_LAGTIME] = cov.get("LAGCOV").copied().unwrap_or(0.0);
             p
-        },
-    );
+        });
 
     let cov_dose = HashMap::from([("LAGCOV".to_string(), 1.0)]);
     let cov_obs = HashMap::from([("LAGCOV".to_string(), 5.0)]);
@@ -1002,14 +926,7 @@ fn tad_lag_uses_dose_covariate_not_obs() {
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![DVector::from_vec(vec![0.0])]];
     let mut subjects_results = vec![sr_iov(1)];
 
-    compute_extra_output_columns(
-        &model,
-        &population,
-        &[],
-        &kappas,
-        &mut subjects_results,
-        None,
-    );
+    compute_extra_output_columns(&model, &population, &[], &kappas, &mut subjects_results, None);
 
     let tad = &subjects_results[0].per_obs_tad;
     assert!(

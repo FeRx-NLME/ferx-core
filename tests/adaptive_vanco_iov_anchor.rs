@@ -129,10 +129,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
         "exactly one IOV effect (κ on CL) — the #701 surface under test"
     );
     assert_eq!(parsed.model.n_eta, 1, "one (negligible) BSV η on CL");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] block present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] block present");
     assert_eq!(spec.start_dose, 500.0, "empiric start dose");
     assert_eq!(spec.dose_bounds, (250.0.into(), 4000.0.into()));
     assert_eq!(
@@ -146,11 +143,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
     );
     assert_eq!(spec.at.len(), 14, "14 daily decisions, t = 0..=312 h");
     assert_eq!(spec.levels, None, "continuous (percentage) titration");
-    assert_eq!(
-        spec.rules.len(),
-        2,
-        "increase / decrease rungs (the per-occasion κ drives both)"
-    );
+    assert_eq!(spec.rules.len(), 2, "increase / decrease rungs (the per-occasion κ drives both)");
 
     // A short seeded reactive run must pass the default frozen-replay verifier.
     let pop = Population {
@@ -185,10 +178,7 @@ fn vanco_iov_example_parses_and_runs_the_verifier() {
 fn vanco_iov_titration_matches_mrgsolve() {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))
         .expect("vanco IOV model must parse");
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
 
     let pop = Population {
         subjects: vec![anchor_subject(&spec.at)],
@@ -224,11 +214,7 @@ fn vanco_iov_titration_matches_mrgsolve() {
     for (i, &(t_ref, trough_ref, dose_ref)) in REF_LADDER.iter().enumerate() {
         let d = &res.decisions[i];
         assert_eq!(d.time, t_ref, "decision {i} time");
-        let sig = d
-            .observed_signals
-            .first()
-            .map(|s| s.value)
-            .unwrap_or(f64::NAN);
+        let sig = d.observed_signals.first().map(|s| s.value).unwrap_or(f64::NAN);
         assert!(
             (sig - trough_ref).abs() < SIGNAL_TOL,
             "decision {i}: ferx trough {sig:.6} vs mrgsolve {trough_ref:.6} \
@@ -292,10 +278,7 @@ fn vanco_iov_window_aucs_match_mrgsolve() {
 fn windows_in(band: (f64, f64)) -> usize {
     let parsed = parse_full_model_file(Path::new("examples/adaptive_vanco_iov.ferx"))
         .expect("model must parse");
-    let mut spec = parsed
-        .adaptive_dosing
-        .clone()
-        .expect("[adaptive_dosing] present");
+    let mut spec = parsed.adaptive_dosing.clone().expect("[adaptive_dosing] present");
     spec.auc_target = Some(band);
     let pop = Population {
         subjects: vec![anchor_subject(&spec.at)],

@@ -76,14 +76,8 @@ fn model_source(sigma: &str, kappa: bool, analytic_cov: bool) -> String {
 /// Fit `src` (an evaluation) and return the fit, the model path and the population, for
 /// the FIX-clone `run_covariance` comparisons.
 fn evaluate(
-    name: &str,
-    src: &str,
-) -> (
-    FitResult,
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-    tempfile::TempDir,
-) {
+    name: &str, src: &str,
+) -> (FitResult, ferx_core::types::CompiledModel, ferx_core::types::Population, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path: PathBuf = dir.path().join(format!("{name}.ferx"));
     std::fs::write(&path, src).unwrap();
@@ -105,9 +99,7 @@ fn all_ses(r: &FitResult) -> Vec<f64> {
 /// marginal*, not `R` itself — the analytic route builds both from the same `R` entries;
 /// the NONMEM anchor (`nonmem_anchor/guard_hold_*`) is the external reference.
 fn fix_clone(
-    fit: &FitResult,
-    model: &ferx_core::types::CompiledModel,
-    pop: &ferx_core::types::Population,
+    fit: &FitResult, model: &ferx_core::types::CompiledModel, pop: &ferx_core::types::Population,
     analytic: bool,
 ) -> FitResult {
     let mut held = fit.clone();
@@ -119,17 +111,12 @@ fn fix_clone(
             ParameterKind::Theta => held.theta_fixed[h.index] = true,
         }
     }
-    let options = FitOptions {
-        analytic_cov_hessian: analytic,
-        ..FitOptions::default()
-    };
+    let options = FitOptions { analytic_cov_hessian: analytic, ..FitOptions::default() };
     run_covariance(&held, Some(model), Some(pop), &options).expect("FIX clone")
 }
 
 fn regularized(r: &FitResult) -> bool {
-    r.warnings
-        .iter()
-        .any(|w| w.starts_with("Covariance step regularized"))
+    r.warnings.iter().any(|w| w.starts_with("Covariance step regularized"))
 }
 
 fn guard_warning(r: &FitResult) -> &str {
@@ -151,11 +138,7 @@ fn a_collapse_is_held_at_a_stationary_point_and_only_listed_at_a_poor_one() {
     // ── Stationary: held ──────────────────────────────────────────────────────────────
     let (f, model, pop, _d) = evaluate("stationary", &model_source(SIGMA_HAT, false, true));
     assert!(f.covariance_matrix.is_some(), "{:?}", f.warnings);
-    assert!(
-        !regularized(&f),
-        "the stationary point has a clean R: {:?}",
-        f.warnings
-    );
+    assert!(!regularized(&f), "the stationary point has a clean R: {:?}", f.warnings);
     let held: Vec<(&str, ParameterKind, usize, usize, HeldReason)> = f
         .held_at_bound
         .iter()
@@ -163,19 +146,9 @@ fn a_collapse_is_held_at_a_stationary_point_and_only_listed_at_a_poor_one() {
         .collect();
     assert_eq!(
         held,
-        [(
-            "ETA_KA",
-            ParameterKind::Omega,
-            2,
-            ETA_KA_ROW,
-            HeldReason::CollapsedAtGuard
-        )]
+        [("ETA_KA", ParameterKind::Omega, 2, ETA_KA_ROW, HeldReason::CollapsedAtGuard)]
     );
-    assert!(
-        f.cov_fixed[ETA_KA_ROW],
-        "the step held ETA_KA: {:?}",
-        f.cov_fixed
-    );
+    assert!(f.cov_fixed[ETA_KA_ROW], "the step held ETA_KA: {:?}", f.cov_fixed);
     assert_eq!(f.cov_fixed.iter().filter(|&&b| b).count(), 1);
     let cov = f.covariance_matrix.as_ref().unwrap();
     for k in 0..cov.nrows() {
@@ -196,61 +169,29 @@ fn a_collapse_is_held_at_a_stationary_point_and_only_listed_at_a_poor_one() {
         "{}",
         guard_warning(&f)
     );
-    let row = parameter_table(&f)
-        .lines()
-        .find(|l| l.starts_with("ETA_KA "))
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        row.split_whitespace().collect::<Vec<_>>()[2..4],
-        ["N/A", "N/A"],
-        "{row}"
-    );
+    let row = parameter_table(&f).lines().find(|l| l.starts_with("ETA_KA ")).unwrap().to_string();
+    assert_eq!(row.split_whitespace().collect::<Vec<_>>()[2..4], ["N/A", "N/A"], "{row}");
 
     // The held SEs are exactly the FIX clone's on the analytic R: a block of the analytic
     // R along the free axes is the full R's sub-block to the bit (`analytic_cov_axes`), and
     // both invert it the same way. Measured: 0 ULP on every SE (macOS arm64).
     let clone = fix_clone(&f, &model, &pop, true);
-    assert_eq!(
-        all_ses(&clone),
-        all_ses(&f),
-        "analytic: held SEs = FIX clone SEs"
-    );
+    assert_eq!(all_ses(&clone), all_ses(&f), "analytic: held SEs = FIX clone SEs");
     assert_eq!(clone.covariance_matrix, f.covariance_matrix);
 
     // ── Poor σ: listed, not held ──────────────────────────────────────────────────────
     let (g, model, pop, _d) = evaluate("poor_sigma", &model_source("0.02", false, true));
     assert!(g.covariance_matrix.is_some(), "{:?}", g.warnings);
-    assert!(
-        regularized(&g),
-        "the straddle: poor σ floors R: {:?}",
-        g.warnings
-    );
-    let floor = g
-        .warnings
-        .iter()
-        .find(|w| w.starts_with("Covariance step regularized"))
-        .unwrap();
+    assert!(regularized(&g), "the straddle: poor σ floors R: {:?}", g.warnings);
+    let floor = g.warnings.iter().find(|w| w.starts_with("Covariance step regularized")).unwrap();
     assert!(floor.contains("severity: severe"), "{floor}");
     assert_eq!(g.held_at_bound.len(), 1);
     assert_eq!(g.held_at_bound[0].name, "ETA_KA");
-    assert!(
-        !g.cov_fixed[ETA_KA_ROW],
-        "a floored R is not held: {:?}",
-        g.cov_fixed
-    );
+    assert!(!g.cov_fixed[ETA_KA_ROW], "a floored R is not held: {:?}", g.cov_fixed);
     // The unconditional SE is kept in the field; only the display says N/A.
     assert!(g.se_omega.as_ref().unwrap()[2] > 0.0);
-    let row = parameter_table(&g)
-        .lines()
-        .find(|l| l.starts_with("ETA_KA "))
-        .unwrap()
-        .to_string();
-    assert_eq!(
-        row.split_whitespace().collect::<Vec<_>>()[2..4],
-        ["N/A", "N/A"],
-        "{row}"
-    );
+    let row = parameter_table(&g).lines().find(|l| l.starts_with("ETA_KA ")).unwrap().to_string();
+    assert_eq!(row.split_whitespace().collect::<Vec<_>>()[2..4], ["N/A", "N/A"], "{row}");
     assert!(
         guard_warning(&g).ends_with(" Their standard errors are not reported."),
         "{}",
@@ -261,14 +202,8 @@ fn a_collapse_is_held_at_a_stationary_point_and_only_listed_at_a_poor_one() {
     // the reported SE must stay the unconditional one.
     let clone = fix_clone(&g, &model, &pop, true);
     assert!(!regularized(&clone), "{:?}", clone.warnings);
-    let (sg, sc) = (
-        g.se_sigma.as_ref().unwrap()[0],
-        clone.se_sigma.as_ref().unwrap()[0],
-    );
-    assert!(
-        sg.is_finite() && sc.is_finite() && sg > 10.0 * sc,
-        "σ SE {sg} vs held {sc}"
-    );
+    let (sg, sc) = (g.se_sigma.as_ref().unwrap()[0], clone.se_sigma.as_ref().unwrap()[0]);
+    assert!(sg.is_finite() && sc.is_finite() && sg > 10.0 * sc, "σ SE {sg} vs held {sc}");
 }
 
 /// Test 6, FD side: on the FD stencil the step holds too, with the other SEs equal to the
@@ -286,11 +221,7 @@ fn a_collapse_is_held_on_the_fd_stencil_route_too() {
     let clone = fix_clone(&f, &model, &pop, false);
     assert_eq!(all_ses(&clone), all_ses(&f), "FD: held SEs = FIX clone SEs");
     let (analytic, _, _, _d) = evaluate("stationary_an", &model_source(SIGMA_HAT, false, true));
-    assert_ne!(
-        all_ses(&analytic),
-        all_ses(&f),
-        "the two fits must run different routes"
-    );
+    assert_ne!(all_ses(&analytic), all_ses(&f), "the two fits must run different routes");
 }
 
 /// Test 7: an IOV κ collapsed with the ETA — both held, two entries in packed order.
@@ -306,16 +237,9 @@ fn a_collapsed_kappa_is_held_with_the_eta() {
     // Packed: [θ×3, Ω×3, σ, κ].
     assert_eq!(
         held,
-        [
-            ("ETA_KA", ParameterKind::Omega, 2, ETA_KA_ROW),
-            ("K_KA", ParameterKind::Kappa, 0, 7),
-        ]
+        [("ETA_KA", ParameterKind::Omega, 2, ETA_KA_ROW), ("K_KA", ParameterKind::Kappa, 0, 7),]
     );
-    assert!(
-        f.cov_fixed[ETA_KA_ROW] && f.cov_fixed[7],
-        "{:?}",
-        f.cov_fixed
-    );
+    assert!(f.cov_fixed[ETA_KA_ROW] && f.cov_fixed[7], "{:?}", f.cov_fixed);
     assert_eq!(f.se_kappa.as_ref().unwrap()[0], 0.0);
     let clone = fix_clone(&f, &model, &pop, true);
     assert_eq!(all_ses(&clone), all_ses(&f));
@@ -340,11 +264,7 @@ fn no_collapse_lists_nothing_and_a_re_run_rebuilds_the_report() {
     // unconditional SE. Mutation: drop `refresh_held_at_bound_report` → every assertion
     // below fails.
     let (f, model, pop, _d) = evaluate("rerun", &model_source(SIGMA_HAT, false, true));
-    let stale_text = guard_warning(&f)
-        .split(" Their standard errors")
-        .next()
-        .unwrap()
-        .to_string();
+    let stale_text = guard_warning(&f).split(" Their standard errors").next().unwrap().to_string();
     let mut stale = f.clone();
     stale.held_at_bound.clear();
     stale.cov_fixed.clear();
@@ -380,15 +300,11 @@ fn no_collapse_lists_nothing_and_a_re_run_rebuilds_the_report() {
 /// the `s` arm → the zero row and the equality fail.
 #[test]
 fn a_collapse_is_held_under_covariance_method_s() {
-    let held_src = model_source(SIGMA_HAT, false, true).replace(
-        "covariance = true",
-        "covariance = true\n  covariance_method = s",
-    );
+    let held_src = model_source(SIGMA_HAT, false, true)
+        .replace("covariance = true", "covariance = true\n  covariance_method = s");
     let (h, _, _, _d) = evaluate("held_s", &held_src);
-    let fix_src = held_src.replace(
-        &format!("omega ETA_KA ~ {RAIL}\n"),
-        &format!("omega ETA_KA ~ {RAIL} FIX\n"),
-    );
+    let fix_src = held_src
+        .replace(&format!("omega ETA_KA ~ {RAIL}\n"), &format!("omega ETA_KA ~ {RAIL} FIX\n"));
     assert_ne!(fix_src, held_src);
     let (f, _, _, _d) = evaluate("fix_s", &fix_src);
     assert_eq!(h.covariance_method, f.covariance_method);
@@ -445,11 +361,7 @@ fn a_held_variance_in_a_block_omega_zeroes_its_own_se_slot() {
         w[w.len() - 4..w.len() - 2].join(" ")
     };
     assert_eq!(cells("ETA_KA "), "N/A N/A", "{table}");
-    assert_ne!(
-        cells("ETA_KA × ETA_CL").split(' ').next().unwrap(),
-        "0.000000",
-        "{table}"
-    );
+    assert_ne!(cells("ETA_KA × ETA_CL").split(' ').next().unwrap(), "0.000000", "{table}");
 }
 
 // ── #2809: a collapsed `[mixture]` per-class override ───────────────────────────────────
@@ -510,15 +422,8 @@ fn evaluate_mixture(name: &str, src: &str) -> (FitResult, tempfile::TempDir) {
 /// The ETA_CL row of `parameter_table`: its estimate, SE and RSE cells.
 fn base_eta_cl_cells(r: &FitResult) -> Vec<String> {
     let table = parameter_table(r);
-    let row = table
-        .lines()
-        .find(|l| l.starts_with("ETA_CL "))
-        .unwrap_or_else(|| panic!("{table}"));
-    row.split_whitespace()
-        .skip(1)
-        .take(3)
-        .map(str::to_string)
-        .collect()
+    let row = table.lines().find(|l| l.starts_with("ETA_CL ")).unwrap_or_else(|| panic!("{table}"));
+    row.split_whitespace().skip(1).take(3).map(str::to_string).collect()
 }
 
 /// T7/T8's shared assertions for one route: the override is held and listed with its
@@ -539,16 +444,7 @@ fn assert_override_held_like_its_fix_twin(analytic: bool) -> FitResult {
     let held: Vec<_> = f
         .held_at_bound
         .iter()
-        .map(|h| {
-            (
-                h.name.as_str(),
-                h.kind,
-                h.index,
-                h.packed_index,
-                h.reason,
-                h.class,
-            )
-        })
+        .map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index, h.reason, h.class))
         .collect();
     assert_eq!(
         held,
@@ -582,20 +478,13 @@ fn assert_override_held_like_its_fix_twin(analytic: bool) -> FitResult {
         "a FIX override raises no guard warning: {:?}",
         twin.warnings
     );
-    assert_eq!(
-        all_ses(&f),
-        all_ses(&twin),
-        "{tag}: held SEs = FIX twin SEs"
-    );
+    assert_eq!(all_ses(&f), all_ses(&twin), "{tag}: held SEs = FIX twin SEs");
     assert_eq!(f.covariance_matrix, twin.covariance_matrix, "{tag}");
     // T10 (#2809, audit 1 row 10): the held override is a clean answer, so `status()`
     // lists no `collapsed_at_guard` — the same verdict as the FIX twin. Mutation: the step
     // lists the override but does not mark `cov_fixed` → the reason appears.
     let collapsed = |r: &FitResult| {
-        r.status()
-            .reasons()
-            .iter()
-            .any(|s| matches!(s, StatusReason::CollapsedAtGuard { .. }))
+        r.status().reasons().iter().any(|s| matches!(s, StatusReason::CollapsedAtGuard { .. }))
     };
     assert!(!collapsed(&f), "{tag}: {:?}", f.status());
     assert_eq!(f.status(), twin.status(), "{tag}");
@@ -623,11 +512,7 @@ fn a_collapsed_mixture_override_is_held_like_its_fix_twin_on_the_analytic_r() {
 fn a_collapsed_mixture_override_is_held_like_its_fix_twin_on_the_fd_stencil() {
     let fd = assert_override_held_like_its_fix_twin(false);
     let (an, _d) = evaluate_mixture("route_analytic", &mixture_source(false, true));
-    assert_ne!(
-        all_ses(&an),
-        all_ses(&fd),
-        "the two fits must run different routes"
-    );
+    assert_ne!(all_ses(&an), all_ses(&fd), "the two fits must run different routes");
 }
 
 /// T9 (#2809): a `run_covariance` re-run on a mixture fit rebuilds the override's entry
@@ -658,24 +543,14 @@ fn a_re_run_rebuilds_the_held_override_entry() {
 
 /// The fit's `SIR:` warnings, in order.
 fn sir_warnings(r: &FitResult) -> Vec<&str> {
-    r.warnings
-        .iter()
-        .filter(|w| w.starts_with("SIR"))
-        .map(String::as_str)
-        .collect()
+    r.warnings.iter().filter(|w| w.starts_with("SIR")).map(String::as_str).collect()
 }
 
 /// `sir_ess` and `sir_ci_{theta,omega,sigma}` of `got` bit-for-bit those of `want`.
 fn assert_same_sir(got: &FitResult, want: &FitResult, how: &str) {
     let ess = |r: &FitResult| r.sir_ess.map(f64::to_bits);
     assert!(want.sir_ess.is_some(), "{how}: no SIR on the reference");
-    assert_eq!(
-        ess(got),
-        ess(want),
-        "{how}: ESS {:?} vs {:?}",
-        got.sir_ess,
-        want.sir_ess
-    );
+    assert_eq!(ess(got), ess(want), "{how}: ESS {:?} vs {:?}", got.sir_ess, want.sir_ess);
     assert_eq!(got.sir_ci_theta, want.sir_ci_theta, "{how}: θ CIs");
     assert_eq!(got.sir_ci_omega, want.sir_ci_omega, "{how}: Ω CIs");
     assert_eq!(got.sir_ci_sigma, want.sir_ci_sigma, "{how}: σ CIs");
@@ -685,8 +560,7 @@ fn assert_same_sir(got: &FitResult, want: &FitResult, how: &str) {
 /// under `method` (`""` for `r`, or a `covariance_method` line). Returns the held fit,
 /// its model, population, source and temp dir for the `run_sir` replays.
 fn held_sir_is_fix_sir(
-    method: &str,
-    how: &str,
+    method: &str, how: &str,
 ) -> (
     FitResult,
     ferx_core::types::CompiledModel,
@@ -696,10 +570,8 @@ fn held_sir_is_fix_sir(
 ) {
     let sir = format!("{method}  sir = true\n  sir_seed = 7\n");
     let held_src = format!("{}{sir}", model_source(SIGMA_HAT, false, true));
-    let fix_src = held_src.replace(
-        &format!("omega ETA_KA ~ {RAIL}\n"),
-        &format!("omega ETA_KA ~ {RAIL} FIX\n"),
-    );
+    let fix_src = held_src
+        .replace(&format!("omega ETA_KA ~ {RAIL}\n"), &format!("omega ETA_KA ~ {RAIL} FIX\n"));
     assert_ne!(fix_src, held_src);
     let (h, model, pop, dir) = evaluate("held_sir", &held_src);
     let (f, _, _, _d) = evaluate("fix_sir", &fix_src);
@@ -707,10 +579,7 @@ fn held_sir_is_fix_sir(
     assert!(h.cov_fixed[ETA_KA_ROW], "{how}: {:?}", h.warnings);
     assert_eq!(h.held_at_bound.len(), 1, "{how}");
     assert_eq!(h.covariance_method, f.covariance_method, "{how}");
-    assert_eq!(
-        h.covariance_matrix, f.covariance_matrix,
-        "{how}: proposals differ"
-    );
+    assert_eq!(h.covariance_matrix, f.covariance_matrix, "{how}: proposals differ");
     assert_same_sir(&h, &f, how);
     assert_eq!(sir_warnings(&h), sir_warnings(&f), "{how}");
     assert!(
@@ -733,21 +602,13 @@ fn held_sir_is_fix_sir(
 #[test]
 fn sir_holds_a_step_held_collapse_as_fix_under_r() {
     let (h, model, pop, held_src, dir) = held_sir_is_fix_sir("", "r");
-    let opts = FitOptions {
-        sir: true,
-        sir_seed: Some(7),
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { sir: true, sir_seed: Some(7), ..FitOptions::default() };
     let mem = ferx_core::run_sir(&h, Some(&model), Some(&pop), &opts).expect("run_sir");
     assert_same_sir(&mem, &h, "run_sir in memory");
     let path = dir.path().join("held_sir.fitrx");
     ferx_core::io::fitrx::save_fit(&h, &pop, &held_src, &path, Default::default()).expect("saves");
     let loaded = ferx_core::io::fitrx::load_fit(&path).expect("loads");
-    assert_eq!(
-        loaded.fit.held_at_bound.len(),
-        1,
-        "the hold survives the reload"
-    );
+    assert_eq!(loaded.fit.held_at_bound.len(), 1, "the hold survives the reload");
     let re = ferx_core::run_sir(&loaded.fit, Some(&model), Some(&pop), &opts)
         .expect("run_sir after reload");
     assert_same_sir(&re, &h, "run_sir after .fitrx reload");
@@ -772,16 +633,9 @@ fn sir_holds_a_step_held_collapse_as_fix_under_s() {
 /// free block and the shrink note disappears (measured, macOS arm64).
 #[test]
 fn sir_keeps_sampling_a_collapse_the_step_did_not_hold() {
-    let src = format!(
-        "{}  sir = true\n  sir_seed = 7\n",
-        model_source("0.02", false, true)
-    );
+    let src = format!("{}  sir = true\n  sir_seed = 7\n", model_source("0.02", false, true));
     let (f, _, _, _d) = evaluate("poor_sir", &src);
-    assert!(
-        !f.cov_fixed[ETA_KA_ROW],
-        "the step held it: {:?}",
-        f.warnings
-    );
+    assert!(!f.cov_fixed[ETA_KA_ROW], "the step held it: {:?}", f.warnings);
     assert_eq!(f.held_at_bound.len(), 1, "listed, not held");
     assert!(
         sir_warnings(&f)
@@ -808,16 +662,9 @@ fn run_sir_core_refuses_a_misshapen_proposal_with_a_collapse() {
     let p = ferx_core::prepare_run(path.to_str().unwrap(), Some(DATA)).expect("prepare");
     let params = &p.init_params;
     // Precondition: the inits carry the collapse, so the hold loop has a coordinate to read.
-    assert_eq!(
-        params.omega.matrix[(2, 2)].to_bits(),
-        RAIL.parse::<f64>().unwrap().to_bits()
-    );
+    assert_eq!(params.omega.matrix[(2, 2)].to_bits(), RAIL.parse::<f64>().unwrap().to_bits());
     let etas = vec![nalgebra::DVector::zeros(3); p.population.subjects.len()];
-    let opts = FitOptions {
-        sir: true,
-        sir_seed: Some(7),
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { sir: true, sir_seed: Some(7), ..FitOptions::default() };
     let proposal = nalgebra::DMatrix::<f64>::zeros(7, ETA_KA_ROW);
     let err = ferx_core::estimation::sir::run_sir_core(
         &p.parsed.model,
@@ -846,14 +693,9 @@ fn run_sir_core_refuses_a_misshapen_proposal_with_a_collapse() {
 #[test]
 fn sir_holds_a_step_held_mixture_override_as_fix() {
     let sir = "  sir = true\n  sir_seed = 7\n";
-    let (h, _d) = evaluate_mixture(
-        "held_mix_sir",
-        &format!("{}{sir}", mixture_source(false, true)),
-    );
-    let (f, _d2) = evaluate_mixture(
-        "fix_mix_sir",
-        &format!("{}{sir}", mixture_source(true, true)),
-    );
+    let (h, _d) =
+        evaluate_mixture("held_mix_sir", &format!("{}{sir}", mixture_source(false, true)));
+    let (f, _d2) = evaluate_mixture("fix_mix_sir", &format!("{}{sir}", mixture_source(true, true)));
     // Precondition: the step held the override, so the two proposals are one matrix.
     assert!(h.cov_fixed[OVERRIDE_ROW], "{:?}", h.warnings);
     assert_eq!(h.held_at_bound.len(), 1);

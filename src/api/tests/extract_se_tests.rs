@@ -169,11 +169,7 @@ fn test_se_theta_respects_packing_scale() {
     let (se_theta, _, _, _) = extract_standard_errors(&Some(cov), &template);
     let se = se_theta.unwrap();
     // log-packed: SE = theta * SE(x) = 2.0 * 0.1 = 0.2
-    assert!(
-        (se[0] - 0.2).abs() < 1e-12,
-        "log-packed theta SE = {}",
-        se[0]
-    );
+    assert!((se[0] - 0.2).abs() < 1e-12, "log-packed theta SE = {}", se[0]);
     // identity-packed: SE = SE(x) = 0.3 (NOT 0.25 * 0.3 = 0.075)
     assert!(
         (se[1] - 0.3).abs() < 1e-12,
@@ -261,17 +257,11 @@ fn test_se_residual_correlation_uses_the_trailing_rho_slot() {
 
     let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
     let mut template = make_template(Some(iov), vec![false]);
-    template.sigma = SigmaVector {
-        values: vec![0.3, 1.0],
-        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
-    };
+    template.sigma =
+        SigmaVector { values: vec![0.3, 1.0], names: vec!["PROP_ERR".into(), "ADD_ERR".into()] };
     template.sigma_fixed = vec![false; 2];
     let rho = 0.6_f64;
-    template.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 1,
-        sigma_j: 0,
-        rho,
-    }];
+    template.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho }];
     template.residual_correlation_fixed = vec![false];
 
     // 1 theta + 1 omega + 2 sigma + 1 kappa + 1 rho = 6, rho last.
@@ -305,16 +295,10 @@ fn test_se_residual_correlation_truncated_cov_reports_zero() {
     use super::extract_residual_correlation_se;
 
     let mut template = make_template(None, Vec::new());
-    template.sigma = SigmaVector {
-        values: vec![0.3, 1.0],
-        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
-    };
+    template.sigma =
+        SigmaVector { values: vec![0.3, 1.0], names: vec!["PROP_ERR".into(), "ADD_ERR".into()] };
     template.sigma_fixed = vec![false; 2];
-    template.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 1,
-        sigma_j: 0,
-        rho: 0.4,
-    }];
+    template.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.4 }];
     template.residual_correlation_fixed = vec![false];
     // Packed length is 5; hand it a 3×3.
     let cov = DMatrix::<f64>::identity(3, 3);
@@ -331,22 +315,13 @@ fn test_se_residual_correlation_truncated_cov_reports_zero() {
 fn override_template() -> ModelParameters {
     let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
     let mut template = make_template(Some(iov), vec![false]);
-    template.sigma = SigmaVector {
-        values: vec![0.3, 1.0],
-        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
-    };
+    template.sigma =
+        SigmaVector { values: vec![0.3, 1.0], names: vec!["PROP_ERR".into(), "ADD_ERR".into()] };
     template.sigma_fixed = vec![false; 2];
-    template.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 1,
-        sigma_j: 0,
-        rho: 0.6,
-    }];
+    template.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.6 }];
     template.residual_correlation_fixed = vec![false];
     let class2_omega = OmegaMatrix::from_diagonal(&[0.25], vec!["ETA_CL".into()]);
-    let class2_sigma = SigmaVector {
-        values: vec![0.3, 0.7],
-        names: template.sigma.names.clone(),
-    };
+    let class2_sigma = SigmaVector { values: vec![0.3, 0.7], names: template.sigma.names.clone() };
     template.mixture = Some(MixtureParams {
         omega: vec![template.omega.clone(), class2_omega],
         sigma: vec![template.sigma.clone(), class2_sigma],
@@ -381,16 +356,7 @@ fn test_se_mixture_overrides_read_their_own_rows_on_the_natural_scale() {
     let params = crate::estimation::parameterization::mixture_override_params(&template);
     let got: Vec<_> = params
         .iter()
-        .map(|p| {
-            (
-                p.name.as_str(),
-                p.kind,
-                p.index,
-                p.class,
-                p.packed_index,
-                p.fixed,
-            )
-        })
+        .map(|p| (p.name.as_str(), p.kind, p.index, p.class, p.packed_index, p.fixed))
         .collect();
     assert_eq!(
         got,
@@ -417,10 +383,7 @@ fn test_se_mixture_overrides_read_their_own_rows_on_the_natural_scale() {
     let mut fixed = template.clone();
     fixed.mixture.as_mut().unwrap().sigma_override_fixed = vec![true];
     let params = crate::estimation::parameterization::mixture_override_params(&fixed);
-    assert_eq!(
-        params.iter().map(|p| p.fixed).collect::<Vec<_>>(),
-        [false, true]
-    );
+    assert_eq!(params.iter().map(|p| p.fixed).collect::<Vec<_>>(), [false, true]);
     let se = extract_mixture_override_se(&cov, &fixed).unwrap();
     assert_eq!(se[1], 0.0);
     approx::assert_relative_eq!(se[0], 3.0, max_relative = 1e-12);

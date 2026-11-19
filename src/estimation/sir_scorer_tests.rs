@@ -59,12 +59,9 @@ const MIX_PACKED: [f64; 7] = [
 
 fn mixture_inputs() -> (CompiledModel, Population) {
     let model = crate::parse_model_string(MIX_OVERRIDE).expect("mixture model must parse");
-    let pop = crate::read_nonmem_csv(
-        &root().join("tests/nonmem/mixture_iv.csv"),
-        Some(&["WT"]),
-        None,
-    )
-    .expect("mixture data must load");
+    let pop =
+        crate::read_nonmem_csv(&root().join("tests/nonmem/mixture_iv.csv"), Some(&["WT"]), None)
+            .expect("mixture data must load");
     (model, pop)
 }
 
@@ -73,22 +70,13 @@ fn mixture_inputs() -> (CompiledModel, Population) {
 fn scorer_gap(model: &CompiledModel, pop: &Population, fit: &FitResult) -> (f64, f64) {
     let (options, params, etas) = scorer_inputs(model, fit);
     let class_etas = sir_class_etas(model, pop, &params, &options);
-    let got = sir_draw_ofv(
-        model,
-        pop,
-        &params,
-        &params,
-        &etas,
-        class_etas.as_deref(),
-        &options,
-    )
-    .expect("the scorer at the estimates rejects no inner start");
+    let got = sir_draw_ofv(model, pop, &params, &params, &etas, class_etas.as_deref(), &options)
+        .expect("the scorer at the estimates rejects no inner start");
     (got, fit.ofv - fit.ofv_prior)
 }
 
 fn scorer_inputs(
-    model: &CompiledModel,
-    fit: &FitResult,
+    model: &CompiledModel, fit: &FitResult,
 ) -> (FitOptions, ModelParameters, Vec<DVector<f64>>) {
     let options = fitted_marginal_options(fit, &FitOptions::default());
     let params = fitted_params_from_result(fit, model).expect("params rebuild");
@@ -104,11 +92,7 @@ fn moved_etas(model: &CompiledModel, pop: &Population, fit: &FitResult) -> Vec<(
     ehs.iter()
         .zip(&etas)
         .enumerate()
-        .filter(|(_, (a, b))| {
-            a.iter()
-                .zip(b.iter())
-                .any(|(x, y)| x.to_bits() != y.to_bits())
-        })
+        .filter(|(_, (a, b))| a.iter().zip(b.iter()).any(|(x, y)| x.to_bits() != y.to_bits()))
         .map(|(i, (a, b))| (i, (a - b).amax()))
         .collect()
 }
@@ -139,11 +123,7 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
     .expect("warfarin must prepare");
     let init = unpack_params(&WARF_LAPLACE_PACKED, &prep.init_params);
     let mut gaps: Vec<(String, f64, f64)> = Vec::new();
-    for method in [
-        EstimationMethod::Foce,
-        EstimationMethod::FoceI,
-        EstimationMethod::Laplace,
-    ] {
+    for method in [EstimationMethod::Foce, EstimationMethod::FoceI, EstimationMethod::Laplace] {
         let opts = FitOptions {
             method,
             outer_maxiter: 0,
@@ -176,10 +156,7 @@ fn sir_draw_ofv_at_the_estimate_is_the_fits_objective() {
     gaps.push(("mixture".into(), got, want));
 
     for (arm, got, want) in &gaps {
-        eprintln!(
-            "MEASURE T3 {arm} scorer={got:?} fit={want:?} gap={:e}",
-            got - want
-        );
+        eprintln!("MEASURE T3 {arm} scorer={got:?} fit={want:?} gap={:e}", got - want);
     }
     for (arm, got, want) in &gaps {
         assert!(got.is_finite() && want.is_finite(), "{arm}: non-finite");
@@ -202,10 +179,7 @@ fn run_sir_core_refuses_mixture_params_mismatch() {
     let (model, pop) = mixture_inputs();
     let cov = DMatrix::identity(7, 7);
     let etas = vec![DVector::zeros(1); pop.subjects.len()];
-    let opts = FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { verbose: false, ..FitOptions::default() };
 
     let mut flat = model.default_params.clone();
     flat.mixture = None;
@@ -227,10 +201,7 @@ fn run_sir_core_refuses_mixture_params_mismatch() {
     // The same model without its `[mixture]` block.
     let plain = crate::parse_model_string(
         &MIX_OVERRIDE
-            .replace(
-                "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.30\n",
-                "",
-            )
+            .replace("[mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.30\n", "")
             .replace(
                 "if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)",
                 "TVCL1 * exp(ETA_CL)",
@@ -265,11 +236,7 @@ fn mixture_override_refusals_carry_their_codes() {
         ..FitOptions::default()
     };
     let fit = crate::api::fit(&model, &pop, &init, &opts).expect("mixture fit must run");
-    let n = fit
-        .packed_estimate
-        .as_ref()
-        .expect("packed-space fit")
-        .len();
+    let n = fit.packed_estimate.as_ref().expect("packed-space fit").len();
 
     // Every row here is a fit without its recorded override values (#1765), so the
     // packed-estimate fallback is what is read; the recorded-values rows are
@@ -299,12 +266,7 @@ fn mixture_override_refusals_carry_their_codes() {
                    the fit was estimated with.";
     let mut bad = Vec::new();
     for (what, f, code, text) in [
-        (
-            "absent",
-            &absent,
-            "E_FIT_INPUT_MISSING",
-            missing.to_string(),
-        ),
+        ("absent", &absent, "E_FIT_INPUT_MISSING", missing.to_string()),
         ("another layout", &short, "E_FIT_INPUT_MODEL", layout),
         ("stale", &stale, "E_FIT_INPUT_MODEL", changed.to_string()),
     ] {
@@ -387,15 +349,7 @@ fn scorer_keeps_a_start_its_certificate_accepts() {
     // The scorer itself keeps it: a draw at the estimates scored from that start returns it.
     let mut shifted = etas.clone();
     shifted[0] = DVector::from_vec(start.clone());
-    let ehs = sir_draw_ebes(
-        model,
-        &prep.population,
-        &params,
-        &params,
-        &shifted,
-        &options,
-    )
-    .etas;
+    let ehs = sir_draw_ebes(model, &prep.population, &params, &params, &shifted, &options).etas;
     assert_eq!(
         bits(ehs[0].as_slice()),
         bits(&start),
@@ -425,35 +379,22 @@ fn same_point_sees_every_scored_value() {
     )
     .expect("warfarin must prepare");
     let mut base = prep.init_params.clone();
-    base.residual_correlations = vec![ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 0,
-        rho: 0.25,
-    }];
+    base.residual_correlations = vec![ResidualCorrelation { sigma_i: 0, sigma_j: 0, rho: 0.25 }];
     base.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04], vec!["K1".into()]));
-    assert!(
-        same_point(&base, &base.clone()),
-        "a clone is the same point"
-    );
+    assert!(same_point(&base, &base.clone()), "a clone is the same point");
     let up = |x: &mut f64| *x = f64::from_bits(x.to_bits() + 1);
     let cases: Vec<(&str, Box<dyn Fn(&mut ModelParameters)>)> = vec![
         ("theta", Box::new(|p| up(&mut p.theta[0]))),
         ("omega", Box::new(|p| up(&mut p.omega.matrix[(0, 0)]))),
         ("sigma", Box::new(|p| up(&mut p.sigma.values[0]))),
         ("rho", Box::new(|p| up(&mut p.residual_correlations[0].rho))),
-        (
-            "omega_iov",
-            Box::new(|p| up(&mut p.omega_iov.as_mut().unwrap().matrix[(0, 0)])),
-        ),
+        ("omega_iov", Box::new(|p| up(&mut p.omega_iov.as_mut().unwrap().matrix[(0, 0)]))),
         ("omega_iov presence", Box::new(|p| p.omega_iov = None)),
     ];
     for (what, bump) in cases {
         let mut moved = base.clone();
         bump(&mut moved);
-        assert!(
-            !same_point(&base, &moved),
-            "{what}: one ULP still reads as the same point"
-        );
+        assert!(!same_point(&base, &moved), "{what}: one ULP still reads as the same point");
     }
 }
 
@@ -499,10 +440,7 @@ fn mixture_override_values_refusals_carry_their_codes() {
     no_packed.packed_estimate = None;
     let mut edited = fit.clone();
     edited.theta[0] *= 1.01;
-    for (what, f) in [
-        ("no packed estimate", &no_packed),
-        ("theta edited", &edited),
-    ] {
+    for (what, f) in [("no packed estimate", &no_packed), ("theta edited", &edited)] {
         let p = fitted_params_from_result(f, &model).unwrap_or_else(|e| panic!("{what}: {e}"));
         let mix = p.mixture.expect("mixture params");
         assert_eq!(
@@ -543,11 +481,7 @@ fn mixture_override_values_refusals_carry_their_codes() {
     };
     let mut bad = Vec::new();
     for (what, values, text) in [
-        (
-            "too many",
-            vec![recorded[0], recorded[0]],
-            count.to_string(),
-        ),
+        ("too many", vec![recorded[0], recorded[0]], count.to_string()),
         ("NaN", vec![f64::NAN], bad_value("NaN")),
         ("infinite", vec![f64::INFINITY], bad_value("inf")),
         ("negative", vec![-1.0], bad_value("-1")),
@@ -625,17 +559,12 @@ fn fit_packed_estimate_checks_recorded_mixture_overrides() {
 /// FOCEI row turns `true`; the gate reading only `method`: the `[saem, focei]` row.
 #[test]
 fn saem_chain_holds_sigma_overrides_fixed_in_rebuilt_params() {
-    let src = MIX_OVERRIDE.replace(
-        "  omega(2) ETA_CL ~ 0.30\n",
-        "  omega(2) ETA_CL ~ 0.30\n  sigma(2) EPS ~ 0.09\n",
-    );
+    let src = MIX_OVERRIDE
+        .replace("  omega(2) ETA_CL ~ 0.30\n", "  omega(2) ETA_CL ~ 0.30\n  sigma(2) EPS ~ 0.09\n");
     let model = crate::parse_model_string(&src).expect("sigma-override model must parse");
     let tmpl = model.default_params.mixture.as_ref().expect("mixture");
     assert_eq!(
-        (
-            tmpl.omega_override_fixed.clone(),
-            tmpl.sigma_override_fixed.clone()
-        ),
+        (tmpl.omega_override_fixed.clone(), tmpl.sigma_override_fixed.clone()),
         (vec![false], vec![false]),
         "fixture premise: both overrides are declared free"
     );
@@ -652,10 +581,7 @@ fn saem_chain_holds_sigma_overrides_fixed_in_rebuilt_params() {
         let mut f = fit.clone();
         f.method = method;
         f.method_chain = chain;
-        let mix = fitted_params_from_result(&f, &model)
-            .expect("rebuild")
-            .mixture
-            .expect("mixture");
+        let mix = fitted_params_from_result(&f, &model).expect("rebuild").mixture.expect("mixture");
         (mix.omega_override_fixed, mix.sigma_override_fixed)
     };
     use EstimationMethod::{FoceI, Saem};
@@ -664,11 +590,7 @@ fn saem_chain_holds_sigma_overrides_fixed_in_rebuilt_params() {
         ("saem", Saem, vec![Saem], true),
         ("saem then focei", FoceI, vec![Saem, FoceI], true),
     ] {
-        assert_eq!(
-            flags(method, chain),
-            (vec![false], vec![want]),
-            "{what}: override FIX flags"
-        );
+        assert_eq!(flags(method, chain), (vec![false], vec![want]), "{what}: override FIX flags");
     }
 }
 
@@ -697,10 +619,7 @@ fn mixture_draws_warm_start_from_the_estimates_classes() {
     let (options, params, etas) = scorer_inputs(&model, &fit);
     let class = sir_class_etas(&model, &pop, &params, &options).expect("mixture: Some");
     assert_eq!(class.len(), 2, "one start set per class");
-    assert!(
-        class.iter().all(|c| c.len() == pop.subjects.len()),
-        "one start per subject per class"
-    );
+    assert!(class.iter().all(|c| c.len() == pop.subjects.len()), "one start per subject per class");
     let score = |p: &ModelParameters, starts: &[Vec<DVector<f64>>]| {
         sir_draw_ofv(&model, &pop, p, &params, &etas, Some(starts), &options)
             .expect("a mixture draw is always scored")
@@ -712,43 +631,19 @@ fn mixture_draws_warm_start_from_the_estimates_classes() {
     let mut draw = params.clone();
     draw.theta[0] *= 1.02;
     let (cold, warm) = (ofv(&draw, None), ofv(&draw, Some(&class)));
-    eprintln!(
-        "MEASURE draw cold={cold:?} warm={warm:?} gap={:e}",
-        warm - cold
-    );
+    eprintln!("MEASURE draw cold={cold:?} warm={warm:?} gap={:e}", warm - cold);
     assert!(cold.is_finite() && warm.is_finite(), "{cold} / {warm}");
-    assert_ne!(
-        cold.to_bits(),
-        warm.to_bits(),
-        "fixture premise: warm ≠ cold at the draw"
-    );
-    assert_eq!(
-        score(&draw, &class).to_bits(),
-        warm.to_bits(),
-        "draw not scored warm"
-    );
+    assert_ne!(cold.to_bits(), warm.to_bits(), "fixture premise: warm ≠ cold at the draw");
+    assert_eq!(score(&draw, &class).to_bits(), warm.to_bits(), "draw not scored warm");
 
     // At the estimates the cold pass's own η̂ is a fixed point of the warm solve on macOS
     // arm64 (gap 0), so those starts cannot tell the arms apart; starts moved off it can.
-    let moved: Vec<Vec<DVector<f64>>> = class
-        .iter()
-        .map(|c| c.iter().map(|e| e.add_scalar(0.05)).collect())
-        .collect();
+    let moved: Vec<Vec<DVector<f64>>> =
+        class.iter().map(|c| c.iter().map(|e| e.add_scalar(0.05)).collect()).collect();
     let (cold, warm) = (ofv(&params, None), ofv(&params, Some(&moved)));
-    eprintln!(
-        "MEASURE estimate cold={cold:?} warm={warm:?} gap={:e}",
-        warm - cold
-    );
-    assert_ne!(
-        cold.to_bits(),
-        warm.to_bits(),
-        "fixture premise: warm ≠ cold at the estimate"
-    );
-    assert_eq!(
-        score(&params, &moved).to_bits(),
-        cold.to_bits(),
-        "estimate not scored cold"
-    );
+    eprintln!("MEASURE estimate cold={cold:?} warm={warm:?} gap={:e}", warm - cold);
+    assert_ne!(cold.to_bits(), warm.to_bits(), "fixture premise: warm ≠ cold at the estimate");
+    assert_eq!(score(&params, &moved).to_bits(), cold.to_bits(), "estimate not scored cold");
 
     let prep = crate::api::prepare_run(
         root().join("examples/warfarin.ferx").to_str().unwrap(),
@@ -756,13 +651,7 @@ fn mixture_draws_warm_start_from_the_estimates_classes() {
     )
     .expect("warfarin must prepare");
     assert!(
-        sir_class_etas(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &options
-        )
-        .is_none(),
+        sir_class_etas(&prep.parsed.model, &prep.population, &prep.init_params, &options).is_none(),
         "a non-mixture model has no class starts"
     );
 }
@@ -780,12 +669,7 @@ fn ode_iov_start_reject_inputs(scale: f64) -> (CompiledModel, Population) {
     // The typical prediction: 100 mg into V = 10, CL = 0.2, re-dosed at 24 h.
     let typical = |t: f64| {
         let k = 0.2 / 10.0;
-        10.0 * ((-k * t).exp()
-            + if t >= 24.0 {
-                (-k * (t - 24.0)).exp()
-            } else {
-                0.0
-            })
+        10.0 * ((-k * t).exp() + if t >= 24.0 { (-k * (t - 24.0)).exp() } else { 0.0 })
     };
     let subject = Subject {
         id: "1".into(),
@@ -833,10 +717,7 @@ fn sir_retries_a_rejected_start_cold_and_scores_the_draw() {
     // A draw off the estimates, so `keep_certified_start` is off, as on every real draw.
     let mut draw = params.clone();
     draw.theta[0] *= 1.01;
-    let options = FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    };
+    let options = FitOptions { verbose: false, ..FitOptions::default() };
     let etas = vec![DVector::from_column_slice(&KAPPA_ONLY_START)];
     let mu_k = compute_mu_k(&model, &draw.theta, options.mu_referencing);
     let inner = |warm: Option<&[DVector<f64>]>| {
@@ -864,10 +745,7 @@ fn sir_retries_a_rejected_start_cold_and_scores_the_draw() {
     assert_eq!(cold_stats.n_start_rejected, 0, "a cold start is exempt");
 
     let got = sir_draw_ebes(&model, &pop, &draw, &params, &etas, &options);
-    assert_eq!(
-        got.n_start_rejected, 0,
-        "#2382: the rejected subject is retried cold"
-    );
+    assert_eq!(got.n_start_rejected, 0, "#2382: the rejected subject is retried cold");
     assert_eq!(got.etas, cold_etas, "its EBE is the cold solve's");
     assert_eq!(got.kappas, cold_kappas, "and so are its κ̂");
     assert_eq!(
@@ -875,10 +753,7 @@ fn sir_retries_a_rejected_start_cold_and_scores_the_draw() {
         "and its H-matrix: the placeholder's H = 0 must not survive at the cold η̂"
     );
     let ofv = sir_draw_ofv(&model, &pop, &draw, &params, &etas, None, &options);
-    assert!(
-        ofv.is_some_and(f64::is_finite),
-        "the draw is scored: {ofv:?}"
-    );
+    assert!(ofv.is_some_and(f64::is_finite), "the draw is scored: {ofv:?}");
 }
 
 /// #2382: SIR through `run_sir_core` scores every draw whose warm starts are rejected. At
@@ -902,11 +777,7 @@ fn sir_scores_draws_whose_warm_starts_are_all_rejected() {
     };
     let out = run_sir_core(&model, &pop, &params, &etas, &cov, 0.0, &opts);
     let out = out.expect("every draw is scored from a cold start");
-    assert!(
-        out.effective_sample_size >= 1.0,
-        "ESS {}",
-        out.effective_sample_size
-    );
+    assert!(out.effective_sample_size >= 1.0, "ESS {}", out.effective_sample_size);
 }
 
 /// #2382: a subject the inner loop rejects even cold (a nested-level subject never given
@@ -921,10 +792,7 @@ fn sir_counts_draws_with_a_subject_rejected_even_cold() {
     let (model, mut pop) = fx::prepared(&fx::ode(), 1);
     // Unprepared: occasion labels no longer parallel to the records.
     pop.subjects[0].occasions.pop();
-    assert!(crate::stats::nested_levels::unprepared(
-        &model,
-        &pop.subjects[0]
-    ));
+    assert!(crate::stats::nested_levels::unprepared(&model, &pop.subjects[0]));
     let params = model.default_params.clone();
     let n = crate::estimation::parameterization::pack_params(&params).len();
     let cov = DMatrix::from_diagonal_element(n, n, 0.01);
@@ -965,10 +833,7 @@ fn a_mixture_draw_with_a_rejected_start_is_rescored_cold() {
     let params = model.default_params.clone();
     let mut draw = params.clone();
     draw.theta[0] *= 1.01;
-    let options = FitOptions {
-        verbose: false,
-        ..FitOptions::default()
-    };
+    let options = FitOptions { verbose: false, ..FitOptions::default() };
     let etas = vec![DVector::zeros(model.n_eta)];
     let warm = vec![vec![DVector::from_column_slice(&KAPPA_ONLY_START)]; 2];
     let warm_eval =
@@ -978,16 +843,9 @@ fn a_mixture_draw_with_a_rejected_start_is_rescored_cold() {
         "fixture premise: the warm class starts are rejected"
     );
     let ofv = sir_draw_ofv(&model, &pop, &draw, &params, &etas, Some(&warm), &options);
-    assert!(
-        ofv.is_some_and(f64::is_finite),
-        "#2382: re-scored cold: {ofv:?}"
-    );
+    assert!(ofv.is_some_and(f64::is_finite), "#2382: re-scored cold: {ofv:?}");
 
     let cold = crate::estimation::mixture::mixture_ofv(&model, &pop, &draw, &options, None);
     assert_eq!(cold.ebe_stats.n_start_rejected, 0, "a cold start is exempt");
-    assert_eq!(
-        ofv.map(f64::to_bits),
-        Some(cold.ofv.to_bits()),
-        "the cold objective"
-    );
+    assert_eq!(ofv.map(f64::to_bits), Some(cold.ofv.to_bits()), "the cold objective");
 }

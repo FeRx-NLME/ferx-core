@@ -353,10 +353,7 @@ impl OdeSolverOptions {
     /// stiffness probe and escalation guard included.
     pub(crate) fn for_integration(&self) -> Self {
         match self.method {
-            OdeMethod::Linear => Self {
-                method: OdeMethod::Auto,
-                ..*self
-            },
+            OdeMethod::Linear => Self { method: OdeMethod::Auto, ..*self },
             _ => *self,
         }
     }
@@ -433,8 +430,7 @@ impl OdeSolverOverride {
                 value.map_or(Ok(()), |v| ode_tol_in_domain(name, v))?;
             }
             self.max_steps.map_or(Ok(()), ode_max_steps_in_domain)?;
-            self.stiff_abort_after
-                .map_or(Ok(()), ode_stiff_abort_after_in_domain)
+            self.stiff_abort_after.map_or(Ok(()), ode_stiff_abort_after_in_domain)
         };
         check().map_err(|e| e.to_string())
     }
@@ -813,14 +809,12 @@ impl OdeSolverStats {
     /// Steps force-accepted at `min_dt` over the error test on trajectories the caller
     /// received: a clamp in an `auto` attempt the guard discarded is not one.
     pub(crate) fn kept_clamped_steps(&self) -> usize {
-        self.min_step_clamped_steps
-            .saturating_sub(self.discarded_clamped_steps)
+        self.min_step_clamped_steps.saturating_sub(self.discarded_clamped_steps)
     }
 
     /// Unfinished segments among the trajectories the caller received.
     pub(crate) fn kept_unfinished_segments(&self) -> usize {
-        self.unfinished_segments
-            .saturating_sub(self.discarded_unfinished_segments)
+        self.unfinished_segments.saturating_sub(self.discarded_unfinished_segments)
     }
 
     /// Accumulate another integration's counters into these, for a caller that splits one
@@ -911,12 +905,7 @@ pub(crate) struct StepClock<T> {
 impl<T: PkNum> StepClock<T> {
     #[inline]
     pub(crate) fn new(t: f64, dt: f64) -> Self {
-        StepClock {
-            t,
-            dt,
-            ts: T::from_f64(t),
-            dts: T::from_f64(dt),
-        }
+        StepClock { t, dt, ts: T::from_f64(t), dts: T::from_f64(dt) }
     }
     /// The step's start time.
     #[inline]
@@ -1037,12 +1026,7 @@ pub(crate) trait Stepper<T: PkNum> {
     /// scored at all. On return [`u_new`](Stepper::u_new) and
     /// [`interpolate_component`](Stepper::interpolate_component) describe this attempt.
     fn attempt(
-        &mut self,
-        rhs: &RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt: f64,
+        &mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], t: f64, dt: f64,
         opts: &OdeSolverOptions,
     ) -> f64;
 
@@ -1091,14 +1075,8 @@ pub(crate) trait Stepper<T: PkNum> {
     /// a stepper that can make use of it. Any other stepper takes [`Self::attempt`].
     #[allow(clippy::too_many_arguments)]
     fn attempt_bound(
-        &mut self,
-        _bound: &super::predictions::BoundStep<'_>,
-        rhs: &RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt: f64,
-        opts: &OdeSolverOptions,
+        &mut self, _bound: &super::predictions::BoundStep<'_>, rhs: &RhsG<'_, T>, u: &[T],
+        params: &[T], t: f64, dt: f64, opts: &OdeSolverOptions,
     ) -> f64 {
         self.attempt(rhs, u, params, t, dt, opts)
     }
@@ -1217,13 +1195,8 @@ const SWITCH_LOCATE_MAX: usize = 100;
 /// now holds, which is the forced attempt to `θ·h`.
 #[allow(clippy::too_many_arguments)]
 fn locate_switch<T: PkNum>(
-    stepper: &mut dyn Stepper<T>,
-    sw: &mut Switches<'_, '_, T>,
-    (u, t, h): (&[T], f64, f64),
-    g_old: &[f64],
-    mut g_hi: Vec<f64>,
-    mut k: usize,
-    opts: &OdeSolverOptions,
+    stepper: &mut dyn Stepper<T>, sw: &mut Switches<'_, '_, T>, (u, t, h): (&[T], f64, f64),
+    g_old: &[f64], mut g_hi: Vec<f64>, mut k: usize, opts: &OdeSolverOptions,
 ) -> (f64, usize, Vec<f64>, Option<f64>) {
     let tol = SWITCH_LOCATE_ULPS * f64::EPSILON * (t.abs() + h);
     let mut hi = 1.0_f64;
@@ -1283,12 +1256,7 @@ impl<T: PkNum> Switches<'_, '_, T> {
     /// before it throughout, whichever side its last stages land on.
     #[allow(clippy::too_many_arguments)]
     fn forced_attempt(
-        &self,
-        stepper: &mut dyn Stepper<T>,
-        u: &[T],
-        t: f64,
-        dt: f64,
-        (k, pos): (usize, bool),
+        &self, stepper: &mut dyn Stepper<T>, u: &[T], t: f64, dt: f64, (k, pos): (usize, bool),
         opts: &OdeSolverOptions,
     ) -> f64 {
         if let Some(h) = &self.hook {
@@ -1393,18 +1361,9 @@ impl<'a> Carried<'a> {
 /// (#2786) decides on its value lane with these: no value stepper shadows its lanes.
 #[derive(Clone, Copy)]
 pub(crate) enum CarriedLayout {
-    Rk45 {
-        n: usize,
-    },
-    Erk {
-        n: usize,
-        tab: &'static super::explicit_rk::ErkTableau,
-        dense: bool,
-    },
-    Ros {
-        n: usize,
-        method: OdeMethod,
-    },
+    Rk45 { n: usize },
+    Erk { n: usize, tab: &'static super::explicit_rk::ErkTableau, dense: bool },
+    Ros { n: usize, method: OdeMethod },
 }
 
 impl CarriedLayout {
@@ -1412,11 +1371,7 @@ impl CarriedLayout {
     /// [`Stepper::set_dense_required`].
     pub(crate) fn of(n: usize, method: OdeMethod, dense: bool) -> Self {
         match method {
-            OdeMethod::Vern7 => CarriedLayout::Erk {
-                n,
-                tab: &super::explicit_rk::VERN7,
-                dense,
-            },
+            OdeMethod::Vern7 => CarriedLayout::Erk { n, tab: &super::explicit_rk::VERN7, dense },
             OdeMethod::Rosenbrock23 | OdeMethod::Rodas4 | OdeMethod::Rodas5P => {
                 CarriedLayout::Ros { n, method }
             }
@@ -1475,22 +1430,12 @@ impl CarriedLayout {
     }
     /// [`Stepper::interpolate_component`], `u_old_i` the component's start value.
     pub(crate) fn interp(
-        &self,
-        c: Carried<'_>,
-        theta: f64,
-        u_old_i: f64,
-        dt: f64,
-        i: usize,
+        &self, c: Carried<'_>, theta: f64, u_old_i: f64, dt: f64, i: usize,
     ) -> f64 {
         match *self {
-            CarriedLayout::Rk45 { n } => hermite_g(
-                theta,
-                dt,
-                u_old_i,
-                c.at(i),
-                c.at(8 * n + i),
-                c.at(6 * n + i),
-            ),
+            CarriedLayout::Rk45 { n } => {
+                hermite_g(theta, dt, u_old_i, c.at(i), c.at(8 * n + i), c.at(6 * n + i))
+            }
             CarriedLayout::Erk { n, tab, .. } => {
                 super::explicit_rk::erk_interp(tab, |b, i| c.at(b * n + i), theta, u_old_i, dt, i)
             }
@@ -1540,10 +1485,9 @@ const RK45_ERR_EXP: f64 = 1.0 / 5.0;
 /// [`make_stepper`] as a [`StepBody`].
 pub(crate) fn make_step_body<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn StepBody<T>> {
     match method {
-        OdeMethod::Vern7 => Box::new(super::explicit_rk::ErkStepper::new(
-            n,
-            &super::explicit_rk::VERN7,
-        )),
+        OdeMethod::Vern7 => {
+            Box::new(super::explicit_rk::ErkStepper::new(n, &super::explicit_rk::VERN7))
+        }
         stiff @ (OdeMethod::Rosenbrock23 | OdeMethod::Rodas4 | OdeMethod::Rodas5P) => {
             Box::new(super::rosenbrock::RosStepper::new(n, stiff))
         }
@@ -1555,13 +1499,8 @@ pub(crate) fn make_step_body<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn S
 /// [`integrate_resolved_g_inner`] past the exact-linear path, at `f64`, under the caller's
 /// [`LaneHook`].
 pub(crate) fn integrate_nonlinear_f64(
-    rhs: &RhsG<'_, f64>,
-    u0: &[f64],
-    t_span: (f64, f64),
-    saveat: &[f64],
-    interp_at: &[f64],
-    opts: &OdeSolverOptions,
-    auto_state: &mut OdeAutoSwitchState,
+    rhs: &RhsG<'_, f64>, u0: &[f64], t_span: (f64, f64), saveat: &[f64], interp_at: &[f64],
+    opts: &OdeSolverOptions, auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<f64>>, Vec<SolPointG<f64>>) {
     // A compiled plan's segment (#2786) is the derivative path's integration, counted as the
     // dual sweeps' were; the run a recording makes of it is not (whether one happens depends
@@ -1579,17 +1518,7 @@ pub(crate) fn integrate_nonlinear_f64(
             auto_state,
         );
     }
-    integrate_resolved_g(
-        rhs,
-        u0,
-        t_span,
-        &[],
-        saveat,
-        interp_at,
-        opts,
-        None,
-        auto_state,
-    )
+    integrate_resolved_g(rhs, u0, t_span, &[], saveat, interp_at, opts, None, auto_state)
 }
 
 /// Build the stepper for `method`, sized for an `n`-state system.
@@ -1608,10 +1537,9 @@ pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Ste
     }
     match method {
         OdeMethod::Rk45 => Box::new(PooledRk45::take(n)),
-        OdeMethod::Vern7 => Box::new(super::explicit_rk::ErkStepper::new(
-            n,
-            &super::explicit_rk::VERN7,
-        )),
+        OdeMethod::Vern7 => {
+            Box::new(super::explicit_rk::ErkStepper::new(n, &super::explicit_rk::VERN7))
+        }
         stiff @ (OdeMethod::Rosenbrock23 | OdeMethod::Rodas4 | OdeMethod::Rodas5P) => {
             Box::new(super::rosenbrock::RosStepper::new(n, stiff))
         }
@@ -1725,12 +1653,7 @@ impl<T: PkNum> Drop for PooledRk45<T> {
 
 impl<T: PkNum> Stepper<T> for PooledRk45<T> {
     fn attempt(
-        &mut self,
-        rhs: &RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt: f64,
+        &mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], t: f64, dt: f64,
         opts: &OdeSolverOptions,
     ) -> f64 {
         self.get_mut().attempt(rhs, u, params, t, dt, opts)
@@ -1760,17 +1683,10 @@ impl<T: PkNum> Stepper<T> for PooledRk45<T> {
         self.get().stiffness_indicator(dt)
     }
     fn attempt_bound(
-        &mut self,
-        bound: &super::predictions::BoundStep<'_>,
-        rhs: &RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt: f64,
-        opts: &OdeSolverOptions,
+        &mut self, bound: &super::predictions::BoundStep<'_>, rhs: &RhsG<'_, T>, u: &[T],
+        params: &[T], t: f64, dt: f64, opts: &OdeSolverOptions,
     ) -> f64 {
-        self.get_mut()
-            .attempt_bound(bound, rhs, u, params, t, dt, opts)
+        self.get_mut().attempt_bound(bound, rhs, u, params, t, dt, opts)
     }
     fn burst(&mut self, c: &mut Burst<'_, T>) -> Option<(f64, f64)> {
         self.get_mut().burst(c)
@@ -1870,13 +1786,7 @@ impl<T: PkNum> Rk45Stepper<T> {
     #[allow(clippy::needless_range_loop)]
     #[inline(always)]
     fn attempt_with<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        rhs: &R,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt_eff: f64,
-        opts: &OdeSolverOptions,
+        &mut self, rhs: &R, u: &[T], params: &[T], t: f64, dt_eff: f64, opts: &OdeSolverOptions,
     ) -> f64 {
         let n = self.n;
         self.attempt_len(n, rhs, u, params, t, dt_eff, opts)
@@ -1887,13 +1797,7 @@ impl<T: PkNum> Rk45Stepper<T> {
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
     fn attempt_len<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        n: usize,
-        rhs: &R,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt_eff: f64,
+        &mut self, n: usize, rhs: &R, u: &[T], params: &[T], t: f64, dt_eff: f64,
         opts: &OdeSolverOptions,
     ) -> f64 {
         debug_assert_eq!(n, self.n);
@@ -1906,11 +1810,7 @@ impl<T: PkNum> Rk45Stepper<T> {
     #[allow(clippy::needless_range_loop)]
     #[inline(always)]
     pub(crate) fn stages<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        rhs: &R,
-        u: &[T],
-        params: &[T],
-        clock: &StepClock<T>,
+        &mut self, rhs: &R, u: &[T], params: &[T], clock: &StepClock<T>,
     ) {
         let n = self.n;
         self.stages_len(n, rhs, u, params, clock)
@@ -1919,12 +1819,7 @@ impl<T: PkNum> Rk45Stepper<T> {
     #[allow(clippy::needless_range_loop)]
     #[inline(always)]
     fn stages_len<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        n: usize,
-        rhs: &R,
-        u: &[T],
-        params: &[T],
-        clock: &StepClock<T>,
+        &mut self, n: usize, rhs: &R, u: &[T], params: &[T], clock: &StepClock<T>,
     ) {
         // The Butcher combinations keep the exact association of the original f64 loop
         // (`dt·(B31·k1 + B32·k2)`, not `(dt·B31)·k1 + …`), so instantiating at `T = f64`
@@ -1939,19 +1834,7 @@ impl<T: PkNum> Rk45Stepper<T> {
         //
         // Every buffer is cut to `n` up front, so the loops index without bounds checks
         // and the compiler keeps the stage pointers in registers across the calls.
-        let Self {
-            k1,
-            k2,
-            k3,
-            k4,
-            k5,
-            k6,
-            k7,
-            u_tmp,
-            u5,
-            have_k1,
-            ..
-        } = self;
+        let Self { k1, k2, k3, k4, k5, k6, k7, u_tmp, u5, have_k1, .. } = self;
         let (k1, k2, k3, k4, k5, k6, k7) = (
             &mut k1[..n],
             &mut k2[..n],
@@ -2015,13 +1898,7 @@ impl<T: PkNum> Rk45Stepper<T> {
     fn err_norm_len(&self, n: usize, u: &[T], dt_eff: f64, opts: &OdeSolverOptions) -> f64 {
         let blocks = self.blocks_n(n);
         let u = &u[..n];
-        rk45_err_norm(
-            n,
-            |b, i| blocks[b][i].plain(),
-            |i| u[i].plain(),
-            dt_eff,
-            opts,
-        )
+        rk45_err_norm(n, |b, i| blocks[b][i].plain(), |i| u[i].plain(), dt_eff, opts)
     }
 
     /// Every carried block cut to `n` (the [`StepBody::carried_into`] order), so a loop over
@@ -2047,10 +1924,7 @@ impl<T: PkNum> Rk45Stepper<T> {
 /// value lane ([`CarriedLayout`]) — one definition, so both decide alike bit for bit.
 #[inline(always)]
 fn rk45_err_norm(
-    n: usize,
-    k: impl Fn(usize, usize) -> f64,
-    u: impl Fn(usize) -> f64,
-    dt_eff: f64,
+    n: usize, k: impl Fn(usize, usize) -> f64, u: impl Fn(usize) -> f64, dt_eff: f64,
     opts: &OdeSolverOptions,
 ) -> f64 {
     let mut err_norm = 0.0;
@@ -2134,12 +2008,7 @@ impl<T: PkNum> StepBody<T> for Rk45Stepper<T> {
 
 impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     fn attempt(
-        &mut self,
-        rhs: &RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt_eff: f64,
+        &mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], t: f64, dt_eff: f64,
         opts: &OdeSolverOptions,
     ) -> f64 {
         // A registered `f64` right-hand side runs its machine code directly at every stage:
@@ -2178,14 +2047,8 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     }
 
     fn attempt_bound(
-        &mut self,
-        bound: &super::predictions::BoundStep<'_>,
-        _rhs: &RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt_eff: f64,
-        opts: &OdeSolverOptions,
+        &mut self, bound: &super::predictions::BoundStep<'_>, _rhs: &RhsG<'_, T>, u: &[T],
+        params: &[T], t: f64, dt_eff: f64, opts: &OdeSolverOptions,
     ) -> f64 {
         // The common small state sizes get their own copy of the step with `n` a literal.
         match self.n {
@@ -2248,8 +2111,7 @@ fn next_dt_eff(dt: f64, t: f64, tf: f64, saveat: &[f64], save_idx: usize, min_dt
 /// for the driver to finish. `None` means the segment ended or the step budget ran out.
 #[inline(always)]
 fn plain_attempts<T: PkNum, S: Stepper<T> + ?Sized>(
-    s: &mut S,
-    c: &mut Burst<'_, T>,
+    s: &mut S, c: &mut Burst<'_, T>,
 ) -> Option<(f64, f64)> {
     let (bound, rhs, params, opts) = (c.bound, c.rhs, c.params, c.opts);
     let (saveat, interp_at, tf, err_exp) = (c.saveat, c.interp_at, c.tf, c.err_exp);
@@ -2290,10 +2152,7 @@ fn plain_attempts<T: PkNum, S: Stepper<T> + ?Sized>(
             copy_state(u, s.u_new());
             s.on_accept();
             while save_idx < saveat.len() && (t - saveat[save_idx]).abs() < 1e-12 {
-                c.results.push(SolPointG {
-                    t: saveat[save_idx],
-                    u: u.to_vec(),
-                });
+                c.results.push(SolPointG { t: saveat[save_idx], u: u.to_vec() });
                 save_idx += 1;
             }
             since_probe += c.on_explicit as usize;
@@ -2381,16 +2240,9 @@ fn interp_idx_due(interp_at: &[f64], idx: usize, t_new: f64) -> bool {
 #[allow(clippy::too_many_arguments)]
 /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
 fn integrate_dense_g<T: PkNum>(
-    method: OdeMethod,
-    rhs: &RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
-    opts: &OdeSolverOptions,
-    mut stats: Option<&mut OdeSolverStats>,
-    auto_state: &mut OdeAutoSwitchState,
+    method: OdeMethod, rhs: &RhsG<'_, T>, u0: &[T], t_span: (f64, f64), params: &[T],
+    saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions,
+    mut stats: Option<&mut OdeSolverStats>, auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let n = u0.len();
     let (t0, tf) = t_span;
@@ -2658,10 +2510,7 @@ fn integrate_dense_g<T: PkNum>(
                 if let Some(h) = &hook {
                     h.point(false);
                 }
-                results.push(SolPointG {
-                    t: saveat[save_idx],
-                    u: u.clone(),
-                });
+                results.push(SolPointG { t: saveat[save_idx], u: u.clone() });
                 save_idx += 1;
             }
 
@@ -2749,9 +2598,7 @@ fn integrate_dense_g<T: PkNum>(
         // nothing. Counting it would report a fully-integrated segment as truncated, which is
         // the one thing this counter must never do.
         if t < tf - 1e-15
-            && opts
-                .stiff_abort_after
-                .is_some_and(|budget| min_step_clamps >= budget.max(1))
+            && opts.stiff_abort_after.is_some_and(|budget| min_step_clamps >= budget.max(1))
         {
             // A budgeted stop on a state that has already gone non-finite is a divergence, and
             // is counted as one below (`diverged_segments`) rather than here: its tail is
@@ -2817,20 +2664,14 @@ fn integrate_dense_g<T: PkNum>(
         if let Some(h) = &hook {
             h.tail(false, diverged);
         }
-        results.push(SolPointG {
-            t: saveat[save_idx],
-            u: tail.clone(),
-        });
+        results.push(SolPointG { t: saveat[save_idx], u: tail.clone() });
         save_idx += 1;
     }
     while interp_idx < interp_at.len() {
         if let Some(h) = &hook {
             h.tail(true, diverged);
         }
-        interp_results.push(SolPointG {
-            t: interp_at[interp_idx],
-            u: tail.clone(),
-        });
+        interp_results.push(SolPointG { t: interp_at[interp_idx], u: tail.clone() });
         interp_idx += 1;
     }
 
@@ -2847,12 +2688,8 @@ fn integrate_dense_g<T: PkNum>(
 /// (a generator that varies in time between its sample points, say). The exact path is taken
 /// only for a model whose `[odes]` block the parser certified (#852).
 pub fn solve_ode(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64], t_span: (f64, f64), params: &[f64],
+    saveat: &[f64], opts: &OdeSolverOptions,
 ) -> Vec<SolPoint> {
     solve_ode_with_stats(rhs, u0, t_span, params, saveat, opts, None)
 }
@@ -2862,12 +2699,8 @@ pub fn solve_ode(
 /// built — the one place [`OdeMethod::Linear`] is honoured, because only there did the parser
 /// certify the system linear.
 pub(crate) fn solve_ode_certified(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64], t_span: (f64, f64), params: &[f64],
+    saveat: &[f64], opts: &OdeSolverOptions,
 ) -> Vec<SolPoint> {
     solve_ode_dense(rhs, u0, t_span, params, saveat, &[], opts, None).0
 }
@@ -2877,13 +2710,8 @@ pub(crate) fn solve_ode_certified(
 /// The counters are intentionally local to this integration segment. Higher layers that split
 /// by dose/observation boundaries can aggregate across calls to classify a full subject or fit.
 pub fn solve_ode_with_stats(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
-    stats: Option<&mut OdeSolverStats>,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64], t_span: (f64, f64), params: &[f64],
+    saveat: &[f64], opts: &OdeSolverOptions, stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPoint> {
     // Uncertified closure: never the exact path (see `solve_ode`).
     let opts = &opts.for_integration();
@@ -2898,14 +2726,8 @@ pub fn solve_ode_with_stats(
 /// every method, since the interpolation comes from the [`Stepper`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_ode_dense(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    saveat: &[f64],
-    interp_at: &[f64],
-    opts: &OdeSolverOptions,
-    stats: Option<&mut OdeSolverStats>,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64], t_span: (f64, f64), params: &[f64],
+    saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions, stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPoint>, Vec<SolPoint>) {
     let mut auto_state = OdeAutoSwitchState::default();
     solve_ode_dense_with_auto_state(
@@ -2926,19 +2748,12 @@ pub(crate) fn solve_ode_dense(
 /// an event may invalidate their stages and Jacobian.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_ode_dense_with_auto_state(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u0: &[f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    saveat: &[f64],
-    interp_at: &[f64],
-    opts: &OdeSolverOptions,
-    stats: Option<&mut OdeSolverStats>,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u0: &[f64], t_span: (f64, f64), params: &[f64],
+    saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions, stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPoint>, Vec<SolPoint>) {
-    let (hard, soft) = integrate_resolved_g(
-        rhs, u0, t_span, params, saveat, interp_at, opts, stats, auto_state,
-    );
+    let (hard, soft) =
+        integrate_resolved_g(rhs, u0, t_span, params, saveat, interp_at, opts, stats, auto_state);
     let to_points = |v: Vec<SolPointG<f64>>| -> Vec<SolPoint> {
         v.into_iter().map(|p| SolPoint { t: p.t, u: p.u }).collect()
     };
@@ -2983,13 +2798,8 @@ pub enum ThresholdCrossing {
 /// continuous extension — so this works for every [`OdeMethod`], and a method added later needs
 /// no changes here.
 pub fn solve_ode_until_threshold(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u: &mut [f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    opts: &OdeSolverOptions,
-    monitor: usize,
-    threshold: f64,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u: &mut [f64], t_span: (f64, f64),
+    params: &[f64], opts: &OdeSolverOptions, monitor: usize, threshold: f64,
 ) -> ThresholdCrossing {
     solve_ode_until_threshold_labelled(rhs, u, t_span, params, opts, monitor, threshold, None)
 }
@@ -3000,13 +2810,8 @@ pub fn solve_ode_until_threshold(
 /// accumulator). `None` is the public driver, byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_ode_until_threshold_labelled(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u: &mut [f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    opts: &OdeSolverOptions,
-    monitor: usize,
-    threshold: f64,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u: &mut [f64], t_span: (f64, f64),
+    params: &[f64], opts: &OdeSolverOptions, monitor: usize, threshold: f64,
     labels: Option<&[String]>,
 ) -> ThresholdCrossing {
     // The crossing search bisects a step's continuous extension and has no exact counterpart,
@@ -3014,10 +2819,7 @@ pub(crate) fn solve_ode_until_threshold_labelled(
     let opts = &opts.for_integration();
     // The explicit re-solve pins its method, which also takes mid-segment switching off it:
     // a fallback that could escalate again would be the escalation it is undoing.
-    let pinned_explicit = OdeSolverOptions {
-        method: OdeMethod::EXPLICIT_FALLBACK,
-        ..*opts
-    };
+    let pinned_explicit = OdeSolverOptions { method: OdeMethod::EXPLICIT_FALLBACK, ..*opts };
     // Both early exits below return without stepping, so probe after them rather than before.
     if u[monitor] >= threshold || (t_span.1 - t_span.0).abs() < 1e-15 {
         return until_threshold_with(
@@ -3053,9 +2855,8 @@ pub(crate) fn solve_ode_until_threshold_labelled(
     // draw laundered out of a diverged stiff solve would be the worst possible outcome here,
     // so the retry is not optional.
     let u_entry = u.to_vec();
-    let run = until_threshold_with(
-        rhs, u, t_span, params, opts, monitor, threshold, method, labels,
-    );
+    let run =
+        until_threshold_with(rhs, u, t_span, params, opts, monitor, threshold, method, labels);
 
     // Both halves of the dense driver's guard, in the shape this driver reports outcomes in.
     //
@@ -3135,14 +2936,8 @@ struct ThresholdRun {
 
 #[allow(clippy::too_many_arguments)]
 fn until_threshold_with(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u: &mut [f64],
-    t_span: (f64, f64),
-    params: &[f64],
-    opts: &OdeSolverOptions,
-    monitor: usize,
-    threshold: f64,
-    method: OdeMethod,
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), u: &mut [f64], t_span: (f64, f64),
+    params: &[f64], opts: &OdeSolverOptions, monitor: usize, threshold: f64, method: OdeMethod,
     labels: Option<&[String]>,
 ) -> ThresholdRun {
     let (t0, tf) = t_span;
@@ -3187,11 +2982,7 @@ fn until_threshold_with(
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
-            return ended(
-                ThresholdCrossing::ReachedEnd,
-                stiff_min_step_clamped,
-                ran_stiff,
-            );
+            return ended(ThresholdCrossing::ReachedEnd, stiff_min_step_clamped, ran_stiff);
         }
 
         let dt_eff = dt.min(tf - t);
@@ -3301,10 +3092,7 @@ fn until_threshold_with(
         // its saves: a clamped step can still be the step that brackets the crossing, and the
         // bisection above has already returned it. Giving up on an answer the solver just
         // found would be a strictly worse outcome than the cost this budget exists to bound.
-        if opts
-            .stiff_abort_after
-            .is_some_and(|budget| clamps >= budget.max(1))
-        {
+        if opts.stiff_abort_after.is_some_and(|budget| clamps >= budget.max(1)) {
             return failed(
                 with_nonfinite_state_note(
                     u,
@@ -3358,10 +3146,7 @@ fn until_threshold_with(
 /// With `labels` the states are named by their labels, comma-joined as the sentence's subject
 /// (#2087), instead of the `state(s) <k>` index form that `None` prints.
 fn with_nonfinite_state_note(
-    u: &[f64],
-    t: f64,
-    labels: Option<&[String]>,
-    clause: String,
+    u: &[f64], t: f64, labels: Option<&[String]>, clause: String,
 ) -> String {
     let bad: Vec<String> = u
         .iter()
@@ -3373,27 +3158,18 @@ fn with_nonfinite_state_note(
         (0, _) => clause,
         // A label is a full noun phrase (`` [odes] state `x` ``, "the cumulative hazard of
         // CMT=3"), so the labelled form carries no "state(s)" prefix of its own.
-        (_, true) => format!(
-            "{} became non-finite before t={t:.6}; {clause}",
-            bad.join(", ")
-        ),
-        (1, false) => format!(
-            "state {} became non-finite before t={t:.6}; {clause}",
-            bad[0]
-        ),
-        (_, false) => format!(
-            "states {} became non-finite before t={t:.6}; {clause}",
-            bad.join(", ")
-        ),
+        (_, true) => format!("{} became non-finite before t={t:.6}; {clause}", bad.join(", ")),
+        (1, false) => format!("state {} became non-finite before t={t:.6}; {clause}", bad[0]),
+        (_, false) => {
+            format!("states {} became non-finite before t={t:.6}; {clause}", bad.join(", "))
+        }
     }
 }
 
 /// State `k` as a `Failed` message names it: its label when the caller supplied one, else the
 /// 0-based index.
 fn state_label(labels: Option<&[String]>, k: usize) -> String {
-    labels
-        .and_then(|l| l.get(k))
-        .map_or_else(|| k.to_string(), String::clone)
+    labels.and_then(|l| l.get(k)).map_or_else(|| k.to_string(), String::clone)
 }
 
 /// The monitored state as the subject of a `Failed` sentence: `monitored state <k>` without
@@ -3422,12 +3198,8 @@ pub struct SolPointG<T> {
 /// sequence. (Adapting on a derivative norm would make the sensitivity inconsistent with the
 /// prediction.)
 pub fn solve_ode_g<T: crate::sens::num::PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]), u0: &[T], t_span: (f64, f64), params: &[T],
+    saveat: &[f64], opts: &OdeSolverOptions,
 ) -> Vec<SolPointG<T>> {
     solve_ode_g_with_stats(rhs, u0, t_span, params, saveat, opts, None)
 }
@@ -3436,37 +3208,17 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
 /// [`solve_ode_certified`], and like it the only `solve_ode_g*` route that honours
 /// [`OdeMethod::Linear`].
 pub(crate) fn solve_ode_g_certified<T: crate::sens::num::PkNum>(
-    rhs: &RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
+    rhs: &RhsG<'_, T>, u0: &[T], t_span: (f64, f64), params: &[T], saveat: &[f64],
     opts: &OdeSolverOptions,
 ) -> Vec<SolPointG<T>> {
     let mut auto_state = OdeAutoSwitchState::default();
-    integrate_resolved_g(
-        rhs,
-        u0,
-        t_span,
-        params,
-        saveat,
-        &[],
-        opts,
-        None,
-        &mut auto_state,
-    )
-    .0
+    integrate_resolved_g(rhs, u0, t_span, params, saveat, &[], opts, None, &mut auto_state).0
 }
 
 /// [`solve_ode_g`] with optional adaptive-step instrumentation.
 pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
-    stats: Option<&mut OdeSolverStats>,
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]), u0: &[T], t_span: (f64, f64), params: &[T],
+    saveat: &[f64], opts: &OdeSolverOptions, stats: Option<&mut OdeSolverStats>,
 ) -> Vec<SolPointG<T>> {
     solve_ode_g_dense(rhs, u0, t_span, params, saveat, &[], opts, stats).0
 }
@@ -3475,13 +3227,8 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
 /// intervals of one prediction/sensitivity walk.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_ode_g_with_auto_state<T: crate::sens::num::PkNum>(
-    rhs: &RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
-    auto_state: &mut OdeAutoSwitchState,
+    rhs: &RhsG<'_, T>, u0: &[T], t_span: (f64, f64), params: &[T], saveat: &[f64],
+    opts: &OdeSolverOptions, auto_state: &mut OdeAutoSwitchState,
 ) -> Vec<SolPointG<T>> {
     integrate_resolved_g(rhs, u0, t_span, params, saveat, &[], opts, None, auto_state).0
 }
@@ -3492,14 +3239,8 @@ pub(crate) fn solve_ode_g_with_auto_state<T: crate::sens::num::PkNum>(
 /// at an event time, say) has one to call.
 #[allow(clippy::too_many_arguments)]
 pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
-    opts: &OdeSolverOptions,
-    stats: Option<&mut OdeSolverStats>,
+    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]), u0: &[T], t_span: (f64, f64), params: &[T],
+    saveat: &[f64], interp_at: &[f64], opts: &OdeSolverOptions, stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let mut auto_state = OdeAutoSwitchState::default();
     let rhs = rhs_of_f64_time(rhs);
@@ -3555,9 +3296,7 @@ pub(crate) struct SolverStatsScope {
 impl SolverStatsScope {
     /// Begin collecting on this thread.
     pub(crate) fn enter() -> Self {
-        Self {
-            prev: STATS_SINK.with(|c| c.replace(Some(OdeSolverStats::default()))),
-        }
+        Self { prev: STATS_SINK.with(|c| c.replace(Some(OdeSolverStats::default()))) }
     }
 
     /// Counters accumulated since [`enter`](Self::enter).
@@ -3614,10 +3353,7 @@ pub(crate) fn record_abandoned_non_finite_timeline(stats: Option<&mut OdeSolverS
     // hand-written `STATS_SINK` read-modify-write next to `record_to_stats_sink`'s: this is
     // also what makes `merge`'s `abandoned_non_finite_timeline` line reachable, since nothing
     // else ever produces a non-scope `OdeSolverStats` carrying the field.
-    let one = OdeSolverStats {
-        abandoned_non_finite_timeline: 1,
-        ..Default::default()
-    };
+    let one = OdeSolverStats { abandoned_non_finite_timeline: 1, ..Default::default() };
     record_to_stats_sink(&one);
     if let Some(s) = stats {
         s.merge(&one);
@@ -3628,10 +3364,7 @@ pub(crate) fn record_abandoned_non_finite_timeline(stats: Option<&mut OdeSolverS
 /// [`SolverStatsScope`] (#2786): its recording declined them, and the plan replays that.
 pub(crate) fn note_linear_declines(n: usize) {
     if stats_sink_active() {
-        record_to_stats_sink(&OdeSolverStats {
-            linear_declined_segments: n,
-            ..Default::default()
-        });
+        record_to_stats_sink(&OdeSolverStats { linear_declined_segments: n, ..Default::default() });
     }
 }
 
@@ -3639,16 +3372,11 @@ pub(crate) fn note_linear_declines(n: usize) {
 /// segment entered with a non-finite state returns without stepping (#2788). `v · NaN`, as in
 /// `integrate_dense_g`'s diverged tail, so a dual's gradient and Hessian block are `NaN` too.
 fn nan_trajectory<T: PkNum>(
-    u0: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
+    u0: &[T], saveat: &[f64], interp_at: &[f64],
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let nan: Vec<T> = u0.iter().map(|&v| v * T::from_f64(f64::NAN)).collect();
     let at = |times: &[f64]| -> Vec<SolPointG<T>> {
-        times
-            .iter()
-            .map(|&t| SolPointG { t, u: nan.clone() })
-            .collect()
+        times.iter().map(|&t| SolPointG { t, u: nan.clone() }).collect()
     };
     (at(saveat), at(interp_at))
 }
@@ -3658,14 +3386,8 @@ fn nan_trajectory<T: PkNum>(
 /// Off the diagnostic path this is one `Cell` read per segment and the same call as before.
 #[allow(clippy::too_many_arguments)]
 fn integrate_resolved_g<T: PkNum>(
-    rhs: &RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
-    opts: &OdeSolverOptions,
-    stats: Option<&mut OdeSolverStats>,
+    rhs: &RhsG<'_, T>, u0: &[T], t_span: (f64, f64), params: &[T], saveat: &[f64],
+    interp_at: &[f64], opts: &OdeSolverOptions, stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     // A recording type's solve (#2786) records a plan, which happens or not by what the plan
@@ -3721,14 +3443,8 @@ fn integrate_resolved_g<T: PkNum>(
 /// a derivative.
 #[allow(clippy::too_many_arguments)]
 fn integrate_resolved_g_inner<T: PkNum>(
-    rhs: &RhsG<'_, T>,
-    u0: &[T],
-    t_span: (f64, f64),
-    params: &[T],
-    saveat: &[f64],
-    interp_at: &[f64],
-    opts: &OdeSolverOptions,
-    mut stats: Option<&mut OdeSolverStats>,
+    rhs: &RhsG<'_, T>, u0: &[T], t_span: (f64, f64), params: &[T], saveat: &[f64],
+    interp_at: &[f64], opts: &OdeSolverOptions, mut stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     // The driver below reads values; a recording reaches it only through `T::ode_segment`.
@@ -3836,10 +3552,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // The explicit re-solve the guard falls back to **pins** its method, which is also what
     // takes mid-segment switching off it (`integrate_dense_g` switches only under `auto`): a
     // re-solve that could escalate again would be the escalation the guard is undoing.
-    let pinned_explicit = OdeSolverOptions {
-        method: OdeMethod::EXPLICIT_FALLBACK,
-        ..*opts
-    };
+    let pinned_explicit = OdeSolverOptions { method: OdeMethod::EXPLICIT_FALLBACK, ..*opts };
 
     // Not a guarded solve — a named method, or `auto` reading the system as non-stiff *and*
     // unable to change its mind later. Nothing to discard, and the caller's counters are
@@ -3967,12 +3680,8 @@ fn integrate_resolved_g_inner<T: PkNum>(
     // that clamps its way to `tf` is the ordinary stability-limited outcome that clause already
     // describes, not a second failure to re-report here.
     let mut fallback = OdeSolverStats::default();
-    let fallback_out = run(
-        OdeMethod::EXPLICIT_FALLBACK,
-        &pinned_explicit,
-        Some(&mut fallback),
-        auto_state,
-    );
+    let fallback_out =
+        run(OdeMethod::EXPLICIT_FALLBACK, &pinned_explicit, Some(&mut fallback), auto_state);
     // Scored on the same two finiteness questions as the attempt, jets included (#1204 item
     // 4): an explicit re-solve that returns finite values with `NaN` jets has not repaired
     // the gradient the guard discarded the escalation to repair, and reporting it as a
@@ -3995,9 +3704,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
 /// to `T = f64`, which is what keeps the two paths on the same stepper).
 /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
 fn finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
-    points
-        .iter()
-        .all(|p| p.u.iter().all(|v| v.plain().is_finite()))
+    points.iter().all(|p| p.u.iter().all(|v| v.plain().is_finite()))
 }
 
 /// Whether every saved state's **derivative jets** are finite, reading the jets only.
@@ -4053,26 +3760,16 @@ mod tests {
                 }));
                 assert!(r.is_err());
                 let now = lane_hook::<f64>().expect("the outer hook is back in force");
-                assert!(
-                    Rc::ptr_eq(&now, &o),
-                    "the outer hook, not the dead inner one"
-                );
+                assert!(Rc::ptr_eq(&now, &o), "the outer hook, not the dead inner one");
                 panic!("the outer operation fails");
             })
         }));
         assert!(r.is_err());
-        assert!(
-            lane_hook::<f64>().is_none(),
-            "no hook outlives the panicked operation"
-        );
+        assert!(lane_hook::<f64>().is_none(), "no hook outlives the panicked operation");
         // Normal return restores too, and the hook is not kept alive by the thread.
         with_lane_hook(outer.clone(), || ());
         assert!(lane_hook::<f64>().is_none());
-        assert_eq!(
-            Rc::strong_count(&outer),
-            2,
-            "only `outer` and its clone `o`"
-        );
+        assert_eq!(Rc::strong_count(&outer), 2, "only `outer` and its clone `o`");
         assert_eq!(Rc::strong_count(&inner), 2);
     }
 
@@ -4083,14 +3780,7 @@ mod tests {
     fn a_solve_starts_with_no_stale_switch_count() {
         note_switches(3);
         let rhs = |u: &[f64], _: &[f64], _: f64, du: &mut [f64]| du[0] = -u[0];
-        let out = solve_ode(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &OdeSolverOptions::default(),
-        );
+        let out = solve_ode(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &OdeSolverOptions::default());
         assert!((out[0].u[0] - (-1.0f64).exp()).abs() < 1e-4);
         assert_eq!(take_switches(), 0, "the stale count was cleared at entry");
     }
@@ -4124,20 +3814,14 @@ mod tests {
 
     #[test]
     fn untouched_fit_options_carry_no_override() {
-        assert!(crate::types::FitOptions::default()
-            .ode_solver_override()
-            .is_empty());
+        assert!(crate::types::FitOptions::default().ode_solver_override().is_empty());
     }
 
     /// The no-loosening half of #1212: a caller who never touched `ode_reltol` must not
     /// pull a model file that pinned `1e-10` back to the `1e-4` default.
     #[test]
     fn an_empty_override_keeps_a_pinned_spec_value() {
-        let baked = OdeSolverOptions {
-            reltol: 1e-10,
-            abstol: 1e-12,
-            ..Default::default()
-        };
+        let baked = OdeSolverOptions { reltol: 1e-10, abstol: 1e-12, ..Default::default() };
         let merged = OdeSolverOverride::default().apply_to(baked);
         assert_eq!(merged.reltol, 1e-10);
         assert_eq!(merged.abstol, 1e-12);
@@ -4186,10 +3870,8 @@ mod tests {
         // Nothing armed: the spec's own value, untouched.
         assert_eq!(effective_solver_options(baked).reltol, baked.reltol);
 
-        let outer = arm_ode_solver_override(OdeSolverOverride {
-            reltol: Some(1e-9),
-            ..Default::default()
-        });
+        let outer =
+            arm_ode_solver_override(OdeSolverOverride { reltol: Some(1e-9), ..Default::default() });
         assert_eq!(effective_solver_options(baked).reltol, 1e-9);
         {
             // A nested fit's opinion wins while it runs...
@@ -4283,10 +3965,7 @@ mod tests {
     #[test]
     fn only_the_pool_built_for_an_override_carries_it() {
         let baked = OdeSolverOptions::default();
-        let ov = OdeSolverOverride {
-            reltol: Some(1e-11),
-            ..Default::default()
-        };
+        let ov = OdeSolverOverride { reltol: Some(1e-11), ..Default::default() };
         let _tight = arm_ode_solver_override(ov);
 
         // The shared pool's workers never install an override, so a default-options fit
@@ -4361,10 +4040,7 @@ mod tests {
 
         // A budget of `None` is distinct from the field being unset: it has to overwrite the
         // baked `Some(7)` rather than leave it standing.
-        let ov = OdeSolverOverride {
-            stiff_abort_after: Some(None),
-            ..Default::default()
-        };
+        let ov = OdeSolverOverride { stiff_abort_after: Some(None), ..Default::default() };
         let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| assert_eq!(effective_solver_options(baked).stiff_abort_after, None));
     }
@@ -4380,11 +4056,8 @@ mod tests {
     #[test]
     fn a_nested_call_that_pins_threads_stays_on_the_override_pool() {
         let baked = OdeSolverOptions::default();
-        let opts = crate::types::FitOptions {
-            ode_reltol: 1e-11,
-            threads: Some(2),
-            ..Default::default()
-        };
+        let opts =
+            crate::types::FitOptions { ode_reltol: 1e-11, threads: Some(2), ..Default::default() };
         let ov = opts.ode_solver_override();
         let pool = crate::api::fit_scope_pool(ov.into(), 2).expect("the override pool builds");
         pool.install(|| {
@@ -4408,14 +4081,8 @@ mod tests {
     /// or a bootstrap's independently budgeted replicate fits would share one worker budget.
     #[test]
     fn the_override_pool_table_is_keyed_by_the_override() {
-        let a = OdeSolverOverride {
-            reltol: Some(1e-9),
-            ..Default::default()
-        };
-        let b = OdeSolverOverride {
-            reltol: Some(1e-10),
-            ..Default::default()
-        };
+        let a = OdeSolverOverride { reltol: Some(1e-9), ..Default::default() };
+        let b = OdeSolverOverride { reltol: Some(1e-10), ..Default::default() };
         let pool_a = crate::api::fit_scope_pool(a.into(), 2).expect("pool a");
         let pool_b = crate::api::fit_scope_pool(b.into(), 2).expect("pool b");
         let pool_a_again = crate::api::fit_scope_pool(a.into(), 2).expect("pool a again");
@@ -4525,16 +4192,8 @@ mod tests {
         let opts = OdeSolverOptions::default();
 
         let reference = solve_ode(&rhs, &[1.0, 0.0], (0.0, 12.0), &[], &saveat, &opts);
-        let (hard, soft) = solve_ode_dense(
-            &rhs,
-            &[1.0, 0.0],
-            (0.0, 12.0),
-            &[],
-            &saveat,
-            &interp_at,
-            &opts,
-            None,
-        );
+        let (hard, soft) =
+            solve_ode_dense(&rhs, &[1.0, 0.0], (0.0, 12.0), &[], &saveat, &interp_at, &opts, None);
 
         assert_eq!(hard.len(), saveat.len());
         assert_eq!(soft.len(), interp_at.len());
@@ -4561,21 +4220,9 @@ mod tests {
 
         // Tight tolerance ⇒ small steps ⇒ the Hermite read-back is near-exact, so
         // this pins the *interpolant* rather than the solver's own truncation.
-        let tight = OdeSolverOptions {
-            abstol: 1e-10,
-            reltol: 1e-9,
-            ..Default::default()
-        };
-        let (_h, soft) = solve_ode_dense(
-            &rhs,
-            &[1.0, 0.0],
-            (0.0, 10.0),
-            &[],
-            &saveat,
-            &interp_at,
-            &tight,
-            None,
-        );
+        let tight = OdeSolverOptions { abstol: 1e-10, reltol: 1e-9, ..Default::default() };
+        let (_h, soft) =
+            solve_ode_dense(&rhs, &[1.0, 0.0], (0.0, 10.0), &[], &saveat, &interp_at, &tight, None);
         for (i, s) in soft.iter().enumerate() {
             let t = interp_at[i];
             assert_relative_eq!(s.t, t, epsilon = 1e-12);
@@ -4588,16 +4235,8 @@ mod tests {
         // (the 8.5 point sits inside a large 6→10 step). 1e-3 covers Hermite-over-a-
         // large-step error while still catching a broken interpolant (≫ 1e-3 off).
         let prod = OdeSolverOptions::default();
-        let (_h2, soft2) = solve_ode_dense(
-            &rhs,
-            &[1.0, 0.0],
-            (0.0, 10.0),
-            &[],
-            &saveat,
-            &interp_at,
-            &prod,
-            None,
-        );
+        let (_h2, soft2) =
+            solve_ode_dense(&rhs, &[1.0, 0.0], (0.0, 10.0), &[], &saveat, &interp_at, &prod, None);
         let clamped = solve_ode(&rhs, &[1.0, 0.0], (0.0, 10.0), &[], &interp_at, &prod);
         for (i, s) in soft2.iter().enumerate() {
             assert_relative_eq!(s.u[0], clamped[i].u[0], epsilon = 1e-3);
@@ -4615,16 +4254,8 @@ mod tests {
         let saveat = vec![4.0];
         let interp_at = vec![0.0, 4.0];
         let opts = OdeSolverOptions::default();
-        let (hard, soft) = solve_ode_dense(
-            &rhs,
-            &[1.0],
-            (0.0, 4.0),
-            &[],
-            &saveat,
-            &interp_at,
-            &opts,
-            None,
-        );
+        let (hard, soft) =
+            solve_ode_dense(&rhs, &[1.0], (0.0, 4.0), &[], &saveat, &interp_at, &opts, None);
         assert_eq!(soft.len(), 2);
         assert_relative_eq!(soft[0].u[0], 1.0, epsilon = 1e-12); // t=0 → u0
         assert_eq!(soft[1].u[0], hard[0].u[0]); // t=4 boundary == hard save (exact)
@@ -4636,16 +4267,8 @@ mod tests {
     fn solve_ode_dense_zero_span_fills_soft() {
         let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = 1.0;
         let opts = OdeSolverOptions::default();
-        let (hard, soft) = solve_ode_dense(
-            &rhs,
-            &[7.0],
-            (3.0, 3.0),
-            &[],
-            &[3.0],
-            &[3.0, 3.0],
-            &opts,
-            None,
-        );
+        let (hard, soft) =
+            solve_ode_dense(&rhs, &[7.0], (3.0, 3.0), &[], &[3.0], &[3.0, 3.0], &opts, None);
         assert_eq!(hard.len(), 1);
         assert_eq!(soft.len(), 2);
         assert!(soft.iter().all(|p| (p.u[0] - 7.0).abs() < 1e-12));
@@ -4679,11 +4302,7 @@ mod tests {
             du[0] = -0.5 * u[0]; // concentration
             du[1] = 0.1 * u[0]; // cumulative hazard
         };
-        let opts = OdeSolverOptions {
-            abstol: 1e-10,
-            reltol: 1e-9,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-10, reltol: 1e-9, ..OdeSolverOptions::default() };
         let mut u = [10.0, 0.0];
         match solve_ode_until_threshold(&rhs, &mut u, (0.0, 1000.0), &[], &opts, 1, 1.0) {
             ThresholdCrossing::Crossed(t) => {
@@ -4747,10 +4366,7 @@ mod tests {
             &mut u_rk,
             (0.0, 5.0),
             &[],
-            &OdeSolverOptions {
-                method: OdeMethod::Rk45,
-                ..Default::default()
-            },
+            &OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() },
             1,
             4.0,
         );
@@ -4785,10 +4401,7 @@ mod tests {
             &mut u,
             (0.0, 1.0),
             &[],
-            &OdeSolverOptions {
-                method: OdeMethod::Rodas4,
-                ..Default::default()
-            },
+            &OdeSolverOptions { method: OdeMethod::Rodas4, ..Default::default() },
             1,
             f64::INFINITY,
         );
@@ -4836,11 +4449,7 @@ mod tests {
         };
         // `min_dt = 1.0` is far above what this system's fast mode admits, so every step is a
         // force-accepted clamp.
-        let stalling = OdeSolverOptions {
-            initial_dt: 1.0,
-            min_dt: 1.0,
-            ..Default::default()
-        };
+        let stalling = OdeSolverOptions { initial_dt: 1.0, min_dt: 1.0, ..Default::default() };
 
         let mut u = [0.0, 0.0];
         let named = solve_ode_until_threshold(
@@ -4848,10 +4457,7 @@ mod tests {
             &mut u,
             (0.0, 5.0),
             &[],
-            &OdeSolverOptions {
-                method: OdeMethod::Rodas4,
-                ..stalling
-            },
+            &OdeSolverOptions { method: OdeMethod::Rodas4, ..stalling },
             1,
             3.0,
         );
@@ -4905,11 +4511,7 @@ mod tests {
         );
         // A different solve in between leaves stale stages and a carried `k1` behind.
         let _other = run([5.0, 1.0], 1.9);
-        assert_eq!(
-            run([2.0, 0.0], 0.7),
-            fresh,
-            "the reused stepper took other steps"
-        );
+        assert_eq!(run([2.0, 0.0], 0.7), fresh, "the reused stepper took other steps");
     }
 
     /// Review r1 #1: a pool filled with steppers of other state sizes still takes the one
@@ -4918,9 +4520,7 @@ mod tests {
     #[test]
     fn a_full_rk45_pool_evicts_its_oldest_stepper() {
         RK45_POOL.with(|p| p.borrow_mut().clear());
-        let held: Vec<_> = (10..10 + RK45_POOL_MAX)
-            .map(PooledRk45::<f64>::take)
-            .collect();
+        let held: Vec<_> = (10..10 + RK45_POOL_MAX).map(PooledRk45::<f64>::take).collect();
         drop(held);
         assert_eq!(RK45_POOL.with(|p| p.borrow().len()), RK45_POOL_MAX);
         drop(PooledRk45::<f64>::take(2));
@@ -4931,11 +4531,7 @@ mod tests {
                 .collect()
         });
         assert_eq!(sizes.len(), RK45_POOL_MAX);
-        assert_eq!(
-            sizes.last(),
-            Some(&2),
-            "the newest stepper is kept: {sizes:?}"
-        );
+        assert_eq!(sizes.last(), Some(&2), "the newest stepper is kept: {sizes:?}");
         assert!(!sizes.contains(&10), "the oldest one is evicted: {sizes:?}");
     }
 
@@ -5025,10 +4621,7 @@ mod tests {
         let rhs = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
             du[0] = 1.0;
         };
-        let opts = OdeSolverOptions {
-            max_steps: 2,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { max_steps: 2, ..OdeSolverOptions::default() };
         let mut u = [0.0];
         // Threshold far beyond what 2 steps can reach within the (huge) span.
         match solve_ode_until_threshold(&rhs, &mut u, (0.0, 1e6), &[], &opts, 0, 1e9) {
@@ -5046,11 +4639,7 @@ mod tests {
         let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
             du[0] = -(p[0] * u[0]);
         };
-        let opts = OdeSolverOptions {
-            abstol: 1e-10,
-            reltol: 1e-9,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-10, reltol: 1e-9, ..OdeSolverOptions::default() };
         let k = Dual2::<1>::var(0.1, 0);
         let u0 = [Dual2::<1>::constant(1.0)];
         let res = solve_ode_g(&rhs, &u0, (0.0, 2.0), &[k], &[2.0], &opts);
@@ -5099,21 +4688,11 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        let result = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        let result =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
         assert_eq!(result.len(), 1);
-        assert_eq!(
-            stats.attempted_steps,
-            stats.accepted_steps + stats.rejected_steps
-        );
+        assert_eq!(stats.attempted_steps, stats.accepted_steps + stats.rejected_steps);
         assert!(stats.accepted_steps > 0, "stats = {stats:?}");
         assert!(stats.rejected_steps > 0, "stats = {stats:?}");
         assert_eq!(stats.min_step_clamped_steps, 0);
@@ -5132,15 +4711,8 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        let result = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        let result =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
         assert_eq!(stats.attempted_steps, 1);
         assert_eq!(stats.min_step_clamped_steps, 0);
@@ -5168,15 +4740,8 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        let _ = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        let _ =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
         assert_eq!(stats.attempted_steps, 1);
         assert_eq!(stats.accepted_steps, 1);
@@ -5201,15 +4766,8 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        let _ = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        let _ =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
         assert_eq!(stats.attempted_steps, 1);
         assert_eq!(stats.accepted_steps, 1);
@@ -5231,22 +4789,12 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        let result = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        let result =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
         assert_eq!(result.len(), 1);
         assert_eq!(stats.attempted_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
-        assert_eq!(
-            stats.min_step_clamped_steps,
-            MAX_CONSECUTIVE_MIN_STEP_CLAMPS
-        );
+        assert_eq!(stats.min_step_clamped_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
     }
 
     /// Regression for #603 review #4: a *finite-but-stiff* min-step clamp (large finite local
@@ -5269,15 +4817,8 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        let result = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        let result =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
         // Ran the full budget — no early break at MAX_CONSECUTIVE_MIN_STEP_CLAMPS …
         assert_eq!(stats.attempted_steps, opts.max_steps);
@@ -5309,20 +4850,10 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let budget = 5;
-        let opts = OdeSolverOptions {
-            stiff_abort_after: Some(budget),
-            ..base
-        };
+        let opts = OdeSolverOptions { stiff_abort_after: Some(budget), ..base };
         let mut stats = OdeSolverStats::default();
-        let result = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        let result =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
 
         assert_eq!(stats.min_step_clamped_steps, budget as usize);
         assert_eq!(stats.attempted_steps, budget as usize);
@@ -5334,15 +4865,7 @@ mod tests {
 
         // …and the un-budgeted run is untouched: full `max_steps`, no abort recorded.
         let mut ground_out = OdeSolverStats::default();
-        solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &base,
-            Some(&mut ground_out),
-        );
+        solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &base, Some(&mut ground_out));
         assert_eq!(ground_out.attempted_steps, base.max_steps);
         assert_eq!(ground_out.stiff_aborted_segments, 0);
     }
@@ -5364,15 +4887,7 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut stats),
-        );
+        solve_ode_with_stats(&rhs, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut stats));
         assert_eq!(stats.attempted_steps, opts.max_steps);
         assert_eq!(stats.stiff_aborted_segments, 0);
     }
@@ -5384,10 +4899,7 @@ mod tests {
         let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -k * u[0];
         let saveat = [1.0, 5.0, 10.0];
         let base = OdeSolverOptions::default();
-        let budgeted = OdeSolverOptions {
-            stiff_abort_after: Some(1),
-            ..base
-        };
+        let budgeted = OdeSolverOptions { stiff_abort_after: Some(1), ..base };
         let a = solve_ode(&rhs, &[1.0], (0.0, 10.0), &[], &saveat, &base);
         let b = solve_ode(&rhs, &[1.0], (0.0, 10.0), &[], &saveat, &budgeted);
         for (x, y) in a.iter().zip(&b) {
@@ -5417,15 +4929,7 @@ mod tests {
             du[0] = Dual2::constant(1e6 * (t * 1e7).sin());
         };
         let mut scalar = OdeSolverStats::default();
-        solve_ode_with_stats(
-            &rhs_f64,
-            &[1.0],
-            (0.0, 1.0),
-            &[],
-            &[1.0],
-            &opts,
-            Some(&mut scalar),
-        );
+        solve_ode_with_stats(&rhs_f64, &[1.0], (0.0, 1.0), &[], &[1.0], &opts, Some(&mut scalar));
         let mut dual = OdeSolverStats::default();
         solve_ode_g_with_stats(
             &rhs_dual,
@@ -5500,10 +5004,7 @@ mod tests {
         // integrations that ran while it was shadowed.
         assert_eq!(outer.collected(), after_one);
         solve();
-        assert_eq!(
-            outer.collected().attempted_steps,
-            after_one.attempted_steps * 2
-        );
+        assert_eq!(outer.collected().attempted_steps, after_one.attempted_steps * 2);
         drop(outer);
         assert!(!stats_sink_active());
     }
@@ -5515,27 +5016,11 @@ mod tests {
         let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -0.1 * u[0];
         let opts = OdeSolverOptions::default();
         let mut without = OdeSolverStats::default();
-        solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 10.0),
-            &[],
-            &[10.0],
-            &opts,
-            Some(&mut without),
-        );
+        solve_ode_with_stats(&rhs, &[1.0], (0.0, 10.0), &[], &[10.0], &opts, Some(&mut without));
 
         let scope = SolverStatsScope::enter();
         let mut with = OdeSolverStats::default();
-        solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 10.0),
-            &[],
-            &[10.0],
-            &opts,
-            Some(&mut with),
-        );
+        solve_ode_with_stats(&rhs, &[1.0], (0.0, 10.0), &[], &[10.0], &opts, Some(&mut with));
         assert_eq!(with, without);
         assert_eq!(scope.collected(), without);
     }
@@ -5562,15 +5047,8 @@ mod tests {
             ..OdeSolverOptions::default()
         };
         let mut stats = OdeSolverStats::default();
-        let result = solve_ode_with_stats(
-            &rhs,
-            &[1.0],
-            (0.0, 5e-3),
-            &[],
-            &[5e-3],
-            &opts,
-            Some(&mut stats),
-        );
+        let result =
+            solve_ode_with_stats(&rhs, &[1.0], (0.0, 5e-3), &[], &[5e-3], &opts, Some(&mut stats));
 
         assert_eq!(stats.min_step_clamped_steps, 5, "the fixture must clamp");
         assert_eq!(
@@ -5668,10 +5146,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(stats.attempted_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
-        assert_eq!(
-            stats.min_step_clamped_steps,
-            MAX_CONSECUTIVE_MIN_STEP_CLAMPS
-        );
+        assert_eq!(stats.min_step_clamped_steps, MAX_CONSECUTIVE_MIN_STEP_CLAMPS);
     }
 
     #[test]
@@ -5759,11 +5234,7 @@ mod tests {
         let _ = solve_ode(&rhs, &[1.0], (0.0, 20.0), &[], &[20.0], &opts);
         let calls = calls.into_inner();
 
-        assert!(
-            calls.len() > 7,
-            "solver did not perform multiple steps (calls = {})",
-            calls.len(),
-        );
+        assert!(calls.len() > 7, "solver did not perform multiple steps (calls = {})", calls.len(),);
 
         let dup_at = calls.windows(2).position(|w| w[0] == w[1]);
         assert!(
@@ -5918,18 +5389,10 @@ mod tests {
 
         // Before the pole: integrated, against the closed forms.
         for (p, t) in [(&saved[0], 1.0), (&interp[0], 0.8)] {
-            assert!(
-                p.u.iter().all(|v| v.is_finite()),
-                "pre-pole t={t}: {:?}",
-                p.u
-            );
+            assert!(p.u.iter().all(|v| v.is_finite()), "pre-pole t={t}: {:?}", p.u);
             let central = 100.0 * (-0.1 * t).exp();
             let x = 1.0 / (1.0 - 0.5 * t);
-            assert!(
-                (p.u[0] - central).abs() <= 1e-3 * central,
-                "t={t}: {:?}",
-                p.u
-            );
+            assert!((p.u[0] - central).abs() <= 1e-3 * central, "t={t}: {:?}", p.u);
             assert!((p.u[1] - x).abs() <= 1e-3 * x, "t={t}: {:?}", p.u);
         }
         // Past the pole: nothing was integrated, so nothing is a number — `central` included,
@@ -5957,10 +5420,8 @@ mod tests {
     #[test]
     fn the_nan_tail_covers_a_segment_that_enters_non_finite() {
         for (label, budget) in [("clamp break", None), ("stiff_abort_after", Some(2))] {
-            let opts = OdeSolverOptions {
-                stiff_abort_after: budget,
-                ..OdeSolverOptions::default()
-            };
+            let opts =
+                OdeSolverOptions { stiff_abort_after: budget, ..OdeSolverOptions::default() };
             let mut stats = OdeSolverStats::default();
             let saved = solve_ode_with_stats(
                 &diverging_rhs,
@@ -6017,11 +5478,7 @@ mod tests {
             assert!(v.value.is_finite() && v.grad[0].is_finite() && v.hess[0][0].is_finite());
         }
         let central = 100.0 * (-0.1f64).exp();
-        assert!(
-            (pre.u[0].grad[0] + central).abs() <= 1e-3 * central,
-            "{:?}",
-            pre.u[0]
-        );
+        assert!((pre.u[0].grad[0] + central).abs() <= 1e-3 * central, "{:?}", pre.u[0]);
         for v in &saved[1].u {
             assert!(v.value.is_nan(), "value: {v:?}");
             assert!(v.grad[0].is_nan(), "gradient: {v:?}");
@@ -6078,11 +5535,7 @@ mod tests {
         let got: Vec<u64> = c.iter().map(|p| p.u[0].to_bits()).collect();
         assert_eq!(
             got,
-            [
-                4636067644216122773,
-                4633732977897763958,
-                4630374309920469964
-            ],
+            [4636067644216122773, 4633732977897763958, 4630374309920469964],
             "control: {:?}",
             c.iter().map(|p| p.u[0]).collect::<Vec<_>>()
         );
@@ -6115,12 +5568,7 @@ mod tests {
         // Both output times sit past the abort at t = 0.005, so both carry the frozen last
         // state, `453.1784280109106` — finite, and the same bits for each.
         for p in &f {
-            assert_eq!(
-                p.u[0].to_bits(),
-                4646680015408494802,
-                "finite stop: {:?}",
-                p.u
-            );
+            assert_eq!(p.u[0].to_bits(), 4646680015408494802, "finite stop: {:?}", p.u);
         }
         assert_eq!(finite.stiff_aborted_segments, 1);
         assert_eq!(finite.diverged_segments, 0);
@@ -6151,10 +5599,7 @@ mod tests {
     /// `with_nonfinite_state_note` call at the budget return.
     #[test]
     fn threshold_budget_failure_names_the_diverged_state() {
-        let opts = OdeSolverOptions {
-            method: OdeMethod::Rk45,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
         let mut u = [0.0, 1.0];
         let msg = failed_text(solve_ode_until_threshold(
             &accumulator_next_to_pole,
@@ -6165,10 +5610,7 @@ mod tests {
             0,
             1e9,
         ));
-        assert!(
-            msg.starts_with("state 1 became non-finite before t=2.0"),
-            "{msg}"
-        );
+        assert!(msg.starts_with("state 1 became non-finite before t=2.0"), "{msg}");
         assert!(msg.contains("; step budget ("), "{msg}");
         assert!(!msg.contains("state 0"), "{msg}");
     }
@@ -6193,10 +5635,7 @@ mod tests {
             0,
             1e9,
         ));
-        assert!(
-            msg.starts_with("state 1 became non-finite before t=2.0"),
-            "{msg}"
-        );
+        assert!(msg.starts_with("state 1 became non-finite before t=2.0"), "{msg}");
         assert!(msg.contains("; aborted at t=2.0"), "{msg}");
         assert!(msg.contains("the segment is stability-limited"), "{msg}");
     }
@@ -6212,21 +5651,10 @@ mod tests {
             du[0] = 0.01;
             du[1] = 0.0;
         };
-        let opts = OdeSolverOptions {
-            method: OdeMethod::Rk45,
-            max_steps: 5,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method: OdeMethod::Rk45, max_steps: 5, ..Default::default() };
         let mut u = [0.0, 1.0];
-        let msg = failed_text(solve_ode_until_threshold(
-            &flat,
-            &mut u,
-            (0.0, 1e6),
-            &[],
-            &opts,
-            0,
-            1e9,
-        ));
+        let msg =
+            failed_text(solve_ode_until_threshold(&flat, &mut u, (0.0, 1e6), &[], &opts, 0, 1e9));
         assert_eq!(
             msg,
             "step budget (5) exhausted before reaching t_end=1000000.000000 (reached t=78.100000)",
@@ -6242,10 +5670,7 @@ mod tests {
             with_nonfinite_state_note(&[f64::NAN, 1.0, f64::INFINITY], 2.0, None, clause.clone()),
             "states 0, 2 became non-finite before t=2.000000; step budget (5) exhausted"
         );
-        assert_eq!(
-            with_nonfinite_state_note(&[0.0, 1.0], 2.0, None, clause.clone()),
-            clause
-        );
+        assert_eq!(with_nonfinite_state_note(&[0.0, 1.0], 2.0, None, clause.clone()), clause);
     }
 
     /// #2087 T5: with labels the note names the states by label, in index order, singular and
@@ -6257,13 +5682,10 @@ mod tests {
     /// on the labelled form.
     #[test]
     fn nonfinite_state_note_names_states_by_label() {
-        let labels: Vec<String> = [
-            "[odes] state `a`",
-            "[odes] state `b`",
-            "the cumulative hazard of CMT=3",
-        ]
-        .map(String::from)
-        .to_vec();
+        let labels: Vec<String> =
+            ["[odes] state `a`", "[odes] state `b`", "the cumulative hazard of CMT=3"]
+                .map(String::from)
+                .to_vec();
         let clause = "step budget (5) exhausted".to_string();
         assert_eq!(
             with_nonfinite_state_note(
@@ -6295,10 +5717,7 @@ mod tests {
     #[test]
     fn threshold_failed_names_the_monitored_state_by_label() {
         let labels: Vec<String> = vec!["the cumulative hazard".into()];
-        let opts = OdeSolverOptions {
-            method: OdeMethod::Rk45,
-            ..Default::default()
-        };
+        let opts = OdeSolverOptions { method: OdeMethod::Rk45, ..Default::default() };
         let run = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]), l: Option<&[String]>| {
             let mut u = [1.0];
             failed_text(solve_ode_until_threshold_labelled(
@@ -6316,21 +5735,12 @@ mod tests {
         let falling = |_u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -1.0;
 
         let named = run(&blowup, Some(&labels));
-        assert!(
-            named.starts_with("the cumulative hazard became non-finite at t="),
-            "{named}"
-        );
+        assert!(named.starts_with("the cumulative hazard became non-finite at t="), "{named}");
         let bare = run(&blowup, None);
-        assert!(
-            bare.starts_with("monitored state 0 became non-finite at t="),
-            "{bare}"
-        );
+        assert!(bare.starts_with("monitored state 0 became non-finite at t="), "{bare}");
 
         let named = run(&falling, Some(&labels));
-        assert!(
-            named.starts_with("the cumulative hazard decreased ("),
-            "{named}"
-        );
+        assert!(named.starts_with("the cumulative hazard decreased ("), "{named}");
         let bare = run(&falling, None);
         assert!(bare.starts_with("monitored state 0 decreased ("), "{bare}");
     }
@@ -6361,16 +5771,8 @@ mod tests {
         let params = [1e6, 2.0];
         let saveat = [0.5, 1.0];
         let interp = [0.25];
-        for method in [
-            OdeMethod::Auto,
-            OdeMethod::Rk45,
-            OdeMethod::Rodas4,
-            OdeMethod::Linear,
-        ] {
-            let opts = OdeSolverOptions {
-                method,
-                ..OdeSolverOptions::default()
-            };
+        for method in [OdeMethod::Auto, OdeMethod::Rk45, OdeMethod::Rodas4, OdeMethod::Linear] {
+            let opts = OdeSolverOptions { method, ..OdeSolverOptions::default() };
             for u0 in [[f64::NAN, f64::NAN], [f64::NAN, 1.0], [f64::INFINITY, 1.0]] {
                 calls.set(0);
                 let mut stats = OdeSolverStats::default();
@@ -6416,14 +5818,8 @@ mod tests {
                 Some(&mut stats),
                 &mut OdeAutoSwitchState::default(),
             );
-            assert!(
-                calls.get() > 0,
-                "{method:?}: the control never reached the RHS"
-            );
-            assert!(
-                finite.0.iter().all(|p| p.u.iter().all(|v| v.is_finite())),
-                "{method:?}"
-            );
+            assert!(calls.get() > 0, "{method:?}: the control never reached the RHS");
+            assert!(finite.0.iter().all(|p| p.u.iter().all(|v| v.is_finite())), "{method:?}");
 
             let zero_length = integrate_resolved_g(
                 &rhs,

@@ -77,9 +77,7 @@ const IOV_SRC: &str = "
 ";
 
 fn parse(src: &str) -> CompiledModel {
-    crate::parser::model_parser::parse_full_model(src)
-        .expect("fixture model parses")
-        .model
+    crate::parser::model_parser::parse_full_model(src).expect("fixture model parses").model
 }
 
 fn age(a: f64) -> HashMap<String, f64> {
@@ -98,11 +96,7 @@ fn subject(id: &str, ages: [f64; 4]) -> Subject {
         obs_cmts: vec![1, 1, 1],
         covariates: age(ages[0]),
         dose_covariates: if tv { vec![age(ages[0])] } else { Vec::new() },
-        obs_covariates: if tv {
-            ages[1..].iter().map(|&a| age(a)).collect()
-        } else {
-            Vec::new()
-        },
+        obs_covariates: if tv { ages[1..].iter().map(|&a| age(a)).collect() } else { Vec::new() },
         cens: vec![0, 0, 0],
         occasions: vec![1, 1, 2],
         dose_occasions: vec![1],
@@ -144,32 +138,17 @@ fn a_negative_clearance_names_the_subject_and_counts_its_records() {
     assert_eq!(entry.category, WarningCode::DegenerateClearanceOrVolume);
     assert_eq!(entry.message, msg);
     // Sentence 1: who, how many records, where first.
-    assert!(
-        msg.starts_with("W_DEGENERATE_CL_V: 1 subject(s) [S2]"),
-        "{msg}"
-    );
-    assert!(
-        !msg.contains("S1"),
-        "the in-range subject is not named: {msg}"
-    );
+    assert!(msg.starts_with("W_DEGENERATE_CL_V: 1 subject(s) [S2]"), "{msg}");
+    assert!(!msg.contains("S1"), "the in-range subject is not named: {msg}");
     assert!(msg.contains("on 4 record(s)"), "{msg}");
     assert!(msg.contains("first at TIME 0 in subject S2"), "{msg}");
     // Sentence 2, gated on non-positive / infinite records: what the engines served.
-    assert!(
-        msg.contains("On 4 of them CL or V is non-positive or infinite"),
-        "{msg}"
-    );
+    assert!(msg.contains("On 4 of them CL or V is non-positive or infinite"), "{msg}");
     assert!(msg.contains("serve a concentration of 0"), "{msg}");
     // Its NaN twin is gated on NaN records, of which there are none here.
-    assert!(
-        !msg.contains("is NaN"),
-        "no NaN record, no NaN sentence: {msg}"
-    );
+    assert!(!msg.contains("is NaN"), "no NaN record, no NaN sentence: {msg}");
     // Sentence 3: why NONMEM differs.
-    assert!(
-        msg.contains("PREDPP rejects a non-positive PK parameter"),
-        "{msg}"
-    );
+    assert!(msg.contains("PREDPP rejects a non-positive PK parameter"), "{msg}");
     // Sentence 4: the advice.
     assert!(msg.contains("exponential or power model"), "{msg}");
     // The emitted text classifies to its own code, not the generic "degenerate" →
@@ -183,10 +162,7 @@ fn a_negative_clearance_names_the_subject_and_counts_its_records() {
     assert_eq!(details["n_zero_records"], 4);
     assert_eq!(details["n_nan_records"], 0);
     assert_eq!(details["subjects"][0]["id"], "S2");
-    assert_eq!(
-        details["subjects"][0]["times"],
-        serde_json::json!([0.0, 1.0, 2.0, 3.0])
-    );
+    assert_eq!(details["subjects"][0]["times"], serde_json::json!([0.0, 1.0, 2.0, 3.0]));
 }
 
 /// A time-varying covariate puts the negative CL on one record only (TIME 2): that record
@@ -206,10 +182,7 @@ fn a_time_varying_covariate_counts_only_the_offending_record() {
     .expect("one negative record must warn");
     assert!(msg.contains("on 1 record(s)"), "{msg}");
     assert!(msg.contains("first at TIME 2 in subject S1"), "{msg}");
-    assert_eq!(
-        entry.details.unwrap()["subjects"][0]["times"],
-        serde_json::json!([2.0])
-    );
+    assert_eq!(entry.details.unwrap()["subjects"][0]["times"], serde_json::json!([2.0]));
 }
 
 /// `V = TVV · exp(ETA_V)` overflows to `+inf` at an extreme η̂: infinite is degenerate too.
@@ -226,10 +199,7 @@ fn an_infinite_volume_warns() {
         None,
     )
     .expect("an infinite V must warn");
-    assert!(
-        msg.contains("[S1]") && msg.contains("on 4 record(s)"),
-        "{msg}"
-    );
+    assert!(msg.contains("[S1]") && msg.contains("on 4 record(s)"), "{msg}");
 }
 
 /// On an IOV model each record reads its own occasion's κ: `KAPPA_CL = −2` on occasion 2
@@ -239,10 +209,7 @@ fn an_iov_model_reads_each_records_own_occasion_kappa() {
     let model = parse(IOV_SRC);
     assert_eq!(model.n_kappa, 1);
     let pop = population(vec![subject("S1", [40.0; 4])]);
-    let kappas = vec![vec![
-        DVector::from_element(1, 0.0),
-        DVector::from_element(1, -2.0),
-    ]];
+    let kappas = vec![vec![DVector::from_element(1, 0.0), DVector::from_element(1, -2.0)]];
     let (msg, _) = degenerate_cl_v_warning(
         &model,
         &pop,
@@ -303,10 +270,7 @@ fn a_nan_clearance_warns_with_its_own_outcome() {
         None,
     )
     .expect("a NaN CL must warn");
-    assert!(
-        msg.contains("non-positive or non-finite CL or V on 1 record(s)"),
-        "{msg}"
-    );
+    assert!(msg.contains("non-positive or non-finite CL or V on 1 record(s)"), "{msg}");
     assert!(msg.contains("first at TIME 1 in subject S1"), "{msg}");
     assert!(msg.contains("On 1 of them CL or V is NaN"), "{msg}");
     // The rule, not a per-record outcome: which of the two a record got depends on the
@@ -315,21 +279,13 @@ fn a_nan_clearance_warns_with_its_own_outcome() {
         msg.contains("predicted NaN once a dose has arrived") && msg.contains("0 before any dose"),
         "{msg}"
     );
-    assert!(
-        !msg.contains("serve a concentration of 0"),
-        "a NaN record is not served 0: {msg}"
-    );
+    assert!(!msg.contains("serve a concentration of 0"), "a NaN record is not served 0: {msg}");
     let details = entry.details.unwrap();
     assert_eq!(details["n_nan_records"], 1);
-    assert_eq!(
-        details["subjects"][0]["nan_times"],
-        serde_json::json!([1.0])
-    );
+    assert_eq!(details["subjects"][0]["nan_times"], serde_json::json!([1.0]));
 
-    let mixed = population(vec![
-        subject("S1", [40.0, f64::NAN, 40.0, 40.0]),
-        subject("S2", [200.0; 4]),
-    ]);
+    let mixed =
+        population(vec![subject("S1", [40.0, f64::NAN, 40.0, 40.0]), subject("S2", [200.0; 4])]);
     let (msg, entry) = degenerate_cl_v_warning(
         &model,
         &mixed,
@@ -341,17 +297,11 @@ fn a_nan_clearance_warns_with_its_own_outcome() {
     .expect("a mixed population must warn");
     assert!(msg.contains("2 subject(s) [S1, S2]"), "{msg}");
     assert!(msg.contains("on 5 record(s)"), "{msg}");
-    assert!(
-        msg.contains("On 4 of them CL or V is non-positive or infinite"),
-        "{msg}"
-    );
+    assert!(msg.contains("On 4 of them CL or V is non-positive or infinite"), "{msg}");
     assert!(msg.contains("On 1 of them CL or V is NaN"), "{msg}");
     let details = entry.details.unwrap();
     assert_eq!(
-        (
-            details["n_zero_records"].as_u64(),
-            details["n_nan_records"].as_u64()
-        ),
+        (details["n_zero_records"].as_u64(), details["n_nan_records"].as_u64()),
         (Some(4), Some(1))
     );
 }
@@ -376,24 +326,15 @@ fn a_reset_record_is_scanned_under_its_own_snapshot() {
         None,
     )
     .expect("a negative CL on the reset row must warn");
-    assert!(
-        msg.contains("on 1 record(s)") && msg.contains("first at TIME 2.5"),
-        "{msg}"
-    );
-    assert_eq!(
-        entry.details.unwrap()["subjects"][0]["times"],
-        serde_json::json!([2.5])
-    );
+    assert!(msg.contains("on 1 record(s)") && msg.contains("first at TIME 2.5"), "{msg}");
+    assert_eq!(entry.details.unwrap()["subjects"][0]["times"], serde_json::json!([2.5]));
 
     let iov = parse(IOV_SRC);
     let mut s2 = subject("S2", [40.0; 4]);
     s2.reset_times = vec![2.5];
     s2.reset_covariates = vec![age(40.0)];
     s2.reset_occasions = vec![2];
-    let kappas = vec![vec![
-        DVector::from_element(1, 0.0),
-        DVector::from_element(1, -2.0),
-    ]];
+    let kappas = vec![vec![DVector::from_element(1, 0.0), DVector::from_element(1, -2.0)]];
     let (msg, _) = degenerate_cl_v_warning(
         &iov,
         &population(vec![s2]),
@@ -404,10 +345,7 @@ fn a_reset_record_is_scanned_under_its_own_snapshot() {
     )
     .expect("an occasion-2 reset row with CL = -5 must warn");
     // The TIME 3 observation is in occasion 2 too; the reset row is the earlier of the two.
-    assert!(
-        msg.contains("on 2 record(s)") && msg.contains("first at TIME 2.5"),
-        "{msg}"
-    );
+    assert!(msg.contains("on 2 record(s)") && msg.contains("first at TIME 2.5"), "{msg}");
 }
 
 /// An EVID=4 row is stored twice by the reader — in `doses` (flagged `evid4`) and in
@@ -438,10 +376,7 @@ fn an_evid4_row_is_one_record_and_a_cotimed_evid3_row_is_another() {
         None,
     )
     .expect("must warn");
-    assert!(
-        msg.contains("on 4 record(s)"),
-        "the EVID=4 twin counts once: {msg}"
-    );
+    assert!(msg.contains("on 4 record(s)"), "the EVID=4 twin counts once: {msg}");
     assert_eq!(
         entry.details.unwrap()["subjects"][0]["times"],
         serde_json::json!([0.0, 1.0, 2.0, 3.0])
@@ -460,10 +395,7 @@ fn an_evid4_row_is_one_record_and_a_cotimed_evid3_row_is_another() {
         None,
     )
     .expect("the co-timed reset row's own negative CL must warn");
-    assert!(
-        msg.contains("on 1 record(s)") && msg.contains("first at TIME 0"),
-        "{msg}"
-    );
+    assert!(msg.contains("on 1 record(s)") && msg.contains("first at TIME 0"), "{msg}");
 
     // A distinct EVID=3 row at TIME 0 under the dose's own AGE 200: same time, same CL
     // and V as the dose, but not flagged — two records, so five in all.
@@ -479,10 +411,7 @@ fn an_evid4_row_is_one_record_and_a_cotimed_evid3_row_is_another() {
         None,
     )
     .expect("must warn");
-    assert!(
-        msg.contains("on 5 record(s)"),
-        "the EVID=3 row is its own record: {msg}"
-    );
+    assert!(msg.contains("on 5 record(s)"), "the EVID=3 row is its own record: {msg}");
     assert_eq!(
         entry.details.unwrap()["subjects"][0]["times"],
         serde_json::json!([0.0, 0.0, 1.0, 2.0, 3.0])

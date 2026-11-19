@@ -42,18 +42,12 @@ impl MonoTol {
     /// the f64 round-off (~1e-15 relative) yet scaling with `H`, so it catches any genuine
     /// negative increment without firing on a legitimate fit.
     pub fn analytic() -> Self {
-        Self {
-            reltol: 1e-9,
-            abstol: 1e-9,
-        }
+        Self { reltol: 1e-9, abstol: 1e-9 }
     }
 
     /// Floor tied to the ODE solver's effective tolerances.
     pub fn from_solver(opts: &crate::ode::OdeSolverOptions) -> Self {
-        Self {
-            reltol: opts.reltol,
-            abstol: opts.abstol,
-        }
+        Self { reltol: opts.reltol, abstol: opts.abstol }
     }
 }
 
@@ -72,12 +66,8 @@ impl Default for MonoTol {
 /// Returns the 1e20 sentinel when the likelihood is numerically ill-defined.
 #[cfg(test)]
 pub(crate) fn tte_data_term(
-    records: &[ObsRecord],
-    hazard: &HazardSpec,
-    recurrence: TteRecurrence,
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &HashMap<String, f64>,
+    records: &[ObsRecord], hazard: &HazardSpec, recurrence: TteRecurrence, theta: &[f64],
+    eta: &[f64], covariates: &HashMap<String, f64>,
 ) -> f64 {
     match hazard {
         HazardSpec::Analytic { family, param_fn } => {
@@ -93,10 +83,7 @@ pub(crate) fn tte_data_term(
 /// The analytic-family TTE data term over any [`PkNum`]; a dual instance seeded on the
 /// parameters gives their exact derivatives (#2437).
 pub(crate) fn analytic_tte_nll_g<T: PkNum>(
-    records: &[ObsRecord],
-    family: HazardFamily,
-    recurrence: TteRecurrence,
-    params: &[T],
+    records: &[ObsRecord], family: HazardFamily, recurrence: TteRecurrence, params: &[T],
 ) -> T {
     analytic_tte_nll_visit_g(records, family, recurrence, params, &mut |_| {})
 }
@@ -104,10 +91,7 @@ pub(crate) fn analytic_tte_nll_g<T: PkNum>(
 /// [`analytic_tte_nll_g`] that also hands each scored record's [`RecordTerm`] to `visit`
 /// (#901): the loop that scores the likelihood is the loop that reports its terms.
 pub(crate) fn analytic_tte_nll_visit_g<T: PkNum>(
-    records: &[ObsRecord],
-    family: HazardFamily,
-    recurrence: TteRecurrence,
-    params: &[T],
+    records: &[ObsRecord], family: HazardFamily, recurrence: TteRecurrence, params: &[T],
     visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let cumhaz_at = |t| hazard_and_cum_hazard_g(family, t, params).1;
@@ -121,9 +105,7 @@ pub(crate) fn analytic_tte_nll_visit_g<T: PkNum>(
         }
         // Clock-forward RTTE (Andersen–Gill): the cumulative hazard is integrated
         // once across the subject's whole risk window (§3.3), so the records couple.
-        TteRecurrence::Repeated {
-            clock: RtteClock::Forward,
-        } => rtte_forward_nll_from_curves_g(
+        TteRecurrence::Repeated { clock: RtteClock::Forward } => rtte_forward_nll_from_curves_g(
             records,
             cumhaz_at,
             hazard_at,
@@ -131,9 +113,7 @@ pub(crate) fn analytic_tte_nll_visit_g<T: PkNum>(
             visit,
         ),
         // Clock-reset RTTE: each inter-event gap is scored on its own duration `Δ_k` (§3.3).
-        TteRecurrence::Repeated {
-            clock: RtteClock::Reset,
-        } => {
+        TteRecurrence::Repeated { clock: RtteClock::Reset } => {
             rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, MonoTol::analytic(), visit)
         }
     }
@@ -143,10 +123,7 @@ pub(crate) fn analytic_tte_nll_visit_g<T: PkNum>(
 /// η-gradient and η-Hessian, `(q, ∇q, ∇²q)`, from its plan (#2786). `None` when the term
 /// does not record, on the repel sentinel, or on a non-finite derivative.
 pub(crate) fn non_gaussian_eta_jets2(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>, DMatrix<f64>)> {
     let (q, g, h) = crate::sens::ode_provider::adjoint::terms::non_gaussian_jets2_planned(
         model, subject, theta, eta,
@@ -161,11 +138,8 @@ pub(crate) fn non_gaussian_eta_jets2(
 /// [`non_gaussian_eta_jets2`]: the per-endpoint curvature the tests pin.
 #[cfg(test)]
 pub(crate) fn term_eta_hessian<S: crate::sens::ode_provider::adjoint::terms::TermEval>(
-    model: &CompiledModel,
-    subject: &Subject,
-    kind: crate::sens::ode_provider::adjoint::terms::TermKind,
-    term: &S,
-    theta: &[f64],
+    model: &CompiledModel, subject: &Subject,
+    kind: crate::sens::ode_provider::adjoint::terms::TermKind, term: &S, theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, DMatrix<f64>)> {
     let (q, g, h) = crate::sens::ode_provider::adjoint::terms::term_jets2_planned(
@@ -183,13 +157,7 @@ pub(crate) fn term_eta_hessian<S: crate::sens::ode_provider::adjoint::terms::Ter
 fn ode_hazard_times(records: &[ObsRecord]) -> Vec<f64> {
     let mut times: Vec<f64> = Vec::new();
     for r in records {
-        let ObsRecord::Event {
-            time,
-            event_type,
-            entry_time,
-            ..
-        } = r
-        else {
+        let ObsRecord::Event { time, event_type, entry_time, .. } = r else {
             continue;
         };
         if *entry_time > 0.0 {
@@ -214,11 +182,7 @@ fn ode_hazard_times(records: &[ObsRecord]) -> Vec<f64> {
 /// scoring, at the model's own monotone tolerance. `None` outside that walk's scope.
 #[cfg(test)]
 pub(crate) fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    chz_state: usize,
-    records: &[ObsRecord],
-    theta: &[T],
+    model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord], theta: &[T],
     eta: &[T],
 ) -> Option<T> {
     ode_tte_nll_visit_g(model, subject, chz_state, records, theta, eta, &mut |_| {})
@@ -228,13 +192,8 @@ pub(crate) fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
 /// returns `None` only before scoring (outside the walk's scope, or no solve), so a `None`
 /// never leaves terms in the visitor.
 pub(crate) fn ode_tte_nll_visit_g<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    chz_state: usize,
-    records: &[ObsRecord],
-    theta: &[T],
-    eta: &[T],
-    visit: &mut impl FnMut(RecordTerm<T>),
+    model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord], theta: &[T],
+    eta: &[T], visit: &mut impl FnMut(RecordTerm<T>),
 ) -> Option<T> {
     let times = ode_hazard_times(records);
     let solved =
@@ -246,12 +205,8 @@ pub(crate) fn ode_tte_nll_visit_g<T: crate::sens::num::vm::VmNum>(
 /// every time the endpoint's records read): what one evaluation's endpoints share. Each
 /// scored record's term goes to `visit`.
 pub(crate) fn ode_tte_nll_from_states<T: crate::sens::num::vm::VmNum>(
-    model: &CompiledModel,
-    subject: &Subject,
-    chz_state: usize,
-    records: &[ObsRecord],
-    times: &[f64],
-    solved: &crate::sens::ode_provider::adjoint::DualStates<T>,
+    model: &CompiledModel, subject: &Subject, chz_state: usize, records: &[ObsRecord],
+    times: &[f64], solved: &crate::sens::ode_provider::adjoint::DualStates<T>,
     visit: &mut impl FnMut(RecordTerm<T>),
 ) -> Option<T> {
     let (cum, haz) = crate::sens::ode_provider::adjoint::cumhaz_hazard_from_states(
@@ -259,17 +214,9 @@ pub(crate) fn ode_tte_nll_from_states<T: crate::sens::num::vm::VmNum>(
     )?;
     let tol = MonoTol::from_solver(&model.ode_spec.as_ref()?.effective_solver_opts());
     let at = |curve: &[T], t: f64| -> T {
-        times
-            .binary_search_by(|x| x.total_cmp(&t))
-            .map_or(T::from_f64(f64::NAN), |i| curve[i])
+        times.binary_search_by(|x| x.total_cmp(&t)).map_or(T::from_f64(f64::NAN), |i| curve[i])
     };
-    Some(tte_nll_from_curves_g(
-        records,
-        |t| at(&cum, t),
-        |t| at(&haz, t),
-        tol,
-        visit,
-    ))
+    Some(tte_nll_from_curves_g(records, |t| at(&cum, t), |t| at(&haz, t), tol, visit))
 }
 
 /// A subject's non-Gaussian data term as a function of `(θ, η)` on any VM number type —
@@ -311,12 +258,7 @@ impl<'a> TteTerm<'a> {
         let mut endpoints = Vec::new();
         let mut ode_times = Vec::new();
         for (cmt, endpoint) in &model.endpoints {
-            let EndpointLikelihood::Tte {
-                hazard,
-                recurrence,
-                hazard_program,
-                ..
-            } = endpoint
+            let EndpointLikelihood::Tte { hazard, recurrence, hazard_program, .. } = endpoint
             else {
                 continue;
             };
@@ -326,12 +268,7 @@ impl<'a> TteTerm<'a> {
                     std::borrow::Cow::Borrowed(&subject.obs_records[..])
                 } else {
                     std::borrow::Cow::Owned(
-                        subject
-                            .obs_records
-                            .iter()
-                            .filter(|r| on_cmt(r))
-                            .cloned()
-                            .collect(),
+                        subject.obs_records.iter().filter(|r| on_cmt(r)).cloned().collect(),
                     )
                 };
             if records.is_empty() {
@@ -348,12 +285,7 @@ impl<'a> TteTerm<'a> {
             });
         }
         sort_dedup(&mut ode_times);
-        TteTerm {
-            model,
-            subject,
-            endpoints,
-            ode_times,
-        }
+        TteTerm { model, subject, endpoints, ode_times }
     }
 
     /// The times the ODE-accumulated endpoints read; empty without one.
@@ -364,9 +296,7 @@ impl<'a> TteTerm<'a> {
     /// The term over a caller's shared solve (`times`, sorted, a superset of
     /// [`Self::ode_times`]) or, without one, a solve of its own when an endpoint needs it.
     pub(crate) fn eval_shared<T: crate::sens::num::vm::VmNum>(
-        &self,
-        theta: &[T],
-        eta: &[T],
+        &self, theta: &[T], eta: &[T],
         shared: Option<(&[f64], &crate::sens::ode_provider::adjoint::DualStates<T>)>,
     ) -> Option<T> {
         let own;
@@ -442,20 +372,14 @@ impl<'a> NonGaussianTerm<'a> {
             .any(|r| matches!(r, ObsRecord::Event { .. }))
             .then(|| TteTerm::new(model, subject));
         #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
-        let mut ode_times: Vec<f64> = tte
-            .as_ref()
-            .map_or_else(Vec::new, |t| t.ode_times().to_vec());
+        let mut ode_times: Vec<f64> =
+            tte.as_ref().map_or_else(Vec::new, |t| t.ode_times().to_vec());
         #[cfg(feature = "markov")]
         if model.has_ctmm() {
             ode_times.extend(crate::markov::endpoint::ctmm_state_grid(model, subject));
         }
         sort_dedup(&mut ode_times);
-        NonGaussianTerm {
-            model,
-            subject,
-            tte,
-            ode_times,
-        }
+        NonGaussianTerm { model, subject, tte, ode_times }
     }
 }
 
@@ -494,10 +418,7 @@ impl SubjectTerm for NonGaussianTerm<'_> {
 /// TTE block. `None` (caller keeps FD) when an endpoint is not served exactly or the
 /// value is the repel sentinel.
 pub(crate) fn tte_subject_eta_grad(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
+    model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
     // The subject's compiled term (#2786).
     use crate::sens::ode_provider::adjoint::terms::{term_gradient_planned, TermKind};
@@ -524,17 +445,14 @@ pub(crate) fn tte_record_served(model: &CompiledModel, subject: &Subject, cmt: u
 /// dual-evaluable program, or an ODE-accumulated one with a compiled RHS (#2786).
 pub(crate) fn tte_endpoint_served(model: &CompiledModel, cmt: usize) -> bool {
     match model.endpoints.get(&cmt) {
-        Some(crate::types::EndpointLikelihood::Tte {
-            hazard,
-            hazard_program,
-            ..
-        }) => match hazard {
-            HazardSpec::Analytic { .. } => hazard_program.is_some(),
-            HazardSpec::OdeAccumulated { .. } => model
-                .ode_spec
-                .as_ref()
-                .is_some_and(|o| o.rhs_program.is_some()),
-        },
+        Some(crate::types::EndpointLikelihood::Tte { hazard, hazard_program, .. }) => {
+            match hazard {
+                HazardSpec::Analytic { .. } => hazard_program.is_some(),
+                HazardSpec::OdeAccumulated { .. } => {
+                    model.ode_spec.as_ref().is_some_and(|o| o.rhs_program.is_some())
+                }
+            }
+        }
         _ => false,
     }
 }
@@ -566,9 +484,7 @@ pub(crate) const REPEL_SENTINEL_FLOOR: f64 = 1e19;
 /// when ill-defined, including a non-monotone `H` (`S = exp(−ΔH) > 1`).
 #[cfg(test)]
 pub(crate) fn tte_nll_from_curves(
-    records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> f64,
-    hazard_at: impl Fn(f64) -> f64,
+    records: &[ObsRecord], cumhaz_at: impl Fn(f64) -> f64, hazard_at: impl Fn(f64) -> f64,
     tol: MonoTol,
 ) -> f64 {
     tte_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, &mut |_| {})
@@ -579,11 +495,8 @@ pub(crate) fn tte_nll_from_curves(
 /// the NLL is the in-order fold of the visited terms (#901). On a sentinel return the
 /// visitor may already hold earlier terms; check the return value first.
 pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
-    records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> T,
-    hazard_at: impl Fn(f64) -> T,
-    tol: MonoTol,
-    visit: &mut impl FnMut(RecordTerm<T>),
+    records: &[ObsRecord], cumhaz_at: impl Fn(f64) -> T, hazard_at: impl Fn(f64) -> T,
+    tol: MonoTol, visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let mut nll = T::from_f64(0.0);
 
@@ -601,13 +514,7 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
     let monotone_violation = |hi: T, lo: T| cumhaz_monotone_violation_g(hi, lo, tol);
 
     for (index, record) in records.iter().enumerate() {
-        let ObsRecord::Event {
-            time,
-            event_type,
-            entry_time,
-            ..
-        } = record
-        else {
+        let ObsRecord::Event { time, event_type, entry_time, .. } = record else {
             // Non-TTE records (discrete-state / count endpoints) don't contribute
             // to the survival likelihood; skip them.
             continue;
@@ -692,11 +599,7 @@ fn entry_lower_limit<T: PkNum>(entry_time: f64, cumhaz_at: impl Fn(f64) -> T) ->
 pub(crate) enum RecordTerm<T> {
     /// A right-censored (`log_h = None`) or exact (`Some(log h)`) record whose
     /// cumulative-hazard increment over its own risk interval is `dh`.
-    Point {
-        index: usize,
-        dh: T,
-        log_h: Option<T>,
-    },
+    Point { index: usize, dh: T, log_h: Option<T> },
     /// An interval-censored record, scored as `−log P(left < T ≤ right | T > entry)`;
     /// `log_prob` is carried only for the tests' fold.
     Interval {
@@ -709,10 +612,7 @@ pub(crate) enum RecordTerm<T> {
 /// censored) — the one place that term is formed, so the fold and the visitor agree.
 #[inline]
 fn visit_point<T: PkNum>(
-    visit: &mut impl FnMut(RecordTerm<T>),
-    index: usize,
-    dh: T,
-    log_h: Option<T>,
+    visit: &mut impl FnMut(RecordTerm<T>), index: usize, dh: T, log_h: Option<T>,
 ) -> T {
     visit(RecordTerm::Point { index, dh, log_h });
     match log_h {
@@ -739,9 +639,7 @@ pub(crate) fn deviance_residual(delta: f64, dh: f64) -> f64 {
 /// `terms = None` (the 1e20 sentinel) leaves residuals NaN; an interval-censored record
 /// has NaN `dv` and residuals. `written_time` maps the engine clock back to data TIME.
 pub(crate) fn tte_record_diagnostics(
-    records: &[ObsRecord],
-    terms: Option<&[RecordTerm<f64>]>,
-    written_time: impl Fn(f64) -> f64,
+    records: &[ObsRecord], terms: Option<&[RecordTerm<f64>]>, written_time: impl Fn(f64) -> f64,
 ) -> Vec<crate::types::TteObsDiagnostic> {
     let mut by_index: Vec<Option<(f64, bool)>> = vec![None; records.len()];
     for term in terms.unwrap_or_default() {
@@ -751,13 +649,7 @@ pub(crate) fn tte_record_diagnostics(
     }
     let mut rows = Vec::new();
     for (index, record) in records.iter().enumerate() {
-        let ObsRecord::Event {
-            time,
-            event_type,
-            cmt,
-            ..
-        } = record
-        else {
+        let ObsRecord::Event { time, event_type, cmt, .. } = record else {
             continue;
         };
         let dv = match event_type {
@@ -793,12 +685,8 @@ pub(crate) fn tte_record_diagnostics(
 /// handled by the callers, so that arm is unreachable here.
 #[inline]
 fn score_event<T: PkNum>(
-    event_type: &EventType,
-    arg: f64,
-    h_lo: T,
-    cumhaz_at: impl Fn(f64) -> T,
-    hazard_at: impl Fn(f64) -> T,
-    tol: MonoTol,
+    event_type: &EventType, arg: f64, h_lo: T, cumhaz_at: impl Fn(f64) -> T,
+    hazard_at: impl Fn(f64) -> T, tol: MonoTol,
 ) -> Option<(T, Option<T>, T)> {
     match event_type {
         EventType::RightCensored => {
@@ -838,9 +726,7 @@ fn score_event<T: PkNum>(
 /// Returns the 1e20 sentinel on a non-positive hazard at an event, a non-monotone `H`,
 /// or a non-finite total.
 pub fn rtte_forward_nll_from_curves(
-    records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> f64,
-    hazard_at: impl Fn(f64) -> f64,
+    records: &[ObsRecord], cumhaz_at: impl Fn(f64) -> f64, hazard_at: impl Fn(f64) -> f64,
     tol: MonoTol,
 ) -> f64 {
     rtte_forward_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, &mut |_| {})
@@ -848,11 +734,8 @@ pub fn rtte_forward_nll_from_curves(
 
 /// [`rtte_forward_nll_from_curves`] over any [`PkNum`]; see [`tte_nll_from_curves_g`].
 pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
-    records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> T,
-    hazard_at: impl Fn(f64) -> T,
-    tol: MonoTol,
-    visit: &mut impl FnMut(RecordTerm<T>),
+    records: &[ObsRecord], cumhaz_at: impl Fn(f64) -> T, hazard_at: impl Fn(f64) -> T,
+    tol: MonoTol, visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let mut nll = T::from_f64(0.0);
     // Running lower limit `H(lo)`: seeded from the entry, then each record's `H(time)`.
@@ -860,13 +743,7 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
     let mut seeded = false;
 
     for (index, record) in records.iter().enumerate() {
-        let ObsRecord::Event {
-            time,
-            event_type,
-            entry_time,
-            ..
-        } = record
-        else {
+        let ObsRecord::Event { time, event_type, entry_time, .. } = record else {
             // Non-TTE records (discrete-state / count endpoints) don't contribute
             // to the survival likelihood; skip them.
             continue;
@@ -917,9 +794,7 @@ pub(crate) fn rtte_forward_nll_from_curves_g<T: PkNum>(
 /// Only the first record's `entry_time` is used; later gaps are fresh renewals.
 /// Preconditions and the 1e20 sentinel cases match [`rtte_forward_nll_from_curves`].
 pub fn rtte_reset_nll_from_curves(
-    records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> f64,
-    hazard_at: impl Fn(f64) -> f64,
+    records: &[ObsRecord], cumhaz_at: impl Fn(f64) -> f64, hazard_at: impl Fn(f64) -> f64,
     tol: MonoTol,
 ) -> f64 {
     rtte_reset_nll_from_curves_g(records, cumhaz_at, hazard_at, tol, &mut |_| {})
@@ -927,24 +802,15 @@ pub fn rtte_reset_nll_from_curves(
 
 /// [`rtte_reset_nll_from_curves`] over any [`PkNum`]; see [`tte_nll_from_curves_g`].
 pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
-    records: &[ObsRecord],
-    cumhaz_at: impl Fn(f64) -> T,
-    hazard_at: impl Fn(f64) -> T,
-    tol: MonoTol,
-    visit: &mut impl FnMut(RecordTerm<T>),
+    records: &[ObsRecord], cumhaz_at: impl Fn(f64) -> T, hazard_at: impl Fn(f64) -> T,
+    tol: MonoTol, visit: &mut impl FnMut(RecordTerm<T>),
 ) -> T {
     let mut nll = T::from_f64(0.0);
     // End of the previous sojourn (a renewal point): `None` until the first record.
     let mut prev_time: Option<f64> = None;
 
     for (index, record) in records.iter().enumerate() {
-        let ObsRecord::Event {
-            time,
-            event_type,
-            entry_time,
-            ..
-        } = record
-        else {
+        let ObsRecord::Event { time, event_type, entry_time, .. } = record else {
             // Non-TTE records (discrete-state / count endpoints) don't contribute
             // to the survival likelihood; skip them.
             continue;
@@ -995,9 +861,7 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
 /// subject whose term no plan records. Entry (j,k) is
 /// `(f(+sj,+sk) − f(+sj,−sk) − f(−sj,+sk) + f(−sj,−sk)) / (4·sj·sk)`.
 pub(crate) fn data_term_hessian_fd(
-    eval: impl Fn(&[f64]) -> f64,
-    eta_hat: &[f64],
-    eps: &[f64],
+    eval: impl Fn(&[f64]) -> f64, eta_hat: &[f64], eps: &[f64],
 ) -> DMatrix<f64> {
     let n = eta_hat.len();
     let mut h = DMatrix::zeros(n, n);
@@ -1030,10 +894,7 @@ pub(crate) fn data_term_hessian_fd(
 /// draws conditional on survival past entry. Returns `f64::MAX` for degenerate / improper
 /// cases (`λ = 0`; a Gompertz with `γ < 0` that never reaches the quantile).
 fn draw_tte_latent<R: rand::Rng>(
-    family: HazardFamily,
-    params: &[f64],
-    entry_time: f64,
-    rng: &mut R,
+    family: HazardFamily, params: &[f64], entry_time: f64, rng: &mut R,
 ) -> f64 {
     // Open01 samples from (0, 1) exclusive, avoiding the u=0 edge case that
     // would send -ln(u) to +∞.
@@ -1049,11 +910,7 @@ fn draw_tte_latent<R: rand::Rng>(
 /// window, else `(window, false)`. A `f64::MAX` degenerate draw is never an event, even
 /// with an unbounded window (see [`observation_window`]).
 fn draw_tte_outcome<R: rand::Rng>(
-    family: HazardFamily,
-    params: &[f64],
-    entry_time: f64,
-    window: f64,
-    rng: &mut R,
+    family: HazardFamily, params: &[f64], entry_time: f64, window: f64, rng: &mut R,
 ) -> (f64, bool, bool) {
     let t_event = draw_tte_latent(family, params, entry_time, rng);
     // The `f64::MAX` degenerate sentinel (#763) is reported to the caller and never an
@@ -1093,19 +950,13 @@ fn resolve_competing_risks(latents: &[f64], window: f64) -> (usize, f64, bool) {
 /// `(theta, eta, covariates)`; `None` for a non-`Tte` endpoint or an ODE-accumulated
 /// hazard. Shared by simulation and `predict_survival`.
 pub(crate) fn tte_cause_params(
-    endpoint: &EndpointLikelihood,
-    theta: &[f64],
-    eta: &[f64],
-    covariates: &HashMap<String, f64>,
+    endpoint: &EndpointLikelihood, theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>,
 ) -> Option<(HazardFamily, Vec<f64>)> {
     let EndpointLikelihood::Tte { hazard, .. } = endpoint else {
         return None;
     };
     // ODE-accumulated hazards have no closed-form cause params.
-    let HazardSpec::Analytic {
-        family, param_fn, ..
-    } = hazard
-    else {
+    let HazardSpec::Analytic { family, param_fn, .. } = hazard else {
         return None;
     };
     Some((*family, param_fn(theta, eta, covariates)))
@@ -1117,12 +968,8 @@ pub(crate) fn tte_cause_params(
 /// `api::predict_survival`.
 #[cfg(feature = "survival")]
 pub(crate) fn ode_cumhaz_hazard(
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    chz_state: usize,
-    theta: &[f64],
-    eta: &[f64],
-    times: &[f64],
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject, chz_state: usize,
+    theta: &[f64], eta: &[f64], times: &[f64],
 ) -> (Vec<f64>, Vec<f64>) {
     let n = times.len();
     let (mut cum, mut haz) = (vec![f64::NAN; n], vec![f64::NAN; n]);
@@ -1168,13 +1015,8 @@ pub(crate) fn ode_cumhaz_hazard(
 /// (`W_TTE_SOLVE_FAILED`, #2087). `u` is drawn before the solve, so RNG use is fixed.
 #[cfg(feature = "survival")]
 fn draw_ode_tte_latent<R: rand::Rng>(
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    theta: &[f64],
-    eta: &[f64],
-    chz_state: usize,
-    horizon: Option<f64>,
-    rng: &mut R,
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
+    eta: &[f64], chz_state: usize, horizon: Option<f64>, rng: &mut R,
 ) -> Result<f64, String> {
     let horizon = horizon.expect(
         "ODE-accumulated TTE simulation requires a finite horizon; the simulate entry \
@@ -1187,10 +1029,7 @@ fn draw_ode_tte_latent<R: rand::Rng>(
     let pk = (model.pk_param_fn)(theta, eta, &subject.covariates, 0.0);
     let mut pk_at_dose = Vec::new();
     crate::pk::compute_dose_pk_params_into(model, subject, theta, eta, &mut pk_at_dose);
-    let ode = model
-        .ode_spec
-        .as_ref()
-        .expect("ODE-accumulated hazard requires an [odes] block");
+    let ode = model.ode_spec.as_ref().expect("ODE-accumulated hazard requires an [odes] block");
     match crate::ode::predictions::ode_solve_until_chz_threshold(
         ode,
         &pk.values,
@@ -1212,17 +1051,12 @@ fn draw_ode_tte_latent<R: rand::Rng>(
 /// sibling; this panics if either (or a non-analytic hazard) slips through.
 #[cfg(feature = "survival")]
 fn rtte_cause(
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    theta: &[f64],
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
     eta: &[f64],
 ) -> Option<(usize, RtteClock, HazardFamily, Vec<f64>, f64)> {
     let mut found: Option<(usize, RtteClock, HazardFamily, Vec<f64>, f64)> = None;
     for record in &subject.obs_records {
-        let ObsRecord::Event {
-            cmt, entry_time, ..
-        } = record
-        else {
+        let ObsRecord::Event { cmt, entry_time, .. } = record else {
             continue;
         };
         let Some(EndpointLikelihood::Tte {
@@ -1235,10 +1069,7 @@ fn rtte_cause(
         };
         // The parser rejects `type = rtte` with an ODE-accumulated hazard, so only
         // the analytic closed form reaches simulation.
-        let HazardSpec::Analytic {
-            family, param_fn, ..
-        } = hazard
-        else {
+        let HazardSpec::Analytic { family, param_fn, .. } = hazard else {
             panic!(
                 "RTTE endpoint on CMT={cmt} carries a non-analytic hazard; the parser rejects \
                  `type = rtte` with an ODE-accumulated `hazard = ...`, so this is unreachable"
@@ -1284,18 +1115,9 @@ fn rtte_cause(
 #[cfg(feature = "survival")]
 #[allow(clippy::too_many_arguments)]
 fn simulate_rtte_stream<R: rand::Rng>(
-    family: HazardFamily,
-    params: &[f64],
-    clock: RtteClock,
-    horizon: f64,
-    entry: f64,
-    cmt: usize,
-    id: &str,
-    draw: usize,
-    sim: usize,
-    rng: &mut R,
-    results: &mut Vec<crate::api::SimulationResult>,
-    warnings: &mut Vec<String>,
+    family: HazardFamily, params: &[f64], clock: RtteClock, horizon: f64, entry: f64, cmt: usize,
+    id: &str, draw: usize, sim: usize, rng: &mut R,
+    results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
 ) {
     let push = |time: f64, observed: bool, results: &mut Vec<crate::api::SimulationResult>| {
         results.push(crate::api::SimulationResult {
@@ -1322,11 +1144,7 @@ fn simulate_rtte_stream<R: rand::Rng>(
     // Left truncation (#740) counts only the window past `entry`.
     let expected = match clock {
         RtteClock::Forward => {
-            let h_entry = if entry > 0.0 {
-                cum_hazard(family, entry, params)
-            } else {
-                0.0
-            };
+            let h_entry = if entry > 0.0 { cum_hazard(family, entry, params) } else { 0.0 };
             cum_hazard(family, horizon, params) - h_entry
         }
         RtteClock::Reset => (horizon - entry.max(0.0)) / sample_event_time(family, params, 0.5),
@@ -1407,16 +1225,9 @@ fn simulate_rtte_stream<R: rand::Rng>(
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn simulate_tte<R: rand::Rng>(
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    theta: &[f64],
-    eta: &[f64],
-    draw: usize,
-    sim: usize,
-    horizon: Option<f64>,
-    rng: &mut R,
-    results: &mut Vec<crate::api::SimulationResult>,
-    warnings: &mut Vec<String>,
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
+    eta: &[f64], draw: usize, sim: usize, horizon: Option<f64>, rng: &mut R,
+    results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
 ) {
     let mut degenerate = Vec::new();
     simulate_tte_reporting(
@@ -1434,11 +1245,7 @@ pub(crate) fn simulate_tte<R: rand::Rng>(
     );
     // A call never produces both kinds of warning: a failed ODE cause returns before the
     // degenerate check.
-    warnings.extend(
-        degenerate
-            .into_iter()
-            .map(|cmt| degenerate_hazard_warning(&subject.id, cmt)),
-    );
+    warnings.extend(degenerate.into_iter().map(|cmt| degenerate_hazard_warning(&subject.id, cmt)));
 }
 
 /// The body of `simulate_tte`, reporting each degenerate analytic cause (#763) as its CMT
@@ -1446,16 +1253,9 @@ pub(crate) fn simulate_tte<R: rand::Rng>(
 /// (subject, CMT) once (#1648).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
-    model: &crate::types::CompiledModel,
-    subject: &crate::types::Subject,
-    theta: &[f64],
-    eta: &[f64],
-    draw: usize,
-    sim: usize,
-    horizon: Option<f64>,
-    rng: &mut R,
-    results: &mut Vec<crate::api::SimulationResult>,
-    warnings: &mut Vec<String>,
+    model: &crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],
+    eta: &[f64], draw: usize, sim: usize, horizon: Option<f64>, rng: &mut R,
+    results: &mut Vec<crate::api::SimulationResult>, warnings: &mut Vec<String>,
     degenerate: &mut Vec<usize>,
 ) {
     // RTTE subjects are one recurrent stream, routed first so the single / competing path
@@ -1485,25 +1285,13 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
     // Each TTE cause carries its window and the kind of hazard that draws its latent;
     // non-TTE records are skipped.
     enum CauseKind {
-        Analytic {
-            family: HazardFamily,
-            params: Vec<f64>,
-            entry_time: f64,
-        },
-        Ode {
-            chz_state: usize,
-        },
+        Analytic { family: HazardFamily, params: Vec<f64>, entry_time: f64 },
+        Ode { chz_state: usize },
     }
 
     let mut causes: Vec<(usize, f64, CauseKind)> = Vec::new(); // (cmt, window, kind)
     for record in &subject.obs_records {
-        let ObsRecord::Event {
-            cmt,
-            entry_time,
-            time,
-            event_type,
-        } = record
-        else {
+        let ObsRecord::Event { cmt, entry_time, time, event_type } = record else {
             // Non-TTE records don't contribute a competing-risk cause; skip them.
             continue;
         };
@@ -1513,16 +1301,12 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
         // `horizon` overrides every window (#522); see `observation_window` otherwise.
         let window = horizon.unwrap_or_else(|| observation_window(event_type, *time));
         let kind = match hazard {
-            HazardSpec::Analytic {
-                family, param_fn, ..
-            } => CauseKind::Analytic {
+            HazardSpec::Analytic { family, param_fn, .. } => CauseKind::Analytic {
                 family: *family,
                 params: param_fn(theta, eta, &subject.covariates),
                 entry_time: *entry_time,
             },
-            HazardSpec::OdeAccumulated { chz_state } => CauseKind::Ode {
-                chz_state: *chz_state,
-            },
+            HazardSpec::OdeAccumulated { chz_state } => CauseKind::Ode { chz_state: *chz_state },
         };
         causes.push((*cmt, window, kind));
     }
@@ -1546,11 +1330,7 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
         // pre-ODE path; an ODE hazard root-finds its latent).
         [(cmt, window, kind)] => {
             let (t, observed) = match kind {
-                CauseKind::Analytic {
-                    family,
-                    params,
-                    entry_time,
-                } => {
+                CauseKind::Analytic { family, params, entry_time } => {
                     let (t, observed, is_degenerate) =
                         draw_tte_outcome(*family, params, *entry_time, *window, rng);
                     if is_degenerate {
@@ -1586,11 +1366,9 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
             let drawn: Vec<Result<f64, String>> = causes
                 .iter()
                 .map(|(_, _, kind)| match kind {
-                    CauseKind::Analytic {
-                        family,
-                        params,
-                        entry_time,
-                    } => Ok(draw_tte_latent(*family, params, *entry_time, rng)),
+                    CauseKind::Analytic { family, params, entry_time } => {
+                        Ok(draw_tte_latent(*family, params, *entry_time, rng))
+                    }
                     CauseKind::Ode { chz_state } => {
                         draw_ode_tte_latent(model, subject, theta, eta, *chz_state, horizon, rng)
                     }
@@ -1599,10 +1377,7 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
             // `max` over windows: any event-bearing cause (+∞) makes the subject
             // uncensored (the #494 anti-truncation rule); `min` would re-censor at an
             // observed event time.
-            let window = causes
-                .iter()
-                .map(|(_, w, _)| *w)
-                .fold(f64::NEG_INFINITY, f64::max);
+            let window = causes.iter().map(|(_, w, _)| *w).fold(f64::NEG_INFINITY, f64::max);
             // A failed ODE cause leaves nothing to compete with: censor every cause at
             // the window and name each failure; skip the #763 check.
             if drawn.iter().any(Result::is_err) {
@@ -1689,12 +1464,7 @@ impl DegenerateHazardTally {
     /// Record that the subject at `position` (named `id`) was censored in replicate
     /// `(draw, sim)` because its cause on `cmt` degenerated.
     pub(crate) fn record(
-        &mut self,
-        position: usize,
-        id: &str,
-        cmt: usize,
-        draw: usize,
-        sim: usize,
+        &mut self, position: usize, id: &str, cmt: usize, draw: usize, sim: usize,
     ) {
         match self
             .hits
@@ -1702,9 +1472,7 @@ impl DegenerateHazardTally {
             .find(|(at_position, c, _, _)| *at_position == position && *c == cmt)
         {
             Some((_, _, _, at)) => at.push((draw, sim)),
-            None => self
-                .hits
-                .push((position, cmt, id.to_string(), vec![(draw, sim)])),
+            None => self.hits.push((position, cmt, id.to_string(), vec![(draw, sim)])),
         }
     }
 
@@ -1779,17 +1547,10 @@ impl DegenerateHazardTally {
 /// `"sim 3, 17, 41"`: the first [`DEGENERATE_INDEX_CAP`] indices under the row field's
 /// name, then how many more there are.
 fn index_list(label: &str, indices: &[usize]) -> String {
-    let shown: Vec<String> = indices
-        .iter()
-        .take(DEGENERATE_INDEX_CAP)
-        .map(usize::to_string)
-        .collect();
+    let shown: Vec<String> =
+        indices.iter().take(DEGENERATE_INDEX_CAP).map(usize::to_string).collect();
     let rest = indices.len().saturating_sub(DEGENERATE_INDEX_CAP);
-    let more = if rest > 0 {
-        format!(" and {rest} more")
-    } else {
-        String::new()
-    };
+    let more = if rest > 0 { format!(" and {rest} more") } else { String::new() };
     format!("{label} {}{more}", shown.join(", "))
 }
 
@@ -1800,11 +1561,7 @@ fn index_list(label: &str, indices: &[usize]) -> String {
 /// selects the wording where every cause is censored.
 #[cfg(feature = "survival")]
 fn ode_solve_failed_warning(
-    id: &str,
-    cmt: usize,
-    why: &str,
-    window: f64,
-    competing: bool,
+    id: &str, cmt: usize, why: &str, window: f64, competing: bool,
 ) -> String {
     let odes_diverged = why.contains("[odes] state `");
     let hazard = why.contains("the cumulative hazard");
@@ -1865,9 +1622,8 @@ pub(crate) fn cif_curves(cum_hazards: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) 
         // `drop > 0 ⟺ dh_tot > 0` (same cumulative hazards), so the guard only skips a
         // node carrying no mass.
         let drop = (s_prev - s_all[i]).max(0.0);
-        let dh: Vec<f64> = (0..n_cause)
-            .map(|k| (cum_hazards[k][i] - cum_prev[k]).max(0.0))
-            .collect();
+        let dh: Vec<f64> =
+            (0..n_cause).map(|k| (cum_hazards[k][i] - cum_prev[k]).max(0.0)).collect();
         let dh_tot: f64 = dh.iter().sum();
         if drop > 0.0 && dh_tot > 0.0 && dh_tot.is_finite() {
             for k in 0..n_cause {
@@ -1948,10 +1704,7 @@ mod tests {
         }];
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let theta = &[0.1_f64];
         let eta = &[0.0_f64];
         let cov = HashMap::new();
@@ -1971,10 +1724,7 @@ mod tests {
         let param_fn: HazardParamFn =
             Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
         let tte = EndpointLikelihood::Tte {
-            hazard: HazardSpec::Analytic {
-                family: HazardFamily::Exponential,
-                param_fn,
-            },
+            hazard: HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn },
             recurrence: TteRecurrence::Single,
             hazard_covariates: Vec::new(),
             hazard_program: None,
@@ -2014,14 +1764,7 @@ mod tests {
         }];
         let hazard = HazardSpec::OdeAccumulated { chz_state: 2 };
         let cov = HashMap::new();
-        let nll = tte_data_term(
-            &records,
-            &hazard,
-            TteRecurrence::Single,
-            &[0.1],
-            &[0.0],
-            &cov,
-        );
+        let nll = tte_data_term(&records, &hazard, TteRecurrence::Single, &[0.1], &[0.0], &cov);
         assert_eq!(nll, SUBJECT_SENTINEL_NLL);
     }
 
@@ -2032,28 +1775,15 @@ mod tests {
         // shared per-record path returns the 1e20 sentinel (covers the degenerate guard).
         let records = vec![ObsRecord::Event {
             time: 0.0,
-            event_type: EventType::IntervalCensored {
-                left: 10.0,
-                right: 5.0,
-            },
+            event_type: EventType::IntervalCensored { left: 10.0, right: 5.0 },
             entry_time: 0.0,
             cmt: 2,
         }];
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let cov = HashMap::new();
-        let nll = tte_data_term(
-            &records,
-            &hazard,
-            TteRecurrence::Single,
-            &[0.1],
-            &[0.0],
-            &cov,
-        );
+        let nll = tte_data_term(&records, &hazard, TteRecurrence::Single, &[0.1], &[0.0], &cov);
         assert_eq!(nll, SUBJECT_SENTINEL_NLL);
     }
 
@@ -2094,12 +1824,8 @@ mod tests {
     /// Non-TTE records in the slice are skipped: a mixed slice gives the Event-only NLL.
     #[test]
     fn tte_nll_from_curves_skips_non_event_records() {
-        let event = ObsRecord::Event {
-            time: 5.0,
-            event_type: EventType::Exact,
-            entry_time: 0.0,
-            cmt: 2,
-        };
+        let event =
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 };
         let cumhaz = |t: f64| 0.1 * t;
         let hazard = |_t: f64| 0.1;
         let event_only = tte_nll_from_curves(&[event.clone()], cumhaz, hazard, MonoTol::default());
@@ -2110,18 +1836,8 @@ mod tests {
         let mixed = tte_nll_from_curves(
             &[
                 event,
-                ObsRecord::DiscreteState {
-                    time: 1.0,
-                    raw_time: 1.0,
-                    state: 0,
-                    cmt: 3,
-                },
-                ObsRecord::Count {
-                    time: 2.0,
-                    raw_time: 2.0,
-                    count: 4,
-                    cmt: 4,
-                },
+                ObsRecord::DiscreteState { time: 1.0, raw_time: 1.0, state: 0, cmt: 3 },
+                ObsRecord::Count { time: 2.0, raw_time: 2.0, count: 4, cmt: 4 },
             ],
             cumhaz,
             hazard,
@@ -2138,12 +1854,7 @@ mod tests {
     #[test]
     fn rtte_forward_nll_from_curves_skips_non_event_records() {
         let events = [
-            ObsRecord::Event {
-                time: 2.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 2.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
             ObsRecord::Event {
                 time: 5.0,
                 event_type: EventType::RightCensored,
@@ -2155,15 +1866,7 @@ mod tests {
         let hazard = |_t: f64| 0.1;
         let event_only = rtte_forward_nll_from_curves(&events, cumhaz, hazard, MonoTol::default());
         let mut mixed = events.to_vec();
-        mixed.insert(
-            1,
-            ObsRecord::DiscreteState {
-                time: 3.0,
-                raw_time: 3.0,
-                state: 1,
-                cmt: 3,
-            },
-        );
+        mixed.insert(1, ObsRecord::DiscreteState { time: 3.0, raw_time: 3.0, state: 1, cmt: 3 });
         let mixed_nll = rtte_forward_nll_from_curves(&mixed, cumhaz, hazard, MonoTol::default());
         assert_eq!(event_only, mixed_nll, "non-TTE records must be skipped");
     }
@@ -2172,12 +1875,7 @@ mod tests {
     #[test]
     fn rtte_reset_nll_from_curves_skips_non_event_records() {
         let events = [
-            ObsRecord::Event {
-                time: 2.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 2.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
             ObsRecord::Event {
                 time: 5.0,
                 event_type: EventType::RightCensored,
@@ -2189,15 +1887,7 @@ mod tests {
         let hazard = |_t: f64| 0.1;
         let event_only = rtte_reset_nll_from_curves(&events, cumhaz, hazard, MonoTol::default());
         let mut mixed = events.to_vec();
-        mixed.insert(
-            1,
-            ObsRecord::Count {
-                time: 3.0,
-                raw_time: 3.0,
-                count: 2,
-                cmt: 4,
-            },
-        );
+        mixed.insert(1, ObsRecord::Count { time: 3.0, raw_time: 3.0, count: 2, cmt: 4 });
         let mixed_nll = rtte_reset_nll_from_curves(&mixed, cumhaz, hazard, MonoTol::default());
         assert_eq!(event_only, mixed_nll, "non-TTE records must be skipped");
     }
@@ -2213,10 +1903,7 @@ mod tests {
         }];
         // H(5) = −1e−9, below the 1e−6 absolute floor ⇒ accepted, not sentinel.
         let nll = tte_nll_from_curves(&records, |_t| -1e-9, |_t| 0.0, MonoTol::default());
-        assert!(
-            nll.abs() < 1e-6,
-            "round-off dip must stay finite, got {nll}"
-        );
+        assert!(nll.abs() < 1e-6, "round-off dip must stay finite, got {nll}");
     }
 
     /// Interval-censored with `H(left) < H(entry)`: the interval arm's monotone branch.
@@ -2224,10 +1911,7 @@ mod tests {
     fn tte_nll_from_curves_rejects_non_monotone_interval() {
         let records = vec![ObsRecord::Event {
             time: 0.0,
-            event_type: EventType::IntervalCensored {
-                left: 5.0,
-                right: 10.0,
-            },
+            event_type: EventType::IntervalCensored { left: 5.0, right: 10.0 },
             entry_time: 2.0,
             cmt: 3,
         }];
@@ -2335,10 +2019,7 @@ mod tests {
         }];
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let theta = &[0.1_f64];
         let eta = &[0.0_f64];
         let cov = HashMap::new();
@@ -2359,10 +2040,7 @@ mod tests {
         }];
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _eta: &[f64], _cov: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let nll = tte_data_term(
             &records,
             &hazard,
@@ -2383,19 +2061,13 @@ mod tests {
         // nll = 1.70881...
         let records = vec![ObsRecord::Event {
             time: 5.0, // right bound (time field = right for interval-censored)
-            event_type: EventType::IntervalCensored {
-                left: 3.0,
-                right: 5.0,
-            },
+            event_type: EventType::IntervalCensored { left: 3.0, right: 5.0 },
             entry_time: 0.0,
             cmt: 2,
         }];
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let nll = tte_data_term(
             &records,
             &hazard,
@@ -2415,19 +2087,13 @@ mod tests {
         // Tight interval (10, 10.0001), λ=0.1: the expm1 form stays finite and positive.
         let records = vec![ObsRecord::Event {
             time: 10.0001,
-            event_type: EventType::IntervalCensored {
-                left: 10.0,
-                right: 10.0001,
-            },
+            event_type: EventType::IntervalCensored { left: 10.0, right: 10.0001 },
             entry_time: 0.0,
             cmt: 2,
         }];
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let nll = tte_data_term(
             &records,
             &hazard,
@@ -2451,18 +2117,8 @@ mod tests {
     // form: H(t) = λt, h(t) = λ.
     fn rtte_constant_hazard_records() -> Vec<ObsRecord> {
         vec![
-            ObsRecord::Event {
-                time: 5.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
-            ObsRecord::Event {
-                time: 10.0,
-                event_type: EventType::Exact,
-                entry_time: 0.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
+            ObsRecord::Event { time: 10.0, event_type: EventType::Exact, entry_time: 0.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -2523,18 +2179,8 @@ mod tests {
         // Same event/censor times as `rtte_constant_hazard_records`, but the subject
         // enters the risk set at t = 2 (left truncation carried on the first record).
         let records = vec![
-            ObsRecord::Event {
-                time: 5.0,
-                event_type: EventType::Exact,
-                entry_time: 2.0,
-                cmt: 2,
-            },
-            ObsRecord::Event {
-                time: 10.0,
-                event_type: EventType::Exact,
-                entry_time: 2.0,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 2.0, cmt: 2 },
+            ObsRecord::Event { time: 10.0, event_type: EventType::Exact, entry_time: 2.0, cmt: 2 },
             ObsRecord::Event {
                 time: 30.0,
                 event_type: EventType::RightCensored,
@@ -2558,10 +2204,7 @@ mod tests {
         let cumhaz_at = |t: f64| if t < 6.0 { t } else { 12.0 - t };
         let hazard_at = |_t: f64| 0.1;
         let nll = rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
-        assert_eq!(
-            nll, SUBJECT_SENTINEL_NLL,
-            "non-monotone CHZ must return the sentinel"
-        );
+        assert_eq!(nll, SUBJECT_SENTINEL_NLL, "non-monotone CHZ must return the sentinel");
     }
 
     #[test]
@@ -2572,16 +2215,11 @@ mod tests {
         let records = rtte_constant_hazard_records();
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let via_dispatch = tte_data_term(
             &records,
             &hazard,
-            TteRecurrence::Repeated {
-                clock: RtteClock::Forward,
-            },
+            TteRecurrence::Repeated { clock: RtteClock::Forward },
             &[lambda],
             &[0.0],
             &HashMap::new(),
@@ -2682,12 +2320,7 @@ mod tests {
         let lambda = 0.05_f64;
         let entry = 4.0;
         let records = vec![
-            ObsRecord::Event {
-                time: 6.0,
-                event_type: EventType::Exact,
-                entry_time: entry,
-                cmt: 2,
-            },
+            ObsRecord::Event { time: 6.0, event_type: EventType::Exact, entry_time: entry, cmt: 2 },
             ObsRecord::Event {
                 time: 12.0,
                 event_type: EventType::Exact,
@@ -2708,11 +2341,7 @@ mod tests {
             rtte_forward_nll_from_curves(&records, cumhaz_at, hazard_at, MonoTol::analytic());
         assert_abs_diff_eq!(reset, forward, epsilon = 1e-12);
         // Closed form: λ(T − entry) − 2·log λ = 0.05·(30 − 4) − 2·log(0.05).
-        assert_abs_diff_eq!(
-            reset,
-            lambda * (30.0 - entry) - 2.0 * lambda.ln(),
-            epsilon = 1e-12
-        );
+        assert_abs_diff_eq!(reset, lambda * (30.0 - entry) - 2.0 * lambda.ln(), epsilon = 1e-12);
     }
 
     #[test]
@@ -2744,26 +2373,17 @@ mod tests {
         let records = rtte_constant_hazard_records();
         let param_fn: crate::types::HazardParamFn =
             Box::new(|theta: &[f64], _: &[f64], _: &HashMap<String, f64>| vec![theta[0]]);
-        let hazard = HazardSpec::Analytic {
-            family: HazardFamily::Exponential,
-            param_fn,
-        };
+        let hazard = HazardSpec::Analytic { family: HazardFamily::Exponential, param_fn };
         let via_dispatch = tte_data_term(
             &records,
             &hazard,
-            TteRecurrence::Repeated {
-                clock: RtteClock::Reset,
-            },
+            TteRecurrence::Repeated { clock: RtteClock::Reset },
             &[lambda],
             &[0.0],
             &HashMap::new(),
         );
         // Exponential ⇒ reset == forward == 30λ − 2·log λ.
-        assert_abs_diff_eq!(
-            via_dispatch,
-            30.0 * lambda - 2.0 * lambda.ln(),
-            epsilon = 1e-12
-        );
+        assert_abs_diff_eq!(via_dispatch, 30.0 * lambda - 2.0 * lambda.ln(), epsilon = 1e-12);
     }
 
     #[test]
@@ -2811,17 +2431,11 @@ mod tests {
         // Interval-censored record is unsupported for RTTE → sentinel.
         let interval = ObsRecord::Event {
             time: 5.0,
-            event_type: EventType::IntervalCensored {
-                left: 3.0,
-                right: 5.0,
-            },
+            event_type: EventType::IntervalCensored { left: 3.0, right: 5.0 },
             entry_time: 0.0,
             cmt: 2,
         };
-        assert_eq!(
-            rtte_reset_nll_from_curves(&[interval], lin, good_h, tol),
-            SUBJECT_SENTINEL_NLL
-        );
+        assert_eq!(rtte_reset_nll_from_curves(&[interval], lin, good_h, tol), SUBJECT_SENTINEL_NLL);
     }
 
     // ── draw_tte_outcome: administrative censoring at the observation window ──
@@ -2840,10 +2454,7 @@ mod tests {
             let (t, observed, _) =
                 draw_tte_outcome(HazardFamily::Exponential, &[lambda], 0.0, window, &mut rng);
             if observed {
-                assert!(
-                    t > 0.0 && t < window,
-                    "event time must lie in (0, window): {t}"
-                );
+                assert!(t > 0.0 && t < window, "event time must lie in (0, window): {t}");
             } else {
                 assert_eq!(t, window, "censored time must equal the window");
                 censored += 1;
@@ -2862,18 +2473,10 @@ mod tests {
         use rand::SeedableRng;
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
         for _ in 0..1000 {
-            let (t, observed, _) = draw_tte_outcome(
-                HazardFamily::Exponential,
-                &[1.0],
-                0.0,
-                f64::INFINITY,
-                &mut rng,
-            );
+            let (t, observed, _) =
+                draw_tte_outcome(HazardFamily::Exponential, &[1.0], 0.0, f64::INFINITY, &mut rng);
             assert!(observed, "no censoring is possible with an infinite window");
-            assert!(
-                t.is_finite() && t > 0.0,
-                "event time must be finite positive: {t}"
-            );
+            assert!(t.is_finite() && t > 0.0, "event time must be finite positive: {t}");
         }
     }
 
@@ -2904,20 +2507,14 @@ mod tests {
             let (t, observed, _) =
                 draw_tte_outcome(HazardFamily::Exponential, &[0.2], entry, window, &mut rng);
             if observed {
-                assert!(
-                    t > entry && t < window,
-                    "conditional event in (entry, window): {t}"
-                );
+                assert!(t > entry && t < window, "conditional event in (entry, window): {t}");
                 saw_event = true;
             } else {
                 assert_eq!(t, window);
                 saw_censor = true;
             }
         }
-        assert!(
-            saw_event && saw_censor,
-            "expected a mix of events and censored draws"
-        );
+        assert!(saw_event && saw_censor, "expected a mix of events and censored draws");
     }
 
     #[test]
@@ -2926,13 +2523,8 @@ mod tests {
         // λ=0 ⇒ f64::MAX; with an unbounded window it must still be censored.
         let mut rng = rand::rngs::StdRng::seed_from_u64(123);
         for _ in 0..100 {
-            let (t, observed, _) = draw_tte_outcome(
-                HazardFamily::Exponential,
-                &[0.0],
-                0.0,
-                f64::INFINITY,
-                &mut rng,
-            );
+            let (t, observed, _) =
+                draw_tte_outcome(HazardFamily::Exponential, &[0.0], 0.0, f64::INFINITY, &mut rng);
             assert!(
                 !observed,
                 "a degenerate (no-event) draw must never be reported as an observed event"
@@ -2947,11 +2539,7 @@ mod tests {
     /// row at the horizon and every earlier row is an observed event, increasing in
     /// `(0, horizon)`, on `cmt` with NaN ipred.
     fn rtte_stream_events<R: rand::Rng>(
-        family: HazardFamily,
-        params: &[f64],
-        clock: RtteClock,
-        horizon: f64,
-        rng: &mut R,
+        family: HazardFamily, params: &[f64], clock: RtteClock, horizon: f64, rng: &mut R,
     ) -> Vec<f64> {
         let mut results = Vec::new();
         let mut warnings = Vec::new();
@@ -2995,9 +2583,7 @@ mod tests {
             }
         }
         assert!(
-            results
-                .iter()
-                .all(|r| r.cmt == 2 && r.id == "1" && r.ipred.is_nan()),
+            results.iter().all(|r| r.cmt == 2 && r.id == "1" && r.ipred.is_nan()),
             "cmt / id / NaN-ipred echoed on every row"
         );
         events
@@ -3034,18 +2620,11 @@ mod tests {
             );
             match results[0].outcome {
                 SimOutcome::Event { time, observed } => {
-                    assert!(
-                        !observed && time == horizon,
-                        "{clock:?}: censored at horizon"
-                    );
+                    assert!(!observed && time == horizon, "{clock:?}: censored at horizon");
                 }
                 _ => panic!("expected an Event outcome"),
             }
-            assert_eq!(
-                warnings.len(),
-                1,
-                "{clock:?}: exactly one degenerate-stream warning"
-            );
+            assert_eq!(warnings.len(), 1, "{clock:?}: exactly one degenerate-stream warning");
             assert!(
                 warnings[0].contains("W_RTTE_DEGENERATE")
                     && warnings[0].contains("S1")
@@ -3165,10 +2744,7 @@ mod tests {
         let mean = counts.iter().sum::<f64>() / n as f64;
         let var = counts.iter().map(|c| (c - mean).powi(2)).sum::<f64>() / n as f64;
         let expected = lambda * horizon;
-        assert!(
-            (mean - expected).abs() < 0.15,
-            "mean events {mean} should track λT = {expected}"
-        );
+        assert!((mean - expected).abs() < 0.15, "mean events {mean} should track λT = {expected}");
         assert!(
             (var / mean - 1.0).abs() < 0.15,
             "count dispersion var/mean = {} should be ≈ 1 (Poisson)",
@@ -3225,11 +2801,7 @@ mod tests {
             &mut r_rst,
         );
         assert_eq!(fwd, rst, "exponential forward == reset (memoryless)");
-        assert!(
-            !fwd.is_empty(),
-            "expected events for λT = {}",
-            lambda * horizon
-        );
+        assert!(!fwd.is_empty(), "expected events for λT = {}", lambda * horizon);
     }
 
     #[test]
@@ -3264,10 +2836,7 @@ mod tests {
             (fwd[0] - rst[0]).abs() < 1e-12,
             "the first event is a fresh draw from 0 either way"
         );
-        assert_ne!(
-            fwd, rst,
-            "Weibull forward and reset must diverge after the first event"
-        );
+        assert_ne!(fwd, rst, "Weibull forward and reset must diverge after the first event");
     }
 
     #[test]
@@ -3357,11 +2926,7 @@ mod tests {
     /// Observed event times of one RTTE stream with a given left-truncation `entry`
     /// (excludes the trailing administrative-censor row).
     fn collect_rtte_events<R: rand::Rng>(
-        family: HazardFamily,
-        params: &[f64],
-        clock: RtteClock,
-        horizon: f64,
-        entry: f64,
+        family: HazardFamily, params: &[f64], clock: RtteClock, horizon: f64, entry: f64,
         rng: &mut R,
     ) -> Vec<f64> {
         let mut results = Vec::new();
@@ -3425,10 +2990,7 @@ mod tests {
             assert!(events_0.len() >= events_e.len());
             for (k, &t_e) in events_e.iter().enumerate() {
                 assert_abs_diff_eq!(t_e, events_0[k] + entry, epsilon = 1e-9);
-                assert!(
-                    t_e >= entry,
-                    "{clock:?}: no simulated event may precede entry"
-                );
+                assert!(t_e >= entry, "{clock:?}: no simulated event may precede entry");
             }
         }
     }
@@ -3460,10 +3022,7 @@ mod tests {
             0.0,
             &mut r_0,
         );
-        assert!(
-            !events_e.is_empty(),
-            "expected at least one event before the horizon"
-        );
+        assert!(!events_e.is_empty(), "expected at least one event before the horizon");
         assert!(
             events_e[0] >= entry,
             "first sojourn must be conditioned past entry: {} < {entry}",
@@ -3523,10 +3082,7 @@ mod tests {
             let u1: f64 = probe.sample(rand::distr::Open01);
             let b = sample_conditional_event_time(HazardFamily::Weibull, &params, entry, u1);
             let a = entry + sample_event_time(HazardFamily::Weibull, &params, u1);
-            assert!(
-                b < horizon,
-                "setup: first B event must land before the horizon"
-            );
+            assert!(b < horizon, "setup: first B event must land before the horizon");
             assert!(
                 (a - b).abs() > 0.5,
                 "setup: A ({a}) and B ({b}) must differ materially for a time-varying hazard"
@@ -3632,10 +3188,8 @@ mod tests {
         //   F_k(t) = (λ_k/Σλ)·(1 − exp(−Σλ·t)),  S_all(t) = exp(−Σλ·t).
         let (l1, l2) = (0.1_f64, 0.3_f64);
         let grid = [0.0, 2.0, 5.0, 13.0, 40.0];
-        let cum: Vec<Vec<f64>> = vec![
-            grid.iter().map(|&t| l1 * t).collect(),
-            grid.iter().map(|&t| l2 * t).collect(),
-        ];
+        let cum: Vec<Vec<f64>> =
+            vec![grid.iter().map(|&t| l1 * t).collect(), grid.iter().map(|&t| l2 * t).collect()];
 
         let (cif, s_all) = cif_curves(&cum);
         let lsum = l1 + l2;
@@ -3707,9 +3261,7 @@ mod tests {
 
         // `cif_curves` on a fine grid over [0, 15] (dt = 0.0025).
         let n_grid = 6000usize;
-        let grid: Vec<f64> = (0..=n_grid)
-            .map(|i| i as f64 * 15.0 / n_grid as f64)
-            .collect();
+        let grid: Vec<f64> = (0..=n_grid).map(|i| i as f64 * 15.0 / n_grid as f64).collect();
         let chz = vec![
             grid.iter().map(|&t| cumh0(t)).collect::<Vec<_>>(),
             grid.iter().map(|&t| cumh1(t)).collect::<Vec<_>>(),
@@ -3734,13 +3286,7 @@ mod tests {
         // Event records carry no horizon: they draw uncensored (+∞).
         assert_eq!(observation_window(&EventType::Exact, 12.0), f64::INFINITY);
         assert_eq!(
-            observation_window(
-                &EventType::IntervalCensored {
-                    left: 1.0,
-                    right: 5.0
-                },
-                5.0
-            ),
+            observation_window(&EventType::IntervalCensored { left: 1.0, right: 5.0 }, 5.0),
             f64::INFINITY
         );
     }
@@ -3769,11 +3315,7 @@ mod tests {
             Diagnosis::OdesDiverged,
             ODES,
         ),
-        (
-            "the cumulative hazard became non-finite at t=2.000000",
-            Diagnosis::HazardNonFinite,
-            BOTH,
-        ),
+        ("the cumulative hazard became non-finite at t=2.000000", Diagnosis::HazardNonFinite, BOTH),
         (
             "the cumulative hazard decreased (0.500000 → 0.400000) over [1.000000, 1.100000]: \
              non-monotone accumulator (negative rate / hazard)",
@@ -3841,10 +3383,7 @@ mod tests {
             "The [event_model] hazard went negative for this subject's parameter draw.";
         for (why, diagnosis, advice) in SOLVE_FAILED_REASONS {
             let w = ode_solve_failed_warning("7", 2, why, 30.0, false);
-            assert!(
-                w.starts_with("W_TTE_SOLVE_FAILED: subject '7' (CMT=2): "),
-                "{w}"
-            );
+            assert!(w.starts_with("W_TTE_SOLVE_FAILED: subject '7' (CMT=2): "), "{w}");
             assert!(w.contains(&format!("failed: {why}.")), "{w}");
             let (odes, nonfinite, negative) = match diagnosis {
                 Diagnosis::OdesDiverged => (true, false, false),
@@ -3854,16 +3393,8 @@ mod tests {
                 Diagnosis::None => (false, false, false),
             };
             assert_eq!(w.contains(ODES_SENTENCE), odes, "{diagnosis:?}: {w}");
-            assert_eq!(
-                w.contains(NONFINITE_SENTENCE),
-                nonfinite,
-                "{diagnosis:?}: {w}"
-            );
-            assert_eq!(
-                w.contains(NEGATIVE_SENTENCE),
-                negative,
-                "{diagnosis:?}: {w}"
-            );
+            assert_eq!(w.contains(NONFINITE_SENTENCE), nonfinite, "{diagnosis:?}: {w}");
+            assert_eq!(w.contains(NEGATIVE_SENTENCE), negative, "{diagnosis:?}: {w}");
             assert!(w.ends_with(advice), "{diagnosis:?} advice: {w}");
             assert!(
                 w.contains(
@@ -3872,10 +3403,7 @@ mod tests {
                 ),
                 "{w}"
             );
-            assert!(
-                w.contains("The rest of the population still simulates."),
-                "{w}"
-            );
+            assert!(w.contains("The rest of the population still simulates."), "{w}");
             assert!(!w.contains("degenerate"), "{w}");
             assert!(!w.contains("__chz"), "{w}");
             // No bare 0-based state index: every "state " is followed by a label, not a digit.
@@ -3942,13 +3470,7 @@ mod exact_eta_hessian_tests {
         let theta = &model.default_params.theta;
         let (cmt, ep) = model.endpoints.iter().next().unwrap();
         assert!(
-            matches!(
-                ep,
-                EndpointLikelihood::Tte {
-                    hazard: HazardSpec::Analytic { .. },
-                    ..
-                }
-            ),
+            matches!(ep, EndpointLikelihood::Tte { hazard: HazardSpec::Analytic { .. }, .. }),
             "an analytic exponential endpoint"
         );
         let mut checked = 0;
@@ -3970,9 +3492,7 @@ mod exact_eta_hessian_tests {
             let t_sum: f64 = recs
                 .iter()
                 .map(|r| match r {
-                    ObsRecord::Event {
-                        time, entry_time, ..
-                    } => {
+                    ObsRecord::Event { time, entry_time, .. } => {
                         assert_eq!(*entry_time, 0.0, "the closed form assumes no truncation");
                         *time
                     }
@@ -3980,11 +3500,7 @@ mod exact_eta_hessian_tests {
                 })
                 .sum();
             let want = lambda * t_sum;
-            assert!(
-                ((h[(0, 0)] - want) / want).abs() < 1e-14,
-                "{} vs {want}",
-                h[(0, 0)]
-            );
+            assert!(((h[(0, 0)] - want) / want).abs() < 1e-14, "{} vs {want}", h[(0, 0)]);
             checked += 1;
         }
         assert!(checked > 0);
@@ -4013,10 +3529,7 @@ mod exact_eta_hessian_tests {
             let lambda = theta[0] * eta[0].exp();
             let (mut t_sum, mut n_exact) = (0.0, 0.0);
             for r in &s.obs_records {
-                if let ObsRecord::Event {
-                    time, event_type, ..
-                } = r
-                {
+                if let ObsRecord::Event { time, event_type, .. } = r {
                     t_sum += time;
                     if matches!(event_type, EventType::Exact) {
                         n_exact += 1.0;
@@ -4024,16 +3537,9 @@ mod exact_eta_hessian_tests {
                 }
             }
             let want = lambda * t_sum - n_exact;
-            assert!(
-                (g[0] - want).abs() <= 1e-13 * (1.0 + want.abs()),
-                "{} vs {want}",
-                g[0]
-            );
+            assert!((g[0] - want).abs() <= 1e-13 * (1.0 + want.abs()), "{} vs {want}", g[0]);
             let (cmt, ep) = model.endpoints.iter().next().unwrap();
-            let crate::types::EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } = ep
-            else {
+            let crate::types::EndpointLikelihood::Tte { hazard, recurrence, .. } = ep else {
                 unreachable!()
             };
             let recs: Vec<ObsRecord> = s
@@ -4132,10 +3638,7 @@ mod ode_hazard_exact_tests {
         // hazard's drug channel carries an η.
         let src = std::fs::read_to_string(format!("{root}/nonmem_anchor/pktte_tdep_fit.ferx"))
             .unwrap()
-            .replace(
-                "  sigma PROP_ERR",
-                "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR",
-            )
+            .replace("  sigma PROP_ERR", "  omega ETA_CL ~ 0.09\n  sigma PROP_ERR")
             .replace("CL   = TVCL\n", "CL   = TVCL * exp(ETA_CL)\n");
         let mut model = crate::parser::model_parser::parse_model_string(&src).unwrap();
         assert_eq!(model.n_eta, 1);
@@ -4161,10 +3664,7 @@ mod ode_hazard_exact_tests {
             .find(|(_, ep)| matches!(ep, EndpointLikelihood::Tte { .. }))
             .unwrap()
             .0;
-        assert!(
-            tte_endpoint_served(model, cmt),
-            "a TIME-reading hazard is served"
-        );
+        assert!(tte_endpoint_served(model, cmt), "a TIME-reading hazard is served");
         let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
             let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
             // Relative to `x` itself: a small parameter (a baseline hazard of 0.02) under an
@@ -4180,17 +3680,8 @@ mod ode_hazard_exact_tests {
             acc
         };
         let (mut worst_v, mut worst_g, mut n) = (0.0f64, 0.0f64, 0);
-        for s in population
-            .subjects
-            .iter()
-            .filter(|s| !s.obs_records.is_empty())
-            .take(4)
-        {
-            assert!(
-                tte_record_served(model, s, cmt),
-                "subject {} is served",
-                s.id
-            );
+        for s in population.subjects.iter().filter(|s| !s.obs_records.is_empty()).take(4) {
+            assert!(tte_record_served(model, s, cmt), "subject {} is served", s.id);
             let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.05 * k as f64).collect();
             let (v, g) = tte_subject_eta_grad(model, s, &theta, &eta).expect("exact");
             let v_ref = nll(s, &theta, &eta);
@@ -4291,14 +3782,8 @@ mod ode_hazard_exact_tests {
         let ss_model = MODEL
             .replace("  omega ETA_LAG ~ 0.09\n  omega ETA_MTT ~ 0.09\n", "")
             .replace("transit(n=NTR, mtt=MTT) - KA * depot", "-KA * depot")
-            .replace(
-                "  MTT   = TVMTT * exp(ETA_MTT) - 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n",
-                "",
-            )
-            .replace(
-                "  ALAG1 = TVLAG * exp(ETA_LAG) + 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n",
-                "",
-            )
+            .replace("  MTT   = TVMTT * exp(ETA_MTT) - 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n", "")
+            .replace("  ALAG1 = TVLAG * exp(ETA_LAG) + 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n", "")
             .replace(" + 0.002 * TAD", "")
             .replace(" * (if (TIME < 0.5) 1.5 else 1.0)", "");
         let (mut worst_v, mut worst_g) = (0.0f64, 0.0f64);

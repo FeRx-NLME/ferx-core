@@ -90,10 +90,7 @@ fn warnings_for(pop: &Population, decisions: &[f64]) -> Vec<String> {
     let make = || |_c: &ControllerCtx| vec![DoseAction::Hold];
     let res = simulate_adaptive(&m, pop, &m.default_params, 1, make, &opts)
         .expect("a holding controller runs");
-    res.warnings
-        .into_iter()
-        .filter(|w| w.starts_with(CODE))
-        .collect()
+    res.warnings.into_iter().filter(|w| w.starts_with(CODE)).collect()
 }
 
 /// The premise of every moved-reset fixture: where the reader put each reset, and the
@@ -118,10 +115,7 @@ fn straddle_moved_reset_warns_and_unmoved_twin_is_silent() {
     let w_unmoved = warnings_for(&unmoved, &decisions);
     assert_eq!(w_moved.len(), 1, "moved twin warns once: {w_moved:?}");
     assert!(w_moved[0].contains("subject 1:"), "{}", w_moved[0]);
-    assert!(
-        w_unmoved.is_empty(),
-        "an unmoved reset must not warn: {w_unmoved:?}"
-    );
+    assert!(w_unmoved.is_empty(), "an unmoved reset must not warn: {w_unmoved:?}");
 }
 
 #[test]
@@ -133,16 +127,14 @@ fn infusion_case_names_decision_and_both_reset_times() {
     let w = warnings_for(&pop, &[0.0, 12.0, 24.0, 36.0]);
     assert_eq!(
         w,
-        vec![
-            "W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET: subject 1: decision time(s) 24 come \
+        vec!["W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET: subject 1: decision time(s) 24 come \
              after the reset written at TIME 18 but before it on the engine clock, where it \
              runs at 31. The data reader moved this reset, and every row after it, later by \
              13 (#1609). `decision_times` and the `[adaptive_dosing]` block's `at` are read \
              on the engine clock, so a dose issued at these times lands before the reset, \
              and the reset removes it. To decide after the reset, add 13 to each decision \
              time written between it and the next reset."
-                .to_string()
-        ]
+            .to_string()]
     );
 }
 
@@ -183,11 +175,7 @@ fn decision_at_the_written_reset_warns_and_at_the_engine_reset_does_not() {
     assert_resets(&pop, &[31.0], &[18.0], "infusion");
     let w = warnings_for(&pop, &[18.0, 31.0]);
     assert_eq!(w.len(), 1, "{w:?}");
-    assert!(
-        w[0].contains("decision time(s) 18 come after"),
-        "18 flagged, 31 not: {}",
-        w[0]
-    );
+    assert!(w[0].contains("decision time(s) 18 come after"), "18 flagged, 31 not: {}", w[0]);
 }
 
 #[test]
@@ -261,15 +249,9 @@ fn a_reset_after_a_restart_is_not_checked() {
     let pop = read(RESET_AFTER_RESTART_CSV);
     assert_resets(&pop, &[25.0, 56.0], &[0.0, 30.0], "reset after a restart");
     let d = 40.0;
-    assert!(
-        d >= 30.0 && d < 56.0,
-        "premise: the side test straddles the second reset"
-    );
+    assert!(d >= 30.0 && d < 56.0, "premise: the side test straddles the second reset");
     let w = warnings_for(&pop, &[25.0, d]);
-    assert!(
-        w.is_empty(),
-        "no reset after a restart is on the decision clock: {w:?}"
-    );
+    assert!(w.is_empty(), "no reset after a restart is on the decision clock: {w:?}");
 }
 
 #[test]
@@ -286,30 +268,21 @@ fn from_spec_with_an_every_grid_warns() {
 "
     );
     let parsed = parse_full_model(&src).expect("parse model with [adaptive_dosing]");
-    let (m, spec) = (
-        &parsed.model,
-        parsed.adaptive_dosing.as_ref().expect("block parsed"),
-    );
+    let (m, spec) = (&parsed.model, parsed.adaptive_dosing.as_ref().expect("block parsed"));
     let pop = read(&infusion_rows("1", 20.0));
     assert_resets(&pop, &[31.0], &[18.0], "infusion");
     let mut opts = AdaptiveSimulateOptions::default();
     opts.seed = Some(11);
     let res =
         simulate_adaptive_from_spec(m, &pop, &m.default_params, 1, spec, &opts).expect("spec run");
-    let w: Vec<&String> = res
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with(CODE))
-        .collect();
+    let w: Vec<&String> = res.warnings.iter().filter(|w| w.starts_with(CODE)).collect();
     assert_eq!(w.len(), 1, "{w:?}");
     assert!(w[0].contains("decision time(s) 24 come after"), "{}", w[0]);
 }
 
 #[test]
 fn more_than_ten_lines_are_counted_in_one_closing_line() {
-    let rows: String = (1..=11)
-        .map(|i| infusion_rows(&i.to_string(), 20.0))
-        .collect();
+    let rows: String = (1..=11).map(|i| infusion_rows(&i.to_string(), 20.0)).collect();
     let pop = read(&rows);
     let w = warnings_for(&pop, &[24.0]);
     assert_eq!(w.len(), 11, "{w:?}");

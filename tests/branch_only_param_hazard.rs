@@ -69,23 +69,12 @@ fn all_arm_hazard_parameter_predicts_like_its_ternary_twin() {
     for header in ["[event_model]", "[event_model DEATH]"] {
         let all_arm = cum_hazard_at_5(&model(ALL_ARM, header));
         let ternary = cum_hazard_at_5(&model(TERNARY, header));
-        assert_eq!(
-            all_arm, ternary,
-            "{header}: the two spellings must agree bit for bit"
-        );
+        assert_eq!(all_arm, ternary, "{header}: the two spellings must agree bit for bit");
         // Closed form, H(5) = h · 5: 0.02 · 5 for WT 60, 0.01 · 5 for WT 80.
         // Both arms are live: the two subjects differ by a factor of two.
         assert_eq!(all_arm.len(), 2, "{header}: one row per subject");
-        assert!(
-            (all_arm[0] - 0.10).abs() < 1e-9,
-            "{header}: WT 60 H(5) = {}",
-            all_arm[0]
-        );
-        assert!(
-            (all_arm[1] - 0.05).abs() < 1e-9,
-            "{header}: WT 80 H(5) = {}",
-            all_arm[1]
-        );
+        assert!((all_arm[0] - 0.10).abs() < 1e-9, "{header}: WT 60 H(5) = {}", all_arm[0]);
+        assert!((all_arm[1] - 0.05).abs() < 1e-9, "{header}: WT 80 H(5) = {}", all_arm[1]);
     }
 }
 
@@ -142,10 +131,7 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
         let (pop, _) =
             read_population_for(&m, &None, f.path().to_str().unwrap(), None, None, None, &[])
                 .unwrap_or_else(|e| panic!("data must load: {e}"));
-        let opts = FitOptions {
-            outer_maxiter: 2,
-            ..Default::default()
-        };
+        let opts = FitOptions { outer_maxiter: 2, ..Default::default() };
         fit(&m, &pop, &m.default_params, &opts).expect("fit")
     };
     let all_arm = run(ALL_ARM_ETA);
@@ -159,9 +145,7 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
             "{label}: every TTE subject runs the exact inner gradient"
         );
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains("use finite-difference inner gradients")),
+            !r.warnings.iter().any(|w| w.contains("use finite-difference inner gradients")),
             "{label}: no subject falls to FD: {:?}",
             r.warnings
         );

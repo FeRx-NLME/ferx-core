@@ -27,20 +27,11 @@ fn model(src: &str) -> CompiledModel {
 }
 
 fn rec(time: f64, event_type: EventType, cmt: usize) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time: 0.0,
-        cmt,
-    }
+    ObsRecord::Event { time, event_type, entry_time: 0.0, cmt }
 }
 
 fn subj(id: &str, records: Vec<ObsRecord>) -> Subject {
-    Subject {
-        id: id.into(),
-        obs_records: records,
-        ..Default::default()
-    }
+    Subject { id: id.into(), obs_records: records, ..Default::default() }
 }
 
 fn pop(subjects: Vec<Subject>) -> Population {
@@ -57,23 +48,14 @@ fn pop(subjects: Vec<Subject>) -> Population {
 /// `n` subjects on cmt 2, every one censored at `c` (`event = false`) or with an event
 /// at `c` (`event = true`).
 fn uniform_pop(n: usize, c: f64, event: bool) -> Population {
-    let et = if event {
-        EventType::Exact
-    } else {
-        EventType::RightCensored
-    };
-    pop((1..=n)
-        .map(|i| subj(&i.to_string(), vec![rec(c, et.clone(), 2)]))
-        .collect())
+    let et = if event { EventType::Exact } else { EventType::RightCensored };
+    pop((1..=n).map(|i| subj(&i.to_string(), vec![rec(c, et.clone(), 2)])).collect())
 }
 
 fn opts(n_sim: usize) -> VpcTteOptions {
     VpcTteOptions {
         n_sim,
-        sim: SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        sim: SimulateOptions { seed: Some(7), ..Default::default() },
         ..Default::default()
     }
 }
@@ -103,23 +85,18 @@ fn post_censor_censors_draws_past_the_censoring_time() {
 /// 6 for `u = 0.6`; reading the censoring curve the wrong way round changes `g.surv`.
 #[test]
 fn draw_censoring_inverts_the_conditional_censoring_distribution() {
-    let rows: Vec<ObsRow> = [
-        (1.0, None),
-        (2.0, Some(2.0)),
-        (3.0, None),
-        (4.0, Some(4.0)),
-        (6.0, Some(6.0)),
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, (time, censor_at))| ObsRow {
-        id: i.to_string(),
-        time,
-        event: censor_at.is_none(),
-        censor_at,
-        stratum: 0,
-    })
-    .collect();
+    let rows: Vec<ObsRow> =
+        [(1.0, None), (2.0, Some(2.0)), (3.0, None), (4.0, Some(4.0)), (6.0, Some(6.0))]
+            .into_iter()
+            .enumerate()
+            .map(|(i, (time, censor_at))| ObsRow {
+                id: i.to_string(),
+                time,
+                event: censor_at.is_none(),
+                censor_at,
+                stratum: 0,
+            })
+            .collect();
     let g = censoring_curve(rows.iter());
     assert_eq!(g.surv, [1.0, 0.75, 0.75, 0.375, 0.0]);
     assert_eq!(draw_censoring(&g, 1.0, 0.8, 9.0), 2.0);
@@ -137,9 +114,7 @@ fn draw_censoring_inverts_the_conditional_censoring_distribution() {
 /// The censoring uniforms are in `[0, 1)`, depend on every key, and look uniform.
 #[test]
 fn censoring_uniform_is_keyed_and_uniform() {
-    let u: Vec<f64> = (0..10_000)
-        .map(|i| censoring_uniform(3, 1 + i / 100, i % 100))
-        .collect();
+    let u: Vec<f64> = (0..10_000).map(|i| censoring_uniform(3, 1 + i / 100, i % 100)).collect();
     assert!(u.iter().all(|x| (0.0..1.0).contains(x)));
     let mean = u.iter().sum::<f64>() / u.len() as f64;
     assert!((mean - 0.5).abs() < 0.01, "{mean}");
@@ -218,11 +193,7 @@ fn censoring_distribution_is_per_stratum() {
     o.stratify = VpcStratify::Covariate("ARM".into());
     let v = run(EXP_TTE, &pop(subjects), &o).unwrap();
     assert_eq!(v.strata[0].label, "ARM=0");
-    assert_eq!(
-        v.strata[0].n_used,
-        [20, 0],
-        "ARM 0 is never followed past 2"
-    );
+    assert_eq!(v.strata[0].n_used, [20, 0], "ARM 0 is never followed past 2");
     assert_eq!(v.strata[1].n_used, [20, 20], "ARM 1 is followed to 8");
 }
 
@@ -239,10 +210,7 @@ fn competing_event_is_not_an_observed_censoring() {
         .map(|i| {
             subj(
                 &i.to_string(),
-                vec![
-                    rec(1.0, EventType::Exact, 2),
-                    rec(1.0, EventType::RightCensored, 3),
-                ],
+                vec![rec(1.0, EventType::Exact, 2), rec(1.0, EventType::RightCensored, 3)],
             )
         })
         .collect();
@@ -275,9 +243,8 @@ fn event_subjects_keep_the_horizon_without_observed_censoring() {
 /// censoring at 30 are censorings at 5, so at 6 the observed value is empty.
 #[test]
 fn horizon_defaults_to_latest_record_and_wins_when_below_it() {
-    let mut subjects: Vec<Subject> = (1..=25)
-        .map(|i| subj(&i.to_string(), vec![rec(i as f64, EventType::Exact, 2)]))
-        .collect();
+    let mut subjects: Vec<Subject> =
+        (1..=25).map(|i| subj(&i.to_string(), vec![rec(i as f64, EventType::Exact, 2)])).collect();
     subjects.push(subj("26", vec![rec(30.0, EventType::RightCensored, 2)]));
     let p = pop(subjects);
     let v = run(EXP_TTE, &p, &opts(20)).unwrap();
@@ -290,19 +257,11 @@ fn horizon_defaults_to_latest_record_and_wins_when_below_it() {
     assert_eq!(s.grid.last(), Some(&30.0));
     // The observed times are on the grid, and the overlay reads the observed curve.
     for t in [1.0, 13.0, 25.0] {
-        let k = s
-            .grid
-            .iter()
-            .position(|&g| g == t)
-            .expect("observed time on grid");
+        let k = s.grid.iter().position(|&g| g == t).expect("observed time on grid");
         assert_eq!(s.obs_on_grid[k], s.observed.at(t));
     }
     // 101 even points plus 26 observed times, minus those that coincide.
-    assert!(
-        s.grid.len() > 101 && s.grid.len() <= 101 + 26,
-        "{}",
-        s.grid.len()
-    );
+    assert!(s.grid.len() > 101 && s.grid.len() <= 101 + 26, "{}", s.grid.len());
     assert!(s.n_used.iter().all(|&n| n <= 20));
 
     let mut o = opts(20);
@@ -387,14 +346,8 @@ fn horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
             })
             .collect()
     };
-    assert!(
-        times(&g).iter().any(|&t| t > G_HORIZON),
-        "G has records past H"
-    );
-    assert!(
-        times(&cut).iter().all(|&t| t <= G_HORIZON),
-        "the cut has none"
-    );
+    assert!(times(&g).iter().any(|&t| t > G_HORIZON), "G has records past H");
+    assert!(times(&cut).iter().all(|&t| t <= G_HORIZON), "the cut has none");
 
     for censoring in [VpcCensoring::Observed, VpcCensoring::Horizon] {
         for grid in [VpcGrid::Auto, VpcGrid::Times(vec![3.0, 9.0, 10.0, 15.0])] {
@@ -453,8 +406,7 @@ fn stratify_by_covariate_splits_subjects_by_exact_value() {
     let subjects = (1..=30)
         .map(|i| {
             let mut s = subj(&i.to_string(), vec![rec(i as f64, EventType::Exact, 2)]);
-            s.covariates
-                .insert("SEX".into(), if i % 3 == 0 { 1.0 } else { 0.0 });
+            s.covariates.insert("SEX".into(), if i % 3 == 0 { 1.0 } else { 0.0 });
             s
         })
         .collect();
@@ -508,10 +460,7 @@ fn competing_risks_with_cmt_reads_that_cause() {
             } else {
                 (EventType::RightCensored, EventType::Exact)
             };
-            subj(
-                &i.to_string(),
-                vec![rec(i as f64, a, 2), rec(i as f64, b, 3)],
-            )
+            subj(&i.to_string(), vec![rec(i as f64, a, 2), rec(i as f64, b, 3)])
         })
         .collect();
     let mut o = opts(20);
@@ -543,10 +492,7 @@ fn assert_refusal<T: std::fmt::Debug>(got: Result<T, EngineError>, text: &str) {
 fn refuses_two_tte_endpoints_without_cmt() {
     let p = pop(vec![subj(
         "1",
-        vec![
-            rec(1.0, EventType::Exact, 2),
-            rec(1.0, EventType::RightCensored, 3),
-        ],
+        vec![rec(1.0, EventType::Exact, 2), rec(1.0, EventType::RightCensored, 3)],
     )]);
     assert_refusal(
         run(COMPETING, &p, &opts(20)),
@@ -583,12 +529,7 @@ fn refuses_no_tte_endpoint_and_a_cmt_that_is_not_one() {
 fn refuses_left_truncation() {
     let p = pop(vec![subj(
         "7",
-        vec![ObsRecord::Event {
-            time: 5.0,
-            event_type: EventType::Exact,
-            entry_time: 1.5,
-            cmt: 2,
-        }],
+        vec![ObsRecord::Event { time: 5.0, event_type: EventType::Exact, entry_time: 1.5, cmt: 2 }],
     )]);
     assert_refusal(
         run(EXP_TTE, &p, &opts(20)),
@@ -601,14 +542,7 @@ fn refuses_left_truncation() {
 fn refuses_interval_censoring() {
     let p = pop(vec![subj(
         "8",
-        vec![rec(
-            5.0,
-            EventType::IntervalCensored {
-                left: 2.0,
-                right: 5.0,
-            },
-            2,
-        )],
+        vec![rec(5.0, EventType::IntervalCensored { left: 2.0, right: 5.0 }, 2)],
     )]);
     assert_refusal(
         run(EXP_TTE, &p, &opts(20)),
@@ -678,10 +612,7 @@ fn refuses_a_missing_stratification_covariate() {
 fn refuses_several_records_duplicate_ids_and_no_records() {
     let p = pop(vec![subj(
         "4",
-        vec![
-            rec(1.0, EventType::RightCensored, 2),
-            rec(2.0, EventType::Exact, 2),
-        ],
+        vec![rec(1.0, EventType::RightCensored, 2), rec(2.0, EventType::Exact, 2)],
     )]);
     assert_refusal(
         run(EXP_TTE, &p, &opts(20)),

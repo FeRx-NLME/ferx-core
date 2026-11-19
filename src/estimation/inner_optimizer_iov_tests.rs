@@ -264,26 +264,17 @@ fn iov_fd_fallback_warning_reports_all_fd_population_under_an_analytic_label() {
         warnings: vec![],
     };
 
-    assert!(
-        inner_reports_analytic_model(&auto),
-        "fixture: the label must claim analytic"
-    );
+    assert!(inner_reports_analytic_model(&auto), "fixture: the label must claim analytic");
     let warning = fd_fallback_warning(&auto, &population, &auto.default_params.theta)
         .expect("all-FD population under an analytic label must warn");
     assert!(warning.contains("2 of 2"), "got: {warning}");
-    assert!(
-        warning.contains("subject outside IOV analytic scope"),
-        "got: {warning}"
-    );
+    assert!(warning.contains("subject outside IOV analytic scope"), "got: {warning}");
 
     // `gradient = fd` as `run` stamps it onto the model (`GradientMethod::effective`);
     // `parse_model_string` leaves the option on the parsed `FitOptions`.
     let mut fd = auto;
     fd.gradient_method = crate::types::GradientMethod::Fd;
-    assert!(
-        !inner_reports_analytic_model(&fd),
-        "fixture: the label must say FD"
-    );
+    assert!(!inner_reports_analytic_model(&fd), "fixture: the label must say FD");
     assert!(
         fd_fallback_warning(&fd, &population, &fd.default_params.theta).is_none(),
         "all-FD population under an FD label must not warn"
@@ -319,13 +310,7 @@ fn a_stacked_width_past_the_old_dispatch_ceiling_is_served_analytically() {
         "a 50-wide stacked [η, κ] must be analytic"
     );
     let population = Population {
-        subjects: vec![
-            subject.clone(),
-            Subject {
-                id: "2".into(),
-                ..subject
-            },
-        ],
+        subjects: vec![subject.clone(), Subject { id: "2".into(), ..subject }],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: vec![],
@@ -348,10 +333,7 @@ fn iov_inner_subject_route_admits_steady_state_lagtime() {
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVLAG(0.5,0.01,5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_LAG ~ 0.09\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  LAGTIME = TVLAG * exp(ETA_LAG)\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  obs_scale = V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
         .expect("parse ODE IOV + lagtime");
-    assert!(
-        model.has_lagtime(),
-        "model should carry a LAGTIME individual parameter"
-    );
+    assert!(model.has_lagtime(), "model should carry a LAGTIME individual parameter");
     let subject = Subject {
         id: "1".into(),
         // Steady-state bolus (ss, ii > 0) under an estimated lagtime.
@@ -418,11 +400,7 @@ fn iov_fd_reason_names_the_calls_gradient_fd() {
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  kappa KAPPA_CL ~ 0.01\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  iov_column = OCC\n",
         )
         .expect("parse ODE IOV without D1");
-    assert_eq!(
-        model.gradient_method,
-        GradientMethod::Auto,
-        "premise: unstamped"
-    );
+    assert_eq!(model.gradient_method, GradientMethod::Auto, "premise: unstamped");
     let subject = Subject {
         id: "1".into(),
         doses: vec![DoseEvent::modeled(
@@ -467,10 +445,7 @@ fn iov_fd_reason_names_the_calls_gradient_fd() {
 fn transit_twin_ss_forcing_is_analytic_under_iov() {
     let model = crate::parser::model_parser::parse_model_string(TRANSIT_IOV_MODEL)
         .expect("parse transit IOV");
-    assert!(
-        model.ode_spec.is_none(),
-        "the closed-form transit primary is analytic"
-    );
+    assert!(model.ode_spec.is_none(), "the closed-form transit primary is analytic");
     let subject = Subject {
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)],
@@ -505,15 +480,13 @@ fn make_iov_model() -> CompiledModel {
     };
     CompiledModel {
         name: "iov_test".into(),
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                // eta[0] = bsv, eta[1] = kappa (combined)
-                p.values[0] = theta[0] * eta[0].exp();
-                p.values[1] = theta[1];
-                p
-            },
-        ),
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            // eta[0] = bsv, eta[1] = kappa (combined)
+            p.values[0] = theta[0] * eta[0].exp();
+            p.values[1] = theta[1];
+            p
+        }),
         n_kappa: 1,
         kappa_names: vec!["KAPPA_CL".into()],
         kappa_init_as_sd: vec![false],
@@ -574,16 +547,7 @@ fn iov_warm_start_of_another_width_panics_in_debug() {
     assert_eq!(model.n_eta, 1, "fixture: width 2 must be off-width");
     assert_eq!(stacked_width(model.n_eta, model.n_kappa, 2), 3, "fixture");
     let params = model.default_params.clone();
-    find_ebe(
-        &model,
-        &subject,
-        &params,
-        200,
-        1e-5,
-        Some(&[0.01, 0.02]),
-        None,
-        0,
-    );
+    find_ebe(&model, &subject, &params, 200, 1e-5, Some(&[0.01, 0.02]), None, 0);
 }
 
 /// #2261: a cancelled subject's placeholder keeps the warm `η̂` from a joint warm start
@@ -594,10 +558,7 @@ fn cancelled_placeholder_keeps_eta_hat_of_a_joint_warm_start() {
     let model = make_iov_model();
     let subject = make_iov_subject();
     let eta_of = |init: Option<&[f64]>| {
-        cancelled_ebe_placeholder(&model, &subject, init)
-            .eta
-            .as_slice()
-            .to_vec()
+        cancelled_ebe_placeholder(&model, &subject, init).eta.as_slice().to_vec()
     };
     assert_eq!(eta_of(Some(&[0.3])), vec![0.3], "η̂ only");
     assert_eq!(eta_of(Some(&[0.3, -0.4, 0.5])), vec![0.3], "η̂ then κ̂");
@@ -641,9 +602,8 @@ fn repro555_subject22() -> Subject {
     covariates.insert("WT".to_string(), 72.1);
     covariates.insert("CRCL".to_string(), 76.7);
     let obs_times = vec![0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 12.0, 24.0, 36.0, 48.0];
-    let observations = vec![
-        2.0190, 2.4021, 2.2985, 1.8141, 1.4699, 1.2589, 1.0804, 0.8993, 0.7054, 0.5966,
-    ];
+    let observations =
+        vec![2.0190, 2.4021, 2.2985, 1.8141, 1.4699, 1.2589, 1.0804, 0.8993, 0.7054, 0.5966];
     let n = obs_times.len();
     Subject {
         id: "22".into(),
@@ -738,16 +698,7 @@ fn repro555_ode_exprscale_ebe_finds_global_min() {
 
     // The ODE form must reach the same global minimum (objectives are identical), and
     // must report it as a converged EBE (not a fallback that left it non-stationary).
-    let e_od = find_ebe(
-        &ode,
-        &subject,
-        &ode.default_params,
-        300,
-        1e-7,
-        None,
-        None,
-        0,
-    );
+    let e_od = find_ebe(&ode, &subject, &ode.default_params, 300, 1e-7, None, None, 0);
     let eta_od: Vec<f64> = e_od.eta.iter().copied().collect();
     let ode_nll = nll(&ode, &eta_od);
 
@@ -758,10 +709,7 @@ fn repro555_ode_exprscale_ebe_finds_global_min() {
             "ODE EBE stuck in a spurious basin: inner NLL {ode_nll:.4} vs analytical global min {ref_nll:.4} \
              (eta_ode={eta_od:?}, eta_an={eta_an:?})"
         );
-    assert!(
-        e_od.converged,
-        "ODE EBE should be reported converged at the mode"
-    );
+    assert!(e_od.converged, "ODE EBE should be reported converged at the mode");
 }
 
 /// #587 review: the shared inner-EBE fallback keeps the lower-objective **value** of the
@@ -782,11 +730,7 @@ fn bimodal_obj(x: &[f64]) -> f64 {
 
 fn bimodal_grad(x: &[f64]) -> Vec<f64> {
     let v = x[0];
-    vec![if v < 0.0 {
-        2.0 * (v + 2.0)
-    } else {
-        2.0 * (v - 2.0)
-    }]
+    vec![if v < 0.0 { 2.0 * (v + 2.0) } else { 2.0 * (v - 2.0) }]
 }
 
 fn never_stall(_: &[f64]) -> bool {
@@ -799,10 +743,7 @@ fn always_stall(_: &[f64]) -> bool {
 
 /// A [`FallbackCertifier`] for an exact objective (no stall stop, no preconditioner).
 fn exact_cert<'a>(
-    grad: &'a dyn Fn(&[f64]) -> Vec<f64>,
-    n: usize,
-    max_iter: usize,
-    tol: f64,
+    grad: &'a dyn Fn(&[f64]) -> Vec<f64>, n: usize, max_iter: usize, tol: f64,
 ) -> FallbackCertifier<'a> {
     FallbackCertifier {
         grad,
@@ -829,29 +770,17 @@ fn argmin_inner_fallback_keeps_better_basin() {
 
     // Partial in the shallow well, cold NM seed reaches the deep well: NM wins.
     let (eta2, _) = argmin_inner_fallback(&obj, &[2.0], &[-2.0], &cert);
-    assert!(
-        (eta2[0] + 2.0).abs() < 1e-2,
-        "NM found deeper well, got {eta2:?}"
-    );
+    assert!((eta2[0] + 2.0).abs() < 1e-2, "NM found deeper well, got {eta2:?}");
 
     // Non-finite partial objective → unusable → NM result is taken.
     let (eta3, _) = argmin_inner_fallback(&obj, &[f64::NAN], &[-2.0], &cert);
-    assert!(
-        eta3[0].is_finite(),
-        "NaN partial must be discarded, got {eta3:?}"
-    );
+    assert!(eta3[0].is_finite(), "NaN partial must be discarded, got {eta3:?}");
 
     // `ebe_warm_start` seeds the single NM from the partial (covers the warm branch):
     // from the deep well it stays there even though the cold seed is far away.
-    let warm = arm_inner_settings(InnerSettings {
-        warm: true,
-        ..Default::default()
-    });
+    let warm = arm_inner_settings(InnerSettings { warm: true, ..Default::default() });
     let (eta4, _) = argmin_inner_fallback(&obj, &[-2.0], &[5.0], &cert);
-    assert!(
-        (eta4[0] + 2.0).abs() < 1e-2,
-        "warm seed held the deep well, got {eta4:?}"
-    );
+    assert!((eta4[0] + 2.0).abs() < 1e-2, "warm seed held the deep well, got {eta4:?}");
     drop(warm);
     drop(cold);
 }
@@ -872,14 +801,8 @@ fn ode_iov_skips_nelder_mead_inner_fallback() {
     // carries the same per-vertex ODE cost — it must skip the impractical NM inner fallback
     // like a hand-written [odes] + IOV model, even though its own `ode_spec` is `None`.
     let transit_iov = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
-    assert!(
-        transit_iov.ode_spec.is_none(),
-        "transit primary is analytic"
-    );
-    assert!(
-        transit_iov.absorption_ode_equivalent.is_some(),
-        "transit+IOV carries an ODE twin"
-    );
+    assert!(transit_iov.ode_spec.is_none(), "transit primary is analytic");
+    assert!(transit_iov.absorption_ode_equivalent.is_some(), "transit+IOV carries an ODE twin");
     assert!(skip_ode_iov_nm_fallback(&transit_iov));
 }
 
@@ -897,11 +820,7 @@ fn ode_iov_start_rejects_only_pathological_ode_iov_nll() {
     assert!(!reject_ode_iov_inner_start(&ode_iov, 20, 4_999.0));
     assert!(reject_ode_iov_inner_start(&ode_iov, 20, 5_001.0));
     assert!(reject_ode_iov_inner_start(&ode_iov, 20, f64::NAN));
-    assert!(!reject_ode_iov_inner_start(
-        &closed_form_iov,
-        4,
-        1_000_000.0
-    ));
+    assert!(!reject_ode_iov_inner_start(&closed_form_iov, 4, 1_000_000.0));
 
     // #814: the transit + IOV twin puts the model in the ODE+IOV cost class, so the
     // degenerate-warm-start rejection guard applies to it too (inactive before the fix).
@@ -972,10 +891,7 @@ fn ode_iov_start_reject_exempts_a_start_certified_as_the_mode() {
             None,
             0,
             None,
-            InnerSolvePolicy {
-                init_is_mode,
-                ..InnerSolvePolicy::default()
-            },
+            InnerSolvePolicy { init_is_mode, ..InnerSolvePolicy::default() },
         )
     };
     let stale = solve(false);
@@ -1120,12 +1036,7 @@ fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
 
     // Plain closed-form IOV (no twin): objective is exact → no stall (bit-identical path).
     let plain = make_iov_model();
-    assert!(!inner_stall_enabled_at_iov(
-        &plain,
-        &subject,
-        &plain.default_params.theta,
-        &[0.0; 3]
-    ));
+    assert!(!inner_stall_enabled_at_iov(&plain, &subject, &plain.default_params.theta, &[0.0; 3]));
 
     // Hand-written [odes] + IOV: RK45 objective → stall (unchanged pre-existing behaviour).
     let ode_iov = parse_model_string(
@@ -1142,10 +1053,7 @@ fn inner_stall_enabled_at_iov_tracks_the_effective_model() {
     // Closed-form transit + IOV. Stacked layout [η_V, κ_occ1, κ_occ2].
     let transit_iov = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
     let theta = transit_iov.default_params.theta.clone();
-    assert!(
-        transit_iov.ode_spec.is_none(),
-        "transit primary is analytic"
-    );
+    assert!(transit_iov.ode_spec.is_none(), "transit primary is analytic");
     // κ = 0: ke = 0.2/10 = 0.02 against KTR = (3+1)/1 = 4 — in domain on both occasions.
     let in_domain = [0.0, 0.0, 0.0];
     // κ_occ2 = 6: CL = 0.2·e⁶ = 80.7, ke = 8.07 ≥ KTR = 4 — the second dose's pair flips.
@@ -1206,10 +1114,7 @@ fn inner_optimizer_pin_reaches_same_ebe() {
     let params = model.default_params.clone();
 
     let solve = |mode| {
-        let _mode = arm_inner_settings(InnerSettings {
-            mode,
-            ..Default::default()
-        });
+        let _mode = arm_inner_settings(InnerSettings { mode, ..Default::default() });
         find_ebe(&model, &subject, &params, 200, 1e-8, None, None, 0)
     };
     let bfgs = solve(InnerOptimizer::Bfgs);
@@ -1217,12 +1122,7 @@ fn inner_optimizer_pin_reaches_same_ebe() {
 
     assert!(bfgs.converged && lbfgs.converged, "both must converge");
     for k in 0..model.n_eta {
-        approx::assert_relative_eq!(
-            bfgs.eta[k],
-            lbfgs.eta[k],
-            max_relative = 1e-5,
-            epsilon = 1e-7
-        );
+        approx::assert_relative_eq!(bfgs.eta[k], lbfgs.eta[k], max_relative = 1e-5, epsilon = 1e-7);
     }
 }
 
@@ -1346,10 +1246,7 @@ fn dense_residual_inner_grad_matches_fd() {
             "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  omega ETA_CL ~ 0.09 FIX\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
         )
         .expect("parse correlated block_sigma model");
-    assert!(
-        !model.residual_correlations.is_empty(),
-        "fixture must carry a residual correlation"
-    );
+    assert!(!model.residual_correlations.is_empty(), "fixture must carry a residual correlation");
     assert!(
         !analytic_inner_common_bail(&model),
         "block_sigma must now take the analytic inner gradient (#627)"
@@ -1425,10 +1322,7 @@ fn dense_expression_scale_inner_grad_matches_fd() {
             "[parameters]\n  theta TVCL(1.0, 0.01, 10.0) FIX\n  theta TVV(10.0, 0.1, 100.0) FIX\n  omega ETA_CL ~ 0.09 FIX\n  omega ETA_V ~ 0.04 FIX\n  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.05, 1.00] FIX\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV * exp(ETA_V)\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[scaling]\n  obs_scale = 1000 / V\n[error_model]\n  DV ~ combined(PROP_ERR, ADD_ERR)\n[fit_options]\n  method = focei\n",
         )
         .expect("parse block_sigma + ExpressionScale");
-    assert!(matches!(
-        model.scaling,
-        crate::types::ScalingSpec::ExpressionScale { .. }
-    ));
+    assert!(matches!(model.scaling, crate::types::ScalingSpec::ExpressionScale { .. }));
     assert!(!analytic_inner_common_bail(&model));
     let mut subject = Subject {
         id: "1".into(),
@@ -1512,10 +1406,7 @@ fn ode_ltbs_inner_ebe_matches_fd() {
     assert!(!analytic_inner_grad_supported(&model, &subject));
     let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
-    assert!(
-        analytic.converged && fd.converged,
-        "both EBE solves converge"
-    );
+    assert!(analytic.converged && fd.converged, "both EBE solves converge");
     for k in 0..model.n_eta {
         approx::assert_relative_eq!(
             analytic.eta[k],
@@ -1564,10 +1455,7 @@ fn ode_custom_magnitude_takes_analytic_inner_gradient() {
         )
         .expect("parse ODE + custom magnitude");
     mag.gradient_method = GradientMethod::Auto;
-    assert!(
-        mag.has_custom_ruv_magnitude(),
-        "fixture must carry a custom residual magnitude"
-    );
+    assert!(mag.has_custom_ruv_magnitude(), "fixture must carry a custom residual magnitude");
     assert!(
         analytic_inner_grad_supported(&mag, &subject),
         "ODE + custom magnitude should take the analytic inner gradient (#576/#486)"
@@ -1671,15 +1559,9 @@ fn magnitude_with_sde_takes_the_per_row_assembler() {
     };
     let params = model.default_params.clone();
     let preds = crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, &[0.1, -0.1]);
-    s.observations = preds
-        .iter()
-        .enumerate()
-        .map(|(j, p)| p * (1.0 + 0.1 * (1.3 * j as f64).sin()))
-        .collect();
-    assert!(
-        analytic_inner_grad_supported(&model, &s),
-        "the per-row assembler serves it"
-    );
+    s.observations =
+        preds.iter().enumerate().map(|(j, p)| p * (1.0 + 0.1 * (1.3 * j as f64).sin())).collect();
+    assert!(analytic_inner_grad_supported(&model, &s), "the per-row assembler serves it");
     let eta = [0.05, -0.08];
     let g = analytic_eta_nll_gradient(
         &model,
@@ -1778,10 +1660,7 @@ fn ode_ltbs_no_ruv_inner_ebe_matches_fd() {
     assert!(!analytic_inner_grad_supported(&model, &subject));
     let fd = find_ebe(&model, &subject, &params, 200, 1e-10, None, None, 0);
 
-    assert!(
-        analytic.converged && fd.converged,
-        "both EBE solves converge"
-    );
+    assert!(analytic.converged && fd.converged, "both EBE solves converge");
     for k in 0..model.n_eta {
         // Two independently-converged EBE solves; agreement to ~1e-4 confirms
         // no #438-style drift (which inflated SEs ~5×, i.e. ~400% off).
@@ -1867,10 +1746,7 @@ fn ode_ltbs_init_cond_inner_grad_matches_fd() {
 fn inner_settings_guard_round_trips() {
     let read = || (inner_optimizer_mode(), ebe_warm_start_enabled());
     assert_eq!(read(), (InnerOptimizer::Auto, false), "default");
-    let outer = arm_inner_settings(InnerSettings {
-        mode: InnerOptimizer::Lbfgs,
-        warm: true,
-    });
+    let outer = arm_inner_settings(InnerSettings { mode: InnerOptimizer::Lbfgs, warm: true });
     assert_eq!(read(), (InnerOptimizer::Lbfgs, true), "armed");
     let nested = arm_inner_settings(InnerSettings::default());
     assert_eq!(
@@ -1884,10 +1760,8 @@ fn inner_settings_guard_round_trips() {
     assert_eq!(read(), (InnerOptimizer::Auto, false), "outer restored");
 
     let unwound = std::panic::catch_unwind(|| {
-        let _armed = arm_inner_settings(InnerSettings {
-            mode: InnerOptimizer::NelderMead,
-            warm: true,
-        });
+        let _armed =
+            arm_inner_settings(InnerSettings { mode: InnerOptimizer::NelderMead, warm: true });
         panic!("inside the scope");
     });
     assert!(unwound.is_err());
@@ -1905,14 +1779,12 @@ fn no_iov_1cpt_model() -> CompiledModel {
     };
     CompiledModel {
         name: "no_iov".into(),
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                p.values[0] = theta[0] * eta[0].exp();
-                p.values[1] = theta[1];
-                p
-            },
-        ),
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            p.values[0] = theta[0] * eta[0].exp();
+            p.values[1] = theta[1];
+            p
+        }),
         gradient_method: GradientMethod::default(),
         ..crate::types::test_helpers::bare_model(default_params)
     }
@@ -1981,14 +1853,12 @@ fn find_ebe_noniov_invariant_to_large_mu_shift() {
     };
     let model = CompiledModel {
         name: "noniov_mu".into(),
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                p.values[0] = theta[0] * eta[0].exp();
-                p.values[1] = theta[1];
-                p
-            },
-        ),
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            p.values[0] = theta[0] * eta[0].exp();
+            p.values[1] = theta[1];
+            p
+        }),
         gradient_method: GradientMethod::default(),
         ..crate::types::test_helpers::bare_model(default_params)
     };
@@ -2070,10 +1940,8 @@ fn expression_scale_with_correlated_residual_is_analytic_both_loops() {
         )
         .expect("parse ExpressionScale + correlated residual");
     assert!(
-        matches!(
-            corr.scaling,
-            crate::types::ScalingSpec::ExpressionScale { .. }
-        ) && !corr.residual_correlations.is_empty(),
+        matches!(corr.scaling, crate::types::ScalingSpec::ExpressionScale { .. })
+            && !corr.residual_correlations.is_empty(),
         "fixture must carry both an ExpressionScale obs_scale and a residual correlation"
     );
     assert!(
@@ -2092,9 +1960,7 @@ fn expression_scale_with_correlated_residual_is_analytic_both_loops() {
         .expect("parse ExpressionScale + diagonal residual");
     assert!(diag.residual_correlations.is_empty());
     assert!(!analytic_inner_common_bail(&diag));
-    assert!(crate::sens::provider::analytic_outer_gradient_available(
-        &diag
-    ));
+    assert!(crate::sens::provider::analytic_outer_gradient_available(&diag));
 }
 
 // `analytical_ad_unsupported` is the VESTIGIAL retired-AD classifier (not consulted by
@@ -2272,10 +2138,7 @@ fn iov_inner_fallback_keeps_bfgs_partial_over_worse_cold_nm() {
 "#,
     )
     .expect("closed-form IOV model parses");
-    assert!(
-        !skip_ode_iov_nm_fallback(&model),
-        "fixture must take the closed-form NM fallback arm"
-    );
+    assert!(!skip_ode_iov_nm_fallback(&model), "fixture must take the closed-form NM fallback arm");
     let _cold = arm_inner_settings(InnerSettings::default());
 
     // Two occasions, one 100 mg IV bolus each; observations simulated at
@@ -2427,10 +2290,7 @@ fn argmin_inner_fallback_flag_belongs_to_the_returned_point() {
     // Normal budget: the polish reaches the deep mode and earns the flag.
     let (eta2, ok2) =
         argmin_inner_fallback(&obj, &partial, &[2.0], &exact_cert(&grad, 1, 200, 1e-8));
-    assert!(
-        (eta2[0] + 2.0).abs() < 1e-2,
-        "polish must reach the deep mode, got {eta2:?}"
-    );
+    assert!((eta2[0] + 2.0).abs() < 1e-2, "polish must reach the deep mode, got {eta2:?}");
     assert!(ok2, "a stationary returned point is certified");
     assert!(
         grad(&eta2)[0].abs() < 1e-8,
@@ -2477,10 +2337,7 @@ fn argmin_inner_fallback_certifies_on_stationarity_not_simplex_spread() {
         "NM's simplex collapsed on a plane with |∇f| = 1e-2 = 1000·tol; that is not a \
          converged EBE (#1527), got converged = true at {eta:?}"
     );
-    assert_eq!(
-        eta, nm_point,
-        "an uncertified polish must not move the returned point"
-    );
+    assert_eq!(eta, nm_point, "an uncertified polish must not move the returned point");
 
     // 2. A bowl NM approaches but does not reach under a gradient `tol`.
     let bowl = |x: &[f64]| 50.0 * (x[0] - 1.0).powi(2);
@@ -2543,10 +2400,7 @@ fn fallback_certifier_newton_step_needs_a_positive_definite_mode() {
         exact_cert(&stiff_grad, 1, 50, tol).certify(&stiff, &mut x),
         "a point 1e-8 from a PD mode is within `tol` of it and must be certified"
     );
-    assert_eq!(
-        x, start,
-        "the Newton-step test certifies in place, without moving the point"
-    );
+    assert_eq!(x, start, "the Newton-step test certifies in place, without moving the point");
 
     let saddle = |x: &[f64]| 5e3 * (x[0] * x[0] - x[1] * x[1]);
     let saddle_grad = |x: &[f64]| vec![1e4 * x[0], -1e4 * x[1]];
@@ -2584,30 +2438,21 @@ fn nelder_mead_recover_is_certified_and_honours_admissibility() {
     let plane_grad = |_: &[f64]| vec![0.01];
     let (_, ok) =
         exact_cert(&plane_grad, 1, 50, tol).nelder_mead_recover(&plane, vec![0.0], &|_| true);
-    assert!(
-        !ok,
-        "a plane has no mode; NM's collapse must not certify one"
-    );
+    assert!(!ok, "a plane has no mode; NM's collapse must not certify one");
 
     let bowl = |x: &[f64]| 50.0 * (x[0] - 1.0).powi(2);
     let bowl_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
     let (x, ok) =
         exact_cert(&bowl_grad, 1, 50, tol).nelder_mead_recover(&bowl, vec![0.9], &|_| true);
     let g = bowl_grad(&x)[0].abs();
-    assert!(
-        ok && g < tol,
-        "the bowl's mode is certified: converged = {ok}, |g| = {g:.3e}"
-    );
+    assert!(ok && g < tol, "the bowl's mode is certified: converged = {ok}, |g| = {g:.3e}");
 
     let mut nm_end = vec![0.9];
     nelder_mead_minimize(&bowl, &mut nm_end, 1, 250, tol);
     let (y, ok) =
         exact_cert(&bowl_grad, 1, 50, tol)
             .nelder_mead_recover(&bowl, vec![0.9], &|e: &[f64]| (e[0] - 1.0).abs() > 1e-5);
-    assert!(
-        !ok,
-        "a polish into the excluded region must not certify, ended at {y:?}"
-    );
+    assert!(!ok, "a polish into the excluded region must not certify, ended at {y:?}");
     assert_eq!(y, nm_end, "the NM end point is returned unchanged");
 }
 
@@ -2678,15 +2523,9 @@ fn fallback_certifier_leaves_numerical_objectives_to_the_stall_polish() {
     let tol = 1e-5;
     let big = |x: &[f64]| 1e12 + 50.0 * (x[0] - 1.0).powi(2);
     let big_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
-    let cert = FallbackCertifier {
-        stall_at: &always_stall,
-        ..exact_cert(&big_grad, 1, 200, tol)
-    };
+    let cert = FallbackCertifier { stall_at: &always_stall, ..exact_cert(&big_grad, 1, 200, tol) };
     let mut x = vec![1.1];
-    assert!(
-        cert.certify(&big, &mut x),
-        "the stall polish certifies, ended at {x:?}"
-    );
+    assert!(cert.certify(&big, &mut x), "the stall polish certifies, ended at {x:?}");
     assert!(
         (x[0] - 1.0).abs() < 1e-2,
         "a numerical objective's point must come from the polish, not be certified in place \
@@ -2704,24 +2543,14 @@ fn fallback_certifier_leaves_numerical_objectives_to_the_stall_polish() {
 fn fallback_certifier_polish_is_gradient_based_under_nelder_mead_mode() {
     let plane = |x: &[f64]| 0.01 * x[0];
     let plane_grad = |_: &[f64]| vec![0.01];
-    for mode in [
-        crate::types::InnerOptimizer::Auto,
-        crate::types::InnerOptimizer::NelderMead,
-    ] {
-        let _armed = arm_inner_settings(InnerSettings {
-            mode,
-            ..Default::default()
-        });
+    for mode in [crate::types::InnerOptimizer::Auto, crate::types::InnerOptimizer::NelderMead] {
+        let _armed = arm_inner_settings(InnerSettings { mode, ..Default::default() });
         let mut x = vec![0.0];
         assert!(
             !exact_cert(&plane_grad, 1, 50, 1e-5).certify(&plane, &mut x),
             "{mode:?}: a plane has no mode; the polish must not certify one on simplex spread"
         );
-        assert_eq!(
-            x,
-            vec![0.0],
-            "{mode:?}: an uncertified point is returned unchanged"
-        );
+        assert_eq!(x, vec![0.0], "{mode:?}: an uncertified point is returned unchanged");
     }
 }
 
@@ -2741,11 +2570,7 @@ fn fallback_certifier_certifies_a_stationary_point_with_one_gradient() {
     };
     let mut x = vec![1.0, -2.0];
     assert!(exact_cert(&counted, 2, 50, 1e-5).certify(&bowl, &mut x));
-    assert_eq!(
-        calls.get(),
-        1,
-        "a stationary point is certified on its first gradient"
-    );
+    assert_eq!(calls.get(), 1, "a stationary point is certified on its first gradient");
 }
 
 /// Deterministic pseudo-noise in `[−1, 1)` — a hash of `x`'s bits, so a fixture can carry a
@@ -2784,10 +2609,8 @@ fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
     };
     let start = vec![1.0 + 3e-3];
 
-    let stall_cert = FallbackCertifier {
-        stall_at: &always_stall,
-        ..exact_cert(&floored, 1, 200, tol)
-    };
+    let stall_cert =
+        FallbackCertifier { stall_at: &always_stall, ..exact_cert(&floored, 1, 200, tol) };
     let mut x = start.clone();
     assert!(
         stall_cert.certify(&noisy, &mut x),
@@ -2919,11 +2742,9 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
 fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vector() {
     use crate::stats::nested_levels::test_helpers as fx;
     use crate::stats::nested_levels::NestedLayout;
-    for (label, src) in [
-        ("algebraic", fx::algebraic()),
-        ("closed form", fx::closed_form()),
-        ("ode", fx::ode()),
-    ] {
+    for (label, src) in
+        [("algebraic", fx::algebraic()), ("closed form", fx::closed_form()), ("ode", fx::ode())]
+    {
         let (model, pop) = fx::prepared(&src, 1);
         let subject = &pop.subjects[0];
         let params = model.default_params.clone();
@@ -3006,37 +2827,19 @@ fn the_nested_walks_decline_an_unprepared_subject() {
     pop.subjects[0].doses[0] = crate::types::DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
     assert!(transit.absorption_ode_equivalent.is_some() && transit.has_nested_levels());
     assert!(transit.effective_for(&pop.subjects[0]).ode_spec.is_some());
-    assert_eq!(
-        walks(&transit, &pop.subjects[0]),
-        (true, true),
-        "transit twin"
-    );
-    for (label, src) in [
-        ("algebraic", fx::algebraic()),
-        ("closed form", fx::closed_form()),
-        ("ode", fx::ode()),
-    ] {
+    assert_eq!(walks(&transit, &pop.subjects[0]), (true, true), "transit twin");
+    for (label, src) in
+        [("algebraic", fx::algebraic()), ("closed form", fx::closed_form()), ("ode", fx::ode())]
+    {
         let (m, pop) = fx::prepared(&src, 1);
         let prepared = &pop.subjects[0];
-        assert_eq!(
-            walks(&m, prepared),
-            (true, true),
-            "{label}: the prepared twin is served"
-        );
+        assert_eq!(walks(&m, prepared), (true, true), "{label}: the prepared twin is served");
         // Unprepared: occasion labels no longer parallel to the records.
         let mut bare = prepared.clone();
         bare.occasions.pop();
         assert!(crate::stats::stacked_layout::StackedLayout::sens_of(&m, &bare).is_none());
-        assert_eq!(
-            walks(&m, &bare),
-            (false, false),
-            "{label}: unprepared subject"
-        );
-        assert_eq!(
-            iov_fd_reason(&m, &bare),
-            "nested-level subject without level cells",
-            "{label}"
-        );
+        assert_eq!(walks(&m, &bare), (false, false), "{label}: unprepared subject");
+        assert_eq!(iov_fd_reason(&m, &bare), "nested-level subject without level cells", "{label}");
     }
 }
 
@@ -3047,11 +2850,9 @@ fn the_nested_walks_decline_an_unprepared_subject() {
 #[test]
 fn the_public_inner_loop_gives_a_raw_nested_population_its_cells() {
     use crate::stats::nested_levels::test_helpers as fx;
-    for (label, src) in [
-        ("algebraic", fx::algebraic()),
-        ("closed form", fx::closed_form()),
-        ("ode", fx::ode()),
-    ] {
+    for (label, src) in
+        [("algebraic", fx::algebraic()), ("closed form", fx::closed_form()), ("ode", fx::ode())]
+    {
         let (m, prepared) = fx::prepared(&src, 2);
         let mut raw = prepared.clone();
         for s in &mut raw.subjects {
@@ -3084,11 +2885,9 @@ fn the_public_inner_loop_gives_a_raw_nested_population_its_cells() {
 #[test]
 fn the_nested_ebe_search_takes_the_analytic_gradient_at_every_step() {
     use crate::stats::nested_levels::test_helpers as fx;
-    for (label, src) in [
-        ("algebraic", fx::algebraic()),
-        ("closed form", fx::closed_form()),
-        ("ode", fx::ode()),
-    ] {
+    for (label, src) in
+        [("algebraic", fx::algebraic()), ("closed form", fx::closed_form()), ("ode", fx::ode())]
+    {
         let (m, pop) = fx::prepared(&src, 1);
         let stage = FitOptions {
             method: crate::types::EstimationMethod::FoceI,
@@ -3145,12 +2944,7 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
     labelled.dose_occasions = vec![1];
     // `(label, model, subject, takes the analytic gradient)`.
     let mut cases: Vec<(&str, CompiledModel, Subject, bool)> = vec![
-        (
-            "one level, fd inner",
-            make_iov_model(),
-            make_iov_subject(),
-            false,
-        ),
+        ("one level, fd inner", make_iov_model(), make_iov_subject(), false),
         ("one level", one_level, labelled, true),
     ];
     for (label, src) in [
@@ -3169,17 +2963,10 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
         let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
         // `is_finite()` alone passes the `1e20` refusal sentinel; these searches end
         // between −12.5 and 2.7e5, fourteen orders below it (#2063 review 1, finding 2).
-        assert!(
-            ebe.nll.is_finite() && ebe.nll < 1e19,
-            "{label}: EBE objective {}",
-            ebe.nll
-        );
+        assert!(ebe.nll.is_finite() && ebe.nll < 1e19, "{label}: EBE objective {}", ebe.nll);
         if *analytic_route {
             // The bound must be far below the work, or it could not tell the two apart.
-            assert!(
-                analytic >= 30 && fd == 0,
-                "{label}: {analytic} analytic / {fd} FD steps"
-            );
+            assert!(analytic >= 30 && fd == 0, "{label}: {analytic} analytic / {fd} FD steps");
         }
         assert!(
             builds <= MAX_BUILDS,
@@ -3255,11 +3042,7 @@ fn a_registered_subjects_layout_and_schedule_are_built_once_and_equal_the_fresh_
     let c = StackedLayout::new_cached(m.n_eta, m.n_kappa, s);
     let d = StackedLayout::new_cached(m.n_eta, m.n_kappa, s);
     let e = StackedLayout::new_cached(m.n_eta + 1, m.n_kappa, s);
-    assert_eq!(
-        LAYOUT_BUILDS.get(),
-        3,
-        "the sens layout once, each width pair of `new` once"
-    );
+    assert_eq!(LAYOUT_BUILDS.get(), 3, "the sens layout once, each width pair of `new` once");
     assert!(Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&c, &d) && !Arc::ptr_eq(&c, &e));
     assert_eq!(
         shape(&a),
@@ -3326,14 +3109,8 @@ fn a_registered_subjects_layout_and_schedule_are_built_once_and_equal_the_fresh_
 fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_the_exact_gradient() {
     use crate::stats::nested_levels::test_helpers as fx;
     let src = fx::algebraic()
-        .replace(
-            "  sigma ADD ~ 0.5\n",
-            "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n",
-        )
-        .replace(
-            "  DV ~ additive(ADD)\n",
-            "  DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n",
-        );
+        .replace("  sigma ADD ~ 0.5\n", "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n")
+        .replace("  DV ~ additive(ADD)\n", "  DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM\n");
     let (m, mut pop) = fx::prepared(&src, 1);
     // A twin with one observation per arm: every block a singleton, so `R` is diagonal.
     let mut single = pop.subjects[0].clone();
@@ -3342,19 +3119,13 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_the_exact_gradient() 
     let pick = |v: &Vec<f64>| keep.iter().map(|&j| v[j]).collect::<Vec<f64>>();
     single.obs_times = pick(&single.obs_times);
     single.observations = pick(&single.observations);
-    single.obs_covariates = keep
-        .iter()
-        .map(|&j| single.obs_covariates[j].clone())
-        .collect();
+    single.obs_covariates = keep.iter().map(|&j| single.obs_covariates[j].clone()).collect();
     single.obs_cmts = vec![1; keep.len()];
     single.cens = vec![0; keep.len()];
     pop.subjects.push(single);
     crate::stats::nested_levels::assign_level_cells(&m, &mut pop);
     crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
-    assert_eq!(
-        pop.subjects[0].obs_rgroup,
-        vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5]
-    );
+    assert_eq!(pop.subjects[0].obs_rgroup, vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5]);
     assert_eq!(pop.subjects[1].obs_rgroup, vec![1, 2, 3, 4, 5]);
 
     let stage = FitOptions {
@@ -3365,31 +3136,13 @@ fn an_iov_subject_with_correlated_rows_searches_its_ebe_on_the_exact_gradient() 
     let p = &m.default_params;
     for (i, correlated) in [(0usize, true), (1, false)] {
         let s = &pop.subjects[i];
-        assert_eq!(
-            iov_inner_residual_correlation(&m, s),
-            correlated,
-            "{}",
-            s.id
-        );
-        assert!(
-            iov_inner_subject_route(&m, s, &p.theta).is_some(),
-            "{}: the reported route",
-            s.id
-        );
+        assert_eq!(iov_inner_residual_correlation(&m, s), correlated, "{}", s.id);
+        assert!(iov_inner_subject_route(&m, s, &p.theta).is_some(), "{}: the reported route", s.id);
         IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
         let ebe = find_ebe_for_stage(&m, s, p, 200, 1e-8, None, None, 0, &stage);
         let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
-        assert!(
-            ebe.nll.is_finite() && ebe.nll < 1e19,
-            "{}: {}",
-            s.id,
-            ebe.nll
-        );
-        assert!(
-            analytic >= 3 && fd == 0,
-            "{}: {analytic} analytic / {fd} FD",
-            s.id
-        );
+        assert!(ebe.nll.is_finite() && ebe.nll < 1e19, "{}: {}", s.id, ebe.nll);
+        assert!(analytic >= 3 && fd == 0, "{}: {analytic} analytic / {fd} FD", s.id);
         // Stationarity of the objective the search scored, over the compact vector.
         let layout = crate::stats::nested_levels::NestedLayout::of(&m, s).unwrap();
         let b = layout.compact(ebe.eta.as_slice(), &ebe.kappas).unwrap();
@@ -3431,10 +3184,7 @@ fn an_iov_weighted_correlated_residual_reports_the_analytic_inner_gradient() {
     use crate::build_info::{gradient_method_inner, GradientMethodKind, BUILD_INFO};
     use crate::stats::nested_levels::test_helpers as fx;
     let src = fx::algebraic()
-        .replace(
-            "  sigma ADD ~ 0.5\n",
-            "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n",
-        )
+        .replace("  sigma ADD ~ 0.5\n", "  sigma ADD ~ 0.5\n  theta RHO(0.6, -0.9, 0.9)\n")
         .replace(
             "[individual_parameters]\n",
             "[covariates]\n  NARM continuous\n[individual_parameters]\n",
@@ -3451,20 +3201,14 @@ fn an_iov_weighted_correlated_residual_reports_the_analytic_inner_gradient() {
     let pick = |v: &Vec<f64>| keep.iter().map(|&j| v[j]).collect::<Vec<f64>>();
     single.obs_times = pick(&single.obs_times);
     single.observations = pick(&single.observations);
-    single.obs_covariates = keep
-        .iter()
-        .map(|&j| single.obs_covariates[j].clone())
-        .collect();
+    single.obs_covariates = keep.iter().map(|&j| single.obs_covariates[j].clone()).collect();
     single.obs_cmts = vec![1; keep.len()];
     single.cens = vec![0; keep.len()];
     pop.subjects.push(single);
     crate::stats::nested_levels::assign_level_cells(&m, &mut pop);
     crate::stats::residual_error::assign_residual_groups(&m, &mut pop);
 
-    assert_eq!(
-        gradient_method_inner(&BUILD_INFO, &m),
-        GradientMethodKind::Analytic
-    );
+    assert_eq!(gradient_method_inner(&BUILD_INFO, &m), GradientMethodKind::Analytic);
     let stage = FitOptions {
         method: crate::types::EstimationMethod::FoceI,
         interaction: true,
@@ -3474,39 +3218,18 @@ fn an_iov_weighted_correlated_residual_reports_the_analytic_inner_gradient() {
     assert_eq!(fd_fallback_warning(&m, &pop, &p.theta), None);
     for (i, correlated) in [(0usize, true), (1, false)] {
         let s = &pop.subjects[i];
-        assert_eq!(
-            iov_inner_residual_correlation(&m, s),
-            correlated,
-            "{}",
-            s.id
-        );
-        assert!(
-            iov_inner_subject_route(&m, s, &p.theta).is_some(),
-            "{}: the reported route",
-            s.id
-        );
+        assert_eq!(iov_inner_residual_correlation(&m, s), correlated, "{}", s.id);
+        assert!(iov_inner_subject_route(&m, s, &p.theta).is_some(), "{}: the reported route", s.id);
         IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
         let ebe = find_ebe_for_stage(&m, s, p, 200, 1e-8, None, None, 0, &stage);
         let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
-        assert!(
-            ebe.nll.is_finite() && ebe.nll < 1e19,
-            "{}: {}",
-            s.id,
-            ebe.nll
-        );
-        assert!(
-            analytic >= 3 && fd == 0,
-            "{}: {analytic} analytic / {fd} FD",
-            s.id
-        );
+        assert!(ebe.nll.is_finite() && ebe.nll < 1e19, "{}: {}", s.id, ebe.nll);
+        assert!(analytic >= 3 && fd == 0, "{}: {analytic} analytic / {fd} FD", s.id);
     }
 
     let (mut forced, _) = fx::prepared(&src, 1);
     forced.gradient_method = GradientMethod::Fd;
-    assert_eq!(
-        gradient_method_inner(&BUILD_INFO, &forced),
-        GradientMethodKind::FiniteDifferences
-    );
+    assert_eq!(gradient_method_inner(&BUILD_INFO, &forced), GradientMethodKind::FiniteDifferences);
 }
 
 /// #2093 review (round 2): `gradient = fd` takes the IOV inner search off every exact
@@ -3531,33 +3254,14 @@ fn gradient_fd_keeps_the_iov_inner_search_off_the_exact_gradient() {
     for (gm, label) in [(GradientMethod::Auto, "auto"), (GradientMethod::Fd, "fd")] {
         model.gradient_method = gm;
         IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
-        let ebe = find_ebe_for_stage(
-            &model,
-            &s,
-            &model.default_params,
-            200,
-            1e-8,
-            None,
-            None,
-            0,
-            &stage,
-        );
+        let ebe =
+            find_ebe_for_stage(&model, &s, &model.default_params, 200, 1e-8, None, None, 0, &stage);
         let (exact, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
-        assert!(
-            ebe.nll.is_finite() && ebe.nll < 1e19,
-            "{label}: {}",
-            ebe.nll
-        );
+        assert!(ebe.nll.is_finite() && ebe.nll < 1e19, "{label}: {}", ebe.nll);
         if gm == GradientMethod::Fd {
-            assert!(
-                exact == 0 && fd > 0,
-                "{label}: {exact} exact / {fd} FD steps"
-            );
+            assert!(exact == 0 && fd > 0, "{label}: {exact} exact / {fd} FD steps");
         } else {
-            assert!(
-                exact > 0 && fd == 0,
-                "{label}: {exact} exact / {fd} FD steps"
-            );
+            assert!(exact > 0 && fd == 0, "{label}: {exact} exact / {fd} FD steps");
         }
     }
 }
@@ -3678,10 +3382,7 @@ fn analytic_iov_inner_gradient_m3_matches_fd_on_ode_bloq() {
             "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  theta TVKA(1.5,0.01,50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  omega ETA_KA ~ 0.30\n  kappa KAPPA_CL ~ 0.02\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA * exp(ETA_KA)\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot)   = -KA * depot\n  d/dt(central) =  KA * depot / V - (CL/V) * central\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  method = focei\n  bloq_method = m3\n  iov_column = OCC\n  ode_reltol = 1e-10\n  ode_abstol = 1e-12\n",
         )
         .expect("parse ODE IOV + M3");
-    assert!(
-        matches!(model.bloq_method, crate::types::BloqMethod::M3),
-        "model must be M3"
-    );
+    assert!(matches!(model.bloq_method, crate::types::BloqMethod::M3), "model must be M3");
     assert!(model.is_ode_based(), "must be on the ODE path");
     // After the #486 gate flip, the ODE IOV walk serves M3 analytically on the inner
     // loop (single gate — no separate M3 bail).
@@ -3819,9 +3520,8 @@ fn analytic_iov_inner_grad_matches_fd_of_nll() {
     // Central FD of the inner objective (same NLL `find_ebe_iov` minimises).
     let nll = |s: &[f64]| -> f64 {
         let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
+        let kappas: Vec<Vec<f64>> =
+            (0..k).map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec()).collect();
         individual_nll_iov(
             &model,
             &subject,
@@ -3895,9 +3595,8 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_expr_scale() {
 
     let nll = |s: &[f64]| -> f64 {
         let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
+        let kappas: Vec<Vec<f64>> =
+            (0..k).map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec()).collect();
         individual_nll_iov(
             &model,
             &subject,
@@ -3953,10 +3652,9 @@ fn analytic_iov_inner_grad_matches_fd_of_nll_closed_form_ltbs() {
              iov_column = OCC\n"
         )
     };
-    for (label, scaling_block) in [
-        ("plain LTBS", ""),
-        ("LTBS + obs_scale", "[scaling]\n  obs_scale = 1000 / V\n"),
-    ] {
+    for (label, scaling_block) in
+        [("plain LTBS", ""), ("LTBS + obs_scale", "[scaling]\n  obs_scale = 1000 / V\n")]
+    {
         let model = parse_model_string(&fixture(scaling_block)).expect("parse LTBS IOV fixture");
         assert!(model.log_transform, "{label}: fixture must be LTBS");
         // Routing first: a scope gap must fail loudly here rather than quietly FD-ing and
@@ -4105,9 +3803,8 @@ fn iov_iiv_on_ruv_inner_grad_matches_fd() {
 
     let nll = |s: &[f64]| -> f64 {
         let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
+        let kappas: Vec<Vec<f64>> =
+            (0..k).map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec()).collect();
         individual_nll_iov(
             &model,
             &subject,
@@ -4201,9 +3898,8 @@ fn iov_m3_iiv_on_ruv_inner_grad_matches_fd() {
 
     let nll = |s: &[f64]| -> f64 {
         let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
+        let kappas: Vec<Vec<f64>> =
+            (0..k).map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec()).collect();
         individual_nll_iov(
             &model,
             &subject,
@@ -4308,9 +4004,8 @@ fn iov_m3_inner_grad_matches_fd() {
 
     let nll = |s: &[f64]| -> f64 {
         let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
+        let kappas: Vec<Vec<f64>> =
+            (0..k).map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec()).collect();
         individual_nll_iov(
             &model,
             &subject,
@@ -4407,9 +4102,8 @@ fn iov_m3_right_censored_inner_grad_matches_fd() {
 
     let nll = |s: &[f64]| -> f64 {
         let eta_t = &s[..n_eta];
-        let kappas: Vec<Vec<f64>> = (0..k)
-            .map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec())
-            .collect();
+        let kappas: Vec<Vec<f64>> =
+            (0..k).map(|kk| s[n_eta + kk * n_kappa..n_eta + (kk + 1) * n_kappa].to_vec()).collect();
         individual_nll_iov(
             &model,
             &subject,
@@ -4477,10 +4171,8 @@ fn unlabelled_dose_models() -> Vec<(&'static str, CompiledModel)> {
 /// evaluates it under κ = 0 while the observations after it read occasion 2's κ.
 fn unlabelled_dose_subject(model: &CompiledModel) -> Subject {
     let mut s = make_iov_subject();
-    s.doses = [0.0, 12.0, 24.0]
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
+    s.doses =
+        [0.0, 12.0, 24.0].iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect();
     s.obs_times = vec![2.0, 6.0, 10.0, 14.0, 18.0, 22.0, 26.0, 30.0, 34.0];
     s.occasions = vec![1, 1, 1, 2, 2, 2, 2, 2, 2];
     s.obs_cmts = vec![1; 9];
@@ -4523,22 +4215,13 @@ fn an_unlabelled_dose_takes_the_analytic_iov_inner_gradient_on_both_engines() {
         let neighbour = crate::pk::predict_iov(&m, &labelled, theta, &[0.1], &kappas);
         for j in 0..s.obs_times.len() {
             let moved = (unlabelled[j] - neighbour[j]).abs() > 1e-3 * neighbour[j];
-            assert_eq!(
-                moved,
-                s.obs_times[j] > 24.0,
-                "{label}: obs {j} at t = {}",
-                s.obs_times[j]
-            );
+            assert_eq!(moved, s.obs_times[j] > 24.0, "{label}: obs {j} at t = {}", s.obs_times[j]);
         }
         IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
         let ebe = find_ebe_for_stage(&m, &s, &m.default_params, 200, 1e-8, None, None, 0, &stage);
         let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
         // `is_finite()` alone passes the `1e20` refusal sentinel.
-        assert!(
-            ebe.nll.is_finite() && ebe.nll < 1e19,
-            "{label}: EBE objective {}",
-            ebe.nll
-        );
+        assert!(ebe.nll.is_finite() && ebe.nll < 1e19, "{label}: EBE objective {}", ebe.nll);
         assert!(
             analytic >= 3 && fd == 0,
             "{label}: {analytic} analytic / {fd} FD steps on the unlabelled-dose subject"
@@ -4565,11 +4248,7 @@ fn an_unlabelled_dose_iov_inner_jacobian_matches_fd_of_predict_iov_on_both_engin
         let theta = &m.default_params.theta;
         let layout = crate::stats::stacked_layout::StackedLayout::sens_of(&m, &s)
             .unwrap_or_else(|| panic!("{label}: no layout"));
-        assert_eq!(
-            layout.n_groups(),
-            2,
-            "{label}: occasions 1 and 2, no group for 0"
-        );
+        assert_eq!(layout.n_groups(), 2, "{label}: occasions 1 and 2, no group for 0");
         let stacked = [0.1, 0.15, -0.2];
         let rows = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
             &m,
@@ -4653,10 +4332,8 @@ fn a_time_step_ode_iov_inner_jacobian_matches_fd_of_predict_iov() {
     let mut s = make_iov_subject();
     // Busulfan's q6h-style regimen in µg: occasion 1 takes the doses before the step,
     // occasion 2 those after, and each occasion samples on both sides of t = 24.
-    s.doses = [0.0, 18.0, 30.0]
-        .iter()
-        .map(|&t| DoseEvent::new(t, 20000.0, 1, 0.0, false, 0.0))
-        .collect();
+    s.doses =
+        [0.0, 18.0, 30.0].iter().map(|&t| DoseEvent::new(t, 20000.0, 1, 0.0, false, 0.0)).collect();
     s.dose_occasions = vec![1, 1, 2];
     s.obs_times = vec![2.0, 6.0, 20.0, 23.0, 25.0, 28.0, 32.0, 36.0];
     s.occasions = vec![1, 1, 1, 1, 1, 2, 2, 2];
@@ -4778,22 +4455,9 @@ fn iov_solve_started_next_to_its_mode_converges_without_the_fallback() {
     let mut fell_back = Vec::new();
     let mut solved = 0;
     for s in pop.subjects.iter().filter(|s| !s.occasions.is_empty()) {
-        let mode = find_ebe_iov(
-            &model,
-            s,
-            &p,
-            500,
-            1e-12,
-            None,
-            None,
-            EbeVariance::Conditional,
-            false,
-        );
-        assert!(
-            mode.converged,
-            "subject {}: reference solve must converge",
-            s.id
-        );
+        let mode =
+            find_ebe_iov(&model, s, &p, 500, 1e-12, None, None, EbeVariance::Conditional, false);
+        assert!(mode.converged, "subject {}: reference solve must converge", s.id);
         let mut start: Vec<f64> = mode.eta.iter().copied().collect();
         start.extend(mode.kappas.iter().flat_map(|k| k.iter().copied()));
         let per_delta = gnorm(&moved(1e-6), s, &start) / 1e-6;
@@ -4816,11 +4480,7 @@ fn iov_solve_started_next_to_its_mode_converges_without_the_fallback() {
                 EbeVariance::Conditional,
                 false,
             );
-            assert!(
-                r.converged,
-                "subject {}: near-mode solve did not converge",
-                s.id
-            );
+            assert!(r.converged, "subject {}: near-mode solve did not converge", s.id);
             if r.used_fallback {
                 fell_back.push(format!("{} at {near_mode}·tol", s.id));
             }
@@ -4850,10 +4510,7 @@ fn iov_fd_fallback_warning_names_the_survival_cause_on_an_all_tte_population() {
     use std::io::Write;
     let src = std::fs::read_to_string("examples/tte_exponential.ferx")
         .expect("model file")
-        .replace(
-            "omega ETA_LAMBDA ~ 0.09",
-            "omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04 FIX",
-        )
+        .replace("omega ETA_LAMBDA ~ 0.09", "omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04 FIX")
         .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)");
     // The hazard without a program: a TTE term with no exact η-channel, the case whose
     // survival cause the warning names (an analytic hazard *with* one is served).
@@ -4884,10 +4541,7 @@ fn iov_fd_fallback_warning_names_the_survival_cause_on_an_all_tte_population() {
         pop.subjects.iter().all(subject_has_survival_records),
         "fixture: every subject carries a TTE record"
     );
-    assert!(
-        !inner_reports_analytic_model(&model),
-        "a TTE model reports FD"
-    );
+    assert!(!inner_reports_analytic_model(&model), "a TTE model reports FD");
 
     let w = fd_fallback_warning(&model, &pop, &model.default_params.theta)
         .expect("an all-TTE IOV population warns although the label reads FD");
@@ -4910,10 +4564,7 @@ fn iov_inner_gradient_serves_an_analytic_hazard() {
     use std::io::Write;
     let src = std::fs::read_to_string("examples/tte_exponential.ferx")
         .expect("model file")
-        .replace(
-            "omega ETA_LAMBDA ~ 0.09",
-            "omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04 FIX",
-        )
+        .replace("omega ETA_LAMBDA ~ 0.09", "omega ETA_LAMBDA ~ 0.09\n  kappa KAPPA_CL ~ 0.04 FIX")
         .replace("CL     = DUMMY_CL", "CL     = DUMMY_CL * exp(KAPPA_CL)");
     let model = crate::parser::model_parser::parse_model_string(&src).expect("parse");
     let csv = std::fs::read_to_string("data/tte_exponential.csv").expect("data");
@@ -4934,10 +4585,7 @@ fn iov_inner_gradient_serves_an_analytic_hazard() {
         &[],
     )
     .expect("data");
-    assert!(
-        inner_reports_analytic_model(&model),
-        "an analytic hazard is served"
-    );
+    assert!(inner_reports_analytic_model(&model), "an analytic hazard is served");
     let params = &model.default_params;
     assert!(
         fd_fallback_warning(&model, &pop, &params.theta).is_none(),
@@ -5012,16 +4660,9 @@ fn a_nested_warm_start_that_does_not_compact_keeps_eta_hat() {
     let eta_hat = &b[..m.n_eta];
     let expanded = layout.expand(&b);
     let cells: Vec<&[f64]> = expanded.iter().map(Vec::as_slice).collect();
-    assert!(
-        cells.len() > 1,
-        "fixture drift: needs two cells to drop one"
-    );
+    assert!(cells.len() > 1, "fixture drift: needs two cells to drop one");
 
-    assert_eq!(
-        nested_warm_start(&layout, eta_hat, &cells),
-        b,
-        "the subject's own cells compact"
-    );
+    assert_eq!(nested_warm_start(&layout, eta_hat, &cells), b, "the subject's own cells compact");
     assert_eq!(
         nested_warm_start(&layout, eta_hat, &cells[..cells.len() - 1]),
         eta_hat,
@@ -5068,12 +4709,7 @@ fn a_nested_layout_off_the_warm_start_is_loud_in_debug() {
         let layout = NestedLayout::of(&m, subject).expect("prepared");
         fx::stacked(&layout, &fx::point(&layout, 1.0))
     };
-    m.indiv_param_partials
-        .nested_levels
-        .as_mut()
-        .expect("a nested model")
-        .kappa_level
-        .push(0);
+    m.indiv_param_partials.nested_levels.as_mut().expect("a nested model").kappa_level.push(0);
     find_ebe_iov(
         &m,
         subject,
@@ -5107,12 +4743,7 @@ fn a_nested_layout_off_the_warm_start_keeps_eta_hat_in_release() {
         let b = fx::point(&layout, 1.0);
         (fx::stacked(&layout, &b), b[..m.n_eta].to_vec())
     };
-    m.indiv_param_partials
-        .nested_levels
-        .as_mut()
-        .expect("a nested model")
-        .kappa_level
-        .push(0);
+    m.indiv_param_partials.nested_levels.as_mut().expect("a nested model").kappa_level.push(0);
     let (_, rec) = record_inner_solves(|| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             find_ebe_iov(
@@ -5142,10 +4773,7 @@ const BLOCK_SIGMA_IOV: &str = crate::test_models::ODE_8;
 fn block_sigma_iov_subject(model: &CompiledModel, paired: bool) -> Subject {
     let base = [1.0, 4.0, 10.0, 13.0, 16.0, 22.0, 25.0, 28.0, 34.0];
     let per = if paired { 2 } else { 1 };
-    let times: Vec<f64> = base
-        .iter()
-        .flat_map(|&t| std::iter::repeat_n(t, per))
-        .collect();
+    let times: Vec<f64> = base.iter().flat_map(|&t| std::iter::repeat_n(t, per)).collect();
     let n = times.len();
     let mut s = make_iov_subject();
     s.id = if paired { "PAIRED" } else { "TOTAL_ONLY" }.into();
@@ -5286,11 +4914,7 @@ fn block_sigma_iov_ebe_searches_the_live_rho_objective_on_the_exact_gradient() {
         (true, crate::types::EstimationMethod::FoceI),
         (false, crate::types::EstimationMethod::Foce),
     ] {
-        let stage = FitOptions {
-            method,
-            interaction,
-            ..FitOptions::default()
-        };
+        let stage = FitOptions { method, interaction, ..FitOptions::default() };
         for paired in [true, false] {
             let s = block_sigma_iov_subject(&m, paired);
             assert_eq!(
@@ -5308,17 +4932,8 @@ fn block_sigma_iov_ebe_searches_the_live_rho_objective_on_the_exact_gradient() {
             IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
             let ebe = find_ebe_for_stage(&m, &s, &p, 200, 1e-8, None, None, 0, &stage);
             let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
-            assert!(
-                ebe.nll.is_finite() && ebe.nll < 1e19,
-                "{} {method:?}: {}",
-                s.id,
-                ebe.nll
-            );
-            assert!(
-                analytic >= 3 && fd == 0,
-                "{} {method:?}: {analytic} analytic / {fd} FD",
-                s.id
-            );
+            assert!(ebe.nll.is_finite() && ebe.nll < 1e19, "{} {method:?}: {}", s.id, ebe.nll);
+            assert!(analytic >= 3 && fd == 0, "{} {method:?}: {analytic} analytic / {fd} FD", s.id);
             let layout = crate::stats::stacked_layout::StackedLayout::sens_of(&m, &s).unwrap();
             let k = crate::stats::stacked_layout::group_count(&s);
             let frozen = if interaction {
@@ -5333,10 +4948,8 @@ fn block_sigma_iov_ebe_searches_the_live_rho_objective_on_the_exact_gradient() {
                 b.extend(kap.iter());
             }
             let nll = |b: &[f64]| {
-                let kappas: Vec<Vec<f64>> = b[m.n_eta..]
-                    .chunks(m.n_kappa)
-                    .map(<[f64]>::to_vec)
-                    .collect();
+                let kappas: Vec<Vec<f64>> =
+                    b[m.n_eta..].chunks(m.n_kappa).map(<[f64]>::to_vec).collect();
                 individual_nll_iov_frozen_in(
                     &m,
                     &s,
@@ -5364,11 +4977,7 @@ fn block_sigma_iov_ebe_searches_the_live_rho_objective_on_the_exact_gradient() {
                 worst = worst.max(g.abs());
             }
             eprintln!("{} {method:?}: |∇| {worst:.3e} at the EBE", s.id);
-            assert!(
-                worst < 1e-4,
-                "{} {method:?}: |∇| {worst:.3e} at the EBE",
-                s.id
-            );
+            assert!(worst < 1e-4, "{} {method:?}: |∇| {worst:.3e} at the EBE", s.id);
         }
     }
 }
@@ -5513,16 +5122,9 @@ fn iov_solve_at_a_tight_tolerance_certifies_a_partial_at_its_mode() {
     };
     let without = run(true);
     let with = run(false);
-    assert!(
-        with.len() >= 10,
-        "fixture premise: {} IOV solves",
-        with.len()
-    );
+    assert!(with.len() >= 10, "fixture premise: {} IOV solves", with.len());
     let restarts = |rs: &[(String, bool, f64, Vec<f64>, usize)]| {
-        rs.iter()
-            .filter(|r| r.4 > 0)
-            .map(|r| r.0.clone())
-            .collect::<Vec<_>>()
+        rs.iter().filter(|r| r.4 > 0).map(|r| r.0.clone()).collect::<Vec<_>>()
     };
     assert!(
         !restarts(&without).is_empty(),
@@ -5563,25 +5165,12 @@ fn partial_at_mode_certificate_takes_only_a_point_at_resolution() {
     let bowl_grad = |x: &[f64]| vec![100.0 * (x[0] - 1.0)];
     let cert = exact_cert(&bowl_grad, 1, 200, 1e-12);
     let mut near = vec![1.0 + 1e-9];
-    assert!(
-        cert.certifies_partial_at_mode(&bowl, &mut near),
-        "at {near:?}"
-    );
-    assert!(
-        bowl_grad(&near)[0].abs() < 1e-12,
-        "the Newton steps carry it to tol: {near:?}"
-    );
+    assert!(cert.certifies_partial_at_mode(&bowl, &mut near), "at {near:?}");
+    assert!(bowl_grad(&near)[0].abs() < 1e-12, "the Newton steps carry it to tol: {near:?}");
     let far_start = 1.0 + 1e-3;
     let mut far = vec![far_start];
-    assert!(
-        !cert.certifies_partial_at_mode(&bowl, &mut far),
-        "at {far:?}"
-    );
-    assert_eq!(
-        far,
-        vec![far_start],
-        "an uncertified point is left as it was"
-    );
+    assert!(!cert.certifies_partial_at_mode(&bowl, &mut far), "at {far:?}");
+    assert_eq!(far, vec![far_start], "an uncertified point is left as it was");
 }
 
 /// #1564: the IOV EBE search's cached event schedule (`cacheable_schedule_iov`) changes no
@@ -5603,11 +5192,7 @@ fn the_iov_schedule_cache_is_bit_identical_and_declines_a_lagtime() {
         let n_occ = crate::stats::stacked_layout::group_count(subject).max(1);
         let eta: Vec<f64> = (0..model.n_eta).map(|k| 0.1 - 0.07 * k as f64).collect();
         let kappas: Vec<Vec<f64>> = (0..n_occ)
-            .map(|o| {
-                (0..model.n_kappa)
-                    .map(|k| 0.03 * (o as f64) - 0.02 * k as f64)
-                    .collect()
-            })
+            .map(|o| (0..model.n_kappa).map(|k| 0.03 * (o as f64) - 0.02 * k as f64).collect())
             .collect();
         let schedule = cacheable_schedule_iov(&model, subject);
         cached += usize::from(schedule.is_some());
@@ -5632,19 +5217,12 @@ fn the_iov_schedule_cache_is_bit_identical_and_declines_a_lagtime() {
         assert!(with.is_finite(), "subject {}: {with}", subject.id);
         assert_eq!(with.to_bits(), without.to_bits(), "subject {}", subject.id);
     }
-    assert_eq!(
-        cached,
-        pop.subjects.len(),
-        "every warfarin_iov subject takes the cache"
-    );
+    assert_eq!(cached, pop.subjects.len(), "every warfarin_iov subject takes the cache");
 
     let lagged = crate::parse_full_model_file(Path::new("examples/oral_with_lagtime.ferx"))
         .expect("oral_with_lagtime parses")
         .model;
-    assert!(
-        lagged.has_lagtime(),
-        "premise: the fixture carries a lagtime"
-    );
+    assert!(lagged.has_lagtime(), "premise: the fixture carries a lagtime");
     assert!(cacheable_schedule_iov(&lagged, &pop.subjects[0]).is_none());
 }
 
@@ -5670,13 +5248,10 @@ fn nelder_mead_primary_reports_converged_only_at_its_mode() {
         find_ebe(&model, s, p, 200, 1e-5, None, None, 0)
     };
     let dist = |a: &DVector<f64>, b: &[f64]| {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0_f64, |m, d| {
-                assert!(d.is_finite(), "non-finite η");
-                m.max(d)
-            })
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0_f64, |m, d| {
+            assert!(d.is_finite(), "non-finite η");
+            m.max(d)
+        })
     };
     let (mut worst, mut raw_worst) = (0.0_f64, 0.0_f64);
     for s in &pop.subjects {
@@ -5690,11 +5265,7 @@ fn nelder_mead_primary_reports_converged_only_at_its_mode() {
         raw_worst = raw_worst.max(dist(&mode.eta, &raw));
         let nm = solve(crate::types::InnerOptimizer::NelderMead, s);
         assert!(nm.converged, "{}: a certifiable NM stop is reported", s.id);
-        assert!(
-            !nm.used_fallback,
-            "{}: the primary search certified it",
-            s.id
-        );
+        assert!(!nm.used_fallback, "{}: the primary search certified it", s.id);
         worst = worst.max(dist(&mode.eta, nm.eta.as_slice()));
     }
     eprintln!("NM-certified vs BFGS mode: {worst:.3e}; raw NM stop: {raw_worst:.3e}");
@@ -5754,10 +5325,7 @@ fn certify_moved_names_a_moved_point_whichever_test_moved_it() {
     assert_eq!(x, start);
 
     let start = vec![1.0 + 1e-4];
-    assert!(
-        bowl_grad(&start)[0].abs() > 10.0 * tol,
-        "fixture: the gradient test fails"
-    );
+    assert!(bowl_grad(&start)[0].abs() > 10.0 * tol, "fixture: the gradient test fails");
     let mut x = start.clone();
     assert_eq!(
         exact_cert(&bowl_grad, 1, 50, tol).certify_moved(&bowl, &mut x),
@@ -5780,15 +5348,8 @@ fn certify_moved_names_a_moved_point_whichever_test_moved_it() {
     assert!((x[0] - 1.0).abs() < 1e-4, "{x:?}");
 
     let mut x = vec![0.0];
-    assert_eq!(
-        exact_cert(&plane_grad, 1, 50, tol).certify_moved(&plane, &mut x),
-        None
-    );
-    assert_eq!(
-        x,
-        vec![0.0],
-        "the plane: no step is taken, so x is unchanged"
-    );
+    assert_eq!(exact_cert(&plane_grad, 1, 50, tol).certify_moved(&plane, &mut x), None);
+    assert_eq!(x, vec![0.0], "the plane: no step is taken, so x is unchanged");
 
     // #2589: an uncertified point is not necessarily the one handed in. On `x⁴` from `x = 1`
     // with `max_iter = 1` the Newton test takes its one step (`x − 4x³/12x² = 2/3`, a
@@ -5797,17 +5358,11 @@ fn certify_moved_names_a_moved_point_whichever_test_moved_it() {
     let quartic = |x: &[f64]| x[0].powi(4);
     let quartic_grad = |x: &[f64]| vec![4.0 * x[0].powi(3)];
     let mut x = vec![1.0];
-    assert_eq!(
-        exact_cert(&quartic_grad, 1, 1, tol).certify_moved(&quartic, &mut x),
-        None
-    );
+    assert_eq!(exact_cert(&quartic_grad, 1, 1, tol).certify_moved(&quartic, &mut x), None);
     // The Hessian is a central difference of the gradient, so the step is `2/3` to its
     // truncation error, not to the bit: measured `|x − 2/3| = 4.413e-11` (macOS arm64), so
     // `1e-9` keeps ~23× headroom while an unmoved `x = 1` misses it by 1/3.
-    assert!(
-        (x[0] - 2.0 / 3.0).abs() < 1e-9,
-        "the accepted Newton step stays: {x:?}"
-    );
+    assert!((x[0] - 2.0 / 3.0).abs() < 1e-9, "the accepted Newton step stays: {x:?}");
 }
 
 /// #2571: under `inner_optimizer = nelder_mead`, `EbeResult::nm_polished` marks exactly the
@@ -5844,11 +5399,7 @@ fn nelder_mead_primary_flags_the_subjects_the_certificate_moved() {
             find_ebe(&model, s, p, max_iter, tol, None, None, 0)
         };
         assert!(nm.converged && !nm.used_fallback, "{}: fixture", s.id);
-        let differs = nm
-            .eta
-            .iter()
-            .zip(&stop)
-            .any(|(a, b)| a.to_bits() != b.to_bits());
+        let differs = nm.eta.iter().zip(&stop).any(|(a, b)| a.to_bits() != b.to_bits());
         assert_eq!(
             nm.nm_polished,
             differs,
@@ -5870,10 +5421,7 @@ fn nelder_mead_primary_flags_the_subjects_the_certificate_moved() {
         );
     }
     eprintln!("warfarin, nelder_mead at tol {tol:e}: {moved} moved, {as_given} as given");
-    assert!(
-        moved > 0 && as_given > 0,
-        "no straddle: {moved} moved, {as_given} as given"
-    );
+    assert!(moved > 0 && as_given > 0, "no straddle: {moved} moved, {as_given} as given");
 
     // The loop fans out over rayon, so the setting reaches its workers through a fit scope,
     // not the calling thread's guard.
@@ -5956,11 +5504,7 @@ fn two_mode_fixture(csv: &str, id: &str) -> (CompiledModel, Subject) {
     let pop =
         crate::io::datareader::read_nonmem_csv(std::path::Path::new(&path), None, Some("OCC"))
             .expect("anchor data");
-    let subject = pop
-        .subjects
-        .into_iter()
-        .find(|s| s.id == id)
-        .expect("subject");
+    let subject = pop.subjects.into_iter().find(|s| s.id == id).expect("subject");
     (model, subject)
 }
 
@@ -5969,11 +5513,7 @@ const TWO_MODE_NO_RESET: &str = "iov_kappa_two_mode_noreset.csv";
 
 /// A cold solve of `subject` with `restarts`, under the stage defaults.
 fn cold_iov_solve(
-    model: &CompiledModel,
-    subject: &Subject,
-    restarts: usize,
-    tol: f64,
-    mu: Option<&[f64]>,
+    model: &CompiledModel, subject: &Subject, restarts: usize, tol: f64, mu: Option<&[f64]>,
 ) -> EbeResult {
     find_ebe_for_stage(
         model,
@@ -5994,18 +5534,11 @@ fn cold_iov_solve(
 #[test]
 fn iov_multistart_reaches_the_deep_kappa_mode_of_a_reset_subject() {
     let (model, subject) = two_mode_fixture(TWO_MODE_RESET, "1");
-    assert!(
-        subject.has_resets(),
-        "family 1: every coordinate is scanned"
-    );
+    assert!(subject.has_resets(), "family 1: every coordinate is scanned");
     let off = cold_iov_solve(&model, &subject, 0, 1e-6, None);
     let on = cold_iov_solve(&model, &subject, 1, 1e-6, None);
     assert!(off.kappas[1][0] > 0.0, "shallow mode: {:?}", off.kappas);
-    assert!(
-        (on.kappas[1][0] + 2.2).abs() < 0.01,
-        "deep mode: {:?}",
-        on.kappas
-    );
+    assert!((on.kappas[1][0] + 2.2).abs() < 0.01, "deep mode: {:?}", on.kappas);
     assert!(on.nll + 1.0 < off.nll, "{} vs {}", on.nll, off.nll);
     assert!(on.converged, "the deep mode's descent converged");
     assert!(!on.used_fallback);
@@ -6020,11 +5553,7 @@ fn iov_multistart_scans_a_sharp_kappa_behind_a_barrier() {
     let off = cold_iov_solve(&model, &subject, 0, 1e-6, None);
     let on = cold_iov_solve(&model, &subject, 1, 1e-6, None);
     assert!(off.kappas[1][0] > 0.0, "shallow mode: {:?}", off.kappas);
-    assert!(
-        (on.kappas[1][0] + 2.2).abs() < 0.01,
-        "deep mode: {:?}",
-        on.kappas
-    );
+    assert!((on.kappas[1][0] + 2.2).abs() < 0.01, "deep mode: {:?}", on.kappas);
 }
 
 /// A genuine warm start is never re-scanned: the outer loop carries the chosen mode on, and
@@ -6168,10 +5697,8 @@ fn iov_axis_seed_that_stopped_short_is_not_reported_converged() {
 fn iov_prior_diag_follows_the_search_vector() {
     let mut params = make_iov_model().default_params;
     params.omega = OmegaMatrix::from_diagonal(&[0.09, 0.16], vec!["A".into(), "B".into()]);
-    params.omega_iov = Some(OmegaMatrix::from_diagonal(
-        &[0.04, 0.25],
-        vec!["K1".into(), "K2".into()],
-    ));
+    params.omega_iov =
+        Some(OmegaMatrix::from_diagonal(&[0.04, 0.25], vec!["K1".into(), "K2".into()]));
     let d = iov_prior_diag(2, 2, 2, None, &params);
     let vars: Vec<f64> = d.iter().map(|a| a.var).collect();
     assert_eq!(vars, vec![0.09, 0.16, 0.04, 0.25, 0.04, 0.25]);
@@ -6208,25 +5735,14 @@ fn iov_prior_diag_follows_the_compact_vector_under_nested_levels() {
     // The multi-start runs over that vector, end to end.
     let off = cold_iov_solve(&model, subject, 0, 1e-6, None);
     let on = cold_iov_solve(&model, subject, 2, 1e-6, None);
-    assert!(
-        on.nll.is_finite() && on.nll <= off.nll,
-        "{} vs {}",
-        on.nll,
-        off.nll
-    );
+    assert!(on.nll.is_finite() && on.nll <= off.nll, "{} vs {}", on.nll, off.nll);
 }
 
 #[test]
 fn axis_seed_starts_ladder_about_the_centre_and_skip_a_fixed_coordinate() {
     let base = [0.5, 0.25, 0.75];
-    let starts = axis_seed_starts(
-        &base,
-        &[1.0, 0.0, 0.0],
-        &[true, false, true],
-        &[0.5, 1.0, 0.0],
-        2,
-        None,
-    );
+    let starts =
+        axis_seed_starts(&base, &[1.0, 0.0, 0.0], &[true, false, true], &[0.5, 1.0, 0.0], 2, None);
     let want: Vec<Vec<f64>> = vec![
         vec![0.0, 0.25, 0.75],
         vec![2.0, 0.25, 0.75],
@@ -6259,10 +5775,7 @@ fn axis_seeds_follow_the_prior_column_of_a_correlated_omega() {
     let held = axis_seed_starts(&base, &[0.0, 0.0], &[true, false], &sd, 2, None);
     assert_eq!(shifted.len(), 4);
     for (k, (seed, plain)) in shifted.iter().zip(&held).enumerate() {
-        assert_eq!(
-            seed[0], plain[0],
-            "seed {k}: the scanned coordinate is where it was"
-        );
+        assert_eq!(seed[0], plain[0], "seed {k}: the scanned coordinate is where it was");
         // The move from `base` along coordinate 0 is `seed[0] − base[0]`, not `(m + 1)·sd`
         // (seeds ladder about the centre, not about `base`), so compare to its own length.
         let along = (seed[0] - base[0]) / s1;
@@ -6294,14 +5807,8 @@ fn iov_axis_seeds_shift_only_the_bsv_block() {
     let omega = DMatrix::from_row_slice(2, 2, &[0.09, rho * 0.09, rho * 0.09, 0.09]);
     let base = [0.1, 0.2, 0.3, -0.4];
     let sd = [0.3, 0.3, 1.0, 1.0];
-    let starts = axis_seed_starts(
-        &base,
-        &[0.0; 4],
-        &[true, false, true, false],
-        &sd,
-        1,
-        Some(&omega),
-    );
+    let starts =
+        axis_seed_starts(&base, &[0.0; 4], &[true, false, true, false], &sd, 1, Some(&omega));
     assert_eq!(starts.len(), 4);
     for s in &starts[..2] {
         let delta = s[0] - base[0];
@@ -6328,10 +5835,7 @@ fn iov_axis_seeds_follow_a_correlated_bsv_omega() {
         "  omega ETA_CL ~ 0.09\n  omega ETA_V  ~ 0.09\n",
         "  block_omega (ETA_CL, ETA_V) = [0.09, 0.0899, 0.09]\n",
     );
-    assert!(
-        src.contains("block_omega"),
-        "premise: the fixture's Ω changed"
-    );
+    assert!(src.contains("block_omega"), "premise: the fixture's Ω changed");
     let model = crate::parser::model_parser::parse_model_string(&src).expect("model");
     let pop = crate::io::datareader::read_nonmem_csv(
         std::path::Path::new("nonmem_anchor/iov_kappa_two_mode.csv"),
@@ -6340,18 +5844,12 @@ fn iov_axis_seeds_follow_a_correlated_bsv_omega() {
     )
     .expect("anchor data");
     let subject = pop.subjects.iter().find(|s| s.id == "1").expect("subject");
-    assert!(
-        subject.has_resets(),
-        "family 1: every coordinate is scanned"
-    );
+    assert!(subject.has_resets(), "family 1: every coordinate is scanned");
     IOV_SEED_MAX_BSV_MAHA.with(|c| c.set(0.0));
     let before = IOV_AXIS_SEEDS_RUN.with(|n| n.get());
     let r = cold_iov_solve(&model, subject, 1, 1e-6, None);
     assert!(r.nll.is_finite());
-    assert!(
-        IOV_AXIS_SEEDS_RUN.with(|n| n.get()) > before,
-        "premise: seeds ran"
-    );
+    assert!(IOV_AXIS_SEEDS_RUN.with(|n| n.get()) > before, "premise: seeds ran");
     let worst = IOV_SEED_MAX_BSV_MAHA.with(|c| c.get());
     assert!(
         worst.is_finite() && worst > 1.0 && worst <= 9.0,
@@ -6368,10 +5866,7 @@ fn section_has_barrier_needs_a_rise_and_a_fall() {
     let saturating = |p: &[f64]| 1.0 - (-p[0] * p[0]).exp();
     assert!(!section_has_barrier(&bowl, &x, &seed));
     assert!(section_has_barrier(&two_wells, &x, &seed));
-    assert!(
-        !section_has_barrier(&saturating, &x, &seed),
-        "a flattening rise has no second mode"
-    );
+    assert!(!section_has_barrier(&saturating, &x, &seed), "a flattening rise has no second mode");
     let nan_seed = |p: &[f64]| if p[0] > 1.5 { f64::NAN } else { 1.0 };
     let inf_mid = |p: &[f64]| if p[0] < 1.5 { f64::INFINITY } else { 0.0 };
     assert!(!section_has_barrier(&nan_seed, &x, &seed));
@@ -6407,21 +5902,15 @@ fn sde_iov_inner_search_takes_the_per_row_assembler() {
         observations: vec![0.0; times.len()],
         obs_cmts: vec![2; times.len()],
         cens: vec![0; times.len()],
-        occasions: times
-            .iter()
-            .map(|&t| if t < 12.0 { 1 } else { 2 })
-            .collect(),
+        occasions: times.iter().map(|&t| if t < 12.0 { 1 } else { 2 }).collect(),
         dose_occasions: vec![1, 2],
         ..Default::default()
     };
     let params = model.default_params.clone();
     let preds =
         crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, &[0.1, -0.05, 0.2]);
-    s.observations = preds
-        .iter()
-        .enumerate()
-        .map(|(j, p)| p * (1.0 + 0.1 * (1.3 * j as f64).sin()))
-        .collect();
+    s.observations =
+        preds.iter().enumerate().map(|(j, p)| p * (1.0 + 0.1 * (1.3 * j as f64).sin())).collect();
     assert!(super::analytic_iov_inner_supported(&model, &s, &params));
     super::IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
     let r = super::find_ebe_iov(
@@ -6437,10 +5926,7 @@ fn sde_iov_inner_search_takes_the_per_row_assembler() {
     );
     let (analytic, fd) = super::IOV_AGRAD_ROUTE.with(|c| c.get());
     assert!(r.nll.is_finite(), "{}", r.nll);
-    assert!(
-        analytic > 0 && fd == 0,
-        "{analytic} analytic / {fd} FD steps"
-    );
+    assert!(analytic > 0 && fd == 0, "{analytic} analytic / {fd} FD steps");
 }
 
 /// The IOV twin of `a_dose_only_subject_is_not_counted_as_finite_differences`: the IOV loop's
@@ -6473,10 +5959,7 @@ fn an_iov_dose_only_subject_is_not_counted_as_finite_differences() {
         2,
     );
     let _ = std::fs::remove_dir_all(&dir);
-    assert!(
-        model.default_params.omega_iov.is_some(),
-        "fixture precondition: an IOV model"
-    );
+    assert!(model.default_params.omega_iov.is_some(), "fixture precondition: an IOV model");
     assert!(
         pop.subjects[1].obs_times.is_empty() && pop.subjects[1].obs_records.is_empty(),
         "fixture precondition: subject 2 has no observations"

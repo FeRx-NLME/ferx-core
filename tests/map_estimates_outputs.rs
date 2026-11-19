@@ -14,10 +14,7 @@ use ferx_core::parser::model_parser::parse_model_file;
 use ferx_core::{fit, read_nonmem_csv, FitOptions, Optimizer};
 use std::path::Path;
 
-fn warfarin_setup() -> (
-    ferx_core::types::CompiledModel,
-    ferx_core::types::Population,
-) {
+fn warfarin_setup() -> (ferx_core::types::CompiledModel, ferx_core::types::Population) {
     let model =
         parse_model_file(Path::new("examples/warfarin.ferx")).expect("warfarin example must parse");
     let population = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -69,17 +66,11 @@ fn sdtab_omits_eta_columns_after_fit() {
     let cols = sdtab(&result, &population);
     let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
     let eta_cols: Vec<&&str> = names.iter().filter(|n| n.starts_with("ETA")).collect();
-    assert!(
-        eta_cols.is_empty(),
-        "sdtab must not contain ETA columns; found: {:?}",
-        eta_cols
-    );
+    assert!(eta_cols.is_empty(), "sdtab must not contain ETA columns; found: {:?}", eta_cols);
 
     // Spot-check the per-observation columns we still expect, so a future
     // accidental column drop also fails this test.
-    for required in [
-        "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS",
-    ] {
+    for required in ["ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "EBE_OFV", "N_OBS"] {
         assert!(
             names.contains(&required),
             "sdtab missing required column `{}`; have: {:?}",
@@ -134,25 +125,14 @@ fn sdtab_emits_finite_npde_columns_when_enabled() {
     assert_eq!(npd.len(), n_obs_total);
     assert!(n_obs_total > 0);
 
-    assert!(
-        npde.iter().all(|v| v.is_finite()),
-        "all NPDE values must be finite; got {:?}",
-        npde
-    );
-    assert!(
-        npd.iter().all(|v| v.is_finite()),
-        "all NPD values must be finite; got {:?}",
-        npd
-    );
+    assert!(npde.iter().all(|v| v.is_finite()), "all NPDE values must be finite; got {:?}", npde);
+    assert!(npd.iter().all(|v| v.is_finite()), "all NPD values must be finite; got {:?}", npd);
 
     // The whole-population NPD/NPDE should be roughly mean-zero, unit-variance
     // (standard-normal under a reasonable fit) — a loose sanity band, not a
     // convergence assertion (the fit is deliberately truncated).
     let mean = npde.iter().sum::<f64>() / npde.len() as f64;
-    assert!(
-        mean.abs() < 1.0,
-        "NPDE population mean should be near 0, got {mean}"
-    );
+    assert!(mean.abs() < 1.0, "NPDE population mean should be near 0, got {mean}");
 }
 
 #[test]
@@ -167,10 +147,7 @@ fn npde_is_reproducible_across_runs_with_same_seed() {
     let r2 = fit(&model, &population, &model.default_params, &opts).expect("fit 2");
 
     for (s1, s2) in r1.subjects.iter().zip(r2.subjects.iter()) {
-        assert_eq!(
-            s1.npde, s2.npde,
-            "NPDE must be reproducible for a fixed seed"
-        );
+        assert_eq!(s1.npde, s2.npde, "NPDE must be reproducible for a fixed seed");
         assert_eq!(s1.npd, s2.npd, "NPD must be reproducible for a fixed seed");
     }
 }

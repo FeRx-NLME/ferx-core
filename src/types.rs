@@ -178,21 +178,13 @@ pub struct CmtToggle {
 /// "At" is the engines' order: a dose sorts ahead of a co-timed row, so the row stops it. The
 /// reader leaves no such tie, having put the two a ULP apart in file order.
 pub(crate) fn cmt_off_times(
-    doses: &[DoseEvent],
-    toggles: &[CmtToggle],
-    pk_only_times: &[f64],
+    doses: &[DoseEvent], toggles: &[CmtToggle], pk_only_times: &[f64],
 ) -> Vec<f64> {
     doses
         .iter()
         .map(|d| {
             let record = d.implied.map_or(d.time, |i| doses[i.parent].time);
-            cmt_off_time(
-                record,
-                d.cmt_idx(),
-                toggles,
-                pk_only_times,
-                CoTimedOff::Stops,
-            )
+            cmt_off_time(record, d.cmt_idx(), toggles, pk_only_times, CoTimedOff::Stops)
         })
         .collect()
 }
@@ -214,11 +206,7 @@ pub(crate) enum CoTimedOff {
 /// [`CoTimedOff::After`]), `+∞` when none follows. The one rule for `DoseEvent::off_at`,
 /// shared by [`cmt_off_times`] and the adaptive driver's controller doses.
 pub(crate) fn cmt_off_time(
-    record: f64,
-    cmt_idx: usize,
-    toggles: &[CmtToggle],
-    pk_only_times: &[f64],
-    cotimed: CoTimedOff,
+    record: f64, cmt_idx: usize, toggles: &[CmtToggle], pk_only_times: &[f64], cotimed: CoTimedOff,
 ) -> f64 {
     toggles
         .iter()
@@ -552,11 +540,7 @@ impl DoseEvent {
     /// the `F`-reshaped infusion without an extra post-multiply (#419).
     pub(crate) fn with_bioavailable_infusion(&self, f_bio: f64) -> DoseEvent {
         let (rate, duration) = self.bioavailable_infusion(f_bio);
-        DoseEvent {
-            rate,
-            duration,
-            ..self.clone()
-        }
+        DoseEvent { rate, duration, ..self.clone() }
     }
 
     /// The infusions one steady-state cycle of this dose replays, at the cycle origin with
@@ -897,16 +881,13 @@ impl DoseAttrMap {
     /// unconditional and cheap; whether it *matters* depends on the dataset, which
     /// is why nothing here rejects.
     pub fn mark_prediction_path_read(&mut self, attr: DoseAttr, cmt: usize, name: &str) {
-        self.prediction_path_reads
-            .insert((attr, cmt), name.to_string());
+        self.prediction_path_reads.insert((attr, cmt), name.to_string());
     }
 
     /// The parameter name for `(attr, cmt)` when it is read on the prediction path,
     /// else `None`. See [`Self::mark_prediction_path_read`].
     pub fn prediction_path_read(&self, attr: DoseAttr, cmt: usize) -> Option<&str> {
-        self.prediction_path_reads
-            .get(&(attr, cmt))
-            .map(String::as_str)
+        self.prediction_path_reads.get(&(attr, cmt)).map(String::as_str)
     }
 
     /// `true` when no compartment-indexed attribute is recorded — the common
@@ -955,10 +936,7 @@ impl DoseAttrMap {
     /// bare `lagtime`): a dose lowered to an infusion reads it as the dose's lag
     /// ([`Self::lagtime_for_dose`]); the forcing keeps it for every other dose.
     pub(crate) fn set_zero_order(
-        &mut self,
-        cmt: usize,
-        slot: usize,
-        route_lag_slot: Option<usize>,
+        &mut self, cmt: usize, slot: usize, route_lag_slot: Option<usize>,
     ) {
         self.zero_order.insert(cmt, (slot, route_lag_slot));
     }
@@ -996,8 +974,7 @@ impl DoseAttrMap {
     /// compartment lags by the route's `lag=` slot (its lag now lives on the dose); every other
     /// dose by its compartment's lag. The one reader every dose-lag consumer goes through.
     pub(crate) fn lag_slot_for_dose(&self, d: &DoseEvent) -> usize {
-        self.lowered_dose_lag_slot(d)
-            .unwrap_or_else(|| self.lag_slot(d.cmt_raw()))
+        self.lowered_dose_lag_slot(d).unwrap_or_else(|| self.lag_slot(d.cmt_raw()))
     }
 
     /// [`Self::lagtime`] for the dose `d` ([`Self::lag_slot_for_dose`]).
@@ -1038,20 +1015,14 @@ impl DoseAttrMap {
     /// sources the slot-resolution fallback that callers (e.g. the ODE sensitivity
     /// walk's `dose_lag_slot`) would otherwise re-implement.
     pub fn lag_slot(&self, cmt: usize) -> usize {
-        self.indexed_slot(DoseAttr::Lag, cmt)
-            .unwrap_or(PK_IDX_LAGTIME)
+        self.indexed_slot(DoseAttr::Lag, cmt).unwrap_or(PK_IDX_LAGTIME)
     }
 
     /// Read `attr` for `cmt` from its indexed slot, else from `bare_slot`, else
     /// `dflt` (both reads are bounds-checked so a short `params` slice — e.g. an
     /// analytical model whose vector stops at slot 8 — cannot panic).
     fn resolve_or(
-        &self,
-        attr: DoseAttr,
-        cmt: usize,
-        bare_slot: usize,
-        dflt: f64,
-        params: &[f64],
+        &self, attr: DoseAttr, cmt: usize, bare_slot: usize, dflt: f64, params: &[f64],
     ) -> f64 {
         let slot = self.indexed_slot(attr, cmt).unwrap_or(bare_slot);
         params.get(slot).copied().unwrap_or(dflt)
@@ -1382,10 +1353,7 @@ pub struct Subject {
 /// times. [`Subject::readout_time`] over a subject's own vectors; the slice form
 /// is for callers that are handed the vectors, not the subject.
 pub(crate) fn written_time(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -> f64 {
-    obs_raw_times
-        .get(j)
-        .copied()
-        .unwrap_or_else(|| obs_times.get(j).copied().unwrap_or(0.0))
+    obs_raw_times.get(j).copied().unwrap_or_else(|| obs_times.get(j).copied().unwrap_or(0.0))
 }
 
 /// [`Subject::param_time_at`] over a `reset_period_times` table, ascending in engine time.
@@ -1473,13 +1441,7 @@ impl Subject {
     /// `cmt_idx` (#2753): see [`CoTimedOff::After`]. The driver sets it at injection and the
     /// frozen replay on each ledger dose, so the two cut the same input at the same row.
     pub(crate) fn controller_dose_off_at(&self, t: f64, cmt_idx: usize) -> f64 {
-        cmt_off_time(
-            t,
-            cmt_idx,
-            &self.cmt_toggles,
-            &self.pk_only_times,
-            CoTimedOff::After,
-        )
+        cmt_off_time(t, cmt_idx, &self.cmt_toggles, &self.pk_only_times, CoTimedOff::After)
     }
 
     /// True when any dose record on this subject is flagged steady-state
@@ -1610,9 +1572,7 @@ impl Subject {
     pub(crate) fn has_event_records(&self) -> bool {
         #[cfg(feature = "survival")]
         {
-            self.obs_records
-                .iter()
-                .any(|r| matches!(r, ObsRecord::Event { .. }))
+            self.obs_records.iter().any(|r| matches!(r, ObsRecord::Event { .. }))
         }
         #[cfg(not(feature = "survival"))]
         {
@@ -1634,8 +1594,7 @@ impl Subject {
         });
         if aligned {
             let mut k = kept.into_iter();
-            self.endpoint_covariates
-                .retain(|_| k.next().unwrap_or(true));
+            self.endpoint_covariates.retain(|_| k.next().unwrap_or(true));
         }
     }
 
@@ -1643,9 +1602,7 @@ impl Subject {
     /// snapshot when `snaps` (this subject's [`Self::record_covariate_snapshots`], taken
     /// once per walk) aligns, else the baseline map.
     pub(crate) fn record_cov<'a>(
-        &'a self,
-        snaps: Option<&'a [HashMap<String, f64>]>,
-        r: usize,
+        &'a self, snaps: Option<&'a [HashMap<String, f64>]>, r: usize,
     ) -> &'a HashMap<String, f64> {
         snaps.and_then(|s| s.get(r)).unwrap_or(&self.covariates)
     }
@@ -1801,11 +1758,7 @@ impl Subject {
     /// keeps the value at `0` rather than negative: a decision at `0` on records from
     /// `1` would otherwise read `−1` (#2741).
     fn pre_dose_tad_at(&self, obs_t: f64) -> f64 {
-        let first_dose = self
-            .doses
-            .iter()
-            .map(|d| d.time)
-            .fold(f64::INFINITY, f64::min);
+        let first_dose = self.doses.iter().map(|d| d.time).fold(f64::INFINITY, f64::min);
         let first_record = self
             .obs_times
             .iter()
@@ -2150,11 +2103,7 @@ impl CovariateDecl {
     /// A declaration with no levels — the shape every `[covariates]` line had
     /// before `levels = [...]` existed.
     pub fn new(name: impl Into<String>, kind: CovariateKind) -> Self {
-        CovariateDecl {
-            name: name.into(),
-            kind,
-            levels: None,
-        }
+        CovariateDecl { name: name.into(), kind, levels: None }
     }
 }
 
@@ -2242,10 +2191,7 @@ impl CovariateForm {
     /// rather than silently producing a factor keyed on a level that does not
     /// exist.
     pub fn is_categorical(&self) -> bool {
-        matches!(
-            self,
-            CovariateForm::Categorical | CovariateForm::Categorical2
-        )
+        matches!(self, CovariateForm::Categorical | CovariateForm::Categorical2)
     }
 }
 
@@ -2601,10 +2547,7 @@ pub struct OmegaMatrix {
 
 impl OmegaMatrix {
     pub fn from_matrix_with_mask(
-        m: DMatrix<f64>,
-        names: Vec<String>,
-        diagonal: bool,
-        free_mask: DMatrix<bool>,
+        m: DMatrix<f64>, names: Vec<String>, diagonal: bool, free_mask: DMatrix<bool>,
     ) -> Self {
         let n = m.nrows();
         // If the input matrix is PD we use it as-is. If Cholesky fails we
@@ -2622,10 +2565,7 @@ impl OmegaMatrix {
                 let min_eig = eig.eigenvalues.min();
                 let reg = if min_eig < 0.0 { -min_eig + 1e-8 } else { 1e-8 };
                 let m_reg = &m + DMatrix::identity(n, n) * reg;
-                let c = m_reg
-                    .clone()
-                    .cholesky()
-                    .expect("Regularized matrix must be PD");
+                let c = m_reg.clone().cholesky().expect("Regularized matrix must be PD");
                 (m_reg, c.l(), c.inverse(), sim_chol)
             }
         };
@@ -2701,10 +2641,7 @@ impl OmegaMatrix {
     /// Ω⁻¹ = L⁻ᵀ L⁻¹, where L⁻¹ comes from one lower-triangular solve
     /// against the identity.
     pub fn from_chol_factor(
-        l: DMatrix<f64>,
-        names: Vec<String>,
-        diagonal: bool,
-        free_mask: DMatrix<bool>,
+        l: DMatrix<f64>, names: Vec<String>, diagonal: bool, free_mask: DMatrix<bool>,
     ) -> Self {
         let n = l.nrows();
         let matrix = &l * l.transpose();
@@ -2717,11 +2654,7 @@ impl OmegaMatrix {
         let identity = DMatrix::<f64>::identity(n, n);
         let inv = match l.solve_lower_triangular(&identity) {
             Some(l_inv) => &l_inv.transpose() * &l_inv,
-            None => matrix
-                .clone()
-                .cholesky()
-                .expect("L Lᵀ should be PD by construction")
-                .inverse(),
+            None => matrix.clone().cholesky().expect("L Lᵀ should be PD by construction").inverse(),
         };
         let mut log_det = 0.0;
         for i in 0..n {
@@ -2783,9 +2716,7 @@ impl OmegaMatrix {
     ///   keeps a caller who supplies a real variance for that η from losing it.
     /// - Otherwise `chol`, borrowed, exactly as before.
     pub(crate) fn sim_draw_factor<'a>(
-        &'a self,
-        declared: Option<&OmegaMatrix>,
-        declared_fixed: &[bool],
+        &'a self, declared: Option<&OmegaMatrix>, declared_fixed: &[bool],
     ) -> std::borrow::Cow<'a, DMatrix<f64>> {
         use std::borrow::Cow;
         if let Some(l) = &self.sim_chol {
@@ -2828,9 +2759,8 @@ const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
 /// `0`) and the rest factors on its own; `None` otherwise (#1605).
 fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
     let n = m.nrows();
-    let zeros: Vec<bool> = (0..n)
-        .map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0))
-        .collect();
+    let zeros: Vec<bool> =
+        (0..n).map(|i| (0..n).all(|j| m[(i, j)] == 0.0 && m[(j, i)] == 0.0)).collect();
     if !zeros.iter().any(|&z| z) {
         return None;
     }
@@ -3314,24 +3244,15 @@ impl PkModel {
         match self {
             PkModel::OneCptIv => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v")],
             PkModel::OneCptOral => &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_KA, "ka")],
-            PkModel::OneCptTransit => &[
-                (PK_IDX_CL, "cl"),
-                (PK_IDX_V, "v"),
-                (PK_IDX_N, "n"),
-                (PK_IDX_MTT, "mtt"),
-            ],
-            PkModel::OneCptIg => &[
-                (PK_IDX_CL, "cl"),
-                (PK_IDX_V, "v"),
-                (PK_IDX_MAT, "mat"),
-                (PK_IDX_CV2, "cv2"),
-            ],
-            PkModel::TwoCptIv => &[
-                (PK_IDX_CL, "cl"),
-                (PK_IDX_V, "v1"),
-                (PK_IDX_Q, "q"),
-                (PK_IDX_V2, "v2"),
-            ],
+            PkModel::OneCptTransit => {
+                &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_N, "n"), (PK_IDX_MTT, "mtt")]
+            }
+            PkModel::OneCptIg => {
+                &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v"), (PK_IDX_MAT, "mat"), (PK_IDX_CV2, "cv2")]
+            }
+            PkModel::TwoCptIv => {
+                &[(PK_IDX_CL, "cl"), (PK_IDX_V, "v1"), (PK_IDX_Q, "q"), (PK_IDX_V2, "v2")]
+            }
             PkModel::TwoCptOral => &[
                 (PK_IDX_CL, "cl"),
                 (PK_IDX_V, "v1"),
@@ -3580,10 +3501,7 @@ pub enum ErrorSpec {
     /// observation's covariate snapshot to a 0-based key into `endpoints`; the
     /// `EndpointError` values carry the same `error_model` + `sigma_idx` layout
     /// as `PerCmt`.
-    Selected {
-        selector: ErrorSelector,
-        endpoints: HashMap<usize, EndpointError>,
-    },
+    Selected { selector: ErrorSelector, endpoints: HashMap<usize, EndpointError> },
 }
 
 impl std::fmt::Debug for ErrorSpec {
@@ -3591,10 +3509,7 @@ impl std::fmt::Debug for ErrorSpec {
         match self {
             ErrorSpec::Single(em) => f.debug_tuple("Single").field(em).finish(),
             ErrorSpec::PerCmt(map) => f.debug_tuple("PerCmt").field(map).finish(),
-            ErrorSpec::Selected {
-                selector,
-                endpoints,
-            } => f
+            ErrorSpec::Selected { selector, endpoints } => f
                 .debug_struct("Selected")
                 .field("selector", selector)
                 .field("endpoints", endpoints)
@@ -3623,9 +3538,7 @@ impl ErrorSpec {
     pub fn obs_keys<'a>(&self, subject: &'a Subject) -> std::borrow::Cow<'a, [usize]> {
         match self {
             ErrorSpec::Selected { selector, .. } => std::borrow::Cow::Owned(
-                (0..subject.obs_cmts.len())
-                    .map(|j| (selector.eval)(subject.obs_cov(j)))
-                    .collect(),
+                (0..subject.obs_cmts.len()).map(|j| (selector.eval)(subject.obs_cov(j))).collect(),
             ),
             _ => std::borrow::Cow::Borrowed(&subject.obs_cmts),
         }
@@ -3682,9 +3595,7 @@ pub struct KappaWeight {
 
 impl std::fmt::Debug for KappaWeight {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KappaWeight")
-            .field("expr", &self.expr)
-            .finish_non_exhaustive()
+        f.debug_struct("KappaWeight").field("expr", &self.expr).finish_non_exhaustive()
     }
 }
 
@@ -3772,11 +3683,8 @@ pub struct RuvMagnitude {
 
 impl std::fmt::Debug for RuvMagnitude {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let slots: Vec<&str> = self
-            .per_sigma
-            .iter()
-            .map(|s| if s.is_some() { "expr" } else { "bare" })
-            .collect();
+        let slots: Vec<&str> =
+            self.per_sigma.iter().map(|s| if s.is_some() { "expr" } else { "bare" }).collect();
         if self.has_exponent() {
             let exps: Vec<&str> = self
                 .per_sigma_exponent
@@ -3816,10 +3724,7 @@ impl RuvMagnitude {
     /// a block that has endpoint magnitudes, since a `Selected` key evaluates the
     /// selector and this runs on the inner objective's per-call path.
     fn endpoint_for(
-        &self,
-        spec: &ErrorSpec,
-        subject: &Subject,
-        j: usize,
+        &self, spec: &ErrorSpec, subject: &Subject, j: usize,
     ) -> Option<&EndpointMagnitude> {
         if self.per_endpoint.is_empty() {
             return None;
@@ -3830,9 +3735,7 @@ impl RuvMagnitude {
     /// The per-sigma programs endpoint `key` reads: its own when the block has an
     /// entry for it, else the single-endpoint tables.
     fn fns_for_key(&self, key: usize) -> &[Option<RuvMagFn>] {
-        self.per_endpoint
-            .get(&key)
-            .map_or(&self.per_sigma, |ep| &ep.per_sigma)
+        self.per_endpoint.get(&key).map_or(&self.per_sigma, |ep| &ep.per_sigma)
     }
 
     /// [`eval_obs`](Self::eval_obs) on the programs of endpoint `key` (keyed as
@@ -3841,12 +3744,7 @@ impl RuvMagnitude {
     /// needs no observation row: the adaptive controller's assay evaluates it at a
     /// decision (#2741), and [`eval_subject_obs`](Self::eval_subject_obs) at a data row.
     pub(crate) fn eval_key(
-        &self,
-        key: usize,
-        theta: &[f64],
-        covariates: &HashMap<String, f64>,
-        time: f64,
-        tad: f64,
+        &self, key: usize, theta: &[f64], covariates: &HashMap<String, f64>, time: f64, tad: f64,
     ) -> Vec<f64> {
         self.eval_row(self.fns_for_key(key), theta, covariates, time, tad)
     }
@@ -3878,11 +3776,7 @@ impl RuvMagnitude {
     /// This reads the single-endpoint tables, so for a `CMT=N:` or `if/else` block it
     /// returns all ones; [`CompiledModel::ruv_obs_mult`] resolves each row's endpoint.
     pub fn eval_obs(
-        &self,
-        theta: &[f64],
-        obs_covariates: &HashMap<String, f64>,
-        time: f64,
-        tad: f64,
+        &self, theta: &[f64], obs_covariates: &HashMap<String, f64>, time: f64, tad: f64,
     ) -> Vec<f64> {
         self.eval_row(&self.per_sigma, theta, obs_covariates, time, tad)
     }
@@ -3890,19 +3784,11 @@ impl RuvMagnitude {
     /// [`eval_obs`](Self::eval_obs) of observation `j` of `subject`, on the magnitude
     /// programs of the endpoint it resolves to under `spec`.
     pub(crate) fn eval_subject_obs(
-        &self,
-        spec: &ErrorSpec,
-        subject: &Subject,
-        j: usize,
-        theta: &[f64],
+        &self, spec: &ErrorSpec, subject: &Subject, j: usize, theta: &[f64],
     ) -> Vec<f64> {
         // The key is resolved only for a block with endpoint magnitudes: a `Selected`
         // key evaluates the selector, and this runs on the inner objective's path.
-        let key = if self.per_endpoint.is_empty() {
-            0
-        } else {
-            spec.obs_key(subject, j)
-        };
+        let key = if self.per_endpoint.is_empty() { 0 } else { spec.obs_key(subject, j) };
         self.eval_key(
             key,
             theta,
@@ -3913,12 +3799,8 @@ impl RuvMagnitude {
     }
 
     fn eval_row(
-        &self,
-        fns: &[Option<RuvMagFn>],
-        theta: &[f64],
-        obs_covariates: &HashMap<String, f64>,
-        time: f64,
-        tad: f64,
+        &self, fns: &[Option<RuvMagFn>], theta: &[f64], obs_covariates: &HashMap<String, f64>,
+        time: f64, tad: f64,
     ) -> Vec<f64> {
         let mut out: Vec<f64> = fns
             .iter()
@@ -3942,11 +3824,7 @@ impl RuvMagnitude {
     /// two-half row (multipliers, then exponents when a power form is active), each a
     /// function of the caller's θ. `None` when an active slot has no compiled program.
     pub(crate) fn eval_subject_obs_g<T: crate::sens::num::vm::VmNum>(
-        &self,
-        spec: &ErrorSpec,
-        subject: &Subject,
-        j: usize,
-        theta: &[T],
+        &self, spec: &ErrorSpec, subject: &Subject, j: usize, theta: &[T],
     ) -> Option<Vec<T>> {
         let obs_covariates = subject.obs_cov(j);
         let time = subject.readout_time(j);
@@ -3957,10 +3835,7 @@ impl RuvMagnitude {
             (0..self.per_sigma.len())
                 .map(|k| match fns.get(k) {
                     Some(Some(_)) => {
-                        progs
-                            .get(k)?
-                            .as_ref()?
-                            .eval_g(theta, obs_covariates, time, tad)
+                        progs.get(k)?.as_ref()?.eval_g(theta, obs_covariates, time, tad)
                     }
                     _ => Some(T::from_f64(1.0)),
                 })
@@ -3971,10 +3846,7 @@ impl RuvMagnitude {
             None => half(&self.per_sigma, &self.per_sigma_deriv)?,
         };
         if self.has_exponent() {
-            out.extend(half(
-                &self.per_sigma_exponent,
-                &self.per_sigma_exponent_deriv,
-            )?);
+            out.extend(half(&self.per_sigma_exponent, &self.per_sigma_exponent_deriv)?);
         }
         Some(out)
     }
@@ -4151,9 +4023,9 @@ impl AnalyticReadout {
             crate::ode::OdeReadout::Single(_) => {
                 self.program.as_ref().is_some_and(|p| p.references_state(0))
             }
-            crate::ode::OdeReadout::PerCmt(map) => map
-                .values()
-                .any(|r| r.program.as_ref().is_some_and(|p| p.references_state(0))),
+            crate::ode::OdeReadout::PerCmt(map) => {
+                map.values().any(|r| r.program.as_ref().is_some_and(|p| p.references_state(0)))
+            }
         }
     }
 }
@@ -4231,31 +4103,19 @@ impl ScalingSpec {
     /// the outer NLL goes NaN, matching the established loud-failure
     /// semantic used everywhere else in the scaling path.
     pub fn build_obs_scale_array(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-        pk: &PkParams,
+        &self, theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, pk: &PkParams,
         obs_cmts: &[usize],
     ) -> Vec<f64> {
         let n = obs_cmts.len();
         match self {
             Self::None => vec![1.0; n],
             Self::ScalarScale(k) => {
-                let v = if *k > 0.0 && k.is_finite() {
-                    *k
-                } else {
-                    f64::NAN
-                };
+                let v = if *k > 0.0 && k.is_finite() { *k } else { f64::NAN };
                 vec![v; n]
             }
             Self::ExpressionScale { scale_fn, .. } => {
                 let s = scale_fn(theta, eta, covariates, pk);
-                let v = if s > 0.0 && s.is_finite() {
-                    s
-                } else {
-                    f64::NAN
-                };
+                let v = if s > 0.0 && s.is_finite() { s } else { f64::NAN };
                 vec![v; n]
             }
             Self::PerCmt(map) => obs_cmts
@@ -4547,21 +4407,11 @@ pub enum ObsRecord {
     /// `raw_time` is the TIME the input CSV carried, and is what every reported row
     /// (sdtab, `simulate()`, `predict_categorical`) must use so output joins back to
     /// the input and to covtab. They differ only for reset-delimited occasions.
-    DiscreteState {
-        time: f64,
-        raw_time: f64,
-        state: usize,
-        cmt: usize,
-    },
+    DiscreteState { time: f64, raw_time: f64, state: usize, cmt: usize },
     /// Non-negative integer count observation (Poisson / negative-binomial, Track C).
     /// Carries both clocks for the same reason [`Self::DiscreteState`] does — reporting
     /// must use `raw_time` or the rows cannot be joined back to the input.
-    Count {
-        time: f64,
-        raw_time: f64,
-        count: u32,
-        cmt: usize,
-    },
+    Count { time: f64, raw_time: f64, count: u32, cmt: usize },
 }
 
 impl ObsRecord {
@@ -4610,7 +4460,9 @@ pub enum HazardSpec {
     /// compartment's index in the ODE state vector. The TTE likelihood reads
     /// `H(t)` from the integrated state `u[chz_state]` and `h(t)` from its
     /// derivative `du[chz_state]`, rather than from a closed-form family.
-    OdeAccumulated { chz_state: usize },
+    OdeAccumulated {
+        chz_state: usize,
+    },
 }
 
 #[cfg(feature = "survival")]
@@ -4913,9 +4765,7 @@ impl std::fmt::Debug for EndpointLikelihood {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EndpointLikelihood::Gaussian(e) => write!(f, "Gaussian({e:?})"),
-            EndpointLikelihood::Tte {
-                hazard, recurrence, ..
-            } => {
+            EndpointLikelihood::Tte { hazard, recurrence, .. } => {
                 write!(f, "Tte({hazard:?}, {recurrence:?})")
             }
             EndpointLikelihood::Binary { link, .. } => write!(f, "Binary({link:?})"),
@@ -4923,18 +4773,11 @@ impl std::fmt::Debug for EndpointLikelihood {
                 write!(f, "Count({family:?}, {scale:?})")
             }
             #[cfg(feature = "markov")]
-            EndpointLikelihood::Ctmm {
-                n_states,
-                state_codes,
-                ..
-            } => write!(f, "Ctmm(n_states={n_states}, codes={state_codes:?})"),
+            EndpointLikelihood::Ctmm { n_states, state_codes, .. } => {
+                write!(f, "Ctmm(n_states={n_states}, codes={state_codes:?})")
+            }
             #[cfg(feature = "markov")]
-            EndpointLikelihood::Dtmm {
-                n_states,
-                state_codes,
-                transitions,
-                ..
-            } => write!(
+            EndpointLikelihood::Dtmm { n_states, state_codes, transitions, .. } => write!(
                 f,
                 "Dtmm(n_states={n_states}, codes={state_codes:?}, transitions={transitions:?})"
             ),
@@ -5027,11 +4870,7 @@ impl Prediction {
             Prediction::CatProbs { probs } => probs.get(k).copied(),
             Prediction::Rate { lambda, size } => {
                 let k = u32::try_from(k).ok()?;
-                Some(crate::stats::special::count_pmf(
-                    *lambda,
-                    *size,
-                    f64::from(k),
-                ))
+                Some(crate::stats::special::count_pmf(*lambda, *size, f64::from(k)))
             }
             Prediction::Continuous { .. } => None,
         }
@@ -5581,9 +5420,7 @@ impl AbsorptionOdeEquivalent {
     /// desugar that produced it.
     pub(crate) fn build(source: &str) -> Result<Self, String> {
         let built = crate::parser::model_parser::parse_model_string(source)?;
-        Ok(Self {
-            built: Box::new(built),
-        })
+        Ok(Self { built: Box::new(built) })
     }
 
     /// The ODE equivalent sub-model.
@@ -5621,11 +5458,7 @@ const TWIN_DECLINE_REASON_MARKER: &str = " Reason: ";
 /// following sentence.
 pub(crate) fn absorption_twin_declined_warning(reason: &str) -> String {
     let reason = reason.trim();
-    let terminator = if reason.ends_with(['.', '!', '?']) {
-        ""
-    } else {
-        "."
-    };
+    let terminator = if reason.ends_with(['.', '!', '?']) { "" } else { "." };
     format!(
         "This absorption model's ODE equivalent could not be built, so the model stays \
          closed-form. Subjects needing the ODE fallback (time-varying covariates, a \
@@ -5733,9 +5566,7 @@ pub(crate) struct ForcedFdGuard {
 /// See [`ForcedFdGuard`]. `false` arms `Some(false)`, so a nested call that did not ask for
 /// FD reads "not forced", not the enclosing call's flag.
 pub(crate) fn arm_forced_fd(fd: bool) -> ForcedFdGuard {
-    ForcedFdGuard {
-        prev: LOCAL_FORCED_FD.replace(Some(fd)),
-    }
+    ForcedFdGuard { prev: LOCAL_FORCED_FD.replace(Some(fd)) }
 }
 
 impl Drop for ForcedFdGuard {
@@ -5866,9 +5697,7 @@ impl CompiledModel {
     /// per `(θ, η)` and can reach it at a perturbed point only (#520 review).
     pub(crate) fn integrator_spec(&self) -> Option<&crate::ode::predictions::OdeSpec> {
         self.ode_spec.as_ref().or_else(|| {
-            self.absorption_ode_equivalent
-                .as_ref()
-                .and_then(|eq| eq.built().ode_spec.as_ref())
+            self.absorption_ode_equivalent.as_ref().and_then(|eq| eq.built().ode_spec.as_ref())
         })
     }
 
@@ -5888,10 +5717,7 @@ impl CompiledModel {
     /// every compartment-bearing readout carries at least `central`).
     pub fn is_algebraic(&self) -> bool {
         self.ode_spec.is_none()
-            && self
-                .analytic_readout
-                .as_ref()
-                .is_some_and(|ar| ar.state_names.is_empty())
+            && self.analytic_readout.as_ref().is_some_and(|ar| ar.state_names.is_empty())
     }
 
     /// The model that should actually serve `subject`'s predictions / sensitivities.
@@ -6049,9 +5875,7 @@ impl CompiledModel {
     /// vestigial `analytical_ad_unsupported`).
     #[cfg(feature = "survival")]
     pub fn has_tte(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Tte { .. }))
+        self.endpoints.values().any(|e| matches!(e, EndpointLikelihood::Tte { .. }))
     }
 
     /// CMTs routed to a `Tte` endpoint, sorted ascending. Keeps the
@@ -6078,13 +5902,7 @@ impl CompiledModel {
     #[cfg(feature = "survival")]
     pub fn has_rtte(&self) -> bool {
         self.endpoints.values().any(|e| {
-            matches!(
-                e,
-                EndpointLikelihood::Tte {
-                    recurrence: TteRecurrence::Repeated { .. },
-                    ..
-                }
-            )
+            matches!(e, EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
         })
     }
 
@@ -6092,9 +5910,7 @@ impl CompiledModel {
     /// endpoint — Phase 4 categorical, Track C (#760).
     #[cfg(feature = "survival")]
     pub fn has_binary(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
+        self.endpoints.values().any(|e| matches!(e, EndpointLikelihood::Binary { .. }))
     }
 
     /// CMTs routed to a `Binary` endpoint, sorted ascending. The datareader routes
@@ -6114,9 +5930,7 @@ impl CompiledModel {
     /// negative-binomial) endpoint (#2877).
     #[cfg(feature = "survival")]
     pub fn has_count(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Count { .. }))
+        self.endpoints.values().any(|e| matches!(e, EndpointLikelihood::Count { .. }))
     }
 
     /// CMTs routed to a `Count` endpoint, ascending (`endpoints` is a `BTreeMap`). The
@@ -6133,18 +5947,14 @@ impl CompiledModel {
     /// (continuous-time Markov) endpoint — Phase 5, Track D (#759).
     #[cfg(feature = "markov")]
     pub fn has_ctmm(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Ctmm { .. }))
+        self.endpoints.values().any(|e| matches!(e, EndpointLikelihood::Ctmm { .. }))
     }
 
     /// True if any endpoint is a [`Dtmm`](EndpointLikelihood::Dtmm) (discrete-time Markov)
     /// endpoint — Phase 4b (#2473).
     #[cfg(feature = "markov")]
     pub fn has_dtmm(&self) -> bool {
-        self.endpoints
-            .values()
-            .any(|e| matches!(e, EndpointLikelihood::Dtmm { .. }))
+        self.endpoints.values().any(|e| matches!(e, EndpointLikelihood::Dtmm { .. }))
     }
 
     /// CMTs routed to a `Dtmm` endpoint, sorted ascending. Like [`Self::ctmm_cmts`], these
@@ -6285,11 +6095,7 @@ impl CompiledModel {
     /// exists to remove. Every in-tree caller derives the class from a fit, where it
     /// cannot be out of range.
     pub fn indiv_param_values(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-        time: f64,
+        &self, theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64,
         mixture_class: Option<usize>,
     ) -> Vec<f64> {
         let n_classes = self.mixture.as_ref().map_or(1, |m| m.n_classes);
@@ -6359,11 +6165,7 @@ impl CompiledModel {
     /// If `mixture_class` is out of range; see
     /// [`indiv_param_values`](Self::indiv_param_values).
     pub fn indiv_param_value_map(
-        &self,
-        theta: &[f64],
-        eta: &[f64],
-        covariates: &HashMap<String, f64>,
-        time: f64,
+        &self, theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64,
         mixture_class: Option<usize>,
     ) -> HashMap<String, f64> {
         let values = self.indiv_param_values(theta, eta, covariates, time, mixture_class);
@@ -6430,9 +6232,7 @@ impl CompiledModel {
                 // the #1899 failure mode again, so it fails the test suite loudly
                 // and only release builds fall back to dropping the row.
                 debug_assert!(
-                    prog.pk_var_slots()
-                        .iter()
-                        .all(|&(_, i)| i < self.indiv_param_names.len()),
+                    prog.pk_var_slots().iter().all(|&(_, i)| i < self.indiv_param_names.len()),
                     "pk_var_slots must point at top-level names: {:?} vs {} names",
                     prog.pk_var_slots(),
                     self.indiv_param_names.len()
@@ -6443,13 +6243,9 @@ impl CompiledModel {
                     .filter(|&(_, i)| i < self.indiv_param_names.len())
                     .collect()
             }
-            None => self
-                .pk_indices
-                .iter()
-                .copied()
-                .enumerate()
-                .map(|(i, slot)| (slot, i))
-                .collect(),
+            None => {
+                self.pk_indices.iter().copied().enumerate().map(|(i, slot)| (slot, i)).collect()
+            }
         }
     }
 
@@ -6461,10 +6257,7 @@ impl CompiledModel {
     /// that scan returns the first *declared* name whose entry equals the slot, so an
     /// unbound intermediate declared above `CL` answers for `PK_IDX_CL` (#1899).
     pub(crate) fn indiv_param_for_pk_slot(&self, pk_slot: usize) -> Option<usize> {
-        self.pk_slot_rows()
-            .into_iter()
-            .find(|&(slot, _)| slot == pk_slot)
-            .map(|(_, i)| i)
+        self.pk_slot_rows().into_iter().find(|&(slot, _)| slot == pk_slot).map(|(_, i)| i)
     }
 
     /// Returns true when the model routes a compartment lag time to
@@ -6520,10 +6313,7 @@ impl CompiledModel {
     /// route and the model stays on the lag-free paths.
     pub(crate) fn has_dose_lag(&self) -> bool {
         self.has_lagtime()
-            || self
-                .ode_spec
-                .as_ref()
-                .is_some_and(|o| o.dose_attr_map.has_lowered_route_lag())
+            || self.ode_spec.as_ref().is_some_and(|o| o.dose_attr_map.has_lowered_route_lag())
     }
 
     /// Routes 1 and 3 of [`Self::has_lagtime`]: the bare lag slot is written,
@@ -6531,10 +6321,7 @@ impl CompiledModel {
     /// line (`const_pk_slots`).
     fn routes_lag_slot(&self) -> bool {
         self.pk_indices.contains(&PK_IDX_LAGTIME)
-            || self
-                .indiv_param_partials
-                .const_pk_slots()
-                .contains(&PK_IDX_LAGTIME)
+            || self.indiv_param_partials.const_pk_slots().contains(&PK_IDX_LAGTIME)
     }
 
     /// Route 2 of [`Self::has_lagtime`] / [`Self::has_bioavailability`]: an ODE
@@ -6606,8 +6393,7 @@ impl CompiledModel {
     /// its θ carries (#1081). What every dense-`R` builder is handed when it
     /// scores those parameters.
     pub(crate) fn residual_cov_at<'a>(
-        &'a self,
-        params: &'a ModelParameters,
+        &'a self, params: &'a ModelParameters,
     ) -> crate::stats::residual_error::ResidualCov<'a> {
         self.residual_cov_with(&params.residual_correlations, &params.theta)
     }
@@ -6618,16 +6404,13 @@ impl CompiledModel {
     /// a θ, so it is read from `theta` like any other θ: there is no declared `ρ`
     /// to fall back on, and no form of this function that omits `theta` (#1081).
     pub(crate) fn residual_cov_theta<'a>(
-        &'a self,
-        theta: &[f64],
+        &'a self, theta: &[f64],
     ) -> crate::stats::residual_error::ResidualCov<'a> {
         self.residual_cov_with(&self.residual_correlations, theta)
     }
 
     pub(crate) fn residual_cov_with<'a>(
-        &'a self,
-        pairs: &'a [ResidualCorrelation],
-        theta: &[f64],
+        &'a self, pairs: &'a [ResidualCorrelation], theta: &[f64],
     ) -> crate::stats::residual_error::ResidualCov<'a> {
         let serial = self.residual_serial.as_ref().map(|s| {
             crate::stats::residual_error::SerialCov {
@@ -6666,11 +6449,7 @@ impl CompiledModel {
     /// observation (from [`RuvMagnitude::eval_obs`]); a `None` falls back to the
     /// plain [`residual_variance_at`](Self::residual_variance_at).
     pub fn residual_variance_at_scaled(
-        &self,
-        cmt: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        mult: Option<&[f64]>,
+        &self, cmt: usize, f_pred: f64, sigma: &[f64], mult: Option<&[f64]>,
     ) -> f64 {
         match mult {
             Some(m) => self.error_spec.variance_at_scaled(
@@ -6818,9 +6597,7 @@ impl CompiledModel {
     /// gradient that chains through the prediction alone is still exact.
     #[inline]
     pub fn has_theta_dependent_ruv_magnitude(&self) -> bool {
-        self.ruv_magnitude
-            .as_ref()
-            .is_some_and(|m| m.is_active() && m.theta_dependent)
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active() && m.theta_dependent)
     }
 
     /// Whether the `[error_model]` is a `power(...)` form (#1182): a
@@ -6830,9 +6607,7 @@ impl CompiledModel {
     /// `stats/residual_error.rs`; an exponent that names a θ is a θ-dependent
     /// magnitude ([`Self::has_theta_dependent_ruv_magnitude`]) like any other.
     pub fn has_ruv_exponent(&self) -> bool {
-        self.ruv_magnitude
-            .as_ref()
-            .is_some_and(|m| m.has_exponent())
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.has_exponent())
     }
 
     /// Multiplicative factor applied to the residual *variance* for a subject
@@ -6887,14 +6662,8 @@ impl CompiledModel {
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn sim_residual_variance(
-        &self,
-        subject: &Subject,
-        j: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        correlations: &[ResidualCorrelation],
-        ruv_scale: f64,
-        mult: Option<&[f64]>,
+        &self, subject: &Subject, j: usize, f_pred: f64, sigma: &[f64],
+        correlations: &[ResidualCorrelation], ruv_scale: f64, mult: Option<&[f64]>,
     ) -> f64 {
         if let Some(ref fc) = self.frem_config {
             if subject.fremtype.get(j).copied().unwrap_or(0) > 0 {
@@ -6920,21 +6689,12 @@ impl CompiledModel {
     /// form at a row of ones is *not* (it associates the product differently), so a
     /// model without a magnitude must pass `None`.
     pub(crate) fn residual_variance_for_key(
-        &self,
-        key: usize,
-        f_pred: f64,
-        sigma: &[f64],
-        correlations: &[ResidualCorrelation],
-        ruv_scale: f64,
-        mult: Option<&[f64]>,
+        &self, key: usize, f_pred: f64, sigma: &[f64], correlations: &[ResidualCorrelation],
+        ruv_scale: f64, mult: Option<&[f64]>,
     ) -> f64 {
         let v = match mult {
-            Some(m) => self
-                .error_spec
-                .variance_at_scaled(key, f_pred, sigma, correlations, m),
-            None => self
-                .error_spec
-                .variance_at_with_correlations(key, f_pred, sigma, correlations),
+            Some(m) => self.error_spec.variance_at_scaled(key, f_pred, sigma, correlations, m),
+            None => self.error_spec.variance_at_with_correlations(key, f_pred, sigma, correlations),
         };
         v * ruv_scale
     }
@@ -7095,9 +6855,7 @@ fn nan_f64() -> f64 {
 /// its `NPDE` column) read.
 #[cfg(feature = "survival")]
 pub(crate) fn any_tte_npde(subjects: &[SubjectResult]) -> bool {
-    subjects
-        .iter()
-        .any(|s| s.tte_rows.iter().any(|r| r.npde.is_finite()))
+    subjects.iter().any(|s| s.tte_rows.iter().any(|r| r.npde.is_finite()))
 }
 
 /// Per-subject estimation results
@@ -7244,11 +7002,7 @@ pub enum DerivedKind {
     PerRow { eval: DerivedEvalFn },
     /// Reduction over observation rows (max/min/tmax), optionally filtered.
     /// The scalar is repeated for all rows of the subject.
-    Aggregate {
-        func: AggFunction,
-        value: DerivedEvalFn,
-        filter: Option<DerivedFilterFn>,
-    },
+    Aggregate { func: AggFunction, value: DerivedEvalFn, filter: Option<DerivedFilterFn> },
     /// Numeric integration over a time window.
     Integral {
         integrand: DerivedEvalFn,
@@ -8015,10 +7769,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // `flip-flop regime` arm claimed it during development. An explicit `W_` token beats
         // a prose match, so it is tested before any of them rather than just before the one
         // that happened to collide.
-        (
-            WarningSeverity::Warning,
-            WarningCode::AbsorptionTwinDeclined,
-        )
+        (WarningSeverity::Warning, WarningCode::AbsorptionTwinDeclined)
     } else if lower.starts_with("w_tte_solve_failed") {
         // #2087: a simulated subject's ODE-accumulated event-time solve failed and the
         // subject was censored. Ahead of every prose arm for the reason the arm above gives:
@@ -8039,18 +7790,12 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // #2104: a non-positive or non-finite CL / V at the final estimates. A token arm ahead
         // of the generic "degenerate" → optimizer-health prose arm, which its wording would
         // otherwise match.
-        (
-            WarningSeverity::Warning,
-            WarningCode::DegenerateClearanceOrVolume,
-        )
+        (WarningSeverity::Warning, WarningCode::DegenerateClearanceOrVolume)
     } else if lower.contains("w_uncertainty_draws_skipped") {
         // #1485: skipped uncertainty draws, one warning per run. A token arm ahead of the
         // prose ones because the message says "flip-flop regime" — the `FlipFlop` arm below
         // would otherwise claim it and lose the count's own category.
-        (
-            WarningSeverity::Warning,
-            WarningCode::UncertaintyDrawsSkipped,
-        )
+        (WarningSeverity::Warning, WarningCode::UncertaintyDrawsSkipped)
     } else if lower.contains("w_simulated_flip_flop") {
         // #1823: simulated individuals whose drawn η crossed into a twin-less transit / IG
         // closed form's flip-flop regime, so their dose-driven contribution came back
@@ -8390,15 +8135,9 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // survives into the flat message a re-classified (e.g.
         // multi-start-spliced) warning carries.
         if lower.contains("guard, runaway") {
-            (
-                WarningSeverity::Critical,
-                WarningCode::ParameterAtRunawayGuard,
-            )
+            (WarningSeverity::Critical, WarningCode::ParameterAtRunawayGuard)
         } else {
-            (
-                WarningSeverity::Warning,
-                WarningCode::ParameterAtRunawayGuard,
-            )
+            (WarningSeverity::Warning, WarningCode::ParameterAtRunawayGuard)
         }
     } else if lower.contains("optimizer bound")
         || lower.starts_with("profiled level(s) on a declared bound")
@@ -8493,13 +8232,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         (WarningSeverity::Warning, WarningCode::General)
     };
 
-    WarningEntry {
-        severity,
-        category,
-        message: msg,
-        source_method,
-        details: None,
-    }
+    WarningEntry { severity, category, message: msg, source_method, details: None }
 }
 
 /// The κ̂ of one level of a model with nested levels (#1082 PR4), in
@@ -9071,10 +8804,7 @@ pub struct FitResult {
     /// fitted model on other data — a design for `simulate`, a reloaded
     /// `.fitrx` — needs exactly these, not ones re-resolved from that data.
     /// Empty for a model with no data-derived binding; omitted from JSON when empty.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::parser::model_parser::DataBindings::is_empty"
-    )]
+    #[serde(default, skip_serializing_if = "crate::parser::model_parser::DataBindings::is_empty")]
     pub data_bindings: crate::parser::model_parser::DataBindings,
     /// Per-theta transformation (Identity / Log / Logit), parallel to `theta`.
     /// Tells the R layer whether a theta must be back-transformed before display.
@@ -9589,10 +9319,7 @@ impl FitResult {
     pub fn to_json_value(&self) -> serde_json::Value {
         let mut v = serde_json::to_value(self).expect("FitResult is serializable");
         if let serde_json::Value::Object(map) = &mut v {
-            map.insert(
-                "schema_version".to_string(),
-                serde_json::json!(Self::JSON_SCHEMA_VERSION),
-            );
+            map.insert("schema_version".to_string(), serde_json::json!(Self::JSON_SCHEMA_VERSION));
             // #2799: the derived usability verdict, as `schema_version` is derived: there is no
             // stored field, so a reader gets it from the same facts the result carries.
             map.insert(
@@ -9603,10 +9330,7 @@ impl FitResult {
             // `estimates.theta.CL.estimate` is the YAML's `theta.CL.estimate` — so a reader
             // of final estimates does not branch on which file it was handed. Derived, like
             // `status`: `from_json_str` ignores it and reads the vectors above.
-            map.insert(
-                "estimates".to_string(),
-                crate::io::output::estimates_json(self),
-            );
+            map.insert("estimates".to_string(), crate::io::output::estimates_json(self));
         }
         v
     }
@@ -9970,10 +9694,7 @@ pub struct FitOptions {
     /// Read by nothing. It was never a `[fit_options]` key, and no optimizer takes its
     /// L-BFGS history length from it. The field goes at the next minor release, with
     /// `gn_lambda` (#1841).
-    #[deprecated(
-        since = "0.4.1",
-        note = "never read; removed at the next minor release (#1841)"
-    )]
+    #[deprecated(since = "0.4.1", note = "never read; removed at the next minor release (#1841)")]
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -10913,9 +10634,7 @@ pub(crate) struct BloqOverrideGuard {
 
 /// See [`BloqOverrideGuard`]. `None` arms `None`, so a nested call reads its own model.
 pub(crate) fn arm_bloq_override(bloq: Option<BloqMethod>) -> BloqOverrideGuard {
-    BloqOverrideGuard {
-        prev: LOCAL_BLOQ_OVERRIDE.replace(bloq),
-    }
+    BloqOverrideGuard { prev: LOCAL_BLOQ_OVERRIDE.replace(bloq) }
 }
 
 impl Drop for BloqOverrideGuard {
@@ -11172,9 +10891,7 @@ impl Optimizer {
     /// [`Optimizer::resolve_auto`] with the analytic predicate supplied by the caller, so the
     /// `gradient = fd` coupling warning (#1381) can ask the counterfactual off this one rule.
     pub(crate) fn resolve_auto_given_analytic(
-        self,
-        model: &CompiledModel,
-        analytic_outer_gradient: bool,
+        self, model: &CompiledModel, analytic_outer_gradient: bool,
     ) -> Optimizer {
         if self != Optimizer::Auto {
             return self;
@@ -11623,11 +11340,7 @@ impl FitOptions {
         let chain_label: String = if chain.len() == 1 {
             chain[0].label().to_string()
         } else {
-            chain
-                .iter()
-                .map(|m| m.label())
-                .collect::<Vec<_>>()
-                .join(" → ")
+            chain.iter().map(|m| m.label()).collect::<Vec<_>>().join(" → ")
         };
         let available: Vec<&'static str> = method_only.iter().copied().collect();
 
@@ -11736,8 +11449,7 @@ impl FitOptions {
     /// The `ode_*` keys are method-agnostic but model-conditional: a silent no-op on a model
     /// that does not integrate (#517, #518).
     pub(crate) fn unsupported_keys_warnings_with_model(
-        &self,
-        model: &CompiledModel,
+        &self, model: &CompiledModel,
     ) -> Vec<String> {
         let mut warnings = self.unsupported_keys_warnings();
         if model.honors_ode_solver_opts() {
@@ -11790,10 +11502,7 @@ pub(crate) fn deprecated_keys() -> &'static [(&'static str, &'static str)] {
 
 /// The [`deprecated_keys`] notice for `key`, if it is deprecated.
 fn deprecated_key_notice(key: &str) -> Option<&'static str> {
-    deprecated_keys()
-        .iter()
-        .find(|(k, _)| *k == key)
-        .map(|(_, notice)| *notice)
+    deprecated_keys().iter().find(|(k, _)| *k == key).map(|(_, notice)| *notice)
 }
 
 /// The `ode_*` subset of [`framework_keys`]: knobs that only ever reach the ODE

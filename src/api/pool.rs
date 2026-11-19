@@ -29,10 +29,7 @@ const DEFAULT_THREADS_CAP: usize = 8;
 /// left a single worker, every fit serial (measured equal to one core on a 2-core
 /// affinity, #2706 follow-up), so the free core bought nothing but half the throughput.
 pub(crate) fn cap_default_threads(available: usize) -> usize {
-    available
-        .saturating_sub(1)
-        .max(available.min(2))
-        .clamp(1, DEFAULT_THREADS_CAP)
+    available.saturating_sub(1).max(available.min(2)).clamp(1, DEFAULT_THREADS_CAP)
 }
 
 /// Default worker-thread count used when nothing pins an explicit count (`threads` unset
@@ -45,9 +42,7 @@ pub(crate) fn default_thread_count() -> usize {
 /// `std::thread::available_parallelism()`, `1` when it cannot be read. Respects cgroup
 /// quotas and affinity masks, so it is the host's usable width inside a container too.
 pub(crate) fn available_cpus() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 /// The process-wide worker count a caller explicitly asked for (currently: the CLI's
@@ -135,10 +130,7 @@ pub(crate) fn reconfiguration_result(already: usize, requested: usize) -> Result
 pub(crate) fn default_fit_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
-        fit_thread_pool_builder()
-            .num_threads(effective_default_threads())
-            .build()
-            .ok()
+        fit_thread_pool_builder().num_threads(effective_default_threads()).build().ok()
     })
     .as_ref()
 }
@@ -286,10 +278,7 @@ impl Drop for ForcedDeclineGuard {
 
 impl From<crate::ode::solver::OdeSolverOverride> for FitScope {
     fn from(ode: crate::ode::solver::OdeSolverOverride) -> Self {
-        Self {
-            ode,
-            ..Default::default()
-        }
+        Self { ode, ..Default::default() }
     }
 }
 
@@ -327,15 +316,13 @@ fn shared_override_pool_cache() -> &'static SharedPoolCache {
 /// all keys while retaining one most-recent oversized pool.
 /// Acquisition never waits for a busy pool, including inside nested fits.
 pub(crate) fn fit_scope_pool(
-    scope: FitScope,
-    n_threads: usize,
+    scope: FitScope, n_threads: usize,
 ) -> Result<FitPoolLease<'static>, String> {
     fit_pool_cache().acquire(n_threads, scope)
 }
 
 fn shared_fit_scope_pool(
-    scope: FitScope,
-    n_threads: usize,
+    scope: FitScope, n_threads: usize,
 ) -> Result<std::sync::Arc<rayon::ThreadPool>, String> {
     shared_override_pool_cache().acquire(n_threads, scope)
 }
@@ -356,8 +343,7 @@ fn shared_fit_scope_pool(
 /// Refuses ODE solver settings no solver can run with as `E_ODE_SOLVER_OPTIONS` (#2044),
 /// before any pool is leased. A pool that cannot be built is a runtime failure, uncoded.
 pub(crate) fn with_fit_scope<R: Send>(
-    options: &FitOptions,
-    f: impl FnOnce() -> R + Send,
+    options: &FitOptions, f: impl FnOnce() -> R + Send,
 ) -> Result<R, crate::diagnostics::EngineError> {
     with_scope(FitScope::of(options), options.threads, f)
 }
@@ -367,29 +353,18 @@ pub(crate) fn with_fit_scope<R: Send>(
 /// incumbent at a tighter integrator tolerance than the fit's own (#2001); `ode` is the whole
 /// override, not a merge onto the fit's.
 pub(crate) fn with_fit_scope_ode<R: Send>(
-    options: &FitOptions,
-    ode: crate::ode::solver::OdeSolverOverride,
-    f: impl FnOnce() -> R + Send,
+    options: &FitOptions, ode: crate::ode::solver::OdeSolverOverride, f: impl FnOnce() -> R + Send,
 ) -> Result<R, crate::diagnostics::EngineError> {
-    let scope = FitScope {
-        ode,
-        ..FitScope::of(options)
-    };
+    let scope = FitScope { ode, ..FitScope::of(options) };
     with_scope(scope, options.threads, f)
 }
 
 fn with_scope<R: Send>(
-    scope: FitScope,
-    threads: Option<usize>,
-    f: impl FnOnce() -> R + Send,
+    scope: FitScope, threads: Option<usize>, f: impl FnOnce() -> R + Send,
 ) -> Result<R, crate::diagnostics::EngineError> {
     use crate::diagnostics::EngineError;
-    scope
-        .validate()
-        .map_err(super::entry_refusals::ode_solver_options)?;
-    let requested_threads = threads
-        .filter(|&n| n > 0)
-        .unwrap_or_else(effective_default_threads);
+    scope.validate().map_err(super::entry_refusals::ode_solver_options)?;
+    let requested_threads = threads.filter(|&n| n > 0).unwrap_or_else(effective_default_threads);
     // `current_num_threads()` is only meaningful — and only safe to call — on a worker:
     // off one it reports (and *initializes*) Rayon's global pool, at one worker per logical
     // CPU, which is the pool this engine never wants to own (#1460).
@@ -400,19 +375,13 @@ fn with_scope<R: Send>(
         // covariance step's per-subject passes). On a worker that also carries nothing, stay
         // there, keeping an enclosing tool's budget as `install_on_pool_sized` does; anywhere
         // else, a ferx pool of the width the caller asked for.
-        return Ok(if carried {
-            f()
-        } else {
-            install_on_ferx_pool_sized(requested_threads, f)
-        });
+        return Ok(if carried { f() } else { install_on_ferx_pool_sized(requested_threads, f) });
     }
     if carried && rayon::current_num_threads() == requested_threads {
         return Ok(f());
     }
     match threads.filter(|&n| n > 0) {
-        Some(n) => Ok(fit_scope_pool(scope, n)
-            .map_err(EngineError::uncoded)?
-            .install(f)),
+        Some(n) => Ok(fit_scope_pool(scope, n).map_err(EngineError::uncoded)?.install(f)),
         None => Ok(shared_fit_scope_pool(scope, requested_threads)
             .map_err(EngineError::uncoded)?
             .install(f)),
@@ -470,28 +439,21 @@ fn install_on_ferx_pool_sized<R: Send>(n_threads: usize, f: impl FnOnce() -> R +
 /// failed. One pool serves both levels of a multi-start fan-out, which is why this is called
 /// once per `fit()` and not per start.
 pub(crate) fn install_on_fit_pool<R: Send>(
-    options: &FitOptions,
-    f: impl FnOnce() -> R + Send,
+    options: &FitOptions, f: impl FnOnce() -> R + Send,
 ) -> Result<R, crate::diagnostics::EngineError> {
     use crate::diagnostics::EngineError;
     let scope = FitScope::of(options);
     // ODE solver settings no solver can run with are `E_ODE_SOLVER_OPTIONS`, as in
     // `with_fit_scope` (#2044), so `fit()` carries the code too (#2062 review 2, F2).
-    scope
-        .validate()
-        .map_err(super::entry_refusals::ode_solver_options)?;
+    scope.validate().map_err(super::entry_refusals::ode_solver_options)?;
     let f = scope.armed(f);
     let resolved = fit_thread_resolution(options.threads);
     let pinned = resolved.source == ThreadSource::Pinned;
     if !scope.is_empty() {
         return if pinned {
-            Ok(fit_scope_pool(scope, resolved.n)
-                .map_err(EngineError::uncoded)?
-                .install(f))
+            Ok(fit_scope_pool(scope, resolved.n).map_err(EngineError::uncoded)?.install(f))
         } else {
-            Ok(shared_fit_scope_pool(scope, resolved.n)
-                .map_err(EngineError::uncoded)?
-                .install(f))
+            Ok(shared_fit_scope_pool(scope, resolved.n).map_err(EngineError::uncoded)?.install(f))
         };
     }
     if pinned {
@@ -549,17 +511,10 @@ pub(crate) fn fit_thread_resolution(threads: Option<usize>) -> DefaultThreads {
 /// `pinned = Some(0)` is "the engine default" — the CLI's `--threads auto` and R's
 /// `threads = 0` — so it falls through to 2–4 and the environment applies to it.
 pub(crate) fn resolve_fit_threads(
-    pinned: Option<usize>,
-    explicit: usize,
-    env: Option<&str>,
-    available: usize,
+    pinned: Option<usize>, explicit: usize, env: Option<&str>, available: usize,
 ) -> DefaultThreads {
     match pinned.filter(|&n| n > 0) {
-        Some(n) => DefaultThreads {
-            n,
-            source: ThreadSource::Pinned,
-            env_ignored: None,
-        },
+        Some(n) => DefaultThreads { n, source: ThreadSource::Pinned, env_ignored: None },
         None => resolve_default_threads(explicit, env, available),
     }
 }
@@ -574,8 +529,7 @@ pub(crate) const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 /// disagreement #1115 forbids. Rayon reads it once for its global pool for the same reason.
 fn rayon_num_threads_env() -> Option<&'static str> {
     static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    RAW.get_or_init(|| std::env::var(RAYON_NUM_THREADS_ENV).ok())
-        .as_deref()
+    RAW.get_or_init(|| std::env::var(RAYON_NUM_THREADS_ENV).ok()).as_deref()
 }
 
 /// Who chose the worker count of a fit (#2800). Reported in the fit's thread warnings so a
@@ -634,9 +588,7 @@ pub(crate) struct DefaultThreads {
 /// (#1460). It also silently builds Rayon's global pool when called off-worker, so an
 /// engine that never wants one must not ask.
 pub(crate) fn resolve_default_threads(
-    explicit: usize,
-    env: Option<&str>,
-    available: usize,
+    explicit: usize, env: Option<&str>, available: usize,
 ) -> DefaultThreads {
     let auto = |env_ignored| DefaultThreads {
         n: cap_default_threads(available),
@@ -644,21 +596,13 @@ pub(crate) fn resolve_default_threads(
         env_ignored,
     };
     if explicit > 0 {
-        return DefaultThreads {
-            n: explicit,
-            source: ThreadSource::Declared,
-            env_ignored: None,
-        };
+        return DefaultThreads { n: explicit, source: ThreadSource::Declared, env_ignored: None };
     }
     match env {
         None | Some("") => auto(None),
         Some(raw) => match raw.parse::<usize>() {
             Ok(0) => auto(None),
-            Ok(n) => DefaultThreads {
-                n,
-                source: ThreadSource::Env,
-                env_ignored: None,
-            },
+            Ok(n) => DefaultThreads { n, source: ThreadSource::Env, env_ignored: None },
             Err(_) => auto(Some(raw.to_string())),
         },
     }
@@ -669,10 +613,7 @@ pub(crate) fn resolve_default_threads(
 /// source, which ignored env value — is the code [`fit_thread_warnings_with`] tests, not a
 /// copy of it in `fit.rs` (#2813 review row 1).
 pub(crate) fn fit_thread_warnings(
-    threads: Option<usize>,
-    n_used: usize,
-    n_subjects: usize,
-    saem: bool,
+    threads: Option<usize>, n_used: usize, n_subjects: usize, saem: bool,
 ) -> Vec<String> {
     fit_thread_warnings_with(
         threads,
@@ -687,23 +628,11 @@ pub(crate) fn fit_thread_warnings(
 
 /// [`fit_thread_warnings`] with every process-global input injected.
 pub(crate) fn fit_thread_warnings_with(
-    threads: Option<usize>,
-    explicit: usize,
-    env: Option<&str>,
-    available: usize,
-    n_used: usize,
-    n_subjects: usize,
-    saem: bool,
+    threads: Option<usize>, explicit: usize, env: Option<&str>, available: usize, n_used: usize,
+    n_subjects: usize, saem: bool,
 ) -> Vec<String> {
     let r = resolve_fit_threads(threads, explicit, env, available);
-    thread_warnings(
-        n_used,
-        r.source,
-        r.env_ignored.as_deref(),
-        available,
-        n_subjects,
-        saem,
-    )
+    thread_warnings(n_used, r.source, r.env_ignored.as_deref(), available, n_subjects, saem)
 }
 
 /// The thread warnings a fit reports after its chain (#2800, #1811), as a pure function
@@ -714,12 +643,8 @@ pub(crate) fn fit_thread_warnings_with(
 /// back to the ambient pool). `env_ignored` is consulted only for an unpinned fit, the one
 /// case in which the variable was read at all.
 pub(crate) fn thread_warnings(
-    n_used: usize,
-    source: ThreadSource,
-    env_ignored: Option<&str>,
-    available: usize,
-    n_subjects: usize,
-    saem: bool,
+    n_used: usize, source: ThreadSource, env_ignored: Option<&str>, available: usize,
+    n_subjects: usize, saem: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(raw) = env_ignored {
@@ -842,10 +767,7 @@ impl PoolPlan {
     /// since `0` would mean "Rayon picks" — the ambiguity this type exists to
     /// remove.
     pub fn new(replicates: usize, threads_per_fit: usize) -> Self {
-        Self {
-            replicates: replicates.max(1),
-            threads_per_fit: threads_per_fit.max(1),
-        }
+        Self { replicates: replicates.max(1), threads_per_fit: threads_per_fit.max(1) }
     }
 
     /// Split `total_threads` across `n_units` fits, spending the budget on the
@@ -868,11 +790,7 @@ impl PoolPlan {
     /// where two cores exist, capped at 8.
     /// `n_units = 0` yields a single-replicate plan.
     pub fn from_budget(total_threads: usize, n_units: usize) -> Self {
-        let total = if total_threads == 0 {
-            effective_default_threads()
-        } else {
-            total_threads
-        };
+        let total = if total_threads == 0 { effective_default_threads() } else { total_threads };
         let replicates = total.min(n_units).max(1);
         Self::new(replicates, total / replicates)
     }
@@ -946,9 +864,7 @@ impl PoolPlan {
         OP: FnOnce() -> R + Send,
         R: Send,
     {
-        Ok(fit_pool_cache()
-            .acquire(self.replicates, Default::default())?
-            .install(op))
+        Ok(fit_pool_cache().acquire(self.replicates, Default::default())?.install(op))
     }
 }
 

@@ -30,10 +30,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     // ── Minimal CompiledModel: 1-cpt IV bolus, CL scaled by per-event WT ──
     let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["ETA_CL".into()]);
     let default_params = ModelParameters {
-        sigma: SigmaVector {
-            values: vec![0.1],
-            names: vec!["PROP_ERR".into()],
-        },
+        sigma: SigmaVector { values: vec![0.1], names: vec!["PROP_ERR".into()] },
         ..crate::types::test_helpers::bare_params(omega)
     };
     let model = CompiledModel {
@@ -43,15 +40,13 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         // `obs_covariates` / `dose_covariates`. With WT changing per obs
         // the TV path produces a profile that the (broken) no-TV path
         // can't match.
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                let wt = cov.get("WT").copied().unwrap_or(70.0);
-                p.values[0] = theta[0] * eta[0].exp() * (wt / 70.0);
-                p.values[1] = theta[1];
-                p
-            },
-        ),
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], cov: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            let wt = cov.get("WT").copied().unwrap_or(70.0);
+            p.values[0] = theta[0] * eta[0].exp() * (wt / 70.0);
+            p.values[1] = theta[1];
+            p
+        }),
         referenced_covariates: vec!["WT".into()],
         ..crate::types::test_helpers::bare_model(default_params.clone())
     };
@@ -89,10 +84,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
     };
     // Sanity: this subject must be classified TV — that's the regime the
     // bug lived in.
-    assert!(
-        subject.has_tv_covariates(),
-        "test setup wrong: subject must have TV covariates"
-    );
+    assert!(subject.has_tv_covariates(), "test setup wrong: subject must have TV covariates");
 
     let population = Population {
         subjects: vec![subject.clone()],
@@ -127,18 +119,9 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         &subject.covariates,
         0.0,
     );
-    let ipred_no_tv = model_preds(
-        &model,
-        &subject,
-        &pk_no_tv,
-        &default_params.theta,
-        eta_hats[0].as_slice(),
-    );
-    let gap: f64 = ipred_reference
-        .iter()
-        .zip(ipred_no_tv.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
+    let ipred_no_tv =
+        model_preds(&model, &subject, &pk_no_tv, &default_params.theta, eta_hats[0].as_slice());
+    let gap: f64 = ipred_reference.iter().zip(ipred_no_tv.iter()).map(|(a, b)| (a - b).abs()).sum();
     assert!(
         gap > 1e-3,
         "test setup wrong: TV and no-TV IPRED paths must differ noticeably \
@@ -183,18 +166,10 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         crate::pk::compute_predictions_with_tv(&model, &subject, &default_params.theta, &zero_eta);
     let pk_pred_no_tv =
         (model.pk_param_fn)(&default_params.theta, &zero_eta, &subject.covariates, 0.0);
-    let pred_no_tv = model_preds(
-        &model,
-        &subject,
-        &pk_pred_no_tv,
-        &default_params.theta,
-        &zero_eta,
-    );
-    let pred_gap: f64 = pred_reference
-        .iter()
-        .zip(pred_no_tv.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
+    let pred_no_tv =
+        model_preds(&model, &subject, &pk_pred_no_tv, &default_params.theta, &zero_eta);
+    let pred_gap: f64 =
+        pred_reference.iter().zip(pred_no_tv.iter()).map(|(a, b)| (a - b).abs()).sum();
     assert!(
         pred_gap > 1e-3,
         "test setup wrong: TV and no-TV PRED paths must differ noticeably; \
@@ -300,10 +275,7 @@ fn test_sdtab_iwres_uses_block_sigma_correlation() {
 fn test_simulate_honours_tv_covariates() {
     let default_params = ModelParameters {
         omega_fixed: Vec::new(),
-        sigma: SigmaVector {
-            values: vec![0.0],
-            names: vec!["PROP_ERR".into()],
-        },
+        sigma: SigmaVector { values: vec![0.0], names: vec!["PROP_ERR".into()] },
         ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(&[], vec![]))
     };
     let model = CompiledModel {
@@ -356,11 +328,7 @@ fn test_simulate_honours_tv_covariates() {
         crate::pk::compute_predictions_with_tv(&model, &subject, &default_params.theta, &[]);
     let pk_no_tv = (model.pk_param_fn)(&default_params.theta, &[], &subject.covariates, 0.0);
     let no_tv = model_preds(&model, &subject, &pk_no_tv, &default_params.theta, &[]);
-    let gap: f64 = reference
-        .iter()
-        .zip(no_tv.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
+    let gap: f64 = reference.iter().zip(no_tv.iter()).map(|(a, b)| (a - b).abs()).sum();
     assert!(
         gap > 1e-3,
         "test setup wrong: TV and baseline-only simulation paths must differ; \

@@ -106,24 +106,14 @@ pub enum MarkovError {
         "two distinct states ({from} → {to}) at identical time {time} (index {index}); \
          a state transition needs Δt > 0"
     )]
-    ZeroDtStateChange {
-        index: usize,
-        time: f64,
-        from: usize,
-        to: usize,
-    },
+    ZeroDtStateChange { index: usize, time: f64, from: usize, to: usize },
 
     /// A generator *derivative* `∂Q/∂p` passed to [`ctmm_data_term_grad`] does not match
     /// the generator's shape. Checked at runtime, not just in debug: the gradient
     /// contracts `⟨G, ∂Q/∂p⟩` with a zipped iterator, which on a short `∂Q/∂p` would
     /// silently *truncate* and return a confidently wrong gradient.
     #[error("∂Q/∂p at axis {axis} is {rows}×{cols}, but the generator is {n_states}×{n_states}")]
-    DerivativeShapeMismatch {
-        axis: usize,
-        rows: usize,
-        cols: usize,
-        n_states: usize,
-    },
+    DerivativeShapeMismatch { axis: usize, rows: usize, cols: usize, n_states: usize },
 }
 
 /// Transition-probability matrix `P(Δt) = expm(A)` for `A = Q·Δt`.
@@ -164,11 +154,7 @@ pub fn matrix_exp(a: &DMatrix<f64>) -> DMatrix<f64> {
 #[must_use]
 pub fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64> {
     debug_assert!(a.is_square(), "matrix_exp_frechet requires a square A");
-    debug_assert_eq!(
-        a.shape(),
-        e.shape(),
-        "matrix_exp_frechet requires E to match A's shape"
-    );
+    debug_assert_eq!(a.shape(), e.shape(), "matrix_exp_frechet requires E to match A's shape");
     let s = a.nrows();
     // Build the 2S×2S block matrix [[A, E], [0, A]].
     let mut c = DMatrix::<f64>::zeros(2 * s, 2 * s);
@@ -191,14 +177,8 @@ pub fn matrix_exp_frechet(a: &DMatrix<f64>, e: &DMatrix<f64>) -> DMatrix<f64> {
 /// (setup-time programming errors, checked unconditionally: called `O(#rate params)` times).
 #[must_use]
 pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatrix<f64> {
-    assert!(
-        j != k,
-        "a generator rate parameter is off-diagonal; got j == k == {j}"
-    );
-    assert!(
-        j < s && k < s,
-        "rate index ({j},{k}) out of range for {s}-state generator"
-    );
+    assert!(j != k, "a generator rate parameter is off-diagonal; got j == k == {j}");
+    assert!(j < s && k < s, "rate index ({j},{k}) out of range for {s}-state generator");
     let mut e = DMatrix::<f64>::zeros(s, s);
     e[(j, k)] = dt; //  +E_jk·dt
     e[(j, j)] = -dt; //  −E_jj·dt
@@ -210,10 +190,7 @@ pub fn generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> DMatri
 /// (fail loud), not the degenerate sentinel.
 fn validate_generator(q: &DMatrix<f64>) -> Result<usize, MarkovError> {
     if !q.is_square() {
-        return Err(MarkovError::NonSquareGenerator {
-            rows: q.nrows(),
-            cols: q.ncols(),
-        });
+        return Err(MarkovError::NonSquareGenerator { rows: q.nrows(), cols: q.ncols() });
     }
     let s = q.nrows();
     if s < 2 {
@@ -228,16 +205,10 @@ fn validate_generator(q: &DMatrix<f64>) -> Result<usize, MarkovError> {
 fn validate_obs(obs: &[StateObs], s: usize) -> Result<(), MarkovError> {
     for (i, o) in obs.iter().enumerate() {
         if o.state >= s {
-            return Err(MarkovError::StateOutOfRange {
-                state: o.state,
-                n_states: s,
-            });
+            return Err(MarkovError::StateOutOfRange { state: o.state, n_states: s });
         }
         if !o.time.is_finite() {
-            return Err(MarkovError::NonFiniteTime {
-                index: i,
-                time: o.time,
-            });
+            return Err(MarkovError::NonFiniteTime { index: i, time: o.time });
         }
     }
     Ok(())
@@ -281,20 +252,12 @@ enum GapOutcome<T> {
 /// (see [`MAX_EXP_ARG_ABS`]); `Expm::exp`'s own guards (squaring count, a singular Padé
 /// denominator, a non-finite jet) are the degenerate case too.
 fn gap_transition<T: crate::sens::num::PkNum>(
-    q: &[T],
-    s: usize,
-    a: StateObs,
-    b: StateObs,
-    i: usize,
+    q: &[T], s: usize, a: StateObs, b: StateObs, i: usize,
 ) -> Result<GapOutcome<T>, MarkovError> {
     let dt = b.time - a.time;
 
     if dt < 0.0 {
-        return Err(MarkovError::TimeDecreased {
-            index: i + 1,
-            prev: a.time,
-            next: b.time,
-        });
+        return Err(MarkovError::TimeDecreased { index: i + 1, prev: a.time, next: b.time });
     }
     if dt == 0.0 {
         if a.state != b.state {
@@ -313,8 +276,7 @@ fn gap_transition<T: crate::sens::num::PkNum>(
     // Through the branch API (#2786): `|x| < ∞` is finite.
     if arg.iter().any(|x| {
         !x.br_abs_lt(f64::INFINITY)
-            || x.abs()
-                .br_cmp_c(crate::sens::num::BranchCmp::Gt, MAX_EXP_ARG_ABS)
+            || x.abs().br_cmp_c(crate::sens::num::BranchCmp::Gt, MAX_EXP_ARG_ABS)
     }) {
         return Ok(GapOutcome::Degenerate);
     }
@@ -394,9 +356,7 @@ pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s:
 /// generator the value is a flat repellent constant with no meaningful derivative, so the
 /// caller falls back to FD there. Errors mirror [`ctmm_data_term`].
 pub fn ctmm_data_term_grad(
-    q: &DMatrix<f64>,
-    dq: &[DMatrix<f64>],
-    obs: &[StateObs],
+    q: &DMatrix<f64>, dq: &[DMatrix<f64>], obs: &[StateObs],
 ) -> Result<Option<(f64, Vec<f64>)>, MarkovError> {
     let s = validate_generator(q)?;
     // Validated at runtime, not merely debug-asserted: the contraction below zips `G` with
@@ -447,12 +407,7 @@ pub fn ctmm_data_term_grad(
         let g = matrix_exp_frechet(&arg.transpose(), &seed);
         for (ax, dq_a) in dq.iter().enumerate() {
             // ∂P[u,v]/∂p_a = ⟨G, (∂Q/∂p_a)·Δt⟩; the NLL term is −log P.
-            let dp: f64 = g
-                .iter()
-                .zip(dq_a.iter())
-                .map(|(gi, di)| gi * di)
-                .sum::<f64>()
-                * dt;
+            let dp: f64 = g.iter().zip(dq_a.iter()).map(|(gi, di)| gi * di).sum::<f64>() * dt;
             grad[ax] -= dp / p;
         }
     }
@@ -489,9 +444,7 @@ pub fn ctmm_data_term(q: &DMatrix<f64>, obs: &[StateObs]) -> Result<f64, MarkovE
 /// path, a dual one seeded on η gives the endpoint's exact η-Hessian (#2437). `Ok(None)`
 /// where the value path returns [`SUBJECT_SENTINEL_NLL`].
 pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
-    q: &[T],
-    s: usize,
-    obs: &[StateObs],
+    q: &[T], s: usize, obs: &[StateObs],
 ) -> Result<Option<T>, MarkovError> {
     let mut nll = T::from_f64(0.0);
     for (i, pair) in obs.windows(2).enumerate() {
@@ -565,16 +518,10 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
 /// every EBE/FD evaluation is needlessly slow.
 #[must_use]
 pub fn ctmm_inhomogeneous_transition(
-    q_at: impl Fn(f64) -> DMatrix<f64>,
-    dq_at: impl Fn(f64) -> Option<DMatrix<f64>>,
-    delta_t: f64,
+    q_at: impl Fn(f64) -> DMatrix<f64>, dq_at: impl Fn(f64) -> Option<DMatrix<f64>>, delta_t: f64,
     n_states: usize,
 ) -> DMatrix<f64> {
-    let opts = crate::ode::OdeSolverOptions {
-        abstol: 1e-12,
-        reltol: 1e-10,
-        ..Default::default()
-    };
+    let opts = crate::ode::OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..Default::default() };
     ctmm_inhomogeneous_transition_with_opts(q_at, dq_at, delta_t, n_states, &opts)
 }
 
@@ -584,22 +531,15 @@ pub fn ctmm_inhomogeneous_transition(
 /// per-evaluation cost in line with the rest of the ODE machinery.
 #[must_use]
 pub fn ctmm_inhomogeneous_transition_with_opts(
-    q_at: impl Fn(f64) -> DMatrix<f64>,
-    dq_at: impl Fn(f64) -> Option<DMatrix<f64>>,
-    delta_t: f64,
-    n_states: usize,
-    opts: &crate::ode::OdeSolverOptions,
+    q_at: impl Fn(f64) -> DMatrix<f64>, dq_at: impl Fn(f64) -> Option<DMatrix<f64>>, delta_t: f64,
+    n_states: usize, opts: &crate::ode::OdeSolverOptions,
 ) -> DMatrix<f64> {
     let s = n_states;
     if delta_t <= 0.0 || delta_t.is_nan() {
         // P(0) = I; also the guard for a NaN/negative gap (validated upstream).
         return DMatrix::identity(s, s);
     }
-    debug_assert_eq!(
-        q_at(0.0).shape(),
-        (s, s),
-        "q_at must return an n_states×n_states generator"
-    );
+    debug_assert_eq!(q_at(0.0).shape(), (s, s), "q_at must return an n_states×n_states generator");
 
     // Flattened matrix ODE: u ↔ P row-major (u[i*s + j] = P[i, j]).
     // Forward Kolmogorov `dP/dt = P·Q(t)` (right multiplication), so
@@ -664,12 +604,8 @@ pub fn ctmm_inhomogeneous_transition_with_opts(
 /// `f` is linear in `P` — `∂(P·Q)[i, j]/∂P[i', k] = δ_{ii'}·Q[k, j]`, i.e. `J = I ⊗ Qᵀ` — and
 /// `f_t = P·∂Q/∂τ`. `q` and `dq` read `Q` and `∂Q/∂τ` at `(row, col)`.
 pub(crate) fn kolmogorov_jacobian<T: crate::sens::num::PkNum>(
-    u: &[T],
-    q: impl Fn(usize, usize) -> T,
-    dq: impl Fn(usize, usize) -> T,
-    s: usize,
-    jac: &mut [T],
-    ft: &mut [T],
+    u: &[T], q: impl Fn(usize, usize) -> T, dq: impl Fn(usize, usize) -> T, s: usize,
+    jac: &mut [T], ft: &mut [T],
 ) {
     let n = s * s;
     let zero = T::from_f64(0.0);
@@ -713,12 +649,7 @@ mod tests {
         DMatrix::from_row_slice(
             2,
             2,
-            &[
-                (b + a * e) / lam,
-                (a - a * e) / lam,
-                (b - b * e) / lam,
-                (a + b * e) / lam,
-            ],
+            &[(b + a * e) / lam, (a - a * e) / lam, (b - b * e) / lam, (a + b * e) / lam],
         )
     }
 
@@ -811,10 +742,7 @@ mod tests {
         assert_eq!(reference[(1, 0)], 0.0, "no 1→0 transition");
         assert_eq!(reference[(2, 0)], 0.0, "no 2→0 transition");
         assert_eq!(reference[(2, 1)], 0.0, "no 2→1 transition");
-        assert!(
-            (reference[(2, 2)] - 1.0).abs() < 1e-15,
-            "state 2 is absorbing"
-        );
+        assert!((reference[(2, 2)] - 1.0).abs() < 1e-15, "state 2 is absorbing");
 
         // Now the anchor itself: expm agrees with the independent closed form.
         let p = matrix_exp(&(&q * t));
@@ -885,10 +813,7 @@ mod tests {
     fn expm_of_generator_is_stochastic() {
         let p = matrix_exp(&(generator_3() * 1.5));
         for i in 0..3 {
-            assert!(
-                (p.row(i).sum() - 1.0).abs() < 1e-13,
-                "row {i} must sum to 1"
-            );
+            assert!((p.row(i).sum() - 1.0).abs() < 1e-13, "row {i} must sum to 1");
         }
         assert!(p.iter().all(|&x| x >= 0.0), "entries must be non-negative");
         assert!(p.iter().all(|&x| x <= 1.0 + 1e-13), "entries must be ≤ 1");
@@ -935,10 +860,7 @@ mod tests {
     #[test]
     fn frechet_matches_daleckii_krein_exact() {
         let a = DMatrix::from_row_slice(3, 3, &[0.4, 0.1, -0.2, 0.1, -0.3, 0.05, -0.2, 0.05, 0.6]);
-        assert!(
-            (a.clone() - a.transpose()).abs().max() < 1e-15,
-            "A symmetric"
-        );
+        assert!((a.clone() - a.transpose()).abs().max() < 1e-15, "A symmetric");
         let e = DMatrix::from_row_slice(
             3,
             3,
@@ -1069,22 +991,10 @@ mod tests {
             })
             .collect();
         let obs = vec![
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.3,
-                state: 1,
-            },
-            StateObs {
-                time: 2.1,
-                state: 1,
-            },
-            StateObs {
-                time: 4.0,
-                state: 0,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.3, state: 1 },
+            StateObs { time: 2.1, state: 1 },
+            StateObs { time: 4.0, state: 0 },
         ];
         let q = build(&theta);
         let (v, g) = ctmm_data_term_grad(&q, &dq, &obs)
@@ -1101,11 +1011,7 @@ mod tests {
             let fd = (ctmm_data_term(&build(&tp), &obs).unwrap()
                 - ctmm_data_term(&build(&tm), &obs).unwrap())
                 / (2.0 * h);
-            assert!(
-                (g[a] - fd).abs() < 1e-6,
-                "axis {a}: analytic {}, FD {fd}",
-                g[a]
-            );
+            assert!((g[a] - fd).abs() < 1e-6, "axis {a}: analytic {}, FD {fd}", g[a]);
         }
     }
 
@@ -1117,16 +1023,7 @@ mod tests {
         let big = MAX_EXP_ARG_ABS;
         let q = DMatrix::from_row_slice(2, 2, &[-big, big, big, -big]);
         let dq = vec![DMatrix::<f64>::zeros(2, 2)];
-        let obs = vec![
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 10.0,
-                state: 1,
-            },
-        ];
+        let obs = vec![StateObs { time: 0.0, state: 0 }, StateObs { time: 10.0, state: 1 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
         assert!(ctmm_data_term_grad(&q, &dq, &obs).unwrap().is_none());
     }
@@ -1139,16 +1036,7 @@ mod tests {
     fn data_term_grad_rejects_a_misshapen_derivative() {
         let q = DMatrix::from_row_slice(2, 2, &[-0.5, 0.5, 0.3, -0.3]);
         let dq = vec![DMatrix::<f64>::zeros(3, 3)];
-        let obs = vec![
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-        ];
+        let obs = vec![StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 1 }];
         assert!(matches!(
             ctmm_data_term_grad(&q, &dq, &obs),
             Err(MarkovError::DerivativeShapeMismatch { axis: 0, .. })
@@ -1175,18 +1063,9 @@ mod tests {
         let (a, b) = (0.7, 0.3);
         let q = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
         let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 3.0,
-                state: 1,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 3.0, state: 1 },
         ];
         let p1 = exact_2state(a, b, 1.0)[(0, 1)];
         let p2 = exact_2state(a, b, 2.0)[(1, 1)];
@@ -1203,18 +1082,9 @@ mod tests {
         let (a, b) = (0.6, 0.9);
         let q = DMatrix::from_row_slice(3, 3, &[-a, a, 0.0, 0.0, -b, b, 0.0, 0.0, 0.0]);
         let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 2.5,
-                state: 2,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 2.5, state: 2 },
         ];
         let p01 = exact_seq3(a, b, 1.0)[(0, 1)]; // 0 → 1 over Δt = 1.0
         let p12 = exact_seq3(a, b, 1.5)[(1, 2)]; // 1 → 2 over Δt = 1.5
@@ -1227,17 +1097,7 @@ mod tests {
     fn data_term_fewer_than_two_obs_is_zero() {
         let q = generator_3();
         assert_eq!(ctmm_data_term(&q, &[]).unwrap(), 0.0);
-        assert_eq!(
-            ctmm_data_term(
-                &q,
-                &[StateObs {
-                    time: 0.0,
-                    state: 1
-                }]
-            )
-            .unwrap(),
-            0.0
-        );
+        assert_eq!(ctmm_data_term(&q, &[StateObs { time: 0.0, state: 1 }]).unwrap(), 0.0);
     }
 
     #[test]
@@ -1245,36 +1105,15 @@ mod tests {
         let (a, b) = (0.7, 0.3);
         let q = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
         let with_dup = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            }, // duplicate timestamp, same state
-            StateObs {
-                time: 3.0,
-                state: 1,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 1.0, state: 1 }, // duplicate timestamp, same state
+            StateObs { time: 3.0, state: 1 },
         ];
         let without = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-            StateObs {
-                time: 3.0,
-                state: 1,
-            },
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 1 },
+            StateObs { time: 3.0, state: 1 },
         ];
         let a1 = ctmm_data_term(&q, &with_dup).unwrap();
         let a2 = ctmm_data_term(&q, &without).unwrap();
@@ -1288,16 +1127,7 @@ mod tests {
         // State 1 absorbing; P(dt)[0,0] = e^{-1000·dt} underflows to 0. Observing
         // 0 → 0 across dt=1 is a (numerically) impossible transition.
         let q = DMatrix::from_row_slice(2, 2, &[-1000.0, 1000.0, 0.0, 0.0]);
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 0,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 0 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
@@ -1307,16 +1137,7 @@ mod tests {
         // nalgebra's expm — whose internal LU-solve `.unwrap()` can panic on a
         // non-finite input. It is the degenerate case → sentinel, not a panic.
         let q = DMatrix::from_row_slice(2, 2, &[f64::NEG_INFINITY, f64::INFINITY, 0.0, 0.0]);
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 1 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
@@ -1332,16 +1153,7 @@ mod tests {
         // Precondition: the argument really is finite, so finiteness alone is not
         // enough to catch it — the magnitude bound is what does.
         assert!((&q * 1.0).iter().all(|x: &f64| x.is_finite()));
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 1 }];
         assert_eq!(ctmm_data_term(&q, &obs).unwrap(), SUBJECT_SENTINEL_NLL);
     }
 
@@ -1352,16 +1164,7 @@ mod tests {
         // optimizer toward the malformed input. The `p.min(1.0)` clamp makes the
         // contribution exactly 0, never negative.
         let q = DMatrix::from_row_slice(2, 2, &[5.0, 0.0, 0.0, 5.0]); // P[0,0] = e^5 > 1
-        let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 0,
-            },
-        ];
+        let obs = [StateObs { time: 0.0, state: 0 }, StateObs { time: 1.0, state: 0 }];
         let nll = ctmm_data_term(&q, &obs).unwrap();
         assert!(nll >= 0.0, "nll must never be negative, got {nll}");
         assert_eq!(nll, 0.0, "clamped p = 1 ⇒ −log 1 = 0");
@@ -1380,33 +1183,18 @@ mod tests {
     #[test]
     fn data_term_rejects_too_few_states() {
         let q = DMatrix::from_row_slice(1, 1, &[0.0]);
-        assert_eq!(
-            ctmm_data_term(&q, &[]).unwrap_err(),
-            MarkovError::TooFewStates { n: 1 }
-        );
+        assert_eq!(ctmm_data_term(&q, &[]).unwrap_err(), MarkovError::TooFewStates { n: 1 });
     }
 
     #[test]
     fn data_term_rejects_state_out_of_range() {
         let q = generator_3();
         let obs = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 3,
-            }, // valid states are 0..=2
+            StateObs { time: 0.0, state: 0 },
+            StateObs { time: 1.0, state: 3 }, // valid states are 0..=2
         ];
         let err = ctmm_data_term(&q, &obs).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::StateOutOfRange {
-                state: 3,
-                n_states: 3
-            }
-        );
+        assert_eq!(err, MarkovError::StateOutOfRange { state: 3, n_states: 3 });
         assert!(err.to_string().contains("out of range"));
     }
 
@@ -1415,16 +1203,7 @@ mod tests {
         let q = generator_3();
         // NaN: `NaN != NaN`, so match the variant + `is_nan()` rather than
         // `assert_eq!` (which can never hold for a NaN-bearing error).
-        let obs_nan = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: f64::NAN,
-                state: 1,
-            },
-        ];
+        let obs_nan = [StateObs { time: 0.0, state: 0 }, StateObs { time: f64::NAN, state: 1 }];
         match ctmm_data_term(&q, &obs_nan).unwrap_err() {
             MarkovError::NonFiniteTime { index, time } => {
                 assert_eq!(index, 1);
@@ -1433,24 +1212,10 @@ mod tests {
             other => panic!("expected NonFiniteTime, got {other:?}"),
         }
         // +inf is `PartialEq`-comparable and exercises the Display message.
-        let obs_inf = [
-            StateObs {
-                time: 0.0,
-                state: 0,
-            },
-            StateObs {
-                time: f64::INFINITY,
-                state: 1,
-            },
-        ];
+        let obs_inf =
+            [StateObs { time: 0.0, state: 0 }, StateObs { time: f64::INFINITY, state: 1 }];
         let err = ctmm_data_term(&q, &obs_inf).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::NonFiniteTime {
-                index: 1,
-                time: f64::INFINITY
-            }
-        );
+        assert_eq!(err, MarkovError::NonFiniteTime { index: 1, time: f64::INFINITY });
         assert!(err.to_string().contains("not finite"));
     }
 
@@ -1458,24 +1223,11 @@ mod tests {
     fn data_term_rejects_decreasing_time() {
         let q = generator_3();
         let obs = [
-            StateObs {
-                time: 2.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 1,
-            }, // goes backwards
+            StateObs { time: 2.0, state: 0 },
+            StateObs { time: 1.0, state: 1 }, // goes backwards
         ];
         let err = ctmm_data_term(&q, &obs).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::TimeDecreased {
-                index: 1,
-                prev: 2.0,
-                next: 1.0
-            }
-        );
+        assert_eq!(err, MarkovError::TimeDecreased { index: 1, prev: 2.0, next: 1.0 });
         assert!(err.to_string().contains("non-decreasing"));
     }
 
@@ -1483,25 +1235,11 @@ mod tests {
     fn data_term_rejects_zero_dt_state_change() {
         let q = generator_3();
         let obs = [
-            StateObs {
-                time: 1.0,
-                state: 0,
-            },
-            StateObs {
-                time: 1.0,
-                state: 2,
-            }, // same instant, different state
+            StateObs { time: 1.0, state: 0 },
+            StateObs { time: 1.0, state: 2 }, // same instant, different state
         ];
         let err = ctmm_data_term(&q, &obs).unwrap_err();
-        assert_eq!(
-            err,
-            MarkovError::ZeroDtStateChange {
-                index: 1,
-                time: 1.0,
-                from: 0,
-                to: 2
-            }
-        );
+        assert_eq!(err, MarkovError::ZeroDtStateChange { index: 1, time: 1.0, from: 0, to: 2 });
         assert!(err.to_string().contains("Δt > 0"));
     }
 
@@ -1645,20 +1383,12 @@ mod tests {
             let pq = p * q_at(t);
             (0..s * s).map(|r| pq[(r / s, r % s)]).collect()
         };
-        let u: Vec<f64> = (0..s * s)
-            .map(|r| 0.3 + 0.17 * r as f64 - 0.05 * (r * r) as f64)
-            .collect();
+        let u: Vec<f64> =
+            (0..s * s).map(|r| 0.3 + 0.17 * r as f64 - 0.05 * (r * r) as f64).collect();
         let t = 0.8;
         let (q, dq) = (q_at(t), dq_at(t));
         let (mut jac, mut ft) = (vec![f64::NAN; s.pow(4)], vec![f64::NAN; s * s]);
-        kolmogorov_jacobian(
-            &u,
-            |a, b| q[(a, b)],
-            |a, b| dq[(a, b)],
-            s,
-            &mut jac,
-            &mut ft,
-        );
+        kolmogorov_jacobian(&u, |a, b| q[(a, b)], |a, b| dq[(a, b)], s, &mut jac, &mut ft);
         let h = 1e-5;
         let (mut worst_j, mut worst_t) = (0.0f64, 0.0f64);
         for c in 0..s * s {
@@ -1699,10 +1429,9 @@ mod tests {
         // (Rosenbrock23), the differenced 7.4e-8 / 2.2e-8; an `f_t` of `P·Q` in place of
         // `P·∂Q/∂τ` misses by 3.2e-6 / 1.3e-7, so the step reads the `f_t` it is handed. (At
         // 1e-6 and 1e-8 every variant sits at the stepper's noise, 1e-12–1e-9.)
-        for (method, bound) in [
-            (crate::ode::OdeMethod::Rodas4, 3e-7),
-            (crate::ode::OdeMethod::Rosenbrock23, 6e-8),
-        ] {
+        for (method, bound) in
+            [(crate::ode::OdeMethod::Rodas4, 3e-7), (crate::ode::OdeMethod::Rosenbrock23, 6e-8)]
+        {
             let opts = crate::ode::OdeSolverOptions {
                 method,
                 reltol: 1e-4,
@@ -1721,15 +1450,9 @@ mod tests {
                 "stiff occupancy {method:?}: exact-J {err:.2e}, FD-J {:.2e}",
                 max_abs_diff(&fd, &want)
             );
-            assert!(
-                err.is_finite() && err < bound,
-                "{method:?}: exact-J {err:.2e}"
-            );
+            assert!(err.is_finite() && err < bound, "{method:?}: exact-J {err:.2e}");
             // The registration is what the step read: differenced, the bits move.
-            assert_ne!(
-                exact, fd,
-                "{method:?}: the stiff step never took the exact J"
-            );
+            assert_ne!(exact, fd, "{method:?}: the stiff step never took the exact J");
         }
     }
 }

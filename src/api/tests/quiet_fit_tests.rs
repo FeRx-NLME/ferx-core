@@ -145,14 +145,7 @@ fn a_quiet_fit_writes_nothing_to_stdout_or_stderr() {
 
     // Strictly empty, not `trim().is_empty()`: a bare `eprintln!()` leaking from
     // the engine writes a lone newline, and trimming would hide exactly that.
-    assert!(
-        out.stderr.is_empty(),
-        "a quiet fit wrote to stderr:\n{stderr}"
-    );
+    assert!(out.stderr.is_empty(), "a quiet fit wrote to stderr:\n{stderr}");
     let stray: Vec<&str> = stdout.lines().filter(|l| !is_harness_line(l)).collect();
-    assert!(
-        stray.is_empty(),
-        "a quiet fit wrote to stdout:\n{}",
-        stray.join("\n")
-    );
+    assert!(stray.is_empty(), "a quiet fit wrote to stdout:\n{}", stray.join("\n"));
 }

@@ -17,12 +17,7 @@ use crate::types::DoseEvent;
 /// disposition cubic, ordered by construction (no sort), with exact jets of every order.
 #[allow(clippy::many_single_char_names)]
 pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    cl: T, v1: T, q2: T, v2: T, q3: T, v3: T,
 ) -> (T, T, T, T, T) {
     let k10 = cl / v1;
     let k12 = q2 / v1;
@@ -54,11 +49,8 @@ pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     let q = c1 * c2 * third - c2 * c2 * c2 * T::from_f64(2.0 / 27.0) - c0;
     // Guard p = 0 (a triple root; inactive for valid PK) and the rounding of `arg` past ±1:
     // the start only, which the Newton steps then converge from.
-    let p_safe = if p.br_cmp_c(crate::sens::num::BranchCmp::Lt, -1e-30) {
-        p
-    } else {
-        T::from_f64(-1e-30)
-    };
+    let p_safe =
+        if p.br_cmp_c(crate::sens::num::BranchCmp::Lt, -1e-30) { p } else { T::from_f64(-1e-30) };
     let m = (-(p_safe * third)).sqrt() * T::from_f64(2.0);
     let arg_raw = (q * T::from_f64(3.0)) / (p_safe * m);
     let arg = if arg_raw.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1.0) {
@@ -101,17 +93,7 @@ pub(crate) struct ThreeCpt<T> {
 impl<T: PkNum> ThreeCpt<T> {
     pub(crate) fn new(cl: T, v1: T, q2: T, v2: T, q3: T, v3: T) -> Self {
         let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt_g(cl, v1, q2, v2, q3, v3);
-        Self {
-            cl,
-            v1,
-            v2,
-            v3,
-            alpha,
-            beta,
-            gamma,
-            k21,
-            k31,
-        }
+        Self { cl, v1, v2, v3, alpha, beta, gamma, k21, k31 }
     }
 
     /// The disposition modes `(c, λ)` of the central impulse response `(1/V1)·Σ c·e^{−λt}`,
@@ -120,14 +102,7 @@ impl<T: PkNum> ThreeCpt<T> {
     /// a zero inter-compartmental clearance (a positive one keeps the roots of the
     /// irreducible arrowhead generator distinct).
     pub(crate) fn modes(&self) -> Option<[(T, T); 3]> {
-        let ThreeCpt {
-            alpha: a,
-            beta: b,
-            gamma: g,
-            k21,
-            k31,
-            ..
-        } = *self;
+        let ThreeCpt { alpha: a, beta: b, gamma: g, k21, k31, .. } = *self;
         use crate::sens::num::BranchCmp::Le;
         if (a - b).br_cmp_c(Le, 0.0) || (b - g).br_cmp_c(Le, 0.0) {
             return None;
@@ -140,14 +115,7 @@ impl<T: PkNum> ThreeCpt<T> {
 /// 3-cpt IV bolus: `C = A·e^{−αt} + B·e^{−βt} + G·e^{−γt}`.
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_iv_bolus_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    amt: f64, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T,
 ) -> T {
     three_cpt_iv_bolus_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
 }
@@ -164,14 +132,7 @@ pub(crate) fn three_cpt_iv_bolus_d<T: PkNum>(amt: f64, t: T, d: &ThreeCpt<T>) ->
 /// central impulse. The single-dose path delegates here with a constant `amt`.
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_iv_bolus_amt_g<T: PkNum>(
-    amt: T,
-    t: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    amt: T, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T,
 ) -> T {
     three_cpt_iv_bolus_amt_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
 }
@@ -205,16 +166,7 @@ pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) 
 /// 3-cpt constant-rate IV infusion (duration `dur`, rate `rate`).
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_infusion_g<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    rate: f64, dur: f64, amt: f64, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T,
 ) -> T {
     three_cpt_infusion_d(rate, dur, amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
 }
@@ -223,11 +175,7 @@ pub fn three_cpt_infusion_g<T: PkNum>(
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_infusion_d<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    d: &ThreeCpt<T>,
+    rate: f64, dur: f64, amt: f64, t: T, d: &ThreeCpt<T>,
 ) -> T {
     let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
@@ -259,16 +207,7 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
 /// modes, the Bateman function one smooth function through `KA = λ` (`bateman`).
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
-    ka: T,
-    f_bio: T,
+    amt: f64, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T,
 ) -> T {
     three_cpt_oral_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3), ka, f_bio)
 }
@@ -284,16 +223,7 @@ pub(crate) fn three_cpt_oral_d<T: PkNum>(amt: f64, t: T, d: &ThreeCpt<T>, ka: T,
 /// initial-condition path passes a pre-loaded depot `A₀` as a dual with `F = 1`.
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_amt_g<T: PkNum>(
-    amt: T,
-    t: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
-    ka: T,
-    f_bio: T,
+    amt: T, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T,
 ) -> T {
     three_cpt_oral_amt_d(amt, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3), ka, f_bio)
 }
@@ -328,15 +258,7 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
 /// 3-cpt IV bolus at steady state.
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    ii: f64,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    amt: f64, t: T, ii: f64, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T,
 ) -> T {
     three_cpt_iv_bolus_ss_d(amt, t, ii, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
 }
@@ -372,38 +294,16 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
 /// (`bateman_ss`).
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_ss_g<T: PkNum>(
-    amt: f64,
-    t: T,
-    ii: f64,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
-    ka: T,
-    f_bio: T,
+    amt: f64, t: T, ii: f64, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T,
 ) -> T {
-    three_cpt_oral_ss_d(
-        amt,
-        t,
-        ii,
-        &ThreeCpt::new(cl, v1, q2, v2, q3, v3),
-        ka,
-        f_bio,
-    )
+    three_cpt_oral_ss_d(amt, t, ii, &ThreeCpt::new(cl, v1, q2, v2, q3, v3), ka, f_bio)
 }
 
 /// [`three_cpt_oral_ss_g`] over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
-    amt: f64,
-    t: T,
-    ii: f64,
-    d: &ThreeCpt<T>,
-    ka: T,
-    f_bio: T,
+    amt: f64, t: T, ii: f64, d: &ThreeCpt<T>, ka: T, f_bio: T,
 ) -> T {
     let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
@@ -433,38 +333,16 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
 /// overlapping pulses (`dur > ii`). Mirrors production `three_cpt_infusion_ss`.
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_infusion_ss_g<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    ii: f64,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
+    rate: f64, dur: f64, amt: f64, t: T, ii: f64, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T,
 ) -> T {
-    three_cpt_infusion_ss_d(
-        rate,
-        dur,
-        amt,
-        t,
-        ii,
-        &ThreeCpt::new(cl, v1, q2, v2, q3, v3),
-    )
+    three_cpt_infusion_ss_d(rate, dur, amt, t, ii, &ThreeCpt::new(cl, v1, q2, v2, q3, v3))
 }
 
 /// [`three_cpt_infusion_ss_g`] over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
-    rate: f64,
-    dur: f64,
-    amt: f64,
-    t: T,
-    ii: f64,
-    d: &ThreeCpt<T>,
+    rate: f64, dur: f64, amt: f64, t: T, ii: f64, d: &ThreeCpt<T>,
 ) -> T {
     let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
@@ -499,38 +377,16 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_conc_g<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    cl: T,
-    v1: T,
-    q2: T,
-    v2: T,
-    q3: T,
-    v3: T,
-    ka: T,
-    f_bio: T,
-    oral: bool,
+    dose: &DoseEvent, t: T, cl: T, v1: T, q2: T, v2: T, q3: T, v3: T, ka: T, f_bio: T, oral: bool,
 ) -> T {
-    three_cpt_conc_d(
-        dose,
-        t,
-        &ThreeCpt::new(cl, v1, q2, v2, q3, v3),
-        ka,
-        f_bio,
-        oral,
-    )
+    three_cpt_conc_d(dose, t, &ThreeCpt::new(cl, v1, q2, v2, q3, v3), ka, f_bio, oral)
 }
 
 /// `three_cpt_conc_g` over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_conc_d<T: PkNum>(
-    dose: &DoseEvent,
-    t: T,
-    d: &ThreeCpt<T>,
-    ka: T,
-    f_bio: T,
-    oral: bool,
+    dose: &DoseEvent, t: T, d: &ThreeCpt<T>, ka: T, f_bio: T, oral: bool,
 ) -> T {
     // The shared #2104 rule decides an arrived dose before `F` scales it, as
     // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
@@ -609,10 +465,7 @@ mod tests {
                 "value {} vs f64 {v64} for {dose:?}",
                 d.value
             );
-            assert!(
-                d.grad.iter().all(|g| g.is_finite()),
-                "non-finite grad for {dose:?}"
-            );
+            assert!(d.grad.iter().all(|g| g.is_finite()), "non-finite grad for {dose:?}");
         }
     }
 }

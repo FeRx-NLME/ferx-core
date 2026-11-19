@@ -66,10 +66,7 @@ impl MixingGradCache {
 
     /// The subject's `K × n_theta` rows ([`mixing_logp_grad`]), bit-equal to calling it directly.
     pub(crate) fn rows(
-        &self,
-        model: &CompiledModel,
-        spec: &crate::types::MixtureSpec,
-        theta: &[f64],
+        &self, model: &CompiledModel, spec: &crate::types::MixtureSpec, theta: &[f64],
         covariates: &std::collections::HashMap<String, f64>,
     ) -> Vec<Vec<f64>> {
         // A missing column and a stored value are different inputs; the flag keeps them apart.
@@ -86,8 +83,7 @@ impl MixingGradCache {
         let slot = self.rows.lock().unwrap().entry(key).or_default().clone();
         slot.get_or_init(|| {
             #[cfg(test)]
-            self.computed
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.computed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             mixing_logp_grad(model, spec, theta, covariates, &self.floor)
         })
         .clone()
@@ -140,10 +136,7 @@ pub struct MixtureEval {
 /// A class-`k` (0-based) view of `params`: base theta / FIX flags, with the
 /// class's Omega/Sigma swapped in.
 pub fn class_params(params: &ModelParameters, k: usize) -> ModelParameters {
-    let mix = params
-        .mixture
-        .as_ref()
-        .expect("class_params called on non-mixture ModelParameters");
+    let mix = params.mixture.as_ref().expect("class_params called on non-mixture ModelParameters");
     let mut p = params.clone();
     p.omega = mix.omega[k].clone();
     p.sigma = mix.sigma[k].clone();
@@ -208,16 +201,11 @@ pub(crate) fn merged_classes_from(nll: &[Vec<f64>], pmix: &[Vec<f64>]) -> Vec<Cl
             })
         })
         .collect();
-    let empty: Vec<bool> = max_pmix
-        .iter()
-        .map(|m| m.is_some_and(|m| m < EMPTY_CLASS_PMIX))
-        .collect();
+    let empty: Vec<bool> =
+        max_pmix.iter().map(|m| m.is_some_and(|m| m < EMPTY_CLASS_PMIX)).collect();
     let mut out: Vec<ClassCollapse> = (0..k)
         .filter(|&c| empty[c])
-        .map(|c| ClassCollapse::Empty {
-            class: c + 1,
-            max_pmix: max_pmix[c].unwrap_or(0.0),
-        })
+        .map(|c| ClassCollapse::Empty { class: c + 1, max_pmix: max_pmix[c].unwrap_or(0.0) })
         .collect();
     for a in 0..k {
         for b in a + 1..k {
@@ -228,21 +216,13 @@ pub(crate) fn merged_classes_from(nll: &[Vec<f64>], pmix: &[Vec<f64>]) -> Vec<Cl
             for n in nll {
                 let bf = (n[a] - n[b]).abs();
                 // NaN (∞ − ∞) and ∞ both separate the pair; `f64::max` would drop NaN.
-                max_log_bf = if bf.is_finite() {
-                    max_log_bf.max(bf)
-                } else {
-                    f64::INFINITY
-                };
+                max_log_bf = if bf.is_finite() { max_log_bf.max(bf) } else { f64::INFINITY };
                 if max_log_bf >= MERGED_CLASS_LOG_BF {
                     break;
                 }
             }
             if max_log_bf < MERGED_CLASS_LOG_BF {
-                out.push(ClassCollapse::Merged {
-                    a: a + 1,
-                    b: b + 1,
-                    max_log_bf,
-                });
+                out.push(ClassCollapse::Merged { a: a + 1, b: b + 1, max_log_bf });
             }
         }
     }
@@ -309,10 +289,7 @@ const PMIX_CONTRIB_TOL: f64 = 1e-6;
 /// subject, not just its winning class — a non-converged non-winning class still
 /// enters the log-sum-exp OFV with weight `PMIX_ik` and must be surfaced.
 fn any_contributing(flags: &[bool], probs: &[f64]) -> bool {
-    flags
-        .iter()
-        .zip(probs)
-        .any(|(&f, &p)| f && p > PMIX_CONTRIB_TOL)
+    flags.iter().zip(probs).any(|(&f, &p)| f && p > PMIX_CONTRIB_TOL)
 }
 
 /// Evaluate the mixture FOCE objective at `params` (#977 Phase 3).
@@ -322,10 +299,7 @@ fn any_contributing(flags: &[bool], probs: &[f64]) -> bool {
 /// solve returned, so an exactly-zero one is warm like any other and does not rerun the
 /// cold inner multi-start; pass `None` for a cold start.
 pub fn mixture_ofv(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
     warm: Option<&[Vec<DVector<f64>>]>,
 ) -> MixtureEval {
     mixture_ofv_with_modes(model, population, params, options, warm).0
@@ -343,20 +317,11 @@ pub(crate) struct MixtureClassModes {
 
 /// [`mixture_ofv`], also returning every class's modes ([`MixtureClassModes`]).
 pub(crate) fn mixture_ofv_with_modes(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
     warm: Option<&[Vec<DVector<f64>>]>,
 ) -> (MixtureEval, MixtureClassModes) {
-    let spec = model
-        .mixture
-        .as_ref()
-        .expect("mixture_ofv on a non-mixture model");
-    let mp = params
-        .mixture
-        .as_ref()
-        .expect("mixture_ofv with no MixtureParams");
+    let spec = model.mixture.as_ref().expect("mixture_ofv on a non-mixture model");
+    let mp = params.mixture.as_ref().expect("mixture_ofv with no MixtureParams");
     let k = mp.omega.len();
     let n = population.subjects.len();
     let interaction = options.interaction;
@@ -383,10 +348,8 @@ pub(crate) fn mixture_ofv_with_modes(
         let mut hmats_c = Vec::with_capacity(n);
         let mut kappas_c = Vec::with_capacity(n);
         for (i, subject) in population.subjects.iter().enumerate() {
-            let warm_i = warm
-                .and_then(|w| w.get(cls))
-                .and_then(|wc| wc.get(i))
-                .map(|e| e.as_slice());
+            let warm_i =
+                warm.and_then(|w| w.get(cls)).and_then(|wc| wc.get(i)).map(|e| e.as_slice());
             let ebe = find_ebe_for_stage_with_prev(
                 model,
                 subject,
@@ -512,18 +475,11 @@ pub(crate) fn mixture_ofv_with_modes(
         pmix,
         mixest,
         etas_by_class,
-        ebe_stats: InnerLoopStats {
-            n_unconverged,
-            n_fallback,
-            n_nm_polished,
-            n_start_rejected,
-        },
+        ebe_stats: InnerLoopStats { n_unconverged, n_fallback, n_nm_polished, n_start_rejected },
         n_fd_h_redone,
         class_nll,
     };
-    let modes = MixtureClassModes {
-        kappas: kappas_by_class,
-    };
+    let modes = MixtureClassModes { kappas: kappas_by_class };
     (eval, modes)
 }
 
@@ -542,20 +498,12 @@ pub(crate) fn mixture_ofv_with_modes(
 /// `mixture_gradient_with_modes` declines.
 #[cfg(test)]
 pub(crate) fn mixture_gradient(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
     eval: &MixtureEval,
 ) -> Option<Vec<f64>> {
     if params.omega_iov.is_some() {
-        let (own, modes) = mixture_ofv_with_modes(
-            model,
-            population,
-            params,
-            options,
-            Some(&eval.etas_by_class),
-        );
+        let (own, modes) =
+            mixture_ofv_with_modes(model, population, params, options, Some(&eval.etas_by_class));
         return mixture_gradient_with_modes(model, population, params, options, &own, Some(&modes));
     }
     mixture_gradient_with_modes(model, population, params, options, eval, None)
@@ -569,17 +517,11 @@ pub(crate) fn mixture_gradient(
 /// plan, #2786) is `None` for the whole ([`mixture_gradient_salvaged`] salvages it per
 /// term). Under IOV without `modes` there is no κ̂ to differentiate at, so it is `None`.
 pub(crate) fn mixture_gradient_with_modes(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
-    eval: &MixtureEval,
-    modes: Option<&MixtureClassModes>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
+    eval: &MixtureEval, modes: Option<&MixtureClassModes>,
 ) -> Option<Vec<f64>> {
     let rows =
-        mixture_subject_gradients(model, population, params, options, eval, modes, None, |f| {
-            f()
-        })?;
+        mixture_subject_gradients(model, population, params, options, eval, modes, None, |f| f())?;
     let mut grad = vec![0.0f64; packed_segments(params).total()];
     for row in &rows {
         for (g, v) in grad.iter_mut().zip(row) {
@@ -608,12 +550,8 @@ pub(crate) fn mixture_gradient_with_modes(
 /// whole-objective difference. Under IOV `modes` must be supplied (the fit's outer loop
 /// always holds them, `mixture_ofv_with_modes`).
 pub(crate) fn mixture_gradient_salvaged(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
-    eval: &MixtureEval,
-    modes: Option<&MixtureClassModes>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
+    eval: &MixtureEval, modes: Option<&MixtureClassModes>,
     declines: &crate::estimation::outer_optimizer::OuterFdDeclineLog,
 ) -> Vec<f64> {
     let salvage = |d: DeclinedTerm<'_>| {
@@ -631,9 +569,7 @@ pub(crate) fn mixture_gradient_salvaged(
                 declines.record_structural(d.subject);
             }
         }
-        Some(class_subject_reconverged_gradient(
-            model, subject, params, d.cls, d.eta, options,
-        ))
+        Some(class_subject_reconverged_gradient(model, subject, params, d.cls, d.eta, options))
     };
     // An IOV gradient reads every class's κ̂. The caller's gate for producing them
     // (`needs_class_modes`) is this one; a caller that did not have them gets the evaluation
@@ -701,13 +637,8 @@ pub(crate) type SalvageTerm<'a> = dyn Fn(DeclinedTerm<'_>) -> Option<Vec<f64>> +
 /// (a caller's per-subject check wraps it there).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mixture_subject_gradients(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    options: &FitOptions,
-    eval: &MixtureEval,
-    modes: Option<&MixtureClassModes>,
-    salvage: Option<&SalvageTerm<'_>>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, options: &FitOptions,
+    eval: &MixtureEval, modes: Option<&MixtureClassModes>, salvage: Option<&SalvageTerm<'_>>,
     each: impl Fn(&dyn Fn() -> Option<Vec<f64>>) -> Option<Vec<f64>> + Sync,
 ) -> Option<Vec<Vec<f64>>> {
     use crate::sens::ode_provider::adjoint::PackedPoint;
@@ -727,10 +658,8 @@ pub(crate) fn mixture_subject_gradients(
             (cp, x_k)
         })
         .collect();
-    let points: Vec<Option<PackedPoint<'_>>> = classes
-        .iter()
-        .map(|(cp, x_k)| PackedPoint::new(cp, x_k))
-        .collect();
+    let points: Vec<Option<PackedPoint<'_>>> =
+        classes.iter().map(|(cp, x_k)| PackedPoint::new(cp, x_k)).collect();
     let n = packed_segments(params).total();
     let rows = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
@@ -790,12 +719,9 @@ pub(crate) fn mixture_subject_gradients(
                 });
                 let g_c = match exact {
                     Some(g_c) => g_c,
-                    None if salvage.is_some() => salvage?(DeclinedTerm {
-                        subject: i,
-                        cls,
-                        cp,
-                        eta: &eta,
-                    })?,
+                    None if salvage.is_some() => {
+                        salvage?(DeclinedTerm { subject: i, cls, cp, eta: &eta })?
+                    }
                     None => return None,
                 };
                 route_class_gradient(&mut g, &g_c, w, cls, params, mp);
@@ -821,12 +747,8 @@ pub(crate) fn mixture_subject_gradients(
 /// class layout's inert override tail is pinned, so no probe is spent on a coordinate
 /// `class_params` has already swapped out.
 fn class_subject_reconverged_gradient(
-    model: &CompiledModel,
-    subject: &crate::types::Subject,
-    params: &ModelParameters,
-    cls: usize,
-    eta: &DVector<f64>,
-    options: &FitOptions,
+    model: &CompiledModel, subject: &crate::types::Subject, params: &ModelParameters, cls: usize,
+    eta: &DVector<f64>, options: &FitOptions,
 ) -> Vec<f64> {
     let mut cp = class_params(params, cls);
     if let Some(mix) = cp.mixture.as_mut() {
@@ -858,13 +780,7 @@ fn class_subject_reconverged_gradient(
 /// θ → packed chain factor `dθ_j/dx_j`: `θ_j` for a log-packed θ, 1 for an identity one.
 fn theta_chain_factors(params: &ModelParameters) -> Vec<f64> {
     (0..params.theta.len())
-        .map(|j| {
-            if theta_packs_log(params.theta_lower[j]) {
-                params.theta[j]
-            } else {
-                1.0
-            }
-        })
+        .map(|j| if theta_packs_log(params.theta_lower[j]) { params.theta[j] } else { 1.0 })
         .collect()
 }
 
@@ -882,11 +798,7 @@ fn theta_chain_factors(params: &ModelParameters) -> Vec<f64> {
 /// (`class_params` has already swapped the class's values into the base slots) and is
 /// not read.
 fn route_class_gradient(
-    grad: &mut [f64],
-    g_c: &[f64],
-    scale: f64,
-    cls: usize,
-    params: &ModelParameters,
+    grad: &mut [f64], g_c: &[f64], scale: f64, cls: usize, params: &ModelParameters,
     mp: &MixtureParams,
 ) {
     for (s, dest) in class_route(cls, params, mp).into_iter().enumerate() {
@@ -948,12 +860,8 @@ fn class_route(cls: usize, params: &ModelParameters, mp: &MixtureParams) -> Vec<
 /// come from one cold `mixture_ofv` at the covariance inner tolerance, the evaluation the
 /// step's base OFV and its score `S` read.
 pub(crate) fn mixture_cov_hessian(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x_hat: &[f64],
-    options: &FitOptions,
-    objective: crate::sens::ode_provider::adjoint::Objective,
+    model: &CompiledModel, population: &Population, template: &ModelParameters, x_hat: &[f64],
+    options: &FitOptions, objective: crate::sens::ode_provider::adjoint::Objective,
 ) -> Option<DMatrix<f64>> {
     use crate::sens::ode_provider::adjoint::Objective;
     use crate::sens::ode_provider::adjoint::{
@@ -983,11 +891,7 @@ pub(crate) fn mixture_cov_hessian(
         })
         .collect();
     let chain = theta_chain_factors(&params);
-    let log_packed: Vec<bool> = params
-        .theta_lower
-        .iter()
-        .map(|&l| theta_packs_log(l))
-        .collect();
+    let log_packed: Vec<bool> = params.theta_lower.iter().map(|&l| theta_packs_log(l)).collect();
     let n_theta = params.theta.len();
     let per_subject: Vec<Option<DMatrix<f64>>> = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
@@ -1097,10 +1001,7 @@ pub(crate) struct MixtureScoreContext {
 
 impl MixtureScoreContext {
     pub(crate) fn new(
-        model: &CompiledModel,
-        population: &Population,
-        template: &ModelParameters,
-        x_hat: &[f64],
+        model: &CompiledModel, population: &Population, template: &ModelParameters, x_hat: &[f64],
         options: &FitOptions,
     ) -> Self {
         let params = unpack_params(x_hat, template);
@@ -1110,10 +1011,7 @@ impl MixtureScoreContext {
         };
         let (eval, modes) =
             mixture_ofv_with_modes(model, population, &params, &score_options, None);
-        let mp = params
-            .mixture
-            .as_ref()
-            .expect("MixtureScoreContext on non-mixture parameters");
+        let mp = params.mixture.as_ref().expect("MixtureScoreContext on non-mixture parameters");
         let classes = (0..mp.omega.len())
             .map(|cls| {
                 let mut cp = class_params(&params, cls);
@@ -1141,11 +1039,7 @@ impl MixtureScoreContext {
                     cm.sigma_override_fixed.fill(true);
                 }
                 let start = pack_with_bounds(&cp);
-                ClassScoreView {
-                    template: cp,
-                    x: start.packed,
-                    bounds: start.bounds,
-                }
+                ClassScoreView { template: cp, x: start.packed, bounds: start.bounds }
             })
             .collect();
         let dtheta_dx = theta_chain_factors(&params);
@@ -1173,21 +1067,13 @@ impl MixtureScoreContext {
     /// Subject `i`'s score `∂(−log Lᵢ)/∂x` over the full mixture packed layout; `points` is
     /// [`Self::class_points`].
     pub(crate) fn score(
-        &self,
-        model: &CompiledModel,
-        population: &Population,
-        i: usize,
+        &self, model: &CompiledModel, population: &Population, i: usize,
         points: &[Option<crate::sens::ode_provider::adjoint::PackedPoint<'_>>],
     ) -> Vec<f64> {
-        let spec = model
-            .mixture
-            .as_ref()
-            .expect("mixture score on a non-mixture model");
+        let spec = model.mixture.as_ref().expect("mixture score on a non-mixture model");
         let mp = self.params.mixture.as_ref().expect("mixture parameters");
         let covariates = &population.subjects[i].covariates;
-        let dlnp = self
-            .mixing
-            .rows(model, spec, &self.params.theta, covariates);
+        let dlnp = self.mixing.rows(model, spec, &self.params.theta, covariates);
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
         for (cls, view) in self.classes.iter().enumerate() {
             let w = self.eval.pmix[i][cls];
@@ -1233,10 +1119,7 @@ impl MixtureScoreContext {
 /// to a point, so its span is zero and its gradient stays 0.
 #[cfg(test)]
 pub(crate) fn mixture_gradient_fd(
-    model: &CompiledModel,
-    population: &Population,
-    x: &[f64],
-    init_params: &ModelParameters,
+    model: &CompiledModel, population: &Population, x: &[f64], init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
     let floor = crate::estimation::parameterization::fd_step_floors(init_params, model);
@@ -1300,11 +1183,7 @@ mod tests {
             let (nl, pm) = posteriors(&[0.3, 0.7], &near);
             let got = merged_classes_from(&nl, &pm);
             match got.as_slice() {
-                [ClassCollapse::Merged {
-                    a: 1,
-                    b: 2,
-                    max_log_bf,
-                }] => {
+                [ClassCollapse::Merged { a: 1, b: 2, max_log_bf }] => {
                     assert!((max_log_bf - d).abs() < 1e-9, "factor {max_log_bf} vs {d}");
                 }
                 other => panic!("want classes 1 and 2 merged, got {other:?}"),
@@ -1329,10 +1208,7 @@ mod tests {
             let w = merged_classes_warning(&got).unwrap();
             assert!(w.starts_with("W_MIXTURE_MERGED_CLASSES: "), "{w}");
             assert!(w.contains("classes 1 and 3 have merged"), "{w}");
-            assert!(
-                !w.contains("classes 1 and 2") && !w.contains("classes 2 and 3"),
-                "{w}"
-            );
+            assert!(!w.contains("classes 1 and 2") && !w.contains("classes 2 and 3"), "{w}");
             assert!(!w.contains("empty"), "{w}");
         }
 
@@ -1346,10 +1222,7 @@ mod tests {
             let (nl, pm) = posteriors(&[1.0 - p2, p2], &nll);
             assert!(pm.iter().all(|p| p[1] < EMPTY_CLASS_PMIX));
             let got = merged_classes_from(&nl, &pm);
-            assert!(
-                matches!(got.as_slice(), [ClassCollapse::Empty { class: 2, .. }]),
-                "{got:?}"
-            );
+            assert!(matches!(got.as_slice(), [ClassCollapse::Empty { class: 2, .. }]), "{got:?}");
             let w = merged_classes_warning(&got).unwrap();
             assert!(w.contains("class 2 is empty"), "{w}");
             assert!(!w.contains("merged ("), "{w}");
@@ -1366,16 +1239,9 @@ mod tests {
             // Review round 1: three classes, classes 1 and 2 identical. Subject 1 is dominated
             // by class 3 by ~1000 nats, so its PMIX_1 and PMIX_2 underflow to exactly 0, and a
             // factor rebuilt from PMIX would be 0 / 0. Read from the nll's it is 0.
-            let nll = vec![
-                vec![1005.0, 1005.0, 2.0],
-                vec![3.0, 3.0, 20.0],
-                vec![4.0, 4.0, 30.0],
-            ];
+            let nll = vec![vec![1005.0, 1005.0, 2.0], vec![3.0, 3.0, 20.0], vec![4.0, 4.0, 30.0]];
             let (nl, pm) = posteriors(&[0.3, 0.3, 0.4], &nll);
-            assert!(
-                pm[0][0] == 0.0 && pm[0][1] == 0.0,
-                "fixture must underflow: {pm:?}"
-            );
+            assert!(pm[0][0] == 0.0 && pm[0][1] == 0.0, "fixture must underflow: {pm:?}");
             let got = merged_classes_from(&nl, &pm);
             assert!(
                 matches!(got.as_slice(), [ClassCollapse::Merged { a: 1, b: 2, .. }]),
@@ -1475,11 +1341,7 @@ mod tests {
         let (dg, d2g) = (0.5 / g, -0.25 / (g * tiny));
         let none = HashMap::new();
         for logit in [true, false] {
-            let mixing = if logit {
-                "logit(1) = sqrt(TINY)"
-            } else {
-                "p(1) = sqrt(TINY)"
-            };
+            let mixing = if logit { "logit(1) = sqrt(TINY)" } else { "p(1) = sqrt(TINY)" };
             let src = format!(
                 "[parameters]
   theta TVCL(1.0, 0.01, 100.0)
@@ -1506,10 +1368,7 @@ mod tests {
             let (d, d2) = if logit {
                 let p1 = 1.0 / (1.0 + (-g).exp());
                 let q = -p1 * (1.0 - p1) * dg * dg;
-                (
-                    [(1.0 - p1) * dg, -p1 * dg],
-                    [q + (1.0 - p1) * d2g, q - p1 * d2g],
-                )
+                ([(1.0 - p1) * dg, -p1 * dg], [q + (1.0 - p1) * d2g, q - p1 * d2g])
             } else {
                 let (a, b) = (dg / g, dg / (1.0 - g));
                 ([a, -b], [d2g / g - a * a, -d2g / (1.0 - g) - b * b])
@@ -1518,16 +1377,8 @@ mod tests {
                 // Measured at rounding (the closed form and the recording associate
                 // differently).
                 let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
-                assert!(
-                    rel(grad[c][1], d[c]) < 1e-12,
-                    "{mixing} class {}: grad",
-                    c + 1
-                );
-                assert!(
-                    rel(hess[c][3], d2[c]) < 1e-10,
-                    "{mixing} class {}: hess",
-                    c + 1
-                );
+                assert!(rel(grad[c][1], d[c]) < 1e-12, "{mixing} class {}: grad", c + 1);
+                assert!(rel(hess[c][3], d2[c]) < 1e-10, "{mixing} class {}: hess", c + 1);
                 assert_eq!([grad[c][0], hess[c][0], hess[c][1], hess[c][2]], [0.0; 4]);
             }
         }
@@ -1624,18 +1475,13 @@ mod tests {
         let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
         assert_eq!(model.n_kappa, 1, "one IOV kappa on CL");
         let pop = read_pop_iov(&bimodal_iov_csv(4, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            outer_maxiter: 3,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { outer_maxiter: 3, ..crate::types::FitOptions::default() };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("IOV + mixture fit should return Ok");
         assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
         for sr in &res.subjects {
-            let pmix = sr
-                .pmix
-                .as_ref()
-                .expect("PMIX populated for an IOV mixture fit");
+            let pmix = sr.pmix.as_ref().expect("PMIX populated for an IOV mixture fit");
             assert_eq!(pmix.len(), 2);
             assert!((pmix.iter().sum::<f64>() - 1.0).abs() < 1e-9);
             assert!(sr.mixest.is_some());
@@ -1652,10 +1498,8 @@ mod tests {
         // per subject, correctly dimensioned) and to a populated κ shrinkage vector.
         let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
         let pop = read_pop_iov(&bimodal_iov_csv(4, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            outer_maxiter: 3,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { outer_maxiter: 3, ..crate::types::FitOptions::default() };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("IOV + mixture fit should return Ok");
 
@@ -1668,18 +1512,12 @@ mod tests {
         );
         for ks in &res.ebe_kappas {
             assert_eq!(ks.len(), 2, "two occasions per subject");
-            assert!(
-                ks.iter().all(|k| k.len() == 1),
-                "one κ (KAPPA_CL) per occasion"
-            );
+            assert!(ks.iter().all(|k| k.len() == 1), "one κ (KAPPA_CL) per occasion");
         }
         // κ is genuinely estimated (not a zero placeholder): at least one occasion of
         // one subject moved off the prior mode.
         assert!(
-            res.ebe_kappas
-                .iter()
-                .flatten()
-                .any(|k| k.iter().any(|&v| v.abs() > 1e-6)),
+            res.ebe_kappas.iter().flatten().any(|k| k.iter().any(|&v| v.abs() > 1e-6)),
             "at least one κ̂ should be non-zero"
         );
         // κ shrinkage is reported (one per kappa parameter) — empty before the fix,
@@ -1702,10 +1540,7 @@ mod tests {
             .lines()
             .map(|l| {
                 let t = l.trim_start();
-                if ["theta ", "omega ", "kappa ", "sigma "]
-                    .iter()
-                    .any(|p| t.starts_with(p))
-                {
+                if ["theta ", "omega ", "kappa ", "sigma "].iter().any(|p| t.starts_with(p)) {
                     format!("{l} FIX\n")
                 } else {
                     format!("{l}\n")
@@ -1715,10 +1550,8 @@ mod tests {
         let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
         let pop = read_pop_iov(&bimodal_iov_csv(4, 1.0, 3.0));
         let run = |outer_maxiter: usize| {
-            let opts = crate::types::FitOptions {
-                outer_maxiter,
-                ..crate::types::FitOptions::default()
-            };
+            let opts =
+                crate::types::FitOptions { outer_maxiter, ..crate::types::FitOptions::default() };
             crate::api::fit(&model, &pop, &model.default_params, &opts)
                 .expect("all-FIX IOV + mixture fit should return Ok")
         };
@@ -1734,16 +1567,9 @@ mod tests {
             conv.ofv
         );
         for (name, res) in [("eval-only", &eval), ("converged", &conv)] {
-            assert_eq!(
-                res.ebe_kappas.len(),
-                pop.subjects.len(),
-                "{name}: one κ̂ set per subject"
-            );
+            assert_eq!(res.ebe_kappas.len(), pop.subjects.len(), "{name}: one κ̂ set per subject");
             assert!(
-                res.ebe_kappas
-                    .iter()
-                    .flatten()
-                    .any(|k| k.iter().any(|&v| v.abs() > 1e-6)),
+                res.ebe_kappas.iter().flatten().any(|k| k.iter().any(|&v| v.abs() > 1e-6)),
                 "{name}: κ̂ is estimated, not a zero placeholder"
             );
             assert!(
@@ -1786,9 +1612,8 @@ mod tests {
         // the same data/model with the kappa stripped (n_kappa = 0), which routes
         // through the legacy foce_subject_nll — they must not coincide.
         let iov = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
-        let no_iov_src = MIX_IOV_MODEL
-            .replace("  kappa KAPPA_CL ~ 0.02\n", "")
-            .replace(" + KAPPA_CL", "");
+        let no_iov_src =
+            MIX_IOV_MODEL.replace("  kappa KAPPA_CL ~ 0.02\n", "").replace(" + KAPPA_CL", "");
         let no_iov = crate::parser::model_parser::parse_model_string(&no_iov_src).unwrap();
         let csv = bimodal_iov_csv(4, 1.0, 3.0);
         let pop_iov = read_pop_iov(&csv);
@@ -1846,10 +1671,8 @@ mod tests {
                         )
                         .eta
                     };
-                    let (frozen, cond) = (
-                        solve(EbeVariance::Population),
-                        solve(EbeVariance::Conditional),
-                    );
+                    let (frozen, cond) =
+                        (solve(EbeVariance::Population), solve(EbeVariance::Conditional));
                     let want = if interaction { &cond } else { &frozen };
                     for (a, b) in got.iter().zip(want.iter()) {
                         assert_eq!(
@@ -1862,10 +1685,7 @@ mod tests {
                 }
             }
         }
-        assert!(
-            sep > 1e-3,
-            "the conventions must separate on this fixture ({sep:e})"
-        );
+        assert!(sep > 1e-3, "the conventions must separate on this fixture ({sep:e})");
     }
 
     /// #2588 (M12): the mixture evaluation's `n_nm_polished` counts the subjects with a
@@ -1952,10 +1772,7 @@ mod tests {
             pop.subjects.len()
         );
         assert!(cells.iter().any(|&(_, e)| e > 0), "fixture: no class moved");
-        assert!(
-            non_winning > 0,
-            "no subject was counted through a contributing non-winning class"
-        );
+        assert!(non_winning > 0, "no subject was counted through a contributing non-winning class");
     }
 
     #[test]
@@ -1965,10 +1782,8 @@ mod tests {
         // mis-slotted κ gradient would fail the length and FD-parity checks below.
         let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
         let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            inner_tol: 1e-10,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { inner_tol: 1e-10, ..crate::types::FitOptions::default() };
         let eval = super::mixture_ofv(&model, &pop, &model.default_params, &opts, None);
         let g = super::mixture_gradient(&model, &pop, &model.default_params, &opts, &eval)
             .expect("an IOV mixture is served, not routed to FD");
@@ -1996,10 +1811,8 @@ mod tests {
         use crate::estimation::outer_optimizer::OuterFdDeclineLog;
         let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
         let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            inner_tol: 1e-10,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { inner_tol: 1e-10, ..crate::types::FitOptions::default() };
         let params = &model.default_params;
         assert!(super::needs_class_modes(params), "premise: IOV");
         let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
@@ -2033,10 +1846,8 @@ mod tests {
         use crate::estimation::outer_optimizer::OuterFdDeclineLog;
         let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
         let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            inner_tol: 1e-10,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { inner_tol: 1e-10, ..crate::types::FitOptions::default() };
         let loose = crate::types::FitOptions {
             inner_tol: 1e-2,
             inner_maxiter: 3,
@@ -2054,11 +1865,7 @@ mod tests {
             .collect();
         let (warmed, _) = super::mixture_ofv_with_modes(&model, &pop, params, &loose, Some(&warm));
         let mut apart = 0.0f64;
-        for (a, b) in cold
-            .etas_by_class
-            .iter()
-            .flatten()
-            .zip(warmed.etas_by_class.iter().flatten())
+        for (a, b) in cold.etas_by_class.iter().flatten().zip(warmed.etas_by_class.iter().flatten())
         {
             for (u, v) in a.iter().zip(b.iter()) {
                 assert!(u.is_finite() && v.is_finite());
@@ -2066,10 +1873,7 @@ mod tests {
             }
         }
         eprintln!("MEASURE warm vs cold class eta apart {apart:.3e}");
-        assert!(
-            apart > 1e-3,
-            "premise: the warm eval's eta is off the cold one: {apart:e}"
-        );
+        assert!(apart > 1e-3, "premise: the warm eval's eta is off the cold one: {apart:e}");
         let log = OuterFdDeclineLog::new(pop.subjects.len());
         let want = super::mixture_gradient_salvaged(
             &model,
@@ -2107,10 +1911,8 @@ mod tests {
         use crate::estimation::outer_optimizer::OuterFdDeclineLog;
         let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
         let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            inner_tol: 1e-10,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { inner_tol: 1e-10, ..crate::types::FitOptions::default() };
         let params = &model.default_params;
         let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
         let n = pop.subjects.len();
@@ -2124,21 +1926,12 @@ mod tests {
             Some(&modes),
             &clean_log,
         );
-        assert!(
-            clean_log.declined_indices().is_empty(),
-            "control: nothing declines"
-        );
+        assert!(clean_log.declined_indices().is_empty(), "control: nothing declines");
 
         // The class with the larger weight for subject 0: its term is live.
-        let cls = if eval.pmix[0][0] >= eval.pmix[0][1] {
-            0
-        } else {
-            1
-        };
+        let cls = if eval.pmix[0][0] >= eval.pmix[0][1] { 0 } else { 1 };
         assert!(eval.pmix[0][cls] > 0.1, "fixture: a live term");
-        let mut bad = super::MixtureClassModes {
-            kappas: modes.kappas.clone(),
-        };
+        let mut bad = super::MixtureClassModes { kappas: modes.kappas.clone() };
         assert!(bad.kappas[cls][0].len() >= 2, "fixture: several occasions");
         bad.kappas[cls][0].pop();
 
@@ -2146,11 +1939,7 @@ mod tests {
         let log = OuterFdDeclineLog::new(n);
         let g =
             super::mixture_gradient_salvaged(&model, &pop, params, &opts, &eval, Some(&bad), &log);
-        assert_eq!(
-            log.declined_indices(),
-            vec![0],
-            "the mis-shaped term is salvaged"
-        );
+        assert_eq!(log.declined_indices(), vec![0], "the mis-shaped term is salvaged");
         let mut worst = 0.0f64;
         for (a, b) in g.iter().zip(&clean) {
             assert!(a.is_finite() && b.is_finite());
@@ -2172,10 +1961,7 @@ mod tests {
             Some(&bad),
             &log,
         );
-        assert!(
-            log.declined_indices().is_empty(),
-            "a repelled term takes no salvage"
-        );
+        assert!(log.declined_indices().is_empty(), "a repelled term takes no salvage");
         let (mut unweighted, _) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
         unweighted.pmix[0][cls] = 0.0;
         let want = super::mixture_gradient_salvaged(
@@ -2188,15 +1974,8 @@ mod tests {
             &OuterFdDeclineLog::new(n),
         );
         assert_eq!(g0, want, "a repelled term contributes exactly zero");
-        let live = g0
-            .iter()
-            .zip(&clean)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f64, f64::max); // nan-ok: every operand asserted finite above
-        assert!(
-            live > 1e3 * worst,
-            "straddle: the zeroed term is live, {live:e} vs {worst:e}"
-        );
+        let live = g0.iter().zip(&clean).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max); // nan-ok: every operand asserted finite above
+        assert!(live > 1e3 * worst, "straddle: the zeroed term is live, {live:e} vs {worst:e}");
     }
 
     #[test]
@@ -2232,11 +2011,7 @@ mod tests {
                 panic!("covariance non-PD: {reason}")
             }
         };
-        assert_eq!(
-            matrix.nrows(),
-            packed_len(params),
-            "covariance is packed-square"
-        );
+        assert_eq!(matrix.nrows(), packed_len(params), "covariance is packed-square");
         for i in 0..4 {
             let v = matrix[(i, i)];
             assert!(v.is_finite() && v > 0.0, "theta[{i}] variance = {v}");
@@ -2277,24 +2052,16 @@ mod tests {
         // `mixture_posteriors: None`, so the sdtab columns silently vanished.
         let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
         let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            outer_maxiter: 0,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { outer_maxiter: 0, ..crate::types::FitOptions::default() };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("eval-only mixture fit should return Ok");
         assert!(res.ofv.is_finite(), "OFV = {}", res.ofv);
         for sr in &res.subjects {
-            let pmix = sr
-                .pmix
-                .as_ref()
-                .expect("PMIX populated for an eval-only mixture fit");
+            let pmix = sr.pmix.as_ref().expect("PMIX populated for an eval-only mixture fit");
             assert_eq!(pmix.len(), 2, "K = 2 posterior weights per subject");
             assert!((pmix.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-            assert!(
-                sr.mixest.is_some(),
-                "MIXEST populated for eval-only mixture"
-            );
+            assert!(sr.mixest.is_some(), "MIXEST populated for eval-only mixture");
         }
     }
 
@@ -2440,10 +2207,8 @@ mod tests {
         // resolve to p = [0.3, 0.7] and every other line is shared.
         let pform = mix_form_model("theta P1(0.3, 0.001, 0.999)", "p(1) = P1");
         let logit_c = (0.3f64 / 0.7).ln(); // ≈ -0.8473
-        let lform = mix_form_model(
-            &format!("theta MIXL({logit_c}, -10.0, 10.0)"),
-            "logit(1) = MIXL",
-        );
+        let lform =
+            mix_form_model(&format!("theta MIXL({logit_c}, -10.0, 10.0)"), "logit(1) = MIXL");
         let mp = crate::parser::model_parser::parse_model_string(&pform).unwrap();
         let ml = crate::parser::model_parser::parse_model_string(&lform).unwrap();
         let pop = read_pop(&bimodal_csv(6, 1.0, 3.0));
@@ -2482,11 +2247,7 @@ mod tests {
         let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
             .expect("the p(k) form is in analytic scope");
         let fd = super::mixture_gradient_fd(&model, &pop, &pack_params(params), params, &opts);
-        let i_p1 = model
-            .theta_names
-            .iter()
-            .position(|n| n == "P1")
-            .expect("P1");
+        let i_p1 = model.theta_names.iter().position(|n| n == "P1").expect("P1");
         assert!(fd[i_p1].abs() > 1e-2, "∂OFV/∂P1 should be clearly nonzero");
         // A FIX coordinate's quotient collapses to 0 while the analytic gradient reports
         // the true derivative; the optimizer pins those coordinates, so only free ones are
@@ -2500,10 +2261,7 @@ mod tests {
             let rel = (a - f).abs() / f.abs().max(a.abs()).max(1e-3);
             worst = worst.max(rel);
             // Measured 3.0e-5: the objective quotient's truncation. 30× headroom.
-            assert!(
-                rel < 1e-3,
-                "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})"
-            );
+            assert!(rel < 1e-3, "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})");
         }
         eprintln!("p-form mixture gradient vs the objective's central difference: {worst:.2e}");
     }
@@ -2517,10 +2275,8 @@ mod tests {
 
     /// The exact gradient of `mixture_ofv` at tight inner tolerance, with every class's modes.
     fn exact_mixture_grad(
-        model: &crate::types::CompiledModel,
-        pop: &crate::types::Population,
-        params: &crate::types::ModelParameters,
-        opts: &crate::types::FitOptions,
+        model: &crate::types::CompiledModel, pop: &crate::types::Population,
+        params: &crate::types::ModelParameters, opts: &crate::types::FitOptions,
     ) -> Vec<f64> {
         let (eval, modes) = super::mixture_ofv_with_modes(model, pop, params, opts, None);
         super::mixture_gradient_with_modes(model, pop, params, opts, &eval, Some(&modes))
@@ -2529,28 +2285,13 @@ mod tests {
 
     /// The mixture fixtures the exact derivatives are pinned on: logit mixing on a
     /// covariate with per-class Ω/σ overrides, the `p` form, and an IOV mixture.
-    fn mixture_cases() -> Vec<(
-        &'static str,
-        crate::types::CompiledModel,
-        crate::types::Population,
-    )> {
+    fn mixture_cases() -> Vec<(&'static str, crate::types::CompiledModel, crate::types::Population)>
+    {
         let parse = |src: &str| crate::parser::model_parser::parse_model_string(src).unwrap();
         vec![
-            (
-                "logit+overrides",
-                parse(MIX_PARITY_MODEL),
-                read_pop(&bimodal_csv(4, 1.0, 3.0)),
-            ),
-            (
-                "p-form",
-                parse(MIX_COV_MODEL),
-                read_pop(&bimodal_csv(4, 1.0, 3.0)),
-            ),
-            (
-                "iov",
-                parse(MIX_IOV_MODEL),
-                read_pop_iov(&bimodal_iov_csv(4, 1.0, 3.0)),
-            ),
+            ("logit+overrides", parse(MIX_PARITY_MODEL), read_pop(&bimodal_csv(4, 1.0, 3.0))),
+            ("p-form", parse(MIX_COV_MODEL), read_pop(&bimodal_csv(4, 1.0, 3.0))),
+            ("iov", parse(MIX_IOV_MODEL), read_pop_iov(&bimodal_iov_csv(4, 1.0, 3.0))),
         ]
     }
 
@@ -2609,11 +2350,7 @@ mod tests {
                     inner_tol: 1e-10,
                     ..crate::types::FitOptions::default()
                 };
-                let objective = if interaction {
-                    Objective::Focei
-                } else {
-                    Objective::Foce
-                };
+                let objective = if interaction { Objective::Focei } else { Objective::Foce };
                 let h = super::mixture_cov_hessian(&model, &pop, params, &x, &opts, objective)
                     .unwrap_or_else(|| panic!("{tag}: in scope"));
                 assert_eq!((h.nrows(), h.ncols()), (n, n));
@@ -2627,9 +2364,7 @@ mod tests {
                     let step = 1e-3 * (1.0 + x[i].abs());
                     let central = |st: f64| {
                         let (gp, gm) = (grad_at(st), grad_at(-st));
-                        (0..n)
-                            .map(|j| (gp[j] - gm[j]) / (2.0 * st))
-                            .collect::<Vec<_>>()
+                        (0..n).map(|j| (gp[j] - gm[j]) / (2.0 * st)).collect::<Vec<_>>()
                     };
                     let (d1, d2) = (central(step), central(0.5 * step));
                     for j in 0..n {
@@ -2669,11 +2404,7 @@ mod tests {
             let src = MIX_PARITY_MODEL
                 .replace(
                     "theta TVV(10.0, 0.1, 1000.0)",
-                    &format!(
-                        "theta TVV_S({tvv:e}, {:e}, {:e})",
-                        -100.0 * tvv,
-                        100.0 * tvv
-                    ),
+                    &format!("theta TVV_S({tvv:e}, {:e}, {:e})", -100.0 * tvv, 100.0 * tvv),
                 )
                 .replace("V  = TVV\n", &format!("V  = TVV_S / {k:e}\n"));
             assert!(src.contains("TVV_S /"), "fixture: V is rescaled");
@@ -2747,10 +2478,7 @@ mod tests {
         );
         assert!(fd[k].is_finite(), "FD at the bound is {}", fd[k]);
         let rel = (fd[k] - reference).abs() / reference.abs();
-        eprintln!(
-            "MEASURE #2187 mixture bound: {} vs {reference:e}, rel {rel:e}",
-            fd[k]
-        );
+        eprintln!("MEASURE #2187 mixture bound: {} vs {reference:e}, rel {rel:e}", fd[k]);
         assert!(rel < 1e-3, "rel {rel:e}");
     }
 
@@ -2779,10 +2507,7 @@ mod tests {
             let denom = f.abs().max(a.abs()).max(1e-3);
             let rel = (a - f).abs() / denom;
             worst = worst.max(rel);
-            assert!(
-                rel < 2e-2,
-                "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})"
-            );
+            assert!(rel < 2e-2, "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})");
         }
         assert!(worst.is_finite());
     }
@@ -2812,11 +2537,7 @@ mod tests {
         assert_eq!(ana.len(), fd.len());
         // Locate the TVCL1 / TVCL2 theta slots: the class-swap bug zeroes the
         // gradient for the class that isn't the thread-local default (class 1).
-        let i_tvcl2 = model
-            .theta_names
-            .iter()
-            .position(|n| n == "TVCL2")
-            .expect("TVCL2 theta");
+        let i_tvcl2 = model.theta_names.iter().position(|n| n == "TVCL2").expect("TVCL2 theta");
         assert!(
             fd[i_tvcl2].abs() > 1e-2,
             "FD ∂OFV/∂TVCL2 should be clearly nonzero, got {}",
@@ -2825,10 +2546,7 @@ mod tests {
         for (i, (a, f)) in ana.iter().zip(&fd).enumerate() {
             let denom = f.abs().max(a.abs()).max(1e-3);
             let rel = (a - f).abs() / denom;
-            assert!(
-                rel < 2e-2,
-                "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})"
-            );
+            assert!(rel < 2e-2, "coord {i}: analytic {a:.6} vs FD {f:.6} (rel {rel:.2e})");
         }
     }
 
@@ -2866,9 +2584,7 @@ mod tests {
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("mixture fit with a downgraded optimizer should still return Ok");
         assert!(
-            res.warnings
-                .iter()
-                .any(|w| w.contains("BOBYQA") && w.contains("`bfgs`")),
+            res.warnings.iter().any(|w| w.contains("BOBYQA") && w.contains("`bfgs`")),
             "expected an optimizer-downgrade warning, got {:?}",
             res.warnings
         );
@@ -2880,15 +2596,11 @@ mod tests {
         // silent — only an explicitly-chosen unsupported optimizer warns.
         let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
         let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
-        let opts = crate::types::FitOptions {
-            outer_maxiter: 2,
-            ..crate::types::FitOptions::default()
-        };
+        let opts =
+            crate::types::FitOptions { outer_maxiter: 2, ..crate::types::FitOptions::default() };
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts).unwrap();
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("does not carry the mixture objective")),
+            !res.warnings.iter().any(|w| w.contains("does not carry the mixture objective")),
             "auto optimizer must not emit a downgrade warning, got {:?}",
             res.warnings
         );
@@ -2908,9 +2620,7 @@ mod tests {
         let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
             .expect("explicit-bobyqa mixture fit should return Ok");
         assert!(
-            !res.warnings
-                .iter()
-                .any(|w| w.contains("does not carry the mixture objective")),
+            !res.warnings.iter().any(|w| w.contains("does not carry the mixture objective")),
             "explicit bobyqa runs as requested and must not warn, got {:?}",
             res.warnings
         );
@@ -3015,11 +2725,7 @@ mod tests {
                     resolve_outer_optimizer(requested, &model, false, analytic);
                 assert_eq!(warning, None, "{requested:?} without a mixture: no warning");
                 if requested == Optimizer::Auto {
-                    assert_ne!(
-                        resolved,
-                        Optimizer::Auto,
-                        "auto resolves to a concrete optimizer"
-                    );
+                    assert_ne!(resolved, Optimizer::Auto, "auto resolves to a concrete optimizer");
                 } else {
                     assert_eq!(resolved, requested, "{requested:?} without a mixture");
                 }
@@ -3028,10 +2734,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: opt in with --features slow-tests"
-    )]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn mixture_fit_recovers_bimodal_cl() {
         // Tier-3: full convergence recovers the two class CLs (≈1 and ≈3) and the
         // class typical values stay separated (label-order convention: class 1 < 2).
@@ -3061,13 +2764,9 @@ mod tests {
     /// anything `MixtureScoreContext::score` calls for its routing, mixing gradient or class
     /// weights.
     fn subject_marginal_reestimated(
-        model: &crate::types::CompiledModel,
-        pop: &crate::types::Population,
-        template: &crate::types::ModelParameters,
-        x: &[f64],
-        i: usize,
-        ctx: &super::MixtureScoreContext,
-        interaction: bool,
+        model: &crate::types::CompiledModel, pop: &crate::types::Population,
+        template: &crate::types::ModelParameters, x: &[f64], i: usize,
+        ctx: &super::MixtureScoreContext, interaction: bool,
     ) -> f64 {
         let p = crate::estimation::parameterization::unpack_params(x, template);
         let subject = &pop.subjects[i];
@@ -3076,10 +2775,7 @@ mod tests {
             &p.theta,
             &subject.covariates,
         );
-        let opts = crate::types::FitOptions {
-            interaction,
-            ..Default::default()
-        };
+        let opts = crate::types::FitOptions { interaction, ..Default::default() };
         let k = p.mixture.as_ref().unwrap().omega.len();
         let nll: Vec<f64> = (0..k)
             .map(|c| {
@@ -3140,19 +2836,12 @@ mod tests {
     /// free packed coordinate, to relative error `|g − fd| / max(|fd|, 1) < tol`. Each
     /// caller's `tol` is its measured worst error (macOS arm64) with ≥ 10× headroom.
     fn assert_score_matches_fd(
-        src: &str,
-        pop: &crate::types::Population,
-        interaction: bool,
-        tol: f64,
-        label: &str,
+        src: &str, pop: &crate::types::Population, interaction: bool, tol: f64, label: &str,
     ) {
         use crate::estimation::parameterization::{pack_params, packed_fixed_mask};
         let model = crate::parser::model_parser::parse_model_string(src).unwrap();
         let template = &model.default_params;
-        let opts = crate::types::FitOptions {
-            interaction,
-            ..Default::default()
-        };
+        let opts = crate::types::FitOptions { interaction, ..Default::default() };
         let x = pack_params(template);
         let ctx = super::MixtureScoreContext::new(&model, pop, template, &x, &opts);
         let fixed = packed_fixed_mask(template);
@@ -3326,10 +3015,7 @@ mod tests {
         for (i, (a, f)) in ana.iter().zip(&fd).enumerate() {
             assert!(a.is_finite() && f.is_finite(), "coord {i}: {a} / {f}");
             let rel = (a - f).abs() / f.abs().max(1.0);
-            assert!(
-                rel < 1e-6,
-                "coord {i}: analytic {a:.8e} vs FD {f:.8e} (rel {rel:.2e})"
-            );
+            assert!(rel < 1e-6, "coord {i}: analytic {a:.8e} vs FD {f:.8e} (rel {rel:.2e})");
             worst = worst.max(rel);
         }
         eprintln!("ρ mixture gradient: worst rel error {worst:.3e}");
@@ -3406,10 +3092,7 @@ mod tests {
         let start = pack_with_bounds(params);
         let free: Vec<usize> = (0..x.len()).filter(|&j| !start.fixed[j]).collect();
         assert_eq!(free, [0, 1, 2, 3], "the four θ are the free coordinates");
-        let opts = crate::types::FitOptions {
-            interaction: true,
-            ..Default::default()
-        };
+        let opts = crate::types::FitOptions { interaction: true, ..Default::default() };
         let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
         let s = assemble_score_cross_product(
             &x,
@@ -3424,25 +3107,17 @@ mod tests {
         )
         .expect("finite S");
         for j in 0..4 {
-            assert!(
-                s[(j, j)] > 0.0,
-                "S[{j},{j}] = {} must be positive",
-                s[(j, j)]
-            );
+            assert!(s[(j, j)] > 0.0, "S[{j},{j}] = {} must be positive", s[(j, j)]);
         }
         let eig = nalgebra::SymmetricEigen::new(s.clone()).eigenvalues;
         let (lo, hi) = (eig.min(), eig.max());
         assert!(lo > 1e-8 * hi, "S must be full rank: eigenvalues {eig:?}");
 
         // End to end: `s` and `rsr` both yield positive θ variances.
-        for method in [
-            crate::types::CovarianceMethod::CrossProduct,
-            crate::types::CovarianceMethod::Sandwich,
-        ] {
-            let o = crate::types::FitOptions {
-                covariance_method: method,
-                ..opts.clone()
-            };
+        for method in
+            [crate::types::CovarianceMethod::CrossProduct, crate::types::CovarianceMethod::Sandwich]
+        {
+            let o = crate::types::FitOptions { covariance_method: method, ..opts.clone() };
             let matrix = match compute_covariance(
                 &x,
                 params,
@@ -3479,14 +3154,8 @@ mod tests {
         // A dose-only subject: nothing informs its η, so its mode is exactly the prior's.
         let pop = read_pop(&format!("{}99,0,0,100,1,1,75\n", bimodal_csv(2, 1.0, 3.0)));
         let empty = "99".to_string();
-        assert!(pop
-            .subjects
-            .iter()
-            .any(|s| s.id == empty && s.observations.is_empty()));
-        let opts = crate::types::FitOptions {
-            inner_restarts: 1,
-            ..Default::default()
-        };
+        assert!(pop.subjects.iter().any(|s| s.id == empty && s.observations.is_empty()));
+        let opts = crate::types::FitOptions { inner_restarts: 1, ..Default::default() };
         let params = &model.default_params;
         let k = 2;
         let count = |ids: &[String]| ids.iter().filter(|id| **id == empty).count();
@@ -3510,16 +3179,8 @@ mod tests {
         let (_, warm_rec) = record_inner_solves(|| {
             super::mixture_ofv(&model, &pop, params, &opts, Some(&cold.etas_by_class))
         });
-        let solved: Vec<String> = warm_rec
-            .solve_tols
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect();
-        assert_eq!(
-            count(&solved),
-            k,
-            "the warm pass solves the empty subject per class"
-        );
+        let solved: Vec<String> = warm_rec.solve_tols.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(count(&solved), k, "the warm pass solves the empty subject per class");
         assert_eq!(
             count(&warm_rec.multistarts),
             0,
@@ -3657,10 +3318,7 @@ mod tests {
         assert_eq!(salvaged.len(), fd.len());
         let (mut worst, mut live) = (0.0f64, 0.0f64);
         for (j, ((&s, &f), &z)) in salvaged.iter().zip(&fd).zip(&zeroed).enumerate() {
-            assert!(
-                s.is_finite() && f.is_finite() && z.is_finite(),
-                "coord {j}: {s} {f} {z}"
-            );
+            assert!(s.is_finite() && f.is_finite() && z.is_finite(), "coord {j}: {s} {f} {z}");
             let rel = (s - f).abs() / f.abs().max(1.0);
             let moved = (s - z).abs() / f.abs().max(1.0);
             assert!(rel.is_finite() && moved.is_finite(), "coord {j}");

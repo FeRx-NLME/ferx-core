@@ -28,10 +28,7 @@ fn model() -> CompiledModel {
 
 fn subject(id: &str, scale: f64, n_obs: usize) -> Subject {
     let obs_times: Vec<f64> = (1..=n_obs).map(|k| 0.5 + 2.0 * k as f64).collect();
-    let observations = obs_times
-        .iter()
-        .map(|t| scale * 10.0 * (-0.1 * t).exp())
-        .collect();
+    let observations = obs_times.iter().map(|t| scale * 10.0 * (-0.1 * t).exp()).collect();
     Subject {
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -46,13 +43,7 @@ fn subject(id: &str, scale: f64, n_obs: usize) -> Subject {
 fn population() -> Population {
     Population {
         subjects: (0..48)
-            .map(|i| {
-                subject(
-                    &format!("{i}"),
-                    1.0 + 0.07 * ((i * 7) % 13) as f64,
-                    3 + (i * 5) % 18,
-                )
-            })
+            .map(|i| subject(&format!("{i}"), 1.0 + 0.07 * ((i * 7) % 13) as f64, 3 + (i * 5) % 18))
             .collect(),
         covariate_names: Vec::new(),
         dv_column: "DV".into(),

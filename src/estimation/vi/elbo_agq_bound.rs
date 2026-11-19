@@ -272,20 +272,12 @@ fn fixtures() -> Vec<Fixture> {
     let one = lognormal_model();
     let one_pop = bound_population(
         &one,
-        &[
-            ("1", &[0.45], 0.10),
-            ("2", &[-0.55], 0.06),
-            ("3", &[0.05], 0.18),
-        ],
+        &[("1", &[0.45], 0.10), ("2", &[-0.55], 0.06), ("3", &[0.05], 0.18)],
     );
     let two = two_eta_model();
     let two_pop = bound_population(
         &two,
-        &[
-            ("1", &[0.40, 0.25], 0.10),
-            ("2", &[-0.50, 0.30], 0.06),
-            ("3", &[0.10, -0.35], 0.15),
-        ],
+        &[("1", &[0.40, 0.25], 0.10), ("2", &[-0.50, 0.30], 0.06), ("3", &[0.10, -0.35], 0.15)],
     );
     vec![
         Fixture {
@@ -324,11 +316,7 @@ fn singleton(pop: &Population, i: usize) -> Population {
 
 /// `−2 log p(yᵢ)` by adaptive GH quadrature, with the grid laid at the subject's EBE.
 fn agq_neg_two_log_marginal(
-    model: &CompiledModel,
-    pop: &Population,
-    i: usize,
-    params: &ModelParameters,
-    n_nodes: usize,
+    model: &CompiledModel, pop: &Population, i: usize, params: &ModelParameters, n_nodes: usize,
 ) -> f64 {
     let one = singleton(pop, i);
     let ebe = find_ebe(model, &one.subjects[0], params, 200, 1e-10, None, None, 0);
@@ -350,10 +338,7 @@ fn agq_neg_two_log_marginal(
 /// of the bugs this module exists to catch, so the comparison must not route through it.
 fn kl_to_prior(mu: &DVector<f64>, s: &DMatrix<f64>, omega: &DMatrix<f64>) -> f64 {
     let d = mu.len() as f64;
-    let omega_inv = omega
-        .clone()
-        .try_inverse()
-        .expect("prior Omega is invertible");
+    let omega_inv = omega.clone().try_inverse().expect("prior Omega is invertible");
     let trace = (&omega_inv * s).trace();
     let quad = (mu.transpose() * &omega_inv * mu)[(0, 0)];
     let log_det_ratio = omega.clone().determinant().ln() - s.clone().determinant().ln();
@@ -370,9 +355,7 @@ fn kl_to_prior(mu: &DVector<f64>, s: &DMatrix<f64>, omega: &DMatrix<f64>) -> f64
 /// by an order of magnitude, which is the sort of thing a bound test scaled in absolute
 /// units would have hidden.
 fn laplace_posterior(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters,
 ) -> (DVector<f64>, DMatrix<f64>) {
     let ebe = find_ebe(model, subject, params, 200, 1e-10, None, None, 0);
     let mode = ebe.eta.clone();
@@ -412,10 +395,7 @@ fn laplace_posterior(
             hess[(j, i)] = v;
         }
     }
-    let cov = hess
-        .clone()
-        .try_inverse()
-        .expect("conditional Hessian at the mode is invertible");
+    let cov = hess.clone().try_inverse().expect("conditional Hessian at the mode is invertible");
     for i in 0..d {
         assert!(
             cov[(i, i)] > 0.0 && cov[(i, i)].is_finite(),
@@ -453,19 +433,11 @@ fn gh_grid(n_nodes: usize, d: usize) -> Vec<(Vec<f64>, f64)> {
 /// it alongside VI's Monte-Carlo data term: the bound test needs both sides free of sampling
 /// noise, or an ELBO that overshoots by MC error looks like a violated bound.
 fn data_term_quad(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    mu: &DVector<f64>,
-    s: &DMatrix<f64>,
-    n_nodes: usize,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, mu: &DVector<f64>,
+    s: &DMatrix<f64>, n_nodes: usize,
 ) -> f64 {
     let d = mu.len();
-    let l = s
-        .clone()
-        .cholesky()
-        .expect("q covariance is positive-definite")
-        .l();
+    let l = s.clone().cholesky().expect("q covariance is positive-definite").l();
     let mut scratch = crate::pk::EventPkParams::with_capacity_for(subject);
     let mut acc = 0.0;
     for (z, w) in gh_grid(n_nodes, d) {
@@ -485,12 +457,8 @@ fn data_term_quad(
 
 /// `−2·ELBO` for one subject, entirely by quadrature: no Monte Carlo on either half.
 fn neg_two_elbo_quad(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    mu: &DVector<f64>,
-    s: &DMatrix<f64>,
-    n_nodes: usize,
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, mu: &DVector<f64>,
+    s: &DMatrix<f64>, n_nodes: usize,
 ) -> f64 {
     2.0 * (data_term_quad(model, subject, params, mu, s, n_nodes)
         + kl_to_prior(mu, s, &params.omega.matrix))
@@ -500,11 +468,7 @@ fn neg_two_elbo_quad(
 /// triangle, with the diagonal stored as its logarithm.
 fn full_rank_phi(mu: &DVector<f64>, s: &DMatrix<f64>) -> Vec<f64> {
     let d = mu.len();
-    let l = s
-        .clone()
-        .cholesky()
-        .expect("q covariance is positive-definite")
-        .l();
+    let l = s.clone().cholesky().expect("q covariance is positive-definite").l();
     let mut phi: Vec<f64> = mu.iter().copied().collect();
     for i in 0..d {
         for j in 0..=i {
@@ -527,12 +491,8 @@ const N_MC: usize = 600;
 /// `(seed, iteration, subject, sample)`, so changing the seed is the only way to get an
 /// independent replicate of the same quantity.
 fn mc_neg_two_elbo_stats(
-    model: &CompiledModel,
-    one: &Population,
-    params: &ModelParameters,
-    x: &[f64],
-    family: &FullRank,
-    phi: &[f64],
+    model: &CompiledModel, one: &Population, params: &ModelParameters, x: &[f64],
+    family: &FullRank, phi: &[f64],
 ) -> (f64, f64) {
     let phis = vec![phi.to_vec()];
     let draws: Vec<f64> = (0..N_SEEDS)
@@ -606,17 +566,9 @@ const Q_SWEEP: [(&str, f64, f64); 7] = [
 
 /// `(μ, S)` for one sweep entry: displace the mode along `u` in whitened space, then scale.
 fn sweep_q(
-    mode: &DVector<f64>,
-    lap_cov: &DMatrix<f64>,
-    u: &DVector<f64>,
-    shift: f64,
-    s_mult: f64,
+    mode: &DVector<f64>, lap_cov: &DMatrix<f64>, u: &DVector<f64>, shift: f64, s_mult: f64,
 ) -> (DVector<f64>, DMatrix<f64>) {
-    let l = lap_cov
-        .clone()
-        .cholesky()
-        .expect("Laplace covariance is positive-definite")
-        .l();
+    let l = lap_cov.clone().cholesky().expect("Laplace covariance is positive-definite").l();
     (mode + shift * (&l * u), lap_cov * s_mult)
 }
 
@@ -889,11 +841,7 @@ fn the_quadrature_transform_reproduces_gaussian_moments_and_kl() {
 
         for k in 0..d {
             let m1 = expect(&|e| e[k]);
-            assert!(
-                (m1 - mu[k]).abs() < 1e-12,
-                "E_q[eta_{k}] = {m1:.14}, expected {:.14}",
-                mu[k]
-            );
+            assert!((m1 - mu[k]).abs() < 1e-12, "E_q[eta_{k}] = {m1:.14}, expected {:.14}", mu[k]);
             for j in 0..d {
                 let m2 = expect(&|e| e[k] * e[j]);
                 let want = mu[k] * mu[j] + s[(k, j)];
@@ -931,10 +879,7 @@ fn the_quadrature_transform_reproduces_gaussian_moments_and_kl() {
 /// the only test here that can catch a bug living in that assembly rather than in the
 /// objective.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn bound_holds_at_the_converged_vi_point() {
     for fx in fixtures() {
         let opts = crate::types::FitOptions {
@@ -947,10 +892,7 @@ fn bound_holds_at_the_converged_vi_point() {
 
         let fit = crate::api::fit(&fx.model, &fx.pop, &fx.model.default_params, &opts)
             .unwrap_or_else(|e| panic!("[{}] VI fit failed: {e}", fx.label));
-        let vi = fit
-            .vi
-            .as_ref()
-            .expect("method = vi populates FitResult::vi");
+        let vi = fit.vi.as_ref().expect("method = vi populates FitResult::vi");
 
         // Rebuild the parameters VI converged to, so the marginal is evaluated at the same
         // point the ELBO was. `FitResult` reports theta/omega/sigma separately rather than
@@ -1044,12 +986,7 @@ fn production_kl_matches_the_textbook_kl() {
     let omega_2d = DMatrix::from_row_slice(2, 2, &[0.25, 0.06, 0.06, 0.16]);
 
     let cases: Vec<KlCase> = vec![
-        (
-            "1d: q at the prior",
-            omega_1d.clone(),
-            DVector::from_vec(vec![0.0]),
-            omega_1d.clone(),
-        ),
+        ("1d: q at the prior", omega_1d.clone(), DVector::from_vec(vec![0.0]), omega_1d.clone()),
         (
             "1d: displaced, narrow",
             omega_1d.clone(),
@@ -1062,12 +999,7 @@ fn production_kl_matches_the_textbook_kl() {
             DVector::from_vec(vec![-0.4]),
             DMatrix::from_vec(1, 1, vec![1.5]),
         ),
-        (
-            "2d: q at the prior",
-            omega_2d.clone(),
-            DVector::zeros(2),
-            omega_2d.clone(),
-        ),
+        ("2d: q at the prior", omega_2d.clone(), DVector::zeros(2), omega_2d.clone()),
         (
             "2d: S nearly diagonal",
             omega_2d.clone(),
@@ -1125,10 +1057,7 @@ fn production_kl_matches_the_textbook_kl() {
         // Full rank: the general case, off-diagonals and all.
         let full = FullRank::new(d);
         let phi = full_rank_phi(&mu, &s);
-        let got = full
-            .kl_to_normal(&phi, &omega)
-            .expect("FullRank has a closed-form KL")
-            .value;
+        let got = full.kl_to_normal(&phi, &omega).expect("FullRank has a closed-form KL").value;
         assert!(
             (got - expected).abs() < 1e-12,
             "[{label}] FullRank::kl_to_normal = {got:.14}, textbook = {expected:.14} \
@@ -1141,10 +1070,8 @@ fn production_kl_matches_the_textbook_kl() {
         let mf = MeanField::new(d);
         let mut phi_mf: Vec<f64> = mu.iter().copied().collect();
         phi_mf.extend((0..d).map(|k| 0.5 * s[(k, k)].ln()));
-        let got_mf = mf
-            .kl_to_normal(&phi_mf, &omega)
-            .expect("MeanField has a closed-form KL")
-            .value;
+        let got_mf =
+            mf.kl_to_normal(&phi_mf, &omega).expect("MeanField has a closed-form KL").value;
         let expected_mf = kl_to_prior(&mu, &s_diag, &omega_m);
         assert!(
             (got_mf - expected_mf).abs() < 1e-12,
@@ -1221,10 +1148,8 @@ fn the_mean_field_bound_is_looser_than_full_rank_at_one_parameter_vector() {
             let subject = &fx.pop.subjects[i];
             let marginal = agq_neg_two_log_marginal(&fx.model, &fx.pop, i, &params, fx.agq_nodes);
             let (mode, lap_cov) = laplace_posterior(&fx.model, subject, &params);
-            let precision = lap_cov
-                .clone()
-                .try_inverse()
-                .expect("the Laplace covariance is invertible");
+            let precision =
+                lap_cov.clone().try_inverse().expect("the Laplace covariance is invertible");
 
             // The mean-field optimum: S_kk = 1/H_kk.
             let mf_cov = DMatrix::from_diagonal(&DVector::from_iterator(
@@ -1251,10 +1176,8 @@ fn the_mean_field_bound_is_looser_than_full_rank_at_one_parameter_vector() {
             );
 
             // Both are still bounds — a looser bound is still a bound.
-            for (label, value) in [
-                ("full_rank", full_rank_bound),
-                ("mean_field", mean_field_bound),
-            ] {
+            for (label, value) in [("full_rank", full_rank_bound), ("mean_field", mean_field_bound)]
+            {
                 assert!(
                     value >= marginal - 1e-7,
                     "[{}] subject {} {label}: -2*ELBO = {value:.10} fell BELOW \

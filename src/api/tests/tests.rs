@@ -52,10 +52,7 @@ fn an_explicit_thread_count_beats_the_default_cap() {
 fn no_explicit_thread_count_falls_back_to_the_capped_default() {
     // `0` is "nothing was declared", which is why `configure_global_thread_pool`
     // refuses to store it.
-    assert_eq!(
-        resolve_default_threads(0, None, 16).n,
-        cap_default_threads(16)
-    );
+    assert_eq!(resolve_default_threads(0, None, 16).n, cap_default_threads(16));
 }
 
 #[test]
@@ -71,9 +68,7 @@ fn reconfiguring_the_same_thread_count_is_accepted_and_a_different_one_is_not() 
 
 #[test]
 fn default_thread_count_matches_cap_of_available_parallelism() {
-    let available = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     assert_eq!(default_thread_count(), cap_default_threads(available));
 }
 
@@ -143,11 +138,7 @@ fn fit_from_files_uses_model_data_block_when_data_path_none() {
     let model = dir.path().join("model.ferx");
     std::fs::write(&model, model_content).unwrap();
 
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..FitOptions::default() };
     let result = fit_from_files(model.to_str().unwrap(), None, None, Some(opts))
         .expect("fit_from_files must honor the model's [data] block");
     assert_eq!(result.data_path.as_deref(), Some(data.to_str().unwrap()));
@@ -466,26 +457,18 @@ fn test_eta_shrinkage_zero_when_eta_rms_matches_omega_sd() {
     // NONMEM convention: shrinkage = 1 - sqrt(mean(eta^2)) / sqrt(omega).
     // omega = 1.0, eta = [+1, -1] => mean(eta^2) = 1 => shrinkage = 0.
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
-    let subjects = vec![
-        make_subject(vec![1.0], vec![0.0]),
-        make_subject(vec![-1.0], vec![0.0]),
-    ];
+    let subjects = vec![make_subject(vec![1.0], vec![0.0]), make_subject(vec![-1.0], vec![0.0])];
     let sh = compute_eta_shrinkage(&subjects, &omega);
     assert_eq!(sh.len(), 1);
-    assert!(
-        (sh[0]).abs() < 1e-10,
-        "expected ~0 shrinkage, got {}",
-        sh[0]
-    );
+    assert!((sh[0]).abs() < 1e-10, "expected ~0 shrinkage, got {}", sh[0]);
 }
 
 #[test]
 fn test_eta_shrinkage_positive_when_etas_shrunk() {
     // Etas close to zero → shrinkage > 0
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
-    let subjects: Vec<SubjectResult> = (0..10)
-        .map(|_| make_subject(vec![0.01], vec![0.0]))
-        .collect();
+    let subjects: Vec<SubjectResult> =
+        (0..10).map(|_| make_subject(vec![0.01], vec![0.0])).collect();
     let sh = compute_eta_shrinkage(&subjects, &omega);
     assert!(sh[0] > 0.5, "expected high shrinkage, got {}", sh[0]);
 }
@@ -498,27 +481,16 @@ fn test_eta_shrinkage_uses_n_not_n_minus_1_divisor() {
     // same eta values + omega = 2.0 must now give a clearly positive value:
     // shrinkage = 1 - 1/sqrt(2) ≈ 0.293.
     let omega = DMatrix::from_diagonal_element(1, 1, 2.0);
-    let subjects = vec![
-        make_subject(vec![1.0], vec![0.0]),
-        make_subject(vec![-1.0], vec![0.0]),
-    ];
+    let subjects = vec![make_subject(vec![1.0], vec![0.0]), make_subject(vec![-1.0], vec![0.0])];
     let sh = compute_eta_shrinkage(&subjects, &omega);
     let expected = 1.0 - 1.0 / 2.0_f64.sqrt();
-    assert!(
-        (sh[0] - expected).abs() < 1e-10,
-        "expected {}, got {}",
-        expected,
-        sh[0]
-    );
+    assert!((sh[0] - expected).abs() < 1e-10, "expected {}, got {}", expected, sh[0]);
 }
 
 #[test]
 fn test_eta_shrinkage_nan_when_omega_zero() {
     let omega = DMatrix::zeros(1, 1);
-    let subjects = vec![
-        make_subject(vec![0.1], vec![0.0]),
-        make_subject(vec![-0.1], vec![0.0]),
-    ];
+    let subjects = vec![make_subject(vec![0.1], vec![0.0]), make_subject(vec![-0.1], vec![0.0])];
     let sh = compute_eta_shrinkage(&subjects, &omega);
     assert!(sh[0].is_nan(), "expected NaN when omega=0");
 }
@@ -535,10 +507,7 @@ fn test_eta_shrinkage_nan_when_fewer_than_2_subjects() {
 fn test_eps_shrinkage_near_zero_for_unit_normal_iwres() {
     // NONMEM convention: shrinkage = 1 - sqrt(mean(IWRES^2)).
     // IWRES = [+1, -1] => mean(IWRES^2) = 1 => shrinkage = 0.
-    let subjects = vec![
-        make_subject(vec![0.0], vec![1.0]),
-        make_subject(vec![0.0], vec![-1.0]),
-    ];
+    let subjects = vec![make_subject(vec![0.0], vec![1.0]), make_subject(vec![0.0], vec![-1.0])];
     let sh = compute_eps_shrinkage(&subjects);
     assert!((sh).abs() < 1e-10, "expected ~0 eps shrinkage, got {}", sh);
 }
@@ -554,10 +523,7 @@ fn test_eps_shrinkage_negative_when_iwres_inflated() {
     // IWRES with mean(IWRES^2) > 1 must produce a negative value, not be
     // clamped. Matches the SAEM repro on `nmdata_20230216_1.csv` where
     // mean(IWRES^2) ~ 2.45 -> shrinkage ~ -0.566.
-    let subjects = vec![
-        make_subject(vec![0.0], vec![2.0]),
-        make_subject(vec![0.0], vec![-2.0]),
-    ];
+    let subjects = vec![make_subject(vec![0.0], vec![2.0]), make_subject(vec![0.0], vec![-2.0])];
     let sh = compute_eps_shrinkage(&subjects);
     assert!(sh < 0.0, "expected negative shrinkage, got {}", sh);
     assert!((sh - (1.0 - 2.0)).abs() < 1e-10);
@@ -588,13 +554,9 @@ fn saem_non_mu_referenced_warning_lists_individual_params_with_unmapped_eta() {
     model.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
     model.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
     model.eta_map = vec![0, 1, -1];
-    model.mu_refs.insert(
-        "ETA_CL".into(),
-        MuRef {
-            theta_name: "TVCL".into(),
-            transform: MuTransform::Log,
-        },
-    );
+    model
+        .mu_refs
+        .insert("ETA_CL".into(), MuRef { theta_name: "TVCL".into(), transform: MuTransform::Log });
 
     let warning =
         saem_non_mu_referenced_individual_params_warning(&model, &[]).expect("expected warning");
@@ -609,20 +571,12 @@ fn saem_non_mu_referenced_warning_is_none_when_all_eta_params_are_muref() {
     model.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
     model.eta_names = vec!["ETA_CL".into(), "ETA_V".into()];
     model.eta_map = vec![0, 1, -1];
-    model.mu_refs.insert(
-        "ETA_CL".into(),
-        MuRef {
-            theta_name: "TVCL".into(),
-            transform: MuTransform::Log,
-        },
-    );
-    model.mu_refs.insert(
-        "ETA_V".into(),
-        MuRef {
-            theta_name: "TVV".into(),
-            transform: MuTransform::Log,
-        },
-    );
+    model
+        .mu_refs
+        .insert("ETA_CL".into(), MuRef { theta_name: "TVCL".into(), transform: MuTransform::Log });
+    model
+        .mu_refs
+        .insert("ETA_V".into(), MuRef { theta_name: "TVV".into(), transform: MuTransform::Log });
 
     assert!(saem_non_mu_referenced_individual_params_warning(&model, &[]).is_none());
 }
@@ -644,10 +598,7 @@ fn saem_non_mu_referenced_warning_returns_when_the_run_builds_no_covariate_group
     let w = saem_non_mu_referenced_individual_params_warning(&model, &[])
         .expect("with no group built, nothing mu-references CL");
     assert!(w.contains("CL"), "{w}");
-    assert!(
-        !w.contains(" V"),
-        "V keeps its own single-anchor mu-ref: {w}"
-    );
+    assert!(!w.contains(" V"), "V keeps its own single-anchor mu-ref: {w}");
 }
 
 // ── kappa shrinkage ──────────────────────────────────────────────────────
@@ -655,12 +606,7 @@ fn saem_non_mu_referenced_warning_returns_when_the_run_builds_no_covariate_group
 fn make_kappas(vals: Vec<Vec<f64>>) -> Vec<Vec<DVector<f64>>> {
     // vals[subj_idx][occ_idx] = single-kappa value
     vals.into_iter()
-        .map(|occ_vals| {
-            occ_vals
-                .into_iter()
-                .map(|v| DVector::from_vec(vec![v]))
-                .collect()
-        })
+        .map(|occ_vals| occ_vals.into_iter().map(|v| DVector::from_vec(vec![v])).collect())
         .collect()
 }
 
@@ -719,19 +665,11 @@ fn test_kappa_shrinkage_by_occ_values() {
     // OCC 1: kappas = [+1, -1, +1, -1] → mean(κ²) = 1 → shrinkage = 0 with omega=1
     // OCC 2: kappas = [0.1, -0.1, 0.1, -0.1] → mean(κ²) = 0.01 → high shrinkage
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
-    let kappas = make_kappas(vec![
-        vec![1.0, 0.1],
-        vec![-1.0, -0.1],
-        vec![1.0, 0.1],
-        vec![-1.0, -0.1],
-    ]);
+    let kappas =
+        make_kappas(vec![vec![1.0, 0.1], vec![-1.0, -0.1], vec![1.0, 0.1], vec![-1.0, -0.1]]);
     let sh = compute_kappa_shrinkage_by_occ(&kappas, &[], &omega);
     assert_eq!(sh.len(), 2, "expected 2 occasions");
-    assert!(
-        (sh[0][0]).abs() < 1e-10,
-        "occ 1 shrinkage ~0, got {}",
-        sh[0][0]
-    );
+    assert!((sh[0][0]).abs() < 1e-10, "occ 1 shrinkage ~0, got {}", sh[0][0]);
     assert!(sh[1][0] > 0.8, "occ 2 shrinkage high, got {}", sh[1][0]);
 }
 
@@ -742,18 +680,12 @@ fn test_kappa_shrinkage_two_kappas_independent() {
     // kappa 1: RMS = 0.1 → shrinkage = 1 - 0.1/1.0 = 0.9 with omega_11 = 1.0
     let omega = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0, 1.0]));
     // Each subject has 1 occasion; kappa vector is [k0_val, k1_val].
-    let kappas: Vec<Vec<DVector<f64>>> = vec![
-        vec![DVector::from_vec(vec![1.0, 0.1])],
-        vec![DVector::from_vec(vec![-1.0, -0.1])],
-    ];
+    let kappas: Vec<Vec<DVector<f64>>> =
+        vec![vec![DVector::from_vec(vec![1.0, 0.1])], vec![DVector::from_vec(vec![-1.0, -0.1])]];
     let sh = compute_kappa_shrinkage(&kappas, &[], &omega);
     assert_eq!(sh.len(), 2);
     assert!((sh[0]).abs() < 1e-10, "kappa 0 shrinkage ~0, got {}", sh[0]);
-    assert!(
-        (sh[1] - 0.9).abs() < 1e-10,
-        "kappa 1 shrinkage ~0.9, got {}",
-        sh[1]
-    );
+    assert!((sh[1] - 0.9).abs() < 1e-10, "kappa 1 shrinkage ~0.9, got {}", sh[1]);
 }
 
 /// #1911: an uninformed group (κ̂ = 0, the prior mode) no longer moves the pooled
@@ -769,11 +701,7 @@ fn test_kappa_shrinkage_pooled_skips_uninformed_group() {
     let filtered = compute_kappa_shrinkage(&with_extra, &mask, &omega);
     let alone = compute_kappa_shrinkage(&informed_only, &[], &omega);
     let unfiltered = compute_kappa_shrinkage(&with_extra, &[], &omega);
-    assert_eq!(
-        filtered[0].to_bits(),
-        alone[0].to_bits(),
-        "{filtered:?} vs {alone:?}"
-    );
+    assert_eq!(filtered[0].to_bits(), alone[0].to_bits(), "{filtered:?} vs {alone:?}");
     // mean κ̂² over 6 pairs is half that over 3: 1 − (1 − s)/√2 > s.
     assert!(
         unfiltered[0] > filtered[0] + 0.1,
@@ -857,26 +785,12 @@ fn test_kappa_shrinkage_by_occ_skips_uninformed_group() {
     let sh = compute_kappa_shrinkage_by_occ(&kappas, &mask, &omega);
     assert_eq!(sh.len(), 4, "{sh:?}");
     let alone = |v: Vec<f64>| {
-        compute_kappa_shrinkage(
-            &make_kappas(v.into_iter().map(|x| vec![x]).collect()),
-            &[],
-            &omega,
-        )[0]
+        compute_kappa_shrinkage(&make_kappas(v.into_iter().map(|x| vec![x]).collect()), &[], &omega)
+            [0]
     };
-    assert_eq!(
-        sh[1][0].to_bits(),
-        alone(vec![0.5, -0.3]).to_bits(),
-        "{sh:?}"
-    );
-    assert!(
-        sh[2][0].is_nan(),
-        "uninformed slot 2 must stay empty: {sh:?}"
-    );
-    assert_eq!(
-        sh[3][0].to_bits(),
-        alone(vec![0.7, -0.2]).to_bits(),
-        "{sh:?}"
-    );
+    assert_eq!(sh[1][0].to_bits(), alone(vec![0.5, -0.3]).to_bits(), "{sh:?}");
+    assert!(sh[2][0].is_nan(), "uninformed slot 2 must stay empty: {sh:?}");
+    assert_eq!(sh[3][0].to_bits(), alone(vec![0.7, -0.2]).to_bits(), "{sh:?}");
     // Slot 0 is all informed: unchanged.
     let unmasked = compute_kappa_shrinkage_by_occ(&kappas, &[], &omega);
     assert_eq!(sh[0][0].to_bits(), unmasked[0][0].to_bits());
@@ -895,10 +809,9 @@ fn test_kappa_shrinkage_by_occ_skips_uninformed_group() {
 fn test_kappa_shrinkages_reads_informed_rule_from_population() {
     use crate::parser::model_parser::parse_model_string;
     let pk = parse_model_string(include_str!("../../../examples/warfarin_iov.ferx")).unwrap();
-    let pred = parse_model_string(include_str!(
-        "../../../tests/data/mbma_placebo/mbma_placebo.ferx"
-    ))
-    .unwrap();
+    let pred =
+        parse_model_string(include_str!("../../../tests/data/mbma_placebo/mbma_placebo.ferx"))
+            .unwrap();
     assert!(!pk.is_algebraic() && pred.is_algebraic());
     let pop = |pk_only_at: Option<f64>| {
         let subject = Subject {
@@ -925,18 +838,12 @@ fn test_kappa_shrinkages_reads_informed_rule_from_population() {
     };
     let omega = DMatrix::from_diagonal_element(1, 1, 1.0);
     let observed = make_kappas(vec![vec![0.6, 0.2], vec![-0.4, 0.3], vec![0.5, -0.1]]);
-    let with_pk = make_kappas(vec![
-        vec![0.6, 0.2, 0.0],
-        vec![-0.4, 0.3, 0.0],
-        vec![0.5, -0.1, 0.0],
-    ]);
+    let with_pk =
+        make_kappas(vec![vec![0.6, 0.2, 0.0], vec![-0.4, 0.3, 0.0], vec![0.5, -0.1, 0.0]]);
     let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let (base, base_occ) = kappa_shrinkages(&pk, &pop(None), &observed, &omega);
     // Control: the all-observed population is the unmasked value.
-    assert_eq!(
-        bits(&base),
-        bits(&compute_kappa_shrinkage(&observed, &[], &omega))
-    );
+    assert_eq!(bits(&base), bits(&compute_kappa_shrinkage(&observed, &[], &omega)));
     let unmasked = compute_kappa_shrinkage(&with_pk, &[], &omega);
     assert!(unmasked[0] > base[0] + 0.05, "{unmasked:?} vs {base:?}");
 
@@ -949,17 +856,9 @@ fn test_kappa_shrinkages_reads_informed_rule_from_population() {
     }
 
     let (mid_pk, _) = kappa_shrinkages(&pk, &pop(Some(1.5)), &with_pk, &omega);
-    assert_eq!(
-        bits(&mid_pk),
-        bits(&unmasked),
-        "mid-course pk-only row, PK model"
-    );
+    assert_eq!(bits(&mid_pk), bits(&unmasked), "mid-course pk-only row, PK model");
     let (mid_pred, _) = kappa_shrinkages(&pred, &pop(Some(1.5)), &with_pk, &omega);
-    assert_eq!(
-        bits(&mid_pred),
-        bits(&base),
-        "mid-course pk-only row, MBMA model"
-    );
+    assert_eq!(bits(&mid_pred), bits(&base), "mid-course pk-only row, MBMA model");
 }
 
 #[test]
@@ -1026,17 +925,10 @@ fn crcl_population() -> Population {
 #[test]
 fn saem_active_covariate_group_etas_drops_a_weak_iiv_group() {
     let pop = crcl_population();
-    let options = FitOptions {
-        mu_referencing: true,
-        ..Default::default()
-    };
+    let options = FitOptions { mu_referencing: true, ..Default::default() };
 
     let healthy = additive_group_model(0.2);
-    assert_eq!(
-        healthy.covariate_mu_refs.len(),
-        1,
-        "premise: parsed a group"
-    );
+    assert_eq!(healthy.covariate_mu_refs.len(), 1, "premise: parsed a group");
     let etas = saem_active_covariate_group_etas(&healthy, &pop, &healthy.default_params, &options);
     assert_eq!(etas, vec!["ETA_CL"], "a healthy group is built");
     assert!(
@@ -1048,17 +940,11 @@ fn saem_active_covariate_group_etas_drops_a_weak_iiv_group() {
     let weak = additive_group_model(0.0001);
     assert_eq!(weak.covariate_mu_refs.len(), 1, "premise: still parsed");
     let etas = saem_active_covariate_group_etas(&weak, &pop, &weak.default_params, &options);
-    assert!(
-        etas.is_empty(),
-        "the resolver drops it for negligible IIV, got {etas:?}"
-    );
+    assert!(etas.is_empty(), "the resolver drops it for negligible IIV, got {etas:?}");
     let w = saem_non_mu_referenced_individual_params_warning(&weak, &etas)
         .expect("with no group built, nothing mu-references CL");
     assert!(w.contains("CL"), "{w}");
-    assert!(
-        !w.contains(" V"),
-        "V keeps its own single-anchor mu-ref: {w}"
-    );
+    assert!(!w.contains(" V"), "V keeps its own single-anchor mu-ref: {w}");
 }
 
 /// The two outer gates `run_saem` applies before it resolves anything.
@@ -1067,10 +953,7 @@ fn saem_active_covariate_group_etas_honours_the_two_outer_gates() {
     let pop = crcl_population();
     let m = additive_group_model(0.2);
 
-    let off = FitOptions {
-        mu_referencing: false,
-        ..Default::default()
-    };
+    let off = FitOptions { mu_referencing: false, ..Default::default() };
     assert!(
         saem_active_covariate_group_etas(&m, &pop, &m.default_params, &off).is_empty(),
         "no group under mu_referencing = false"
@@ -1085,10 +968,7 @@ fn saem_active_covariate_group_etas_honours_the_two_outer_gates() {
         sigma_overrides: Vec::new(),
         mu_refs: Vec::new(),
     });
-    let on = FitOptions {
-        mu_referencing: true,
-        ..Default::default()
-    };
+    let on = FitOptions { mu_referencing: true, ..Default::default() };
     assert!(
         saem_active_covariate_group_etas(&mixture, &pop, &mixture.default_params, &on).is_empty(),
         "no group under a mixture"

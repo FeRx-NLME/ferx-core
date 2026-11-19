@@ -45,10 +45,7 @@ fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
             theta_upper: Vec::new(),
             theta_fixed: Vec::new(),
             omega_fixed: Vec::new(),
-            sigma: SigmaVector {
-                values: vec![0.1],
-                names: vec!["ERR".into()],
-            },
+            sigma: SigmaVector { values: vec![0.1], names: vec!["ERR".into()] },
             ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(&[], vec![]))
         })
     }
@@ -113,9 +110,7 @@ fn sr_for(n_obs: usize) -> SubjectResult {
 fn derived_per_row_time_is_raw_clock() {
     let derived_exprs = vec![DerivedExprSpec {
         name: "T".into(),
-        kind: DerivedKind::PerRow {
-            eval: Box::new(|ctx: &DerivedContext| ctx.time),
-        },
+        kind: DerivedKind::PerRow { eval: Box::new(|ctx: &DerivedContext| ctx.time) },
         uses_compartments: false,
     }];
     let model = minimal_model(derived_exprs);
@@ -178,10 +173,7 @@ fn derived_aggregate_tmax_returns_raw_time() {
     let col = &subjects_results[0].extra_columns[0].1;
     // All entries should be 1.0 (raw time of peak at j=4).
     for &v in col {
-        assert!(
-            (v - 1.0).abs() < 1e-12,
-            "Tmax should be raw time 1.0, got {v}"
-        );
+        assert!((v - 1.0).abs() < 1e-12, "Tmax should be raw time 1.0, got {v}");
     }
 }
 
@@ -250,10 +242,7 @@ fn derived_integral_periodic_uses_raw_clock() {
             condition: None,
             data_based: true,
             uses_compartments: false,
-            window: IntegralWindow::Periodic {
-                period: 5.0,
-                anchor: 0.0,
-            },
+            window: IntegralWindow::Periodic { period: 5.0, anchor: 0.0 },
             step: IntegralStep::ObsTimes,
         },
         uses_compartments: false,
@@ -274,10 +263,7 @@ fn derived_integral_periodic_uses_raw_clock() {
     // All obs land in the raw-clock window [0,5); all three per-session
     // points contribute → AUC=8.0 for every row.
     for (j, &v) in col.iter().enumerate() {
-        assert!(
-            (v - 8.0).abs() < 1e-12,
-            "Periodic integral at obs {j}: got {v}, expected 8.0"
-        );
+        assert!((v - 8.0).abs() < 1e-12, "Periodic integral at obs {j}: got {v}, expected 8.0");
     }
 }
 
@@ -323,9 +309,6 @@ fn derived_integral_single_session_unchanged() {
     let col = &subjects_results[0].extra_columns[0].1;
     // AUC = trapezoid([(0,0),(1,1),(4,4)]) = 8.0
     for &v in col {
-        assert!(
-            (v - 8.0).abs() < 1e-12,
-            "Single-session AUC should be 8.0, got {v}"
-        );
+        assert!((v - 8.0).abs() < 1e-12, "Single-session AUC should be 8.0, got {v}");
     }
 }

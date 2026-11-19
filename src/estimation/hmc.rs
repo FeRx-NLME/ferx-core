@@ -43,10 +43,7 @@ const HMC_DIVERGENCE_THRESHOLD: f64 = 1000.0;
 /// half-step and the correction cancel exactly) — the proposal equals the
 /// current state, ΔH = 0, and the step is trivially accepted.
 pub fn leapfrog(
-    eta: &[f64],
-    momentum: &[f64],
-    nll_grad_eta: &dyn Fn(&[f64]) -> Vec<f64>,
-    step_size: f64,
+    eta: &[f64], momentum: &[f64], nll_grad_eta: &dyn Fn(&[f64]) -> Vec<f64>, step_size: f64,
     n_steps: usize,
 ) -> (Vec<f64>, Vec<f64>) {
     let n = eta.len();
@@ -106,16 +103,9 @@ pub fn leapfrog(
 /// declines, like plain LTBS).
 #[allow(clippy::too_many_arguments)]
 pub fn hmc_step(
-    subject: &crate::types::Subject,
-    eta: &[f64],
-    nll_current: f64,
-    model: &crate::types::CompiledModel,
-    theta: &[f64],
-    omega: &crate::types::OmegaMatrix,
-    sigma_values: &[f64],
-    step_size: f64,
-    n_leapfrog: usize,
-    rng: &mut impl Rng,
+    subject: &crate::types::Subject, eta: &[f64], nll_current: f64,
+    model: &crate::types::CompiledModel, theta: &[f64], omega: &crate::types::OmegaMatrix,
+    sigma_values: &[f64], step_size: f64, n_leapfrog: usize, rng: &mut impl Rng,
 ) -> Option<(Vec<f64>, f64, bool, bool)> {
     use crate::estimation::inner_optimizer::analytic_eta_nll_gradient;
     use crate::stats::likelihood::individual_nll;
@@ -146,14 +136,7 @@ pub fn hmc_step(
     // failed/divergent move (reject, stay put) rather than silently biasing.
     let grad_failed = Cell::new(false);
     let grad_fn = |q: &[f64]| -> Vec<f64> {
-        last_nll.set(individual_nll(
-            model,
-            subject,
-            theta,
-            q,
-            omega,
-            sigma_values,
-        ));
+        last_nll.set(individual_nll(model, subject, theta, q, omega, sigma_values));
         match analytic_eta_nll_gradient(model, subject, theta, q, omega, sigma_values) {
             Some(g) => g,
             None => {
@@ -269,9 +252,7 @@ mod tests {
         let times = [0.5, 1.0, 2.0, 4.0, 8.0];
         crate::types::Subject {
             id: "1".to_string(),
-            doses: vec![crate::types::DoseEvent::new(
-                0.0, 1000.0, 1, 0.0, false, 0.0,
-            )],
+            doses: vec![crate::types::DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0)],
             obs_times: times.to_vec(),
             observations: vec![5.0; times.len()],
             obs_cmts: vec![1; times.len()],
@@ -313,9 +294,8 @@ mod tests {
             crate::stats::likelihood::individual_nll(&model, &subject, theta, &eta, &omega, &sigma);
 
         let mut rng = StdRng::seed_from_u64(1);
-        let stepped = hmc_step(
-            &subject, &eta, nll, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
-        );
+        let stepped =
+            hmc_step(&subject, &eta, nll, &model, theta, &omega, &sigma, 0.05, 5, &mut rng);
         assert!(
             stepped.is_some(),
             "closed-form ExpressionScale must take the gradient-based HMC path (#486)"
@@ -330,9 +310,8 @@ mod tests {
         let nll_ltbs =
             crate::stats::likelihood::individual_nll(&model, &subject, theta, &eta, &omega, &sigma);
         let mut rng = StdRng::seed_from_u64(1);
-        let stepped_ltbs = hmc_step(
-            &subject, &eta, nll_ltbs, &model, theta, &omega, &sigma, 0.05, 5, &mut rng,
-        );
+        let stepped_ltbs =
+            hmc_step(&subject, &eta, nll_ltbs, &model, theta, &omega, &sigma, 0.05, 5, &mut rng);
         assert!(
             stepped_ltbs.is_some(),
             "LTBS + ExpressionScale now takes the gradient-based HMC path"
@@ -354,9 +333,6 @@ mod tests {
         let (q1, _) = leapfrog(&q0, &p0, &grad_fn, 0.05, 5);
         let nll1 = nll(&q1);
 
-        assert!(
-            nll1 < nll0,
-            "leapfrog did not reduce NLL: nll0={nll0:.6}, nll1={nll1:.6}"
-        );
+        assert!(nll1 < nll0, "leapfrog did not reduce NLL: nll0={nll0:.6}, nll1={nll1:.6}");
     }
 }

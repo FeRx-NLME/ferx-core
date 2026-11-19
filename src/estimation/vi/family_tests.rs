@@ -24,11 +24,8 @@ fn omega_2x2() -> OmegaMatrix {
 }
 
 fn omega_3x3() -> OmegaMatrix {
-    let m = DMatrix::from_row_slice(
-        3,
-        3,
-        &[0.09, 0.02, 0.01, 0.02, 0.06, 0.015, 0.01, 0.015, 0.04],
-    );
+    let m =
+        DMatrix::from_row_slice(3, 3, &[0.09, 0.02, 0.01, 0.02, 0.06, 0.015, 0.01, 0.015, 0.04]);
     OmegaMatrix::from_matrix_with_mask(
         m,
         vec!["A".into(), "B".into(), "C".into()],
@@ -101,12 +98,7 @@ fn init_places_q_at_the_prior() {
     for k in 0..2 {
         assert_close(mean[k], 0.0, 1e-12, "full-rank init mean");
         for j in 0..2 {
-            assert_close(
-                cov[(k, j)],
-                omega.matrix[(k, j)],
-                1e-10,
-                "full-rank init cov",
-            );
+            assert_close(cov[(k, j)], omega.matrix[(k, j)], 1e-10, "full-rank init cov");
         }
     }
 
@@ -114,12 +106,7 @@ fn init_places_q_at_the_prior() {
     let (mean, cov) = mf.moments(&mf.init(&omega));
     for k in 0..2 {
         assert_close(mean[k], 0.0, 1e-12, "mean-field init mean");
-        assert_close(
-            cov[(k, k)],
-            omega.matrix[(k, k)],
-            1e-10,
-            "mean-field init var",
-        );
+        assert_close(cov[(k, k)], omega.matrix[(k, k)], 1e-10, "mean-field init var");
     }
     assert_eq!(cov[(0, 1)], 0.0, "mean-field cov must stay diagonal");
 }
@@ -131,17 +118,13 @@ fn init_places_q_at_the_prior() {
 fn kl_is_zero_at_the_prior() {
     let omega = omega_2x2();
     let fr = FullRank::new(2);
-    let kl = fr
-        .kl_to_normal(&fr.init(&omega), &omega)
-        .expect("closed form");
+    let kl = fr.kl_to_normal(&fr.init(&omega), &omega).expect("closed form");
     assert_close(kl.value, 0.0, 1e-9, "full-rank KL at prior");
 
     // Mean-field cannot represent the correlation, so its KL at "its own prior"
     // is strictly positive — that gap IS the mean-field approximation error.
     let mf = MeanField::new(2);
-    let kl_mf = mf
-        .kl_to_normal(&mf.init(&omega), &omega)
-        .expect("closed form");
+    let kl_mf = mf.kl_to_normal(&mf.init(&omega), &omega).expect("closed form");
     assert!(
         kl_mf.value > 0.0,
         "mean-field cannot match a correlated prior exactly, got KL = {}",
@@ -150,9 +133,7 @@ fn kl_is_zero_at_the_prior() {
 
     // On an uncorrelated Ω it can, and must.
     let diag = OmegaMatrix::from_diagonal(&[0.04, 0.09], vec!["A".into(), "B".into()]);
-    let kl_diag = mf
-        .kl_to_normal(&mf.init(&diag), &diag)
-        .expect("closed form");
+    let kl_diag = mf.kl_to_normal(&mf.init(&diag), &diag).expect("closed form");
     assert_close(kl_diag.value, 0.0, 1e-9, "mean-field KL at diagonal prior");
 }
 
@@ -181,12 +162,8 @@ fn sample_matches_mu_plus_l_eps() {
     for j in 0..2 {
         let mut eps = vec![0.0; 2];
         eps[j] = 1.0;
-        let col: Vec<f64> = fr
-            .sample(&phi, &eps)
-            .iter()
-            .zip(mean.iter())
-            .map(|(e, m)| e - m)
-            .collect();
+        let col: Vec<f64> =
+            fr.sample(&phi, &eps).iter().zip(mean.iter()).map(|(e, m)| e - m).collect();
         for a in 0..2 {
             for b in 0..2 {
                 reconstructed[(a, b)] += col[a] * col[b];
@@ -207,10 +184,7 @@ fn chain_to_phi_matches_fd_of_sample() {
     let omega = omega_3x3();
 
     for (label, fam) in [
-        (
-            "full_rank",
-            Box::new(FullRank::new(3)) as Box<dyn VariationalFamily>,
-        ),
+        ("full_rank", Box::new(FullRank::new(3)) as Box<dyn VariationalFamily>),
         ("mean_field", Box::new(MeanField::new(3))),
     ] {
         let phi = {
@@ -295,10 +269,7 @@ fn closed_form_kl_matches_monte_carlo() {
     }
     let mc = acc / n as f64;
     // Monte-Carlo error at this sample size; the point is agreement, not precision.
-    assert!(
-        (mc - closed).abs() < 5e-3,
-        "closed-form KL {closed:.6} vs Monte-Carlo {mc:.6}"
-    );
+    assert!((mc - closed).abs() < 5e-3, "closed-form KL {closed:.6} vs Monte-Carlo {mc:.6}");
 }
 
 /// `∂KL/∂φ` against central FD of the KL value, for both families.
@@ -307,10 +278,7 @@ fn kl_d_phi_matches_fd() {
     let omega = omega_3x3();
 
     for (label, fam) in [
-        (
-            "full_rank",
-            Box::new(FullRank::new(3)) as Box<dyn VariationalFamily>,
-        ),
+        ("full_rank", Box::new(FullRank::new(3)) as Box<dyn VariationalFamily>),
         ("mean_field", Box::new(MeanField::new(3))),
     ] {
         let phi = {
@@ -323,11 +291,8 @@ fn kl_d_phi_matches_fd() {
         let kl = fam.kl_to_normal(&phi, &omega).expect("closed form");
 
         for i in 0..fam.n_params() {
-            let want = central_fd(
-                |p| fam.kl_to_normal(p, &omega).expect("closed form").value,
-                &phi,
-                i,
-            );
+            let want =
+                central_fd(|p| fam.kl_to_normal(p, &omega).expect("closed form").value, &phi, i);
             assert_close(kl.d_phi[i], want, 1e-6, &format!("{label} ∂KL/∂φ[{i}]"));
         }
     }
@@ -474,10 +439,7 @@ fn log_density_gradient_matches_fd() {
     let omega = omega_3x3();
 
     for (label, fam) in [
-        (
-            "full_rank",
-            Box::new(FullRank::new(3)) as Box<dyn VariationalFamily>,
-        ),
+        ("full_rank", Box::new(FullRank::new(3)) as Box<dyn VariationalFamily>),
         ("mean_field", Box::new(MeanField::new(3))),
     ] {
         let phi = {
@@ -540,10 +502,7 @@ fn single_eta_models_work_for_both_families() {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
 
     for (label, fam) in [
-        (
-            "full_rank",
-            Box::new(FullRank::new(1)) as Box<dyn VariationalFamily>,
-        ),
+        ("full_rank", Box::new(FullRank::new(1)) as Box<dyn VariationalFamily>),
         ("mean_field", Box::new(MeanField::new(1))),
     ] {
         let phi = fam.init(&omega);

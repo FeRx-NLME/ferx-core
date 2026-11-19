@@ -80,10 +80,7 @@ fn predict_rejects_an_undefined_scaling_identifier() {
     let pop = population(&[], HashMap::new());
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("TOTALLY_UNDEFINED_NAME"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("TOTALLY_UNDEFINED_NAME"), "unexpected Err: {err}");
 }
 
 /// Positive control: the guard keys on the *data*, not on the name. The identical
@@ -97,10 +94,7 @@ fn predict_accepts_a_scaling_identifier_the_data_carries() {
     let model =
         parse_model_string(&UNDEFINED_READOUT.replace("TOTALLY_UNDEFINED_NAME", "SOME_COVARIATE"))
             .expect("parse");
-    let pop = population(
-        &["SOME_COVARIATE"],
-        HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]),
-    );
+    let pop = population(&["SOME_COVARIATE"], HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]));
     let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3, "one row per observation");
     assert!(
@@ -123,10 +117,7 @@ fn predict_accepts_a_covariate_carried_only_by_the_subject_maps() {
         parse_model_string(&UNDEFINED_READOUT.replace("TOTALLY_UNDEFINED_NAME", "SOME_COVARIATE"))
             .expect("parse");
     let pop = population(&[], HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]));
-    assert!(
-        pop.covariate_names.is_empty(),
-        "the point of this case is an unpopulated name list"
-    );
+    assert!(pop.covariate_names.is_empty(), "the point of this case is an unpopulated name list");
     let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3, "one row per observation");
     assert!(

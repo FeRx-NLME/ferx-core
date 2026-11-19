@@ -18,12 +18,8 @@ use std::collections::HashMap;
 const DECISIONS: [f64; 4] = [0.0, 24.0, 48.0, 72.0];
 
 /// The four record layouts of the #2895 table.
-const LAYOUTS: [&[f64]; 4] = [
-    &[0.0, 24.0, 48.0, 72.0],
-    &[0.0, 23.0, 47.0, 71.0],
-    &[0.0, 12.0, 48.0, 72.0],
-    &[0.0, 72.0],
-];
+const LAYOUTS: [&[f64]; 4] =
+    [&[0.0, 24.0, 48.0, 72.0], &[0.0, 23.0, 47.0, 71.0], &[0.0, 12.0, 48.0, 72.0], &[0.0, 72.0]];
 
 /// A 100-unit bolus at every decision except a hold at 48, so the decision at 48 leaves no
 /// dose row: only the decision's own record can end the interval there.
@@ -56,10 +52,7 @@ fn drawn_eta_and_kappas(model: &CompiledModel, seed: u64) -> (Vec<f64>, Vec<Vec<
             let z: Vec<f64> = (0..model.n_kappa)
                 .map(|k| crate::sim::adaptive::kappa_standard_normal(base, g, k))
                 .collect();
-            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
-                .iter()
-                .copied()
-                .collect()
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z)).iter().copied().collect()
         })
         .collect();
     (eta, kappas)
@@ -70,12 +63,8 @@ fn drawn_eta_and_kappas(model: &CompiledModel, seed: u64) -> (Vec<f64>, Vec<Vec<
 /// `predict_iov` indexes κ by `iov_occasion_groups` — observation occasions first — so the
 /// drawn κ are handed over in that order, not in decision order.
 fn predict_iov_static(
-    model: &CompiledModel,
-    res: &AdaptiveSimulationResult,
-    obs: &[f64],
-    eta: &[f64],
-    kappas: &[Vec<f64>],
-    records: bool,
+    model: &CompiledModel, res: &AdaptiveSimulationResult, obs: &[f64], eta: &[f64],
+    kappas: &[Vec<f64>], records: bool,
 ) -> Vec<f64> {
     let doses: Vec<DoseEvent> = res
         .ledger
@@ -188,11 +177,7 @@ fn a_data_record_on_a_decision_changes_nothing() {
     let sparse = run_iov(&[0.0, 72.0], false, SEED);
     let with_record = run_iov(&[0.0, 24.0, 72.0], false, SEED);
     let at = |res: &AdaptiveSimulationResult, t: f64| {
-        res.trajectories
-            .iter()
-            .find(|r| r.time == t)
-            .expect("a row")
-            .ipred
+        res.trajectories.iter().find(|r| r.time == t).expect("a row").ipred
     };
     for t in [0.0, 72.0] {
         assert_eq!(
@@ -267,9 +252,7 @@ fn wt(w: f64) -> HashMap<String, f64> {
 /// covariate row `fill_rule` gives it. `rows` are `(time, WT)` observation records (`WT`
 /// unread by `ODE_TIME`). Returns the worst relative gap, `NaN`-safe.
 fn tv_gap(
-    model_src: &str,
-    rows: &[(f64, f64)],
-    run_rule: DecisionCovariates,
+    model_src: &str, rows: &[(f64, f64)], run_rule: DecisionCovariates,
     fill_rule: DecisionCovariates,
 ) -> f64 {
     let model = parse_model_string(model_src).expect("parse");
@@ -313,12 +296,7 @@ fn tv_gap(
     assert_eq!(preds.len(), res.trajectories.len());
     let mut worst = 0.0_f64;
     for (r, p) in res.trajectories.iter().zip(&preds) {
-        assert!(
-            r.ipred.is_finite() && p.pred.is_finite(),
-            "{} / {}",
-            r.ipred,
-            p.pred
-        );
+        assert!(r.ipred.is_finite() && p.pred.is_finite(), "{} / {}", r.ipred, p.pred);
         let gap = ((r.ipred - p.pred) / p.pred).abs();
         assert!(gap.is_finite(), "gap {gap} at t={}", r.time);
         worst = worst.max(gap);
@@ -345,10 +323,7 @@ fn each_decision_covariates_rule_equals_predict_on_its_own_fill() {
         let own = tv_gap(ODE_TV, &sparse, rule, rule);
         assert_eq!(own, 0.0, "{rule:?} against its own fill: {own:e}");
         let crossed = tv_gap(ODE_TV, &sparse, rule, other);
-        assert!(
-            crossed > 1e-2,
-            "{rule:?} against {other:?}'s fill: {crossed:e}"
-        );
+        assert!(crossed > 1e-2, "{rule:?} against {other:?}'s fill: {crossed:e}");
     }
     for rule in [DecisionCovariates::Locf, DecisionCovariates::Nocb] {
         let flat = [(0.0, 70.0), (12.0, 70.0), (72.0, 70.0)];
@@ -416,12 +391,7 @@ fn an_implied_dose_before_the_next_data_record_is_governed_by_the_decision() {
     let want = crate::pk::predict_iov(&model, s, &model.default_params.theta, &eta, &ordered);
     let got = res.trajectories[1].ipred;
     assert!(got.is_finite() && want[1].is_finite() && got > 1.0);
-    assert_eq!(
-        got.to_bits(),
-        want[1].to_bits(),
-        "t=96: adaptive {got} vs predict_iov {}",
-        want[1]
-    );
+    assert_eq!(got.to_bits(), want[1].to_bits(), "t=96: adaptive {got} vs predict_iov {}", want[1]);
 }
 
 /// A declarative block owns `decision_covariates`, so `simulate_adaptive_from_spec` refuses
@@ -535,10 +505,7 @@ fn under_iov_each_decision_covariates_rule_equals_predict_iov_on_its_own_fill() 
     ] {
         assert_eq!(gap(rule, rule), 0.0, "{rule:?} against its own fill");
         let crossed = gap(rule, other);
-        assert!(
-            crossed > 1e-2,
-            "{rule:?} against {other:?}'s fill: {crossed:e}"
-        );
+        assert!(crossed > 1e-2, "{rule:?} against {other:?}'s fill: {crossed:e}");
     }
 }
 
@@ -575,13 +542,6 @@ fn an_implied_dose_governed_by_a_decision_reads_the_decisions_time() {
     let preds = predict(&model, &sp, &model.default_params).expect("predicts");
     let want: Vec<f64> = preds.iter().map(|p| p.pred).collect();
     let got: Vec<f64> = res.trajectories.iter().map(|r| r.ipred).collect();
-    assert!(
-        got.iter().all(|v| v.is_finite()) && got[1] > 1e-2,
-        "{got:?}"
-    );
-    assert_eq!(
-        bits(got.iter().copied()),
-        bits(want.iter().copied()),
-        "{got:?} vs {want:?}"
-    );
+    assert!(got.iter().all(|v| v.is_finite()) && got[1] > 1e-2, "{got:?}");
+    assert_eq!(bits(got.iter().copied()), bits(want.iter().copied()), "{got:?} vs {want:?}");
 }

@@ -94,10 +94,7 @@ fn tv_subject_with_dose() -> Subject {
 /// a third, independent orchestration used only to hand the check a *correct*
 /// build (accepted) and known-corrupt copies (rejected).
 fn canonical_iov(
-    model: &CompiledModel,
-    params: &ModelParameters,
-    subject: &Subject,
-    eta_slice: &[f64],
+    model: &CompiledModel, params: &ModelParameters, subject: &Subject, eta_slice: &[f64],
     decision_times: &[f64],
 ) -> (Vec<Vec<f64>>, Vec<PkParams>, crate::pk::EventPkParams) {
     let n_eta = model.n_eta;
@@ -108,9 +105,8 @@ fn canonical_iov(
     let mut eta_occ = Vec::with_capacity(n_occ);
     let mut decision_pk = Vec::with_capacity(n_occ);
     for g in 0..n_occ {
-        let zk: Vec<f64> = (0..model.n_kappa)
-            .map(|k| kappa_standard_normal(kappa_base, g, k))
-            .collect();
+        let zk: Vec<f64> =
+            (0..model.n_kappa).map(|k| kappa_standard_normal(kappa_base, g, k)).collect();
         let kappa_g = &omega_iov.chol * DVector::from_column_slice(&zk);
         let mut e: Vec<f64> = eta_slice[..n_eta].to_vec();
         e.extend(kappa_g.iter().copied());
@@ -120,12 +116,7 @@ fn canonical_iov(
             subject,
             &subject.covariates,
         );
-        decision_pk.push((model.pk_param_fn)(
-            &params.theta,
-            &e,
-            dcov,
-            decision_times[g],
-        ));
+        decision_pk.push((model.pk_param_fn)(&params.theta, &e, dcov, decision_times[g]));
         eta_occ.push(e);
     }
     let event_pk = crate::pk::compute_event_pk_params_iov(
@@ -272,11 +263,7 @@ fn catches_corrupted_pk_only_snapshot() {
     let decisions = vec![0.0, 12.0, 24.0];
     let (eta_occ, decision_pk, mut event_pk) =
         canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
-    assert_eq!(
-        event_pk.pk_only.len(),
-        1,
-        "the EVID=2 record must yield a pk_only snapshot"
-    );
+    assert_eq!(event_pk.pk_only.len(), 1, "the EVID=2 record must yield a pk_only snapshot");
     event_pk.pk_only[0].values[0] += 1.0; // corrupt CL at the pk-only record
     let err = verify_adaptive_snapshots(
         &model,
@@ -309,11 +296,7 @@ fn catches_corrupted_dose_snapshot() {
     let decisions = vec![0.0, 12.0, 24.0];
     let (eta_occ, decision_pk, mut event_pk) =
         canonical_iov(&model, &params, &subject, &eta_slice, &decisions);
-    assert_eq!(
-        event_pk.dose.len(),
-        1,
-        "the base dose must yield a per-dose snapshot (#931)"
-    );
+    assert_eq!(event_pk.dose.len(), 1, "the base dose must yield a per-dose snapshot (#931)");
     // Sanity: the canonical (correct) build passes before we corrupt it.
     verify_adaptive_snapshots(
         &model,
@@ -359,15 +342,10 @@ fn an_implied_doses_parent_lag_is_part_of_the_canonical_dose_snapshot() {
     let params = model.default_params.clone();
     let mut subject = tv_subject_with_dose();
     let mut implied = DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0);
-    implied.implied = Some(crate::types::ImpliedDose {
-        parent: 0,
-        param_time: 24.0,
-        gov_time: 24.0,
-    });
+    implied.implied =
+        Some(crate::types::ImpliedDose { parent: 0, param_time: 24.0, gov_time: 24.0 });
     subject.doses.push(implied);
-    subject
-        .dose_covariates
-        .push(HashMap::from([("CRCL".to_string(), 50.0)]));
+    subject.dose_covariates.push(HashMap::from([("CRCL".to_string(), 50.0)]));
     subject.dose_occasions.push(0);
     let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
     let decisions = vec![0.0, 12.0, 24.0];
@@ -424,10 +402,7 @@ fn catches_missized_occasion_arrays() {
         Some(&event_pk),
     )
     .expect_err("a mis-sized occasion array must be rejected");
-    assert!(
-        err.contains("mis-sized"),
-        "explains the size mismatch: {err}"
-    );
+    assert!(err.contains("mis-sized"), "explains the size mismatch: {err}");
 }
 
 #[test]
@@ -497,10 +472,8 @@ fn wired_into_a_real_reactive_tvcov_iov_run() {
     let decisions = vec![0.0, 24.0, 48.0, 72.0];
     // Obs coincide with decisions; CRCL declines across the horizon.
     let crcls = [100.0, 80.0, 60.0, 40.0];
-    let obs_covariates: Vec<HashMap<String, f64>> = crcls
-        .iter()
-        .map(|&c| HashMap::from([("CRCL".to_string(), c)]))
-        .collect();
+    let obs_covariates: Vec<HashMap<String, f64>> =
+        crcls.iter().map(|&c| HashMap::from([("CRCL".to_string(), c)])).collect();
     let subject = Subject {
         id: "S1".into(),
         obs_times: decisions.clone(),
@@ -538,10 +511,7 @@ fn rejects_iov_arrays_without_omega_iov() {
     // typed error rather than unwrap-panic.
     let model = parse_model_string(TVCOV_NO_IOV).expect("parse"); // omega_iov = None
     let params = model.default_params.clone();
-    assert!(
-        params.omega_iov.is_none(),
-        "TVCOV_NO_IOV must have no omega_iov"
-    );
+    assert!(params.omega_iov.is_none(), "TVCOV_NO_IOV must have no omega_iov");
     let subject = tv_subject();
     let eta_slice = vec![0.0; model.n_eta + model.n_kappa];
     let decisions = vec![0.0, 12.0, 24.0];
@@ -658,22 +628,12 @@ fn records_subject_1599() -> Subject {
     ];
     s.dose_occasions = vec![0; 6];
     s.pk_only_times = vec![10.0, 20.0, 50.0, 80.0, 80.0];
-    s.pk_only_covariates = vec![
-        row_1599(4.0),
-        row_1599(5.0),
-        row_1599(13.0),
-        row_1599(18.0),
-        row_1599(19.0),
-    ];
+    s.pk_only_covariates =
+        vec![row_1599(4.0), row_1599(5.0), row_1599(13.0), row_1599(18.0), row_1599(19.0)];
     s.pk_only_occasions = vec![1; 5];
     s.reset_times = vec![10.0, 25.0, 40.0, 60.0, 60.0];
-    s.reset_covariates = vec![
-        row_1599(1.0),
-        row_1599(9.0),
-        row_1599(11.0),
-        row_1599(14.0),
-        row_1599(15.0),
-    ];
+    s.reset_covariates =
+        vec![row_1599(1.0), row_1599(9.0), row_1599(11.0), row_1599(14.0), row_1599(15.0)];
     s.reset_occasions = vec![1; 5];
     s
 }
@@ -685,41 +645,17 @@ fn decision_covs_by_scan_picks_the_record_in_force() {
     let s = records_subject_1599();
     let cases: [(f64, f64, &str); 12] = [
         (30.0, 8.0, "a later record replaces an earlier one"),
-        (
-            5.0,
-            0.0,
-            "before the first record: the baseline, not the first record ahead",
-        ),
-        (
-            10.0,
-            7.0,
-            "obs over EVID=2 / dose / reset, and the LAST of two co-timed obs",
-        ),
-        (
-            22.0,
-            5.0,
-            "carried forward from the latest record (EVID=2@20)",
-        ),
+        (5.0, 0.0, "before the first record: the baseline, not the first record ahead"),
+        (10.0, 7.0, "obs over EVID=2 / dose / reset, and the LAST of two co-timed obs"),
+        (22.0, 5.0, "carried forward from the latest record (EVID=2@20)"),
         (25.0, 9.0, "a reset is a record"),
-        (
-            10.0 - 1e-13,
-            7.0,
-            "a record within EVENT_MATCH_TOL after the decision counts",
-        ),
+        (10.0 - 1e-13, 7.0, "a record within EVENT_MATCH_TOL after the decision counts"),
         (15.0, 7.0, "carried forward across a gap"),
         (41.0, 10.0, "dose over a co-timed reset"),
         (50.0, 13.0, "EVID=2 over a co-timed dose"),
         (60.0, 15.0, "the LAST of two co-timed resets"),
-        (
-            70.0,
-            17.0,
-            "the LAST of two co-timed doses, nothing above them",
-        ),
-        (
-            80.0,
-            19.0,
-            "the LAST of two co-timed EVID=2 rows, nothing above them",
-        ),
+        (70.0, 17.0, "the LAST of two co-timed doses, nothing above them"),
+        (80.0, 19.0, "the LAST of two co-timed EVID=2 rows, nothing above them"),
     ];
     let times: Vec<f64> = cases.iter().map(|c| c.0).collect();
     let got = super::adaptive::decision_covs_by_scan(&s, &times);
@@ -745,11 +681,7 @@ fn decision_covs_by_scan_skips_an_implied_dose() {
     let row = |v: f64| HashMap::from([("ROW".to_string(), v)]);
     let implied = |t: f64, gov: f64| {
         let mut d = DoseEvent::new(t, 10.0, 1, 0.0, false, 0.0);
-        d.implied = Some(crate::types::ImpliedDose {
-            parent: 0,
-            param_time: gov,
-            gov_time: gov,
-        });
+        d.implied = Some(crate::types::ImpliedDose { parent: 0, param_time: gov, gov_time: gov });
         d
     };
     let mut s = tv_subject_with_dose();
@@ -766,10 +698,7 @@ fn decision_covs_by_scan_skips_an_implied_dose() {
     s.covariates = row(0.0);
     let times = [15.0, 27.0];
     let got = super::adaptive::decision_covs_by_scan(&s, &times);
-    assert_eq!(
-        got[0]["ROW"], 2.0,
-        "t=15: the observation at 6, not the implied dose's ROW 3"
-    );
+    assert_eq!(got[0]["ROW"], 2.0, "t=15: the observation at 6, not the implied dose's ROW 3");
     assert_eq!(
         got[1]["ROW"], 4.0,
         "t=27: the dose row at 24, not the co-timed implied dose's ROW 5"

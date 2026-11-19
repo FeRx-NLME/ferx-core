@@ -82,11 +82,7 @@ fn check_covariates_reports_undeclared_eta_before_missing_covariate() {
     let pop = population_with_covariates(&[]);
     let diags = check_covariates(&model, &pop);
 
-    assert_eq!(
-        diags.len(),
-        2,
-        "expected one eta + one covariate diagnostic"
-    );
+    assert_eq!(diags.len(), 2, "expected one eta + one covariate diagnostic");
     assert_eq!(diags[0].code, "E_ETA_NOT_DECLARED");
     assert_eq!(diags[1].code, "E_MISSING_COVARIATE");
     assert!(diags[0].message.contains("ETA_CL"));
@@ -182,11 +178,7 @@ fn check_covariates_reports_only_the_eta_diagnostic_when_nothing_else_is_missing
     let pop = population_with_covariates(&["WT"]);
     let diags = check_covariates(&model, &pop);
 
-    assert_eq!(
-        diags.len(),
-        1,
-        "expected the eta diagnostic alone: {diags:?}"
-    );
+    assert_eq!(diags.len(), 1, "expected the eta diagnostic alone: {diags:?}");
     assert_eq!(diags[0].code, "E_ETA_NOT_DECLARED");
     assert_eq!(diags[0].block.as_deref(), Some("parameters"));
 }
@@ -196,17 +188,11 @@ fn undeclared_random_effect_message_agrees_in_number() {
     // Singular and plural are separate arms; a model can easily lose a whole
     // `omega` block and strand several etas at once, so both must read correctly.
     let one = crate::api::validation::undeclared_random_effect_message(&["ETA_CL"]);
-    assert!(
-        one.contains("references ETA_CL as a random effect"),
-        "{one}"
-    );
+    assert!(one.contains("references ETA_CL as a random effect"), "{one}");
     assert!(one.contains("declaration defines it"), "{one}");
 
     let many = crate::api::validation::undeclared_random_effect_message(&["ETA_CL", "KAPPA_V"]);
-    assert!(
-        many.contains("references ETA_CL, KAPPA_V as random effects"),
-        "{many}"
-    );
+    assert!(many.contains("references ETA_CL, KAPPA_V as random effects"), "{many}");
     assert!(many.contains("declaration defines them"), "{many}");
     // The worked example is drawn from the first name in both arms.
     assert!(many.contains("omega ETA_CL ~ 0.09"), "{many}");
@@ -218,10 +204,7 @@ fn undeclared_random_effect_message_agrees_in_number() {
 /// is reached through the path, and the model stem names the report.
 fn temp_model(src: &str) -> tempfile::NamedTempFile {
     use std::io::Write;
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
     f.write_all(src.as_bytes()).expect("write temp model");
     f.flush().expect("flush temp model");
     f
@@ -260,9 +243,7 @@ fn check_without_data_warns_about_an_undeclared_random_effect() {
     assert_eq!(hit.severity, crate::Severity::Warning);
     assert!(hit.message.contains("ETA_CL"), "{}", hit.message);
     assert!(
-        hit.suggestion
-            .as_deref()
-            .is_some_and(|s| s.contains("--data")),
+        hit.suggestion.as_deref().is_some_and(|s| s.contains("--data")),
         "the suggestion must point at re-running with data: {:?}",
         hit.suggestion
     );
@@ -282,19 +263,10 @@ fn check_with_data_escalates_the_undeclared_random_effect_to_an_error() {
         Some("data/one_cpt_iv.csv"),
     );
 
+    assert!(!report.valid, "a stranded eta with data present is an error");
+    assert!(report.diagnostics.iter().any(|d| d.code == "E_ETA_NOT_DECLARED"));
     assert!(
-        !report.valid,
-        "a stranded eta with data present is an error"
-    );
-    assert!(report
-        .diagnostics
-        .iter()
-        .any(|d| d.code == "E_ETA_NOT_DECLARED"));
-    assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "W_ETA_NOT_DECLARED"),
+        !report.diagnostics.iter().any(|d| d.code == "W_ETA_NOT_DECLARED"),
         "the warning must not double up with the error: {:?}",
         report.diagnostics
     );
@@ -306,27 +278,17 @@ fn check_is_clean_for_a_deliberately_fixed_effects_only_model() {
     // model that drops the `omega` line AND the `exp(ETA_…)` term is simply valid.
     let report = validate_model_file("examples/one_cpt_iv_pooled.ferx", None);
     assert!(
-        !report
-            .diagnostics
-            .iter()
-            .any(|d| d.code == "W_ETA_NOT_DECLARED"),
+        !report.diagnostics.iter().any(|d| d.code == "W_ETA_NOT_DECLARED"),
         "a fixed-effects-only model must not be warned about: {:?}",
         report.diagnostics
     );
-    assert!(
-        report.valid,
-        "unexpected findings: {:?}",
-        report.diagnostics
-    );
+    assert!(report.valid, "unexpected findings: {:?}", report.diagnostics);
 }
 
 // --- SAEM guard -------------------------------------------------------------
 
 fn opts_with_methods(methods: Vec<EstimationMethod>) -> FitOptions {
-    FitOptions {
-        methods,
-        ..Default::default()
-    }
+    FitOptions { methods, ..Default::default() }
 }
 
 #[test]
@@ -367,11 +329,7 @@ fn check_model_options_allows_focei_without_random_effects() {
     // The estimators that *do* reduce exactly at n_eta = 0 must stay unguarded.
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
-    for method in [
-        EstimationMethod::Foce,
-        EstimationMethod::FoceI,
-        EstimationMethod::Laplace,
-    ] {
+    for method in [EstimationMethod::Foce, EstimationMethod::FoceI, EstimationMethod::Laplace] {
         let diags = check_model_options(&model, &opts_with_methods(vec![method]));
         assert!(
             !diags.iter().any(|d| d.code == "E_SAEM_NO_RANDOM_EFFECTS"),
@@ -426,11 +384,7 @@ fn check_model_options_rejects_imp_anywhere_in_a_chain() {
 fn check_model_options_allows_imp_impmap_bayes_with_random_effects() {
     let model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     assert!(model.n_eta > 0, "fixture must carry random effects");
-    for method in [
-        EstimationMethod::Imp,
-        EstimationMethod::Impmap,
-        EstimationMethod::Bayes,
-    ] {
+    for method in [EstimationMethod::Imp, EstimationMethod::Impmap, EstimationMethod::Bayes] {
         let diags = check_model_options(&model, &opts_with_methods(vec![method]));
         assert!(
             !diags.iter().any(|d| d.code == "E_METHOD_NO_RANDOM_EFFECTS"),
@@ -451,28 +405,12 @@ fn check_model_options_rejects_exactly_the_methods_that_require_random_effects()
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     model.n_eta = 0;
     use EstimationMethod::*;
-    for method in [
-        Foce,
-        FoceI,
-        FoceGn,
-        FoceGnHybrid,
-        Saem,
-        Imp,
-        Impmap,
-        Bayes,
-        Laplace,
-        Vi,
-    ] {
+    for method in [Foce, FoceI, FoceGn, FoceGnHybrid, Saem, Imp, Impmap, Bayes, Laplace, Vi] {
         let diags = check_model_options(&model, &opts_with_methods(vec![method]));
         let codes: Vec<&str> = diags
             .iter()
             .map(|d| d.code.as_str())
-            .filter(|c| {
-                matches!(
-                    *c,
-                    "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"
-                )
-            })
+            .filter(|c| matches!(*c, "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"))
             .collect();
         let want: &[&str] = match (method.requires_random_effects(), method) {
             (false, _) => &[],
@@ -494,10 +432,7 @@ fn check_model_options_reports_each_member_once_in_chain_order() {
         check_model_options(&model, &opts_with_methods(methods))
             .into_iter()
             .filter(|d| {
-                matches!(
-                    d.code.as_str(),
-                    "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS"
-                )
+                matches!(d.code.as_str(), "E_SAEM_NO_RANDOM_EFFECTS" | "E_METHOD_NO_RANDOM_EFFECTS")
             })
             .map(|d| d.message)
             .collect()
@@ -536,10 +471,8 @@ fn check_model_options_does_not_warn_gn_hybrid_or_mixed_effects_gn() {
     // has the inner EBE loop to absorb a poor start — neither may warn.
     let mut pooled = crate::types::test_helpers::analytical_model(GradientMethod::Fd);
     pooled.n_eta = 0;
-    let diags = check_model_options(
-        &pooled,
-        &opts_with_methods(vec![EstimationMethod::FoceGnHybrid]),
-    );
+    let diags =
+        check_model_options(&pooled, &opts_with_methods(vec![EstimationMethod::FoceGnHybrid]));
     assert!(
         !diags.iter().any(|d| d.code == "W_GN_NO_RANDOM_EFFECTS"),
         "gn_hybrid must not warn at n_eta = 0: {diags:?}"
@@ -566,10 +499,7 @@ fn check_model_options_rejects_imp_via_the_singular_method_field() {
         (EstimationMethod::Impmap, "impmap"),
         (EstimationMethod::Bayes, "bayes"),
     ] {
-        let opts = FitOptions {
-            method,
-            ..Default::default()
-        };
+        let opts = FitOptions { method, ..Default::default() };
         assert!(opts.methods.is_empty(), "must exercise the singular field");
         let diags = check_model_options(&model, &opts);
         let hit = diags

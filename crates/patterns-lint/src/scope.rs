@@ -63,10 +63,7 @@ pub fn attrs_mark_test(attrs: &[Attribute]) -> bool {
     attrs.iter().any(|a| {
         let path = a.path();
         if path.is_ident("cfg") {
-            return a
-                .parse_args::<Meta>()
-                .map(|m| cfg_meta_requires_test(&m))
-                .unwrap_or(false);
+            return a.parse_args::<Meta>().map(|m| cfg_meta_requires_test(&m)).unwrap_or(false);
         }
         // `#[test]`, `#[tokio::test]`, `#[rstest::test]`, …
         path.segments.last().is_some_and(|s| s.ident == "test")
@@ -82,11 +79,7 @@ pub fn path_is_test_by_name(rel: &str) -> bool {
     }
     // Position of the crate's `src`/`tests` directory: `tests/..` at the repo
     // root, or `crates/<name>/tests/..`.
-    let crate_dir_len = if parts.first() == Some(&"crates") {
-        2
-    } else {
-        0
-    };
+    let crate_dir_len = if parts.first() == Some(&"crates") { 2 } else { 0 };
     match parts.get(crate_dir_len) {
         Some(&"tests") => true,
         Some(&"src") => parts[crate_dir_len + 1..parts.len() - 1].contains(&"tests"),
@@ -126,16 +119,9 @@ fn rel_of(root: &Path, p: &Path) -> String {
 /// The directory a file's out-of-line child modules resolve against.
 fn module_dir(file: &Path, rel: &str) -> PathBuf {
     let parent = file.parent().unwrap_or(Path::new("")).to_path_buf();
-    let name = file
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
+    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
     let parts: Vec<&str> = rel.split('/').collect();
-    let crate_dir_len = if parts.first() == Some(&"crates") {
-        2
-    } else {
-        0
-    };
+    let crate_dir_len = if parts.first() == Some(&"crates") { 2 } else { 0 };
     let in_crate = &parts[crate_dir_len.min(parts.len())..];
     // Crate roots behave like `mod.rs`: `src/lib.rs`, `src/main.rs`,
     // `src/bin/x.rs`, and every top-level `tests/x.rs` integration target.
@@ -145,10 +131,7 @@ fn module_dir(file: &Path, rel: &str) -> PathBuf {
     if is_root {
         parent
     } else {
-        let stem = file
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_default();
+        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         parent.join(stem)
     }
 }
@@ -156,10 +139,7 @@ fn module_dir(file: &Path, rel: &str) -> PathBuf {
 fn path_attr(attrs: &[Attribute]) -> Option<String> {
     attrs.iter().find_map(|a| match &a.meta {
         Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
-            syn::Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(s),
-                ..
-            }) => Some(s.value()),
+            syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) => Some(s.value()),
             _ => None,
         },
         _ => None,
@@ -169,11 +149,7 @@ fn path_attr(attrs: &[Attribute]) -> Option<String> {
 /// Out-of-line `mod x;` declarations in `items`, resolved to files, with
 /// whether each declaration sits in test code.
 fn child_modules(
-    items: &[Item],
-    file_dir: &Path,
-    mod_dir: &Path,
-    in_test: bool,
-    out: &mut Vec<(PathBuf, bool)>,
+    items: &[Item], file_dir: &Path, mod_dir: &Path, in_test: bool, out: &mut Vec<(PathBuf, bool)>,
 ) {
     for item in items {
         let Item::Mod(m) = item else { continue };
@@ -227,10 +203,7 @@ pub fn source_paths(root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     for d in &dirs {
         walk_rs(d, &mut paths).map_err(|e| format!("{}: {e}", d.display()))?;
     }
-    Ok(paths
-        .into_iter()
-        .map(|abs| (rel_of(root, &abs), normalize(&abs)))
-        .collect())
+    Ok(paths.into_iter().map(|abs| (rel_of(root, &abs), normalize(&abs))).collect())
 }
 
 /// The files this file's out-of-line `mod x;` declarations resolve to, each
@@ -293,9 +266,7 @@ mod tests {
         assert!(cfg_meta_requires_test(&meta("all(test, feature = \"nn\")")));
         assert!(cfg_meta_requires_test(&meta("any(test, all(test, unix))")));
         // `any(test, feature)` also compiles into a production build with the feature on.
-        assert!(!cfg_meta_requires_test(&meta(
-            "any(test, feature = \"nn\")"
-        )));
+        assert!(!cfg_meta_requires_test(&meta("any(test, feature = \"nn\")")));
         assert!(!cfg_meta_requires_test(&meta("not(test)")));
         assert!(!cfg_meta_requires_test(&meta("feature = \"test\"")));
         assert!(!cfg_meta_requires_test(&meta("any()")));
@@ -333,10 +304,7 @@ mod tests {
         assert_eq!(d, Path::new("/r/src/types"));
         let d = module_dir(Path::new("/r/tests/foo.rs"), "tests/foo.rs");
         assert_eq!(d, Path::new("/r/tests"));
-        let d = module_dir(
-            Path::new("/r/crates/c/src/bin/x.rs"),
-            "crates/c/src/bin/x.rs",
-        );
+        let d = module_dir(Path::new("/r/crates/c/src/bin/x.rs"), "crates/c/src/bin/x.rs");
         assert_eq!(d, Path::new("/r/crates/c/src/bin"));
     }
 
@@ -354,11 +322,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(root.join("src/odd_name.rs"), "").unwrap();
-        std::fs::write(
-            root.join("src/a.rs"),
-            "#[cfg(test)] mod helpers;\nmod prod;\n",
-        )
-        .unwrap();
+        std::fs::write(root.join("src/a.rs"), "#[cfg(test)] mod helpers;\nmod prod;\n").unwrap();
         std::fs::write(root.join("src/a/prod.rs"), "").unwrap();
         std::fs::write(root.join("src/a/helpers.rs"), "mod deeper;\n").unwrap();
         std::fs::write(root.join("src/a/helpers/deeper.rs"), "").unwrap();

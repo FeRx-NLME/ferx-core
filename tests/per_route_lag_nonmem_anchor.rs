@@ -75,9 +75,7 @@ const PER_ROUTE_LAG_AT_NONMEM_OPTIMUM: &str = r"
 /// Evaluate ferx's FOCEI marginal objective at NONMEM's optimum (no outer steps,
 /// NONMEM-equivalent ODE accuracy) on the ferx-keyed matched dataset.
 fn ferx_ofv_at_optimum(model_src: &str, data: &str) -> f64 {
-    let model = parse_full_model(model_src)
-        .expect("anchor model must parse")
-        .model;
+    let model = parse_full_model(model_src).expect("anchor model must parse").model;
     let pop = read_nonmem_csv(Path::new(data), None, None).expect("anchor data must load");
 
     let mut opts = FitOptions::default();
@@ -90,11 +88,7 @@ fn ferx_ofv_at_optimum(model_src: &str, data: &str) -> f64 {
     opts.inner_tol = 1e-6;
 
     let result = fit(&model, &pop, &model.default_params, &opts).expect("anchor fit must run");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     result.ofv
 }
 
@@ -113,10 +107,7 @@ fn ferx_ofv_at_optimum(model_src: &str, data: &str) -> f64 {
 fn per_route_lag_marginal_ofv_matches_nonmem_at_their_optimum() {
     const NONMEM_OFV: f64 = -882.357;
     const TOLERANCE: f64 = 0.5;
-    let ofv = ferx_ofv_at_optimum(
-        PER_ROUTE_LAG_AT_NONMEM_OPTIMUM,
-        "data/per_route_lag_oral.csv",
-    );
+    let ofv = ferx_ofv_at_optimum(PER_ROUTE_LAG_AT_NONMEM_OPTIMUM, "data/per_route_lag_oral.csv");
     assert!(
         (ofv - NONMEM_OFV).abs() < TOLERANCE,
         "ferx FOCEI objective {ofv:.4} at NONMEM's optimum is outside the NONMEM-anchored \
