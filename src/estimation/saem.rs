@@ -2441,6 +2441,14 @@ fn class_sigma_subst(sigma_values: &[f64], over: &[(usize, f64)]) -> Option<Vec<
     Some(v)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch: take the per-evaluation prediction path even when every θ is pinned.
+    pub(crate) static SIGMA_ONLY_CACHE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test hook: objective evaluations served from the σ-only prediction cache.
+    pub(crate) static SIGMA_ONLY_CACHE_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[allow(clippy::too_many_arguments)]
 fn theta_sigma_mstep_light(
     model: &CompiledModel,
@@ -2607,7 +2615,75 @@ fn theta_sigma_mstep_light(
             fold_nll_grad(per_subj, n)
         }
     };
+    // σ-only M-step (#2986): with every θ pinned (`lower == upper` — mu-referenced or
+    // FIX, moved by the closed form instead), NLopt's evaluations differ only in σ, and the
+    // predictions do not depend on σ. `obs_nll_subject_into_with_schedule` is a prediction
+    // followed by `obs_nll_subject_from_preds`, so predicting once per subject and draw and
+    // reusing the result is the same arithmetic without the repeated PK solves. The cache
+    // is keyed by the exact θ the objective receives (bit pattern) and the draw, and is
+    // rebuilt if either changes, so the objective stays bit-identical. The plain arm only
+    // (no mixture class guard, no κ).
+    let sigma_only = mix_mstep.is_none()
+        && kappas_opt.is_none()
+        && n_theta > 0
+        && (0..n_theta).all(|i| lower[i] == upper[i]);
+    #[cfg(test)]
+    let sigma_only = sigma_only && !SIGMA_ONLY_CACHE_OFF.with(std::cell::Cell::get);
+    #[allow(clippy::type_complexity)]
+    let pred_cache: std::cell::RefCell<Vec<(usize, Vec<u64>, Vec<Vec<f64>>)>> =
+        std::cell::RefCell::new(Vec::new());
+    let cached_value = |th: &[f64], sg: &[f64], etas: &[Vec<f64>]| -> f64 {
+        #[cfg(test)]
+        SIGMA_ONLY_CACHE_HITS.with(|c| c.set(c.get() + 1));
+        let key = etas.as_ptr() as usize;
+        let th_bits: Vec<u64> = th.iter().map(|v| v.to_bits()).collect();
+        let n_subj = population.subjects.len();
+        let mut cache = pred_cache.borrow_mut();
+        let slot = match cache
+            .iter()
+            .position(|(k, b, _)| *k == key && *b == th_bits)
+        {
+            Some(j) => j,
+            None => {
+                cache.retain(|(k, _, _)| *k != key);
+                let preds: Vec<Vec<f64>> =
+                    crate::par::map_init(n_subj, EventPkParams::default, |scratch, i| {
+                        crate::pk::compute_predictions_with_tv_into_with_schedule(
+                            model,
+                            &population.subjects[i],
+                            th,
+                            &etas[i],
+                            scratch,
+                            schedules.get(i).and_then(|s| s.as_ref()),
+                        )
+                    });
+                cache.push((key, th_bits, preds));
+                cache.len() - 1
+            }
+        };
+        let preds = &cache[slot].2;
+        // Per subject, then summed serially in subject order — as `obs_nll_sum` (#703).
+        let per_subj: Vec<f64> = crate::par::map_init(
+            n_subj,
+            || (),
+            |_, i| {
+                crate::stats::likelihood::obs_nll_subject_from_preds(
+                    model,
+                    &population.subjects[i],
+                    &preds[i],
+                    th,
+                    sg,
+                    model.residual_cov_theta(th),
+                    &etas[i],
+                )
+            },
+        );
+        per_subj.iter().sum()
+    };
     let one_draw_value = |th: &[f64], sg: &[f64], etas: &[Vec<f64>]| -> f64 {
+        if sigma_only {
+            return cached_value(th, sg, etas);
+        }
         match (mix_mstep, kappas_opt) {
             (Some(mx), Some(kappas)) => {
                 obs_nll_sum_iov_mix(model, population, th, sg, etas, kappas, mx)

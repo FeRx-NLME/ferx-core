@@ -1432,3 +1432,51 @@ fn chain_copies_are_fingerprinted_once_not_per_evaluation() {
          registered, so every likelihood evaluation re-hashes its subject"
     );
 }
+
+/// #2986: when every θ is pinned (mu-referenced), the numerical M-step moves σ only, and
+/// predicts each subject once per draw instead of once per NLopt evaluation. Same
+/// arithmetic, so the whole fit is bit-identical to the per-evaluation path, and the
+/// cached path must actually run.
+#[test]
+fn sigma_only_mstep_reuses_predictions_bit_for_bit() {
+    use super::{SIGMA_ONLY_CACHE_HITS, SIGMA_ONLY_CACHE_OFF};
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(3.0, 0.5, 30.0)
+  theta TVV(20.0, 2.0, 200.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.05
+  sigma PROP ~ 0.04
+  sigma ADD ~ 0.1
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ combined(PROP, ADD)
+",
+    )
+    .expect("fully mu-referenced model parses");
+    let pop = baseline_cov_population();
+    let opts = FitOptions {
+        saem_n_chains: 1,
+        ..saem_opts()
+    };
+    SIGMA_ONLY_CACHE_HITS.with(|c| c.set(0));
+    SIGMA_ONLY_CACHE_OFF.with(|c| c.set(false));
+    let cached = run_bits_with(&model, &pop, &opts);
+    let hits = SIGMA_ONLY_CACHE_HITS.with(std::cell::Cell::get);
+    SIGMA_ONLY_CACHE_OFF.with(|c| c.set(true));
+    let uncached = run_bits_with(&model, &pop, &opts);
+    SIGMA_ONLY_CACHE_OFF.with(|c| c.set(false));
+    assert!(
+        hits > 0,
+        "the σ-only path never ran: every θ should be pinned"
+    );
+    assert_eq!(cached, uncached, "the cached σ-only M-step changed the fit");
+}
