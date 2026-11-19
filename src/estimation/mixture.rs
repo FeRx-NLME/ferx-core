@@ -2423,6 +2423,7 @@ mod tests {
         };
         assert!(eval.pmix[0][cls] > 0.1, "fixture: a live term");
         let mut bad = super::MixtureClassModes {
+            etas: modes.etas.clone(),
             kappas: modes.kappas.clone(),
         };
         assert!(bad.kappas[cls][0].len() >= 2, "fixture: several occasions");
@@ -4381,7 +4382,7 @@ mod tests {
                 .is_none(),
                 "{kind}: fixture: the strict assembly must decline subject 0"
             );
-            let log = OuterFdDeclineLog::reconverging(pop.subjects.len());
+            let log = OuterFdDeclineLog::new(pop.subjects.len());
             let salvaged = super::mixture_gradient_salvaged(
                 &model,
                 &pop,
@@ -4390,8 +4391,7 @@ mod tests {
                 &eval,
                 Some(&modes),
                 &log,
-            )
-            .expect("the mixing map is in scope, so the salvage forms a gradient");
+            );
             assert_eq!(
                 log.declined_indices(),
                 vec![0],
