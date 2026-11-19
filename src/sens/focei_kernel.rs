@@ -628,6 +628,130 @@ fn focei_parts<T: PkNum>(
     focei_rows_k(ctx, f, g, eta, p, None, true)
 }
 
+/// An uncensored Gaussian row's `ℓ = r²/V + log V` at prediction `fd` with variance `vd`
+/// (`r = y − f`), over any dual the caller carries: [`focei_rows`]' and the covariance
+/// Hessian's structured rows' one formula (#2980).
+#[inline]
+fn gauss_l<D: PkNum>(y: f64, fd: D, vd: D) -> D {
+    let r = D::from_f64(y) - fd;
+    r * r / vd + vd.ln()
+}
+
+/// A FOCEI row's `H̃` weight `1/V + ½·(∂V/∂f / V)²` (`c̃ = (∂V/∂f / V)·g`, no RUV IIV).
+#[inline]
+fn focei_alpha<T: PkNum>(v: T, vf: T) -> T {
+    let cs = vf / v;
+    T::from_f64(1.0) / v + T::from_f64(0.5) * cs * cs
+}
+
+/// Row `j` of the FOCEI diagonal path as the structured covariance Hessian reads it (#2980):
+/// `(ℓ, ∂ℓ/∂f, α)` at prediction `f` — an uncensored Gaussian row, no RUV IIV, no SDE, no
+/// FREM ([`structured_rows_supported`]). `T` carries the derivatives the caller needs (a dual
+/// over the row's local inputs); the arithmetic is [`focei_rows`]'.
+pub(crate) fn focei_gauss_row<T: PkNum>(
+    ctx: &LikCtx,
+    j: usize,
+    f: T,
+    p: &ParT<T>,
+) -> Option<(T, T, T)> {
+    let pk = p.wrap_rows::<1>();
+    let fd = DualT::<1, T> {
+        v: f,
+        g: [T::from_f64(1.0)],
+    };
+    let ruv = DualT::<1, T> {
+        v: T::from_f64(1.0),
+        g: [T::from_f64(0.0)],
+    };
+    let vd = ctx.variance_v(j, fd, ruv, &pk);
+    if !positive_finite(vd.v) {
+        return None;
+    }
+    let lj = gauss_l(ctx.subject.observations[j], fd, vd);
+    Some((lj.v, lj.g[0], focei_alpha(vd.v, vd.g[0])))
+}
+
+/// Row `j`'s `ℓ = r²/V + log V` alone at prediction `f` (an uncensored Gaussian row, as
+/// [`focei_gauss_row`]): what a quadrature node's aggregate `Σℓ` reads (#2980) — no
+/// derivative in `f` carried beyond `T`'s own.
+pub(crate) fn gauss_row_l<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -> Option<T> {
+    let v = ctx.variance_v(j, f, T::from_f64(1.0), p);
+    if !positive_finite(v) {
+        return None;
+    }
+    Some(gauss_l(ctx.subject.observations[j], f, v))
+}
+
+/// Whether a subject's FOCEI objective is the row-and-reduce form [`focei_gauss_row`] and the
+/// reduce `½·[ηᵀΩ⁻¹η + log|Ω| + log|Ω⁻¹ + Σ αGGᵀ|]` describe exactly: the diagonal path with
+/// every row an uncensored Gaussian one, no RUV IIV, no SDE, no FREM rows, no non-Gaussian
+/// records, no custom residual magnitude and a diagonal residual covariance — asked of
+/// `ResidualCov::is_dense` (`stats::residual_error`), which sees every correlation source,
+/// not only `block_sigma` pairs (#1081).
+pub(crate) fn structured_rows_supported(ctx: &LikCtx) -> bool {
+    let m = ctx.model;
+    !ctx.cov.is_dense()
+        && m.residual_error_eta.is_none()
+        && !ctx.sde
+        && m.frem_config.is_none()
+        && !ctx.subject.fremtype.iter().any(|&ft| ft > 0)
+        && ctx.subject.obs_records.is_empty()
+        && !(0..ctx.n()).any(|j| ctx.censored(j).is_some())
+        && !m.ruv_magnitude.as_ref().is_some_and(|rm| rm.is_active())
+}
+
+/// Row `j` of FOCE's Sheiner–Beal marginal as the structured covariance Hessian reads it
+/// (#2980): `(iv·e², iv·e, iv, log V)` with `e = y − f`, `V = R⁰` at `r_eval` (the population
+/// prediction under an `f`-dependent variance, else any — `V` does not read it) and `iv = 1/V`.
+/// [`foce_f`]'s aggregates over these: `Σ iv·res²` with `res = e + G·η`, `b = Σ iv·G·res`,
+/// `S = Σ iv·GGᵀ`, `Σ log V`.
+pub(crate) fn foce_row<T: PkNum>(
+    ctx: &LikCtx,
+    j: usize,
+    f: T,
+    r_eval: T,
+    p: &ParT<T>,
+) -> Option<[T; 4]> {
+    let v = ctx.variance_v(j, r_eval, T::from_f64(1.0), p);
+    if !positive_finite(v) {
+        return None;
+    }
+    let iv = T::from_f64(1.0) / v;
+    let e = T::from_f64(ctx.subject.observations[j]) - f;
+    Some([iv * e * e, iv * e, iv, v.ln()])
+}
+
+/// Row `j` of the Laplace objective as the structured covariance Hessian reads it (#2980):
+/// `(ℓ, ℓ′, ℓ″)` of [`row_l`] in its prediction — the row term and the derivatives
+/// [`inner_hessian_through_predictions`] builds the exact inner Hessian from.
+pub(crate) fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -> Option<[T; 3]> {
+    let pl = p.map_rows(d2_const);
+    let el: [D2<T>; 1] = [d2_const(T::from_f64(0.0))];
+    let fj = d2_seed(f);
+    let l = row_l(
+        ctx,
+        j,
+        fj,
+        fj,
+        d2_const(T::from_f64(0.0)),
+        d2_const(T::from_f64(1.0)),
+        &el,
+        &pl,
+    )?;
+    Some([l.v.v, l.v.g[0], l.g[0].g[0]])
+}
+
+/// Whether [`foce_f`] takes its Woodbury form at `S = LᵀGᵀD⁻¹GL` with trace `tr_s` — the
+/// form the structured FOCE kernel is (#2980): otherwise production factors `R̃` itself.
+pub(crate) fn foce_woodbury_ok(tr_s: f64) -> bool {
+    1.0 + tr_s <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
+}
+
+/// `ηᵀΩ⁻¹η + log|Ω|` (the prior the objective reads), for the structured reduce.
+pub(crate) fn prior_of<T: PkNum>(ctx: &LikCtx, eta: &[T], p: &ParT<T>) -> T {
+    ctx.prior(eta, p)
+}
+
 /// [`focei_rows`] at the dual width the subject needs: direction 0 is the prediction, then
 /// `η_r` under RUV IIV, then the row's `p_obs` under an SDE.
 fn focei_rows_k<T: PkNum>(
@@ -736,8 +860,7 @@ fn focei_rows<T: PkNum, const K: usize>(
                 if !positive_finite(vd.v) {
                     return None;
                 }
-                let r = lift(c(y)) - fd;
-                let lj = r * r / vd + vd.ln();
+                let lj = gauss_l(y, fd, vd);
                 data = data + lj.v;
                 dl[j] = lj.g[0];
                 if let Some(r) = rr {
@@ -753,9 +876,11 @@ fn focei_rows<T: PkNum, const K: usize>(
                 // g·gᵀ/V + ½·c̃c̃ᵀ with c̃ = (∂V/∂f / V)·g, whose η_r entry is 2 under RUV IIV.
                 match (rr, interaction) {
                     (_, false) => terms.push((iv, Cow::Borrowed(gj), Cow::Borrowed(gj))),
-                    (None, true) => {
-                        terms.push((iv + c(0.5) * cs * cs, Cow::Borrowed(gj), Cow::Borrowed(gj)))
-                    }
+                    (None, true) => terms.push((
+                        focei_alpha(vd.v, vd.g[0]),
+                        Cow::Borrowed(gj),
+                        Cow::Borrowed(gj),
+                    )),
                     (Some(r), true) => {
                         let ck: Vec<T> = (0..nn)
                             .map(|k| if k == r { c(2.0) } else { cs * gj[k] })
@@ -1552,7 +1677,7 @@ pub(crate) fn chol_logdet<T: PkNum>(l: &[Vec<T>]) -> T {
 }
 
 /// `A⁻¹b` from `A = LLᵀ`.
-fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
+pub(crate) fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
     let n = l.len();
     let mut y = b.to_vec();
     for i in 0..n {

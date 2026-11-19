@@ -20,6 +20,7 @@ pub(crate) mod par;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;
+pub(crate) mod rng;
 pub(crate) mod scratch;
 pub mod sens;
 pub(crate) mod serde_nalgebra;

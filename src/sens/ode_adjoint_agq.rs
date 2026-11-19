@@ -19,8 +19,20 @@ use super::*;
 use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, wsum3};
 
+/// A quadrature node's plan forward, kept for its one reverse.
+type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
+/// Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
+/// produced them (the predictions', the variances').
+type Node = (Vec<f64>, Fwd, Option<Fwd>);
+
 /// The quadrature (AGQ, Laplace) gradient of a subject through its plans; `None` where a
 /// plan cannot be recorded.
+///
+/// Every node's forward is recorded once (a forward that fails declines the subject). The
+/// gradient is formed over every node; only when it does not form is each node's term examined,
+/// and it is re-run (over the same recorded forwards) only when that drops one: a diverged node
+/// (see below) is left out as the objective leaves it out, while a subject with no diverged node
+/// pays nothing for the check.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn agq_planned(
     model: &CompiledModel,
@@ -45,6 +57,121 @@ pub(super) fn agq_planned(
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
+    let sigma = params.sigma.values.as_slice();
+    // The node predictions, values only, each forward kept for its one reverse: a node's
+    // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
+    // `G` itself is never formed.
+    let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
+    let mode_plan = mode_fwd.map(|m| &m.0);
+    for (_, _, b) in grid {
+        if n_obs == 0 {
+            break;
+        }
+        let rec = || -> Option<Node> {
+            let (plan, mut du, f) =
+                plan_forward_f64(mode_plan, model, subject, lay, theta, &b[..])?;
+            let var = if var_fwd.is_some() {
+                let (pp, dp, pf) =
+                    plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
+                du.extend(dp);
+                Some((pp, std::sync::Arc::new(pf)))
+            } else {
+                None
+            };
+            Some((du, (plan, std::sync::Arc::new(f)), var))
+        };
+        nodes.push(rec()?);
+    }
+    let kept: Vec<usize> = (0..grid.len()).collect();
+    let mut run = |keep: &[usize]| {
+        agq_planned_over(
+            model,
+            subject,
+            lay,
+            template,
+            params,
+            x,
+            eta,
+            ctx,
+            so,
+            pv,
+            grid,
+            &nodes,
+            keep,
+            h_exact,
+            exact,
+            held,
+            ng,
+            eta_dx.as_deref_mut(),
+            mode_fwd,
+            var_fwd,
+            p1,
+        )
+        .filter(|g| g.iter().all(|v| v.is_finite()))
+    };
+    if let Some(g) = run(&kept) {
+        return Some(g);
+    }
+    // The nodes the objective itself drops. A diverged node scores `individual_nll`'s `1e20`
+    // sentinel (`agq::agq_terms`), a log-term of ~-1e20 that `logsumexp` takes to exactly
+    // zero weight; its derivative is then `0 * d(huge or non-finite)`, which the reverse
+    // turns into a NaN and declines the whole subject (a `[covariate_nn]` DCM under 3-node
+    // AGQ, #3004). So a node whose total term (the Gaussian `l` plus the non-Gaussian endpoint
+    // term `q`, the sum the value path scores) is non-finite or the sentinel is left out of the
+    // kernel, as it is out of the sum: the value and every gradient component are unchanged by
+    // it. A finite node whose weight merely underflows stays: its derivative is `0 * finite`.
+    // Only a node with a recorded forward can fail the reverse this way (the endpoint term enters
+    // as numbers, so an unusable `q` alone never does: no reverse runs through it), which is why
+    // a subject with no prediction rows keeps every node.
+    let live: Vec<usize> = kept
+        .iter()
+        .copied()
+        .filter(|&j| {
+            let Some((du, _, _)) = nodes.get(j) else {
+                return true;
+            };
+            inner_l(ctx, du, &grid[j].2, pv, None).is_some_and(|l| {
+                crate::stats::likelihood::is_usable_subject_nll(
+                    l + ng.map_or(0.0, |ng| ng.nodes[j].0),
+                )
+            })
+        })
+        .collect();
+    if live.len() < kept.len() && !live.is_empty() {
+        run(&live)
+    } else {
+        None
+    }
+}
+
+/// [`agq_planned`] over the nodes `keep` names (indices into `grid`; `nodes` holds their recorded
+/// forwards, none when the subject has no prediction rows).
+#[allow(clippy::too_many_arguments)]
+fn agq_planned_over(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    template: &ModelParameters,
+    params: &ModelParameters,
+    x: &[f64],
+    eta: &[f64],
+    ctx: &LikCtx,
+    so: &StackedOmega,
+    pv: &ParT<f64>,
+    grid: &[(Vec<f64>, f64, Vec<f64>)],
+    nodes: &[Node],
+    keep: &[usize],
+    h_exact: Option<&DMatrix<f64>>,
+    exact: bool,
+    held: bool,
+    ng: Option<&AgqNg>,
+    mut eta_dx: Option<&mut ModeOut>,
+    mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
+    var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
+    p1: &PredLanes<&[f64]>,
+) -> Option<Vec<f64>> {
+    let theta = &params.theta;
+    let n_obs = subject.observations.len();
     let n_bsv = model.n_eta;
     let n = eta.len();
     let full = terms::layout2(n);
@@ -58,30 +185,17 @@ pub(super) fn agq_planned(
     let n_rows = p1.rows();
     let n_th = theta.len();
     let n_cols = n_th + if sde { sigma.len() } else { 0 };
-    // The node predictions, values only, each forward kept for its one reverse: a node's
-    // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
-    // `G` itself is never formed.
-    type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
-    // Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
-    // produced them (the predictions', the variances').
-    type Node = (Vec<f64>, Fwd, Option<Fwd>);
-    let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
-    let mode_plan = mode_fwd.map(|m| &m.0);
-    for (_, _, b) in grid {
-        if n_obs == 0 {
-            continue;
-        }
-        let (plan, mut du, f) = plan_forward_f64(mode_plan, model, subject, lay, theta, &b[..])?;
-        let var = if sde {
-            let (pp, dp, pf) =
-                plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
-            du.extend(dp);
-            Some((pp, std::sync::Arc::new(pf)))
-        } else {
-            None
-        };
-        nodes.push((du, (plan, std::sync::Arc::new(f)), var));
-    }
+    let nodes: Vec<&Node> = keep.iter().filter_map(|&j| nodes.get(j)).collect();
+    let kept_grid;
+    let grid: &[(Vec<f64>, f64, Vec<f64>)] = if keep.len() == grid.len() {
+        grid
+    } else {
+        kept_grid = keep.iter().map(|&j| grid[j].clone()).collect::<Vec<_>>();
+        &kept_grid
+    };
+    let ng_nodes: Vec<&(f64, Vec<f64>)> = ng
+        .map(|ng| keep.iter().map(|&j| &ng.nodes[j]).collect())
+        .unwrap_or_default();
 
     // ---- the objective and ∇_η l from the kernel plan --------------------------------
     // Every input that moves between calls is a leaf: the predictions and their jets at η̂
@@ -111,11 +225,11 @@ pub(super) fn agq_planned(
     let (pr, om) = param_leaves(pv, so, &mut inp);
     let ng_r = ng.map(|ng| ng_leaves(n, &ng.jets, &mut inp));
     let node_qr: Vec<Leaf> = ng
-        .map(|ng| ng.nodes.iter().map(|(q, _)| inp.leaf(*q)).collect())
+        .map(|_| ng_nodes.iter().map(|(q, _)| inp.leaf(*q)).collect())
         .unwrap_or_default();
     let node_gq: Vec<Vec<Leaf>> = ng
-        .map(|ng| {
-            ng.nodes
+        .map(|_| {
+            ng_nodes
                 .iter()
                 .map(|(_, gq)| gq.iter().take(n_bsv).map(|&v| inp.leaf(v)).collect())
                 .collect()
@@ -143,7 +257,7 @@ pub(super) fn agq_planned(
         exact,
         grid.len(),
         n_nodes_b,
-        ng.map(|n| (n.jets.g.len(), n.nodes.len())),
+        ng.map(|n| n.jets.g.len()),
         &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
     ));
     type T = kj_tr::Tr;

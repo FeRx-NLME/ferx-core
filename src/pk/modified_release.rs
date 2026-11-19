@@ -501,6 +501,7 @@ fn forcing_arg<T: PkNum>(f: &InputRateForcing, p: &[T], i: usize, dflt: f64) -> 
 /// see [`crate::sens::one_cpt::one_cpt_zero_order_g`]); `weibull` has no
 /// elementary closed form and is excluded by the support gate, returning `0`
 /// here as a defensive no-op.
+#[inline(always)]
 fn route_conc_g<T: PkNum>(
     kind: InputRateKind,
     f: &InputRateForcing,
@@ -566,6 +567,12 @@ fn route_conc_g<T: PkNum>(
 /// before the `FR` split). Clamped at `0` like the analytic superposition. Pure
 /// superposition — the disposition parameters `dp` are recovered by the caller,
 /// which keeps this testable in isolation against manual kernel sums.
+// `inline(always)` here and on `route_conc_g`: the `f64` instance was inlined into
+// `mr_predictions` (its one caller) until the adjoint recorder became a second one, and the
+// out-of-line copy lost the compiler's sharing of equal-argument `expm1` terms across the
+// routes' loop -- 34 % more `expm1` calls, +12 % instructions on an SAEM fit whose every
+// evaluation is this function.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub fn mr_observable_g<T: PkNum>(
     dp: &DispParams<T>,
@@ -666,6 +673,7 @@ fn route_flips(f: &InputRateForcing, dp: &DispParams<f64>, p: &[f64]) -> bool {
 /// share), and the `f64` PK-parameter snapshot at `(θ, η, t=0)`.
 pub(crate) struct MrScope<'a> {
     pub spec: &'a OdeSpec,
+    pub disp: MrDisposition,
     pub dp: DispParams<f64>,
     pub pk: crate::types::PkParams,
 }
@@ -791,7 +799,7 @@ pub(crate) fn mr_scope<'a>(
     {
         return None;
     }
-    Some(MrScope { spec, dp, pk })
+    Some(MrScope { spec, disp, dp, pk })
 }
 
 /// Verify-gate memo key (#1150): what the twin comparison actually depends on, by
@@ -1235,12 +1243,11 @@ fn verify_against_twin(
 /// ([`crate::stats`]'s `model_predictions` →
 /// [`crate::pk::compute_predictions_with_tv`]). For an FD-method fit the
 /// gradient finite-differences these same values, so it is fully
-/// self-consistent. For an analytic-gradient fit the gradient comes from the
-/// adjoint over the ODE walk (before #2093, from the closed-form
-/// `mr_subject_sensitivities`/`mr_subject_eta_grad` under the identical `mr_scope`)
-/// — either way value and gradient **agree to solver tolerance** (the
-/// closed form reduces to the same integrated twin), so the objective stays
-/// consistent to far within `inner_tol`.
+/// self-consistent. For an analytic-gradient fit the adjoint records this same
+/// kernel (`mr_observable_g` over the recording type, `ode_adjoint::record_modified_release`)
+/// under the identical `mr_scope`, so the plan's values are these bits and its derivatives
+/// are the exact derivatives of this value; only a point `mr_scope` declines is recorded on
+/// the ODE twin.
 pub(crate) fn mr_predictions(
     model: &crate::types::CompiledModel,
     subject: &crate::types::Subject,

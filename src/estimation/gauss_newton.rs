@@ -820,8 +820,10 @@ pub fn run_foce_gn(
             covariance_wall_time_secs,
             warnings,
             saem_mu_ref_m_step_evals_saved: None,
+            saem_objective_value: None,
             saem_n_subjects_hmc: None,
             saem_mh_accept_tail: None,
+            mstep_optimizer_used: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -1013,8 +1015,10 @@ pub fn run_foce_gn(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -7332,7 +7336,7 @@ mod tests {
         }
 
         /// The FD-salvage side: `gradient_method = fd` declines the adjoint, so every
-        /// subject takes `subject_reconverged_fd_gradient_iov`.
+        /// subject takes `subject_reconverged_fd_gradient`.
         #[test]
         fn gn_takes_the_fd_salvage_iov_outer_gradient() {
             let (mut model, pop) = warfarin_iov(4);

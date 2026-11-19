@@ -13,7 +13,8 @@
 //!
 //! evaluated **per record** under the model-time guard so a `TIME` term in the
 //! predictor is honoured (baseline covariates are read from `subject.covariates`).
-//! Ordinal / Poisson / negative-binomial are later slices of this module.
+//! The Poisson / negative-binomial count endpoint (`[count_model]`, #2877) lives in the
+//! `count` submodule and joins the same discrete seam; ordinal is a later slice.
 //!
 //! The whole module is gated behind `survival` (the non-Gaussian endpoint feature —
 //! see `Cargo.toml`); [`LinkFn`]/[`LinearPredictorFn`] live under the same gate.
@@ -27,6 +28,9 @@ use crate::types::{
 };
 use rand::RngExt;
 use std::collections::HashMap;
+
+mod count;
+pub use count::{count_diagnostics, count_pearson_residual, predict_count, simulate_count};
 
 /// `log(1 + eˣ)`, computed without overflow: `max(x, 0) + log1p(e^{−|x|})`.
 #[inline]
@@ -308,8 +312,8 @@ fn binary_prob(link: LinkFn, lp: f64) -> f64 {
 }
 
 /// Sum the per-subject NLL of every **discrete** (non-Gaussian, non-TTE) endpoint — the
-/// binary / Bernoulli term today; ordinal / Poisson / negative-binomial are future arms of
-/// the same match. Returns `0.0` when the model has no discrete endpoint or the subject has
+/// binary / Bernoulli term, the Poisson / negative-binomial count term (#2877) and the DTMM;
+/// ordinal is a future arm of the same sum. Returns `0.0` when the model has no discrete endpoint or the subject has
 /// no records for one. Callers apply the site's OFV-scale factor (`2·` on the halved
 /// FOCEI/IOV `data_ll`, `1·` on the raw SAEM / non-interaction paths) — the same factor they
 /// apply to the TTE term.
@@ -335,6 +339,7 @@ pub(crate) fn discrete_subject_nll(
     #[cfg(not(feature = "markov"))]
     let dtmm = 0.0;
     dtmm + binary_subject_nll(model, subject, theta, eta)
+        + count::count_subject_nll(model, subject, theta, eta)
 }
 
 /// The binary / Bernoulli half of [`discrete_subject_nll`].
@@ -415,7 +420,7 @@ pub(crate) fn binary_subject_nll(
 /// the same sum [`discrete_subject_nll`] returns.
 ///
 /// `None` — caller falls back to FD for this point — when *any* binary endpoint on the
-/// subject cannot be served exactly: no dual program (an unbindable identifier), or a
+/// subject cannot be served exactly: no dual program (an opaque Rust-closure endpoint), or a
 /// non-finite predictor on some record, where the value is the flat `1e20` repellent with
 /// no meaningful derivative.
 ///
@@ -483,6 +488,9 @@ impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
                 nll = nll + binary_record_nll_g(*link, lp, (*state as f64).min(1.0));
             }
         }
+        if self.model.has_count() {
+            nll = nll + count::count_term_eval(self.model, self.subject, th, et)?;
+        }
         #[cfg(feature = "markov")]
         if self.model.has_dtmm() {
             nll = nll
@@ -521,13 +529,13 @@ pub(crate) fn all_binary_endpoints_analytic(model: &CompiledModel) -> bool {
 }
 
 /// Whether [`discrete_subject_eta_grad`] can serve every discrete endpoint of `model` —
-/// binary and DTMM alike (#2473). Vacuously `true` with none.
+/// binary, count (#2877) and DTMM (#2473) alike. Vacuously `true` with none.
 pub(crate) fn all_discrete_endpoints_analytic(model: &CompiledModel) -> bool {
     #[cfg(feature = "markov")]
     if !crate::markov::dtmm::all_dtmm_endpoints_analytic(model) {
         return false;
     }
-    all_binary_endpoints_analytic(model)
+    all_binary_endpoints_analytic(model) && count::all_count_endpoints_analytic(model)
 }
 
 /// Draw a simulated outcome for every binary record of every `Binary` endpoint, pushing

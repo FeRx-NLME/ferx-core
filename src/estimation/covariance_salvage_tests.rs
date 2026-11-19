@@ -1151,11 +1151,11 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
             );
         }
         assert_eq!(
-            super::analytic_cov_declines(&m, &options, false),
+            super::analytic_cov_declines(&m, &options),
             vec![CovScopeDecline::PerSubjectBail],
             "{axes} axes: no model-level clause may decline the analytic R-matrix"
         );
-        assert!(super::analytic_r_expected(&m, &options, false));
+        assert!(super::analytic_r_expected(&m, &options));
 
         let mut fd = model(n_fix);
         fd.gradient_method = GradientMethod::Fd;
@@ -1165,7 +1165,7 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
             Optimizer::Bobyqa,
             "{axes} axes, FD"
         );
-        assert!(!super::analytic_r_expected(&fd, &options, false));
+        assert!(!super::analytic_r_expected(&fd, &options));
     }
 }
 
@@ -1293,7 +1293,7 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
         ..FitOptions::default()
     };
     assert_eq!(
-        predicted_r_route(&model, &options, false),
+        predicted_r_route(&model, &options),
         PredictedRRoute::Analytic
     );
     let disabled = FitOptions {
@@ -1301,7 +1301,7 @@ fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
         ..options.clone()
     };
     assert_eq!(
-        predicted_r_route(&model, &disabled, false),
+        predicted_r_route(&model, &disabled),
         PredictedRRoute::Stencil
     );
     assert_eq!(
@@ -1415,14 +1415,11 @@ fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
 
     for (label, model) in &cases {
         assert_eq!(
-            super::analytic_cov_model_declines(model, &options, false),
+            super::analytic_cov_model_declines(model, &options),
             Vec::new(),
             "{label}"
         );
-        assert!(
-            super::analytic_r_expected(model, &options, false),
-            "{label}"
-        );
+        assert!(super::analytic_r_expected(model, &options), "{label}");
     }
 }
 
@@ -1459,7 +1456,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             other => unreachable!("{other:?} has a remedy but no fixture applying it"),
         }
         assert_eq!(
-            super::analytic_cov_model_declines(&model, &options, false),
+            super::analytic_cov_model_declines(&model, &options),
             vec![decline],
             "{decline:?}: the fixture hits only its own clause"
         );
@@ -1469,7 +1466,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             _ => unreachable!(),
         }
         assert_eq!(
-            super::analytic_cov_model_declines(&model, &options, false),
+            super::analytic_cov_model_declines(&model, &options),
             Vec::new(),
             "{decline:?}: {} must clear the walk",
             decline.remedy().unwrap()
@@ -1708,7 +1705,7 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
     assert!(options.analytic_cov_hessian);
     assert!(super::cov_ode_override(&default, &options).is_some());
     assert_eq!(
-        super::predicted_r_route(&default, &options, false),
+        super::predicted_r_route(&default, &options),
         super::PredictedRRoute::Analytic,
         "fixture: every subject is on the analytic R-matrix"
     );
@@ -1784,7 +1781,7 @@ fn the_hybrid_covariance_step_runs_whole_at_the_plateau_tolerance() {
     let tight = ode_model_at(Some((1e-9, 1e-11)));
     let options = FitOptions::default();
     assert_eq!(
-        super::predicted_r_route(&default, &options, false),
+        super::predicted_r_route(&default, &options),
         super::PredictedRRoute::Analytic,
         "fixture: the decline is invisible to the route walk"
     );
@@ -2282,4 +2279,58 @@ fn the_analytic_r_matrix_skips_held_axes_and_keeps_the_free_block_bit_identical(
             );
         }
     }
+}
+
+/// A mixture's objective is FOCE/FOCEI whatever `n_agq` says (`mixture_ofv` never evaluates a
+/// quadrature grid; Laplace/AGQ mixtures are #3025), so a caller-supplied quadrature `n_agq`
+/// through `run_covariance` must not move the R-matrix onto an objective the fit never
+/// minimised: `cov_objective` gives the mixture FOCEI and the exact mixture assembly serves it
+/// (#3004 review r2). The same options on a non-mixture model keep the quadrature objective, so
+/// the rule is the mixture's, not the options'.
+#[test]
+fn a_mixture_differentiates_the_objective_its_fit_scored_whatever_n_agq_says() {
+    use crate::estimation::covariance::PredictedRRoute;
+    use crate::sens::ode_provider::adjoint::Objective;
+    use crate::types::{EstimationMethod, FitOptions};
+    let mixture = parse_model_string(
+        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
+         theta MIXL(0.2, -10.0, 10.0)\n  omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
+         [mixture]\n  nsub = 2\n  logit(1) = MIXL\n  omega(2) ETA_CL ~ 0.15\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .unwrap();
+    let plain = parse_model_string(
+        "[parameters]\n  theta TVCL(1.5, 0.01, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n\
+         omega ETA_CL ~ 0.06\n  sigma EPS ~ 0.02\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n",
+    )
+    .unwrap();
+    let focei_agq = FitOptions {
+        method: EstimationMethod::FoceI,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    assert!(
+        focei_agq.agq_nodes().is_some(),
+        "premise: a quadrature objective"
+    );
+    assert_eq!(
+        super::cov_objective(&mixture, &focei_agq),
+        Objective::Focei,
+        "the mixture keeps the objective its fit scored"
+    );
+    assert!(
+        matches!(
+            super::cov_objective(&plain, &focei_agq),
+            Objective::Agq { n_agq: 3, .. }
+        ),
+        "a single population keeps the quadrature objective"
+    );
+    assert!(super::analytic_cov_model_declines(&mixture, &focei_agq).is_empty());
+    assert_eq!(
+        super::predicted_r_route(&mixture, &focei_agq),
+        PredictedRRoute::Analytic
+    );
 }

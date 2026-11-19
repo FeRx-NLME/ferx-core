@@ -338,8 +338,12 @@ pub fn ferx_core::cancel::is_cancelled(flag: &core::option::Option<ferx_core::ca
 pub mod ferx_core::categorical
 pub fn ferx_core::categorical::binary_diagnostics(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
 pub fn ferx_core::categorical::binary_pearson_residual(y: f64, p: f64, q: f64) -> f64
+pub fn ferx_core::categorical::count_diagnostics(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
+pub fn ferx_core::categorical::count_pearson_residual(k: f64, lambda: f64, size: core::option::Option<f64>) -> f64
 pub fn ferx_core::categorical::predict_binary(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], results: &mut alloc::vec::Vec<ferx_core::EndpointPredictionResult>)
+pub fn ferx_core::categorical::predict_count(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], results: &mut alloc::vec::Vec<ferx_core::EndpointPredictionResult>)
 pub fn ferx_core::categorical::simulate_binary<R: rand_core::Rng>(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize, rng: &mut R, results: &mut alloc::vec::Vec<ferx_core::SimulationResult>, warnings: &mut alloc::vec::Vec<alloc::string::String>)
+pub fn ferx_core::categorical::simulate_count<R: rand_core::Rng>(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], draw: usize, sim: usize, rng: &mut R, results: &mut alloc::vec::Vec<ferx_core::SimulationResult>, warnings: &mut alloc::vec::Vec<alloc::string::String>)
 pub mod ferx_core::diagnostics
 pub enum ferx_core::diagnostics::Severity
 pub ferx_core::diagnostics::Severity::Error
@@ -633,7 +637,6 @@ pub ferx_core::estimation::mixture::MixtureEval::pmix: alloc::vec::Vec<alloc::ve
 pub fn ferx_core::estimation::mixture::class_params(params: &ferx_core::ModelParameters, k: usize) -> ferx_core::ModelParameters
 pub fn ferx_core::estimation::mixture::combine_subject(logp: &[f64], nll: &[f64]) -> (f64, alloc::vec::Vec<f64>, usize)
 pub fn ferx_core::estimation::mixture::mixture_gradient(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions, eval: &ferx_core::estimation::mixture::MixtureEval) -> core::option::Option<alloc::vec::Vec<f64>>
-pub fn ferx_core::estimation::mixture::mixture_gradient_fd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, x: &[f64], init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::mixture::mixture_ofv(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions, warm: core::option::Option<&[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>]>) -> ferx_core::estimation::mixture::MixtureEval
 pub mod ferx_core::estimation::outer_optimizer
 pub struct ferx_core::estimation::outer_optimizer::MixturePosteriors
@@ -657,6 +660,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::kappas: alloc::vec::Vec
 pub ferx_core::estimation::outer_optimizer::OuterResult::left_init: core::option::Option<bool>
 pub ferx_core::estimation::outer_optimizer::OuterResult::max_unconverged_subjects: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::mixture_posteriors: core::option::Option<ferx_core::estimation::outer_optimizer::MixturePosteriors>
+pub ferx_core::estimation::outer_optimizer::OuterResult::mstep_optimizer_used: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::n_iterations: usize
 pub ferx_core::estimation::outer_optimizer::OuterResult::newton_decrement: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::ofv: f64
@@ -666,6 +670,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::params: ferx_core::Mode
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::saem_n_subjects_hmc: core::option::Option<usize>
+pub ferx_core::estimation::outer_optimizer::OuterResult::saem_objective_value: core::option::Option<f64>
 pub ferx_core::estimation::outer_optimizer::OuterResult::sir_fallback_proposal: core::option::Option<nalgebra::base::alias::DMatrix<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::stationary_start: bool
 pub ferx_core::estimation::outer_optimizer::OuterResult::total_ebe_fallbacks: u32
@@ -2508,6 +2513,8 @@ pub fn ferx_core::stats::residual_error::iwres(obs: f64, ipred: f64, error_model
 pub fn ferx_core::stats::residual_error::iwres_autocorrelation(subjects: &[ferx_core::SubjectResult]) -> (f64, f64)
 pub fn ferx_core::stats::residual_error::residual_variance(error_model: ferx_core::ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64
 pub mod ferx_core::stats::special
+pub fn ferx_core::stats::special::count_log_pmf(lambda: f64, size: core::option::Option<f64>, k: f64) -> f64
+pub fn ferx_core::stats::special::count_pmf(lambda: f64, size: core::option::Option<f64>, k: f64) -> f64
 pub fn ferx_core::stats::special::digamma(x: f64) -> f64
 pub fn ferx_core::stats::special::erf(x: f64) -> f64
 pub fn ferx_core::stats::special::erf_g<T: ferx_core::sens::num::PkNum>(x: T) -> T
@@ -2573,6 +2580,12 @@ impl ferx_core::BloqMethod
 pub fn ferx_core::BloqMethod::has_censored_row(self, cens: &[i8]) -> bool
 pub fn ferx_core::BloqMethod::is_censored_row(self, cens: i8) -> bool
 pub fn ferx_core::BloqMethod::label(self) -> &'static str
+pub enum ferx_core::types::CountFamily
+pub ferx_core::types::CountFamily::NegBin
+pub ferx_core::types::CountFamily::Poisson
+pub enum ferx_core::types::CountMeanScale
+pub ferx_core::types::CountMeanScale::Linear
+pub ferx_core::types::CountMeanScale::Log
 pub enum ferx_core::types::CovarianceFallback
 pub ferx_core::types::CovarianceFallback::None
 pub ferx_core::types::CovarianceFallback::Sir
@@ -2662,6 +2675,12 @@ pub ferx_core::types::EndpointLikelihood::Binary::link: ferx_core::LinkFn
 pub ferx_core::types::EndpointLikelihood::Binary::lp_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::EndpointLikelihood::Binary::lp_fn: ferx_core::LinearPredictorFn
 pub ferx_core::types::EndpointLikelihood::Binary::lp_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::types::EndpointLikelihood::Count
+pub ferx_core::types::EndpointLikelihood::Count::count_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::EndpointLikelihood::Count::family: ferx_core::CountFamily
+pub ferx_core::types::EndpointLikelihood::Count::param_fn: ferx_core::CountParamFn
+pub ferx_core::types::EndpointLikelihood::Count::param_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::types::EndpointLikelihood::Count::scale: ferx_core::CountMeanScale
 pub ferx_core::types::EndpointLikelihood::Ctmm
 pub ferx_core::types::EndpointLikelihood::Ctmm::generator_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::EndpointLikelihood::Ctmm::generator_fn: ferx_core::GeneratorFn
@@ -2811,6 +2830,13 @@ pub ferx_core::types::KappaTreatment::NotApplicable
 pub enum ferx_core::types::LinkFn
 pub ferx_core::types::LinkFn::Logit
 pub ferx_core::types::LinkFn::Probit
+pub enum ferx_core::types::MstepOptimizer
+pub ferx_core::types::MstepOptimizer::Auto
+pub ferx_core::types::MstepOptimizer::Bobyqa
+pub ferx_core::types::MstepOptimizer::Lbfgs
+pub ferx_core::types::MstepOptimizer::Newton
+impl ferx_core::MstepOptimizer
+pub fn ferx_core::MstepOptimizer::as_str(self) -> &'static str
 pub enum ferx_core::types::MuTransform
 pub ferx_core::types::MuTransform::Identity
 pub ferx_core::types::MuTransform::Log
@@ -2872,6 +2898,9 @@ pub ferx_core::types::Prediction::CatProbs
 pub ferx_core::types::Prediction::CatProbs::probs: alloc::vec::Vec<f64>
 pub ferx_core::types::Prediction::Continuous
 pub ferx_core::types::Prediction::Continuous::pred: f64
+pub ferx_core::types::Prediction::Rate
+pub ferx_core::types::Prediction::Rate::lambda: f64
+pub ferx_core::types::Prediction::Rate::size: core::option::Option<f64>
 impl ferx_core::Prediction
 pub fn ferx_core::Prediction::prob(&self, k: usize) -> core::option::Option<f64>
 pub enum ferx_core::types::PriorSpread
@@ -2896,6 +2925,11 @@ pub ferx_core::types::SaemKernel::RandomWalk
 pub enum ferx_core::types::SaemMstepSolver
 pub ferx_core::types::SaemMstepSolver::Bobyqa
 pub ferx_core::types::SaemMstepSolver::ScoreSa
+pub enum ferx_core::types::SaemOfv
+pub ferx_core::types::SaemOfv::Agq
+pub ferx_core::types::SaemOfv::Focei
+pub ferx_core::types::SaemOfv::Imp
+pub ferx_core::types::SaemOfv::Saem
 pub enum ferx_core::types::ScaleAdaptation
 pub ferx_core::types::ScaleAdaptation::Interval
 pub ferx_core::types::ScaleAdaptation::RobbinsMonro
@@ -3116,6 +3150,7 @@ pub ferx_core::types::CompiledModel::tv_fn: core::option::Option<ferx_core::TvFn
 impl ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static [alloc::string::String]
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
+pub fn ferx_core::CompiledModel::count_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
@@ -3123,6 +3158,7 @@ pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
+pub fn ferx_core::CompiledModel::has_count(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
@@ -3345,6 +3381,7 @@ pub ferx_core::types::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::types::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitOptions::imp_adapt_passes: usize
+pub ferx_core::types::FitOptions::imp_adapt_samples: usize
 pub ferx_core::types::FitOptions::imp_auto: bool
 pub ferx_core::types::FitOptions::imp_averaging: usize
 pub ferx_core::types::FitOptions::imp_defensive_alpha: f64
@@ -3384,6 +3421,7 @@ pub ferx_core::types::FitOptions::max_unconverged_frac: f64
 pub ferx_core::types::FitOptions::method: ferx_core::EstimationMethod
 pub ferx_core::types::FitOptions::methods: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::types::FitOptions::min_obs_for_convergence_check: u32
+pub ferx_core::types::FitOptions::mstep_optimizer: ferx_core::MstepOptimizer
 pub ferx_core::types::FitOptions::mu_referencing: bool
 pub ferx_core::types::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::types::FitOptions::n_agq: usize
@@ -3425,6 +3463,10 @@ pub ferx_core::types::FitOptions::saem_n_convergence: usize
 pub ferx_core::types::FitOptions::saem_n_exploration: usize
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::types::FitOptions::saem_n_mh_steps: usize
+pub ferx_core::types::FitOptions::saem_ofv: ferx_core::SaemOfv
+pub ferx_core::types::FitOptions::saem_ofv_nodes: usize
+pub ferx_core::types::FitOptions::saem_ofv_pilot_samples: usize
+pub ferx_core::types::FitOptions::saem_ofv_samples: usize
 pub ferx_core::types::FitOptions::saem_omega_burnin: usize
 pub ferx_core::types::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::types::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
@@ -3470,9 +3512,9 @@ pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Ve
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
 pub struct ferx_core::types::FitResult
-pub ferx_core::types::FitResult::aic: f64
+pub ferx_core::types::FitResult::aic: core::option::Option<f64>
 pub ferx_core::types::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
-pub ferx_core::types::FitResult::bic: f64
+pub ferx_core::types::FitResult::bic: core::option::Option<f64>
 pub ferx_core::types::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::types::FitResult::bloq_method: alloc::string::String
 pub ferx_core::types::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
@@ -3537,6 +3579,7 @@ pub ferx_core::types::FitResult::model_hash: core::option::Option<alloc::string:
 pub ferx_core::types::FitResult::model_name: alloc::string::String
 pub ferx_core::types::FitResult::model_path: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::model_text: core::option::Option<alloc::string::String>
+pub ferx_core::types::FitResult::mstep_optimizer_used: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::multi_start_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::n_iterations: usize
 pub ferx_core::types::FitResult::n_obs: usize
@@ -3577,6 +3620,7 @@ pub ferx_core::types::FitResult::restored_from_checkpoint: bool
 pub ferx_core::types::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::types::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::types::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
+pub ferx_core::types::FitResult::saem_objective: core::option::Option<ferx_core::SaemObjective>
 pub ferx_core::types::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::types::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
@@ -3852,6 +3896,12 @@ pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::types::SaemObjective
+pub ferx_core::types::SaemObjective::foce_ofv: f64
+pub ferx_core::types::SaemObjective::kind: ferx_core::SaemOfv
+pub ferx_core::types::SaemObjective::mc_standard_error: core::option::Option<f64>
+pub ferx_core::types::SaemObjective::n_nodes: core::option::Option<usize>
+pub ferx_core::types::SaemObjective::n_samples: core::option::Option<usize>
 pub struct ferx_core::types::SigmaVector
 pub ferx_core::types::SigmaVector::names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::SigmaVector::values: alloc::vec::Vec<f64>
@@ -4006,6 +4056,7 @@ pub fn ferx_core::types::classify_warning(raw: &str) -> ferx_core::WarningEntry
 pub fn ferx_core::types::framework_keys() -> &'static [&'static str]
 pub fn ferx_core::types::method_specific_keys(m: ferx_core::EstimationMethod) -> &'static [&'static str]
 pub fn ferx_core::types::omega_se_at(se_omega: &core::option::Option<alloc::vec::Vec<f64>>, n_eta: usize, i: usize, j: usize) -> core::option::Option<f64>
+pub type ferx_core::types::CountParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> [f64; 2] + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::DerivedFilterFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> bool + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::types::ErrorSelectFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&std::collections::hash::map::HashMap<alloc::string::String, f64>) -> usize + core::marker::Send + core::marker::Sync)>
@@ -4052,6 +4103,12 @@ pub ferx_core::Comparison::Ge
 pub ferx_core::Comparison::Gt
 pub ferx_core::Comparison::Le
 pub ferx_core::Comparison::Lt
+pub enum ferx_core::CountFamily
+pub ferx_core::CountFamily::NegBin
+pub ferx_core::CountFamily::Poisson
+pub enum ferx_core::CountMeanScale
+pub ferx_core::CountMeanScale::Linear
+pub ferx_core::CountMeanScale::Log
 pub enum ferx_core::CovarianceFallback
 pub ferx_core::CovarianceFallback::None
 pub ferx_core::CovarianceFallback::Sir
@@ -4170,6 +4227,12 @@ pub ferx_core::EndpointLikelihood::Binary::link: ferx_core::LinkFn
 pub ferx_core::EndpointLikelihood::Binary::lp_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::EndpointLikelihood::Binary::lp_fn: ferx_core::LinearPredictorFn
 pub ferx_core::EndpointLikelihood::Binary::lp_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::EndpointLikelihood::Count
+pub ferx_core::EndpointLikelihood::Count::count_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::EndpointLikelihood::Count::family: ferx_core::CountFamily
+pub ferx_core::EndpointLikelihood::Count::param_fn: ferx_core::CountParamFn
+pub ferx_core::EndpointLikelihood::Count::param_program: core::option::Option<ferx_core::parser::model_parser::EndpointExprProgram>
+pub ferx_core::EndpointLikelihood::Count::scale: ferx_core::CountMeanScale
 pub ferx_core::EndpointLikelihood::Ctmm
 pub ferx_core::EndpointLikelihood::Ctmm::generator_covariates: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::EndpointLikelihood::Ctmm::generator_fn: ferx_core::GeneratorFn
@@ -4326,6 +4389,13 @@ pub enum ferx_core::MatchMethod
 pub ferx_core::MatchMethod::Nearest
 pub ferx_core::MatchMethod::Optimal
 pub ferx_core::MatchMethod::Rank
+pub enum ferx_core::MstepOptimizer
+pub ferx_core::MstepOptimizer::Auto
+pub ferx_core::MstepOptimizer::Bobyqa
+pub ferx_core::MstepOptimizer::Lbfgs
+pub ferx_core::MstepOptimizer::Newton
+impl ferx_core::MstepOptimizer
+pub fn ferx_core::MstepOptimizer::as_str(self) -> &'static str
 pub enum ferx_core::MuTransform
 pub ferx_core::MuTransform::Identity
 pub ferx_core::MuTransform::Log
@@ -4394,6 +4464,9 @@ pub ferx_core::Prediction::CatProbs
 pub ferx_core::Prediction::CatProbs::probs: alloc::vec::Vec<f64>
 pub ferx_core::Prediction::Continuous
 pub ferx_core::Prediction::Continuous::pred: f64
+pub ferx_core::Prediction::Rate
+pub ferx_core::Prediction::Rate::lambda: f64
+pub ferx_core::Prediction::Rate::size: core::option::Option<f64>
 impl ferx_core::Prediction
 pub fn ferx_core::Prediction::prob(&self, k: usize) -> core::option::Option<f64>
 pub enum ferx_core::PriorSpread
@@ -4418,6 +4491,11 @@ pub ferx_core::SaemKernel::RandomWalk
 pub enum ferx_core::SaemMstepSolver
 pub ferx_core::SaemMstepSolver::Bobyqa
 pub ferx_core::SaemMstepSolver::ScoreSa
+pub enum ferx_core::SaemOfv
+pub ferx_core::SaemOfv::Agq
+pub ferx_core::SaemOfv::Focei
+pub ferx_core::SaemOfv::Imp
+pub ferx_core::SaemOfv::Saem
 pub enum ferx_core::ScaleAdaptation
 pub ferx_core::ScaleAdaptation::Interval
 pub ferx_core::ScaleAdaptation::RobbinsMonro
@@ -4746,6 +4824,7 @@ pub ferx_core::CompiledModel::tv_fn: core::option::Option<ferx_core::TvFn>
 impl ferx_core::CompiledModel
 pub fn ferx_core::CompiledModel::analytical_compartment_names(&self) -> &'static [alloc::string::String]
 pub fn ferx_core::CompiledModel::binary_cmts(&self) -> alloc::vec::Vec<usize>
+pub fn ferx_core::CompiledModel::count_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::ctmm_cmts(&self) -> alloc::vec::Vec<usize>
 pub fn ferx_core::CompiledModel::data_bindings(&self) -> &ferx_core::parser::model_parser::DataBindings
 pub fn ferx_core::CompiledModel::dtmm_cmts(&self) -> alloc::vec::Vec<usize>
@@ -4753,6 +4832,7 @@ pub fn ferx_core::CompiledModel::effective_for<'a>(&'a self, subject: &ferx_core
 pub fn ferx_core::CompiledModel::free_packed_dim(&self) -> usize
 pub fn ferx_core::CompiledModel::has_binary(&self) -> bool
 pub fn ferx_core::CompiledModel::has_bioavailability(&self) -> bool
+pub fn ferx_core::CompiledModel::has_count(&self) -> bool
 pub fn ferx_core::CompiledModel::has_ctmm(&self) -> bool
 pub fn ferx_core::CompiledModel::has_custom_ruv_magnitude(&self) -> bool
 pub fn ferx_core::CompiledModel::has_discrete(&self) -> bool
@@ -5053,6 +5133,7 @@ pub ferx_core::FitOptions::gradient_method: ferx_core::GradientMethod
 pub ferx_core::FitOptions::ignore_exprs: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::ignore_subjects: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitOptions::imp_adapt_passes: usize
+pub ferx_core::FitOptions::imp_adapt_samples: usize
 pub ferx_core::FitOptions::imp_auto: bool
 pub ferx_core::FitOptions::imp_averaging: usize
 pub ferx_core::FitOptions::imp_defensive_alpha: f64
@@ -5092,6 +5173,7 @@ pub ferx_core::FitOptions::max_unconverged_frac: f64
 pub ferx_core::FitOptions::method: ferx_core::EstimationMethod
 pub ferx_core::FitOptions::methods: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::FitOptions::min_obs_for_convergence_check: u32
+pub ferx_core::FitOptions::mstep_optimizer: ferx_core::MstepOptimizer
 pub ferx_core::FitOptions::mu_referencing: bool
 pub ferx_core::FitOptions::multi_start_seed: core::option::Option<u64>
 pub ferx_core::FitOptions::n_agq: usize
@@ -5133,6 +5215,10 @@ pub ferx_core::FitOptions::saem_n_convergence: usize
 pub ferx_core::FitOptions::saem_n_exploration: usize
 pub ferx_core::FitOptions::saem_n_leapfrog: usize
 pub ferx_core::FitOptions::saem_n_mh_steps: usize
+pub ferx_core::FitOptions::saem_ofv: ferx_core::SaemOfv
+pub ferx_core::FitOptions::saem_ofv_nodes: usize
+pub ferx_core::FitOptions::saem_ofv_pilot_samples: usize
+pub ferx_core::FitOptions::saem_ofv_samples: usize
 pub ferx_core::FitOptions::saem_omega_burnin: usize
 pub ferx_core::FitOptions::saem_scale_adaptation: ferx_core::ScaleAdaptation
 pub ferx_core::FitOptions::saem_scale_deadband: core::option::Option<(f64, f64)>
@@ -5178,9 +5264,9 @@ pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Ve
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
 pub struct ferx_core::FitResult
-pub ferx_core::FitResult::aic: f64
+pub ferx_core::FitResult::aic: core::option::Option<f64>
 pub ferx_core::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
-pub ferx_core::FitResult::bic: f64
+pub ferx_core::FitResult::bic: core::option::Option<f64>
 pub ferx_core::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::FitResult::bloq_method: alloc::string::String
 pub ferx_core::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
@@ -5245,6 +5331,7 @@ pub ferx_core::FitResult::model_hash: core::option::Option<alloc::string::String
 pub ferx_core::FitResult::model_name: alloc::string::String
 pub ferx_core::FitResult::model_path: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::model_text: core::option::Option<alloc::string::String>
+pub ferx_core::FitResult::mstep_optimizer_used: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::multi_start_seed: core::option::Option<u64>
 pub ferx_core::FitResult::n_iterations: usize
 pub ferx_core::FitResult::n_obs: usize
@@ -5285,6 +5372,7 @@ pub ferx_core::FitResult::restored_from_checkpoint: bool
 pub ferx_core::FitResult::saem_mh_accept_tail: core::option::Option<f64>
 pub ferx_core::FitResult::saem_mu_ref_m_step_evals_saved: core::option::Option<u64>
 pub ferx_core::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
+pub ferx_core::FitResult::saem_objective: core::option::Option<ferx_core::SaemObjective>
 pub ferx_core::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
@@ -5693,6 +5781,12 @@ pub fn ferx_core::RuvMagnitude::has_exponent(&self) -> bool
 pub fn ferx_core::RuvMagnitude::is_active(&self) -> bool
 impl core::fmt::Debug for ferx_core::RuvMagnitude
 pub fn ferx_core::RuvMagnitude::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::SaemObjective
+pub ferx_core::SaemObjective::foce_ofv: f64
+pub ferx_core::SaemObjective::kind: ferx_core::SaemOfv
+pub ferx_core::SaemObjective::mc_standard_error: core::option::Option<f64>
+pub ferx_core::SaemObjective::n_nodes: core::option::Option<usize>
+pub ferx_core::SaemObjective::n_samples: core::option::Option<usize>
 pub struct ferx_core::ScoringSettings
 pub ferx_core::ScoringSettings::ebe_warm_start: bool
 pub ferx_core::ScoringSettings::gradient_method: ferx_core::GradientMethod
@@ -6066,6 +6160,7 @@ pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::op
 pub fn ferx_core::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
+pub type ferx_core::CountParamFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&[f64], &[f64], &std::collections::hash::map::HashMap<alloc::string::String, f64>) -> [f64; 2] + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::DerivedFilterFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> bool + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ErrorSelectFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&std::collections::hash::map::HashMap<alloc::string::String, f64>) -> usize + core::marker::Send + core::marker::Sync)>

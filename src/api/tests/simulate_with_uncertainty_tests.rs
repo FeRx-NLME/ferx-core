@@ -722,8 +722,8 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         covariance_wall_time_secs: 0.0,
         converged: true,
         ofv: 0.0,
-        aic: 0.0,
-        bic: 0.0,
+        aic: Some(0.0),
+        bic: Some(0.0),
         theta: template.theta.clone(),
         theta_names: template.theta_names.clone(),
         eta_names: template.omega.eta_names.clone(),
@@ -756,6 +756,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: None,
+        saem_objective: None,
         impmap_trace: None,
         bayes: None,
         vi: None,
@@ -774,6 +775,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        mstep_optimizer_used: None,
         gradient_method_inner: String::new(),
         gradient_method_outer: String::new(),
         uses_ode_solver: false,
@@ -3757,7 +3759,7 @@ fn every_public_options_struct_implements_default() {
 
 /// The crossers an NPDE reference run at `seed` draws on [`tiny_population`] under
 /// [`INDOMAIN_TWINLESS_TRANSIT_SRC`] at ω²(ETA_CL) = `var`, counted **outside** the engine:
-/// the subject-`i` stream is `StdRng::seed_from_u64(seed + i)`, each replicate draws one η
+/// the subject-`i` stream is `StdRng::seed_from_u64(stream_seed(seed, &[i]))`, each replicate draws one η
 /// normal then one ε normal per observation (a single σ, no `block_sigma`, so the per-row
 /// draw), and the domain test is the closed form — `CL/V = 0.5·e^η/4 ≥ KTR = (3+1)/20`
 /// ⇔ `η ≥ ln 1.6`. Coupled to the draw order on purpose: an exact count is what lets the
@@ -3770,7 +3772,7 @@ fn npde_reference_crossers(var: f64, nsim: usize, seed: u64) -> usize {
     let threshold = 1.6_f64.ln();
     let mut crossed = 0;
     for (i, s) in pop.subjects.iter().enumerate() {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(i as u64));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(crate::rng::stream_seed(seed, &[i as u64]));
         for _ in 0..nsim {
             let eta = var.sqrt() * normal.sample(&mut rng);
             for _ in &s.observations {

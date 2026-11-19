@@ -227,6 +227,10 @@ fn saem_falls_back_to_fd() {
         saem_seed: Some(3),
         // Every θ through the M-step's numerical score, not the mu-referenced closed form.
         mu_referencing: false,
+        // The comparison is plans against the forced fallback under ONE M-step solver. `auto`
+        // is Newton on the plans and BOBYQA (the information is gone) on the fallback: two
+        // different solves, 0.354 apart in OFV (#3001), which says nothing about the plans.
+        mstep_optimizer: crate::types::MstepOptimizer::Bobyqa,
         ..opts(EstimationMethod::Saem)
     };
     let (e, f) = pair(&m, &p, &o);
@@ -409,7 +413,6 @@ fn mixture_falls_back_to_fd() {
         crate::estimation::mixture::mixture_gradient_salvaged(
             &model, &pop, params, &o, &eval, None, &log,
         )
-        .expect("a mixture gradient")
     };
     let exact = grad();
     let fd = plans_failing(grad);

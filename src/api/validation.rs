@@ -841,7 +841,7 @@ pub(crate) fn check_endpoint_routing(
     population: &Population,
     require_records: bool,
 ) -> Vec<Diagnostic> {
-    use crate::types::EndpointLikelihood;
+    use crate::types::{EndpointLikelihood, ObsRecord};
     use std::collections::BTreeMap;
 
     // (what to call the endpoint in the message, the block the diagnostic points at)
@@ -853,6 +853,7 @@ pub(crate) fn check_endpoint_routing(
             EndpointLikelihood::Binary { .. } => {
                 Some(("binary (`[binary_model]`)", "binary_model"))
             }
+            EndpointLikelihood::Count { .. } => Some(("count (`[count_model]`)", "count_model")),
             #[cfg(feature = "markov")]
             EndpointLikelihood::Ctmm { .. } | EndpointLikelihood::Dtmm { .. } => {
                 Some(("Markov (`[markov_model]`)", "markov_model"))
@@ -870,6 +871,33 @@ pub(crate) fn check_endpoint_routing(
     if endpoints.is_empty() {
         return Vec::new();
     }
+    // The record variant an endpoint's likelihood scores (#2877 review round 6): every
+    // likelihood path matches on its own variant and skips the rest, so a record of another
+    // kind on its CMT — possible only in a hand-built population, the routed reader picks
+    // the variant from the endpoint — would be dropped from the objective without a word.
+    let scores = |ep: &EndpointLikelihood, r: &ObsRecord| -> bool {
+        match (ep, r) {
+            (EndpointLikelihood::Tte { .. }, ObsRecord::Event { .. })
+            | (EndpointLikelihood::Binary { .. }, ObsRecord::DiscreteState { .. })
+            | (EndpointLikelihood::Count { .. }, ObsRecord::Count { .. }) => true,
+            #[cfg(feature = "markov")]
+            (
+                EndpointLikelihood::Ctmm { .. } | EndpointLikelihood::Dtmm { .. },
+                ObsRecord::DiscreteState { .. },
+            ) => true,
+            _ => false,
+        }
+    };
+    let variant_of = |r: &ObsRecord| match r {
+        ObsRecord::Event { .. } => "`ObsRecord::Event`",
+        ObsRecord::DiscreteState { .. } => "`ObsRecord::DiscreteState`",
+        ObsRecord::Count { .. } => "`ObsRecord::Count`",
+    };
+    let expected_variant = |ep: &EndpointLikelihood| match ep {
+        EndpointLikelihood::Tte { .. } => "`ObsRecord::Event`",
+        EndpointLikelihood::Count { .. } => "`ObsRecord::Count`",
+        _ => "`ObsRecord::DiscreteState`",
+    };
 
     let mut diags = Vec::new();
     // cmt -> (first offending subject, number of Gaussian rows on it)
@@ -902,8 +930,42 @@ pub(crate) fn check_endpoint_routing(
             .with_block(block),
         );
     }
+    // cmt -> (first offending subject, its record's variant, number of such records)
+    let mut wrong_kind: BTreeMap<usize, (String, &'static str, usize)> = BTreeMap::new();
+    for subj in &population.subjects {
+        for r in &subj.obs_records {
+            let cmt = r.cmt();
+            if let Some(ep) = model.endpoints.get(&cmt) {
+                if endpoints.contains_key(&cmt) && !scores(ep, r) {
+                    wrong_kind
+                        .entry(cmt)
+                        .or_insert_with(|| (subj.id.clone(), variant_of(r), 0))
+                        .2 += 1;
+                }
+            }
+        }
+    }
+    for (cmt, (id, variant, n)) in &wrong_kind {
+        let (kind, block) = endpoints[cmt];
+        let want = expected_variant(&model.endpoints[cmt]);
+        diags.push(
+            Diagnostic::error(
+                "E_ENDPOINT_RECORD_KIND",
+                format!(
+                    "E_ENDPOINT_RECORD_KIND: CMT {cmt} is declared as a {kind} endpoint, but \
+                     {n} record(s) on it are {variant} (first: subject {id}), which its \
+                     likelihood does not score, so they would contribute nothing. A {kind} \
+                     record is {want}: build the population with \
+                     `read_population_for(&model, ...)`, which picks the record from the \
+                     endpoint, or construct those records as {want}."
+                ),
+            )
+            .with_block(block),
+        );
+    }
     if require_records {
-        // one pass over the records: cmt -> routed rows
+        // one pass over the records: cmt -> routed rows, of any kind — a CMT whose records
+        // are all of the wrong kind has its own, more precise, error above
         let mut routed: BTreeMap<usize, usize> = BTreeMap::new();
         for r in population
             .subjects
@@ -1220,18 +1282,21 @@ pub(crate) fn check_theta_gather_indices(
             // then dose rows, which read the individual parameters too.
             // Each row's TIME as written (#1959, #1969): a dose in a reset period that
             // restarts TIME runs at a shifted engine time the file does not hold.
-            // Discrete-state records too: a `[binary_model]` predictor or a DTMM reads the
-            // index from each record's own snapshot (#2562).
+            // Discrete-state and count records too: a `[binary_model]` predictor, a DTMM or a
+            // `[count_model]` mean reads the index from each record's own snapshot (#2562,
+            // #2877).
             let snaps = subj.record_covariate_snapshots();
             let records = subj
                 .obs_records
                 .iter()
                 .enumerate()
                 .filter_map(|(r, rec)| match rec {
-                    crate::types::ObsRecord::DiscreteState { raw_time, .. } => {
+                    crate::types::ObsRecord::DiscreteState { raw_time, .. }
+                    | crate::types::ObsRecord::Count { raw_time, .. } => {
                         Some((*raw_time, subj.record_cov(snaps, r)))
                     }
-                    _ => None,
+                    #[cfg(feature = "survival")]
+                    crate::types::ObsRecord::Event { .. } => None,
                 });
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))
@@ -5119,6 +5184,38 @@ pub(crate) fn check_survival_tv_covariates(
                 }
                 continue;
             }
+            // Count (#2877): the mean and size read each record's own snapshot, as the binary
+            // predictor does, with the same refusal when the snapshot cannot line up.
+            if let EndpointLikelihood::Count {
+                count_covariates, ..
+            } = endpoint
+            {
+                if let Some(name) = count_covariates
+                    .iter()
+                    .find(|c| tv_set.contains(c.as_str()))
+                {
+                    if subject.record_covariate_snapshots().is_none() {
+                        return refuse(
+                            "count_model",
+                            format!(
+                                "[count_model] on CMT={cmt}: the count mean or size references \
+                                 {}, which is time-varying for subject `{}`, but that subject \
+                                 carries no per-record covariate snapshot aligned with its \
+                                 count records (it also has time-to-event records, or was built \
+                                 in memory without `endpoint_covariates`), so the expression \
+                                 could only read the baseline value (#741). {}",
+                                tv_reference(name),
+                                subject.id,
+                                tv_remedy(
+                                    name,
+                                    "fit the count endpoint without the time-to-event endpoint"
+                                ),
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
             // DTMM (#2473): the transition probabilities read each record's own covariate
             // snapshot, so a time-varying covariate is honoured — provided the subject's
             // snapshot lines up with its records (`record_covariate_snapshots`). One that
@@ -6188,6 +6285,7 @@ fn profile_refused_endpoint(model: &CompiledModel) -> Option<&'static str> {
         match e {
             E::Gaussian(_) | E::Binary { .. } => None,
             E::Tte { .. } => Some((0, "time-to-event")),
+            E::Count { .. } => Some((1, "count")),
             #[cfg(feature = "markov")]
             E::Dtmm { .. } => Some((1, "Markov (DTMM)")),
             #[cfg(feature = "markov")]
@@ -6617,6 +6715,23 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+    }
+
+    // Count (#2877): the same Gauss-Newton gap as binary.
+    if model.has_count()
+        && chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_COUNT_GN_UNSUPPORTED",
+                "method = gn / gn_hybrid is not supported with a [count_model] endpoint. The \
+                 Gauss-Newton gradient is built from the Gaussian residual structure and ignores \
+                 the count likelihood. Use method = focei (default), saem, or imp.",
+            )
+            .with_block("fit_options"),
+        );
     }
 
     // CTMM (#759) endpoint compatibility — same shape as the binary case above. FOCEI

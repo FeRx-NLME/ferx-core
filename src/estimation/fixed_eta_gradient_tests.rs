@@ -3094,3 +3094,490 @@ fn the_exact_theta_score_is_the_central_difference_of_the_production_objective()
         );
     }
 }
+
+/// With every θ pinned (SAEM's σ-only numerical M-step), the score skips the θ recording
+/// and sweep: its θ part is zero and its σ part and value are exactly those of the same call
+/// with θ free; with one θ free the sweep runs. The counter tells which side ran, so a
+/// mutation that always sweeps, or never does, reddens one of the two.
+#[test]
+fn a_fully_pinned_theta_block_skips_the_adjoint_and_keeps_the_sigma_score() {
+    use crate::types::DoseEvent;
+    let model = crate::types::test_helpers::parsed_analytical_model(GradientMethod::Auto);
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 4.0, 8.0],
+        observations: vec![8.0, 4.8, 2.4],
+        obs_cmts: vec![1, 1, 1],
+        cens: vec![0, 0, 0],
+        ..Default::default()
+    };
+    let (theta, sigma, eta) = ([1.5f64, 20.0, 1.0], [0.2f64], [0.05f64]);
+    let mask = [true, true, true];
+    let score = |lower: &[f64], upper: &[f64]| {
+        let before = EXACT_THETA_SCORES.with(|c| c.get());
+        let mut scratch = EventPkParams::default();
+        let (v, g) = obs_nll_subject_grad(
+            &model,
+            &subject,
+            &theta,
+            &sigma,
+            &eta,
+            &mask,
+            lower,
+            upper,
+            3,
+            1,
+            &mut scratch,
+        );
+        (v, g, EXACT_THETA_SCORES.with(|c| c.get()) - before)
+    };
+    let (v_free, g_free, swept_free) = score(&[-9.0; 4], &[9.0; 4]);
+    let (v_pin, g_pin, swept_pin) = score(&[-9.0; 4], &[-9.0, -9.0, -9.0, 9.0]);
+    let (_, g_one, swept_one) = score(&[-9.0; 4], &[-9.0, 9.0, -9.0, 9.0]);
+    assert_eq!((swept_free, swept_pin, swept_one), (1, 0, 1));
+    assert_eq!(v_free, v_pin);
+    assert_eq!(&g_pin[..3], &[0.0, 0.0, 0.0]);
+    assert_eq!(
+        g_pin[3], g_free[3],
+        "the σ score must not depend on the θ block"
+    );
+    assert_eq!(g_one[0], 0.0);
+    assert!(g_free[0].abs() > 1e-6 && g_one[1] == g_free[1]);
+}
+
+/// The IOV score's expected information (`obs_nll_subject_score_iov`) against the closed
+/// form of a proportional-error model assembled independently from central differences of
+/// `predict_iov` (`V = σ²f²`, so `dV/df = 2σ²f`, `∂V/∂log σ = 2V`):
+/// the sum of `f_a f_b / V + ½ V_a V_b / V²` over observations, written out below term by
+/// term, including the θσ cross block. The value and gradient are the non-Fisher IOV score's to the bit, the
+/// information is symmetric, and an adjoint decline (the stub model) withholds it.
+/// Two occasions with a dose in each, so κ acts on a later dose with drug on board.
+#[test]
+fn the_iov_information_is_the_closed_form_of_the_proportional_model() {
+    use crate::types::DoseEvent;
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  kappa KAPPA_CL ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n",
+    )
+    .expect("fixture parses");
+    let times = vec![1.0, 3.0, 6.0, 13.0, 16.0, 20.0];
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        dose_occasions: vec![1, 2],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_cmts: vec![1; 6],
+        cens: vec![0; 6],
+        obs_times: times,
+        observations: vec![1.7, 1.2, 0.8, 2.1, 1.6, 1.0],
+        ..Default::default()
+    };
+    let (theta, sigma, eta) = (vec![5.0f64, 50.0], vec![0.1f64], vec![0.1f64]);
+    let kappas = vec![vec![0.15f64], vec![-0.1]];
+    let (n_theta, n_sigma) = (2usize, 1usize);
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let mut scratch = EventPkParams::default();
+    let (v0, g0) = obs_nll_subject_grad_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &kappas,
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+    );
+    let (v1, g1, info) = obs_nll_subject_score_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &kappas,
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+        true,
+        None,
+        None,
+    );
+    // The objective is the same call; the gradient is the same derivative taken two ways —
+    // one reverse sweep seeded with the weights, or (with the information, whose rows it
+    // needs anyway) the weights' contraction of the forward-tangent Jacobian — so it agrees
+    // to rounding, not in the bits (measured: 7e-15 relative).
+    assert_eq!(v0, v1, "the objective is the same call");
+    for (a, b) in g0.iter().zip(&g1) {
+        assert!(
+            (a - b).abs() <= 1e-12 * (1.0 + a.abs()),
+            "the score is the same derivative: {g0:?} vs {g1:?}"
+        );
+    }
+    let info = info.expect("a parsed IOV model is inside the information's scope");
+
+    // Independent assembly: ∂f_j/∂(log θ_a) by central differences of the IOV predictions.
+    let f0 = crate::pk::predict_iov(&model, &subject, &theta, &eta, &kappas);
+    let mut df = vec![vec![0.0f64; f0.len()]; n_theta];
+    for a in 0..n_theta {
+        let h = 1e-5 * theta[a];
+        let at = |d: f64| {
+            let mut t = theta.clone();
+            t[a] += d;
+            crate::pk::predict_iov(&model, &subject, &t, &eta, &kappas)
+        };
+        let (up, dn) = (at(h), at(-h));
+        for j in 0..f0.len() {
+            df[a][j] = theta[a] * (up[j] - dn[j]) / (2.0 * h);
+        }
+    }
+    let s2 = sigma[0] * sigma[0];
+    let mut want = vec![0.0f64; n * n];
+    for j in 0..f0.len() {
+        let (f, v) = (f0[j], s2 * f0[j] * f0[j]);
+        let dv_df = 2.0 * s2 * f;
+        let dv: Vec<f64> = (0..n)
+            .map(|a| {
+                if a < n_theta {
+                    dv_df * df[a][j]
+                } else {
+                    2.0 * v
+                }
+            })
+            .collect();
+        for a in 0..n {
+            for b in 0..n {
+                let fa = if a < n_theta { df[a][j] } else { 0.0 };
+                let fb = if b < n_theta { df[b][j] } else { 0.0 };
+                want[a * n + b] += fa * fb / v + 0.5 * dv[a] * dv[b] / (v * v);
+            }
+        }
+    }
+    assert!(want.iter().all(|w| w.is_finite()), "{want:?}");
+    let scale = want.iter().fold(0.0f64, |m, w| m.max(w.abs()));
+    assert!(scale > 1.0, "a flat information tests nothing ({scale})");
+    for a in 0..n {
+        for b in 0..n {
+            let (g, w) = (info[a * n + b], want[a * n + b]);
+            assert!(g.is_finite(), "({a},{b}): {g}");
+            assert!(
+                (g - w).abs() < 1e-6 * scale,
+                "({a},{b}): {g} vs closed form {w} (scale {scale})"
+            );
+            assert_eq!(g, info[b * n + a], "symmetry at ({a},{b})");
+        }
+    }
+    // κ must be live: the occasion-2 rows differ from a κ = 0 evaluation, or the stacked
+    // adjoint input could be ignored without this test seeing it.
+    let (_, _, flat) = obs_nll_subject_score_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &[vec![0.0], vec![0.0]],
+        &mask,
+        &lo,
+        &hi,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+        true,
+        None,
+        None,
+    );
+    let flat = flat.expect("in scope");
+    assert!(
+        (0..n * n).any(|i| (flat[i] - info[i]).abs() > 1e-3 * scale),
+        "κ does not move the information on this fixture"
+    );
+    // A pinned θ keeps an all-zero row and column.
+    let mut hi_pin = hi.clone();
+    let mut lo_pin = lo.clone();
+    lo_pin[1] = 0.0;
+    hi_pin[1] = 0.0;
+    let (_, _, pinned) = obs_nll_subject_score_iov(
+        &model,
+        &subject,
+        &theta,
+        &sigma,
+        &eta,
+        &kappas,
+        &mask,
+        &lo_pin,
+        &hi_pin,
+        n_theta,
+        n_sigma,
+        &mut scratch,
+        true,
+        None,
+        None,
+    );
+    let pinned = pinned.expect("in scope");
+    for b in 0..n {
+        assert_eq!(
+            (pinned[n + b], pinned[b * n + 1]),
+            (0.0, 0.0),
+            "row/col 1 at {b}"
+        );
+    }
+    assert_eq!(
+        pinned[0], info[0],
+        "a free coordinate's own block is unchanged"
+    );
+}
+
+/// The prediction memo changes no number: the score (value, gradient, information) and the
+/// IOV value, with predictions served from a slot, equal the memo-free calls bit for bit across
+/// a σ-only sequence, a θ change, and the value-then-score sharing of one slot. The slot really
+/// serves: the same θ with *different* η returns the first η's score (a stale slot), and a
+/// different θ recomputes. Non-IOV (parsed analytic model) and IOV (κ live on a later dose).
+#[test]
+fn memoised_predictions_change_no_score_and_are_served_for_an_unchanged_theta() {
+    use crate::estimation::pred_memo::{MemoSlot, PredMemo};
+    use crate::types::DoseEvent;
+    let mk = |iov: bool| {
+        let kappa = if iov { "  kappa KAPPA_CL ~ 0.04\n" } else { "" };
+        let cl = if iov {
+            "TVCL * exp(ETA_CL + KAPPA_CL)"
+        } else {
+            "TVCL * exp(ETA_CL)"
+        };
+        crate::parser::model_parser::parse_model_string(&format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n{kappa}  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = {cl}\n  V = TVV\n\
+             [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        ))
+        .expect("fixture parses")
+    };
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        dose_occasions: vec![1, 2],
+        occasions: vec![1, 1, 1, 2, 2, 2],
+        obs_cmts: vec![1; 6],
+        cens: vec![0; 6],
+        obs_times: vec![1.0, 3.0, 6.0, 13.0, 16.0, 20.0],
+        observations: vec![1.7, 1.2, 0.8, 2.1, 1.6, 1.0],
+        ..Default::default()
+    };
+    let (n_theta, n_sigma) = (2usize, 1usize);
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let kappas = vec![vec![0.15f64], vec![-0.1]];
+    for iov in [false, true] {
+        let model = mk(iov);
+        let mut scratch = EventPkParams::default();
+        let mut score = |theta: &[f64], sigma: f64, eta: f64, memo: Option<MemoSlot<'_>>| {
+            if iov {
+                obs_nll_subject_score_iov(
+                    &model,
+                    &subject,
+                    theta,
+                    &[sigma],
+                    &[eta],
+                    &kappas,
+                    &mask,
+                    &lo,
+                    &hi,
+                    n_theta,
+                    n_sigma,
+                    &mut scratch,
+                    true,
+                    memo,
+                    None,
+                )
+            } else {
+                obs_nll_subject_score(
+                    &model,
+                    &subject,
+                    theta,
+                    &[sigma],
+                    &[eta],
+                    &mask,
+                    &lo,
+                    &hi,
+                    n_theta,
+                    n_sigma,
+                    &mut scratch,
+                    true,
+                    memo,
+                    None,
+                )
+            }
+        };
+        // θ free under Newton: the memo follows θ, one evaluation per distinct θ.
+        let memo = PredMemo::for_solve([1usize], true, true).unwrap();
+        let slot = |theta: &[f64]| memo.begin(theta).map(|ev| ev.slot(0, 0));
+        let th = [5.0f64, 50.0];
+        // σ-only sequence: the first call fills the slot, the rest are served from it.
+        for sigma in [0.1, 0.17, 0.3] {
+            let plain = score(&th, sigma, 0.1, None);
+            let with = score(&th, sigma, 0.1, slot(&th));
+            assert_eq!(plain, with, "iov={iov} σ={sigma}");
+            assert!(plain.2.is_some(), "iov={iov}: information in scope");
+        }
+        // Stale on purpose: the slot holds η = 0.1's predictions for this θ, so η = -0.3 through
+        // it scores η = 0.1's predictions — and the memo-free η = -0.3 is a different number.
+        let first = score(&th, 0.1, 0.1, None);
+        let stale = score(&th, 0.1, -0.3, slot(&th));
+        let fresh = score(&th, 0.1, -0.3, None);
+        assert_eq!(stale.0, first.0, "iov={iov}: served from the slot");
+        assert!(fresh.0 != first.0, "iov={iov}: the two η must differ");
+        // A different θ recomputes (and now the slot holds that one).
+        let th2 = [5.5f64, 48.0];
+        assert_eq!(
+            score(&th2, 0.1, -0.3, slot(&th2)),
+            score(&th2, 0.1, -0.3, None),
+            "iov={iov}"
+        );
+        // One slot shared by the value path and the score path.
+        if iov {
+            let memo2 = PredMemo::for_solve([1usize], true, true).unwrap();
+            let s2 = memo2.begin(&th).map(|ev| ev.slot(0, 0));
+            let mut scratch2 = EventPkParams::default();
+            let plain_v = obs_nll_subject_into_iov(
+                &model,
+                &subject,
+                &th,
+                &[0.1],
+                &[0.1],
+                &kappas,
+                &mut scratch2,
+            );
+            let memo_v = obs_nll_subject_into_iov_memo(
+                &model,
+                &subject,
+                &th,
+                &[0.1],
+                &[0.1],
+                &kappas,
+                &mut scratch2,
+                None,
+                s2,
+            );
+            assert_eq!(plain_v, memo_v);
+            let via = score(&th, 0.2, 0.1, s2);
+            assert_eq!(via, score(&th, 0.2, 0.1, None));
+        }
+    }
+}
+
+/// The Newton M-step's information is the adjoint's or none: `obs_nll_subject_score` (the
+/// M-step solves' entry) withholds it from a subject the adjoint declined — whose per-θ rows
+/// would be forward differences, a curvature the exact-curvature solve must not step on —
+/// while `obs_nll_subject_grad_fisher` (`score_sa`'s) still takes the differenced rows; the
+/// gradient is the same either way. Both sides on one declined subject, and the in-scope
+/// control, where the two entries agree to the bit.
+#[test]
+fn the_solve_entry_withholds_a_differenced_information_where_score_sa_takes_it() {
+    use crate::types::DoseEvent;
+    let src = |ode: bool| {
+        let structural = if ode {
+            "ode(states=[central])\n[odes]\n  d/dt(central) = -(CL/V) * central\n[scaling]\n  y = central / V"
+        } else {
+            "pk one_cpt_iv(cl=CL, v=V)"
+        };
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 50.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+             [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n\
+             [structural_model]\n  {structural}\n\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        )
+    };
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        dose_occasions: vec![1],
+        occasions: vec![1; 3],
+        obs_cmts: vec![1; 3],
+        cens: vec![0; 3],
+        obs_times: vec![1.0, 3.0, 6.0],
+        observations: vec![1.7, 1.2, 0.8],
+        ..Default::default()
+    };
+    let (n_theta, n_sigma) = (2usize, 1usize);
+    let n = n_theta + n_sigma;
+    let mask = vec![true; n_theta];
+    let (lo, hi) = (vec![-1e30f64; n], vec![1e30f64; n]);
+    let both = |model: &CompiledModel| {
+        let th = [5.0f64, 50.0];
+        let mut scratch = EventPkParams::default();
+        let solve = obs_nll_subject_score(
+            model,
+            &subject,
+            &th,
+            &[0.1],
+            &[0.1],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+            true,
+            None,
+            None,
+        );
+        let score_sa = obs_nll_subject_grad_fisher(
+            model,
+            &subject,
+            &th,
+            &[0.1],
+            &[0.1],
+            &mask,
+            &lo,
+            &hi,
+            n_theta,
+            n_sigma,
+            &mut scratch,
+        );
+        (solve, score_sa)
+    };
+    // In scope: the exact rows serve both entries, bit for bit.
+    let model = crate::parser::model_parser::parse_model_string(&src(false)).unwrap();
+    assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(
+        &model
+    ));
+    let (solve, score_sa) = both(&model);
+    assert!(solve.2.is_some());
+    assert_eq!(solve, score_sa);
+    // Declined (an ODE readout without its compiled program): the gradient is the same
+    // forward difference in both; only `score_sa` has an information, and the solve has none.
+    let mut model = crate::parser::model_parser::parse_model_string(&src(true)).unwrap();
+    assert!(crate::sens::ode_provider::adjoint::recorder_in_scope(
+        &model
+    ));
+    model.ode_spec.as_mut().unwrap().readout_program = None;
+    assert!(!crate::sens::ode_provider::adjoint::recorder_in_scope(
+        &model
+    ));
+    let (solve, score_sa) = both(&model);
+    assert!(
+        solve.2.is_none(),
+        "the solve entry must not carry a differenced information"
+    );
+    assert!(score_sa.2.is_some(), "score_sa takes the differenced rows");
+    assert_eq!((solve.0, &solve.1), (score_sa.0, &score_sa.1));
+}

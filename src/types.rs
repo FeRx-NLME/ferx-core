@@ -4677,6 +4677,38 @@ pub enum LinkFn {
 pub type LinearPredictorFn =
     Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> f64 + Send + Sync>;
 
+#[cfg(feature = "survival")]
+/// Distribution family of a `[count_model]` endpoint (#2877).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountFamily {
+    /// Poisson: `P(Y = k) = λᵏ e^{−λ} / k!`, variance `λ`.
+    Poisson,
+    /// Negative binomial in the mean / size parameterisation (`type = negbin`): mean `λ`,
+    /// size `r > 0`, variance `λ + λ²/r`. The Poisson is the `r → ∞` limit.
+    NegBin,
+}
+
+#[cfg(feature = "survival")]
+/// Which scale a `[count_model]` mean expression is written on (#2877): `lambda = …` gives
+/// the mean itself (it must evaluate to a finite positive number), `log_lambda = …` gives
+/// `log λ` (any finite number).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountMeanScale {
+    /// `lambda = …`: the expression is the mean count `λ`.
+    Linear,
+    /// `log_lambda = …`: the expression is `log λ`.
+    Log,
+}
+
+#[cfg(feature = "survival")]
+/// Closure evaluating a `[count_model]` endpoint's parameters at one record from
+/// `(theta, eta, covariates)`: `[mean, size]`, the mean on the endpoint's
+/// [`CountMeanScale`] and the negative-binomial size `r` (`NaN` for a Poisson endpoint,
+/// which has none). Called under the record's model-time scope, as
+/// [`LinearPredictorFn`] is.
+pub type CountParamFn =
+    Box<dyn Fn(&[f64], &[f64], &HashMap<String, f64>) -> [f64; 2] + Send + Sync>;
+
 #[cfg(feature = "markov")]
 /// Closure building a CTMM generator matrix `Q(θ, η, covariates, state)` — the
 /// S×S transition-intensity (generator) matrix for a continuous-time Markov
@@ -4732,9 +4764,9 @@ pub enum EndpointLikelihood {
         /// expressions, in the [`HazardParamFn`] layout minus a trailing absent `loghr`, for
         /// the **exact** η-Hessian of the FOCEI Laplace term (#2437).
         ///
-        /// `None` — and the Laplace term finite-differences this endpoint's η-Hessian —
-        /// for an [`HazardSpec::OdeAccumulated`] hazard, or when the expressions cannot be
-        /// represented exactly (see `build_endpoint_expr_program`).
+        /// `None` for an [`HazardSpec::OdeAccumulated`] hazard (served by the RHS program) and
+        /// for a hazard whose `param_fn` is an opaque Rust closure, which has no expression
+        /// tree to compile; its terms then take FD. A parsed analytic hazard always has one.
         hazard_program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Binary / Bernoulli endpoint — mixed-effects logistic regression (§3.5 of
@@ -4750,10 +4782,10 @@ pub enum EndpointLikelihood {
         /// through the closed-form Bernoulli score `(p − y)` instead of
         /// finite-differencing the whole data term (#2024).
         ///
-        /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
-        /// represented exactly (an unbindable identifier). A program past the gradient's
-        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks
-        /// `EndpointExprProgram::gradient_in_scope` (#2437).
+        /// `None` — and the endpoint keeps its FD gradient — only for an opaque Rust closure
+        /// `lp_fn`; a parsed predictor always has one. A program past the gradient's
+        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks its own
+        /// scope (#2437).
         lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline
@@ -4789,8 +4821,8 @@ pub enum EndpointLikelihood {
         /// or for a time-**inhomogeneous** endpoint the occupancy ODE with the ODE states
         /// from the dual state solve) instead of finite-differencing it (#759).
         ///
-        /// `None` — and the endpoint keeps its FD gradient — when the program cannot be
-        /// represented exactly (see `build_ctmm_generator_program`).
+        /// `None` — and the endpoint keeps its FD gradient — only for an opaque Rust closure
+        /// `generator_fn`; a parsed generator always has one.
         generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
@@ -4839,8 +4871,8 @@ pub enum EndpointLikelihood {
         /// Resolved, dual-evaluable form of the same probabilities (one output per
         /// transition), for the **analytic** inner gradient: `∂P_jk/∂(θ,η)` exactly,
         /// chained through `∂(−log P)/∂P` instead of finite-differencing the data term.
-        /// `None` — and the endpoint keeps its FD gradient — when an expression cannot be
-        /// represented exactly or the `(θ, η)` width is past the dual dispatch cap.
+        /// `None` — and the endpoint keeps its FD gradient — only for an opaque Rust closure
+        /// `prob_fn`; a parsed probability always has one.
         prob_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by any transition probability (including those
         /// reached through `[individual_parameters]`). Read at the **record being scored**,
@@ -4849,7 +4881,28 @@ pub enum EndpointLikelihood {
         /// refused at fit setup by `crate::api::check_survival_tv_covariates` (#741).
         prob_covariates: Vec<String>,
     },
-    // Ordinal, Poisson, NegBin deferred to Phase 4
+    /// Count endpoint (#2877): a non-negative integer DV observed via
+    /// [`ObsRecord::Count`], scored per record against a Poisson or negative-binomial law
+    /// with mean `λ(θ, η, covariates, TIME)` — the `[count_model]` block. The data term is
+    /// `−Σ log P(Y = k_r)`, constant `ln Γ(k + 1)` included (NONMEM's `F_FLAG = 1`
+    /// `−2·log PMF` convention).
+    Count {
+        family: CountFamily,
+        /// Scale the mean expression is written on (`lambda` / `log_lambda`).
+        scale: CountMeanScale,
+        /// `[mean, size]` at one record — see [`CountParamFn`].
+        param_fn: CountParamFn,
+        /// Resolved, dual-evaluable form of the same expressions (the mean, then `r` for a
+        /// negative binomial), for the exact inner / outer derivatives through the
+        /// discrete term's plan. `None` — the endpoint keeps its FD gradient — when an
+        /// expression cannot be represented exactly.
+        param_program: Option<crate::parser::model_parser::EndpointExprProgram>,
+        /// Covariate names the mean and size read (including through
+        /// `[individual_parameters]`). Read at each record's own covariate snapshot, as
+        /// [`Self::Binary`]'s `lp_covariates` are.
+        count_covariates: Vec<String>,
+    },
+    // Ordinal deferred to Phase 4
 }
 
 #[cfg(feature = "survival")]
@@ -4863,6 +4916,9 @@ impl std::fmt::Debug for EndpointLikelihood {
                 write!(f, "Tte({hazard:?}, {recurrence:?})")
             }
             EndpointLikelihood::Binary { link, .. } => write!(f, "Binary({link:?})"),
+            EndpointLikelihood::Count { family, scale, .. } => {
+                write!(f, "Count({family:?}, {scale:?})")
+            }
             #[cfg(feature = "markov")]
             EndpointLikelihood::Ctmm {
                 n_states,
@@ -4941,8 +4997,8 @@ impl SimOutcome {
 /// Only variants with a **live producer** are declared. The plan also sketches
 /// `Survival` and `Rate` arms; TTE prediction already ships as the richer
 /// [`crate::api::SurvivalPredictionResult`] (S/H/h + CIF + median/mean, more than a
-/// three-field variant would hold), and `Rate` waits on the Poisson/count slice —
-/// adding either before it can be produced would be an untestable dead arm.
+/// three-field variant would hold), so adding it would be an untestable dead arm. `Rate`
+/// is the count endpoint's (#2877).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Prediction {
     /// Gaussian continuous prediction (the existing scalar path).
@@ -4952,15 +5008,28 @@ pub enum Prediction {
     /// CTMM occupancy `π(t)` reuses this variant (#820), indexed by generator
     /// state; callers map back to DV codes through the endpoint's `state_codes`.
     CatProbs { probs: Vec<f64> },
+    /// Count-endpoint prediction (#2877): the mean count `lambda` of the record and, for a
+    /// negative-binomial endpoint, its size `r` (`None` for a Poisson endpoint).
+    /// [`Prediction::prob`] turns it into `P(Y = k)`.
+    Rate { lambda: f64, size: Option<f64> },
 }
 
 impl Prediction {
-    /// `P(Y = k)` for state index `k`, or `None` when this is not a categorical
-    /// prediction or `k` is out of range. Keeps callers from indexing `probs`
+    /// `P(Y = k)` for state index `k` (or count `k`), or `None` when this is not a
+    /// categorical or count prediction or `k` is out of range — for a count, above
+    /// `u32::MAX`, the largest count a record carries. Keeps callers from indexing `probs`
     /// directly and panicking on a shape they did not check.
     pub fn prob(&self, k: usize) -> Option<f64> {
         match self {
             Prediction::CatProbs { probs } => probs.get(k).copied(),
+            Prediction::Rate { lambda, size } => {
+                let k = u32::try_from(k).ok()?;
+                Some(crate::stats::special::count_pmf(
+                    *lambda,
+                    *size,
+                    f64::from(k),
+                ))
+            }
             Prediction::Continuous { .. } => None,
         }
     }
@@ -5602,10 +5671,10 @@ pub struct FremConfig {
 /// The inner optimizer is BFGS; what differs across variants is how the
 /// gradient of the individual NLL w.r.t. ETA is computed.
 ///
-/// - `Auto` (default): use the exact analytic `Dual2` sensitivities whenever
-///   the model is in scope for them (analytical PK path: `tv_fn` populated,
-///   no LTBS / expression-scale inner / SDE), else fall back to `Fd`. The
-///   resolved per-subject route is reported in the startup banner.
+/// - `Auto` (default): the exact adjoint gradient (the compiled per-subject plans) for every
+///   model the parser accepts — closed-form, ODE, compartment-free, LTBS, expression scale,
+///   SDE, IOV. `Fd` is taken only for a subject whose plan fails at a point (reported as
+///   `W_PLAN_FD_FALLBACK`). The resolved per-subject route is reported in the startup banner.
 /// - `Fd`: central finite differences on the forward NLL. Performs `2·n_eta`
 ///   forward evaluations per gradient, so cost scales linearly with the
 ///   number of random effects. Always available, including for ODE models.
@@ -6038,6 +6107,25 @@ impl CompiledModel {
         c
     }
 
+    /// True if any endpoint is a [`Count`](EndpointLikelihood::Count) (Poisson /
+    /// negative-binomial) endpoint (#2877).
+    #[cfg(feature = "survival")]
+    pub fn has_count(&self) -> bool {
+        self.endpoints
+            .values()
+            .any(|e| matches!(e, EndpointLikelihood::Count { .. }))
+    }
+
+    /// CMTs routed to a `Count` endpoint, ascending (`endpoints` is a `BTreeMap`). The
+    /// datareader routes these rows to [`ObsRecord::Count`] via `ObsRouting.count`.
+    #[cfg(feature = "survival")]
+    pub fn count_cmts(&self) -> Vec<usize> {
+        self.endpoints
+            .iter()
+            .filter_map(|(cmt, ep)| matches!(ep, EndpointLikelihood::Count { .. }).then_some(*cmt))
+            .collect()
+    }
+
     /// True if any endpoint is a [`Ctmm`](EndpointLikelihood::Ctmm)
     /// (continuous-time Markov) endpoint — Phase 5, Track D (#759).
     #[cfg(feature = "markov")]
@@ -6084,16 +6172,16 @@ impl CompiledModel {
     }
 
     /// True if the model carries any **discrete** (non-Gaussian, non-TTE) endpoint scored
-    /// by `discrete_subject_nll` — the binary / Bernoulli family and the discrete-time
-    /// Markov (DTMM, #2473) endpoint; ordinal / Poisson / negative-binomial extend this
-    /// match. This is the family-agnostic gate for the discrete data term and its η-Hessian
+    /// by `discrete_subject_nll` — the binary / Bernoulli family, the Poisson /
+    /// negative-binomial count family (#2877) and the discrete-time Markov (DTMM, #2473)
+    /// endpoint; ordinal extends this match. This is the family-agnostic gate for the discrete data term and its η-Hessian
     /// contribution, so a new discrete family is enabled here and in `discrete_subject_nll`
     /// without editing a likelihood dispatch site. (The CTMM is not in it: it has its own
     /// `ctmm_subject_nll` dispatch.)
     #[cfg(feature = "survival")]
     pub fn has_discrete(&self) -> bool {
         self.endpoints.values().any(|e| match e {
-            EndpointLikelihood::Binary { .. } => true,
+            EndpointLikelihood::Binary { .. } | EndpointLikelihood::Count { .. } => true,
             #[cfg(feature = "markov")]
             EndpointLikelihood::Dtmm { .. } => true,
             _ => false,
@@ -6128,6 +6216,12 @@ impl CompiledModel {
     /// (TTE or categorical) can be parsed.
     #[cfg(not(feature = "survival"))]
     pub fn has_non_gaussian(&self) -> bool {
+        false
+    }
+
+    /// Always false without the `survival` feature - `[count_model]` can't be parsed.
+    #[cfg(not(feature = "survival"))]
+    pub fn has_count(&self) -> bool {
         false
     }
 
@@ -8247,6 +8341,8 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // #2832's adopted rail completion; its not-converged twin says "not reported as
         // converged" and is filed by the convergence arm above first.
         || lower.contains("resumed from just above the guard")
+        // #3005's adopted collapse completion, the same shape.
+        || lower.contains("re-inflated to the initial value")
     {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
@@ -8618,8 +8714,14 @@ pub struct FitResult {
     /// the **penalized** objective — MAP / penalized-ML SEs, not posterior SDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prior_summary: Vec<PriorSummary>,
-    pub aic: f64,
-    pub bic: f64,
+    /// `ofv_data + 2k`, or `None` when the reported objective is not a likelihood: a SAEM
+    /// fit under `saem_ofv = saem` (NONMEM's SAEMOBJ, #2973). Set `saem_ofv = imp`
+    /// (or `agq` / `focei`) for a value. Also `None` when the value is not finite (an
+    /// estimator with no objective, such as a VI fit under `vi_final_ofv = none`).
+    pub aic: Option<f64>,
+    /// `ofv_data + k·ln(n)`; `None` whenever [`Self::aic`] is, and also for a fit with no
+    /// records to count (`n = 0`).
+    pub bic: Option<f64>,
     pub theta: Vec<f64>,
     pub theta_names: Vec<String>,
     /// Names of the random effects (etas), parallel to the omega diagonal.
@@ -8719,6 +8821,12 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
+    /// `Some` when `ofv` of a SAEM fit is NONMEM's SAEM objective or the importance-sampled /
+    /// quadrature `−2 log L` (`saem_ofv`, default `saem`, #2973) rather than the FOCE/Laplace objective, which it
+    /// then carries as [`SaemObjective::foce_ofv`]. `None` for every other fit and for
+    /// `saem_ofv = focei`.
+    #[serde(default)]
+    pub saem_objective: Option<SaemObjective>,
     /// Per-iteration IMPMAP parameter trace, analogous to NONMEM `.ext` file
     /// output. `Some` when the final estimating stage was IMPMAP.
     pub impmap_trace: Option<ImpmapTrace>,
@@ -8806,6 +8914,13 @@ pub struct FitResult {
     /// across whichever ran (issue #1444).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saem_mh_accept_tail: Option<f64>,
+    /// The numerical θ/σ M-step optimizer a SAEM, IMP or IMPMAP fit actually ran
+    /// (`newton`, `bobyqa` or `lbfgs`): what `[fit_options] mstep_optimizer = auto`
+    /// (the default) resolved to for this model. `None` for other methods and where no
+    /// numerical solve runs: `mstep_solver = score_sa` replaces it, and a single free
+    /// additive/proportional σ with every free θ mu-referenced is updated in closed form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mstep_optimizer_used: Option<String>,
     /// Gradient method used in the inner (per-subject EBE) BFGS loop.
     pub gradient_method_inner: String,
     /// Gradient method used in the outer (population parameter) optimizer.
@@ -9166,7 +9281,9 @@ pub struct FitResult {
     #[serde(default)]
     pub starts: Vec<StartRecord>,
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
-    /// when no explicit seed was set in `[fit_options]`.
+    /// when no explicit seed was set in `[fit_options]`. When start `k > 0` of a
+    /// multi-start SAEM fit wins, this is that start's derived seed
+    /// (`per_start_seed`, #3021), the one that reproduces it.
     pub saem_seed: Option<u64>,
     /// The seed the SIR draws actually used: `sir_seed` when it was set, the
     /// built-in default otherwise, so the run is reproducible from this field
@@ -9972,6 +10089,11 @@ pub struct FitOptions {
     /// [`SaemMstepSolver::Bobyqa`], the historical single-draw re-maximisation,
     /// so an existing fit's estimates do not change.
     pub saem_mstep_solver: SaemMstepSolver,
+    /// Optimizer of the numerical θ/σ M-step, shared by SAEM (`bobyqa` solver),
+    /// IMP and IMPMAP. Defaults to [`MstepOptimizer::Auto`]: Fisher scoring where the
+    /// model is in its scope, BOBYQA run to its tolerance elsewhere.
+    /// `[fit_options] mstep_optimizer`.
+    pub mstep_optimizer: MstepOptimizer,
     /// Number of E-step draws the **`bobyqa`** M-step objective is averaged over
     /// (#1458). `1` (the default) is the historical single-draw objective.
     ///
@@ -10293,6 +10415,13 @@ pub struct FitOptions {
     /// draws per subject. `0` keeps the single Laplace proposal, which reads high
     /// on sparse subjects (#2653).
     pub imp_adapt_passes: usize,
+    /// Draws per pilot pass of the evaluation's proposal adaptation (`imp_adapt_passes`).
+    /// `0` (default) runs every pilot at the full `imp_samples`, as NONMEM's `EONLY=1`
+    /// iterations do; a smaller value (clamped to `2..=imp_samples`) fits the proposal's
+    /// centre and scale from fewer draws and keeps the final readout at `imp_samples`, so the
+    /// estimate stays unbiased while the evaluation costs `(passes·pilot + K)/((passes + 1)·K)`
+    /// of the full one. Read by the evaluation only, not by the estimating `imp` iterations.
+    pub imp_adapt_samples: usize,
     /// Number of MCEM iterations for the estimating `imp` path (ignored when
     /// `imp_eval_only`). Default 200.
     pub imp_iterations: usize,
@@ -10318,6 +10447,22 @@ pub struct FitOptions {
     /// The EBEs are reconverged at the incoming parameters before the grid is laid, because
     /// adaptive quadrature centres itself on the conditional mode.
     pub agq_eval_only: bool,
+    /// Which objective a SAEM fit reports as its OFV (AIC/BIC exist only for a likelihood readout): see
+    /// [`SaemOfv`]. Default [`SaemOfv::Saem`], NONMEM's `SAEMOBJ`; `imp` is its `IMP EONLY=1` follow-up.
+    /// Read only when SAEM is the last estimating stage and the chain has no explicit
+    /// evaluator stage of its own.
+    pub saem_ofv: SaemOfv,
+    /// Importance samples per subject for the `saem_ofv = imp` readout. Default 3000, the
+    /// `NITER=5 ISAMPLE=3000` setting `docs/estimation/importance-sampling.qmd` matches
+    /// NONMEM's `EONLY=1` at. Independent of `imp_samples`, which the estimating `imp`
+    /// stage and an explicit `imp_eval_only` stage use.
+    pub saem_ofv_samples: usize,
+    /// Quadrature nodes per random effect for the `saem_ofv = agq` readout. Default 11: on a 500-subject, 3-eta fit 5, 7, 11 and 15 nodes gave 5224.76, 5221.22, 5220.31 and 5220.21, so 11 is within 0.1 of the converged value where 7 is 1.0 high.
+    pub saem_ofv_nodes: usize,
+    /// Draws per pilot pass of the `saem_ofv = imp` readout's proposal adaptation (see
+    /// [`Self::imp_adapt_samples`]); the final readout always draws `saem_ofv_samples`. `0`
+    /// runs the pilots at the full count.
+    pub saem_ofv_pilot_samples: usize,
     // IMPMAP (Importance Sampling assisted by Mode A Posteriori) options,
     // consumed by the `Impmap` estimating stage. IMPMAP runs a Monte-Carlo EM
     // loop: each iteration re-centers a per-subject importance-sampling proposal
@@ -10743,6 +10888,7 @@ impl Default for FitOptions {
             saem_scale_deadband: Some(DEFAULT_SCALE_DEADBAND),
             saem_mstep_damping: None,
             saem_mstep_solver: SaemMstepSolver::default(),
+            mstep_optimizer: MstepOptimizer::default(),
             saem_mstep_draws: 1,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -10788,10 +10934,15 @@ impl Default for FitOptions {
             imp_seed: None,
             imp_low_ess_threshold: 0.1,
             imp_adapt_passes: 5,
+            imp_adapt_samples: 0,
             imp_iterations: 200,
             imp_averaging: 50,
             imp_eval_only: false,
             agq_eval_only: false,
+            saem_ofv: SaemOfv::default(),
+            saem_ofv_samples: 3000,
+            saem_ofv_nodes: 11,
+            saem_ofv_pilot_samples: 300,
             impmap_iterations: 200,
             impmap_samples: 300,
             impmap_proposal_df: 4.0,
@@ -11172,6 +11323,54 @@ pub enum SaemMstepSolver {
     /// returns 1.99 / 1.62 / 1.59. See
     /// `tests/saem_combined_error.rs::score_sa_does_not_bring_back_the_additive_sigma_collapse`.
     ScoreSa,
+}
+
+/// Optimizer of the numerical θ/σ M-step of SAEM, IMP and IMPMAP, set via
+/// `[fit_options] mstep_optimizer`.
+///
+/// Every arm minimises the same smooth, deterministic frozen-η (SAEM) or
+/// importance-weighted (IMP/IMPMAP) observation objective, in the same packed
+/// log/identity space, over the same bounds and relative tolerance. They differ in what
+/// the solve reads from the objective. BOBYQA (and Newton's continuation) runs to its
+/// tolerance under a runaway guard of 100 evaluations per interpolation point; `lbfgs`
+/// keeps the `mstep_maxiter * (n + 1)` budget of a gradient method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MstepOptimizer {
+    /// `newton` where the model is inside Newton's scope (the adjoint serves it and the
+    /// likelihood is a plain Gaussian one, not a mixture), `bobyqa` otherwise. Silent: the
+    /// fit's `mstep_optimizer` output line and `FitResult::mstep_optimizer_used` record what
+    /// it resolved to (the default).
+    #[default]
+    Auto,
+    /// NLopt BOBYQA, derivative-free, run to its tolerance.
+    Bobyqa,
+    /// NLopt L-BFGS on the exact fixed-η score: the per-subject adjoint θ score
+    /// and the analytic σ score (the one `mstep_solver = score_sa` already
+    /// uses). One value-and-gradient pass replaces the `n + 1` value passes
+    /// BOBYQA's interpolation model needs per step. Where a subject's plan
+    /// declines (a model outside the adjoint's scope) that subject's θ score is
+    /// a forward difference, as everywhere the fixed-η score is used.
+    Lbfgs,
+    /// Fisher scoring (damped Gauss-Newton) on the same exact score and the expected
+    /// information from the same adjoint recording (`estimation::mstep_newton`):
+    /// a handful of fused value-gradient-information passes from the warm start. A subject
+    /// outside the information's closed form (and a mixture) keeps the BOBYQA solve. A solve
+    /// that stalls or loses its information at run time continues with BOBYQA from the
+    /// point it reached on what is left of the one BOBYQA budget (every pass,
+    /// value or fused, counts as one evaluation), and the fit's warnings count those M-steps.
+    Newton,
+}
+
+impl MstepOptimizer {
+    /// The `[fit_options] mstep_optimizer` token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MstepOptimizer::Auto => "auto",
+            MstepOptimizer::Bobyqa => "bobyqa",
+            MstepOptimizer::Lbfgs => "lbfgs",
+            MstepOptimizer::Newton => "newton",
+        }
+    }
 }
 
 /// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the
@@ -11570,6 +11769,56 @@ pub enum ViSigmaUpdate {
     /// Step `σ` with Adam alongside `θ`. The pre-fix behaviour, kept as an escape
     /// hatch and for reproducing earlier fits; expect the bias described above.
     Adam,
+}
+
+/// Which objective a SAEM fit reports as its OFV (`saem_ofv`, #2973).
+///
+/// SAEM maximises the exact marginal likelihood but produces no usable value of it. NONMEM
+/// reports its **`SAEMOBJ`** for the SAEM step — the stochastic-approximation readout of the
+/// complete-data objective, not a likelihood — and follows it with `METHOD=IMP EONLY=1` for the
+/// marginal `−2 log L` when one is wanted. That is the default here, and the importance-sampled
+/// value is the explicit follow-up (`saem_ofv = imp`, or `method = [saem, imp]` with
+/// `imp_eval_only`). The FOCE/Laplace value stays available on [`SaemObjective::foce_ofv`] either
+/// way; under the default AIC/BIC are `None` (no likelihood is reported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum SaemOfv {
+    /// NONMEM's `SAEMOBJ`: `−2 Σ_i log( mean p(y_i, η_i) )`, the log of the mean joint density of
+    /// the data and the random effects over the convergence phase's draws and iterations (no
+    /// `2π` constants; `estimation/saem_objective.rs`). **Not a likelihood**: it is not comparable
+    /// across models or with a FOCE/FOCEI/IMP objective, and AIC/BIC are not built from it.
+    /// A mixture, whose convention no NONMEM run anchors, reports `imp` with a warning.
+    #[default]
+    Saem,
+    /// Importance-sampled `−2 log L` at the final estimates (NONMEM `IMP EONLY=1`), with
+    /// its Monte-Carlo standard error: `saem_ofv_samples` draws per subject, seeded by
+    /// `imp_seed`, so two runs agree.
+    Imp,
+    /// Adaptive Gauss–Hermite quadrature at the final estimates, `saem_ofv_nodes` nodes per
+    /// random effect. Deterministic; practical for up to three random effects, beyond which
+    /// (and for mixtures) the fit falls back to `imp` with a warning.
+    Agq,
+    /// The FOCE/Laplace objective at the SAEM estimates: the pre-#2973 behaviour, and the
+    /// value that is directly comparable with a FOCE/FOCEI fit of the same data.
+    Focei,
+}
+
+/// What the OFV of a SAEM fit is, when it is not the FOCE/Laplace value (#2973). Surfaced on
+/// [`FitResult::saem_objective`]; `None` there means `ofv` is the FOCE/Laplace objective.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct SaemObjective {
+    /// Which evaluator produced `FitResult::ofv` (never [`SaemOfv::Focei`]).
+    pub kind: SaemOfv,
+    /// Monte-Carlo standard error of `ofv` under [`SaemOfv::Imp`]; `None` under `saem` and `agq`.
+    pub mc_standard_error: Option<f64>,
+    /// Importance samples per subject under `imp`; `None` under `saem` and `agq`.
+    pub n_samples: Option<usize>,
+    /// Quadrature nodes per random effect under `agq`; `None` under `saem` and `imp`.
+    pub n_nodes: Option<usize>,
+    /// The FOCE/Laplace objective at the same estimates, `2·pop_nll` after the EBE
+    /// refinement: the value SAEM fits reported before #2973, kept as a diagnostic and for
+    /// comparison with a FOCE fit. AIC/BIC are `None` under [`SaemOfv::Saem`] (the SAEM
+    /// objective is not a likelihood) and built from `ofv` under `imp` and `agq`.
+    pub foce_ofv: f64,
 }
 
 /// Which marginal likelihood, if any, to evaluate at the converged VI estimate.
@@ -12381,6 +12630,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_mstep_solver",
             "mstep_draws",
             "saem_mstep_draws",
+            "mstep_optimizer",
             "saem_kernel",
             "saem_imh_proposals",
             "saem_imh_refresh",
@@ -12394,6 +12644,10 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "conddist_keep_samples",
             "seed",
             "saem_seed",
+            "saem_ofv",
+            "saem_ofv_samples",
+            "saem_ofv_nodes",
+            "saem_ofv_pilot_samples",
         ],
         EstimationMethod::Imp => &[
             "imp_samples",
@@ -12401,6 +12655,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_seed",
             "imp_low_ess_threshold",
             "imp_adapt_passes",
+            "imp_adapt_samples",
             "imp_iterations",
             "imp_averaging",
             "imp_eval_only",
@@ -12413,6 +12668,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_auto",
             "imp_max_time",
             "imp_defensive_alpha",
+            "mstep_optimizer",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -12438,6 +12694,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             // "unsupported" (issue #528).
             "impmap_defensive_alpha",
             "imp_defensive_alpha",
+            "mstep_optimizer",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",
