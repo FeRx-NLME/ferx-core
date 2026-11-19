@@ -20,6 +20,8 @@
 //!
 //! Cost is ≈ K× the inner loop (K EBE searches per subject per outer iteration).
 //! Parallelising across (subject × class) is a later optimisation (#977 risks).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use nalgebra::{DMatrix, DVector};
 
@@ -1149,6 +1151,8 @@ pub(crate) fn mixture_gradient_fd(
 #[cfg(test)]
 mod tests {
     use super::{any_contributing, combine_subject};
+    #[allow(unused_imports)]
+    use ferx_model::internal::*;
 
     mod merged_classes {
         use super::super::{

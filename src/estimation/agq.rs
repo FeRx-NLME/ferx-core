@@ -72,6 +72,8 @@
 //! contribution is not small. The contribution is only known after `nll(η_j)` is evaluated,
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use crate::sens::ode_provider::adjoint::ModeOut;
 use crate::stats::stacked_layout::{kappa_range, stacked_width};

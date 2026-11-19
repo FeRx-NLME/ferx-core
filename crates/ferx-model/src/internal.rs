@@ -16,6 +16,8 @@ use crate::io::datareader::SelectionFilter;
 use crate::ode::predictions::OdeSpec;
 use crate::ode::solver::OdeSolverStats;
 use crate::parser::model_parser::Bytecode;
+use crate::parser::model_parser::CtmmGeneratorProgram;
+use crate::parser::model_parser::EndpointExprProgram;
 use crate::parser::model_parser::EtaCoupling;
 use crate::parser::model_parser::Expression;
 use crate::parser::model_parser::IndivParamPartials;
@@ -26,6 +28,7 @@ use crate::parser::model_parser::OdeOutputProgram;
 use crate::parser::model_parser::OdeRhsProgram;
 use crate::parser::model_parser::RhsBindingPlan;
 use crate::parser::model_parser::RhsHoist;
+use crate::parser::model_parser::RuvMagDerivProgram;
 use crate::parser::model_parser::ScaleDerivProgram;
 use crate::parser::model_parser::Statement;
 use crate::parser::model_parser::ThetaBlocks;
@@ -145,6 +148,9 @@ pub trait SubjectInternal: sealed::Sealed + Sized {
     fn n_scored_rows(&self) -> usize;
     fn record_covariate_snapshots(&self) -> Option<&[HashMap<String, f64>]>;
     fn retain_records(&mut self, keep: impl FnMut(&mut ObsRecord) -> bool);
+    fn record_cov<'a>(
+        &'a self, snaps: Option<&'a [HashMap<String, f64>]>, r: usize,
+    ) -> &'a HashMap<String, f64>;
     fn param_time_obs(&self, j: usize) -> f64;
     fn param_time_pk_only(&self, m: usize) -> f64;
     fn param_time_at(&self, engine_t: f64) -> f64;
@@ -172,6 +178,11 @@ impl SubjectInternal for Subject {
     }
     fn retain_records(&mut self, mut keep: impl FnMut(&mut ObsRecord) -> bool) {
         Subject::retain_records(self, keep)
+    }
+    fn record_cov<'a>(
+        &'a self, snaps: Option<&'a [HashMap<String, f64>]>, r: usize,
+    ) -> &'a HashMap<String, f64> {
+        Subject::record_cov(self, snaps, r)
     }
     fn param_time_obs(&self, j: usize) -> f64 {
         Subject::param_time_obs(self, j)
@@ -203,6 +214,9 @@ impl sealed::Sealed for Subject {}
 pub trait OmegaMatrixInternal: sealed::Sealed + Sized {
     fn with_block_declared(self, block_declared: Vec<bool>) -> Self;
     fn structural_zeros(&self) -> Vec<bool>;
+    fn sim_draw_factor<'a>(
+        &'a self, declared: Option<&OmegaMatrix>, declared_fixed: &[bool],
+    ) -> std::borrow::Cow<'a, DMatrix<f64>>;
 }
 impl OmegaMatrixInternal for OmegaMatrix {
     fn with_block_declared(mut self, block_declared: Vec<bool>) -> Self {
@@ -210,6 +224,11 @@ impl OmegaMatrixInternal for OmegaMatrix {
     }
     fn structural_zeros(&self) -> Vec<bool> {
         OmegaMatrix::structural_zeros(self)
+    }
+    fn sim_draw_factor<'a>(
+        &'a self, declared: Option<&OmegaMatrix>, declared_fixed: &[bool],
+    ) -> std::borrow::Cow<'a, DMatrix<f64>> {
+        OmegaMatrix::sim_draw_factor(self, declared, declared_fixed)
     }
 }
 impl sealed::Sealed for OmegaMatrix {}
@@ -321,6 +340,15 @@ pub trait CompiledModelInternal: sealed::Sealed + Sized {
     fn indiv_param_for_pk_slot(&self, pk_slot: usize) -> Option<usize>;
     fn has_dose_lag(&self) -> bool;
     fn has_route_absorption_lag(&self) -> bool;
+    fn residual_cov_at<'a>(
+        &'a self, params: &'a ModelParameters,
+    ) -> crate::stats::residual_error::ResidualCov<'a>;
+    fn residual_cov_theta<'a>(
+        &'a self, theta: &[f64],
+    ) -> crate::stats::residual_error::ResidualCov<'a>;
+    fn residual_cov_with<'a>(
+        &'a self, pairs: &'a [ResidualCorrelation], theta: &[f64],
+    ) -> crate::stats::residual_error::ResidualCov<'a>;
     fn residual_is_dense(&self) -> bool;
     fn has_nested_levels(&self) -> bool;
     fn nested_levels(&self) -> Option<&NestedLevels>;
@@ -361,6 +389,21 @@ impl CompiledModelInternal for CompiledModel {
     }
     fn has_route_absorption_lag(&self) -> bool {
         CompiledModel::has_route_absorption_lag(self)
+    }
+    fn residual_cov_at<'a>(
+        &'a self, params: &'a ModelParameters,
+    ) -> crate::stats::residual_error::ResidualCov<'a> {
+        CompiledModel::residual_cov_at(self, params)
+    }
+    fn residual_cov_theta<'a>(
+        &'a self, theta: &[f64],
+    ) -> crate::stats::residual_error::ResidualCov<'a> {
+        CompiledModel::residual_cov_theta(self, theta)
+    }
+    fn residual_cov_with<'a>(
+        &'a self, pairs: &'a [ResidualCorrelation], theta: &[f64],
+    ) -> crate::stats::residual_error::ResidualCov<'a> {
+        CompiledModel::residual_cov_with(self, pairs, theta)
     }
     fn residual_is_dense(&self) -> bool {
         CompiledModel::residual_is_dense(self)
@@ -500,6 +543,9 @@ impl sealed::Sealed for ThetaBlocks {}
 
 pub trait OdeRhsProgramInternal: sealed::Sealed + Sized {
     fn route_note(&self) -> Option<(&'static str, String, serde_json::Value)>;
+    fn init_state_g<T: crate::sens::num::vm::VmNum>(
+        &self, params: &[T], n_states: usize,
+    ) -> Option<Vec<T>>;
     fn uses_time_vars(&self) -> bool;
     fn reads_time_builtin(&self) -> bool;
     fn reads_model_time(&self) -> bool;
@@ -511,10 +557,19 @@ pub trait OdeRhsProgramInternal: sealed::Sealed + Sized {
     fn pk_reads_tafd(&self) -> bool;
     fn pk_reads_solver_time(&self) -> bool;
     fn pk_reads_absolute_time(&self) -> bool;
+    fn eval_rhs_g<T: crate::sens::num::vm::VmNum>(
+        &self, u: &[T], params: &[T], t: f64, tafd: f64, tad: T, dt: T, du: &mut [T],
+        vars: &mut Vec<T>, stack: &mut Vec<T>,
+    );
 }
 impl OdeRhsProgramInternal for OdeRhsProgram {
     fn route_note(&self) -> Option<(&'static str, String, serde_json::Value)> {
         OdeRhsProgram::route_note(self)
+    }
+    fn init_state_g<T: crate::sens::num::vm::VmNum>(
+        &self, params: &[T], n_states: usize,
+    ) -> Option<Vec<T>> {
+        OdeRhsProgram::init_state_g(self, params, n_states)
     }
     fn uses_time_vars(&self) -> bool {
         OdeRhsProgram::uses_time_vars(self)
@@ -549,8 +604,42 @@ impl OdeRhsProgramInternal for OdeRhsProgram {
     fn pk_reads_absolute_time(&self) -> bool {
         OdeRhsProgram::pk_reads_absolute_time(self)
     }
+    fn eval_rhs_g<T: crate::sens::num::vm::VmNum>(
+        &self, u: &[T], params: &[T], t: f64, tafd: f64, tad: T, dt: T, du: &mut [T],
+        vars: &mut Vec<T>, stack: &mut Vec<T>,
+    ) {
+        OdeRhsProgram::eval_rhs_g(self, u, params, t, tafd, tad, dt, du, vars, stack)
+    }
 }
 impl sealed::Sealed for OdeRhsProgram {}
+
+pub trait CtmmGeneratorProgramInternal: sealed::Sealed + Sized {
+    fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>>;
+}
+impl CtmmGeneratorProgramInternal for CtmmGeneratorProgram {
+    fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        CtmmGeneratorProgram::eval_generator_colmajor_g(self, theta, eta, covariates)
+    }
+}
+impl sealed::Sealed for CtmmGeneratorProgram {}
+
+pub trait EndpointExprProgramInternal: sealed::Sealed + Sized {
+    fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>>;
+}
+impl EndpointExprProgramInternal for EndpointExprProgram {
+    fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
+    ) -> Option<Vec<T>> {
+        EndpointExprProgram::eval_g(self, theta, eta, covariates)
+    }
+}
+impl sealed::Sealed for EndpointExprProgram {}
 
 pub trait IndivParamProgramInternal: sealed::Sealed + Sized {
     fn n_eta_axis(&self) -> usize;
@@ -558,6 +647,9 @@ pub trait IndivParamProgramInternal: sealed::Sealed + Sized {
     fn params_reading_time(&self) -> Vec<bool>;
     fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool>;
     fn pk_var_slots(&self) -> &[(usize, usize)];
+    fn eval_params_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>, nn: &[Vec<T>],
+    ) -> Vec<T>;
     fn eval_param_values(
         &self, theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64,
         nn_outputs: &[Vec<f64>],
@@ -578,6 +670,11 @@ impl IndivParamProgramInternal for IndivParamProgram {
     }
     fn pk_var_slots(&self) -> &[(usize, usize)] {
         IndivParamProgram::pk_var_slots(self)
+    }
+    fn eval_params_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>, nn: &[Vec<T>],
+    ) -> Vec<T> {
+        IndivParamProgram::eval_params_g(self, theta, eta, covariates, nn)
     }
     fn eval_param_values(
         &self, theta: &[f64], eta: &[f64], covariates: &HashMap<String, f64>, time: f64,
@@ -611,6 +708,20 @@ impl ScaleDerivProgramInternal for ScaleDerivProgram {
     }
 }
 impl sealed::Sealed for ScaleDerivProgram {}
+
+pub trait RuvMagDerivProgramInternal: sealed::Sealed + Sized {
+    fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], cov: &HashMap<String, f64>, time: f64, tad: f64,
+    ) -> Option<T>;
+}
+impl RuvMagDerivProgramInternal for RuvMagDerivProgram {
+    fn eval_g<T: crate::sens::num::vm::VmNum>(
+        &self, theta: &[T], cov: &HashMap<String, f64>, time: f64, tad: f64,
+    ) -> Option<T> {
+        RuvMagDerivProgram::eval_g(self, theta, cov, time, tad)
+    }
+}
+impl sealed::Sealed for RuvMagDerivProgram {}
 
 pub trait ErrorSpecInternal: sealed::Sealed + Sized {
     fn slot_reads_f(&self, cmt: usize, k: usize, n_sigma: usize) -> bool;

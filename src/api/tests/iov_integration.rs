@@ -2,6 +2,8 @@ use super::fit;
 use super::simulate_with_seed;
 use super::{simulate_with_options, SimOutcome};
 use crate::types::*;
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use std::collections::HashMap;
 

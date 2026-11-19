@@ -91,7 +91,27 @@ for src in list(sources):
     sources |= defined.get(src.rsplit('::', 1)[1], set())
 
 ordered = sorted(sources, key=len, reverse=True)
+# The sealed traits of `ferx_model::internal` are ferx-core's private access to crate-private
+# members (#3041), not API: their impls on public types, and the members listed under each
+# such impl header (`cargo public-api` prints an impl's members right after its header, as
+# `pub fn <Type>::member`), are left out.
+# More generally, an impl of a ferx-model trait that ferx-core does not re-export (one that was
+# crate-private before the split, such as `sens::num::RecHooks`) is not reachable from ferx-core:
+# a caller cannot name the trait. Those impls and their members are left out the same way.
+TRAIT_IMPL = re.compile(r'^(?:unsafe )?impl(?:<.*?>)? (ferx_model::(?:\w+::)*\w+)(?:<[^>]*>)? for (\S+?)(?:<.*)?$')
+internal_owner = None
 for line in lines:
+    mi = TRAIT_IMPL.match(line)
+    if mi and mi.group(1) not in sources:
+        internal_owner = mi.group(2)
+        continue
+    if internal_owner:
+        if re.match(r'^pub (?:[a-z ]+ )?' + re.escape(internal_owner) + r'(?:<[^>]*>)?::', line):
+            continue
+        internal_owner = None
+    if line.startswith(('pub trait ferx_model::internal::', 'pub fn ferx_model::internal::',
+                        'pub mod ferx_model::internal', 'pub const ferx_model::internal::')):
+        continue
     line = line + '\n' if line else ''
     s = subject(line.rstrip('\n'))
     if (s and any(s == src or s.startswith(src + '::') for src in ordered)) or PRIMITIVE_MEMBER.match(line):

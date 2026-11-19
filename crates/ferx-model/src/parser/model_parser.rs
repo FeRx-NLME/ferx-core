@@ -30579,7 +30579,7 @@ impl OdeRhsProgram {
     /// verify-gate memo keys on it (#1150), where a behavioural probe at a finite set
     /// of points could not tell `y = f` from `y = f + g` with `g` vanishing there.
     #[cfg(debug_assertions)]
-    pub fn hash_structure<H: std::hash::Hasher>(&self, h: &mut H) {
+    pub(crate) fn hash_structure<H: std::hash::Hasher>(&self, h: &mut H) {
         use std::fmt::Write;
         let _ = write!(
             HashWriter(h),
@@ -30599,7 +30599,7 @@ impl OdeRhsProgram {
     /// vector `params` (states other than the seeded ones, and every state at the origin,
     /// read 0): the exact counterpart of `OdeSpec::init_fn` on a dual walk. `None` when
     /// the model's inits have no compiled form.
-    pub fn init_state_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn init_state_g<T: crate::sens::num::vm::VmNum>(
         &self, params: &[T], n_states: usize,
     ) -> Option<Vec<T>> {
         let progs = self.init_program.as_ref()?;
@@ -30980,7 +30980,7 @@ impl OdeRhsProgram {
     /// `state_count`). Mirrors the f64 binding in the `rhs` closure
     /// statement-for-statement (issue #410, inner η-gradient).
     #[allow(clippy::too_many_arguments)]
-    pub fn eval_rhs_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_rhs_g<T: crate::sens::num::vm::VmNum>(
         &self, u: &[T], params: &[T], t: f64, tafd: f64, tad: T, dt: T, du: &mut [T],
         vars: &mut Vec<T>, stack: &mut Vec<T>,
     ) {
@@ -31500,7 +31500,7 @@ impl CtmmGeneratorProgram {
     /// whatever derivative structure the caller seeded — each intensity placed at its
     /// off-diagonal entry and subtracted from the diagonal.
     /// `None` on a θ/η count shorter than the program reads.
-    pub fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_generator_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>> {
         let (mut vars, cov_vec) = self.vars_g(theta, eta, covariates)?;
@@ -31514,7 +31514,7 @@ impl CtmmGeneratorProgram {
 
     /// The `[individual_parameters]` var slots and the covariate slice, once per `(θ, η)`:
     /// what [`generator_at_g`](Self::generator_at_g) reads at every state.
-    pub fn vars_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn vars_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<(Vec<T>, Vec<f64>)> {
         if theta.len() < self.n_theta || eta.len() < self.n_eta {
@@ -31540,7 +31540,7 @@ impl CtmmGeneratorProgram {
 
     /// The generator `Q` (row-major) at the ODE state `state` (ignored by a homogeneous
     /// endpoint), from [`vars_g`](Self::vars_g)'s slots; the state slots are overwritten.
-    pub fn generator_at_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn generator_at_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], cov_vec: &[f64], vars: &mut [T], state: &[T],
     ) -> Vec<T> {
         for &(slot, idx) in &self.state_slots {
@@ -31562,7 +31562,7 @@ impl CtmmGeneratorProgram {
     /// transpose of [`eval_generator_g`](Self::eval_generator_g)'s row-major one, so every
     /// derivative has zero row sums. The homogeneous CTMM likelihood written once over `T`
     /// reads it (#2437). `None` where [`eval_generator_g`](Self::eval_generator_g) is.
-    pub fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>> {
         let q = self.eval_generator_g(theta, eta, covariates)?;
@@ -31766,7 +31766,7 @@ impl EndpointExprProgram {
     /// the caller seeded — a second-order η-dual for the η-Hessian (#2437), tape leaves for the
     /// adjoint's θ block (#2482) — at a covariate snapshot and the current model time (a
     /// `TIME` leaf). `None` on a θ/η count shorter than the program reads.
-    pub fn eval_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>> {
         if theta.len() < self.n_theta || eta.len() < self.n_eta {
@@ -31923,7 +31923,7 @@ impl IndivParamProgram {
     /// seeded by the caller (a forward dual's axes, or tape leaves). Returns one value
     /// per [`pk_var_slots`](Self::pk_var_slots) entry, in that order. The single
     /// evaluator behind the adjoint gradient's taped parameters.
-    pub fn eval_params_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_params_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>, nn: &[Vec<T>],
     ) -> Vec<T> {
         self.eval_vars_g(theta, eta, covariates, nn, |vars| {
@@ -31939,7 +31939,7 @@ impl IndivParamProgram {
 
     /// Variables `slots` (top-level `[individual_parameters]` names' slots) at `(θ, η)` on any
     /// number type, from one run of the program: the folded mu lines' values (#2982).
-    pub fn eval_var_slots_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_var_slots_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>, slots: &[usize],
     ) -> Vec<T> {
         self.eval_vars_g(theta, eta, covariates, &[], |v| slots.iter().map(|&s| v[s]).collect())
@@ -32121,7 +32121,7 @@ impl OdeOutputProgram {
     /// The readout counterpart of [`OdeRhsProgram::hash_structure`]: the bytecode,
     /// the state/parameter layout and the covariate names it reads (#1150).
     #[cfg(debug_assertions)]
-    pub fn hash_structure<H: std::hash::Hasher>(&self, h: &mut H) {
+    pub(crate) fn hash_structure<H: std::hash::Hasher>(&self, h: &mut H) {
         use std::fmt::Write;
         let _ = write!(
             HashWriter(h),
@@ -32180,7 +32180,7 @@ impl OdeOutputProgram {
     /// covariate snapshot, whose values thread in as constants (#540). `vars`/
     /// `stack` are caller-owned scratch. `theta` and `eta` are the recording's leaves, read by a readout that reads them
     /// directly ([`reads_leaves`](Self::reads_leaves)).
-    pub fn eval_output_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_output_g<T: crate::sens::num::vm::VmNum>(
         &self, state: &[T], params: &[T], theta: &[T], eta: &[T], cov: &HashMap<String, f64>,
         vars: &mut Vec<T>, stack: &mut Vec<T>,
     ) -> T {
@@ -32236,7 +32236,7 @@ impl ScaleDerivProgram {
     /// individual-parameter values (`var_vals[i]` for var slot `i`, as in
     /// the pre-#2093 `eval_scale_dual`). The single evaluator behind the
     /// adjoint gradient's taped scale.
-    pub fn eval_scale_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_scale_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], cov: &HashMap<String, f64>, var_vals: &[T],
     ) -> T {
         let cov_vec: Vec<f64> =
@@ -32266,7 +32266,7 @@ impl RuvMagDerivProgram {
     /// whatever derivative structure the caller seeded (tape leaves for the adjoint
     /// gradient) — with the observation's covariates and raw TIME, as the runtime
     /// closure evaluates it. `None` on a θ-count mismatch.
-    pub fn eval_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], cov: &HashMap<String, f64>, time: f64, tad: f64,
     ) -> Option<T> {
         if theta.len() != self.n_theta {

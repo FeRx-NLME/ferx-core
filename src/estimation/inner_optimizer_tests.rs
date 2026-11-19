@@ -53,6 +53,8 @@ static TEST_ALLOCATOR: CountingAllocator = CountingAllocator;
 #[cfg(feature = "markov")]
 mod ctmm_inner {
     use crate::types::{ObsRecord, Subject};
+    #[allow(unused_imports)]
+    use ferx_model::internal::*;
 
     const MIXED_CTMM: &str = crate::test_models::MODEL_1;
 
@@ -5193,6 +5195,8 @@ mod weighted_dense_residual_inner {
 #[cfg(feature = "survival")]
 mod binary_inner {
     use crate::types::{CompiledModel, EventType, ObsRecord, Population, Subject};
+    #[allow(unused_imports)]
+    use ferx_model::internal::*;
 
     /// Endpoint-only mixed-effects logistic with **two** live η: an intercept on the log-odds
     /// scale (`ETA_I`) and one inside a log-normal slope on `TIME` (`ETA_S`), so `∂lp/∂η_S`

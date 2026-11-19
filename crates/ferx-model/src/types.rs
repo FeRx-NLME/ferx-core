@@ -1718,7 +1718,7 @@ impl Subject {
     /// The covariate map record `r` of [`Self::obs_records`] is evaluated with: its own
     /// snapshot when `snaps` (this subject's [`Self::record_covariate_snapshots`], taken
     /// once per walk) aligns, else the baseline map.
-    pub fn record_cov<'a>(
+    pub(crate) fn record_cov<'a>(
         &'a self, snaps: Option<&'a [HashMap<String, f64>]>, r: usize,
     ) -> &'a HashMap<String, f64> {
         snaps.and_then(|s| s.get(r)).unwrap_or(&self.covariates)
@@ -2832,7 +2832,7 @@ impl OmegaMatrix {
     ///   A `FIX` value never moves, so the declaration is the truth; the floor check
     ///   keeps a caller who supplies a real variance for that η from losing it.
     /// - Otherwise `chol`, borrowed, exactly as before.
-    pub fn sim_draw_factor<'a>(
+    pub(crate) fn sim_draw_factor<'a>(
         &'a self, declared: Option<&OmegaMatrix>, declared_fixed: &[bool],
     ) -> std::borrow::Cow<'a, DMatrix<f64>> {
         use std::borrow::Cow;
@@ -3940,7 +3940,7 @@ impl RuvMagnitude {
     /// compiled slot programs (`per_sigma_deriv` / `per_sigma_exponent_deriv`): the same
     /// two-half row (multipliers, then exponents when a power form is active), each a
     /// function of the caller's θ. `None` when an active slot has no compiled program.
-    pub fn eval_subject_obs_g<T: crate::sens::num::vm::VmNum>(
+    pub(crate) fn eval_subject_obs_g<T: crate::sens::num::vm::VmNum>(
         &self, spec: &ErrorSpec, subject: &Subject, j: usize, theta: &[T],
     ) -> Option<Vec<T>> {
         let obs_covariates = subject.obs_cov(j);
@@ -6509,7 +6509,7 @@ impl CompiledModel {
     /// `block_sigma` correlations (#847) and, under a `correlation` line, the `ρ`
     /// its θ carries (#1081). What every dense-`R` builder is handed when it
     /// scores those parameters.
-    pub fn residual_cov_at<'a>(
+    pub(crate) fn residual_cov_at<'a>(
         &'a self, params: &'a ModelParameters,
     ) -> crate::stats::residual_error::ResidualCov<'a> {
         self.residual_cov_with(&params.residual_correlations, &params.theta)
@@ -6520,13 +6520,13 @@ impl CompiledModel {
     /// declaration (SAEM, HMC, VI, AGQ, IMP; #847). A `correlation` line's `ρ` is
     /// a θ, so it is read from `theta` like any other θ: there is no declared `ρ`
     /// to fall back on, and no form of this function that omits `theta` (#1081).
-    pub fn residual_cov_theta<'a>(
+    pub(crate) fn residual_cov_theta<'a>(
         &'a self, theta: &[f64],
     ) -> crate::stats::residual_error::ResidualCov<'a> {
         self.residual_cov_with(&self.residual_correlations, theta)
     }
 
-    pub fn residual_cov_with<'a>(
+    pub(crate) fn residual_cov_with<'a>(
         &'a self, pairs: &'a [ResidualCorrelation], theta: &[f64],
     ) -> crate::stats::residual_error::ResidualCov<'a> {
         let serial = self.residual_serial.as_ref().map(|s| {

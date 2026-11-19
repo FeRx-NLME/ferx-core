@@ -10,6 +10,8 @@
 //! Central FD is also *more* accurate than the forward FD this work replaces,
 //! so `hybrid_is_closer_to_central_fd_than_forward_fd` can assert the direction
 //! of the change rather than merely bounding the disagreement.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 // --- the imports of the original parent module (relocated test, #3041) ---
 use nalgebra::DMatrix;
 

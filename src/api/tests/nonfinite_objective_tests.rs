@@ -28,6 +28,8 @@ use crate::estimation::outer_optimizer::{
 };
 use crate::parser::model_parser::parse_model_string;
 use crate::types::{BloqMethod, ViFinalOfv, WarningCode, WarningSeverity};
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  G1 — the reported regression, end to end

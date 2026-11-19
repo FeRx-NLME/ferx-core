@@ -547,7 +547,7 @@ impl MlpMapper {
 
     /// The forward pass on any number type (weights on it, inputs constant), in
     /// [`Self::forward_cache`]'s exact association, so the value is bit-identical.
-    pub fn forward_g<T: crate::sens::num::PkNum>(&self, x: &[f64], weights: &[T]) -> Vec<T> {
+    pub(crate) fn forward_g<T: crate::sens::num::PkNum>(&self, x: &[f64], weights: &[T]) -> Vec<T> {
         let l_max = self.layers.len() - 1;
         let mut a_prev: Vec<T> = x.iter().map(|&v| T::from_f64(v)).collect();
         for l in 1..=l_max {
@@ -950,7 +950,7 @@ impl NamedMlpMapper {
 
     /// [`Self::forward_raw`] on any number type: the weights on it, the (zero-filled,
     /// normalised) inputs constant.
-    pub fn forward_raw_g<T: crate::sens::num::PkNum>(
+    pub(crate) fn forward_raw_g<T: crate::sens::num::PkNum>(
         &self, weights: &[T], covariates: &HashMap<String, f64>,
     ) -> Vec<T> {
         self.mlp.forward_g(&self.build_input_vec_zero_fill(covariates), weights)

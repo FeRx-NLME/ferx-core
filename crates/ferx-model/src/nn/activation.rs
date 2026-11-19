@@ -73,7 +73,7 @@ impl Activation {
 
     /// [`Self::apply`] on any number type: the same branches on the value, so the value
     /// is bit-identical and the derivatives are those of the branch taken.
-    pub fn apply_g<T: crate::sens::num::PkNum>(self, x: T) -> T {
+    pub(crate) fn apply_g<T: crate::sens::num::PkNum>(self, x: T) -> T {
         use crate::sens::num::{BranchCmp, JetFn};
         match self {
             Activation::Identity => x,
