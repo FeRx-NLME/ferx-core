@@ -106,9 +106,15 @@ pub(crate) fn method_in_scope(method: EstimationMethod) -> bool {
 }
 
 /// The ODE override the re-solve runs under, or `None` when there is nothing to check: a model
-/// that integrates nothing, one solved exactly by matrix exponential (no tolerance enters), or
-/// a fit whose `reltol` and `abstol` are both already at their floors ([`RELTOL_FLOOR`],
-/// [`ABSTOL_FLOOR`]). Each tolerance is tightened one decade, but not past its floor. Read on
+/// with no integrator, or a fit whose `reltol` and `abstol` are both already at their floors
+/// ([`RELTOL_FLOOR`], [`ABSTOL_FLOOR`]).
+///
+/// A model routed to the exact matrix-exponential propagation is checked too (#2994 review
+/// r6): its PK is exact, but the objective can still integrate at the tolerance — a
+/// time-inhomogeneous CTMM likelihood solves its occupancy ODE at
+/// `effective_solver_opts().for_integration()`, and a segment the linear propagator declines
+/// falls back to an integrated one. When nothing in the objective integrates, both sides
+/// score the same and the check stays silent, at the cost of one inner-loop pass. Each tolerance is tightened one decade, but not past its floor. Read on
 /// the thread the fit runs on, where its own override is armed, so the tolerance tightened is
 /// the one the fit integrated at.
 pub(crate) fn tightened_override(
@@ -116,9 +122,6 @@ pub(crate) fn tightened_override(
     options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
     let eff = model.integrator_spec()?.effective_solver_opts();
-    if eff.method == crate::ode::OdeMethod::Linear {
-        return None;
-    }
     let reltol = (eff.reltol * TIGHTEN_FACTOR)
         .max(RELTOL_FLOOR)
         .min(eff.reltol);

@@ -430,9 +430,11 @@ Scope and limits:
   `foce`, `focei`, `gn`, `gn_hybrid` or `laplace` (also with `n_agq > 1`). A trailing
   `agq_eval_only` readout owns the published OFV, so `method = [focei, laplace]` is checked on
   the quadrature marginal and `method = [vi, laplace]` is checked too; both sides then re-find
-  the modes under the readout's settings. A `[mixture]` model, an objective published by a
-  Monte-Carlo estimator and a model solved exactly by the [matrix exponential](#linear-exact)
-  are not checked.
+  the modes under the readout's settings. A `[mixture]` model and an objective published by
+  a Monte-Carlo estimator are not checked. A model whose PK is solved exactly by the
+  [matrix exponential](#linear-exact) is checked: its objective can still integrate at the
+  tolerance (a drug-driven CTMM likelihood, or a segment that falls back to integration),
+  and where nothing integrates both sides agree and no warning is given.
 - A re-scored objective is used only if it can be trusted. The fit carries
   `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, naming every reason, when the tighter solve
   cannot be set up (its worker pool cannot be built), or when either side has

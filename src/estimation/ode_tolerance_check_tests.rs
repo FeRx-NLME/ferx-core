@@ -614,3 +614,59 @@ fn a_stored_fit_side_that_did_not_integrate_cleanly_is_reported_unchecked() {
         "{why}"
     );
 }
+
+/// #2994 review r6: a model whose PK is routed to the exact matrix exponential is still
+/// checked, because its objective can integrate at the tolerance — here a drug-driven
+/// (time-inhomogeneous) CTMM likelihood, which solves its occupancy ODE per gap. Measured on
+/// this fixture (macOS arm64) at `outer_maxiter = 0`: `1e-1` → `1e-2` moves the OFV by +0.984,
+/// and at `1e-6` the OFV is within 1e-4 of its `1e-8` value, so the pair sits ~10× above and
+/// far below the threshold. With the old `Linear` early return the loose half is silent.
+#[cfg(feature = "markov")]
+#[test]
+fn a_linear_routed_model_with_an_integrated_likelihood_is_checked() {
+    let prep = crate::api::prepare_run(
+        "examples/ctmm_pd_2state.ferx",
+        Some("data/ctmm_pd_2state.csv"),
+    )
+    .expect("prepare ctmm_pd_2state");
+    assert_eq!(
+        prep.parsed
+            .model
+            .integrator_spec()
+            .expect("an integrated model")
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "fixture: the PK must be on the exact linear route"
+    );
+    let at = |tol: f64| {
+        let opts = FitOptions {
+            verbose: false,
+            outer_maxiter: 0,
+            run_covariance_step: false,
+            ode_reltol: tol,
+            ode_abstol: tol,
+            ..prep.parsed.fit_options.clone()
+        };
+        crate::fit(
+            &prep.parsed.model,
+            &prep.population,
+            &prep.init_params,
+            &opts,
+        )
+        .expect("the evaluation runs")
+    };
+    let loose = at(1e-1);
+    let msg = not_settled(&loose)
+        .unwrap_or_else(|| panic!("no W_ODE_OFV_NOT_SETTLED in {:?}", loose.warnings));
+    assert!(
+        msg.contains("ode_reltol = 1e-2 / ode_abstol = 1e-2 instead of the fit's 1e-1 / 1e-1"),
+        "{msg}"
+    );
+    let settled = at(1e-6);
+    assert!(
+        not_settled(&settled).is_none(),
+        "a settled objective warned: {:?}",
+        settled.warnings
+    );
+}
