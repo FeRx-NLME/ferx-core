@@ -358,7 +358,10 @@ fn a_user_chosen_kernel_combination_runs_and_all_zero_is_refused() {
     let mut o = FitOptions {
         method: EstimationMethod::Saem,
         saem_isample_m1: Some(0),
+        saem_isample_imh: Some(0),
         saem_isample_m1b: Some(0),
+        saem_isample_hmc: Some(0),
+        saem_isample_nuts: Some(0),
         saem_isample_m2: Some(0),
         saem_isample_m3: Some(0),
         ..FitOptions::default()
