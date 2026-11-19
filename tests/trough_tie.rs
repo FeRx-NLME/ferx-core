@@ -334,3 +334,88 @@ fn adaptive_driver_reads_a_trough_before_its_co_timed_record() {
     }
     assert_closed_form("adaptive", &got);
 }
+
+/// #2534: the same tie when a *derived* break lands one ULP below the dose, on the trough's
+/// bits. `5.1 + 2.96` is `8.06` one ULP down, so an infusion of 2.96 at `RATE` 1 from 5.1
+/// (IDs 1 / 2) ends there and a dose at 5.1 under `ALAG1 = 2.96` (IDs 3 / 4) arrives there.
+/// The bolus at 8.06 fired at that break, so the trough listed before it read post-dose. The
+/// infusion case was fixed by #2485. On `8391287e` the lag case read 144.664 on `predict()`
+/// and the state pass, and `fit()` scored 827.394 at `maxiter = 0` (NONMEM 821.994), while
+/// the dual walk read 44.664: the objective and its gradient described two functions. Model
+/// `nonmem_anchor/derived_break_tie_fit.ferx` (K = 0.1, KA = 1, IV 100 at 0), anchored by
+/// `nonmem_anchor/derived_break_tie.ctl`.
+#[test]
+fn a_trough_on_a_derived_break_reads_before_its_co_timed_dose_2534() {
+    let parsed = parse_full_model_file(Path::new("nonmem_anchor/derived_break_tie_fit.ferx"))
+        .expect("model");
+    let m = &parsed.model;
+    let pop = read_nonmem_csv(Path::new("nonmem_anchor/derived_break_tie.csv"), None, None)
+        .expect("data");
+    let e = |t: f64| (-K * t).exp();
+    let (t0, t1) = (8.06, 10.0);
+    let inf = 10.0 * (1.0 - e(2.96)); // the infusion's amount left at its end
+    let depot = 100.0 / 0.9 * (e(t1 - t0) - (t0 - t1).exp()); // the lagged dose at t1
+    let base = 100.0 * (e(t1) + e(t1 - t0));
+    let want = [
+        100.0 * e(t0) + inf,
+        base + inf * e(t1 - t0),
+        100.0 * e(t0) + inf + 100.0,
+        base + inf * e(t1 - t0),
+        100.0 * e(t0),
+        base + depot,
+        100.0 * e(t0) + 100.0,
+        base + depot,
+    ];
+    let (th, eta) = (&m.default_params.theta, vec![0.0; m.n_eta]);
+    let mut legs: [Vec<f64>; 4] = Default::default();
+    legs[0] = predict(m, &pop, &m.default_params)
+        .expect("predict")
+        .iter()
+        .map(|p| p.pred)
+        .collect();
+    for s in &pop.subjects {
+        let dual = subject_eta_grad(m, s, th, &eta).expect("the dual walk");
+        legs[1].extend(dual.iter().map(|o| o.f));
+        let (_, st) = ferx_core::pk::compute_predictions_with_states(m, s, th, &eta);
+        legs[2].extend(st.iter().map(|u| u[1]));
+    }
+    let nm = |f: &str| std::fs::read_to_string(format!("nonmem_anchor/results/{f}")).expect(f);
+    let rows = |t: &str| -> Vec<Vec<f64>> {
+        let row = |l: &str| {
+            l.split_whitespace()
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+        };
+        t.lines().filter_map(|l| row(l).ok()).collect()
+    };
+    let tab = nm("derived_break_tie.tab");
+    legs[3] = rows(&tab)
+        .iter()
+        .filter(|r| r[2] == 0.0)
+        .map(|r| r[3])
+        .collect();
+    // Measured worst |leg − closed form| on macOS arm64: 1.7e-13 on the engines,
+    // 9.5e-8 on NONMEM's table (`TOL=9`), so ~10× headroom. The smallest defect is 100.
+    for (leg, got) in ["predict", "dual", "states", "nonmem"].iter().zip(&legs) {
+        assert_eq!(got.len(), want.len(), "{leg}: observation count");
+        let errs: Vec<f64> = got.iter().zip(&want).map(|(g, w)| (g - w).abs()).collect();
+        println!("{leg}: |error| {errs:?}");
+        // `all`, not a `max` fold, which would drop a NaN.
+        assert!(
+            errs.iter().all(|e| *e < 1e-6),
+            "{leg}: {got:?} vs closed form {want:?}"
+        );
+    }
+    let ext = nm("derived_break_tie.ext");
+    let objv = rows(&ext)
+        .into_iter()
+        .find(|r| r[0] == -1e9)
+        .expect("#OBJV row");
+    let ofv = ferx_core::fit(m, &pop, &m.default_params, &parsed.fit_options)
+        .expect("fit")
+        .ofv;
+    // Measured |ferx − NONMEM #OBJV| on macOS arm64: 3.1e-8. The defect was 5.4.
+    let d = (ofv - objv[objv.len() - 1]).abs();
+    println!("fit: OFV {ofv:.8}, |Δ #OBJV| {d:.3e}");
+    assert!(d < 1e-5, "fit OFV {ofv} vs NONMEM {objv:?}");
+}

@@ -56,8 +56,8 @@ pub(crate) const INFUSION_EPS: f64 = 1e-12;
 /// **Invariant: `dedup (1e-15) ≤ EVENT_MATCH_TOL`, and a dose fires at one break
 /// within `EVENT_MATCH_TOL` and at no other** — enforced by the `seed_applied` /
 /// `applied` masks the rescanning loops carry, not by the tolerance. Which break:
-/// the last one at or before the event where a walk hands [`event_on_break`] the
-/// real next break (#2532); the first one in the band elsewhere.
+/// the last one at or before the event on every walk that applies a lag (#2532, #2534); the
+/// first one in the band on the adjoint's `integrate_g` and the EKF (see [`event_on_break`]).
 ///
 /// #1186: a *derived* break (a route onset `dose.time + lag_cmt +
 /// lag_route`, an infusion end `dose.time + amt/rate`) is a multi-term float sum,
@@ -237,7 +237,7 @@ fn dedup_breaks_keeping_records(
 /// an event that has a break of its own later in the band is applied there, not here. The
 /// band can hold two breaks when the reader moved a record one ULP below a co-timed event
 /// (#614, #1810) and that record is itself a break — every observation is on the
-/// time-varying / IOV adaptive walk (#2532). Matched by the band alone, the dose listed after
+/// time-varying / IOV adaptive walk (#2532), and a lag arrival can land on its bits (#2534). Matched by the band alone, the dose listed after
 /// a pre-dose observation fired at the observation's break, so the observation read the
 /// post-dose state, and so did a decision at the dose's own time (#933's trough).
 ///
@@ -247,16 +247,14 @@ fn dedup_breaks_keeping_records(
 /// for an event whose own time was pushed. Combined with the apply-once masks, an event
 /// fires at the **last** break at or before it within the band.
 ///
-/// **Where it is live.** Doses go through it with the real `t_next` only on the time-varying
-/// adaptive walk (`ode_predictions_adaptive_impl` when `tv`) and its frozen replay
-/// (`adaptive_frozen_replay_tv`), the one pair whose break list holds every observation. The
-/// static engine (`ode_predictions_with_extra_breaks_and_stats`) and the constant adaptive
-/// path pass `f64::INFINITY`, which is the band-only first-break rule, because the static
-/// engine's twins — the adjoint's `integrate_g`, `ode_predictions_with_states`,
-/// `apply_segment_boundary`'s dose loops, the EKF — all fire at the first break, and value and
-/// gradient must describe one function. A trough listed before a dose that a lag arrival or
-/// infusion end lands one ULP below still reads post-dose on those walks; that is #2534. Resets
-/// go through it with the real `t_next` in `apply_segment_boundary` (#2141).
+/// **Where it is live.** Doses go through it with the real `t_next` on every walk that applies
+/// a lag: the static engine, `ode_predictions_with_states`, `apply_segment_boundary`, the
+/// adaptive driver and both frozen replays. Matched by the band alone, a dose listed after a
+/// trough that a lag arrival lands one ULP below fired at the arrival's break, and the trough
+/// read post-dose (#2534). The adjoint's `integrate_g` and the EKF still match by the band:
+/// they apply no lag, and an infusion end or route onset there leaves the state unchanged, so
+/// [`band_read_state`] already reads the trough pre-dose. Resets go through it with the real
+/// `t_next` in `apply_segment_boundary` (#2141).
 #[inline]
 pub(crate) fn event_on_break(t_event: f64, t_break: f64, t_next: f64) -> bool {
     (t_event - t_break).abs() < EVENT_MATCH_TOL && t_event < t_next
@@ -278,22 +276,6 @@ pub(crate) fn earliest_reset_at_break(reset_times: &[f64], t_start: f64, t_next:
         .copied()
         .filter(|&rt| event_on_break(rt, t_start, t_next))
         .fold(f64::INFINITY, f64::min)
-}
-
-/// The `t_next` the reactive driver hands [`event_on_break`] for a dose at break `k`: the real
-/// next break on the time-varying path, whose replay (`adaptive_frozen_replay_tv`) uses it
-/// too; `f64::INFINITY` on the constant path, whose replay is the static engine, which stays
-/// band-only (see [`event_on_break`]). Driver and replay must apply each dose at the same
-/// break, or the verifier refuses the run.
-///
-/// `bounded` is the time-varying path, or any subject with a compartment on/off record
-/// (#2753), on which the static engine takes the real next break too.
-fn doses_next_break(break_times: &[f64], k: usize, bounded: bool) -> f64 {
-    if bounded {
-        break_times.get(k + 1).copied().unwrap_or(f64::INFINITY)
-    } else {
-        f64::INFINITY
-    }
 }
 
 /// The save points handed to `solve_ode` for the segment `(t_start, t_end]`: every time in
@@ -6048,13 +6030,8 @@ fn ode_predictions_with_extra_breaks_and_stats(
             &dose_f_bio,
             pk_params_flat,
             t_start,
-            // Band-only (first break): the static engine's dual / state / EKF twins match
-            // that way, so moving it alone would split value from gradient. See
-            // [`event_on_break`] and #2534. A toggled subject has no such twin here (the
-            // dispatcher sends it to the event-driven walk), and its doses must fire at their
-            // own breaks around a co-timed on/off row, so it takes the real next break, as
-            // the driver does (`doses_next_break`).
-            if toggled { next_break } else { f64::INFINITY },
+            // The real next break: a dose fires at the last break at or before it (#2534).
+            next_break,
             reset_floor,
             &opts,
             &mut seed_applied,
@@ -7645,11 +7622,12 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // state the row leaves (an off compartment reads 0) and a dose decided here is a
         // record after the row (`CoTimedOff::After`). Each row has a break of its own, so a
         // base dose one ULP away fires at its own break, on its own side of the row.
+        let t_next = break_times.get(k + 1).copied().unwrap_or(f64::INFINITY);
         if toggled {
             first_event = first_event.min(apply_cmt_toggles_at_break(
                 subject,
                 t_start,
-                break_times.get(k + 1).copied().unwrap_or(f64::INFINITY),
+                t_next,
                 &mut u,
                 &mut off_states,
             ));
@@ -7681,7 +7659,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
                 &base_lagtimes,
                 pk_params_flat,
                 t_start,
-                doses_next_break(&break_times, k, tv || toggled),
+                t_next,
                 reset_floor,
                 &ode.effective_solver_opts(),
                 &mut seed_applied[..n_base],
@@ -8148,7 +8126,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             &dose_lagtimes,
             &injected_f,
             t_start,
-            doses_next_break(&break_times, k, tv || toggled),
+            t_next,
             reset_floor,
             &mut applied,
             &mut off_states,
@@ -10064,6 +10042,7 @@ pub fn ode_predictions_with_states(
     let mut boundary_obs: Vec<usize> = Vec::new();
     for k in 0..break_times.len() {
         let t_start = break_times[k];
+        let t_next = break_times.get(k + 1).copied().unwrap_or(f64::INFINITY);
 
         // The band, collected before the events so a record strictly earlier than the
         // first of them reads the state they find (#2124, [`band_read_state`]).
@@ -10079,7 +10058,7 @@ pub fn ode_predictions_with_states(
             if seed_applied[i] {
                 continue;
             }
-            if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
+            if ss_seeded_at_record(dose, lag) && event_on_break(dose.time, t_start, t_next) {
                 seed_applied[i] = true;
                 first_event = first_event.min(dose.time);
                 let chz_before = chz_snapshot(ode, &u);
@@ -10104,7 +10083,7 @@ pub fn ode_predictions_with_states(
                 continue;
             }
             let t_eff = dose.time + dose_lagtimes[dose_idx];
-            if (t_eff - t_start).abs() < EVENT_MATCH_TOL {
+            if event_on_break(t_eff, t_start, t_next) {
                 // Marked for every matched dose, whichever branch fires below — the
                 // arrival is one event (equilibrate + bolus + infusion push) (#1186).
                 applied[dose_idx] = true;
@@ -10647,7 +10626,7 @@ fn apply_segment_boundary(
         if seed_applied[i] {
             continue;
         }
-        if ss_seeded_at_record(dose, lag) && (dose.time - t_start).abs() < EVENT_MATCH_TOL {
+        if ss_seeded_at_record(dose, lag) && event_on_break(dose.time, t_start, t_next) {
             seed_applied[i] = true;
             first_event = first_event.min(dose.time);
             let chz_before = chz_snapshot(ode, u);
@@ -10679,7 +10658,7 @@ fn apply_segment_boundary(
             continue;
         }
         let t_eff = dose.time + dose_lagtimes[dose_idx];
-        if (t_eff - t_start).abs() < EVENT_MATCH_TOL {
+        if event_on_break(t_eff, t_start, t_next) {
             // One arrival event: equilibrate + bolus + infusion push (#1186).
             applied[dose_idx] = true;
             first_event = first_event.min(t_eff);
