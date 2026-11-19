@@ -475,7 +475,7 @@ pub(crate) fn is_record(k: EventKind) -> bool {
 /// none. The index was built from the `F`-reshaped `eff_doses`, so `f_bio = 1` there.
 /// The scan this replaced pushed the same values in dose order; the total-order sort
 /// below makes the result independent of push order, so it is the same `Vec`.
-fn compute_propagation_bounds(
+pub(crate) fn compute_propagation_bounds(
     t_from: f64,
     t_to: f64,
     index: &crate::dosing::DoseIndex,
