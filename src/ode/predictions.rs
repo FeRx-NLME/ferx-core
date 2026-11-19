@@ -56,8 +56,8 @@ pub(crate) const INFUSION_EPS: f64 = 1e-12;
 /// **Invariant: `dedup (1e-15) ≤ EVENT_MATCH_TOL`, and a dose fires at one break
 /// within `EVENT_MATCH_TOL` and at no other** — enforced by the `seed_applied` /
 /// `applied` masks the rescanning loops carry, not by the tolerance. Which break:
-/// the last one at or before the event where a walk hands [`event_on_break`] the
-/// real next break (#2532); the first one in the band elsewhere.
+/// the last one at or before the event on every walk that applies a lag (#2532, #2534); the
+/// first one in the band on the adjoint's `integrate_g` and the EKF (see [`event_on_break`]).
 ///
 /// #1186: a *derived* break (a route onset `dose.time + lag_cmt +
 /// lag_route`, an infusion end `dose.time + amt/rate`) is a multi-term float sum,
@@ -237,7 +237,7 @@ fn dedup_breaks_keeping_records(
 /// an event that has a break of its own later in the band is applied there, not here. The
 /// band can hold two breaks when the reader moved a record one ULP below a co-timed event
 /// (#614, #1810) and that record is itself a break — every observation is on the
-/// time-varying / IOV adaptive walk (#2532). Matched by the band alone, the dose listed after
+/// time-varying / IOV adaptive walk (#2532), and a lag arrival can land on its bits (#2534). Matched by the band alone, the dose listed after
 /// a pre-dose observation fired at the observation's break, so the observation read the
 /// post-dose state, and so did a decision at the dose's own time (#933's trough).
 ///
