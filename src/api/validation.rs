@@ -4343,10 +4343,11 @@ pub(crate) fn check_iiv_on_ruv(model: &CompiledModel, options: &FitOptions) -> V
 /// - `E_PARAM_SHAPE`: `params` carry no per-class Ω/Σ (`mixture: None`), e.g. rebuilt from a
 ///   prior `FitResult`; the objective would silently run single-population with `MIXNUM`
 ///   pinned to class 1;
-/// - `E_MIXTURE_METHOD` (block `fit_options`), per stage of the chain: FOCEI quadrature
-///   (`n_agq > 1`); an estimator other than FOCE / FOCEI / SAEM / Bayes / IMP / IMPMAP; and
-///   Bayes with per-class `omega(k)` / `sigma(k)` overrides (its single conjugate Ω draw is
-///   shared across classes). Refused before any stage runs (`bayes.rs` re-checks defensively).
+/// - `E_MIXTURE_METHOD` (block `fit_options`), per stage of the chain: an estimator other than
+///   FOCE / FOCEI / Laplace / SAEM / Bayes / IMP / IMPMAP; `agq_eval_only` (it would overwrite
+///   the mixture OFV with a one-class quadrature value); and Bayes with per-class `omega(k)` /
+///   `sigma(k)` overrides (its single conjugate Ω draw is shared across classes). Refused before
+///   any stage runs (`bayes.rs` re-checks defensively).
 ///
 /// `fit()` passes its `init_params`; `ferx check`, the model's parsed defaults.
 pub(crate) fn check_mixture_options(
@@ -4369,17 +4370,13 @@ pub(crate) fn check_mixture_options(
     };
     let chain = options.method_chain();
     for &m in &chain {
-        if m == EstimationMethod::FoceI && options.n_agq > 1 {
-            refuse(
-                "mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 \
-                 for mixture FOCEI. The mixture objective does not evaluate the quadrature grid."
-                    .to_string(),
-            );
-        }
         if !matches!(
             m,
             EstimationMethod::Foce
                 | EstimationMethod::FoceI
+                // Laplace and FOCEI quadrature (`n_agq > 1`) score each class with the
+                // single population's quadrature objective at the class mode (#3025).
+                | EstimationMethod::Laplace
                 | EstimationMethod::Saem
                 | EstimationMethod::Bayes
                 // IMP / IMPMAP run a class-partitioned MCEM (per-class IS E-step +
@@ -4391,11 +4388,25 @@ pub(crate) fn check_mixture_options(
                 | EstimationMethod::Impmap
         ) {
             refuse(format!(
-                "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
-                 IMPMAP; the {} method is not yet wired for mixtures (#985)",
+                "mixture models (#977) currently support FOCE / FOCEI / Laplace / SAEM / Bayes / \
+                 IMP / IMPMAP; the {} method is not yet wired for mixtures (#985)",
                 m.label()
             ));
         }
+    }
+    // An `agq_eval_only` Laplace stage re-scores the OFV with the single-population
+    // quadrature marginal (`agq_marginal_at`), which has no class mixing: it would replace a
+    // mixture fit's published OFV with a one-class value. Refused, as before #3025, rather
+    // than silently publishing the wrong objective; an estimating Laplace stage scores the
+    // mixture (`mixture_ofv`) and stays accepted.
+    if options.agq_eval_only && chain.contains(&EstimationMethod::Laplace) {
+        refuse(
+            "`agq_eval_only = true` is not supported for mixture models: the evaluation-only \
+             quadrature stage scores a single population and would replace the mixture \
+             objective with a one-class value. Drop `agq_eval_only` (an estimating \
+             `method = laplace` stage already reports the mixture objective) (#3025)."
+                .to_string(),
+        );
     }
     if chain.contains(&EstimationMethod::Bayes) {
         if let Some(mp) = params.mixture.as_ref() {
@@ -6233,14 +6244,12 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // Fires only when the coupling changed the pick. Both sides go through `resolve_outer_optimizer`
     // (what the outer loop resolves with), differing only in the analytic-gradient predicate: the live
     // one and the scope-only one `auto` would have used under `gradient = auto`. (Asking `resolve_auto`
-    // directly missed the mixture arm, where `auto` is BOBYQA whatever the gradient, and the
-    // `outer_maxiter == 0` short-circuit.)
+    // directly missed the `outer_maxiter == 0` short-circuit.)
     //
     // Quiet on: a model out of the analytic scope anyway (ODE/PD, LTBS, TTE); a model above
-    // `BOBYQA_MAX_DIM` (L-BFGS on an FD gradient either way); a mixture model; an evaluation-only
-    // (`maxiter = 0`) fit. The gradient is read through `GradientMethod::effective`, not
-    // `model.gradient_method`, because `validate_model_file` hands us the parser's model with
-    // `gradient = fd` still in the *options*.
+    // `BOBYQA_MAX_DIM` (L-BFGS on an FD gradient either way); an evaluation-only (`maxiter = 0`) fit.
+    // The gradient is read through `GradientMethod::effective`, not `model.gradient_method`, because
+    // `validate_model_file` hands us the parser's model with `gradient = fd` still in the *options*.
     let effective_gradient = crate::types::GradientMethod::effective(model, options);
     if options.optimizer == Optimizer::Auto
         // The user's own `gradient = fd`, not an engine-forced one. An SDE model is

@@ -259,10 +259,9 @@ pub fn fit_from_files(
 /// For the FOCE/FOCEI path the requested optimizer is resolved through
 /// `estimation::outer_optimizer::resolve_outer_optimizer` — the function the outer loop
 /// itself dispatches on — and not a second copy of the rule (#1540). `auto` is reported
-/// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model sends
-/// `auto` to BOBYQA, which `Optimizer::resolve_auto` alone does not know about, and it
-/// replaces an explicit optimizer that cannot carry the mixture objective (built-in
-/// BFGS/L-BFGS, trust-region) with BOBYQA too; that replacement is reported as `bobyqa`,
+/// with what it resolved to (e.g. `auto (nlopt_lbfgs)`, #490). A mixture model replaces an
+/// explicit optimizer that cannot carry the mixture objective (built-in BFGS/L-BFGS,
+/// trust-region) with NLopt L-BFGS; that replacement is reported as `nlopt_lbfgs`,
 /// and the outer loop's downgrade warning says why. `has_mixture` is the same
 /// `init_params.mixture.is_some()` the outer loop keys on.
 pub(crate) fn reported_optimizer_label(
@@ -1470,6 +1469,19 @@ fn floor_escaped(
     })
 }
 
+/// The optimizer a stage hands to the outer loop. A Laplace stage turns `auto` into NLopt
+/// L-BFGS (the quadrature objective has an analytic gradient and BOBYQA false-converges on
+/// it); a mixture takes the same promotion, as `resolve_outer_optimizer`'s mixture rule
+/// sends its `auto` to L-BFGS on the exact mixture gradient for every method (#3025). An
+/// explicit choice is never changed.
+pub(crate) fn stage_optimizer_request(method: EstimationMethod, requested: Optimizer) -> Optimizer {
+    if matches!(method, EstimationMethod::Laplace) && requested == Optimizer::Auto {
+        Optimizer::NloptLbfgs
+    } else {
+        requested
+    }
+}
+
 /// The adaptive-Gauss–Hermite `−2 log L` at `params`, with the EBEs reconverged there: the
 /// grid is centred on the conditional mode and scaled by its Hessian, so a mode carried over
 /// from another method would misplace it. `opts` is a quadrature stage's options
@@ -2355,9 +2367,7 @@ fn fit_inner(
         // estimates land ~3% off NONMEM LAPLACIAN. L-BFGS on the analytic gradient matches
         // NONMEM to 4-5 significant figures on every parameter, in 0.39 s against FOCEI's
         // 0.29 s. See docs/estimation/agq.qmd. An explicit `optimizer = ...` is honoured.
-        if matches!(method, EstimationMethod::Laplace) && stage_opts.optimizer == Optimizer::Auto {
-            stage_opts.optimizer = Optimizer::NloptLbfgs;
-        }
+        stage_opts.optimizer = stage_optimizer_request(method, stage_opts.optimizer);
         // The **quadrature** methods need a tighter EBE than plain FOCE/FOCEI: their analytic
         // grid gradient assumes b̂ is exactly the mode (Bartlett identity), so a loose b̂ from
         // a poor start yields a non-descent direction that stalls the outer optimizer.

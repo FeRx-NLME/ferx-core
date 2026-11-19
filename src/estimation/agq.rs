@@ -741,6 +741,19 @@ pub(crate) fn agq_subject_term(
     model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta_hat: &[f64],
     kappas: &[nalgebra::DVector<f64>], n_nodes: usize, anchor: HessianAnchor,
 ) -> f64 {
+    agq_subject_term_with_work(model, subject, params, eta_hat, kappas, n_nodes, anchor, None, None)
+}
+
+/// [`agq_subject_term`] with the caller's hoisted `schedule` and the inner solve's
+/// `terminal` work (its exact Hessian at the mode, and the mode's NLL), as the population
+/// objective takes them: the same arithmetic on the same mode, minus a second provider pass.
+/// The mixture objective scores each class's subject with it (#3025).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agq_subject_term_with_work(
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta_hat: &[f64],
+    kappas: &[nalgebra::DVector<f64>], n_nodes: usize, anchor: HessianAnchor,
+    schedule: Option<&pk::event_driven::EventSchedule>, terminal: Option<&TerminalLaplaceWork>,
+) -> f64 {
     let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
     let uncached_log_weights;
     let log_weights = if cached_log_weights_enabled() {
@@ -760,9 +773,9 @@ pub(crate) fn agq_subject_term(
         nodes,
         log_weights,
         anchor,
-        None,
-        None,
-        None,
+        schedule,
+        terminal.and_then(|t| t.0.as_ref()),
+        terminal.map(|t| t.1),
     )
 }
 
@@ -1258,7 +1271,7 @@ impl<'a> SubjectScoreContext<'a> {
                 }
             }
         }
-        self.finite_difference_score(subject, &joint_warm)
+        self.finite_difference_score(subject, &joint_warm, false)
             .map(|g| (g, ScoreRoute::Reconverged { structural }))
     }
 
@@ -1337,8 +1350,22 @@ impl<'a> SubjectScoreContext<'a> {
         is_usable_subject_nll(nll).then_some(nll)
     }
 
-    fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {
-        self.reconverged_nll(subject, self.x, joint_warm)?;
+    /// The reconverged finite-difference score from the stacked mode `joint_warm`: a mixture
+    /// class's per-term salvage (#3025).
+    pub(crate) fn reconverged_score(
+        &self, subject: &Subject, joint_warm: &[f64],
+    ) -> Option<Vec<f64>> {
+        self.finite_difference_score(subject, joint_warm, true)
+    }
+
+    /// `salvage`: a probe that fails at a live `x` takes the one-sided difference against the
+    /// centre value (both failing leaves that coordinate 0), as `central_diff_packed_gated`
+    /// does; without it any failed probe is `None`. `None` with `salvage` is only a subject
+    /// repelled (or cancelled) at `x` itself.
+    fn finite_difference_score(
+        &self, subject: &Subject, joint_warm: &[f64], salvage: bool,
+    ) -> Option<Vec<f64>> {
+        let f0 = self.reconverged_nll(subject, self.x, joint_warm)?;
         let mut g = vec![0.0; self.x.len()];
         for k in 0..self.x.len() {
             if self.fixed[k] {
@@ -1355,15 +1382,34 @@ impl<'a> SubjectScoreContext<'a> {
             if width.abs() < 1e-16 {
                 continue;
             }
-            let fp = self.reconverged_nll(subject, &xp, joint_warm)?;
-            let fm = self.reconverged_nll(subject, &xm, joint_warm)?;
-            g[k] = (fp - fm) / width;
-            if !g[k].is_finite() {
-                return None;
-            }
+            let fp = self.reconverged_nll(subject, &xp, joint_warm);
+            let fm = self.reconverged_nll(subject, &xm, joint_warm);
+            let probes = (fp, fm);
+            g[k] = match difference_with_salvage(self.x[k], (xm[k], xp[k]), f0, probes, salvage) {
+                Some(d) => d,
+                None if salvage => 0.0,
+                None => return None,
+            };
         }
         Some(g)
     }
+}
+
+/// The difference of one coordinate's probes `(f(xm), f(xp))` around `x0` (value `f0`): central
+/// when both solved. With `salvage` a failed probe at a live `x0` takes the one-sided
+/// difference against `f0`, as `central_diff_packed_gated` does; both failing, or a
+/// non-finite result, is `None`. Without it any failed probe is `None`.
+fn difference_with_salvage(
+    x0: f64, (xm, xp): (f64, f64), f0: f64, (fp, fm): (Option<f64>, Option<f64>), salvage: bool,
+) -> Option<f64> {
+    let d = match (fp, fm) {
+        (Some(fp), Some(fm)) => (fp - fm) / (xp - xm),
+        _ if !salvage => return None,
+        (Some(fp), None) => (fp - f0) / (xp - x0),
+        (None, Some(fm)) => (f0 - fm) / (x0 - xm),
+        (None, None) => return None,
+    };
+    d.is_finite().then_some(d)
 }
 
 /// Use analytic scores where possible and reconverge only subjects needing numerical scores.
@@ -2402,5 +2448,24 @@ mod tests {
         });
         assert_starts_at_modes("AGQ FD score", &rec, |_| true, &pop, &etas, &kappas);
         assert_solves_at_stencil_tol("AGQ FD score", &rec, |_| true, opts.inner_tol);
+    }
+
+    /// #3034 review 2: a probe that fails at a live `x` is differenced one-sidedly, never
+    /// zero-filled; a repelled `x` (no `f0`) is the caller's `None`. `f = x^2` at 1.0, so the
+    /// derivative is 2 and a one-sided step of 0.01 reads 2.01 / 1.99.
+    /// Mutation: return `Some(0.0)` for a failed probe -> the two one-sided asserts die;
+    /// ignore `salvage` -> the `!salvage` assert dies.
+    #[test]
+    fn a_failed_probe_at_a_live_point_is_differenced_one_sidedly() {
+        let f = |x: f64| x * x;
+        let (x0, xm, xp) = (1.0, 0.99, 1.01);
+        let f0 = f(x0);
+        let up = difference_with_salvage(x0, (xm, xp), f0, (Some(f(xp)), None), true).unwrap();
+        let down = difference_with_salvage(x0, (xm, xp), f0, (None, Some(f(xm))), true).unwrap();
+        assert!((up - 2.01).abs() < 1e-12 && (down - 1.99).abs() < 1e-12, "{up} {down}");
+        let both = difference_with_salvage(x0, (xm, xp), f0, (Some(f(xp)), Some(f(xm))), true);
+        assert!((both.unwrap() - 2.0).abs() < 1e-12);
+        assert_eq!(difference_with_salvage(x0, (xm, xp), f0, (None, None), true), None);
+        assert_eq!(difference_with_salvage(x0, (xm, xp), f0, (Some(f(xp)), None), false), None);
     }
 }

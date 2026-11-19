@@ -3711,6 +3711,7 @@ impl ProfileCtx<'_> {
             &bounds,
             self.options,
             &free_all,
+            None,
         )?;
         if crate::cancel::is_cancelled(&self.options.cancel) {
             return Err(crate::estimation::covariance::COV_CANCELLED_MSG.to_string());
