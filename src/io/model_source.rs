@@ -39,22 +39,26 @@ pub(crate) enum ModelSourceError {
     Read(String),
     /// The file's hash is not the one the caller expected.
     Hash(String),
-    /// The text does not parse: the message, naming the file (#1807), and the parser's own
-    /// text, which the classifier keys on from its first byte.
-    Parse(String, String),
+    /// The text does not parse.
+    Parse {
+        /// The message, naming the file (#1807).
+        text: String,
+        /// The parser's own message, which the classifier keys on from its first byte.
+        raw: String,
+    },
 }
 
 impl ModelSourceError {
     /// The read's own text, before any classifier rewords it.
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::Read(m) | Self::Hash(m) | Self::Parse(m, _) => m,
+            Self::Read(m) | Self::Hash(m) | Self::Parse { text: m, .. } => m,
         }
     }
 
     pub(crate) fn into_message(self) -> String {
         match self {
-            Self::Read(m) | Self::Hash(m) | Self::Parse(m, _) => m,
+            Self::Read(m) | Self::Hash(m) | Self::Parse { text: m, .. } => m,
         }
     }
 }
@@ -81,10 +85,11 @@ impl ModelSource {
     pub fn read_verified(
         path: impl AsRef<Path>, expected_hash: Option<&str>, entry: &str,
     ) -> Result<Self, EngineError> {
-        // Classify the unprefixed read: several parse codes are keyed on the
-        // parser's message from byte zero (`Missing [`, `Unknown block`), so a
-        // prefix in the message would downgrade them to `E_PARSE`. The entry is
-        // the error's context instead, which `Display` prints as `{entry}: `.
+        // Several parse codes are keyed on the parser's message from byte zero
+        // (`Missing [`, `Unknown block`), which the classifier reads from
+        // `ModelSourceError::Parse::raw`, not from the text that names the file
+        // (#1807). The entry is the error's context, which `Display` prints as
+        // `{entry}: `.
         Self::load(path.as_ref(), expected_hash, "", "")
             .map_err(|e| crate::api::model_source_refusal(e).in_context(entry))
     }
@@ -116,10 +121,8 @@ impl ModelSource {
         })?;
         let parsed =
             crate::parser::model_parser::parse_full_model_source(&text, path).map_err(|e| {
-                ModelSourceError::Parse(
-                    format!("{prefix}error parsing the model file {shown}: {e}"),
-                    e,
-                )
+                let text = format!("{prefix}error parsing the model file {shown}: {e}");
+                ModelSourceError::Parse { text, raw: e }
             })?;
         Ok(Self { path: path.to_path_buf(), text, hash, parsed })
     }
