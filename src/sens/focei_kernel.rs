@@ -742,7 +742,7 @@ pub(crate) fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -
 }
 
 /// Whether [`foce_f`] takes its Woodbury form at `S = LᵀGᵀD⁻¹GL` with trace `tr_s` — the
-/// form the structured FOCE kernel is (#2980): otherwise production factors `R̃` itself.
+/// form the structured FOCE kernel is (#2980): otherwise it rotates the rows into `I + S` (#2988).
 pub(crate) fn foce_woodbury_ok(tr_s: f64) -> bool {
     1.0 + tr_s <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
 }
@@ -995,7 +995,7 @@ fn assemble_grad<T: PkNum>(
 /// A diagonal `R⁰` takes Woodbury's form, `rᵀR̃⁻¹r = rᵀR⁻¹r − bᵀA⁻¹b` and
 /// `log|R̃| = log|R| + log|Ω| + log|A|` with `A = Ω⁻¹ + GᵀR⁻¹G`, `b = GᵀR⁻¹r`: `N × N`
 /// work per subject instead of the `n × n` factorisation. A covariance coupling rows
-/// factors `R̃` directly.
+/// factors `R̃` directly; past the #1498 gate the rows are rotated into `I + S` (#2988).
 pub(crate) fn foce_f<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
@@ -1075,7 +1075,8 @@ pub(crate) fn foce_f<T: PkNum>(
     // with `S = LᵀGᵀD⁻¹GL` (`Ω = LLᵀ`, `GL` = `lg`). A row whose `R⁰` is on the variance
     // floor while its `G` is O(1) (FOCE's `R⁰` is taken at η = 0, `G` at η̂) drives
     // `1 + tr S` to ~1e11 and the correction loses every digit (#1498): above
-    // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, `R̃` is factored at observation size.
+    // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, the rows are rotated into
+    // `I + S` instead. A dense `R⁰` factors `R̃` at observation size.
     let woodbury = rm.is_none() && {
         let tr = quant.iter().fold(c(0.0), |acc, &j| {
             let s = (0..nn).fold(c(0.0), |a, k| a + lg[j][k] * lg[j][k]);
@@ -1083,7 +1084,7 @@ pub(crate) fn foce_f<T: PkNum>(
         });
         (one + tr).br_cmp_c(BranchCmp::Le, WOODBURY_MAX_INFO_TRACE) || woodbury_forced()
     };
-    if !woodbury {
+    if rm.is_some() {
         // R̃ = R⁰_q + (LᵀG)ᵀ(LᵀG), FREM rows decoupled (`apply_frem_r_matrix_overrides`).
         let rt: Vec<Vec<T>> = (0..nq)
             .map(|a| {
@@ -1106,6 +1107,39 @@ pub(crate) fn foce_f<T: PkNum>(
         let z = chol_solve(&l, &res);
         let quad = wsum3(0.0, (0..nq).map(|i| (one, res[i], z[i])));
         return Some(c(0.5) * (quad + chol_logdet(&l) + bloq));
+    }
+    let mut log_r = c(0.0);
+    for &j in &quant {
+        log_r = log_r + rdiag[j].ln();
+    }
+    if !woodbury {
+        // `min_w ‖w‖² + ‖D^-½(res − GL·w)‖²` (the same quadratic form) by Givens rotations of
+        // each row into the triangular factor `R` of `I + S`, started at `I`: no subtraction of
+        // large terms, every pivot ≥ 1, and `O(nq·nn²)` work where an `nq × nq` `R̃` costs a
+        // compiled plan `O(nq³)` instructions (#2988).
+        let mut r: Vec<Vec<T>> = (0..nn)
+            .map(|k| (0..nn).map(|l| c(if k == l { 1.0 } else { 0.0 })).collect())
+            .collect();
+        let mut z = vec![c(0.0); nn];
+        let mut quad = c(0.0);
+        for (i, &j) in quant.iter().enumerate() {
+            let w = one / rdiag[j].sqrt();
+            let mut v: Vec<T> = lg[j].iter().map(|&x| x * w).collect();
+            let mut t = res[i] * w;
+            for k in 0..nn {
+                let h = (r[k][k] * r[k][k] + v[k] * v[k]).sqrt();
+                let (cs, sn) = (r[k][k] / h, v[k] / h);
+                r[k][k] = h;
+                for l in k + 1..nn {
+                    (r[k][l], v[l]) = (cs * r[k][l] + sn * v[l], cs * v[l] - sn * r[k][l]);
+                }
+                (z[k], t) = (cs * z[k] + sn * t, cs * t - sn * z[k]);
+            }
+            quad = quad + t * t;
+        }
+        let ld = (0..nn).fold(c(0.0), |a, k| a + c(2.0) * r[k][k].ln());
+        // A non-finite `S` declines, as the dense factor it replaces did.
+        return positive_finite(one + quad + ld).then(|| c(0.5) * (quad + log_r + ld + bloq));
     }
     // Woodbury / determinant lemma on the diagonal R⁰, Ω-normalised: with `B = D⁻¹GL`,
     // `R̃⁻¹ = D⁻¹ − B(I + S)⁻¹Bᵀ` and `|R̃| = |D|·|I + S|`. Factoring `I + S` rather than
@@ -1130,10 +1164,6 @@ pub(crate) fn foce_f<T: PkNum>(
     let ab = chol_solve(&la, &b);
     let quad = wsum3(0.0, (0..nq).map(|i| (iv[i], res[i], res[i])))
         - wsum3(0.0, (0..nn).map(|k| (one, b[k], ab[k])));
-    let mut log_r = c(0.0);
-    for &j in &quant {
-        log_r = log_r + rdiag[j].ln();
-    }
     Some(c(0.5) * (quad + log_r + chol_logdet(&la) + bloq))
 }
 
