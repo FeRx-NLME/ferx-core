@@ -418,7 +418,7 @@ fn summarize(name: &str, population: &Population) -> Result<CovariateSummary, St
 
 /// Every distinct finite value `name` takes within one subject, in first-seen
 /// order: the subject-static fallback, then each observation, dose, EVID=2
-/// covariate-change marker and EVID=3/4 reset snapshot.
+/// covariate-change marker, EVID=3/4 reset snapshot and endpoint-record snapshot.
 ///
 /// Shared with [`crate::api::validation`]'s categorical-level check, so the
 /// values a summary is built from and the values a declared level set is
@@ -439,6 +439,10 @@ pub(crate) fn subject_covariate_values(subject: &Subject, name: &str) -> Vec<f64
         .chain(&subject.dose_covariates)
         .chain(&subject.pk_only_covariates)
         .chain(&subject.reset_covariates)
+        // The per-record snapshots a `[binary_model]` / `[count_model]` / DTMM expression
+        // is evaluated at (#2562, #2877): a value only an endpoint record carries is a
+        // value the model reads.
+        .chain(&subject.endpoint_covariates)
     {
         if let Some(v) = snapshot.get(name) {
             push(*v);

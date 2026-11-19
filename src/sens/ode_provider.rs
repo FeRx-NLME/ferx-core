@@ -3152,6 +3152,86 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     // `None` for a bolus. One shared source for both SS call sites (`K_DOSE` and `K_SS_SEED`),
     // so their infusion-jet handling can't desync (#642 review #5). `inf_eff[idx]` is only read
     // when `is_inf(d)` (which implies `has_any_infusion`, so `inf_eff` is populated).
+    // #3010: an infusion whose end moves with the inputs (a modeled `D`/`R`, or the `F`-scaled
+    // window of a rate-defined one) is walked without an event at its end. As an event, the
+    // end is sorted against the observations through the branch API, and a recording keeps
+    // that order as a check: wherever the end crosses an observation the plan stops serving
+    // and the subject is recorded again (with `D1 = TD1·exp(η)`, at most trial points of an
+    // EBE search). Instead, every segment between the dose and the next infusion's arrival is
+    // cut at `m = clamp(end, start, stop)`, chosen on every evaluation (`select_if`): the rate
+    // on before `m`, off after, each piece flowed exactly at any length, zero included, and
+    // differentiated through it (`ode::linear::AffinePieces`). The one check left is that the end comes before that
+    // arrival. Where the pieces need what the walk cannot give them — an exact linear system
+    // that does not read the clock, a fixed arrival, no window overlapping another moving
+    // one, no reset, steady state or compartment toggle to gate it — the end stays an event,
+    // as before.
+    struct SoftEnd<T> {
+        /// The dose's arrival, and the next infusion's (`∞` past the last): the window the
+        /// end is walked inside.
+        start: f64,
+        until: f64,
+        /// The end, with its derivatives.
+        end: T,
+        cmt: usize,
+        rate: T,
+    }
+    let soft: Vec<Option<SoftEnd<T>>> = if !(has_any_infusion
+        && opts.method == crate::ode::OdeMethod::Linear
+        && !program.reads_model_time()
+        && !has_lagtime
+        && !has_input_rate
+        && !has_route_lag
+        && subject.reset_times.is_empty()
+        && subject.cmt_toggles.is_empty()
+        && subject.doses.iter().all(|d| !d.ss))
+    {
+        Vec::new()
+    } else {
+        let doses = &subject.doses;
+        let mut order: Vec<usize> = (0..doses.len()).collect();
+        order.sort_by(|&i, &j| doses[i].time.total_cmp(&doses[j].time).then(i.cmp(&j)));
+        let mut soft: Vec<Option<SoftEnd<T>>> = (0..doses.len()).map(|_| None).collect();
+        // The moving ends left as events: a later window must not contain one.
+        let mut hard_ends: Vec<T> = Vec::new();
+        for &k in &order {
+            let d = &doses[k];
+            if !is_inf(d) {
+                continue;
+            }
+            // The timeline's `K_INF_END` time, with the window's derivatives (no lag here).
+            let end = tf(d.time) + lag_val(k) + inf_eff[k].1;
+            let moving = modeled_at(k).is_some()
+                || matches!(d.infusion_def, crate::types::InfusionDef::RateDefined);
+            let until = doses
+                .iter()
+                .filter(|o| is_inf(o) && o.time > d.time)
+                .map(|o| o.time)
+                .fold(f64::INFINITY, f64::min);
+            let alone = !doses
+                .iter()
+                .enumerate()
+                .any(|(j, o)| j != k && is_inf(o) && o.time == d.time);
+            let walked = moving
+                && alone
+                && plain_rate_channel(ode, d)
+                && d.cmt_idx() < n_states
+                && hard_ends.iter().all(|e| e.br_cmp(Le, tf(d.time)))
+                && (until == f64::INFINITY || end.br_cmp(Lt, tf(until)));
+            if walked {
+                soft[k] = Some(SoftEnd {
+                    start: d.time,
+                    until,
+                    end,
+                    cmt: d.cmt_idx(),
+                    rate: inf_eff[k].0,
+                });
+            } else if !end.is_constant() {
+                hard_ends.push(end);
+            }
+        }
+        soft
+    };
+    let is_soft = |k: usize| soft.get(k).is_some_and(Option::is_some);
     let ss_inf = |d: &crate::types::DoseEvent, idx: usize| -> Option<(T, T)> {
         if is_inf(d) {
             Some(inf_eff[idx])
@@ -3259,9 +3339,10 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
         // parameters are in force before the dose lands.
         tl.push((tf(d.time), K_DOSE_REC, k));
         tl.push((tf(d.time) + lag_val(k), K_DOSE, k));
-        if is_inf(d) {
+        if is_inf(d) && !is_soft(k) {
             // Window end uses the bioavailable length (`F·dur` for a rate-defined infusion,
-            // the modeled `D`/`F·amt/R` for a modeled dose, #530).
+            // the modeled `D`/`F·amt/R` for a modeled dose, #530). A walked end (#3010, `soft`)
+            // has no event: its segments are cut where it falls.
             tl.push((tf(d.time) + lag_val(k) + inf_window_len(k), K_INF_END, k));
         }
         // The earlier pulses still infusing after the record (#1121 when seeded; every
@@ -3490,7 +3571,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 // a validated call; it must still read the same here as in the walk's
                 // forcing and in its rate-off saltation, or the gradient carries a
                 // boundary the trajectory never had.
-                if !is_inf(d) || !plain_rate_channel(ode, d) {
+                // A walked end's rate is added by its own crossing (#3010): no boundary but
+                // that one lies inside its window.
+                if !is_inf(d) || !plain_rate_channel(ode, d) || is_soft(k) {
                     continue;
                 }
                 let iws = tf(d.time) + lag_val(k);
@@ -3796,7 +3879,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                     // with `active_infusions` and with the rate-off saltation below —
                     // hence the shared predicate rather than a local `cmt_raw() >= 1`
                     // (#1077).
-                    .filter(|(_, d)| is_inf(d) && plain_rate_channel(ode, d))
+                    // A walked end's rate is the pieces' (#3010).
+                    .filter(|&(k, d)| is_inf(d) && plain_rate_channel(ode, d) && !is_soft(k))
                     .flat_map(|(k, d)| {
                         // (Lagged) window start; an infusion before the most recent reset is
                         // off (#472 review #1) and the window tolerance is production's
@@ -3925,69 +4009,181 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                     du[c] = T::from_f64(0.0);
                 }
             };
-            // Single save point per segment — a stack array avoids the per-segment
-            // heap allocation of `vec![t_event]` (#449 review #14).
-            // The span, ends that may move with the inputs (#2786).
-            T::span_hint(cur_t, t_event);
-            let saveat = [t_event.span_value()];
-            // The exact `J` at `T = f64`: the program over this segment's clocks, the input-rate
-            // forcing's `f_t`, a zero row for each state held off.
-            let pj = ProgJac::new(
-                program,
-                first_dose_time,
-                last_dose_eff,
-                &off_states.borrow(),
-            )
-            .declining(!cum.is_empty() || sj.is_some())
-            .with_forcing_ft(input_rate_ft(
-                ode,
-                &dose_forcings,
-                &subject.doses,
-                &dose_lagtimes_dual,
-                f_bio_at_dose,
-                &modeled_windows,
-                gate,
-                Some(cur_t),
-            ));
-            register_prog_jac!(&rhs, pj);
-            let sol = solve_ode_g_with_auto_state(
-                &rhs,
-                &u,
-                (cur_t.span_value(), t_event.span_value()),
-                params,
-                &saveat,
-                opts,
-                &mut auto_state,
-            );
-            let _ = T::take_span();
-            if let Some(last) = sol.last() {
-                u.copy_from_slice(&last.u);
-                // Back to the physical state (the shift is zero where the segment began).
-                cum.add_shift(sj.map_or(t_event, |j| t_event + j), &mut u);
-                if let Some(j) = sj {
-                    // The state at `t_end + δ` flows back to the fixed `t_end`: the pre side's
-                    // field at offset `s`, smooth here (the kernel's age is far from its onset).
-                    let anchor = if last_dose_eff.br_abs_lt(f64::INFINITY) {
-                        last_dose_eff
-                    } else {
-                        t_event
-                    };
-                    let mut end_field = |x: &[T], s: T, out: &mut [T]| {
-                        out.copy_from_slice(&boundary_velocity(
-                            x,
-                            params,
-                            t_event,
-                            s,
-                            anchor,
-                            reset_floor,
-                            true,
-                        ));
-                    };
-                    let y = rk4_dual(&u, j, -j, &mut end_field);
-                    u.copy_from_slice(&y);
+            // The walked end whose window holds this segment (#3010): at most one, since a
+            // window closes at the next infusion's arrival. Found on plain values only — the
+            // ends of a segment inside a window are data.
+            let walked = match (cur_t.nonrec_val(), t_event.nonrec_val()) {
+                (Some(a), Some(b)) if !soft.is_empty() => soft
+                    .iter()
+                    .flatten()
+                    .find(|w| w.start <= a && b <= w.until)
+                    .map(|w| (w, a)),
+                _ => None,
+            };
+            if let Some((w, t_ref)) = walked {
+                // `m = clamp(end, cur_t, t_event)`, chosen on every evaluation and carrying the
+                // end's derivatives where it lies inside: the two pieces' lengths move with it,
+                // and their exact flows differentiate to the rate-off boundary term, to every
+                // order (`AffinePieces`).
+                // An end exactly at `cur_t` belongs to the segment before, which took it as its
+                // `t_event` (the upper clamp keeps the end there): `≤`, or both would carry
+                // its derivative.
+                let lo = T::select_if(Le, w.end, cur_t, cur_t, w.end);
+                let m = T::select_if(Gt, lo, t_event, t_event, lo);
+                let with_rate = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+                    rhs(us, ps, t, du);
+                    du[w.cmt] = du[w.cmt] + w.rate;
+                };
+                let flowed = crate::ode::linear::AffinePieces::new(&rhs, &u, t_ref, params)
+                    .and_then(|sys| {
+                        let x = sys.flow(&u, m - cur_t, Some((w.cmt, w.rate)))?;
+                        sys.flow(&x, t_event - m, None)
+                    });
+                match flowed {
+                    Some(x) => u.copy_from_slice(&x),
+                    // A type that does not record reads `A` by probing, and its self-check may
+                    // decline a finite segment (jets lost to cancellation): integrate it as the
+                    // end's event would have, on the values — up to the end with the rate,
+                    // across it with the rate-off saltation, on without.
+                    None => {
+                        if !T::RECORDS_BRANCHES {
+                            let (t0, t1) = (t_ref, t_event.plain());
+                            let e = w.end.plain();
+                            let mut solve = |u: &mut [T],
+                                             f: &crate::ode::solver::RhsG<'_, T>,
+                                             a: f64,
+                                             b: f64| {
+                                if b > a {
+                                    if let Some(last) = solve_ode_g_with_auto_state(
+                                        f,
+                                        u,
+                                        (a, b),
+                                        params,
+                                        &[b],
+                                        opts,
+                                        &mut auto_state,
+                                    )
+                                    .last()
+                                    {
+                                        u.copy_from_slice(&last.u);
+                                    }
+                                }
+                            };
+                            if e <= t0 {
+                                solve(&mut u, &rhs, t0, t1);
+                            } else {
+                                let cut = e.min(t1);
+                                solve(&mut u, &with_rate, t0, cut);
+                                if e <= t1 {
+                                    let at = tf(e);
+                                    let mut pre = |x: &[T], s: T, out: &mut [T]| {
+                                        out.copy_from_slice(&boundary_velocity(
+                                            x,
+                                            params,
+                                            at,
+                                            s,
+                                            last_dose_eff,
+                                            reset_floor,
+                                            false,
+                                        ));
+                                        out[w.cmt] = out[w.cmt] + w.rate;
+                                    };
+                                    let mut post = |x: &[T], s: T, out: &mut [T]| {
+                                        out.copy_from_slice(&boundary_velocity(
+                                            x,
+                                            params,
+                                            at,
+                                            s,
+                                            last_dose_eff,
+                                            reset_floor,
+                                            false,
+                                        ));
+                                    };
+                                    cross_moving_boundary(
+                                        &mut u,
+                                        jet_only(w.end),
+                                        &mut pre,
+                                        &mut post,
+                                        &|_| {},
+                                    );
+                                    solve(&mut u, &rhs, cut, t1);
+                                }
+                            }
+                        } else {
+                            // A recording reads `A` and `b` off its recording exactly, and the walk is
+                            // on the exact linear path only for a right-hand side certified affine
+                            // (`OdeSpec::linear_eligible`): what it declines is a part or a state that is
+                            // not finite, and so is the subject (the walk's other declines fill the same).
+                            u.fill(T::from_f64(f64::NAN));
+                        }
+                    }
                 }
+                cur_t = t_event;
+            } else {
+                // Single save point per segment — a stack array avoids the per-segment
+                // heap allocation of `vec![t_event]` (#449 review #14).
+                // The span, ends that may move with the inputs (#2786).
+                T::span_hint(cur_t, t_event);
+                let saveat = [t_event.span_value()];
+                // The exact `J` at `T = f64`: the program over this segment's clocks, the input-rate
+                // forcing's `f_t`, a zero row for each state held off.
+                let pj = ProgJac::new(
+                    program,
+                    first_dose_time,
+                    last_dose_eff,
+                    &off_states.borrow(),
+                )
+                .declining(!cum.is_empty() || sj.is_some())
+                .with_forcing_ft(input_rate_ft(
+                    ode,
+                    &dose_forcings,
+                    &subject.doses,
+                    &dose_lagtimes_dual,
+                    f_bio_at_dose,
+                    &modeled_windows,
+                    gate,
+                    Some(cur_t),
+                ));
+                register_prog_jac!(&rhs, pj);
+                let sol = solve_ode_g_with_auto_state(
+                    &rhs,
+                    &u,
+                    (cur_t.span_value(), t_event.span_value()),
+                    params,
+                    &saveat,
+                    opts,
+                    &mut auto_state,
+                );
+                let _ = T::take_span();
+                if let Some(last) = sol.last() {
+                    u.copy_from_slice(&last.u);
+                    // Back to the physical state (the shift is zero where the segment began).
+                    cum.add_shift(sj.map_or(t_event, |j| t_event + j), &mut u);
+                    if let Some(j) = sj {
+                        // The state at `t_end + δ` flows back to the fixed `t_end`: the pre side's
+                        // field at offset `s`, smooth here (the kernel's age is far from its onset).
+                        let anchor = if last_dose_eff.br_abs_lt(f64::INFINITY) {
+                            last_dose_eff
+                        } else {
+                            t_event
+                        };
+                        let mut end_field = |x: &[T], s: T, out: &mut [T]| {
+                            out.copy_from_slice(&boundary_velocity(
+                                x,
+                                params,
+                                t_event,
+                                s,
+                                anchor,
+                                reset_floor,
+                                true,
+                            ));
+                        };
+                        let y = rk4_dual(&u, j, -j, &mut end_field);
+                        u.copy_from_slice(&y);
+                    }
+                }
+                cur_t = t_event;
             }
-            cur_t = t_event;
         }
         // The reset gate at this event, one spelling for every arm below that asks it (the
         // arrival, the route onset, the infusion end and the zero-order end cohort). Built

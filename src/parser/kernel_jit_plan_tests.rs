@@ -990,7 +990,7 @@ fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
         let (v, live) = v;
         let (cp, layout) = zero_tangent_chunk(live);
         let l = layout.lanes();
-        let t = cp.get(layout, false).expect("a kernel");
+        let t = cp.get(layout, Sweep::Forward).expect("a kernel");
         let idx: Vec<u32> = (0..5).collect();
         let lits = [0.0f64];
         let mut interp = zero_tangent_inputs(v, l);
@@ -1044,7 +1044,7 @@ fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
 fn the_reverse_tiers_agree_bit_for_bit_across_seeds() {
     let (cp, layout) = zero_tangent_chunk(false);
     let l = layout.lanes();
-    let t = cp.get(layout, true).expect("a kernel");
+    let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
     let idx: Vec<u32> = (0..5).collect();
     let lits = [0.0f64];
     let (seeds, stride) = (3, 5 * l);
@@ -1157,7 +1157,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let idx: Vec<u32> = (0..5).collect();
     let lits = [0.0f64];
     // The forward.
-    let t = cp.get(layout, false).expect("a kernel");
+    let t = cp.get(layout, Sweep::Forward).expect("a kernel");
     let p = simd::packs(&t.f, l, false, 0).expect("the forward packs");
     let vec_ops = p
         .members
@@ -1196,7 +1196,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
         assert_eq!(interp[c].to_bits(), native[c].to_bits(), "forward lane {c}");
     }
     // The reverse, several seeds at once.
-    let t = cp.get(layout, true).expect("a kernel");
+    let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
     assert!(
         simd::packs(&t.f, l, true, t.prefix).is_some(),
         "the reverse packs"
@@ -1492,8 +1492,8 @@ fn resolved_kernels_are_shared_per_key_and_serve_past_the_slots() {
     let mut shared = 0;
     for tan in 0..(RESOLVED_SLOTS as u8 + 4) {
         let lay = Layout { tan, ..base };
-        let a = plan.fns(lay, false).expect("resolves");
-        let b = plan.fns(lay, false).expect("resolves");
+        let a = plan.fns(lay, Sweep::Forward).expect("resolves");
+        let b = plan.fns(lay, Sweep::Forward).expect("resolves");
         assert_eq!(a.len(), b.len());
         if matches!(a, Fns::Shared(_)) {
             assert!(
@@ -1722,7 +1722,7 @@ fn the_caches_shrink_when_a_model_drops() {
     };
     assert!(held_by_cache(&mine), "the program is shared by structure");
     // Compile it, so there is native code to free.
-    let k = prog.get(l2(), false).expect("a kernel");
+    let k = prog.get(l2(), Sweep::Forward).expect("a kernel");
     k.promote(true, "none");
     assert_ne!(k.native.load(std::sync::atomic::Ordering::Acquire), 0);
     drop((k, prog, plan));
@@ -2035,6 +2035,77 @@ fn a_structure_other_than_the_template_is_recorded_afresh() {
     close(du[0], want, "the afresh recording's value");
 }
 
+/// A family whose structure changes at every point (an event time that moves with η: a modeled
+/// infusion duration crossing the observations) keeps no template once it is unstable. Its first
+/// structure leaves one; at the `UNSTABLE_AFTER`th replay that meets another structure the
+/// templates it kept are released — from its replay list and from the template map, whose key is
+/// the structure and so bounds nothing — and twenty structures leave none, each of which would
+/// otherwise be a recording kept for the rest of the fit. Every plan still computes its own
+/// structure. Mutations: drop the `misses >= UNSTABLE_AFTER` early return in `recorded` -> the
+/// replays go on and `misses` passes `UNSTABLE_AFTER`; drop the release in `missed` -> the
+/// templates of the first structures stay kept.
+#[test]
+fn an_unstable_family_releases_its_templates() {
+    let subject = crate::types::Subject::default();
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let family = SubjectKey::new(&m, &subject, 1, 2)
+        .with_variant(Desc::of_value(&0x7e_4412u64))
+        .family();
+    let owner = Some((family.scope, family.model));
+    let kept = || {
+        templates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .flatten()
+            .filter(|t| t.owner == owner)
+            .count()
+    };
+    let chain = |n: usize| {
+        move || {
+            let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
+            let mut x = et[0];
+            for _ in 0..n {
+                x = x * et[1] + et[0];
+            }
+            Some(vec![x.reg()])
+        }
+    };
+    let (e0, e1) = (0.3, 0.2);
+    let l = l2().lanes();
+    let mut u = vec![0.0; 2 * l];
+    for (k, e) in [e0, e1].into_iter().enumerate() {
+        u[k * l] = e;
+        u[k * l + 1 + k] = 1.0;
+    }
+    for n in 1..=20 {
+        let plan = recorded(&family, chain(n))
+            .expect("records")
+            .plan(l2(), 2, 0)
+            .expect("plans");
+        let mut want = e0;
+        for _ in 0..n {
+            want = want * e1 + e0;
+        }
+        let mut du = vec![0.0; 2 * l];
+        plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
+        close(du[0], want, "each structure's own value");
+        if n == 1 {
+            assert_eq!(kept(), 1, "a family's first structure leaves a template");
+        }
+    }
+    let f = lock_families()
+        .get(&family)
+        .cloned()
+        .expect("the family is known");
+    assert_eq!(
+        f.misses, UNSTABLE_AFTER,
+        "replays stop once the family is unstable"
+    );
+    assert!(f.alts.is_empty(), "an unstable family replays nothing");
+    assert_eq!(kept(), 0, "an unstable family's templates are released");
+}
+
 /// What a recording that declines the exact linear path leaves behind: nothing. The state of
 /// the recording after `restore` is what it was at `snapshot` — instructions, registers, the
 /// literal pool, hash-consing, loop calls, chunk marks, the guard and the template trace — and
@@ -2326,6 +2397,143 @@ fn every_native_plan_tier_probes_its_stack() {
     }
 }
 
+/// Forward over reverse (#2980) against reverse over forward, through every call kind's
+/// reverse (the repeat call's walk back, the fixed point's transposed steps, the recorded
+/// solve): at the first-order layout with two tangent directions on η, one sweep seeded with
+/// `ū` on the outputs' value lanes must give, on each η adjoint's tangent lane `a`, what the
+/// reverse seeded with `ū` on tangent lane `a` gives on the value lane — and on the value
+/// lanes, that reverse's tangent-lane-`a` adjoint (the plain gradient `ūᵀ·∂y/∂η`). Every base
+/// lane is compared, the η-dual lanes included, so a sub-plan reverse that dropped the
+/// adjoints' tangents (or read the value lanes for them) shows on the second-order entries.
+#[test]
+fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
+    let l1 = Layout {
+        n: 2,
+        m: 0,
+        th: false,
+        wide: false,
+        tan: 0,
+    };
+    const K: usize = 2;
+    let lt = Layout { tan: K as u8, ..l1 };
+    let (lb, l) = (l1.lanes(), lt.lanes());
+    for (name, f) in CASES {
+        begin();
+        let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, [0.3, 0.2][k])).collect();
+        let y = f(&et);
+        let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
+        let plan = rec.plan(l1, 2, 0).expect("plans");
+        let n_out = y.len();
+        let u_bar: Vec<f64> = (0..n_out).map(|j| 0.7 - 0.4 * j as f64).collect();
+        for eta in [[0.3, 0.2], [1.2, 0.9]] {
+            // η's value and one-hot duals; direction `a` moves η_a's value.
+            let mut u = vec![0.0; 2 * l];
+            for k in 0..2 {
+                u[k * l] = eta[k];
+                u[k * l + 1 + k] = 1.0;
+                u[k * l + lb + k] = 1.0;
+            }
+            let fwd = plan.forward_kept(lt, &u, &[]).expect("runs");
+            let mut du_bar = vec![0.0; n_out * l];
+            for j in 0..n_out {
+                // The value lane and `∂y/∂η₀`'s, so the η-dual lanes' adjoints are live too.
+                du_bar[j * l] = u_bar[j];
+                du_bar[j * l + 1] = 0.5 * u_bar[j] + 0.3;
+            }
+            let mut fr = vec![0.0; 2 * l];
+            assert!(
+                plan.reverse_tangent_from(&fwd, 1, &mut fr, &mut [], &du_bar),
+                "{name}: forward over reverse sweeps"
+            );
+            let mut du_rf = vec![0.0; K * n_out * l];
+            for a in 0..K {
+                for j in 0..n_out {
+                    du_rf[a * n_out * l + j * l + lb + a] = u_bar[j];
+                    du_rf[a * n_out * l + j * l + lb + K + a] = 0.5 * u_bar[j] + 0.3;
+                }
+            }
+            let mut rf = vec![0.0; K * 2 * l];
+            assert!(
+                plan.reverse_from(&fwd, lt, K, &mut rf, &mut [], &du_rf),
+                "{name}: reverse over forward sweeps"
+            );
+            let mut seen = 0.0f64;
+            for a in 0..K {
+                for k in 0..2 {
+                    for x in 0..lb {
+                        let what = |s: &str| format!("{name} η{k} lane {x} dir {a} {s} at {eta:?}");
+                        let want = rf[a * 2 * l + k * l + x];
+                        close(fr[k * l + lb + x * K + a], want, &what("tangent"));
+                        close(
+                            fr[k * l + x],
+                            rf[a * 2 * l + k * l + lb + x * K + a],
+                            &what("value"),
+                        );
+                        assert!(want.is_finite(), "{name}: non-finite second derivative");
+                        seen = seen.max(want.abs());
+                    }
+                }
+            }
+            assert!(
+                seen > 1e-3,
+                "{name}: the second derivatives vanish, testing nothing"
+            );
+        }
+    }
+}
+
+/// `derivs_of`'s Hessians (#2980: one forward-over-reverse sweep, a seed per output) against
+/// closed forms, on two outputs of three live inputs whose every second derivative is
+/// distinct where it is not zero — so a swapped lane, a wrong input slot or
+/// one output's seed leaking into another's row shows. `y₀ = x₀²x₁ + x₀e^{x₂}`,
+/// `y₁ = e^{x₀x₂} + x₁³`.
+///
+/// Mutations: an input slot off by one in the read (`pb[((i + 1) % n) * l + 1 + j]`); every
+/// output's seed in row 0 (both outputs' rows then coincide). (A transposed read is not one:
+/// the matrix is symmetric.)
+#[test]
+fn derivs_hessians_match_closed_forms_on_several_live_inputs() {
+    let x = [0.7f64, -1.3, 0.4];
+    let f = |v: &[Tr]| -> Option<Vec<Tr>> {
+        let (a, b, c) = (v[0], v[1], v[2]);
+        Some(vec![a * a * b + a * c.exp(), (a * c).exp() + b * b * b])
+    };
+    let (vals, grad, hess) = derivs_of(&x, 2, true, &f).expect("served");
+    let (a, b, c) = (x[0], x[1], x[2]);
+    let (e2, e) = (c.exp(), (a * c).exp());
+    let want_vals = [a * a * b + a * e2, e + b * b * b];
+    let want_grad = [
+        [2.0 * a * b + e2, a * a, a * e2],
+        [c * e, 3.0 * b * b, a * e],
+    ];
+    // Row-major `[i][j]`, `∂²y/∂x_i∂x_j`.
+    let want_hess = [
+        [
+            [2.0 * b, 2.0 * a, e2],
+            [2.0 * a, 0.0, 0.0],
+            [e2, 0.0, a * e2],
+        ],
+        [
+            [c * c * e, 0.0, e * (1.0 + a * c)],
+            [0.0, 6.0 * b, 0.0],
+            [e * (1.0 + a * c), 0.0, a * a * e],
+        ],
+    ];
+    for o in 0..2 {
+        close(vals[o], want_vals[o], &format!("y{o}"));
+        for i in 0..3 {
+            close(grad[o][i], want_grad[o][i], &format!("∂y{o}/∂x{i}"));
+            for j in 0..3 {
+                close(
+                    hess[o][i * 3 + j],
+                    want_hess[o][i][j],
+                    &format!("∂²y{o}/∂x{i}∂x{j}"),
+                );
+            }
+        }
+    }
+}
+
 /// A thread's hot table serves several subjects at once (the solve of one subject follows
 /// another's, so one entry missed once per solve), evicts only on a slot collision, and a put
 /// under a newer stamp releases the entries filled under the old one (a dropped scope's plans
@@ -2515,4 +2723,169 @@ fn the_hot_table_compares_the_layout_structure() {
     t.put(key, stamp, None, &ks);
     assert!(t.get(&key, stamp, None).is_some(), "none vs none");
     assert!(t.get(&key, stamp, Some(&l_a)).is_none(), "none vs layout");
+}
+
+/// A matrix call or a repeat call whose record-time run overflows is at a point the value path
+/// cannot score (its own `exp` returns `None` on the non-finite power), so the recording fails
+/// as repelled, not counted as a plan failure: a diverged trial point (an extreme η) made the
+/// squaring of a Padé approximant overflow and the subject reported `W_PLAN_FD_FALLBACK` for a
+/// point nothing needed a derivative at (#3004). The controls on the other side of each gate
+/// stay the point's: a count out of range (the repeat) and a finite product that is simply
+/// recorded. Mutation: stop `MatSpec::run` noting a non-finite result to an open recording
+/// -> the product row and the repeat row both read `Point`.
+#[test]
+fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_scope() {
+    use crate::sens::num::RecHooks;
+    let square = |v: &[Tr]| {
+        <Tr as RecHooks>::mat_mul(v, v, 1)
+            .flatten()
+            .expect("records")
+    };
+    let repeat = |x: f64, count: f64| {
+        begin();
+        let (x0, n) = (Tr::eta(0, x), Tr::eta(1, count));
+        let out = <Tr as RecHooks>::repeat(&[x0], n, &square);
+        assert_eq!(
+            matches!(out, Some(Some(_))),
+            x.abs() < 1e50 && count <= 64.0
+        );
+        end(Some(vec![]))
+    };
+    // The product: finite records, an overflow is repelled.
+    begin();
+    let x = Tr::eta(0, 2.0);
+    assert!(<Tr as RecHooks>::mat_mul(&[x], &[x], 1).flatten().is_some());
+    assert!(end(Some(vec![])).is_ok(), "a finite product records");
+    begin();
+    let x = Tr::eta(0, 1e200);
+    assert!(<Tr as RecHooks>::mat_mul(&[x], &[x], 1).flatten().is_none());
+    assert_eq!(
+        end(Some(vec![])).err().expect("fails").1,
+        FailScope::Repelled
+    );
+    // The repeat: finite records, an overflowing iterate is repelled, a count out of range is
+    // the point's.
+    assert!(repeat(2.0, 3.0).is_ok(), "a finite repeat records");
+    assert_eq!(
+        repeat(1e100, 3.0).err().expect("fails").1,
+        FailScope::Repelled
+    );
+    assert_eq!(repeat(2.0, 100.0).err().expect("fails").1, FailScope::Point);
+    // A body whose inner solve is singular at a later iterate (`x -> (x-1)²/(x-1)`, singular at
+    // `x = 1`): a real failure of the point, not an overflow, so it stays the point's. Mutation:
+    // note a non-finite result unconditionally in `RepeatSpec::run` (the old reading of every
+    // body `None`) -> this row reads `Repelled`.
+    let solve_body = |v: &[Tr]| {
+        let q = v[0] - Tr::k(1.0);
+        <Tr as RecHooks>::mat_solve(&[q], &[q * q], 1)
+            .flatten()
+            .expect("records")
+    };
+    begin();
+    let out = <Tr as RecHooks>::repeat(&[Tr::eta(0, 3.0)], Tr::eta(1, 3.0), &solve_body);
+    assert!(matches!(out, Some(None)), "the third iterate is singular");
+    assert_eq!(end(Some(vec![])).err().expect("fails").1, FailScope::Point);
+    begin();
+    let out = <Tr as RecHooks>::repeat(&[Tr::eta(0, 3.0)], Tr::eta(1, 2.0), &solve_body);
+    assert!(matches!(out, Some(Some(_))), "two iterates are regular");
+    assert!(end(Some(vec![])).is_ok());
+}
+
+/// A plan's kernels keep only what runs and lowers them (#3010): each compiled kernel's
+/// instructions at their length and no `live`, which only the transforms that built it read,
+/// and each chunk program's code at its length. A fit keeps thousands of kernels; on #3010's
+/// 156-subject model this was 1.7 GB of IR at the peak, 0.8 GB after.
+/// Mutation: drop `into_kernel` from `Tiered::new` (or the chunk code's `shrink_to_fit`) → the
+/// kernel (or program) named in the message keeps its slack.
+#[test]
+fn a_plans_kernels_keep_only_what_runs_them() {
+    begin();
+    let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
+    let y = (et[0] * et[1]).exp() + et[0] * et[0];
+    let rec = end(Some(vec![y.reg()])).expect("records");
+    let l1 = Layout {
+        n: 2,
+        m: 0,
+        th: false,
+        wide: false,
+        tan: 0,
+    };
+    let plan = rec.plan(l1, 2, 0).expect("plans");
+    let l = l1.lanes();
+    let u = [0.3, 1.0, 0.0, 0.3, 0.0, 1.0];
+    assert_eq!(u.len(), 2 * l);
+    let fwd = plan.forward_kept(l1, &u, &[]).expect("runs");
+    let mut du_bar = vec![0.0; l];
+    du_bar[0] = 1.0;
+    let mut ub = vec![0.0; 2 * l];
+    assert!(plan.reverse_from(&fwd, l1, 1, &mut ub, &mut [], &du_bar));
+    // Kernels seen: [forward, reverse].
+    let mut seen = [0usize; 2];
+    for c in &plan.calls {
+        let Call::Chunk { prog, .. } = c else {
+            continue;
+        };
+        assert_eq!(
+            prog.code.capacity(),
+            prog.code.len(),
+            "a chunk program's code"
+        );
+        for t in prog.compiled.lock().unwrap().values().flatten() {
+            let what = if t.rev { "reverse" } else { "forward" };
+            assert!(t.f.live.is_empty(), "the {what} kernel keeps `live`");
+            assert_eq!(
+                t.f.insts.capacity(),
+                t.f.insts.len(),
+                "the {what} kernel's instructions"
+            );
+            seen[t.rev as usize] += 1;
+        }
+    }
+    assert!(seen[0] > 0 && seen[1] > 0, "kernels seen {seen:?}");
+}
+
+/// An unkept forward (`Plan::forward_unkept`, the exact tangent Jacobian of the M-step's
+/// fixed-η score) writes the outputs' lanes and the guard exactly as the kept forward does —
+/// here the value and both θ-tangents of `c = θ₁θ₀² + θ₀`, checked against their closed
+/// forms — reports the guard as its result, and holds no run log or buffer afterwards.
+#[test]
+fn an_unkept_forward_writes_what_the_kept_one_does() {
+    begin();
+    let th: Vec<Tr> = (0..2).map(|j| Tr::theta(j, [2.0, 1.5][j])).collect();
+    let a = th[0] * th[0];
+    assert!(a.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1.0));
+    Tr::chunk_mark();
+    let c = th[1] * a + th[0];
+    let rec = end(Some(vec![c.reg()])).expect("records");
+    let plan = rec.plan(Layout::F64, 0, 2).expect("plans");
+    let layout = Layout {
+        tan: 2,
+        ..Layout::F64
+    };
+    let l = layout.lanes();
+    for (theta, held) in [([2.0_f64, 1.5], true), ([0.5, 1.5], false)] {
+        let mut p = vec![0.0; 2 * l];
+        for j in 0..2 {
+            p[j * l] = theta[j];
+            p[j * l + 1 + j] = 1.0;
+        }
+        let (mut kept, mut unkept) = (vec![0.0; 2 * l], vec![0.0; 2 * l]);
+        let f = plan
+            .forward_layout(layout, &[], &p, &mut kept)
+            .expect("runs");
+        assert_eq!(plan.kept_guard(&f), held);
+        assert_eq!(
+            plan.forward_unkept(layout, &[], &p, &mut unkept),
+            Some(held),
+            "the result is the guard"
+        );
+        assert_eq!(unkept[l], f64::from(u8::from(held)), "the guard lane");
+        if held {
+            assert_eq!(unkept, kept, "the same lanes, bit for bit");
+            let (t0, t1) = (theta[0], theta[1]);
+            close(unkept[0], t1 * t0 * t0 + t0, "value");
+            close(unkept[1], 2.0 * t0 * t1 + 1.0, "∂/∂θ₀");
+            close(unkept[2], t0 * t0, "∂/∂θ₁");
+        }
+    }
 }

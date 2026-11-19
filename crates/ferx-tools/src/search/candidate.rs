@@ -262,7 +262,7 @@ impl Criterion {
     pub fn of(&self, result: &FitResult) -> f64 {
         match self {
             Criterion::Ofv => result.ofv,
-            Criterion::Aic => result.aic,
+            Criterion::Aic => result.aic.unwrap_or(f64::NAN),
             Criterion::Bic(kind) => bic(result, *kind),
             Criterion::Penalized(p) => p.score(result),
         }

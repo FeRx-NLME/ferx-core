@@ -356,10 +356,12 @@ The fit output reports which route ran.
 
 A subject inside the scope can still miss the exact gradient at one trial point. If the inner
 search stops short of the mode (a Nelder–Mead fallback, for example) and the exact Hessian there
-is indefinite, the identity behind the exact score does not hold. The subject then takes the
-analytic gradient at its held EBE, which leaves out the EBE-response term, the same salvage
-FOCE and FOCEI use. The outer gradient fallback warning counts these subjects. The covariance
-step never uses a held-EBE score: it takes the exact score or the reconverged one.
+is indefinite, the identity behind the exact score does not hold. The subject then takes
+the exact score at its EBE re-solved at the trial point, which is stationary, so the identity
+holds there; where no recorder serves it either, it takes the reconverged finite-difference
+score. Neither leaves out the EBE-response term, which a held-EBE gradient would, and the
+outer gradient fallback warning counts only the reconverged subjects. The covariance step
+takes the exact score or the reconverged one the same way.
 
 ### Where AGQ stops
 
@@ -428,7 +430,7 @@ The analytic R-matrix supports every quadrature fit, under either anchor:
 | `method = laplace`, any `n_agq` | the quadrature marginal under the exact anchor |
 
 It is the gradient's identity one order up: `Uᵀ∇²Ψ U`, with `U = [I; dη̂/dx]` the mode's
-tangent, by reverse over forward through the same recorder and kernel
+tangent, by forward over reverse through the same recorder and kernel
 ([the R-matrix](foce.qmd#sensitivity-assembly)). Under the exact anchor the predictions
 carry `∂²f/∂η²` on an inner η-dual, so the fourth derivative `∂²H/∂x²` needs is exact too.
 That case is what used to keep `method = laplace` on the finite-difference stencil.
@@ -496,7 +498,7 @@ own quadrature objective:
   equality and confirms that the old inverse round trip changes the fixture's entries.
 
 Since #486 the assembly differences nothing: the R-matrix is `Uᵀ∇²Ψ U` at the mode,
-by reverse over forward through the same recorder and quadrature kernel the
+by forward over reverse through the same recorder and quadrature kernel the
 adjoint gradient uses, the grid's dependence on the anchor included (see
 [FOCE / FOCEI](foce.qmd) for the identity).
 

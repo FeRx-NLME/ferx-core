@@ -25,8 +25,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::inner_optimizer::{find_ebe_for_stage_with_prev, InnerLoopStats, PrevEtas};
 use crate::estimation::parameterization::{
-    fd_step_floors, fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments,
-    theta_packs_log, unpack_params, PackedBounds,
+    fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments, theta_packs_log,
+    unpack_params, PackedBounds,
 };
 use crate::parser::model_parser::{
     eval_mixing_log_probs, mixing_logp_derivs, mixing_logp_grad, MixtureClassGuard,
@@ -685,13 +685,17 @@ pub(crate) fn mixture_gradient_with_modes(
 /// difference under class `k` ([`class_subject_reconverged_gradient`]) — `2·n_free`
 /// solves of one subject in one class, where the whole-objective
 /// [`mixture_gradient_fd`] re-solves every subject in every class per probe. A term
-/// whose posterior weight is exactly zero carries no gradient and is not differenced.
+/// whose posterior weight is exactly zero carries no gradient and is not differenced. Without
+/// `modes` (IOV only) the evaluation itself is re-solved, so the gradient is taken at one
+/// solve's joint modes and `eval` is not read.
 ///
 /// Each subject that took a salvage is recorded on `declines` (structural when no
 /// recorder serves the subject's data shape under that class, as
 /// `outer_optimizer::is_structural_decline` asks), so the fit's #1154 warning reports
-/// it. Still `None` when the mixing map declines (a model-level gap, so the caller's
-/// whole-objective FD is the only gradient there is), or under IOV without `modes`.
+/// it. Total: the mixing map's own derivative is exact, or its central difference after a
+/// plan failure ([`crate::parser::model_parser::mixing_logp_grad`]), so no model reaches a
+/// whole-objective difference. Under IOV `modes` must be supplied (the fit's outer loop
+/// always holds them, `mixture_ofv_with_modes`).
 pub(crate) fn mixture_gradient_salvaged(
     model: &CompiledModel,
     population: &Population,
@@ -700,10 +704,11 @@ pub(crate) fn mixture_gradient_salvaged(
     eval: &MixtureEval,
     modes: Option<&MixtureClassModes>,
     declines: &crate::estimation::outer_optimizer::OuterFdDeclineLog,
-) -> Option<Vec<f64>> {
+) -> Vec<f64> {
     let salvage = |d: DeclinedTerm<'_>| {
         let subject = &population.subjects[d.subject];
         declines.record(d.subject);
+        declines.record_reconverged(d.subject);
         if d.cp.omega_iov.is_none() {
             let _guard = MixtureClassGuard::enter(d.cls + 1);
             if crate::estimation::outer_optimizer::is_structural_decline(
@@ -719,6 +724,19 @@ pub(crate) fn mixture_gradient_salvaged(
             model, subject, params, d.cls, d.eta, options,
         ))
     };
+    // An IOV gradient reads every class's κ̂. The caller's gate for producing them
+    // (`needs_class_modes`) is this one; a caller that did not have them gets the evaluation
+    // re-solved here, η̂ and κ̂ together from one solve: a class's stacked `[η̂, κ̂]` is a joint
+    // stationary point only when both come from the same solve, and the caller's `eval` may
+    // have been warm-started to a different η̂, so its η̂ is not paired with a fresh κ̂.
+    let resolved;
+    let (eval, modes) = match modes {
+        None if needs_class_modes(params) => {
+            resolved = mixture_ofv_with_modes(model, population, params, options, None);
+            (&resolved.0, Some(&resolved.1))
+        }
+        m => (eval, m),
+    };
     let rows = mixture_subject_gradients(
         model,
         population,
@@ -728,14 +746,22 @@ pub(crate) fn mixture_gradient_salvaged(
         modes,
         Some(&salvage),
         |f| f(),
-    )?;
+    )
+    .expect("a mixture model's params carry the mixture (the caller holds a `MixtureEval`)");
     let mut grad = vec![0.0f64; packed_segments(params).total()];
     for row in &rows {
         for (g, v) in grad.iter_mut().zip(row) {
             *g += 2.0 * v;
         }
     }
-    Some(grad)
+    grad
+}
+
+/// Whether the mixture gradient needs every class's modes ([`MixtureClassModes`]) — an IOV
+/// mixture's κ̂, which the eval keeps for the MIXEST class only. The one condition the
+/// producer (the outer loop) and the consumer ([`mixture_subject_gradients`]) both read.
+pub(crate) fn needs_class_modes(params: &ModelParameters) -> bool {
+    params.omega_iov.is_some()
 }
 
 /// One (subject × class) term the adjoint declined: what its salvage needs.
@@ -776,7 +802,7 @@ pub(crate) fn mixture_subject_gradients(
     use crate::sens::ode_provider::adjoint::PackedPoint;
     let spec = model.mixture.as_ref()?;
     let mp = params.mixture.as_ref()?;
-    let iov = params.omega_iov.is_some();
+    let iov = needs_class_modes(params);
     if iov && modes.is_none() {
         return None;
     }
@@ -807,18 +833,42 @@ pub(crate) fn mixture_subject_gradients(
                 }
                 // `MIXNUM` resolves to the class on this (worker) thread.
                 let _class = MixtureClassGuard::enter(cls + 1);
+                let mut misshaped = false;
                 let eta = match modes.filter(|_| iov) {
-                    Some(m) => {
-                        DVector::from_column_slice(&crate::estimation::covariance::stacked_mode(
-                            model,
-                            subject,
-                            &eval.etas_by_class[cls][i],
-                            m.kappas[cls].get(i),
-                        )?)
-                    }
+                    Some(m) => match crate::estimation::covariance::stacked_mode(
+                        model,
+                        subject,
+                        &eval.etas_by_class[cls][i],
+                        m.kappas[cls].get(i),
+                    ) {
+                        Some(mode) => DVector::from_column_slice(&mode),
+                        // A κ̂ count or width that does not match the occasions (a class
+                        // solve that failed or was hard-rejected): the value scores this
+                        // term at `class_nll`, the sentinel for such a mode. A repelled
+                        // term contributes zero, as a non-mixture subject does; one with a
+                        // real objective takes the reconverged difference from κ̂ = 0, which
+                        // re-solves its own mode (the exact route would differentiate at the
+                        // κ̂ = 0 start, not at a mode). Only with a salvage: without one the
+                        // decline is `None` for the whole.
+                        None if salvage.is_none() => return None,
+                        None if !crate::stats::likelihood::is_usable_subject_nll(
+                            eval.class_nll[i][cls],
+                        ) =>
+                        {
+                            continue
+                        }
+                        None => {
+                            misshaped = true;
+                            let cells =
+                                crate::stats::stacked_layout::group_count(subject) * model.n_kappa;
+                            let mut stacked = eval.etas_by_class[cls][i].as_slice().to_vec();
+                            stacked.resize(stacked.len() + cells, 0.0);
+                            DVector::from_vec(stacked)
+                        }
+                    },
                     None => eval.etas_by_class[cls][i].clone(),
                 };
-                let exact = points[cls].as_ref().and_then(|pt| {
+                let exact = points[cls].as_ref().filter(|_| !misshaped).and_then(|pt| {
                     crate::estimation::sens_outer_gradient::subject_gradient_at(
                         model,
                         subject,
@@ -889,15 +939,9 @@ fn class_subject_reconverged_gradient(
     let x_k = pack_params(&cp);
     let bounds = crate::estimation::parameterization::compute_bounds(&cp);
     let _guard = MixtureClassGuard::enter(cls + 1);
-    if cp.omega_iov.is_some() {
-        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
-            &x_k, &cp, model, subject, eta, &bounds, options,
-        )
-    } else {
-        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
-            &x_k, &cp, model, subject, eta, &bounds, options,
-        )
-    }
+    crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+        &x_k, &cp, model, subject, eta, &bounds, options,
+    )
 }
 
 /// θ → packed chain factor `dθ_j/dx_j`: `θ_j` for a log-packed θ, 1 for an identity one.
@@ -1263,9 +1307,9 @@ impl MixtureScoreContext {
     }
 }
 
-/// Central-FD outer gradient of the mixture OFV in real packed space — the
-/// fallback when [`mixture_gradient`] is out of analytic scope (#977 Phase 4).
-/// Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
+/// Central-FD outer gradient of the mixture OFV in real packed space — the test oracle
+/// for the exact gradient ([`mixture_gradient_salvaged`]; no model reaches it in a fit,
+/// #3004). Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
 ///
 /// `hᵢ = 1e-5·floorᵢ`, `floor` from `fd_step_floors`: a flat `1e-5` on every coordinate
 /// but a small identity-packed θ, whose packed coordinate is the θ itself, so a flat step
@@ -1276,14 +1320,15 @@ impl MixtureScoreContext {
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
-pub fn mixture_gradient_fd(
+#[cfg(test)]
+pub(crate) fn mixture_gradient_fd(
     model: &CompiledModel,
     population: &Population,
     x: &[f64],
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let floor = fd_step_floors(init_params, model);
+    let floor = crate::estimation::parameterization::fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
@@ -2074,6 +2119,219 @@ mod tests {
         }
         eprintln!("IOV mixture_gradient vs reconverged FD: worst {worst:.2e}");
         assert!(worst < 1e-7, "{worst:.2e}");
+    }
+
+    /// #3004 review: an IOV mixture handed no class modes used to panic
+    /// [`super::mixture_gradient_salvaged`] (`.expect` on a `None` the two gates produced
+    /// separately: the outer loop's `n_kappa > 0`, the gradient's `omega_iov.is_some()`). The
+    /// modes are now re-solved from the same inputs, so the answer is the one with the modes
+    /// supplied, bit for bit. Mutation: drop the `None if needs_class_modes` arm -> panic.
+    #[test]
+    fn iov_mixture_gradient_without_class_modes_resolves_them() {
+        use crate::estimation::outer_optimizer::OuterFdDeclineLog;
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            inner_tol: 1e-10,
+            ..crate::types::FitOptions::default()
+        };
+        let params = &model.default_params;
+        assert!(super::needs_class_modes(params), "premise: IOV");
+        let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let with = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            &log,
+        );
+        let without =
+            super::mixture_gradient_salvaged(&model, &pop, params, &opts, &eval, None, &log);
+        assert!(with.iter().all(|g| g.is_finite()));
+        assert_eq!(with.len(), without.len());
+        for (a, b) in with.iter().zip(&without) {
+            assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+        }
+    }
+
+    /// #3009 review 3: an IOV mixture handed no class modes re-solves the evaluation, η̂ and κ̂
+    /// from one solve. The caller's `eval` here comes from a loose, warm-started solve whose η̂
+    /// differs from the cold one (asserted: the premise), so pairing its η̂ with a fresh κ̂ is
+    /// not a joint mode. The answer must be the gradient of the cold evaluation with its own
+    /// modes, bit for bit, and must not depend on the `eval` passed.
+    /// Mutation: keep the caller's `eval` and re-solve only the modes -> the bits differ.
+    #[test]
+    fn iov_mixture_gradient_without_class_modes_pairs_one_solves_eta_and_kappa() {
+        use crate::estimation::outer_optimizer::OuterFdDeclineLog;
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            inner_tol: 1e-10,
+            ..crate::types::FitOptions::default()
+        };
+        let loose = crate::types::FitOptions {
+            inner_tol: 1e-2,
+            inner_maxiter: 3,
+            ..crate::types::FitOptions::default()
+        };
+        let params = &model.default_params;
+        let (cold, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        let k = cold.etas_by_class.len();
+        let warm: Vec<Vec<nalgebra::DVector<f64>>> = (0..k)
+            .map(|_| {
+                (0..pop.subjects.len())
+                    .map(|_| nalgebra::DVector::from_element(model.n_eta, 0.7))
+                    .collect()
+            })
+            .collect();
+        let (warmed, _) = super::mixture_ofv_with_modes(&model, &pop, params, &loose, Some(&warm));
+        let mut apart = 0.0f64;
+        for (a, b) in cold
+            .etas_by_class
+            .iter()
+            .flatten()
+            .zip(warmed.etas_by_class.iter().flatten())
+        {
+            for (u, v) in a.iter().zip(b.iter()) {
+                assert!(u.is_finite() && v.is_finite());
+                apart = apart.max((u - v).abs()); // nan-ok: operands asserted finite above
+            }
+        }
+        eprintln!("MEASURE warm vs cold class eta apart {apart:.3e}");
+        assert!(
+            apart > 1e-3,
+            "premise: the warm eval's eta is off the cold one: {apart:e}"
+        );
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
+        let want = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &cold,
+            Some(&modes),
+            &log,
+        );
+        let got =
+            super::mixture_gradient_salvaged(&model, &pop, params, &opts, &warmed, None, &log);
+        assert_eq!(want.len(), got.len());
+        for (a, b) in want.iter().zip(&got) {
+            assert!(a.is_finite() && b.is_finite());
+            assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+        }
+    }
+
+    /// #3009 review 4: a class mode whose κ̂ count does not match the subject's occasions (a
+    /// failed or hard-rejected class solve) used to panic [`super::mixture_gradient_salvaged`]
+    /// (`.expect` on the whole row). The value path scores that term at `class_nll`:
+    ///
+    /// - with a real objective, the term takes the reconverged difference from a κ̂ = 0 start,
+    ///   which re-solves its own mode and is recorded on the log — the same gradient as the
+    ///   clean modes' (measured below; differentiating at the κ̂ = 0 start itself is off by
+    ///   2.6e-2);
+    /// - at the sentinel (repelled), it contributes zero — bit for bit the gradient with that
+    ///   term's weight zeroed — and nothing is recorded.
+    ///
+    /// The second half is a straddle on the first: zeroing a term whose value is real moves the
+    /// gradient (asserted), so a zero fill that ignored `class_nll` would redden the first half.
+    #[test]
+    fn iov_mixture_gradient_survives_a_misshaped_class_mode() {
+        use crate::estimation::outer_optimizer::OuterFdDeclineLog;
+        let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
+        let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            inner_tol: 1e-10,
+            ..crate::types::FitOptions::default()
+        };
+        let params = &model.default_params;
+        let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        let n = pop.subjects.len();
+        let clean_log = OuterFdDeclineLog::new(n);
+        let clean = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            &clean_log,
+        );
+        assert!(
+            clean_log.declined_indices().is_empty(),
+            "control: nothing declines"
+        );
+
+        // The class with the larger weight for subject 0: its term is live.
+        let cls = if eval.pmix[0][0] >= eval.pmix[0][1] {
+            0
+        } else {
+            1
+        };
+        assert!(eval.pmix[0][cls] > 0.1, "fixture: a live term");
+        let mut bad = super::MixtureClassModes {
+            kappas: modes.kappas.clone(),
+        };
+        assert!(bad.kappas[cls][0].len() >= 2, "fixture: several occasions");
+        bad.kappas[cls][0].pop();
+
+        // Real objective: differenced at the re-solved mode.
+        let log = OuterFdDeclineLog::new(n);
+        let g =
+            super::mixture_gradient_salvaged(&model, &pop, params, &opts, &eval, Some(&bad), &log);
+        assert_eq!(
+            log.declined_indices(),
+            vec![0],
+            "the mis-shaped term is salvaged"
+        );
+        let mut worst = 0.0f64;
+        for (a, b) in g.iter().zip(&clean) {
+            assert!(a.is_finite() && b.is_finite());
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        eprintln!("MEASURE mis-shaped class mode, salvaged vs clean: worst rel {worst:.3e}");
+        assert!(worst < 1e-4, "{worst:e}");
+
+        // Repelled: the term is zero, exactly as if its weight were.
+        let (mut repelled, _) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        repelled.class_nll[0][cls] = crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
+        let log = OuterFdDeclineLog::new(n);
+        let g0 = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &repelled,
+            Some(&bad),
+            &log,
+        );
+        assert!(
+            log.declined_indices().is_empty(),
+            "a repelled term takes no salvage"
+        );
+        let (mut unweighted, _) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        unweighted.pmix[0][cls] = 0.0;
+        let want = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &unweighted,
+            Some(&modes),
+            &OuterFdDeclineLog::new(n),
+        );
+        assert_eq!(g0, want, "a repelled term contributes exactly zero");
+        let live = g0
+            .iter()
+            .zip(&clean)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max); // nan-ok: every operand asserted finite above
+        assert!(
+            live > 1e3 * worst,
+            "straddle: the zeroed term is live, {live:e} vs {worst:e}"
+        );
     }
 
     #[test]
@@ -3549,7 +3807,7 @@ mod tests {
                 .is_none(),
             "fixture: the strict assembly must decline subject 0"
         );
-        let log = OuterFdDeclineLog::reconverging(pop.subjects.len());
+        let log = OuterFdDeclineLog::new(pop.subjects.len());
         let salvaged = super::mixture_gradient_salvaged(
             &model,
             &pop,
@@ -3558,8 +3816,7 @@ mod tests {
             &eval,
             Some(&modes),
             &log,
-        )
-        .expect("the mixing map is in scope, so the salvage forms a gradient");
+        );
         assert_eq!(log.declined_indices(), vec![0], "only subject 0 declined");
 
         // The same assembly with subject 0's salvage zeroed: how much its terms carry.
@@ -3607,7 +3864,7 @@ mod tests {
             "fixture: subject 0's salvaged terms must be live ({live:e} vs {worst:e})"
         );
 
-        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the decline warns");
+        let w = outer_fd_fallback_warning(&pop, &log).expect("the decline warns");
         assert!(
             w.contains("1 of 4") && w.contains(&format!("subject {}", pop.subjects[0].id)),
             "{w}"

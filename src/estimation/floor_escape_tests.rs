@@ -107,6 +107,7 @@ fn resolve_probe(first: Stub, probe: Stub, restart: impl FnOnce(&Stub) -> Stub) 
         near_probe,
         false,
     )
+    .0
 }
 
 /// The stub's `near_floor` hook: its near-floor θ, the restart's point re-scored (the same
@@ -1149,7 +1150,8 @@ fn the_near_floor_gate_ranks_on_the_penalized_objective() {
             })
         },
         false,
-    );
+    )
+    .0;
     assert!(r.converged, "{:?}", r.warnings);
 }
 
@@ -2129,6 +2131,23 @@ fn rail_lock() -> std::sync::MutexGuard<'static, ()> {
     rail_switch::LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Collapse completion (#3005) off until dropped, for a test of rail completion alone whose
+/// fixture has a variance far below its start. Take [`rail_lock`] first.
+struct CollapseOff;
+
+impl CollapseOff {
+    fn new() -> Self {
+        rail_switch::COLLAPSE_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
+        CollapseOff
+    }
+}
+
+impl Drop for CollapseOff {
+    fn drop(&mut self) {
+        rail_switch::COLLAPSE_OFF.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// `template()` with a second Ω diagonal, both near the rail: `ETA_EM` at guard + 1.2 and
 /// `ETA_B` at guard + 0.8.
 fn two_near_rail() -> ModelParameters {
@@ -2158,6 +2177,8 @@ fn packed_of(p: &ModelParameters, name: &str) -> f64 {
 fn escape_floor_probes_each_near_rail_variance_alone_then_resumes_the_downhill_ones() {
     use std::cell::RefCell;
     let _g = rail_lock();
+    // `template()`'s ETA_EM starts at 0.25, so near its guard it is also a collapse candidate.
+    let _off = CollapseOff::new();
     let start = template();
     // A small inner budget, so the probes' "at least the default" budget is visible (row 4).
     let options = FitOptions {
@@ -2354,6 +2375,8 @@ fn rail_completion_skips_evaluation_only_cancelled_and_non_finite_fits() {
 fn rail_completion_reads_the_floor_escapes_restart_not_the_first_stop() {
     use std::cell::RefCell;
     let _g = rail_lock();
+    // `template()`'s ETA_EM starts at 0.25, so near its guard it is also a collapse candidate.
+    let _off = CollapseOff::new();
     let start = template();
     let options = FitOptions::default();
     let g = OMEGA_CHOL_PACKED_LOWER;
@@ -2537,6 +2560,35 @@ fn a_variance_already_on_the_guard_is_not_probed() {
     );
     assert!(!probed.contains(&"ETA_KA_T6".to_string()), "{probed:?}");
     assert_rail_untouched(&on, &off);
+
+    // #3005: ω_KA fell from 0.05 to the guard, far below 1/1000 of its start, so collapse
+    // completion probes it — upward, at ω² = 5e-5 — finds that uphill (the truth has no KA
+    // IIV), and leaves the fit bit-identical to one with collapse completion off. A real fit
+    // through the probe's non-empty, no-restart path.
+    rail_switch::COLLAPSE_PROBED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    let (on_again, _) = rail_fit(src, data, true);
+    let collapse_probed = std::mem::take(
+        &mut *rail_switch::COLLAPSE_PROBED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
+    assert!(
+        collapse_probed.contains(&"ETA_KA_T6".to_string()),
+        "{collapse_probed:?}"
+    );
+    let collapse_off = {
+        let _off = CollapseOff::new();
+        rail_fit(src, data, true).0
+    };
+    assert_rail_untouched(&on_again, &collapse_off);
+    assert!(
+        on_again.warnings.iter().all(|w| !w.contains("re-inflated")),
+        "{:?}",
+        on_again.warnings
+    );
 }
 
 /// T7. A small but **real** variance (`small_real_iiv.csv`, ω²_V = 4e-5 in the truth) is
@@ -2712,5 +2764,832 @@ fn the_rail_messages_classify_as_health_and_convergence() {
     assert_eq!(
         (kept.category, kept.severity),
         (WarningCode::Convergence, WarningSeverity::Critical)
+    );
+}
+
+// ── Collapse completion (#3005) ────────────────────────────────────────────────────────
+
+/// The #3005 C-QTc shape: a large Ω diagonal (`ETA_SLOPE ~ 600`), a small one
+/// (`ETA_INT ~ 0.01`, so that one near its guard is not a collapse candidate), a FIXed one,
+/// and an additive σ (SD 9), all as declared starts.
+fn collapse_start() -> ModelParameters {
+    ModelParameters {
+        omega: OmegaMatrix::from_diagonal(
+            &[0.01, 600.0, 600.0],
+            vec!["ETA_INT".into(), "ETA_SLOPE".into(), "ETA_FIX".into()],
+        ),
+        omega_fixed: vec![false, false, true],
+        sigma: SigmaVector {
+            values: vec![9.0],
+            names: vec!["ADD".into()],
+        },
+        sigma_fixed: vec![false],
+        ..template()
+    }
+}
+
+/// `base` with the packed coordinate `name` moved until its packed value (after the pack
+/// round trip) is exactly `target`, or panics — so an edge is tested on the value the walk
+/// reads, not the one written.
+fn with_packed_at(base: &ModelParameters, name: &str, target: f64) -> ModelParameters {
+    let i = coordinate_names(base)
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("{name}"));
+    let mut x = pack_params(base);
+    let mut v = target;
+    for _ in 0..64 {
+        x[i] = v;
+        let p = unpack_params(&x, base);
+        let got = pack_params(&p)[i];
+        if got == target {
+            return p;
+        }
+        v += target - got;
+    }
+    panic!("no {name} value packs to exactly {target}");
+}
+
+/// #3005's stop: ω²_slope at 0.00622 (start 600), ω²_FIX moved the same way (it cannot have
+/// moved in a real fit; here it pins the FIX gate), σ collapsed from SD 9 to e^-3, ETA_INT
+/// where it started.
+fn collapsed_stop() -> ModelParameters {
+    let p = with_packed_at(&collapse_start(), "ETA_SLOPE", 0.5 * 0.00622f64.ln());
+    let p = with_packed_at(&p, "ETA_FIX", 0.5 * 0.00622f64.ln());
+    with_packed_at(&p, "ADD", -3.0)
+}
+
+/// `base` with the packed coordinate `name` written at `target`, read back within 1e-12:
+/// for an edge straddled at a margin far wider than the round trip's error.
+fn with_packed_near(base: &ModelParameters, name: &str, target: f64) -> ModelParameters {
+    let i = coordinate_names(base)
+        .iter()
+        .position(|n| n == name)
+        .unwrap_or_else(|| panic!("{name}"));
+    let mut x = pack_params(base);
+    x[i] = target;
+    let p = unpack_params(&x, base);
+    let got = pack_params(&p)[i];
+    assert!((got - target).abs() < 1e-12, "{name}: {got} vs {target}");
+    p
+}
+
+fn collapse_names(p: &ModelParameters) -> Vec<String> {
+    let mut v: Vec<String> = collapsed_variances(p, &collapse_start())
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+    v.sort();
+    v
+}
+
+/// The depth is the θ floor probe's 1/1000, on a variance: half its log on the packed
+/// log-SD scale.
+#[test]
+fn the_collapse_depth_is_a_thousandfold_fall_in_variance() {
+    assert!((collapse_depth() - 0.5 * 1000f64.ln()).abs() < 1e-15);
+    assert!(((-2.0 * collapse_depth()).exp() - FLOOR_PROBE_REL).abs() < 1e-18);
+}
+
+/// The candidates are the free variance coordinates more than the depth below their start:
+/// the collapsed Ω and σ, not the Ω at its start nor the FIXed one. The edge straddled on
+/// the packed value the walk reads: just over `start − depth` out, just under it in.
+#[test]
+fn collapsed_variances_are_free_and_far_below_their_start() {
+    let stop = collapsed_stop();
+    assert_eq!(collapse_names(&stop), vec!["ADD", "ETA_SLOPE"]);
+    let c = collapsed_variances(&stop, &collapse_start());
+    let slope = c.iter().find(|c| c.name == "ETA_SLOPE").expect("ETA_SLOPE");
+    assert_eq!(slope.family, RailFamily::RandomEffect);
+    assert!((slope.value - 0.00622).abs() < 1e-12, "{}", slope.value);
+    let add = c.iter().find(|c| c.name == "ADD").expect("ADD");
+    assert_eq!(add.family, RailFamily::ResidualError);
+
+    let s = pack_params(&collapse_start())[coordinate_names(&stop)
+        .iter()
+        .position(|n| n == "ETA_SLOPE")
+        .expect("ETA_SLOPE")];
+    // `start − depth` itself does not round-trip exactly through the Cholesky packing, so
+    // this edge is straddled 1e-9 either side.
+    let edge = s - collapse_depth();
+    let at_edge = with_packed_near(&stop, "ETA_SLOPE", edge + 1e-9);
+    assert!(!collapse_names(&at_edge).contains(&"ETA_SLOPE".to_string()));
+    let under = with_packed_near(&stop, "ETA_SLOPE", edge - 1e-9);
+    assert!(collapse_names(&under).contains(&"ETA_SLOPE".to_string()));
+
+    // Where it landed is not the test: inside rail completion's span (which probes it the
+    // other way) and on the guard itself it is still a candidate.
+    let in_span = with_packed_at(&stop, "ETA_SLOPE", OMEGA_CHOL_PACKED_LOWER + 1.0);
+    assert!(collapse_names(&in_span).contains(&"ETA_SLOPE".to_string()));
+    assert!(near_rail_variances(&in_span)
+        .iter()
+        .any(|c| c.name == "ETA_SLOPE"));
+    let on_guard = with_packed_at(&stop, "ETA_SLOPE", OMEGA_CHOL_PACKED_LOWER);
+    assert!(collapse_names(&on_guard).contains(&"ETA_SLOPE".to_string()));
+}
+
+/// The probe and the restart point: the named coordinates at `below` under their packed
+/// start (exactly), everything else where it stopped, and the user's θ FIX mask.
+#[test]
+fn below_start_params_moves_only_the_named_coordinates_relative_to_their_start() {
+    let mut stop = collapsed_stop();
+    stop.theta_fixed = vec![true, false, false];
+    let start = collapse_start();
+    let names = coordinate_names(&stop);
+    let at = |n: &str| names.iter().position(|x| x == n).expect(n);
+    let (x0, xs) = (pack_params(&stop), pack_params(&start));
+    let probe = below_start_params(&stop, &start, &[at("ETA_SLOPE")], collapse_depth());
+    let x1 = pack_params(&probe);
+    assert!((x1[at("ETA_SLOPE")] - (xs[at("ETA_SLOPE")] - collapse_depth())).abs() < 1e-12);
+    assert!(
+        (probe.omega.matrix[(1, 1)] - 600.0 * FLOOR_PROBE_REL).abs() < 1e-9,
+        "the probe is ω² at 1/1000 of its start: {}",
+        probe.omega.matrix[(1, 1)]
+    );
+    for n in ["ETA_INT", "ETA_FIX", "ADD", "TVE0"] {
+        assert!((x1[at(n)] - x0[at(n)]).abs() < 1e-12, "{n} moved");
+    }
+    assert_eq!(probe.theta_fixed, start.theta_fixed);
+    let resumed = below_start_params(&stop, &start, &[at("ETA_SLOPE"), at("ADD")], 0.0);
+    assert!((resumed.omega.matrix[(1, 1)] - 600.0).abs() < 1e-9);
+    assert!((resumed.sigma.values[0] - 9.0).abs() < 1e-12);
+}
+
+fn slope_candidate() -> RailCandidate {
+    RailCandidate {
+        index: 4,
+        name: "ETA_SLOPE".into(),
+        family: RailFamily::RandomEffect,
+        value: 0.00622,
+    }
+}
+
+/// The #3005 stop as a stub: converged at 3327.580600.
+fn qtc_stop() -> Stub {
+    Stub {
+        ofv: 3327.5806,
+        ..floor_stop()
+    }
+}
+
+/// One collapse resolve over a single candidate with probe OFV `probe` and resumed OFV
+/// `restart`; the resumed run's own candidates (`again`) probe at `again_probe`. Returns the
+/// result, the carried warnings, and whether it restarted.
+fn resolve_collapse(
+    first: Stub,
+    carried: Vec<String>,
+    probe: f64,
+    restart: Option<f64>,
+    again: Vec<RailCandidate>,
+    again_probe: f64,
+) -> (Stub, Vec<String>, bool) {
+    let stop_ofv = first.ofv;
+    let is_stop = move |s: &Stub| s.ofv.to_bits() == stop_ofv.to_bits();
+    let restarted = std::cell::Cell::new(false);
+    let (r, c) = resolve_short_stop(
+        ShortStop::Collapse,
+        first,
+        carried,
+        |s: &Stub| {
+            if is_stop(s) {
+                vec![slope_candidate()]
+            } else {
+                again.clone()
+            }
+        },
+        |s: &Stub| s.clone(),
+        |s: &Stub, _| at_ofv(if is_stop(s) { probe } else { again_probe }),
+        |_, idx| {
+            assert_eq!(idx, &[4]);
+            restarted.set(true);
+            restart.map(|ofv| Stub {
+                evals: 40,
+                ..at_ofv(ofv)
+            })
+        },
+        |s| s.ofv + s.penalty,
+        FitOptions::default().inner_maxiter,
+        false,
+    );
+    (r, c, restarted.get())
+}
+
+/// The decision, both sides of each gate. A downhill probe resumes the fit with the variance
+/// re-inflated and adopts a lower resumed run, which carries the earlier stages' warnings
+/// ahead of its own and hands its own on; one within the gain does nothing but book its
+/// evaluations; a resumed run no lower keeps the stop, not converged, and hands on only what
+/// it was given (the stop still holds those).
+#[test]
+fn collapse_completion_re_inflates_a_downhill_variance_and_adopts_only_a_lower_run() {
+    // Adopted: the #3005 numbers (probe ≈ 0.6 OFV-units of slope × 0.6, restart 3326.857).
+    let (r, carried, restarted) = resolve_collapse(
+        qtc_stop(),
+        vec!["the θ escape's".into()],
+        3327.5797,
+        Some(3326.8566),
+        Vec::new(),
+        f64::NAN,
+    );
+    assert!(restarted);
+    assert_eq!(r.ofv, 3326.8566);
+    assert!(r.converged);
+    assert_eq!(
+        r.evals,
+        40 + 30 + 1 + 1,
+        "resumed + stop + re-score + one probe"
+    );
+    assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+    assert_eq!(r.warnings[0], "the θ escape's");
+    assert!(
+        r.warnings[1].contains("re-inflated to the initial value"),
+        "{}",
+        r.warnings[1]
+    );
+    assert_eq!(carried, r.warnings, "a later stage carries both");
+
+    // Within the gain: untouched but for the re-score and the probe.
+    let stop = qtc_stop();
+    let (r, carried, restarted) = resolve_collapse(
+        stop.clone(),
+        Vec::new(),
+        stop.ofv - 0.5 * FLOOR_PROBE_GAIN,
+        Some(3326.8566),
+        Vec::new(),
+        f64::NAN,
+    );
+    assert!(!restarted);
+    assert_eq!((r.converged, r.evals), (true, stop.evals + 2));
+    assert!(r.warnings.is_empty() && carried.is_empty());
+
+    // Resumed no lower: the stop, not converged, with the not-converged text.
+    let (r, carried, restarted) = resolve_collapse(
+        qtc_stop(),
+        vec!["the θ escape's".into()],
+        3327.5797,
+        Some(3327.5806),
+        Vec::new(),
+        f64::NAN,
+    );
+    assert!(restarted);
+    assert_eq!(r.ofv, 3327.5806);
+    assert!(!r.converged);
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("not reported as converged"));
+    assert_eq!(carried, vec!["the θ escape's".to_string()]);
+
+    // Adopted but collapsed again, downhill there: reported, not converged.
+    let (r, _, _) = resolve_collapse(
+        qtc_stop(),
+        Vec::new(),
+        3327.5797,
+        Some(3327.0),
+        vec![RailCandidate {
+            value: 0.004,
+            ..slope_candidate()
+        }],
+        3326.9,
+    );
+    assert_eq!(r.ofv, 3327.0);
+    assert!(!r.converged);
+    assert!(
+        r.warnings[0].contains("below 1/1000 of its initial value again"),
+        "{}",
+        r.warnings[0]
+    );
+
+    // Verification only (no restart allowed, #3005 review): a downhill probe keeps the stop
+    // bit-identical, demotes it, books the probes, and hands on only what it was given.
+    let stop = qtc_stop();
+    let (r, carried, restarted) = resolve_collapse(
+        stop.clone(),
+        vec!["the rail stage's".into()],
+        3327.5797,
+        None,
+        Vec::new(),
+        f64::NAN,
+    );
+    assert!(restarted, "the restart closure was asked");
+    assert_eq!(r.ofv.to_bits(), stop.ofv.to_bits());
+    assert_eq!(pack_params(&r.params), pack_params(&stop.params));
+    assert!(!r.converged);
+    assert_eq!(r.evals, stop.evals + 2);
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(
+        r.warnings[0].contains(
+            "It was reached by a run that had already been resumed, so it was not resumed \
+             again; the fit is not reported as converged: try another `optimizer`"
+        ),
+        "{}",
+        r.warnings[0]
+    );
+    assert_eq!(
+        classify_warning(&r.warnings[0]).category,
+        WarningCode::Convergence
+    );
+    assert_eq!(carried, vec!["the rail stage's".to_string()]);
+    // …and an uphill probe leaves a verified stop converged.
+    let (r, _, _) = resolve_collapse(stop.clone(), Vec::new(), 3327.6, None, Vec::new(), 0.0);
+    assert!(r.converged && r.warnings.is_empty());
+}
+
+/// Every sentence of the collapse texts, and their classes: the adopted one is
+/// `optimizer_health` (a warning, so a converged fit stays converged), the others are
+/// `convergence`. Each sentence is asserted so deleting it reddens this test; the rail
+/// wording ("guard") must not leak into a collapse text, nor the reverse.
+#[test]
+fn the_collapse_messages_say_where_why_what_happened_and_what_to_do() {
+    let at = RailScore {
+        at_ofv: 3327.5806,
+        inner_maxiter: 200,
+    };
+    let d = [(slope_candidate(), 3327.579700)];
+    let adopted = collapse_restart_warning(&d, 3327.5806, at, 3326.856600);
+    for want in [
+        "Outer optimization stopped at OFV 3327.580600 with the random effect ETA_SLOPE \
+         (variance 6.220e-3; OFV 3327.579700 with it raised to 1/1000 of its initial value) \
+         below 1/1000 of its initial value, where the objective is still falling.",
+        "Variances are optimized on a log scale, where the gradient of a collapsed one is \
+         scaled down by its own size, so the optimizer read the point as stationary; it is \
+         not a minimum.",
+        "It was resumed with it re-inflated to the initial value and reached OFV = \
+         3326.856600; the reported estimates are from the resumed run.",
+    ] {
+        assert!(adopted.contains(want), "missing {want:?} in {adopted}");
+    }
+    assert!(!adopted.contains("guard"), "{adopted}");
+    let e = classify_warning(&adopted);
+    assert_eq!(
+        (e.category, e.severity),
+        (WarningCode::OptimizerHealth, WarningSeverity::Warning)
+    );
+
+    let kept = collapse_not_converged_warning(&d, 3327.5806, at);
+    assert!(
+        kept.contains(
+            "A run resumed with it re-inflated to the initial value found no lower point, so \
+             the fit is not reported as converged: try another `optimizer` or `method = \
+             gn_hybrid`, or start the variance closer to its expected estimate."
+        ),
+        "{kept}"
+    );
+    assert!(kept.contains("it is not a minimum."), "{kept}");
+    let e = classify_warning(&kept);
+    assert_eq!(
+        (e.category, e.severity),
+        (WarningCode::Convergence, WarningSeverity::Critical)
+    );
+
+    // Two coordinates: plural throughout.
+    let add = RailCandidate {
+        index: 6,
+        name: "ADD".into(),
+        family: RailFamily::ResidualError,
+        value: 0.05,
+    };
+    let two = [(slope_candidate(), 3327.5797), (add.clone(), 3327.57)];
+    let again = collapse_again_warning(&two, 3327.5806, at, 3327.0, &[(add, 3326.9)]);
+    for want in [
+        "ETA_SLOPE (variance 6.220e-3; OFV 3327.579700 with it raised to 1/1000 of its \
+         initial value), the residual error ADD (SD 5.000e-2; OFV 3327.570000 with it raised to 1/1000 \
+         of its initial value) below 1/1000 of their initial values, where",
+        "It was resumed with them re-inflated to the initial values and reached OFV = \
+         3327.000000, but stopped with the residual error ADD (SD 5.000e-2; OFV 3326.900000 \
+         with it raised to 1/1000 of its initial value) below 1/1000 of its initial value \
+         again.",
+        "The reported estimates are from the resumed run, and the fit is not reported as \
+         converged: try another `optimizer`",
+    ] {
+        assert!(again.contains(want), "missing {want:?} in {again}");
+    }
+    assert_eq!(classify_warning(&again).category, WarningCode::Convergence);
+
+    // The rail texts keep their own wording.
+    let rail = rail_restart_warning(&d, 3327.5806, at, 3326.8566);
+    assert!(
+        rail.contains("just above ferx's internal lower guard"),
+        "{rail}"
+    );
+    assert!(
+        rail.contains("OFV 3327.579700 with it on the guard"),
+        "{rail}"
+    );
+    assert!(
+        !rail.contains("1/1000") && !rail.contains("log scale"),
+        "{rail}"
+    );
+}
+
+/// End to end over a fake optimizer: the collapsed ω² is probed evaluation-only at 1/1000 of
+/// its start, the fit is resumed with it back at its start and the fit's own options, and
+/// the adopted run is reported. Collapse completion runs **before** rail completion, so a
+/// resumed run that ends with a variance just above the guard is read by the rail stage and
+/// carries the collapse warning. With the switch off the stop comes back as returned.
+#[test]
+fn escape_floor_re_inflates_a_collapsed_variance_then_hands_the_result_to_rail_completion() {
+    use std::cell::RefCell;
+    let _g = rail_lock();
+    let start = collapse_start();
+    let options = FitOptions::default();
+    let stop = with_packed_at(&collapse_start(), "ETA_SLOPE", 0.5 * 0.00622f64.ln());
+    let s = packed_of(&start, "ETA_SLOPE");
+    let g = OMEGA_CHOL_PACKED_LOWER;
+    let calls: RefCell<Vec<(ModelParameters, usize)>> = RefCell::new(Vec::new());
+    let run = |p: &ModelParameters, o: &FitOptions| {
+        calls.borrow_mut().push((p.clone(), o.outer_maxiter));
+        let n = calls.borrow().len();
+        let slope = packed_of(p, "ETA_SLOPE");
+        let int = packed_of(p, "ETA_INT");
+        let (ofv, params) = match (n, o.outer_maxiter) {
+            (1, _) => (3327.5806, stop.clone()),
+            // Collapse stage: the re-score, then the probe at start − depth.
+            (2, 0) => (3327.5806, p.clone()),
+            (3, 0) if (slope - (s - collapse_depth())).abs() < 1e-12 => (3327.5797, p.clone()),
+            // The resumed run starts with ω² back at 600 and ends with ETA_INT near its
+            // guard (packed g + 1.2).
+            (4, m) if m > 0 && (slope - s).abs() < 1e-12 => {
+                (3326.86, with_packed_at(p, "ETA_INT", g + 1.2))
+            }
+            // Its own collapse re-check finds nothing (ETA_SLOPE at its start), so the rail
+            // stage: re-score, ETA_INT probed on the guard (uphill), done.
+            (5, 0) => (3326.86, p.clone()),
+            (6, 0) if int == g => (3326.95, p.clone()),
+            other => panic!("unexpected call {other:?} (slope {slope}, int {int})"),
+        };
+        Stub {
+            params,
+            ofv,
+            ..landed()
+        }
+    };
+    let r = escape_floor(&start, &options, 44, run, |_| 0.0);
+    let calls = calls.into_inner();
+    assert_eq!(
+        calls.len(),
+        6,
+        "fit; re-score, probe, resume; rail re-score, rail probe"
+    );
+    let probe = &calls[2].0;
+    assert!(
+        (probe.omega.matrix[(1, 1)] - 0.6).abs() < 1e-9,
+        "probed at 1/1000 of its start: {}",
+        probe.omega.matrix[(1, 1)]
+    );
+    assert!(
+        (packed_of(probe, "ETA_INT") - packed_of(&stop, "ETA_INT")).abs() < 1e-12,
+        "only the candidate moves"
+    );
+    assert_eq!(
+        calls[3].1, options.outer_maxiter,
+        "resumed with the fit's options"
+    );
+    assert!((calls[3].0.omega.matrix[(1, 1)] - 600.0).abs() < 1e-9);
+    assert_eq!(r.ofv, 3326.86);
+    assert!(r.converged);
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("ETA_SLOPE") && r.warnings[0].contains("re-inflated"));
+
+    // Off: one call, the stop as returned.
+    rail_switch::COLLAPSE_OFF.store(true, std::sync::atomic::Ordering::SeqCst);
+    let n = RefCell::new(0);
+    let off = escape_floor(
+        &start,
+        &options,
+        44,
+        |_, _| {
+            *n.borrow_mut() += 1;
+            Stub {
+                params: stop.clone(),
+                ofv: 3327.5806,
+                ..landed()
+            }
+        },
+        |_| 0.0,
+    );
+    rail_switch::COLLAPSE_OFF.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!((*n.borrow(), off.ofv, off.converged), (1, 3327.5806, true));
+}
+
+/// The #3005 model: `lmer(dQTcF ~ TIME + ACTIVE + BLC + CONC + (CONC || ID))` as a ferx
+/// model, with the issue's starts.
+const QTC_MODEL: &str = "[parameters]
+  theta INT(0.1, -100.0, 100.0)
+  theta TEFF[TIME, contrast = ref](0.0, -100.0, 100.0)
+  theta ACT(0.1, -100.0, 100.0)
+  theta SLOPE(10, -1000.0, 1000.0)
+  theta BL(-0.1, -10.0, 10.0)
+
+  omega ETA_INT ~ 25
+  omega ETA_SLOPE ~ 600
+
+  sigma ADD ~ 80 (variance)
+
+[covariates]
+  CONC continuous
+  ACTIVE continuous
+  BLC continuous
+
+[individual_parameters]
+  B0 = INT + ETA_INT
+  B2 = SLOPE + ETA_SLOPE
+
+[structural_model]
+  y = B0 + TEFF + ACT * ACTIVE + B2 * CONC + BL * BLC
+
+[error_model]
+  DV ~ additive(ADD)
+";
+
+/// The default FOCEI fit of [`QTC_MODEL`] to `qtc_sim.csv`, with collapse completion on or
+/// off, and ω²_slope.
+fn qtc_fit(on: bool) -> (crate::types::FitResult, f64) {
+    use std::sync::atomic::Ordering;
+    let mut parsed = crate::parser::model_parser::parse_full_model(QTC_MODEL).expect("model");
+    let mut pop =
+        crate::api::read_population_as_fitted(&parsed, "tests/data/variance_collapse/qtc_sim.csv")
+            .expect("data")
+            .0;
+    crate::api::bind_theta_levels(&mut parsed, QTC_MODEL, &mut pop).expect("TEFF levels");
+    let model = parsed.model;
+    let opts = FitOptions {
+        method: crate::types::EstimationMethod::FoceI,
+        outer_maxiter: 1000,
+        run_covariance_step: false,
+        threads: Some(1),
+        ..FitOptions::default()
+    };
+    rail_switch::COLLAPSE_OFF.store(!on, Ordering::SeqCst);
+    let r = crate::fit(&model, &pop, &model.default_params, &opts);
+    rail_switch::COLLAPSE_OFF.store(false, Ordering::SeqCst);
+    let r = r.expect("fit runs");
+    let w = r.omega[(1, 1)];
+    (r, w)
+}
+
+/// #3005 end to end, on data simulated at ω²_slope = 652 whose ML optimum is ω²_slope =
+/// 87.41 at OFV 3307.9166 (lme4 `REML = FALSE`, −2 log L − 704 ln 2π = 3307.916). With
+/// collapse completion off the default optimizer throws ω²_slope from 600 to ~3e-5 — into
+/// rail completion's span, whose downward probe is uphill — and stops `converged` 0.77
+/// above the optimum. On, the probe at ω² = 0.6 is downhill, the resumed run from 600
+/// reaches the optimum, and the warning names the variance. Measured on Linux x86_64 and
+/// macOS arm64 alike: off 3308.688073, ω² 3.085e-5; on 3307.916556, ω² 87.4131.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn a_collapsed_variance_with_an_inward_slope_is_re_inflated_to_the_optimum() {
+    let _g = rail_lock();
+    let (off, w_off) = qtc_fit(false);
+    let (on, w_on) = qtc_fit(true);
+    eprintln!(
+        "#3005 off {:.6} ω² {w_off:.3e} converged {}; on {:.6} ω² {w_on:.4} converged {}",
+        off.ofv, off.converged, on.ofv, on.converged
+    );
+    assert!(off.ofv.is_finite() && on.ofv.is_finite());
+    assert!(
+        w_off < 0.6,
+        "fixture premise: the uncompleted fit collapses ω²_slope below 1/1000 of its start, \
+         got {w_off}"
+    );
+    assert!(
+        (on.ofv - 3307.9166).abs() < 1e-3,
+        "the lme4 optimum, got {:.6}",
+        on.ofv
+    );
+    assert!((w_on - 87.41).abs() < 0.5, "ω²_slope {w_on}");
+    assert!(off.ofv - on.ofv > 0.5, "{} vs {}", off.ofv, on.ofv);
+    assert!(on.converged);
+    let w = on
+        .warnings
+        .iter()
+        .find(|w| w.contains("re-inflated to the initial value"))
+        .unwrap_or_else(|| panic!("no collapse warning in {:?}", on.warnings));
+    assert!(w.contains("the random effect ETA_SLOPE (variance "), "{w}");
+}
+
+/// The world of a rail restart that collapses a variance (#3005 review): `ETA_INT` (start
+/// 1e-4) stops just above its guard and is downhill there; every rail restart lands it on
+/// the guard but throws `ETA_SLOPE` (start 600) to 0.0062, where raising it is downhill;
+/// every collapse restart re-inflates `ETA_SLOPE` and, while `int_bounces`, leaves `ETA_INT`
+/// short of its guard again. Each evaluation lowers the OFV by 0.5 from the last run.
+/// Returns the report and the call log (`outer_maxiter`, packed ETA_SLOPE, packed ETA_INT).
+fn rail_then_collapse_world(int_bounces: bool) -> (Stub, Vec<(usize, f64, f64)>) {
+    use std::cell::RefCell;
+    let mut start = collapse_start();
+    start.omega = OmegaMatrix::from_diagonal(
+        &[1e-4, 600.0, 600.0],
+        vec!["ETA_INT".into(), "ETA_SLOPE".into(), "ETA_FIX".into()],
+    );
+    let g = OMEGA_CHOL_PACKED_LOWER;
+    let s = packed_of(&start, "ETA_SLOPE");
+    let collapsed = 0.5 * 0.00622f64.ln();
+    let short = with_packed_at(&start, "ETA_INT", g + 1.2);
+    let options = FitOptions::default();
+    let log: RefCell<Vec<(usize, f64, f64)>> = RefCell::new(Vec::new());
+    let ofv = RefCell::new(100.0);
+    let at = RefCell::new((f64::NAN, f64::NAN));
+    let r = escape_floor(
+        &start,
+        &options,
+        44,
+        |p, o| {
+            let (slope, int) = (packed_of(p, "ETA_SLOPE"), packed_of(p, "ETA_INT"));
+            log.borrow_mut().push((o.outer_maxiter, slope, int));
+            let n = log.borrow().len();
+            let last = *ofv.borrow();
+            let params = if n == 1 {
+                short.clone()
+            } else if o.outer_maxiter == 0 {
+                // A probe (any point other than the last run's) is downhill by 0.5, a
+                // re-score is level.
+                let probing = *at.borrow() != (slope, int);
+                return Stub {
+                    params: p.clone(),
+                    ofv: if probing { last - 0.5 } else { last },
+                    ..landed()
+                };
+            } else if (int - (g + RAIL_RESTART_ABOVE)).abs() < 1e-12 {
+                // A rail restart: ETA_INT onto the guard, ETA_SLOPE collapsed.
+                let q = at_rail_params(
+                    p,
+                    &start,
+                    &[coordinate_names(p)
+                        .iter()
+                        .position(|n| n == "ETA_INT")
+                        .expect("ETA_INT")],
+                    0.0,
+                );
+                with_packed_at(&q, "ETA_SLOPE", collapsed)
+            } else if (slope - s).abs() < 1e-12 {
+                // A collapse restart.
+                if int_bounces {
+                    with_packed_at(p, "ETA_INT", g + 1.2)
+                } else {
+                    p.clone()
+                }
+            } else {
+                panic!("unexpected run {n}: slope {slope}, int {int}");
+            };
+            let next = last - 1.0;
+            *ofv.borrow_mut() = next;
+            *at.borrow_mut() = (
+                packed_of(&params, "ETA_SLOPE"),
+                packed_of(&params, "ETA_INT"),
+            );
+            Stub {
+                params,
+                ofv: if n == 1 { 100.0 } else { next },
+                ..landed()
+            }
+        },
+        |_| 0.0,
+    );
+    (r, log.into_inner())
+}
+
+/// #3005 review: a rail restart is a full outer optimization, and the run it adopts can
+/// collapse a variance. Collapse completion reads that run again: here it re-inflates
+/// `ETA_SLOPE`, and the rail stage, given nothing new, does not run a second time. The
+/// report carries both stages' warnings and is converged.
+#[test]
+fn a_rail_restart_that_collapses_a_variance_is_read_by_collapse_completion_again() {
+    let _g = rail_lock();
+    let (r, log) = rail_then_collapse_world(false);
+    let runs: Vec<usize> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.0 > 0)
+        .map(|(i, _)| i + 1)
+        .collect();
+    assert_eq!(
+        log.len(),
+        7,
+        "fit; rail re-score, probe, restart; collapse re-score, probe, restart: {log:?}"
+    );
+    assert_eq!(runs, vec![1, 4, 7], "three full runs");
+    assert!(r.converged, "{:?}", r.warnings);
+    assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("resumed from just above the guard"));
+    assert!(
+        r.warnings[1].contains("ETA_SLOPE") && r.warnings[1].contains("re-inflated"),
+        "{}",
+        r.warnings[1]
+    );
+}
+
+/// The bound: when the rail stage still adopts a run in the last of `COMPLETION_ROUNDS`
+/// rounds, that run is verified for collapse without a restart; its downhill probe leaves it
+/// reported but not converged. Without the verification this fit came back `converged`
+/// with `ETA_SLOPE` collapsed.
+#[test]
+fn a_collapse_left_by_the_last_rail_restart_is_verified_and_not_converged() {
+    let _g = rail_lock();
+    assert_eq!(COMPLETION_ROUNDS, 2, "the call log below is two rounds");
+    let (r, log) = rail_then_collapse_world(true);
+    assert_eq!(
+        log.len(),
+        12,
+        "fit; rail ×3; collapse ×3; rail ×3; collapse verification: re-score, probe: {log:?}"
+    );
+    assert!(
+        log[10..].iter().all(|c| c.0 == 0),
+        "the verification restarts nothing: {log:?}"
+    );
+    assert!(!r.converged);
+    let last = r.warnings.last().expect("a warning");
+    assert!(
+        last.contains("ETA_SLOPE") && last.contains("not resumed again"),
+        "{last}"
+    );
+}
+
+/// The world of a collapse restart that floors a θ (#3005 review, round 2): the stop has
+/// `ETA_SLOPE` collapsed (raising it is downhill); the collapse restart re-inflates it, is
+/// lower, and leaves `TVE0` (start 55, `≥ 0`) on the log-packing floor, where the θ probe is
+/// downhill; the θ restart ends at `theta_restart_ofv` with TVE0 = 50. Returns the report
+/// and the call log (`outer_maxiter`, TVE0).
+fn collapse_then_floor_world(theta_restart_ofv: f64) -> (Stub, Vec<(usize, f64)>) {
+    use std::cell::RefCell;
+    let start = collapse_start();
+    let s = packed_of(&start, "ETA_SLOPE");
+    let stop = with_packed_at(&start, "ETA_SLOPE", 0.5 * 0.00622f64.ln());
+    let options = FitOptions::default();
+    let log: RefCell<Vec<(usize, f64)>> = RefCell::new(Vec::new());
+    let r = escape_floor(
+        &start,
+        &options,
+        44,
+        |p, o| {
+            let (tve0, slope) = (p.theta[0], packed_of(p, "ETA_SLOPE"));
+            log.borrow_mut().push((o.outer_maxiter, tve0));
+            let n = log.borrow().len();
+            let (ofv, params) = match (n, o.outer_maxiter) {
+                (1, _) => (100.0, stop.clone()),
+                (2, 0) => (100.0, p.clone()),
+                (3, 0) if (slope - (s - collapse_depth())).abs() < 1e-12 => (99.5, p.clone()),
+                (4, m) if m > 0 && (slope - s).abs() < 1e-12 => {
+                    let mut q = p.clone();
+                    q.theta[0] = LOG_PACK_FLOOR;
+                    (98.0, q)
+                }
+                // The θ floor escape on the adopted run: probe at 1/1000 of TVE0's start …
+                (5, 0) if (tve0 - FLOOR_PROBE_REL * 55.0).abs() < 1e-12 => (97.5, p.clone()),
+                // … and the restart from TVE0's start.
+                (6, m) if m > 0 && (tve0 - 55.0).abs() < 1e-9 => {
+                    let mut q = p.clone();
+                    q.theta[0] = 50.0;
+                    (theta_restart_ofv, q)
+                }
+                other => panic!("unexpected call {other:?} (TVE0 {tve0}, slope {slope})"),
+            };
+            Stub {
+                params,
+                ofv,
+                ..landed()
+            }
+        },
+        |_| 0.0,
+    );
+    (r, log.into_inner())
+}
+
+/// #3005 review, round 2: a run a completion adopts goes through the θ floor escape again.
+/// Here the collapse restart is lower but floors TVE0 with the objective still falling;
+/// the θ restart is adopted, carries the collapse warning ahead of its own, and — being a
+/// new run — is read by both completions again (no candidates, so no calls). When the θ
+/// restart ends no lower, the collapse restart is kept, not converged. Without the second
+/// escape this fit came back `converged` at 98 with TVE0 on the floor.
+#[test]
+fn a_completion_restart_that_floors_a_theta_goes_through_the_floor_escape_again() {
+    let _g = rail_lock();
+    let (r, log) = collapse_then_floor_world(96.0);
+    assert_eq!(
+        log.len(),
+        6,
+        "fit; collapse re-score, probe, restart; θ probe, θ restart: {log:?}"
+    );
+    assert_eq!(r.ofv, 96.0);
+    assert_eq!(r.params.theta[0], 50.0);
+    assert!(r.converged, "{:?}", r.warnings);
+    assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+    assert!(r.warnings[0].contains("re-inflated"), "{}", r.warnings[0]);
+    assert!(
+        r.warnings[1].contains("TVE0") && r.warnings[1].contains("log-packing floor"),
+        "{}",
+        r.warnings[1]
+    );
+
+    let (r, log) = collapse_then_floor_world(98.5);
+    assert_eq!(log.len(), 6, "{log:?}");
+    assert_eq!(r.ofv, 98.0, "the collapse restart is kept");
+    assert_eq!(r.params.theta[0], LOG_PACK_FLOOR);
+    assert!(!r.converged);
+    assert!(
+        r.warnings.iter().any(|w| w.contains("re-inflated"))
+            && r.warnings
+                .last()
+                .is_some_and(|w| w.contains("TVE0") && w.contains("not reported as converged")),
+        "{:?}",
+        r.warnings
     );
 }

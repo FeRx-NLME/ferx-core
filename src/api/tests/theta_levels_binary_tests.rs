@@ -1018,17 +1018,18 @@ const BARE_WHY_GAUSSIAN: &str = "this data: it has no Gaussian rows, a CTMM gene
 /// #2819: … and dropped when the cannot-estimate sentence follows, which states it.
 const BARE_WHY_SHORT: &str = "this data: a CTMM generator";
 const BARE_ADVICE: &str =
-    "Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` transition.";
+    "Read the block in a `[binary_model]` predictor, a `[count_model]` mean or a DTMM \
+     `[markov_model]` transition.";
 /// … or a level-defining endpoint the data has no record for.
 const BARE_NO_RECORDS: &str = "The block is read bare by an endpoint whose records define levels \
                                (CMT 1), but the data has no record there.";
 /// #2751: the closing sentence when the data has no discrete-state record, so no reader
 /// the model could add defines a level on it. It ends both the unread arm (review r1 #1)
 /// and the non-definer bare-read arm.
-const BARE_NO_DEFINER_DATA: &str = "Only Gaussian rows and the discrete-state records of a \
-                                    `[binary_model]` or DTMM `[markov_model]` endpoint define a \
-                                    level, and this data has neither, so it cannot estimate the \
-                                    block.";
+const BARE_NO_DEFINER_DATA: &str = "Only Gaussian rows and the records of a `[binary_model]`, \
+                                    `[count_model]` or DTMM `[markov_model]` endpoint define a \
+                                    level, and this data has none of them, so it cannot estimate \
+                                    the block.";
 /// #2819: the half of the next step both arms share, wherever `BARE_NO_DEFINER_DATA` is.
 const ADD_ROWS: &str = "add rows that define a level, scored by an expression that reads it.";
 /// #2819: the unread arm's next step. It spans the sentence boundary, so it pins that the
@@ -1337,8 +1338,8 @@ fn a_subscripted_read_never_reaches_the_binder() {
 /// #2751: the clause naming the data's time-to-event records.
 const EVENT_CLAUSE: &str = ", and its time-to-event records define no level";
 /// #2751: the clause naming the data's count records.
-const COUNT_CLAUSE: &str =
-    ", and its count records define no level, since no endpoint scores a count record";
+const COUNT_CLAUSE: &str = ", and none of its count records is on an endpoint whose expression \
+                            reads the block through its implicit index";
 
 /// The record kinds a #2751 cell's data carries, none of them on an endpoint that reads
 /// the block (CMT 3 and up; the reading endpoints are on CMT 1).
@@ -1717,4 +1718,106 @@ fn ctmm_records_define_no_level_cells() {
             }
         }
     }
+}
+
+/// #2877 review r3: a count record on a `[count_model]` endpoint is a record a reader could
+/// make define a level, so on count-only data where the block is read only by a Gaussian
+/// prediction the refusal advises reading it in an endpoint expression rather than ending
+/// on the cannot-estimate sentence. The pair straddles the gate: the same data without the
+/// count endpoint (its records then sit on a CMT nothing scores) gets the cannot-estimate
+/// sentence and no advice.
+#[test]
+fn count_records_on_a_count_endpoint_are_level_capable() {
+    let base = reader_model(Reader::NonDefiner);
+    let with_count = format!("{base}[count_model]\n  cmt = 4\n  lambda = 2.0\n");
+    let message = |text: &str| {
+        let mut parsed = parse_full_model(text).unwrap();
+        let mut pop = records_population(Kinds {
+            discrete: false,
+            events: false,
+            counts: true,
+        });
+        crate::api::levels::bind_theta_levels_diag(&mut parsed, text, &mut pop)
+            .expect_err("no level")
+            .message
+    };
+    let m = message(&with_count);
+    assert!(m.contains(BARE_ADVICE), "{m}");
+    assert!(m.contains(BARE_WHY_GAUSSIAN), "{m}");
+    assert!(!m.contains(BARE_NO_DEFINER_DATA), "{m}");
+    assert!(m.contains(COUNT_CLAUSE), "{m}");
+    let m = message(&base);
+    assert!(!m.contains(BARE_ADVICE), "{m}");
+    assert!(m.contains(BARE_NO_DEFINER_DATA), "{m}");
+}
+
+/// [`BINARY`] as a `[count_model]`: the same block and study η, read in the log mean (the
+/// fixture's 0/1 DVs are valid counts).
+fn count_model_text() -> String {
+    BINARY.replace(
+        "[binary_model]\n  cmt   = 1\n  logit = TVL + PLACEBO + ETA_S + EMAX * TRT",
+        "[count_model]\n  cmt        = 1\n  type       = negbin\n  log_lambda = TVL + PLACEBO + ETA_S + EMAX * TRT\n  r          = exp(EMAX)",
+    )
+}
+
+/// `contrast = auto` sees the study η a `[count_model]` mean reads beside the block, as
+/// for a binary predictor (#2877 review round 5): the block absorbs it, so auto resolves
+/// to the within-study contrast, not a global sum-to-zero.
+///
+/// Mutations: leave the count expressions out of the coupling walk's readouts and auto
+/// resolves to a global sum-to-zero; leave them out of the scale-share walk and the block
+/// shares no expression with the η.
+#[test]
+fn auto_sees_the_eta_the_count_mean_reads_with_the_block() {
+    let text = count_model_text().replace(", contrast = sum_to_zero_within", "");
+    assert!(text.contains("[count_model]") && !text.contains("[binary_model]"));
+    let (parsed, _) = bound(&text, &csv(&[0, 4, 8], true)).unwrap_or_else(|e| panic!("{e}"));
+    let decl = &parsed.model.theta_blocks().level_blocks()[0];
+    assert_eq!(decl.contrast(), LevelContrast::SumToZeroWithin);
+    assert!(
+        decl.shares_scale_with_eta(),
+        "the count mean reads the block and the η in one expression"
+    );
+}
+
+/// The identifiability refusal names the count expression where the block meets the
+/// random effect — the mean, or the size `r` — not `y` and not a binary predictor.
+///
+/// Mutations: give count expressions the binary label, or swap the mean and size labels,
+/// and one of the two messages names the wrong expression.
+#[test]
+fn the_share_site_names_the_count_expression() {
+    let text = count_model_text().replace(
+        "PLACEBO[STUDY, TIME, contrast = sum_to_zero_within]",
+        "PLACEBO[STUDY]",
+    );
+    let err = bound(&text, &csv(&[0, 4], true))
+        .err()
+        .expect("not identified");
+    assert!(
+        err.contains("the `[count_model]` mean reads this block and a random effect"),
+        "{err}"
+    );
+    assert!(!err.contains("the `y` readout"), "{err}");
+    assert!(!err.contains("[binary_model]"), "{err}");
+    assert!(!err.contains("size `r`"), "{err}");
+
+    // The block and the η met in the size instead.
+    let size = text
+        .replace(
+            "log_lambda = TVL + PLACEBO + ETA_S + EMAX * TRT",
+            "log_lambda = TVL + EMAX * TRT",
+        )
+        .replace(
+            "r          = exp(EMAX)",
+            "r          = exp(PLACEBO + ETA_S)",
+        );
+    let err = bound(&size, &csv(&[0, 4], true))
+        .err()
+        .expect("not identified");
+    assert!(
+        err.contains("the `[count_model]` size `r` reads this block and a random effect"),
+        "{err}"
+    );
+    assert!(!err.contains("`[count_model]` mean"), "{err}");
 }

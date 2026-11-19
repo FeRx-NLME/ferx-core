@@ -162,7 +162,7 @@ generous enough that the good start is allowed to settle.
 `optimizer = auto` (the default) resolves to a concrete optimizer from the model, with no user input:
 
 - **`nlopt_lbfgs`** — when the **exact analytic gradient** is available (see [Analytic FOCE / FOCEI gradient](#analytic-foce-focei-gradient-analytical-pk-models)) and the model is **not** forced onto finite differences via `gradient = fd`.
-- **`bobyqa`** — otherwise: any model outside the analytic scope (for example an out-of-scope ODE/PD model or an SDE model), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
+- **`bobyqa`** — otherwise: a model the recorders cannot serve (a hand-built `CompiledModel` with no compiled individual-parameter program), or any fit with `gradient = fd`, where the outer loop runs on finite differences.
 
 One case overrides that rule, and mixture models have one exception of their own:
 
@@ -220,9 +220,8 @@ one the unforced arm would use. `ferx check` reports it too, against the
 The warning is silent whenever nothing was actually coupled — `optimizer`
 pinned; a model out of analytic scope anyway, where `auto` picks `bobyqa` either
 way; a model above `BOBYQA_MAX_DIM`, where `auto` takes `nlopt_lbfgs` on a
-finite-difference gradient regardless; an evaluation-only
-(`maxiter = 0`) run, which constructs no optimizer at all; and an SDE model,
-which the engine forces onto finite differences whatever you asked for.
+finite-difference gradient regardless; and an evaluation-only
+(`maxiter = 0`) run, which constructs no optimizer at all.
 
 The check reads the model, not the start, so it still fires on a
 [mixture](mixture.qmd) model whose classes start indistinguishable. There the
@@ -348,6 +347,41 @@ there when started near it. A start far from the expected estimates can reach a 
 any model. Compare fits from two or three starts, or use a [global pre-search](#global-pre-search),
 when the starts are uncertain.
 
+### A variance collapsed far below its start {#variance-collapsed-below-start}
+
+Because a variance is optimized as the log of its standard deviation, the gradient the optimizer
+sees for it is `2·ω² · ∂OFV/∂ω²`: the real slope scaled down by the variance itself. A quasi-Newton
+step built while other parameters are still far from their optimum can throw a variance down by
+several orders of magnitude, and where it lands the packed gradient is under tolerance even though
+the objective still falls as the variance rises. On a linear C-QTc mixed model
+([#3005](https://github.com/FeRx-NLME/ferx-core/issues/3005); 44 subjects, `ETA_SLOPE ~ 600`) the
+default L-BFGS took ω²_slope from 650 to 2.3 in four iterations and stopped `converged = true` at
+0.0062, 0.72 OFV above the optimum, with the C-QTc slope at 10.5 instead of 13.5 ms per µg/mL.
+NONMEM, lme4 and nlmixr2 reach ω²_slope = 652 from the same starts. ferx's objective was never the
+problem: scored at NONMEM's estimates it agrees to four decimals.
+
+Since #3005, after the outer optimizer of a FOCE-family fit stops (and after the
+[log-packing floor](#log-packing-floor) check above), ferx looks at every free variance below
+1/1000 of its initial value: Ω and κ diagonals (a block's Cholesky diagonal `L_ii`), σ, and
+`[mixture]` overrides, wherever it landed, on its internal guard included. It re-scores the stop and
+evaluates the objective once per such variance with that variance alone raised back to 1/1000 of its
+initial value, at the same one inner budget as the guard check below. Each variance that is lower
+there by more than `1e-6` is re-inflated to its initial value and the fit is resumed once.
+
+The outcomes are those of the guard check. A resumed run that ends lower is reported with an
+`optimizer_health` warning naming each variance, its value and both objectives; on the C-QTc model
+it reaches 3326.856470, NONMEM's 3326.8565. One that ends no lower leaves the first stop
+`converged = false` with a `convergence` warning, and so does one that collapses again with the
+objective still falling. A variance whose objective rises when it is raised is a genuine near-zero
+estimate and is left alone, bit for bit; only `n_iterations` counts the evaluations. A run that
+the [guard check](#variance-short-of-guard) below resumes is a full optimization too, so when it
+adopts one, this check reads that run again, for at most two rounds; a variance a last resumed
+run leaves collapsed and downhill is reported `converged = false` without a further restart.
+Every run either check resumes also goes through the [log-packing floor](#log-packing-floor)
+check again, since re-inflating a variance can put a THETA on that floor. The
+check costs nothing on a fit with no variance that far below its start. Starting a variance closer to its
+expected size, `optimizer = slsqp`, or `method = gn_hybrid` avoid the collapse in the first place.
+
 ### A variance stopped short of its guard {#variance-short-of-guard}
 
 A variance is optimized as the log of its standard deviation (for Ω and κ, of the Cholesky
@@ -361,7 +395,8 @@ at a point that is not a minimum. On a two-class `[mixture]` fixture
 way when the class labels were swapped. L-BFGS reached the guard on both.
 
 Since #2832, after the outer optimizer of a FOCE-family fit stops (and after the
-[log-packing floor](#log-packing-floor) check above), ferx looks at every free variance within 2
+[log-packing floor](#log-packing-floor) and [collapse](#variance-collapsed-below-start) checks
+above), ferx looks at every free variance within 2
 log units of its guard but not on it: Ω and κ diagonals, σ, and `[mixture]` overrides. A block's
 coordinate is its Cholesky diagonal `L_ii`, as for the [collapse hold](parameterization.qmd#held-parameters), so
 `Ω_ii` itself need not be small; for a block's later rows the warning reports `L_ii` as the
@@ -718,7 +753,7 @@ The gradient is computed by the **adjoint method**. At the EBE `η̂` the total 
 
 The predictions are recorded once per subject, with η-tangents, and one reverse sweep of `Ψ` gives the derivative for every θ, Ω, σ and ρ at once. The cost therefore does **not** grow with the number of θ or individual parameters, and no per-model width or slot caps apply. The recorder is the production integrator itself, so the gradient is exact for the trajectory the objective predicts. It serves the closed-form 1-/2-/3-compartment models on every dose path (lag, steady state, infusion, modeled duration, time-varying covariates, `TIME`, `init(...)`, scaling, LTBS), compartment-free models, user `[odes]` models on both the explicit and the Rosenbrock integrators, IOV, FREM, M3 BLOQ, IIV on the residual, correlated residuals, custom residual magnitudes, mixtures and covariate networks. TTE, binary and CTMM endpoints enter the same `Ψ`, their data term folded into the subject objective as production scores it. A subject no recorder serves (SDE, or one of the [known FD fallbacks](foce.qmd#known-fd-fallbacks)) takes its own finite-difference salvage, and the fit reports it (see [the outer-loop route](foce.qmd#outer-loop-fd-fallback)).
 
-The same identity, one order up, gives the **covariance step's R-matrix**. Along the mode's tangent directions `u = (e, dη̂/dx)`, the profile Hessian is `Uᵀ∇²Ψ U`, assembled by reverse over forward through the same recorder and kernel: a forward first-order pass along eight tangent directions whose components are recorded on the reverse tape, then one reverse sweep per direction, gives eight full Hessian columns. It is exact for every estimator above, including Laplace's exact anchor and FOCE with a prediction-dependent residual variance, which used to take the reconverged finite-difference stencil.
+The same identity, one order up, gives the **covariance step's R-matrix**. Along the mode's tangent directions `u = (e, dη̂/dx)`, the profile Hessian is `Uᵀ∇²Ψ U`, assembled by forward over reverse through the same recorder: each prediction plan runs once per subject along its input axes, the likelihood is differentiated through its row aggregates, and every direction's Hessian column is assembled from those ([#2980](https://github.com/FeRx-NLME/ferx-core/issues/2980); see [the R-matrix](foce.qmd#sensitivity-assembly)). It is exact for every estimator above, including Laplace's exact anchor and FOCE with a prediction-dependent residual variance, which used to take the reconverged finite-difference stencil.
 
 Because the gradient is exact and bias-free, `lbfgs` / `nlopt_lbfgs` are strong choices: each evaluation is one recording and two sweeps per subject rather than an `O(n)` finite-difference sweep, and the optimizer reaches the true optimum. Wall time against the derivative-free `bobyqa` is model-dependent.
 

@@ -69,6 +69,8 @@ fn run_single(method: EstimationMethod, optimizer: Optimizer) -> FitResult {
     opts.outer_maxiter = 800;
     opts.run_covariance_step = false;
     opts.verbose = false;
+    // Compared with FOCEI objectives below, so SAEM reports its FOCE/Laplace value.
+    opts.saem_ofv = ferx_core::types::SaemOfv::Focei;
     fit(&model, &population, &model.default_params, &opts).expect("IOV fit must succeed")
 }
 

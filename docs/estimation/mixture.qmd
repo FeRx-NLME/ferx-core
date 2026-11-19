@@ -178,8 +178,8 @@ assignment is identical for every subject.
 ### Standard errors
 
 A mixture fit runs the covariance step like any other fit: the Hessian is built on the
-**mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix under
-FOCE/FOCEI, the finite-difference stencil under Laplace/AGQ — and
+**mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix (a
+mixture under Laplace/AGQ is rejected, `E_MIXTURE_METHOD`) — and
 the standard errors are $\sqrt{\operatorname{diag}(R^{-1})}$. The mixing-fraction
 SE is reported on the scale the mixing form is written in — the coefficients of a
 `logit(k) = …` form carry a logit-scale SE, a `p(k) = …` probability an SE
@@ -522,9 +522,14 @@ objective-evaluation pass, Ω/Σ FIXed:
 One SAEM run is one chain's draw, so ferx is anchored on the mean over ten
 seeds, compared with NONMEM's exact-likelihood IMPMAP estimate. The mean agrees
 to 0.6 % on `V` and 0.15 % on the clearances, and the 40-seed spread is 0.7 %
-(`TVCL1`), 0.45 % (`TVCL2`) and 0.9 % (`V`) per run. ferx reports the FOCEI-type
-mixture marginal as the SAEM OFV: 301.90 against NONMEM's FOCEI minimum of
-301.58, which it sits above because the estimate is the exact-likelihood MLE.
+(`TVCL1`), 0.45 % (`TVCL2`) and 0.9 % (`V`) per run. With `saem_ofv = focei` ferx reports
+the FOCEI-type mixture marginal as the SAEM OFV: 301.90 against NONMEM's FOCEI minimum of
+301.58, which it sits above because the estimate is the exact-likelihood MLE. A mixture has no NONMEM-anchored SAEM objective, so by default
+(`saem_ofv = saem` falls back to `imp` here with a warning, as does an explicit `saem_ofv = imp` without one) the SAEM `ofv` is the class-marginal importance-sampled
+`−2 log L`, the number NONMEM's `METHOD=IMP EONLY=1` pass reports (300.87 on this model;
+ferx's chained `[saem, imp]` evaluation is pinned to it in
+`tests/mixture_nonmem.rs::imp_mixture_marginal_matches_nonmem`), and the FOCEI value is kept
+as `saem_objective.foce_ofv`.
 Covariate-dependent mixing under SAEM is exercised end-to-end in
 `tests/mixture_nonmem.rs`.
 

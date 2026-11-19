@@ -475,3 +475,113 @@ fn predict_categorical_on_the_routed_population_returns_one_row_per_record() {
     assert!(total_events(&r) > 0, "the fixture carries binary rows");
     assert_eq!(rows.len(), total_events(&r));
 }
+
+/// A record of the wrong variant on an endpoint's CMT is refused (#2877 review round 6):
+/// every likelihood path scores only its own variant, so a hand-built population with
+/// `DiscreteState` records on a `[count_model]` CMT — or `Count` records on a
+/// `[binary_model]` one — used to pass routing (the CMT was right) and `fit()` returned an
+/// objective with that endpoint's term missing. Both directions, each message naming its
+/// own endpoint and the variant it needs, and the correctly routed population of each
+/// passes.
+///
+/// Mutations: drop the kind check and both `fit()`s succeed; give every endpoint the
+/// `DiscreteState` expectation and the count message names the wrong variant; count only the
+/// records an endpoint scores as routed and `E_ENDPOINT_NO_RECORDS` fires beside it.
+#[test]
+fn a_record_of_the_wrong_kind_on_an_endpoint_cmt_is_refused() {
+    use crate::types::ObsRecord;
+    const COUNT_MODEL: &str = "nonmem_anchor/count_pois.ferx";
+    const COUNT_DATA: &str = "nonmem_anchor/count_pois.csv";
+
+    // Count endpoint fed discrete-state records.
+    let m = model(COUNT_MODEL);
+    let ok = routed(&m, COUNT_DATA);
+    assert!(
+        !codes(&check_model_data(&m, &ok))
+            .iter()
+            .any(|c| c.starts_with("E_ENDPOINT_")),
+        "routed count population must pass"
+    );
+    let mut bad = ok.clone();
+    let mut n = 0;
+    for s in &mut bad.subjects {
+        for r in &mut s.obs_records {
+            if let ObsRecord::Count {
+                time,
+                raw_time,
+                count,
+                cmt,
+            } = *r
+            {
+                *r = ObsRecord::DiscreteState {
+                    time,
+                    raw_time,
+                    state: count as usize,
+                    cmt,
+                };
+                n += 1;
+            }
+        }
+    }
+    assert!(n > 0, "the fixture carries count records");
+    let diags = check_model_data(&m, &bad);
+    let msg = message_of(&diags, "E_ENDPOINT_RECORD_KIND");
+    assert!(
+        msg.contains("CMT 1 is declared as a count (`[count_model]`) endpoint"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(&format!(
+            "{n} record(s) on it are `ObsRecord::DiscreteState`"
+        )),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("A count (`[count_model]`) record is `ObsRecord::Count`"),
+        "{msg}"
+    );
+    assert!(msg.contains("first: subject 1"), "{msg}");
+    assert!(msg.contains("`read_population_for(&model, ...)`"), "{msg}");
+    assert!(
+        !codes(&diags).contains(&"E_ENDPOINT_NO_RECORDS"),
+        "the more precise cause only: {:?}",
+        codes(&diags)
+    );
+    let err = fit(&m, &bad, &m.default_params, &FitOptions::default())
+        .expect_err("fit() must refuse records its count endpoint does not score")
+        .to_string();
+    assert!(err.contains("E_ENDPOINT_RECORD_KIND"), "fit() error: {err}");
+
+    // Binary endpoint fed count records.
+    let m = model(BINARY_MODEL);
+    let mut bad = routed(&m, BINARY_DATA);
+    for s in &mut bad.subjects {
+        for r in &mut s.obs_records {
+            if let ObsRecord::DiscreteState {
+                time,
+                raw_time,
+                state,
+                cmt,
+            } = *r
+            {
+                *r = ObsRecord::Count {
+                    time,
+                    raw_time,
+                    count: state as u32,
+                    cmt,
+                };
+            }
+        }
+    }
+    let msg = message_of(&check_model_data(&m, &bad), "E_ENDPOINT_RECORD_KIND");
+    assert!(msg.contains("binary (`[binary_model]`) endpoint"), "{msg}");
+    assert!(msg.contains("are `ObsRecord::Count`"), "{msg}");
+    assert!(
+        msg.contains("record is `ObsRecord::DiscreteState`") && !msg.contains("[count_model]"),
+        "{msg}"
+    );
+    let err = fit(&m, &bad, &m.default_params, &FitOptions::default())
+        .expect_err("fit() must refuse records its binary endpoint does not score")
+        .to_string();
+    assert!(err.contains("E_ENDPOINT_RECORD_KIND"), "fit() error: {err}");
+}

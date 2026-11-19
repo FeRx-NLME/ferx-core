@@ -943,12 +943,22 @@ pub(crate) fn compute_subject_results(
                 // EBE η (§8.8.5). Empty for every model without a binary endpoint, so
                 // existing output is untouched.
                 #[cfg(feature = "survival")]
-                discrete_rows: crate::categorical::binary_diagnostics(
-                    model,
-                    subject,
-                    &params.theta,
-                    eta.as_slice(),
-                ),
+                discrete_rows: {
+                    let mut rows = crate::categorical::binary_diagnostics(
+                        model,
+                        subject,
+                        &params.theta,
+                        eta.as_slice(),
+                    );
+                    // Count records (#2877): mean at η = 0 / EBE and the Pearson residual.
+                    rows.extend(crate::categorical::count_diagnostics(
+                        model,
+                        subject,
+                        &params.theta,
+                        eta.as_slice(),
+                    ));
+                    rows
+                },
                 #[cfg(not(feature = "survival"))]
                 discrete_rows: Vec::new(),
                 // TTE per-record residuals at the same EBE, off the curves the OFV
