@@ -100,6 +100,14 @@ time is salvaged on its own by that term's reconverged difference, as for FOCE/F
 A mixture of identical classes reproduces the single-population Laplace/AGQ fit.
 FOCE and FOCEI fits are unchanged.
 
+`optimizer = auto` resolves as for FOCE/FOCEI: a mixture runs BOBYQA whatever the method
+(a single-population Laplace fit resolves `auto` to NLopt L-BFGS), because L-BFGS from close
+class starts can collapse the classes (see the class-collapse warning below). An explicit
+`optimizer = nlopt_lbfgs` is honoured. `agq_eval_only = true` is refused on a mixture
+(`E_MIXTURE_METHOD`): the evaluation-only quadrature stage scores a single population and
+would replace the mixture objective with a one-class value; an estimating `laplace` stage
+already reports the mixture objective.
+
 ## Output
 
 For a mixture fit, `sdtab` gains two per-subject diagnostics, matching the

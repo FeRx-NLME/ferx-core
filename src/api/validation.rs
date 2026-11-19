@@ -4993,6 +4993,20 @@ pub(crate) fn check_mixture_options(
             ));
         }
     }
+    // An `agq_eval_only` Laplace stage re-scores the OFV with the single-population
+    // quadrature marginal (`agq_marginal_at`), which has no class mixing: it would replace a
+    // mixture fit's published OFV with a one-class value. Refused, as before #3025, rather
+    // than silently publishing the wrong objective; an estimating Laplace stage scores the
+    // mixture (`mixture_ofv`) and stays accepted.
+    if options.agq_eval_only && chain.contains(&EstimationMethod::Laplace) {
+        refuse(
+            "`agq_eval_only = true` is not supported for mixture models: the evaluation-only \
+             quadrature stage scores a single population and would replace the mixture \
+             objective with a one-class value. Drop `agq_eval_only` (an estimating \
+             `method = laplace` stage already reports the mixture objective) (#3025)."
+                .to_string(),
+        );
+    }
     if chain.contains(&EstimationMethod::Bayes) {
         if let Some(mp) = params.mixture.as_ref() {
             if !mp.omega_override_addr.is_empty() || !mp.sigma_override_addr.is_empty() {

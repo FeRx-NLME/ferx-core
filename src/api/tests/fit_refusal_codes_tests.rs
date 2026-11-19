@@ -143,6 +143,36 @@ fn mixture_refusals_are_coded() {
         );
     }
 
+    // `agq_eval_only` would overwrite the mixture OFV with a one-class quadrature value.
+    // Refused per stage: a chain that merely contains Laplace is refused too, and the
+    // estimating Laplace stage without it stays accepted (asserted above).
+    for (label, opts) in [
+        (
+            "laplace + agq_eval_only",
+            FitOptions {
+                method: EstimationMethod::Laplace,
+                agq_eval_only: true,
+                ..FitOptions::default()
+            },
+        ),
+        (
+            "[focei, laplace] + agq_eval_only",
+            FitOptions {
+                methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+                agq_eval_only: true,
+                ..FitOptions::default()
+            },
+        ),
+    ] {
+        let err = fit_refusal(&model, &pop, &model.default_params, &opts);
+        assert_eq!(err.code(), Some("E_MIXTURE_METHOD"), "{label}: {err}");
+        assert_eq!(err.block(), Some("fit_options"), "{label}");
+        assert!(
+            err.to_string().contains("agq_eval_only") && err.to_string().contains("one-class"),
+            "{label}: {err}"
+        );
+    }
+
     let vi = FitOptions {
         method: EstimationMethod::Vi,
         ..FitOptions::default()
@@ -921,5 +951,43 @@ fn run_model_simulate_survival_design_refusals_are_coded() {
             "[simulation] has no `times`, but the model has a [binary_model] endpoint."
         ),
         "{err}"
+    );
+}
+
+/// #3025 review item 3: `optimizer = auto` on a Laplace stage is NLopt L-BFGS for a single
+/// population but must resolve exactly as a FOCE/FOCEI mixture does (BOBYQA) for a
+/// mixture, while an explicit `nlopt_lbfgs` is honoured. Keyed on the model, not the method.
+#[test]
+fn laplace_mixture_auto_resolves_to_bobyqa_and_explicit_lbfgs_is_honoured() {
+    use crate::api::fit::stage_optimizer_request;
+    use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+    use crate::types::Optimizer;
+    let mix = parse_model_string(MIXTURE).expect("parse");
+    let single = parse_model_string(ONE_CPT_IV).expect("parse");
+    let resolve = |m: &CompiledModel, method, req| {
+        let request = stage_optimizer_request(m, method, req);
+        resolve_outer_optimizer(request, m, m.mixture.is_some(), true).0
+    };
+    // The single-population control: the L-BFGS promotion still happens, so the
+    // mixture exemption below is a real straddle of the model predicate.
+    assert_eq!(
+        resolve(&single, EstimationMethod::Laplace, Optimizer::Auto),
+        Optimizer::NloptLbfgs
+    );
+    for method in [
+        EstimationMethod::Laplace,
+        EstimationMethod::Foce,
+        EstimationMethod::FoceI,
+    ] {
+        assert_eq!(
+            resolve(&mix, method, Optimizer::Auto),
+            Optimizer::Bobyqa,
+            "{method:?}: a mixture under `auto` is BOBYQA whatever the method"
+        );
+    }
+    assert_eq!(
+        resolve(&mix, EstimationMethod::Laplace, Optimizer::NloptLbfgs),
+        Optimizer::NloptLbfgs,
+        "an explicit nlopt_lbfgs is honoured"
     );
 }
