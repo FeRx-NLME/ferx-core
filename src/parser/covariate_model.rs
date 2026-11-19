@@ -604,7 +604,8 @@ fn parse_theta_clause(
         let nums: Vec<f64> = args
             .split(',')
             .map(|t| {
-                t.trim().parse::<f64>().map_err(|_| {
+                // `NaN` is refused: it marks the bounds `NAME(init)` leaves to the form.
+                t.trim().parse::<f64>().ok().filter(|v| !v.is_nan()).ok_or_else(|| {
                     format!("[covariate_model]: `{}` is not a number in `{part}`", t.trim())
                 })
             })

@@ -773,6 +773,10 @@ fn a_malformed_theta_clause_is_an_error() {
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => T(0.75, low, 10)");
     assert!(e.contains("`low` is not a number"), "{e}");
 
+    // `NaN` would read as `NAME(init)`'s "no bounds stated" (#2864).
+    let e = err("  WT continuous", "  CL ~ WT power(center = 70) => T(1, nan, nan)");
+    assert!(e.contains("`nan` is not a number"), "{e}");
+
     let e = err("  WT continuous", "  CL ~ WT power(center = 70) => T(0.75, -10)");
     assert!(e.contains("needs (init) or (init, lower, upper)"), "{e}");
 
