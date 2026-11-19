@@ -719,6 +719,7 @@ pub(crate) fn assemble_score_cross_product(
     bounds: &PackedBounds,
     options: &FitOptions,
     free_idx: &[usize],
+    schedules: Option<&crate::estimation::mixture::ScheduleCache>,
 ) -> Result<DMatrix<f64>, String> {
     let n_free = free_idx.len();
     let n_subj = population.subjects.len();
@@ -748,7 +749,7 @@ pub(crate) fn assemble_score_cross_product(
     // `kappas` (the MIXEST class's) are not read for it.
     let mixture = model.mixture.as_ref().map(|_| {
         crate::estimation::mixture::MixtureScoreContext::new(
-            model, population, template, x_hat, options,
+            model, population, template, x_hat, options, schedules,
         )
     });
 
@@ -2368,6 +2369,12 @@ fn covariance_step(
     // objective and skip the single-population reconvergence / analytic R-matrix
     // (both single-population-only). Gated on `template.mixture`.
     let is_mixture = template.mixture.is_some();
+    // One schedule cache for the whole step: every mixture evaluation below (the stencil, the
+    // score context, the exact R) re-solves the same subjects' schedules, which depend only on
+    // the model and the data.
+    let mixture_schedules = is_mixture
+        .then(|| crate::estimation::mixture::hoisted_schedules(model, population, options))
+        .flatten();
     // #1352: the covariate-NN regularizer, when the estimator that produced `x_hat` minimised
     // it (`None` for an unregularized fit, and for SAEM / IMP / IMPMAP / Bayes, which never
     // apply the penalty, so their SEs are the curvature of what they fitted).
@@ -2451,13 +2458,15 @@ fn covariance_step(
     let cov_ofv = |xv: &[f64]| -> f64 {
         if is_mixture {
             let params = unpack_params(xv, template);
-            return crate::estimation::mixture::mixture_ofv(
+            return crate::estimation::mixture::mixture_ofv_cached(
                 model,
                 population,
                 &params,
                 mixture_cov_options,
                 None,
+                mixture_schedules.as_deref(),
             )
+            .0
             .ofv;
         }
         subset_cov_ofv(xv, population, &warm, false)
@@ -2574,7 +2583,16 @@ fn covariance_step(
     // whose placeholder rows are then never trusted.
     let score_cross_product = || {
         let s = assemble_score_cross_product(
-            x_hat, template, model, population, eta_hats, kappas, &bounds, options, &free_idx,
+            x_hat,
+            template,
+            model,
+            population,
+            eta_hats,
+            kappas,
+            &bounds,
+            options,
+            &free_idx,
+            mixture_schedules.as_deref(),
         );
         (!crate::cancel::is_cancelled(&options.cancel)).then_some(s)
     };
@@ -2652,7 +2670,12 @@ fn covariance_step(
             && !crate::types::GradientMethod::forced_fd(model)
         {
             match crate::estimation::mixture::mixture_cov_hessian(
-                model, population, template, x_hat, options,
+                model,
+                population,
+                template,
+                x_hat,
+                options,
+                mixture_schedules.as_deref(),
             ) {
                 Some(h) => AnalyticCovAssembly::Full(h),
                 None => AnalyticCovAssembly::Unavailable,
@@ -2834,13 +2857,15 @@ fn covariance_step(
             fd_evals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             match scope {
                 FdScope::Whole if is_mixture => {
-                    let m = crate::estimation::mixture::mixture_ofv(
+                    let m = crate::estimation::mixture::mixture_ofv_cached(
                         model,
                         population,
                         &unpack_params(xv, template),
                         &tight_mixture_options,
                         None,
-                    );
+                        mixture_schedules.as_deref(),
+                    )
+                    .0;
                     crate::estimation::fd_resolution::inner_resolved(&m.ebe_stats).then_some(m.ofv)
                 }
                 FdScope::Whole => subset_tight_ofv(xv, population, &warm),
@@ -6802,7 +6827,7 @@ mod tests {
         let free_idx: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
         assert_eq!(free_idx.len(), 1, "fixture: ω² alone is free");
         let s = super::assemble_score_cross_product(
-            &x, &p, &model, &pop, &etas, &kappas, &bounds, &opts, &free_idx,
+            &x, &p, &model, &pop, &etas, &kappas, &bounds, &opts, &free_idx, None,
         )
         .expect("S");
         let want = super::embed_free(
@@ -7621,7 +7646,7 @@ mod tests {
         let rec = on_one_thread(|| {
             record_inner_solves(|| {
                 super::assemble_score_cross_product(
-                    &x, p, &model, &pop, &etas, &kappas, &bounds, &opts, &free,
+                    &x, p, &model, &pop, &etas, &kappas, &bounds, &opts, &free, None,
                 )
                 .expect("the S matrix")
             })

@@ -823,6 +823,7 @@ fn test_assemble_score_cross_product_cancelled() {
         &bounds,
         &options,
         &free_idx,
+        None,
     )
     .expect("cancelled score assembly returns a discarded zero matrix");
     assert!(
@@ -6485,6 +6486,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
         &x,
         template,
         &options,
+        None,
     );
 
     for (k, (got, want)) in ours.iter().zip(&independent).enumerate() {
@@ -10174,7 +10176,8 @@ fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished
             PrevEtas::Solved,
         );
         let gradients = |strict| {
-            per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict).is_some()
+            per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict, None)
+                .is_some()
         };
         (
             stats.n_unconverged == 0 && stats.n_start_rejected == 0,
@@ -11345,6 +11348,7 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
         etas: vec![DVector::from_element(2, v); 2],
         h_mats: vec![DMatrix::identity(2, 2); 2],
         kappas: vec![Vec::new(); 2],
+        class_etas: Vec::new(),
         scores: None,
     };
     let mut held = Some(warm(1.0));
@@ -15088,8 +15092,10 @@ fn the_fit_population_gradients_unpack_the_packed_point_once() {
         "population_gradient_sens_mixed: one unpack, not one per subject"
     );
     let n = watch_packed_points(params, &|| {
-        per_subject_outer_gradients_checked(&model, &pop, params, &x, &ehs, &kappas, &opts, true)
-            .expect("every subject served");
+        per_subject_outer_gradients_checked(
+            &model, &pop, params, &x, &ehs, &kappas, &opts, true, None,
+        )
+        .expect("every subject served");
     });
     assert_eq!(n, 1, "per_subject_outer_gradients_checked: one unpack");
     // IOV loop.
@@ -19003,6 +19009,12 @@ fn quadrature_remaining_gain_of_a_laplace_mixture_is_zero_at_its_optimum() {
         let mut params = model.default_params.clone();
         params.theta = theta.to_vec();
         let x = crate::estimation::parameterization::pack_params(&params);
+        // The incumbent's class modes at `x` and the fit's schedule cache: the warm solve.
+        let class_etas =
+            crate::estimation::mixture::mixture_ofv(&model, &pop, &params, &opts, None)
+                .etas_by_class;
+        let schedules = crate::estimation::mixture::hoisted_schedules(&model, &pop, &opts)
+            .expect("a quadrature objective");
         quadrature_predicted_remaining_gain(
             &model,
             &pop,
@@ -19011,6 +19023,8 @@ fn quadrature_remaining_gain_of_a_laplace_mixture_is_zero_at_its_optimum() {
             &[],
             &[],
             None,
+            &class_etas,
+            &schedules,
             &compute_bounds(&params),
             &opts,
             &crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts),

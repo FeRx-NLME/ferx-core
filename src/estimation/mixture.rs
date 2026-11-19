@@ -25,7 +25,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::covariance::ExactDecline;
 use crate::estimation::inner_optimizer::{
-    build_schedule_cache, find_ebe_cached, find_ebe_for_stage_with_prev, InnerLoopStats, PrevEtas,
+    build_schedule_cache, find_ebe_cached, find_ebe_for_stage_with_prev, EbeResult, InnerLoopStats,
+    PrevEtas,
 };
 use crate::estimation::parameterization::{
     fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments, theta_packs_log,
@@ -369,9 +370,21 @@ pub(crate) fn mixture_ofv_cached(
     params: &ModelParameters,
     options: &FitOptions,
     warm: Option<&[Vec<DVector<f64>>]>,
-    schedules: &ScheduleCache,
+    schedules: Option<&ScheduleCache>,
 ) -> (MixtureEval, MixtureClassModes) {
-    mixture_ofv_impl(model, population, params, options, warm, Some(schedules))
+    mixture_ofv_impl(model, population, params, options, warm, schedules)
+}
+
+/// The schedule cache a run of mixture evaluations shares: built once here when the objective is
+/// the quadrature (the only one that reads it), `None` otherwise.
+pub(crate) fn hoisted_schedules(
+    model: &CompiledModel,
+    population: &Population,
+    options: &FitOptions,
+) -> Option<Vec<Option<crate::pk::event_driven::EventSchedule>>> {
+    options
+        .agq_nodes()
+        .map(|_| build_schedule_cache(model, population))
 }
 
 fn mixture_ofv_impl(
@@ -425,15 +438,13 @@ fn mixture_ofv_impl(
     });
 
     for cls in 0..k {
-        // MIXNUM = cls+1 for the whole class solve (serial → thread-local safe).
-        let _guard = MixtureClassGuard::enter(cls + 1);
         let cp = class_params(params, cls);
-        let mut etas_c = Vec::with_capacity(n);
-        let mut hmats_c = Vec::with_capacity(n);
-        let mut kappas_c = Vec::with_capacity(n);
-        for (i, subject) in population.subjects.iter().enumerate() {
-            #[cfg(test)]
-            CLASS_SOLVES.with(|c| c.set(c.get() + 1));
+        #[cfg(test)]
+        CLASS_SOLVES.with(|c| c.set(c.get() + n));
+        // One subject's solve in this class and its class objective, under `MIXNUM = cls + 1`
+        // on the calling thread.
+        let solve = |i: usize| -> (f64, EbeResult) {
+            let subject = &population.subjects[i];
             let warm_i = warm
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
@@ -466,7 +477,6 @@ fn mixture_ofv_impl(
                     PrevEtas::Solved,
                 )
             };
-            fd_h_redone[cls][i] = ebe.fd_h_redone;
             // Inter-occasion variability (#985): `find_ebe` already routes to the
             // IOV inner solve when `n_kappa > 0` (each class carries the shared base
             // `omega_iov`, since `class_params` only swaps Ω/Σ), so `ebe.kappas` are
@@ -478,7 +488,7 @@ fn mixture_ofv_impl(
             // present-`n_kappa`-but-absent-`omega_iov` model. It self-reduces to
             // `foce_subject_nll` when `omega_iov` is absent, keeping a non-IOV mixture
             // on the byte-identical legacy call.
-            nll[cls][i] = if let Some((n_nodes, anchor, _, schedules)) = &quad {
+            let nll = if let Some((n_nodes, anchor, _, schedules)) = &quad {
                 let work = (ebe.terminal_hessian.take(), ebe.nll);
                 crate::estimation::agq::agq_subject_term_with_work(
                     model,
@@ -518,6 +528,26 @@ fn mixture_ofv_impl(
                     interaction,
                 )
             };
+            (nll, ebe)
+        };
+        // The quadrature class term is the single population's, parallel over subjects; the
+        // results come back in subject order, so everything downstream reduces as the serial
+        // loop did. FOCE / FOCEI keep the historical serial solve (one guard for the class).
+        let solved: Vec<(f64, EbeResult)> = if quad.is_some() {
+            crate::par::map(n, |i| {
+                let _guard = MixtureClassGuard::enter(cls + 1);
+                solve(i)
+            })
+        } else {
+            let _guard = MixtureClassGuard::enter(cls + 1);
+            (0..n).map(solve).collect()
+        };
+        let mut etas_c = Vec::with_capacity(n);
+        let mut hmats_c = Vec::with_capacity(n);
+        let mut kappas_c = Vec::with_capacity(n);
+        for (i, (nll_i, ebe)) in solved.into_iter().enumerate() {
+            nll[cls][i] = nll_i;
+            fd_h_redone[cls][i] = ebe.fd_h_redone;
             converged[cls][i] = ebe.converged;
             fallback[cls][i] = ebe.used_fallback;
             nm_polished[cls][i] = ebe.nm_polished;
@@ -744,6 +774,29 @@ pub(crate) fn mixture_gradient_salvaged(
         }
     }
     grad
+}
+
+/// The outer gradient of the mixture objective at `x`: the exact class-term sum
+/// ([`mixture_gradient_salvaged`]), or — under the `gradient = fd` opt-out
+/// ([`crate::types::GradientMethod::forced_fd`]) — the central difference of the mixture
+/// objective itself ([`mixture_gradient_fd`]), the one route this opt-out takes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mixture_outer_gradient(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    options: &FitOptions,
+    eval: &MixtureEval,
+    modes: Option<&MixtureClassModes>,
+    declines: &crate::estimation::outer_optimizer::OuterFdDeclineLog,
+    schedules: Option<&ScheduleCache>,
+) -> Vec<f64> {
+    if crate::types::GradientMethod::forced_fd(model) {
+        return mixture_gradient_fd(model, population, x, init_params, options, schedules);
+    }
+    let params = unpack_params(x, init_params);
+    mixture_gradient_salvaged(model, population, &params, options, eval, modes, declines)
 }
 
 /// Whether the mixture gradient needs every class's modes ([`MixtureClassModes`]) — an IOV
@@ -1030,13 +1083,15 @@ fn class_route(cls: usize, params: &ModelParameters, mp: &MixtureParams) -> Vec<
 /// [`mixture_candidate_hessian`] shares — takes the derivatives at `x_hat` along every axis at
 /// those modes, converged or not: the covariance step has no iterate to refuse, and the R at a
 /// cold mode is what it always assembled. The point-specific not-resolved gate is
-/// [`mixture_candidate_hessian`]'s own.
+/// [`mixture_candidate_hessian`]'s own, and the scope gates (`analytic_cov_hessian`, a recorder
+/// for the model, `gradient = fd`) are `covariance_step`'s, which asks them before calling this.
 pub(crate) fn mixture_cov_hessian(
     model: &CompiledModel,
     population: &Population,
     template: &ModelParameters,
     x_hat: &[f64],
     options: &FitOptions,
+    schedules: Option<&ScheduleCache>,
 ) -> Option<DMatrix<f64>> {
     let params = unpack_params(x_hat, template);
     let n = packed_segments(&params).total();
@@ -1044,7 +1099,8 @@ pub(crate) fn mixture_cov_hessian(
         return None;
     }
     let score_options = cov_score_options(model, options);
-    let (eval, modes) = mixture_ofv_with_modes(model, population, &params, &score_options, None);
+    let (eval, modes) =
+        mixture_ofv_cached(model, population, &params, &score_options, None, schedules);
     let axes: Vec<usize> = (0..n).collect();
     mixture_derivatives_at_modes(model, population, &params, &eval, &modes, options, &axes)
         .ok()
@@ -1077,7 +1133,7 @@ fn cov_score_options(model: &CompiledModel, options: &FitOptions) -> FitOptions 
     not(test),
     expect(
         dead_code,
-        reason = "the trust region's mixture branch (#2976 follow-up, #3025) is its production caller"
+        reason = "will be called by the trust region's mixture branch (#3025)"
     )
 )]
 pub(crate) fn mixture_candidate_hessian(
@@ -1088,7 +1144,13 @@ pub(crate) fn mixture_candidate_hessian(
     warm: &[Vec<DVector<f64>>],
     options: &FitOptions,
     axes: &[usize],
+    schedules: Option<&ScheduleCache>,
 ) -> Result<(Vec<f64>, DMatrix<f64>), ExactDecline> {
+    // A model no recorder serves is declined by the assembly itself (every subject's adjoint
+    // pass), so the scope gate is only the two opt-outs, which that pass does not read.
+    if !options.analytic_cov_hessian || crate::types::GradientMethod::forced_fd(model) {
+        return Err(ExactDecline::OutOfScope);
+    }
     let params = unpack_params(x, template);
     let n_subjects = population.subjects.len();
     let k_classes = params.mixture.as_ref().map(|m| m.omega.len());
@@ -1103,8 +1165,14 @@ pub(crate) fn mixture_candidate_hessian(
         inner_restarts: 0,
         ..cov_score_options(model, options)
     };
-    let (eval, modes) =
-        mixture_ofv_with_modes(model, population, &params, &score_options, Some(warm));
+    let (eval, modes) = mixture_ofv_cached(
+        model,
+        population,
+        &params,
+        &score_options,
+        Some(warm),
+        schedules,
+    );
     if crate::cancel::is_cancelled(&options.cancel) || eval.ebe_stats.n_unconverged > 0 {
         return Err(ExactDecline::NotResolved);
     }
@@ -1138,12 +1206,6 @@ fn mixture_derivatives_at_modes(
     use crate::sens::ode_provider::adjoint::{
         subject_adjoint_cov_block_with_gradient_at, PackedPoint,
     };
-    if !options.analytic_cov_hessian
-        || !crate::sens::ode_provider::adjoint::recorder_in_scope(model)
-        || crate::types::GradientMethod::forced_fd(model)
-    {
-        return Err(ExactDecline::OutOfScope);
-    }
     let spec = model.mixture.as_ref().ok_or(ExactDecline::OutOfScope)?;
     let mp = params.mixture.as_ref().ok_or(ExactDecline::OutOfScope)?;
     let objective = crate::estimation::covariance::cov_objective(options);
@@ -1313,11 +1375,12 @@ impl MixtureScoreContext {
         template: &ModelParameters,
         x_hat: &[f64],
         options: &FitOptions,
+        schedules: Option<&ScheduleCache>,
     ) -> Self {
         let params = unpack_params(x_hat, template);
         let score_options = cov_score_options(model, options);
         let (eval, modes) =
-            mixture_ofv_with_modes(model, population, &params, &score_options, None);
+            mixture_ofv_cached(model, population, &params, &score_options, None, schedules);
         let mp = params
             .mixture
             .as_ref()
@@ -1490,13 +1553,13 @@ pub(crate) struct ClassScorer<'a> {
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
-#[cfg(test)]
 pub(crate) fn mixture_gradient_fd(
     model: &CompiledModel,
     population: &Population,
     x: &[f64],
     init_params: &ModelParameters,
     options: &FitOptions,
+    schedules: Option<&ScheduleCache>,
 ) -> Vec<f64> {
     let floor = crate::estimation::parameterization::fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
@@ -1516,8 +1579,12 @@ pub(crate) fn mixture_gradient_fd(
         let denom = xp[i] - xm[i];
         let pp = crate::estimation::parameterization::unpack_params(&xp, init_params);
         let pm = crate::estimation::parameterization::unpack_params(&xm, init_params);
-        let fp = mixture_ofv(model, population, &pp, options, None).ofv;
-        let fm = mixture_ofv(model, population, &pm, options, None).ofv;
+        let fp = mixture_ofv_cached(model, population, &pp, options, None, schedules)
+            .0
+            .ofv;
+        let fm = mixture_ofv_cached(model, population, &pm, options, None, schedules)
+            .0
+            .ofv;
         g[i] = (fp - fm) / denom;
     }
     g
@@ -2280,7 +2347,7 @@ mod tests {
         use crate::estimation::parameterization::{pack_params, packed_len};
         assert_eq!(g.len(), packed_len(&model.default_params));
         let x = pack_params(&model.default_params);
-        let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts, None);
         assert_eq!(fd.len(), g.len());
         let mut worst = 0.0f64;
         for (e, f) in g.iter().zip(&fd) {
@@ -2808,7 +2875,8 @@ mod tests {
         let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
         let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
             .expect("the p(k) form is in analytic scope");
-        let fd = super::mixture_gradient_fd(&model, &pop, &pack_params(params), params, &opts);
+        let fd =
+            super::mixture_gradient_fd(&model, &pop, &pack_params(params), params, &opts, None);
         let i_p1 = model
             .theta_names
             .iter()
@@ -2923,7 +2991,7 @@ mod tests {
             };
             let exact = exact_mixture_grad(&model, &pop, params, &opts);
             let x = pack_params(params);
-            let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+            let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts, None);
             assert_eq!(exact.len(), fd.len());
             for (k, (e, f)) in exact.iter().zip(&fd).enumerate() {
                 assert!(e.is_finite() && f.is_finite(), "[{k}]");
@@ -2999,7 +3067,7 @@ mod tests {
             let x = pack_params(params);
             let n = x.len();
             for (kind, opts) in objective_cases() {
-                let h = super::mixture_cov_hessian(&model, &pop, params, &x, &opts)
+                let h = super::mixture_cov_hessian(&model, &pop, params, &x, &opts, None)
                     .unwrap_or_else(|| panic!("{tag} {kind}: in scope"));
                 assert_eq!((h.nrows(), h.ncols()), (n, n));
                 let mut fd = nalgebra::DMatrix::<f64>::zeros(n, n);
@@ -3078,7 +3146,7 @@ mod tests {
                     Some(&modes),
                 )
                 .unwrap_or_else(|| panic!("{tag} {kind}: exact gradient in scope"));
-                let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+                let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts, None);
                 // A FIX coordinate's FD is pinned to 0 (its box is a point); the exact gradient
                 // is differentiated there too and zeroed by the outer loop.
                 let fixed = crate::estimation::parameterization::packed_fixed_mask(params);
@@ -3233,13 +3301,14 @@ mod tests {
                     &warm.etas_by_class,
                     &opts,
                     &axes,
+                    None,
                 )
                 .unwrap_or_else(|e| panic!("{tag} {kind}: {e:?}"));
                 let p1 = unpack_params(&x1, params0);
                 let full_g = exact_mixture_grad(&model, &pop, &p1, &opts);
-                let full_h = super::mixture_cov_hessian(&model, &pop, params0, &x1, &opts)
+                let full_h = super::mixture_cov_hessian(&model, &pop, params0, &x1, &opts, None)
                     .unwrap_or_else(|| panic!("{tag} {kind}: full R"));
-                let fd = super::mixture_gradient_fd(&model, &pop, &x1, params0, &opts);
+                let fd = super::mixture_gradient_fd(&model, &pop, &x1, params0, &opts, None);
                 let (mut dh, mut dg, mut dfd) = (0.0f64, 0.0f64, 0.0f64);
                 for (a, &ia) in axes.iter().enumerate() {
                     assert!(
@@ -3309,8 +3378,10 @@ mod tests {
                 })
                 .collect();
             assert_eq!(
-                super::mixture_candidate_hessian(&model, &pop, params, &x, &lost, &starved, &axes)
-                    .err(),
+                super::mixture_candidate_hessian(
+                    &model, &pop, params, &x, &lost, &starved, &axes, None
+                )
+                .err(),
                 Some(ExactDecline::NotResolved),
                 "{kind}: the trust region keeps the point-specific refusal"
             );
@@ -3320,7 +3391,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{kind}: {e:?}"))
             .1;
             super::CLASS_SOLVES.with(|c| c.set(0));
-            let got = super::mixture_cov_hessian(&model, &pop, params, &x, &starved)
+            let got = super::mixture_cov_hessian(&model, &pop, params, &x, &starved, None)
                 .unwrap_or_else(|| panic!("{kind}: the covariance step assembles the exact R"));
             assert_eq!(
                 super::CLASS_SOLVES.with(|c| c.get()),
@@ -3362,7 +3433,7 @@ mod tests {
             let call = |model: &crate::types::CompiledModel,
                         warm: &[Vec<nalgebra::DVector<f64>>],
                         o: &crate::types::FitOptions| {
-                super::mixture_candidate_hessian(model, &pop, params, &x, warm, o, &axes)
+                super::mixture_candidate_hessian(model, &pop, params, &x, warm, o, &axes, None)
             };
             assert!(
                 call(&model, &warm, &opts).is_ok(),
@@ -3385,6 +3456,18 @@ mod tests {
                 call(&fd_model, &warm, &opts).err(),
                 Some(ExactDecline::OutOfScope),
                 "{kind}: gradient = fd"
+            );
+            // No recorder serves a model whose individual-parameter program is gone.
+            let mut no_recorder =
+                crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
+            no_recorder.indiv_param_partials.indiv_param_program = None;
+            assert!(!crate::sens::ode_provider::adjoint::recorder_in_scope(
+                &no_recorder
+            ));
+            assert_eq!(
+                call(&no_recorder, &warm, &opts).err(),
+                Some(ExactDecline::OutOfScope),
+                "{kind}: no recorder serves the model"
             );
             let mut short = warm.clone();
             short[0].pop();
@@ -3414,42 +3497,136 @@ mod tests {
         }
     }
 
-    /// Routing (#3025): a Laplace mixture fit takes the exact gradient and the exact R-matrix —
-    /// no finite-difference fallback warning, no whole-population stencil, the covariance step
-    /// predicted analytic — and `E_MIXTURE_METHOD` no longer refuses it.
+    /// Routing (#3025): a Laplace / AGQ mixture is served by the exact routes — the covariance
+    /// step is predicted analytic and assembles the exact R, and the exact outer gradient is
+    /// available and formed by the adjoint with no declined term. (The fit-level check, that no
+    /// finite-difference fallback is reported, is Tier 2: `tests/mixture_exact_routes.rs`.)
     #[test]
-    fn a_laplace_mixture_fit_takes_the_exact_routes() {
+    fn a_laplace_mixture_takes_the_exact_routes() {
         use crate::estimation::covariance::{predicted_r_route, PredictedRRoute};
+        use crate::estimation::parameterization::pack_params;
         let model = crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
         let pop = read_pop(&bimodal_csv(5, 1.0, 3.0));
-        for (kind, n_agq) in [("laplace", 1usize), ("agq3", 3)] {
-            let opts = crate::types::FitOptions {
-                method: if n_agq == 1 {
-                    crate::types::EstimationMethod::Laplace
-                } else {
-                    crate::types::EstimationMethod::FoceI
-                },
-                interaction: true,
-                n_agq,
-                outer_maxiter: 3,
-                run_covariance_step: true,
-                ..crate::types::FitOptions::default()
-            };
+        let params = &model.default_params;
+        let x = pack_params(params);
+        assert!(crate::sens::provider::analytic_outer_gradient_available(
+            &model
+        ));
+        for (kind, opts) in objective_cases()
+            .into_iter()
+            .filter(|(k, _)| matches!(*k, "laplace" | "agq3"))
+        {
             assert_eq!(
                 predicted_r_route(&model, &opts),
                 PredictedRRoute::Analytic,
                 "{kind}"
             );
-            let fit = crate::api::fit(&model, &pop, &model.default_params, &opts)
-                .unwrap_or_else(|e| panic!("{kind}: {e}"));
-            assert!(fit.ofv.is_finite(), "{kind}");
-            let fd_warning = fit
-                .warnings
-                .iter()
-                .find(|w| w.contains("finite-difference") || w.contains("finite difference"));
-            assert!(fd_warning.is_none(), "{kind}: {fd_warning:?}");
+            let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+            let g = super::mixture_gradient_with_modes(
+                &model,
+                &pop,
+                params,
+                &opts,
+                &eval,
+                Some(&modes),
+            )
+            .unwrap_or_else(|| panic!("{kind}: the adjoint serves every term"));
+            assert!(g.iter().all(|v| v.is_finite()), "{kind}");
+            let h = super::mixture_cov_hessian(&model, &pop, params, &x, &opts, None)
+                .unwrap_or_else(|| panic!("{kind}: the exact R"));
+            assert!(h.iter().all(|v| v.is_finite()), "{kind}");
         }
     }
+
+    /// #3025 review: the mixture outer gradient honours the `gradient = fd` opt-out. The
+    /// differential pair is the same objective at the same point with and without the flag:
+    /// under `gradient = fd` the gradient is bit-equal to `mixture_gradient_fd` (the central
+    /// difference of the mixture objective), and under `auto` it is the exact one — close to
+    /// the difference but not its bits. Dies if the opt-out is dropped (the exact gradient is
+    /// then returned under `gradient = fd`).
+    #[test]
+    fn the_mixture_outer_gradient_takes_the_fd_route_under_gradient_fd() {
+        use crate::estimation::parameterization::pack_params;
+        use crate::types::GradientMethod;
+        let pop = read_pop(&bimodal_csv(5, 1.0, 3.0));
+        for (kind, opts) in objective_cases() {
+            let mut gradients = Vec::new();
+            for method in [GradientMethod::Auto, GradientMethod::Fd] {
+                let mut model =
+                    crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
+                model.gradient_method = method;
+                let params = model.default_params.clone();
+                let x = pack_params(&params);
+                let (eval, modes) =
+                    super::mixture_ofv_with_modes(&model, &pop, &params, &opts, None);
+                let declines =
+                    crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
+                let g = super::mixture_outer_gradient(
+                    &model,
+                    &pop,
+                    &params,
+                    &x,
+                    &opts,
+                    &eval,
+                    Some(&modes),
+                    &declines,
+                    None,
+                );
+                let fd = super::mixture_gradient_fd(&model, &pop, &x, &params, &opts, None);
+                gradients.push((g, fd));
+            }
+            let (auto_g, auto_fd) = &gradients[0];
+            let (fd_g, fd_fd) = &gradients[1];
+            assert_eq!(
+                fd_g, fd_fd,
+                "{kind}: gradient = fd is the objective's difference"
+            );
+            assert!(fd_g.iter().all(|v| v.is_finite()), "{kind}");
+            assert_ne!(
+                auto_g, auto_fd,
+                "{kind}: the straddle: auto is the exact gradient"
+            );
+            assert!(
+                auto_g.iter().zip(fd_g).any(|(a, f)| a != f),
+                "{kind}: the two routes differ"
+            );
+        }
+    }
+
+    /// #3025 review: the Laplace / AGQ class term runs in parallel over subjects, and the
+    /// objective, the modes and the posteriors are bit-identical to a one-thread run (the
+    /// results come back in subject order and every reduction after them is the serial one).
+    /// Dies if a subject's result lands in another's slot, or the reduction order changes.
+    #[test]
+    fn the_quadrature_class_term_is_bit_identical_across_thread_counts() {
+        let model = crate::parser::model_parser::parse_model_string(MIX_PARITY_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(6, 1.0, 3.0));
+        let params = &model.default_params;
+        for (kind, opts) in objective_cases()
+            .into_iter()
+            .filter(|(k, _)| matches!(*k, "laplace" | "agq3"))
+        {
+            let run = |threads: usize| {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| super::mixture_ofv(&model, &pop, params, &opts, None))
+            };
+            let (one, many) = (run(1), run(4));
+            assert!(one.ofv.is_finite(), "{kind}");
+            assert_eq!(one.ofv.to_bits(), many.ofv.to_bits(), "{kind}: OFV");
+            assert_eq!(one.pmix, many.pmix, "{kind}: posteriors");
+            assert_eq!(one.class_nll, many.class_nll, "{kind}: class objectives");
+            assert_eq!(one.etas_by_class, many.etas_by_class, "{kind}: class modes");
+            // Subjects differ (two clearance groups), so a cross-wired slot is visible.
+            assert!(
+                one.class_nll.windows(2).any(|w| w[0] != w[1]),
+                "{kind}: fixture: subjects differ"
+            );
+        }
+    }
+
     /// #2187: `mixture_gradient_fd` steps a small identity-packed θ by `1e-5·|θ₀|`, not a
     /// flat `1e-5` in its own units. `MIX_PARITY_MODEL` with `V = TVV_S / k`, `TVV_S`
     /// identity-packed at `10·k`: `k·∂OFV/∂TVV_S` at `k = 1e-4` is `∂OFV/∂TVV_S` at `k = 1`,
@@ -3476,7 +3653,8 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
             let x = pack_params(&model.default_params);
             assert_eq!(x[1], tvv, "fixture: TVV_S is identity-packed");
-            let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts);
+            let fd =
+                super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts, None);
             k * fd[1]
         };
         let reference = scaled(1.0);
@@ -3528,7 +3706,7 @@ mod tests {
 
         let pop = read_pop(&bimodal_csv(4, 1.0, 3.0));
         let opts = crate::types::FitOptions::default();
-        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts, None);
 
         let ofv_at = |v: f64| {
             let mut xv = x.clone();
@@ -3567,7 +3745,7 @@ mod tests {
         let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
             .expect("analytic gradient in scope (logit form, diagonal base Ω)");
         let x = pack_params(params);
-        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts, None);
 
         assert_eq!(ana.len(), fd.len());
         let mut worst = 0.0f64;
@@ -3603,7 +3781,7 @@ mod tests {
         let ana = super::mixture_gradient(&model, &pop, params, &opts, &eval)
             .expect("MIXNUM-conditional typical value is in analytic scope");
         let x = pack_params(params);
-        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts, None);
 
         assert_eq!(ana.len(), fd.len());
         // Locate the TVCL1 / TVCL2 theta slots: the class-swap bug zeroes the
@@ -3956,7 +4134,7 @@ mod tests {
             ..Default::default()
         };
         let x = pack_params(template);
-        let ctx = super::MixtureScoreContext::new(&model, pop, template, &x, &opts);
+        let ctx = super::MixtureScoreContext::new(&model, pop, template, &x, &opts, None);
         let fixed = packed_fixed_mask(template);
         let f = |xv: &[f64], i: usize| {
             subject_marginal_reestimated(&model, pop, template, xv, i, &ctx, interaction)
@@ -4125,7 +4303,7 @@ mod tests {
             .expect("analytic gradient in scope (logit form, diagonal base Ω)");
         let x = pack_params(params);
         assert_eq!(ana.len(), x.len(), "gradient spans the packed layout");
-        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts, None);
         let mut worst = 0.0f64;
         for (i, (a, f)) in ana.iter().zip(&fd).enumerate() {
             assert!(a.is_finite() && f.is_finite(), "coord {i}: {a} / {f}");
@@ -4172,6 +4350,7 @@ mod tests {
                 &start.bounds,
                 &opts,
                 &free,
+                None,
             )
             .expect("finite S")
         };
@@ -4225,6 +4404,7 @@ mod tests {
             &start.bounds,
             &opts,
             &free,
+            None,
         )
         .expect("finite S");
         for j in 0..4 {
@@ -4412,7 +4592,7 @@ mod tests {
                     continue;
                 }
                 let grad = exact_mixture_grad(&model, &pop, params, &opts);
-                let ctx = super::MixtureScoreContext::new(&model, &pop, params, &x, &opts);
+                let ctx = super::MixtureScoreContext::new(&model, &pop, params, &x, &opts, None);
                 let scorers = ctx.class_scorers(&model);
                 let mut sum = vec![0.0f64; x.len()];
                 for i in 0..pop.subjects.len() {
@@ -4608,7 +4788,7 @@ mod tests {
         };
 
         let x = pack_params(params);
-        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts, None);
         assert_eq!(salvaged.len(), fd.len());
         let (mut worst, mut live) = (0.0f64, 0.0f64);
         for (j, ((&s, &f), &z)) in salvaged.iter().zip(&fd).zip(&zeroed).enumerate() {

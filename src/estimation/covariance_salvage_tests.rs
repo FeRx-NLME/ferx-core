@@ -1746,6 +1746,7 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
             &bounds,
             &options,
             &free_idx,
+            None,
         )
         .expect("S assembles");
         super::combine_covariance(CovarianceMethod::Sandwich, r_inv.clone(), &s, &units)
