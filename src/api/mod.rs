@@ -80,11 +80,13 @@ pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 pub use fit::{fit, fit_from_files};
 pub(crate) use validation::check_level_labels;
-// Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
+// The fit-scoped pools live at the crate root (#3041); `api` keeps their public paths.
 pub(crate) use crate::pool::install_on_fit_pool;
 pub use crate::pool::{
     configure_global_thread_pool, install_on_engine_pool, PoolPlan, FIT_RAYON_STACK_SIZE,
 };
+
+// Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.
 #[allow(deprecated)]
 pub use levels::bind_theta_levels_from_fit;
 pub(crate) use levels::{
