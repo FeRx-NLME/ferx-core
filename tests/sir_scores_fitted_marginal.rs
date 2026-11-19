@@ -977,8 +977,8 @@ fn saem_mixture_override_run_sir_and_covariance_are_identical_to_in_fit() {
 
     // SAEM reports the FOCEI mixture marginal (`mixture_ofv`) at its estimates, so a
     // FOCEI evaluation there — parameters rebuilt from the fit — is the same number
-    // (304.14592327836084, macOS arm64). Before #1765 the class-2 Ω kept the base's
-    // Cholesky factor, and the SAEM side read 1.4 units off the FOCEI value.
+    // (298.3435187597649 at #2986's defaults, macOS arm64). Before #1765 the class-2 Ω
+    // kept the base's Cholesky factor, and the SAEM side read 1.4 units off the FOCEI value.
     let at = ferx_core::estimation::uncertainty_samples::fitted_params_from_result(&r, &model)
         .expect("rebuild the SAEM fit's parameters");
     let eval = fit(
@@ -994,10 +994,17 @@ fn saem_mixture_override_run_sir_and_covariance_are_identical_to_in_fit() {
     )
     .expect("FOCEI evaluation at the SAEM estimates");
     assert!(r.ofv.is_finite(), "SAEM OFV not finite");
-    assert_eq!(
-        r.ofv.to_bits(),
-        eval.ofv.to_bits(),
-        "SAEM OFV {} vs FOCEI at its estimates {}",
+    // Same function at the same parameters — but FOCEI's evaluation-only path packs and
+    // unpacks them (`evaluate_at_initial_params`: log θ, Cholesky-of-Ω coordinates), which
+    // goes through the platform's `exp`/`log`, so equality to the last bit holds only where
+    // libm round-trips these particular values: it did on macOS arm64 and not on Linux
+    // x86_64 CI at #2986's estimates (1 ULP). The mutation this guards (the class-2 Ω with
+    // the base's stale Cholesky factor) moves the OFV by 1.4 units, twelve orders of
+    // magnitude beyond this tolerance.
+    let rel = (r.ofv - eval.ofv).abs() / eval.ofv.abs();
+    assert!(
+        rel < 1e-12,
+        "SAEM OFV {} vs FOCEI at its estimates {} (relative {rel:e})",
         r.ofv,
         eval.ofv
     );
