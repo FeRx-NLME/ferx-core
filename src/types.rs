@@ -9748,6 +9748,11 @@ pub struct FitOptions {
     /// [`SaemKernel::Nonmem`]: target acceptance of the random-walk kernels (NONMEM
     /// `IACCEPT`, default 0.4).
     pub saem_iaccept: f64,
+    /// [`SaemKernel::Nonmem`]: NONMEM's `MCETA` for SAEM — when larger than `isample_m1`,
+    /// kernels M1, M2 and M3 each run this many proposals on the **first** iteration, a
+    /// robust initial search for each subject's η (NONMEM 7.5; `AUTO=2` uses 100). `0`
+    /// (the default, NONMEM's) leaves the first iteration like every other.
+    pub saem_mceta: usize,
     /// Number of block-kernel MH proposals per subject per SAEM outer
     /// iteration, or `0` — the default, written `n_mh_steps = auto` in a model
     /// file — to size it from the dataset.
@@ -10482,6 +10487,7 @@ impl Default for FitOptions {
             saem_isample_m2: 2,
             saem_isample_m3: 2,
             saem_iaccept: 0.4,
+            saem_mceta: 0,
             // 0 = `auto`: resolved from the dataset by
             // `estimation::saem::auto_n_mh_steps` (#1459).
             saem_n_mh_steps: 0,
@@ -11769,6 +11775,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "isample_m2",
             "isample_m3",
             "iaccept",
+            "mceta",
             "n_mh_steps",
             "n_leapfrog",
             "saem_n_leapfrog",

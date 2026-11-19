@@ -5704,6 +5704,12 @@ pub fn run_saem(
             }
             break;
         }
+        // NONMEM's MCETA (#2986): on the first iteration kernels M1, M2 and M3 run `mceta`
+        // proposals each, when that exceeds `isample_m1` — a robust initial search.
+        let mceta_now = nonmem_kernel && k == 1 && options.saem_mceta > options.saem_isample_m1;
+        let isample_m1_k = if mceta_now { options.saem_mceta } else { options.saem_isample_m1 };
+        let n_mh_steps = if mceta_now { options.saem_mceta } else { n_mh_steps };
+        let n_cw_sweeps = if mceta_now { options.saem_mceta } else { n_cw_sweeps };
         let gamma = if k <= k1 {
             1.0
         } else if smoothing_exponent == 1.0 {
@@ -6008,7 +6014,7 @@ pub fn run_saem(
                                 omega_ref,
                                 sigma_ref,
                                 &mut rng,
-                                options.saem_isample_m1,
+                                isample_m1_k,
                                 mh_scratch,
                                 schedules[i].as_ref(),
                                 kappas_mh_opt,

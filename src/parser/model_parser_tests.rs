@@ -3842,6 +3842,9 @@ fn test_apply_fit_option_saem_exploration_stop_and_smoothing() {
         (opts.saem_isample_m1, opts.saem_isample_m1b, opts.saem_isample_m2, opts.saem_isample_m3),
         (3, 0, 4, 1)
     );
+    assert_eq!(opts.saem_mceta, 0, "NONMEM's default MCETA");
+    assert_eq!(apply_fit_option(&mut opts, "mceta", "100"), Ok(true));
+    assert_eq!(opts.saem_mceta, 100);
     assert_eq!(apply_fit_option(&mut opts, "iaccept", "0.3"), Ok(true));
     assert_eq!(opts.saem_iaccept, 0.3);
     assert!(apply_fit_option(&mut opts, "iaccept", "1.0").is_err());

@@ -12142,6 +12142,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         }
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
         "isample_m1" => opts.saem_isample_m1 = parse_usize(key)?,
+        "mceta" => opts.saem_mceta = parse_usize(key)?,
         "isample_m1b" => opts.saem_isample_m1b = parse_usize(key)?,
         "isample_m2" => opts.saem_isample_m2 = parse_usize(key)?,
         "isample_m3" => opts.saem_isample_m3 = parse_usize(key)?,

@@ -3442,6 +3442,7 @@ pub ferx_core::types::FitOptions::saem_isample_m1b: usize
 pub ferx_core::types::FitOptions::saem_isample_m2: usize
 pub ferx_core::types::FitOptions::saem_isample_m3: usize
 pub ferx_core::types::FitOptions::saem_kernel: ferx_core::SaemKernel
+pub ferx_core::types::FitOptions::saem_mceta: usize
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::types::FitOptions::saem_mstep_draws: usize
 pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
@@ -5200,6 +5201,7 @@ pub ferx_core::FitOptions::saem_isample_m1b: usize
 pub ferx_core::FitOptions::saem_isample_m2: usize
 pub ferx_core::FitOptions::saem_isample_m3: usize
 pub ferx_core::FitOptions::saem_kernel: ferx_core::SaemKernel
+pub ferx_core::FitOptions::saem_mceta: usize
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::FitOptions::saem_mstep_draws: usize
 pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
