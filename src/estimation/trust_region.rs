@@ -210,7 +210,7 @@ fn exact_trust_region(
     // `OutOfScope` is a property of the model: once the exact Hessian (or the exact gradient at
     // held modes) declines that way, it is not asked again this leg. `NotResolved` is one of
     // the point: the exact Hessian is not asked again at the point it declined at.
-    let mut hessian_out_of_scope = false;
+    let hessian_out_of_scope = std::cell::Cell::new(false);
     let mut unresolved_at: Option<Vec<f64>> = None;
     // The packed norm of the accepted step that reached the current iterate, for the trace.
     let mut last_step: Option<f64> = None;
@@ -287,7 +287,7 @@ fn exact_trust_region(
                     // A model the exact Hessian declined as out of scope is outside the
                     // recorders' scope; a `None` here at another model is a property of
                     // the point (a non-finite subject term), so it is asked again next time.
-                    _ => (!hessian_out_of_scope)
+                    _ => (!hessian_out_of_scope.get())
                         .then(|| {
                             exact_gradient_at_modes(
                                 model,
@@ -318,7 +318,7 @@ fn exact_trust_region(
         let (g_ax, h_ax): (Vec<f64>, DMatrix<f64>) = match quasi {
             Some(gb) => gb,
             None => {
-                let exact = if hessian_out_of_scope {
+                let exact = if hessian_out_of_scope.get() {
                     Err(ExactDecline::OutOfScope)
                 } else if unresolved_at.as_ref() == Some(&x) {
                     Err(ExactDecline::NotResolved)
@@ -335,7 +335,7 @@ fn exact_trust_region(
                     )
                 };
                 match exact {
-                    Err(ExactDecline::OutOfScope) => hessian_out_of_scope = true,
+                    Err(ExactDecline::OutOfScope) => hessian_out_of_scope.set(true),
                     Err(ExactDecline::NotResolved) => unresolved_at = Some(x.clone()),
                     Ok(_) => {}
                 }
