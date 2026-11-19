@@ -144,7 +144,14 @@ fn assert_check_agrees(what: &str, model: &Path, data: Option<&Path>, e: &Engine
         .unwrap_or_else(|| panic!("{what}: ferx check reports no error"));
     assert_eq!(Some(d.code.as_str()), e.code(), "{what}: code");
     assert_eq!(d.block.as_deref(), e.block(), "{what}: block");
-    assert_eq!(d.message, e.message(), "{what}: message");
+    // An entry names the file a parse failure is in (#1807); `ferx check` shows the file
+    // beside the diagnostic, so its message is the parser's alone.
+    let named = format!("error parsing the model file {}: ", show(model));
+    assert_eq!(
+        d.message,
+        e.message().strip_prefix(&named).unwrap_or(e.message()),
+        "{what}: message"
+    );
 }
 
 /// The reader's own refusal for `path` under `settings`: `read_population_for`, the
@@ -399,7 +406,10 @@ fn the_re_reads_carry_ferx_checks_codes() {
             r,
             "E_MISSING_BLOCK",
             Some("error_model"),
-            "Missing [error_model] block",
+            &format!(
+                "error parsing the model file {}: Missing [error_model] block",
+                show(&fs.model)
+            ),
         ));
 
         // E_DATA: the data file is gone, at its hash and at each of the three readers.
