@@ -6714,3 +6714,48 @@ fn modified_release_plan_agrees_with_its_ode_twin() {
     }
     assert!(bad.is_empty(), "closed form vs ODE twin: {bad:?}");
 }
+
+/// A Form-B `obs_scale` (`= V`, an η-dependent individual parameter, or a constant) under
+/// LTBS (additive and combined error) on a built-in `first_order` input kernel, which
+/// production's modified-release closed form predicts while the plan walks the ODE (S19's
+/// report of a 1.9 / 2.7 gradient gap on this shape under #3001). Every cell — η on `V` or
+/// not, scale `V` or `10` — is gradient-vs-reconverged-FD parity for FOCEI and FOCE. Measured
+/// worst 3.5e-7 over the gradients (the kernel's ODE tolerance); bound 1e-5. Mutation: take the
+/// LTBS log before the `obs_scale` quotient in `apply_expression_scale` and the `V` cells move
+/// by O(1).
+#[test]
+fn first_order_kernel_with_obs_scale_under_ltbs_matches_reconverged_fd() {
+    for scale in ["V", "10.0"] {
+        for eta_v in [true, false] {
+            for (sigmas, err) in [
+                ("  sigma ADD ~ 0.1 (sd)\n", "log(DV) ~ additive(ADD)"),
+                (
+                    "  sigma PROP ~ 0.1 (sd)\n  sigma ADD ~ 0.3 (sd)\n",
+                    "log(DV) ~ combined(PROP, ADD)",
+                ),
+            ] {
+                let src = format!(
+                    "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+                     theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n{sigmas}\
+                     [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp({})\n  \
+                     KA = TVKA\n[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+                     [odes]\n  d/dt(central) = first_order(ka=KA) - CL/V*central\n\
+                     [scaling]\n  obs_scale = {scale}\n[error_model]\n  {err}\n",
+                    if eta_v { "ETA_V" } else { "0.0 * ETA_V" },
+                );
+                let m = tight(parse_model_string(&src).unwrap());
+                assert!(m.log_transform, "LTBS");
+                let s = two_dose_subject(&m);
+                assert!(served(&m, &s), "{scale} etav={eta_v} {err}: served");
+                for interaction in [true, false] {
+                    let g = fd_oracle(&m, &s, interaction);
+                    eprintln!("obs_scale={scale} etav={eta_v} {err} FOCEI={interaction}: {g:.2e}");
+                    assert!(
+                        g.is_finite() && g < 1e-5,
+                        "{scale} etav={eta_v} {err}: {g:.2e}"
+                    );
+                }
+            }
+        }
+    }
+}
