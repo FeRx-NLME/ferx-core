@@ -15084,7 +15084,8 @@ fn cold_mode_pair(
 
 /// #2645, the one fit a PR runs: both rounds open and run legs of their own, on the simulated
 /// dataset that did so most steadily of twelve tried on both platforms (20 subjects, six legs
-/// and 196.7247 on Linux aarch64 and macOS arm64, ~0.5 s). What the rounds gain, and what a
+/// and 196.7247 on Linux aarch64 and macOS arm64; ~22 s one-threaded on x86_64, measured
+/// 2026-11-19, the same before #2939). What the rounds gain, and what a
 /// losing round leaves, is pinned by the `slow-tests` pairs below.
 ///
 /// The fixture's subjects have second EBE modes, so which trajectory a start takes is

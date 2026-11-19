@@ -402,6 +402,18 @@ fn adjoint_matches_reconverged_finite_differences_of_the_objective() {
     assert!(worst < 5e-6, "worst relative difference {worst:.2e}");
 }
 
+/// The cells of a reconverged-FD case table that run: all of them under `slow-tests`, and per
+/// PR only `per_pr` (indices into `cases`). Every cell is a full oracle (four EBE re-solves per
+/// packed coordinate), so a nine-cell table cost minutes of the per-PR coverage shard; the
+/// per-PR cells are the ones whose comment names the defect they caught.
+pub(super) fn oracle_cells<T>(cases: Vec<T>, per_pr: &[usize]) -> Vec<T> {
+    if cfg!(feature = "slow-tests") {
+        return cases;
+    }
+    assert!(per_pr.iter().all(|&i| i < cases.len()), "per-PR cell out of range");
+    cases.into_iter().enumerate().filter(|(i, _)| per_pr.contains(i)).map(|(_, c)| c).collect()
+}
+
 thread_local! {
     /// The oracle's EBE tolerance (the base point's and every re-solve's).
     static ORACLE_EBE_TOL: std::cell::Cell<f64> = const { std::cell::Cell::new(1e-12) };
@@ -9117,14 +9129,18 @@ fn sde_steady_state_dose_matches_reconverged_finite_differences() {
     let with = crate::pk::compute_predictions_with_tv(&model, &s, theta, &eta);
     assert!(with[0] > 2.0 * without[0], "the steady state is not live: {with:?}");
     assert!(in_scope(&model, &s), "the exact gradient must serve it");
-    for interaction in [true, false] {
+    // Measured locally, one thread: each oracle 60-120 s (FOCEI 62, FOCE 61, Laplace 78, AGQ
+    // n = 3 121 and 102), 429 s in all. Per PR: FOCEI, plus the AGQ routing check below (the
+    // steady state reaching every node without a decline); the other oracles under
+    // `slow-tests`.
+    for interaction in oracle_cells(vec![true, false], &[0]) {
         let worst = fd_oracle(&model, &s, interaction);
         eprintln!("sde SS interaction={interaction} worst {worst:.3e}");
         // Measured on Linux: 4.9e-8 (FOCEI) and 5.5e-8 (FOCE); about 18x headroom.
         assert!(worst < 1e-6, "interaction={interaction}: {worst:.2e}");
     }
     // Laplace and AGQ through the same plans: the steady state reaches every node.
-    for (n_agq, exact) in [(1, true), (3, true), (3, false)] {
+    for (n_agq, exact) in oracle_cells(vec![(1, true), (3, true), (3, false)], &[]) {
         let worst = fd_oracle_agq(&model, &s, n_agq, exact);
         eprintln!("sde SS n_agq={n_agq} exact={exact}: worst {worst:.3e}");
         assert!(worst < SDE_PARITY_BOUND, "n_agq={n_agq} exact={exact}: {worst:.2e}");
@@ -9299,7 +9315,16 @@ fn sde_rate_defined_infusion_under_f_matches_reconverged_finite_differences() {
 /// difference quotient (measured: 6.0e-4 at 2.47, 1.1e-8 at 2.3, 2.5e-8 at 2.62).
 #[test]
 fn sde_steady_state_moving_windows_match_reconverged_finite_differences() {
-    for case in ["D1", "R1", "F1"] {
+    // The longest unit test in the crate: 497 s for the six cells locally (one thread, 60-100 s
+    // each), a floor under its coverage shard. Per PR: the modeled duration (the kink-adjusted
+    // start) under FOCEI; every
+    // window is pinned without SS per PR by the three `sde_*_matches_reconverged_*` tests above,
+    // and the full table runs under `slow-tests`.
+    let cells = oracle_cells(
+        ["D1", "R1", "F1"].into_iter().flat_map(|c| [(c, true), (c, false)]).collect(),
+        &[0],
+    );
+    for (case, interaction) in cells {
         let (mut model, s, k) = sde_window_case(case, true);
         if case == "D1" {
             model.default_params.theta[k] = 2.3;
@@ -9307,11 +9332,9 @@ fn sde_steady_state_moving_windows_match_reconverged_finite_differences() {
         assert!(s.doses[0].ss && s.doses[0].ii == 12.0);
         assert_window_moves_p_obs(&model, &s, k);
         assert!(in_scope(&model, &s), "{case}: the exact gradient must serve it");
-        for interaction in [true, false] {
-            let w = fd_oracle(&model, &s, interaction);
-            eprintln!("sde SS moving window {case} interaction={interaction}: worst {w:.3e}");
-            assert!(w < 5e-7, "{case} interaction={interaction}: {w:.2e}");
-        }
+        let w = fd_oracle(&model, &s, interaction);
+        eprintln!("sde SS moving window {case} interaction={interaction}: worst {w:.3e}");
+        assert!(w < 5e-7, "{case} interaction={interaction}: {w:.2e}");
     }
 }
 
