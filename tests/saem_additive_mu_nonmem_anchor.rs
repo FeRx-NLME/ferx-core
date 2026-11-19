@@ -155,16 +155,19 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
     );
 
     // #2544: the inline spelling is the split one's mu-reference, so SAEM takes the same
-    // path: the estimates are asserted bit for bit, and the bounds above then hold for
-    // the inline spelling against both NONMEM streams, which are bit-identical. The OFV
-    // sums the same terms in a different association for the two spellings, so it may
-    // differ in the last bit (measured: 1 ULP, 165.82613916088266 vs …263); it is held
-    // to 1e-12 relative, which a different chain path would exceed by many orders.
+    // path, and the bounds above then hold for the inline spelling against both NONMEM
+    // streams, which are bit-identical. The two spellings compile to plans that sum the
+    // same terms in a different association, so the OFV — and, since the default E-step
+    // moves along the AD gradient (#2986), the estimates — may differ in the last bit
+    // (measured: OFV 1 ULP, 165.82613916088266 vs …263; TVE0 1 ULP on Linux x86_64). They
+    // are held to 1e-12 relative, which a different chain path would exceed by many
+    // orders.
     for (what, a, b) in [
         ("TVE0", inline.theta[0], split.theta[0]),
         ("omega2", inline.omega[(0, 0)], split.omega[(0, 0)]),
     ] {
-        assert_eq!(a.to_bits(), b.to_bits(), "inline vs split {what}: {a} vs {b}");
+        let rel = (a - b).abs() / b.abs();
+        assert!(rel < 1e-12, "inline vs split {what}: {a} vs {b} (relative {rel:e})");
     }
     let ofv_rel = (inline.ofv - split.ofv).abs() / split.ofv.abs();
     assert!(
