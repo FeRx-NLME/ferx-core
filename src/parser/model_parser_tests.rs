@@ -4175,7 +4175,15 @@ fn test_apply_fit_option_saem_exploration_stop_and_smoothing() {
     let mut opts = FitOptions::default();
     assert_eq!(opts.saem_n_exploration, None);
     assert_eq!(opts.saem_exploration_min, 150);
-    assert_eq!(opts.saem_exploration_max, 2000);
+    assert_eq!(opts.saem_exploration_max, 4000);
+    assert_eq!(opts.saem_n_chains, 2);
+    assert_eq!(apply_fit_option(&mut opts, "n_chains", "3"), Ok(true));
+    assert_eq!(opts.saem_n_chains, 3);
+    assert!(apply_fit_option(&mut opts, "n_chains", "0").is_err());
+    assert_eq!(
+        opts.saem_n_chains, 3,
+        "a rejected value leaves the previous one"
+    );
     assert_eq!(opts.saem_smoothing_exponent, 1.0);
 
     assert_eq!(

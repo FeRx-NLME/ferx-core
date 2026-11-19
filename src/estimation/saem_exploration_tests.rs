@@ -45,17 +45,17 @@ fn flag_rate(n: usize, rho: f64, drift_sd: f64, trials: u64) -> f64 {
 /// the series' autocorrelation time reads wander as trend. The previous rule (five
 /// 20-iteration batch means) flagged 12–23 % of stationary SAEM coordinates. With
 /// the spacing taken from the autocorrelation time the null rate stays near the
-/// nominal 1 % up to rho = 0.97 (autocorrelation time ~66, clamped to 50). Bounds:
-/// measured value (in the comment) plus a ~4-sigma binomial band.
+/// nominal 5 % (NONMEM `CALPHA=0.05`) up to rho = 0.97 (autocorrelation time ~66,
+/// clamped to 50). Bounds: measured value plus a ~4-sigma binomial band.
 #[test]
 fn stationary_autocorrelated_noise_is_not_flagged_beyond_nominal() {
     let r0 = flag_rate(2000, 0.0, 0.0, 400);
     let r9 = flag_rate(2000, 0.9, 0.0, 400);
     let r97 = flag_rate(2000, 0.97, 0.0, 400);
     eprintln!("null rates: rho 0 {r0}, 0.9 {r9}, 0.97 {r97}");
-    assert!(r0 < 0.04, "iid null rate {r0}");
-    assert!(r9 < 0.06, "rho 0.9 null rate {r9}");
-    assert!(r97 < 0.12, "rho 0.97 null rate {r97}");
+    assert!(r0 < 0.09, "iid null rate {r0}");
+    assert!(r9 < 0.11, "rho 0.9 null rate {r9}");
+    assert!(r97 < 0.17, "rho 0.97 null rate {r97}");
 }
 
 /// The other half: a real drift must be seen, more often the larger it is. The test
@@ -97,7 +97,7 @@ fn decaying_variance_trajectory_is_a_trend_and_its_plateau_is_not() {
         .count();
     eprintln!("decay: still flagged at 300 in {still}/40, settled at 2000 in {settled}/40");
     assert!(still >= 38, "still decaying at 300: {still}/40");
-    assert!(settled >= 36, "settled by 2000: {settled}/40");
+    assert!(settled >= 33, "settled by 2000: {settled}/40");
 }
 
 #[test]
@@ -218,7 +218,7 @@ fn bounds_precedence_explicit_length_overrides_the_automatic_stop() {
     let mut o = FitOptions::default();
     assert_eq!(
         exploration_bounds(&o),
-        (true, 150, 2000),
+        (true, 150, 4000),
         "default is automatic"
     );
     o.saem_exploration_min = 100;

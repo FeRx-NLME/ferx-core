@@ -62,6 +62,13 @@ fn ext_last(name: &str) -> HashMap<String, f64> {
 }
 
 fn fit(model: &str) -> ferx_core::types::FitResult {
+    fit_with(model, |_| {})
+}
+
+fn fit_with(
+    model: &str,
+    edit: impl FnOnce(&mut ferx_core::types::FitOptions),
+) -> ferx_core::types::FitResult {
     let prep = ferx_core::prepare_run(
         root().join("nonmem_anchor").join(model).to_str().unwrap(),
         Some(
@@ -72,10 +79,11 @@ fn fit(model: &str) -> ferx_core::types::FitResult {
         ),
     )
     .expect("prepare");
-    let opts = ferx_core::types::FitOptions {
+    let mut opts = ferx_core::types::FitOptions {
         verbose: false,
         ..prep.parsed.fit_options.clone()
     };
+    edit(&mut opts);
     ferx_core::fit(
         &prep.parsed.model,
         &prep.population,
@@ -117,7 +125,15 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
 
     let split = fit("saem_additive_mu.ferx");
     let inline = fit("saem_additive_mu_inline.ferx");
-    let shared = fit("saem_additive_mu_shared.ferx");
+    // The control runs the pre-#2986 schedule (150 + 250 iterations, one chain): it
+    // shows what mu-referencing buys at a fixed budget. At the current defaults
+    // (automatic exploration, 1000 accumulation iterations, two chains) the
+    // non-mu-referenced spelling also gets close (measured 166.12, MLE + 0.30).
+    let shared = fit_with("saem_additive_mu_shared.ferx", |o| {
+        o.saem_n_exploration = Some(150);
+        o.saem_n_convergence = 250;
+        o.saem_n_chains = 1;
+    });
     assert!(split.ofv.is_finite() && inline.ofv.is_finite() && shared.ofv.is_finite());
     // The realised gaps, so a passing run on another platform still records its digits.
     eprintln!(
@@ -185,9 +201,9 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
         nm_inline["THETA1"]
     );
 
-    // The control: TVE0 also read in [structural_model], so it is not mu-referenced and
-    // stays on the ridge (measured 172.663 at the default seed, 168.54–172.76 over five,
-    // what the inline spelling gave before #2544).
+    // The control: TVE0 also read in [structural_model], so it is not mu-referenced and,
+    // at the 150 + 250 single-chain schedule, stays on the ridge (measured 172.663 at the
+    // default seed, 168.54–172.76 over five, what the inline spelling gave before #2544).
     assert!(
         shared.ofv > mle + 1.0,
         "shared BASE = TVE0 + PLAFIX + ETA_E0 with TVE0 read elsewhere must stay off the \

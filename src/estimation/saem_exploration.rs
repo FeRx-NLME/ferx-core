@@ -23,19 +23,20 @@
 //!
 //! Here each coordinate gets its own interval: its integrated autocorrelation time
 //! τ̂ (Geyer, on the linearly detrended series after the first [`TAU_SKIP`]
-//! iterations), clamped to [[`SPACING_MIN`], [`SPACING_MAX`]] — NONMEM's
-//! recommended range. With spacing ≈ τ the ten points are close to independent, and
-//! the OLS slope is tested with a Student t (`CITER − 2 = 8` df) at two-sided 1 %
-//! (`CALPHA = 0.01`, the level NONMEM's guide recommends for MCMC methods). A
-//! coordinate whose series is shorter than `CITER × spacing` is *not yet testable*
-//! and blocks the stop like a drifting one. The test runs every [`CHECK_EVERY`]
-//! iterations; exploration ends at the first check ≥ the minimum where every
-//! coordinate is testable and none drifts, never later than the maximum.
+//! iterations), clamped to [[`SPACING_MIN`], [`SPACING_MAX`]] — inside NONMEM's
+//! recommended 10–100. With spacing ≈ τ the ten points are close to independent, and
+//! the OLS slope is tested with a Student t (`CITER − 2 = 8` df) at two-sided 5 %
+//! (`CALPHA = 0.05`, NONMEM's `AUTO=1` value). A coordinate whose series is shorter
+//! than `CITER × spacing` is *not yet testable* and blocks the stop like a drifting
+//! one. The test runs every [`CHECK_EVERY`] iterations; exploration ends at the first
+//! check ≥ the minimum where every coordinate is testable and none drifts, never
+//! later than the maximum (default 4000, NONMEM's `AUTO=1` `NBURN`).
 //!
-//! Calibration on simulated AR(1) noise (2000 iterations): false-trend rate 0.7 % /
-//! 1.3 % / 4.0 % / 6.7 % at lag-1 correlation 0 / 0.9 / 0.97 / 0.99. On traced
-//! SAEM runs it stopped pk2s at 830–1350 with ω²_Q at its plateau, where the
-//! 100-iteration rule stopped at 273–442 with ω²_Q still 40–90 % above it.
+//! Calibration on simulated AR(1) noise (2000 iterations): false-trend rate 6.8 % /
+//! 6.5 % / 11.3 % at lag-1 correlation 0 / 0.9 / 0.97 (nominal 5 %); a drift of 15
+//! marginal sds over 600 iterations at 0.9 is caught 83 % of the time. On traced SAEM
+//! runs of a pk2_big stand-in the 100-iteration batch-means rule it replaces stopped
+//! at 273–442 with ω²_Q still 40–90 % above its plateau; this rule stops at its plateau.
 //!
 //! Tracked coordinates (NONMEM's `CTYPE=3` set, scale-free in the test): the
 //! complete-data −log L (Σᵢ −log p(yᵢ, ηᵢ; θ, Ω, σ), Monolix's "convergence
@@ -58,8 +59,9 @@ pub(crate) const MIN_TEST_WINDOW: usize = CITER * SPACING_MIN;
 pub(crate) const TAU_SKIP: usize = 20;
 /// The stop is evaluated every this many iterations.
 pub(crate) const CHECK_EVERY: usize = 10;
-/// Two-sided 1 % Student-t quantile, `CITER − 2 = 8` degrees of freedom.
-pub(crate) const TREND_T: f64 = 3.355_387_331_333_396;
+/// Two-sided 5 % Student-t quantile, `CITER − 2 = 8` degrees of freedom (NONMEM
+/// `CALPHA=0.05`, its `AUTO=1` value).
+pub(crate) const TREND_T: f64 = 2.306_004_135_204_166;
 
 /// Point spacing for series `y`: its integrated autocorrelation time on the
 /// linearly detrended values after [`TAU_SKIP`], clamped to
@@ -90,7 +92,7 @@ pub(crate) fn spacing(y: &[f64]) -> usize {
 
 /// Termination test of one coordinate's series `y` (all exploration iterates so
 /// far): `Some(true)` when the slope of its latest [`CITER`] points, spaced by
-/// [`spacing`], is significant at 1 %; `Some(false)` when it is not, or the
+/// [`spacing`], is significant at 5 %; `Some(false)` when it is not, or the
 /// points are numerically constant; `None` when the series is still shorter than
 /// `CITER × spacing` (not yet testable). A non-finite point counts as drifting.
 pub(crate) fn trend_test(y: &[f64]) -> Option<bool> {

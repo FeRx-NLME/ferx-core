@@ -4270,12 +4270,47 @@ fn saem_final_ofv_report(ofv: f64) -> String {
     format!("SAEM completed. Final OFV = {:.4}", ofv)
 }
 
+/// The population SAEM iterates on with `n_chains` independent η chains per
+/// subject: the subjects repeated `n_chains` times, chain `c` of subject `i` at
+/// index `c·N + i` (chain 0 keeps the original indices, and so the per-subject
+/// random streams a single-chain run uses). Copies get distinct ids.
+fn replicate_for_chains(population: &Population, n_chains: usize) -> Population {
+    let mut rep = population.clone();
+    rep.subjects = (0..n_chains)
+        .flat_map(|c| {
+            population.subjects.iter().map(move |s| {
+                let mut s = s.clone();
+                if c > 0 {
+                    s.id = format!("{}#c{}", s.id, c + 1);
+                }
+                s
+            })
+        })
+        .collect();
+    rep
+}
+
 pub fn run_saem(
     model: &CompiledModel,
     population: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    // Chains (NONMEM `ISAMPLE`, Monolix's replicated data set): the SAEM iterations
+    // run on the subjects repeated `n_chains` times; the sufficient statistics are
+    // means over subjects and the θ/σ M-step objective a sum, so the copies average
+    // `n_chains` draws per subject without changing the target. Everything after the
+    // loop (final EBEs, OFV, covariance) uses the original subjects again.
+    let n_chains = options.saem_n_chains.max(1);
+    let n_subjects_data = population.subjects.len();
+    let original_population = population;
+    let replicated_population;
+    let population: &Population = if n_chains > 1 {
+        replicated_population = replicate_for_chains(population, n_chains);
+        &replicated_population
+    } else {
+        population
+    };
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     // Run-time backstop for callers that bypass `check_model_options`
@@ -4358,8 +4393,9 @@ pub fn run_saem(
 
     if verbose {
         eprintln!(
-            "SAEM: {} subjects, {} ETAs, up to {} total iter ({} explore{} + {} converge)",
-            n_subjects,
+            "SAEM: {} subjects × {} chain(s), {} ETAs, up to {} total iter ({} explore{} + {} converge)",
+            n_subjects_data,
+            n_chains,
             n_eta,
             n_iter,
             k1,
@@ -6995,6 +7031,20 @@ pub fn run_saem(
 
     if verbose {
         eprintln!("SAEM iterations complete. Computing final EBEs and OFV...");
+    }
+
+    // Back to the original subjects: keep chain 0 of each (indices `0..N`) as the
+    // warm start of the final EBEs; the other chains have done their job.
+    let population = original_population;
+    if n_chains > 1 {
+        state.etas.truncate(n_subjects_data);
+        state.kappas.truncate(n_subjects_data);
+        state.nll_cache.truncate(n_subjects_data);
+        hmc_subjects.truncate(n_subjects_data);
+        if let Some(mix) = saem_mix.as_mut() {
+            mix.classes.truncate(n_subjects_data);
+            mix.rbar.truncate(n_subjects_data);
+        }
     }
 
     // ---- Post-SAEM: build final parameters ----

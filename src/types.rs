@@ -9879,15 +9879,21 @@ pub struct FitOptions {
     /// former fixed length and Monolix's minimum). Ignored when
     /// `saem_n_exploration` is `Some`.
     pub saem_exploration_min: usize,
-    /// Maximum exploration length under the automatic stop (default 2000, between
-    /// NONMEM's default `NBURN` of 1000 and its `AUTO=1` value of 4000; the test's
-    /// longest window is 500). Ignored when `saem_n_exploration` is `Some`.
+    /// Maximum exploration length under the automatic stop (default 4000, NONMEM's
+    /// `NBURN` under `AUTO=1`). Ignored when `saem_n_exploration` is `Some`.
     pub saem_exploration_max: usize,
     /// Exponent `a` of the convergence-phase step `γ_k = 1/(k − K1)^a`
     /// (default `1.0`, the classical Kuhn–Lavielle choice; Monolix uses `0.7`).
     /// Must lie in `(0.5, 1]` — the Robbins–Monro conditions `Σγ = ∞`, `Σγ² < ∞`.
     pub saem_smoothing_exponent: f64,
     pub saem_n_convergence: usize,
+    /// Independent η chains per subject in SAEM (default `2`, NONMEM's `ISAMPLE=2`).
+    /// Each SAEM iteration draws one η per chain and the sufficient statistics and
+    /// M-step use all of them, which lowers the Monte Carlo noise of every
+    /// iteration. Implemented as Monolix describes its chains: the dataset is
+    /// replicated `n` times for the SAEM iterations, and the final EBEs, OFV and
+    /// covariance step use the original subjects. `1` is the single-chain SAEM.
+    pub saem_n_chains: usize,
     /// Number of block-kernel MH proposals per subject per SAEM outer
     /// iteration, or `0` — the default, written `n_mh_steps = auto` in a model
     /// file — to size it from the dataset.
@@ -10761,9 +10767,10 @@ impl Default for FitOptions {
             global_maxeval: 0,
             saem_n_exploration: None,
             saem_exploration_min: 150,
-            saem_exploration_max: 2000,
+            saem_exploration_max: 4000,
             saem_smoothing_exponent: 1.0,
-            saem_n_convergence: 250,
+            saem_n_convergence: 1000,
+            saem_n_chains: 2,
             // 0 = `auto`: resolved from the dataset by
             // `estimation::saem::auto_n_mh_steps` (#1459).
             saem_n_mh_steps: 0,
@@ -12399,6 +12406,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "n_exploration_max",
             "smoothing_exponent",
             "n_convergence",
+            "n_chains",
             "n_mh_steps",
             "n_leapfrog",
             "saem_n_leapfrog",

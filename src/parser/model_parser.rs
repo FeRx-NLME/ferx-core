@@ -12666,6 +12666,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.saem_smoothing_exponent = v;
         }
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
+        "n_chains" => {
+            let n = parse_usize("n_chains")?;
+            if n == 0 {
+                return Err("fit option `n_chains` must be at least 1".to_string());
+            }
+            opts.saem_n_chains = n;
+        }
         // `auto` (the default) sizes the block kernel from the dataset — see
         // `estimation::saem::auto_n_mh_steps` (#1459). It is spelled out here
         // rather than left as a bare 0 so a model file can say what it means.

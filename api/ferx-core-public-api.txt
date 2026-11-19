@@ -3424,6 +3424,7 @@ pub ferx_core::types::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::types::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::types::FitOptions::saem_mstep_draws: usize
 pub ferx_core::types::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
+pub ferx_core::types::FitOptions::saem_n_chains: usize
 pub ferx_core::types::FitOptions::saem_n_convergence: usize
 pub ferx_core::types::FitOptions::saem_n_exploration: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_n_leapfrog: usize
@@ -5136,6 +5137,7 @@ pub ferx_core::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::FitOptions::saem_mstep_damping: core::option::Option<f64>
 pub ferx_core::FitOptions::saem_mstep_draws: usize
 pub ferx_core::FitOptions::saem_mstep_solver: ferx_core::SaemMstepSolver
+pub ferx_core::FitOptions::saem_n_chains: usize
 pub ferx_core::FitOptions::saem_n_convergence: usize
 pub ferx_core::FitOptions::saem_n_exploration: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_n_leapfrog: usize

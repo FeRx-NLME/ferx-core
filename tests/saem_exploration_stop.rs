@@ -210,3 +210,27 @@ fn smoothing_exponent_out_of_range_is_rejected_from_the_api() {
         assert!(msg.contains("smoothing_exponent"), "{bad}: {msg}");
     }
 }
+
+/// Two chains per subject are the default (NONMEM `ISAMPLE=2`). The chains are
+/// an internal replication of the subjects for the SAEM iterations only: the
+/// result has one row per *data* subject with the data's ids, and a different
+/// chain count gives a different fit on the same seed (so the option is live).
+#[test]
+fn two_chains_are_the_default_and_the_result_keeps_the_data_subjects() {
+    assert_eq!(FitOptions::default().saem_n_chains, 2);
+    let fixed = |o: &mut FitOptions| o.saem_n_exploration = Some(30);
+    let two = run(fixed);
+    let one = run(|o| {
+        fixed(o);
+        o.saem_n_chains = 1;
+    });
+    let model = parse_model_string(MODEL).unwrap();
+    let pop = population(&model);
+    for r in [&two, &one] {
+        assert_eq!(r.subjects.len(), pop.subjects.len());
+        for (s, d) in r.subjects.iter().zip(&pop.subjects) {
+            assert_eq!(s.id, d.id, "no chain copy leaks into the result");
+        }
+    }
+    assert_ne!(two.theta, one.theta, "the chain count changes the fit");
+}

@@ -24,13 +24,19 @@ SAEM replaces the deterministic inner loop of FOCE with stochastic sampling, fol
 
 Step size $\gamma_k = 1$. The algorithm explores the parameter space rapidly, with the sufficient statistics being fully replaced each iteration. This allows fast movement toward the basin of the MLE.
 
-By default K1 is **chosen by the run** (see [the automatic stop](#exploration-stop)): at least 150 iterations (`n_exploration_min`), at most 2000 (`n_exploration_max`). Setting `n_exploration = n` instead fixes K1 = n and turns the automatic stop off.
+By default K1 is **chosen by the run** (see [the automatic stop](#exploration-stop)): at least 150 iterations (`n_exploration_min`), at most 4000 (`n_exploration_max`). Setting `n_exploration = n` instead fixes K1 = n and turns the automatic stop off.
 
-### Phase 2: Convergence (iterations K1+1 to K1+K2)
+### Phase 2: Convergence (iterations K1+1 to K1+K2) {#phase-2}
 
 Step size $\gamma_k = 1/(k - K_1)^a$, with $a = 1$ by default (`smoothing_exponent`). The algorithm performs a decreasing-weight average, which guarantees almost-sure convergence to the MLE under regularity conditions (the Robbins-Monro conditions need $a \in (1/2, 1]$).
 
-Default: 250 iterations.
+Default: 1000 iterations (NONMEM's `NITER` default).
+
+**Why 1000.** With $a = 1$ the averaging phase removes an offset left by the exploration phase only like $K_2^{-\lambda}$, where λ is the rate at which EM contracts in that direction — a slow, Robbins–Monro regime whenever λ < ½. Traced runs on `warfarin_iov_saem` measured λ ≈ 0.1–0.36 along the ETA_CL / KAPPA_CL ridge, so the estimate largely keeps where exploration ended: at the former 250 iterations an exploration of 500 ended +0.32 (−2 log L, paired over 5 seeds) worse than one of 150 — not because exploring longer hurts, but because averaging could not undo where the longer exploration happened to stop (from poor initial estimates the difference disappears). Lengthening the phase improved every set measured, paired against 250 (automatic exploration): 500 / 1000 / 2000 iterations gave −0.20 / −0.34 / −0.44 on the pk2_big stand-in (10/10 seeds better), −0.23 / −0.30 / −0.36 on `warfarin_iov_saem` (5/5) and −0.08 / −0.11 / −0.19 on `two_cpt_oral_cov`, at +20 / +53 / +120 % CPU. Polyak–Ruppert iterate averaging (exponent 0.7 or 0.8, mean over the last ½ or ¾) was measured as the alternative and is not used: −0.50 on the stand-in but +0.30 (sd 0.67) on `warfarin_iov_saem` and +0.15 on `two_cpt_oral_cov`.
+
+### Chains {#chains}
+
+`n_chains` (default **2**, NONMEM's `ISAMPLE=2`) independent η chains are run per subject. Each SAEM iteration draws one η per chain, and the sufficient statistics and the M-step use all of them, which lowers the Monte Carlo noise of every iteration. It is implemented the way Monolix describes its chains — the data set is replicated `n_chains` times for the SAEM iterations (chain 1 keeps the subjects' own random streams), and the final EBEs, OFV and covariance step use the original subjects. (Monolix's own default is to add chains until at least 50 subjects are sampled, `minIndivForChains = 50`.) With the automatic exploration stop and 1000 averaging iterations, two chains against one: pk2_big stand-in +1.22 → **+0.73** (mean gap, 10 seeds; sd 0.51 → 0.28), `warfarin_iov_saem` (10 subjects) +0.42 → **+0.11** (sd 0.56 → 0.10), at 2.5–3× the CPU per fit. On `two_cpt_oral_cov` two chains ended a little more often in a ridge region around $\omega^2_{V1}$ ≈ 0.15 (about +2, against the optimum's 0.11; importance-sampled estimation started there walks back to the optimum) — both chain counts reach it and the deeper V1–KA trap on some seeds, so it is a property of that surface, not of the chains: one chain on the data set duplicated is bit-for-bit the two-chain fit. Set `n_chains = 1` for the single-chain SAEM.
 
 ### The exploration stop {#exploration-stop}
 
@@ -41,8 +47,8 @@ Monolix ends exploration by an automatic stop (on by default) between a minimum 
 #### The rule {#exploration-stop-rule}
 
 - **Tracked coordinates.** The complete-data −log L $\sum_i -\log p(y_i, \eta_i;\theta,\Omega,\sigma)$ at the current draws (the `condNLL` that `verbose` prints), θ, log Ω<sub>jj</sub>, the correlations $\Omega_{jk}/\sqrt{\Omega_{jj}\Omega_{kk}}$ (and the same for Ω<sub>IOV</sub>), and log σ. A fixed parameter or structural zero is constant and cannot drift.
-- **Test.** For each coordinate, its latest ten iterates spaced `c` apart (NONMEM `CITER=10`, `CINTERVAL=c`) are regressed on the iteration number, and the slope is tested against zero with a Student t (8 degrees of freedom, two-sided 1 %, NONMEM `CALPHA=0.01`). The spacing `c` is the coordinate's integrated autocorrelation time (Geyer initial-positive sequence, on the linearly detrended series after the 20 burn-in iterations), clamped to 10–50, so the ten points are close to independent. A coordinate whose series is still shorter than `10 × c` is not yet testable and blocks the stop. The test runs every 10 iterations.
-- **Why the spacing.** An earlier version of this rule tested five 20-iteration batch means over the trailing 100 iterations. Traced long runs showed integrated autocorrelation times of ~35 iterations at the median and 90–170 at the 90th percentile, so those batches were far from independent: on the stationary tail of the traces each coordinate was flagged 12–23 % of the time against a nominal 5 %, and the rule stopped when, by chance, every coordinate passed in the same window (on the pk2_big stand-in below, ω²<sub>Q</sub> was still 40–90 % above its plateau at the stop). Calibration of the spaced test on simulated AR(1) noise, 2000 iterations: false-trend rate 1.0 % / 1.5 % / 2.8 % at lag-1 correlation 0 / 0.9 / 0.97.
+- **Test.** For each coordinate, its latest ten iterates spaced `c` apart (NONMEM `CITER=10`, `CINTERVAL=c`) are regressed on the iteration number, and the slope is tested against zero with a Student t (8 degrees of freedom, two-sided 5 %, NONMEM `CALPHA=0.05` as under `AUTO=1`). The spacing `c` is the coordinate's integrated autocorrelation time (Geyer initial-positive sequence, on the linearly detrended series after the 20 burn-in iterations), clamped to 10–50, so the ten points are close to independent. A coordinate whose series is still shorter than `10 × c` is not yet testable and blocks the stop. The test runs every 10 iterations.
+- **Why the spacing.** An earlier version of this rule tested five 20-iteration batch means over the trailing 100 iterations. Traced long runs showed integrated autocorrelation times of ~35 iterations at the median and 90–170 at the 90th percentile, so those batches were far from independent: on the stationary tail of the traces each coordinate was flagged 12–23 % of the time against a nominal 5 %, and the rule stopped when, by chance, every coordinate passed in the same window (on the pk2_big stand-in below, ω²<sub>Q</sub> was still 40–90 % above its plateau at the stop). Calibration of the spaced test on simulated AR(1) noise, 2000 iterations: false-trend rate 6.8 % / 6.5 % / 11.3 % at lag-1 correlation 0 / 0.9 / 0.97 (nominal 5 %).
 - **Rule.** Exploration ends at the first check ≥ `n_exploration_min` at which every tracked coordinate is testable and none trends, and never later than `n_exploration_max`. The shortest test window is 100 iterations (ten points at spacing 10), the longest 500; an `n_exploration_max` below 100 can never be tested and the fit warns.
 - **The Ω exploration step cap is kept.** Removing it alone made the E-step unstable in the investigation that led here; with the automatic stop the cap only slows the decay, and the stop waits for it.
 - **Precedence.** `n_exploration` present in the model file (or `saem_n_exploration = Some(n)` in code) is a *fixed* length: `n_exploration_min` / `n_exploration_max` are ignored, no test runs. Absent, the stop is automatic.
@@ -50,26 +56,19 @@ Monolix ends exploration by an automatic stop (on by default) between a minimum 
 
 #### Measured {#exploration-stop-measured}
 
-A public stand-in for `pk2_big` (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples), the `warfarin_iov_saem` example and the 5-η `two_cpt_oral_cov` example; `--threads 2`, gap = importance-sampled −2 log L (3000 samples) above the best value reached — for the stand-in, an IMP estimate started from FOCEI (−4802.85, $\omega^2_Q$ 0.0057).
+A public stand-in for `pk2_big` (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples), the `warfarin_iov_saem` example (10 subjects) and the 5-η `two_cpt_oral_cov` example (30 subjects); `--threads 2`, gap = importance-sampled −2 log L (3000 samples) above the best value reached — for the stand-in, an IMP estimate started from FOCEI (−4802.85, $\omega^2_Q$ 0.0057). Mean gap over seeds:
 
-| set (seeds) | schedule | gap median (range) | K1 | CPU / fit |
-|---|---|---|---|---|
-| pk2s (15) | fixed 150 (old default) | +5.17 (3.42–6.64) | 150 | 7.2 s |
-| | 100-iteration batch-means rule (earlier version) | +3.00 (1.23–4.20) | 273–500 | 8.4 s |
-| | fixed 500 | +2.00 (1.20–2.65) | 500 | 8.7 s |
-| | **automatic (this rule)** | +1.80 (0.97–4.52) | 830–1700 | 11.7 s |
-| wiov (5) | fixed 150 | +0.10 (0.02–0.28) | 150 | 1.0 s |
-| | fixed 500 | +0.44 (0.22–0.61) | 500 | 1.3 s |
-| | **automatic** | +0.46 (0.20–0.61) | 310–560 | 1.3 s |
-| two_cpt_oral_cov (5) | fixed 150 | +0.42 (0.02–37.11) | 150 | 0.9 s |
-| | fixed 500 | +0.41 (0.00–37.32) | 500 | 1.1 s |
-| | **automatic** | +0.52 (0.11–36.91) | 540–690 | 1.2 s |
+| set (seeds) | old default: 150 + 250, 1 chain | automatic + 1000, 1 chain | **default: automatic + 1000, 2 chains** | K1 (default) | CPU / fit: old → default |
+|---|---|---|---|---|---|
+| pk2s (10) | +4.85 | +1.22 | **+0.73** | 1190–3150 | 7.1 → 51 s |
+| wiov (5) | +0.20 | +0.42 | **+0.11** | 500–800 | 1.0 → 5.9 s |
+| two_cpt_oral_cov (20) | 9 / 20 seeds within 0.5 of the optimum at 1 chain, ~5 / 20 within 0.6 at 2 chains; about half of all seeds end in the V1–KA trap under every schedule | | | 500–860 | 0.9 → 4.4 s |
 
-The automatic stop brings $\omega^2_Q$ closest to the IMP estimate (median 0.0158 against 0.0198 at fixed 500 and 0.0318 at 150), but paired by seed its −2 log L is not distinguishable from fixed 500 (better on 7 of 15 seeds, median paired difference +0.5 against an IS noise of ~0.4) at +35 % CPU; on the two easier sets every schedule from 500 iterations up lies within a few tenths of each other. The remaining ~2 on pk2s is not an exploration-length effect: a fixed 1500 gives +1.97. Seeds 2 and 4 of `two_cpt_oral_cov` end in a V1–KA trade-off mode under every schedule.
+Fixed exploration lengths, measured with 250 averaging iterations on the stand-in (15 seeds, median gap): 150 → +5.17, 500 → +2.00, 1500 → +1.97; the 100-iteration batch-means rule this replaces, +3.00.
 
 #### Maximum and smoothing exponent {#exploration-stop-max}
 
-**Maximum.** 2000, between NONMEM's default `NBURN` (1000) and its `AUTO=1` value (4000). The stand-in needed 830–1700; the longest test window is 500, so a maximum near 500 would turn the rule into a fixed length for any coordinate with an autocorrelation time of 50 or more.
+**Maximum.** 4000, NONMEM's `NBURN` under `AUTO=1`. The stand-in stopped at 1190–3150 with two chains; the longest test window is 500, so a maximum near 500 would turn the rule into a fixed length for any coordinate with an autocorrelation time of 50 or more.
 
 **Smoothing exponent.** `smoothing_exponent = 0.7` (Monolix's $\gamma_k = 1/(k-K_1)^{0.7}$) was measured with the earlier 150–500 rule and is *not* the default, because it was worse on an easy model: wiov +0.08 → +0.45 (median gap), pk1 +0.04 → +0.05, pk1_sparse +2.53 → +2.91, against pk2_big +2.94 → +2.54 and corr +0.16 → +0.11. The option is there for users who want it.
 
@@ -1544,11 +1543,12 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 ```
 [fit_options]
   method        = saem
-  # n_exploration = 150    # Phase 1 length; omit for the automatic stop (150..2000)
+  # n_exploration = 150    # Phase 1 length; omit for the automatic stop (150..4000)
   n_exploration_min = 150  # automatic stop only
-  n_exploration_max = 2000 # automatic stop only
+  n_exploration_max = 4000 # automatic stop only
   smoothing_exponent = 1.0 # Phase 2 step 1/(k-K1)^a
-  n_convergence = 250      # Phase 2 iterations
+  n_convergence = 1000     # Phase 2 iterations
+  n_chains      = 2        # eta chains per subject (NONMEM ISAMPLE)
   n_mh_steps    = auto     # block-MH steps/subject/iteration, or `auto` (see above)
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
   adapt_interval = 50      # Step-size adaptation frequency (interval rule)
