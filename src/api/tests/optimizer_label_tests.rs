@@ -14,7 +14,6 @@
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
-use std::collections::HashMap;
 
 /// A 2-class closed-form mixture model (class-specific CL). No covariate in the
 /// mixing logit, so the fixture subjects need no covariate columns.
@@ -89,17 +88,11 @@ fn assert_analytic_scope(model: &CompiledModel) {
 fn auto_label_is_nlopt_lbfgs_for_a_mixture_too() {
     let model = parse(MIXTURE);
     assert!(model.mixture.is_some());
-    for (method, interaction) in [
-        (EstimationMethod::Foce, false),
-        (EstimationMethod::FoceI, true),
-    ] {
+    for (method, interaction) in [(EstimationMethod::Foce, false), (EstimationMethod::FoceI, true)]
+    {
         assert_analytic_scope(&model);
-        let opts = FitOptions {
-            method,
-            interaction,
-            optimizer: Optimizer::Auto,
-            ..Default::default()
-        };
+        let opts =
+            FitOptions { method, interaction, optimizer: Optimizer::Auto, ..Default::default() };
         assert_eq!(
             reported_optimizer_label(method, &opts, &model, true),
             "auto (nlopt_lbfgs)",
@@ -125,10 +118,7 @@ fn auto_label_is_nlopt_lbfgs_for_a_mixture_too() {
 fn explicit_optimizer_label_reports_the_mixture_replacement() {
     let model = parse(MIXTURE);
     let label = |optimizer, has_mixture| {
-        let opts = FitOptions {
-            optimizer,
-            ..Default::default()
-        };
+        let opts = FitOptions { optimizer, ..Default::default() };
         reported_optimizer_label(EstimationMethod::FoceI, &opts, &model, has_mixture)
     };
     for (optimizer, own) in [
@@ -136,16 +126,8 @@ fn explicit_optimizer_label_reports_the_mixture_replacement() {
         (Optimizer::Lbfgs, "lbfgs"),
         (Optimizer::TrustRegion, "trust_region"),
     ] {
-        assert_eq!(
-            label(optimizer, true),
-            "nlopt_lbfgs",
-            "{optimizer:?} under a mixture"
-        );
-        assert_eq!(
-            label(optimizer, false),
-            own,
-            "{optimizer:?} without a mixture"
-        );
+        assert_eq!(label(optimizer, true), "nlopt_lbfgs", "{optimizer:?} under a mixture");
+        assert_eq!(label(optimizer, false), own, "{optimizer:?} without a mixture");
     }
     for (optimizer, own) in [
         (Optimizer::NloptLbfgs, "nlopt_lbfgs"),
@@ -153,50 +135,23 @@ fn explicit_optimizer_label_reports_the_mixture_replacement() {
         (Optimizer::Mma, "mma"),
         (Optimizer::Bobyqa, "bobyqa"),
     ] {
-        assert_eq!(
-            label(optimizer, true),
-            own,
-            "{optimizer:?} is honoured under a mixture"
-        );
+        assert_eq!(label(optimizer, true), own, "{optimizer:?} is honoured under a mixture");
     }
 }
 
 fn subject(id: &str, cl: f64) -> Subject {
     let obs_times: Vec<f64> = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.0];
-    let observations: Vec<f64> = obs_times
-        .iter()
-        .map(|t| 100.0 / 10.0 * (-cl / 10.0 * t).exp())
-        .collect();
+    let observations: Vec<f64> =
+        obs_times.iter().map(|t| 100.0 / 10.0 * (-cl / 10.0 * t).exp()).collect();
     let n = obs_times.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -208,12 +163,7 @@ fn subject(id: &str, cl: f64) -> Subject {
 #[test]
 fn fit_reports_the_mixture_rule_for_a_mixture_model() {
     let pop = Population {
-        subjects: vec![
-            subject("1", 1.0),
-            subject("2", 1.2),
-            subject("3", 3.0),
-            subject("4", 2.8),
-        ],
+        subjects: vec![subject("1", 1.0), subject("2", 1.2), subject("3", 3.0), subject("4", 2.8)],
         covariate_names: Vec::new(),
         dv_column: "DV".into(),
         input_columns: Vec::new(),
@@ -239,11 +189,6 @@ fn fit_reports_the_mixture_rule_for_a_mixture_model() {
         let model = parse(src);
         assert_analytic_scope(&model);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
-        assert_eq!(
-            result.optimizer,
-            want,
-            "{optimizer:?}, mixture = {}",
-            model.mixture.is_some()
-        );
+        assert_eq!(result.optimizer, want, "{optimizer:?}, mixture = {}", model.mixture.is_some());
     }
 }

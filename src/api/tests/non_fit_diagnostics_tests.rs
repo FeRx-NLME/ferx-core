@@ -121,10 +121,7 @@ fn has(warnings: &[String], token: &str) -> bool {
 /// here. The property these arms pin is the bundle, never that note; its absence is pinned under
 /// a binary-local guard in `tests/ss_absorption_nonmem_anchor.rs`.
 fn without_ss_sink_note(warnings: &[String]) -> Vec<&String> {
-    warnings
-        .iter()
-        .filter(|w| !w.contains("Steady-state (SS=1) equilibration"))
-        .collect()
+    warnings.iter().filter(|w| !w.contains("Steady-state (SS=1) equilibration")).collect()
 }
 
 const SS_II: &str = "SS=1 doses with missing or non-positive II";
@@ -177,10 +174,7 @@ fn simulate_carries_the_model_data_bundle_that_simulate_used_to_drop() {
         &pop_ss_bad_ii(1),
         &m.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(7), ..Default::default() },
     )
     .expect("simulate");
     assert!(
@@ -193,10 +187,7 @@ fn simulate_carries_the_model_data_bundle_that_simulate_used_to_drop() {
         &pop(1),
         &m.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(7), ..Default::default() },
     )
     .expect("simulate");
     assert!(
@@ -320,10 +311,7 @@ fn predict_reports_a_freeze_padded_segment_instead_of_serving_it_silently() {
 /// green and fails this one.
 #[test]
 fn simulate_reports_a_freeze_padded_segment_instead_of_serving_it_silently() {
-    let opts = SimulateOptions {
-        seed: Some(3),
-        ..Default::default()
-    };
+    let opts = SimulateOptions { seed: Some(3), ..Default::default() };
     let m = ode_model(1e5, 20);
     let out = simulate_with_options_diag(&m, &pop(2), &m.default_params, 1, &opts).expect("sim");
     assert!(
@@ -334,11 +322,7 @@ fn simulate_reports_a_freeze_padded_segment_instead_of_serving_it_silently() {
     let clean_m = ode_model(1.0, 10_000);
     let clean = simulate_with_options_diag(&clean_m, &pop(2), &clean_m.default_params, 1, &opts)
         .expect("sim");
-    assert!(
-        !has(&clean.warnings, SOLVER),
-        "…and stay silent on a clean one: {:?}",
-        clean.warnings
-    );
+    assert!(!has(&clean.warnings, SOLVER), "…and stay silent on a clean one: {:?}", clean.warnings);
 }
 
 /// `predict()`'s scope must be **per subject task**, not one on the calling thread.
@@ -371,10 +355,7 @@ fn predicts_solver_counters_cover_every_subject_not_just_the_calling_threads() {
 fn segment_count(warnings: &[String]) -> Option<usize> {
     let w = warnings.iter().find(|w| w.contains(FREEZE_PAD))?;
     let head = &w[..w.find(FREEZE_PAD)?];
-    head.rsplit(|c: char| !c.is_ascii_digit())
-        .find(|s| !s.is_empty())?
-        .parse()
-        .ok()
+    head.rsplit(|c: char| !c.is_ascii_digit()).find(|s| !s.is_empty())?.parse().ok()
 }
 
 // ── the shared bundle ────────────────────────────────────────────────────────
@@ -405,11 +386,7 @@ fn every_diagnostic_carrying_entry_point_reports_the_same_bundle() {
     // make this a test of the other one alone.
     let m = ode_model(1e5, 20);
     let p = pop_ss_bad_ii(2);
-    let opts = |mm| SimulateOptions {
-        seed: Some(11),
-        match_method: mm,
-        ..Default::default()
-    };
+    let opts = |mm| SimulateOptions { seed: Some(11), match_method: mm, ..Default::default() };
 
     let from_predict = codes(&predict_diag(&m, &p, &m.default_params).unwrap().warnings);
     assert!(
@@ -452,10 +429,7 @@ fn every_diagnostic_carrying_entry_point_reports_the_same_bundle() {
                 .warnings,
             ),
         ),
-        (
-            "simulate_with_uncertainty_diag",
-            codes(&uncertainty.warnings),
-        ),
+        ("simulate_with_uncertainty_diag", codes(&uncertainty.warnings)),
     ] {
         assert_eq!(
             from_predict, got,
@@ -464,11 +438,7 @@ fn every_diagnostic_carrying_entry_point_reports_the_same_bundle() {
         );
     }
     // The uncertainty run's solver counters are its own, over every draw (#1645).
-    let solver = uncertainty
-        .warnings
-        .iter()
-        .find(|w| w.contains(SOLVER))
-        .expect("solver half");
+    let solver = uncertainty.warnings.iter().find(|w| w.contains(SOLVER)).expect("solver half");
     assert!(
         solver.contains("from this simulate_with_uncertainty() run over all parameter draws")
             && solver.contains("at the drawn parameter sets"),
@@ -501,30 +471,7 @@ fn simulate_adaptive_reports_both_halves_of_the_bundle() {
 
     // Same starved-budget ODE the adaptive suite uses, plus an `SS=1, II=0` base dose so the
     // model/data half is live alongside the solver half.
-    let m = parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-[fit_options]
-  ode_method = rk45
-  ode_max_steps = 2
-"#,
-    )
-    .expect("parse");
+    let m = parse_model_string(crate::test_models::ODE_4).expect("parse");
 
     let obs_times = vec![6.0, 30.0, 54.0];
     let subject = Subject {
@@ -582,31 +529,8 @@ fn simulate_adaptive_reports_both_halves_of_the_bundle() {
 fn simulate_adaptive_withholds_no_doses_and_only_there() {
     use crate::sim::adaptive::{ControllerCtx, DoseAction};
 
-    let m = parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(5.0, 0.1, 50.0)
-  theta TVV(50.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.09
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  ode(states=[central])
-[odes]
-  d/dt(central) = -(CL / V) * central
-[scaling]
-  y = central
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse");
-    assert!(
-        !m.is_algebraic(),
-        "the filter's own predicate must not be what hides it"
-    );
+    let m = parse_model_string(crate::test_models::ODE_5).expect("parse");
+    assert!(!m.is_algebraic(), "the filter's own predicate must not be what hides it");
     let obs_times = vec![6.0, 30.0, 54.0];
     let subject = Subject {
         id: "1".into(),
@@ -649,10 +573,7 @@ fn simulate_adaptive_withholds_no_doses_and_only_there() {
         &population,
         &m.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(1),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(1), ..Default::default() },
     )
     .expect("sim")
     .warnings;
@@ -692,16 +613,10 @@ fn the_row_only_entry_points_stay_silent_by_contract() {
     // `predict` → rows only, and they are the `_diag` form's rows.
     assert_eq!(
         predict(&m, &p, &m.default_params).unwrap().len(),
-        predict_diag(&m, &p, &m.default_params)
-            .unwrap()
-            .results
-            .len()
+        predict_diag(&m, &p, &m.default_params).unwrap().results.len()
     );
     // `simulate_with_options` → rows only, from an output that *did* carry warnings.
-    let opts = SimulateOptions {
-        seed: Some(5),
-        ..Default::default()
-    };
+    let opts = SimulateOptions { seed: Some(5), ..Default::default() };
     let diag = simulate_with_options_diag(&m, &p, &m.default_params, 1, &opts).expect("sim");
     let rows = simulate_with_options(&m, &p, &m.default_params, 1, &opts).expect("sim");
     assert!(
@@ -735,15 +650,7 @@ fn simulate_with_uncertainty_is_its_diag_forms_rows_bit_for_bit() {
             #[allow(unreachable_patterns)]
             _ => panic!("a Gaussian fixture simulates continuous rows: {r:?}"),
         };
-        (
-            r.draw,
-            r.sim,
-            r.id.clone(),
-            r.time.to_bits(),
-            r.cmt,
-            r.ipred.to_bits(),
-            value,
-        )
+        (r.draw, r.sim, r.id.clone(), r.time.to_bits(), r.cmt, r.ipred.to_bits(), value)
     };
     assert_eq!(rows.len(), 2 * 2 * 2 * p.subjects[0].obs_times.len());
     assert!(rows.iter().all(|r| r.ipred.is_finite()), "{rows:?}");
@@ -777,9 +684,7 @@ fn simulate_with_uncertainty_diag_filters_reader_warnings_like_fit() {
 
     let run = |m: &CompiledModel| {
         let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
-        simulate_with_uncertainty_diag(m, &p, &fit, &uncertainty_opts())
-            .expect("sim")
-            .warnings
+        simulate_with_uncertainty_diag(m, &p, &fit, &uncertainty_opts()).expect("sim").warnings
     };
     let suppressed = run(&algebraic);
     assert!(
@@ -842,10 +747,7 @@ fn the_message_names_the_pass_that_produced_the_counters() {
         "the structured payload must carry the phase too — a consumer reading back a \
          {{model}}-fit.yaml keys off it"
     );
-    assert!(
-        !from_predict.contains("  "),
-        "no run of blank space may reach a user: {from_predict}"
-    );
+    assert!(!from_predict.contains("  "), "no run of blank space may reach a user: {from_predict}");
     // `simulate` says "and replicates": it integrates `n_sim` copies of each subject, so its
     // counters are not comparable with a one-pass-per-subject sweep's.
     let (from_simulate, _) =
@@ -880,10 +782,7 @@ fn the_message_names_the_pass_that_produced_the_counters() {
 fn the_abandoned_clause_and_the_escalation_note_carry_the_phase() {
     let o = FitOptions::default();
     let (abandoned, _) = ode_solver_diagnostics_warning(
-        &crate::ode::OdeSolverStats {
-            abandoned_non_finite_timeline: 2,
-            ..Default::default()
-        },
+        &crate::ode::OdeSolverStats { abandoned_non_finite_timeline: 2, ..Default::default() },
         &o,
         SolverStatsPhase::Simulate,
     )
@@ -928,16 +827,9 @@ fn the_reported_ode_method_is_the_models_own_not_the_fitoptions_default() {
         FitOptions::default().ode_method,
         "this test is vacuous unless the fixture's method differs from the default"
     );
-    assert_eq!(
-        solver_reporting_options(&m).ode_method,
-        crate::ode::OdeMethod::Rk45
-    );
+    assert_eq!(solver_reporting_options(&m).ode_method, crate::ode::OdeMethod::Rk45);
     let out = predict_diag(&m, &pop(1), &m.default_params).unwrap();
-    let w = out
-        .warnings
-        .iter()
-        .find(|w| w.contains(SOLVER))
-        .expect("a solver warning");
+    let w = out.warnings.iter().find(|w| w.contains(SOLVER)).expect("a solver warning");
     assert!(
         w.contains("ode_method = rk45"),
         "the message must name the method the model runs at: {w}"
@@ -954,9 +846,8 @@ fn the_reported_ode_method_is_the_models_own_not_the_fitoptions_default() {
 #[test]
 fn the_solver_warning_reads_only_the_two_options_this_view_carries() {
     let src = include_str!("../postfit.rs");
-    let start = src
-        .find("pub(crate) fn ode_solver_diagnostics_warning(")
-        .expect("the function must exist");
+    let start =
+        src.find("pub(crate) fn ode_solver_diagnostics_warning(").expect("the function must exist");
     // Its body ends at the next item at column 0 after it.
     let end = start
         + src[start..]
@@ -971,9 +862,7 @@ fn the_solver_warning_reads_only_the_two_options_this_view_carries() {
         .filter_map(|(i, _)| {
             let tail = body[i + "options".len()..].trim_start();
             let tail = tail.strip_prefix('.')?;
-            let n = tail
-                .find(|c: char| !c.is_alphanumeric() && c != '_')
-                .unwrap_or(tail.len());
+            let n = tail.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(tail.len());
             Some(&tail[..n])
         })
         .collect();
@@ -1061,10 +950,7 @@ fn a_dv_free_simulation_template_does_not_trip_the_dv_reading_member_of_the_bund
         &template,
         &m.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(2),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(2), ..Default::default() },
     )
     .expect("sim");
     assert!(
@@ -1137,8 +1023,7 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     // (2) `Population::warnings` — the data reader's own findings.
     let m = analytic_model();
     let mut p = pop_ss_bad_ii(1);
-    p.warnings
-        .push("W_ADDL_MISSING_II: subject '1' has ADDL with no II".into());
+    p.warnings.push("W_ADDL_MISSING_II: subject '1' has ADDL with no II".into());
     let out = predict_diag(&m, &p, &m.default_params).unwrap();
     assert!(
         has(&out.warnings, "W_ADDL_MISSING_II"),
@@ -1147,9 +1032,7 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     );
     assert!(
         !has(
-            &predict_diag(&m, &pop_ss_bad_ii(1), &m.default_params)
-                .unwrap()
-                .warnings,
+            &predict_diag(&m, &pop_ss_bad_ii(1), &m.default_params).unwrap().warnings,
             "W_ADDL_MISSING_II"
         ),
         "…and must not appear when the population carries none"
@@ -1163,15 +1046,9 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     // only for specific malformed inputs, and the property under test is that the *source* is
     // read, not which strings that source can hold.
     let mut with_parse_warning = ode_model(1.0, 10_000);
-    with_parse_warning
-        .parse_warnings
-        .push("W_TEST_PARSE: injected parse warning".into());
-    let with_parse = predict_diag(
-        &with_parse_warning,
-        &pop(1),
-        &with_parse_warning.default_params,
-    )
-    .unwrap();
+    with_parse_warning.parse_warnings.push("W_TEST_PARSE: injected parse warning".into());
+    let with_parse =
+        predict_diag(&with_parse_warning, &pop(1), &with_parse_warning.default_params).unwrap();
     assert!(
         has(&with_parse.warnings, "W_TEST_PARSE"),
         "a parse warning must reach predict_diag — `W_ABSORPTION_TWIN_DECLINED` changes what \
@@ -1181,9 +1058,7 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     let clean = ode_model(1.0, 10_000);
     assert!(
         !has(
-            &predict_diag(&clean, &pop(1), &clean.default_params)
-                .unwrap()
-                .warnings,
+            &predict_diag(&clean, &pop(1), &clean.default_params).unwrap().warnings,
             "W_TEST_PARSE"
         ),
         "…and must not appear on a model that carries none"
@@ -1200,9 +1075,7 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
     );
     assert!(
         !has(
-            &predict_diag(&clean, &pop(1), &clean.default_params)
-                .unwrap()
-                .warnings,
+            &predict_diag(&clean, &pop(1), &clean.default_params).unwrap().warnings,
             "EXPERIMENTAL feature"
         ),
         "…and a non-experimental model must not carry one"
@@ -1215,17 +1088,10 @@ fn the_bundle_carries_every_model_and_data_source_fit_carries() {
         &p,
         &m.default_params,
         1,
-        &SimulateOptions {
-            seed: Some(4),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(4), ..Default::default() },
     )
     .expect("sim");
-    assert!(
-        has(&sim.warnings, "W_ADDL_MISSING_II"),
-        "{:?}",
-        sim.warnings
-    );
+    assert!(has(&sim.warnings, "W_ADDL_MISSING_II"), "{:?}", sim.warnings);
     assert!(has(&sim.warnings, SS_II), "{:?}", sim.warnings);
 }
 
@@ -1276,11 +1142,8 @@ fn the_bundle_excludes_the_findings_that_are_about_a_fit() {
         ..Default::default()
     };
     let option_diags = crate::api::check_model_options(&m, &opts);
-    let fit_only: Vec<String> = option_diags
-        .iter()
-        .filter(|d| !d.is_error())
-        .map(|d| d.message.clone())
-        .collect();
+    let fit_only: Vec<String> =
+        option_diags.iter().filter(|d| !d.is_error()).map(|d| d.message.clone()).collect();
     assert!(
         !fit_only.is_empty(),
         "the fixture must raise at least one option warning, or the exclusion below is \
@@ -1362,10 +1225,7 @@ fn the_informational_note_and_the_rejection_clause_name_their_pass_too() {
             !note.contains("post-fit prediction pass") && !note.contains("final estimates"),
             "{phase:?}: …and must not claim to describe a fit: {note}"
         );
-        assert!(
-            !note.contains("  "),
-            "no run of blank space may reach a user: {note}"
-        );
+        assert!(!note.contains("  "), "no run of blank space may reach a user: {note}");
 
         let (rej, _) =
             ode_solver_diagnostics_warning(&rejected, &o, phase).expect("a rejection is a warning");
@@ -1519,22 +1379,12 @@ fn predict_serves_nan_past_a_diverged_state_and_says_so() {
     assert_eq!(c.len(), 3);
     assert_eq!(d.len(), 3);
 
-    assert_eq!(
-        d[0].to_bits(),
-        c[0].to_bits(),
-        "pre-dose row: {d:?} vs {c:?}"
-    );
+    assert_eq!(d[0].to_bits(), c[0].to_bits(), "pre-dose row: {d:?} vs {c:?}");
     assert!(d[0].is_finite());
     for (i, t) in [(1, 20.0), (2, 40.0)] {
         let want = 100.0 * (-0.1f64 * (t - 12.0)).exp();
-        assert!(
-            c[i].is_finite() && (c[i] - want).abs() <= 1e-3 * want,
-            "control {c:?}"
-        );
-        assert!(
-            d[i].is_nan(),
-            "t={t} must be NaN, not a frozen value: {d:?}"
-        );
+        assert!(c[i].is_finite() && (c[i] - want).abs() <= 1e-3 * want, "control {c:?}");
+        assert!(d[i].is_nan(), "t={t} must be NaN, not a frozen value: {d:?}");
     }
 
     assert!(!has(&control.warnings, SOLVER), "{:?}", control.warnings);

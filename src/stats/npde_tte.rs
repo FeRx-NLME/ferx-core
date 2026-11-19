@@ -107,11 +107,7 @@ fn scored_cmt(model: &CompiledModel) -> Result<usize, EngineError> {
         }
         [only] => *only,
         several => {
-            let list = several
-                .iter()
-                .map(usize::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
+            let list = several.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
             return Err(refuse(format!(
                 "compute_tte_npde: the model has TTE endpoints on cmt {list} (competing risks). \
                  npde under competing risks is not supported yet."
@@ -120,10 +116,7 @@ fn scored_cmt(model: &CompiledModel) -> Result<usize, EngineError> {
     };
     if matches!(
         model.endpoints.get(&cmt),
-        Some(EndpointLikelihood::Tte {
-            recurrence: TteRecurrence::Repeated { .. },
-            ..
-        })
+        Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
     ) {
         return Err(refuse(format!(
             "compute_tte_npde: cmt {cmt} is a repeated events (RTTE) endpoint. npde for \
@@ -139,8 +132,7 @@ pub(crate) type Scored = Option<(f64, f64, bool)>;
 
 /// Each subject's record on `cmt`, in population order.
 pub(crate) fn scored_records(
-    population: &Population,
-    cmt: usize,
+    population: &Population, cmt: usize,
 ) -> Result<Vec<Scored>, EngineError> {
     let mut seen: HashMap<&str, ()> = HashMap::new();
     let mut out = Vec::with_capacity(population.subjects.len());
@@ -154,13 +146,7 @@ pub(crate) fn scored_records(
         }
         let mut on_cmt = Vec::new();
         for r in &s.obs_records {
-            let ObsRecord::Event {
-                time,
-                event_type,
-                entry_time,
-                cmt: rc,
-            } = r
-            else {
+            let ObsRecord::Event { time, event_type, entry_time, cmt: rc } = r else {
                 continue;
             };
             if *rc != cmt {
@@ -207,9 +193,7 @@ pub(crate) fn scored_records(
         }
     }
     if out.iter().all(Option::is_none) {
-        return Err(refuse(format!(
-            "compute_tte_npde: no subject has a record on cmt {cmt}."
-        )));
+        return Err(refuse(format!("compute_tte_npde: no subject has a record on cmt {cmt}.")));
     }
     Ok(out)
 }
@@ -234,9 +218,7 @@ pub(crate) fn fold_warnings(all: Vec<String>, nsim: usize) -> Vec<String> {
     order
         .into_iter()
         .map(|code| {
-            let (w, n) = first
-                .remove(&code)
-                .expect("every code in `order` was inserted");
+            let (w, n) = first.remove(&code).expect("every code in `order` was inserted");
             if n == 1 {
                 w
             } else {
@@ -262,39 +244,23 @@ pub(crate) fn event_before(time: f64, observed: bool, y: f64) -> bool {
 /// one with no record), with every batch's simulator warnings.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reference_counts(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    nsim: usize,
-    seed: u64,
-    iov_occasion: Option<&IovOccasionRule>,
-    cmt: usize,
-    records: &[Scored],
+    model: &CompiledModel, population: &Population, params: &ModelParameters, nsim: usize,
+    seed: u64, iov_occasion: Option<&IovOccasionRule>, cmt: usize, records: &[Scored],
 ) -> Result<(Vec<usize>, Vec<usize>, Vec<String>), EngineError> {
     // The latest scored time: no later draw is ever compared with anything.
-    let horizon = records
-        .iter()
-        .flatten()
-        .map(|r| r.0)
-        .fold(0.0_f64, |a, b| if b > a { b } else { a });
+    let horizon =
+        records.iter().flatten().map(|r| r.0).fold(0.0_f64, |a, b| if b > a { b } else { a });
     if horizon == 0.0 {
         // Every scored time is 0 (review r1 #9). No event lies strictly before time 0,
         // so every count is exactly 0 and there is nothing to simulate: an event scores
         // at the lower clamp and a censored time is imputed on the whole of (0, 1). The
         // simulator would refuse a horizon of 0 with a message about an option this
         // function's caller never set.
-        let denominators = records
-            .iter()
-            .map(|r| if r.is_some() { nsim } else { 0 })
-            .collect();
+        let denominators = records.iter().map(|r| if r.is_some() { nsim } else { 0 }).collect();
         return Ok((vec![0; records.len()], denominators, Vec::new()));
     }
-    let by_id: HashMap<&str, usize> = population
-        .subjects
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.id.as_str(), i))
-        .collect();
+    let by_id: HashMap<&str, usize> =
+        population.subjects.iter().enumerate().map(|(i, s)| (s.id.as_str(), i)).collect();
     let mut n_before = vec![0usize; records.len()];
     let mut n_drawn = vec![0usize; records.len()];
     let mut warnings = Vec::new();
@@ -393,39 +359,22 @@ pub(crate) fn fit_time_warnings(folded: Vec<String>) -> Vec<String> {
 /// endpoint, a time that is not finite and non-negative, a duplicated subject id, or no
 /// record on the endpoint at all. Otherwise any `Err` the simulator returns.
 pub fn compute_tte_npde(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    nsim: usize,
-    seed: Option<u64>,
-    iov_occasion: Option<&IovOccasionRule>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, nsim: usize,
+    seed: Option<u64>, iov_occasion: Option<&IovOccasionRule>,
 ) -> Result<(Vec<Vec<TteNpde>>, Vec<String>), EngineError> {
     if nsim == 0 {
-        return Err(refuse(
-            "compute_tte_npde: `nsim` must be at least 1.".to_string(),
-        ));
+        return Err(refuse("compute_tte_npde: `nsim` must be at least 1.".to_string()));
     }
     let cmt = scored_cmt(model)?;
     let records = scored_records(population, cmt)?;
     let seed = effective_seed(seed);
-    let (n_before, n_drawn, warnings) = reference_counts(
-        model,
-        population,
-        params,
-        nsim,
-        seed,
-        iov_occasion,
-        cmt,
-        &records,
-    )?;
+    let (n_before, n_drawn, warnings) =
+        reference_counts(model, population, params, nsim, seed, iov_occasion, cmt, &records)?;
 
     // The simulator returns one row per replicate for every scored subject, whatever
     // the replicate's outcome, so `nsim` is the denominator.
     debug_assert!(
-        records
-            .iter()
-            .zip(&n_drawn)
-            .all(|(r, &d)| d == if r.is_some() { nsim } else { 0 }),
+        records.iter().zip(&n_drawn).all(|(r, &d)| d == if r.is_some() { nsim } else { 0 }),
         "replicates drawn per subject: {n_drawn:?}, nsim {nsim}"
     );
 
@@ -435,11 +384,7 @@ pub fn compute_tte_npde(
         .map(|(i, r)| match r {
             None => Vec::new(),
             Some((_, written, censored)) => {
-                let u = if *censored {
-                    impute_uniform(seed, i)
-                } else {
-                    0.0
-                };
+                let u = if *censored { impute_uniform(seed, i) } else { 0.0 };
                 let pd = tte_pd(n_before[i], nsim, *censored, u);
                 vec![TteNpde {
                     cmt,

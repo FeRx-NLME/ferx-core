@@ -126,3 +126,7 @@ pub use api::{
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod debug_assertion_canary;
+
+/// Model texts shared by test modules (written once instead of per test).
+#[cfg(test)]
+pub(crate) mod test_models;

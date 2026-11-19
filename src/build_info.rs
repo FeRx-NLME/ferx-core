@@ -121,10 +121,7 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// this label (#1154) — the same division of labour [`gradient_method_inner`] has with
 /// `inner_optimizer::fd_fallback_warning`.
 pub fn gradient_method_outer(
-    _build: &BuildInfo,
-    method: EstimationMethod,
-    optimizer: Optimizer,
-    model: &CompiledModel,
+    _build: &BuildInfo, method: EstimationMethod, optimizer: Optimizer, model: &CompiledModel,
 ) -> GradientMethodKind {
     match method {
         EstimationMethod::Saem
@@ -225,10 +222,7 @@ mod tests {
     #[test]
     fn inner_analytical_auto_returns_analytic() {
         let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
-        assert_eq!(
-            gradient_method_inner(&ci_build(), &m),
-            GradientMethodKind::Analytic
-        );
+        assert_eq!(gradient_method_inner(&ci_build(), &m), GradientMethodKind::Analytic);
     }
 
     #[test]
@@ -238,19 +232,13 @@ mod tests {
         // step reconverges its EBEs at the tighter `cov_inner_tol`.
         let mut m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
         m.log_transform = true;
-        assert_eq!(
-            gradient_method_inner(&ci_build(), &m),
-            GradientMethodKind::Analytic
-        );
+        assert_eq!(gradient_method_inner(&ci_build(), &m), GradientMethodKind::Analytic);
     }
 
     #[test]
     fn inner_user_forces_fd_returns_fd() {
         let m = test_helpers::analytical_model(GradientMethod::Fd);
-        assert_eq!(
-            gradient_method_inner(&ad_build(), &m),
-            GradientMethodKind::FiniteDifferences
-        );
+        assert_eq!(gradient_method_inner(&ad_build(), &m), GradientMethodKind::FiniteDifferences);
     }
 
     #[test]
@@ -351,12 +339,7 @@ mod tests {
         );
         // A user-forced concrete gradient optimizer under FOCE also reports Analytic.
         assert_eq!(
-            gradient_method_outer(
-                &ad_build(),
-                EstimationMethod::Foce,
-                Optimizer::NloptLbfgs,
-                &m
-            ),
+            gradient_method_outer(&ad_build(), EstimationMethod::Foce, Optimizer::NloptLbfgs, &m),
             GradientMethodKind::Analytic,
             "FOCE + magnitude with a forced gradient optimizer reports the analytic method"
         );
@@ -375,9 +358,7 @@ mod tests {
         let params = "[parameters]\n  theta TVCL(1.0, 0.001, 100.0)\n  theta TVV(10.0, 0.1, 1000.0)\n  theta MIXL(0.0, -10.0, 10.0)\n  omega ETA_CL ~ 0.1\n  sigma EPS ~ 0.01\n";
         let body = "[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(EPS)\n";
         let parse = |s: &str| crate::parser::model_parser::parse_model_string(s).expect("parse");
-        let mix = parse(&format!(
-            "{params}[mixture]\n  nsub = 2\n  logit(1) = MIXL\n{body}"
-        ));
+        let mix = parse(&format!("{params}[mixture]\n  nsub = 2\n  logit(1) = MIXL\n{body}"));
         let plain = parse(&format!("{params}{body}"));
         assert!(mix.mixture.is_some() && plain.mixture.is_none());
         let outer = |opt, m: &CompiledModel| {

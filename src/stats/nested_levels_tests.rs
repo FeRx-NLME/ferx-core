@@ -17,23 +17,14 @@ fn model() -> CompiledModel {
 }
 
 fn snap(study: f64, arm: f64) -> HashMap<String, f64> {
-    [("STUDY".to_string(), study), ("ARM".to_string(), arm)]
-        .into_iter()
-        .collect()
+    [("STUDY".to_string(), study), ("ARM".to_string(), arm)].into_iter().collect()
 }
 
 /// Six observations over two studies with arms numbered 1, 2 inside each study, plus a
 /// pk-only row in study 2, arm 1, and one in an arm no observation reaches (study 1,
 /// arm 3).
 fn population() -> Population {
-    let rows = [
-        (1.0, 1.0),
-        (1.0, 1.0),
-        (1.0, 2.0),
-        (2.0, 1.0),
-        (2.0, 2.0),
-        (2.0, 2.0),
-    ];
+    let rows = [(1.0, 1.0), (1.0, 1.0), (1.0, 2.0), (2.0, 1.0), (2.0, 2.0), (2.0, 2.0)];
     let subject = Subject {
         id: "1".to_string(),
         obs_times: (0..rows.len()).map(|j| j as f64 + 1.0).collect(),
@@ -178,10 +169,7 @@ fn the_kappa_prior_counts_each_group_once_against_its_own_level() {
         want += term(&omega_b, &b[3 + 2 * g..5 + 2 * g]);
     }
     assert!(got.is_finite());
-    assert!(
-        (got - want).abs() < 1e-12 * want.abs().max(1.0),
-        "{got} vs {want}"
-    );
+    assert!((got - want).abs() < 1e-12 * want.abs().max(1.0), "{got} vs {want}");
 }
 
 /// A non-positive Cholesky diagonal (a singular level block) makes the prior
@@ -195,10 +183,7 @@ fn a_singular_level_block_returns_the_subject_sentinel() {
     let mut chol = full.cholesky().unwrap().l();
     chol[(1, 1)] = 0.0;
     let b = vec![0.0; n.n_compact()];
-    assert_eq!(
-        n.kappa_prior(&b, &inv, &chol),
-        crate::stats::likelihood::SUBJECT_SENTINEL_NLL
-    );
+    assert_eq!(n.kappa_prior(&b, &inv, &chol), crate::stats::likelihood::SUBJECT_SENTINEL_NLL);
 }
 
 #[test]
@@ -212,10 +197,7 @@ fn a_model_without_nested_levels_has_no_nested_layout() {
     let mut p = population();
     let before = p.subjects[0].occasions.clone();
     assign_level_cells(&m, &mut p);
-    assert_eq!(
-        p.subjects[0].occasions, before,
-        "a no-op for a one-level model"
-    );
+    assert_eq!(p.subjects[0].occasions, before, "a no-op for a one-level model");
     assert!(NestedLayout::of(&m, &p.subjects[0]).is_none());
 }
 
@@ -224,10 +206,7 @@ fn obs_groups_at_keys_a_group_by_its_whole_path() {
     let (m, p) = prepared();
     let levels = m.nested_levels().unwrap();
     let a = obs_groups_at(levels, &p.subjects[0], 0);
-    assert_eq!(
-        a,
-        vec![("A 1".into(), vec![0, 1, 2]), ("A 2".into(), vec![3, 4, 5])]
-    );
+    assert_eq!(a, vec![("A 1".into(), vec![0, 1, 2]), ("A 2".into(), vec![3, 4, 5])]);
     let b = obs_groups_at(levels, &p.subjects[0], 1);
     // Four arms, though only two arm labels: study 2's arm 1 is its own group.
     assert_eq!(b.len(), 4);
@@ -315,10 +294,7 @@ fn each_level_s_draw_has_its_own_level_s_covariance() {
         assert!(v.is_finite(), "{what}: {v}");
         // The covariance is small; compare it on the scale of its variances.
         let scale = if what.contains("cov") { 0.2 } else { want };
-        eprintln!(
-            "{what}: realised relative error {:.4}",
-            ((v - want) / scale).abs()
-        );
+        eprintln!("{what}: realised relative error {:.4}", ((v - want) / scale).abs());
         assert!(((v - want) / scale).abs() < 0.05, "{what}: {v} vs {want}");
     }
 }

@@ -58,11 +58,8 @@ fn a_single_sample_size_splits_strata_in_proportion() {
     spec.extend(std::iter::repeat_n("rich", 10));
     spec.extend(std::iter::repeat_n("sparse", 90));
     let strata = Strata::from_labels(&labels(&spec), "GRP");
-    let alloc: BTreeMap<String, usize> = strata
-        .allocation(&SampleSize::Total(50))
-        .unwrap()
-        .into_iter()
-        .collect();
+    let alloc: BTreeMap<String, usize> =
+        strata.allocation(&SampleSize::Total(50)).unwrap().into_iter().collect();
     assert_eq!(alloc["rich"], 5);
     assert_eq!(alloc["sparse"], 45);
 }
@@ -89,18 +86,14 @@ fn per_stratum_sample_size_requires_stratification_and_every_stratum() {
     // A stratum present in the data but missing from the list: far more likely a
     // typo than an intent to include it whole.
     let strata = Strata::from_labels(&labels(&["a", "b"]), "GRP");
-    let err = strata
-        .allocation(&SampleSize::PerStratum(map.clone()))
-        .unwrap_err();
+    let err = strata.allocation(&SampleSize::PerStratum(map.clone())).unwrap_err();
     assert!(err.contains("omits"), "{err}");
 
     // A stratum named in the list but absent from the data.
     let mut unknown = map.clone();
     unknown.insert("zz".to_string(), 1);
     unknown.insert("b".to_string(), 1);
-    let err = strata
-        .allocation(&SampleSize::PerStratum(unknown))
-        .unwrap_err();
+    let err = strata.allocation(&SampleSize::PerStratum(unknown)).unwrap_err();
     assert!(err.contains("zz"), "{err}");
 }
 
@@ -126,16 +119,9 @@ fn draws_are_reproducible_and_order_independent() {
     // whether it is computed first, last, or on another thread. PsN's guide
     // documents the opposite as a known wart.
     let forward: Vec<Replicate> = (1..=10).map(|i| draw(&strata, &alloc, 99, i)).collect();
-    let backward: Vec<Replicate> = (1..=10)
-        .rev()
-        .map(|i| draw(&strata, &alloc, 99, i))
-        .collect();
+    let backward: Vec<Replicate> = (1..=10).rev().map(|i| draw(&strata, &alloc, 99, i)).collect();
     for r in &forward {
-        assert!(
-            backward.contains(r),
-            "replicate {} was not reproduced",
-            r.index
-        );
+        assert!(backward.contains(r), "replicate {} was not reproduced", r.index);
     }
 
     // Distinct replicates are actually distinct draws.
@@ -148,10 +134,7 @@ fn a_draw_is_sorted_and_the_right_size() {
     let alloc = strata.allocation(&SampleSize::Original).unwrap();
     let r = draw(&strata, &alloc, 3, 1);
     assert_eq!(r.keys.len(), 12);
-    assert!(
-        r.keys.windows(2).all(|w| w[0] <= w[1]),
-        "keys must be ascending"
-    );
+    assert!(r.keys.windows(2).all(|w| w[0] <= w[1]), "keys must be ascending");
     assert!(r.keys.iter().all(|&k| k < 12));
     // With replacement: over 12 draws from 12 subjects, some subject is drawn
     // twice with overwhelming probability, so the multiset is not a permutation.
@@ -172,10 +155,7 @@ fn stratified_draws_have_exactly_the_requested_composition() {
         let rich = r.keys.iter().filter(|&&k| k < 10).count();
         let sparse = r.keys.iter().filter(|&&k| k >= 10).count();
         assert_eq!(rich, 10, "replicate {index} lost the rich stratum's size");
-        assert_eq!(
-            sparse, 90,
-            "replicate {index} lost the sparse stratum's size"
-        );
+        assert_eq!(sparse, 90, "replicate {index} lost the sparse stratum's size");
     }
 }
 
@@ -208,10 +188,7 @@ fn an_identity_replicate_rebuilds_the_original_subjects() {
     // what pins the reconstruction — if `build_population` dropped a field, the
     // fits below it would silently be fitting something else.
     let original = population(&["A", "B", "C"]);
-    let replicate = Replicate {
-        index: 1,
-        keys: vec![0, 1, 2],
-    };
+    let replicate = Replicate { index: 1, keys: vec![0, 1, 2] };
     let rebuilt = build_population(&original, &replicate);
 
     assert_eq!(rebuilt.subjects.len(), 3);
@@ -230,10 +207,7 @@ fn an_identity_replicate_rebuilds_the_original_subjects() {
 #[test]
 fn duplicate_draws_become_independent_subjects() {
     let original = population(&["A", "B"]);
-    let replicate = Replicate {
-        index: 1,
-        keys: vec![0, 0, 0, 1],
-    };
+    let replicate = Replicate { index: 1, keys: vec![0, 0, 0, 1] };
     let rebuilt = build_population(&original, &replicate);
 
     let ids: Vec<&str> = rebuilt.subjects.iter().map(|s| s.id.as_str()).collect();
@@ -254,9 +228,6 @@ fn duplicate_draws_become_independent_subjects() {
 
 #[test]
 fn sample_keys_count_every_original_subject() {
-    let replicate = Replicate {
-        index: 1,
-        keys: vec![0, 0, 2],
-    };
+    let replicate = Replicate { index: 1, keys: vec![0, 0, 2] };
     assert_eq!(replicate.counts(4), vec![2, 0, 1, 0]);
 }

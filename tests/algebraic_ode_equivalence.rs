@@ -166,19 +166,12 @@ fn population() -> Population {
 
 #[test]
 fn algebraic_structural_model_matches_the_dummy_ode_twin() {
-    let alg = parse_full_model(&algebraic_src())
-        .expect("compartment-free model parses")
-        .model;
-    let ode = parse_full_model(&dummy_ode_src())
-        .expect("dummy-ODE twin parses")
-        .model;
+    let alg = parse_full_model(&algebraic_src()).expect("compartment-free model parses").model;
+    let ode = parse_full_model(&dummy_ode_src()).expect("dummy-ODE twin parses").model;
 
     // The two must actually be the two different engines, or this proves nothing.
     assert!(alg.is_algebraic(), "compartment-free model");
-    assert!(
-        alg.ode_spec.is_none(),
-        "no ODE spec on the compartment-free model"
-    );
+    assert!(alg.ode_spec.is_none(), "no ODE spec on the compartment-free model");
     assert!(!ode.is_algebraic(), "the twin is an ODE model");
     assert!(ode.ode_spec.is_some(), "the twin integrates a state");
 
@@ -208,9 +201,7 @@ fn algebraic_structural_model_matches_the_dummy_ode_twin() {
 /// the population estimate (η = 0, so `E0 = TVE0`).
 #[test]
 fn algebraic_structural_model_predicts_the_written_equation() {
-    let alg = parse_full_model(&algebraic_src())
-        .expect("compartment-free model parses")
-        .model;
+    let alg = parse_full_model(&algebraic_src()).expect("compartment-free model parses").model;
     let pop = population();
     let preds = predict(&alg, &pop, &alg.default_params).unwrap();
     assert!(!preds.is_empty());
@@ -240,20 +231,14 @@ fn algebraic_structural_model_predicts_the_written_equation() {
 /// path runs and scores, not that it converges (Tier 2).
 #[test]
 fn algebraic_structural_model_fits() {
-    let model = parse_full_model(&algebraic_src())
-        .expect("compartment-free model parses")
-        .model;
+    let model = parse_full_model(&algebraic_src()).expect("compartment-free model parses").model;
 
     // Observations *from* the model at the population estimate, so the objective
     // is well-behaved and a wrong prediction path shows up as a non-finite OFV.
     let mut pop = population();
     let (e0, emax, et50) = (10.0_f64, 6.0_f64, 2.0_f64);
     for s in &mut pop.subjects {
-        s.observations = s
-            .obs_times
-            .iter()
-            .map(|t| e0 - emax * t / (et50 + t))
-            .collect();
+        s.observations = s.obs_times.iter().map(|t| e0 - emax * t / (et50 + t)).collect();
     }
 
     let opts = FitOptions {
@@ -265,11 +250,7 @@ fn algebraic_structural_model_fits() {
 
     let result = fit(&model, &pop, &model.default_params, &opts)
         .expect("a compartment-free model must be fittable");
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
 }
 
 /// Inter-occasion variability on a compartment-free model must agree with the
@@ -280,12 +261,9 @@ fn algebraic_structural_model_fits() {
 /// hold κ at zero and still produce a perfectly plausible — and wrong — fit.
 #[test]
 fn algebraic_iov_matches_the_dummy_ode_twin() {
-    let alg = parse_full_model(&iov_algebraic_src())
-        .expect("compartment-free IOV model parses")
-        .model;
-    let ode = parse_full_model(&iov_dummy_ode_src())
-        .expect("dummy-ODE IOV twin parses")
-        .model;
+    let alg =
+        parse_full_model(&iov_algebraic_src()).expect("compartment-free IOV model parses").model;
+    let ode = parse_full_model(&iov_dummy_ode_src()).expect("dummy-ODE IOV twin parses").model;
     assert!(alg.is_algebraic() && alg.n_kappa == 1);
     assert!(ode.ode_spec.is_some() && ode.n_kappa == 1);
 
@@ -299,11 +277,7 @@ fn algebraic_iov_matches_the_dummy_ode_twin() {
             .enumerate()
             .map(|(i, _)| if i < s.obs_times.len() / 2 { 1 } else { 2 })
             .collect();
-        s.observations = s
-            .obs_times
-            .iter()
-            .map(|t| e0 - emax * t / (et50 + t))
-            .collect();
+        s.observations = s.obs_times.iter().map(|t| e0 - emax * t / (et50 + t)).collect();
     }
 
     // Compare the *predictions* at a fixed parameter point rather than two fits:

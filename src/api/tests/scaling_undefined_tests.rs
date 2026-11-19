@@ -55,34 +55,13 @@ fn population(covariate_names: &[&str], covariates: HashMap<String, f64>) -> Pop
     let n = times.len();
     Population {
         subjects: vec![Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
-            doses: Vec::new(),
             obs_times: times,
-            obs_raw_times: Vec::new(),
             observations: vec![1.0; n],
             obs_cmts: vec![1; n],
             covariates,
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; n],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         }],
         covariate_names: covariate_names.iter().map(|s| s.to_string()).collect(),
         dv_column: "DV".into(),
@@ -101,10 +80,7 @@ fn predict_rejects_an_undefined_scaling_identifier() {
     let pop = population(&[], HashMap::new());
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("TOTALLY_UNDEFINED_NAME"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("TOTALLY_UNDEFINED_NAME"), "unexpected Err: {err}");
 }
 
 /// Positive control: the guard keys on the *data*, not on the name. The identical
@@ -118,10 +94,7 @@ fn predict_accepts_a_scaling_identifier_the_data_carries() {
     let model =
         parse_model_string(&UNDEFINED_READOUT.replace("TOTALLY_UNDEFINED_NAME", "SOME_COVARIATE"))
             .expect("parse");
-    let pop = population(
-        &["SOME_COVARIATE"],
-        HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]),
-    );
+    let pop = population(&["SOME_COVARIATE"], HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]));
     let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3, "one row per observation");
     assert!(
@@ -144,10 +117,7 @@ fn predict_accepts_a_covariate_carried_only_by_the_subject_maps() {
         parse_model_string(&UNDEFINED_READOUT.replace("TOTALLY_UNDEFINED_NAME", "SOME_COVARIATE"))
             .expect("parse");
     let pop = population(&[], HashMap::from([("SOME_COVARIATE".to_string(), 2.0)]));
-    assert!(
-        pop.covariate_names.is_empty(),
-        "the point of this case is an unpopulated name list"
-    );
+    assert!(pop.covariate_names.is_empty(), "the point of this case is an unpopulated name list");
     let preds = predict(&model, &pop, &model.default_params).unwrap();
     assert_eq!(preds.len(), 3, "one row per observation");
     assert!(

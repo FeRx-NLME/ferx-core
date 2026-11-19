@@ -86,9 +86,7 @@ pub fn describe_replicate_inits(options: &BootstrapOptions) -> &'static str {
 impl RunManifest {
     /// The manifest describing the run `options` is about to perform.
     pub fn new(
-        options: &BootstrapOptions,
-        model_hash: Option<String>,
-        data_hash: Option<String>,
+        options: &BootstrapOptions, model_hash: Option<String>, data_hash: Option<String>,
         parameter_names: &[String],
     ) -> Self {
         RunManifest {
@@ -115,10 +113,7 @@ impl RunManifest {
 
     pub fn read(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path).map_err(|e| {
-            format!(
-                "--resume needs `{}`, written by the run being resumed: {e}",
-                path.display()
-            )
+            format!("--resume needs `{}`, written by the run being resumed: {e}", path.display())
         })?;
         serde_json::from_str(&text).map_err(|e| format!("cannot parse `{}`: {e}", path.display()))
     }
@@ -147,29 +142,17 @@ impl RunManifest {
             return refuse("--seed", disk.seed.to_string(), self.seed.to_string());
         }
         if self.samples != disk.samples {
-            return refuse(
-                "--samples",
-                disk.samples.to_string(),
-                self.samples.to_string(),
-            );
+            return refuse("--samples", disk.samples.to_string(), self.samples.to_string());
         }
         if self.sample_size != disk.sample_size {
-            return refuse(
-                "--sample-size",
-                disk.sample_size.clone(),
-                self.sample_size.clone(),
-            );
+            return refuse("--sample-size", disk.sample_size.clone(), self.sample_size.clone());
         }
         if self.stratify_on != disk.stratify_on {
             let show = |v: &Option<String>| match v {
                 Some(c) => format!("`{c}`"),
                 None => "no stratification".to_string(),
             };
-            return refuse(
-                "--stratify-on",
-                show(&disk.stratify_on),
-                show(&self.stratify_on),
-            );
+            return refuse("--stratify-on", show(&disk.stratify_on), show(&self.stratify_on));
         }
         // The initialization mode is the subtle one, and the reason it is
         // pinned rather than tolerated: interrupt a default run and resume it

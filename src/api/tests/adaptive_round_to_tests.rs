@@ -78,23 +78,11 @@ fn run(p: &ParsedModel, population: &Population) -> Result<AdaptiveSimulationRes
 }
 
 fn run_n(
-    p: &ParsedModel,
-    population: &Population,
-    n_sim: usize,
+    p: &ParsedModel, population: &Population, n_sim: usize,
 ) -> Result<AdaptiveSimulationResult, EngineError> {
     let spec = p.adaptive_dosing.as_ref().expect("block present");
-    let opts = AdaptiveSimulateOptions {
-        seed: Some(17),
-        ..Default::default()
-    };
-    simulate_adaptive_from_spec(
-        &p.model,
-        population,
-        &p.model.default_params,
-        n_sim,
-        spec,
-        &opts,
-    )
+    let opts = AdaptiveSimulateOptions { seed: Some(17), ..Default::default() };
+    simulate_adaptive_from_spec(&p.model, population, &p.model.default_params, n_sim, spec, &opts)
 }
 
 /// V7 per subject: `[10 * WT, 12 * WT]` is `[200, 240]` at WT 20 (no multiple of 250)
@@ -107,12 +95,7 @@ fn run_n(
 /// subject named; the evaluated bounds dropped from the text.
 #[test]
 fn bounds_holding_no_multiple_are_refused_per_subject() {
-    let p = model(&block(
-        "10 * WT",
-        "[10 * WT, 12 * WT]",
-        "",
-        "signal > 1000000 : decrease 25%",
-    ));
+    let p = model(&block("10 * WT", "[10 * WT, 12 * WT]", "", "signal > 1000000 : decrease 25%"));
     let e = run(&p, &pop(&[("2", 100.0), ("1", 20.0)])).expect_err("subject 1 has no grid");
     assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_VALUE"), "{e}");
     assert_eq!(
@@ -134,12 +117,7 @@ fn bounds_holding_no_multiple_are_refused_per_subject() {
 /// low 50 < 250, refused too); the advice dropped.
 #[test]
 fn a_low_bound_aligning_to_zero_is_refused_per_subject() {
-    let p = model(&block(
-        "500",
-        "[WT - 20, 4000]",
-        "",
-        "signal < 1000000 : increase 25%",
-    ));
+    let p = model(&block("500", "[WT - 20, 4000]", "", "signal < 1000000 : increase 25%"));
     let e = run(&p, &pop(&[("2", 70.0), ("1", 20.0)])).expect_err("subject 1: low 0");
     assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_VALUE"), "{e}");
     assert_eq!(
@@ -163,24 +141,14 @@ fn a_low_bound_aligning_to_zero_is_refused_per_subject() {
 #[test]
 fn an_oracle_subject_grid_refusal_names_the_replicate() {
     let oracle = "  dose_knowledge = oracle\n";
-    let p = model(&block(
-        "CL",
-        "[CL, CL + 1]",
-        oracle,
-        "signal > 1000000 : decrease 25%",
-    ));
+    let p = model(&block("CL", "[CL, CL + 1]", oracle, "signal > 1000000 : decrease 25%"));
     let e = run(&p, &pop(&[("1", 70.0)])).expect_err("no multiple of 250 near CL");
     assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_VALUE"), "{e}");
     let head = "[adaptive_dosing] subject 1, replicate 1: no multiple of round_to = 250 lies \
                 within dose_bounds = [CL, CL + 1], which evaluate to [";
     assert!(e.message().starts_with(head), "{e}");
 
-    let p = model(&block(
-        "500",
-        "[0 * CL, 4000]",
-        oracle,
-        "signal < 1000000 : increase 25%",
-    ));
+    let p = model(&block("500", "[0 * CL, 4000]", oracle, "signal < 1000000 : increase 25%"));
     let e = run(&p, &pop(&[("1", 70.0)])).expect_err("low 0");
     assert_eq!(e.code(), Some("E_ADAPTIVE_DOSE_VALUE"), "{e}");
     let head = "[adaptive_dosing] subject 1, replicate 1: with round_to = 250, dose_bounds = \
@@ -197,12 +165,7 @@ fn an_oracle_subject_grid_refusal_names_the_replicate() {
 /// the unrounded 550 reaching the ledger.
 #[test]
 fn an_absorbed_step_logs_the_rule_and_counts_no_increase() {
-    let p = model(&block(
-        "500",
-        "[250, 4000]",
-        "",
-        "signal < 1000000 : increase 10%",
-    ));
+    let p = model(&block("500", "[250, 4000]", "", "signal < 1000000 : increase 10%"));
     let r = run(&p, &pop(&[("1", 70.0)])).expect("runs");
     assert_eq!(r.ledger.len(), 3, "{:?}", r.ledger);
     for e in &r.ledger {
@@ -248,15 +211,13 @@ fn the_shipped_rounded_example_warns_for_the_subject_the_grid_holds_at_250() {
 
     assert_eq!(
         absorbed_warnings(&r),
-        [
-            "W_ADAPTIVE_STEP_ABSORBED: with round_to = 250, `increase 25%` (the smallest \
+        ["W_ADAPTIVE_STEP_ABSORBED: with round_to = 250, `increase 25%` (the smallest \
           increase step) cannot raise a dose that 1 of 2 subject(s) can be at: the step \
           rounds back to the same dose, so each time that rule fires there the dose stays \
           where it is. From the start dose on: '20' at 250. The lowest dose this step can \
           raise is 500. To let these doses rise, use a smaller round_to or a larger increase \
           step, or, where a subject's upper bound allows, a start dose and a dose_bounds low \
-          of at least 500."
-        ]
+          of at least 500."]
     );
     assert!(!absorbed_warnings(&r)[0].contains("'40'"));
 
@@ -268,14 +229,8 @@ fn the_shipped_rounded_example_warns_for_the_subject_the_grid_holds_at_250() {
     for e in &light {
         assert_eq!(e.amt.to_bits(), 250.0f64.to_bits(), "{e:?}");
     }
-    let fired = light
-        .iter()
-        .filter(|e| e.rule_fired.ends_with("increase 25%"))
-        .count();
-    assert!(
-        fired >= 2,
-        "the increase rule fired {fired} time(s): {light:?}"
-    );
+    let fired = light.iter().filter(|e| e.rule_fired.ends_with("increase 25%")).count();
+    assert!(fired >= 2, "the increase rule fired {fired} time(s): {light:?}");
     // The subject that is not named does climb, under the same rule.
     let heavy = of("40");
     assert_eq!(heavy[0].amt.to_bits(), 500.0f64.to_bits(), "{:?}", heavy[0]);
@@ -297,12 +252,7 @@ fn the_warning_straddles_half_a_step_and_agrees_with_the_ledger() {
     };
     let at = run_with("25");
     assert_eq!(absorbed_warnings(&at), [""; 0], "{:?}", at.warnings);
-    assert_eq!(
-        at.ledger[0].amt.to_bits(),
-        750.0f64.to_bits(),
-        "{:?}",
-        at.ledger
-    );
+    assert_eq!(at.ledger[0].amt.to_bits(), 750.0f64.to_bits(), "{:?}", at.ledger);
 
     let below = run_with("24.99");
     assert_eq!(absorbed_warnings(&below).len(), 1, "{:?}", below.warnings);
@@ -343,16 +293,14 @@ fn each_subject_is_checked_on_its_own_plan_and_the_two_cases_are_named_apart() {
     let r = run(&p, &pop(&[("c", 300.0), ("a", 100.0), ("b", 150.0)])).expect("runs");
     assert_eq!(
         absorbed_warnings(&r),
-        [
-            "W_ADAPTIVE_STEP_ABSORBED: with round_to = 250, `increase 10%` (the smallest \
+        ["W_ADAPTIVE_STEP_ABSORBED: with round_to = 250, `increase 10%` (the smallest \
           increase step) cannot raise a dose that 2 of 3 subject(s) can be at: the step \
           rounds back to the same dose, so each time that rule fires there the dose stays \
           where it is. From the start dose on: 'a' at 1000. Once the decrease rules have \
           brought the dose down: 'b' at 750. The lowest dose this step can raise is 1250. To \
           let these doses rise, use a smaller round_to or a larger increase step, or, where \
           a subject's upper bound allows, a start dose and a dose_bounds low of at least \
-          1250."
-        ]
+          1250."]
     );
     assert!(!absorbed_warnings(&r)[0].contains("'c'"));
 }
@@ -401,12 +349,8 @@ fn an_oracle_subject_counts_only_the_replicates_the_step_is_absorbed_in() {
         "signal < 0 : increase 25%",
     ));
     let r = run_n(&p, &pop(&[("1", 70.0)]), N).expect("runs");
-    let starts: Vec<(usize, f64)> = r
-        .ledger
-        .iter()
-        .filter(|e| e.dose_idx == 0)
-        .map(|e| (e.sim, e.amt))
-        .collect();
+    let starts: Vec<(usize, f64)> =
+        r.ledger.iter().filter(|e| e.dose_idx == 0).map(|e| (e.sim, e.amt)).collect();
     assert_eq!(starts.len(), N, "{starts:?}");
     let mut stuck: Vec<usize> = starts
         .iter()
@@ -415,10 +359,7 @@ fn an_oracle_subject_counts_only_the_replicates_the_step_is_absorbed_in() {
         .collect();
     stuck.sort_unstable();
     assert!(!stuck.is_empty() && stuck.len() < N, "{starts:?}");
-    assert!(
-        stuck[0] > 1,
-        "the first replicate must not be absorbed: {starts:?}"
-    );
+    assert!(stuck[0] > 1, "the first replicate must not be absorbed: {starts:?}");
 
     assert_eq!(absorbed_warnings(&r).len(), 1, "{:?}", r.warnings);
     let w = absorbed_warnings(&r)[0];
@@ -440,27 +381,16 @@ fn an_oracle_subject_counts_only_the_replicates_the_step_is_absorbed_in() {
 #[test]
 fn an_oracle_subject_whose_replicates_differ_is_named_in_both_groups() {
     use crate::sim::adaptive::AbsorbedIncrease::{FromStart, OnceSteppedDown};
-    let p = model(&block(
-        "500",
-        "[250, 4000]",
-        "",
-        "signal < 0 : increase 10%",
-    ));
+    let p = model(&block("500", "[250, 4000]", "", "signal < 0 : increase 10%"));
     let spec = p.adaptive_dosing.as_ref().expect("block present");
     let population = pop(&[("s1", 70.0), ("s2", 70.0)]);
     let plan = |replicate, found| AbsorbedPlan {
         subject: 0,
-        replicate: Some(crate::sim::adaptive::ReplicateTag {
-            draw: None,
-            sim: replicate,
-        }),
+        replicate: Some(crate::sim::adaptive::ReplicateTag { draw: None, sim: replicate }),
         found,
     };
-    let plans = vec![
-        plan(3, FromStart(250.0)),
-        plan(2, OnceSteppedDown(500.0)),
-        plan(1, FromStart(250.0)),
-    ];
+    let plans =
+        vec![plan(3, FromStart(250.0)), plan(2, OnceSteppedDown(500.0)), plan(1, FromStart(250.0))];
     let w = absorbed_step_warning(spec, &population, 3, plans).expect("a line");
     assert!(w.contains("a dose that 1 of 2 subject(s) can be at"), "{w}");
     assert!(
@@ -480,12 +410,7 @@ fn an_oracle_subject_whose_replicates_differ_is_named_in_both_groups() {
 /// Mutations: printing a placeholder dose; dropping the whole remedy sentence.
 #[test]
 fn a_step_that_raises_no_dose_gives_no_lowest_dose() {
-    let p = model(&block(
-        "500",
-        "[250, 4000]",
-        "",
-        "signal < 0 : increase 10%",
-    ));
+    let p = model(&block("500", "[250, 4000]", "", "signal < 0 : increase 10%"));
     let mut spec = p.adaptive_dosing.clone().expect("block present");
     spec.round_to = Some(1e308);
     let population = pop(&[("s1", 70.0)]);
@@ -502,10 +427,7 @@ fn a_step_that_raises_no_dose_gives_no_lowest_dose() {
         ),
         "{w}"
     );
-    assert!(
-        !w.contains("lowest dose") && !w.contains("upper bound"),
-        "{w}"
-    );
+    assert!(!w.contains("lowest dose") && !w.contains("upper bound"), "{w}");
 }
 
 /// More subjects than are named: the first ten in population order, then a count. The
@@ -514,12 +436,7 @@ fn a_step_that_raises_no_dose_gives_no_lowest_dose() {
 /// Mutations: no cap; the count of all subjects in place of the rest; arrival order.
 #[test]
 fn subjects_past_the_tenth_are_counted_not_named() {
-    let p = model(&block(
-        "500",
-        "[250, 4000]",
-        "",
-        "signal < 0 : increase 10%",
-    ));
+    let p = model(&block("500", "[250, 4000]", "", "signal < 0 : increase 10%"));
     let spec = p.adaptive_dosing.as_ref().expect("block present");
     let ids: Vec<String> = (1..=12).map(|i| format!("s{i}")).collect();
     let subjects: Vec<(&str, f64)> = ids.iter().map(|id| (id.as_str(), 70.0)).collect();
@@ -533,10 +450,7 @@ fn subjects_past_the_tenth_are_counted_not_named() {
         })
         .collect();
     let w = absorbed_step_warning(spec, &population, 1, plans).expect("a line");
-    assert!(
-        w.contains("a dose that 12 of 12 subject(s) can be at"),
-        "{w}"
-    );
+    assert!(w.contains("a dose that 12 of 12 subject(s) can be at"), "{w}");
     assert!(
         w.contains(
             "From the start dose on: 's1' at 500, 's2' at 500, 's3' at 500, 's4' at 500, \
@@ -545,8 +459,5 @@ fn subjects_past_the_tenth_are_counted_not_named() {
         ),
         "{w}"
     );
-    assert_eq!(
-        absorbed_step_warning(spec, &population, 1, Vec::new()),
-        None
-    );
+    assert_eq!(absorbed_step_warning(spec, &population, 1, Vec::new()), None);
 }

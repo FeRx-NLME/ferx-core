@@ -102,9 +102,7 @@ fn read(model_src: &str, fallback: Option<&[&str]>) -> Population {
 }
 
 fn read_filtered(
-    model_src: &str,
-    fallback: Option<&[&str]>,
-    filter: Option<&SelectionFilter>,
+    model_src: &str, fallback: Option<&[&str]>, filter: Option<&SelectionFilter>,
 ) -> Population {
     let parsed = parse_full_model(model_src).expect("model parses");
     let f = data_file();
@@ -153,20 +151,12 @@ fn the_model_blind_reader_warns_for_every_gapped_column() {
 #[test]
 fn an_unread_column_with_gaps_does_not_warn() {
     let pop = read(MODEL, None);
-    assert_eq!(
-        warned(&pop),
-        ["ALB", "CRCL", "LAB", "OUT", "WT"],
-        "{:?}",
-        pop.warnings
-    );
+    assert_eq!(warned(&pop), ["ALB", "CRCL", "LAB", "OUT", "WT"], "{:?}", pop.warnings);
     // The unread columns are still in the population with their gaps, so the silence
     // is the gate and not a column the reader dropped.
     assert!(pop.subjects[1].covariates["UNUSED_SOME"].is_nan());
     assert_eq!(pop.subjects[0].covariates["UNUSED_SOME"], 3.0);
-    assert!(pop
-        .subjects
-        .iter()
-        .all(|s| s.covariates["UNUSED_ALL"].is_nan()));
+    assert!(pop.subjects.iter().all(|s| s.covariates["UNUSED_ALL"].is_nan()));
     assert!(pop.subjects[1].covariates["LAB_RATIO"].is_nan());
     assert!(
         !pop.warnings.iter().any(|w| w.contains("UNUSED")
@@ -192,16 +182,10 @@ fn a_derived_expression_records_the_names_it_reads() {
         "IPRED is a built-in, not a column"
     );
     assert!(
-        !parsed
-            .model
-            .referenced_covariates
-            .iter()
-            .any(|c| c == "LAB"),
+        !parsed.model.referenced_covariates.iter().any(|c| c == "LAB"),
         "a [derived]-only read is not a required column, so the reader needs `derived_reads`"
     );
-    assert!(crate::types::IndivParamPartials::empty()
-        .derived_reads
-        .is_empty());
+    assert!(crate::types::IndivParamPartials::empty().derived_reads.is_empty());
 }
 
 /// Listing an unread column in `covariate_columns` does not make a relation read it,
@@ -209,12 +193,7 @@ fn a_derived_expression_records_the_names_it_reads() {
 #[test]
 fn a_caller_listed_but_unread_column_does_not_warn() {
     let pop = read(MODEL, Some(&["WT", "CRCL", "LAB", "OUT", "UNUSED_SOME"]));
-    assert_eq!(
-        warned(&pop),
-        ["CRCL", "LAB", "OUT", "WT"],
-        "{:?}",
-        pop.warnings
-    );
+    assert_eq!(warned(&pop), ["CRCL", "LAB", "OUT", "WT"], "{:?}", pop.warnings);
     assert!(pop.subjects[1].covariates["UNUSED_SOME"].is_nan());
 }
 
@@ -222,12 +201,7 @@ fn a_caller_listed_but_unread_column_does_not_warn() {
 #[test]
 fn a_declared_but_unread_column_does_not_warn() {
     let pop = read(&model_declaring_unused(), None);
-    assert_eq!(
-        warned(&pop),
-        ["CRCL", "LAB", "OUT", "WT"],
-        "{:?}",
-        pop.warnings
-    );
+    assert_eq!(warned(&pop), ["CRCL", "LAB", "OUT", "WT"], "{:?}", pop.warnings);
     assert!(pop.subjects[1].covariates["UNUSED_SOME"].is_nan());
 }
 
@@ -238,12 +212,7 @@ fn a_declared_but_unread_column_does_not_warn() {
 fn an_unread_column_read_by_the_row_filter_warns() {
     let filter = SelectionFilter::from_opts(&["KEEP == 1".to_string()], &[], &[]).unwrap();
     let pop = read_filtered(MODEL, None, Some(&filter));
-    assert_eq!(
-        warned(&pop),
-        ["ALB", "CRCL", "KEEP", "LAB", "OUT", "WT"],
-        "{:?}",
-        pop.warnings
-    );
+    assert_eq!(warned(&pop), ["ALB", "CRCL", "KEEP", "LAB", "OUT", "WT"], "{:?}", pop.warnings);
     assert_eq!(pop.subjects.len(), 2, "the NaN cell keeps subject 2");
 }
 
@@ -258,16 +227,8 @@ fn a_column_read_only_by_a_string_comparison_does_not_warn() {
         &[],
     )
     .unwrap();
-    assert!(
-        filter.needs_str_covariates(),
-        "FLAG == DROP is a string clause"
-    );
+    assert!(filter.needs_str_covariates(), "FLAG == DROP is a string clause");
     let pop = read_filtered(MODEL, None, Some(&filter));
-    assert_eq!(
-        warned(&pop),
-        ["ALB", "CRCL", "KEEP", "LAB", "OUT", "WT"],
-        "{:?}",
-        pop.warnings
-    );
+    assert_eq!(warned(&pop), ["ALB", "CRCL", "KEEP", "LAB", "OUT", "WT"], "{:?}", pop.warnings);
     assert_eq!(pop.subjects.len(), 2, "no row holds FLAG = DROP");
 }

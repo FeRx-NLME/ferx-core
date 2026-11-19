@@ -67,10 +67,7 @@ mod survfit_reference {
         let mut subjects: Vec<Subject> = Vec::new();
         for r in read_csv("data.csv") {
             if subjects.last().map(|s| s.id.as_str()) != Some(r[0].as_str()) {
-                let mut s = Subject {
-                    id: r[0].clone(),
-                    ..Default::default()
-                };
+                let mut s = Subject { id: r[0].clone(), ..Default::default() };
                 let strat = match r[1].as_str() {
                     "A" => 0.0,
                     "B" => 1.0,
@@ -79,21 +76,13 @@ mod survfit_reference {
                 s.covariates.insert("STRAT".into(), strat);
                 subjects.push(s);
             }
-            let event_type = if r[3] == "1" {
-                EventType::Exact
-            } else {
-                EventType::RightCensored
-            };
-            subjects
-                .last_mut()
-                .unwrap()
-                .obs_records
-                .push(ObsRecord::Event {
-                    time: r[2].parse().unwrap(),
-                    event_type,
-                    entry_time: 0.0,
-                    cmt: 2,
-                });
+            let event_type = if r[3] == "1" { EventType::Exact } else { EventType::RightCensored };
+            subjects.last_mut().unwrap().obs_records.push(ObsRecord::Event {
+                time: r[2].parse().unwrap(),
+                event_type,
+                entry_time: 0.0,
+                cmt: 2,
+            });
         }
         Population {
             subjects,
@@ -109,15 +98,13 @@ mod survfit_reference {
     fn reference() -> BTreeMap<(String, String, usize), Vec<Row>> {
         let mut by: BTreeMap<(String, String, usize), Vec<Row>> = BTreeMap::new();
         for r in read_csv("reference.csv") {
-            by.entry((r[0].clone(), r[1].clone(), r[2].parse().unwrap()))
-                .or_default()
-                .push(Row {
-                    time: r[3].parse().unwrap(),
-                    n_risk: r[4].parse().unwrap(),
-                    n_event: r[5].parse().unwrap(),
-                    n_censor: r[6].parse().unwrap(),
-                    value: r[7].parse().unwrap(),
-                });
+            by.entry((r[0].clone(), r[1].clone(), r[2].parse().unwrap())).or_default().push(Row {
+                time: r[3].parse().unwrap(),
+                n_risk: r[4].parse().unwrap(),
+                n_event: r[5].parse().unwrap(),
+                n_censor: r[6].parse().unwrap(),
+                value: r[7].parse().unwrap(),
+            });
         }
         by
     }
@@ -125,13 +112,8 @@ mod survfit_reference {
     /// Compare one curve's rows with survfit's; `n_censor` is `None` for the mean
     /// cumulative function, whose curve has no such column. Returns the worst |Δvalue|.
     fn compare(
-        at: &str,
-        want: &[Row],
-        time: &[f64],
-        n_risk: &[usize],
-        n_event: &[usize],
-        n_censor: Option<&[usize]>,
-        value: &[f64],
+        at: &str, want: &[Row], time: &[f64], n_risk: &[usize], n_event: &[usize],
+        n_censor: Option<&[usize]>, value: &[f64],
     ) -> f64 {
         assert_eq!(time.len(), want.len(), "{at}: row count");
         let mut worst = 0.0_f64;
@@ -157,10 +139,7 @@ mod survfit_reference {
             n_sim: 20,
             max_order: Some(3),
             stratify: VpcStratify::Covariate("STRAT".into()),
-            sim: SimulateOptions {
-                seed: Some(1),
-                ..Default::default()
-            },
+            sim: SimulateOptions { seed: Some(1), ..Default::default() },
             ..Default::default()
         };
         vpc_rtte(&model, &population(), &model.default_params, &opts).unwrap()
@@ -192,11 +171,8 @@ mod survfit_reference {
             assert!(d.is_finite());
             worst_mcf = worst_mcf.max(d);
             assert_eq!((s.absolute.len(), s.gap.len()), (3, 2));
-            let curves = s
-                .absolute
-                .iter()
-                .map(|b| ("abs", b))
-                .chain(s.gap.iter().map(|b| ("gap", b)));
+            let curves =
+                s.absolute.iter().map(|b| ("abs", b)).chain(s.gap.iter().map(|b| ("gap", b)));
             for (curve, b) in curves {
                 let c = &b.observed;
                 let d = compare(

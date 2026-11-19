@@ -148,15 +148,8 @@ const NONMEM_TOL: f64 = 1e-9;
 /// up to two orders of magnitude; the two paths agreeing *and* both landing on
 /// NONMEM is the acceptance criterion.
 fn assert_both_paths_match(
-    src: &str,
-    dose_cmt: usize,
-    obs_cmt: usize,
-    rate: f64,
-    ss: u8,
-    ii: f64,
-    nonmem: &[f64],
-    tol: f64,
-    case: &str,
+    src: &str, dose_cmt: usize, obs_cmt: usize, rate: f64, ss: u8, ii: f64, nonmem: &[f64],
+    tol: f64, case: &str,
 ) {
     let walk = walk_preds(src, dose_cmt, obs_cmt, rate, ss, ii);
     let plain = plain_preds(src, dose_cmt, obs_cmt, rate, ss, ii);
@@ -191,10 +184,7 @@ fn assert_close(got: &[f64], nonmem: &[f64], tol: f64, case: &str) {
     assert_eq!(got.len(), nonmem.len(), "{case}: row count");
     for (j, (&g, &n)) in got.iter().zip(nonmem).enumerate() {
         let rel = (g - n).abs() / n.abs().max(1e-12);
-        assert!(
-            rel < tol,
-            "{case} obs {j}: ferx {g:.8} vs NONMEM {n:.8} (rel {rel:.2e})"
-        );
+        assert!(rel < tol, "{case} obs {j}: ferx {g:.8} vs NONMEM {n:.8} (rel {rel:.2e})");
     }
 }
 
@@ -202,11 +192,7 @@ fn one_cpt_iv() -> String {
     model_src("pk one_cpt_iv(cl=CL, v=V)", "", "")
 }
 fn one_cpt_oral() -> String {
-    model_src(
-        "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
-        "  theta TVKA(1.0, 0.01, 10.0)",
-        "  KA = TVKA",
-    )
+    model_src("pk one_cpt_oral(cl=CL, v=V, ka=KA)", "  theta TVKA(1.0, 0.01, 10.0)", "  KA = TVKA")
 }
 fn slow_one_cpt_iv() -> String {
     slow_model_src("pk one_cpt_iv(cl=CL, v=V)", "", "")
@@ -236,11 +222,7 @@ const THREE_P: &str = "  theta TVQ(3.0, 0.1, 50.0)\n  theta TVV2(80.0, 5.0, 500.
                        theta TVQ3(1.0, 0.1, 50.0)\n  theta TVV3(120.0, 5.0, 900.0)";
 const THREE_I: &str = "  Q  = TVQ\n  V2 = TVV2\n  Q3 = TVQ3\n  V3 = TVV3";
 fn three_cpt_iv() -> String {
-    model_src(
-        "pk three_cpt_iv(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3)",
-        THREE_P,
-        THREE_I,
-    )
+    model_src("pk three_cpt_iv(cl=CL, v=V, q=Q, v2=V2, q3=Q3, v3=V3)", THREE_P, THREE_I)
 }
 fn three_cpt_oral() -> String {
     model_src(

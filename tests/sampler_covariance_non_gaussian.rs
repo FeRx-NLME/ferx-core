@@ -63,28 +63,15 @@ const BAND_OMEGA2: f64 = 0.20;
 fn sampler_standard_errors_on_a_tte_model_match_the_exact_marginal() {
     let src = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
     let model = parse_model_string(&src).expect("parse");
-    let (pop, _) = read_population_for(
-        &model,
-        &None,
-        "data/tte_exponential.csv",
-        None,
-        None,
-        None,
-        &[],
-    )
-    .expect("data");
+    let (pop, _) =
+        read_population_for(&model, &None, "data/tte_exponential.csv", None, None, None, &[])
+            .expect("data");
 
     let mut failures = Vec::new();
-    for method in [
-        EstimationMethod::Saem,
-        EstimationMethod::Imp,
-        EstimationMethod::Impmap,
-    ] {
-        for cm in [
-            CovarianceMethod::Hessian,
-            CovarianceMethod::Sandwich,
-            CovarianceMethod::CrossProduct,
-        ] {
+    for method in [EstimationMethod::Saem, EstimationMethod::Imp, EstimationMethod::Impmap] {
+        for cm in
+            [CovarianceMethod::Hessian, CovarianceMethod::Sandwich, CovarianceMethod::CrossProduct]
+        {
             let opts = FitOptions {
                 method,
                 covariance_method: cm,
@@ -94,26 +81,16 @@ fn sampler_standard_errors_on_a_tte_model_match_the_exact_marginal() {
             };
             let r = fit(&model, &pop, &model.default_params, &opts).expect("fit");
             let label = format!("{method:?} / {}", cm.label());
+            assert_eq!(r.covariance_method, Some(cm), "{label}: the published estimator");
             assert_eq!(
-                r.covariance_method,
-                Some(cm),
-                "{label}: the published estimator"
-            );
-            assert_eq!(
-                r.warnings
-                    .iter()
-                    .filter(|w| w.starts_with("W_COV_QUADRATURE_OBJECTIVE"))
-                    .count(),
+                r.warnings.iter().filter(|w| w.starts_with("W_COV_QUADRATURE_OBJECTIVE")).count(),
                 1,
                 "{label}: {:?}",
                 r.warnings
             );
             let se_l = r.se_theta.as_ref().expect("se_theta")[0];
             let se_o = r.se_omega.as_ref().expect("se_omega")[0];
-            assert!(
-                se_l.is_finite() && se_o.is_finite(),
-                "{label}: {se_l} {se_o}"
-            );
+            assert!(se_l.is_finite() && se_o.is_finite(), "{label}: {se_l} {se_o}");
             let (ref_l, ref_o) = reference(cm);
             let (el, eo) = ((se_l - ref_l).abs() / ref_l, (se_o - ref_o).abs() / ref_o);
             eprintln!(
@@ -124,9 +101,7 @@ fn sampler_standard_errors_on_a_tte_model_match_the_exact_marginal() {
                 100.0 * (se_o / ref_o - 1.0),
             );
             if el > BAND_LAMBDA || eo > BAND_OMEGA2 {
-                failures.push(format!(
-                    "{label}: SE(λ) {se_l} ({el:.3}), SE(ω²) {se_o} ({eo:.3})"
-                ));
+                failures.push(format!("{label}: SE(λ) {se_l} ({el:.3}), SE(ω²) {se_o} ({eo:.3})"));
             }
         }
     }
@@ -139,27 +114,16 @@ fn sampler_standard_errors_on_a_tte_model_match_the_exact_marginal() {
 fn a_focei_fit_on_the_same_model_keeps_its_own_objective() {
     let src = std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file");
     let model = parse_model_string(&src).expect("parse");
-    let (pop, _) = read_population_for(
-        &model,
-        &None,
-        "data/tte_exponential.csv",
-        None,
-        None,
-        None,
-        &[],
-    )
-    .expect("data");
+    let (pop, _) =
+        read_population_for(&model, &None, "data/tte_exponential.csv", None, None, None, &[])
+            .expect("data");
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
         run_covariance_step: true,
         ..FitOptions::default()
     };
     let r = fit(&model, &pop, &model.default_params, &opts).expect("fit");
-    assert!(
-        !r.warnings.iter().any(|w| w.contains("W_COV_QUADRATURE")),
-        "{:?}",
-        r.warnings
-    );
+    assert!(!r.warnings.iter().any(|w| w.contains("W_COV_QUADRATURE")), "{:?}", r.warnings);
     let se_l = r.se_theta.as_ref().expect("se_theta")[0];
     eprintln!("FOCEI SE(λ) = {se_l:.6}");
     assert!((se_l - 0.008871).abs() < 1e-4, "FOCEI SE(λ) = {se_l}");

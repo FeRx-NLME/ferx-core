@@ -101,11 +101,7 @@ mod npde_tte_fit {
                         } else {
                             4.0 + 20.0 * unif(i + 100)
                         },
-                        event_type: if event {
-                            EventType::Exact
-                        } else {
-                            EventType::RightCensored
-                        },
+                        event_type: if event { EventType::Exact } else { EventType::RightCensored },
                         entry_time: 0.0,
                         cmt: 2,
                     }];
@@ -132,19 +128,11 @@ mod npde_tte_fit {
     }
 
     fn skipped(result: &FitResult) -> Vec<&String> {
-        result
-            .warnings
-            .iter()
-            .filter(|w| w.starts_with("W_NPDE_TTE_SKIPPED"))
-            .collect()
+        result.warnings.iter().filter(|w| w.starts_with("W_NPDE_TTE_SKIPPED")).collect()
     }
 
     fn tte_scores(result: &FitResult) -> Vec<Vec<f64>> {
-        result
-            .subjects
-            .iter()
-            .map(|s| s.tte_rows.iter().map(|r| r.npde).collect())
-            .collect()
+        result.subjects.iter().map(|s| s.tte_rows.iter().map(|r| r.npde).collect()).collect()
     }
 
     /// The sentence every `W_NPDE_TTE_SKIPPED` opens with; the reason follows it.
@@ -204,10 +192,7 @@ mod npde_tte_fit {
         let mut lines = text.lines();
         let header: Vec<&str> = lines.next().unwrap().split(',').collect();
         let at = |name: &str| {
-            header
-                .iter()
-                .position(|h| *h == name)
-                .unwrap_or_else(|| panic!("{name} in {header:?}"))
+            header.iter().position(|h| *h == name).unwrap_or_else(|| panic!("{name} in {header:?}"))
         };
         let (id, cmt, npde, npd, epred) = (at("ID"), at("CMT"), at("NPDE"), at("NPD"), at("EPRED"));
         let (mut n_tte, mut n_gaussian) = (0, 0);
@@ -232,13 +217,8 @@ mod npde_tte_fit {
     #[test]
     fn no_npde_requested_no_score_no_warning() {
         let model = parse_model_string(JOINT).expect("model parses");
-        let result = fit(
-            &model,
-            &joint_population(),
-            &model.default_params,
-            &options(0),
-        )
-        .expect("fit");
+        let result =
+            fit(&model, &joint_population(), &model.default_params, &options(0)).expect("fit");
         assert!(tte_scores(&result).iter().flatten().all(|v| v.is_nan()));
         assert!(skipped(&result).is_empty());
     }
@@ -272,10 +252,7 @@ mod npde_tte_fit {
             let mut p = common::tte_pop_from_pairs(&[(5.0, 1), (9.0, 0), (3.0, 1), (12.0, 0)]);
             p.subjects[2].obs_records = vec![ObsRecord::Event {
                 time: 6.0,
-                event_type: EventType::IntervalCensored {
-                    left: 2.0,
-                    right: 6.0,
-                },
+                event_type: EventType::IntervalCensored { left: 2.0, right: 6.0 },
                 entry_time: 0.0,
                 cmt: 2,
             }];
@@ -463,11 +440,7 @@ mod npde_tte_fit {
         let result = fit(&model, &pop, &model.default_params, &options(200)).expect("fit");
         assert!(skipped(&result).is_empty(), "{:?}", result.warnings);
         assert!(tte_scores(&result).iter().flatten().all(|v| v.is_finite()));
-        assert!(
-            !result.warnings.iter().any(|w| w.contains("W_TTE_")),
-            "{:?}",
-            result.warnings
-        );
+        assert!(!result.warnings.iter().any(|w| w.contains("W_TTE_")), "{:?}", result.warnings);
         let (_, direct) = compute_tte_npde(
             &model,
             &pop,
@@ -479,16 +452,9 @@ mod npde_tte_fit {
         .expect("post-fit scores");
         // Only the time-to-event warnings: the simulator also drains a process-wide
         // sink that other tests of this binary may write to.
-        let direct: Vec<String> = direct
-            .into_iter()
-            .filter(|w| w.starts_with("W_TTE_"))
-            .collect();
+        let direct: Vec<String> = direct.into_iter().filter(|w| w.starts_with("W_TTE_")).collect();
         assert_eq!(direct.len(), 1, "{direct:?}");
-        assert!(
-            direct[0].starts_with("W_TTE_DEGENERATE_HAZARD: "),
-            "{}",
-            direct[0]
-        );
+        assert!(direct[0].starts_with("W_TTE_DEGENERATE_HAZARD: "), "{}", direct[0]);
         assert!(
             direct[0].contains("warnings were raised over the 200 npde reference replicates"),
             "{}",

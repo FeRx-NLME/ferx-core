@@ -199,10 +199,7 @@ impl Runner {
     /// that does not compile or does not fit is a [`CandidateResult`] carrying
     /// the reason.
     pub fn run(
-        &self,
-        candidates: &[Candidate],
-        data: &Population,
-        options: &RunOptions,
+        &self, candidates: &[Candidate], data: &Population, options: &RunOptions,
     ) -> Result<RunReport, String> {
         self.run_observed(candidates, data, options, &|_| {})
     }
@@ -218,10 +215,7 @@ impl Runner {
     /// result the returned [`RunReport`] carries is reported exactly once;
     /// candidates a cancelled run never reached are not reported.
     pub fn run_observed(
-        &self,
-        candidates: &[Candidate],
-        data: &Population,
-        options: &RunOptions,
+        &self, candidates: &[Candidate], data: &Population, options: &RunOptions,
         on_finished: &(dyn Fn(&CandidateResult) + Sync),
     ) -> Result<RunReport, String> {
         self.run_with_fitter_observed(
@@ -245,11 +239,7 @@ impl Runner {
     /// `fit()`).
     #[cfg(test)]
     fn run_with_fitter<F>(
-        &self,
-        candidates: &[Candidate],
-        data: &Population,
-        options: &RunOptions,
-        fitter: F,
+        &self, candidates: &[Candidate], data: &Population, options: &RunOptions, fitter: F,
     ) -> Result<RunReport, String>
     where
         F: Fn(&Candidate, usize) -> Result<FitResult, CandidateError> + Sync,
@@ -260,11 +250,7 @@ impl Runner {
     /// [`run_with_fitter`](Self::run_with_fitter) with the
     /// [`run_observed`](Self::run_observed) callback.
     fn run_with_fitter_observed<F>(
-        &self,
-        candidates: &[Candidate],
-        data: &Population,
-        options: &RunOptions,
-        fitter: F,
+        &self, candidates: &[Candidate], data: &Population, options: &RunOptions, fitter: F,
         on_finished: &(dyn Fn(&CandidateResult) + Sync),
     ) -> Result<RunReport, String>
     where
@@ -303,18 +289,13 @@ impl Runner {
         // fingerprints the *whole dataset* — a SHA-256 over every field of
         // every subject — so computing one for a cacheless run would hash
         // hundreds of megabytes for a value nothing reads.
-        let manifest = self
-            .cache_dir
-            .as_ref()
-            .map(|_| SearchManifest::new(options, data));
+        let manifest = self.cache_dir.as_ref().map(|_| SearchManifest::new(options, data));
         let kept = match (&self.cache_dir, &manifest, options.resume) {
             (Some(dir), Some(manifest), true) => load_resumable(dir, manifest)?,
             _ => Vec::new(),
         };
-        let reused: HashMap<&str, &CandidateRecord> = kept
-            .iter()
-            .map(|record| (record.hash.as_str(), record))
-            .collect();
+        let reused: HashMap<&str, &CandidateRecord> =
+            kept.iter().map(|record| (record.hash.as_str(), record)).collect();
 
         // ── fits from other directories ─────────────────────────────────────
         // Read after the run's own journal, which wins: a hash the resume
@@ -324,9 +305,7 @@ impl Runner {
         let mut warnings: Vec<String> = Vec::new();
         let mut foreign: HashMap<String, Foreign> = HashMap::new();
         if !self.reuse_from.is_empty() {
-            let own = manifest
-                .clone()
-                .unwrap_or_else(|| SearchManifest::new(options, data));
+            let own = manifest.clone().unwrap_or_else(|| SearchManifest::new(options, data));
             let wanted: HashSet<&str> = hashes
                 .iter()
                 .enumerate()
@@ -607,10 +586,7 @@ impl Runner {
 /// a run the user configured with more `retries` than a tool's per-candidate
 /// guess keeps them. Always at least one, since zero starts is no fit.
 fn effective_starts(candidate: &Candidate, options: &RunOptions) -> usize {
-    candidate
-        .n_starts
-        .map_or(options.n_starts, |n| n.max(options.n_starts))
-        .max(1)
+    candidate.n_starts.map_or(options.n_starts, |n| n.max(options.n_starts)).max(1)
 }
 
 /// The indices of `todo`, split into groups of equal
@@ -632,12 +608,7 @@ fn cost_groups(candidates: &[Candidate], todo: &[usize]) -> Vec<Vec<usize>> {
     costs.sort_by(|a, b| b.total_cmp(a));
     costs
         .into_iter()
-        .map(|cost| {
-            todo.iter()
-                .copied()
-                .filter(|i| candidates[*i].cost == cost)
-                .collect()
-        })
+        .map(|cost| todo.iter().copied().filter(|i| candidates[*i].cost == cost).collect())
         .collect()
 }
 
@@ -706,20 +677,14 @@ fn record_of(result: &CandidateResult) -> CandidateRecord {
 /// run interrupted before it, instead of a journalled `passed: true` ranking a
 /// candidate the current gate excludes.
 fn reused_result(
-    candidate: &Candidate,
-    record: &CandidateRecord,
-    dir: Option<&Path>,
-    options: &RunOptions,
+    candidate: &Candidate, record: &CandidateRecord, dir: Option<&Path>, options: &RunOptions,
 ) -> CandidateResult {
     let fit = match (record.has_fit, dir) {
         (true, Some(dir)) => journal::load_fit(dir, &record.hash),
         _ => None,
     };
     let (verdict, criterion) = match &fit {
-        Some(fit) => (
-            check_strictness(fit, &options.strictness),
-            options.criterion.of(fit),
-        ),
+        Some(fit) => (check_strictness(fit, &options.strictness), options.criterion.of(fit)),
         None => (
             StrictnessVerdict {
                 passed: record.passed,
@@ -740,10 +705,10 @@ fn reused_result(
         verdict,
         criterion,
         seconds: record.seconds,
-        error: record.error.clone().map(|message| CandidateError {
-            message,
-            retryable: record.retryable,
-        }),
+        error: record
+            .error
+            .clone()
+            .map(|message| CandidateError { message, retryable: record.retryable }),
         duplicate_of: None,
         reused: true,
     }
@@ -769,11 +734,8 @@ enum Foreign {
 /// left to be fitted. Bounded to a few levels deep, which covers every
 /// tool's `<run>/<step>/` layout.
 fn load_foreign(
-    root: &Path,
-    own: &SearchManifest,
-    wanted: &HashSet<&str>,
-    found: &mut HashMap<String, Foreign>,
-    warnings: &mut Vec<String>,
+    root: &Path, own: &SearchManifest, wanted: &HashSet<&str>,
+    found: &mut HashMap<String, Foreign>, warnings: &mut Vec<String>,
 ) {
     let mut dirs: Vec<PathBuf> = Vec::new();
     collect_search_dirs(root, 0, &mut dirs);
@@ -812,10 +774,7 @@ fn load_foreign(
                 if let Some(fit) = journal::load_fit(&dir, &record.hash) {
                     found.insert(
                         record.hash.clone(),
-                        Foreign::Fit {
-                            fit: Box::new(fit),
-                            seconds: record.seconds,
-                        },
+                        Foreign::Fit { fit: Box::new(fit), seconds: record.seconds },
                     );
                 }
             } else if record.error.is_some() && same_scores {
@@ -838,11 +797,8 @@ fn collect_search_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut children: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
+    let mut children: Vec<PathBuf> =
+        entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_dir()).collect();
     children.sort();
     for child in children {
         collect_search_dirs(&child, depth + 1, out);
@@ -852,9 +808,7 @@ fn collect_search_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// Whether `fit` reports an objective that is not a likelihood — a SAEM fit under the default
 /// `saem_ofv = saem` (#2973) — so no candidate can be ranked on it, under any criterion.
 fn ranks_on_no_likelihood(fit: &ferx_core::types::FitResult) -> bool {
-    fit.saem_objective
-        .as_ref()
-        .is_some_and(|o| o.kind == ferx_core::types::SaemOfv::Saem)
+    fit.saem_objective.as_ref().is_some_and(|o| o.kind == ferx_core::types::SaemOfv::Saem)
 }
 
 /// The run-stopping error for a candidate whose fit has no AIC/BIC (#2973).
@@ -870,10 +824,7 @@ fn no_information_criterion_message(id: &str) -> String {
 /// A foreign fit as this run's result: scored under *this* run's criterion
 /// and judged by *this* run's gate, with the seconds the other run spent.
 fn foreign_result(
-    candidate: &Candidate,
-    hash: &str,
-    foreign: Foreign,
-    options: &RunOptions,
+    candidate: &Candidate, hash: &str, foreign: Foreign, options: &RunOptions,
 ) -> CandidateResult {
     match foreign {
         Foreign::Fit { fit, seconds } => {
@@ -956,10 +907,7 @@ fn load_resumable(dir: &Path, manifest: &SearchManifest) -> Result<Vec<Candidate
 /// make for itself (`api/fit.rs` is `Cow` for the same reason), so a 16-wide
 /// plan held up to 32 copies of data nothing was going to modify.
 fn compile_and_fit(
-    candidate: &Candidate,
-    data: &Population,
-    options: &RunOptions,
-    threads_per_fit: usize,
+    candidate: &Candidate, data: &Population, options: &RunOptions, threads_per_fit: usize,
     cancel: &Option<CancelFlag>,
 ) -> Result<FitResult, CandidateError> {
     // Compilation and binding are properties of the candidate and this run's
@@ -969,10 +917,7 @@ fn compile_and_fit(
     // [`CandidateError`].
     let text = candidate.model.render();
     let mut parsed = parse_full_model(&text).map_err(|e| {
-        CandidateError::model(format!(
-            "candidate `{}` does not compile: {e}",
-            candidate.id
-        ))
+        CandidateError::model(format!("candidate `{}` does not compile: {e}", candidate.id))
     })?;
     let mut population = Cow::Borrowed(data);
     if !parsed.model.theta_blocks().level_blocks().is_empty() {

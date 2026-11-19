@@ -408,9 +408,7 @@ impl CheckReport {
     /// Build a report from collected diagnostics; `valid` is derived as
     /// "no error-severity diagnostics present".
     pub fn new(
-        model: impl Into<String>,
-        data: Option<String>,
-        diagnostics: Vec<Diagnostic>,
+        model: impl Into<String>, data: Option<String>, diagnostics: Vec<Diagnostic>,
     ) -> Self {
         let valid = !diagnostics.iter().any(Diagnostic::is_error);
         CheckReport {
@@ -434,10 +432,7 @@ impl CheckReport {
 
     /// Count of `Info`-severity diagnostics (#2387).
     pub fn info_count(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Info)
-            .count()
+        self.diagnostics.iter().filter(|d| d.severity == Severity::Info).count()
     }
 }
 
@@ -516,20 +511,14 @@ impl EngineError {
     /// rewords (`ferx check` renders `block:line` beside a parse error's message, so its
     /// diagnostic drops the ` (line N)` the raw text carries; #2062 review B1).
     pub(crate) fn from_diagnostic_keeping_text(d: Diagnostic, message: String) -> Self {
-        EngineError {
-            message,
-            ..EngineError::from_diagnostic(d)
-        }
+        EngineError { message, ..EngineError::from_diagnostic(d) }
     }
 
     /// An error carrying `d` whose `Display` folds the suggestion in after the
     /// message, capitalised and closed with a full stop — for a refusal whose
     /// historical text read that way. [`message`](Self::message) stays `d.message`.
     pub(crate) fn with_suggestion_in_display(d: Diagnostic) -> Self {
-        EngineError {
-            suggestion_in_display: true,
-            ..EngineError::from_diagnostic(d)
-        }
+        EngineError { suggestion_in_display: true, ..EngineError::from_diagnostic(d) }
     }
 
     /// An error with no diagnostic: [`code`](Self::code) is `None`.
@@ -572,9 +561,7 @@ impl EngineError {
 
     /// The diagnostic's actionable hint, if any.
     pub fn suggestion(&self) -> Option<&str> {
-        self.diagnostic
-            .as_ref()
-            .and_then(|d| d.suggestion.as_deref())
+        self.diagnostic.as_ref().and_then(|d| d.suggestion.as_deref())
     }
 
     /// The message, without the entry-point context and without the suggestion.
@@ -718,10 +705,7 @@ mod tests {
         assert_eq!(folded.code(), Some("E_X"));
         assert_eq!(folded.message(), "Short.");
         assert_eq!(folded.suggestion(), Some("with the advice folded in"));
-        assert_eq!(
-            folded.to_string(),
-            "predict: Short. With the advice folded in."
-        );
+        assert_eq!(folded.to_string(), "predict: Short. With the advice folded in.");
         // The fold is the exception: an ordinary diagnostic with a suggestion prints
         // its message alone.
         let plain_coded = EngineError::from_diagnostic(
@@ -741,10 +725,7 @@ mod tests {
         let d = Diagnostic::error("E_PARSE", "bad");
         let json = serde_json::to_string(&d).unwrap();
         // block / line / suggestion are None → skipped.
-        assert_eq!(
-            json,
-            r#"{"severity":"error","code":"E_PARSE","message":"bad"}"#
-        );
+        assert_eq!(json, r#"{"severity":"error","code":"E_PARSE","message":"bad"}"#);
     }
 }
 

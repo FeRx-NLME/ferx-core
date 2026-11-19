@@ -63,11 +63,7 @@ fn a_laplace_mixture_fit_takes_the_exact_routes() {
     let pop = read_nonmem_csv(f.path(), Some(&["WT"]), None).unwrap();
     for (kind, n_agq) in [("laplace", 1usize), ("agq3", 3)] {
         let opts = FitOptions {
-            method: if n_agq == 1 {
-                EstimationMethod::Laplace
-            } else {
-                EstimationMethod::FoceI
-            },
+            method: if n_agq == 1 { EstimationMethod::Laplace } else { EstimationMethod::FoceI },
             interaction: true,
             n_agq,
             outer_maxiter: 3,

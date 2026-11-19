@@ -246,10 +246,9 @@ impl RuvsearchOptions {
     /// or a `cutoff` is refused rather than ignored.
     pub fn from_config(config: &SearchConfig) -> Result<Self, String> {
         let section = match config.tools.get("ruvsearch") {
-            Some(table) => table
-                .clone()
-                .try_into::<Section>()
-                .map_err(|e| format!("[ruvsearch]: {e}"))?,
+            Some(table) => {
+                table.clone().try_into::<Section>().map_err(|e| format!("[ruvsearch]: {e}"))?
+            }
             None => Section::default(),
         };
         let options = Self::from_section(section);
@@ -284,10 +283,7 @@ impl RuvsearchOptions {
     /// Pharmpy's `validate_input`: `groups ≥ 2`, `0 < p ≤ 1`, `1 ≤ max_iter ≤ 3`.
     pub fn validate(&self) -> Result<(), String> {
         if self.groups < 2 {
-            return Err(format!(
-                "[ruvsearch] groups = {}: must be at least 2",
-                self.groups
-            ));
+            return Err(format!("[ruvsearch] groups = {}: must be at least 2", self.groups));
         }
         if !(self.p_value > 0.0 && self.p_value <= 1.0) {
             return Err(format!(
@@ -296,10 +292,7 @@ impl RuvsearchOptions {
             ));
         }
         if !(1..=3).contains(&self.max_iter) {
-            return Err(format!(
-                "[ruvsearch] max_iter = {}: must be 1, 2 or 3",
-                self.max_iter
-            ));
+            return Err(format!("[ruvsearch] max_iter = {}: must be 1, 2 or 3", self.max_iter));
         }
         Ok(())
     }
@@ -457,9 +450,7 @@ pub struct RuvsearchRun<'a> {
 /// base model. Writes `steps.csv`, `models/<id>.ferx` and `final.ferx` into
 /// `run.dir` when given.
 pub fn run_ruvsearch(
-    config: &SearchConfig,
-    base: &BaseModel,
-    run: RuvsearchRun<'_>,
+    config: &SearchConfig, base: &BaseModel, run: RuvsearchRun<'_>,
 ) -> Result<RuvsearchResult, String> {
     let options = RuvsearchOptions::from_config(config)?;
     let mut run_options = config.run_options();
@@ -536,28 +527,14 @@ impl Space {
         // `[foce, focei]` base would otherwise be offered a candidate core
         // then rejects, and the row would read "could not be fitted" instead
         // of the "not tested" note (review of #1273).
-        let interaction_ok = base
-            .prepared
-            .parsed
-            .fit_options
-            .non_interaction_stage()
-            .is_none();
-        Ok(Self::build(
-            base.text.clone(),
-            input_spec,
-            population.clone(),
-            interaction_ok,
-            options,
-        ))
+        let interaction_ok = base.prepared.parsed.fit_options.non_interaction_stage().is_none();
+        Ok(Self::build(base.text.clone(), input_spec, population.clone(), interaction_ok, options))
     }
 
     /// The space from its parts — the seam the unit tests use.
     pub(crate) fn build(
-        input_model: ModelText,
-        input_spec: ErrorSpecText,
-        population: Population,
-        interaction_ok: bool,
-        options: &RuvsearchOptions,
+        input_model: ModelText, input_spec: ErrorSpecText, population: Population,
+        interaction_ok: bool, options: &RuvsearchOptions,
     ) -> Space {
         let mut notes = Vec::new();
         let tad_cutoffs = tad_cutoffs(&population, options.groups);
@@ -643,10 +620,7 @@ struct Node {
 
 impl Node {
     fn from_result(
-        result: &CandidateResult,
-        model: ModelText,
-        spec: ErrorSpecText,
-        features: Vec<RuvFeature>,
+        result: &CandidateResult, model: ModelText, spec: ErrorSpecText, features: Vec<RuvFeature>,
     ) -> Node {
         let fit = result.fit.clone();
         Node {
@@ -669,17 +643,12 @@ fn fresh_name(model: &ModelText, base: &str) -> String {
         .filter_map(|l| {
             let mut it = l.split_whitespace();
             let kind = it.next()?;
-            if !matches!(
-                kind.to_ascii_lowercase().as_str(),
-                "theta" | "omega" | "sigma" | "kappa"
-            ) {
+            if !matches!(kind.to_ascii_lowercase().as_str(), "theta" | "omega" | "sigma" | "kappa")
+            {
                 return None;
             }
-            let name: String = it
-                .next()?
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
+            let name: String =
+                it.next()?.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
             Some(name)
         })
         .collect();
@@ -724,11 +693,7 @@ pub struct Init {
 /// error model cannot take it (a `power` on a model that is not proportional,
 /// a second `iiv_on_ruv`). `init` overrides the feature's default init.
 fn derive(
-    id: &str,
-    parent: &Node,
-    feature: RuvFeature,
-    space: &Space,
-    init: Option<Init>,
+    id: &str, parent: &Node, feature: RuvFeature, space: &Space, init: Option<Init>,
 ) -> Result<Option<(Candidate, ErrorSpecText)>, String> {
     let mut spec = parent.spec.clone();
     let model_for_names = &parent.model;
@@ -790,9 +755,8 @@ fn derive(
     model
         .apply(ModelEdit::SetErrorModel(spec.clone()))
         .map_err(|e| format!("{id}: adding {}: {e}", feature.label()))?;
-    let candidate = Candidate::new(id, model)
-        .parent(parent.id.clone())
-        .features(feature_vector(&spec));
+    let candidate =
+        Candidate::new(id, model).parent(parent.id.clone()).features(feature_vector(&spec));
     Ok(Some((candidate, spec)))
 }
 
@@ -854,9 +818,7 @@ fn retire(skip: &mut BTreeSet<Family>, feature: RuvFeature) {
 
 /// The search proper, over an injected fitter.
 pub(crate) fn search(
-    fitter: &dyn StepFitter,
-    space: Space,
-    options: &RuvsearchOptions,
+    fitter: &dyn StepFitter, space: Space, options: &RuvsearchOptions,
     progress: Option<ProgressFn<'_>>,
 ) -> Result<RuvsearchResult, String> {
     let emit = |event: RuvsearchEvent| {
@@ -876,30 +838,13 @@ pub(crate) fn search(
     let report = fitter.fit_step("input", std::slice::from_ref(&input_candidate))?;
     notes.extend(report.warnings.iter().cloned());
     let input = root_node(&report, &input_candidate, &space.input_spec, "input")?;
-    rows.push(row_of(
-        &report,
-        &input_candidate.id,
-        0,
-        None,
-        false,
-        f64::NAN,
-        None,
-    ));
+    rows.push(row_of(&report, &input_candidate.id, 0, None, false, f64::NAN, None));
     models.insert(input.id.clone(), input.model.clone());
     emit(RuvsearchEvent::InputFinished { ofv: input.ofv });
     if report.cancelled {
-        return Ok(finish(
-            options,
-            &space,
-            &input,
-            None,
-            rows,
-            input.clone(),
-            models,
-            notes,
-            true,
-        )
-        .0);
+        return Ok(
+            finish(options, &space, &input, None, rows, input.clone(), models, notes, true).0
+        );
     }
 
     // ── the proportional base, when the input is not one ────────────────
@@ -925,21 +870,12 @@ pub(crate) fn search(
             space.input_spec.render_statement(),
             spec.render_statement()
         ));
-        let candidate = Candidate::new("base", model)
-            .parent("input")
-            .features(feature_vector(&spec));
+        let candidate =
+            Candidate::new("base", model).parent("input").features(feature_vector(&spec));
         let report = fitter.fit_step("base", std::slice::from_ref(&candidate))?;
         notes.extend(report.warnings.iter().cloned());
         let node = root_node(&report, &candidate, &spec, "base")?;
-        rows.push(row_of(
-            &report,
-            &candidate.id,
-            0,
-            None,
-            false,
-            input.ofv,
-            None,
-        ));
+        rows.push(row_of(&report, &candidate.id, 0, None, false, input.ofv, None));
         models.insert(node.id.clone(), node.model.clone());
         emit(RuvsearchEvent::BaseFinished { ofv: node.ofv });
         parent = node.clone();
@@ -1015,17 +951,8 @@ pub(crate) fn search(
         }
     }
 
-    let (result, reverted) = finish(
-        options,
-        &space,
-        &input,
-        base.as_ref(),
-        rows,
-        parent,
-        models,
-        notes,
-        cancelled,
-    );
+    let (result, reverted) =
+        finish(options, &space, &input, base.as_ref(), rows, parent, models, notes, cancelled);
     if let Some((to, ofv)) = reverted {
         emit(RuvsearchEvent::Reverted { to, ofv });
     }
@@ -1038,11 +965,9 @@ pub(crate) fn search(
 fn proportional_spec(input: &ErrorSpecText, model: &ModelText) -> ErrorSpecText {
     let prop = match input.form {
         ErrorForm::Proportional | ErrorForm::Combined | ErrorForm::Power => input.sigmas[0].clone(),
-        ErrorForm::Additive => SigmaDecl {
-            name: fresh_name(model, "PROP_ERR"),
-            init: 0.09,
-            as_sd: false,
-        },
+        ErrorForm::Additive => {
+            SigmaDecl { name: fresh_name(model, "PROP_ERR"), init: 0.09, as_sd: false }
+        }
     };
     ErrorSpecText::new(input.endpoint.clone(), ErrorForm::Proportional, vec![prop])
 }
@@ -1051,10 +976,7 @@ fn proportional_spec(input: &ErrorSpecText, model: &ModelText) -> ErrorSpecText 
 /// search: a root that could not be fitted, failed the gate, or has no fit
 /// to seed from.
 fn root_node(
-    report: &RunReport,
-    candidate: &Candidate,
-    spec: &ErrorSpecText,
-    what: &str,
+    report: &RunReport, candidate: &Candidate, spec: &ErrorSpecText, what: &str,
 ) -> Result<Node, String> {
     let result = report
         .results
@@ -1077,12 +999,7 @@ fn root_node(
              seeded from it; refit without `resume`"
         ));
     }
-    Ok(Node::from_result(
-        result,
-        candidate.model.clone(),
-        spec.clone(),
-        Vec::new(),
-    ))
+    Ok(Node::from_result(result, candidate.model.clone(), spec.clone(), Vec::new()))
 }
 
 /// What one iteration reports back to the driver.
@@ -1099,16 +1016,9 @@ enum Outcome {
 /// One full-refit iteration: every candidate fitted to the data.
 #[allow(clippy::too_many_arguments)]
 fn full_iteration(
-    fitter: &dyn StepFitter,
-    space: &Space,
-    parent: &Node,
-    features: &[RuvFeature],
-    iteration: usize,
-    options: &RuvsearchOptions,
-    emit: &dyn Fn(RuvsearchEvent),
-    rows: &mut Vec<StepRow>,
-    models: &mut BTreeMap<String, ModelText>,
-    notes: &mut Vec<String>,
+    fitter: &dyn StepFitter, space: &Space, parent: &Node, features: &[RuvFeature],
+    iteration: usize, options: &RuvsearchOptions, emit: &dyn Fn(RuvsearchEvent),
+    rows: &mut Vec<StepRow>, models: &mut BTreeMap<String, ModelText>, notes: &mut Vec<String>,
 ) -> Result<Outcome, String> {
     let mut candidates: Vec<(RuvFeature, Candidate, ErrorSpecText)> =
         Vec::with_capacity(features.len());
@@ -1150,10 +1060,7 @@ fn full_iteration(
     }
     if report.cancelled {
         rows.extend(step_rows.into_iter().map(|(_, r)| r));
-        emit(RuvsearchEvent::IterationFinished {
-            iteration,
-            selected: None,
-        });
+        emit(RuvsearchEvent::IterationFinished { iteration, selected: None });
         return Ok(Outcome::Cancelled);
     }
     // Lowest OFV among the candidates that passed the gate and the test.
@@ -1162,19 +1069,14 @@ fn full_iteration(
         .enumerate()
         .filter(|(_, (_, r))| r.passed && r.lrt.is_some_and(|t| t.significant))
         .min_by(|(_, (_, a)), (_, (_, b))| {
-            a.ofv
-                .unwrap_or(f64::NAN)
-                .total_cmp(&b.ofv.unwrap_or(f64::NAN))
+            a.ofv.unwrap_or(f64::NAN).total_cmp(&b.ofv.unwrap_or(f64::NAN))
         })
         .map(|(i, _)| i);
     if let Some(i) = winner {
         step_rows[i].1.selected = true;
     }
     let selected = winner.map(|i| (step_rows[i].0, step_rows[i].1.ofv.unwrap_or(f64::NAN)));
-    emit(RuvsearchEvent::IterationFinished {
-        iteration,
-        selected,
-    });
+    emit(RuvsearchEvent::IterationFinished { iteration, selected });
     let Some(i) = winner else {
         rows.extend(step_rows.into_iter().map(|(_, r)| r));
         return Ok(Outcome::Nothing);
@@ -1203,17 +1105,9 @@ fn full_iteration(
 /// the best of them refitted on the data.
 #[allow(clippy::too_many_arguments)]
 fn screened_iteration(
-    fitter: &dyn StepFitter,
-    space: &Space,
-    parent: &Node,
-    features: &[RuvFeature],
-    iteration: usize,
-    options: &RuvsearchOptions,
-    cutoff: f64,
-    emit: &dyn Fn(RuvsearchEvent),
-    rows: &mut Vec<StepRow>,
-    models: &mut BTreeMap<String, ModelText>,
-    notes: &mut Vec<String>,
+    fitter: &dyn StepFitter, space: &Space, parent: &Node, features: &[RuvFeature],
+    iteration: usize, options: &RuvsearchOptions, cutoff: f64, emit: &dyn Fn(RuvsearchEvent),
+    rows: &mut Vec<StepRow>, models: &mut BTreeMap<String, ModelText>, notes: &mut Vec<String>,
 ) -> Result<Outcome, String> {
     let Some(fit) = &parent.fit else {
         return Err(format!(
@@ -1222,13 +1116,8 @@ fn screened_iteration(
              set cwres_prescreen = false"
         ));
     };
-    let screen = cwres::Screen::build(
-        fit,
-        &space.population,
-        features,
-        &space.tad_cutoffs,
-        iteration,
-    )?;
+    let screen =
+        cwres::Screen::build(fit, &space.population, features, &space.tad_cutoffs, iteration)?;
     emit(RuvsearchEvent::IterationStarted {
         iteration,
         candidates: screen.candidates.len() - 1,
@@ -1243,23 +1132,11 @@ fn screened_iteration(
     for c in &screen.candidates {
         models.insert(c.id.clone(), c.model.clone());
     }
-    let base_ofv = report
-        .results
-        .iter()
-        .find(|r| r.id == screen.base_id)
-        .and_then(|r| r.ofv);
+    let base_ofv = report.results.iter().find(|r| r.id == screen.base_id).and_then(|r| r.ofv);
     // The CWRES base is a row too, so the table shows what the screened
     // drops are measured from.
     if report.results.iter().any(|r| r.id == screen.base_id) {
-        rows.push(row_of(
-            &report,
-            &screen.base_id,
-            iteration,
-            None,
-            true,
-            f64::NAN,
-            None,
-        ));
+        rows.push(row_of(&report, &screen.base_id, iteration, None, true, f64::NAN, None));
     }
     let mut screened: Vec<(RuvFeature, StepRow, Option<Init>)> = Vec::new();
     for (feature, id) in &screen.features {
@@ -1283,22 +1160,13 @@ fn screened_iteration(
         if base_ofv.is_none() {
             row.note = Some("the CWRES base model produced no OFV".into());
         }
-        let init = result
-            .fit
-            .as_ref()
-            .map(|f| cwres::init_from_screen(*feature, f));
+        let init = result.fit.as_ref().map(|f| cwres::init_from_screen(*feature, f));
         screened.push((*feature, row, init.flatten()));
     }
     if report.cancelled {
         rows.extend(screened.into_iter().map(|(_, r, _)| r));
-        emit(RuvsearchEvent::Screened {
-            iteration,
-            feature: None,
-        });
-        emit(RuvsearchEvent::IterationFinished {
-            iteration,
-            selected: None,
-        });
+        emit(RuvsearchEvent::Screened { iteration, feature: None });
+        emit(RuvsearchEvent::IterationFinished { iteration, selected: None });
         return Ok(Outcome::Cancelled);
     }
     // Pharmpy's `_create_best_model`: the largest CWRES improvement, if any
@@ -1313,14 +1181,8 @@ fn screened_iteration(
         })
         .map(|(i, _)| i);
     let Some(i) = best else {
-        emit(RuvsearchEvent::Screened {
-            iteration,
-            feature: None,
-        });
-        emit(RuvsearchEvent::IterationFinished {
-            iteration,
-            selected: None,
-        });
+        emit(RuvsearchEvent::Screened { iteration, feature: None });
+        emit(RuvsearchEvent::IterationFinished { iteration, selected: None });
         rows.extend(screened.into_iter().map(|(_, r, _)| r));
         return Ok(Outcome::Nothing);
     };
@@ -1328,10 +1190,7 @@ fn screened_iteration(
     let (feature, _, init) = &screened[i];
     let feature = *feature;
     let init = *init;
-    emit(RuvsearchEvent::Screened {
-        iteration,
-        feature: Some(feature),
-    });
+    emit(RuvsearchEvent::Screened { iteration, feature: Some(feature) });
     rows.extend(screened.into_iter().map(|(_, r, _)| r));
 
     // The refit of the pick, on the data, from the screen's estimate.
@@ -1354,10 +1213,7 @@ fn screened_iteration(
     );
     if report.cancelled {
         rows.push(row);
-        emit(RuvsearchEvent::IterationFinished {
-            iteration,
-            selected: None,
-        });
+        emit(RuvsearchEvent::IterationFinished { iteration, selected: None });
         return Ok(Outcome::Cancelled);
     }
     let accepted = row.passed && row.lrt.is_some_and(|t| t.significant);
@@ -1399,13 +1255,8 @@ impl StepRow {
 /// The table row for one result of a report, judged against `judge` when
 /// given: the parent and the level.
 fn row_of(
-    report: &RunReport,
-    id: &str,
-    iteration: usize,
-    feature: Option<RuvFeature>,
-    screened: bool,
-    parent_ofv: f64,
-    judge: Option<(&Node, f64)>,
+    report: &RunReport, id: &str, iteration: usize, feature: Option<RuvFeature>, screened: bool,
+    parent_ofv: f64, judge: Option<(&Node, f64)>,
 ) -> StepRow {
     let result = report
         .results
@@ -1465,15 +1316,9 @@ fn judge_one(parent: &Node, result: &CandidateResult, alpha: f64) -> (Option<Lrt
 /// Pharmpy's final comparison, then the result.
 #[allow(clippy::too_many_arguments)]
 fn finish(
-    options: &RuvsearchOptions,
-    space: &Space,
-    input: &Node,
-    base: Option<&Node>,
-    rows: Vec<StepRow>,
-    selected: Node,
-    models: BTreeMap<String, ModelText>,
-    mut notes: Vec<String>,
-    cancelled: bool,
+    options: &RuvsearchOptions, space: &Space, input: &Node, base: Option<&Node>,
+    rows: Vec<StepRow>, selected: Node, models: BTreeMap<String, ModelText>,
+    mut notes: Vec<String>, cancelled: bool,
 ) -> (RuvsearchResult, Option<(String, f64)>) {
     let cutoff = options.cutoff();
     // Both gates judge the *selected* model. Pharmpy runs the second on the

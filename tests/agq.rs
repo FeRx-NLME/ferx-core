@@ -59,10 +59,7 @@ fn warfarin() -> Population {
 
 /// OFV at the initial parameters (no outer minimisation) of an already-parsed `model`.
 fn eval_only_ofv_model(
-    model: &CompiledModel,
-    population: &Population,
-    method: EstimationMethod,
-    n_agq: usize,
+    model: &CompiledModel, population: &Population, method: EstimationMethod, n_agq: usize,
 ) -> f64 {
     let opts = FitOptions {
         method,
@@ -89,18 +86,8 @@ fn eval_only_ofv(population: &Population, method: EstimationMethod, n_agq: usize
 /// own fit options — the path a real `.ferx` user takes.
 fn fit_from_src(src: &str) -> Result<FitResult, String> {
     let parsed = parse_full_model(src)?;
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options
-    };
-    fit(
-        &parsed.model,
-        &warfarin(),
-        &parsed.model.default_params,
-        &opts,
-    )
-    .map_err(|e| e.to_string())
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options };
+    fit(&parsed.model, &warfarin(), &parsed.model.default_params, &opts).map_err(|e| e.to_string())
 }
 
 /// The `[fit_options]` a model source parses to.
@@ -117,12 +104,7 @@ fn with_fit_options(body: &str) -> String {
 fn agq_method_token_is_rejected_with_migration_note() {
     // `method = agq` was removed (#251): adaptive quadrature is `method = laplace` with
     // `n_agq > 1`. The old tokens must error, and the message must name the replacement.
-    for token in [
-        "agq",
-        "aghq",
-        "gauss_hermite",
-        "adaptive_gaussian_quadrature",
-    ] {
+    for token in ["agq", "aghq", "gauss_hermite", "adaptive_gaussian_quadrature"] {
         match parse_full_model(&with_fit_options(&format!("  method = {token}"))) {
             Ok(_) => panic!("`{token}` must be rejected now that agq is removed"),
             Err(err) => assert!(
@@ -172,24 +154,14 @@ fn audit_mixture_cannot_silently_ignore_focei_quadrature() {
     };
     let focei = ofv(&options);
     assert!(focei.is_finite());
-    for methods in [
-        vec![],
-        vec![EstimationMethod::Foce, EstimationMethod::FoceI],
-    ] {
-        let quadrature = ofv(&FitOptions {
-            n_agq: 3,
-            methods,
-            ..options.clone()
-        });
+    for methods in [vec![], vec![EstimationMethod::Foce, EstimationMethod::FoceI]] {
+        let quadrature = ofv(&FitOptions { n_agq: 3, methods, ..options.clone() });
         assert!(
             quadrature.is_finite() && (quadrature - focei).abs() > 1e-6,
             "n_agq = 3 must change a mixture's objective: {quadrature} vs FOCEI {focei}"
         );
     }
-    let laplace = ofv(&FitOptions {
-        method: EstimationMethod::Laplace,
-        ..options.clone()
-    });
+    let laplace = ofv(&FitOptions { method: EstimationMethod::Laplace, ..options.clone() });
     assert!(
         laplace.is_finite() && (laplace - focei).abs() > 1e-6,
         "Laplace is not the FOCEI objective: {laplace} vs {focei}"
@@ -209,10 +181,7 @@ fn audit_zero_nodes_from_rust_api_cannot_change_the_method() {
             ..FitOptions::default()
         };
         let result = fit(&model, &pop, &model.default_params, &opts);
-        assert!(
-            result.is_err(),
-            "zero nodes must not become plain FOCEI / Laplace"
-        );
+        assert!(result.is_err(), "zero nodes must not become plain FOCEI / Laplace");
         assert!(result.err().unwrap().to_string().contains("n_agq"));
         let valid = FitOptions { n_agq: 1, ..opts };
         assert!(fit(&model, &pop, &model.default_params, &valid).is_ok());
@@ -223,10 +192,7 @@ fn audit_zero_nodes_from_rust_api_cannot_change_the_method() {
 fn n_agq_is_validated() {
     // Rejected at parse time (the `[fit_options]` grammar), so `parse_full_model` errors.
     // `ParsedModel` isn't `Debug`, so unwrap the Result by hand rather than `expect_err`.
-    for bad in [
-        "  method = laplace\n  n_agq = 0",
-        "  method = laplace\n  n_agq = 99",
-    ] {
+    for bad in ["  method = laplace\n  n_agq = 0", "  method = laplace\n  n_agq = 99"] {
         match parse_full_model(&with_fit_options(bad)) {
             Ok(_) => panic!("out-of-range n_agq must be rejected: {bad:?}"),
             Err(err) => assert!(err.contains("n_agq"), "unhelpful error: {err}"),
@@ -445,11 +411,7 @@ fn ofv_is_bit_identical_across_runs() {
     let pop = warfarin();
     let a = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
     let b = eval_only_ofv(&pop, EstimationMethod::Laplace, 3);
-    assert_eq!(
-        a.to_bits(),
-        b.to_bits(),
-        "AGQ OFV must be bit-identical run to run: {a} vs {b}"
-    );
+    assert_eq!(a.to_bits(), b.to_bits(), "AGQ OFV must be bit-identical run to run: {a} vs {b}");
 }
 
 /// **The analytic outer gradient must be the exact gradient of the objective — at every
@@ -537,14 +499,8 @@ fn analytic_gradient_matches_fd_at_every_node_count() {
             fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
         }
 
-        let scale = fd
-            .iter()
-            .chain(g.iter())
-            .fold(1e-6f64, |m, v| m.max(v.abs()));
-        let max_diff = g
-            .iter()
-            .zip(fd.iter())
-            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        let scale = fd.iter().chain(g.iter()).fold(1e-6f64, |m, v| m.max(v.abs()));
+        let max_diff = g.iter().zip(fd.iter()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
         rel_errs.push(max_diff / scale);
     }
 
@@ -652,14 +608,8 @@ fn gauss_newton_anchored_gradient_matches_fd() {
             fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
         }
 
-        let scale = fd
-            .iter()
-            .chain(g.iter())
-            .fold(1e-6f64, |m, v| m.max(v.abs()));
-        let max_diff = g
-            .iter()
-            .zip(fd.iter())
-            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        let scale = fd.iter().chain(g.iter()).fold(1e-6f64, |m, v| m.max(v.abs()));
+        let max_diff = g.iter().zip(fd.iter()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
         rel_errs.push(max_diff / scale);
     }
 
@@ -743,14 +693,8 @@ fn fd_score_path_agrees_with_the_analytic_one() {
         )
         .expect("FD-score gradient");
 
-        let scale = g_an
-            .iter()
-            .chain(g_fd.iter())
-            .fold(1e-6f64, |m, v| m.max(v.abs()));
-        let max_diff = g_an
-            .iter()
-            .zip(g_fd.iter())
-            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        let scale = g_an.iter().chain(g_fd.iter()).fold(1e-6f64, |m, v| m.max(v.abs()));
+        let max_diff = g_an.iter().zip(g_fd.iter()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
         assert!(
             max_diff / scale < 1e-3,
             "n_agq={n}: the FD score must reproduce the analytic one — they are the same \
@@ -823,10 +767,7 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
         .replace("  V  = TVV  * exp(ETA_V)", "  V  = TVV")
         .replace("  KA = TVKA * exp(ETA_KA)", "  KA = TVKA");
     let model = parse_model_string(&src).expect("single-eta warfarin must parse");
-    assert_eq!(
-        model.n_eta, 1,
-        "fixture must have exactly one random effect"
-    );
+    assert_eq!(model.n_eta, 1, "fixture must have exactly one random effect");
 
     let n = ferx_core::estimation::agq::MAX_AGQ_NODES + 79; // 100, safely under MAX_AGQ_GRID at n_eta = 1
     assert!(
@@ -834,11 +775,7 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
             < ferx_core::estimation::agq::MAX_AGQ_GRID,
         "the grid must stay under MAX_AGQ_GRID so only the node cap can reject this"
     );
-    let opts = FitOptions {
-        method: EstimationMethod::Laplace,
-        n_agq: n,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { method: EstimationMethod::Laplace, n_agq: n, ..FitOptions::default() };
     let diags = check_model_options(&model, &opts);
     assert!(
         diags.iter().any(|d| d.code == "E_AGQ_NODES_TOO_LARGE"),
@@ -853,9 +790,7 @@ fn agq_rejects_out_of_range_node_count_built_via_the_rust_api() {
         ..FitOptions::default()
     };
     assert!(
-        !check_model_options(&model, &ok_opts)
-            .iter()
-            .any(|d| d.code == "E_AGQ_NODES_TOO_LARGE"),
+        !check_model_options(&model, &ok_opts).iter().any(|d| d.code == "E_AGQ_NODES_TOO_LARGE"),
         "n_agq = MAX_AGQ_NODES is in range and must be accepted"
     );
 }
@@ -872,11 +807,8 @@ fn focei_quadrature_hits_the_node_cap_like_laplace() {
     let over = ferx_core::estimation::agq::MAX_AGQ_NODES + 79; // 100
 
     // focei + n_agq > MAX_AGQ_NODES → rejected, exactly as laplace is.
-    let focei = FitOptions {
-        method: EstimationMethod::FoceI,
-        n_agq: over,
-        ..FitOptions::default()
-    };
+    let focei =
+        FitOptions { method: EstimationMethod::FoceI, n_agq: over, ..FitOptions::default() };
     assert!(
         check_model_options(&model, &focei)
             .iter()
@@ -885,15 +817,9 @@ fn focei_quadrature_hits_the_node_cap_like_laplace() {
     );
 
     // Plain FOCEI (n_agq = 1) is not a quadrature — the caps must NOT fire.
-    let plain = FitOptions {
-        method: EstimationMethod::FoceI,
-        n_agq: 1,
-        ..FitOptions::default()
-    };
+    let plain = FitOptions { method: EstimationMethod::FoceI, n_agq: 1, ..FitOptions::default() };
     assert!(
-        !check_model_options(&model, &plain)
-            .iter()
-            .any(|d| d.code.starts_with("E_AGQ_")),
+        !check_model_options(&model, &plain).iter().any(|d| d.code.starts_with("E_AGQ_")),
         "plain FOCEI (n_agq = 1) must not trip the quadrature caps"
     );
 }
@@ -910,27 +836,16 @@ fn focei_quadrature_out_of_analytic_scope_is_rejected() {
     let mut model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
     model.gradient_method = GradientMethod::Fd; // forces analytic_score_supported == false
 
-    let focei = FitOptions {
-        method: EstimationMethod::FoceI,
-        n_agq: 3,
-        ..FitOptions::default()
-    };
+    let focei = FitOptions { method: EstimationMethod::FoceI, n_agq: 3, ..FitOptions::default() };
     assert!(
-        check_model_options(&model, &focei)
-            .iter()
-            .any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
+        check_model_options(&model, &focei).iter().any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
         "focei + n_agq > 1 out of analytic scope must be rejected"
     );
     // Laplace is unaffected — the exact anchor needs no provider.
-    let laplace = FitOptions {
-        method: EstimationMethod::Laplace,
-        n_agq: 3,
-        ..FitOptions::default()
-    };
+    let laplace =
+        FitOptions { method: EstimationMethod::Laplace, n_agq: 3, ..FitOptions::default() };
     assert!(
-        !check_model_options(&model, &laplace)
-            .iter()
-            .any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
+        !check_model_options(&model, &laplace).iter().any(|d| d.code == "E_FOCEI_NAGQ_UNSUPPORTED"),
         "laplace + n_agq > 1 must not be gated on analytic scope"
     );
 }
@@ -951,9 +866,7 @@ fn trust_region_with_a_quadrature_stage_is_rejected() {
 
     let model = parse_model_string(WARFARIN_SRC).expect("warfarin must parse");
     let has_agq_guard = |opts: &FitOptions| {
-        check_model_options(&model, opts)
-            .iter()
-            .any(|d| d.code == "E_OPTIMIZER_AGQ")
+        check_model_options(&model, opts).iter().any(|d| d.code == "E_OPTIMIZER_AGQ")
     };
 
     // `laplace` is a quadrature stage at any node count, including the n_agq = 1 default.
@@ -964,10 +877,7 @@ fn trust_region_with_a_quadrature_stage_is_rejected() {
             n_agq,
             ..FitOptions::default()
         };
-        assert!(
-            has_agq_guard(&opts),
-            "laplace + trust_region must be rejected at n_agq = {n_agq}"
-        );
+        assert!(has_agq_guard(&opts), "laplace + trust_region must be rejected at n_agq = {n_agq}");
     }
 
     // `focei` is one only above n_agq = 1; plain FOCEI keeps working with trust_region.
@@ -1020,10 +930,7 @@ fn trust_region_with_a_quadrature_stage_is_rejected() {
         optimizer: Optimizer::TrustRegion,
         ..FitOptions::default()
     };
-    assert!(
-        has_agq_guard(&chained),
-        "a laplace stage anywhere in the chain must be caught"
-    );
+    assert!(has_agq_guard(&chained), "a laplace stage anywhere in the chain must be caught");
 }
 
 /// The runtime IOV grid cap fires for the FOCEI quadrature too, and names `focei` (not
@@ -1040,14 +947,9 @@ fn focei_iov_grid_cap_reports_focei() {
         run_covariance_step: false,
         ..parsed.fit_options
     };
-    let err = fit(
-        &parsed.model,
-        &warfarin_iov(),
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect_err("an intractable FOCEI-IOV grid must be rejected")
-    .to_string();
+    let err = fit(&parsed.model, &warfarin_iov(), &parsed.model.default_params, &opts)
+        .expect_err("an intractable FOCEI-IOV grid must be rejected")
+        .to_string();
     assert!(
         err.contains("method = focei") && err.contains("n_agq"),
         "the FOCEI-IOV grid-cap error must name focei and the lever: {err}"
@@ -1072,19 +974,15 @@ fn audit_later_quadrature_stage_cannot_bypass_the_iov_grid_cap() {
             run_covariance_step: false,
             ..parsed.fit_options.clone()
         };
-        let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
-            .unwrap_err()
-            .to_string();
+        let err =
+            fit(&parsed.model, &pop, &parsed.model.default_params, &opts).unwrap_err().to_string();
         assert!(err.contains("grid") && err.contains("occasions"), "{err}");
         assert!(err.contains(&method.label().to_lowercase()), "{err}");
         let one_node = FitOptions { n_agq: 1, ..opts };
         let err = fit(&parsed.model, &pop, &parsed.model.default_params, &one_node)
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("cancelled"),
-            "one-node chain must pass the grid validation: {err}"
-        );
+        assert!(err.contains("cancelled"), "one-node chain must pass the grid validation: {err}");
     }
 }
 
@@ -1107,18 +1005,13 @@ fn agq_covariance_step_produces_finite_standard_errors() {
         ..FitOptions::default()
     };
     let res = fit(&model, &pop, &model.default_params, &opts).expect("AGQ fit with covariance");
-    let se = res
-        .se_theta
-        .expect("AGQ must report theta standard errors when covariance is on");
+    let se = res.se_theta.expect("AGQ must report theta standard errors when covariance is on");
     assert_eq!(se.len(), 3, "one SE per theta");
     assert!(
         se.iter().all(|s| s.is_finite() && *s > 0.0),
         "AGQ theta standard errors must be finite and positive: {se:?}"
     );
-    assert!(
-        res.covariance_matrix.is_some(),
-        "AGQ covariance matrix must be reported"
-    );
+    assert!(res.covariance_matrix.is_some(), "AGQ covariance matrix must be reported");
 }
 
 /// **#1821: the analytic FOCEI `n_agq > 1` covariance Hessian completes in a debug build and
@@ -1151,20 +1044,14 @@ fn focei_agq_analytic_covariance_matches_the_fd_stencil() {
             analytic_cov_hessian: analytic,
             ..FitOptions::default()
         };
-        fit(
-            &prep.parsed.model,
-            &prep.population,
-            &prep.init_params,
-            &opts,
-        )
-        .unwrap_or_else(|e| panic!("analytic_cov_hessian = {analytic}: fit failed: {e}"))
+        fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+            .unwrap_or_else(|e| panic!("analytic_cov_hessian = {analytic}: fit failed: {e}"))
     };
     let ses = |r: &FitResult, label: &str| -> Vec<f64> {
         let all: Vec<f64> = [&r.se_theta, &r.se_omega, &r.se_sigma]
             .into_iter()
             .flat_map(|v| {
-                v.clone()
-                    .unwrap_or_else(|| panic!("{label}: covariance step reported no SEs"))
+                v.clone().unwrap_or_else(|| panic!("{label}: covariance step reported no SEs"))
             })
             .collect();
         assert!(
@@ -1176,10 +1063,7 @@ fn focei_agq_analytic_covariance_matches_the_fd_stencil() {
     let analytic = run(true);
     let stencil = run(false);
     assert!(
-        !analytic
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_COV_ANALYTIC_SALVAGE")),
+        !analytic.warnings.iter().any(|w| w.contains("W_COV_ANALYTIC_SALVAGE")),
         "premise: every subject must take the analytic AGQ route: {:?}",
         analytic.warnings
     );
@@ -1189,11 +1073,7 @@ fn focei_agq_analytic_covariance_matches_the_fd_stencil() {
         a, s,
         "premise: the analytic route must actually run — bit-identical SEs mean it fell back to FD"
     );
-    let worst = a
-        .iter()
-        .zip(&s)
-        .map(|(x, y)| (x - y).abs() / y.abs())
-        .fold(0.0_f64, f64::max);
+    let worst = a.iter().zip(&s).map(|(x, y)| (x - y).abs() / y.abs()).fold(0.0_f64, f64::max);
     assert!(
         worst < 2e-3,
         "analytic AGQ SEs must match the FD stencil: worst relative diff {worst:e}\n\
@@ -1216,11 +1096,9 @@ fn standard_errors(r: &FitResult) -> Vec<f64> {
 /// Tier-2: a handful of outer steps. The planning measurement found 3 and 200 iterations give
 /// identical decline sets (14/30 before #1844, 0/30 after).
 fn two_cpt_oral_cov_agq3(analytic: bool) -> FitResult {
-    let prep = ferx_core::prepare_run(
-        "examples/two_cpt_oral_cov.ferx",
-        Some("data/two_cpt_oral_cov.csv"),
-    )
-    .expect("two_cpt_oral_cov must load");
+    let prep =
+        ferx_core::prepare_run("examples/two_cpt_oral_cov.ferx", Some("data/two_cpt_oral_cov.csv"))
+            .expect("two_cpt_oral_cov must load");
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
         n_agq: 3,
@@ -1230,13 +1108,8 @@ fn two_cpt_oral_cov_agq3(analytic: bool) -> FitResult {
         analytic_cov_hessian: analytic,
         ..FitOptions::default()
     };
-    let res = fit(
-        &prep.parsed.model,
-        &prep.population,
-        &prep.init_params,
-        &opts,
-    )
-    .expect("FOCEI n_agq = 3 fit with covariance");
+    let res = fit(&prep.parsed.model, &prep.population, &prep.init_params, &opts)
+        .expect("FOCEI n_agq = 3 fit with covariance");
     eprintln!(
         "#1844 two_cpt_oral_cov n_agq=3 analytic_cov_hessian={analytic}: covariance {:.2} s",
         res.covariance_wall_time_secs
@@ -1262,15 +1135,9 @@ fn two_cpt_oral_cov_agq3(analytic: bool) -> FitResult {
 #[test]
 fn focei_agq_covariance_serves_indefinite_tail_nodes_analytically() {
     let analytic = two_cpt_oral_cov_agq3(true);
-    let salvage: Vec<&String> = analytic
-        .warnings
-        .iter()
-        .filter(|w| w.contains("W_COV_ANALYTIC_SALVAGE"))
-        .collect();
-    assert!(
-        salvage.is_empty(),
-        "no subject may decline to the FD salvage: {salvage:?}"
-    );
+    let salvage: Vec<&String> =
+        analytic.warnings.iter().filter(|w| w.contains("W_COV_ANALYTIC_SALVAGE")).collect();
+    assert!(salvage.is_empty(), "no subject may decline to the FD salvage: {salvage:?}");
     let se = standard_errors(&analytic);
     assert_eq!(se.len(), 13, "premise: every parameter carries an SE");
     assert!(
@@ -1306,10 +1173,7 @@ fn focei_agq_covariance_ses_match_the_fd_stencil_at_indefinite_tail_nodes() {
     assert_eq!(sa.len(), 13, "premise: every parameter carries an SE");
     let mut worst = 0.0f64;
     for (k, (a, f)) in sa.iter().zip(&sf).enumerate() {
-        assert!(
-            a.is_finite() && f.is_finite() && *f > 0.0,
-            "SE {k}: analytic {a}, FD {f}"
-        );
+        assert!(a.is_finite() && f.is_finite() && *f > 0.0, "SE {k}: analytic {a}, FD {f}");
         worst = worst.max(((a - f) / f).abs());
     }
     eprintln!("#1844 T4 worst relative SE, analytic vs FD stencil = {worst:.4e}");
@@ -1407,10 +1271,7 @@ mod non_gaussian {
     #[test]
     fn agq_integrates_a_binary_endpoint_and_agrees_with_importance_sampling() {
         let model = parse_model_string(BINARY_MIXED).expect("mixed binary model must parse");
-        assert_eq!(
-            model.n_eta, 1,
-            "fixture must have exactly one random effect"
-        );
+        assert_eq!(model.n_eta, 1, "fixture must have exactly one random effect");
         assert!(
             agq::analytic_gradient_available(&model),
             "AGQ supplies its own gradient for the binary endpoint too (no scope gate)"
@@ -1418,14 +1279,8 @@ mod non_gaussian {
         let pop = binary_population();
 
         // AGQ node sweep at the initial parameters — every OFV must be finite.
-        let agq: Vec<f64> = [1usize, 3, 7, 15]
-            .iter()
-            .map(|&n| agq_ofv(&model, &pop, n))
-            .collect();
-        assert!(
-            agq.iter().all(|o| o.is_finite()),
-            "AGQ binary OFVs must be finite: {agq:?}"
-        );
+        let agq: Vec<f64> = [1usize, 3, 7, 15].iter().map(|&n| agq_ofv(&model, &pop, n)).collect();
+        assert!(agq.iter().all(|o| o.is_finite()), "AGQ binary OFVs must be finite: {agq:?}");
 
         // Independent truth: the IS marginal at the same parameters. IS estimates the same
         // integral by sampling η and averaging the exact conditional likelihood (which includes
@@ -1472,11 +1327,7 @@ mod non_gaussian {
         };
         let res = fit(&model, &pop, &model.default_params, &opts)
             .expect("a short AGQ fit over a binary endpoint must return Ok");
-        assert!(
-            res.ofv.is_finite(),
-            "AGQ binary fit OFV must be finite: {}",
-            res.ofv
-        );
+        assert!(res.ofv.is_finite(), "AGQ binary fit OFV must be finite: {}", res.ofv);
     }
 
     /// **Point 4: the `d == 0` short-circuit** (`agq_subject_nll`, `agq_subject_packed_gradient`).
@@ -1518,11 +1369,7 @@ mod non_gaussian {
         };
         let res = fit(&model, &pop, &model.default_params, &opts)
             .expect("a fixed-effects AGQ fit must return Ok");
-        assert!(
-            res.ofv.is_finite(),
-            "fixed-effects AGQ OFV must be finite: {}",
-            res.ofv
-        );
+        assert!(res.ofv.is_finite(), "fixed-effects AGQ OFV must be finite: {}", res.ofv);
     }
 }
 
@@ -1570,11 +1417,7 @@ fn laplace_respects_n_agq() {
 fn laplace_method_parses() {
     for token in ["laplace", "LAPLACE", "laplacian"] {
         let opts = options_of(&with_fit_options(&format!("  method = {token}")));
-        assert_eq!(
-            opts.method,
-            EstimationMethod::Laplace,
-            "`{token}` must select LAPLACE"
-        );
+        assert_eq!(opts.method, EstimationMethod::Laplace, "`{token}` must select LAPLACE");
     }
     assert_eq!(EstimationMethod::Laplace.label(), "LAPLACE");
 }
@@ -1630,13 +1473,8 @@ fn iov_ofv(method: EstimationMethod, n_agq: usize) -> f64 {
         run_covariance_step: false,
         ..parsed.fit_options
     };
-    let r = fit(
-        &parsed.model,
-        &warfarin_iov(),
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect("IOV eval-only fit must succeed");
+    let r = fit(&parsed.model, &warfarin_iov(), &parsed.model.default_params, &opts)
+        .expect("IOV eval-only fit must succeed");
     assert!(r.ofv.is_finite(), "IOV OFV must be finite, got {}", r.ofv);
     r.ofv
 }
@@ -1734,14 +1572,8 @@ fn iov_gauss_newton_anchored_gradient_matches_fd() {
         fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
     }
 
-    let scale = fd
-        .iter()
-        .chain(g.iter())
-        .fold(1e-6f64, |m, v| m.max(v.abs()));
-    let max_diff = g
-        .iter()
-        .zip(fd.iter())
-        .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+    let scale = fd.iter().chain(g.iter()).fold(1e-6f64, |m, v| m.max(v.abs()));
+    let max_diff = g.iter().zip(fd.iter()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
     assert!(
         max_diff / scale < 2e-3,
         "IOV GN-anchored analytic gradient must match FD of its objective, got {:.3e}          (analytic={g:?}, fd={fd:?})",
@@ -1765,14 +1597,9 @@ fn agq_iov_grid_cap_counts_the_stacked_dimension() {
         run_covariance_step: false,
         ..parsed.fit_options.clone()
     };
-    let err = fit(
-        &parsed.model,
-        &warfarin_iov(),
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect_err("an intractable IOV grid must be rejected")
-    .to_string();
+    let err = fit(&parsed.model, &warfarin_iov(), &parsed.model.default_params, &opts)
+        .expect_err("an intractable IOV grid must be rejected")
+        .to_string();
     assert!(
         err.contains("stacked") || err.contains("occasions"),
         "the rejection must explain that IOV raised the dimension: {err}"
@@ -1868,14 +1695,8 @@ fn analytic_gradient_matches_fd_under_iov() {
             fd[i] = (ofv(&xp, n) - ofv(&xm, n)) / (2.0 * h);
         }
 
-        let scale = fd
-            .iter()
-            .chain(g.iter())
-            .fold(1e-6f64, |m, v| m.max(v.abs()));
-        let max_diff = g
-            .iter()
-            .zip(fd.iter())
-            .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
+        let scale = fd.iter().chain(g.iter()).fold(1e-6f64, |m, v| m.max(v.abs()));
+        let max_diff = g.iter().zip(fd.iter()).fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
         // Measured: 2.4e-4 — the same order as the non-IOV case, not a degraded one. The Ω_iov
         // block (the genuinely new algebra here) is exact; a wrong one — a dropped
         // `K·Ω_iov⁻¹`, a mis-summed occasion axis — misses by tens of percent.
@@ -1908,10 +1729,7 @@ fn agq_reports_convergence_rather_than_grinding_into_nlopt_failure() {
     let model = parse_model_string(WARFARIN_SRC).expect("model must parse");
     let pop = warfarin();
 
-    for (method, n) in [
-        (EstimationMethod::Laplace, 1usize),
-        (EstimationMethod::Laplace, 3),
-    ] {
+    for (method, n) in [(EstimationMethod::Laplace, 1usize), (EstimationMethod::Laplace, 3)] {
         let opts = FitOptions {
             method,
             methods: vec![],
@@ -1935,17 +1753,13 @@ fn agq_reports_convergence_rather_than_grinding_into_nlopt_failure() {
 /// `agq_eval_only` parses, and is only accepted on a `laplace` stage.
 #[test]
 fn agq_eval_only_parses_from_the_model_file() {
-    let opts = options_of(&with_fit_options(
-        "  method = laplace\n  n_agq = 5\n  agq_eval_only = true",
-    ));
+    let opts =
+        options_of(&with_fit_options("  method = laplace\n  n_agq = 5\n  agq_eval_only = true"));
     assert!(opts.agq_eval_only, "agq_eval_only must round-trip");
     assert_eq!(opts.n_agq, 5);
 
     // Default is off, so no existing fit changes behaviour.
-    assert!(
-        !options_of(WARFARIN_SRC).agq_eval_only,
-        "agq_eval_only must default to false"
-    );
+    assert!(!options_of(WARFARIN_SRC).agq_eval_only, "agq_eval_only must default to false");
 }
 
 /// A standalone `laplace` stage with `agq_eval_only` reports exactly the OFV the ordinary
@@ -2015,14 +1829,8 @@ fn agq_eval_only_preserves_the_preceding_stages_parameters() {
     );
     assert_eq!(result.method_chain, chained.methods);
 
-    assert_eq!(
-        result.theta, focei.theta,
-        "an evaluator must not move theta"
-    );
-    assert_eq!(
-        result.sigma, focei.sigma,
-        "an evaluator must not move sigma"
-    );
+    assert_eq!(result.theta, focei.theta, "an evaluator must not move theta");
+    assert_eq!(result.sigma, focei.sigma, "an evaluator must not move sigma");
     assert!(
         result.ofv.is_finite(),
         "the reported OFV must be the finite AGQ marginal, got {}",
@@ -2090,17 +1898,10 @@ fn agq_eval_only_requires_a_terminal_laplace_stage() {
     let err = fit(&model, &population, &model.default_params, &mid)
         .expect_err("laplace mid-chain with agq_eval_only must be rejected")
         .to_string();
-    assert!(
-        err.contains("final stage"),
-        "error should name the terminal-stage rule, got: {err}"
-    );
+    assert!(err.contains("final stage"), "error should name the terminal-stage rule, got: {err}");
 
-    let missing = FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
-        methods: vec![],
-        ..base
-    };
+    let missing =
+        FitOptions { method: EstimationMethod::FoceI, interaction: true, methods: vec![], ..base };
     let err = fit(&model, &population, &model.default_params, &missing)
         .expect_err("agq_eval_only without a laplace stage must be rejected")
         .to_string();

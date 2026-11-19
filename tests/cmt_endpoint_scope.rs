@@ -39,10 +39,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 
 fn temp(contents: &str, suffix: &str) -> NamedTempFile {
-    let mut f = tempfile::Builder::new()
-        .suffix(suffix)
-        .tempfile()
-        .expect("temp file");
+    let mut f = tempfile::Builder::new().suffix(suffix).tempfile().expect("temp file");
     write!(f, "{contents}").expect("write");
     f.flush().expect("flush");
     f
@@ -64,10 +61,7 @@ fn warns(src: &str, data: &str) -> bool {
     let m = temp(src, ".ferx");
     let d = temp(data, ".csv");
     let report = validate_model_file(m.path().to_str().unwrap(), Some(d.path().to_str().unwrap()));
-    report
-        .diagnostics
-        .iter()
-        .any(|x| x.code == "W_CMT_DEFAULTED")
+    report.diagnostics.iter().any(|x| x.code == "W_CMT_DEFAULTED")
 }
 
 #[test]

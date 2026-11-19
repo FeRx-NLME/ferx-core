@@ -64,13 +64,8 @@ pub const MODEL_COLUMNS: [&str; 24] = [
 ];
 
 /// The columns of `generations.csv`.
-pub const GENERATION_COLUMNS: [&str; 5] = [
-    "generation",
-    "best_genome",
-    "best_fitness",
-    "mean_fitness",
-    "polished",
-];
+pub const GENERATION_COLUMNS: [&str; 5] =
+    ["generation", "best_genome", "best_fitness", "mean_fitness", "polished"];
 
 fn transits(t: Option<TransitCount>) -> String {
     match t {
@@ -131,18 +126,12 @@ fn write_models(path: &Path, result: &GlobalsearchResult) -> Result<(), String> 
                 r.id.clone(),
                 r.parent.clone().unwrap_or_default(),
                 r.step.clone(),
-                r.genome
-                    .as_ref()
-                    .map(|_| r.description.clone())
-                    .unwrap_or_default(),
-                s.map(|s| s.absorption.label().to_string())
-                    .unwrap_or_default(),
-                s.map(|s| s.elimination.label().to_string())
-                    .unwrap_or_default(),
+                r.genome.as_ref().map(|_| r.description.clone()).unwrap_or_default(),
+                s.map(|s| s.absorption.label().to_string()).unwrap_or_default(),
+                s.map(|s| s.elimination.label().to_string()).unwrap_or_default(),
                 s.map(|s| s.peripherals.to_string()).unwrap_or_default(),
                 s.map(|s| transits(s.transits)).unwrap_or_default(),
-                s.map(|s| if s.lagtime { "ON" } else { "OFF" }.to_string())
-                    .unwrap_or_default(),
+                s.map(|s| if s.lagtime { "ON" } else { "OFF" }.to_string()).unwrap_or_default(),
                 covariates_label(r),
                 r.n_parameters.map(|n| n.to_string()).unwrap_or_default(),
                 opt_number(r.ofv),
@@ -152,10 +141,7 @@ fn write_models(path: &Path, result: &GlobalsearchResult) -> Result<(), String> 
                 r.converged.map(|c| c.to_string()).unwrap_or_default(),
                 r.passed.to_string(),
                 r.failures.join("; "),
-                r.error
-                    .as_ref()
-                    .map(|e| e.message.clone())
-                    .unwrap_or_default(),
+                r.error.as_ref().map(|e| e.message.clone()).unwrap_or_default(),
                 number(r.seconds),
                 r.selected.to_string(),
                 r.non_influential.to_string(),
@@ -164,9 +150,7 @@ fn write_models(path: &Path, result: &GlobalsearchResult) -> Result<(), String> 
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 fn write_generations(path: &Path, result: &GlobalsearchResult) -> Result<(), String> {
@@ -192,9 +176,7 @@ fn write_generations(path: &Path, result: &GlobalsearchResult) -> Result<(), Str
             ])
             .map_err(|e| format!("cannot write `{}`: {e}", path.display()))?;
     }
-    writer
-        .flush()
-        .map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
+    writer.flush().map_err(|e| format!("cannot flush `{}`: {e}", path.display()))
 }
 
 /// A human-readable rendering of the search: the grid, every model best
@@ -219,13 +201,8 @@ pub fn render_summary(result: &GlobalsearchResult) -> String {
     let _ = writeln!(
         out,
         "Input model: OFV {}, {label} {}",
-        input
-            .and_then(|r| r.ofv)
-            .map(|v| format!("{v:.3}"))
-            .unwrap_or_else(|| "-".into()),
-        input
-            .map(|r| number_or_dash(r.criterion))
-            .unwrap_or_else(|| "-".into())
+        input.and_then(|r| r.ofv).map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
+        input.map(|r| number_or_dash(r.criterion)).unwrap_or_else(|| "-".into())
     );
     let _ = writeln!(
         out,
@@ -234,11 +211,7 @@ pub fn render_summary(result: &GlobalsearchResult) -> String {
         result.n_fitted(),
         if result.n_fitted() == 1 { "" } else { "s" },
         result.rows.len(),
-        if result.cancelled {
-            " (search cancelled)"
-        } else {
-            ""
-        }
+        if result.cancelled { " (search cancelled)" } else { "" }
     );
     let _ = writeln!(
         out,
@@ -268,21 +241,15 @@ pub fn render_summary(result: &GlobalsearchResult) -> String {
         let genome = if r.genome.is_some() {
             r.description.clone()
         } else {
-            r.structure
-                .map(|s| structure_label(&s))
-                .unwrap_or_else(|| "input".into())
+            r.structure.map(|s| structure_label(&s)).unwrap_or_else(|| "input".into())
         };
         let _ = writeln!(
             out,
             "  {:<8} {:<44} {:>5} {:>12} {:>12} {:>12} {:>4} {:>7.1}  {:<13} {}",
             r.id,
             truncate(&genome, 44),
-            r.n_parameters
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "-".into()),
-            r.ofv
-                .map(|v| format!("{v:.3}"))
-                .unwrap_or_else(|| "-".into()),
+            r.n_parameters.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
+            r.ofv.map(|v| format!("{v:.3}")).unwrap_or_else(|| "-".into()),
             number_or_dash(r.criterion),
             number_or_dash(r.fitness),
             r.rank.map(|n| n.to_string()).unwrap_or_else(|| "-".into()),
@@ -318,10 +285,7 @@ pub fn render_summary(result: &GlobalsearchResult) -> String {
         out,
         "\nFinal model: {} — {} (fitness {})",
         result.final_id,
-        result
-            .row(&result.final_id)
-            .map(|r| r.description.clone())
-            .unwrap_or_default(),
+        result.row(&result.final_id).map(|r| r.description.clone()).unwrap_or_default(),
         number_or_dash(result.final_fitness)
     );
     if !result.notes.is_empty() {

@@ -84,23 +84,14 @@ fn model_src(readout: Readout) -> String {
 const OBS_TIMES: [f64; 7] = [1.0, 4.0, 8.0, 23.0, 25.0, 30.0, 47.0];
 
 fn regimen() -> Vec<DoseEvent> {
-    [0.0, 24.0]
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect()
+    [0.0, 24.0].iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect()
 }
 
 fn population(n: usize) -> Population {
     let k = OBS_TIMES.len();
     let subjects = (1..=n)
         .map(|i| {
-            common::subject(
-                &i.to_string(),
-                regimen(),
-                OBS_TIMES.to_vec(),
-                vec![0.0; k],
-                vec![1; k],
-            )
+            common::subject(&i.to_string(), regimen(), OBS_TIMES.to_vec(), vec![0.0; k], vec![1; k])
         })
         .collect();
     Population {
@@ -126,10 +117,7 @@ fn adaptive_run_on_fitted_params_matches_static_simulate_expression_readout() {
 fn check_fitted_params_reach_the_adaptive_run(readout: Readout) {
     let parsed = parse_full_model(&model_src(readout)).expect("model parses");
     let model = &parsed.model;
-    let spec = parsed
-        .adaptive_dosing
-        .as_ref()
-        .expect("[adaptive_dosing] present");
+    let spec = parsed.adaptive_dosing.as_ref().expect("[adaptive_dosing] present");
 
     // Data from a truth away from the initial estimates, so two outer iterations
     // move θ off them.
@@ -141,10 +129,7 @@ fn check_fitted_params_reach_the_adaptive_run(readout: Readout) {
         &data,
         &truth,
         1,
-        &SimulateOptions {
-            seed: Some(11),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(11), ..Default::default() },
     )
     .expect("data simulation runs");
     let mut rows = sim.iter();
@@ -168,12 +153,7 @@ fn check_fitted_params_reach_the_adaptive_run(readout: Readout) {
     let params = fitted_params_from_result(&fit_result, model).expect("fitted params");
 
     // Straddle: the fixture can only tell `params` from `default_params` if they differ.
-    for (i, (f, d)) in params
-        .theta
-        .iter()
-        .zip(&model.default_params.theta)
-        .enumerate()
-    {
+    for (i, (f, d)) in params.theta.iter().zip(&model.default_params.theta).enumerate() {
         assert_ne!(
             f.to_bits(),
             d.to_bits(),
@@ -183,10 +163,7 @@ fn check_fitted_params_reach_the_adaptive_run(readout: Readout) {
     }
     // The same for Ω, which sets the η draw: an entry point that drew η from the
     // initial Ω would otherwise pass whenever the fit left Ω where it started.
-    let (f, d) = (
-        params.omega.matrix[(0, 0)],
-        model.default_params.omega.matrix[(0, 0)],
-    );
+    let (f, d) = (params.omega.matrix[(0, 0)], model.default_params.omega.matrix[(0, 0)]);
     assert_ne!(
         f.to_bits(),
         d.to_bits(),
@@ -202,20 +179,14 @@ fn check_fitted_params_reach_the_adaptive_run(readout: Readout) {
 
     let adaptive = simulate_adaptive_from_spec(model, &target, &params, 1, spec, &adaptive_opts)
         .expect("adaptive run on fitted params");
-    assert!(
-        adaptive.ledger.is_empty(),
-        "the controller holds throughout"
-    );
+    assert!(adaptive.ledger.is_empty(), "the controller holds throughout");
 
     let reference = simulate_with_options(
         model,
         &target,
         &params,
         1,
-        &SimulateOptions {
-            seed: Some(seed),
-            ..Default::default()
-        },
+        &SimulateOptions { seed: Some(seed), ..Default::default() },
     )
     .expect("static simulate on fitted params");
 

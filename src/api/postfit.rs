@@ -1,39 +1,17 @@
-#![allow(unused_imports)]
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
 use crate::cold_sort::ColdSort;
-use crate::diagnostics::{first_error, CheckReport, Diagnostic};
-use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
-    chol_lt_idx, lower_tri_iter, omega_cholesky_jacobian, omega_packed_len, rho_chain,
-    rho_packed_start, theta_packs_log, PackedCoordKind,
-};
-use crate::estimation::saem;
-use crate::io::datareader::{
-    read_nonmem_csv_filtered_mapped, read_nonmem_csv_mapped,
-    read_nonmem_csv_with_covariates_filtered_mapped, read_nonmem_csv_with_covariates_mapped,
-    SelectionFilter, ERR_COV_MISSING_COLUMNS, ERR_COV_NON_NUMERIC,
-};
-use crate::pk;
-use crate::propensity_match::MatchMethod;
-use crate::sim::adaptive::{
-    AdaptiveRun, AdaptiveSubjectMetrics, ControllerCtx, DecisionLogEntry, DoseAction,
-    DoseLedgerEntry, MonitorSpec,
+    chol_lt_idx, omega_cholesky_jacobian, omega_packed_len, rho_chain, rho_packed_start,
+    PackedCoordKind,
 };
 use crate::stats::likelihood::{
     build_frem_r_override, compute_cwres_cov, foce_subject_nll_cov, foce_subject_nll_iov_cov,
     foce_subject_nll_iov_linearized, iov_linearization, population_variance_preds_iov,
 };
-use crate::stats::residual_error::{compute_iwres_with_correlations, iwres_autocorrelation};
-use crate::types::*;
+use crate::stats::residual_error::compute_iwres_with_correlations;
 use nalgebra::{DMatrix, DVector};
-use rand::{RngExt, SeedableRng};
-use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
-use std::collections::HashMap;
-use std::path::Path;
-use std::time::Instant;
 
 /// Rebuild `warnings_structured` from the current `warnings` vec.
 ///
@@ -125,8 +103,7 @@ pub(crate) struct DiagStats<'a> {
 /// `cov_condition_number` in particular is documented as `+Inf` for a
 /// near-singular parameter space, so it is dropped from the payload there.
 pub(crate) fn diagnostic_details(
-    code: &crate::types::WarningCode,
-    s: &DiagStats,
+    code: &crate::types::WarningCode, s: &DiagStats,
 ) -> Option<serde_json::Value> {
     use crate::types::WarningCode;
     match code {
@@ -177,11 +154,9 @@ pub(crate) fn diagnostic_details(
             }
             _ => None,
         },
-        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => covariance_details(
-            s.cov_condition_number,
-            s.cov_eigenvalues,
-            s.covariance_method,
-        ),
+        WarningCode::CovarianceFailed | WarningCode::CovarianceRegularized => {
+            covariance_details(s.cov_condition_number, s.cov_eigenvalues, s.covariance_method)
+        }
         _ => None,
     }
 }
@@ -195,10 +170,7 @@ fn insert_covariance_method(
     covariance_method: Option<crate::types::CovarianceMethod>,
 ) {
     if let Some(m) = covariance_method {
-        obj.insert(
-            "covariance_method".to_string(),
-            serde_json::json!(m.label()),
-        );
+        obj.insert("covariance_method".to_string(), serde_json::json!(m.label()));
     }
 }
 
@@ -209,8 +181,7 @@ fn insert_covariance_method(
 /// diagnose a non-PD Hessian). Non-finite values are skipped; returns `None` if
 /// nothing usable is available.
 fn covariance_details(
-    cov_condition_number: Option<f64>,
-    cov_eigenvalues: Option<&[f64]>,
+    cov_condition_number: Option<f64>, cov_eigenvalues: Option<&[f64]>,
     covariance_method: Option<crate::types::CovarianceMethod>,
 ) -> Option<serde_json::Value> {
     let mut obj = serde_json::Map::new();
@@ -226,10 +197,7 @@ fn covariance_details(
             let min = finite.iter().copied().fold(f64::INFINITY, f64::min);
             let n_neg = finite.iter().filter(|&&v| v < 0.0).count();
             obj.insert("min_eigenvalue".to_string(), serde_json::json!(min));
-            obj.insert(
-                "n_negative_eigenvalues".to_string(),
-                serde_json::json!(n_neg),
-            );
+            obj.insert("n_negative_eigenvalues".to_string(), serde_json::json!(n_neg));
         }
     }
     if obj.is_empty() {
@@ -245,20 +213,13 @@ pub(crate) fn probe_nlopt_algorithms() -> Vec<String> {
         0.0
     }
     let available = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _opt = nlopt::Nlopt::new(
-            nlopt::Algorithm::Crs2Lm,
-            1,
-            dummy_obj,
-            nlopt::Target::Minimize,
-            (),
-        );
+        let _opt =
+            nlopt::Nlopt::new(nlopt::Algorithm::Crs2Lm, 1, dummy_obj, nlopt::Target::Minimize, ());
     }));
     if available.is_err() {
-        vec![
-            "NLopt CRS2-LM not available in this build — global_search = true will fail. \
+        vec!["NLopt CRS2-LM not available in this build — global_search = true will fail. \
              Install a full NLopt build: brew install nlopt / apt install libnlopt-dev"
-                .to_string(),
-        ]
+            .to_string()]
     } else {
         vec![]
     }
@@ -287,10 +248,7 @@ const OFFDIAG_EPS: f64 = 1e-15;
 /// Returns `None` when the matrix is diagonal (no off-diagonals above
 /// `OFFDIAG_EPS`).
 pub(crate) fn compute_param_corr(
-    omega: &DMatrix<f64>,
-    log_transformed: &[bool],
-    names: &[String],
-    warn_prefix: &str,
+    omega: &DMatrix<f64>, log_transformed: &[bool], names: &[String], warn_prefix: &str,
     warnings: &mut Vec<String>,
 ) -> Option<DMatrix<f64>> {
     let n = omega.nrows();
@@ -370,9 +328,7 @@ pub(crate) fn compute_param_corr(
 /// real estimator that owns the step itself, so it must not be skipped. Split out
 /// of `fit()` so the per-stage gating is unit-testable.
 pub(crate) fn is_last_estimating_stage(
-    chain: &[EstimationMethod],
-    stage_idx: usize,
-    eval_only: &[EstimationMethod],
+    chain: &[EstimationMethod], stage_idx: usize, eval_only: &[EstimationMethod],
 ) -> bool {
     let is_last = stage_idx + 1 == chain.len();
     // Every remaining stage is a pure evaluator, so *this* one is the last that estimates.
@@ -405,9 +361,7 @@ pub(crate) fn keep_gn_zero_eta_warning(warning: &str, is_last_estimating: bool) 
 /// covariance always wins over a fallback, which wins over a plain failure — is
 /// unit-testable without driving a full fit to a non-PD Hessian.
 pub(crate) fn resolve_covariance_status(
-    run_covariance_step: bool,
-    has_covariance_matrix: bool,
-    has_sir_fallback: bool,
+    run_covariance_step: bool, has_covariance_matrix: bool, has_sir_fallback: bool,
 ) -> CovarianceStatus {
     if !run_covariance_step {
         CovarianceStatus::NotRequested
@@ -436,10 +390,7 @@ pub(crate) fn resolve_covariance_status(
 /// though the rectified-|λ| proposal for exactly that case had already been
 /// built (#972).
 pub(crate) fn should_run_sir_fallback(
-    fallback_is_sir: bool,
-    sir_requested: bool,
-    has_covariance_matrix: bool,
-    normal_sir_ran: bool,
+    fallback_is_sir: bool, sir_requested: bool, has_covariance_matrix: bool, normal_sir_ran: bool,
     has_fallback_proposal: bool,
 ) -> bool {
     (fallback_is_sir || sir_requested)
@@ -474,12 +425,8 @@ pub(crate) fn should_run_sir_fallback(
 /// has already pushed its own `"SIR fallback failed: …"` warning, so this
 /// returns `None` to avoid stacking two messages on one failure.
 pub(crate) fn sir_unavailable_warning(
-    sir_requested: bool,
-    covariance_requested: bool,
-    bayes_fit: bool,
-    has_covariance_matrix: bool,
-    has_fallback_proposal: bool,
-    sir_ran: bool,
+    sir_requested: bool, covariance_requested: bool, bayes_fit: bool, has_covariance_matrix: bool,
+    has_fallback_proposal: bool, sir_ran: bool,
 ) -> Option<String> {
     if !sir_requested || has_covariance_matrix || sir_ran {
         return None;
@@ -537,16 +484,9 @@ pub(crate) fn sir_unavailable_warning(
 /// caller, so the unit test that reaches this path sees the warm start the fit hands.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_sir_fallback(
-    options: &FitOptions,
-    has_covariance_matrix: bool,
-    normal_sir_ran: bool,
-    fallback_proposal: Option<&DMatrix<f64>>,
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    ofv: f64,
+    options: &FitOptions, has_covariance_matrix: bool, normal_sir_ran: bool,
+    fallback_proposal: Option<&DMatrix<f64>>, model: &CompiledModel, population: &Population,
+    params: &ModelParameters, eta_hats: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], ofv: f64,
     warnings: &mut Vec<String>,
 ) -> Option<crate::estimation::sir::SirResult> {
     if crate::cancel::is_cancelled(&options.cancel) {
@@ -592,8 +532,7 @@ pub(crate) fn resolve_sir_fallback(
 /// whose SIR did not run reports `sir_seed = None` whatever seed it was handed
 /// (#1758).
 pub(crate) fn apply_sir_result(
-    out: &mut FitResult,
-    normal: Option<&crate::estimation::sir::SirResult>,
+    out: &mut FitResult, normal: Option<&crate::estimation::sir::SirResult>,
     fallback: Option<&crate::estimation::sir::SirResult>,
 ) {
     let sir = normal.or(fallback);
@@ -619,19 +558,14 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
     }
     let sub = DMatrix::from_fn(free.len(), free.len(), |a, b| cov[(free[a], free[b])]);
     let std_devs: Vec<f64> = (0..free.len()).map(|a| sub[(a, a)].sqrt()).collect();
-    let cor = DMatrix::from_fn(free.len(), free.len(), |a, b| {
-        sub[(a, b)] / (std_devs[a] * std_devs[b])
-    });
+    let cor =
+        DMatrix::from_fn(free.len(), free.len(), |a, b| sub[(a, b)] / (std_devs[a] * std_devs[b]));
     let eig = cor.symmetric_eigen();
     let mut eigenvalues: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
     eigenvalues.cold_sort_by(&|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let min_ev = eigenvalues.last().copied().unwrap_or(0.0);
     let max_ev = eigenvalues.first().copied().unwrap_or(0.0);
-    let condition_number = if min_ev > 1e-10 {
-        max_ev / min_ev
-    } else {
-        f64::INFINITY
-    };
+    let condition_number = if min_ev > 1e-10 { max_ev / min_ev } else { f64::INFINITY };
     (Some(eigenvalues), Some(condition_number))
 }
 
@@ -667,14 +601,9 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
 /// Pass `false` on a model that integrates nothing: entering a scope *activates*
 /// per-segment recording, and a closed-form model has no segments to record.
 pub(crate) fn compute_subject_results(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
-    kappas_per_subject: &[Vec<DVector<f64>>],
-    interaction: bool,
-    mixest: Option<&[usize]>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[DVector<f64>], h_matrices: &[DMatrix<f64>],
+    kappas_per_subject: &[Vec<DVector<f64>>], interaction: bool, mixest: Option<&[usize]>,
     collect_solver_stats: bool,
 ) -> (Vec<SubjectResult>, crate::ode::solver::OdeSolverStats) {
     let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> =
@@ -699,11 +628,8 @@ pub(crate) fn compute_subject_results(
             let params = class_params.as_ref().unwrap_or(params);
             let eta = &eta_hats[i];
             let h = &h_matrices[i];
-            let kappas: &[DVector<f64>] = if i < kappas_per_subject.len() {
-                kappas_per_subject[i].as_slice()
-            } else {
-                &[]
-            };
+            let kappas: &[DVector<f64>] =
+                if i < kappas_per_subject.len() { kappas_per_subject[i].as_slice() } else { &[] };
 
             // Individual predictions: f(eta_hat), with occasion-specific kappas for IOV.
             // Uses the continuous per-occasion-aware prediction (issue #104) for IOV
@@ -728,10 +654,7 @@ pub(crate) fn compute_subject_results(
             // CWRES and the OFV contribution below — the same `[η, κ₁…κ_K]` system the
             // fit's marginal scored (#1948).
             let omega_iov = (!kappas.is_empty()).then(|| {
-                params
-                    .omega_iov
-                    .as_ref()
-                    .expect("omega_iov present when kappas non-empty")
+                params.omega_iov.as_ref().expect("omega_iov present when kappas non-empty")
             });
             let iov_lin = omega_iov.and_then(|omega_iov| {
                 iov_linearization(
@@ -996,9 +919,7 @@ pub(crate) fn compute_subject_results(
 /// (the occasion's first observation, or the subject's covariates when the
 /// occasion carries only doses), matching the granularity κ is drawn at.
 pub(crate) fn kappa_weight_typicals(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
+    model: &CompiledModel, population: &Population, theta: &[f64],
 ) -> Vec<Option<f64>> {
     if !model.has_weighted_kappa() {
         return Vec::new();
@@ -1041,9 +962,7 @@ pub(crate) fn kappa_weight_typicals(
                         let occs: Vec<u32> = group.iter().map(|&g| cells[g].0).collect();
                         let pk_only = (0..subj.pk_only_times.len())
                             .find(|&m| {
-                                subj.pk_only_occasions
-                                    .get(m)
-                                    .is_some_and(|o| occs.contains(o))
+                                subj.pk_only_occasions.get(m).is_some_and(|o| occs.contains(o))
                             })
                             .map(|m| (subj.pk_only_cov(m), subj.param_time_pk_only(m)));
                         pk_only
@@ -1090,19 +1009,15 @@ pub(crate) fn kappa_weight_typicals(
 /// `informed` (parallel per subject, from `iov_group_informed`), with the group's
 /// position in that subject's own list kept. A group with no mask entry is kept.
 fn informed_kappas<'a>(
-    kappas_per_subject: &'a [Vec<DVector<f64>>],
-    informed: &'a [Vec<bool>],
+    kappas_per_subject: &'a [Vec<DVector<f64>>], informed: &'a [Vec<bool>],
 ) -> impl Iterator<Item = (usize, &'a DVector<f64>)> + 'a {
-    kappas_per_subject
-        .iter()
-        .enumerate()
-        .flat_map(move |(i, occ_kappas)| {
-            let mask = informed.get(i);
-            occ_kappas
-                .iter()
-                .enumerate()
-                .filter(move |(g, _)| mask.and_then(|m| m.get(*g)).copied().unwrap_or(true))
-        })
+    kappas_per_subject.iter().enumerate().flat_map(move |(i, occ_kappas)| {
+        let mask = informed.get(i);
+        occ_kappas
+            .iter()
+            .enumerate()
+            .filter(move |(g, _)| mask.and_then(|m| m.get(*g)).copied().unwrap_or(true))
+    })
 }
 
 /// `1 - sqrt(mean(κ̂²)) / sqrt(var)` over `kappas` for kappa `k`; NaN when `var` is
@@ -1133,20 +1048,15 @@ fn shrinkage_of(vals: &[f64], var: f64) -> f64 {
 /// contributes nothing. Returns NaN for a given kappa when the corresponding diagonal
 /// of `omega_iov` is non-positive or when fewer than two informed pairs remain.
 pub(crate) fn compute_kappa_shrinkage(
-    kappas_per_subject: &[Vec<DVector<f64>>],
-    informed: &[Vec<bool>],
-    omega_iov: &DMatrix<f64>,
+    kappas_per_subject: &[Vec<DVector<f64>>], informed: &[Vec<bool>], omega_iov: &DMatrix<f64>,
 ) -> Vec<f64> {
     let n_kappa = omega_iov.nrows();
     if n_kappa == 0 {
         return vec![];
     }
-    let all_kappas: Vec<&DVector<f64>> = informed_kappas(kappas_per_subject, informed)
-        .map(|(_, kv)| kv)
-        .collect();
-    (0..n_kappa)
-        .map(|k| kappa_shrinkage_over(&all_kappas, omega_iov[(k, k)], k))
-        .collect()
+    let all_kappas: Vec<&DVector<f64>> =
+        informed_kappas(kappas_per_subject, informed).map(|(_, kv)| kv).collect();
+    (0..n_kappa).map(|k| kappa_shrinkage_over(&all_kappas, omega_iov[(k, k)], k)).collect()
 }
 
 /// `(shrinkage_kappa, shrinkage_kappa_by_occ)` of a fit over `population`: both pooled
@@ -1155,9 +1065,7 @@ pub(crate) fn compute_kappa_shrinkage(
 /// `model` carries no state between records, so there only a group's own observations
 /// inform it.
 pub(crate) fn kappa_shrinkages(
-    model: &CompiledModel,
-    population: &Population,
-    kappas_per_subject: &[Vec<DVector<f64>>],
+    model: &CompiledModel, population: &Population, kappas_per_subject: &[Vec<DVector<f64>>],
     omega_iov: &DMatrix<f64>,
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
     let informed: Vec<Vec<bool>> = population
@@ -1192,28 +1100,20 @@ pub(crate) struct NestedKappaFacts {
 }
 
 pub(crate) fn nested_kappa_facts(
-    model: &CompiledModel,
-    population: &Population,
-    kappas_per_subject: &[Vec<DVector<f64>>],
+    model: &CompiledModel, population: &Population, kappas_per_subject: &[Vec<DVector<f64>>],
     omega_iov: &DMatrix<f64>,
 ) -> Option<NestedKappaFacts> {
     use crate::stats::nested_levels::NestedLayout;
     let levels = model.nested_levels()?;
-    let kappa_levels: Vec<String> = levels
-        .kappa_level
-        .iter()
-        .map(|&l| levels.levels[l].name.clone())
-        .collect();
+    let kappa_levels: Vec<String> =
+        levels.kappa_level.iter().map(|&l| levels.levels[l].name.clone()).collect();
     let mut by_level: Vec<crate::types::LevelKappaEbes> = levels
         .levels
         .iter()
         .enumerate()
         .map(|(l, level)| crate::types::LevelKappaEbes {
             level: level.name.clone(),
-            columns: levels.levels[..=l]
-                .iter()
-                .map(|x| x.column.clone())
-                .collect(),
+            columns: levels.levels[..=l].iter().map(|x| x.column.clone()).collect(),
             kappa_names: (0..model.n_kappa)
                 .filter(|&k| levels.kappa_level[k] == l)
                 .map(|k| model.kappa_names[k].clone())
@@ -1253,23 +1153,15 @@ pub(crate) fn nested_kappa_facts(
                             pooled[k].push(v);
                         }
                     }
-                    crate::types::LevelGroupEbe {
-                        labels: layout.labels(g, l),
-                        kappa,
-                    }
+                    crate::types::LevelGroupEbe { labels: layout.labels(g, l), kappa }
                 })
                 .collect();
             entry.groups.push(groups);
         }
     }
-    let shrinkage = (0..model.n_kappa)
-        .map(|k| shrinkage_of(&pooled[k], omega_iov[(k, k)]))
-        .collect();
-    Some(NestedKappaFacts {
-        kappa_levels,
-        by_level,
-        shrinkage,
-    })
+    let shrinkage =
+        (0..model.n_kappa).map(|k| shrinkage_of(&pooled[k], omega_iov[(k, k)])).collect();
+    Some(NestedKappaFacts { kappa_levels, by_level, shrinkage })
 }
 
 /// Kappa shrinkage broken out by occasion index.
@@ -1293,20 +1185,14 @@ pub(crate) fn nested_kappa_facts(
 /// Returns an empty outer vec when fewer than two distinct occasions are present
 /// or no kappa parameters exist.
 pub(crate) fn compute_kappa_shrinkage_by_occ(
-    kappas_per_subject: &[Vec<DVector<f64>>],
-    informed: &[Vec<bool>],
-    omega_iov: &DMatrix<f64>,
+    kappas_per_subject: &[Vec<DVector<f64>>], informed: &[Vec<bool>], omega_iov: &DMatrix<f64>,
 ) -> Vec<Vec<f64>> {
     let n_kappa = omega_iov.nrows();
     if n_kappa == 0 {
         return vec![];
     }
     // Determine max number of occasions across subjects.
-    let n_occ = kappas_per_subject
-        .iter()
-        .map(|v| v.len())
-        .max()
-        .unwrap_or(0);
+    let n_occ = kappas_per_subject.iter().map(|v| v.len()).max().unwrap_or(0);
     if n_occ < 2 {
         return vec![];
     }
@@ -1316,9 +1202,7 @@ pub(crate) fn compute_kappa_shrinkage_by_occ(
                 .filter(|(g, _)| *g == occ_idx)
                 .map(|(_, kv)| kv)
                 .collect();
-            (0..n_kappa)
-                .map(|k| kappa_shrinkage_over(&occ_kappas, omega_iov[(k, k)], k))
-                .collect()
+            (0..n_kappa).map(|k| kappa_shrinkage_over(&occ_kappas, omega_iov[(k, k)], k)).collect()
         })
         .collect()
 }
@@ -1354,11 +1238,8 @@ pub(crate) fn compute_eta_shrinkage(subjects: &[SubjectResult], omega: &DMatrix<
 /// IWRES has model-imposed mean 0 and variance 1, so the uncentered second
 /// moment with `n` divisor is the natural estimator (matches NONMEM).
 pub(crate) fn compute_eps_shrinkage(subjects: &[SubjectResult]) -> f64 {
-    let vals: Vec<f64> = subjects
-        .iter()
-        .flat_map(|s| s.iwres.iter().copied())
-        .filter(|v| v.is_finite())
-        .collect();
+    let vals: Vec<f64> =
+        subjects.iter().flat_map(|s| s.iwres.iter().copied()).filter(|v| v.is_finite()).collect();
     let n = vals.len();
     if n < 2 {
         return f64::NAN;
@@ -1416,10 +1297,7 @@ pub(crate) fn high_shrinkage_eta_indices(shrinkage: &[f64]) -> Vec<usize> {
 /// when the name is missing — so both the message and the `details` payload
 /// stay unambiguous.
 fn eta_label(eta_names: &[String], i: usize) -> String {
-    eta_names
-        .get(i)
-        .cloned()
-        .unwrap_or_else(|| format!("eta_{i}"))
+    eta_names.get(i).cloned().unwrap_or_else(|| format!("eta_{i}"))
 }
 
 /// Build the user-facing warning for high ETA shrinkage, or `None` when no ETA
@@ -1539,11 +1417,8 @@ fn boundary_estimates(params: &ModelParameters) -> Vec<(String, f64, f64, &'stat
                     continue;
                 }
             }
-            let name = params
-                .theta_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            let name =
+                params.theta_names.get(i).cloned().unwrap_or_else(|| format!("THETA{}", i + 1));
             hits.push((name, est, bound, side));
         }
     }
@@ -1604,9 +1479,7 @@ fn packed_guard_eq(estimate: f64, guard: f64) -> bool {
 /// introduced by optimizer scaling/unscaling. Degenerate or non-finite bounds
 /// are never internal guard hits.
 pub(crate) fn packed_guard_side(
-    estimate: f64,
-    lower: f64,
-    upper: f64,
+    estimate: f64, lower: f64, upper: f64,
 ) -> Option<(&'static str, f64)> {
     if !estimate.is_finite() || !lower.is_finite() || !upper.is_finite() || lower >= upper {
         return None;
@@ -1692,10 +1565,7 @@ pub(crate) fn collapsed_coordinates(params: &ModelParameters) -> Vec<(usize, Pac
 /// `FitResult::held_at_bound`, so the list and the matrix cannot disagree on which
 /// coordinates are held.
 pub(crate) fn held_guard_coordinates(params: &ModelParameters) -> Vec<usize> {
-    collapsed_coordinates(params)
-        .into_iter()
-        .map(|(i, _)| i)
-        .collect()
+    collapsed_coordinates(params).into_iter().map(|(i, _)| i).collect()
 }
 
 /// `FitResult::held_at_bound` for the estimate `params` (#2797): the
@@ -1703,8 +1573,7 @@ pub(crate) fn held_guard_coordinates(params: &ModelParameters) -> Vec<usize> {
 /// [`HeldReason::CollapsedAtGuard`] coordinates ([`held_guard_coordinates`]), in packed
 /// order, each with the name and family the estimate table shows it under.
 pub(crate) fn held_at_bound_list(
-    params: &ModelParameters,
-    profiled_levels_at_bound: &[usize],
+    params: &ModelParameters, profiled_levels_at_bound: &[usize],
 ) -> Vec<HeldAtBound> {
     use crate::estimation::parameterization::{coordinate_names, packed_segments};
     let segs = packed_segments(params);
@@ -1748,15 +1617,11 @@ pub(crate) fn held_at_bound_list(
 /// (`omega(2)` → `Some(2)`); an Ω override is always diagonal (the parser refuses a block
 /// one). `None` for an off-diagonal or a ρ, neither of which is ever held.
 fn packed_diagonal_parameter(
-    params: &ModelParameters,
-    segs: &crate::estimation::parameterization::PackedSegments,
-    p: usize,
+    params: &ModelParameters, segs: &crate::estimation::parameterization::PackedSegments, p: usize,
 ) -> Option<(ParameterKind, usize, Option<usize>)> {
     use crate::estimation::parameterization::lower_tri_iter;
     let diag_of = |om: &crate::types::OmegaMatrix, off: usize| {
-        lower_tri_iter(om.dim(), om.diagonal)
-            .nth(off)
-            .and_then(|(i, j)| (i == j).then_some(i))
+        lower_tri_iter(om.dim(), om.diagonal).nth(off).and_then(|(i, j)| (i == j).then_some(i))
     };
     if p < segs.omega_start() {
         Some((ParameterKind::Theta, p, None))
@@ -1769,15 +1634,11 @@ fn packed_diagonal_parameter(
         diag_of(iov, p - segs.iov_start()).map(|i| (ParameterKind::Kappa, i, None))
     } else if p < segs.mixture_sigma_start() {
         let mix = params.mixture.as_ref()?;
-        let &(c, e) = mix
-            .omega_override_addr
-            .get(p - segs.mixture_omega_start())?;
+        let &(c, e) = mix.omega_override_addr.get(p - segs.mixture_omega_start())?;
         Some((ParameterKind::Omega, e, Some(c + 1)))
     } else if p < segs.rho_start() {
         let mix = params.mixture.as_ref()?;
-        let &(c, s) = mix
-            .sigma_override_addr
-            .get(p - segs.mixture_sigma_start())?;
+        let &(c, s) = mix.sigma_override_addr.get(p - segs.mixture_sigma_start())?;
         Some((ParameterKind::Sigma, s, Some(c + 1)))
     } else {
         None
@@ -1788,39 +1649,24 @@ fn packed_diagonal_parameter(
 /// emitter shares (`severity: Warning`, `source_method: None`), varying only
 /// `category`, `message`, and `details`.
 fn warning_entry(
-    category: WarningCode,
-    message: String,
-    details: Option<serde_json::Value>,
+    category: WarningCode, message: String, details: Option<serde_json::Value>,
 ) -> WarningEntry {
     warning_entry_with_severity(WarningSeverity::Warning, category, message, details)
 }
 
 /// [`warning_entry`] for the emitters whose severity depends on what they found.
 fn warning_entry_with_severity(
-    severity: WarningSeverity,
-    category: WarningCode,
-    message: String,
+    severity: WarningSeverity, category: WarningCode, message: String,
     details: Option<serde_json::Value>,
 ) -> WarningEntry {
-    WarningEntry {
-        severity,
-        category,
-        message,
-        source_method: None,
-        details,
-    }
+    WarningEntry { severity, category, message, source_method: None, details }
 }
 
 /// The `[odes]` RHS-route note (#2681) as a fit warning, once per fit: informational,
 /// with the construct that kept the interpreter (or why no native code) in `details`.
 /// `None` for a model with no `[odes]` block or one whose RHS runs as native code.
 pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, WarningEntry)> {
-    let (_, msg, details) = model
-        .ode_spec
-        .as_ref()?
-        .rhs_program
-        .as_ref()?
-        .route_note()?;
+    let (_, msg, details) = model.ode_spec.as_ref()?.rhs_program.as_ref()?.route_note()?;
     let entry = warning_entry_with_severity(
         WarningSeverity::Info,
         WarningCode::OdeRhsRoute,
@@ -1834,8 +1680,7 @@ pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, Wa
 /// derivatives (`W_PLAN_FD_FALLBACK`, #2786), counted from what ran: in theory never, so the
 /// message asks for a report. `None` when every plan held.
 pub(crate) fn plan_fd_fallback_warning(
-    counts: &crate::parser::model_parser::rhs_regcode::kernel_jit::PlanFailureCounts,
-    n: usize,
+    counts: &crate::parser::model_parser::rhs_regcode::kernel_jit::PlanFailureCounts, n: usize,
 ) -> (String, WarningEntry) {
     let (k, why) = (counts.any, &counts.why);
     let msg = format!(
@@ -1844,10 +1689,7 @@ pub(crate) fn plan_fd_fallback_warning(
          report this as a bug."
     );
     let details = serde_json::json!({ "n_subjects": k, "n_total": n, "reason": why });
-    (
-        msg.clone(),
-        warning_entry(WarningCode::GradientFallback, msg, Some(details)),
-    )
+    (msg.clone(), warning_entry(WarningCode::GradientFallback, msg, Some(details)))
 }
 
 /// A standalone post-fit step's (`run_covariance`, `run_sir`) own plan failures, over a clone of
@@ -1858,15 +1700,11 @@ pub(crate) fn plan_fd_fallback_warning(
 /// call's [`register`](crate::parser::model_parser::rhs_regcode::kernel_jit::register) guard is
 /// alive, since the failures leave with the scope.
 pub(crate) fn refresh_plan_fd_fallback(
-    model: &CompiledModel,
-    population: &Population,
-    step: &str,
-    out: &mut FitResult,
+    model: &CompiledModel, population: &Population, step: &str, out: &mut FitResult,
 ) {
     let tag = format!("W_PLAN_FD_FALLBACK ({step}):");
     out.warnings.retain(|w| !w.starts_with(&tag));
-    out.warnings_structured
-        .retain(|e| !e.message.starts_with(&tag));
+    out.warnings_structured.retain(|e| !e.message.starts_with(&tag));
     let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
         model,
         &population.subjects,
@@ -1884,11 +1722,7 @@ pub(crate) fn refresh_plan_fd_fallback(
         "step": step, "n_subjects": c.any, "n_total": n, "reason": why
     });
     out.warnings.push(msg.clone());
-    out.warnings_structured.push(warning_entry(
-        WarningCode::GradientFallback,
-        msg,
-        Some(details),
-    ));
+    out.warnings_structured.push(warning_entry(WarningCode::GradientFallback, msg, Some(details)));
 }
 
 /// Report `counts` (`None`: no plan failed) on `out`: the warning, and each route's label from
@@ -1917,9 +1751,7 @@ pub(crate) fn apply_plan_failures(
 /// forms (it rewrites only an analytic route), `label` itself otherwise.
 fn plan_fallback_base(label: &str) -> String {
     if label == PLAN_FAILED_ALL_FD || label.starts_with("analytic ×") {
-        crate::build_info::GradientMethodKind::Analytic
-            .as_str()
-            .to_string()
+        crate::build_info::GradientMethodKind::Analytic.as_str().to_string()
     } else {
         label.to_string()
     }
@@ -1947,10 +1779,7 @@ pub(crate) fn plan_fallback_label(label: &str, k: usize, n: usize) -> String {
 /// hit), format the message (`msg` over the joined list), build the structured
 /// `details`, and wrap it in a [`WarningEntry`] as `Some((message, entry))`.
 fn list_warning<H>(
-    hits: Vec<H>,
-    category: WarningCode,
-    line: impl Fn(&H) -> String,
-    msg: impl Fn(&str) -> String,
+    hits: Vec<H>, category: WarningCode, line: impl Fn(&H) -> String, msg: impl Fn(&str) -> String,
     details: impl Fn(&[H]) -> serde_json::Value,
 ) -> Option<(String, WarningEntry)> {
     if hits.is_empty() {
@@ -1971,11 +1800,8 @@ fn list_warning<H>(
 /// which relation by parsing θ names — exactly the string surgery this block
 /// exists to remove.
 pub(crate) fn covariate_relation_estimates(
-    model: &crate::types::CompiledModel,
-    theta_names: &[String],
-    theta: &[f64],
-    se_theta: Option<&Vec<f64>>,
-    theta_fixed: &[bool],
+    model: &crate::types::CompiledModel, theta_names: &[String], theta: &[f64],
+    se_theta: Option<&Vec<f64>>, theta_fixed: &[bool],
 ) -> Vec<crate::types::CovariateRelationEstimate> {
     let Some(spec) = model.covariate_model.as_ref() else {
         return Vec::new();
@@ -2063,9 +1889,7 @@ pub(crate) fn boundary_estimate_warning(
 /// `with_se`: the covariance step produced a matrix, which held these levels at their
 /// bounds; the warning then says what that does to the standard errors.
 pub(crate) fn profiled_bound_warning(
-    theta_names: &[String],
-    hits: &[(usize, f64, bool)],
-    with_se: bool,
+    theta_names: &[String], hits: &[(usize, f64, bool)], with_se: bool,
 ) -> Option<(String, WarningEntry)> {
     list_warning(
         hits.to_vec(),
@@ -2114,18 +1938,13 @@ const PROFILED_BOUND_PREFIX: &str = "Profiled level(s) on a declared bound:";
 /// matrix). The covariance step holds exactly these levels, derived from the same
 /// `(θ̂, box)`, so `fit()` and `run_covariance` both report them through here.
 pub(crate) fn profiled_bound_report(
-    model: &crate::types::CompiledModel,
-    population: &crate::types::Population,
-    params: &crate::types::ModelParameters,
-    with_se: bool,
+    model: &crate::types::CompiledModel, population: &crate::types::Population,
+    params: &crate::types::ModelParameters, with_se: bool,
 ) -> (Vec<usize>, Option<(String, WarningEntry)>) {
     let hits = crate::estimation::profile::ProfileLayout::build(model, population, params)
         .map(|layout| layout.at_bound(&params.theta))
         .unwrap_or_default();
-    (
-        sorted_indices(&hits),
-        profiled_bound_warning(&params.theta_names, &hits, with_se),
-    )
+    (sorted_indices(&hits), profiled_bound_warning(&params.theta_names, &hits, with_se))
 }
 
 /// `run_covariance`'s refresh of the at-bound report on a re-run step: the incoming fit's
@@ -2135,23 +1954,18 @@ pub(crate) fn profiled_bound_report(
 /// the step itself held (`ProfileCtx::covariance_at_estimate`), when it got that far;
 /// otherwise from `params`, as [`profiled_bound_report`] reads the fit's estimates.
 pub(crate) fn refresh_profiled_bound_report(
-    model: &crate::types::CompiledModel,
-    population: &crate::types::Population,
-    params: &crate::types::ModelParameters,
-    held: Option<Vec<(usize, f64, bool)>>,
+    model: &crate::types::CompiledModel, population: &crate::types::Population,
+    params: &crate::types::ModelParameters, held: Option<Vec<(usize, f64, bool)>>,
     result: &mut FitResult,
 ) {
     // The stale entry in `warnings_structured` goes with its message: `run_covariance`
     // rebuilds the structured list from `warnings` (`rebuild_warnings_structured`).
-    result
-        .warnings
-        .retain(|w| !w.starts_with(PROFILED_BOUND_PREFIX));
+    result.warnings.retain(|w| !w.starts_with(PROFILED_BOUND_PREFIX));
     let with_se = result.covariance_matrix.is_some();
     let (held, warning) = match held {
-        Some(hits) => (
-            sorted_indices(&hits),
-            profiled_bound_warning(&params.theta_names, &hits, with_se),
-        ),
+        Some(hits) => {
+            (sorted_indices(&hits), profiled_bound_warning(&params.theta_names, &hits, with_se))
+        }
         None => profiled_bound_report(model, population, params, with_se),
     };
     if let Some((msg, entry)) = warning {
@@ -2207,9 +2021,7 @@ pub(crate) fn apply_held_at_bound(params: &ModelParameters, result: &mut FitResu
 /// copy dropped. `converged` is not revisited: a runaway demoted it in `fit()` already,
 /// and this call never promotes.
 pub(crate) fn refresh_held_at_bound_report(params: &ModelParameters, result: &mut FitResult) {
-    result
-        .warnings
-        .retain(|w| !w.contains(RUNAWAY_GUARD_PREFIX));
+    result.warnings.retain(|w| !w.contains(RUNAWAY_GUARD_PREFIX));
     let mut ignored = result.converged;
     if let Some((msg, entry)) =
         runaway_guard_warning_for(&mut ignored, params, result.covariance_matrix.as_ref())
@@ -2233,18 +2045,15 @@ pub(crate) fn refresh_held_at_bound_report(params: &ModelParameters, result: &mu
 /// to its `at_bound` value. The objective and the EBEs are not recomputed, and the warning
 /// says that too. `with_matrix`: the step produced a matrix.
 pub(crate) fn report_resolved_levels(
-    levels: &[(usize, f64)],
-    params: &mut crate::types::ModelParameters,
-    with_matrix: bool,
+    levels: &[(usize, f64)], params: &mut crate::types::ModelParameters, with_matrix: bool,
 ) -> Option<String> {
     let moved: Vec<(usize, f64, f64)> = levels
         .iter()
         .filter(|&&(k, v)| params.theta[k].to_bits() != v.to_bits())
         .map(|&(k, v)| (k, params.theta[k], v))
         .collect();
-    let &(k, from, to) = moved
-        .iter()
-        .max_by(|a, b| (a.2 - a.1).abs().total_cmp(&(b.2 - b.1).abs()))?;
+    let &(k, from, to) =
+        moved.iter().max_by(|a, b| (a.2 - a.1).abs().total_cmp(&(b.2 - b.1).abs()))?;
     for &(k, _, v) in &moved {
         params.theta[k] = v;
     }
@@ -2312,10 +2121,7 @@ fn sorted_indices(hits: &[(usize, f64, bool)]) -> Vec<usize> {
 /// the user strictly less. So: the boolean carries the verdict, the warning
 /// carries the reason, and `Err` stays for inputs that can be rejected up front.
 pub(crate) fn nonfinite_objective_warning(
-    converged: &mut bool,
-    ofv: f64,
-    method: EstimationMethod,
-    options: &FitOptions,
+    converged: &mut bool, ofv: f64, method: EstimationMethod, options: &FitOptions,
 ) -> Option<(String, WarningEntry)> {
     if crate::estimation::outer_optimizer::publishes_no_objective(method, options) {
         return None;
@@ -2355,10 +2161,7 @@ pub(crate) fn nonfinite_objective_warning(
 /// `marginal` is `None` when no marginal was published, which leaves the verdict alone:
 /// an estimating stage whose marginal pass was skipped is not checked for a rise.
 pub(crate) fn mcem_marginal_warning(
-    converged: &mut bool,
-    marginal: Option<f64>,
-    lowest: Option<f64>,
-    n_obs: usize,
+    converged: &mut bool, marginal: Option<f64>, lowest: Option<f64>, n_obs: usize,
 ) -> Option<(String, WarningEntry)> {
     use crate::estimation::impmap::{
         mcem_objective_rise, objective_converged, MCEM_RISE_TOLERANCE,
@@ -2413,8 +2216,7 @@ pub(crate) fn mcem_marginal_warning(
 /// the run did not diverge. A run long enough whose trace cannot be read is demoted:
 /// nothing in it shows the run settled.
 pub(crate) fn mcem_settling_warning(
-    converged: &mut bool,
-    trail: Option<&crate::estimation::impmap::McemObjectiveTrail>,
+    converged: &mut bool, trail: Option<&crate::estimation::impmap::McemObjectiveTrail>,
     marginal: Option<crate::estimation::impmap::FinalMarginal>,
 ) -> Option<(String, WarningEntry)> {
     use crate::estimation::impmap::{McemSettling, MCEM_SETTLE_MIN_WINDOW};
@@ -2452,13 +2254,7 @@ pub(crate) fn mcem_settling_warning(
             });
             (WarningSeverity::Critical, msg, details)
         }
-        McemSettling::Falling {
-            window,
-            previous_floor,
-            floor,
-            previous_mc_se,
-            mc_se,
-        } => {
+        McemSettling::Falling { window, previous_floor, floor, previous_mc_se, mc_se } => {
             *converged = false;
             let msg = format!(
                 "{MCEM_NOT_SETTLED_TOKEN}: {label}: the objective was still falling when the \
@@ -2478,12 +2274,7 @@ pub(crate) fn mcem_settling_warning(
             });
             (WarningSeverity::Critical, msg, details)
         }
-        McemSettling::AboveMarginal {
-            window,
-            floor,
-            marginal,
-            mc_se,
-        } => {
+        McemSettling::AboveMarginal { window, floor, marginal, mc_se } => {
             *converged = false;
             let msg = format!(
                 "{MCEM_NOT_SETTLED_TOKEN}: {label}: the iteration objective stayed well above \
@@ -2505,12 +2296,8 @@ pub(crate) fn mcem_settling_warning(
             (WarningSeverity::Critical, msg, details)
         }
     };
-    let entry = warning_entry_with_severity(
-        severity,
-        WarningCode::Convergence,
-        msg.clone(),
-        Some(details),
-    );
+    let entry =
+        warning_entry_with_severity(severity, WarningCode::Convergence, msg.clone(), Some(details));
     Some((msg, entry))
 }
 
@@ -2597,10 +2384,7 @@ impl ContributionSource {
     /// `options.interaction` (the post-fit options), `mixture` when the fit is one, and
     /// `prior` the penalty added to it.
     pub(crate) fn of(
-        method: EstimationMethod,
-        options: &FitOptions,
-        mixture: bool,
-        prior: f64,
+        method: EstimationMethod, options: &FitOptions, mixture: bool, prior: f64,
     ) -> Self {
         let score = if options.interaction { "FOCEI" } else { "FOCE" };
         let agq = FitOptions::agq_nodes_for(method, options.n_agq);
@@ -2621,11 +2405,7 @@ impl ContributionSource {
             }
             name
         });
-        Self {
-            score,
-            objective,
-            prior,
-        }
+        Self { score, objective, prior }
     }
 }
 
@@ -2647,13 +2427,8 @@ impl ContributionSource {
 /// Without a usable `h_matrix`, each non-Gaussian data term alone.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn contribution_terms(
-    model: &CompiledModel,
-    subject: &Subject,
-    params: &ModelParameters,
-    eta: &DVector<f64>,
-    h_matrix: Option<&DMatrix<f64>>,
-    interaction: bool,
-    kappas: &[DVector<f64>],
+    model: &CompiledModel, subject: &Subject, params: &ModelParameters, eta: &DVector<f64>,
+    h_matrix: Option<&DMatrix<f64>>, interaction: bool, kappas: &[DVector<f64>],
     mix_class: Option<usize>,
 ) -> Vec<ContributionTerm> {
     let iov = !kappas.is_empty();
@@ -2728,10 +2503,7 @@ pub(crate) fn contribution_terms(
         #[cfg(not(feature = "survival"))]
         _ => {}
     }
-    terms
-        .into_iter()
-        .map(|(name, nll)| ContributionTerm { name, nll })
-        .collect()
+    terms.into_iter().map(|(name, nll)| ContributionTerm { name, nll }).collect()
 }
 
 /// The per-subject term scorer `name_nonfinite_subjects` calls for each subject it
@@ -2835,15 +2607,9 @@ fn count_and_first(it: impl Iterator<Item = usize>) -> (usize, Option<usize>) {
 /// whose position does not match `population` gets no `TIME`, and since its `DV`s
 /// are then unknown, no likelihood clause and no terms either.
 pub(crate) fn name_nonfinite_subjects(
-    msg: String,
-    entry: &mut WarningEntry,
-    subjects: &[SubjectResult],
-    population: &Population,
-    model: &CompiledModel,
-    params: &ModelParameters,
-    mixest: Option<&[usize]>,
-    source: &ContributionSource,
-    terms: &TermScorer<'_>,
+    msg: String, entry: &mut WarningEntry, subjects: &[SubjectResult], population: &Population,
+    model: &CompiledModel, params: &ModelParameters, mixest: Option<&[usize]>,
+    source: &ContributionSource, terms: &TermScorer<'_>,
 ) -> String {
     use crate::estimation::outer_optimizer::ofv_is_valid;
     // A term's `nll` is raw; the contribution it sits in is `2·nll`-scaled.
@@ -2899,15 +2665,7 @@ pub(crate) fn name_nonfinite_subjects(
                 .map(|(j, _)| j),
             );
             let terms = data.map(|d| terms(i, d, s)).unwrap_or_default();
-            Named {
-                s,
-                n_bad,
-                first_bad,
-                n_unusable,
-                first_unusable,
-                data,
-                terms,
-            }
+            Named { s, n_bad, first_bad, n_unusable, first_unusable, data, terms }
         })
         .collect();
     let caveat = source.objective.as_deref().map(|objective| {
@@ -3140,10 +2898,7 @@ pub(crate) fn name_nonfinite_subjects(
         })
         .collect();
     if let Some(serde_json::Value::Object(map)) = entry.details.as_mut() {
-        map.insert(
-            "unusable_subjects".into(),
-            serde_json::Value::Array(payload),
-        );
+        map.insert("unusable_subjects".into(), serde_json::Value::Array(payload));
         map.insert("contribution_score".into(), serde_json::json!(source.score));
         map.insert(
             "contributions_are_objective_terms".into(),
@@ -3155,11 +2910,7 @@ pub(crate) fn name_nonfinite_subjects(
         }
         map.insert(
             "reason_read_from".into(),
-            serde_json::json!(if reread.is_some() {
-                "subjects"
-            } else {
-                "total"
-            }),
+            serde_json::json!(if reread.is_some() { "subjects" } else { "total" }),
         );
         if !largest.is_empty() {
             map.insert(
@@ -3210,9 +2961,7 @@ pub(crate) fn step_held(cov: Option<&DMatrix<f64>>, p: usize) -> bool {
 /// claim about the others), and is absent without a matrix — there are no SEs to qualify.
 /// A runaway is never held (D1). `details.parameters[].held` mirrors `cov_fixed`.
 pub(crate) fn runaway_guard_warning_for(
-    converged: &mut bool,
-    params: &ModelParameters,
-    cov: Option<&DMatrix<f64>>,
+    converged: &mut bool, params: &ModelParameters, cov: Option<&DMatrix<f64>>,
 ) -> Option<(String, WarningEntry)> {
     let hits = runaway_guard_estimates(params);
     if hits.is_empty() {
@@ -3264,10 +3013,7 @@ pub(crate) fn runaway_guard_warning_for(
     // unscaled DV (ng/mL, cell counts) can have a residual SD above it — and the
     // remediation is then the data scale, not the model. Name it, because the
     // generic advice above does not.
-    if hits
-        .iter()
-        .any(|hit| hit.is_runaway() && hit.kind == PackedCoordKind::Sigma)
-    {
+    if hits.iter().any(|hit| hit.is_runaway() && hit.kind == PackedCoordKind::Sigma) {
         guidance.push_str(
             " A SIGMA at the ceiling can also mean the residual error is genuinely that \
              large on the scale of the data: rescale DV, or use a proportional or \
@@ -3277,18 +3023,13 @@ pub(crate) fn runaway_guard_warning_for(
     // #2797: the collapses the step reports no SE for (`held_guard_coordinates`, `[mixture]`
     // overrides included since #2809), and whether it held them.
     let held_set = held_guard_coordinates(params);
-    let collapsed: Vec<&RunawayGuardHit> = hits
-        .iter()
-        .filter(|hit| held_set.contains(&hit.index))
-        .collect();
+    let collapsed: Vec<&RunawayGuardHit> =
+        hits.iter().filter(|hit| held_set.contains(&hit.index)).collect();
     if cov.is_some() && !collapsed.is_empty() {
         let held = collapsed.iter().all(|hit| step_held(cov, hit.index));
         let subject = if has_runaway {
-            let names = collapsed
-                .iter()
-                .map(|hit| hit.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let names =
+                collapsed.iter().map(|hit| hit.name.as_str()).collect::<Vec<_>>().join(", ");
             format!("The standard errors of the collapsed parameter(s) {names} are")
         } else {
             "Their standard errors are".to_string()
@@ -3320,11 +3061,7 @@ pub(crate) fn runaway_guard_warning_for(
         "parameters": params_json,
     });
     let entry = warning_entry_with_severity(
-        if has_runaway {
-            WarningSeverity::Critical
-        } else {
-            WarningSeverity::Warning
-        },
+        if has_runaway { WarningSeverity::Critical } else { WarningSeverity::Warning },
         WarningCode::ParameterAtRunawayGuard,
         msg.clone(),
         Some(details),
@@ -3341,8 +3078,7 @@ const RSE_WARN_THRESHOLD_PCT: f64 = 50.0;
 /// threshold, as `(name, estimate, se, rse_pct)`. Empty when the covariance
 /// step produced no SEs, or none are imprecise. `RSE = 100 * se / |estimate|`.
 fn inflated_rse_thetas(
-    se_theta: &Option<Vec<f64>>,
-    params: &ModelParameters,
+    se_theta: &Option<Vec<f64>>, params: &ModelParameters,
 ) -> Vec<(String, f64, f64, f64)> {
     let Some(se) = se_theta else {
         return Vec::new();
@@ -3358,11 +3094,8 @@ fn inflated_rse_thetas(
         }
         let rse = 100.0 * se_i / est.abs();
         if rse.is_finite() && rse > RSE_WARN_THRESHOLD_PCT {
-            let name = params
-                .theta_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("THETA{}", i + 1));
+            let name =
+                params.theta_names.get(i).cloned().unwrap_or_else(|| format!("THETA{}", i + 1));
             hits.push((name, est, se_i, rse));
         }
     }
@@ -3372,8 +3105,7 @@ fn inflated_rse_thetas(
 /// Build the human message + native structured entry (with `details`) for
 /// free THETAs whose relative standard error exceeds the threshold, or `None`.
 pub(crate) fn inflated_rse_warning(
-    se_theta: &Option<Vec<f64>>,
-    params: &ModelParameters,
+    se_theta: &Option<Vec<f64>>, params: &ModelParameters,
 ) -> Option<(String, WarningEntry)> {
     list_warning(
         inflated_rse_thetas(se_theta, params),
@@ -3421,8 +3153,7 @@ const CORRELATION_WARN_THRESHOLD: f64 = 0.95;
 /// packed labels are murkier). Fixed / zero-variance thetas (diagonal `<= 0`)
 /// are skipped. Empty when there is no covariance matrix.
 pub(crate) fn high_correlation_pairs(
-    cov: Option<&DMatrix<f64>>,
-    theta_names: &[String],
+    cov: Option<&DMatrix<f64>>, theta_names: &[String],
 ) -> Vec<(String, String, f64)> {
     let Some(cov) = cov else {
         return Vec::new();
@@ -3509,8 +3240,7 @@ pub(crate) fn high_correlation_warning(result: &FitResult) -> Option<(String, Wa
 /// a judgement for the caller, and one `Strictness::reject_init_stall` already
 /// makes for search harnesses that want it fatal.
 pub(crate) fn stalled_at_init_warning(
-    result: &FitResult,
-    options: &FitOptions,
+    result: &FitResult, options: &FitOptions,
 ) -> Option<(String, WarningEntry)> {
     // An evaluation-only run reports the objective at the initial estimates *by
     // request*: `outer_maxiter = 0` (NONMEM `MAXEVAL=0`), or a chain with no estimating
@@ -3536,11 +3266,7 @@ pub(crate) fn stalled_at_init_warning(
         .enumerate()
         .filter(|(i, _)| !result.theta_fixed.get(*i).copied().unwrap_or(false))
         .filter_map(|(i, name)| {
-            Some((
-                name.clone(),
-                *result.theta.get(i)?,
-                *result.theta_init.get(i)?,
-            ))
+            Some((name.clone(), *result.theta.get(i)?, *result.theta_init.get(i)?))
         })
         .collect();
     let list = free_thetas
@@ -3604,10 +3330,7 @@ pub(crate) fn stalled_at_init_warning(
 /// fit already completed — pointing at the ODE `transit()`/`igd()` forcing form,
 /// which reroutes per-eval at the actual η.
 pub(crate) fn absorption_flip_flop_ebe_warning(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    eta_hats: &[DVector<f64>],
+    model: &CompiledModel, population: &Population, theta: &[f64], eta_hats: &[DVector<f64>],
 ) -> Option<(String, WarningEntry)> {
     // Only a twin-less transit/IG closed form can degenerate this way: a twin-carrying
     // model reroutes per-eval, a non-absorption model has no flip-flop regime.
@@ -3631,10 +3354,7 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
     if crossers.is_empty() {
         return None;
     }
-    let is_transit = matches!(
-        model.pk_model,
-        PkModel::OneCptTransit | PkModel::TwoCptTransit
-    );
+    let is_transit = matches!(model.pk_model, PkModel::OneCptTransit | PkModel::TwoCptTransit);
     let (abscissa_label, ode_fn, params) = if is_transit {
         ("transit rate KTR = (n+1)/mtt", "transit()", "MTT / CL")
     } else {
@@ -3690,12 +3410,8 @@ pub(crate) fn absorption_flip_flop_ebe_warning(
 /// [`compute_subject_results`] takes them; `mixest` evaluates a mixture subject under its
 /// own fitted class.
 pub(crate) fn degenerate_cl_v_warning(
-    model: &CompiledModel,
-    population: &Population,
-    theta: &[f64],
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    mixest: Option<&[usize]>,
+    model: &CompiledModel, population: &Population, theta: &[f64], eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>], mixest: Option<&[usize]>,
 ) -> Option<(String, WarningEntry)> {
     let no_kappas: Vec<DVector<f64>> = Vec::new();
     let hits: Vec<(String, Vec<(f64, bool)>)> = population
@@ -3713,10 +3429,7 @@ pub(crate) fn degenerate_cl_v_warning(
                 subject,
                 theta,
                 eta.as_slice(),
-                ks.iter()
-                    .map(|k| k.as_slice())
-                    .collect::<Vec<_>>()
-                    .as_slice(),
+                ks.iter().map(|k| k.as_slice()).collect::<Vec<_>>().as_slice(),
             );
             (!records.is_empty()).then(|| (subject.id.clone(), records))
         })
@@ -3935,10 +3648,7 @@ pub(crate) fn integrates_odes(model: &CompiledModel) -> bool {
 /// [`integrates_odes`] before opening a scope at all.
 pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
     let spec = model.ode_spec.as_ref().or_else(|| {
-        model
-            .absorption_ode_equivalent
-            .as_ref()
-            .and_then(|eq| eq.built().ode_spec.as_ref())
+        model.absorption_ode_equivalent.as_ref().and_then(|eq| eq.built().ode_spec.as_ref())
     });
     let solver = spec.map(|s| s.effective_solver_opts()).unwrap_or_default();
     FitOptions {
@@ -4026,11 +3736,8 @@ pub(crate) fn solver_reporting_options(model: &CompiledModel) -> FitOptions {
 /// `OdeSolverStats::default()` on a model that integrates nothing (no scope, no counters, no
 /// warning — `ode_solver_diagnostics_warning` returns `None` on an all-zero payload).
 pub(crate) fn non_fit_diagnostics(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    stats: &crate::ode::OdeSolverStats,
-    phase: SolverStatsPhase,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    stats: &crate::ode::OdeSolverStats, phase: SolverStatsPhase,
 ) -> Vec<String> {
     let mut out: Vec<String> = model.parse_warnings.clone();
     // No `[data_selection]` clauses: these entry points are handed a `Population` the
@@ -4069,11 +3776,7 @@ pub(crate) fn non_fit_diagnostics(
         crate::api::validation::negative_lagtime_warning(model, population, &params.theta)
             .map(|d| d.message),
     );
-    out.extend(
-        crate::api::check_experimental_features(model)
-            .into_iter()
-            .map(|d| d.message),
-    );
+    out.extend(crate::api::check_experimental_features(model).into_iter().map(|d| d.message));
     if let Some((msg, _)) =
         ode_solver_diagnostics_warning(stats, &solver_reporting_options(model), phase)
     {
@@ -4089,8 +3792,7 @@ const FD_H_NOT_TIGHTENED_TOKEN: &str = "W_FD_JACOBIAN_NOT_TIGHTENED";
 /// estimates fell back to the fit's own ODE settings (#2701), or `None` when none did. The
 /// wording holds for a fit tighter than the Jacobian's target too, whose tolerances are its own.
 pub(crate) fn fd_h_not_tightened_warning(
-    redone: usize,
-    n_subjects: usize,
+    redone: usize, n_subjects: usize,
 ) -> Option<(String, WarningEntry)> {
     use crate::estimation::inner_optimizer::{
         ODE_FD_JACOBIAN_ABSTOL, ODE_FD_JACOBIAN_MAX_STEPS_FACTOR, ODE_FD_JACOBIAN_RELTOL,
@@ -4144,8 +3846,7 @@ pub(crate) fn solver_stats_scope(
 /// propagates `?` out of the enclosing function, which a closure cannot do. An early return
 /// there simply drops the scope, which is right — nothing is reported on a run that failed.
 pub(crate) fn with_solver_stats<T>(
-    model: &CompiledModel,
-    f: impl FnOnce() -> T,
+    model: &CompiledModel, f: impl FnOnce() -> T,
 ) -> (T, crate::ode::OdeSolverStats) {
     let scope = solver_stats_scope(model);
     let out = f();
@@ -4193,11 +3894,8 @@ pub(crate) fn with_solver_stats<T>(
 /// pass can ever produce — would have been permanently zero again, which is the dead
 /// diagnostic #1080 existed to remove.
 pub(crate) fn sweep_sensitivity_solver_stats(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    mixest: Option<&[usize]>,
+    model: &CompiledModel, population: &Population, params: &ModelParameters,
+    eta_hats: &[DVector<f64>], mixest: Option<&[usize]>,
 ) -> crate::ode::solver::OdeSolverStats {
     let mut merged = crate::ode::solver::OdeSolverStats::default();
     if model.ode_spec.is_none()
@@ -4278,9 +3976,7 @@ pub(crate) fn sweep_sensitivity_solver_stats(
 /// left behind therefore reads clean here, which is the honest scope: the warning is about the
 /// trajectories the fit *reports*, not about every one it visited.
 pub(crate) fn ode_solver_diagnostics_warning(
-    stats: &crate::ode::OdeSolverStats,
-    options: &FitOptions,
-    phase: SolverStatsPhase,
+    stats: &crate::ode::OdeSolverStats, options: &FitOptions, phase: SolverStatsPhase,
 ) -> Option<(String, WarningEntry)> {
     // Clamps taken inside escalations the guard discarded describe a trajectory nobody
     // received — the explicit re-solve replaced it — so they must not drive the freeze-padding
@@ -4314,9 +4010,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // subset of `unfinished_kept` — so it comes out of the remainder too. Their tails are `NaN`,
     // not freeze-padded, which is the whole reason they get a clause of their own.
     let diverged = stats.diverged_segments;
-    let unfinished_other = unfinished_kept
-        .saturating_sub(aborted)
-        .saturating_sub(diverged);
+    let unfinished_other = unfinished_kept.saturating_sub(aborted).saturating_sub(diverged);
     // Every damaged result is a divergence: no finite unfinished or aborted segment, and every
     // discarded escalation's explicit re-solve failed too (so none was repaired by the
     // fallback, which is the case the `rodas5p` advice is about). Then no `ode_method` or
@@ -4540,10 +4234,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
         parts.push(format!(
             "{aborted} segment(s) were abandoned early by ode_stiff_abort_after{budget}, which \
              bounds their cost and freeze-pads their tails",
-            budget = options
-                .ode_stiff_abort_after
-                .map(|b| format!(" = {b}"))
-                .unwrap_or_default(),
+            budget = options.ode_stiff_abort_after.map(|b| format!(" = {b}")).unwrap_or_default(),
         ));
     }
 
@@ -4613,14 +4304,8 @@ pub(crate) fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f6
 /// Extract standard errors from covariance matrix on the packed parameter scale,
 /// then transform back to the original scale via delta method.
 pub(crate) fn extract_standard_errors(
-    cov: &Option<DMatrix<f64>>,
-    template: &ModelParameters,
-) -> (
-    Option<Vec<f64>>,
-    Option<Vec<f64>>,
-    Option<Vec<f64>>,
-    Option<Vec<f64>>,
-) {
+    cov: &Option<DMatrix<f64>>, template: &ModelParameters,
+) -> (Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>, Option<Vec<f64>>) {
     let cov = match cov {
         Some(c) => c,
         None => return (None, None, None, None),
@@ -4771,8 +4456,7 @@ pub(crate) fn extract_standard_errors(
 /// so the offsets are the packed-segment helpers', never re-spelled here. A fixed override
 /// reports `0.0`, as a pinned θ/Ω/σ does. `None` with no override or no matrix.
 pub(crate) fn extract_mixture_override_se(
-    cov: &Option<DMatrix<f64>>,
-    template: &ModelParameters,
+    cov: &Option<DMatrix<f64>>, template: &ModelParameters,
 ) -> Option<Vec<f64>> {
     let mix = template.mixture.as_ref()?;
     let params = crate::estimation::parameterization::mixture_override_params(template);
@@ -4817,8 +4501,7 @@ pub(crate) fn extract_mixture_override_se(
 /// excluded from the reduced-Hessian free set and reports `0.0`, exactly like a
 /// pinned theta/omega/sigma.
 pub(crate) fn extract_residual_correlation_se(
-    cov: &Option<DMatrix<f64>>,
-    template: &ModelParameters,
+    cov: &Option<DMatrix<f64>>, template: &ModelParameters,
 ) -> Option<Vec<f64>> {
     if template.residual_correlations.is_empty() {
         return None;

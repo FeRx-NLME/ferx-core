@@ -73,11 +73,7 @@ pub(crate) struct SourceEstimate {
 /// guess, because reading a `.csv` as YAML would return an empty set and look
 /// like "the source model has no parameters".
 pub(crate) fn read_fit_estimates(path: &Path) -> Result<Vec<SourceEstimate>, String> {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
     match ext.as_str() {
         "fitrx" => {
             let loaded = crate::io::fitrx::load_fit(path)
@@ -158,11 +154,7 @@ pub(crate) fn from_fit_result(fit: &FitResult) -> Vec<SourceEstimate> {
     for (i, &value) in fit.sigma.iter().enumerate() {
         out.push(SourceEstimate {
             kind: EstimateKind::Sigma,
-            name: fit
-                .sigma_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("sigma_{}", i + 1)),
+            name: fit.sigma_names.get(i).cloned().unwrap_or_else(|| format!("sigma_{}", i + 1)),
             value,
             se: se_of(fit.se_sigma.as_ref().and_then(|v| v.get(i).copied()))
                 .filter(|_| !fit.sigma_fixed.get(i).copied().unwrap_or(false)),
@@ -173,11 +165,7 @@ pub(crate) fn from_fit_result(fit: &FitResult) -> Vec<SourceEstimate> {
         for i in 0..iov.nrows() {
             out.push(SourceEstimate {
                 kind: EstimateKind::Kappa,
-                name: fit
-                    .kappa_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("kappa_{}", i + 1)),
+                name: fit.kappa_names.get(i).cloned().unwrap_or_else(|| format!("kappa_{}", i + 1)),
                 value: iov[(i, i)],
                 se: se_of(fit.se_kappa.as_ref().and_then(|v| v.get(i).copied()))
                     .filter(|_| !fit.kappa_fixed.get(i).copied().unwrap_or(false)),
@@ -238,17 +226,11 @@ pub(crate) fn parse_estimates_yaml(text: &str) -> Result<Vec<SourceEstimate>, St
 
     // Close the open entry, pushing it when the section's value key was seen.
     fn flush(
-        out: &mut Vec<SourceEstimate>,
-        kind: EstimateKind,
+        out: &mut Vec<SourceEstimate>, kind: EstimateKind,
         entry: Option<(String, Option<f64>, Option<f64>, bool)>,
     ) {
         if let Some((name, Some(value), se, fixed)) = entry {
-            out.push(SourceEstimate {
-                kind,
-                name,
-                value,
-                se: se_of(se).filter(|_| !fixed),
-            });
+            out.push(SourceEstimate { kind, name, value, se: se_of(se).filter(|_| !fixed) });
         }
     }
 
@@ -310,11 +292,9 @@ pub(crate) fn parse_estimates_yaml(text: &str) -> Result<Vec<SourceEstimate>, St
     }
 
     if out.is_empty() {
-        return Err(
-            "no `theta:` / `omega:` / `sigma:` entries found — is this a ferx \
+        return Err("no `theta:` / `omega:` / `sigma:` entries found — is this a ferx \
              `{model}-fit.yaml`?"
-                .to_string(),
-        );
+            .to_string());
     }
     Ok(out)
 }

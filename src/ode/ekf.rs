@@ -81,13 +81,7 @@ impl EkfRhs for ProgramRhs<'_> {
 
 /// `f` over `rhs` with the infusion rates `active` added, as an integrator's right-hand side.
 fn forced_eval<T: VmNum, R: EkfRhs>(
-    rhs: &R,
-    active: &[(usize, T)],
-    u: &[T],
-    p: &[T],
-    t: T,
-    anchors: Anchors<T>,
-    du: &mut [T],
+    rhs: &R, active: &[(usize, T)], u: &[T], p: &[T], t: T, anchors: Anchors<T>, du: &mut [T],
 ) {
     rhs.eval::<T>(u, p, t, anchors, du);
     for &(cmt, rate) in active {
@@ -108,13 +102,7 @@ fn zeros<T: VmNum>(n: usize) -> Mat<T> {
 /// covariance's derivatives with respect to θ and η flow through `F` exactly.
 #[allow(clippy::too_many_arguments)]
 fn jacobian<T: VmNum, R: EkfRhs>(
-    rhs: &R,
-    active: &[(usize, T)],
-    u: &[T],
-    p: &[T],
-    t: T,
-    anchors: Anchors<T>,
-    n: usize,
+    rhs: &R, active: &[(usize, T)], u: &[T], p: &[T], t: T, anchors: Anchors<T>, n: usize,
 ) -> Mat<T> {
     type D<T> = DualT<1, T>;
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
@@ -147,16 +135,8 @@ fn jacobian<T: VmNum, R: EkfRhs>(
 /// adjoint through a long steady-state train. The caller sub-steps at [`RICCATI_DT_MAX`].
 #[allow(clippy::too_many_arguments)]
 fn propagate_covariance<T: VmNum, R: EkfRhs>(
-    rhs: &R,
-    active: &[(usize, T)],
-    p_mat: &[T],
-    u_mid: &[T],
-    params: &[T],
-    t_mid: T,
-    anchors: Anchors<T>,
-    dt: T,
-    q_diag: &[T],
-    n: usize,
+    rhs: &R, active: &[(usize, T)], p_mat: &[T], u_mid: &[T], params: &[T], t_mid: T,
+    anchors: Anchors<T>, dt: T, q_diag: &[T], n: usize,
 ) -> Mat<T> {
     let f = jacobian(rhs, active, u_mid, params, t_mid, anchors, n);
     let zero = T::from_f64(0.0);
@@ -235,17 +215,8 @@ const RICCATI_DT_MAX: f64 = 0.5;
 /// sub-step count is read on the value, the comparisons that fix it guarded.
 #[allow(clippy::too_many_arguments)]
 fn propagate_covariance_between<T: VmNum, R: EkfRhs>(
-    rhs: &R,
-    active: &[(usize, T)],
-    mut p_mat: Mat<T>,
-    t_prev: T,
-    u_prev: &[T],
-    t: T,
-    u: &[T],
-    params: &[T],
-    anchors: Anchors<T>,
-    q_diag: &[T],
-    n: usize,
+    rhs: &R, active: &[(usize, T)], mut p_mat: Mat<T>, t_prev: T, u_prev: &[T], t: T, u: &[T],
+    params: &[T], anchors: Anchors<T>, q_diag: &[T], n: usize,
 ) -> Mat<T> {
     let dt = t - t_prev;
     if dt.br_cmp_c(BranchCmp::Le, 1e-15) {
@@ -265,11 +236,7 @@ fn propagate_covariance_between<T: VmNum, R: EkfRhs>(
     for s in 0..n_steps {
         let alpha = (s as f64 + 0.5) / n_steps as f64;
         let alpha_mid = T::from_f64(alpha);
-        let u_mid: Vec<T> = u_prev
-            .iter()
-            .zip(u)
-            .map(|(&a, &b)| a + alpha_mid * (b - a))
-            .collect();
+        let u_mid: Vec<T> = u_prev.iter().zip(u).map(|(&a, &b)| a + alpha_mid * (b - a)).collect();
         let t_mid = t_prev + alpha_mid * dt;
         p_mat = propagate_covariance(
             rhs, active, &p_mat, &u_mid, params, t_mid, anchors, dt_sub, q_diag, n,
@@ -314,14 +281,8 @@ fn kalman_update<T: VmNum>(p_mat: &[T], obs_cmt: usize, r_obs: T, n: usize) -> (
 /// its point at a moving end is flowed on by the end's. On `f64` both are no-ops.
 #[allow(clippy::too_many_arguments)]
 fn integrate_mean<T: VmNum, R: EkfRhs>(
-    rhs: &R,
-    active: &[(usize, T)],
-    u: &[T],
-    span: (T, T),
-    params: &[T],
-    anchors: Anchors<T>,
-    saveat: &[f64],
-    opts: &OdeSolverOptions,
+    rhs: &R, active: &[(usize, T)], u: &[T], span: (T, T), params: &[T], anchors: Anchors<T>,
+    saveat: &[f64], opts: &OdeSolverOptions,
 ) -> Vec<crate::ode::solver::SolPointG<T>> {
     let f = |u: &[T], p: &[T], t: T, du: &mut [T]| forced_eval(rhs, active, u, p, t, anchors, du);
     // The step's `J` and `f_t` are the program's exact tangents at `T = f64`, as on the
@@ -335,9 +296,8 @@ fn integrate_mean<T: VmNum, R: EkfRhs>(
         pj.as_ref().is_some_and(|pj| pj.eval(u, p, t, j, ft))
     };
     let jr: &crate::ode::rosenbrock::JacFnG<'_, T> = &jf;
-    let _guard = pj
-        .is_some()
-        .then(|| crate::ode::rosenbrock::RhsGuard::register_jac_g::<T>(&f, &jr));
+    let _guard =
+        pj.is_some().then(|| crate::ode::rosenbrock::RhsGuard::register_jac_g::<T>(&f, &jr));
     T::span_hint(span.0, span.1);
     let (t0, t1) = (span.0.span_value(), span.1.span_value());
     // `x` flowed over the value-zero `h` from offset `s0` past `t_v`.
@@ -388,39 +348,30 @@ fn point_time<T: VmNum>(t: f64, end: T) -> T {
     }
 }
 
-/// Periodic steady state of the EKF's `(mean, covariance)` pair for an `SS=1` record
-/// (#1260): the state the filter would hold at the record had the dose been given every
-/// `II` since forever, with no observation in between.
+/// Periodic steady state of the EKF's `(mean, covariance)` pair for an `SS=1` record (#1260): the
+/// state the filter would hold at the record had the dose been given every `II` since forever, with
+/// no observation in between.
 ///
-/// The pulse train is expanded the way the ODE path's nonlinear fallback does it
-/// (`equilibrate_ss_pk_state`): from `u = 0, P = 0`, cycles of *(apply dose; integrate
-/// `II`)* on that fallback's cycle-local clock — bolus, or an `F`-reshaped active window
-/// followed by a quiet one — until the concatenated `(u, P)` stops moving by [`SsStopTracker`]'s
-/// criterion (read on the values, as the dual walks do) or [`SS_EQUILIBRATION_CYCLES`] is
-/// spent, with the #867 non-convergence warning on a spent cap. No exact linear fixed point
-/// here: a bolus leaves `P` untouched, so `P`'s cycle map is the continuous Riccati flow
-/// over `II`, and the same quadrature the walk uses is what makes an explicit train and
-/// this run-in agree to the stop tolerance. `P` is carried alongside `u` rather than seeded
-/// after it because on a nonlinear right-hand side the Jacobian along the cycle depends on
-/// the mean's own phase. A recording type records the cycle map once and the train as a
-/// run-time search on the values ([`ss_train`]), differentiating the converged pair implicitly.
+/// The pulse train is expanded as the ODE path's nonlinear fallback does it
+/// (`equilibrate_ss_pk_state`): from `u = 0, P = 0`, cycles of *(apply dose; integrate `II`)* on that
+/// fallback's cycle-local clock (bolus, or an `F`-reshaped active window then a quiet one) until the
+/// concatenated `(u, P)` stops moving by [`SsStopTracker`]'s criterion (read on the values, as the
+/// dual walks do) or [`SS_EQUILIBRATION_CYCLES`] is spent, with the #867 non-convergence warning on
+/// a spent cap. No exact linear fixed point: a bolus leaves `P` untouched, so `P`'s cycle map is the
+/// continuous Riccati flow over `II`, and the same quadrature the walk uses makes an explicit train
+/// and this run-in agree to the stop tolerance. `P` is carried alongside `u` because on a nonlinear
+/// RHS the Jacobian along the cycle depends on the mean's own phase. A recording type records the
+/// cycle map once and the train as a run-time search on the values ([`ss_train`]), differentiating
+/// the converged pair implicitly.
 ///
-/// Cost, measured on the #1260 fixture (one objective evaluation, debug build): the run-in
-/// early-stops after 16–21 cycles; 569 ms with the `SS=1` record against 996 ms with the 41
-/// explicit records it stands for.
-///
-/// Returns the zero pair for the shapes the ODE run-in also declines: `II ≤ 0` or a compartment
+/// Cost on the #1260 fixture (one objective evaluation, debug build): the run-in early-stops after
+/// 16-21 cycles; 569 ms with the `SS=1` record against 996 ms with the 41 explicit records it stands
+/// for. Returns the zero pair for the shapes the ODE run-in also declines: `II ≤ 0` or a compartment
 /// outside the state vector.
 #[allow(clippy::too_many_arguments)]
 fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
-    rhs: &R,
-    n: usize,
-    dose: &DoseEvent,
-    f_bio: T,
-    (inf_rate, t_inf): (T, T),
-    params: &[T],
-    q_diag: &[T],
-    opts: &OdeSolverOptions,
+    rhs: &R, n: usize, dose: &DoseEvent, f_bio: T, (inf_rate, t_inf): (T, T), params: &[T],
+    q_diag: &[T], opts: &OdeSolverOptions,
 ) -> (Vec<T>, Mat<T>) {
     let zero = T::from_f64(0.0);
     let cmt_idx = dose.cmt_idx();
@@ -473,9 +424,8 @@ fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
         }
         p_out
     };
-    let inf_active: Vec<(usize, T)> = std::iter::once((cmt_idx, inf_rate))
-        .chain(held.iter().copied())
-        .collect();
+    let inf_active: Vec<(usize, T)> =
+        std::iter::once((cmt_idx, inf_rate)).chain(held.iter().copied()).collect();
     // One cycle of the train on the flat pair `[u; P]`: the dose, then its interval.
     let cycle = |z: &[T]| -> Option<Vec<T>> {
         let mut u = z[..n].to_vec();
@@ -517,12 +467,8 @@ fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
 /// Non-recording: run at `f64` by a recording's run-time search (`T::ss_fixed_point`'s
 /// `solve`), and at `T` only in `equilibrate_ss_ekf`'s `!T::RECORDS_BRANCHES` arm.
 fn ss_train<T: VmNum>(
-    n: usize,
-    cycle: &dyn Fn(&[T]) -> Option<Vec<T>>,
-) -> Option<(
-    Vec<T>,
-    crate::parser::model_parser::rhs_regcode::kernel_jit::Found,
-)> {
+    n: usize, cycle: &dyn Fn(&[T]) -> Option<Vec<T>>,
+) -> Option<(Vec<T>, crate::parser::model_parser::rhs_regcode::kernel_jit::Found)> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit::Found;
     let mut z = vec![T::from_f64(0.0); n + n * n];
     let mut tracker = SsStopTracker::default();
@@ -542,14 +488,8 @@ fn ss_train<T: VmNum>(
     }
     let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
     note_ss_nonconvergence_if_capped(converged, incr_prev, incr_last, incr_mag);
-    let found = if converged {
-        Found::Fixed(0)
-    } else {
-        Found::Iterated {
-            map: 0,
-            count: cycles_run,
-        }
-    };
+    let found =
+        if converged { Found::Fixed(0) } else { Found::Iterated { map: 0, count: cycles_run } };
     Some((z, found))
 }
 
@@ -590,10 +530,7 @@ pub struct EkfObsPoint<T = f64> {
 
 impl<T: VmNum> EkfObsPoint<T> {
     fn of(v: f64) -> Self {
-        EkfObsPoint {
-            ipred: T::from_f64(v),
-            p_obs: T::from_f64(v),
-        }
+        EkfObsPoint { ipred: T::from_f64(v), p_obs: T::from_f64(v) }
     }
 }
 
@@ -613,41 +550,29 @@ fn ekf_ipred<T: VmNum>(v: T) -> T {
 
 /// Propagate mean and covariance through a subject's dose+obs timeline.
 ///
-/// `rhs`, `n_states`, `obs_cmt_idx` mirror `OdeSpec`. `diffusion_var` is the
-/// diagonal of Q (length == n_states). `r_of(j, ipred)` is observation `j`'s
-/// measurement variance R given the filter's own prediction there, so the Kalman
-/// update is correct for proportional and combined error models, where R depends on the
-/// predicted value. The returned `p_obs` values are the pre-update EKF covariance
-/// components and are not inflated by R. `dose_f_bio` is each dose's bioavailability
-/// (`Fn`, #369) and `params` the PK parameters (both numbers of the filter's type, so their
-/// derivatives flow through the mean and the covariance); the EKF path applies no lagtime.
-/// `doses` are resolved (`resolve_subject_doses`); `modeled[k]`, when given, is dose `k`'s
-/// modeled `D`/`R` as such a number ([`infusion_of`]), and empty for a caller on `f64`.
+/// `rhs`, `n_states`, `obs_cmt_idx` mirror `OdeSpec`. `diffusion_var` is the diagonal of Q (length
+/// == n_states). `r_of(j, ipred)` is observation `j`'s measurement variance R given the filter's own
+/// prediction there, so the Kalman update is correct for proportional and combined error models. The
+/// returned `p_obs` values are the pre-update EKF covariance components, not inflated by R.
+/// `dose_f_bio` is each dose's bioavailability (`Fn`, #369) and `params` the PK parameters (both of
+/// the filter's number type, so derivatives flow through the mean and covariance); the EKF path
+/// applies no lagtime. `doses` are resolved (`resolve_subject_doses`); `modeled[k]`, when given, is
+/// dose `k`'s modeled `D`/`R` as such a number ([`infusion_of`]), empty for a caller on `f64`.
 ///
-/// An infusion's window end moves with `F` (rate-defined) or its modeled `D`/`R`: it is a
-/// break time of the filter's type, so the mean solve's span, the covariance quadrature's
-/// sub-steps and their midpoints all carry its derivatives — the discrete filter is
-/// differentiated as it is computed, with the timeline's order guarded.
+/// An infusion's window end moves with `F` (rate-defined) or its modeled `D`/`R`: it is a break time
+/// of the filter's type, so the mean solve's span, the covariance quadrature's sub-steps and their
+/// midpoints all carry its derivatives (the discrete filter is differentiated as computed, with the
+/// timeline's order guarded).
 ///
-/// Dose events are handled identically to `ode_predictions`: boluses add to
-/// state; infusions inject a rate term into the wrapped RHS. Covariance is
-/// reset to zero at initial time and propagated forward from there; an `SS=1`
-/// record replaces both mean and covariance with their periodic steady state
+/// Dose events are handled as in `ode_predictions`: boluses add to state; infusions inject a rate
+/// term into the wrapped RHS. Covariance is reset to zero at the initial time and propagated forward;
+/// an `SS=1` record replaces mean and covariance with their periodic steady state
 /// ([`equilibrate_ss_ekf`], #1260).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
-    rhs: &R,
-    n_states: usize,
-    obs_cmt_idx: usize,
-    diffusion_var: &[T],
-    params: &[T],
-    dose_f_bio: &[T],
-    modeled: &[Option<T>],
-    initial_state: &[T],
-    doses: &[DoseEvent],
-    obs_times: &[f64],
-    r_of: &dyn Fn(usize, T) -> T,
-    opts: OdeSolverOptions,
+    rhs: &R, n_states: usize, obs_cmt_idx: usize, diffusion_var: &[T], params: &[T],
+    dose_f_bio: &[T], modeled: &[Option<T>], initial_state: &[T], doses: &[DoseEvent],
+    obs_times: &[f64], r_of: &dyn Fn(usize, T) -> T, opts: OdeSolverOptions,
 ) -> Vec<EkfObsPoint<T>> {
     use std::collections::HashMap;
     let tf = T::from_f64;
@@ -658,11 +583,8 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
     // Seed the EKF mean from the model's initial compartment amounts
     // (`init(state) = expr`); zeros for models without an init block. The
     // covariance still starts at zero — init sets the deterministic mean only.
-    let mut u = if initial_state.len() == n {
-        initial_state.to_vec()
-    } else {
-        vec![T::from_f64(0.0); n]
-    };
+    let mut u =
+        if initial_state.len() == n { initial_state.to_vec() } else { vec![T::from_f64(0.0); n] };
     let mut p_mat = zeros::<T>(n);
     let mut results = vec![EkfObsPoint::<T>::of(0.0); n_obs];
 
@@ -670,11 +592,7 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
     // time for the whole subject, and the last effective dose time re-anchored per segment
     // (#1131: they were `NaN` once, through a params slice too short to hold them).
     let first_dose = crate::ode::predictions::earliest_dose_time(doses);
-    let first_dose = if first_dose.is_finite() {
-        first_dose
-    } else {
-        f64::NAN
-    };
+    let first_dose = if first_dose.is_finite() { first_dose } else { f64::NAN };
     // Every observation index at a given time, not just the last one: multiple records
     // can share a time (simultaneous PK/PD samples on different compartments), and a
     // `HashMap<u64, usize>` keeps only one of them — the rest would keep the
@@ -711,11 +629,11 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
     // restores the very phantom leading segment this seed removes. Nothing is scored for
     // such a subject, so it costs only wasted integration, but it would make the code
     // contradict the comment above.
-    let t_last = obs_times
-        .iter()
-        .cloned()
-        .fold(0.0f64, f64::max)
-        .max(if t_first.is_finite() { t_first } else { 0.0 });
+    let t_last = obs_times.iter().cloned().fold(0.0f64, f64::max).max(if t_first.is_finite() {
+        t_first
+    } else {
+        0.0
+    });
     // Each infusion's bioavailable `(rate, window)`, its derivatives with it.
     let inf: Vec<(T, T)> = doses
         .iter()
@@ -757,13 +675,7 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
     // finite-looking filter pass built on a timeline that could not be ordered.
     // Finite, as a branch per break (a guard on the verdict, not on each break's value).
     if crate::ode::predictions::abandon_non_finite_timeline(
-        break_times.iter().map(|t| {
-            if t.br_abs_lt(f64::INFINITY) {
-                0.0
-            } else {
-                f64::NAN
-            }
-        }),
+        break_times.iter().map(|t| if t.br_abs_lt(f64::INFINITY) { 0.0 } else { f64::NAN }),
         None,
     ) {
         // `fill`, not a per-field loop: one spelling of the struct, so a field added to
@@ -946,10 +858,8 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
         // Re-anchor TAD for this segment, *before* anything integrates with it. `&[]`, not a
         // zero-filled vector: this path applies no lagtime, and `tad_anchor_for` reads a
         // missing entry as zero lag.
-        let anchors = (
-            first_dose,
-            tf(crate::ode::predictions::tad_anchor_for(doses, &[], t_start)),
-        );
+        let anchors =
+            (first_dose, tf(crate::ode::predictions::tad_anchor_for(doses, &[], t_start)));
 
         // Active infusion rates for this segment (shared with the FOCEI ODE
         // path so the F·RATE / span / lag / reset semantics stay in lockstep).
@@ -969,28 +879,13 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
         )
         .into_iter()
         .map(|(k, cmt, pulses)| {
-            (
-                cmt,
-                if pulses == 1 {
-                    inf[k].0
-                } else {
-                    inf[k].0 * T::from_f64(pulses as f64)
-                },
-            )
+            (cmt, if pulses == 1 { inf[k].0 } else { inf[k].0 * T::from_f64(pulses as f64) })
         })
         .collect();
 
         // Integrate mean state
-        let sol = integrate_mean(
-            rhs,
-            &active,
-            &u,
-            (t_start_g, t_end_g),
-            params,
-            anchors,
-            &saveat,
-            &opts,
-        );
+        let sol =
+            integrate_mean(rhs, &active, &u, (t_start_g, t_end_g), params, anchors, &saveat, &opts);
 
         // Propagate covariance and update at obs times within this segment
         let mut t_prev = t_start_g;
@@ -1012,24 +907,18 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
                 n,
             );
 
-            // Same assimilate-once mask as the boundary read: an observation sitting
-            // exactly on this segment's `t_end` is read here *and* at the next break as
-            // its `t_start`, and `kalman_update` is not idempotent.
+            // Same assimilate-once mask as the boundary read: an observation exactly on this segment's `t_end`
+            // is read here *and* at the next break as its `t_start`, and `kalman_update` is not idempotent.
             //
-            // Records sharing this exact time are **one** measurement instant and share
-            // a single update, exactly as the boundary path above does — `solve_ekf`
-            // has one `obs_cmt_idx`, so N records here are N reads of the same
-            // compartment at the same time, and updating N times would shrink `p_mat`
-            // as though N independent measurements had arrived. Before #1263 only the
-            // last index of a shared time was in the map at all, so the others kept
-            // their `{ ipred: 0.0, p_obs: 0.0 }` prefill.
-            //
-            // So are the records one ULP above it: the reader moves the first of two
-            // co-timed records one ULP below their tie (#614, #1810), and the pair is still
-            // one instant (`crate::types::same_instant`). Both times are in `saveat`, so the
-            // earlier point takes the pair's single update and the later finds every index
-            // already assimilated. No break sits between the two times, so the solver saves
-            // both off one step and they share a state as well.
+            // Records sharing this exact time are **one** measurement instant and share a single update
+            // (`solve_ekf` has one `obs_cmt_idx`, so N records are N reads of the same compartment at the same
+            // time; N updates would shrink `p_mat` as if N independent measurements arrived). Before #1263 only
+            // the last index of a shared time was in the map, so the others kept their
+            // `{ ipred: 0.0, p_obs: 0.0 }` prefill. So are the records one ULP above it: the reader moves the
+            // first of two co-timed records one ULP below their tie (#614, #1810) and the pair is still one
+            // instant (`crate::types::same_instant`). Both times are in `saveat`, so the earlier point takes
+            // the pair's single update and the later finds every index already assimilated (no break sits
+            // between them, so they also share a state).
             let here = obs_map
                 .get(&pt.t.to_bits())
                 .into_iter()
@@ -1113,22 +1002,13 @@ mod tests {
     /// dose-attribute map for `F`, and a precomputed per-observation `R`.
     #[allow(clippy::too_many_arguments)]
     fn solve_ekf(
-        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
-        n_states: usize,
-        obs_cmt_idx: usize,
-        diffusion_var: &[f64],
-        pk_params_flat: &[f64],
-        dose_attr_map: &crate::types::DoseAttrMap,
-        initial_state: &[f64],
-        doses: &[DoseEvent],
-        obs_times: &[f64],
-        r_obs_vec: &[f64],
-        opts: OdeSolverOptions,
+        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync), n_states: usize,
+        obs_cmt_idx: usize, diffusion_var: &[f64], pk_params_flat: &[f64],
+        dose_attr_map: &crate::types::DoseAttrMap, initial_state: &[f64], doses: &[DoseEvent],
+        obs_times: &[f64], r_obs_vec: &[f64], opts: OdeSolverOptions,
     ) -> Vec<EkfObsPoint> {
-        let dose_f: Vec<f64> = doses
-            .iter()
-            .map(|d| dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
-            .collect();
+        let dose_f: Vec<f64> =
+            doses.iter().map(|d| dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat)).collect();
         solve_ekf_g::<f64, _>(
             &FdRhs(rhs),
             n_states,
@@ -1163,8 +1043,7 @@ mod tests {
     /// way (e.g. indexing, or defaulting to 0.0) would make the fixture unable to
     /// reproduce the defect at all.
     fn time_reading_rhs(
-        slot: usize,
-        coef: f64,
+        slot: usize, coef: f64,
     ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync {
         move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
             let cl = p[crate::types::PK_IDX_CL];
@@ -1199,7 +1078,6 @@ mod tests {
     fn ekf_zero_diffusion_matches_ode_predictions() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         let doses = vec![bolus_dose(100.0)];
         let obs_times = vec![1.0, 4.0, 8.0, 12.0];
@@ -1222,49 +1100,17 @@ mod tests {
         );
 
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ode_spec = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(one_cpt_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
-            init_fn: None,
-            solver_opts: OdeSolverOptions::default(),
-            input_rate: Vec::new(),
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
-            dose_attr_map: Default::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(one_cpt_rhs))
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -1290,17 +1136,13 @@ mod tests {
     /// not the steady-state bug it was filed alongside.
     #[test]
     fn time_reading_rhs_gets_finite_anchors_on_the_ekf_walk() {
-        for (name, slot) in [
-            ("TAFD", crate::types::MAX_PK_PARAMS),
-            ("TAD", crate::types::MAX_PK_PARAMS + 1),
-        ] {
+        for (name, slot) in
+            [("TAFD", crate::types::MAX_PK_PARAMS), ("TAD", crate::types::MAX_PK_PARAMS + 1)]
+        {
             // Two doses: under a single dose TAD == TAFD, so a one-dose fixture cannot
             // tell the two slots apart and would agree with an engine that plumbed only
             // one of them.
-            let doses = vec![
-                bolus_dose(100.0),
-                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-            ];
+            let doses = vec![bolus_dose(100.0), DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)];
             let obs_times = vec![2.0, 4.0, 8.0, 24.0];
             let pk = make_pk(1.0, 20.0);
             let r_obs_vec: Vec<f64> = vec![0.01; obs_times.len()];
@@ -1349,10 +1191,7 @@ mod tests {
     /// — `0.0 * NaN` is `NaN`, so merely *mentioning* the builtin destroyed the run.
     #[test]
     fn a_zero_coefficient_model_time_term_is_bit_identical_to_omitting_it() {
-        let doses = vec![
-            bolus_dose(100.0),
-            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-        ];
+        let doses = vec![bolus_dose(100.0), DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)];
         let obs_times = vec![2.0, 4.0, 8.0, 24.0];
         let pk = make_pk(1.0, 20.0);
         let r_obs_vec: Vec<f64> = vec![0.01; obs_times.len()];
@@ -1393,28 +1232,24 @@ mod tests {
         }
     }
 
-    /// The **value** oracle for #1131, and the strongest one available: with the diffusion
-    /// variance at zero the EKF's mean walk reduces to the ordinary ODE integration, so
-    /// `solve_ekf`'s `ipred` must equal `ode_predictions`' — on a TAD- and a TAFD-reading
-    /// RHS, the exact models the bare-slice defect destroyed.
+    /// The **value** oracle for #1131: with the diffusion variance at zero the EKF's mean walk reduces
+    /// to the ordinary ODE integration, so `solve_ekf`'s `ipred` must equal `ode_predictions`' on a TAD-
+    /// and a TAFD-reading RHS, the exact models the bare-slice defect destroyed.
     ///
-    /// Both engines call `predictions::tad_anchor_for` after this fix, so this test cannot
-    /// observe a wrong *anchor rule* shared by both — that is what the NONMEM anchors in
-    /// `nonmem_anchor/` are for. What it does observe is the defect that was actually there:
-    /// the EKF passing a slice too short for the RHS to read the slot at all. Deleting
-    /// either the `seed_ext_params` call or the per-segment anchor write in `solve_ekf`
-    /// turns the EKF column into the `0.0` clamp while the ODE column stays correct.
+    /// Both engines call `predictions::tad_anchor_for`, so this cannot observe a wrong *anchor rule*
+    /// shared by both (that is what `nonmem_anchor/` is for). It observes the defect that was there: the
+    /// EKF passing a slice too short for the RHS to read the slot at all. Deleting either the
+    /// `seed_ext_params` call or the per-segment anchor write in `solve_ekf` turns the EKF column into the
+    /// `0.0` clamp while the ODE column stays correct.
     ///
-    /// A third reference, independent of both engines, keeps them from agreeing on a wrong
-    /// answer. For `dA/dt = -ke·A·(1 + c·u)` the exponent integrates in closed form:
-    /// with `u = TAD` the clock restarts at each arrival, with `u = TAFD` it does not, so
-    /// the two slots have *different* closed forms after the second dose — a fixture that
-    /// plumbed one slot into both would fail here.
+    /// A third reference independent of both engines keeps them from agreeing on a wrong answer: for
+    /// `dA/dt = -ke·A·(1 + c·u)` the exponent integrates in closed form; with `u = TAD` the clock
+    /// restarts at each arrival, with `u = TAFD` it does not, so the two slots have *different* closed
+    /// forms after the second dose (a fixture plumbing one slot into both would fail).
     #[test]
     fn ekf_matches_the_ode_twin_and_a_closed_form_on_a_model_time_rhs() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         let (cl, v) = (1.0f64, 20.0f64);
         let ke = cl / v;
@@ -1430,11 +1265,7 @@ mod tests {
         // disagree — is actually scored.
         let obs_times = vec![2.0, 8.0, 14.0, 24.0];
         let pk = make_pk(cl, v);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
 
         // ∫ (1 + c·u) over the leg, with `u` measured from `anchor`.
         let phase = |t_from: f64, t_to: f64, anchor: f64| -> f64 {
@@ -1472,49 +1303,18 @@ mod tests {
             );
 
             let subj = Subject {
-                obs_rgroup: Vec::new(),
                 id: "1".into(),
                 doses: doses.clone(),
                 obs_times: obs_times.clone(),
-                obs_raw_times: Vec::new(),
                 observations: vec![0.0; obs_times.len()],
                 obs_cmts: vec![1; obs_times.len()],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                reset_times: Vec::new(),
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0; obs_times.len()],
-                occasions: Vec::new(),
-                obs_l2: Vec::new(),
-                dose_occasions: Vec::new(),
-                reset_occasions: Vec::new(),
-                pk_only_occasions: Vec::new(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             };
             let ode_spec = OdeSpec {
-                chz_state_slots: Vec::new(),
-                rhs: Box::new(time_reading_rhs(slot, c)),
-                n_states: 1,
-                state_names: vec!["central".into()],
                 readout: crate::ode::OdeReadout::ObsCmt(0),
-                diffusion_var: Vec::new(),
-                init_fn: None,
                 solver_opts: opts,
-                input_rate: Vec::new(),
-                rhs_program: None,
-                readout_program: None,
-                indiv_param_program: None,
-                dose_attr_map: Default::default(),
+                ..crate::types::test_helpers::bare_ode(Box::new(time_reading_rhs(slot, c)))
             };
             let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -1548,27 +1348,18 @@ mod tests {
         );
     }
 
-    /// #1226 on the EKF walk: an observation **one ULP after** a dose record is read
-    /// post-dose, matching `ode_predictions`.
-    ///
-    /// This loop rescans every dose at every break exactly as the ODE prediction engines
-    /// do, and it carried the same `t > t_start + 1e-12 && t <= t_end + 1e-12` segment
-    /// filter plus an exact-bit `obs_map` boundary lookup — so the sample was claimed by
-    /// the *pre*-dose segment and the post-dose read missed it. The EKF path applies no
-    /// lagtime, so a data time one ULP after a dose record is the reachable geometry here
-    /// rather than a lagged arrival.
-    ///
-    /// Oracle: `ode_predictions` on the identical fixture, which is itself anchored on
-    /// NONMEM in `ode/predictions_tests.rs::lag_arrival_read_1226` — plus the closed form
-    /// below, so the two engines cannot agree on a wrong answer.
-    ///
-    /// Mutation: revert either the boundary band read or the segment filter in `solve_ekf`
-    /// and `ipred` at the ULP sample drops by a whole 100 mg dose.
+    /// #1226 on the EKF walk: an observation **one ULP after** a dose record is read post-dose, matching
+    /// `ode_predictions`. This loop rescans every dose at every break as the ODE engines do and carried
+    /// the same `t > t_start + 1e-12 && t <= t_end + 1e-12` segment filter plus an exact-bit `obs_map`
+    /// boundary lookup, so the sample was claimed by the *pre*-dose segment. The EKF applies no lagtime,
+    /// so one ULP after a dose record is the reachable geometry. Oracle: `ode_predictions` on the same
+    /// fixture (anchored on NONMEM in `ode/predictions_tests.rs::lag_arrival_read_1226`) plus the closed
+    /// form below. Mutation: reverting either the boundary band read or the segment filter drops `ipred`
+    /// at the ULP sample by a whole 100 mg dose.
     #[test]
     fn ekf_reads_an_obs_one_ulp_after_a_dose_post_dose() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         // Two doses so the second lands with the compartment non-empty: the pre/post-dose
         // pair is 45.38 vs 145.38 rather than 0 vs 100.
@@ -1585,11 +1376,7 @@ mod tests {
         ];
         let obs_times = vec![obs_1ulp, 9.0];
         let pk = make_pk(1.0, 10.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let ekf_pts = solve_ekf(
             &one_cpt_rhs,
             1,
@@ -1625,49 +1412,18 @@ mod tests {
         );
 
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: doses.clone(),
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ode_spec = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(one_cpt_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
-            init_fn: None,
             solver_opts: opts,
-            input_rate: Vec::new(),
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
-            dose_attr_map: Default::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(one_cpt_rhs))
         };
         let ode_preds = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
         for (i, (ekf, &ode)) in ekf_pts.iter().zip(ode_preds.iter()).enumerate() {
@@ -1836,40 +1592,29 @@ mod tests {
         );
 
         for pt in &ekf_pts {
-            assert!(
-                pt.p_obs > 0.0,
-                "expected p_obs > 0 with diffusion, got {}",
-                pt.p_obs
-            );
+            assert!(pt.p_obs > 0.0, "expected p_obs > 0 with diffusion, got {}", pt.p_obs);
         }
     }
 
-    /// A measurement landing exactly on a dose break must be assimilated **once**, while its
-    /// `ipred` is still the post-dose one.
+    /// A measurement landing exactly on a dose break must be assimilated **once**, while its `ipred` is
+    /// still the post-dose one.
     ///
-    /// Unlike the ODE engines, where a band write is an idempotent index assignment, the EKF
-    /// runs a `kalman_update` that mutates `p_mat`. An observation on an interior break is
-    /// saved by the segment ending there *and* read at that break as the next `t_start`, so
-    /// it was assimilated twice — the covariance shrank twice, giving an over-confident
-    /// `p_obs` at that record and a distorted covariance for the rest of the subject.
+    /// Unlike the ODE engines (an idempotent index assignment), the EKF runs a `kalman_update` that
+    /// mutates `p_mat`. An observation on an interior break is saved by the segment ending there *and*
+    /// read at that break as the next `t_start`, so it was assimilated twice: an over-confident `p_obs`
+    /// and a distorted covariance for the rest of the subject. Measured here: `p_obs` at `t = 6` was
+    /// **0.0437** against the correct **0.3460** (8×), and at `t = 12` 0.4420 against 0.4514. The defect
+    /// **predates #1226** (the old exact-bit lookup matched an observation at `t_start` as the band does),
+    /// but the band widens which records can reach it.
     ///
-    /// Measured on this fixture: `p_obs` at `t = 6` was **0.0437** against the correct
-    /// **0.3460** (a factor of 8), and the knock-on at `t = 12` was 0.4420 against 0.4514.
-    /// The defect **predates #1226** — the old exact-bit boundary lookup matched an
-    /// observation exactly at `t_start` just as the band does — but the band widens which
-    /// records can reach it, so the mask is part of this change.
+    /// **Oracle: a bolus does not touch `p_mat`.** Nudging the dose 1e-6 h earlier (far outside the match
+    /// band, negligible propagation) must leave every `p_obs` unchanged; a double assimilation violates
+    /// that by 8× and no reference implementation is needed. The split is asserted both ways: gating the
+    /// *whole* boundary read on the mask (not only the `kalman_update`) makes `ipred` read pre-dose
+    /// (68.73 instead of 168.73), reintroducing #1226.
     ///
-    /// **Oracle: a bolus does not touch `p_mat`.** So nudging the dose 1e-6 h earlier —
-    /// far outside the match band, but a negligible amount of propagation — must leave every
-    /// `p_obs` unchanged. That differential is what a double assimilation violates by a
-    /// factor of 8, and it needs no reference implementation.
-    ///
-    /// The split matters and is asserted both ways: gating the *whole* boundary read on the
-    /// mask (rather than only the `kalman_update`) makes `ipred` read pre-dose — measured
-    /// 68.73 instead of 168.73, i.e. it reintroduces the #1226 defect on the EKF.
-    ///
-    /// Mutations: drop the `assimilated` guard → `p_obs` at `t = 6` collapses to 0.0437;
-    /// make the guard `continue` before writing `ipred` → `ipred` at `t = 6` reads 68.73.
+    /// Mutations: drop the `assimilated` guard → `p_obs` at `t = 6` collapses to 0.0437; make the guard
+    /// `continue` before writing `ipred` → `ipred` at `t = 6` reads 68.73.
     #[test]
     fn ekf_assimilates_a_measurement_on_a_dose_break_exactly_once() {
         let obs_times = vec![2.0, 6.0, 12.0];
@@ -1955,7 +1700,7 @@ mod tests {
     /// since only one of the two engines is mutated).
     #[test]
     fn ekf_infusion_end_collision_applies_the_bolus_once() {
-        use crate::ode::predictions::{ode_predictions, OdeReadout, OdeSpec};
+        use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
         use std::collections::HashMap;
 
@@ -1985,11 +1730,7 @@ mod tests {
         ];
         let obs_times = vec![8.2001, 12.0, 24.0];
         let pk = make_pk(1.0, 10.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let got = solve_ekf(
             &one_cpt_rhs,
             1,
@@ -2020,19 +1761,9 @@ mod tests {
 
         // And against the objective engine at zero diffusion, so the two cannot drift.
         let ode = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(one_cpt_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
-            readout: OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
             solver_opts: opts,
-            input_rate: Vec::new(),
-            init_fn: None,
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
             dose_attr_map: crate::types::DoseAttrMap::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(one_cpt_rhs))
         };
         let subject = Subject {
             id: "1".into(),
@@ -2052,22 +1783,19 @@ mod tests {
         }
     }
 
-    /// A non-finite time on this walk's timeline used to panic its
-    /// `partial_cmp(..).unwrap()` sort. It must now return non-finite `ipred`s — not a
-    /// finite filter pass computed on a timeline that could not be ordered, which is
-    /// what `total_cmp` alone would give.
+    /// A non-finite time on this walk's timeline used to panic its `partial_cmp(..).unwrap()` sort; it
+    /// must now return non-finite `ipred`s, not a finite filter pass on a timeline that could not be
+    /// ordered (what `total_cmp` alone would give).
     ///
-    /// **Defence in depth, and the fixture says why.** The route that reaches the other
-    /// engines — a non-finite *lag* — cannot reach this one: the EKF path applies no
-    /// lagtime, and its only derived break is the infusion end, which
-    /// [`is_real_infusion`] already refuses to emit when `duration = amt/rate` is
-    /// non-finite (that dose falls back to the bolus branch, deliberately, and the
-    /// timeline stays orderable — measured). So the trigger here is a non-finite *record*
-    /// time, reachable through the hand-built entry `solve_ekf` exposes. The guard exists
-    /// because this walk's sort is the same one, not because a fitted dataset gets here.
+    /// **Defence in depth.** The route reaching the other engines (a non-finite *lag*) cannot reach this
+    /// one: the EKF applies no lagtime and its only derived break is the infusion end, which
+    /// [`is_real_infusion`] refuses to emit when `duration = amt/rate` is non-finite (that dose falls
+    /// back to the bolus branch and the timeline stays orderable, measured). So the trigger is a
+    /// non-finite *record* time via the hand-built `solve_ekf` entry; the guard exists because this
+    /// walk's sort is the same one, not because a fitted dataset gets here.
     ///
-    /// Mutation: restore `partial_cmp(..).unwrap()` → panic; delete the
-    /// `times_have_non_finite` guard → finite `ipred`s and the assert below fires.
+    /// Mutation: restore `partial_cmp(..).unwrap()` → panic; delete the `times_have_non_finite` guard →
+    /// finite `ipred`s and the assert below fires.
     #[test]
     fn ekf_non_finite_break_is_non_finite_not_a_panic() {
         let doses = vec![
@@ -2119,28 +1847,23 @@ mod tests {
         );
     }
 
-    /// **NONMEM anchor — a RATE-defined infusion under `F ≠ 1` on the EKF walk.**
+    /// **NONMEM anchor: a RATE-defined infusion under `F ≠ 1` on the EKF walk.**
     ///
-    /// `F` reshapes an infusion's **duration**, not its rate (#419): NONMEM holds the data
-    /// `RATE` and delivers `F·AMT` over `F·AMT/RATE`. `ekf.rs` pushed an unscaled
-    /// `dose.time + dose.duration` as the window's break, so `active_infusions`'
-    /// membership test (`predictions.rs:1520-1531`, `end >= t_end - EPS`) rejected the
-    /// window in **every** segment and the infusion delivered zero mass — measured
-    /// `ipred = 0.0` at every observation for `F = 0.5`, against `27.86 / 42.08 / 31.18`
-    /// from `ode_predictions` (#1263 review).
+    /// `F` reshapes an infusion's **duration**, not its rate (#419): NONMEM holds the data `RATE` and
+    /// delivers `F·AMT` over `F·AMT/RATE`. `ekf.rs` pushed an unscaled `dose.time + dose.duration` as the
+    /// window's break, so `active_infusions`' membership test (`predictions.rs:1520-1531`,
+    /// `end >= t_end - EPS`) rejected the window in **every** segment and the infusion delivered zero
+    /// mass (`ipred = 0.0` at every observation for `F = 0.5`, against `27.86 / 42.08 / 31.18` from
+    /// `ode_predictions`, #1263).
     ///
-    /// The reference is **NONMEM 7.6.0 PRED**, not ferx: `nonmem_anchor/oral_central_inf_advan2_f06.ctl`
-    /// (ADVAN2 TRANS2, `CL=5, V=50, KA=1, F2=0.6, S2=V`, 100 mg at `RATE=25` into `CMT=2`,
-    /// obs at `t = 1, 3, 6, 10, 16`), whose digits are also pinned in
-    /// `tests/oral_central_infusion_nonmem_anchor.rs` for the analytical paths. The system
-    /// is written here as the explicit two-state ODE twin so it reaches `solve_ekf`, which
-    /// the analytical anchor cannot.
-    ///
-    /// Non-degenerate on both sides of the quantity under test: `t = 1` is **inside** the
-    /// window (where `F` has not yet moved the answer — it is the same value as the `F = 1`
-    /// run) and `t = 3, 6, 10, 16` are all **past** the `F`-shortened end at `2.4 h`, where
-    /// an unscaled duration and a scaled one disagree. An implementation that ignored `F`
-    /// on the window would match the first point and miss the other four.
+    /// The reference is **NONMEM 7.6.0 PRED**: `nonmem_anchor/oral_central_inf_advan2_f06.ctl` (ADVAN2
+    /// TRANS2, `CL=5, V=50, KA=1, F2=0.6, S2=V`, 100 mg at `RATE=25` into `CMT=2`, obs at
+    /// `t = 1, 3, 6, 10, 16`), whose values are also pinned in
+    /// `tests/oral_central_infusion_nonmem_anchor.rs` for the analytical paths; written here as the
+    /// explicit two-state ODE twin so it reaches `solve_ekf`. Non-degenerate on both sides: `t = 1` is
+    /// **inside** the window (same as the `F = 1` run) and `t = 3, 6, 10, 16` are **past** the
+    /// `F`-shortened end at `2.4 h`, so an implementation ignoring `F` on the window would match the
+    /// first point and miss the other four.
     #[test]
     fn ekf_infusion_under_f_matches_nonmem() {
         // `oral_central_inf_advan2_f06.tab`, NONMEM 7.6.0 PRED at FORMAT=,1PE17.10.
@@ -2164,11 +1887,7 @@ mod tests {
         let obs_times = vec![1.0, 3.0, 6.0, 10.0, 16.0];
         // AMT=100, RATE=25 -> duration 4 h; F=0.6 shortens the window to 2.4 h.
         let doses = vec![DoseEvent::new(0.0, 100.0, 2, 25.0, false, 0.0)];
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
 
         let pts = solve_ekf(
             &rhs,
@@ -2199,15 +1918,9 @@ mod tests {
             assert!(got.is_finite(), "non-finite EKF ipred at t={t}: {got}");
             let rel = ((got - want) / want).abs();
             worst = worst.max(rel);
-            assert!(
-                rel < 1e-9,
-                "t={t}: EKF {got:.10e} vs NONMEM {want:.10e} (rel {rel:.3e})"
-            );
+            assert!(rel < 1e-9, "t={t}: EKF {got:.10e} vs NONMEM {want:.10e} (rel {rel:.3e})");
         }
-        assert!(
-            worst > 0.0,
-            "a zero worst-case error means the loop never compared anything"
-        );
+        assert!(worst > 0.0, "a zero worst-case error means the loop never compared anything");
     }
 
     /// **The TAFD anchor is the first dose time, not a literal zero.**
@@ -2235,11 +1948,7 @@ mod tests {
         ];
         let obs_times = vec![8.0, 14.0, 20.0, 30.0];
         let pk = make_pk(cl, v);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
 
         // ∫ (1 + c·u) du over the leg, with `u` measured from `anchor`.
         let phase = |t_from: f64, t_to: f64, anchor: f64| -> f64 {
@@ -2330,11 +2039,7 @@ mod tests {
     fn ekf_covariance_starts_at_the_first_record_not_at_zero() {
         let q = 0.25f64;
         let pk = make_pk(0.0, 20.0); // CL = 0 -> ke = 0 -> dP/dt = Q exactly
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
 
         // One variable: the same subject, shifted. Both must give the same `p_obs` at the
         // same elapsed time — a start-dependent answer is the defect.
@@ -2393,14 +2098,12 @@ mod tests {
     /// `0, 12, …, 480`. `ss` builds the record arm; `train` the oracle; `single` the same
     /// record with `SS=0`, which is what the filter used to compute.
     fn ss_fixture(
-        amt: f64,
-        rate: f64,
+        amt: f64, rate: f64,
     ) -> (Vec<DoseEvent>, Vec<DoseEvent>, Vec<DoseEvent>, Vec<f64>) {
         let ss = vec![DoseEvent::new(480.0, amt, 1, rate, true, 12.0)];
         let single = vec![DoseEvent::new(480.0, amt, 1, rate, false, 0.0)];
-        let train: Vec<DoseEvent> = (0..=40)
-            .map(|k| DoseEvent::new(12.0 * k as f64, amt, 1, rate, false, 0.0))
-            .collect();
+        let train: Vec<DoseEvent> =
+            (0..=40).map(|k| DoseEvent::new(12.0 * k as f64, amt, 1, rate, false, 0.0)).collect();
         (ss, train, single, vec![482.0, 485.0, 488.0, 491.0])
     }
 
@@ -2593,7 +2296,6 @@ mod tests {
     fn ekf_ss_run_in_shares_the_ode_run_in_clock_on_a_time_reading_rhs() {
         use crate::ode::predictions::{ode_predictions, OdeSpec};
         use crate::types::Subject;
-        use std::collections::HashMap;
 
         let (cl, v, c, ii, amt) = (1.0f64, 20.0f64, 0.05f64, 12.0f64, 100.0f64);
         let ke = cl / v;
@@ -2603,11 +2305,7 @@ mod tests {
         }
         let pk = make_pk(cl, v);
         let (ss, _, single, obs_times) = ss_fixture(amt, 0.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let run = |doses: &[DoseEvent]| {
             solve_ekf(
                 &t_reading_rhs,
@@ -2626,49 +2324,18 @@ mod tests {
         let (got, was) = (run(&ss), run(&single));
 
         let subj = Subject {
-            obs_rgroup: Vec::new(),
             id: "1".into(),
             doses: ss.clone(),
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: vec![0.0; obs_times.len()],
             obs_cmts: vec![1; obs_times.len()],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; obs_times.len()],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         };
         let ode_spec = OdeSpec {
-            chz_state_slots: Vec::new(),
-            rhs: Box::new(t_reading_rhs),
-            n_states: 1,
-            state_names: vec!["central".into()],
             readout: crate::ode::OdeReadout::ObsCmt(0),
-            diffusion_var: Vec::new(),
-            init_fn: None,
             solver_opts: opts,
-            input_rate: Vec::new(),
-            rhs_program: None,
-            readout_program: None,
-            indiv_param_program: None,
-            dose_attr_map: Default::default(),
+            ..crate::types::test_helpers::bare_ode(Box::new(t_reading_rhs))
         };
         let ode = ode_predictions(&ode_spec, &pk, &[], &[], &subj);
 
@@ -2757,18 +2424,14 @@ mod tests {
             &vec![0.01; obs_times.len()],
             OdeSolverOptions::default(),
         );
-        assert!(pts
-            .iter()
-            .all(|p| p.ipred.is_finite() && p.p_obs.is_finite()));
+        assert!(pts.iter().all(|p| p.ipred.is_finite() && p.p_obs.is_finite()));
         assert!(
             crate::dosing::last_ss_equilibration_warned(),
             "the EKF run-in must record its own non-convergence"
         );
         let warning = crate::dosing::last_ss_equilibration_warning();
         assert!(
-            warning
-                .as_deref()
-                .is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
+            warning.as_deref().is_some_and(|w| w.contains("Steady-state (SS=1) equilibration")),
             "a model with no periodic steady state must surface the #867 warning from the \
              EKF run-in; got: {warning:?}"
         );
@@ -2791,11 +2454,7 @@ mod tests {
     #[test]
     fn ekf_duplicate_in_segment_obs_times_share_one_update() {
         let pk = make_pk(1.0, 20.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let doses = vec![bolus_dose(100.0)];
         // t = 2 is strictly inside the only segment [0, 8], so this exercises the
         // in-segment read rather than the boundary read.
@@ -2828,10 +2487,7 @@ mod tests {
         );
 
         for (i, p) in dup.iter().enumerate() {
-            assert!(
-                p.ipred.is_finite() && p.p_obs.is_finite(),
-                "idx {i}: non-finite point {p:?}"
-            );
+            assert!(p.ipred.is_finite() && p.p_obs.is_finite(), "idx {i}: non-finite point {p:?}");
         }
         assert!(
             dup[0].ipred > 0.0,
@@ -2870,32 +2526,23 @@ mod tests {
 
     /// **A co-timed pair the reader split one ULP apart is filled, from one update.**
     ///
-    /// Two observations at `TIME 4` with an EVID=2 row after the first reach the engine as
-    /// `[4⁻, 4]`: the reader moves the first one ULP below the tie (#1810). The segment
-    /// `saveat` deduped at `1e-15`, which merged the pair, so the record at `4` was never
-    /// saved and kept its `{ ipred: 0.0, p_obs: 0.0 }` prefill, a finite zero in the
-    /// likelihood. With both times saved, the in-segment read must still treat the pair as the
-    /// one instant it was written as (`crate::types::same_instant`): one update, as for the
-    /// unsplit `[4, 4]`, not two.
+    /// Two observations at `TIME 4` with an EVID=2 row after the first reach the engine as `[4⁻, 4]`
+    /// (#1810). The segment `saveat` deduped at `1e-15`, merging the pair, so the record at `4` was never
+    /// saved and kept its `{ ipred: 0.0, p_obs: 0.0 }` prefill (a finite zero in the likelihood). With
+    /// both times saved, the in-segment read must treat the pair as the one instant it was written as
+    /// (`crate::types::same_instant`): one update, as for the unsplit `[4, 4]`.
     ///
-    /// Measured on macOS arm64: worst relative difference from the unsplit run 2.1e-16, over
-    /// `ipred` and `p_obs` of all three records. Bound `1e-12`.
-    ///
-    /// Mutation: drop the one-ULP-up lookup and the pair assimilates twice — `p_obs` of the
-    /// record at `4` measured 0.0097 against the unsplit 0.337. Restoring the `1e-15` dedup
-    /// alone leaves this test green, since the lookup fills the record at `4` from the `4⁻`
-    /// point either way. That dedup is pinned on the other engines, by
-    /// `a_reader_split_tie_is_read_on_every_ode_engine` in `predictions_tests.rs`. With both
-    /// reverted, the code before the fix, the record at `4` keeps its `0.0` prefill and the
-    /// first assertion below fails.
+    /// Measured on macOS arm64: worst relative difference from the unsplit run 2.1e-16 over `ipred` and
+    /// `p_obs` of all three records. Bound `1e-12`. Mutation: dropping the one-ULP-up lookup assimilates
+    /// the pair twice (`p_obs` of the record at `4`: 0.0097 against the unsplit 0.337). Restoring the
+    /// `1e-15` dedup alone leaves this test green (the lookup fills the record from the `4⁻` point either
+    /// way); that dedup is pinned on the other engines by `a_reader_split_tie_is_read_on_every_ode_engine`
+    /// in `predictions_tests.rs`. With both reverted, the record at `4` keeps its `0.0` prefill and the
+    /// first assertion fails.
     #[test]
     fn ekf_reader_split_tie_is_one_instant() {
         let pk = make_pk(1.0, 20.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let doses = vec![bolus_dose(100.0)];
         let t = 4.0f64;
         assert!(
@@ -2936,33 +2583,22 @@ mod tests {
 
     /// **An obs / dose / obs tie the reader split takes one update too.**
     ///
-    /// Obs, bolus, obs at `TIME 4` reach the engine as `[4⁻, 4]` (#614), with a break at `4`
-    /// between the pair. The `4⁻` record reads the state before the dose and the `4` record
-    /// the state after it, but the pair is still one instant, so it takes one update, as the
-    /// unsplit `[4, 4]` does. This tie was already filled before #2010's fix, since a break
-    /// sits at `4`, but from two updates: the `4⁻` point took an in-segment update and the
-    /// boundary read at `4` a second one. The one-ULP-up lookup makes it one, so an EKF fit
-    /// with such a tie moves its objective.
+    /// Obs, bolus, obs at `TIME 4` reach the engine as `[4⁻, 4]` (#614), with a break at `4` between the
+    /// pair. The `4⁻` record reads the state before the dose and the `4` record the state after, but the
+    /// pair is one instant, so it takes one update, as the unsplit `[4, 4]` does. The tie was already
+    /// filled before #2010's fix (a break sits at `4`) but from two updates: an in-segment update at `4⁻`
+    /// and a second from the boundary read at `4`. The one-ULP-up lookup makes it one, so an EKF fit with
+    /// such a tie moves its objective.
     ///
     /// Measured on macOS arm64: `p_obs` 0.33658 / 0.0097115 / 0.33985 before the fix and
-    /// 0.33658 / 0.33658 / 0.34302 after, the unsplit run's to 1.7e-16 relative. `ipred`
-    /// is 81.87 / 181.87 / 148.91 either way. Bound `1e-12`.
-    ///
-    /// Mutation: drop the one-ULP-up lookup and the pair assimilates twice — `p_obs` of the
-    /// record at `4` falls back to 0.0097 and the bit-equality below fails.
+    /// 0.33658 / 0.33658 / 0.34302 after, the unsplit run's to 1.7e-16 relative. `ipred` is
+    /// 81.87 / 181.87 / 148.91 either way. Bound `1e-12`.
     #[test]
     fn ekf_reader_split_tie_across_a_dose_is_one_update() {
         let pk = make_pk(1.0, 20.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let t = 4.0f64;
-        let dosed = vec![
-            bolus_dose(100.0),
-            DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0),
-        ];
+        let dosed = vec![bolus_dose(100.0), DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)];
         let run_dosed = |obs: &[f64]| {
             solve_ekf(
                 &one_cpt_rhs,
@@ -3019,11 +2655,7 @@ mod tests {
     #[test]
     fn ekf_observation_one_ulp_before_an_ss_dose_reads_the_carried_pair() {
         let pk = make_pk(1.0, 20.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let run = |doses: &[DoseEvent], obs: &[f64]| {
             solve_ekf(
                 &one_cpt_rhs,
@@ -3043,15 +2675,8 @@ mod tests {
         // the dose share the first break. `4` and `8.2`: a later dose with residual drug, at two
         // ULP sizes. The EKF breaks on doses and infusion ends, not on observations, so there
         // the record is a save point of the segment ending at the dose's break.
-        for (t, ss) in [0.0f64, 4.0, 8.2]
-            .into_iter()
-            .flat_map(|t| [(t, true), (t, false)])
-        {
-            let history: Vec<DoseEvent> = if t > 0.0 {
-                vec![bolus_dose(100.0)]
-            } else {
-                vec![]
-            };
+        for (t, ss) in [0.0f64, 4.0, 8.2].into_iter().flat_map(|t| [(t, true), (t, false)]) {
+            let history: Vec<DoseEvent> = if t > 0.0 { vec![bolus_dose(100.0)] } else { vec![] };
             let mut doses = history.clone();
             doses.push(DoseEvent::new(t, 100.0, 1, 0.0, ss, 12.0));
             let obs = [t.next_down(), t + 4.0];
@@ -3112,11 +2737,7 @@ mod tests {
     #[test]
     fn ekf_split_tie_across_an_ss_dose_conditions_on_the_steady_state() {
         let pk = make_pk(1.0, 20.0);
-        let opts = OdeSolverOptions {
-            abstol: 1e-12,
-            reltol: 1e-10,
-            ..OdeSolverOptions::default()
-        };
+        let opts = OdeSolverOptions { abstol: 1e-12, reltol: 1e-10, ..OdeSolverOptions::default() };
         let run = |doses: &[DoseEvent], obs: &[f64]| {
             solve_ekf(
                 &one_cpt_rhs,
@@ -3324,11 +2945,7 @@ mod tests {
         // The straddle: a time-varying rate must actually move `p_obs`, or every assertion
         // above is satisfied by an engine that ignores the model-time term entirely — the
         // exact failure this fixture family exists to catch.
-        let sep = at_c0
-            .iter()
-            .zip(&at_c1)
-            .map(|(a, b)| ((a - b) / a).abs())
-            .fold(0.0f64, f64::max);
+        let sep = at_c0.iter().zip(&at_c1).map(|(a, b)| ((a - b) / a).abs()).fold(0.0f64, f64::max);
         assert!(
             sep > 0.05,
             "the c=0 and c=0.05 covariance curves must differ materially — worst \
@@ -3375,11 +2992,7 @@ mod tests {
         };
         let control = run(0.0);
         let diverged = run(0.5);
-        assert_eq!(
-            diverged[0].to_bits(),
-            control[0].to_bits(),
-            "{diverged:?} {control:?}"
-        );
+        assert_eq!(diverged[0].to_bits(), control[0].to_bits(), "{diverged:?} {control:?}");
         for (i, t) in [(1, 20.0), (2, 40.0)] {
             let want = 100.0 * (-0.1f64 * (t - 12.0)).exp();
             assert!(
@@ -3428,11 +3041,8 @@ mod tests {
             .values
             .to_vec();
         let slot = |name: &str| {
-            let i = model
-                .indiv_param_names
-                .iter()
-                .position(|n| n == name)
-                .expect("named parameter");
+            let i =
+                model.indiv_param_names.iter().position(|n| n == name).expect("named parameter");
             model.pk_indices[i]
         };
         let slots = [slot("VMAX"), slot("KM"), slot("V"), slot("KA")];
@@ -3622,11 +3232,7 @@ mod tests {
         let mut worst: f64 = 0.0;
         for ((e, d), o) in exact.iter().zip(&differenced).zip(&off) {
             assert!(e.ipred.is_finite() && d.ipred.is_finite());
-            assert_eq!(
-                d.ipred.to_bits(),
-                o.ipred.to_bits(),
-                "switch-off == differenced"
-            );
+            assert_eq!(d.ipred.to_bits(), o.ipred.to_bits(), "switch-off == differenced");
             worst = worst.max((e.ipred - d.ipred).abs() / d.ipred.abs()); // nan-ok: finite asserted above
         }
         eprintln!("exact-vs-differenced Jacobian, mean relative difference: {worst:e}");
@@ -3685,11 +3291,7 @@ mod tests {
         let n_out = want.len();
 
         kj::begin();
-        let lv: Vec<kj::Tr> = x0
-            .iter()
-            .enumerate()
-            .map(|(j, &v)| kj::Tr::theta(j, v))
-            .collect();
+        let lv: Vec<kj::Tr> = x0.iter().enumerate().map(|(j, &v)| kj::Tr::theta(j, v)).collect();
         let mut params: Vec<kj::Tr> = fx.pk.iter().map(|&v| kj::Tr::from_f64(v)).collect();
         for (s, l) in fx.slots.iter().zip(&lv) {
             params[*s] = *l;
@@ -3711,16 +3313,11 @@ mod tests {
             &r,
             opts,
         );
-        let regs: Vec<u32> = pts
-            .iter()
-            .flat_map(|p| [p.ipred.reg(), p.p_obs.reg()])
-            .collect();
+        let regs: Vec<u32> = pts.iter().flat_map(|p| [p.ipred.reg(), p.p_obs.reg()]).collect();
         let rec = kj::end(Some(regs)).expect("the filter records");
         let plan = rec.plan(Layout::F64, 0, n_in).expect("plans");
         let mut out = vec![0.0; n_out + 1];
-        let fwd = plan
-            .forward_layout(Layout::F64, &[], &x0, &mut out)
-            .expect("forward");
+        let fwd = plan.forward_layout(Layout::F64, &[], &x0, &mut out).expect("forward");
         assert_eq!(out[n_out], 1.0, "guards hold at the recording point");
         for (g, w) in out[..n_out].iter().zip(&want) {
             assert_relative_eq!(*g, *w, max_relative = 1e-10);
@@ -3736,8 +3333,7 @@ mod tests {
         // A replay at another point is the filter there, not the recording point's.
         let x1 = [4.0, 3.0, 12.0, 1.4, 0.08, 0.02];
         let mut out1 = vec![0.0; n_out + 1];
-        plan.forward_layout(Layout::F64, &[], &x1, &mut out1)
-            .expect("forward");
+        plan.forward_layout(Layout::F64, &[], &x1, &mut out1).expect("forward");
         if out1[n_out] == 1.0 {
             let want1 = run_f64(&x1);
             for (g, w) in out1[..n_out].iter().zip(&want1) {
@@ -3782,11 +3378,8 @@ mod tests {
         // `MM_SDE` with a modeled duration `D1` on the depot.
         let with_d1 = |src: &str| {
             crate::parser::model_parser::parse_model_string(
-                &src.replace(
-                    "  omega ETA_V",
-                    "  theta TVD1(1.9, 0.1, 10.0)\n  omega ETA_V",
-                )
-                .replace("  KA = TVKA\n", "  KA = TVKA\n  D1 = TVD1\n"),
+                &src.replace("  omega ETA_V", "  theta TVD1(1.9, 0.1, 10.0)\n  omega ETA_V")
+                    .replace("  KA = TVKA\n", "  KA = TVKA\n  D1 = TVD1\n"),
             )
             .unwrap()
         };
@@ -3796,54 +3389,31 @@ mod tests {
             "VMAX * central / (KM + central) * (1 + 0.05 * TAD)",
         ));
         let modeled = |t: f64, ss: bool| {
-            DoseEvent::modeled(
-                t,
-                100.0,
-                1,
-                ss,
-                6.0,
-                crate::types::RateMode::ModeledDuration,
-            )
+            DoseEvent::modeled(t, 100.0, 1, ss, 6.0, crate::types::RateMode::ModeledDuration)
         };
-        let obs = [
-            0.5, 1.0, 1.4, 1.8, 2.2, 2.6, 4.0, 6.5, 7.0, 7.4, 7.8, 8.2, 8.6, 10.0,
-        ];
+        let obs = [0.5, 1.0, 1.4, 1.8, 2.2, 2.6, 4.0, 6.5, 7.0, 7.4, 7.8, 8.2, 8.6, 10.0];
         let opts = tight();
         let r = |_: usize, f: f64| 0.01 * f * f + 1e-3;
         let d0 = 1.9;
         let mut worst: f64 = 0.0;
         for (label, model, doses) in [
-            (
-                "two doses",
-                &plain,
-                vec![modeled(0.0, false), modeled(6.0, false)],
-            ),
+            ("two doses", &plain, vec![modeled(0.0, false), modeled(6.0, false)]),
             ("SS", &plain, vec![modeled(0.0, true), modeled(6.0, false)]),
-            (
-                "SS + TAD",
-                &tad,
-                vec![modeled(0.0, true), modeled(6.0, false)],
-            ),
+            ("SS + TAD", &tad, vec![modeled(0.0, true), modeled(6.0, false)]),
         ] {
             let ode = model.ode_spec.as_ref().unwrap();
             let rhs = &ProgramRhs(ode.rhs_program.as_ref().unwrap());
             let p = &model.default_params;
             let pk0 = (model.pk_param_fn)(&p.theta, &[0.0], &Default::default(), 0.0).values;
-            let slot = model.pk_indices[model
-                .indiv_param_names
-                .iter()
-                .position(|n| n == "D1")
-                .unwrap()];
+            let slot =
+                model.pk_indices[model.indiv_param_names.iter().position(|n| n == "D1").unwrap()];
             let pk_at = |d: f64| {
                 let mut pk = pk0.to_vec();
                 pk[slot] = d;
                 pk
             };
             let resolve = |d: f64| -> Vec<DoseEvent> {
-                doses
-                    .iter()
-                    .map(|x| x.resolve_rate(&ode.dose_attr_map, &pk_at(d)))
-                    .collect()
+                doses.iter().map(|x| x.resolve_rate(&ode.dose_attr_map, &pk_at(d))).collect()
             };
             let run_f64 = |d: f64| -> Vec<f64> {
                 let f = vec![1.0; doses.len()];
@@ -3886,20 +3456,12 @@ mod tests {
                 &rt,
                 opts,
             );
-            let regs: Vec<u32> = pts
-                .iter()
-                .flat_map(|p| [p.ipred.reg(), p.p_obs.reg()])
-                .collect();
+            let regs: Vec<u32> = pts.iter().flat_map(|p| [p.ipred.reg(), p.p_obs.reg()]).collect();
             let rec = kj::end(Some(regs)).expect("the filter records");
             let plan = rec.plan(Layout::F64, 0, 1).expect("plans");
             let mut out = vec![0.0; n_out + 1];
-            let fwd = plan
-                .forward_layout(Layout::F64, &[], &[d0], &mut out)
-                .expect("forward");
-            assert_eq!(
-                out[n_out], 1.0,
-                "{label}: guards hold at the recording point"
-            );
+            let fwd = plan.forward_layout(Layout::F64, &[], &[d0], &mut out).expect("forward");
+            assert_eq!(out[n_out], 1.0, "{label}: guards hold at the recording point");
             for (g, w) in out[..n_out].iter().zip(&want) {
                 assert_relative_eq!(*g, *w, max_relative = 1e-10);
             }

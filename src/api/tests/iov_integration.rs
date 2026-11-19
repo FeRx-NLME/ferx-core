@@ -10,96 +10,24 @@ fn make_iov_model() -> CompiledModel {
     let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
     let omega_iov = OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]);
     let default_params = ModelParameters {
-        residual_correlations: Vec::new(),
-        residual_correlation_fixed: Vec::new(),
-        theta: vec![5.0, 50.0],
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        theta_lower: vec![0.1, 5.0],
-        theta_upper: vec![50.0, 500.0],
-        theta_fixed: vec![false; 2],
-        omega,
-        omega_fixed: vec![false],
-        sigma: SigmaVector {
-            values: vec![0.05],
-            names: vec!["PROP_ERR".into()],
-        },
-        sigma_fixed: vec![false],
         omega_iov: Some(omega_iov),
         kappa_fixed: vec![false],
-        mixture: None,
+        ..crate::types::test_helpers::bare_params(omega)
     };
     CompiledModel {
-        plan_id: Default::default(),
-        residual_serial: None,
-        priors: Vec::new(),
-        prior_from_fit: None,
-        covariate_model: None,
         name: "iov_test".into(),
-        pk_model: PkModel::OneCptIv,
-        error_model: ErrorModel::Proportional,
-        error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
-        residual_correlations: Vec::new(),
         // pk_param_fn: eta[0]=BSV for CL, eta[1]=KAPPA_CL (appended by IOV path)
-        pk_param_fn: Box::new(
-            |theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
-                let mut p = PkParams::default();
-                let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
-                p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL = TVCL * exp(ETA_CL + KAPPA_CL)
-                p.values[1] = theta[1]; // V
-                p
-            },
-        ),
-        n_theta: 2,
-        n_eta: 1,
-        n_epsilon: 1,
+        pk_param_fn: Box::new(|theta: &[f64], eta: &[f64], _: &HashMap<String, f64>, _t: f64| {
+            let mut p = PkParams::default();
+            let kappa = if eta.len() > 1 { eta[1] } else { 0.0 };
+            p.values[0] = theta[0] * (eta[0] + kappa).exp(); // CL = TVCL * exp(ETA_CL + KAPPA_CL)
+            p.values[1] = theta[1]; // V
+            p
+        }),
         n_kappa: 1,
         kappa_names: vec!["KAPPA_CL".into()],
-        theta_names: vec!["TVCL".into(), "TVV".into()],
-        eta_names: vec!["ETA_CL".into()],
-        indiv_param_names: vec!["CL".into(), "V".into()],
-        indiv_param_partials: crate::types::IndivParamPartials::empty(),
-        default_params,
-        omega_init_as_sd: vec![false],
-        sigma_init_as_sd: vec![false],
         kappa_init_as_sd: vec![false],
-        kappa_weights: Vec::new(),
-        mu_refs: HashMap::new(),
-        covariate_mu_refs: Vec::new(),
-        kappa_mu_refs: HashMap::new(),
-        tv_fn: None,
-        pk_indices: vec![0, 1],
-        eta_map: vec![0],
-        pk_idx_f64: vec![0.0, 1.0],
-        sel_flat: vec![1.0, 0.0],
-        ode_spec: None,
-        dose_attr_map: Default::default(),
-        diffusion_theta_start: None,
-        diffusion_state_indices: Vec::new(),
-        bloq_method: BloqMethod::Drop,
-        referenced_covariates: Vec::new(),
-        gradient_method: GradientMethod::Fd,
-        parse_warnings: Vec::new(),
-        has_conditional_eta_params: false,
-        eta_param_info: Vec::new(),
-        kappa_param_types: Vec::new(),
-        theta_transform: Vec::new(),
-        theta_eta_linked: Vec::new(),
-        #[cfg(feature = "nn")]
-        covariate_nns: Vec::new(),
-        scaling: ScalingSpec::None,
-        log_transform: false,
-        dv_pre_logged: false,
-        derived_exprs: vec![],
-        output_columns: vec![],
-        #[cfg(feature = "survival")]
-        endpoints: std::collections::BTreeMap::new(),
-        frem_config: None,
-        residual_error_eta: None,
-        analytical_init: Vec::new(),
-        analytic_readout: None,
-        ruv_magnitude: None,
-        absorption_ode_equivalent: None,
-        mixture: None,
+        ..crate::types::test_helpers::bare_model(default_params)
     }
 }
 
@@ -120,37 +48,18 @@ fn make_iov_population() -> Population {
     let subjects: Vec<Subject> = subject_data
         .iter()
         .map(|(id, obs)| Subject {
-            obs_rgroup: Vec::new(),
             id: id.to_string(),
             doses: vec![
                 DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
                 DoseEvent::new(3.5, 100.0, 1, 0.0, false, 0.0),
             ],
             obs_times: obs_times.clone(),
-            obs_raw_times: Vec::new(),
             observations: obs.clone(),
             obs_cmts: vec![1; 6],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: occasions.clone(),
-            obs_l2: Vec::new(),
             dose_occasions: dose_occ.clone(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         })
         .collect();
     Population {
@@ -185,10 +94,7 @@ fn assert_iov_fit_ok(result: &FitResult) {
     assert!(result.ofv.is_finite(), "OFV must be finite");
     assert!(result.omega_iov.is_some(), "omega_iov must be populated");
     let iov_diag = result.omega_iov.as_ref().unwrap()[(0, 0)];
-    assert!(
-        iov_diag > 0.0,
-        "omega_iov diagonal must be positive, got {iov_diag}"
-    );
+    assert!(iov_diag > 0.0, "omega_iov diagonal must be positive, got {iov_diag}");
     assert_eq!(result.kappa_names, vec!["KAPPA_CL"], "kappa name mismatch");
     assert_eq!(result.ebe_kappas.len(), 4, "expected kappas for 4 subjects");
     for (i, subj_kappas) in result.ebe_kappas.iter().enumerate() {
@@ -366,12 +272,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     // closed form, and the differing inner gradient routes).
     approx::assert_relative_eq!(ra.ofv, ro.ofv, max_relative = 1e-3, epsilon = 0.5);
     for k in 0..2 {
-        approx::assert_relative_eq!(
-            ra.theta[k],
-            ro.theta[k],
-            max_relative = 0.02,
-            epsilon = 1e-2
-        );
+        approx::assert_relative_eq!(ra.theta[k], ro.theta[k], max_relative = 0.02, epsilon = 1e-2);
     }
     let iov_a = ra.omega_iov.as_ref().unwrap()[(0, 0)];
     let iov_o = ro.omega_iov.as_ref().unwrap()[(0, 0)];
@@ -381,10 +282,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
 // ── Tests: FOCEI ─────────────────────────────────────────────────────────
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn test_iov_focei_bobyqa() {
     let model = make_iov_model();
     let pop = make_iov_population();
@@ -406,10 +304,7 @@ fn test_iov_foce_mu_referencing_on() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn test_iov_focei_mu_referencing_on() {
     let model = make_iov_model();
     let pop = make_iov_population();
@@ -431,10 +326,7 @@ fn test_iov_gn() {
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn test_iov_gn_hybrid() {
     let model = make_iov_model();
     let pop = make_iov_population();
@@ -452,21 +344,10 @@ fn test_iov_saem_succeeds() {
     let pop = make_iov_population();
     let opts = fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false);
     let result = fit(&model, &pop, &model.default_params, &opts);
-    assert!(
-        result.is_ok(),
-        "SAEM with IOV must succeed, got: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "SAEM with IOV must succeed, got: {:?}", result.err());
     let fr = result.unwrap();
-    assert!(
-        fr.ofv.is_finite(),
-        "SAEM IOV OFV must be finite, got {}",
-        fr.ofv
-    );
-    assert!(
-        fr.omega_iov.is_some(),
-        "omega_iov must be present in result"
-    );
+    assert!(fr.ofv.is_finite(), "SAEM IOV OFV must be finite, got {}", fr.ofv);
+    assert!(fr.omega_iov.is_some(), "omega_iov must be present in result");
 }
 
 // ── Test: SAEM in a chained methods sequence + IOV succeeds ──────────────
@@ -477,16 +358,9 @@ fn test_iov_saem_in_methods_chain_succeeds() {
     let mut opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
     opts.methods = vec![EstimationMethod::Saem, EstimationMethod::Foce];
     let result = fit(&model, &pop, &model.default_params, &opts);
-    assert!(
-        result.is_ok(),
-        "SAEM in methods chain with IOV must succeed, got: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "SAEM in methods chain with IOV must succeed, got: {:?}", result.err());
     let fr = result.unwrap();
-    assert!(
-        fr.ofv.is_finite(),
-        "chained SAEM+FOCE IOV OFV must be finite"
-    );
+    assert!(fr.ofv.is_finite(), "chained SAEM+FOCE IOV OFV must be finite");
     assert!(
         fr.omega_iov.is_some(),
         "omega_iov must survive the FOCE polishing step in a chained run"
@@ -558,11 +432,7 @@ fn test_iov_imp_chain_runs_importance_sampling() {
                               // Evaluation-only: score FOCE's estimates rather than re-estimate them.
     opts.imp_eval_only = true;
     let result = fit(&model, &pop, &model.default_params, &opts);
-    assert!(
-        result.is_ok(),
-        "FOCE→IMP chain with IOV must succeed, got: {:?}",
-        result.err()
-    );
+    assert!(result.is_ok(), "FOCE→IMP chain with IOV must succeed, got: {:?}", result.err());
     let fr = result.unwrap();
     let is = fr
         .importance_sampling
@@ -579,10 +449,7 @@ fn test_iov_imp_chain_runs_importance_sampling() {
         is.mc_standard_error
     );
     assert_eq!(is.n_samples, 200, "n_samples should echo the IS budget");
-    assert!(
-        fr.omega_iov.is_some(),
-        "omega_iov must survive into the IS-augmented result"
-    );
+    assert!(fr.omega_iov.is_some(), "omega_iov must survive into the IS-augmented result");
 }
 
 // ── Test: trust-region optimizer + IOV must return Err ────────────────────
@@ -595,10 +462,7 @@ fn test_iov_trust_region_returns_err() {
     let pop = make_iov_population();
     let opts = fast_opts(EstimationMethod::Foce, Optimizer::TrustRegion, false);
     let result = fit(&model, &pop, &model.default_params, &opts);
-    assert!(
-        result.is_err(),
-        "trust_region with IOV must return an error"
-    );
+    assert!(result.is_err(), "trust_region with IOV must return an error");
     let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("trust_region") && msg.contains("IOV"),
@@ -619,10 +483,7 @@ fn test_iov_missing_occ_returns_err() {
     }
     let opts = fast_opts(EstimationMethod::Foce, Optimizer::Bobyqa, false);
     let result = fit(&model, &pop, &model.default_params, &opts);
-    assert!(
-        result.is_err(),
-        "IOV model without occasion labels must error"
-    );
+    assert!(result.is_err(), "IOV model without occasion labels must error");
     let msg = result.unwrap_err().to_string();
     assert!(
         msg.contains("iov_column") || msg.contains("OCC") || msg.contains("occasion"),
@@ -710,10 +571,7 @@ fn warfarin_iov_sim_model(edit: impl Fn(&str) -> String) -> tempfile::NamedTempF
     let src = edit(base);
     // `maxiter = 0` is appended below, so `[fit_options]` must be the last block.
     assert_eq!(src.rfind("\n["), src.find("\n[fit_options]"));
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
     write!(
         f,
         "{src}\n  maxiter = 0\n\n[simulation]\n  n_subjects = 10\n  dose_amt = 100.0\n  \
@@ -778,10 +636,7 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
         ),
         "says why the dose rule cannot: {msg}"
     );
-    assert!(
-        !msg.contains("Set `iov_occasion = dose`"),
-        "advises the dose rule: {msg}"
-    );
+    assert!(!msg.contains("Set `iov_occasion = dose`"), "advises the dose rule: {msg}");
     assert!(
         msg.contains("`iov_column = OCC` names a dataset column, so it has no effect"),
         "says the set key is ignored: {msg}"
@@ -800,10 +655,7 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
 
     // A derived rule: simulates and fits.
     let c = warfarin_iov_sim_model(|s| {
-        no_column(s).replace(
-            "[fit_options]\n",
-            "[fit_options]\n  iov_occasion = time(24)\n",
-        )
+        no_column(s).replace("[fit_options]\n", "[fit_options]\n  iov_occasion = time(24)\n")
     });
     simulate(&c).expect("a derived occasion rule labels the simulated population");
 
@@ -814,9 +666,8 @@ fn simulate_refuses_an_unlabelled_iov_model_with_advice_that_can_work() {
     let d = warfarin_iov_sim_model(|s| {
         no_column(s).replace("[fit_options]\n", "[fit_options]\n  iov_occasion = dose\n")
     });
-    let msg = simulate(&d)
-        .expect_err("the dose rule cannot label a [simulation] population")
-        .to_string();
+    let msg =
+        simulate(&d).expect_err("the dose rule cannot label a [simulation] population").to_string();
     assert!(msg.contains("derives only a single occasion"), "{msg}");
 
     // The data path keeps the dataset advice, both remedies included.
@@ -853,10 +704,8 @@ fn simulate_refuses_a_single_occasion_rule_before_simulating() {
     let with_rule = |rule: &'static str| {
         warfarin_iov_sim_model(move |s| {
             assert!(s.contains("  iov_column = OCC\n"));
-            s.replace("  iov_column = OCC\n", "").replace(
-                "[fit_options]\n",
-                &format!("[fit_options]\n  iov_occasion = {rule}\n"),
-            )
+            s.replace("  iov_column = OCC\n", "")
+                .replace("[fit_options]\n", &format!("[fit_options]\n  iov_occasion = {rule}\n"))
         })
     };
     // What every refusal says, whichever rule produced it.
@@ -879,14 +728,8 @@ fn simulate_refuses_a_single_occasion_rule_before_simulating() {
             ),
             "names the remedy: {msg}"
         );
-        assert!(
-            !msg.contains("iov_column"),
-            "names the dataset remedy: {msg}"
-        );
-        assert!(
-            !msg.contains("multiple-dose design"),
-            "names the multiple-dose remedy: {msg}"
-        );
+        assert!(!msg.contains("iov_column"), "names the dataset remedy: {msg}");
+        assert!(!msg.contains("multiple-dose design"), "names the multiple-dose remedy: {msg}");
         assert!(!msg.contains(SINGLE_OCCASION_DATA_ADVICE), "{msg}");
     };
 
@@ -1015,11 +858,7 @@ fn test_apply_iov_occasion_labels_pk_only_rows() {
             vec![2.0, edge.next_down(), edge, 5.0],
             vec![0u32, 0, 1, 1],
         ),
-        (
-            IovOccasionRule::PerDose,
-            vec![5.0, edge.next_down(), -1.0, edge],
-            vec![1, 0, 0, 1],
-        ),
+        (IovOccasionRule::PerDose, vec![5.0, edge.next_down(), -1.0, edge], vec![1, 0, 0, 1]),
     ] {
         let mut pop = make_iov_population();
         for s in &mut pop.subjects {
@@ -1110,12 +949,7 @@ fn test_iov_occasion_dsl_matches_column_fit() {
     // same bits while a per-kappa ULP diverges — so pin it exactly too.
     assert_eq!(r_col.ebe_kappas.len(), r_dsl.ebe_kappas.len());
     for (subj, (a, b)) in r_col.ebe_kappas.iter().zip(&r_dsl.ebe_kappas).enumerate() {
-        assert_eq!(
-            a.len(),
-            b.len(),
-            "subject {} must have the same number of occasions",
-            subj,
-        );
+        assert_eq!(a.len(), b.len(), "subject {} must have the same number of occasions", subj,);
         for (k, (ka, kb)) in a.iter().zip(b).enumerate() {
             assert_eq!(
                 ka.len(),
@@ -1202,9 +1036,7 @@ fn test_iov_occasion_degenerate_single_occasion_errors() {
     // Breakpoint past the last observation (max 6.0) → one occasion for all.
     opts.iov_occasion = IovOccasionRule::TimeWindows(vec![100.0]);
     let res = fit(&model, &pop, &model.default_params, &opts);
-    let msg = res
-        .expect_err("single-occasion derivation must error")
-        .to_string();
+    let msg = res.expect_err("single-occasion derivation must error").to_string();
     assert!(
         msg.contains("single occasion") || msg.contains("unidentifiable"),
         "unexpected error: {msg}"
@@ -1253,9 +1085,7 @@ fn test_iov_occasion_without_kappa_warns() {
     opts.iov_occasion = IovOccasionRule::PerDose;
     let res = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
     assert!(
-        res.warnings
-            .iter()
-            .any(|w| w.contains("iov_occasion") && w.contains("no effect")),
+        res.warnings.iter().any(|w| w.contains("iov_occasion") && w.contains("no effect")),
         "expected a no-op warning, got: {:?}",
         res.warnings
     );
@@ -1327,11 +1157,8 @@ fn test_check_model_options_flags_trust_region_iov() {
 #[test]
 fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
     let mut model = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 0.5,
-    }];
+    model.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
 
     // gn (Gauss-Newton) is rejected.
     let opts = fast_opts(EstimationMethod::FoceGn, Optimizer::Bobyqa, true);
@@ -1389,11 +1216,8 @@ fn test_check_model_options_block_sigma_rejects_unsupported_methods() {
 #[test]
 fn test_check_model_options_block_sigma_sde_rejected_for_saem_not_foce() {
     let mut model = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 0.5,
-    }];
+    model.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
     // is_sde() reads diffusion_theta_start; flag the model as an SDE/EKF model.
     model.diffusion_theta_start = Some(0);
 
@@ -1415,11 +1239,8 @@ fn test_check_model_options_block_sigma_sde_rejected_for_saem_not_foce() {
 #[test]
 fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
     let mut model = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::Fd);
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 0.5,
-    }];
+    model.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.5 }];
     // has_tte() scans endpoints for a Tte variant; attach a trivial one.
     model.endpoints.insert(
         2,
@@ -1448,74 +1269,22 @@ fn test_check_model_options_block_sigma_tte_rejected_all_methods() {
 #[test]
 fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
-    0.04,
-    0.01, 0.09
-  ]
-
-[individual_parameters]
-  CL  = TVCL * exp(ETA_CL)
-  V   = TVV
-
-[structural_model]
-  ode(states=[central])
-
-[odes]
-  d/dt(central) = -CL/V * central
-
-[scaling]
-  y[CMT=1] = 2.0 * central / V
-  y[CMT=2] = central / V
-
-[error_model]
-  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
-  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
-",
-    )
-    .expect("cross-endpoint block_sigma ODE model parses");
+    let model = parse_model_string(crate::test_models::ODE_3)
+        .expect("cross-endpoint block_sigma ODE model parses");
 
     let mut subjects = Vec::new();
-    for (id, dose_amt, obs) in [
-        ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
-        ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
-    ] {
+    for (id, dose_amt, obs) in
+        [("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]), ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0])]
+    {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1552,7 +1321,6 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
 #[test]
 fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -1578,34 +1346,13 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
     let mut subjects = Vec::new();
     for (id, dose_amt, obs) in [("1", 100.0, vec![8.0, 6.0]), ("2", 80.0, vec![6.5, 4.9])] {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1651,15 +1398,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
         &base(vec![EstimationMethod::Vi, EstimationMethod::FoceI]),
     )
     .expect("vi + focei fit succeeds");
-    assert_eq!(
-        chained
-            .vi
-            .as_ref()
-            .expect("VI block")
-            .superseded_by
-            .as_deref(),
-        Some("FOCEI")
-    );
+    assert_eq!(chained.vi.as_ref().expect("VI block").superseded_by.as_deref(), Some("FOCEI"));
     assert!(
         chained
             .warnings
@@ -1682,39 +1421,9 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
 #[test]
 fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.1, 10.0)
-  theta TVV(10.0, 1.0, 100.0)
-  omega ETA_CL ~ 0.04
-  block_sigma (PROP_ERR_UNBOUND, PROP_ERR_TOTAL) = [
-    0.04,
-    0.01, 0.09
-  ]
-
-[individual_parameters]
-  CL  = TVCL * exp(ETA_CL)
-  V   = TVV
-
-[structural_model]
-  ode(states=[central])
-
-[odes]
-  d/dt(central) = -CL/V * central
-
-[scaling]
-  y[CMT=1] = 2.0 * central / V
-  y[CMT=2] = central / V
-
-[error_model]
-  CMT=1: DV ~ proportional(PROP_ERR_TOTAL)
-  CMT=2: DV ~ proportional(PROP_ERR_UNBOUND)
-",
-    )
-    .expect("cross-endpoint block_sigma ODE model parses");
+    let model = parse_model_string(crate::test_models::ODE_3)
+        .expect("cross-endpoint block_sigma ODE model parses");
 
     // Check time first: this is the guard the docs contradicted.
     let check_opts = fast_opts(EstimationMethod::Vi, Optimizer::Bobyqa, false);
@@ -1726,39 +1435,17 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
     );
 
     let mut subjects = Vec::new();
-    for (id, dose_amt, obs) in [
-        ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
-        ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
-    ] {
+    for (id, dose_amt, obs) in
+        [("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]), ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0])]
+    {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1777,16 +1464,10 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
     let result = fit(&model, &population, &model.default_params, &opts)
         .expect("VI fit with cross-endpoint block_sigma should succeed");
     let vi = result.vi.as_ref().expect("VI block present");
-    assert!(
-        vi.neg_two_elbo.is_finite(),
-        "dense-R data term must produce a finite -2*ELBO"
-    );
+    assert!(vi.neg_two_elbo.is_finite(), "dense-R data term must produce a finite -2*ELBO");
     // And the promised fallback actually fired, with its reason recorded.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("vi_sigma_update") && w.contains("Adam")),
+        result.warnings.iter().any(|w| w.contains("vi_sigma_update") && w.contains("Adam")),
         "expected the closed-form sigma fallback warning, got {:?}",
         result.warnings
     );
@@ -1799,7 +1480,6 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
 #[test]
 fn test_imp_accepts_block_sigma_cross_endpoint() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     let model = parse_model_string(
         r"
@@ -1834,39 +1514,17 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
     .expect("cross-endpoint block_sigma ODE model parses");
 
     let mut subjects = Vec::new();
-    for (id, dose_amt, obs) in [
-        ("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]),
-        ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0]),
-    ] {
+    for (id, dose_amt, obs) in
+        [("1", 100.0, vec![17.0, 8.0, 15.0, 7.0]), ("2", 80.0, vec![14.0, 6.8, 12.0, 6.0])]
+    {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, dose_amt, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 1.0, 2.0, 2.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 2, 1, 2],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -1904,66 +1562,24 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
 #[test]
 fn test_saem_block_sigma_ofv_matches_foce() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
     // Single-endpoint combined error with a fixed correlated $SIGMA block —
     // the docs validation model (NONMEM FOCE OFV 18.7158, ferx FOCE 18.7274).
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.01, 10.0) FIX
-  theta TVV(10.0, 0.1, 100.0) FIX
-  omega ETA_CL ~ 0.04 FIX
-  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ combined(PROP_ERR, ADD_ERR)
-",
-    )
-    .expect("fixed-param block_sigma combined model parses");
+    let model = parse_model_string(crate::test_models::ONE_CPT_IV_1)
+        .expect("fixed-param block_sigma combined model parses");
 
     let mut subjects = Vec::new();
-    for (id, obs) in [
-        ("1", vec![9.5, 8.0, 6.2]),
-        ("2", vec![10.5, 7.4, 5.6]),
-        ("3", vec![8.8, 7.9, 6.7]),
-    ] {
+    for (id, obs) in
+        [("1", vec![9.5, 8.0, 6.2]), ("2", vec![10.5, 7.4, 5.6]), ("3", vec![8.8, 7.9, 6.7])]
+    {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -2013,64 +1629,22 @@ fn test_saem_block_sigma_ofv_matches_foce() {
 #[test]
 fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
     use crate::parser::model_parser::parse_model_string;
-    use std::collections::HashMap;
 
-    let model = parse_model_string(
-        r"
-[parameters]
-  theta TVCL(1.0, 0.01, 10.0) FIX
-  theta TVV(10.0, 0.1, 100.0) FIX
-  omega ETA_CL ~ 0.04 FIX
-  block_sigma (PROP_ERR, ADD_ERR) = [0.04, 0.10, 1.00] FIX
-
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ combined(PROP_ERR, ADD_ERR)
-",
-    )
-    .expect("fixed-param block_sigma combined model parses");
+    let model = parse_model_string(crate::test_models::ONE_CPT_IV_1)
+        .expect("fixed-param block_sigma combined model parses");
 
     let mut subjects = Vec::new();
-    for (id, obs) in [
-        ("1", vec![9.5, 8.0, 6.2]),
-        ("2", vec![10.5, 7.4, 5.6]),
-        ("3", vec![8.8, 7.9, 6.7]),
-    ] {
+    for (id, obs) in
+        [("1", vec![9.5, 8.0, 6.2]), ("2", vec![10.5, 7.4, 5.6]), ("3", vec![8.8, 7.9, 6.7])]
+    {
         subjects.push(Subject {
-            obs_rgroup: Vec::new(),
             id: id.into(),
             doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
             obs_times: vec![1.0, 2.0, 4.0],
-            obs_raw_times: Vec::new(),
             observations: obs,
             obs_cmts: vec![1, 1, 1],
-            covariates: HashMap::new(),
-            dose_covariates: Vec::new(),
-            obs_covariates: Vec::new(),
-            pk_only_times: Vec::new(),
-            pk_only_raw_times: Vec::new(),
-            reset_period_times: Vec::new(),
-            pk_only_covariates: Vec::new(),
-            reset_times: Vec::new(),
-            reset_covariates: Vec::new(),
-            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
-            occasions: Vec::new(),
-            obs_l2: Vec::new(),
-            dose_occasions: Vec::new(),
-            reset_occasions: Vec::new(),
-            pk_only_occasions: Vec::new(),
-            fremtype: Vec::new(),
-            obs_records: vec![],
-            endpoint_covariates: Vec::new(),
-            filled_cells: Vec::new(),
-            simulated_mixnum: None,
+            ..Default::default()
         });
     }
     let population = Population {
@@ -2094,10 +1668,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
     let focei_ofv = eval(EstimationMethod::FoceI, true);
     let foce_ofv = eval(EstimationMethod::Foce, false);
 
-    assert!(
-        focei_ofv.is_finite(),
-        "FOCEI block_sigma OFV must be finite"
-    );
+    assert!(focei_ofv.is_finite(), "FOCEI block_sigma OFV must be finite");
     // The interaction term (½·log|H̃| with the dense ∂R/∂η curvature) shifts
     // the OFV away from the non-interaction marginal on a combined model.
     assert!(
@@ -2146,39 +1717,22 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
     // exact fixture `test_selected_error_block_sigma_cross_branch_covariance`
     // uses to pin the estimation-side dense `R`.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "S1".to_string(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times: vec![1.0, 1.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.0, 0.0],
         obs_cmts: vec![1, 1],
         // The first record's value, as the reader fills it: a covariate is present
         // only when the subject-static map carries it (#2181).
         covariates: HashMap::from([("FREE".to_string(), 0.0)]),
-        dose_covariates: Vec::new(),
         obs_covariates: vec![
             HashMap::from([("FREE".to_string(), 0.0)]),
             HashMap::from([("FREE".to_string(), 1.0)]),
         ],
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let population = Population {
         subjects: vec![subject],
@@ -2216,12 +1770,8 @@ fn test_simulate_recovers_block_sigma_cross_branch_correlation() {
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let (m0, m1) = (mean(&resid_total), mean(&resid_unbound));
     let n = n_sim as f64;
-    let cov = resid_total
-        .iter()
-        .zip(&resid_unbound)
-        .map(|(a, b)| (a - m0) * (b - m1))
-        .sum::<f64>()
-        / n;
+    let cov =
+        resid_total.iter().zip(&resid_unbound).map(|(a, b)| (a - m0) * (b - m1)).sum::<f64>() / n;
     let var0 = resid_total.iter().map(|a| (a - m0).powi(2)).sum::<f64>() / n;
     let var1 = resid_unbound.iter().map(|a| (a - m1).powi(2)).sum::<f64>() / n;
     let empirical_rho = cov / (var0.sqrt() * var1.sqrt());
@@ -2251,11 +1801,8 @@ fn test_simulate_recovers_block_sigma_cross_branch_correlation() {
 #[test]
 fn test_simulate_zero_rho_matches_diagonal_draw_path() {
     let (mut model, population) = block_sigma_selected_model_and_population();
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 0.0,
-    }];
+    model.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 0.0 }];
     let dense_path =
         simulate_with_seed(&model, &population, &model.default_params, 200, 7).unwrap();
 
@@ -2282,11 +1829,7 @@ fn test_simulate_zero_rho_matches_diagonal_draw_path() {
 #[test]
 fn test_simulate_singular_rho_one_does_not_panic() {
     let (mut model, population) = block_sigma_selected_model_and_population();
-    let singular = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 1,
-        rho: 1.0,
-    }];
+    let singular = vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 1, rho: 1.0 }];
     // `simulate` draws from the **parameter vector's** correlations since #847
     // (so a VPC of an estimated `block_sigma` reproduces the fitted rho), so the
     // singular value has to be set there; the model copy is kept in step because
@@ -2308,12 +1851,8 @@ fn test_simulate_singular_rho_one_does_not_panic() {
     let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
     let (m0, m1) = (mean(&resid_total), mean(&resid_unbound));
     let n = n_sim as f64;
-    let cov = resid_total
-        .iter()
-        .zip(&resid_unbound)
-        .map(|(a, b)| (a - m0) * (b - m1))
-        .sum::<f64>()
-        / n;
+    let cov =
+        resid_total.iter().zip(&resid_unbound).map(|(a, b)| (a - m0) * (b - m1)).sum::<f64>() / n;
     let var0 = resid_total.iter().map(|a| (a - m0).powi(2)).sum::<f64>() / n;
     let var1 = resid_unbound.iter().map(|a| (a - m1).powi(2)).sum::<f64>() / n;
     let empirical_rho = cov / (var0.sqrt() * var1.sqrt());
@@ -2356,9 +1895,7 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
         &mut results,
     );
     assert_eq!(results.len(), 2);
-    assert!(results
-        .iter()
-        .all(|r| r.outcome.continuous_value().is_finite()));
+    assert!(results.iter().all(|r| r.outcome.continuous_value().is_finite()));
 }
 
 /// #979: block_sigma + IOV is fitted by FOCE and FOCEI (single node), and refused for
@@ -2367,11 +1904,8 @@ fn test_emit_correlated_residual_rows_magnitude_and_scale_paths() {
 #[test]
 fn test_check_model_options_block_sigma_iov_scope() {
     let mut model = make_iov_model();
-    model.residual_correlations = vec![crate::types::ResidualCorrelation {
-        sigma_i: 0,
-        sigma_j: 0,
-        rho: 0.5,
-    }];
+    model.residual_correlations =
+        vec![crate::types::ResidualCorrelation { sigma_i: 0, sigma_j: 0, rho: 0.5 }];
     let iov_diag_of = |model: &CompiledModel, opts: &FitOptions| {
         super::check_model_options(model, opts)
             .into_iter()
@@ -2381,10 +1915,7 @@ fn test_check_model_options_block_sigma_iov_scope() {
 
     for method in [EstimationMethod::Foce, EstimationMethod::FoceI] {
         let opts = fast_opts(method, Optimizer::Bobyqa, false);
-        assert!(
-            iov_diag(&opts).is_none(),
-            "block_sigma + IOV must be accepted for {method:?}"
-        );
+        assert!(iov_diag(&opts).is_none(), "block_sigma + IOV must be accepted for {method:?}");
     }
 
     for (method, label) in [
@@ -2418,11 +1949,8 @@ fn test_check_model_options_block_sigma_iov_scope() {
     let mut no_kappa = make_iov_model();
     no_kappa.residual_correlations = model.residual_correlations.clone();
     no_kappa.n_kappa = 0;
-    assert!(iov_diag_of(
-        &no_kappa,
-        &fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false)
-    )
-    .is_none());
+    assert!(iov_diag_of(&no_kappa, &fast_opts(EstimationMethod::Saem, Optimizer::Bobyqa, false))
+        .is_none());
 }
 
 // IMP and IMPMAP estimate IOV models since #2301, so `ferx check` must not
@@ -2433,11 +1961,8 @@ fn test_check_model_options_accepts_imp_and_impmap_with_iov() {
     for method in [EstimationMethod::Impmap, EstimationMethod::Imp] {
         let opts = fast_opts(method, Optimizer::Bobyqa, false);
         let diags = super::check_model_options(&model, &opts);
-        let errors: Vec<&str> = diags
-            .iter()
-            .filter(|d| d.is_error())
-            .map(|d| d.code.as_str())
-            .collect();
+        let errors: Vec<&str> =
+            diags.iter().filter(|d| d.is_error()).map(|d| d.code.as_str()).collect();
         assert!(errors.is_empty(), "{method:?} + IOV refused: {errors:?}");
     }
 }
@@ -2492,22 +2017,15 @@ fn test_check_model_options_refuses_imp_mixture_with_iov() {
         assert!(msg.contains("[mixture]") && msg.contains("saem"), "{msg}");
     }
     // A later chain stage is caught too: the runtime refusal would fire after SAEM ran.
-    assert!(refused(
-        &mixture_iov,
-        vec![EstimationMethod::Saem, EstimationMethod::Impmap]
-    )
-    .is_some());
+    assert!(refused(&mixture_iov, vec![EstimationMethod::Saem, EstimationMethod::Impmap]).is_some());
     // Methods whose mixture path handles κ are not refused.
     for method in [EstimationMethod::Saem, EstimationMethod::FoceI] {
         assert_eq!(refused(&mixture_iov, vec![method]), None, "{method:?}");
     }
 
     // The same mixture without κ is not refused.
-    let mixture_no_iov = parse(
-        &MIXTURE_IOV
-            .replace("  kappa KAPPA_CL ~ 0.02\n", "")
-            .replace(" + KAPPA_CL", ""),
-    );
+    let mixture_no_iov =
+        parse(&MIXTURE_IOV.replace("  kappa KAPPA_CL ~ 0.02\n", "").replace(" + KAPPA_CL", ""));
     assert!(mixture_no_iov.mixture.is_some() && mixture_no_iov.n_kappa == 0);
     for method in [EstimationMethod::Imp, EstimationMethod::Impmap] {
         assert_eq!(refused(&mixture_no_iov, vec![method]), None, "{method:?}");
@@ -2524,21 +2042,14 @@ fn ad_requested_errors_now_that_ad_is_retired() {
     opts.gradient_method = crate::types::GradientMethod::Ad;
     let diags = super::check_model_options(&model, &opts);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.code == "E_AD_RETIRED" && d.is_error()),
+        diags.iter().any(|d| d.code == "E_AD_RETIRED" && d.is_error()),
         "explicit gradient_method=ad must error now that AD is retired, got: {diags:?}"
     );
 
-    for gm in [
-        crate::types::GradientMethod::Auto,
-        crate::types::GradientMethod::Fd,
-    ] {
+    for gm in [crate::types::GradientMethod::Auto, crate::types::GradientMethod::Fd] {
         opts.gradient_method = gm;
         assert!(
-            !super::check_model_options(&model, &opts)
-                .iter()
-                .any(|d| d.code == "E_AD_RETIRED"),
+            !super::check_model_options(&model, &opts).iter().any(|d| d.code == "E_AD_RETIRED"),
             "gradient_method={gm:?} must not trigger E_AD_RETIRED"
         );
     }
@@ -2570,10 +2081,7 @@ fn iov_with_compartments_derived_emits_unsupported_warning() {
 
     // Warning must be present.
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_IOV_UNSUPPORTED")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_IOV_UNSUPPORTED")),
         "expected W_DERIVED_CMT_IOV_UNSUPPORTED warning; got: {:?}",
         result.warnings
     );
@@ -2635,34 +2143,13 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
     // One subject with an explicit zero-order infusion into the depot (cmt 1):
     // rate 25 over AMT/rate = 4 h, then first-order KA absorption.
     let subject = Subject {
-        obs_rgroup: Vec::new(),
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 25.0, false, 0.0)],
         obs_times: vec![1.0, 2.0, 4.0, 8.0, 12.0],
-        obs_raw_times: Vec::new(),
         observations: vec![0.8, 1.4, 1.6, 0.9, 0.4],
         obs_cmts: vec![2; 5],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     };
     let pop = Population {
         subjects: vec![subject],
@@ -2677,10 +2164,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
     let result = fit(&model, &pop, &model.default_params.clone(), &opts).expect("fit must succeed");
 
     assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
+        result.warnings.iter().any(|w| w.contains("W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL")),
         "expected W_DERIVED_CMT_ORAL_DEPOT_INFUSION_ANALYTICAL warning; got: {:?}",
         result.warnings
     );
@@ -2692,10 +2176,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
             "depot-infusion subject must have empty compartment_states (got {})",
             sr.compartment_states.len()
         );
-        assert!(
-            sr.ipred.iter().all(|p| p.is_finite()),
-            "predictions must be finite"
-        );
+        assert!(sr.ipred.iter().all(|p| p.is_finite()), "predictions must be finite");
     }
 }
 
@@ -2726,10 +2207,7 @@ fn test_simulate_with_options_errs_when_omega_iov_missing() {
         &population,
         &params,
         2,
-        &crate::SimulateOptions {
-            seed: Some(1),
-            ..Default::default()
-        },
+        &crate::SimulateOptions { seed: Some(1), ..Default::default() },
     )
     .expect_err("an IOV model with no omega_iov must not simulate");
     assert!(
@@ -2747,10 +2225,7 @@ fn test_simulate_with_seed_errs_when_omega_iov_missing() {
     // there, rather than rows with zero inter-occasion variability.
     let err = simulate_with_seed(&model, &population, &params, 1, 1)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(
-        err.to_string().contains("carry no omega_iov"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("carry no omega_iov"), "unexpected Err: {err}");
 }
 
 #[test]
@@ -2776,10 +2251,7 @@ fn test_simulate_from_fitted_params_carries_omega_iov() {
         &population,
         &params,
         2,
-        &crate::SimulateOptions {
-            seed: Some(7),
-            ..Default::default()
-        },
+        &crate::SimulateOptions { seed: Some(7), ..Default::default() },
     )
     .expect("simulating from fitted params must succeed");
     assert_eq!(
@@ -2798,10 +2270,7 @@ fn test_simulate_from_fitted_params_carries_omega_iov() {
 // inside occasion 0, one co-timed with the dose at 3.5 that opens occasion 1.
 #[test]
 fn test_apply_iov_occasion_rule_labels_reset_rows() {
-    for rule in [
-        IovOccasionRule::PerDose,
-        IovOccasionRule::TimeWindows(vec![3.5]),
-    ] {
+    for rule in [IovOccasionRule::PerDose, IovOccasionRule::TimeWindows(vec![3.5])] {
         for stale in [vec![7u32, 7], Vec::new()] {
             let mut pop = make_iov_population();
             for s in &mut pop.subjects {
@@ -2862,14 +2331,8 @@ fn reset_crossover_model() -> CompiledModel {
 /// Dataset labels: OCC 1 in period 1, 2 from the reset row on. `reset_label` is the reset
 /// row's own OCC, the one value the cases below vary.
 fn reset_crossover_population(reset_label: Option<u32>) -> Population {
-    let factors: [(f64, f64); 6] = [
-        (1.0, 1.3),
-        (1.2, 0.8),
-        (0.9, 1.1),
-        (1.1, 0.7),
-        (0.8, 1.25),
-        (1.05, 0.9),
-    ];
+    let factors: [(f64, f64); 6] =
+        [(1.0, 1.3), (1.2, 0.8), (0.9, 1.1), (1.1, 0.7), (0.8, 1.25), (1.05, 0.9)];
     let subjects = factors
         .iter()
         .enumerate()
@@ -2890,31 +2353,14 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                     DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
                 ],
                 obs_times,
-                obs_raw_times: Vec::new(),
                 observations,
                 obs_cmts: vec![1; 8],
-                covariates: HashMap::new(),
-                dose_covariates: Vec::new(),
-                obs_covariates: Vec::new(),
-                pk_only_times: Vec::new(),
-                pk_only_raw_times: Vec::new(),
-                reset_period_times: Vec::new(),
-                pk_only_covariates: Vec::new(),
-                pk_only_occasions: Vec::new(),
                 reset_times: vec![12.0],
-                reset_covariates: Vec::new(),
-                cmt_toggles: Vec::new(),
                 cens: vec![0; 8],
                 occasions: vec![1, 1, 1, 1, 2, 2, 2, 2],
-                obs_l2: Vec::new(),
-                obs_rgroup: Vec::new(),
                 dose_occasions: vec![1, 2],
                 reset_occasions: reset_label.into_iter().collect(),
-                fremtype: Vec::new(),
-                obs_records: vec![],
-                endpoint_covariates: Vec::new(),
-                filled_cells: Vec::new(),
-                simulated_mixnum: None,
+                ..Default::default()
             }
         })
         .collect();
@@ -2953,17 +2399,13 @@ fn test_iov_occasion_rule_labels_reset_rows_in_fit() {
         assert!(r.ofv.is_finite(), "OFV must be finite, got {}", r.ofv);
         r.ofv
     };
-    let reference = ofv(
-        &reset_crossover_population(Some(2)),
-        IovOccasionRule::Column,
-    );
+    let reference = ofv(&reset_crossover_population(Some(2)), IovOccasionRule::Column);
 
     // Each pre-fix state is one reset label on the column path, and each must move the
     // objective, or the bit-identities below could not tell the fix from the defect.
-    for (label, what) in [
-        (None, "fallback to the previous record"),
-        (Some(3), "a label with no κ group"),
-    ] {
+    for (label, what) in
+        [(None, "fallback to the previous record"), (Some(3), "a label with no κ group")]
+    {
         let wrong = ofv(&reset_crossover_population(label), IovOccasionRule::Column);
         assert_ne!(
             wrong.to_bits(),
@@ -2979,10 +2421,7 @@ fn test_iov_occasion_rule_labels_reset_rows_in_fit() {
     }
     let labelled = reset_crossover_population(Some(2));
     for (pop, over) in [(&unlabelled, "no column"), (&labelled, "an iov_column")] {
-        for rule in [
-            IovOccasionRule::PerDose,
-            IovOccasionRule::TimeWindows(vec![12.0]),
-        ] {
+        for rule in [IovOccasionRule::PerDose, IovOccasionRule::TimeWindows(vec![12.0])] {
             let got = ofv(pop, rule.clone());
             assert_eq!(
                 got.to_bits(),
@@ -3173,15 +2612,9 @@ fn sim_bits(rows: &[super::SimulationResult]) -> Vec<(u64, u64)> {
 }
 
 fn iov_sim_opts(
-    match_method: Option<crate::MatchMethod>,
-    iov_occasion: Option<IovOccasionRule>,
+    match_method: Option<crate::MatchMethod>, iov_occasion: Option<IovOccasionRule>,
 ) -> crate::SimulateOptions {
-    crate::SimulateOptions {
-        seed: Some(11),
-        match_method,
-        iov_occasion,
-        ..Default::default()
-    }
+    crate::SimulateOptions { seed: Some(11), match_method, iov_occasion, ..Default::default() }
 }
 
 /// Both branches of `simulate_with_options_diag`: the propensity branch runs a posthoc
@@ -3209,18 +2642,12 @@ fn simulate_with_options_derives_occasions_from_the_rule() {
             "{method:?}: an unlabelled population with no rule must not draw κ"
         );
         assert_eq!(
-            rows(
-                &unlabelled,
-                &iov_sim_opts(method, Some(IovOccasionRule::Column))
-            ),
+            rows(&unlabelled, &iov_sim_opts(method, Some(IovOccasionRule::Column))),
             no_rule,
             "{method:?}: the Column rule derives nothing, so it is the no-rule run"
         );
         assert_eq!(
-            rows(
-                &unlabelled,
-                &iov_sim_opts(method, Some(IovOccasionRule::PerDose))
-            ),
+            rows(&unlabelled, &iov_sim_opts(method, Some(IovOccasionRule::PerDose))),
             from_labels,
             "{method:?}: rows under `iov_occasion = dose` must be bit-identical to rows \
              simulated from the same occasions written in the data"
@@ -3233,15 +2660,7 @@ fn simulate_with_uncertainty_derives_occasions_from_the_fits_rule() {
     use crate::estimation::uncertainty_samples::UncertaintyMethod;
     let model = make_iov_model();
     let mut fit = super::simulate_with_uncertainty_tests::synthetic_fit(&model.default_params);
-    fit.omega_iov = Some(
-        model
-            .default_params
-            .omega_iov
-            .as_ref()
-            .unwrap()
-            .matrix
-            .clone(),
-    );
+    fit.omega_iov = Some(model.default_params.omega_iov.as_ref().unwrap().matrix.clone());
     fit.kappa_names = model.kappa_names.clone();
     fit.kappa_fixed = vec![false];
     fit.kappa_init_as_sd = vec![false];
@@ -3338,11 +2757,7 @@ fn iov_simulate_warns_when_no_kappa_is_drawn() {
             some.contains("2 of 4 subject(s)"),
             "{method:?}: only the unlabelled subjects are counted: {some}"
         );
-        assert_eq!(
-            diag(&labelled, None),
-            None,
-            "{method:?}: labelled data draws κ"
-        );
+        assert_eq!(diag(&labelled, None), None, "{method:?}: labelled data draws κ");
         assert_eq!(
             diag(&unlabelled, Some(IovOccasionRule::PerDose)),
             None,
@@ -3371,15 +2786,7 @@ fn iov_simulate_warns_when_no_kappa_is_drawn() {
     }
 
     let mut fit = super::simulate_with_uncertainty_tests::synthetic_fit(&model.default_params);
-    fit.omega_iov = Some(
-        model
-            .default_params
-            .omega_iov
-            .as_ref()
-            .unwrap()
-            .matrix
-            .clone(),
-    );
+    fit.omega_iov = Some(model.default_params.omega_iov.as_ref().unwrap().matrix.clone());
     fit.kappa_names = model.kappa_names.clone();
     fit.kappa_fixed = vec![false];
     fit.kappa_init_as_sd = vec![false];
@@ -3407,10 +2814,7 @@ fn iov_simulate_warns_when_no_kappa_is_drawn() {
         "the uncertainty path takes its rule from the fit, and says so: {all}"
     );
     assert_eq!(uncertainty(&labelled, None), None);
-    assert_eq!(
-        uncertainty(&unlabelled, Some(IovOccasionRule::PerDose)),
-        None
-    );
+    assert_eq!(uncertainty(&unlabelled, Some(IovOccasionRule::PerDose)), None);
 }
 
 /// The CLI `--simulate` path (`run_model_simulate_with_overrides`) passes the model file's
@@ -3468,20 +2872,13 @@ fn cli_simulate_draws_kappa_under_the_model_files_rule() {
             &crate::api::RunOverrides::default(),
         )
         .map_err(|e| e.to_string())?;
-        let found: Vec<String> = result
-            .warnings
-            .iter()
-            .filter(|w| w.starts_with(CODE))
-            .cloned()
-            .collect();
+        let found: Vec<String> =
+            result.warnings.iter().filter(|w| w.starts_with(CODE)).cloned().collect();
         assert!(found.len() <= 1, "one {CODE} per run, got {found:?}");
         Ok::<_, String>((found.into_iter().next(), result, population))
     };
     let dvs = |pop: &Population| -> Vec<u64> {
-        pop.subjects
-            .iter()
-            .flat_map(|s| s.observations.iter().map(|v| v.to_bits()))
-            .collect()
+        pop.subjects.iter().flat_map(|s| s.observations.iter().map(|v| v.to_bits())).collect()
     };
 
     let (w_low, fit_low, low) = run("0.01", "iov_occasion = time(3)").expect("--simulate runs");
@@ -3571,9 +2968,8 @@ fn test_block_sigma_with_iov_takes_one_foce_and_focei_step() {
             for dt in [1.0, 4.0, 10.0] {
                 let t = t0 + dt;
                 // Earlier doses decayed at this occasion's rate: close enough for a fit.
-                let c: f64 = (0..=occ)
-                    .map(|d| 100.0 / 30.0 * (-k * (t - 12.0 * d as f64)).exp())
-                    .sum();
+                let c: f64 =
+                    (0..=occ).map(|d| 100.0 / 30.0 * (-k * (t - 12.0 * d as f64)).exp()).sum();
                 let e = 0.08 * (1.3 * row as f64 + id as f64).sin();
                 row += 1;
                 csv.push_str(&format!("{id},{t},{},0,0,1,{}\n", c * (1.0 + e), occ + 1));
@@ -3610,10 +3006,7 @@ fn test_block_sigma_with_iov_takes_one_foce_and_focei_step() {
         // The step moved ρ off its declaration (0.4), and the per-subject contributions
         // are scored at the moved one, as the objective is: they sum to it.
         eprintln!("{method:?}: ρ {rho}, OFV {}", result.ofv);
-        assert!(
-            (rho - 0.4).abs() > 1e-3,
-            "{method:?}: ρ did not move ({rho})"
-        );
+        assert!((rho - 0.4).abs() > 1e-3, "{method:?}: ρ did not move ({rho})");
         let summed: f64 = result.subjects.iter().map(|s| s.ofv_contribution).sum();
         assert!(
             (summed - result.ofv).abs() < 1e-6 * result.ofv.abs().max(1.0),

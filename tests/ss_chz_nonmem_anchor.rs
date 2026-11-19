@@ -78,10 +78,7 @@ fn load_with(arm: &str, data: &str) -> (CompiledModel, Population) {
 
 /// `(H, h)` of every survival row at time `t`, matched at the file's `1e-9` tolerance.
 fn survival_rows_at(rows: &[ferx_core::SurvivalPredictionResult], t: f64) -> Vec<(f64, f64)> {
-    rows.iter()
-        .filter(|r| (r.time - t).abs() < 1e-9)
-        .map(|r| (r.cum_hazard, r.hazard))
-        .collect()
+    rows.iter().filter(|r| (r.time - t).abs() < 1e-9).map(|r| (r.cum_hazard, r.hazard)).collect()
 }
 
 /// `nonmem_anchor/ss_chz_ss2.csv`: an `SS=1` dose at `t = 0` **and** a second at `t = 48`.
@@ -112,10 +109,7 @@ fn nonmem_rows(arm: &str) -> Vec<(f64, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             (f.len() >= 9 && f[8] == 0.0 && f[1] > 600.0).then(|| (f[1] - 600.0, f[5], f[6], f[7]))
         })
         .collect();
@@ -138,10 +132,7 @@ fn nonmem_rows_r3(arm: &str) -> Vec<(f64, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             // `f[2]` is CMT: keep the PK observations only, so the TTE row at T = 660 does not
             // collide with the PK row at the same time.
             (f.len() >= 9 && f[8] == 0.0 && f[2] == 2.0 && f[1] > 600.0)
@@ -161,10 +152,7 @@ fn nonmem_rows_r3(arm: &str) -> Vec<(f64, f64, f64, f64)> {
         GRID_R3.len()
     );
     for (got, want) in times.iter().zip(&GRID_R3) {
-        assert!(
-            (got - want).abs() < 1e-9,
-            "{arm}: r3 record at ferx t={got}, expected {want}"
-        );
+        assert!((got - want).abs() < 1e-9, "{arm}: r3 record at ferx t={got}, expected {want}");
     }
     rows
 }
@@ -179,10 +167,7 @@ fn nonmem_rows_r5() -> Vec<(f64, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             // `f[2]` is CMT: PK observations only, so the TTE row at T = 876 does not collide
             // with the PK row at the same time.
             (f.len() >= 9 && f[8] == 0.0 && f[2] == 2.0 && f[1] > 600.0)
@@ -202,10 +187,7 @@ fn nonmem_rows_r5() -> Vec<(f64, f64, f64, f64)> {
         GRID_R5.len()
     );
     for (got, want) in times.iter().zip(&GRID_R5) {
-        assert!(
-            (got - want).abs() < 1e-9,
-            "r5 record at ferx t={got}, expected {want}"
-        );
+        assert!((got - want).abs() < 1e-9, "r5 record at ferx t={got}, expected {want}");
     }
     rows
 }
@@ -312,15 +294,8 @@ fn a_second_ss_dose_keeps_the_hazard_and_matches_nonmem() {
 fn every_committed_reference_run_is_what_it_claims_to_be() {
     const FAILURE_MARKERS: [&str; 3] = ["PRDERR", "NUMERICAL DIFFICULTIES", "PROGRAM TERMINATED"];
 
-    for arm in [
-        "r2_const",
-        "r2_drug",
-        "r2_tdep",
-        "r3_const",
-        "r3_drug",
-        "r4_const",
-        "r5_drug_lag",
-    ] {
+    for arm in ["r2_const", "r2_drug", "r2_tdep", "r3_const", "r3_drug", "r4_const", "r5_drug_lag"]
+    {
         let path = format!("nonmem_anchor/results/ss_chz_{arm}.lst");
         let lst = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
         for marker in FAILURE_MARKERS {
@@ -405,10 +380,7 @@ fn a_lagged_mid_record_ss_dose_keeps_the_hazard_and_matches_nonmem() {
         .find(|d| d.ss)
         .map(|d| d.ii)
         .expect("the fixture must carry an SS dose");
-    assert!(
-        lag > ii,
-        "this arm anchors the `lag >= II` regime; got ALAG1={lag}, II={ii}"
-    );
+    assert!(lag > ii, "this arm anchors the `lag >= II` regime; got ALAG1={lag}, II={ii}");
     let sv = predict_survival(&m, &pop, &m.default_params, &GRID_R5).unwrap();
     let pred = predict(&m, &pop, &m.default_params).unwrap();
     let reference = nonmem_rows_r5();
@@ -489,14 +461,8 @@ fn a_lagged_mid_record_ss_dose_keeps_the_hazard_and_matches_nonmem() {
     // sit on the reference's own printf floor — `FORMAT=s1PE15.8` gives nine significant digits,
     // and `A(3) ~ 5e2` is therefore worth ~1e-9 by itself. 2e-8 is ~3.6x the largest, the same
     // bound and the same reasoning as the r3 arm above.
-    assert!(
-        worst_h < 2e-8,
-        "worst relative H/h disagreement vs the r5 train = {worst_h}"
-    );
-    assert!(
-        worst_pred < 2e-8,
-        "worst relative PRED disagreement vs the r5 train = {worst_pred}"
-    );
+    assert!(worst_h < 2e-8, "worst relative H/h disagreement vs the r5 train = {worst_h}");
+    assert!(worst_pred < 2e-8, "worst relative PRED disagreement vs the r5 train = {worst_pred}");
 }
 
 /// The reference certifies itself before anything is compared against it: on the constant
@@ -561,10 +527,7 @@ fn cumulative_hazard_after_an_ss_dose_matches_nonmem() {
         }
         // Measured worst relative disagreement: const 0, drug 1.5e-9, tdep 1.7e-9 (see the
         // bound rationale in the module docs). 2e-8 is ~12x the largest of those.
-        assert!(
-            worst < 2e-8,
-            "{arm}: worst relative H disagreement vs NONMEM = {worst}"
-        );
+        assert!(worst < 2e-8, "{arm}: worst relative H disagreement vs NONMEM = {worst}");
     }
 }
 
@@ -588,10 +551,7 @@ fn instantaneous_hazard_after_an_ss_dose_matches_nonmem() {
             );
             worst = worst.max(((r.hazard - haz) / haz).abs());
         }
-        assert!(
-            worst < 2e-8,
-            "{arm}: worst relative h disagreement vs NONMEM = {worst}"
-        );
+        assert!(worst < 2e-8, "{arm}: worst relative h disagreement vs NONMEM = {worst}");
     }
 }
 
@@ -618,10 +578,7 @@ fn steady_state_predictions_match_nonmem() {
             compared, 3,
             "{arm}: expected the three PK records to be compared, not {compared}"
         );
-        assert!(
-            worst < 2e-8,
-            "{arm}: worst relative PRED disagreement vs NONMEM = {worst}"
-        );
+        assert!(worst < 2e-8, "{arm}: worst relative PRED disagreement vs NONMEM = {worst}");
     }
 }
 
@@ -686,11 +643,8 @@ fn a_joint_steady_state_fit_does_not_bank_the_run_in_into_the_objective() {
     };
     let r = ferx_core::fit(&m, &pop, &m.default_params, &opts).expect("joint SS fit runs");
 
-    let ss_warnings: Vec<&String> = r
-        .warnings
-        .iter()
-        .filter(|w| w.contains("Steady-state (SS=1) equilibration"))
-        .collect();
+    let ss_warnings: Vec<&String> =
+        r.warnings.iter().filter(|w| w.contains("Steady-state (SS=1) equilibration")).collect();
     assert!(
         ss_warnings.is_empty(),
         "a joint SS model reported a non-converged equilibration: {ss_warnings:?}"
@@ -721,11 +675,7 @@ fn a_simulated_steady_state_subject_draws_a_distribution_of_event_times() {
     use ferx_core::api::{simulate_with_options, SimulateOptions};
 
     let (m, pop) = load("drug");
-    let opts = SimulateOptions {
-        horizon: Some(24.0),
-        seed: Some(7),
-        ..Default::default()
-    };
+    let opts = SimulateOptions { horizon: Some(24.0), seed: Some(7), ..Default::default() };
     let sim = simulate_with_options(&m, &pop, &m.default_params, 20, &opts)
         .expect("joint SS simulation runs");
 
@@ -741,10 +691,7 @@ fn a_simulated_steady_state_subject_draws_a_distribution_of_event_times() {
     }
     let lo = times.iter().copied().fold(f64::INFINITY, f64::min);
     let hi = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    assert!(
-        hi - lo > 0.5,
-        "simulated event times are degenerate: min {lo}, max {hi}"
-    );
+    assert!(hi - lo > 0.5, "simulated event times are degenerate: min {lo}, max {hi}");
 }
 
 /// `nonmem_anchor/ss_chz_reset.csv`: an `SS=1` dose at `t = 0`, then `EVID=4` (reset + dose)
@@ -763,10 +710,7 @@ fn nonmem_rows_r4() -> Vec<(f64, f64, f64, f64)> {
         .lines()
         .skip(2)
         .filter_map(|l| {
-            let f: Vec<f64> = l
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
+            let f: Vec<f64> = l.split_whitespace().filter_map(|x| x.parse().ok()).collect();
             (f.len() >= 9 && f[8] == 0.0 && f[2] == 2.0 && f[1] > 600.0)
                 .then(|| (f[1] - 600.0, f[5], f[6], f[7]))
         })
@@ -781,10 +725,7 @@ fn nonmem_rows_r4() -> Vec<(f64, f64, f64, f64)> {
         GRID_R4.len()
     );
     for (got, want) in times.iter().zip(&GRID_R4) {
-        assert!(
-            (got - want).abs() < 1e-9,
-            "r4 record at ferx t={got}, expected {want}"
-        );
+        assert!((got - want).abs() < 1e-9, "r4 record at ferx t={got}, expected {want}");
     }
     rows
 }
@@ -863,21 +804,12 @@ fn a_reset_zeroes_the_accumulated_hazard_and_matches_nonmem() {
         worst_pred = worst_pred.max(((pr.pred - ipred) / ipred).abs());
         compared += 1;
     }
-    assert_eq!(
-        compared, 4,
-        "expected all four records to be compared, not {compared}"
-    );
+    assert_eq!(compared, 4, "expected all four records to be compared, not {compared}");
     // Measured worst relative disagreement: 3.5e-16 on H/h — the const arm's hazard is exact
     // against the closed form on both sides of the reset — and 2.4e-9 on PRED, which is the
     // reference table's own nine-digit print resolution. 2e-8 is ~8x the larger.
-    assert!(
-        worst_h < 2e-8,
-        "worst relative H/h disagreement vs the r4 train = {worst_h}"
-    );
-    assert!(
-        worst_pred < 2e-8,
-        "worst relative PRED disagreement vs the r4 train = {worst_pred}"
-    );
+    assert!(worst_h < 2e-8, "worst relative H/h disagreement vs the r4 train = {worst_h}");
+    assert!(worst_pred < 2e-8, "worst relative PRED disagreement vs the r4 train = {worst_pred}");
 }
 
 /// #1218: a grid with no point past the first event returned `NaN, NaN` — `[0.0]`, `[0.0, 0.0]`
@@ -918,27 +850,17 @@ fn predict_survival_on_a_single_instant_grid_matches_the_multi_point_grid() {
         let single = predict_survival(&m, &pop, &m.default_params, &[0.0]).unwrap();
         let dup = predict_survival(&m, &pop, &m.default_params, &[0.0, 0.0]).unwrap();
         let pre_grid = predict_survival(&m, &pop, &m.default_params, &[-1.0, 0.0]).unwrap();
-        for (label, rows, n_zero) in [
-            ("[0.0]", &single, 1),
-            ("[0.0, 0.0]", &dup, 2),
-            ("[-1.0, 0.0]", &pre_grid, 1),
-        ] {
+        for (label, rows, n_zero) in
+            [("[0.0]", &single, 1), ("[0.0, 0.0]", &dup, 2), ("[-1.0, 0.0]", &pre_grid, 1)]
+        {
             let got = survival_rows_at(rows, 0.0);
-            assert_eq!(
-                got.len(),
-                n_zero,
-                "{arm} {label}: one row per requested t = 0"
-            );
+            assert_eq!(got.len(), n_zero, "{arm} {label}: one row per requested t = 0");
             for (h, haz) in got {
                 assert!(
                     h.is_finite() && haz.is_finite(),
                     "{arm} {label}: non-finite (H, h) at t = 0: {h}, {haz}"
                 );
-                assert_eq!(
-                    h.to_bits(),
-                    want_h.to_bits(),
-                    "{arm} {label}: H(0) {h} != {want_h}"
-                );
+                assert_eq!(h.to_bits(), want_h.to_bits(), "{arm} {label}: H(0) {h} != {want_h}");
                 assert_eq!(
                     haz.to_bits(),
                     want_haz.to_bits(),

@@ -132,9 +132,7 @@ use nalgebra::{DMatrix, DVector};
 ///   prepared as `fit()` prepared it — occasions derived under the fit's recorded rule
 ///   (`fit.iov_occasion`), DV log-transformed for a `log(DV) ~ …` model (#1783).
 pub fn run_covariance(
-    fit: &FitResult,
-    model: Option<&CompiledModel>,
-    population: Option<&Population>,
+    fit: &FitResult, model: Option<&CompiledModel>, population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
     // #426: the scoring settings the fit's objective ran under, wherever the caller left the
@@ -154,15 +152,11 @@ pub fn run_covariance(
     // file's. #426: the scope carries this call's `inner_optimizer` / `ebe_warm_start` the
     // same way, so the reconverged EBEs use the resolved inner solver — the same source as
     // `inner_maxiter` / `inner_tol` — and not whatever another fit in the process last set.
-    crate::api::with_fit_scope(options, || {
-        run_covariance_scoped(fit, model, population, options)
-    })?
+    crate::api::with_fit_scope(options, || run_covariance_scoped(fit, model, population, options))?
 }
 
 fn run_covariance_scoped(
-    fit: &FitResult,
-    model: Option<&CompiledModel>,
-    population: Option<&Population>,
+    fit: &FitResult, model: Option<&CompiledModel>, population: Option<&Population>,
     options: &FitOptions,
 ) -> Result<FitResult, crate::diagnostics::EngineError> {
     // Input resolution mirrors `run_sir` exactly: stale-input errors win over
@@ -198,9 +192,7 @@ fn run_covariance_scoped(
     // population read model-blind carries a joint model's event rows as Gaussian
     // observations, and the covariance step would be taken on the Gaussian half of
     // the likelihood. The re-read above is routed; this covers a supplied population.
-    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(
-        model_ref, pop_ref, true,
-    ))?;
+    crate::diagnostics::first_error(&crate::api::check_endpoint_routing(model_ref, pop_ref, true))?;
     // A caller's `ode_method = Linear` asserts the exact path, as it does for `fit()` (#852).
     crate::diagnostics::first_error(&crate::api::check_ode_method_linear(model_ref, options))
         .map_err(|e| e.in_context("run_covariance"))?;
@@ -213,9 +205,7 @@ fn run_covariance_scoped(
     // covariate on an endpoint read at the baseline snapshot — for a drug-driven CTMM, one
     // reaching the disposition its `[odes]` solve integrates. `fit()` refuses it (#741).
     #[cfg(feature = "survival")]
-    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(
-        model_ref, pop_ref,
-    ))?;
+    crate::diagnostics::first_error(&crate::api::check_survival_tv_covariates(model_ref, pop_ref))?;
 
     // --- The shape gate ----------------------------------------------------
     // Ω, σ and Ω_IOV against the model (#1833), before the EBE check below: a fit of a
@@ -380,12 +370,11 @@ fn run_covariance_scoped(
         &mut out.warnings,
     );
     out.warnings.extend(resolved_warning);
-    out.warnings
-        .extend(crate::api::rsr_one_subject_levels_warning(
-            model_ref,
-            pop_ref,
-            out.covariance_method,
-        ));
+    out.warnings.extend(crate::api::rsr_one_subject_levels_warning(
+        model_ref,
+        pop_ref,
+        out.covariance_method,
+    ));
     // The levels the replayed step held on their bound (#2112), and their warning: the
     // incoming fit's describe a step this call replaced.
     crate::api::refresh_profiled_bound_report(model_ref, pop_ref, &params, held_at_bound, &mut out);
@@ -440,10 +429,7 @@ fn run_covariance_scoped(
 /// and no covariance can tell whether it is there: that removing it leaves the mixture
 /// rows of `tests/sir_scores_fitted_marginal.rs` green is by construction, not a gap.
 fn reported_ebe_inputs(
-    fit: &FitResult,
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
+    fit: &FitResult, model: &CompiledModel, population: &Population, params: &ModelParameters,
     options: &FitOptions,
 ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
     use crate::estimation::inner_optimizer::{
@@ -491,10 +477,7 @@ fn reported_ebe_inputs(
             .all(|(r, c)| r.len() == c.len() && r.iter().all(|k| k.len() == model.n_kappa));
     let agrees = || {
         reported_matches(&reported, &cold_ehs)
-            && reported_kappas
-                .iter()
-                .zip(&cold_kappas)
-                .all(|(r, c)| reported_matches(r, c))
+            && reported_kappas.iter().zip(&cold_kappas).all(|(r, c)| reported_matches(r, c))
     };
     if params.mixture.is_some() || !comparable || agrees() {
         return (cold_ehs, cold_hms, cold_kappas);
@@ -601,9 +584,7 @@ mod tests {
     /// produce a matrix. The warfarin FD cov step is occasionally FD-unstable;
     /// the parity assertions require a non-None reference matrix.
     fn fit_with_cov_or_skip(
-        model_path: &str,
-        data_path: &str,
-        opts: FitOptions,
+        model_path: &str, data_path: &str, opts: FitOptions,
     ) -> Option<FitResult> {
         let fit = fit_from_files(model_path, Some(data_path), None, Some(opts))
             .expect("fit must converge");
@@ -677,20 +658,14 @@ mod tests {
             return;
         }
         // The whole point of the IOV variant: se_kappa must actually be exercised.
-        assert!(
-            fit_a.se_kappa.is_some(),
-            "inline IOV cov step must populate se_kappa"
-        );
+        assert!(fit_a.se_kappa.is_some(), "inline IOV cov step must populate se_kappa");
 
         // Fit B: identical settings, no inline covariance step.
         let fit_b = fit(
             &model,
             &pop,
             &model.default_params,
-            &FitOptions {
-                run_covariance_step: false,
-                ..opts.clone()
-            },
+            &FitOptions { run_covariance_step: false, ..opts.clone() },
         )
         .expect("iov fit B converges");
         assert!(
@@ -710,16 +685,11 @@ mod tests {
 
         assert_eq!(out.covariance_status, CovarianceStatus::Computed);
         let cov_ref = fit_a.covariance_matrix.as_ref().unwrap();
-        let cov_new = out
-            .covariance_matrix
-            .as_ref()
-            .expect("run_covariance populated covariance_matrix");
+        let cov_new =
+            out.covariance_matrix.as_ref().expect("run_covariance populated covariance_matrix");
         assert_eq!(cov_ref.shape(), cov_new.shape());
-        let max_abs_diff = cov_ref
-            .iter()
-            .zip(cov_new.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        let max_abs_diff =
+            cov_ref.iter().zip(cov_new.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max);
         assert!(
             max_abs_diff < 1e-12,
             "IOV run_covariance matrix diverged from inline cov (max abs diff {max_abs_diff})"
@@ -767,10 +737,7 @@ mod tests {
         };
 
         // Fit B: identical settings but no inline covariance step.
-        let opts_no_cov = FitOptions {
-            run_covariance_step: false,
-            ..opts.clone()
-        };
+        let opts_no_cov = FitOptions { run_covariance_step: false, ..opts.clone() };
         let fit_b = fit_from_files(
             model_path.to_str().unwrap(),
             Some(data_path.to_str().unwrap()),
@@ -787,16 +754,11 @@ mod tests {
 
         assert_eq!(out.covariance_status, CovarianceStatus::Computed);
         let cov_ref = fit_a.covariance_matrix.as_ref().unwrap();
-        let cov_new = out
-            .covariance_matrix
-            .as_ref()
-            .expect("run_covariance populated covariance_matrix");
+        let cov_new =
+            out.covariance_matrix.as_ref().expect("run_covariance populated covariance_matrix");
         assert_eq!(cov_ref.shape(), cov_new.shape());
-        let max_abs_diff = cov_ref
-            .iter()
-            .zip(cov_new.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        let max_abs_diff =
+            cov_ref.iter().zip(cov_new.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max);
         // `run_covariance` reuses the optimizer's exact packed vector
         // (`fit.packed_estimate`) to rebuild the parameters, so its `OmegaMatrix`
         // `Ω⁻¹` / `log|Ω|` are built from the same Cholesky factor `L` the inline
@@ -862,10 +824,7 @@ mod tests {
             model_path.to_str().unwrap(),
             Some(data_path.to_str().unwrap()),
             None,
-            Some(FitOptions {
-                run_covariance_step: false,
-                ..opts.clone()
-            }),
+            Some(FitOptions { run_covariance_step: false, ..opts.clone() }),
         )
         .expect("fit must converge");
 
@@ -895,11 +854,8 @@ mod tests {
         // Loose agreement with the inline step: the re-decomposition divergence is
         // ~0.1 here, so this only guards against gross regressions, not the
         // bit-for-bit exactness the reuse arm provides.
-        let max_abs_diff = cov_ref
-            .iter()
-            .zip(cov_new.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
+        let max_abs_diff =
+            cov_ref.iter().zip(cov_new.iter()).map(|(a, b)| (a - b).abs()).fold(0.0_f64, f64::max);
         assert!(
             max_abs_diff < 0.5,
             "fallback run_covariance grossly diverged from inline cov (max abs diff {max_abs_diff})"
@@ -937,10 +893,7 @@ mod tests {
             model_path.to_str().unwrap(),
             Some(data_path.to_str().unwrap()),
             None,
-            Some(FitOptions {
-                run_covariance_step: false,
-                ..quick_opts()
-            }),
+            Some(FitOptions { run_covariance_step: false, ..quick_opts() }),
         )
         .expect("fit must converge on the renamed dataset");
 
@@ -967,26 +920,17 @@ mod tests {
             model_path.to_str().unwrap(),
             Some(data_path.to_str().unwrap()),
             None,
-            Some(FitOptions {
-                run_covariance_step: false,
-                ..quick_opts()
-            }),
+            Some(FitOptions { run_covariance_step: false, ..quick_opts() }),
         )
         .expect("fit must converge");
 
-        let bad_opts = FitOptions {
-            fd_hessian_step: -1.0,
-            ..quick_opts()
-        };
+        let bad_opts = FitOptions { fd_hessian_step: -1.0, ..quick_opts() };
         let n_warn_before = fit.warnings.len();
         let out =
             run_covariance(&fit, None, None, &bad_opts).expect("failed cov step is Ok, not Err");
         assert!(out.covariance_matrix.is_none());
         assert_eq!(out.covariance_status, CovarianceStatus::Failed);
-        assert!(
-            out.warnings.len() > n_warn_before,
-            "a diagnostic warning must be appended"
-        );
+        assert!(out.warnings.len() > n_warn_before, "a diagnostic warning must be appended");
         assert!(
             out.warnings.iter().any(|w| w.contains("fd_hessian_step")),
             "warning should name fd_hessian_step, got: {:?}",
@@ -1008,10 +952,7 @@ mod tests {
         )
         .expect("fit must converge");
 
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&model_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&model_path).unwrap();
         writeln!(f, "  ").unwrap();
         drop(f);
 
@@ -1037,10 +978,7 @@ mod tests {
         )
         .expect("fit must converge");
 
-        let mut f = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&data_path)
-            .unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&data_path).unwrap();
         writeln!(f, "# tampered").unwrap();
         drop(f);
 
@@ -1070,10 +1008,7 @@ mod tests {
         .expect("fit must converge");
 
         {
-            let mut f = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&model_path)
-                .unwrap();
+            let mut f = std::fs::OpenOptions::new().append(true).open(&model_path).unwrap();
             writeln!(f, "# tampered").unwrap();
         }
 
@@ -1141,10 +1076,7 @@ mod tests {
         ))
         .expect("parse warfarin_iov.ferx")
         .model;
-        assert!(
-            iov_model.n_kappa > 0,
-            "warfarin_iov.ferx must declare kappa"
-        );
+        assert!(iov_model.n_kappa > 0, "warfarin_iov.ferx must declare kappa");
 
         let err = run_covariance(&fit, Some(&iov_model), None, &quick_opts()).unwrap_err();
         assert!(
@@ -1170,13 +1102,8 @@ mod from_fit_bindings {
     }
 
     fn oracle(c: &Case) -> FitResult {
-        run_covariance(
-            &c.fit,
-            Some(&c.prep.parsed.model),
-            Some(&c.prep.population),
-            &c.opts,
-        )
-        .expect("the oracle runs")
+        run_covariance(&c.fit, Some(&c.prep.parsed.model), Some(&c.prep.population), &c.opts)
+            .expect("the oracle runs")
     }
 
     fn assert_same_covariance(got: &FitResult, want: &FitResult, what: &str) {
@@ -1192,9 +1119,7 @@ mod from_fit_bindings {
         assert_eq!(bits(got_cov), bits(want_cov), "{what}: covariance bits");
         assert_eq!(got.covariance_status, CovarianceStatus::Computed, "{what}");
         let se = |f: &FitResult| {
-            f.se_theta
-                .as_ref()
-                .map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
+            f.se_theta.as_ref().map(|v| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>())
         };
         assert_eq!(se(got), se(want), "{what}: se_theta bits");
     }
@@ -1208,10 +1133,8 @@ mod from_fit_bindings {
         {
             let c = case(kind);
             let bare = unbound(&c);
-            let symbolic = bare
-                .covariate_model
-                .as_ref()
-                .is_some_and(|s| !s.unresolved().is_empty());
+            let symbolic =
+                bare.covariate_model.as_ref().is_some_and(|s| !s.unresolved().is_empty());
             assert_eq!(
                 symbolic,
                 matches!(kind, Kind::Median | Kind::LevelMedian),
@@ -1258,10 +1181,7 @@ mod from_fit_bindings {
     /// 60 s under the coverage build of `Tests + coverage (core)`). Adds the plain
     /// control and the level kinds, where skipping the bind is refused on `n_theta`.
     #[test]
-    #[cfg_attr(
-        not(feature = "slow-tests"),
-        ignore = "slow: opt in with --features slow-tests"
-    )]
+    #[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
     fn the_re_read_equals_the_model_bound_on_the_fit_data() {
         for kind in [
             Kind::Plain,
@@ -1294,9 +1214,7 @@ mod from_fit_bindings {
             let mut c = case(kind);
             assert!(!c.fit.data_bindings.is_empty(), "{kind:?}");
             c.fit.data_bindings = Default::default();
-            let err = run_covariance(&c.fit, None, None, &c.opts)
-                .map(|_| ())
-                .expect_err("refused");
+            let err = run_covariance(&c.fit, None, None, &c.opts).map(|_| ()).expect_err("refused");
             assert!(
                 err.to_string().starts_with(
                     "run_covariance: this fit carries no data-derived bindings, so the model \
@@ -1305,8 +1223,7 @@ mod from_fit_bindings {
                 "{kind:?}: {err}"
             );
             assert_eq!(
-                err.to_string()
-                    .contains("its theta level block(s) `SHIFT[STUDY]`"),
+                err.to_string().contains("its theta level block(s) `SHIFT[STUDY]`"),
                 has_level,
                 "{kind:?}: {err}"
             );
@@ -1341,14 +1258,10 @@ mod from_fit_bindings {
     fn a_supplied_model_must_be_the_fitted_one() {
         let level = case(Kind::Level);
         let bare = unbound(&level);
-        let err = run_covariance(
-            &level.fit,
-            Some(&bare),
-            Some(&level.prep.population),
-            &level.opts,
-        )
-        .map(|_| ())
-        .unwrap_err();
+        let err =
+            run_covariance(&level.fit, Some(&bare), Some(&level.prep.population), &level.opts)
+                .map(|_| ())
+                .unwrap_err();
         assert_eq!(
             err.to_string(),
             "run_covariance: the supplied model is not bound with this fit's bindings: its \
@@ -1359,14 +1272,10 @@ mod from_fit_bindings {
 
         let mut no_bindings = level.fit.clone();
         no_bindings.data_bindings = Default::default();
-        let err = run_covariance(
-            &no_bindings,
-            Some(&bare),
-            Some(&level.prep.population),
-            &level.opts,
-        )
-        .map(|_| ())
-        .unwrap_err();
+        let err =
+            run_covariance(&no_bindings, Some(&bare), Some(&level.prep.population), &level.opts)
+                .map(|_| ())
+                .unwrap_err();
         assert_eq!(
             err.to_string(),
             "run_covariance: the model has n_theta = 6 but the fit has 8 θ. Verify you supplied \
@@ -1374,13 +1283,8 @@ mod from_fit_bindings {
              fit's `data_bindings`)."
         );
 
-        let got = run_covariance(
-            &level.fit,
-            Some(&level.prep.parsed.model),
-            None,
-            &level.opts,
-        )
-        .expect("a bound model re-reads its own population");
+        let got = run_covariance(&level.fit, Some(&level.prep.parsed.model), None, &level.opts)
+            .expect("a bound model re-reads its own population");
         assert_same_covariance(&got, &oracle(&level), "Level Some/None");
 
         // A population that is not the fit's subjects is refused: the EBEs are matched
@@ -1396,14 +1300,10 @@ mod from_fit_bindings {
         };
         let mut short = level.prep.population.clone();
         short.subjects.pop();
-        let err = run_covariance(
-            &level.fit,
-            Some(&level.prep.parsed.model),
-            Some(&short),
-            &level.opts,
-        )
-        .map(|_| ())
-        .unwrap_err();
+        let err =
+            run_covariance(&level.fit, Some(&level.prep.parsed.model), Some(&short), &level.opts)
+                .map(|_| ())
+                .unwrap_err();
         assert_eq!(err.to_string(), why("it has 29 subjects, the fit's has 30"));
         // #1813: coded, though `ferx check` (which has no fit) cannot raise it.
         assert_eq!(err.code(), Some("E_POPULATION_MISMATCH"), "{err}");
@@ -1411,18 +1311,11 @@ mod from_fit_bindings {
         // …then the right count in the wrong order, naming the first position.
         let mut swapped = level.prep.population.clone();
         swapped.subjects.swap(1, 2);
-        let err = run_covariance(
-            &level.fit,
-            Some(&level.prep.parsed.model),
-            Some(&swapped),
-            &level.opts,
-        )
-        .map(|_| ())
-        .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            why("its subject 2 is `3`, the fit's is `2`")
-        );
+        let err =
+            run_covariance(&level.fit, Some(&level.prep.parsed.model), Some(&swapped), &level.opts)
+                .map(|_| ())
+                .unwrap_err();
+        assert_eq!(err.to_string(), why("its subject 2 is `3`, the fit's is `2`"));
         // Finding 7: checked before binding, so a population with a level the fit
         // never saw hears that it is not the fit's, not the design advice of the
         // unseen-level refusal.
@@ -1431,36 +1324,23 @@ mod from_fit_bindings {
         newcomer.id = "99".to_string();
         newcomer.covariates.insert("STUDY".to_string(), 4.0);
         extra.subjects.push(newcomer);
-        let err = run_covariance(&level.fit, None, Some(&extra), &level.opts)
-            .map(|_| ())
-            .unwrap_err();
+        let err =
+            run_covariance(&level.fit, None, Some(&extra), &level.opts).map(|_| ()).unwrap_err();
         assert_eq!(err.to_string(), why("it has 31 subjects, the fit's has 30"));
 
         let median = case(Kind::Median);
         let bare = unbound(&median);
-        let err = run_covariance(
-            &median.fit,
-            Some(&bare),
-            Some(&median.prep.population),
-            &median.opts,
-        )
-        .map(|_| ())
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("is not bound with this fit's bindings"),
-            "{err}"
-        );
+        let err =
+            run_covariance(&median.fit, Some(&bare), Some(&median.prep.population), &median.opts)
+                .map(|_| ())
+                .unwrap_err();
+        assert!(err.to_string().contains("is not bound with this fit's bindings"), "{err}");
         let mut no_bindings = median.fit.clone();
         no_bindings.data_bindings = Default::default();
-        let err = run_covariance(
-            &no_bindings,
-            Some(&bare),
-            Some(&median.prep.population),
-            &median.opts,
-        )
-        .map(|_| ())
-        .unwrap_err();
+        let err =
+            run_covariance(&no_bindings, Some(&bare), Some(&median.prep.population), &median.opts)
+                .map(|_| ())
+                .unwrap_err();
         assert!(
             err.to_string().starts_with(
                 "run_covariance: [covariate_model] relations still need data-derived statistics:"
@@ -1549,18 +1429,12 @@ mod from_fit_bindings {
         // Live: the design's WT median is not the fit's.
         let (mm, dm) = (wt_median(lent), wt_median(fitted));
         assert_ne!(mm, dm);
-        for (pop, source) in [
-            (Some(&c.prep.population), Source::Supplied),
-            (None, Source::ReRead),
-        ] {
+        for (pop, source) in [(Some(&c.prep.population), Source::Supplied), (None, Source::ReRead)]
+        {
             let err = run_covariance(&fit, Some(lent), pop, &c.opts)
                 .map(|_| ())
                 .expect_err("a design-bound model is refused");
-            assert_eq!(
-                err.to_string(),
-                stats_refusal(source, mm, dm, false),
-                "{source:?}"
-            );
+            assert_eq!(err.to_string(), stats_refusal(source, mm, dm, false), "{source:?}");
         }
     }
 
@@ -1583,14 +1457,9 @@ mod from_fit_bindings {
         let err = run_covariance(&fit, Some(lent), Some(&c.prep.population), &c.opts)
             .map(|_| ())
             .expect_err("refused");
-        assert_eq!(
-            err.to_string(),
-            stats_refusal(Source::Supplied, mm, dm, true)
-        );
+        assert_eq!(err.to_string(), stats_refusal(Source::Supplied, mm, dm, true));
 
-        let err = run_covariance(&fit, Some(lent), None, &c.opts)
-            .map(|_| ())
-            .expect_err("refused");
+        let err = run_covariance(&fit, Some(lent), None, &c.opts).map(|_| ()).expect_err("refused");
         assert!(
             err.to_string().starts_with(
                 "run_covariance: theta SHIFT[STUDY]: the design has 1 level(s) the fit \
@@ -1632,27 +1501,17 @@ mod from_fit_bindings {
             (&routed, None, Source::Routed),
         ];
         for (f, pop, source) in cells {
-            let err = run_covariance(f, Some(lent), pop, &c.opts)
-                .map(|_| ())
-                .expect_err("refused");
-            assert_eq!(
-                err.to_string(),
-                stats_refusal(source, mm, dm, false),
-                "{source:?}"
-            );
+            let err = run_covariance(f, Some(lent), pop, &c.opts).map(|_| ()).expect_err("refused");
+            assert_eq!(err.to_string(), stats_refusal(source, mm, dm, false), "{source:?}");
         }
         // #1685, the other side of the routed caveat's gate: no `model_path`, but
         // recorded settings, so the re-read did apply the selection and says nothing
         // about it.
         let mut recorded = fit.clone();
         recorded.model_path = None;
-        let err = run_covariance(&recorded, Some(lent), None, &c.opts)
-            .map(|_| ())
-            .expect_err("refused");
-        assert_eq!(
-            err.to_string(),
-            stats_refusal(Source::ReRead, mm, dm, false)
-        );
+        let err =
+            run_covariance(&recorded, Some(lent), None, &c.opts).map(|_| ()).expect_err("refused");
+        assert_eq!(err.to_string(), stats_refusal(Source::ReRead, mm, dm, false));
         // The supplied and re-read texts differ, so neither equality is the other's.
         assert_ne!(
             stats_refusal(Source::Supplied, mm, dm, false),
@@ -1734,9 +1593,8 @@ mod from_fit_bindings {
 
             let design = design(&c);
             let lent = &design.parsed.model;
-            let err = run_covariance(&fit, Some(lent), pop, &c.opts)
-                .map(|_| ())
-                .expect_err("refused");
+            let err =
+                run_covariance(&fit, Some(lent), pop, &c.opts).map(|_| ()).expect_err("refused");
             let (mm, dm) = (wt_median(lent), wt_median(&c.prep.parsed.model));
             assert_eq!(
                 err.to_string(),
@@ -1756,9 +1614,7 @@ mod from_fit_bindings {
             crate::api::bind_covariate_stats(&mut parsed, &text, &c.prep.population).unwrap();
             let fresh = run_covariance(&fit, Some(&parsed.model), pop, &c.opts);
             if levels {
-                let err = fresh
-                    .map(|_| ())
-                    .expect_err("the level block stays unbound");
+                let err = fresh.map(|_| ()).expect_err("the level block stays unbound");
                 assert!(
                     err.to_string()
                         .starts_with("run_covariance: the model has n_theta = 6 but the fit has 8"),
@@ -1800,36 +1656,23 @@ mod from_fit_bindings {
 
         let text = std::fs::read_to_string(&c.model_path).unwrap();
         std::fs::write(&c.model_path, format!("{text}\n# edited after the fit\n")).unwrap();
-        let err = run_covariance(&legacy, Some(model), None, &c.opts)
-            .map(|_| ())
-            .unwrap_err();
-        assert!(
-            err.to_string()
-                .starts_with("run_covariance: model hash mismatch for "),
-            "{err}"
-        );
+        let err = run_covariance(&legacy, Some(model), None, &c.opts).map(|_| ()).unwrap_err();
+        assert!(err.to_string().starts_with("run_covariance: model hash mismatch for "), "{err}");
         // #1774: a file changed since the fit carries `E_FIT_INPUT_CHANGED` (it had no
         // code under #1746), and is still attributed to the entry point. Mutation:
         // code the hash failure as the read failure's `E_MODEL_READ` → this dies.
         assert_eq!(err.code(), Some("E_FIT_INPUT_CHANGED"), "{err}");
         assert_eq!(err.context(), Some("run_covariance"), "{err}");
+        assert!(err.message().starts_with("model hash mismatch for "), "{err}");
         assert!(
-            err.message().starts_with("model hash mismatch for "),
-            "{err}"
-        );
-        assert!(
-            err.to_string()
-                .ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
+            err.to_string().ends_with(&format!("refusing to run against stale source.{BECAUSE}")),
             "{err}"
         );
 
         std::fs::remove_file(&c.model_path).unwrap();
-        let err = run_covariance(&legacy, Some(model), None, &c.opts)
-            .map(|_| ())
-            .unwrap_err();
+        let err = run_covariance(&legacy, Some(model), None, &c.opts).map(|_| ()).unwrap_err();
         assert!(
-            err.to_string()
-                .starts_with("run_covariance: cannot read the model file "),
+            err.to_string().starts_with("run_covariance: cannot read the model file "),
             "{err}"
         );
         assert!(err.to_string().ends_with(BECAUSE), "{err}");
@@ -1934,20 +1777,11 @@ mod reported_ebes {
         let v = |xs: &[f64]| vec![DVector::from_column_slice(xs)];
         let cold = v(&[0.123_456_5, -1.000_000_499_9, 0.0]);
         assert!(reported_matches(&cold, &cold), "identity");
-        assert!(
-            reported_matches(&v(&[0.123_456_5, -1.000_000_499_9, -0.0]), &cold),
-            "signed zero"
-        );
+        assert!(reported_matches(&v(&[0.123_456_5, -1.000_000_499_9, -0.0]), &cold), "signed zero");
         let one_ulp = v(&[0.123_456_5_f64.next_up(), -1.000_000_499_9, 0.0]);
         assert!(!reported_matches(&one_ulp, &cold), "one ULP off");
-        assert!(
-            !reported_matches(&v(&[f64::NAN, -1.000_000_499_9, 0.0]), &cold),
-            "NaN"
-        );
-        assert!(
-            !reported_matches(&v(&[0.123_456_5, -1.000_000_499_9]), &cold),
-            "dimension"
-        );
+        assert!(!reported_matches(&v(&[f64::NAN, -1.000_000_499_9, 0.0]), &cold), "NaN");
+        assert!(!reported_matches(&v(&[0.123_456_5, -1.000_000_499_9]), &cold), "dimension");
         assert!(!reported_matches(&[], &cold), "subject count");
     }
 
@@ -1975,10 +1809,7 @@ mod reported_ebes {
             })
             .collect();
         let near: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
-        assert!(
-            !reported_matches(&near, &cold_etas),
-            "premise: not bit-equal"
-        );
+        assert!(!reported_matches(&near, &cold_etas), "premise: not bit-equal");
         let (etas, _, _) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
         assert!(etas == near, "the step must run from the reported EBEs");
     }
@@ -2004,10 +1835,7 @@ mod reported_ebes {
         fit.subjects.clear();
         let (cold_etas, _, cold_kappas) =
             reported_ebe_inputs(&fit, &model, &population, &params, &options);
-        assert!(
-            cold_kappas.iter().any(|k| !k.is_empty()),
-            "premise: the cold solve has κ̂"
-        );
+        assert!(cold_kappas.iter().any(|k| !k.is_empty()), "premise: the cold solve has κ̂");
 
         fit.subjects = population
             .subjects
@@ -2028,10 +1856,8 @@ mod reported_ebes {
         );
 
         // κ̂ off the cold solve too, so the reported κ̂ and the cold κ̂ are told apart.
-        fit.ebe_kappas = cold_kappas
-            .iter()
-            .map(|occ| occ.iter().map(|k| k.add_scalar(0.1)).collect())
-            .collect();
+        fit.ebe_kappas =
+            cold_kappas.iter().map(|occ| occ.iter().map(|k| k.add_scalar(0.1)).collect()).collect();
         assert!(fit.ebe_kappas != cold_kappas, "premise: reported κ̂ differ");
         let (etas, _, kappas) = reported_ebe_inputs(&fit, &model, &population, &params, &options);
         let reported: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();
