@@ -355,8 +355,8 @@ fn a_check_that_could_not_run_is_reported_not_silent() {
     assert_eq!(classified.severity, WarningSeverity::Warning);
 }
 
-/// A kept clamp or a kept unfinished segment makes a pass unclean, by name; a clamp or stop in
-/// an `auto` attempt the guard discarded does not.
+/// A kept clamp, a kept unfinished segment or an abandoned walk makes a pass unclean, by name;
+/// a clamp or stop in an `auto` attempt the guard discarded does not.
 #[test]
 fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
     use crate::ode::solver::OdeSolverStats;
@@ -399,6 +399,15 @@ fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
                 ..Default::default()
             },
             "3 unfinished segments",
+        ),
+        (
+            // An abandoned walk starts no segment, so it is not among the unfinished ones
+            // (#1234): it must be reported on its own.
+            OdeSolverStats {
+                abandoned_non_finite_timeline: 2,
+                ..Default::default()
+            },
+            "2 abandoned non-finite timelines",
         ),
     ] {
         assert_eq!(unclean_integration(&st).as_deref(), Some(want));

@@ -141,14 +141,18 @@ pub(crate) fn tightened_override(
 }
 
 /// Whether the trajectories a re-scored pass **kept** were integrated, not padded (#2994
-/// review r2): no segment left unfinished and no step force-accepted at `min_dt`. Either
-/// returns a finite trajectory (or a sentinel-clamped objective) that never met the tolerance,
-/// so a small shift from it would read as a settled objective. A stiff-aborted or diverged
-/// segment is an unfinished one, so it is caught here too; an `auto` attempt the guard
-/// discarded and re-solved cleanly does not count. The same two counters
-/// `with_fd_jacobian_integration` accepts its tight pass on, so a finite-difference `H` the
-/// pass kept is clean by this test by construction and needs no separate accounting. `None`
-/// when clean, else the counters that were not, for the warning.
+/// review r2): no segment left unfinished, no step force-accepted at `min_dt`, and no
+/// prediction walk abandoned before integrating. Each returns a finite trajectory (or a
+/// sentinel-clamped objective) that never met the tolerance, so a small shift from it would
+/// read as a settled objective. A stiff-aborted or diverged segment is an unfinished one, so it
+/// is caught by that counter; an abandoned walk (an unorderable timeline, #1234) never starts
+/// a segment, so it has its own; an `auto` attempt the guard discarded and re-solved cleanly
+/// does not count.
+///
+/// `with_fd_jacobian_integration` keeps its tight pass only when that pass has no kept clamp,
+/// no kept unfinished segment and a finite `H`, and an abandoned walk's predictions are `NaN`,
+/// so a kept finite-difference `H` is clean by this test by construction and needs no separate
+/// accounting. `None` when clean, else the counters that were not, for the warning.
 pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Option<String> {
     let parts: Vec<String> = [
         (
@@ -156,6 +160,10 @@ pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Op
             "steps clamped at the minimum step size",
         ),
         (st.kept_unfinished_segments(), "unfinished segments"),
+        (
+            st.abandoned_non_finite_timeline,
+            "abandoned non-finite timelines",
+        ),
     ]
     .into_iter()
     .filter(|(n, _)| *n > 0)
@@ -318,11 +326,11 @@ fn score_subject(
     options: &FitOptions,
 ) -> f64 {
     match options.agq_nodes() {
-        Some(n_nodes) => crate::estimation::agq::agq_subject_nll_at_mode(
+        Some(n_nodes) => crate::estimation::agq::agq_subject_term(
             model,
             subject,
             params,
-            eta,
+            eta.as_slice(),
             kappas,
             n_nodes,
             options.hessian_anchor(),
