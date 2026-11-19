@@ -147,8 +147,8 @@ fn test_iov_foce_lbfgs() {
     assert_iov_fit_ok(&result);
 }
 
-/// `nlopt_lbfgs`, `mma` and `bfgs` ran all 60 outer iterations on this fixture (39–55 s each,
-/// measured locally), while `assert_iov_fit_ok` needs only a finite objective and the IOV
+/// `nlopt_lbfgs`, `mma` and `bfgs` ran up to 60 outer iterations on this fixture (`bfgs` 8.1 s
+/// one-threaded, 0.65 s capped; 39–55 s each in a loaded 8-thread run), while `assert_iov_fit_ok` needs only a finite objective and the IOV
 /// outputs, which the first outer steps already produce. The cap keeps each optimizer's IOV
 /// path covered per PR; IOV convergence stays pinned by the slow-tests fits below.
 const OPTIMIZER_SMOKE_ITERS: usize = 5;
