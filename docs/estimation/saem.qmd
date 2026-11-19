@@ -36,7 +36,7 @@ Default: 1000 iterations (NONMEM's `NITER` default).
 
 ### Chains {#chains}
 
-`n_chains` (default **2**, NONMEM's `ISAMPLE=2`) independent η chains are run per subject. Each SAEM iteration draws one η per chain, and the sufficient statistics and the M-step use all of them, which lowers the Monte Carlo noise of every iteration. It is implemented the way Monolix describes its chains — the data set is replicated `n_chains` times for the SAEM iterations (chain 1 keeps the subjects' own random streams), and the final EBEs, OFV and covariance step use the original subjects. (Monolix's own default is to add chains until at least 50 subjects are sampled, `minIndivForChains = 50`.) With the automatic exploration stop and 1000 averaging iterations, two chains against one: pk2_big stand-in +1.22 → **+0.73** (mean gap, 10 seeds; sd 0.51 → 0.28), `warfarin_iov_saem` (10 subjects) +0.42 → **+0.11** (sd 0.56 → 0.10), at 2.5–3× the CPU per fit. On `two_cpt_oral_cov` two chains ended a little more often in a ridge region around $\omega^2_{V1}$ ≈ 0.15 (about +2, against the optimum's 0.11; importance-sampled estimation started there walks back to the optimum) — both chain counts reach it and the deeper V1–KA trap on some seeds, so it is a property of that surface, not of the chains: one chain on the data set duplicated is bit-for-bit the two-chain fit. Set `n_chains = 1` for the single-chain SAEM.
+`n_chains` (default **2**, NONMEM's `ISAMPLE=2`) independent η chains are run per subject. Each SAEM iteration draws one η per chain, and the sufficient statistics and the M-step use all of them, which lowers the Monte Carlo noise of every iteration. It is implemented the way Monolix describes its chains — the data set is replicated `n_chains` times for the SAEM iterations (chain 1 keeps the subjects' own random streams), and the final EBEs, OFV and covariance step use the original subjects. (Monolix's own default is to add chains until at least 50 subjects are sampled, `minIndivForChains = 50`.) With the automatic exploration stop and 1000 averaging iterations, two chains against one (measured on the base before main's hashed streams): pk2_big stand-in +1.22 → **+0.73** (mean gap, 10 seeds; sd 0.51 → 0.28), `warfarin_iov_saem` (10 subjects) +0.42 → **+0.11** (sd 0.56 → 0.10). A second chain costs ~1.9× per iteration: the copies are registered with the fit's kernel-JIT scope, so their plan keys are read by address rather than re-hashed per likelihood evaluation (unregistered, they cost 2.5–3×). On `two_cpt_oral_cov` two chains ended a little more often in a ridge region around $\omega^2_{V1}$ ≈ 0.15 (about +2, against the optimum's 0.11; importance-sampled estimation started there walks back to the optimum) — both chain counts reach it and the deeper V1–KA trap on some seeds, so it is a property of that surface, not of the chains: one chain on the data set duplicated is bit-for-bit the two-chain fit. Set `n_chains = 1` for the single-chain SAEM.
 
 ### The exploration stop {#exploration-stop}
 
@@ -58,17 +58,21 @@ Monolix ends exploration by an automatic stop (on by default) between a minimum 
 
 A public stand-in for `pk2_big` (2-cpt oral, block Ω on CL/V1, true $\omega^2_Q$ = 0.003 started at 0.08, 300 subjects × 6 samples), the `warfarin_iov_saem` example (10 subjects) and the 5-η `two_cpt_oral_cov` example (30 subjects); `--threads 2`, gap = importance-sampled −2 log L (3000 samples) above the best value reached — for the stand-in, an IMP estimate started from FOCEI (−4802.85, $\omega^2_Q$ 0.0057). Mean gap over seeds:
 
-| set (seeds) | old default: 150 + 250, 1 chain | automatic + 1000, 1 chain | **default: automatic + 1000, 2 chains** | K1 (default) | CPU / fit: old → default |
-|---|---|---|---|---|---|
-| pk2s (10) | +4.85 | +1.22 | **+0.73** | 1190–3150 | 7.1 → 51 s |
-| wiov (5) | +0.20 | +0.42 | **+0.11** | 500–800 | 1.0 → 5.9 s |
-| two_cpt_oral_cov (20) | 9 / 20 seeds within 0.5 of the optimum at 1 chain, ~5 / 20 within 0.6 at 2 chains; about half of all seeds end in the V1–KA trap under every schedule | | | 500–860 | 0.9 → 4.4 s |
+Measured on ferx with these defaults merged onto main (hashed SAEM streams, `mstep_optimizer = auto`):
+
+| set (seeds) | old default: 150 + 250, 1 chain | **default: automatic + 1000, 2 chains** | K1 (default) | CPU / fit: old → default |
+|---|---|---|---|---|
+| pk2s (10) | +4.63 (sd 1.06) | **+0.18** (sd 0.19) | 1300–4000 (2 seeds reach the maximum and warn) | 6.1 → 28.9 s |
+| wiov (5) | +0.82 (sd 0.50) | **+0.14** (sd 0.12) | 540–580 | 1.0 → 2.7 s |
+| two_cpt_oral_cov (20) | 10 / 20 within 0.5 of the optimum, 9 / 20 in the V1–KA trap (> +5) | 7 / 20 within 0.5, 12 / 20 in the trap | 490–890 | 0.8 → 3.1 s |
+
+`two_cpt_oral_cov` ends in a V1–KA trade-off mode on about half the seeds under either schedule; the difference between the two (3 seeds of 20) is within binomial noise, but leans the way two chains' lower per-iteration noise would suggest (less of the wandering that lets a single chain leave the ridge). On the earlier base, one chain against two at the new schedule measured +1.22 → +0.73 on pk2s and +0.42 → +0.11 on wiov.
 
 Fixed exploration lengths, measured with 250 averaging iterations on the stand-in (15 seeds, median gap): 150 → +5.17, 500 → +2.00, 1500 → +1.97; the 100-iteration batch-means rule this replaces, +3.00.
 
 #### Maximum and smoothing exponent {#exploration-stop-max}
 
-**Maximum.** 4000, NONMEM's `NBURN` under `AUTO=1`. The stand-in stopped at 1190–3150 with two chains; the longest test window is 500, so a maximum near 500 would turn the rule into a fixed length for any coordinate with an autocorrelation time of 50 or more.
+**Maximum.** 4000, NONMEM's `NBURN` under `AUTO=1`. The stand-in stopped at 1300–4000 with two chains (2 of 10 seeds at the maximum, with the warning naming what still drifted); the longest test window is 500, so a maximum near 500 would turn the rule into a fixed length for any coordinate with an autocorrelation time of 50 or more.
 
 **Smoothing exponent.** `smoothing_exponent = 0.7` (Monolix's $\gamma_k = 1/(k-K_1)^{0.7}$) was measured with the earlier 150–500 rule and is *not* the default, because it was worse on an easy model: wiov +0.08 → +0.45 (median gap), pk1 +0.04 → +0.05, pk1_sparse +2.53 → +2.91, against pk2_big +2.94 → +2.54 and corr +0.16 → +0.11. The option is there for users who want it.
 
