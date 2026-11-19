@@ -371,10 +371,18 @@ fn ferx_engines_agree_on_a_steady_state_infusion_with_a_lagtime_past_the_interva
 // ---------------------------------------------------------------------------
 
 /// ferx FOCEI OFV at the same fixed parameters NONMEM evaluated (`maxiter = 0`,
-/// covariance off — both set in the `.ferx` files).
+/// covariance off — both set in the `.ferx` files), with no steady-state warning: the estimates
+/// have one, though on `ss_lag_ge_ii` the EBE search probes `CL ≈ 1e-46`, where none exists
+/// (#1522).
 fn ferx_ofv(model: &str, data: &str) -> f64 {
     let (result, _pop) = ferx_core::run_model_with_data(&anchor(model), Some(&anchor(data)))
         .expect("the anchor model and dataset load and evaluate");
+    let ss: Vec<_> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("(SS=1)"))
+        .collect();
+    assert!(ss.is_empty(), "{model} on {data}: {ss:?}");
     result.ofv
 }
 

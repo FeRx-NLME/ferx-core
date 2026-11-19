@@ -775,9 +775,10 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 /// `ode_predictions_*` variant and its callers would be a wide, invasive change for a rare
 /// diagnostic, and a thread-local would be lost on the rayon worker threads. So the message —
 /// written only on the rare non-converged nonlinear branch — is deduplicated into this cross-thread
-/// map, one set per *run* (the id the pool tasks carry as their fit, [`run_scope`]), and drained by every `api` boundary that returns a `warnings` channel — `fit`,
-/// `simulate_with_options_diag`, `simulate_with_uncertainty_diag`, `predict_diag` and the adaptive
-/// driver behind `simulate_adaptive` / `simulate_adaptive_from_spec` (#1652) — via
+/// map, one set per *run* (the id the pool tasks carry as their fit, [`run_scope`]), and drained by
+/// every `api` boundary that returns a `warnings` channel — `fit` (which reports only its pass at
+/// the estimates, [`ss_notes_at_estimates`], #1522), `simulate_with_options_diag`,
+/// `simulate_with_uncertainty_diag`, `predict_diag` and the adaptive driver behind `simulate_adaptive` / `simulate_adaptive_from_spec` (#1652) — via
 /// [`take_ss_nonconvergence_warnings`]. Bare `predict()` / `simulate()` are wrappers over their
 /// `_diag` forms, so they drain too and discard the note with the rest of the diagnostics.
 ///
@@ -854,10 +855,44 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
     // records — see `record_ss_nonconvergence_warning`.
     record_ss_nonconvergence_warning(warning.as_deref());
     if let Some(msg) = warning {
+        let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
+        if let Some(set) = ss_at_estimates()
+            .lock()
+            .as_mut()
+            .ok()
+            .and_then(|m| m.get_mut(&fit))
+        {
+            set.insert(msg.clone());
+        }
         if let Ok(mut m) = ss_nonconvergence_sink().lock() {
             m.entry(ss_run_key()).or_default().insert(msg);
         }
     }
+}
+
+/// The fits collecting the notes of their pass at the reported estimates, and those notes
+/// ([`ss_notes_at_estimates`]).
+fn ss_at_estimates() -> &'static SsSink {
+    static AT: std::sync::OnceLock<SsSink> = std::sync::OnceLock::new();
+    AT.get_or_init(std::sync::Mutex::default)
+}
+
+/// `f`, run by the calling thread's fit, with the SS non-convergence notes its predictions write
+/// (its pool tasks carry the fit). A fit reports these, from its pass at the estimates, and not
+/// the run's: those also hold the trial points its searches visited, where an `η` far out can
+/// leave no periodic steady state at all — on #1522's linear model a line-search probe at
+/// `CL ≈ 1e-46` — while the estimates have one.
+pub(crate) fn ss_notes_at_estimates<R>(f: impl FnOnce() -> R) -> (R, Vec<String>) {
+    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
+    let at = || {
+        ss_at_estimates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    at().insert(fit, Default::default());
+    let r = f();
+    let notes = at().remove(&fit).unwrap_or_default();
+    (r, notes.into_iter().collect())
 }
 
 /// Build the #867 non-convergence warning from the last two **absolute** cycle increments and the
@@ -994,6 +1029,31 @@ mod ss_warn_tests {
         note_ss_nonconvergence_if_capped(true, 1.0, 2.0, 10.0);
         assert_eq!(last_ss_equilibration_warning(), None);
         assert!(!last_ss_equilibration_warned());
+    }
+
+    /// #1522: a fit reports the notes of its pass at the estimates, including one a pool task of
+    /// its fit writes, and not a note its search wrote before the pass or another fit wrote during
+    /// it. Mutation: write only the run's bucket -> no notes; drop the fit-id check -> the other
+    /// fit's note is among them.
+    #[test]
+    fn a_fit_reports_only_the_notes_of_its_pass_at_the_estimates() {
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::{current_fit, in_fit};
+        // Each note's ratio (`last` over a previous increment of 1) names its writer.
+        let note = |last: f64| note_ss_nonconvergence_if_capped(false, 1.0, last, 10.0);
+        let _run = run_scope();
+        let fit = current_fit();
+        note(4.0);
+        let ((), notes) = ss_notes_at_estimates(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| in_fit(fit, || note(2.0)));
+                s.spawn(|| {
+                    let _other = run_scope();
+                    note(3.0)
+                });
+            })
+        });
+        let want = ss_equilibration_tail_warning(false, 1.0, 2.0, 10.0).unwrap();
+        assert_eq!(notes, vec![want]);
     }
 
     /// #2067: two runs open at once keep their notes apart, including a note written by a pool

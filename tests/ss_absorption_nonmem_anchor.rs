@@ -311,9 +311,9 @@ fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
 
 /// The blocking-bug regression (#874 review): `n_starts` defaults to `1`, so a plain `fit()` takes
 /// the single-start fast path — which must drain the SS non-convergence sink into
-/// `FitResult.warnings`, not just the multi-start arm. A couple of outer iterations run enough
-/// objective prediction passes to populate the sink; no convergence loop is needed (Tier-2), and
-/// covariance is off to keep it quick.
+/// `FitResult.warnings`, not just the multi-start arm. A fit reports the notes of its pass at the
+/// estimates (#1522), so it is evaluated at the start, where `VMAX = 10` is below the mean input
+/// `100/8`; covariance is off to keep it quick.
 #[test]
 fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
     // Serialize against the other SS tests in this binary (#1113).
@@ -323,7 +323,7 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
         .expect("dataset loads");
 
     let mut opts = parsed.fit_options;
-    opts.outer_maxiter = 2;
+    opts.outer_maxiter = 0;
     opts.run_covariance_step = false;
 
     let result = fit(&model, &population, &model.default_params, &opts).expect("fit returns Ok");
@@ -359,7 +359,7 @@ fn concurrent_fits_each_report_only_their_own_ss_notes() {
         .expect("dataset loads");
     let notes = |parsed: &ferx_core::types::ParsedModel| -> Vec<String> {
         let mut opts = parsed.fit_options.clone();
-        opts.outer_maxiter = 3;
+        opts.outer_maxiter = 0;
         opts.run_covariance_step = false;
         let r = fit(
             &parsed.model,
