@@ -2555,6 +2555,9 @@ pub(crate) struct InnerRecording {
     pub(crate) passes: Vec<PassRecord>,
     /// Every warm-start prediction the outer loop handed a pass (#2549).
     pub(crate) predictions: Vec<PredictionRecord>,
+    /// Every terminal η-Jacobian [`ebe_h_matrix`] recorded afresh on the analytic route (no
+    /// held or captured rows to reuse): its subject.
+    pub(crate) fresh_jacobians: Vec<String>,
     n_passes: usize,
     current_pass: Option<usize>,
 }
@@ -3426,9 +3429,22 @@ fn find_ebe_solve(
             fresh
         })
         .flatten();
-    // The seed wrote its own rows into the buffer.
-    if let Some(k) = rows_at.borrow_mut().as_mut() {
-        k.clear();
+    // A seed that hands back a fused first gradient took it on the light path, whose rows in
+    // the buffer are the `exact_obs_grads_in` recording at exactly this `eta`, the one
+    // `ebe_h_matrix` would repeat. They are held for the terminal Jacobian like an analytic
+    // gradient's, so a warm solve that returns its start records the subject once, not
+    // twice. Any other seed (the carried Hessian, the full one, a light pass that declined
+    // after writing) leaves rows that are not this point's, or none: the key is cleared.
+    {
+        let fused_rows = use_analytic && matches!(seed, Some((_, Some(_))));
+        let mut held = rows_at.borrow_mut();
+        if fused_rows {
+            let key = held.get_or_insert_with(Vec::new);
+            key.clear();
+            key.extend(eta.iter().map(|v| v.to_bits()));
+        } else if let Some(k) = held.as_mut() {
+            k.clear();
+        }
     }
     let initial_hessian = seed.map(|(hessian, gradient)| {
         if use_analytic {
@@ -3909,6 +3925,10 @@ fn ebe_h_matrix(
     let n_eta = model.n_eta;
     let t_jac = GRADIENT_TIMINGS.start();
     let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
+        #[cfg(test)]
+        if captured_jac.is_none() {
+            with_recording(|r| r.fresh_jacobians.push(subject.id.clone()));
+        }
         match captured_jac {
             Some(jac) => Some(jac),
             None => crate::sens::ode_provider::adjoint::exact_obs_grads(
