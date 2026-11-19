@@ -51,10 +51,17 @@
 //!   takes `D1 = X` and `D1 = 0.5 + 0.1·TIME` from the governing record, where the
 //!   parent-row rule is 6.50 and 6.97 off. Its `RATE=-1` subjects are left out (see the
 //!   test).
+//! * `addl_endpoint` (#2368): an endpoint row, or a row skipped for its missing DV, is a
+//!   record of the PK model, so it governs an implied dose as `addl_tie`'s rows do. The
+//!   `addl_tie` model with a binary endpoint on CMT 3 (see the `.ctl` for the seven cases);
+//!   NONMEM reads those rows as `MDV=1` records. Both twins match the `.tab` exactly (macOS
+//!   arm64). With those rows not records, a closed form is up to 2.03 off. NONMEM 7.5.1,
+//!   `.tab` at 17 significant figures.
 //!
 //! Tier 2: one `predict()` per anchor.
 
-use ferx_core::{parse_model_file, predict, read_nonmem_csv};
+use ferx_core::api::read_population_for;
+use ferx_core::{parse_model_file, predict};
 use std::path::Path;
 
 /// `(ID, TIME, PRED)` of every scored observation in `nonmem_anchor/results/<name>.tab`.
@@ -112,7 +119,9 @@ fn worst_pred_error_on(
     let model_path = format!("nonmem_anchor/{twin}_fit.ferx");
     let model = parse_model_file(Path::new(&model_path)).unwrap_or_else(|e| panic!("{e}"));
     let csv = format!("nonmem_anchor/{csv}.csv");
-    let pop = read_nonmem_csv(Path::new(&csv), None, None).unwrap_or_else(|e| panic!("{e}"));
+    // Routed, so an endpoint's rows reach `obs_records` (#2368).
+    let (pop, _) = read_population_for(&model, &None, &csv, None, None, None, &[])
+        .unwrap_or_else(|e| panic!("{e}"));
     for &(id, want) in pk_only {
         let s = pop.subjects.iter().find(|s| s.id == id).expect("subject");
         let got = &s.pk_only_times;
@@ -220,6 +229,29 @@ fn an_addl_implied_dose_runs_under_the_record_that_ends_its_interval_matches_non
     worst_pred_error("addl_tie", "addl_tie_ode", "addl_tie", pk_only);
 }
 
+#[cfg(feature = "survival")]
+#[test]
+fn an_endpoint_or_missing_dv_row_governs_an_addl_implied_dose_matches_nonmem() {
+    // ID 7's endpoint row at 0 leads every other record, so it is not one.
+    let at15: &[f64] = &[15.0];
+    let pk_only: &[(&str, &[f64])] = &[
+        ("1", &[12.0]),
+        ("2", at15),
+        ("3", at15),
+        ("4", at15),
+        ("5", at15),
+        ("6", &[15.0, 24.0]),
+        ("7", at15),
+    ];
+    worst_pred_error("addl_endpoint", "addl_endpoint", "addl_endpoint", pk_only);
+    worst_pred_error(
+        "addl_endpoint",
+        "addl_endpoint_ode",
+        "addl_endpoint",
+        pk_only,
+    );
+}
+
 #[test]
 fn an_addl_implied_dose_takes_f_and_time_from_the_governing_record_and_lag_from_its_parent_matches_nonmem(
 ) {
@@ -290,9 +322,8 @@ fn pred_tol(anchor: &str, twin: &str) -> f64 {
     }
     match anchor {
         "evid2_clock" | "tied_evid2" | "tied_evid2_advan1" => PRED_TOL,
-        "addl_tie" | "addl_f" | "addl_lag" | "addl_ftime" | "addl_lagt" | "addl_dx" | "addl_dt" => {
-            PRED_TOL_17
-        }
+        "addl_tie" | "addl_f" | "addl_lag" | "addl_ftime" | "addl_lagt" | "addl_dx" | "addl_dt"
+        | "addl_endpoint" => PRED_TOL_17,
         other => panic!("{other}: no PRED bound; name its `.tab` precision in `pred_tol`"),
     }
 }

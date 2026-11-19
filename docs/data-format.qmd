@@ -19,14 +19,18 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 > value (e.g. a calendar/clock time). Integration starts at each subject's first
 > record — matching NONMEM — so an off-zero start is **not** integrated over a
 > phantom `[0, first record]` window. A record is any row the reader keeps: a
-> dose, a scored observation, a reset, an `EVID=2` row, or an `EVID=0` row with
-> `MDV=1`. So on an `[odes]` model whose state moves before the first observation
+> dose, an observation of any endpoint, a reset, an `EVID=2` row, or an `EVID=0` row
+> with `MDV=1`, which includes one skipped for a missing `DV` (`W_MISSING_DV`, below).
+> So on an `[odes]` model whose state moves before the first observation
 > (a production term, `TIME` in the right-hand side, an `init()` that is not an
 > equilibrium), a leading covariate-marker row is where the clock starts. Before
 > [#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809) such a row was
 > dropped on a subject whose covariates were all constant, and an `MDV=1` row on
-> every subject, and integration started at the first observation or dose. A row
-> skipped for a missing `DV` (`W_MISSING_DV`, below) is not a record. `TIME` is used exactly as written
+> every subject, and integration started at the first observation or dose. Before
+> [#2368](https://github.com/FeRx-NLME/ferx-core/issues/2368) a time-to-event, count or
+> discrete-state row, and a row skipped for a missing `DV`, were not records of the PK
+> model either. An endpoint row ahead of every other record still is not one, so a
+> subject with only endpoint rows integrates from 0. `TIME` is used exactly as written
 > everywhere it is visible: the model `TIME`/`T` builtin, `[derived]` columns,
 > the survival left-truncation `TENTRY`, and the sdtab / `predict()` /
 > `simulate()` output. ferx does not re-base `TIME` onto a per-subject elapsed
@@ -61,8 +65,9 @@ ferx-core reads data in NONMEM-compatible CSV format. This is the standard forma
 > likelihood only when its `DV` is present. If the `DV` is missing
 > (`.`, `NA`, or blank), mark the row `MDV=1`. As a safety net, ferx also treats
 > an `EVID=0` row with a missing `DV` as `MDV=1` even when the flag is absent —
-> the row is skipped rather than scored as `DV=0` — and emits a single
-> `W_MISSING_DV` warning reporting how many rows were skipped. Set `MDV=1`
+> the row is skipped rather than scored as `DV=0`, and kept as a record like any
+> `MDV=1` row — and emits a single `W_MISSING_DV` warning reporting how many rows
+> were skipped. Set `MDV=1`
 > explicitly to silence it, or fix the data if the missing values are an error.
 >
 > **Simulation reads it the other way round.** When the dataset is a *design*
