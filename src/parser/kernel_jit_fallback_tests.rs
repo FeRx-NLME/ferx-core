@@ -227,6 +227,8 @@ fn saem_falls_back_to_fd() {
         saem_seed: Some(3),
         // Every θ through the M-step's numerical score, not the mu-referenced closed form.
         mu_referencing: false,
+        // The 1e-6 SE gate was set on the single-chain run (#2986 made two the default).
+        saem_n_chains: 1,
         ..opts(EstimationMethod::Saem)
     };
     let (e, f) = pair(&m, &p, &o);

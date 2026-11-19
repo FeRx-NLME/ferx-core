@@ -7040,6 +7040,7 @@ pub fn run_saem(
         state.etas.truncate(n_subjects_data);
         state.kappas.truncate(n_subjects_data);
         state.nll_cache.truncate(n_subjects_data);
+        state.step_scales.truncate(n_subjects_data);
         hmc_subjects.truncate(n_subjects_data);
         if let Some(mix) = saem_mix.as_mut() {
             mix.classes.truncate(n_subjects_data);

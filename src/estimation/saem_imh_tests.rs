@@ -1192,6 +1192,9 @@ fn imh_opts(seed: u64) -> FitOptions {
         run_covariance_step: false,
         saem_kernel: SaemKernel::Imh,
         saem_imh_refresh: 2,
+        // These tests count kernel work per subject per iteration; one chain keeps
+        // the count the subjects' own (two would double it, #2986).
+        saem_n_chains: 1,
         ..Default::default()
     }
 }
@@ -1894,6 +1897,8 @@ fn the_default_random_walk_fit_matches_main() {
         saem_n_convergence: 8,
         saem_seed: Some(11),
         run_covariance_step: false,
+        // Pinned against main's single-chain trajectory (#2986 made two the default).
+        saem_n_chains: 1,
         ..Default::default()
     };
     let r = run_saem(&model, &pop, &model.default_params, &opts).expect("SAEM runs");

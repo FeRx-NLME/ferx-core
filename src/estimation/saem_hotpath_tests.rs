@@ -1074,6 +1074,9 @@ fn the_score_sa_mstep_rebuilds_the_event_schedule() {
     let n = pop.subjects.len() as u64;
     let short = FitOptions {
         saem_mstep_solver: crate::types::SaemMstepSolver::ScoreSa,
+        // One rebuild per *data* subject per iteration is what is counted; a second
+        // chain would add one per copy (#2986).
+        saem_n_chains: 1,
         ..saem_opts()
     };
     let long = FitOptions {
