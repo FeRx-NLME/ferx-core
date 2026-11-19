@@ -4311,6 +4311,14 @@ pub fn run_saem(
     } else {
         population
     };
+    // The copies are new `Subject` objects: register them with the fit (joining its scope,
+    // as `impmap` does for its population) so the kernel JIT reads each one's plan key by
+    // address. Unregistered, every likelihood evaluation re-serialises and hashes the whole
+    // subject to find its plan — measured at ~28 % of a two-chain SAEM run (#2986). Held
+    // until `run_saem` returns; declared after the copies, so dropped before them.
+    let _chain_prints = (n_chains > 1).then(|| {
+        crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects)
+    });
     let n_subjects = population.subjects.len();
     let n_eta = model.n_eta;
     // Run-time backstop for callers that bypass `check_model_options`

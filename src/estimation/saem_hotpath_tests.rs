@@ -1370,3 +1370,65 @@ fn e_step_prep_is_built_inside_the_drawn_mixture_class() {
         .expect("mixture SAEM run must succeed");
     assert!(r.ofv.is_finite(), "mixture SAEM produced a non-finite OFV");
 }
+
+/// #2986: the chain copies `run_saem` builds are registered with the fit, so the kernel JIT
+/// reads each one's plan key by address. Unregistered, every likelihood evaluation
+/// fingerprints the whole subject again (measured at ~28 % of a two-chain run). A fit
+/// fingerprints each data subject once (`fit`'s registration) and each copy once (the
+/// chains'), so at most three per subject with two chains — not one per evaluation.
+#[test]
+fn chain_copies_are_fingerprinted_once_not_per_evaluation() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::{
+        SUBJECT_DESC_MARK, SUBJECT_DESC_MARKED,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    // The pk2_big shape whose profile showed it: a two-compartment oral model with
+    // allometric covariates, evaluated through the planned (kernel-JIT) path.
+    let model = parse_model_string(
+        r"
+[parameters]
+  theta TVCL(3.0, 0.5, 30.0)
+  theta TVV1(20.0, 2.0, 200.0)
+  theta TVQ(5.0, 0.5, 50.0)
+  theta TVV2(40.0, 2.0, 400.0)
+  theta TVKA(1.0, 0.05, 10.0)
+  theta B_CL(0.75, 0.0, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V1 ~ 0.05
+  sigma PROP ~ 0.04
+
+[individual_parameters]
+  CL = TVCL * (WT / 70)^B_CL * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70) * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+    )
+    .expect("two-compartment covariate model parses");
+    let mut pop = baseline_cov_population();
+    for s in &mut pop.subjects {
+        s.id = format!("{SUBJECT_DESC_MARK}{}", s.id);
+    }
+    let n = pop.subjects.len();
+    let opts = FitOptions {
+        method: crate::types::EstimationMethod::Saem,
+        saem_n_chains: 2,
+        run_covariance_step: false,
+        ..saem_opts()
+    };
+    let before = SUBJECT_DESC_MARKED.load(Relaxed);
+    crate::fit(&model, &pop, &model.default_params, &opts).expect("SAEM fit");
+    let calls = SUBJECT_DESC_MARKED.load(Relaxed) - before;
+    assert!(
+        calls <= 3 * n,
+        "{calls} subject fingerprints for {n} subjects × 2 chains: the chain copies are not \
+         registered, so every likelihood evaluation re-hashes its subject"
+    );
+}
