@@ -10,6 +10,8 @@
 //! `TVCL = 6` while `CL = 12`) and each one asserts the placeholder is actually present —
 //! `pk_indices[TVCL] == 0` next to `pk.values[0] == 12.0` — so a fixture that stops
 //! reaching the defect fails rather than passing vacuously.
+#[allow(unused_imports)]
+use ferx_model::internal::*;
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -364,7 +366,7 @@ fn synthetic_readout_params_hidden_from_the_value_map() {
 fn hand_built_model_without_a_program_falls_back_to_the_slot_read() {
     let mut model = crate::types::test_helpers::analytical_model(GradientMethod::Auto);
     assert!(
-        model.indiv_param_partials.indiv_param_program.is_none(),
+        model.indiv_param_partials.indiv_param_program().is_none(),
         "the shared fixture must stay program-free, or this tests the wrong branch"
     );
     model.indiv_param_names = vec!["CL".into(), "V".into()];

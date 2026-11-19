@@ -144,7 +144,7 @@ fn a_model_reading_time_shares_nothing() {
 #[test]
 fn a_model_without_an_individual_parameter_program_shares_nothing() {
     let model = cl_from_cr_model();
-    assert!(model.indiv_param_partials.indiv_param_program.is_none());
+    assert!(model.indiv_param_partials.indiv_param_program().is_none());
     let m = covs(&[("CR", 1.0)]);
     let records = [(None, &m), (None, &m), (Some(0), &m)];
     assert_eq!(first_record_with_same_pk_inputs(&model, records.iter().copied()), None);

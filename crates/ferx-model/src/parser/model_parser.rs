@@ -23375,7 +23375,7 @@ pub enum LevelContrast {
 }
 
 impl LevelContrast {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::SumToZero => "sum_to_zero",
@@ -23408,13 +23408,13 @@ impl LevelContrast {
 /// re-parses with a [`LevelBinding`] in hand.
 #[derive(Debug, Clone)]
 pub struct LevelBlockDecl {
-    pub name: String,
+    pub(crate) name: String,
     /// Data columns whose observed combinations define the levels. A column
     /// named `TIME` is the record time, not a covariate.
-    pub columns: Vec<String>,
-    pub contrast: LevelContrast,
+    pub(crate) columns: Vec<String>,
+    pub(crate) contrast: LevelContrast,
     /// Resolved labels in gather order. Empty until the data-bound reparse.
-    pub labels: Vec<String>,
+    pub(crate) labels: Vec<String>,
     /// Set by the parse: some expression — an `[individual_parameters]`
     /// assignment or the `y` readout — reads this block *and* a random effect,
     /// directly or through a variable (#1642). States carry no taint here.
@@ -32935,7 +32935,7 @@ pub struct IndivParamPartials {
     /// partials — and the selector rows name no parameter. A consumer MUST
     /// look partials up by name (`rposition`), never zip them positionally
     /// against `indiv_param_names`.
-    pub names: Vec<String>,
+    pub(crate) names: Vec<String>,
     /// `d_d_theta[i][k]` = ∂P_i/∂θ_k. Inner Vec length = `n_theta_base`
     /// (user-declared θ count, NOT including NN-weight or diffusion θ which
     /// indiv params don't reference). Each Expression is in resolved form.
@@ -32984,7 +32984,7 @@ pub struct IndivParamPartials {
     /// this field IS consumed at runtime by `sens::provider` and the adjoint. `None` for
     /// hand-built fixtures and when no `[individual_parameters]` block exists;
     /// the ODE provider reads its own copy from `ode_spec`.
-    pub indiv_param_program: Option<IndivParamProgram>,
+    pub(crate) indiv_param_program: Option<IndivParamProgram>,
     /// Additive parser metadata kept behind this existing opaque public field.
     pub(crate) theta_blocks: ThetaBlocks,
     /// PK slots an analytical `pk(...)` line binds to a numeric **literal**
@@ -33001,7 +33001,7 @@ pub struct IndivParamPartials {
     /// The data-derived bindings the parse compiled this model from (#1621).
     /// Written only by `parse_full_model_with`; read through
     /// [`crate::types::CompiledModel::data_bindings`]. Empty for hand-built fixtures.
-    pub data_bindings: DataBindings,
+    pub(crate) data_bindings: DataBindings,
     /// Whether this model was laid out on a **fit's** data-derived bindings
     /// (#1730): set by `FitLayout::apply` (`bind_from_fit`, `layout_from_fit`) and
     /// the deprecated `bind_theta_levels_from_fit`, never by the parse. Read through

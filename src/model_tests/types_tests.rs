@@ -2091,7 +2091,7 @@ fn dose_event_resolve_rate_modeled_duration_matches_explicit_infusion() {
     assert_eq!(resolved.rate, explicit.rate);
     assert_eq!(resolved.duration, explicit.duration);
     // cmt/time/amt/ss/ii are preserved through resolution.
-    assert_eq!(resolved.cmt, 1);
+    assert_eq!(resolved.cmt(), 1);
     assert_eq!(resolved.amt, 100.0);
 
     // A Fixed dose is returned unchanged (the common, allocation-cheap path).
@@ -2139,7 +2139,7 @@ fn dose_event_resolve_rate_modeled_rate_matches_explicit_infusion() {
     let explicit = DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0);
     assert_eq!(resolved.rate, explicit.rate);
     assert_eq!(resolved.duration, explicit.duration);
-    assert_eq!(resolved.cmt, 1);
+    assert_eq!(resolved.cmt(), 1);
     assert_eq!(resolved.amt, 100.0);
 }
 
@@ -2205,7 +2205,7 @@ fn dose_event_resolve_rate_repels_a_non_finite_duration_or_rate() {
             // `is_real_infusion`'s unresolved tripwire in every engine.
             assert_eq!(r.rate_mode, RateMode::Fixed, "{attr} = {bad}: resolved");
             // The event is still recognisable: amt/cmt/ss/ii are untouched.
-            assert_eq!((r.amt, r.cmt, r.ss, r.ii), (100.0, 1, false, 0.0));
+            assert_eq!((r.amt, r.cmt(), r.ss, r.ii), (100.0, 1, false, 0.0));
         }
 
         // The straddle, and it must straddle under the OLD behaviour too: a
@@ -3783,7 +3783,7 @@ fn pk_slot_rows_fall_back_to_pk_indices_without_a_program() {
     m.indiv_param_names = vec!["CL".into(), "V".into(), "KA".into()];
     m.pk_indices = vec![PK_IDX_CL, PK_IDX_V, PK_IDX_KA];
     assert!(
-        m.indiv_param_partials.indiv_param_program.is_none(),
+        m.indiv_param_partials.indiv_param_program().is_none(),
         "the hand-built fixture must carry no program, or this tests the other arm"
     );
     assert_eq!(m.pk_slot_rows(), vec![(PK_IDX_CL, 0), (PK_IDX_V, 1), (PK_IDX_KA, 2)]);

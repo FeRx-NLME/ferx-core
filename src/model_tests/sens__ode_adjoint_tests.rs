@@ -6355,7 +6355,7 @@ fn unbound_parameter_and_literal_pk_argument_stay_in_recorder_scope() {
          DV ~ proportional(PROP_ERR)\n",
     )
     .unwrap();
-    let prog = model.indiv_param_partials.indiv_param_program.as_ref();
+    let prog = model.indiv_param_partials.indiv_param_program().as_ref();
     eprintln!(
         "closed_form_model_scope={} program={} analytic_param_program={} n_eta_axis={:?} n_eta={} required={:?} prog_slots={:?}",
         crate::sens::provider::closed_form_model_scope(&model),

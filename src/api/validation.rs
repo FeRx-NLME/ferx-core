@@ -3397,7 +3397,7 @@ pub(crate) fn check_survival_time_dependent_pk(model: &CompiledModel) -> Option<
             ", or drop the ODE-accumulated hazard",
         );
     };
-    let Some(program) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+    let Some(program) = model.indiv_param_partials.indiv_param_program().as_ref() else {
         return unanalysable(
             "compiled `[individual_parameters]` program (`CompiledModel::indiv_param_partials`)",
             " rather than replacing that field with `IndivParamPartials::empty()`",

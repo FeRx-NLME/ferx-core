@@ -18164,7 +18164,7 @@ fn eval_partials_along(
     keys.sort();
     let cov_vec: Vec<f64> = keys.iter().map(|k| cov[k.as_str()]).collect();
     let nn_outputs: Vec<Vec<f64>> = Vec::new();
-    let n = partials.names.len();
+    let n = partials.names().len();
     let mut vars = vec![0.0_f64; partials.tangent_base() + n];
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -18249,7 +18249,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
     let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let m = &parsed.model;
     let partials = &m.indiv_param_partials;
-    assert_eq!(partials.names, vec!["CL", "V", "KA"]);
+    assert_eq!(*partials.names(), vec!["CL", "V", "KA"]);
     assert_eq!(partials.d_d_theta().len(), 3);
     assert_eq!(partials.d_d_eta().len(), 3);
     // Each row has length n_theta_base (3) and n_eta_extended (3).
@@ -18272,7 +18272,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
             assert!(
                 (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
                 "∂{}/∂θ_{}: sym={sym}, fd={fd}",
-                partials.names[i],
+                partials.names()[i],
                 k,
             );
             let sym = eval_partial(partials, i, DiffAxis::Eta(k), theta, eta, &cov);
@@ -18280,7 +18280,7 @@ fn indiv_partials_populated_for_1cpt_oral() {
             assert!(
                 (sym - fd).abs() < 1e-6 * sym.abs().max(fd.abs()).max(1e-8),
                 "∂{}/∂η_{}: sym={sym}, fd={fd}",
-                partials.names[i],
+                partials.names()[i],
                 k,
             );
         }
@@ -18322,12 +18322,12 @@ fn indiv_partials_zero_for_cross_axis() {
     // Cross-η partials (indiv i, η k ≠ i).
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
         let v = eval_partial(partials, i, DiffAxis::Eta(k), theta, eta, &cov);
-        assert!(v.abs() < 1e-12, "∂{}/∂η_{} should be 0, got {v}", partials.names[i], k);
+        assert!(v.abs() < 1e-12, "∂{}/∂η_{} should be 0, got {v}", partials.names()[i], k);
     }
     // Cross-θ partials.
     for (i, k) in [(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)] {
         let v = eval_partial(partials, i, DiffAxis::Theta(k), theta, eta, &cov);
-        assert!(v.abs() < 1e-12, "∂{}/∂θ_{} should be 0, got {v}", partials.names[i], k);
+        assert!(v.abs() < 1e-12, "∂{}/∂θ_{} should be 0, got {v}", partials.names()[i], k);
     }
 }
 
@@ -18362,7 +18362,7 @@ fn indiv_partials_logit_inv_logit_chain() {
     let parsed = ferx_model::parser::model_parser::parse_full_model(model_str).unwrap();
     let m = &parsed.model;
     let partials = &m.indiv_param_partials;
-    assert_eq!(partials.names, vec!["CL", "V", "KA", "F"]);
+    assert_eq!(*partials.names(), vec!["CL", "V", "KA", "F"]);
     let theta = &[7.5, 75.0, 1.05, 0.6];
     let eta = &[0.05, -0.1, 0.15, 0.2];
     let cov: HashMap<String, f64> = HashMap::new();
@@ -18427,7 +18427,7 @@ fn indiv_partials_chain_rule_through_intermediate() {
     let partials = &m.indiv_param_partials;
     // ka_mult IS a top-level Assign so it has a row; ordering must match
     // declaration order.
-    assert_eq!(partials.names, vec!["CL", "V", "ka_mult", "KA"]);
+    assert_eq!(*partials.names(), vec!["CL", "V", "ka_mult", "KA"]);
     let theta = &[7.5, 75.0, 1.05, 2.0];
     let eta = &[0.0, 0.0, 0.3]; // η_CL=0, η_V=0, η_KAM=0.3
     let cov: HashMap<String, f64> = HashMap::new();
@@ -19992,7 +19992,7 @@ fn cov_static_mask_classifies_kernel_and_dynamic_tail() {
     let (model, ..) = cov_static_fold_fixture();
     let prog = model
         .indiv_param_partials
-        .indiv_param_program
+        .indiv_param_program()
         .as_ref()
         .expect("indiv param program present");
     // Some slots fold (the covariate/FIXED-θ kernel) …
@@ -20227,7 +20227,7 @@ fn cov_static_else_if_governed_by_earlier_dynamic_condition() {
     let model = parse_model_string(ELSE_IF_DYNAMIC_PRIOR_MODEL).expect("model compiles");
     let prog = model
         .indiv_param_partials
-        .indiv_param_program
+        .indiv_param_program()
         .as_ref()
         .expect("indiv param program present");
     let names = &model.indiv_param_names;
@@ -26056,7 +26056,7 @@ fn eta_independent_split_is_value_preserving_on_every_shape() {
             .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let program = model
             .indiv_param_partials
-            .indiv_param_program
+            .indiv_param_program()
             .as_ref()
             .unwrap_or_else(|| panic!("{name}: no indiv_param_program"));
         let stmts = &program.stmts();
@@ -26150,7 +26150,7 @@ fn hoisted_pk_param_fn_is_bit_identical_under_interleaved_inputs() {
             .unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let program = model
             .indiv_param_partials
-            .indiv_param_program
+            .indiv_param_program()
             .as_ref()
             .unwrap_or_else(|| panic!("{name}: no indiv_param_program"))
             .clone();
@@ -26268,7 +26268,7 @@ fn eta_dependent_statements_shed_their_eta_independent_powers() {
         .map(|(_, b)| b)
         .expect("zoo entry");
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
-    let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
+    let program = model.indiv_param_partials.indiv_param_program().as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
         &program.stmts(),
         program.n_vars(),
@@ -26304,7 +26304,7 @@ fn a_literal_left_subtraction_is_lifted_out_of_an_eta_statement() {
         .map(|(_, b)| b)
         .expect("zoo entry");
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
-    let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
+    let program = model.indiv_param_partials.indiv_param_program().as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
         &program.stmts(),
         program.n_vars(),
@@ -26337,7 +26337,7 @@ fn a_tainted_slot_blocks_the_sub_expression_lift() {
                 \x20 V     = TVV * SCALE^0.5 * exp(ETA_V)\n\
                 \x20 KA    = TVKA\n";
     let model = parse_model_string(&e6_model_text(body)).expect("parse");
-    let program = model.indiv_param_partials.indiv_param_program.as_ref().expect("program");
+    let program = model.indiv_param_partials.indiv_param_program().as_ref().expect("program");
     let split = split_ip_eta_independent_prefix(
         &program.stmts(),
         program.n_vars(),
@@ -26406,8 +26406,8 @@ fn ip_unhoisted_model(src: &str) -> CompiledModel {
     let model = parse_model_string(src).expect("unhoisted parse");
     assert!(
         split_ip_eta_independent_prefix(
-            &model.indiv_param_partials.indiv_param_program.as_ref().expect("program").stmts(),
-            model.indiv_param_partials.indiv_param_program.as_ref().expect("program").n_vars(),
+            &model.indiv_param_partials.indiv_param_program().as_ref().expect("program").stmts(),
+            model.indiv_param_partials.indiv_param_program().as_ref().expect("program").n_vars(),
             model.n_theta,
             model.referenced_covariates.len(),
         )
@@ -26765,8 +26765,8 @@ fn hoist_cache_never_serves_another_models_entry() {
 fn hoist_leaves_the_indiv_param_program_unsplit() {
     let hoisted = parse_model_string(IP_KEY_PROBE_MODEL).expect("hoisted parse");
     let cold = ip_unhoisted_model(IP_KEY_PROBE_MODEL);
-    let hp = hoisted.indiv_param_partials.indiv_param_program.as_ref().expect("program");
-    let cp = cold.indiv_param_partials.indiv_param_program.as_ref().expect("program");
+    let hp = hoisted.indiv_param_partials.indiv_param_program().as_ref().expect("program");
+    let cp = cold.indiv_param_partials.indiv_param_program().as_ref().expect("program");
     assert_eq!(
         hp.stmts().len(),
         cp.stmts().len(),
@@ -28906,7 +28906,7 @@ fn the_symbolic_partials_are_linear_on_a_diamond() {
         let count = |d: usize| {
             let src = op_diamond(d, "TVV * exp(ETA_V)", op) + &tail.replace("{d}", &d.to_string());
             let p = diamond_partials(&src);
-            assert_eq!(p.names.len(), 3 * d + 2, "{op} diamond, depth {d}: one row per line");
+            assert_eq!(p.names().len(), 3 * d + 2, "{op} diamond, depth {d}: one row per line");
             p.d_d_theta().iter().chain(p.d_d_eta()).flatten().map(expr_nodes).sum::<usize>()
         };
         // From depth 1: level 0 reads `X0`, whose partials are leaves.
@@ -28972,7 +28972,7 @@ fn the_symbolic_partials_on_a_diamond_match_fd() {
                 let fd = (plus[i] - minus[i]) / (2.0 * h);
                 assert!(s.is_finite() && fd.is_finite(), "{op}: row {i} {axis:?}");
                 let rel = (s - fd).abs() / s.abs().max(fd.abs()).max(1e-8);
-                assert!(rel < 1e-6, "{op} diamond: ∂{}/∂{axis:?}: sym={s}, fd={fd}", p.names[i]);
+                assert!(rel < 1e-6, "{op} diamond: ∂{}/∂{axis:?}: sym={s}, fd={fd}", p.names()[i]);
                 worst = worst.max(rel);
             }
         }
@@ -29012,8 +29012,8 @@ fn program_final(
             wt
         })
         .collect();
-    let mut vars = vec![0.0_f64; p.tangent_base() + p.names.len()];
-    for i in 0..p.names.len() {
+    let mut vars = vec![0.0_f64; p.tangent_base() + p.names().len()];
+    for i in 0..p.names().len() {
         let v = eval_expression_indexed(&p.values()[i], theta, eta, &cov, &mut vars, &[]);
         let d = match axis {
             DiffAxis::Theta(k) => &p.d_d_theta()[i][k],
@@ -29025,7 +29025,7 @@ fn program_final(
         vars[p.tangent_base() + i] = dv;
     }
     let row = p
-        .names
+        .names()
         .iter()
         .rposition(|n| n == name)
         .unwrap_or_else(|| panic!("`{name}` has a partials row"));
@@ -29277,7 +29277,7 @@ fn a_guarded_row_off_its_axis_folds_to_zero() {
          V = TVV * exp(ETA_V)\n  KA = TVKA",
     );
     let p = &m.indiv_param_partials;
-    let row = p.names.iter().rposition(|n| n == "CL").unwrap();
+    let row = p.names().iter().rposition(|n| n == "CL").unwrap();
     assert!(
         matches!(p.d_d_eta()[row][0], Expression::Literal(v) if v == 0.0),
         "{:?}",
@@ -30696,7 +30696,7 @@ fn time_mask_of(ip: &str) -> Vec<(String, bool)> {
     let model = time_taint_model(ip);
     let mask = model
         .indiv_param_partials
-        .indiv_param_program
+        .indiv_param_program()
         .as_ref()
         .expect("indiv param program present")
         .params_reading_time();
@@ -34683,7 +34683,7 @@ fn cov_mask_of(ip: &str, covs: &[&str]) -> Vec<(String, bool)> {
     let model = time_taint_model(ip);
     let mask = model
         .indiv_param_partials
-        .indiv_param_program
+        .indiv_param_program()
         .as_ref()
         .expect("indiv param program present")
         .params_reading_covariates(covs);

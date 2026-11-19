@@ -23,6 +23,7 @@ use crate::parser::model_parser::Expression;
 use crate::parser::model_parser::IndivParamPartials;
 use crate::parser::model_parser::IndivParamProgram;
 use crate::parser::model_parser::LevelBlockDecl;
+use crate::parser::model_parser::LevelContrast;
 use crate::parser::model_parser::MuFoldSpec;
 use crate::parser::model_parser::OdeOutputProgram;
 use crate::parser::model_parser::OdeRhsProgram;
@@ -36,9 +37,11 @@ use crate::parser::model_parser::VectorThetaDecl;
 use crate::pk::topology::PkTopology;
 use crate::sens::dual2::Dual2;
 use crate::sim::adaptive::AbsorbedIncrease;
+use crate::sim::adaptive::AdaptiveAction;
 use crate::sim::adaptive::AdaptiveDosingSpec;
 use crate::sim::adaptive::AdaptiveRule;
 use crate::sim::adaptive::DoseGrid;
+use crate::sim::adaptive::IntervalStep;
 use crate::sim::adaptive::SubjectDosePlan;
 use crate::types::population_fingerprint::Difference;
 use crate::types::population_fingerprint::PopulationFingerprint;
@@ -527,6 +530,16 @@ impl<const N: usize> Dual2Internal<N> for Dual2<N> {
 }
 impl<const N: usize> sealed::Sealed for Dual2<N> {}
 
+pub trait LevelContrastInternal: sealed::Sealed + Sized {
+    fn label(self) -> &'static str;
+}
+impl LevelContrastInternal for LevelContrast {
+    fn label(self) -> &'static str {
+        LevelContrast::label(self)
+    }
+}
+impl sealed::Sealed for LevelContrast {}
+
 pub trait ThetaBlocksInternal: sealed::Sealed + Sized {
     fn profiled_names(&self) -> Vec<String>;
     fn profiled_theta_indices(&self) -> Vec<usize>;
@@ -767,10 +780,14 @@ impl sealed::Sealed for OdeSpec {}
 
 pub trait AdaptiveRuleInternal: sealed::Sealed + Sized {
     fn matches(&self, signal: f64) -> bool;
+    fn label(&self) -> String;
 }
 impl AdaptiveRuleInternal for AdaptiveRule {
     fn matches(&self, signal: f64) -> bool {
         AdaptiveRule::matches(self, signal)
+    }
+    fn label(&self) -> String {
+        AdaptiveRule::label(self)
     }
 }
 impl sealed::Sealed for AdaptiveRule {}
@@ -800,6 +817,26 @@ impl AdaptiveDosingSpecInternal for AdaptiveDosingSpec {
     }
 }
 impl sealed::Sealed for AdaptiveDosingSpec {}
+
+pub trait IntervalStepInternal: sealed::Sealed + Sized {
+    fn label(self) -> &'static str;
+}
+impl IntervalStepInternal for IntervalStep {
+    fn label(self) -> &'static str {
+        IntervalStep::label(self)
+    }
+}
+impl sealed::Sealed for IntervalStep {}
+
+pub trait AdaptiveActionInternal: sealed::Sealed + Sized {
+    fn label(&self) -> String;
+}
+impl AdaptiveActionInternal for AdaptiveAction {
+    fn label(&self) -> String {
+        AdaptiveAction::label(self)
+    }
+}
+impl sealed::Sealed for AdaptiveAction {}
 
 pub trait PopulationFingerprintInternal: sealed::Sealed + Sized {
     fn occasions_derived(&self) -> bool;
@@ -912,6 +949,8 @@ impl CovariateMuRefFields for CovariateMuRef {
 impl sealed::Sealed for CovariateMuRef {}
 
 pub trait DoseEventFields: sealed::Sealed + Sized {
+    fn cmt(&self) -> usize;
+    fn cmt_mut(&mut self) -> &mut usize;
     fn evid4(&self) -> bool;
     fn evid4_mut(&mut self) -> &mut bool;
     fn implied(&self) -> &Option<ImpliedDose>;
@@ -920,6 +959,12 @@ pub trait DoseEventFields: sealed::Sealed + Sized {
     fn off_at_mut(&mut self) -> &mut f64;
 }
 impl DoseEventFields for DoseEvent {
+    fn cmt(&self) -> usize {
+        self.cmt
+    }
+    fn cmt_mut(&mut self) -> &mut usize {
+        &mut self.cmt
+    }
     fn evid4(&self) -> bool {
         self.evid4
     }
@@ -947,12 +992,16 @@ pub trait IndivParamPartialsFields: sealed::Sealed + Sized {
     fn d_d_theta_mut(&mut self) -> &mut Vec<Vec<Expression>>;
     fn derived_reads(&self) -> &Vec<String>;
     fn derived_reads_mut(&mut self) -> &mut Vec<String>;
+    fn indiv_param_program(&self) -> &Option<IndivParamProgram>;
+    fn indiv_param_program_mut(&mut self) -> &mut Option<IndivParamProgram>;
     fn lognormal_eta_chain(&self) -> Option<bool>;
     fn lognormal_eta_chain_mut(&mut self) -> &mut Option<bool>;
     fn mu_fold(&self) -> &MuFoldSpec;
     fn mu_fold_mut(&mut self) -> &mut MuFoldSpec;
     fn mu_ref_owners(&self) -> &std::collections::BTreeMap<String, String>;
     fn mu_ref_owners_mut(&mut self) -> &mut std::collections::BTreeMap<String, String>;
+    fn names(&self) -> &Vec<String>;
+    fn names_mut(&mut self) -> &mut Vec<String>;
     fn nested_levels(&self) -> &Option<crate::types::NestedLevels>;
     fn nested_levels_mut(&mut self) -> &mut Option<crate::types::NestedLevels>;
     fn slots(&self) -> &Vec<usize>;
@@ -983,6 +1032,12 @@ impl IndivParamPartialsFields for IndivParamPartials {
     fn derived_reads_mut(&mut self) -> &mut Vec<String> {
         &mut self.derived_reads
     }
+    fn indiv_param_program(&self) -> &Option<IndivParamProgram> {
+        &self.indiv_param_program
+    }
+    fn indiv_param_program_mut(&mut self) -> &mut Option<IndivParamProgram> {
+        &mut self.indiv_param_program
+    }
     fn lognormal_eta_chain(&self) -> Option<bool> {
         self.lognormal_eta_chain
     }
@@ -1000,6 +1055,12 @@ impl IndivParamPartialsFields for IndivParamPartials {
     }
     fn mu_ref_owners_mut(&mut self) -> &mut std::collections::BTreeMap<String, String> {
         &mut self.mu_ref_owners
+    }
+    fn names(&self) -> &Vec<String> {
+        &self.names
+    }
+    fn names_mut(&mut self) -> &mut Vec<String> {
+        &mut self.names
     }
     fn nested_levels(&self) -> &Option<crate::types::NestedLevels> {
         &self.nested_levels

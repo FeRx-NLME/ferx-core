@@ -559,7 +559,7 @@ impl ThetaDecl {
     /// `theta NAME(init, lower, upper)` — or `theta NAME(init)` when both
     /// bounds are infinite, which is how [`ErrorSpecText::read`] reports a
     /// declaration written without bounds.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         if !self.lower.is_finite() && !self.upper.is_finite() {
             return format!("theta {}({})", self.name, num(self.init));
         }
@@ -581,7 +581,7 @@ impl EtaDecl {
     }
 
     /// `omega NAME ~ variance`.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         format!("omega {} ~ {}", self.name, num(self.variance))
     }
 }
@@ -616,7 +616,7 @@ pub struct SigmaDecl {
 
 impl SigmaDecl {
     /// `sigma NAME ~ init (sd)`.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let scale = if self.as_sd { " (sd)" } else { "" };
         format!("sigma {} ~ {}{scale}", self.name, num(self.init))
     }
@@ -688,7 +688,7 @@ impl Relation {
     /// The operator is written only when it is `+`: `*` is the default, and
     /// emitting it on every line would rewrite every existing
     /// `[covariate_model]` an edit passes through.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut line = format!("{} ~ {} {}", self.parameter, self.covariate, self.form_src());
         if self.op == CovariateOp::Add {
             line.push_str(" +");

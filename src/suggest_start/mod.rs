@@ -630,7 +630,7 @@ fn name_rule_may_use(model: &CompiledModel, param: &str, eta: &str) -> bool {
         Some(owner) if owner == param => return true,
         Some(_) => {}
     }
-    let Some(row) = partials.names.iter().rposition(|n| n == param) else {
+    let Some(row) = partials.names().iter().rposition(|n| n == param) else {
         return false;
     };
     let Some(k) = model.eta_names.iter().position(|n| n == eta) else {
@@ -2313,7 +2313,7 @@ mod tests {
         // The premise: CL's last partials row does not read ETA_CL, and ETA_CL
         // is S's and passes the name rule for CL.
         let p = &m.indiv_param_partials;
-        let row = p.names.iter().rposition(|n| n == "CL").expect("CL has rows");
+        let row = p.names().iter().rposition(|n| n == "CL").expect("CL has rows");
         let k = m.eta_names.iter().position(|n| n == "ETA_CL").unwrap();
         assert!(matches!(
             p.d_d_eta()[row][k],

@@ -1600,7 +1600,7 @@ pub enum IntervalStep {
 }
 
 impl IntervalStep {
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             IntervalStep::Lengthen => "lengthen",
             IntervalStep::Shorten => "shorten",
@@ -1667,7 +1667,7 @@ impl Comparison {
 
 impl AdaptiveAction {
     /// The action's source-like label (`"increase 25%"`, `"hold"`, …).
-    pub fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         match self {
             AdaptiveAction::Increase(DoseStep::Percent(p)) => format!("increase {p}%"),
             AdaptiveAction::Increase(DoseStep::Level) => "increase".to_string(),
@@ -1684,7 +1684,7 @@ impl AdaptiveRule {
     /// A human-readable label reconstructing the rule as written
     /// (`"signal < 10 : increase 25%"`) — recorded as the dose ledger's
     /// `rule_fired` so an audit can name which rung produced each dose.
-    pub fn label(&self) -> String {
+    pub(crate) fn label(&self) -> String {
         let effects: Vec<String> = [self.action.label()]
             .into_iter()
             .chain(self.interval.map(|i| i.label().to_string()))

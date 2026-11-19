@@ -230,7 +230,7 @@ pub struct DoseEvent {
     /// (the literal authored value). Keeping the field private is what makes the
     /// recurring `cmt - 1` underflow bug (#899) unrepresentable at the call site —
     /// a bare `- 1` cannot be written against it.
-    pub cmt: usize,
+    pub(crate) cmt: usize,
     pub rate: f64,
     pub duration: f64,
     pub ss: bool,
