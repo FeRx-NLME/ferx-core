@@ -830,6 +830,27 @@ pub(crate) fn agq_subject_term(
     n_nodes: usize,
     anchor: HessianAnchor,
 ) -> f64 {
+    agq_subject_term_with_work(
+        model, subject, params, eta_hat, kappas, n_nodes, anchor, None, None,
+    )
+}
+
+/// [`agq_subject_term`] with the caller's hoisted `schedule` and the inner solve's
+/// `terminal` work (its exact Hessian at the mode, and the mode's NLL), as the population
+/// objective takes them: the same arithmetic on the same mode, minus a second provider pass.
+/// The mixture objective scores each class's subject with it (#3025).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agq_subject_term_with_work(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta_hat: &[f64],
+    kappas: &[nalgebra::DVector<f64>],
+    n_nodes: usize,
+    anchor: HessianAnchor,
+    schedule: Option<&pk::event_driven::EventSchedule>,
+    terminal: Option<&TerminalLaplaceWork>,
+) -> f64 {
     let (nodes, weights, cached_log_weights) = cached_gauss_hermite(n_nodes);
     let uncached_log_weights;
     let log_weights = if cached_log_weights_enabled() {
@@ -849,9 +870,9 @@ pub(crate) fn agq_subject_term(
         nodes,
         log_weights,
         anchor,
-        None,
-        None,
-        None,
+        schedule,
+        terminal.and_then(|t| t.0.as_ref()),
+        terminal.map(|t| t.1),
     )
 }
 
@@ -1400,6 +1421,16 @@ impl<'a> SubjectScoreContext<'a> {
             None,
         );
         is_usable_subject_nll(nll).then_some(nll)
+    }
+
+    /// The reconverged finite-difference score from the stacked mode `joint_warm`: a mixture
+    /// class's per-term salvage (#3025).
+    pub(crate) fn reconverged_score(
+        &self,
+        subject: &Subject,
+        joint_warm: &[f64],
+    ) -> Option<Vec<f64>> {
+        self.finite_difference_score(subject, joint_warm)
     }
 
     fn finite_difference_score(&self, subject: &Subject, joint_warm: &[f64]) -> Option<Vec<f64>> {

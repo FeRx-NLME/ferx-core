@@ -1613,7 +1613,7 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
 }
 
 // ---- #2093 review round 2 (finding 7): the decline/remedy sentence cells, rebuilt on the
-// adjoint's clause set. `GradientFd` and `Disabled` carry a one-line remedy; `Mixture`,
+// adjoint's clause set. `GradientFd` and `Disabled` carry a one-line remedy;
 // `NonGaussianEndpoint`, `ModelOutOfScope` and `PerSubjectBail` do not.
 
 #[test]
@@ -1628,13 +1628,13 @@ fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
     );
 
     let mut without = measured_severe_facts();
-    without.declines = &[CovScopeDecline::Mixture];
+    without.declines = &[CovScopeDecline::ModelOutOfScope];
     let m = format_regularized_warning(&without);
     assert!(
-        m.contains("declined because the model is a mixture model under Laplace/AGQ."),
+        m.contains("declined because the model is outside the analytic recorders' scope."),
         "{m}"
     );
-    // No invented advice: the FD stencil is the correct route for a mixture.
+    // No invented advice: the FD stencil is the correct route for such a model.
     assert!(!m.contains("moves the fit onto the analytic route"), "{m}");
     assert!(!m.contains("stays on the finite-difference route"), "{m}");
 }
@@ -1643,15 +1643,15 @@ fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
 fn several_unremediable_clauses_invent_no_advice() {
     let mut facts = measured_severe_facts();
     facts.declines = &[
-        CovScopeDecline::Mixture,
+        CovScopeDecline::PerSubjectBail,
         CovScopeDecline::ModelOutOfScope,
         CovScopeDecline::NonGaussianEndpoint,
     ];
     let m = format_regularized_warning(&facts);
     assert!(
         m.contains(
-            "the model is a mixture model under Laplace/AGQ, the model is outside the analytic \
-             recorders' scope \
+            "at least one subject fell outside the analytic assembly, the model is outside the \
+             analytic recorders' scope \
              and the model has a non-Gaussian endpoint ([event_model] / [binary_model]) \
              outside the exact term (an endpoint without an exact channel, or an SDE)."
         ),
@@ -1782,7 +1782,7 @@ fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
     facts.declines = &[
         CovScopeDecline::Disabled,
         CovScopeDecline::GradientFd,
-        CovScopeDecline::Mixture,
+        CovScopeDecline::ModelOutOfScope,
     ];
     let m = format_regularized_warning(&facts);
     assert!(
@@ -1798,7 +1798,7 @@ fn two_remediable_clauses_next_to_an_unremediable_one_name_the_plural_forms() {
     let mut two_left = measured_severe_facts();
     two_left.declines = &[
         CovScopeDecline::GradientFd,
-        CovScopeDecline::Mixture,
+        CovScopeDecline::ModelOutOfScope,
         CovScopeDecline::NonGaussianEndpoint,
     ];
     let m = format_regularized_warning(&two_left);

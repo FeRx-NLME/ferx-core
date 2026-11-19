@@ -2077,11 +2077,7 @@ fn fit_inner(
     // an estimator that builds no `R` (#1803).
     // The route is predicted from the covariance step's own scope walk (#2054): no note on
     // the analytic R-matrix.
-    let covariance_route = crate::estimation::covariance::predicted_r_route(
-        model,
-        options,
-        init_params.mixture.is_some(),
-    );
+    let covariance_route = crate::estimation::covariance::predicted_r_route(model, options);
     let covariance_cost = crate::estimation::covariance::pre_fit_covariance_cost(
         n_params_pre,
         options,

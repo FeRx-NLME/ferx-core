@@ -4940,9 +4940,8 @@ pub(crate) fn check_iiv_on_ruv(model: &CompiledModel, options: &FitOptions) -> V
 ///   rebuilt from a prior `FitResult`. The objective keys the mixture path off
 ///   `params.mixture`, so the fit would silently run the single-population objective with
 ///   `MIXNUM` pinned to class 1;
-/// - `E_MIXTURE_METHOD` (block `fit_options`), per stage of the chain: FOCEI quadrature
-///   (`n_agq > 1`), which the mixture objective does not evaluate; an estimator other than
-///   FOCE / FOCEI / SAEM / Bayes / IMP / IMPMAP; and Bayes with per-class `omega(k)` /
+/// - `E_MIXTURE_METHOD` (block `fit_options`), per stage of the chain: an estimator other than
+///   FOCE / FOCEI / Laplace / SAEM / Bayes / IMP / IMPMAP; and Bayes with per-class `omega(k)` /
 ///   `sigma(k)` overrides, whose single conjugate Ω draw is shared across classes.
 ///   Refused before any stage runs, so `method = [focei, bayes]` does not burn a FOCEI
 ///   fit only to fail at the hand-off (`bayes.rs` re-checks it defensively).
@@ -4970,17 +4969,13 @@ pub(crate) fn check_mixture_options(
     };
     let chain = options.method_chain();
     for &m in &chain {
-        if m == EstimationMethod::FoceI && options.n_agq > 1 {
-            refuse(
-                "mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 \
-                 for mixture FOCEI. The mixture objective does not evaluate the quadrature grid."
-                    .to_string(),
-            );
-        }
         if !matches!(
             m,
             EstimationMethod::Foce
                 | EstimationMethod::FoceI
+                // Laplace and FOCEI quadrature (`n_agq > 1`) score each class with the
+                // single population's quadrature objective at the class mode (#3025).
+                | EstimationMethod::Laplace
                 | EstimationMethod::Saem
                 | EstimationMethod::Bayes
                 // IMP / IMPMAP run a class-partitioned MCEM (per-class IS E-step +
@@ -4992,8 +4987,8 @@ pub(crate) fn check_mixture_options(
                 | EstimationMethod::Impmap
         ) {
             refuse(format!(
-                "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
-                 IMPMAP; the {} method is not yet wired for mixtures (#985)",
+                "mixture models (#977) currently support FOCE / FOCEI / Laplace / SAEM / Bayes / \
+                 IMP / IMPMAP; the {} method is not yet wired for mixtures (#985)",
                 m.label()
             ));
         }

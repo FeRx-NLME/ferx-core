@@ -117,32 +117,43 @@ fn mixture_refusals_are_coded() {
          them from the model file) rather than params with `mixture: None`",
     );
 
-    let quadrature = FitOptions {
-        method: EstimationMethod::FoceI,
-        interaction: true,
-        n_agq: 3,
-        ..FitOptions::default()
-    };
-    assert_coded(
-        &fit_refusal(&model, &pop, &model.default_params, &quadrature),
-        "n_agq > 1",
-        "E_MIXTURE_METHOD",
-        Some("fit_options"),
-        "mixture models do not yet support FOCEI quadrature (n_agq > 1); use n_agq = 1 \
-         for mixture FOCEI. The mixture objective does not evaluate the quadrature grid.",
-    );
+    // Laplace and FOCEI quadrature are accepted since #3025 (the refusal is lifted).
+    for (label, opts) in [
+        (
+            "focei n_agq = 3",
+            FitOptions {
+                method: EstimationMethod::FoceI,
+                interaction: true,
+                n_agq: 3,
+                ..FitOptions::default()
+            },
+        ),
+        (
+            "laplace",
+            FitOptions {
+                method: EstimationMethod::Laplace,
+                ..FitOptions::default()
+            },
+        ),
+    ] {
+        assert!(
+            crate::api::validation::check_mixture_options(&model, &opts, &model.default_params)
+                .is_empty(),
+            "{label}: a mixture under quadrature is accepted"
+        );
+    }
 
-    let laplace = FitOptions {
-        method: EstimationMethod::Laplace,
+    let vi = FitOptions {
+        method: EstimationMethod::Vi,
         ..FitOptions::default()
     };
     assert_coded(
-        &fit_refusal(&model, &pop, &model.default_params, &laplace),
-        "laplace",
+        &fit_refusal(&model, &pop, &model.default_params, &vi),
+        "vi",
         "E_MIXTURE_METHOD",
         Some("fit_options"),
-        "mixture models (#977) currently support FOCE / FOCEI / SAEM / Bayes / IMP / \
-         IMPMAP; the LAPLACE method is not yet wired for mixtures (#985)",
+        "mixture models (#977) currently support FOCE / FOCEI / Laplace / SAEM / Bayes / \
+         IMP / IMPMAP; the VI method is not yet wired for mixtures (#985)",
     );
 
     let overrides = parse_model_string(
@@ -168,12 +179,16 @@ fn mixture_refusals_are_coded() {
     // for the accepted one.
     let with = |opts: &str| format!("{MIXTURE}[fit_options]\n  {opts}\n");
     assert!(
-        check_codes(&with("method = laplace")).contains(&"E_MIXTURE_METHOD".to_string()),
+        check_codes(&with("method = vi")).contains(&"E_MIXTURE_METHOD".to_string()),
         "ferx check misses the mixture method"
     );
     assert!(
         !check_codes(&with("method = foce")).contains(&"E_MIXTURE_METHOD".to_string()),
         "ferx check refuses an accepted mixture method"
+    );
+    assert!(
+        !check_codes(&with("method = laplace")).contains(&"E_MIXTURE_METHOD".to_string()),
+        "ferx check refuses a Laplace mixture (#3025)"
     );
 }
 

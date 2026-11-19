@@ -1,6 +1,6 @@
 ---
 pagetitle: "Mixture models in ferx"
-description-meta: "Fit latent subpopulation mixture models with FOCEI, SAEM, and Bayesian methods in the ferx NLME engine."
+description-meta: "Fit latent subpopulation mixture models with FOCEI, Laplace, AGQ, SAEM, and Bayesian methods in the ferx NLME engine."
 ---
 
 # Mixture Models
@@ -83,6 +83,22 @@ analytic scope is salvaged on its own: the other subjects keep their exact gradi
 that subject's per-class terms are finite-differenced, re-solving its class modes at each
 probe. Such a subject is named in the "could not be given the exact analytic outer gradient"
 warning, as for a single population (#2906). `MIXNUM`-branched typical values are in scope.
+
+
+### Laplace and AGQ {#laplace-and-agq}
+
+`method = laplace`, and `method = focei` with `n_agq > 1`, fit a mixture too. The class
+objective $\mathrm{nll}_{ik}$ is then the single-population quadrature objective
+([Laplace and AGQ](agq.qmd)) evaluated with class-$k$ parameters at the class's own mode
+and on the class's own grid (the Hessian that scales the grid is class $k$'s, exact for
+Laplace and Gauss-Newton for FOCEI quadrature), instead of the FOCE/FOCEI marginal; the
+log-sum-exp over classes is unchanged. Under IOV the class mode is the stacked
+$[\hat\eta, \hat\kappa]$, as for a single population. The outer gradient, the
+covariance R-matrix and the score cross-product $S$ are exact for the same objective, with
+no finite-difference fallback: a (subject $\times$ class) term the adjoint declines at run
+time is salvaged on its own by that term's reconverged difference, as for FOCE/FOCEI.
+A mixture of identical classes reproduces the single-population Laplace/AGQ fit.
+FOCE and FOCEI fits are unchanged.
 
 ## Output
 
@@ -170,7 +186,7 @@ assignment is identical for every subject.
 
 A mixture fit runs the covariance step like any other fit: the Hessian is built on the
 **mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix under
-FOCE/FOCEI, the finite-difference stencil under Laplace/AGQ — and
+FOCE, FOCEI, Laplace and AGQ — and
 the standard errors are $\sqrt{\operatorname{diag}(R^{-1})}$. The mixing-fraction
 SE is reported on the scale the mixing form is written in — the coefficients of a
 `logit(k) = …` form carry a logit-scale SE, a `p(k) = …` probability an SE

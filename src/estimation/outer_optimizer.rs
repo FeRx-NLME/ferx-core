@@ -1685,7 +1685,7 @@ fn skip_duplicate_laplace_terminal_capture() -> bool {
     })
 }
 
-fn agq_inner_solve_policy(
+pub(crate) fn agq_inner_solve_policy(
     model: &CompiledModel,
     options: &FitOptions,
     fused_gradient: bool,

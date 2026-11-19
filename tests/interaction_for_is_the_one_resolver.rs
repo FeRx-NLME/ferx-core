@@ -92,7 +92,7 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/mixture.rs",
-        2,
+        1,
         "the mixture outer loop, run on a stage's options",
     ),
     (

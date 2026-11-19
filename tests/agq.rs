@@ -144,6 +144,9 @@ fn agq_method_token_is_rejected_with_migration_note() {
 
 #[test]
 fn audit_mixture_cannot_silently_ignore_focei_quadrature() {
+    // Since #3025 a mixture is scored with the quadrature objective, so a node count must
+    // *change* its objective: accepted, and not the one-node FOCEI value (a mixture engine
+    // that ignored `n_agq` would return the same OFV for every node count).
     let source = WARFARIN_SRC
         .replace(
             "[individual_parameters]",
@@ -162,24 +165,35 @@ fn audit_mixture_cannot_silently_ignore_focei_quadrature() {
         run_covariance_step: false,
         ..FitOptions::default()
     };
-    assert!(
-        fit(&model, &pop, &model.default_params, &options).is_ok(),
-        "plain FOCEI mixtures remain supported"
-    );
+    let ofv = |opts: &FitOptions| {
+        fit(&model, &pop, &model.default_params, opts)
+            .expect("a mixture fits under the quadrature objectives")
+            .ofv
+    };
+    let focei = ofv(&options);
+    assert!(focei.is_finite());
     for methods in [
         vec![],
         vec![EstimationMethod::Foce, EstimationMethod::FoceI],
     ] {
-        let opts = FitOptions {
+        let quadrature = ofv(&FitOptions {
             n_agq: 3,
             methods,
             ..options.clone()
-        };
-        let err = fit(&model, &pop, &model.default_params, &opts)
-            .expect_err("mixture engine does not evaluate quadrature")
-            .to_string();
-        assert!(err.contains("mixture") && err.contains("n_agq"), "{err}");
+        });
+        assert!(
+            quadrature.is_finite() && (quadrature - focei).abs() > 1e-6,
+            "n_agq = 3 must change a mixture's objective: {quadrature} vs FOCEI {focei}"
+        );
     }
+    let laplace = ofv(&FitOptions {
+        method: EstimationMethod::Laplace,
+        ..options.clone()
+    });
+    assert!(
+        laplace.is_finite() && (laplace - focei).abs() > 1e-6,
+        "Laplace is not the FOCEI objective: {laplace} vs {focei}"
+    );
 }
 
 #[test]

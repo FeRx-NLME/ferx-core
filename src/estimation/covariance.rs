@@ -767,7 +767,7 @@ pub(crate) fn assemble_score_cross_product(
         inner_tol: options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
         ..options.clone()
     };
-    let mixture_points = mixture.as_ref().map(|c| c.class_points());
+    let mixture_scorers = mixture.as_ref().map(|c| c.class_scorers(model));
     let report = cov_progress("score matrix", n_subj, options.verbose);
     let scores: Vec<Result<Vec<f64>, String>> = crate::par::map(n_subj, |i| {
         // Cooperative cancel: skip the per-subject gradient and return a
@@ -788,10 +788,10 @@ pub(crate) fn assemble_score_cross_product(
                 model,
                 population,
                 i,
-                mixture_points.as_deref().unwrap_or(&[]),
+                mixture_scorers.as_deref().unwrap_or(&[]),
             );
             report();
-            return Ok(score);
+            return score.ok_or_else(|| format!("Covariance step failed: could not obtain a converged, finite quadrature score for subject {}. SE estimates not available.", population.subjects[i].id));
         }
         if let Some(context) = &quadrature {
             // The subject score has NLL units already and cannot contain the
@@ -933,6 +933,18 @@ pub(super) mod forced_cov_decline {
     }
 }
 
+/// Why `exact_candidate_hessian` gave no Hessian.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExactDecline {
+    /// The exact derivatives do not cover the model or a subject (or the user turned them off
+    /// with `analytic_cov_hessian = false`): the finite-difference twin
+    /// (`fd_candidate_hessian`) is the same quantity at FD precision.
+    OutOfScope,
+    /// In scope, but not resolved at this point: a subject's EBE did not re-converge, a result
+    /// was non-finite, or the run was cancelled. A property of the point, not of the model.
+    NotResolved,
+}
+
 /// The objective the analytic R-matrix differentiates: the one the fit minimised (see
 /// `analytic_cov_hessian`), and whose per-subject gradients the BHHH decrement reads.
 pub(crate) fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
@@ -966,12 +978,8 @@ pub(crate) fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::
 ///
 /// Called only when a regularization warning is about to be emitted on the FD route, i.e. after
 /// a stencil that has just spent `2·n_free²` reconverged population objectives.
-fn analytic_cov_declines(
-    model: &CompiledModel,
-    options: &FitOptions,
-    is_mixture: bool,
-) -> Vec<CovScopeDecline> {
-    let mut out = analytic_cov_model_declines(model, options, is_mixture);
+fn analytic_cov_declines(model: &CompiledModel, options: &FitOptions) -> Vec<CovScopeDecline> {
+    let mut out = analytic_cov_model_declines(model, options);
     if out.is_empty() {
         out.push(CovScopeDecline::PerSubjectBail);
     }
@@ -1084,12 +1092,8 @@ fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
 /// `fd_r_objective_evals(n)` reconverged population objectives, so the large-problem reroute to
 /// `S` and the pre-fit cost note, both written for the stencil, do not apply on
 /// [`PredictedRRoute::Analytic`].
-pub(crate) fn predicted_r_route(
-    model: &CompiledModel,
-    options: &FitOptions,
-    is_mixture: bool,
-) -> PredictedRRoute {
-    if analytic_cov_model_declines(model, options, is_mixture).is_empty() {
+pub(crate) fn predicted_r_route(model: &CompiledModel, options: &FitOptions) -> PredictedRRoute {
+    if analytic_cov_model_declines(model, options).is_empty() {
         PredictedRRoute::Analytic
     } else {
         PredictedRRoute::Stencil
@@ -1099,38 +1103,23 @@ pub(crate) fn predicted_r_route(
 /// Whether the covariance step is expected to take the analytic R-matrix for every subject:
 /// [`predicted_r_route`] is [`PredictedRRoute::Analytic`], i.e. no clause of
 /// [`analytic_cov_declines`]'s walk fires.
-pub(crate) fn analytic_r_expected(
-    model: &CompiledModel,
-    options: &FitOptions,
-    is_mixture: bool,
-) -> bool {
-    predicted_r_route(model, options, is_mixture) == PredictedRRoute::Analytic
+pub(crate) fn analytic_r_expected(model: &CompiledModel, options: &FitOptions) -> bool {
+    predicted_r_route(model, options) == PredictedRRoute::Analytic
 }
 
 /// The clauses of [`analytic_cov_declines`] — every one that sends the whole population to
 /// the stencil, whatever the subjects look like. Empty when none fires.
-fn analytic_cov_model_declines(
+pub(crate) fn analytic_cov_model_declines(
     model: &CompiledModel,
     options: &FitOptions,
-    is_mixture: bool,
 ) -> Vec<CovScopeDecline> {
     let mut out: Vec<CovScopeDecline> = Vec::new();
     if !options.analytic_cov_hessian {
         out.push(CovScopeDecline::Disabled);
     }
-    // A mixture has its own exact assembly (`mixture::mixture_cov_hessian`), for the
-    // FOCE/FOCEI class objectives `mixture_ofv` scores.
-    if is_mixture
-        && !matches!(
-            cov_objective(options),
-            crate::sens::ode_provider::adjoint::Objective::Foce
-                | crate::sens::ode_provider::adjoint::Objective::Focei
-        )
-    {
-        out.push(CovScopeDecline::Mixture);
-    }
-    // The adjoint's profile Hessian serves every estimator and anchor; what it declines is
-    // the model (a shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's
+    // The adjoint's profile Hessian serves every estimator and anchor, and a mixture through
+    // its own exact assembly (`mixture::mixture_cov_hessian`, over the class objective
+    // `mixture_ofv` scores: FOCE, FOCEI, Laplace or AGQ); what it declines is the model (a shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's
     // exact term) or the user's `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
@@ -2216,8 +2205,7 @@ pub(crate) fn compute_covariance_for(
         return at_fit_tolerance(false).expect("a step that may take any route always completes");
     };
     if needs_r(options.covariance_method)
-        && predicted_r_route(model, options, template.mixture.is_some())
-            == PredictedRRoute::Analytic
+        && predicted_r_route(model, options) == PredictedRRoute::Analytic
     {
         if let Some(out) = at_fit_tolerance(true) {
             return out;
@@ -2666,12 +2654,7 @@ fn covariance_step(
             && !crate::types::GradientMethod::forced_fd(model)
         {
             match crate::estimation::mixture::mixture_cov_hessian(
-                model,
-                population,
-                template,
-                x_hat,
-                options,
-                cov_objective(options),
+                model, population, template, x_hat, options,
             ) {
                 Some(h) => AnalyticCovAssembly::Full(h),
                 None => AnalyticCovAssembly::Unavailable,
@@ -3329,7 +3312,7 @@ fn covariance_step(
         // on a fit that had no complaint to make. On the hybrid route it is the *salvaged*
         // subjects' clauses it names — the same walk, since every other subject passes it.
         let declines = if source.emits_fd_guidance() {
-            analytic_cov_declines(model, options, is_mixture)
+            analytic_cov_declines(model, options)
         } else {
             Vec::new()
         };
@@ -4146,7 +4129,7 @@ pub(crate) fn run_covariance_step_inner(
         model.free_packed_dim(),
         options,
         !model.priors.is_empty(),
-        analytic_r_expected(model, options, template.mixture.is_some()),
+        analytic_r_expected(model, options),
     );
     if let Some(w) = scale_warning {
         warnings.push(w);
@@ -4385,7 +4368,7 @@ mod tests {
             let m = model(n_extra);
             assert_eq!(m.n_eta, 3 + n_extra);
             assert_eq!(
-                super::analytic_cov_declines(&m, &options, false),
+                super::analytic_cov_declines(&m, &options),
                 vec![CovScopeDecline::Disabled],
                 "{} η",
                 m.n_eta
@@ -4409,38 +4392,27 @@ mod tests {
         let in_scope = crate::parser::model_parser::parse_model_string(src).unwrap();
         let on = FitOptions::default();
         assert_eq!(
-            super::analytic_cov_declines(&in_scope, &on, false),
+            super::analytic_cov_declines(&in_scope, &on),
             vec![CovScopeDecline::PerSubjectBail]
         );
-        assert!(super::analytic_r_expected(&in_scope, &on, false));
+        assert!(super::analytic_r_expected(&in_scope, &on));
 
         let mut fd = crate::parser::model_parser::parse_model_string(src).unwrap();
         fd.gradient_method = GradientMethod::Fd;
-        // Laplace, so the mixture clause (the quadrature's) fires too.
         let off = FitOptions {
             analytic_cov_hessian: false,
             method: crate::types::EstimationMethod::Laplace,
             ..FitOptions::default()
         };
         assert_eq!(
-            super::analytic_cov_declines(&fd, &off, true),
-            vec![
-                CovScopeDecline::Disabled,
-                CovScopeDecline::Mixture,
-                CovScopeDecline::GradientFd
-            ],
+            super::analytic_cov_declines(&fd, &off),
+            vec![CovScopeDecline::Disabled, CovScopeDecline::GradientFd],
             "every clause, in gate order"
         );
-        assert!(!super::analytic_r_expected(&fd, &off, true));
+        assert!(!super::analytic_r_expected(&fd, &off));
         // Each clause alone moves the predicate.
-        assert!(
-            !super::analytic_r_expected(&fd, &on, false),
-            "gradient = fd"
-        );
-        assert!(
-            !super::analytic_r_expected(&in_scope, &off, false),
-            "disabled"
-        );
+        assert!(!super::analytic_r_expected(&fd, &on), "gradient = fd");
+        assert!(!super::analytic_r_expected(&in_scope, &off), "disabled");
     }
 
     /// #1613 G4 on the adjoint: the R-matrix scope reads the **call's** `gradient = fd`, not
@@ -4459,10 +4431,8 @@ mod tests {
         .unwrap();
         assert_eq!(model.gradient_method, GradientMethod::Auto);
         let opts = FitOptions::default();
-        let has_fd = || {
-            super::analytic_cov_declines(&model, &opts, false)
-                .contains(&CovScopeDecline::GradientFd)
-        };
+        let has_fd =
+            || super::analytic_cov_declines(&model, &opts).contains(&CovScopeDecline::GradientFd);
         assert!(!has_fd(), "control: unarmed, no gradient = fd clause");
         {
             let _fd = crate::types::arm_forced_fd(true);
@@ -4470,7 +4440,7 @@ mod tests {
                 has_fd(),
                 "fit's guard: the call's gradient = fd declines the R-matrix"
             );
-            assert!(!super::analytic_r_expected(&model, &opts, false));
+            assert!(!super::analytic_r_expected(&model, &opts));
         }
         let fd_opts = FitOptions {
             gradient_method: GradientMethod::Fd,
@@ -4524,26 +4494,24 @@ mod tests {
              pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
         )
         .unwrap();
-        assert!(super::analytic_r_expected(&m, &defaulted, false));
-        // A FOCE/FOCEI mixture has its own exact R (`mixture::mixture_cov_hessian`); under
-        // the quadrature it takes the stencil.
-        assert!(
-            super::analytic_r_expected(&m, &defaulted, true),
-            "a FOCE/FOCEI mixture is analytic"
-        );
-        let laplace = FitOptions {
-            method: crate::types::EstimationMethod::Laplace,
-            ..defaulted.clone()
-        };
-        assert!(
-            !super::analytic_r_expected(&m, &laplace, true),
-            "a Laplace mixture takes the stencil"
-        );
+        assert!(super::analytic_r_expected(&m, &defaulted));
+        // A mixture has its own exact R (`mixture::mixture_cov_hessian`) under every class
+        // objective, Laplace and AGQ included (#3025): the route is the model's, not the method's.
+        for method in [
+            crate::types::EstimationMethod::FoceI,
+            crate::types::EstimationMethod::Laplace,
+        ] {
+            let o = FitOptions {
+                method,
+                ..defaulted.clone()
+            };
+            assert!(super::analytic_r_expected(&m, &o), "{method:?}");
+        }
         let disabled = FitOptions {
             analytic_cov_hessian: false,
             ..defaulted
         };
-        assert!(!super::analytic_r_expected(&m, &disabled, false));
+        assert!(!super::analytic_r_expected(&m, &disabled));
     }
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
