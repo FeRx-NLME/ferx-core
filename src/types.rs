@@ -10682,9 +10682,36 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// How many threads hold an override (`LOCAL_BLOQ_OVERRIDE` is `Some`), so
+/// [`CompiledModel::bloq_in_force`] can skip the thread-local read — on macOS a
+/// `_tlv_get_addr` call, once per likelihood evaluation (~3 % of an SAEM fit, #2986) —
+/// whenever no thread holds one, which is every fit without a per-call `bloq_method`.
+///
+/// Every change is a read-modify-write, so each value after a thread's increment includes
+/// it until that thread decrements: a thread holding an override never reads `0`. A thread
+/// that reads `0` holds none, and its thread-local would read `None` too. A thread that
+/// exits holding one leaves the count raised; that only turns the shortcut off.
+static BLOQ_OVERRIDES_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Set this thread's override, keeping [`BLOQ_OVERRIDES_HELD`] in step. Returns the previous.
+fn replace_bloq_override(bloq: Option<BloqMethod>) -> Option<BloqMethod> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let prev = LOCAL_BLOQ_OVERRIDE.replace(bloq);
+    match (prev.is_some(), bloq.is_some()) {
+        (false, true) => {
+            BLOQ_OVERRIDES_HELD.fetch_add(1, Relaxed);
+        }
+        (true, false) => {
+            BLOQ_OVERRIDES_HELD.fetch_sub(1, Relaxed);
+        }
+        _ => {}
+    }
+    prev
+}
+
 /// Install `bloq` for a pool worker's whole lifetime (its `start_handler`).
 pub(crate) fn install_worker_bloq_override(bloq: Option<BloqMethod>) {
-    LOCAL_BLOQ_OVERRIDE.set(bloq);
+    replace_bloq_override(bloq);
 }
 
 /// Arms this call's `bloq_method` override on this thread until dropped (fan-out via
@@ -10696,12 +10723,12 @@ pub(crate) struct BloqOverrideGuard {
 
 /// See [`BloqOverrideGuard`]. `None` arms `None`, so a nested call reads its own model.
 pub(crate) fn arm_bloq_override(bloq: Option<BloqMethod>) -> BloqOverrideGuard {
-    BloqOverrideGuard { prev: LOCAL_BLOQ_OVERRIDE.replace(bloq) }
+    BloqOverrideGuard { prev: replace_bloq_override(bloq) }
 }
 
 impl Drop for BloqOverrideGuard {
     fn drop(&mut self) {
-        LOCAL_BLOQ_OVERRIDE.set(self.prev);
+        replace_bloq_override(self.prev);
     }
 }
 
@@ -10710,6 +10737,9 @@ impl CompiledModel {
     /// [`bloq_method`](Self::bloq_method) (#1824). The one reader of the field
     /// (`tests/bloq_in_force_is_the_one_reader.rs`).
     pub(crate) fn bloq_in_force(&self) -> BloqMethod {
+        if BLOQ_OVERRIDES_HELD.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            return self.bloq_method;
+        }
         LOCAL_BLOQ_OVERRIDE.get().unwrap_or(self.bloq_method)
     }
 }
