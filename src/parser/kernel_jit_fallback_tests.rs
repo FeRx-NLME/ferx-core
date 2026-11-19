@@ -190,6 +190,10 @@ fn saem_falls_back_to_fd() {
         mu_referencing: false,
         // The 1e-6 SE gate was set on the single-chain run (#2986 made two the default).
         saem_n_chains: 1,
+        // The likelihood path is under test, not the sampler: without the plans the AD engine
+        // gives no gradient and the default `hmc` preset falls back to the random walks, so
+        // pin kernels that run on either path (#2986).
+        saem_kernel: crate::types::SaemKernel::Nonmem,
         // The comparison is plans against the forced fallback under ONE M-step solver. `auto`
         // is Newton on the plans and BOBYQA (the information is gone) on the fallback: two
         // different solves, 0.354 apart in OFV (#3001), which says nothing about the plans.

@@ -13263,6 +13263,9 @@ DV ~ additive(EPS)
             saem_adapt_interval: 25,
             saem_seed: Some(1444),
             run_covariance_step: false,
+            // The random-walk scale rule is what this pins, so a kernel that runs the random
+            // walks: the default `hmc` preset runs none (#2986).
+            saem_kernel: crate::types::SaemKernel::Nonmem,
             ..FitOptions::default()
         };
         // Arm 1: the options left alone. Arm 2: exactly what #1449 says the
