@@ -145,6 +145,9 @@ fn the_nested_anova_matches_a_hand_computed_cube() {
     // One subject: the population is that subject, and the between-row line is 0.
     let p = Sc::Population;
     assert_eq!(est(&d, &p, L::Parameter).0, -5.0);
+    // The population jackknife drops each draw for the subjects that share it: here the
+    // one subject's SE (review r1, mutation 3).
+    assert_eq!(est(&d, &p, L::Bsv), (8.0, Some(2.5)));
     assert_eq!(est(&d, &p, L::BetweenRow), (0.0, Some(0.0)));
     assert_eq!(est(&d, &p, L::Total), (7.5, None));
 }
@@ -181,10 +184,14 @@ fn without_uncertainty_the_parameter_layer_is_not_drawn_and_the_lines_sum_to_the
 
 /// A supplied-η subject has a `Supplied` BSV (never 0, never estimated), and the
 /// population BSV averages the drawn subjects only (A's 5.5), while within and the
-/// between-row line still pool both: total = 5.5 + 4.5 + 0.0625.
+/// between-row line still pool both. The population `Total` is the pooled variance
+/// `mean_i Var(Y | i) + Var_i E[Y | i]` = (A 10.5 + B 4)/2 + 0.0625 = 7.3125, not the sum
+/// of the lines (5.5 + 4.5 + 0.0625 = 10.0625, which counts A's BSV for B too; review r1
+/// row 3).
 ///
 /// Mutations: the supplied subject's BSV estimated (10.5) or entered in the population
-/// average (8); `n_subjects` of the population BSV counting it.
+/// average (8); `n_subjects` of the population BSV counting it; the population `Total` as
+/// the sum of the lines (10.0625).
 #[test]
 fn a_supplied_subject_has_no_bsv_and_the_population_bsv_pools_the_drawn_ones() {
     let a: [[[f64; 2]; 2]; 1] = [CUBE[0]];
@@ -198,7 +205,7 @@ fn a_supplied_subject_has_no_bsv_and_the_population_bsv_pools_the_drawn_ones() {
     assert_eq!(est(&d, &p, L::Bsv).0, 5.5);
     assert_eq!(cell(&d, &M::SignalMean, &p, L::Bsv).n_subjects, 1);
     assert_eq!(est(&d, &p, L::Within).0, 4.5);
-    assert_eq!(est(&d, &p, L::Total).0, 10.0625);
+    assert_eq!(est(&d, &p, L::Total).0, 7.3125);
 
     // Every subject supplied: the population BSV is `Supplied` too, not an empty average.
     r.metrics.iter_mut().for_each(|m| m.eta_supplied = true);
@@ -280,6 +287,17 @@ fn designs_that_cannot_separate_a_layer_are_refused_naming_the_layer() {
     ));
     // The straddle: the same one-draw rows without uncertainty decompose.
     assert!(decompose_adaptive(&result_of(&[("1", &[CUBE[0]])], false)).is_ok());
+}
+
+/// A result with no metrics rows (a caller's filter can leave none) is refused as such,
+/// not as an `n_reps = 0` design (review r1 row 7).
+#[test]
+fn a_result_without_runs_is_refused_as_empty() {
+    let mut r = result_of(&[("1", &CUBE)], true);
+    r.metrics.clear();
+    assert!(
+        refusal(&r).ends_with("decompose_adaptive: the result has no metrics rows to decompose")
+    );
 }
 
 /// Rows that are not one balanced D × S × R set per subject are refused, never decomposed
@@ -401,6 +419,28 @@ fn rep_one_of_a_replicated_run_is_the_run_without_replicates() {
             });
         assert!(differs, "rep {k} redrew no κ or assay noise");
     }
+}
+
+/// The `Dv` assay noise is redrawn per rep on its own, without an IOV κ to carry the
+/// difference (review r1 row 1): the controller reads the noised value, so rep 2 doses
+/// differently from rep 1 and the within layer is positive. The straddle is the
+/// `Ipred` case of the test below, where the same model has within = 0 exactly.
+///
+/// Mutation: the assay key without the rep (κ keeping it) — reps identical, within 0.
+#[test]
+fn the_assay_noise_is_redrawn_per_rep_without_iov() {
+    let m = model("omega ETA_CL ~ 0.09", "");
+    let r = run(&m, 2, 3, &opts(ObserveMode::Dv, 3), reading_controller);
+    let rep1 = rep_rows(&r.decisions, |d| d.rep, 1);
+    for k in 2..=3 {
+        let differs = rep1.iter().zip(rep_rows(&r.decisions, |d| d.rep, k)).any(|(a, b)| {
+            a.observed_signals[0].value.to_bits() != b.observed_signals[0].value.to_bits()
+        });
+        assert!(differs, "rep {k} redrew no assay noise");
+    }
+    let d = decompose_adaptive(&r).expect("decomposes");
+    let (within, _) = est(&d, &Sc::Population, L::Within);
+    assert!(within > 0.0, "{within}");
 }
 
 /// η (and the class) stay fixed across reps: without IOV and with an `Ipred` monitor there

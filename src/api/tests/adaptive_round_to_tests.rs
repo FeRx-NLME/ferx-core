@@ -329,6 +329,39 @@ fn an_oracle_subject_is_named_with_its_replicates() {
     );
 }
 
+/// With assay replicates the line counts over `n_sim × n_reps` runs and names the first
+/// by its sim and rep (#946 PR3 review r1 row 2): two sims × two reps, an oracle plan
+/// evaluated in each, all four absorbed.
+///
+/// Mutation: the run-level count without `× n_reps` ("4 of 2").
+#[test]
+fn an_oracle_subject_is_counted_over_every_assay_replicate() {
+    let p = model(&block(
+        "500 + 0 * CL",
+        "[250, 4000]",
+        "  dose_knowledge = oracle\n",
+        "signal < 0 : increase 10%",
+    ));
+    let spec = p.adaptive_dosing.as_ref().expect("block present");
+    let opts = AdaptiveSimulateOptions { seed: Some(17), n_reps: 2, ..Default::default() };
+    let r = simulate_adaptive_from_spec(
+        &p.model,
+        &pop(&[("1", 70.0)]),
+        &p.model.default_params,
+        2,
+        spec,
+        &opts,
+    )
+    .expect("runs");
+    let w = absorbed_warnings(&r)[0];
+    assert!(
+        w.contains(
+            "From the start dose on: '1' in 4 of 4 replicate(s), first in sim 1, rep 1 at 500."
+        ),
+        "{w}"
+    );
+}
+
 /// The replicate count is the number of replicates the step is absorbed in, not the
 /// number of replicates (#2890 review r1 row 4). `start_dose = 62.5 * CL` is 375 at the
 /// typical clearance, so a draw below it is placed at 250, where `increase 25%` is

@@ -77,7 +77,10 @@ pub enum AdaptiveVarianceLayer {
     Within,
     /// `Var_i E[Y|i]` over the subjects (population scope only): covariates and design.
     BetweenRow,
-    /// The sum of the estimated lines of the scope.
+    /// `Var(Y | i)` for a subject: the sum of its estimated layers. For the population,
+    /// the pooled variance `mean_i Var(Y | i) + Var_i E[Y | i]`, which is the sum of the
+    /// population lines when no subject's η was supplied (the population `Bsv` averages
+    /// the drawn subjects only).
     Total,
 }
 
@@ -87,7 +90,7 @@ pub enum AdaptiveVarianceLayer {
 pub enum AdaptiveComponentStatus {
     /// The estimate and its jackknife Monte Carlo standard error; `mc_se` is `None` when
     /// a delete-one replicate cannot estimate the layer (two draws for `Parameter`, two
-    /// sims for `Bsv` without parameter uncertainty).
+    /// sims for `Bsv` without parameter uncertainty), and for the `Total` that includes it.
     Estimated {
         /// The estimate, as computed: a negative value is not truncated.
         value: f64,
@@ -219,6 +222,13 @@ fn total_of(lines: &[(Option<f64>, bool)]) -> Option<f64> {
     lines.iter().filter(|(_, reported)| *reported).map(|(v, _)| *v).sum()
 }
 
+/// A subject's `Var(Y | i)`: the sum of its reported layers (BSV only when its η was
+/// drawn, the parameter layer only under uncertainty). One definition for the subject's
+/// `Total` and for the population's pooled one.
+fn subject_total(l: &Layers, supplied: bool, d: usize) -> Option<f64> {
+    total_of(&[(l.param, d > 1), (l.bsv, !supplied), (l.within, true)])
+}
+
 /// Which layers a run of this design identifies; `Err` names the one it cannot.
 fn identifiability(d: usize, s: usize, r: usize, uncertain: bool) -> Result<(), String> {
     if r < 2 {
@@ -262,6 +272,9 @@ pub fn decompose_adaptive(
 ) -> Result<AdaptiveDecomposition, EngineError> {
     let refuse =
         |msg: String| crate::entry_refusals::adaptive_options(format!("decompose_adaptive: {msg}"));
+    if result.metrics.is_empty() {
+        return Err(refuse("the result has no metrics rows to decompose".to_string()));
+    }
     let uncertain = !result.parameters.is_empty();
     let d = result.parameters.len().max(1);
     let s = result.metrics.iter().map(|m| m.sim).max().unwrap_or(0);
@@ -280,6 +293,7 @@ pub fn decompose_adaptive(
     // Subjects in first-seen order, each with whether its η was supplied, and a balance
     // check: every subject has each (draw, sim, rep) exactly once.
     let mut subjects: Vec<(&str, bool)> = Vec::new();
+    let mut runs_of: BTreeMap<&str, usize> = BTreeMap::new();
     let mut seen: BTreeSet<RunKey<'_>> = BTreeSet::new();
     for m in &result.metrics {
         let k = RunKey { subject: &m.subject, draw: m.draw, sim: m.sim, rep: m.rep };
@@ -289,17 +303,16 @@ pub fn decompose_adaptive(
                 k.subject, k.draw, k.sim, k.rep
             )));
         }
-        if !subjects.iter().any(|(id, _)| *id == m.subject) {
+        let runs = runs_of.entry(&m.subject).or_insert(0);
+        if *runs == 0 {
             subjects.push((&m.subject, m.eta_supplied));
         }
+        *runs += 1;
     }
-    if let Some((id, _)) =
-        subjects.iter().find(|(id, _)| seen.iter().filter(|k| k.subject == *id).count() != n_runs)
+    if let Some((id, runs)) =
+        subjects.iter().map(|(id, _)| (id, runs_of[id])).find(|&(_, n)| n != n_runs)
     {
-        return Err(unbalanced(format!(
-            "subject '{id}' has {} of {n_runs} runs",
-            seen.iter().filter(|k| k.subject == *id).count()
-        )));
+        return Err(unbalanced(format!("subject '{id}' has {runs} of {n_runs} runs")));
     }
 
     // Each (metric, subject)'s values in cube order; `None` marks a run without the metric.
@@ -372,8 +385,7 @@ fn push_metric(
             let l = layers(&cube.units, dims, drop);
             // A supplied subject's BSV is computed but never reported: the `Supplied`
             // status below and `total_of`'s `reported` flag are the one gate.
-            let total = total_of(&[(l.param, d > 1), (l.bsv, !cube.supplied), (l.within, true)]);
-            vec![l.param, l.bsv, l.within, total]
+            vec![l.param, l.bsv, l.within, subject_total(&l, cube.supplied, d)]
         };
         let (full, se) = (est(None), jackknife(n_units, est));
         let scope = || AdaptiveVarianceScope::Subject(id.to_string());
@@ -389,8 +401,9 @@ fn push_metric(
     }
 
     // The population: each layer averaged over the subjects (BSV over the drawn ones), the
-    // between-subject variance of the subject means, and their sum. Leaving out a draw
-    // leaves it out for every subject, which share it.
+    // between-subject variance of the subject means, and the pooled variance
+    // `mean_i Var(Y | i) + Var_i E[Y | i]` — the sum of the lines when no subject is supplied.
+    // Leaving out a draw leaves it out for every subject, which share it.
     let n_drawn = cubes.iter().filter(|(_, c)| !c.supplied).count();
     let est = |drop: Option<usize>| {
         let ls: Vec<(Layers, bool)> =
@@ -406,8 +419,9 @@ fn push_metric(
         let n = ls.len() as f64;
         let grand = ls.iter().map(|(l, _)| l.mean).sum::<f64>() / n;
         let between = ls.iter().map(|(l, _)| (l.mean - grand).powi(2)).sum::<f64>() / n;
-        let total =
-            total_of(&[(param, d > 1), (bsv, n_drawn > 0), (within, true), (Some(between), true)]);
+        let totals: Option<Vec<f64>> =
+            ls.iter().map(|(l, sup)| subject_total(l, *sup, d)).collect();
+        let total = totals.map(|t| t.iter().sum::<f64>() / n + between);
         vec![param, bsv, within, Some(between), total]
     };
     let (full, se) = (est(None), jackknife(n_units, est));

@@ -355,9 +355,6 @@ pub fn summarize_adaptive(
     Ok(out)
 }
 
-/// Runs that carry no value. At most one value per run is an engine invariant (one
-/// metrics row per run, and the driver refuses two monitors with one name), so a larger
-/// count is a defect: it panics in release too, rather than wrapping into a huge count.
 /// The run a value came from: `(subject, draw, sim, rep)`, the key of a metrics row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) struct RunKey<'a> {
@@ -391,6 +388,9 @@ pub(super) fn run_values(
     scalars.chain(signals)
 }
 
+/// Runs that carry no value. At most one value per run is an engine invariant (one
+/// metrics row per run, and the driver refuses two monitors with one name), so a larger
+/// count is a defect: it panics in release too, rather than wrapping into a huge count.
 fn missing(n_runs: usize, present: usize) -> usize {
     n_runs.checked_sub(present).expect("more values than runs: one analyte recorded twice")
 }

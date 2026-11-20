@@ -1018,9 +1018,11 @@ the inner layer, so a Θ × η interaction counts as BSV. The metrics are the on
 missing values.
 
 `components` holds one row per metric, scope and layer. The scope is a subject or the
-`Population`. A population row averages that layer over the subjects. Two lines exist only
-at population scope: `BetweenRow`, the variance of the subject means (covariates and
-design), and `Total`, the sum of the population lines. Each estimate carries a Monte
+`Population`. A population row averages that layer over the subjects. `BetweenRow`, the
+variance of the subject means (covariates and design), exists only at population scope.
+`Total` is `Var(Y | i)` for a subject, the sum of its layers. For the population it is the
+pooled variance, `mean_i Var(Y | i) + Var_i E[Y | i]`, which is the sum of the population
+lines unless some subject's η was supplied (see below). Each estimate carries a Monte
 Carlo standard error (`mc_se`).
 
 #### Assay replicates
@@ -1046,7 +1048,7 @@ controller reading a `Dv` monitor chooses.
 | `n_sim = 1` | Refused: BSV is confounded with the parameter layer |
 | Uncertainty with `n_draws = 1` | Refused: one draw cannot estimate the parameter layer |
 | No uncertainty | `Parameter` is `NotDrawn`, not 0 |
-| Supplied η (`with_etas`) | That subject's `Bsv` is `Supplied`. The population BSV averages the drawn subjects. Within and `BetweenRow` average all of them. |
+| Supplied η (`with_etas`) | That subject's `Bsv` is `Supplied`, and its `Total` has no BSV. The population BSV averages the drawn subjects; within and `BetweenRow` average all of them. So the population `Total`, the pooled variance, is then less than the sum of the population lines. |
 | A metric missing in a run | Skipped for that subject and counted in `skipped`, never imputed |
 
 #### Estimator and standard error
@@ -1061,7 +1063,8 @@ analytic fixture below and on two 0/1 metrics, over 300 seeds, its mean was 0.90
 of the empirical SD in all 30 cells (four designs, three layers). The normal-theory
 formula, `Var(MS) = 2 MS²/df`, gave 0.51 to 1.67: the metrics are skewed or discrete, so
 it is not used. `mc_se` is `None` when a delete-one replicate cannot form the layer
-(`Parameter` with two draws, `Bsv` with two sims and no uncertainty).
+(`Parameter` with two draws, `Bsv` with two sims and no uncertainty), and for the
+`Total` that includes it.
 
 The parameter layer's error is about `2/√D`: draws, not sims, buy its precision.
 
