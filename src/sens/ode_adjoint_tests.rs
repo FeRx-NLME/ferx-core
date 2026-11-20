@@ -11581,3 +11581,88 @@ fn a_rejected_step_with_non_finite_stages_matches_reconverged_fd() {
     // oracle's finiteness assert fails first.
     assert!(worst < 1e-7, "worst relative difference {worst:.2e}");
 }
+
+/// #3078: the step loop's log is a checkpoint its reverse runs forward again from, and the exact
+/// derivatives must be those of the full log **bit for bit** — the outer gradient (one-seed
+/// reverses) and the covariance Hessian (its bases through the rows loop, every seed's tangents
+/// in one checkpoint) — on a non-stiff and a stiff integration of a nonlinear system, and
+/// across a moving switch whose arms jump (#2649: located crossings, forced steps, recorded
+/// jumps, rejected trial steps). `REPLAY_FROM_FULL` reverses from the full log test builds keep
+/// beside the checkpoint; every replay in a test build also checks each body input it
+/// regenerates that the body reads against that log.
+///
+/// Regression caught: a replay that regenerates a read input wrongly (a save skipped, the
+/// clock or a jump's state copy not replayed) — the replay's own bitwise check fails, and an
+/// input it only passes through but that some later body reads would part the adjoints here.
+#[test]
+fn checkpointed_loop_logs_give_the_full_logs_derivatives_bit_for_bit() {
+    use crate::ode::solver::OdeMethod;
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::{
+        REPLAYED, REPLAY_FROM_FULL, ROWS_RUNS,
+    };
+    let mm = |method: OdeMethod| {
+        let mut model = parse_model_string(MM_ODE).unwrap();
+        model.ode_spec.as_mut().unwrap().solver_opts.method = method;
+        let s = subject(
+            &model,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &TIMES,
+            &[0.1, -0.05, 0.2],
+        );
+        (model, s)
+    };
+    let (rk, rk_s) = mm(OdeMethod::Rk45);
+    let (ro, ro_s) = mm(OdeMethod::Rodas5P);
+    let (sw, sw_s) = moving_jump_fixture(3.0);
+    for (name, model, s) in
+        [("mm rk45", &rk, &rk_s), ("mm rodas5p", &ro, &ro_s), ("jump", &sw, &sw_s)]
+    {
+        assert!(in_scope(model, s), "{name}: the exact derivatives must serve it");
+        let params = moved_params(model);
+        let x = pack_params(&params);
+        let eta = ebe_for(model, s, &params, 1e-10, true);
+        let run = |from_full: bool| {
+            with_fit_stack(|| {
+                REPLAY_FROM_FULL.with(|c| c.set(from_full));
+                REPLAYED.with(|c| c.set(0));
+                ROWS_RUNS.with(|c| c.set([0; 3]));
+                let g =
+                    subject_adjoint_packed_gradient(model, s, &params, &x, eta.as_slice(), true)
+                        .expect("in scope");
+                let h = subject_adjoint_cov_hessian(
+                    model,
+                    s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    Objective::Focei,
+                )
+                .expect("in scope");
+                REPLAY_FROM_FULL.with(|c| c.set(false));
+                let counts =
+                    (REPLAYED.with(std::cell::Cell::get), ROWS_RUNS.with(std::cell::Cell::get)[2]);
+                let bits: Vec<u64> = g.iter().chain(h.iter()).map(|v| v.to_bits()).collect();
+                (bits, counts)
+            })
+        };
+        let (got, (replayed, rows)) = run(false);
+        let (want, _) = run(true);
+        eprintln!("{name}: {replayed} bodies replayed, {rows} rows loop runs");
+        assert!(replayed > 0, "{name}: no body was replayed");
+        assert!(rows > 0, "{name}: the covariance bases must take the rows loop");
+        assert!(got.iter().all(|&b| f64::from_bits(b).is_finite()), "{name}: finite");
+        assert_eq!(got.len(), want.len());
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                a,
+                b,
+                "{name}: entry {i}: {} vs {} from the full log",
+                f64::from_bits(*a),
+                f64::from_bits(*b)
+            );
+        }
+    }
+}

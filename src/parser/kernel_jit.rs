@@ -36,6 +36,8 @@ mod matrix;
 #[path = "kernel_jit_loop.rs"]
 mod ode_loop;
 #[cfg(test)]
+pub(crate) use ode_loop::{REPLAYED, REPLAY_FROM_FULL};
+#[cfg(test)]
 #[path = "kernel_jit_plan_tests.rs"]
 mod plan_tests;
 #[path = "kernel_jit_simd.rs"]
