@@ -175,6 +175,7 @@ website:
           - development/sdlc.qmd
           - development/docs-lint.qmd
           - development/golden-fits.qmd
+          - development/peak-memory.qmd
 
   page-footer:
     background: light
