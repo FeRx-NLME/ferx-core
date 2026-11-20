@@ -403,7 +403,19 @@ fn a_zero_score_names_its_parameters() {
         ),
         "{two}"
     );
-    for m in [&all, &one, &two] {
+    // Between the zero floor (1e-20) and the eigen floor (1e-10): named alone, not collinear.
+    let near = singular_msg(
+        &cross(&[[1.0, 1e-7, 2.0], [3.0, -2e-7, -1.0], [2.0, 1e-7, 5.0]]),
+        3,
+    );
+    assert!(
+        near.contains(
+            "(covariance_method = s). The score for TVVB is nearly zero in every subject \
+             relative to the others, so the data barely inform it; fix or remove it. SE"
+        ),
+        "{near}"
+    );
+    for m in [&all, &one, &two, &near] {
         let other = ["rank at most", "rsr", "collinear"];
         assert!(!other.iter().any(|o| m.contains(o)), "{m}");
     }
@@ -481,5 +493,18 @@ fn collinear_scores_name_the_parameters_they_cancel_in() {
              the data inform only a combination of them; fix or remove one of them. SE"
         ),
         "{m}"
+    );
+    // Rank 1 over three: two clipped eigenvalues, both loading on every coordinate, so each
+    // name is listed once and two must go.
+    let rank1 = singular_msg(
+        &cross(&[[1.0, 2.0, 3.0], [-2.0, -4.0, -6.0], [0.5, 1.0, 1.5]]),
+        3,
+    );
+    assert!(
+        rank1.contains(
+            "(covariance_method = s). The per-subject scores of TVKON, TVVB, TVV are collinear, \
+             so the data inform only a combination of them; fix or remove 2 of them. SE"
+        ),
+        "{rank1}"
     );
 }

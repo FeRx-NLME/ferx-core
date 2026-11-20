@@ -561,7 +561,8 @@ pub(crate) fn free_coordinate_names(template: &ModelParameters, free_idx: &[usiz
 /// naming the cause (#1780), judged on the matrix the inverse judges (its unit-free scaling and
 /// floor): free coordinates whose score is zero in every subject; fewer subjects than free
 /// coordinates; else the other coordinates loading on the eigenvectors the floor clips (at
-/// least 0.1 of each one's largest loading). `names` are the free coordinates', in `s`'s order.
+/// least 0.1 of each one's largest loading): one alone is a near-zero score, and `k` clipped
+/// eigenvalues need `k` of them fixed. `names` are the free coordinates', in `s`'s order.
 /// Only a design with no zero score is advised `r`/`rsr`: otherwise the objective is flat along
 /// the same direction, so `R` is singular too.
 pub(crate) fn s_singular_msg(
@@ -613,20 +614,42 @@ pub(crate) fn s_singular_msg(
             );
         }
     } else if zero.len() < n {
-        let eig = SymmetricEigen::new(c);
+        // On the scored coordinates only: a zero score's null direction is degenerate with a
+        // collinear one, so the eigensolver could mix the two and miscount `low`.
+        let nz: Vec<usize> = (0..n).filter(|i| !zero.contains(i)).collect();
+        let eig = SymmetricEigen::new(c.select_rows(&nz).select_columns(&nz));
         let floor = psd_floor(eig.eigenvalues.max());
+        let low: Vec<usize> = (0..nz.len())
+            .filter(|&k| eig.eigenvalues[k] < floor)
+            .collect();
         let mut ix: Vec<usize> = Vec::new();
-        for k in (0..n).filter(|&k| eig.eigenvalues[k] < floor) {
+        for &k in &low {
             let w = eig.eigenvectors.column(k);
             let top = w.amax();
-            ix.extend((0..n).filter(|&i| w[i].abs() >= 0.1 * top && !zero.contains(&i)));
+            ix.extend(
+                (0..nz.len())
+                    .filter(|&i| w[i].abs() >= 0.1 * top)
+                    .map(|i| nz[i]),
+            );
         }
         ix.sort_unstable();
         ix.dedup();
-        if !ix.is_empty() {
+        if ix.len() == 1 {
+            cause.push(format!(
+                "The score for {} is nearly zero in every subject relative to the others, so the \
+                 data barely inform it; fix or remove it.",
+                list(&ix)
+            ));
+        } else if !ix.is_empty() {
+            let k = low.len();
+            let which = if k == 1 {
+                "one".to_string()
+            } else {
+                k.to_string()
+            };
             cause.push(format!(
                 "The per-subject scores of {} are collinear, so the data inform only a \
-                 combination of them; fix or remove one of them.",
+                 combination of them; fix or remove {which} of them.",
                 list(&ix)
             ));
         }
