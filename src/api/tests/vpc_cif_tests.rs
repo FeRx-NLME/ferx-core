@@ -228,9 +228,13 @@ fn causes_are_read_by_cmt_in_data_and_replicates() {
         let (a, b) = (s.causes[0].band.med[g].unwrap(), s.causes[1].band.med[g].unwrap());
         assert!(a > 2.0 * b, "t = {}: median F_A = {a}, F_B = {b}", s.grid[g]);
     }
-    // At t = 10 the closed form gives F_A = 0.2/0.22·(1 − e^{−2.2}) = 0.810.
+    // At t = 10 the closed form gives F_A = 0.2/0.22·(1 − e^{−2.2}) = 0.80836. Measured on
+    // macOS arm64: median 0.80229, |Δ| = 0.0061. The bound 0.04 keeps 6.5× that, and about
+    // 3.3 standard deviations of a 40-replicate median here (sd ≈ 0.012, review r1 row 3).
+    let want = 0.2 / 0.22 * (1.0 - (-2.2f64).exp());
     let fa = s.causes[0].band.med[2].unwrap();
-    assert!((fa - 0.810).abs() < 0.08, "median F_A at 10 = {fa}");
+    eprintln!("T8: median F_A at 10 = {fa}, |Δ| from {want:.5} = {:.4}", (fa - want).abs());
+    assert!((fa - want).abs() < 0.04, "median F_A at 10 = {fa}, closed form {want}");
 }
 
 /// T8b, the `competing_event_is_not_an_observed_censoring` analogue. Every subject has
