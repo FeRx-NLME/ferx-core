@@ -108,11 +108,14 @@ fn saem_additive_mu_reference_reaches_the_mle_like_nonmem_mu() {
 
     let split = fit("saem_additive_mu.ferx");
     let inline = fit("saem_additive_mu_inline.ferx");
-    // The control runs the pre-#2986 schedule (150 + 250 iterations, one chain): it
-    // shows what mu-referencing buys at a fixed budget. At the current defaults
-    // (automatic exploration, 1000 accumulation iterations, two chains) the
-    // non-mu-referenced spelling also gets close (measured 166.12, MLE + 0.30).
+    // The control runs the pre-#2986 E-step and schedule (the random-walk kernels, 150 + 250
+    // iterations, one chain), where the margins below were measured: it shows what
+    // mu-referencing buys at a fixed budget. At the current defaults (HMC, automatic
+    // exploration, 1000 accumulation iterations, two chains) the non-mu-referenced spelling
+    // also gets close (measured 166.12, MLE + 0.30), and HMC alone at the old schedule
+    // reaches MLE + 0.024 at the default seed (Linux CI).
     let shared = fit_with("saem_additive_mu_shared.ferx", |o| {
+        o.saem_kernel = ferx_core::types::SaemKernel::RandomWalk;
         o.saem_n_exploration = Some(150);
         o.saem_n_convergence = 250;
         o.saem_n_chains = 1;
