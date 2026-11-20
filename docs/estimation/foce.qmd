@@ -752,7 +752,7 @@ The SIR fallback inherits all `sir_*` settings (`sir_samples`, `sir_df`, `sir_re
 
 The outer loop terminates when any of:
 - The gradient norm falls below `outer_gtol` (default 1e-6)
-- The budget `maxiter` sets is spent: on the NLopt optimizers that is `maxiter × (n + 1)` objective evaluations (more for `bobyqa`), not iterations ([what `maxiter` counts](../model-file/fit-options.qmd#maxiter-budget))
+- `maxiter` is spent (objective evaluations on the NLopt optimizers, iterations on `trust_region`; [what it counts](../model-file/fit-options.qmd#maxiter-budget))
 - The optimizer reports convergence (NLopt `XtolReached` or `FtolReached`)
 
 The inner loop terminates when the gradient norm falls below `inner_tol` (default `1e-5`, tight enough that residual EBE noise does not perturb the marginal objective the outer optimizer minimises — see [`fit-options.md`](../model-file/fit-options.qmd#general-options) for tuning guidance) or `inner_maxiter` (default 200) iterations are reached.
