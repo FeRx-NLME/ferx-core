@@ -425,6 +425,38 @@ fn gap_band_is_built_from_the_replicates_gap_time_curves() {
     assert!(abs.is_finite() && (abs - 1.75 * (-0.75f64).exp()).abs() < 0.06, "absolute {abs}");
 }
 
+/// A gap curve that reached 0 is undefined past its last time, observed and replicate
+/// alike (#2930). 30 subjects with events at 1, 2 and 3 (+ 0.01·i) and censored at
+/// 3.5: every subject at risk for the second gap has it, at gap 1, so the observed
+/// gap-order-2 curve reaches 0 at 1, and grid time 5 is past it. Under the rule before
+/// #2930 the observed value was `Some(0.0)` and `n_used` 3 (the replicates that reached
+/// 0); carrying the last value forward gives `Some(0.0)` and 20.
+#[test]
+fn gap_curve_is_undefined_past_its_last_time_even_at_zero() {
+    const RTTE_FAST: &str = "\n[parameters]\n  theta TVLAMBDA(0.5, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  type   = rtte\n  clock  = forward\n  family = exponential\n  scale  = TVLAMBDA\n";
+    let p = pop((1..=30)
+        .map(|i| {
+            let d = 0.01 * i as f64;
+            stream(&i.to_string(), 3.5, &[1.0 + d, 2.0 + d, 3.0 + d])
+        })
+        .collect());
+    let mut o = opts(20);
+    o.max_order = Some(2);
+    o.sim.horizon = Some(10.0);
+    o.grid = VpcGrid::Times(vec![0.5, 5.0]);
+    let v = run(RTTE_FAST, &p, &o).unwrap();
+    let g2 = &v.strata[0].gap[0];
+    assert_eq!(g2.order, 2);
+    // The straddle: the observed curve reached 0, and 5 is past its last time.
+    assert_eq!(g2.observed.surv.last(), Some(&0.0));
+    assert!(5.0 > *g2.observed.time.last().unwrap(), "{:?}", g2.observed.time);
+    // Control at 0.5: every second gap is 1, so nobody has had it yet.
+    assert_eq!(g2.obs_on_grid[0], Some(1.0));
+    // Past the last time, even at zero.
+    assert_eq!(g2.obs_on_grid[1], None, "observed past its last time");
+    assert_eq!(g2.n_used[1], 0, "no replicate gap-2 curve is followed up to 5");
+}
+
 /// The simulator's warnings reach the result (review r1 row 4). At a rate of 1e6 the
 /// simulator expects 2e7 events before the horizon, skips every stream and says so, one
 /// `W_RTTE_DEGENERATE` per subject per replicate. Those replicate subjects have no

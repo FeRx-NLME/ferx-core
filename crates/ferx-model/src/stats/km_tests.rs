@@ -67,16 +67,20 @@ fn km_groups_ties_into_one_row() {
     assert_eq!(c.n_censor, [1, 0, 0, 1, 0, 1, 1]);
 }
 
-/// T3. Past the last time a curve is undefined unless it has reached zero. Always
-/// carrying the last value forward breaks the first assertion; always returning
-/// `None` breaks the second.
+/// T3. Past the last time a curve is undefined, also when it has reached zero
+/// (#2930), and the last time itself is defined. Returning `Some(0.0)` past the end
+/// of a curve that reached zero (the rule before #2930) breaks the `hit_zero.at(3.0)`
+/// assertion; carrying the last value forward breaks `censored_last.at(4.0)`; `>=`
+/// for `>` breaks both last-time assertions.
 #[test]
-fn km_at_past_last_time_is_none_unless_curve_reached_zero() {
+fn km_at_past_last_time_is_none() {
     let censored_last = kaplan_meier(&[1.0, 2.0, 3.0], &[true, true, false]).unwrap();
     assert_eq!(censored_last.at(4.0), None);
     assert!((censored_last.at(3.0).unwrap() - 1.0 / 3.0).abs() < 1e-15);
     let hit_zero = kaplan_meier(&[1.0, 2.0], &[true, true]).unwrap();
-    assert_eq!(hit_zero.at(3.0), Some(0.0));
+    assert_eq!(hit_zero.surv.last(), Some(&0.0), "fixture must reach zero");
+    assert_eq!(hit_zero.at(2.0), Some(0.0), "the last time is defined");
+    assert_eq!(hit_zero.at(3.0), None, "past the last time, even at zero");
     // Before the first time, and between steps.
     assert_eq!(hit_zero.at(0.5), Some(1.0));
     assert_eq!(hit_zero.at(1.5), Some(0.5));
@@ -112,6 +116,27 @@ fn band_uses_only_curves_defined_at_the_grid_time() {
     let mut v: Vec<f64> = (0..22).map(|i| (i + 1) as f64 / 30.0).collect();
     v.sort_by(f64::total_cmp);
     assert_eq!(band.lo[1], Some(quantile_sorted(&v, 0.05)));
+    assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
+    assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
+}
+
+/// A replicate whose curve reached 0 before the grid time is past its last time
+/// there, so it is left out like any other (#2930): 22 curves are followed to 10,
+/// 3 reach 0 at 2. Counting the 3 as 0 (the rule before #2930) gives `n_used` 25 and
+/// pulls `lo` to 0, a point mass the observed curve can then never fall below.
+#[test]
+fn band_leaves_out_a_replicate_that_reached_zero_before_the_grid_time() {
+    let mut curves: Vec<KmCurve> = (0..22).map(|i| flat((i + 1) as f64 / 30.0, 10.0)).collect();
+    let zero = kaplan_meier(&[1.0, 2.0], &[true, true]).unwrap();
+    assert_eq!(zero.surv.last(), Some(&0.0), "fixture must reach zero");
+    curves.extend((0..3).map(|_| zero.clone()));
+    let band = vpc_band(&curves, &[1.0, 5.0], [0.05, 0.5, 0.95]).unwrap();
+    assert_eq!(band.n_used, [25, 22], "the 3 zero curves count at 1, not at 5");
+    let mut v: Vec<f64> = (0..22).map(|i| (i + 1) as f64 / 30.0).collect();
+    v.sort_by(f64::total_cmp);
+    let lo = band.lo[1].expect("22 curves resolve the band");
+    assert_eq!(lo, quantile_sorted(&v, 0.05));
+    assert!(lo > 0.0, "lo = {lo}: the zero curves must not reach the quantile");
     assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
     assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
 }
