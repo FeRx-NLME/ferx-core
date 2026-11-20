@@ -168,7 +168,7 @@ pub struct TteVpc {
 
 /// A replicate's draw `(t, observed)` censored at the subject's censoring time `c`: a
 /// draw past `c` becomes `(c, censored)`, anything else is kept.
-fn post_censor(t: f64, observed: bool, c: f64) -> (f64, bool) {
+pub(super) fn post_censor(t: f64, observed: bool, c: f64) -> (f64, bool) {
     if t > c {
         (c, false)
     } else {
@@ -179,7 +179,7 @@ fn post_censor(t: f64, observed: bool, c: f64) -> (f64, bool) {
 /// The censoring distribution `G` of `rows`: their reverse Kaplan–Meier curve, a subject
 /// observed censored counting as a censoring "event" and every other subject as censored
 /// for it. Built per stratum by the caller.
-fn censoring_curve<'a>(rows: impl Iterator<Item = &'a ObsRow>) -> KmCurve {
+pub(super) fn censoring_curve<'a>(rows: impl Iterator<Item = &'a ObsRow>) -> KmCurve {
     let (t, c): (Vec<f64>, Vec<bool>) = rows.map(|r| (r.time, r.censor_at.is_some())).unzip();
     kaplan_meier(&t, &c)
         .expect("`observed_rows` refuses a time that is not finite and non-negative")
@@ -198,7 +198,7 @@ fn draw_censoring(g: &KmCurve, t: f64, u: f64, horizon: f64) -> f64 {
 }
 
 /// A uniform `[0, 1)` from `(seed, sim, subject)`, independent of row order (SplitMix64).
-fn censoring_uniform(seed: u64, sim: usize, subject: usize) -> f64 {
+pub(super) fn censoring_uniform(seed: u64, sim: usize, subject: usize) -> f64 {
     let mut z = seed
         ^ (sim as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (subject as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -244,11 +244,14 @@ pub(super) fn horizon_and_cut(rows: &mut [ObsRow], sim_horizon: Option<f64>) -> 
 /// the function the caller called. [`vpc_rtte`](super::vpc_rtte) shares the endpoint,
 /// record, strata and grid helpers below, and [`vpc_kmmc`](super::vpc_kmmc) also the
 /// observed rows, the horizon and its cut ([`horizon_and_cut`]) and the replicate loop.
+/// [`vpc_cif`](super::vpc_cif) shares the record, strata, grid and censoring helpers and
+/// the cut, but resolves its causes and reads its rows itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Entry {
     Tte,
     Rtte,
     Kmmc,
+    Cif,
 }
 
 impl std::fmt::Display for Entry {
@@ -257,6 +260,7 @@ impl std::fmt::Display for Entry {
             Entry::Tte => "vpc_tte",
             Entry::Rtte => "vpc_rtte",
             Entry::Kmmc => "vpc_kmmc",
+            Entry::Cif => "vpc_cif",
         })
     }
 }
@@ -399,13 +403,15 @@ pub(super) fn resolve_cmt(
                 Entry::Tte => {
                     " Under competing risks 1 − KM of one cause is not its cumulative \
                      incidence: the curve is that cause's survival with the other causes as \
-                     censoring."
+                     censoring. `vpc_cif` draws the cumulative incidence of every cause."
                 }
                 Entry::Kmmc => {
                     " Under competing risks the risk set of one cause holds the subjects \
-                     free of every cause, so the other causes act as censorings."
+                     free of every cause, so the other causes act as censorings. `vpc_cif` \
+                     draws the cumulative incidence of every cause."
                 }
-                Entry::Rtte => "",
+                // `vpc_cif` takes every TTE endpoint and never resolves one `cmt`.
+                Entry::Rtte | Entry::Cif => "",
             };
             return Err(refuse(format!(
                 "{who}: the model has TTE endpoints on cmt {list}; set `cmt` to the one to \
@@ -474,6 +480,7 @@ pub(super) fn checked_record(
                 Entry::Tte => "A Kaplan–Meier curve needs",
                 Entry::Kmmc => "A Kaplan–Meier mean covariate needs",
                 Entry::Rtte => "The repeated-events curves need",
+                Entry::Cif => "A cumulative incidence curve needs",
             };
             Err(refuse(format!(
                 "{who}: subject {id} has an interval-censored record on cmt {cmt}. {needs} \

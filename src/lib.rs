@@ -96,6 +96,9 @@ pub use api::{
     predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
     SurvivalPredictionOutput, SurvivalPredictionResult,
 };
+// Cumulative-incidence VPC of competing risks: every cause's Aalen–Johansen curve (#1887).
+#[cfg(feature = "survival")]
+pub use api::{vpc_cif, CifCauseBand, CifVpc, CifVpcBand, CifVpcStratum, VpcCifOptions};
 // Kaplan–Meier mean covariate VPC of a single-event TTE endpoint (#1886).
 #[cfg(feature = "survival")]
 pub use api::{vpc_kmmc, KmmcVpc, KmmcVpcStratum, VpcKmmcOptions};

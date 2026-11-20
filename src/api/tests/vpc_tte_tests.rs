@@ -529,7 +529,8 @@ fn refuses_two_tte_endpoints_without_cmt() {
         run(COMPETING, &p, &opts(20)),
         "vpc_tte: the model has TTE endpoints on cmt 2, 3; set `cmt` to the one to check. \
          Under competing risks 1 − KM of one cause is not its cumulative incidence: the curve \
-         is that cause's survival with the other causes as censoring.",
+         is that cause's survival with the other causes as censoring. `vpc_cif` draws the \
+         cumulative incidence of every cause.",
     );
 }
 
