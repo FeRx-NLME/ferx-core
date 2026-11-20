@@ -17,7 +17,8 @@
 //! so the reset follows the data instead of preceding the dose. Only `TVCL` is
 //! estimated. NONMEM 7.5.1 at the same estimates, `MAXEVAL=0`, gives −219.629822 from
 //! η = 0 (`MCETA=0`) and −235.253006 with `MCETA=1000`; ferx matches both to 6 decimals at
-//! `maxiter = 0` (#2013's comparison).
+//! `maxiter = 0` (#2013's comparison). That run had the reset before the dose; either reset
+//! is inert, so the objectives are the same.
 //!
 //! This test in a debug build: with the gate reverted to `eta_init.is_none()` the fit
 //! reports OFV −235.559329, `converged = false`, `W_EBE_START_DEPENDENT` and

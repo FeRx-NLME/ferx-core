@@ -4211,7 +4211,10 @@ fn a_reset_is_effective_only_after_a_record() {
                2,0,.,3,.,1,1\n2,2,.,1,100,1,1\n2,3,5,0,.,1,0\n\
                3,0,.,1,100,1,1\n3,0,.,4,100,1,1\n3,1,5,0,.,1,0\n\
                4,0,.,1,100,1,1\n4,1,5,0,.,1,0\n4,5,.,3,.,1,1\n4,6,5,0,.,1,0\n\
-               5,0,.,1,100,1,1\n5,1,5,0,.,1,0\n";
+               5,0,.,1,100,1,1\n5,1,5,0,.,1,0\n\
+               6,0,4,0,.,1,0\n6,1,.,3,.,1,1\n6,2,.,1,100,1,1\n6,3,5,0,.,1,0\n\
+               7,0,.,2,.,1,1\n7,1,.,3,.,1,1\n7,2,.,1,100,1,1\n7,3,5,0,.,1,0\n\
+               8,0,.,0,.,1,0\n8,1,.,3,.,1,1\n8,2,.,1,100,1,1\n8,3,5,0,.,1,0\n";
     let path = std::env::temp_dir().join(format!("ferx_2081_{}.csv", std::process::id()));
     std::fs::write(&path, csv).unwrap();
     let pop = crate::read_nonmem_csv(&path, None, None).unwrap();
@@ -4219,10 +4222,12 @@ fn a_reset_is_effective_only_after_a_record() {
     let got: Vec<(bool, bool)> =
         pop.subjects.iter().map(|s| (s.has_resets(), s.has_effective_resets())).collect();
     // The first-record EVID=4, an EVID=3 ahead of the first dose, a dose then EVID=4 at the
-    // same time, a reset after a dose, no reset.
-    assert_eq!(got, [(true, false), (true, false), (true, true), (true, true), (false, false)]);
+    // same time, a reset after a dose, no reset; a reset after an observation and after an
+    // `EVID=2` row, with no dose before it; one after a dropped missing-DV row (no record).
+    let (inert, live) = ((true, false), (true, true));
+    assert_eq!(got, [inert, inert, live, live, (false, false), live, live, inert]);
     // A subject with endpoint records counts any reset as effective, the conservative side.
-    let inert = Subject { reset_times: vec![0.0], ..Subject::default() };
+    let bare = Subject { reset_times: vec![0.0], ..Subject::default() };
     let endpoint = Subject {
         obs_records: vec![crate::types::ObsRecord::Count {
             time: 5.0,
@@ -4230,7 +4235,9 @@ fn a_reset_is_effective_only_after_a_record() {
             count: 1,
             cmt: 1,
         }],
-        ..inert.clone()
+        ..bare.clone()
     };
-    assert!(!inert.has_effective_resets() && endpoint.has_effective_resets());
+    assert!(!bare.has_effective_resets() && endpoint.has_effective_resets());
+    // ... but only with a reset: endpoint records alone are not one.
+    assert!(!Subject { reset_times: Vec::new(), ..endpoint }.has_effective_resets());
 }
