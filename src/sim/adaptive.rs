@@ -239,7 +239,8 @@ pub struct DoseLedgerEntry {
     /// Human-readable tag for the action/rule that fired (e.g. `"bolus"`, or a
     /// named ladder rule once S2 lands).
     pub rule_fired: String,
-    /// What the controller observed at this decision (per-analyte value + mode).
+    /// The signals at this decision, per analyte: the value the controller saw, its
+    /// latent readout (which the controller did not see, #946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
     /// State immediately before / after the dose discontinuity, for the mass-balance
     /// checks (S6). `None` when snapshots are not retained.
@@ -296,8 +297,8 @@ impl DecisionOutcome {
 
 /// One decision the controller made, recorded for every decision time (holds included):
 /// the Part-D decision log and the input to the Part-E audit replay (S1.6). It pins what
-/// the controller saw (`observed_signals`, which under `Dv` holds the realized assay
-/// draw) and what it did. `state`, covariates and history are re-derivable from the
+/// the controller saw (`observed_signals`, whose `value` under `Dv` holds the realized
+/// assay draw, next to the `latent` readout the controller did not see) and what it did. `state`, covariates and history are re-derivable from the
 /// frozen inputs, so they are not stored. Nothing is logged after a `Stop`.
 /// `#[non_exhaustive]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -313,8 +314,8 @@ pub struct DecisionLogEntry {
     pub decision_idx: usize,
     /// Decision time on the subject's clock.
     pub time: f64,
-    /// What the controller observed at this decision (per-analyte value + mode) —
-    /// the exact inputs to reproduce the decision.
+    /// The signals at this decision, per analyte: the value the controller saw (the
+    /// exact input to reproduce the decision), its latent readout (#946) and the mode.
     pub observed_signals: Vec<ObservedSignal>,
     /// What the controller did (dose / hold / stop), or `NotDue`.
     pub outcome: DecisionOutcome,
@@ -467,6 +468,9 @@ pub(crate) fn compute_subject_metrics(
         (Some(min), Some(max), Some(mean))
     };
     let pct_readings_in_window = match target_window {
+        // A NaN reading fails both comparisons and would count as a miss; surface it
+        // instead, as the min/max fold above does (same unreachable-today guard, #1578).
+        Some(_) if signal_vals.iter().any(|v| v.is_nan()) => Some(f64::NAN),
         Some((lo, hi)) if !signal_vals.is_empty() => {
             let n_in = signal_vals.iter().filter(|&&v| v >= lo && v <= hi).count();
             Some(n_in as f64 / signal_vals.len() as f64)
@@ -2623,10 +2627,11 @@ mod tests {
     }
 
     #[test]
-    fn metrics_signal_min_max_propagate_nan_946() {
+    fn metrics_signal_summary_and_window_propagate_nan_946() {
         // Unreachable through the engine (#1578 refuses a non-finite readout), so the
         // signal is hand-built. `f64::min`/`f64::max` would drop the NaN and report the
-        // finite readings' 5 and 9 as if nothing happened.
+        // finite readings' 5 and 9 as if nothing happened; the window count would score
+        // it as a miss (2/3, since the band [5, 9] holds every finite reading).
         let ledger = vec![ledger_entry(100.0)];
         for nan_at in 0..3 {
             let mut latents = [5.0, 7.0, 9.0];
@@ -2636,7 +2641,20 @@ mod tests {
                 .enumerate()
                 .map(|(k, &l)| dv_decision(24.0 * k as f64, 1.0, l))
                 .collect();
-            let m = compute_subject_metrics("S", 1, 1, &ledger, &decisions, None, None, &[]);
+            let m = compute_subject_metrics(
+                "S",
+                1,
+                1,
+                &ledger,
+                &decisions,
+                Some((5.0, 9.0)),
+                None,
+                &[],
+            );
+            assert!(
+                m.pct_readings_in_window.is_some_and(f64::is_nan),
+                "NaN at {nan_at}: window {m:?}"
+            );
             assert!(m.signal_min.is_some_and(f64::is_nan), "NaN at {nan_at}: min {m:?}");
             assert!(m.signal_max.is_some_and(f64::is_nan), "NaN at {nan_at}: max {m:?}");
             assert!(m.signal_mean.is_some_and(f64::is_nan), "NaN at {nan_at}: mean");
