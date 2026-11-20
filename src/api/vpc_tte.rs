@@ -168,7 +168,7 @@ pub struct TteVpc {
 
 /// A replicate's draw `(t, observed)` censored at the subject's censoring time `c`: a
 /// draw past `c` becomes `(c, censored)`, anything else is kept.
-pub(super) fn post_censor(t: f64, observed: bool, c: f64) -> (f64, bool) {
+fn post_censor(t: f64, observed: bool, c: f64) -> (f64, bool) {
     if t > c {
         (c, false)
     } else {
@@ -179,7 +179,7 @@ pub(super) fn post_censor(t: f64, observed: bool, c: f64) -> (f64, bool) {
 /// The censoring distribution `G` of `rows`: their reverse Kaplan–Meier curve, a subject
 /// observed censored counting as a censoring "event" and every other subject as censored
 /// for it. Built per stratum by the caller.
-pub(super) fn censoring_curve<'a>(rows: impl Iterator<Item = &'a ObsRow>) -> KmCurve {
+fn censoring_curve<'a>(rows: impl Iterator<Item = &'a ObsRow>) -> KmCurve {
     let (t, c): (Vec<f64>, Vec<bool>) = rows.map(|r| (r.time, r.censor_at.is_some())).unzip();
     kaplan_meier(&t, &c)
         .expect("`observed_rows` refuses a time that is not finite and non-negative")
@@ -198,7 +198,7 @@ fn draw_censoring(g: &KmCurve, t: f64, u: f64, horizon: f64) -> f64 {
 }
 
 /// A uniform `[0, 1)` from `(seed, sim, subject)`, independent of row order (SplitMix64).
-pub(super) fn censoring_uniform(seed: u64, sim: usize, subject: usize) -> f64 {
+fn censoring_uniform(seed: u64, sim: usize, subject: usize) -> f64 {
     let mut z = seed
         ^ (sim as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ (subject as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -289,6 +289,48 @@ pub(super) fn replicate_censoring(
     }
 }
 
+/// How every replicate draw is censored: under [`VpcCensoring::Observed`] at the subject's
+/// censoring time from [`replicate_censoring`] (its stratum's `G`, a uniform keyed by
+/// `(seed, sim, row index)`), under [`VpcCensoring::Horizon`] not at all. The one
+/// implementation [`vpc_tte`], [`vpc_kmmc`](super::vpc_kmmc) and
+/// [`vpc_cif`](super::vpc_cif) share, so with one cause `vpc_cif` draws `vpc_tte`'s
+/// replicates bit for bit.
+pub(super) struct ReplicateCensor {
+    censoring: VpcCensoring,
+    rule: TteCensorRule,
+    seed: u64,
+    /// The censoring distribution of each stratum.
+    g: Vec<KmCurve>,
+    horizon: f64,
+}
+
+impl ReplicateCensor {
+    pub(super) fn new(
+        censoring: VpcCensoring, rule: TteCensorRule, seed: Option<u64>, rows: &[ObsRow],
+        n_strata: usize, horizon: f64,
+    ) -> Self {
+        let g = (0..n_strata)
+            .map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k)))
+            .collect();
+        let seed = seed.unwrap_or_else(rand::random);
+        ReplicateCensor { censoring, rule, seed, g, horizon }
+    }
+
+    /// Replicate `sim`'s (1-based) draw `(t, observed)` for the subject of observed row `i`.
+    pub(super) fn apply(
+        &self, sim: usize, i: usize, row: &ObsRow, t: f64, observed: bool,
+    ) -> (f64, bool) {
+        match self.censoring {
+            VpcCensoring::Observed => {
+                let u = censoring_uniform(self.seed, sim, i);
+                let c = replicate_censoring(self.rule, row, &self.g[row.stratum], u, self.horizon);
+                post_censor(t, observed, c)
+            }
+            VpcCensoring::Horizon => (t, observed),
+        }
+    }
+}
+
 /// One stratum of one replicate: the post-censored `(time, event)` of each simulated
 /// subject, and the index into the observed rows of the subject each came from.
 #[derive(Debug, Clone, Default)]
@@ -313,9 +355,7 @@ pub(super) fn simulate_replicates(
 
     let by_id: HashMap<&str, (usize, &ObsRow)> =
         rows.iter().enumerate().map(|(i, r)| (r.id.as_str(), (i, r))).collect();
-    let g: Vec<KmCurve> =
-        (0..n_strata).map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k))).collect();
-    let seed = opts.sim.seed.unwrap_or_else(rand::random);
+    let censor = ReplicateCensor::new(opts.censoring, rule, opts.sim.seed, rows, n_strata, horizon);
     let mut reps: Vec<Vec<RepStratum>> = vec![vec![RepStratum::default(); n_strata]; opts.n_sim];
     for SimulationResult { sim, id, cmt: rc, outcome, .. } in &out.results {
         let SimOutcome::Event { time, observed } = outcome else {
@@ -327,14 +367,7 @@ pub(super) fn simulate_replicates(
         let Some(&(i, row)) = by_id.get(id.as_str()) else {
             continue;
         };
-        let (t, e) = match opts.censoring {
-            VpcCensoring::Observed => {
-                let u = censoring_uniform(seed, *sim, i);
-                let c = replicate_censoring(rule, row, &g[row.stratum], u, horizon);
-                post_censor(*time, *observed, c)
-            }
-            VpcCensoring::Horizon => (*time, *observed),
-        };
+        let (t, e) = censor.apply(*sim, i, row, *time, *observed);
         let slot = &mut reps[sim - 1][row.stratum];
         slot.times.push(t);
         slot.events.push(e);
@@ -384,11 +417,7 @@ pub(super) fn resolve_cmt(
     let tte = model.tte_cmts();
     let list = tte.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
     let c = match (cmt, tte.as_slice()) {
-        (_, []) => {
-            return Err(refuse(format!(
-                "{who}: the model declares no TTE endpoint ([event_model])."
-            )))
-        }
+        (_, []) => return Err(no_tte_endpoint(who)),
         (Some(c), _) if !tte.contains(&c) => {
             return Err(refuse(format!(
                 "{who}: `cmt = {c}` is not a TTE endpoint. The model's TTE endpoints are on \
@@ -419,11 +448,7 @@ pub(super) fn resolve_cmt(
             )));
         }
     };
-    let repeated = matches!(
-        model.endpoints.get(&c),
-        Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
-    );
-    match (who, repeated) {
+    match (who, is_repeated(model, c)) {
         (Entry::Tte, true) => Err(refuse(format!(
             "{who}: cmt {c} is a repeated-events (RTTE) endpoint. Use `vpc_rtte` for its \
              Kaplan–Meier and mean-cumulative-function VPC."
@@ -439,6 +464,19 @@ pub(super) fn resolve_cmt(
         ))),
         _ => Ok(c),
     }
+}
+
+/// Whether `cmt` is a repeated-events (RTTE) endpoint of `model`.
+pub(super) fn is_repeated(model: &CompiledModel, cmt: usize) -> bool {
+    matches!(
+        model.endpoints.get(&cmt),
+        Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
+    )
+}
+
+/// The refusal for a model with no TTE endpoint.
+pub(super) fn no_tte_endpoint(who: Entry) -> EngineError {
+    refuse(format!("{who}: the model declares no TTE endpoint ([event_model])."))
 }
 
 /// The refusal for a subject id that is in the population twice.

@@ -34,18 +34,15 @@
 
 use super::simulate::simulate_with_options_impl;
 use super::vpc_tte::{
-    build_strata, censoring_curve, censoring_uniform, check_band_options, checked_record,
-    duplicate_id, horizon_and_cut, post_censor, refuse, replicate_censoring, stratum_grid,
-    stratum_value, Entry, ObsRow, TteCensorRule, VpcCensoring, VpcGrid, VpcStratify,
+    build_strata, check_band_options, checked_record, duplicate_id, horizon_and_cut, is_repeated,
+    no_tte_endpoint, refuse, stratum_grid, stratum_value, Entry, ObsRow, ReplicateCensor,
+    TteCensorRule, VpcCensoring, VpcGrid, VpcStratify,
 };
 use super::{SimulateOptions, SimulationResult};
 use crate::diagnostics::EngineError;
 use crate::stats::cif::{aalen_johansen, vpc_band_cif, CifCurve};
-use crate::stats::km::{band_over, KmCurve, VpcBand};
-use crate::types::{
-    CompiledModel, EndpointLikelihood, ModelParameters, ObsRecord, Population, SimOutcome,
-    TteRecurrence,
-};
+use crate::stats::km::{band_over, VpcBand};
+use crate::types::{CompiledModel, ModelParameters, ObsRecord, Population, SimOutcome};
 use std::collections::HashMap;
 
 const WHO: Entry = Entry::Cif;
@@ -140,19 +137,14 @@ pub struct CifVpc {
 fn resolve_causes(model: &CompiledModel) -> Result<Vec<usize>, EngineError> {
     let cmts = model.tte_cmts();
     if cmts.is_empty() {
-        return Err(refuse(format!("{WHO}: the model declares no TTE endpoint ([event_model]).")));
+        return Err(no_tte_endpoint(WHO));
     }
-    for &c in &cmts {
-        if matches!(
-            model.endpoints.get(&c),
-            Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
-        ) {
-            return Err(refuse(format!(
-                "{WHO}: cmt {c} is a repeated-events (RTTE) endpoint. A cumulative incidence \
-                 takes single-event causes; `vpc_rtte` draws the Kaplan–Meier and \
-                 mean-cumulative-function VPC of a repeated-events endpoint."
-            )));
-        }
+    if let Some(c) = cmts.iter().find(|&&c| is_repeated(model, c)) {
+        return Err(refuse(format!(
+            "{WHO}: cmt {c} is a repeated-events (RTTE) endpoint. A cumulative incidence takes \
+             single-event causes; `vpc_rtte` draws the Kaplan–Meier and \
+             mean-cumulative-function VPC of a repeated-events endpoint."
+        )));
     }
     Ok(cmts)
 }
@@ -284,9 +276,14 @@ fn simulate_cause_replicates(
         }
     }
 
-    let g: Vec<KmCurve> =
-        (0..n_strata).map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k))).collect();
-    let seed = opts.sim.seed.unwrap_or_else(rand::random);
+    let censor = ReplicateCensor::new(
+        opts.censoring,
+        TteCensorRule::KeepObserved,
+        opts.sim.seed,
+        rows,
+        n_strata,
+        horizon,
+    );
     let mut reps: Vec<Vec<CauseStratum>> =
         vec![vec![CauseStratum::default(); n_strata]; opts.n_sim];
     for (s, per_row) in drawn.iter().enumerate() {
@@ -295,20 +292,7 @@ fn simulate_cause_replicates(
                 continue;
             };
             let row = &rows[i];
-            let (t, e) = match opts.censoring {
-                VpcCensoring::Observed => {
-                    let u = censoring_uniform(seed, s + 1, i);
-                    let c = replicate_censoring(
-                        TteCensorRule::KeepObserved,
-                        row,
-                        &g[row.stratum],
-                        u,
-                        horizon,
-                    );
-                    post_censor(time, cause > 0, c)
-                }
-                VpcCensoring::Horizon => (time, cause > 0),
-            };
+            let (t, e) = censor.apply(s + 1, i, row, time, cause > 0);
             let slot = &mut reps[s][row.stratum];
             slot.times.push(t);
             slot.causes.push(if e { cause } else { 0 });
@@ -346,15 +330,11 @@ pub fn vpc_cif(
     let probs = opts.probs;
     check_band_options(WHO, probs, opts.n_sim, &opts.grid)?;
     let cmts = resolve_causes(model)?;
-    let (mut rows, mut causes, values, labels) =
+    let (mut rows, causes, values, labels) =
         observed_cause_rows(population, &cmts, &opts.stratify)?;
-    // The data on [0, H] only: a row cut at H is a censoring there.
+    // The data on [0, H] only: a row cut at H is a censoring there, so its cause is read
+    // through `r.event` below.
     let horizon = horizon_and_cut(&mut rows, opts.sim.horizon);
-    for (c, r) in causes.iter_mut().zip(&rows) {
-        if !r.event {
-            *c = 0;
-        }
-    }
 
     let n_strata = values.len();
     let (reps, warnings) = simulate_cause_replicates(
@@ -369,7 +349,7 @@ pub fn vpc_cif(
             .iter()
             .zip(&causes)
             .filter(|(r, _)| r.stratum == s)
-            .map(|(r, c)| (r.time, *c))
+            .map(|(r, &c)| (r.time, if r.event { c } else { 0 }))
             .unzip();
         let observed = aalen_johansen(&ot, &oc, k_causes).map_err(|e| err(&e))?;
         let curves = reps
