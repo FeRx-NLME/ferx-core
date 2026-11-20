@@ -1101,8 +1101,10 @@ fn information_scope_gap(model: &CompiledModel) -> Option<&'static str> {
     if !model.covariate_nns.is_empty() {
         return Some("the model has a `[covariate_nn]` block");
     }
-    if model.has_custom_ruv_magnitude() {
-        return Some("the residual error carries a magnitude term");
+    // A θ-free magnitude (`weight = SE`, the MBMA form) is a per-observation constant, and the
+    // information stays exact (#3064).
+    if model.ruv_magnitude_reads_theta() {
+        return Some("the residual error carries a magnitude term that reads a θ");
     }
     None
 }

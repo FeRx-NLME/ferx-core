@@ -648,6 +648,15 @@ All three solve the same problem — same objective, packed space, bounds and to
 they move to the same optimum; they are not a different estimator. An explicit `newton` on
 a model outside its scope still warns and runs `bobyqa`; `auto` does not.
 
+Newton's scope includes a residual magnitude that reads no θ (#3064): `weight = SE`, the MBMA
+weighting, is a per-observation constant, so the expected information keeps its closed form
+(checked against the observed Hessian on paired residuals). Before, every magnitude was
+excluded, and since BOBYQA runs to tolerance an SE-weighted MBMA fit paid for it in full. On
+the naproxen MBMA data written in the `weight = WPSE` form (7 θ, 5 seeds), SAEM takes 0.76 s
+with Newton against 7.0 s with BOBYQA, at the same objective within seed noise (mean
+−172.78 against −173.04 on the FOCEI scale). A magnitude that reads a θ, such as
+`σ·(1 + THETA·X)`, moves the variance directly and stays outside the scope.
+
 ##### Budget and scope {#saem-mstep-optimizer-budget}
 
 BOBYQA runs to its tolerance (`1e-7` relative) wherever it runs: `bobyqa` itself, the
@@ -954,7 +963,8 @@ other **shrinks** it by averaging more draws into the one it forms. Both are
 Both are restricted to the plain Gaussian residual scope the expected
 information has a closed form on: no IOV, no [mixture](mixture.qmd), no M3, no
 time-to-event endpoint, no `block_sigma` residual correlation, no
-`[covariate_nn]` θ, no residual magnitude. FREM is in scope since #1421, which
+`[covariate_nn]` θ, no residual magnitude that reads a θ. A θ-free magnitude (`weight = SE`, the
+MBMA form) is a per-observation constant and is in scope since #3064. FREM is in scope since #1421, which
 fixed the σ score of its covariate pseudo-observations. A model outside it keeps
 the historical solver and says so by name in the fit's warnings.
 

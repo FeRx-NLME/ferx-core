@@ -6550,6 +6550,14 @@ impl CompiledModel {
         self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active())
     }
 
+    /// Whether an active residual magnitude reads a θ (`RuvMagnitude::theta_dependent`): then θ
+    /// reaches the residual variance directly, not only through the prediction. A θ-free one —
+    /// every `weight = <covariate>` model, the MBMA SE weighting — is a per-observation constant
+    /// for a fixed dataset (#3064).
+    pub(crate) fn ruv_magnitude_reads_theta(&self) -> bool {
+        self.ruv_magnitude.as_ref().is_some_and(|m| m.is_active() && m.theta_dependent)
+    }
+
     /// Exact number of free coordinates the outer optimizer searches over.
     /// This uses the same packed FIX and structural-zero masks as estimation,
     /// including diagonal/separate BSV and IOV blocks and mixture overrides.

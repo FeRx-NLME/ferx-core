@@ -646,9 +646,39 @@ fn magnitude_model() -> CompiledModel {
     .expect("magnitude fixture parses")
 }
 
+/// [`magnitude_model`] with a θ in the magnitude: θ then reaches the residual variance directly.
+fn theta_magnitude_model() -> CompiledModel {
+    parse_model_string(
+        r"
+[parameters]
+  theta TVCL(1.0, 0.1, 10.0)
+  theta TVV(10.0, 1.0, 100.0)
+  theta MAG(0.5, 0.0, 5.0)
+  omega ETA_CL ~ 0.04
+  sigma PROP_ERR ~ 0.10 (sd)
+  sigma ADD_ERR  ~ 0.50 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ combined(PROP_ERR * (1.0 + MAG * WPSE), ADD_ERR) weight = WPSE
+[covariates]
+  WPSE continuous
+",
+    )
+    .expect("θ-magnitude fixture parses")
+}
+
+/// #3064: a residual magnitude that reads a θ is outside the information's scope (θ reaches
+/// `V` directly); a θ-free one — `weight = SE`, the MBMA form — is a per-observation constant
+/// and stays in it, so Newton (and `score_sa`) serve it.
 #[test]
-fn numerical_mstep_scope_gap_refuses_a_residual_magnitude() {
-    assert!(numerical_mstep_scope_gap(&magnitude_model(), 0, false).is_some());
+fn numerical_mstep_scope_gap_refuses_only_a_theta_reading_magnitude() {
+    assert!(numerical_mstep_scope_gap(&theta_magnitude_model(), 0, false).is_some());
+    assert_eq!(numerical_mstep_scope_gap(&magnitude_model(), 0, false), None);
+    assert_eq!(newton_scope_gap(&magnitude_model(), false), None);
 }
 
 /// #1421: a FREM model is in scope — its covariate rows' score and information
@@ -1586,7 +1616,7 @@ fn the_newton_scope_is_one_decision_with_a_named_reason() {
         assert!(!w.contains("score_sa"), "{label}: {w}");
     }
     // The model-property reasons of the Gaussian-scope list are the same list `score_sa` reads.
-    for (model, k) in [(correlated_residual_model(), 2), (magnitude_model(), 3)] {
+    for (model, k) in [(correlated_residual_model(), 2), (theta_magnitude_model(), 3)] {
         let gap = newton_scope_gap(&model, false).expect("a gap");
         assert!(gap.contains(reasons[k]), "{gap}");
         assert_eq!(Some(gap), numerical_mstep_scope_gap(&model, 0, false));

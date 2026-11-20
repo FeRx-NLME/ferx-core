@@ -593,7 +593,9 @@ pub(crate) fn obs_nll_subject_score_iov(
     let any_theta_free = (0..n_theta).any(|i| lower[i] != upper[i]);
     // The information needs a per-observation `∂f_j/∂θ` (the adjoint's, below) and no second
     // `∂V/∂θ` channel (a residual magnitude) nor an `NnGradPlan` θ.
-    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none();
+    // A θ-free magnitude (#3064) is a per-observation constant: no second `∂V/∂θ` channel.
+    let magnitude_reads_theta = ruv_mult.is_some() && model.ruv_magnitude_reads_theta();
+    let fisher_ok = want_fisher && nn_plan.is_none() && !magnitude_reads_theta;
     let mut df_packed: Vec<Vec<f64>> = vec![Vec::new(); if fisher_ok { n } else { 0 }];
     let exact = !any_theta_free
         || exact_theta_score(
@@ -602,7 +604,7 @@ pub(crate) fn obs_nll_subject_score_iov(
             theta,
             &stacked,
             &d_nll_d_f,
-            ruv_mult.is_some().then_some(sigma_values),
+            magnitude_reads_theta.then_some(sigma_values),
             theta_packs_log_mask,
             lower,
             upper,
@@ -921,8 +923,8 @@ const SIGMA_ONLY_MAX: usize = 8;
 /// information entry summed over the observations in turn — so the same bits, without its
 /// per-θ rows, its per-call vectors or the `n×n` assembly. A σ-only SAEM M-step evaluates it
 /// at every Newton step on the memoized predictions. `None` (the general path runs) under a
-/// residual magnitude (the general path withholds the information there), a `[covariate_nn]`
-/// θ plan, or more than [`SIGMA_ONLY_MAX`] free σ.
+/// residual magnitude that reads θ (the general path withholds the information there), a
+/// `[covariate_nn]` θ plan, or more than [`SIGMA_ONLY_MAX`] free σ.
 #[allow(clippy::too_many_arguments)]
 fn sigma_only_score(
     model: &CompiledModel, subject: &Subject, preds: &[f64], theta: &[f64], sigma_values: &[f64],
@@ -932,9 +934,10 @@ fn sigma_only_score(
     let free: Vec<usize> =
         (0..n_sigma).filter(|&k| lower[n_theta + k] != upper[n_theta + k]).collect();
     let m = free.len();
-    if m > SIGMA_ONLY_MAX || model.ruv_obs_mult(subject, theta).is_some() {
+    if m > SIGMA_ONLY_MAX || model.ruv_magnitude_reads_theta() {
         return None;
     }
+    let ruv_mult = model.ruv_obs_mult(subject, theta);
     if NnGradPlan::build(model, subject, theta, n_theta).is_some() {
         return None;
     }
@@ -951,18 +954,19 @@ fn sigma_only_score(
     let mut dv = [0.0f64; SIGMA_ONLY_MAX];
     for (j, &f) in preds.iter().enumerate().take(subject.observations.len()) {
         let cmt = err_keys[j];
+        let mult_j = ruv_mult.as_ref().map(|m| m[j].as_slice());
         let frem_vj = frem_ov.as_ref().and_then(|o| o.get(j)).and_then(|x| *x);
         let s = if frem_vj.is_some() { 1.0 } else { ruv_scale };
         let v = match frem_vj {
             Some(vv) => vv.max(1e-12),
             None => crate::stats::residual_error::guard_variance(
-                model.residual_variance_at_scaled(cmt, f, sigma_values, None) * s,
+                model.residual_variance_at_scaled(cmt, f, sigma_values, mult_j) * s,
             ),
         };
         let resid = subject.observations[j] - f;
         nll += 0.5 * (v.ln() + resid * resid / v);
         for (a, &k) in free.iter().enumerate() {
-            let ratio = obs_dvar_dlogsigma(model, cmt, k, f, sigma_values, None, frem_vj) * s;
+            let ratio = obs_dvar_dlogsigma(model, cmt, k, f, sigma_values, mult_j, frem_vj) * s;
             dv[a] = ratio;
             g[a] += 0.5 * ratio * (1.0 / v - resid * resid / (v * v));
         }
@@ -1245,7 +1249,9 @@ fn obs_nll_subject_grad_impl(
     // θ dependence (`dv_df = 0` above), and `obs_dvar_dlogsigma` gives the one
     // σ derivative it does have. Every term of `I_ab` below is then exact on
     // those rows too.
-    let fisher_ok = want_fisher && nn_plan.is_none() && ruv_mult.is_none();
+    // A θ-free magnitude (#3064) is a per-observation constant: no second `∂V/∂θ` channel.
+    let magnitude_reads_theta = ruv_mult.is_some() && model.ruv_magnitude_reads_theta();
+    let fisher_ok = want_fisher && nn_plan.is_none() && !magnitude_reads_theta;
     // `∂f_j/∂x_a` in PACKED coordinates, per free θ coordinate. Empty for a
     // pinned coordinate, for every σ coordinate (predictions do not depend on
     // σ), and for the whole subject when the information is out of scope.
@@ -1302,7 +1308,7 @@ fn obs_nll_subject_grad_impl(
             theta,
             eta,
             &d_nll_d_f,
-            ruv_mult.is_some().then_some(sigma_values),
+            magnitude_reads_theta.then_some(sigma_values),
             theta_packs_log_mask,
             lower,
             upper,
