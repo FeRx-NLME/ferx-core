@@ -1032,8 +1032,11 @@ The curve uses R `survival::survfit`'s tie convention: at a tied time, events co
 censorings, so the subjects censored at that time are still in the risk set of its events.
 `ferx_core::stats::km::kaplan_meier` computes it. The band at each grid time is R's default
 quantile (type 7, the one `vpc::vpc_tte` uses) over the replicate curves still defined there.
-A replicate past its last follow-up time is left out unless its curve has reached zero; it
-is not counted as 0 or 1. A band point with fewer replicates than `⌈1 / min(p, 1 − p)⌉ − 1`
+A replicate past its last follow-up time is left out, also when its curve has reached zero;
+it is not counted as 0 or 1. Counting it as 0 would put a point mass at 0 into the band, so
+once enough replicates had reached zero the lower edge would sit at 0, the observed curve
+could never fall below it and the misses would all fall above (#2930). The observed curve
+follows the same rule: past its last time it is undefined. A band point with fewer replicates than `⌈1 / min(p, 1 − p)⌉ − 1`
 (19 for 5 %/95 %) is empty: with fewer than about 1/p curves the p-tail holds less than one
 curve, so its quantile is only an interpolation between the two most extreme values. So
 `n_sim` must be at least one more than that, 20 for the default band.

@@ -382,17 +382,16 @@ impl McfCurve {
 }
 
 impl KmCurve {
-    /// `S(t)`: `1` before the first time, the step value at or after it, and past
-    /// the last time `Some(0.0)` when the curve has reached zero and `None` when it
-    /// has not, since the estimate is undefined once nobody is under follow-up.
+    /// `S(t)`: `1` before the first time, the step value at or after it up to and
+    /// including the last time, and `None` past the last time, also when the curve
+    /// has reached zero: the estimate is undefined once nobody is under follow-up, as
+    /// for [`McfCurve::at`]. Reading a curve that reached zero as `Some(0.0)` there
+    /// would put a point mass at 0 into a band past the replicates' follow-up (#2930).
     /// `None` for an empty curve and for a `t` that is not a number.
     pub fn at(&self, t: f64) -> Option<f64> {
-        let (&last_t, &last_s) = (self.time.last()?, self.surv.last()?);
-        if t.is_nan() {
+        let &last_t = self.time.last()?;
+        if t.is_nan() || t > last_t {
             return None;
-        }
-        if t > last_t {
-            return (last_s == 0.0).then_some(0.0);
         }
         // Number of rows with time ≤ t.
         let j = self.time.partition_point(|&x| x <= t);
@@ -433,8 +432,8 @@ pub fn min_curves_for(probs: [f64; 3]) -> usize {
 
 /// The pointwise `probs` band of `curves` on `grid`. At each grid time only the
 /// curves still defined there contribute (a replicate past its last follow-up
-/// is left out, not counted as 0 or 1), and a point with fewer than
-/// [`min_curves_for`] of them is `None`. No `NaN` reaches a quantile.
+/// is left out, also one whose curve reached 0, not counted as 0 or 1), and a
+/// point with fewer than [`min_curves_for`] of them is `None`. No `NaN` reaches a quantile.
 ///
 /// # Errors
 ///
