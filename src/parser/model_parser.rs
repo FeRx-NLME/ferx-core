@@ -12225,6 +12225,7 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "isample_imh" => opts.saem_isample_imh = Some(parse_usize(key)?),
         "isample_hmc" => opts.saem_isample_hmc = Some(parse_usize(key)?),
         "isample_nuts" => opts.saem_isample_nuts = Some(parse_usize(key)?),
+        "isample_mala" => opts.saem_isample_mala = Some(parse_usize(key)?),
         "iaccept" => {
             let v = parse_f64(key)?;
             if !(v.is_finite() && v > 0.0 && v < 1.0) {
@@ -12326,9 +12327,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 "nonmem" | "nm" => crate::types::SaemKernel::Nonmem,
                 "hmc" => crate::types::SaemKernel::Hmc,
                 "nuts" => crate::types::SaemKernel::Nuts,
+                "mala" => crate::types::SaemKernel::Mala,
                 other => {
                     return Err(format!(
-                        "fit option `{key}`: unknown value `{other}` — expected rw/imh/nonmem/hmc/nuts"
+                        "fit option `{key}`: unknown value `{other}` — expected rw/imh/nonmem/hmc/nuts/mala"
                     ));
                 }
             };

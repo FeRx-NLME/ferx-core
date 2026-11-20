@@ -252,7 +252,7 @@ fn nonmem_kernels_fit_and_differ_from_the_random_walk() {
     }
 }
 
-/// #2986: `saem_kernel = hmc | nuts` replace NONMEM's kernels 2 and 3 by a gradient move whose
+/// #2986: `saem_kernel = hmc | nuts | mala` replace NONMEM's kernels 2 and 3 by a gradient move whose
 /// η-gradient the AD engine gives. On this closed-form model it must give one for every subject
 /// (no "gave no η-gradient" warning), the move must reach the E-step (a different fit from
 /// NONMEM's kernels on the same seed), and the fit must recover the simulated CL and V.
@@ -267,7 +267,7 @@ fn gradient_kernels_are_served_differ_and_recover_the_truth() {
         fixed(o);
         o.saem_kernel = SaemKernel::Nonmem;
     });
-    for kernel in [SaemKernel::Hmc, SaemKernel::Nuts] {
+    for kernel in [SaemKernel::Hmc, SaemKernel::Nuts, SaemKernel::Mala] {
         let r = run(|o| {
             fixed(o);
             o.saem_kernel = kernel;
@@ -278,7 +278,11 @@ fn gradient_kernels_are_served_differ_and_recover_the_truth() {
             r.warnings
         );
         assert_ne!(r.theta, nm.theta, "{kernel:?} reaches the E-step");
-        let want = if kernel == SaemKernel::Hmc { "imh 1, hmc 1" } else { "imh 1, nuts 1" };
+        let want = match kernel {
+            SaemKernel::Hmc => "imh 1, hmc 1",
+            SaemKernel::Nuts => "imh 1, nuts 1",
+            _ => "imh 1, mala 3",
+        };
         assert_eq!(r.saem_kernels.as_deref(), Some(want), "the fit reports the schedule it ran");
         let g = r.saem_gradient_kernel.as_ref().expect("gradient diagnostics");
         assert!(g.transitions > 0 && g.declined == 0, "{g:?}");
@@ -362,6 +366,7 @@ fn a_user_chosen_kernel_combination_runs_and_all_zero_is_refused() {
         saem_isample_m1b: Some(0),
         saem_isample_hmc: Some(0),
         saem_isample_nuts: Some(0),
+        saem_isample_mala: Some(0),
         saem_isample_m2: Some(0),
         saem_isample_m3: Some(0),
         ..FitOptions::default()

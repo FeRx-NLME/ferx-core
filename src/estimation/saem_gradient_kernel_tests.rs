@@ -1,4 +1,4 @@
-//! The gradient E-step kernels (`saem_kernel = hmc | nuts`, #2986) sample the right
+//! The gradient E-step kernels (`saem_kernel = hmc | nuts | mala`, #2986) sample the right
 //! distribution: each subject's conditional `p(η | y)` — and under IOV the joint
 //! `p(η, κ₁..κ_K | y)` — whatever the metric.
 //!
@@ -15,7 +15,7 @@
 
 use super::{
     nuts_step, preconditioned_hmc_step, EtaPotential, GradStep, MhScratch, HMC_EPS_GAIN,
-    HMC_EPS_HI, HMC_EPS_INIT, HMC_EPS_LO, HMC_MAX_LEAPFROG, HMC_TARGET_ACCEPT,
+    HMC_EPS_HI, HMC_EPS_INIT, HMC_EPS_LO, HMC_MAX_LEAPFROG, HMC_TARGET_ACCEPT, MALA_TARGET_ACCEPT,
 };
 use crate::parser::model_parser::parse_model_string;
 use crate::types::*;
@@ -141,7 +141,7 @@ fn grid_moments(
 /// the production rule for `warmup` transitions and frozen after.
 #[allow(clippy::type_complexity)]
 fn chain(
-    x0: &[f64], n: usize, warmup: usize, pot: &mut EtaPotential<'_>,
+    x0: &[f64], n: usize, warmup: usize, target: f64, pot: &mut EtaPotential<'_>,
     step: &mut dyn FnMut(&mut [f64], f64, f64, &mut EtaPotential<'_>) -> Option<GradStep>,
 ) -> Vec<Vec<f64>> {
     let mut x = x0.to_vec();
@@ -153,8 +153,7 @@ fn chain(
         let (alpha, nll_new) = (g.alpha, g.nll);
         nll = nll_new;
         if t < warmup {
-            eps = (eps * (HMC_EPS_GAIN * (alpha - HMC_TARGET_ACCEPT)).exp())
-                .clamp(HMC_EPS_LO, HMC_EPS_HI);
+            eps = (eps * (HMC_EPS_GAIN * (alpha - target)).exp()).clamp(HMC_EPS_LO, HMC_EPS_HI);
         } else {
             out.push(x.clone());
         }
@@ -203,7 +202,7 @@ fn lower_chol(c: &DMatrix<f64>) -> DMatrix<f64> {
     c.clone().cholesky().expect("SPD").l()
 }
 
-/// HMC and NUTS over (η_CL, η_V) without IOV, under the exact posterior's metric and under
+/// HMC, NUTS and MALA over (η_CL, η_V) without IOV, under the exact posterior's metric and under
 /// Ω's (mis-scaled: the prior is ~3× wider than the posterior here).
 #[test]
 fn gradient_kernels_sample_the_exact_conditional_posterior() {
@@ -218,20 +217,41 @@ fn gradient_kernels_sample_the_exact_conditional_posterior() {
     let sd: Vec<f64> = (0..2).map(|d| omega.matrix[(d, d)].sqrt()).collect();
     let (mean, cov) = grid_moments(2, &sd, &mut |x| pot.value(x));
     for (metric, l) in [("posterior", lower_chol(&cov)), ("omega", omega.chol.clone())] {
+        // The gradient carries from one transition to the next, as in the E-step.
         let mut rng = StdRng::seed_from_u64(2986);
-        let draws = chain(&mean, 20_000, 1_000, &mut pot, &mut |x, nll, eps, pot| {
-            preconditioned_hmc_step(x, nll, &l, eps, HMC_MAX_LEAPFROG, pot, &mut rng)
-        });
+        let mut grad_at = None;
+        let draws =
+            chain(&mean, 20_000, 1_000, HMC_TARGET_ACCEPT, &mut pot, &mut |x, nll, eps, pot| {
+                preconditioned_hmc_step(
+                    x,
+                    nll,
+                    &l,
+                    eps,
+                    HMC_MAX_LEAPFROG,
+                    None,
+                    &mut grad_at,
+                    pot,
+                    &mut rng,
+                )
+            });
         assert_moments(&format!("hmc, {metric} metric"), &draws, &mean, &cov);
         let mut rng = StdRng::seed_from_u64(2987);
-        let draws = chain(&mean, 10_000, 1_000, &mut pot, &mut |x, nll, eps, pot| {
-            nuts_step(x, nll, &l, eps, pot, &mut rng)
-        });
+        let draws =
+            chain(&mean, 10_000, 1_000, HMC_TARGET_ACCEPT, &mut pot, &mut |x, nll, eps, pot| {
+                nuts_step(x, nll, &l, eps, pot, &mut rng)
+            });
         assert_moments(&format!("nuts, {metric} metric"), &draws, &mean, &cov);
+        let mut rng = StdRng::seed_from_u64(29870);
+        let mut grad_at = None;
+        let draws =
+            chain(&mean, 40_000, 1_000, MALA_TARGET_ACCEPT, &mut pot, &mut |x, nll, eps, pot| {
+                preconditioned_hmc_step(x, nll, &l, eps, 1, Some(1), &mut grad_at, pot, &mut rng)
+            });
+        assert_moments(&format!("mala, {metric} metric"), &draws, &mean, &cov);
     }
 }
 
-/// The joint IOV move over `[η_CL, κ₁, κ₂]`: HMC and NUTS reproduce the exact joint
+/// The joint IOV move over `[η_CL, κ₁, κ₂]`: HMC, NUTS and MALA reproduce the exact joint
 /// posterior, η–κ correlation included, under its metric and under the block prior one.
 #[test]
 fn the_joint_iov_move_samples_the_exact_joint_posterior() {
@@ -266,16 +286,37 @@ fn the_joint_iov_move_samples_the_exact_joint_posterior() {
     prior[(1, 1)] = omega_iov.chol[(0, 0)];
     prior[(2, 2)] = omega_iov.chol[(0, 0)];
     for (metric, l) in [("posterior", lower_chol(&cov)), ("block prior", prior)] {
+        // The gradient carries from one transition to the next, as in the E-step.
         let mut rng = StdRng::seed_from_u64(2988);
-        let draws = chain(&mean, 20_000, 1_000, &mut pot, &mut |x, nll, eps, pot| {
-            preconditioned_hmc_step(x, nll, &l, eps, HMC_MAX_LEAPFROG, pot, &mut rng)
-        });
+        let mut grad_at = None;
+        let draws =
+            chain(&mean, 20_000, 1_000, HMC_TARGET_ACCEPT, &mut pot, &mut |x, nll, eps, pot| {
+                preconditioned_hmc_step(
+                    x,
+                    nll,
+                    &l,
+                    eps,
+                    HMC_MAX_LEAPFROG,
+                    None,
+                    &mut grad_at,
+                    pot,
+                    &mut rng,
+                )
+            });
         assert_moments(&format!("joint hmc, {metric} metric"), &draws, &mean, &cov);
         let mut rng = StdRng::seed_from_u64(2989);
-        let draws = chain(&mean, 10_000, 1_000, &mut pot, &mut |x, nll, eps, pot| {
-            nuts_step(x, nll, &l, eps, pot, &mut rng)
-        });
+        let draws =
+            chain(&mean, 10_000, 1_000, HMC_TARGET_ACCEPT, &mut pot, &mut |x, nll, eps, pot| {
+                nuts_step(x, nll, &l, eps, pot, &mut rng)
+            });
         assert_moments(&format!("joint nuts, {metric} metric"), &draws, &mean, &cov);
+        let mut rng = StdRng::seed_from_u64(29890);
+        let mut grad_at = None;
+        let draws =
+            chain(&mean, 40_000, 1_000, MALA_TARGET_ACCEPT, &mut pot, &mut |x, nll, eps, pot| {
+                preconditioned_hmc_step(x, nll, &l, eps, 1, Some(1), &mut grad_at, pot, &mut rng)
+            });
+        assert_moments(&format!("joint mala, {metric} metric"), &draws, &mean, &cov);
     }
 }
 
@@ -298,6 +339,15 @@ fn the_kernel_schedule_resolves_presets_and_overrides() {
     assert!(hmc.gradient());
     let nuts = KernelSchedule::resolve(&with(SaemKernel::Nuts, &|_| {}), true).expect("counted");
     assert_eq!(nuts.describe(), "imh 1, nuts 1");
+    let mala = KernelSchedule::resolve(&with(SaemKernel::Mala, &|_| {}), true).expect("counted");
+    assert_eq!(mala.describe(), "imh 1, mala 3");
+    assert!(mala.gradient());
+    // MALA beside the HMC preset, in the order the E-step runs them.
+    let both = with(SaemKernel::Hmc, &|o| o.saem_isample_mala = Some(2));
+    assert_eq!(
+        KernelSchedule::resolve(&both, true).expect("counted").describe(),
+        "imh 1, hmc 1, mala 2"
+    );
     // Outside the f-SAEM proposal's scope the preset's jump runs as M1.
     let out = KernelSchedule::resolve(&with(SaemKernel::Hmc, &|_| {}), false).expect("counted");
     assert_eq!(out.describe(), "m1 1, hmc 1");
@@ -325,4 +375,55 @@ fn the_kernel_schedule_resolves_presets_and_overrides() {
     // The legacy kernels keep their own path.
     assert!(KernelSchedule::resolve(&with(SaemKernel::RandomWalk, &|_| {}), true).is_none());
     assert!(KernelSchedule::resolve(&with(SaemKernel::Imh, &|_| {}), true).is_none());
+}
+
+/// Value/gradient fusion under IOV (#2986): the value the joint `[η, κ]` potential takes from
+/// the AD pass is the native IOV NLL (`individual_nll_iov…`) every other kernel scores with,
+/// at points across the posterior — the gradient kernels' accept/reject reads one, the
+/// random-walk kernels after them the other.
+#[test]
+fn the_fused_iov_value_is_the_native_iov_nll() {
+    let model = parse_model_string(IOV_MODEL).expect("parses");
+    let s = iov_subject();
+    let p = &model.default_params;
+    let (theta, omega, sigma) = (&p.theta, &p.omega, &p.sigma.values);
+    let omega_iov = p.omega_iov.as_ref().expect("a κ");
+    let kappas = vec![vec![0.0]; 2];
+    let mut scratch = MhScratch::default();
+    scratch.begin_subject(&model, &s, theta, 1);
+    let mut pot = EtaPotential::new(
+        &model,
+        &s,
+        theta,
+        omega,
+        sigma,
+        None,
+        Some((kappas.as_slice(), omega_iov)),
+        &mut scratch,
+        1,
+        true,
+    );
+    for x in [[0.0, 0.0, 0.0], [0.3, -0.2, 0.1], [-0.5, 0.4, -0.3], [0.8, 0.1, 0.6]] {
+        let native = pot.value(&x);
+        let (_, fused) = pot.grad(&x, true).expect("served");
+        // The AD pass itself scores it (no silent fallback to the native objective).
+        let mut direct = None;
+        crate::estimation::inner_optimizer::analytic_eta_nll_value_gradient_iov(
+            &model,
+            &s,
+            theta,
+            &x,
+            omega,
+            omega_iov,
+            sigma,
+            None,
+            Some(&mut direct),
+        )
+        .expect("served");
+        assert_eq!(direct, Some(fused), "at {x:?}: the potential reads the fused value");
+        assert!(
+            (fused - native).abs() <= 1e-12 * native.abs().max(1.0),
+            "at {x:?}: fused {fused} vs native {native}"
+        );
+    }
 }

@@ -5946,6 +5946,62 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
     frozen_var_preds: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
+    analytic_eta_nll_value_gradient_iov_frozen(
+        model,
+        subject,
+        layout,
+        theta,
+        stacked_true,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+        None,
+    )
+}
+
+/// [`analytic_eta_nll_gradient_iov`] that also reports the IOV objective's **value** through
+/// `value_out`, from the same pass (value/gradient fusion, as
+/// [`analytic_eta_nll_value_gradient_with_schedule`] does without IOV): the predictions the
+/// gradient is built from are the ones `individual_nll_iov_frozen_in` scores, so the value
+/// costs a few flops where the native objective re-predicts the whole subject. The SAEM
+/// gradient kernels read it at every proposal (#2986). `*value_out` is `Some(l)` only for a
+/// plain Gaussian row sum on one IOV level — no nested levels, dense `R`, censored or FREM
+/// row, SDE variance or non-Gaussian record — with a finite value; `None` otherwise (the
+/// caller takes the native objective there).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn analytic_eta_nll_value_gradient_iov(
+    model: &CompiledModel, subject: &Subject, theta: &[f64], stacked_true: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
+    mult: Option<&[Vec<f64>]>, value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject)?;
+    analytic_eta_nll_value_gradient_iov_frozen(
+        model,
+        subject,
+        &layout,
+        theta,
+        stacked_true,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        None,
+        value_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analytic_eta_nll_value_gradient_iov_frozen(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
+    omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
+    frozen_var_preds: Option<&[f64]>, mut value_out: Option<&mut Option<f64>>,
+) -> Option<Vec<f64>> {
+    if let Some(v) = value_out.as_deref_mut() {
+        *v = None;
+    }
     // A record without an exact η-channel would leave its term out of the gradient: refuse
     // the subject here too, not only at the routing gate (direct callers skip that).
     if !non_gaussian_eta_grad_served(model, subject) {
@@ -5999,6 +6055,20 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     let mut ruv_grad = 0.0_f64;
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // The value is scored only where `individual_nll_iov_frozen_in` is a plain Gaussian row
+    // sum over these predictions (see the doc above).
+    let value_ok = value_out.is_some()
+        && frozen_var_preds.is_none()
+        && layout.nested().is_none()
+        && p_rows.is_empty()
+        && !model.is_sde()
+        && !model.bloq_in_force().has_censored_row(&subject.cens)
+        && !subject.fremtype.iter().any(|&ft| ft > 0)
+        && subject.obs_records.is_empty()
+        && !model.residual_cov_theta(theta).is_dense()
+        && omega_bsv.log_det.is_finite()
+        && omega_iov.log_det.is_finite();
+    let mut data_ll = 0.0_f64;
     for (j, obs) in sens.iter().enumerate() {
         let cens = if m3 { subject.cens.get(j).copied().unwrap_or(0) } else { 0 };
         // The residual logic is shared with the non-IOV inner via `residual_inner_obs`
@@ -6022,6 +6092,17 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
             *g += coef * obs.df_deta[k] + p.map_or(0.0, |p| coef_p * p.df_deta[k]);
         }
         ruv_grad += ruv_term; // 0 unless `iiv_on_ruv`
+        if value_ok {
+            // `individual_nll_iov_frozen_in`'s row term, the same expression.
+            let v = model.residual_variance_at_scaled(
+                err_keys[j],
+                obs.f,
+                sigma,
+                mult.and_then(|m| m.get(j)).map(Vec::as_slice),
+            ) * ruv_scale;
+            let resid = subject.observations[j] - obs.f;
+            data_ll += resid * resid / v + v.ln();
+        }
     }
     if let Some(r) = ruv_idx {
         grad[r] += ruv_grad;
@@ -6056,6 +6137,24 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
         for c in 0..w {
             grad[base + c] += prior_kg[c];
         }
+    }
+    if let Some(out) = value_out.filter(|_| value_ok) {
+        // `½(ηᵀΩ⁻¹η + log|Ω| + Σ_g κ_gᵀΩ_IOV⁻¹κ_g + K·log|Ω_IOV| + data)`, the native order.
+        let quad = crate::stats::likelihood::quad_form;
+        let eta_prior = quad(&omega_bsv.inv, &stacked_true[..n_eta]);
+        let mut kappa_prior = 0.0;
+        let mut k_groups = 0usize;
+        for (ks, base) in layout.kappa_blocks() {
+            kappa_prior += quad(&omega_iov.inv, &axes[base..base + ks.len()]);
+            k_groups += 1;
+        }
+        let nll = 0.5
+            * (eta_prior
+                + omega_bsv.log_det
+                + kappa_prior
+                + (k_groups as f64) * omega_iov.log_det
+                + data_ll);
+        *out = nll.is_finite().then_some(nll);
     }
     Some(grad)
 }

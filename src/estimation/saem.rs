@@ -2296,6 +2296,10 @@ const HMC_EPS_INIT: f64 = 0.5;
 const HMC_EPS_LO: f64 = 0.02;
 const HMC_EPS_HI: f64 = 1.9;
 const HMC_TARGET_ACCEPT: f64 = 0.8;
+/// `isample_mala`: MALA's own step size adapts towards the acceptance rate that is optimal for
+/// it (0.574, Roberts & Rosenthal 1998) — one leapfrog step accepts more often than a
+/// trajectory at the same step size, so it gets a step size of its own.
+const MALA_TARGET_ACCEPT: f64 = 0.574;
 const HMC_EPS_GAIN: f64 = 0.1;
 
 /// A subject's η potential `U(η) = NLL(η)` (κ held at the chain's draw) and its gradient from
@@ -2306,7 +2310,9 @@ const HMC_EPS_GAIN: f64 = 0.1;
 /// Without IOV the gradient and value come from one pass (value/gradient fusion,
 /// `analytic_eta_nll_value_gradient_with_schedule`); the value falls back to the native NLL
 /// where the fused pass does not score the subject. With IOV the gradient is the stacked
-/// `[η, κ₁..κ_K]` one's η block, the value the IOV NLL every other kernel scores with. Whether
+/// `[η, κ₁..κ_K]` one (its η block for an η-only move), and the value comes from the same pass
+/// (`analytic_eta_nll_value_gradient_iov`) or, outside its plain-Gaussian scope, the IOV NLL
+/// every other kernel scores with. Whether
 /// a gradient exists is the engine's call: `None` from it declines the transition.
 struct EtaPotential<'a> {
     model: &'a CompiledModel,
@@ -2418,7 +2424,8 @@ impl<'a> EtaPotential<'a> {
                         self.stacked.extend_from_slice(k);
                     }
                 }
-                let g = crate::estimation::inner_optimizer::analytic_eta_nll_gradient_iov(
+                let mut fused: Option<f64> = None;
+                let g = crate::estimation::inner_optimizer::analytic_eta_nll_value_gradient_iov(
                     self.model,
                     self.subject,
                     self.theta,
@@ -2427,6 +2434,7 @@ impl<'a> EtaPotential<'a> {
                     omega_iov,
                     self.sigma,
                     self.prep.ruv_mult(),
+                    want_value.then_some(&mut fused),
                 )?;
                 // The η block leads the stacked vector unless the layout compacts it (nested
                 // levels); then the engine's axes are not ours, and we take no gradient.
@@ -2434,7 +2442,7 @@ impl<'a> EtaPotential<'a> {
                     return None;
                 }
                 // A joint move takes the whole stacked gradient.
-                (if self.joint { g } else { g[..n].to_vec() }, None)
+                (if self.joint { g } else { g[..n].to_vec() }, fused)
             }
             None => {
                 let mut fused: Option<f64> = None;
@@ -2476,6 +2484,7 @@ pub(crate) struct KernelSchedule {
     pub(crate) m1b: usize,
     pub(crate) hmc: usize,
     pub(crate) nuts: usize,
+    pub(crate) mala: usize,
     pub(crate) m2: usize,
     pub(crate) m3: usize,
 }
@@ -2498,6 +2507,9 @@ impl KernelSchedule {
             // under IOV (warfarin_iov_saem +0.02 against +0.09 with HMC alone).
             K::Hmc => KernelSchedule { imh: 1, hmc: 1, ..Default::default() },
             K::Nuts => KernelSchedule { imh: 1, nuts: 1, ..Default::default() },
+            // A MALA transition is one leapfrog step: three of them cost about what one HMC
+            // transition does (the gradient at a chain's state carries from one to the next).
+            K::Mala => KernelSchedule { imh: 1, mala: 3, ..Default::default() },
             K::RandomWalk | K::Imh => return None,
         };
         let pick = |set: Option<usize>, preset: usize| set.unwrap_or(preset);
@@ -2507,6 +2519,7 @@ impl KernelSchedule {
             m1b: pick(options.saem_isample_m1b, preset.m1b),
             hmc: pick(options.saem_isample_hmc, preset.hmc),
             nuts: pick(options.saem_isample_nuts, preset.nuts),
+            mala: pick(options.saem_isample_mala, preset.mala),
             m2: pick(options.saem_isample_m2, preset.m2),
             m3: pick(options.saem_isample_m3, preset.m3),
         };
@@ -2519,12 +2532,12 @@ impl KernelSchedule {
 
     /// No kernel moves η.
     pub(crate) fn is_empty(&self) -> bool {
-        self.m1 + self.imh + self.m1b + self.hmc + self.nuts + self.m2 + self.m3 == 0
+        self.m1 + self.imh + self.m1b + self.hmc + self.nuts + self.mala + self.m2 + self.m3 == 0
     }
 
     /// Whether a gradient kernel runs.
     pub(crate) fn gradient(&self) -> bool {
-        self.hmc + self.nuts > 0
+        self.hmc + self.nuts + self.mala > 0
     }
 
     /// `m1 2, m1b 2, m2 2, m3 2`: the kernels that run, in their order.
@@ -2535,6 +2548,7 @@ impl KernelSchedule {
             ("m1b", self.m1b),
             ("hmc", self.hmc),
             ("nuts", self.nuts),
+            ("mala", self.mala),
             ("m2", self.m2),
             ("m3", self.m3),
         ]
@@ -2580,21 +2594,39 @@ fn lower_t_mul(l: &DMatrix<f64>, g: &[f64], out: &mut [f64]) {
 /// acceptance probability `min(1, e^{−ΔH})` the caller adapts `eps` on, and the chain's NLL
 /// after the transition — or `None` when the engine gives no gradient at the start (the caller
 /// then runs kernels 2 and 3). A gradient declined mid-trajectory rejects with `α = 0`.
+///
+/// `fixed_steps = Some(1)` is MALA (`isample_mala`): one leapfrog step from a fresh momentum is
+/// the Langevin proposal `η' = η − ½ε²·LLᵀ∇U(η) + ε·Lξ`, and the HMC acceptance
+/// `e^{−ΔH}` equals MALA's Metropolis-Hastings ratio with its asymmetric proposal density.
+///
+/// `grad_at`: the gradient at `eta` if the caller has it (the last transition's endpoint or
+/// start), updated to the gradient at the state the transition leaves — consecutive
+/// transitions then pay one gradient less each.
 #[allow(clippy::too_many_arguments)]
 fn preconditioned_hmc_step(
     eta: &mut [f64], nll_current: f64, l: &DMatrix<f64>, eps: f64, max_leapfrog: usize,
-    pot: &mut EtaPotential<'_>, rng: &mut impl Rng,
+    fixed_steps: Option<usize>, grad_at: &mut Option<Vec<f64>>, pot: &mut EtaPotential<'_>,
+    rng: &mut impl Rng,
 ) -> Option<GradStep> {
     let n = eta.len();
     if n == 0 || (0..n).any(|j| !(l[(j, j)] > 0.0)) || !(eps > 0.0) {
         return None;
     }
-    let (g0, _) = pot.grad(eta, false)?;
+    let g0 = match grad_at.take().filter(|g| g.len() == n) {
+        Some(g) => g,
+        None => pot.grad(eta, false)?.0,
+    };
     let mut lg = vec![0.0; n];
     lower_t_mul(l, &g0, &mut lg);
     let p0: Vec<f64> = (0..n).map(|_| rng.sample(StandardNormal)).collect();
-    let t = HMC_TIME * (0.8 + 0.4 * rng.random::<f64>());
-    let n_steps = ((t / eps).ceil() as usize).clamp(1, max_leapfrog.max(1));
+    let n_steps = match fixed_steps {
+        Some(s) => s.max(1),
+        None => {
+            let t = HMC_TIME * (0.8 + 0.4 * rng.random::<f64>());
+            ((t / eps).ceil() as usize).clamp(1, max_leapfrog.max(1))
+        }
+    };
+    let mut g_end: Vec<f64> = Vec::new();
     let mut q = eta.to_vec();
     let mut p = p0.clone();
     let mut lp = vec![0.0; n];
@@ -2608,6 +2640,7 @@ fn preconditioned_hmc_step(
             q[i] += eps * lp[i];
         }
         let Some((g, u)) = pot.grad(&q, step + 1 == n_steps) else {
+            *grad_at = Some(g0);
             return Some(GradStep {
                 alpha: 0.0,
                 nll: nll_current,
@@ -2620,6 +2653,7 @@ fn preconditioned_hmc_step(
         for j in 0..n {
             p[j] -= 0.5 * eps * lg[j];
         }
+        g_end = g;
     }
     let kin = |v: &[f64]| 0.5 * v.iter().map(|x| x * x).sum::<f64>();
     let delta_h = (nll_current + kin(&p0)) - (u_end + kin(&p));
@@ -2627,8 +2661,10 @@ fn preconditioned_hmc_step(
     let divergent = !delta_h.is_finite() || -delta_h > NUTS_MAX_DELTA_H;
     let nll = if rng.random::<f64>() < alpha {
         eta.copy_from_slice(&q);
+        *grad_at = Some(g_end);
         u_end
     } else {
+        *grad_at = Some(g0);
         nll_current
     };
     Some(GradStep { alpha, nll, n_leapfrog: n_steps, divergent })
@@ -5288,8 +5324,8 @@ pub fn run_saem(
     let schedule = KernelSchedule::resolve(options, imh_supported_model(model));
     if schedule.is_some_and(|s| s.is_empty()) {
         return Err("SAEM: every E-step kernel count is 0 (isample_m1, isample_imh, \
-                    isample_m1b, isample_hmc, isample_nuts, isample_m2, isample_m3 after the \
-                    saem_kernel preset), so nothing moves the random effects; set at least one \
+                    isample_m1b, isample_hmc, isample_nuts, isample_mala, isample_m2, isample_m3 \
+                    after the saem_kernel preset), so nothing moves the random effects; set at least one \
                     above 0"
             .to_string());
     }
@@ -5308,7 +5344,8 @@ pub fn run_saem(
     let gradient_divergent = std::sync::atomic::AtomicUsize::new(0);
     let gradient_avg_transitions = std::sync::atomic::AtomicUsize::new(0);
     let gradient_leapfrog = std::sync::atomic::AtomicUsize::new(0);
-    let mut gradient_accept = (0.0_f64, 0_usize);
+    // ... per step size: `[0]` the trajectory kernels' (hmc, nuts), `[1]` MALA's.
+    let mut gradient_accept = [(0.0_f64, 0_usize); 2];
     let n_mh_steps = if nonmem_kernel {
         sched.m2
     } else {
@@ -5346,9 +5383,13 @@ pub fn run_saem(
     };
     // `saem_kernel = hmc`: each chain's step size, and the last transition's acceptance
     // probability (`NaN` where no transition ran), read after the parallel E-step.
-    let mut hmc_eps: Vec<f64> = vec![HMC_EPS_INIT; if hmc_in_scope { n_subjects } else { 0 }];
-    let hmc_alpha: Vec<std::sync::atomic::AtomicU64> =
-        (0..hmc_eps.len()).map(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())).collect();
+    // Two per chain: `[0]` for the trajectory kernels (hmc, nuts), `[1]` for MALA, which
+    // adapts towards its own target.
+    let mut hmc_eps: Vec<[f64; 2]> =
+        vec![[HMC_EPS_INIT; 2]; if hmc_in_scope { n_subjects } else { 0 }];
+    let hmc_alpha: Vec<[std::sync::atomic::AtomicU64; 2]> = (0..hmc_eps.len())
+        .map(|_| std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(f64::NAN.to_bits())))
+        .collect();
     let adapt_interval = options.saem_adapt_interval;
     // `scale_adaptation`: the legacy ×1.1/×0.9 every `adapt_interval` (default),
     // or a Robbins-Monro step taken every iteration (#1444). Governs the primary
@@ -5471,6 +5512,7 @@ pub fn run_saem(
             ("isample_m1b", options.saem_isample_m1b),
             ("isample_hmc", options.saem_isample_hmc),
             ("isample_nuts", options.saem_isample_nuts),
+            ("isample_mala", options.saem_isample_mala),
             ("isample_m2", options.saem_isample_m2),
             ("isample_m3", options.saem_isample_m3),
         ]
@@ -6800,27 +6842,50 @@ pub fn run_saem(
                                 eta_work.len(),
                                 joint.is_some(),
                             );
-                            // `isample_hmc` HMC then `isample_nuts` NUTS transitions; the
-                            // first the engine declines ends the run of them.
+                            // `isample_hmc` HMC, `isample_nuts` NUTS, then `isample_mala`
+                            // MALA transitions; the first the engine declines ends the run of
+                            // them. The last acceptance of each step size is kept for its
+                            // adaptation; the gradient at the chain's state carries between
+                            // HMC and MALA transitions (NUTS does not report it).
                             let mut step: Option<GradStep> = None;
-                            for t in 0..sched.hmc + sched.nuts {
-                                let eps = hmc_eps_ref[i];
-                                let g = if t < sched.hmc {
-                                    preconditioned_hmc_step(
+                            let mut alphas = [f64::NAN; 2];
+                            let mut grad_at: Option<Vec<f64>> = None;
+                            for t in 0..sched.hmc + sched.nuts + sched.mala {
+                                let [eps, eps_mala] = hmc_eps_ref[i];
+                                let (g, which) = if t < sched.hmc {
+                                    let g = preconditioned_hmc_step(
                                         &mut x,
                                         nll_cur,
                                         l,
                                         eps,
                                         HMC_MAX_LEAPFROG,
+                                        None,
+                                        &mut grad_at,
                                         &mut pot,
                                         &mut rng,
-                                    )
+                                    );
+                                    (g, 0)
+                                } else if t < sched.hmc + sched.nuts {
+                                    grad_at = None;
+                                    (nuts_step(&mut x, nll_cur, l, eps, &mut pot, &mut rng), 0)
                                 } else {
-                                    nuts_step(&mut x, nll_cur, l, eps, &mut pot, &mut rng)
+                                    let g = preconditioned_hmc_step(
+                                        &mut x,
+                                        nll_cur,
+                                        l,
+                                        eps_mala,
+                                        1,
+                                        Some(1),
+                                        &mut grad_at,
+                                        &mut pot,
+                                        &mut rng,
+                                    );
+                                    (g, 1)
                                 };
                                 let Some(g) = g else {
                                     break;
                                 };
+                                alphas[which] = g.alpha;
                                 nll_cur = g.nll;
                                 step = Some(match step {
                                     Some(prev) => GradStep {
@@ -6837,9 +6902,7 @@ pub fn run_saem(
                                 gradient_declined_ref
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
-                            if let Some(GradStep { alpha, nll: nll_h, n_leapfrog, divergent }) =
-                                step
-                            {
+                            if let Some(GradStep { nll: nll_h, n_leapfrog, divergent, .. }) = step {
                                 use std::sync::atomic::Ordering::Relaxed;
                                 gradient_served_ref.fetch_add(1, Relaxed);
                                 gradient_leapfrog_ref.fetch_add(n_leapfrog, Relaxed);
@@ -6864,8 +6927,9 @@ pub fn run_saem(
                                 }
                                 nll_cur = nll_h;
                                 hmc_served = true;
-                                hmc_alpha_ref[i]
-                                    .store(alpha.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                                for (slot, a) in hmc_alpha_ref[i].iter().zip(alphas) {
+                                    slot.store(a.to_bits(), std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                         // HMC path: one gradient-guided proposal per SAEM iteration.
@@ -8091,15 +8155,20 @@ pub fn run_saem(
         // ---- `saem_kernel = hmc`: each chain's step size (#2986) ----
         // A Robbins-Monro step on `log ε` toward the acceptance probability target, during
         // exploration only: the averaging phase runs a fixed kernel.
-        for (i, a) in hmc_alpha.iter().enumerate() {
-            let alpha =
-                f64::from_bits(a.swap(f64::NAN.to_bits(), std::sync::atomic::Ordering::Relaxed));
-            if k <= k1 && alpha.is_finite() {
-                hmc_eps[i] = (hmc_eps[i] * (HMC_EPS_GAIN * (alpha - HMC_TARGET_ACCEPT)).exp())
-                    .clamp(HMC_EPS_LO, HMC_EPS_HI);
-            } else if alpha.is_finite() {
-                gradient_accept.0 += alpha;
-                gradient_accept.1 += 1;
+        for (i, slots) in hmc_alpha.iter().enumerate() {
+            for (w, (a, target)) in
+                slots.iter().zip([HMC_TARGET_ACCEPT, MALA_TARGET_ACCEPT]).enumerate()
+            {
+                let alpha = f64::from_bits(
+                    a.swap(f64::NAN.to_bits(), std::sync::atomic::Ordering::Relaxed),
+                );
+                if k <= k1 && alpha.is_finite() {
+                    hmc_eps[i][w] = (hmc_eps[i][w] * (HMC_EPS_GAIN * (alpha - target)).exp())
+                        .clamp(HMC_EPS_LO, HMC_EPS_HI);
+                } else if alpha.is_finite() {
+                    gradient_accept[w].0 += alpha;
+                    gradient_accept[w].1 += 1;
+                }
             }
         }
 
@@ -8261,10 +8330,15 @@ pub fn run_saem(
             mix.rbar.truncate(n_subjects_data);
         }
     }
+    // The reported step size and acceptance are the trajectory kernels' where one runs,
+    // MALA's otherwise (each adapts towards its own target).
+    let (w_report, target_report) =
+        if sched.hmc + sched.nuts > 0 { (0, HMC_TARGET_ACCEPT) } else { (1, MALA_TARGET_ACCEPT) };
     let saem_gradient_kernel = hmc_in_scope.then(|| {
         use std::sync::atomic::Ordering::Relaxed;
         let transitions = gradient_served.load(Relaxed) as u64;
-        let mut eps = hmc_eps.clone();
+        let gradient_accept = gradient_accept[w_report];
+        let mut eps: Vec<f64> = hmc_eps.iter().map(|e| e[w_report]).collect();
         eps.sort_by(f64::total_cmp);
         crate::types::SaemGradientKernelStats {
             transitions,
@@ -8277,11 +8351,12 @@ pub fn run_saem(
         }
     });
     if let Some(g) = &saem_gradient_kernel {
-        let name = match (sched.hmc > 0, sched.nuts > 0) {
-            (true, true) => "hmc + nuts",
-            (false, true) => "nuts",
-            _ => "hmc",
-        };
+        let name = [("hmc", sched.hmc), ("nuts", sched.nuts), ("mala", sched.mala)]
+            .iter()
+            .filter(|(_, n)| *n > 0)
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>()
+            .join(" + ");
         if g.transitions == 0 {
             warnings.push(format!(
                 "SAEM {name} kernel: the AD engine gave no subject's η-gradient, so NONMEM's \
@@ -8298,11 +8373,11 @@ pub fn run_saem(
                     g.divergences
                 ));
             }
-            if g.mean_accept.is_some_and(|a| a < 0.6) {
+            if g.mean_accept.is_some_and(|a| a < target_report - 0.2) {
                 warnings.push(format!(
                     "SAEM {name} kernel: mean acceptance {:.2} over the averaging phase (target \
-                     0.8): the step size adapted during exploration no longer fits the \
-                     posterior",
+                     {target_report}): the step size adapted during exploration no longer fits \
+                     the posterior",
                     g.mean_accept.unwrap_or(f64::NAN)
                 ));
             }

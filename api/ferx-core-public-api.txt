@@ -2903,6 +2903,7 @@ pub ferx_core::types::RtteClock::Reset
 pub enum ferx_core::types::SaemKernel
 pub ferx_core::types::SaemKernel::Hmc
 pub ferx_core::types::SaemKernel::Imh
+pub ferx_core::types::SaemKernel::Mala
 pub ferx_core::types::SaemKernel::Nonmem
 pub ferx_core::types::SaemKernel::Nuts
 pub ferx_core::types::SaemKernel::RandomWalk
@@ -3447,6 +3448,7 @@ pub ferx_core::types::FitOptions::saem_isample_m1: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_isample_m1b: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_isample_m2: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_isample_m3: core::option::Option<usize>
+pub ferx_core::types::FitOptions::saem_isample_mala: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_isample_nuts: core::option::Option<usize>
 pub ferx_core::types::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::types::FitOptions::saem_mceta: usize
@@ -4490,6 +4492,7 @@ pub ferx_core::RtteClock::Reset
 pub enum ferx_core::SaemKernel
 pub ferx_core::SaemKernel::Hmc
 pub ferx_core::SaemKernel::Imh
+pub ferx_core::SaemKernel::Mala
 pub ferx_core::SaemKernel::Nonmem
 pub ferx_core::SaemKernel::Nuts
 pub ferx_core::SaemKernel::RandomWalk
@@ -5220,6 +5223,7 @@ pub ferx_core::FitOptions::saem_isample_m1: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_isample_m1b: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_isample_m2: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_isample_m3: core::option::Option<usize>
+pub ferx_core::FitOptions::saem_isample_mala: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_isample_nuts: core::option::Option<usize>
 pub ferx_core::FitOptions::saem_kernel: ferx_core::SaemKernel
 pub ferx_core::FitOptions::saem_mceta: usize

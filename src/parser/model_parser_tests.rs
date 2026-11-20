@@ -3675,8 +3675,12 @@ fn test_saem_imh_options_round_trip_validate_and_warn() {
     assert_eq!(opts.saem_kernel, SaemKernel::Hmc);
     assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "NUTS"), Ok(true));
     assert_eq!(opts.saem_kernel, SaemKernel::Nuts);
+    assert_eq!(apply_fit_option(&mut opts, "saem_kernel", "mala"), Ok(true));
+    assert_eq!(opts.saem_kernel, SaemKernel::Mala);
+    assert_eq!(apply_fit_option(&mut opts, "isample_mala", "4"), Ok(true));
+    assert_eq!(opts.saem_isample_mala, Some(4));
     let err = apply_fit_option(&mut opts, "saem_kernel", "gibbs").expect_err("unknown kernel");
-    assert!(err.contains("rw/imh/nonmem/hmc/nuts") && err.contains("gibbs"), "got: {err}");
+    assert!(err.contains("rw/imh/nonmem/hmc/nuts/mala") && err.contains("gibbs"), "got: {err}");
 
     // Each message is asserted whole: every clause is something the user reads
     // (what the key is, the bound, the value they wrote), so deleting any of them

@@ -9766,6 +9766,10 @@ pub struct FitOptions {
     pub saem_isample_hmc: Option<usize>,
     /// `nuts`: No-U-Turn transitions, otherwise as `hmc`.
     pub saem_isample_nuts: Option<usize>,
+    /// `mala`: preconditioned Metropolis-adjusted Langevin transitions — one leapfrog step,
+    /// the proposal `η + ½ε²·M⁻¹(−∇U) + ε·L·ξ` — with their own step size, adapted towards
+    /// an acceptance probability of 0.574; otherwise as `hmc`.
+    pub saem_isample_mala: Option<usize>,
     /// `m2`: block random-walk proposals `η + s·chol(Ω)·z` (NONMEM `ISAMPLE_M2`).
     pub saem_isample_m2: Option<usize>,
     /// `m3`: componentwise random-walk sweeps (NONMEM `ISAMPLE_M3`).
@@ -10514,6 +10518,7 @@ impl Default for FitOptions {
             saem_isample_imh: None,
             saem_isample_hmc: None,
             saem_isample_nuts: None,
+            saem_isample_mala: None,
             saem_iaccept: 0.4,
             saem_mceta: 0,
             // 0 = `auto`: resolved from the dataset by
@@ -10881,6 +10886,12 @@ pub enum SaemKernel {
     /// the fixed-length HMC one; the step size adapts towards a mean acceptance statistic of
     /// 0.8.
     Nuts,
+    /// As [`SaemKernel::Hmc`], with **MALA** transitions (the Metropolis-adjusted Langevin
+    /// algorithm: one leapfrog step, i.e. a gradient-drifted Gaussian proposal under the same
+    /// metric) in place of the HMC one, with their own step size adapted towards 0.574 (the
+    /// optimal MALA acceptance rate, Roberts & Rosenthal 1998). Cheaper per transition than
+    /// HMC and more local: the preset `imh 1, mala 3`.
+    Mala,
 }
 
 /// Which solver moves the SAEM numerical θ/σ M-step (`[fit_options] mstep_solver`,
@@ -11226,7 +11237,7 @@ pub enum SaemOfv {
     Focei,
 }
 
-/// How a SAEM fit's gradient E-step kernel ran (`saem_kernel = hmc | nuts`, #2986), so a
+/// How a SAEM fit's gradient E-step kernel ran (`saem_kernel = hmc | nuts | mala`, #2986), so a
 /// caller can see a sampler that struggled without parsing a warning.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct SaemGradientKernelStats {
@@ -11241,11 +11252,13 @@ pub struct SaemGradientKernelStats {
     pub divergences: u64,
     /// Mean leapfrog steps per transition.
     pub mean_leapfrog: f64,
-    /// Mean acceptance probability (HMC) or acceptance statistic (NUTS) over the averaging
-    /// phase, where the step size is frozen; `None` when that phase ran no transition.
+    /// Mean acceptance probability (HMC, MALA) or acceptance statistic (NUTS) over the
+    /// averaging phase, where the step size is frozen; `None` when that phase ran no
+    /// transition. With MALA beside HMC or NUTS, the trajectory kernel's: MALA has a step size
+    /// and target (0.574) of its own.
     pub mean_accept: Option<f64>,
     /// Median over chains of the frozen step size, in the metric's whitened coordinates
-    /// (bounded to `[0.02, 1.9]`).
+    /// (bounded to `[0.02, 1.9]`); the trajectory kernel's where one runs, as `mean_accept`.
     pub median_step_size: f64,
 }
 
@@ -11874,6 +11887,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "isample_imh",
             "isample_hmc",
             "isample_nuts",
+            "isample_mala",
             "iaccept",
             "mceta",
             "n_mh_steps",
