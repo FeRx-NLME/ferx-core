@@ -54,6 +54,7 @@ pub(crate) use validation::check_survival_time_dependent_pk;
 // ── production submodules (peeled from this file) ──
 mod adaptive;
 mod adaptive_inputs;
+mod adaptive_summary;
 mod fit;
 mod output_columns;
 pub(crate) mod postfit;
@@ -76,6 +77,11 @@ pub use adaptive::{
     DrawnParameters,
 };
 pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
+pub use adaptive_summary::{
+    summarize_adaptive, AdaptiveBandStatus, AdaptivePopulationSummary, AdaptivePredictionInterval,
+    AdaptiveQuantiles, AdaptiveSummaryBand, AdaptiveSummaryMetric, AdaptiveSummaryOptions,
+    AdaptiveSummaryRow, AdaptiveSummaryStatistic,
+};
 pub use fit::{fit, fit_from_files};
 // The fit-scoped pools live at the crate root (#3041); `api` keeps their public paths.
 pub(crate) use crate::pool::install_on_fit_pool;
@@ -546,6 +552,11 @@ mod tests_derived_iov_kappa;
 #[cfg(test)]
 #[path = "tests/adaptive_sim_tests.rs"]
 mod adaptive_sim_tests;
+
+// ── Tests: the population summary, bands and prediction interval (#946 PR2) ──
+#[cfg(test)]
+#[path = "tests/adaptive_summary_tests.rs"]
+mod adaptive_summary_tests;
 
 // ── Tests: under IOV every decision is a record (#2895) ──
 #[cfg(test)]

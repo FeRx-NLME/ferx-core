@@ -847,9 +847,9 @@ The result bundles four tidy, long-form artifacts — each tagged by
   decisions, so if a run discontinues (a `Stop`) the later, dose-free scheduled
   windows are not counted — discontinuation is already its own metric, and folding
   it in here too would double-count it; this keeps `auc_target_attainment` on the
-  same realized basis as `pct_readings_in_window`. Population summaries **with
-  uncertainty bands** across the draws of a run with
-  [parameter uncertainty](#parameter-uncertainty) are a follow-up (#946).
+  same realized basis as `pct_readings_in_window`. To summarise these rows over the
+  population, with bands across parameter draws, see
+  [Population summary and bands](#population-summary-and-bands).
 
 ### Outcome metrics read the latent signal
 
@@ -945,6 +945,56 @@ validated by the degenerate oracle (draws at the point estimate reproduce the ru
 without uncertainty, bit for bit) and by a cross-check against
 `simulate_with_uncertainty` on the same draws under a fixed regimen (IPRED equal to
 the bit).
+
+### Population summary and bands
+
+`summarize_adaptive(&result, &AdaptiveSummaryOptions::default())` turns a run's
+`metrics` and `decisions` rows into three tables
+([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)). It reads the result and
+changes nothing in it, so the same run can be summarised again with other options.
+
+| Table | One entry per | What it holds |
+|---|---|---|
+| `rows` | metric, statistic, draw | The statistic over that draw's runs, `n_runs` and `n_missing` |
+| `bands` | metric, statistic | Quantiles of the per-draw statistic **across draws** |
+| `prediction_intervals` | metric | Quantiles of the individual value **pooled over every run** |
+
+The metrics are the `AdaptiveSubjectMetrics` fields, with `discontinued` as 1 or 0, and
+the latent signal of every monitored analyte at each `decision_idx`.
+`time_to_discontinuation` is left out: it is censored, and `discontinued` covers it.
+Every metric gets a `Mean` and a `Median`. `AdaptiveSummaryOptions::thresholds` adds a
+`FractionAtLeast(a)` row, e.g. `(PctReadingsInWindow, 0.8)` for the fraction of
+patients in the window at least 80 % of the time; there is none by default. The mean of
+`Discontinued` is the fraction discontinued.
+
+#### How runs are pooled
+
+- A draw's statistic is over all its runs, `n_sim × subjects`, each run weighted the
+  same. Supplied-η subjects (`with_etas`, without uncertainty) count like any other.
+- A run that carries no value for a metric, such as `pct_readings_in_window` without a
+  `target_window` or the signal at a decision after a `Stop`, is skipped and counted in
+  `n_missing`, never imputed. A metric no run carries has `value = None`.
+- A non-finite value makes every statistic, band and interval it enters `NaN`.
+
+#### Band versus prediction interval
+
+The **band** answers "how sure are we of the population outcome": the quantiles across
+draws of, say, the fraction attaining target. It reflects parameter uncertainty only. The
+**prediction interval** answers "where does one patient fall": it pools every run, so it
+holds between-patient and within-patient variability as well, and it is wider. The two
+are separate types and never share a table.
+
+Quantiles are type 7 (R's default), as in the VPC bands, at
+`AdaptiveSummaryOptions::probs` (default 0.05 / 0.5 / 0.95). A quantile at `p` is only
+reported once there are `⌈1 / min(p, 1 − p)⌉ − 1` values (19 for 5 % and 95 %, 1 for
+the median); below that it is `None`. A run with a single draw, which includes every
+run without uncertainty, has no band: its status is `NotDrawn`, not a zero-width band.
+Its rows and prediction intervals are still there. Per-trial quantities such as the
+probability of success are computed from `metrics` grouped by `(draw, sim)`.
+
+The band is checked against a conditional oracle. With Ω fixed at 0 and a fixed regimen,
+every run of a draw is the same patient, so each draw's statistic is a closed form of
+that draw's θ. The band equals the type-7 quantiles of those closed forms to 1e-13.
 
 ## Verification (on by default)
 
@@ -1416,8 +1466,7 @@ cannot see a failure in the solver itself.
 - **One monitored signal per block** — the declarative block titrates on a single
   `observe`; multiple named per-analyte monitors (already supported by the
   programmatic engine) are a declarative-surface follow-up.
-- **Roadmap** — population outcome summaries with uncertainty bands, the imperative
-  `[dose_control]` block, and PK + PD + safety model composition.
+- **Roadmap** — the imperative `[dose_control]` block, and PK + PD + safety model composition.
 
 [`ControllerCtx`]: https://docs.rs/ferx-core
 [`DoseAction`]: https://docs.rs/ferx-core

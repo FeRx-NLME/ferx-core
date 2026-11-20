@@ -143,6 +143,34 @@ fn min_curves_for_reads_the_smallest_tail() {
     assert_eq!(min_curves_for([0.2, 0.5, 0.95]), 19);
 }
 
+/// The per-probability floor that `min_curves_for` maximises over (#946 PR2): the median
+/// needs one value, 5 % and 95 % need 19, and the two tails of one `p` agree.
+///
+/// Mutations: `max` replaced by `min` in `min_curves_for` (the test above reddens with 1);
+/// the tail taken as `p` instead of `min(p, 1 − p)` (95 % gives 0).
+#[test]
+fn min_n_for_prob_reads_its_own_tail() {
+    assert_eq!(min_n_for_prob(0.5), 1);
+    assert_eq!(min_n_for_prob(0.05), 19);
+    assert_eq!(min_n_for_prob(0.95), 19);
+    assert_eq!(min_n_for_prob(0.25), 3);
+}
+
+/// Each quantile is gated by its own count, and a non-finite value is propagated into every
+/// quantile that is read rather than sorted past (`total_cmp` puts `NaN` last, so without
+/// the guard the lower quantiles would read the finite values only).
+///
+/// Mutations: dropping the `finite` guard (the 5 % and 50 % levels come back finite); one
+/// gate for all three levels.
+#[test]
+fn gated_quantiles_gates_each_level_and_propagates_nan() {
+    let mut v = vec![3.0, 1.0, 2.0];
+    assert_eq!(gated_quantiles(&mut v, [0.05, 0.5, 0.95], [19, 1, 19]), [None, Some(2.0), None]);
+    let mut v = vec![1.0, 2.0, 3.0, f64::NAN];
+    let q = gated_quantiles(&mut v, [0.05, 0.5, 0.95], [1, 1, 1]);
+    assert!(q.iter().all(|x| x.expect("gate passed").is_nan()), "{q:?}");
+}
+
 /// T6. The band is R's type-7 quantile. Against R 4.6 `quantile()`:
 /// `c(.1,.4,.2,.9,.5)` at `.25/.5/.75` is `.20/.40/.50` (type 6: `.15/.40/.70`), and
 /// `(1:20)/21` at `.05/.5/.95` is `0.0928571…/.5/0.9071428…` (type 6: `.05/.5/.95`).
