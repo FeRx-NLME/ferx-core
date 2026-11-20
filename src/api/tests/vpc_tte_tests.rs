@@ -810,6 +810,12 @@ fn too_few_curves_text_per_entry() {
         warn_for(Entry::Kmmc, &[5.0], &[3], &reps, Some((30, 10))).as_deref(),
         Some(format!("{HEAD}{}{FLOOR}", too_few(3, 20)).as_str())
     );
+    // #3111 r1 row 1: a grid running from before the latest last time to after it is
+    // too few curves, not past it — only *every* grid time past `latest` is C2.
+    assert_eq!(
+        warn_for(Entry::Tte, &[10.0, 20.0], &[3, 0], &reps, None).as_deref(),
+        Some(format!("{HEAD}{}{ZERO}", too_few(3, 20)).as_str())
+    );
 }
 
 /// Fixture P1 (#2947 plan §0): 30 subjects with events at `0.1·i`, λ = 0.5, no IIV,
