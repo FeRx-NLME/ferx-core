@@ -329,7 +329,12 @@ pub(crate) fn ofv_tolerance_shift(
         Err(why) => return Some(Err(format!("at the fit's own tolerance, {why}"))),
     };
     let tight_ofv = match crate::pool::with_fit_scope_ode(options, tight, || {
-        rescore_checked(model, population, params, eta_hats, kappas, options)
+        let out = rescore_checked(model, population, params, eta_hats, kappas, options);
+        // Its plans, recorded under the tighter override, serve nothing after it; and the
+        // tighter scope's pool outlives the call (idle pools are cached), so its workers drop
+        // their buffers here, on that pool (#3077).
+        crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
+        out
     }) {
         Ok(None) => return None,
         Ok(Some(Ok(v))) => v,

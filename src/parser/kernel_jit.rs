@@ -2913,6 +2913,67 @@ fn drop_scope(scope: u64) {
     }
 }
 
+/// Release the plans the fit this thread runs holds — at a boundary between two of its phases
+/// (#3077): estimation, the covariance step, the post-fit sensitivity sweep, the ODE tolerance
+/// settle check. Each phase records plans of its own (another layout, another solver override),
+/// which would otherwise all live until the fit's scope ends ([`drop_scope`]), so every later
+/// phase's peak would stack on the estimation plateau instead of replacing it.
+///
+/// Plans are a cache — a template replays what planning would build, bit for bit, and a kept
+/// forward is the forward its plan would run again — so a release costs a later phase a
+/// re-recording, never a value. What is released: the scope's plans, its families' templates,
+/// its kept forwards, and through them the chunk programs (IR and native code) only they ran
+/// ([`ChunkCache`] holds them weakly). What stays: the scope's bad marks and model bad marks
+/// (a subject that failed to plan does not try again) and its failure records, which the fit
+/// reports at its end ([`plan_failure_counts`]).
+///
+/// Then every worker of the pool this thread runs on drops its thread-local buffers and plan
+/// handles ([`release_thread_caches`]), which keep the largest a pass ever needed. Off a pool,
+/// only this thread's. A fit sharing the pool (another start of a multi-start) loses only cached
+/// buffers, which its next pass allocates again.
+///
+/// A no-op outside a registered fit: scope `0`'s plans leave with their model ([`drop_model`]).
+pub(crate) fn release_fit_plans() {
+    let scope = current_fit();
+    if scope == 0 {
+        return;
+    }
+    clear_kept(|k| k.scope == scope);
+    let mut s = subjects().write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A bad mark (`None`) stays: the subject's plan failed, and re-trying it each phase would
+    // only fail again.
+    s.retain(|k, v| k.scope != scope || v.is_none());
+    GENERATION.fetch_add(1, Relaxed);
+    drop(s);
+    lock_families().retain(|k, _| k.scope != scope);
+    prune_caches(|sc, _| sc == scope);
+    if rayon::current_thread_index().is_some() {
+        rayon::broadcast(|_| release_thread_caches());
+    } else {
+        release_thread_caches();
+    }
+}
+
+/// Drop this thread's cached buffers and plan handles: the pass buffers (`BUF`, `VBUF`, `ADJ`,
+/// the pool [`take`] serves), the ODE loop's slot buffers and run logs, and the last-subject and
+/// hot lookup entries, which hold plans. Each is a cache its next user refills. A cell borrowed
+/// right now — a worker that picked this up while waiting inside a pass that holds it — is left
+/// as it is, and so is what depends on it (`LAST_RUN` describes `BUF`).
+pub(crate) fn release_thread_caches() {
+    let freed =
+        BUF.try_with(|b| b.try_borrow_mut().map(|mut b| *b = Vec::new()).is_ok()).unwrap_or(false);
+    if freed {
+        LAST_RUN.with(|c| c.set(None));
+    }
+    for cell in [&VBUF, &ADJ] {
+        let _ = cell.try_with(|c| c.try_borrow_mut().map(|mut v| *v = Vec::new()));
+    }
+    let _ = POOL.try_with(|p| p.try_borrow_mut().map(|mut p| *p = Vec::new()));
+    let _ = LAST.try_with(|l| l.try_borrow_mut().map(|mut l| *l = None));
+    let _ = HOT.try_with(|h| h.try_borrow_mut().map(|mut h| *h = HotTable::default()));
+    ode_loop::release_thread_buffers();
+}
+
 /// Forget the plans and bad marks of the model `id`, as its [`crate::types::PlanId`] drops.
 pub(crate) fn drop_model(id: u64) {
     // A live fit borrows its model, so what a dropped model's plans leave kept is unregistered.

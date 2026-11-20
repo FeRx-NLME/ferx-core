@@ -2865,6 +2865,9 @@ fn fit_inner(
     }
 
     let mut result = result.expect("method chain must have at least one stage");
+    // Estimation is over: its plans go before the post-fit phases record their own, so the
+    // post-fit peak replaces the estimation plateau instead of stacking on it (#3077).
+    crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
     // Overwrite with chain-aware totals
     result.n_iterations = total_iterations;
 
@@ -2977,6 +2980,8 @@ fn fit_inner(
             mixest_classes.as_deref(),
         )
         .auto_stiff_rejected_jets;
+        // The sweep's sensitivity plans serve nothing after it (#3077).
+        crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans();
     }
 
     // Mixture (#977 Phase 5): thread the converged per-subject posteriors onto
@@ -3572,18 +3577,30 @@ fn fit_inner(
     // both are out of scope.
     {
         use crate::estimation::ode_tolerance_check as otc;
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::release_fit_plans;
         // The owner's options are recorded by every stage this check can re-score; an
         // `imp_eval_only` owner records none and is out of scope anyway.
         let stage = objective_stage_opts.filter(|o| otc::method_in_scope(o.method));
         if let (Some(stage), None) = (stage, &result.mixture_posteriors) {
-            match otc::ofv_tolerance_shift(
+            // The check re-records every subject at a tighter solver override, which a plan
+            // carries (`Plan::ode_override`): it starts from no plans of the phases before it
+            // (SIR's draws, the output columns) and leaves none behind (#3077).
+            let applies = otc::tightened_override(model, &stage).is_some();
+            if applies {
+                release_fit_plans();
+            }
+            let shift = otc::ofv_tolerance_shift(
                 model,
                 population,
                 &result.params,
                 &result.eta_hats,
                 &result.kappas,
                 &stage,
-            ) {
+            );
+            if applies {
+                release_fit_plans();
+            }
+            match shift {
                 Some(Ok(shift)) => {
                     if let Some((msg, entry)) = super::postfit::ode_ofv_not_settled_warning(&shift)
                     {

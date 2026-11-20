@@ -2457,3 +2457,125 @@ fn blocked_cholesky_records_linear_in_the_rows() {
     let (b16, b32, b64) = (count(16, true), count(32, true), count(64, true));
     assert!(b32 <= 2 * b16 + 8 && b64 <= 2 * b32 + 8, "blocked: {b16} → {b32} → {b64}");
 }
+
+/// A phase boundary (#3077) releases the plans, templates and kept forwards of the fit the
+/// thread runs and nothing else: the fit's bad marks and failure records stay (the subject does
+/// not re-try a failed plan, and the fit still reports it at its end), another fit's plans,
+/// templates and forwards stay, and a thread that runs no fit releases nothing.
+/// Mutations: drop `|| v.is_none()` from the retain -> the bad mark is gone (`Missing`); retain
+/// on anything but the scope -> B's plan / template / forward go; release under scope `0`
+/// instead of returning -> the unregistered plan goes; skip `clear_kept` -> A's forward stays;
+/// skip `lock_families().retain` / `prune_caches` -> A's template stays.
+#[test]
+fn a_phase_boundary_releases_only_the_running_fits_plans_and_keeps_its_bad_marks() {
+    let ma = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let mb = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let (ida, idb) = (ma.plan_id.get(), mb.plan_id.get());
+    let (a, b) = (vec![crate::types::Subject::default()], vec![crate::types::Subject::default()]);
+    let guard_a = super::in_fit(0, || register(&ma, &a));
+    let guard_b = super::in_fit(0, || register(&mb, &b));
+    let scope_of =
+        |s: &[crate::types::Subject]| registered(s.as_ptr() as usize).expect("registered").1;
+    let (scope_a, scope_b) =
+        (super::in_fit(guard_a.fit, || scope_of(&a)), super::in_fit(guard_b.fit, || scope_of(&b)));
+    assert_ne!(scope_a, scope_b, "fixture: two fits");
+    let variant = |v: u64| Desc::of_value(&v);
+    // Per fit: a plan, a bad-marked plan, a template and a kept forward.
+    // A structure per fit (`depth`): another fit's recording of the same one would replay its
+    // template instead of planning one of its own.
+    let fill = |m: &crate::types::CompiledModel,
+                s: &[crate::types::Subject],
+                scope: u64,
+                depth: usize| {
+        super::in_fit(scope, || {
+            let key = SubjectKey::new(m, &s[0], 1, 2).with_variant(variant(0x3077_0001));
+            add(&key, square_plan());
+            let bad = SubjectKey::new(m, &s[0], 1, 2).with_variant(variant(0x3077_0002));
+            mark_bad(&bad, "forced");
+            let family =
+                SubjectKey::new(m, &s[0], 1, 2).with_variant(variant(0x3077_0003)).family();
+            let rec = recorded(&family, || {
+                let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
+                let mut x = et[0];
+                for _ in 0..depth {
+                    x = x * et[1] + et[0];
+                }
+                Some(vec![x.reg()])
+            })
+            .expect("records");
+            rec.plan(l2(), 2, 0).expect("plans");
+            kept_lock().insert(
+                s.as_ptr() as usize,
+                Kept { plan: 0, layout: l2(), buf: vec![0.0; 4], scope, model: m.plan_id.get() },
+            );
+            (key, bad)
+        })
+    };
+    let (key_a, bad_a) = fill(&ma, &a, scope_a, 13);
+    let (key_b, _) = fill(&mb, &b, scope_b, 14);
+    // An unregistered plan (scope `0`), which a thread running no fit must leave alone.
+    let mc = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let loose = crate::types::Subject::default();
+    let key_0 = super::in_fit(0, || {
+        let k = SubjectKey::new(&mc, &loose, 1, 2).with_variant(variant(0x3077_0004));
+        add(&k, square_plan());
+        k
+    });
+    assert_eq!(key_0.scope, 0, "fixture: unregistered");
+    assert_eq!((templates_of(ida), templates_of(idb)), (1, 1), "fixture: a template each");
+    assert_eq!((kept_in(scope_a), kept_in(scope_b)), (1, 1), "fixture: a forward each");
+
+    super::in_fit(0, release_fit_plans);
+    assert!(matches!(lookup(&key_0), Lookup::Found(_)), "no fit, nothing released");
+    assert_eq!(kept_in(scope_a), 1, "no fit, no forward released");
+
+    super::in_fit(scope_a, release_fit_plans);
+    assert!(matches!(lookup(&key_a), Lookup::Missing), "A's plan is released");
+    assert!(matches!(lookup(&bad_a), Lookup::Bad), "A's bad mark stays");
+    assert_eq!(templates_of(ida), 0, "A's template is released");
+    assert!(lock_families().keys().all(|k| k.scope != scope_a), "and its family");
+    assert_eq!(kept_in(scope_a), 0, "A's forward is released");
+    let reported = super::in_fit(scope_a, || plan_failures(&ma, &a));
+    assert_eq!(reported, Some((1, "forced".to_string())), "its failure is still reported");
+    assert!(matches!(lookup(&key_b), Lookup::Found(_)), "B's plan stays");
+    assert_eq!(templates_of(idb), 1, "B's template stays");
+    assert_eq!(kept_in(scope_b), 1, "B's forward stays");
+    assert!(matches!(lookup(&key_0), Lookup::Found(_)), "the unregistered plan stays");
+    drop((guard_a, guard_b));
+    drop_model(ida);
+}
+
+/// A phase boundary frees every pool worker's thread-local buffers, not only the calling
+/// thread's (#3077): each keeps the largest a pass ever needed. Mutation: release only the
+/// calling thread (drop the `rayon::broadcast`) -> the other worker still holds its buffers.
+#[test]
+fn a_phase_boundary_frees_every_workers_pooled_buffers() {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().expect("a pool");
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let subs = vec![crate::types::Subject::default()];
+    let pooled = || {
+        POOL.with(|p| p.borrow().len())
+            + LAST.with(|l| usize::from(l.borrow().is_some()))
+            + super::ode_loop::pooled_buffers()
+    };
+    let counts = pool.install(|| {
+        let guard = register(&m, &subs);
+        let key = SubjectKey::new(&m, &subs[0], 1, 2).with_variant(Desc::of_value(&0x3077_0005u64));
+        add(&key, square_plan());
+        let fit = guard.fit;
+        // Every worker pools a buffer and caches the plan it looked up last.
+        rayon::broadcast(|_| {
+            give(vec![0.0; 1 << 12]);
+            super::in_fit(fit, || assert!(matches!(lookup(&key), Lookup::Found(_))));
+            super::ode_loop::Log::default().give();
+        });
+        let before = rayon::broadcast(|_| pooled());
+        release_fit_plans();
+        let after = rayon::broadcast(|_| pooled());
+        drop(guard);
+        (before, after)
+    });
+    assert!(counts.0.iter().all(|&n| n >= 3), "fixture: each worker holds some: {:?}", counts.0);
+    assert_eq!(counts.1, vec![0, 0], "each worker's are freed");
+    drop(m);
+}
