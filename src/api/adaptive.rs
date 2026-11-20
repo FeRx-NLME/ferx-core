@@ -191,7 +191,7 @@ pub struct AdaptiveSimulationResult {
     pub decisions: Vec<DecisionLogEntry>,
     /// Per-subject outcome metrics (#391 S2.4): one row per realized `(subject,
     /// draw, sim)` run — cumulative dose, dose-change / hold / discontinuation
-    /// counts, the observed-signal summary, and `pct_readings_in_window` when the block
+    /// counts, the signal summary (on the latent signal, #946), and `pct_readings_in_window` when the block
     /// declares a `target_window`. Derived from `ledger` + `decisions` alone (no
     /// re-integration). The population summary *with bands* rides with the
     /// uncertainty slice (S5), where bands carry meaning.

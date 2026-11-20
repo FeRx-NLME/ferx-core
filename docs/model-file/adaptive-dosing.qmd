@@ -856,7 +856,7 @@ The result bundles four tidy, long-form artifacts — each tagged by
 Each monitor reading is recorded twice in `observed_signals`: `value`, what the
 controller saw, and `latent`, the noise-free readout it was taken from. Under `Ipred`
 the two are the same number. Under `Dv`, `value` carries the assay draw (and the clamp
-at 0), and `latent` does not.
+at 0 where the readout cannot be negative), and `latent` does not.
 
 The outcome metrics `signal_min`, `signal_max`, `signal_mean` and `pct_readings_in_window`
 are scored on `latent`, like `auc_target_attainment` (#946). Whether the patient was in
