@@ -637,12 +637,12 @@ fn ss_state_at_phase_event_driven(
 // per-model `match (pk_model, d.cmt)` now subsumes it.
 
 /// Per-dose bioavailability-adjusted copies for the event-driven walker: each
-/// dose's `(rate, duration)` is replaced by [`DoseEvent::bioavailable_infusion`]
+/// dose's `(rate, duration)` is replaced by `DoseEvent::bioavailable_infusion`
 /// using the dose-time bioavailability `F` (`pk_at_dose[k].f_bio()`), so `F` is
 /// applied exactly once, up front, for every infusion (#419) - rate-defined doses
 /// get an `F`-scaled duration, duration-defined doses an `F`-scaled rate.
 /// Boluses are returned unchanged (`(0, 0)`); their `F` is applied to the amount
-/// via [`PkParams::bioavailable_amount`] in the walk. Parallel to `subject.doses`.
+/// via `PkParams::bioavailable_amount` in the walk. Parallel to `subject.doses`.
 /// Per-record PK parameters as the walk reads them (#2549): a slice, one snapshot per
 /// record, or an [`Indexed`] table, where records sharing a snapshot hold its index
 /// instead of a 1 KB copy each. The walk only ever borrows a record's snapshot.
@@ -764,7 +764,7 @@ pub fn event_driven_predictions_with_schedule(
     )
 }
 
-/// Profiling wrapper around [`event_driven_predictions_with_schedule_impl`],
+/// Profiling wrapper around `event_driven_predictions_with_schedule_impl`,
 /// taking the pre-built bioavailability-adjusted `eff_doses` so both entry points
 /// ([`event_driven_predictions`] and [`event_driven_predictions_with_schedule`])
 /// build them exactly once (#419).
@@ -1342,7 +1342,7 @@ pub fn propagate_one_cpt(state: &mut [f64], dt: f64, pk: &PkParams, rate: f64) {
 // ─── Oral models ─────────────────────────────────────────────────────
 
 /// 1-cpt oral propagator. State = `[A_depot, A_central]`. The dose-event
-/// handler adds a bolus to state[0] (depot); during propagation the depot
+/// handler adds a bolus to state`0` (depot); during propagation the depot
 /// drains into the central compartment via the absorption rate `ka`.
 /// `rate_central` is a constant zero-order input into the central compartment
 /// over this sub-interval — a depot-bypassing infusion (RATE>0 into cmt 2) —

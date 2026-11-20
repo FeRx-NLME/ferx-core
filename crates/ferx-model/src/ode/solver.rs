@@ -384,7 +384,7 @@ impl Default for OdeSolverOptions {
 // override below carries those fields the last hop.
 
 /// A per-field override of a spec's baked [`OdeSolverOptions`], armed for the duration of one
-/// [`fit`](crate::fit) (#1212).
+/// `fit` (#1212).
 ///
 /// Only the fields a caller actually moved are `Some`. `FitOptions::ode_solver_override` builds
 /// this by comparing against `FitOptions::default()`, whose `ode_*` values are identical to
@@ -1017,7 +1017,7 @@ impl<T: PkNum> StepClock<T> {
 /// method. A new consumer written against this trait therefore works with every method at
 /// once, and a new method implementing it works with every consumer at once.
 ///
-/// **Every comparison a driver makes reads [`PkNum::val`] only**, so at `T = Dual2` the
+/// **Every comparison a driver makes reads `PkNum::val` only**, so at `T = Dual2` the
 /// derivative rides a step sequence fixed by the value part — the property the analytic
 /// FOCE/FOCEI gradient depends on.
 pub trait Stepper<T: PkNum> {
@@ -1190,7 +1190,7 @@ pub const SWITCH_LOCATE_MAX: usize = 100;
 /// with lands on the far side of the crossing, where the right-hand side takes the other arm.
 /// A second switch that crossed before the bracket's far end is located instead, in what is
 /// left. Every attempt forces the located switch's arm before the crossing in all its stages
-/// ([`Switches::forced_attempt`]), so the step that ends there is a flow of that arm alone.
+/// (`Switches::forced_attempt`), so the step that ends there is a flow of that arm alone.
 /// Returns `θ`, the switch, its functions at the end, and the error of the attempt the stepper
 /// now holds, which is the forced attempt to `θ·h`.
 #[allow(clippy::too_many_arguments)]

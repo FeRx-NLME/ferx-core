@@ -193,7 +193,7 @@ pub(super) fn kernel_run(
     )
 }
 
-/// [`kernel_run`] for a kernel that reads no subject data — its leaves carry everything that
+/// `kernel_run` for a kernel that reads no subject data — its leaves carry everything that
 /// differs between subjects, and `variant` everything its recording bakes in (layout, the
 /// parameter values it reads as literals): one plan per configuration serves every subject, so
 /// a subject neither records nor first-tier runs it (#2980: the structured covariance kernel's

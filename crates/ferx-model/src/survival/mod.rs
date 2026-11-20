@@ -188,7 +188,7 @@ pub fn ode_tte_nll_g<T: crate::sens::num::vm::VmNum>(
     ode_tte_nll_visit_g(model, subject, chz_state, records, theta, eta, &mut |_| {})
 }
 
-/// [`ode_tte_nll_g`] handing each scored record's [`RecordTerm`] to `visit` (#901). It
+/// `ode_tte_nll_g` handing each scored record's [`RecordTerm`] to `visit` (#901). It
 /// returns `None` only before scoring (outside the walk's scope, or no solve), so a `None`
 /// never leaves terms in the visitor.
 pub fn ode_tte_nll_visit_g<T: crate::sens::num::vm::VmNum>(
@@ -201,7 +201,7 @@ pub fn ode_tte_nll_visit_g<T: crate::sens::num::vm::VmNum>(
     ode_tte_nll_from_states(model, subject, chz_state, records, &times, &solved, visit)
 }
 
-/// [`ode_tte_nll_g`] over a solve already saved at `times` (sorted, deduplicated, holding
+/// `ode_tte_nll_g` over a solve already saved at `times` (sorted, deduplicated, holding
 /// every time the endpoint's records read): what one evaluation's endpoints share. Each
 /// scored record's term goes to `visit`.
 pub fn ode_tte_nll_from_states<T: crate::sens::num::vm::VmNum>(
@@ -635,7 +635,7 @@ pub fn deviance_residual(delta: f64, dh: f64) -> f64 {
     (delta - dh).signum() * (2.0 * radicand).sqrt()
 }
 
-/// One endpoint's [`TteObsDiagnostic`] rows (#901), one per `Event` record in order.
+/// One endpoint's `TteObsDiagnostic` rows (#901), one per `Event` record in order.
 /// `terms = None` (the 1e20 sentinel) leaves residuals NaN; an interval-censored record
 /// has NaN `dv` and residuals. `written_time` maps the engine clock back to data TIME.
 pub fn tte_record_diagnostics(
@@ -1418,7 +1418,7 @@ pub fn simulate_tte_reporting<R: rand::Rng>(
 
 /// Shared diagnostic for a subject whose analytic hazard draw degenerated (a
 /// non-positive / non-finite effective rate, yielding the `f64::MAX` sentinel and so
-/// no event) — collected into [`crate::api::SimulationOutput::warnings`] (#763).
+/// no event) — collected into `crate::api::SimulationOutput::warnings` (#763).
 #[cfg(feature = "survival")]
 pub fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
     degenerate_hazard_text(id, cmt, "")

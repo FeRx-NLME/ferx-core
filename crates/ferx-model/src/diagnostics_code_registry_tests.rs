@@ -252,9 +252,9 @@ fn the_check_names_each_kind_of_drift() {
     let info = BTreeSet::from(["W_INFO".to_string()]);
     let problems = registry_problems(&emitted, &info, &registry, &docs);
     let want = [
-        "W_UNROWED (emitted at src/a.rs:2) has no row in src/diagnostics.rs's registry table",
+        "W_UNROWED (emitted at src/a.rs:2) has no row in crates/ferx-model/src/diagnostics.rs's registry table",
         "W_UNROWED (emitted at src/a.rs:2) has no row in docs/file-formats/check-report.qmd's code tables",
-        "E_STALE has a row in src/diagnostics.rs but nothing in src/ emits it — remove the stale row",
+        "E_STALE has a row in crates/ferx-model/src/diagnostics.rs but nothing in src/ emits it — remove the stale row",
         "E_A_ROW has 2 rows in docs/file-formats/check-report.qmd",
         "E_A_ROW's row in docs/file-formats/check-report.qmd says severity `warning`; an E_ code is `error`",
         "W_INFO's row in docs/file-formats/check-report.qmd says severity `warning`; a code emitted by Diagnostic::info is `info`",

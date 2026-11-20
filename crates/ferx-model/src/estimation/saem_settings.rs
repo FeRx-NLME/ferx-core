@@ -6,13 +6,13 @@
 /// ferx-r glue, `ferx-tools`, a test, any embedder can build one directly and
 /// never pass through that validator (#1479 review). The failure mode is the
 /// worst one this option has: `Some((0.0, 1.0))` puts every attainable
-/// acceptance rate inside the band, so [`inside_scale_deadband`] answers `true`
+/// acceptance rate inside the band, so `inside_scale_deadband` answers `true`
 /// on every iteration and **both scale controllers freeze for the whole fit**
 /// — silently, and with the Robbins-Monro rule now on by default.
 ///
 /// Returns `Some(substituted)` when the band had to be changed, so the caller
 /// can warn, and `None` when it was already in contract — the same shape as
-/// [`sanitize_mstep_damping`]. The rules, applied in this order:
+/// `sanitize_mstep_damping`. The rules, applied in this order:
 ///
 /// 1. a non-finite end drops the band (`NaN` already compares `false`
 ///    everywhere, but `(-inf, inf)` would freeze the fit);
@@ -46,7 +46,7 @@ pub fn sanitize_scale_deadband(band: Option<(f64, f64)>) -> Option<Option<(f64, 
     }
 }
 
-/// Value of [`FitOptions::saem_n_mh_steps`] that selects
-/// [`auto_n_mh_steps`] — the shipped default, written `n_mh_steps = auto` in a
+/// Value of `FitOptions::saem_n_mh_steps` that selects
+/// `auto_n_mh_steps` — the shipped default, written `n_mh_steps = auto` in a
 /// model file.
 pub const SAEM_N_MH_STEPS_AUTO: usize = 0;

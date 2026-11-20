@@ -23,8 +23,6 @@
 use crate::parser::model_parser::with_model_time;
 use crate::sens::num::{BranchCmp, PkNum};
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
-#[cfg(test)]
-use crate::stats::special::NEGBIN_SUM_MAX_K;
 use crate::stats::special::{ln_gamma, negbin_log_pmf_g};
 use crate::types::{
     CompiledModel, CountFamily, CountMeanScale, CountParamFn, DiscreteObsDiagnostic,

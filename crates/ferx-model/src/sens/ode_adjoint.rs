@@ -1146,7 +1146,7 @@ pub fn inner_search_gradient(
 pub const MODE_STATIONARY_TOL: f64 = 1e-4;
 
 /// The θ leaves of one recording and, when the weights reach the likelihood through the
-/// networks' outputs alone ([`hessian::NnReduction`]), those outputs on the **same** number
+/// networks' outputs alone (`hessian::NnReduction`), those outputs on the **same** number
 /// type: the recording reads them in place of evaluating the networks over the weights. The
 /// type is the guarantee — a recording can only be handed outputs of its own type, so there
 /// is no thread-local channel to miss or to nest (#2293 review).
@@ -2362,7 +2362,7 @@ pub fn with_plan_in<R>(
 }
 
 /// [`with_plan_in`]; `record_miss = false` records only a subject that has no plan yet, and
-/// answers `None` where its plans do not serve the point ([`plan_or_record`]).
+/// answers `None` where its plans do not serve the point (`plan_or_record`).
 #[allow(clippy::too_many_arguments)]
 pub fn with_plan_in_or<R>(
     model: &CompiledModel, subject: &Subject,
@@ -2477,7 +2477,7 @@ pub(super) fn plan_or_record<R>(
     r
 }
 
-/// [`with_plan`] for the covariance step's reduced basis ([`hessian::NnReduction`]): the
+/// [`with_plan`] for the covariance step's reduced basis (`hessian::NnReduction`): the
 /// predictions recorded with the networks' raw outputs `nn_z` as parameter slots after θ, so
 /// they are inputs a direction can move — with `sigma`, an SDE subject's variance rows
 /// ([`with_plan_in`]), σ's slots after the outputs'. Keyed apart from the subject's plain plans.
@@ -3816,7 +3816,7 @@ pub fn non_gaussian_terms_supported(model: &CompiledModel, subject: &Subject) ->
     crate::estimation::inner_settings::non_gaussian_eta_grad_served(model, subject)
 }
 
-/// [`crate::survival::non_gaussian_eta_hessian`], `None` without the `survival` feature.
+/// `crate::survival::non_gaussian_eta_hessian`, `None` without the `survival` feature.
 pub fn non_gaussian_eta_hessian(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Option<DMatrix<f64>> {
@@ -4022,7 +4022,7 @@ pub fn stacked_parts(
     StackedOmega { chol, placed }
 }
 
-/// [`tape_params`] as a kernel plan's inputs: Ω by its packed Cholesky entries (one leaf per
+/// `tape_params` as a kernel plan's inputs: Ω by its packed Cholesky entries (one leaf per
 /// entry, shared across occasion blocks), σ, ρ, the serial ρ
 /// and every θ — a plan replays at new values, so nothing parameter-dependent may enter as a
 /// constant (a θ the kernel does not read costs nothing: the plan drops it). Ω's inverse and
@@ -4086,7 +4086,7 @@ pub fn param_tr(
     })
 }
 
-/// [`ng_tape_inputs`] as a kernel plan's inputs, padded with constants to the stacked `width`
+/// `ng_tape_inputs` as a kernel plan's inputs, padded with constants to the stacked `width`
 /// (the term reads the leading BSV block).
 pub fn ng_leaves(
     width: usize, j: &NgJets, inp: &mut kernel::Inputs,
@@ -4224,7 +4224,7 @@ pub fn ng_jets3(
     terms::non_gaussian_jets3_planned(model, subject, theta, eta)
 }
 
-/// The adjoints `(a_q, a_g, a_h)` of [`ng_tape_inputs`]' inputs, `a_h[k][l]` for `k ≥ l`.
+/// The adjoints `(a_q, a_g, a_h)` of `ng_tape_inputs`' inputs, `a_h[k][l]` for `k ≥ l`.
 pub fn ng_adjoints<H: Copy>(
     ngr: &crate::sens::focei_kernel::NonGauss<H>, n: usize, adj: impl Fn(H) -> f64,
 ) -> (f64, Vec<f64>, Vec<Vec<f64>>) {

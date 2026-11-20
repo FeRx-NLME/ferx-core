@@ -465,7 +465,7 @@ pub fn bind_from_fit_on(
 ///
 /// Whether the model needs the fit's bindings is decided from `model_text`, not from
 /// `parsed`, so a model already bound to other data (a simulation design, by
-/// [`prepare_run`](crate::api::prepare_run) or
+/// `prepare_run` or
 /// [`bind_covariate_stats`](crate::covariate_stats::bind_covariate_stats)) is laid out on the
 /// fit's statistics, or refused when the fit carries none (#1686). Refused, with
 /// `parsed` left as it was: everything [`bind_from_fit`] refuses except a level the
@@ -1108,7 +1108,7 @@ pub fn cmp_levels(a: &Level, b: &Level) -> std::cmp::Ordering {
 
 /// A record that defines a level of a block: a Gaussian observation `j`, or record `r`
 /// of [`Subject::obs_records`], a discrete-state record of an endpoint whose expression
-/// reads the block ([`LevelBlockDecl::record_cmts`], #2562). A record of either kind is
+/// reads the block (`LevelBlockDecl::record_cmts`, #2562). A record of either kind is
 /// scored at its own level, so each one names a level the block must hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LevelRow {
@@ -1117,7 +1117,7 @@ pub enum LevelRow {
 }
 
 /// The rows of `subject` that define `decl`'s levels: every Gaussian observation, then
-/// every discrete-state record on one of the block's [`LevelBlockDecl::record_cmts`].
+/// every discrete-state record on one of the block's `LevelBlockDecl::record_cmts`.
 pub fn level_rows<'a>(
     decl: &'a LevelBlockDecl, subject: &'a Subject,
 ) -> impl Iterator<Item = LevelRow> + 'a {
@@ -1143,7 +1143,7 @@ pub fn rows_on<'a>(
 /// The value of one level column on `row` of `subject`: [`column_value`] for a Gaussian
 /// observation; for a discrete-state record, its `TIME` as written (`raw_time`, the
 /// clock [`column_value`] keys on too) or the column in its own covariate snapshot
-/// (`snaps`, the subject's [`Subject::record_covariate_snapshots`]), else the baseline.
+/// (`snaps`, the subject's `Subject::record_covariate_snapshots`), else the baseline.
 pub fn row_value(
     subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, column: &str, row: LevelRow,
 ) -> Option<f64> {
@@ -1165,7 +1165,7 @@ pub fn row_value(
 }
 
 /// The level index the predictors read on `row`: the observation's snapshot
-/// ([`Subject::obs_cov`]) or the record's ([`Subject::record_cov`]).
+/// ([`Subject::obs_cov`]) or the record's (`Subject::record_cov`).
 pub fn row_index(
     subject: &Subject, snaps: Option<&[HashMap<String, f64>]>, column: &str, row: LevelRow,
 ) -> Option<f64> {
@@ -1249,7 +1249,7 @@ pub fn discover_levels(
 
 /// The sentence [`no_levels_message`] closes the unread and the non-definer arms with,
 /// when the data has no record on a binary, count or DTMM endpoint
-/// ([`LevelBlockDecl::level_capable_cmts`], #2808): then no reader the user could add
+/// (`LevelBlockDecl::level_capable_cmts`, #2808): then no reader the user could add
 /// defines a level on it, so the block cannot be estimated. Each arm follows it with its
 /// own next step (#2819). The definer arm never appends it: there, that the data has no
 /// record on the reading endpoint is the fact the user can act on.
@@ -1267,9 +1267,9 @@ pub const ADD_DEFINING_ROWS: &str = "add rows that define a level, scored by an 
 /// kind either, it has no observation rows, and the refusal says that. Otherwise it names
 /// each record kind present and why it defined no level: a discrete-state record is on no
 /// endpoint that reads the block through its implicit index
-/// ([`LevelBlockDecl::record_cmts`]) (#2623), and likewise a count record (#2877), while a
+/// (`LevelBlockDecl::record_cmts`) (#2623), and likewise a count record (#2877), while a
 /// time-to-event record never defines one (#2751). Then why, which depends on whether any expression reads the block
-/// bare ([`LevelBlockDecl::read_bare`]): if none does, nothing reads it at all, since the
+/// bare (`LevelBlockDecl::read_bare`): if none does, nothing reads it at all, since the
 /// parse refuses a subscripted `NAME[COLUMN]` read (#2744); if one does, its reader defines
 /// no level on this data — a level-defining endpoint with no records here, or only a
 /// Gaussian prediction, a CTMM generator or a TTE hazard. When no reader could define a
@@ -1542,7 +1542,7 @@ pub fn records_replicate(
 }
 
 /// Whether observation records `j` and `k` of `subject` are replicates: one
-/// instant ([`Subject::same_instant`]) with no dose or reset between them, and
+/// instant (`Subject::same_instant`) with no dose or reset between them, and
 /// the same occasion, compartment and record covariates, so the data gives a
 /// random effect no way to move one and not the other.
 ///
@@ -2442,7 +2442,7 @@ pub fn span_residual(g: &[f64], cols: &[Vec<f64>]) -> Option<f64> {
 /// unit's column on its own (#1878 review r6).
 ///
 /// One that needed partners comes back with them as its partners
-/// ([`Absorption::with`]).
+/// (`Absorption::with`).
 ///
 /// Over the whole subject, not the unit's own records, and against every level
 /// of the subject, not the unit's own (#1877): on an ODE model a kappa on one
@@ -2891,7 +2891,7 @@ pub fn dot(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// `v` minus its projection on the orthonormal `basis`, projected twice (one
-/// re-orthogonalisation pass, as [`orthonormal_basis`] builds it).
+/// re-orthogonalisation pass, as `orthonormal_basis` builds it).
 pub fn project_out(v: &mut [f64], basis: &[Vec<f64>]) {
     project_out_coefs(v, basis);
 }
@@ -3220,7 +3220,7 @@ impl BlockBasis {
         // direction.
         let live: Vec<&(usize, Vec<usize>)> =
             members.iter().filter(|(_, js)| js.iter().all(|&j| nonzero(&cols[j]))).collect();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.joint = live.len();
         }
@@ -3640,7 +3640,7 @@ impl Probe<'_> {
     }
 }
 
-/// A block's level columns `raw` ([`Probe::level_cols`]), coded by its
+/// A block's level columns `raw` (`Probe::level_cols`), coded by its
 /// contrast over its groups: a column per free θ of the bound model (`free`),
 /// so a `FIX` level gives none (#1992). Under `none` every free level, under
 /// `ref` the free levels but the first of each group. Under sum-to-zero each
@@ -4628,7 +4628,7 @@ pub fn alternatives(
 }
 
 /// `contrast = auto` against the global rank check (#2421): while `layout`
-/// is rank-deficient ([`RankColumns::deficiency`]), each block left on `auto`
+/// is rank-deficient (`RankColumns::deficiency`), each block left on `auto`
 /// that absorbs no random effect, in declaration order, takes the first of its
 /// [`alternatives`] under which the whole layout keeps its rank; failing that,
 /// the first that lowers the deficiency, so that independent aliases — each
@@ -4675,7 +4675,7 @@ pub fn settle_auto(
 /// The global rank check (#2421): refuse `layout` when every free θ, each
 /// level block coded under its contrast, is rank-deficient over the values the
 /// likelihood reads at both probe points ([`RankColumns`]). The refusal names
-/// a minimal dependent set ([`RankColumns::dependent`]) and, where one keeps
+/// a minimal dependent set (`RankColumns::dependent`) and, where one keeps
 /// the rank, a contrast for one of its blocks that absorbs no random effect
 /// ([`rank_message`]).
 ///
@@ -6098,7 +6098,7 @@ pub fn level_map(model: &crate::types::CompiledModel) -> HashMap<String, Vec<Str
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ThetaLevelValue {
-    /// The level's label (`STUDY=7,TIME=4`), as [`theta_level_map`](crate::theta_level_map)
+    /// The level's label (`STUDY=7,TIME=4`), as `theta_level_map`
     /// lists it.
     pub label: String,
     /// The value the model uses for this level at the supplied θ. A free level is its
@@ -6134,7 +6134,7 @@ pub struct ThetaLevelValue {
 }
 
 /// Every level's value, free and dependent, of each bound level block, keyed by
-/// block name and in [`theta_level_map`](crate::theta_level_map) order (#1623), with
+/// block name and in `theta_level_map` order (#1623), with
 /// its standard error and SIR interval when the fit's uncertainty is supplied (#1890).
 ///
 /// The value is what the model's own evaluator reads for that level at `theta` — the
@@ -6159,7 +6159,7 @@ pub struct ThetaLevelValue {
 /// unless the fit was given other bounds by hand.
 ///
 /// Unbound level blocks and counted `theta NAME[N]` blocks are omitted, as in
-/// [`theta_level_map`](crate::theta_level_map); a model with neither gives an empty map.
+/// `theta_level_map`; a model with neither gives an empty map.
 pub fn theta_level_values(
     model: &crate::types::CompiledModel, theta: &[f64],
     covariance: Option<&nalgebra::DMatrix<f64>>, sir_resamples_packed: Option<&[Vec<f64>]>,
@@ -6426,7 +6426,7 @@ pub fn rsr_one_subject_levels_warning(
 }
 
 /// The CMTs of the per-record discrete-state endpoints whose expression reads `column`
-/// ([`LevelBlockDecl::record_cmts`]'s rule, for a block keyed on a plain column). An
+/// (`LevelBlockDecl::record_cmts`'s rule, for a block keyed on a plain column). An
 /// endpoint that reads the column for another reason than the block (`STUDY` in a second
 /// term) is counted too; that over-includes levels, which [`active_levels`] documents as
 /// safe.

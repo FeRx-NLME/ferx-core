@@ -259,7 +259,7 @@ pub fn theta_guard_is_internal(params: &ModelParameters, i: usize, side: &str) -
 
 /// Packed lower rail for a SIGMA coordinate: `exp(-8) ≈ 3.4e-4`.
 ///
-/// Named because three places spell it — [`unpinned_bounds`], which pushes it;
+/// Named because three places spell it — `unpinned_bounds`, which pushes it;
 /// the start-side diagnostic, which quotes the interval back at the user; and
 /// the docs tables. Before #1309's review the diagnostic carried its own
 /// literal `-8.0`, so moving the rail would have left the message quoting the
@@ -275,7 +275,7 @@ pub const SIGMA_PACK_UPPER: f64 = 5.0;
 /// `exp(2·-6) = 6.144e-6`.
 ///
 /// Named for the same reason [`SIGMA_PACK_LOWER`] is, and with more sites to
-/// keep honest: [`unpinned_bounds`] pushes it three times (BSV diagonal, Ω_IOV
+/// keep honest: `unpinned_bounds` pushes it three times (BSV diagonal, Ω_IOV
 /// diagonal, `[mixture]` Ω override); `api::validation`'s
 /// `E_OMEGA_INIT_AT_RAIL` (#1229) both *compares against* it and quotes
 /// `exp(2·lower)` back at the user as the largest variance that lands on it —
@@ -289,7 +289,7 @@ pub const SIGMA_PACK_UPPER: f64 = 5.0;
 /// `OmegaMatrix::from_matrix_with_mask` regularises a non-PD declared Ω with an
 /// eigenvalue floor of `1e-8`, so a declared `omega NAME ~ 0.0` arrives as
 /// `L_ii = 1e-4` and packs at `ln(1e-4) = -9.21` — **3.2 units below this
-/// rail**, outside the box the same template's [`unpinned_bounds`] builds.
+/// rail**, outside the box the same template's `unpinned_bounds` builds.
 ///
 /// That disagreement reads like something to reconcile by lifting the floor
 /// *inside* the rail. It is not: `E_OMEGA_INIT_AT_RAIL` fires on
@@ -426,11 +426,11 @@ pub const RHO_Z_BOUND: f64 = 3.0;
 const RHO_CLAMP: f64 = 0.999_999;
 
 /// The admissible ρ the packer takes `atanh` of: `ρ` itself for every
-/// `|ρ| < 1`, and `±`[`RHO_CLAMP`] for a ρ at or beyond the unit boundary.
+/// `|ρ| < 1`, and `±``RHO_CLAMP` for a ρ at or beyond the unit boundary.
 ///
 /// `atanh` is finite across the whole open interval — the largest `f64` below 1
 /// gives `atanh(0.999_999_999_999_999_9) = 18.71`, measured — so nothing between
-/// [`RHO_CLAMP`] and 1 needs backing off, and backing it off is what broke the
+/// `RHO_CLAMP` and 1 needs backing off, and backing it off is what broke the
 /// `FIX` contract a second time. Only `|ρ| >= 1`, where `atanh` is `±inf`, does.
 ///
 /// `NaN` passes through: `NaN.abs() >= 1.0` is false, so it reaches `atanh` and
@@ -1251,7 +1251,7 @@ pub fn omega_correlated_diagonal_mask(template: &ModelParameters) -> Vec<bool> {
 /// **declared inside** a `block_omega` / `block_kappa` line, one-eta blocks
 /// included (#1394).
 ///
-/// Pure provenance, read from [`OmegaMatrix::block_declared`], and the only
+/// Pure provenance, read from `OmegaMatrix::block_declared`, and the only
 /// thing that can name a declaration the way the user spelled it. It says
 /// nothing about whether the eta has covariances — see
 /// [`omega_correlated_diagonal_mask`] for that. The two agree on every block of
@@ -1588,7 +1588,7 @@ pub fn coordinates_outside_bounds<'a>(
 /// The declared range of θ `i` intersected with ferx's packing caps, on the
 /// **natural** scale — the interval a start actually has to land inside.
 ///
-/// [`unpinned_bounds`] packs exactly this, so the two cannot drift: the caps
+/// `unpinned_bounds` packs exactly this, so the two cannot drift: the caps
 /// live here and the `ln` lives there. Reading the interval back out of the
 /// packed box instead would go through `exp(ln(x))`, which is not the identity
 /// — `exp(ln(1e-10))` is `9.999999999999996e-11` and `exp(ln(1e9))` is
@@ -1713,14 +1713,14 @@ pub struct InvertedBox {
 ///
 /// **Only THETA can reach this**, and the reason is worth stating because it is
 /// what keeps the check from needing a per-kind message: every other segment's
-/// bounds are compile-time constants ([`unpinned_bounds`] pushes `±6`, `±10`,
+/// bounds are compile-time constants (`unpinned_bounds` pushes `±6`, `±10`,
 /// `[-8, 5]` and `±RHO_Z_BOUND`), and [`pack_with_bounds`] pins a FIX-ed
 /// coordinate to `lower == upper`, which is equal, not inverted. The iterator
 /// is written over every coordinate anyway, so a future rail that could invert
 /// is reported rather than silently skipped.
 ///
 /// With `theta_lower <= theta_upper` the box still inverts in two ways, both
-/// from caps [`unpinned_bounds`] applies and the declaration does not mention:
+/// from caps `unpinned_bounds` applies and the declaration does not mention:
 /// `theta_lower > `[`THETA_PACK_CEIL`] and `theta_upper < `[`LOG_PACK_FLOOR`].
 /// `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter — is the
 /// second, and it packs to `lower = -23.03` against `upper = -25.33`.
@@ -2200,8 +2200,8 @@ pub fn theta_se_from_packed(var: f64, theta: f64, theta_lower: f64) -> f64 {
 }
 
 /// Whether the covariance step held packed coordinate `p` (#2797): it produced a matrix
-/// and `p`'s row is the zero row [`crate::estimation::covariance::condition_on_held`]
-/// embeds. Read only for a coordinate [`held_guard_coordinates`] lists: a free coordinate
+/// and `p`'s row is the zero row `crate::estimation::covariance::condition_on_held`
+/// embeds. Read only for a coordinate `held_guard_coordinates` lists: a free coordinate
 /// the step did not hold has the positive diagonal of a positive-definite inverse.
 pub fn step_held(cov: Option<&DMatrix<f64>>, p: usize) -> bool {
     cov.is_some_and(|m| p < m.nrows() && m[(p, p)] == 0.0)

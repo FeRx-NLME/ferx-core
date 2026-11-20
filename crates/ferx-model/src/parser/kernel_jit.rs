@@ -6,7 +6,7 @@
 //! small θ-only function ([`derivs`]) — writes the register program ([`Flat`]) of that
 //! computation: θ and η are inputs, data are literals, and identical operations on identical
 //! operands are one register (hash-consing). `Recording::plan` lowers the program by the RHS's
-//! own lane code ([`ir::forward`]) at the layout a caller asks for (value, η-gradient, packed
+//! own lane code (`ir::forward`) at the layout a caller asks for (value, η-gradient, packed
 //! η-Hessian), so each operation is the forward-dual arithmetic lane for lane; the lanes the
 //! inputs fix (η's one-hot seeds, θ's zero tangents) become constants, a folding pass drops the
 //! terms they make exactly `0` or `1`, and Cranelift compiles the result. The plan's reverse
@@ -14,8 +14,8 @@
 //! gradient, `H` and the covariance R-matrix need — no second copy of any formula.
 //!
 //! **Soundness.** A plan is valid only where every branch the recorder took still goes the same
-//! way. Reading an input-dependent value ([`PkNum::val`]) aborts the recording unless it is a
-//! guard; a guard ([`Tr::guard_cmp`]) is compiled as a check, whose verdict is the plan's last
+//! way. Reading an input-dependent value (`PkNum::val`) aborts the recording unless it is a
+//! guard; a guard (`Tr::guard_cmp`) is compiled as a check, whose verdict is the plan's last
 //! output. A plan whose guard fails does not serve: the caller records another variant at that
 //! point (a subject keeps up to `MAX_VARIANTS`), so a subject is followed across its branches
 //! with exact derivatives on each.
@@ -23,7 +23,7 @@
 //! **Failure.** A recording that cannot be made ([`end`] says why) or a plan that does not serve
 //! at its own recording point marks the subject — or, for a reason of the model's, the model —
 //! bad: its derivatives take finite differences, and the fit reports every such subject once
-//! (`W_PLAN_FD_FALLBACK`, [`plan_failures`]). It should never happen. `FERX_KJIT_DEBUG=1`
+//! (`W_PLAN_FD_FALLBACK`, `plan_failures`). It should never happen. `FERX_KJIT_DEBUG=1`
 //! prints each failed recording's reason, replays every recording on values to check its
 //! lowering, and prints the counters ([`report`]) at the end of a fit.
 
@@ -220,7 +220,7 @@ pub struct Rec {
     transient: bool,
 }
 
-/// A recording's extent at one point ([`Rec::snapshot`]).
+/// A recording's extent at one point (`Rec::snapshot`).
 pub struct Snapshot {
     code: usize,
     n_regs: u32,
@@ -452,7 +452,7 @@ pub fn node(key: Option<Key>, mk: impl FnOnce(u32) -> Flat) -> u32 {
     })
 }
 
-/// [`node`] and its recorded value ([`Tr::mk`]) in one borrow of the recording: a dependent
+/// [`node`] and its recorded value (`Tr::mk`) in one borrow of the recording: a dependent
 /// value.
 pub fn node_v(key: Key, v: f64, mk: impl FnOnce(u32) -> Flat) -> Tr {
     let r = rec(|r| {
@@ -2686,7 +2686,7 @@ pub enum FailedPlan {
 
 /// Per `(scope, model)`: the plans that failed, each with the quantities (`Q_*`) it fed, and
 /// the first reason. In theory no plan fails; one that does sends its subject to finite
-/// differences for the quantity at hand, and the fit reports it once ([`plan_failures`]).
+/// differences for the quantity at hand, and the fit reports it once (`plan_failures`).
 pub type Failures = HashMap<(u64, u64), (HashMap<FailedPlan, u8>, String)>;
 pub fn failures() -> &'static Mutex<Failures> {
     static F: OnceLock<Mutex<Failures>> = OnceLock::new();
@@ -2737,7 +2737,7 @@ pub fn model_wide() -> FailedPlan {
 
 /// Note that a derivative of the model's alone (a θ-only recording, [`derivs`]) fell back to
 /// finite differences because its recording failed (`why`): it enters every subject's outer
-/// gradient only, so the fit counts every subject there ([`plan_failures`]).
+/// gradient only, so the fit counts every subject there (`plan_failures`).
 pub fn note_model_failure(model: &crate::types::CompiledModel, why: &str) {
     STATS.bad.fetch_add(1, Relaxed);
     *failures()
@@ -3083,8 +3083,8 @@ impl HotKey {
     }
 }
 
-/// One thread's hot entries, direct-mapped by [`HotKey::slot`], all of them filled under one
-/// [`HotStamp`]: the first [`get`](Self::get) or [`put`](Self::put) under another stamp drops
+/// One thread's hot entries, direct-mapped by `HotKey::slot`, all of them filled under one
+/// [`HotStamp`]: the first `get` or `put` under another stamp drops
 /// the stale ones (which hold only the variants' allocations, not the plans). The slot array
 /// is pointers, allocated on the first put.
 #[derive(Default)]
@@ -3489,7 +3489,7 @@ impl Tiered {
         })
     }
 
-    /// The doubled slot table a rows reverse call passes: `idx`'s first [`Self::entries`]
+    /// The doubled slot table a rows reverse call passes: `idx`'s first `Self::entries`
     /// entries, then each `off` on.
     pub fn doubled(&self, idx: &[u32], off: u32, out: &mut Vec<u32>) {
         // The kernel's second-half offsets assume exactly `entries` entries before them: a
@@ -3530,7 +3530,7 @@ impl Tiered {
 
     /// Count `k` calls, promoting at each tier's point crossed. The count is a plain load
     /// and store, not a locked add — a lost update between threads only delays a promotion
-    /// — and each tier is compiled once ([`Self::tier`]).
+    /// — and each tier is compiled once (`Self::tier`).
     #[inline]
     pub fn count(&self, k: usize) {
         let n0 = self.calls.load(Relaxed);
@@ -3993,7 +3993,7 @@ thread_local! {
 /// `0.0`.
 ///
 /// # Safety
-/// As [`Tiered::call_seeds`].
+/// As `Tiered::call_seeds`.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn interpret_func(
     f: &Func, lanes: usize, n_in: usize, rev: bool, prefix: usize, base: *mut f64, adj: *mut f64,
@@ -4108,7 +4108,7 @@ pub struct Plan {
     serial: u64,
 }
 
-/// A fresh [`Plan::serial`].
+/// A fresh `Plan::serial`.
 pub fn next_serial() -> u64 {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     N.fetch_add(1, Relaxed)
@@ -4444,7 +4444,7 @@ impl std::ops::BitAnd<&DirMask> for &DirMask {
 }
 
 /// Each register's live directions: the η a value can depend on (bit `k` = η `k`), and
-/// [`DirMask::FREE`] when it depends on any input. A lane outside it is an exact zero, whatever the
+/// `DirMask::FREE` when it depends on any input. A lane outside it is an exact zero, whatever the
 /// inputs' values.
 pub fn direction_masks(
     code: &[Flat], n_regs: usize, eta_regs: &[(u32, usize)], dense: bool,
@@ -4498,7 +4498,7 @@ pub fn direction_masks(
 /// among its literals, which share a register by value), takes the plan's calls with its own
 /// literals and loop calls instead of planning: what planning would build, bit for bit, since
 /// nothing else of it reaches the plan. The structure is hashed in order and a hit is
-/// confirmed instruction by instruction ([`Recording::fits`]), so no hash collision serves a
+/// confirmed instruction by instruction (`Recording::fits`), so no hash collision serves a
 /// wrong plan.
 pub struct Template {
     /// The `(scope, model)` whose recording planned it ([`drop_scope`], [`drop_model`] forget
@@ -4528,7 +4528,7 @@ thread_local! {
     pub static REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The planned programs, by [`Recording::shape`].
+/// The planned programs, by `Recording::shape`.
 pub fn templates() -> &'static Mutex<HashMap<u64, Vec<Arc<Template>>, FxBuild>> {
     static T: OnceLock<Mutex<HashMap<u64, Vec<Arc<Template>>, FxBuild>>> = OnceLock::new();
     T.get_or_init(Default::default)
@@ -6195,7 +6195,7 @@ impl Plan {
     }
 }
 
-/// [`fold`] for a chunk: input `i`'s lanes outside its directions are zero, a seed's own
+/// `fold` for a chunk: input `i`'s lanes outside its directions are zero, a seed's own
 /// lane is one; literals carry no tangent.
 pub fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
     let lanes = layout.lanes();
@@ -6261,13 +6261,13 @@ pub fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
 /// 3–6 % more instructions than whole, and `iov_ode` 7 %. The point is the size above which a
 /// frame is a hazard, not the size at which cutting is cheap.
 pub const SEG_MIN_INSTS: usize = 24576;
-/// The low bit of [`Tiered::native`] of a segmented kernel.
+/// The low bit of `Tiered::native` of a segmented kernel.
 pub const SEGMENTED: usize = 1;
 /// A segment's instructions: its frame is bounded by this, not by the kernel.
 pub const SEG_INSTS: usize = 1024;
 
 /// A large kernel cut into segments of [`SEG_INSTS`] instructions, one native function each, run
-/// in order ([`Tiered::run_segments`]). A value used in a later segment than its definition
+/// in order (`Tiered::run_segments`). A value used in a later segment than its definition
 /// goes through a heap scratch buffer — stored where it is defined, read back (once per
 /// segment) where it is used — so no function holds more than a segment's values and the
 /// frames stay small whatever the kernel's size. Every segment runs the instructions the one
@@ -6356,7 +6356,7 @@ impl SegPlan {
     }
 }
 
-/// With `rev`, the first `prefix` instructions are the recomputed forward ([`ir::reverse`]):
+/// With `rev`, the first `prefix` instructions are the recomputed forward (`ir::reverse`):
 /// they run once, the rest in a loop over the seeds.
 /// The target a plan is compiled for at a tier (`quick`: the single-pass register allocator;
 /// `opt`: Cranelift's `opt_level`), on the host flags every module shares

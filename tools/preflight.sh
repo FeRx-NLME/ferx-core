@@ -272,7 +272,10 @@ group_fmt() {
 group_check() {
   CI_JOB="Check"
 
-  run cargo check --tests --no-default-features --features ci
+  # Both engine crates (#3041): `ferx-model` is a dependency of `ferx-core`, so a root-only
+  # `cargo check --tests` would compile its library but never its own unit tests. The two
+  # share feature names (ferx-core forwards each to ferx-model), so one feature list fits both.
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci
 
   # `tests/tte_convergence.rs` is gated on BOTH `survival` and `slow-tests`, and no
   # other per-PR job sets both — so those Tier-3 TTE tests compile in *neither*.
@@ -280,14 +283,14 @@ group_check() {
   # only breaks the nightly slow-tests run, decoupled from the offending PR.
   # Compile-only: the tests themselves stay nightly per the tier rules.
   # (#441 review finding #3.)
-  run cargo check --tests --no-default-features --features ci,survival,slow-tests
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci,survival,slow-tests
 
   # This is also what COMPILE-GATES the whole feature-gated surface. The
   # `Tests + coverage (TTE/CTMM endpoints)` job builds only the handful of endpoint
   # test binaries, so a break in any *other* file under `--features ci,markov`
   # (which implies `survival`) is caught here in ~1 min, rather than by an 18-min
   # instrumented build.
-  run cargo check --tests --no-default-features --features ci,markov
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci,markov
 
   # Same rationale for `nn`, with `slow-tests` folded in for the same reason as the
   # survival line — but the double-gated bodies are in `src/`, not `tests/`.
@@ -302,7 +305,7 @@ group_check() {
   # One cheap check covers the whole `nn` surface — `src/nn`, the `[covariate_nn]`
   # parser, the θ-gradient module, and every nn-gated test file. This is the exact
   # line that would have caught #1133's E0063, and #1446's E0425, before the push.
-  run cargo check --tests --no-default-features --features ci,nn,slow-tests
+  run cargo check -p ferx-core -p ferx-model --tests --no-default-features --features ci,nn,slow-tests
 
   # The workspace members (#1114). `-p` rather than `--workspace` so the `ferx-core`
   # targets above are not rebuilt, and the feature is package-qualified
@@ -387,7 +390,7 @@ group_clippy() {
   # local toolchain unless you have updated recently — one of those 6
   # (`EULER_GAMMA`, `src/stats/special.rs`) is invisible to an old clippy. Run
   # `rustup update nightly` before trusting a green result here.
-  run cargo clippy --no-default-features --features ci,markov,nn --all-targets -- -Dunused
+  run cargo clippy -p ferx-core -p ferx-model --no-default-features --features ci,markov,nn --all-targets -- -Dunused
 
   # The same gate on the feature set ferx-core SHIPS with (`default = []`, which is what
   # ferx-r builds). The line above cannot see it: `markov` implies `survival`, so an item
@@ -404,7 +407,7 @@ group_clippy() {
   # production helper that only a test calls still warns in ferx-r's build while this
   # line passes. ferx-r compiles the lib alone; so does this. Test code is linted by
   # the feature-rich `--all-targets` line above.
-  run cargo clippy --no-default-features --features ci --lib -- -Dunused
+  run cargo clippy -p ferx-core -p ferx-model --no-default-features --features ci --lib -- -Dunused
 
   # Same package-qualified-feature trick as `check`, so the members reuse the
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
@@ -486,7 +489,7 @@ group_rustdoc() {
   # `cargo doc` documents the library only — `#[cfg(test)]` modules and sibling
   # `*_tests.rs` files are not rustdoc'd, so a doc link in test code is not
   # gated. That is fine: it renders nowhere.
-  run env RUSTDOCFLAGS=-Dwarnings cargo doc --no-deps --no-default-features \
+  run env RUSTDOCFLAGS=-Dwarnings cargo doc -p ferx-core -p ferx-model --no-deps --no-default-features \
     --features ci,markov,nn
 
   # The members, for the same reason clippy checks them separately (#1114):

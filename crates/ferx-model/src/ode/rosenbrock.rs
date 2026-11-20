@@ -51,9 +51,9 @@
 //! # Shared discipline with RK45
 //!
 //! Step-size control, the `min_dt` force-accept, the non-finite divergence break, the
-//! `saveat` clipping and [`OdeSolverStats`] accounting are all deliberately identical to
+//! `saveat` clipping and `OdeSolverStats` accounting are all deliberately identical to
 //! [`super::solver::solve_ode`], and — as there — **every comparison branches on
-//! [`PkNum::val`] only**, so the derivative rides a step sequence fixed by the value part.
+//! `PkNum::val` only**, so the derivative rides a step sequence fixed by the value part.
 //! That discipline extends here to the LU pivot selection (see
 //! [`crate::sens::linsolve::lu_factor_in_place_g`]).
 
@@ -519,7 +519,7 @@ thread_local! {
 /// Registers `jac` as the exact Jacobian, and `direct` as the direct native calls, of exactly
 /// the closure `rhs` for the guard's lifetime, on this thread: a Rosenbrock step whose `rhs`
 /// *is* that closure (same address) takes `J` and `f_t` from `jac`
-/// ([`RosWorkspace::refresh_jacobian`]); every other `f64` right-hand side (a host closure)
+/// (`RosWorkspace::refresh_jacobian`); every other `f64` right-hand side (a host closure)
 /// falls back to differences. Restores the previous registration on drop, so nested
 /// integrations of other systems are unaffected.
 pub struct RhsGuard {
@@ -969,7 +969,7 @@ impl<T: PkNum> RosWorkspace<T> {
     }
 }
 
-/// [`RosWorkspace::err_norm`] over accessors: the stepper's own, and a compiled run's off its
+/// `RosWorkspace::err_norm` over accessors: the stepper's own, and a compiled run's off its
 /// value lane (#2786).
 #[inline(always)]
 pub fn ros_err_norm(

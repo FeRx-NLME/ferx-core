@@ -147,7 +147,7 @@ fn probe_rhs_f64(spec: &OdeSpec, u: &[f64], p: &[f64], t: f64) -> Option<Vec<f64
 /// compartment. Structure only; per-subject rates come from
 /// [`recover_disp_params_g`]. `p` is a representative (positive) parameter point
 /// and `t` a probe time; the checks are parameter-point-agnostic in structure,
-/// and [`verify_against_ode_twin`] re-validates numerically in debug builds.
+/// and `verify_against_ode_twin` re-validates numerically in debug builds.
 ///
 /// The probe is behavioural by design, but it cannot decide **model-time
 /// dependence**: it samples two times with `tad` pinned, so a `TAD` term is
@@ -591,7 +591,7 @@ pub struct MrScope<'a> {
 /// closed-form-able kind ([`is_closed_form_kind`]); a canonical linear 1-/2-cpt disposition
 /// ([`identify_disposition`]); no IOV, time-varying covariates, resets, `init(...)`,
 /// steady-state or infusion doses, or compartment-indexed `F{c}`/`ALAG{c}` (the
-/// `dose_attr_map`); and no route in its flip-flop domain ([`route_flips`]). Returns `None`
+/// `dose_attr_map`); and no route in its flip-flop domain (`route_flips`). Returns `None`
 /// when out of scope, and the caller falls back to the ODE path (always correct).
 pub fn mr_scope<'a>(
     model: &'a crate::types::CompiledModel, subject: &crate::types::Subject, theta: &[f64],

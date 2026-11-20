@@ -12731,6 +12731,8 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     rust_sources(&root.join("src"), &mut files);
+    // The model layer moved to its own crate in #3041; it is scanned as before.
+    rust_sources(&root.join("crates/ferx-model/src"), &mut files);
     files.sort();
     assert!(
         files.len() > 100,
@@ -12770,10 +12772,12 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
          string that no longer exists: {seen_name:?}"
     );
 
-    let expected: BTreeMap<String, usize> =
-        [("src/ode/predictions.rs".to_string(), 1), ("src/sens/ode_provider.rs".to_string(), 2)]
-            .into_iter()
-            .collect();
+    let expected: BTreeMap<String, usize> = [
+        ("crates/ferx-model/src/ode/predictions.rs".to_string(), 1),
+        ("crates/ferx-model/src/sens/ode_provider.rs".to_string(), 2),
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
         calls, expected,
         "the bare non-finite-timeline predicates are called somewhere new. An engine guard \

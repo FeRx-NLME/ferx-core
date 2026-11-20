@@ -5,7 +5,7 @@ use crate::types::*;
 
 /// Every [`FitOptions`] setting that changes a SIR result, as one SIR run used
 /// it (#1758). Carried on [`FitResult::sir_settings`] so a later
-/// [`run_sir`](crate::run_sir) on that fit re-scores under the same settings by
+/// `run_sir` on that fit re-scores under the same settings by
 /// default, and so a reader can tell which scale, degrees of freedom and seed
 /// produced the reported intervals.
 ///
@@ -14,7 +14,7 @@ use crate::types::*;
 ///
 /// `method` and `interaction` are not here: they already ride on the
 /// [`FitResult`] (`method`, `interaction`), and which of them SIR scores is
-/// [`run_sir`](crate::run_sir)'s business (#1710).
+/// `run_sir`'s business (#1710).
 ///
 /// `Default` is `SirSettings::from_options(&FitOptions::default())`, the
 /// settings of a SIR run that changed nothing.

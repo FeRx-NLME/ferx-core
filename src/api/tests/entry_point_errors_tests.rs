@@ -1098,6 +1098,8 @@ fn no_library_code_re_raises_a_precondition_err_as_a_panic() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     rust_sources(&root.join("src"), &mut files);
+    // The model layer moved to its own crate in #3041; it is scanned as before.
+    rust_sources(&root.join("crates/ferx-model/src"), &mut files);
 
     let unwrapped_call =
         regex::Regex::new(r"(^|[^\w.])(predict|simulate|simulate_with_seed)\(.*\)\.unwrap\(\)")

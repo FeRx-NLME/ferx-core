@@ -4,7 +4,7 @@
 //! `join_context` / collect-consumer machinery per call site, because every closure is its own
 //! type. The ~40 per-subject fan-outs in the estimators each paid that (~1.2 MB of shipped code
 //! in total). Here the generic part is only a loop over a range writing results in place; the
-//! rayon driver ([`run_ranges`]) is non-generic and is entered once per *leaf range* through a
+//! rayon driver (`run_ranges`) is non-generic and is entered once per *leaf range* through a
 //! `&dyn Fn` — never per item — so the per-item cost is the same as rayon's own collect.
 //!
 //! Scheduling is rayon's adaptive splitting (`rayon::iter::split`, the same `Splitter` the

@@ -365,7 +365,7 @@ pub fn summarize(name: &str, population: &Population) -> Result<CovariateSummary
 /// order: the subject-static fallback, then each observation, dose, EVID=2
 /// covariate-change marker, EVID=3/4 reset snapshot and endpoint-record snapshot.
 ///
-/// Shared with [`crate::api::validation`]'s categorical-level check, so the
+/// Shared with `crate::api::validation`'s categorical-level check, so the
 /// values a summary is built from and the values a declared level set is
 /// checked against are, by construction, the same set.
 pub fn subject_covariate_values(subject: &Subject, name: &str) -> Vec<f64> {

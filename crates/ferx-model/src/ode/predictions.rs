@@ -2464,7 +2464,7 @@ pub fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::n
 /// (a steady-state train and an infusion keep the pointwise path: their kernel enters through the
 /// periodic sum / the convolved `R_in_inf`). It is delivered there when its onset is lagged
 /// (`lag + route lag > 0`) and the density is infinite at it
-/// ([`PreparedInputRate::frame_kernel`], `β < 1`): the one place the pointwise path's derivative
+/// (`PreparedInputRate::frame_kernel`, `β < 1`): the one place the pointwise path's derivative
 /// is not the integral's. The frame integrates `v = u − shift`, so its tolerance is relative to
 /// `|v|`, and it is used where nothing cheaper is exact.
 #[inline]
@@ -3235,7 +3235,7 @@ impl OdeReadout {
 /// `subject.obs_cmts[obs_idx]` selects the per-CMT readout when
 /// `OdeReadout::PerCmt` is in use; the simpler variants ignore it. `time` is the
 /// observation time a `TIME`-referencing Form C readout resolves against (#1028)
-/// — see [`OdeReadout::eval`].
+/// — see `OdeReadout::eval`.
 #[inline]
 pub fn read_observable(
     ode: &OdeSpec, u: &[f64], pk_params_flat: &[f64], theta: &[f64], eta: &[f64],
@@ -3320,7 +3320,7 @@ pub fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64
 /// `api::output_columns::tad_at_time`, and the lag-ignoring sdtab fallback in `io::output`), and three
 /// disagreed on `(t_dose = 120, ALAG = 3, II = 12, t = 121)`: `-2.0`, `NaN` and `+1.0`. #1126
 /// collapsed the **lag-aware** ones onto one function. Two are deliberately outside that:
-/// [`crate::types::Subject::data_tad`] (#1182/#1273) answers the lag-free *data* question with its
+/// `crate::types::Subject::data_tad` (#1182/#1273) answers the lag-free *data* question with its
 /// own tie-convention switch (see [`crate::dosing::tad_referent`]); and the dual walk's running `max`
 /// over arrivals in `sens::ode_provider`, which takes every `SS=1` dose's referent at each segment
 /// start from [`crate::dosing::tad_referent_g`] (the same per-dose rule over its own number type).
@@ -3517,7 +3517,7 @@ pub fn earliest_dose_time(doses: &[DoseEvent]) -> f64 {
 /// true of all of them; the non-finite opener would pin on the clock a symptom it did not
 /// cause.
 ///
-/// Keyed **per spelling**, not on [`OdeRhsProgram::pk_reads_model_time`]: `T`/`TIME` are the
+/// Keyed **per spelling**, not on `OdeRhsProgram::pk_reads_model_time`: `T`/`TIME` are the
 /// integration axis and are always anchored, so a `TIME`-reading RHS over a dose-free base
 /// integrates correctly and must not be refused. The dependence test backs that up — such a RHS
 /// reads no clock slot, so no anchor can move it, and keying the candidates on
@@ -4211,7 +4211,7 @@ impl OdeReadout {
 /// (#391 S1.2). Behaviour is identical to the inline segment body it replaced.
 ///
 /// The compartments in `off` are held at zero over the segment (#2732, #2753): the forcing's
-/// [`SegmentForcing::holding`], as the event-driven walk integrates a segment while a
+/// `SegmentForcing::holding`, as the event-driven walk integrates a segment while a
 /// compartment is off. The walks on this function — the static dense engine (the adaptive
 /// constant-path replay), the adaptive driver and its time-varying replay — carry the off
 /// list and apply the records through [`apply_cmt_toggles_at_break`]; it is empty for a
@@ -5227,7 +5227,7 @@ impl std::fmt::Display for AdaptiveDriverError {
 }
 
 /// Out-of-scope-compartment guards shared by the bolus and infusion decision
-/// branches of [`ode_predictions_adaptive`]. A controller dose into compartment
+/// branches of `ode_predictions_adaptive`. A controller dose into compartment
 /// `cmt` (1-based) is a typed error — never a silent wrong answer — when the
 /// compartment is:
 ///  - **out of range** (`cmt > n_states`);
@@ -5281,9 +5281,9 @@ pub fn reject_unsupported_dose_compartment(
 /// instant, which is `ode_predictions_event_driven`'s `kind_order`
 /// (`Reset < DoseRecord < PkOnly < Obs`):
 ///
-///   * [`Self::at`] — the **first** record at an instant: the one that terminates, and so
+///   * `Self::at` — the **first** record at an instant: the one that terminates, and so
 ///     governs, the segment arriving there (#1073).
-///   * [`Self::in_force`] — the **last** record at or before an instant: the one a
+///   * `Self::in_force` — the **last** record at or before an instant: the one a
 ///     decision there reads (covariates, readout PK, an injected dose's `F`).
 ///
 /// A controller-injected dose is not a data record and is never indexed.
@@ -5449,7 +5449,7 @@ impl AdaptiveRecordIndex {
     /// record at or after it — so reading it here handed a decision between the dose and
     /// that record a covariate recorded only later: CRCL 50 at t=15 from an observation at
     /// t=18, an injected dose's `F` halved. It still terminates and governs a segment
-    /// ([`Self::at`]), and the disposition carry ([`Self::carried_pk_at`]) still steps
+    /// ([`Self::at`]), and the disposition carry (`Self::carried_pk_at`) still steps
     /// through it, as the static engines' trailing rule does: those describe the
     /// integration, which runs under the governing record either way, not what a
     /// controller can know.
@@ -7315,7 +7315,7 @@ pub fn ode_predictions_adaptive_impl(
 }
 
 /// Frozen-schedule replay verifier — the Part-E backbone of #391, default-on in
-/// [`crate::api::simulate_adaptive`].
+/// `crate::api::simulate_adaptive`.
 ///
 /// Rebuild the *static* dose schedule from a reactive run's realized `ledger`,
 /// integrate it through the trusted static engine ([`ode_predictions`]) on the

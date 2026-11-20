@@ -11,8 +11,8 @@
 //! one `DualT<1, T>` pass per state) and Q = diag(σ²_w).
 //!
 //! Measurement update at obs j (scalar observation of state obs_cmt):
-//!   S   = P̃[c,c] + R_j          (innovation variance)
-//!   K   = P̃[:,c] / S             (Kalman gain vector)
+//!   S   = P̃`c,c` + R_j          (innovation variance)
+//!   K   = P̃`:,c` / S             (Kalman gain vector)
 //!   P⁺  = (I - K·eₓᵀ) · P̃      (updated covariance)
 //!
 //! Only P[obs_cmt, obs_cmt] is returned per observation — the caller adds it
@@ -45,7 +45,7 @@ pub trait EkfRhs {
 
     /// The compiled `[odes]` program this right-hand side evaluates, when it is one: what the
     /// mean integration's Rosenbrock step differentiates for its exact Jacobian
-    /// ([`integrate_mean`]). `None` for a host closure, which the step differences.
+    /// (`integrate_mean`). `None` for a host closure, which the step differences.
     fn program(&self) -> Option<&crate::parser::model_parser::OdeRhsProgram> {
         None
     }
@@ -557,7 +557,7 @@ fn ekf_ipred<T: VmNum>(v: T) -> T {
 /// `dose_f_bio` is each dose's bioavailability (`Fn`, #369) and `params` the PK parameters (both of
 /// the filter's number type, so derivatives flow through the mean and covariance); the EKF path
 /// applies no lagtime. `doses` are resolved (`resolve_subject_doses`); `modeled[k]`, when given, is
-/// dose `k`'s modeled `D`/`R` as such a number ([`infusion_of`]), empty for a caller on `f64`.
+/// dose `k`'s modeled `D`/`R` as such a number (`infusion_of`), empty for a caller on `f64`.
 ///
 /// An infusion's window end moves with `F` (rate-defined) or its modeled `D`/`R`: it is a break time
 /// of the filter's type, so the mean solve's span, the covariance quadrature's sub-steps and their
@@ -567,7 +567,7 @@ fn ekf_ipred<T: VmNum>(v: T) -> T {
 /// Dose events are handled as in `ode_predictions`: boluses add to state; infusions inject a rate
 /// term into the wrapped RHS. Covariance is reset to zero at the initial time and propagated forward;
 /// an `SS=1` record replaces mean and covariance with their periodic steady state
-/// ([`equilibrate_ss_ekf`], #1260).
+/// (`equilibrate_ss_ekf`, #1260).
 #[allow(clippy::too_many_arguments)]
 pub fn solve_ekf_g<T: VmNum, R: EkfRhs>(
     rhs: &R, n_states: usize, obs_cmt_idx: usize, diffusion_var: &[T], params: &[T],

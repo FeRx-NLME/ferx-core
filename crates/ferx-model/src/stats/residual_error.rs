@@ -221,7 +221,7 @@ impl LoadingForm {
 // boundary for `residual_variance`; `types.rs` now keeps only the `ErrorSpec`
 // data definition + `obs_key`/`obs_keys` (data/dispatch concerns).
 /// The most σ loadings one observation has (combined error: a proportional and an additive
-/// slot), the size of [`ErrorSpec::sigma_loading_shape`]'s buffer.
+/// slot), the size of `ErrorSpec::sigma_loading_shape`'s buffer.
 pub const MAX_SIGMA_LOADINGS: usize = 2;
 
 impl ErrorSpec {
@@ -1280,7 +1280,7 @@ fn cross_observation_covariance<T: crate::sens::num::PkNum>(
 /// Do observations `j` and `k` share at least one `block_sigma` cross
 /// correlation, judged purely from which sigma slots their loadings occupy?
 ///
-/// This mirrors the slot bookkeeping of [`cross_observation_covariance`]
+/// This mirrors the slot bookkeeping of `cross_observation_covariance`
 /// (identical within-observation skip) but ignores the loading *coefficients*,
 /// so the answer is independent of the prediction values. A pure proportional
 /// row at `f = 0` keeps its slot (as `(idx, 0.0)`), so it still pairs with its
@@ -4605,7 +4605,7 @@ pub fn residual_rd2(
 
 /// Does this subject's residual covariance `R` couple two different observation rows?
 ///
-/// True when [`match_partners`] finds at least one cross-observation pair, i.e. a
+/// True when `match_partners` finds at least one cross-observation pair, i.e. a
 /// `block_sigma` correlation links the sigmas of two rows in one residual block (paired
 /// total/unbound assays at one time and occasion, or one explicit `L2` group). This is the
 /// pairing [`compute_r_matrix_with_correlations`] and the derivative builders fill, found

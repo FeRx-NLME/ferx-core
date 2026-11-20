@@ -952,22 +952,30 @@ fn no_bare_sentinel_literal_in_guard_files() {
     .join("\n");
     assert_eq!(bare_lines(&fixture), (vec![2, 9], false));
 
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    walk(&root, &mut files);
-    files.sort();
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The allowlisted population objectives are all ferx-core's; the guard files (and the
+    // constant's definition) are mostly in ferx-model since #3041. Scan both crates.
+    let root = manifest.join("src");
     let mut hits = Vec::new();
     let mut saw_definition = false;
-    for path in &files {
-        let rel = path.strip_prefix(&root).unwrap().to_string_lossy().replace('\\', "/");
-        let is_test_file = rel.ends_with("_tests.rs") || rel.contains("/tests/");
-        if is_test_file || POPULATION_OBJECTIVE_FILES.contains(&rel.as_str()) {
-            continue;
+    for (prefix, dir) in
+        [("src", root.clone()), ("crates/ferx-model/src", manifest.join("crates/ferx-model/src"))]
+    {
+        let mut files = Vec::new();
+        walk(&dir, &mut files);
+        files.sort();
+        for path in &files {
+            let rel = path.strip_prefix(&dir).unwrap().to_string_lossy().replace('\\', "/");
+            let is_test_file = rel.ends_with("_tests.rs") || rel.contains("/tests/");
+            let allowlisted = prefix == "src" && POPULATION_OBJECTIVE_FILES.contains(&rel.as_str());
+            if is_test_file || allowlisted {
+                continue;
+            }
+            let src = std::fs::read_to_string(path).expect("read source");
+            let (lines, defines) = bare_lines(&src);
+            saw_definition |= defines;
+            hits.extend(lines.into_iter().map(|n| format!("{prefix}/{rel}:{n}")));
         }
-        let src = std::fs::read_to_string(path).expect("read source");
-        let (lines, defines) = bare_lines(&src);
-        saw_definition |= defines;
-        hits.extend(lines.into_iter().map(|n| format!("src/{rel}:{n}")));
     }
     assert!(
         hits.is_empty(),

@@ -1148,7 +1148,7 @@ struct EdgeGroup<T> {
 /// was sorted against the observations, and a recording keeps the walk's order of its breaks as
 /// a guard: every point of an EBE search that moved the end across a sample recorded and
 /// compiled the subject again. Walked, each sub-interval between the dose's arrival and the
-/// next infusion's is cut where the end falls ([`walk_cut`]), chosen on every evaluation, so the
+/// next infusion's is cut where the end falls (`walk_cut`), chosen on every evaluation, so the
 /// end can move anywhere inside that span under one recording.
 pub struct WalkedEnd<T> {
     /// The dose this window belongs to.

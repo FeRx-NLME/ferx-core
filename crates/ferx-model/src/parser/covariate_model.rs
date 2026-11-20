@@ -147,7 +147,7 @@ use crate::types::{
 
 /// Data-derived covariate statistics threaded into a second parse, keyed by
 /// covariate name. Empty on the first parse, filled by
-/// [`crate::api::bind_covariate_stats`].
+/// `crate::api::bind_covariate_stats`.
 pub type CovariateStatBindings = HashMap<String, CovariateSummary>;
 
 /// Everything the desugar needs to know about the rest of the model.

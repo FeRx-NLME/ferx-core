@@ -9,7 +9,7 @@ use crate::types::*;
 use std::collections::HashMap;
 
 /// Mandatory sdtab column names that are always written — declaring them in
-/// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
+/// `output` is allowed but produces a W_OUTPUT_DUPLICATE warning.
 pub const OUTPUT_MANDATORY: &[&str] = &[
     "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
     "EPRED", "PWRES", "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
@@ -17,7 +17,7 @@ pub const OUTPUT_MANDATORY: &[&str] = &[
 
 /// `(block, synthesized index column)` of every **bound** level block whose column the
 /// model reads. An unbound block's column is not here: an unbound block is
-/// [`check_unbound_theta_levels`]'s to report, before any population is looked at.
+/// `check_unbound_theta_levels`'s to report, before any population is looked at.
 pub fn bound_level_columns(model: &CompiledModel) -> Vec<(&str, String)> {
     let blocks = model.theta_blocks();
     blocks
@@ -366,7 +366,7 @@ pub fn model_scores_gaussian_observations(model: &CompiledModel) -> bool {
     }
 }
 
-/// `E_LEVEL_MISSING_LABEL` (the first rule of [`check_nested_levels`]): the first record
+/// `E_LEVEL_MISSING_LABEL` (the first rule of `check_nested_levels`): the first record
 /// of a nested model with no value in a level column. Shared with the simulate
 /// chokepoint (#1082 PR4), which groups the κ draw by those labels and needs nothing
 /// else `check_nested_levels` asks of a fit.
@@ -773,7 +773,7 @@ pub fn check_cmt_toggles(model: &CompiledModel, population: &Population) -> Vec<
 
 /// Every dose must name a compartment the **analytical** engine can actually deliver it
 /// into (#375). The datareader has no model, and the parse-time infusable check
-/// (`model_parser`, [`PkModel::infusable_compartments`]) only fires for a *declared*
+/// (`model_parser`, `PkModel::infusable_compartments`) only fires for a *declared*
 /// `D{cmt}`/`R{cmt}`, so an explicit positive `RATE` (or out-of-range bolus `CMT`) from
 /// the dataset reached the predictors unvalidated and the paths disagreed: the
 /// superposition path never reads `dose.cmt` and routed the infusion into central, the
@@ -793,7 +793,7 @@ pub fn check_cmt_toggles(model: &CompiledModel, population: &Population) -> Vec<
 ///     `dose_needs_event_walk` maps it to 1, superposition ignores `cmt`), so it is left
 ///     alone.
 ///   - **Routing, infusions that actually deliver.** The compartment must be in
-///     [`PkModel::infusable_compartments`] (central; oral depot since #400; the
+///     `PkModel::infusable_compartments` (central; oral depot since #400; the
 ///     peripheral(s) of the 2-/3-cpt IV and, since #375, the oral models). That is
 ///     `1..=n_states` for all six walk-supported models, so with the range rule claimed
 ///     first the only value still rejected is `CMT=0` (no meaning for a zero-order
@@ -1097,7 +1097,7 @@ pub fn check_covariate_levels(model: &CompiledModel, population: &Population) ->
 /// Returns an empty list when none applies, else one `E_ENDPOINT_TV_COVARIATE` error whose block
 /// is the endpoint's (`binary_model`, `markov_model` or `event_model`). `fit()` and every predict
 /// / simulate entry point surface it as an `Err` (#898); `ferx check` through
-/// [`check_model_data_rule`] (#1774).
+/// `check_model_data_rule` (#1774).
 ///
 /// How an `E_ENDPOINT_TV_COVARIATE` message names the time-varying input `name`: a data covariate
 /// by its column, a θ level block's synthesized index column (#2562) by the block (`__level_*` is
@@ -1356,9 +1356,9 @@ pub fn check_survival_tv_covariates(
 /// sub-grid error, against 3.3778309 for the per-record convention; `central(20)` is 13.53 frozen
 /// against 3.68 per record.
 ///
-/// The predicate is [`check_survival_time_dependent_pk`]'s, per parameter and per endpoint: the
+/// The predicate is `check_survival_time_dependent_pk`'s, per parameter and per endpoint: the
 /// dependency slice is the union of
-/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] over every state the
+/// `crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice` over every state the
 /// generator reads. A time-**homogeneous** CTMM reads no ODE state and returns `None`. Fails closed
 /// like the hazard check.
 #[cfg(feature = "markov")]
@@ -1422,7 +1422,7 @@ pub fn check_ctmm_time_dependent_pk(model: &CompiledModel) -> Option<String> {
 }
 
 /// What a drug-driven CTMM generator's ODE states depend on: the union of
-/// [`crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice`] over every state
+/// `crate::parser::model_parser::OdeRhsProgram::chz_dependency_slice` over every state
 /// it reads. Shared by the `TIME` (#1918) and covariate (#1854) freezes.
 #[cfg(feature = "markov")]
 pub fn ctmm_generator_slice(
@@ -1494,7 +1494,7 @@ pub fn ctmm_tv_covariate_on_disposition<'m>(
 }
 
 /// [`check_ctmm_time_dependent_pk`] as a diagnostic: `E_ENDPOINT_TIME_DEPENDENT_PK` on block
-/// `markov_model` (#1918). Kept apart from [`check_survival_time_dependent_pk_diags`] because
+/// `markov_model` (#1918). Kept apart from `check_survival_time_dependent_pk_diags` because
 /// the two freezes are read by different entry points: the CTMM likelihood is scored by
 /// `fit()` and re-scored by the post-fit `run_covariance()` / `run_sir()`, so those three and
 /// `ferx check` call this. `predict()` drops CTMM rows when
@@ -1517,7 +1517,7 @@ pub fn check_ctmm_time_dependent_pk_diags(model: &CompiledModel) -> Vec<Diagnost
 /// caller's `FitOptions` never passes the parser, and without this the fit-scoped override
 /// would quietly integrate an ineligible model (`effective_solver_opts` demotes it to `auto`)
 /// or ignore the option on an analytical one. Every entry point that arms `FitOptions`' ODE
-/// settings calls it: `fit()` (through [`check_model_options`]), `run_covariance` and
+/// settings calls it: `fit()` (through `check_model_options`), `run_covariance` and
 /// `run_sir`.
 pub fn check_ode_method_linear(model: &CompiledModel, options: &FitOptions) -> Vec<Diagnostic> {
     if options.ode_method != crate::ode::OdeMethod::Linear {
@@ -1555,7 +1555,7 @@ pub fn referenced_columns(model: &CompiledModel) -> Vec<String> {
 ///
 /// This is the **only** place the routing is derived from a model. Every reader
 /// call that has a model in hand must go through it — the file-based
-/// [`read_population_for`] family, and [`read_population_routed_by`] for the
+/// `read_population_for` family, and `read_population_routed_by` for the
 /// `.fitrx` reload and the `run_covariance` / `run_sir` re-read — because a
 /// population read *without* it carries the endpoint's rows as Gaussian
 /// observations and no event records, which `fit()` then rejects with
@@ -1700,7 +1700,7 @@ pub fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
 /// covariate of that name, its individual parameters): every declared column but
 /// a `[derived]` one (filled by the derived pass), a mandatory sdtab column and an
 /// ETA (both ignored with `W_OUTPUT_DUPLICATE`). The single rule both
-/// [`compute_extra_output_columns`] and the reader's `W_COVARIATE_MISSING` gate
+/// `compute_extra_output_columns` and the reader's `W_COVARIATE_MISSING` gate
 /// (#2599) read, so the warning covers exactly the columns the echo reads.
 ///
 /// `MIXNUM` on a `[mixture]` model is not echoed: it is the class, as everywhere else

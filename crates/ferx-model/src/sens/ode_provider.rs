@@ -1366,8 +1366,8 @@ fn eval_rhs_anchored<T: crate::sens::num::vm::VmNum>(
     );
 }
 
-/// [`eval_rhs_anchored`] at the clock `t + dt`, `dt` a jet-only offset (a moving-boundary
-/// flow's, [`cross_moving_boundary`]): every clock the RHS reads — `TIME`/`T`, `TAFD`, `TAD` —
+/// `eval_rhs_anchored` at the clock `t + dt`, `dt` a jet-only offset (a moving-boundary
+/// flow's, `cross_moving_boundary`): every clock the RHS reads — `TIME`/`T`, `TAFD`, `TAD` —
 /// moves by `dt`, so the field's explicit time dependence carries the offset's jet exactly.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_rhs_at_offset<T: crate::sens::num::vm::VmNum>(
@@ -2049,7 +2049,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
         .map_or(u, |(u, _)| u)
 }
 
-/// A plain-compartment steady state ([`equilibrate_ss_state_g`]) from its maps: the exact
+/// A plain-compartment steady state (`equilibrate_ss_state_g`) from its maps: the exact
 /// affine fixed point through `unforced`/`forced` (one `II` without and with the dose), else
 /// the pulse train — `cycle` iterated from the zero state until the trough converges, capped at
 /// `SS_EQUILIBRATION_CYCLES` — or, for overlapping infusion pulses, the zero state. Returns the
@@ -5046,7 +5046,7 @@ fn records_at_break_g<T: crate::sens::num::PkNum>(
     }
 }
 
-/// Times in ascending order ([`cmp_times`]).
+/// Times in ascending order (`cmp_times`).
 pub fn sort_times<T: crate::sens::num::PkNum>(times: &mut [T]) {
     times.sort_by(|a, b| cmp_times(*a, *b));
 }

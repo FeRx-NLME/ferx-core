@@ -130,7 +130,7 @@ impl SelectionFilter {
     }
 }
 
-/// Which rule removed a record — the answer [`SelectionFilter::first_excluding_rule`]
+/// Which rule removed a record — the answer `SelectionFilter::first_excluding_rule`
 /// gives, carried as the rule itself rather than as its rendered message so a caller
 /// can ask what the rule *reads* as well as what it says (#1409).
 pub enum Excluder<'a> {
@@ -227,7 +227,7 @@ fn is_missing_cell(s: &str) -> bool {
 ///
 /// **Model-blind — no endpoint routing**: every `EVID=0` row is Gaussian. Models
 /// with non-Gaussian endpoints need
-/// [`read_population_for`](crate::api::read_population_for); `fit()` /
+/// `read_population_for`; `fit()` /
 /// `simulate()` / `predict()` reject such a population with `E_ENDPOINT_UNROUTED`
 /// (#1199).
 pub fn read_nonmem_csv(
@@ -407,7 +407,7 @@ pub enum MissingDvPolicy {
 /// missing-DV policy. Empty sets ⇒ every row is Gaussian.
 ///
 /// The sets must be pairwise disjoint (§8.1: routing is by the CMT's declared
-/// endpoint, never guessed from the DV); [`ObsRouting::validate`] enforces it.
+/// endpoint, never guessed from the DV); `ObsRouting::validate` enforces it.
 #[derive(Debug, Clone, Default)]
 pub struct ObsRouting {
     /// CMTs whose rows become `ObsRecord::Event` (TTE / RTTE; `survival` feature).
@@ -655,7 +655,7 @@ pub fn read_nonmem_csv_filtered_routed(
 
 /// The one reader every wrapper delegates to: builds the covariate read set
 /// (declared union or the explicit lenient list), adds filter-referenced columns,
-/// and calls [`read_nonmem_csv_impl`].
+/// and calls `read_nonmem_csv_impl`.
 ///
 /// `decls = Some` is the strict `[covariates]` path (validated, returns a
 /// [`CovariateTable`]); `None` reads `covariate_columns` leniently (`None` =

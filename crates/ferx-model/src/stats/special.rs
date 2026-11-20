@@ -265,7 +265,7 @@ const MILLS_CF_DEPTH: usize = 160;
 /// Every step adds positive terms, so there is no cancellation however large `t` is, and over
 /// a jet type it gives `a`'s derivatives the same way. `1/R = t + a` is the inverse Mills ratio
 /// `φ(−t)/Φ(−t)` of the lower tail; `a ≈ 1/t` is the part of it a direct `φ/Φ − t` loses to
-/// cancellation. Callers take it only for `t ≥ 2`, where [`MILLS_CF_DEPTH`] has converged.
+/// cancellation. Callers take it only for `t ≥ 2`, where `MILLS_CF_DEPTH` has converged.
 pub fn mills_excess<T: PkNum>(t: T) -> T {
     let mut f = t;
     for k in (2..=MILLS_CF_DEPTH).rev() {
@@ -437,7 +437,7 @@ pub fn m3_censored_outer(
 /// the forward CDF, and our [`normal_cdf`] carries the A&S 7.1.26 error of
 /// ~1.5e-7, so refining against it degrades rather than improves the result.)
 ///
-/// Used by the simulation-based NPDE/NPD diagnostics ([`crate::stats::npde`]) to
+/// Used by the simulation-based NPDE/NPD diagnostics (`crate::stats::npde`) to
 /// inverse-normal-transform empirical CDF probabilities. `f64`-only — not on any
 /// gradient path.
 pub fn normal_inv_cdf(p: f64) -> f64 {

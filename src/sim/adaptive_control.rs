@@ -24,8 +24,8 @@ use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
     dose_plan_violation, percent_step, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute,
-    AdaptiveRule, Comparison, ControllerCtx, ControllerDecision, DoseAction, DoseGrid,
-    DosePlanViolation, DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
+    AdaptiveRule, ControllerCtx, ControllerDecision, DoseAction, DoseGrid, DosePlanViolation,
+    DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
 };
 use crate::types::CompiledModel;
 
@@ -597,6 +597,7 @@ pub(crate) fn compile_adaptive(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::adaptive::Comparison;
     use crate::sim::adaptive::DoseStep;
     use std::collections::HashMap;
 

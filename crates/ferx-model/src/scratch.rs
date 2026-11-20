@@ -14,8 +14,8 @@
 //! a nested caller of the same type gets its own; nothing is shared while in use, and a
 //! buffer's contents never outlive its holder (it is cleared on return).
 //!
-//! The spare list per type is bounded ([`MAX_SPARE`]), and a buffer that grew past
-//! [`MAX_SPARE_BYTES`] is dropped rather than kept, so a single huge recording does not
+//! The spare list per type is bounded (`MAX_SPARE`), and a buffer that grew past
+//! `MAX_SPARE_BYTES` is dropped rather than kept, so a single huge recording does not
 //! pin its memory on a worker for the rest of a long-lived process.
 
 use std::any::Any;

@@ -1,6 +1,6 @@
 //! Vocabulary for state-reactive ("adaptive" / feedback) dosing simulation (#391): the
 //! types the reactive driver (`crate::ode::predictions::ode_predictions_adaptive`) and
-//! [`crate::api::simulate_adaptive`] are built on. A controller is
+//! `crate::api::simulate_adaptive` are built on. A controller is
 //! `FnMut(&ControllerCtx) -> Vec<DoseAction>` reading declared [`MonitorSpec`] signals,
 //! each on its own [`ObserveMode`]; every realized dose is a [`DoseLedgerEntry`]. The
 //! engine, not the controller, resolves signals and draws assay noise, so draw order
@@ -883,7 +883,7 @@ fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
 }
 
 /// `x` rounded to the nearest multiple of `s`, ties up: the half is nudged up by
-/// [`GRID_SNAP`] (relative), since `x / s` misses a tie by an ulp (`0.35 / 0.1`).
+/// `GRID_SNAP` (relative), since `x / s` misses a tie by an ulp (`0.35 / 0.1`).
 pub fn round_to_grid(x: f64, s: f64) -> f64 {
     let q = x / s;
     grid_point((q + 0.5 + GRID_SNAP * q.abs().max(1.0)).floor(), s)

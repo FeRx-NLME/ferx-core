@@ -3,7 +3,7 @@
 //!
 //! # The problem
 //!
-//! [`crate::estimation::fixed_eta_gradient`] gets its θ-gradient by finite
+//! `crate::estimation::fixed_eta_gradient` gets its θ-gradient by finite
 //! differences: one perturbed solve of the whole subject per non-pinned θ. That
 //! is fine at classical-PopPK scale (a handful of θ), and hopeless for a deep
 //! compartment model, where the NN's weights *are* θ. On a 146-θ DCM (2 inputs →

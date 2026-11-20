@@ -2,6 +2,7 @@
 //! readers): mounted at their original module paths so libtest filters still match (#3041).
 #![allow(unused_imports)]
 
+#[cfg(feature = "survival")]
 #[path = "."]
 pub(crate) mod categorical {
     #[path = "."]
@@ -24,6 +25,7 @@ pub(crate) mod dosing {
     #[path = "dosing__zero_order_binding_tests.rs"]
     pub(crate) mod zero_order_binding_tests;
 }
+#[cfg(feature = "nn")]
 #[path = "."]
 pub(crate) mod estimation {
     #[path = "."]
@@ -47,6 +49,7 @@ pub(crate) mod levels {
     #[path = "api__tests__theta_levels_tests.rs"]
     pub(crate) mod tests;
 }
+#[cfg(feature = "markov")]
 #[path = "."]
 pub(crate) mod markov {
     #[path = "."]
@@ -56,6 +59,7 @@ pub(crate) mod markov {
     }
     #[path = "."]
     pub(crate) mod endpoint {
+        #[cfg(feature = "survival")]
         #[path = "markov__endpoint_order_tests.rs"]
         pub(crate) mod endpoint_order_tests;
         #[path = "markov__endpoint__exact_eta_hessian_tests.rs"]
@@ -69,6 +73,7 @@ pub(crate) mod nn {
         #[path = "nn__export_tests.rs"]
         pub(crate) mod tests;
     }
+    #[cfg(feature = "nn")]
     #[path = "."]
     pub(crate) mod mlp {
         #[path = "nn__mlp__regularizer_fit_tests.rs"]
@@ -133,12 +138,14 @@ pub(crate) mod sens {
 pub(crate) mod stats {
     #[path = "."]
     pub(crate) mod likelihood {
+        #[cfg(feature = "survival")]
         #[path = "stats__endpoint_order_tests.rs"]
         pub(crate) mod endpoint_order_tests;
         #[path = "stats__likelihood__tests.rs"]
         pub(crate) mod tests;
     }
 }
+#[cfg(feature = "survival")]
 #[path = "."]
 pub(crate) mod survival {
     #[path = "survival__endpoint_order_test_helpers.rs"]

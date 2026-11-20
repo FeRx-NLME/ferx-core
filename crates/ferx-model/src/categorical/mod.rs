@@ -51,7 +51,7 @@ pub fn inv_logit(x: f64) -> f64 {
 
 /// One binary record's negative log-likelihood at linear predictor `lp`, over any
 /// [`PkNum`](crate::sens::num::PkNum): `softplus(lp) − y·lp` under the logit link. The
-/// value path ([`binary_data_term`]) is the `f64` instance; [`discrete_subject_eta_hessian`]
+/// value path ([`binary_data_term`]) is the `f64` instance; `discrete_subject_eta_hessian`
 /// runs it on η-jets (#2437). `softplus` enters through its value and first four
 /// derivatives (`σ`, `σ(1−σ)`, `σ(1−σ)(1−2σ)`, `σ(1−σ)(1−6σ+6σ²)`): the gradient's
 /// third-order jets and the covariance step's nested duals read past the second (#2482),
@@ -296,7 +296,7 @@ pub fn binary_prob(link: LinkFn, lp: f64) -> f64 {
 /// A new discrete endpoint family adds **one arm here** and needs no new likelihood
 /// dispatch-site edit: every FOCEI / IOV / SAEM path, the FD-Hessian closure, and IMP reach
 /// it through the single `accumulate_non_gaussian_nll` seam. It also doubles as the FD-Hessian
-/// closure at the FOCEI interaction site, for the subjects [`discrete_subject_eta_hessian`]
+/// closure at the FOCEI interaction site, for the subjects `discrete_subject_eta_hessian`
 /// declines (#2437): evaluated at a perturbed η it re-scores every discrete record, so
 /// `data_term_hessian_fd` picks up the curvature w.r.t. η.
 pub fn discrete_subject_nll(

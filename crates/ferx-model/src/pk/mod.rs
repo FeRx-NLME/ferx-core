@@ -107,7 +107,7 @@ pub fn model_uses_time_builtin(model: &CompiledModel) -> bool {
 /// is `#[inline]` over three `bool` reads).
 /// **Which flag the `[odes]` half asks, and why it is the narrow one.** This
 /// predicate asks whether the *PK dynamics* are non-autonomous, so it asks
-/// [`OdeRhsProgram::pk_reads_model_time`] — the same walk with the injected
+/// `OdeRhsProgram::pk_reads_model_time` — the same walk with the injected
 /// joint-PK-TTE `d/dt(__chz_<cmt>)` hazard lines excluded (#1166). A standard
 /// joint model has a Weibull or Gompertz baseline hazard, which reads `TIME` by
 /// definition, while its PK block is time-invariant; asking the wide flag made
@@ -306,7 +306,7 @@ pub fn invalid_cl_v_records<K: AsRef<[f64]>>(
 /// and sensitivity dispatchers both route through here at the same `(theta, eta)`.
 ///
 /// A flip-flop model with no twin is rejected up front by
-/// [`crate::api::check_absorption_flip_flop_no_twin`]; see
+/// `crate::api::check_absorption_flip_flop_no_twin`; see
 /// [`crate::types::CompiledModel::absorption_ode_equivalent`] for what "no twin" covers
 /// (an open-ended set, #1008).
 pub fn effective_model_for_eval<'a>(
@@ -744,7 +744,7 @@ pub fn analytical_init_concentration(
     )
 }
 
-/// Generic form of [`analytical_init_concentration`] over [`PkNum`]: in `Dual2` it gives
+/// Generic form of [`analytical_init_concentration`] over `PkNum`: in `Dual2` it gives
 /// the exact `∂C/∂A₀`, `∂C/∂(CL,V,…)` for the analytic provider (#524). `F = 1`; returns 0
 /// for unsupported compartments.
 #[allow(clippy::too_many_arguments)]
@@ -1366,7 +1366,7 @@ pub fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// [`predict_iov`], not a third divergence** (#2371). Since #1909 an implied dose's
 /// covariates and `TIME` are its governing record's (the first record at or after it;
 /// [`crate::types::ImpliedDose`]), and so is its κ here: the occasion is resolved at
-/// [`Subject::dose_occasion_time`], the governing record's engine time, not at the dose's
+/// `Subject::dose_occasion_time`, the governing record's engine time, not at the dose's
 /// own. `predict_iov` takes that record's `OCC`, so the two agree. Resolving κ at the
 /// dose's own time instead gave one snapshot two occasions whenever a decision fell
 /// between the dose and its governing record — window `g`'s κ with window `g + 1`'s
@@ -1877,7 +1877,7 @@ pub fn predict_concentration(
 
 /// External bioavailability post-multiplier for the superposition closed forms. Only an
 /// **IV bolus** uses it; oral-depot forms (`*_oral_f`) bake `F` in, and infusions carry it
-/// in `(rate, duration)` via [`DoseEvent::with_bioavailable_infusion`] (#419). Matches
+/// in `(rate, duration)` via `DoseEvent::with_bioavailable_infusion` (#419). Matches
 /// NONMEM's `F1` (#327).
 pub fn route_f_scale(pk_model: PkModel, infusion: bool, p: &PkParams) -> f64 {
     if infusion || pk_model.is_oral() {
@@ -1988,7 +1988,7 @@ pub fn central_raw(
 /// Returns the full state vector contribution from one dose at elapsed time `tau`.
 ///
 /// Layout per PkModel:
-///   OneCptIv:     [C_central]
+///   OneCptIv:     `C_central`
 ///   OneCptOral:   [A_depot, C_central]
 ///   TwoCptIv:     [C_central, C_periph]
 ///   TwoCptOral:   [A_depot, C_central, C_periph]
@@ -2394,7 +2394,7 @@ pub fn apply_frem_prediction_override(
 }
 
 /// Per-observation predictions for one subject at `(theta, eta)` — the unchecked
-/// prediction kernel under [`crate::predict`], [`crate::fit`] and the simulators.
+/// prediction kernel under `crate::predict`, `crate::fit` and the simulators.
 ///
 /// # No model/data checks
 ///
@@ -2404,7 +2404,7 @@ pub fn apply_frem_prediction_override(
 /// [`CompiledModel::referenced_covariates`](crate::types::CompiledModel::referenced_covariates)
 /// absent from the subject's covariate data evaluates to `0.0` silently — including
 /// `TAD`/`TAFD`/`MACHEPS` read in a readout or `[scaling]` (#1028). Run
-/// [`crate::check_model_data`] first, or call [`crate::predict`] (`E_MISSING_COVARIATE`).
+/// `crate::check_model_data` first, or call `crate::predict` (`E_MISSING_COVARIATE`).
 pub fn compute_predictions_with_tv(
     model: &crate::types::CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],
 ) -> Vec<f64> {

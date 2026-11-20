@@ -30,14 +30,12 @@ use std::path::Path;
 use crate::diagnostics::EngineError;
 use crate::io::hash::sha256_file;
 use crate::types::{
-    subject_list_difference, CompiledModel, FitOptions, FitResult, GradientMethod, InnerOptimizer,
-    IovOccasionRule, ParsedModel, Population, PopulationDifference, PopulationFingerprint,
+    subject_list_difference, CompiledModel, FitOptions, FitResult, IovOccasionRule, ParsedModel,
+    Population, PopulationDifference, PopulationFingerprint,
 };
 
 pub(crate) use crate::estimation::population_check::{
-    check_levels_and_content, mismatch_refusal, ode_max_steps_in_domain,
-    ode_stiff_abort_after_in_domain, ode_tol_in_domain, OutOfDomain, PopulationSource,
-    STALE_FINGERPRINT_WARNING,
+    check_levels_and_content, mismatch_refusal, PopulationSource, STALE_FINGERPRINT_WARNING,
 };
 
 /// The model a post-hoc step runs on: the caller's, or one rebuilt from the fit.

@@ -5,10 +5,10 @@
 //! time. Measured on `two_cpt_oral_ode` under RK45, the bytecode interpreter plus the
 //! per-call `vars` binding were 71% of a FOCEI fit's CPU.
 //!
-//! [`RhsRegProgram::compile`] translates an RHS of `AssignBc` / `DiffEqBc` statements once
+//! `RhsRegProgram::compile` translates an RHS of `AssignBc` / `DiffEqBc` statements once
 //! into three-address instructions over one register file. The
 //! states, the individual parameters and the time seeds are loaded straight from the RHS's
-//! own arguments (`u`, `params`, `seeds`; see [`RhsLayout`]), so a call needs neither the
+//! own arguments (`u`, `params`, `seeds`; see `RhsLayout`), so a call needs neither the
 //! thread-local scratch nor the `vars` binding, and each operation is one dispatch.
 //!
 //! It is a translation, not an optimisation: every instruction applies the operation the
@@ -367,7 +367,7 @@ flat_enum! {
         d: Reg,
         k: u32,
     },
-    /// `∂^(i+j) P(a, x) / ∂aⁱ ∂xʲ` (of `Q` when `upper`); `i = j = 0` is [`PkNum::gamma_pq`]
+    /// `∂^(i+j) P(a, x) / ∂aⁱ ∂xʲ` (of `Q` when `upper`); `i = j = 0` is `PkNum::gamma_pq`
     /// as one primitive. Only a kernel recording emits it (#2786).
     GammaPq {
         d: Reg,
@@ -503,7 +503,7 @@ impl RhsLayout<'_> {
     }
 }
 
-/// Why [`RhsRegProgram::compile`] kept the interpreter (#2681): the first construct, in
+/// Why `RhsRegProgram::compile` kept the interpreter (#2681): the first construct, in
 /// program order, outside the translatable shape, and the statement it is in.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RhsRefusal {
@@ -575,7 +575,7 @@ pub struct RhsInterpreted {
     pub site: String,
 }
 
-/// Which engine runs an `[odes]` RHS ([`super::OdeRhsProgram::rhs_route`]).
+/// Which engine runs an `[odes]` RHS (`super::OdeRhsProgram::rhs_route`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RhsRoute<'a> {
     /// The `f64` native function.
@@ -719,7 +719,7 @@ pub struct HoistCache {
 }
 
 /// A program's `f64` native code as the hoisted pair, resolved once
-/// ([`RhsRegProgram::native_f64`]): the parameter-only values are computed when the
+/// (`RhsRegProgram::native_f64`): the parameter-only values are computed when the
 /// parameters change and read from a [`HoistCache`] on every other call.
 #[derive(Clone, Copy)]
 pub struct NativeF64<'a>(jit::Resolved<'a, (jit::PrepFn, jit::MainFn)>);
@@ -765,7 +765,7 @@ impl NativeF64<'_> {
         Some((self.0.main_fn(), cache.vals.as_ptr()))
     }
 
-    /// [`RhsRegProgram::try_native`] at `f64`, bit for bit: `true` when it ran (and wrote
+    /// `RhsRegProgram::try_native` at `f64`, bit for bit: `true` when it ran (and wrote
     /// `du`), `false` with nothing written when a slice is shorter than the program reads.
     #[inline(always)]
     pub fn run(
@@ -792,7 +792,7 @@ impl NativeF64<'_> {
 }
 
 /// The `f64` RHS with its forward tangents along `k` directions, one native call
-/// ([`RhsRegProgram::native_tangent`]): every input and output element is `1 + k` lanes, the
+/// (`RhsRegProgram::native_tangent`): every input and output element is `1 + k` lanes, the
 /// value then its `k` tangents.
 #[derive(Clone, Copy)]
 pub struct NativeTan<'a>(jit::Resolved<'a, jit::RhsFn>, usize);

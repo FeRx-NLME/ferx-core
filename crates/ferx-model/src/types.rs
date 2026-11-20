@@ -16,7 +16,7 @@ pub mod population_fingerprint;
 pub use population_fingerprint::subject_list_difference;
 pub use population_fingerprint::Difference as PopulationDifference;
 pub use population_fingerprint::PopulationFingerprint;
-/// Which NCA-based starting-value strategy [`inits_from_nca`] should run.
+/// Which NCA-based starting-value strategy `inits_from_nca` should run.
 ///
 /// User-facing names (fit option, CLI flag, R argument): `nca`, `nca_sweep`,
 /// `nca_ebe`. A boolean `true` maps to [`NcaInit::Sweep`].
@@ -37,7 +37,7 @@ pub enum NcaInit {
 /// them, the explicit covariate columns), the IOV column and the `[data_selection]`
 /// clauses, the model file's merged with any a caller added (#1685).
 ///
-/// A file entry point builds one, reads with it through [`read_population_with`],
+/// A file entry point builds one, reads with it through `read_population_with`,
 /// and records it on [`FitResult::reader_settings`], so the recorded settings are
 /// the ones the data were read with by construction. `run_sir`, `run_covariance`
 /// and `load_fit` re-read `fit.data_path` with them: a row filter the model file
@@ -58,7 +58,7 @@ pub struct ReaderSettings {
     #[serde(default)]
     pub covariate_decls: Option<Vec<CovariateDecl>>,
     /// Covariate columns for a model with no `[covariates]` block (the
-    /// `covariate_columns` argument of [`fit_from_files`](crate::fit_from_files));
+    /// `covariate_columns` argument of `fit_from_files`);
     /// `None` auto-detects.
     #[serde(default)]
     pub fallback_columns: Option<Vec<String>>,
@@ -196,8 +196,8 @@ pub enum InfusionDef {
 /// Clamp `x` to a lower `floor`: returns `x` when `x > floor`, otherwise `floor`.
 ///
 /// The single home for the "pull a transient mid-fit excursion back off the
-/// domain wall" clamp shared by [`DoseEvent::DURATION_FLOOR`] (modeled infusion
-/// duration `D ≤ 0`) and [`crate::pk::absorption::PreparedInputRate::MIN_PARAM`]
+/// domain wall" clamp shared by `DoseEvent::DURATION_FLOOR` (modeled infusion
+/// duration `D ≤ 0`) and `crate::pk::absorption::PreparedInputRate::MIN_PARAM`
 /// (transit `mtt`, inverse-Gaussian `mat`/`cv2` ≤ 0). Both keep a downstream `amt/D` /
 /// `ktr.ln()` finite at the wall so the optimiser can climb back to the interior
 /// without perturbing a converged (interior) fit. Centralising it keeps the
@@ -206,7 +206,7 @@ pub enum InfusionDef {
 /// is what makes the `NaN`-to-`floor` behaviour deliberate rather than incidental.
 ///
 /// **A caller that must not treat a non-finite input as a small positive one
-/// tests for that first** — see [`DoseEvent::resolve_rate`], which repels the
+/// tests for that first** — see `DoseEvent::resolve_rate`, which repels the
 /// subject instead (#1284). The clamp answers "`x` is on the wrong side of the
 /// wall, pull it back"; `NaN` is not a side.
 #[inline]
@@ -1473,7 +1473,7 @@ pub fn written_time(obs_times: &[f64], obs_raw_times: &[f64], j: usize) -> f64 {
     obs_raw_times.get(j).copied().unwrap_or_else(|| obs_times.get(j).copied().unwrap_or(0.0))
 }
 
-/// [`Subject::param_time_at`] over a `reset_period_times` table, ascending in engine time.
+/// `Subject::param_time_at` over a `reset_period_times` table, ascending in engine time.
 /// Free so the reader can ask it before the `Subject` exists (#1909).
 pub fn period_written_time(table: &[(f64, f64)], engine_t: f64) -> f64 {
     let after = table.partition_point(|&(e, _)| e <= engine_t);
@@ -2863,7 +2863,7 @@ impl OmegaMatrix {
 }
 
 /// The largest diagonal a fit-carried Ω may hold on a `FIX`-ed declared zero and
-/// still be read back as that zero by [`OmegaMatrix::sim_draw_factor`] (#1605).
+/// still be read back as that zero by `OmegaMatrix::sim_draw_factor` (#1605).
 /// A fit holds such an η at the constructor's `1e-8` floor, reached as
 /// `exp(ln 1e-4)²`, which lands 10 ULP above `1e-8` (measured through the
 /// parameterisation round trip; `a_fit_carried_fix_zero_is_recovered_from_the_declaration`
@@ -2871,7 +2871,7 @@ impl OmegaMatrix {
 /// caller would supply on purpose; that test also pins a supplied `3e-8` as honoured.
 pub const SIM_ZERO_RECOVERY_CEILING: f64 = 2e-8;
 
-/// [`OmegaMatrix::sim_chol`] for an input `m` whose Cholesky failed: `Some` when
+/// `OmegaMatrix::sim_chol` for an input `m` whose Cholesky failed: `Some` when
 /// `m` has structural zeros (diagonal exactly `0`, whole row and column exactly
 /// `0`) and the rest factors on its own; `None` otherwise (#1605).
 pub fn structural_zero_factor(m: &DMatrix<f64>) -> Option<DMatrix<f64>> {
@@ -4952,14 +4952,14 @@ impl SimOutcome {
 /// [`SimOutcome`] (`plans/tte-survival-markov.md` §8.8.1).
 ///
 /// A non-Gaussian endpoint's prediction is a **probability vector or a curve, never
-/// one scalar**, which is why the legacy [`crate::api::PredictionResult`] (`pred: f64`)
+/// one scalar**, which is why the legacy `crate::api::PredictionResult` (`pred: f64`)
 /// cannot carry it. That struct is unchanged and still backs the Gaussian
-/// [`crate::predict`]; this enum backs the per-endpoint predictors
-/// ([`crate::api::predict_categorical`] today).
+/// `crate::predict`; this enum backs the per-endpoint predictors
+/// (`crate::api::predict_categorical` today).
 ///
 /// Only variants with a **live producer** are declared. The plan also sketches
 /// `Survival` and `Rate` arms; TTE prediction already ships as the richer
-/// [`crate::api::SurvivalPredictionResult`] (S/H/h + CIF + median/mean, more than a
+/// `crate::api::SurvivalPredictionResult` (S/H/h + CIF + median/mean, more than a
 /// three-field variant would hold), so adding it would be an untestable dead arm. `Rate`
 /// is the count endpoint's (#2877).
 #[derive(Debug, Clone, PartialEq)]
@@ -4995,7 +4995,7 @@ impl Prediction {
 }
 
 /// A prediction attached to a specific endpoint CMT — the multi-endpoint analogue
-/// of [`crate::api::PredictionResult`], which has no CMT field because it predates
+/// of `crate::api::PredictionResult`, which has no CMT field because it predates
 /// per-CMT endpoints.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EndpointPredictionResult {
@@ -5365,8 +5365,8 @@ pub struct CompiledModel {
     pub covariate_model: Option<CovariateModelSpec>,
     /// Mirror of [`FitOptions::gradient_method`] so the inner loop can
     /// dispatch at runtime without threading the options struct through
-    /// every call site. Set by [`fit_from_files`](crate::fit_from_files)
-    /// automatically; callers invoking [`fit`](crate::fit) with a
+    /// every call site. Set by `fit_from_files`
+    /// automatically; callers invoking `fit` with a
     /// hand-built `CompiledModel` must set this field to match
     /// `options.gradient_method` themselves. A mismatch is not detected —
     /// `find_ebe` reads this field, not `options`.
@@ -5914,7 +5914,7 @@ impl CompiledModel {
     /// primary's own `ode_spec` is `None`, so on such a model the call is no longer a
     /// full no-op.
     ///
-    /// Note: [`fit`](crate::fit) takes `&CompiledModel` and so cannot call this — the
+    /// Note: `fit` takes `&CompiledModel` and so cannot call this — the
     /// integrator reads [`OdeSpec::solver_opts`](crate::ode::predictions::OdeSpec::solver_opts),
     /// never `FitOptions::ode_reltol` directly. As of #1212 it does not have to: `fit` arms a
     /// fit-scoped override (`FitOptions::ode_solver_override`) that every integration path
@@ -6949,7 +6949,7 @@ pub struct TteObsDiagnostic {
     /// estimate instead.
     pub pit: f64,
     /// Simulation-based npde of a single-event record (#1889), from
-    /// [`crate::stats::npde::compute_tte_npde`]: `Φ⁻¹` of the fraction of population
+    /// `crate::stats::npde::compute_tte_npde`: `Φ⁻¹` of the fraction of population
     /// replicates with an earlier event, imputed above that fraction for a
     /// right-censored time. NaN unless the fit ran with `[fit_options] npde_nsim > 0`
     /// and the record could be scored. NPDE and NPD are the same number for a single
@@ -6987,7 +6987,7 @@ pub struct SubjectResult {
     pub cwres: Vec<f64>,
     /// Normalized prediction distribution errors (simulation-based, decorrelated
     /// within subject). Empty unless `[fit_options] npde_nsim > 0`. Populated
-    /// post-fit by [`crate::stats::npde`]; emitted as the `NPDE` sdtab column.
+    /// post-fit by `crate::stats::npde`; emitted as the `NPDE` sdtab column.
     pub npde: Vec<f64>,
     /// Normalized prediction discrepancies (simulation-based, no decorrelation).
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
@@ -7000,7 +7000,7 @@ pub struct SubjectResult {
     /// Monte-Carlo population-weighted residual `Σ_sim^(-1/2) (y − E_sim[y])`
     /// (Monolix `PWRES`, NONMEM `EWRES`), symmetric-root decorrelated. Empty unless
     /// `[fit_options] npde_nsim > 0`. Emitted as the `PWRES` and `EWRES` columns.
-    /// See [`crate::stats::npde::SubjectNpde::pwres`].
+    /// See `crate::stats::npde::SubjectNpde::pwres`.
     #[serde(default)]
     pub pwres: Vec<f64>,
     pub ofv_contribution: f64,
@@ -7632,7 +7632,7 @@ pub enum WarningCode {
     /// often accompanied by `converged = true`, since a fit that never moved has
     /// a perfectly flat objective trace to plateau on.
     ///
-    /// Read from [`crate::stalled_at_init`], which prefers the optimizer's own
+    /// Read from `crate::stalled_at_init`, which prefers the optimizer's own
     /// scaled-space escape verdict ([`FitResult::left_init`]) and falls back to a
     /// natural-scale comparison against the initial estimates. It fires only when
     /// *nothing* moved — a well-chosen start that the optimizer correctly leaves
@@ -9140,7 +9140,7 @@ pub struct FitResult {
     /// alone. `None` exactly when SIR did not run (#1758), as for `npde_seed`.
     /// Equal to `sir_settings.seed` whenever SIR ran. Where the two disagree — a
     /// `sir_settings.seed` edited after the fit — `sir_settings.seed` is canonical:
-    /// [`run_sir`](crate::run_sir) draws with it, and `save_fit` writes this field from
+    /// `run_sir` draws with it, and `save_fit` writes this field from
     /// it (#1770).
     ///
     /// Except on a fit produced before #1758 (a `.fitrx` with no `sir.settings`),
@@ -9152,7 +9152,7 @@ pub struct FitResult {
     /// scale, degrees of freedom, draw counts, seed, inner-loop and ODE
     /// settings. `None` exactly when SIR did not run.
     ///
-    /// [`run_sir`](crate::run_sir) reads it: a setting its caller leaves at the
+    /// `run_sir` reads it: a setting its caller leaves at the
     /// default is taken from here, so `run_sir` on this fit with default options
     /// repeats the reported SIR.
     #[serde(default)]
@@ -9164,7 +9164,7 @@ pub struct FitResult {
     /// `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. Set by every `fit()`; `None`
     /// only on a hand-built result.
     ///
-    /// [`run_covariance`](crate::run_covariance) reads it: a setting its caller leaves
+    /// `run_covariance` reads it: a setting its caller leaves
     /// at the default is taken from here, so `run_covariance` on this fit with
     /// default options reconverges the EBEs as the fit's inline covariance step did.
     #[serde(default)]
@@ -9210,13 +9210,13 @@ pub struct FitResult {
     /// Echo of the declared covariate columns from the input dataset (ID, TIME,
     /// EVID + one column per declared covariate, one row per input record).
     /// `Some` only when the model has a `[covariates]` block AND the fit was
-    /// launched from a data file; `None` for the in-memory [`crate::fit`] entry point
+    /// launched from a data file; `None` for the in-memory `crate::fit` entry point
     /// (which has no raw rows) or when no `[covariates]` block is declared.
     /// Missing values are `f64::NAN`. See [`CovariateTable`].
     pub covariate_table: Option<CovariateTable>,
     /// A JSON document holding an interface's own data: the R package's call settings,
     /// objects a user added beside the fit, and so on. Core stores and returns the text
-    /// byte for byte and never reads it. [`crate::io::fitrx::save_fit`] requires only that
+    /// byte for byte and never reads it. `crate::io::fitrx::save_fit` requires only that
     /// it is well-formed JSON. `None` until an interface sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interface_extras: Option<String>,
@@ -9236,7 +9236,7 @@ pub struct FitResult {
     pub exclusions: Option<ExclusionSummary>,
     /// The optimizer's **exact** final packed parameter vector (log-theta,
     /// Cholesky-omega lower triangle, log-sigma, over the free parameters), lifted
-    /// from [`OuterResult::packed_estimate`](crate::estimation::outer_optimizer::OuterResult::packed_estimate). Lets [`crate::run_covariance`] reproduce the
+    /// from `OuterResult::packed_estimate`. Lets `crate::run_covariance` reproduce the
     /// inline covariance step's FD-Hessian bit-for-bit by reusing this exact
     /// Cholesky factor instead of re-decomposing `omega` (which is not the
     /// round-trip inverse of the stored `L·Lᵀ`; the FD Hessian amplifies the
@@ -9247,9 +9247,9 @@ pub struct FitResult {
     /// matrix, so both paths re-decompose identically and already agree), for Bayes
     /// (no Hessian covariance step), and for hand-built results.
     ///
-    /// **Persisted by the `.fitrx` bundle** (#1815): [`save_fit`](crate::io::fitrx::save_fit)
+    /// **Persisted by the `.fitrx` bundle** (#1815): `save_fit`
     /// writes it as `fit.json`'s `packed_estimate` key and
-    /// [`load_fit`](crate::io::fitrx::load_fit) reads it back bit-for-bit, so a
+    /// `load_fit` reads it back bit-for-bit, so a
     /// `run_covariance` on a reloaded fit repeats the inline step. `FitResult`'s own
     /// serde still skips it (`#[serde(skip)]`): that is not the bundle format. Every consumer
     /// reads it only when it unpacks bit-for-bit to this result's `theta` / `omega` /
@@ -9267,8 +9267,8 @@ pub struct FitResult {
     ///
     /// The base `omega` / `sigma` rebuild every class entry that is not
     /// overridden, so this is the only part of a mixture fit's parameters no other
-    /// field records. [`crate::run_sir`], [`crate::run_covariance`] and
-    /// [`crate::simulate_with_uncertainty`] read it (ahead of `packed_estimate`) to
+    /// field records. `crate::run_sir`, `crate::run_covariance` and
+    /// `crate::simulate_with_uncertainty` read it (ahead of `packed_estimate`) to
     /// rebuild the per-class matrices the fit had. `Some` for every estimator that
     /// produces a `[mixture]` fit with at least one override — SAEM included, which
     /// carries no `packed_estimate`; `None` otherwise and for hand-built results.
@@ -9327,7 +9327,7 @@ pub struct FitResult {
     #[serde(default)]
     pub kappa_is_diagonal: Option<bool>,
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
-    /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
+    /// `crate::io::fitrx::load_fit` rather than produced by a live fit.
     ///
     /// The checkpoint carries per-record time-to-event diagnostics
     /// (`SubjectResult::tte_rows`) since #911, but a bundle written before that has none.
@@ -9387,7 +9387,7 @@ pub struct FitResult {
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count
 /// the observation-level BIC penalty uses (#1177). Filled by `fit()` from the
-/// packed free-parameter mask; consumed by [`crate::bic`].
+/// packed free-parameter mask; consumed by `crate::bic`.
 ///
 /// The five counts sum to `FitResult::n_parameters`. Class membership follows
 /// `pharmpy.modeling.calculate_bic`: every free Ω / Ω_IOV element is random; a
@@ -9681,7 +9681,7 @@ pub struct FitOptions {
     /// value (e.g. `1e-10`) is needed for the ODE-form OFV to match the
     /// analytical OFV. Copied onto `OdeSpec::solver_opts` via
     /// [`CompiledModel::sync_ode_solver_opts`] at parse time, and carried to the integrator
-    /// for a programmatic [`fit`](crate::fit) by `FitOptions::ode_solver_override` — which
+    /// for a programmatic `fit` by `FitOptions::ode_solver_override` — which
     /// also states the one rule worth knowing: a field left at its default is read as "no
     /// opinion" and yields to a model file that pinned one (#1212).
     pub ode_reltol: f64,
@@ -10112,7 +10112,7 @@ pub struct FitOptions {
     /// `n_agq^n_eta` likelihood evaluations per subject per outer iteration, so raise it
     /// deliberately — odd values are conventional (they keep a node exactly at the mode).
     /// Capped by [`crate::estimation::gauss_hermite::MAX_AGQ_NODES`], with the *grid* additionally
-    /// capped by [`crate::estimation::agq::MAX_AGQ_GRID`].
+    /// capped by `crate::estimation::agq::MAX_AGQ_GRID`.
     pub n_agq: usize,
 
     // ---- Variational inference (`method = vi`) ----
@@ -10396,7 +10396,7 @@ pub struct FitOptions {
     /// [`FitResult::bloq_method`] instead, falling back to this field.
     pub bloq_method: Option<BloqMethod>,
     /// Monte-Carlo replicates per subject for the post-fit NPDE/NPD diagnostics; `0`
-    /// (default) disables them. Typical `1000`. See [`crate::stats::npde`].
+    /// (default) disables them. Typical `1000`. See `crate::stats::npde`.
     pub npde_nsim: usize,
     /// RNG seed for the NPDE/NPD simulation; `None` uses a fixed default.
     pub npde_seed: Option<u64>,
@@ -10464,7 +10464,7 @@ pub struct FitOptions {
     /// benchmark). Opt-in: it perturbs the outer trajectory and can derail gradient-based
     /// optimisers (e.g. MMA).
     pub ebe_warm_start: bool,
-    /// Run [`crate::suggest_start::inits_from_nca`] with this strategy before the optimizer.
+    /// Run `crate::suggest_start::inits_from_nca` with this strategy before the optimizer.
     pub inits_from_nca: Option<crate::types::NcaInit>,
     /// `[data_selection] ignore` / `ignore_subjects` expressions (`&&`-joined clauses); a
     /// record is excluded when any clause is true. Compiled to `FilterClause` at read time.
@@ -10947,7 +10947,7 @@ impl MstepOptimizer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InnerOptimizer {
-    /// Dense BFGS below [`crate::estimation::inner_optimizer::INNER_LBFGS_MIN_DIM`],
+    /// Dense BFGS below `crate::estimation::inner_optimizer::INNER_LBFGS_MIN_DIM`,
     /// L-BFGS at/above it. Nelder–Mead remains the on-failure fallback in every mode.
     #[default]
     Auto,
@@ -11064,7 +11064,7 @@ pub enum EstimationMethod {
     /// adaptive Gauss–Hermite quadrature by `n_agq` (#251). `n_agq = 1` reduces term for term
     /// to Laplace; `n_agq > 1` integrates the real likelihood, so it handles non-Gaussian
     /// endpoints without approximation. Deterministic; cost `n_agq^n_eta` evaluations per
-    /// subject (see [`crate::estimation::agq::MAX_AGQ_GRID`]).
+    /// subject (see `crate::estimation::agq::MAX_AGQ_GRID`).
     ///
     /// The Hessian anchor distinguishes it from [`FoceI`](Self::FoceI) (Gauss-Newton
     /// `CᵀC + Ω⁻¹`): the exact one reproduces NONMEM's LAPLACIAN to six figures on warfarin.
@@ -11075,7 +11075,7 @@ pub enum EstimationMethod {
     ///
     /// The objective is a lower bound, so `FitResult::ofv` is `NaN` unless
     /// [`FitOptions::vi_final_ofv`] asks for a marginal likelihood. No IOV or non-Gaussian
-    /// endpoints; see [`crate::estimation::vi::elbo::unsupported_data_term_reason`].
+    /// endpoints; see `crate::estimation::vi::elbo::unsupported_data_term_reason`.
     Vi,
 }
 
@@ -11169,7 +11169,7 @@ pub enum ViOmegaUpdate {
 pub enum ViSigmaUpdate {
     /// Replace `σ` with the exact ELBO maximiser (default):
     /// `σ*² = (1/n_obs) · Σ E_q[(y − f(η))² / f(η)²]` (`f²` only for proportional); see
-    /// [`crate::estimation::vi::closed_form_sigma`]. Combined error, several σs,
+    /// `crate::estimation::vi::closed_form_sigma`. Combined error, several σs,
     /// per-endpoint/covariate error, correlated residuals, M3, IIV-on-RUV, FREM or a FIXed σ
     /// fall back to `Adam` with a warning.
     #[default]
@@ -11359,7 +11359,7 @@ impl FitOptions {
     }
 
     /// The first stage with no η–ε interaction (FOCE, or GN without `interaction`), or
-    /// `None`. `iiv_on_ruv` needs interaction, so [`crate::fit`] refuses such a stage and
+    /// `None`. `iiv_on_ruv` needs interaction, so `crate::fit` refuses such a stage and
     /// `ruvsearch` reads this (#1182). Walks the whole chain: `method` is only the last stage.
     pub fn non_interaction_stage(&self) -> Option<EstimationMethod> {
         self.method_chain().into_iter().find(|m| match m {
@@ -11625,7 +11625,7 @@ pub fn deprecated_key_notice(key: &str) -> Option<&'static str> {
 }
 
 /// The `ode_*` subset of [`framework_keys`]: knobs that only ever reach the ODE
-/// Kept separate so [`FitOptions::unsupported_keys_warnings_with_model`] can treat these
+/// Kept separate so `FitOptions::unsupported_keys_warnings_with_model` can treat these
 /// as model-conditional; a unit test pins the subset relation.
 pub fn ode_solver_keys() -> &'static [&'static str] {
     &[
@@ -11639,7 +11639,7 @@ pub fn ode_solver_keys() -> &'static [&'static str] {
 }
 
 /// The covariance subset of [`framework_keys`]: knobs that only ever reach the post-fit
-/// covariance step ([`crate::estimation::covariance::run_covariance_step`]).
+/// covariance step (`crate::estimation::covariance::run_covariance_step`).
 ///
 /// Kept separate because the covariance step is skipped when the covariance stage is
 /// Bayes; a unit test pins the subset relation. `cov_inner_tol` belongs here, not per
@@ -11949,7 +11949,7 @@ pub struct ParsedModel {
     /// [`FitResult::covariate_table`].
     pub covariate_decls: Option<Vec<CovariateDecl>>,
     /// `[data] path`, resolved relative to the model file (#690). An external path always
-    /// overrides it — see [`crate::api::resolve_data_path`].
+    /// overrides it — see `crate::api::resolve_data_path`.
     pub data_path: Option<String>,
     /// `[data]` column remappings `(canonical_role_lowercase, actual_csv_header)` (#730),
     /// e.g. `("time", "TAFD")`.

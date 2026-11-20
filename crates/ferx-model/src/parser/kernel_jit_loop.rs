@@ -18,7 +18,7 @@
 //! step with that switch's arm forced, which the steps locating a crossing take; and per switch
 //! and side the **jump** at a crossing, `[u, t] → u⁺`: the state carried through the crossing to
 //! the other arm by flows of a value-zero duration whose derivatives are those of the crossing
-//! time, so every lane, of every order the layout carries, jumps exactly ([`jump_tr`]). The
+//! time, so every lane, of every order the layout carries, jumps exactly (`jump_tr`). The
 //! values do not move.
 use super::*;
 use crate::ode::solver::{self as sol, OdeMethod, OdeSolverOptions, StepClock};
@@ -615,7 +615,7 @@ pub enum Entry {
     /// A stepper for method `m` starts, its carried state fresh.
     NewStepper,
     /// Method `m`'s body `kind` (0 start, 1 step, 2 accept, `4 + j` forced step `j`) ran on the
-    /// input lanes at `at` of the log's [`Log::vars`]; or, `kind` 3, jump `m` (#2649).
+    /// input lanes at `at` of the log's `Log::vars`; or, `kind` 3, jump `m` (#2649).
     Body { m: usize, kind: u8, at: usize },
     /// The current state became output point `idx` of the hard (`saveat`) or soft list.
     Point { soft: bool, idx: usize, diverged: bool },

@@ -53,7 +53,7 @@ fn subject_gradient(
     subject_gradient_at(model, subject, &pt, eta_hat, interaction)
 }
 
-/// [`subject_gradient`] at a [`PackedPoint`] the population loop unpacked once — the fit's
+/// `subject_gradient` at a [`PackedPoint`] the population loop unpacked once — the fit's
 /// per-subject entry (`outer_optimizer`'s population gradients), so `x` is unpacked once per
 /// evaluation rather than once per subject. `eta_hat` is the stacked `[η, κ₁ … κ_K]` under
 /// IOV, as for the per-subject wrappers above.
@@ -149,7 +149,7 @@ pub struct ModeResponses {
     pub scores: Option<Vec<Vec<f64>>>,
     /// Per subject, the stacked `[η̂, κ̂]` its gradient was taken at when the pass polished an
     /// off-mode start to the mode (`None` for one served where it stood; empty when no pass
-    /// ran). The caller's EBE store takes these ([`adopt_polished_modes`]), so the next
+    /// ran). The caller's EBE store takes these (`adopt_polished_modes`), so the next
     /// objective is evaluated at the `η̂` this gradient differentiates.
     pub polished: Vec<Option<Vec<f64>>>,
 }

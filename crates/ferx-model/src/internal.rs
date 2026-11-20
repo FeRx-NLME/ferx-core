@@ -16,7 +16,9 @@ use crate::io::datareader::SelectionFilter;
 use crate::ode::predictions::OdeSpec;
 use crate::ode::solver::OdeSolverStats;
 use crate::parser::model_parser::Bytecode;
+#[cfg(feature = "markov")]
 use crate::parser::model_parser::CtmmGeneratorProgram;
+#[cfg(feature = "survival")]
 use crate::parser::model_parser::EndpointExprProgram;
 use crate::parser::model_parser::EtaCoupling;
 use crate::parser::model_parser::Expression;
@@ -90,7 +92,7 @@ impl EngineErrorInternal for EngineError {
     fn uncoded(message: impl Into<String>) -> Self {
         EngineError::uncoded(message)
     }
-    fn in_context(mut self, context: impl Into<String>) -> Self {
+    fn in_context(self, context: impl Into<String>) -> Self {
         EngineError::in_context(self, context)
     }
 }
@@ -150,6 +152,7 @@ pub trait SubjectInternal: sealed::Sealed + Sized {
     fn record_maps(&self) -> impl Iterator<Item = &HashMap<String, f64>>;
     fn n_scored_rows(&self) -> usize;
     fn record_covariate_snapshots(&self) -> Option<&[HashMap<String, f64>]>;
+    #[cfg(feature = "survival")]
     fn retain_records(&mut self, keep: impl FnMut(&mut ObsRecord) -> bool);
     fn record_cov<'a>(
         &'a self, snaps: Option<&'a [HashMap<String, f64>]>, r: usize,
@@ -179,7 +182,8 @@ impl SubjectInternal for Subject {
     fn record_covariate_snapshots(&self) -> Option<&[HashMap<String, f64>]> {
         Subject::record_covariate_snapshots(self)
     }
-    fn retain_records(&mut self, mut keep: impl FnMut(&mut ObsRecord) -> bool) {
+    #[cfg(feature = "survival")]
+    fn retain_records(&mut self, keep: impl FnMut(&mut ObsRecord) -> bool) {
         Subject::retain_records(self, keep)
     }
     fn record_cov<'a>(
@@ -222,7 +226,7 @@ pub trait OmegaMatrixInternal: sealed::Sealed + Sized {
     ) -> std::borrow::Cow<'a, DMatrix<f64>>;
 }
 impl OmegaMatrixInternal for OmegaMatrix {
-    fn with_block_declared(mut self, block_declared: Vec<bool>) -> Self {
+    fn with_block_declared(self, block_declared: Vec<bool>) -> Self {
         OmegaMatrix::with_block_declared(self, block_declared)
     }
     fn structural_zeros(&self) -> Vec<bool> {
@@ -554,6 +558,16 @@ impl ThetaBlocksInternal for ThetaBlocks {
 }
 impl sealed::Sealed for ThetaBlocks {}
 
+pub trait BytecodeInternal: sealed::Sealed + Sized {
+    fn push_const(&mut self, v: f64);
+}
+impl BytecodeInternal for Bytecode {
+    fn push_const(&mut self, v: f64) {
+        Bytecode::push_const(self, v)
+    }
+}
+impl sealed::Sealed for Bytecode {}
+
 pub trait OdeRhsProgramInternal: sealed::Sealed + Sized {
     fn route_note(&self) -> Option<(&'static str, String, serde_json::Value)>;
     fn init_state_g<T: crate::sens::num::vm::VmNum>(
@@ -562,9 +576,13 @@ pub trait OdeRhsProgramInternal: sealed::Sealed + Sized {
     fn uses_time_vars(&self) -> bool;
     fn reads_time_builtin(&self) -> bool;
     fn reads_model_time(&self) -> bool;
+    #[cfg(feature = "survival")]
     fn chz_dependency_slice(&self, chz_slot: usize) -> Vec<bool>;
+    #[cfg(feature = "survival")]
     fn indiv_param_reaches_chz(&self, i: usize, slice: &[bool]) -> bool;
+    #[cfg(feature = "survival")]
     fn init_reads_indiv_param_reaching_chz(&self, i: usize, slice: &[bool]) -> bool;
+    #[cfg(feature = "survival")]
     fn has_indiv_param(&self, i: usize) -> bool;
     fn pk_reads_model_time(&self) -> bool;
     fn pk_reads_tafd(&self) -> bool;
@@ -593,15 +611,19 @@ impl OdeRhsProgramInternal for OdeRhsProgram {
     fn reads_model_time(&self) -> bool {
         OdeRhsProgram::reads_model_time(self)
     }
+    #[cfg(feature = "survival")]
     fn chz_dependency_slice(&self, chz_slot: usize) -> Vec<bool> {
         OdeRhsProgram::chz_dependency_slice(self, chz_slot)
     }
+    #[cfg(feature = "survival")]
     fn indiv_param_reaches_chz(&self, i: usize, slice: &[bool]) -> bool {
         OdeRhsProgram::indiv_param_reaches_chz(self, i, slice)
     }
+    #[cfg(feature = "survival")]
     fn init_reads_indiv_param_reaching_chz(&self, i: usize, slice: &[bool]) -> bool {
         OdeRhsProgram::init_reads_indiv_param_reaching_chz(self, i, slice)
     }
+    #[cfg(feature = "survival")]
     fn has_indiv_param(&self, i: usize) -> bool {
         OdeRhsProgram::has_indiv_param(self, i)
     }
@@ -626,38 +648,50 @@ impl OdeRhsProgramInternal for OdeRhsProgram {
 }
 impl sealed::Sealed for OdeRhsProgram {}
 
+#[cfg(feature = "markov")]
 pub trait CtmmGeneratorProgramInternal: sealed::Sealed + Sized {
+    #[cfg(feature = "markov")]
     fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>>;
 }
+#[cfg(feature = "markov")]
 impl CtmmGeneratorProgramInternal for CtmmGeneratorProgram {
+    #[cfg(feature = "markov")]
     fn eval_generator_colmajor_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>> {
         CtmmGeneratorProgram::eval_generator_colmajor_g(self, theta, eta, covariates)
     }
 }
+#[cfg(feature = "markov")]
 impl sealed::Sealed for CtmmGeneratorProgram {}
 
+#[cfg(feature = "survival")]
 pub trait EndpointExprProgramInternal: sealed::Sealed + Sized {
+    #[cfg(feature = "survival")]
     fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>>;
 }
+#[cfg(feature = "survival")]
 impl EndpointExprProgramInternal for EndpointExprProgram {
+    #[cfg(feature = "survival")]
     fn eval_g<T: crate::sens::num::vm::VmNum>(
         &self, theta: &[T], eta: &[T], covariates: &HashMap<String, f64>,
     ) -> Option<Vec<T>> {
         EndpointExprProgram::eval_g(self, theta, eta, covariates)
     }
 }
+#[cfg(feature = "survival")]
 impl sealed::Sealed for EndpointExprProgram {}
 
 pub trait IndivParamProgramInternal: sealed::Sealed + Sized {
     fn n_eta_axis(&self) -> usize;
     fn pk_slots_ref(&self) -> &[usize];
+    #[cfg(feature = "survival")]
     fn params_reading_time(&self) -> Vec<bool>;
+    #[cfg(feature = "markov")]
     fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool>;
     fn pk_var_slots(&self) -> &[(usize, usize)];
     fn eval_params_g<T: crate::sens::num::vm::VmNum>(
@@ -675,9 +709,11 @@ impl IndivParamProgramInternal for IndivParamProgram {
     fn pk_slots_ref(&self) -> &[usize] {
         IndivParamProgram::pk_slots_ref(self)
     }
+    #[cfg(feature = "survival")]
     fn params_reading_time(&self) -> Vec<bool> {
         IndivParamProgram::params_reading_time(self)
     }
+    #[cfg(feature = "markov")]
     fn params_reading_covariates(&self, names: &[&str]) -> Vec<bool> {
         IndivParamProgram::params_reading_covariates(self, names)
     }

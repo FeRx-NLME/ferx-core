@@ -570,7 +570,7 @@ fn focei_alpha<T: PkNum>(v: T, vf: T) -> T {
 /// Row `j` of the FOCEI diagonal path as the structured covariance Hessian reads it (#2980):
 /// `(ℓ, ∂ℓ/∂f, α)` at prediction `f` — an uncensored Gaussian row, no RUV IIV, no SDE, no
 /// FREM ([`structured_rows_supported`]). `T` carries the derivatives the caller needs (a dual
-/// over the row's local inputs); the arithmetic is [`focei_rows`]'.
+/// over the row's local inputs); the arithmetic is `focei_rows`'.
 pub fn focei_gauss_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -> Option<(T, T, T)> {
     let pk = p.wrap_rows::<1>();
     let fd = DualT::<1, T> { v: f, g: [T::from_f64(1.0)] };
@@ -628,7 +628,7 @@ pub fn foce_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, r_eval: T, p: &ParT<T>) 
 }
 
 /// Row `j` of the Laplace objective as the structured covariance Hessian reads it (#2980):
-/// `(ℓ, ℓ′, ℓ″)` of [`row_l`] in its prediction — the row term and the derivatives
+/// `(ℓ, ℓ′, ℓ″)` of `row_l` in its prediction — the row term and the derivatives
 /// [`inner_hessian_through_predictions`] builds the exact inner Hessian from.
 pub fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -> Option<[T; 3]> {
     let pl = p.map_rows(d2_const);
@@ -1236,7 +1236,7 @@ fn note_inner_hessian_route(subject: &Subject, generic: bool) {
 /// (taped and untaped), `exact_inner_hessian`, and the covariance step.
 ///
 /// By the chain rule through the predictions ([`inner_hessian_through_predictions`]) unless a
-/// row reads η directly ([`reads_eta_directly`]), and otherwise by [`inner_l`] over a
+/// row reads η directly (`reads_eta_directly`), and otherwise by [`inner_l`] over a
 /// second-order dual — the one decline rule and the one fallback, here rather than at each
 /// site. `None` only where the objective itself is undefined at these jets (a row with no
 /// valid variance): the generic path fails at the same row, so it is not re-run.
@@ -1255,8 +1255,8 @@ pub fn exact_inner_hessian_kernel<T: PkNum>(
 ///
 /// `∂²l/∂η∂ηᵀ = ½(Ω⁻¹ + Ω⁻ᵀ) + ½·Σⱼ (ℓⱼ″·GⱼGⱼᵀ + ℓⱼ′·Qⱼ)`
 ///
-/// with `ℓⱼ′`, `ℓⱼ″` the derivatives of the row term [`row_l`] in its prediction, from one
-/// pass of `row_l` over a [`D2`]. Every row kind that reads η only through its prediction is
+/// with `ℓⱼ′`, `ℓⱼ″` the derivatives of the row term `row_l` in its prediction, from one
+/// pass of `row_l` over a `D2`. Every row kind that reads η only through its prediction is
 /// covered by that one definition — Gaussian under any error model, M3-censored. A row costs
 /// one 4-component pass plus the `n(n+1)/2` assembly. The caller has established that no row
 /// reads η directly ([`exact_inner_hessian_kernel`]); `None` is an undefined row.
@@ -1339,7 +1339,7 @@ pub fn inner_hessian_generic<T: PkNum>(
 /// `∇_η l` at `(f, G, η)`, under the conditional or FOCE's `frozen` convention (see
 /// [`inner_l`]). Row-separable on the diagonal path: each row contributes
 /// `½·(∂ℓ_j/∂f)·G_j` plus its explicit η-dependence (the RUV-IIV scale, or a FREM row's
-/// `θ_i + η_e`), from a small dual over the row term [`row_l`] (the conditional case is
+/// `θ_i + η_e`), from a small dual over the row term `row_l` (the conditional case is
 /// [`focei_f_grad`]'s row pass); the prior adds `Ω⁻¹η`. The dense path couples rows, so
 /// there `l` itself is evaluated over an η-dual whose predictions carry `G`.
 pub fn inner_grad<T: PkNum>(

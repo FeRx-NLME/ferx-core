@@ -50,7 +50,7 @@
 //! not FSAL and its own continuous extension would need three extra stages and a coefficient
 //! block larger than the method, so it pays one extra evaluation — and only when a caller has
 //! actually asked for in-step reads
-//! ([`Stepper::set_dense_required`](super::solver::Stepper::set_dense_required)), keeping the
+//! ([`Stepper::set_dense_required`]), keeping the
 //! ordinary `saveat` path at exactly 10 evaluations per step. Its in-step reads are therefore
 //! 3rd-order accurate while its steps are 7th-order accurate.
 

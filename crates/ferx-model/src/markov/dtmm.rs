@@ -275,7 +275,7 @@ pub fn dtmm_subject_eta_grad(
 }
 
 /// Whether every `Dtmm` endpoint of `model` carries a dual-evaluable probability program,
-/// i.e. [`dtmm_subject_eta_grad`] can serve it. Vacuously `true` with none.
+/// i.e. `dtmm_subject_eta_grad` can serve it. Vacuously `true` with none.
 pub fn all_dtmm_endpoints_analytic(model: &CompiledModel) -> bool {
     model.endpoints.values().all(|ep| match ep {
         EndpointLikelihood::Dtmm { prob_program, .. } => prob_program.is_some(),

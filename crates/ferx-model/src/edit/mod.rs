@@ -442,7 +442,7 @@ fn split_keeping_terminators(src: &str) -> Vec<String> {
 /// parser reads. `#` and `//` both start a comment, whichever comes first.
 ///
 /// A marker **inside a quoted string is content, not a comment**. This is the
-/// same rule [`canonical::squeeze`] applies to whitespace, and it is here for
+/// same rule `canonical::squeeze` applies to whitespace, and it is here for
 /// the same reason: with a naive cut at the first `#` or `//`, the two `[data]`
 /// paths `"s3://bucket/a.csv"` and `"s3://bucket/b.csv"` both truncate to
 /// `path = "s3:` and hash alike, so a search would fit one candidate and report

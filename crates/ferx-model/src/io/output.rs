@@ -2338,7 +2338,7 @@ fn fmt_cov_entry(v: f64) -> String {
 /// result, falls back to inferring the layout from the size `n` of a
 /// packed-space matrix on the result (its covariance matrix) — the count of
 /// coordinates left after θ, σ, the trailing mixture overrides and the
-/// `block_sigma` correlations ([`trailing_packed_count`], #2833) — which is a
+/// `block_sigma` correlations (`trailing_packed_count`, #2833) — which is a
 /// guess: when `n_eta == n_kappa > 1` with exactly one of the two a block, both
 /// assignments give the same count and the block is assumed to be Ω. Labels
 /// only; nothing that gates a candidate reads the inferred layout.

@@ -14,7 +14,6 @@ pub mod filter_expr {
         is_standard_column, FilterClause, FilterExpr, RowContext,
     };
 }
-pub(crate) use ferx_model::io::fit_estimates;
 pub mod fitrx;
 pub mod hash {
     #[allow(unused_imports)]
@@ -23,6 +22,8 @@ pub mod hash {
 }
 pub(crate) mod model_source;
 pub mod output {
+    #[cfg(feature = "survival")]
+    pub use ferx_model::io::output::TTE_RESIDUAL_COLUMNS;
     #[allow(unused_imports)]
     pub(crate) use ferx_model::io::output::*;
     pub use ferx_model::io::output::{
@@ -31,7 +32,7 @@ pub mod output {
         sdtab, write_conddist_csv, write_conddist_outputs, write_conddist_samples_csv,
         write_covtab_csv, write_estimates_yaml, write_result_json, write_sdtab_csv, EtaLinkedTheta,
         KappaRowsInput, KappaRowsOptions, OffDiagCorr, OffDiagCorrSource, OmegaRowsInput,
-        OmegaRowsOptions, THETA_BLOCK_COMPACT_MIN, TTE_RESIDUAL_COLUMNS,
+        OmegaRowsOptions, THETA_BLOCK_COMPACT_MIN,
     };
 }
 pub(crate) use ferx_model::io::serde_nan;

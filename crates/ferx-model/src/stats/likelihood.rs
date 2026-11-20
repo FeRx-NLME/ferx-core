@@ -8,7 +8,7 @@ use nalgebra::{DMatrix, DVector};
 /// parameters under time-varying covariates (`pk::compute_predictions_with_tv`).
 /// Canonical predictions entry for FOCE/FOCEI inner-loop objectives; pass the same
 /// `(theta, eta)` used elsewhere in the NLL. Allocates a fresh `EventPkParams`; hot
-/// loops should use [`model_predictions_into`].
+/// loops should use `model_predictions_into`.
 #[inline]
 pub fn model_predictions(
     model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64],

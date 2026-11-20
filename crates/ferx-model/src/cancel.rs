@@ -58,8 +58,8 @@ pub fn is_cancelled(flag: &Option<CancelFlag>) -> bool {
     matches!(flag, Some(f) if f.is_cancelled())
 }
 
-#[cfg(any(test, feature = "test-support"))]
-pub mod tests {
+#[cfg(test)]
+mod tests {
     use super::*;
 
     #[test]

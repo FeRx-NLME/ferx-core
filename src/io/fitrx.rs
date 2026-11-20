@@ -2264,6 +2264,15 @@ fn epoch_to_utc(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
 // ---------------------------------------------------------------------------
 
 /// Read a fit bundle from `path`.
+/// Install [`load_fit`] as `ferx-model`'s `.fitrx` reader for `[priors] from_fit`. The parser
+/// lives below this crate and cannot name it; every ferx-core entry point that can parse a
+/// model calls this first. Idempotent and cheap (a `OnceLock` set).
+pub(crate) fn install_fit_estimates_reader() {
+    ferx_model::io::fit_estimates::install_fitrx_reader(|path| {
+        load_fit(path).map(|loaded| loaded.fit).map_err(|e| e.to_string())
+    });
+}
+
 pub fn load_fit(path: &Path) -> Result<LoadedFit, FitrxError> {
     load_bundle(File::open(path)?, true)
 }
@@ -2304,6 +2313,8 @@ fn read_manifest<R: Read + std::io::Seek>(
 fn load_bundle<R: Read + std::io::Seek>(
     reader: R, read_population: bool,
 ) -> Result<LoadedFit, FitrxError> {
+    // A bundled model re-parsed below may itself carry `[priors] from_fit`.
+    install_fit_estimates_reader();
     let mut archive = ZipArchive::new(reader)?;
     let manifest = read_manifest(&mut archive)?;
 

@@ -5,6 +5,21 @@
 use super::*;
 use crate::sens::num::PkNum;
 
+/// `reset()` forgets every unregistered plan, bad mark and template — every test's, not only its
+/// caller's. The tests here assert on those tables across several steps, so a `reset()` on
+/// another thread between two of them reads as a lost entry: `a_bad_mark_outlives_…` saw its
+/// mark vanish in about one run in seven of the ferx-model lib tests (#3041). The two tests that
+/// call `reset()` hold this exclusively; every other test in this file holds it shared.
+static RESETS: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+fn resets_shared() -> std::sync::RwLockReadGuard<'static, ()> {
+    RESETS.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn resets_exclusive() -> std::sync::RwLockWriteGuard<'static, ()> {
+    RESETS.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// The second-order layout over 2 η: value, `∂_0`, `∂_1`, `∂²_00`, `∂²_10`, `∂²_11`.
 fn l2() -> Layout {
     Layout { n: 2, m: 3, th: false, wide: false, tan: 0 }
@@ -39,6 +54,7 @@ fn close(got: f64, want: f64, what: &str) {
 /// the pivot row changing between the recording point and the evaluation point.
 #[test]
 fn a_recorded_linear_solve_is_exact_to_second_order_across_pivot_changes() {
+    let _resets = resets_shared();
     // A(η): entries affine and bilinear in η, so A′ and A″ are exact by hand.
     let a_of = |e: [f64; 2]| -> ([f64; 9], [[f64; 9]; 2], [[[f64; 9]; 2]; 2]) {
         let a = [
@@ -125,6 +141,7 @@ fn a_recorded_linear_solve_is_exact_to_second_order_across_pivot_changes() {
 /// `F_u = I + diag(0.3e^{−u}) − 0.1·swap` and `F_uu` the diagonal `−0.3e^{−u}` terms.
 #[test]
 fn a_recorded_fixed_point_has_its_implicit_derivatives_to_second_order() {
+    let _resets = resets_shared();
     let c_of = |e: [f64; 2]| -> ([f64; 2], [[f64; 2]; 2], [[[f64; 2]; 2]; 2]) {
         let c = [e[0] * e[0] + 2.0 * e[1], e[0] * e[1] - 0.5];
         let d = [[2.0 * e[0], e[1]], [2.0, e[0]]];
@@ -193,6 +210,7 @@ fn a_recorded_fixed_point_has_its_implicit_derivatives_to_second_order() {
 /// the recording's. Oracle: `∂ e^{a} = a′e^{a}`, `∂² e^{a} = (a″ + a′a′)e^{a}`, per entry.
 #[test]
 fn a_recorded_matrix_exponential_squares_as_often_as_the_values_ask() {
+    let _resets = resets_shared();
     // a = −4η₀² − 6, d = −3η₀η₁ − 5: ‖A‖ ≈ 10–40, two to four squarings.
     let f = |e: &[Tr]| -> Vec<Tr> {
         let k = |c: f64| Tr::from_f64(c);
@@ -299,6 +317,7 @@ const CASES: [Case; 3] = [("expm", case_expm), ("fixed point", case_fixed), ("so
 /// the recorded solve's refinement) against its own forward's first-order lanes.
 #[test]
 fn every_call_kind_reverses_to_its_forward_derivatives() {
+    let _resets = resets_shared();
     for (name, f) in CASES {
         for eta in [[0.3, 0.2], [1.2, 0.9]] {
             let fw = run2(f, [0.3, 0.2], eta);
@@ -323,6 +342,7 @@ fn every_call_kind_reverses_to_its_forward_derivatives() {
 /// the exact `x‴/2` is 1.2594, three give it to rounding.
 #[test]
 fn every_call_kind_reverses_exactly_from_second_order_lanes() {
+    let _resets = resets_shared();
     let l2t = Layout { tan: 1, ..l2() };
     let (l, lt) = (l2().lanes(), l2t.lanes());
     // `∂²` lane of the pair `(k, m)`, `k ≥ m`: payload order 00, 10, 11.
@@ -405,6 +425,7 @@ fn case_fixed_held(e: &[Tr]) -> Vec<Tr> {
 /// singular there and the call failed at every derivative layout.
 #[test]
 fn a_held_coordinate_is_a_constant_of_the_fixed_point() {
+    let _resets = resets_shared();
     for eta in [[0.3, 0.2], [1.2, 0.9]] {
         let want = run2(case_fixed, [0.3, 0.2], eta);
         let got = run2(case_fixed_held, [0.3, 0.2], eta);
@@ -431,6 +452,7 @@ fn a_held_coordinate_is_a_constant_of_the_fixed_point() {
 /// between the plan's θ-adjoint and a forward dual on a Rodas5P case run after an RK45 one).
 #[test]
 fn the_solver_options_key_a_plan() {
+    let _resets = resets_shared();
     let mut model = crate::parser::model_parser::parse_model_string(
         "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
          omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01\n[individual_parameters]\n  \
@@ -459,6 +481,7 @@ fn the_solver_options_key_a_plan() {
 /// `Σ c_k·η_k²` and `Π (1 + 0.01·η_k)` is still exact at every η (the ones past 63 included).
 #[test]
 fn a_recording_over_70_eta_plans_and_has_its_first_order_gradient() {
+    let _resets = resets_shared();
     const N: usize = 70;
     let l1 = Layout { n: N as u16, m: 0, th: false, wide: false, tan: 0 };
     let eta: Vec<f64> = (0..N).map(|k| 0.1 + 0.01 * k as f64).collect();
@@ -493,6 +516,7 @@ fn a_recording_over_70_eta_plans_and_has_its_first_order_gradient() {
 
 #[test]
 fn dir_mask_ops_match_the_single_word_algebra_and_spill_past_it() {
+    let _resets = resets_shared();
     let (a, b) = (DirMask::eta(2), DirMask::eta(70));
     let u = a.clone() | &b;
     assert!(u.has(2) && u.has(70) && !u.has(3) && !u.has(69) && !u.has(200));
@@ -517,6 +541,7 @@ fn square_plan() -> Entry {
 /// decided in the first, and the point on the other side of it runs that chunk alone.
 #[test]
 fn a_failed_guard_stops_the_forward_at_its_chunk() {
+    let _resets = resets_shared();
     begin();
     let e: Vec<Tr> = (0..2).map(|k| Tr::eta(k, [2.0, 1.0][k])).collect();
     let a = e[0] * e[0];
@@ -550,6 +575,7 @@ fn a_failed_guard_stops_the_forward_at_its_chunk() {
 /// Variants are tried most recently serving first.
 #[test]
 fn variants_are_tried_most_recent_first() {
+    let _resets = resets_shared();
     let mut v = Variants::default();
     for _ in 0..3 {
         v = v.with(square_plan());
@@ -565,6 +591,7 @@ fn variants_are_tried_most_recent_first() {
 /// Past `MAX_VARIANTS` the oldest variant goes unless it served last; then the next oldest.
 #[test]
 fn a_full_variant_list_keeps_the_one_that_served_last() {
+    let _resets = resets_shared();
     let first = square_plan();
     let mut v = Variants::default().with(first.clone());
     let second = square_plan();
@@ -585,6 +612,7 @@ fn a_full_variant_list_keeps_the_one_that_served_last() {
 /// thread's, and a later variant joins the list.
 #[test]
 fn add_refreshes_this_threads_last_subject() {
+    let _resets = resets_shared();
     let model = crate::parser::model_parser::parse_model_string(
         "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
          omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01\n[individual_parameters]\n  \
@@ -610,6 +638,7 @@ fn add_refreshes_this_threads_last_subject() {
 /// registers a different value than the per-call hash (two keys for one subject).
 #[test]
 fn a_registered_fit_keys_by_its_fingerprints_and_releases_them() {
+    let _resets = resets_shared();
     let model = crate::parser::model_parser::parse_model_string(
         "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01\n\
          [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = 30.0\n[structural_model]\n  \
@@ -638,6 +667,7 @@ fn a_registered_fit_keys_by_its_fingerprints_and_releases_them() {
 /// per-fit race this replaced) or a scope's plans outlive it (memory held across fits).
 #[test]
 fn a_fits_plans_survive_resets_and_leave_with_its_scope() {
+    let _resets = resets_exclusive();
     let model = crate::parser::model_parser::parse_model_string(
         "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01\n\
          [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = 30.0\n[structural_model]\n  \
@@ -662,6 +692,7 @@ fn a_fits_plans_survive_resets_and_leave_with_its_scope() {
 /// table) made that lookup `Missing`, and the term came back `None`, scored as the 1e20 sentinel.
 #[test]
 fn add_returns_the_stored_variants_not_a_second_lookup() {
+    let _resets = resets_exclusive();
     let model = crate::parser::model_parser::parse_model_string(
         "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
          omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.01\n[individual_parameters]\n  \
@@ -712,6 +743,7 @@ fn case_ode_interp(method: crate::ode::solver::OdeMethod) -> impl Fn(&[Tr]) -> V
 /// the run's log does carry in-step read-outs strictly between a step's ends.
 #[test]
 fn an_interpolated_sample_reverses_like_the_forward_tangent() {
+    let _resets = resets_shared();
     use crate::ode::solver::OdeMethod;
     let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
     let l = l1.lanes();
@@ -819,6 +851,7 @@ fn zero_tangent_inputs(v: [f64; 4], l: usize) -> Vec<f64> {
 /// patches its outputs (a `+0` canonicalisation on one side only).
 #[test]
 fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
+    let _resets = resets_shared();
     for v in [
         [1.3, 0.4, 2.0, 0.9],
         [-1.3, 0.4, -2.0, -0.9],
@@ -879,6 +912,7 @@ fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
 /// every input's adjoint lanes, from several seeds at once (`call_seeds`).
 #[test]
 fn the_reverse_tiers_agree_bit_for_bit_across_seeds() {
+    let _resets = resets_shared();
     let (cp, layout) = zero_tangent_chunk(false);
     let l = layout.lanes();
     let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
@@ -961,6 +995,7 @@ fn simd_inputs(l: usize) -> Vec<f64> {
 /// or read from the wrong operand, a reverse pack scheduled across the adjoint store it reads back.
 #[test]
 fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
+    let _resets = resets_shared();
     let (cp, layout) = simd_chunk();
     let l = layout.lanes();
     let idx: Vec<u32> = (0..5).collect();
@@ -1019,6 +1054,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
 /// equal maps key apart at random (#2786).
 #[test]
 fn a_covariate_value_keys_a_plan_by_its_name() {
+    let _resets = resets_shared();
     let subject = |pairs: &[(&str, f64)]| {
         let mut s = crate::types::Subject::default();
         s.covariates = pairs.iter().map(|&(k, v)| (k.to_string(), v)).collect();
@@ -1045,6 +1081,7 @@ fn a_covariate_value_keys_a_plan_by_its_name() {
 /// to FD (`an_exact_h_is_never_counted_as_redone`). Dies when the `Unary::Abs` rule branches.
 #[test]
 fn a_recorded_jacobian_holds_across_an_abs_kink() {
+    let _resets = resets_shared();
     let jac_of = |e: &[Tr]| -> Vec<Tr> {
         let rhs = |u: &[Tr], p: &[Tr], _t: Tr, du: &mut [Tr]| du[0] = u[0].abs() * p[0];
         let (mut f, mut j, mut ft) = ([Tr::k(0.0)], [Tr::k(0.0)], [Tr::k(0.0)]);
@@ -1070,6 +1107,7 @@ fn a_recorded_jacobian_holds_across_an_abs_kink() {
 /// entries), so these rows can only key apart.
 #[test]
 fn subject_fingerprints_tell_apart_rows_differing_in_two_values() {
+    let _resets = resets_shared();
     let row = |study: f64, trt: f64, level: f64| -> HashMap<String, f64> {
         [("STUDY", study), ("TRT", trt), ("__level_PLACEBO", level)]
             .into_iter()
@@ -1100,6 +1138,7 @@ fn subject_fingerprints_tell_apart_rows_differing_in_two_values() {
 /// key and served a level-block subject another's plan (`level_two_block_nonmem_anchor` 13.8 OFV off).
 #[test]
 fn whole_number_covariate_values_key_apart() {
+    let _resets = resets_shared();
     let desc = |level: f64| {
         let mut s = crate::types::Subject::default();
         s.covariates = [("STUDY", level), ("__level_PLACEBO", level), ("OCC", 1.0)]
@@ -1125,6 +1164,7 @@ fn whole_number_covariate_values_key_apart() {
 /// plan) or when the id's drop leaves plans behind (memory held for dead models).
 #[test]
 fn a_model_keys_its_plans_by_identity_and_they_leave_with_it() {
+    let _resets = resets_shared();
     let subject = crate::types::Subject::default();
     let build = |scale: f64| {
         let mut m =
@@ -1169,6 +1209,7 @@ fn a_model_keys_its_plans_by_identity_and_they_leave_with_it() {
 /// key compares a descriptor's hash instead of its bytes.
 #[test]
 fn colliding_keys_are_told_apart_by_their_content() {
+    let _resets = resets_shared();
     COLLIDE.with(|c| c.set(true));
     let model =
         crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
@@ -1208,6 +1249,7 @@ fn colliding_keys_are_told_apart_by_their_content() {
 /// (live derivative `0.5/√x = 1`, curvature `−0.25/√x³ = −2`).
 #[test]
 fn sqrt_at_zero_is_flat_in_a_compiled_plan() {
+    let _resets = resets_shared();
     for x in [0.0, -0.0, -1e-18] {
         let (_, g, h) = derivs_of(&[x], 1, true, &|t| Some(vec![t[0].sqrt()])).unwrap();
         assert!(g[0][0] == 0.0 && h[0][0] == 0.0, "sqrt({x:e}): {g:?} {h:?}");
@@ -1222,6 +1264,7 @@ fn sqrt_at_zero_is_flat_in_a_compiled_plan() {
 /// call (so the tail of a plan's layouts never goes missing).
 #[test]
 fn resolved_kernels_are_shared_per_key_and_serve_past_the_slots() {
+    let _resets = resets_shared();
     begin();
     let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
     let y = vec![et[0] * et[1] + et[0]];
@@ -1283,6 +1326,7 @@ fn k_solve<T: PkNum>(e: &[T]) -> Vec<T> {
 
 #[test]
 fn the_linear_kernels_plan_values_are_the_native_bits() {
+    let _resets = resets_shared();
     type F = Box<dyn Fn(&[Tr]) -> Vec<Tr>>;
     type G = Box<dyn Fn(&[f64]) -> Vec<f64>>;
     let mut cases: Vec<(String, F, G)> = Vec::new();
@@ -1316,6 +1360,7 @@ fn the_linear_kernels_plan_values_are_the_native_bits() {
 /// and a dose list equal in all of them does not. Dies when any one leaves `subject_desc`.
 #[test]
 fn every_dose_field_a_recording_reads_keys_the_plan() {
+    let _resets = resets_shared();
     use crate::types::{DoseEvent, ImpliedDose, Subject};
     let base = || {
         let mut s = Subject::default();
@@ -1360,6 +1405,7 @@ fn every_dose_field_a_recording_reads_keys_the_plan() {
 /// goes back to an address, or to none.
 #[test]
 fn a_kept_forward_is_adopted_only_by_the_plan_that_made_it() {
+    let _resets = resets_shared();
     let (a, b) = (square_plan(), square_plan());
     assert!(a.chunky && b.chunky && a.layout == b.layout);
     assert_ne!(a.serial, b.serial, "serials are unique");
@@ -1393,16 +1439,19 @@ fn a_kept_forward_is_adopted_only_by_the_plan_that_made_it() {
 /// or when a compiled kernel's module is never freed.
 #[test]
 fn the_caches_shrink_when_a_model_drops() {
+    let _resets = resets_shared();
     let subject = crate::types::Subject::default();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let id = m.plan_id.get();
-    // A structure no other test records, so the counts below are this model's alone.
+    // A structure no other test records, so the counts below are this model's alone: templates
+    // are shared by shape, and `a_structure_other_than_the_template_is_recorded_afresh` records
+    // the 23-step chain this used to, so whichever ran first owned the template (#3041).
     let family =
         SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0xcac4_e5u64)).family();
     let rec = recorded(&family, || {
         let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
         let mut x = et[0];
-        for _ in 0..23 {
+        for _ in 0..37 {
             x = x * et[1] + et[0];
         }
         Some(vec![x.reg()])
@@ -1446,6 +1495,7 @@ fn the_caches_shrink_when_a_model_drops() {
 /// second `add` finds a plan again, on this thread and on another.
 #[test]
 fn a_bad_mark_outlives_the_cached_plan_and_a_late_add() {
+    let _resets = resets_shared();
     let subject = crate::types::Subject::default();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let key = SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0xbad_0001u64));
@@ -1472,6 +1522,7 @@ fn a_bad_mark_outlives_the_cached_plan_and_a_late_add() {
 /// kept forwards, or let `drop_model` clear them all -> the `kept_in` counts below.
 #[test]
 fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
+    let _resets = resets_shared();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let id = m.plan_id.get();
     let (a, b) = (vec![crate::types::Subject::default()], vec![crate::types::Subject::default()]);
@@ -1522,13 +1573,20 @@ fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
 
 /// `drop_model` frees the dropped model's unregistered kept forwards and no other model's
 /// (#2786 round 2, finding 10). Mutation: `clear_kept(|k| k.scope == 0)` in `drop_model` (the
-/// old `clear_kept(0)`) -> the second model's forward is gone.
+/// old `clear_kept(0)`) -> the dropped model's forward stays.
+///
+/// The entries sit under a scope of their own, not the unregistered scope 0: `reset()` clears
+/// scope 0, and another test calling it concurrently removed the second model's forward
+/// (~1 run in 20 of the ferx-model lib tests, #3041). `drop_model` clears by model, whatever
+/// the scope, so the property under test is unchanged.
 #[test]
 fn drop_model_clears_only_its_own_kept_forwards() {
+    let _resets = resets_shared();
     let (ma, mb) = (0x7a_0001u64, 0x7a_0002u64);
     let (oa, ob) = (0x7a_1001usize, 0x7a_1002usize);
+    let scope = 0x7a_5c0e_u64;
     let put = |o: usize, model: u64| {
-        kept_lock().insert(o, Kept { plan: 0, layout: l2(), buf: vec![0.0; 4], scope: 0, model });
+        kept_lock().insert(o, Kept { plan: 0, layout: l2(), buf: vec![0.0; 4], scope, model });
     };
     put(oa, ma);
     put(ob, mb);
@@ -1546,6 +1604,7 @@ fn drop_model_clears_only_its_own_kept_forwards() {
 /// Mutation: `.lock().unwrap()` in `kept_lock` -> the drop panics.
 #[test]
 fn a_poisoned_kept_table_does_not_panic_a_scope_drop() {
+    let _resets = resets_shared();
     let h = std::thread::spawn(|| {
         let _g = kept_table().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         panic!("poison the kept table");
@@ -1565,6 +1624,7 @@ fn a_poisoned_kept_table_does_not_panic_a_scope_drop() {
 /// not re-served; count `Repelled` -> the count is 1 after it.
 #[test]
 fn settling_a_failure_counts_a_point_declines_a_repelled_point_and_marks_a_model() {
+    let _resets = resets_shared();
     let new_model =
         || crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let subs = vec![crate::types::Subject::default()];
@@ -1606,6 +1666,7 @@ fn settling_a_failure_counts_a_point_declines_a_repelled_point_and_marks_a_model
 /// overflow row reads its finite-side scope.
 #[test]
 fn a_failure_at_an_overflowed_point_is_repelled_and_a_finite_one_keeps_its_scope() {
+    let _resets = resets_shared();
     let overflow = || Tr::eta(0, 800.0).exp();
     let fine = || Tr::eta(0, 1.0).exp();
     // A bailing predictor.
@@ -1651,6 +1712,7 @@ fn a_failure_at_an_overflowed_point_is_repelled_and_a_finite_one_keeps_its_scope
 /// instead of recording afresh -> `expect("records afresh")` fails.
 #[test]
 fn a_structure_other_than_the_template_is_recorded_afresh() {
+    let _resets = resets_shared();
     let subject = crate::types::Subject::default();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let family =
@@ -1708,6 +1770,7 @@ fn a_structure_other_than_the_template_is_recorded_afresh() {
 /// templates of the first structures stay kept.
 #[test]
 fn an_unstable_family_releases_its_templates() {
+    let _resets = resets_shared();
     let subject = crate::types::Subject::default();
     let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
     let family =
@@ -1767,6 +1830,7 @@ fn an_unstable_family_releases_its_templates() {
 /// `code` but not `n_regs` -> the registers differ.
 #[test]
 fn restoring_a_recording_undoes_everything_recorded_since() {
+    let _resets = resets_shared();
     begin();
     let x = Tr::eta(0, 0.7);
     let y = x * Tr::k(2.5);
@@ -1812,6 +1876,7 @@ fn restoring_a_recording_undoes_everything_recorded_since() {
 /// skip the restore -> the guard on the placeholder state stays and `guard` is `Some`.
 #[test]
 fn a_right_hand_side_not_affine_in_the_state_declines_without_a_trace() {
+    let _resets = resets_shared();
     begin();
     // `f = −u²` with a branch on the state: not affine, and the branch would guard the variable.
     let rhs = |u: &[Tr], _p: &[Tr], _t: Tr, f: &mut [Tr]| {
@@ -1839,6 +1904,7 @@ fn a_right_hand_side_not_affine_in_the_state_declines_without_a_trace() {
 /// right-hand side -> `recorded` is `Err`.
 #[test]
 fn a_non_affine_system_on_the_linear_method_is_integrated_by_the_plan() {
+    let _resets = resets_shared();
     fn solve<T: crate::sens::num::PkNum>(e0: T, e1: T) -> T {
         let k = |c: f64| T::from_f64(c);
         let p = [k(0.8) * e0.exp()];
@@ -1902,6 +1968,7 @@ fn a_non_affine_system_on_the_linear_method_is_integrated_by_the_plan() {
 /// wrong order (`3` for `4`) -> the value is `tetragamma`, not `pentagamma`.
 #[test]
 fn the_tangent_of_tetragamma_is_pentagamma() {
+    let _resets = resets_shared();
     use crate::stats::special::{pentagamma, tetragamma};
     let record_at = 1.7;
     begin();
@@ -1933,6 +2000,7 @@ fn the_tangent_of_tetragamma_is_pentagamma() {
 /// assertions fail.
 #[test]
 fn only_a_recording_with_a_segment_rule_or_a_plain_type_reaches_the_ode_driver() {
+    let _resets = resets_shared();
     use crate::sens::jet::DualT;
     use crate::sens::num::RecHooks;
     assert!(<Tr as RecHooks>::ODE_DRIVER_OK);
@@ -1949,6 +2017,7 @@ fn only_a_recording_with_a_segment_rule_or_a_plain_type_reaches_the_ode_driver()
 /// `Tr::ss_fixed_point` -> `end` is `Ok`.
 #[test]
 fn a_steady_state_call_the_recording_cannot_take_fails_the_recording() {
+    let _resets = resets_shared();
     use crate::sens::num::RecHooks;
     begin();
     let declines: &dyn Fn(&[Tr]) -> Option<Vec<Tr>> = &|_| None;
@@ -1967,6 +2036,7 @@ fn a_steady_state_call_the_recording_cannot_take_fails_the_recording() {
 /// functions fail.
 #[test]
 fn every_jet_function_is_the_same_in_a_plan_as_in_its_table() {
+    let _resets = resets_shared();
     use crate::sens::num::JetFn;
     for f in JetFn::ALL {
         for k in 0..=4u8 {
@@ -1989,6 +2059,7 @@ fn every_jet_function_is_the_same_in_a_plan_as_in_its_table() {
 /// -> the checks fail at the other point (or the function returned `None` under a recording).
 #[test]
 fn the_ss_affinity_self_check_holds_at_another_point() {
+    let _resets = resets_shared();
     let ii = 12.0;
     let f = |e: &[Tr]| {
         let k = (e[0] * Tr::k(0.2) - Tr::k(1.5)).exp();
@@ -2017,6 +2088,7 @@ fn the_ss_affinity_self_check_holds_at_another_point() {
 /// -> the assertion names the tier.
 #[test]
 fn every_native_plan_tier_probes_its_stack() {
+    let _resets = resets_shared();
     use cranelift_codegen::settings::ProbestackStrategy;
     for (quick, opt) in [(true, "none"), (true, "speed"), (false, "speed")] {
         let isa = plan_isa(quick, opt).expect("a host target");
@@ -2040,6 +2112,7 @@ fn every_native_plan_tier_probes_its_stack() {
 /// adjoints' tangents (or read the value lanes for them) shows on the second-order entries.
 #[test]
 fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
+    let _resets = resets_shared();
     let l1 = Layout { n: 2, m: 0, th: false, wide: false, tan: 0 };
     const K: usize = 2;
     let lt = Layout { tan: K as u8, ..l1 };
@@ -2117,6 +2190,7 @@ fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
 /// the matrix is symmetric.)
 #[test]
 fn derivs_hessians_match_closed_forms_on_several_live_inputs() {
+    let _resets = resets_shared();
     let x = [0.7f64, -1.3, 0.4];
     let f = |v: &[Tr]| -> Option<Vec<Tr>> {
         let (a, b, c) = (v[0], v[1], v[2]);
@@ -2156,6 +2230,7 @@ fn derivs_hessians_match_closed_forms_on_several_live_inputs() {
 /// (The stale drop in `get` is `the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get`.)
 #[test]
 fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
+    let _resets = resets_shared();
     let key = |s: usize| HotKey {
         model: 0x1000,
         subject: 0x40_0000 + s * 0x40,
@@ -2196,6 +2271,7 @@ fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
 /// slot `(h >> 20) & 4095`) → the collision count is 256 and the second `get` misses.
 #[test]
 fn the_variants_of_one_subject_hold_different_hot_slots() {
+    let _resets = resets_shared();
     let key = |s: usize, kind: u8, n_in: usize| HotKey {
         model: 0x1000,
         subject: 0x40_0000 + s * 0x40,
@@ -2226,6 +2302,7 @@ fn the_variants_of_one_subject_hold_different_hot_slots() {
 /// final `get` still serves the variants.
 #[test]
 fn the_hot_table_does_not_pin_released_variants() {
+    let _resets = resets_shared();
     let key = HotKey { model: 0x1000, subject: 0x40_0000, n: 1, n_in: 2, kind: 0, class: 0 };
     let stamp = HotStamp { prints: 1, gen: 7 };
     let a: Kernels = Arc::new(Variants::default());
@@ -2242,6 +2319,7 @@ fn the_hot_table_does_not_pin_released_variants() {
 /// the stamp. Mutation: drop `release_stale` from `get` → the `weak_count` rows fail.
 #[test]
 fn the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get() {
+    let _resets = resets_shared();
     let key = HotKey { model: 0x1000, subject: 0x40_0000, n: 1, n_in: 2, kind: 0, class: 0 };
     for (what, newer) in [
         ("generation", HotStamp { prints: 1, gen: 8 }),
@@ -2262,6 +2340,7 @@ fn the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get() {
 /// → the none/Some rows serve.
 #[test]
 fn the_hot_table_compares_the_layout_structure() {
+    let _resets = resets_shared();
     use crate::stats::stacked_layout::StackedLayout;
     let subject_with = |occasions: Vec<u32>| crate::types::Subject {
         obs_times: vec![1.0; occasions.len()],
@@ -2295,6 +2374,7 @@ fn the_hot_table_compares_the_layout_structure() {
 /// -> the product row and the repeat row both read `Point`.
 #[test]
 fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_scope() {
+    let _resets = resets_shared();
     use crate::sens::num::RecHooks;
     let square = |v: &[Tr]| <Tr as RecHooks>::mat_mul(v, v, 1).flatten().expect("records");
     let repeat = |x: f64, count: f64| {
@@ -2344,6 +2424,7 @@ fn an_overflowing_matrix_or_repeat_call_is_repelled_and_its_controls_keep_their_
 /// kernel (or program) named in the message keeps its slack.
 #[test]
 fn a_plans_kernels_keep_only_what_runs_them() {
+    let _resets = resets_shared();
     begin();
     let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
     let y = (et[0] * et[1]).exp() + et[0] * et[0];
@@ -2381,6 +2462,7 @@ fn a_plans_kernels_keep_only_what_runs_them() {
 /// forms — reports the guard as its result, and holds no run log or buffer afterwards.
 #[test]
 fn an_unkept_forward_writes_what_the_kept_one_does() {
+    let _resets = resets_shared();
     begin();
     let th: Vec<Tr> = (0..2).map(|j| Tr::theta(j, [2.0, 1.5][j])).collect();
     let a = th[0] * th[0];

@@ -147,7 +147,12 @@ pub(super) fn production_lines(text: &str) -> Vec<&str> {
             while j < lines.len() && lines[j].starts_with("#[") {
                 j += 1;
             }
-            if j < lines.len() && lines[j].starts_with("mod ") && lines[j].ends_with('{') {
+            let decl = lines.get(j).map(|l| {
+                l.trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub(super) ")
+                    .trim_start_matches("pub ")
+            });
+            if decl.is_some_and(|l| l.starts_with("mod ") && l.ends_with('{')) {
                 let mut k = j + 1;
                 while k < lines.len() && lines[k] != "}" {
                     k += 1;
@@ -171,7 +176,11 @@ pub(super) fn production_lines(text: &str) -> Vec<&str> {
 /// error-code registry check (#1051), so the two scans agree on what test code is.
 pub(super) fn production_files(root: &Path) -> Vec<(String, String)> {
     let mut files = Vec::new();
-    let mut stack = vec![root.join("src"), root.join("crates/ferx-model/src")];
+    // Both crates since #3041; a planted fixture tree has only `src/`.
+    let mut stack: Vec<_> = [root.join("src"), root.join("crates/ferx-model/src")]
+        .into_iter()
+        .filter(|d| d.is_dir())
+        .collect();
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read a src dir") {
             let path = entry.expect("a dir entry").path();
@@ -186,6 +195,8 @@ pub(super) fn production_files(root: &Path) -> Vec<(String, String)> {
             if !name.ends_with(".rs")
                 || name.ends_with("_tests.rs")
                 || name == "diagnostics_uncoded_sites.rs"
+                // Generated forwarders to items scanned (and listed) where they are defined.
+                || (name == "internal.rs" && dir.ends_with("ferx-model/src"))
             {
                 continue;
             }

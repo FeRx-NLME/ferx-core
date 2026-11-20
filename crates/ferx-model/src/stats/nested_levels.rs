@@ -160,7 +160,7 @@ impl KappaDraw {
     }
 
     /// The factor every κ draw multiplies by: the declared Ω_IOV's
-    /// [`crate::types::OmegaMatrix::sim_draw_factor`], so a zero κ draws exactly 0
+    /// `crate::types::OmegaMatrix::sim_draw_factor`, so a zero κ draws exactly 0
     /// (#1605). The only way to build a [`KappaFactor`], so no draw site can hand
     /// [`Self::draw`] the regularised `chol` instead (review r2 on #1082 PR4: under nested
     /// levels the NPDE reference cannot observe that difference, so a type has to).

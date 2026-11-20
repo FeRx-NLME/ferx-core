@@ -14,7 +14,7 @@
 //! The basis is the plan's η slots (every direction's `η′` moves them all) and the parameter
 //! slots some direction moves. Ω, σ outside an SDE's variance plan, and ρ never reach a plan
 //! but through η, so they cost a plan nothing. A θ that reaches every prediction only through
-//! exclusive mu lines `P = g⁻¹(μ(θ) + η)` ([`MuFold`]) moves the predictions as the η-direction
+//! exclusive mu lines `P = g⁻¹(μ(θ) + η)` (`MuFold`) moves the predictions as the η-direction
 //! `∂μ/∂θ` does, so it needs no axis either: the basis of a mu-referenced model's prediction
 //! plan is its η slots alone.
 

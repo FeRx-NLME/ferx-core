@@ -576,8 +576,6 @@ name = "ferx-model"
 version = "0.4.0"
 dependencies = [
  "approx",
- "argmin",
- "argmin-math",
  "cranelift-codegen",
  "cranelift-frontend",
  "cranelift-jit",
@@ -585,7 +583,6 @@ dependencies = [
  "cranelift-native",
  "csv",
  "nalgebra",
- "nlopt",
  "rand 0.10.3",
  "rand_distr",
  "rayon",
@@ -594,10 +591,8 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "sha2",
- "sobol",
  "tempfile",
  "thiserror",
- "zip",
 ]
 
 [[package]]

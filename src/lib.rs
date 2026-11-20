@@ -64,11 +64,11 @@ pub mod markov {
 pub(crate) use ferx_model::model_checks;
 pub mod model_selection;
 pub mod nn {
+    pub use ferx_model::nn::Activation;
     #[allow(unused_imports)]
     pub(crate) use ferx_model::nn::*;
-    pub use ferx_model::nn::{
-        Activation, CovariateMapper, CovariateNn, MlpMapper, NamedMlpMapper, NnError,
-    };
+    #[cfg(feature = "nn")]
+    pub use ferx_model::nn::{CovariateMapper, CovariateNn, MlpMapper, NamedMlpMapper, NnError};
     pub mod export {
         #[allow(unused_imports)]
         pub(crate) use ferx_model::nn::export::*;
@@ -79,6 +79,8 @@ pub mod nn {
 }
 pub(crate) use ferx_model::occasions;
 pub mod ode {
+    #[cfg(feature = "survival")]
+    pub use ferx_model::ode::ThresholdOutcome;
     #[allow(unused_imports)]
     pub(crate) use ferx_model::ode::*;
     pub use ferx_model::ode::{
@@ -87,16 +89,18 @@ pub mod ode {
         ode_predictions_with_solver_stats, ode_predictions_with_states, solve_ode, solve_ode_g,
         solve_ode_g_dense, solve_ode_g_with_stats, solve_ode_until_threshold, solve_ode_with_stats,
         OdeMethod, OdeOutputFn, OdeReadout, OdeRhsFn, OdeSolverOptions, OdeSolverStats, OdeSpec,
-        PerCmtReadout, SolPoint, SolPointG, ThresholdCrossing, ThresholdOutcome,
+        PerCmtReadout, SolPoint, SolPointG, ThresholdCrossing,
     };
     pub mod predictions {
+        #[cfg(feature = "survival")]
+        pub use ferx_model::ode::predictions::ThresholdOutcome;
         #[allow(unused_imports)]
         pub(crate) use ferx_model::ode::predictions::*;
         pub use ferx_model::ode::predictions::{
             ode_dense_solve_states, ode_predictions, ode_predictions_ekf_with_diffusion,
             ode_predictions_event_driven, ode_predictions_event_driven_with_states,
             ode_predictions_with_solver_stats, ode_predictions_with_states, OdeOutputFn,
-            OdeReadout, OdeSpec, PerCmtReadout, ThresholdOutcome,
+            OdeReadout, OdeSpec, PerCmtReadout,
         };
     }
     pub mod solver {
@@ -124,17 +128,93 @@ pub mod parser {
         pub(crate) use ferx_model::parser::covariate_model::*;
     }
     pub mod model_parser {
+        #[cfg(feature = "markov")]
+        pub use ferx_model::parser::model_parser::CtmmGeneratorProgram;
+        #[cfg(feature = "survival")]
+        pub use ferx_model::parser::model_parser::EndpointExprProgram;
         #[allow(unused_imports)]
         pub(crate) use ferx_model::parser::model_parser::*;
         pub use ferx_model::parser::model_parser::{
-            apply_fit_option, apply_method_option, expand_prior_from_fit, known_block_names,
-            parse_full_model, parse_full_model_bound, parse_full_model_file, parse_full_model_with,
-            parse_method_token, parse_model_file, parse_model_string, CtmmGeneratorProgram,
-            DataBindings, EndpointExprProgram, IndivParamPartials, IndivParamProgram, LevelBinding,
-            LevelBindings, LevelBlockDecl, LevelContrast, OdeOutputProgram, OdeRhsProgram,
-            ParseBindings, RuvMagDerivProgram, ScaleDerivProgram, ThetaBlocks,
-            NN_WEIGHT_DIRECT_REFERENCE_MARKER, ODE_INIT_REJECTED_BUILTINS, ODE_INIT_SCOPE_BUILTINS,
+            apply_fit_option, apply_method_option, known_block_names, parse_method_token,
+            DataBindings, IndivParamPartials, IndivParamProgram, LevelBinding, LevelBindings,
+            LevelBlockDecl, LevelContrast, OdeOutputProgram, OdeRhsProgram, ParseBindings,
+            RuvMagDerivProgram, ScaleDerivProgram, ThetaBlocks, NN_WEIGHT_DIRECT_REFERENCE_MARKER,
+            ODE_INIT_REJECTED_BUILTINS, ODE_INIT_SCOPE_BUILTINS,
         };
+        // The entry points that can reach `[priors] from_fit`: each installs the `.fitrx`
+        // reader, which lives here, before handing over to the parser (#3041).
+        /// Parse a model file (.ferx) and return a CompiledModel.
+        ///
+        /// Goes through [`parse_full_model_file`] rather than [`parse_model_string`] so
+        /// the relative-path rewrites that need the model file's directory —
+        /// `[data] path` and `[priors] from_fit` — apply here too. A caller that only
+        /// wants the `CompiledModel` still gets a `from_fit` resolved against the model,
+        /// not against the process's working directory.
+        pub fn parse_model_file(
+            path: &std::path::Path,
+        ) -> Result<ferx_model::types::CompiledModel, String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::parse_model_file(path)
+        }
+        /// Parse a full model file including simulation spec, initial values, and fit options.
+        pub fn parse_full_model_file(
+            path: &std::path::Path,
+        ) -> Result<ferx_model::types::ParsedModel, String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::parse_full_model_file(path)
+        }
+        /// Read `model.prior_from_fit` and turn it into ordinary
+        /// [`crate::types::ParameterPrior`]s on `model.priors` (#254 phase 2).
+        ///
+        /// Every parse entry point calls this, so a model that came from
+        /// [`parse_model_file`] / [`parse_model_string`] is already expanded and calling
+        /// it again is a no-op. It is public for the other producer of a
+        /// `CompiledModel` — a caller that builds one field by field (ferx-r) and sets
+        /// `prior_from_fit` itself has nothing to read the fit file for it, and
+        /// `PriorSet::build` refuses an unexpanded model rather than fitting it
+        /// unpenalized.
+        ///
+        /// A relative path resolves against the process's working directory; resolve it
+        /// yourself first if it should be relative to something else.
+        pub fn expand_prior_from_fit(
+            model: &mut ferx_model::types::CompiledModel,
+        ) -> Result<(), String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::expand_prior_from_fit(model)
+        }
+        /// Parse a model string and return a CompiledModel (backward compatible).
+        pub fn parse_model_string(
+            content: &str,
+        ) -> Result<ferx_model::types::CompiledModel, String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::parse_model_string(content)
+        }
+        /// Parse a full model string including all optional blocks.
+        pub fn parse_full_model(content: &str) -> Result<ferx_model::types::ParsedModel, String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::parse_full_model(content)
+        }
+        /// [`parse_full_model`] with the observed levels of every `theta NAME ~
+        /// NAME[COL, ...]` block supplied (#1064).
+        ///
+        /// A level block's level count is a property of the *data*, which the first
+        /// parse has not seen — so `levels::bind` reads the population, discovers
+        /// the observed combinations, and calls this. Re-parsing (milliseconds) is what
+        /// lets the compiled closures be built once, with the real θ count, instead of
+        /// being rebuilt in place after the fact.
+        pub fn parse_full_model_bound(
+            content: &str, level_bindings: &ferx_model::parser::model_parser::LevelBindings,
+        ) -> Result<ferx_model::types::ParsedModel, String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::parse_full_model_bound(content, level_bindings)
+        }
+        /// [`parse_full_model`] with every data-derived binding supplied.
+        pub fn parse_full_model_with(
+            content: &str, bindings: &ferx_model::parser::model_parser::ParseBindings,
+        ) -> Result<ferx_model::types::ParsedModel, String> {
+            crate::io::fitrx::install_fit_estimates_reader();
+            ferx_model::parser::model_parser::parse_full_model_with(content, bindings)
+        }
     }
 }
 pub mod pk {
@@ -281,7 +361,6 @@ pub mod sens {
         };
     }
 }
-pub(crate) use ferx_model::serde_nalgebra;
 pub mod sim;
 pub(crate) use ferx_model::sim_result;
 pub mod stats;
@@ -305,39 +384,46 @@ pub mod survival {
     }
 }
 pub mod types {
+    #[cfg(feature = "nn")]
+    pub use ferx_model::types::NeuralNetworkInfo;
     #[allow(unused_imports)]
     pub(crate) use ferx_model::types::*;
     pub use ferx_model::types::{
         classify_warning, framework_keys, method_specific_keys, omega_se_at,
         AbsorptionOdeEquivalent, AggFunction, AnalyticReadout, AnalyticalInit, BayesResult,
-        BicInputs, BloqMethod, CmtToggle, CompiledModel, CondDist, CountFamily, CountMeanScale,
-        CountParamFn, CovarianceFallback, CovarianceMethod, CovarianceStatus, CovariateDecl,
-        CovariateForm, CovariateKind, CovariateLevels, CovariateModelSpec, CovariateMuRef,
-        CovariateOp, CovariateRelation, CovariateRelationEstimate, CovariateRow, CovariateStat,
-        CovariateSummary, CovariateTable, CovariateTheta, CovariateThetaEstimate, DerivedContext,
-        DerivedEvalFn, DerivedExprSpec, DerivedFilterFn, DerivedKind, DiscreteObsDiagnostic,
-        DoseAttr, DoseAttrConsumption, DoseAttrMap, DoseEvent, EndpointError, EndpointLikelihood,
-        EndpointPredictionResult, ErrorModel, ErrorSelectFn, ErrorSelector, ErrorSpec,
-        EstimationMethod, EtaParamInfo, EtaParamType, EventType, ExclusionSummary, FitOptions,
-        FitResult, FitStatus, FremConfig, GeneratorFn, GradientMethod, HazardFamily, HazardParamFn,
-        HazardSpec, HeldAtBound, HeldReason, HessianAnchor, ImpmapTrace, ImpmapTraceRow,
-        ImportanceSamplingResult, IndivParamPartials, InfusionDef, InnerOptimizer, IntegralStep,
-        IntegralWindow, IovOccasionRule, KappaTreatment, KappaWeight, KappaWeightFn, LevelGroupEbe,
-        LevelKappaEbes, LinearPredictorFn, LinkFn, MixingExpr, MixtureClassOverride, MixtureMuRef,
-        MixtureOverrideParam, MixtureParams, MixtureSpec, ModelParameters, MstepOptimizer, MuRef,
-        MuTransform, NeuralNetworkInfo, ObsRecord, OmegaMatrix, Optimizer, ParameterKind,
-        ParameterPrior, ParameterScaling, ParsedModel, PkModel, PkParamFn, PkParams, PlanId,
-        Population, PopulationFingerprint, PosteriorSummary, Prediction, PriorSpread, PriorSummary,
-        RateMode, ResidualCorrelation, ResidualSerial, ResidualSerialKind, RtteClock, RuvMagFn,
+        BicInputs, BloqMethod, CmtToggle, CompiledModel, CondDist, CovarianceFallback,
+        CovarianceMethod, CovarianceStatus, CovariateDecl, CovariateForm, CovariateKind,
+        CovariateLevels, CovariateModelSpec, CovariateMuRef, CovariateOp, CovariateRelation,
+        CovariateRelationEstimate, CovariateRow, CovariateStat, CovariateSummary, CovariateTable,
+        CovariateTheta, CovariateThetaEstimate, DerivedContext, DerivedEvalFn, DerivedExprSpec,
+        DerivedFilterFn, DerivedKind, DiscreteObsDiagnostic, DoseAttr, DoseAttrConsumption,
+        DoseAttrMap, DoseEvent, EndpointError, EndpointPredictionResult, ErrorModel, ErrorSelectFn,
+        ErrorSelector, ErrorSpec, EstimationMethod, EtaParamInfo, EtaParamType, ExclusionSummary,
+        FitOptions, FitResult, FitStatus, FremConfig, GradientMethod, HeldAtBound, HeldReason,
+        HessianAnchor, ImpmapTrace, ImpmapTraceRow, ImportanceSamplingResult, IndivParamPartials,
+        InfusionDef, InnerOptimizer, IntegralStep, IntegralWindow, IovOccasionRule, KappaTreatment,
+        KappaWeight, KappaWeightFn, LevelGroupEbe, LevelKappaEbes, MixingExpr,
+        MixtureClassOverride, MixtureMuRef, MixtureOverrideParam, MixtureParams, MixtureSpec,
+        ModelParameters, MstepOptimizer, MuRef, MuTransform, ObsRecord, OmegaMatrix, Optimizer,
+        ParameterKind, ParameterPrior, ParameterScaling, ParsedModel, PkModel, PkParamFn, PkParams,
+        PlanId, Population, PopulationFingerprint, PosteriorSummary, Prediction, PriorSpread,
+        PriorSummary, RateMode, ResidualCorrelation, ResidualSerial, ResidualSerialKind, RuvMagFn,
         RuvMagnitude, SaemKernel, SaemMstepSolver, SaemObjective, SaemOfv, ScaleAdaptation,
         ScaleFn, ScalingSpec, SigmaType, SigmaVector, SimOutcome, SimulationSpec, SirScale,
-        StartRecord, StatusReason, Subject, SubjectResult, ThetaBlocks, ThetaTransform,
-        TransitionProbFn, TteObsDiagnostic, TteRecurrence, TvFn, ViEtaGrad, ViFamily, ViFinalOfv,
-        ViKl, ViOmegaUpdate, ViResult, ViSigmaUpdate, WarningCode, WarningEntry, WarningSeverity,
-        BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM, MAX_PK_PARAMS, PK_IDX_CL, PK_IDX_CV2, PK_IDX_F,
-        PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MAT, PK_IDX_MTT, PK_IDX_N, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V,
-        PK_IDX_V2, PK_IDX_V3,
+        StartRecord, StatusReason, Subject, SubjectResult, ThetaBlocks, ThetaTransform, TvFn,
+        ViEtaGrad, ViFamily, ViFinalOfv, ViKl, ViOmegaUpdate, ViResult, ViSigmaUpdate, WarningCode,
+        WarningEntry, WarningSeverity, BOBYQA_MAX_DIM, COV_HESSIAN_MAX_DIM, MAX_PK_PARAMS,
+        PK_IDX_CL, PK_IDX_CV2, PK_IDX_F, PK_IDX_KA, PK_IDX_LAGTIME, PK_IDX_MAT, PK_IDX_MTT,
+        PK_IDX_N, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
     };
+    #[cfg(feature = "survival")]
+    pub use ferx_model::types::{
+        CountFamily, CountMeanScale, CountParamFn, EndpointLikelihood, EventType, HazardFamily,
+        HazardParamFn, HazardSpec, LinearPredictorFn, LinkFn, RtteClock, TteObsDiagnostic,
+        TteRecurrence,
+    };
+    #[cfg(feature = "markov")]
+    pub use ferx_model::types::{GeneratorFn, TransitionProbFn};
 }
 
 // Deprecated in favour of `bind_from_fit` (#1619); kept for callers pinned to it.

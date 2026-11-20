@@ -3887,13 +3887,16 @@ fn pk_slot_rows_give_one_name_both_of_its_slots() {
 /// failure mode — rather than a loud test failure.
 #[test]
 fn pk_slot_rows_keeps_its_range_guard() {
-    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/types.rs"))
-        .expect("src/types.rs is valid UTF-8");
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/crates/ferx-model/src/types.rs"
+    ))
+    .expect("src/types.rs is valid UTF-8");
     let body = {
-        let start = src.find("pub fn pk_slot_rows(&self)").expect("pk_slot_rows must exist");
+        let start = src.find("fn pk_slot_rows(&self)").expect("pk_slot_rows must exist");
         let rest = &src[start..];
         let end = rest
-            .find("pub fn indiv_param_for_pk_slot")
+            .find("fn indiv_param_for_pk_slot")
             .expect("indiv_param_for_pk_slot follows pk_slot_rows");
         &rest[..end]
     };

@@ -9,6 +9,13 @@ use crate::types::Population;
 use ferx_model::io::fit_estimates::*;
 use nalgebra::DMatrix;
 
+/// The parser's reader with ferx-core's `.fitrx` reader installed, as every ferx-core parse
+/// entry point installs it (#3041). Shadows the glob import above.
+fn read_fit_estimates(path: &Path) -> Result<Vec<SourceEstimate>, String> {
+    crate::io::fitrx::install_fit_estimates_reader();
+    ferx_model::io::fit_estimates::read_fit_estimates(path)
+}
+
 /// Look one estimate up by kind and name.
 fn find<'a>(v: &'a [SourceEstimate], kind: EstimateKind, name: &str) -> &'a SourceEstimate {
     v.iter()

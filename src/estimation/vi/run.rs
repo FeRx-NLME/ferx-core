@@ -39,7 +39,7 @@ use crate::estimation::parameterization::{
 };
 use crate::types::{
     CompiledModel, FitOptions, ModelParameters, Population, ViFamily, ViFinalOfv, ViOmegaUpdate,
-    ViResult, ViSigmaUpdate,
+    ViSigmaUpdate,
 };
 
 use super::adam::{averaging_start, AdamConfig, AdamState, PolyakAverager};

@@ -488,7 +488,7 @@ pub fn detect_mu_refs(
         .collect()
 }
 
-/// [`detect_mu_refs`] plus the `[individual_parameters]` name owning each
+/// `detect_mu_refs` plus the `[individual_parameters]` name owning each
 /// mu-reference. `suggest_start` routes an NCA estimate to a θ through it; matching η
 /// names instead let `IIV_CL` on `S` capture `CL`'s θ (#1930).
 pub fn detect_mu_refs_with_owners(
@@ -718,7 +718,7 @@ pub fn detect_mixture_pattern(
 }
 
 /// Class-aware mu-references in `[individual_parameters]` (#996); top-level only, as
-/// [`detect_mu_refs`]. Non-log patterns are dropped (the closed-form shift is
+/// `detect_mu_refs`. Non-log patterns are dropped (the closed-form shift is
 /// log-scale only). The last assignment to an eta wins over *both* pattern kinds, so
 /// `MixtureSpec::mu_refs` and `CompiledModel::mu_refs` never name different anchors.
 pub fn detect_mixture_mu_refs(
@@ -1149,7 +1149,7 @@ thread_local! {
 }
 
 /// The local definitions a mu-reference scan substitutes into later right-hand
-/// sides ([`detect_mu_refs`], [`detect_covariate_mu_refs`]), in statement order.
+/// sides (`detect_mu_refs`, [`detect_covariate_mu_refs`]), in statement order.
 ///
 /// Read through the scope ([`Self::view`]), a name defined earlier is replaced by its
 /// own inlined body, through operators, calls and conditionals (not a gather index).
@@ -1424,11 +1424,11 @@ pub fn fold_branch_definitions(stmts: &[Statement]) -> Vec<(usize, String, Expre
     out
 }
 
-/// Typical values reading **two or more** thetas, which [`detect_mu_refs`] cannot
+/// Typical values reading **two or more** thetas, which `detect_mu_refs` cannot
 /// anchor (#619): `(TVCL + (CRCL-90)*TH_CRCL) * exp(ETA_CL)`, `TVCL * (WT/70)^TH_WT *
 /// exp(ETA_CL)`, `inv_logit(LOGIT_F + TH_SEX*SEX + ETA_F)`.
 ///
-/// Same statement walk and local-definition inlining as [`detect_mu_refs`], plus
+/// Same statement walk and local-definition inlining as `detect_mu_refs`, plus
 /// the locals an `if` / `else` assigns in every arm from data and literals
 /// ([`fold_branch_definitions`], #1422) — the usual way a renal-function
 /// covariate is written. The two scans run side by side and never edit each
@@ -1451,7 +1451,7 @@ pub fn fold_branch_definitions(stmts: &[Statement]) -> Vec<(usize, String, Expre
 ///
 /// The same walk notes every one-theta typical value of the same shapes
 /// ([`classify_single_anchor`]), and each group carries the ones on its own
-/// thetas as [`CovariateMuRef::colliding_anchors`] (#1630), so SAEM / IMP can
+/// thetas as `CovariateMuRef::colliding_anchors` (#1630), so SAEM / IMP can
 /// take such an anchor into the group's joint M-step instead of declining it.
 pub fn detect_covariate_mu_refs(
     stmts: &[Statement], theta_names: &[String], eta_names: &[String], n_bsv_eta: usize,
@@ -1631,7 +1631,7 @@ pub fn retire_superseded_groups_in<T>(found: &mut Vec<(usize, String, T)>, stmts
 
 /// Which group thetas reach the likelihood by a route **other** than the typical
 /// value that defines the group; decides whether the exact M-step engine
-/// ([`crate::estimation::covariate_mu_ref`]) is admissible. That engine drops the data
+/// (`crate::estimation::covariate_mu_ref`) is admissible. That engine drops the data
 /// term since freezing `φ_i` freezes the parameter; with `V = TVV + TH_X` beside
 /// `CL = (TVCL + TH_X*WT) * exp(ETA_CL)`, `TH_X` stays live and the group must go to
 /// the prior-plus-data engine.
@@ -1642,7 +1642,7 @@ pub fn retire_superseded_groups_in<T>(found: &mut Vec<(usize, String, T)>, stmts
 /// - taint **stops at the defining statement** (`owners`), not at every assignment to
 ///   its name: an earlier `CL = TH_X * 2` read by `Q` is live, and the defining
 ///   statement clears the name (#1632 review). With every group's statement in
-///   `owners` it answers the joint question ([`CovariateMuRef::read_outside_groups`],
+///   `owners` it answers the joint question (`CovariateMuRef::read_outside_groups`,
 ///   #1620);
 /// - θ is shared when another block (`[structural_model]`, `[odes]`, `[derived]`,
 ///   `[scaling]`, `[error_model]`) names θ or a tainted name.
@@ -1673,7 +1673,7 @@ pub fn retire_superseded_groups_in<T>(found: &mut Vec<(usize, String, T)>, stmts
 ///   it overwrites whatever the earlier one left there (#1632 review). Called
 ///   with every recorded group's statement in `owners`, it answers the same
 ///   question for a joint M-step that freezes all of their `φ_i` at once
-///   ([`CovariateMuRef::read_outside_groups`], #1620);
+///   (`CovariateMuRef::read_outside_groups`, #1620);
 /// - θ is shared when another block names θ itself or names any tainted name.
 ///   The [`OUTSIDE_READER_BLOCKS`] (`[structural_model]`, `[odes]`, `[error_model]`,
 ///   `[mixture]`, the endpoint blocks, …) are where an individual parameter
@@ -2024,7 +2024,7 @@ pub fn single_anchor_of<'a, V: RhsView<'a>>(
 /// the same shapes and the same admissible reads, with exactly **one** theta —
 /// `V2 = TVV2 * exp(ETA_V2)`, `V = TVV * WT/70 * exp(ETA_V)`. Recorded only so
 /// that a group reading that theta can take the anchor into its joint M-step
-/// (#1630, [`CovariateMuRef::colliding_anchors`]).
+/// (#1630, `CovariateMuRef::colliding_anchors`).
 pub fn classify_single_anchor<'a, V: RhsView<'a>>(
     expr: V, theta_names: &[String], eta_names: &[String], n_bsv_eta: usize,
 ) -> Option<(usize, CovariateMuRef)> {
@@ -2320,7 +2320,7 @@ pub fn split_sum_eta<'a, V: RhsView<'a>>(v: V) -> Option<(TypicalParts<V>, usize
 /// With `through_definitions` false a substituted local definition is kept
 /// whole, as one operand. That is what [`split_typical_and_eta`] wants: a
 /// definition is eta-free, so the eta's operand is never inside one, and
-/// flattening it would walk every path of a diamond. [`TypicalParts::build`]
+/// flattening it would walk every path of a diamond. `TypicalParts::build`
 /// keeps them whole too, each one line of its [`TypicalProgram`] (#1699).
 pub fn flatten_chain<'a, V: RhsView<'a>>(
     v: V, op: BinOp, through_definitions: bool, out: &mut Vec<V>,
@@ -2769,7 +2769,7 @@ pub fn indiv_var_deps(
         .collect()
 }
 
-/// Classify each top-level [individual_parameters] assignment and return
+/// Classify each top-level `individual_parameters` assignment and return
 /// `(eta_param_infos, theta_transforms)`.
 ///
 /// `theta_transforms` is indexed parallel to `theta_names`; `eta_param_infos`
@@ -2777,7 +2777,7 @@ pub fn indiv_var_deps(
 ///
 /// An ETA's scale is the one a kappa gets ([`classify_kappa_params`], #1656):
 /// where its leaf sits ([`leaf_scales`]), and for a leaf that only `+`/`-`
-/// separate from the root, the use of the assigned variable ([`ScaleWalk::root_scale`],
+/// separate from the root, the use of the assigned variable (`ScaleWalk::root_scale`,
 /// with `consumers` as the stop set). So `TVE0 + PLACEBO + ETA_E0 + KAPPA_ARM`
 /// is `Additive` like `THETA + ETA`. The whole-expression patterns
 /// ([`classify_expr`]) still run first: they name the linked θ and its
@@ -3170,7 +3170,7 @@ pub struct ScaleWalk<'a> {
 }
 
 /// Where one definition is **in force**, per branch path, as a walk over the
-/// later assignments in order (#1689): the rule [`ScaleWalk::root_scale`] and
+/// later assignments in order (#1689): the rule `ScaleWalk::root_scale` and
 /// [`unconditionally_replaced`] share, so the two cannot drift apart.
 ///
 /// A later assignment to the same variable ends the definition for every later
@@ -3339,8 +3339,8 @@ pub fn common_scale(seen: &[crate::types::EtaParamType]) -> crate::types::EtaPar
 }
 
 /// Blocks that read an `[individual_parameters]` variable **as a parameter**:
-/// the stop set of [`ScaleWalk::root_scale`] (#1662). Every entry of `BLOCK_REGISTRY` is in
-/// exactly one of this list and [`NON_PARAM_CONSUMER_BLOCKS`];
+/// the stop set of `ScaleWalk::root_scale` (#1662). Every entry of `BLOCK_REGISTRY` is in
+/// exactly one of this list and `NON_PARAM_CONSUMER_BLOCKS`;
 /// `every_block_is_sorted_into_param_consumer_or_not` pins the partition, so a
 /// new block cannot be added without deciding which.
 ///
@@ -3389,7 +3389,7 @@ pub const NON_PARAM_CONSUMER_BLOCKS: &[&str] = &[
 /// objective: every [`PARAM_CONSUMER_BLOCKS`] block, and the blocks that read θ, η, σ or
 /// those names directly. The source of `outside_idents`, the exclusivity checks' view of
 /// the rest of the model (#619, #2544, #2980). Every entry of `BLOCK_REGISTRY` is in
-/// exactly one of this list and [`NON_OUTSIDE_READER_BLOCKS`];
+/// exactly one of this list and `NON_OUTSIDE_READER_BLOCKS`;
 /// `every_block_is_sorted_into_outside_reader_or_not` pins the partition, so a new block
 /// cannot be added without deciding which (#3014 review).
 pub const OUTSIDE_READER_BLOCKS: &[&str] = &[
@@ -3489,7 +3489,7 @@ pub fn is_mixture_class_variance_line(line: &str) -> bool {
 /// the ETA patterns wherever those answer.
 ///
 /// A kappa that only `+`/`-` separate from the root of its assignment takes the
-/// scale of that assignment's **use** ([`ScaleWalk::root_scale`]): a variable a consuming
+/// scale of that assignment's **use** (`ScaleWalk::root_scale`): a variable a consuming
 /// block reads (`consumers`, see [`PARAM_CONSUMER_BLOCKS`]) or that nothing
 /// else reads is a parameter, and the kappa is `Additive` on it; an
 /// intermediate that later statements read (`IOVCL = KAPPA_CL`, then
@@ -3734,7 +3734,7 @@ pub fn lognormal_eta_chain_exact(
 
 /// Whether definition `def` is unconditionally replaced: every evaluation that
 /// runs it runs a later assignment to the same variable after it, by the
-/// in-force rule [`ScaleWalk::root_scale`] uses ([`InForce`], #1687 / #1689) —
+/// in-force rule `ScaleWalk::root_scale` uses ([`InForce`], #1687 / #1689) —
 /// a reassignment in the same or an enclosing scope, or an `if` with an `else`
 /// that reassigns in every branch. A reassignment in only some branches leaves
 /// `def` live on the other path, and one in the other branch of the `if`
@@ -3864,7 +3864,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// RAII guard for [`REFERENCED_THETAS`], restoring the previous list on drop so
+/// RAII guard for `REFERENCED_THETAS`, restoring the previous list on drop so
 /// a nested parse (the absorption ODE-equivalent source is compiled inside the
 /// primary parse) cannot leak its references into the enclosing model.
 pub struct ThetaRefScope(Vec<usize>);
@@ -7334,7 +7334,7 @@ pub fn parse_full_model_with(
 /// they cannot drift apart.
 pub const MAX_CMT_INDEX: usize = 255;
 
-/// Built-in sdtab column names that [derived] names must not clash with.
+/// Built-in sdtab column names that `derived` names must not clash with.
 pub const DERIVED_BUILTIN_NAMES: &[&str] = &[
     "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EPRED", "PWRES",
     "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD", "CENS", "OCC", "CMT",
@@ -10333,7 +10333,7 @@ pub fn mctmm_rate_texts(
     out
 }
 
-/// Build the [`EndpointLikelihood::Dtmm`](crate::types::EndpointLikelihood::Dtmm) endpoint
+/// Build the [`EndpointLikelihood::Dtmm`] endpoint
 /// of a `[markov_model] type = dtmm` block (#2473) from its resolved `transitions`
 /// (`(from, to, probability expression)`, already checked for unknown states,
 /// self-transitions and duplicates by [`parse_markov_model_block`]).
@@ -15252,7 +15252,7 @@ pub fn balanced_parens(s: &str, open: usize) -> Option<(String, usize)> {
 /// State name `X` if `line` is a `d/dt(X) = …` equation, else `None`.
 ///
 /// Whitespace-insensitive, matching the **token-based** `[odes]` statement
-/// parser ([`parse_statement`], which recognises `d/dt(NAME)` as the token
+/// parser (`parse_statement`, which recognises `d/dt(NAME)` as the token
 /// sequence `Ident("d") Slash Ident("dt") LParen Ident RParen` regardless of
 /// spacing — so `d/dt (central)` and `d / dt(central)` are valid state
 /// equations there). A literal `strip_prefix("d/dt(")` would diverge from that
@@ -15401,7 +15401,7 @@ pub fn split_args_on_commas(s: &str) -> Vec<&str> {
 }
 
 /// Built-in absorption input-rate functions recognised in `[odes]` RHS lines
-/// (design A), each with its [`InputRateKind`] and the **ordered** named
+/// (design A), each with its `InputRateKind` and the **ordered** named
 /// arguments it requires. Arguments are resolved to individual-parameter slots
 /// and stored in `arg_slots` in this order, so `src/pk/absorption.rs` reads them
 /// positionally. Each new model adds one row here in the PR that implements it
@@ -15417,7 +15417,7 @@ pub const INPUT_RATE_FNS: &[(&str, crate::pk::absorption::InputRateKind, &[&str]
 /// Extract built-in absorption input-rate calls ([`INPUT_RATE_FNS`] —
 /// `transit(...)`, `igd(...)`, `weibull(...)`, `zero_order(...)`) from the `[odes]`
 /// RHS lines. For each `d/dt(STATE) = … [FR*]fn(arg=P, …) …`, records an
-/// [`InputRateForcing`] (`cmt` ← STATE index; named args resolved to
+/// `InputRateForcing` (`cmt` ← STATE index; named args resolved to
 /// individual-parameter slots in declared order; an optional leading declared
 /// parameter `FR` resolved to `frac_slot`) and rewrites the `[FR*]fn(...)` span to
 /// `0` so the remaining RHS parses as a normal expression. A line may carry **more
@@ -15569,7 +15569,7 @@ pub fn extract_input_rate_terms(
 /// reason: without `survival` there is no `prescan_ode_hazards` and no
 /// reserved-name guard, so a user may legally declare a state called
 /// `__chz_1`, and a name-prefix filter would then silently exclude that user's
-/// own derivative from [`OdeRhsProgram::pk_reads_model_time`] (#1166).
+/// own derivative from `OdeRhsProgram::pk_reads_model_time` (#1166).
 pub fn build_ode_spec(
     lines: &[String], state_names: &[String], obs_cmt_name: Option<&str>,
     indiv_param_names: &[String], indiv_param_slots: &[usize], chz_state_slots: &[usize],
@@ -19239,7 +19239,7 @@ pub fn level_index_column(block: &str) -> String {
 }
 
 /// The CMTs of the per-record discrete-state endpoints whose expression reads the level
-/// index column `index`, sorted ([`LevelBlockDecl::record_cmts`], #2562). An endpoint's
+/// index column `index`, sorted (`LevelBlockDecl::record_cmts`, #2562). An endpoint's
 /// covariate list includes the columns reached through `[individual_parameters]`, so a
 /// block read through an individual parameter counts.
 #[cfg(feature = "survival")]
@@ -22645,7 +22645,7 @@ pub fn build_pk_param_fn(
             let mut p = PkParams::default();
             FERX_SCRATCH.with(|cell| {
                 let mut scratch = cell.borrow_mut();
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 let (mut hits_delta, mut misses_delta) = (0u64, 0u64);
                 let FerxThreadScratch { pk_cov, pk_vars, bc_stack, ip_key, ip_cache, .. } =
                     &mut *scratch;
@@ -22721,7 +22721,7 @@ pub fn build_pk_param_fn(
                                 .zip(ip_key.iter())
                                 .all(|(a, b)| a.to_bits() == b.to_bits());
                         if hit {
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "test-support"))]
                             {
                                 hits_delta += 1;
                             }
@@ -22729,7 +22729,7 @@ pub fn build_pk_param_fn(
                                 pk_vars[slot] = v;
                             }
                         } else {
-                            #[cfg(test)]
+                            #[cfg(any(test, feature = "test-support"))]
                             {
                                 misses_delta += 1;
                             }
@@ -22786,7 +22786,7 @@ pub fn build_pk_param_fn(
                         p.values[slot] = pk_vars[var_slot];
                     }
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 {
                     scratch.ip_hits += hits_delta;
                     scratch.ip_misses += misses_delta;
@@ -24894,7 +24894,7 @@ pub enum ProfileRouteBreak {
 /// Where a [`ProfileRouteBreak`] was found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileRouteSite {
-    /// A readout, by its label (`the \`y\` readout`, `` `[scaling] obs_scale` ``).
+    /// A readout, by its label (`the \`y\` readout`, `` ``scaling` obs_scale` ``).
     Readout(String),
     /// An `[individual_parameters]` assignment, by its left-hand side.
     Param(String),
@@ -26685,7 +26685,7 @@ pub fn readout_used_theta_eta(
 }
 
 /// The individual parameters whose own expression reads random effect `k`,
-/// sorted (see [`LevelBlockDecl::eta_readers`]), `if` branches included. Only
+/// sorted (see `LevelBlockDecl::eta_readers`), `if` branches included. Only
 /// direct reads count: a parameter that reads another one carrying the random
 /// effect is not listed.
 pub fn direct_eta_readers(stmts: &[Statement], k: usize) -> Vec<String> {
@@ -28185,7 +28185,7 @@ impl Bytecode {
     pub fn new() -> Self {
         Self { ops: Vec::new(), constants: Vec::new(), max_stack: 0, gathers: Vec::new() }
     }
-    fn push_const(&mut self, v: f64) {
+    pub(crate) fn push_const(&mut self, v: f64) {
         let idx = self.constants.len() as u32;
         self.constants.push(v);
         self.ops.push(Op::PushConst(idx));
@@ -28790,7 +28790,7 @@ pub fn apply_scalar_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, c: f64
 }
 
 /// Generic counterpart to [`eval_bytecode`] for the analytic-sensitivity path:
-/// the same `Bytecode`, evaluated over any [`PkNum`] `T` so a single program
+/// the same `Bytecode`, evaluated over any `PkNum` `T` so a single program
 /// serves both the scalar value (`T = f64`) and its exact PK-parameter
 /// derivatives (`T = Dual2<N>`). Only `vars` carries `T` — that slice holds the
 /// ODE state and individual parameters, the things seeded as dual variables.
@@ -29454,10 +29454,8 @@ pub fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
 
 /// Compiled ODE RHS program + var layout, exposed so the analytic-sensitivity
 /// provider can evaluate the same RHS over a dual type (issue #367, Option A).
-/// Carries exactly what the f64 `rhs` closure binds, so [`eval_rhs_g`]
+/// Carries exactly what the f64 `rhs` closure binds, so `eval_rhs_g`
 /// reproduces that binding but seeds the individual parameters as dual variables.
-///
-/// [`eval_rhs_g`]: OdeRhsProgram::eval_rhs_g
 ///
 /// `pub` only so it can appear in the (public) [`OdeSpec`](crate::ode::OdeSpec)
 /// field; all fields are private, so it is opaque outside the crate and can be
@@ -29492,7 +29490,7 @@ pub fn cond_reads_slots(c: &Condition, slots: &[usize]) -> bool {
 
 /// Whether the RHS statements read any of `slots` — scans both the compiled bytecode
 /// (`PushVar`) and any `if`-condition / fallback expressions. Used at construction to set
-/// [`OdeRhsProgram::uses_time_vars`].
+/// `OdeRhsProgram::uses_time_vars`.
 pub fn stmts_read_slots(stmts: &[Statement], slots: &[usize]) -> bool {
     stmts.iter().any(|s| match s {
         Statement::AssignBc(_, bc) | Statement::DiffEqBc(_, bc) => {
@@ -29602,7 +29600,7 @@ pub fn pk_block_statements(stmts: &[Statement], chz_state_slots: &[usize]) -> Ve
 /// `TIME` is **not** a variable slot: it resolves to `Op::PushTime` /
 /// [`Expression::Time`], read from the model-time thread-local at evaluation
 /// (only the `T`/`t` aliases use `time_slot`). So [`stmts_read_slots`] —
-/// and therefore [`OdeRhsProgram::uses_time_vars`] — structurally cannot see it,
+/// and therefore `OdeRhsProgram::uses_time_vars` — structurally cannot see it,
 /// and reports `false` for a `TIME`-reading RHS. Callers that must reject *any*
 /// model-time dependence need this walk as well (#1124).
 pub fn expr_reads_time_builtin(e: &Expression) -> bool {
@@ -30212,12 +30210,12 @@ pub fn cond_reads_defined(c: &Condition, defined: &[bool]) -> bool {
 }
 
 /// `eval_bytecode` (the scalar VM the f64 RHS closure uses) in the shape
-/// [`RhsHoist::refresh`] takes.
+/// `RhsHoist::refresh` takes.
 pub fn rhs_lift_eval_f64(bc: &Bytecode, vars: &[f64], stack: &mut Vec<f64>) -> f64 {
     eval_bytecode(bc, &[], &[], &[], vars, &[], stack)
 }
 
-/// `eval_bytecode_g` in the shape [`RhsHoist::refresh`] takes.
+/// `eval_bytecode_g` in the shape `RhsHoist::refresh` takes.
 pub fn rhs_lift_eval_g<T: crate::sens::num::vm::VmNum>(
     bc: &Bytecode, vars: &[T], stack: &mut Vec<T>,
 ) -> T {
@@ -30416,7 +30414,7 @@ impl BoundMain {
     }
 }
 
-/// The exact Jacobian of the `f64` RHS in one native call ([`OdeRhsProgram::native_jacobian`]):
+/// The exact Jacobian of the `f64` RHS in one native call (`OdeRhsProgram::native_jacobian`):
 /// the program's forward tangents along every state, and along the clock when `clock`.
 pub struct NativeJacobian<'a> {
     tan: rhs_regcode::NativeTan<'a>,
@@ -31258,7 +31256,7 @@ pub fn compute_cov_static_mask(stmts: &[Statement], n_vars: usize) -> Vec<bool> 
 /// value changes with the `TIME` built-in, directly or through another slot that
 /// does (#1853). The `[individual_parameters]` analogue of
 /// [`compute_cov_static_mask`], and the per-parameter refinement of
-/// [`IndivParamProgram::uses_time_builtin`], which is one flag for the whole block.
+/// `IndivParamProgram::uses_time_builtin`, which is one flag for the whole block.
 ///
 /// `TIME` is the only time axis this block has: `T`, `TAD` and `TAFD` are ordinary
 /// covariates outside `[odes]` (see [`ODE_INIT_SCOPE_BUILTINS`]), and a covariate that

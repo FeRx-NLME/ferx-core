@@ -90,7 +90,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The working vectors of [`MlpMapper::backprop`]: the running adjoint `da_l` (the seed on
+/// The working vectors of `MlpMapper::backprop`: the running adjoint `da_l` (the seed on
 /// entry) and `dz_l`.
 #[derive(Default)]
 pub struct Backprop {
@@ -1201,7 +1201,7 @@ impl CurvatureGrid {
     }
 
     /// The `(x−h, x, x+h)` stencils the penalty evaluates, materialised.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     fn triples(&self) -> Vec<[Vec<f64>; 3]> {
         self.axes
             .iter()
@@ -1232,7 +1232,7 @@ pub fn median_of_sorted(sorted: &[f64]) -> f64 {
 
 /// Collect the observed values of each of a mapper's named inputs across the population, in the
 /// mapper's input order and **normalised the way the mapper feeds them to its MLP**
-/// (`(x − center) / scale`, [`NamedMlpMapper::normalize`]), so the grid lives in the space the fit
+/// (`(x − center) / scale`, `NamedMlpMapper::normalize`), so the grid lives in the space the fit
 /// evaluates the network in. Missing covariates are skipped; a subject's `NaN` placeholder for a
 /// column it has no finite value in passes through and is dropped by [`CurvatureGrid::build`].
 ///
@@ -1361,7 +1361,7 @@ impl NnRegularizer {
     /// Add the penalty's Hessian contributions through `add(i, j, v)` at packed
     /// coordinates: exact `2·λ_l2` on the weight diagonal for L2, and the
     /// Gauss–Newton `2·λ_smooth·Σ ∂C/∂w ∂C/∂wᵀ` for the curvature term (see
-    /// [`MlpMapper::curvature_penalty_accum`]). Storage-agnostic so the
+    /// `MlpMapper::curvature_penalty_accum`). Storage-agnostic so the
     /// trust-region `Vec<Vec<f64>>` and the Gauss–Newton `DMatrix` both feed
     /// from it. No-op when inactive.
     pub fn add_packed_hessian(&self, theta: &[f64], add: &mut dyn FnMut(usize, usize, f64)) {

@@ -11,13 +11,13 @@
 //! That one form serves two consumers:
 //!
 //! - **the native code** (`super::jit`) lowers it to Cranelift, one instruction each;
-//! - **the reverse pass** ([`reverse`]) is its mechanical adjoint: the forward
+//! - **the reverse pass** (`reverse`) is its mechanical adjoint: the forward
 //!   instructions, then their local derivatives in reverse order, accumulating into the
 //!   inputs' adjoints. Because the form is scalar, one transform differentiates every
 //!   layout — `f64`, first-order duals, second-order payloads — with no per-type rules.
 //!
 //! **The forward instructions are each dual type's own arithmetic, in its own order** (see
-//! [`Lanes`]): the operand association, `0 − g` for a reversed subtraction, `ib = 1/b`
+//! `Lanes`): the operand association, `0 − g` for a reversed subtraction, `ib = 1/b`
 //! computed once, the out-of-line duals' full product for a constant operand. Lowered
 //! without contraction or folding, the native code is bit for bit the register code.
 //!
@@ -28,7 +28,7 @@
 //! overflow) that the select discards — but a reverse pass that merely sent it a zero adjoint
 //! would still multiply that zero by its values (`0·∞ = NaN`) into the inputs' adjoints. So
 //! every instruction an arm emits carries the condition under which it is live
-//! ([`Func::live`]), and the reverse pass selects each of its local derivatives against that
+//! (`Func::live`), and the reverse pass selects each of its local derivatives against that
 //! condition: a dead arm contributes an exact zero, whatever it computed.
 use super::{Arith, Flat, Unary};
 
@@ -308,10 +308,10 @@ pub enum Inst {
     /// `cond ? a : b`.
     Select(V, V, V),
     /// Its operand's value, with no derivative: the identity forward, no adjoint in
-    /// [`reverse`] (`PkNum::value_only`). Not the operand itself: a reverse pass through
+    /// `reverse` (`PkNum::value_only`). Not the operand itself: a reverse pass through
     /// `d − value_only(d)` would otherwise cancel `d`'s own derivative.
     StopGrad(V),
-    /// A host call ([`host`]): queue an argument, run, read output `k`.
+    /// A host call (`host`): queue an argument, run, read output `k`.
     HostArg(V),
     Host(crate::sens::num::HostFn),
     HostOut(u32),

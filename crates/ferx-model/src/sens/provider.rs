@@ -448,7 +448,7 @@ pub fn apply_closed_form_readout_g<'p, T: crate::sens::num::vm::VmNum>(
 
 /// The oral depot amount at every observation (`pk::analytical_state_at_times`, slot 0) over
 /// the recording's number type: the superposed `F·amt·e^{−ka·τ}` of every bolus into the
-/// depot (an infusion bypasses it), `τ` the lagged elapsed time of [`lagged_elapsed`], an SS
+/// depot (an infusion bypasses it), `τ` the lagged elapsed time of `lagged_elapsed`, an SS
 /// bolus scaled by the steady-state factor, floored at zero — all at the **one** snapshot
 /// `pk` production reads it from (the subject-static `t = 0` parameters of the occasion), so
 /// on a time-varying-covariate subject it is not the per-observation snapshot the readout's own

@@ -1,7 +1,7 @@
 //! Structured diagnostics for model validation.
 //!
 //! [`Diagnostic`] is the shared currency between the validation logic in
-//! [`crate::api`] / [`crate::parser`] and the `ferx check` CLI command. It
+//! `crate::api` / [`crate::parser`] and the `ferx check` CLI command. It
 //! replaces (well, wraps) the historical free-text `Result<_, String>` errors
 //! with a machine-readable shape — a stable `code`, the owning block, a
 //! block-level `line`, and an optional `suggestion` — so external callers
@@ -450,9 +450,9 @@ pub fn first_error(diagnostics: &[Diagnostic]) -> Result<(), EngineError> {
 }
 
 /// The error an entry point (`predict*`, `simulate*`, `compute_npde_npd`,
-/// [`crate::run_sir`], [`crate::run_covariance`], `inits_from_nca` since #1746; [`crate::fit`]
-/// and the file entry points built on it — [`crate::fit_from_files`],
-/// [`crate::prepare_run`], [`crate::run_model_with_data`], [`crate::run_model_simulate`]
+/// `crate::run_sir`, `crate::run_covariance`, `inits_from_nca` since #1746; `crate::fit`
+/// and the file entry points built on it — `crate::fit_from_files`,
+/// `crate::prepare_run`, `crate::run_model_with_data`, `crate::run_model_simulate`
 /// and their variants — since #1772) returns when it refuses its input or fails.
 ///
 /// When `ferx check` reports the same refusal with a code, the error carries that

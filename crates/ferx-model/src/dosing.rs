@@ -373,7 +373,7 @@ impl SsStopTracker {
 }
 
 /// Absolute L∞ change `max|cur − prev|` between SS cycles (#867); see
-/// [`SsStopTracker::abs_increments`].
+/// `SsStopTracker::abs_increments`.
 pub fn ss_abs_increment(cur: &[f64], prev: &[f64]) -> f64 {
     cur.iter().zip(prev).fold(0.0_f64, |m, (&a, &b)| m.max((a - b).abs()))
 }
@@ -1128,7 +1128,7 @@ pub const TAD_EPS: f64 = 1e-12;
 /// `(t_dose = 120, ALAG = 3, II = 12, t = 121)`, returning `-2.0`, `NaN` and `+1.0`. The
 /// referent is a property of a dose, not of an engine, so it is stated once.
 ///
-/// **[`crate::types::Subject::data_tad`] is deliberately not folded in** (#1182/#1273). It
+/// **`crate::types::Subject::data_tad` is deliberately not folded in** (#1182/#1273). It
 /// answers a different question — what the *dataset* says `TAD` is, before any model, with no
 /// lagtime at all and a `same_time_counts` switch between NONMEM's record order and Pharmpy's
 /// `get_doseid` grouping. Being lag-free, the pre-arrival window this function exists for is
@@ -1220,7 +1220,7 @@ pub fn wrap_into_period_g<G: crate::sens::num::PkNum>(x: G, ii: f64) -> G {
 /// around it — `fold(NEG_INFINITY, f64::max)`, then `is_finite`, then `NaN` — was written out
 /// beside it too. `api::output_columns::tad_at_time` is its caller. (`io::output`'s sdtab
 /// fallback was a third copy when #1126 was written; #1273 moved that call site to
-/// [`crate::types::Subject::data_tad`] instead, for the tie rule described on
+/// `crate::types::Subject::data_tad` instead, for the tie rule described on
 /// [`tad_referent`], so it is not one of ours.)
 ///
 /// `dose_lagtimes` may be **shorter than `doses`, including empty**; a missing entry is zero

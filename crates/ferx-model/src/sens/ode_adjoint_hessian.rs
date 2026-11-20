@@ -12,10 +12,10 @@
 //! response never appears: the Hessian is the second derivative of one scalar along the
 //! mode's tangent directions `u_a = (e_a, η′e_a)`.
 //!
-//! Everything comes from one primitive, the subject's **covariance plan** ([`CovPlan`]): the
+//! Everything comes from one primitive, the subject's **covariance plan** (`CovPlan`): the
 //! objective `F` (FOCE, FOCEI, or the AGQ marginal under either anchor) and `g`, through the
 //! same recorders and kernel as the gradient, recorded once on the recording type with every
-//! packed coordinate, η (and, under [`NnReduction`], the networks' raw outputs) an input slot
+//! packed coordinate, η (and, under `NnReduction`, the networks' raw outputs) an input slot
 //! (#2786). The predictions carry an inner η-dual over the recording type, so `G` (and under
 //! the exact anchor `Q`) are values the kernel reads.
 //!
@@ -26,7 +26,7 @@
 //!   one forward-over-reverse sweep seeded with `Ψ_w` on the value lanes give, on the
 //!   adjoints' tangent lanes, their Hessian columns `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted
 //!   with every `u_b` (`psi_along`). A structured subject ([`st`]) takes one pass of every
-//!   direction; the recorded kernel one pass per direction ([`pass_width`], #2980).
+//!   direction; the recorded kernel one pass per direction (`pass_width`, #2980).
 //!
 //! There are no third-order sensitivity tables and no finite differences, and FOCE's
 //! frozen-variance mode (whose `R⁰` moves with θ through `f(η = 0)`) is just another term
@@ -323,7 +323,7 @@ fn hessian_with(
         let plan =
             CovPlan::new(&ctx, sc, subject, template, x, objective, &so, Some(red.z.as_slice()));
         if let Some(h) = red.hessian(model, &plan, template, x, sc.width, sel) {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             NN_REDUCED_HITS.with(|c| c.set(c.get() + 1));
             return Some(h);
         }
@@ -465,9 +465,9 @@ thread_local! {
 
 #[cfg(feature = "nn")]
 fn nn_reduce_off() -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     return NN_REDUCE_OFF.with(std::cell::Cell::get);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     false
 }
 

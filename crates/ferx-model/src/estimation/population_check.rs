@@ -235,17 +235,17 @@ pub fn sir_df_in_domain(field: &'static str, v: f64) -> Result<(), OutOfDomain> 
 /// The [`FitOptions`] of the stage that produced a fit's estimates (and ran its inline
 /// covariance step), as one record (#426): every
 /// option a post-hoc step reads when it reconverges the EBEs and re-scores the objective
-/// at the fit's estimates. Carried on [`FitResult::scoring_settings`] (the stage that
+/// at the fit's estimates. Carried on `FitResult::scoring_settings` (the stage that
 /// produced the estimates) and inside [`SirSettings`](crate::estimation::sir_settings::SirSettings)
-/// (the options SIR's draws were scored under), so [`run_covariance`](crate::run_covariance)
-/// and [`run_sir`](crate::run_sir) with default options score what the fit scored.
+/// (the options SIR's draws were scored under), so `run_covariance`
+/// and `run_sir` with default options score what the fit scored.
 ///
 /// The settings that decide how a post-hoc step reconverges the EBEs and evaluates the
 /// objective at the fit's estimates. `gradient_method` is here too (#1835): it is the inner
 /// η-gradient route, and it also gates the covariance R-matrix, because `gradient = fd` is
 /// one flag (#1613) — the covariance step must not build an R-matrix from the `Dual2` jets
 /// the fit refused. `method` and `interaction` are not here: they ride on the fit
-/// itself ([`FitResult::method`], [`FitResult::interaction`]). Nor are the settings that
+/// itself (`FitResult::method`, `FitResult::interaction`). Nor are the settings that
 /// define the covariance *step* rather than the objective it differentiates
 /// (`covariance_method`, `fd_hessian_step`, `analytic_cov_hessian`, `cov_inner_tol`;
 /// the Hessian anchor follows the fit's method): those say what the caller asks `run_covariance` to compute, and stay

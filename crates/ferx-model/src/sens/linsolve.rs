@@ -17,7 +17,7 @@ use crate::sens::num::PkNum;
 /// Gaussian elimination, returning `x` (length `n`) or `None` when the value-part matrix is
 /// singular to a scaled pivot tolerance.
 ///
-/// Pivoting branches on the **value part** ([`PkNum::val`]) only, so the elimination sequence
+/// Pivoting branches on the **value part** (`PkNum::val`) only, so the elimination sequence
 /// is identical to the `f64` solve of `A.val()`; the dual jets then propagate through the same
 /// `× ÷ −` operations, giving the exact derivative (and 2nd order) of the solution. On a
 /// singular value-part matrix the caller falls back to the iterative equilibration, mirroring
@@ -100,7 +100,7 @@ pub fn skips_zeros<T: PkNum>() -> bool {
 /// back-solve it once per stage, which is the whole cost argument for a linearly-implicit
 /// method over a Newton-iterating one.
 ///
-/// Pivoting branches on [`PkNum::val`] only — see the module note; a dual-part comparison
+/// Pivoting branches on `PkNum::val` only — see the module note; a dual-part comparison
 /// would make the elimination order differ between the `f64` and `Dual2` runs and silently
 /// desynchronise the sensitivities from the prediction.
 // `col` indexes `m`, `piv` and the elimination bounds together; iterating `piv` would hide
@@ -257,7 +257,7 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> bool {
 
 /// The pivot storage [`lu_factor_in_place_g`] needs for `T`: the pivot rows, and for a
 /// recording type (#2786) also the values' LU and the matrix itself
-/// (`[pivots (n) | LU (n²) | A (n²)]`, [`lu_factor_recorded`]).
+/// (`[pivots (n) | LU (n²) | A (n²)]`, `lu_factor_recorded`).
 pub fn lu_piv_len<T: PkNum>(n: usize) -> usize {
     if T::RECORDS_BRANCHES {
         n + 2 * n * n

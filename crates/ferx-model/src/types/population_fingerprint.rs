@@ -28,7 +28,7 @@ use sha2::{Digest, Sha256};
 use super::EventType;
 use super::{DoseEvent, InfusionDef, ObsRecord, Population, RateMode, Subject};
 
-/// The encoding version. Bump it whenever what [`PopulationFingerprint::of`]
+/// The encoding version. Bump it whenever what `PopulationFingerprint::of`
 /// hashes, or how, changes — including when the reader starts building a different
 /// `Subject` from the same file, since a fingerprint stored before the change would
 /// otherwise read as a population mismatch on a file that did not change.

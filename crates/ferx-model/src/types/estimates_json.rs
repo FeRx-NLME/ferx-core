@@ -91,7 +91,7 @@ impl Value {
 /// scalar may contain `[`, `]`, `=` and `,` as long as it does not *start* with an
 /// indicator, so it stays bare. What is quoted is anything that would change the
 /// document's shape: a leading indicator or space, `: ` or ` #` inside, a trailing `:`
-/// or space, or a control character ([`needs_quotes_in_block`]). In a flow sequence
+/// or space, or a control character (`needs_quotes_in_block`). In a flow sequence
 /// (`[a, b]`) more characters are structural — use [`yaml_flow_name`] there (#3006).
 pub fn yaml_name(name: &str, always: bool) -> String {
     if always || needs_quotes_in_block(name) {

@@ -3,7 +3,7 @@
 //!
 //! This is the input side of `[priors] from_fit = "…"`: the model-updating path
 //! where a published or previously-run model becomes the prior for a fit on new,
-//! sparse data. The caller ([`crate::estimation::priors`]) turns each estimate
+//! sparse data. The caller (`crate::estimation::priors`) turns each estimate
 //! into `prior(value, rse = se/value)` — exactly the object a user would have
 //! typed by hand off the source run's parameter table.
 //!
@@ -25,7 +25,7 @@
 //!
 //! | Extension | Reader | Precision |
 //! |---|---|---|
-//! | `.fitrx` | [`crate::io::fitrx::load_fit`] | exact |
+//! | `.fitrx` | `crate::io::fitrx::load_fit` | exact |
 //! | `.json` | serde, via [`FitResult`]'s own derives | exact |
 //! | `.yaml` / `.yml` | [`parse_estimates_yaml`] | 6 decimals |
 //!

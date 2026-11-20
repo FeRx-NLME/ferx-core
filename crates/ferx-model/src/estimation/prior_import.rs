@@ -84,7 +84,7 @@ impl PriorScale {
 ///
 /// # Why this runs once, at parse time
 ///
-/// The file read used to sit in [`PriorSet::build`], which every estimation
+/// The file read used to sit in `PriorSet::build`, which every estimation
 /// stage and the covariance and SIR steps call. That was wrong twice over
 /// (review of #1363): `build_prior_set` turns a build error into an *empty* set,
 /// and `run_covariance` / `run_sir` are public entry points that do not run
@@ -308,7 +308,7 @@ pub struct CoordInfo {
     pub rejection: Option<String>,
 }
 
-/// Describe every packed coordinate, in [`pack_params`] order.
+/// Describe every packed coordinate, in `pack_params` order.
 ///
 /// This is the one place the packed layout is walked for priors. The Ω / Ω_IOV
 /// segments are walked with [`lower_tri_iter`] rather than by offset arithmetic,

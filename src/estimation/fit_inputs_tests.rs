@@ -14,6 +14,7 @@ use super::*;
 use crate::estimation::run_covariance::run_covariance;
 use crate::estimation::run_sir::run_sir;
 use crate::types::CovarianceStatus;
+use crate::types::{GradientMethod, InnerOptimizer};
 
 // #1813: the source sentences say how the population was obtained and nothing
 // else; the remedy is the suggestion, the same in every cell.

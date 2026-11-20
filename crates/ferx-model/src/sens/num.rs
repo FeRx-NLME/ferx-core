@@ -608,7 +608,7 @@ pub trait RecHooks: Sized {
     where
         Self: PkNum;
     /// The value, for a decision the code takes on it — a discrete outcome of a
-    /// [`host`](Self::host) analysis. A recording type checks it comes out the same on every
+    /// `host` analysis. A recording type checks it comes out the same on every
     /// evaluation.
     fn br_value(self) -> f64
     where

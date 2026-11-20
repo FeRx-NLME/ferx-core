@@ -4,7 +4,7 @@
 use crate::pk;
 use crate::types::*;
 
-/// [`cacheable_schedule`] for an IOV subject (#1564): its staleness rules alone, without
+/// `cacheable_schedule` for an IOV subject (#1564): its staleness rules alone, without
 /// the routing arm. An IOV subject on an event-driven model always walks the event-driven
 /// funnel (`pk::predict_iov_in`), which otherwise rebuilt and re-sorted the schedule inside
 /// every objective evaluation of the EBE search (10.6% of a `warfarin_iov` fit).
@@ -27,7 +27,7 @@ pub fn cacheable_schedule_iov_cached(
     )
 }
 
-/// The staleness rules of [`cacheable_schedule`], the one place they live, so the IOV
+/// The staleness rules of `cacheable_schedule`, the one place they live, so the IOV
 /// gate ([`cacheable_schedule_iov`]) and the routed one cannot drift: an analytical,
 /// event-driven, non-algebraic model, with no lagtime and no `F` reshaping a rate-defined
 /// infusion's window.
@@ -83,14 +83,14 @@ pub fn subject_has_survival_records(subject: &Subject) -> bool {
     }
 }
 
-/// Whether [`analytic_eta_nll_gradient_with_schedule`] serves **every** non-Gaussian term
+/// Whether `analytic_eta_nll_gradient_with_schedule` serves **every** non-Gaussian term
 /// `subject` carries: none at all, or only CTMM state records and `[binary_model]` records
 /// whose exact programs cover them.
 ///
 /// That function asks this itself and declines (`None` → FD) when the answer is no, since
 /// for a subject with no Gaussian rows it returns the Ω prior plus the served non-Gaussian
 /// blocks and nothing else. The inner loop also asks up front, through
-/// [`analytic_inner_grad_supported`], so its route report matches what runs.
+/// `analytic_inner_grad_supported`, so its route report matches what runs.
 pub fn non_gaussian_eta_grad_served(model: &CompiledModel, subject: &Subject) -> bool {
     !subject_has_survival_records(subject) || non_gaussian_records_fully_analytic(model, subject)
 }
@@ -237,7 +237,7 @@ pub fn analytic_inner_common_bail(model: &CompiledModel) -> bool {
     // live in the shared, provider-agnostic gradient.
 }
 
-/// Model-level half of [`analytic_inner_grad_supported`]: every gate that does
+/// Model-level half of `analytic_inner_grad_supported`: every gate that does
 /// not depend on the subject. `build_info::gradient_method_inner` reports the
 /// inner route off **this same** predicate, so the reported `gradient_method_inner`
 /// cannot drift from what `find_ebe` actually runs (PR #381 review #9).
@@ -302,7 +302,7 @@ pub fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool {
 /// Whether the inner (per-subject EBE) loop reports an **analytic** gradient at the model
 /// level: [`analytic_inner_grad_supported_model`], the unified recorder's scope behind the
 /// shared escape hatches. **Single source of truth** for `build_info::gradient_method_inner`
-/// and [`fd_fallback_warning`]'s whole-population-FD guard, so the persisted label and the
+/// and `fd_fallback_warning`'s whole-population-FD guard, so the persisted label and the
 /// reconciling warning cannot drift. Best-case and model-level: a per-subject FD fallback is
 /// reported by `fd_fallback_warning`.
 pub fn inner_reports_analytic_model(model: &CompiledModel) -> bool {

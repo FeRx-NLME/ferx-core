@@ -38,6 +38,7 @@ ferx-core/                       # repo root = ferx-core package + workspace roo
 ├─ src/                          # the engine
 ├─ api/ferx-core-public-api.txt  # public-API baseline, diffed in CI
 └─ crates/
+   ├─ ferx-model/                # the model/numerics layer; ferx-core re-exports it (#3041)
    ├─ ferx-tools/                # depends on ferx-core
    ├─ ferx-cli/                  # depends on ferx-core; [[bin]] name = "ferx"
    ├─ docs-lint/                 # dev tooling; depends on NOTHING (see Documentation)
@@ -56,6 +57,26 @@ patches `ferx-core = { path = "../../../ferx-core" }` — the repo *root*. Movin
 the package under `crates/` breaks every local ferx-r build, and breaks it
 *silently*: the patch stops applying and ferx-r quietly builds `main` instead of
 your branch.
+
+**`ferx-model`: the layer below the estimators (#3041).** The data types, the parser and its
+JIT, the closed-form and ODE engines, the sensitivities, the likelihood kernels and the data
+reader / output writer live in `crates/ferx-model`, so its lib and lib-test compile in parallel
+with `ferx-core`'s and an edit above it does not recompile it (lib-test build −59%, measured).
+Four rules:
+
+- **Nothing in `ferx-model` names `ferx-core`** (an estimator, `api`, `io::fitrx`). Move the
+  piece down, or inject it: the one hook is the `.fitrx` reader for `[priors] from_fit`.
+- **`ferx-core`'s public API does not change.** Its moved modules are inline facades that
+  `pub use` exactly the baseline's items. `tools/update-public-api.sh` gates both
+  `api/ferx-core-public-api.txt` and `api/ferx-model-public-api.txt` (the shape of every item
+  ferx-core re-exports, which `cargo public-api` lists in ferx-core as bare `pub use` lines).
+- **A crate-private member ferx-core needs stays `pub(crate)`** and is reached through the
+  sealed traits of `ferx_model::internal` (`use ferx_model::internal::*;`), which ferx-core never
+  re-exports. Never `pub` it — that widens ferx-core's API through the re-exported type.
+- **Test-only code ferx-core's tests use is `cfg(any(test, feature = "test-support"))`, and so
+  is everything that reads it** (a hook set by a test and read only under `cfg(test)` tests
+  nothing). A `ferx-model` unit test that needs `fit()` lives in `src/model_tests/`, mounted at
+  its original module path so libtest filters still match.
 
 **Boundary rule.** `ferx-core` = one model, one dataset, one fit. `ferx-tools` =
 many fits, resampling, model-space search. If it calls `fit()` more than once, it
@@ -554,6 +575,11 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 ```
 
 ### Key Modules
+
+Since #3041 the model/numerics modules (`types`, `parser`, `pk`, `ode`, `sens`, most of `stats`,
+`nn`, `survival`, `markov`, `categorical`, `edit`, `io::{datareader,output}`) live under
+`crates/ferx-model/src/`; paths below and elsewhere in this file are relative to whichever crate
+holds the module, and their fit-dependent unit tests under `src/model_tests/`.
 
 | Module | Purpose |
 |--------|---------|

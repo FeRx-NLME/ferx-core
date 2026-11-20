@@ -26,7 +26,7 @@
 //! **One implementation for the value and the gradient.** Both functions are generic over
 //! [`PkNum`]: at `T = f64` they are the prediction, at `T = Dual2`/`Dual2` the exact `∂/∂(θ,η)`
 //! and its second order, by the same `*_g<T: PkNum>` rule the closed forms follow. Every
-//! branch — the squaring count, LU pivoting, the self-checks below — reads [`PkNum::val`]
+//! branch — the squaring count, LU pivoting, the self-checks below — reads `PkNum::val`
 //! only, so the dual run differentiates the very computation the `f64` run reports.
 
 use super::solver::SolPointG;
@@ -237,7 +237,7 @@ impl<T: PkNum> Expm<T> {
     /// with the degree-13 diagonal Padé approximant (Higham 2005); read it with [`Self::get`].
     ///
     /// Returns `None` when the value part is non-finite, the norm needs more than
-    /// [`MAX_SQUARINGS`] halvings, or the Padé denominator `V − U` is singular (it is not, for
+    /// `MAX_SQUARINGS` halvings, or the Padé denominator `V − U` is singular (it is not, for
     /// any finite input in range — the guard is for a diverged parameter set).
     ///
     /// The scaling exponent `s` is chosen from `‖A.val()‖₁`, so at `T = Dual2` the jets ride a
@@ -434,7 +434,7 @@ pub fn forcing_scale(args: &[f64], out: &mut Vec<f64>) {
 
 /// The [`HostFn::PadeSquarings`](crate::sens::num::HostFn) analysis: `args = [A (n·n), n]`
 /// → `[s]`, the halvings that bring `‖A‖₁` under `θ₁₃`, or `−1` when a value is not finite or
-/// more than [`MAX_SQUARINGS`] are needed.
+/// more than `MAX_SQUARINGS` are needed.
 pub fn pade_squarings(args: &[f64], out: &mut Vec<f64>) {
     let n = args[args.len() - 1] as usize;
     let a = &args[..n * n];
@@ -628,7 +628,7 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
 }
 
 /// The `f64` half of the spectral form — every decision and every quantity read off `A`'s
-/// values (`args = [A (n·n), n, present]`) — into `out`, laid out as [`SpectralLayout`]: `ok`
+/// values (`args = [A (n·n), n, present]`) — into `out`, laid out as `SpectralLayout`: `ok`
 /// (`1` when the spectral path applies, else `0` and nothing more), the eigenvalues, each one's
 /// diagonal compartment (`−1` when it is not a diagonal), each projector's support masks, the
 /// `f64` projectors, and per non-diagonal eigenvalue the chord system's `v₀` and `J₀⁻¹`.
@@ -1263,8 +1263,8 @@ fn reproduces_affine<T: PkNum>(
 
 /// A segment's affine system `x' = A·x + b`, read once and flowed over pieces whose ends move
 /// with the inputs — and may meet (#3010): [`Self::flow`] is exact at every length `h ≥ 0`,
-/// zero included, with no decision on `h`'s value. A recording type ([`RecHooks`]) records
-/// each flow as one piece of code exact at every length, where [`segment_span`] decides on
+/// zero included, with no decision on `h`'s value. A recording type (`RecHooks`) records
+/// each flow as one piece of code exact at every length, where `segment_span` decides on
 /// `h > 0` and on its step count (guards a piece that grows from zero would fail). With `h`
 /// carrying derivatives, a flow is differentiated through its length: the pieces of a
 /// segment cut at a moving point compose to the exact derivative in that point, to every

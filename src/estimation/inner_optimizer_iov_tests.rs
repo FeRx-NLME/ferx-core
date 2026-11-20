@@ -4750,7 +4750,12 @@ fn a_nested_layout_off_the_warm_start_keeps_eta_hat_in_release() {
         let b = fx::point(&layout, 1.0);
         (fx::stacked(&layout, &b), b[..m.n_eta].to_vec())
     };
-    m.indiv_param_partials.nested_levels.as_mut().expect("a nested model").kappa_level.push(0);
+    m.indiv_param_partials
+        .nested_levels_mut()
+        .as_mut()
+        .expect("a nested model")
+        .kappa_level
+        .push(0);
     let (_, rec) = record_inner_solves(|| {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             find_ebe_iov(

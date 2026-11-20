@@ -6,7 +6,7 @@ use ferx_model::internal::*;
 
 #[cfg(test)]
 pub(crate) use crate::estimation::inner_settings::analytic_inner_grad_supported_model;
-#[cfg(test)]
+#[cfg(all(test, feature = "markov"))]
 pub(crate) use crate::estimation::inner_settings::non_gaussian_endpoints_served;
 pub(crate) use crate::estimation::inner_settings::{
     cacheable_schedule_iov, cacheable_schedule_iov_cached, non_gaussian_eta_grad_served,
