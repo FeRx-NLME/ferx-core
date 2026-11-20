@@ -2892,8 +2892,9 @@ fn find_ebe_solve(
     // back from here instead of walked again. The solve reads back one point's predictions —
     // the mode's, which is the lowest value it scored — so one entry is all that is kept
     // (not a vector per η the search and its finite-difference probes visited), written only
-    // on an improvement and read without a copy. An ODE walk is what a repeat is worth
-    // skipping; a closed form re-walks for less than the lookup costs.
+    // on an improvement or a tie (the mode can score bit-equal to a point an ulp beside it
+    // that was walked first, #3042) and read without a copy. An ODE walk is what a repeat is
+    // worth skipping; a closed form re-walks for less than the lookup costs.
     let best_walk: RefCell<Option<(Vec<u64>, f64, Vec<f64>)>> = RefCell::new(None);
     let track_walks = model.ode_spec.is_some();
     let obj = |e: &[f64]| -> f64 {
@@ -2913,7 +2914,7 @@ fn find_ebe_solve(
         } else {
             let v = obj_uncached(e);
             let mut best = best_walk.borrow_mut();
-            if v.is_finite() && best.as_ref().is_none_or(|b| v < b.1) {
+            if v.is_finite() && best.as_ref().is_none_or(|b| v <= b.1) {
                 let (k, bv, p) = best.get_or_insert_with(Default::default);
                 k.clear();
                 k.extend(e.iter().map(|x| x.to_bits()));
