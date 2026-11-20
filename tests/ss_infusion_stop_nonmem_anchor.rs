@@ -70,10 +70,7 @@ const STRADDLES: &[(&str, &str)] = &[
 
 /// `ids` and their event-driven twins (+ 100).
 fn with_twins(ids: &[u32]) -> Vec<u32> {
-    ids.iter()
-        .copied()
-        .chain(ids.iter().map(|i| i + 100))
-        .collect()
+    ids.iter().copied().chain(ids.iter().map(|i| i + 100)).collect()
 }
 
 const PARAMS: &str = r#"
@@ -104,11 +101,7 @@ fn ode_model(zero_order: bool, scaled: bool) -> CompiledModel {
     } else {
         ("ALAG2 = LAG2", "-KA*depot")
     };
-    let scaling = if scaled {
-        "[scaling]\n  y = central / V"
-    } else {
-        ""
-    };
+    let scaling = if scaled { "[scaling]\n  y = central / V" } else { "" };
     let src = format!(
         r#"{PARAMS}
 [individual_parameters]
@@ -147,14 +140,10 @@ fn analytic() -> CompiledModel {
 /// The subjects `ids`, from the zero-order dataset when they are zero-order cells.
 fn pop(ids: &[u32]) -> Population {
     let zo = ids.iter().any(|i| Z.contains(&(i % 100)));
-    assert!(
-        ids.iter().all(|i| Z.contains(&(i % 100)) == zo),
-        "one dataset per fixture"
-    );
+    assert!(ids.iter().all(|i| Z.contains(&(i % 100)) == zo), "one dataset per fixture");
     let path = if zo { DATA_ZO } else { DATA };
     let mut p = read_nonmem_csv(std::path::Path::new(path), None, None).expect("dataset loads");
-    p.subjects
-        .retain(|s| ids.iter().any(|i| s.id == i.to_string()));
+    p.subjects.retain(|s| ids.iter().any(|i| s.id == i.to_string()));
     assert_eq!(p.subjects.len(), ids.len(), "every fixture ID is in {path}");
     p
 }
@@ -165,10 +154,7 @@ fn nonmem_obs() -> Vec<(String, f64, f64)> {
     text.lines()
         .skip(2)
         .map(|l| {
-            let c: Vec<f64> = l
-                .split_whitespace()
-                .map(|x| x.parse().expect("number"))
-                .collect();
+            let c: Vec<f64> = l.split_whitespace().map(|x| x.parse().expect("number")).collect();
             (c[0], c[1], c[2], c[3])
         })
         .filter(|&(_, _, evid, _)| evid == 0.0)
@@ -182,10 +168,7 @@ fn nonmem_obs() -> Vec<(String, f64, f64)> {
 /// report fails.
 fn assert_matches(label: &str, got: &[(String, f64, f64)], ids: &[u32], bound: f64) {
     let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
-    let want: Vec<_> = nonmem_obs()
-        .into_iter()
-        .filter(|r| ids.contains(&r.0))
-        .collect();
+    let want: Vec<_> = nonmem_obs().into_iter().filter(|r| ids.contains(&r.0)).collect();
     assert_eq!(got.len(), want.len(), "{label}: observation count");
     let mut worst = 0.0_f64;
     let mut bad = Vec::new();
@@ -197,9 +180,7 @@ fn assert_matches(label: &str, got: &[(String, f64, f64)], ids: &[u32], bound: f
         assert!(g.is_finite(), "{label}: ID {id} t={t} non-finite ({g})");
         let err = (g - w).abs() / (1.0 + w.abs());
         if !(err < bound) {
-            bad.push(format!(
-                "{label} ID {id} t={t}: ferx {g} vs NONMEM {w} (err {err:.3e})"
-            ));
+            bad.push(format!("{label} ID {id} t={t}: ferx {g} vs NONMEM {w} (err {err:.3e})"));
         }
         worst = worst.max(err);
     }
@@ -223,9 +204,7 @@ fn via_predict(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64
 /// Engine-side values carry the reader's shifted clock on the EVID=3 twins, so they are
 /// paired with the raw times `predict` reports, row for row.
 fn with_raw(
-    model: &CompiledModel,
-    pop: &Population,
-    rows: Vec<(String, f64)>,
+    model: &CompiledModel, pop: &Population, rows: Vec<(String, f64)>,
 ) -> Vec<(String, f64, f64)> {
     let raw = via_predict(model, pop);
     assert_eq!(rows.len(), raw.len(), "row count vs predict");
@@ -255,8 +234,7 @@ fn via_with_states(model: &CompiledModel, pop: &Population) -> Vec<(String, f64,
 /// A dual walk's value (`o.f`). Every subject must stay on `subject_eta_grad`'s dual walk: an
 /// FD-routed subject would make this leg FD-of-f64 and blind to the dual walk (T3).
 fn via_dual(
-    model: &CompiledModel,
-    pop: &Population,
+    model: &CompiledModel, pop: &Population,
     sens: impl Fn(&Subject) -> Option<Vec<ferx_core::sens::provider::ObsGrad>>,
 ) -> Vec<(String, f64, f64)> {
     let mut out = Vec::new();
@@ -270,16 +248,12 @@ fn via_dual(
 
 fn via_ode_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let eta = vec![0.0; model.n_eta];
-    via_dual(model, pop, |s| {
-        subject_eta_grad(model, s, &model.default_params.theta, &eta)
-    })
+    via_dual(model, pop, |s| subject_eta_grad(model, s, &model.default_params.theta, &eta))
 }
 
 fn via_analytic_dual(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f64)> {
     let eta = vec![0.0; model.n_eta];
-    via_dual(model, pop, |s| {
-        subject_eta_grad(model, s, &model.default_params.theta, &eta)
-    })
+    via_dual(model, pop, |s| subject_eta_grad(model, s, &model.default_params.theta, &eta))
 }
 
 /// `simulate_adaptive` with a controller that never doses: the base regimen through the
@@ -303,10 +277,7 @@ fn via_adaptive(model: &CompiledModel, pop: &Population) -> Vec<(String, f64, f6
     )
     .expect("adaptive sim runs and passes the frozen-replay verifier");
     assert!(res.ledger.is_empty(), "the no-op controller dosed");
-    res.trajectories
-        .into_iter()
-        .map(|r| (r.id, r.time, r.ipred))
-        .collect()
+    res.trajectories.into_iter().map(|r| (r.id, r.time, r.ipred)).collect()
 }
 
 /// The EKF propagator with zero diffusion: its mean is the deterministic ODE solution. It
@@ -350,19 +321,13 @@ const ANALYTIC_BOUND: f64 = 1e-13;
 fn the_nonmem_table_straddles_the_ss_record_gate() {
     let want = nonmem_obs();
     let late = |id: &str| -> Vec<f64> {
-        want.iter()
-            .filter(|(i, t, _)| i == id && *t >= 12.0)
-            .map(|r| r.2)
-            .collect()
+        want.iter().filter(|(i, t, _)| i == id && *t >= 12.0).map(|r| r.2).collect()
     };
     for &(stopped, live) in STRADDLES {
         let (s, l) = (late(stopped), late(live));
         assert!(!s.is_empty() && s.len() == l.len(), "IDs {stopped}/{live}");
-        let rel: Vec<f64> = s
-            .iter()
-            .zip(&l)
-            .map(|(a, b)| (a - b).abs() / a.abs().max(b.abs()))
-            .collect();
+        let rel: Vec<f64> =
+            s.iter().zip(&l).map(|(a, b)| (a - b).abs() / a.abs().max(b.abs())).collect();
         assert!(
             rel.iter().all(|&r| r > 0.01) && rel.iter().any(|&r| r > 0.1),
             "IDs {stopped}/{live} must differ after the record (> 1 % everywhere, > 10 % \
@@ -438,12 +403,7 @@ fn ode_dual_walk_stops_a_window_recorded_before_the_ss_record() {
 #[test]
 fn analytic_predict_stops_an_infusion_recorded_before_the_ss_record() {
     let ids = with_twins(A0);
-    assert_matches(
-        "analytic predict",
-        &via_predict(&analytic(), &pop(&ids)),
-        &ids,
-        ANALYTIC_BOUND,
-    );
+    assert_matches("analytic predict", &via_predict(&analytic(), &pop(&ids)), &ids, ANALYTIC_BOUND);
 }
 
 #[test]
@@ -471,10 +431,7 @@ fn analytic_dual_value_equals_the_prediction_on_every_id() {
     for ((id, t, d), (_, _, v)) in dual.iter().zip(&value) {
         assert!(d.is_finite() && v.is_finite(), "ID {id} t={t}: {d} / {v}");
         let err = (d - v).abs() / (1.0 + v.abs());
-        assert!(
-            err < ANALYTIC_BOUND,
-            "ID {id} t={t}: dual {d} vs value {v} (err {err:.3e})"
-        );
+        assert!(err < ANALYTIC_BOUND, "ID {id} t={t}: dual {d} vs value {v} (err {err:.3e})");
         worst = worst.max(err);
     }
     println!("#1586 analytic dual vs value: worst {worst:.3e}");

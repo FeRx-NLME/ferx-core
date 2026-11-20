@@ -62,13 +62,7 @@ pub(super) fn with_theta_len(params: &ModelParameters, n: usize) -> ModelParamet
     let mut p = params.clone();
     p.theta.resize(n, 1.0);
     let names: Vec<String> = (0..n)
-        .map(|i| {
-            params
-                .theta_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("EXTRA{i}"))
-        })
+        .map(|i| params.theta_names.get(i).cloned().unwrap_or_else(|| format!("EXTRA{i}")))
         .collect();
     p.theta_names = names;
     p.theta_lower.resize(n, 1e-3);
@@ -80,9 +74,7 @@ pub(super) fn with_theta_len(params: &ModelParameters, n: usize) -> ModelParamet
 /// The message for a θ of length `got` against the two-θ model, held to the contract table.
 fn assert_counts_message(msg: &str, got: usize, entry: &str) {
     assert!(
-        msg.contains(&format!(
-            "the supplied theta has {got} values but this model has 2"
-        )),
+        msg.contains(&format!("the supplied theta has {got} values but this model has 2")),
         "{entry}, θ len {got}: counts not named: {msg}"
     );
     assert!(
@@ -119,10 +111,7 @@ fn every_static_simulate_entry_refuses_a_theta_of_the_wrong_length() {
         assert_counts_message(&e.to_string(), n, "simulate");
         let e = simulate_with_seed(&model, &pop, &params, 1, 5).expect_err("simulate_with_seed");
         assert_counts_message(&e.to_string(), n, "simulate_with_seed");
-        let opts = SimulateOptions {
-            seed: Some(5),
-            ..Default::default()
-        };
+        let opts = SimulateOptions { seed: Some(5), ..Default::default() };
         let e = simulate_with_options_diag(&model, &pop, &params, 1, &opts)
             .expect_err("simulate_with_options_diag");
         assert_counts_message(&e.to_string(), n, "simulate_with_options_diag");
@@ -297,23 +286,13 @@ fn the_survival_predictors_refuse_a_theta_of_the_wrong_length() {
     let k = tte.default_params.theta.len();
     let grid = [1.0, 10.0, 50.0];
     for n in [k - 1, k + 1] {
-        let e = predict_survival(
-            &tte,
-            &tte_pop,
-            &with_theta_len(&tte.default_params, n),
-            &grid,
-        )
-        .expect_err("predict_survival");
+        let e = predict_survival(&tte, &tte_pop, &with_theta_len(&tte.default_params, n), &grid)
+            .expect_err("predict_survival");
         counts(&e.to_string(), n, k, "predict_survival");
     }
     let a = predict_survival(&tte, &tte_pop, &tte.default_params, &grid).expect("accepted");
-    let b = predict_survival(
-        &tte,
-        &tte_pop,
-        &with_theta_len(&tte.default_params, k),
-        &grid,
-    )
-    .expect("accepted");
+    let b = predict_survival(&tte, &tte_pop, &with_theta_len(&tte.default_params, k), &grid)
+        .expect("accepted");
     assert!(!a.is_empty());
     assert_eq!(a.len(), b.len());
     for (x, y) in a.iter().zip(&b) {
@@ -358,9 +337,7 @@ fn the_survival_predictors_refuse_a_theta_of_the_wrong_length() {
 /// model-aware with the **original** model — `data` carries no column an edit adds.
 #[cfg(feature = "survival")]
 fn edited_example(
-    name: &str,
-    data: &str,
-    edits: &[(&str, &str)],
+    name: &str, data: &str, edits: &[(&str, &str)],
 ) -> (String, crate::types::ParsedModel, Population) {
     use crate::parser::model_parser::parse_full_model;
     let src = std::fs::read_to_string(format!("examples/{name}")).expect("example");
@@ -383,11 +360,7 @@ fn with_study(mut pop: Population) -> Population {
     for (i, s) in pop.subjects.iter_mut().enumerate() {
         let v = (i % 3 + 1) as f64;
         s.covariates.insert("STUDY".to_string(), v);
-        for m in s
-            .obs_covariates
-            .iter_mut()
-            .chain(s.dose_covariates.iter_mut())
-        {
+        for m in s.obs_covariates.iter_mut().chain(s.dose_covariates.iter_mut()) {
             m.insert("STUDY".to_string(), v);
         }
     }
@@ -399,12 +372,7 @@ fn with_study(mut pop: Population) -> Population {
 #[cfg(feature = "survival")]
 fn eff_moved(model: &CompiledModel) -> ModelParameters {
     let mut params = model.default_params.clone();
-    for (k, (name, t)) in model
-        .theta_names
-        .iter()
-        .zip(params.theta.iter_mut())
-        .enumerate()
-    {
+    for (k, (name, t)) in model.theta_names.iter().zip(params.theta.iter_mut()).enumerate() {
         if name.starts_with("EFF") {
             *t = 0.25 * k as f64 - 0.6;
         }
@@ -421,15 +389,10 @@ fn assert_unbound_names(err: &crate::diagnostics::EngineError, entry: &str) {
         "{entry}: the population the entry reads: {text}"
     );
     assert!(
-        text.contains(&format!(
-            "and call `{entry}` with the model it re-parses into `parsed`."
-        )),
+        text.contains(&format!("and call `{entry}` with the model it re-parses into `parsed`.")),
         "{entry}: the model to call it with: {text}"
     );
-    assert!(
-        !text.contains("`predict`"),
-        "{entry}: names `predict`: {text}"
-    );
+    assert!(!text.contains("`predict`"), "{entry}: names `predict`: {text}");
 }
 
 /// #1763, Q1–Q4b. `predict_survival` and `predict_categorical` returned `Ok` on three inputs
@@ -647,10 +610,7 @@ fn an_error_model_selector_is_required_by_the_survival_predictors_too() {
         "pktte_joint.ferx",
         "data/pktte_joint.csv",
         &[
-            (
-                "sigma PROP_ERR ~ 0.05 (sd)",
-                "sigma PROP_ERR ~ 0.05 (sd)\n  sigma PROP_B ~ 0.1 (sd)",
-            ),
+            ("sigma PROP_ERR ~ 0.05 (sd)", "sigma PROP_ERR ~ 0.05 (sd)\n  sigma PROP_B ~ 0.1 (sd)"),
             (
                 "DV ~ proportional(PROP_ERR)   # applies to the Gaussian PK rows (CMT 2); TTE \
                  rows (CMT 3) route to the event likelihood",

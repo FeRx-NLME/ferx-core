@@ -40,6 +40,7 @@
 //! | `W_PER_CMT_UNMATCHED`     | the other direction of the two above: a **declared** per-CMT entry — `[scaling] obs_scale[CMT=N]`, `[error_model] CMT=N:`, or a `y[CMT=N]` readout on either engine — that no observation is recorded on, so the entry is inert. A warning rather than an error because nothing goes `NaN`, and one code for all three channels, with the channel named in the message. Names `[data_selection]` as a candidate cause only for the dead compartments a clause actually emptied. Silent on an observation-free population, so `ferx check` without `--data` does not report every declared entry as dead (#1405) |
 //! | `E_ENDPOINT_UNROUTED`     | a CMT declared as a non-Gaussian endpoint carries Gaussian observations — the population was read without the model's endpoint routing (#1199) |
 //! | `E_ENDPOINT_NO_RECORDS`   | a declared non-Gaussian endpoint has no row routed to it (typically a missing `CMT` column) |
+//! | `E_ENDPOINT_RECORD_KIND`  | a record on an endpoint's CMT is of a variant that endpoint's likelihood does not score (a hand-built population) |
 //! | `E_NO_SCORED_OBSERVATIONS` | the population has no record the likelihood scores — no Gaussian observation and no endpoint record on any subject — so the data contribute nothing to the objective. One population-level finding, last in `check_model_data_rule` so the specific data codes win `fit()`'s first error; the message names `[data_selection]` when it removed observation rows, and otherwise says what makes a row scored (#1491) |
 //! | `E_DATA`                  | the `--data` file could not be read or parsed. Also raised by `run_sir` / `run_covariance` when the re-read of `fit.data_path` fails for any other reason than a covariate column (#1774), through the same classifier; there the message is the reader's own, without `ferx check`'s `Failed to read data file` lead |
 //! | `E_SDE_INCOMPATIBLE`      | an SDE (`[diffusion]`) model used with SAEM / GN |
@@ -122,7 +123,7 @@
 //! | `E_LTBS_UNSUPPORTED`      | LTBS (`log_transform = true`) with a proportional or (natural-scale) combined error on any endpoint, a covariate-selected error spec, or an SDE; or a `LogCombined` error without LTBS (#2729). Block `error_model`. Only a hand-built `CompiledModel` reaches it; the parser refuses all of these. Raised by `fit()` and `check_model_options` (#1788) |
 //! | `E_IIV_ON_RUV_SHARED_ETA` | the `iiv_on_ruv` η is also used in `[individual_parameters]`; the residual-error random effect must be a dedicated omega (#409). Block `error_model`. Raised by `fit()` and `ferx check` (#1788) |
 //! | `E_IIV_ON_RUV_METHOD`     | `iiv_on_ruv` with a non-interaction stage (`foce` / `gn` without `interaction`) anywhere in the method chain; `Y = IPRED + EPS·EXP(ETA)` is an interaction model (#409). Block `fit_options`. Raised by `fit()` and `ferx check` (#1788) |
-//! | `E_MIXTURE_METHOD`        | a `[mixture]` model with a method its objective is not wired for: FOCEI quadrature (`n_agq > 1`), an estimator other than FOCE / FOCEI / SAEM / Bayes / IMP / IMPMAP, or Bayes with per-class `omega(k)` / `sigma(k)` overrides (#977, #985). Block `fit_options`. Raised by `fit()` (on its `init_params`) and `ferx check` (on the parsed parameters) (#1788) |
+//! | `E_MIXTURE_METHOD`        | a `[mixture]` model with a method its objective is not wired for: an estimator other than FOCE / FOCEI / Laplace / SAEM / Bayes / IMP / IMPMAP, or Bayes with per-class `omega(k)` / `sigma(k)` overrides (#977, #985). Block `fit_options`. Raised by `fit()` (on its `init_params`) and `ferx check` (on the parsed parameters) (#1788) |
 //! | `E_ENDPOINT_TV_COVARIATE` | a covariate that varies within a subject is read by an endpoint that evaluates it at the baseline: an analytic hazard's own parameters, any covariate under an ODE-accumulated hazard, a `[binary_model]` predictor, a `[markov_model]` intensity or DTMM transition probability (#741, #2473). Block is the endpoint's (`event_model` / `binary_model` / `markov_model`). Raised by `fit()`, `ferx check` (since #1774), `predict` / `predict_diag` / `predict_survival` / `predict_categorical` and the `simulate*` entry points |
 //! | `E_ENDPOINT_TIME_DEPENDENT_PK` | an ODE-accumulated hazard would integrate a `TIME`-dependent individual parameter (reaching it through the `[odes]` RHS or an `init()` seed) at its TIME=0 value (#1853), or, fail-closed, a hand-built model lacks the compiled programs that decide it. Block `event_model`. A function of the model alone. Raised by `fit()`, `ferx check` (without `--data`, since #1774), `predict` / `predict_diag` / `predict_survival` and the `simulate*` entry points; not `predict_categorical` |
 //! | `E_READOUT_DEPOT_UNSUPPORTED` | an analytic `[scaling] y` readout reads the oral `depot` amount on a subject dose superposition cannot reconstruct it for: an EVID=3/4 reset (#650) or a dose into a non-default compartment (#375). Block `scaling`. Raised by `fit()`, `ferx check` (since #1774) and `predict` / `predict_diag` |
@@ -191,6 +192,7 @@
 //! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
 //! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
+//! | `E_COUNT_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[count_model]` (Poisson / negative-binomial) endpoint (#2877) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM or DTMM) endpoint (#759, #2473) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM or DTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator / transition probabilities use BSV η only, so κ would be ignored (#759, #2473) |
 //! | `E_IMP_MIXTURE_IOV_UNSUPPORTED` | `method = imp` / `impmap` anywhere in the chain on a `[mixture]` model with IOV (`n_kappa > 0`); their mixture E-step has no κ (#2301) |
@@ -249,6 +251,8 @@
 //! | `W_VI_BAD_BASIN` | VI's final ELBO tightness check found the data term more than 25× further above its value at the variational means than expected, so the fit is in a bad basin and reported `converged: false` |
 //! | `W_ODE_SOLVER_DIAGNOSTICS` | the ODE solver did not integrate cleanly on that pass: kept min-step clamps, rejected or failed stiff escalations, unfinished, stiff-aborted or diverged segments, or an abandoned non-finite timeline (#1080, #1304) |
 //! | `W_FD_JACOBIAN_NOT_TIGHTENED` | some subjects' finite-difference Jacobian at the final estimates could not be integrated cleanly at no looser than `ode_reltol = 1e-8` / `ode_abstol = 1e-10` with 32 times `ode_max_steps`, and was taken at the fit's own ODE settings, so the OFV may carry integration error through the determinant term (#2701) |
+//! | `W_ODE_OFV_NOT_SETTLED` | re-finding the EBEs and re-scoring the objective at the final estimates with `ode_reltol` / `ode_abstol` one decade tighter moved the OFV by more than 0.1 units, or gave a non-finite objective, so the OFV is not settled at the fit's ODE tolerance. checked on the objective the fit publishes (`foce` / `focei` / `gn` / `gn_hybrid` / `laplace`, including a trailing `agq_eval_only` readout), non-mixture, integrated models only (#2994) |
+//! | `W_ODE_OFV_SETTLEMENT_UNCHECKED` | the `W_ODE_OFV_NOT_SETTLED` check applied but its tighter re-solve could not be set up (the worker pool could not be built) or a re-scored side did not integrate cleanly (clamped, unfinished, stiff-aborted or diverged segments, an abandoned timeline, counted over every integration behind the objective) or failed the EBE convergence guard, so whether the OFV is settled was not checked (#2994) |
 //! | `W_ODE_SOLVER_ESCALATION_NOTE` | informational: `ode_method = auto` escalated some segments to a stiff stepper and the integration was otherwise clean (no rejected escalation, no min-step clamp) |
 //! | `W_ODE_RHS_INTERPRETED` | informational: the `[odes]` right-hand side runs on the bytecode interpreter; the message names the construct that kept it there and its statement. `ferx check` (severity `Info`) and once per `fit()` (#2681) |
 //! | `W_PLAN_FD_FALLBACK` | some subjects' compiled per-subject plan failed at run time, so they took finite-difference derivatives instead; the message counts them and quotes the first failure's reason. Results are correct but slower, and it should never appear: please report it (#2786) |
@@ -406,9 +410,7 @@ impl CheckReport {
     /// Build a report from collected diagnostics; `valid` is derived as
     /// "no error-severity diagnostics present".
     pub fn new(
-        model: impl Into<String>,
-        data: Option<String>,
-        diagnostics: Vec<Diagnostic>,
+        model: impl Into<String>, data: Option<String>, diagnostics: Vec<Diagnostic>,
     ) -> Self {
         let valid = !diagnostics.iter().any(Diagnostic::is_error);
         CheckReport {
@@ -432,10 +434,7 @@ impl CheckReport {
 
     /// Count of `Info`-severity diagnostics (#2387).
     pub fn info_count(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|d| d.severity == Severity::Info)
-            .count()
+        self.diagnostics.iter().filter(|d| d.severity == Severity::Info).count()
     }
 }
 
@@ -514,20 +513,14 @@ impl EngineError {
     /// rewords (`ferx check` renders `block:line` beside a parse error's message, so its
     /// diagnostic drops the ` (line N)` the raw text carries; #2062 review B1).
     pub(crate) fn from_diagnostic_keeping_text(d: Diagnostic, message: String) -> Self {
-        EngineError {
-            message,
-            ..EngineError::from_diagnostic(d)
-        }
+        EngineError { message, ..EngineError::from_diagnostic(d) }
     }
 
     /// An error carrying `d` whose `Display` folds the suggestion in after the
     /// message, capitalised and closed with a full stop — for a refusal whose
     /// historical text read that way. [`message`](Self::message) stays `d.message`.
     pub(crate) fn with_suggestion_in_display(d: Diagnostic) -> Self {
-        EngineError {
-            suggestion_in_display: true,
-            ..EngineError::from_diagnostic(d)
-        }
+        EngineError { suggestion_in_display: true, ..EngineError::from_diagnostic(d) }
     }
 
     /// An error with no diagnostic: [`code`](Self::code) is `None`.
@@ -570,9 +563,7 @@ impl EngineError {
 
     /// The diagnostic's actionable hint, if any.
     pub fn suggestion(&self) -> Option<&str> {
-        self.diagnostic
-            .as_ref()
-            .and_then(|d| d.suggestion.as_deref())
+        self.diagnostic.as_ref().and_then(|d| d.suggestion.as_deref())
     }
 
     /// The message, without the entry-point context and without the suggestion.
@@ -716,10 +707,7 @@ mod tests {
         assert_eq!(folded.code(), Some("E_X"));
         assert_eq!(folded.message(), "Short.");
         assert_eq!(folded.suggestion(), Some("with the advice folded in"));
-        assert_eq!(
-            folded.to_string(),
-            "predict: Short. With the advice folded in."
-        );
+        assert_eq!(folded.to_string(), "predict: Short. With the advice folded in.");
         // The fold is the exception: an ordinary diagnostic with a suggestion prints
         // its message alone.
         let plain_coded = EngineError::from_diagnostic(
@@ -739,10 +727,7 @@ mod tests {
         let d = Diagnostic::error("E_PARSE", "bad");
         let json = serde_json::to_string(&d).unwrap();
         // block / line / suggestion are None → skipped.
-        assert_eq!(
-            json,
-            r#"{"severity":"error","code":"E_PARSE","message":"bad"}"#
-        );
+        assert_eq!(json, r#"{"severity":"error","code":"E_PARSE","message":"bad"}"#);
     }
 }
 

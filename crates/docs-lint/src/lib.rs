@@ -36,11 +36,7 @@ pub fn repo_root() -> PathBuf {
         return PathBuf::from(root);
     }
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest
-        .parent()
-        .and_then(Path::parent)
-        .unwrap_or(manifest)
-        .to_path_buf()
+    manifest.parent().and_then(Path::parent).unwrap_or(manifest).to_path_buf()
 }
 
 /// Default location of the R1 baseline.

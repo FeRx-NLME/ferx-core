@@ -101,9 +101,7 @@ fn simulated_population(model: &ferx_core::types::CompiledModel) -> Population {
 }
 
 fn fit_with(
-    method: EstimationMethod,
-    model: &ferx_core::types::CompiledModel,
-    pop: &Population,
+    method: EstimationMethod, model: &ferx_core::types::CompiledModel, pop: &Population,
 ) -> f64 {
     let mut opts = FitOptions::default();
     opts.method = method;
@@ -119,10 +117,7 @@ fn fit_with(
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_combined_error_additive_sigma_matches_focei() {
     let model = parse_model_string(MODEL).expect("combined model parses");
     let pop = simulated_population(&model);
@@ -187,9 +182,7 @@ const SIGMA_FLOOR: f64 = 3.354_626_279_025_118e-4; // exp(-8)
 fn sparse_template_population(n: usize) -> Population {
     let mut rng_state: u64 = 0x1445_0000_beef;
     let mut next = || {
-        rng_state = rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((rng_state >> 33) as f64) / ((1u64 << 31) as f64)
     };
     let subjects = (1..=n)
@@ -250,10 +243,7 @@ fn sparse_simulated_population(model: &ferx_core::types::CompiledModel, n: usize
 }
 
 fn sparse_fit(
-    method: EstimationMethod,
-    model: &ferx_core::types::CompiledModel,
-    pop: &Population,
-    seed: u64,
+    method: EstimationMethod, model: &ferx_core::types::CompiledModel, pop: &Population, seed: u64,
 ) -> ferx_core::types::FitResult {
     let mut opts = FitOptions::default();
     opts.method = method;
@@ -328,10 +318,7 @@ fn sparse_fit(
 ///   finite `f64` near `exp(-8)`; the bound has to be on the magnitude, and both
 ///   distances are stated above.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
     let model = parse_model_string(SPARSE_MODEL).expect("sparse combined model parses");
     let pop = sparse_simulated_population(&model, 300);
@@ -420,10 +407,7 @@ fn saem_sparse_combined_additive_sigma_is_not_a_single_draw() {
 /// the claim being pinned is that the new solver is not worse on σ, not that it
 /// is better.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn score_sa_does_not_bring_back_the_additive_sigma_collapse() {
     let model = parse_model_string(SPARSE_MODEL).expect("sparse combined model parses");
     let pop = sparse_simulated_population(&model, 300);
@@ -442,10 +426,7 @@ fn score_sa_does_not_bring_back_the_additive_sigma_collapse() {
 
         // The arm has to be in force, or this is a duplicate of the test above.
         assert!(
-            !saem
-                .warnings
-                .iter()
-                .any(|w| w.contains("score_sa") && w.contains("not available")),
+            !saem.warnings.iter().any(|w| w.contains("score_sa") && w.contains("not available")),
             "seed {seed}: the scope gate refused this fixture: {:?}",
             saem.warnings
         );
@@ -491,11 +472,7 @@ fn committed_nonmem_csv_still_describes_the_fixture() {
     let csv = std::fs::read_to_string("data/saem_sparse_combined.csv")
         .expect("data/saem_sparse_combined.csv — the NONMEM anchor's dataset");
     let mut lines = csv.lines();
-    assert_eq!(
-        lines.next(),
-        Some("ID,TIME,AMT,RATE,DV,MDV,EVID,CMT"),
-        "unexpected header"
-    );
+    assert_eq!(lines.next(), Some("ID,TIME,AMT,RATE,DV,MDV,EVID,CMT"), "unexpected header");
     // (ID, TIME, DV) for every observation row, in file order.
     let csv_obs: Vec<(String, f64, f64)> = lines
         .filter(|l| !l.trim().is_empty())

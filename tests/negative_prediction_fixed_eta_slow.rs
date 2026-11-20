@@ -46,10 +46,7 @@ const TIMES: [f64; 7] = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
 struct Lcg(u64);
 impl Lcg {
     fn uniform(&mut self) -> f64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((self.0 >> 11) as f64) / (1u64 << 53) as f64
     }
     fn normal(&mut self) -> f64 {
@@ -69,10 +66,8 @@ fn population() -> Population {
     let subjects = (0..30)
         .map(|i| {
             let eta = 0.5 * rng.normal();
-            let observations = TIMES
-                .iter()
-                .map(|&t| pred(&truth, t) + eta + 0.5 * rng.normal())
-                .collect();
+            let observations =
+                TIMES.iter().map(|&t| pred(&truth, t) + eta + 0.5 * rng.normal()).collect();
             Subject {
                 id: format!("{}", i + 1),
                 obs_times: TIMES.to_vec(),
@@ -156,16 +151,8 @@ fn foce_exact() -> f64 {
 /// with FOCE's. Under the old prediction floor the gap was hundreds to thousands.
 fn assert_reaches_foce(method: EstimationMethod, tol: f64, tweak: impl FnOnce(&mut FitOptions)) {
     let pop = population();
-    let negatives = pop
-        .subjects
-        .iter()
-        .flat_map(|s| &s.observations)
-        .filter(|&&y| y < 0.0)
-        .count();
-    assert!(
-        negatives > 150,
-        "fixture must be dominated by negative DV ({negatives})"
-    );
+    let negatives = pop.subjects.iter().flat_map(|s| &s.observations).filter(|&&y| y < 0.0).count();
+    assert!(negatives > 150, "fixture must be dominated by negative DV ({negatives})");
     let reference = foce_exact();
     let r = run(method, tweak);
     let got = exact_at_fit(&pop, &r);
@@ -178,10 +165,7 @@ fn assert_reaches_foce(method: EstimationMethod, tol: f64, tweak: impl FnOnce(&m
         r.omega[(0, 0)],
         r.sigma[0]
     );
-    assert!(
-        got.is_finite(),
-        "{method:?}: exact −2LL at fit is not finite"
-    );
+    assert!(got.is_finite(), "{method:?}: exact −2LL at fit is not finite");
     // FOCE is the exact MLE here, so a fixed-η fit can only sit at or above it.
     assert!(
         got - reference < tol && got - reference > -1e-3,
@@ -190,40 +174,30 @@ fn assert_reaches_foce(method: EstimationMethod, tol: f64, tweak: impl FnOnce(&m
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn saem_reaches_the_foce_objective_on_negative_predictions() {
-    assert_reaches_foce(EstimationMethod::Saem, TOL_SAEM, |o| o.saem_seed = Some(7));
+    assert_reaches_foce(EstimationMethod::Saem, TOL_SAEM, |o| {
+        o.saem_seed = Some(7);
+        // The oracle is the FOCE objective, so SAEM reports its FOCE/Laplace value.
+        o.saem_ofv = ferx_core::types::SaemOfv::Focei;
+    });
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn imp_reaches_the_foce_objective_on_negative_predictions() {
     assert_reaches_foce(EstimationMethod::Imp, TOL_IMP, |o| o.imp_seed = Some(7));
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn impmap_reaches_the_foce_objective_on_negative_predictions() {
     // IMPMAP reads `impmap_seed`, not `imp_seed` (#1476).
-    assert_reaches_foce(EstimationMethod::Impmap, TOL_IMPMAP, |o| {
-        o.impmap_seed = Some(7)
-    });
+    assert_reaches_foce(EstimationMethod::Impmap, TOL_IMPMAP, |o| o.impmap_seed = Some(7));
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn vi_reaches_the_foce_objective_on_negative_predictions() {
     assert_reaches_foce(EstimationMethod::Vi, TOL_VI, |o| o.vi_seed = Some(7));
 }

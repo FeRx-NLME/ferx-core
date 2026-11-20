@@ -3,12 +3,7 @@ use crate::parser::model_parser::parse_model_string;
 use std::collections::HashMap;
 
 fn disc(time: f64, state: usize, cmt: usize) -> ObsRecord {
-    ObsRecord::DiscreteState {
-        time,
-        raw_time: time,
-        state,
-        cmt,
-    }
+    ObsRecord::DiscreteState { time, raw_time: time, state, cmt }
 }
 
 fn subject(states: &[(f64, usize)]) -> Subject {
@@ -89,10 +84,7 @@ fn two_state_nll_matches_hand_computation() {
 fn first_record_is_conditioned_on() {
     let model = parse_model_string(TWO_STATE).expect("parse");
     let (theta, eta) = ([-0.8_f64, -1.3], [0.0_f64]);
-    assert_eq!(
-        dtmm_subject_nll(&model, &subject(&[(0.0, 1)]), &theta, &eta),
-        0.0
-    );
+    assert_eq!(dtmm_subject_nll(&model, &subject(&[(0.0, 1)]), &theta, &eta), 0.0);
     let p01 = inv_logit(-0.8);
     let p10 = inv_logit(-1.3);
     let from0 = dtmm_subject_nll(&model, &subject(&[(0.0, 0), (1.0, 0)]), &theta, &eta);
@@ -127,14 +119,8 @@ fn time_term_reads_the_current_record() {
     let got = dtmm_subject_nll(&model, &subject(&[(1.0, 1), (3.0, 0)]), &theta, &eta);
     let current = -inv_logit(-1.3 + 0.5 * 3.0).ln();
     let previous = -inv_logit(-1.3 + 0.5 * 1.0).ln();
-    assert!(
-        (current - previous).abs() > 0.1,
-        "fixture does not straddle"
-    );
-    assert!(
-        (got - current).abs() < 1e-14,
-        "got {got}, current-record {current}"
-    );
+    assert!((current - previous).abs() > 0.1, "fixture does not straddle");
+    assert!((got - current).abs() < 1e-14, "got {got}, current-record {current}");
 }
 
 /// Three ordered states via the cumulative-logit spelling: the auto-filled diagonal is
@@ -203,11 +189,7 @@ fn invalid_matrix_repels() {
         let v = dtmm_subject_nll(&model, &s, &[0.2], &[]);
         // the analytic path declines exactly where the value is the sentinel
         let g = dtmm_subject_eta_grad(&model, &s, &[0.2], &[]);
-        assert_eq!(
-            g.is_none(),
-            v == SUBJECT_SENTINEL_NLL,
-            "{p01} {p02} {p10}: {v}"
-        );
+        assert_eq!(g.is_none(), v == SUBJECT_SENTINEL_NLL, "{p01} {p02} {p10}: {v}");
         v
     };
     let chain = [(0.0, 0), (1.0, 1)];
@@ -218,19 +200,13 @@ fn invalid_matrix_repels() {
     // ... off-diagonals sum past 1 (a negative stay probability)
     assert_eq!(probe("0.6", "0.5", "A", &chain), SUBJECT_SENTINEL_NLL);
     // a stay with an off-diagonal sum of exactly 1 has probability 0
-    assert_eq!(
-        probe("0.5", "0.5", "A", &[(0.0, 0), (1.0, 0)]),
-        SUBJECT_SENTINEL_NLL
-    );
+    assert_eq!(probe("0.5", "0.5", "A", &[(0.0, 0), (1.0, 0)]), SUBJECT_SENTINEL_NLL);
     // a row the step does NOT read: P10 > 1, the chain only ever leaves state 0
     assert_eq!(probe("A", "0.1", "A + 1", &chain), SUBJECT_SENTINEL_NLL);
     // ... row 1's off-diagonals 0.8 + 0.3 sum past 1
     assert_eq!(probe("A", "0.1", "0.8", &chain), SUBJECT_SENTINEL_NLL);
     // ... a NaN in row 1
-    assert_eq!(
-        probe("A", "0.1", "log(A - 1)", &chain),
-        SUBJECT_SENTINEL_NLL
-    );
+    assert_eq!(probe("A", "0.1", "log(A - 1)", &chain), SUBJECT_SENTINEL_NLL);
     // control: the same data under a valid matrix
     let ok = probe("A", "0.1", "A", &chain);
     assert!((ok + 0.2_f64.ln()).abs() < 1e-14, "control {ok}");
@@ -329,10 +305,8 @@ fn dtmm_routes_to_the_analytic_inner_gradient() {
 /// model-time scope on both).
 #[test]
 fn time_reading_eta_grad_matches_fd() {
-    let src = TWO_STATE.replace(
-        "inv_logit(A_AS + ETA_AS)",
-        "inv_logit(A_AS + ETA_AS - 0.3 * TIME)",
-    );
+    let src =
+        TWO_STATE.replace("inv_logit(A_AS + ETA_AS)", "inv_logit(A_AS + ETA_AS - 0.3 * TIME)");
     let model = parse_model_string(&src).expect("parse");
     let s = subject(&[(0.0, 0), (1.0, 0), (2.5, 1), (3.0, 0), (6.0, 0)]);
     let theta = [-0.8_f64, -1.3];
@@ -350,12 +324,7 @@ fn validate_rejects_an_undeclared_step_and_names_it() {
     // only 0 → 1 is declared
     let transitions = [(0, 1)];
     let codes = [3, 7];
-    let ok = [
-        disc(0.0, 3, 5),
-        disc(1.0, 3, 5),
-        disc(2.0, 7, 5),
-        disc(3.0, 7, 5),
-    ];
+    let ok = [disc(0.0, 3, 5), disc(1.0, 3, 5), disc(2.0, 7, 5), disc(3.0, 7, 5)];
     assert!(validate_dtmm_records(5, &codes, &transitions, &ok).is_ok());
     let bad = [disc(0.0, 3, 5), disc(1.0, 7, 5), disc(2.0, 3, 5)];
     let err = validate_dtmm_records(5, &codes, &transitions, &bad).unwrap_err();
@@ -391,10 +360,7 @@ fn parser_builds_a_dtmm_endpoint() {
     };
     assert_eq!(*n_states, 3);
     assert_eq!(state_codes, &[0, 1, 2]);
-    assert_eq!(
-        transitions,
-        &[(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]
-    );
+    assert_eq!(transitions, &[(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)]);
     assert!(prob_program.is_some());
     assert!(prob_covariates.is_empty());
     // A block with no `type` line is still a CTMM.
@@ -447,15 +413,11 @@ fn parser_refuses_a_drug_driven_dtmm_and_mctmm() {
     let theta_named_like_the_state = DRUG_DRIVEN
         .replace("theta A(", "theta central(")
         .replace("A + S * central / V", "central + S");
-    let eta_named_like_the_state = DRUG_DRIVEN
-        .replace("ETA_CL", "central")
-        .replace("A + S * central / V", "A + S * central");
-    for src in [
-        DRUG_DRIVEN.to_string(),
-        via_indiv,
-        theta_named_like_the_state,
-        eta_named_like_the_state,
-    ] {
+    let eta_named_like_the_state =
+        DRUG_DRIVEN.replace("ETA_CL", "central").replace("A + S * central / V", "A + S * central");
+    for src in
+        [DRUG_DRIVEN.to_string(), via_indiv, theta_named_like_the_state, eta_named_like_the_state]
+    {
         let err = parse_model_string(&src).unwrap_err();
         for needle in [
             "transition probability reads the model state `central`",
@@ -522,10 +484,7 @@ fn time_varying_covariate_reads_the_current_record() {
     let previous = -(p01.ln() + p10(1.0).ln() + (1.0 - p01).ln());
     assert!((want - previous).abs() > 0.1, "fixture does not straddle");
     let got = dtmm_subject_nll(&model, &s, &theta, &eta);
-    assert!(
-        (got - want).abs() < 1e-14,
-        "got {got}, current record {want}"
-    );
+    assert!((got - want).abs() < 1e-14, "got {got}, current record {want}");
     // the analytic gradient reads the same record covariates
     let (v, _) = dtmm_subject_eta_grad(&model, &s, &theta, &eta).unwrap();
     assert_eq!(v.to_bits(), got.to_bits());
@@ -550,16 +509,8 @@ fn time_varying_covariate_reads_the_current_record() {
         let refused = crate::api::check_survival_tv_covariates(&model, &population_of(bad));
         assert_eq!(refused.len(), 1, "{refused:?}");
         assert_eq!(refused[0].code, "E_ENDPOINT_TV_COVARIATE");
-        assert!(
-            refused[0].message.contains("type = dtmm"),
-            "{}",
-            refused[0].message
-        );
-        assert!(
-            refused[0].message.contains("`DOSE`"),
-            "{}",
-            refused[0].message
-        );
+        assert!(refused[0].message.contains("type = dtmm"), "{}", refused[0].message);
+        assert!(refused[0].message.contains("`DOSE`"), "{}", refused[0].message);
     }
     // the same covariate held constant needs no snapshot
     let mut constant = subject(&[(0.0, 0), (1.0, 1), (2.0, 0)]);
@@ -591,16 +542,13 @@ fn reader_snapshots_align_with_state_records() {
          1,3,0,0,5,3\n",
     )
     .unwrap();
-    let run = crate::api::prepare_run(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("load");
+    let run =
+        crate::api::prepare_run(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("load");
     let _ = std::fs::remove_dir_all(&dir);
     let s = &run.population.subjects[0];
-    let snaps = s
-        .record_covariate_snapshots()
-        .expect("a time-varying DOSE yields aligned snapshots");
+    let snaps =
+        s.record_covariate_snapshots().expect("a time-varying DOSE yields aligned snapshots");
     let doses: Vec<f64> = snaps.iter().map(|c| c["DOSE"]).collect();
     assert_eq!(doses, [1.0, 1.0, 3.0, 3.0]);
     let (theta, eta) = ([-0.8_f64, -1.3], [0.0_f64]);
@@ -608,9 +556,7 @@ fn reader_snapshots_align_with_state_records() {
     let want = -(p01.ln() + inv_logit(-1.3 + 0.6 * 3.0).ln() + (1.0 - p01).ln());
     let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &eta);
     assert!((got - want).abs() < 1e-14, "got {got}, want {want}");
-    assert!(
-        crate::api::check_survival_tv_covariates(&run.parsed.model, &run.population).is_empty()
-    );
+    assert!(crate::api::check_survival_tv_covariates(&run.parsed.model, &run.population).is_empty());
 }
 
 /// A valid mode on the stochastic boundary — `P01 = A + η²` at `A = 1`, `η = 0`: every
@@ -669,10 +615,7 @@ fn laplace_fold_takes_the_exact_curvature_at_a_boundary_mode() {
         .expect("the exact jet serves a valid mode");
     assert!((h[(0, 0)] + 4.0).abs() < 1e-12, "exact −4, got {h}");
     let exact = fold(&model);
-    assert!(
-        exact < 1e3,
-        "the exact curvature gives an ordinary objective: {exact}"
-    );
+    assert!(exact < 1e3, "the exact curvature gives an ordinary objective: {exact}");
 
     let repelled = fold(&unrecorded);
     assert!(
@@ -714,11 +657,9 @@ fn read_through_reader(tag: &str, model_src: &str, csv: &str) -> crate::api::Pre
     let (model_path, data_path) = (dir.join("m.ferx"), dir.join("d.csv"));
     std::fs::write(&model_path, model_src).unwrap();
     std::fs::write(&data_path, csv).unwrap();
-    let run = crate::api::prepare_run(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    )
-    .expect("load");
+    let run =
+        crate::api::prepare_run(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()))
+            .expect("load");
     let _ = std::fs::remove_dir_all(&dir);
     run
 }
@@ -748,10 +689,7 @@ fn time_reads_the_written_clock_across_a_reset() {
         .collect();
     let (engine, written) = times[3];
     assert_eq!(written, 1.0);
-    assert!(
-        engine > 2.5,
-        "the reader stacks the occasion: engine time {engine}"
-    );
+    assert!(engine > 2.5, "the reader stacks the occasion: engine time {engine}");
 
     let (theta, eta) = ([-0.8_f64, -1.3], [0.0_f64]);
     let p01 = inv_logit(-0.8);
@@ -759,19 +697,9 @@ fn time_reads_the_written_clock_across_a_reset() {
     // steps: 0→1 at 1, 1→1 at 2, 1→0 at written 1
     let at = |t_last: f64| -(p01.ln() + (1.0 - p10(2.0)).ln() + p10(t_last).ln());
     let (want, engine_clock) = (at(written), at(engine));
-    assert!(
-        (want - engine_clock).abs() > 0.1,
-        "fixture does not straddle"
-    );
+    assert!((want - engine_clock).abs() > 0.1, "fixture does not straddle");
     let got = dtmm_subject_nll(&run.parsed.model, s, &theta, &eta);
-    assert!(
-        (got - want).abs() < 1e-14,
-        "got {got}, written clock {want}"
-    );
+    assert!((got - want).abs() < 1e-14, "got {got}, written clock {want}");
     let (v, _) = dtmm_subject_eta_grad(&run.parsed.model, s, &theta, &eta).unwrap();
-    assert_eq!(
-        v.to_bits(),
-        got.to_bits(),
-        "the analytic path reads the same clock"
-    );
+    assert_eq!(v.to_bits(), got.to_bits(), "the analytic path reads the same clock");
 }

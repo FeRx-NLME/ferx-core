@@ -317,11 +317,7 @@ fn split_and_natural_datasets_agree_prediction_for_prediction() {
     // record into the seed shows up here first.
     let a = ferx_preds("reset_init_snapshot.csv");
     let c = ferx_preds("reset_init_snapshot_split.csv");
-    assert_eq!(
-        a.len(),
-        c.len(),
-        "the two datasets have the same observation rows"
-    );
+    assert_eq!(a.len(), c.len(), "the two datasets have the same observation rows");
     for ((t, pa), (_, pc)) in a.iter().zip(&c) {
         assert!(
             (pa - pc).abs() < 1e-9,
@@ -358,10 +354,7 @@ fn the_objective_matches_nonmem_with_an_eta_inside_the_reset_seed() {
     // this by far more than that.
     let ofv = ferx_ofv("reset_init_snapshot.csv");
     let delta = (ofv - NM_OBJV_F).abs();
-    assert!(
-        delta < 0.5,
-        "OFV anchor: ferx {ofv:.6} vs NONMEM {NM_OBJV_F:.6} (Δ {delta:.3e})"
-    );
+    assert!(delta < 0.5, "OFV anchor: ferx {ofv:.6} vs NONMEM {NM_OBJV_F:.6} (Δ {delta:.3e})");
 }
 
 #[test]
@@ -388,11 +381,7 @@ fn the_reset_row_supplies_its_own_occasion() {
     // Before this measurement ferx inferred the reset's occasion from the preceding record
     // — a choice made to avoid regressing κ, never against evidence. It reads 14.0 here,
     // a factor of three out.
-    assert_matches_nonmem_with(
-        "reset_init_snapshot_occ.ferx",
-        "reset_init_snapshot_occ.csv",
-        NM_J,
-    );
+    assert_matches_nonmem_with("reset_init_snapshot_occ.ferx", "reset_init_snapshot_occ.csv", NM_J);
 }
 
 #[test]
@@ -435,10 +424,7 @@ fn an_occasion_only_the_reset_row_carries_gets_its_own_kappa() {
     eprintln!("arm K: ferx {ofv:.9} vs NONMEM {NM_OBJV_K:.9} (Δ {delta:.3e})");
     // Measured Δ = 1.6e-8 (macOS arm64); 1e-6 keeps ~60× headroom. The K_k0 convention
     // sits 40.03 away.
-    assert!(
-        delta < 1e-6,
-        "OFV anchor K: ferx {ofv:.6} vs NONMEM {NM_OBJV_K:.6} (Δ {delta:.3e})"
-    );
+    assert!(delta < 1e-6, "OFV anchor K: ferx {ofv:.6} vs NONMEM {NM_OBJV_K:.6} (Δ {delta:.3e})");
     assert!(
         (ofv - NM_OBJV_K_K0).abs() > 10.0,
         "ferx {ofv:.6} is within 10 of K_k0 ({NM_OBJV_K_K0:.6}): the reset-only occasion \

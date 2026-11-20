@@ -66,10 +66,7 @@ fn fit_impmap() -> FitResult {
 }
 
 fn assert_within(got: f64, (name, mean, sd): (&str, f64, f64)) {
-    assert!(
-        got.is_finite(),
-        "{name}: ferx estimate is not finite ({got})"
-    );
+    assert!(got.is_finite(), "{name}: ferx estimate is not finite ({got})");
     let z = (got - mean) / sd;
     eprintln!("{name:20} ferx {got:.6}  NONMEM mean50 {mean:.6}  z {z:+.2}");
     assert!(
@@ -100,10 +97,7 @@ fn impmap_iov_matches_nonmem_impmap() {
     assert_within(r.omega[(2, 2)], NM_OM_KA);
     assert_within(r.sigma[0] * r.sigma[0], NM_SIGMA2);
 
-    let iov = r
-        .omega_iov
-        .as_ref()
-        .expect("an IMPMAP IOV fit must report Ω_IOV");
+    let iov = r.omega_iov.as_ref().expect("an IMPMAP IOV fit must report Ω_IOV");
     let om_iov = iov[(0, 0)];
     assert_within(om_iov, NM_OM_IOV);
     assert!(
@@ -111,10 +105,8 @@ fn impmap_iov_matches_nonmem_impmap() {
         "Ω_IOV must leave its start {OMEGA_IOV_START}: got {om_iov}"
     );
 
-    let is = r
-        .importance_sampling
-        .as_ref()
-        .expect("the final IMPMAP stage evaluates the IS objective");
+    let is =
+        r.importance_sampling.as_ref().expect("the final IMPMAP stage evaluates the IS objective");
     assert!(matches!(is.kappa_treatment, KappaTreatment::Marginalized));
     assert_within(is.minus2_log_likelihood, NM_OBJ);
 }

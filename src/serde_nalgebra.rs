@@ -95,10 +95,8 @@ pub mod vec_vec_dvector {
 
     #[allow(clippy::ptr_arg)]
     pub fn serialize<S: Serializer>(v: &Vec<Vec<DVector<f64>>>, s: S) -> Result<S::Ok, S::Error> {
-        let nested: Vec<Vec<&[f64]>> = v
-            .iter()
-            .map(|inner| inner.iter().map(|dv| dv.as_slice()).collect())
-            .collect();
+        let nested: Vec<Vec<&[f64]>> =
+            v.iter().map(|inner| inner.iter().map(|dv| dv.as_slice()).collect()).collect();
         nested.serialize(s)
     }
 
@@ -144,10 +142,7 @@ mod tests {
         // Row-major: first row [1,2,3] precedes second row [4,5,6].
         assert_eq!(json["m"]["rows"], 2);
         assert_eq!(json["m"]["cols"], 3);
-        assert_eq!(
-            json["m"]["data"],
-            serde_json::json!([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-        );
+        assert_eq!(json["m"]["data"], serde_json::json!([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
         assert_eq!(json["v"], serde_json::json!([7.0, 8.0]));
 
         let back: Holder = serde_json::from_value(json).unwrap();
@@ -156,12 +151,7 @@ mod tests {
 
     #[test]
     fn none_option_round_trips() {
-        let h = Holder {
-            m: DMatrix::zeros(1, 1),
-            om: None,
-            v: DVector::zeros(0),
-            vv: vec![],
-        };
+        let h = Holder { m: DMatrix::zeros(1, 1), om: None, v: DVector::zeros(0), vv: vec![] };
         let s = serde_json::to_string(&h).unwrap();
         let back: Holder = serde_json::from_str(&s).unwrap();
         assert_eq!(back, h);

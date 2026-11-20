@@ -76,23 +76,11 @@ fn worst(a: &[f64], b: &[f64]) -> f64 {
 /// fit reports the fallback, naming every subject and the plan layer's reason.
 fn check(label: &str, exact: &FitResult, forced: &FitResult, tol: [f64; 3]) {
     let [ofv_tol, par_tol, se_tol] = tol;
-    assert!(
-        exact.ofv.is_finite() && forced.ofv.is_finite(),
-        "{label}: OFV"
-    );
-    assert!(
-        forced.ofv < 1e10,
-        "{label}: forced OFV {} repelled",
-        forced.ofv
-    );
+    assert!(exact.ofv.is_finite() && forced.ofv.is_finite(), "{label}: OFV");
+    assert!(forced.ofv < 1e10, "{label}: forced OFV {} repelled", forced.ofv);
     let d_ofv = (exact.ofv - forced.ofv).abs();
     let pars = |r: &FitResult| -> Vec<f64> {
-        r.theta
-            .iter()
-            .chain(r.omega.iter())
-            .chain(&r.sigma)
-            .copied()
-            .collect()
+        r.theta.iter().chain(r.omega.iter()).chain(&r.sigma).copied().collect()
     };
     let d_par = worst(&pars(exact), &pars(forced));
     let d_se = match (&exact.se_theta, &forced.se_theta) {
@@ -103,14 +91,8 @@ fn check(label: &str, exact: &FitResult, forced: &FitResult, tol: [f64; 3]) {
     eprintln!(
         "{label}: |ΔOFV| = {d_ofv:.3e}, max rel Δparam = {d_par:.3e}, max rel ΔSE = {d_se:.3e}"
     );
-    assert!(
-        d_ofv <= ofv_tol,
-        "{label}: |ΔOFV| = {d_ofv:e} > {ofv_tol:e}"
-    );
-    assert!(
-        d_par <= par_tol,
-        "{label}: Δparam = {d_par:e} > {par_tol:e}"
-    );
+    assert!(d_ofv <= ofv_tol, "{label}: |ΔOFV| = {d_ofv:e} > {ofv_tol:e}");
+    assert!(d_par <= par_tol, "{label}: Δparam = {d_par:e} > {par_tol:e}");
     assert!(
         d_se <= se_tol,
         "{label}: ΔSE = {d_se:e} > {se_tol:e}: {:?} vs {:?}",
@@ -123,17 +105,8 @@ fn check(label: &str, exact: &FitResult, forced: &FitResult, tol: [f64; 3]) {
         exact.warnings
     );
     let n = forced.subjects.len();
-    let w: Vec<&String> = forced
-        .warnings
-        .iter()
-        .filter(|w| w.contains(TOKEN))
-        .collect();
-    assert_eq!(
-        w.len(),
-        1,
-        "{label}: one warning, got {:?}",
-        forced.warnings
-    );
+    let w: Vec<&String> = forced.warnings.iter().filter(|w| w.contains(TOKEN)).collect();
+    assert_eq!(w.len(), 1, "{label}: one warning, got {:?}", forced.warnings);
     let want = format!(
         "W_PLAN_FD_FALLBACK: {n} of {n} subjects fell back to finite-difference derivatives \
          because their compiled plan failed ({}); results are correct but slower — please \
@@ -141,17 +114,11 @@ fn check(label: &str, exact: &FitResult, forced: &FitResult, tol: [f64; 3]) {
         super::FORCED_FAILURE
     );
     assert_eq!(*w[0], want, "{label}");
-    let entry = forced
-        .warnings_structured
-        .iter()
-        .find(|e| e.message.contains(TOKEN))
-        .expect("typed entry");
+    let entry =
+        forced.warnings_structured.iter().find(|e| e.message.contains(TOKEN)).expect("typed entry");
     assert_eq!(entry.category, WarningCode::GradientFallback);
     // Re-classified from its text (a `.fitrx` round trip) it lands in the same category.
-    assert_eq!(
-        crate::types::classify_warning(w[0]).category,
-        WarningCode::GradientFallback
-    );
+    assert_eq!(crate::types::classify_warning(w[0]).category, WarningCode::GradientFallback);
 }
 
 #[test]
@@ -176,10 +143,7 @@ fn laplace_and_agq_fall_back_to_fd() {
     let (e, f) = pair(&m, &p, &opts(EstimationMethod::Laplace));
     // Measured 2.9e-4 / 6.3e-5 / 3.3e-5.
     check("laplace", &e, &f, [2e-3, 5e-4, 3e-4]);
-    let o = FitOptions {
-        n_agq: 3,
-        ..opts(EstimationMethod::Laplace)
-    };
+    let o = FitOptions { n_agq: 3, ..opts(EstimationMethod::Laplace) };
     let (e, f) = pair(&m, &p, &o);
     // Measured 3.0e-4 / 4.7e-5 / 2.4e-5.
     check("agq3", &e, &f, [2e-3, 5e-4, 3e-4]);
@@ -191,10 +155,7 @@ fn gauss_newton_and_trust_region_fall_back_to_fd() {
     let (e, f) = pair(&m, &p, &opts(EstimationMethod::FoceGn));
     // Measured 2.2e-6 / 1.1e-8 / 2.7e-4.
     check("gn", &e, &f, [2e-5, 1e-6, 2e-3]);
-    let o = FitOptions {
-        optimizer: Optimizer::TrustRegion,
-        ..opts(EstimationMethod::FoceI)
-    };
+    let o = FitOptions { optimizer: Optimizer::TrustRegion, ..opts(EstimationMethod::FoceI) };
     let (e, f) = pair(&m, &p, &o);
     // Measured 1.8e-5 / 3.7e-7 / 4.0e-4.
     check("trust-region", &e, &f, [2e-4, 4e-6, 3e-3]);
@@ -227,6 +188,10 @@ fn saem_falls_back_to_fd() {
         saem_seed: Some(3),
         // Every θ through the M-step's numerical score, not the mu-referenced closed form.
         mu_referencing: false,
+        // The comparison is plans against the forced fallback under ONE M-step solver. `auto`
+        // is Newton on the plans and BOBYQA (the information is gone) on the fallback: two
+        // different solves, 0.354 apart in OFV (#3001), which says nothing about the plans.
+        mstep_optimizer: crate::types::MstepOptimizer::Bobyqa,
         ..opts(EstimationMethod::Saem)
     };
     let (e, f) = pair(&m, &p, &o);
@@ -251,10 +216,7 @@ fn sde_falls_back_to_fd() {
     let (m, mut p) = example("examples/warfarin_sde.ferx", "data/warfarin_sde.csv");
     // Its finite differences re-run the filter per coordinate: a few subjects keep it short.
     p.subjects.truncate(4);
-    let o = FitOptions {
-        outer_maxiter: 0,
-        ..opts(EstimationMethod::FoceI)
-    };
+    let o = FitOptions { outer_maxiter: 0, ..opts(EstimationMethod::FoceI) };
     let (e, f) = pair(&m, &p, &o);
     // Measured 8.6e-6 / 0 / 6.3e-4.
     check("sde", &e, &f, [1e-4, 1e-8, 5e-3]);
@@ -265,10 +227,7 @@ fn sde_falls_back_to_fd() {
         ode.solver_opts.reltol = 1e-10;
         ode.solver_opts.abstol = 1e-12;
     }
-    let o = FitOptions {
-        inner_tol: 1e-10,
-        ..o
-    };
+    let o = FitOptions { inner_tol: 1e-10, ..o };
     let worst = outer_gradient_gap(&m, &p, &o);
     eprintln!("sde: worst outer-gradient gap {worst:.3e}");
     // Measured 6.6e-5 at these tolerances (8.1e-2 at the defaults, the quotient's noise).
@@ -303,10 +262,7 @@ fn outer_gradient_gap(m: &CompiledModel, pop: &Population, o: &FitOptions) -> f6
         let eta = ebe.eta.as_slice();
         let exact = adjoint(s, eta).expect("exact gradient");
         let fd = plans_failing(|| {
-            assert!(
-                adjoint(s, eta).is_none(),
-                "the failed plan declines the gradient"
-            );
+            assert!(adjoint(s, eta).is_none(), "the failed plan declines the gradient");
             crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
                 &x, params, m, s, &ebe.eta, &bounds, o,
             )
@@ -344,30 +300,7 @@ fn non_gaussian_curvature_falls_back_to_fd() {
     }
 }
 
-const MIXTURE: &str = r"
-[parameters]
-  theta TVCL1(1.2, 0.01, 100.0)
-  theta TVCL2(2.5, 0.01, 100.0)
-  theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  theta BWT(0.0, -5.0, 5.0)
-  omega ETA_CL ~ 0.05
-  sigma EPS ~ 0.01
-
-[mixture]
-  nsub = 2
-  logit(1) = MIXL + BWT*(WT - 75)
-
-[individual_parameters]
-  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
-  V  = TVV
-
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-
-[error_model]
-  DV ~ proportional(EPS)
-";
+const MIXTURE: &str = crate::test_models::ONE_CPT_IV_18;
 
 #[test]
 fn mixture_falls_back_to_fd() {
@@ -409,7 +342,6 @@ fn mixture_falls_back_to_fd() {
         crate::estimation::mixture::mixture_gradient_salvaged(
             &model, &pop, params, &o, &eval, None, &log,
         )
-        .expect("a mixture gradient")
     };
     let exact = grad();
     let fd = plans_failing(grad);
@@ -465,10 +397,7 @@ fn no_example_model_falls_back_with_plans_working() {
         }
         let file = dir.path().join(path.file_name().expect("name"));
         std::fs::write(&file, out.join("\n")).expect("write");
-        let overrides = crate::api::RunOverrides {
-            threads: Some(1),
-            ..Default::default()
-        };
+        let overrides = crate::api::RunOverrides { threads: Some(1), ..Default::default() };
         let fit = match crate::api::run_model_simulate_with_overrides(
             file.to_str().expect("utf8"),
             &overrides,
@@ -493,10 +422,7 @@ fn no_example_model_falls_back_with_plans_working() {
     // Measured: 20 example models simulate and fit with `survival`, 19 without it (an
     // `[event_model]` example does not parse in a build without the feature).
     let want = if cfg!(feature = "survival") { 20 } else { 19 };
-    assert!(
-        n >= want,
-        "only {n} example models were simulated and fitted"
-    );
+    assert!(n >= want, "only {n} example models were simulated and fitted");
 }
 
 /// The standalone post-fit steps report a failed plan too (#2786 review #11): `run_covariance`
@@ -516,10 +442,7 @@ fn standalone_covariance_and_sir_report_the_fallback() {
         ..opts(EstimationMethod::FoceI)
     };
     let mut fit = crate::api::fit(&m, &p, &m.default_params, &base).expect("fit");
-    assert!(
-        fit.covariance_matrix.is_some(),
-        "the fit carries a covariance"
-    );
+    assert!(fit.covariance_matrix.is_some(), "the fit carries a covariance");
     let n = p.subjects.len();
     // The estimation's own report, which a step did not rerun.
     let own = format!("{TOKEN}: 99 of {n} subjects fell back (from the fit)");
@@ -537,31 +460,13 @@ fn standalone_covariance_and_sir_report_the_fallback() {
         let tag = format!("{TOKEN} ({name}):");
         let of_step = |r: &FitResult| r.warnings.iter().filter(|w| w.starts_with(&tag)).count();
         let exact = step(&fit, &m, &p, &base);
-        assert_eq!(
-            of_step(&exact),
-            0,
-            "{label}: plans held: {:?}",
-            exact.warnings
-        );
-        assert!(
-            exact.warnings.contains(&own),
-            "{label}: the fit's report is kept"
-        );
+        assert_eq!(of_step(&exact), 0, "{label}: plans held: {:?}", exact.warnings);
+        assert!(exact.warnings.contains(&own), "{label}: the fit's report is kept");
         let forced = plans_failing(|| step(&fit, &m, &p, &base));
         assert_eq!(of_step(&forced), 1, "{label}: {:?}", forced.warnings);
-        assert!(
-            forced.warnings.contains(&own),
-            "{label}: the fit's report is kept"
-        );
-        let w = forced
-            .warnings
-            .iter()
-            .find(|w| w.starts_with(&tag))
-            .unwrap();
-        assert!(
-            w.contains(super::FORCED_FAILURE),
-            "{label}: the reason: {w}"
-        );
+        assert!(forced.warnings.contains(&own), "{label}: the fit's report is kept");
+        let w = forced.warnings.iter().find(|w| w.starts_with(&tag)).unwrap();
+        assert!(w.contains(super::FORCED_FAILURE), "{label}: the reason: {w}");
         assert!(w.contains(name), "{label}: names the step: {w}");
         let e = forced
             .warnings_structured
@@ -594,11 +499,7 @@ fn exact_and_matches_fd(label: &str, model: &str, data: &str) -> f64 {
     let (m, p) = from_text(model, data);
     let o = opts(EstimationMethod::FoceI);
     let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
-    assert!(
-        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{label}: {:?}",
-        fit.warnings
-    );
+    assert!(!fit.warnings.iter().any(|w| w.contains(TOKEN)), "{label}: {:?}", fit.warnings);
     let gap = outer_gradient_gap(&m, &p, &o);
     eprintln!("{label}: worst outer-gradient gap {gap:.3e}");
     gap
@@ -709,11 +610,7 @@ fn a_reset_steady_state_dose_with_f_and_ruv_eta_plans_without_fallback() {
     let evid1 = SS_RESET_F_LOGADD_DATA.replace("1,0,4,1,0,20", "1,0,1,1,0,20");
     assert_ne!(evid1, SS_RESET_F_LOGADD_DATA);
     let gaps = [
-        exact_and_matches_fd(
-            "ss_reset_f_logadd",
-            SS_RESET_F_LOGADD,
-            SS_RESET_F_LOGADD_DATA,
-        ),
+        exact_and_matches_fd("ss_reset_f_logadd", SS_RESET_F_LOGADD, SS_RESET_F_LOGADD_DATA),
         exact_and_matches_fd("ss_evid1_f_logadd", SS_RESET_F_LOGADD, &evid1),
     ];
     for g in gaps {
@@ -784,10 +681,7 @@ fn the_route_labels_name_a_plan_fallback() {
     use crate::api::postfit::plan_fallback_label as lab;
     assert_eq!(lab("analytic", 0, 4), "analytic");
     assert_eq!(lab("analytic", 1, 4), "analytic ×3, FD ×1");
-    assert_eq!(
-        lab("analytic", 4, 4),
-        "finite differences (compiled plan failed)"
-    );
+    assert_eq!(lab("analytic", 4, 4), "finite differences (compiled plan failed)");
     assert_eq!(lab("N/A", 4, 4), "N/A");
 }
 
@@ -846,16 +740,9 @@ fn an_ode_expression_scale_on_an_individual_parameter_plans_without_fallback() {
     let model = TWO_CPT_AMOUNTS;
     let data = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT\n1,0,1,1,.,100,100,1\n1,0.5,0,0,4.2931,0,0,1\n1,1.0,0,0,4.2024,0,0,1\n1,2.0,0,0,3.2577,0,0,1\n1,4.0,0,0,2.9236,0,0,1\n1,8.0,0,0,1.9541,0,0,1\n1,24.0,0,0,0.5111,0,0,1\n2,0,1,1,.,100,100,1\n2,0.5,0,0,3.9917,0,0,1\n2,1.0,0,0,3.9186,0,0,1\n2,2.0,0,0,3.6982,0,0,1\n2,4.0,0,0,2.7256,0,0,1\n2,8.0,0,0,1.8316,0,0,1\n2,24.0,0,0,0.5425,0,0,1\n3,0,1,1,.,100,100,1\n3,0.5,0,0,3.6904,0,0,1\n3,1.0,0,0,3.6348,0,0,1\n3,2.0,0,0,3.4465,0,0,1\n3,4.0,0,0,2.5276,0,0,1\n3,8.0,0,0,1.7090,0,0,1\n3,24.0,0,0,0.5245,0,0,1\n4,0,1,1,.,100,100,1\n4,0.5,0,0,4.2177,0,0,1\n4,1.0,0,0,4.1315,0,0,1\n4,2.0,0,0,3.1948,0,0,1\n4,4.0,0,0,2.8741,0,0,1\n4,8.0,0,0,1.9235,0,0,1\n4,24.0,0,0,0.5066,0,0,1\n5,0,1,1,.,100,100,1\n5,0.5,0,0,3.9164,0,0,1\n5,1.0,0,0,3.8477,0,0,1\n5,2.0,0,0,3.6353,0,0,1\n5,4.0,0,0,2.6761,0,0,1\n5,8.0,0,0,1.8009,0,0,1\n5,24.0,0,0,0.5380,0,0,1\n6,0,1,1,.,100,100,1\n6,0.5,0,0,4.4438,0,0,1\n6,1.0,0,0,3.5639,0,0,1\n6,2.0,0,0,3.3836,0,0,1\n6,4.0,0,0,3.0226,0,0,1\n6,8.0,0,0,1.6784,0,0,1\n6,24.0,0,0,0.5200,0,0,1";
     let (m, p) = from_text(model, data);
-    let o = FitOptions {
-        outer_maxiter: 25,
-        ..opts(EstimationMethod::FoceI)
-    };
+    let o = FitOptions { outer_maxiter: 25, ..opts(EstimationMethod::FoceI) };
     let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
-    assert!(
-        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
-        fit.warnings
-    );
+    assert!(!fit.warnings.iter().any(|w| w.contains(TOKEN)), "{:?}", fit.warnings);
     assert!(fit.converged, "converged");
     let gap = exact_and_matches_fd("ode obs_scale = V1", model, data);
     assert!(gap.is_finite() && gap < GAP_TOL, "{gap:e}");
@@ -953,11 +840,8 @@ fn one_fit(m: &CompiledModel, p: &Population) -> FitResult {
 #[test]
 fn a_twin_plan_failure_is_reported_and_leaves_with_the_fit() {
     let (m, p) = from_text(TRANSIT_TV, TRANSIT_TV_DATA);
-    let twin = m
-        .absorption_ode_equivalent
-        .as_ref()
-        .expect("a transit model carries its ODE twin")
-        .built();
+    let twin =
+        m.absorption_ode_equivalent.as_ref().expect("a transit model carries its ODE twin").built();
     let (twin_id, id) = (twin.plan_id.get(), m.plan_id.get());
     let forced = plans_failing(|| one_fit(&m, &p));
     let n = p.subjects.len();
@@ -969,20 +853,13 @@ fn a_twin_plan_failure_is_reported_and_leaves_with_the_fit() {
         "{:?}",
         forced.warnings
     );
-    assert_eq!(
-        forced.gradient_method_inner,
-        "finite differences (compiled plan failed)"
-    );
+    assert_eq!(forced.gradient_method_inner, "finite differences (compiled plan failed)");
     // Nothing of the failed fit is left: not the twin's marks, not the model's.
     assert_eq!(state_of(twin_id), 0, "the twin's state outlived the fit");
     assert_eq!(state_of(id), 0, "the model's state outlived the fit");
     // A later fit, plans unforced, records fresh and reports nothing.
     let later = one_fit(&m, &p);
-    assert!(
-        !later.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
-        later.warnings
-    );
+    assert!(!later.warnings.iter().any(|w| w.contains(TOKEN)), "{:?}", later.warnings);
     assert_eq!(later.gradient_method_inner, "analytic");
     // A failure filed under the twin's own id alone is the fit's too (the fit above may also
     // have failed plans of the model itself, which would hide a twin that is not counted).
@@ -1043,11 +920,7 @@ fn overlapping_fits_of_one_model_keep_their_failures_apart() {
         (a.join().expect("A"), b.join().expect("B"))
     });
     assert!(fa.warnings.iter().any(|w| w.contains(TOKEN)));
-    assert!(
-        !fb.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
-        fb.warnings
-    );
+    assert!(!fb.warnings.iter().any(|w| w.contains(TOKEN)), "{:?}", fb.warnings);
     assert_eq!(fb.gradient_method_inner, "analytic");
 }
 
@@ -1060,10 +933,7 @@ fn overlapping_fits_of_one_model_keep_their_failures_apart() {
 #[test]
 fn fits_over_the_same_objects_keep_their_plan_failures_apart() {
     let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
-    let o = FitOptions {
-        threads: Some(2),
-        ..opts(EstimationMethod::FoceI)
-    };
+    let o = FitOptions { threads: Some(2), ..opts(EstimationMethod::FoceI) };
     let fit = || crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
     let barrier = std::sync::Barrier::new(2);
     let (fa, fb) = std::thread::scope(|sc| {
@@ -1085,11 +955,7 @@ fn fits_over_the_same_objects_keep_their_plan_failures_apart() {
         "{:?}",
         fa.warnings
     );
-    assert!(
-        !fb.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
-        fb.warnings
-    );
+    assert!(!fb.warnings.iter().any(|w| w.contains(TOKEN)), "{:?}", fb.warnings);
     assert_eq!(fb.gradient_method_inner, "analytic");
 }
 
@@ -1141,16 +1007,9 @@ fn an_outer_only_failure_keeps_the_inner_label() {
     let guard = register(&m, &p.subjects);
     note_model_failure(&m, "a θ-only recording: test");
     let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
-    assert!(
-        fit.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
-        fit.warnings
-    );
+    assert!(fit.warnings.iter().any(|w| w.contains(TOKEN)), "{:?}", fit.warnings);
     assert_eq!(fit.gradient_method_inner, "analytic");
-    assert_eq!(
-        fit.gradient_method_outer,
-        "finite differences (compiled plan failed)"
-    );
+    assert_eq!(fit.gradient_method_outer, "finite differences (compiled plan failed)");
     drop(guard);
     // The counts, per route.
     let _g = register(&m, &p.subjects);
@@ -1179,11 +1038,7 @@ fn a_kernel_failure_counts_the_subject_whose_data_it_is() {
     let _g = register(&m, &p.subjects);
     let key =
         |s: &crate::types::Subject| SubjectKey::new(&m, s, 0, 3).with_kind(8).with_observed(s);
-    assert_ne!(
-        key(&p.subjects[0]),
-        key(&p.subjects[1]),
-        "fixture: data differ"
-    );
+    assert_ne!(key(&p.subjects[0]), key(&p.subjects[1]), "fixture: data differ");
     note_failure(&key(&p.subjects[1]), "kernel");
     let c = plan_failure_counts(&m, &p.subjects).expect("counted");
     assert_eq!(c.any, 1);
@@ -1209,11 +1064,7 @@ fn a_point_failure_counts_the_subject_that_failed_not_its_design_twins() {
     let (m, p) = from_text(TWO_CPT_TV, data);
     let _g = register(&m, &p.subjects);
     let key = |s: &crate::types::Subject| SubjectKey::new(&m, s, 2, 6);
-    assert_eq!(
-        key(&p.subjects[0]),
-        key(&p.subjects[1]),
-        "fixture: one design, one shared plan"
-    );
+    assert_eq!(key(&p.subjects[0]), key(&p.subjects[1]), "fixture: one design, one shared plan");
     super::note_point_failure(&key(&p.subjects[1]), "point");
     let c = plan_failure_counts(&m, &p.subjects).expect("counted");
     assert_eq!((c.any, c.inner, c.outer), (1, 1, 1));
@@ -1262,17 +1113,11 @@ fn a_standalone_step_keeps_the_fits_route_labels_and_warning() {
     let out = crate::run_covariance(&forced, Some(&m), Some(&p), &o).expect("run_covariance");
     assert_eq!(out.gradient_method_inner, forced.gradient_method_inner);
     assert_eq!(out.gradient_method_outer, forced.gradient_method_outer);
-    let kept = |r: &FitResult| {
-        r.warnings
-            .iter()
-            .filter(|w| w.starts_with(&format!("{TOKEN}:")))
-            .count()
-    };
+    let kept =
+        |r: &FitResult| r.warnings.iter().filter(|w| w.starts_with(&format!("{TOKEN}:"))).count();
     assert_eq!(kept(&out), kept(&forced), "the fit's warning is kept");
     assert!(
-        !out.warnings
-            .iter()
-            .any(|w| w.contains("(the covariance step)")),
+        !out.warnings.iter().any(|w| w.contains("(the covariance step)")),
         "a clean step adds none: {:?}",
         out.warnings
     );
@@ -1280,11 +1125,7 @@ fn a_standalone_step_keeps_the_fits_route_labels_and_warning() {
     let failed = plans_failing(|| {
         crate::run_covariance(&exact, Some(&m), Some(&p), &o).expect("run_covariance")
     });
-    let lines = failed
-        .warnings
-        .iter()
-        .filter(|w| w.contains("(the covariance step)"))
-        .count();
+    let lines = failed.warnings.iter().filter(|w| w.contains("(the covariance step)")).count();
     assert_eq!(lines, 1, "{:?}", failed.warnings);
     assert_eq!(failed.gradient_method_inner, exact.gradient_method_inner);
     assert_eq!(failed.gradient_method_outer, exact.gradient_method_outer);
@@ -1307,14 +1148,8 @@ fn a_standalone_step_keeps_the_fits_route_labels_and_warning() {
 fn the_inner_solve_decides_the_evaluated_model_once_per_point() {
     use crate::estimation::inner_optimizer::{find_ebe, EVAL_ROUTE_LOG};
     let fixtures = [
-        (
-            "transit with a time-varying covariate",
-            from_text(TRANSIT_TV, TRANSIT_TV_DATA),
-        ),
-        (
-            "closed form",
-            example("examples/warfarin.ferx", "data/warfarin.csv"),
-        ),
+        ("transit with a time-varying covariate", from_text(TRANSIT_TV, TRANSIT_TV_DATA)),
+        ("closed form", example("examples/warfarin.ferx", "data/warfarin.csv")),
     ];
     for (label, (m, p)) in fixtures {
         EVAL_ROUTE_LOG.with(|l| l.borrow_mut().clear());
@@ -1322,18 +1157,9 @@ fn the_inner_solve_decides_the_evaluated_model_once_per_point() {
             let _ = find_ebe(&m, s, &m.default_params, 200, 1e-6, None, None, 0);
         }
         let log = EVAL_ROUTE_LOG.with(|l| l.borrow().clone());
-        assert!(
-            log.len() >= 3,
-            "{label}: the solve decided {} points",
-            log.len()
-        );
+        assert!(log.len() >= 3, "{label}: the solve decided {} points", log.len());
         let repeats = log.windows(2).filter(|w| w[0] == w[1]).count();
-        assert_eq!(
-            repeats,
-            0,
-            "{label}: {repeats} of {} decisions repeat",
-            log.len()
-        );
+        assert_eq!(repeats, 0, "{label}: {repeats} of {} decisions repeat", log.len());
     }
 }
 
@@ -1367,11 +1193,7 @@ fn floor_ceil_round_of_a_dependent_value_do_not_fall_back() {
     .expect("read data");
     let o = opts(EstimationMethod::FoceI);
     let fit = crate::api::fit(&parsed.model, &pop, &parsed.model.default_params, &o).expect("fit");
-    assert!(
-        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
-        fit.warnings
-    );
+    assert!(!fit.warnings.iter().any(|w| w.contains(TOKEN)), "{:?}", fit.warnings);
     assert!(fit.ofv.is_finite());
     // Straddle: the same fit with every plan failing does report the fallback, so the absence
     // above is the plan serving the subject, not the warning being unreachable.
@@ -1386,11 +1208,7 @@ fn floor_ceil_round_of_a_dependent_value_do_not_fall_back() {
 /// A three-subject steady-state bolus dose (`II = ii`) into the two-compartment amounts ODE.
 fn ss_bolus_data(ii: f64) -> String {
     let mut s = String::from("ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,II,SS\n");
-    for (id, dv) in [
-        (1, [4.0, 3.5, 3.0]),
-        (2, [4.2, 3.7, 3.1]),
-        (3, [3.8, 3.4, 2.9]),
-    ] {
+    for (id, dv) in [(1, [4.0, 3.5, 3.0]), (2, [4.2, 3.7, 3.1]), (3, [3.8, 3.4, 2.9])] {
         s += &format!("{id},0,1,1,.,100,0,1,{ii},1\n");
         for (t, y) in [0.5, 1.0, 2.0].iter().zip(dv) {
             s += &format!("{id},{t},0,0,{y},0,0,1,0,0\n");
@@ -1410,35 +1228,16 @@ fn ss_bolus_data(ii: f64) -> String {
 fn short_interval_and_step_limited_steady_states_plan_without_fallback() {
     for (label, cl, q, ii, extra) in [
         ("tiny II", "5.0", "2.0", 0.001, ""),
-        (
-            "fast Q, step-limited",
-            "5.0",
-            "50000.0",
-            1.0,
-            "\n  ode_max_steps = 40",
-        ),
+        ("fast Q, step-limited", "5.0", "50000.0", 1.0, "\n  ode_max_steps = 40"),
     ] {
         let model = TWO_CPT_AMOUNTS
-            .replace(
-                "theta TVCL(5.0, 0.1, 100.0)",
-                &format!("theta TVCL({cl}, 1e-6, 100.0)"),
-            )
-            .replace(
-                "theta TVQ(2.0, 0.05, 50.0)",
-                &format!("theta TVQ({q}, 0.05, 1e6)"),
-            )
+            .replace("theta TVCL(5.0, 0.1, 100.0)", &format!("theta TVCL({cl}, 1e-6, 100.0)"))
+            .replace("theta TVQ(2.0, 0.05, 50.0)", &format!("theta TVQ({q}, 0.05, 1e6)"))
             .replace("covariance = false", &format!("covariance = false{extra}"));
         let (m, p) = from_text(&model, &ss_bolus_data(ii));
-        let o = FitOptions {
-            outer_maxiter: 3,
-            ..opts(EstimationMethod::FoceI)
-        };
+        let o = FitOptions { outer_maxiter: 3, ..opts(EstimationMethod::FoceI) };
         let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
-        assert!(
-            !fit.warnings.iter().any(|w| w.contains(TOKEN)),
-            "{label}: {:?}",
-            fit.warnings
-        );
+        assert!(!fit.warnings.iter().any(|w| w.contains(TOKEN)), "{label}: {:?}", fit.warnings);
         assert!(fit.ofv.is_finite(), "{label}: {}", fit.ofv);
     }
 }
@@ -1476,20 +1275,11 @@ fn an_overflowing_growth_state_is_repelled_not_sent_to_finite_differences() {
             &format!("{id},0,1,1,.,1,0,1\n{id},100,0,0,1e150,0,0,1\n{id},200,0,0,1e300,0,0,1\n");
     }
     let (m, p) = from_text(GROWTH, &data);
-    let o = FitOptions {
-        outer_maxiter: 3,
-        ..opts(EstimationMethod::FoceI)
-    };
+    let o = FitOptions { outer_maxiter: 3, ..opts(EstimationMethod::FoceI) };
     let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
+    assert!(!fit.warnings.iter().any(|w| w.contains(TOKEN)), "{:?}", fit.warnings);
     assert!(
-        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
-        fit.warnings
-    );
-    assert!(
-        fit.warnings
-            .iter()
-            .any(|w| w.contains("W_NO_FEASIBLE_EVAL")),
+        fit.warnings.iter().any(|w| w.contains("W_NO_FEASIBLE_EVAL")),
         "every trial is repelled: {:?}",
         fit.warnings
     );

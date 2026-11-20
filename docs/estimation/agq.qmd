@@ -356,10 +356,12 @@ The fit output reports which route ran.
 
 A subject inside the scope can still miss the exact gradient at one trial point. If the inner
 search stops short of the mode (a Nelder–Mead fallback, for example) and the exact Hessian there
-is indefinite, the identity behind the exact score does not hold. The subject then takes the
-analytic gradient at its held EBE, which leaves out the EBE-response term, the same salvage
-FOCE and FOCEI use. The outer gradient fallback warning counts these subjects. The covariance
-step never uses a held-EBE score: it takes the exact score or the reconverged one.
+is indefinite, the identity behind the exact score does not hold. The subject then takes
+the exact score at its EBE re-solved at the trial point, which is stationary, so the identity
+holds there; where no recorder serves it either, it takes the reconverged finite-difference
+score. Neither leaves out the EBE-response term, which a held-EBE gradient would, and the
+outer gradient fallback warning counts only the reconverged subjects. The covariance step
+takes the exact score or the reconverged one the same way.
 
 ### Where AGQ stops
 
@@ -428,7 +430,7 @@ The analytic R-matrix supports every quadrature fit, under either anchor:
 | `method = laplace`, any `n_agq` | the quadrature marginal under the exact anchor |
 
 It is the gradient's identity one order up: `Uᵀ∇²Ψ U`, with `U = [I; dη̂/dx]` the mode's
-tangent, by reverse over forward through the same recorder and kernel
+tangent, by forward over reverse through the same recorder and kernel
 ([the R-matrix](foce.qmd#sensitivity-assembly)). Under the exact anchor the predictions
 carry `∂²f/∂η²` on an inner η-dual, so the fourth derivative `∂²H/∂x²` needs is exact too.
 That case is what used to keep `method = laplace` on the finite-difference stencil.
@@ -444,7 +446,7 @@ The analytic route is taken for every subject a recorder serves, including IOV
 (correlated blocks shared across occasions), LTBS, observation scaling and the TTE, binary
 and CTMM endpoints, at any number of random effects (stacked under IOV) and under either
 anchor. A subject outside the scope is
-finite-differenced on its own, and a mixture or `gradient = fd` keeps the whole-population
+finite-differenced on its own, and `gradient = fd` keeps the whole-population
 stencil. The anchor must be positive-definite at the subject's **mode**. At a quadrature
 node it may be indefinite (common in the tails of a wide-Ω grid), since the assembly
 never inverts it there.
@@ -496,7 +498,7 @@ own quadrature objective:
   equality and confirms that the old inverse round trip changes the fixture's entries.
 
 Since #486 the assembly differences nothing: the R-matrix is `Uᵀ∇²Ψ U` at the mode,
-by reverse over forward through the same recorder and quadrature kernel the
+by forward over reverse through the same recorder and quadrature kernel the
 adjoint gradient uses, the grid's dependence on the anchor included (see
 [FOCE / FOCEI](foce.qmd) for the identity).
 
@@ -541,9 +543,9 @@ read, and the error names the occasion count so the cause is obvious.
 - Subjects outside the adjoint's scope take a reconverged finite-difference score
   rather than an analytic one (see [Scope](#scope)). The gradient is the same, but each
   iteration is slower.
-- Mixture models support plain FOCEI, but `focei` with `n_agq > 1` is rejected:
-  the mixture engine does not yet integrate each class by quadrature. It must not
-  silently ignore the node count.
+- Mixture models run under `laplace` and under `focei` with `n_agq > 1` too: each class is
+  scored with this page's subject objective at the class's own mode (see
+  [Mixture models](mixture.qmd#laplace-and-agq)).
 
 ## Method boundaries
 

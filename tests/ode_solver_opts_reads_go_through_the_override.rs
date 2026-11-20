@@ -40,10 +40,7 @@ fn source_roots() -> Vec<PathBuf> {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut roots = vec![repo.join("src")];
     for entry in std::fs::read_dir(repo.join("crates")).expect("crates/ must be readable") {
-        let member = entry
-            .expect("a readable directory entry")
-            .path()
-            .join("src");
+        let member = entry.expect("a readable directory entry").path().join("src");
         if member.is_dir() {
             roots.push(member);
         }
@@ -64,10 +61,7 @@ fn production_lines(src: &str, is_test_file: bool) -> Vec<(usize, &str)> {
         // A sibling test file (`<file>_tests.rs`) is test code in its entirety.
         return Vec::new();
     }
-    src.lines()
-        .enumerate()
-        .take_while(|(_, l)| l.trim() != "#[cfg(test)]")
-        .collect()
+    src.lines().enumerate().take_while(|(_, l)| l.trim() != "#[cfg(test)]").collect()
 }
 
 #[test]
@@ -101,9 +95,7 @@ fn no_production_code_reads_the_baked_solver_opts_field() {
             // `ode.solver_opts.reltol = opts.ode_reltol;` — the parse-time stamping, which is
             // the writer this whole mechanism merges on top of.
             if t.contains(" = ")
-                && t.split(" = ")
-                    .next()
-                    .is_some_and(|l| l.contains(".solver_opts"))
+                && t.split(" = ").next().is_some_and(|l| l.contains(".solver_opts"))
             {
                 continue;
             }
@@ -154,10 +146,8 @@ fn the_test_module_boundary_ignores_a_comment_that_names_the_attribute() {
 
     // …while a real attribute still ends the production region, so a test module keeps its
     // licence to read the baked field.
-    let production = production_lines(
-        "fn f() {}\n#[cfg(test)]\nmod t { spec.solver_opts }\n",
-        false,
-    );
+    let production =
+        production_lines("fn f() {}\n#[cfg(test)]\nmod t { spec.solver_opts }\n", false);
     assert_eq!(production.len(), 1);
 
     // And a sibling `_tests.rs` file is test code start to finish.

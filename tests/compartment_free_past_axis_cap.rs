@@ -148,11 +148,8 @@ fn evaluate(n_pad: usize, fix: bool) -> (Vec<String>, FitResult) {
     let data = dir.path().join("emax.csv");
     std::fs::write(&data, DATA).unwrap();
     let pop = read_nonmem_csv(&data, None, None).expect("data loads");
-    let options = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    };
+    let options =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() };
     let r = fit(&parsed.model, &pop, &parsed.model.default_params, &options).expect("fit runs");
     (parsed.model.parse_warnings.clone(), r)
 }
@@ -202,9 +199,6 @@ fn compartment_free_route_ignores_the_old_axis_cap_and_fix_theta() {
                     || w.contains("estimates 25")
             })
             .collect();
-        assert!(
-            stale.is_empty(),
-            "{label}: unexpected warning(s): {stale:?}"
-        );
+        assert!(stale.is_empty(), "{label}: unexpected warning(s): {stale:?}");
     }
 }

@@ -40,11 +40,7 @@ const MODEL: &str = "\
 fn data(last: u32) -> String {
     let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,GRP\n");
     for id in 1..=12u32 {
-        let g = if id == 12 {
-            last
-        } else {
-            [1, 2, 2, 3][(id as usize - 1) % 4]
-        };
+        let g = if id == 12 { last } else { [1, 2, 2, 3][(id as usize - 1) % 4] };
         let dv = 2.0 + 0.1 * f64::from(id);
         s.push_str(&format!("{id},0,.,1,100,1,1,{g}\n"));
         s.push_str(&format!("{id},1,{dv},0,.,1,0,{g}\n"));
@@ -64,11 +60,7 @@ fn predict_after_bind_from_fit_refuses_a_level_the_fit_never_saw() {
     let dir = tempfile::tempdir().expect("tempdir");
     let model_path = write(&dir, "m.ferx", MODEL);
     let fit_data = write(&dir, "fit.csv", &data(3));
-    let opts = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 0, run_covariance_step: false, ..FitOptions::default() };
     let fit = ferx_core::fit_from_files(
         model_path.to_str().unwrap(),
         Some(fit_data.to_str().unwrap()),
@@ -100,10 +92,7 @@ fn predict_after_bind_from_fit_refuses_a_level_the_fit_never_saw() {
     // rather than on this text (#1746).
     assert_eq!(err.code(), Some("E_COV_LEVEL_UNKNOWN"), "{err}");
     let e = err.to_string();
-    assert!(
-        e.contains("has the fit's levels [1.0, 2.0, 3.0] (reference 2)"),
-        "{e}"
-    );
+    assert!(e.contains("has the fit's levels [1.0, 2.0, 3.0] (reference 2)"), "{e}");
     assert!(e.contains("`GRP` takes [4.0] in this data"), "{e}");
     assert!(e.contains("The fit estimated no θ for these values"), "{e}");
     assert!(!e.contains("levels = auto"), "{e}");

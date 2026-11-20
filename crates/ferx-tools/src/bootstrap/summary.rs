@@ -79,11 +79,7 @@ pub fn percentile(sorted: &[f64], pct: f64) -> Option<f64> {
     let idx = i as usize; // 1-based in the formula
     let lo = sorted[idx - 1];
     // `i == n-1` lands exactly on the last element, with `f == 0`.
-    let hi = if idx < sorted.len() {
-        sorted[idx]
-    } else {
-        sorted[idx - 1]
-    };
+    let hi = if idx < sorted.len() { sorted[idx] } else { sorted[idx - 1] };
     Some((1.0 - f) * lo + f * hi)
 }
 
@@ -184,9 +180,7 @@ pub fn exclusion_reason(r: &ReplicateResult, options: &BootstrapOptions) -> Opti
 /// bias and for the standard-error interval, and is never itself part of the
 /// bootstrap distribution.
 pub fn summarize(
-    names: &[String],
-    original: Option<&ReplicateResult>,
-    replicates: &[ReplicateResult],
+    names: &[String], original: Option<&ReplicateResult>, replicates: &[ReplicateResult],
     options: &BootstrapOptions,
 ) -> BootstrapSummary {
     let n_completed = replicates.iter().filter(|r| r.error.is_none()).count();
@@ -222,11 +216,7 @@ pub fn summarize(
             .filter(|v| v.is_finite())
             .collect();
         let n = values.len();
-        let mean = if n == 0 {
-            f64::NAN
-        } else {
-            values.iter().sum::<f64>() / n as f64
-        };
+        let mean = if n == 0 { f64::NAN } else { values.iter().sum::<f64>() / n as f64 };
         // Sample standard deviation (n−1). The bootstrap distribution is a
         // sample from the sampling distribution, so the unbiased divisor is the
         // right one; with n=1 there is no spread to report.
@@ -238,10 +228,7 @@ pub fn summarize(
         let mut sorted = values.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite values sort"));
         let median = percentile(&sorted, 50.0).unwrap_or(f64::NAN);
-        let ci_percentile = match (
-            percentile(&sorted, alpha),
-            percentile(&sorted, 100.0 - alpha),
-        ) {
+        let ci_percentile = match (percentile(&sorted, alpha), percentile(&sorted, 100.0 - alpha)) {
             (Some(lo), Some(hi)) => Some((lo, hi)),
             _ => None,
         };
@@ -288,30 +275,12 @@ fn diagnostic_means(replicates: &[ReplicateResult]) -> Vec<(String, f64)> {
         completed.iter().filter(|r| f(r)).count() as f64 / n
     };
     vec![
-        (
-            "minimization_successful".to_string(),
-            frac(&|r| r.converged),
-        ),
-        (
-            "estimate_near_boundary".to_string(),
-            frac(&|r| r.estimate_near_boundary),
-        ),
-        (
-            "covariance_step_successful".to_string(),
-            frac(&|r| r.covariance_step_successful),
-        ),
-        (
-            "covariance_step_warnings".to_string(),
-            frac(&|r| r.covariance_step_warnings),
-        ),
-        (
-            "ofv".to_string(),
-            completed.iter().map(|r| r.ofv).sum::<f64>() / n,
-        ),
-        (
-            "subproblem_est_time".to_string(),
-            completed.iter().map(|r| r.seconds).sum::<f64>() / n,
-        ),
+        ("minimization_successful".to_string(), frac(&|r| r.converged)),
+        ("estimate_near_boundary".to_string(), frac(&|r| r.estimate_near_boundary)),
+        ("covariance_step_successful".to_string(), frac(&|r| r.covariance_step_successful)),
+        ("covariance_step_warnings".to_string(), frac(&|r| r.covariance_step_warnings)),
+        ("ofv".to_string(), completed.iter().map(|r| r.ofv).sum::<f64>() / n),
+        ("subproblem_est_time".to_string(), completed.iter().map(|r| r.seconds).sum::<f64>() / n),
     ]
 }
 

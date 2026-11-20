@@ -43,11 +43,7 @@ fn sponsor_pop() -> Population {
         subject.doses.clear();
         subject.covariates = snap(0, rows[0].1, rows[0].2);
         subject.obs_times = rows.iter().map(|r| r.0).collect();
-        subject.obs_covariates = rows
-            .iter()
-            .enumerate()
-            .map(|(j, r)| snap(j, r.1, r.2))
-            .collect();
+        subject.obs_covariates = rows.iter().enumerate().map(|(j, r)| snap(j, r.1, r.2)).collect();
         subject.observations = vec![1.0; n];
         subject.obs_cmts = vec![1; n];
         subject.cens = vec![0; n];
@@ -59,11 +55,8 @@ fn sponsor_pop() -> Population {
 /// the `E0` line, `cols` the block's columns, `contrast` its contrast (`""` = auto).
 /// The random effects `e0` does not read sit on `Z`, which `y` never reads.
 fn nested_model(e0: &str, cols: &str, contrast: &str) -> String {
-    let modifier = if contrast.is_empty() {
-        String::new()
-    } else {
-        format!(", contrast = {contrast}")
-    };
+    let modifier =
+        if contrast.is_empty() { String::new() } else { format!(", contrast = {contrast}") };
     format!(
         r#"
 [parameters]
@@ -143,28 +136,16 @@ fn each_level_measures_its_kappa_on_its_own_groups() {
     let pop = sponsor_pop();
     let rows = [
         ("STUDY", "K_ST", "SUBJ, TIME", LevelContrast::SumToZero),
-        (
-            "STUDY",
-            "K_ST",
-            "STUDY, TIME",
-            LevelContrast::SumToZeroWithin,
-        ),
+        ("STUDY", "K_ST", "STUDY, TIME", LevelContrast::SumToZeroWithin),
         ("ARM", "K_ARM", "STUDY, TIME", LevelContrast::SumToZero),
-        (
-            "ARM",
-            "K_ARM",
-            "ARMID, TIME",
-            LevelContrast::SumToZeroWithin,
-        ),
+        ("ARM", "K_ARM", "ARMID, TIME", LevelContrast::SumToZeroWithin),
     ];
     let mut wrong = Vec::new();
     for (level, kappa, cols, want) in rows {
         let text = nested_model(&format!("  E0 = TVE0 + PLACEBO + {kappa}"), cols, "");
         let got = try_bind(&text, &pop).map(|(c, _)| c);
         if got != Ok(want) {
-            wrong.push(format!(
-                "level {level}: {kappa} on [{cols}]: {got:?}, want {want:?}"
-            ));
+            wrong.push(format!("level {level}: {kappa} on [{cols}]: {got:?}, want {want:?}"));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
@@ -265,11 +246,7 @@ fn a_one_level_model_and_its_two_level_spelling_bind_alike() {
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     // Both sides of the gate: some cells refused, some bound.
-    assert!(
-        (1..cells.len() * 5).contains(&refused),
-        "{refused} of {} refused",
-        cells.len() * 5
-    );
+    assert!((1..cells.len() * 5).contains(&refused), "{refused} of {} refused", cells.len() * 5);
 }
 
 /// Two kappas at two nested levels absorbed together (#2034 review r1). On
@@ -308,9 +285,8 @@ fn kappas_at_two_levels_absorbed_together_are_parted_by_the_within_contrast() {
     assert!(err.contains(joint), "[STUDY, ARMID]: {err}");
     let mut one_arm = pop.clone();
     for s in one_arm.subjects.iter_mut() {
-        let keep: Vec<usize> = (0..s.obs_times.len())
-            .filter(|&j| s.obs_covariates[j]["ARM"] == 1.0)
-            .collect();
+        let keep: Vec<usize> =
+            (0..s.obs_times.len()).filter(|&j| s.obs_covariates[j]["ARM"] == 1.0).collect();
         s.obs_times = keep.iter().map(|&j| s.obs_times[j]).collect();
         s.obs_covariates = keep.iter().map(|&j| s.obs_covariates[j].clone()).collect();
         s.observations = vec![1.0; keep.len()];

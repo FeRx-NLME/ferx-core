@@ -46,13 +46,8 @@ fn fit_example(model: &str) -> FitResult {
     let population = read_nonmem_csv(Path::new(DATA), None, None).expect("example data must load");
     let mut opts = parsed.fit_options.clone();
     opts.verbose = false;
-    fit(
-        &parsed.model,
-        &population,
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect("the example fit returns a result")
+    fit(&parsed.model, &population, &parsed.model.default_params, &opts)
+        .expect("the example fit returns a result")
 }
 
 /// The cold objective the basin-shift restart notice quotes (`cold OFV = …`).
@@ -152,36 +147,23 @@ fn assert_restart_reported_converged(model: &str, cold_ofv: f64, probe_less_eval
         "{model}: a restart verified by the start probe is reported converged: {:?}",
         result.warnings
     );
-    assert_eq!(
-        result.left_init,
-        Some(true),
-        "{model}: the estimates left the user's start"
-    );
+    assert_eq!(result.left_init, Some(true), "{model}: the estimates left the user's start");
     assert!(!result.stationary_start, "{model}");
     assert!(
-        !result
-            .warnings_structured
-            .iter()
-            .any(|w| w.category == WarningCode::StalledAtInit),
+        !result.warnings_structured.iter().any(|w| w.category == WarningCode::StalledAtInit),
         "{model}: a recovered fit is not a stall at the inits: {:?}",
         result.warnings
     );
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_verified_basin_shift_restart_is_converged_closed_form() {
     assert_restart_reported_converged(CLOSED_FORM, -3051.324118, 87);
 }
 
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_verified_basin_shift_restart_is_converged_ode_twin() {
     assert_restart_reported_converged(ODE_TWIN, -3051.295773, 85);
 }
@@ -202,13 +184,8 @@ fn the_restart_probe_spends_only_what_is_left_of_the_fits_budget() {
     opts.verbose = false;
     opts.outer_maxiter = 20;
     opts.run_covariance_step = false;
-    let result = fit(
-        &parsed.model,
-        &population,
-        &parsed.model.default_params,
-        &opts,
-    )
-    .expect("the example fit returns a result");
+    let result = fit(&parsed.model, &population, &parsed.model.default_params, &opts)
+        .expect("the example fit returns a result");
     let budget = 20 * (7 + 1);
     eprintln!(
         "MEASURE #2707 budget {budget}: {} evaluations, converged {}",
@@ -218,10 +195,7 @@ fn the_restart_probe_spends_only_what_is_left_of_the_fits_budget() {
     // legs end at 87 evaluations, so a fit without the probe stops far below the budget, and
     // reaching it can only be the probe's legs spending what was left. Realised 160 with
     // `converged: false` on Linux x86_64 and macOS arm64.
-    assert!(
-        !result.converged,
-        "the probe was cut by the budget, so the fit is not converged"
-    );
+    assert!(!result.converged, "the probe was cut by the budget, so the fit is not converged");
     assert!(
         result.n_iterations >= budget,
         "the probe spent what was left of the budget ({} evaluations, budget {budget})",
@@ -241,17 +215,9 @@ fn the_restart_probe_spends_only_what_is_left_of_the_fits_budget() {
         "a budget spent by the probe is the fit's: {:?}",
         result.warnings
     );
-    let advice: Vec<&String> = result
-        .warnings
-        .iter()
-        .filter(|w| w.contains("increase maxiter"))
-        .collect();
-    assert_eq!(
-        advice.len(),
-        1,
-        "the fit gives the budget advice once: {:?}",
-        result.warnings
-    );
+    let advice: Vec<&String> =
+        result.warnings.iter().filter(|w| w.contains("increase maxiter")).collect();
+    assert_eq!(advice.len(), 1, "the fit gives the budget advice once: {:?}", result.warnings);
     assert!(
         advice[0].contains("(maxiter = 20)"),
         "the advice names the fit's budget: {}",

@@ -144,16 +144,7 @@ const RODAS4: RosTableau = RosTableau {
     a: [
         [0.0; 8],
         [1.544, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [
-            0.946_678_528_081_582_6,
-            0.255_701_169_898_328_4,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ],
+        [0.946_678_528_081_582_6, 0.255_701_169_898_328_4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         [
             3.314_825_187_068_521,
             2.896_124_015_972_201,
@@ -190,16 +181,7 @@ const RODAS4: RosTableau = RosTableau {
     c: [
         [0.0; 8],
         [-5.6688, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [
-            -2.430_093_356_833_875,
-            -0.206_359_915_709_191_5,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ],
+        [-2.430_093_356_833_875, -0.206_359_915_709_191_5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         [
             -0.107_352_905_815_137_5,
             -9.594_562_251_023_355,
@@ -270,16 +252,7 @@ const RODAS5P: RosTableau = RosTableau {
     a: [
         [0.0; 8],
         [3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [
-            2.849_394_379_747_939,
-            0.458_422_422_044_639_23,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ],
+        [2.849_394_379_747_939, 0.458_422_422_044_639_23, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         [
             -6.954_028_509_809_101,
             2.489_845_061_869_568,
@@ -334,16 +307,7 @@ const RODAS5P: RosTableau = RosTableau {
     c: [
         [0.0; 8],
         [-14.155_112_264_123_755, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        [
-            -17.972_960_358_859_52,
-            -2.859_693_295_451_294,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        ],
+        [-17.972_960_358_859_52, -2.859_693_295_451_294, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         [
             147.121_502_757_117_16,
             -1.412_214_027_182_13,
@@ -564,9 +528,7 @@ pub(crate) struct RhsGuard {
 
 impl RhsGuard {
     pub(crate) fn register<'a, F: Fn(&[f64], &[f64], f64, &mut [f64])>(
-        rhs: &'a F,
-        jac: Option<&'a JacFn<'a>>,
-        direct: Option<&'a DirectStep<'a>>,
+        rhs: &'a F, jac: Option<&'a JacFn<'a>>, direct: Option<&'a DirectStep<'a>>,
     ) -> Self {
         let prev = RHS_REG.with(|c| c.get());
         if jac.is_some() || direct.is_some() {
@@ -610,21 +572,14 @@ pub(crate) fn registered_direct<T: PkNum>(
     let addr = rhs as *const crate::ode::solver::RhsG<'_, T> as *const ();
     let d = RHS_REG.with(|c| c.get())?;
     // SAFETY: see above; the entry's `direct` is live while its guard is.
-    (d.rhs == addr)
-        .then_some(d.direct)
-        .flatten()
-        .map(|p| unsafe { &*p })
+    (d.rhs == addr).then_some(d.direct).flatten().map(|p| unsafe { &*p })
 }
 
 /// `rhs` at `(u, params, t)` into `du` through `direct` when it serves the call, else
 /// through `rhs` itself — the same bits either way (`DirectStep::eval`).
 #[inline(always)]
 pub(crate) fn call_direct<T: PkNum>(
-    direct: &DirectStep<'_>,
-    rhs: &crate::ode::solver::RhsG<'_, T>,
-    u: &[T],
-    params: &[T],
-    t: T,
+    direct: &DirectStep<'_>, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: T,
     du: &mut [T],
 ) {
     debug_assert_eq!(std::any::TypeId::of::<T>(), std::any::TypeId::of::<f64>());
@@ -649,8 +604,7 @@ impl RhsGuard {
     /// For a T-generic walk whose closure is built in generic code, where the closure's `f64`
     /// instance cannot be named.
     pub(crate) fn register_jac_of<'a, T: PkNum>(
-        rhs: &'a crate::ode::solver::RhsG<'_, T>,
-        jac: &'a JacFn<'a>,
+        rhs: &'a crate::ode::solver::RhsG<'_, T>, jac: &'a JacFn<'a>,
     ) -> Self {
         let prev = RHS_REG.with(|c| c.get());
         if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
@@ -673,8 +627,7 @@ impl RhsGuard {
     /// T-generic walk's right-hand side, carrying `T`'s derivatives. Only a `T` stepper that
     /// has no recording of its own (`PkNum::rhs_jacobian`) reads it.
     pub(crate) fn register_jac_g<'a, T: PkNum>(
-        rhs: &'a crate::ode::solver::RhsG<'_, T>,
-        jac: &'a &'a JacFnG<'a, T>,
+        rhs: &'a crate::ode::solver::RhsG<'_, T>, jac: &'a &'a JacFnG<'a, T>,
     ) -> Self {
         let prev = RHS_REG.with(|c| c.get());
         RHS_REG.with(|c| {
@@ -746,11 +699,7 @@ impl<T: PkNum> RosWorkspace<T> {
     /// registrations.
     #[inline(always)]
     fn refresh_jacobian<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        stage: &R,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
+        &mut self, stage: &R, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T],
         clock: &StepClock<T>,
     ) {
         let t = clock.start();
@@ -768,11 +717,7 @@ impl<T: PkNum> RosWorkspace<T> {
     /// `J` and `f_t` from the [`JacFnG`] an [`RhsGuard`] registered for exactly `rhs` over this
     /// number type; `false` (nothing written) for any other `rhs`.
     fn registered_jacobian_g(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: T,
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: T,
     ) -> bool {
         #[cfg(test)]
         if EXACT_JAC_OFF.with(|c| c.get()) {
@@ -796,11 +741,7 @@ impl<T: PkNum> RosWorkspace<T> {
     /// `J` and `f_t` from the evaluator an [`RhsGuard`] registered for exactly `rhs`
     /// (`f64` only); `false` (nothing written) for any other `rhs`, and when it declines.
     fn registered_jacobian(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64,
     ) -> bool {
         #[cfg(test)]
         if EXACT_JAC_OFF.with(|c| c.get()) {
@@ -835,11 +776,7 @@ impl<T: PkNum> RosWorkspace<T> {
     #[inline(always)]
     /// Non-recording: `T::rhs_jacobian` is `true` for a recording type, so `refresh_jacobian` never differences one.
     fn differenced_jacobian<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        rhs: &R,
-        u: &[T],
-        params: &[T],
-        clock: &StepClock<T>,
+        &mut self, rhs: &R, u: &[T], params: &[T], clock: &StepClock<T>,
     ) {
         let n = self.n;
         for j in 0..n {
@@ -852,12 +789,7 @@ impl<T: PkNum> RosWorkspace<T> {
             }
         }
         let delt = (f64::EPSILON * clock.t.abs().max(FD_FLOOR)).sqrt();
-        rhs.call(
-            u,
-            params,
-            clock.shifted(T::from_f64(delt), delt),
-            &mut self.f_tmp,
-        );
+        rhs.call(u, params, clock.shifted(T::from_f64(delt), delt), &mut self.f_tmp);
         for i in 0..n {
             self.ft[i] = (self.f_tmp[i] - self.f0[i]) * T::from_f64(1.0 / delt);
         }
@@ -901,30 +833,13 @@ impl<T: PkNum> RosWorkspace<T> {
     /// [`build_and_factor_w`](Self::build_and_factor_w) already ran for this `(u, t, dt)`.
     #[inline(always)]
     fn rodas_stages<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        rhs: &R,
-        u: &[T],
-        params: &[T],
-        clock: &StepClock<T>,
-        tab: &RosTableau,
+        &mut self, rhs: &R, u: &[T], params: &[T], clock: &StepClock<T>, tab: &RosTableau,
     ) {
         let n = self.n;
         let s = tab.stages;
         // Every buffer cut to `n` up front, so the loops index without bounds checks; the
         // operations and their order are the per-element loop's.
-        let Self {
-            ks,
-            u_tmp,
-            f_tmp,
-            f0,
-            ft,
-            rhs_tmp,
-            u_new,
-            err,
-            w,
-            piv,
-            ..
-        } = self;
+        let Self { ks, u_tmp, f_tmp, f0, ft, rhs_tmp, u_new, err, w, piv, .. } = self;
         let (u_tmp, f_tmp, f0, ft) = (&mut u_tmp[..n], &mut f_tmp[..n], &f0[..n], &ft[..n]);
         let (rhs_tmp, u) = (&mut rhs_tmp[..n], &u[..n]);
         for i in 0..s {
@@ -985,11 +900,7 @@ impl<T: PkNum> RosWorkspace<T> {
     #[allow(clippy::needless_range_loop)]
     #[inline(always)]
     fn ros23_stages<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        rhs: &R,
-        u: &[T],
-        params: &[T],
-        clock: &StepClock<T>,
+        &mut self, rhs: &R, u: &[T], params: &[T], clock: &StepClock<T>,
     ) {
         let n = self.n;
         let inv_gh = clock.inv_times_dt(ROS23_GAMMA);
@@ -1062,10 +973,7 @@ impl<T: PkNum> RosWorkspace<T> {
 /// value lane (#2786).
 #[inline(always)]
 pub(crate) fn ros_err_norm(
-    n: usize,
-    u_new: impl Fn(usize) -> f64,
-    err: impl Fn(usize) -> f64,
-    u: impl Fn(usize) -> f64,
+    n: usize, u_new: impl Fn(usize) -> f64, err: impl Fn(usize) -> f64, u: impl Fn(usize) -> f64,
     opts: &OdeSolverOptions,
 ) -> f64 {
     let mut acc = 0.0;
@@ -1108,12 +1016,7 @@ pub(crate) const START_KEPT_ON_ACCEPT: bool = false;
 /// `u_new_i` the proposed state's.
 #[inline(always)]
 pub(crate) fn ros_interp<T: PkNum>(
-    method: OdeMethod,
-    ks: impl Fn(usize) -> T,
-    theta: f64,
-    u_old_i: T,
-    u_new_i: T,
-    dt: f64,
+    method: OdeMethod, ks: impl Fn(usize) -> T, theta: f64, u_old_i: T, u_new_i: T, dt: f64,
 ) -> T {
     match method {
         OdeMethod::Rodas4 => RODAS4.interpolate(theta, u_old_i, u_new_i, ks),
@@ -1170,14 +1073,8 @@ impl<T: PkNum> RosStepper<T> {
     #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn attempt_with<R: StageRhs<T> + ?Sized>(
-        &mut self,
-        stage: &R,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt: f64,
-        opts: &OdeSolverOptions,
+        &mut self, stage: &R, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64,
+        dt: f64, opts: &OdeSolverOptions,
     ) -> f64 {
         let gamma = method_gamma(self.method);
         let clock = StepClock::new(t, dt);
@@ -1209,20 +1106,14 @@ impl<T: PkNum> RosStepper<T> {
 
 impl<T: PkNum> super::solver::StepBody<T> for RosStepper<T> {
     fn start(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T],
         clock: &StepClock<T>,
     ) {
         self.ws.refresh_jacobian(rhs, rhs, u, params, clock);
         self.jac_valid = true;
     }
     fn step(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T],
         clock: &StepClock<T>,
     ) {
         self.jac_valid = true;
@@ -1250,10 +1141,7 @@ impl<T: PkNum> super::solver::StepBody<T> for RosStepper<T> {
     fn carried_into(&self, out: &mut Vec<T>) {
         let w = &self.ws;
         out.clear();
-        for v in [&w.f0, &w.jac, &w.ft, &w.u_tmp, &w.u_new, &w.err]
-            .into_iter()
-            .chain(w.ks.iter())
-        {
+        for v in [&w.f0, &w.jac, &w.ft, &w.u_tmp, &w.u_new, &w.err].into_iter().chain(w.ks.iter()) {
             out.extend_from_slice(v);
         }
         out.push(self.usable_t);
@@ -1261,16 +1149,9 @@ impl<T: PkNum> super::solver::StepBody<T> for RosStepper<T> {
     fn set_carried(&mut self, v: &[T]) {
         let w = &mut self.ws;
         let mut at = 0;
-        for dst in [
-            &mut w.f0,
-            &mut w.jac,
-            &mut w.ft,
-            &mut w.u_tmp,
-            &mut w.u_new,
-            &mut w.err,
-        ]
-        .into_iter()
-        .chain(w.ks.iter_mut())
+        for dst in [&mut w.f0, &mut w.jac, &mut w.ft, &mut w.u_tmp, &mut w.u_new, &mut w.err]
+            .into_iter()
+            .chain(w.ks.iter_mut())
         {
             let m = dst.len();
             dst.copy_from_slice(&v[at..at + m]);
@@ -1285,12 +1166,7 @@ impl<T: PkNum> super::solver::StepBody<T> for RosStepper<T> {
 
 impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
     fn attempt(
-        &mut self,
-        rhs: &crate::ode::solver::RhsG<'_, T>,
-        u: &[T],
-        params: &[T],
-        t: f64,
-        dt: f64,
+        &mut self, rhs: &crate::ode::solver::RhsG<'_, T>, u: &[T], params: &[T], t: f64, dt: f64,
         opts: &OdeSolverOptions,
     ) -> f64 {
         // A registered `f64` right-hand side runs its machine code directly at every stage
@@ -1307,14 +1183,7 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
 
     fn interpolate_component(&self, theta: f64, u_old: &[T], dt: f64, i: usize) -> T {
         let ks = &self.ws.ks;
-        ros_interp(
-            self.method,
-            |j| ks[j][i],
-            theta,
-            u_old[i],
-            self.ws.u_new[i],
-            dt,
-        )
+        ros_interp(self.method, |j| ks[j][i], theta, u_old[i], self.ws.u_new[i], dt)
     }
 
     fn on_accept(&mut self) {

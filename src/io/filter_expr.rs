@@ -116,9 +116,7 @@ impl FilterExpr {
         // single bare identifier qualifies; anything else is a malformed clause.
         let t = s.trim();
         if !t.is_empty()
-            && t.chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
             && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             return Ok(FilterExpr {
@@ -323,10 +321,7 @@ impl FilterClause {
     /// raw cell instead (`RowContext::str_covariates`), so a label column the numeric
     /// map holds as `NaN` is not a missing value to it (#2599).
     pub(crate) fn numeric_columns(&self) -> impl Iterator<Item = &str> {
-        self.exprs
-            .iter()
-            .filter(|e| matches!(e.rhs, FilterValue::Num(_)))
-            .map(|e| e.col.as_str())
+        self.exprs.iter().filter(|e| matches!(e.rhs, FilterValue::Num(_))).map(|e| e.col.as_str())
     }
 
     /// True when any sub-expression compares a covariate column as a raw string
@@ -335,9 +330,7 @@ impl FilterClause {
     /// that allocation entirely. `id` string comparisons read [`RowContext::id`]
     /// directly, not the map, so they do not count.
     pub fn needs_str_covariates(&self) -> bool {
-        self.exprs
-            .iter()
-            .any(|e| matches!(e.rhs, FilterValue::Str(_)) && e.col != "id")
+        self.exprs.iter().any(|e| matches!(e.rhs, FilterValue::Str(_)) && e.col != "id")
     }
 }
 
@@ -405,12 +398,7 @@ mod tests {
     }
 
     fn eval_with_str(
-        expr: &str,
-        id: &str,
-        dv: f64,
-        evid: u32,
-        bw: f64,
-        str_cov: &HashMap<String, String>,
+        expr: &str, id: &str, dv: f64, evid: u32, bw: f64, str_cov: &HashMap<String, String>,
     ) -> bool {
         let (_, cov) = ctx(id, dv, evid, bw);
         let clause = FilterClause::parse(expr).expect("parse ok");
@@ -693,23 +681,13 @@ mod tests {
     #[test]
     fn test_needs_str_covariates() {
         // String covariate comparison needs the raw-cell map.
-        assert!(FilterClause::parse("C == C")
-            .unwrap()
-            .needs_str_covariates());
-        assert!(FilterClause::parse("FLAG != X")
-            .unwrap()
-            .needs_str_covariates());
+        assert!(FilterClause::parse("C == C").unwrap().needs_str_covariates());
+        assert!(FilterClause::parse("FLAG != X").unwrap().needs_str_covariates());
         assert!(FilterClause::parse("C").unwrap().needs_str_covariates());
         // Purely numeric / ID-string clauses do not.
-        assert!(!FilterClause::parse("DV < 0.001")
-            .unwrap()
-            .needs_str_covariates());
-        assert!(!FilterClause::parse("BW >= 30 && BW < 48")
-            .unwrap()
-            .needs_str_covariates());
-        assert!(!FilterClause::parse("ID == 3")
-            .unwrap()
-            .needs_str_covariates());
+        assert!(!FilterClause::parse("DV < 0.001").unwrap().needs_str_covariates());
+        assert!(!FilterClause::parse("BW >= 30 && BW < 48").unwrap().needs_str_covariates());
+        assert!(!FilterClause::parse("ID == 3").unwrap().needs_str_covariates());
     }
 
     #[test]

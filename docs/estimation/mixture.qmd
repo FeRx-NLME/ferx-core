@@ -1,6 +1,6 @@
 ---
 pagetitle: "Mixture models in ferx"
-description-meta: "Fit latent subpopulation mixture models with FOCEI, SAEM, and Bayesian methods in the ferx NLME engine."
+description-meta: "Fit latent subpopulation mixture models with FOCEI, Laplace, AGQ, SAEM, and Bayesian methods in the ferx NLME engine."
 ---
 
 # Mixture Models
@@ -75,14 +75,53 @@ $$
 `nll_ik` is the ordinary per-subject FOCE/FOCEI negative log-likelihood evaluated
 with class-$k$ parameters and a **separate empirical Bayes solve per
 (subject × class)**. The mixing-logit coefficients are ordinary thetas and any
-per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to the
-derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer
-gradient is available — exact also under IOV and with a block (correlated) $\Omega$ — so a
-user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured. A subject outside
+per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults
+to NLopt L-BFGS on the analytic posterior-weighted outer gradient — exact also under IOV
+and with a block (correlated) $\Omega$ — like a single population; an explicit `bobyqa`
+or another NLopt optimizer (SLSQP / MMA) is honoured. A subject outside
 analytic scope is salvaged on its own: the other subjects keep their exact gradient, and only
 that subject's per-class terms are finite-differenced, re-solving its class modes at each
 probe. Such a subject is named in the "could not be given the exact analytic outer gradient"
 warning, as for a single population (#2906). `MIXNUM`-branched typical values are in scope.
+
+
+### Laplace and AGQ {#laplace-and-agq}
+
+`method = laplace`, and `method = focei` with `n_agq > 1`, fit a mixture too. The class
+objective $\mathrm{nll}_{ik}$ is then the single-population quadrature objective
+([Laplace and AGQ](agq.qmd)) evaluated with class-$k$ parameters at the class's own mode
+and on the class's own grid (the Hessian that scales the grid is class $k$'s, exact for
+Laplace and Gauss-Newton for FOCEI quadrature), instead of the FOCE/FOCEI marginal; the
+log-sum-exp over classes is unchanged. Under IOV the class mode is the stacked
+$[\hat\eta, \hat\kappa]$, as for a single population. The outer gradient, the
+covariance R-matrix and the score cross-product $S$ are exact for the same objective, with
+no finite-difference fallback: a (subject $\times$ class) term the adjoint declines at run
+time is salvaged on its own by that term's reconverged difference, as for FOCE/FOCEI.
+A mixture of identical classes reproduces the single-population Laplace/AGQ fit.
+The FOCE and FOCEI mixture objectives are unchanged; their default optimizer is not (below).
+
+`optimizer = auto` resolves for a mixture exactly as for a single population: NLopt L-BFGS on
+the exact mixture gradient for every method (FOCE, FOCEI, Laplace, AGQ). An explicit
+`optimizer = bobyqa` is honoured. `agq_eval_only = true` is refused on a mixture
+(`E_MIXTURE_METHOD`): the evaluation-only quadrature stage scores a single population and
+would replace the mixture objective with a one-class value; an estimating `laplace` stage
+already reports the mixture objective.
+
+Cross-checked against NONMEM 7.5.1 (`$MIX NSPOP=2`, `$EST METHOD=COND LAPLACIAN INTER`,
+`$COV MATRIX=R`; `nonmem_anchor/mixture_laplace.ctl` and the Tier-2
+`tests/mixture_laplace_nonmem_anchor.rs`) on the two-class clearance fixture of
+[Validation against NONMEM](#validation-against-nonmem):
+
+| Quantity | NONMEM | ferx |
+|---|---|---|
+| OFV (without constant) | 301.772953 | 301.772952 (at NONMEM's estimate: −3.8e-7) |
+| `TVCL1` (SE) | 0.949834 (0.1039) | 0.949848 (0.1042) |
+| `TVCL2` (SE) | 2.81952 (0.2533) | 2.81959 (0.2515) |
+| `V` (SE) | 10.0110 (0.1868) | 10.0110 (0.1867) |
+| `p(1)` (SE, delta-method) | 0.470531 (0.1021) | 0.470538 (0.1021) |
+
+The SEs are ferx's exact R and NONMEM's finite-difference R, evaluated at NONMEM's estimate;
+they agree to < 1 %, with `TVCL2` the largest gap, as under FOCEI below.
 
 ## Output
 
@@ -134,16 +173,22 @@ and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907)
 - **Empty class.** No subject's posterior probability of the class reaches 0.01.
 
 The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ
-estimated. Started from clearances 1.70 / 1.71, L-BFGS ends in a collapsed optimum
+estimated. Started from clearances 1.70 / 1.71, FOCEI with L-BFGS ends in a collapsed optimum
 (OFV 310.02, class clearances 1.71 / 1.76, ω_CL 0.35, which absorbs the
 bimodality). There the largest factor is 0.09. At the two-class optimum (OFV 299.86)
 it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of
 `mixture_iv_iov.csv` (301.58, 470.81) it is 11.45 and 19.29. A mixing logit held at
 −9 leaves class 1 with a largest posterior of 3e-4, which is reported empty.
 
-The warning does not change the fit. When it fires, refit with the class starts
-further apart, or with `optimizer = bobyqa`, and compare the objectives: on the
-fixture above, BOBYQA from the same 1.70 / 1.71 start reaches 299.86.
+The warning does not change the fit. A start with near-identical classes is a
+near-symmetric point of the objective, where the gradient barely separates the classes
+and the fit can settle on a saddle (at the collapsed optimum above the exact
+R-matrix has one negative eigenvalue, $-0.18$ against a largest of $5.5\times10^{3}$).
+When it fires, refit with the class starts further apart and compare the objectives:
+on the fixture above, a start of 1.2 / 2.5 reaches 299.86 under the default L-BFGS.
+Changing the optimizer is not a reliable fix, because neither one escapes every
+symmetric start: from 1.70 / 1.71, `optimizer = bobyqa` reaches 299.86 under FOCEI but
+collapses under `n_agq = 3` (OFV 310.88), where the default L-BFGS reaches 300.17.
 
 ## Validation against NONMEM
 
@@ -170,7 +215,7 @@ assignment is identical for every subject.
 
 A mixture fit runs the covariance step like any other fit: the Hessian is built on the
 **mixture** objective (the K-fold log-sum-exp above) — an exact analytic R matrix under
-FOCE/FOCEI, the finite-difference stencil under Laplace/AGQ — and
+FOCE, FOCEI, Laplace and AGQ — and
 the standard errors are $\sqrt{\operatorname{diag}(R^{-1})}$. The mixing-fraction
 SE is reported on the scale the mixing form is written in — the coefficients of a
 `logit(k) = …` form carry a logit-scale SE, a `p(k) = …` probability an SE
@@ -513,9 +558,14 @@ objective-evaluation pass, Ω/Σ FIXed:
 One SAEM run is one chain's draw, so ferx is anchored on the mean over ten
 seeds, compared with NONMEM's exact-likelihood IMPMAP estimate. The mean agrees
 to 0.6 % on `V` and 0.15 % on the clearances, and the 40-seed spread is 0.7 %
-(`TVCL1`), 0.45 % (`TVCL2`) and 0.9 % (`V`) per run. ferx reports the FOCEI-type
-mixture marginal as the SAEM OFV: 301.90 against NONMEM's FOCEI minimum of
-301.58, which it sits above because the estimate is the exact-likelihood MLE.
+(`TVCL1`), 0.45 % (`TVCL2`) and 0.9 % (`V`) per run. With `saem_ofv = focei` ferx reports
+the FOCEI-type mixture marginal as the SAEM OFV: 301.90 against NONMEM's FOCEI minimum of
+301.58, which it sits above because the estimate is the exact-likelihood MLE. A mixture has no NONMEM-anchored SAEM objective, so by default
+(`saem_ofv = saem` falls back to `imp` here with a warning, as does an explicit `saem_ofv = imp` without one) the SAEM `ofv` is the class-marginal importance-sampled
+`−2 log L`, the number NONMEM's `METHOD=IMP EONLY=1` pass reports (300.87 on this model;
+ferx's chained `[saem, imp]` evaluation is pinned to it in
+`tests/mixture_nonmem.rs::imp_mixture_marginal_matches_nonmem`), and the FOCEI value is kept
+as `saem_objective.foce_ofv`.
 Covariate-dependent mixing under SAEM is exercised end-to-end in
 `tests/mixture_nonmem.rs`.
 

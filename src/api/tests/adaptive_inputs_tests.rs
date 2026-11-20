@@ -9,7 +9,6 @@ use super::*;
 use crate::diagnostics::EngineError;
 use crate::parser::model_parser::parse_model_string;
 use crate::sim::adaptive::{ControllerCtx, DoseAction, MonitorSpec, ObserveMode};
-use std::collections::HashMap;
 
 // 1-cpt IV ODE with BSV on CL, so a subject's IPRED reads its η.
 const ODE_IIV: &str = r#"
@@ -58,41 +57,20 @@ const OBS: [f64; 4] = [4.0, 20.0, 28.0, 44.0];
 
 /// One subject on the base regimen: 100 at each decision time.
 fn subject(id: &str) -> Subject {
-    let doses: Vec<DoseEvent> = DECISIONS
-        .iter()
-        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
-        .collect();
+    let doses: Vec<DoseEvent> =
+        DECISIONS.iter().map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0)).collect();
     let n = OBS.len();
     let n_dose = doses.len();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.to_string(),
         doses,
         obs_times: OBS.to_vec(),
-        obs_raw_times: Vec::new(),
         observations: vec![0.0; n],
         obs_cmts: vec![1; n],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1u32; n],
-        obs_l2: Vec::new(),
         dose_occasions: vec![1u32; n_dose],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -173,11 +151,8 @@ fn supplied_subject_keeps_the_eta_stream_of_the_others() {
             "subject 2, replicate {sim}: its supplied η was not used"
         );
     }
-    let flags: Vec<(&str, usize, bool)> = mixed
-        .metrics
-        .iter()
-        .map(|m| (m.subject.as_str(), m.sim, m.eta_supplied))
-        .collect();
+    let flags: Vec<(&str, usize, bool)> =
+        mixed.metrics.iter().map(|m| (m.subject.as_str(), m.sim, m.eta_supplied)).collect();
     assert_eq!(
         flags,
         vec![
@@ -280,11 +255,7 @@ fn supplied_eta_is_fixed_across_replicates_and_the_assay_reads_params_sigma() {
         "the supplied η was redrawn between replicates"
     );
     let signal = |res: &AdaptiveSimulationResult, sim: usize| -> Vec<f64> {
-        res.decisions
-            .iter()
-            .filter(|d| d.sim == sim)
-            .map(|d| d.observed_signals[0].value)
-            .collect()
+        res.decisions.iter().filter(|d| d.sim == sim).map(|d| d.observed_signals[0].value).collect()
     };
     // Straddle: the assay is redrawn, so the equality above is not between two copies
     // of one replicate.
@@ -299,11 +270,7 @@ fn supplied_eta_is_fixed_across_replicates_and_the_assay_reads_params_sigma() {
     let mut compared = 0;
     let mut worst = 0.0f64;
     for sim in 1..=2 {
-        for ((f, va), vb) in signal(&latent, sim)
-            .iter()
-            .zip(signal(&a, sim))
-            .zip(signal(&b, sim))
-        {
+        for ((f, va), vb) in signal(&latent, sim).iter().zip(signal(&a, sim)).zip(signal(&b, sim)) {
             if *f == 0.0 {
                 continue; // before the first dose: nothing to scale
             }
@@ -375,37 +342,16 @@ fn supplied_eta_refusals_carry_their_code_and_text() {
     let code = "E_SUPPLIED_ETAS".to_string();
 
     assert_eq!(
-        refusal(SuppliedEtas::from_table(
-            vec!["1".into(), "2".into()],
-            names(),
-            vec![vec![0.1]]
-        )),
-        (
-            code.clone(),
-            "2 subject ID(s) but 1 row(s) of η".to_string()
-        )
+        refusal(SuppliedEtas::from_table(vec!["1".into(), "2".into()], names(), vec![vec![0.1]])),
+        (code.clone(), "2 subject ID(s) but 1 row(s) of η".to_string())
     );
     assert_eq!(
-        refusal(SuppliedEtas::from_table(
-            vec!["1".into()],
-            names(),
-            vec![vec![0.1, 0.2]]
-        )),
-        (
-            code.clone(),
-            "subject '1' has 2 η but 1 are named; a row gives every η".to_string()
-        )
+        refusal(SuppliedEtas::from_table(vec!["1".into()], names(), vec![vec![0.1, 0.2]])),
+        (code.clone(), "subject '1' has 2 η but 1 are named; a row gives every η".to_string())
     );
     assert_eq!(
-        refusal(SuppliedEtas::from_table(
-            vec!["1".into()],
-            names(),
-            vec![vec![f64::NAN]]
-        )),
-        (
-            code.clone(),
-            "subject '1' has a non-finite ETA_CL = NaN".to_string()
-        )
+        refusal(SuppliedEtas::from_table(vec!["1".into()], names(), vec![vec![f64::NAN]])),
+        (code.clone(), "subject '1' has a non-finite ETA_CL = NaN".to_string())
     );
     assert_eq!(
         refusal(SuppliedEtas::from_table(
@@ -413,10 +359,7 @@ fn supplied_eta_refusals_carry_their_code_and_text() {
             names(),
             vec![vec![0.1], vec![0.2]]
         )),
-        (
-            code.clone(),
-            "subject ID '1' appears more than once".to_string()
-        )
+        (code.clone(), "subject ID '1' appears more than once".to_string())
     );
     // `from_fit`'s own refusal (a fit of another model) is in
     // `tests/adaptive_supplied_etas.rs`, which has a fit to hand it.
@@ -424,9 +367,7 @@ fn supplied_eta_refusals_carry_their_code_and_text() {
     let pop = population(&["1", "2", "3"]);
     let opts = options(1, ObserveMode::Ipred);
     let run = |e: &SuppliedEtas, policy: UnmatchedSubjects| {
-        let inputs = AdaptiveInputs::new(&model.default_params)
-            .with_etas(e)
-            .with_unmatched(policy);
+        let inputs = AdaptiveInputs::new(&model.default_params).with_etas(e).with_unmatched(policy);
         simulate_adaptive_with_inputs(&model, &pop, &inputs, 1, hold_all, &opts)
     };
     let wrong_names =

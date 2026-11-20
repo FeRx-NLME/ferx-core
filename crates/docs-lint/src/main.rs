@@ -132,16 +132,11 @@ fn run() -> Result<ExitCode, String> {
         return Err(format!("no docs directory at {}", docs_dir.display()));
     }
 
-    let cfg = Config {
-        max_chars: args.max_chars,
-    };
+    let cfg = Config { max_chars: args.max_chars };
     let violations =
         lint_tree(&docs_dir, &root, &cfg).map_err(|e| format!("{}: {e}", docs_dir.display()))?;
 
-    let baseline_path = args
-        .baseline_path
-        .clone()
-        .unwrap_or_else(|| default_baseline_path(&root));
+    let baseline_path = args.baseline_path.clone().unwrap_or_else(|| default_baseline_path(&root));
 
     if args.update_baseline {
         let new = Baseline::from_violations(&violations);
@@ -160,11 +155,7 @@ fn run() -> Result<ExitCode, String> {
     let filtered = if args.use_baseline {
         baseline::apply(&Baseline::load(&baseline_path)?, violations)
     } else {
-        baseline::Filtered {
-            failing: violations,
-            baselined: 0,
-            stale: Vec::new(),
-        }
+        baseline::Filtered { failing: violations, baselined: 0, stale: Vec::new() }
     };
 
     if args.json {
@@ -177,10 +168,7 @@ fn run() -> Result<ExitCode, String> {
             println!(
                 "{}: R1: no longer over the limit — remove this line from {}",
                 key,
-                baseline_path
-                    .strip_prefix(&root)
-                    .unwrap_or(&baseline_path)
-                    .display()
+                baseline_path.strip_prefix(&root).unwrap_or(&baseline_path).display()
             );
         }
         let failures = filtered.failing.len() + filtered.stale.len();
@@ -199,13 +187,11 @@ fn run() -> Result<ExitCode, String> {
         }
     }
 
-    Ok(
-        if filtered.failing.is_empty() && filtered.stale.is_empty() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        },
-    )
+    Ok(if filtered.failing.is_empty() && filtered.stale.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 fn main() -> ExitCode {

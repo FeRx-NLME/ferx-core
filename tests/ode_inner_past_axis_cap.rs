@@ -30,17 +30,12 @@ use std::path::Path;
 fn make_model(n_fix: usize) -> String {
     let prms = ["CL", "V1", "Q", "V2", "KA"];
     let effs = ["WT", "CRCL", "LIN"];
-    let pairs: Vec<(&str, &str)> = prms
-        .iter()
-        .flat_map(|p| effs.iter().map(move |e| (*p, *e)))
-        .take(n_fix)
-        .collect();
+    let pairs: Vec<(&str, &str)> =
+        prms.iter().flat_map(|p| effs.iter().map(move |e| (*p, *e))).take(n_fix).collect();
     assert_eq!(pairs.len(), n_fix, "only 15 zero-effect θ are available");
 
-    let thetas: String = pairs
-        .iter()
-        .map(|(p, e)| format!("  theta TH_{p}_{e}(0.0, -3.0, 3.0) FIX\n"))
-        .collect();
+    let thetas: String =
+        pairs.iter().map(|(p, e)| format!("  theta TH_{p}_{e}(0.0, -3.0, 3.0) FIX\n")).collect();
     let factors = |p: &str| -> String {
         pairs
             .iter()
@@ -59,10 +54,8 @@ fn make_model(n_fix: usize) -> String {
             format!("TV{p}")
         }
     };
-    let indiv: String = prms
-        .iter()
-        .map(|p| format!("  {p} = {}{} * exp(ETA_{p})\n", tv(p), factors(p)))
-        .collect();
+    let indiv: String =
+        prms.iter().map(|p| format!("  {p} = {}{} * exp(ETA_{p})\n", tv(p), factors(p))).collect();
 
     format!(
         "[parameters]
@@ -111,11 +104,8 @@ fn evaluate(n_fix: usize, ode_tol: Option<(f64, f64)>) -> FitResult {
     );
     let pop = read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
         .expect("two_cpt_oral_cov.csv loads");
-    let mut options = FitOptions {
-        outer_maxiter: 0,
-        run_covariance_step: false,
-        ..parsed.fit_options.clone()
-    };
+    let mut options =
+        FitOptions { outer_maxiter: 0, run_covariance_step: false, ..parsed.fit_options.clone() };
     if let Some((reltol, abstol)) = ode_tol {
         options.ode_reltol = reltol;
         options.ode_abstol = abstol;
@@ -143,12 +133,7 @@ fn assert_twins_agree(case: &str, ode_tol: Option<(f64, f64)>) {
     assert_eq!(at_cap.subjects.len(), past_cap.subjects.len());
     for (a, b) in at_cap.subjects.iter().zip(&past_cap.subjects) {
         assert_eq!(a.id, b.id);
-        assert!(
-            a.ofv_contribution.is_finite(),
-            "{case}, subject {}: {}",
-            a.id,
-            a.ofv_contribution
-        );
+        assert!(a.ofv_contribution.is_finite(), "{case}, subject {}: {}", a.id, a.ofv_contribution);
         assert_eq!(
             a.ofv_contribution, b.ofv_contribution,
             "{case}, subject {}: per-subject OFV at 24 vs 25 axes",
@@ -163,15 +148,9 @@ fn assert_twins_agree(case: &str, ode_tol: Option<(f64, f64)>) {
             r.gradient_method_inner, "analytic",
             "{case}, {label}: the inner η-gradient is seeded on η only, so it must stay analytic"
         );
-        let fd: Vec<&String> = r
-            .warnings
-            .iter()
-            .filter(|w| w.contains("finite-difference inner"))
-            .collect();
-        assert!(
-            fd.is_empty(),
-            "{case}, {label}: unexpected FD-inner warning(s): {fd:?}"
-        );
+        let fd: Vec<&String> =
+            r.warnings.iter().filter(|w| w.contains("finite-difference inner")).collect();
+        assert!(fd.is_empty(), "{case}, {label}: unexpected FD-inner warning(s): {fd:?}");
     }
 }
 

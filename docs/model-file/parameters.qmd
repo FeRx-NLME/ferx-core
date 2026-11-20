@@ -137,7 +137,8 @@ fit's θ layout. See
 [Simulating with a fit's θ](../api/fitting.qmd#simulate-with-fit-theta).
 
 Levels are discovered from **Gaussian observation records**, and from the records of
-a `[binary_model]` predictor or a DTMM `[markov_model]` that reads the block (#2562).
+a `[binary_model]` predictor, a [`[count_model]`](count.qmd) mean (#2877) or a DTMM
+`[markov_model]` that reads the block (#2562).
 Those endpoints evaluate each record on its own, so each record is a level of the block
 and carries its own index, keyed on its `TIME` as written. A subject with neither — only
 time-to-event or CTMM records, or records of an endpoint that does not read the block —
@@ -841,6 +842,10 @@ the unprofiled one (#2136):
   genuine second mode at OFV ≈ 104.68, where ω(ETA_EM) has collapsed, and both ferx and
   NONMEM report it as converged from a start near it. Try more than one start when the
   baseline's start is uncertain.
+- **A collapsed variance.** A free variance that the optimizer leaves below 1/1000 of
+  its initial value while the objective still falls as it rises is re-inflated to its
+  initial value and the fit resumed, or the fit is reported not converged (#3005,
+  [A variance collapsed far below its start](../estimation/optimizers.qmd#variance-collapsed-below-start)).
 - **A variance short of its guard.** A free variance that the optimizer leaves just above
   its internal lower guard while the objective is lower on the guard is resumed from the
   guard, or the fit is reported not converged (#2832,

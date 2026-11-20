@@ -72,10 +72,7 @@ fn moved(pop: &Population) -> bool {
 /// Per subject, the level index each observation carries.
 fn obs_indices(pop: &Population) -> Vec<Vec<f64>> {
     let col = level_index_column("PLACEBO");
-    pop.subjects
-        .iter()
-        .map(|s| s.obs_covariates.iter().map(|m| m[&col]).collect())
-        .collect()
+    pop.subjects.iter().map(|s| s.obs_covariates.iter().map(|m| m[&col]).collect()).collect()
 }
 
 fn decl(parsed: &ParsedModel) -> LevelBlockDecl {
@@ -98,10 +95,7 @@ fn a_co_timed_row_without_an_observation_adds_no_level_cell() {
         bind_theta_levels(&mut base, &text, &mut base_pop).expect("base binds");
         assert!(!moved(&base_pop));
         let names = theta_names(&base.model);
-        assert!(
-            names.contains(&"PLACEBO[STUDY=1,TIME=1]".to_string()),
-            "{names:?}"
-        );
+        assert!(names.contains(&"PLACEBO[STUDY=1,TIME=1]".to_string()), "{names:?}");
         for kind in KINDS {
             for extra in [Extra::After(kind), Extra::Before(kind)] {
                 let (mut parsed, mut pop) = read(&text, &csv(extra));
@@ -130,10 +124,7 @@ fn the_from_fit_binder_binds_the_fits_cells_on_moved_observations() {
     for text in [no_eta_model(), mbma_model("")] {
         let (mut fit, mut fit_pop) = read(&text, &csv(Extra::None));
         bind_theta_levels(&mut fit, &text, &mut fit_pop).expect("fit binds");
-        let fitted = DataBindings {
-            levels: fit.bindings.levels.clone(),
-            ..Default::default()
-        };
+        let fitted = DataBindings { levels: fit.bindings.levels.clone(), ..Default::default() };
         for kind in KINDS {
             let (mut sim, mut sim_pop) = read(&text, &csv(Extra::After(kind)));
             assert!(moved(&sim_pop));
@@ -175,10 +166,7 @@ fn the_misindex_message_reads_the_written_time_on_a_stacked_reset_subject() {
     let text = no_eta_model();
     let (mut parsed, mut pop) = read(&text, &reset_csv());
     bind_theta_levels(&mut parsed, &text, &mut pop).expect("binds");
-    let levels = theta_names(&parsed.model)
-        .iter()
-        .filter(|n| n.starts_with("PLACEBO["))
-        .count();
+    let levels = theta_names(&parsed.model).iter().filter(|n| n.starts_with("PLACEBO[")).count();
     assert_eq!(
         levels, 3,
         "2 studies × 2 written times, one derived: {:?}",
@@ -186,16 +174,9 @@ fn the_misindex_message_reads_the_written_time_on_a_stacked_reset_subject() {
     );
     // The straddle: period 2's observation at written TIME 2 is on a shifted clock.
     let s1 = &pop.subjects[0];
-    let j = (0..s1.obs_times.len())
-        .rev()
-        .find(|&j| s1.readout_time(j) == 2.0)
-        .unwrap();
+    let j = (0..s1.obs_times.len()).rev().find(|&j| s1.readout_time(j) == 2.0).unwrap();
     assert!(s1.obs_times[j] > 2.0, "{:?}", s1.obs_times);
-    assert_eq!(
-        level_index_finding(&decl(&parsed), &pop),
-        None,
-        "bound as written"
-    );
+    assert_eq!(level_index_finding(&decl(&parsed), &pop), None, "bound as written");
 
     let col = level_index_column("PLACEBO");
     let want = pop.subjects[0].obs_covariates[j][&col];
@@ -236,26 +217,15 @@ fn same_instant_tolerates_the_move_and_not_a_reset() {
     assert_eq!(s.obs_times[1], 2.0f64.next_down(), "{:?}", s.obs_times);
     assert_eq!(s.obs_times[2], 2.0, "{:?}", s.obs_times);
     assert!(s.same_instant(1, 2));
-    assert!(
-        resolves_observations(&decl(&parsed), &pop, false),
-        "the moved replicate"
-    );
+    assert!(resolves_observations(&decl(&parsed), &pop, false), "the moved replicate");
 
     let (mut parsed, mut pop) = read(&text, &reset_csv());
     bind_theta_levels(&mut parsed, &text, &mut pop).expect("binds");
     let s = &pop.subjects[0];
-    assert_eq!(
-        s.readout_time(1),
-        s.readout_time(3),
-        "{:?}",
-        s.obs_raw_times
-    );
+    assert_eq!(s.readout_time(1), s.readout_time(3), "{:?}", s.obs_raw_times);
     assert_ne!(s.obs_times[1], s.obs_times[3]);
     assert!(!s.same_instant(1, 3));
-    assert!(
-        !resolves_observations(&decl(&parsed), &pop, false),
-        "the reset periods"
-    );
+    assert!(!resolves_observations(&decl(&parsed), &pop, false), "the reset periods");
 }
 
 /// The dead-level advice's "only records at `TIME = 0`" reads the written time: a
@@ -281,9 +251,7 @@ fn the_time_zero_advice_reads_the_written_time() {
     }
     for (tag, mut pop) in [("still", still), ("moved", moved)] {
         let mut parsed = parse_full_model(&text).unwrap();
-        let err = bind_theta_levels(&mut parsed, &text, &mut pop)
-            .expect_err(tag)
-            .to_string();
+        let err = bind_theta_levels(&mut parsed, &text, &mut pop).expect_err(tag).to_string();
         assert!(err.contains(AT_ZERO), "{tag}: {err}");
     }
 }
