@@ -1671,6 +1671,31 @@ pub enum AdaptiveAction {
     Maintain,
 }
 
+/// Compile-time tripwire for the matches ferx-core can no longer make exhaustive (#3041).
+///
+/// `AdaptiveAction`, `IntervalStep` and `DecisionCovariates` are `#[non_exhaustive]` and
+/// live in this crate, so ferx-core's `AdaptiveController::apply` / `step_interval`
+/// (`src/sim/adaptive_control.rs`) and its decision-covariate re-derivation
+/// (`src/api/adaptive.rs`) must carry a wildcard arm — which turns a new variant into a
+/// runtime `unreachable!` / `Err` instead of the compile error it was before the split.
+/// The exhaustive matches below restore that: a new variant fails to compile *here*.
+/// Give it its arm in those ferx-core sites first, then list it here.
+const _: fn(&AdaptiveAction, IntervalStep, DecisionCovariates) = |action, step, rule| {
+    match action {
+        AdaptiveAction::Increase(_)
+        | AdaptiveAction::Decrease(_)
+        | AdaptiveAction::Hold
+        | AdaptiveAction::Stop
+        | AdaptiveAction::Maintain => {}
+    }
+    match step {
+        IntervalStep::Lengthen | IntervalStep::Shorten => {}
+    }
+    match rule {
+        DecisionCovariates::Locf | DecisionCovariates::Nocb => {}
+    }
+};
+
 /// The magnitude of an [`AdaptiveAction::Increase`] / [`AdaptiveAction::Decrease`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum DoseStep {

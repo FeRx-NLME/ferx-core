@@ -1112,10 +1112,10 @@ fn preflight_is_executable_and_lists_every_group() {
         ("changelog", 1),  // tools/changelog.sh check (#1545)
         ("fmt", 1),        // cargo fmt --all -- --check
         ("check", 5),      // ci · ci,survival,slow-tests · ci,markov · ci,nn,slow-tests · members
-        ("clippy", 3),     // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · members
-        ("rustdoc", 2),    // ferx-core rustdoc · members
-        ("docs", 2),       // cargo test -p docs-lint · cargo clippy -p docs-lint
-        ("patterns", 2),   // cargo test -p patterns-lint · cargo clippy -p patterns-lint (#2634)
+        ("clippy", 4), // ferx-core ci,markov,nn · ferx-core ci --lib (#2075) · ci,markov,nn --lib (#3041) · members
+        ("rustdoc", 2), // ferx-core rustdoc · members
+        ("docs", 2),   // cargo test -p docs-lint · cargo clippy -p docs-lint
+        ("patterns", 2), // cargo test -p patterns-lint · cargo clippy -p patterns-lint (#2634)
         ("public-api", 1), // tools/update-public-api.sh --check
         // #344: `--features ci` · `--features ci,markov,nn`. The second line is
         // not padding — `ci` compiles neither `src/survival`, `src/markov`,

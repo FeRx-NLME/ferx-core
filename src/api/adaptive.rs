@@ -2096,7 +2096,8 @@ pub(crate) fn verify_decision_records(
         }
         crate::sim::adaptive::DecisionCovariates::Locf => None,
         // `DecisionCovariates` is `#[non_exhaustive]` and lives in ferx-model (#3041), so this
-        // match can no longer be exhaustive: an unknown rule refuses rather than defaults.
+        // match can no longer be exhaustive: an unknown rule refuses rather than defaults. A new
+        // variant breaks the tripwire next to `AdaptiveAction` in ferx-model, which points here.
         _ => return Err("a decision-covariate rule this check does not know".to_string()),
     };
     for (g, &t) in decision_times.iter().enumerate() {

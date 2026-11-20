@@ -409,6 +409,17 @@ group_clippy() {
   # the feature-rich `--all-targets` line above.
   run cargo clippy -p ferx-core -p ferx-model --no-default-features --features ci --lib -- -Dunused
 
+  # The same no-dev-dependency `--lib` build on every feature ferx-core ships (#3041).
+  # ferx-core dev-depends on `ferx-model` with `test-support`, and cargo unifies that
+  # feature into any build that compiles a test target — every `check --tests` line, the
+  # `--all-targets` line above, every `cargo test`. Several ferx-model types are
+  # `#[non_exhaustive]` only when `test-support` is OFF (`WarningCode`, `AdaptiveRule`,
+  # `MixtureSpec`, …), so those builds all see them exhaustive: a wildcard-less match or a
+  # struct literal in ferx-core compiles there and fails with E0004/E0639 in ferx-r's
+  # build. The line above builds without dev-deps but on `ci` alone, so `markov`/`nn`-gated
+  # code would slip past it; this line is the one that sees it as ferx-r does.
+  run cargo clippy -p ferx-core -p ferx-model --no-default-features --features ci,markov,nn --lib -- -Dunused
+
   # Same package-qualified-feature trick as `check`, so the members reuse the
   # `ferx-core` build the line above just produced. `--tests` here (unlike the
   # ferx-core line) because the members' test code is a meaningful share of their

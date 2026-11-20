@@ -10,7 +10,8 @@ the way the first gates their names.
 
 usage: public-api-model-filter.py REPO_ROOT FERX_CORE_LISTING FERX_MODEL_LISTING
 Prints the filtered ferx-model listing; exits 1 if a `pub use ferx_core::…` line of
-the ferx-core listing has no facade source (an unaccounted re-export)."""
+the ferx-core listing has no facade source (an unaccounted re-export), or if a facade
+`pub use ferx_model::…` line has a shape this filter cannot read."""
 import collections
 import os
 import re
@@ -32,19 +33,33 @@ model_mods = {m.group(1) for m in (re.match(r'^pub mod ferx_model::([\w:]+)$', l
 #    facade mirrors ferx-model's module paths, so `crate::<m>::x` is `ferx_model::<m>::x`).
 sources = set()
 aliases = set()  # `x as y`: the public name is y
+# A facade line this reader cannot parse would drop its items from the baseline without a
+# word, leaving their shape ungated. Nothing like that exists today, so refuse it outright
+# rather than guess: a nested group, a glob, or a path inside a group.
+unreadable = []
+FACADE = re.compile(r'^\s*pub use (ferx_model|crate)::((?:\w+::)*)(\{[^}]*\}|\w+(?: as \w+)?);',
+                    re.M | re.S)
+ANY_MODEL_USE = re.compile(r'^\s*pub use ferx_model::[^;]*;', re.M | re.S)
 for d, _, fs in os.walk(os.path.join(root, 'src')):
     for f in fs:
         if not f.endswith('.rs'):
             continue
-        text = open(os.path.join(d, f), encoding='utf-8').read()
-        for m in re.finditer(r'^\s*pub use (ferx_model|crate)::((?:\w+::)*)(\{[^}]*\}|\w+(?: as \w+)?);',
-                             text, re.M | re.S):
+        path = os.path.join(d, f)
+        text = open(path, encoding='utf-8').read()
+        read = {m.start() for m in FACADE.finditer(text)}
+        for m in ANY_MODEL_USE.finditer(text):
+            if m.start() not in read:
+                unreadable.append(f'{os.path.relpath(path, root)}: {" ".join(m.group(0).split())}')
+        for m in FACADE.finditer(text):
             origin, prefix, tail = m.group(1), m.group(2), m.group(3)
             if origin == 'crate' and prefix.rstrip(':') not in model_mods:
                 continue
             for item in (re.split(r',', tail.strip('{}')) if tail.startswith('{') else [tail]):
                 item = item.strip()
-                if not item or item == 'self' or '::' in item:
+                if not item or item == 'self':
+                    continue
+                if '::' in item:
+                    unreadable.append(f'{os.path.relpath(path, root)}: `{item}` inside a group')
                     continue
                 src = item.split(' as ')[0].strip()
                 sources.add('ferx_model::' + prefix + src)
@@ -121,6 +136,11 @@ for line in lines:
     s = subject(line.rstrip('\n'))
     if (s and any(s == src or s.startswith(src + '::') for src in ordered)) or PRIMITIVE_MEMBER.match(line):
         sys.stdout.write(line)
+if unreadable:
+    sys.stderr.write('facade re-exports this filter cannot read (write them as one flat '
+                     '`pub use ferx_model::path::{A, B};` per module):\n  '
+                     + '\n  '.join(unreadable) + '\n')
+    sys.exit(1)
 if missing:
     sys.stderr.write('re-exports with no `pub use ferx_model::…` facade source:\n  '
                      + '\n  '.join(missing) + '\n')

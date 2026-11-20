@@ -173,8 +173,8 @@ impl AdaptiveController {
                 self.emit_dose(self.dose)
             }
             AdaptiveAction::Maintain => self.emit_dose(self.dose),
-            // `AdaptiveAction` is `#[non_exhaustive]` and defined in ferx-model (#3041): a
-            // variant added there needs its own arm here, which this cannot enforce.
+            // `AdaptiveAction` is `#[non_exhaustive]` and defined in ferx-model (#3041); a new
+            // variant breaks the tripwire next to its definition, which points here.
             _ => unreachable!("an `AdaptiveAction` this controller does not know"),
         }
     }
@@ -187,6 +187,7 @@ impl AdaptiveController {
         let rung = match step {
             IntervalStep::Lengthen => (self.rung + 1).min(ladder.len() - 1),
             IntervalStep::Shorten => self.rung.saturating_sub(1),
+            // Same tripwire as `apply` (ferx-model `sim::adaptive`, #3041).
             _ => unreachable!("an `IntervalStep` this controller does not know"),
         };
         if rung == self.rung {
