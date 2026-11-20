@@ -4046,6 +4046,9 @@ fn find_ebe_iov_seeded(
     // Custom / time-varying residual-magnitude (#484/#576): η-independent, so
     // computed once per subject here rather than inside `agrad` (see `find_ebe`).
     let mult = model.ruv_obs_mult(subject, &params.theta);
+    // The recording's row buffer, reused by every analytic gradient of this search
+    // (#3088), as `find_ebe_solve`'s `obs_grad_recycle`.
+    let obs_grad_recycle = RefCell::new(Vec::<crate::sens::provider::ObsGrad>::new());
     // One gradient closure for both the optimizer and the fallback stationarity check
     // (analytic stacked-η IOV gradient when in scope, else FD), so they agree on
     // convergence — see the matching note in `find_ebe`.
@@ -4121,6 +4124,7 @@ fn find_ebe_iov_seeded(
             &params.sigma.values,
             mult.as_deref(),
             frozen,
+            &mut obs_grad_recycle.borrow_mut(),
         ) {
             Some(g) => {
                 #[cfg(test)]
@@ -5910,6 +5914,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
         sigma,
         mult,
         None,
+        &mut Vec::new(),
     )
 }
 
@@ -5922,12 +5927,16 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
 /// [`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of),
 /// built once per EBE search by the caller (#2037); it carries `n_eta`, the κ width and
 /// the group count, so none of them is a parameter that could disagree with it.
+///
+/// `obs_grad_recycle` is the caller's per-subject row buffer, as in the non-IOV
+/// [`analytic_eta_nll_value_gradient_with_schedule`]: the recording fills it in place, so
+/// an EBE search reuses one `∂f/∂η` row per observation across its iterations (#3088).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
     theta: &[f64], stacked_true: &[f64], omega_bsv: &crate::types::OmegaMatrix,
     omega_iov: &crate::types::OmegaMatrix, sigma: &[f64], mult: Option<&[Vec<f64>]>,
-    frozen_var_preds: Option<&[f64]>,
+    frozen_var_preds: Option<&[f64]>, obs_grad_recycle: &mut Vec<crate::sens::provider::ObsGrad>,
 ) -> Option<Vec<f64>> {
     // A record without an exact η-channel would leave its term out of the gradient: refuse
     // the subject here too, not only at the routing gate (direct callers skip that).
@@ -5937,22 +5946,61 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // The recording reads the per-cell `stacked_true` and returns the jet over the
     // layout's axes — the compact vector under nested levels (#1082), the stack itself
     // otherwise — so the gradient below is over the vector the EBE search moves.
-    let n_eta = layout.n_eta();
-    let axes = layout.to_axes(stacked_true)?;
+    // One level: the axes are the stack itself, read in place (no copy per call).
+    let axes: std::borrow::Cow<'_, [f64]> = if layout.nested().is_some() {
+        std::borrow::Cow::Owned(layout.to_axes(stacked_true)?)
+    } else if stacked_true.len() == layout.n_stacked() {
+        std::borrow::Cow::Borrowed(stacked_true)
+    } else {
+        return None;
+    };
     // No Gaussian rows ⇒ no Gaussian data term and nothing to record (an endpoint-only
     // subject: its inner gradient is the prior plus the non-Gaussian terms below).
-    let sens = if subject.obs_times.is_empty() {
-        Vec::new()
-    } else {
-        crate::sens::ode_provider::adjoint::exact_obs_grads_in(
-            model,
-            subject,
-            Some(layout),
-            theta,
-            model.is_sde().then_some(sigma),
-            stacked_true,
-        )?
-    };
+    // Otherwise the recording fills the caller's buffer in place, handed back on every exit.
+    let mut rows = std::mem::take(obs_grad_recycle);
+    if subject.obs_times.is_empty() {
+        rows.clear();
+    } else if !crate::sens::ode_provider::adjoint::exact_obs_grads_into(
+        model,
+        subject,
+        Some(layout),
+        theta,
+        model.is_sde().then_some(sigma),
+        stacked_true,
+        &mut rows,
+    ) {
+        *obs_grad_recycle = rows;
+        return None;
+    }
+    let grad = iov_gradient_from_rows(
+        model,
+        subject,
+        layout,
+        &rows,
+        theta,
+        stacked_true,
+        &axes,
+        omega_bsv,
+        omega_iov,
+        sigma,
+        mult,
+        frozen_var_preds,
+    );
+    *obs_grad_recycle = rows;
+    grad
+}
+
+/// The body of [`analytic_eta_nll_gradient_iov_frozen`] over the recorded rows `sens`
+/// (the subject's prediction rows, then an SDE subject's EKF variance rows) and the search
+/// vector `axes`, so the caller hands its row buffer back on every exit.
+#[allow(clippy::too_many_arguments)]
+fn iov_gradient_from_rows(
+    model: &CompiledModel, subject: &Subject, layout: &crate::stats::stacked_layout::StackedLayout,
+    sens: &[crate::sens::provider::ObsGrad], theta: &[f64], stacked_true: &[f64], axes: &[f64],
+    omega_bsv: &crate::types::OmegaMatrix, omega_iov: &crate::types::OmegaMatrix, sigma: &[f64],
+    mult: Option<&[Vec<f64>]>, frozen_var_preds: Option<&[f64]>,
+) -> Option<Vec<f64>> {
+    let n_eta = layout.n_eta();
     // An SDE subject's EKF variance rows (BSV-only filter: their κ columns are zero).
     let (sens, p_rows) = sens.split_at(sens.len().min(subject.observations.len()));
     let n_stacked = layout.n_axes();
@@ -6021,26 +6069,35 @@ pub(crate) fn analytic_eta_nll_gradient_iov_frozen(
     // Prior: block-diagonal Σ_b⁻¹·b. BSV block Ω_bsv⁻¹·η_bsv, each κ block Ω_L⁻¹·κ_g —
     // one block per occasion group (the κ-variance shared across occasions, SAME), or under
     // nested levels one per group of each level, `Ω_L` the rows and columns of its κs.
-    let eta_bsv = DVector::from_column_slice(&axes[..n_eta]);
-    let prior_bsv = &omega_bsv.inv * &eta_bsv;
-    for (k, g) in grad.iter_mut().take(n_eta).enumerate() {
-        *g += prior_bsv[k];
-    }
-    for (ks, base) in layout.kappa_blocks() {
-        let w = ks.len();
-        let kappa_g = DVector::from_column_slice(&axes[base..base + w]);
-        // A block carrying every κ in order (each one-level group) reads `Ω_iov⁻¹` as is;
-        // only a nested level's subset is copied out (#2037).
-        let prior_kg = if ks.iter().copied().eq(0..omega_iov.inv.nrows()) {
-            &omega_iov.inv * &kappa_g
-        } else {
-            &omega_iov.inv.select_rows(&ks).select_columns(&ks) * &kappa_g
-        };
-        for c in 0..w {
-            grad[base + c] += prior_kg[c];
+    // Each block's product is read straight off the inverse, with no submatrix or vector
+    // copied out per call (#3088); the sum runs in the column order of a matrix product.
+    add_block_prior(&mut grad, &omega_bsv.inv, 0..n_eta, 0, axes);
+    if layout.nested().is_some() {
+        for (ks, base) in layout.kappa_blocks() {
+            add_block_prior(&mut grad, &omega_iov.inv, ks.iter().copied(), base, axes);
+        }
+    } else {
+        for g in 0..layout.n_groups() {
+            let base = layout.kappa_offset(g);
+            add_block_prior(&mut grad, &omega_iov.inv, 0..layout.n_kappa(), base, axes);
         }
     }
     Some(grad)
+}
+
+/// `grad[base..base + w] += A·x[base..base + w]` with `A` the rows and columns `idx` of
+/// `inv` (`w = idx.len()`): one block of the block-diagonal stacked prior.
+fn add_block_prior(
+    grad: &mut [f64], inv: &DMatrix<f64>, idx: impl Iterator<Item = usize> + Clone, base: usize,
+    x: &[f64],
+) {
+    for (c, r) in idx.clone().enumerate() {
+        let mut acc = 0.0;
+        for (d, s) in idx.clone().enumerate() {
+            acc += inv[(r, s)] * x[base + d];
+        }
+        grad[base + c] += acc;
+    }
 }
 
 /// Build the diagonal inner-BFGS preconditioner (the search `H0`) for a subject.
