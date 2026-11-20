@@ -241,9 +241,9 @@ fn vanco_renal_titration_matches_mrgsolve() {
 
     // Point metric: troughs in [10, 15] on 6 of 14 decisions (5, 6, 9, 10, 12, 13).
     assert!(
-        (m.pct_time_in_window.expect("trough window declared") - 6.0 / 14.0).abs() < 1e-9,
-        "pct_time_in_window {:?}",
-        m.pct_time_in_window
+        (m.pct_readings_in_window.expect("trough window declared") - 6.0 / 14.0).abs() < 1e-9,
+        "pct_readings_in_window {:?}",
+        m.pct_readings_in_window
     );
 
     // The example declares no `auc_target`, so no exposure metric is reported.

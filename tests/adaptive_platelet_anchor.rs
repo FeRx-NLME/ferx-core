@@ -160,7 +160,7 @@ fn platelet_ladder_matches_mrgsolve() {
     assert_eq!(m.time_to_discontinuation, None);
     // pct of decisions with platelets >= 100 (one-sided target_window = [100, inf]):
     // 8 of 10 (only the two `decrease` decisions, ~94 and ~99, fall below).
-    assert!((m.pct_time_in_window.expect("window declared") - 0.8).abs() < 1e-9);
+    assert!((m.pct_readings_in_window.expect("window declared") - 0.8).abs() < 1e-9);
     assert_eq!(m.signal_max.expect("max"), 250.0, "baseline at the first decision");
     assert!((m.signal_min.expect("min") - 94.266960).abs() < SIGNAL_TOL);
     assert!((m.signal_mean.expect("mean") - 159.014182).abs() < SIGNAL_TOL);

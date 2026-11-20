@@ -2317,7 +2317,7 @@ pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_increases: usize
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::n_not_due: usize
-pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
+pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::pct_readings_in_window: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveSubjectMetrics::signal_min: core::option::Option<f64>
@@ -2364,7 +2364,8 @@ pub ferx_core::sim::adaptive::MonitorSpec::mode: ferx_core::sim::adaptive::Obser
 pub ferx_core::sim::adaptive::MonitorSpec::name: alloc::string::String
 impl ferx_core::sim::adaptive::MonitorSpec
 pub fn ferx_core::sim::adaptive::MonitorSpec::new(name: impl core::convert::Into<alloc::string::String>, cmt: usize, mode: ferx_core::sim::adaptive::ObserveMode) -> Self
-pub struct ferx_core::sim::adaptive::ObservedSignal
+#[non_exhaustive] pub struct ferx_core::sim::adaptive::ObservedSignal
+pub ferx_core::sim::adaptive::ObservedSignal::latent: f64
 pub ferx_core::sim::adaptive::ObservedSignal::mode: ferx_core::sim::adaptive::ObserveMode
 pub ferx_core::sim::adaptive::ObservedSignal::name: alloc::string::String
 pub ferx_core::sim::adaptive::ObservedSignal::value: f64
@@ -4677,7 +4678,7 @@ pub ferx_core::AdaptiveSubjectMetrics::n_doses: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_holds: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_increases: usize
 pub ferx_core::AdaptiveSubjectMetrics::n_not_due: usize
-pub ferx_core::AdaptiveSubjectMetrics::pct_time_in_window: core::option::Option<f64>
+pub ferx_core::AdaptiveSubjectMetrics::pct_readings_in_window: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_max: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_mean: core::option::Option<f64>
 pub ferx_core::AdaptiveSubjectMetrics::signal_min: core::option::Option<f64>
@@ -5561,7 +5562,8 @@ pub ferx_core::NeuralNetworkInfo::output_activation: alloc::string::String
 pub ferx_core::NeuralNetworkInfo::output_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::NeuralNetworkInfo::shape: alloc::vec::Vec<usize>
 pub ferx_core::NeuralNetworkInfo::weights_offset: usize
-pub struct ferx_core::ObservedSignal
+#[non_exhaustive] pub struct ferx_core::ObservedSignal
+pub ferx_core::ObservedSignal::latent: f64
 pub ferx_core::ObservedSignal::mode: ferx_core::sim::adaptive::ObserveMode
 pub ferx_core::ObservedSignal::name: alloc::string::String
 pub ferx_core::ObservedSignal::value: f64
