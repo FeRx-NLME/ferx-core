@@ -194,11 +194,7 @@ fn draw_censoring(g: &KmCurve, t: f64, u: f64, horizon: f64) -> f64 {
         Some(v) if v > 0.0 => v,
         _ => return horizon,
     };
-    g.time
-        .iter()
-        .zip(&g.surv)
-        .find(|(_, s)| **s / g_t <= u)
-        .map_or(horizon, |(x, _)| *x)
+    g.time.iter().zip(&g.surv).find(|(_, s)| **s / g_t <= u).map_or(horizon, |(x, _)| *x)
 }
 
 /// A uniform `[0, 1)` from `(seed, sim, subject)`, independent of row order (SplitMix64).
@@ -235,11 +231,8 @@ pub(super) struct ObsRow {
 /// [`vpc_tte`] and [`vpc_kmmc`](super::vpc_kmmc) take `H` from here, and resolving `H`
 /// and cutting are one call, so neither can skip the cut.
 pub(super) fn horizon_and_cut(rows: &mut [ObsRow], sim_horizon: Option<f64>) -> f64 {
-    let horizon = sim_horizon.unwrap_or_else(|| {
-        rows.iter()
-            .map(|r| r.time)
-            .fold(f64::NEG_INFINITY, f64::max)
-    });
+    let horizon = sim_horizon
+        .unwrap_or_else(|| rows.iter().map(|r| r.time).fold(f64::NEG_INFINITY, f64::max));
     for r in rows.iter_mut().filter(|r| r.time > horizon) {
         r.time = horizon;
         r.event = false;
@@ -282,16 +275,12 @@ pub(super) enum TteCensorRule {
 /// The censoring time of one replicate subject observed as `row`, with `g` its stratum's
 /// censoring distribution and `u` its uniform from [`censoring_uniform`].
 pub(super) fn replicate_censoring(
-    rule: TteCensorRule,
-    row: &ObsRow,
-    g: &KmCurve,
-    u: f64,
-    horizon: f64,
+    rule: TteCensorRule, row: &ObsRow, g: &KmCurve, u: f64, horizon: f64,
 ) -> f64 {
     match rule {
-        TteCensorRule::KeepObserved => row
-            .censor_at
-            .unwrap_or_else(|| draw_censoring(g, row.time, u, horizon)),
+        TteCensorRule::KeepObserved => {
+            row.censor_at.unwrap_or_else(|| draw_censoring(g, row.time, u, horizon))
+        }
         TteCensorRule::DrawAll => draw_censoring(g, 0.0, u, horizon),
     }
 }
@@ -311,38 +300,20 @@ pub(super) struct RepStratum {
 /// warnings. The censoring uniforms are keyed by `(sim.seed, sim, row index)`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn simulate_replicates(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    opts: &VpcTteOptions,
-    cmt: usize,
-    rows: &[ObsRow],
-    n_strata: usize,
-    horizon: f64,
-    rule: TteCensorRule,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, opts: &VpcTteOptions,
+    cmt: usize, rows: &[ObsRow], n_strata: usize, horizon: f64, rule: TteCensorRule,
 ) -> Result<(Vec<Vec<RepStratum>>, Vec<String>), EngineError> {
     let mut sim_opts = opts.sim.clone();
     sim_opts.horizon = Some(horizon);
     let out = simulate_with_options_impl(model, population, params, opts.n_sim, &sim_opts, false)?;
 
-    let by_id: HashMap<&str, (usize, &ObsRow)> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (r.id.as_str(), (i, r)))
-        .collect();
-    let g: Vec<KmCurve> = (0..n_strata)
-        .map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k)))
-        .collect();
+    let by_id: HashMap<&str, (usize, &ObsRow)> =
+        rows.iter().enumerate().map(|(i, r)| (r.id.as_str(), (i, r))).collect();
+    let g: Vec<KmCurve> =
+        (0..n_strata).map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k))).collect();
     let seed = opts.sim.seed.unwrap_or_else(rand::random);
     let mut reps: Vec<Vec<RepStratum>> = vec![vec![RepStratum::default(); n_strata]; opts.n_sim];
-    for SimulationResult {
-        sim,
-        id,
-        cmt: rc,
-        outcome,
-        ..
-    } in &out.results
-    {
+    for SimulationResult { sim, id, cmt: rc, outcome, .. } in &out.results {
         let SimOutcome::Event { time, observed } = outcome else {
             continue;
         };
@@ -369,16 +340,13 @@ pub(super) fn simulate_replicates(
 }
 
 pub(super) fn refuse(message: String) -> EngineError {
-    super::entry_refusals::vpc_tte_input(message)
+    crate::entry_refusals::vpc_tte_input(message)
 }
 
 /// The option checks both entry points make: the band probabilities, enough
 /// replicates for them, and the times of a [`VpcGrid::Times`] grid.
 pub(super) fn check_band_options(
-    who: Entry,
-    probs: [f64; 3],
-    n_sim: usize,
-    grid: &VpcGrid,
+    who: Entry, probs: [f64; 3], n_sim: usize, grid: &VpcGrid,
 ) -> Result<(), EngineError> {
     if !probs_valid(probs) {
         return Err(refuse(format!(
@@ -407,16 +375,10 @@ pub(super) fn check_band_options(
 /// `who` draws: single-event for [`Entry::Tte`] and [`Entry::Kmmc`], repeated events for
 /// [`Entry::Rtte`].
 pub(super) fn resolve_cmt(
-    who: Entry,
-    model: &CompiledModel,
-    cmt: Option<usize>,
+    who: Entry, model: &CompiledModel, cmt: Option<usize>,
 ) -> Result<usize, EngineError> {
     let tte = model.tte_cmts();
-    let list = tte
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
+    let list = tte.iter().map(usize::to_string).collect::<Vec<_>>().join(", ");
     let c = match (cmt, tte.as_slice()) {
         (_, []) => {
             return Err(refuse(format!(
@@ -453,10 +415,7 @@ pub(super) fn resolve_cmt(
     };
     let repeated = matches!(
         model.endpoints.get(&c),
-        Some(EndpointLikelihood::Tte {
-            recurrence: TteRecurrence::Repeated { .. },
-            ..
-        })
+        Some(EndpointLikelihood::Tte { recurrence: TteRecurrence::Repeated { .. }, .. })
     );
     match (who, repeated) {
         (Entry::Tte, true) => Err(refuse(format!(
@@ -493,12 +452,7 @@ pub(super) fn no_record(who: Entry, cmt: usize) -> EngineError {
 /// entry points make: a finite, non-negative time, no left truncation, and no interval
 /// censoring.
 pub(super) fn checked_record(
-    who: Entry,
-    id: &str,
-    cmt: usize,
-    time: f64,
-    entry_time: f64,
-    event_type: &EventType,
+    who: Entry, id: &str, cmt: usize, time: f64, entry_time: f64, event_type: &EventType,
 ) -> Result<(f64, bool), EngineError> {
     if !(time.is_finite() && time >= 0.0) {
         return Err(refuse(format!(
@@ -531,9 +485,7 @@ pub(super) fn checked_record(
 
 /// Each subject's stratum value, or `None` for [`VpcStratify::None`].
 pub(super) fn stratum_value(
-    who: Entry,
-    subject: &crate::types::Subject,
-    stratify: &VpcStratify,
+    who: Entry, subject: &crate::types::Subject, stratify: &VpcStratify,
 ) -> Result<Option<f64>, EngineError> {
     Ok(match stratify {
         VpcStratify::None => None,
@@ -554,9 +506,7 @@ pub(super) fn stratum_value(
 /// (sorted), their labels, and each subject's index into them.
 #[allow(clippy::type_complexity)]
 pub(super) fn build_strata(
-    who: Entry,
-    per_subject: &[Option<f64>],
-    stratify: &VpcStratify,
+    who: Entry, per_subject: &[Option<f64>], stratify: &VpcStratify,
 ) -> Result<(Vec<Option<f64>>, Vec<String>, Vec<usize>), EngineError> {
     let mut values: Vec<Option<f64>> = per_subject.to_vec();
     values.sort_by(|a, b| a.unwrap_or(0.0).total_cmp(&b.unwrap_or(0.0)));
@@ -595,10 +545,7 @@ pub(super) fn build_strata(
 /// the strata's values (sorted) and labels. `who` names the entry point in a refusal.
 #[allow(clippy::type_complexity)]
 pub(super) fn observed_rows(
-    who: Entry,
-    population: &Population,
-    cmt: usize,
-    stratify: &VpcStratify,
+    who: Entry, population: &Population, cmt: usize, stratify: &VpcStratify,
 ) -> Result<(Vec<ObsRow>, Vec<Option<f64>>, Vec<String>), EngineError> {
     let mut picked: Vec<(String, f64, bool, Option<f64>, Option<f64>)> = Vec::new();
     let mut seen: HashMap<&str, ()> = HashMap::new();
@@ -609,27 +556,14 @@ pub(super) fn observed_rows(
         let mut on_cmt = Vec::new();
         let mut all_censored = true;
         for r in &s.obs_records {
-            let ObsRecord::Event {
-                time,
-                event_type,
-                entry_time,
-                cmt: rc,
-            } = r
-            else {
+            let ObsRecord::Event { time, event_type, entry_time, cmt: rc } = r else {
                 continue;
             };
             all_censored &= matches!(event_type, EventType::RightCensored);
             if *rc != cmt {
                 continue;
             }
-            on_cmt.push(checked_record(
-                who,
-                &s.id,
-                cmt,
-                *time,
-                *entry_time,
-                event_type,
-            )?);
+            on_cmt.push(checked_record(who, &s.id, cmt, *time, *entry_time, event_type)?);
         }
         match on_cmt.as_slice() {
             [] => {}
@@ -672,9 +606,7 @@ pub(super) fn observed_rows(
 /// The grid of one stratum's curve: `observed_times` are the times of its observed
 /// curve, `rep_times` those of each replicate curve (read only by [`VpcGrid::AllSteps`]).
 pub(super) fn stratum_grid<'a>(
-    grid: &VpcGrid,
-    horizon: f64,
-    observed_times: &[f64],
+    grid: &VpcGrid, horizon: f64, observed_times: &[f64],
     rep_times: impl Iterator<Item = &'a [f64]>,
 ) -> Vec<f64> {
     let mut g: Vec<f64> = match grid {
@@ -716,10 +648,7 @@ pub(super) fn stratum_grid<'a>(
 /// stratification covariate a subject lacks or with more than
 /// [`VPC_TTE_MAX_STRATA`] values. Otherwise any `Err` the simulator returns.
 pub fn vpc_tte(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    opts: &VpcTteOptions,
+    model: &CompiledModel, population: &Population, params: &ModelParameters, opts: &VpcTteOptions,
 ) -> Result<TteVpc, EngineError> {
     let probs = opts.probs;
     check_band_options(Entry::Tte, probs, opts.n_sim, &opts.grid)?;
@@ -743,11 +672,8 @@ pub fn vpc_tte(
 
     let mut strata = Vec::with_capacity(n_strata);
     for (k, (value, label)) in values.into_iter().zip(labels).enumerate() {
-        let (ot, oe): (Vec<f64>, Vec<bool>) = rows
-            .iter()
-            .filter(|r| r.stratum == k)
-            .map(|r| (r.time, r.event))
-            .unzip();
+        let (ot, oe): (Vec<f64>, Vec<bool>) =
+            rows.iter().filter(|r| r.stratum == k).map(|r| (r.time, r.event)).unzip();
         let observed = kaplan_meier(&ot, &oe).map_err(|e| refuse(format!("vpc_tte: {e}")))?;
         let curves = reps
             .iter()

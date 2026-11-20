@@ -64,11 +64,8 @@ fn dry_run(args: &[&str]) -> DryRun {
     // "not called", but only by failing loudly; this one proves the negative even if a
     // regression tolerated the failure.
     let sentinel = dir.path().join("docker-was-called");
-    let docker = write_exe(
-        dir.path(),
-        "docker",
-        &format!("touch '{}'\nexit 0", sentinel.display()),
-    );
+    let docker =
+        write_exe(dir.path(), "docker", &format!("touch '{}'\nexit 0", sentinel.display()));
     let out = run_script(&docker, args);
     assert!(
         out.status.success(),
@@ -82,36 +79,21 @@ fn dry_run(args: &[&str]) -> DryRun {
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
     let mut lines = stdout.lines();
-    assert_eq!(
-        lines.next(),
-        Some("# docker command:"),
-        "dry-run layout:\n{stdout}"
-    );
+    assert_eq!(lines.next(), Some("# docker command:"), "dry-run layout:\n{stdout}");
     let argv = lines
         .next()
         .expect("the docker argv line")
         .split_whitespace()
         .map(str::to_string)
         .collect();
-    assert_eq!(
-        lines.next(),
-        Some("# inner script ($inner):"),
-        "dry-run layout:\n{stdout}"
-    );
-    DryRun {
-        argv,
-        inner: lines.map(str::to_string).collect(),
-    }
+    assert_eq!(lines.next(), Some("# inner script ($inner):"), "dry-run layout:\n{stdout}");
+    DryRun { argv, inner: lines.map(str::to_string).collect() }
 }
 
 impl DryRun {
     /// Every value passed with `flag` (`-v`, `-e`, `--platform`).
     fn values(&self, flag: &str) -> Vec<&str> {
-        self.argv
-            .windows(2)
-            .filter(|w| w[0] == flag)
-            .map(|w| w[1].as_str())
-            .collect()
+        self.argv.windows(2).filter(|w| w[0] == flag).map(|w| w[1].as_str()).collect()
     }
 
     fn inner_line(&self, pred: impl Fn(&str) -> bool) -> Option<usize> {
@@ -176,9 +158,7 @@ fn dry_run_prints_the_measured_container_layout() {
     let marker = d
         .inner_line(|l| l.starts_with("echo \"ferx-platform: Linux/"))
         .expect("the inner script must echo the `ferx-platform: Linux/` marker");
-    let cargo = d
-        .inner_line(|l| l.starts_with("cargo "))
-        .expect("the inner script must run cargo");
+    let cargo = d.inner_line(|l| l.starts_with("cargo ")).expect("the inner script must run cargo");
     assert!(
         marker < cargo,
         "the platform marker must be printed before cargo runs:\n{}",
@@ -269,11 +249,7 @@ fn missing_docker_and_dead_daemon_are_told_apart() {
     // No binary at all.
     let out = run_script(Path::new("/nonexistent/docker"), &["--", "test"]);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "no docker binary: exit 2; stderr: {err}"
-    );
+    assert_eq!(out.status.code(), Some(2), "no docker binary: exit 2; stderr: {err}");
     assert!(
         err.contains("docker not found") && !err.contains("daemon"),
         "no docker binary must say `docker not found` and give no daemon advice: {err}"
@@ -283,11 +259,7 @@ fn missing_docker_and_dead_daemon_are_told_apart() {
     let docker = write_exe(dir.path(), "docker", "exit 1");
     let out = run_script(&docker, &["--", "test"]);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(2),
-        "daemon down: exit 2; stderr: {err}"
-    );
+    assert_eq!(out.status.code(), Some(2), "daemon down: exit 2; stderr: {err}");
     assert!(
         err.contains("docker daemon not reachable (docker info failed)")
             && err.contains("start the Docker daemon and retry")

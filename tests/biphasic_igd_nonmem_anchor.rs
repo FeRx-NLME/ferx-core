@@ -128,11 +128,7 @@ fn biphasic_igd_marginal_ofv_matches_nonmem_at_their_optimum() {
     let result = fit(&model, &pop, &model.default_params, &opts)
         .expect("biphasic inverse-Gaussian fit must run");
 
-    assert!(
-        result.ofv.is_finite(),
-        "OFV must be finite, got {}",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV must be finite, got {}", result.ofv);
     assert!(
         (result.ofv - NONMEM_OFV).abs() < TOLERANCE,
         "ferx FOCEI objective {:.4} at NONMEM's optimum is outside the NONMEM-anchored \

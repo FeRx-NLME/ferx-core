@@ -66,21 +66,13 @@ fn pop_single_igd(obs_times: Vec<f64>) -> Population {
         input_columns: vec![],
         exclusions: None,
         warnings: vec![],
-        subjects: vec![common::subject(
-            "1",
-            vec![dose],
-            obs_times,
-            vec![0.0; n],
-            vec![1; n],
-        )],
+        subjects: vec![common::subject("1", vec![dose], obs_times, vec![0.0; n], vec![1; n])],
     }
 }
 
 #[test]
 fn igd_curve_recovers_dose_auc_and_has_delayed_peak() {
-    let model = parse_full_model(IGD_MODEL)
-        .expect("inverse-Gaussian model parses")
-        .model;
+    let model = parse_full_model(IGD_MODEL).expect("inverse-Gaussian model parses").model;
 
     // 0, 0.25, …, 72.0 — fine enough for trapezoidal AUC, long enough that the
     // truncated tail is negligible (ke = CL/V = 0.1 ⇒ t½ ≈ 6.9 h).
@@ -113,10 +105,8 @@ fn igd_curve_recovers_dose_auc_and_has_delayed_peak() {
     // (3) Mass balance via the absorption-independent invariant ∫A dt = Dose/ke.
     //     Catches a missing forcing (AUC → 0), a double-counted bolus (AUC →
     //     2·Dose/ke), or a mis-normalised IG density (∫R_in ≠ Dose).
-    let auc: f64 = preds
-        .windows(2)
-        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
-        .sum();
+    let auc: f64 =
+        preds.windows(2).map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time)).sum();
     let auc_inf = 100.0 * 50.0 / 5.0; // F·Dose/ke = Dose·V/CL with F = 1
     let rel = (auc - auc_inf).abs() / auc_inf;
     assert!(
@@ -133,9 +123,7 @@ fn igd_normal_dosing_passes_data_checks() {
     // Positive control: ordinary (non-SS, bolus) dosing into the igd()
     // compartment raises no absorption diagnostic.
     use ferx_core::check_model_data;
-    let model = parse_full_model(IGD_MODEL)
-        .expect("inverse-Gaussian model parses")
-        .model;
+    let model = parse_full_model(IGD_MODEL).expect("inverse-Gaussian model parses").model;
     let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -202,27 +190,17 @@ fn biphasic_igd_recovers_dose_auc() {
     // fraction scaling (e.g. both pathways delivering the full dose) would inflate
     // the AUC. FR2 = 1 − FR1 is the declared-complement pattern (#388).
     let src = biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1\n  FR2 = 1 - TVFR1");
-    let model = parse_full_model(&src)
-        .expect("biphasic inverse-Gaussian model parses")
-        .model;
+    let model = parse_full_model(&src).expect("biphasic inverse-Gaussian model parses").model;
     let obs_times: Vec<f64> = (0..=288).map(|i| i as f64 * 0.25).collect();
     let pop = pop_single_igd(obs_times);
     let preds = predict(&model, &pop, &model.default_params).unwrap();
 
-    assert!(
-        preds[0].pred.abs() < 1e-12,
-        "biphasic dose leaked in as a bolus"
-    );
-    let auc: f64 = preds
-        .windows(2)
-        .map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time))
-        .sum();
+    assert!(preds[0].pred.abs() < 1e-12, "biphasic dose leaked in as a bolus");
+    let auc: f64 =
+        preds.windows(2).map(|w| 0.5 * (w[0].pred + w[1].pred) * (w[1].time - w[0].time)).sum();
     let auc_inf = 100.0 * 50.0 / 5.0; // F·Dose/ke
     let rel = (auc - auc_inf).abs() / auc_inf;
-    assert!(
-        rel < 0.02,
-        "biphasic amount AUC {auc:.4} vs Dose·V/CL {auc_inf:.4} (rel {rel:.2e})"
-    );
+    assert!(rel < 0.02, "biphasic amount AUC {auc:.4} vs Dose·V/CL {auc_inf:.4} (rel {rel:.2e})");
 }
 
 #[test]
@@ -238,26 +216,15 @@ fn biphasic_igd_fraction_value_validation() {
     let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let has_fraction_err = |src: &str| {
         let model = parse_full_model(src).expect("model parses").model;
-        check_model_data(&model, &pop)
-            .iter()
-            .any(|d| d.code == "E_ABSORPTION_FRACTION")
+        check_model_data(&model, &pop).iter().any(|d| d.code == "E_ABSORPTION_FRACTION")
     };
 
     // Good: complementary fractions summing to 1 → no fraction diagnostic.
-    assert!(!has_fraction_err(&biphasic_model(
-        BIPHASIC_ODES,
-        "  FR1 = TVFR1\n  FR2 = 1 - TVFR1"
-    )));
+    assert!(!has_fraction_err(&biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1\n  FR2 = 1 - TVFR1")));
     // (c) Fractions that don't sum to 1 (both 0.6 → 1.2) are rejected.
-    assert!(has_fraction_err(&biphasic_model(
-        BIPHASIC_ODES,
-        "  FR1 = TVFR1\n  FR2 = TVFR1"
-    )));
+    assert!(has_fraction_err(&biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1\n  FR2 = TVFR1")));
     // (b) A fraction outside (0, 1] (FR1 = 1.5) is rejected.
-    assert!(has_fraction_err(&biphasic_model(
-        BIPHASIC_ODES,
-        "  FR1 = TVFR1 * 2.5\n  FR2 = TVFR2"
-    )));
+    assert!(has_fraction_err(&biphasic_model(BIPHASIC_ODES, "  FR1 = TVFR1 * 2.5\n  FR2 = TVFR2")));
 }
 
 #[test]
@@ -308,10 +275,7 @@ fn biphasic_igd_fraction_value_error_errs_on_predict() {
     let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("Pathway fractions on compartment"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("Pathway fractions on compartment"), "unexpected Err: {err}");
 }
 
 #[test]
@@ -324,8 +288,5 @@ fn biphasic_igd_fraction_value_error_errs_on_simulate() {
     let pop = pop_single_igd(vec![0.5, 1.0, 2.0, 4.0, 8.0]);
     let err = simulate_with_seed(&model, &pop, &model.default_params, 1, 42)
         .expect_err("simulate_with_seed() must refuse this input");
-    assert!(
-        err.to_string().contains("Pathway fractions on compartment"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("Pathway fractions on compartment"), "unexpected Err: {err}");
 }

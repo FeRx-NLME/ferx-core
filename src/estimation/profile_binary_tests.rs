@@ -39,8 +39,7 @@ fn b1_text(method: &str) -> String {
     for from in ["(0.0, -10.0, 10.0)\n", "  method     = laplace\n"] {
         assert!(t.contains(from), "the fixture moved: {from:?}");
     }
-    t.replace("(0.0, -10.0, 10.0)\n", "(0.0) profile\n")
-        .replace("  method     = laplace\n", method)
+    t.replace("(0.0, -10.0, 10.0)\n", "(0.0) profile\n").replace("  method     = laplace\n", method)
 }
 
 fn b1(max_study: Option<usize>, method: &'static str) -> crate::api::PreparedRun {
@@ -55,10 +54,7 @@ fn b1_unbalanced(method: &'static str, max_study: usize) -> crate::api::Prepared
     let csv = std::fs::read_to_string(root().join(B1_DATA)).unwrap();
     let mut lines = csv.lines();
     let header = lines.next().unwrap();
-    assert!(
-        header.starts_with("ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT"),
-        "the data moved"
-    );
+    assert!(header.starts_with("ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT"), "the data moved");
     let kept: String = std::iter::once(format!("{header}\n"))
         .chain(lines.filter_map(|l| {
             let f: Vec<&str> = l.split(',').collect();
@@ -90,9 +86,7 @@ fn nonmem_optimum() -> (Vec<f64>, f64, f64) {
             Some(&"ITERATION") => names = f.iter().map(|s| s.to_string()).collect(),
             Some(&"-1000000000") => {
                 let get = |n: &str| -> f64 {
-                    f[names.iter().position(|x| x == n).unwrap()]
-                        .parse()
-                        .unwrap()
+                    f[names.iter().position(|x| x == n).unwrap()].parse().unwrap()
                 };
                 return (
                     (1..=32).map(|k| get(&format!("THETA{k}"))).collect(),
@@ -140,10 +134,7 @@ fn the_rsr_one_subject_note_counts_binary_records() {
         Some(crate::types::CovarianceMethod::Sandwich),
     )
     .expect("every level is read by one study");
-    assert!(
-        sandwich.contains("40 of the 40 levels of theta PLACEBO[...]"),
-        "{sandwich}"
-    );
+    assert!(sandwich.contains("40 of the 40 levels of theta PLACEBO[...]"), "{sandwich}");
     assert!(crate::api::rsr_one_subject_levels_warning(
         &p.parsed.model,
         &p.population,
@@ -165,10 +156,7 @@ fn a_binary_only_subject_counts_its_records_toward_min_obs() {
     let p = b1(None, ARMS[0].1);
     let model = &p.parsed.model;
     let pop = &p.population;
-    assert!(pop
-        .subjects
-        .iter()
-        .all(|s| s.observations.is_empty() && s.n_scored_rows() == 240));
+    assert!(pop.subjects.iter().all(|s| s.observations.is_empty() && s.n_scored_rows() == 240));
     let count = |min_obs: usize| {
         let (_, _, stats, _) = crate::estimation::inner_optimizer::run_inner_loop_warm(
             model,
@@ -219,10 +207,7 @@ fn a_counted_block_read_by_the_binary_predictor_takes_its_levels_from_the_record
     assert!(text.contains(from), "the fixture moved");
     let text = text
         .replace(from, "PLACEBO[4](0.0) profile\n")
-        .replace(
-            "  TRT   continuous\n",
-            "  TRT   continuous\n  VISIT categorical\n",
-        )
+        .replace("  TRT   continuous\n", "  TRT   continuous\n  VISIT categorical\n")
         .replace("TVL + PLACEBO + ETA_S", "PLACEBO[VISIT] + ETA_S")
         .replace("  theta TVL(-0.3, -5.0, 5.0)\n", "");
     let model = temp("b1_visit.ferx");
@@ -263,11 +248,8 @@ fn a_binary_read_block_takes_the_exact_newton_matrix_under_every_method() {
         }
         let held = {
             let c = ctx(&p, &layout, &o);
-            c.solve(
-                &p.init_params,
-                &ProfileWarm::from_template(&layout, &p.init_params),
-            )
-            .unwrap_or_else(|e| panic!("{name}: held {e:?}"))
+            c.solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
+                .unwrap_or_else(|e| panic!("{name}: held {e:?}"))
         };
         eprintln!(
             "{name}: exact {} it {ce:?}; declined {} it, ofv gap {:.3e}, levels {:.3e} SE; \
@@ -278,24 +260,13 @@ fn a_binary_read_block_takes_the_exact_newton_matrix_under_every_method() {
             beta_gap_se(&layout, &exact, &fd),
             held.iterations
         );
-        assert!(
-            exact.iterations <= NEWTON_MAX_ITER,
-            "{name}: {}",
-            exact.iterations
-        );
+        assert!(exact.iterations <= NEWTON_MAX_ITER, "{name}: {}", exact.iterations);
         assert!(
             ce.exact_matrices > 0 && ce.fd_matrices == 0 && ce.fd_gradients == 0,
             "{name}: {ce:?}"
         );
-        assert!(
-            fd.iterations <= NEWTON_MAX_ITER,
-            "{name}: {}",
-            fd.iterations
-        );
-        assert!(
-            cf.exact_matrices == 0 && cf.fd_matrices > 0,
-            "{name}: {cf:?}"
-        );
+        assert!(fd.iterations <= NEWTON_MAX_ITER, "{name}: {}", fd.iterations);
+        assert!(cf.exact_matrices == 0 && cf.fd_matrices > 0, "{name}: {cf:?}");
         assert!((fd.ofv - exact.ofv).abs() < 1e-8, "{name}");
         assert!(beta_gap_se(&layout, &exact, &fd) < 1e-6, "{name}");
         assert!(
@@ -345,25 +316,15 @@ fn the_profiled_binary_objective_is_the_unprofiled_one_under_every_method() {
             s.ofv - unprofiled
         );
         assert!((s.ofv - cold).abs() < 1e-8, "{name}: D0");
-        assert!(
-            s.ofv - unprofiled < 1e-8,
-            "{name}: above the unprofiled point"
-        );
-        assert!(
-            s.ofv - unprofiled > -1e-6,
-            "{name}: far below NONMEM's optimum"
-        );
+        assert!(s.ofv - unprofiled < 1e-8, "{name}: above the unprofiled point");
+        assert!(s.ofv - unprofiled > -1e-6, "{name}: far below NONMEM's optimum");
         ofv.push(s.ofv);
     }
     for (k, (name, _)) in ARMS.iter().enumerate().take(3).skip(1) {
         assert!((ofv[k] - ofv[0]).abs() < 1e-9, "{name} vs laplace");
     }
     assert!((ofv[3] - ofv[4]).abs() < 1e-9, "the two quadrature anchors");
-    assert!(
-        ofv[0] - ofv[3] > 1e-3,
-        "three nodes read: {}",
-        ofv[0] - ofv[3]
-    );
+    assert!(ofv[0] - ofv[3] > 1e-3, "three nodes read: {}", ofv[0] - ofv[3]);
 }
 
 /// D3-bin. On [`b1_unbalanced`] (two studies) the solve is the minimum over the levels, a
@@ -408,24 +369,15 @@ fn mixed(method: &'static str, max_study: usize) -> crate::api::PreparedRun {
         assert!(text.contains(from), "the fixture moved: {from:?}");
     }
     let text = text
-        .replace(
-            "[fit_options]\n",
-            "[binary_model]\n  cmt   = 2\n  logit = LP\n\n[fit_options]\n",
-        )
+        .replace("[fit_options]\n", "[binary_model]\n  cmt   = 2\n  logit = LP\n\n[fit_options]\n")
         .replace("  method     = focei\n", method);
     let b2 = std::fs::read_to_string(root().join("nonmem_anchor/profile_logit_b2.csv")).unwrap();
     let b1 = std::fs::read_to_string(root().join(B1_DATA)).unwrap();
     let mut b2 = b2.lines();
     let header = b2.next().unwrap();
-    assert_eq!(
-        header, "ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT,NARM",
-        "the data moved"
-    );
+    assert_eq!(header, "ID,STUDY,TIME,DV,CMT,EVID,MDV,TRT,NARM", "the data moved");
     let mut rows: Vec<(usize, f64, usize, String)> = Vec::new();
-    for (lines, cmt) in [
-        (b2.collect::<Vec<_>>(), 1usize),
-        (b1.lines().skip(1).collect(), 2),
-    ] {
+    for (lines, cmt) in [(b2.collect::<Vec<_>>(), 1usize), (b1.lines().skip(1).collect(), 2)] {
         for l in lines {
             let f: Vec<&str> = l.split(',').collect();
             let study: usize = f[1].parse().unwrap();
@@ -499,10 +451,7 @@ fn a_block_read_by_gaussian_and_binary_rows_is_solved_to_the_minimum() {
         // Measured 6.0e-2 / 5.5e-2 SE (FOCEI / Laplace), solve − oracle 1e-11: B2 aggregates B1's draws, so the two kinds of
         // row agree closely, but the shift is four decades above the 1e-6 SE the solve
         // reaches levels to, which is what a dropped binary row would leave.
-        assert!(
-            shift > 1e-2,
-            "{name}: the binary rows do not move the levels"
-        );
+        assert!(shift > 1e-2, "{name}: the binary rows do not move the levels");
     }
 }
 
@@ -526,12 +475,8 @@ fn the_binary_newton_matrix_and_level_gradient_match_reconverged_differences() {
         let layout = layout_of(&p);
         let o = options(&p);
         let c = ctx(&p, &layout, &o);
-        let sol = c
-            .solve(
-                &p.init_params,
-                &ProfileWarm::from_template(&layout, &p.init_params),
-            )
-            .unwrap();
+        let sol =
+            c.solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params)).unwrap();
         let zero = DVector::zeros(c.model.n_eta);
         let (mut matrix, mut held_gap, mut gradient) = (0.0_f64, 0.0_f64, 0.0_f64);
         for params in [p.init_params.clone(), sol.params.clone()] {
@@ -539,10 +484,8 @@ fn the_binary_newton_matrix_and_level_gradient_match_reconverged_differences() {
             let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
             for i in 0..p.population.subjects.len() {
                 let s = c.resolve(i, &params, &zero);
-                let se: Vec<f64> = layout.reads[i]
-                    .iter()
-                    .map(|r| sol.level_scale[r.level])
-                    .collect();
+                let se: Vec<f64> =
+                    layout.reads[i].iter().map(|r| sol.level_scale[r.level]).collect();
                 let exact = c
                     .exact_hessian(i, &pt, &s)
                     .unwrap_or_else(|| panic!("{name}: the adjoint serves subject {i}"));
@@ -575,10 +518,7 @@ fn the_binary_newton_matrix_and_level_gradient_match_reconverged_differences() {
              gradient adjoint − FD {gradient:.3e} SE"
         );
         assert!(matrix < 1e-4, "{name}: {matrix:.3e}");
-        assert!(
-            held_gap > 10.0 * matrix,
-            "{name}: the fixture cannot tell them apart"
-        );
+        assert!(held_gap > 10.0 * matrix, "{name}: the fixture cannot tell them apart");
         assert!(gradient < 1e-6, "{name}: {gradient:.3e}");
     }
 }

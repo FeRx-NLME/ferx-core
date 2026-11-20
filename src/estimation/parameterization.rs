@@ -56,6 +56,60 @@ pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
     }
 }
 
+/// The packed `[θ | σ]` start and box of the EM-family M-steps (SAEM, MCEM and its
+/// mixture variant): θ per [`theta_packs_log`] (log for `theta_lower >= 0`, identity
+/// otherwise, so covariate exponents with negative lower bounds are not pinned to ~0),
+/// σ always log. θ bounds take the same packing (upper capped at `1e9` before the log);
+/// σ lives in `[-8, 5]`. A FIX θ or σ is pinned at its start (`lower == upper`), which is
+/// what the M-step optimizers read as a constant — the FOCE/FOCEI treatment.
+pub(crate) struct EmPacking {
+    pub(crate) theta_packs_log_mask: Vec<bool>,
+    pub(crate) log_theta: Vec<f64>,
+    pub(crate) log_sigma: Vec<f64>,
+    pub(crate) log_theta_lower: Vec<f64>,
+    pub(crate) log_theta_upper: Vec<f64>,
+    pub(crate) log_sigma_lower: Vec<f64>,
+    pub(crate) log_sigma_upper: Vec<f64>,
+}
+
+impl EmPacking {
+    /// Pack the start `theta` / `sigma` against `init`'s θ bounds and FIX flags.
+    pub(crate) fn new(init: &ModelParameters, theta: &[f64], sigma: &[f64]) -> Self {
+        let mask: Vec<bool> = init.theta_lower.iter().map(|&lo| theta_packs_log(lo)).collect();
+        let pack = |i: usize, t: f64, log_t: fn(f64) -> f64| if mask[i] { log_t(t) } else { t };
+        let log_theta: Vec<f64> =
+            (0..theta.len()).map(|i| pack(i, theta[i], |t| t.max(1e-10).ln())).collect();
+        let log_sigma: Vec<f64> = sigma.iter().map(|&s| s.max(1e-10).ln()).collect();
+        let mut log_theta_lower: Vec<f64> =
+            (0..theta.len()).map(|i| pack(i, init.theta_lower[i], |t| t.max(1e-10).ln())).collect();
+        let mut log_theta_upper: Vec<f64> =
+            (0..theta.len()).map(|i| pack(i, init.theta_upper[i], |t| t.min(1e9).ln())).collect();
+        let mut log_sigma_lower = vec![-8.0f64; sigma.len()];
+        let mut log_sigma_upper = vec![5.0f64; sigma.len()];
+        for i in 0..theta.len() {
+            if init.theta_fixed.get(i).copied().unwrap_or(false) {
+                log_theta_lower[i] = log_theta[i];
+                log_theta_upper[i] = log_theta[i];
+            }
+        }
+        for i in 0..sigma.len() {
+            if init.sigma_fixed.get(i).copied().unwrap_or(false) {
+                log_sigma_lower[i] = log_sigma[i];
+                log_sigma_upper[i] = log_sigma[i];
+            }
+        }
+        EmPacking {
+            theta_packs_log_mask: mask,
+            log_theta,
+            log_sigma,
+            log_theta_lower,
+            log_theta_upper,
+            log_sigma_lower,
+            log_sigma_upper,
+        }
+    }
+}
+
 /// The floor `sₖ` of packed coordinate `k`'s finite-difference step `eps·(sₖ + |xₖ|)`
 /// ([`fd_step`], #2147).
 ///
@@ -79,20 +133,13 @@ pub(crate) fn theta_packing_jacobian(theta: f64, theta_lower: f64) -> f64 {
 /// 1e-4 gets a reconverged-FD gradient 6.4e-3 off the exact adjoint gradient under the `|θ₀|`
 /// floor and 1.1e-8 under 1 (`a_small_covariate_nn_weight_gets_its_exact_gradient_from_the_fd_route`).
 pub(crate) fn fd_step_floor(template: &ModelParameters, model: &CompiledModel, k: usize) -> f64 {
-    fd_step_floor_of(
-        template,
-        &model.default_params,
-        &model.nn_weight_theta_ranges(),
-        k,
-    )
+    fd_step_floor_of(template, &model.default_params, &model.nn_weight_theta_ranges(), k)
 }
 
 /// [`fd_step_floor`] over explicit parts: `declared` the initial values and `nn_weights` the θ
 /// ranges of the `[covariate_nn]` weights (`CompiledModel::nn_weight_theta_ranges`).
 fn fd_step_floor_of(
-    template: &ModelParameters,
-    declared: &ModelParameters,
-    nn_weights: &[std::ops::Range<usize>],
+    template: &ModelParameters, declared: &ModelParameters, nn_weights: &[std::ops::Range<usize>],
     k: usize,
 ) -> f64 {
     match template.theta_lower.get(k) {
@@ -104,9 +151,7 @@ fn fd_step_floor_of(
 /// The declared-magnitude floor of θ `i`: `|θ₀ᵢ|` when `0 < |θ₀ᵢ| < 1` and θ `i` is not a
 /// `[covariate_nn]` weight, else 1 — including for an `i` past the declared θ vector.
 fn theta0_floor(
-    declared: &ModelParameters,
-    nn_weights: &[std::ops::Range<usize>],
-    i: usize,
+    declared: &ModelParameters, nn_weights: &[std::ops::Range<usize>], i: usize,
 ) -> f64 {
     match declared.theta.get(i) {
         Some(&t0) if t0 != 0.0 && t0.abs() < 1.0 && !nn_weights.iter().any(|w| w.contains(&i)) => {
@@ -527,10 +572,7 @@ pub(crate) struct PackMove {
 /// floor for it, while `NaN < x` is false and the natural spelling would say
 /// nothing.
 fn floor_for_log(
-    moves: &mut Vec<PackMove>,
-    index: usize,
-    value: f64,
-    report: fn(f64) -> f64,
+    moves: &mut Vec<PackMove>, index: usize, value: f64, report: fn(f64) -> f64,
 ) -> f64 {
     if !(value >= LOG_PACK_FLOOR) {
         moves.push(PackMove {
@@ -616,11 +658,7 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
     let n_eta = l.nrows();
     // A diagonal Ω reports its declared variance (`L²`); a block one cannot —
     // see `as_variance` / `as_cholesky_diagonal` (#1307 review round 2).
-    let omega_report = if params.omega.diagonal {
-        as_variance
-    } else {
-        as_cholesky_diagonal
-    };
+    let omega_report = if params.omega.diagonal { as_variance } else { as_cholesky_diagonal };
     for (i, j) in lower_tri_iter(n_eta, params.omega.diagonal) {
         if i == j {
             let idx = v.len();
@@ -641,11 +679,7 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
     // IOV omega: diagonal elements as log; off-diagonal as-is (mirrors BSV omega).
     if let Some(ref iov) = params.omega_iov {
         let l = &iov.chol;
-        let iov_report = if iov.diagonal {
-            as_variance
-        } else {
-            as_cholesky_diagonal
-        };
+        let iov_report = if iov.diagonal { as_variance } else { as_cholesky_diagonal };
         for (i, j) in lower_tri_iter(iov.dim(), iov.diagonal) {
             if i == j {
                 let idx = v.len();
@@ -688,11 +722,7 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
     // and flagged in `packed_fixed_mask`.
     for (i, corr) in params.residual_correlations.iter().enumerate() {
         let idx = v.len();
-        let fixed = params
-            .residual_correlation_fixed
-            .get(i)
-            .copied()
-            .unwrap_or(false);
+        let fixed = params.residual_correlation_fixed.get(i).copied().unwrap_or(false);
         // `rho_within_unit` guards `atanh` at the unit boundary on both
         // spellings, and binds only at `|ρ| >= 1`; `RHO_Z_BOUND` is the
         // *estimation* rail and applies to the free one only (#1307).
@@ -723,11 +753,7 @@ pub(crate) fn pack_params_with_moves(params: &ModelParameters) -> (Vec<f64>, Vec
         if unit_bound || rail_bound {
             moves.push(PackMove {
                 index: idx,
-                guard: if unit_bound {
-                    PackGuard::RhoUnit
-                } else {
-                    PackGuard::RhoRail
-                },
+                guard: if unit_bound { PackGuard::RhoUnit } else { PackGuard::RhoRail },
                 declared: corr.rho,
                 represented: unpack_rho(z),
             });
@@ -784,10 +810,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
             val
         })
         .collect();
-    let sigma = SigmaVector {
-        values: sigma_values,
-        names: template.sigma.names.clone(),
-    };
+    let sigma = SigmaVector { values: sigma_values, names: template.sigma.names.clone() };
 
     // IOV omega: mirrors BSV omega unpacking, checking the diagonal flag.
     let omega_iov = if let Some(ref iov_tmpl) = template.omega_iov {
@@ -799,10 +822,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
                 idx += 1;
                 variances.push(chol_diag * chol_diag);
             }
-            Some(OmegaMatrix::from_diagonal(
-                &variances,
-                iov_tmpl.eta_names.clone(),
-            ))
+            Some(OmegaMatrix::from_diagonal(&variances, iov_tmpl.eta_names.clone()))
         } else {
             let mut l = DMatrix::zeros(n_iov, n_iov);
             for (i, j) in lower_tri_iter(n_iov, false) {
@@ -871,10 +891,7 @@ pub fn unpack_params(v: &[f64], template: &ModelParameters) -> ModelParameters {
 /// point, and `fitted_params_from_result` for a fit's estimates (#1704), so the
 /// standalone SIR and covariance steps get the very class matrices the fit had.
 pub(crate) fn mixture_from_base(
-    tmpl: &crate::types::MixtureParams,
-    omega: &OmegaMatrix,
-    sigma: &SigmaVector,
-    packed: &[f64],
+    tmpl: &crate::types::MixtureParams, omega: &OmegaMatrix, sigma: &SigmaVector, packed: &[f64],
 ) -> crate::types::MixtureParams {
     // `zip` in the rebuild would silently leave trailing overrides at the base value.
     debug_assert_eq!(
@@ -904,14 +921,8 @@ pub(crate) fn mixture_override_values(mix: &crate::types::MixtureParams) -> Opti
     if mix.omega_override_addr.is_empty() && mix.sigma_override_addr.is_empty() {
         return None;
     }
-    let omega = mix
-        .omega_override_addr
-        .iter()
-        .map(|&(c, e)| mix.omega[c].matrix[(e, e)]);
-    let sigma = mix
-        .sigma_override_addr
-        .iter()
-        .map(|&(c, si)| mix.sigma[c].values[si]);
+    let omega = mix.omega_override_addr.iter().map(|&(c, e)| mix.omega[c].matrix[(e, e)]);
+    let sigma = mix.sigma_override_addr.iter().map(|&(c, si)| mix.sigma[c].values[si]);
     Some(omega.chain(sigma).collect())
 }
 
@@ -935,42 +946,22 @@ pub(crate) fn mixture_override_params(
     let seg = packed_segments(template);
     let names = coordinate_names(template);
     let mask = packed_fixed_mask(template);
-    let omega = mix
-        .omega_override_addr
-        .iter()
-        .enumerate()
-        .map(|(k, &(c, e))| {
-            (
-                crate::types::ParameterKind::Omega,
-                c,
-                e,
-                seg.mixture_omega_start() + k,
-            )
-        });
-    let sigma = mix
-        .sigma_override_addr
-        .iter()
-        .enumerate()
-        .map(|(k, &(c, s))| {
-            (
-                crate::types::ParameterKind::Sigma,
-                c,
-                s,
-                seg.mixture_sigma_start() + k,
-            )
-        });
+    let omega = mix.omega_override_addr.iter().enumerate().map(|(k, &(c, e))| {
+        (crate::types::ParameterKind::Omega, c, e, seg.mixture_omega_start() + k)
+    });
+    let sigma = mix.sigma_override_addr.iter().enumerate().map(|(k, &(c, s))| {
+        (crate::types::ParameterKind::Sigma, c, s, seg.mixture_sigma_start() + k)
+    });
     omega
         .chain(sigma)
-        .map(
-            |(kind, class0, index, packed_index)| crate::types::MixtureOverrideParam {
-                name: names[packed_index].clone(),
-                kind,
-                index,
-                class: class0 + 1,
-                packed_index,
-                fixed: mask[packed_index],
-            },
-        )
+        .map(|(kind, class0, index, packed_index)| crate::types::MixtureOverrideParam {
+            name: names[packed_index].clone(),
+            kind,
+            index,
+            class: class0 + 1,
+            packed_index,
+            fixed: mask[packed_index],
+        })
         .collect()
 }
 
@@ -979,10 +970,7 @@ pub(crate) fn mixture_override_params(
 /// these values, so a mixture rebuilt from its own `mixture_override_values` over the
 /// same base is bit-identical to it.
 pub(crate) fn mixture_from_overrides(
-    tmpl: &crate::types::MixtureParams,
-    omega: &OmegaMatrix,
-    sigma: &SigmaVector,
-    natural: &[f64],
+    tmpl: &crate::types::MixtureParams, omega: &OmegaMatrix, sigma: &SigmaVector, natural: &[f64],
 ) -> crate::types::MixtureParams {
     debug_assert_eq!(
         natural.len(),
@@ -990,24 +978,15 @@ pub(crate) fn mixture_from_overrides(
         "mixture_from_overrides: override count"
     );
     let (nat_omega, nat_sigma) = natural.split_at(tmpl.omega_override_addr.len());
-    mixture_from_natural(
-        tmpl,
-        omega,
-        sigma,
-        nat_omega.iter().copied(),
-        nat_sigma.iter().copied(),
-    )
+    mixture_from_natural(tmpl, omega, sigma, nat_omega.iter().copied(), nat_sigma.iter().copied())
 }
 
 /// The one per-class rebuild behind [`mixture_from_base`] and
 /// [`mixture_from_overrides`]: every class starts from the base, and each override
 /// takes its class variance (Ω) or σ value (Σ) from the iterators, in address order.
 fn mixture_from_natural(
-    tmpl: &crate::types::MixtureParams,
-    omega: &OmegaMatrix,
-    sigma: &SigmaVector,
-    omega_values: impl Iterator<Item = f64>,
-    sigma_values: impl Iterator<Item = f64>,
+    tmpl: &crate::types::MixtureParams, omega: &OmegaMatrix, sigma: &SigmaVector,
+    omega_values: impl Iterator<Item = f64>, sigma_values: impl Iterator<Item = f64>,
 ) -> crate::types::MixtureParams {
     let k = tmpl.omega.len();
     let mut class_omega_mat: Vec<DMatrix<f64>> = vec![omega.matrix.clone(); k];
@@ -1031,10 +1010,7 @@ fn mixture_from_natural(
         .collect();
     let class_sigma = class_sigma_val
         .into_iter()
-        .map(|values| SigmaVector {
-            values,
-            names: sigma.names.clone(),
-        })
+        .map(|values| SigmaVector { values, names: sigma.names.clone() })
         .collect();
     crate::types::MixtureParams {
         omega: class_omega,
@@ -1118,13 +1094,7 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
     // the parser always fills it, but `ModelParameters` is public and a caller
     // that builds one by hand should not lose the correlation entirely.
     for i in 0..template.residual_correlations.len() {
-        mask.push(
-            template
-                .residual_correlation_fixed
-                .get(i)
-                .copied()
-                .unwrap_or(false),
-        );
+        mask.push(template.residual_correlation_fixed.get(i).copied().unwrap_or(false));
     }
 
     // Structural zeros (#1018). One source for their positions — the covariance
@@ -1147,8 +1117,7 @@ pub fn packed_fixed_mask(template: &ModelParameters) -> Vec<bool> {
 /// bound (`profiled_levels_at_bound`, θ indices), which `theta_fixed` does not list. Read
 /// after both are final.
 pub(crate) fn cov_fixed_mask(
-    template: &ModelParameters,
-    fit: &crate::types::FitResult,
+    template: &ModelParameters, fit: &crate::types::FitResult,
 ) -> Vec<bool> {
     let Some(dim) = fit.covariance_matrix.as_ref().map(|m| m.nrows()) else {
         return Vec::new();
@@ -1231,8 +1200,7 @@ pub fn omega_structural_zero_mask(template: &ModelParameters) -> Vec<bool> {
 /// the right offsets — a diagonal Ω packs `n` coordinates, not `n(n+1)/2` —
 /// so there is no second `if om.diagonal` guard for the first to hide behind.
 fn omega_diagonal_mask(
-    template: &ModelParameters,
-    per_eta: impl Fn(&OmegaMatrix, usize) -> bool,
+    template: &ModelParameters, per_eta: impl Fn(&OmegaMatrix, usize) -> bool,
 ) -> Vec<bool> {
     let segs = packed_segments(template);
     let mut mask = vec![false; segs.total()];
@@ -1275,9 +1243,7 @@ fn omega_diagonal_mask(
 /// where `L_ii²` is exactly the declared variance and the correlation story
 /// would be false. For the spelling, see [`omega_block_declared_mask`].
 pub(crate) fn omega_correlated_diagonal_mask(template: &ModelParameters) -> Vec<bool> {
-    omega_diagonal_mask(template, |om, i| {
-        (0..om.dim()).any(|k| k != i && om.free_mask[(i, k)])
-    })
+    omega_diagonal_mask(template, |om, i| (0..om.dim()).any(|k| k != i && om.free_mask[(i, k)]))
 }
 
 /// Packed-length mask marking each Ω / Ω_IOV Cholesky **diagonal** whose eta was
@@ -1291,9 +1257,7 @@ pub(crate) fn omega_correlated_diagonal_mask(template: &ModelParameters) -> Vec<
 /// two or more etas and come apart only on a singleton, which is exactly the
 /// case where quoting one to answer the other goes wrong.
 pub(crate) fn omega_block_declared_mask(template: &ModelParameters) -> Vec<bool> {
-    omega_diagonal_mask(template, |om, i| {
-        om.block_declared.get(i).copied().unwrap_or(false)
-    })
+    omega_diagonal_mask(template, |om, i| om.block_declared.get(i).copied().unwrap_or(false))
 }
 
 /// What kind of quantity a packed coordinate holds, in [`pack_params`] order.
@@ -1332,22 +1296,13 @@ pub(crate) fn coordinate_kinds(template: &ModelParameters) -> Vec<PackedCoordKin
     let mut kinds = Vec::with_capacity(packed_len(template));
     kinds.resize(template.theta.len(), PackedCoordKind::Theta);
     push_omega_kinds(&mut kinds, &template.omega);
-    kinds.resize(
-        kinds.len() + template.sigma.values.len(),
-        PackedCoordKind::Sigma,
-    );
+    kinds.resize(kinds.len() + template.sigma.values.len(), PackedCoordKind::Sigma);
     if let Some(ref iov) = template.omega_iov {
         push_omega_kinds(&mut kinds, iov);
     }
     if let Some(ref mix) = template.mixture {
-        kinds.resize(
-            kinds.len() + mix.omega_override_addr.len(),
-            PackedCoordKind::OmegaDiagonal,
-        );
-        kinds.resize(
-            kinds.len() + mix.sigma_override_addr.len(),
-            PackedCoordKind::Sigma,
-        );
+        kinds.resize(kinds.len() + mix.omega_override_addr.len(), PackedCoordKind::OmegaDiagonal);
+        kinds.resize(kinds.len() + mix.sigma_override_addr.len(), PackedCoordKind::Sigma);
     }
     // `block_sigma` off-diagonals (#847) are Fisher-z coordinates bounded
     // symmetrically at ±`RHO_Z_BOUND`, so — exactly like an Ω off-diagonal —
@@ -1415,17 +1370,15 @@ impl PackedSegments {
 
 /// Per-segment lengths of `template`'s packed vector. See [`PackedSegments`].
 pub(crate) fn packed_segments(template: &ModelParameters) -> PackedSegments {
-    let (mixture_omega, mixture_sigma) = template.mixture.as_ref().map_or((0, 0), |mix| {
-        (mix.omega_override_addr.len(), mix.sigma_override_addr.len())
-    });
+    let (mixture_omega, mixture_sigma) = template
+        .mixture
+        .as_ref()
+        .map_or((0, 0), |mix| (mix.omega_override_addr.len(), mix.sigma_override_addr.len()));
     PackedSegments {
         theta: template.theta.len(),
         omega: omega_packed_len(template.omega.dim(), template.omega.diagonal),
         sigma: template.sigma.values.len(),
-        iov: template
-            .omega_iov
-            .as_ref()
-            .map_or(0, |m| omega_packed_len(m.dim(), m.diagonal)),
+        iov: template.omega_iov.as_ref().map_or(0, |m| omega_packed_len(m.dim(), m.diagonal)),
         mixture_omega,
         mixture_sigma,
         rho: template.residual_correlations.len(),
@@ -1507,12 +1460,7 @@ pub(crate) fn pack_with_bounds(template: &ModelParameters) -> PackedStart {
         }
     }
 
-    PackedStart {
-        packed,
-        bounds,
-        fixed,
-        moves,
-    }
+    PackedStart { packed, bounds, fixed, moves }
 }
 
 /// Which side of its own box a packed start fell off.
@@ -1595,8 +1543,7 @@ pub(crate) struct OutOfBox {
 /// *declaration* by [`theta_outside_declared_range`] instead, and this walk
 /// keeps only ferx's internal rails on that segment (#1309 review).
 pub(crate) fn coordinates_outside_bounds<'a>(
-    start: &'a PackedStart,
-    kinds: &'a [PackedCoordKind],
+    start: &'a PackedStart, kinds: &'a [PackedCoordKind],
 ) -> impl Iterator<Item = OutOfBox> + 'a {
     (0..start.packed.len()).filter_map(move |index| {
         // A coordinate any one of the parallel vectors is too short to describe
@@ -1633,13 +1580,7 @@ pub(crate) fn coordinates_outside_bounds<'a>(
         } else {
             return None;
         };
-        Some(OutOfBox {
-            index,
-            kind,
-            packed,
-            bound,
-            side,
-        })
+        Some(OutOfBox { index, kind, packed, bound, side })
     })
 }
 
@@ -1741,12 +1682,7 @@ pub(crate) fn theta_outside_declared_range(
         } else {
             return None;
         };
-        Some(OutOfDeclaredRange {
-            index,
-            side,
-            value,
-            bound,
-        })
+        Some(OutOfDeclaredRange { index, side, value, bound })
     })
 }
 
@@ -1788,26 +1724,17 @@ pub(crate) struct InvertedBox {
 /// `theta TVCL(1e-12, 1e-13, 1e-11)` — an ordinary small parameter — is the
 /// second, and it packs to `lower = -23.03` against `upper = -25.33`.
 pub(crate) fn coordinates_with_inverted_bounds<'a>(
-    start: &'a PackedStart,
-    kinds: &'a [PackedCoordKind],
+    start: &'a PackedStart, kinds: &'a [PackedCoordKind],
 ) -> impl Iterator<Item = InvertedBox> + 'a {
     (0..start.packed.len()).filter_map(move |index| {
         // Same short-vector guard as `coordinates_outside_bounds`.
-        let (&lower, &upper, &kind) = (
-            start.bounds.lower.get(index)?,
-            start.bounds.upper.get(index)?,
-            kinds.get(index)?,
-        );
+        let (&lower, &upper, &kind) =
+            (start.bounds.lower.get(index)?, start.bounds.upper.get(index)?, kinds.get(index)?);
         // `!(lower <= upper)` rather than `lower > upper` so a `NaN` bound is
         // caught too: `clamp` panics on a `NaN` min or max just as it does on
         // an inverted pair, and `NaN > x` is false.
         if lower.is_nan() || upper.is_nan() || lower > upper {
-            Some(InvertedBox {
-                index,
-                kind,
-                lower,
-                upper,
-            })
+            Some(InvertedBox { index, kind, lower, upper })
         } else {
             None
         }
@@ -1928,15 +1855,11 @@ fn unpinned_bounds(template: &ModelParameters) -> PackedBounds {
 pub fn coordinate_names(params: &ModelParameters) -> Vec<String> {
     let mut names = Vec::with_capacity(packed_len(params));
     for i in 0..params.theta.len() {
-        names.push(named_or(&params.theta_names, i, || {
-            format!("THETA{}", i + 1)
-        }));
+        names.push(named_or(&params.theta_names, i, || format!("THETA{}", i + 1)));
     }
     push_omega_names(&mut names, &params.omega);
     for i in 0..params.sigma.values.len() {
-        names.push(named_or(&params.sigma.names, i, || {
-            format!("SIGMA({})", i + 1)
-        }));
+        names.push(named_or(&params.sigma.names, i, || format!("SIGMA({})", i + 1)));
     }
     if let Some(ref iov) = params.omega_iov {
         push_omega_names(&mut names, iov);
@@ -1944,9 +1867,8 @@ pub fn coordinate_names(params: &ModelParameters) -> Vec<String> {
     // Mixture overrides (#977): `<ETA|SIGMA>_MIX{class}`, same order as pack.
     if let Some(ref mix) = params.mixture {
         for &(c, e) in &mix.omega_override_addr {
-            let base = named_or(&params.omega.eta_names, e, || {
-                format!("OMEGA({},{})", e + 1, e + 1)
-            });
+            let base =
+                named_or(&params.omega.eta_names, e, || format!("OMEGA({},{})", e + 1, e + 1));
             names.push(format!("{base}_MIX{}", c + 1));
         }
         for &(c, s) in &mix.sigma_override_addr {
@@ -2029,10 +1951,7 @@ pub fn coordinate_values(params: &ModelParameters) -> Vec<f64> {
 /// callers (e.g. SAEM) that hold parameters as loose matrices/vectors rather
 /// than a `ModelParameters`. Order matches [`pack_params`].
 pub fn coordinate_values_raw(
-    theta: &[f64],
-    omega_mat: &DMatrix<f64>,
-    omega_diagonal: bool,
-    sigma: &[f64],
+    theta: &[f64], omega_mat: &DMatrix<f64>, omega_diagonal: bool, sigma: &[f64],
     iov: Option<(&DMatrix<f64>, bool)>,
 ) -> Vec<f64> {
     let mut v = Vec::new();
@@ -2077,10 +1996,7 @@ pub fn compute_mu_k(model: &CompiledModel, theta: &[f64], enabled: bool) -> Vec<
     let mut mu = vec![0.0; model.n_eta];
     for (eta_idx, eta_name) in model.eta_names.iter().enumerate() {
         if let Some(mu_ref) = model.mu_refs.get(eta_name) {
-            if let Some(theta_idx) = model
-                .theta_names
-                .iter()
-                .position(|n| n == &mu_ref.theta_name)
+            if let Some(theta_idx) = model.theta_names.iter().position(|n| n == &mu_ref.theta_name)
             {
                 let theta_val = theta[theta_idx];
                 mu[eta_idx] = match mu_ref.transform {
@@ -2108,9 +2024,7 @@ pub fn compute_mu_k(model: &CompiledModel, theta: &[f64], enabled: bool) -> Vec<
 /// near zero means the natural-scale parameter is near 1.0 — no scaling
 /// needed there.
 pub fn compute_scale(x: &[f64]) -> Vec<f64> {
-    x.iter()
-        .map(|&v| if v.abs() > 0.1 { v.abs() } else { 1.0 })
-        .collect()
+    x.iter().map(|&v| if v.abs() > 0.1 { v.abs() } else { 1.0 }).collect()
 }
 
 /// [`compute_scale`], but the `block_sigma` Fisher-z coordinates keep scale 1.0
@@ -2141,11 +2055,7 @@ pub fn compute_scale(x: &[f64]) -> Vec<f64> {
 /// converges from both (736.89 with ρ = 0.9319, against NONMEM's 0.9312).
 pub(crate) fn compute_scale_packed(x: &[f64], template: &ModelParameters) -> Vec<f64> {
     let mut scale = compute_scale(x);
-    for (s, z) in scale
-        .iter_mut()
-        .zip(x.iter())
-        .skip(rho_packed_start(template))
-    {
+    for (s, z) in scale.iter_mut().zip(x.iter()).skip(rho_packed_start(template)) {
         *s = z.abs().max(1.0);
     }
     scale
@@ -2345,13 +2255,7 @@ mod tests {
         let l = DMatrix::from_row_slice(n, n, &[0.5, 0.0, 0.0, -0.2, 0.4, 0.0, 0.1, -0.3, 0.6]);
         let n_lt = omega_packed_len(n, false);
         let packed: Vec<f64> = lower_tri_iter(n, false)
-            .map(|(i, j)| {
-                if i == j {
-                    f64::ln(l[(i, j)])
-                } else {
-                    l[(i, j)]
-                }
-            })
+            .map(|(i, j)| if i == j { f64::ln(l[(i, j)]) } else { l[(i, j)] })
             .collect();
         let omega_of = |x: &[f64]| -> Vec<f64> {
             let mut lm = DMatrix::<f64>::zeros(n, n);
@@ -2401,25 +2305,16 @@ mod tests {
     fn make_template() -> ModelParameters {
         let omega =
             OmegaMatrix::from_diagonal(&[0.09, 0.04], vec!["eta_cl".into(), "eta_v".into()]);
-        let sigma = SigmaVector {
-            values: vec![0.3],
-            names: vec!["sigma_prop".into()],
-        };
+        let sigma = SigmaVector { values: vec![0.3], names: vec!["sigma_prop".into()] };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![10.0, 100.0],
             theta_names: vec!["cl".into(), "v".into()],
             theta_lower: vec![0.01, 0.01],
             theta_upper: vec![1000.0, 10000.0],
-            theta_fixed: vec![false; 2],
-            omega,
             omega_fixed: vec![false; 2],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
@@ -2472,9 +2367,8 @@ mod tests {
         declared.theta_names = (0..5).map(|i| format!("t{i}")).collect();
         declared.theta_fixed = vec![false; 5];
         let nn = [4..5];
-        let packed: Vec<f64> = (0..5)
-            .map(|k| fd_step_floor_of(&declared, &declared, &nn, k))
-            .collect();
+        let packed: Vec<f64> =
+            (0..5).map(|k| fd_step_floor_of(&declared, &declared, &nn, k)).collect();
         assert_eq!(packed, [0.0077, 1.0, 1.0, 1.0, 1.0]);
         let natural: Vec<f64> = (0..5).map(|i| theta0_floor(&declared, &nn, i)).collect();
         assert_eq!(natural, [0.0077, 1.0, 1.0, 0.5, 1.0]);
@@ -2555,16 +2449,9 @@ mod tests {
   DV ~ proportional(PROP)
 ";
         let plain = crate::parser::model_parser::parse_model_string(beta_src).expect("parses");
-        assert!(
-            !theta_packs_log(plain.default_params.theta_lower[0]),
-            "BETA is identity-packed"
-        );
+        assert!(!theta_packs_log(plain.default_params.theta_lower[0]), "BETA is identity-packed");
         assert_eq!(fd_theta_step_floor(&plain, 0), 0.3, "non-weight |θ₀| floor");
-        assert_eq!(
-            fd_theta_step_floors(&plain)[0],
-            0.3,
-            "non-weight |θ₀| floor"
-        );
+        assert_eq!(fd_theta_step_floors(&plain)[0], 0.3, "non-weight |θ₀| floor");
         // The packed wrappers too: BETA is identity-packed, so its packed coordinate is the θ
         // and takes the |θ₀| floor. Without these, `fd_step_floor → 1.0` survived the whole
         // `ci,survival,nn` unit suite (#2665 self-review): every other assertion on it expects 1.
@@ -2579,10 +2466,7 @@ mod tests {
     #[test]
     fn fd_step_at_floor_one_is_the_legacy_step() {
         for &(eps, x) in &[(1e-2, 0.3), (1e-4, -7.25), (1e-5, 1e-12), (1e-2, 0.0)] {
-            assert_eq!(
-                fd_step(eps, x, 1.0).to_bits(),
-                (eps * (1.0 + x.abs())).to_bits()
-            );
+            assert_eq!(fd_step(eps, x, 1.0).to_bits(), (eps * (1.0 + x.abs())).to_bits());
         }
         assert_eq!(fd_step(1e-2, 0.0077, 0.0077), 1e-2 * (0.0077 + 0.0077));
     }
@@ -2657,11 +2541,7 @@ mod tests {
                 sigma_override_addr: vec![(1, 0), (2, 0)],
                 sigma_override_fixed: vec![false, true],
             }),
-            residual_correlations: vec![ResidualCorrelation {
-                sigma_i: 1,
-                sigma_j: 0,
-                rho: 0.42,
-            }],
+            residual_correlations: vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho: 0.42 }],
             residual_correlation_fixed: vec![false],
         }
     }
@@ -2692,11 +2572,7 @@ mod tests {
         let separate_packed = pack_params(&t);
         let separate_fixed = packed_fixed_mask(&t);
         for i in 0..19 {
-            assert_eq!(
-                start.packed[i].to_bits(),
-                separate_packed[i].to_bits(),
-                "packed[{i}]"
-            );
+            assert_eq!(start.packed[i].to_bits(), separate_packed[i].to_bits(), "packed[{i}]");
             assert_eq!(start.fixed[i], separate_fixed[i], "fixed[{i}]");
         }
 
@@ -2806,10 +2682,7 @@ mod tests {
         // identified by kind and by the coordinate *before* them belonging to
         // the previous segment.
         assert_eq!(names[segs.mixture_omega_start() - 1], "kappa_v");
-        assert_eq!(
-            kinds[segs.mixture_omega_start()],
-            PackedCoordKind::OmegaDiagonal
-        );
+        assert_eq!(kinds[segs.mixture_omega_start()], PackedCoordKind::OmegaDiagonal);
         assert_eq!(kinds[segs.mixture_sigma_start()], PackedCoordKind::Sigma);
         assert_eq!(
             kinds[segs.rho_start()],
@@ -2844,18 +2717,16 @@ mod tests {
         };
         let kinds = vec![PackedCoordKind::Theta; 6];
 
-        let inverted: Vec<usize> = coordinates_with_inverted_bounds(&start, &kinds)
-            .map(|h| h.index)
-            .collect();
+        let inverted: Vec<usize> =
+            coordinates_with_inverted_bounds(&start, &kinds).map(|h| h.index).collect();
         assert_eq!(
             inverted,
             vec![0, 1, 2],
             "an inverted pair and either bound being NaN all panic `f64::clamp`"
         );
 
-        let outside: Vec<(usize, BoxSide)> = coordinates_outside_bounds(&start, &kinds)
-            .map(|h| (h.index, h.side))
-            .collect();
+        let outside: Vec<(usize, BoxSide)> =
+            coordinates_outside_bounds(&start, &kinds).map(|h| (h.index, h.side)).collect();
         assert_eq!(
             outside,
             vec![(4, BoxSide::Below)],
@@ -2905,14 +2776,8 @@ mod tests {
 
             // The pin is the box, so the coordinate cannot move even where it
             // sits outside the rail a free ρ would have carried.
-            assert_eq!(
-                start.bounds.lower[idx].to_bits(),
-                start.packed[idx].to_bits()
-            );
-            assert_eq!(
-                start.bounds.upper[idx].to_bits(),
-                start.packed[idx].to_bits()
-            );
+            assert_eq!(start.bounds.lower[idx].to_bits(), start.packed[idx].to_bits());
+            assert_eq!(start.bounds.upper[idx].to_bits(), start.packed[idx].to_bits());
             assert!(start.fixed[idx]);
 
             // Nothing to report: the declared value survived intact.
@@ -2985,16 +2850,8 @@ mod tests {
             (0, |t| t.theta[0] = 0.0, 0.0),
             (3, |t| t.omega.chol[(0, 0)] = 0.0, 0.0),
             (9, |t| t.sigma.values[0] = 0.0, 0.0),
-            (
-                11,
-                |t| t.omega_iov.as_mut().unwrap().chol[(0, 0)] = 0.0,
-                0.0,
-            ),
-            (
-                13,
-                |t| t.mixture.as_mut().unwrap().omega[1].chol[(0, 0)] = 0.0,
-                0.0,
-            ),
+            (11, |t| t.omega_iov.as_mut().unwrap().chol[(0, 0)] = 0.0, 0.0),
+            (13, |t| t.mixture.as_mut().unwrap().omega[1].chol[(0, 0)] = 0.0, 0.0),
         ];
         // Which of those report as a variance (`x²`) rather than verbatim, and
         // the split is the object of #1307 review round 2 rather than a detail:
@@ -3018,11 +2875,8 @@ mod tests {
             assert_eq!(mv.index, idx, "the report must name the coordinate");
             assert_eq!(mv.guard, PackGuard::ValueFloor);
             assert_eq!(mv.declared, declared);
-            let want = if is_variance(idx) {
-                LOG_PACK_FLOOR * LOG_PACK_FLOOR
-            } else {
-                LOG_PACK_FLOOR
-            };
+            let want =
+                if is_variance(idx) { LOG_PACK_FLOOR * LOG_PACK_FLOOR } else { LOG_PACK_FLOOR };
             assert_relative_eq!(mv.represented, want, epsilon = 1e-30);
             // The move is real: that is what the optimizer will see.
             let seen = pack_with_bounds(&t).packed[idx].exp();
@@ -3115,10 +2969,7 @@ mod tests {
                 start.packed[idx].is_finite(),
                 "fixed = {fixed}: atanh(1) is +inf and must not reach the optimizer"
             );
-            assert!(start
-                .moves
-                .iter()
-                .any(|m| m.guard == PackGuard::RhoUnit && m.index == idx));
+            assert!(start.moves.iter().any(|m| m.guard == PackGuard::RhoUnit && m.index == idx));
         }
     }
 
@@ -3158,11 +3009,7 @@ mod tests {
             // remedy follows from — even when the rail also bound.
             assert_eq!(mv.guard, PackGuard::RhoUnit);
             // And the value quoted is the packer's *final* output.
-            assert_relative_eq!(
-                mv.represented,
-                unpack_rho(start.packed[idx]),
-                epsilon = 1e-15
-            );
+            assert_relative_eq!(mv.represented, unpack_rho(start.packed[idx]), epsilon = 1e-15);
             assert!(start.packed[idx].is_finite());
         }
 
@@ -3209,16 +3056,9 @@ mod tests {
     /// A two-sigma template carrying one `block_sigma` off-diagonal (#847).
     fn make_rho_template(rho: f64, fixed: bool) -> ModelParameters {
         let mut t = make_template();
-        t.sigma = SigmaVector {
-            values: vec![0.3, 1.0],
-            names: vec!["prop".into(), "add".into()],
-        };
+        t.sigma = SigmaVector { values: vec![0.3, 1.0], names: vec!["prop".into(), "add".into()] };
         t.sigma_fixed = vec![false; 2];
-        t.residual_correlations = vec![ResidualCorrelation {
-            sigma_i: 1,
-            sigma_j: 0,
-            rho,
-        }];
+        t.residual_correlations = vec![ResidualCorrelation { sigma_i: 1, sigma_j: 0, rho }];
         t.residual_correlation_fixed = vec![fixed];
         t
     }
@@ -3243,11 +3083,7 @@ mod tests {
         // Pair indices are structural — they come from the template, not the vector.
         assert_eq!(recovered.residual_correlations[0].sigma_i, 1);
         assert_eq!(recovered.residual_correlations[0].sigma_j, 0);
-        assert_relative_eq!(
-            recovered.residual_correlations[0].rho,
-            0.62,
-            epsilon = 1e-12
-        );
+        assert_relative_eq!(recovered.residual_correlations[0].rho, 0.62, epsilon = 1e-12);
         assert_eq!(recovered.residual_correlation_fixed, vec![false]);
 
         // Free (non-FIX): the box is the open Fisher-z interval, not a pin.
@@ -3396,12 +3232,7 @@ mod tests {
         }
 
         // Sigma should round-trip
-        for (orig, rec) in template
-            .sigma
-            .values
-            .iter()
-            .zip(recovered.sigma.values.iter())
-        {
+        for (orig, rec) in template.sigma.values.iter().zip(recovered.sigma.values.iter()) {
             assert_relative_eq!(orig, rec, epsilon = 1e-8);
         }
     }
@@ -3430,25 +3261,17 @@ mod tests {
         // allows negatives (i.e. < 0). Positive-only parameters keep their
         // log-scale conditioning.
         let omega = OmegaMatrix::from_diagonal(&[0.04], vec!["eta_cl".into()]);
-        let sigma = SigmaVector {
-            values: vec![0.3],
-            names: vec!["sigma_prop".into()],
-        };
+        let sigma = SigmaVector { values: vec![0.3], names: vec!["sigma_prop".into()] };
         let template = ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0, -0.8, -0.01],
             theta_names: vec!["tvcl".into(), "gamma".into(), "age_eff".into()],
             theta_lower: vec![0.1, -3.0, -1.0],
             theta_upper: vec![100.0, 3.0, 1.0],
             theta_fixed: vec![false; 3],
-            omega,
             omega_fixed: vec![false; 1],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         };
         let packed = pack_params(&template);
         // theta[0] is sign-constrained (lower=0.1) → log-packed.
@@ -3536,9 +3359,7 @@ mod tests {
         assert!(omega_variance_at_or_below_rail(0.0));
         // Above it — including the next representable f64, so the boundary is
         // pinned from both sides rather than by a comfortable margin.
-        assert!(!omega_variance_at_or_below_rail(f64::from_bits(
-            rail.to_bits() + 1
-        )));
+        assert!(!omega_variance_at_or_below_rail(f64::from_bits(rail.to_bits() + 1)));
         assert!(!omega_variance_at_or_below_rail(0.09));
 
         // The consumer's contract, without depending on `ferx-tools`: its
@@ -3596,25 +3417,16 @@ mod tests {
         m[(0, 1)] = 0.02; // cov(eta_cl, eta_v)
         m[(1, 0)] = 0.02;
         let omega = OmegaMatrix::from_matrix(m, vec!["eta_cl".into(), "eta_v".into()], false);
-        let sigma = SigmaVector {
-            values: vec![0.3],
-            names: vec!["sigma_prop".into()],
-        };
+        let sigma = SigmaVector { values: vec![0.3], names: vec!["sigma_prop".into()] };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![10.0, 100.0],
             theta_names: vec!["cl".into(), "v".into()],
             theta_lower: vec![0.01, 0.01],
             theta_upper: vec![1000.0, 10000.0],
-            theta_fixed: vec![false; 2],
-            omega,
             omega_fixed: vec![false; 2],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
@@ -3656,23 +3468,14 @@ mod tests {
     /// (2,2)=7, σ=8.
     fn block_plus_diag_template() -> ModelParameters {
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0, 2.0],
             theta_names: vec!["a".into(), "b".into()],
             theta_lower: vec![0.0, 0.0],
             theta_upper: vec![10.0, 10.0],
             theta_fixed: vec![false, false],
-            omega: make_block_plus_diag_omega(),
             omega_fixed: vec![false, false, false],
-            sigma: SigmaVector {
-                values: vec![0.3],
-                names: vec!["s".into()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            sigma: SigmaVector { values: vec![0.3], names: vec!["s".into()] },
+            ..crate::types::test_helpers::bare_params(make_block_plus_diag_omega())
         }
     }
 
@@ -3719,23 +3522,18 @@ mod tests {
     ///   iov packed offset 3: (0,0)=3 (1,0)=4 (2,0)=5 (1,1)=6 (2,1)=7 (2,2)=8
     fn block_plus_diag_iov_template() -> ModelParameters {
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
             theta_names: vec!["a".into()],
             theta_lower: vec![0.0],
             theta_upper: vec![10.0],
             theta_fixed: vec![false],
-            omega: OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]),
-            omega_fixed: vec![false],
-            sigma: SigmaVector {
-                values: vec![0.3],
-                names: vec!["s".into()],
-            },
-            sigma_fixed: vec![false],
+            sigma: SigmaVector { values: vec![0.3], names: vec!["s".into()] },
             omega_iov: Some(make_block_plus_diag_omega()),
             kappa_fixed: vec![false, false, false],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(OmegaMatrix::from_diagonal(
+                &[0.09],
+                vec!["ETA_CL".into()],
+            ))
         }
     }
 
@@ -3842,11 +3640,8 @@ mod tests {
             OmegaMatrix::from_matrix_with_mask(m, vec!["ETA_CL".into(), "ETA_V".into()], false, fm)
                 .with_block_declared(vec![true, false]);
 
-        let template = ModelParameters {
-            omega,
-            omega_fixed: vec![false, false],
-            ..make_block_template()
-        };
+        let template =
+            ModelParameters { omega, omega_fixed: vec![false, false], ..make_block_template() };
 
         // Ω packed offsets from 2: (0,0)=2 (1,0)=3 (1,1)=4.
         let correlated = omega_correlated_diagonal_mask(&template);
@@ -3858,10 +3653,7 @@ mod tests {
         );
         assert!(declared[2], "...but it was declared as a block");
         // The standalone diagonal eta is neither.
-        assert!(
-            !correlated[4] && !declared[4],
-            "ETA_V is a plain omega line"
-        );
+        assert!(!correlated[4] && !declared[4], "ETA_V is a plain omega line");
         // The off-diagonal coordinate is not a variance under either question.
         assert!(!correlated[3] && !declared[3]);
     }
@@ -3906,12 +3698,7 @@ mod tests {
             assert_eq!(h, structural.contains(&i), "held[{i}]");
         }
 
-        let PackedStart {
-            packed,
-            bounds,
-            fixed,
-            moves,
-        } = pack_with_bounds(&template);
+        let PackedStart { packed, bounds, fixed, moves } = pack_with_bounds(&template);
         assert_eq!(fixed, held);
         assert!(
             moves.is_empty(),
@@ -3954,11 +3741,7 @@ mod tests {
             stale.omega.chol[(2, 0)] != 0.0,
             "fixture must carry a non-zero structural Cholesky entry"
         );
-        assert_eq!(
-            pack_params(&stale)[4],
-            0.0,
-            "pack_params must zero a structural slot"
-        );
+        assert_eq!(pack_params(&stale)[4], 0.0, "pack_params must zero a structural slot");
         let pinned = pack_with_bounds(&stale);
         assert!(
             pinned.packed[4] == 0.0
@@ -3997,12 +3780,7 @@ mod tests {
         }
 
         // Sigma round-trip
-        for (orig, rec) in template
-            .sigma
-            .values
-            .iter()
-            .zip(recovered.sigma.values.iter())
-        {
+        for (orig, rec) in template.sigma.values.iter().zip(recovered.sigma.values.iter()) {
             assert_relative_eq!(orig, rec, epsilon = 1e-8);
         }
     }
@@ -4037,10 +3815,7 @@ mod tests {
         // (0,0)=eta_cl, (1,0)=eta_v~eta_cl, (1,1)=eta_v.
         let t = make_block_template();
         let names = coordinate_names(&t);
-        assert_eq!(
-            names,
-            vec!["cl", "v", "eta_cl", "eta_v~eta_cl", "eta_v", "sigma_prop"]
-        );
+        assert_eq!(names, vec!["cl", "v", "eta_cl", "eta_v~eta_cl", "eta_v", "sigma_prop"]);
     }
 
     #[test]
@@ -4063,35 +3838,17 @@ mod tests {
         m[(1, 0)] = 0.02;
         let omega = OmegaMatrix::from_matrix(m, vec![String::new(), String::new()], false);
         let t = ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![1.0],
             theta_names: vec![String::new()],
             theta_lower: vec![0.0],
             theta_upper: vec![10.0],
             theta_fixed: vec![false],
-            omega,
             omega_fixed: vec![false, false],
-            sigma: SigmaVector {
-                values: vec![0.3],
-                names: vec![String::new()],
-            },
-            sigma_fixed: vec![false],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            sigma: SigmaVector { values: vec![0.3], names: vec![String::new()] },
+            ..crate::types::test_helpers::bare_params(omega)
         };
         let names = coordinate_names(&t);
-        assert_eq!(
-            names,
-            vec![
-                "THETA1",
-                "OMEGA(1,1)",
-                "OMEGA(2,1)",
-                "OMEGA(2,2)",
-                "SIGMA(1)"
-            ]
-        );
+        assert_eq!(names, vec!["THETA1", "OMEGA(1,1)", "OMEGA(2,1)", "OMEGA(2,2)", "SIGMA(1)"]);
     }
 
     #[test]
@@ -4121,10 +3878,7 @@ mod tests {
 
     // ── mu-referencing helpers ──────────────────────────────────────────
 
-    use crate::types::{
-        BloqMethod, CompiledModel, ErrorModel, GradientMethod, MuRef, PkModel, PkParams,
-        ScalingSpec,
-    };
+    use crate::types::{CompiledModel, GradientMethod, MuRef, PkParams};
     use std::collections::HashMap;
 
     /// Build a minimal CompiledModel with the given mu-refs. Only fields
@@ -4148,60 +3902,30 @@ mod tests {
             );
         }
         let omega = OmegaMatrix::from_diagonal(&[0.09, 0.04, 0.30], eta_names.clone());
-        let sigma = SigmaVector {
-            values: vec![0.02],
-            names: vec!["PROP_ERR".into()],
-        };
+        let sigma = SigmaVector { values: vec![0.02], names: vec!["PROP_ERR".into()] };
         let default_params = ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![0.2, 10.0, 1.5],
             theta_names: theta_names.clone(),
             theta_lower: vec![0.001, 0.1, 0.01],
             theta_upper: vec![10.0, 500.0, 50.0],
             theta_fixed: vec![false; 3],
-            omega,
             omega_fixed: vec![false; 3],
             sigma,
             sigma_fixed: vec![false; 1],
-            omega_iov: None,
-            kappa_fixed: Vec::new(),
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         };
         CompiledModel {
-            plan_id: Default::default(),
-            residual_serial: None,
-            priors: Vec::new(),
-            prior_from_fit: None,
-            covariate_model: None,
-            name: "test".into(),
-            pk_model: PkModel::OneCptIv,
-            error_model: ErrorModel::Proportional,
-            error_spec: crate::types::ErrorSpec::Single(ErrorModel::Proportional),
-            residual_correlations: Vec::new(),
             pk_param_fn: Box::new(|_, _, _, _t: f64| PkParams::default()),
             n_theta: 3,
             n_eta: 3,
-            n_epsilon: 1,
             theta_names,
             eta_names,
             indiv_param_names: vec!["CL".into(), "V".into(), "KA".into()],
-            indiv_param_partials: crate::types::IndivParamPartials::empty(),
-            default_params,
             omega_init_as_sd: vec![false; 3],
-            sigma_init_as_sd: vec![false],
-            kappa_init_as_sd: Vec::new(),
-            kappa_weights: Vec::new(),
             mu_refs: refs,
-            covariate_mu_refs: Vec::new(),
-            kappa_mu_refs: HashMap::new(),
-            tv_fn: None,
             pk_indices: vec![0, 1, 4],
-
             eta_map: (0..3).map(|i| i as i32).collect(),
-
             pk_idx_f64: vec![0.0, 1.0, 4.0],
-
             sel_flat: {
                 let mut v = vec![0.0f64; 3 * 3];
                 for i in 0..3 {
@@ -4209,37 +3933,8 @@ mod tests {
                 }
                 v
             },
-            ode_spec: None,
-            dose_attr_map: Default::default(),
-            diffusion_theta_start: None,
-            diffusion_state_indices: Vec::new(),
-            bloq_method: BloqMethod::Drop,
-            referenced_covariates: Vec::new(),
             gradient_method: GradientMethod::default(),
-            parse_warnings: Vec::new(),
-            has_conditional_eta_params: false,
-            eta_param_info: Vec::new(),
-            kappa_param_types: Vec::new(),
-            theta_transform: Vec::new(),
-            theta_eta_linked: Vec::new(),
-            n_kappa: 0,
-            kappa_names: Vec::new(),
-            #[cfg(feature = "nn")]
-            covariate_nns: Vec::new(),
-            scaling: ScalingSpec::None,
-            log_transform: false,
-            dv_pre_logged: false,
-            derived_exprs: vec![],
-            output_columns: vec![],
-            #[cfg(feature = "survival")]
-            endpoints: std::collections::BTreeMap::new(),
-            frem_config: None,
-            residual_error_eta: None,
-            analytical_init: Vec::new(),
-            analytic_readout: None,
-            ruv_magnitude: None,
-            absorption_ode_equivalent: None,
-            mixture: None,
+            ..crate::types::test_helpers::bare_model(default_params)
         }
     }
 
@@ -4299,10 +3994,7 @@ mod tests {
         let mut model = make_model_with_mu_refs(vec![]);
         model.mu_refs.insert(
             "ETA_CL".into(),
-            MuRef {
-                theta_name: "TVCL".into(),
-                transform: crate::types::MuTransform::Logit,
-            },
+            MuRef { theta_name: "TVCL".into(), transform: crate::types::MuTransform::Logit },
         );
         let mu = compute_mu_k(&model, &[-0.405_465, 10.0, 1.5], true);
         assert_relative_eq!(mu[0], -0.405_465, epsilon = 1e-12);
@@ -4326,11 +4018,7 @@ mod tests {
 
         for degenerate in [0.0, 1.0] {
             let mu = compute_mu_k(&model, &[degenerate, 10.0, 1.5], true);
-            assert!(
-                mu[0].is_finite(),
-                "logit({degenerate}) must be clamped, got {}",
-                mu[0]
-            );
+            assert!(mu[0].is_finite(), "logit({degenerate}) must be clamped, got {}", mu[0]);
         }
     }
 
@@ -4341,10 +4029,7 @@ mod tests {
         let mut model = make_model_with_mu_refs(vec![]);
         model.mu_refs.insert(
             "ETA_CL".into(),
-            MuRef {
-                theta_name: "NON_EXISTENT".into(),
-                transform: crate::types::MuTransform::Log,
-            },
+            MuRef { theta_name: "NON_EXISTENT".into(), transform: crate::types::MuTransform::Log },
         );
         let mu = compute_mu_k(&model, &[0.2, 10.0, 1.5], true);
         assert_eq!(mu, vec![0.0, 0.0, 0.0]);
@@ -4416,16 +4101,8 @@ mod tests {
         let bounds = compute_bounds(&template);
         let packed = pack_params(&template);
         let omega0_idx = template.theta.len(); // first omega entry after theta
-        assert_relative_eq!(
-            bounds.lower[omega0_idx],
-            packed[omega0_idx],
-            epsilon = 1e-12
-        );
-        assert_relative_eq!(
-            bounds.upper[omega0_idx],
-            packed[omega0_idx],
-            epsilon = 1e-12
-        );
+        assert_relative_eq!(bounds.lower[omega0_idx], packed[omega0_idx], epsilon = 1e-12);
+        assert_relative_eq!(bounds.upper[omega0_idx], packed[omega0_idx], epsilon = 1e-12);
         // The other omega (free) still has a real interval
         assert!(bounds.lower[omega0_idx + 1] < bounds.upper[omega0_idx + 1]);
     }
@@ -4495,25 +4172,17 @@ mod tests {
     fn make_iov_template() -> ModelParameters {
         let omega = OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
         let omega_iov = OmegaMatrix::from_diagonal(&[0.01], vec!["KAPPA_CL".into()]);
-        let sigma = SigmaVector {
-            values: vec![0.02],
-            names: vec!["PROP_ERR".into()],
-        };
+        let sigma = SigmaVector { values: vec![0.02], names: vec!["PROP_ERR".into()] };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![5.0],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.01],
             theta_upper: vec![100.0],
             theta_fixed: vec![false],
-            omega,
-            omega_fixed: vec![false],
             sigma,
-            sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 
@@ -4584,14 +4253,8 @@ mod tests {
         let b = from_conv.omega_iov.as_ref().unwrap();
         // Bit-for-bit on every cached field — this is the `1e-12` the fit-level
         // parity test observes, reduced to its root cause.
-        assert_eq!(
-            a.matrix, b.matrix,
-            "Ω_IOV matrix must not depend on template values"
-        );
-        assert_eq!(
-            a.chol, b.chol,
-            "Ω_IOV chol must not depend on template values"
-        );
+        assert_eq!(a.matrix, b.matrix, "Ω_IOV matrix must not depend on template values");
+        assert_eq!(a.chol, b.chol, "Ω_IOV chol must not depend on template values");
         assert_eq!(a.inv, b.inv, "Ω_IOV inv must not depend on template values");
         assert_eq!(
             a.log_det.to_bits(),
@@ -4651,25 +4314,17 @@ mod tests {
         let _chol = mat.clone().cholesky().unwrap().l();
         let omega_iov =
             OmegaMatrix::from_matrix(mat, vec!["KAPPA_CL".into(), "KAPPA_V".into()], false);
-        let sigma = SigmaVector {
-            values: vec![0.02],
-            names: vec!["PROP_ERR".into()],
-        };
+        let sigma = SigmaVector { values: vec![0.02], names: vec!["PROP_ERR".into()] };
         ModelParameters {
-            residual_correlations: Vec::new(),
-            residual_correlation_fixed: Vec::new(),
             theta: vec![0.2],
             theta_names: vec!["TVCL".into()],
             theta_lower: vec![0.01],
             theta_upper: vec![100.0],
             theta_fixed: vec![false],
-            omega,
-            omega_fixed: vec![false],
             sigma,
-            sigma_fixed: vec![false],
             omega_iov: Some(omega_iov),
             kappa_fixed: vec![false, false],
-            mixture: None,
+            ..crate::types::test_helpers::bare_params(omega)
         }
     }
 

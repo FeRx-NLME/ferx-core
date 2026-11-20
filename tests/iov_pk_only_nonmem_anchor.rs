@@ -47,18 +47,10 @@ use ferx_core::types::{FitResult, Population};
 fn nonmem_obj(name: &str) -> f64 {
     let path = format!("nonmem_anchor/results/{name}.ext");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
-    let rows: Vec<Vec<&str>> = text
-        .lines()
-        .map(|l| l.split_whitespace().collect())
-        .collect();
-    let header = rows
-        .iter()
-        .find(|r| r.first() == Some(&"ITERATION"))
-        .expect(".ext header");
-    let last = rows
-        .iter()
-        .find(|r| r.first() == Some(&"-1000000000"))
-        .expect(".ext final-estimate row");
+    let rows: Vec<Vec<&str>> = text.lines().map(|l| l.split_whitespace().collect()).collect();
+    let header = rows.iter().find(|r| r.first() == Some(&"ITERATION")).expect(".ext header");
+    let last =
+        rows.iter().find(|r| r.first() == Some(&"-1000000000")).expect(".ext final-estimate row");
     let i = header.iter().position(|h| *h == "OBJ").expect(".ext OBJ");
     let obj: f64 = last[i].parse().expect(".ext OBJ value");
     assert!(obj.is_finite(), "{path}: OBJ {obj}");
@@ -114,15 +106,9 @@ fn pk_only_row_runs_under_its_own_occasion_matches_nonmem() {
         let mut by_engine: Vec<Vec<f64>> = Vec::new();
         for engine in ["an", "ode"] {
             let mut ofvs = Vec::new();
-            for (data, want) in [
-                ("A", a),
-                ("E", e),
-                ("X", x),
-                ("XM", x),
-                ("X3", x3),
-                ("XM3", xm3),
-                ("AT", at),
-            ] {
+            for (data, want) in
+                [("A", a), ("E", e), ("X", x), ("XM", x), ("X3", x3), ("XM3", xm3), ("AT", at)]
+            {
                 let (fit, pop) = ferx(engine, method, data);
                 let tag = format!("{engine}_{method} on {data}");
                 // The rows must reach the engine, labelled: a reader that drops them, or
@@ -148,10 +134,8 @@ fn pk_only_row_runs_under_its_own_occasion_matches_nonmem() {
                     );
                 }
                 // The analytic inner gradient ran, so the exact (adjoint) path is what was anchored.
-                if let Some(w) = fit
-                    .warnings
-                    .iter()
-                    .find(|w| w.contains("finite-difference inner gradients"))
+                if let Some(w) =
+                    fit.warnings.iter().find(|w| w.contains("finite-difference inner gradients"))
                 {
                     failures.push(format!("{tag}: {w}"));
                 }

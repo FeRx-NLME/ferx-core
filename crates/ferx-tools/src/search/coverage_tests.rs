@@ -28,11 +28,7 @@ fn the_epic_table_supported_rows_pass() {
         "IIV(@PK,[EXP,ADD,PROP])",
         "COVARIANCE(IIV,@PK_IIV)",
     ] {
-        assert!(
-            gaps(src).is_empty(),
-            "{src} should be supported: {:?}",
-            gaps(src)
-        );
+        assert!(gaps(src).is_empty(), "{src} should be supported: {:?}", gaps(src));
     }
 }
 
@@ -47,16 +43,10 @@ fn the_issue_gaps_are_hard_errors_naming_the_feature() {
     assert_eq!(gaps("ABSORPTION(ZO)"), Vec::<String>::new());
     assert_eq!(gaps("ABSORPTION(WEIBULL)"), Vec::<String>::new());
     assert_eq!(gaps("ABSORPTION(SEQ-ZO-FO)"), vec!["ABSORPTION(SEQ-ZO-FO)"]);
-    assert_eq!(
-        gaps("ABSORPTION([FO,SEQ-ZO-FO])"),
-        vec!["ABSORPTION(SEQ-ZO-FO)"]
-    );
+    assert_eq!(gaps("ABSORPTION([FO,SEQ-ZO-FO])"), vec!["ABSORPTION(SEQ-ZO-FO)"]);
     assert_eq!(gaps("DIRECTEFFECT(EMAX)"), vec!["DIRECTEFFECT(...)"]);
     assert_eq!(gaps("EFFECTCOMP(*)"), vec!["EFFECTCOMP(...)"]);
-    assert_eq!(
-        gaps("INDIRECTEFFECT(LINEAR,DEGRADATION)"),
-        vec!["INDIRECTEFFECT(...)"]
-    );
+    assert_eq!(gaps("INDIRECTEFFECT(LINEAR,DEGRADATION)"), vec!["INDIRECTEFFECT(...)"]);
 }
 
 #[test]
@@ -75,10 +65,7 @@ fn wildcards_are_checked_against_their_full_expansion() {
 #[test]
 fn the_remaining_gap_rows() {
     assert_eq!(gaps("PERIPHERALS(3)"), vec!["PERIPHERALS(3)"]);
-    assert_eq!(
-        gaps("PERIPHERALS(0..4)"),
-        vec!["PERIPHERALS(3)", "PERIPHERALS(4)"]
-    );
+    assert_eq!(gaps("PERIPHERALS(0..4)"), vec!["PERIPHERALS(3)", "PERIPHERALS(4)"]);
     assert_eq!(gaps("TRANSITS(2,DEPOT)"), vec!["TRANSITS(n, DEPOT)"]);
     // Omitting the option is Pharmpy's DEPOT, not a way past the gap; `N`
     // has no option and is NODEPOT by Pharmpy's own grammar.
@@ -88,10 +75,7 @@ fn the_remaining_gap_rows() {
     assert_eq!(gaps("METABOLITE(PSC)"), vec!["METABOLITE(...)"]);
     // `cat2` became `categorical2` in #1312, so it is no longer a gap.
     assert_eq!(gaps("COVARIATE(CL,SEX,cat2)"), Vec::<String>::new());
-    assert_eq!(
-        gaps("COVARIATE(CL,WT,custom)"),
-        vec!["COVARIATE(..., custom)"]
-    );
+    assert_eq!(gaps("COVARIATE(CL,WT,custom)"), vec!["COVARIATE(..., custom)"]);
     // The `+` operator is expressible as of #1313 — the block spells it as a
     // trailing operator token. ferx's additive template is null-at-zero where
     // Pharmpy's is not, but that is a semantic divergence `resolve` states as a
@@ -99,10 +83,7 @@ fn the_remaining_gap_rows() {
     assert_eq!(gaps("COVARIATE(CL,WT,pow,+)"), Vec::<String>::new());
     // …and a form gap under `+` is still a gap: dropping the operator check
     // must not have dropped the form check with it.
-    assert_eq!(
-        gaps("COVARIATE(CL,WT,custom,+)"),
-        vec!["COVARIATE(..., custom)"]
-    );
+    assert_eq!(gaps("COVARIATE(CL,WT,custom,+)"), vec!["COVARIATE(..., custom)"]);
     // IOV is searchable since #1183 — in the exponential form only, which is
     // the form `[iov]` estimates; both covariance levels are blocks.
     assert_eq!(gaps("IOV(CL,EXP)"), Vec::<String>::new());
@@ -122,23 +103,14 @@ fn every_gap_is_reported_once_with_a_reason_and_the_docs_link() {
     let e = check_coverage(&mfl).expect_err("has gaps");
     assert_eq!(e.gaps.len(), 2, "{e}");
     let text = e.to_string();
-    assert!(
-        text.starts_with("the search space asks for 2 features ferx cannot build"),
-        "{text}"
-    );
-    assert!(
-        text.contains("ABSORPTION(SEQ-ZO-FO): sequential zero-order"),
-        "{text}"
-    );
+    assert!(text.starts_with("the search space asks for 2 features ferx cannot build"), "{text}");
+    assert!(text.contains("ABSORPTION(SEQ-ZO-FO): sequential zero-order"), "{text}");
     assert!(
         text.contains("IOV(..., ADD): `ferx-core::edit` writes a κ inside the exponential"),
         "{text}"
     );
     assert!(text.ends_with(COVERAGE_DOCS), "{text}");
-    assert!(
-        text.contains("#coverage"),
-        "the link must land on the table: {text}"
-    );
+    assert!(text.contains("#coverage"), "the link must land on the table: {text}");
     // The `String` conversion is what `?` inside the loader uses.
     let s: String = e.into();
     assert_eq!(s, text);
@@ -148,8 +120,5 @@ fn every_gap_is_reported_once_with_a_reason_and_the_docs_link() {
 fn singular_grammar_for_one_gap() {
     let mfl = Mfl::parse("ABSORPTION(SEQ-ZO-FO)").expect("parses");
     let text = check_coverage(&mfl).expect_err("gap").to_string();
-    assert!(
-        text.starts_with("the search space asks for 1 feature ferx"),
-        "{text}"
-    );
+    assert!(text.starts_with("the search space asks for 1 feature ferx"), "{text}");
 }

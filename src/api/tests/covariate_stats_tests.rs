@@ -108,10 +108,7 @@ fn a_symbolic_median_resolves_to_the_data_median() {
 #[test]
 fn each_statistic_resolves_to_its_own_summary() {
     for (keyword, expected) in [("mean", 70.0), ("min", 50.0), ("max", 90.0)] {
-        let text = model(
-            "  WT continuous",
-            &format!("  CL ~ WT power(center = {keyword})"),
-        );
+        let text = model("  WT continuous", &format!("  CL ~ WT power(center = {keyword})"));
         let pop = population("WT", &[50.0, 60.0, 70.0, 80.0, 90.0]);
         let bound = bind(&text, &pop).expect("binding should succeed");
         assert_eq!(
@@ -134,10 +131,7 @@ fn the_median_weights_one_value_per_subject() {
     pop.subjects[0].cens = vec![0; 40];
     let text = model("  WT continuous", "  CL ~ WT power(center = median)");
     let bound = bind(&text, &pop).expect("binding should succeed");
-    assert_eq!(
-        bound.covariate_model.as_ref().unwrap().relations[0].resolved_center,
-        Some(70.0)
-    );
+    assert_eq!(bound.covariate_model.as_ref().unwrap().relations[0].resolved_center, Some(70.0));
 }
 
 #[test]
@@ -151,18 +145,12 @@ fn a_time_varying_covariate_contributes_each_distinct_value() {
     let bound = bind(&text, &pop).expect("binding should succeed");
     // Values are 50, 70, 90 → median 70, not the 70 the two-subject static case
     // would have averaged to.
-    assert_eq!(
-        bound.covariate_model.as_ref().unwrap().relations[0].resolved_center,
-        Some(70.0)
-    );
+    assert_eq!(bound.covariate_model.as_ref().unwrap().relations[0].resolved_center, Some(70.0));
 }
 
 #[test]
 fn the_mode_is_the_reference_level_of_a_categorical_relation() {
-    let text = model(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = mode)",
-    );
+    let text = model("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = mode)");
     let pop = population("SEX", &[0.0, 1.0, 1.0, 1.0]);
     let bound = bind(&text, &pop).expect("binding should succeed");
     let rel = &bound.covariate_model.as_ref().unwrap().relations[0];
@@ -174,10 +162,7 @@ fn the_mode_is_the_reference_level_of_a_categorical_relation() {
 
 #[test]
 fn auto_levels_are_discovered_from_the_data() {
-    let text = model(
-        "  SEX categorical(levels = auto)",
-        "  CL ~ SEX categorical(ref = 0)",
-    );
+    let text = model("  SEX categorical(levels = auto)", "  CL ~ SEX categorical(ref = 0)");
     let pop = population("SEX", &[0.0, 1.0, 2.0, 2.0]);
     let bound = bind(&text, &pop).expect("binding should succeed");
     let names: Vec<String> = bound.covariate_model.as_ref().unwrap().relations[0]
@@ -193,10 +178,7 @@ fn auto_levels_are_discovered_from_the_data() {
 /// the round-trip of what `Relation::render()` writes for the form.
 #[test]
 fn categorical2_binds_its_reference_to_the_mode() {
-    let text = model(
-        "  SEX categorical(levels = auto)",
-        "  CL ~ SEX categorical2(ref = mode)",
-    );
+    let text = model("  SEX categorical(levels = auto)", "  CL ~ SEX categorical2(ref = mode)");
     // 2 is the mode, so it is the reference and 0 / 1 carry the θ.
     let pop = population("SEX", &[0.0, 1.0, 2.0, 2.0]);
     let bound = bind(&text, &pop).expect("binding should succeed");
@@ -205,16 +187,8 @@ fn categorical2_binds_its_reference_to_the_mode() {
     let names: Vec<String> = rel.thetas.iter().map(|t| t.name.clone()).collect();
     assert_eq!(names, vec!["THETA_CL_SEX_0", "THETA_CL_SEX_1"]);
     // …and the bound factor is the `cat2` shape, not the `cat` one.
-    assert!(
-        cl_line(&bound).contains("(if (SEX == 0) THETA_CL_SEX_0 else "),
-        "{}",
-        cl_line(&bound)
-    );
-    assert!(
-        !cl_line(&bound).contains("1 + THETA"),
-        "{}",
-        cl_line(&bound)
-    );
+    assert!(cl_line(&bound).contains("(if (SEX == 0) THETA_CL_SEX_0 else "), "{}", cl_line(&bound));
+    assert!(!cl_line(&bound).contains("1 + THETA"), "{}", cl_line(&bound));
 }
 
 #[test]
@@ -275,11 +249,7 @@ fn every_event_snapshot_feeds_the_summary_not_only_the_observations() {
         }
         let bound = bind(&text, &pop).expect("binding should succeed");
         let rel = &bound.covariate_model.as_ref().unwrap().relations[0];
-        assert_eq!(
-            rel.resolved_center,
-            Some(90.0),
-            "`max` must see the {source} snapshot"
-        );
+        assert_eq!(rel.resolved_center, Some(90.0), "`max` must see the {source} snapshot");
     }
 }
 
@@ -305,9 +275,8 @@ fn a_centre_the_form_divides_by_must_be_usable() {
         ("linear_relative(center = 0)", "non-zero centre"),
     ] {
         let text = model("  WT continuous", &format!("  CL ~ WT {form}"));
-        let e = parse_full_model(&text)
-            .err()
-            .unwrap_or_else(|| panic!("`{form}` must be rejected"));
+        let e =
+            parse_full_model(&text).err().unwrap_or_else(|| panic!("`{form}` must be rejected"));
         assert!(e.contains(needle), "{form}: {e}");
     }
     // …while `linear`, which subtracts, is untouched by the same centre.
@@ -320,19 +289,11 @@ fn a_centre_the_form_divides_by_must_be_usable() {
 /// reverses them. They must come back ordered (#1111 review).
 #[test]
 fn a_negative_relative_centre_still_emits_ordered_bounds() {
-    let text = model(
-        "  TEMP continuous",
-        "  CL ~ TEMP linear_relative(center = -5)",
-    );
+    let text = model("  TEMP continuous", "  CL ~ TEMP linear_relative(center = -5)");
     let pop = population("TEMP", &[-10.0, -5.0, 10.0]);
     let bound = bind(&text, &pop).expect("binding should succeed");
     let theta = &bound.covariate_model.as_ref().unwrap().relations[0].thetas[0];
-    assert!(
-        theta.lower < theta.upper,
-        "lower {} must be below upper {}",
-        theta.lower,
-        theta.upper
-    );
+    assert!(theta.lower < theta.upper, "lower {} must be below upper {}", theta.lower, theta.upper);
     assert!(
         theta.init > theta.lower && theta.init < theta.upper,
         "init {} must lie inside ({}, {})",
@@ -347,10 +308,7 @@ fn a_negative_relative_centre_still_emits_ordered_bounds() {
 /// check refuses it (#1111 review).
 #[test]
 fn a_categorical_value_outside_the_declared_levels_is_rejected() {
-    let text = model(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical(ref = 0)",
-    );
+    let text = model("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical(ref = 0)");
     let parsed = parse_full_model(&text).expect("model should parse");
 
     // Declared levels only: clean.
@@ -380,10 +338,7 @@ fn a_categorical_value_outside_the_declared_levels_is_rejected() {
 /// this is the test that a new categorical variant cannot slip past it.
 #[test]
 fn a_categorical2_value_outside_the_declared_levels_is_rejected_too() {
-    let text = model(
-        "  SEX categorical(levels = [0, 1])",
-        "  CL ~ SEX categorical2(ref = 0)",
-    );
+    let text = model("  SEX categorical(levels = [0, 1])", "  CL ~ SEX categorical2(ref = 0)");
     let parsed = parse_full_model(&text).expect("model should parse");
 
     let clean = population("SEX", &[0.0, 1.0, 0.0]);
@@ -422,18 +377,13 @@ fn the_echoed_relation_table_keeps_level_and_expression() {
     let rels =
         crate::api::covariate_relation_estimates(&parsed.model, &names, &theta, None, &fixed);
 
-    let cat = rels
-        .iter()
-        .find(|r| r.form == "categorical")
-        .expect("the categorical relation is echoed");
+    let cat =
+        rels.iter().find(|r| r.form == "categorical").expect("the categorical relation is echoed");
     assert_eq!(cat.thetas.len(), 1, "one contrast against the reference");
     assert_eq!(cat.thetas[0].level, Some(1.0));
     assert_eq!(cat.expression, None);
 
-    let expr = rels
-        .iter()
-        .find(|r| r.form == "expr")
-        .expect("the expr relation is echoed");
+    let expr = rels.iter().find(|r| r.form == "expr").expect("the expr relation is echoed");
     assert_eq!(expr.expression.as_deref(), Some("1 + 0.1 * SEX"));
     assert!(expr.thetas.is_empty());
 }
@@ -442,18 +392,12 @@ fn the_echoed_relation_table_keeps_level_and_expression() {
 
 /// `CL ~ GRP categorical`, levels `[1, 2, 3]`, reference 2, written literally.
 fn grp_literal() -> String {
-    model(
-        "  GRP categorical(levels = [1, 2, 3])",
-        "  CL ~ GRP categorical(ref = 2)",
-    )
+    model("  GRP categorical(levels = [1, 2, 3])", "  CL ~ GRP categorical(ref = 2)")
 }
 
 /// The same relation with the levels and reference read off the data.
 fn grp_auto() -> String {
-    model(
-        "  GRP categorical(levels = auto)",
-        "  CL ~ GRP categorical(ref = mode)",
-    )
+    model("  GRP categorical(levels = auto)", "  CL ~ GRP categorical(ref = mode)")
 }
 
 /// The model's default parameters with every `THETA_CL_GRP_*` contrast set to
@@ -517,10 +461,7 @@ fn predict_refuses_a_categorical_value_outside_the_levels() {
         assert!(e.to_string().contains(needle), "missing {needle:?}: {e}");
     }
     for absent in ["the fit's levels", "The fit estimated no θ"] {
-        assert!(
-            !e.to_string().contains(absent),
-            "{absent:?} is the from-fit cell: {e}"
-        );
+        assert!(!e.to_string().contains(absent), "{absent:?} is the from-fit cell: {e}");
     }
 }
 
@@ -553,16 +494,10 @@ fn the_advice_for_an_unseen_level_depends_on_whether_the_model_came_from_a_fit()
         "The fit estimated no θ for these values",
         "drop or recode those rows, or refit on data that carries them",
     ] {
-        assert!(
-            e.to_string().contains(needle),
-            "from fit, missing {needle:?}: {e}"
-        );
+        assert!(e.to_string().contains(needle), "from fit, missing {needle:?}: {e}");
     }
     for absent in ["levels = auto", "Add the value"] {
-        assert!(
-            !e.to_string().contains(absent),
-            "from fit, {absent:?} is wrong here: {e}"
-        );
+        assert!(!e.to_string().contains(absent), "from fit, {absent:?} is wrong here: {e}");
     }
 
     let literal = parse_full_model(&grp_literal()).expect("parse").model;
@@ -595,30 +530,20 @@ fn the_from_fit_advice_covers_a_relation_whose_levels_are_written_out() {
     let with_wt = |grp: &[f64]| {
         let mut pop = population("GRP", grp);
         for (i, s) in pop.subjects.iter_mut().enumerate() {
-            s.covariates
-                .insert("WT".to_string(), 50.0 + 10.0 * i as f64);
+            s.covariates.insert("WT".to_string(), 50.0 + 10.0 * i as f64);
         }
         pop.covariate_names.push("WT".to_string());
         pop
     };
-    let bindings = bind(&text, &with_wt(&[1.0, 2.0, 2.0, 3.0]))
-        .expect("bind")
-        .data_bindings()
-        .clone();
+    let bindings =
+        bind(&text, &with_wt(&[1.0, 2.0, 2.0, 3.0])).expect("bind").data_bindings().clone();
     let mut parsed = parse_full_model(&text).expect("parse");
     let mut design = with_wt(&[1.0, 2.0, 4.0]);
     crate::api::bind_from_fit(&mut parsed, &text, &mut design, &bindings).expect("from fit");
-    assert!(
-        parsed.model.bound_from_fit(),
-        "the WT relation lays the model out"
-    );
+    assert!(parsed.model.bound_from_fit(), "the WT relation lays the model out");
 
     let e = preds(&parsed.model, &design).expect_err("from fit: unlisted level refused");
-    assert!(
-        e.to_string()
-            .contains("The fit estimated no θ for these values"),
-        "{e}"
-    );
+    assert!(e.to_string().contains("The fit estimated no θ for these values"), "{e}");
     assert!(
         e.to_string()
             .contains("adding them to `levels = [...]` first if the levels are written out"),
@@ -701,16 +626,10 @@ fn run_covariance_and_run_sir_refuse_an_unseen_level_in_a_supplied_population() 
             "run_covariance",
             crate::run_covariance(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
         ),
-        (
-            "run_sir",
-            crate::run_sir(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused"),
-        ),
+        ("run_sir", crate::run_sir(&fit, Some(&m), Some(&recoded), &opts).expect_err("refused")),
     ] {
         assert!(err.to_string().starts_with(&format!("{entry}: ")), "{err}");
-        assert!(
-            err.to_string().contains("`GRP` takes [4.0] in this data"),
-            "{entry}: {err}"
-        );
+        assert!(err.to_string().contains("`GRP` takes [4.0] in this data"), "{entry}: {err}");
         // #1746: the refusal keeps `ferx check`'s diagnostic through the input
         // resolution, and the entry point is its context, not part of its message.
         // Mutations: `.to_string()` the level error in `resolve_fit_inputs` → the code
@@ -756,18 +675,9 @@ fn a_covariate_absent_from_the_data_is_rejected() {
 fn a_literal_centred_model_needs_no_binding_at_all() {
     // The common case: nothing symbolic, so `bind` is a no-op and the model was
     // already fully desugared at parse time.
-    let text = model(
-        "  WT continuous",
-        "  CL ~ WT power(center = 70) => T(0.75, 0.1, 1.5)",
-    );
+    let text = model("  WT continuous", "  CL ~ WT power(center = 70) => T(0.75, 0.1, 1.5)");
     let parsed = parse_full_model(&text).expect("model should parse");
-    assert!(parsed
-        .model
-        .covariate_model
-        .as_ref()
-        .unwrap()
-        .unresolved()
-        .is_empty());
+    assert!(parsed.model.covariate_model.as_ref().unwrap().unresolved().is_empty());
     assert!(crate::api::assert_covariate_model_bound(&parsed.model).is_ok());
 }
 
@@ -803,10 +713,7 @@ fn an_unbound_symbolic_statistic_is_a_hard_error() {
     // …and the check the fit path runs reports it under its own code.
     let pop = population("WT", &[50.0, 70.0, 90.0]);
     let diags = crate::api::check_model_data(&parsed.model, &pop);
-    assert!(
-        diags.iter().any(|d| d.code == "E_COVSTAT_UNRESOLVED"),
-        "{diags:?}"
-    );
+    assert!(diags.iter().any(|d| d.code == "E_COVSTAT_UNRESOLVED"), "{diags:?}");
 }
 
 #[test]
@@ -844,9 +751,7 @@ fn binding_preserves_a_level_block_binding_made_first() {
     let mut pop = population("WT", &[50.0, 70.0, 90.0]);
     pop.covariate_names.push("STUDY".to_string());
     for (i, subject) in pop.subjects.iter_mut().enumerate() {
-        subject
-            .covariates
-            .insert("STUDY".to_string(), (i + 1) as f64);
+        subject.covariates.insert("STUDY".to_string(), (i + 1) as f64);
         // Two times per subject: with one study per subject and a single
         // record, `ETA_CL` and the subject's level are one number each on one
         // record, which the binder measures as absorbed and refuses (#1834).
@@ -863,12 +768,7 @@ fn binding_preserves_a_level_block_binding_made_first() {
     // The level block is still bound to the three observed studies — two free θ
     // under the default sum-to-zero contrast, which derives the third.
     assert_eq!(
-        parsed
-            .model
-            .theta_names
-            .iter()
-            .filter(|n| n.starts_with("PLACEBO["))
-            .count(),
+        parsed.model.theta_names.iter().filter(|n| n.starts_with("PLACEBO[")).count(),
         2,
         "{:?}",
         parsed.model.theta_names
@@ -886,10 +786,7 @@ fn binding_preserves_a_level_block_binding_made_first() {
 /// take a path rather than a string.
 fn temp_model(src: &str) -> tempfile::NamedTempFile {
     use std::io::Write;
-    let mut f = tempfile::Builder::new()
-        .suffix(".ferx")
-        .tempfile()
-        .expect("create temp model");
+    let mut f = tempfile::Builder::new().suffix(".ferx").tempfile().expect("create temp model");
     f.write_all(src.as_bytes()).expect("write temp model");
     f.flush().expect("flush temp model");
     f
@@ -907,22 +804,14 @@ fn check_without_data_warns_that_the_statistics_are_still_unbound() {
     let f = temp_model(&text);
     let report = crate::api::validate_model_file(f.path().to_str().expect("utf-8 temp path"), None);
 
-    let hit = report
-        .diagnostics
-        .iter()
-        .find(|d| d.code == "W_COVSTAT_UNBOUND")
-        .unwrap_or_else(|| {
-            panic!(
-                "unbound statistics must be reported: {:?}",
-                report.diagnostics
-            )
+    let hit =
+        report.diagnostics.iter().find(|d| d.code == "W_COVSTAT_UNBOUND").unwrap_or_else(|| {
+            panic!("unbound statistics must be reported: {:?}", report.diagnostics)
         });
     assert_eq!(hit.severity, crate::Severity::Warning);
     assert!(hit.message.contains("`CL ~ WT`"), "{}", hit.message);
     assert!(
-        hit.suggestion
-            .as_deref()
-            .is_some_and(|s| s.contains("--data")),
+        hit.suggestion.as_deref().is_some_and(|s| s.contains("--data")),
         "the suggestion must point at re-running with data: {:?}",
         hit.suggestion
     );
@@ -974,10 +863,7 @@ fn check_with_data_binds_the_statistics_and_echoes_the_desugared_block() {
 /// subject, for the entry points that read a data file. A `None` cell is `.`.
 fn temp_cov_csv(name: &str, values: &[Option<f64>]) -> tempfile::NamedTempFile {
     use std::io::Write;
-    let mut f = tempfile::Builder::new()
-        .suffix(".csv")
-        .tempfile()
-        .expect("create temp data");
+    let mut f = tempfile::Builder::new().suffix(".csv").tempfile().expect("create temp data");
     writeln!(f, "ID,TIME,DV,EVID,AMT,CMT,MDV,{name}").unwrap();
     for (i, v) in values.iter().enumerate() {
         let g = v.map_or(".".to_string(), |v| format!("{v}"));
@@ -1045,16 +931,11 @@ fn file_entry_points_carry_each_binders_code() {
             .iter()
             .find(|d| d.code.ends_with("_BINDING"))
             .unwrap_or_else(|| panic!("{label}: check binds: {:?}", report.diagnostics));
-        assert_eq!(
-            want.code, code,
-            "{label}: the fixture trips the intended half"
-        );
+        assert_eq!(want.code, code, "{label}: the fixture trips the intended half");
         let errs: [(&str, EngineError); 3] = [
             (
                 "prepare_run",
-                crate::api::prepare_run(mp, Some(dp))
-                    .err()
-                    .expect("prepare_run refuses"),
+                crate::api::prepare_run(mp, Some(dp)).err().expect("prepare_run refuses"),
             ),
             (
                 "fit_from_files",
@@ -1091,15 +972,8 @@ fn file_entry_points_carry_each_binders_code() {
         // The design reaches a different cell of the same binder than the data do (for
         // the level block, `sum_to_zero`'s zero-init rule), so the text is pinned only to
         // name what is at fault.
-        let names = if code == "E_THETA_LEVEL_BINDING" {
-            "theta PLACEBO["
-        } else {
-            "GRP"
-        };
-        assert!(
-            e.to_string().contains(names),
-            "{label} via run_model_simulate: {e}"
-        );
+        let names = if code == "E_THETA_LEVEL_BINDING" { "theta PLACEBO[" } else { "GRP" };
+        assert!(e.to_string().contains(names), "{label} via run_model_simulate: {e}");
     }
 }
 
@@ -1112,10 +986,7 @@ fn file_entry_points_carry_each_binders_code() {
 /// is `tests/theta_level_blocks.rs::check_reports_level_binding_errors_directly`.
 #[test]
 fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
-    let text = model(
-        "  GRP categorical(levels = auto)",
-        "  CL ~ GRP categorical(ref = mode)",
-    );
+    let text = model("  GRP categorical(levels = auto)", "  CL ~ GRP categorical(ref = mode)");
     let m = temp_model(&text);
     for (label, values, needle) in [
         ("single level", vec![Some(2.0); 4], "nothing to estimate"),
@@ -1127,19 +998,12 @@ fn a_covariate_statistic_bind_failure_carries_its_own_code_and_block() {
             Some(d.path().to_str().expect("utf-8 temp path")),
         );
         assert!(!report.valid, "{label}: {:?}", report.diagnostics);
-        let binds: Vec<_> = report
-            .diagnostics
-            .iter()
-            .filter(|d| d.code.ends_with("_BINDING"))
-            .collect();
+        let binds: Vec<_> =
+            report.diagnostics.iter().filter(|d| d.code.ends_with("_BINDING")).collect();
         assert_eq!(binds.len(), 1, "{label}: {:?}", report.diagnostics);
         let hit = binds[0];
         assert_eq!(hit.code, "E_COVARIATE_STATS_BINDING", "{label}: {hit:?}");
-        assert_eq!(
-            hit.block.as_deref(),
-            Some("covariate_model"),
-            "{label}: {hit:?}"
-        );
+        assert_eq!(hit.block.as_deref(), Some("covariate_model"), "{label}: {hit:?}");
         assert!(hit.message.contains(needle), "{label}: {}", hit.message);
     }
 }
@@ -1173,11 +1037,7 @@ fn each_binding_failure_of_the_check_carries_its_own_code() {
     let stats = bind(&text, &mut population("GRP", &[2.0, 2.0]));
     assert_eq!(stats.code, "E_COVARIATE_STATS_BINDING", "{stats:?}");
     assert_eq!(stats.block.as_deref(), Some("covariate_model"), "{stats:?}");
-    assert!(
-        stats.message.contains("nothing to estimate"),
-        "{}",
-        stats.message
-    );
+    assert!(stats.message.contains("nothing to estimate"), "{}", stats.message);
 }
 
 /// #1752, inverting #1743's test: a `validate_model_file` run whose model file is
@@ -1206,10 +1066,7 @@ fn a_model_file_gone_after_the_parse_does_not_fail_the_check() {
     for gone in [true, false] {
         std::fs::write(&model, &text).unwrap();
         let fifo = dir.path().join(format!("data-{gone}.csv"));
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .expect("run mkfifo");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status().expect("run mkfifo");
         assert!(made.success(), "mkfifo");
         let (done, wrote) = std::sync::mpsc::channel();
         let writer = {
@@ -1229,10 +1086,7 @@ fn a_model_file_gone_after_the_parse_does_not_fail_the_check() {
         // A check that never opens the data leaves the writer blocked in `open`: fail
         // rather than hang (#1745 review r1, finding 1). Opening the read end releases
         // it, so the thread is not left behind.
-        if wrote
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .is_err()
-        {
+        if wrote.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
             drop(std::fs::File::open(&fifo));
             panic!("the writer is still blocked: the check never opened the data");
         }
@@ -1278,11 +1132,7 @@ fn an_unreadable_model_file_is_e_model_read_and_a_bad_one_a_parse_error() {
     // The parse's own code, not merely "not `E_MODEL_READ`" (#1760 review r1,
     // finding 3): any other mapping of a parse failure must fail this.
     assert_eq!(report.diagnostics.len(), 1, "{:?}", report.diagnostics);
-    assert_eq!(
-        report.diagnostics[0].code, "E_PARSE",
-        "{:?}",
-        report.diagnostics
-    );
+    assert_eq!(report.diagnostics[0].code, "E_PARSE", "{:?}", report.diagnostics);
 }
 
 /// The #1738 fixture: `CL ~ WT power` with an explicit `=> THETA_CL_WT(...)`,
@@ -1292,10 +1142,7 @@ fn unused_census_model(center: &str) -> String {
         "  WT continuous",
         &format!("  CL ~ WT power(center = {center}) => THETA_CL_WT(0.6, 0.01, 5.0)"),
     )
-    .replace(
-        "  theta TVV(",
-        "  theta UNUSED_T(1.0, 0.1, 10.0)\n  theta TVV(",
-    )
+    .replace("  theta TVV(", "  theta UNUSED_T(1.0, 0.1, 10.0)\n  theta TVV(")
 }
 
 /// WT 55, 58, …, 88: twelve subjects, median 71.5.
@@ -1327,13 +1174,7 @@ fn a_theta_read_only_by_an_unresolved_relation_is_not_reported_unused() {
     let symbolic = parse_full_model(&symbolic_text).expect("parse");
     // The fixture is the unresolved case, or it tests nothing.
     assert_eq!(
-        symbolic
-            .model
-            .covariate_model
-            .as_ref()
-            .expect("block recorded")
-            .unresolved()
-            .len(),
+        symbolic.model.covariate_model.as_ref().expect("block recorded").unresolved().len(),
         1
     );
     let bound = bind(&symbolic_text, &pop).expect("bind");
@@ -1345,11 +1186,7 @@ fn a_theta_read_only_by_an_unresolved_relation_is_not_reported_unused() {
 
     let want = vec!["UNUSED_T".to_string()];
     assert_eq!(unreferenced(&literal.model.parse_warnings), want, "literal");
-    assert_eq!(
-        unreferenced(&symbolic.model.parse_warnings),
-        want,
-        "symbolic, unbound"
-    );
+    assert_eq!(unreferenced(&symbolic.model.parse_warnings), want, "symbolic, unbound");
     assert_eq!(unreferenced(&bound.parse_warnings), want, "symbolic, bound");
 }
 
@@ -1359,10 +1196,7 @@ fn a_theta_read_only_by_an_unresolved_relation_is_not_reported_unused() {
 fn check_reports_the_same_unused_parameters_for_a_symbolic_and_a_literal_centre() {
     let unused = |center: &str, with_data: bool| -> Vec<String> {
         let m = temp_model(&unused_census_model(center));
-        let d = temp_cov_csv(
-            "WT",
-            &census_weights().into_iter().map(Some).collect::<Vec<_>>(),
-        );
+        let d = temp_cov_csv("WT", &census_weights().into_iter().map(Some).collect::<Vec<_>>());
         let report = crate::api::validate_model_file(
             m.path().to_str().expect("utf-8 temp path"),
             with_data.then(|| d.path().to_str().expect("utf-8 temp path")),
@@ -1371,13 +1205,7 @@ fn check_reports_the_same_unused_parameters_for_a_symbolic_and_a_literal_centre(
             .diagnostics
             .iter()
             .filter(|d| d.code == "W_UNUSED_PARAM")
-            .map(|d| {
-                d.message
-                    .split('\'')
-                    .nth(1)
-                    .unwrap_or(&d.message)
-                    .to_string()
-            })
+            .map(|d| d.message.split('\'').nth(1).unwrap_or(&d.message).to_string())
             .collect();
         hits.sort();
         hits
@@ -1471,16 +1299,9 @@ fn check_stats_on_re_summarises_the_population() {
     // probability 1 − 2⁻⁸.
     for _ in 0..8 {
         let bound = bind(&text, &pop).expect("binds");
-        let got = super::check_stats_on(&bound, &other)
-            .unwrap()
-            .expect("differs");
+        let got = super::check_stats_on(&bound, &other).unwrap().expect("differs");
         assert_eq!(
-            (
-                got.covariate.as_str(),
-                got.field,
-                got.model.as_str(),
-                got.data.as_str()
-            ),
+            (got.covariate.as_str(), got.field, got.model.as_str(), got.data.as_str()),
             ("AGE", "median", "40", "41")
         );
     }
@@ -1523,4 +1344,25 @@ fn a_from_fit_reparse_refusal_on_a_stats_only_model_is_the_stats_code() {
         assert_eq!(e.block(), Some("covariate_model"), "{what}: {e}");
         assert!(e.to_string().contains("nothing to estimate"), "{what}: {e}");
     }
+}
+
+#[cfg(feature = "survival")]
+/// A covariate that changes only across count records (TRT is 0 on each subject's first
+/// three rows and 1 after, and the count rows are not Gaussian observations) is seen by the
+/// covariate-statistics walk at every value the count mean is evaluated at, so `levels =
+/// auto` / `[covariate_model]` statistics cannot drop the later level (review r2 #1).
+#[test]
+fn covariate_values_include_count_record_snapshots() {
+    let prep = crate::categorical::exact_eta_hessian_tests::load(
+        "[parameters]\n  theta BASE(4.0, 0.01, 100.0)\n  theta GAM(-0.5, -10.0, 10.0)\n\
+         [covariates]\n  TRT continuous\n[count_model]\n  cmt = 1\n  \
+         log_lambda = log(BASE) + GAM * TRT\n",
+        "nonmem_anchor/count_nb.csv",
+    );
+    let s = &prep.population.subjects[0];
+    assert_eq!(s.covariates.get("TRT"), Some(&0.0), "baseline is the first row's");
+    assert!(s.obs_covariates.is_empty(), "no Gaussian rows carry TRT");
+    let mut vals = super::subject_covariate_values(s, "TRT");
+    vals.sort_by(f64::total_cmp);
+    assert_eq!(vals, vec![0.0, 1.0]);
 }

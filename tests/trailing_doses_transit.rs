@@ -55,11 +55,8 @@ fn fitted(csv: &str) -> FitResult {
     model.write_all(MODEL.as_bytes()).unwrap();
     let mut data = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
     data.write_all(csv.as_bytes()).unwrap();
-    let run = prepare_run(
-        model.path().to_str().unwrap(),
-        Some(data.path().to_str().unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("prepare_run: {e}"));
+    let run = prepare_run(model.path().to_str().unwrap(), Some(data.path().to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("prepare_run: {e}"));
     let options = FitOptions {
         method: EstimationMethod::Foce,
         interaction: true,
@@ -69,13 +66,8 @@ fn fitted(csv: &str) -> FitResult {
         threads: Some(1),
         ..FitOptions::default()
     };
-    fit(
-        &run.parsed.model,
-        &run.population,
-        &run.init_params,
-        &options,
-    )
-    .unwrap_or_else(|e| panic!("fit: {e}"))
+    fit(&run.parsed.model, &run.population, &run.init_params, &options)
+        .unwrap_or_else(|e| panic!("fit: {e}"))
 }
 
 fn bits(r: &FitResult) -> Vec<u64> {

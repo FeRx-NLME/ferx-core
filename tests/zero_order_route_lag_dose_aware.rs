@@ -74,21 +74,11 @@ fn preds(src: &str) -> (bool, Vec<f64>) {
 fn non_ss_zero_order_route_lag_anchors_tad_at_the_dose_record() {
     let (lagged_tad, tad) = preds(&model("TAD"));
     let (lagged_time, time) = preds(&model("TIME"));
-    assert!(
-        !lagged_tad && !lagged_time,
-        "a route lag is not a compartment lag"
-    );
+    assert!(!lagged_tad && !lagged_time, "a route lag is not a compartment lag");
     // The clock is live: a model without the term predicts something else.
     let (_, none) = preds(&model("0.0"));
-    assert!(
-        tad.iter().chain(&none).all(|x| x.is_finite()),
-        "non-finite prediction"
-    );
-    let live = tad
-        .iter()
-        .zip(&none)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f64, f64::max); // nan-ok: `tad` and `none` asserted finite above
+    assert!(tad.iter().chain(&none).all(|x| x.is_finite()), "non-finite prediction");
+    let live = tad.iter().zip(&none).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max); // nan-ok: `tad` and `none` asserted finite above
     assert!(live > 1e-3, "the TAD term moves no prediction ({live:e})");
     for (j, (a, b)) in tad.iter().zip(&time).enumerate() {
         assert!(a.is_finite() && b.is_finite(), "row {j}: {a} vs {b}");

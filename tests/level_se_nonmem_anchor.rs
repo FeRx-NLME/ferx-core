@@ -64,10 +64,7 @@ fn ext(name: &str) -> (HashMap<String, f64>, HashMap<String, f64>) {
             }
         }
     }
-    assert!(
-        !est.is_empty() && !se.is_empty(),
-        "{name}: no final estimates or SEs"
-    );
+    assert!(!est.is_empty() && !se.is_empty(), "{name}: no final estimates or SEs");
     (est, se)
 }
 
@@ -77,16 +74,8 @@ fn level_standard_errors_match_nonmem_under_both_parameterisations() {
     let (_, se_b) = ext("level_se_b.ext");
 
     let prep = ferx_core::prepare_run(
-        root()
-            .join("nonmem_anchor/level_se_mbma_fit.ferx")
-            .to_str()
-            .unwrap(),
-        Some(
-            root()
-                .join("tests/data/mbma_placebo/mbma_placebo.csv")
-                .to_str()
-                .unwrap(),
-        ),
+        root().join("nonmem_anchor/level_se_mbma_fit.ferx").to_str().unwrap(),
+        Some(root().join("tests/data/mbma_placebo/mbma_placebo.csv").to_str().unwrap()),
     )
     .expect("prepare");
     let model = &prep.parsed.model;
@@ -130,21 +119,14 @@ fn level_standard_errors_match_nonmem_under_both_parameterisations() {
                 se_b[&format!("THETA{}", 7 + 3 * study)]
             }
         };
-        assert!(
-            got.is_finite() && want.is_finite(),
-            "{}: {got} vs {want}",
-            l.label
-        );
+        assert!(got.is_finite() && want.is_finite(), "{}: {got} vs {want}", l.label);
         let rel = (got - want).abs() / want;
         if l.theta_index.is_some() {
             worst_free = worst_free.max(rel);
         } else {
             worst_dep = worst_dep.max(rel);
         }
-        eprintln!(
-            "{:20} ferx {got:.6} NONMEM {want:.6} rel {rel:.2e}",
-            l.label
-        );
+        eprintln!("{:20} ferx {got:.6} NONMEM {want:.6} rel {rel:.2e}", l.label);
     }
     eprintln!("worst relative SE gap: free {worst_free:.2e}, dependent {worst_dep:.2e}");
     assert_eq!(n_dep, 6);

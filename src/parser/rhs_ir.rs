@@ -338,12 +338,7 @@ pub(super) struct Func {
 
 impl Func {
     pub(super) fn new(n_args: u8) -> Self {
-        Func {
-            insts: Vec::new(),
-            n_args,
-            live: Vec::new(),
-            cur: None,
-        }
+        Func { insts: Vec::new(), n_args, live: Vec::new(), cur: None }
     }
     fn push(&mut self, i: Inst) -> V {
         self.insts.push(i);
@@ -352,6 +347,16 @@ impl Func {
     }
     fn k(&mut self, c: f64) -> V {
         self.push(Inst::Const(c.to_bits()))
+    }
+
+    /// This function as a kernel keeps it to run and lower: its instructions at their length,
+    /// without `live`, which only the transforms read ([`reverse`], [`tangent`],
+    /// [`dedup_calls`]). A fit keeps thousands of kernels' IR live (#3010), and `live` is a
+    /// third of it.
+    pub(super) fn into_kernel(mut self) -> Self {
+        self.live = Vec::new();
+        self.insts.shrink_to_fit();
+        self
     }
 }
 
@@ -441,12 +446,7 @@ pub(super) struct Lower<'a> {
 
 impl<'a> Lower<'a> {
     pub(super) fn new(f: &'a mut Func, layout: Layout, n_regs: usize) -> Self {
-        Lower {
-            f,
-            layout,
-            regs: vec![Vec::new(); n_regs],
-            arms: Vec::new(),
-        }
+        Lower { f, layout, regs: vec![Vec::new(); n_regs], arms: Vec::new() }
     }
     /// Close every `if` that ends at instruction `at`: each value its arms write becomes the
     /// select of the else arm's lanes on `is_else` over the then arm's. A caller that walks
@@ -536,23 +536,12 @@ impl<'a> Lower<'a> {
     }
     pub(super) fn load(&mut self, arg: u8, index: usize) -> Lanes {
         let lanes = self.lanes();
-        (0..lanes)
-            .map(|j| {
-                self.ins(Inst::Load {
-                    arg,
-                    off: (index * lanes + j) as u32,
-                })
-            })
-            .collect()
+        (0..lanes).map(|j| self.ins(Inst::Load { arg, off: (index * lanes + j) as u32 })).collect()
     }
     pub(super) fn store(&mut self, arg: u8, index: usize, l: &[V]) {
         let lanes = self.lanes();
         for (j, &v) in l.iter().enumerate() {
-            self.ins(Inst::Store {
-                arg,
-                off: (index * lanes + j) as u32,
-                v,
-            });
+            self.ins(Inst::Store { arg, off: (index * lanes + j) as u32, v });
         }
     }
     pub(super) fn reg(&self, r: u32) -> Lanes {
@@ -562,24 +551,15 @@ impl<'a> Lower<'a> {
         self.regs[d as usize] = l;
     }
     fn select(&mut self, c: V, a: &[V], b: &[V]) -> Lanes {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| self.ins(Inst::Select(c, x, y)))
-            .collect()
+        a.iter().zip(b).map(|(&x, &y)| self.ins(Inst::Select(c, x, y))).collect()
     }
     /// Lane by lane — every type's `+`.
     fn add(&mut self, a: &[V], b: &[V]) -> Lanes {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| self.ins(Inst::Add(x, y)))
-            .collect()
+        a.iter().zip(b).map(|(&x, &y)| self.ins(Inst::Add(x, y))).collect()
     }
     /// Lane by lane — every type's `−`.
     fn sub(&mut self, a: &[V], b: &[V]) -> Lanes {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| self.ins(Inst::Sub(x, y)))
-            .collect()
+        a.iter().zip(b).map(|(&x, &y)| self.ins(Inst::Sub(x, y))).collect()
     }
 
     // ── The primitives, as `f64` and the forward dual's untaped bodies compute them (`+` and `−`
@@ -875,13 +855,7 @@ impl<'a> Lower<'a> {
     }
     fn gamma_pq(&mut self, a: &[V], x: &[V], upper: bool, i: u8, j: u8) -> Lanes {
         let (av, xv) = (a[0], x[0]);
-        self.binary_prim(a, x, |di, dj| Inst::Gamma {
-            upper,
-            i: i + di,
-            j: j + dj,
-            a: av,
-            x: xv,
-        })
+        self.binary_prim(a, x, |di, dj| Inst::Gamma { upper, i: i + di, j: j + dj, a: av, x: xv })
     }
     /// A unary primitive whose `k`-th derivative is `Call1(shim(k), x)`.
     fn unary_chain(&mut self, a: &[V], shim: impl Fn(u8) -> Shim1) -> Lanes {
@@ -1048,14 +1022,7 @@ pub(super) fn emit(al: &mut Lower<'_>, f: &Flat, args: [u8; 4]) {
             let l = al.pow(&al.reg(a), &al.reg(e));
             al.set(d, l);
         }
-        Flat::GammaPq {
-            d,
-            a,
-            x,
-            upper,
-            i,
-            j,
-        } => {
+        Flat::GammaPq { d, a, x, upper, i, j } => {
             let l = al.gamma_pq(&al.reg(a), &al.reg(x), upper, i, j);
             al.set(d, l);
         }
@@ -1093,9 +1060,9 @@ pub(super) fn emit(al: &mut Lower<'_>, f: &Flat, args: [u8; 4]) {
                     let v = al.ins(Inst::StopGrad(x[0]));
                     al.constant(v)
                 }
-                Unary::Sin => al.unary_chain(&x, &|k| {
-                    [Shim1::Sin, Shim1::Cos, Shim1::NegSin][k as usize % 3]
-                }),
+                Unary::Sin => {
+                    al.unary_chain(&x, &|k| [Shim1::Sin, Shim1::Cos, Shim1::NegSin][k as usize % 3])
+                }
                 Unary::Digamma => al.unary_chain(&x, &|k| Shim1::polygamma(1 + k)),
                 Unary::Trigamma => al.unary_chain(&x, &|k| Shim1::polygamma(2 + k)),
                 Unary::Tetragamma => al.unary_chain(&x, &|k| Shim1::polygamma(3 + k)),
@@ -1259,13 +1226,7 @@ pub(super) fn dedup_calls(f: &Func, prefix: usize) -> (Func, usize) {
             Inst::Ceil(x) => Inst::Ceil(m(x)),
             Inst::Call1(s, x) => Inst::Call1(s, m(x)),
             Inst::Powf(x, y) => Inst::Powf(m(x), m(y)),
-            Inst::Gamma { upper, i, j, a, x } => Inst::Gamma {
-                upper,
-                i,
-                j,
-                a: m(a),
-                x: m(x),
-            },
+            Inst::Gamma { upper, i, j, a, x } => Inst::Gamma { upper, i, j, a: m(a), x: m(x) },
             Inst::Cmp(c, x, y) => Inst::Cmp(c, m(x), m(y)),
             Inst::And(x, y) => Inst::And(m(x), m(y)),
             Inst::Or(x, y) => Inst::Or(m(x), m(y)),
@@ -1323,13 +1284,7 @@ pub(super) fn reverse(fwd: &Func) -> Func {
             Inst::Ceil(x) => Inst::Ceil(r(x)),
             Inst::Call1(s, x) => Inst::Call1(s, r(x)),
             Inst::Powf(x, y) => Inst::Powf(r(x), r(y)),
-            Inst::Gamma { upper, i, j, a, x } => Inst::Gamma {
-                upper,
-                i,
-                j,
-                a: r(a),
-                x: r(x),
-            },
+            Inst::Gamma { upper, i, j, a, x } => Inst::Gamma { upper, i, j, a: r(a), x: r(x) },
             Inst::Cmp(c, x, y) => Inst::Cmp(c, r(x), r(y)),
             Inst::And(x, y) => Inst::And(r(x), r(y)),
             Inst::Or(x, y) => Inst::Or(r(x), r(y)),
@@ -1444,11 +1399,7 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 acc(&mut b, &mut adj, live, x, d, false);
             }
             Inst::Call1(s @ (Shim1::Trigamma | Shim1::Tetragamma), x) => {
-                let next = if s == Shim1::Trigamma {
-                    Shim1::Tetragamma
-                } else {
-                    Shim1::Pentagamma
-                };
+                let next = if s == Shim1::Trigamma { Shim1::Tetragamma } else { Shim1::Pentagamma };
                 let p = b.push(Inst::Call1(next, fw(x)));
                 let d = b.push(Inst::Mul(g, p));
                 acc(&mut b, &mut adj, live, x, d, false);
@@ -1500,20 +1451,8 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 let dy = b.push(Inst::Select(pos, dy, z));
                 acc(&mut b, &mut adj, live, y, dy, false);
             }
-            Inst::Gamma {
-                upper,
-                i,
-                j,
-                a: x,
-                x: y,
-            } => {
-                let p = |i, j| Inst::Gamma {
-                    upper,
-                    i,
-                    j,
-                    a: fw(x),
-                    x: fw(y),
-                };
+            Inst::Gamma { upper, i, j, a: x, x: y } => {
+                let p = |i, j| Inst::Gamma { upper, i, j, a: fw(x), x: fw(y) };
                 let pa = b.push(p(i + 1, j));
                 let dx = b.push(Inst::Mul(g, pa));
                 acc(&mut b, &mut adj, live, x, dx, false);
@@ -1534,20 +1473,12 @@ pub(super) fn reverse(fwd: &Func) -> Func {
     let mut by_loc: std::collections::BTreeMap<(u8, u32), V> = Default::default();
     for (loc, g) in loads {
         let e = by_loc.entry(loc).or_insert(V::MAX);
-        *e = if *e == V::MAX {
-            g
-        } else {
-            b.push(Inst::Add(*e, g))
-        };
+        *e = if *e == V::MAX { g } else { b.push(Inst::Add(*e, g)) };
     }
     for ((arg, off), g) in by_loc {
         let old = b.push(Inst::Load { arg: n + arg, off });
         let s = b.push(Inst::Add(old, g));
-        b.push(Inst::Store {
-            arg: n + arg,
-            off,
-            v: s,
-        });
+        b.push(Inst::Store { arg: n + arg, off, v: s });
     }
     b
 }
@@ -1562,7 +1493,12 @@ pub(super) fn reverse(fwd: &Func) -> Func {
 /// Tangents are kept sparse: a value no input reaches has none, and emits nothing. A dead
 /// arm needs no mask here — its value is only read through the [`Inst::Select`] that chose
 /// it, and the select picks the taken arm's tangent.
-pub(super) fn tangent(f: &Func, k: usize) -> Func {
+///
+/// Also returns how many of its instructions come from `f`'s first `prefix`: the tangent of a
+/// prefix that reads none of `f`'s later arguments reads none of their tangents either, so a
+/// reverse's forward recomputation stays a prefix of its forward over reverse (#2980) — run
+/// once and shared by every seed (`prefix` 0: none).
+pub(super) fn tangent(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
     type Tan = Option<Vec<V>>;
     // `Σ ± scale·tangent`, sparse: `None` when every term is.
     fn lin(b: &mut Func, k: usize, terms: &[(&Tan, Option<V>, bool)]) -> Tan {
@@ -1595,6 +1531,7 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
     let mut b = Func::new(2 * n);
     let mut map = vec![V::MAX; f.insts.len()];
     let mut tan: Vec<Tan> = vec![None; f.insts.len()];
+    let mut emitted = 0;
     for (i, inst) in f.insts.iter().enumerate() {
         b.cur = f.live[i].map(|c| map[c as usize]);
         let fw = |x: V| map[x as usize];
@@ -1612,13 +1549,9 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
             Inst::Ceil(x) => Some(Inst::Ceil(fw(x))),
             Inst::Call1(s, x) => Some(Inst::Call1(s, fw(x))),
             Inst::Powf(x, y) => Some(Inst::Powf(fw(x), fw(y))),
-            Inst::Gamma { upper, i, j, a, x } => Some(Inst::Gamma {
-                upper,
-                i,
-                j,
-                a: fw(a),
-                x: fw(x),
-            }),
+            Inst::Gamma { upper, i, j, a, x } => {
+                Some(Inst::Gamma { upper, i, j, a: fw(a), x: fw(x) })
+            }
             Inst::Cmp(c, x, y) => Some(Inst::Cmp(c, fw(x), fw(y))),
             Inst::And(x, y) => Some(Inst::And(fw(x), fw(y))),
             Inst::Or(x, y) => Some(Inst::Or(fw(x), fw(y))),
@@ -1640,23 +1573,14 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
         let new: Tan = match *inst {
             Inst::Load { arg, off } => Some(
                 (0..k)
-                    .map(|j| {
-                        b.push(Inst::Load {
-                            arg: n + arg,
-                            off: off * k as u32 + j as u32,
-                        })
-                    })
+                    .map(|j| b.push(Inst::Load { arg: n + arg, off: off * k as u32 + j as u32 }))
                     .collect(),
             ),
             Inst::Store { arg, off, v } => {
                 let z = b.k(0.0);
                 for j in 0..k {
                     let d = t(v).as_ref().map_or(z, |tv| tv[j]);
-                    b.push(Inst::Store {
-                        arg: n + arg,
-                        off: off * k as u32 + j as u32,
-                        v: d,
-                    });
+                    b.push(Inst::Store { arg: n + arg, off: off * k as u32 + j as u32, v: d });
                 }
                 b.push(Inst::Store { arg, off, v: fw(v) });
                 None
@@ -1667,11 +1591,9 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
             Inst::Add(x, y) => lin(&mut b, k, &[(t(x), None, false), (t(y), None, false)]),
             Inst::Sub(x, y) => lin(&mut b, k, &[(t(x), None, false), (t(y), None, true)]),
             Inst::Neg(x) => lin(&mut b, k, &[(t(x), None, true)]),
-            Inst::Mul(x, y) => lin(
-                &mut b,
-                k,
-                &[(t(x), Some(fw(y)), false), (t(y), Some(fw(x)), false)],
-            ),
+            Inst::Mul(x, y) => {
+                lin(&mut b, k, &[(t(x), Some(fw(y)), false), (t(y), Some(fw(x)), false)])
+            }
             Inst::Div(x, y) if t(x).is_some() || t(y).is_some() => {
                 // `q = x/y`: `dq = (dx − q·dy)/y`.
                 let one = b.k(1.0);
@@ -1733,33 +1655,13 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
                 let z = b.k(0.0);
                 let pos = b.push(Inst::Cmp(Cc::Gt, fw(x), z));
                 let dy = b.push(Inst::Select(pos, rl, z));
-                lin(
-                    &mut b,
-                    k,
-                    &[(t(x), Some(dx), false), (t(y), Some(dy), false)],
-                )
+                lin(&mut b, k, &[(t(x), Some(dx), false), (t(y), Some(dy), false)])
             }
-            Inst::Gamma {
-                upper,
-                i: gi,
-                j: gj,
-                a: x,
-                x: y,
-            } if t(x).is_some() || t(y).is_some() => {
-                let p = |i, j| Inst::Gamma {
-                    upper,
-                    i,
-                    j,
-                    a: fw(x),
-                    x: fw(y),
-                };
+            Inst::Gamma { upper, i: gi, j: gj, a: x, x: y } if t(x).is_some() || t(y).is_some() => {
+                let p = |i, j| Inst::Gamma { upper, i, j, a: fw(x), x: fw(y) };
                 let pa = b.push(p(gi + 1, gj));
                 let px = b.push(p(gi, gj + 1));
-                lin(
-                    &mut b,
-                    k,
-                    &[(t(x), Some(pa), false), (t(y), Some(px), false)],
-                )
+                lin(&mut b, k, &[(t(x), Some(pa), false), (t(y), Some(px), false)])
             }
             Inst::Powf(..) | Inst::Gamma { .. } => None,
             Inst::Select(c, x, y) if t(x).is_some() || t(y).is_some() => {
@@ -1777,9 +1679,203 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
             Inst::Select(..) => None,
         };
         tan[i] = new;
+        if i + 1 == prefix {
+            emitted = b.insts.len();
+        }
     }
     b.cur = None;
-    b
+    (b, emitted)
+}
+
+/// An instruction's value operands, as a list (tests).
+#[cfg(test)]
+pub(super) fn value_operands(inst: &Inst) -> Vec<V> {
+    let (o, k) = operands(inst);
+    o[..k].to_vec()
+}
+
+/// An instruction's value operands.
+fn operands(inst: &Inst) -> ([V; 3], usize) {
+    match *inst {
+        Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => ([0; 3], 0),
+        Inst::Neg(x)
+        | Inst::Abs(x)
+        | Inst::Floor(x)
+        | Inst::Ceil(x)
+        | Inst::Call1(_, x)
+        | Inst::StopGrad(x)
+        | Inst::HostArg(x) => ([x, 0, 0], 1),
+        Inst::Store { v, .. } => ([v, 0, 0], 1),
+        Inst::Add(x, y)
+        | Inst::Sub(x, y)
+        | Inst::Mul(x, y)
+        | Inst::Div(x, y)
+        | Inst::Powf(x, y)
+        | Inst::Cmp(_, x, y)
+        | Inst::And(x, y)
+        | Inst::Or(x, y) => ([x, y, 0], 2),
+        Inst::Gamma { a, x, .. } => ([a, x, 0], 2),
+        Inst::Select(c, x, y) => ([c, x, y], 3),
+    }
+}
+
+/// `inst` with each value operand mapped by `m`.
+fn remap(inst: Inst, m: impl Fn(V) -> V) -> Inst {
+    match inst {
+        Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => inst,
+        Inst::Add(x, y) => Inst::Add(m(x), m(y)),
+        Inst::Sub(x, y) => Inst::Sub(m(x), m(y)),
+        Inst::Mul(x, y) => Inst::Mul(m(x), m(y)),
+        Inst::Div(x, y) => Inst::Div(m(x), m(y)),
+        Inst::Neg(x) => Inst::Neg(m(x)),
+        Inst::Abs(x) => Inst::Abs(m(x)),
+        Inst::Floor(x) => Inst::Floor(m(x)),
+        Inst::Ceil(x) => Inst::Ceil(m(x)),
+        Inst::Call1(s, x) => Inst::Call1(s, m(x)),
+        Inst::Powf(x, y) => Inst::Powf(m(x), m(y)),
+        Inst::Gamma { upper, i, j, a, x } => Inst::Gamma { upper, i, j, a: m(a), x: m(x) },
+        Inst::Cmp(c, x, y) => Inst::Cmp(c, m(x), m(y)),
+        Inst::And(x, y) => Inst::And(m(x), m(y)),
+        Inst::Or(x, y) => Inst::Or(m(x), m(y)),
+        Inst::Select(c, x, y) => Inst::Select(m(c), m(x), m(y)),
+        Inst::StopGrad(x) => Inst::StopGrad(m(x)),
+        Inst::HostArg(x) => Inst::HostArg(m(x)),
+        Inst::Store { arg, off, v } => Inst::Store { arg, off, v: m(v) },
+    }
+}
+
+/// `g` with every instruction that reads no per-seed argument (`per_seed(arg)`) first, in
+/// order, then the rest: the prefix a multi-seed call runs once, and the suffix it runs per
+/// seed. Exact: a shared instruction never reads a per-seed one, so every value keeps its
+/// operands before it; a host call's arguments, call and outputs are tied by order rather than
+/// by operand, so a call any of whose arguments is per seed moves whole. The result carries no
+/// dead-arm conditions: they mask a reverse transform's derivatives, and these functions are
+/// only run, never transformed again.
+fn split_per_seed(g: &Func, per_seed: impl Fn(u8) -> bool) -> (Func, usize) {
+    let mut dep = vec![false; g.insts.len()];
+    let mut call_dep = false;
+    let mut after_host = false;
+    for (i, inst) in g.insts.iter().enumerate() {
+        let (ops, k) = operands(inst);
+        let reads = ops[..k].iter().any(|&x| dep[x as usize]);
+        dep[i] = match *inst {
+            Inst::Load { arg, .. } => per_seed(arg),
+            Inst::Store { arg, .. } => reads || per_seed(arg),
+            Inst::HostArg(_) => {
+                if after_host {
+                    call_dep = false;
+                    after_host = false;
+                }
+                call_dep |= reads;
+                reads
+            }
+            Inst::Host(_) => {
+                after_host = true;
+                call_dep
+            }
+            Inst::HostOut(_) => call_dep,
+            _ => reads,
+        };
+    }
+    // A host call's arguments follow its dependence too: a call that moves takes them along.
+    let mut group = false;
+    for i in (0..g.insts.len()).rev() {
+        match g.insts[i] {
+            Inst::Host(_) => group = dep[i],
+            Inst::HostArg(_) if group => dep[i] = true,
+            _ => {}
+        }
+    }
+    let mut out = Func::new(g.n_args);
+    let mut map = vec![V::MAX; g.insts.len()];
+    for pass in [false, true] {
+        for (i, &inst) in g.insts.iter().enumerate() {
+            if dep[i] == pass {
+                map[i] = out.push(remap(inst, |x| map[x as usize]));
+            }
+        }
+    }
+    out.live = vec![None; out.insts.len()];
+    let prefix = dep.iter().filter(|d| !**d).count();
+    (out, prefix)
+}
+
+/// The forward `f` differentiated along one direction, laid out for a multi-seed call
+/// (#2980): the tangent of argument `a` is argument `n + a` at the same offsets ([`tangent`]
+/// at `k = 1`), which the reverse kernels' calling convention binds to a per-seed buffer; and
+/// every instruction that reads no tangent comes first ([`split_per_seed`]). Those — the
+/// primal, its stores included — run once per call; the rest once per seed, each seed's
+/// tangents in its own buffer.
+pub(super) fn tangent_rows(f: &Func) -> Option<(Func, usize)> {
+    let (g, _) = tangent(f, 1, 0);
+    let n = f.n_args;
+    // The literals' tangents (argument `n + 2`) are zeros, so reading them reads no tangent.
+    Some(split_per_seed(&g, |a| a >= n && a != n + 2))
+}
+
+/// The reverse of the forward `f` differentiated along one direction, for a multi-seed call
+/// whose adjoint seed every seed shares (#2980): `tangent(reverse(f), 1)`, its arguments
+/// placed on a doubled slot table — the call's entries, then the same entries a plan's slot
+/// count on — so the shared buffer is `[values | adjoints]` and each seed's
+/// `[values' tangents | adjoints' tangents]`, through the arguments a kernel already binds
+/// (inputs `0`, outputs `3`, a seed's inputs `4` and outputs `7`). `n_in` is the chunk's input
+/// entries, `l` the lanes. The values and adjoints (the forward recomputation and the reverse
+/// seeded with the shared `ū`) run once per call; every tangent once per seed. Returns the
+/// function, its prefix, and the entry count `k` the table's second half starts at: a caller
+/// builds the doubled table from the first `k` entries ([`super::kernel_jit`]).
+pub(super) fn tangent_reverse_rows(
+    f: &Func, n_in: usize, l: usize,
+) -> Option<(Func, usize, usize)> {
+    let n = f.n_args;
+    if n != 4 {
+        return None;
+    }
+    let n_out = f
+        .insts
+        .iter()
+        .filter_map(|i| match *i {
+            Inst::Store { arg: 3, off, .. } => Some(off as usize / l + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let (g, _) = tangent(&reverse(f), 1, 0);
+    // Entry `e`'s copy in the table's second half.
+    let k = (n_in + n_out) as u32;
+    let up = |off: u32| off + k * l as u32;
+    let mut h = Func::new(n);
+    for &inst in &g.insts {
+        let inst = match inst {
+            // Values: the primal (inputs 0, outputs 3, literals 2) unchanged.
+            Inst::Load { arg: 0 | 2, .. } => inst,
+            // Adjoints: the shared buffer's second half.
+            Inst::Load { arg: 4, off } => Inst::Load { arg: 0, off: up(off) },
+            Inst::Load { arg: 7, off } => Inst::Load { arg: 0, off: up(off) + (n_in * l) as u32 },
+            Inst::Store { arg: 4, off, v } => {
+                Inst::Store { arg: 3, off: off + (n_out * l) as u32, v }
+            }
+            // The values' tangents: each seed's first half.
+            Inst::Load { arg: 8, off } => Inst::Load { arg: 4, off },
+            Inst::Store { arg: 11, off, v } => Inst::Store { arg: 7, off, v },
+            // The adjoints' tangents: each seed's second half.
+            Inst::Load { arg: 12, off } => Inst::Load { arg: 4, off: up(off) },
+            Inst::Load { arg: 15, off } => Inst::Load { arg: 4, off: up(off) + (n_in * l) as u32 },
+            Inst::Store { arg: 12, off, v } => {
+                Inst::Store { arg: 7, off: off + (n_out * l) as u32, v }
+            }
+            // Literals' adjoints and every literal tangent: zeros, never stored (a dropped store
+            // keeps its index, as a constant: nothing reads a store's).
+            Inst::Load { arg: 6 | 10 | 14, .. } | Inst::Store { arg: 6 | 10 | 14, .. } => {
+                Inst::Const(0f64.to_bits())
+            }
+            Inst::Load { .. } | Inst::Store { .. } => return None,
+            i => i,
+        };
+        h.insts.push(inst);
+        h.live.push(None);
+    }
+    let (g, prefix) = split_per_seed(&h, |a| a == 4 || a == 7);
+    Some((g, prefix, n_in + n_out))
 }
 
 /// [`tangent`] in `k` directions with the tangents packed into the value arguments: a
@@ -1788,7 +1884,15 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
 /// `i·l(1+k) + l + lane·k + j` (`Layout::tan`). Argument 2 (the literals, indexed by slot
 /// alone) has no tangents: their loads are zeros.
 pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) -> Func {
-    let t = tangent(f, k);
+    tangent_packed_prefix(f, k, l, seed_tangents, 0).0
+}
+
+/// [`tangent_packed`] with [`tangent`]'s count of the instructions `f`'s first `prefix` became
+/// (packing moves locations, never instructions).
+pub(super) fn tangent_packed_prefix(
+    f: &Func, k: usize, l: usize, seed_tangents: bool, prefix: usize,
+) -> (Func, usize) {
+    let (t, emitted) = tangent(f, k, prefix);
     let n = f.n_args;
     let wl = (l * (1 + k)) as u32;
     let (l32, k32) = (l as u32, k as u32);
@@ -1823,7 +1927,7 @@ pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) 
         })
         .collect();
     out.live = t.live.clone();
-    out
+    (out, emitted)
 }
 
 /// Run a [`Func`] in Rust: the reference semantics the native lowering must reproduce, and
@@ -1916,10 +2020,9 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
         let r = |v: V| x[v as usize];
         let d = |v: V| dx[v as usize];
         let (val, tan) = match *inst {
-            Inst::Load { arg, off } => (
-                args[arg as usize][off as usize],
-                dargs[arg as usize][off as usize],
-            ),
+            Inst::Load { arg, off } => {
+                (args[arg as usize][off as usize], dargs[arg as usize][off as usize])
+            }
             Inst::Const(bits) => (f64::from_bits(bits), 0.0),
             Inst::Add(a, b) => (r(a) + r(b), d(a) + d(b)),
             Inst::Sub(a, b) => (r(a) - r(b), d(a) - d(b)),
@@ -1945,14 +2048,12 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
             Inst::Call1(Shim1::Cos, a) => (r(a).cos(), -r(a).sin() * d(a)),
             Inst::Call1(Shim1::Sin, a) => (r(a).sin(), r(a).cos() * d(a)),
             Inst::Call1(Shim1::Acos, a) => (r(a).acos(), -d(a) / (1.0 - r(a) * r(a)).sqrt()),
-            Inst::Call1(Shim1::LnGamma, a) => (
-                crate::stats::special::ln_gamma(r(a)),
-                crate::stats::special::digamma(r(a)) * d(a),
-            ),
-            Inst::Call1(Shim1::Digamma, a) => (
-                crate::stats::special::digamma(r(a)),
-                crate::stats::special::trigamma(r(a)) * d(a),
-            ),
+            Inst::Call1(Shim1::LnGamma, a) => {
+                (crate::stats::special::ln_gamma(r(a)), crate::stats::special::digamma(r(a)) * d(a))
+            }
+            Inst::Call1(Shim1::Digamma, a) => {
+                (crate::stats::special::digamma(r(a)), crate::stats::special::trigamma(r(a)) * d(a))
+            }
             Inst::Call1(Shim1::Trigamma, a) => (
                 crate::stats::special::trigamma(r(a)),
                 crate::stats::special::tetragamma(r(a)) * d(a),
@@ -1965,14 +2066,12 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
                 (crate::stats::special::pentagamma(r(a)), f64::NAN)
             }
             Inst::Call1(Shim1::NegSin, a) => (-r(a).sin(), -r(a).cos() * d(a)),
-            Inst::Call1(s @ Shim1::ExpRel(k), a) => (
-                (s.f())(r(a)),
-                (Shim1::ExpRel(k.saturating_add(1)).f())(r(a)) * d(a),
-            ),
-            Inst::Call1(s @ Shim1::Jet(f, k), a) => (
-                (s.f())(r(a)),
-                (Shim1::Jet(f, k.saturating_add(1)).f())(r(a)) * d(a),
-            ),
+            Inst::Call1(s @ Shim1::ExpRel(k), a) => {
+                ((s.f())(r(a)), (Shim1::ExpRel(k.saturating_add(1)).f())(r(a)) * d(a))
+            }
+            Inst::Call1(s @ Shim1::Jet(f, k), a) => {
+                ((s.f())(r(a)), (Shim1::Jet(f, k.saturating_add(1)).f())(r(a)) * d(a))
+            }
             Inst::Call1(Shim1::Nan, _) => (f64::NAN, f64::NAN),
             Inst::Gamma { upper, i, j, a, x } => {
                 let f = |i, j| crate::stats::special::gamma_pq_partial(r(a), r(x), upper, i, j);
@@ -1981,11 +2080,7 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
             Inst::Powf(a, b) => {
                 let p = r(a).powf(r(b));
                 let da = r(b) * r(a).powf(r(b) - 1.0) * d(a);
-                let db = if r(a) > 0.0 {
-                    p * r(a).ln() * d(b)
-                } else {
-                    0.0
-                };
+                let db = if r(a) > 0.0 { p * r(a).ln() * d(b) } else { 0.0 };
                 (p, da + db)
             }
             Inst::Cmp(cc, a, b) => {

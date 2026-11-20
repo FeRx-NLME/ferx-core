@@ -32,23 +32,13 @@ fn unique_temp(stem: &str) -> PathBuf {
 /// B2 under `method`, profiled or not.
 fn prep(method: &str, profiled: bool) -> ferx_core::PreparedRun {
     let text = std::fs::read_to_string(root().join(B2)).unwrap();
-    assert!(
-        text.contains(PROFILED) && text.contains(FOCEI),
-        "fixture moved"
-    );
+    assert!(text.contains(PROFILED) && text.contains(FOCEI), "fixture moved");
     let text = text.replace(FOCEI, &format!("  method     = {method}\n"));
-    let text = if profiled {
-        text
-    } else {
-        text.replace(PROFILED, UNPROFILED)
-    };
+    let text = if profiled { text } else { text.replace(PROFILED, UNPROFILED) };
     let path = unique_temp("ferx_profiled_logit");
     std::fs::write(&path, text).unwrap();
-    ferx_core::prepare_run(
-        path.to_str().unwrap(),
-        Some(root().join(B2_DATA).to_str().unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("{e}"))
+    ferx_core::prepare_run(path.to_str().unwrap(), Some(root().join(B2_DATA).to_str().unwrap()))
+        .unwrap_or_else(|e| panic!("{e}"))
 }
 
 /// The final estimates and standard errors of a NONMEM `.ext`, by column name.
@@ -123,10 +113,7 @@ const A_B2_SE: f64 = 5e-4;
 fn assert_reproduces(ext_name: &str, method: &str) {
     let (est, se) = ext(ext_name);
     let (p, f) = profiled_at(ext_name, method);
-    assert_eq!(
-        p.parsed.model.n_theta, 32,
-        "2 structural θ and 30 free levels"
-    );
+    assert_eq!(p.parsed.model.n_theta, 32, "2 structural θ and 30 free levels");
     assert_eq!(f.profiled_blocks, ["PLACEBO"]);
     for w in &f.warnings {
         assert!(
@@ -162,18 +149,10 @@ fn assert_reproduces(ext_name: &str, method: &str) {
          {worst_se:.3e}, structural SE {:.3e} / {:.3e}",
         struct_se[0], struct_se[1]
     );
-    assert!(
-        d_ofv.abs() < A_B2_OFV,
-        "{method}: ferx {} vs NONMEM {}",
-        f.ofv,
-        est["OBJ"]
-    );
+    assert!(d_ofv.abs() < A_B2_OFV, "{method}: ferx {} vs NONMEM {}", f.ofv, est["OBJ"]);
     assert!(worst_level < A_B2_LEVEL, "{method}: {worst_level:.3e}");
     assert!(worst_se < A_B2_SE, "{method}: {worst_se:.3e}");
-    assert!(
-        struct_se.iter().all(|&r| r < A_B2_SE),
-        "{method}: {struct_se:?}"
-    );
+    assert!(struct_se.iter().all(|&r| r < A_B2_SE), "{method}: {struct_se:?}");
 }
 
 // ── A-B2: NONMEM, every level a THETA ───────────────────────────────────────────
@@ -199,30 +178,20 @@ fn a_profiled_logit_evaluation_reproduces_nonmem_laplace() {
 /// objectives have one optimum. The unprofiled side starts there because its own stop is
 /// the looser one (it stops 1.7e-5 above NONMEM under Laplace from the inits, #2462).
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn a_profiled_logit_fit_lands_on_nonmems_optimum() {
-    for (method, ext_name) in [
-        ("focei", "profile_logit_b2_focei.ext"),
-        ("laplace", "profile_logit_b2_laplace.ext"),
-    ] {
+    for (method, ext_name) in
+        [("focei", "profile_logit_b2_focei.ext"), ("laplace", "profile_logit_b2_laplace.ext")]
+    {
         let (est, _) = ext(ext_name);
         let p = prep(method, true);
-        let o = FitOptions {
-            verbose: false,
-            ..p.parsed.fit_options.clone()
-        };
+        let o = FitOptions { verbose: false, ..p.parsed.fit_options.clone() };
         let fp = ferx_core::fit(&p.parsed.model, &p.population, &p.init_params, &o)
             .unwrap_or_else(|e| panic!("{e}"));
         let pu = prep(method, false);
         let mut start = pu.init_params.clone();
         start.theta.clone_from(&fp.theta);
-        let ou = FitOptions {
-            verbose: false,
-            ..pu.parsed.fit_options.clone()
-        };
+        let ou = FitOptions { verbose: false, ..pu.parsed.fit_options.clone() };
         let fu = ferx_core::fit(&pu.parsed.model, &pu.population, &start, &ou)
             .unwrap_or_else(|e| panic!("{e}"));
         eprintln!(
@@ -247,10 +216,9 @@ fn a_profiled_logit_fit_lands_on_nonmems_optimum() {
 /// ΔOFV −1.5e-8 / 3.8e-12 (the solve's stop under FOCEI), macOS arm64.
 #[test]
 fn the_profiled_logit_covariance_is_the_unprofiled_one_at_the_same_point() {
-    for (method, ext_name) in [
-        ("focei", "profile_logit_b2_focei.ext"),
-        ("laplace", "profile_logit_b2_laplace.ext"),
-    ] {
+    for (method, ext_name) in
+        [("focei", "profile_logit_b2_focei.ext"), ("laplace", "profile_logit_b2_laplace.ext")]
+    {
         let (est, _) = ext(ext_name);
         let (_, fp) = profiled_at(ext_name, method);
         let pu = prep(method, false);
@@ -258,13 +226,8 @@ fn the_profiled_logit_covariance_is_the_unprofiled_one_at_the_same_point() {
         params.theta.clone_from(&fp.theta);
         params.omega = OmegaMatrix::from_diagonal(&[est["OMEGA(1,1)"]], vec!["ETA_S".into()]);
         params.sigma.values[0] = est["SIGMA(1,1)"].sqrt();
-        let fu = ferx_core::fit(
-            &pu.parsed.model,
-            &pu.population,
-            &params,
-            &eval_options(&pu),
-        )
-        .unwrap_or_else(|e| panic!("{e}"));
+        let fu = ferx_core::fit(&pu.parsed.model, &pu.population, &params, &eval_options(&pu))
+            .unwrap_or_else(|e| panic!("{e}"));
         let (sp, su) = (fp.se_theta.as_ref().unwrap(), fu.se_theta.as_ref().unwrap());
         let mut worst = 0.0_f64;
         for (a, b) in sp.iter().zip(su) {
@@ -272,10 +235,7 @@ fn the_profiled_logit_covariance_is_the_unprofiled_one_at_the_same_point() {
             assert!(rel.is_finite(), "{method}: {a} vs {b}");
             worst = worst.max(rel);
         }
-        eprintln!(
-            "C1-link {method}: ΔOFV {:.3e}, worst SE {worst:.3e}",
-            fu.ofv - fp.ofv
-        );
+        eprintln!("C1-link {method}: ΔOFV {:.3e}, worst SE {worst:.3e}", fu.ofv - fp.ofv);
         assert!((fu.ofv - fp.ofv).abs() < 1e-7, "{method}");
         assert!(worst < 1e-9, "{method}: {worst:.3e}");
     }

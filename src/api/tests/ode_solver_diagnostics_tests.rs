@@ -9,7 +9,6 @@
 use super::*;
 use crate::ode::OdeSolverStats;
 use crate::parser::model_parser::parse_model_string;
-use std::collections::HashMap;
 
 /// A rapid-equilibrium two-state model: the exchange rate `KFAST` sets `|Re λ|max`, so the
 /// same source is a stiff or a benign fixture depending on one theta.
@@ -47,34 +46,13 @@ fn subject(id: &str, scale: f64) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
     let observations = obs_times.iter().map(|t| scale * 50.0 / (1.0 + t)).collect();
     Subject {
-        obs_rgroup: Vec::new(),
         id: id.into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
         obs_times,
-        obs_raw_times: Vec::new(),
         observations,
         obs_cmts: vec![1, 1, 1, 1],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
-        occasions: Vec::new(),
-        obs_l2: Vec::new(),
-        dose_occasions: Vec::new(),
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
+        ..Default::default()
     }
 }
 
@@ -92,18 +70,11 @@ fn population() -> Population {
 /// One outer iteration is enough — the warning is built from the post-fit prediction pass,
 /// not from the optimizer's history.
 fn one_iteration_opts() -> FitOptions {
-    FitOptions {
-        outer_maxiter: 1,
-        run_covariance_step: false,
-        ..Default::default()
-    }
+    FitOptions { outer_maxiter: 1, run_covariance_step: false, ..Default::default() }
 }
 
 fn ode_solver_entry(result: &FitResult) -> Option<&WarningEntry> {
-    result
-        .warnings_structured
-        .iter()
-        .find(|e| e.category == WarningCode::OdeSolver)
+    result.warnings_structured.iter().find(|e| e.category == WarningCode::OdeSolver)
 }
 
 // ── message construction ─────────────────────────────────────────────────────
@@ -141,10 +112,7 @@ fn an_escalation_that_worked_is_reported_as_info() {
     assert!(msg.contains("240"), "{msg}");
     assert_eq!(entry.severity, WarningSeverity::Info);
     assert_eq!(entry.category, WarningCode::OdeSolver);
-    assert_eq!(
-        entry.details.as_ref().unwrap()["auto_stiff_segments"],
-        serde_json::json!(240)
-    );
+    assert_eq!(entry.details.as_ref().unwrap()["auto_stiff_segments"], serde_json::json!(240));
 }
 
 /// A mid-segment switch (#1080 Part C) is reported as a clause on the escalation note, not as
@@ -176,14 +144,8 @@ fn a_mid_segment_switch_is_reported_on_the_escalation_note() {
         ),
         "{msg}"
     );
-    assert!(
-        !msg.contains("  "),
-        "no run of blank space may reach a user: {msg}"
-    );
-    assert_eq!(
-        entry.details.as_ref().unwrap()["auto_switched_segments"],
-        serde_json::json!(9)
-    );
+    assert!(!msg.contains("  "), "no run of blank space may reach a user: {msg}");
+    assert_eq!(entry.details.as_ref().unwrap()["auto_switched_segments"], serde_json::json!(9));
 }
 
 /// …and a fit that switched *and* did not integrate cleanly says both: the switch clause rides
@@ -214,14 +176,8 @@ fn a_switch_is_reported_alongside_an_unclean_solve() {
         ),
         "{msg}"
     );
-    assert!(
-        !msg.contains("of them"),
-        "the warning body gives \"of them\" no antecedent: {msg}"
-    );
-    assert!(
-        !msg.contains("  "),
-        "no run of blank space may reach a user: {msg}"
-    );
+    assert!(!msg.contains("of them"), "the warning body gives \"of them\" no antecedent: {msg}");
+    assert!(!msg.contains("  "), "no run of blank space may reach a user: {msg}");
     assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
 }
 
@@ -288,10 +244,7 @@ fn an_unfinished_named_solve_is_warned_without_an_auto_rejection() {
         unfinished_segments: 1,
         ..Default::default()
     };
-    let opts = FitOptions {
-        ode_method: crate::ode::OdeMethod::Rk45,
-        ..Default::default()
-    };
+    let opts = FitOptions { ode_method: crate::ode::OdeMethod::Rk45, ..Default::default() };
     let (msg, entry) =
         ode_solver_diagnostics_warning(&stats, &opts, SolverStatsPhase::PostfitPredictions)
             .expect("a warning");
@@ -305,15 +258,9 @@ fn an_unfinished_named_solve_is_warned_without_an_auto_rejection() {
 /// so a reader who adds them up gets the number of segments rather than twice it (#1080 review).
 #[test]
 fn an_abandoned_segment_is_not_also_reported_as_an_unfinished_one() {
-    let stats = OdeSolverStats {
-        unfinished_segments: 3,
-        stiff_aborted_segments: 3,
-        ..Default::default()
-    };
-    let opts = FitOptions {
-        ode_stiff_abort_after: Some(5),
-        ..Default::default()
-    };
+    let stats =
+        OdeSolverStats { unfinished_segments: 3, stiff_aborted_segments: 3, ..Default::default() };
+    let opts = FitOptions { ode_stiff_abort_after: Some(5), ..Default::default() };
     let (msg, entry) =
         ode_solver_diagnostics_warning(&stats, &opts, SolverStatsPhase::PostfitPredictions)
             .expect("a warning");
@@ -332,11 +279,8 @@ fn an_abandoned_segment_is_not_also_reported_as_an_unfinished_one() {
 /// causes an abort clause would not explain.
 #[test]
 fn an_unfinished_segment_beyond_the_abandoned_ones_is_still_reported() {
-    let stats = OdeSolverStats {
-        unfinished_segments: 3,
-        stiff_aborted_segments: 2,
-        ..Default::default()
-    };
+    let stats =
+        OdeSolverStats { unfinished_segments: 3, stiff_aborted_segments: 2, ..Default::default() };
     let (msg, _) = ode_solver_diagnostics_warning(
         &stats,
         &FitOptions::default(),
@@ -366,10 +310,7 @@ fn an_abort_names_the_budget_that_caused_it() {
     assert!(msg.contains("4 segment(s)"), "{msg}");
     // The method the user actually asked for is named, so the advice is not about `auto`.
     assert!(msg.contains("ode_method = rodas4"), "{msg}");
-    assert_eq!(
-        entry.details.as_ref().unwrap()["stiff_aborted_segments"],
-        serde_json::json!(4)
-    );
+    assert_eq!(entry.details.as_ref().unwrap()["stiff_aborted_segments"], serde_json::json!(4));
 }
 
 /// Review follow-up (#1080): a rejected escalation must not be reported as freeze-padding. The
@@ -396,17 +337,11 @@ fn a_rejected_escalations_clamps_do_not_claim_freeze_padding() {
         "no clamp survived into a returned trajectory: {msg}"
     );
     assert!(msg.contains("3 of 240"), "{msg}");
-    assert_eq!(
-        entry.details.as_ref().unwrap()["kept_clamped_steps"],
-        serde_json::json!(0)
-    );
+    assert_eq!(entry.details.as_ref().unwrap()["kept_clamped_steps"], serde_json::json!(0));
 
     // …and a clamp in the *kept* solve still is reported, alongside the rejection.
-    let with_kept = OdeSolverStats {
-        min_step_clamped_steps: 14,
-        discarded_clamped_steps: 12,
-        ..stats
-    };
+    let with_kept =
+        OdeSolverStats { min_step_clamped_steps: 14, discarded_clamped_steps: 12, ..stats };
     let (msg, _) = ode_solver_diagnostics_warning(
         &with_kept,
         &FitOptions::default(),
@@ -420,10 +355,7 @@ fn a_rejected_escalations_clamps_do_not_claim_freeze_padding() {
 /// consumer only has the plain message text (reading back a `{model}-fit.yaml`).
 #[test]
 fn the_escalation_note_keeps_its_severity_through_classification() {
-    let stats = OdeSolverStats {
-        auto_stiff_segments: 7,
-        ..Default::default()
-    };
+    let stats = OdeSolverStats { auto_stiff_segments: 7, ..Default::default() };
     let (msg, entry) = ode_solver_diagnostics_warning(
         &stats,
         &FitOptions::default(),
@@ -465,14 +397,8 @@ fn the_solver_scope_gate_covers_the_absorption_ode_twin() {
 "#,
     )
     .expect("parse");
-    assert!(
-        transit.ode_spec.is_none(),
-        "the fixture must be the closed form, not an ODE model"
-    );
-    assert!(
-        transit.absorption_ode_equivalent.is_some(),
-        "the fixture must carry a twin"
-    );
+    assert!(transit.ode_spec.is_none(), "the fixture must be the closed form, not an ODE model");
+    assert!(transit.absorption_ode_equivalent.is_some(), "the fixture must carry a twin");
     assert!(
         integrates_odes(&transit),
         "a model that integrates only through its twin still has solver statistics"
@@ -491,9 +417,7 @@ fn a_stiff_ode_fit_reports_the_solver_decisions() {
     let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
 
     let entry = ode_solver_entry(&result).expect("an ode_solver warning");
-    let escalated = entry.details.as_ref().unwrap()["auto_stiff_segments"]
-        .as_u64()
-        .unwrap();
+    let escalated = entry.details.as_ref().unwrap()["auto_stiff_segments"].as_u64().unwrap();
     assert!(escalated > 0, "the probe should have escalated: {entry:?}");
     assert!(
         result.warnings.iter().any(|w| w.contains("W_ODE_SOLVER_")),
@@ -537,15 +461,9 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
     )
     .expect("a warning");
     assert_eq!(entry.severity, WarningSeverity::Warning);
-    assert!(
-        msg.contains("2 segment(s) of the analytic-sensitivity solve were discarded"),
-        "{msg}"
-    );
+    assert!(msg.contains("2 segment(s) of the analytic-sensitivity solve were discarded"), "{msg}");
     assert!(msg.contains("units and scaling"), "{msg}");
-    assert!(
-        msg.contains("naming a different ode_method will not help"),
-        "{msg}"
-    );
+    assert!(msg.contains("naming a different ode_method will not help"), "{msg}");
     // The count comes from a different sweep than the escalation counts, so the clause must
     // not phrase itself as a subset of them.
     assert!(!msg.contains("of those"), "{msg}");
@@ -554,10 +472,7 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
     assert!(msg.contains("consider a different ode_method"), "{msg}");
     // A clause literal wrapped without `\` continuations reaches the user as runs of
     // indentation. This is what caught it (#1207 review); every clause here is checked.
-    assert!(
-        !msg.contains("  "),
-        "no run of blank space may reach a user: {msg}"
-    );
+    assert!(!msg.contains("  "), "no run of blank space may reach a user: {msg}");
     let details = entry.details.as_ref().unwrap();
     assert_eq!(details["auto_stiff_rejected_jets"], serde_json::json!(2));
     assert_eq!(classify_warning(&msg).category, WarningCode::OdeSolver);
@@ -565,7 +480,7 @@ fn a_jet_rejection_says_the_derivatives_overflowed_not_that_the_method_failed() 
 
 /// A jet rejection on an otherwise clean fit still warns. The prediction pass can be spotless
 /// — it is a different solve — so `unclean` has to count this counter or the one failure only
-/// the sensitivity sweep can see would be reported as an `Info` escalation note.
+/// a dual sensitivity solve can see would be reported as an `Info` escalation note.
 #[test]
 fn a_jet_rejection_alone_is_a_warning_not_an_info_note() {
     let stats = OdeSolverStats {
@@ -608,57 +523,76 @@ fn an_ordinary_rejection_carries_no_jet_clause() {
     .expect("a warning");
     assert!(!msg.contains("analytic-sensitivity solve"), "{msg}");
     assert!(msg.contains("rodas5p"), "{msg}");
-    assert!(
-        !msg.contains("will not help"),
-        "the two remedies must never both appear: {msg}"
-    );
-    assert!(
-        !msg.contains("  "),
-        "no run of blank space may reach a user: {msg}"
-    );
+    assert!(!msg.contains("will not help"), "the two remedies must never both appear: {msg}");
+    assert!(!msg.contains("  "), "no run of blank space may reach a user: {msg}");
     let details = entry.details.as_ref().unwrap();
     assert_eq!(details["auto_stiff_rejected_jets"], serde_json::json!(0));
 }
 
-/// The second half of the post-fit sweep (#1204): the diagnostic scope has to observe a
-/// **dual** solve, not only the `f64` prediction pass.
+/// Why `fit()` runs no sensitivity sweep for `auto_stiff_rejected_jets` (#3076), stated as a
+/// test: the derivative solves are compiled plans, and a plan's ODE loop integrates on the
+/// value lane, where the jet clause cannot fire. The fixture is the `stiffness_tests.rs` #1204
+/// repro as a model — a fast mode that makes `auto` escalate, and `u' = P·u` driven to
+/// `6e303`, whose η-Hessian `(Pt)²·u` overflows while its value does not. The plan's solve
+/// escalates and its Hessian is unusable, yet no jet rejection is counted.
 ///
-/// Without this the jet-rejection clause could never fire in production — `f64` carries no
-/// jets, so the only path that can take that decision is the sensitivity solve — and the
-/// counter would be exactly the dead diagnostic #1080 item 3 existed to remove. Asserting the
-/// sweep deposits counters of its own is what pins that it runs at all.
+/// If this ever fails on the counter, a plan has learned to take the jet decision, and
+/// `fit_inner` must collect the counter again (the removed sweep ran exactly this solve, per
+/// subject, at the estimates). The direct dual solve still takes it:
+/// `auto_rejects_an_escalation_whose_jets_overflowed_while_its_values_did_not`.
 #[test]
-fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
-    let model = two_state_model(1000.0);
-    let pop = population();
-    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
-
-    let mut params = model.default_params.clone();
-    params.theta = result.theta.clone();
-    let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
-    // Read from the **return value**, not from a scope opened here: the sweep is
-    // parallel over subjects and `SolverStatsScope` is thread-local, so a
-    // caller-side scope sees this thread's work and the sweep does none on it
-    // (#1329). That is the counter-loss the merge exists to prevent, and this
-    // test is where it would have shown up.
-    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    assert!(
-        stats.accepted_steps > 0,
-        "the sensitivity sweep integrated nothing: {stats:?}"
+fn the_plan_sensitivity_solve_cannot_take_the_jet_decision() {
+    let model = parse_model_string(
+        r#"
+[parameters]
+  theta TVP(3.5, 0.1, 10.0)
+  omega ETA_P ~ 0.04
+  sigma PROP ~ 0.04
+[individual_parameters]
+  P = TVP * exp(ETA_P)
+[structural_model]
+  ode(obs_cmt=grow, states=[fast, grow])
+[odes]
+  init(fast) = 1
+  init(grow) = 1
+  d/dt(fast) = -100 * fast / (1 + fast * 1e-12)
+  d/dt(grow) = grow * P
+[error_model]
+  DV ~ proportional(PROP)
+[fit_options]
+  ode_reltol = 1e-2
+  ode_abstol = 1e-2
+"#,
+    )
+    .expect("parse");
+    let subject = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(0.0, 0.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![200.0],
+        observations: vec![1e300],
+        obs_cmts: vec![2],
+        cens: vec![0],
+        ..Default::default()
+    };
+    let params = model.default_params.clone();
+    assert!(crate::sens::provider::analytic_outer_gradient_available(&model));
+    let scope = crate::ode::solver::SolverStatsScope::enter();
+    let h = crate::sens::ode_provider::adjoint::exact_inner_hessian_or_decline(
+        &model,
+        &subject,
+        &params,
+        &[0.0],
     );
-    assert!(
-        stats.auto_stiff_segments > 0,
-        "and it should see the same escalations the prediction pass does: {stats:?}"
-    );
-    // …and it must be the *second-order* provider for a model with an analytic outer
-    // gradient (#1207 review). The overflow this counter exists for reaches the Hessian
-    // first and the gradient only later, so a `Dual2` sweep would miss the very case #1204
-    // documents. This fixture has to take that branch, or the assertions above are only
-    // testing the first-order path.
-    assert!(
-        crate::sens::provider::analytic_outer_gradient_available(&model),
-        "the fixture must exercise the Dual2 branch of the sweep"
-    );
+    let stats = scope.collected();
+    // The premise: the plan's solve ran, escalated, and lost its second derivatives.
+    assert!(stats.auto_stiff_segments > 0, "{stats:?}");
+    assert!(h.is_err(), "the η-Hessian must overflow: {h:?}");
+    let pred = predict(&model, &Population { subjects: vec![subject], ..population() }, &params)
+        .expect("predict");
+    assert!(pred[0].pred.is_finite() && pred[0].pred > 1e300, "{:?}", pred[0].pred);
+    // …and yet nothing on this path can count the jet rejection.
+    assert_eq!(stats.auto_stiff_rejected_jets, 0, "{stats:?}");
+    assert_eq!(stats.auto_stiff_rejected, 0, "{stats:?}");
 }
 
 /// The post-fit passes are parallel over subjects (#1329), and both things that makes fragile
@@ -683,17 +617,12 @@ fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
 fn the_parallel_post_fit_pass_is_worker_count_independent() {
     let model = two_state_model(1000.0);
     let pop = Population {
-        subjects: (0..8)
-            .map(|i| subject(&format!("{i}"), 1.0 + 0.1 * f64::from(i)))
-            .collect(),
+        subjects: (0..8).map(|i| subject(&format!("{i}"), 1.0 + 0.1 * f64::from(i))).collect(),
         ..population()
     };
 
     let fit_on = |threads: usize| {
-        let opts = FitOptions {
-            threads: Some(threads),
-            ..one_iteration_opts()
-        };
+        let opts = FitOptions { threads: Some(threads), ..one_iteration_opts() };
         fit(&model, &pop, &model.default_params, &opts).expect("fit")
     };
     let serial = fit_on(1);
@@ -737,66 +666,6 @@ fn the_parallel_post_fit_pass_is_worker_count_independent() {
             a.id
         );
     }
-}
-
-/// …and it costs nothing on a model that has no ODE sensitivity path to sweep. The helper is
-/// called on every ODE fit, so a model on a closed-form solution must exit before it
-/// integrates anything.
-#[test]
-fn the_sensitivity_sweep_is_a_no_op_off_the_analytic_ode_path() {
-    let model = closed_form_model();
-    let pop = population();
-    let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
-
-    let mut params = model.default_params.clone();
-    params.theta = result.theta.clone();
-    let etas: Vec<DVector<f64>> = result.subjects.iter().map(|s| s.eta.clone()).collect();
-    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    assert_eq!(stats.accepted_steps, 0, "{stats:?}");
-    assert_eq!(stats.attempted_steps, 0, "{stats:?}");
-}
-
-/// A one-compartment closed-form twin of [`two_state_model`]: no `[odes]`, so
-/// the sweep's `model.ode_spec.is_none()` guard fires and it has nothing to do.
-fn closed_form_model() -> CompiledModel {
-    parse_model_string(
-        r#"
-[parameters]
-  theta TVCL(1.0, 0.1, 50.0)
-  theta TVV(10.0, 1.0, 500.0)
-  omega ETA_CL ~ 0.04
-  sigma PROP ~ 0.04
-[individual_parameters]
-  CL = TVCL * exp(ETA_CL)
-  V  = TVV
-[structural_model]
-  pk one_cpt_iv(cl=CL, v=V)
-[error_model]
-  DV ~ proportional(PROP)
-"#,
-    )
-    .expect("parse")
-}
-
-/// An **FD fit** must sweep nothing (#1207 review). `adjoint::recorder_in_scope` describes
-/// the ODE provider's analytical reach and says nothing about `gradient_method`, so gating on
-/// it alone swept a dual solve for a fit that computed every gradient by finite differences —
-/// and then reported solver counters from a code path that fit never took.
-#[test]
-fn the_sensitivity_sweep_is_a_no_op_when_the_fit_asked_for_fd_gradients() {
-    let mut model = two_state_model(1000.0);
-    model.gradient_method = GradientMethod::Fd;
-    let pop = population();
-    let params = model.default_params.clone();
-    let etas: Vec<DVector<f64>> = pop
-        .subjects
-        .iter()
-        .map(|_| DVector::zeros(model.n_eta))
-        .collect();
-
-    let stats = sweep_sensitivity_solver_stats(&model, &pop, &params, &etas, None);
-    assert_eq!(stats.accepted_steps, 0, "{stats:?}");
-    assert_eq!(stats.attempted_steps, 0, "{stats:?}");
 }
 
 // ── abandoned non-finite timelines (#1234) ───────────────────────────────────
@@ -873,11 +742,7 @@ fn the_static_walk_separates_an_abandoned_timeline_from_nothing_to_integrate() {
     let (abandoned, preds) = static_walk(&nan_dose_time_subject("bad"));
     // `.all()` is vacuously true on an empty `preds`, and "the walk bails before recording
     // observations" is the state under test — so the length is asserted before the premise.
-    assert_eq!(
-        preds.len(),
-        4,
-        "the fixture must have observations: {preds:?}"
-    );
+    assert_eq!(preds.len(), 4, "the fixture must have observations: {preds:?}");
     assert!(
         preds.iter().all(|p| p.is_nan()),
         "static walk: the fixture must actually be abandoned (NaN predictions), got {preds:?}"
@@ -951,11 +816,7 @@ fn the_event_driven_walk_separates_an_abandoned_timeline_from_nothing_to_integra
 
     let (abandoned, preds) = run(&nan_dose_time_subject("bad"));
     // As T1: `.all()` on an empty `preds` asserts nothing.
-    assert_eq!(
-        preds.len(),
-        4,
-        "the fixture must have observations: {preds:?}"
-    );
+    assert_eq!(preds.len(), 4, "the fixture must have observations: {preds:?}");
     assert!(
         preds.iter().all(|p| p.is_nan()),
         "event-driven walk: the fixture must actually be abandoned, got {preds:?}"
@@ -1044,9 +905,8 @@ fn a_fit_over_an_unorderable_timeline_says_so() {
     let result = fit(&model, &pop, &model.default_params, &one_iteration_opts()).expect("fit");
     let entry = ode_solver_entry(&result)
         .expect("a fit whose predictions are NaN by construction must carry an ode_solver warning");
-    let abandoned = entry.details.as_ref().unwrap()["abandoned_non_finite_timeline"]
-        .as_u64()
-        .unwrap();
+    let abandoned =
+        entry.details.as_ref().unwrap()["abandoned_non_finite_timeline"].as_u64().unwrap();
     // Exactly three, not `> 0`, and the difference is the point. Measured inside the fit's own
     // `SolverStatsScope`: the one bad subject is abandoned **three times** in the post-fit
     // sweep — twice at `ode_predictions_with_extra_breaks_and_stats` and once at
@@ -1077,9 +937,7 @@ fn a_fit_over_an_unorderable_timeline_says_so() {
          was dropped: {entry:?}"
     );
     assert!(
-        entry
-            .message
-            .contains(&format!("{abandoned} solver walk(s)")),
+        entry.message.contains(&format!("{abandoned} solver walk(s)")),
         "the message must name the count, not only the details payload: {}",
         entry.message
     );
@@ -1144,11 +1002,7 @@ fn the_public_solver_stats_surface_reports_an_abandoned_walk() {
         &[0.0],
         &nan_dose_time_subject("bad"),
     );
-    assert_eq!(
-        preds.len(),
-        4,
-        "the fixture must have observations: {preds:?}"
-    );
+    assert_eq!(preds.len(), 4, "the fixture must have observations: {preds:?}");
     assert!(
         preds.iter().all(|p| p.is_nan()),
         "the fixture must actually be abandoned, got {preds:?}"
@@ -1167,11 +1021,7 @@ fn the_public_solver_stats_surface_reports_an_abandoned_walk() {
     // record nothing. Without it a counter wired to fire on every call would pass above.
     let (preds, clean) =
         crate::ode::ode_predictions_with_solver_stats(ode, &pk, theta, &[0.0], &subject("2", 1.0));
-    assert_eq!(
-        preds.len(),
-        4,
-        "the control must have observations: {preds:?}"
-    );
+    assert_eq!(preds.len(), 4, "the control must have observations: {preds:?}");
     assert!(
         preds.iter().all(|p| p.is_finite()),
         "the control must actually integrate, got {preds:?}"
@@ -1210,10 +1060,7 @@ fn the_solver_knob_advice_is_attached_only_to_counters_it_applies_to() {
     const NOT_A_SOLVER_SETTING: &str = "not an ode_method or tolerance problem";
 
     let (abandoned_only, _) = ode_solver_diagnostics_warning(
-        &OdeSolverStats {
-            abandoned_non_finite_timeline: 3,
-            ..Default::default()
-        },
+        &OdeSolverStats { abandoned_non_finite_timeline: 3, ..Default::default() },
         &FitOptions::default(),
         SolverStatsPhase::PostfitPredictions,
     )
@@ -1327,16 +1174,8 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
             "at the final estimates",
             "from the post-fit prediction pass",
         ),
-        (
-            SolverStatsPhase::Predict,
-            "at the supplied parameters",
-            "from this predict() pass",
-        ),
-        (
-            SolverStatsPhase::Simulate,
-            "at the supplied parameters",
-            "from this simulate() pass",
-        ),
+        (SolverStatsPhase::Predict, "at the supplied parameters", "from this predict() pass"),
+        (SolverStatsPhase::Simulate, "at the supplied parameters", "from this simulate() pass"),
         (
             SolverStatsPhase::SimulateAdaptive,
             "at the supplied parameters",
@@ -1360,17 +1199,11 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
         assert!(msg.contains("1 segment(s) had both attempts fail"), "{msg}");
         assert!(msg.contains("131 step(s) clamped"), "{msg}");
         for unwanted in ADVICE_A_DIVERGENCE_MUST_NOT_GET {
-            assert!(
-                !msg.contains(unwanted),
-                "{phase:?}: must not say {unwanted:?}: {msg}"
-            );
+            assert!(!msg.contains(unwanted), "{phase:?}: must not say {unwanted:?}: {msg}");
         }
         // The two diverged segments are not reported again as ordinary stopped ones.
         assert!(!msg.contains("returned segment(s) stopped"), "{msg}");
-        assert_eq!(
-            entry.details.as_ref().unwrap()["diverged_segments"],
-            serde_json::json!(2)
-        );
+        assert_eq!(entry.details.as_ref().unwrap()["diverged_segments"], serde_json::json!(2));
     }
 
     // Leg 2 — one diverged and one finite unfinished segment: both clauses, counts that
@@ -1428,10 +1261,7 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
         diverged_segments: 1,
         ..Default::default()
     };
-    let abort_opts = FitOptions {
-        ode_stiff_abort_after: Some(3),
-        ..Default::default()
-    };
+    let abort_opts = FitOptions { ode_stiff_abort_after: Some(3), ..Default::default() };
     let (msg, _) = ode_solver_diagnostics_warning(&aborted, &abort_opts, SolverStatsPhase::Predict)
         .expect("a warning");
     assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
@@ -1440,7 +1270,7 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
     assert!(msg.contains("consider a different ode_method"), "{msg}");
     assert!(msg.contains("stability-limited"), "{msg}");
 
-    // Leg 5 — a divergence beside a jet-only rejection from the sensitivity sweep. The jet
+    // Leg 5 — a divergence beside a jet-only rejection from a sensitivity solve. The jet
     // clause itself says a different `ode_method` will not help, so the knob advice is dropped
     // here too rather than contradicting it (#1577 review, row 1: `rejected_jets` is
     // deliberately not a conjunct of the gate).
@@ -1454,10 +1284,7 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
         ode_solver_diagnostics_warning(&jets, &FitOptions::default(), SolverStatsPhase::Predict)
             .expect("a warning");
     assert!(msg.contains("1 returned segment(s) had a state"), "{msg}");
-    assert!(
-        msg.contains("naming a different ode_method will not help"),
-        "{msg}"
-    );
+    assert!(msg.contains("naming a different ode_method will not help"), "{msg}");
     assert!(!msg.contains("consider a different ode_method"), "{msg}");
 }
 
@@ -1466,11 +1293,8 @@ fn the_solver_advice_is_dropped_only_when_every_damaged_segment_diverged() {
 /// diverged clause stays. Mutation that reddens it: an unconditional clamp clause.
 #[test]
 fn a_divergence_at_segment_entry_names_no_clamps() {
-    let stats = OdeSolverStats {
-        unfinished_segments: 1,
-        diverged_segments: 1,
-        ..Default::default()
-    };
+    let stats =
+        OdeSolverStats { unfinished_segments: 1, diverged_segments: 1, ..Default::default() };
     let (msg, _) =
         ode_solver_diagnostics_warning(&stats, &FitOptions::default(), SolverStatsPhase::Predict)
             .expect("a warning");
@@ -1489,11 +1313,8 @@ fn a_divergence_at_segment_entry_names_no_clamps() {
 /// clause's `reading` half when nothing diverged.
 #[test]
 fn a_finite_freeze_pad_message_is_unchanged_by_the_divergence_clause() {
-    let stats = OdeSolverStats {
-        min_step_clamped_steps: 5,
-        unfinished_segments: 1,
-        ..Default::default()
-    };
+    let stats =
+        OdeSolverStats { min_step_clamped_steps: 5, unfinished_segments: 1, ..Default::default() };
     let (msg, entry) =
         ode_solver_diagnostics_warning(&stats, &FitOptions::default(), SolverStatsPhase::Predict)
             .expect("a warning");
@@ -1513,10 +1334,7 @@ fn a_finite_freeze_pad_message_is_unchanged_by_the_divergence_clause() {
          ode_abstol, or checking the parameter estimates that produce these dynamics."
     );
     assert!(!msg.contains("non-finite"), "{msg}");
-    assert_eq!(
-        entry.details.as_ref().unwrap()["diverged_segments"],
-        serde_json::json!(0)
-    );
+    assert_eq!(entry.details.as_ref().unwrap()["diverged_segments"], serde_json::json!(0));
 }
 
 /// The abort and diverged counters are disjoint by construction (the solver counts a budgeted
@@ -1531,10 +1349,7 @@ fn the_unfinished_remainder_subtracts_aborted_and_diverged_segments() {
         diverged_segments: 2,
         ..Default::default()
     };
-    let opts = FitOptions {
-        ode_stiff_abort_after: Some(3),
-        ..Default::default()
-    };
+    let opts = FitOptions { ode_stiff_abort_after: Some(3), ..Default::default() };
     let (msg, _) =
         ode_solver_diagnostics_warning(&stats, &opts, SolverStatsPhase::Predict).expect("warn");
     assert!(msg.contains("2 returned segment(s) had a state"), "{msg}");

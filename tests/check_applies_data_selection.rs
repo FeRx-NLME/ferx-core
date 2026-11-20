@@ -165,10 +165,7 @@ const IGNORE_CMT3: &str = "\n[data_selection]\n  ignore = CMT == 3\n";
 const IGNORE_ABSENT_COLUMN: &str = "\n[data_selection]\n  ignore = STUDY == 7\n";
 
 fn temp(contents: &str, suffix: &str) -> NamedTempFile {
-    let mut f = tempfile::Builder::new()
-        .suffix(suffix)
-        .tempfile()
-        .expect("temp file");
+    let mut f = tempfile::Builder::new().suffix(suffix).tempfile().expect("temp file");
     write!(f, "{contents}").expect("write");
     f.flush().expect("flush");
     f
@@ -186,39 +183,24 @@ fn check_and_fit(model_src: &str, data: &str) -> (CheckReport, Result<FitResult,
     let mp = m.path().to_str().expect("utf-8 temp path").to_string();
     let dp = d.path().to_str().expect("utf-8 temp path").to_string();
     let report = validate_model_file(&mp, Some(&dp));
-    let fit = run_model_with_data(&mp, Some(&dp))
-        .map(|(r, _)| r)
-        .map_err(|e| e.to_string());
+    let fit = run_model_with_data(&mp, Some(&dp)).map(|(r, _)| r).map_err(|e| e.to_string());
     (report, fit)
 }
 
 /// The error-severity codes of a report, in order.
 fn error_codes(report: &CheckReport) -> Vec<String> {
-    report
-        .diagnostics
-        .iter()
-        .filter(|d| d.code.starts_with('E'))
-        .map(|d| d.code.clone())
-        .collect()
+    report.diagnostics.iter().filter(|d| d.code.starts_with('E')).map(|d| d.code.clone()).collect()
 }
 
 /// A diagnostic whose message opens with `code`, or a message naming what was
 /// there instead — a bare `expect` on `find` says only "None".
 fn diagnostic_for<'a>(report: &'a CheckReport, code: &str) -> &'a ferx_core::Diagnostic {
-    report
-        .diagnostics
-        .iter()
-        .find(|d| d.message.starts_with(code))
-        .unwrap_or_else(|| {
-            panic!(
-                "no `{code}` in the check report; it carried {:?}",
-                report
-                    .diagnostics
-                    .iter()
-                    .map(|d| d.code.as_str())
-                    .collect::<Vec<_>>()
-            )
-        })
+    report.diagnostics.iter().find(|d| d.message.starts_with(code)).unwrap_or_else(|| {
+        panic!(
+            "no `{code}` in the check report; it carried {:?}",
+            report.diagnostics.iter().map(|d| d.code.as_str()).collect::<Vec<_>>()
+        )
+    })
 }
 
 /// A report serialized with the two fields that necessarily differ between two
@@ -253,14 +235,9 @@ fn a_clause_that_empties_an_uncovered_compartment_makes_check_agree_with_the_fit
          `ferx check` has nothing fatal to report: {:?}",
         report.diagnostics
     );
-    assert!(
-        report.valid,
-        "and the report says so: {:?}",
-        report.diagnostics
-    );
-    let ofv = fit
-        .expect("the fit accepts the filtered dataset — that is what check must agree with")
-        .ofv;
+    assert!(report.valid, "and the report says so: {:?}", report.diagnostics);
+    let ofv =
+        fit.expect("the fit accepts the filtered dataset — that is what check must agree with").ofv;
     assert!(
         ofv.is_finite(),
         "the oracle has to be a real evaluation, not a diverged one: OFV = {ofv}"
@@ -290,9 +267,7 @@ fn a_clause_that_empties_an_uncovered_compartment_makes_check_agree_with_the_fit
 #[test]
 fn the_unmatched_entry_warning_describes_the_records_the_fit_scores() {
     let (report, fit) = check_and_fit(&format!("{H_MODEL}{IGNORE_CMT3}"), H_CSV);
-    let checked = diagnostic_for(&report, "W_PER_CMT_UNMATCHED")
-        .message
-        .clone();
+    let checked = diagnostic_for(&report, "W_PER_CMT_UNMATCHED").message.clone();
     let fitted = fit
         .expect("the fit evaluates this pair")
         .warnings
@@ -300,10 +275,7 @@ fn the_unmatched_entry_warning_describes_the_records_the_fit_scores() {
         .find(|w| w.starts_with("W_PER_CMT_UNMATCHED"))
         .cloned()
         .expect("the fit reports the dead per-CMT entries too");
-    assert_eq!(
-        checked, fitted,
-        "check and the fit must describe the same dataset"
-    );
+    assert_eq!(checked, fitted, "check and the fit must describe the same dataset");
 
     // Both sides come from the same producer, so the equality above pins routing
     // and not content. These literals are the content: the unfiltered read named
@@ -336,10 +308,7 @@ fn a_clause_that_matches_no_record_leaves_the_report_byte_identical() {
     ] {
         let with = normalized_report(&format!("{model}{IGNORE_NOTHING}"), csv);
         let without = normalized_report(&format!("{model}{NO_SELECTION}"), csv);
-        assert_eq!(
-            with, without,
-            "{name}: a clause matching no record is not a change of dataset"
-        );
+        assert_eq!(with, without, "{name}: a clause matching no record is not a change of dataset");
         // Both reports say something, so this is not two empty documents agreeing.
         assert!(
             with.contains(literal),
@@ -363,9 +332,7 @@ fn every_clause_kind_reaches_the_check_read() {
         "dropping subject 2 removes every CMT-2 row: {:?}",
         by_subject.diagnostics
     );
-    let subject_ofv = subject_fit
-        .expect("the fit accepts the subject-filtered dataset")
-        .ofv;
+    let subject_ofv = subject_fit.expect("the fit accepts the subject-filtered dataset").ofv;
 
     let (by_accept, accept_fit) = check_and_fit(&format!("{A_MODEL}{ACCEPT_CMT1}"), A_CSV);
     assert_eq!(
@@ -374,9 +341,7 @@ fn every_clause_kind_reaches_the_check_read() {
         "and so does keeping compartment 1 only: {:?}",
         by_accept.diagnostics
     );
-    let accept_ofv = accept_fit
-        .expect("the fit accepts the accept-filtered dataset")
-        .ofv;
+    let accept_ofv = accept_fit.expect("the fit accepts the accept-filtered dataset").ofv;
 
     // The straddle: no clause at all and both entry points reject the pair.
     let (bare, bare_fit) = check_and_fit(&format!("{A_MODEL}{NO_SELECTION}"), A_CSV);
@@ -417,17 +382,9 @@ fn a_reader_warning_is_reported_under_the_code_the_reader_wrote() {
     // compiling the clause against the dataset's columns.
     let (absent, absent_fit) = check_and_fit(&format!("{H_MODEL}{IGNORE_ABSENT_COLUMN}"), H_CSV);
     let d = diagnostic_for(&absent, "W_FILTER_COLUMN_ABSENT");
-    assert_eq!(
-        d.code, "W_FILTER_COLUMN_ABSENT",
-        "not the generic `W_DATA`: {}",
-        d.message
-    );
+    assert_eq!(d.code, "W_FILTER_COLUMN_ABSENT", "not the generic `W_DATA`: {}", d.message);
     assert!(
-        absent_fit
-            .expect("the fit evaluates this pair")
-            .warnings
-            .iter()
-            .any(|w| *w == d.message),
+        absent_fit.expect("the fit evaluates this pair").warnings.iter().any(|w| *w == d.message),
         "and it is the fit's own sentence, not a re-spelling: {}",
         d.message
     );
@@ -435,21 +392,13 @@ fn a_reader_warning_is_reported_under_the_code_the_reader_wrote() {
     // Reachable before this change, and miscoded: `warning[W_DATA]: W_MISSING_DV: …`.
     let (missing_dv, _) = check_and_fit(H_MODEL, H_MISSING_DV_CSV);
     let d = diagnostic_for(&missing_dv, "W_MISSING_DV");
-    assert_eq!(
-        d.code, "W_MISSING_DV",
-        "the code `check-report.qmd` documents: {}",
-        d.message
-    );
+    assert_eq!(d.code, "W_MISSING_DV", "the code `check-report.qmd` documents: {}", d.message);
 
     // The hand-written arm this replaces. `W_CMT_DEFAULTED` had one, so it is the
     // arm the prefix rule has to reproduce rather than merely not break.
     let (defaulted, _) = check_and_fit(H_MODEL, H_NO_CMT_CSV);
     let d = diagnostic_for(&defaulted, "W_CMT_DEFAULTED");
-    assert_eq!(
-        d.code, "W_CMT_DEFAULTED",
-        "unchanged by the prefix rule: {}",
-        d.message
-    );
+    assert_eq!(d.code, "W_CMT_DEFAULTED", "unchanged by the prefix rule: {}", d.message);
 
     // The one the first review round found: reachable from `ferx check --data` with
     // no feature gate and no clause, newly coded here (the three-arm chain relayed
@@ -458,9 +407,5 @@ fn a_reader_warning_is_reported_under_the_code_the_reader_wrote() {
     // #1495, which proposes asserting the registries instead of enumerating them.
     let (censored, _) = check_and_fit(H_MODEL, H_BAD_CENS_CSV);
     let d = diagnostic_for(&censored, "W_CENS_UNEXPECTED");
-    assert_eq!(
-        d.code, "W_CENS_UNEXPECTED",
-        "not the generic `W_DATA`: {}",
-        d.message
-    );
+    assert_eq!(d.code, "W_CENS_UNEXPECTED", "not the generic `W_DATA`: {}", d.message);
 }

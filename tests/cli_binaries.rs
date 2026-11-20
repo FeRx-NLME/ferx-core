@@ -26,12 +26,7 @@ fn generate_data_writes_all_datasets() {
         .expect("run generate_data");
     assert!(status.success(), "generate_data exited with {status:?}");
 
-    for name in [
-        "warfarin.csv",
-        "two_cpt_iv.csv",
-        "two_cpt_oral_cov.csv",
-        "mm_oral.csv",
-    ] {
+    for name in ["warfarin.csv", "two_cpt_iv.csv", "two_cpt_oral_cov.csv", "mm_oral.csv"] {
         let p = tmp.path().join("data").join(name);
         let meta = std::fs::metadata(&p)
             .unwrap_or_else(|e| panic!("expected {} to exist: {e}", p.display()));

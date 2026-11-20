@@ -25,10 +25,7 @@ fn replicate(index: usize) -> ReplicateResult {
 }
 
 fn draw(index: usize) -> Replicate {
-    Replicate {
-        index,
-        keys: vec![0, index % 3, 2],
-    }
+    Replicate { index, keys: vec![0, index % 3, 2] }
 }
 
 fn read(path: &Path) -> Vec<Vec<String>> {
@@ -43,16 +40,8 @@ fn read(path: &Path) -> Vec<Vec<String>> {
 }
 
 fn open(dir: &Path, kept: &[ReplicateResult], draws: &[Replicate]) -> Journal {
-    Journal::create(
-        dir,
-        &names(),
-        &subject_ids(),
-        None,
-        kept,
-        draws,
-        &BootstrapOptions::default(),
-    )
-    .expect("journal opens")
+    Journal::create(dir, &names(), &subject_ids(), None, kept, draws, &BootstrapOptions::default())
+        .expect("journal opens")
 }
 
 #[test]
@@ -67,10 +56,7 @@ fn a_fresh_journal_writes_only_the_two_headers() {
     assert_eq!(raw[0].last().map(String::as_str), Some("error"));
 
     // `sample_keys1.csv` names its columns; the other two draw files do not.
-    assert_eq!(
-        read(&dir.path().join("sample_keys1.csv")),
-        vec![subject_ids()]
-    );
+    assert_eq!(read(&dir.path().join("sample_keys1.csv")), vec![subject_ids()]);
     assert!(read(&dir.path().join("included_individuals1.csv")).is_empty());
     assert!(read(&dir.path().join("included_keys1.csv")).is_empty());
 }
@@ -101,19 +87,12 @@ fn appended_rows_stay_aligned_across_the_four_files() {
     for (j, index) in [3usize, 1, 2].into_iter().enumerate() {
         assert_eq!(raw[j + 1][0], index.to_string(), "raw row {j}");
         let expected = draw(index);
-        let ids: Vec<String> = expected
-            .keys
-            .iter()
-            .map(|&k| subject_ids()[k].clone())
-            .collect();
+        let ids: Vec<String> = expected.keys.iter().map(|&k| subject_ids()[k].clone()).collect();
         assert_eq!(individuals[j], ids, "included_individuals row {j}");
         let ordinals: Vec<String> = expected.keys.iter().map(|&k| (k + 1).to_string()).collect();
         assert_eq!(keys[j], ordinals, "included_keys row {j}");
-        let n: Vec<String> = expected
-            .counts(subject_ids().len())
-            .iter()
-            .map(|c| c.to_string())
-            .collect();
+        let n: Vec<String> =
+            expected.counts(subject_ids().len()).iter().map(|c| c.to_string()).collect();
         assert_eq!(counts[j + 1], n, "sample_keys row {j}");
     }
 }
@@ -168,12 +147,9 @@ fn reopening_rewrites_the_kept_rows_over_a_damaged_file() {
     assert!(raw.iter().all(|r| r.len() == raw[0].len()), "{raw:?}");
     assert_eq!(read(&dir.path().join("included_keys1.csv")).len(), 2);
     // The rewrite went through temp siblings; none of them are left behind.
-    for name in [
-        "raw_results.csv",
-        "included_individuals1.csv",
-        "included_keys1.csv",
-        "sample_keys1.csv",
-    ] {
+    for name in
+        ["raw_results.csv", "included_individuals1.csv", "included_keys1.csv", "sample_keys1.csv"]
+    {
         let part = dir.path().join(format!("{name}.part"));
         assert!(!part.exists(), "{} left behind", part.display());
     }
@@ -194,10 +170,7 @@ fn the_headers_reach_disk_before_the_first_append() {
     let raw = read(&dir.path().join("raw_results.csv"));
     assert_eq!(raw.len(), 1, "header on disk already: {raw:?}");
     assert_eq!(raw[0][0], "sample");
-    assert_eq!(
-        read(&dir.path().join("sample_keys1.csv")),
-        vec![subject_ids()]
-    );
+    assert_eq!(read(&dir.path().join("sample_keys1.csv")), vec![subject_ids()]);
 
     journal.into_result().expect("no write error");
 }
@@ -234,10 +207,7 @@ fn a_failed_reopen_leaves_the_previous_files_intact() {
     assert!(err.contains("included_keys1.csv.part"), "{err}");
 
     assert_eq!(std::fs::read_to_string(&raw_path).expect("read"), before);
-    assert!(
-        !dir.path().join("raw_results.csv.part").exists(),
-        "the temp siblings are cleaned up"
-    );
+    assert!(!dir.path().join("raw_results.csv.part").exists(), "the temp siblings are cleaned up");
 }
 
 /// `--keep-covariance` and `--dofv` widen the row. The journal has to use the
@@ -246,21 +216,10 @@ fn a_failed_reopen_leaves_the_previous_files_intact() {
 #[test]
 fn the_column_shape_follows_the_options() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let options = BootstrapOptions {
-        keep_covariance: true,
-        dofv: true,
-        ..BootstrapOptions::default()
-    };
-    let journal = Journal::create(
-        dir.path(),
-        &names(),
-        &subject_ids(),
-        None,
-        &[],
-        &[],
-        &options,
-    )
-    .expect("journal opens");
+    let options =
+        BootstrapOptions { keep_covariance: true, dofv: true, ..BootstrapOptions::default() };
+    let journal = Journal::create(dir.path(), &names(), &subject_ids(), None, &[], &[], &options)
+        .expect("journal opens");
     let mut r = replicate(1);
     r.standard_errors = Some(vec![Some(0.1), None]);
     r.delta_ofv = Some(2.5);
@@ -273,10 +232,7 @@ fn the_column_shape_follows_the_options() {
     assert_eq!(raw[1].len(), raw[0].len());
     // The unreported SE is an empty cell, not a zero: it must come back as
     // `None` so the column stays aligned with its name.
-    let se_v = raw[0]
-        .iter()
-        .position(|h| h == "se_V")
-        .expect("se_V column");
+    let se_v = raw[0].iter().position(|h| h == "se_V").expect("se_V column");
     assert_eq!(raw[1][se_v], "");
 }
 

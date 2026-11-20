@@ -59,11 +59,7 @@ const NM_SE_TVV: f64 = 1.76021;
 const NM_SE_SIGMA_SD: f64 = 0.0182395;
 
 fn anchor_opts(outer_maxiter: usize) -> FitOptions {
-    FitOptions {
-        outer_maxiter,
-        run_covariance_step: false,
-        ..Default::default()
-    }
+    FitOptions { outer_maxiter, run_covariance_step: false, ..Default::default() }
 }
 
 /// Evaluate ferx's objective **at NONMEM's optimum** and require it to reproduce
@@ -81,10 +77,7 @@ fn anchor_opts(outer_maxiter: usize) -> FitOptions {
 fn ofv_at_nonmem_optimum_matches_nonmem_objv() {
     let parsed = parse_full_model_file(Path::new(MODEL)).expect("pooled example must parse");
     let model = parsed.model;
-    assert_eq!(
-        model.n_eta, 0,
-        "the anchor model must carry no random effects"
-    );
+    assert_eq!(model.n_eta, 0, "the anchor model must carry no random effects");
 
     let mut params = model.default_params.clone();
     params.theta[0] = NM_TVCL;
@@ -122,10 +115,7 @@ fn ofv_at_nonmem_optimum_matches_nonmem_objv() {
 /// Slow-gated: this is a real convergence loop. The evaluation-only test above is
 /// what runs on every PR.
 #[test]
-#[cfg_attr(
-    not(feature = "slow-tests"),
-    ignore = "slow: opt in with --features slow-tests"
-)]
+#[cfg_attr(not(feature = "slow-tests"), ignore = "slow: opt in with --features slow-tests")]
 fn converged_estimates_match_nonmem_naive_pooled_run() {
     let parsed = parse_full_model_file(Path::new(MODEL)).expect("pooled example must parse");
     let model = parsed.model;
@@ -134,28 +124,13 @@ fn converged_estimates_match_nonmem_naive_pooled_run() {
         .expect("naive-pooled fit must return Ok");
 
     assert!(res.converged, "fit must converge");
-    assert!(
-        (res.ofv - NM_OBJV).abs() < 1e-3,
-        "OFV {} vs NONMEM {}",
-        res.ofv,
-        NM_OBJV
-    );
+    assert!((res.ofv - NM_OBJV).abs() < 1e-3, "OFV {} vs NONMEM {}", res.ofv, NM_OBJV);
     // NONMEM ran SIGDIGITS=4, so it reports five figures; compare on relative
     // error at that precision rather than an absolute band that would mean
     // something different for TVCL (~5) than for TVV (~53).
     let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
-    assert!(
-        rel(res.theta[0], NM_TVCL) < 1e-3,
-        "TVCL {} vs NONMEM {}",
-        res.theta[0],
-        NM_TVCL
-    );
-    assert!(
-        rel(res.theta[1], NM_TVV) < 1e-3,
-        "TVV {} vs NONMEM {}",
-        res.theta[1],
-        NM_TVV
-    );
+    assert!(rel(res.theta[0], NM_TVCL) < 1e-3, "TVCL {} vs NONMEM {}", res.theta[0], NM_TVCL);
+    assert!(rel(res.theta[1], NM_TVV) < 1e-3, "TVV {} vs NONMEM {}", res.theta[1], NM_TVV);
     assert!(
         rel(res.sigma[0], NM_SIGMA_SD) < 1e-3,
         "PROP_ERR (sd) {} vs NONMEM {}",
@@ -191,10 +166,7 @@ fn covariance_step_at_nonmem_optimum_matches_nonmem_rsr_standard_errors() {
 
     let parsed = parse_full_model_file(Path::new(MODEL)).expect("pooled example must parse");
     let model = parsed.model;
-    assert_eq!(
-        model.n_eta, 0,
-        "the anchor model must carry no random effects"
-    );
+    assert_eq!(model.n_eta, 0, "the anchor model must carry no random effects");
 
     let mut params = model.default_params.clone();
     params.theta[0] = NM_TVCL;
@@ -224,14 +196,8 @@ fn covariance_step_at_nonmem_optimum_matches_nonmem_rsr_standard_errors() {
         res.se_omega
     );
 
-    let se_theta = res
-        .se_theta
-        .as_ref()
-        .expect("theta SEs must be produced at n_eta = 0");
-    let se_sigma = res
-        .se_sigma
-        .as_ref()
-        .expect("sigma SEs must be produced at n_eta = 0");
+    let se_theta = res.se_theta.as_ref().expect("theta SEs must be produced at n_eta = 0");
+    let se_sigma = res.se_sigma.as_ref().expect("sigma SEs must be produced at n_eta = 0");
 
     // Observed at the time of writing: 2.0e-6 (TVCL), 7.6e-6 (TVV), 2.7e-6 (sigma)
     // — an order of magnitude closer than the *converged*-fit comparison in

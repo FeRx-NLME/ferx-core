@@ -97,9 +97,7 @@ fn bounds_num(bounds: &Punctuated<syn::TypeParamBound, Token![+]>) -> bool {
 }
 
 fn generics_num(g: &syn::Generics) -> bool {
-    g.params
-        .iter()
-        .any(|p| matches!(p, syn::GenericParam::Type(t) if bounds_num(&t.bounds)))
+    g.params.iter().any(|p| matches!(p, syn::GenericParam::Type(t) if bounds_num(&t.bounds)))
         || g.where_clause.as_ref().is_some_and(|w| {
             w.predicates
                 .iter()
@@ -167,10 +165,7 @@ fn nonrec_when(cond: &Expr, truth: bool, al: &[String]) -> bool {
 fn block_diverges(b: &syn::Block) -> bool {
     matches!(
         b.stmts.last(),
-        Some(syn::Stmt::Expr(
-            Expr::Return(_) | Expr::Break(_) | Expr::Continue(_),
-            _
-        ))
+        Some(syn::Stmt::Expr(Expr::Return(_) | Expr::Break(_) | Expr::Continue(_), _))
     )
 }
 
@@ -182,17 +177,10 @@ fn doc_non_recording(attrs: &[syn::Attribute]) -> bool {
         let syn::Meta::NameValue(nv) = &a.meta else {
             return false;
         };
-        let syn::Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Str(s),
-            ..
-        }) = &nv.value
-        else {
+        let syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Str(s), .. }) = &nv.value else {
             return false;
         };
-        s.value()
-            .trim()
-            .strip_prefix("Non-recording:")
-            .is_some_and(|r| !r.trim().is_empty())
+        s.value().trim().strip_prefix("Non-recording:").is_some_and(|r| !r.trim().is_empty())
     })
 }
 
@@ -220,9 +208,7 @@ impl Linter<'_> {
             comment(n)
                 .and_then(|c| c.text.as_deref())
                 .and_then(|t| {
-                    t.trim_start_matches(['/', '!'])
-                        .trim_start()
-                        .strip_prefix("value-read-ok:")
+                    t.trim_start_matches(['/', '!']).trim_start().strip_prefix("value-read-ok:")
                 })
                 .is_some_and(|r| !r.trim().is_empty())
         })
@@ -231,10 +217,7 @@ impl Linter<'_> {
     fn report(&mut self, first: usize, last: usize, what: &str) {
         // A function *named* like the read is the primitive itself (`DualT::probe_value`
         // delegating to its base): its callers are what the rule lints.
-        let is_primitive = self
-            .path
-            .last()
-            .is_some_and(|f| READS.contains(&f.as_str()));
+        let is_primitive = self.path.last().is_some_and(|f| READS.contains(&f.as_str()));
         if self.test_depth > 0 || self.nonrec > 0 || is_primitive || self.marked(first, last) {
             return;
         }
@@ -301,11 +284,8 @@ impl<'ast> Visit<'ast> for Linter<'_> {
 
     fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
         let own = NUM_TRAITS.contains(&i.ident.to_string().as_str());
-        let t = self.enter(
-            format!("trait {}", i.ident),
-            &i.attrs,
-            own || generics_num(&i.generics),
-        );
+        let t =
+            self.enter(format!("trait {}", i.ident), &i.attrs, own || generics_num(&i.generics));
         visit::visit_item_trait(self, i);
         self.leave(t);
     }
@@ -362,9 +342,7 @@ impl<'ast> Visit<'ast> for Linter<'_> {
             s.visit_block(&i.then_branch)
         });
         if let Some((_, e)) = &i.else_branch {
-            self.with_nonrec(nonrec_when(&i.cond, false, &self.aliases), |s| {
-                s.visit_expr(e)
-            });
+            self.with_nonrec(nonrec_when(&i.cond, false, &self.aliases), |s| s.visit_expr(e));
         }
     }
 
@@ -383,11 +361,7 @@ impl<'ast> Visit<'ast> for Linter<'_> {
         {
             let first = m.method.span().start().line;
             let last = m.span().end().line.max(first);
-            self.report(
-                first,
-                last,
-                &format!("`.{}()` on a number-type value", m.method),
-            );
+            self.report(first, last, &format!("`.{}()` on a number-type value", m.method));
         }
         visit::visit_expr_method_call(self, m);
     }
@@ -398,11 +372,7 @@ impl<'ast> Visit<'ast> for Linter<'_> {
             let last = segs.last().map(|s| s.ident.to_string()).unwrap_or_default();
             if READS.contains(&last.as_str()) && self.in_generic() {
                 let line = p.span().start().line;
-                self.report(
-                    line,
-                    p.span().end().line.max(line),
-                    &format!("`{last}` path"),
-                );
+                self.report(line, p.span().end().line.max(line), &format!("`{last}` path"));
             }
         }
         visit::visit_expr_path(self, p);

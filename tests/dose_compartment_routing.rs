@@ -141,10 +141,7 @@ fn fit_rejects_an_unroutable_infusion() {
         err.contains("compartment 0") && err.contains("two_cpt_oral"),
         "error should name the offending compartment and model: {err}"
     );
-    assert!(
-        err.contains("[1, 2, 3]"),
-        "error should name the infusable compartments: {err}"
-    );
+    assert!(err.contains("[1, 2, 3]"), "error should name the infusable compartments: {err}");
 }
 
 /// The original #375 repro now **predicts** instead of aborting: an infusion into
@@ -192,8 +189,7 @@ fn predict_errs_before_reaching_the_event_driven_walk() {
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
     assert!(
-        err.to_string()
-            .contains("subject 1, time 0: infusion into compartment 0"),
+        err.to_string().contains("subject 1, time 0: infusion into compartment 0"),
         "unexpected Err: {err}"
     );
 }
@@ -205,8 +201,7 @@ fn simulate_errs_before_reaching_the_event_driven_walk() {
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
     assert!(
-        err.to_string()
-            .contains("subject 1, time 0: infusion into compartment 0"),
+        err.to_string().contains("subject 1, time 0: infusion into compartment 0"),
         "unexpected Err: {err}"
     );
 }
@@ -216,10 +211,7 @@ fn simulate_errs_before_reaching_the_event_driven_walk() {
 #[test]
 fn central_and_depot_infusions_still_predict_on_the_event_driven_walk() {
     let model = model_of(TWO_CPT_ORAL);
-    for (label, csv) in [
-        ("central", central_infusion_csv()),
-        ("depot", depot_infusion_csv()),
-    ] {
+    for (label, csv) in [("central", central_infusion_csv()), ("depot", depot_infusion_csv())] {
         let pop = pop_of(&csv);
         assert!(
             check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
@@ -256,9 +248,7 @@ fn a_zero_amount_out_of_range_dose_is_rejected_not_panicked() {
     ));
     let diags = check_model_data(&model, &pop);
     assert!(
-        diags
-            .iter()
-            .any(|d| d.is_error() && d.code == "E_DOSE_CMT_OUT_OF_RANGE"),
+        diags.iter().any(|d| d.is_error() && d.code == "E_DOSE_CMT_OUT_OF_RANGE"),
         "a zero-amount dose into compartment 9 of a 3-state model must be rejected \
          by the range rule, which applies regardless of amount; got {diags:?}"
     );
@@ -332,10 +322,8 @@ fn pure_tte_subject_is_not_validated_against_the_placeholder_pk_model() {
     // Loaded routed (#1199): the model-blind reader would leave that event in the
     // Gaussian grid, and `check_model_data` now rejects such a population before
     // any dose-compartment check runs.
-    let pop = pop_of_routed(
-        &model,
-        "ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n",
-    );
+    let pop =
+        pop_of_routed(&model, "ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
     assert!(pop.subjects[0].obs_times.is_empty());
     let diags = check_model_data(&model, &pop);
     assert!(
@@ -365,11 +353,7 @@ fn a_record_row_does_not_make_a_pure_tte_subject_a_pk_subject() {
          2,0,.,1,100,2,1,70\n2,2,.,2,.,2,1,80\n2,3,.,0,.,2,1,90\n2,5,1,0,.,2,0,90\n",
     );
     for s in &pop.subjects {
-        assert!(
-            s.obs_times.is_empty(),
-            "subject {}: no Gaussian observation",
-            s.id
-        );
+        assert!(s.obs_times.is_empty(), "subject {}: no Gaussian observation", s.id);
         assert_eq!(
             s.pk_only_times,
             vec![2.0, 3.0, 5.0],
@@ -479,11 +463,7 @@ fn pk_value_path_still_declines_a_model_blind_tte_subject_with_nan() {
     assert!(v[0].is_nan(), "declined row must be NaN, got {}", v[0]);
     let v = ferx_core::pk::predict_iov(&model, subj, theta, &eta, &[]);
     assert_eq!(v.len(), 1);
-    assert!(
-        v[0].is_nan(),
-        "IOV twin must decline the same way, got {}",
-        v[0]
-    );
+    assert!(v[0].is_nan(), "IOV twin must decline the same way, got {}", v[0]);
 }
 
 #[cfg(feature = "survival")]
@@ -498,10 +478,7 @@ fn pure_tte_high_cmt_dose_predict_refuses_the_model_blind_load() {
     );
     let err =
         predict(&model, &pop, &model.default_params).expect_err("predict() must refuse this input");
-    assert!(
-        err.to_string().contains("E_ENDPOINT_UNROUTED"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
 }
 
 /// `simulate()` on the same model-blind population. #905 pinned "one row with a NaN
@@ -516,10 +493,7 @@ fn pure_tte_high_cmt_dose_simulate_refuses_the_model_blind_load() {
     assert_eq!(pop.subjects[0].obs_times, vec![5.0]);
     let err = simulate(&model, &pop, &model.default_params, 1)
         .expect_err("simulate() must refuse this input");
-    assert!(
-        err.to_string().contains("E_ENDPOINT_UNROUTED"),
-        "unexpected Err: {err}"
-    );
+    assert!(err.to_string().contains("E_ENDPOINT_UNROUTED"), "unexpected Err: {err}");
 }
 
 /// `fit()` on the model-blind population. #905's contract was "no panic" with a
@@ -533,10 +507,7 @@ fn pure_tte_high_cmt_dose_simulate_refuses_the_model_blind_load() {
 fn pure_tte_high_cmt_dose_fit_refuses_the_model_blind_load() {
     let model = model_of(TTE_ONLY);
     let pop = pop_of("ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
-    let opts = FitOptions {
-        outer_maxiter: 1,
-        ..FitOptions::default()
-    };
+    let opts = FitOptions { outer_maxiter: 1, ..FitOptions::default() };
     let err = fit(&model, &pop, &model.default_params, &opts)
         .expect_err("a model-blind load of a TTE model is refused")
         .to_string();
@@ -567,10 +538,7 @@ fn pure_tte_high_cmt_dose_is_safe_through_the_routed_loader() {
         "the TTE row is routed to obs_records, not the Gaussian grid"
     );
     let preds = predict(&model, &pop, &model.default_params).unwrap();
-    assert!(
-        preds.is_empty(),
-        "no Gaussian rows remain to predict on the routed load: {preds:?}"
-    );
+    assert!(preds.is_empty(), "no Gaussian rows remain to predict on the routed load: {preds:?}");
 }
 
 /// **Over-fire guard** (#905). The gate must NOT decline a subject that *does* carry a
@@ -636,17 +604,11 @@ const TTE_ONLY_IOV: &str = r#"
 fn pure_tte_iov_high_cmt_dose_simulates_without_panicking() {
     let model = model_of(TTE_ONLY_IOV);
     assert_eq!(model.n_kappa, 1, "fixture must exercise the IOV funnel");
-    let pop = pop_of_routed(
-        &model,
-        "ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n",
-    );
+    let pop =
+        pop_of_routed(&model, "ID,TIME,DV,EVID,AMT,CMT,MDV\n1,0,.,1,100,2,1\n1,5,1,0,.,2,0\n");
     assert!(pop.subjects[0].obs_times.is_empty());
     let sim = simulate(&model, &pop, &model.default_params, 1).unwrap();
-    assert_eq!(
-        sim.len(),
-        1,
-        "IOV simulate returns one event row without panicking"
-    );
+    assert_eq!(sim.len(), 1, "IOV simulate returns one event row without panicking");
 }
 
 /// IOV gradient twin. #924 fenced the model-blind load (TTE rows in `obs_times`,
@@ -659,14 +621,9 @@ fn pure_tte_iov_high_cmt_dose_simulates_without_panicking() {
 #[test]
 fn pure_tte_iov_high_cmt_dose_fit_refuses_the_model_blind_load() {
     let model = model_of(TTE_ONLY_IOV);
-    let pop = pop_of_iov(
-        "ID,TIME,DV,EVID,AMT,CMT,MDV,OCC\n1,0,.,1,100,2,1,1\n1,5,1,0,.,2,0,1\n",
-        "OCC",
-    );
-    let opts = FitOptions {
-        outer_maxiter: 1,
-        ..FitOptions::default()
-    };
+    let pop =
+        pop_of_iov("ID,TIME,DV,EVID,AMT,CMT,MDV,OCC\n1,0,.,1,100,2,1,1\n1,5,1,0,.,2,0,1\n", "OCC");
+    let opts = FitOptions { outer_maxiter: 1, ..FitOptions::default() };
     let err = fit(&model, &pop, &model.default_params, &opts)
         .expect_err("a model-blind IOV load of a TTE model is refused")
         .to_string();
@@ -685,18 +642,14 @@ fn pure_tte_iov_high_cmt_dose_fit_refuses_the_model_blind_load() {
 #[test]
 fn a_bolus_into_the_peripheral_is_computed_in_the_peripheral() {
     let model = model_of(TWO_CPT_ORAL);
-    let pop = pop_of(&format!(
-        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,3,0,1,70\n{OBS_ROWS}"
-    ));
+    let pop =
+        pop_of(&format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,3,0,1,70\n{OBS_ROWS}"));
     assert!(
         check_model_data(&model, &pop).iter().all(|d| !d.is_error()),
         "a peripheral bolus must stay accepted"
     );
-    let preds: Vec<f64> = predict(&model, &pop, &model.default_params)
-        .unwrap()
-        .into_iter()
-        .map(|p| p.pred)
-        .collect();
+    let preds: Vec<f64> =
+        predict(&model, &pop, &model.default_params).unwrap().into_iter().map(|p| p.pred).collect();
     // The TV covariate in TWO_CPT_ORAL scales CL, so these are not the bare
     // NONMEM numbers; what matters is that the dose landed in the peripheral —
     // a peripheral bolus rises from ~0 as it redistributes, where a depot dose
@@ -763,9 +716,7 @@ fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
     // Dose into CMT=2 (central) — not the depot the readout reconstructs.
     // The readout gate lives on the `fit()`/`predict()` boundary (alongside the
     // pre-existing reset rejection), not in `check_model_data`.
-    let bad = pop_of(&format!(
-        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,2,0,1,70\n{obs}"
-    ));
+    let bad = pop_of(&format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,2,0,1,70\n{obs}"));
     let err = fit(&model, &bad, &model.default_params, &FitOptions::default())
         .expect_err("a depot readout with a CMT=2 bolus must be an Err, not a mis-prediction")
         .to_string();
@@ -776,9 +727,7 @@ fn depot_readout_with_a_non_default_dose_compartment_is_rejected() {
 
     // Control: the same model dosing the depot is unaffected. `maxiter = 0` makes
     // this an evaluation-only run, so the test still returns immediately (Tier 2).
-    let good = pop_of(&format!(
-        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,1,0,1,70\n{obs}"
-    ));
+    let good = pop_of(&format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,WT\n1,0,.,1,100,1,0,1,70\n{obs}"));
     fit(&model, &good, &model.default_params, &FitOptions::default())
         .expect("a depot readout dosing the depot must stay accepted");
 }
@@ -897,15 +846,9 @@ fn an_ode_cmt_zero_bolus_predicts_like_cmt_one() {
     let zero = predict(&model, &pop_of(&ode_csv(0)), &model.default_params).unwrap();
     let one = predict(&model, &pop_of(&ode_csv(1)), &model.default_params).unwrap();
     assert_eq!(zero.len(), one.len());
-    assert!(
-        one.iter().all(|p| p.pred > 0.0),
-        "control must be non-trivial"
-    );
+    assert!(one.iter().all(|p| p.pred > 0.0), "control must be non-trivial");
     for (z, o) in zero.iter().zip(one.iter()) {
-        assert_eq!(
-            z.pred, o.pred,
-            "CMT=0 must dose the default compartment exactly like CMT=1"
-        );
+        assert_eq!(z.pred, o.pred, "CMT=0 must dose the default compartment exactly like CMT=1");
     }
 }
 
@@ -920,23 +863,16 @@ fn an_ode_cmt_zero_bolus_predicts_like_cmt_one() {
 fn an_out_of_range_observation_cmt_is_inert_on_a_form_c_readout() {
     let model = model_of(ODE_TWO_STATE);
     let stray_obs = "1,1,5.0,0,.,99,.,0\n1,4,4.0,0,.,99,.,0\n1,8,3.0,0,.,99,.,0\n";
-    let stray = pop_of(&format!(
-        "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,0,1\n{stray_obs}"
-    ));
+    let stray =
+        pop_of(&format!("ID,TIME,DV,EVID,AMT,CMT,RATE,MDV\n1,0,.,1,100,1,0,1\n{stray_obs}"));
     let normal = pop_of(&ode_csv(1));
 
     let a = predict(&model, &stray, &model.default_params).unwrap();
     let b = predict(&model, &normal, &model.default_params).unwrap();
     assert_eq!(a.len(), b.len());
-    assert!(
-        b.iter().all(|p| p.pred > 0.0),
-        "control must be non-trivial"
-    );
+    assert!(b.iter().all(|p| p.pred > 0.0), "control must be non-trivial");
     for (x, y) in a.iter().zip(b.iter()) {
-        assert_eq!(
-            x.pred, y.pred,
-            "a Form C readout must ignore the observation's CMT entirely"
-        );
+        assert_eq!(x.pred, y.pred, "a Form C readout must ignore the observation's CMT entirely");
     }
 }
 

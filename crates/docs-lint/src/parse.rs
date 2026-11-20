@@ -94,10 +94,7 @@ fn div_marker(line: &str) -> Option<(usize, String)> {
 /// in these docs: `::: {.callout-note}` and the bare `::: callout-note`.
 fn opens_callout(attrs: &str) -> bool {
     attrs.contains(".callout-")
-        || attrs
-            .split_whitespace()
-            .next()
-            .is_some_and(|w| w.starts_with("callout-"))
+        || attrs.split_whitespace().next().is_some_and(|w| w.starts_with("callout-"))
 }
 
 /// One open fenced div.
@@ -205,11 +202,7 @@ pub fn parse_file(path: &Path, root: &Path) -> std::io::Result<Doc> {
 
 pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
     let lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let rel = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
 
     let mut body_start = 0;
     let mut i = 0;
@@ -273,10 +266,7 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
                 divs.pop();
             } else {
                 mark_content(&mut divs);
-                divs.push(DivFrame {
-                    callout: opens_callout(&attrs),
-                    awaiting_first_block: true,
-                });
+                divs.push(DivFrame { callout: opens_callout(&attrs), awaiting_first_block: true });
             }
             pending_disable.clear();
             for id in explicit_ids_in_line(line) {
@@ -305,10 +295,7 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
                 // `docs/estimation/saem.qmd` has one — so this is the first
                 // block, not any heading in a callout.
                 let raw = rest.trim();
-                if divs
-                    .last()
-                    .is_some_and(|f| f.callout && f.awaiting_first_block)
-                {
+                if divs.last().is_some_and(|f| f.callout && f.awaiting_first_block) {
                     // The title still *spends* its identifier. Pandoc's reader
                     // assigns auto-identifiers before Quarto's callout filter
                     // drops the header, so a later `## Dup` on a page whose
@@ -348,23 +335,12 @@ pub fn parse_str(text: &str, path: &Path, root: &Path) -> Doc {
             all_ids.insert(id);
         }
         for target in links_in_line(&strip_code_spans(line)) {
-            links.push(Link {
-                line: i + 1,
-                target,
-            });
+            links.push(Link { line: i + 1, target });
         }
         i += 1;
     }
 
-    Doc {
-        path: path.to_path_buf(),
-        rel,
-        lines,
-        body_start,
-        headings,
-        links,
-        ids: all_ids,
-    }
+    Doc { path: path.to_path_buf(), rel, lines, body_start, headings, links, ids: all_ids }
 }
 
 /// Every `.qmd` under `dir`, excluding the generated `_site/` tree, sorted.

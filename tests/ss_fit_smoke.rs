@@ -96,11 +96,7 @@ fn fit_runs_on_ss_oral_dataset() {
     // Convergence check: the outer optimiser must flag convergence, not
     // just exit on iteration-limit. Without this, a regression that
     // produces wildly biased but recoverable estimates could slip through.
-    assert!(
-        result.converged,
-        "SS fit did not converge (final OFV = {})",
-        result.ofv
-    );
+    assert!(result.converged, "SS fit did not converge (final OFV = {})", result.ofv);
 
     let theta = &result.theta;
     assert_eq!(theta.len(), 3);
@@ -108,11 +104,7 @@ fn fit_runs_on_ss_oral_dataset() {
         assert!(v.is_finite(), "theta[{}] = {} is not finite", i, v);
         assert!(*v > 0.0, "theta[{}] = {} is non-positive", i, v);
     }
-    assert!(
-        result.ofv.is_finite(),
-        "OFV = {} should be finite",
-        result.ofv
-    );
+    assert!(result.ofv.is_finite(), "OFV = {} should be finite", result.ofv);
 
     // Truth: TVCL=2.0, TVV=20.0, TVKA=1.5. The initials above are
     // 1.5-2x off truth in each direction, so these tolerances do

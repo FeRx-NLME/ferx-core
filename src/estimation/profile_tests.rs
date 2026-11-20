@@ -44,10 +44,7 @@ fn temp(name: &str) -> PathBuf {
 /// `model` on `data`, keeping the studies `<= max_study` when given; `edit` rewrites the
 /// model text first.
 fn prep(
-    model: &str,
-    data: &str,
-    max_study: Option<usize>,
-    edit: impl Fn(String) -> String,
+    model: &str, data: &str, max_study: Option<usize>, edit: impl Fn(String) -> String,
 ) -> crate::api::PreparedRun {
     let text = edit(std::fs::read_to_string(root().join(model)).unwrap());
     let model_path = temp("model.ferx");
@@ -60,10 +57,7 @@ fn prep(
             Some(n) => {
                 let mut lines = csv.lines();
                 let header = lines.next().unwrap();
-                let col = header
-                    .split(',')
-                    .position(|c| c.trim_matches('"') == "STUDY")
-                    .unwrap();
+                let col = header.split(',').position(|c| c.trim_matches('"') == "STUDY").unwrap();
                 std::iter::once(header)
                     .chain(lines.filter(|l| {
                         l.split(',').nth(col).unwrap().parse::<f64>().unwrap() <= n as f64
@@ -73,10 +67,8 @@ fn prep(
             }
         };
     std::fs::write(&data_path, kept).unwrap();
-    let run = crate::api::prepare_run(
-        model_path.to_str().unwrap(),
-        Some(data_path.to_str().unwrap()),
-    );
+    let run =
+        crate::api::prepare_run(model_path.to_str().unwrap(), Some(data_path.to_str().unwrap()));
     // The run holds what it read: the files go before any assertion can leave them behind.
     for p in [&model_path, &data_path] {
         let _ = std::fs::remove_file(p);
@@ -85,16 +77,11 @@ fn prep(
 }
 
 fn options(p: &crate::api::PreparedRun) -> FitOptions {
-    FitOptions {
-        verbose: false,
-        ..p.parsed.fit_options.clone()
-    }
+    FitOptions { verbose: false, ..p.parsed.fit_options.clone() }
 }
 
 fn ctx<'a>(
-    p: &'a crate::api::PreparedRun,
-    layout: &'a ProfileLayout,
-    options: &'a FitOptions,
+    p: &'a crate::api::PreparedRun, layout: &'a ProfileLayout, options: &'a FitOptions,
 ) -> ProfileCtx<'a> {
     ProfileCtx {
         model: &p.parsed.model,
@@ -158,9 +145,8 @@ fn oracle_min_of(f: impl Fn(&[f64]) -> f64, start: &[f64]) -> (f64, Vec<f64>) {
     let chol = h.cholesky().expect("oracle Hessian PD");
     for _ in 0..60 {
         let hg = 1e-4;
-        let g: Vec<f64> = (0..n)
-            .map(|j| (at(&b, &[(j, hg)]) - at(&b, &[(j, -hg)])) / (2.0 * hg))
-            .collect();
+        let g: Vec<f64> =
+            (0..n).map(|j| (at(&b, &[(j, hg)]) - at(&b, &[(j, -hg)])) / (2.0 * hg)).collect();
         let step = chol.solve(&DVector::from_vec(g));
         for j in 0..n {
             b[j] -= step[j];
@@ -189,20 +175,15 @@ fn frozen_levels(c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64]) ->
         for (&k, &v) in c.layout.coords.iter().zip(&b) {
             p.theta[k] = v;
         }
-        let states: Vec<SubjectState> = (0..c.population.subjects.len())
-            .map(|i| c.resolve(i, &p, &zero))
-            .collect();
+        let states: Vec<SubjectState> =
+            (0..c.population.subjects.len()).map(|i| c.resolve(i, &p, &zero)).collect();
         // The held objective's gradient and its exact (quadratic) Newton step.
         let held = |x: &[f64]| -> f64 {
             let mut q = params.clone();
             for (&k, &v) in c.layout.coords.iter().zip(x) {
                 q.theta[k] = v;
             }
-            states
-                .iter()
-                .enumerate()
-                .map(|(i, s)| c.fit_term(i, &q, &s.eta, &s.h, &s.kappas))
-                .sum()
+            states.iter().enumerate().map(|(i, s)| c.fit_term(i, &q, &s.eta, &s.h, &s.kappas)).sum()
         };
         let h = 1e-3;
         let at = |j: usize, d: f64| {
@@ -251,27 +232,16 @@ fn a_model_linear_in_its_random_effects_profiles_in_one_newton_step() {
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
-    assert_eq!(
-        layout.groups.len(),
-        6,
-        "one group per study under sum_to_zero_within"
-    );
+    assert_eq!(layout.groups.len(), 6, "one group per study under sum_to_zero_within");
     let s = c
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
         .expect("the solve converges");
     assert!(
         s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty(),
         "N1 runs on the adjoint level gradient (#2109)"
     );
     assert_eq!(s.iterations, 1, "criterion {:.3e}", s.criterion);
-    assert!(
-        s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
-        "{}",
-        s.criterion
-    );
+    assert!(s.criterion.is_finite() && s.criterion <= PROFILE_TOL, "{}", s.criterion);
 }
 
 /// The dense oracle's minimum on F2 cut to two studies, started from the template's
@@ -329,22 +299,10 @@ fn the_profile_objective_is_the_minimum_over_the_levels() {
         frozen - o_star,
         s.iterations
     );
-    assert!(
-        s.iterations > 1,
-        "a nonlinear fixture takes more than one step"
-    );
-    assert!(
-        (s.ofv - o_star).abs() < D3_OFV_BOUND,
-        "{} vs {}",
-        s.ofv,
-        o_star
-    );
+    assert!(s.iterations > 1, "a nonlinear fixture takes more than one step");
+    assert!((s.ofv - o_star).abs() < D3_OFV_BOUND, "{} vs {}", s.ofv, o_star);
     assert!(worst_beta < D3_BETA_BOUND, "{worst_beta}");
-    assert!(
-        frozen - o_star > 10.0 * D3_OFV_BOUND,
-        "the straddle: {}",
-        frozen - o_star
-    );
+    assert!(frozen - o_star > 10.0 * D3_OFV_BOUND, "the straddle: {}", frozen - o_star);
 }
 
 /// Worst realised |ΔOFV| 1.8e-8 (N2 `ref`, macOS arm64; 6.2e-9 Linux aarch64; D3 6.1e-9
@@ -370,10 +328,7 @@ fn f1_read_as(read: &str) -> (f64, usize) {
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let s = c
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
         .unwrap_or_else(|e| panic!("{read}: {e:?}"));
     assert!(s.ofv.is_finite(), "{read}: {}", s.ofv);
     (s.ofv, s.iterations)
@@ -409,10 +364,7 @@ fn a_collected_affine_form_profiles_like_its_one_read_rewrite() {
             plain - want
         );
         assert_eq!((n_got, n_want), (1, 1), "{form}: one Newton step each");
-        assert!(
-            (got - want).abs() < COLLECTED_OFV_BOUND,
-            "{form}: {got} vs {want}"
-        );
+        assert!((got - want).abs() < COLLECTED_OFV_BOUND, "{form}: {got} vs {want}");
         assert!(
             (plain - want).abs() > 1e3 * COLLECTED_OFV_BOUND,
             "{form}: the straddle, {plain} vs {want}"
@@ -437,12 +389,8 @@ fn the_profiled_objective_is_the_unprofiled_objective_at_its_own_point() {
         let layout = layout_of(&p);
         let o = options(&p);
         let c = ctx(&p, &layout, &o);
-        let s = c
-            .solve(
-                &p.init_params,
-                &ProfileWarm::from_template(&layout, &p.init_params),
-            )
-            .unwrap();
+        let s =
+            c.solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params)).unwrap();
         let mu = compute_mu_k(c.model, &s.params.theta, o.mu_referencing);
         let (e, h, _, k) = run_inner_loop_warm_seeded(
             c.model,
@@ -498,12 +446,7 @@ fn a_frozen_level_is_an_offset() {
     let s = c.solve(&p.init_params, &warm).unwrap();
     assert_eq!(s.params.theta[k], 0.3);
     let (o_star, _) = oracle_min(&c, &p.init_params, &warm.beta);
-    assert!(
-        (s.ofv - o_star).abs() < D3_OFV_BOUND,
-        "{} vs {}",
-        s.ofv,
-        o_star
-    );
+    assert!((s.ofv - o_star).abs() < D3_OFV_BOUND, "{} vs {}", s.ofv, o_star);
 }
 
 // ── G1: the envelope gradient is the gradient of the profile objective ─────────────
@@ -516,11 +459,7 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) -> usize
     let p = prep(F2, F2_DATA, Some(3), edit);
     // A `correlation` line's blocks, as `fit()` assigns them (#2110); the other arms keep
     // `prepare_run`'s population.
-    let p = if p.parsed.model.residual_serial.is_some() {
-        scored(p)
-    } else {
-        p
-    };
+    let p = if p.parsed.model.residual_serial.is_some() { scored(p) } else { p };
     assert_eq!(
         crate::sens::provider::analytic_outer_gradient_available(&p.parsed.model),
         analytic,
@@ -530,12 +469,7 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) -> usize
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let hold = hold_template(&layout, &p.init_params);
-    let PackedStart {
-        packed: x,
-        bounds,
-        fixed,
-        ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, bounds, fixed, .. } = pack_with_bounds(&hold);
     let warm = ProfileWarm::from_template(&layout, &p.init_params);
     let s = c.solve(&unpack_params(&x, &hold), &warm).unwrap();
     // The solve's level gradient runs on the outer gradient's engine (#2109).
@@ -576,10 +510,7 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) -> usize
             "{i}: {fd} / {held} / {}",
             g[i]
         );
-        eprintln!(
-            "DBG {i}: handed {:.9e} fd {:.9e} held {:.9e}",
-            g[i], fd, held
-        );
+        eprintln!("DBG {i}: handed {:.9e} fd {:.9e} held {:.9e}", g[i], fd, held);
         worst_handed = worst_handed.max((g[i] - fd).abs() / (1.0 + fd.abs()));
         worst_identity = worst_identity.max((held - fd).abs() / (1.0 + fd.abs()));
     }
@@ -602,10 +533,8 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) -> usize
 fn the_envelope_gradient_is_the_bounded_profile_gradient_on_the_fd_engine() {
     let pinned = envelope_matches_fd(
         |t| {
-            boxed("(0.0, -10.0, 1.0)")(t).replace(
-                "  method     = focei\n",
-                "  method     = focei\n  gradient   = fd\n",
-            )
+            boxed("(0.0, -10.0, 1.0)")(t)
+                .replace("  method     = focei\n", "  method     = focei\n  gradient   = fd\n")
         },
         false,
     );
@@ -645,12 +574,7 @@ const G1_HANDED_BOUND: f64 = 5e-4;
 #[test]
 fn the_envelope_gradient_is_the_profile_gradient_on_the_fd_engine() {
     envelope_matches_fd(
-        |t| {
-            t.replace(
-                "  method     = focei\n",
-                "  method     = focei\n  gradient   = fd\n",
-            )
-        },
+        |t| t.replace("  method     = focei\n", "  method     = focei\n  gradient   = fd\n"),
         false,
     );
 }
@@ -664,10 +588,7 @@ fn the_envelope_gradient_is_the_profile_gradient_on_the_non_iov_fd_engine() {
             t.replace("  kappa KAPPA_ARM ~ 1.0\n", "")
                 .replace(" + KAPPA_ARM", "")
                 .replace("  iov_column = OCC\n", "")
-                .replace(
-                    "  method     = focei\n",
-                    "  method     = focei\n  gradient   = fd\n",
-                )
+                .replace("  method     = focei\n", "  method     = focei\n  gradient   = fd\n")
         },
         false,
     );
@@ -696,14 +617,8 @@ fn the_envelope_gradient_is_the_profile_gradient_with_a_correlation_line() {
     envelope_matches_fd(
         |t| {
             assert!(t.contains("  omega ETA_EM") && t.contains("weight = SE\n"));
-            t.replace(
-                "  omega ETA_EM",
-                "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
-            )
-            .replace(
-                "weight = SE\n",
-                "weight = SE\n  correlation car1(RHO) by OCC\n",
-            )
+            t.replace("  omega ETA_EM", "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM")
+                .replace("weight = SE\n", "weight = SE\n  correlation car1(RHO) by OCC\n")
         },
         true,
     );
@@ -726,22 +641,14 @@ fn a_bad_start_still_reaches_the_minimum() {
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
-    let bad = ProfileWarm {
-        beta: vec![BAD_START; layout.coords.len()],
-        etas: None,
-    };
+    let bad = ProfileWarm { beta: vec![BAD_START; layout.coords.len()], etas: None };
     let s = c.solve(&p.init_params, &bad).expect("the solve converges");
     let o_star = f2_oracle().0;
     eprintln!(
         "backtracking: from {BAD_START} {:.10} vs oracle {:.10} in {} steps",
         s.ofv, o_star, s.iterations
     );
-    assert!(
-        (s.ofv - o_star).abs() < D3_OFV_BOUND,
-        "{} vs {}",
-        s.ofv,
-        o_star
-    );
+    assert!((s.ofv - o_star).abs() < D3_OFV_BOUND, "{} vs {}", s.ofv, o_star);
 }
 
 const BAD_START: f64 = 20.0;
@@ -781,9 +688,7 @@ fn every_contrast_profiles_to_the_minimum() {
         let o = options(&p);
         let c = ctx(&p, &layout, &o);
         let warm = ProfileWarm::from_template(&layout, &p.init_params);
-        let s = c
-            .solve(&p.init_params, &warm)
-            .unwrap_or_else(|e| panic!("{contrast}: {e:?}"));
+        let s = c.solve(&p.init_params, &warm).unwrap_or_else(|e| panic!("{contrast}: {e:?}"));
         let o_star = if block == within {
             f2_oracle().0
         } else {
@@ -795,12 +700,7 @@ fn every_contrast_profiles_to_the_minimum() {
             s.ofv,
             o_star
         );
-        assert!(
-            (s.ofv - o_star).abs() < D3_OFV_BOUND,
-            "{contrast}: {} vs {}",
-            s.ofv,
-            o_star
-        );
+        assert!((s.ofv - o_star).abs() < D3_OFV_BOUND, "{contrast}: {} vs {}", s.ofv, o_star);
     }
 }
 
@@ -828,10 +728,7 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
     let layout = layout_of(&p);
     let mut params = p.init_params.clone();
     params.theta[layout.coords[0]] = f64::NAN;
-    let o = FitOptions {
-        covariance_method: CovarianceMethod::Hessian,
-        ..options(&p)
-    };
+    let o = FitOptions { covariance_method: CovarianceMethod::Hessian, ..options(&p) };
     let out = replay_covariance(
         &p.parsed.model,
         &p.population,
@@ -844,10 +741,7 @@ fn a_failed_replay_solve_is_a_covariance_failure() {
     .expect("F1 profiles a level block")
     .0;
     assert!(out.matrix.is_none());
-    assert_eq!(
-        out.warnings,
-        vec![profile_solve_failed_msg(&ProfileFailure::NonFinite)]
-    );
+    assert_eq!(out.warnings, vec![profile_solve_failed_msg(&ProfileFailure::NonFinite)]);
     let w = crate::types::classify_warning(&out.warnings[0]);
     assert_eq!(
         (w.severity, w.category.as_str()),
@@ -915,11 +809,7 @@ fn a_guarded_covariance_resolve_fails_the_step() {
     assert!(guarded.wall_time_secs > 0.0);
 
     let passed = run(1.0);
-    assert!(
-        !passed.warnings.iter().any(|w| w.contains("EBE guard")),
-        "{:?}",
-        passed.warnings
-    );
+    assert!(!passed.warnings.iter().any(|w| w.contains("EBE guard")), "{:?}", passed.warnings);
 }
 
 /// The guard's warning names the trigger that fired, over both cells of its input space
@@ -960,9 +850,7 @@ fn the_guarded_resolve_warning_names_the_trigger_that_fired() {
 /// step failed with `profile_solve_failed_msg`'s text, and the time it spent, not `0.0`.
 #[test]
 fn a_failed_inline_resolve_fails_the_fit_covariance_step() {
-    let p = prep(F1, F1_DATA, Some(2), |t| {
-        t.replace("TVE0", FAIL_COVARIANCE_RESOLVE)
-    });
+    let p = prep(F1, F1_DATA, Some(2), |t| t.replace("TVE0", FAIL_COVARIANCE_RESOLVE));
     let o = FitOptions {
         outer_maxiter: 0,
         run_covariance_step: true,
@@ -977,11 +865,7 @@ fn a_failed_inline_resolve_fails_the_fit_covariance_step() {
     assert_eq!(f.covariance_status, crate::types::CovarianceStatus::Failed);
     let msg = "Covariance step failed: the profile solve did not converge at the estimates \
                (Singular). SE estimates not available.";
-    assert!(
-        f.warnings.iter().any(|w| w.contains(msg)),
-        "{:?}",
-        f.warnings
-    );
+    assert!(f.warnings.iter().any(|w| w.contains(msg)), "{:?}", f.warnings);
     assert!(f.covariance_wall_time_secs > 0.0);
 }
 
@@ -1003,21 +887,12 @@ fn a_profiled_gradient_fit_stops_on_its_own_ftol() {
         assert_eq!(profiled_ftol(algo, model, &o), PROFILED_GRADIENT_FTOL_REL);
     }
     assert!(PROFILED_GRADIENT_FTOL_REL < unprofiled);
-    assert_eq!(
-        profiled_ftol(nlopt::Algorithm::Bobyqa, model, &o),
-        unprofiled
-    );
-    let user = FitOptions {
-        outer_ftol: Some(3e-7),
-        ..o.clone()
-    };
+    assert_eq!(profiled_ftol(nlopt::Algorithm::Bobyqa, model, &o), unprofiled);
+    let user = FitOptions { outer_ftol: Some(3e-7), ..o.clone() };
     for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Bobyqa] {
         assert_eq!(profiled_ftol(algo, model, &user), 3e-7);
     }
-    assert!(
-        matches!(profiled_algorithm(&o), nlopt::Algorithm::Lbfgs),
-        "auto"
-    );
+    assert!(matches!(profiled_algorithm(&o), nlopt::Algorithm::Lbfgs), "auto");
 }
 
 /// #2285: every leg of a profiled gradient fit runs at `xtol_rel ≤`
@@ -1029,14 +904,8 @@ fn a_profiled_gradient_fit_stops_on_its_own_ftol() {
 fn a_profiled_gradient_fit_caps_its_xtol() {
     let default = FitOptions::default();
     assert_eq!(default.outer_xtol, 1e-4, "the default this caps moved");
-    let looser = FitOptions {
-        outer_xtol: 1e-2,
-        ..FitOptions::default()
-    };
-    let tighter = FitOptions {
-        outer_xtol: 1e-9,
-        ..FitOptions::default()
-    };
+    let looser = FitOptions { outer_xtol: 1e-2, ..FitOptions::default() };
+    let tighter = FitOptions { outer_xtol: 1e-9, ..FitOptions::default() };
     for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Slsqp] {
         assert_eq!(profiled_xtol(algo, &default), PROFILED_GRADIENT_XTOL_REL);
         assert_eq!(profiled_xtol(algo, &looser), PROFILED_GRADIENT_XTOL_REL);
@@ -1077,21 +946,10 @@ fn a_profiled_stop_that_could_be_a_minimum_is_verified() {
             err(F::Failure),
             err(F::RoundoffLimited),
         ] {
-            assert!(
-                profiled_stop_needs_verify(algo, &r, false, true),
-                "{algo:?} {r:?}"
-            );
-            assert!(
-                !profiled_stop_needs_verify(algo, &r, true, true),
-                "cancelled {r:?}"
-            );
+            assert!(profiled_stop_needs_verify(algo, &r, false, true), "{algo:?} {r:?}");
+            assert!(!profiled_stop_needs_verify(algo, &r, true, true), "cancelled {r:?}");
         }
-        for r in [
-            ok(S::Success),
-            ok(S::FtolReached),
-            ok(S::XtolReached),
-            ok(S::StopValReached),
-        ] {
+        for r in [ok(S::Success), ok(S::FtolReached), ok(S::XtolReached), ok(S::StopValReached)] {
             assert!(
                 profiled_stop_needs_verify(algo, &r, false, false),
                 "a tolerance stop at the start: {algo:?} {r:?}"
@@ -1110,10 +968,7 @@ fn a_profiled_stop_that_could_be_a_minimum_is_verified() {
             err(F::InvalidArgs),
             err(F::OutOfMemory),
         ] {
-            assert!(
-                !profiled_stop_needs_verify(algo, &r, false, true),
-                "{algo:?} {r:?}"
-            );
+            assert!(!profiled_stop_needs_verify(algo, &r, false, true), "{algo:?} {r:?}");
         }
     }
     let bobyqa = nlopt::Algorithm::Bobyqa;
@@ -1124,10 +979,7 @@ fn a_profiled_stop_that_could_be_a_minimum_is_verified() {
                 "BOBYQA {r:?}, left_init {left_init}"
             );
         }
-        assert!(
-            !profiled_stop_needs_verify(bobyqa, &r, true, true),
-            "cancelled BOBYQA {r:?}"
-        );
+        assert!(!profiled_stop_needs_verify(bobyqa, &r, true, true), "cancelled BOBYQA {r:?}");
     }
     for r in [
         ok(S::StopValReached),
@@ -1137,10 +989,7 @@ fn a_profiled_stop_that_could_be_a_minimum_is_verified() {
         err(F::RoundoffLimited),
         err(F::ForcedStop),
     ] {
-        assert!(
-            !profiled_stop_needs_verify(bobyqa, &r, false, true),
-            "BOBYQA {r:?}"
-        );
+        assert!(!profiled_stop_needs_verify(bobyqa, &r, false, true), "BOBYQA {r:?}");
     }
 }
 
@@ -1155,13 +1004,7 @@ fn a_profiled_verdict_is_the_verification_gain() {
     let lbfgs = nlopt::Algorithm::Lbfgs;
     let verdict = |end, r: NloptReturn| profiled_converged(lbfgs, end, &r, false, true);
     // A `Failure` that never left the start is judged on its status, not converged.
-    assert!(!profiled_converged(
-        lbfgs,
-        PolishEnd::NotNeeded,
-        &err(F::Failure),
-        false,
-        false
-    ));
+    assert!(!profiled_converged(lbfgs, PolishEnd::NotNeeded, &err(F::Failure), false, false));
     assert!(verdict(PolishEnd::Settled, err(F::Failure)));
     assert!(verdict(PolishEnd::Settled, err(F::RoundoffLimited)));
     assert!(verdict(PolishEnd::Settled, ok(S::XtolReached)));
@@ -1171,10 +1014,7 @@ fn a_profiled_verdict_is_the_verification_gain() {
     assert!(!verdict(PolishEnd::NotNeeded, ok(S::MaxEvalReached)));
     assert!(!verdict(PolishEnd::NotNeeded, err(F::ForcedStop)));
     for r in [ok(S::XtolReached), err(F::Failure)] {
-        assert!(!verdict(
-            PolishEnd::LegCapReached { last_gain: 2e-5 },
-            r.clone()
-        ));
+        assert!(!verdict(PolishEnd::LegCapReached { last_gain: 2e-5 }, r.clone()));
         assert!(!verdict(PolishEnd::BudgetSpent, r.clone()));
         assert!(!verdict(PolishEnd::Skipped, r));
     }
@@ -1183,10 +1023,7 @@ fn a_profiled_verdict_is_the_verification_gain() {
     assert!(verdict(PolishEnd::Settled, ok(S::FtolReached)));
     assert!(verdict(PolishEnd::Settled, ok(S::XtolReached)));
     assert!(!verdict(PolishEnd::Settled, ok(S::MaxEvalReached)));
-    assert!(!verdict(
-        PolishEnd::LegCapReached { last_gain: 2e-5 },
-        ok(S::FtolReached)
-    ));
+    assert!(!verdict(PolishEnd::LegCapReached { last_gain: 2e-5 }, ok(S::FtolReached)));
     assert!(!verdict(PolishEnd::BudgetSpent, ok(S::FtolReached)));
     assert!(!verdict(PolishEnd::NotNeeded, err(F::Failure)));
 }
@@ -1203,15 +1040,8 @@ fn a_profiled_bobyqa_leg_polishes_at_the_polish_tolerances() {
     let bobyqa = nlopt::Algorithm::Bobyqa;
     assert!(POLISH_XTOL_REL < profiled_xtol(bobyqa, &o));
     assert!(POLISH_FTOL_REL < profiled_ftol(bobyqa, model, &o));
-    assert_eq!(
-        profiled_leg_tols(bobyqa, model, &o),
-        (POLISH_XTOL_REL, POLISH_FTOL_REL)
-    );
-    let tighter = FitOptions {
-        outer_xtol: 1e-9,
-        outer_ftol: Some(1e-12),
-        ..o.clone()
-    };
+    assert_eq!(profiled_leg_tols(bobyqa, model, &o), (POLISH_XTOL_REL, POLISH_FTOL_REL));
+    let tighter = FitOptions { outer_xtol: 1e-9, outer_ftol: Some(1e-12), ..o.clone() };
     assert_eq!(profiled_leg_tols(bobyqa, model, &tighter), (1e-9, 1e-12));
     for algo in [nlopt::Algorithm::Lbfgs, nlopt::Algorithm::Slsqp] {
         assert_eq!(
@@ -1231,12 +1061,8 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
     use nlopt::{FailState as F, SuccessState as S};
     let w = |end, r: NloptReturn, converged| profiled_verdict_warning(end, &r, converged);
 
-    let cap = w(
-        PolishEnd::LegCapReached { last_gain: 2.1e-5 },
-        ok(S::XtolReached),
-        false,
-    )
-    .expect("a leg cap warns");
+    let cap = w(PolishEnd::LegCapReached { last_gain: 2.1e-5 }, ok(S::XtolReached), false)
+        .expect("a leg cap warns");
     for sentence in [
         format!("still improving after {MAX_POLISH_LEGS} verification legs"),
         "the last lowered the objective by 2.100e-5".to_string(),
@@ -1251,14 +1077,8 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
     // so rather than "still improving" by a gain that reads like a converged fit (#2465
     // review #2). Both sides of the gate are asserted here, so a variant stuck on either
     // branch fails.
-    let creep = w(
-        PolishEnd::LegCapReached {
-            last_gain: CREEPER_GAIN,
-        },
-        ok(S::XtolReached),
-        false,
-    )
-    .expect("a creeping leg cap warns");
+    let creep = w(PolishEnd::LegCapReached { last_gain: CREEPER_GAIN }, ok(S::XtolReached), false)
+        .expect("a creeping leg cap warns");
     for sentence in [
         format!("still moving after {MAX_POLISH_LEGS} verification legs"),
         "the last stopped on its step tolerance while still moving".to_string(),
@@ -1266,23 +1086,15 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
         "so it is not reported as converged".to_string(),
         "re-run from these estimates".to_string(),
     ] {
-        assert!(
-            creep.contains(&sentence),
-            "{sentence:?} missing from {creep:?}"
-        );
+        assert!(creep.contains(&sentence), "{sentence:?} missing from {creep:?}");
     }
     assert!(!creep.contains("still improving"), "{creep:?}");
 
     let budget = w(PolishEnd::BudgetSpent, ok(S::FtolReached), false).expect("a spent budget");
-    for sentence in [
-        "spent its evaluation budget",
-        "before its stop was verified",
-        "increase maxiter",
-    ] {
-        assert!(
-            budget.contains(sentence),
-            "{sentence:?} missing from {budget:?}"
-        );
+    for sentence in
+        ["spent its evaluation budget", "before its stop was verified", "increase maxiter"]
+    {
+        assert!(budget.contains(sentence), "{sentence:?} missing from {budget:?}");
     }
     assert_eq!(
         w(PolishEnd::Settled, ok(S::MaxEvalReached), false).as_deref(),
@@ -1309,12 +1121,7 @@ fn a_profiled_verdict_names_why_it_is_not_converged() {
 
 /// A scripted verification leg at the default profiled `xtol_rel`.
 fn scripted_leg(ret: NloptReturn, gain: f64, displacement: f64) -> LegOutcome {
-    LegOutcome {
-        ret,
-        gain,
-        displacement,
-        xtol: PROFILED_GRADIENT_XTOL_REL,
-    }
+    LegOutcome { ret, gain, displacement, xtol: PROFILED_GRADIENT_XTOL_REL }
 }
 
 /// The loop the verdict reads, driven by the profiled predicate over a scripted run:
@@ -1398,10 +1205,7 @@ fn a_leg_that_stopped_on_its_step_test_while_moving_does_not_settle() {
         GENUINE_XTOL_DISPLACEMENT <= gate && gate < CREEPER_DISPLACEMENT,
         "the pair no longer straddles the gate {gate:e}"
     );
-    assert!(
-        CREEPER_GAIN <= PROFILED_VERIFY_GAIN,
-        "the creeper's gain alone settles"
-    );
+    assert!(CREEPER_GAIN <= PROFILED_VERIFY_GAIN, "the creeper's gain alone settles");
     let settles = |algo, status, gain, displacement| {
         profiled_leg_settles(algo, &ok(status), gain, displacement, xtol)
     };
@@ -1411,42 +1215,22 @@ fn a_leg_that_stopped_on_its_step_test_while_moving_does_not_settle() {
             "{algo:?}: the creeping leg settled"
         );
         assert!(
-            settles(
-                algo,
-                S::XtolReached,
-                CREEPER_GAIN,
-                GENUINE_XTOL_DISPLACEMENT
-            ),
+            settles(algo, S::XtolReached, CREEPER_GAIN, GENUINE_XTOL_DISPLACEMENT),
             "{algo:?}: a genuine optimum's leg did not settle"
         );
         assert!(
             settles(algo, S::FtolReached, S1_FTOL_GAIN, S1_FTOL_DISPLACEMENT),
             "{algo:?}: S1's FtolReached leg did not settle"
         );
-        assert!(!settles(
-            algo,
-            S::XtolReached,
-            2.0 * PROFILED_VERIFY_GAIN,
-            0.0
-        ));
+        assert!(!settles(algo, S::XtolReached, 2.0 * PROFILED_VERIFY_GAIN, 0.0));
         assert!(settles(algo, S::XtolReached, f64::NAN, 0.0));
         // #2465 review #8: a `NaN` gain passes the gain test only. A creeping leg with one
         // still runs on, and a `NaN` displacement does not settle either.
-        assert!(!settles(
-            algo,
-            S::XtolReached,
-            f64::NAN,
-            CREEPER_DISPLACEMENT
-        ));
+        assert!(!settles(algo, S::XtolReached, f64::NAN, CREEPER_DISPLACEMENT));
         assert!(!settles(algo, S::XtolReached, CREEPER_GAIN, f64::NAN));
     }
     assert!(
-        settles(
-            A::Bobyqa,
-            S::XtolReached,
-            CREEPER_GAIN,
-            CREEPER_DISPLACEMENT
-        ),
+        settles(A::Bobyqa, S::XtolReached, CREEPER_GAIN, CREEPER_DISPLACEMENT),
         "BOBYQA's polish legs are judged on the gain alone"
     );
     // Relative to the leg's own `xtol`: a tighter user `outer_xtol` tightens the gate.
@@ -1506,11 +1290,7 @@ fn a_creeping_leg_is_followed_by_another() {
             script.next()
         },
     );
-    assert_eq!(
-        (ran, end),
-        (3, PolishEnd::Settled),
-        "the loop stopped on the creeper"
-    );
+    assert_eq!((ran, end), (3, PolishEnd::Settled), "the loop stopped on the creeper");
     assert!(profiled_converged(lbfgs, end, &last, false, true));
     assert_eq!(profiled_verdict_warning(end, &last, true), None);
 
@@ -1519,26 +1299,12 @@ fn a_creeping_leg_is_followed_by_another() {
         ok(S::FtolReached),
         |r| profiled_stop_needs_verify(lbfgs, r, false, true),
         || 100,
-        |_| {
-            Some(scripted_leg(
-                ok(S::XtolReached),
-                CREEPER_GAIN,
-                CREEPER_DISPLACEMENT,
-            ))
-        },
+        |_| Some(scripted_leg(ok(S::XtolReached), CREEPER_GAIN, CREEPER_DISPLACEMENT)),
     );
-    assert_eq!(
-        end,
-        PolishEnd::LegCapReached {
-            last_gain: CREEPER_GAIN
-        }
-    );
+    assert_eq!(end, PolishEnd::LegCapReached { last_gain: CREEPER_GAIN });
     assert!(!profiled_converged(lbfgs, end, &last, false, true));
     let w = profiled_verdict_warning(end, &last, false).expect("a leg cap warns");
-    assert!(
-        w.contains("while still moving"),
-        "the creep cap's reason: {w}"
-    );
+    assert!(w.contains("while still moving"), "the creep cap's reason: {w}");
 
     // The gate reads each leg's own `xtol` (#2465 review #1): a genuine-sized displacement
     // on a leg run at a tenth of the default `xtol_rel` is creeping, so the loop runs on.
@@ -1558,12 +1324,7 @@ fn a_creeping_leg_is_followed_by_another() {
     );
     assert_eq!(
         (ran, end),
-        (
-            MAX_POLISH_LEGS,
-            PolishEnd::LegCapReached {
-                last_gain: CREEPER_GAIN
-            }
-        ),
+        (MAX_POLISH_LEGS, PolishEnd::LegCapReached { last_gain: CREEPER_GAIN }),
         "the loop judged the leg at another xtol than its own"
     );
 }
@@ -1580,15 +1341,8 @@ fn assert_legs_are_capped_and_honest(legs: &[VerifyLeg], o: &FitOptions) {
     assert!(want <= PROFILED_GRADIENT_XTOL_REL);
     for (k, l) in legs.iter().enumerate() {
         assert_eq!(l.xtol, Some(want), "leg {k} ran at another xtol_rel: {l:?}");
-        assert!(
-            l.before.is_finite() && l.after.is_finite(),
-            "leg {k}: {l:?}"
-        );
-        assert_eq!(
-            l.gain,
-            l.before - l.after,
-            "leg {k} reported a gain it did not make"
-        );
+        assert!(l.before.is_finite() && l.after.is_finite(), "leg {k}: {l:?}");
+        assert_eq!(l.gain, l.before - l.after, "leg {k} reported a gain it did not make");
         // #2340: the displacement the settle test reads is the incumbent's move. A move
         // means an improvement, and an improvement beyond the profile solve's noise means
         // a move. A gain within noise at the same point is a warm re-solve scoring lower,
@@ -1598,10 +1352,7 @@ fn assert_legs_are_capped_and_honest(legs: &[VerifyLeg], o: &FitOptions) {
             assert!(l.gain > 0.0, "leg {k} moved without improving: {l:?}");
         }
         if l.gain > OFV_NOISE * l.before.abs().max(1.0) {
-            assert!(
-                l.displacement > 0.0,
-                "leg {k} reported a displacement it did not make: {l:?}"
-            );
+            assert!(l.displacement > 0.0, "leg {k} reported a displacement it did not make: {l:?}");
         }
     }
 }
@@ -1613,10 +1364,7 @@ fn assert_legs_are_capped_and_honest(legs: &[VerifyLeg], o: &FitOptions) {
 #[test]
 fn a_profiled_fit_runs_its_verification_leg() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);
-    let o = FitOptions {
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, ..options(&p) };
     assert!(matches!(profiled_algorithm(&o), nlopt::Algorithm::Lbfgs));
     take_verify_legs();
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
@@ -1642,27 +1390,17 @@ fn a_profiled_fit_runs_its_verification_leg() {
 #[test]
 fn a_profiled_fit_whose_legs_keep_gaining_is_not_converged() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);
-    let o = FitOptions {
-        run_covariance_step: false,
-        outer_ftol: Some(LOOSE_FTOL),
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, outer_ftol: Some(LOOSE_FTOL), ..options(&p) };
     take_verify_legs();
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     let legs = take_verify_legs();
     eprintln!("F2 loose-ftol legs: {legs:?}; warnings {:?}", r.warnings);
     assert_legs_are_capped_and_honest(&legs, &o);
     assert_eq!(legs.len(), MAX_POLISH_LEGS, "{legs:?}");
-    assert!(
-        legs.iter().all(|l| l.gain > PROFILED_VERIFY_GAIN),
-        "{legs:?}"
-    );
+    assert!(legs.iter().all(|l| l.gain > PROFILED_VERIFY_GAIN), "{legs:?}");
     assert!(!r.converged);
     assert_eq!(
-        r.warnings
-            .iter()
-            .filter(|w| w.contains("verification legs"))
-            .count(),
+        r.warnings.iter().filter(|w| w.contains("verification legs")).count(),
         1,
         "{:?}",
         r.warnings
@@ -1686,16 +1424,10 @@ const LOOSE_FTOL: f64 = 1e-3;
 #[test]
 fn a_profiled_bobyqa_fit_polishes_its_tolerance_stop() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);
-    let base = FitOptions {
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let base = FitOptions { run_covariance_step: false, ..options(&p) };
     let lbfgs = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &base);
     assert!(lbfgs.converged, "{:?}", lbfgs.warnings);
-    let o = FitOptions {
-        optimizer: Optimizer::Bobyqa,
-        ..base
-    };
+    let o = FitOptions { optimizer: Optimizer::Bobyqa, ..base };
     take_verify_legs();
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     let legs = take_verify_legs();
@@ -1715,10 +1447,7 @@ fn a_profiled_bobyqa_fit_polishes_its_tolerance_stop() {
     for (k, l) in legs.iter().enumerate() {
         assert_eq!(l.xtol, Some(POLISH_XTOL_REL), "leg {k}: {l:?}");
         assert_eq!(l.ftol, Some(POLISH_FTOL_REL), "leg {k}: {l:?}");
-        assert!(
-            l.before.is_finite() && l.after.is_finite(),
-            "leg {k}: {l:?}"
-        );
+        assert!(l.before.is_finite() && l.after.is_finite(), "leg {k}: {l:?}");
         assert_eq!(l.gain, l.before - l.after, "leg {k}: {l:?}");
     }
     let settled = legs.last().unwrap().gain <= PROFILED_VERIFY_GAIN;
@@ -1748,11 +1477,7 @@ const BOBYQA_POLISHED_OFV: f64 = 1e-5;
 /// covariance step: what the #2136 rows below inspect.
 fn short_profiled_fit(edit: impl Fn(String) -> String) -> (crate::api::PreparedRun, OuterResult) {
     let p = prep(F2, F2_DATA, Some(2), edit);
-    let o = FitOptions {
-        outer_maxiter: 3,
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { outer_maxiter: 3, run_covariance_step: false, ..options(&p) };
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     (p, r)
 }
@@ -1764,10 +1489,7 @@ fn with_junk_theta(t: String) -> String {
         "  theta ET50(2.0, 0.01, 100.0)\n",
         "  theta ET50(2.0, 0.01, 100.0)\n  theta JUNK(1.0, 0.01, 10.0)\n",
     )
-    .replace(
-        "  EMAXI = EMAX * exp(ETA_EM)\n",
-        "  EMAXI = EMAX * exp(ETA_EM)\n  UNUSED = JUNK\n",
-    )
+    .replace("  EMAXI = EMAX * exp(ETA_EM)\n", "  EMAXI = EMAX * exp(ETA_EM)\n  UNUSED = JUNK\n")
 }
 
 /// Row 1, the flat-θ pre-flight (#826): a structural θ the profile objective ignores is
@@ -1788,21 +1510,11 @@ fn a_profiled_fit_freezes_a_theta_the_objective_ignores() {
     junk.model.name = p.parsed.model.name.clone();
     p.init_params = junk.model.default_params.clone();
     p.parsed.model = junk.model;
-    let o = FitOptions {
-        outer_maxiter: 3,
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { outer_maxiter: 3, run_covariance_step: false, ..options(&p) };
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     let names = &p.init_params.theta_names;
-    let junk = names
-        .iter()
-        .position(|n| n == "JUNK")
-        .expect("JUNK declared");
-    assert!(
-        !p.init_params.theta_fixed[junk],
-        "fixture: JUNK starts free"
-    );
+    let junk = names.iter().position(|n| n == "JUNK").expect("JUNK declared");
+    assert!(!p.init_params.theta_fixed[junk], "fixture: JUNK starts free");
     let w = crate::estimation::outer_optimizer::flat_theta_warning("JUNK", 1.0);
     assert!(r.warnings.contains(&w), "{:?}", r.warnings);
     assert!(r.params.theta_fixed[junk]);
@@ -1811,9 +1523,7 @@ fn a_profiled_fit_freezes_a_theta_the_objective_ignores() {
         let k = names.iter().position(|n| n == name).unwrap();
         assert!(!r.params.theta_fixed[k], "{name} must stay free");
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains(&format!("`{name}` has no effect"))),
+            !r.warnings.iter().any(|w| w.contains(&format!("`{name}` has no effect"))),
             "{name}: {:?}",
             r.warnings
         );
@@ -1849,11 +1559,7 @@ fn a_profiled_fit_writes_a_checkpoint_at_its_incumbent() {
         crate::estimation::parameterization::coordinate_names(&p.init_params),
         0,
     );
-    let o = FitOptions {
-        outer_maxiter: 10,
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { outer_maxiter: 10, run_covariance_step: false, ..options(&p) };
     let writes_before = crate::io::checkpoint::writes();
     let updates_before = INCUMBENT_UPDATES.with(std::cell::Cell::get);
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
@@ -1876,39 +1582,20 @@ fn a_profiled_fit_writes_a_checkpoint_at_its_incumbent() {
     assert_eq!(cp.ofv.to_bits(), r.ofv.to_bits(), "the final incumbent");
     assert!(cp.iter >= 1 && cp.iter <= r.n_iterations, "{}", cp.iter);
 
-    assert_eq!(
-        cp.packed.len(),
-        crate::estimation::parameterization::packed_len(&p.init_params)
-    );
+    assert_eq!(cp.packed.len(), crate::estimation::parameterization::packed_len(&p.init_params));
     let layout = layout_of(&p);
     let at = unpack_params(&cp.packed, &p.init_params);
     assert!(
         layout.coords.iter().any(|&k| at.theta[k] != 0.0),
         "levels at the template: {:?}",
-        layout
-            .coords
-            .iter()
-            .map(|&k| at.theta[k])
-            .collect::<Vec<_>>()
+        layout.coords.iter().map(|&k| at.theta[k]).collect::<Vec<_>>()
     );
-    assert!(
-        cp.ofv.is_finite() && cp.ofv >= r.ofv - 1e-9,
-        "{} vs {}",
-        cp.ofv,
-        r.ofv
-    );
+    assert!(cp.ofv.is_finite() && cp.ofv >= r.ofv - 1e-9, "{} vs {}", cp.ofv, r.ofv);
     let c = ctx(&p, &layout, &o);
-    let warm = ProfileWarm {
-        beta: layout.coords.iter().map(|&k| at.theta[k]).collect(),
-        etas: None,
-    };
+    let warm =
+        ProfileWarm { beta: layout.coords.iter().map(|&k| at.theta[k]).collect(), etas: None };
     let s = c.solve(&at, &warm).expect("the checkpoint re-profiles");
-    assert!(
-        (s.ofv - cp.ofv).abs() < 1e-6 * (1.0 + cp.ofv.abs()),
-        "{} vs {}",
-        s.ofv,
-        cp.ofv
-    );
+    assert!((s.ofv - cp.ofv).abs() < 1e-6 * (1.0 + cp.ofv.abs()), "{} vs {}", s.ofv, cp.ofv);
 }
 
 /// Row 3, the optimizer trace: a profiled fit writes one row per evaluation, each with
@@ -1935,25 +1622,13 @@ fn profiled_trace(edit: fn(String) -> String, method: &str, file: &str) {
     let p = prep(F2, F2_DATA, Some(2), edit);
     let names = crate::estimation::parameterization::coordinate_names(&p.init_params);
     crate::estimation::trace::init(path_s.clone(), &names).unwrap();
-    let o = FitOptions {
-        outer_maxiter: 3,
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { outer_maxiter: 3, run_covariance_step: false, ..options(&p) };
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     crate::estimation::trace::finish();
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::remove_file(&path).ok();
-    let rows: Vec<Vec<&str>> = text
-        .lines()
-        .skip(1)
-        .map(|l| l.split(',').collect())
-        .collect();
-    assert!(
-        !rows.is_empty() && rows.len() <= r.n_iterations,
-        "{} rows",
-        rows.len()
-    );
+    let rows: Vec<Vec<&str>> = text.lines().skip(1).map(|l| l.split(',').collect()).collect();
+    assert!(!rows.is_empty() && rows.len() <= r.n_iterations, "{} rows", rows.len());
     let n = names.len();
     let layout = layout_of(&p);
     let tve0 = names.iter().position(|n| n == "TVE0").unwrap();
@@ -1966,10 +1641,7 @@ fn profiled_trace(edit: fn(String) -> String, method: &str, file: &str) {
             assert_eq!(row[17 + k + n], "NA", "a held level's gradient: {row:?}");
         }
         assert!(
-            layout
-                .coords
-                .iter()
-                .any(|&k| row[17 + k].parse::<f64>().unwrap() != 0.0),
+            layout.coords.iter().any(|&k| row[17 + k].parse::<f64>().unwrap() != 0.0),
             "the levels are solved: {row:?}"
         );
     }
@@ -1989,26 +1661,17 @@ fn a_profiled_step_holds_a_structural_coordinate_on_the_guard() {
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let hold = hold_template(&layout, &p.init_params);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let s = c
-        .solve(
-            &unpack_params(&x, &hold),
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&unpack_params(&x, &hold), &ProfileWarm::from_template(&layout, &p.init_params))
         .unwrap();
     let x_hat = solved_point(&layout, &hold, &x, &s);
     let nf = free.len();
     // ETA_EM's log-Cholesky diagonal: the first packed coordinate after θ.
     let eta = hold.theta.len();
     let a = free.iter().position(|&i| i == eta).expect("ETA_EM is free");
-    let a_p = DMatrix::from_fn(
-        nf,
-        nf,
-        |i, j| if i == j { 10.0 * (i + 1) as f64 } else { 0.5 },
-    );
+    let a_p = DMatrix::from_fn(nf, nf, |i, j| if i == j { 10.0 * (i + 1) as f64 } else { 0.5 });
 
     // Off the rail: the unconditional inverse, ETA_EM's row live.
     let off = c
@@ -2020,10 +1683,7 @@ fn a_profiled_step_holds_a_structural_coordinate_on_the_guard() {
     // On the rail: held.
     let mut on_rail = x_hat.clone();
     on_rail[eta] = -6.0;
-    assert_eq!(
-        crate::api::held_guard_coordinates(&unpack_params(&on_rail, &hold)),
-        [eta]
-    );
+    assert_eq!(crate::api::held_guard_coordinates(&unpack_params(&on_rail, &hold)), [eta]);
     let held =
         c.covariance_from_profile_hessian(&hold, &on_rail, &free, &s, &a_p, Instant::now(), None);
     assert!(held.warnings.is_empty(), "{:?}", held.warnings);
@@ -2037,10 +1697,7 @@ fn a_profiled_step_holds_a_structural_coordinate_on_the_guard() {
     let want = sub.cholesky().unwrap().inverse() * 2.0;
     for (i, &ki) in keep.iter().enumerate() {
         for (j, &kj) in keep.iter().enumerate() {
-            assert!(
-                (m[(free[ki], free[kj])] - want[(i, j)]).abs() < 1e-12,
-                "({ki}, {kj})"
-            );
+            assert!((m[(free[ki], free[kj])] - want[(i, j)]).abs() < 1e-12, "({ki}, {kj})");
         }
     }
     // The held coordinate's correlation with the rest moved the others: not the off-rail
@@ -2065,25 +1722,16 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let hold = hold_template(&layout, &p.init_params);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let s = c
-        .solve(
-            &unpack_params(&x, &hold),
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&unpack_params(&x, &hold), &ProfileWarm::from_template(&layout, &p.init_params))
         .unwrap();
     let x_hat = solved_point(&layout, &hold, &x, &s);
     let nf = free.len();
     // A PD A_p of the fixture's scale: the diagonal of a structural FD stencil, not
     // needed exactly — the claim is about the branch, and D, B are the real ones.
-    let a_pd = DMatrix::from_fn(
-        nf,
-        nf,
-        |a, b| if a == b { 10.0 * (a + 1) as f64 } else { 0.5 },
-    );
+    let a_pd = DMatrix::from_fn(nf, nf, |a, b| if a == b { 10.0 * (a + 1) as f64 } else { 0.5 });
     let pd =
         c.covariance_from_profile_hessian(&hold, &x_hat, &free, &s, &a_pd, Instant::now(), None);
     let m = pd.matrix.expect("a PD A_p publishes a matrix");
@@ -2103,9 +1751,7 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     assert!(out.matrix.is_none() && out.method.is_none());
     let eigvals = crate::estimation::covariance::extract_eigenvalues(&a_bad).unwrap();
     assert_eq!(out.warnings, vec![profile_non_pd_msg(&eigvals)]);
-    let prop = out
-        .sir_fallback_proposal
-        .expect("a non-PD A_p hands SIR a proposal");
+    let prop = out.sir_fallback_proposal.expect("a non-PD A_p hands SIR a proposal");
     assert_eq!((prop.nrows(), prop.ncols()), (x.len(), x.len()));
     // The structural block is the unprofiled builder's.
     let units = crate::estimation::covariance::free_coordinate_units(
@@ -2120,10 +1766,7 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     );
     for a in 0..nf {
         for b in 0..nf {
-            assert!(
-                (prop[(free[a], free[b])] - want[(a, b)]).abs() < 1e-12,
-                "({a}, {b})"
-            );
+            assert!((prop[(free[a], free[b])] - want[(a, b)]).abs() < 1e-12, "({a}, {b})");
         }
     }
     // The levels carry variance, and the proposal is a covariance SIR can draw from.
@@ -2131,10 +1774,7 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     let idx: Vec<usize> = free.iter().chain(&layout.coords).copied().collect();
     let sub = DMatrix::from_fn(idx.len(), idx.len(), |a, b| prop[(idx[a], idx[b])]);
     assert!((&sub - sub.transpose()).amax() < 1e-9 * sub.amax());
-    assert!(
-        sub.cholesky().is_some(),
-        "the proposal is positive definite"
-    );
+    assert!(sub.cholesky().is_some(), "the proposal is positive definite");
     // Its level blocks are twice the PD covariance's `D⁻¹` term: rebuilt from the same
     // structural block, `d_scale = 4` against `d_scale = 2` differs by exactly `2·D⁻¹`.
     let LevelBlocks { d_groups, b, .. } = c.level_blocks(&hold, &x_hat, &free, &s).unwrap();
@@ -2155,20 +1795,15 @@ fn a_non_pd_profile_hessian_hands_sir_a_fallback_proposal() {
     );
 }
 
-/// #10, the envelope gradient's reconverge override, keyed on the route each subject
-/// took. F2 without κ is analytic at model level; every subject is forced to decline the
-/// analytic gradient at runtime, the numerical decline `sens/provider.rs` names. On the
-/// reconverging log `optimize_profiled` builds — taken from the same
-/// [`profiled_decline_log`] the driver calls, so a driver built on a plain log fails
-/// here — the declined subjects are reconverged
-/// and the gradient is still the profile gradient (G1's bound); on a plain log they take
-/// the held-EBE salvage, which drops `dη̂/dθ`, and it is not — the straddle, asserted so
-/// the test cannot pass on a fixture where the two agree. Dies when the profiled loop
-/// keys the override on the model-level predicate alone (a plain log). Measured (F2,
-/// three studies, macOS arm64): reconverged 2.1e-5, held-EBE 2.2 — the bound sits 24×
-/// above one and 4500× below the other.
+/// #10, the envelope gradient of a subject that declines at runtime. F2 without κ is
+/// analytic at model level; every subject is forced to decline the analytic gradient at
+/// runtime, the numerical decline `sens/provider.rs` names. The salvage serves each at its
+/// EBE re-solved at the trial point (#3004), so the gradient is still the profile gradient
+/// (G1's bound) and the log says every decline was served exactly. The held-EBE salvage
+/// this replaced dropped `dη̂/dθ` and was 2.2 off (F2, three studies, macOS arm64, #2136),
+/// 4500× over the bound, so a salvage that returned it fails here.
 #[test]
-fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
+fn a_subject_that_declines_at_runtime_gets_the_exact_envelope_gradient() {
     let p = prep(F2, F2_DATA, Some(3), |t| {
         t.replace("  kappa KAPPA_ARM ~ 1.0\n", "")
             .replace(" + KAPPA_ARM", "")
@@ -2182,17 +1817,9 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let hold = hold_template(&layout, &p.init_params);
-    let PackedStart {
-        packed: x,
-        bounds,
-        fixed,
-        ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, bounds, fixed, .. } = pack_with_bounds(&hold);
     let s = c
-        .solve(
-            &unpack_params(&x, &hold),
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&unpack_params(&x, &hold), &ProfileWarm::from_template(&layout, &p.init_params))
         .unwrap();
     let w = ProfileWarm::from_solve(&layout, &s);
     let n_subj = p.population.subjects.len();
@@ -2201,11 +1828,8 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
             log.force_decline(i);
         }
         let g = envelope_gradient(&c, &hold, &x, &s, &bounds, &mut 0, &log);
-        assert_eq!(
-            log.declined_indices().len(),
-            n_subj,
-            "every subject declined"
-        );
+        assert_eq!(log.declined_indices().len(), n_subj, "every subject declined");
+        assert!(log.all_declines_exact(), "every decline served exactly");
         let mut worst = 0.0_f64;
         for i in (0..x.len()).filter(|&i| !fixed[i]) {
             let h = 1e-4 * (1.0 + x[i].abs());
@@ -2221,20 +1845,16 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
         }
         worst
     };
-    let reconverged = worst(profiled_decline_log(n_subj));
-    let held = worst(OuterFdDeclineLog::new(n_subj));
-    eprintln!("#2136 #10: reconverged {reconverged:.3e}, held-EBE {held:.3e}");
-    assert!(reconverged < G1_HANDED_BOUND, "{reconverged}");
-    assert!(held > G1_HANDED_BOUND, "the straddle: held-EBE {held}");
+    let exact = worst(profiled_decline_log(n_subj));
+    eprintln!("#2136 #10: exact salvage {exact:.3e}");
+    assert!(exact < G1_HANDED_BOUND, "{exact}");
 }
 
-/// A profiled fit reports the subjects that declined the analytic outer gradient at
-/// runtime, as an unprofiled fit does (#1154): before, `optimize_profiled` built its own
-/// decline log and never read it, so the fallback was silent. Non-IOV F2 (analytic at
-/// model level), every subject forced to decline: the warning counts them and names the
-/// **reconverged** salvage that log gives them, not the held-EBE one. The same fit without
-/// the switch is the straddle — no warning. Dies when the warning is not emitted, or is
-/// emitted from a plain log's wording.
+/// A profiled fit reads the decline log it builds, as an unprofiled fit does (#1154): non-IOV
+/// F2 (analytic at model level), every subject forced to decline. Each decline is served
+/// exactly at its re-solved EBE (#3004), so no fallback ran and no warning is emitted
+/// (#3009 review 3); the same fit without the switch likewise. The warning's text for
+/// declines that are not served exactly is pinned in `outer_optimizer_tests`.
 #[test]
 fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
     let p = prep(F2, F2_DATA, Some(2), |t| {
@@ -2247,11 +1867,7 @@ fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
         "fixture: analytic at model level"
     );
     let n = p.population.subjects.len();
-    let o = FitOptions {
-        run_covariance_step: false,
-        outer_maxiter: 3,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, outer_maxiter: 3, ..options(&p) };
     let fallback = |r: &OuterResult| -> Vec<String> {
         r.warnings
             .iter()
@@ -2266,18 +1882,10 @@ fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
     FORCE_PROFILED_DECLINES.with(|c| c.set(false));
     let forced = forced.unwrap_or_else(|e| std::panic::resume_unwind(e));
     let w = fallback(&forced);
-    assert_eq!(w.len(), 1, "{:?}", forced.warnings);
-    assert!(
-        w[0].starts_with(&format!("{n} of {n} subjects")),
-        "{}",
-        w[0]
-    );
-    assert!(
-        w[0].contains("used reconverged finite-difference outer gradients")
-            && !w[0].contains("fixed-EBE"),
-        "the profiled log reconverges every decline: {}",
-        w[0]
-    );
+    // Every decline is served exactly at its re-solved EBE (#3004), so no fallback ran and
+    // there is nothing to warn about (#3009 review 3): the old sentence claimed both.
+    assert!(w.is_empty(), "{:?}", forced.warnings);
+    let _ = n;
 
     let plain = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     assert!(fallback(&plain).is_empty(), "{:?}", plain.warnings);
@@ -2309,24 +1917,11 @@ fn a_global_sum_to_zero_differences_each_subject_over_its_own_levels() {
     let p = global_prep(3);
     let layout = layout_of(&p);
     let model = &p.parsed.model;
-    let decl = model
-        .indiv_param_partials
-        .theta_blocks
-        .decls
-        .iter()
-        .find(|d| d.name == "PLACEBO")
-        .unwrap();
+    let decl =
+        model.indiv_param_partials.theta_blocks.decls.iter().find(|d| d.name == "PLACEBO").unwrap();
     let al = crate::api::active_levels(model, &p.population);
-    let per_subject = &al
-        .iter()
-        .find(|a| a.block == "PLACEBO")
-        .unwrap()
-        .per_subject;
-    assert_eq!(
-        layout.groups.len(),
-        1,
-        "the global contrast ties every level"
-    );
+    let per_subject = &al.iter().find(|a| a.block == "PLACEBO").unwrap().per_subject;
+    assert_eq!(layout.groups.len(), 1, "the global contrast ties every level");
     assert_eq!(layout.borders.len(), 1, "one dependent level");
     let n_levels = decl.spec.levels.len();
     assert_eq!(layout.coords.len(), n_levels - 1);
@@ -2340,18 +1935,11 @@ fn a_global_sum_to_zero_differences_each_subject_over_its_own_levels() {
     let (mut dependent_readers, mut max_reads) = (0, 0);
     for (i, levels) in per_subject.iter().enumerate() {
         let reads = &layout.reads[i];
-        assert_eq!(
-            reads.len(),
-            levels.len(),
-            "subject {i}: its own levels only"
-        );
+        assert_eq!(reads.len(), levels.len(), "subject {i}: its own levels only");
         max_reads = max_reads.max(reads.len());
         if levels.contains(&(n_levels - 1)) {
             dependent_readers += 1;
-            assert!(
-                reads.iter().any(|r| r.level >= layout.coords.len()),
-                "subject {i}"
-            );
+            assert!(reads.iter().any(|r| r.level >= layout.coords.len()), "subject {i}");
         }
         let before = level_values(theta, levels);
         for (j, _) in reads.iter().enumerate() {
@@ -2366,15 +1954,8 @@ fn a_global_sum_to_zero_differences_each_subject_over_its_own_levels() {
             assert!(moved.iter().any(|m| (m - d).abs() < 1e-12), "{moved:?}");
         }
     }
-    assert!(
-        dependent_readers > 0,
-        "the fixture reads the dependent level"
-    );
-    assert!(
-        max_reads < layout.coords.len() / 2,
-        "{max_reads} of {} levels",
-        layout.coords.len()
-    );
+    assert!(dependent_readers > 0, "the fixture reads the dependent level");
+    assert!(max_reads < layout.coords.len() / 2, "{max_reads} of {} levels", layout.coords.len());
 }
 
 /// Under `sum_to_zero_within` every F2 subject reads all of its study's levels, so no θ
@@ -2410,9 +1991,7 @@ fn bordered_fixture(border_of: Vec<Option<usize>>, nb: usize) -> ProfileGroup {
 fn block_spd(n: usize, blocks: &[Vec<usize>], seed: u64) -> DMatrix<f64> {
     let mut x = seed;
     let mut next = || {
-        x = x
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((x >> 11) as f64 / (1u64 << 53) as f64) - 0.5
     };
     let mut m = DMatrix::zeros(n, n);
@@ -2436,17 +2015,9 @@ fn block_spd(n: usize, blocks: &[Vec<usize>], seed: u64) -> DMatrix<f64> {
 fn the_bordered_step_is_the_theta_newton_step() {
     let cases: Vec<(Vec<Option<usize>>, usize, Vec<Vec<usize>>)> = vec![
         // θ 1..4 summed by border 0 (level 4); θ 0 outside it.
-        (
-            vec![None, Some(0), Some(0), Some(0)],
-            1,
-            vec![vec![0, 1], vec![2, 4], vec![3]],
-        ),
+        (vec![None, Some(0), Some(0), Some(0)], 1, vec![vec![0, 1], vec![2, 4], vec![3]]),
         // Two dependents: θ 0, 1 → level 4; θ 2, 3 → level 5.
-        (
-            vec![Some(0), Some(0), Some(1), Some(1)],
-            2,
-            vec![vec![0, 2], vec![1, 4], vec![3, 5]],
-        ),
+        (vec![Some(0), Some(0), Some(1), Some(1)], 2, vec![vec![0, 2], vec![1, 4], vec![3, 5]]),
     ];
     for (seed, (border_of, nb, blocks)) in cases.into_iter().enumerate() {
         let g = bordered_fixture(border_of, nb);
@@ -2491,11 +2062,7 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let hold = hold_template(&layout, &p.init_params);
-    let PackedStart {
-        packed: mut x,
-        fixed,
-        ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: mut x, fixed, .. } = pack_with_bounds(&hold);
     let warm = ProfileWarm::from_template(&layout, &p.init_params);
     let s = c.solve(&unpack_params(&x, &hold), &warm).unwrap();
     for &k in &layout.coords {
@@ -2580,23 +2147,14 @@ const LEVEL_BLOCKS_ORACLE_STEP: f64 = 3e-4;
 
 /// The pass-`k` EBEs of a recording, per subject in population order.
 fn pass_modes(
-    rec: &crate::estimation::inner_optimizer::InnerRecording,
-    k: usize,
-    pop: &Population,
+    rec: &crate::estimation::inner_optimizer::InnerRecording, k: usize, pop: &Population,
 ) -> (Vec<DVector<f64>>, Vec<Vec<DVector<f64>>>) {
     let pass: Vec<_> = rec.passes.iter().filter(|p| p.pass == k).collect();
     assert_eq!(pass.len(), pop.subjects.len(), "pass {k}");
     (
+        pass.iter().map(|p| DVector::from_column_slice(&p.eta)).collect(),
         pass.iter()
-            .map(|p| DVector::from_column_slice(&p.eta))
-            .collect(),
-        pass.iter()
-            .map(|p| {
-                p.kappas
-                    .iter()
-                    .map(|c| DVector::from_column_slice(c))
-                    .collect()
-            })
+            .map(|p| p.kappas.iter().map(|c| DVector::from_column_slice(c)).collect())
             .collect(),
     )
 }
@@ -2627,38 +2185,24 @@ fn gradient_and_line_search_start_at_the_pass_mode(fd: bool) {
     let c = ctx(&p, &layout, &o);
     let (s, rec) = on_one_thread(|| {
         record_inner_solves(|| {
-            c.solve(
-                &p.init_params,
-                &ProfileWarm::from_template(&layout, &p.init_params),
-            )
-            .expect("the solve converges")
+            c.solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
+                .expect("the solve converges")
         })
     });
-    assert_eq!(
-        s.iterations, 1,
-        "fixture: one Newton step, so one line search"
-    );
+    assert_eq!(s.iterations, 1, "fixture: one Newton step, so one line search");
     let (etas, kappas) = pass_modes(&rec, 0, &p.population);
     let mut first = Vec::new();
     let mut line_search = Vec::new();
     for (i, subject) in p.population.subjects.iter().enumerate() {
         let k = layout.reads[i].len();
-        let mine: Vec<_> = rec
-            .starts
-            .iter()
-            .filter(|s| s.pass.is_none() && s.subject == subject.id)
-            .collect();
+        let mine: Vec<_> =
+            rec.starts.iter().filter(|s| s.pass.is_none() && s.subject == subject.id).collect();
         if k == 0 {
             assert!(mine.is_empty(), "subject {} reads no level", subject.id);
             continue;
         }
         let probes = if fd { 2 * k } else { 0 };
-        assert!(
-            mine.len() > probes,
-            "subject {}: {} re-solves",
-            subject.id,
-            mine.len()
-        );
+        assert!(mine.len() > probes, "subject {}: {} re-solves", subject.id, mine.len());
         first.extend(mine[..probes].iter().copied());
         line_search.push(mine[probes]);
     }
@@ -2671,13 +2215,7 @@ fn gradient_and_line_search_start_at_the_pass_mode(fd: bool) {
             &kappas,
         );
     }
-    assert_these_start_at_modes(
-        "profile line search",
-        line_search,
-        &p.population,
-        &etas,
-        &kappas,
-    );
+    assert_these_start_at_modes("profile line search", line_search, &p.population, &etas, &kappas);
 }
 
 /// A solve warm-started from a previous one (`ProfileWarm::from_solve`, the outer loop's
@@ -2692,17 +2230,13 @@ fn profile_solve_from_a_previous_solve_starts_at_its_mode() {
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
     let first = c
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
         .expect("the solve converges");
     let mut moved = p.init_params.clone();
     moved.theta[0] *= 1.01;
     let rec = on_one_thread(|| {
         record_inner_solves(|| {
-            c.solve(&moved, &ProfileWarm::from_solve(&layout, &first))
-                .expect("the solve converges")
+            c.solve(&moved, &ProfileWarm::from_solve(&layout, &first)).expect("the solve converges")
         })
         .1
     });
@@ -2740,10 +2274,7 @@ fn profiled_covariance_starts_at_the_fit_mode() {
         let c = ctx(&p, &layout, &o);
         assert_eq!(c.cov_is_analytic(), exact);
         let fit = c
-            .solve(
-                &p.init_params,
-                &ProfileWarm::from_template(&layout, &p.init_params),
-            )
+            .solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
             .expect("the solve converges");
         let x = pack_with_bounds(&fit.params).packed;
         let rec = on_one_thread(|| {
@@ -2805,18 +2336,9 @@ fn profiled_covariance_starts_at_the_fit_mode() {
 /// the visits of each arm (`car1` on the visit times, `ar1` on their order).
 fn f1_corr(kind: &'static str, init: &'static str, lo: &'static str) -> impl Fn(String) -> String {
     move |t: String| {
-        assert!(
-            t.contains("  omega ETA_E0") && t.contains("weight = SE\n"),
-            "F1 moved"
-        );
-        t.replace(
-            "  omega ETA_E0",
-            &format!("  theta RHO({init}, {lo}, 0.95)\n  omega ETA_E0"),
-        )
-        .replace(
-            "weight = SE\n",
-            &format!("weight = SE\n  correlation {kind}(RHO) by OCC\n"),
-        )
+        assert!(t.contains("  omega ETA_E0") && t.contains("weight = SE\n"), "F1 moved");
+        t.replace("  omega ETA_E0", &format!("  theta RHO({init}, {lo}, 0.95)\n  omega ETA_E0"))
+            .replace("weight = SE\n", &format!("weight = SE\n  correlation {kind}(RHO) by OCC\n"))
     }
 }
 
@@ -2831,10 +2353,7 @@ fn nested_corr(t: String) -> String {
          omega ETA_SP",
     )
     .replace("  y = TVE0 + ", "  y = TVE0 + PLACEBO + ")
-    .replace(
-        "DV ~ additive(ADD)",
-        "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM",
-    )
+    .replace("DV ~ additive(ADD)", "DV ~ additive(ADD)\n  correlation ar1(RHO) by ARM")
 }
 
 const NESTED: &str = "nonmem_anchor/nested_levels_3.ferx";
@@ -2854,10 +2373,7 @@ fn scored(mut p: crate::api::PreparedRun) -> crate::api::PreparedRun {
     .into_owned();
     assert!(
         p.parsed.model.residual_serial.is_none()
-            || p.population
-                .subjects
-                .iter()
-                .all(|s| s.obs_rgroup.len() == s.obs_times.len())
+            || p.population.subjects.iter().all(|s| s.obs_rgroup.len() == s.obs_times.len())
     );
     p
 }
@@ -2867,10 +2383,7 @@ fn solve_at(p: &crate::api::PreparedRun) -> (ProfileLayout, ProfileSolve) {
     let layout = layout_of(p);
     let o = options(p);
     let s = ctx(p, &layout, &o)
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
         .unwrap_or_else(|e| panic!("the profile solve failed: {e:?}"));
     (layout, s)
 }
@@ -2937,18 +2450,9 @@ fn unprofiled_ofv(p: &crate::api::PreparedRun, params: &ModelParameters) -> f64 
 #[test]
 fn the_correlated_profiled_objective_is_the_unprofiled_objective_at_its_own_point() {
     let cases: Vec<(&str, crate::api::PreparedRun)> = vec![
-        (
-            "F1 car1",
-            scored(prep(F1, F1_DATA, None, f1_corr("car1", "0.6", "0.0"))),
-        ),
-        (
-            "F1 ar1",
-            scored(prep(F1, F1_DATA, None, f1_corr("ar1", "0.6", "-0.95"))),
-        ),
-        (
-            "nested ar1",
-            scored(prep(NESTED, NESTED_DATA, None, nested_corr)),
-        ),
+        ("F1 car1", scored(prep(F1, F1_DATA, None, f1_corr("car1", "0.6", "0.0")))),
+        ("F1 ar1", scored(prep(F1, F1_DATA, None, f1_corr("ar1", "0.6", "-0.95")))),
+        ("nested ar1", scored(prep(NESTED, NESTED_DATA, None, nested_corr))),
     ];
     for (name, p) in &cases {
         let (_, s) = solve_at(p);
@@ -2986,12 +2490,7 @@ fn a_profiled_correlation_at_rho_zero_is_the_model_without_it() {
     let p_zero = scored(prep(F1, F1_DATA, None, f1_corr("ar1", "0.0", "-0.95")));
     let (_, plain) = solve_at(&p_plain);
     let (_, zero) = solve_at(&p_zero);
-    let (_, live) = solve_at(&scored(prep(
-        F1,
-        F1_DATA,
-        None,
-        f1_corr("ar1", "0.6", "-0.95"),
-    )));
+    let (_, live) = solve_at(&scored(prep(F1, F1_DATA, None, f1_corr("ar1", "0.6", "-0.95"))));
     // RHO is declared after the block, so the level θ keep their indices.
     let n = plain.params.theta.len();
     assert_eq!(zero.params.theta.len(), n + 1);
@@ -3001,12 +2500,13 @@ fn a_profiled_correlation_at_rho_zero_is_the_model_without_it() {
     at.theta.push(0.0);
     let objective_gap = unprofiled_ofv(&p_zero, &at) - unprofiled_ofv(&p_plain, &plain.params);
     let profile_gap = zero.ofv - plain.ofv;
-    let worst_level = (0..n)
-        .map(|k| (zero.params.theta[k] - plain.params.theta[k]).abs())
-        .fold(0.0_f64, |a, v| {
+    let worst_level = (0..n).map(|k| (zero.params.theta[k] - plain.params.theta[k]).abs()).fold(
+        0.0_f64,
+        |a, v| {
             assert!(v.is_finite());
             a.max(v)
-        });
+        },
+    );
     eprintln!(
         "ρ = 0: plain {:.15}, ρ = 0 {:.15} (Δ {profile_gap:.3e}; the objective alone \
          {objective_gap:.3e}), worst level {worst_level:.3e}; ρ = 0.6 {:.12}",
@@ -3081,8 +2581,7 @@ fn level_gradient_gaps(p: &crate::api::PreparedRun) -> (f64, f64) {
             (gap, size)
         })
         .collect();
-    per.iter()
-        .fold((0.0, 0.0), |(g, s), &(gi, si)| (g.max(gi), s.max(si)))
+    per.iter().fold((0.0, 0.0), |(g, s), &(gi, si)| (g.max(gi), s.max(si)))
 }
 
 /// The fixtures G2 runs on, each with the engine the adjoint must serve it on.
@@ -3094,20 +2593,11 @@ fn g2_fixtures() -> Vec<(&'static str, crate::api::PreparedRun)> {
             "F2 car1",
             scored(prep(F2, F2_DATA, Some(3), |t| {
                 assert!(t.contains("  omega ETA_EM") && t.contains("weight = SE\n"));
-                t.replace(
-                    "  omega ETA_EM",
-                    "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
-                )
-                .replace(
-                    "weight = SE\n",
-                    "weight = SE\n  correlation car1(RHO) by OCC\n",
-                )
+                t.replace("  omega ETA_EM", "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM")
+                    .replace("weight = SE\n", "weight = SE\n  correlation car1(RHO) by OCC\n")
             })),
         ),
-        (
-            "nested",
-            scored(prep(NESTED, NESTED_DATA, None, nested_corr)),
-        ),
+        ("nested", scored(prep(NESTED, NESTED_DATA, None, nested_corr))),
         ("global", global_prep(3)),
     ]
 }
@@ -3130,20 +2620,13 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one() {
         }
         if name == "global" {
             assert!(
-                layout_of(&p)
-                    .reads
-                    .iter()
-                    .flatten()
-                    .any(|r| r.moves.len() > 1),
+                layout_of(&p).reads.iter().flatten().any(|r| r.moves.len() > 1),
                 "the global fixture reads a level through a slack"
             );
         }
         let (gap, size) = level_gradient_gaps(&p);
         eprintln!("G2 {name}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE");
-        assert!(
-            size > G2_LIVE,
-            "{name}: the gradient is not live ({size:.3e})"
-        );
+        assert!(size > G2_LIVE, "{name}: the gradient is not live ({size:.3e})");
         assert!(gap < G2_BOUND, "{name}: {gap:.3e}");
     }
 }
@@ -3164,10 +2647,7 @@ const G2_LIVE: f64 = 1e-2;
 /// F2 with `gradient = fd`, which keeps the whole profile on finite differences.
 fn forced_fd(t: String) -> String {
     assert!(t.contains("  method     = focei\n"), "F2 moved");
-    t.replace(
-        "  method     = focei\n",
-        "  method     = focei\n  gradient   = fd\n",
-    )
+    t.replace("  method     = focei\n", "  method     = focei\n  gradient   = fd\n")
 }
 
 /// On F2 every level gradient of the solve comes from the adjoint, none falls back; with
@@ -3176,17 +2656,12 @@ fn forced_fd(t: String) -> String {
 /// an in-scope fixture silently runs on FD.
 #[test]
 fn the_profile_gradient_runs_on_the_outer_gradients_engine() {
-    for (fd, p) in [
-        (false, prep(F2, F2_DATA, Some(3), |t| t)),
-        (true, prep(F2, F2_DATA, Some(3), forced_fd)),
-    ] {
+    for (fd, p) in
+        [(false, prep(F2, F2_DATA, Some(3), |t| t)), (true, prep(F2, F2_DATA, Some(3), forced_fd))]
+    {
         assert_eq!(profile_gradient_is_analytic(&p.parsed.model), !fd);
         let (_, s) = solve_at(&p);
-        assert!(
-            s.fd_gradient_subjects.is_empty(),
-            "fd={fd}: {:?}",
-            s.fd_gradient_subjects
-        );
+        assert!(s.fd_gradient_subjects.is_empty(), "fd={fd}: {:?}", s.fd_gradient_subjects);
         if fd {
             assert_eq!(s.n_adjoint_gradients, 0);
         } else {
@@ -3250,11 +2725,7 @@ fn a_profiled_fit_reports_its_fd_profile_gradients() {
          but slower."
     );
     let ours = |r: &OuterResult| -> Vec<String> {
-        r.warnings
-            .iter()
-            .filter(|w| w.contains("W_PROFILE_FD_GRADIENT"))
-            .cloned()
-            .collect()
+        r.warnings.iter().filter(|w| w.contains("W_PROFILE_FD_GRADIENT")).cloned().collect()
     };
     assert_eq!(ours(&forced), vec![want], "{:?}", forced.warnings);
     let (_, plain) = short_profiled_fit(|t| t);
@@ -3271,20 +2742,14 @@ fn the_profiled_covariance_step_reports_its_fd_profile_gradients() {
     let c = ctx(&p, &layout, &o);
     let (_, s) = solve_at(&p);
     let hold = hold_template(&layout, &p.init_params);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let out = with_declined(0, || {
-        c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas)
-            .0
+        c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas).0
     });
     let id = &p.population.subjects[0].id;
-    let mine: Vec<&String> = out
-        .warnings
-        .iter()
-        .filter(|w| w.contains("during the covariance step"))
-        .collect();
+    let mine: Vec<&String> =
+        out.warnings.iter().filter(|w| w.contains("during the covariance step")).collect();
     assert_eq!(mine.len(), 1, "{:?}", out.warnings);
     assert_eq!(
         *mine[0],
@@ -3362,10 +2827,7 @@ fn a_profile_solve_counts_its_work() {
     assert!(plain.newton_steps >= plain_s.iterations.max(1), "{plain:?}");
     // The straddle: the decline moves gradients from adjoint to differenced and nothing else,
     // since the two solves take the same steps (β̂ within 1e-5 SE, above).
-    assert_eq!(
-        forced.newton_steps, plain.newton_steps,
-        "{forced:?} vs {plain:?}"
-    );
+    assert_eq!(forced.newton_steps, plain.newton_steps, "{forced:?} vs {plain:?}");
     assert!(forced.fd_gradients >= 1, "{forced:?}");
     assert_eq!(
         forced.adjoint_gradients + forced.fd_gradients,
@@ -3397,25 +2859,11 @@ fn a_failed_profile_solve_still_counts_its_work() {
     eprintln!("failed {work:?}, groups {}", layout.groups.len());
     // Measured on Linux aarch64 and macOS arm64 alike: 3 groups, 3 steps, 3 re-solves, 6
     // adjoint gradients.
-    assert!(
-        matches!(s, Err(ProfileFailure::NotConverged { .. })),
-        "{s:?}"
-    );
+    assert!(matches!(s, Err(ProfileFailure::NotConverged { .. })), "{s:?}");
     let n = p.population.subjects.len();
-    assert_eq!(
-        work.newton_steps,
-        layout.groups.len(),
-        "one step per group: {work:?}"
-    );
-    assert_eq!(
-        work.adjoint_gradients,
-        2 * n,
-        "two passes per subject: {work:?}"
-    );
-    assert!(
-        work.resolves >= n,
-        "one line-search trial per subject at least: {work:?}"
-    );
+    assert_eq!(work.newton_steps, layout.groups.len(), "one step per group: {work:?}");
+    assert_eq!(work.adjoint_gradients, 2 * n, "two passes per subject: {work:?}");
+    assert!(work.resolves >= n, "one line-search trial per subject at least: {work:?}");
 }
 
 /// #2405: the `verbose` summary, in full. Each figure lands in its own slot.
@@ -3454,9 +2902,8 @@ fn a_verbose_profiled_fit_sums_its_profile_work() {
         LAST_PROFILE_WORK.with(|c| c.set(None));
         LAST_PROFILE_SUMMARY.with(|c| *c.borrow_mut() = None);
         let _ = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
-        let (n, failed, work) = LAST_PROFILE_WORK
-            .with(std::cell::Cell::get)
-            .expect("the fit recorded its work");
+        let (n, failed, work) =
+            LAST_PROFILE_WORK.with(std::cell::Cell::get).expect("the fit recorded its work");
         // What was printed is the line of what was summed (#2405 review N2).
         let printed = LAST_PROFILE_SUMMARY.with(|c| c.borrow_mut().take());
         assert_eq!(printed, Some(profile_work_summary(n, failed, &work)));
@@ -3466,10 +2913,7 @@ fn a_verbose_profiled_fit_sums_its_profile_work() {
     eprintln!("declined: {n} evals, {failed} failed, {work:?}");
     assert!(n >= 1);
     assert_eq!(failed, 0, "{work:?}");
-    assert!(
-        work.fd_gradients >= 1 && work.adjoint_gradients >= 1,
-        "{work:?}"
-    );
+    assert!(work.fd_gradients >= 1 && work.adjoint_gradients >= 1, "{work:?}");
 
     FORCE_PROFILE_GROUP_FAILURE.with(|x| x.set(Some(0)));
     let out = std::panic::catch_unwind(verbose_fit);
@@ -3482,50 +2926,171 @@ fn a_verbose_profiled_fit_sums_its_profile_work() {
     assert!(work.adjoint_gradients >= n, "{work:?}");
 }
 
-/// A level that would log-pack declines the adjoint level gradient (#2401 review row 1):
-/// the packed gradient is `∂/∂x`, and reading it as `∂/∂θ` would be off by a factor of θ.
-/// One template gives both sides: a lower bound of 0 on the first level makes it log-pack,
-/// so a subject reading it declines while a subject reading only other levels is still
-/// served. Dies when the check is dropped (the reader is served) or widened to every
-/// subject (the other one declines).
+/// F2 whose first level log-packs: a lower bound of 0 on it (the hand-built template a parsed
+/// profiled block never produces, its box being open) and a positive value, so the packed
+/// coordinate is `ln θ` and the adjoint's packed derivatives need converting to θ.
+fn log_packed_level_prep() -> (crate::api::PreparedRun, usize) {
+    let mut p = prep(F2, F2_DATA, Some(3), |t| t);
+    let k = layout_of(&p).coords[0];
+    p.init_params.theta[k] = 1.0;
+    p.init_params.theta_lower[k] = 0.0;
+    assert!(theta_packs_log(p.init_params.theta_lower[k]), "fixture: the level log-packs");
+    (p, k)
+}
+
+/// #3009 review 3: the log-packed conversions read their inputs once. `theta_derivative`
+/// takes θ unpacked once per call (it unpacked the whole parameter set per `(read, move)`
+/// pair), and the Newton matrix's `−∂/∂x` diagonal term comes out of the block's own pass
+/// (it recorded a second adjoint gradient only for it). Reference: the former formulas,
+/// reproduced here from the public adjoint entry points. The gradient is bit for bit the
+/// reference (the same values, unpacked once); the matrix is the reference to rounding of the
+/// `−∂/∂x` term (the block's `∇Ψ` against the standalone gradient: two different sweeps).
+/// Dies when the diagonal term is dropped, or θ is read from the wrong coordinate.
 #[test]
-fn a_level_that_log_packs_declines_the_adjoint_gradient() {
-    let p = prep(F2, F2_DATA, Some(3), |t| t);
+fn log_packed_conversions_are_unchanged_by_reading_their_inputs_once() {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_block_at, subject_adjoint_gradient_at,
+    };
+    let (mut p, k) = log_packed_level_prep();
+    p.init_params.theta[k] = 2.0;
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
-    let k = layout.coords[0];
-    let mut params = p.init_params.clone();
-    params.theta[k] = 1.0;
-    params.theta_lower[k] = 0.0;
-    assert!(
-        theta_packs_log(params.theta_lower[k]),
-        "fixture: the level log-packs"
-    );
-    let reads = |i: usize| {
-        layout.reads[i]
-            .iter()
-            .flat_map(|r| &r.moves)
-            .any(|&(j, _)| j == k)
-    };
-    let reader = (0..p.population.subjects.len())
-        .find(|&i| reads(i))
-        .unwrap();
-    let other = (0..p.population.subjects.len())
-        .find(|&i| !reads(i) && !layout.reads[i].is_empty())
-        .expect("fixture: a subject reading other levels only");
+    let params = p.init_params.clone();
     let x = pack_params(&params);
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
     let zero = DVector::zeros(c.model.n_eta);
-    let at = |i: usize| c.total_gradient_adjoint(i, &pt, &c.resolve(i, &params, &zero));
+    let reader = (0..p.population.subjects.len())
+        .find(|&i| layout.reads[i].iter().flat_map(|r| &r.moves).any(|&(j, _)| j == k))
+        .unwrap();
+    let s = c.resolve(reader, &params, &zero);
+    let subject = &p.population.subjects[reader];
+    let mode =
+        crate::estimation::covariance::stacked_mode(c.model, subject, &s.eta, Some(&s.kappas))
+            .unwrap();
+    let g = subject_adjoint_gradient_at(c.model, subject, &pt, &mode, c.objective()).unwrap();
+
+    // Gradient: the former per-pair unpack.
+    let want: Vec<f64> = layout.reads[reader]
+        .iter()
+        .map(|r| {
+            r.moves
+                .iter()
+                .map(|&(j, w)| {
+                    let packed = g[j];
+                    let d = if theta_packs_log(params.theta_lower[j]) {
+                        packed / unpack_params(&x, &params).theta[j]
+                    } else {
+                        packed
+                    };
+                    w * d
+                })
+                .sum()
+        })
+        .collect();
+    let got = c.total_gradient_adjoint(reader, &pt, &s).unwrap();
+    assert_eq!(want.len(), got.len());
     assert!(
-        at(reader).is_none(),
-        "the log-packed level's reader must decline"
+        theta_packs_log(params.theta_lower[k]) && params.theta[k] != 1.0,
+        "fixture: the conversion is live"
     );
-    assert!(
-        at(other).is_some(),
-        "a subject not reading it is still served"
-    );
+    for (a, b) in want.iter().zip(&got) {
+        assert!(a.is_finite() && b.is_finite());
+        assert_eq!(a.to_bits(), b.to_bits(), "{a} vs {b}");
+    }
+
+    // Matrix: the former second gradient for the diagonal term.
+    let mut touched: Vec<usize> =
+        layout.reads[reader].iter().flat_map(|r| r.moves.iter().map(|&(j, _)| j)).collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let mut h = subject_adjoint_cov_block_at(c.model, subject, &pt, &mode, c.objective(), &touched)
+        .unwrap();
+    let gt: Vec<f64> = touched.iter().map(|&j| g[j]).collect();
+    ProfileCtx::theta_scale(&pt, &touched, 0, &gt, &mut h);
+    let m = DMatrix::from_fn(touched.len(), layout.reads[reader].len(), |t, a| {
+        layout.reads[reader][a]
+            .moves
+            .iter()
+            .filter(|&&(j, _)| j == touched[t])
+            .map(|&(_, w)| w)
+            .sum::<f64>()
+    });
+    let want_h = m.transpose() * h * &m;
+    let got_h = c.exact_hessian(reader, &pt, &s).unwrap();
+    let scale = want_h.iter().fold(0.0_f64, |a, v| {
+        assert!(v.is_finite());
+        a.max(v.abs())
+    });
+    let mut gap = 0.0_f64;
+    for (a, b) in want_h.iter().zip(got_h.iter()) {
+        assert!(a.is_finite() && b.is_finite());
+        gap = gap.max((a - b).abs()); // nan-ok: both operands asserted finite above
+    }
+    eprintln!("MEASURE one-pass Newton matrix vs two-pass: gap {:.3e} relative", gap / scale);
+    assert!(gap / scale < 1e-10, "{:.3e}", gap / scale);
+}
+
+/// A level that log-packs is served by the adjoint, not declined to re-solved differences
+/// (#2401 review row 1, #3004): the packed derivative is `∂/∂ln θ`, which
+/// [`ProfileCtx::theta_derivative`] divides by θ, and the Hessian's diagonal takes
+/// `(∂²/∂x² − ∂/∂x)/θ²`. The subject reading the level has its gradient (against the
+/// reconverged differences, in SEs, as G2) and its Newton matrix
+/// ([`ProfileCtx::exact_hessian`], against [`ProfileCtx::resolved_hessian`]) exact, and a
+/// subject reading other levels only is unaffected. Dies when the factor is dropped (the
+/// gradient is off by θ ≠ 1 only where θ ≠ 1: the level starts at 1, so a second level at 2
+/// is set below to make the factor visible), or the diagonal's `−∂/∂x` is dropped.
+#[test]
+fn a_level_that_log_packs_gets_the_exact_adjoint_gradient_and_matrix() {
+    let (mut p, k) = log_packed_level_prep();
+    // θ ≠ 1, or dividing by θ cannot be told from not dividing.
+    p.init_params.theta[k] = 2.0;
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let params = p.init_params.clone();
+    let x = pack_params(&params);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&params, &x).unwrap();
+    let zero = DVector::zeros(c.model.n_eta);
+    let reads = |i: usize| layout.reads[i].iter().flat_map(|r| &r.moves).any(|&(j, _)| j == k);
+    let reader = (0..p.population.subjects.len()).find(|&i| reads(i)).unwrap();
+    assert!(c.reads_a_log_packed_level(reader, &params));
+    let s = c.resolve(reader, &params, &zero);
+    let m = layout.reads[reader].len();
+    let held = c.held_hessian(reader, &params, &s, &vec![1.0; m]);
+    let se: Vec<f64> = (0..m).map(|a| 1.0 / held[(a, a)].sqrt()).collect();
+    let steps: Vec<f64> = se.iter().map(|v| FD_STEP_SE * v).collect();
+    let fd = c.total_gradient_fd(reader, &params, &s, &steps);
+    let ad = c.total_gradient_adjoint(reader, &pt, &s).expect("a log-packed level is served");
+    let (mut gap, mut size) = (0.0_f64, 0.0_f64);
+    for a in 0..m {
+        assert!(fd[a].is_finite() && ad[a].is_finite(), "level {a}");
+        gap = gap.max(((ad[a] - fd[a]) * se[a]).abs()); // nan-ok: fd, ad finite asserted above; se is 1/sqrt of a positive held curvature
+        size = size.max((fd[a] * se[a]).abs()); // nan-ok: as the line above
+    }
+    eprintln!("log-packed level gradient: gap {gap:.3e} SE, size {size:.3e} SE");
+    assert!(size > G2_LIVE, "the gradient is live: {size:.3e}");
+    assert!(gap < G2_BOUND, "{gap:.3e}");
+
+    let ad_h = c.exact_hessian(reader, &pt, &s).expect("a log-packed level's matrix is served");
+    let fd_h = c.resolved_hessian(reader, &params, &s, &steps);
+    let scale = fd_h.iter().fold(0.0_f64, |m, v| {
+        assert!(v.is_finite());
+        m.max(v.abs())
+    });
+    let mut hgap = 0.0_f64;
+    for (x, y) in ad_h.iter().zip(fd_h.iter()) {
+        assert!(x.is_finite(), "{x}");
+        hgap = hgap.max((x - y).abs()); // nan-ok: x asserted finite above, fd_h finite in the scale loop
+    }
+    eprintln!("log-packed level matrix: gap {:.3e} (relative)", hgap / scale);
+    assert!(hgap / scale < 1e-3, "{:.3e}", hgap / scale);
+
+    let other = (0..p.population.subjects.len())
+        .find(|&i| !reads(i) && !layout.reads[i].is_empty())
+        .expect("fixture: a subject reading other levels only");
+    assert!(!c.reads_a_log_packed_level(other, &params));
+    assert!(c.total_gradient_adjoint(other, &pt, &c.resolve(other, &params, &zero)).is_some());
 }
 
 /// A subject whose inner solve stops short of its mode takes the re-solved differences for
@@ -3548,10 +3113,7 @@ fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
     let p = prep(F2, F2_DATA, Some(3), |t| t);
     let layout = layout_of(&p);
     let o = options(&p);
-    let short = FitOptions {
-        inner_maxiter: 2,
-        ..o.clone()
-    };
+    let short = FitOptions { inner_maxiter: 2, ..o.clone() };
     let warm = ProfileWarm::from_template(&layout, &p.init_params);
     let at = |opts: &FitOptions| {
         ctx(&p, &layout, opts)
@@ -3559,11 +3121,7 @@ fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
             .unwrap_or_else(|e| panic!("the solve failed: {e:?}"))
     };
     let (full, cut) = (at(&o), at(&short));
-    assert!(
-        full.fd_gradient_subjects.is_empty(),
-        "{:?}",
-        full.fd_gradient_subjects
-    );
+    assert!(full.fd_gradient_subjects.is_empty(), "{:?}", full.fd_gradient_subjects);
     eprintln!(
         "off-mode: {} of {} subjects on FD, {} adjoint level gradients",
         cut.fd_gradient_subjects.len(),
@@ -3578,24 +3136,15 @@ fn a_subject_off_its_mode_takes_the_resolved_level_gradient() {
         "off-mode subjects took the adjoint gradient"
     );
     // The re-solves: certified fallbacks, so the adjoint serves them.
-    assert!(
-        cut.n_adjoint_gradients > 0,
-        "a certified fallback re-solve was declined"
-    );
+    assert!(cut.n_adjoint_gradients > 0, "a certified fallback re-solve was declined");
     // A re-solve that stops short is flagged on its own.
-    let one = FitOptions {
-        inner_maxiter: 1,
-        ..o.clone()
-    };
+    let one = FitOptions { inner_maxiter: 1, ..o.clone() };
     let (cf, c1) = (ctx(&p, &layout, &o), ctx(&p, &layout, &one));
     let zero = DVector::zeros(cf.model.n_eta);
     for i in 0..p.population.subjects.len() {
         let start = cf.resolve(i, &p.init_params, &zero).warm().add_scalar(0.1);
         let s = c1.resolve(i, &p.init_params, &start);
-        assert!(
-            s.off_mode,
-            "subject {i}: a re-solve that stopped short is not flagged: {s:?}"
-        );
+        assert!(s.off_mode, "subject {i}: a re-solve that stopped short is not flagged: {s:?}");
     }
 }
 
@@ -3613,11 +3162,7 @@ fn boxed(bx: &'static str) -> impl Fn(String) -> String {
 /// enumerating every assignment of each coordinate to {free, lower, upper} and keeping the
 /// one that is feasible and satisfies the KKT signs. Shares nothing with `box_qp_step`.
 fn kkt_by_enumeration(
-    m: &DMatrix<f64>,
-    g: &[f64],
-    beta: &[f64],
-    lo: &[f64],
-    hi: &[f64],
+    m: &DMatrix<f64>, g: &[f64], beta: &[f64], lo: &[f64], hi: &[f64],
 ) -> Vec<f64> {
     let n = g.len();
     let mut found = Vec::new();
@@ -3637,11 +3182,7 @@ fn kkt_by_enumeration(
             let rhs = DVector::from_iterator(
                 free.len(),
                 free.iter().map(|&a| {
-                    -(g[a]
-                        + (0..n)
-                            .filter(|&k| s[k] != 0)
-                            .map(|k| m[(a, k)] * d[k])
-                            .sum::<f64>())
+                    -(g[a] + (0..n).filter(|&k| s[k] != 0).map(|k| m[(a, k)] * d[k]).sum::<f64>())
                 }),
             );
             let x = mff.cholesky().unwrap().solve(&rhs);
@@ -3651,9 +3192,8 @@ fn kkt_by_enumeration(
         }
         let feasible =
             (0..n).all(|k| beta[k] + d[k] >= lo[k] - 1e-12 && beta[k] + d[k] <= hi[k] + 1e-12);
-        let r: Vec<f64> = (0..n)
-            .map(|a| g[a] + (0..n).map(|k| m[(a, k)] * d[k]).sum::<f64>())
-            .collect();
+        let r: Vec<f64> =
+            (0..n).map(|a| g[a] + (0..n).map(|k| m[(a, k)] * d[k]).sum::<f64>()).collect();
         let kkt = (0..n).all(|k| match s[k] {
             1 => r[k] >= 0.0,
             2 => r[k] <= 0.0,
@@ -3700,28 +3240,14 @@ fn the_box_qp_is_the_kkt_point_not_the_clamped_newton_step() {
     );
     for k in 0..3 {
         assert!(got[k].is_finite());
-        assert!(
-            (got[k] - want[k]).abs() < 1e-12,
-            "θ {k}: {got:?} vs {want:?}"
-        );
+        assert!((got[k] - want[k]).abs() < 1e-12, "θ {k}: {got:?} vs {want:?}");
         assert_eq!(pinned[k].is_some(), at(k), "θ {k}: {pinned:?}");
     }
-    let newton = -m
-        .clone()
-        .cholesky()
-        .unwrap()
-        .solve(&DVector::from_row_slice(&g));
-    let clamp_gap = (0..3)
-        .map(|k| (newton[k].clamp(lo[k], hi[k]) - want[k]).abs())
-        .fold(0.0_f64, f64::max);
-    eprintln!(
-        "Q1: kkt {want:?}, newton {:?}, clamp gap {clamp_gap:.3}",
-        newton.as_slice()
-    );
-    assert!(
-        clamp_gap > 0.1,
-        "clamping must miss the KKT point: {clamp_gap}"
-    );
+    let newton = -m.clone().cholesky().unwrap().solve(&DVector::from_row_slice(&g));
+    let clamp_gap =
+        (0..3).map(|k| (newton[k].clamp(lo[k], hi[k]) - want[k]).abs()).fold(0.0_f64, f64::max);
+    eprintln!("Q1: kkt {want:?}, newton {:?}, clamp gap {clamp_gap:.3}", newton.as_slice());
+    assert!(clamp_gap > 0.1, "clamping must miss the KKT point: {clamp_gap}");
 }
 
 /// Q1, the release arm: a box on which the active-set path blocks θ 2 at a bound on its way
@@ -3741,16 +3267,10 @@ fn a_theta_blocked_on_the_way_is_released_at_the_subspace_minimum() {
     let g = [-5.8, 6.1, 0.3];
     let want = kkt_by_enumeration(&m, &g, &beta, &lo, &hi);
     let (got, pinned) = q_step(&g, &beta, &lo, &hi);
-    assert!(
-        want[2] > lo[2] + 0.05 && want[2] < hi[2] - 0.05,
-        "θ 2 ends inside: {want:?}"
-    );
+    assert!(want[2] > lo[2] + 0.05 && want[2] < hi[2] - 0.05, "θ 2 ends inside: {want:?}");
     assert_eq!(pinned, [Some(2.0), Some(-2.0), None]);
     for k in 0..3 {
-        assert!(
-            (got[k] - want[k]).abs() < 1e-12,
-            "θ {k}: {got:?} vs {want:?}"
-        );
+        assert!((got[k] - want[k]).abs() < 1e-12, "θ {k}: {got:?} vs {want:?}");
     }
 
     let (lo, hi) = ([-0.5, -1.25, -1.65], [0.14, 0.13, 0.38]);
@@ -3760,10 +3280,7 @@ fn a_theta_blocked_on_the_way_is_released_at_the_subspace_minimum() {
     for k in 0..3 {
         let on = want[k] == lo[k] || want[k] == hi[k];
         assert_eq!(pinned[k].is_some(), on, "θ {k}: {pinned:?} vs {want:?}");
-        assert!(
-            (got[k] - want[k]).abs() < 1e-12,
-            "θ {k}: {got:?} vs {want:?}"
-        );
+        assert!((got[k] - want[k]).abs() < 1e-12, "θ {k}: {got:?} vs {want:?}");
     }
 }
 
@@ -3797,17 +3314,10 @@ fn a_theta_on_a_bound_is_held_or_released_by_its_multiplier() {
     for (g, held) in [([1.0, -0.5, 0.2], true), ([-3.0, -0.5, 0.2], false)] {
         let want = kkt_by_enumeration(&m, &g, &beta, &lo, &hi);
         let (got, pinned) = q_step(&g, &beta, &lo, &hi);
-        assert_eq!(
-            want[0] == 0.0,
-            held,
-            "the oracle agrees with the case: {want:?}"
-        );
+        assert_eq!(want[0] == 0.0, held, "the oracle agrees with the case: {want:?}");
         assert_eq!(pinned[0], held.then_some(-1.0), "g = {g:?}: {pinned:?}");
         for k in 0..3 {
-            assert!(
-                (got[k] - want[k]).abs() < 1e-12,
-                "g = {g:?}, θ {k}: {got:?} vs {want:?}"
-            );
+            assert!((got[k] - want[k]).abs() < 1e-12, "g = {g:?}, θ {k}: {got:?} vs {want:?}");
         }
         kept += usize::from(held);
     }
@@ -3828,11 +3338,7 @@ fn the_bordered_box_step_is_the_theta_form_box_step() {
     let beta = [0.0; 4];
     let theta_m = g.theta_matrix(&m);
     let theta_g = g.theta_gradient(&gy);
-    let unbounded = -theta_m
-        .clone()
-        .cholesky()
-        .unwrap()
-        .solve(&DVector::from_vec(theta_g.clone()));
+    let unbounded = -theta_m.clone().cholesky().unwrap().solve(&DVector::from_vec(theta_g.clone()));
     // A box that cuts the θ the unbounded step moves most.
     let k = unbounded.iamax();
     let cut = 0.5 * unbounded[k];
@@ -3855,11 +3361,7 @@ fn the_bordered_box_step_is_the_theta_form_box_step() {
         &[1.0; 4],
     )
     .unwrap();
-    assert_eq!(
-        pinned[k],
-        Some(cut),
-        "the cut θ ends on its bound: {pinned:?}"
-    );
+    assert_eq!(pinned[k], Some(cut), "the cut θ ends on its bound: {pinned:?}");
     for a in 0..4 {
         assert!(bordered[a].is_finite());
         assert!(
@@ -3868,39 +3370,27 @@ fn the_bordered_box_step_is_the_theta_form_box_step() {
         );
     }
     assert!(
-        (0..4)
-            .filter(|&a| a != k)
-            .any(|a| (dense[a] - unbounded[a]).abs() > 1e-3),
+        (0..4).filter(|&a| a != k).any(|a| (dense[a] - unbounded[a]).abs() > 1e-3),
         "holding the cut θ moves the others"
     );
 }
 
 /// The solve of `edit`'s fixture at the template's structural point.
 fn solve_boxed(
-    model: &str,
-    data: &str,
-    studies: Option<usize>,
-    edit: impl Fn(String) -> String,
+    model: &str, data: &str, studies: Option<usize>, edit: impl Fn(String) -> String,
 ) -> (crate::api::PreparedRun, ProfileLayout, ProfileSolve) {
     let p = prep(model, data, studies, edit);
     let layout = layout_of(&p);
     let o = options(&p);
     let s = ctx(&p, &layout, &o)
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
+        .solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
         .expect("the solve converges");
     (p, layout, s)
 }
 
 /// The θ index of the level `name` of `p`'s block.
 fn theta_named(p: &crate::api::PreparedRun, name: &str) -> usize {
-    p.init_params
-        .theta_names
-        .iter()
-        .position(|n| n == name)
-        .unwrap_or_else(|| panic!("{name}"))
+    p.init_params.theta_names.iter().position(|n| n == name).unwrap_or_else(|| panic!("{name}"))
 }
 
 /// N1: on F1 with `(0.0, -10.0, 3.0)`, the level the unbounded solve puts at 4.39 is held
@@ -3917,15 +3407,9 @@ fn a_bounded_profile_holds_a_level_exactly_on_its_bound() {
     assert_eq!(s.params.theta[pinned].to_bits(), 3.0_f64.to_bits());
     let v = s.params.theta[free];
     assert!(v.is_finite() && v < 3.0 && v > 2.0, "{v}");
-    assert!(layout
-        .at_bound(&s.params.theta)
-        .contains(&(pinned, 3.0, true)));
+    assert!(layout.at_bound(&s.params.theta).contains(&(pinned, 3.0, true)));
     assert!(!layout.at_bound(&s.params.theta).iter().any(|h| h.0 == free));
-    assert!(
-        s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
-        "{}",
-        s.criterion
-    );
+    assert!(s.criterion.is_finite() && s.criterion <= PROFILE_TOL, "{}", s.criterion);
     assert_eq!(s.iterations, 1);
     let unbounded = solve_boxed(F1, F1_DATA, None, |t| t).2;
     assert!(
@@ -3945,17 +3429,10 @@ fn a_bounded_profile_holds_a_level_exactly_on_its_lower_bound() {
     let pinned = theta_named(&p, "PLACEBO[STUDY=3,TIME=4]");
     let free = theta_named(&p, "PLACEBO[STUDY=5,TIME=4]");
     assert_eq!(s.params.theta[pinned].to_bits(), (-1.5_f64).to_bits());
-    assert_eq!(
-        layout.at_bound(&s.params.theta),
-        vec![(pinned, -1.5, false)]
-    );
+    assert_eq!(layout.at_bound(&s.params.theta), vec![(pinned, -1.5, false)]);
     let v = s.params.theta[free];
     assert!(v.is_finite() && v > -1.5 && v < -1.0, "{v}");
-    assert!(
-        s.criterion.is_finite() && s.criterion <= PROFILE_TOL,
-        "{}",
-        s.criterion
-    );
+    assert!(s.criterion.is_finite() && s.criterion <= PROFILE_TOL, "{}", s.criterion);
     assert_eq!(s.iterations, 1);
     let unbounded = solve_boxed(F1, F1_DATA, None, |t| t).2;
     assert!(
@@ -4004,31 +3481,14 @@ fn a_start_outside_the_box_is_clamped_into_it() {
     let o = options(&p);
     let unbounded = solve_boxed(F1, F1_DATA, None, |t| t).2;
     let outside = ProfileWarm::from_solve(&layout, &unbounded);
-    assert!(
-        outside.beta.iter().any(|&b| b > 3.0),
-        "the start leaves the box"
-    );
-    let s = ctx(&p, &layout, &o)
-        .solve(&p.init_params, &outside)
-        .expect("the solve converges");
+    assert!(outside.beta.iter().any(|&b| b > 3.0), "the start leaves the box");
+    let s = ctx(&p, &layout, &o).solve(&p.init_params, &outside).expect("the solve converges");
     for &k in &layout.coords {
         let v = s.params.theta[k];
-        assert!(
-            v.is_finite() && v <= 3.0,
-            "{}: {v}",
-            p.init_params.theta_names[k]
-        );
+        assert!(v.is_finite() && v <= 3.0, "{}: {v}", p.init_params.theta_names[k]);
     }
-    assert_eq!(
-        layout.at_bound(&s.params.theta),
-        layout.at_bound(&inside.params.theta)
-    );
-    assert!(
-        (s.ofv - inside.ofv).abs() < D0_BOUND,
-        "{} vs {}",
-        s.ofv,
-        inside.ofv
-    );
+    assert_eq!(layout.at_bound(&s.params.theta), layout.at_bound(&inside.params.theta));
+    assert!((s.ofv - inside.ofv).abs() < D0_BOUND, "{} vs {}", s.ofv, inside.ofv);
 }
 
 /// D0b: the bounded solve's objective is the unprofiled objective at its own joint point
@@ -4039,10 +3499,9 @@ fn a_start_outside_the_box_is_clamped_into_it() {
 /// 8.7e-10 to the frozen solve; F1 identical in every printed digit. D0's band.
 #[test]
 fn the_bounded_objective_is_the_frozen_unbounded_objective() {
-    for (model, data, n, bx) in [
-        (F1, F1_DATA, None, "(0.0, -10.0, 3.0)"),
-        (F2, F2_DATA, Some(3), "(0.0, -10.0, 1.0)"),
-    ] {
+    for (model, data, n, bx) in
+        [(F1, F1_DATA, None, "(0.0, -10.0, 3.0)"), (F2, F2_DATA, Some(3), "(0.0, -10.0, 1.0)")]
+    {
         let (p, layout, s) = solve_boxed(model, data, n, boxed(bx));
         let hits = layout.at_bound(&s.params.theta);
         assert!(!hits.is_empty() && hits.len() < layout.coords.len());
@@ -4081,10 +3540,7 @@ fn the_bounded_objective_is_the_frozen_unbounded_objective() {
         let frozen_layout = layout_of(&q);
         let qo = options(&q);
         let frozen = ctx(&q, &frozen_layout, &qo)
-            .solve(
-                &q.init_params,
-                &ProfileWarm::from_template(&frozen_layout, &q.init_params),
-            )
+            .solve(&q.init_params, &ProfileWarm::from_template(&frozen_layout, &q.init_params))
             .unwrap();
         eprintln!(
             "D0b {model}: bounded {:.12} plain {:.12} frozen {:.12} ({} pinned)",
@@ -4095,12 +3551,7 @@ fn the_bounded_objective_is_the_frozen_unbounded_objective() {
         );
         assert!(s.ofv.is_finite() && plain.is_finite() && frozen.ofv.is_finite());
         assert!((s.ofv - plain).abs() < D0_BOUND, "{} vs {}", s.ofv, plain);
-        assert!(
-            (s.ofv - frozen.ofv).abs() < D0_BOUND,
-            "{} vs {}",
-            s.ofv,
-            frozen.ofv
-        );
+        assert!((s.ofv - frozen.ofv).abs() < D0_BOUND, "{} vs {}", s.ofv, frozen.ofv);
     }
 }
 
@@ -4109,11 +3560,7 @@ fn the_bounded_objective_is_the_frozen_unbounded_objective() {
 /// a dense FD Newton step on the rest, the iterate projected onto the box — until the free
 /// step vanishes. It shares only the objective with the solve's active-set QP.
 fn oracle_box_min(
-    c: &ProfileCtx<'_>,
-    params: &ModelParameters,
-    start: &[f64],
-    lo: &[f64],
-    hi: &[f64],
+    c: &ProfileCtx<'_>, params: &ModelParameters, start: &[f64], lo: &[f64], hi: &[f64],
 ) -> (f64, Vec<f64>) {
     let n = start.len();
     let mut b: Vec<f64> = (0..n).map(|j| start[j].clamp(lo[j], hi[j])).collect();
@@ -4127,9 +3574,8 @@ fn oracle_box_min(
     };
     for _ in 0..60 {
         let hg = 1e-4;
-        let g: Vec<f64> = (0..n)
-            .map(|j| (at(&b, &[(j, hg)]) - at(&b, &[(j, -hg)])) / (2.0 * hg))
-            .collect();
+        let g: Vec<f64> =
+            (0..n).map(|j| (at(&b, &[(j, hg)]) - at(&b, &[(j, -hg)])) / (2.0 * hg)).collect();
         let free: Vec<usize> = (0..n)
             .filter(|&j| !((b[j] == lo[j] && g[j] > 0.0) || (b[j] == hi[j] && g[j] < 0.0)))
             .collect();
@@ -4184,11 +3630,7 @@ fn bounded_profile_is_the_box_constrained_minimum(adjoint: bool) {
     };
     let (p, layout, s) = solve_boxed(F2, F2_DATA, Some(3), edit);
     assert_eq!(profile_gradient_is_analytic(&p.parsed.model), adjoint);
-    assert!(
-        s.fd_gradient_subjects.is_empty(),
-        "{:?}",
-        s.fd_gradient_subjects
-    );
+    assert!(s.fd_gradient_subjects.is_empty(), "{:?}", s.fd_gradient_subjects);
     if adjoint {
         assert!(
             s.n_adjoint_gradients >= p.population.subjects.len(),
@@ -4224,16 +3666,8 @@ fn bounded_profile_is_the_box_constrained_minimum(adjoint: bool) {
         s.iterations
     );
     assert!(s.ofv.is_finite() && o_star.is_finite());
-    assert!(
-        layout.at_bound(&s.params.theta).len() == 2,
-        "two levels pinned"
-    );
-    assert!(
-        (s.ofv - o_star).abs() < D3_OFV_BOUND,
-        "{} vs {}",
-        s.ofv,
-        o_star
-    );
+    assert!(layout.at_bound(&s.params.theta).len() == 2, "two levels pinned");
+    assert!((s.ofv - o_star).abs() < D3_OFV_BOUND, "{} vs {}", s.ofv, o_star);
     assert!(worst_beta < D3_BETA_BOUND, "{worst_beta}");
 }
 
@@ -4256,10 +3690,7 @@ fn an_unreached_box_is_bit_identical_to_no_box() {
     let wide = boxed("(0.0, -1e9, 1e9)");
     let cases: Vec<(Box<dyn Fn() -> crate::api::PreparedRun>, &str)> = vec![
         (Box::new(|| prep(F1, F1_DATA, None, |t| t)), "F1"),
-        (
-            Box::new(|| prep(F1, F1_DATA, None, boxed("(0.0, -1e9, 1e9)"))),
-            "F1 boxed",
-        ),
+        (Box::new(|| prep(F1, F1_DATA, None, boxed("(0.0, -1e9, 1e9)"))), "F1 boxed"),
         (Box::new(|| global_prep(2)), "G"),
         (
             Box::new(move || prep(F2, F2_DATA, Some(2), |t| wide(t.replace(WITHIN, GLOBAL)))),
@@ -4273,10 +3704,7 @@ fn an_unreached_box_is_bit_identical_to_no_box() {
             let layout = layout_of(&p);
             let o = options(&p);
             let s = ctx(&p, &layout, &o)
-                .solve(
-                    &p.init_params,
-                    &ProfileWarm::from_template(&layout, &p.init_params),
-                )
+                .solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params))
                 .unwrap();
             (layout, s)
         })
@@ -4304,10 +3732,8 @@ fn an_unreached_box_is_bit_identical_to_no_box() {
 /// `BoundaryEstimate`, so every boundary consumer reads it.
 #[test]
 fn the_profiled_bound_warning_names_each_level_and_its_side() {
-    let names: Vec<String> = ["TVE0", "PLACEBO[STUDY=1]", "PLACEBO[STUDY=2]"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let names: Vec<String> =
+        ["TVE0", "PLACEBO[STUDY=1]", "PLACEBO[STUDY=2]"].iter().map(|s| s.to_string()).collect();
     let first = "Profiled level(s) on a declared bound: PLACEBO[STUDY=1] (-0.5000 at lower \
                  bound). The profile solve holds each at its bound. This often indicates \
                  non-identifiability or a too-tight bound; inspect the affected level(s) and \
@@ -4373,10 +3799,7 @@ const F1B_LOWER_OPT: [f64; 6] = [
 /// (`(TVE0, EMAX, ED50, ET50, ω², κ²)`, the levels left for the profile solve) or at the
 /// fixture's inits, with the covariance step `method` when `cov`.
 fn f1b_evaluated(
-    edit: &dyn Fn(String) -> String,
-    start: Option<&[f64; 6]>,
-    cov: bool,
-    method: CovarianceMethod,
+    edit: &dyn Fn(String) -> String, start: Option<&[f64; 6]>, cov: bool, method: CovarianceMethod,
 ) -> (crate::api::PreparedRun, crate::types::FitResult) {
     let p = prep(F1, F1_DATA, None, edit);
     let o = FitOptions {
@@ -4392,8 +3815,7 @@ fn f1b_evaluated(
 
 /// `p`'s inits with the structural θ, ω² and κ² of `start` written in.
 fn f1b_start(
-    p: &crate::api::PreparedRun,
-    start: Option<&[f64; 6]>,
+    p: &crate::api::PreparedRun, start: Option<&[f64; 6]>,
 ) -> crate::types::ModelParameters {
     let mut params = p.init_params.clone();
     if let Some(s) = start {
@@ -4440,12 +3862,7 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
                 );
                 assert_eq!(f.se_theta.as_ref().unwrap()[k], 0.0);
             } else if !p.init_params.theta_fixed[k] {
-                assert!(
-                    c[(k, k)] > 0.0,
-                    "{}: {}",
-                    p.init_params.theta_names[k],
-                    c[(k, k)]
-                );
+                assert!(c[(k, k)] > 0.0, "{}: {}", p.init_params.theta_names[k], c[(k, k)]);
             }
         }
     };
@@ -4455,16 +3872,8 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
     let pinned = [(theta_named(&p, "PLACEBO[STUDY=3,TIME=0]"), 3.0, true)];
     let held = [pinned[0].0];
     let names = &p.init_params.theta_names;
-    let at = |with_se| {
-        crate::api::profiled_bound_warning(names, &pinned, with_se)
-            .unwrap()
-            .0
-    };
-    assert!(
-        with_cov.warnings.contains(&at(true)),
-        "{:?}",
-        with_cov.warnings
-    );
+    let at = |with_se| crate::api::profiled_bound_warning(names, &pinned, with_se).unwrap().0;
+    assert!(with_cov.warnings.contains(&at(true)), "{:?}", with_cov.warnings);
     assert!(!with_cov.warnings.contains(&at(false)));
     assert_held(&p, &with_cov, &held);
     assert_eq!(
@@ -4484,18 +3893,10 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
         .find(|l| l.theta_index.is_none() && l.label.contains("STUDY=3"))
         .expect("study 3 has a dependent level");
     let dep_se = dep.se.unwrap_or_else(|| panic!("{}: no SE", dep.label));
-    assert!(
-        dep_se.is_finite() && dep_se > 0.0,
-        "{}: {dep_se}",
-        dep.label
-    );
+    assert!(dep_se.is_finite() && dep_se > 0.0, "{}: {dep_se}", dep.label);
 
     let (_, no_cov) = run(&bx, up, false, CovarianceMethod::Hessian);
-    assert!(
-        no_cov.warnings.contains(&at(false)),
-        "{:?}",
-        no_cov.warnings
-    );
+    assert!(no_cov.warnings.contains(&at(false)), "{:?}", no_cov.warnings);
     assert!(!no_cov.warnings.contains(&at(true)));
     assert_eq!(no_cov.profiled_levels_at_bound, held);
     assert!(crate::model_selection::estimate_near_boundary(&no_cov));
@@ -4504,12 +3905,7 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
     // layout. `s` is on F2b (`tests/profiled_levels.rs`): F1's 6 subjects leave `S`
     // rank-deficient whatever is held.
     for method in [CovarianceMethod::Hessian, CovarianceMethod::Sandwich] {
-        let (lp, lower) = run(
-            &boxed("(0.0, -1.5, 10.0)"),
-            Some(&F1B_LOWER_OPT),
-            true,
-            method,
-        );
+        let (lp, lower) = run(&boxed("(0.0, -1.5, 10.0)"), Some(&F1B_LOWER_OPT), true, method);
         let k = theta_named(&lp, "PLACEBO[STUDY=3,TIME=4]");
         assert_eq!(lower.theta[k].to_bits(), (-1.5_f64).to_bits());
         assert!(
@@ -4531,12 +3927,7 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
 
     // A box that holds every free level (#2416 review row 6): the held layout has no
     // coordinates left, and the step is the structural one around 18 offsets.
-    let (tp, tight) = run(
-        &boxed("(0.0, -0.01, 0.01)"),
-        up,
-        true,
-        CovarianceMethod::Hessian,
-    );
+    let (tp, tight) = run(&boxed("(0.0, -0.01, 0.01)"), up, true, CovarianceMethod::Hessian);
     let levels: Vec<usize> = (0..tight.theta.len())
         .filter(|&k| {
             tp.init_params.theta_names[k].starts_with("PLACEBO[") && !tp.init_params.theta_fixed[k]
@@ -4552,10 +3943,7 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
     );
 
     let (_, unboxed) = run(&|t| t, None, false, CovarianceMethod::Hessian);
-    assert!(!unboxed
-        .warnings
-        .iter()
-        .any(|w| w.contains("declared bound")));
+    assert!(!unboxed.warnings.iter().any(|w| w.contains("declared bound")));
     assert!(unboxed.profiled_levels_at_bound.is_empty());
     assert!(!crate::model_selection::estimate_near_boundary(&unboxed));
 }
@@ -4575,52 +3963,30 @@ fn run_covariance_reports_the_levels_its_step_held() {
     let (p, fit) = f1b_evaluated(&bx, Some(&F1B_UPPER_OPT), false, CovarianceMethod::Hessian);
     let k = theta_named(&p, "PLACEBO[STUDY=3,TIME=0]");
     let names = &p.init_params.theta_names;
-    let at = |with_se| {
-        crate::api::profiled_bound_warning(names, &[(k, 3.0, true)], with_se)
-            .unwrap()
-            .0
-    };
+    let at =
+        |with_se| crate::api::profiled_bound_warning(names, &[(k, 3.0, true)], with_se).unwrap().0;
     assert!(fit.covariance_matrix.is_none());
     assert_eq!(fit.profiled_levels_at_bound, [k]);
     assert!(fit.warnings.contains(&at(false)), "{:?}", fit.warnings);
-    let o = FitOptions {
-        covariance_method: CovarianceMethod::Hessian,
-        ..options(&p)
-    };
+    let o = FitOptions { covariance_method: CovarianceMethod::Hessian, ..options(&p) };
     let replay = |f: &crate::types::FitResult| {
         crate::run_covariance(f, Some(&p.parsed.model), Some(&p.population), &o)
             .unwrap_or_else(|e| panic!("{e}"))
     };
     let reports_held = |out: &crate::types::FitResult, cell: &str| {
-        assert!(
-            out.covariance_matrix.is_some(),
-            "{cell}: {:?}",
-            out.warnings
-        );
+        assert!(out.covariance_matrix.is_some(), "{cell}: {:?}", out.warnings);
         assert_eq!(out.profiled_levels_at_bound, [k], "{cell}");
         assert!(out.cov_fixed[k], "{cell}: the replayed step held it");
         let n = |w: &str| out.warnings.iter().filter(|x| x.as_str() == w).count();
-        assert_eq!(
-            (n(&at(true)), n(&at(false))),
-            (1, 0),
-            "{cell}: {:?}",
-            out.warnings
-        );
+        assert_eq!((n(&at(true)), n(&at(false))), (1, 0), "{cell}: {:?}", out.warnings);
         let entries: Vec<_> = out
             .warnings_structured
             .iter()
-            .filter(|e| {
-                e.message
-                    .starts_with("Profiled level(s) on a declared bound:")
-            })
+            .filter(|e| e.message.starts_with("Profiled level(s) on a declared bound:"))
             .collect();
         assert_eq!(entries.len(), 1, "{cell}");
         assert_eq!(entries[0].message, at(true), "{cell}");
-        assert_eq!(
-            entries[0].category,
-            crate::types::WarningCode::BoundaryEstimate,
-            "{cell}"
-        );
+        assert_eq!(entries[0].category, crate::types::WarningCode::BoundaryEstimate, "{cell}");
         assert!(entries[0].details.is_some(), "{cell}");
     };
     reports_held(&replay(&fit), "(a)");
@@ -4636,11 +4002,7 @@ fn run_covariance_reports_the_levels_its_step_held() {
         .lines()
         .find(|l| l.trim_start().starts_with("PLACEBO[STUDY=3,TIME=0]"))
         .unwrap_or_else(|| panic!("{summary}"));
-    assert_eq!(
-        row.split_whitespace().skip(2).collect::<Vec<_>>(),
-        ["N/A", "N/A"],
-        "{row}"
-    );
+    assert_eq!(row.split_whitespace().skip(2).collect::<Vec<_>>(), ["N/A", "N/A"], "{row}");
 
     let mut moved = stale.clone();
     moved.theta[k] = 2.9;
@@ -4663,11 +4025,7 @@ fn run_covariance_reports_the_levels_its_step_held() {
         assert_eq!(out.theta[i].to_bits(), moved.theta[i].to_bits(), "{i}");
     }
     assert_eq!(out.ofv.to_bits(), moved.ofv.to_bits());
-    assert!(out
-        .subjects
-        .iter()
-        .zip(&moved.subjects)
-        .all(|(a, b)| a.eta == b.eta));
+    assert!(out.subjects.iter().zip(&moved.subjects).all(|(a, b)| a.eta == b.eta));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.yaml");
     crate::io::output::write_estimates_yaml(&out, path.to_str().unwrap()).unwrap();
@@ -4704,12 +4062,7 @@ fn run_covariance_reports_the_levels_its_step_held() {
     // (#2420), the step fails after the first re-solve moved the levels. They are still
     // reported where it put them, and the warning says the step failed there.
     let starved = |t: String| bx(t).replace("TVE0", STARVE_HELD_RESOLVE);
-    let (ps, fs) = f1b_evaluated(
-        &starved,
-        Some(&F1B_UPPER_OPT),
-        false,
-        CovarianceMethod::Hessian,
-    );
+    let (ps, fs) = f1b_evaluated(&starved, Some(&F1B_UPPER_OPT), false, CovarianceMethod::Hessian);
     let mut moved_s = fs.clone();
     moved_s.theta[k] = 2.9;
     moved_s.packed_estimate = None;
@@ -4717,18 +4070,11 @@ fn run_covariance_reports_the_levels_its_step_held() {
         &moved_s,
         Some(&ps.parsed.model),
         Some(&ps.population),
-        &FitOptions {
-            max_unconverged_frac: 0.0,
-            ..o.clone()
-        },
+        &FitOptions { max_unconverged_frac: 0.0, ..o.clone() },
     )
     .unwrap_or_else(|e| panic!("{e}"));
     assert!(failed.covariance_matrix.is_none(), "{:?}", failed.warnings);
-    assert!(
-        failed.warnings.iter().any(|w| w.contains("EBE guard")),
-        "{:?}",
-        failed.warnings
-    );
+    assert!(failed.warnings.iter().any(|w| w.contains("EBE guard")), "{:?}", failed.warnings);
     assert_eq!(failed.theta[k].to_bits(), 3.0f64.to_bits());
     assert_eq!(
         resolved(&failed),
@@ -4743,19 +4089,11 @@ fn run_covariance_reports_the_levels_its_step_held() {
     for (cell, f) in [("(a)", &fit), ("(b)", &stale)] {
         let r = replay(f);
         assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.starts_with("W_COV_PROFILED_LEVELS_RESOLVED")),
+            !r.warnings.iter().any(|w| w.starts_with("W_COV_PROFILED_LEVELS_RESOLVED")),
             "{cell}: {:?}",
             r.warnings
         );
-        assert!(
-            r.theta
-                .iter()
-                .zip(&f.theta)
-                .all(|(a, b)| a.to_bits() == b.to_bits()),
-            "{cell}"
-        );
+        assert!(r.theta.iter().zip(&f.theta).all(|(a, b)| a.to_bits() == b.to_bits()), "{cell}");
     }
 }
 
@@ -4789,18 +4127,12 @@ fn an_unreached_box_leaves_the_fit_bit_identical() {
         bits(&plain.omega.iter().copied().collect::<Vec<_>>()),
         bits(&wide.omega.iter().copied().collect::<Vec<_>>())
     );
-    assert_eq!(
-        bits(cov.as_slice()),
-        bits(wide.covariance_matrix.as_ref().unwrap().as_slice())
-    );
+    assert_eq!(bits(cov.as_slice()), bits(wide.covariance_matrix.as_ref().unwrap().as_slice()));
     // The SS-equilibration diagnostic is collected process-wide, so a concurrently running
     // test's `SS=1` warnings can land in either fit (measured on the full `--lib` run);
     // F1 has no `SS` record, so none of them is this fit's.
     let own = |w: &[String]| -> Vec<String> {
-        w.iter()
-            .filter(|s| !s.starts_with("Steady-state (SS=1)"))
-            .cloned()
-            .collect()
+        w.iter().filter(|s| !s.starts_with("Steady-state (SS=1)")).cloned().collect()
     };
     assert_eq!(own(&plain.warnings), own(&wide.warnings));
 }
@@ -4821,17 +4153,11 @@ fn an_unreached_box_leaves_the_fit_bit_identical() {
 fn the_profiled_covariance_step_is_its_own_default_unless_set() {
     let unset = FitOptions::default();
     assert!(!unset.fd_hessian_step_set);
-    assert_ne!(
-        PROFILE_FD_HESSIAN_STEP, unset.fd_hessian_step,
-        "the straddle"
-    );
+    assert_ne!(PROFILE_FD_HESSIAN_STEP, unset.fd_hessian_step, "the straddle");
     assert_eq!(profile_fd_hessian_step(&unset), PROFILE_FD_HESSIAN_STEP);
     for h in [1e-2, 1e-3] {
-        let set = FitOptions {
-            fd_hessian_step: h,
-            fd_hessian_step_set: true,
-            ..FitOptions::default()
-        };
+        let set =
+            FitOptions { fd_hessian_step: h, fd_hessian_step_set: true, ..FitOptions::default() };
         assert_eq!(profile_fd_hessian_step(&set), h, "explicit {h}");
     }
 
@@ -4844,10 +4170,9 @@ fn the_profiled_covariance_step_is_its_own_default_unless_set() {
     };
     let without = parsed(&text);
     assert!(!without.fd_hessian_step_set, "no key, no flag");
-    let with = parsed(&text.replace(
-        "  covariance = true\n",
-        "  covariance = true\n  fd_hessian_step = 1e-2\n",
-    ));
+    let with = parsed(
+        &text.replace("  covariance = true\n", "  covariance = true\n  fd_hessian_step = 1e-2\n"),
+    );
     assert!(with.fd_hessian_step_set, "the key raises the flag");
     assert_eq!(profile_fd_hessian_step(&with), 1e-2);
 }
@@ -4876,9 +4201,7 @@ struct CovPoint {
 
 /// The covariance step's context for `p` (its inner tolerance, as `covariance` builds it).
 fn cov_ctx<'a>(
-    p: &'a crate::api::PreparedRun,
-    layout: &'a ProfileLayout,
-    o: &'a FitOptions,
+    p: &'a crate::api::PreparedRun, layout: &'a ProfileLayout, o: &'a FitOptions,
 ) -> ProfileCtx<'a> {
     ProfileCtx {
         inner_tol: o
@@ -4897,9 +4220,7 @@ fn cov_point(p: &crate::api::PreparedRun, layout: &ProfileLayout, o: &FitOptions
 /// population inner loop's cold start. At `inner_maxiter = 2` each of those stops short of
 /// its mode, where a line-search re-solve would end on a certified fallback (#2539).
 fn cov_point_at_solved_levels(
-    p: &crate::api::PreparedRun,
-    layout: &ProfileLayout,
-    o: &FitOptions,
+    p: &crate::api::PreparedRun, layout: &ProfileLayout, o: &FitOptions,
 ) -> CovPoint {
     let solved = cov_point(p, layout, &options(p)).solve;
     let mut template = p.init_params.clone();
@@ -4910,29 +4231,16 @@ fn cov_point_at_solved_levels(
 }
 
 fn cov_point_from(
-    p: &crate::api::PreparedRun,
-    layout: &ProfileLayout,
-    o: &FitOptions,
-    template: &ModelParameters,
+    p: &crate::api::PreparedRun, layout: &ProfileLayout, o: &FitOptions, template: &ModelParameters,
 ) -> CovPoint {
     let hold = hold_template(layout, template);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let solve = cov_ctx(p, layout, o)
-        .solve(
-            &unpack_params(&x, &hold),
-            &ProfileWarm::from_template(layout, template),
-        )
+        .solve(&unpack_params(&x, &hold), &ProfileWarm::from_template(layout, template))
         .unwrap_or_else(|e| panic!("the profile solve failed: {e:?}"));
     let x_hat = solved_point(layout, &hold, &x, &solve);
-    CovPoint {
-        hold,
-        x_hat,
-        free,
-        solve,
-    }
+    CovPoint { hold, x_hat, free, solve }
 }
 
 /// C2, per fixture: at `β̂`, every subject's exact `Dᵢ` and `Bᵢ` against the re-solved
@@ -4945,9 +4253,7 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
     let o = options(p);
     let cp = cov_point(p, &layout, &o);
     let c = cov_ctx(p, &layout, &o);
-    let (_, ls) = c
-        .block_steps(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
-        .unwrap();
+    let (_, ls) = c.block_steps(&cp.hold, &cp.x_hat, &cp.free, &cp.solve).unwrap();
     // The structural steps well below the stencil's default, whose truncation would be
     // most of the gap (`level_blocks_over_levels_are_the_theta_hessian`).
     let ts: Vec<f64> = cp
@@ -4999,10 +4305,9 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
             (gd, gb, ga, sd.min(sb).min(sa))
         })
         .collect();
-    per.iter().fold(
-        (0.0, 0.0, 0.0, f64::INFINITY),
-        |(d, b, a, s), &(gd, gb, ga, si)| (d.max(gd), b.max(gb), a.max(ga), s.min(si)),
-    )
+    per.iter().fold((0.0, 0.0, 0.0, f64::INFINITY), |(d, b, a, s), &(gd, gb, ga, si)| {
+        (d.max(gd), b.max(gb), a.max(ga), s.min(si))
+    })
 }
 
 /// C2. Every G2 fixture is on the adjoint and its `Dᵢ`, `Bᵢ` match the re-solved
@@ -5050,28 +4355,18 @@ const C2_A_BOUND: f64 = 2e-3;
 #[test]
 fn the_schur_profile_hessian_is_the_profile_stencil() {
     on_fit_pool(|| {
-        for (name, p) in [
-            ("F2", prep(F2, F2_DATA, Some(2), |t| t)),
-            ("global", global_prep(2)),
-        ] {
+        for (name, p) in [("F2", prep(F2, F2_DATA, Some(2), |t| t)), ("global", global_prep(2))] {
             let layout = layout_of(&p);
             let o = options(&p);
             let cp = cov_point(&p, &layout, &o);
             let c = cov_ctx(&p, &layout, &o);
-            let blocks = c
-                .level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
-                .unwrap();
-            assert!(
-                blocks.fd_subjects.is_empty(),
-                "{name}: {:?}",
-                blocks.fd_subjects
-            );
+            let blocks = c.level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve).unwrap();
+            assert!(blocks.fd_subjects.is_empty(), "{name}: {:?}", blocks.fd_subjects);
             let a = blocks.a.as_ref().expect("every subject exact");
             let a_p = schur_profile_hessian(&layout, a, &blocks.d_groups, &blocks.b).unwrap();
             let warm = ProfileWarm::from_solve(&layout, &cp.solve);
             let f = |xv: &[f64]| {
-                c.solve(&unpack_params(xv, &cp.hold), &warm)
-                    .map_or(f64::NAN, |s| s.ofv)
+                c.solve(&unpack_params(xv, &cp.hold), &warm).map_or(f64::NAN, |s| s.ofv)
             };
             let floor = fd_step_floors(&cp.hold, &c.model);
             let st = fd_ofv_hessian(
@@ -5125,21 +4420,12 @@ const C4_STRADDLE: f64 = 0.2;
 fn cov_step(p: &crate::api::PreparedRun, o: &FitOptions) -> (CovStepOutcome, usize) {
     let layout = layout_of(p);
     let c = ctx(p, &layout, o);
-    let s = c
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(&layout, &p.init_params),
-        )
-        .unwrap();
+    let s = c.solve(&p.init_params, &ProfileWarm::from_template(&layout, &p.init_params)).unwrap();
     let hold = hold_template(&layout, &p.init_params);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let before = PROFILE_COV_SCHUR.with(std::cell::Cell::get);
-    let out = c
-        .covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas)
-        .0;
+    let out = c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas).0;
     (out, PROFILE_COV_SCHUR.with(std::cell::Cell::get) - before)
 }
 
@@ -5154,34 +4440,21 @@ fn a_subject_off_its_mode_takes_the_resolved_level_blocks() {
         let p = prep(F2, F2_DATA, Some(2), |t| t);
         let layout = layout_of(&p);
         let o = options(&p);
-        let short = FitOptions {
-            inner_maxiter: 2,
-            ..o.clone()
-        };
+        let short = FitOptions { inner_maxiter: 2, ..o.clone() };
         for (opts, all_off) in [(&o, false), (&short, true)] {
             let cp = if all_off {
                 cov_point_at_solved_levels(&p, &layout, opts)
             } else {
                 cov_point(&p, &layout, opts)
             };
-            assert!(
-                cp.solve.off_mode.iter().all(|&b| b == all_off),
-                "{:?}",
-                cp.solve.off_mode
-            );
+            assert!(cp.solve.off_mode.iter().all(|&b| b == all_off), "{:?}", cp.solve.off_mode);
             let blocks = cov_ctx(&p, &layout, opts)
                 .level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
                 .unwrap();
-            let want: Vec<usize> = if all_off {
-                (0..p.population.subjects.len()).collect()
-            } else {
-                Vec::new()
-            };
+            let want: Vec<usize> =
+                if all_off { (0..p.population.subjects.len()).collect() } else { Vec::new() };
             assert_eq!(blocks.fd_subjects, want);
-            assert!(blocks
-                .a
-                .as_ref()
-                .is_some_and(|a| a.iter().all(|v| v.is_finite())));
+            assert!(blocks.a.as_ref().is_some_and(|a| a.iter().all(|v| v.is_finite())));
         }
     });
 }
@@ -5199,11 +4472,7 @@ fn an_off_mode_subject_below_min_obs_is_not_reported() {
         let layout = layout_of(&p);
         let n = p.population.subjects.len();
         let all: Vec<usize> = (0..n).collect();
-        assert!(p
-            .population
-            .subjects
-            .iter()
-            .all(|s| s.observations.len() == 8));
+        assert!(p.population.subjects.iter().all(|s| s.observations.len() == 8));
         for (min_obs, excused) in [(8, false), (9, true)] {
             let o = FitOptions {
                 inner_maxiter: 2,
@@ -5211,11 +4480,7 @@ fn an_off_mode_subject_below_min_obs_is_not_reported() {
                 ..options(&p)
             };
             let cp = cov_point_at_solved_levels(&p, &layout, &o);
-            assert!(
-                cp.solve.off_mode.iter().all(|&b| b),
-                "{:?}",
-                cp.solve.off_mode
-            );
+            assert!(cp.solve.off_mode.iter().all(|&b| b), "{:?}", cp.solve.off_mode);
             assert!(
                 cp.solve.off_mode_excused.iter().all(|&b| b == excused),
                 "min_obs {min_obs}: {:?}",
@@ -5224,9 +4489,7 @@ fn an_off_mode_subject_below_min_obs_is_not_reported() {
             let want: Vec<usize> = if excused { Vec::new() } else { all.clone() };
             assert_eq!(cp.solve.fd_gradient_subjects, want, "min_obs {min_obs}");
             let c = cov_ctx(&p, &layout, &o);
-            let blocks = c
-                .level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve)
-                .unwrap();
+            let blocks = c.level_blocks(&cp.hold, &cp.x_hat, &cp.free, &cp.solve).unwrap();
             assert_eq!(blocks.fd_subjects, all, "the fallback itself stays");
             let out = c.exact_covariance(&cp.hold, &cp.x_hat, &cp.free, &cp.solve, Instant::now());
             let named: Vec<&String> = out
@@ -5236,11 +4499,7 @@ fn an_off_mode_subject_below_min_obs_is_not_reported() {
                 .collect();
             assert_eq!(named.is_empty(), excused, "{:?}", out.warnings);
             if !excused {
-                assert!(
-                    named[0].starts_with(&format!("{n} of {n} subjects")),
-                    "{}",
-                    named[0]
-                );
+                assert!(named[0].starts_with(&format!("{n} of {n} subjects")), "{}", named[0]);
             }
         }
     });
@@ -5260,10 +4519,8 @@ fn a_profiled_fit_does_not_report_off_mode_subjects_below_min_obs() {
             ..options(&p)
         };
         let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
-        let named = r
-            .warnings
-            .iter()
-            .any(|w| w.contains("gradient of the profile solve during this fit"));
+        let named =
+            r.warnings.iter().any(|w| w.contains("gradient of the profile solve during this fit"));
         assert_eq!(named, !excused, "min_obs {min_obs}: {:?}", r.warnings);
     }
 }
@@ -5295,25 +4552,15 @@ fn the_profiled_covariance_step_runs_on_the_exact_blocks() {
         let p = prep(F2, F2_DATA, Some(2), |t| t);
         let o = options(&p);
         // A step value no other test uses, so the stencil-call log is this test's alone.
-        let exact_step = FitOptions {
-            fd_hessian_step: R2_EXACT_STEP,
-            fd_hessian_step_set: true,
-            ..o.clone()
-        };
+        let exact_step =
+            FitOptions { fd_hessian_step: R2_EXACT_STEP, fd_hessian_step_set: true, ..o.clone() };
         let (first, n1) = cov_step(&p, &exact_step);
-        assert_eq!(
-            take_fd_hessian(R2_EXACT_STEP),
-            0,
-            "the exact route ran the stencil"
-        );
+        assert_eq!(take_fd_hessian(R2_EXACT_STEP), 0, "the exact route ran the stencil");
         let (second, n2) = cov_step(&p, &o);
         assert_eq!((n1, n2), (1, 1), "{:?}", first.warnings);
         assert!(first.warnings.is_empty(), "{:?}", first.warnings);
         let (m1, m2) = (first.matrix.unwrap(), second.matrix.unwrap());
-        assert!(m1
-            .iter()
-            .zip(m2.iter())
-            .all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(m1.iter().zip(m2.iter()).all(|(a, b)| a.to_bits() == b.to_bits()));
 
         // Off the exact route the stencil steps at the profile's own default when
         // `fd_hessian_step` is left unset (#2414), whatever value the field holds.
@@ -5324,33 +4571,19 @@ fn the_profiled_covariance_step_runs_on_the_exact_blocks() {
             ..o.clone()
         };
         let (out, n) = cov_step(&p, &off);
-        assert_eq!(
-            n, 0,
-            "analytic_cov_hessian = false ran the Schur complement"
-        );
+        assert_eq!(n, 0, "analytic_cov_hessian = false ran the Schur complement");
         assert_eq!(
             take_fd_hessian(R2_UNSET_STEP),
             0,
             "an unset fd_hessian_step reached the stencil"
         );
-        assert!(
-            take_fd_hessian(PROFILE_FD_HESSIAN_STEP) >= 1,
-            "no stencil ran"
-        );
-        assert!(
-            out.matrix.is_some() && out.warnings.is_empty(),
-            "{:?}",
-            out.warnings
-        );
+        assert!(take_fd_hessian(PROFILE_FD_HESSIAN_STEP) >= 1, "no stencil ran");
+        assert!(out.matrix.is_some() && out.warnings.is_empty(), "{:?}", out.warnings);
         let pf = prep(F2, F2_DATA, Some(2), forced_fd);
         let of = options(&pf);
         let (out, n) = cov_step(&pf, &of);
         assert_eq!(n, 0, "gradient = fd ran the Schur complement");
-        assert!(
-            out.matrix.is_some() && out.warnings.is_empty(),
-            "{:?}",
-            out.warnings
-        );
+        assert!(out.matrix.is_some() && out.warnings.is_empty(), "{:?}", out.warnings);
 
         FORCE_PROFILE_COV_DECLINE.with(|c| c.set(Some(1)));
         let declined = cov_step(&p, &o);
@@ -5383,11 +4616,7 @@ fn the_profiled_covariance_step_runs_on_the_exact_blocks() {
         assert!(gap < R2_MIXED_GAP, "{gap:.3e}");
         let (out, n) = declined_fd;
         assert_eq!(n, 0);
-        assert!(
-            out.warnings.is_empty(),
-            "the FD route warned: {:?}",
-            out.warnings
-        );
+        assert!(out.warnings.is_empty(), "the FD route warned: {:?}", out.warnings);
     });
 }
 
@@ -5398,15 +4627,10 @@ fn exact_step_by_hand(p: &crate::api::PreparedRun, solver: &ProfileCtx<'_>) -> D
     let layout = solver.layout;
     let c = solver.at_cov_tol();
     let s = ctx(p, layout, solver.options)
-        .solve(
-            &p.init_params,
-            &ProfileWarm::from_template(layout, &p.init_params),
-        )
+        .solve(&p.init_params, &ProfileWarm::from_template(layout, &p.init_params))
         .unwrap();
     let hold = hold_template(layout, &p.init_params);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let warm = ProfileWarm {
         beta: layout.coords.iter().map(|&k| s.params.theta[k]).collect(),
@@ -5415,13 +4639,9 @@ fn exact_step_by_hand(p: &crate::api::PreparedRun, solver: &ProfileCtx<'_>) -> D
     let sol = solver.solve(&s.params, &warm).unwrap();
     let x_hat = solved_point(layout, &hold, &x, &sol);
     let blocks = c.level_blocks(&hold, &x_hat, &free, &sol).unwrap();
-    let a_p = schur_profile_hessian(
-        layout,
-        blocks.a.as_ref().unwrap(),
-        &blocks.d_groups,
-        &blocks.b,
-    )
-    .unwrap();
+    let a_p =
+        schur_profile_hessian(layout, blocks.a.as_ref().unwrap(), &blocks.d_groups, &blocks.b)
+            .unwrap();
     c.covariance_from_profile_hessian(
         &hold,
         &x_hat,
@@ -5449,15 +4669,9 @@ fn the_exact_covariance_step_reads_its_blocks_at_the_cov_tolerance() {
     on_fit_pool(|| {
         let p = prep(F2, F2_DATA, Some(2), |t| t);
         let layout = layout_of(&p);
-        let o = FitOptions {
-            cov_inner_tol: Some(1e-12),
-            ..options(&p)
-        };
+        let o = FitOptions { cov_inner_tol: Some(1e-12), ..options(&p) };
         let c = ctx(&p, &layout, &o);
-        assert!(
-            c.at_cov_tol().inner_tol < c.inner_tol,
-            "the fixture separates the two"
-        );
+        assert!(c.at_cov_tol().inner_tol < c.inner_tol, "the fixture separates the two");
         let (out, n) = cov_step(&p, &o);
         assert_eq!(n, 1, "{:?}", out.warnings);
         let got = out.matrix.unwrap();
@@ -5491,32 +4705,20 @@ fn the_held_layout_resolve_runs_at_the_cov_tolerance() {
     };
     let c = ctx(&p, &layout, &o);
     assert!(c.cov_is_analytic());
-    let s = c
-        .solve(&start, &ProfileWarm::from_template(&layout, &start))
-        .unwrap();
+    let s = c.solve(&start, &ProfileWarm::from_template(&layout, &start)).unwrap();
     let hold = hold_template(&layout, &start);
-    let PackedStart {
-        packed: x, fixed, ..
-    } = pack_with_bounds(&hold);
+    let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
     let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
     let ((out, pinned), rec) = on_one_thread(|| {
         record_inner_solves(|| {
             c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas)
         })
     });
-    assert_eq!(
-        pinned.map(|r| r.pinned.len()),
-        Some(1),
-        "one level held: {:?}",
-        out.warnings
-    );
+    assert_eq!(pinned.map(|r| r.pinned.len()), Some(1), "one level held: {:?}", out.warnings);
     assert!(out.matrix.is_some(), "{:?}", out.warnings);
     let tols: Vec<f64> = rec.solve_tols.iter().map(|&(_, t)| t).collect();
     assert!(!tols.is_empty());
-    assert!(
-        tols.iter().all(|&t| t == 1e-12),
-        "a solve off the step's tolerance: {tols:?}"
-    );
+    assert!(tols.iter().all(|&t| t == 1e-12), "a solve off the step's tolerance: {tols:?}");
 }
 
 /// #2420: the held-layout re-solve (#2112) goes through the #2214 EBE guard, as the first
@@ -5530,9 +4732,7 @@ fn the_held_layout_resolve_runs_at_the_cov_tolerance() {
 #[test]
 fn a_guarded_held_layout_resolve_fails_the_step() {
     let step = |edit: &dyn Fn(String) -> String| {
-        let p = prep(F1, F1_DATA, None, |t| {
-            edit(t).replace("TVE0", STARVE_HELD_RESOLVE)
-        });
+        let p = prep(F1, F1_DATA, None, |t| edit(t).replace("TVE0", STARVE_HELD_RESOLVE));
         let layout = layout_of(&p);
         let start = f1b_start(&p, Some(&F1B_UPPER_OPT));
         let o = FitOptions {
@@ -5541,13 +4741,9 @@ fn a_guarded_held_layout_resolve_fails_the_step() {
             ..options(&p)
         };
         let c = ctx(&p, &layout, &o);
-        let s = c
-            .solve(&start, &ProfileWarm::from_template(&layout, &start))
-            .unwrap();
+        let s = c.solve(&start, &ProfileWarm::from_template(&layout, &start)).unwrap();
         let hold = hold_template(&layout, &start);
-        let PackedStart {
-            packed: x, fixed, ..
-        } = pack_with_bounds(&hold);
+        let PackedStart { packed: x, fixed, .. } = pack_with_bounds(&hold);
         let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
         let (out, resolved) =
             c.covariance_at_estimate(&hold, &x, &free, &s.params, &s.etas, &s.kappas);
@@ -5577,11 +4773,7 @@ fn a_guarded_held_layout_resolve_fails_the_step() {
 
     let (_, unheld, resolved) = step(&|t| t);
     assert_eq!(resolved.map(|r| r.pinned.len()), Some(0), "no level held");
-    assert!(
-        !unheld.warnings.iter().any(|w| w.contains("EBE guard")),
-        "{:?}",
-        unheld.warnings
-    );
+    assert!(!unheld.warnings.iter().any(|w| w.contains("EBE guard")), "{:?}", unheld.warnings);
 }
 
 /// `W_COV_PROFILED_LEVELS_RESOLVED` names the largest move by its signed size, so a move
@@ -5636,10 +4828,7 @@ fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
     let free = theta_named(&p, "PLACEBO[STUDY=3,TIME=4]");
     assert_eq!(fit.profiled_levels_at_bound, [k]);
     assert_eq!(fit.theta[k].to_bits(), 3.0f64.to_bits());
-    let cov = fit
-        .covariance_matrix
-        .clone()
-        .expect("the step held the level");
+    let cov = fit.covariance_matrix.clone().expect("the step held the level");
     assert_eq!(cov[(k, k)], 0.0);
     assert!(cov[(free, free)] > 0.0);
     let template =
@@ -5655,14 +4844,8 @@ fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
         &mut rng,
     )
     .unwrap();
-    let off = draws
-        .iter()
-        .filter(|d| d.theta[k].to_bits() != 3.0f64.to_bits())
-        .count();
-    let moved = draws
-        .iter()
-        .filter(|d| d.theta[free] != fit.theta[free])
-        .count();
+    let off = draws.iter().filter(|d| d.theta[k].to_bits() != 3.0f64.to_bits()).count();
+    let moved = draws.iter().filter(|d| d.theta[free] != fit.theta[free]).count();
     eprintln!("asymptotic: held off {off}/400, free moved {moved}/400");
     assert_eq!(off, 0, "asymptotic draws off the held level's bound");
     assert_eq!(moved, 400, "the free level of the same study varies");
@@ -5687,18 +4870,12 @@ fn uncertainty_draws_hold_a_level_the_step_held_on_its_bound() {
     .unwrap();
     let pool = r.resamples_packed.expect("kept");
     let x_hat = pack_with_bounds(&template).packed;
-    let off = pool
-        .iter()
-        .filter(|x| x[k].to_bits() != x_hat[k].to_bits())
-        .count();
+    let off = pool.iter().filter(|x| x[k].to_bits() != x_hat[k].to_bits()).count();
     let moved = pool.iter().filter(|x| x[free] != x_hat[free]).count();
     eprintln!("sir: held off {off}/{}, free moved {moved}", pool.len());
     assert_eq!(pool.len(), 100);
     assert_eq!(off, 0, "SIR resamples off the held level's bound");
-    assert!(
-        moved > 50,
-        "the free level of the same study varies: {moved}"
-    );
+    assert!(moved > 50, "the free level of the same study varies: {moved}");
 }
 
 // ── #2539: a certified Nelder–Mead fallback is a mode ──────────────────────────────
@@ -5751,10 +4928,7 @@ const CERTIFIED_FALLBACK_GAP: f64 = 6e-6;
 fn certified_and_short_gaps(p: &crate::api::PreparedRun, short_maxiter: usize) -> (f64, f64) {
     let layout = layout_of(p);
     let o = options(p);
-    let short = FitOptions {
-        inner_maxiter: short_maxiter,
-        ..o.clone()
-    };
+    let short = FitOptions { inner_maxiter: short_maxiter, ..o.clone() };
     let (cf, cs) = (ctx(p, &layout, &o), ctx(p, &layout, &short));
     let params = &p.init_params;
     let scale = cf
@@ -5775,12 +4949,8 @@ fn certified_and_short_gaps(p: &crate::api::PreparedRun, short_maxiter: usize) -
             let g = cs
                 .total_gradient_adjoint(i, &pt, s)
                 .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
-            let d: Vec<f64> = g
-                .iter()
-                .zip(&reference)
-                .zip(&se)
-                .map(|((a, b), s)| ((a - b) * s).abs())
-                .collect();
+            let d: Vec<f64> =
+                g.iter().zip(&reference).zip(&se).map(|((a, b), s)| ((a - b) * s).abs()).collect();
             assert!(d.iter().all(|v| v.is_finite()), "subject {i}: {d:?}");
             d.into_iter().fold(0.0, f64::max)
         };
@@ -5821,10 +4991,7 @@ fn a_certified_fallback_takes_the_adjoint_level_gradient() {
     );
     assert!(f2 <= CERTIFIED_FALLBACK_GAP, "F2: {f2:.3e} SE");
     assert!(nested <= CERTIFIED_FALLBACK_GAP, "nested: {nested:.3e} SE");
-    assert!(
-        nested_short > 1.0,
-        "the straddle is gone: {nested_short:.3e} SE"
-    );
+    assert!(nested_short > 1.0, "the straddle is gone: {nested_short:.3e} SE");
 }
 
 /// #2588 (M8): the profile solve's `n_nm_polished` is the population loop's count at the
@@ -5846,11 +5013,8 @@ fn the_profile_solve_counts_its_own_moved_states() {
     let cf = ctx(&p, &layout, &o);
     let params = &p.init_params;
     let counts = |mode| {
-        let scoped = FitOptions {
-            inner_optimizer: mode,
-            ..o.clone()
-        };
-        crate::api::with_fit_scope(&scoped, || {
+        let scoped = FitOptions { inner_optimizer: mode, ..o.clone() };
+        crate::pool::with_fit_scope(&scoped, || {
             let warm = ProfileWarm::from_template(&layout, params);
             let mut ps = params.clone();
             for (pos, (&k, &b)) in layout.coords.iter().zip(&warm.beta).enumerate() {
@@ -5878,11 +5042,7 @@ fn the_profile_solve_counts_its_own_moved_states() {
             )
             .2
             .n_nm_polished;
-            let solve = cf
-                .solve(params, &warm)
-                .expect("the solve converges")
-                .ebe
-                .n_nm_polished;
+            let solve = cf.solve(params, &warm).expect("the solve converges").ebe.n_nm_polished;
             (start, solve)
         })
         .expect("the scope builds")
@@ -5949,15 +5109,13 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
         let g = cf
             .total_gradient_adjoint(i, &pt, &nm)
             .unwrap_or_else(|| panic!("subject {i}: the adjoint declined"));
-        let gap = g
-            .iter()
-            .zip(&reference)
-            .zip(&se)
-            .map(|((a, b), s)| ((a - b) * s).abs())
-            .fold(0.0_f64, |m, d| {
+        let gap = g.iter().zip(&reference).zip(&se).map(|((a, b), s)| ((a - b) * s).abs()).fold(
+            0.0_f64,
+            |m, d| {
                 assert!(d.is_finite(), "subject {i}: non-finite gap");
                 m.max(d)
-            });
+            },
+        );
         worst = worst.max(gap);
     }
     eprintln!(
@@ -5973,11 +5131,8 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
     // 1's stop was 3.3e-2 off its mode), and the profile solve's own count reports them.
     assert!(moved > 0, "no NM stop needed the certificate");
     let solve_moved = |mode| {
-        let o = FitOptions {
-            inner_optimizer: mode,
-            ..o.clone()
-        };
-        crate::api::with_fit_scope(&o, || {
+        let o = FitOptions { inner_optimizer: mode, ..o.clone() };
+        crate::pool::with_fit_scope(&o, || {
             cf.solve(params, &ProfileWarm::from_template(&layout, params))
                 .expect("the solve converges")
                 .ebe
@@ -6011,11 +5166,7 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
 #[test]
 fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
     let p = prep(F2, F2_DATA, None, |t| t);
-    let o = FitOptions {
-        outer_maxiter: 500,
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { outer_maxiter: 500, run_covariance_step: false, ..options(&p) };
     use crate::estimation::inner_optimizer::STUCK_CERTIFIED;
     use std::sync::atomic::Ordering;
     let stuck0 = STUCK_CERTIFIED.load(Ordering::Relaxed);
@@ -6033,13 +5184,7 @@ fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
     );
     assert!(r.ofv.is_finite());
     assert_eq!(r.max_unconverged_subjects, 0, "every EBE converged");
-    assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("W_PROFILE_FD_GRADIENT")),
-        "{:?}",
-        r.warnings
-    );
+    assert!(!r.warnings.iter().any(|w| w.contains("W_PROFILE_FD_GRADIENT")), "{:?}", r.warnings);
 }
 
 // ── #2107: the profile under `method = laplace` (PR-L) ──────────────────────────────
@@ -6147,11 +5292,7 @@ fn the_laplace_profile_objective_is_the_minimum_over_the_levels() {
     let s = c.solve(&p.init_params, &warm).expect("the solve converges");
     assert!(s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty());
     let (o_star, b_star) = oracle_min_of(|b| laplace_ofv(&p, &p.init_params, b), &warm.beta);
-    let frozen = laplace_ofv(
-        &p,
-        &p.init_params,
-        &frozen_levels(&c, &p.init_params, &warm.beta),
-    );
+    let frozen = laplace_ofv(&p, &p.init_params, &frozen_levels(&c, &p.init_params, &warm.beta));
     assert!(s.ofv.is_finite() && o_star.is_finite() && frozen.is_finite());
     let worst_beta = layout
         .coords
@@ -6173,17 +5314,10 @@ fn the_laplace_profile_objective_is_the_minimum_over_the_levels() {
         frozen - o_star,
         s.iterations
     );
-    assert!(
-        s.iterations > 1,
-        "a nonlinear fixture takes more than one step"
-    );
+    assert!(s.iterations > 1, "a nonlinear fixture takes more than one step");
     assert!((s.ofv - o_star).abs() < D3L_OFV, "{} vs {}", s.ofv, o_star);
     assert!(worst_beta < D3_BETA_BOUND, "{worst_beta}");
-    assert!(
-        frozen - o_star > D3L_FROZEN,
-        "the straddle: {}",
-        frozen - o_star
-    );
+    assert!(frozen - o_star > D3L_FROZEN, "the straddle: {}", frozen - o_star);
 }
 
 /// Worst realised |ΔOFV| 1.4e-10 (probe, macOS arm64): the oracle's FD and inner-solve
@@ -6213,10 +5347,7 @@ fn the_laplace_profiled_objective_is_the_unprofiled_one_at_its_own_point() {
     );
     assert!(s.ofv.is_finite() && plain.is_finite() && f.ofv.is_finite());
     assert!((s.ofv - plain).abs() < D0_BOUND, "{} vs {}", s.ofv, plain);
-    assert!(
-        (s.ofv - f.ofv).abs() > 1e3 * D0_BOUND,
-        "Laplace ≠ FOCEI here"
-    );
+    assert!((s.ofv - f.ofv).abs() > 1e3 * D0_BOUND, "Laplace ≠ FOCEI here");
 }
 
 /// G2-L. The adjoint level gradient under `laplace` against the reconverged differences
@@ -6230,24 +5361,15 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_laplace() {
             "F2 car1",
             scored(prep(F2, F2_DATA, Some(3), |t| {
                 laplace(t)
-                    .replace(
-                        "  omega ETA_EM",
-                        "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
-                    )
-                    .replace(
-                        "weight = SE\n",
-                        "weight = SE\n  correlation car1(RHO) by OCC\n",
-                    )
+                    .replace("  omega ETA_EM", "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM")
+                    .replace("weight = SE\n", "weight = SE\n  correlation car1(RHO) by OCC\n")
             })),
         ),
     ] {
         assert!(profile_gradient_is_analytic(&p.parsed.model));
         let (gap, size) = level_gradient_gaps(&p);
         eprintln!("G2-L {name}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE");
-        assert!(
-            size > G2_LIVE,
-            "{name}: the gradient is not live ({size:.3e})"
-        );
+        assert!(size > G2_LIVE, "{name}: the gradient is not live ({size:.3e})");
         assert!(gap < G2_BOUND, "{name}: {gap:.3e}");
     }
 }
@@ -6262,9 +5384,7 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_laplace() {
 fn the_envelope_gradient_is_the_profile_gradient_under_laplace() {
     for (fd, edit) in [
         (false, laplace as fn(String) -> String),
-        (true, |t| {
-            forced_fd(t).replace("  method     = focei\n", "  method     = laplace\n")
-        }),
+        (true, |t| forced_fd(t).replace("  method     = focei\n", "  method     = laplace\n")),
     ] {
         let p = prep(F2, F2_DATA, Some(3), edit);
         let o = options(&p);
@@ -6299,10 +5419,7 @@ fn a_declined_subject_takes_the_reconverged_gradient_under_laplace() {
             assert!(b.is_finite());
             a.max(b)
         });
-    eprintln!(
-        "G3-L: declined vs adjoint β̂ {worst:.3e} SE, ΔOFV {:.2e}",
-        forced.ofv - plain.ofv
-    );
+    eprintln!("G3-L: declined vs adjoint β̂ {worst:.3e} SE, ΔOFV {:.2e}", forced.ofv - plain.ofv);
     assert!(worst < DECLINED_BETA, "{worst:.3e}");
 }
 
@@ -6323,30 +5440,20 @@ fn a_declined_subject_takes_the_reconverged_gradient_under_laplace() {
 /// The fixture's text under `method = laplace` with `n_agq = 3`: the exact-anchor quadrature.
 fn agq3_laplace(t: String) -> String {
     assert!(t.contains("  method     = focei\n"), "the fixture moved");
-    t.replace(
-        "  method     = focei\n",
-        "  method     = laplace\n  n_agq      = 3\n",
-    )
+    t.replace("  method     = focei\n", "  method     = laplace\n  n_agq      = 3\n")
 }
 
 /// The fixture's text under `method = focei` with `n_agq = 3`: the Gauss–Newton-anchored
 /// quadrature.
 fn agq3_focei(t: String) -> String {
     assert!(t.contains("  method     = focei\n"), "the fixture moved");
-    t.replace(
-        "  method     = focei\n",
-        "  method     = focei\n  n_agq      = 3\n",
-    )
+    t.replace("  method     = focei\n", "  method     = focei\n  n_agq      = 3\n")
 }
 
 /// Both anchors at three nodes, each with the anchor it must resolve to.
 const AGQ3: [(&str, fn(String) -> String, crate::types::HessianAnchor); 2] = [
     ("laplace", agq3_laplace, crate::types::HessianAnchor::Exact),
-    (
-        "focei",
-        agq3_focei,
-        crate::types::HessianAnchor::GaussNewton,
-    ),
+    ("focei", agq3_focei, crate::types::HessianAnchor::GaussNewton),
 ];
 
 /// The arm runs three-node quadrature at its own anchor: what every test below relies on.
@@ -6369,10 +5476,7 @@ fn three_nodes_move_the_one_node_laplace_solve() {
     assert_eq!(options(&p1).agq_nodes(), Some(1));
     let (_, one) = solve_at(&p1);
     let (_, s3) = solve_at(&prep(F2, F2_DATA, Some(3), agq3_laplace));
-    eprintln!(
-        "n_agq: one node {:.12}, three nodes {:.12}",
-        one.ofv, s3.ofv
-    );
+    eprintln!("n_agq: one node {:.12}, three nodes {:.12}", one.ofv, s3.ofv);
     assert!(one.ofv.is_finite() && s3.ofv.is_finite());
     assert!(
         (s3.ofv - one.ofv).abs() > 1e3 * D0_BOUND,
@@ -6432,11 +5536,8 @@ fn the_quadrature_profile_objective_is_the_minimum_over_the_levels() {
         let s = c.solve(&p.init_params, &warm).expect("the solve converges");
         assert!(s.n_adjoint_gradients > 0 && s.fd_gradient_subjects.is_empty());
         let (o_star, b_star) = oracle_min_of(|b| laplace_ofv(&p, &p.init_params, b), &warm.beta);
-        let frozen = laplace_ofv(
-            &p,
-            &p.init_params,
-            &frozen_levels(&c, &p.init_params, &warm.beta),
-        );
+        let frozen =
+            laplace_ofv(&p, &p.init_params, &frozen_levels(&c, &p.init_params, &warm.beta));
         assert!(s.ofv.is_finite() && o_star.is_finite() && frozen.is_finite());
         let worst_beta = layout
             .coords
@@ -6459,18 +5560,9 @@ fn the_quadrature_profile_objective_is_the_minimum_over_the_levels() {
             s.iterations
         );
         assert!(s.iterations > 1, "{name}: a nonlinear fixture");
-        assert!(
-            (s.ofv - o_star).abs() < D3L_OFV,
-            "{name}: {} vs {}",
-            s.ofv,
-            o_star
-        );
+        assert!((s.ofv - o_star).abs() < D3L_OFV, "{name}: {} vs {}", s.ofv, o_star);
         assert!(worst_beta < D3_BETA_BOUND, "{name}: {worst_beta}");
-        assert!(
-            frozen - o_star > D3A_FROZEN,
-            "{name}: the straddle: {}",
-            frozen - o_star
-        );
+        assert!(frozen - o_star > D3A_FROZEN, "{name}: the straddle: {}", frozen - o_star);
     }
 }
 
@@ -6504,22 +5596,11 @@ fn the_quadrature_profiled_objective_is_the_unprofiled_one_at_its_own_point() {
             one.ofv
         );
         assert!(s.ofv.is_finite() && plain.is_finite() && one.ofv.is_finite());
-        assert!(
-            (s.ofv - plain).abs() < D0_BOUND,
-            "{name}: {} vs {}",
-            s.ofv,
-            plain
-        );
-        assert!(
-            (s.ofv - one.ofv).abs() > 1e3 * D0_BOUND,
-            "{name}: n_agq = 3 ≠ n_agq = 1 here"
-        );
+        assert!((s.ofv - plain).abs() < D0_BOUND, "{name}: {} vs {}", s.ofv, plain);
+        assert!((s.ofv - one.ofv).abs() > 1e3 * D0_BOUND, "{name}: n_agq = 3 ≠ n_agq = 1 here");
         ofvs.push(s.ofv);
     }
-    assert!(
-        (ofvs[0] - ofvs[1]).abs() > 1e3 * D0_BOUND,
-        "the anchors differ here: {ofvs:?}"
-    );
+    assert!((ofvs[0] - ofvs[1]).abs() > 1e3 * D0_BOUND, "the anchors differ here: {ofvs:?}");
 }
 
 /// G2-A, the dual-vs-FD parity under quadrature. Each anchor's adjoint level gradient
@@ -6536,14 +5617,8 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_quadrature() {
                 "F2 car1",
                 scored(prep(F2, F2_DATA, Some(3), |t| {
                     edit(t)
-                        .replace(
-                            "  omega ETA_EM",
-                            "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM",
-                        )
-                        .replace(
-                            "weight = SE\n",
-                            "weight = SE\n  correlation car1(RHO) by OCC\n",
-                        )
+                        .replace("  omega ETA_EM", "  theta RHO(0.6, 0.0, 0.95)\n  omega ETA_EM")
+                        .replace("weight = SE\n", "weight = SE\n  correlation car1(RHO) by OCC\n")
                 })),
             ),
         ] {
@@ -6553,10 +5628,7 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_quadrature() {
             eprintln!(
                 "G2-A {name} {fixture}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE"
             );
-            assert!(
-                size > G2_LIVE,
-                "{name} {fixture}: the gradient is not live ({size:.3e})"
-            );
+            assert!(size > G2_LIVE, "{name} {fixture}: the gradient is not live ({size:.3e})");
             assert!(gap < G2_BOUND, "{name} {fixture}: {gap:.3e}");
         }
     }
@@ -6585,16 +5657,13 @@ fn the_envelope_gradient_is_the_profile_gradient_under_quadrature() {
 /// `gradient = fd` on a fixture already rewritten by an [`AGQ3`] edit.
 fn forced_fd_agq(t: String) -> String {
     assert!(t.contains("  n_agq      = 3\n"), "not a quadrature fixture");
-    t.replace(
-        "  n_agq      = 3\n",
-        "  n_agq      = 3\n  gradient   = fd\n",
-    )
+    t.replace("  n_agq      = 3\n", "  n_agq      = 3\n  gradient   = fd\n")
 }
 
 /// G3-A. A subject whose adjoint level gradient is declined under quadrature takes the
 /// **reconverged** differences, and the solve lands where the all-adjoint one does, at
 /// both anchors. Dies when a declined subject's gradient is taken with its EBE held (the
-/// quadrature's held-EBE salvage, `subject_adjoint_held_ebe_score`).
+/// held-EBE salvage `subject_adjoint_held_ebe_score` computes, a test oracle now).
 #[test]
 fn a_declined_subject_takes_the_reconverged_gradient_under_quadrature() {
     for (name, edit, anchor) in AGQ3 {
@@ -6634,8 +5703,7 @@ fn a_profiled_quadrature_fit_is_traced_as_agq() {
 /// `template` restarted at `result`'s estimates — θ (the profiled levels among them), Ω,
 /// κ and Σ — as a refit or a bootstrap replicate from a previous fit starts.
 fn warm_start_2591(
-    template: &ModelParameters,
-    result: &crate::types::FitResult,
+    template: &ModelParameters, result: &crate::types::FitResult,
 ) -> ModelParameters {
     use crate::types::OmegaMatrix;
     let mut warm = template.clone();
@@ -6646,11 +5714,7 @@ fn warm_start_2591(
         template.omega.diagonal,
     );
     if let (Some(t), Some(m)) = (&template.omega_iov, &result.omega_iov) {
-        warm.omega_iov = Some(OmegaMatrix::from_matrix(
-            m.clone(),
-            t.eta_names.clone(),
-            t.diagonal,
-        ));
+        warm.omega_iov = Some(OmegaMatrix::from_matrix(m.clone(), t.eta_names.clone(), t.diagonal));
     }
     warm.sigma.values = result.sigma.clone();
     warm
@@ -6666,10 +5730,7 @@ fn f2_cold_fit_2591(name: &str) -> (crate::api::PreparedRun, FitOptions, crate::
     });
     p.parsed.model.name = name.to_string();
     let model = &p.parsed.model;
-    let o = FitOptions {
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, ..options(&p) };
     let cold = crate::api::fit(model, &p.population, &p.init_params, &o).expect("cold fit");
     assert!(
         cold.converged && crate::model_selection::stalled_at_init(&cold) == Some(false),
@@ -6747,10 +5808,7 @@ fn a_profiled_stop_at_its_start_is_verified_or_flagged_by_the_start() {
             "{status:?}: stall OFV {:.6} (unprobed {:.6}), cold {:.6}; warnings {:?}",
             r.ofv, unprobed.ofv, cold.ofv, r.warnings
         );
-        assert_eq!(
-            r.ofv, unprobed.ofv,
-            "{status:?}: the stalled run is reported, not the probe's"
-        );
+        assert_eq!(r.ofv, unprobed.ofv, "{status:?}: the stalled run is reported, not the probe's");
         // Measured (Linux x86_64): the inits sit at 26.465827, 0.744 above the cold
         // optimum 25.722100 the probe reaches — 74× the probe's 1e-2 tolerance.
         assert!(
@@ -6777,19 +5835,12 @@ fn a_profiled_stop_at_its_start_is_verified_or_flagged_by_the_start() {
             "{status:?}: {:?}",
             r.warnings
         );
-        assert_eq!(
-            crate::model_selection::stalled_at_init(&r),
-            Some(true),
-            "{status:?}"
-        );
+        assert_eq!(crate::model_selection::stalled_at_init(&r), Some(true), "{status:?}");
         let v = crate::model_selection::check_strictness(
             &r,
             &crate::model_selection::Strictness::default(),
         );
-        assert!(
-            !v.passed,
-            "{status:?}: a stall fails the default strictness: {v:?}"
-        );
+        assert!(!v.passed, "{status:?}: a stall fails the default strictness: {v:?}");
     }
 }
 
@@ -6808,18 +5859,9 @@ fn a_profiled_stop_at_its_start_is_verified_or_flagged_by_the_start() {
 fn a_profile_only_fit_is_converged_and_not_a_stall() {
     let mut p = prep(F2, F2_DATA, Some(2), |t| {
         [
-            (
-                "theta TVE0(45.0, 0.0, 200.0)",
-                "theta TVE0(45.0, 0.0, 200.0) FIX",
-            ),
-            (
-                "theta EMAX(8.0, 0.0, 100.0)",
-                "theta EMAX(8.0, 0.0, 100.0) FIX",
-            ),
-            (
-                "theta ET50(2.0, 0.01, 100.0)",
-                "theta ET50(2.0, 0.01, 100.0) FIX",
-            ),
+            ("theta TVE0(45.0, 0.0, 200.0)", "theta TVE0(45.0, 0.0, 200.0) FIX"),
+            ("theta EMAX(8.0, 0.0, 100.0)", "theta EMAX(8.0, 0.0, 100.0) FIX"),
+            ("theta ET50(2.0, 0.01, 100.0)", "theta ET50(2.0, 0.01, 100.0) FIX"),
             ("omega ETA_EM ~ 0.25", "omega ETA_EM ~ 0.25 FIX"),
             ("kappa KAPPA_ARM ~ 1.0", "kappa KAPPA_ARM ~ 1.0 FIX"),
         ]
@@ -6831,19 +5873,12 @@ fn a_profile_only_fit_is_converged_and_not_a_stall() {
     });
     p.parsed.model.name = "profile_only_2591".to_string();
     let model = &p.parsed.model;
-    let o = FitOptions {
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, ..options(&p) };
     let cold = crate::api::fit(model, &p.population, &p.init_params, &o).expect("cold fit");
     let warm_start = warm_start_2591(&p.init_params, &cold);
     let warm = crate::api::fit(model, &p.population, &warm_start, &o).expect("warm fit");
     assert!(
-        p.init_params
-            .theta
-            .iter()
-            .zip(&cold.theta)
-            .any(|(a, b)| a != b),
+        p.init_params.theta.iter().zip(&cold.theta).any(|(a, b)| a != b),
         "fixture precondition — the levels are estimated and leave the file's inits"
     );
     assert!(
@@ -6860,11 +5895,7 @@ fn a_profile_only_fit_is_converged_and_not_a_stall() {
         assert!(r.converged, "{label}: {:?}", r.warnings);
         assert_eq!(r.left_init, Some(false), "{label}");
         assert!(r.stationary_start, "{label}");
-        assert_eq!(
-            crate::model_selection::stalled_at_init(r),
-            Some(false),
-            "{label}"
-        );
+        assert_eq!(crate::model_selection::stalled_at_init(r), Some(false), "{label}");
         assert!(
             !r.warnings.iter().any(|w| w.contains("W_STALLED_AT_INIT")),
             "{label}: {:?}",
@@ -6888,10 +5919,7 @@ fn a_profile_only_fit_is_converged_and_not_a_stall() {
         model,
         &p.population,
         &p.init_params,
-        &FitOptions {
-            outer_maxiter: 0,
-            ..o.clone()
-        },
+        &FitOptions { outer_maxiter: 0, ..o.clone() },
     )
     .expect("evaluation");
     assert!(!eval_only.converged, "{:?}", eval_only.warnings);
@@ -6917,24 +5945,15 @@ fn a_profiled_stall_at_the_inits_is_probed_and_stays_flagged() {
     });
     p.parsed.model.name = name.to_string();
     let model = &p.parsed.model;
-    let o = FitOptions {
-        run_covariance_step: false,
-        outer_maxiter: 3,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, outer_maxiter: 3, ..options(&p) };
     let has_probe_warning = |r: &crate::types::FitResult| {
-        r.warnings
-            .iter()
-            .any(|w| w.contains("stalled on its initial estimates"))
+        r.warnings.iter().any(|w| w.contains("stalled on its initial estimates"))
     };
 
     forced_stop_at_start::set(name, None, true);
     let unprobed = crate::api::fit(model, &p.population, &p.init_params, &o).expect("unprobed");
     assert!(!has_probe_warning(&unprobed), "{:?}", unprobed.warnings);
-    assert_eq!(
-        unprobed.left_init, None,
-        "no probe ran, so nothing is published"
-    );
+    assert_eq!(unprobed.left_init, None, "no probe ran, so nothing is published");
     assert!(!unprobed.converged);
 
     forced_stop_at_start::set(name, None, false);
@@ -6951,28 +5970,14 @@ fn a_profiled_stall_at_the_inits_is_probed_and_stays_flagged() {
         "profiled stall: OFV {:.6} (unprobed {:.6}), the 3-iteration probe reached {reached:.6}",
         r.ofv, unprobed.ofv
     );
-    assert_eq!(
-        r.ofv, unprobed.ofv,
-        "the stalled run is reported, not the probe's"
-    );
+    assert_eq!(r.ofv, unprobed.ofv, "the stalled run is reported, not the probe's");
     // Measured (Linux x86_64): the 3-iteration probe ends at 26.145018, 0.321 below the
     // inits' 26.465827 — 32× the probe's 1e-2 tolerance; the bound is a third of that.
-    assert!(
-        reached < r.ofv - 0.1,
-        "the probe's lower objective: {reached} vs {}",
-        r.ofv
-    );
+    assert!(reached < r.ofv - 0.1, "the probe's lower objective: {reached} vs {}", r.ofv);
     assert_eq!(r.left_init, Some(false));
     assert!(!r.stationary_start && !r.converged);
-    assert!(
-        r.n_iterations > unprobed.n_iterations,
-        "the probe's evaluations count"
-    );
-    assert!(
-        r.warnings.iter().any(|w| w.contains("W_STALLED_AT_INIT")),
-        "{:?}",
-        r.warnings
-    );
+    assert!(r.n_iterations > unprobed.n_iterations, "the probe's evaluations count");
+    assert!(r.warnings.iter().any(|w| w.contains("W_STALLED_AT_INIT")), "{:?}", r.warnings);
     assert_eq!(crate::model_selection::stalled_at_init(&r), Some(true));
     let v = crate::model_selection::check_strictness(
         &r,
@@ -6991,9 +5996,7 @@ mod logit;
 
 /// #2519: whether `r` carries the #2461 above-start warning.
 fn warns_above_start(warnings: &[String]) -> bool {
-    warnings
-        .iter()
-        .any(|w| w.starts_with(crate::estimation::outer_optimizer::ABOVE_START_TOKEN))
+    warnings.iter().any(|w| w.starts_with(crate::estimation::outer_optimizer::ABOVE_START_TOKEN))
 }
 
 /// #2519: the profiled loop publishes its first evaluation — the structural start with the
@@ -7003,28 +6006,19 @@ fn warns_above_start(warnings: &[String]) -> bool {
 #[test]
 fn optimize_profiled_publishes_its_first_evaluation() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);
-    let o = FitOptions {
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, ..options(&p) };
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     let at_start = optimize_profiled(
         &p.parsed.model,
         &p.population,
         &p.init_params,
-        &FitOptions {
-            outer_maxiter: 0,
-            ..o.clone()
-        },
+        &FitOptions { outer_maxiter: 0, ..o.clone() },
     );
     let start = r.start_eval.expect("the profiled loop records its start");
     assert!(!start.guard_rejected, "{start:?}");
     assert_eq!((start.n_unconverged, start.n_start_rejected), (0, 0));
     assert!(at_start.ofv.is_finite() && r.ofv.is_finite());
-    assert_eq!(
-        start.ofv, at_start.ofv,
-        "the start is the evaluation-only objective"
-    );
+    assert_eq!(start.ofv, at_start.ofv, "the start is the evaluation-only objective");
     assert!(start.ofv > r.ofv + 1.0, "{} vs {}", start.ofv, r.ofv);
 }
 
@@ -7035,10 +6029,7 @@ fn optimize_profiled_publishes_its_first_evaluation() {
 #[test]
 fn escape_floor_holds_a_profiled_fit_against_its_start() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);
-    let o = FitOptions {
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, ..options(&p) };
     let run = |shift: Option<f64>| {
         crate::estimation::floor_escape::escape_floor(
             &p.init_params,
@@ -7090,15 +6081,8 @@ fn escape_floor_holds_a_profiled_fit_against_its_start() {
 fn a_profiled_fit_pushed_off_a_rejected_start_is_not_converged() {
     let p = prep(F2, F2_DATA, Some(2), |t| t);
     let opts_at = |inner_maxiter: usize| {
-        let o = FitOptions {
-            run_covariance_step: false,
-            inner_maxiter,
-            ..options(&p)
-        };
-        assert_eq!(
-            o.max_unconverged_frac, 0.1,
-            "the default the fixture straddles"
-        );
+        let o = FitOptions { run_covariance_step: false, inner_maxiter, ..options(&p) };
+        assert_eq!(o.max_unconverged_frac, 0.1, "the default the fixture straddles");
         o
     };
     let fit_at = |im: usize| {
@@ -7112,21 +6096,14 @@ fn a_profiled_fit_pushed_off_a_rejected_start_is_not_converged() {
         Some(2),
         "#2682: the cold start must be rejected (2 of 2) and re-solved warm: {start:?}"
     );
-    assert!(
-        !start.guard_rejected && start.n_unconverged == 0,
-        "{start:?}"
-    );
+    assert!(!start.guard_rejected && start.n_unconverged == 0, "{start:?}");
     assert!(
         (start.ofv - 26.465827).abs() < 1e-5,
         "the warm re-solve scores the start the default budget does: {start:?}"
     );
     let fitted = fit_at(2);
     assert!(fitted.converged, "{:?}", fitted.warnings);
-    assert!(
-        !warns_above_start(&fitted.warnings),
-        "{:?}",
-        fitted.warnings
-    );
+    assert!(!warns_above_start(&fitted.warnings), "{:?}", fitted.warnings);
     assert!((fitted.ofv - 22.139638).abs() < 1e-5, "{}", fitted.ofv);
 
     let starved = fit_at(1);
@@ -7145,10 +6122,7 @@ fn a_profiled_fit_pushed_off_a_rejected_start_is_not_converged() {
     // The floor escape demoted the run before `escape_floor`'s start check, so that check
     // adds no second generic non-convergence line; the floor warning is the run's own.
     assert!(
-        starved
-            .warnings
-            .iter()
-            .any(|w| w.contains("log-packing floor")),
+        starved.warnings.iter().any(|w| w.contains("log-packing floor")),
         "{:?}",
         starved.warnings
     );
@@ -7159,11 +6133,7 @@ fn a_profiled_fit_pushed_off_a_rejected_start_is_not_converged() {
             .expect("recorded");
     assert_eq!(control_start.warm_rescored_from, None, "{control_start:?}");
     assert!(control.converged, "{:?}", control.warnings);
-    assert!(
-        !warns_above_start(&control.warnings),
-        "{:?}",
-        control.warnings
-    );
+    assert!(!warns_above_start(&control.warnings), "{:?}", control.warnings);
     assert!(control.ofv < starved.ofv - 1.0);
 }
 
@@ -7208,11 +6178,8 @@ fn fit_rescores_a_failed_start_and_demotes_a_run_above_it() {
         crate::api::fit(&p.parsed.model, &p.population, &p.init_params, &o).expect("fit")
     };
     let f = fit_at(1);
-    let tagged: Vec<&String> = f
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with(ABOVE_START_TOKEN))
-        .collect();
+    let tagged: Vec<&String> =
+        f.warnings.iter().filter(|w| w.starts_with(ABOVE_START_TOKEN)).collect();
     assert!(!f.converged, "{:?}", f.warnings);
     assert_eq!(tagged.len(), 1, "{:?}", f.warnings);
     assert!(
@@ -7257,20 +6224,14 @@ fn the_profiled_start_carries_the_nn_penalty() {
         .collect();
     assert!(refused.is_empty(), "{refused:?}");
     assert_eq!(p.parsed.model.covariate_nns.len(), 1);
-    let o = FitOptions {
-        run_covariance_step: false,
-        ..options(&p)
-    };
+    let o = FitOptions { run_covariance_step: false, ..options(&p) };
     assert!(o.nn_l2_lambda > 0.0);
     let r = optimize_profiled(&p.parsed.model, &p.population, &p.init_params, &o);
     let at_start = optimize_profiled(
         &p.parsed.model,
         &p.population,
         &p.init_params,
-        &FitOptions {
-            outer_maxiter: 0,
-            ..o.clone()
-        },
+        &FitOptions { outer_maxiter: 0, ..o.clone() },
     );
     let penalty =
         crate::estimation::nn_reg::NnRegularizer::build(&p.parsed.model, &p.population, &o)
@@ -7328,12 +6289,7 @@ fn floor_warning(f: &crate::FitResult) -> Option<&String> {
 #[test]
 fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
     let trapped = f2_fit(Some(2), f2_unprofiled, 1);
-    assert!(
-        (trapped.ofv - 42.788001).abs() < 1e-5,
-        "{} {:?}",
-        trapped.ofv,
-        trapped.warnings
-    );
+    assert!((trapped.ofv - 42.788001).abs() < 1e-5, "{} {:?}", trapped.ofv, trapped.warnings);
     assert!(!trapped.converged, "{:?}", trapped.warnings);
     let w = floor_warning(&trapped).expect("a floor-escape warning");
     assert!(
@@ -7346,12 +6302,7 @@ fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
     );
 
     let healthy = f2_fit(Some(2), f2_unprofiled, 3);
-    assert!(
-        (healthy.ofv - 22.1396).abs() < 1e-4,
-        "{} {:?}",
-        healthy.ofv,
-        healthy.warnings
-    );
+    assert!((healthy.ofv - 22.1396).abs() < 1e-4, "{} {:?}", healthy.ofv, healthy.warnings);
     assert!(healthy.converged, "{:?}", healthy.warnings);
     assert!(
         floor_warning(&healthy).is_none_or(|w| !w.contains("but stopped with")),
@@ -7372,10 +6323,8 @@ fn a_restart_left_just_above_the_floor_is_not_reported_converged() {
 /// profiled 101.911514, Linux x86_64) — one verdict for the pair, asserted below.
 #[test]
 fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
-    for (twin, edit) in [
-        ("unprofiled", f2_unprofiled as fn(String) -> String),
-        ("profiled", |t| t),
-    ] {
+    for (twin, edit) in [("unprofiled", f2_unprofiled as fn(String) -> String), ("profiled", |t| t)]
+    {
         let rescued = f2_fit(None, edit, 2);
         assert!(
             (rescued.ofv - 101.9113).abs() < 1e-3 && rescued.converged,
@@ -7384,11 +6333,7 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
             rescued.ofv,
             rescued.warnings
         );
-        assert!(
-            floor_warning(&rescued).is_none(),
-            "{twin}: {:?}",
-            rescued.warnings
-        );
+        assert!(floor_warning(&rescued).is_none(), "{twin}: {:?}", rescued.warnings);
     }
 
     let unprofiled = f2_fit(None, f2_unprofiled, 1);
@@ -7403,12 +6348,7 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
     assert!(w.contains("EMAX below 1/1000 of its start"), "{w}");
 
     let profiled = f2_fit(None, |t| t, 1);
-    assert!(
-        (profiled.ofv - 310.367564).abs() < 1e-5,
-        "{} {:?}",
-        profiled.ofv,
-        profiled.warnings
-    );
+    assert!((profiled.ofv - 310.367564).abs() < 1e-5, "{} {:?}", profiled.ofv, profiled.warnings);
     assert!(!profiled.converged, "{:?}", profiled.warnings);
     assert!(
         profiled
@@ -7418,11 +6358,7 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
         "{:?}",
         profiled.warnings
     );
-    assert!(
-        floor_warning(&profiled).is_none(),
-        "{:?}",
-        profiled.warnings
-    );
+    assert!(floor_warning(&profiled).is_none(), "{:?}", profiled.warnings);
 }
 
 /// #2799: `profiled_budget_spent`, the one predicate behind the budget advice and
@@ -7434,42 +6370,17 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
 fn a_profiled_budget_is_spent_only_before_or_during_a_leg() {
     use nlopt::{FailState as F, SuccessState as S};
     let cases: [(&str, PolishEnd, NloptReturn, bool); 7] = [
-        (
-            "before a leg",
-            PolishEnd::BudgetSpent,
-            ok(S::XtolReached),
-            true,
-        ),
-        (
-            "during a leg",
-            PolishEnd::Settled,
-            ok(S::MaxEvalReached),
-            true,
-        ),
-        (
-            "settled on tolerance",
-            PolishEnd::Settled,
-            ok(S::FtolReached),
-            false,
-        ),
-        (
-            "settled on failure",
-            PolishEnd::Settled,
-            Err((F::Failure, 1.0)),
-            false,
-        ),
+        ("before a leg", PolishEnd::BudgetSpent, ok(S::XtolReached), true),
+        ("during a leg", PolishEnd::Settled, ok(S::MaxEvalReached), true),
+        ("settled on tolerance", PolishEnd::Settled, ok(S::FtolReached), false),
+        ("settled on failure", PolishEnd::Settled, Err((F::Failure, 1.0)), false),
         (
             "leg cap on MaxEvalReached",
             PolishEnd::LegCapReached { last_gain: 1.0 },
             ok(S::MaxEvalReached),
             false,
         ),
-        (
-            "not needed",
-            PolishEnd::NotNeeded,
-            ok(S::MaxEvalReached),
-            false,
-        ),
+        ("not needed", PolishEnd::NotNeeded, ok(S::MaxEvalReached), false),
         ("skipped", PolishEnd::Skipped, ok(S::FtolReached), false),
     ];
     for (name, end, last, want) in cases {

@@ -27,14 +27,8 @@ fn result() -> BootstrapResult {
             replicate(2, vec![0.9, 9.5], Some(1.5)),
         ],
         draws: vec![
-            Replicate {
-                index: 1,
-                keys: vec![0, 0, 2],
-            },
-            Replicate {
-                index: 2,
-                keys: vec![1, 1, 2],
-            },
+            Replicate { index: 1, keys: vec![0, 0, 2] },
+            Replicate { index: 2, keys: vec![1, 1, 2] },
         ],
         subject_ids: vec!["A".to_string(), "B".to_string(), "C".to_string()],
         summary: BootstrapSummary {
@@ -73,10 +67,7 @@ fn read(path: &std::path::Path) -> Vec<Vec<String>> {
 #[test]
 fn write_all_produces_every_psn_artefact() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let options = BootstrapOptions {
-        dofv: true,
-        ..BootstrapOptions::default()
-    };
+    let options = BootstrapOptions { dofv: true, ..BootstrapOptions::default() };
     write_all(dir.path(), &result(), &options).expect("write");
 
     for name in [
@@ -128,10 +119,7 @@ fn raw_results_puts_the_original_dataset_first() {
     ] {
         assert!(header.contains(&column.to_string()), "missing `{column}`");
     }
-    let idx = header
-        .iter()
-        .position(|h| h == "minimization_successful")
-        .unwrap();
+    let idx = header.iter().position(|h| h == "minimization_successful").unwrap();
     assert_eq!(rows[3][idx], "0", "replicate 2 did not converge");
 }
 
@@ -143,10 +131,7 @@ fn raw_results_gains_se_columns_only_with_keep_covariance() {
     assert!(!read(&plain)[0].contains(&"se_CL".to_string()));
 
     let with_cov = dir.path().join("cov.csv");
-    let options = BootstrapOptions {
-        keep_covariance: true,
-        ..BootstrapOptions::default()
-    };
+    let options = BootstrapOptions { keep_covariance: true, ..BootstrapOptions::default() };
     write_raw_results(&with_cov, &result(), &options).expect("write");
     assert!(read(&with_cov)[0].contains(&"se_CL".to_string()));
 }
@@ -215,26 +200,13 @@ fn diagnostics_report_counts_exclusions_and_means() {
     write_diagnostics(&path, &result()).expect("write");
     let rows = read(&path);
     let find = |k: &str| {
-        rows.iter()
-            .find(|r| r[0] == k)
-            .unwrap_or_else(|| panic!("no row `{k}`"))[1]
-            .clone()
+        rows.iter().find(|r| r[0] == k).unwrap_or_else(|| panic!("no row `{k}`"))[1].clone()
     };
     assert_eq!(find("samples_completed").parse::<f64>().unwrap(), 2.0);
     assert_eq!(find("samples_included").parse::<f64>().unwrap(), 1.0);
     assert_eq!(find("chi_square_df").parse::<f64>().unwrap(), 3.0);
-    assert_eq!(
-        find("excluded: minimization terminated")
-            .parse::<f64>()
-            .unwrap(),
-        1.0
-    );
-    assert_eq!(
-        find("mean: minimization_successful")
-            .parse::<f64>()
-            .unwrap(),
-        0.5
-    );
+    assert_eq!(find("excluded: minimization terminated").parse::<f64>().unwrap(), 1.0);
+    assert_eq!(find("mean: minimization_successful").parse::<f64>().unwrap(), 0.5);
 }
 
 #[test]
@@ -256,10 +228,7 @@ fn raw_results_round_trip_preserves_estimates_and_diagnostics() {
     // round trip would silently change which replicates count.
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("raw_results.csv");
-    let options = BootstrapOptions {
-        dofv: true,
-        ..BootstrapOptions::default()
-    };
+    let options = BootstrapOptions { dofv: true, ..BootstrapOptions::default() };
     let written = result();
     write_raw_results(&path, &written, &options).expect("write");
 
@@ -273,10 +242,7 @@ fn raw_results_round_trip_preserves_estimates_and_diagnostics() {
     assert_eq!(replicates.len(), 2);
     assert!((replicates[0].estimates[1] - 10.5).abs() < 1e-9);
     assert!(replicates[0].converged);
-    assert!(
-        !replicates[1].converged,
-        "the diagnostic must survive the round trip"
-    );
+    assert!(!replicates[1].converged, "the diagnostic must survive the round trip");
     assert!((replicates[1].delta_ofv.unwrap() - 1.5).abs() < 1e-9);
 }
 
@@ -284,10 +250,7 @@ fn raw_results_round_trip_preserves_estimates_and_diagnostics() {
 fn raw_results_round_trip_finds_the_se_columns() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("raw_results.csv");
-    let options = BootstrapOptions {
-        keep_covariance: true,
-        ..BootstrapOptions::default()
-    };
+    let options = BootstrapOptions { keep_covariance: true, ..BootstrapOptions::default() };
     let mut written = result();
     written.replicates[0].standard_errors = Some(vec![Some(0.1), None]);
     write_raw_results(&path, &written, &options).expect("write");
@@ -307,10 +270,7 @@ fn reading_a_file_that_is_not_raw_results_says_so() {
     let path = dir.path().join("sdtab.csv");
     std::fs::write(&path, "ID,TIME,DV\n1,0,5\n").expect("write");
     let err = read_raw_results(&path).unwrap_err();
-    assert!(
-        err.contains("does not look like a bootstrap raw_results file"),
-        "{err}"
-    );
+    assert!(err.contains("does not look like a bootstrap raw_results file"), "{err}");
 }
 
 #[test]

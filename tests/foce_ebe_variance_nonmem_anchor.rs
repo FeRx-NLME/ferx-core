@@ -57,10 +57,7 @@ fn read_phi(path: &str, n_eta: usize) -> Vec<(String, Vec<f64>, f64)> {
         .skip(2)
         .map(|l| {
             let c: Vec<&str> = l.split_whitespace().collect();
-            let etas: Vec<f64> = c[2..2 + n_eta]
-                .iter()
-                .map(|x| x.parse().expect("eta"))
-                .collect();
+            let etas: Vec<f64> = c[2..2 + n_eta].iter().map(|x| x.parse().expect("eta")).collect();
             let obj: f64 = c.last().unwrap().parse().expect("obj");
             (c[1].to_string(), etas, obj)
         })
@@ -68,11 +65,7 @@ fn read_phi(path: &str, n_eta: usize) -> Vec<(String, Vec<f64>, f64)> {
 }
 
 fn run_at(
-    model_file: &str,
-    theta: &[f64],
-    omega: &[f64],
-    kappa: Option<f64>,
-    sigma_var: f64,
+    model_file: &str, theta: &[f64], omega: &[f64], kappa: Option<f64>, sigma_var: f64,
 ) -> FitResult {
     let prep = prepare_run(model_file, Some("data/warfarin_iov.csv")).expect("prepare");
     let mut init = prep.init_params.clone();
@@ -95,9 +88,7 @@ fn run_at(
 
 fn assert_analytic(label: &str, r: &FitResult) {
     assert!(
-        !r.warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradients")),
+        !r.warnings.iter().any(|w| w.contains("finite-difference inner gradients")),
         "{label}: fixture left the analytic inner path: {:?}",
         r.warnings
     );
@@ -108,10 +99,7 @@ fn assert_analytic(label: &str, r: &FitResult) {
 fn worst_abs(label: &str, pairs: impl Iterator<Item = (f64, f64)>) -> f64 {
     let mut worst = 0.0_f64;
     for (k, (a, b)) in pairs.enumerate() {
-        assert!(
-            a.is_finite() && b.is_finite(),
-            "{label}: pair {k} not finite ({a}, {b})"
-        );
+        assert!(a.is_finite() && b.is_finite(), "{label}: pair {k} not finite ({a}, {b})");
         worst = worst.max((a - b).abs());
     }
     worst
@@ -145,19 +133,13 @@ fn foce_ebe_variance_matches_nonmem_noiov() {
     );
     let obj = worst_abs(
         "noiov per-subject OBJ",
-        r.subjects
-            .iter()
-            .zip(&phi)
-            .map(|(s, (_, _, o))| (s.ofv_contribution, *o)),
+        r.subjects.iter().zip(&phi).map(|(s, (_, _, o))| (s.ofv_contribution, *o)),
     );
     // CWRES: NONMEM's table carries every record; observation rows are the MDV = 0 rows
     // of the data file, in file order.
     let data = std::fs::read_to_string("data/warfarin_iov.csv").expect("data");
-    let mdv: Vec<bool> = data
-        .lines()
-        .skip(1)
-        .map(|l| l.split(',').nth(7).unwrap().trim() == "1")
-        .collect();
+    let mdv: Vec<bool> =
+        data.lines().skip(1).map(|l| l.split(',').nth(7).unwrap().trim() == "1").collect();
     let tab =
         std::fs::read_to_string("nonmem_anchor/results/foce_ebe_freeze_noiov.tab").expect("table");
     let nm_cwres: Vec<f64> = tab
@@ -183,10 +165,7 @@ fn foce_ebe_variance_matches_nonmem_noiov() {
         r.ofv
     );
     assert!(eta < ETA_TOL, "non-IOV eta-hat off NONMEM .phi by {eta:e}");
-    assert!(
-        obj < OBJ_TOL,
-        "non-IOV per-subject OBJ off NONMEM by {obj:e}"
-    );
+    assert!(obj < OBJ_TOL, "non-IOV per-subject OBJ off NONMEM by {obj:e}");
     assert!(cwres < CWRES_TOL, "non-IOV CWRES off NONMEM by {cwres:e}");
 }
 
@@ -228,10 +207,7 @@ fn foce_ebe_variance_matches_nonmem_iov() {
     );
     let obj = worst_abs(
         "iov per-subject OBJ",
-        r.subjects
-            .iter()
-            .zip(&phi)
-            .map(|(s, (_, _, o))| (s.ofv_contribution, *o)),
+        r.subjects.iter().zip(&phi).map(|(s, (_, _, o))| (s.ofv_contribution, *o)),
     );
     let d_ofv = r.ofv - IOV_OFV;
     eprintln!(
@@ -246,9 +222,6 @@ fn foce_ebe_variance_matches_nonmem_iov() {
         r.ofv
     );
     assert!(eta < ETA_TOL, "IOV eta-hat off NONMEM .phi by {eta:e}");
-    assert!(
-        kappa < KAPPA_TOL,
-        "IOV kappa-hat off NONMEM .phi by {kappa:e}"
-    );
+    assert!(kappa < KAPPA_TOL, "IOV kappa-hat off NONMEM .phi by {kappa:e}");
     assert!(obj < OBJ_TOL, "IOV per-subject OBJ off NONMEM by {obj:e}");
 }

@@ -31,11 +31,7 @@ fn record(id: &str, hash: &str) -> CandidateRecord {
 }
 
 fn options() -> RunOptions {
-    RunOptions {
-        criterion: Criterion::Ofv,
-        n_starts: 2,
-        ..RunOptions::default()
-    }
+    RunOptions { criterion: Criterion::Ofv, n_starts: 2, ..RunOptions::default() }
 }
 
 // ── the numbers survive the round trip ───────────────────────────────────────
@@ -230,45 +226,21 @@ fn each_difference_is_refused_by_name() {
 
     let cases: [(SearchManifest, &str); 5] = [
         (
-            SearchManifest::new(
-                &RunOptions {
-                    criterion: Criterion::Aic,
-                    ..options()
-                },
-                &data,
-            ),
+            SearchManifest::new(&RunOptions { criterion: Criterion::Aic, ..options() }, &data),
             "ranking criterion",
         ),
+        (SearchManifest::new(&RunOptions { n_starts: 5, ..options() }, &data), "starts"),
         (
             SearchManifest::new(
-                &RunOptions {
-                    n_starts: 5,
-                    ..options()
-                },
-                &data,
-            ),
-            "starts",
-        ),
-        (
-            SearchManifest::new(
-                &RunOptions {
-                    strictness: ferx_core::Strictness::none(),
-                    ..options()
-                },
+                &RunOptions { strictness: ferx_core::Strictness::none(), ..options() },
                 &data,
             ),
             "strictness",
         ),
-        (
-            SearchManifest::new(&options(), &population(&["1", "3"])),
-            "dataset",
-        ),
+        (SearchManifest::new(&options(), &population(&["1", "3"])), "dataset"),
         (
             SearchManifest::new(
-                &RunOptions {
-                    fit_options: Some(ferx_core::FitOptions::default()),
-                    ..options()
-                },
+                &RunOptions { fit_options: Some(ferx_core::FitOptions::default()), ..options() },
                 &data,
             ),
             "fit settings",
@@ -279,10 +251,7 @@ fn each_difference_is_refused_by_name() {
         let err = manifest
             .check_compatible(&disk, dir.path())
             .expect_err("an incompatible resume must be refused");
-        assert!(
-            err.contains(expected),
-            "expected the message to name `{expected}`, got: {err}"
-        );
+        assert!(err.contains(expected), "expected the message to name `{expected}`, got: {err}");
     }
 }
 
@@ -381,8 +350,7 @@ fn the_fingerprint_sees_the_contents_and_not_only_the_shape() {
             "changing {what} left the fingerprint unmoved"
         );
         assert!(
-            base.check_compatible(&changed, std::path::Path::new("."))
-                .is_err(),
+            base.check_compatible(&changed, std::path::Path::new(".")).is_err(),
             "a resume against changed {what} was accepted"
         );
     }
@@ -425,33 +393,23 @@ fn a_pk_only_occasion_moves_the_digest_only_when_present() {
 #[test]
 fn a_filled_cell_moves_the_digest() {
     let read = |tag: &str, csv: &str| {
-        let path = std::env::temp_dir().join(format!(
-            "ferx_journal_filled_{}_{tag}.csv",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir()
+            .join(format!("ferx_journal_filled_{}_{tag}.csv", std::process::id()));
         std::fs::write(&path, csv).unwrap();
         let pop = ferx_core::read_nonmem_csv(&path, None, None).unwrap();
         let _ = std::fs::remove_file(&path);
         pop
     };
-    let written = read(
-        "written",
-        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n",
-    );
-    let blank = read(
-        "blank",
-        "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n",
-    );
+    let written = read("written", "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,2\n");
+    let blank = read("blank", "ID,TIME,DV,STUDY,ARM\n1,1,10,1,1\n1,2,11,1,2\n1,3,12,1,\n");
     assert_eq!(
         written.subjects[0].obs_covariates, blank.subjects[0].obs_covariates,
         "the snapshots agree"
     );
     assert!(written.subjects[0].filled_cells.is_empty());
     assert!(!blank.subjects[0].filled_cells.is_empty());
-    let (w, b) = (
-        SearchManifest::new(&options(), &written),
-        SearchManifest::new(&options(), &blank),
-    );
+    let (w, b) =
+        (SearchManifest::new(&options(), &written), SearchManifest::new(&options(), &blank));
     assert_ne!(w.data_fingerprint, b.data_fingerprint);
     assert!(
         w.check_compatible(&b, std::path::Path::new(".")).is_err(),
@@ -480,13 +438,7 @@ fn the_fingerprint_is_stable_across_repeated_construction() {
 // ── the fit-settings fingerprint ─────────────────────────────────────────────
 
 fn with_fit_options(fit_options: Option<FitOptions>) -> SearchManifest {
-    SearchManifest::new(
-        &RunOptions {
-            fit_options,
-            ..options()
-        },
-        &loaded_population(),
-    )
+    SearchManifest::new(&RunOptions { fit_options, ..options() }, &loaded_population())
 }
 
 #[test]
@@ -532,9 +484,7 @@ fn the_fit_settings_fingerprint_moves_with_every_setting_that_changes_a_fit() {
             "changing {what} left the fit-settings fingerprint unmoved"
         );
         assert!(
-            reference
-                .check_compatible(&changed, std::path::Path::new("."))
-                .is_err(),
+            reference.check_compatible(&changed, std::path::Path::new(".")).is_err(),
             "a resume against changed {what} was accepted"
         );
     }
@@ -548,18 +498,13 @@ fn the_fit_settings_fingerprint_does_not_move_between_spellings_of_the_same_bloq
     // still moves it (also pinned above), so the equality is not a fingerprint that
     // ignores the field.
     let spelled = |bloq: Option<BloqMethod>| {
-        with_fit_options(Some(FitOptions {
-            bloq_method: bloq,
-            ..FitOptions::default()
-        }))
+        with_fit_options(Some(FitOptions { bloq_method: bloq, ..FitOptions::default() }))
     };
     let none = spelled(None);
     let drop = spelled(Some(BloqMethod::Drop));
     let m3 = spelled(Some(BloqMethod::M3));
     assert_eq!(none.fit_options_fingerprint, drop.fit_options_fingerprint);
-    assert!(none
-        .check_compatible(&drop, std::path::Path::new("."))
-        .is_ok());
+    assert!(none.check_compatible(&drop, std::path::Path::new(".")).is_ok());
     assert_ne!(none.fit_options_fingerprint, m3.fit_options_fingerprint);
 }
 
@@ -583,9 +528,7 @@ fn the_fit_settings_fingerprint_ignores_this_runs_scheduling() {
         same.fit_options_fingerprint, reference.fit_options_fingerprint,
         "a run-scheduling knob leaked into the fit-settings fingerprint"
     );
-    assert!(reference
-        .check_compatible(&same, std::path::Path::new("."))
-        .is_ok());
+    assert!(reference.check_compatible(&same, std::path::Path::new(".")).is_ok());
 }
 
 #[test]
@@ -596,10 +539,6 @@ fn no_override_and_an_override_are_not_interchangeable() {
     let default_override = with_fit_options(Some(FitOptions::default()));
     assert!(none.fit_options_fingerprint.is_none());
     assert!(default_override.fit_options_fingerprint.is_some());
-    assert!(none
-        .check_compatible(&default_override, std::path::Path::new("."))
-        .is_err());
-    assert!(default_override
-        .check_compatible(&none, std::path::Path::new("."))
-        .is_err());
+    assert!(none.check_compatible(&default_override, std::path::Path::new(".")).is_err());
+    assert!(default_override.check_compatible(&none, std::path::Path::new(".")).is_err());
 }

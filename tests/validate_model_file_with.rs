@@ -18,9 +18,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 
 fn pairs(kv: &[(&str, &str)]) -> Vec<(String, String)> {
-    kv.iter()
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
+    kv.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
 fn error_codes(report: &CheckReport) -> Vec<&str> {
@@ -54,17 +52,9 @@ const NO_OCC_DATA: &str = "data/warfarin.csv";
 /// `time(24)`, splits each subject into two occasions and clears every error.
 #[test]
 fn iov_occasion_override_clears_the_missing_occ_error() {
-    let no_column = validate_model_file_with(
-        IOV_MODEL,
-        Some(NO_OCC_DATA),
-        &pairs(&[("iov_column", "none")]),
-    );
-    assert_eq!(
-        error_codes(&no_column),
-        vec!["E_IOV_MISSING_OCC"],
-        "{:#?}",
-        no_column.diagnostics
-    );
+    let no_column =
+        validate_model_file_with(IOV_MODEL, Some(NO_OCC_DATA), &pairs(&[("iov_column", "none")]));
+    assert_eq!(error_codes(&no_column), vec!["E_IOV_MISSING_OCC"], "{:#?}", no_column.diagnostics);
 
     let derived = validate_model_file_with(
         IOV_MODEL,
@@ -96,16 +86,9 @@ fn iov_occasion_override_clears_the_missing_occ_error() {
 #[test]
 fn iov_column_override_reaches_the_data_read() {
     let file_only = validate_model_file(IOV_MODEL, Some(NO_OCC_DATA));
-    let overridden = validate_model_file_with(
-        IOV_MODEL,
-        Some(NO_OCC_DATA),
-        &pairs(&[("iov_column", "none")]),
-    );
-    assert!(
-        !error_codes(&file_only).is_empty(),
-        "{:#?}",
-        file_only.diagnostics
-    );
+    let overridden =
+        validate_model_file_with(IOV_MODEL, Some(NO_OCC_DATA), &pairs(&[("iov_column", "none")]));
+    assert!(!error_codes(&file_only).is_empty(), "{:#?}", file_only.diagnostics);
     assert_ne!(
         error_codes(&file_only),
         error_codes(&overridden),
@@ -156,10 +139,7 @@ const CMT_CSV: &str = "ID,TIME,DV,EVID,AMT,CMT,MDV\n\
 fn selection_override_reaches_the_data_read() {
     let model = write_tmp(CMT_MODEL, ".ferx");
     let data = write_tmp(CMT_CSV, ".csv");
-    let (m, d) = (
-        model.path().to_str().unwrap(),
-        data.path().to_str().unwrap(),
-    );
+    let (m, d) = (model.path().to_str().unwrap(), data.path().to_str().unwrap());
 
     let file_only = validate_model_file_with(m, Some(d), &[]);
     assert!(
@@ -169,11 +149,7 @@ fn selection_override_reaches_the_data_read() {
     );
     for clause in [("ignore", "CMT == 2"), ("accept", "CMT == 1")] {
         let filtered = validate_model_file_with(m, Some(d), &pairs(&[clause]));
-        assert!(
-            error_codes(&filtered).is_empty(),
-            "{clause:?}: {:#?}",
-            filtered.diagnostics
-        );
+        assert!(error_codes(&filtered).is_empty(), "{clause:?}: {:#?}", filtered.diagnostics);
     }
 }
 
@@ -182,18 +158,10 @@ fn selection_override_reaches_the_data_read() {
 #[test]
 fn optimizer_override_reaches_check_model_options() {
     let file_only = validate_model_file_with(IOV_MODEL, None, &[]);
-    assert!(
-        !error_codes(&file_only).contains(&"E_OPTIMIZER_IOV"),
-        "{:#?}",
-        file_only.diagnostics
-    );
+    assert!(!error_codes(&file_only).contains(&"E_OPTIMIZER_IOV"), "{:#?}", file_only.diagnostics);
     let overridden =
         validate_model_file_with(IOV_MODEL, None, &pairs(&[("optimizer", "trust_region")]));
-    assert!(
-        error_codes(&overridden).contains(&"E_OPTIMIZER_IOV"),
-        "{:#?}",
-        overridden.diagnostics
-    );
+    assert!(error_codes(&overridden).contains(&"E_OPTIMIZER_IOV"), "{:#?}", overridden.diagnostics);
 }
 
 /// `check_parameter_priors` reads the merged options: SAEM does not apply priors.
@@ -202,27 +170,12 @@ fn optimizer_override_reaches_check_model_options() {
 fn method_override_reaches_check_parameter_priors() {
     let prior = "examples/warfarin_prior.ferx";
     let file_only = validate_model_file_with(prior, None, &[]);
-    assert!(
-        error_codes(&file_only).is_empty(),
-        "{:#?}",
-        file_only.diagnostics
-    );
+    assert!(error_codes(&file_only).is_empty(), "{:#?}", file_only.diagnostics);
     let saem = validate_model_file_with(prior, None, &pairs(&[("method", "saem")]));
-    assert!(
-        error_codes(&saem).contains(&"E_PRIOR_METHOD_UNSUPPORTED"),
-        "{:#?}",
-        saem.diagnostics
-    );
-    let back = validate_model_file_with(
-        prior,
-        None,
-        &pairs(&[("method", "saem"), ("method", "focei")]),
-    );
-    assert!(
-        error_codes(&back).is_empty(),
-        "the later `method` wins: {:#?}",
-        back.diagnostics
-    );
+    assert!(error_codes(&saem).contains(&"E_PRIOR_METHOD_UNSUPPORTED"), "{:#?}", saem.diagnostics);
+    let back =
+        validate_model_file_with(prior, None, &pairs(&[("method", "saem"), ("method", "focei")]));
+    assert!(error_codes(&back).is_empty(), "the later `method` wins: {:#?}", back.diagnostics);
 }
 
 /// A pair that cannot be applied is `E_FIT_OPTION`, one per pair, and nothing
@@ -233,11 +186,7 @@ fn an_override_that_does_not_apply_is_e_fit_option_and_terminal() {
     let report = validate_model_file_with(
         IOV_MODEL,
         Some(NO_OCC_DATA),
-        &pairs(&[
-            ("no_such_option", "1"),
-            ("maxiter", "many"),
-            ("iov_occasion", "dose"),
-        ]),
+        &pairs(&[("no_such_option", "1"), ("maxiter", "many"), ("iov_occasion", "dose")]),
     );
     assert!(!report.valid);
     assert_eq!(
@@ -249,9 +198,7 @@ fn an_override_that_does_not_apply_is_e_fit_option_and_terminal() {
     assert_eq!(report.diagnostics.len(), 2, "{:#?}", report.diagnostics);
     assert!(
         report.diagnostics[0].message.contains("`no_such_option`")
-            && report.diagnostics[0]
-                .message
-                .contains("not a known fit option"),
+            && report.diagnostics[0].message.contains("not a known fit option"),
         "{}",
         report.diagnostics[0].message
     );
@@ -277,10 +224,7 @@ fn empty_overrides_is_validate_model_file() {
     let a = validate_model_file(IOV_MODEL, Some(NO_OCC_DATA));
     let b = validate_model_file_with(IOV_MODEL, Some(NO_OCC_DATA), &[]);
     assert!(!a.diagnostics.is_empty());
-    assert_eq!(
-        serde_json::to_string(&a).unwrap(),
-        serde_json::to_string(&b).unwrap()
-    );
+    assert_eq!(serde_json::to_string(&a).unwrap(), serde_json::to_string(&b).unwrap());
 }
 
 /// `bloq_method` reaches the checks too: M3 does not combine with a `block_sigma`.
@@ -289,11 +233,7 @@ fn bloq_override_reaches_the_checks() {
     let model = "examples/correlated_residual_combined.ferx";
     const CODE: &str = "E_BLOCK_SIGMA_M3_UNSUPPORTED";
     let file_only = validate_model_file_with(model, None, &[]);
-    assert!(
-        !error_codes(&file_only).contains(&CODE),
-        "{:#?}",
-        file_only.diagnostics
-    );
+    assert!(!error_codes(&file_only).contains(&CODE), "{:#?}", file_only.diagnostics);
     let m3 = validate_model_file_with(model, None, &pairs(&[("bloq_method", "m3")]));
     assert!(error_codes(&m3).contains(&CODE), "{:#?}", m3.diagnostics);
 }
@@ -303,12 +243,7 @@ fn bloq_override_reaches_the_checks() {
 #[test]
 fn a_bad_method_override_is_e_fit_option() {
     let report = validate_model_file_with(IOV_MODEL, None, &pairs(&[("method", "nope")]));
-    assert_eq!(
-        error_codes(&report),
-        vec!["E_FIT_OPTION"],
-        "{:#?}",
-        report.diagnostics
-    );
+    assert_eq!(error_codes(&report), vec!["E_FIT_OPTION"], "{:#?}", report.diagnostics);
     assert!(
         report.diagnostics[0].message.contains("`method = nope`"),
         "{}",

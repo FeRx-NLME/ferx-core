@@ -20,43 +20,17 @@ fn exp_model(lambda: f64) -> CompiledModel {
 
 const RTTE: &str = "\n[parameters]\n  theta TVLAMBDA(0.15, 0.001, 10.0)\n\n[event_model]\n  cmt    = 2\n  type   = rtte\n  family = exponential\n  scale  = TVLAMBDA\n";
 
-const COMPETING: &str = r"
-[parameters]
-  theta TVLAMBDA_A(0.05, 0.001, 10.0)
-  theta TVLAMBDA_B(0.03, 0.001, 10.0)
-
-[event_model cause_a]
-  cmt    = 2
-  family = exponential
-  scale  = TVLAMBDA_A
-
-[event_model cause_b]
-  cmt    = 3
-  family = exponential
-  scale  = TVLAMBDA_B
-";
+const COMPETING: &str = crate::test_models::MODEL_2;
 
 fn rec(time: f64, event_type: EventType, cmt: usize) -> ObsRecord {
-    ObsRecord::Event {
-        time,
-        event_type,
-        entry_time: 0.0,
-        cmt,
-    }
+    ObsRecord::Event { time, event_type, entry_time: 0.0, cmt }
 }
 
 /// A subject with one record on cmt 2 and covariate `Z = z`.
 fn subj(id: &str, time: f64, event: bool, z: f64) -> Subject {
-    let et = if event {
-        EventType::Exact
-    } else {
-        EventType::RightCensored
-    };
-    let mut s = Subject {
-        id: id.into(),
-        obs_records: vec![rec(time, et, 2)],
-        ..Default::default()
-    };
+    let et = if event { EventType::Exact } else { EventType::RightCensored };
+    let mut s =
+        Subject { id: id.into(), obs_records: vec![rec(time, et, 2)], ..Default::default() };
     s.covariates.insert("Z".into(), z);
     s
 }
@@ -75,10 +49,7 @@ fn pop(subjects: Vec<Subject>) -> Population {
 fn opts(n_sim: usize) -> VpcKmmcOptions {
     let mut o = VpcKmmcOptions::new("Z");
     o.vpc.n_sim = n_sim;
-    o.vpc.sim = SimulateOptions {
-        seed: Some(11),
-        ..Default::default()
-    };
+    o.vpc.sim = SimulateOptions { seed: Some(11), ..Default::default() };
     o
 }
 
@@ -101,13 +72,7 @@ fn one_step_g(c0: f64) -> KmCurve {
 }
 
 fn obs_row(time: f64, event: bool) -> ObsRow {
-    ObsRow {
-        id: "1".into(),
-        time,
-        event,
-        censor_at: (!event).then_some(time),
-        stratum: 0,
-    }
+    ObsRow { id: "1".into(), time, event, censor_at: (!event).then_some(time), stratum: 0 }
 }
 
 /// K6, unit level. `DrawAll` (KMMC) draws every subject's censoring time from `G`,
@@ -122,19 +87,13 @@ fn draw_all_ignores_the_subjects_own_censoring_time() {
     for u in [0.0, 0.3, 0.999] {
         let censored = obs_row(3.0, false);
         let event = obs_row(9.0, true);
-        assert_eq!(
-            replicate_censoring(TteCensorRule::DrawAll, &censored, &g, u, h),
-            7.0
-        );
+        assert_eq!(replicate_censoring(TteCensorRule::DrawAll, &censored, &g, u, h), 7.0);
         assert_eq!(
             replicate_censoring(TteCensorRule::DrawAll, &event, &g, u, h),
             7.0,
             "an event subject draws unconditionally, not given c > t"
         );
-        assert_eq!(
-            replicate_censoring(TteCensorRule::KeepObserved, &censored, &g, u, h),
-            3.0
-        );
+        assert_eq!(replicate_censoring(TteCensorRule::KeepObserved, &censored, &g, u, h), 3.0);
         assert_eq!(
             replicate_censoring(TteCensorRule::KeepObserved, &event, &g, u, h),
             h,
@@ -162,11 +121,7 @@ fn two_censoring_pop() -> Population {
 fn times_of(reps: &[Vec<RepStratum>], row: usize) -> Vec<f64> {
     reps.iter()
         .flat_map(|r| {
-            r[0].rows
-                .iter()
-                .zip(&r[0].times)
-                .filter(move |(&i, _)| i == row)
-                .map(|(_, &t)| t)
+            r[0].rows.iter().zip(&r[0].times).filter(move |(&i, _)| i == row).map(|(_, &t)| t)
         })
         .collect()
 }
@@ -186,26 +141,15 @@ fn kmmc_replicates_draw_every_censoring_time_from_g() {
     let run_rule = |rule, censoring| {
         let mut v = o.vpc.clone();
         v.censoring = censoring;
-        simulate_replicates(&m, &p, &m.default_params, &v, 2, &rows, 1, 8.0, rule)
-            .unwrap()
-            .0
+        simulate_replicates(&m, &p, &m.default_params, &v, 2, &rows, 1, 8.0, rule).unwrap().0
     };
     let draw = run_rule(TteCensorRule::DrawAll, VpcCensoring::Observed);
     let censored = times_of(&draw, 0);
     let event = times_of(&draw, 6);
     assert_eq!(censored.len(), 40);
-    assert!(
-        censored.iter().all(|t| *t == 2.0 || *t == 8.0),
-        "{censored:?}"
-    );
-    assert!(
-        censored.contains(&8.0),
-        "a censored subject is not kept at 2"
-    );
-    assert!(
-        event.contains(&2.0),
-        "an event subject draws below its event time"
-    );
+    assert!(censored.iter().all(|t| *t == 2.0 || *t == 8.0), "{censored:?}");
+    assert!(censored.contains(&8.0), "a censored subject is not kept at 2");
+    assert!(event.contains(&2.0), "an event subject draws below its event time");
 
     let keep = run_rule(TteCensorRule::KeepObserved, VpcCensoring::Observed);
     assert!(times_of(&keep, 0).iter().all(|t| *t == 2.0));
@@ -227,10 +171,7 @@ fn kmmc_replicates_draw_every_censoring_time_from_g() {
     let r = run(&m, &p, &ko).unwrap();
     let s = &r.strata[0];
     let (lo, hi) = (s.lo[0].unwrap(), s.hi[0].unwrap());
-    assert!(
-        hi > lo,
-        "vpc_kmmc band at 5 is [{lo}, {hi}]: replicates kept their own censoring"
-    );
+    assert!(hi > lo, "vpc_kmmc band at 5 is [{lo}, {hi}]: replicates kept their own censoring");
 }
 
 // ── K7: the t = 0 identity ───────────────────────────────────────────────────
@@ -238,14 +179,7 @@ fn kmmc_replicates_draw_every_censoring_time_from_g() {
 /// 30 subjects, events at 1..30, `Z = 3·i mod 7 + 0.1·i` (not sorted by time).
 fn thirty() -> Population {
     pop((1..=30)
-        .map(|i| {
-            subj(
-                &i.to_string(),
-                i as f64,
-                true,
-                ((3 * i) % 7) as f64 + 0.1 * i as f64,
-            )
-        })
+        .map(|i| subj(&i.to_string(), i as f64, true, ((3 * i) % 7) as f64 + 0.1 * i as f64))
         .collect())
 }
 
@@ -265,12 +199,9 @@ fn band_collapses_to_the_population_mean_at_time_zero() {
     let mean: f64 = p.subjects.iter().map(|s| s.covariates["Z"]).sum::<f64>() / 30.0;
     let s = &r.strata[0];
     let tol = 4.0 * f64::EPSILON * mean;
-    for (what, v) in [
-        ("obs", s.obs_on_grid[0]),
-        ("lo", s.lo[0]),
-        ("med", s.med[0]),
-        ("hi", s.hi[0]),
-    ] {
+    for (what, v) in
+        [("obs", s.obs_on_grid[0]), ("lo", s.lo[0]), ("med", s.med[0]), ("hi", s.hi[0])]
+    {
         let v = v.unwrap_or_else(|| panic!("{what} at 0 is None"));
         assert!((v - mean).abs() <= tol, "{what}(0) = {v} vs mean {mean}");
     }
@@ -301,10 +232,7 @@ fn band_collapses_to_the_population_mean_at_time_zero() {
         let tol = 4.0 * f64::EPSILON * mean;
         for (what, v) in [("lo", s.lo[0]), ("hi", s.hi[0])] {
             let v = v.unwrap_or_else(|| panic!("stratum {k} {what} at 0 is None"));
-            assert!(
-                (v - mean).abs() <= tol,
-                "stratum {k} {what}(0) = {v} vs its mean {mean}"
-            );
+            assert!((v - mean).abs() <= tol, "stratum {k} {what}(0) = {v} vs its mean {mean}");
         }
     }
 }
@@ -316,9 +244,7 @@ fn band_collapses_to_the_population_mean_at_time_zero() {
 /// times, so both assertions fail.
 #[test]
 fn level_gives_the_share_at_that_level() {
-    let p = pop((1..=30)
-        .map(|i| subj(&i.to_string(), i as f64, true, (i % 3) as f64))
-        .collect());
+    let p = pop((1..=30).map(|i| subj(&i.to_string(), i as f64, true, (i % 3) as f64)).collect());
     let m = exp_model(0.05);
     let mut o = opts(20);
     o.level = Some(2.0);
@@ -362,13 +288,7 @@ fn driver_floors_the_band_and_the_observed_curve() {
     .unwrap();
     let z: Vec<f64> = rows
         .iter()
-        .map(|row| {
-            p.subjects
-                .iter()
-                .find(|s| s.id == row.id)
-                .unwrap()
-                .covariates["Z"]
-        })
+        .map(|row| p.subjects.iter().find(|s| s.id == row.id).unwrap().covariates["Z"])
         .collect();
     let curves: Vec<KmmcCurve> = reps
         .iter()
@@ -438,9 +358,7 @@ fn refuses_a_missing_baseline_with_count_and_first_id() {
     let mut p = thirty();
     p.subjects[6].covariates.insert("Z".into(), f64::NAN);
     p.subjects[2].covariates.insert("Z".into(), f64::INFINITY);
-    let e = run(&exp_model(0.05), &p, &opts(20))
-        .unwrap_err()
-        .to_string();
+    let e = run(&exp_model(0.05), &p, &opts(20)).unwrap_err().to_string();
     assert_eq!(
         e,
         "vpc_kmmc: covariate `Z` is missing (every value blank or not finite) in 2 \
@@ -486,14 +404,8 @@ fn refuses_two_tte_endpoints_without_cmt() {
 fn shared_record_refusals_name_vpc_kmmc() {
     let m = exp_model(0.05);
     let mut p = thirty();
-    p.subjects[0].obs_records = vec![rec(
-        3.0,
-        EventType::IntervalCensored {
-            left: 1.0,
-            right: 3.0,
-        },
-        2,
-    )];
+    p.subjects[0].obs_records =
+        vec![rec(3.0, EventType::IntervalCensored { left: 1.0, right: 3.0 }, 2)];
     let e = run(&m, &p, &opts(20)).unwrap_err().to_string();
     assert_eq!(
         e,
@@ -503,12 +415,8 @@ fn shared_record_refusals_name_vpc_kmmc() {
     assert!(!e.contains("vpc_tte:"));
 
     let mut p = thirty();
-    p.subjects[0].obs_records = vec![ObsRecord::Event {
-        time: 3.0,
-        event_type: EventType::Exact,
-        entry_time: 1.0,
-        cmt: 2,
-    }];
+    p.subjects[0].obs_records =
+        vec![ObsRecord::Event { time: 3.0, event_type: EventType::Exact, entry_time: 1.0, cmt: 2 }];
     assert_refusal(
         run(&m, &p, &opts(20)),
         "vpc_kmmc: subject 1 has entry time 1 on cmt 2. Left truncation (delayed entry) is \
@@ -516,9 +424,7 @@ fn shared_record_refusals_name_vpc_kmmc() {
     );
 
     let mut p = thirty();
-    p.subjects[0]
-        .obs_records
-        .push(rec(9.0, EventType::RightCensored, 2));
+    p.subjects[0].obs_records.push(rec(9.0, EventType::RightCensored, 2));
     let e = run(&m, &p, &opts(20)).unwrap_err().to_string();
     assert_eq!(
         e,
@@ -539,18 +445,13 @@ fn warns_on_a_time_varying_covariate() {
         p.subjects[i].endpoint_covariates = vec![snap];
     }
     let r = run(&exp_model(0.05), &p, &opts(20)).unwrap();
-    let w: Vec<&String> = r
-        .warnings
-        .iter()
-        .filter(|w| w.starts_with("W_VPC_KMMC_TIME_VARYING_COVARIATE"))
-        .collect();
+    let w: Vec<&String> =
+        r.warnings.iter().filter(|w| w.starts_with("W_VPC_KMMC_TIME_VARYING_COVARIATE")).collect();
     assert_eq!(
         w,
-        [
-            "W_VPC_KMMC_TIME_VARYING_COVARIATE: covariate `Z` changes over time in 2 subjects. \
+        ["W_VPC_KMMC_TIME_VARYING_COVARIATE: covariate `Z` changes over time in 2 subjects. \
              The Kaplan–Meier mean covariate uses each subject's first value, not its value at \
-             the risk time."
-        ]
+             the risk time."]
     );
     assert!(!w[0].contains("refused"));
     assert!(
@@ -600,10 +501,7 @@ fn fixture_c() -> Population {
 fn cut_by_hand(p: &Population, h: f64) -> Population {
     let mut q = p.clone();
     for r in q.subjects.iter_mut().flat_map(|s| s.obs_records.iter_mut()) {
-        if let ObsRecord::Event {
-            time, event_type, ..
-        } = r
-        {
+        if let ObsRecord::Event { time, event_type, .. } = r {
             if *time > h {
                 *time = h;
                 *event_type = EventType::RightCensored;
@@ -641,14 +539,8 @@ fn record_times(p: &Population) -> Vec<f64> {
 fn kmmc_horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
     let p = fixture_c();
     let cut = cut_by_hand(&p, H_CUT);
-    assert!(
-        record_times(&p).iter().any(|&t| t > H_CUT),
-        "C has records past H"
-    );
-    assert!(
-        record_times(&cut).iter().all(|&t| t <= H_CUT),
-        "the cut has none"
-    );
+    assert!(record_times(&p).iter().any(|&t| t > H_CUT), "C has records past H");
+    assert!(record_times(&cut).iter().all(|&t| t <= H_CUT), "the cut has none");
 
     let m = exp_model(0.08);
     for stratify in [VpcStratify::None, VpcStratify::Covariate("W".into())] {
@@ -729,9 +621,7 @@ fn kmmc_replicates_are_the_same_with_the_rows_cut_at_the_horizon_or_not() {
     let (mut cut, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
     assert_eq!(horizon_and_cut(&mut cut, Some(H_CUT)), H_CUT);
     assert_eq!(
-        rows.iter()
-            .filter(|r| r.time > H_CUT && r.censor_at.is_some())
-            .count(),
+        rows.iter().filter(|r| r.time > H_CUT && r.censor_at.is_some()).count(),
         2,
         "C18, C20 put G's mass past H"
     );
@@ -762,12 +652,8 @@ fn kmmc_replicates_are_the_same_with_the_rows_cut_at_the_horizon_or_not() {
         assert_eq!(sa.events, sb.events);
         let bits = |t: &[f64]| t.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(bits(&sa.times), bits(&sb.times));
-        censored_below_h += sa
-            .times
-            .iter()
-            .zip(&sa.events)
-            .filter(|(t, e)| !**e && **t < H_CUT)
-            .count();
+        censored_below_h +=
+            sa.times.iter().zip(&sa.events).filter(|(t, e)| !**e && **t < H_CUT).count();
     }
     // Not a fixture where nobody is censored before H: the draws under H are live.
     assert!(censored_below_h > 0, "no replicate censored before H");
@@ -808,12 +694,6 @@ fn horizon_and_cut_without_a_horizon_is_the_latest_record_and_cuts_nothing() {
     let (mut got, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
     assert_eq!(horizon_and_cut(&mut got, None), 20.0);
     let key = |r: &ObsRow| (r.id.clone(), r.time.to_bits(), r.event, r.censor_at);
-    assert_eq!(
-        got.iter().map(key).collect::<Vec<_>>(),
-        rows.iter().map(key).collect::<Vec<_>>()
-    );
-    assert!(
-        got.iter().any(|r| r.id == "X20" && r.event),
-        "the event at H is kept"
-    );
+    assert_eq!(got.iter().map(key).collect::<Vec<_>>(), rows.iter().map(key).collect::<Vec<_>>());
+    assert!(got.iter().any(|r| r.id == "X20" && r.event), "the event at H is kept");
 }

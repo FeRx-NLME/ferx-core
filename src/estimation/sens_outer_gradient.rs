@@ -14,59 +14,37 @@ use crate::types::{CompiledModel, ModelParameters, Population, Subject};
 use nalgebra::DVector;
 
 /// The exact per-subject FOCEI gradient `dFᵢ/dx` in the **packed** optimizer space, or
-/// `None` outside the adjoint's scope. `eta_hat` must be the EBE for `unpack_params(x)`.
+/// `None` outside the adjoint's scope. `eta_hat` must be the EBE for `unpack_params(x)`;
+/// an IOV subject passes the stacked EBE `[η_bsv, κ₁ … κ_K]`.
 pub fn subject_packed_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
     subject_gradient(model, subject, template, x, eta_hat, true)
 }
 
-/// [`subject_packed_gradient`] for an **IOV** subject, over the stacked EBE
-/// `[η_bsv, κ₁ … κ_K]`.
-pub fn subject_packed_gradient_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    stacked_eta_hat: &[f64],
-) -> Option<Vec<f64>> {
-    subject_gradient(model, subject, template, x, stacked_eta_hat, true)
-}
-
 /// The exact per-subject **FOCE** (Sheiner–Beal, no interaction) gradient `dFᵢ/dx` in the
 /// packed space, at FOCE's frozen-variance EBE.
-pub fn subject_packed_gradient_foce(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
+#[cfg(test)]
+pub(crate) fn subject_packed_gradient_foce(
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
     subject_gradient(model, subject, template, x, eta_hat, false)
 }
 
-/// [`subject_packed_gradient_foce`] for an **IOV** subject, over the stacked EBE.
-pub fn subject_packed_gradient_foce_iov(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
+/// `subject_packed_gradient_foce` for an **IOV** subject, over the stacked EBE.
+#[cfg(test)]
+pub(crate) fn subject_packed_gradient_foce_iov(
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
     stacked_eta_hat: &[f64],
 ) -> Option<Vec<f64>> {
     subject_gradient(model, subject, template, x, stacked_eta_hat, false)
 }
 
 fn subject_gradient(
-    model: &CompiledModel,
-    subject: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hat: &[f64],
-    interaction: bool,
+    model: &CompiledModel, subject: &Subject, template: &ModelParameters, x: &[f64],
+    eta_hat: &[f64], interaction: bool,
 ) -> Option<Vec<f64>> {
     if subject.observations.is_empty() && subject.obs_records.is_empty() {
         return Some(vec![0.0; x.len()]);
@@ -80,10 +58,7 @@ fn subject_gradient(
 /// evaluation rather than once per subject. `eta_hat` is the stacked `[η, κ₁ … κ_K]` under
 /// IOV, as for the per-subject wrappers above.
 pub(crate) fn subject_gradient_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<f64>> {
     subject_objective_gradient_at(
@@ -91,20 +66,13 @@ pub(crate) fn subject_gradient_at(
         subject,
         pt,
         eta_hat,
-        if interaction {
-            Objective::Focei
-        } else {
-            Objective::Foce
-        },
+        if interaction { Objective::Focei } else { Objective::Foce },
     )
 }
 
 /// [`subject_gradient_at`] for any [`Objective`] (the covariance step's may be a quadrature).
 pub(crate) fn subject_objective_gradient_at(
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: &PackedPoint<'_>,
-    eta_hat: &[f64],
+    model: &CompiledModel, subject: &Subject, pt: &PackedPoint<'_>, eta_hat: &[f64],
     objective: Objective,
 ) -> Option<Vec<f64>> {
     // No data at all contributes nothing; a subject with only non-Gaussian records still
@@ -126,39 +94,23 @@ pub(crate) fn subject_objective_gradient_at(
 /// `MIXTURE_CLASS` thread-local is set **inside** each rayon worker, so `MIXNUM` resolves
 /// to class `k` there (the calling thread's guard does not reach the workers).
 pub fn per_subject_packed_gradients(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[DVector<f64>],
-    interaction: bool,
-    mixture_class: Option<usize>,
+    model: &CompiledModel, population: &Population, template: &ModelParameters, x: &[f64],
+    eta_hats: &[DVector<f64>], interaction: bool, mixture_class: Option<usize>,
 ) -> Vec<Option<Vec<f64>>> {
     // One unpack for the population (every subject is at the same packed point).
     let pt = PackedPoint::new(template, x);
     crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
         let _guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
-        subject_gradient_at(
-            model,
-            subject,
-            pt.as_ref()?,
-            eta_hats[i].as_slice(),
-            interaction,
-        )
+        subject_gradient_at(model, subject, pt.as_ref()?, eta_hats[i].as_slice(), interaction)
     })
 }
 
 /// [`per_subject_packed_gradients`] for an **IOV** model: `eta_hats[i]` the BSV EBEs and
 /// `kappas[i]` the per-occasion κ̂, stacked into `[η_bsv, κ₁ … κ_K]` per subject.
 pub fn per_subject_packed_gradients_iov(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    interaction: bool,
+    model: &CompiledModel, population: &Population, template: &ModelParameters, x: &[f64],
+    eta_hats: &[DVector<f64>], kappas: &[Vec<DVector<f64>>], interaction: bool,
 ) -> Vec<Option<Vec<f64>>> {
     let pt = PackedPoint::new(template, x);
     crate::par::map(population.subjects.len(), |i| {
@@ -217,10 +169,7 @@ pub(crate) struct ModeResponses {
 /// rescue that leaves every working prediction alone. A non-finite step leaves the mode, and
 /// a Jacobian column of the wrong length is skipped.
 pub fn predict_warm_etas(
-    prev_etas: &[DVector<f64>],
-    jacs: &[Vec<DVector<f64>>],
-    x_prev: &[f64],
-    x_new: &[f64],
+    prev_etas: &[DVector<f64>], jacs: &[Vec<DVector<f64>>], x_prev: &[f64], x_new: &[f64],
 ) -> Vec<DVector<f64>> {
     prev_etas
         .iter()
@@ -252,23 +201,12 @@ mod first_order_prediction_tests {
     #[test]
     fn the_start_is_the_whole_first_order_expansion() {
         let eta = vec![DVector::from_vec(vec![0.3, -0.1])];
-        let jac = vec![vec![
-            DVector::from_vec(vec![2.0, 0.0]),
-            DVector::from_vec(vec![0.5, -1.0]),
-        ]];
+        let jac = vec![vec![DVector::from_vec(vec![2.0, 0.0]), DVector::from_vec(vec![0.5, -1.0])]];
         for scale in [1e-3, 1.0, 50.0] {
             let p = predict_warm_etas(&eta, &jac, &[1.0, 2.0], &[1.0 + scale, 2.0 + scale]);
             let want = [0.3 + 2.5 * scale, -0.1 - scale];
-            assert!(
-                (p[0][0] - want[0]).abs() < 1e-12 * (1.0 + want[0].abs()),
-                "{}",
-                p[0]
-            );
-            assert!(
-                (p[0][1] - want[1]).abs() < 1e-12 * (1.0 + want[1].abs()),
-                "{}",
-                p[0]
-            );
+            assert!((p[0][0] - want[0]).abs() < 1e-12 * (1.0 + want[0].abs()), "{}", p[0]);
+            assert!((p[0][1] - want[1]).abs() < 1e-12 * (1.0 + want[1].abs()), "{}", p[0]);
         }
     }
 

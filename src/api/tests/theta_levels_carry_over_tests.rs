@@ -22,11 +22,8 @@ fn periods_pop(occ1: usize) -> Population {
     const OCC2: [f64; 4] = [12.0, 14.0, 16.0, 20.0];
     let mut pop = population(3, 0);
     for s in pop.subjects.iter_mut() {
-        let rows: Vec<(f64, u32)> = OCC1[4 - occ1..]
-            .iter()
-            .map(|&t| (t, 1))
-            .chain(OCC2.iter().map(|&t| (t, 2)))
-            .collect();
+        let rows: Vec<(f64, u32)> =
+            OCC1[4 - occ1..].iter().map(|&t| (t, 1)).chain(OCC2.iter().map(|&t| (t, 2))).collect();
         let n = rows.len();
         s.obs_times = rows.iter().map(|r| r.0).collect();
         s.occasions = rows.iter().map(|r| r.1).collect();
@@ -34,10 +31,7 @@ fn periods_pop(occ1: usize) -> Population {
             .iter()
             .enumerate()
             .map(|(j, r)| {
-                HashMap::from([
-                    ("OCC".to_string(), r.1 as f64),
-                    ("W".to_string(), 1.0 + j as f64),
-                ])
+                HashMap::from([("OCC".to_string(), r.1 as f64), ("W".to_string(), 1.0 + j as f64)])
             })
             .collect();
         s.observations = vec![1.0; n];
@@ -60,11 +54,8 @@ fn periods_pop(occ1: usize) -> Population {
 /// block: `ip` the `[individual_parameters]` body after `V`, `y` the readout.
 /// `ETA_V` sits on an unread `Z`, so no η shares a direction with the kappa.
 fn ode_model(ip: &str, y: &str, contrast: &str) -> String {
-    let modifier = if contrast.is_empty() {
-        String::new()
-    } else {
-        format!(", contrast = {contrast}")
-    };
+    let modifier =
+        if contrast.is_empty() { String::new() } else { format!(", contrast = {contrast}") };
     format!(
         r#"
 [parameters]
@@ -175,10 +166,7 @@ fn dose_only_pop() -> Population {
             .iter()
             .enumerate()
             .map(|(j, r)| {
-                HashMap::from([
-                    ("OCC".to_string(), r.1 as f64),
-                    ("W".to_string(), 1.0 + j as f64),
-                ])
+                HashMap::from([("OCC".to_string(), r.1 as f64), ("W".to_string(), 1.0 + j as f64)])
             })
             .collect();
         s.observations = vec![1.0; n];
@@ -242,10 +230,7 @@ fn a_dose_only_occasion_is_measured_through_its_carry_over() {
     let ip = |k: &str| {
         format!("  CL = TVCL\n  G = 1 + 0.1 * W\n  F1 = exp(PLACEBO * (OCC - 1) * G + {k} * G)")
     };
-    let cells = [
-        ("D", ip("KAPPA_CL"), false),
-        ("D0", ip("KAPPA_CL * (OCC - 1)"), true),
-    ];
+    let cells = [("D", ip("KAPPA_CL"), false), ("D0", ip("KAPPA_CL * (OCC - 1)"), true)];
     let pop = dose_only_pop();
     let mut wrong = Vec::new();
     for (tag, ip, absorbed) in &cells {

@@ -1,16 +1,10 @@
 fn main() {
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     println!("cargo:rustc-env=FERX_BUILD_TIMESTAMP={}", timestamp);
 
     // The Enzyme autodiff variant was retired; `ci` remains as a no-op feature.
-    let variant = if std::env::var("CARGO_FEATURE_CI").is_ok() {
-        "ci"
-    } else {
-        "default"
-    };
+    let variant = if std::env::var("CARGO_FEATURE_CI").is_ok() { "ci" } else { "default" };
     println!("cargo:rustc-env=FERX_BUILD_VARIANT={}", variant);
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
