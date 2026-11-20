@@ -478,12 +478,15 @@ pub use api::{
     run_model_with_overrides, simulate, simulate_adaptive, simulate_adaptive_from_spec,
     simulate_adaptive_from_spec_with_inputs, simulate_adaptive_with_inputs, simulate_with_options,
     simulate_with_options_diag, simulate_with_seed, simulate_with_uncertainty,
-    simulate_with_uncertainty_diag, theta_level_map, theta_level_values, validate_model_file,
-    validate_model_file_with, AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
-    DrawnParameters, PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings,
-    RunOverrides, SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters,
-    SimulatedSubjectParameters, SimulationOutput, SimulationResult, SuppliedEtas, UncertaintySpec,
-    UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
+    simulate_with_uncertainty_diag, summarize_adaptive, theta_level_map, theta_level_values,
+    validate_model_file, validate_model_file_with, AdaptiveBandStatus, AdaptiveInputs,
+    AdaptivePopulationSummary, AdaptivePredictionInterval, AdaptiveQuantiles,
+    AdaptiveSimulateOptions, AdaptiveSimulationResult, AdaptiveSummaryBand, AdaptiveSummaryMetric,
+    AdaptiveSummaryOptions, AdaptiveSummaryRow, AdaptiveSummaryStatistic, DrawnParameters,
+    PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides,
+    SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters,
+    SimulationOutput, SimulationResult, SuppliedEtas, UncertaintySpec, UnmatchedSubjects,
+    FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, EngineError, Severity};

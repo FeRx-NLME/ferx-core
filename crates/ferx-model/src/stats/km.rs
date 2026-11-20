@@ -425,10 +425,34 @@ pub fn probs_valid(probs: [f64; 3]) -> bool {
 /// the outer quantile is an interpolation between the two most extreme values
 /// rather than an estimate of the tail. Assumes [`probs_valid`].
 pub fn min_curves_for(probs: [f64; 3]) -> usize {
-    // Increasing probabilities: the smallest tail is the first one's or the last one's.
-    let tail = if probs[0] < 1.0 - probs[2] { probs[0] } else { 1.0 - probs[2] };
+    // The smallest tail sets the floor, so the most demanding probability wins.
+    probs.into_iter().map(min_n_for_prob).max().unwrap_or(0)
+}
+
+/// The fewest values the `p`-quantile needs before it is read: `⌈1 / min(p, 1 − p)⌉ − 1`,
+/// 19 for 5 % or 95 %, 1 for the median. Below it the `p`-tail holds less than one value
+/// (see [`min_curves_for`], the largest of these over a band's probabilities).
+pub fn min_n_for_prob(p: f64) -> usize {
     // `1 / 0.05` is 20 up to rounding; the epsilon keeps the ceiling from stepping to 21.
-    ((1.0 / tail) - 1e-9).ceil() as usize - 1
+    ((1.0 / p.min(1.0 - p)) - 1e-9).ceil() as usize - 1
+}
+
+/// The type-7 quantiles ([`quantile_sorted`]) of `vals` at `probs`, each `None` while
+/// `vals` holds fewer than its `need`. `vals` is sorted in place. A non-finite value is
+/// propagated, never sorted past: every quantile that is read is then `NaN`, so a
+/// diverged input cannot hide behind the finite ones.
+pub fn gated_quantiles(vals: &mut [f64], probs: [f64; 3], need: [usize; 3]) -> [Option<f64>; 3] {
+    let finite = vals.iter().all(|v| v.is_finite());
+    vals.sort_by(f64::total_cmp);
+    std::array::from_fn(|k| {
+        (vals.len() >= need[k]).then(|| {
+            if finite {
+                quantile_sorted(vals, probs[k])
+            } else {
+                f64::NAN
+            }
+        })
+    })
 }
 
 /// The pointwise `probs` band of `curves` on `grid`. At each grid time only the
@@ -493,12 +517,11 @@ fn band_over(
         vals.clear();
         vals.extend((0..n_curves).filter_map(|j| at(j, t)));
         debug_assert!(vals.iter().all(|v| v.is_finite()));
-        vals.sort_by(f64::total_cmp);
         band.n_used.push(vals.len());
-        let q = |p: f64| (vals.len() >= need).then(|| quantile_sorted(&vals, p));
-        band.lo.push(q(probs[0]));
-        band.med.push(q(probs[1]));
-        band.hi.push(q(probs[2]));
+        let [lo, med, hi] = gated_quantiles(&mut vals, probs, [need; 3]);
+        band.lo.push(lo);
+        band.med.push(med);
+        band.hi.push(hi);
     }
     Ok(band)
 }
