@@ -1002,7 +1002,7 @@ pub(crate) fn check_dose_compartments(
 /// `inf` in this engine, so nothing further down would have complained. Fail
 /// here instead, exactly as `check_unbound_theta_levels` does for #1064.
 pub(crate) fn check_covariate_model_bound(model: &CompiledModel) -> Vec<Diagnostic> {
-    match crate::api::assert_covariate_model_bound(model) {
+    match crate::covariate_stats::assert_covariate_model_bound(model) {
         Ok(()) => Vec::new(),
         Err(msg) => {
             vec![Diagnostic::error("E_COVSTAT_UNRESOLVED", msg).with_block("covariate_model")]
@@ -1700,7 +1700,7 @@ pub(crate) fn model_routes_rows_by_cmt(model: &CompiledModel) -> bool {
     // there really does pick between the endpoint and the Gaussian grid. Drop the
     // `routes_only` test and a competing-risks model at `cmt = 1`/`cmt = 2` stops
     // reporting, which is the #1404 measurement this whole channel exists for.
-    if !crate::api::validation::model_scores_gaussian_observations(model)
+    if !model_scores_gaussian_observations(model)
         && routing.routes_only(crate::io::datareader::DEFAULT_CMT)
     {
         return false;
